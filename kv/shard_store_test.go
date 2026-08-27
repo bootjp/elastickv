@@ -1,8 +1,10 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -3221,4 +3223,140 @@ func TestEnsurePrefixWriteAllowedFansOutPartialDynamoPrefixes(t *testing.T) {
 		require.ErrorIs(t, st.ensurePrefixWriteAllowed(prefix, 50), store.ErrWriteConflict,
 			"prefix %q spans the fenced table and must still see its floor", prefix)
 	}
+}
+
+// bucketDeleteSafetyNetElems DEL_PREFIXes six raw S3 families per bucket delete,
+// but every key underneath them routes through !s3route|<bucket><generation>.
+// Checked against the raw interval those six miss the object routes' own write
+// floors, so a cleanup at or below a floor is admitted and its tombstones sit
+// hidden behind migrated object versions -- data retained for a bucket the
+// operator was told is gone.
+func TestEnsurePrefixWriteAllowedRoutesS3BucketPrefixesThroughObjectRoutes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bucket     = "orders"
+		generation = uint64(3)
+	)
+	bucketRoute := s3keys.RoutePrefixForBucket(bucket, generation)
+	// Every object of this bucket generation sorts under bucketRoute.
+	require.True(t, bytes.HasPrefix(
+		s3keys.ExtractRouteKey(s3keys.ObjectManifestKey(bucket, generation, "a/b")), bucketRoute))
+
+	// !s3route| sorts before !s3|, so the bucket's object route range and the
+	// raw !s3| families are three distinct routes. Only the middle one, which
+	// holds the objects, carries a floor.
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: bucketRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: bucketRoute, End: prefixScanEnd(bucketRoute), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+			{RouteID: 3, Start: prefixScanEnd(bucketRoute), End: nil, GroupID: 3, State: distribution.RouteStateActive},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	for name, prefix := range map[string][]byte{
+		"manifest":   s3keys.ObjectManifestPrefixForBucket(bucket, generation),
+		"uploadMeta": s3keys.UploadMetaPrefixForBucket(bucket, generation),
+		"uploadPart": s3keys.UploadPartPrefixForBucket(bucket, generation),
+		"blob":       s3keys.BlobPrefixForBucket(bucket, generation),
+		"chunkRef":   s3keys.ChunkRefPrefixForBucket(bucket, generation),
+		"gcUpload":   s3keys.GCUploadPrefixForBucket(bucket, generation),
+	} {
+		require.ErrorIs(t, st.ensurePrefixWriteAllowed(prefix, 50), store.ErrWriteConflict,
+			"%s prefix must see the object route floor", name)
+		require.NoError(t, st.ensurePrefixWriteAllowed(prefix, 101), "%s prefix above the floor", name)
+	}
+
+	// The route-space prefix in the same batch already resolved correctly and
+	// must keep doing so.
+	require.ErrorIs(t,
+		st.ensurePrefixWriteAllowed(s3keys.RoutePrefixForBucket(bucket, generation), 50),
+		store.ErrWriteConflict,
+	)
+}
+
+// A bucket whose object routes carry no floor is unaffected, and a prefix that
+// cannot be projected still fans out over the raw interval.
+func TestEnsurePrefixWriteAllowedKeepsS3FanoutForUnprojectablePrefixes(t *testing.T) {
+	t.Parallel()
+
+	bucketRoute := s3keys.RoutePrefixForBucket("orders", 3)
+
+	// The floor is on the raw !s3| interval this time, and the bucket's object
+	// route range is clean.
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: bucketRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: bucketRoute, End: prefixScanEnd(bucketRoute), GroupID: 2, State: distribution.RouteStateActive},
+			{RouteID: 3, Start: prefixScanEnd(bucketRoute), End: nil, GroupID: 3, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	// Projectable: only the object route range is consulted, and it has no floor.
+	require.NoError(t, st.ensurePrefixWriteAllowed(s3keys.ObjectManifestPrefixForBucket("orders", 3), 50))
+
+	// Not projectable: the bare family still fans out over the raw interval,
+	// which does carry a floor.
+	require.ErrorIs(t,
+		st.ensurePrefixWriteAllowed([]byte(s3keys.ObjectManifestPrefix), 50),
+		store.ErrWriteConflict,
+	)
+}
+
+// countingGetStore counts the point reads canonicalization performs.
+type countingGetStore struct {
+	store.MVCCStore
+	gets atomic.Int64
+}
+
+func (s *countingGetStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	s.gets.Add(1)
+	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+// Every route page a scan merges has already been through
+// canonicalizeRedisWideColumnScanResults in its local, leader, or proxy page
+// path, and the canonical row keeps the physical key. A second pass over the
+// merged result therefore repeats the point read for every surviving row: 2N
+// reads for a page of N, and on a remote group a fenced RPC each.
+func TestScanAtCanonicalizesWideColumnRowsOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("user:key")
+	fields := [][]byte{[]byte("f1"), []byte("f2"), []byte("f3")}
+
+	newStore := func() (*ShardStore, *countingGetStore) {
+		engine := distribution.NewEngine()
+		engine.UpdateRoute([]byte(""), nil, 1)
+		counting := &countingGetStore{MVCCStore: store.NewMVCCStore()}
+		for _, field := range fields {
+			require.NoError(t, counting.PutAt(ctx, store.HashFieldKey(userKey, field), []byte("v"), 10, 0))
+		}
+		counting.gets.Store(0)
+		return NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: counting}}), counting
+	}
+
+	start := store.HashFieldScanPrefix(userKey)
+	end := prefixScanEnd(start)
+
+	st, counting := newStore()
+	kvs, err := st.ScanAt(ctx, start, end, 10, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, len(fields))
+	require.Equal(t, int64(len(fields)), counting.gets.Load(),
+		"one canonicalizing point read per returned row, not two")
+
+	st, counting = newStore()
+	kvs, err = st.ReverseScanAt(ctx, start, end, 10, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, len(fields))
+	require.Equal(t, int64(len(fields)), counting.gets.Load(),
+		"the reverse path had the same redundant outer pass")
 }

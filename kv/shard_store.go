@@ -528,10 +528,11 @@ func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end 
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
 	})
 	out = dedupeSortedScanResults(out)
-	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, ts, readRouteVersion)
-	if err != nil {
-		return nil, err
-	}
+	// Not canonicalized again here. Every route page this merged already went
+	// through canonicalizeRedisWideColumnScanResults in its local, leader, or
+	// proxy page path, and the canonical row keeps the physical key, so a second
+	// pass repeats the point read for every surviving row -- 2N reads for a page
+	// of N, and on a remote group that is a fenced RPC each.
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -631,10 +632,7 @@ func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byt
 	if err != nil {
 		return nil, err
 	}
-	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, ts, readRouteVersion)
-	if err != nil {
-		return nil, err
-	}
+	// Already canonicalized per page; see scanAtWithReadFence.
 	if len(out) > limit {
 		out = out[:limit]
 	}
@@ -3417,7 +3415,28 @@ func (s *ShardStore) routesForPrefixWrite(prefix []byte) []distribution.Route {
 	if routes, ok := s.routesForDynamoPrefixWrite(prefix); ok {
 		return routes
 	}
+	if routes, ok := s.routesForS3PrefixWrite(prefix); ok {
+		return routes
+	}
 	return s.engine.GetIntersectingRoutes(prefix, prefixScanEnd(prefix))
+}
+
+// S3 object keys route through !s3route|<bucket><generation><object>, never
+// through the raw !s3|obj|head| / !s3|upload| / !s3|blob| / !s3|chunkref| /
+// !s3|gc|upload| intervals. bucketDeleteSafetyNetElems DEL_PREFIXes six of those
+// raw families per bucket delete, and checked against the raw interval those six
+// miss the object routes' own MinWriteTSExclusive floors: a cleanup timestamp at
+// or below a floor is admitted, and its tombstones then sit hidden behind
+// migrated object versions -- data retained for a bucket reported as deleted.
+//
+// Project the prefix onto the object route range for the same bucket generation.
+// This is a range, not one route: a bucket's objects can span several routes.
+func (s *ShardStore) routesForS3PrefixWrite(prefix []byte) ([]distribution.Route, bool) {
+	routeStart, ok := s3keys.BucketScopedRoutePrefix(prefix)
+	if !ok {
+		return nil, false
+	}
+	return s.engine.GetIntersectingRoutes(routeStart, prefixScanEnd(routeStart)), true
 }
 
 // DynamoDB rows route through their logical table key

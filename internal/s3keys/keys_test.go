@@ -504,3 +504,80 @@ func TestPerBucketPrefixes_IsolateByBucketAndGeneration(t *testing.T) {
 		})
 	}
 }
+
+func TestBucketScopedRoutePrefix_ProjectsEveryDeleteFamily(t *testing.T) {
+	const (
+		bucket     = "bkt"
+		generation = uint64(3)
+	)
+	want := RoutePrefixForBucket(bucket, generation)
+
+	for name, prefix := range map[string][]byte{
+		"manifest":   ObjectManifestPrefixForBucket(bucket, generation),
+		"uploadMeta": UploadMetaPrefixForBucket(bucket, generation),
+		"uploadPart": UploadPartPrefixForBucket(bucket, generation),
+		"blob":       BlobPrefixForBucket(bucket, generation),
+		"chunkRef":   ChunkRefPrefixForBucket(bucket, generation),
+		"gcUpload":   GCUploadPrefixForBucket(bucket, generation),
+	} {
+		got, ok := BucketScopedRoutePrefix(prefix)
+		if !ok {
+			t.Fatalf("%s: prefix must project onto the object route range", name)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: got %q want %q", name, got, want)
+		}
+	}
+}
+
+// Every key the projection claims to cover must actually sort under the route
+// prefix it produces, otherwise the write floor it admits against is the wrong
+// one.
+func TestBucketScopedRoutePrefix_CoversTheKeysUnderIt(t *testing.T) {
+	const (
+		bucket     = "bkt"
+		generation = uint64(3)
+	)
+	routePrefix, ok := BucketScopedRoutePrefix(ObjectManifestPrefixForBucket(bucket, generation))
+	if !ok {
+		t.Fatal("manifest prefix must project")
+	}
+	for _, key := range [][]byte{
+		ObjectManifestKey(bucket, generation, "a/b"),
+		UploadMetaKey(bucket, generation, "a/b", "u1"),
+		UploadPartKey(bucket, generation, "a/b", "u1", 2),
+		BlobKey(bucket, generation, "a/b", "u1", 2, 3),
+		ChunkRefKey(bucket, generation, "a/b", "u1", 2, 3),
+		GCUploadKey(bucket, generation, "a/b", "u1"),
+	} {
+		route := ExtractRouteKey(key)
+		if route == nil {
+			t.Fatalf("key %q has no route key", key)
+		}
+		if !bytes.HasPrefix(route, routePrefix) {
+			t.Fatalf("route %q is not under %q", route, routePrefix)
+		}
+	}
+}
+
+// A prefix that stops before the generation still spans several generations, and
+// one that reaches into the object segment is not this function's shape. Both
+// must decline rather than collapse onto a single route range.
+func TestBucketScopedRoutePrefix_RejectsPartialAndDeeperPrefixes(t *testing.T) {
+	const (
+		bucket     = "bkt"
+		generation = uint64(3)
+	)
+	full := ObjectManifestPrefixForBucket(bucket, generation)
+	for name, prefix := range map[string][]byte{
+		"bare family":        []byte(ObjectManifestPrefix),
+		"partial bucket":     full[:len(ObjectManifestPrefix)+1],
+		"missing generation": full[:len(full)-1],
+		"object scoped":      ObjectManifestKey(bucket, generation, "a/b"),
+		"other family":       []byte(BucketMetaPrefix),
+	} {
+		if _, ok := BucketScopedRoutePrefix(prefix); ok {
+			t.Fatalf("%s: prefix %q must not project", name, prefix)
+		}
+	}
+}
