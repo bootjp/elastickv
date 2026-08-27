@@ -2591,6 +2591,22 @@ func nextStagedVisibilityCandidateWindow(window int) int {
 	return next
 }
 
+// stagedVisibilityCandidateScanBudget bounds the range export that resolves a
+// staged-visibility page's candidate keys in one pass.
+//
+// The export spans from the smallest candidate through the largest and filters
+// for the candidate set, so with no budget it scans and decodes every version
+// in between -- tombstoned keys and dense MVCC history included -- even though
+// at most stagedVisibilityMaxCandidateWindow exact keys are wanted. A route
+// whose visible rows are sparse could therefore make an ordinary scan page
+// consume unbounded I/O on the serving leader.
+//
+// With the budget the range pass stays the fast path for the dense case, where
+// the candidates sit close together, and a page that would have run away instead
+// falls back to one exact-key probe per unresolved candidate -- bounded by the
+// candidate count, which the caller already bounds.
+const stagedVisibilityCandidateScanBudget = 1 << 20
+
 func scanVisibleCandidates(ctx context.Context, st store.MVCCStore, start, end []byte, limit int, ts uint64, reverse bool) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
@@ -2663,7 +2679,7 @@ func latestCandidateVersionsAt(ctx context.Context, st store.MVCCStore, keys [][
 		MaxCommitTSInclusive: ts,
 		MaxVersions:          len(sortedKeys),
 		MaxBytes:             ^uint64(0),
-		MaxScannedBytes:      ^uint64(0),
+		MaxScannedBytes:      stagedVisibilityCandidateScanBudget,
 		AcceptKey: func(key []byte) bool {
 			_, ok := candidates[string(key)]
 			return ok
@@ -2680,12 +2696,38 @@ func latestCandidateVersionsAt(ctx context.Context, st store.MVCCStore, keys [][
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if !result.Done && len(result.Versions) < len(sortedKeys) {
-		return nil, errors.New("staged visibility range export stopped before all candidates were examined")
-	}
-	out := make(map[string]store.MVCCVersion, len(result.Versions))
+	out := make(map[string]store.MVCCVersion, len(sortedKeys))
 	for _, version := range result.Versions {
 		out[string(version.Key)] = version
+	}
+	if result.Done {
+		// The export walked the whole enclosing range, so a candidate missing
+		// from the result has no visible version.
+		return out, nil
+	}
+	return probeRemainingCandidateVersionsAt(ctx, st, sortedKeys, out, ts)
+}
+
+// probeRemainingCandidateVersionsAt resolves the candidates the bounded range
+// export did not reach, one exact-key probe each.
+func probeRemainingCandidateVersionsAt(
+	ctx context.Context,
+	st store.MVCCStore,
+	sortedKeys [][]byte,
+	out map[string]store.MVCCVersion,
+	ts uint64,
+) (map[string]store.MVCCVersion, error) {
+	for _, key := range sortedKeys {
+		if _, ok := out[string(key)]; ok {
+			continue
+		}
+		version, found, err := latestMVCCVersionAt(ctx, st, key, ts)
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			out[string(key)] = version
+		}
 	}
 	return out, nil
 }
