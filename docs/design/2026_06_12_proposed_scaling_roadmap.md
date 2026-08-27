@@ -87,7 +87,7 @@ references anywhere in `kv/`, `distribution/`, or
 HLC is `kv/hlc.go` + `kv/coordinator.go` +
 `kv/sharded_coordinator.go`: physical ceiling is Raft-agreed via
 `ProposeHLCLease`, `hlcPhysicalWindowMs = 20 s`, renewed every
-`hlcRenewalInterval = 2 s` by each led shard group
+`hlcRenewalInterval = 1 s` by each led shard group
 (`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced` fails closed
 with `ErrCeilingExpired` once `wall_now >= ceiling`. Wall clock is
 `time.Now().UnixMilli()` — assumes NTP-synced hosts.
@@ -100,7 +100,7 @@ LAN-tuned; would spuriously election-time-out cross-WAN.
 Multi-region blockers:
 
 - HLC ceiling renewal is **per Raft group** — each shard group leader
-  proposes every 2 s, so cross-region leadership for that group makes
+  proposes every 1 s, so cross-region leadership for that group makes
   its persistence-grade ts depend on cross-WAN quorum progress. 1 s WAN
   RTT is now less likely to expire the 20 s window immediately, but
   every renewal still depends on that group's cross-WAN quorum progress.
