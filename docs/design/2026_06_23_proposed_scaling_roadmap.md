@@ -4,7 +4,7 @@ Status: Proposed
 Document type: Roadmap ownership index
 Author: bootjp
 Date: 2026-06-23
-Last audited: 2026-08-22 against `origin/main` and GitHub pull requests
+Last audited: 2026-08-28 against `origin/main` and GitHub pull requests
 
 ## 1. Scope
 
@@ -147,46 +147,47 @@ invented dependencies the rows do not state.
    stack owns `StartSplitMigration`, the migrator FSM, fencing, cutover,
    promotion, and cleanup. It is a root prerequisite for later cross-group range
    movement, not implemented by this roadmap.
-2. Hotspot split M3 cross-group targeting (§3): standalone M3 is implemented.
-   The detector core, committed-window reader, Top-K evidence alignment,
-   leadership watermark, and scheduler wiring are all on `main`, so none of
-   them is work to schedule. What remains is M3-PR4 least-loaded
-   `target_group_id` selection, which is a scheduler action that moves data and
-   therefore waits on the M2 migration plane above.
-3. Dedicated TSO group-0 issuance, routing, and exposure (§3, §4.4 M1): proceed
+2. Dedicated TSO group-0 issuance, routing, and exposure (§3, §4.4 M1): proceed
    as its own open stack. It gates cross-shard transaction completion but not
    follower reads.
-4. Live logical backup pin, admin, and producer stack (§3): scan primitives are
+3. Live logical backup pin, admin, and producer stack (§3): scan primitives are
    on `main`; PR #1056 and PR #1128 own the remaining live stack.
-5. S3 Raft blob offload follow-ups (§3): reference counting, GC readiness, and
+4. S3 Raft blob offload follow-ups (§3): reference counting, GC readiness, and
    legacy migration remain in the focused S3 owner.
-6. Indexed route engine (§4.1 M2) and batched catalog mutation (§4.1 M3), which
+5. Indexed route engine (§4.1 M2) and batched catalog mutation (§4.1 M3), which
    are **parallel, not sequential**: the predecessor's §3.3 records M2 as
    independent and M3 as depending only on M1's batched apply observation path,
    and PR #1117 merged M1. Catalog delta/watch is therefore no longer in this
    list either.
-7. The remaining physical snapshot offload milestones (§4.3 M4: the leader-only
+6. The remaining physical snapshot offload milestones (§4.3 M4: the leader-only
    scheduler, retention/GC readiness, and operational validation) in
    [`2026_07_19_partial_physical_snapshot_object_offload.md`](2026_07_19_partial_physical_snapshot_object_offload.md).
    Their only prerequisite was SST ingest snapshot transfer, which PR #1130
    merged and §4.3 records as implemented.
-8. Per-shard Pebble tuning and write admission (§4.3 M2) and sharded retention
+7. Per-shard Pebble tuning and write admission (§4.3 M2) and sharded retention
    scheduling (§4.3 M3). Independent of
-   step 7: the predecessor's §5.3 records M4 as depending on M1 alone, and the
+   step 6: the predecessor's §5.3 records M4 as depending on M1 alone, and the
    focused offload owner names no dependency on either design.
-9. Same-group range merge (§5), after the focused range-merge design defines
+8. Same-group range merge (§5), after the focused range-merge design defines
    local drain and fencing. Cross-group merge is separate and gated below.
-10. Replica placement (§5). Named as a prerequisite by region balance and by
-    auto group lifecycle, and owned by nothing else, so it gates those two.
-11. Follower and learner reads (§4.4 M2). Multi-node groups and the learner
+9. Replica placement (§5). Named as a prerequisite by region balance and by
+   auto group lifecycle, and owned by nothing else, so it gates those two.
+10. Follower and learner reads (§4.4 M2). Multi-node groups and the learner
     primitive are on `main`; this is not waiting for dedicated TSO unless the
     focused design adds cross-shard or session-global timestamp semantics.
-12. WAN Raft tuning and region-aware membership (§4.2 M1). Multi-node bootstrap
+11. WAN Raft tuning and region-aware membership (§4.2 M1). Multi-node bootstrap
     is on `main`, and this row has no unmet prerequisite inside the regional
     subsystem.
 
 **Gated — each names what it waits for:**
 
+12. Hotspot split M3 cross-group targeting (§3), after the hotspot split M2
+    migration plane in step 1. Standalone M3 is implemented — the detector core,
+    committed-window reader, Top-K evidence alignment, leadership watermark, and
+    scheduler wiring are all on `main`, so none of those is work to schedule.
+    What remains is M3-PR4 least-loaded `target_group_id` selection, and the
+    focused owner's §8.1 records it as post-M2 because it is a scheduler action
+    that moves data.
 13. Cross-group range merge (§5), after the hotspot split M2 migration plane
     and the Composed-1 cross-group commit guard/drain protocol required by the
     range-merge owner.
