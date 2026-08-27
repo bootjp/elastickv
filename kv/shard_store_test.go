@@ -700,12 +700,14 @@ func TestShardStoreExplicitGroupRead_IgnoresUnrelatedStagedRoutes(t *testing.T) 
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
 		Version: 1,
 		Routes: []distribution.RouteDescriptor{
-			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+			// The read's own range is owned by the group it names, so the
+			// staged route below is genuinely unrelated to it.
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
 			{
 				RouteID:                2,
 				Start:                  []byte("m"),
 				End:                    []byte("z"),
-				GroupID:                1,
+				GroupID:                2,
 				State:                  distribution.RouteStateActive,
 				StagedVisibilityActive: true,
 				MigrationJobID:         9,
@@ -3460,4 +3462,98 @@ func TestShardStoreScanAt_ExactLegacyListDeltaScanMarksRouteGroup(t *testing.T) 
 	require.Equal(t, key, kvs[0].Key)
 	require.Equal(t, uint64(2), kvs[0].RouteGroupID,
 		"an exact legacy delta scan must still report the owning route group")
+}
+
+// A coordinator that has not yet applied a promotion keeps forwarding the
+// pre-cutover source group. Once StagedVisibilityActive is cleared the source's
+// former range belongs to the target, and the staged-visibility rejection stops
+// covering the request -- exactly while the source's pre-cutover MVCC is still
+// sitting there waiting for cleanup. Serving that is a stale read, so the
+// mismatch must fail closed instead.
+func TestShardStoreExplicitGroupRead_FailsClosedAfterPromotionClearsStaging(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			// Promotion completed: the range now belongs to group 2 and the
+			// staged-visibility flag is gone.
+			{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("b"), []byte("pre-cutover"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("b"), []byte("post-cutover"), 20, 0))
+
+	_, err := st.GetGroupAt(ctx, 1, []byte("b"), 25)
+	require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
+
+	_, err = st.ScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 25)
+	require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 25, false, 1, 0, []byte("a"), []byte("z"))
+	require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
+
+	// The group the catalog does name still serves the post-cutover value.
+	got, err := st.GetGroupAt(ctx, 2, []byte("b"), 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("post-cutover"), got)
+}
+
+// SQS resolves its owning group through the (queue, partition) resolver rather
+// than the byte-range catalog, so a catalog route naming another group must not
+// reject those reads.
+func TestShardStoreExplicitGroupRead_AllowsResolverOwnedKeysOnMismatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1:  {Store: store.NewMVCCStore()},
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	key := []byte("!sqs|msg|data|p|orders|partition-2|msg-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("payload"), 7, 0))
+
+	got, err := st.GetGroupAt(ctx, 42, key, 7)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), got)
+
+	start := []byte("!sqs|msg|data|p|orders|partition-2|")
+	kvs, err := st.ScanGroupAt(ctx, 42, start, prefixScanEnd(start), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("payload")}}, kvs)
+}
+
+// Filesystem placement stats scan the whole chunk keyspace once per filesystem
+// group, so most of those groups are not the catalog owner of the range. The
+// explicit-group gate must let them through the way it lets SQS through.
+func TestShardStoreExplicitGroupScan_AllowsFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	chunkKey := fskeys.ChunkKey(3, 7, 0)
+	require.NoError(t, groups[2].Store.PutAt(ctx, chunkKey, []byte("chunk"), 7, 0))
+
+	start := fskeys.ChunkAllPrefix()
+	kvs, err := st.ScanGroupAt(ctx, 2, start, prefixScanEnd(start), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: chunkKey, Value: []byte("chunk")}}, kvs)
 }

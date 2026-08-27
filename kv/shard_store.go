@@ -36,6 +36,7 @@ type ShardStore struct {
 var (
 	ErrCrossShardMutationBatchNotSupported     = errors.New("cross-shard mutation batches are not supported")
 	ErrExplicitGroupStagedVisibilityUnresolved = errors.New("explicit group read cannot resolve staged visibility route")
+	ErrExplicitGroupRouteOwnerMismatch         = errors.New("explicit group read does not own the requested key range")
 	ErrReadRouteVersionUnavailable             = errors.New("read route version is not locally available")
 	ErrFilesystemPlacementTargetNotFound       = errors.New("filesystem placement target group has no routable home slot")
 )
@@ -299,8 +300,42 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 		if routeHasStagedVisibility(route) {
 			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
 		}
+		if !explicitGroupResolverOwnedKey(key) {
+			return distribution.Route{}, errors.Wrapf(
+				ErrExplicitGroupRouteOwnerMismatch,
+				"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
+		}
 	}
 	return fallback, nil
+}
+
+// explicitGroupResolverOwnedKey reports whether key belongs to a keyspace whose
+// owning group is chosen by a resolver rather than by the byte-range catalog --
+// SQS HT-FIFO's (queue, partition) resolver being the one such keyspace today.
+// Only those keys may be served from a group the catalog does not name.
+//
+// Everything else must fail closed on a mismatch. Once a migration's promotion
+// clears StagedVisibilityActive, the source's former range belongs to the
+// target, and a coordinator that has not yet applied that catalog version keeps
+// forwarding the source group. Falling back to the requested group then serves
+// the source's own MVCC -- the value from before the cutover -- for as long as
+// source cleanup takes. The staged-visibility rejection above stops covering
+// that window the moment the flag is cleared, which is exactly when the
+// pre-cutover data is still sitting there.
+// fsChunkAllPrefix is the raw filesystem chunk keyspace prefix, hoisted so the
+// explicit-group gate does not allocate it per read.
+var fsChunkAllPrefix = fskeys.ChunkAllPrefix()
+
+func explicitGroupResolverOwnedKey(key []byte) bool {
+	if sqsRouteKey(key) != nil {
+		return true
+	}
+	// Filesystem chunks are placed per group by the filesystem's own home-slot
+	// placement, not by the byte-range catalog: ListFilePlacementStats scans the
+	// whole chunk keyspace once per FilesystemGroupIDs entry
+	// (internal/filesystem/placement.go scanPlacementChunks), so most of those
+	// groups are not the catalog owner of the range and never will be.
+	return bytes.HasPrefix(key, fsChunkAllPrefix)
 }
 
 func (s *ShardStore) getAtWithStagedVisibility(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
@@ -912,6 +947,11 @@ func (s *ShardStore) routesForExplicitGroupRouteBounds(groupID uint64, start []b
 		}
 	}
 	if len(matched) == 0 {
+		if len(routes) > 0 && !explicitGroupResolverOwnedKey(start) {
+			return nil, false, errors.Wrapf(
+				ErrExplicitGroupRouteOwnerMismatch,
+				"group_id=%d range=[%q,%q)", groupID, start, end)
+		}
 		return fallback, false, nil
 	}
 	return matched, false, nil
@@ -939,6 +979,11 @@ func (s *ShardStore) routesForExplicitGroupScan(groupID uint64, start []byte, en
 			matched = dedupeRepeatedRawScanRoutes(matched)
 		}
 		return matched, !routeMapped, nil
+	}
+	if len(routes) > 0 && !explicitGroupResolverOwnedKey(start) {
+		return nil, false, errors.Wrapf(
+			ErrExplicitGroupRouteOwnerMismatch,
+			"group_id=%d range=[%q,%q)", groupID, start, end)
 	}
 	return fallback, false, nil
 }
