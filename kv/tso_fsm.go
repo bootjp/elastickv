@@ -572,7 +572,14 @@ func (f *TSOStateMachine) restoreSnapshotState(
 		f.cutoverActive.Store(true)
 	}
 	if phaseDActive {
-		f.phaseDFloor.Store(phaseDFloor)
+		// The Phase-D floor is immutable once active: applyPhaseDMarker halts
+		// apply on a marker that changes it. A snapshot carrying a lower floor
+		// is therefore older than what this replica already applied, and
+		// regressing to it would reclassify every timestamp in between as
+		// post-Phase-D -- ValidateDurableTimestamp would start accepting values
+		// it had been rejecting. Take the higher, the way the ceiling and the
+		// allocation floor above already do.
+		storeMaxUint64(&f.phaseDFloor, phaseDFloor)
 		f.phaseDActive.Store(true)
 	}
 	if f.hlc != nil {

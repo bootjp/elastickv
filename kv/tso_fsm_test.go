@@ -643,3 +643,73 @@ func TestTSOStateMachineSetObserverPublishesExistingState(t *testing.T) {
 	require.True(t, ok, "installing the observer must publish current state")
 	require.Equal(t, [2]bool{true, false}, got)
 }
+
+// The Phase-D floor is immutable once active -- applyPhaseDMarker halts apply on
+// a marker that changes it -- so a snapshot carrying a lower floor is older than
+// what this replica already applied. Regressing to it reclassifies every
+// timestamp in between as post-Phase-D, and ValidateDurableTimestamp starts
+// accepting values it had been rejecting.
+func TestTSOStateMachineRestoreDoesNotRegressPhaseDFloor(t *testing.T) {
+	t.Parallel()
+
+	ceilingMs := time.Now().Add(time.Hour).UnixMilli()
+	oldFloor := tsoLeaseAllocationFloor(ceilingMs)
+	newFloor := oldFloor + 1_000
+
+	// A snapshot taken while the group was still at the older floor.
+	source := NewTSOStateMachine(NewHLC())
+	require.Nil(t, source.Apply(marshalHLCLeaseRenew(ceilingMs)))
+	require.Nil(t, source.Apply(marshalTSOAllocationFloor(oldFloor)))
+	require.Nil(t, source.Apply(marshalTSOCutover()))
+	require.Nil(t, source.Apply(marshalTSOPhaseD(oldFloor)))
+	snap, err := source.Snapshot()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, snap.Close()) }()
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+
+	// A replica that has already applied the higher floor.
+	target := NewTSOStateMachine(NewHLC())
+	require.Nil(t, target.Apply(marshalHLCLeaseRenew(ceilingMs)))
+	require.Nil(t, target.Apply(marshalTSOAllocationFloor(newFloor)))
+	require.Nil(t, target.Apply(marshalTSOCutover()))
+	require.Nil(t, target.Apply(marshalTSOPhaseD(newFloor)))
+	require.Equal(t, newFloor, target.PhaseDFloor())
+
+	require.NoError(t, target.Restore(bytes.NewReader(buf.Bytes())))
+	require.Equal(t, newFloor, target.PhaseDFloor(),
+		"the older snapshot must not pull the floor back down")
+	require.True(t, target.PhaseDActive())
+}
+
+// A snapshot carrying a higher floor than this replica has applied still moves
+// the floor forward.
+func TestTSOStateMachineRestoreAdvancesPhaseDFloor(t *testing.T) {
+	t.Parallel()
+
+	ceilingMs := time.Now().Add(time.Hour).UnixMilli()
+	oldFloor := tsoLeaseAllocationFloor(ceilingMs)
+	newFloor := oldFloor + 1_000
+
+	source := NewTSOStateMachine(NewHLC())
+	require.Nil(t, source.Apply(marshalHLCLeaseRenew(ceilingMs)))
+	require.Nil(t, source.Apply(marshalTSOAllocationFloor(newFloor)))
+	require.Nil(t, source.Apply(marshalTSOCutover()))
+	require.Nil(t, source.Apply(marshalTSOPhaseD(newFloor)))
+	snap, err := source.Snapshot()
+	require.NoError(t, err)
+	defer func() { require.NoError(t, snap.Close()) }()
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+
+	target := NewTSOStateMachine(NewHLC())
+	require.Nil(t, target.Apply(marshalHLCLeaseRenew(ceilingMs)))
+	require.Nil(t, target.Apply(marshalTSOAllocationFloor(oldFloor)))
+	require.Nil(t, target.Apply(marshalTSOCutover()))
+	require.Nil(t, target.Apply(marshalTSOPhaseD(oldFloor)))
+
+	require.NoError(t, target.Restore(bytes.NewReader(buf.Bytes())))
+	require.Equal(t, newFloor, target.PhaseDFloor())
+}
