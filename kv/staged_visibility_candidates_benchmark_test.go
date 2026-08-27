@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"testing"
@@ -113,6 +114,7 @@ func TestLatestCandidateVersionsAtOmitsAbsentCandidates(t *testing.T) {
 type exportRecordingStore struct {
 	store.MVCCStore
 	scannedBudgets []uint64
+	endKeys        [][]byte
 	exports        int
 }
 
@@ -122,6 +124,7 @@ func (s *exportRecordingStore) ExportVersions(
 ) (store.ExportVersionsResult, error) {
 	s.exports++
 	s.scannedBudgets = append(s.scannedBudgets, opts.MaxScannedBytes)
+	s.endKeys = append(s.endKeys, bytes.Clone(opts.EndKey))
 	return s.MVCCStore.ExportVersions(ctx, opts)
 }
 
@@ -147,4 +150,38 @@ func TestLatestCandidateVersionsAtBoundsTheRangeScan(t *testing.T) {
 		"the range pass must carry a finite scan budget")
 	require.Greater(t, recording.exports, 1,
 		"a range pass that hit the budget must fall back to exact-key probes")
+}
+
+// The probe fallback must cover exactly the candidate key. prefixScanEnd(key)
+// covers every key that has it as a prefix, so probing an absent "a" would walk
+// "ab", "az" and all of their versions before concluding "a" is not there --
+// unbounded work that the scan budget only splits into repeated exports, once
+// per unresolved candidate.
+func TestLatestCandidateVersionsAtProbesExactKeysOnly(t *testing.T) {
+	t.Parallel()
+
+	base := store.NewMVCCStore()
+	t.Cleanup(func() { _ = base.Close() })
+	keys := seedSparseCandidateRange(t, base, 32, 64, 16)
+	// A candidate with no version of its own, but with neighbours that share it
+	// as a prefix: a prefix-bounded probe would scan all of them.
+	absent := []byte("k000000-absent")
+	ctx := context.Background()
+	for i := range 64 {
+		require.NoError(t, base.PutAt(ctx, []byte(fmt.Sprintf("%s-%03d", absent, i)), []byte("neighbour"), 1, 0))
+	}
+	keys = append(keys, absent)
+
+	recording := &exportRecordingStore{MVCCStore: base}
+	got, err := latestCandidateVersionsAt(ctx, recording, keys, ^uint64(0)>>1)
+	require.NoError(t, err)
+	_, ok := got[string(absent)]
+	require.False(t, ok, "the absent candidate has no visible version")
+
+	require.Contains(t, recording.endKeys, exactKeyScanEnd(absent),
+		"the probe must be bounded to the candidate key alone")
+	for _, end := range recording.endKeys[1:] {
+		require.NotEqual(t, prefixScanEnd(absent), end,
+			"no probe may use a prefix bound")
+	}
 }

@@ -361,10 +361,24 @@ func (s *ShardStore) getAtWithStagedVisibility(ctx context.Context, g *ShardGrou
 	return bytes.Clone(winner.Value), nil
 }
 
+// exactKeyScanEnd returns the exclusive upper bound that selects only key.
+//
+// prefixScanEnd(key) selects every key that has key as a prefix, which turns an
+// exact-key probe into a prefix scan: probing an absent "a" walks "ab", "az" and
+// all of their versions before concluding "a" is not there. A byte-string has no
+// value strictly between key and key+0x00, so this bound covers key alone.
+func exactKeyScanEnd(key []byte) []byte {
+	// The immediate successor of key in byte-string order.
+	const successorByte = byte(0)
+	out := make([]byte, 0, len(key)+1)
+	out = append(out, key...)
+	return append(out, successorByte)
+}
+
 func latestMVCCVersionAt(ctx context.Context, st store.MVCCStore, key []byte, ts uint64) (store.MVCCVersion, bool, error) {
 	opts := store.ExportVersionsOptions{
 		StartKey:             key,
-		EndKey:               prefixScanEnd(key),
+		EndKey:               exactKeyScanEnd(key),
 		MaxCommitTSInclusive: ts,
 		MaxVersions:          1,
 		MaxScannedBytes:      0,
