@@ -528,7 +528,7 @@ func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end 
 		return bytes.Compare(out[i].Key, out[j].Key) < 0
 	})
 	out = dedupeSortedScanResults(out)
-	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, end, ts, readRouteVersion)
+	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, ts, readRouteVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -549,7 +549,7 @@ func (s *ShardStore) ScanKeysAtWithReadFence(ctx context.Context, start []byte, 
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
 	}
-	if _, _, _, ok := redisWideColumnScanRouteRange(start, end); ok {
+	if redisWideColumnCanonicalizableScan(start) {
 		kvs, err := s.ScanAtWithReadFence(ctx, start, end, limit, ts, false, groupID, readRouteVersion, nil, nil)
 		if err != nil {
 			return nil, err
@@ -631,7 +631,7 @@ func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byt
 	if err != nil {
 		return nil, err
 	}
-	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, end, ts, readRouteVersion)
+	out, err = s.canonicalizeRedisWideColumnScanResults(ctx, out, start, ts, readRouteVersion)
 	if err != nil {
 		return nil, err
 	}
@@ -641,11 +641,11 @@ func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byt
 	return out, nil
 }
 
-func (s *ShardStore) canonicalizeRedisWideColumnScanResults(ctx context.Context, kvs []*store.KVPair, start []byte, end []byte, ts uint64, readRouteVersion uint64) ([]*store.KVPair, error) {
+func (s *ShardStore) canonicalizeRedisWideColumnScanResults(ctx context.Context, kvs []*store.KVPair, start []byte, ts uint64, readRouteVersion uint64) ([]*store.KVPair, error) {
 	if len(kvs) == 0 {
 		return kvs, nil
 	}
-	if _, _, _, ok := redisWideColumnScanRouteRange(start, end); !ok {
+	if !redisWideColumnCanonicalizableScan(start) {
 		return kvs, nil
 	}
 	out := make([]*store.KVPair, 0, len(kvs))
@@ -666,11 +666,11 @@ func (s *ShardStore) canonicalizeRedisWideColumnScanResults(ctx context.Context,
 	return out, nil
 }
 
-func (s *ShardStore) canonicalizeRedisWideColumnScanKeys(ctx context.Context, keys [][]byte, start []byte, end []byte, ts uint64, readRouteVersion uint64) ([][]byte, error) {
+func (s *ShardStore) canonicalizeRedisWideColumnScanKeys(ctx context.Context, keys [][]byte, start []byte, ts uint64, readRouteVersion uint64) ([][]byte, error) {
 	if len(keys) == 0 {
 		return keys, nil
 	}
-	if _, _, _, ok := redisWideColumnScanRouteRange(start, end); !ok {
+	if !redisWideColumnCanonicalizableScan(start) {
 		return keys, nil
 	}
 	out := make([][]byte, 0, len(keys))
@@ -1330,7 +1330,7 @@ func (s *ShardStore) scanKeysRouteLocal(
 		}
 		return keys, nil
 	}, func(keys [][]byte) ([][]byte, error) {
-		return s.canonicalizeRedisWideColumnScanKeys(ctx, keys, start, end, ts, readRouteVersion)
+		return s.canonicalizeRedisWideColumnScanKeys(ctx, keys, start, ts, readRouteVersion)
 	})
 }
 
@@ -1373,7 +1373,7 @@ func (s *ShardStore) scanKeysRouteAtLeader(
 		if err != nil {
 			return nil, err
 		}
-		visibleKeys, err := s.visibleScanKeysForReadFence(ctx, keysFromKVs(kvs), start, end, ts, readRouteVersion)
+		visibleKeys, err := s.visibleScanKeysForReadFence(ctx, keysFromKVs(kvs), start, ts, readRouteVersion)
 		if err != nil {
 			return nil, err
 		}
@@ -1402,11 +1402,11 @@ func (s *ShardStore) scanLockOnlyVisibleKeysAtLeader(
 	if err != nil {
 		return nil, err
 	}
-	return s.visibleScanKeysForReadFence(ctx, keys, start, end, ts, readRouteVersion)
+	return s.visibleScanKeysForReadFence(ctx, keys, start, ts, readRouteVersion)
 }
 
-func (s *ShardStore) visibleScanKeysForReadFence(ctx context.Context, keys [][]byte, start []byte, end []byte, ts uint64, readRouteVersion uint64) ([][]byte, error) {
-	return s.canonicalizeRedisWideColumnScanKeys(ctx, filterTxnInternalKeys(keys), start, end, ts, readRouteVersion)
+func (s *ShardStore) visibleScanKeysForReadFence(ctx context.Context, keys [][]byte, start []byte, ts uint64, readRouteVersion uint64) ([][]byte, error) {
+	return s.canonicalizeRedisWideColumnScanKeys(ctx, filterTxnInternalKeys(keys), start, ts, readRouteVersion)
 }
 
 func (s *ShardStore) scanLockOnlyKeysAtLeader(
@@ -1659,7 +1659,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterLocalPage(
 	if err != nil {
 		return nil, nil, errors.WithStack(err)
 	}
-	filtered, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, end, ts, readRouteVersion)
+	filtered, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, ts, readRouteVersion)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1683,7 +1683,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterLeaderPage(
 	if err != nil {
 		return nil, nil, err
 	}
-	kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, kvs, start, end, ts, readRouteVersion)
+	kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, kvs, start, ts, readRouteVersion)
 	return kvs, cursorKVs, err
 }
 
@@ -1704,7 +1704,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterProxyPage(
 	if err != nil {
 		return nil, nil, err
 	}
-	filtered, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, end, ts, readRouteVersion)
+	filtered, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, ts, readRouteVersion)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -1915,7 +1915,7 @@ func (s *ShardStore) scanRouteAtForwardLocalPage(
 	if err != nil {
 		return scanRoutePage{}, errors.WithStack(err)
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, end, ts, readRouteVersion)
+	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
@@ -1948,7 +1948,7 @@ func (s *ShardStore) scanRouteAtForwardLeaderPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, end, ts, readRouteVersion)
+	kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, ts, readRouteVersion)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
@@ -1975,7 +1975,7 @@ func (s *ShardStore) scanRouteAtForwardProxyPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, end, ts, readRouteVersion)
+	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
@@ -2068,7 +2068,7 @@ func (s *ShardStore) scanRouteAtReverseLocalPage(
 	if err != nil {
 		return scanRoutePage{}, errors.WithStack(err)
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, end, ts, readRouteVersion)
+	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
@@ -2101,7 +2101,7 @@ func (s *ShardStore) scanRouteAtReverseLeaderPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, end, ts, readRouteVersion)
+	kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, ts, readRouteVersion)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
@@ -2128,7 +2128,7 @@ func (s *ShardStore) scanRouteAtReverseProxyPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, end, ts, readRouteVersion)
+	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
 	if err != nil {
 		return scanRoutePage{}, err
 	}
@@ -3414,7 +3414,43 @@ func (s *ShardStore) routesForPrefixWrite(prefix []byte) []distribution.Route {
 	if routes, ok := s.routesForRedisListPrefixWrite(prefix); ok {
 		return routes
 	}
+	if routes, ok := s.routesForDynamoPrefixWrite(prefix); ok {
+		return routes
+	}
 	return s.engine.GetIntersectingRoutes(prefix, prefixScanEnd(prefix))
+}
+
+// DynamoDB rows route through their logical table key
+// (!ddb|route|table|<table>), never through the raw !ddb|item| / !ddb|gsi|
+// interval, so a DEL_PREFIX checked against that raw interval can miss the
+// table's own migration write floor and install tombstones below already
+// migrated versions. Project the prefix onto the same table route the rows
+// underneath it use.
+//
+// Only the item and GSI families are projected. Their table segment is
+// terminated by '|', so a prefix that reaches the terminator covers exactly one
+// table. The !ddb|meta| families have no terminator in the prefix, so
+// "!ddb|meta|table|foo" would also cover table "foobar" and cannot be collapsed
+// to a single route.
+func (s *ShardStore) routesForDynamoPrefixWrite(prefix []byte) ([]distribution.Route, bool) {
+	for _, family := range dynamoTablePrefixWriteFamilies {
+		if bytes.HasPrefix(family, prefix) {
+			// The prefix stops at or inside the family marker itself, so it
+			// spans every table and has no single logical key to project onto.
+			return s.engine.GetIntersectingRoutes(nil, nil), true
+		}
+		if !bytes.HasPrefix(prefix, family) {
+			continue
+		}
+		route := dynamoRouteKey(prefix)
+		if route == nil {
+			// A partial table segment: the prefix can still match more than one
+			// table, so every table route stays a candidate.
+			return s.engine.GetIntersectingRoutes(nil, nil), true
+		}
+		return s.routesForLogicalPrefixWriteRange(route, nil, true), true
+	}
+	return nil, false
 }
 
 func routesForPrefixWriteForEngine(engine *distribution.Engine, prefix []byte) []distribution.Route {

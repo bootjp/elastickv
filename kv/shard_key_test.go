@@ -240,3 +240,65 @@ func TestRouteKey_CollapsesDynamoGenerationsToSameTableRoute(t *testing.T) {
 	require.Equal(t, want, routeKey(sourceGSIKey),
 		"migration source generation GSI key must route to the same table group as the current generation")
 }
+
+// normalizeRouteKey places stream writes on the logical user-key route. Scans
+// must be projected the same way: if XRANGE/XREAD/XTRIM keep resolving through
+// the raw !stream|entry| prefix, a split that separates the raw prefix from the
+// user key sends the scan to a different group than the XADD that wrote the
+// entries, and the reader silently sees an empty stream.
+func TestStreamScanRouteRangeResolvesThroughUserKey(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("alice")
+	for _, tc := range []struct {
+		name  string
+		start []byte
+	}{
+		{name: "entries", start: store.StreamEntryScanPrefix(userKey)},
+		{name: "meta", start: store.StreamMetaKey(userKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(tc.start, prefixScanEnd(tc.start))
+			require.True(t, ok, "stream scans must be recognized as encoded user-key scans")
+			require.True(t, exact)
+			require.Equal(t, userKey, routeStart)
+			require.Nil(t, routeEnd)
+		})
+	}
+}
+
+// A scan over the bare stream family has no single user key to project onto, so
+// it must fan out to every route rather than silently resolving to one.
+func TestStreamScanRouteRangeFansOutBareFamily(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte(store.StreamEntryPrefix)
+	routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(prefix, prefixScanEnd(prefix))
+	require.True(t, ok)
+	require.False(t, exact)
+	require.Nil(t, routeStart)
+	require.Nil(t, routeEnd)
+}
+
+// Stream scans are routed like wide-column scans but must not be dragged
+// through the wide-column canonicalization path: they have no legacy physical
+// form, so the point reads it performs would be pure overhead.
+func TestStreamScansAreNotWideColumnCanonicalizable(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("alice")
+	for _, start := range [][]byte{
+		store.StreamEntryScanPrefix(userKey),
+		store.StreamMetaKey(userKey),
+		[]byte(store.StreamEntryPrefix),
+	} {
+		require.False(t, redisWideColumnCanonicalizableScan(start))
+	}
+	for _, start := range [][]byte{
+		store.HashFieldScanPrefix(userKey),
+		store.ZSetScoreScanPrefix(userKey),
+		[]byte(store.HashFieldPrefix),
+	} {
+		require.True(t, redisWideColumnCanonicalizableScan(start))
+	}
+}

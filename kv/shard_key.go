@@ -50,7 +50,9 @@ var (
 	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
 	sqsRoutePrefixBytes              = []byte(sqsRoutePrefix)
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
-	redisWideColumnScanPrefixes      = [][]byte{
+	// Families whose physical keys can still appear in a scan result and need a
+	// point-read canonicalization.
+	redisWideColumnScanPrefixes = [][]byte{
 		[]byte(store.HashMetaDeltaPrefix),
 		[]byte(store.HashMetaPrefix),
 		[]byte(store.HashFieldPrefix),
@@ -61,6 +63,24 @@ var (
 		[]byte(store.ZSetMetaPrefix),
 		[]byte(store.ZSetMemberPrefix),
 		[]byte(store.ZSetScorePrefix),
+	}
+	redisStreamScanPrefixes = [][]byte{
+		[]byte(store.StreamMetaPrefix),
+		[]byte(store.StreamEntryPrefix),
+	}
+	// Every family here encodes its keys as prefix + 4-byte user-key length +
+	// user key + suffix, so one scan-range projection covers all of them.
+	// Streams belong in this list because normalizeRouteKey places stream writes
+	// on the logical user-key route: leaving their scans on the raw prefix range
+	// would send XRANGE/XREAD/XTRIM to a different group than the XADD that
+	// produced the entries whenever a split separates the two.
+	redisEncodedUserKeyScanPrefixes = append(
+		append([][]byte{}, redisWideColumnScanPrefixes...),
+		redisStreamScanPrefixes...,
+	)
+	dynamoTablePrefixWriteFamilies = [][]byte{
+		[]byte(DynamoItemPrefix),
+		[]byte(DynamoGSIPrefix),
 	}
 	redisListAuxiliaryScanPrefixes = [][]byte{
 		[]byte(store.ListMetaDeltaPrefix),
@@ -172,7 +192,7 @@ func redisWideColumnRouteKey(key []byte) []byte {
 }
 
 func redisWideColumnScanRouteParts(key []byte) (prefix []byte, userKey []byte, userPrefix []byte, owned bool, parsed bool) {
-	for _, prefix := range redisWideColumnScanPrefixes {
+	for _, prefix := range redisEncodedUserKeyScanPrefixes {
 		if !bytes.HasPrefix(key, prefix) {
 			continue
 		}
@@ -192,6 +212,21 @@ func redisWideColumnLegacyScanRouteRange(start []byte, end []byte) ([]byte, []by
 		return nil, nil, false
 	}
 	return start, end, true
+}
+
+// redisWideColumnCanonicalizableScan reports whether a scan range can return
+// legacy physical wide-column keys that the caller must replace with a
+// canonical point read. Streams share the encoded key layout for routing but
+// have no legacy physical form, so they are excluded: routing them through the
+// value-reading canonicalization path would cost one value read per entry and
+// change nothing.
+func redisWideColumnCanonicalizableScan(start []byte) bool {
+	for _, prefix := range redisWideColumnScanPrefixes {
+		if bytes.HasPrefix(start, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func redisWideColumnScanRouteRange(start []byte, end []byte) (routeStart []byte, routeEnd []byte, exact bool, ok bool) {
