@@ -14,6 +14,21 @@ const (
 	defaultMigrationPromoteMaxVersions     = 1024
 	defaultMigrationPromoteMaxBytes        = 4 << 20
 	defaultMigrationPromoteMaxScannedBytes = defaultMigrationPromoteMaxBytes * 4
+
+	// Hard server-side ceilings. The defaults above only apply to a request
+	// that leaves a bound unset, so without these an operator or migrator could
+	// ask one apply to load, re-encrypt, and commit an unbounded amount of
+	// staged data in a single Pebble batch -- synchronously, in every voter's
+	// apply loop. Clamping keeps the incremental, bounded promotion this API
+	// promises: the caller simply gets more rounds through the cursor, which
+	// PromoteVersionsResult already returns.
+	//
+	// The clamp is a pure function of the request and these constants, so every
+	// replica derives the same bounds from the same command and apply stays
+	// deterministic.
+	maxMigrationPromoteMaxVersions     = 8192
+	maxMigrationPromoteMaxBytes        = 32 << 20
+	maxMigrationPromoteMaxScannedBytes = maxMigrationPromoteMaxBytes * 4
 )
 
 var ErrMigrationPromoteApply = errors.New("migration promote: FSM apply failed; halting apply")
@@ -57,18 +72,19 @@ func (f *kvFSM) applyMigrationPromote(ctx context.Context, data []byte) any {
 }
 
 func migrationPromoteOptionsFromProto(req *pb.PromoteStagedVersionsRequest, appliedIndex uint64) store.PromoteVersionsOptions {
+	// Clamped in the int domain the request already decodes into, so no
+	// widening conversion is introduced here.
 	maxVersions := int(req.GetMaxVersions())
-	if maxVersions <= 0 {
+	switch {
+	case maxVersions <= 0:
 		maxVersions = defaultMigrationPromoteMaxVersions
+	case maxVersions > maxMigrationPromoteMaxVersions:
+		maxVersions = maxMigrationPromoteMaxVersions
 	}
-	maxBytes := req.GetMaxBytes()
-	if maxBytes == 0 {
-		maxBytes = defaultMigrationPromoteMaxBytes
-	}
-	maxScannedBytes := req.GetMaxScannedBytes()
-	if maxScannedBytes == 0 {
-		maxScannedBytes = defaultMigrationPromoteMaxScannedBytes
-	}
+	maxBytes := clampMigrationPromoteBound(
+		req.GetMaxBytes(), defaultMigrationPromoteMaxBytes, maxMigrationPromoteMaxBytes)
+	maxScannedBytes := clampMigrationPromoteBound(
+		req.GetMaxScannedBytes(), defaultMigrationPromoteMaxScannedBytes, maxMigrationPromoteMaxScannedBytes)
 	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
 	return store.PromoteVersionsOptions{
 		JobID:           req.GetJobId(),
@@ -81,6 +97,15 @@ func migrationPromoteOptionsFromProto(req *pb.PromoteStagedVersionsRequest, appl
 		MaxScannedBytes: maxScannedBytes,
 		TargetKey:       migrationPromoteTargetKey(req.GetJobId()),
 	}
+}
+
+// clampMigrationPromoteBound resolves one promotion bound: unset takes the
+// default, anything above the hard ceiling is clamped down to it.
+func clampMigrationPromoteBound(requested, fallback, ceiling uint64) uint64 {
+	if requested == 0 {
+		return fallback
+	}
+	return min(requested, ceiling)
 }
 
 func isMigrationPromoteOrdinaryApplyError(err error) bool {
