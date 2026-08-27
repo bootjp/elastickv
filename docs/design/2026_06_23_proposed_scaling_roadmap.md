@@ -64,7 +64,7 @@ again before merge or deployment.
 | Leader balance | `2026_06_11_implemented_leader_balance_scheduler.md` | PR #1012 merged | Implemented on `main`; data placement is separate |
 | Hotspot split M1 catalog and same-group split | `2026_02_18_implemented_hotspot_split_milestone1_pr.md` and `2026_02_18_partial_hotspot_shard_split.md` | The durable catalog, engine snapshots, split admin API, watcher, and M1 integration coverage landed as an earlier series; PR #999 (`a28afa25`, "Clean up hotspot split catalog path") is cleanup and status promotion only, not that implementation. The focused owner is the evidence of record — an auditor should start there, not from #999 | Implemented M1; parent design remains partial |
 | Hotspot split M2 migration | `2026_06_11_partial_hotspot_split_milestone2_migration.md` | PR #1096 merged the durable `SplitJob` catalog and codec substrate; PRs #1084, #1085, #1088, and #1090 open | The catalog substrate is on `main`; `StartSplitMigration`, the migrator FSM, fencing, cutover, promotion, and cleanup remain in flight, so this is not a complete migration plane |
-| Hotspot split M3 automation | `2026_06_11_partial_hotspot_split_milestone3_automation.md` | PRs #1097 and #1152 merged the detector core and the committed-window reader (`afec0597`, `distribution/autosplit/sampler_reader.go` plus the observe-only detector bridge); PR #1104 open | Partially implemented on `main`; M3-PR2b Top-K, the leadership watermark, and scheduler wiring remain open |
+| Hotspot split M3 automation | `2026_06_11_implemented_hotspot_split_milestone3_automation.md` | PRs #1097 and #1152 merged the detector core and the committed-window reader (`afec0597`, `distribution/autosplit/sampler_reader.go` plus the observe-only detector bridge); PR #1104 (`07c48af2`, "Complete standalone hotspot split automation") merged M3-PR2b Top-K evidence alignment, the leadership watermark, and M3-PR3 scheduler wiring, and renamed the focused owner to `*_implemented_*` | Standalone M3 is implemented on `main`. The focused owner's §8.1 leaves one slice open: M3-PR4 least-loaded `target_group_id` selection, which waits on the M2 migration plane |
 | Per-group HLC renewal and default-group allocator bridge | `2026_04_16_partial_centralized_tso.md` | PR #998 merged | Implemented bridge; dedicated TSO remains in flight |
 | Dedicated TSO group and durable routing | `2026_04_16_partial_centralized_tso.md` | PRs #1064, #1103, #1108, and #1150 merged the reservation, configuration scaffolding, and ceiling state machine (`0e85c822` added `kv/tso_fsm.go` with snapshot/restore of the physical ceiling); PR #1095 open | Group reservation/scaffolding and the ceiling FSM are on `main`; production group-0 issuance, TSO-leader redirect/routing, and operational exposure remain in flight |
 | Shared Pebble block cache | PR #1082 | PR #1082 merged | Implemented on `main`; cache sharing only, not all resource-pool work |
@@ -147,10 +147,12 @@ invented dependencies the rows do not state.
    stack owns `StartSplitMigration`, the migrator FSM, fencing, cutover,
    promotion, and cleanup. It is a root prerequisite for later cross-group range
    movement, not implemented by this roadmap.
-2. Hotspot split M3 automation slices whose inputs are already on `main` (§3):
-   detector core and committed-window reader landed; the remaining Top-K,
-   leadership watermark, and scheduler wiring may proceed, while scheduler
-   actions that move data wait on the M2 migration plane.
+2. Hotspot split M3 cross-group targeting (§3): standalone M3 is implemented.
+   The detector core, committed-window reader, Top-K evidence alignment,
+   leadership watermark, and scheduler wiring are all on `main`, so none of
+   them is work to schedule. What remains is M3-PR4 least-loaded
+   `target_group_id` selection, which is a scheduler action that moves data and
+   therefore waits on the M2 migration plane above.
 3. Dedicated TSO group-0 issuance, routing, and exposure (§3, §4.4 M1): proceed
    as its own open stack. It gates cross-shard transaction completion but not
    follower reads.
