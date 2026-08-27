@@ -4,7 +4,7 @@ Status: Proposed
 Document type: Roadmap ownership index
 Author: bootjp
 Date: 2026-06-23
-Last audited: 2026-08-28 against `origin/main` and GitHub pull requests
+Last audited: 2026-08-27 (UTC) against `origin/main` and GitHub pull requests
 
 ## 1. Scope
 
