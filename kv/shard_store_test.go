@@ -3148,3 +3148,77 @@ func TestLeaseReadGroupTargetsKeepsKeyResolutionForPointKeys(t *testing.T) {
 		"a key-resolved target must stay key-resolved through dedup")
 	require.Equal(t, []byte("!redis|str|k"), got[0].Key)
 }
+
+// A DynamoDB DEL_PREFIX cleanup must be checked against the same route its rows
+// use. Rows route through !ddb|route|table|<table>; if the prefix keeps
+// resolving through the raw !ddb|item| interval, a table whose route carries a
+// migration write floor is skipped entirely and the cleanup installs tombstones
+// below already-migrated versions, leaving the deleted generation's rows behind.
+func TestEnsurePrefixWriteAllowedRoutesDynamoPrefixThroughTableRoute(t *testing.T) {
+	t.Parallel()
+
+	const (
+		fencedTable = "orders"
+		freeTable   = "carts"
+	)
+	tableRoute := func(name string) []byte {
+		return dynamoRouteKey([]byte(DynamoItemPrefix + name + "|1|pk"))
+	}
+	fencedRoute := tableRoute(fencedTable)
+	require.NotNil(t, fencedRoute)
+
+	engine := distribution.NewEngine()
+	// Route 1 owns the raw !ddb|item| interval and carries no floor. Route 2
+	// owns the fenced table's logical route key and does.
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: fencedRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: fencedRoute, End: nil, GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	itemPrefix := []byte(DynamoItemPrefix + fencedTable + "|1|")
+	require.ErrorIs(t,
+		st.ensurePrefixWriteAllowed(itemPrefix, 50),
+		store.ErrWriteConflict,
+		"a cleanup at or below the table route's floor must be rejected",
+	)
+	require.NoError(t, st.ensurePrefixWriteAllowed(itemPrefix, 101))
+
+	gsiPrefix := []byte(DynamoGSIPrefix + fencedTable + "|1|")
+	require.ErrorIs(t, st.ensurePrefixWriteAllowed(gsiPrefix, 50), store.ErrWriteConflict)
+
+	// A table whose logical route has no floor is unaffected.
+	require.NotNil(t, tableRoute(freeTable))
+	require.NoError(t, st.ensurePrefixWriteAllowed([]byte(DynamoItemPrefix+freeTable+"|1|"), 50))
+}
+
+// A prefix that stops before the table terminator can still match several
+// tables, so it must keep fanning out rather than collapsing onto one route.
+func TestEnsurePrefixWriteAllowedFansOutPartialDynamoPrefixes(t *testing.T) {
+	t.Parallel()
+
+	fencedRoute := dynamoRouteKey([]byte(DynamoItemPrefix + "orders|1|pk"))
+	require.NotNil(t, fencedRoute)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: fencedRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: fencedRoute, End: nil, GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	for _, prefix := range [][]byte{
+		[]byte(DynamoItemPrefix),
+		[]byte(DynamoItemPrefix + "order"),
+		[]byte("!ddb|"),
+	} {
+		require.ErrorIs(t, st.ensurePrefixWriteAllowed(prefix, 50), store.ErrWriteConflict,
+			"prefix %q spans the fenced table and must still see its floor", prefix)
+	}
+}
