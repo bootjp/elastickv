@@ -379,3 +379,109 @@ func (t *forwardObserverTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.
 func (t *forwardObserverTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
 	return &kv.TransactionResponse{}, nil
 }
+
+// phaseDForwardAllocator is the receiver-side view of the dedicated TSO: it
+// allocates above a floor and rejects anything at or below it as pre-Phase-D.
+type phaseDForwardAllocator struct {
+	floor         uint64
+	next          uint64
+	validateCalls int
+}
+
+func (a *phaseDForwardAllocator) Next(context.Context) (uint64, error) {
+	a.next++
+	return a.floor + a.next, nil
+}
+
+func (a *phaseDForwardAllocator) NextAfter(_ context.Context, minTS uint64) (uint64, error) {
+	a.next++
+	ts := a.floor + a.next
+	if ts <= minTS {
+		ts = minTS + 1
+	}
+	return ts, nil
+}
+
+func (a *phaseDForwardAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	a.validateCalls++
+	if timestamp == 0 {
+		return kv.ErrTSOTimestampInvalid
+	}
+	if timestamp <= a.floor {
+		return errors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
+	}
+	return nil
+}
+
+func (a *phaseDForwardAllocator) PhaseDActive() bool   { return true }
+func (a *phaseDForwardAllocator) PhaseDRequired() bool { return true }
+
+// Internal.Forward preserves a raw Request.Ts somebody else stamped rather than
+// allocating one, and this receiver never reaches the coordinator's own
+// validation. Without a check here a forwarding peer or a direct caller could
+// persist a value group 0 has not allocated yet, and the TSO would later issue
+// the same timestamp.
+func TestStampRawTimestamps_ValidatesForwardedTimestampUnderPhaseD(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	stale := []*pb.Request{{Ts: 50, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	err := i.stampRawTimestamps(context.Background(), stale)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+	require.Equal(t, 1, alloc.validateCalls)
+
+	// A timestamp the allocator vouches for still passes through unchanged.
+	fresh := []*pb.Request{{Ts: 101, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	require.NoError(t, i.stampRawTimestamps(context.Background(), fresh))
+	require.Equal(t, uint64(101), fresh[0].Ts)
+
+	// An unset timestamp is allocated, not validated.
+	before := alloc.validateCalls
+	unset := []*pb.Request{{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	require.NoError(t, i.stampRawTimestamps(context.Background(), unset))
+	require.NotZero(t, unset[0].Ts)
+	require.Equal(t, before, alloc.validateCalls)
+}
+
+// The same for a commit timestamp that arrived already set in the transaction
+// meta: it is the timestamp every mutation in the batch is persisted under.
+func TestFillForwardedTxnCommitTS_ValidatesForwardedCommitTSUnderPhaseD(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	stamped := func(commitTS uint64) []*pb.Request {
+		return []*pb.Request{{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}}
+	}
+
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(50), 10)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(101), 10)
+	require.NoError(t, err)
+	require.Equal(t, uint64(101), commitTS)
+}
+
+// Without Phase D in force the receiver must keep accepting pre-stamped
+// timestamps exactly as before.
+func TestForwardedTimestamps_UnvalidatedWithoutPhaseD(t *testing.T) {
+	t.Parallel()
+
+	i := &Internal{}
+	reqs := []*pb.Request{{Ts: 7, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
+	require.Equal(t, uint64(7), reqs[0].Ts)
+}

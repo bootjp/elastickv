@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"fmt"
+	"github.com/cockroachdb/errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -521,4 +522,59 @@ func TestConfigureCoordinatorTSOCutoverPinsTimestampGroup(t *testing.T) {
 
 	require.False(t, coord.IsTimestampLeader(),
 		"with the dedicated allocator active, leadership must come from group 0 only")
+}
+
+// phaseDMainAllocator carries the Phase-D surfaces the forwarded-timestamp
+// validation depends on.
+type phaseDMainAllocator struct {
+	floor uint64
+	next  atomic.Uint64
+}
+
+func (a *phaseDMainAllocator) Next(context.Context) (uint64, error) {
+	return a.floor + a.next.Add(1), nil
+}
+
+func (a *phaseDMainAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	if timestamp <= a.floor {
+		return errors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
+	}
+	return nil
+}
+
+func (a *phaseDMainAllocator) PhaseDActive() bool   { return true }
+func (a *phaseDMainAllocator) PhaseDRequired() bool { return true }
+
+// Internal.Forward validates a pre-stamped persistence timestamp through the
+// allocator internalTimestampOptions installs. main.go hands the adapters a
+// startupGatedCoordinator, so if that wrapper stopped exposing the inner
+// allocator, the installed allocator would carry no Phase-D surfaces at all,
+// ValidateDurablePersistenceTimestamp would find nothing required, and the
+// receiver-side check would quietly pass everything in production while unit
+// tests that use an unwrapped allocator stayed green.
+func TestInternalTimestampOptionsPreservesPhaseDValidatorThroughStartupGate(t *testing.T) {
+	t.Parallel()
+
+	allocator := &phaseDMainAllocator{floor: 100}
+	inner := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
+	gated := startupGatedCoordinator{inner: inner, gate: &startupPublicKVGate{}}
+
+	installed, ok := kv.ConfiguredTimestampAllocatorThrough(gated)
+	require.True(t, ok)
+	require.Same(t, allocator, installed,
+		"the wrapper must expose the inner allocator, not itself")
+
+	_, isValidator := installed.(kv.DurableTimestampValidator)
+	require.True(t, isValidator, "installed allocator must carry the durable validator")
+	phaseD, isPhaseD := installed.(kv.TSOPhaseDState)
+	require.True(t, isPhaseD)
+	require.True(t, phaseD.PhaseDRequired())
+
+	// End to end through the wiring the server actually builds.
+	require.ErrorIs(t,
+		kv.ValidateDurablePersistenceTimestamp(context.Background(), installed, 50, "test"),
+		kv.ErrTSOTimestampPrePhaseD,
+	)
+	require.NoError(t,
+		kv.ValidateDurablePersistenceTimestamp(context.Background(), installed, 101, "test"))
 }

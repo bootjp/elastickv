@@ -215,6 +215,14 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 			continue
 		}
 		if r.Ts != 0 {
+			// Somebody else already stamped this write. It is the timestamp the
+			// value will be persisted under, and this receiver is downstream of
+			// the coordinator that would otherwise have validated it, so check
+			// it here rather than taking it on trust.
+			if err := kv.ValidateDurablePersistenceTimestamp(
+				ctx, i.tsAllocator, r.Ts, "stampRawTimestamps: forwarded raw ts"); err != nil {
+				return errors.WithStack(err)
+			}
 			continue
 		}
 		ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
@@ -290,6 +298,12 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		if err != nil {
 			return 0, err
 		}
+	} else if err := kv.ValidateDurablePersistenceTimestamp(
+		ctx, i.tsAllocator, commitTS, "fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
+		// A commit timestamp that arrived already set in the transaction meta
+		// is the timestamp every mutation in this batch is persisted under, and
+		// it never passed through the coordinator's own validation.
+		return 0, errors.WithStack(err)
 	}
 
 	for _, item := range metaMutations {

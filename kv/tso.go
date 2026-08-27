@@ -296,6 +296,36 @@ func TimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
 // resolving runtime-mode decorators. It is used by long-lived internal servers
 // that must keep a DynamicTimestampAllocator reference across later mode-file
 // reloads while still falling back to HLC when that allocator reports legacy.
+// ValidateDurablePersistenceTimestamp checks a caller-supplied persistence
+// timestamp against the Phase-D durable contract.
+//
+// It exists for receiver paths that accept a timestamp somebody else stamped --
+// Internal.Forward preserves a nonzero raw Request.Ts and an already-set
+// transaction-meta CommitTS rather than allocating one -- and that therefore
+// never reach ShardedCoordinator.prepareTxnCommitTimestamp, where the
+// coordinator validates the timestamps it is handed. Without this a forwarding
+// peer or a direct caller could persist AllocationFloor()+1 before group 0
+// allocates it, and the TSO would later issue the same value.
+//
+// A zero timestamp means "unset"; the caller allocates one and that path is
+// already validated. When Phase D is not in force this is a no-op.
+func ValidateDurablePersistenceTimestamp(ctx context.Context, alloc TimestampAllocator, timestamp uint64, label string) error {
+	if alloc == nil || timestamp == 0 {
+		return nil
+	}
+	validator, _, required, err := phaseDTimestampValidator(alloc)
+	if err != nil {
+		return errors.Wrap(err, label)
+	}
+	if !required {
+		return nil
+	}
+	if err := validator.ValidateDurableTimestamp(nonNilTSOContext(ctx), timestamp); err != nil {
+		return errors.Wrap(err, label)
+	}
+	return nil
+}
+
 func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
 	if provider, ok := coord.(ConfiguredTimestampAllocatorProvider); ok {
 		alloc := provider.ConfiguredTimestampAllocator()
