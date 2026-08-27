@@ -37,6 +37,11 @@ type bzpopminCandidate struct {
 const (
 	zsetOpsPerEntry        = 2
 	bzpopminScoreScanLimit = 2
+	// bzpopminIndexProofLimit bounds the key-only scan that proves the score
+	// index covers every member. Past it the proof would cost as much as the
+	// member scan it exists to avoid, so the probe reports "not authoritative"
+	// and lets the member comparison decide instead.
+	bzpopminIndexProofLimit = 4096
 )
 
 // buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
@@ -1220,11 +1225,19 @@ func zsetEntryLess(left, right redisZSetEntry) bool {
 }
 
 // bzpopminWideScoreCandidateAt probes the score index and reports whether that
-// probe is authoritative for BZPOPMIN. A visible base zset meta row means the
-// wide-column score index owns the ordering, except for same-score ties where
-// Pebble's MVCC suffix can sort prefix-related members after longer members.
-// Delta-only metadata is not enough: older member-only wide zsets can acquire
-// a metadata delta plus a partial score index through a later ZADD.
+// probe is authoritative for BZPOPMIN. The index owns the ordering only when it
+// holds a row for every member the metadata counts, and even then not for
+// same-score ties, where Pebble's MVCC suffix can sort prefix-related members
+// after longer members.
+//
+// A visible base zset meta row does not establish that coverage. Ordinary delta
+// compaction (DeltaCompactor.zsetHandler -> foldSimpleLenDeltas) folds ZADD
+// length deltas into a fresh base meta row and deletes the deltas; it never
+// creates the score rows an older member-only wide zset is missing. Taking that
+// compacted row as proof let BZPOPMIN return an indexed member ahead of a lower
+// unindexed one, and -- once the folded length reached one -- let
+// persistBZPopMinResult delete the whole logical key, unindexed members
+// included.
 func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, bool, error) {
 	meta, err := r.bzpopminMetaProbeAt(ctx, key, readTS)
 	if err != nil {
@@ -1237,12 +1250,66 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 		return nil, false, cockerrors.WithStack(err)
 	}
 	candidate, scoreTie := bzpopminScoreCandidateFromKVs(key, scoreKVs)
-	if candidate != nil {
-		scoreIndexAuthoritative := meta.baseExists || meta.truncated
-		candidate.isLast = scoreIndexAuthoritative && !meta.truncated && meta.len == 1
-		return candidate, scoreIndexAuthoritative && !scoreTie, nil
+	cover, err := r.zsetScoreIndexCoverageAt(ctx, key, readTS, meta)
+	if err != nil {
+		return nil, false, err
 	}
-	return nil, meta.baseExists && !meta.truncated && meta.len == 0, nil
+	if candidate != nil {
+		candidate.isLast = cover.complete && cover.members == 1
+		return candidate, cover.complete && !scoreTie, nil
+	}
+	// No score rows at all. Reporting the key empty is only safe when no member
+	// row is hiding outside the index either. baseExists stays in the condition
+	// so a legacy blob, which has no base meta row, still reaches
+	// bzpopminLegacyCandidateAt.
+	return nil, meta.baseExists && !meta.truncated && meta.len == 0 && cover.members == 0, nil
+}
+
+// zsetIndexCoverage is what the score index can be trusted for.
+type zsetIndexCoverage struct {
+	// complete is true when the score index holds a row for every member row.
+	complete bool
+	// members is the member-row count, capped just above the proof limit.
+	members int
+}
+
+// zsetScoreIndexCoverageAt compares the score index against the member rows.
+//
+// The member rows are the ground truth: every wide-zset writer emits one per
+// member, so a member without a score row is a member the index cannot order.
+// The metadata length is not usable for this. An older member-only wide zset
+// carries no base meta row, so its members are not counted at all; a later ZADD
+// adds a length delta, and delta compaction folds that delta into a base row
+// whose length counts only the members added since. Comparing the index against
+// that length compares two undercounts and concludes coverage that is not there.
+//
+// Both scans are key-only and bounded. Past the bound the proof would cost as
+// much as the member scan it exists to avoid, so coverage is reported false and
+// the caller's member comparison -- which is correct either way -- decides.
+func (r *RedisServer) zsetScoreIndexCoverageAt(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+	meta bzpopminMetaProbe,
+) (zsetIndexCoverage, error) {
+	memberPrefix := store.ZSetMemberScanPrefix(key)
+	memberKeys, err := r.store.ScanKeysAt(
+		ctx, memberPrefix, store.PrefixScanEnd(memberPrefix), bzpopminIndexProofLimit+1, readTS)
+	if err != nil {
+		return zsetIndexCoverage{}, cockerrors.WithStack(err)
+	}
+	cover := zsetIndexCoverage{members: len(memberKeys)}
+	if meta.truncated || len(memberKeys) == 0 || len(memberKeys) > bzpopminIndexProofLimit {
+		return cover, nil
+	}
+	scorePrefix := store.ZSetScoreScanPrefix(key)
+	scoreKeys, err := r.store.ScanKeysAt(
+		ctx, scorePrefix, store.PrefixScanEnd(scorePrefix), len(memberKeys), readTS)
+	if err != nil {
+		return zsetIndexCoverage{}, cockerrors.WithStack(err)
+	}
+	cover.complete = len(scoreKeys) >= len(memberKeys)
+	return cover, nil
 }
 
 type bzpopminMetaProbe struct {
