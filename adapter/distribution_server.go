@@ -235,16 +235,36 @@ func timestampActivationValues(req *pb.GetTimestampRequest) (bool, bool, error) 
 // authorizeTSOActivation checks an activation request against this node's own
 // rollout configuration before the one-way marker is committed.
 func (s *DistributionServer) authorizeTSOActivation(activateCutover, activatePhaseD bool) error {
-	if !activateCutover && !activatePhaseD {
-		return nil
-	}
 	if s.tsoActivationGate == nil {
 		return nil
 	}
-	if err := s.tsoActivationGate(activateCutover, activatePhaseD); err != nil {
+	// A marker another leader already committed is not an activation request.
+	// Following it is mandatory, and this node's own mode file can still name
+	// the preceding stage until its next reload -- refusing would answer every
+	// reservation with PermissionDenied, which isTransientTSORouteError does not
+	// retry, so allocation and writes would stall cluster-wide until the local
+	// configuration caught up.
+	cutover, phaseD := s.pendingTSOActivation(activateCutover, activatePhaseD)
+	if !cutover && !phaseD {
+		return nil
+	}
+	if err := s.tsoActivationGate(cutover, phaseD); err != nil {
 		return errors.WithStack(status.Error(codes.PermissionDenied, err.Error()))
 	}
 	return nil
+}
+
+// pendingTSOActivation narrows a request's activation flags to the markers that
+// are not durable yet.
+func (s *DistributionServer) pendingTSOActivation(activateCutover, activatePhaseD bool) (bool, bool) {
+	state, ok := s.timestampAllocator.(interface {
+		CutoverActive() bool
+		PhaseDActive() bool
+	})
+	if !ok {
+		return activateCutover, activatePhaseD
+	}
+	return activateCutover && !state.CutoverActive(), activatePhaseD && !state.PhaseDActive()
 }
 
 func (s *DistributionServer) legacyTimestampResponse(

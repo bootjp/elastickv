@@ -1439,6 +1439,8 @@ func (a *distributionTSOAllocator) PhaseDFloor() uint64 { return a.phaseDFloor }
 
 func (a *distributionTSOAllocator) AllocationFloor() uint64 { return a.base }
 
+func (a *distributionTSOAllocator) CutoverActive() bool { return a.cutover }
+
 func (a *distributionTSOAllocator) PhaseDActive() bool { return a.phaseD }
 
 func (a *distributionTSOAllocator) PhaseDRequired() bool { return a.phaseD }
@@ -1530,4 +1532,62 @@ func TestDistributionServerGetTimestamp_PermittedActivationProceeds(t *testing.T
 	})
 	require.NoError(t, err)
 	require.NotZero(t, resp.GetTimestamp())
+}
+
+// A marker another leader already committed is not an activation request. This
+// node's mode file can still name the preceding stage until its next reload, and
+// refusing would answer every reservation with PermissionDenied -- which
+// isTransientTSORouteError does not retry -- stalling allocation and writes
+// cluster-wide until the local configuration caught up.
+func TestDistributionServerGetTimestamp_AlreadyDurableMarkerSkipsTheGate(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true, cutover: true, phaseD: true}
+	var calls int
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(bool, bool) error {
+			calls++
+			return errors.New("local rollout has not reached this stage yet")
+		}),
+	)
+
+	resp, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+		ActivatePhaseD:  true,
+	})
+	require.NoError(t, err)
+	require.NotZero(t, resp.GetTimestamp())
+	require.Zero(t, calls, "both markers are already durable, so nothing is being activated")
+}
+
+// A marker that is not durable yet is still gated, and only the pending half is
+// presented to the gate.
+func TestDistributionServerGetTimestamp_GatesOnlyThePendingMarker(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true, cutover: true}
+	var seen [][2]bool
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(cutover, phaseD bool) error {
+			seen = append(seen, [2]bool{cutover, phaseD})
+			return errors.New("local rollout has not reached phase d")
+		}),
+	)
+
+	_, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+		ActivatePhaseD:  true,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Equal(t, [][2]bool{{false, true}}, seen,
+		"cutover is already durable; only phase D is still an activation")
 }
