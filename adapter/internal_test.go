@@ -630,3 +630,87 @@ func TestStampTxnTimestamps_ValidatesForwardedStartTS(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, uint64(50), legacy[0].Ts)
 }
+
+// commitSequential applies a batch in order, so a Phase_NONE request placed
+// ahead of a COMMIT carrying the same pre-Phase-D commit timestamp would persist
+// a one-phase write under the resolution's exemption. Every meta that carries
+// the timestamp has to be a resolution, not just the last one the loop saw.
+func TestFillForwardedTxnCommitTS_MixedPhaseBatchGetsNoLegacyExemption(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	meta := func(phase pb.Phase, commitTS uint64) *pb.Request {
+		return &pb.Request{
+			IsTxn: true,
+			Phase: phase,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}
+	}
+
+	// One-phase first, resolution second: the batch must not inherit the
+	// resolution's exemption.
+	mixed := []*pb.Request{meta(pb.Phase_NONE, 60), meta(pb.Phase_COMMIT, 60)}
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), mixed, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	// Resolutions only still pass.
+	resolutions := []*pb.Request{meta(pb.Phase_ABORT, 60), meta(pb.Phase_COMMIT, 60)}
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), resolutions, 50)
+	require.NoError(t, err)
+	require.Equal(t, uint64(60), commitTS)
+}
+
+// Internal.Forward stamps from the envelope's IsTxn while
+// TransactionManager.Commit applies from the inner requests' own IsTxn. A batch
+// that says raw outside and carries a transactional request inside took the raw
+// stamping path, which only looks at Request.Ts, and then went down the
+// transactional apply path, where the FSM takes the persistence timestamp from a
+// transaction meta nothing validated.
+func TestStampTimestamps_RejectsInconsistentForwardEnvelope(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	inner := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    150,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 5_000}),
+		}},
+	}
+
+	_, err := i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    false,
+		Requests: []*pb.Request{inner},
+	})
+	require.ErrorIs(t, err, kv.ErrInvalidRequest)
+
+	// The consistent envelope reaches the transactional path, where the meta's
+	// unissued commit timestamp is caught.
+	_, err = i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    true,
+		Requests: []*pb.Request{inner},
+	})
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+
+	// A genuinely raw envelope is unaffected.
+	_, err = i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn: false,
+		Requests: []*pb.Request{{
+			Ts:        150,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}},
+	})
+	require.NoError(t, err)
+}

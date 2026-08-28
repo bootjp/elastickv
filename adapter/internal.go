@@ -129,11 +129,33 @@ func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) 
 	if req == nil {
 		return 0, nil
 	}
-	if req.IsTxn {
+	// The envelope flag decides how the batch is stamped, but
+	// TransactionManager.Commit decides how it is applied from the inner
+	// requests' own IsTxn. A batch that says raw on the outside and carries a
+	// transactional request inside took the raw stamping path -- which only ever
+	// looks at Request.Ts -- and then went down the transactional apply path,
+	// where the FSM takes the persistence timestamp from a transaction meta
+	// nothing validated. Insist the two agree.
+	innerTxn := forwardedBatchIsTxn(req.Requests)
+	if req.IsTxn != innerTxn {
+		return 0, errors.WithStack(kv.ErrInvalidRequest)
+	}
+	if innerTxn {
 		return i.stampTxnTimestamps(ctx, req.Requests)
 	}
 
 	return 0, i.stampRawTimestamps(ctx, req.Requests)
+}
+
+// forwardedBatchIsTxn mirrors kv.TransactionManager's own test, so the stamping
+// mode and the apply mode are derived from the same evidence.
+func forwardedBatchIsTxn(reqs []*pb.Request) bool {
+	for _, r := range reqs {
+		if r != nil && r.IsTxn {
+			return true
+		}
+	}
+	return false
 }
 
 func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, error) {
@@ -344,7 +366,9 @@ func stampRequestMutationCommitTS(reqs []*pb.Request, commitTS uint64) error {
 func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, bool, error) {
 	metaMutations := make([]forwardedTxnMetaToUpdate, 0, len(reqs))
 	var commitTS uint64
-	var resolution bool
+	// Starts true and is narrowed by every meta that carries the timestamp; a
+	// batch with no such meta leaves commitTS zero, and the caller allocates.
+	resolution := true
 	prefix := []byte(kv.TxnMetaPrefix)
 	for _, r := range reqs {
 		m, ok := forwardedTxnMetaMutation(r, prefix)
@@ -359,8 +383,12 @@ func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, u
 			if commitTS != 0 && commitTS != meta.CommitTS {
 				return nil, 0, false, errors.WithStack(kv.ErrInvalidRequest)
 			}
+			// Every meta carrying the timestamp has to be a resolution, not
+			// just the last one seen: commitSequential applies the requests in
+			// order, so a Phase_NONE request batched ahead of a COMMIT would
+			// otherwise persist a one-phase write under the COMMIT's exemption.
+			resolution = resolution && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT)
 			commitTS = meta.CommitTS
-			resolution = r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT
 			continue
 		}
 		metaMutations = append(metaMutations, forwardedTxnMetaToUpdate{m: m, meta: meta})
