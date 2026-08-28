@@ -31,6 +31,11 @@ service RaftAdmin {
   rpc TransferLeadership(RaftAdminTransferLeadershipRequest) returns (RaftAdminTransferLeadershipResponse) {}
 }
 
+service S3BlobFetch {
+  rpc FetchChunkBlob(FetchChunkBlobRequest) returns (stream FetchChunkBlobResponse) {}
+  rpc PushChunkBlob(stream PushChunkBlobRequest) returns (PushChunkBlobResponse) {}
+}
+
 message RawPutRequest {
   bytes key = 1;
   bytes value = 2;
@@ -45,6 +50,7 @@ message RawGetRequest {
   bytes key = 1;
   uint64 ts = 3; // optional read timestamp; if zero, server uses current HLC
   uint64 group_id = 4; // optional explicit Raft group for non-range-owned keyspaces
+  uint64 read_route_version = 5; // stamped by server-side routing for migration read fences
 }
 
 message RawGetResponse {
@@ -64,11 +70,22 @@ message RawDeleteResponse {
 
 message RawLatestCommitTSRequest {
   bytes key = 1;
+  uint64 read_route_version = 2; // stamped by server-side routing for migration read fences
+  uint64 group_id = 3; // optional explicit Raft group for route-specific probes
+  // When non-zero, also answer whether the key has any committed version at or
+  // below this timestamp. Comparing only `ts` cannot tell a tombstone at or
+  // before the read timestamp apart from a newer version above it.
+  uint64 version_visible_at_ts = 4;
 }
 
 message RawLatestCommitTSResponse {
   uint64 ts = 1;
   bool exists = 2;
+  // Answer to version_visible_at_ts. Only meaningful when
+  // version_visible_supported is set; a server that predates the probe leaves
+  // both unset and the caller falls back to comparing `ts`.
+  bool version_visible = 3;
+  bool version_visible_supported = 4;
 }
 
 message RawScanAtRequest {
@@ -79,6 +96,10 @@ message RawScanAtRequest {
   bool reverse = 5;
   uint64 group_id = 6; // optional explicit Raft group for non-range-owned keyspaces
   bool keys_only = 7; // when true, response kv entries omit values
+  uint64 read_route_version = 8; // stamped by server-side routing for migration read fences
+  bytes route_start = 9; // route-key-normalized inclusive start, when already known
+  bytes route_end = 10; // route-key-normalized exclusive end; empty means +infinity
+  bool route_bounds_present = 11; // true when route_start/route_end were supplied, including ["", +infinity)
 }
 
 message RawKVPair {
@@ -184,9 +205,6 @@ enum RaftAdminState {
 message RaftAdminStatusRequest {}
 
 message RaftAdminStatusResponse {
-  reserved 12, 13;
-  reserved "configuration_index", "pending_conf_change";
-
   RaftAdminState state = 1;
   string leader_id = 2;
   string leader_address = 3;
@@ -198,6 +216,8 @@ message RaftAdminStatusResponse {
   uint64 fsm_pending = 9;
   uint64 num_peers = 10;
   int64 last_contact_nanos = 11;
+  uint64 configuration_index = 12;
+  bool pending_conf_change = 13;
 }
 
 message RaftAdminConfigurationRequest {}
@@ -262,6 +282,26 @@ message RaftAdminTransferLeadershipRequest {
 message TransferTarget {
   string target_id = 1;
   string target_address = 2;
+}
+
+message FetchChunkBlobRequest {
+  bytes content_sha256 = 1;
+}
+
+message FetchChunkBlobResponse {
+  bytes payload = 1;
+  bool eof = 2;
+}
+
+message PushChunkBlobRequest {
+  bytes content_sha256 = 1;
+  bytes payload = 2;
+  bool eof = 3;
+  uint64 commit_ts = 4;
+}
+
+message PushChunkBlobResponse {
+  bool durable = 1;
 }
 
 message RaftAdminTransferLeadershipResponse {}

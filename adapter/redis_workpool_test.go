@@ -91,7 +91,7 @@ func TestRedisHeavyCommandClassification(t *testing.T) {
 		cmdEval, cmdEvalSHA, cmdKeys, cmdScan, cmdHGetAll, cmdLRange,
 		cmdSMembers, cmdXRead, cmdXRange, cmdXRevRange, cmdZRange,
 		cmdZCount, cmdZPopMin, cmdZRangeByScore, cmdZRevRange, cmdZRevRangeByScore,
-		cmdZRem, cmdZRemRangeByRank, cmdZRemRangeByScore, cmdBZPopMin,
+		cmdZRem, cmdElasticKVZRemFast, cmdZRemRangeByRank, cmdZRemRangeByScore, cmdBZPopMin,
 		cmdDBSize,
 	} {
 		require.True(t, isRedisHeavyCommand(cmd), cmd)

@@ -24,6 +24,7 @@ const (
 	Admin_GetAdapterSummary_FullMethodName     = "/Admin/GetAdapterSummary"
 	Admin_GetKeyVizMatrix_FullMethodName       = "/Admin/GetKeyVizMatrix"
 	Admin_GetRouteDetail_FullMethodName        = "/Admin/GetRouteDetail"
+	Admin_SetAutoSplitEnabled_FullMethodName   = "/Admin/SetAutoSplitEnabled"
 	Admin_BeginBackup_FullMethodName           = "/Admin/BeginBackup"
 	Admin_RenewBackup_FullMethodName           = "/Admin/RenewBackup"
 	Admin_EndBackup_FullMethodName             = "/Admin/EndBackup"
@@ -37,9 +38,9 @@ const (
 //
 // For semantics around ctx use and closing/ending streaming RPCs, please refer to https://pkg.go.dev/google.golang.org/grpc/?tab=doc#ClientConn.NewStream.
 //
-// Admin is the node-side admin gRPC service consumed by
-// cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
-// metadata unless the node was started with --adminInsecureNoAuth.
+// Admin is the node-side operator gRPC service consumed by cmd/elastickv-admin.
+// Every method requires "authorization: Bearer <token>" metadata unless the
+// node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
 type AdminClient interface {
 	GetClusterOverview(ctx context.Context, in *GetClusterOverviewRequest, opts ...grpc.CallOption) (*GetClusterOverviewResponse, error)
@@ -47,6 +48,7 @@ type AdminClient interface {
 	GetAdapterSummary(ctx context.Context, in *GetAdapterSummaryRequest, opts ...grpc.CallOption) (*GetAdapterSummaryResponse, error)
 	GetKeyVizMatrix(ctx context.Context, in *GetKeyVizMatrixRequest, opts ...grpc.CallOption) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(ctx context.Context, in *GetRouteDetailRequest, opts ...grpc.CallOption) (*GetRouteDetailResponse, error)
+	SetAutoSplitEnabled(ctx context.Context, in *SetAutoSplitEnabledRequest, opts ...grpc.CallOption) (*SetAutoSplitEnabledResponse, error)
 	BeginBackup(ctx context.Context, in *BeginBackupRequest, opts ...grpc.CallOption) (*BeginBackupResponse, error)
 	RenewBackup(ctx context.Context, in *RenewBackupRequest, opts ...grpc.CallOption) (*RenewBackupResponse, error)
 	EndBackup(ctx context.Context, in *EndBackupRequest, opts ...grpc.CallOption) (*EndBackupResponse, error)
@@ -108,6 +110,16 @@ func (c *adminClient) GetRouteDetail(ctx context.Context, in *GetRouteDetailRequ
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetRouteDetailResponse)
 	err := c.cc.Invoke(ctx, Admin_GetRouteDetail_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) SetAutoSplitEnabled(ctx context.Context, in *SetAutoSplitEnabledRequest, opts ...grpc.CallOption) (*SetAutoSplitEnabledResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(SetAutoSplitEnabledResponse)
+	err := c.cc.Invoke(ctx, Admin_SetAutoSplitEnabled_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -206,9 +218,9 @@ type Admin_StreamEventsClient = grpc.ServerStreamingClient[StreamEventsEvent]
 // All implementations must embed UnimplementedAdminServer
 // for forward compatibility.
 //
-// Admin is the node-side admin gRPC service consumed by
-// cmd/elastickv-admin. Every method requires "authorization: Bearer <token>"
-// metadata unless the node was started with --adminInsecureNoAuth.
+// Admin is the node-side operator gRPC service consumed by cmd/elastickv-admin.
+// Every method requires "authorization: Bearer <token>" metadata unless the
+// node was started with --adminInsecureNoAuth.
 // See docs/admin_ui_key_visualizer_design.md §4 (Layer A).
 type AdminServer interface {
 	GetClusterOverview(context.Context, *GetClusterOverviewRequest) (*GetClusterOverviewResponse, error)
@@ -216,6 +228,7 @@ type AdminServer interface {
 	GetAdapterSummary(context.Context, *GetAdapterSummaryRequest) (*GetAdapterSummaryResponse, error)
 	GetKeyVizMatrix(context.Context, *GetKeyVizMatrixRequest) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(context.Context, *GetRouteDetailRequest) (*GetRouteDetailResponse, error)
+	SetAutoSplitEnabled(context.Context, *SetAutoSplitEnabledRequest) (*SetAutoSplitEnabledResponse, error)
 	BeginBackup(context.Context, *BeginBackupRequest) (*BeginBackupResponse, error)
 	RenewBackup(context.Context, *RenewBackupRequest) (*RenewBackupResponse, error)
 	EndBackup(context.Context, *EndBackupRequest) (*EndBackupResponse, error)
@@ -247,6 +260,9 @@ func (UnimplementedAdminServer) GetKeyVizMatrix(context.Context, *GetKeyVizMatri
 }
 func (UnimplementedAdminServer) GetRouteDetail(context.Context, *GetRouteDetailRequest) (*GetRouteDetailResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRouteDetail not implemented")
+}
+func (UnimplementedAdminServer) SetAutoSplitEnabled(context.Context, *SetAutoSplitEnabledRequest) (*SetAutoSplitEnabledResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method SetAutoSplitEnabled not implemented")
 }
 func (UnimplementedAdminServer) BeginBackup(context.Context, *BeginBackupRequest) (*BeginBackupResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method BeginBackup not implemented")
@@ -376,6 +392,24 @@ func _Admin_GetRouteDetail_Handler(srv interface{}, ctx context.Context, dec fun
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(AdminServer).GetRouteDetail(ctx, req.(*GetRouteDetailRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_SetAutoSplitEnabled_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(SetAutoSplitEnabledRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).SetAutoSplitEnabled(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_SetAutoSplitEnabled_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).SetAutoSplitEnabled(ctx, req.(*SetAutoSplitEnabledRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -518,6 +552,10 @@ var Admin_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetRouteDetail",
 			Handler:    _Admin_GetRouteDetail_Handler,
+		},
+		{
+			MethodName: "SetAutoSplitEnabled",
+			Handler:    _Admin_SetAutoSplitEnabled_Handler,
 		},
 		{
 			MethodName: "BeginBackup",

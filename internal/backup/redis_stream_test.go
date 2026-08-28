@@ -12,6 +12,7 @@ import (
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	gproto "google.golang.org/protobuf/proto"
 )
@@ -45,6 +46,17 @@ func encodeStreamMetaValue(length int64, lastMs, lastSeq uint64) []byte {
 	binary.BigEndian.PutUint64(v[0:8], uint64(length)) //nolint:gosec
 	binary.BigEndian.PutUint64(v[8:16], lastMs)
 	binary.BigEndian.PutUint64(v[16:24], lastSeq)
+	return v
+}
+
+func encodeStreamMetaValueWithTrimCursor(length int64, lastMs, lastSeq, expireAtMs, trimmedMs, trimmedSeq uint64) []byte {
+	v := make([]byte, store.StreamMetaTrimBinarySize)
+	binary.BigEndian.PutUint64(v[0:8], uint64(length)) //nolint:gosec
+	binary.BigEndian.PutUint64(v[8:16], lastMs)
+	binary.BigEndian.PutUint64(v[16:24], lastSeq)
+	binary.BigEndian.PutUint64(v[24:32], expireAtMs)
+	binary.BigEndian.PutUint64(v[32:40], trimmedMs)
+	binary.BigEndian.PutUint64(v[40:48], trimmedSeq)
 	return v
 }
 
@@ -513,6 +525,39 @@ func TestRedisDB_StreamRejectsMalformedMetaValueLength(t *testing.T) {
 	err := db.HandleStreamMeta(streamMetaKey("k"), []byte{0x00, 0x01, 0x02})
 	if !errors.Is(err, ErrRedisInvalidStreamMeta) {
 		t.Fatalf("err=%v want ErrRedisInvalidStreamMeta", err)
+	}
+}
+
+func TestRedisDB_StreamAcceptsTrimCursorMetaValue(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	meta := encodeStreamMetaValueWithTrimCursor(1, 200, 3, 123456, 100, 1)
+	if err := db.HandleStreamMeta(streamMetaKey("s"), meta); err != nil {
+		t.Fatalf("HandleStreamMeta: %v", err)
+	}
+	val := encodeStreamEntryValue(t, "200-3", []string{"k", "v"})
+	if err := db.HandleStreamEntry(streamEntryKey("s", 200, 3), val); err != nil {
+		t.Fatalf("HandleStreamEntry: %v", err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatalf("Finalize: %v", err)
+	}
+
+	_, outMeta := readStreamJSONL(t, filepath.Join(root, "redis", "db_0", "streams", "s.jsonl"))
+	if streamFloat(t, outMeta, "length") != 1 {
+		t.Fatalf("length = %v want 1", outMeta["length"])
+	}
+	if streamFloat(t, outMeta, "last_ms") != 200 {
+		t.Fatalf("last_ms = %v want 200", outMeta["last_ms"])
+	}
+	if streamFloat(t, outMeta, "last_seq") != 3 {
+		t.Fatalf("last_seq = %v want 3", outMeta["last_seq"])
+	}
+	if outMeta["expire_at_ms"] != float64(123456) {
+		t.Fatalf("expire_at_ms = %v want 123456", outMeta["expire_at_ms"])
+	}
+	if _, ok := outMeta["trimmed_ms"]; ok {
+		t.Fatalf("trim cursor must stay out of logical backup meta: %+v", outMeta)
 	}
 }
 

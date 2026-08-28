@@ -24,11 +24,15 @@ Implementation status:
   gated `EVAL`/`EVALSHA` path.
 - Shipped: Layer 3 per-peer Redis connection admission in
   `adapter/redis_peer_limiter.go`, wired through `RedisServer.Run` accept and
-  close hooks. Default cap is 8 per peer IP and is configurable via
-  `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` /
-  `WithRedisPerPeerConnectionLimit`. Redis leader-proxy clients use a small
-  explicit go-redis pool below that default cap, and Pub/Sub detached sockets
-  stay counted until their Pub/Sub cleanup path closes.
+  close hooks. Default cap is 512 per peer IP: two proxy replicas at 192
+  ElasticKV command-pool slots each, plus 128 dedicated headroom for Pub/Sub
+  and detached sockets. It is
+  configurable via `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` /
+  `WithRedisPerPeerConnectionLimit`. The redis-proxy deployment can raise the
+  cap explicitly on ElasticKV nodes before increasing the proxy's ElasticKV
+  pool size. Redis leader-proxy clients use a small explicit go-redis pool
+  below that default cap, and Pub/Sub detached sockets stay counted until their
+  Pub/Sub cleanup path closes.
 - Shipped: Layer 4 stream entry-per-key layout in `store/stream_helpers.go`,
   `adapter/redis_stream_cmds.go`, and `adapter/redis_compat_helpers.go`.
   XREAD now range-scans `!stream|entry|...` after the requested ID instead of
@@ -374,7 +378,7 @@ one check per accept, not per command.
 
 ### Recommended v1 shape
 
-**Per-peer-IP connection cap, default `N=8`, env-configurable,
+**Per-peer-IP connection cap, default `N=128`, env-configurable,
 enforced at accept.** On reject, accept the TCP connection, write a
 `-ERR max connections per client exceeded` RESP error, then close —
 so the client sees a protocol-level message instead of a bare

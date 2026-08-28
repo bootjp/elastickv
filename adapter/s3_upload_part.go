@@ -20,6 +20,12 @@ type s3UploadPartState struct {
 	readPin       *kv.ActiveTimestampToken
 }
 
+type s3UploadPartVersion struct {
+	startTS         uint64
+	commitTS        uint64
+	chunkRefVersion uint64
+}
+
 func (s *S3Server) prepareS3UploadPart(ctx context.Context, bucket, objectKey, uploadID, partNumberRaw string) (*s3UploadPartState, error) {
 	partNo, err := parseS3UploadPartNumber(partNumberRaw, bucket, objectKey)
 	if err != nil {
@@ -61,8 +67,8 @@ func parseS3UploadPartNumber(raw, bucket, objectKey string) (uint64, error) {
 	return uint64(partNumber), nil
 }
 
-func (s *S3Server) storeS3UploadPart(ctx context.Context, request *http.Request, streamBody *s3StreamingBody, state *s3UploadPartState, bucket, objectKey, uploadID, admissionProtocol string) (s3ChunkUploadResult, *s3PartDescriptor, *s3PutBodyError, error) {
-	startTS, commitTS, err := s.allocateS3UploadPartVersion(ctx)
+func (s *S3Server) storeS3UploadPart(ctx context.Context, request *http.Request, streamBody *s3StreamingBody, state *s3UploadPartState, bucket, objectKey, uploadID, admissionProtocol string, offloaded bool) (s3ChunkUploadResult, *s3PartDescriptor, *s3PutBodyError, error) {
+	version, err := s.allocateS3UploadPartVersionForMode(ctx, offloaded)
 	if err != nil {
 		return s3ChunkUploadResult{}, nil, nil, err
 	}
@@ -72,24 +78,60 @@ func (s *S3Server) storeS3UploadPart(ctx context.Context, request *http.Request,
 		admissionProtocol: admissionProtocol,
 		tooLargeMessage:   "part exceeds maximum allowed size",
 		chunkKey: func(chunkNo uint64) []byte {
-			return s3keys.VersionedBlobKey(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, chunkNo, commitTS)
+			return s3keys.VersionedBlobKey(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, chunkNo, version.commitTS)
 		},
+		chunkRefKey: func(chunkNo uint64) []byte {
+			return s3keys.VersionedChunkRefKey(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, chunkNo, version.chunkRefVersion)
+		},
+		offloaded: offloaded,
 	})
 	committed := false
 	defer func() {
 		if !committed && upload.ChunkCount > 0 {
-			s.cleanupPartBlobsAsync(bucket, state.meta.Generation, objectKey, uploadID, state.partNo, upload.ChunkCount, commitTS)
+			s.cleanupPartBlobsAsync(
+				bucket, state.meta.Generation, objectKey, uploadID,
+				state.partNo, upload.ChunkCount, version.commitTS, version.chunkRefVersion, upload.Offloaded,
+			)
 		}
 	}()
 	if err != nil || bodyErr != nil {
 		return upload, nil, bodyErr, err
 	}
-	previous, err := s.commitS3UploadPart(ctx, state, upload, bucket, objectKey, uploadID, startTS, commitTS)
+	version.commitTS, err = s.finalizeS3UploadPartCommitTS(ctx, version.startTS, version.commitTS, offloaded)
+	if err != nil {
+		return upload, nil, nil, err
+	}
+	previous, err := s.commitS3UploadPart(ctx, state, upload, bucket, objectKey, uploadID, version)
 	if err != nil {
 		return upload, nil, nil, err
 	}
 	committed = true
 	return upload, previous, nil, nil
+}
+
+func (s *S3Server) allocateS3UploadPartVersionForMode(ctx context.Context, offloaded bool) (s3UploadPartVersion, error) {
+	startTS, commitTS, err := s.allocateS3UploadPartVersion(ctx)
+	if err != nil {
+		return s3UploadPartVersion{}, err
+	}
+	version := s3UploadPartVersion{startTS: startTS, commitTS: commitTS, chunkRefVersion: startTS}
+	if offloaded {
+		// Reserve the initial commit timestamp as this attempt's immutable
+		// chunkref namespace before delaying the descriptor commit timestamp.
+		version.chunkRefVersion = commitTS
+		// The descriptor timestamp is allocated after blob durability so the
+		// chunkrefs cannot commit behind a side-channel write they make reachable.
+		version.commitTS = 0
+	}
+	return version, nil
+}
+
+func (s *S3Server) finalizeS3UploadPartCommitTS(ctx context.Context, startTS, commitTS uint64, offloaded bool) (uint64, error) {
+	if !offloaded {
+		return commitTS, nil
+	}
+	ts, err := s.nextTxnCommitTS(ctx, startTS)
+	return ts, errors.WithStack(err)
 }
 
 func (s *S3Server) allocateS3UploadPartVersion(ctx context.Context) (uint64, uint64, error) {
@@ -105,10 +147,11 @@ func (s *S3Server) allocateS3UploadPartVersion(ctx context.Context) (uint64, uin
 	return startTS, commitTS, nil
 }
 
-func (s *S3Server) commitS3UploadPart(ctx context.Context, state *s3UploadPartState, upload s3ChunkUploadResult, bucket, objectKey, uploadID string, startTS, commitTS uint64) (*s3PartDescriptor, error) {
+func (s *S3Server) commitS3UploadPart(ctx context.Context, state *s3UploadPartState, upload s3ChunkUploadResult, bucket, objectKey, uploadID string, version s3UploadPartVersion) (*s3PartDescriptor, error) {
 	descriptor := &s3PartDescriptor{
 		PartNo: state.partNo, ETag: upload.ETag, SizeBytes: upload.SizeBytes,
-		ChunkCount: upload.ChunkCount, ChunkSizes: upload.ChunkSizes, PartVersion: commitTS,
+		ChunkCount: upload.ChunkCount, ChunkSizes: upload.ChunkSizes, PartVersion: version.commitTS,
+		ChunkRefVersion: version.chunkRefVersion, Offloaded: upload.Offloaded,
 	}
 	body, err := json.Marshal(descriptor)
 	if err != nil {
@@ -119,9 +162,12 @@ func (s *S3Server) commitS3UploadPart(ctx context.Context, state *s3UploadPartSt
 	if err := s.verifyS3UploadStillExists(ctx, state.uploadMetaKey, bucket, objectKey); err != nil {
 		return nil, err
 	}
+	elems := make([]*kv.Elem[kv.OP], 0, len(upload.ChunkRefElems)+1)
+	elems = append(elems, upload.ChunkRefElems...)
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: partKey, Value: body})
 	_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		IsTxn: true, StartTS: startTS, CommitTS: commitTS,
-		Elems: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: partKey, Value: body}},
+		IsTxn: true, StartTS: version.startTS, CommitTS: version.commitTS,
+		Elems: elems,
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)

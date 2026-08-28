@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
@@ -169,6 +170,30 @@ func TestCoordinate_RunHLCLeaseRenewal_BlockerSuppressesProposals(t *testing.T) 
 		"HLC renewal should resume after startup rotation blocker clears")
 }
 
+func TestCoordinate_RenewHLCLeaseAsync_OverlapsSlowProposal(t *testing.T) {
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	entered := make(chan struct{}, 2)
+	release := make(chan struct{})
+	eng.proposeHook = func() {
+		entered <- struct{}{}
+		<-release
+	}
+	c := NewCoordinatorWithEngine(nil, eng)
+
+	c.renewHLCLeaseAsync(context.Background())
+	<-entered
+	c.renewHLCLeaseAsync(context.Background())
+	<-entered
+
+	require.Equal(t, int32(2), eng.proposeCalls.Load(),
+		"a slow renewal proposal must not monopolize newer ceiling proposals")
+	close(release)
+	require.Eventually(t, func() bool {
+		return c.lease.valid(monoclock.Now())
+	}, time.Second, 10*time.Millisecond,
+		"overlapped renewal goroutines should finish and warm the lease")
+}
+
 // TestShardedCoordinator_RenewHLCLease_WarmsGroupLease proves the
 // sharded renewal path warms the target group's lease on a successful
 // propose, so LeaseReadForKey on a key owned by that group serves from the
@@ -294,6 +319,115 @@ func TestShardedCoordinator_RenewHLCLeases_ProposesToEveryLedGroup(t *testing.T)
 		"the non-default group lease must be warmed by all-group renewal")
 }
 
+func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	coord.clock = clock
+
+	require.NoError(t, coord.RecoverHLCLease(context.Background()))
+	require.Equal(t, int32(1), eng1.proposeCalls.Load())
+	require.Equal(t, int32(1), eng2.proposeCalls.Load())
+
+	got, err := clock.NextFenced()
+	require.NoError(t, err)
+	require.NotZero(t, got)
+}
+
+func TestShardedCoordinator_RecoverHLCLease_SlowTargetDoesNotBlockSuccessfulPeer(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var enteredOnce sync.Once
+	var releaseOnce sync.Once
+	defer releaseOnce.Do(func() { close(release) })
+	eng1.proposeHook = func() {
+		enteredOnce.Do(func() { close(entered) })
+		<-release
+	}
+	eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+	coord.clock = clock
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- coord.RecoverHLCLease(context.Background())
+	}()
+
+	require.Eventually(t, func() bool {
+		select {
+		case <-entered:
+			return true
+		default:
+			return false
+		}
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		return eng2.proposeCalls.Load() == 1
+	}, time.Second, 10*time.Millisecond)
+	require.Eventually(t, func() bool {
+		_, err := clock.NextFenced()
+		return err == nil
+	}, time.Second, 10*time.Millisecond,
+		"a delayed first target must not stop another target from advancing the recovery ceiling")
+
+	select {
+	case err := <-errCh:
+		require.Failf(t, "RecoverHLCLease returned before all attempts finished", "err=%v", err)
+	default:
+	}
+	releaseOnce.Do(func() { close(release) })
+	require.NoError(t, <-errCh)
+}
+
+func TestShardedCoordinator_RecoverHLCLease_SucceedsWhenAnyTargetAdvancesCeiling(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		failFirst  bool
+		failSecond bool
+	}{
+		{name: "first fails then second advances", failFirst: true},
+		{name: "first advances then second fails", failSecond: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			clock := NewHLC()
+			clock.SetPhysicalCeiling(time.Now().Add(-time.Millisecond).UnixMilli())
+			eng1 := newShardedLeaseEngine(100)
+			eng2 := newShardedLeaseEngine(200)
+			eng1.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+			eng2.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+			if tc.failFirst {
+				eng1.proposeErr = errors.New("group 1 unavailable")
+			}
+			if tc.failSecond {
+				eng2.proposeErr = errors.New("group 2 unavailable")
+			}
+			coord := mustShardedLeaseCoord(t, eng1, eng2)
+			coord.clock = clock
+
+			require.NoError(t, coord.RecoverHLCLease(context.Background()))
+			require.Equal(t, int32(1), eng1.proposeCalls.Load())
+			require.Equal(t, int32(1), eng2.proposeCalls.Load())
+
+			got, err := clock.NextFenced()
+			require.NoError(t, err)
+			require.NotZero(t, got)
+		})
+	}
+}
+
 func TestShardedCoordinator_RenewHLCLeases_SkipsNonLeaders(t *testing.T) {
 	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
@@ -333,14 +467,54 @@ func TestShardedCoordinator_RenewHLCLeases_SlowGroupDoesNotBlockPeers(t *testing
 	requireRenewalDone(t, done)
 }
 
-func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
+func TestShardedCoordinator_RenewHLCLeases_UsesProposalTimeoutBeyondCadence(t *testing.T) {
+	t.Parallel()
 	eng1 := newShardedLeaseEngine(100)
 	eng2 := newShardedLeaseEngine(200)
-	entered := make(chan struct{})
+	deadlineRemaining := make(chan time.Duration, 1)
+	eng1.proposeCtxHook = func(ctx context.Context) {
+		deadline, ok := ctx.Deadline()
+		if !ok {
+			deadlineRemaining <- 0
+			return
+		}
+		deadlineRemaining <- time.Until(deadline)
+	}
+	coord := mustShardedLeaseCoord(t, eng1, eng2)
+
+	done := coord.renewHLCLeases(context.Background())
+	requireRenewalDone(t, done)
+
+	select {
+	case remaining := <-deadlineRemaining:
+		require.Greater(t, remaining, hlcRenewalInterval,
+			"renewal proposals need a timeout longer than the cadence under load")
+		require.LessOrEqual(t, remaining, hlcRenewalProposalTimeout)
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for captured renewal deadline")
+	}
+}
+
+func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
+	t.Parallel()
+	window := time.Duration(hlcPhysicalWindowMs) * time.Millisecond
+	require.Less(t, hlcRenewalInterval+hlcRenewalProposalTimeout, window)
+	require.Less(t, uint64(hlcPhysicalWindowMs), defaultTxnLockTTLms)
+}
+
+func TestHLCLeaseRenewalCadencePreservesLogicalCapacity(t *testing.T) {
+	t.Parallel()
+	require.LessOrEqual(t, hlcRenewalInterval, time.Second,
+		"each renewal exposes one 16-bit logical window; a longer cadence lowers timestamp allocation capacity")
+}
+
+func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroupWithoutBlockingPeers(t *testing.T) {
+	eng1 := newShardedLeaseEngine(100)
+	eng2 := newShardedLeaseEngine(200)
+	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
-	var enteredOnce sync.Once
 	eng1.proposeHook = func() {
-		enteredOnce.Do(func() { close(entered) })
+		entered <- struct{}{}
 		<-release
 	}
 	coord := mustShardedLeaseCoord(t, eng1, eng2)
@@ -348,15 +522,23 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	first := coord.renewHLCLeases(context.Background())
 	<-entered
 	require.Eventually(t, func() bool {
-		return eng2.proposeCalls.Load() == 1 && !hlcRenewalInFlight(coord, 2)
+		return eng2.proposeCalls.Load() == 1
 	}, time.Second, 10*time.Millisecond,
 		"precondition: the first round must fully finish for the non-blocked group")
 
 	second := coord.renewHLCLeases(context.Background())
+	require.Eventually(t, func() bool {
+		return eng2.proposeCalls.Load() == 2
+	}, time.Second, 10*time.Millisecond,
+		"other led groups must still renew while one group is in flight")
 	requireRenewalDone(t, second)
-
+	select {
+	case <-entered:
+		t.Fatal("slow in-flight group launched an overlapping renewal")
+	default:
+	}
 	require.Equal(t, int32(1), eng1.proposeCalls.Load(),
-		"an in-flight group must not receive a second concurrent renewal proposal")
+		"a slow in-flight group should be skipped until the previous renewal finishes")
 	require.Equal(t, int32(2), eng2.proposeCalls.Load(),
 		"other led groups must still renew while one group is in flight")
 
@@ -366,14 +548,28 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroup(t *testing.T) {
 	third := coord.renewHLCLeases(context.Background())
 	requireRenewalDone(t, third)
 	require.Equal(t, int32(2), eng1.proposeCalls.Load(),
-		"the group must be eligible for renewal after the in-flight proposal finishes")
+		"the group remains eligible for later renewal after the previous proposal finishes")
+	require.Equal(t, int32(3), eng2.proposeCalls.Load(),
+		"other groups remain independently eligible on later renewal ticks")
 }
 
-func hlcRenewalInFlight(coord *ShardedCoordinator, gid uint64) bool {
-	coord.hlcRenewalMu.Lock()
-	defer coord.hlcRenewalMu.Unlock()
-	_, ok := coord.hlcRenewalInFlight[gid]
-	return ok
+func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testing.T) {
+	t.Parallel()
+	eng0 := newShardedLeaseEngine(300)
+	eng1 := newShardedLeaseEngine(100)
+	distEngine := distribution.NewEngine()
+	distEngine.UpdateRoute([]byte(""), nil, 1)
+	coord := NewShardedCoordinator(distEngine, map[uint64]*ShardGroup{
+		0: {Engine: eng0},
+		1: {Engine: eng1},
+	}, 1, NewHLC(), nil).WithTimestampGroup(0)
+
+	err := coord.ProposeHLCLease(context.Background(), time.Now().UnixMilli()+hlcPhysicalWindowMs)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), eng0.proposeCalls.Load())
+	require.Equal(t, int32(0), eng1.proposeCalls.Load())
+	require.True(t, coord.groups[0].lease.valid(monoclock.Now()),
+		"a synchronous timestamp renewal must warm the timestamp group's lease")
 }
 
 func requireRenewalDone(t *testing.T, done <-chan struct{}) {

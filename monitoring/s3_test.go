@@ -50,6 +50,9 @@ func TestS3BlobOffloadMetricsObserve(t *testing.T) {
 	metrics.ObserveS3ChunkBlobReplicationDegraded()
 	metrics.ObserveS3ChunkBlobSHAMismatch()
 	metrics.ObserveS3ChunkBlobUnrecoverable()
+	metrics.ObserveS3ChunkBlobBackfillQueueDepth(7)
+	metrics.ObserveS3ChunkBlobBackfillResult("fetched")
+	metrics.ObserveS3ChunkBlobBackfillResult("bogus")
 
 	err := testutil.GatherAndCompare(
 		reg,
@@ -67,11 +70,20 @@ elastickv_s3_chunkblob_sha_mismatch_total 1
 # HELP elastickv_s3_chunkblob_unrecoverable_total Total S3 chunkblob reads that could not recover the referenced content from any available peer.
 # TYPE elastickv_s3_chunkblob_unrecoverable_total counter
 elastickv_s3_chunkblob_unrecoverable_total 1
+# HELP elastickv_s3_chunkblob_backfill_queue_depth Current number of S3 chunkrefs queued for asynchronous local blob backfill.
+# TYPE elastickv_s3_chunkblob_backfill_queue_depth gauge
+elastickv_s3_chunkblob_backfill_queue_depth 7
+# HELP elastickv_s3_chunkblob_backfill_results_total Total S3 chunkblob backfill outcomes.
+# TYPE elastickv_s3_chunkblob_backfill_results_total counter
+elastickv_s3_chunkblob_backfill_results_total{result="fetched"} 1
+elastickv_s3_chunkblob_backfill_results_total{result="unknown"} 1
 `),
 		"elastickv_s3_blob_offload_write_decisions_total",
 		"elastickv_s3_chunkblob_replication_degraded_total",
 		"elastickv_s3_chunkblob_sha_mismatch_total",
 		"elastickv_s3_chunkblob_unrecoverable_total",
+		"elastickv_s3_chunkblob_backfill_queue_depth",
+		"elastickv_s3_chunkblob_backfill_results_total",
 	)
 	require.NoError(t, err)
 }

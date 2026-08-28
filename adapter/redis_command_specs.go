@@ -45,6 +45,10 @@ var redisCommandSpecs = []redisCommandSpec{
 	{Constant: cmdDBSize, Name: "dbsize", Arity: 1, Flags: []string{redisCmdFlagReadonly}, FirstKey: 0, LastKey: 0, Step: 0},
 	{Constant: cmdDel, Name: "del", Arity: -2, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: -1, Step: 1},
 	{Constant: cmdDiscard, Name: "discard", Arity: 1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
+	// ELASTICKV.ZREMFAST is a secondary-replay-only ZREM variant for the
+	// Redis proxy. It skips the full wrong-type scan when the expected zset row
+	// is absent so stale BZPOP replays do not turn into wide collection probes.
+	{Constant: cmdElasticKVZRemFast, Name: "elastickv.zremfast", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 1, LastKey: 1, Step: 1},
 	{Constant: cmdEval, Name: "eval", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 0, LastKey: 0, Step: 0},
 	{Constant: cmdEvalSHA, Name: "evalsha", Arity: -3, Flags: []string{redisCmdFlagWrite}, FirstKey: 0, LastKey: 0, Step: 0},
 	{Constant: cmdExec, Name: "exec", Arity: 1, Flags: []string{redisCmdFlagAdmin}, FirstKey: 0, LastKey: 0, Step: 0},
@@ -254,6 +258,7 @@ func (r *RedisServer) buildRouteMap() map[string]func(redcon.Conn, redcon.Comman
 		cmdZRevRangeByScore: r.zrevrangebyscore,
 		cmdZScore:           r.zscore,
 	}
+	handlers[cmdElasticKVZRemFast] = r.elasticKVZRemFast
 	m := make(map[string]func(redcon.Conn, redcon.Command), len(redisCommandSpecs))
 	for _, s := range redisCommandSpecs {
 		h, ok := handlers[s.Constant]

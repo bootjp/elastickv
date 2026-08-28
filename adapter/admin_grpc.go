@@ -35,6 +35,13 @@ type KeyVizSampler interface {
 	Snapshot(from, to time.Time) []keyviz.MatrixColumn
 }
 
+// AutoSplitRuntime is the atomic runtime control exposed by the authenticated
+// Admin service.
+type AutoSplitRuntime interface {
+	Enabled() bool
+	SetEnabled(enabled bool)
+}
+
 // AdminGroup exposes per-Raft-group state to the Admin service. It is a narrow
 // subset of raftengine.Engine so tests can supply an in-memory fake without
 // standing up a real Raft cluster. Configuration is polled on each
@@ -129,7 +136,8 @@ type AdminServer struct {
 	// Nil means keyviz is disabled — the RPC returns Unavailable.
 	// Guarded by groupsMu (same lock as groups/now) so RegisterSampler
 	// pairs atomically with concurrent RPC reads.
-	sampler KeyVizSampler
+	sampler          KeyVizSampler
+	autoSplitRuntime AutoSplitRuntime
 
 	nodeVersion               string
 	leaderVersionProbe        LeaderVersionProbe
@@ -225,6 +233,32 @@ func (s *AdminServer) SetCapability(name string, enabled bool) {
 	s.groupsMu.Lock()
 	s.capabilities[name] = enabled
 	s.groupsMu.Unlock()
+}
+
+// RegisterAutoSplitRuntime wires the process-local automatic split switch.
+func (s *AdminServer) RegisterAutoSplitRuntime(runtime AutoSplitRuntime) {
+	s.groupsMu.Lock()
+	s.autoSplitRuntime = runtime
+	s.groupsMu.Unlock()
+}
+
+// SetAutoSplitEnabled atomically changes whether the scheduler may issue new
+// SplitRange calls. Detector observation continues while disabled.
+func (s *AdminServer) SetAutoSplitEnabled(
+	_ context.Context,
+	req *pb.SetAutoSplitEnabledRequest,
+) (*pb.SetAutoSplitEnabledResponse, error) {
+	if req == nil {
+		return nil, grpcStatusError(codes.InvalidArgument, "request is required")
+	}
+	s.groupsMu.RLock()
+	runtime := s.autoSplitRuntime
+	s.groupsMu.RUnlock()
+	if runtime == nil {
+		return nil, grpcStatusError(codes.Unavailable, "automatic splitting is not configured")
+	}
+	runtime.SetEnabled(req.GetEnabled())
+	return &pb.SetAutoSplitEnabledResponse{Enabled: runtime.Enabled()}, nil
 }
 
 // GetClusterOverview returns the local node identity, the current member
@@ -722,7 +756,11 @@ func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
 // package-qualify the service name) does not silently bypass the auth gate.
 var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 
-func adminAuthenticatedMethod(fullMethod string) bool {
+// adminTokenProtectedMethod covers the Admin service plus the two Internal
+// RPCs that carry admin work between nodes: a forwarded admin proposal and a
+// forwarded lease read are the same authority as a direct Admin call, so they
+// must present the same token.
+func adminTokenProtectedMethod(fullMethod string) bool {
 	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
 		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName ||
 		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName
@@ -733,6 +771,22 @@ func adminAuthenticatedMethod(fullMethod string) bool {
 // empty token disables enforcement; callers should pair that mode with a
 // --adminInsecureNoAuth flag so operators knowingly opt in.
 func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+	return bearerTokenAuth(token, adminTokenProtectedMethod, "admin")
+}
+
+// S3BlobPeerTokenAuth protects the peer-only blob transport with a credential
+// distinct from the read-only Admin token.
+func S3BlobPeerTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+	return bearerTokenAuth(token, func(fullMethod string) bool {
+		return strings.HasPrefix(fullMethod, "/"+pb.S3BlobFetch_ServiceDesc.ServiceName+"/")
+	}, "S3 blob peer")
+}
+
+func bearerTokenAuth(
+	token string,
+	protected func(string) bool,
+	credentialName string,
+) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	if token == "" {
 		return nil, nil
 	}
@@ -751,7 +805,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 			return status.Error(codes.Unauthenticated, "authorization is not a bearer token")
 		}
 		if subtle.ConstantTimeCompare([]byte(got), expected) != 1 {
-			return status.Error(codes.Unauthenticated, "invalid admin token")
+			return status.Errorf(codes.Unauthenticated, "invalid %s token", credentialName)
 		}
 		return nil
 	}
@@ -761,7 +815,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.UnaryServerInfo,
 		handler grpc.UnaryHandler,
 	) (any, error) {
-		if !adminAuthenticatedMethod(info.FullMethod) {
+		if !protected(info.FullMethod) {
 			return handler(ctx, req)
 		}
 		if err := check(ctx); err != nil {
@@ -775,7 +829,7 @@ func AdminTokenAuth(token string) (grpc.UnaryServerInterceptor, grpc.StreamServe
 		info *grpc.StreamServerInfo,
 		handler grpc.StreamHandler,
 	) error {
-		if !adminAuthenticatedMethod(info.FullMethod) {
+		if !protected(info.FullMethod) {
 			return handler(srv, ss)
 		}
 		if err := check(ss.Context()); err != nil {

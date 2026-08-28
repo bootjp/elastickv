@@ -520,7 +520,8 @@
                                   :redis-port   (or (:redis-port opts) 6379)
                                   :dynamo-port  node->port
                                   :raft-groups  (:raft-groups opts)
-                                  :shard-ranges (:shard-ranges opts)}))
+                                  :shard-ranges (:shard-ranges opts)
+                                  :server-env   (:server-env opts)}))
          rate         (double (or (:rate opts) 5))
          time-limit   (or (:time-limit opts) 30)
          faults       (if local?
@@ -564,7 +565,7 @@
                                      (:ssh opts))
              :remote          control/ssh
              :nemesis         (or (:nemesis nemesis-p) nemesis/noop)
-             :final-generator nil
+             :final-generator (when nemesis-p (:final-generator nemesis-p))
              :concurrency     (or (:concurrency opts) 5)
              :generator       (->> (:generator workload)
                                    (gen/nemesis nemesis-gen)
@@ -604,7 +605,12 @@
     :default false]
    [nil "--route-shuffle-interval SECONDS" "Seconds between route-shuffle nemesis operations."
     :default 30
-    :parse-fn #(Double/parseDouble %)]])
+    :parse-fn #(Double/parseDouble %)]
+   [nil "--raft-snapshot-count N" "FSM snapshot threshold for transport soak runs."
+    :default nil
+    :parse-fn #(Long/parseLong %)]
+   [nil "--raft-dispatcher-lanes" "Enable the four-lane Raft dispatcher during the soak."
+    :default false]])
 
 (defn- prepare-dynamo-opts
   "Transform parsed CLI options into the map expected by
@@ -619,7 +625,12 @@
       :dynamo-host (:host options)
       :node->port  node->port
       :dynamo-port (:dynamo-port options)
-      :redis-port  (:redis-port options))))
+      :redis-port  (:redis-port options)
+      :server-env  (cond-> {"ELASTICKV_RAFT_SEND_STREAM" "true"}
+                     (:raft-snapshot-count options)
+                     (assoc "ELASTICKV_RAFT_SNAPSHOT_COUNT" (str (:raft-snapshot-count options)))
+                     (:raft-dispatcher-lanes options)
+                     (assoc "ELASTICKV_RAFT_DISPATCHER_LANES" "true")))))
 
 (defn -main
   [& args]

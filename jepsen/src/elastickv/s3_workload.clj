@@ -134,6 +134,17 @@
 
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
 
+(defn s3-register-checker
+  "Builds the per-key S3 register checker. Knossos's default competition
+   algorithm races its linear and WGL analyzers and returns the first verdict."
+  []
+  (checker/compose
+    ;; Histories with indeterminate S3 writes can make either search strategy
+    ;; pathological. Racing both keeps the full verdict while avoiding a
+    ;; timeout when only one analyzer encounters a large search space.
+    {:linear   (checker/linearizable {:model (model/register)})
+     :timeline (timeline/html)}))
+
 (defn s3-register-workload
   "Builds a linearizable-register workload targeting the S3 endpoint.
    Each independent key is an S3 object; the checker verifies linearizability
@@ -159,11 +170,7 @@
                                   (gen/repeat {:f :read})])
                          (gen/limit max-writes))))
      :checker   (independent/checker
-                  (checker/compose
-                    {:linear   (checker/linearizable
-                                 {:model     (model/register)
-                                  :algorithm :linear})
-                     :timeline (timeline/html)}))}))
+                  (s3-register-checker))}))
 
 (defn elastickv-s3-test
   "Builds a Jepsen test map that drives elastickv's S3-compatible API
