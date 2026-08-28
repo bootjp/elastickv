@@ -281,6 +281,63 @@ func TestShardStoreS3BucketAuxiliaryScanUsesPromotedOwner(t *testing.T) {
 	}, reverse)
 }
 
+func TestShardStoreS3BucketAuxiliaryScanPreservesLegacyRawOnlyRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		prefix   string
+		keyFor   func(string) []byte
+		value    []byte
+		rawValue []byte
+	}{
+		{name: "bucket meta", prefix: s3keys.BucketMetaPrefix, keyFor: s3keys.BucketMetaKey, value: []byte("legacy-meta"), rawValue: []byte("raw-meta")},
+		{name: "bucket generation", prefix: s3keys.BucketGenerationPrefix, keyFor: s3keys.BucketGenerationKey, value: []byte("legacy-generation"), rawValue: []byte("raw-generation")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const (
+				migratedBucket = "bucket-a"
+				otherBucket    = "bucket-z"
+			)
+			engine := distribution.NewEngine()
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 1,
+				Routes:  s3BucketAuxiliaryPromotedRoutes(),
+			}))
+			groups := map[uint64]*ShardGroup{
+				1: {Store: store.NewMVCCStore()},
+				2: {Store: store.NewMVCCStore()},
+			}
+			st := NewShardStore(engine, groups)
+			migratedKey := tc.keyFor(migratedBucket)
+			otherKey := tc.keyFor(otherBucket)
+			require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, tc.value, 10, 0))
+			require.NoError(t, groups[1].Store.PutAt(ctx, otherKey, tc.rawValue, 15, 0))
+
+			start := []byte(tc.prefix)
+			end := prefixScanEnd(start)
+			kvs, err := st.ScanAt(ctx, start, end, 10, 30)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{
+				{Key: migratedKey, Value: tc.value},
+				{Key: otherKey, Value: tc.rawValue},
+			}, kvs)
+
+			reverse, err := st.ReverseScanAt(ctx, start, end, 10, 30)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{
+				{Key: otherKey, Value: tc.rawValue},
+				{Key: migratedKey, Value: tc.value},
+			}, reverse)
+
+			exact, err := st.ScanAt(ctx, migratedKey, prefixScanEnd(migratedKey), 10, 30)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{{Key: migratedKey, Value: tc.value}}, exact)
+		})
+	}
+}
+
 func TestShardStoreRouteBoundedS3BucketAuxiliaryScanKeepsStagedRows(t *testing.T) {
 	t.Parallel()
 

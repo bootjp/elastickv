@@ -2245,7 +2245,11 @@ func (s *ShardStore) scanRouteAtDirectionWithS3AuxiliaryOwnerFilter(
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, filterS3AuxiliaryKVsOwnedByRoute(page, routes, route)...)
+		filtered, err := s.filterS3AuxiliaryKVsOwnedByRoute(ctx, page, routes, route, ts)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, filtered...)
 		if len(out) >= limit {
 			clear(out[limit:])
 			return out[:limit], nil
@@ -2266,7 +2270,13 @@ func (s *ShardStore) scanRouteAtDirectionWithS3AuxiliaryOwnerFilter(
 	return out, nil
 }
 
-func filterS3AuxiliaryKVsOwnedByRoute(kvs []*store.KVPair, routes []distribution.Route, route distribution.Route) []*store.KVPair {
+func (s *ShardStore) filterS3AuxiliaryKVsOwnedByRoute(
+	ctx context.Context,
+	kvs []*store.KVPair,
+	routes []distribution.Route,
+	route distribution.Route,
+	ts uint64,
+) ([]*store.KVPair, error) {
 	out := make([]*store.KVPair, 0, len(kvs))
 	for _, kvp := range kvs {
 		if kvp == nil {
@@ -2274,11 +2284,43 @@ func filterS3AuxiliaryKVsOwnedByRoute(kvs []*store.KVPair, routes []distribution
 		}
 		owner, auxiliary := s3BucketAuxiliaryOwnerRoute(kvp.Key, routes)
 		if auxiliary && !routeMatchesS3BucketAuxiliaryOwner(route, owner) {
-			continue
+			covered, err := s.s3BucketAuxiliaryOwnerHasVersionAt(ctx, owner, kvp.Key, ts)
+			if err != nil {
+				return nil, err
+			}
+			if covered {
+				continue
+			}
 		}
 		out = append(out, kvp)
 	}
-	return out
+	return out, nil
+}
+
+func (s *ShardStore) s3BucketAuxiliaryOwnerHasVersionAt(
+	ctx context.Context,
+	owner distribution.Route,
+	key []byte,
+	ts uint64,
+) (bool, error) {
+	g, ok := s.groupForID(owner.GroupID)
+	if !ok || g == nil || g.Store == nil {
+		return false, nil
+	}
+	live, liveOK, err := latestMVCCVersionAt(ctx, g.Store, key, ts)
+	if err != nil {
+		return false, err
+	}
+	if !routeHasStagedVisibility(owner) {
+		return liveOK, nil
+	}
+	stagedKey := distribution.MigrationStagedDataKey(owner.MigrationJobID, key)
+	staged, stagedOK, err := latestMVCCVersionAt(ctx, g.Store, stagedKey, ts)
+	if err != nil {
+		return false, err
+	}
+	_, found := newerMigrationVersion(live, liveOK, staged, stagedOK)
+	return found, nil
 }
 
 func routeMatchesS3BucketAuxiliaryOwner(route distribution.Route, owner distribution.Route) bool {
