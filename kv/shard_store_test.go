@@ -3557,3 +3557,51 @@ func TestShardStoreExplicitGroupScan_AllowsFilesystemChunkKeys(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []*store.KVPair{{Key: chunkKey, Value: []byte("chunk")}}, kvs)
 }
+
+// Between cutover and promotion a key can be visible through its staged alias
+// while the live key holds nothing. Both store implementations read the live key
+// first and return ErrKeyNotFound when it is absent, so an expiration issued in
+// that window failed for a value the same route serves happily through GetAt.
+func TestExpireAtAppliesToStagedOnlyValues(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+
+	key := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx,
+		distribution.MigrationStagedDataKey(9, key), []byte("staged-b"), 20, 0))
+
+	// The value is visible even though the live key has nothing.
+	got, err := st.GetAt(ctx, key, 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), got)
+
+	// The expiry is in the future relative to the commit timestamp, so the value
+	// survives; the point is that ExpireAt no longer fails outright.
+	require.NoError(t, st.ExpireAt(ctx, key, 5_000, 300))
+
+	got, err = st.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), got)
+
+	// The expiration was recorded as a live MVCC version, which is where every
+	// other post-cutover write goes.
+	live, err := group.Store.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), live)
+
+	// And it takes effect once the read passes the expiry.
+	_, err = st.GetAt(ctx, key, 6_000)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+// A key with nothing on either side still reports ErrKeyNotFound.
+func TestExpireAtStillFailsWhenNothingIsVisible(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, _ := newStagedVisibilityShardStore(t)
+
+	require.ErrorIs(t, st.ExpireAt(ctx, []byte("absent"), 40, 300), store.ErrKeyNotFound)
+}

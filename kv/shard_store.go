@@ -3148,7 +3148,42 @@ func (s *ShardStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, 
 	if err := s.ensureS3BucketAuxiliaryWriteTimestampFloor(key, commitTS); err != nil {
 		return err
 	}
+	if routeHasStagedVisibility(route) {
+		return s.expireStagedVisibleAt(ctx, g, route, key, expireAt, commitTS)
+	}
 	return errors.WithStack(g.Store.ExpireAt(ctx, key, expireAt, commitTS))
+}
+
+// expireStagedVisibleAt applies an expiration to a key whose only visible
+// version may still be staged.
+//
+// Between cutover and promotion a key can be visible through its staged alias
+// while the live key holds nothing. Both store implementations read the live key
+// first and return ErrKeyNotFound when it is absent, so the expiration would
+// fail for a value the same route serves happily through GetAt. Resolve the
+// staged/live winner and write the expiration as a live MVCC version, which is
+// where every other post-cutover write goes.
+//
+// The live attempt comes first so the ordinary path is unchanged and the staged
+// lookup is only paid when the live key really has nothing.
+func (s *ShardStore) expireStagedVisibleAt(
+	ctx context.Context,
+	g *ShardGroup,
+	route distribution.Route,
+	key []byte,
+	expireAt uint64,
+	commitTS uint64,
+) error {
+	err := g.Store.ExpireAt(ctx, key, expireAt, commitTS)
+	if !errors.Is(err, store.ErrKeyNotFound) {
+		return errors.WithStack(err)
+	}
+	value, getErr := s.getAtWithStagedVisibility(ctx, g, route, key, commitTS)
+	if getErr != nil {
+		// Nothing visible either way: the original ErrKeyNotFound stands.
+		return getErr
+	}
+	return errors.WithStack(g.Store.PutWithTTLAt(ctx, key, value, commitTS, expireAt))
 }
 
 func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
