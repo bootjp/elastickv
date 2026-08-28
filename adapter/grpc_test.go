@@ -37,6 +37,8 @@ const (
 	grpcSequenceShortIterations = 256
 )
 
+var _ rawGroupCommitTSReader = (*kvstore.ShardStore)(nil)
+
 func grpcSequenceIterations(t testing.TB) int {
 	t.Helper()
 	if testing.Short() {
@@ -401,6 +403,39 @@ func TestGRPCServer_RawLatestCommitTS_UsesExplicitGroup(t *testing.T) {
 	require.Equal(t, uint64(42), st.latestGroupID)
 	require.Equal(t, uint64(98), st.latestGroupReadVersion)
 	require.Zero(t, st.latestReadRouteVersion)
+}
+
+func TestGRPCServer_RawLatestCommitTS_ExplicitGroupShardStoreVersionProbe(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 42, State: distribution.RouteStateActive},
+		},
+	}))
+	groupStore := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, groupStore.Close()) })
+	key := []byte("!dist|migstage|probe|k")
+	require.NoError(t, groupStore.PutAt(ctx, key, []byte("v"), 10, 0))
+	shards := kvstore.NewShardStore(engine, map[uint64]*kvstore.ShardGroup{
+		42: {Store: groupStore},
+	})
+	server := NewGRPCServer(shards, nil)
+
+	resp, err := server.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{
+		Key:                key,
+		GroupId:            42,
+		ReadRouteVersion:   1,
+		VersionVisibleAtTs: 10,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.GetExists())
+	require.Equal(t, uint64(10), resp.GetTs())
+	require.True(t, resp.GetVersionVisibleSupported())
+	require.True(t, resp.GetVersionVisible())
 }
 
 func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {

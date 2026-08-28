@@ -730,6 +730,57 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testi
 	}
 }
 
+func TestShardStoreS3BucketAuxiliaryOwnerProbeFailsWhenLeaderUnavailable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	migratedKey := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {
+			Store:  store.NewMVCCStore(),
+			Engine: &followerProxyEngine{},
+		},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	_, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 0, 77, nil, nil)
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+}
+
+func TestShardStoreExplicitGroupS3BucketAuxiliaryScanKeepsOwnerRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	migratedKey := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, migratedKey), []byte("owner"), 20, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	kvs, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 1, 77, nil, nil)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+}
+
 func TestShardStoreGetAt_ContinuesLatestVersionExportPages(t *testing.T) {
 	t.Parallel()
 
