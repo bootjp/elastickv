@@ -65,6 +65,7 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		MigrationFamilyS3ChunkRef:                      s3keys.ChunkRefPrefix,
 		MigrationFamilyS3GCUpload:                      s3keys.GCUploadPrefix,
 		MigrationFamilyFilesystemChunk:                 string(fskeys.ChunkAllPrefix()),
+		MigrationFamilyFilesystemUsage:                 string(fskeys.UsageRouteAllPrefix()),
 	}
 
 	for family, prefix := range required {
@@ -126,6 +127,7 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	user.End = nil
 	require.False(t, user.ContainsRawKey(s3keys.ChunkRefKey("bucket", 1, "object", "upload", 1, 0)))
 	require.False(t, user.ContainsRawKey(fskeys.ChunkKey(1, 2, 3)))
+	require.False(t, user.ContainsRawKey(fskeys.UsageRouteKey(fskeys.ChunkRouteKey(1, 2))))
 	for _, raw := range [][]byte{
 		[]byte("!txn|foo"),
 		[]byte("!stream|foo"),
@@ -144,6 +146,7 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 		[]byte(s3keys.ObjectManifestPrefix + "x"),
 		[]byte(migrationRedisPrefix + "string|k"),
 		[]byte(migrationHashPrefix + "meta|x"),
+		fskeys.UsageRouteKey(fskeys.ChunkRouteKey(1, 2)),
 	} {
 		require.False(t, user.ContainsRawKey(raw), "concrete internal key %q must be excluded from familyUser", raw)
 	}
@@ -295,6 +298,24 @@ func TestMigrationBracketContainsRoutedKeyUsesFilesystemChunkRoutes(t *testing.T
 	))
 }
 
+func TestMigrationBracketContainsRoutedKeyUsesFilesystemUsageRoutes(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	usage := bracketsByFamily(brackets)[MigrationFamilyFilesystemUsage]
+	routeKey := fskeys.ChunkRouteKey(10, 20)
+	key := fskeys.UsageRouteKey(routeKey)
+
+	require.True(t, usage.ContainsRoutedKey(key, routeKey, prefixScanEnd(routeKey), fskeys.ExtractRouteKey))
+	require.False(t, usage.ContainsRoutedKey(
+		key,
+		fskeys.ChunkRouteKey(11, 20),
+		nil,
+		fskeys.ExtractRouteKey,
+	))
+}
+
 func TestMigrationBracketContainsRoutedKeyAcceptsEmptyLogicalRouteKey(t *testing.T) {
 	t.Parallel()
 
@@ -421,6 +442,7 @@ func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 		[]byte(migrationDynamoMetaPrefix + "t"),
 		[]byte(migrationSQSQueueMetaPrefix + "q"),
 		[]byte(s3keys.BlobPrefix + "b"),
+		fskeys.UsageRouteKey(fskeys.ChunkRouteKey(1, 2)),
 	} {
 		require.True(t, IsMigrationKnownInternalKey(raw), "concrete internal key %q", raw)
 	}
@@ -658,4 +680,41 @@ func TestPlanMigrationBracketsCoversFilesystemUsageCounters(t *testing.T) {
 	// normalizes back into that interval, so the route filter keeps it.
 	counter := fskeys.UsageRouteKey([]byte("customers"))
 	require.Equal(t, []byte("customers"), fskeys.ExtractRouteKey(counter))
+}
+
+// !s3|chunkblob| rows never travel with a migration. They are written outside
+// Raft directly to the receiving node's Pebble and pulled by peers over
+// S3BlobFetch, and they are content-addressed, so a single row backs every
+// object whose chunk hashes the same -- objects that are not moving included.
+// No bracket may claim them: the user bracket would export them by their raw
+// digest route, which forges a replicated copy of deliberately unreplicated
+// state and lets a later source cleanup delete blobs that unmigrated objects
+// still dereference.
+func TestPlanExportBracketsExcludesPeerLocalChunkBlobs(t *testing.T) {
+	t.Parallel()
+
+	var digest [32]byte
+	digest[0] = 0xab
+	blobKey := s3keys.ChunkBlobKey(digest)
+
+	brackets, err := PlanExportBrackets([]byte(s3keys.ChunkBlobPrefix), []byte("!s4|"))
+	require.NoError(t, err)
+	require.NotEmpty(t, brackets)
+
+	for _, bracket := range brackets {
+		require.False(t, bracket.ContainsRawKey(blobKey),
+			"family %d must not export peer-local chunk blob %q", bracket.Family, blobKey)
+	}
+	require.True(t, IsMigrationKnownInternalKey(blobKey))
+
+	// The neighbouring replicated S3 families keep their own brackets, so the
+	// exclusion is scoped to the blob payloads alone.
+	refKey := []byte(s3keys.ChunkRefPrefix + "b|o|u|1|1")
+	matched := false
+	for _, bracket := range brackets {
+		if bracket.Family == MigrationFamilyS3ChunkRef && bracket.ContainsRawKey(refKey) {
+			matched = true
+		}
+	}
+	require.True(t, matched, "chunkref stays owned by its own export bracket")
 }
