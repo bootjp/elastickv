@@ -446,6 +446,7 @@ func TestMigrationStagedDataKeyRoundTrip(t *testing.T) {
 
 	raw := []byte("user|raw")
 	key := MigrationStagedDataKey(42, raw)
+	require.LessOrEqual(t, len(MigrationStagedDataKey(42, nil)), store.MaxSnapshotInternalKeyEnvelope)
 	require.True(t, IsMigrationStagedDataKey(key))
 	require.True(t, bytes.HasPrefix(key, MigrationStagedDataKeyPrefix(42)))
 	require.False(t, IsMigrationStagedDataKey([]byte("!dist|migstage|short")))

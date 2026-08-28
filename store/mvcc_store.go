@@ -28,14 +28,24 @@ const (
 	mvccSnapshotVersionV1 = uint32(1)
 	mvccSnapshotVersionV2 = uint32(2)
 	mvccSnapshotVersion   = uint32(3)
-	maxSnapshotKeySize    = 1 << 20 // 1 MiB per key
-	// MaxSnapshotKeySize is the largest key a snapshot can carry. Callers that
-	// wrap a key in an envelope before storing it -- migration staging is the
-	// one today -- need it to reserve headroom, because a key that fits on its
-	// own can stop fitting once wrapped, and the snapshot that would carry it
-	// is then unrestorable.
-	MaxSnapshotKeySize      = maxSnapshotKeySize
-	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
+	maxSnapshotKeySize    = 1 << 20 // 1 MiB per logical key
+	// maxSnapshotInternalKeyEnvelope reserves snapshot headroom for internal
+	// stored-key envelopes such as migration staging. Logical source keys keep
+	// the full maxSnapshotKeySize budget so existing snapshot-valid rows remain
+	// migratable.
+	maxSnapshotInternalKeyEnvelope = 32
+	maxSnapshotStoredKeySize       = maxSnapshotKeySize + maxSnapshotInternalKeyEnvelope
+
+	// MaxSnapshotKeySize is the largest logical/source key size guaranteed to
+	// round-trip through snapshots.
+	MaxSnapshotKeySize = maxSnapshotKeySize
+	// MaxSnapshotInternalKeyEnvelope is the stored-key envelope headroom
+	// snapshots reserve for internal namespaces.
+	MaxSnapshotInternalKeyEnvelope = maxSnapshotInternalKeyEnvelope
+	// MaxSnapshotStoredKeySize is the largest physical stored key a snapshot can
+	// carry after adding a bounded internal envelope to a logical key.
+	MaxSnapshotStoredKeySize = maxSnapshotStoredKeySize
+	maxSnapshotVersionCount  = 1 << 20 // 1M versions per key
 )
 
 // maxSnapshotValueSize caps the allowed size of a single value during streaming
@@ -1260,8 +1270,8 @@ func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) 
 		}
 		return nil, nil, false, errors.WithStack(err)
 	}
-	if keyLen > maxSnapshotKeySize {
-		return nil, nil, false, errors.Wrapf(ErrSnapshotKeyTooLarge, "%d > %d", keyLen, maxSnapshotKeySize)
+	if keyLen > maxSnapshotStoredKeySize {
+		return nil, nil, false, errors.Wrapf(ErrSnapshotKeyTooLarge, "%d > %d", keyLen, maxSnapshotStoredKeySize)
 	}
 
 	key := make([]byte, keyLen)

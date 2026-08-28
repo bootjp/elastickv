@@ -38,6 +38,27 @@ func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 	require.Equal(t, []byte("v2"), v)
 }
 
+func TestMVCCStore_SnapshotRestoreMaxStoredKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := newTestMVCCStore(t)
+	key := bytes.Repeat([]byte("k"), MaxSnapshotStoredKeySize)
+	require.NoError(t, src.PutAt(ctx, key, []byte("v"), 10, 0))
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+
+	dst := newTestMVCCStore(t)
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+
+	got, err := dst.GetAt(ctx, key, 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), got)
+}
+
 func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
 	t.Parallel()
 

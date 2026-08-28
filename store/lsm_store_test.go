@@ -1212,3 +1212,39 @@ func TestPebbleStore_SnapshotRestore_MaxSizeKey(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, []byte("val"), got)
 }
+
+func TestPebbleStore_SnapshotRestore_MaxStoredKey(t *testing.T) {
+	dir, err := os.MkdirTemp("", "pebble-maxstoredkey-snap-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir)
+
+	s, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, s.Close()) }()
+
+	ctx := context.Background()
+	bigKey := bytes.Repeat([]byte("k"), maxSnapshotStoredKeySize)
+	require.NoError(t, s.PutAt(ctx, bigKey, []byte("val"), 1, 0))
+
+	snap, err := s.Snapshot()
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, snap.Close()) }()
+
+	var buf bytes.Buffer
+	_, err = snap.WriteTo(&buf)
+	require.NoError(t, err)
+
+	dir2, err := os.MkdirTemp("", "pebble-maxstoredkey-restore-*")
+	require.NoError(t, err)
+	defer os.RemoveAll(dir2)
+
+	s2, err := NewPebbleStore(dir2)
+	require.NoError(t, err)
+	defer func() { assert.NoError(t, s2.Close()) }()
+
+	require.NoError(t, s2.Restore(bytes.NewReader(buf.Bytes())))
+
+	got, err := s2.GetAt(ctx, bigKey, 1)
+	require.NoError(t, err)
+	assert.Equal(t, []byte("val"), got)
+}

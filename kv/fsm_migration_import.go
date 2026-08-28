@@ -77,20 +77,18 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 // the batch while the failed voter skips the imported versions for good, which
 // surfaces as missing data after failover or promotion. Those halt instead,
 // matching applyMigrationPromote.
-// validateStagedKeySizes rejects a batch whose staged form would not fit in a
-// snapshot.
+// validateStagedKeySizes rejects a batch whose staged form would not fit in the
+// physical stored-key snapshot budget.
 //
 // MigrationStagedDataKey prepends the staged prefix, the job id, and a
-// separator, so a source key that is itself within store.MaxSnapshotKeySize can
-// exceed it once staged. Storing it anyway leaves the target holding a version
-// that no snapshot can carry: a new or lagging voter could never restore, and so
-// could never recover through snapshot transfer. Refuse the import instead, so
-// the failure surfaces on the migrator rather than on a future restore.
+// separator. store.MaxSnapshotStoredKeySize includes bounded headroom for that
+// envelope so source keys at store.MaxSnapshotKeySize remain migratable, while
+// still refusing batches that would make the target snapshot unrestorable.
 func validateStagedKeySizes(versions []store.MVCCVersion) error {
 	for _, version := range versions {
-		if len(version.Key) > store.MaxSnapshotKeySize {
+		if len(version.Key) > store.MaxSnapshotStoredKeySize {
 			return errors.Wrapf(store.ErrSnapshotKeyTooLarge,
-				"staged key length %d > %d", len(version.Key), store.MaxSnapshotKeySize)
+				"staged key length %d > %d", len(version.Key), store.MaxSnapshotStoredKeySize)
 		}
 	}
 	return nil

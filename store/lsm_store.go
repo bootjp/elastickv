@@ -55,10 +55,10 @@ const (
 
 	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
 	// which are the user key concatenated with the 8-byte inverted timestamp.
-	// Using maxSnapshotKeySize+timestampSize (instead of just maxSnapshotKeySize)
-	// avoids rejecting keys that are valid at the user-key level but slightly
-	// exceed maxSnapshotKeySize once the timestamp suffix is appended.
-	maxPebbleEncodedKeySize = maxSnapshotKeySize + timestampSize
+	// Using maxSnapshotStoredKeySize+timestampSize avoids rejecting logical keys
+	// that fit maxSnapshotKeySize but gain a bounded internal envelope before the
+	// timestamp suffix is appended.
+	maxPebbleEncodedKeySize = maxSnapshotStoredKeySize + timestampSize
 
 	// defaultPebbleCacheBytes is the fallback process-wide Pebble block-cache
 	// capacity when the node's effective memory budget cannot be discovered.
