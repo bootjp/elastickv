@@ -29,6 +29,10 @@ func TestIsTxnInternalKeyReservesOnlyKnownFamilies(t *testing.T) {
 		[]byte("!txn|foo"),
 		[]byte("!txn|"),
 		[]byte("!txnfoo"),
+		// The backup family reserves the exact floor key, not the prefix: a
+		// stored user key under !txn|backup| must stay writable and visible.
+		[]byte(txnBackupPrefix + "customer"),
+		[]byte(txnBackupPrefix),
 		[]byte("user"),
 	} {
 		require.False(t, isTxnInternalKey(key), "user key %q", key)
