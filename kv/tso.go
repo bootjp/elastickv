@@ -352,17 +352,47 @@ func ValidateForwardedTxnCommitTimestamp(
 	alloc TimestampAllocator,
 	startTS uint64,
 	commitTS uint64,
+	resolution bool,
 	label string,
 ) error {
 	err := ValidateDurablePersistenceTimestamp(ctx, alloc, commitTS, label)
 	if err == nil || !errors.Is(err, ErrTSOTimestampPrePhaseD) {
 		return err
 	}
-	if startTS == 0 {
+	// The carve-out is for replaying a commit timestamp the primary already
+	// recorded, which only a COMMIT or ABORT resolution does. A one-phase
+	// transaction (Phase_NONE) carries a commit timestamp it chose itself and
+	// has no recorded intent behind it, so it gets no exemption.
+	if !resolution || startTS == 0 {
 		return err
 	}
 	startErr := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
 	if startErr != nil && errors.Is(startErr, ErrTSOTimestampPrePhaseD) {
+		return nil
+	}
+	return err
+}
+
+// ValidateForwardedTxnStartTimestamp validates a start timestamp a forwarded
+// transaction arrived with.
+//
+// Internal.Forward keeps a nonzero Request.Ts rather than allocating one, and a
+// PREPARE carries no transaction meta, so the commit-timestamp check never sees
+// it -- yet handlePrepareRequest persists the intent at that value. A caller
+// could otherwise submit AllocationFloor()+1, persist state at a timestamp
+// group 0 has not issued, and let the TSO issue the same value later.
+//
+// A start timestamp that predates Phase D is allowed: a transaction that began
+// before the marker is still entitled to prepare and resolve its intents, and
+// group 0 only ever issues above the floor, so nothing it issues can collide.
+func ValidateForwardedTxnStartTimestamp(
+	ctx context.Context,
+	alloc TimestampAllocator,
+	startTS uint64,
+	label string,
+) error {
+	err := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
+	if err == nil || errors.Is(err, ErrTSOTimestampPrePhaseD) {
 		return nil
 	}
 	return err

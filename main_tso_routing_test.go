@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"fmt"
-	"github.com/cockroachdb/errors"
 	"os"
 	"path/filepath"
 	"sync/atomic"
@@ -16,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 

@@ -551,3 +551,82 @@ func TestFillForwardedTxnCommitTS_StillRejectsUnallocatedCommitTS(t *testing.T) 
 	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
 	require.NotErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 }
+
+// The legacy carve-out is for replaying a commit timestamp the primary already
+// recorded, which only a COMMIT or ABORT resolution does. forwardedTxnMetaMutation
+// also accepts Phase_NONE, and a one-phase transaction chose its own commit
+// timestamp with no recorded intent behind it -- handleOnePhaseTxnRequest would
+// persist it straight away -- so it gets no exemption.
+func TestFillForwardedTxnCommitTS_OnePhaseGetsNoLegacyExemption(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	onePhase := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 60}),
+		}},
+	}}
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), onePhase, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	// The same pair on an ABORT resolution is still admitted.
+	abort := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_ABORT,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 60}),
+		}},
+	}}
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), abort, 50)
+	require.NoError(t, err)
+	require.Equal(t, uint64(60), commitTS)
+}
+
+// A forwarded PREPARE carries no transaction meta, so the commit-timestamp check
+// never sees it -- but handlePrepareRequest persists the intent at the
+// caller-supplied start timestamp. A caller could otherwise submit
+// AllocationFloor()+1 and let the TSO issue the same value later.
+func TestStampTxnTimestamps_ValidatesForwardedStartTS(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	prepare := func(startTS uint64) []*pb.Request {
+		return []*pb.Request{{
+			IsTxn:     true,
+			Phase:     pb.Phase_PREPARE,
+			Ts:        startTS,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}}
+	}
+
+	// Beyond the allocation floor: group 0 has not issued this.
+	_, err := i.stampTxnTimestamps(context.Background(), prepare(5_000))
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+	require.NotErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	// An allocated one passes through unchanged. stampTxnTimestamps returns the
+	// commit timestamp, which a PREPARE has none of, so the start timestamp is
+	// read back off the request it was stamped onto.
+	reqs := prepare(150)
+	_, err = i.stampTxnTimestamps(context.Background(), reqs)
+	require.NoError(t, err)
+	require.Equal(t, uint64(150), reqs[0].Ts)
+
+	// A transaction that began before Phase D may still prepare its intents.
+	legacy := prepare(50)
+	_, err = i.stampTxnTimestamps(context.Background(), legacy)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), legacy[0].Ts)
+}

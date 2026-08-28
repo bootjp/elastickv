@@ -242,6 +242,12 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 			return 0, err
 		}
 		startTS = ts
+	} else if err := kv.ValidateForwardedTxnStartTimestamp(
+		ctx, i.tsAllocator, startTS, "stampTxnTimestamps: forwarded start ts"); err != nil {
+		// A PREPARE carries no transaction meta, so the commit-timestamp check
+		// below never sees it -- yet handlePrepareRequest persists the intent at
+		// this value.
+		return 0, errors.WithStack(err)
 	}
 	if startTS == ^uint64(0) {
 		return 0, errors.WithStack(ErrTxnTimestampOverflow)
@@ -288,7 +294,7 @@ type forwardedTxnMetaToUpdate struct {
 }
 
 func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Request, startTS uint64) (uint64, error) {
-	metaMutations, commitTS, err := collectForwardedTxnMetas(reqs)
+	metaMutations, commitTS, resolution, err := collectForwardedTxnMetas(reqs)
 	if err != nil {
 		return 0, err
 	}
@@ -299,7 +305,8 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 			return 0, err
 		}
 	} else if err := kv.ValidateForwardedTxnCommitTimestamp(
-		ctx, i.tsAllocator, startTS, commitTS, "fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
+		ctx, i.tsAllocator, startTS, commitTS, resolution,
+		"fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
 		// A commit timestamp that arrived already set in the transaction meta
 		// is the timestamp every mutation in this batch is persisted under, and
 		// it never passed through the coordinator's own validation. A legacy
@@ -330,9 +337,14 @@ func stampRequestMutationCommitTS(reqs []*pb.Request, commitTS uint64) error {
 	return nil
 }
 
-func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, error) {
+// collectForwardedTxnMetas also reports whether an already-set commit timestamp
+// arrived on a resolution request. Only COMMIT and ABORT replay a timestamp the
+// primary recorded; Phase_NONE is a one-phase transaction that chose its own and
+// has no recorded intent behind it.
+func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, bool, error) {
 	metaMutations := make([]forwardedTxnMetaToUpdate, 0, len(reqs))
 	var commitTS uint64
+	var resolution bool
 	prefix := []byte(kv.TxnMetaPrefix)
 	for _, r := range reqs {
 		m, ok := forwardedTxnMetaMutation(r, prefix)
@@ -345,14 +357,15 @@ func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, u
 		}
 		if meta.CommitTS != 0 {
 			if commitTS != 0 && commitTS != meta.CommitTS {
-				return nil, 0, errors.WithStack(kv.ErrInvalidRequest)
+				return nil, 0, false, errors.WithStack(kv.ErrInvalidRequest)
 			}
 			commitTS = meta.CommitTS
+			resolution = r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT
 			continue
 		}
 		metaMutations = append(metaMutations, forwardedTxnMetaToUpdate{m: m, meta: meta})
 	}
-	return metaMutations, commitTS, nil
+	return metaMutations, commitTS, resolution, nil
 }
 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded
