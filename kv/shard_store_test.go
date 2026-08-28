@@ -1012,7 +1012,7 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 		legacyRouting bool
 	}{
 		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
-		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
+		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1038,8 +1038,8 @@ func TestShardStoreScanAt_BroadLegacyListDeltaScansAllRoutes(t *testing.T) {
 	ctx := context.Background()
 	st := newTwoRouteShardStoreForScanTest()
 	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
-	leftKey := legacyListMetaDeltaKey([]byte("left-list"), 10, 1)
-	rightKey := legacyListMetaDeltaKey([]byte("right-list"), 11, 1)
+	leftKey := legacyListMetaDeltaKey([]byte("left-list"), 10)
+	rightKey := legacyListMetaDeltaKey([]byte("right-list"), 11)
 	require.NoError(t, st.groups[1].Store.PutAt(ctx, leftKey, deltaValue, 1, 0))
 	require.NoError(t, st.groups[2].Store.PutAt(ctx, rightKey, deltaValue, 1, 0))
 
@@ -1307,8 +1307,9 @@ func TestShardStoreRoutesForScanUsesWideColumnUserKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			routes, clamp := st.routesForScan(tc.prefix, prefixScanEnd(tc.prefix))
 			require.False(t, clamp)
-			require.Len(t, routes, 1)
+			require.Len(t, routes, 2)
 			require.Equal(t, uint64(2), routes[0].GroupID)
+			require.Equal(t, uint64(1), routes[1].GroupID)
 		})
 	}
 }
@@ -1914,7 +1915,7 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T
 	require.NoError(t, g.Store.PutAt(ctx, txnCommitKey([]byte("primary"), 10), []byte("commit"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
@@ -1931,7 +1932,7 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterStagedControlKeys(t *testing
 	require.NoError(t, g.Store.PutAt(ctx, stagedKey, []byte("internal"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("visible"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
@@ -1946,7 +1947,7 @@ func TestShardStoreScanKeysRouteAtLeaderPreservesEmptyKey(t *testing.T) {
 	require.NoError(t, g.Store.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, nil, nil, 2, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, nil, nil, 2, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte(""), []byte("a")}, keys)
 }
@@ -1965,7 +1966,7 @@ func TestShardStoreScanKeysRouteAtLeaderIncludesStagedOnlyKeys(t *testing.T) {
 	key := []byte("staged-key")
 	require.NoError(t, g.Store.PutAt(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key), []byte("value"), 1, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, route, []byte(""), nil, 10, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, route, []byte(""), nil, 10, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{key}, keys)
 }
@@ -3449,7 +3450,7 @@ func TestShardStoreScanAt_ExactLegacyListDeltaScanMarksRouteGroup(t *testing.T) 
 
 	// "right-list" sorts into the second route's group.
 	userKey := []byte("right-list")
-	key := legacyListMetaDeltaKey(userKey, 11, 1)
+	key := legacyListMetaDeltaKey(userKey, 11)
 	require.NoError(t, st.groups[2].Store.PutAt(ctx, key, deltaValue, 1, 0))
 
 	scanStart := store.LegacyListMetaDeltaScanPrefix(userKey)

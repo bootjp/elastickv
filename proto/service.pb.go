@@ -408,8 +408,13 @@ type RawLatestCommitTSRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Key              []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	ReadRouteVersion uint64                 `protobuf:"varint,2,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	GroupId          uint64                 `protobuf:"varint,3,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                              // optional explicit Raft group for route-specific probes
+	// When non-zero, also answer whether the key has any committed version at or
+	// below this timestamp. Comparing only `ts` cannot tell a tombstone at or
+	// before the read timestamp apart from a newer version above it.
+	VersionVisibleAtTs uint64 `protobuf:"varint,4,opt,name=version_visible_at_ts,json=versionVisibleAtTs,proto3" json:"version_visible_at_ts,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSRequest) Reset() {
@@ -456,12 +461,31 @@ func (x *RawLatestCommitTSRequest) GetReadRouteVersion() uint64 {
 	return 0
 }
 
+func (x *RawLatestCommitTSRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *RawLatestCommitTSRequest) GetVersionVisibleAtTs() uint64 {
+	if x != nil {
+		return x.VersionVisibleAtTs
+	}
+	return 0
+}
+
 type RawLatestCommitTSResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ts            uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
-	Exists        bool                   `protobuf:"varint,2,opt,name=exists,proto3" json:"exists,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Ts     uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
+	Exists bool                   `protobuf:"varint,2,opt,name=exists,proto3" json:"exists,omitempty"`
+	// Answer to version_visible_at_ts. Only meaningful when
+	// version_visible_supported is set; a server that predates the probe leaves
+	// both unset and the caller falls back to comparing `ts`.
+	VersionVisible          bool `protobuf:"varint,3,opt,name=version_visible,json=versionVisible,proto3" json:"version_visible,omitempty"`
+	VersionVisibleSupported bool `protobuf:"varint,4,opt,name=version_visible_supported,json=versionVisibleSupported,proto3" json:"version_visible_supported,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSResponse) Reset() {
@@ -504,6 +528,20 @@ func (x *RawLatestCommitTSResponse) GetTs() uint64 {
 func (x *RawLatestCommitTSResponse) GetExists() bool {
 	if x != nil {
 		return x.Exists
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetVersionVisible() bool {
+	if x != nil {
+		return x.VersionVisible
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetVersionVisibleSupported() bool {
+	if x != nil {
+		return x.VersionVisibleSupported
 	}
 	return false
 }
@@ -1585,20 +1623,22 @@ func (*RaftAdminStatusRequest) Descriptor() ([]byte, []int) {
 }
 
 type RaftAdminStatusResponse struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	State             RaftAdminState         `protobuf:"varint,1,opt,name=state,proto3,enum=RaftAdminState" json:"state,omitempty"`
-	LeaderId          string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
-	LeaderAddress     string                 `protobuf:"bytes,3,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
-	Term              uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
-	CommitIndex       uint64                 `protobuf:"varint,5,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
-	AppliedIndex      uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
-	LastLogIndex      uint64                 `protobuf:"varint,7,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
-	LastSnapshotIndex uint64                 `protobuf:"varint,8,opt,name=last_snapshot_index,json=lastSnapshotIndex,proto3" json:"last_snapshot_index,omitempty"`
-	FsmPending        uint64                 `protobuf:"varint,9,opt,name=fsm_pending,json=fsmPending,proto3" json:"fsm_pending,omitempty"`
-	NumPeers          uint64                 `protobuf:"varint,10,opt,name=num_peers,json=numPeers,proto3" json:"num_peers,omitempty"`
-	LastContactNanos  int64                  `protobuf:"varint,11,opt,name=last_contact_nanos,json=lastContactNanos,proto3" json:"last_contact_nanos,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	State              RaftAdminState         `protobuf:"varint,1,opt,name=state,proto3,enum=RaftAdminState" json:"state,omitempty"`
+	LeaderId           string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	LeaderAddress      string                 `protobuf:"bytes,3,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
+	Term               uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
+	CommitIndex        uint64                 `protobuf:"varint,5,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	AppliedIndex       uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LastLogIndex       uint64                 `protobuf:"varint,7,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastSnapshotIndex  uint64                 `protobuf:"varint,8,opt,name=last_snapshot_index,json=lastSnapshotIndex,proto3" json:"last_snapshot_index,omitempty"`
+	FsmPending         uint64                 `protobuf:"varint,9,opt,name=fsm_pending,json=fsmPending,proto3" json:"fsm_pending,omitempty"`
+	NumPeers           uint64                 `protobuf:"varint,10,opt,name=num_peers,json=numPeers,proto3" json:"num_peers,omitempty"`
+	LastContactNanos   int64                  `protobuf:"varint,11,opt,name=last_contact_nanos,json=lastContactNanos,proto3" json:"last_contact_nanos,omitempty"`
+	ConfigurationIndex uint64                 `protobuf:"varint,12,opt,name=configuration_index,json=configurationIndex,proto3" json:"configuration_index,omitempty"`
+	PendingConfChange  bool                   `protobuf:"varint,13,opt,name=pending_conf_change,json=pendingConfChange,proto3" json:"pending_conf_change,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RaftAdminStatusResponse) Reset() {
@@ -1706,6 +1746,20 @@ func (x *RaftAdminStatusResponse) GetLastContactNanos() int64 {
 		return x.LastContactNanos
 	}
 	return 0
+}
+
+func (x *RaftAdminStatusResponse) GetConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ConfigurationIndex
+	}
+	return 0
+}
+
+func (x *RaftAdminStatusResponse) GetPendingConfChange() bool {
+	if x != nil {
+		return x.PendingConfChange
+	}
+	return false
 }
 
 type RaftAdminConfigurationRequest struct {
@@ -2271,6 +2325,214 @@ func (x *TransferTarget) GetTargetAddress() string {
 	return ""
 }
 
+type FetchChunkBlobRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ContentSha256 []byte                 `protobuf:"bytes,1,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FetchChunkBlobRequest) Reset() {
+	*x = FetchChunkBlobRequest{}
+	mi := &file_service_proto_msgTypes[39]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FetchChunkBlobRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FetchChunkBlobRequest) ProtoMessage() {}
+
+func (x *FetchChunkBlobRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_service_proto_msgTypes[39]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FetchChunkBlobRequest.ProtoReflect.Descriptor instead.
+func (*FetchChunkBlobRequest) Descriptor() ([]byte, []int) {
+	return file_service_proto_rawDescGZIP(), []int{39}
+}
+
+func (x *FetchChunkBlobRequest) GetContentSha256() []byte {
+	if x != nil {
+		return x.ContentSha256
+	}
+	return nil
+}
+
+type FetchChunkBlobResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Payload       []byte                 `protobuf:"bytes,1,opt,name=payload,proto3" json:"payload,omitempty"`
+	Eof           bool                   `protobuf:"varint,2,opt,name=eof,proto3" json:"eof,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *FetchChunkBlobResponse) Reset() {
+	*x = FetchChunkBlobResponse{}
+	mi := &file_service_proto_msgTypes[40]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *FetchChunkBlobResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*FetchChunkBlobResponse) ProtoMessage() {}
+
+func (x *FetchChunkBlobResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_service_proto_msgTypes[40]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use FetchChunkBlobResponse.ProtoReflect.Descriptor instead.
+func (*FetchChunkBlobResponse) Descriptor() ([]byte, []int) {
+	return file_service_proto_rawDescGZIP(), []int{40}
+}
+
+func (x *FetchChunkBlobResponse) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *FetchChunkBlobResponse) GetEof() bool {
+	if x != nil {
+		return x.Eof
+	}
+	return false
+}
+
+type PushChunkBlobRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ContentSha256 []byte                 `protobuf:"bytes,1,opt,name=content_sha256,json=contentSha256,proto3" json:"content_sha256,omitempty"`
+	Payload       []byte                 `protobuf:"bytes,2,opt,name=payload,proto3" json:"payload,omitempty"`
+	Eof           bool                   `protobuf:"varint,3,opt,name=eof,proto3" json:"eof,omitempty"`
+	CommitTs      uint64                 `protobuf:"varint,4,opt,name=commit_ts,json=commitTs,proto3" json:"commit_ts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PushChunkBlobRequest) Reset() {
+	*x = PushChunkBlobRequest{}
+	mi := &file_service_proto_msgTypes[41]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushChunkBlobRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushChunkBlobRequest) ProtoMessage() {}
+
+func (x *PushChunkBlobRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_service_proto_msgTypes[41]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushChunkBlobRequest.ProtoReflect.Descriptor instead.
+func (*PushChunkBlobRequest) Descriptor() ([]byte, []int) {
+	return file_service_proto_rawDescGZIP(), []int{41}
+}
+
+func (x *PushChunkBlobRequest) GetContentSha256() []byte {
+	if x != nil {
+		return x.ContentSha256
+	}
+	return nil
+}
+
+func (x *PushChunkBlobRequest) GetPayload() []byte {
+	if x != nil {
+		return x.Payload
+	}
+	return nil
+}
+
+func (x *PushChunkBlobRequest) GetEof() bool {
+	if x != nil {
+		return x.Eof
+	}
+	return false
+}
+
+func (x *PushChunkBlobRequest) GetCommitTs() uint64 {
+	if x != nil {
+		return x.CommitTs
+	}
+	return 0
+}
+
+type PushChunkBlobResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Durable       bool                   `protobuf:"varint,1,opt,name=durable,proto3" json:"durable,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PushChunkBlobResponse) Reset() {
+	*x = PushChunkBlobResponse{}
+	mi := &file_service_proto_msgTypes[42]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PushChunkBlobResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PushChunkBlobResponse) ProtoMessage() {}
+
+func (x *PushChunkBlobResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_service_proto_msgTypes[42]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PushChunkBlobResponse.ProtoReflect.Descriptor instead.
+func (*PushChunkBlobResponse) Descriptor() ([]byte, []int) {
+	return file_service_proto_rawDescGZIP(), []int{42}
+}
+
+func (x *PushChunkBlobResponse) GetDurable() bool {
+	if x != nil {
+		return x.Durable
+	}
+	return false
+}
+
 type RaftAdminTransferLeadershipResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	unknownFields protoimpl.UnknownFields
@@ -2279,7 +2541,7 @@ type RaftAdminTransferLeadershipResponse struct {
 
 func (x *RaftAdminTransferLeadershipResponse) Reset() {
 	*x = RaftAdminTransferLeadershipResponse{}
-	mi := &file_service_proto_msgTypes[39]
+	mi := &file_service_proto_msgTypes[43]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2291,7 +2553,7 @@ func (x *RaftAdminTransferLeadershipResponse) String() string {
 func (*RaftAdminTransferLeadershipResponse) ProtoMessage() {}
 
 func (x *RaftAdminTransferLeadershipResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_service_proto_msgTypes[39]
+	mi := &file_service_proto_msgTypes[43]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2304,7 +2566,7 @@ func (x *RaftAdminTransferLeadershipResponse) ProtoReflect() protoreflect.Messag
 
 // Deprecated: Use RaftAdminTransferLeadershipResponse.ProtoReflect.Descriptor instead.
 func (*RaftAdminTransferLeadershipResponse) Descriptor() ([]byte, []int) {
-	return file_service_proto_rawDescGZIP(), []int{39}
+	return file_service_proto_rawDescGZIP(), []int{43}
 }
 
 var File_service_proto protoreflect.FileDescriptor
@@ -2331,13 +2593,17 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"Z\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xa8\x01\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
-	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\"C\n" +
+	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\x12\x19\n" +
+	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x121\n" +
+	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\"\xa8\x01\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xde\x02\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\x12'\n" +
+	"\x0fversion_visible\x18\x03 \x01(\bR\x0eversionVisible\x12:\n" +
+	"\x19version_visible_supported\x18\x04 \x01(\bR\x17versionVisibleSupported\"\xde\x02\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
@@ -2406,7 +2672,7 @@ const file_service_proto_rawDesc = "" +
 	"\bstart_ts\x18\x01 \x01(\x04R\astartTs\",\n" +
 	"\x10RollbackResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x18\n" +
-	"\x16RaftAdminStatusRequest\"\xa2\x03\n" +
+	"\x16RaftAdminStatusRequest\"\x83\x04\n" +
 	"\x17RaftAdminStatusResponse\x12%\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x0f.RaftAdminStateR\x05state\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12%\n" +
@@ -2420,7 +2686,9 @@ const file_service_proto_rawDesc = "" +
 	"fsmPending\x12\x1b\n" +
 	"\tnum_peers\x18\n" +
 	" \x01(\x04R\bnumPeers\x12,\n" +
-	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanos\"\x1f\n" +
+	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanos\x12/\n" +
+	"\x13configuration_index\x18\f \x01(\x04R\x12configurationIndex\x12.\n" +
+	"\x13pending_conf_change\x18\r \x01(\bR\x11pendingConfChange\"\x1f\n" +
 	"\x1dRaftAdminConfigurationRequest\"W\n" +
 	"\x0fRaftAdminMember\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +
@@ -2454,7 +2722,19 @@ const file_service_proto_rawDesc = "" +
 	"\x11target_candidates\x18\x05 \x03(\v2\x0f.TransferTargetR\x10targetCandidates\"T\n" +
 	"\x0eTransferTarget\x12\x1b\n" +
 	"\ttarget_id\x18\x01 \x01(\tR\btargetId\x12%\n" +
-	"\x0etarget_address\x18\x02 \x01(\tR\rtargetAddress\"%\n" +
+	"\x0etarget_address\x18\x02 \x01(\tR\rtargetAddress\">\n" +
+	"\x15FetchChunkBlobRequest\x12%\n" +
+	"\x0econtent_sha256\x18\x01 \x01(\fR\rcontentSha256\"D\n" +
+	"\x16FetchChunkBlobResponse\x12\x18\n" +
+	"\apayload\x18\x01 \x01(\fR\apayload\x12\x10\n" +
+	"\x03eof\x18\x02 \x01(\bR\x03eof\"\x86\x01\n" +
+	"\x14PushChunkBlobRequest\x12%\n" +
+	"\x0econtent_sha256\x18\x01 \x01(\fR\rcontentSha256\x12\x18\n" +
+	"\apayload\x18\x02 \x01(\fR\apayload\x12\x10\n" +
+	"\x03eof\x18\x03 \x01(\bR\x03eof\x12\x1b\n" +
+	"\tcommit_ts\x18\x04 \x01(\x04R\bcommitTs\"1\n" +
+	"\x15PushChunkBlobResponse\x12\x18\n" +
+	"\adurable\x18\x01 \x01(\bR\adurable\"%\n" +
 	"#RaftAdminTransferLeadershipResponse*\xa9\x01\n" +
 	"\x0eRaftAdminState\x12\x1c\n" +
 	"\x18RAFT_ADMIN_STATE_UNKNOWN\x10\x00\x12\x1d\n" +
@@ -2484,7 +2764,10 @@ const file_service_proto_rawDesc = "" +
 	"AddLearner\x12\x1b.RaftAdminAddLearnerRequest\x1a%.RaftAdminConfigurationChangeResponse\"\x00\x12Z\n" +
 	"\x0ePromoteLearner\x12\x1f.RaftAdminPromoteLearnerRequest\x1a%.RaftAdminConfigurationChangeResponse\"\x00\x12V\n" +
 	"\fRemoveServer\x12\x1d.RaftAdminRemoveServerRequest\x1a%.RaftAdminConfigurationChangeResponse\"\x00\x12a\n" +
-	"\x12TransferLeadership\x12#.RaftAdminTransferLeadershipRequest\x1a$.RaftAdminTransferLeadershipResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x12TransferLeadership\x12#.RaftAdminTransferLeadershipRequest\x1a$.RaftAdminTransferLeadershipResponse\"\x002\x98\x01\n" +
+	"\vS3BlobFetch\x12E\n" +
+	"\x0eFetchChunkBlob\x12\x16.FetchChunkBlobRequest\x1a\x17.FetchChunkBlobResponse\"\x000\x01\x12B\n" +
+	"\rPushChunkBlob\x12\x15.PushChunkBlobRequest\x1a\x16.PushChunkBlobResponse\"\x00(\x01B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_service_proto_rawDescOnce sync.Once
@@ -2499,7 +2782,7 @@ func file_service_proto_rawDescGZIP() []byte {
 }
 
 var file_service_proto_enumTypes = make([]protoimpl.EnumInfo, 1)
-var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 40)
+var file_service_proto_msgTypes = make([]protoimpl.MessageInfo, 44)
 var file_service_proto_goTypes = []any{
 	(RaftAdminState)(0),                          // 0: RaftAdminState
 	(*RawPutRequest)(nil),                        // 1: RawPutRequest
@@ -2541,7 +2824,11 @@ var file_service_proto_goTypes = []any{
 	(*RaftAdminConfigurationChangeResponse)(nil), // 37: RaftAdminConfigurationChangeResponse
 	(*RaftAdminTransferLeadershipRequest)(nil),   // 38: RaftAdminTransferLeadershipRequest
 	(*TransferTarget)(nil),                       // 39: TransferTarget
-	(*RaftAdminTransferLeadershipResponse)(nil),  // 40: RaftAdminTransferLeadershipResponse
+	(*FetchChunkBlobRequest)(nil),                // 40: FetchChunkBlobRequest
+	(*FetchChunkBlobResponse)(nil),               // 41: FetchChunkBlobResponse
+	(*PushChunkBlobRequest)(nil),                 // 42: PushChunkBlobRequest
+	(*PushChunkBlobResponse)(nil),                // 43: PushChunkBlobResponse
+	(*RaftAdminTransferLeadershipResponse)(nil),  // 44: RaftAdminTransferLeadershipResponse
 }
 var file_service_proto_depIdxs = []int32{
 	10, // 0: RawScanAtResponse.kv:type_name -> RawKVPair
@@ -2572,27 +2859,31 @@ var file_service_proto_depIdxs = []int32{
 	35, // 25: RaftAdmin.PromoteLearner:input_type -> RaftAdminPromoteLearnerRequest
 	36, // 26: RaftAdmin.RemoveServer:input_type -> RaftAdminRemoveServerRequest
 	38, // 27: RaftAdmin.TransferLeadership:input_type -> RaftAdminTransferLeadershipRequest
-	2,  // 28: RawKV.RawPut:output_type -> RawPutResponse
-	4,  // 29: RawKV.RawGet:output_type -> RawGetResponse
-	6,  // 30: RawKV.RawDelete:output_type -> RawDeleteResponse
-	8,  // 31: RawKV.RawLatestCommitTS:output_type -> RawLatestCommitTSResponse
-	11, // 32: RawKV.RawScanAt:output_type -> RawScanAtResponse
-	13, // 33: TransactionalKV.Put:output_type -> PutResponse
-	17, // 34: TransactionalKV.Get:output_type -> GetResponse
-	15, // 35: TransactionalKV.Delete:output_type -> DeleteResponse
-	21, // 36: TransactionalKV.Scan:output_type -> ScanResponse
-	23, // 37: TransactionalKV.PreWrite:output_type -> PreCommitResponse
-	25, // 38: TransactionalKV.Commit:output_type -> CommitResponse
-	27, // 39: TransactionalKV.Rollback:output_type -> RollbackResponse
-	29, // 40: RaftAdmin.Status:output_type -> RaftAdminStatusResponse
-	32, // 41: RaftAdmin.Configuration:output_type -> RaftAdminConfigurationResponse
-	37, // 42: RaftAdmin.AddVoter:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 43: RaftAdmin.AddLearner:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 44: RaftAdmin.PromoteLearner:output_type -> RaftAdminConfigurationChangeResponse
-	37, // 45: RaftAdmin.RemoveServer:output_type -> RaftAdminConfigurationChangeResponse
-	40, // 46: RaftAdmin.TransferLeadership:output_type -> RaftAdminTransferLeadershipResponse
-	28, // [28:47] is the sub-list for method output_type
-	9,  // [9:28] is the sub-list for method input_type
+	40, // 28: S3BlobFetch.FetchChunkBlob:input_type -> FetchChunkBlobRequest
+	42, // 29: S3BlobFetch.PushChunkBlob:input_type -> PushChunkBlobRequest
+	2,  // 30: RawKV.RawPut:output_type -> RawPutResponse
+	4,  // 31: RawKV.RawGet:output_type -> RawGetResponse
+	6,  // 32: RawKV.RawDelete:output_type -> RawDeleteResponse
+	8,  // 33: RawKV.RawLatestCommitTS:output_type -> RawLatestCommitTSResponse
+	11, // 34: RawKV.RawScanAt:output_type -> RawScanAtResponse
+	13, // 35: TransactionalKV.Put:output_type -> PutResponse
+	17, // 36: TransactionalKV.Get:output_type -> GetResponse
+	15, // 37: TransactionalKV.Delete:output_type -> DeleteResponse
+	21, // 38: TransactionalKV.Scan:output_type -> ScanResponse
+	23, // 39: TransactionalKV.PreWrite:output_type -> PreCommitResponse
+	25, // 40: TransactionalKV.Commit:output_type -> CommitResponse
+	27, // 41: TransactionalKV.Rollback:output_type -> RollbackResponse
+	29, // 42: RaftAdmin.Status:output_type -> RaftAdminStatusResponse
+	32, // 43: RaftAdmin.Configuration:output_type -> RaftAdminConfigurationResponse
+	37, // 44: RaftAdmin.AddVoter:output_type -> RaftAdminConfigurationChangeResponse
+	37, // 45: RaftAdmin.AddLearner:output_type -> RaftAdminConfigurationChangeResponse
+	37, // 46: RaftAdmin.PromoteLearner:output_type -> RaftAdminConfigurationChangeResponse
+	37, // 47: RaftAdmin.RemoveServer:output_type -> RaftAdminConfigurationChangeResponse
+	44, // 48: RaftAdmin.TransferLeadership:output_type -> RaftAdminTransferLeadershipResponse
+	41, // 49: S3BlobFetch.FetchChunkBlob:output_type -> FetchChunkBlobResponse
+	43, // 50: S3BlobFetch.PushChunkBlob:output_type -> PushChunkBlobResponse
+	30, // [30:51] is the sub-list for method output_type
+	9,  // [9:30] is the sub-list for method input_type
 	9,  // [9:9] is the sub-list for extension type_name
 	9,  // [9:9] is the sub-list for extension extendee
 	0,  // [0:9] is the sub-list for field type_name
@@ -2609,9 +2900,9 @@ func file_service_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_service_proto_rawDesc), len(file_service_proto_rawDesc)),
 			NumEnums:      1,
-			NumMessages:   40,
+			NumMessages:   44,
 			NumExtensions: 0,
-			NumServices:   3,
+			NumServices:   4,
 		},
 		GoTypes:           file_service_proto_goTypes,
 		DependencyIndexes: file_service_proto_depIdxs,

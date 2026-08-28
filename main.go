@@ -20,6 +20,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/distribution/autosplit"
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -162,6 +163,7 @@ var (
 	// SigV4 access keys).
 	adminTokenFile      = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
 	adminInsecureNoAuth = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	s3BlobPeerTokenFile = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
 
 	// Admin HTTP listener flags (PR #545's parallel work merged into
 	// main; serves the cookie/SigV4-authenticated admin dashboard).
@@ -287,14 +289,16 @@ const memoryShutdownThresholdEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB"
 const memoryShutdownPollIntervalEnvVar = "ELASTICKV_MEMORY_SHUTDOWN_POLL_INTERVAL"
 
 const (
-	lockResolverEnabledEnvVar = "ELASTICKV_LOCK_RESOLVER_ENABLED"
-	fsmCompactorEnabledEnvVar = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+	lockResolverEnabledEnvVar        = "ELASTICKV_LOCK_RESOLVER_ENABLED"
+	fsmCompactorEnabledEnvVar        = "ELASTICKV_FSM_COMPACTOR_ENABLED"
+	redisDeltaCompactorEnabledEnvVar = "ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED"
 )
 
 const bytesPerMiB = 1024 * 1024
 
 func main() {
 	flag.Parse()
+	recordExplicitRuntimeFlags(flag.CommandLine)
 
 	err := run()
 	if memoryPressureExit.Load() {
@@ -397,6 +401,14 @@ func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtime
 	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
+func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator) *adapter.DeltaCompactor {
+	if enabledEnv(redisDeltaCompactorEnabledEnvVar) {
+		return adapter.NewDeltaCompactor(shardStore, coordinate)
+	}
+	slog.Info("redis delta compactor disabled", "env", redisDeltaCompactorEnabledEnvVar)
+	return nil
+}
+
 func run() error {
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
 	if err != nil {
@@ -446,6 +458,7 @@ func run() error {
 	}
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
+	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.s3BlobBackfillConfig)
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
@@ -474,6 +487,7 @@ func run() error {
 		*encryptionEnabled,
 		cfg.engine,
 		redisApplyObserver,
+		s3BlobBackfiller,
 	)
 	if err = chainEncryptionStartupGuard(
 		err,
@@ -513,10 +527,6 @@ func run() error {
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
-	if err := configureCoordinatorTSO(coordinate); err != nil {
-		return err
-	}
-
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
 	// TransferLeadership when it acquires (or already holds)
@@ -537,36 +547,29 @@ func run() error {
 	// registry-read / behind-epoch failure fails the process
 	// synchronously here, BEFORE the gRPC servers serve, so writes never
 	// run with no registration gate installed.
-	distCatalog, err := setupDistributionAndRegistration(
-		runCtx, eg, runtimes, cfg.engine,
-		coordinate, shardGroups[cfg.defaultGroup], encWiring, *raftId, *encryptionSidecarPath)
+	distStartup, err := startDistributionStartup(distributionStartupInput{
+		ctx:             runCtx,
+		eg:              eg,
+		cancel:          cancel,
+		cleanup:         &cleanup,
+		runtimes:        runtimes,
+		cfg:             cfg,
+		coordinate:      coordinate,
+		defaultGroup:    shardGroups[cfg.defaultGroup],
+		encWiring:       encWiring,
+		raftID:          *raftId,
+		sidecarPath:     *encryptionSidecarPath,
+		sampler:         sampler,
+		readTracker:     readTracker,
+		metricsRegistry: metricsRegistry,
+		clock:           clock,
+	})
 	if err != nil {
-		cancel()
 		return err
 	}
-	// Seed AFTER setupDistributionCatalog so the sampler picks up the
-	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
-	// setupDistributionCatalog applies a snapshot back into the engine
-	// with durable non-zero RouteIDs; seeding earlier would register
-	// the placeholder zero IDs from buildEngine and Observe would miss
-	// every dispatched mutation.
-	seedKeyVizRoutes(sampler, cfg.engine)
-
-	eg.Go(func() error {
-		return runDistributionCatalogWatcher(runCtx, distCatalog, cfg.engine)
-	})
-	startKeyVizFlusher(runCtx, eg, sampler)
-	startKeyVizLeaderTermPublisher(runCtx, eg, sampler, runtimes)
-	startMemoryWatchdog(runCtx, eg, cancel)
-	distServer := adapter.NewDistributionServer(
-		cfg.engine,
-		distCatalog,
-		adapter.WithDistributionCoordinator(coordinate),
-		adapter.WithDistributionActiveTimestampTracker(readTracker),
-		adapter.WithDistributionFilesystemObserver(metricsRegistry.FileSystemObserver()),
-	)
-	startMonitoringCollectors(runCtx, metricsRegistry, runtimes, clock)
-	startFSMCompactorIfEnabled(runCtx, eg, runtimes, readTracker)
+	defaultRuntime := distStartup.defaultRuntime
+	distServer := distStartup.distServer
+	autoSplitRuntime := distStartup.autoSplitRuntime
 
 	// Stage 7c §3.1: build the encryption-aware
 	// MembershipChangeInterceptor here where the concrete
@@ -575,7 +578,6 @@ func run() error {
 	// group), in which case raftadmin.Server skips the pre-step.
 	encryptionConfChangeInterceptor := newEncryptionPreRegister(
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
-	defaultRuntime := findDefaultGroupRuntime(runtimes, cfg.defaultGroup)
 	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
 		runCtx,
 		*encryptionRotateOnStartup,
@@ -598,8 +600,10 @@ func run() error {
 		metricsRegistry: metricsRegistry, cfg: cfg,
 		redisApplyObserver:              redisApplyObserver,
 		cleanup:                         &cleanup,
+		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
 		keyvizSampler:                   sampler,
+		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
 	}); err != nil {
 		return err
@@ -615,6 +619,88 @@ func run() error {
 		return errors.Wrapf(err, "failed to serve")
 	}
 	return nil
+}
+
+type distributionStartupInput struct {
+	ctx             context.Context
+	eg              *errgroup.Group
+	cancel          context.CancelFunc
+	cleanup         *internalutil.CleanupStack
+	runtimes        []*raftGroupRuntime
+	cfg             runtimeConfig
+	coordinate      *kv.ShardedCoordinator
+	defaultGroup    *kv.ShardGroup
+	encWiring       encryptionWriteWiring
+	raftID          string
+	sidecarPath     string
+	sampler         *keyviz.MemSampler
+	readTracker     *kv.ActiveTimestampTracker
+	metricsRegistry *monitoring.Registry
+	clock           *kv.HLC
+}
+
+type distributionStartup struct {
+	defaultRuntime   *raftGroupRuntime
+	distServer       *adapter.DistributionServer
+	autoSplitRuntime adapter.AutoSplitRuntime
+}
+
+func startDistributionStartup(in distributionStartupInput) (distributionStartup, error) {
+	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
+		in.ctx, in.eg, in.runtimes, in.cfg.engine,
+		in.coordinate, in.defaultGroup, in.cfg.defaultGroup,
+		in.encWiring, in.raftID, in.sidecarPath)
+	if err != nil {
+		in.cancel()
+		return distributionStartup{}, err
+	}
+	// Seed AFTER setupDistributionCatalog so the sampler picks up the
+	// catalog-assigned RouteIDs. EnsureCatalogSnapshot inside
+	// setupDistributionCatalog applies a snapshot back into the engine
+	// with durable non-zero RouteIDs; seeding earlier would register
+	// the placeholder zero IDs from buildEngine and Observe would miss
+	// every dispatched mutation.
+	seedKeyVizRoutes(in.sampler, in.cfg.engine)
+
+	catalogWatchConns := &kv.GRPCConnCache{}
+	in.cleanup.Add(func() { _ = catalogWatchConns.Close() })
+	in.eg.Go(func() error {
+		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.engine)
+	})
+	startKeyVizFlusher(in.ctx, in.eg, in.sampler)
+	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
+	startMemoryWatchdog(in.ctx, in.eg, in.cancel)
+	distServer := adapter.NewDistributionServer(
+		in.cfg.engine,
+		distCatalog,
+		adapter.WithDistributionCoordinator(in.coordinate),
+		adapter.WithDistributionActiveTimestampTracker(in.readTracker),
+		adapter.WithCatalogWatchLeaderCheck(func() bool {
+			engine := catalogRuntime.snapshotEngine()
+			return engine != nil && engine.State() == raftengine.StateLeader
+		}),
+		adapter.WithDistributionFilesystemObserver(in.metricsRegistry.FileSystemObserver()),
+	)
+	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
+		in.ctx,
+		in.eg,
+		distCatalog,
+		in.cfg.engine,
+		distServer,
+		in.coordinate,
+		in.sampler,
+		autosplit.NewPrometheusObserver(in.metricsRegistry.Registerer()),
+	)
+	if err != nil {
+		return distributionStartup{}, err
+	}
+	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock)
+	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
+	return distributionStartup{
+		defaultRuntime:   defaultRuntime,
+		distServer:       distServer,
+		autoSplitRuntime: autoSplitRuntime,
+	}, nil
 }
 
 func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {
@@ -861,6 +947,10 @@ func resolveRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig,
 	if err != nil {
 		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
 	}
+	cfg.s3BlobBackfillConfig, err = adapter.S3BlobBackfillConfigFromEnv()
+	if err != nil {
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, errors.WithStack(err)
+	}
 
 	bootstrapCfg, err := resolveRaftPeerConfig(
 		*raftId,
@@ -930,15 +1020,16 @@ func cloneRaftServers(in []raftengine.Server) []raftengine.Server {
 }
 
 type runtimeConfig struct {
-	groups              []groupSpec
-	defaultGroup        uint64
-	engine              *distribution.Engine
-	leaderRedis         map[string]string
-	leaderS3            map[string]string
-	leaderDynamo        map[string]string
-	leaderSQS           map[string]string
-	sqsFifoPartitionMap map[string]sqsFifoQueueRouting
-	multi               bool
+	groups               []groupSpec
+	defaultGroup         uint64
+	engine               *distribution.Engine
+	leaderRedis          map[string]string
+	leaderS3             map[string]string
+	leaderDynamo         map[string]string
+	leaderSQS            map[string]string
+	sqsFifoPartitionMap  map[string]sqsFifoQueueRouting
+	s3BlobBackfillConfig adapter.S3BlobBackfillConfig
+	multi                bool
 }
 
 func parseRuntimeConfig(myAddr, redisAddr, s3Addr, dynamoAddr, sqsAddr, raftGroups, shardRanges, raftRedisMap, raftS3Map, raftDynamoMap, raftSqsMap, sqsFifoPartitionMapRaw string) (runtimeConfig, error) {
@@ -1774,12 +1865,16 @@ type serversInput struct {
 	encWiring          encryptionWriteWiring
 	redisApplyObserver *adapter.RedisApplyObserver
 	cleanup            *internalutil.CleanupStack
+	s3BlobBackfiller   *adapter.S3BlobBackfiller
 	// keyvizSampler is the in-memory key visualizer sampler, or nil
 	// when --keyvizEnabled is false. Threaded into setupAdminService
 	// so AdminServer.GetKeyVizMatrix can serve snapshots; the
 	// coordinator already has its own copy from
 	// `WithSampler(...)` higher up in run().
 	keyvizSampler *keyviz.MemSampler
+	// autoSplitRuntime is registered on the authenticated Admin gRPC service
+	// when automatic splitting was configured at process startup.
+	autoSplitRuntime adapter.AutoSplitRuntime
 	// encryptionConfChangeInterceptor is the Stage 7c §3.1
 	// pre-register hook for raftadmin AddVoter/AddLearner.
 	// Constructed in run() where concrete *kv.ShardedCoordinator and
@@ -1794,7 +1889,14 @@ type serversInput struct {
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	adminServer, adminGRPCOpts, err := setupAdminService(*raftId, *myAddr, in.runtimes, in.bootstrapServers, in.keyvizSampler)
+	adminServer, adminGRPCOpts, err := setupAdminService(
+		*raftId,
+		*myAddr,
+		in.runtimes,
+		in.bootstrapServers,
+		in.keyvizSampler,
+		in.autoSplitRuntime,
+	)
 	if err != nil {
 		return err
 	}
@@ -1859,7 +1961,9 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		pubsubRelay:        adapter.NewRedisPubSubRelay(),
 		readTracker:        in.readTracker,
 		encWiring:          in.encWiring,
+		defaultGroupID:     in.cfg.defaultGroup,
 		redisApplyObserver: in.redisApplyObserver,
+		s3BlobBackfiller:   in.s3BlobBackfiller,
 		dynamoAddress:      *dynamoAddr,
 		leaderDynamo:       in.cfg.leaderDynamo,
 		s3Address:          *s3Addr,
@@ -2069,6 +2173,7 @@ func setupAdminService(
 	runtimes []*raftGroupRuntime,
 	bootstrapServers []raftengine.Server,
 	keyvizSampler *keyviz.MemSampler,
+	autoSplitRuntime adapter.AutoSplitRuntime,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
 	// In multi-group mode the process does not listen on *myAddr — each group
@@ -2080,6 +2185,8 @@ func setupAdminService(
 	srv, icept, err := configureAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
+		*s3BlobPeerTokenFile,
+		adapter.S3BlobOffloadEnabledFromEnv(),
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
 	)
@@ -2087,7 +2194,7 @@ func setupAdminService(
 		return nil, adminGRPCInterceptors{}, err
 	}
 	if srv == nil {
-		return nil, adminGRPCInterceptors{}, nil
+		return nil, icept, nil
 	}
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.spec.id, rt.engine)
@@ -2098,6 +2205,9 @@ func setupAdminService(
 	// operators want the explicit "keyviz disabled" signal.
 	if keyvizSampler != nil {
 		srv.RegisterSampler(keyvizSampler)
+	}
+	if autoSplitRuntime != nil {
+		srv.RegisterAutoSplitRuntime(autoSplitRuntime)
 	}
 	if *adminInsecureNoAuth {
 		log.Printf("WARNING: --adminInsecureNoAuth is set; Admin gRPC service exposed without authentication")
@@ -2159,8 +2269,9 @@ func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []ada
 // ChainUnaryInterceptor call, so using grpc.UnaryInterceptor alongside risks
 // silent overwrites (gRPC-Go: last option of the same type wins).
 type adminGRPCInterceptors struct {
-	unary  []grpc.UnaryServerInterceptor
-	stream []grpc.StreamServerInterceptor
+	unary              []grpc.UnaryServerInterceptor
+	stream             []grpc.StreamServerInterceptor
+	s3BlobFetchEnabled bool
 }
 
 func (a adminGRPCInterceptors) empty() bool {
@@ -2176,6 +2287,10 @@ var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
 var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.RaftMembershipCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.TimestampAllocator = (*startupGatedCoordinator)(nil)
+var _ kv.TimestampAfterAllocator = (*startupGatedCoordinator)(nil)
+var _ kv.MutationWriteGate = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2216,6 +2331,34 @@ func (c startupGatedCoordinator) Clock() *kv.HLC {
 	return c.inner.Clock()
 }
 
+func (c startupGatedCoordinator) Next(ctx context.Context) (uint64, error) {
+	if alloc, ok := c.inner.(kv.TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		return ts, errors.WithStack(err)
+	}
+	ts, err := kv.NextTimestampThrough(ctx, c.inner, "startup-gated timestamp")
+	return ts, errors.WithStack(err)
+}
+
+func (c startupGatedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	if alloc, ok := c.inner.(kv.TimestampAfterAllocator); ok {
+		ts, err := alloc.NextAfter(ctx, min)
+		return ts, errors.WithStack(err)
+	}
+	ts, err := kv.NextTimestampAfterThrough(ctx, c.inner, min, "startup-gated timestamp after observed ts")
+	return ts, errors.WithStack(err)
+}
+
+func (c startupGatedCoordinator) RecoverHLCLease(ctx context.Context) error {
+	type hlcLeaseRecoverer interface {
+		RecoverHLCLease(context.Context) error
+	}
+	if recoverer, ok := c.inner.(hlcLeaseRecoverer); ok {
+		return errors.WithStack(recoverer.RecoverHLCLease(ctx))
+	}
+	return errors.New("startup-gated coordinator: hlc lease recovery unavailable")
+}
+
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }
@@ -2228,11 +2371,86 @@ func (c startupGatedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
 	return kv.LeaseReadAllGroupsThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }
 
+// IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
+// group-keyed read-fence path. Without them this wrapper silently fails the
+// kv.GroupLeaderRoutableCoordinator assertion in the Redis fence and every
+// target falls back to key resolution, which is exactly the collapse
+// kv.ReadFenceTarget exists to prevent -- and it would not show up in tests that
+// use an unwrapped coordinator.
+func (c startupGatedCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
+	if !ok {
+		return false
+	}
+	return router.IsLeaderForGroup(groupID)
+}
+
+func (c startupGatedCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
+	if !ok {
+		return ""
+	}
+	return router.RaftLeaderForGroup(groupID)
+}
+
+func (c startupGatedCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	if lr, ok := c.inner.(interface {
+		LeaseReadForGroup(context.Context, uint64) (uint64, error)
+	}); ok {
+		return lr.LeaseReadForGroup(ctx, groupID) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+	}
+	// No group-keyed lease read underneath (single-group Coordinate). Fall back
+	// to the plain lease read rather than a key-resolved one: there is no key to
+	// resolve here, and the single group is the one being fenced anyway.
+	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+// Internal.Forward re-applies the route write floor and records forwarded-write
+// samples on the leader. Both reach the handler through an optional-interface
+// probe in internalTimestampOptions, and the value probed there is this wrapper
+// -- not the ShardedCoordinator it holds. Without these two forwards the probe
+// fails, follower-forwarded raw and transactional commits skip the
+// MinWriteTSExclusive check entirely, and forwarded-write sampling goes dark.
+func (c startupGatedCoordinator) EnsureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	gate, ok := c.inner.(kv.MutationWriteGate)
+	if !ok {
+		// Single-group Coordinate owns no route table, so it has no write
+		// floors to enforce. Allowing the write matches the behaviour of
+		// leaving the gate unset.
+		return nil
+	}
+	return gate.EnsureMutationsWriteAllowed(muts, commitTS) //nolint:wrapcheck // Pass through the coordinator's gate error unchanged.
+}
+
+func (c startupGatedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
+	observer, ok := c.inner.(interface{ ObserveForwardedRequests([]*pb.Request) })
+	if !ok {
+		return
+	}
+	observer.ObserveForwardedRequests(reqs)
+}
+
 func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	if router, ok := c.inner.(kv.GroupRoutableCoordinator); ok {
 		return router.EngineGroupIDForKey(key)
 	}
 	return 0
+}
+
+func (c startupGatedCoordinator) RaftMembers(ctx context.Context) ([]kv.RaftMember, error) {
+	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.WithStack(kv.ErrLeaderNotFound)
+	}
+	return provider.RaftMembers(ctx) //nolint:wrapcheck // Preserve membership lookup errors.
+}
+
+func (c startupGatedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]kv.RaftMember, error) {
+	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.WithStack(kv.ErrLeaderNotFound)
+	}
+	return provider.RaftMembersForKey(ctx, key) //nolint:wrapcheck // Preserve membership lookup errors.
 }
 
 type startupPublicKVGate struct {
@@ -2260,6 +2478,20 @@ func (g *startupPublicKVGate) unaryInterceptor(
 	return handler(ctx, req)
 }
 
+func (g *startupPublicKVGate) streamInterceptor(
+	srv interface{},
+	stream grpc.ServerStream,
+	info *grpc.StreamServerInfo,
+	handler grpc.StreamHandler,
+) error {
+	if g != nil && info != nil && startupRotationGatedMethod(info.FullMethod) && g.blocked() {
+		// Return a raw gRPC status so clients and retry policy see Unavailable.
+		//nolint:wrapcheck
+		return status.Error(codes.Unavailable, "startup rotation has not completed")
+	}
+	return handler(srv, stream)
+}
+
 func (g *startupPublicKVGate) blocked() bool {
 	if g == nil {
 		return false
@@ -2285,7 +2517,8 @@ func startupRotationGatedMethod(fullMethod string) bool {
 		pb.EncryptionAdmin_RegisterEncryptionWriter_FullMethodName,
 		pb.EncryptionAdmin_ResyncSidecar_FullMethodName,
 		pb.EncryptionAdmin_EnableStorageEnvelope_FullMethodName,
-		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName:
+		pb.EncryptionAdmin_EnableRaftEnvelope_FullMethodName,
+		pb.S3BlobFetch_PushChunkBlob_FullMethodName:
 		return true
 	default:
 		return strings.HasPrefix(fullMethod, "/RawKV/") ||
@@ -2301,34 +2534,79 @@ func startupRotationGatedMethod(fullMethod string) bool {
 func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
+	s3BlobPeerTokenPath string,
+	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
-	if tokenPath == "" && !insecureNoAuth {
-		return nil, adminGRPCInterceptors{}, nil
+	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath)
+	if err != nil {
+		return nil, adminGRPCInterceptors{}, err
 	}
+	var srv *adapter.AdminServer
+	if auth.adminEnabled {
+		srv = adapter.NewAdminServer(self, members)
+		srv.SetCapability(
+			adapter.S3BlobOffloadCapabilityName,
+			s3BlobOffloadAdminCapability(auth.adminToken, auth.peerToken, s3BlobOffloadEnabled),
+		)
+	}
+	var icept adminGRPCInterceptors
+	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
+	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
+	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
+	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
+	icept.s3BlobFetchEnabled = auth.peerToken != ""
+	return srv, icept, nil
+}
+
+type nodeGRPCAuthConfig struct {
+	adminToken   string
+	peerToken    string
+	adminEnabled bool
+}
+
+func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath string) (nodeGRPCAuthConfig, error) {
 	if tokenPath != "" && insecureNoAuth {
-		return nil, adminGRPCInterceptors{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
+		return nodeGRPCAuthConfig{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
 	}
-	token := ""
+	var cfg nodeGRPCAuthConfig
+	cfg.adminEnabled = tokenPath != "" || insecureNoAuth
 	if tokenPath != "" {
 		loaded, err := loadAdminTokenFile(tokenPath)
 		if err != nil {
-			return nil, adminGRPCInterceptors{}, err
+			return nodeGRPCAuthConfig{}, err
 		}
-		token = loaded
+		cfg.adminToken = loaded
 	}
-	srv := adapter.NewAdminServer(self, members)
-	srv.SetCapability(adapter.S3BlobOffloadCapabilityName, adapter.S3BlobOffloadLocalCapability())
-	unary, stream := adapter.AdminTokenAuth(token)
-	var icept adminGRPCInterceptors
+	if peerTokenPath != "" {
+		loaded, err := loadS3BlobPeerTokenFile(peerTokenPath)
+		if err != nil {
+			return nodeGRPCAuthConfig{}, err
+		}
+		cfg.peerToken = loaded
+	}
+	if cfg.adminToken != "" && cfg.peerToken == cfg.adminToken {
+		return nodeGRPCAuthConfig{}, errors.New("S3 blob peer token must differ from the read-only admin token")
+	}
+	return cfg, nil
+}
+
+func appendGRPCBearerInterceptors(
+	icept *adminGRPCInterceptors,
+	unary grpc.UnaryServerInterceptor,
+	stream grpc.StreamServerInterceptor,
+) {
 	if unary != nil {
 		icept.unary = append(icept.unary, unary)
 	}
 	if stream != nil {
 		icept.stream = append(icept.stream, stream)
 	}
-	return srv, icept, nil
+}
+
+func s3BlobOffloadAdminCapability(adminToken, peerToken string, enabled bool) bool {
+	return adapter.S3BlobOffloadLocalCapability() && enabled && adminToken != "" && peerToken != ""
 }
 
 // loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
@@ -2339,6 +2617,14 @@ func loadAdminTokenFile(path string) (string, error) {
 	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "admin token")
 	if err != nil {
 		return "", errors.Wrap(err, "load admin token")
+	}
+	return tok, nil
+}
+
+func loadS3BlobPeerTokenFile(path string) (string, error) {
+	tok, err := internalutil.LoadBearerTokenFile(path, adminTokenMaxBytes, "S3 blob peer token")
+	if err != nil {
+		return "", errors.Wrap(err, "load S3 blob peer token")
 	}
 	return tok, nil
 }
@@ -2490,6 +2776,48 @@ func fsmCompactionRuntimes(runtimes []*raftGroupRuntime) []kv.FSMCompactRuntime 
 	return out
 }
 
+func registerS3BlobFetchServer(
+	registrar grpc.ServiceRegistrar,
+	enabled bool,
+	st store.MVCCStore,
+	observer adapter.S3BlobOffloadObserver,
+	clock *kv.HLC,
+	pushBlocked func() bool,
+) []string {
+	if !enabled {
+		return nil
+	}
+	pb.RegisterS3BlobFetchServer(registrar, adapter.NewS3BlobFetchServer(
+		st,
+		observer,
+		adapter.WithS3BlobFetchClock(clock),
+		adapter.WithS3BlobFetchPushBlocked(pushBlocked),
+	))
+	return []string{"S3BlobFetch"}
+}
+
+func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOption {
+	baseOpts := internalutil.GRPCServerOptions()
+	// extraOptsCap reserves slots for the unary + stream admin
+	// interceptor options appended below. Sized as a constant so the
+	// magic-number linter does not complain.
+	const extraOptsCap = 2
+	opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
+	opts = append(opts, baseOpts...)
+	// Collapse all interceptors into a single ChainUnaryInterceptor /
+	// ChainStreamInterceptor call so a future grpc.UnaryInterceptor
+	// (single-interceptor) option added anywhere in this chain cannot
+	// silently overwrite the admin auth gate — gRPC-Go keeps only the
+	// last option of the same type.
+	if len(adminGRPCOpts.unary) > 0 {
+		opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
+	}
+	if len(adminGRPCOpts.stream) > 0 {
+		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
+	}
+	return opts
+}
+
 func startRaftServers(
 	ctx context.Context,
 	lc *net.ListenConfig,
@@ -2499,7 +2827,6 @@ func startRaftServers(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
-	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	adminServer *adapter.AdminServer,
@@ -2508,34 +2835,46 @@ func startRaftServers(
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
 	sqsPartitionResolver kv.PartitionResolver,
+	defaultGroupID uint64,
+	s3BlobObserver adapter.S3BlobOffloadObserver,
+	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
-	// extraOptsCap reserves slots for the unary + stream admin interceptor
-	// options appended below. Sized as a constant so the magic-number
-	// linter does not complain.
-	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled()
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
+	writerRegistry, err := encryptionAdminDefaultWriterRegistry(*encryptionSidecarPath, shardGroups, defaultGroupID)
+	if err != nil {
+		return err
+	}
+	defaultAdmin, err := encryptionAdminDefaultRuntimeOptions(runtimes, shardGroups, defaultGroupID, enableMutators || writerRegistry != nil)
+	if err != nil {
+		return err
+	}
+	encryptionAdminServer := newEncryptionAdminServer(
+		etcdraftengine.DeriveNodeID(*raftId),
+		*encryptionSidecarPath,
+		enableMutators,
+		defaultAdmin.engine,
+		encryptionCapabilityFanout,
+		writerRegistry,
+		defaultAdmin.latestAppliedIndex,
+		adapter.WithEncryptionAdminPostCutoverProposer(defaultAdmin.postCutoverProposer),
+		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
+	)
 	for _, rt := range runtimes {
-		baseOpts := internalutil.GRPCServerOptions()
-		opts := make([]grpc.ServerOption, 0, len(baseOpts)+extraOptsCap)
-		opts = append(opts, baseOpts...)
-		// Collapse all interceptors into a single ChainUnaryInterceptor /
-		// ChainStreamInterceptor call so a future grpc.UnaryInterceptor
-		// (single-interceptor) option added anywhere in this chain cannot
-		// silently overwrite the admin auth gate — gRPC-Go keeps only the
-		// last option of the same type.
-		if len(adminGRPCOpts.unary) > 0 {
-			opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
-		}
-		if len(adminGRPCOpts.stream) > 0 {
-			opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
-		}
-		gs := grpc.NewServer(opts...)
+		gs := grpc.NewServer(raftGRPCServerOptions(adminGRPCOpts)...)
 		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
+		staticServingServices := registerS3BlobFetchServer(
+			gs,
+			adminGRPCOpts.s3BlobFetchEnabled,
+			rt.store,
+			s3BlobObserver,
+			coordinate.Clock(),
+			s3BlobPushBlocked,
+		)
 		pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
 			trx,
 			rt.engine,
@@ -2545,14 +2884,11 @@ func startRaftServers(
 				internalTimestampOptions(coordinate),
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
-				adapter.WithInternalRouteEngine(routeEngine),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
-		if adminServer != nil {
-			pb.RegisterAdminServer(gs, adminServer)
-		}
+		registerAdminServerIfPresent(gs, adminServer)
 		// full_node_id MUST be per-node-stable, not per-shard.
 		// rt.spec.id is the Raft group id which every replica of
 		// the same group shares; using it as full_node_id makes
@@ -2565,27 +2901,25 @@ func startRaftServers(
 		// (etcd.DeriveNodeID), so every node in the cluster reports
 		// a stable, distinct value. Codex r1 P1 on PR #760.
 		// Stage 6B-2 mutator gate is resolved once above the
-		// per-shard loop. Each shard's own engine remains the raw
-		// Proposer + LeaderView for the cutover marker, while
-		// ShardGroup.Proposer() supplies the wrap-aware post-cutover
-		// path for normal admin entries.
-		registerEncryptionAdminServer(
-			gs,
-			etcdraftengine.DeriveNodeID(*raftId),
-			*encryptionSidecarPath,
-			enableMutators,
-			rt.engine,
-			encryptionCapabilityFanout,
-			adapter.WithEncryptionAdminLatestAppliedIndex(appliedIndexForEngine(rt.engine)),
-			adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
-			adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
-		)
+		// per-shard loop. The admin control-plane itself is scoped to
+		// the default group: writer-registry rows are written there,
+		// ResyncSidecar's freshness gate must verify that group's
+		// leader, and all mutating admin RPCs must commit into the
+		// same FSM whose registry GetSidecarState/ResyncSidecar read.
+		registerEncryptionAdminServer(gs, encryptionAdminServer)
 		registerAdminForwardServer(gs, forwardDeps, forwardLogger)
 		rt.registerGRPC(gs)
 		// Stage 7c §3.1: pass the encryption-aware pre-register hook
 		// (nil when encryption is not wired); raftadmin.Server invokes
 		// it before AddVoter/AddLearner propose the conf-change.
-		internalraftadmin.RegisterOperationalServicesWithInterceptor(ctx, gs, rt.engine, []string{"RawKV"}, confChangeInterceptor)
+		internalraftadmin.RegisterOperationalServicesWithInterceptorAndStaticServing(
+			ctx,
+			gs,
+			rt.engine,
+			[]string{"RawKV"},
+			staticServingServices,
+			confChangeInterceptor,
+		)
 		reflection.Register(gs)
 
 		grpcSock, err := lc.Listen(ctx, "tcp", rt.spec.address)
@@ -2622,11 +2956,30 @@ func startRaftServers(
 	return nil
 }
 
-func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {
-	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
-		return []adapter.InternalOption{adapter.WithInternalTimestampAllocator(alloc)}
+func registerAdminServerIfPresent(gs grpc.ServiceRegistrar, adminServer *adapter.AdminServer) {
+	if adminServer == nil {
+		return
 	}
-	return nil
+	pb.RegisterAdminServer(gs, adminServer)
+}
+
+func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOption {
+	var opts []adapter.InternalOption
+	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
+		opts = append(opts, adapter.WithInternalTimestampAllocator(alloc))
+	}
+	// Sharded deployments own a route table with migration write floors; the
+	// single-group coordinator has none and its gate allows every write. The
+	// value probed here is whatever main.go handed the adapters, which in the
+	// production path is startupGatedCoordinator -- see the forwards on that
+	// type, without which this probe silently finds nothing.
+	if gate, ok := coordinate.(kv.MutationWriteGate); ok {
+		opts = append(opts, adapter.WithInternalWriteGate(gate))
+	}
+	if observer, ok := coordinate.(interface{ ObserveForwardedRequests([]*pb.Request) }); ok {
+		opts = append(opts, adapter.WithInternalForwardWriteObserver(observer.ObserveForwardedRequests))
+	}
+	return opts
 }
 
 func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr string, shardStore *kv.ShardStore, coordinate kv.Coordinator, leaderRedis map[string]string, relay *adapter.RedisPubSubRelay, metricsRegistry *monitoring.Registry, readTracker *kv.ActiveTimestampTracker, redisApplyObserver *adapter.RedisApplyObserver) (*adapter.RedisServer, *adapter.DeltaCompactor, net.Listener, error) {
@@ -2634,16 +2987,19 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	deltaCompactor := adapter.NewDeltaCompactor(shardStore, coordinate)
-	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay,
+	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate)
+	redisOpts := []adapter.RedisServerOption{
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),
 		adapter.WithLuaObserver(metricsRegistry.LuaObserver()),
 		adapter.WithLuaFastPathObserver(metricsRegistry.LuaFastPathObserver()),
-		adapter.WithRedisCompactor(deltaCompactor),
 		adapter.WithLuaPoolMaxIdle(*redisLuaMaxIdleStates),
 		adapter.WithRedisApplyObserver(redisApplyObserver),
-	)
+	}
+	if deltaCompactor != nil {
+		redisOpts = append(redisOpts, adapter.WithRedisCompactor(deltaCompactor))
+	}
+	redisServer := adapter.NewRedisServer(redisL, redisAddr, shardStore, coordinate, leaderRedis, relay, redisOpts...)
 	// Wire the bounded Lua VM pool into Prometheus. The metrics
 	// (hits/misses/drops/idle/max_idle) are read at scrape time via
 	// CounterFunc / GaugeFunc, so the EVAL hot path stays
@@ -2860,9 +3216,95 @@ func distributionCatalogGroupID(engine *distribution.Engine) (uint64, error) {
 	return route.GroupID, nil
 }
 
-func runDistributionCatalogWatcher(ctx context.Context, catalog *distribution.CatalogStore, engine *distribution.Engine) error {
-	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil); err != nil {
+func runDistributionCatalogWatcher(
+	ctx context.Context,
+	catalog *distribution.CatalogStore,
+	engine *distribution.Engine,
+	observers ...distribution.CatalogSnapshotObserver,
+) error {
+	var opts []distribution.CatalogWatcherOption
+	if len(observers) > 0 {
+		opts = append(opts, distribution.WithCatalogWatcherSnapshotObserver(func(snapshot distribution.CatalogSnapshot) {
+			for _, observer := range observers {
+				if observer != nil {
+					observer(snapshot)
+				}
+			}
+		}))
+	}
+	if err := distribution.RunCatalogWatcher(ctx, catalog, engine, nil, opts...); err != nil {
 		return errors.Wrapf(err, "catalog watcher failed")
+	}
+	return nil
+}
+
+func setupDistributionRuntimeDependencies(
+	runCtx context.Context,
+	eg *errgroup.Group,
+	runtimes []*raftGroupRuntime,
+	engine *distribution.Engine,
+	coordinate *kv.ShardedCoordinator,
+	defaultGroup *kv.ShardGroup,
+	defaultGroupID uint64,
+	encWiring encryptionWriteWiring,
+	raftID string,
+	sidecarPath string,
+) (*distribution.CatalogStore, *raftGroupRuntime, *raftGroupRuntime, error) {
+	if err := configureCoordinatorTSO(coordinate); err != nil {
+		return nil, nil, nil, err
+	}
+	catalog, err := setupDistributionAndRegistration(
+		runCtx, eg, runtimes, engine, coordinate, defaultGroup, encWiring, raftID, sidecarPath)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	catalogGroupID, err := distributionCatalogGroupID(engine)
+	if err != nil {
+		return nil, nil, nil, errors.Wrap(err, "resolve distribution catalog group runtime")
+	}
+	catalogRuntime := findDefaultGroupRuntime(runtimes, catalogGroupID)
+	if catalogRuntime == nil {
+		return nil, nil, nil, errors.WithStack(errors.Newf(
+			"distribution catalog raft group %d runtime is unavailable",
+			catalogGroupID,
+		))
+	}
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
+	if defaultRuntime == nil {
+		return nil, nil, nil, errors.WithStack(errors.Newf(
+			"default raft group %d runtime is unavailable",
+			defaultGroupID,
+		))
+	}
+	return catalog, catalogRuntime, defaultRuntime, nil
+}
+
+func runDistributionCatalogStream(
+	ctx context.Context,
+	runtime *raftGroupRuntime,
+	conns *kv.GRPCConnCache,
+	engine *distribution.Engine,
+) error {
+	watcher := distribution.NewResolvingGRPCCatalogWatcher(
+		func(context.Context) (pb.DistributionClient, error) {
+			raftEngine := runtime.snapshotEngine()
+			if raftEngine == nil {
+				return nil, errors.New("default raft group engine is unavailable")
+			}
+			leader := raftEngine.Leader().Address
+			if leader == "" {
+				return nil, errors.New("default raft group leader is unavailable")
+			}
+			conn, err := conns.ConnFor(leader)
+			if err != nil {
+				return nil, errors.WithStack(err)
+			}
+			return pb.NewDistributionClient(conn), nil
+		},
+		engine,
+	)
+	if err := watcher.Run(ctx); err != nil {
+		return errors.Wrap(err, "catalog stream watcher failed")
 	}
 	return nil
 }
@@ -2897,7 +3339,9 @@ type runtimeServerRunner struct {
 	pubsubRelay                     *adapter.RedisPubSubRelay
 	readTracker                     *kv.ActiveTimestampTracker
 	redisApplyObserver              *adapter.RedisApplyObserver
+	s3BlobBackfiller                *adapter.S3BlobBackfiller
 	encWiring                       encryptionWriteWiring
+	defaultGroupID                  uint64
 	dynamoAddress                   string
 	leaderDynamo                    map[string]string
 	s3Address                       string
@@ -2988,6 +3432,11 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 	adminGRPCOpts := r.adminGRPCOpts
 	if r.publicKVGate != nil {
 		adminGRPCOpts.unary = append(adminGRPCOpts.unary, r.publicKVGate.unaryInterceptor)
+		adminGRPCOpts.stream = append(adminGRPCOpts.stream, r.publicKVGate.streamInterceptor)
+	}
+	var s3BlobPushBlocked func() bool
+	if r.publicKVGate != nil {
+		s3BlobPushBlocked = r.publicKVGate.blocked
 	}
 	forwardDeps := adminForwardServerDeps{
 		tables:  newDynamoTablesSource(r.dynamoServer),
@@ -3007,7 +3456,6 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.shardStore,
 		r.coordinate,
 		r.distServer,
-		r.routeEngine,
 		r.pubsubRelay,
 		func(groupID uint64) kv.ProposalObserver {
 			return r.metricsRegistry.RaftProposalObserver(groupID)
@@ -3018,6 +3466,9 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
 		sqsPartitionResolver,
+		r.defaultGroupID,
+		r.metricsRegistry.S3BlobOffloadObserver(),
+		s3BlobPushBlocked,
 	); err != nil {
 		return r.startupFailure(err)
 	}
@@ -3026,17 +3477,54 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 
 func (r *runtimeServerRunner) prepareAdminForwardServers() error {
 	r.dynamoServer = newDynamoDBServer(r.shardStore, r.coordinate, r.leaderDynamo, r.metricsRegistry, r.readTracker)
+	blobCluster, err := r.newS3BlobCluster()
+	if err != nil {
+		return err
+	}
 	s3Server, err := newS3Server(
 		r.s3Address, r.shardStore, r.coordinate, r.leaderS3, r.s3Region,
 		r.s3CredsFile, r.s3PathStyleOnly, r.readTracker,
 		r.metricsRegistry.S3PutAdmissionObserver(),
 		r.metricsRegistry.S3BlobOffloadObserver(),
+		blobCluster,
+		r.publicKVGate.blocked,
+		r.s3BlobBackfiller,
 	)
 	if err != nil {
+		if blobCluster != nil {
+			_ = blobCluster.Close()
+		}
 		return err
 	}
 	r.s3Server = s3Server
 	return nil
+}
+
+func (r *runtimeServerRunner) newS3BlobCluster() (adapter.S3BlobCluster, error) {
+	if r == nil || !s3BlobNodeEnabled(r.s3Address, *s3BlobPeerTokenFile) {
+		return nil, nil
+	}
+	members, ok := r.coordinate.(kv.RaftMembershipCoordinator)
+	if !ok {
+		return nil, errors.New("S3 blob offload requires raft membership discovery")
+	}
+	adminToken := ""
+	if strings.TrimSpace(*adminTokenFile) != "" {
+		loaded, err := loadAdminTokenFile(*adminTokenFile)
+		if err != nil {
+			return nil, err
+		}
+		adminToken = loaded
+	}
+	peerToken := ""
+	if strings.TrimSpace(*s3BlobPeerTokenFile) != "" {
+		loaded, err := loadS3BlobPeerTokenFile(*s3BlobPeerTokenFile)
+		if err != nil {
+			return nil, err
+		}
+		peerToken = loaded
+	}
+	return adapter.NewGRPCS3BlobCluster(*raftId, members, adminToken, peerToken), nil
 }
 
 func (r *runtimeServerRunner) preparePublicServices() error {
@@ -3144,8 +3632,12 @@ func (r *runtimeServerRunner) startPublicServices() error {
 	r.redisListener = nil
 	runDynamoDBServer(r.ctx, r.eg, r.dynamoServer)
 	r.dynamoListener = nil
-	runS3Server(r.ctx, r.eg, r.s3Server)
-	r.s3Listener = nil
+	if r.s3Listener != nil {
+		runS3Server(r.ctx, r.eg, r.s3Server)
+		r.s3Listener = nil
+	} else {
+		runS3BlobBackfillOnly(r.ctx, r.eg, r.s3Server)
+	}
 	runSQSServer(r.ctx, r.eg, r.sqsServer)
 	r.sqsListener = nil
 	// Plug the SQS adapter into the monitoring registry's depth
@@ -3170,20 +3662,26 @@ func (r *runtimeServerRunner) startAdminHTTP() {
 }
 
 // buildKeyVizSampler constructs the in-memory keyviz sampler from
-// flag-supplied options, or returns nil when --keyvizEnabled is
-// false. The coordinator's WithSampler and AdminServer's
+// flag-supplied options, or returns nil when neither --keyvizEnabled nor
+// --autoSplit is set. The coordinator's WithSampler and AdminServer's
 // RegisterSampler both treat a nil receiver as "keyviz disabled," so
 // this is the single decision point.
 func buildKeyVizSampler() *keyviz.MemSampler {
-	if !*keyvizEnabled {
+	if !*keyvizEnabled && !*autoSplit {
 		return nil
 	}
+	keyBucketsPerRoute := effectiveKeyVizBucketsPerRoute(
+		*autoSplit,
+		keyvizKeyBucketsPerRouteExplicit,
+		*keyvizKeyBucketsPerRoute,
+		*autoSplitDefaultBuckets,
+	)
 	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
 		Step:                   *keyvizStep,
 		HistoryColumns:         *keyvizHistoryColumns,
 		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
 		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
-		KeyBucketsPerRoute:     *keyvizKeyBucketsPerRoute,
+		KeyBucketsPerRoute:     keyBucketsPerRoute,
 		KeyVizLabelsEnabled:    *keyvizLabelsEnabled,
 		HotKeysEnabled:         *keyvizHotKeysEnabled,
 		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
@@ -3205,12 +3703,9 @@ func keyVizSamplerForCoordinator(s *keyviz.MemSampler) keyviz.Sampler {
 	return s
 }
 
-// seedKeyVizRoutes copies the engine's current route catalogue into
-// the sampler so the first matrix snapshots have non-empty metadata.
-// No-op when the sampler is disabled. The coordinator's
-// distribution.Engine handles route mutations after this point;
-// route-watch propagation into the sampler is a follow-up (the
-// design's Phase 3 persistence work).
+// seedKeyVizRoutes copies the engine's current route catalogue into the sampler
+// so the first matrix snapshots have non-empty metadata. The auto-split
+// scheduler keeps membership reconciled after catalog changes.
 func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
 	if s == nil || engine == nil {
 		return

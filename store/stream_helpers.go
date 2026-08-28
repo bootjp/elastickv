@@ -17,6 +17,10 @@ const (
 
 	streamMetaLegacyBinarySize = 24
 	streamMetaBinarySize       = 32
+	streamMetaTrimBinarySize   = 48
+	// StreamMetaTrimBinarySize is the current fixed binary size for StreamMeta:
+	// Len(8) || LastMs(8) || LastSeq(8) || ExpireAtMs(8) || TrimmedMs(8) || TrimmedSeq(8).
+	StreamMetaTrimBinarySize = streamMetaTrimBinarySize
 	// StreamIDBytes is the fixed size of the binary StreamID suffix on an entry key:
 	// 8 bytes big-endian ms || 8 bytes big-endian seq. Big-endian so lex order
 	// over the raw key bytes matches the (ms, seq) numeric order used by XADD / XRANGE.
@@ -37,29 +41,38 @@ var (
 // StreamMeta is the per-stream metadata. Length is authoritative for XLEN;
 // LastMs/LastSeq track the highest ID ever appended so XADD '*' stays
 // strictly monotonic even after XTRIM removes the current tail.
+// TrimmedMs/TrimmedSeq track the largest ID removed by a head trim. They
+// are a seek cursor, not part of Redis-visible stream state: when non-zero,
+// scans for the logical head can start strictly after that ID and skip old
+// tombstoned MVCC history.
 type StreamMeta struct {
-	Length   int64
-	LastMs   uint64
-	LastSeq  uint64
-	ExpireAt uint64
+	Length     int64
+	LastMs     uint64
+	LastSeq    uint64
+	ExpireAt   uint64
+	TrimmedMs  uint64
+	TrimmedSeq uint64
 }
 
-// MarshalStreamMeta encodes StreamMeta into a fixed 32-byte binary format.
+// MarshalStreamMeta encodes StreamMeta into a fixed binary format.
 func MarshalStreamMeta(m StreamMeta) ([]byte, error) {
 	if m.Length < 0 {
 		return nil, errors.WithStack(errors.Newf("stream meta negative length: %d", m.Length))
 	}
-	buf := make([]byte, streamMetaBinarySize)
+	buf := make([]byte, streamMetaTrimBinarySize)
 	binary.BigEndian.PutUint64(buf[0:8], uint64(m.Length)) //nolint:gosec
 	binary.BigEndian.PutUint64(buf[8:16], m.LastMs)
 	binary.BigEndian.PutUint64(buf[16:24], m.LastSeq)
 	binary.BigEndian.PutUint64(buf[24:32], m.ExpireAt)
+	binary.BigEndian.PutUint64(buf[32:40], m.TrimmedMs)
+	binary.BigEndian.PutUint64(buf[40:48], m.TrimmedSeq)
 	return buf, nil
 }
 
-// UnmarshalStreamMeta decodes StreamMeta from the legacy 24-byte or current 32-byte binary format.
+// UnmarshalStreamMeta decodes StreamMeta from the legacy 24-byte, 32-byte,
+// or current 48-byte binary format.
 func UnmarshalStreamMeta(b []byte) (StreamMeta, error) {
-	if len(b) != streamMetaLegacyBinarySize && len(b) != streamMetaBinarySize {
+	if len(b) != streamMetaLegacyBinarySize && len(b) != streamMetaBinarySize && len(b) != streamMetaTrimBinarySize {
 		return StreamMeta{}, errors.WithStack(errors.Newf("invalid stream meta length: %d", len(b)))
 	}
 	length := binary.BigEndian.Uint64(b[0:8])
@@ -73,6 +86,11 @@ func UnmarshalStreamMeta(b []byte) (StreamMeta, error) {
 	}
 	if len(b) == streamMetaBinarySize {
 		meta.ExpireAt = binary.BigEndian.Uint64(b[24:32])
+	}
+	if len(b) == streamMetaTrimBinarySize {
+		meta.ExpireAt = binary.BigEndian.Uint64(b[24:32])
+		meta.TrimmedMs = binary.BigEndian.Uint64(b[32:40])
+		meta.TrimmedSeq = binary.BigEndian.Uint64(b[40:48])
 	}
 	return meta, nil
 }
@@ -118,6 +136,35 @@ func StreamEntryKey(userKey []byte, ms, seq uint64) []byte {
 	buf = append(buf, userKey...)
 	buf = append(buf, EncodeStreamID(ms, seq)...)
 	return buf
+}
+
+// StreamEntryScanStart returns the inclusive start key for scans over a
+// stream's live entries. For streams with a persisted trim cursor, the start
+// skips IDs known to have been removed from the logical head.
+func StreamEntryScanStart(userKey []byte, meta StreamMeta) []byte {
+	prefix := StreamEntryScanPrefix(userKey)
+	if meta.TrimmedMs == 0 && meta.TrimmedSeq == 0 {
+		return prefix
+	}
+	ms, seq, ok := nextStreamID(meta.TrimmedMs, meta.TrimmedSeq)
+	if !ok {
+		return PrefixScanEnd(prefix)
+	}
+	start := make([]byte, 0, len(prefix)+StreamIDBytes)
+	start = append(start, prefix...)
+	start = append(start, EncodeStreamID(ms, seq)...)
+	return start
+}
+
+func nextStreamID(ms, seq uint64) (uint64, uint64, bool) {
+	switch {
+	case seq < ^uint64(0):
+		return ms, seq + 1, true
+	case ms < ^uint64(0):
+		return ms + 1, 0, true
+	default:
+		return 0, 0, false
+	}
 }
 
 // IsStreamMetaKey reports whether the key is a stream metadata key.

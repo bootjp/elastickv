@@ -90,6 +90,32 @@ func (c keyVizLabeledCoordinator) RaftLeaderForKey(key []byte) string {
 
 func (c keyVizLabeledCoordinator) Clock() *HLC { return c.inner.Clock() }
 
+func (c keyVizLabeledCoordinator) Next(ctx context.Context) (uint64, error) {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if alloc, ok := c.inner.(TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		return ts, errors.WithStack(err)
+	}
+	return NextTimestampThrough(ctx, c.inner, "allocate keyviz-labeled timestamp")
+}
+
+func (c keyVizLabeledCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if after, ok := c.inner.(TimestampAfterAllocator); ok {
+		ts, err := after.NextAfter(ctx, min)
+		return ts, errors.WithStack(err)
+	}
+	return NextTimestampAfterThrough(ctx, c.inner, min, "allocate keyviz-labeled timestamp after observed ts")
+}
+
+func (c keyVizLabeledCoordinator) RecoverHLCLease(ctx context.Context) error {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if recoverer, ok := c.inner.(hlcLeaseRecoverer); ok {
+		return errors.WithStack(recoverer.RecoverHLCLease(ctx))
+	}
+	return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+}
+
 func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	if lr, ok := c.inner.(LeaseReadableCoordinator); ok {
 		idx, err := lr.LeaseRead(ctx)
@@ -117,9 +143,49 @@ func (c keyVizLabeledCoordinator) LeaseReadAllGroups(ctx context.Context) error 
 	return errors.WithStack(err)
 }
 
+// IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
+// group-keyed read-fence path. The Redis adapter wraps its coordinator with
+// WithKeyVizLabel, so this is the outermost type the fence type-asserts against;
+// omitting these makes every fence target fall back to key resolution and
+// silently re-introduces the legacy wide-column group collapse.
+func (c keyVizLabeledCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	gr, ok := c.inner.(GroupLeaderRoutableCoordinator)
+	if !ok {
+		return false
+	}
+	return gr.IsLeaderForGroup(groupID)
+}
+
+func (c keyVizLabeledCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	gr, ok := c.inner.(GroupLeaderRoutableCoordinator)
+	if !ok {
+		return ""
+	}
+	return gr.RaftLeaderForGroup(groupID)
+}
+
+func (c keyVizLabeledCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if lr, ok := c.inner.(interface {
+		LeaseReadForGroup(context.Context, uint64) (uint64, error)
+	}); ok {
+		idx, err := lr.LeaseReadForGroup(ctx, groupID)
+		return idx, errors.WithStack(err)
+	}
+	idx, err := c.inner.LinearizableRead(ctx)
+	return idx, errors.WithStack(err)
+}
+
 func (c keyVizLabeledCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	if gr, ok := c.inner.(GroupRoutableCoordinator); ok {
 		return gr.EngineGroupIDForKey(key)
 	}
 	return 0
+}
+
+func (c keyVizLabeledCoordinator) LocalLeaderGroupIDs() []uint64 {
+	if lg, ok := c.inner.(interface{ LocalLeaderGroupIDs() []uint64 }); ok {
+		return lg.LocalLeaderGroupIDs()
+	}
+	return nil
 }

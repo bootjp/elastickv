@@ -19,6 +19,14 @@ import (
 
 type InternalOption func(*Internal)
 
+// WithInternalWriteGate re-applies the coordinator's route-floor check to
+// writes that were forwarded here from a follower.
+func WithInternalWriteGate(gate kv.MutationWriteGate) InternalOption {
+	return func(i *Internal) {
+		i.writeGate = gate
+	}
+}
+
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
 	return func(i *Internal) {
 		i.tsAllocator = alloc
@@ -49,16 +57,21 @@ func WithInternalMigrationPromoteGate(gate func(context.Context) error) Internal
 	}
 }
 
-func WithInternalRouteEngine(engine *distribution.Engine) InternalOption {
-	return func(i *Internal) {
-		i.routeEngine = engine
-	}
-}
-
 func WithInternalMigrationExportRouting(groupID uint64, resolver kv.PartitionResolver) InternalOption {
 	return func(i *Internal) {
 		i.migrationExportGroupID = groupID
 		i.migrationExportResolver = resolver
+	}
+}
+
+// ForwardWriteObserver observes successfully committed leader-side forwarded
+// writes. It lets the autosplit sampler account for writes that entered through
+// followers without coupling adapter.Internal to keyviz.
+type ForwardWriteObserver func([]*pb.Request)
+
+func WithInternalForwardWriteObserver(observer ForwardWriteObserver) InternalOption {
+	return func(i *Internal) {
+		i.forwardWriteObserver = observer
 	}
 }
 
@@ -87,9 +100,10 @@ type Internal struct {
 	migrationProposer       raftengine.Proposer
 	migrationImportGate     func(context.Context) error
 	migrationPromoteGate    func(context.Context) error
-	routeEngine             *distribution.Engine
 	migrationExportGroupID  uint64
 	migrationExportResolver kv.PartitionResolver
+	writeGate               kv.MutationWriteGate
+	forwardWriteObserver    ForwardWriteObserver
 
 	pb.UnimplementedInternalServer
 }
@@ -139,6 +153,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 			Success:     false,
 			CommitIndex: 0,
 		}, errors.WithStack(err)
+	}
+	if i.forwardWriteObserver != nil {
+		i.forwardWriteObserver(req.GetRequests())
 	}
 
 	return &pb.ForwardResponse{
@@ -662,66 +679,25 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 			}
 			r.Ts = ts
 		}
-		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, r.Ts); err != nil {
+		// The follower that forwarded this write could not run the route-floor
+		// check: its own stamping path bails out when the group engine is not
+		// leader, so the timestamp only exists once we assign it here. Without
+		// this the write would reach Raft through the bare TransactionManager
+		// below with no MinWriteTSExclusive check at all. Already-stamped
+		// requests are re-checked too, because the floor may have advanced
+		// since the sender stamped them.
+		if err := i.ensureRawWriteAllowed(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (i *Internal) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commitTS uint64) error {
-	if i == nil || i.routeEngine == nil || commitTS == 0 {
+func (i *Internal) ensureRawWriteAllowed(r *pb.Request) error {
+	if i.writeGate == nil || r == nil {
 		return nil
 	}
-	routes := i.routeEngine.Stats()
-	for _, mut := range muts {
-		if mut == nil || forwardedTxnControlMutation(mut) || (len(mut.Key) == 0 && mut.GetOp() != pb.Op_DEL_PREFIX) {
-			continue
-		}
-		if err := rejectMutationBelowRouteWriteFloor(routes, mut, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func rejectMutationBelowRouteWriteFloor(routes []distribution.Route, mut *pb.Mutation, commitTS uint64) error {
-	for _, route := range routes {
-		if routeWriteTimestampFloorApplies(route, mut, commitTS) {
-			return errors.Wrapf(kv.ErrRouteWriteTimestampTooLow, "key %q commit_ts=%d floor=%d", mut.Key, commitTS, route.MinWriteTSExclusive)
-		}
-	}
-	return nil
-}
-
-func forwardedTxnControlMutation(mut *pb.Mutation) bool {
-	return mut != nil && bytes.HasPrefix(mut.GetKey(), []byte(kv.TxnKeyPrefix))
-}
-
-func routeWriteTimestampFloorApplies(route distribution.Route, mut *pb.Mutation, commitTS uint64) bool {
-	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
-		return false
-	}
-	if mut.GetOp() == pb.Op_DEL_PREFIX {
-		start, end := kv.RoutePrefixRange(mut.GetKey())
-		return rangesIntersect(route.Start, route.End, start, end)
-	}
-	if start, end, ok := forwardedS3BucketAuxiliaryRouteRange(mut.GetKey()); ok {
-		return rangesIntersect(route.Start, route.End, start, end)
-	}
-	return kv.RouteKeyFilter(route.Start, route.End)(mut.GetKey())
-}
-
-func forwardedS3BucketAuxiliaryRouteRange(key []byte) ([]byte, []byte, bool) {
-	bucket, ok := s3keys.ParseBucketMetaKey(key)
-	if !ok {
-		bucket, ok = s3keys.ParseBucketGenerationKey(key)
-	}
-	if !ok {
-		return nil, nil, false
-	}
-	start := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return start, prefixScanEnd(start), true
+	return errors.WithStack(i.writeGate.EnsureMutationsWriteAllowed(r.Mutations, r.Ts))
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {
@@ -748,10 +724,44 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 	if err != nil {
 		return 0, err
 	}
-	if err := i.rejectWriteTimestampFloorTxnRequests(reqs); err != nil {
+	if err := i.ensureTxnWritesAllowed(reqs, commitTS); err != nil {
 		return 0, err
 	}
 	return commitTS, nil
+}
+
+func (i *Internal) ensureTxnWritesAllowed(reqs []*pb.Request, commitTS uint64) error {
+	if i.writeGate == nil || commitTS == 0 {
+		return nil
+	}
+	for _, r := range reqs {
+		if r == nil || !r.IsTxn {
+			continue
+		}
+		if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE {
+			continue
+		}
+		muts := forwardedTxnUserMutations(r.Mutations)
+		if len(muts) == 0 {
+			continue
+		}
+		if err := i.writeGate.EnsureMutationsWriteAllowed(muts, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func forwardedTxnUserMutations(muts []*pb.Mutation) []*pb.Mutation {
+	out := make([]*pb.Mutation, 0, len(muts))
+	metaPrefix := []byte(kv.TxnMetaPrefix)
+	for _, mut := range muts {
+		if mut == nil || bytes.HasPrefix(mut.Key, metaPrefix) {
+			continue
+		}
+		out = append(out, mut)
+	}
+	return out
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
@@ -842,34 +852,6 @@ func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, u
 		metaMutations = append(metaMutations, forwardedTxnMetaToUpdate{m: m, meta: meta})
 	}
 	return metaMutations, commitTS, nil
-}
-
-func (i *Internal) rejectWriteTimestampFloorTxnRequests(reqs []*pb.Request) error {
-	for _, r := range reqs {
-		commitTS, ok := forwardedTxnRequestCommitTS(r)
-		if !ok {
-			continue
-		}
-		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func forwardedTxnRequestCommitTS(r *pb.Request) (uint64, bool) {
-	if r == nil || (r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE) {
-		return 0, false
-	}
-	m, ok := forwardedTxnMetaMutation(r, []byte(kv.TxnMetaPrefix))
-	if !ok {
-		return 0, false
-	}
-	meta, err := kv.DecodeTxnMeta(m.Value)
-	if err != nil || meta.CommitTS == 0 {
-		return 0, false
-	}
-	return meta.CommitTS, true
 }
 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded

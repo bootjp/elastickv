@@ -434,6 +434,9 @@ func (s *LeaderRoutedStore) ScanKeysAtWithReadFence(ctx context.Context, start [
 	}
 	ok, fenceTS := s.leaderFenceTS(ctx, start)
 	if ok {
+		if readRouteVersion != 0 {
+			return nil, errors.WithStack(store.ErrNotSupported)
+		}
 		keys, err := s.local.ScanKeysAt(ctx, start, end, limit, max(ts, fenceTS))
 		return keys, errors.WithStack(err)
 	}

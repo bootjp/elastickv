@@ -538,9 +538,18 @@ func (r *s3AdminObjectReader) ensureBuffered() error {
 			r.chunkIdx = 0
 			continue
 		}
-		chunkKey := s3keys.VersionedBlobKey(r.bucket, r.generation, r.key,
-			r.manifest.UploadID, part.PartNo, r.chunkIdx, part.PartVersion)
-		chunk, err := r.server.store.GetAt(r.ctx, chunkKey, r.readTS)
+		expectedSize := part.ChunkSizes[r.chunkIdx]
+		chunk, err := r.server.readS3ObjectChunk(
+			r.ctx,
+			r.bucket,
+			r.generation,
+			r.key,
+			r.manifest.UploadID,
+			part,
+			r.chunkIdx,
+			expectedSize,
+			r.readTS,
+		)
 		if err != nil {
 			return errors.WithStack(err)
 		}

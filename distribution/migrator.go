@@ -54,6 +54,7 @@ const (
 	MigrationFamilyS3Blob
 	MigrationFamilyS3GCUpload
 	MigrationFamilyLegacyListMetaDelta
+	MigrationFamilyS3ChunkRef
 	// MigrationFamilyFilesystemChunk is appended last on purpose: the values
 	// above are the migration wire contract, so inserting anywhere earlier
 	// would renumber families that peers already use.
@@ -188,6 +189,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(s3keys.UploadMetaPrefix),
 	[]byte(s3keys.UploadPartPrefix),
 	[]byte(s3keys.BlobPrefix),
+	[]byte(s3keys.ChunkRefPrefix),
 	[]byte(s3keys.GCUploadPrefix),
 	// Every family bracket's prefix belongs here so the user bracket does not
 	// also export those rows. A filesystem-chunk route interval can span both
@@ -532,6 +534,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyS3UploadMeta, prefix: s3keys.UploadMetaPrefix},
 		{family: MigrationFamilyS3UploadPart, prefix: s3keys.UploadPartPrefix},
 		{family: MigrationFamilyS3Blob, prefix: s3keys.BlobPrefix},
+		{family: MigrationFamilyS3ChunkRef, prefix: s3keys.ChunkRefPrefix},
 		{family: MigrationFamilyS3GCUpload, prefix: s3keys.GCUploadPrefix},
 		// File chunk payloads live under !fs|chk| but route through a virtual
 		// !fs|route|chk| key via fskeys.ExtractRouteKey. "!fs|chk|" sorts below

@@ -1009,6 +1009,14 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 }
 
 func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, false)
+}
+
+func (r *RedisServer) elasticKVZRemFast(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, true)
+}
+
+func (r *RedisServer) zremWithTypeProbe(conn redcon.Conn, cmd redcon.Command, fastMiss bool) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1017,7 +1025,7 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
 		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
+		typ, err := r.zremTypeAt(ctx, cmd.Args[1], readTS, fastMiss)
 		if err != nil {
 			return err
 		}
@@ -1044,6 +1052,28 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 		return
 	}
 	conn.WriteInt(removed)
+}
+
+func (r *RedisServer) zremTypeAt(ctx context.Context, key []byte, readTS uint64, fastMiss bool) (redisValueType, error) {
+	if !fastMiss {
+		return r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+	}
+	typ, err := r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
+	if err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	return r.legacyZSetTypeAt(ctx, key, readTS)
+}
+
+func (r *RedisServer) legacyZSetTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	exists, err := r.store.ExistsAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		return redisTypeNone, cockerrors.WithStack(err)
+	}
+	if !exists {
+		return redisTypeNone, nil
+	}
+	return r.applyTTLFilter(ctx, key, readTS, redisTypeZSet)
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
@@ -1245,9 +1275,9 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 	// full, starving the fallback timer and letting a wrongType
 	// write on a co-registered key (multi-key BZPOPMIN) go
 	// undetected for the entire BLOCK window. Demoting `fast` back
-	// to false after redisBlockWaitFallback elapses since the last
+	// to false after the configured block fallback elapses since the last
 	// full check restores the #666 ceiling: WRONGTYPE on any
-	// registered key surfaces within ~one fallback interval (100 ms)
+	// registered key surfaces within ~one fallback interval
 	// regardless of signal rate. See
 	// TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad for the
 	// regression scenario.
@@ -1275,8 +1305,8 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteNull()
 			return
 		}
-		signaled := waitForBlockedCommandUpdate(handlerCtx, w, deadline)
-		fast = signaled && time.Since(lastFullCheck) < redisBlockWaitFallback
+		signaled := waitForBlockedCommandUpdate(handlerCtx, w, deadline, r.blockWaitFallback)
+		fast = signaled && time.Since(lastFullCheck) < r.blockWaitFallback
 	}
 }
 
@@ -1325,8 +1355,11 @@ func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast b
 // because writes that bypass fast-safe Signal (Lua flush, follower-applied
 // entries, wrongType-introducing commands) may be observable only through those
 // paths.
-func waitForBlockedCommandUpdate(handlerCtx context.Context, waiter *keyWaiter, deadline time.Time) bool {
-	fallback := redisBlockWaitFallback
+func waitForBlockedCommandUpdate(handlerCtx context.Context, waiter *keyWaiter, deadline time.Time, fallbackInterval time.Duration) bool {
+	fallback := fallbackInterval
+	if fallback <= 0 {
+		fallback = defaultRedisBlockWaitFallback
+	}
 	if remaining := time.Until(deadline); remaining < fallback {
 		fallback = remaining
 	}

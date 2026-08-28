@@ -393,6 +393,7 @@ func TestDistributionServerSplitRange_Success(t *testing.T) {
 	require.Equal(t, uint64(99), resp.Right.MinWriteTsExclusive)
 	require.NotZero(t, resp.Left.SplitAtHlc)
 	require.Equal(t, resp.Left.SplitAtHlc, resp.Right.SplitAtHlc)
+	require.Equal(t, uint64(99), resp.Right.MinWriteTsExclusive)
 
 	snapshot, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
@@ -829,8 +830,9 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 	require.Equal(t, 1, coordinator.dispatchCalls)
 	require.Equal(t, readSnapshot.ReadTS, coordinator.lastStartTS)
-	require.Zero(t, coordinator.lastRequestedCommitTS)
+	require.NotZero(t, coordinator.lastRequestedCommitTS)
 	require.NotZero(t, coordinator.lastCommitTS)
+	require.Equal(t, coordinator.lastRequestedCommitTS, coordinator.lastCommitTS)
 	require.Greater(t, coordinator.lastCommitTS, coordinator.lastStartTS)
 
 	snapshot, err := catalog.Snapshot(ctx)
@@ -843,6 +845,14 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, coordinator.lastCommitTS, right.SplitAtHLC)
 	require.Equal(t, coordinator.lastCommitTS, resp.Left.SplitAtHlc)
 	require.Equal(t, coordinator.lastCommitTS, resp.Right.SplitAtHlc)
+
+	changes, err := catalog.ChangesSince(ctx, saved.Version, 1)
+	require.NoError(t, err)
+	require.Len(t, changes.Deltas, 1)
+	require.Len(t, changes.Deltas[0].Mutations, 3)
+	require.Equal(t, distribution.CatalogMutationDelete, changes.Deltas[0].Mutations[0].Op)
+	require.Equal(t, coordinator.lastCommitTS, changes.Deltas[0].Mutations[1].Route.SplitAtHLC)
+	require.Equal(t, coordinator.lastCommitTS, changes.Deltas[0].Mutations[2].Route.SplitAtHLC)
 }
 
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
@@ -972,6 +982,29 @@ func TestDistributionServerSplitRange_ReturnsExactCommittedSplitVersion(t *testi
 	latest, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)
 	require.Equal(t, uint64(3), latest.Version)
+}
+
+func TestDistributionServerApplyEngineSnapshotAcceptsNewerEngine(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	recent := distribution.CatalogSnapshot{
+		Version: 3,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte(""),
+			End:     nil,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}
+	require.NoError(t, engine.ApplySnapshot(recent))
+
+	s := NewDistributionServer(engine, nil)
+	stale := recent
+	stale.Version = 2
+	require.NoError(t, s.applyEngineSnapshot(stale))
+	require.Equal(t, uint64(3), engine.Version())
 }
 
 func TestDistributionServerSplitRange_RetriesCatalogReloadUntilVisible(t *testing.T) {

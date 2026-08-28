@@ -1322,6 +1322,11 @@ func sqsQueryErrorDetails(err error) (int, string, string, int) {
 	code := sqsErrInternalFailure
 	message := "internal error"
 	retryAfter := 0
+	if isSQSServiceUnavailable(err) {
+		status = http.StatusServiceUnavailable
+		code = sqsErrServiceUnavailable
+		message = "service unavailable"
+	}
 	var throttled *sqsThrottlingError
 	if errors.As(err, &throttled) {
 		status = http.StatusBadRequest

@@ -453,6 +453,10 @@ func TestOpenInitializesAppliedIndexFromPersistedSnapshot(t *testing.T) {
 	})
 
 	require.GreaterOrEqual(t, engine.Status().AppliedIndex, uint64(5))
+	require.Eventually(t, func() bool {
+		return engine.Status().ConfigurationIndex == engine.currentConfigIndex() &&
+			engine.Status().ConfigurationIndex > 0
+	}, time.Second, 10*time.Millisecond)
 }
 
 func TestOpenRestoresPeersFromPersistedMetadata(t *testing.T) {
@@ -1743,7 +1747,7 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
 }
 
-func TestOpenMultiNodeWaitStartedWaitsForCommittedTailDrain(t *testing.T) {
+func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
 	dir := t.TempDir()
 	peers := []Peer{
 		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
@@ -1781,25 +1785,19 @@ func TestOpenMultiNodeWaitStartedWaitsForCommittedTailDrain(t *testing.T) {
 		done <- openResult{engine: engine, err: err}
 	}()
 
-	result := requireOpenResult(t, done, time.Second, "multi-node Open did not return before committed tail drain completed")
+	requireSignal(t, fsm.started, time.Second, "startup committed tail was not being applied")
+	requireNoOpenResult(t, done, 20*time.Millisecond, "multi-node Open returned before committed tail drain completed")
+
+	close(fsm.release)
+
+	result := requireOpenResult(t, done, time.Second, "multi-node Open did not return after committed tail drain completed")
 	require.NoError(t, result.err)
 	require.NotNil(t, result.engine)
 	defer func() {
 		require.NoError(t, result.engine.Close())
 	}()
 
-	requireSignal(t, fsm.started, time.Second, "startup committed tail was not being applied")
-
-	waitDone := make(chan error, 1)
-	go func() {
-		waitDone <- result.engine.WaitStarted(context.Background())
-	}()
-
-	requireNoStartupWaitResult(t, waitDone, 20*time.Millisecond, "WaitStarted returned before committed tail drain completed")
-
-	close(fsm.release)
-
-	requireStartupWaitResult(t, waitDone, time.Second, "WaitStarted did not return after committed tail drain completed")
+	require.NoError(t, result.engine.WaitStarted(context.Background()))
 	requireSignal(t, result.engine.startedCh, time.Second, "engine did not mark started after committed tail drain completed")
 	require.Equal(t, []orderEvent{{kind: "bump", index: 2}}, rec.snapshot(),
 		"startup must persist the committed tail applied index before marking the engine started")
@@ -1821,30 +1819,25 @@ func requireOpenResult(t *testing.T, ch <-chan openResult, timeout time.Duration
 	}
 }
 
+func requireNoOpenResult(t *testing.T, ch <-chan openResult, timeout time.Duration, msg string) {
+	t.Helper()
+	select {
+	case result := <-ch:
+		if result.engine != nil {
+			_ = result.engine.Close()
+		}
+		if result.err != nil {
+			t.Fatalf("%s: Open returned error: %v", msg, result.err)
+		}
+		t.Fatal(msg)
+	case <-time.After(timeout):
+	}
+}
+
 func requireSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg string) {
 	t.Helper()
 	select {
 	case <-ch:
-	case <-time.After(timeout):
-		t.Fatal(msg)
-	}
-}
-
-func requireNoStartupWaitResult(t *testing.T, ch <-chan error, timeout time.Duration, msg string) {
-	t.Helper()
-	select {
-	case err := <-ch:
-		require.NoError(t, err)
-		t.Fatal(msg)
-	case <-time.After(timeout):
-	}
-}
-
-func requireStartupWaitResult(t *testing.T, ch <-chan error, timeout time.Duration, msg string) {
-	t.Helper()
-	select {
-	case err := <-ch:
-		require.NoError(t, err)
 	case <-time.After(timeout):
 		t.Fatal(msg)
 	}
@@ -2093,6 +2086,44 @@ func TestPendingConfChangeFenceTracksUnappliedConfig(t *testing.T) {
 
 	engine.clearPendingConfChange(12)
 	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestProposeMembershipChangeRejectsPendingConfig(t *testing.T) {
+	engine := &Engine{}
+	engine.markPendingConfChange(12)
+	done := make(chan adminResult, 1)
+	req := adminRequest{id: 17, done: done}
+
+	engine.proposeMembershipChange(req, raftpb.ConfChangeRemoveNode, Peer{NodeID: 2, ID: "n2"})
+
+	result := <-done
+	require.ErrorIs(t, result.err, errMembershipConfChangePending)
+	require.Empty(t, engine.pendingConfigs)
+}
+
+func TestReconcilePendingConfChangeFenceClearsOverwrittenProposal(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 10, 12, map[uint64]raftpb.Entry{
+		12: {
+			Type: entryTypePtr(raftpb.EntryNormal),
+			Data: []byte("replacement leader entry"),
+		},
+	})
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(10)
+	engine.markPendingConfChange(12)
+
+	require.NoError(t, engine.reconcilePendingConfChangeFence())
+	require.False(t, engine.hasPendingConfChange())
+}
+
+func TestReconcilePendingConfChangeFenceKeepsUnstableProposal(t *testing.T) {
+	storage := committedTailStorageWithEntries(t, 10, 11, nil)
+	engine := &Engine{storage: storage}
+	engine.appliedIndex.Store(10)
+	engine.markPendingConfChange(12)
+
+	require.NoError(t, engine.reconcilePendingConfChangeFence())
+	require.True(t, engine.hasPendingConfChange())
 }
 
 func TestRestorePendingConfChangeFenceFromStorage(t *testing.T) {

@@ -2,7 +2,9 @@ package kv
 
 import (
 	"context"
+	"encoding/binary"
 	"errors"
+	"math"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -23,7 +25,8 @@ type fakeLeaseEngine struct {
 	linearizableCalls        atomic.Int32
 	proposeErr               error // when set, Propose returns it (warm-up failure tests)
 	proposeCalls             atomic.Int32
-	proposeHook              func() // invoked inside Propose before returning (race injection)
+	proposeHook              func()       // invoked inside Propose before returning (race injection)
+	proposeApply             func([]byte) // invoked after a successful propose (FSM apply simulation)
 	proposeCtxHook           func(context.Context)
 	state                    atomic.Value // stores raftengine.State; default Leader
 	lastQuorumAckMonoNs      atomic.Int64 // 0 = no ack yet. Updated by setQuorumAck().
@@ -63,7 +66,7 @@ func (e *fakeLeaseEngine) Status() raftengine.Status {
 func (e *fakeLeaseEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (e *fakeLeaseEngine) Propose(ctx context.Context, _ []byte) (*raftengine.ProposalResult, error) {
+func (e *fakeLeaseEngine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	e.proposeCalls.Add(1)
 	if e.proposeCtxHook != nil {
 		e.proposeCtxHook(ctx)
@@ -73,6 +76,9 @@ func (e *fakeLeaseEngine) Propose(ctx context.Context, _ []byte) (*raftengine.Pr
 	}
 	if e.proposeErr != nil {
 		return nil, e.proposeErr
+	}
+	if e.proposeApply != nil {
+		e.proposeApply(data)
 	}
 	return &raftengine.ProposalResult{}, nil
 }
@@ -185,6 +191,21 @@ func (e *fakeLeaseEngine) setQuorumAck(i monoclock.Instant) {
 		return
 	}
 	e.lastQuorumAckMonoNs.Store(i.Nanos())
+}
+
+func applyHLCLeaseEntryToClock(t testing.TB, clock *HLC) func([]byte) {
+	t.Helper()
+	return func(data []byte) {
+		if len(data) != hlcLeaseEntryLen || data[0] != raftEncodeHLCLease {
+			return
+		}
+		rawCeilingMs := binary.BigEndian.Uint64(data[1:])
+		if rawCeilingMs > uint64(math.MaxInt64) {
+			t.Error("invalid HLC lease ceiling")
+			return
+		}
+		clock.SetPhysicalCeiling(int64(rawCeilingMs))
+	}
 }
 
 // --- Coordinate.LeaseRead -----------------------------------------------

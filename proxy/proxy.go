@@ -59,7 +59,7 @@ func NewProxyServer(cfg ProxyConfig, dual *DualWriter, metrics *ProxyMetrics, se
 
 // ListenAndServe starts the redcon proxy server.
 func (p *ProxyServer) ListenAndServe(ctx context.Context) error {
-	if p.cfg.Mode == ModeRedisOnly && p.cfg.RedisOnlyRaw {
+	if p.cfg.RedisOnlyRaw && p.cfg.Mode == ModeRedisOnly {
 		return p.listenAndServeRawRedis(ctx)
 	}
 
@@ -434,8 +434,11 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 		conn.WriteError("ERR empty transaction response")
 	}
 
+	// Async replay to secondary (bounded)
 	if p.dual.hasSecondaryWrite() {
-		p.dual.replaySecondaryPipeline(cmds)
+		p.dual.goTxnReplay(cmds, func(ctx context.Context) {
+			p.dual.writeSecondaryPipeline(ctx, cmds)
+		})
 	}
 }
 

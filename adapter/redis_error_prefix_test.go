@@ -37,6 +37,7 @@ func TestIsTransientLeaderRedisError(t *testing.T) {
 		{"adapter.ErrLeaderNotFound", ErrLeaderNotFound, true},
 		{"adapter.ErrNotLeader", ErrNotLeader, true},
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound, true},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen, true},
 		{"raftengine.ErrNotLeader", raftengine.ErrNotLeader, true},
 		{"raftengine.ErrLeadershipLost", raftengine.ErrLeadershipLost, true},
 		{"raftengine.ErrLeadershipTransferInProgress",
@@ -67,6 +68,8 @@ func TestIsTransientLeaderRedisError(t *testing.T) {
 			errors.New("rpc error: code = Aborted desc = raft engine: leadership lost"), true},
 		{"grpc-wrapped leadership transfer",
 			errors.New("rpc error: code = Aborted desc = raft engine: leadership transfer in progress"), true},
+		{"grpc-wrapped leader proxy circuit open",
+			errors.New("rpc error: code = Unavailable desc = leader proxy circuit open"), true},
 		// Suffix discipline: a user-controlled key in the middle
 		// of the message must NOT trigger a false positive. The kv
 		// suffix matcher pins this exact scenario; mirror it here.
@@ -121,7 +124,7 @@ func TestWriteRedisError(t *testing.T) {
 		// instead of :prefix :leader. This covers proxyDBSize / proxyDel /
 		// proxyFlushDatabase / proxyFlushLegacy in redis_proxy.go +
 		// proxyKeys / proxyLRange / proxyRPush / proxyLPush /
-		// leaderClientForKey / resolveLeaderRedisAddr in redis.go — all
+		// leaderClientForRedisUserKey / resolveLeaderRedisAddr in redis.go — all
 		// errors.Newf'd with the same "ERR leader redis address unknown
 		// for %s" prefix.
 		{"leader-address-unknown config-gap is already ERR-prefixed",
@@ -175,6 +178,52 @@ func TestHandleProxyTxnError(t *testing.T) {
 
 }
 
+func TestHandleProxyTxnTerminalExecError(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{
+			name: "ambiguous route change typed",
+			err:  errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt),
+			want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+		},
+		{
+			name: "ambiguous route change decoded RESP",
+			err:  errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error()),
+			want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+		},
+		{
+			name: "split leader typed",
+			err:  errors.WithStack(errRedisExecSplitShardLeaders),
+			want: errRedisExecSplitShardLeaders.Error(),
+		},
+		{
+			name: "split leader decoded RESP",
+			err:  errors.New(errRedisExecSplitShardLeaders.Error()),
+			want: errRedisExecSplitShardLeaders.Error(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c := &captureConn{}
+			handled := handleProxyTxnError(c, tc.err)
+			if !handled {
+				t.Fatal("handleProxyTxnError returned false")
+			}
+			if c.lastErr != tc.want {
+				t.Fatalf("last error = %q", c.lastErr)
+			}
+			if c.wroteArray {
+				t.Fatalf("unexpected array reply %d", c.lastArray)
+			}
+		})
+	}
+}
+
 func TestHandleProxyTxnHeavyCommandBusyError(t *testing.T) {
 	t.Parallel()
 	c := &captureConn{}
@@ -216,6 +265,51 @@ func TestHandleProxyTxnCommandError(t *testing.T) {
 		}
 		if c.lastErr != "" {
 			t.Fatalf("unexpected error reply %q", c.lastErr)
+		}
+	})
+
+	t.Run("ambiguous route change is promoted to top-level EXEC error", func(t *testing.T) {
+		t.Parallel()
+
+		for _, tc := range []struct {
+			name string
+			err  error
+			want string
+		}{
+			{
+				name: "ambiguous route change typed",
+				err:  errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt),
+				want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+			},
+			{
+				name: "ambiguous route change decoded RESP",
+				err:  errors.New(errRedisExecRouteChangedAfterAmbiguousAttempt.Error()),
+				want: errRedisExecRouteChangedAfterAmbiguousAttempt.Error(),
+			},
+			{
+				name: "split leader typed",
+				err:  errors.WithStack(errRedisExecSplitShardLeaders),
+				want: errRedisExecSplitShardLeaders.Error(),
+			},
+			{
+				name: "split leader decoded RESP",
+				err:  errors.New(errRedisExecSplitShardLeaders.Error()),
+				want: errRedisExecSplitShardLeaders.Error(),
+			},
+		} {
+			t.Run(tc.name, func(t *testing.T) {
+				t.Parallel()
+				cmd := redis.NewCmd(context.Background(), "SET", "k", "v")
+				cmd.SetErr(tc.err)
+				c := &captureConn{}
+				handled := handleProxyTxnCommandError(c, []*redis.Cmd{cmd})
+				if !handled {
+					t.Fatal("handleProxyTxnCommandError returned false")
+				}
+				if c.lastErr != tc.want {
+					t.Fatalf("last error = %q", c.lastErr)
+				}
+			})
 		}
 	})
 
