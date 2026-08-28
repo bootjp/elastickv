@@ -652,6 +652,84 @@ func TestShardStoreS3BucketAuxiliaryScanHonorsStagedTombstone(t *testing.T) {
 	require.Empty(t, kvs)
 }
 
+type versionVisibleRawKVServer struct {
+	pb.UnimplementedRawKVServer
+
+	mu         sync.Mutex
+	visible    map[string]bool
+	latestReqs []*pb.RawLatestCommitTSRequest
+}
+
+func (s *versionVisibleRawKVServer) RawGet(context.Context, *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	return &pb.RawGetResponse{}, nil
+}
+
+func (s *versionVisibleRawKVServer) RawScanAt(context.Context, *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+	return &pb.RawScanAtResponse{}, nil
+}
+
+func (s *versionVisibleRawKVServer) RawLatestCommitTS(_ context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latestReqs = append(s.latestReqs, &pb.RawLatestCommitTSRequest{
+		Key:                bytes.Clone(req.GetKey()),
+		GroupId:            req.GetGroupId(),
+		ReadRouteVersion:   req.GetReadRouteVersion(),
+		VersionVisibleAtTs: req.GetVersionVisibleAtTs(),
+	})
+	return &pb.RawLatestCommitTSResponse{
+		VersionVisible:          s.visible[string(req.GetKey())],
+		VersionVisibleSupported: true,
+	}, nil
+}
+
+func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	migratedKey := s3keys.BucketMetaKey(bucket)
+	stagedKey := distribution.MigrationStagedDataKey(9, migratedKey)
+	probe := &versionVisibleRawKVServer{
+		visible: map[string]bool{string(stagedKey): true},
+	}
+	addr, stop := startRawKVServer(t, probe)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {
+			Store:  store.NewMVCCStore(),
+			Engine: &followerProxyEngine{leader: addr},
+		},
+	}
+	st := NewShardStore(engine, groups)
+	visibleKey := s3keys.BucketMetaKey("bucket-z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, visibleKey, []byte("visible"), 10, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	kvs, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 0, 77, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: visibleKey, Value: []byte("visible")}}, kvs)
+
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	require.Len(t, probe.latestReqs, 2)
+	require.Equal(t, migratedKey, probe.latestReqs[0].GetKey())
+	require.Equal(t, stagedKey, probe.latestReqs[1].GetKey())
+	for _, req := range probe.latestReqs {
+		require.Equal(t, uint64(2), req.GetGroupId())
+		require.Equal(t, uint64(77), req.GetReadRouteVersion())
+		require.Equal(t, uint64(30), req.GetVersionVisibleAtTs())
+	}
+}
+
 func TestShardStoreGetAt_ContinuesLatestVersionExportPages(t *testing.T) {
 	t.Parallel()
 
