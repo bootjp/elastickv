@@ -258,7 +258,9 @@ func (r *RedisServer) probeStringTypes(ctx context.Context, key []byte, readTS u
 }
 
 // probeListType detects lists via the base meta key or any delta key.
-// Delta scan is bounded to 1 result.
+// Current-format delta scans are bounded to 1 result. Legacy deltas overlap
+// old list-meta shapes, so they first take the same cheap probe and only page
+// when the first row proves that ambiguous legacy decoding is actually needed.
 func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
 	metaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
 	if err != nil {
@@ -281,12 +283,26 @@ func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint
 
 func (r *RedisServer) listMetaDeltaExistsAt(ctx context.Context, key []byte, deltaPrefix []byte, readTS uint64) (bool, error) {
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	if !isLegacyListMetaDeltaPrefix(deltaPrefix) {
-		deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
-		if err != nil {
-			return false, errors.WithStack(err)
-		}
-		return len(deltaKVs) > 0, nil
+	if isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		return r.legacyListMetaDeltaExistsAt(ctx, key, deltaPrefix, deltaEnd, readTS)
+	}
+	deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return len(deltaKVs) > 0, nil
+}
+
+func (r *RedisServer) legacyListMetaDeltaExistsAt(ctx context.Context, key []byte, deltaPrefix []byte, deltaEnd []byte, readTS uint64) (bool, error) {
+	firstKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if len(firstKVs) == 0 {
+		return false, nil
+	}
+	if legacyListDeltaPairForUserKey(firstKVs[0], key) {
+		return true, nil
 	}
 	cursor := deltaPrefix
 	for {

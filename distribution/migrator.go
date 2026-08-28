@@ -55,6 +55,7 @@ const (
 	MigrationFamilyLegacyListMetaDelta
 	MigrationFamilyS3ChunkRef
 	MigrationFamilyFilesystemChunk
+	MigrationFamilyFilesystemUsage
 )
 
 const (
@@ -141,6 +142,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(s3keys.ChunkRefPrefix),
 	[]byte(s3keys.GCUploadPrefix),
 	fskeys.ChunkAllPrefix(),
+	fskeys.UsageRouteAllPrefix(),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -448,6 +450,7 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyS3ChunkRef, prefix: s3keys.ChunkRefPrefix},
 		{family: MigrationFamilyS3GCUpload, prefix: s3keys.GCUploadPrefix},
 		{family: MigrationFamilyFilesystemChunk, prefix: string(fskeys.ChunkAllPrefix())},
+		{family: MigrationFamilyFilesystemUsage, prefix: string(fskeys.UsageRouteAllPrefix())},
 	}
 
 	out := make([]MigrationBracket, 0, len(defs))

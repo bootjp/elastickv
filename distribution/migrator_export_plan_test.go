@@ -65,6 +65,7 @@ func TestPlanMigrationBracketsIncludesRequiredFamilies(t *testing.T) {
 		MigrationFamilyS3ChunkRef:                      s3keys.ChunkRefPrefix,
 		MigrationFamilyS3GCUpload:                      s3keys.GCUploadPrefix,
 		MigrationFamilyFilesystemChunk:                 string(fskeys.ChunkAllPrefix()),
+		MigrationFamilyFilesystemUsage:                 string(fskeys.UsageRouteAllPrefix()),
 	}
 
 	for family, prefix := range required {
@@ -126,6 +127,7 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	user.End = nil
 	require.False(t, user.ContainsRawKey(s3keys.ChunkRefKey("bucket", 1, "object", "upload", 1, 0)))
 	require.False(t, user.ContainsRawKey(fskeys.ChunkKey(1, 2, 3)))
+	require.False(t, user.ContainsRawKey(fskeys.UsageRouteKey(fskeys.ChunkRouteKey(1, 2))))
 	for _, raw := range [][]byte{
 		[]byte("!txn|foo"),
 		[]byte("!stream|foo"),
@@ -144,6 +146,7 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 		[]byte(s3keys.ObjectManifestPrefix + "x"),
 		[]byte(migrationRedisPrefix + "string|k"),
 		[]byte(migrationHashPrefix + "meta|x"),
+		fskeys.UsageRouteKey(fskeys.ChunkRouteKey(1, 2)),
 	} {
 		require.False(t, user.ContainsRawKey(raw), "concrete internal key %q must be excluded from familyUser", raw)
 	}
@@ -295,6 +298,24 @@ func TestMigrationBracketContainsRoutedKeyUsesFilesystemChunkRoutes(t *testing.T
 	))
 }
 
+func TestMigrationBracketContainsRoutedKeyUsesFilesystemUsageRoutes(t *testing.T) {
+	t.Parallel()
+
+	brackets, err := PlanMigrationBrackets([]byte("m"), []byte("z"))
+	require.NoError(t, err)
+	usage := bracketsByFamily(brackets)[MigrationFamilyFilesystemUsage]
+	routeKey := fskeys.ChunkRouteKey(10, 20)
+	key := fskeys.UsageRouteKey(routeKey)
+
+	require.True(t, usage.ContainsRoutedKey(key, routeKey, prefixScanEnd(routeKey), fskeys.ExtractRouteKey))
+	require.False(t, usage.ContainsRoutedKey(
+		key,
+		fskeys.ChunkRouteKey(11, 20),
+		nil,
+		fskeys.ExtractRouteKey,
+	))
+}
+
 func TestMigrationBracketContainsRoutedKeyAcceptsEmptyLogicalRouteKey(t *testing.T) {
 	t.Parallel()
 
@@ -421,6 +442,7 @@ func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 		[]byte(migrationDynamoMetaPrefix + "t"),
 		[]byte(migrationSQSQueueMetaPrefix + "q"),
 		[]byte(s3keys.BlobPrefix + "b"),
+		fskeys.UsageRouteKey(fskeys.ChunkRouteKey(1, 2)),
 	} {
 		require.True(t, IsMigrationKnownInternalKey(raw), "concrete internal key %q", raw)
 	}
