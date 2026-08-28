@@ -497,3 +497,61 @@ func TestBackupPayloadsHaltApplyWhenUnapplicable(t *testing.T) {
 		})
 	}
 }
+
+// A follower that applied a BackupPin but not its BackupRelease can catch up
+// from a snapshot the leader took after the release. That snapshot carries no
+// pin state and both log entries are already compacted, so the stale pin would
+// otherwise keep blocking compaction and snapshots on this replica -- and keep
+// consuming backup capacity -- until its deadline lapsed.
+func TestFSMRestoreClearsStaleBackupPins(t *testing.T) {
+	const groupID = uint64(7)
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSMWithGroup(t, tracker, groupID)
+	pinID := backupTrackerTestPinID(1)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: pinID, ReadTS: 75, Deadline: time.Now().Add(time.Hour),
+	}))))
+	require.Equal(t, uint64(75), tracker.OldestBackupForGroup(groupID))
+
+	// A snapshot taken on a replica with no pin, restored here.
+	source := newBackupTestFSMWithGroup(t, NewActiveTimestampTracker(
+		WithActiveTimestampTrackerSweepInterval(0)), groupID)
+	snapshot, err := source.Snapshot()
+	require.NoError(t, err)
+	var raw bytes.Buffer
+	_, err = snapshot.WriteTo(&raw)
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+
+	require.NoError(t, fsm.Restore(bytes.NewReader(raw.Bytes())))
+	require.Zero(t, tracker.OldestBackupForGroup(groupID),
+		"a restored snapshot must not leave this group's volatile pins behind")
+
+	// The snapshot itself must now be possible again -- the pin was what
+	// refused it.
+	restored, err := fsm.Snapshot()
+	require.NoError(t, err)
+	require.NoError(t, restored.Close())
+}
+
+// Only the restoring group's pins are dropped. A pin another group holds in
+// the shared tracker is unrelated to this group's snapshot.
+func TestFSMRestoreKeepsOtherGroupsBackupPins(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSMWithGroup(t, tracker, 7)
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(
+		backupTrackerTestPinID(2), 9, 60, time.Now().Add(time.Hour)))
+
+	source := newBackupTestFSMWithGroup(t, NewActiveTimestampTracker(
+		WithActiveTimestampTrackerSweepInterval(0)), 7)
+	snapshot, err := source.Snapshot()
+	require.NoError(t, err)
+	var raw bytes.Buffer
+	_, err = snapshot.WriteTo(&raw)
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+
+	require.NoError(t, fsm.Restore(bytes.NewReader(raw.Bytes())))
+	require.Equal(t, uint64(60), tracker.OldestBackupForGroup(9),
+		"another group's pin must survive this group's restore")
+}

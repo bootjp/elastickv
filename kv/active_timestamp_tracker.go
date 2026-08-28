@@ -310,6 +310,26 @@ func (t *ActiveTimestampTracker) ReleaseBackupPinForGroup(pinID BackupPinID, gro
 	delete(t.backupPins, newBackupPinKey(pinID, groupID))
 }
 
+// ClearBackupPinsForGroup drops every volatile backup pin recorded for one
+// Raft group. Snapshot restore is the caller: a follower that applied a
+// BackupPin but not its BackupRelease can catch up from a snapshot the leader
+// took after the release, and that snapshot legitimately carries no pin state
+// while both log entries are already compacted away. Keeping the old pin would
+// block compaction and snapshots on that replica, and hold backup capacity,
+// until its deadline lapsed.
+func (t *ActiveTimestampTracker) ClearBackupPinsForGroup(groupID uint64) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for key := range t.backupPins {
+		if key.groupID == groupID {
+			delete(t.backupPins, key)
+		}
+	}
+}
+
 func (t *ActiveTimestampTracker) ActiveBackupPinCount() int {
 	if t == nil {
 		return 0
