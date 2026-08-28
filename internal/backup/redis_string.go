@@ -729,25 +729,31 @@ func (r *RedisDB) Finalize() error {
 // RetainedRecordCount reports Redis source records represented by the native
 // dump after finalization. Derivable indexes are excluded by ScopeForKey;
 // orphan TTLs and meta-less stream records are removed here.
+// wideOrLegacyRecordCount counts a collection's stored rows. Wide-column keys
+// hold one row per element; a consolidated legacy blob is a single row however
+// many elements it carries, and the count-only baseline never decodes it, so
+// the element count is not available there either.
+func wideOrLegacyRecordCount(sawWide bool, wideElements int, legacySeen bool) uint64 {
+	if sawWide {
+		return nonNegativeRecordCount(wideElements)
+	}
+	return boolRecordCount(legacySeen)
+}
+
 func (r *RedisDB) RetainedRecordCount() uint64 {
 	count := r.simpleRecordCount + r.ttlRecordCount
 	count = subtractRecordCount(count, r.effectiveOrphanTTLCount())
 	for _, st := range r.hashes {
-		count += boolRecordCount(st.metaSeen) + uint64(len(st.fields))
+		count += boolRecordCount(st.metaSeen) + wideOrLegacyRecordCount(st.sawWide, len(st.fields), st.legacySeen)
 	}
 	for _, st := range r.lists {
 		count += boolRecordCount(st.metaSeen) + uint64(len(st.items))
 	}
 	for _, st := range r.sets {
-		count += boolRecordCount(st.metaSeen) + uint64(len(st.members))
+		count += boolRecordCount(st.metaSeen) + wideOrLegacyRecordCount(st.sawWide, len(st.members), st.legacySeen)
 	}
 	for _, st := range r.zsets {
-		count += boolRecordCount(st.metaSeen)
-		if st.sawWide {
-			count += uint64(len(st.members))
-		} else {
-			count += boolRecordCount(st.legacySeen)
-		}
+		count += boolRecordCount(st.metaSeen) + wideOrLegacyRecordCount(st.sawWide, len(st.members), st.legacySeen)
 	}
 	for _, st := range r.streams {
 		if st.metaSeen {

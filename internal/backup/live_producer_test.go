@@ -517,6 +517,17 @@ func TestLiveScopeCounterUsesRetainedCounts(t *testing.T) {
 			want: map[Scope]uint64{{Adapter: adapterSQS, Name: queue}: 3},
 		},
 		{
+			name:     "Redis legacy hash and set blobs count without their values",
+			adapters: AdapterSet{Redis: true},
+			records: []*pb.BackupKV{
+				// The baseline counts keys and never fetches these values, so
+				// the handlers must register the key instead of decoding.
+				{Key: hashLegacyBlobKey("profile")},
+				{Key: setLegacyBlobKey("tags")},
+			},
+			want: map[Scope]uint64{{Adapter: adapterRedis, Name: "db_0"}: 2},
+		},
+		{
 			name:     "Redis zset legacy row superseded by wide columns",
 			adapters: AdapterSet{Redis: true},
 			records: []*pb.BackupKV{

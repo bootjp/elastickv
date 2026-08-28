@@ -68,10 +68,13 @@ var ErrRedisInvalidSetKey = cockroachdberr.New("backup: malformed !st| key")
 // layouts for one key must drop the legacy members rather than union stale
 // ones onto the source of truth.
 type redisSetState struct {
-	metaSeen       bool
-	declaredLen    int64
-	members        map[string]struct{}
-	sawWide        bool
+	metaSeen    bool
+	declaredLen int64
+	members     map[string]struct{}
+	sawWide     bool
+	// legacySeen records a !redis|set| blob observed with no wide-column row.
+	// See redisHashState.legacySeen.
+	legacySeen     bool
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
@@ -104,6 +107,13 @@ func (r *RedisDB) HandleSetLegacyBlob(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidSetLegacyBlob, "key: %q", key)
 	}
+	if r.countOnly {
+		st := r.setState(userKey)
+		if !st.sawWide {
+			st.legacySeen = true
+		}
+		return nil
+	}
 	members, err := decodeSetLegacyBlobValue(value)
 	if err != nil {
 		return err
@@ -112,6 +122,7 @@ func (r *RedisDB) HandleSetLegacyBlob(key, value []byte) error {
 	if st.sawWide {
 		return nil
 	}
+	st.legacySeen = true
 	for _, member := range members {
 		st.members[member] = struct{}{}
 	}
