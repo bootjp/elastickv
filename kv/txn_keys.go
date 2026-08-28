@@ -17,6 +17,12 @@ const (
 	txnCommitPrefix   = TxnKeyPrefix + "cmt|"
 	txnRollbackPrefix = TxnKeyPrefix + "rb|"
 	txnMetaPrefix     = TxnKeyPrefix + "meta|"
+	// txnBackupPrefix namespaces the backup control records that ride in the
+	// transaction keyspace (the replicated read_ts floor). It is a family of
+	// its own so isTxnInternalKey can reserve it by name: reserving the whole
+	// !txn| umbrella instead would swallow ordinary user keys such as
+	// "!txn|foo", which raw writes would then be refused and scans would hide.
+	txnBackupPrefix = TxnKeyPrefix + "backup|"
 )
 
 // TxnMetaPrefix is the key prefix used for transaction metadata mutations.
@@ -28,6 +34,7 @@ var (
 	txnCommitPrefixBytes   = []byte(txnCommitPrefix)
 	txnRollbackPrefixBytes = []byte(txnRollbackPrefix)
 	txnMetaPrefixBytes     = []byte(txnMetaPrefix)
+	txnBackupPrefixBytes   = []byte(txnBackupPrefix)
 	txnCommonPrefix        = []byte(TxnKeyPrefix)
 )
 
@@ -68,7 +75,15 @@ func txnRollbackKey(primaryKey []byte, startTS uint64) []byte {
 }
 
 func isTxnInternalKey(key []byte) bool {
-	return bytes.HasPrefix(key, txnCommonPrefix)
+	if !bytes.HasPrefix(key, txnCommonPrefix) {
+		return false
+	}
+	return bytes.HasPrefix(key, txnLockPrefixBytes) ||
+		bytes.HasPrefix(key, txnIntentPrefixBytes) ||
+		bytes.HasPrefix(key, txnCommitPrefixBytes) ||
+		bytes.HasPrefix(key, txnRollbackPrefixBytes) ||
+		bytes.HasPrefix(key, txnMetaPrefixBytes) ||
+		bytes.HasPrefix(key, txnBackupPrefixBytes)
 }
 
 func isTxnMetaKey(key []byte) bool {
