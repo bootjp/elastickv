@@ -767,6 +767,27 @@ func TestGroupReadKeysByShardID_RoutesS3BucketAuxiliaryToStagedOwner(t *testing.
 	}, grouped[2])
 }
 
+func TestGroupReadKeysByShardID_RoutesS3BucketAuxiliaryToPromotedOwner(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryPromotedRoutes(),
+	}))
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	}, 1, NewHLC(), nil)
+
+	key := s3keys.BucketMetaKey(bucket)
+	grouped, err := coord.groupReadKeysByShardID([][]byte{key})
+	require.NoError(t, err)
+	require.Empty(t, grouped[1])
+	require.Equal(t, [][]byte{key}, grouped[2])
+}
+
 // ---------------------------------------------------------------------------
 // validateReadOnlyShards
 // ---------------------------------------------------------------------------

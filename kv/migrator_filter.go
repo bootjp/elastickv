@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/s3keys"
 )
 
@@ -57,6 +58,23 @@ func s3BucketAuxiliaryRouteRange(rawKey []byte) ([]byte, []byte, bool) {
 	}
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
 	return bucketRouteStart, prefixScanEnd(bucketRouteStart), true
+}
+
+func s3BucketAuxiliaryOwnerRoute(rawKey []byte, routes []distribution.Route) (distribution.Route, bool) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(rawKey)
+	if !ok {
+		return distribution.Route{}, false
+	}
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, routes)
+}
+
+func s3BucketAuxiliaryOwnerRouteFromRange(start []byte, end []byte, routes []distribution.Route) (distribution.Route, bool) {
+	for _, route := range routes {
+		if migrationRouteRangesIntersect(route.Start, route.End, start, end) {
+			return route, true
+		}
+	}
+	return distribution.Route{}, false
 }
 
 func keyInMigrationRouteRange(key, routeStart, routeEnd []byte) bool {

@@ -104,6 +104,40 @@ func (s *ShardStore) FilesystemGroupIDs() []uint64 {
 	return groupIDs
 }
 
+// LocalStoreForKey resolves the local store that owns a raw key in this
+// process. S3 chunkblob backfill uses this for peer-local auxiliary rows, which
+// bypass Raft but must still follow the same route catalog as the public paths.
+func (s *ShardStore) LocalStoreForKey(key []byte) (store.MVCCStore, bool) {
+	_, group, _, ok := s.routeAndGroupForKeyWithVersion(key)
+	if !ok || group == nil || group.Store == nil {
+		return nil, false
+	}
+	return group.Store, true
+}
+
+// LocalStores returns every local physical store once. It is intentionally not
+// filtered by current route ownership because startup backfill must recover
+// chunkrefs restored from snapshots or retained after a route move.
+func (s *ShardStore) LocalStores() []store.MVCCStore {
+	if s == nil {
+		return nil
+	}
+	groupIDs := make([]uint64, 0, len(s.groups))
+	for groupID := range s.groups {
+		groupIDs = append(groupIDs, groupID)
+	}
+	slices.Sort(groupIDs)
+	stores := make([]store.MVCCStore, 0, len(groupIDs))
+	for _, groupID := range groupIDs {
+		group := s.groups[groupID]
+		if group == nil || group.Store == nil {
+			continue
+		}
+		stores = append(stores, group.Store)
+	}
+	return stores
+}
+
 // ResolveFilesystemHomeSlot finds a home token whose file route belongs to
 // targetGroup. It derives candidates from current route boundaries and verifies
 // each candidate against the live catalog before returning it.
@@ -362,10 +396,8 @@ func (s *ShardStore) s3BucketAuxiliaryPointReadRoutesWithVersion(key []byte) ([]
 	}
 	catalogRoutes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
 	routes := make([]distribution.Route, 0, pointReadRouteCandidateCapacity)
-	for _, route := range catalogRoutes {
-		if routeHasStagedVisibility(route) && migrationRouteRangesIntersect(route.Start, route.End, start, end) {
-			routes = append(routes, route)
-		}
+	if route, ok := s3BucketAuxiliaryOwnerRouteFromRange(start, end, catalogRoutes); ok {
+		routes = append(routes, route)
 	}
 	normalizedKey := routeKey(key)
 	for _, route := range catalogRoutes {
@@ -446,11 +478,16 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 	if s == nil || s.engine == nil {
 		return fallback, nil
 	}
-	if route, ok := s.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
+	if route, ok := s.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
 		if route.GroupID == groupID {
 			return route, nil
 		}
-		return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
+		if routeHasStagedVisibility(route) {
+			return distribution.Route{}, errors.Wrapf(ErrExplicitGroupStagedVisibilityUnresolved, "group_id=%d key=%q", groupID, key)
+		}
+		return distribution.Route{}, errors.Wrapf(
+			ErrExplicitGroupRouteOwnerMismatch,
+			"group_id=%d catalog_group_id=%d key=%q", groupID, route.GroupID, key)
 	}
 	if route, ok := s.engine.GetRoute(routeKey(key)); ok {
 		if route.GroupID == groupID {
@@ -855,7 +892,7 @@ func (s *ShardStore) scanExplicitGroupRoutesAtWithReadFence(ctx context.Context,
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
 		}
-		kvs, err := s.scanRouteAtDirectionWithS3StagedOwnerFilter(ctx, routes, route, scanStart, scanEnd, limit, ts, reverse, true, readRouteVersion, routeStart, routeEnd, dedupeByKey)
+		kvs, err := s.scanRouteAtDirectionWithS3AuxiliaryOwnerFilter(ctx, routes, route, scanStart, scanEnd, limit, ts, reverse, true, readRouteVersion, routeStart, routeEnd, dedupeByKey)
 		if err != nil {
 			return nil, err
 		}
@@ -1167,7 +1204,7 @@ func (s *ShardStore) routesForS3BucketAuxiliaryScan(start []byte, end []byte) ([
 	}
 	routeStart, routeEnd := s3BucketAuxiliaryScanRouteRange(start, end)
 	for _, route := range catalogRoutes {
-		if routeHasStagedVisibility(route) && migrationRouteRangesIntersect(route.Start, route.End, routeStart, routeEnd) {
+		if migrationRouteRangesIntersect(route.Start, route.End, routeStart, routeEnd) {
 			routes = append(routes, route)
 		}
 	}
@@ -1553,7 +1590,7 @@ func (s *ShardStore) scanRouteAtWithMigrationOwnerFilters(
 			readRouteVersion, routeStart, routeEnd, true,
 		)
 	}
-	return s.scanRouteAtDirectionWithS3StagedOwnerFilter(
+	return s.scanRouteAtDirectionWithS3AuxiliaryOwnerFilter(
 		ctx, routes, route, start, end, limit, ts, reverse, explicitGroup,
 		readRouteVersion, routeStart, routeEnd, dedupeByKey,
 	)
@@ -2182,7 +2219,7 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFence(
 	return s.scanRouteAtDirectionWithReadFenceOnce(ctx, route, start, end, limit, ts, reverse, explicitGroup, readRouteVersion, routeStart, routeEnd)
 }
 
-func (s *ShardStore) scanRouteAtDirectionWithS3StagedOwnerFilter(
+func (s *ShardStore) scanRouteAtDirectionWithS3AuxiliaryOwnerFilter(
 	ctx context.Context,
 	routes []distribution.Route,
 	route distribution.Route,
@@ -2197,7 +2234,7 @@ func (s *ShardStore) scanRouteAtDirectionWithS3StagedOwnerFilter(
 	routeEnd []byte,
 	dedupeByKey bool,
 ) ([]*store.KVPair, error) {
-	if !dedupeByKey || routeHasStagedVisibility(route) || !routesContainStagedVisibility(routes) {
+	if !dedupeByKey {
 		return s.scanRouteAtDirectionWithReadFence(ctx, route, start, end, limit, ts, reverse, explicitGroup, readRouteVersion, routeStart, routeEnd)
 	}
 	out := make([]*store.KVPair, 0, limit)
@@ -2208,7 +2245,7 @@ func (s *ShardStore) scanRouteAtDirectionWithS3StagedOwnerFilter(
 		if err != nil {
 			return nil, err
 		}
-		out = append(out, filterS3AuxiliaryKVsOwnedByStagedRoutes(page, routes)...)
+		out = append(out, filterS3AuxiliaryKVsOwnedByRoute(page, routes, route)...)
 		if len(out) >= limit {
 			clear(out[limit:])
 			return out[:limit], nil
@@ -2229,27 +2266,29 @@ func (s *ShardStore) scanRouteAtDirectionWithS3StagedOwnerFilter(
 	return out, nil
 }
 
-func filterS3AuxiliaryKVsOwnedByStagedRoutes(kvs []*store.KVPair, routes []distribution.Route) []*store.KVPair {
+func filterS3AuxiliaryKVsOwnedByRoute(kvs []*store.KVPair, routes []distribution.Route, route distribution.Route) []*store.KVPair {
 	out := make([]*store.KVPair, 0, len(kvs))
 	for _, kvp := range kvs {
 		if kvp == nil {
 			continue
 		}
-		start, end, auxiliary := s3BucketAuxiliaryRouteRange(kvp.Key)
-		ownedByStagedRoute := false
-		if auxiliary {
-			for _, candidate := range routes {
-				if routeHasStagedVisibility(candidate) && migrationRouteRangesIntersect(candidate.Start, candidate.End, start, end) {
-					ownedByStagedRoute = true
-					break
-				}
-			}
+		owner, auxiliary := s3BucketAuxiliaryOwnerRoute(kvp.Key, routes)
+		if auxiliary && !routeMatchesS3BucketAuxiliaryOwner(route, owner) {
+			continue
 		}
-		if !ownedByStagedRoute {
-			out = append(out, kvp)
-		}
+		out = append(out, kvp)
 	}
 	return out
+}
+
+func routeMatchesS3BucketAuxiliaryOwner(route distribution.Route, owner distribution.Route) bool {
+	if route.GroupID != owner.GroupID {
+		return false
+	}
+	if route.RouteID == 0 || owner.RouteID == 0 {
+		return true
+	}
+	return route.RouteID == owner.RouteID
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilter(
@@ -5144,19 +5183,10 @@ func (s *ShardStore) routeAndGroupForKeyWithVersion(key []byte) (distribution.Ro
 		return distribution.Route{}, nil, 0, false
 	}
 	if start, end, auxiliary := s3BucketAuxiliaryRouteRange(key); auxiliary {
-		routes, version := s.engine.GetIntersectingRoutesWithVersion(nil, nil)
-		for _, route := range routes {
-			if routeHasStagedVisibility(route) && migrationRouteRangesIntersect(route.Start, route.End, start, end) {
-				g, ok := s.groups[route.GroupID]
-				return route, g, version, ok
-			}
-		}
-		normalizedKey := routeKey(key)
-		for _, route := range routes {
-			if routeContainsKey(route, normalizedKey) {
-				g, ok := s.groups[route.GroupID]
-				return route, g, version, ok
-			}
+		routes, version := s.engine.GetIntersectingRoutesWithVersion(start, end)
+		if route, ok := s3BucketAuxiliaryOwnerRouteFromRange(start, end, routes); ok {
+			g, groupOK := s.groups[route.GroupID]
+			return route, g, version, groupOK
 		}
 		return distribution.Route{}, nil, version, false
 	}
@@ -5168,7 +5198,7 @@ func (s *ShardStore) routeAndGroupForKeyWithVersion(key []byte) (distribution.Ro
 	return route, g, version, ok
 }
 
-func (s *ShardStore) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []byte) (distribution.Route, bool) {
+func (s *ShardStore) s3BucketAuxiliaryOwnerRouteForKey(key []byte) (distribution.Route, bool) {
 	if s == nil || s.engine == nil {
 		return distribution.Route{}, false
 	}
@@ -5176,12 +5206,7 @@ func (s *ShardStore) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []byte) (d
 	if !ok {
 		return distribution.Route{}, false
 	}
-	for _, route := range s.engine.GetIntersectingRoutes(start, end) {
-		if routeHasStagedVisibility(route) {
-			return route, true
-		}
-	}
-	return distribution.Route{}, false
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, s.engine.GetIntersectingRoutes(start, end))
 }
 
 func (s *ShardStore) proxyRawGet(ctx context.Context, g *ShardGroup, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {

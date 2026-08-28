@@ -159,6 +159,30 @@ func TestShardStoreGetAt_MergesStagedVisibilityForS3BucketAuxiliary(t *testing.T
 	}
 }
 
+func TestShardStoreGetAt_RoutesS3BucketAuxiliaryToPromotedOwner(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryPromotedRoutes(),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	key := s3keys.BucketMetaKey(bucket)
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("promoted-target"), 20, 0))
+
+	got, err := st.GetAt(ctx, key, 30)
+	require.NoError(t, err)
+	require.Equal(t, []byte("promoted-target"), got)
+}
+
 func TestShardStoreS3BucketAuxiliaryScanFiltersStagedRoutesToBucketRange(t *testing.T) {
 	t.Parallel()
 
@@ -214,6 +238,47 @@ func TestShardStoreS3BucketAuxiliaryScanFiltersStagedRoutesToBucketRange(t *test
 		{Key: keyB, Value: []byte("live-b")},
 		{Key: keyA, Value: []byte("live-a")},
 	}, reverseAll)
+}
+
+func TestShardStoreS3BucketAuxiliaryScanUsesPromotedOwner(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const (
+		migratedBucket = "bucket-a"
+		otherBucket    = "bucket-z"
+	)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryPromotedRoutes(),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	migratedKey := s3keys.BucketMetaKey(migratedBucket)
+	otherKey := s3keys.BucketMetaKey(otherBucket)
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, migratedKey, []byte("promoted-target"), 20, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, otherKey, []byte("raw-owner"), 15, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	end := prefixScanEnd(start)
+	kvs, err := st.ScanAt(ctx, start, end, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: migratedKey, Value: []byte("promoted-target")},
+		{Key: otherKey, Value: []byte("raw-owner")},
+	}, kvs)
+
+	reverse, err := st.ReverseScanAt(ctx, start, end, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: otherKey, Value: []byte("raw-owner")},
+		{Key: migratedKey, Value: []byte("promoted-target")},
+	}, reverse)
 }
 
 func TestShardStoreRouteBoundedS3BucketAuxiliaryScanKeepsStagedRows(t *testing.T) {

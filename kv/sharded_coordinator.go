@@ -2408,7 +2408,7 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 }
 
 func (c *ShardedCoordinator) resolveGroupAndRouteForKey(key []byte) (uint64, uint64, bool) {
-	if route, ok := c.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
 		return route.GroupID, route.RouteID, true
 	}
 	gid, ok := c.router.ResolveGroup(key)
@@ -2422,7 +2422,7 @@ func (c *ShardedCoordinator) resolveGroupAndRouteForKey(key []byte) (uint64, uin
 	return gid, routeID, true
 }
 
-func (c *ShardedCoordinator) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []byte) (distribution.Route, bool) {
+func (c *ShardedCoordinator) s3BucketAuxiliaryOwnerRouteForKey(key []byte) (distribution.Route, bool) {
 	if c == nil || c.engine == nil {
 		return distribution.Route{}, false
 	}
@@ -2430,12 +2430,7 @@ func (c *ShardedCoordinator) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []
 	if !ok {
 		return distribution.Route{}, false
 	}
-	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-		if routeHasStagedVisibility(route) {
-			return route, true
-		}
-	}
-	return distribution.Route{}, false
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
 }
 
 // EngineGroupIDForKey reports the Raft group ID that owns key, or 0 when
@@ -2519,14 +2514,18 @@ func (c *ShardedCoordinator) stagedVisibilityReadKeyAlias(gid uint64, key []byte
 	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
 		return nil, false
 	}
-	if route, ok := c.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
-		if route.GroupID != gid {
-			return nil, false
-		}
-		return distribution.MigrationStagedDataKey(route.MigrationJobID, key), true
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
+		return stagedVisibilityReadKeyAliasForRoute(gid, key, route)
 	}
 	route, ok := c.engine.GetRoute(routeKey(key))
-	if !ok || route.GroupID != gid || !routeHasStagedVisibility(route) {
+	if !ok {
+		return nil, false
+	}
+	return stagedVisibilityReadKeyAliasForRoute(gid, key, route)
+}
+
+func stagedVisibilityReadKeyAliasForRoute(gid uint64, key []byte, route distribution.Route) ([]byte, bool) {
+	if route.GroupID != gid || !routeHasStagedVisibility(route) {
 		return nil, false
 	}
 	return distribution.MigrationStagedDataKey(route.MigrationJobID, key), true

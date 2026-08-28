@@ -453,6 +453,13 @@ func s3BucketAuxiliaryStagedRoutes(bucket string, rawGroupID, stagedGroupID uint
 	return routes
 }
 
+func s3BucketAuxiliaryPromotedRoutes() []distribution.RouteDescriptor {
+	const bucket = "bucket-a"
+	routes := s3BucketAuxiliaryFenceRoutes(bucket, 1, 2)
+	routes[1].State = distribution.RouteStateActive
+	return routes
+}
+
 func TestShardedCoordinatorRoutesS3BucketAuxiliaryWriteToStagedOwner(t *testing.T) {
 	t.Parallel()
 
@@ -471,9 +478,41 @@ func TestShardedCoordinatorRoutesS3BucketAuxiliaryWriteToStagedOwner(t *testing.
 	}, 1, NewHLC(), nil)
 
 	key := s3keys.BucketMetaKey(bucket)
-	route, ok := coord.stagedVisibilityRouteForS3BucketAuxiliaryKey(key)
+	route, ok := coord.s3BucketAuxiliaryOwnerRouteForKey(key)
 	require.True(t, ok)
 	require.Equal(t, uint64(2), route.GroupID)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, g1Txn.requests)
+	require.Len(t, g2Txn.requests, 1)
+	require.Equal(t, key, g2Txn.requests[0].Mutations[0].Key)
+}
+
+func TestShardedCoordinatorRoutesS3BucketAuxiliaryWriteToPromotedOwner(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryPromotedRoutes(),
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 22}}}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	key := s3keys.BucketMetaKey(bucket)
+	route, ok := coord.s3BucketAuxiliaryOwnerRouteForKey(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(2), route.GroupID)
+	require.False(t, routeHasStagedVisibility(route))
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
