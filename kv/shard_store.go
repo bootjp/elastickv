@@ -4959,13 +4959,32 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 // is the receiver only when an aggregate (admin / coordinator) path
 // is replaying a global FLUSHALL, which is not raft-applied.
 func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
-	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
-		return err
+	return s.DeletePrefixesAtRaftAt(ctx, []store.PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, appliedIndex)
+}
+
+func (s *ShardStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []store.PrefixDelete, commitTS, appliedIndex uint64) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+	stagedByGroup := make(map[*ShardGroup][]store.PrefixDelete)
+	for _, del := range deletes {
+		if err := s.ensurePrefixWriteTimestampFloors(del.Prefix, commitTS); err != nil {
+			return err
+		}
+		for _, staged := range s.stagedVisibilityPrefixDeletes(del.Prefix, del.ExcludePrefix) {
+			stagedByGroup[staged.group] = append(stagedByGroup[staged.group], store.PrefixDelete{
+				Prefix:        staged.prefix,
+				ExcludePrefix: staged.excludePrefix,
+			})
+		}
 	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
 		}
+		groupDeletes := make([]store.PrefixDelete, 0, len(deletes)+len(stagedByGroup[g]))
+		groupDeletes = append(groupDeletes, deletes...)
+		groupDeletes = append(groupDeletes, stagedByGroup[g]...)
 		// Pass appliedIndex through to every group. In the
 		// single-group call-path (the production raft-apply case)
 		// this is correct: appliedIndex IS that group's raft entry
@@ -4976,12 +4995,7 @@ func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, ex
 		// case impossible to reach in production. Tests that
 		// exercise ShardStore.DeletePrefixAtRaftAt across multiple
 		// groups MUST pass appliedIndex=0 to opt out.
-		if err := g.Store.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	for _, del := range s.stagedVisibilityPrefixDeletes(prefix, excludePrefix) {
-		if err := del.group.Store.DeletePrefixAtRaftAt(ctx, del.prefix, del.excludePrefix, commitTS, appliedIndex); err != nil {
+		if err := g.Store.DeletePrefixesAtRaftAt(ctx, groupDeletes, commitTS, appliedIndex); err != nil {
 			return errors.WithStack(err)
 		}
 	}

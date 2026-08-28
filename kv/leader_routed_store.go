@@ -594,6 +594,13 @@ func (s *LeaderRoutedStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []b
 	return errors.WithStack(s.local.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex))
 }
 
+func (s *LeaderRoutedStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []store.PrefixDelete, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixesAtRaftAt(ctx, deletes, commitTS, appliedIndex))
+}
+
 // LastAppliedIndex forwards to the local store when it implements
 // raftengine.AppliedIndexReader. Defensive: in production today the
 // kvFSM holds a *pebbleStore directly (not a LeaderRoutedStore — that

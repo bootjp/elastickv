@@ -600,12 +600,17 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 	if err := f.verifyRouteWriteTimestampFloorForPrefix(prefix, commitTS); err != nil {
 		return err
 	}
+	deletes := []store.PrefixDelete{{
+		Prefix:        prefix,
+		ExcludePrefix: txnCommonPrefix,
+	}}
 	for _, del := range f.stagedVisibilityPrefixDeletesForApply(prefix, txnCommonPrefix) {
-		if err := f.store.DeletePrefixAtRaftAt(ctx, del.prefix, del.excludePrefix, commitTS, 0); err != nil {
-			return errors.WithStack(err)
-		}
+		deletes = append(deletes, store.PrefixDelete{
+			Prefix:        del.prefix,
+			ExcludePrefix: del.excludePrefix,
+		})
 	}
-	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
+	if err := f.store.DeletePrefixesAtRaftAt(ctx, deletes, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)

@@ -207,6 +207,75 @@ func TestFSMDelPrefixTombstonesStagedVisibilityRowsDuringApply(t *testing.T) {
 	require.Equal(t, []byte("outside"), got)
 }
 
+type recordingPrefixDeleteStore struct {
+	store.MVCCStore
+
+	batchCalls   int
+	singleCalls  int
+	deletes      []store.PrefixDelete
+	commitTS     uint64
+	appliedIndex uint64
+}
+
+func (s *recordingPrefixDeleteStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	s.singleCalls++
+	return s.MVCCStore.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex)
+}
+
+func (s *recordingPrefixDeleteStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []store.PrefixDelete, commitTS, appliedIndex uint64) error {
+	s.batchCalls++
+	s.deletes = clonePrefixDeletes(deletes)
+	s.commitTS = commitTS
+	s.appliedIndex = appliedIndex
+	return s.MVCCStore.DeletePrefixesAtRaftAt(ctx, deletes, commitTS, appliedIndex)
+}
+
+func clonePrefixDeletes(deletes []store.PrefixDelete) []store.PrefixDelete {
+	out := make([]store.PrefixDelete, len(deletes))
+	for i, del := range deletes {
+		out[i] = store.PrefixDelete{
+			Prefix:        append([]byte(nil), del.Prefix...),
+			ExcludePrefix: append([]byte(nil), del.ExcludePrefix...),
+		}
+	}
+	return out
+}
+
+func TestFSMDelPrefixBatchesStagedAndRawTombstonesDuringApply(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+		},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	rec := &recordingPrefixDeleteStore{MVCCStore: fsm.store}
+	fsm.store = rec
+	fsm.pendingApplyIdx = 1234
+
+	require.NoError(t, fsm.handleDelPrefix(ctx, []byte("b/"), 101))
+	require.Equal(t, 1, rec.batchCalls)
+	require.Zero(t, rec.singleCalls)
+	require.Equal(t, uint64(101), rec.commitTS)
+	require.Equal(t, uint64(1234), rec.appliedIndex)
+	require.Equal(t, []store.PrefixDelete{
+		{Prefix: []byte("b/"), ExcludePrefix: txnCommonPrefix},
+		{
+			Prefix:        distribution.MigrationStagedDataKey(9, []byte("b/")),
+			ExcludePrefix: distribution.MigrationStagedDataKey(9, txnCommonPrefix),
+		},
+	}, rec.deletes)
+}
+
 func TestFSMRejectsCurrentWriteFenceAfterObservedActiveRawPointWrite(t *testing.T) {
 	t.Parallel()
 

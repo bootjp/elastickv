@@ -1746,20 +1746,21 @@ func (s *luaCleanupScanTrackingStore) ScanAt(ctx context.Context, start []byte, 
 
 func newLuaCommitPlanTestContext(server *RedisServer, startTS uint64) *luaScriptContext {
 	return &luaScriptContext{
-		server:       server,
-		startTS:      startTS,
-		touched:      map[string]struct{}{},
-		readKeys:     map[string][]byte{},
-		deleted:      map[string]bool{},
-		everDeleted:  map[string]bool{},
-		negativeType: map[string]bool{},
-		strings:      map[string]*luaStringState{},
-		lists:        map[string]*luaListState{},
-		hashes:       map[string]*luaHashState{},
-		sets:         map[string]*luaSetState{},
-		zsets:        map[string]*luaZSetState{},
-		streams:      map[string]*luaStreamState{},
-		ttls:         map[string]*luaTTLState{},
+		server:         server,
+		startTS:        startTS,
+		touched:        map[string]struct{}{},
+		readKeys:       map[string][]byte{},
+		deleted:        map[string]bool{},
+		everDeleted:    map[string]bool{},
+		negativeType:   map[string]bool{},
+		rawTypeAtStart: map[string]redisValueType{},
+		strings:        map[string]*luaStringState{},
+		lists:          map[string]*luaListState{},
+		hashes:         map[string]*luaHashState{},
+		sets:           map[string]*luaSetState{},
+		zsets:          map[string]*luaZSetState{},
+		streams:        map[string]*luaStreamState{},
+		ttls:           map[string]*luaTTLState{},
 	}
 }
 
@@ -1773,6 +1774,8 @@ func TestLuaCommitPlanForAbsentRewriteSkipsFullLogicalCleanupScans(t *testing.T)
 	key := "lua:absent-rewrite"
 
 	scriptCtx := newLuaCommitPlanTestContext(server, 10)
+	scriptCtx.negativeType[key] = true
+	scriptCtx.rawTypeAtStart[key] = redisTypeNone
 	scriptCtx.strings[key] = &luaStringState{loaded: true, exists: true, dirty: true, value: []byte("v")}
 	scriptCtx.ttls[key] = &luaTTLState{loaded: true}
 

@@ -795,10 +795,22 @@ func (s *mvccStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, exclu
 // DeletePrefixAtRaftAt satisfies the MVCCStore interface — see
 // ApplyMutationsRaftAt for the appliedIndex disposition rationale.
 func (s *mvccStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, _ uint64) error {
-	return s.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS)
+	return s.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, 0)
+}
+
+func (s *mvccStore) DeletePrefixesAtRaftAt(_ context.Context, deletes []PrefixDelete, commitTS, _ uint64) error {
+	return s.deletePrefixesAt(deletes, commitTS)
 }
 
 func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.deletePrefixesAt([]PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS)
+}
+
+func (s *mvccStore) deletePrefixesAt(deletes []PrefixDelete, commitTS uint64) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -806,29 +818,9 @@ func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePref
 
 	// Collect matching keys first since we cannot modify the tree while iterating.
 	var toDelete [][]byte
-	it := s.tree.Iterator()
-	var started bool
-	if len(prefix) > 0 {
-		started = seekForwardIteratorStart(s.tree, &it, prefix)
-	} else {
-		started = it.First()
-	}
-	for ok := started; ok; ok = it.Next() {
-		k, keyOK := it.Key().([]byte)
-		if !keyOK {
-			continue
-		}
-		if len(prefix) > 0 && !bytes.HasPrefix(k, prefix) {
-			break
-		}
-		if len(excludePrefix) > 0 && bytes.HasPrefix(k, excludePrefix) {
-			continue
-		}
-		versions, _ := it.Value().([]VersionedValue)
-		if _, visible := visibleValue(versions, commitTS); !visible {
-			continue
-		}
-		toDelete = append(toDelete, k)
+	seen := make(map[string]struct{})
+	for _, del := range deletes {
+		toDelete = s.collectDeletePrefixKeysLocked(del, commitTS, seen, toDelete)
 	}
 
 	for _, k := range toDelete {
@@ -1039,6 +1031,39 @@ func writeMVCCSnapshotVersion(w io.Writer, version VersionedValue) error {
 		return errors.WithStack(err)
 	}
 	return nil
+}
+
+func (s *mvccStore) collectDeletePrefixKeysLocked(del PrefixDelete, commitTS uint64, seen map[string]struct{}, toDelete [][]byte) [][]byte {
+	it := s.tree.Iterator()
+	var started bool
+	if len(del.Prefix) > 0 {
+		started = seekForwardIteratorStart(s.tree, &it, del.Prefix)
+	} else {
+		started = it.First()
+	}
+	for ok := started; ok; ok = it.Next() {
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
+		}
+		if len(del.Prefix) > 0 && !bytes.HasPrefix(k, del.Prefix) {
+			break
+		}
+		if len(del.ExcludePrefix) > 0 && bytes.HasPrefix(k, del.ExcludePrefix) {
+			continue
+		}
+		versions, _ := it.Value().([]VersionedValue)
+		if _, visible := visibleValue(versions, commitTS); !visible {
+			continue
+		}
+		dedupeKey := string(k)
+		if _, ok := seen[dedupeKey]; ok {
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
+		toDelete = append(toDelete, bytes.Clone(k))
+	}
+	return toDelete
 }
 
 func mvccSnapshotTombstoneByte(tombstone bool) byte {

@@ -341,6 +341,38 @@ func TestDeletePrefixAtRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, entryIdx, got)
 }
 
+func TestDeletePrefixesAtRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	const seedTS uint64 = 50
+	require.NoError(t, ps.ApplyMutations(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("p/k1"), Value: []byte("v")},
+		{Op: OpTypePut, Key: []byte("q/drop"), Value: []byte("v")},
+		{Op: OpTypePut, Key: []byte("q/keep"), Value: []byte("v")},
+	}, nil, seedTS, seedTS))
+
+	const entryIdx uint64 = 100
+	require.NoError(t, ps.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{
+		{Prefix: []byte("p/")},
+		{Prefix: []byte("q/"), ExcludePrefix: []byte("q/keep")},
+	}, 200, entryIdx))
+
+	_, err := ps.GetAt(ctx, []byte("p/k1"), 250)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	_, err = ps.GetAt(ctx, []byte("q/drop"), 250)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	gotVal, err := ps.GetAt(ctx, []byte("q/keep"), 250)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), gotVal)
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "DeletePrefixesAtRaftAt must persist metaAppliedIndex")
+	require.Equal(t, entryIdx, got)
+}
+
 // TestSetDurableAppliedIndex_UsesPebbleSync exercises the
 // nosync-mode independence claim — even when ELASTICKV_FSM_SYNC_MODE
 // is nosync, the checkpoint must use pebble.Sync. We can't directly

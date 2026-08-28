@@ -77,6 +77,12 @@ type KVPair struct {
 	RouteGroupID uint64
 }
 
+// PrefixDelete describes one prefix tombstone operation in a batched apply.
+type PrefixDelete struct {
+	Prefix        []byte
+	ExcludePrefix []byte
+}
+
 // MVCCVersion is a raw committed MVCC version for range migration.
 // Unlike scan results, it preserves tombstones and TTL expiry metadata.
 type MVCCVersion struct {
@@ -320,6 +326,11 @@ type MVCCStore interface {
 	// bundles metaAppliedIndex in that batch so DEL_PREFIX entries
 	// also advance the meta key. PR #910 design §2 "why both leaves".
 	DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error
+	// DeletePrefixesAtRaftAt applies several prefix deletes in one
+	// raft-apply batch. It is used when one logical raft command must
+	// tombstone multiple physical namespaces without exposing a partial
+	// apply or advancing metaAppliedIndex separately from any tombstone.
+	DeletePrefixesAtRaftAt(ctx context.Context, deletes []PrefixDelete, commitTS, appliedIndex uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
 	// WriteConflictCountsByPrefix returns a snapshot of the MVCC

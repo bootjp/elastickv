@@ -2538,7 +2538,7 @@ func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64,
 // ELASTICKV_FSM_SYNC_MODE=nosync. Raft-apply callers must use
 // DeletePrefixAtRaft instead.
 func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.directApplyWriteOpts(), 0)
+	return s.deletePrefixesAtWithOpts(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, s.directApplyWriteOpts(), 0)
 }
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt. Durability
@@ -2549,7 +2549,7 @@ func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, exclude
 // DeletePrefixAtRaftAt to bundle metaAppliedIndex atomically — see
 // PR #910 design §2 "why both leaves".
 func (s *pebbleStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), 0)
+	return s.deletePrefixesAtWithOpts(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, s.raftApplyWriteOpts(), 0)
 }
 
 // DeletePrefixAtRaftAt is DeletePrefixAtRaft with the raft entry
@@ -2560,24 +2560,25 @@ func (s *pebbleStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, exc
 // LastAppliedIndex behind the true applied count for any workload
 // that uses DEL_PREFIX. PR #910 design §2.
 func (s *pebbleStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), appliedIndex)
+	return s.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, appliedIndex)
 }
 
-func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
+func (s *pebbleStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []PrefixDelete, commitTS, appliedIndex uint64) error {
+	return s.deletePrefixesAtWithOpts(ctx, deletes, commitTS, s.raftApplyWriteOpts(), appliedIndex)
+}
+
+func (s *pebbleStore) deletePrefixesAtWithOpts(_ context.Context, deletes []PrefixDelete, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 
-	var lowerBound []byte
-	if len(prefix) > 0 {
-		lowerBound = encodeKey(prefix, math.MaxUint64)
-	}
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-	})
+	iter, err := s.newDeletePrefixesIterator(deletes)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -2586,10 +2587,34 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	if err := s.scanDeletePrefix(iter, batch, prefix, excludePrefix, commitTS); err != nil {
+	if err := s.stageDeletePrefixes(iter, batch, deletes, commitTS); err != nil {
 		return err
 	}
+	return s.commitDeletePrefixesBatch(batch, commitTS, writeOpts, appliedIndex)
+}
 
+func (s *pebbleStore) newDeletePrefixesIterator(deletes []PrefixDelete) (*pebble.Iterator, error) {
+	var lowerBound []byte
+	if len(deletes) == 1 && len(deletes[0].Prefix) > 0 {
+		lowerBound = encodeKey(deletes[0].Prefix, math.MaxUint64)
+	}
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lowerBound})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return iter, nil
+}
+
+func (s *pebbleStore) stageDeletePrefixes(iter *pebble.Iterator, batch *pebble.Batch, deletes []PrefixDelete, commitTS uint64) error {
+	for _, del := range deletes {
+		if err := s.scanDeletePrefix(iter, batch, del.Prefix, del.ExcludePrefix, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *pebbleStore) commitDeletePrefixesBatch(batch *pebble.Batch, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
 	// Persist lastCommitTS update atomically with the tombstones.
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -2614,7 +2639,6 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 		return errors.WithStack(err)
 	}
 	s.updateLastCommitTS(newLastTS)
-
 	return nil
 }
 
