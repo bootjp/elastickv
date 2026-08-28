@@ -1694,6 +1694,15 @@ func (s *ShardStore) scanKeyRouteAtWithReadFence(
 		return nil, nil
 	}
 
+	// keys_only reads need the same readiness proof as value scans. Without it
+	// an armed source read fence still hands back old-source keys, and an armed
+	// target guard hands back live-only or empty keys while the catalog watcher
+	// lags -- the exact windows scanRouteAtDirection proves its way out of.
+	route, err := s.targetReadyRouteForRange(ctx, g, route, start, end)
+	if err != nil {
+		return nil, err
+	}
+
 	if engineForGroup(g) == nil {
 		if routeHasStagedVisibility(route) {
 			return scanKeysWithRefill(start, end, limit, func(cursor []byte, pageLimit int) ([][]byte, error) {

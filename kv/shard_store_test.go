@@ -242,6 +242,43 @@ func TestShardStoreSourceReadFenceRejectsPointRead(t *testing.T) {
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
 
+// keys_only reads take a different path than value scans and used to skip the
+// readiness proof entirely, so an armed source read fence still handed back
+// keys from the old source -- and an armed target guard handed back live-only
+// or empty keys while the catalog watcher lagged. Both the routed and the
+// explicit-group form must fail closed the same way ScanAt does.
+func TestShardStoreSourceReadFenceRejectsKeyOnlyScan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:               10,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      10,
+		MinWriteTSExclusive: 50,
+		Armed:               true,
+		SourceWriteFence:    true,
+		SourceReadFence:     true,
+		RetentionPinTS:      40,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
+
+	_, err := st.ScanKeysAt(ctx, []byte("m"), []byte("z"), 60, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, err = st.ScanKeysAtWithReadFence(ctx, []byte("m"), []byte("z"), 60, 0, 1, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending,
+		"an explicit source group is exactly the case the fence exists for")
+}
+
 func TestShardStoreSourceWriteFenceKeepsReadsAvailable(t *testing.T) {
 	t.Parallel()
 
