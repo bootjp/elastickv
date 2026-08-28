@@ -2201,3 +2201,89 @@ func TestDispatcherLanesEnabledFromEnv(t *testing.T) {
 		require.Equalf(t, c.want, dispatcherLanesEnabledFromEnv(), "env=%q", c.val)
 	}
 }
+
+// deferringSnapshotStateMachine declines every snapshot with the deferral
+// sentinel, the way kvFSM does while a backup pin is open.
+type deferringSnapshotStateMachine struct {
+	testStateMachine
+	calls int
+}
+
+func (m *deferringSnapshotStateMachine) Snapshot() (raftengine.Snapshot, error) {
+	m.calls++
+	return nil, errors.Wrap(raftengine.ErrSnapshotDeferred, "test state machine holds a pin")
+}
+
+// A state machine that declines to snapshot must not take the replica down
+// with it. maybePersistLocalSnapshot runs on the raft run loop, and every
+// error it returns reaches fail(), which exits the engine goroutine — so a
+// long-running backup pin plus ordinary writes crossing the snapshot
+// threshold would terminate replicas instead of postponing compaction.
+func TestMaybePersistLocalSnapshotSkipsDeferredSnapshot(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
+
+	entries := make([]raftpb.Entry, defaultSnapshotEvery)
+	for i := range entries {
+		index, err := uint32Len(i + 2)
+		require.NoError(t, err)
+		entries[i] = testEntry(uint64(index), 1, nil)
+	}
+	require.NoError(t, storage.Append(entryPointers(entries)))
+
+	persist := mockstorage.NewStorageRecorder("")
+	fsm := &deferringSnapshotStateMachine{}
+	engine := &Engine{
+		storage:        storage,
+		persist:        persist,
+		fsm:            fsm,
+		applied:        defaultSnapshotEvery + 1,
+		snapshotReqCh:  make(chan snapshotRequest),
+		snapshotResCh:  make(chan snapshotResult, 1),
+		snapshotStopCh: make(chan struct{}),
+	}
+
+	require.NoError(t, engine.maybePersistLocalSnapshot(),
+		"a deferred snapshot must not fail the run loop")
+	require.Equal(t, 1, fsm.calls, "the state machine was asked for a snapshot")
+	require.Empty(t, persist.Action(), "nothing may be persisted for a deferred snapshot")
+}
+
+// Any other Snapshot error still stops the engine: the state machine could not
+// be captured, so continuing would run against state that cannot be persisted.
+func TestMaybePersistLocalSnapshotFailsOnNonDeferredError(t *testing.T) {
+	storage := etcdraft.NewMemoryStorage()
+	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
+	require.NoError(t, storage.ApplySnapshot(&snap))
+
+	entries := make([]raftpb.Entry, defaultSnapshotEvery)
+	for i := range entries {
+		index, err := uint32Len(i + 2)
+		require.NoError(t, err)
+		entries[i] = testEntry(uint64(index), 1, nil)
+	}
+	require.NoError(t, storage.Append(entryPointers(entries)))
+
+	boom := errors.New("snapshot capture failed")
+	engine := &Engine{
+		storage:        storage,
+		persist:        mockstorage.NewStorageRecorder(""),
+		fsm:            &erroringSnapshotStateMachine{err: boom},
+		applied:        defaultSnapshotEvery + 1,
+		snapshotReqCh:  make(chan snapshotRequest),
+		snapshotResCh:  make(chan snapshotResult, 1),
+		snapshotStopCh: make(chan struct{}),
+	}
+
+	require.ErrorIs(t, engine.maybePersistLocalSnapshot(), boom)
+}
+
+type erroringSnapshotStateMachine struct {
+	testStateMachine
+	err error
+}
+
+func (m *erroringSnapshotStateMachine) Snapshot() (raftengine.Snapshot, error) {
+	return nil, m.err
+}

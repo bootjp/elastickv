@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -11,9 +12,19 @@ import (
 
 var ErrBackupApply = errors.New("backup fsm apply failed")
 var ErrBackupTimestampFenced = errors.New("backup timestamp fence rejects stale write")
-var ErrBackupSnapshotBlocked = errors.New("active backup pin blocks fsm snapshot")
 
-var backupTimestampFloorKey = []byte(TxnKeyPrefix + "backup|timestamp_floor")
+// ErrBackupSnapshotBlocked refuses an FSM snapshot while a backup pin is open.
+// It is marked with raftengine.ErrSnapshotDeferred so the engine treats the
+// refusal as "not now" and skips this snapshot round: without the mark the
+// engine's run loop takes any Snapshot error as fatal and terminates the
+// replica, so ordinary writes during a long backup would kill replicas instead
+// of merely postponing compaction.
+var ErrBackupSnapshotBlocked = errors.Wrap(
+	raftengine.ErrSnapshotDeferred,
+	"active backup pin blocks fsm snapshot",
+)
+
+var backupTimestampFloorKey = []byte(txnBackupPrefix + "timestamp_floor")
 
 const backupTimestampFloorValueSize = 8
 

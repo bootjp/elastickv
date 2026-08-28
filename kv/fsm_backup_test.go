@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -283,6 +284,12 @@ func TestFSMSnapshotRejectsActiveBackupPin(t *testing.T) {
 
 	_, err := fsm.Snapshot()
 	require.ErrorIs(t, err, ErrBackupSnapshotBlocked)
+	// The refusal must reach the engine as a deferral. Without this mark the
+	// etcd run loop treats it like any other Snapshot error: drainReady
+	// propagates it, the loop calls fail(), and the replica exits -- so an
+	// open backup pin plus ordinary writes would take replicas down instead of
+	// postponing compaction.
+	require.ErrorIs(t, err, raftengine.ErrSnapshotDeferred)
 
 	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReleaseEntry(BackupReleaseEntry{PinID: pinID}))))
 	snapshot, err := fsm.Snapshot()

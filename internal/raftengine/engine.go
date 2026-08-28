@@ -49,6 +49,18 @@ var (
 	// ConfChange-time RegisterEncryptionWriter) and never observes
 	// this error.
 	ErrEnvelopeCutoverInProgress = errors.New("raft engine: envelope cutover in progress")
+	// ErrSnapshotDeferred indicates StateMachine.Snapshot declined to
+	// produce a snapshot right now and wants the caller to try again
+	// later. It is the only Snapshot error a caller may treat as
+	// non-fatal: every other one means the state machine could not be
+	// captured and the engine must stop rather than continue against
+	// state it cannot persist. A deferral necessarily also defers the
+	// log truncation that follows a snapshot, so nothing the skipped
+	// snapshot would have recorded is lost -- WAL replay still
+	// reconstructs it. State machines that hold a resource across
+	// snapshots (an open backup pin, for instance) mark their refusal
+	// with this sentinel.
+	ErrSnapshotDeferred = errors.New("raft engine: fsm snapshot deferred")
 )
 
 type State string

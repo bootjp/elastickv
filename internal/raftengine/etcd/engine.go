@@ -2636,6 +2636,9 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	}
 	snapshot, err := e.fsm.Snapshot()
 	if err != nil {
+		if snapshotDeferred(err, "local snapshot", e.applied) {
+			return nil
+		}
 		return errors.WithStack(err)
 	}
 
@@ -2644,6 +2647,23 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 		snapshot: snapshot,
 	}
 	return e.enqueueSnapshotRequest(req)
+}
+
+// snapshotDeferred reports whether a StateMachine.Snapshot error is the state
+// machine asking to be snapshotted later rather than a failure to capture it.
+// Every other Snapshot error stays fatal: the run loop calls fail() and the
+// replica exits, which is right when the state machine genuinely cannot be
+// captured and wrong when it is merely holding the snapshot back.
+func snapshotDeferred(err error, site string, index uint64) bool {
+	if !errors.Is(err, raftengine.ErrSnapshotDeferred) {
+		return false
+	}
+	slog.Warn("etcd raft engine: fsm deferred a snapshot",
+		"site", site,
+		"index", index,
+		"error", err,
+	)
+	return true
 }
 
 func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
@@ -3176,6 +3196,9 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 
 	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
+		if snapshotDeferred(err, "config snapshot", index) {
+			return nil
+		}
 		return err
 	}
 	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
@@ -3212,6 +3235,14 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 
 	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
+		// A deferred snapshot leaves configIndex where it is, so the next
+		// config change (or the first one after the deferral clears) persists
+		// the state again. Nothing is lost meanwhile: no snapshot means no log
+		// truncation, so replay still reaches this ConfState, and the peer
+		// metadata written above is allowed to lead the persisted snapshot.
+		if snapshotDeferred(err, "config state snapshot", index) {
+			return nil
+		}
 		return err
 	}
 	if err := e.persistConfigSnapshotPayloadLocked(index, confState, payload); err != nil {
