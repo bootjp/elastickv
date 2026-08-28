@@ -9,7 +9,9 @@ import (
 	"sort"
 	"unicode/utf8"
 
+	pb "github.com/bootjp/elastickv/proto"
 	cockroachdberr "github.com/cockroachdb/errors"
+	gproto "google.golang.org/protobuf/proto"
 )
 
 // Snapshot key prefixes the hash encoder dispatches on. Mirror the live
@@ -19,7 +21,25 @@ const (
 	RedisHashMetaPrefix      = "!hs|meta|"
 	RedisHashFieldPrefix     = "!hs|fld|"
 	RedisHashMetaDeltaPrefix = "!hs|meta|d|"
+
+	// RedisHashLegacyBlobPrefix is the consolidated single-key layout the
+	// live store still reads for hashes that predate the wide-column
+	// migration: adapter/redis_hash_cmds.go's buildHashLegacyMigrationElems
+	// falls back to !redis|hash|<userKey> until the next write migrates the
+	// key. A dump that skipped it would silently omit those hashes.
+	RedisHashLegacyBlobPrefix = "!redis|hash|"
 )
+
+// redisHashLegacyProtoPrefix is the 4-byte magic the live store writes ahead
+// of the pb.RedisHashValue body (adapter/redis_storage_codec.go's
+// storedRedisHashProtoPrefix). Duplicated rather than imported because the
+// backup package must not depend on the adapter; a rename on the live side
+// surfaces as ErrRedisInvalidHashLegacyBlob on any real dump.
+var redisHashLegacyProtoPrefix = []byte{0x00, 'R', 'H', 0x01}
+
+// ErrRedisInvalidHashLegacyBlob is returned when a !redis|hash| value is not
+// a magic-prefixed pb.RedisHashValue.
+var ErrRedisInvalidHashLegacyBlob = cockroachdberr.New("backup: invalid !redis|hash| value")
 
 // ErrRedisInvalidHashMeta is returned when the !hs|meta| value is not
 // the expected big-endian field count, optionally followed by inline TTL.
@@ -34,13 +54,74 @@ var ErrRedisInvalidHashKey = cockroachdberr.New("backup: malformed !hs| key")
 // record at Finalize time. We deliberately buffer per key (rather than
 // stream) because the design's per-hash JSON shape requires the full
 // field map up-front and Redis hashes are typically small.
+//
+// sawWide records whether any wide-column row (!hs|meta| or !hs|fld|) has
+// been seen for the user key. The live read path treats those as
+// authoritative and consults the !redis|hash| blob only when none exist, so
+// a store holding both layouts for one key must drop the legacy entries
+// rather than merge stale ones over the source of truth.
 type redisHashState struct {
 	declaredLen    int64
 	metaSeen       bool
 	fields         map[string][]byte // field-name → field-value bytes
+	sawWide        bool
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
+}
+
+// markHashWide flips sawWide and, on the first wide-column row for this key,
+// drops any fields a legacy blob deposited first. The map is reused rather
+// than reallocated so the nil-vs-empty contract for an empty-but-meta-seen
+// hash stays as it was.
+func (r *RedisDB) markHashWide(st *redisHashState) {
+	if st.sawWide {
+		return
+	}
+	st.sawWide = true
+	for k := range st.fields {
+		delete(st.fields, k)
+	}
+}
+
+// HandleHashLegacyBlob processes one !redis|hash|<userKey> record: the
+// consolidated layout the live store still reads for unmigrated hashes. The
+// value is a magic-prefixed pb.RedisHashValue carrying every field.
+//
+// Scan-order note: "!hs|" sorts before "!redis|hash|", so in a Pebble-ordered
+// dump the wide-column rows normally arrive first and this handler drops the
+// blob as a post-migration leftover. The reverse order (custom dispatcher, or
+// a key that has only the legacy layout) deposits the fields here and lets
+// any later wide-column row clear them through markHashWide.
+func (r *RedisDB) HandleHashLegacyBlob(key, value []byte) error {
+	userKey, ok := parseRedisLegacyBlobKey(key, RedisHashLegacyBlobPrefix)
+	if !ok {
+		return cockroachdberr.Wrapf(ErrRedisInvalidHashLegacyBlob, "key: %q", key)
+	}
+	entries, err := decodeHashLegacyBlobValue(value)
+	if err != nil {
+		return err
+	}
+	st := r.hashState(userKey)
+	if st.sawWide {
+		return nil
+	}
+	for field, fieldValue := range entries {
+		st.fields[field] = []byte(fieldValue)
+	}
+	return nil
+}
+
+func decodeHashLegacyBlobValue(value []byte) (map[string]string, error) {
+	if !bytes.HasPrefix(value, redisHashLegacyProtoPrefix) {
+		return nil, cockroachdberr.Wrapf(ErrRedisInvalidHashLegacyBlob,
+			"missing or corrupt magic prefix (len=%d)", len(value))
+	}
+	msg := &pb.RedisHashValue{}
+	if err := gproto.Unmarshal(value[len(redisHashLegacyProtoPrefix):], msg); err != nil {
+		return nil, cockroachdberr.Wrapf(ErrRedisInvalidHashLegacyBlob, "unmarshal: %v", err)
+	}
+	return msg.GetEntries(), nil
 }
 
 // HandleHashMeta processes one !hs|meta|<userKey> record. The value is
@@ -76,6 +157,7 @@ func (r *RedisDB) HandleHashMeta(key, value []byte) error {
 		return err
 	}
 	st := r.hashState(userKey)
+	r.markHashWide(st)
 	st.declaredLen = declaredLen
 	st.metaSeen = true
 	if inlineTTL {
@@ -101,6 +183,7 @@ func (r *RedisDB) HandleHashField(key, value []byte) error {
 		return cockroachdberr.Wrapf(ErrRedisInvalidHashKey, "field key: %q", key)
 	}
 	st := r.hashState(userKey)
+	r.markHashWide(st)
 	st.fields[string(fieldName)] = bytes.Clone(value)
 	return nil
 }

@@ -178,8 +178,10 @@ func parsedS3Scope(name string, ok bool, key []byte) (Scope, bool, error) {
 func isRedisBackupKey(key []byte) bool {
 	prefixes := [...]string{
 		RedisHashMetaDeltaPrefix, RedisHashMetaPrefix, RedisHashFieldPrefix,
+		RedisHashLegacyBlobPrefix,
 		ListMetaDeltaPrefix, ListMetaPrefix, ListItemPrefix, ListClaimPrefix,
 		RedisSetMetaDeltaPrefix, RedisSetMetaPrefix, RedisSetMemberPrefix,
+		RedisSetLegacyBlobPrefix,
 		RedisZSetMetaDeltaPrefix, RedisZSetMetaPrefix, RedisZSetMemberPrefix,
 		RedisZSetScorePrefix, RedisZSetLegacyBlobPrefix,
 		RedisStreamMetaPrefix, RedisStreamEntryPrefix,
