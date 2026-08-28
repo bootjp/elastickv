@@ -3798,18 +3798,14 @@ func (s *ShardStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, 
 	return errors.WithStack(g.Store.ExpireAt(ctx, key, expireAt, commitTS))
 }
 
-// expireStagedVisibleAt applies an expiration to a key whose only visible
-// version may still be staged.
+// expireStagedVisibleAt applies an expiration to the version visible through
+// the staged/live merge.
 //
 // Between cutover and promotion a key can be visible through its staged alias
-// while the live key holds nothing. Both store implementations read the live key
-// first and return ErrKeyNotFound when it is absent, so the expiration would
-// fail for a value the same route serves happily through GetAt. Resolve the
-// staged/live winner and write the expiration as a live MVCC version, which is
-// where every other post-cutover write goes.
-//
-// The live attempt comes first so the ordinary path is unchanged and the staged
-// lookup is only paid when the live key really has nothing.
+// while the live key is missing, older, or tombstoned by a newer staged delete.
+// Resolve the staged/live winner before writing the expiration, then record the
+// result as a live MVCC version, which is where every other post-cutover write
+// goes.
 func (s *ShardStore) expireStagedVisibleAt(
 	ctx context.Context,
 	g *ShardGroup,
@@ -3818,16 +3814,23 @@ func (s *ShardStore) expireStagedVisibleAt(
 	expireAt uint64,
 	commitTS uint64,
 ) error {
-	err := g.Store.ExpireAt(ctx, key, expireAt, commitTS)
-	if !errors.Is(err, store.ErrKeyNotFound) {
-		return errors.WithStack(err)
+	live, liveOK, err := latestMVCCVersionAt(ctx, g.Store, key, commitTS)
+	if err != nil {
+		return err
 	}
-	value, getErr := s.getAtWithStagedVisibility(ctx, g, route, key, commitTS)
-	if getErr != nil {
-		// Nothing visible either way: the original ErrKeyNotFound stands.
-		return getErr
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
+	staged, stagedOK, err := latestMVCCVersionAt(ctx, g.Store, stagedKey, commitTS)
+	if err != nil {
+		return err
 	}
-	return errors.WithStack(g.Store.PutWithTTLAt(ctx, key, value, commitTS, expireAt))
+	if stagedOK {
+		staged.Key = bytes.Clone(key)
+	}
+	winner, ok := newerMigrationVersion(live, liveOK, staged, stagedOK)
+	if !ok || !migrationVersionVisible(winner, commitTS) {
+		return store.ErrKeyNotFound
+	}
+	return errors.WithStack(g.Store.PutWithTTLAt(ctx, key, winner.Value, commitTS, expireAt))
 }
 
 func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {

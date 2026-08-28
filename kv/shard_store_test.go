@@ -3719,6 +3719,47 @@ func TestExpireAtAppliesToStagedOnlyValues(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
+func TestExpireAtUsesNewerStagedValueOverLiveValue(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+
+	key := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx,
+		distribution.MigrationStagedDataKey(9, key), []byte("staged-b"), 20, 0))
+
+	require.NoError(t, st.ExpireAt(ctx, key, 5_000, 300))
+
+	got, err := st.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), got)
+
+	live, err := group.Store.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), live)
+}
+
+func TestExpireAtHonorsNewerStagedTombstone(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+
+	key := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.DeleteAt(ctx, distribution.MigrationStagedDataKey(9, key), 20))
+
+	require.ErrorIs(t, st.ExpireAt(ctx, key, 5_000, 300), store.ErrKeyNotFound)
+
+	_, err := st.GetAt(ctx, key, 300)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	live, err := group.Store.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live-b"), live)
+}
+
 // A key with nothing on either side still reports ErrKeyNotFound.
 func TestExpireAtStillFailsWhenNothingIsVisible(t *testing.T) {
 	t.Parallel()
