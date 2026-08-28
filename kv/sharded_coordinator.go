@@ -1803,26 +1803,25 @@ func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64)
 // and goes to the next transaction, so the rollback record and that transaction
 // would share one supposedly global timestamp.
 //
-// The cleanup this feeds must still run when allocation fails: the intents it
-// releases would otherwise sit until LockResolver picks them up, and that path
-// derives its abort timestamp the same way anyway. So the derived value stays
-// as the fallback -- which is what this code used unconditionally before -- and
-// the failure is logged rather than swallowed.
+// Returning zero when allocation fails leaves the rollback undone --
+// abortPreparedTxn skips a zero timestamp -- and the prewrite intents wait for
+// LockResolver. That is the lesser harm. Persisting the derived neighbour
+// anyway would write a value the allocator never issued, and a later refill can
+// hand that same value to another transaction; a warning log does not make the
+// persisted timestamp safe.
 func (c *ShardedCoordinator) abortTimestamp(ctx context.Context, startTS, commitTS uint64) uint64 {
 	base := max(startTS, commitTS)
 	ts, err := c.nextTxnTSAfter(ctx, base)
 	if err == nil && ts > base {
 		return ts
 	}
-	derived := abortTSFrom(startTS, commitTS)
 	c.logger().WarnContext(ctx,
-		"abort timestamp allocation failed; falling back to a derived timestamp",
+		"abort timestamp allocation failed; leaving intents for the lock resolver",
 		"start_ts", startTS,
 		"commit_ts", commitTS,
-		"abort_ts", derived,
 		"err", err,
 	)
-	return derived
+	return 0
 }
 
 func abortTSFrom(startTS, commitTS uint64) uint64 {

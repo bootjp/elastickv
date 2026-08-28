@@ -71,10 +71,11 @@ func TestAbortTimestampIsAllocatedNotDerived(t *testing.T) {
 	require.NotEqual(t, abortTS, nextForSomeoneElse)
 }
 
-// The cleanup this feeds releases prewrite intents, so it must still run when
-// allocation fails. The derived value stays as the fallback -- which is what the
-// code used unconditionally before.
-func TestAbortTimestampFallsBackWhenAllocationFails(t *testing.T) {
+// When allocation fails the rollback is left undone rather than written at a
+// value the allocator never issued: abortPreparedTxn skips a zero timestamp and
+// the intents wait for LockResolver. Persisting the derived neighbour would let
+// a later refill hand that same value to another transaction.
+func TestAbortTimestampDoesNotPersistADerivedTimestamp(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
@@ -88,6 +89,6 @@ func TestAbortTimestampFallsBackWhenAllocationFails(t *testing.T) {
 		commitTS = uint64(500)
 	)
 	abortTS := coord.abortTimestamp(context.Background(), startTS, commitTS)
-	require.Equal(t, abortTSFrom(startTS, commitTS), abortTS)
-	require.Greater(t, abortTS, startTS, "abortPreparedTxn drops anything at or below startTS")
+	require.Zero(t, abortTS, "no rollback record rather than one at an unissued timestamp")
+	require.NotEqual(t, abortTSFrom(startTS, commitTS), abortTS)
 }
