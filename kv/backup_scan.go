@@ -6,6 +6,7 @@ import (
 	"sort"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -294,7 +295,9 @@ func (s *ShardStore) capturedBackupGetAt(
 		// and BeginBackup fails with ErrTxnLocked on a clean snapshot. That is
 		// the same wrong-status failure this function exists to prevent, just
 		// caused by replication lag instead of a route move.
-		val, err := s.getRouteAt(ctx, route, key, ts)
+		// readRouteVersion 0: the captured snapshot already fixes which route
+		// owns this key, so there is no catalog version to wait for here.
+		val, err := s.getRouteAt(ctx, route, key, ts, 0)
 		return val, errors.WithStack(err)
 	}
 	return s.GetAt(ctx, key, ts)
@@ -562,7 +565,7 @@ func (s *backupScanner) materializeBackupKey(ctx context.Context, item routedSca
 			return nil, false, nil
 		}
 	}
-	val, err := s.store.getRouteAt(ctx, route, item.key, s.ts)
+	val, err := s.store.getRouteAt(ctx, route, item.key, s.ts, 0)
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return nil, false, nil
 	}
@@ -827,6 +830,15 @@ func (s *ShardStore) mergeAndTrimRoutedScanKeys(
 	return out[:limit], nil
 }
 
+// preferredRoutedScanKey picks between two enumerations of the same key.
+//
+// Route ownership decides first: a key the captured routes own beats one they
+// do not, which is what keeps a stale copy on a former owner out of the dump.
+// When ownership does not separate them -- both owned, or neither -- the later
+// enumeration wins, except for filesystem usage-route keys, where the catalog
+// owner is authoritative. Dropping either half regresses a real case: without
+// the ownership test a stale copy can win, and without the fallback the first
+// group enumerated always wins even when a later group is the live owner.
 func (s *ShardStore) preferredRoutedScanKey(current, candidate routedScanKey, routes []distribution.Route) (routedScanKey, error) {
 	_, currentOwned, err := s.routeForRoutedKey(current, routes)
 	if err != nil {
@@ -836,10 +848,23 @@ func (s *ShardStore) preferredRoutedScanKey(current, candidate routedScanKey, ro
 	if err != nil {
 		return routedScanKey{}, err
 	}
-	if candidateOwned && !currentOwned {
+	if currentOwned != candidateOwned {
+		if candidateOwned {
+			return candidate, nil
+		}
+		return current, nil
+	}
+	if !fskeys.IsUsageRouteKey(candidate.key) {
 		return candidate, nil
 	}
-	return current, nil
+	owner, ok := s.engine.GetRoute(routeKey(candidate.key))
+	if !ok {
+		return candidate, nil
+	}
+	if current.route.GroupID == owner.GroupID {
+		return current, nil
+	}
+	return candidate, nil
 }
 
 func lastRoutedScanKey(keys []routedScanKey) []byte {
