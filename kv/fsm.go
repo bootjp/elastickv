@@ -623,18 +623,6 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	// blocking compaction and snapshots here, and keep consuming backup
 	// capacity, until its deadline lapsed. The durable floor below is the part
 	// that does survive, and it is reloaded right after.
-	// Volatile pins do not travel in a snapshot, and the entries that would
-	// have released them are compacted away by the time this replica installs
-	// one. A pin this node applied before falling behind would otherwise keep
-	// blocking compaction and snapshots here, and keep consuming backup
-	// capacity, until its deadline lapsed. The durable floor below is the part
-	// that does survive, and it is reloaded right after.
-	// Volatile pins do not travel in a snapshot, and the entries that would
-	// have released them are compacted away by the time this replica installs
-	// one. A pin this node applied before falling behind would otherwise keep
-	// blocking compaction and snapshots here, and keep consuming backup
-	// capacity, until its deadline lapsed. The durable floor below is the part
-	// that does survive, and it is reloaded right after.
 	if f.readTracker != nil {
 		f.readTracker.ClearBackupPinsForGroup(f.shardGroupID)
 	}
