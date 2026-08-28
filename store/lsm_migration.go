@@ -252,26 +252,17 @@ func (s *pebbleStore) exportPebbleVersion(
 	commitTS uint64,
 	result *ExportVersionsResult,
 ) (bool, error) {
-	tag := exportCursorTagScanned
 	rawValue := iter.Value()
 	result.ScannedBytes += versionExportSize(userKey, len(rawValue))
+	tag := exportCursorTagScanned
 	if shouldExportPebbleVersion(opts, userKey, commitTS) {
-		version, err := s.decodeExportedPebbleVersion(iter, userKey, commitTS, opts.KeyFamily)
-		if err != nil {
+		emitted, cont, err := s.appendExportedPebbleVersion(iter, opts, userKey, commitTS, result)
+		if err != nil || !cont {
 			return false, err
 		}
-		if opts.AcceptVersion != nil && !opts.AcceptVersion(version.Key, version.Value) {
-			result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
-			if finishExportIfLimited(opts, result) {
-				result.Done = false
-				return false, nil
-			}
-			return true, nil
+		if emitted {
+			tag = exportCursorTagEmitted
 		}
-		result.Versions = append(result.Versions, version)
-		result.ExportedBytes += versionExportSize(userKey, len(version.Value))
-		result.AcceptedRows++
-		tag = exportCursorTagEmitted
 	}
 	result.NextCursor = encodeExportCursor(userKey, commitTS, tag)
 	if finishExportIfLimited(opts, result) {
@@ -279,6 +270,41 @@ func (s *pebbleStore) exportPebbleVersion(
 		return false, nil
 	}
 	return true, nil
+}
+
+// appendExportedPebbleVersion decodes the version at the iterator and puts it
+// on the page. It returns emitted=false when a filter rejected the version,
+// and cont=false when the page had to stop: either because the row would push
+// a page that already holds rows past its byte budget -- the cursor stays on
+// the previous row so this one starts the next page -- or because a rejected
+// version finished the chunk.
+func (s *pebbleStore) appendExportedPebbleVersion(
+	iter *pebble.Iterator,
+	opts ExportVersionsOptions,
+	userKey []byte,
+	commitTS uint64,
+	result *ExportVersionsResult,
+) (emitted bool, cont bool, err error) {
+	version, err := s.decodeExportedPebbleVersion(iter, userKey, commitTS, opts.KeyFamily)
+	if err != nil {
+		return false, false, err
+	}
+	if opts.AcceptVersion != nil && !opts.AcceptVersion(version.Key, version.Value) {
+		result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
+		if finishExportIfLimited(opts, result) {
+			result.Done = false
+			return false, false, nil
+		}
+		return false, true, nil
+	}
+	if exportPageWouldOverflow(opts, result, userKey, len(version.Value)) {
+		result.Done = false
+		return false, false, nil
+	}
+	result.Versions = append(result.Versions, version)
+	result.ExportedBytes += versionExportSize(userKey, len(version.Value))
+	result.AcceptedRows++
+	return true, true, nil
 }
 
 func shouldExportPebbleVersion(opts ExportVersionsOptions, userKey []byte, commitTS uint64) bool {

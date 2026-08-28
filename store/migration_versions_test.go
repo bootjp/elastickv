@@ -1342,3 +1342,60 @@ func TestPebbleRestoreStreamingSnapshotPreservesMigrationPromotionState(t *testi
 	require.Equal(t, uint64(2), restored.TotalPromotedRows)
 	require.Equal(t, uint64(110), restored.MaxPromotedTS)
 }
+
+// MaxBytes is checked after a row is appended, so a page can overshoot its
+// budget by the whole size of its last row. A 3 MiB page followed by a 61 MiB
+// row therefore builds a 64 MiB page that the migration transport refuses --
+// and the same cursor rebuilds it on every retry. Each row fits on its own, so
+// the page must stop before the row that would overshoot.
+func TestExportVersionsSplitsBeforeOverflowingTheByteBudget(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+
+		small := bytes.Repeat([]byte("s"), 1<<10)
+		large := bytes.Repeat([]byte("l"), 8<<10)
+		require.NoError(t, st.PutAt(ctx, []byte("a"), small, 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("b"), large, 11, 0))
+
+		opts := ExportVersionsOptions{
+			MaxVersions:          16,
+			MaxBytes:             4 << 10,
+			MaxCommitTSInclusive: 100,
+			EndKey:               []byte("z"),
+		}
+		first, err := st.ExportVersions(ctx, opts)
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Len(t, first.Versions, 1, "the oversized row must not join this page")
+		require.Equal(t, []byte("a"), first.Versions[0].Key)
+		require.LessOrEqual(t, first.ExportedBytes, opts.MaxBytes, "the page stays inside its budget")
+
+		opts.Cursor = first.NextCursor
+		second, err := st.ExportVersions(ctx, opts)
+		require.NoError(t, err)
+		require.Len(t, second.Versions, 1, "the oversized row goes out alone")
+		require.Equal(t, []byte("b"), second.Versions[0].Key)
+		require.Equal(t, large, second.Versions[0].Value)
+	})
+}
+
+// A single row larger than the whole budget still goes out: a page holding
+// nothing has to make progress, or the cursor never advances.
+func TestExportVersionsEmitsSingleOversizedRow(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+
+		huge := bytes.Repeat([]byte("h"), 8<<10)
+		require.NoError(t, st.PutAt(ctx, []byte("a"), huge, 10, 0))
+
+		got, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxVersions:          16,
+			MaxBytes:             1 << 10,
+			MaxCommitTSInclusive: 100,
+			EndKey:               []byte("z"),
+		})
+		require.NoError(t, err)
+		require.Len(t, got.Versions, 1)
+		require.Equal(t, huge, got.Versions[0].Value)
+	})
+}
