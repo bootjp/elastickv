@@ -648,7 +648,11 @@ func streamBackupRecords(
 			return backupScanStreamError(err)
 		}
 		if !ok {
-			return nil
+			// Exhaustion is only a complete dump if the pin was still live for
+			// the whole of that last page. materializeBackupKey treats a
+			// compacted-away key as a skip, so a pin that expired mid-scan
+			// produces exhaustion with keys silently missing.
+			return requireLive()
 		}
 		selectedRecord, err := backupRecordSelected(pair, selected)
 		if err != nil {
@@ -1429,15 +1433,19 @@ func (s *AdminServer) requireLiveBackupSession(tok backupToken) error {
 	now := s.nowSnapshot()
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
+	s.reapBackupSessionsLocked(now)
 	session, ok := s.backupSessions[tok.pinID]
 	if !ok || session.readTS != tok.readTS {
 		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
 	}
-	if session.deadline.IsZero() || !now.Before(session.deadline) {
-		delete(s.backupSessions, tok.pinID)
-		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
+	// EndBackup marks the session closing before it proposes the releases, and
+	// those fan out concurrently. A scan that keeps running past that point can
+	// read groups whose pin is already gone, where compaction is free to drop
+	// the pinned versions -- and finish reporting success on an incomplete
+	// dump. Renewal already refuses a closing session; reads must too.
+	if session.closing {
+		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin is being released")
 	}
-	s.reapBackupSessionsLocked(now)
 	return nil
 }
 

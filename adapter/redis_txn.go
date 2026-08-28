@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
@@ -20,8 +21,46 @@ var redisTxnWideHashFencePrefix = []byte("!redis|txn-wide-hash|")
 var redisTxnWideSetFencePrefix = []byte("!redis|txn-wide-set|")
 var redisTxnWideListFencePrefix = []byte("!redis|txn-wide-list|")
 var redisTxnWideZSetFencePrefix = []byte("!redis|txn-wide-zset|")
+var redisReadFenceRouteChangedKey = []byte("!redis|read-fence-route-changed")
+
+const redisReadFenceLocalLeaderTarget = "\x00redis-read-fence-local-leader"
+
+var errRedisExecSplitShardLeaders = errors.New("ERR EXEC read fence spans multiple shard leaders")
+var errRedisExecRouteChangedAfterAmbiguousAttempt = errors.New("ERR EXEC read fence route changed after ambiguous dispatch")
 
 type txnCommandHandler func(*txnContext, redcon.Command) (redisResult, error)
+
+const (
+	redisCommandKeyArgCount = 2
+	redisHashFirstFieldArg  = 2
+	redisZIncrByArgCount    = 4
+	redisZIncrByMemberArg   = 3
+)
+
+type redisReadFenceRange struct {
+	start []byte
+	end   []byte
+}
+
+type redisReadFenceRangeGroupKeyProvider interface {
+	ReadFenceGroupKeysForRange(start []byte, end []byte) [][]byte
+}
+
+// redisReadFenceRangeTargetProvider is the preferred provider: it keeps each
+// group's identity attached to its representative key, which the key-only form
+// loses (see kv.ReadFenceTarget).
+type redisReadFenceRangeTargetProvider interface {
+	ReadFenceTargetsForRange(start []byte, end []byte) []kv.ReadFenceTarget
+}
+
+type redisReadFenceRouteVersionProvider interface {
+	ReadFenceRouteVersion() uint64
+}
+
+type redisReadFenceRouteVersion struct {
+	tracked bool
+	version uint64
+}
 
 var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdSet:     (*txnContext).applySet,
@@ -36,6 +75,550 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdZIncrBy: (*txnContext).applyZIncrBy,
 	cmdExpire:  (*txnContext).applyExpireSeconds,
 	cmdPExpire: (*txnContext).applyExpireMilliseconds,
+}
+
+func redisTxnReadFenceKeys(userKey []byte) [][]byte {
+	keys := append([][]byte{}, redisTxnReadFencePointKeys(userKey)...)
+	keys = append(keys,
+		store.ListMetaDeltaScanPrefix(userKey),
+		store.ListClaimScanPrefix(userKey),
+		store.HashFieldScanPrefix(userKey),
+		store.HashMetaDeltaScanPrefix(userKey),
+		store.SetMemberScanPrefix(userKey),
+		store.SetMetaDeltaScanPrefix(userKey),
+		store.ZSetMemberScanPrefix(userKey),
+		store.ZSetScoreScanPrefix(userKey),
+		store.ZSetMetaDeltaScanPrefix(userKey),
+		store.StreamEntryScanPrefix(userKey),
+	)
+	return keys
+}
+
+func redisTxnReadFencePointKeys(userKey []byte) [][]byte {
+	keys := [][]byte{
+		redisStrKey(userKey),
+		redisHLLKey(userKey),
+		redisTTLKey(userKey),
+		listMetaKey(userKey),
+		listItemKey(userKey, 0),
+		redisTxnWideListFenceKey(userKey),
+		redisHashKey(userKey),
+		store.HashMetaKey(userKey),
+		redisTxnWideHashFenceKey(userKey),
+		redisSetKey(userKey),
+		store.SetMetaKey(userKey),
+		redisTxnWideSetFenceKey(userKey),
+		redisZSetKey(userKey),
+		store.ZSetMetaKey(userKey),
+		redisTxnWideZSetFenceKey(userKey),
+		redisStreamKey(userKey),
+		store.StreamMetaKey(userKey),
+	}
+	if redisLegacyBareReadFenceAllowed(userKey) {
+		keys = append(keys, userKey)
+	}
+	return keys
+}
+
+func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
+	if isKnownInternalKey(userKey) {
+		return false
+	}
+	return !bytes.HasPrefix(userKey, []byte("!sqs|"))
+}
+
+func (r *RedisServer) redisTxnReadFenceKeysForRanges(userKey []byte, ranges []redisReadFenceRange) [][]byte {
+	return readFenceTargetKeys(r.redisTxnReadFenceTargetsForRanges(userKey, ranges))
+}
+
+// redisTxnReadFenceTargetsForRanges builds the fence set for a user key. Point
+// keys carry no group id and are resolved from bytes; range-derived targets keep
+// the group the range expansion already resolved.
+func (r *RedisServer) redisTxnReadFenceTargetsForRanges(userKey []byte, ranges []redisReadFenceRange) []kv.ReadFenceTarget {
+	targets := make([]kv.ReadFenceTarget, 0, len(ranges)+1)
+	for _, key := range redisTxnReadFencePointKeys(userKey) {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
+	for _, readRange := range ranges {
+		rangeTargets := r.redisReadFenceRangeTargets(readRange.start, readRange.end)
+		if len(rangeTargets) == 0 {
+			rangeTargets = []kv.ReadFenceTarget{{Key: readRange.start}}
+		}
+		targets = append(targets, rangeTargets...)
+	}
+	return targets
+}
+
+func readFenceTargetKeys(targets []kv.ReadFenceTarget) [][]byte {
+	keys := make([][]byte, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, target.Key)
+	}
+	return keys
+}
+
+func redisTxnReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	ranges := redisListReadFenceRanges(userKey)
+	ranges = append(ranges, redisHashReadFenceRanges(userKey)...)
+	ranges = append(ranges, redisSetReadFenceRanges(userKey)...)
+	ranges = append(ranges, redisZSetReadFenceRanges(userKey)...)
+	ranges = append(ranges, redisStreamReadFenceRanges(userKey)...)
+	return ranges
+}
+
+func redisListReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
+		store.ListMetaDeltaScanPrefix(userKey),
+		store.ListClaimScanPrefix(userKey),
+	})
+}
+
+func redisTypeDetectionReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
+		store.ListMetaDeltaScanPrefix(userKey),
+		store.HashFieldScanPrefix(userKey),
+		store.HashMetaDeltaScanPrefix(userKey),
+		store.SetMemberScanPrefix(userKey),
+		store.SetMetaDeltaScanPrefix(userKey),
+		store.ZSetMemberScanPrefix(userKey),
+		store.ZSetMetaDeltaScanPrefix(userKey),
+	})
+}
+
+func redisHashReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
+		store.HashFieldScanPrefix(userKey),
+		store.HashMetaDeltaScanPrefix(userKey),
+	})
+}
+
+func redisSetReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
+		store.SetMemberScanPrefix(userKey),
+		store.SetMetaDeltaScanPrefix(userKey),
+	})
+}
+
+func redisZSetReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
+		store.ZSetMemberScanPrefix(userKey),
+		store.ZSetScoreScanPrefix(userKey),
+		store.ZSetMetaDeltaScanPrefix(userKey),
+	})
+}
+
+func redisStreamReadFenceRanges(userKey []byte) []redisReadFenceRange {
+	return redisReadFenceRangesForPrefixes([][]byte{
+		store.StreamEntryScanPrefix(userKey),
+	})
+}
+
+func redisReadFenceRangesForPrefixes(prefixes [][]byte) []redisReadFenceRange {
+	ranges := make([]redisReadFenceRange, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		ranges = append(ranges, redisReadFenceRange{
+			start: prefix,
+			end:   store.PrefixScanEnd(prefix),
+		})
+	}
+	return ranges
+}
+
+func (r *RedisServer) redisReadFenceRangeTargets(start []byte, end []byte) []kv.ReadFenceTarget {
+	if r == nil || r.store == nil {
+		return nil
+	}
+	if provider, ok := r.store.(redisReadFenceRangeTargetProvider); ok {
+		return provider.ReadFenceTargetsForRange(start, end)
+	}
+	provider, ok := r.store.(redisReadFenceRangeGroupKeyProvider)
+	if !ok {
+		return nil
+	}
+	keys := provider.ReadFenceGroupKeysForRange(start, end)
+	targets := make([]kv.ReadFenceTarget, 0, len(keys))
+	for _, key := range keys {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
+	return targets
+}
+
+func (r *RedisServer) redisReadFenceRouteVersion() redisReadFenceRouteVersion {
+	if r == nil || r.store == nil {
+		return redisReadFenceRouteVersion{}
+	}
+	provider, ok := r.store.(redisReadFenceRouteVersionProvider)
+	if !ok {
+		return redisReadFenceRouteVersion{}
+	}
+	return redisReadFenceRouteVersion{
+		tracked: true,
+		version: provider.ReadFenceRouteVersion(),
+	}
+}
+
+func (r *RedisServer) ensureRedisReadFenceRouteStable(observed redisReadFenceRouteVersion) error {
+	if !observed.tracked || r == nil || r.store == nil {
+		return nil
+	}
+	provider, ok := r.store.(redisReadFenceRouteVersionProvider)
+	if !ok || provider.ReadFenceRouteVersion() == observed.version {
+		return nil
+	}
+	return errors.WithStack(store.NewWriteConflictError(redisReadFenceRouteChangedKey))
+}
+
+func (v redisReadFenceRouteVersion) observedRouteVersion() uint64 {
+	if !v.tracked {
+		return 0
+	}
+	return kv.EncodeObservedRouteVersion(v.version)
+}
+
+func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
+	return redisQueuedCommandReadFenceKeysForServer(nil, queue)
+}
+
+func redisQueuedCommandReadFenceKeysForServer(r *RedisServer, queue []redcon.Command) [][]byte {
+	seen := make(map[string]struct{}, len(queue))
+	keys := make([][]byte, 0, len(queue))
+	appendKey := func(key []byte) {
+		keyID := string(key)
+		if _, ok := seen[keyID]; ok {
+			return
+		}
+		seen[keyID] = struct{}{}
+		keys = append(keys, key)
+	}
+	for _, cmd := range queue {
+		for _, fenceKey := range redisCommandReadFenceKeysForServer(r, cmd) {
+			appendKey(fenceKey)
+		}
+	}
+	return keys
+}
+
+func redisCommandReadFenceKeysForServer(r *RedisServer, cmd redcon.Command) [][]byte {
+	if len(cmd.Args) == 0 {
+		return nil
+	}
+	cmdName := strings.ToUpper(string(cmd.Args[0]))
+	meta, ok := redisCommandTable[cmdName]
+	if !ok {
+		return nil
+	}
+	keys := make([][]byte, 0)
+	for _, userKey := range redisCommandGetKeys(meta, cmd.Args) {
+		if r == nil {
+			keys = append(keys, redisTxnReadFenceKeys(userKey)...)
+			continue
+		}
+		keys = append(keys, r.redisTxnReadFenceKeysForRanges(userKey, redisCommandReadFenceRanges(cmdName, userKey))...)
+	}
+	keys = append(keys, redisCommandExactReadFenceKeys(cmd)...)
+	return keys
+}
+
+func redisCommandReadFenceRanges(cmdName string, userKey []byte) []redisReadFenceRange {
+	switch cmdName {
+	case cmdGet, cmdExists:
+		return redisTypeDetectionReadFenceRanges(userKey)
+	case cmdHSet, cmdHMSet:
+		return redisTypeCheckedReadFenceRanges(userKey, redisHashReadFenceRanges(userKey))
+	case cmdRPush, cmdLRange:
+		return redisTypeCheckedReadFenceRanges(userKey, redisListReadFenceRanges(userKey))
+	case cmdZIncrBy:
+		return redisTypeCheckedReadFenceRanges(userKey, redisZSetReadFenceRanges(userKey))
+	case cmdSet, cmdDel, cmdIncr, cmdExpire, cmdPExpire:
+		return redisTxnReadFenceRanges(userKey)
+	default:
+		return nil
+	}
+}
+
+func redisTypeCheckedReadFenceRanges(userKey []byte, ranges []redisReadFenceRange) []redisReadFenceRange {
+	typeRanges := redisTypeDetectionReadFenceRanges(userKey)
+	return append(typeRanges, ranges...)
+}
+
+func redisCommandExactReadFenceKeys(cmd redcon.Command) [][]byte {
+	if len(cmd.Args) < redisCommandKeyArgCount {
+		return nil
+	}
+	key := cmd.Args[1]
+	switch strings.ToUpper(string(cmd.Args[0])) {
+	case cmdHSet, cmdHMSet:
+		fieldArgs := cmd.Args[redisHashFirstFieldArg:]
+		if len(fieldArgs) == 0 || len(fieldArgs)%redisPairWidth != 0 {
+			return nil
+		}
+		keys := make([][]byte, 0, len(fieldArgs)/redisPairWidth)
+		for i := redisHashFirstFieldArg; i < len(cmd.Args); i += redisPairWidth {
+			keys = append(keys, store.HashFieldKey(key, cmd.Args[i]))
+		}
+		return keys
+	case cmdZIncrBy:
+		if len(cmd.Args) < redisZIncrByArgCount {
+			return nil
+		}
+		return [][]byte{store.ZSetMemberKey(key, cmd.Args[redisZIncrByMemberArg])}
+	default:
+		return nil
+	}
+}
+
+type redisTxnProxyRoute struct {
+	defaultLeader bool
+	key           []byte
+}
+
+func (r *RedisServer) redisReadFenceGroupTargets(targets []kv.ReadFenceTarget) []kv.ReadFenceTarget {
+	if r == nil || r.coordinator == nil {
+		return nil
+	}
+	return kv.LeaseReadGroupTargets(r.coordinator, targets)
+}
+
+func (r *RedisServer) queuedCommandReadFenceGroupKeys(queue []redcon.Command) [][]byte {
+	return readFenceTargetKeys(r.queuedCommandReadFenceGroupTargets(queue))
+}
+
+// queuedCommandReadFenceGroupTargets collapses the queue's fence set to one
+// target per group, keeping each range-derived group id intact. It mirrors
+// redisQueuedCommandReadFenceKeysForServer exactly, including its per-key dedup,
+// and differs only in carrying the group id alongside each key.
+func (r *RedisServer) queuedCommandReadFenceGroupTargets(queue []redcon.Command) []kv.ReadFenceTarget {
+	seen := make(map[string]struct{}, len(queue))
+	targets := make([]kv.ReadFenceTarget, 0, len(queue))
+	appendTarget := func(target kv.ReadFenceTarget) {
+		keyID := string(target.Key)
+		if _, ok := seen[keyID]; ok {
+			return
+		}
+		seen[keyID] = struct{}{}
+		targets = append(targets, target)
+	}
+	for _, cmd := range queue {
+		for _, target := range r.commandReadFenceTargets(cmd) {
+			appendTarget(target)
+		}
+	}
+	return r.redisReadFenceGroupTargets(targets)
+}
+
+// commandReadFenceTargets is the target-carrying form of
+// redisCommandReadFenceKeysForServer.
+func (r *RedisServer) commandReadFenceTargets(cmd redcon.Command) []kv.ReadFenceTarget {
+	if len(cmd.Args) == 0 {
+		return nil
+	}
+	cmdName := strings.ToUpper(string(cmd.Args[0]))
+	meta, ok := redisCommandTable[cmdName]
+	if !ok {
+		return nil
+	}
+	targets := make([]kv.ReadFenceTarget, 0)
+	for _, userKey := range redisCommandGetKeys(meta, cmd.Args) {
+		if r == nil {
+			for _, key := range redisTxnReadFenceKeys(userKey) {
+				targets = append(targets, kv.ReadFenceTarget{Key: key})
+			}
+			continue
+		}
+		targets = append(targets, r.redisTxnReadFenceTargetsForRanges(userKey, redisCommandReadFenceRanges(cmdName, userKey))...)
+	}
+	for _, key := range redisCommandExactReadFenceKeys(cmd) {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
+	return targets
+}
+
+func (r *RedisServer) readFenceProxyKeyForTargets(targets []kv.ReadFenceTarget) ([]byte, bool, error) {
+	if r == nil || r.coordinator == nil || len(targets) == 0 {
+		return nil, false, nil
+	}
+
+	var targetLeader string
+	var proxyKey []byte
+	for _, target := range targets {
+		key := target.Key
+		leader, localLeader, err := r.readFenceLeaderForTarget(target)
+		if err != nil {
+			return nil, false, err
+		}
+		if err := recordReadFenceTargetLeader(&targetLeader, leader); err != nil {
+			return nil, false, err
+		}
+		if localLeader || len(proxyKey) > 0 {
+			continue
+		}
+		proxyKey = key
+	}
+	if len(proxyKey) == 0 {
+		return nil, false, nil
+	}
+	return proxyKey, true, nil
+}
+
+// readFenceLeaderForTarget prefers the target's already-resolved group id.
+// Re-deriving the group from Key normalizes a raw wide-column prefix back to its
+// logical user key, which can name a different group than the one the fence set
+// out to cover.
+func (r *RedisServer) readFenceLeaderForTarget(target kv.ReadFenceTarget) (string, bool, error) {
+	if router, ok := r.coordinator.(kv.GroupLeaderRoutableCoordinator); ok && target.GroupID != 0 {
+		if router.IsLeaderForGroup(target.GroupID) {
+			return redisReadFenceLocalLeaderTarget, true, nil
+		}
+		return r.readFenceLeaderAddress(router.RaftLeaderForGroup(target.GroupID))
+	}
+	key := target.Key
+	localLeader := r.coordinator.IsLeaderForKey(key)
+	if localLeader {
+		return redisReadFenceLocalLeaderTarget, true, nil
+	}
+	leader := r.coordinator.RaftLeaderForKey(key)
+	return r.readFenceLeaderAddress(leader)
+}
+
+func (r *RedisServer) readFenceLeaderAddress(leader string) (string, bool, error) {
+	if leader == "" {
+		return "", false, ErrLeaderNotFound
+	}
+	if r.leaderRedis != nil {
+		leaderAddr, ok := r.leaderRedis[leader]
+		if !ok || leaderAddr == "" {
+			return "", false, errors.WithStack(errors.Newf("ERR leader redis address unknown for raft address %s", leader))
+		}
+		return leaderAddr, false, nil
+	}
+	return leader, false, nil
+}
+
+func recordReadFenceTargetLeader(target *string, leader string) error {
+	if leader == "" {
+		return nil
+	}
+	if *target == "" {
+		*target = leader
+		return nil
+	}
+	if *target != leader {
+		return errRedisExecSplitShardLeaders
+	}
+	return nil
+}
+
+func (r *RedisServer) transactionProxyRoute(queue []redcon.Command) (redisTxnProxyRoute, error) {
+	if r == nil || r.coordinator == nil {
+		return redisTxnProxyRoute{}, nil
+	}
+
+	routeVersion := r.redisReadFenceRouteVersion()
+	fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return redisTxnProxyRoute{}, err
+	}
+	if len(fenceTargets) == 0 {
+		if !r.coordinator.IsLeader() {
+			return redisTxnProxyRoute{defaultLeader: true}, nil
+		}
+		return redisTxnProxyRoute{}, nil
+	}
+
+	proxyKey, ok, err := r.readFenceProxyKeyForTargets(fenceTargets)
+	if err != nil {
+		return redisTxnProxyRoute{}, err
+	}
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return redisTxnProxyRoute{}, err
+	}
+	if ok {
+		return redisTxnProxyRoute{key: proxyKey}, nil
+	}
+	return redisTxnProxyRoute{}, nil
+}
+
+func (r *RedisServer) retryTransactionProxyRoute(ctx context.Context, queue []redcon.Command) (redisTxnProxyRoute, error) {
+	var route redisTxnProxyRoute
+	err := r.retryRedisWrite(ctx, func() error {
+		next, err := r.transactionProxyRoute(queue)
+		if err != nil {
+			return err
+		}
+		route = next
+		return nil
+	})
+	return route, err
+}
+
+// leaseRedisReadFenceTargets establishes the lease bound on each fenced group,
+// using a target's carried group id when it has one so the legacy wide-column
+// group is not re-resolved into its logical owner.
+func (r *RedisServer) leaseRedisReadFenceTargets(ctx context.Context, targets []kv.ReadFenceTarget) error {
+	if r == nil || r.coordinator == nil {
+		return nil
+	}
+	if len(targets) == 0 {
+		return nil
+	}
+	if len(targets) == 1 {
+		_, err := kv.LeaseReadForGroupThrough(r.coordinator, ctx, targets[0].GroupID, targets[0].Key)
+		return errors.WithStack(err)
+	}
+
+	leaseCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+
+	errCh := make(chan error, len(targets))
+	var wg sync.WaitGroup
+	var cancelOnce sync.Once
+	for _, target := range targets {
+		wg.Add(1)
+		go func(t kv.ReadFenceTarget) {
+			defer wg.Done()
+			if _, err := kv.LeaseReadForGroupThrough(r.coordinator, leaseCtx, t.GroupID, t.Key); err != nil {
+				errCh <- errors.WithStack(err)
+				cancelOnce.Do(cancel)
+			}
+		}(target)
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		if err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (r *RedisServer) redisReadFencedTimestamp(
+	ctx context.Context,
+	groupKeys [][]byte,
+	selectTS func() uint64,
+) (uint64, *kv.ActiveTimestampToken, error) {
+	targets := make([]kv.ReadFenceTarget, 0, len(groupKeys))
+	for _, key := range groupKeys {
+		targets = append(targets, kv.ReadFenceTarget{Key: key})
+	}
+	return r.redisReadFencedTimestampForTargets(ctx, targets, selectTS)
+}
+
+func (r *RedisServer) redisReadFencedTimestampForTargets(
+	ctx context.Context,
+	targets []kv.ReadFenceTarget,
+	selectTS func() uint64,
+) (uint64, *kv.ActiveTimestampToken, error) {
+	if err := r.leaseRedisReadFenceTargets(ctx, targets); err != nil {
+		return 0, nil, err
+	}
+	readTS := selectTS()
+	readPin := r.pinReadTS(readTS)
+	if err := r.leaseRedisReadFenceTargets(ctx, targets); err != nil {
+		readPin.Release()
+		return 0, nil, err
+	}
+	return readTS, readPin, nil
 }
 
 // MULTI/EXEC/DISCARD handling
@@ -72,11 +655,19 @@ func (r *RedisServer) exec(conn redcon.Conn, _ redcon.Command) {
 	state.inTxn = false
 	state.queue = nil
 
-	// Always execute MULTI/EXEC on the leader so that reads and writes within
-	// the transaction see consistent, up-to-date data. Serving transactions
-	// on followers risks reading stale MVCC state and producing write cycles.
-	if !r.coordinator.IsLeader() {
+	routeCtx, routeCancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	route, err := r.retryTransactionProxyRoute(routeCtx, queue)
+	routeCancel()
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
+	if route.defaultLeader {
 		r.proxyTransactionToLeader(conn, queue)
+		return
+	}
+	if len(route.key) > 0 {
+		r.proxyTransactionToLeaderForKey(conn, route.key, queue)
 		return
 	}
 
@@ -1561,21 +2152,25 @@ func (t *txnContext) dispatchContext() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parentCtx, redisDispatchTimeout)
 }
 
-func (t *txnContext) commit() error {
+func (t *txnContext) commit(routeVersion redisReadFenceRouteVersion) error {
 	prepared, err := t.prepareDispatch()
 	if err != nil {
 		return err
 	}
 	defer prepared.cancel()
+	if err := t.server.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return err
+	}
 	if len(prepared.elems) == 0 {
 		return nil
 	}
 	group := &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		Elems:    prepared.elems,
-		StartTS:  t.startTS,
-		CommitTS: prepared.commitTS,
-		ReadKeys: prepared.readKeys,
+		IsTxn:                true,
+		Elems:                prepared.elems,
+		StartTS:              t.startTS,
+		CommitTS:             prepared.commitTS,
+		ReadKeys:             prepared.readKeys,
+		ObservedRouteVersion: routeVersion.observedRouteVersion(),
 	}
 	if _, err := t.server.coordinator.Dispatch(prepared.ctx, group); err != nil {
 		return errors.WithStack(err)
@@ -2369,6 +2964,42 @@ func (r *RedisServer) runTransaction(queue []redcon.Command) ([]redisResult, err
 	return r.runTransactionDirect(queue)
 }
 
+func (r *RedisServer) applyExecQueueAtSnapshot(
+	dispatchCtx context.Context,
+	queue []redcon.Command,
+	startTS uint64,
+) (*txnContext, []redisResult, error) {
+	txn := &txnContext{
+		server:                r,
+		ctx:                   dispatchCtx,
+		working:               map[string]*txnValue{},
+		replacers:             map[string]*stringReplacement{},
+		listStates:            map[string]*listTxnState{},
+		hashStates:            map[string]*hashTxnState{},
+		zsetStates:            map[string]*zsetTxnState{},
+		ttlStates:             map[string]*ttlTxnState{},
+		readKeys:              map[string][]byte{},
+		deletedKeys:           map[string]struct{}{},
+		logicalDeletes:        map[string][]byte{},
+		hashDeletes:           map[string][]byte{},
+		setDeletes:            map[string][]byte{},
+		hashCreates:           map[string]struct{}{},
+		collectionExpireTypes: map[string]redisValueType{},
+		streamDeletions:       map[string][]byte{},
+		startTS:               startTS,
+	}
+
+	nextResults := make([]redisResult, 0, len(queue))
+	for _, cmd := range queue {
+		res, err := txn.apply(cmd)
+		if err != nil {
+			return nil, nil, err
+		}
+		nextResults = append(nextResults, res)
+	}
+	return txn, nextResults, nil
+}
+
 func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResult, error) {
 	if r.onePhaseTxnDedup {
 		return r.runTransactionWithDedup(queue)
@@ -2379,43 +3010,29 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 
 	var results []redisResult
 	err := r.retryRedisWrite(dispatchCtx, func() error {
-		startTS := r.txnStartTS()
-		readPin := r.pinReadTS(startTS)
+		routeVersion := r.redisReadFenceRouteVersion()
+		fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
+		startTS, readPin, err := r.redisReadFencedTimestampForTargets(dispatchCtx, fenceTargets, r.txnStartTS)
+		if err != nil {
+			return err
+		}
 		defer readPin.Release()
-
-		txn := &txnContext{
-			server:                r,
-			ctx:                   dispatchCtx,
-			working:               map[string]*txnValue{},
-			replacers:             map[string]*stringReplacement{},
-			listStates:            map[string]*listTxnState{},
-			hashStates:            map[string]*hashTxnState{},
-			zsetStates:            map[string]*zsetTxnState{},
-			ttlStates:             map[string]*ttlTxnState{},
-			readKeys:              map[string][]byte{},
-			deletedKeys:           map[string]struct{}{},
-			logicalDeletes:        map[string][]byte{},
-			hashDeletes:           map[string][]byte{},
-			setDeletes:            map[string][]byte{},
-			hashCreates:           map[string]struct{}{},
-			collectionExpireTypes: map[string]redisValueType{},
-			streamDeletions:       map[string][]byte{},
-			startTS:               startTS,
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+			return err
 		}
 
-		nextResults := make([]redisResult, 0, len(queue))
-		for _, cmd := range queue {
-			res, err := txn.apply(cmd)
-			if err != nil {
-				return err
-			}
-			nextResults = append(nextResults, res)
+		txn, nextResults, err := r.applyExecQueueAtSnapshot(dispatchCtx, queue, startTS)
+		if err != nil {
+			return err
 		}
 
 		if err := txn.validateReadSet(dispatchCtx); err != nil {
 			return err
 		}
-		if err := txn.commit(); err != nil {
+		if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+			return err
+		}
+		if err := txn.commit(routeVersion); err != nil {
 			return err
 		}
 		results = nextResults
@@ -2446,11 +3063,12 @@ func (r *RedisServer) runTransactionDirect(queue []redcon.Command) ([]redisResul
 // results are only returned when reuse actually represents the
 // outcome of attempt 1's intent.
 type reusableExecTxn struct {
-	elems    []*kv.Elem[kv.OP]
-	startTS  uint64
-	commitTS uint64
-	readKeys [][]byte
-	results  []redisResult
+	elems                []*kv.Elem[kv.OP]
+	startTS              uint64
+	commitTS             uint64
+	observedRouteVersion uint64
+	readKeys             [][]byte
+	results              []redisResult
 }
 
 // dispatchExecReuse runs one iteration of the option-2 reuse path for
@@ -2468,6 +3086,9 @@ type reusableExecTxn struct {
 // is the current length" question; the client-visible result IS the
 // cached results array.
 func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableExecTxn) (results []redisResult, drop bool, err error) {
+	if err := r.ensureReusableExecRouteStable(pending); err != nil {
+		return nil, false, errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)
+	}
 	// gemini PR-A HIGH: persistence-grade commit_ts allocation must honor the
 	// HLC-4 physical-ceiling fence (see kv/hlc.go NextFenced + the TLA proof
 	// at tla/hlc/MCHLC_gap.cfg). Clock().Next() bypasses the ceiling and
@@ -2479,12 +3100,13 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		return nil, false, errors.WithStack(allocErr)
 	}
 	_, dispErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
-		IsTxn:        true,
-		StartTS:      pending.startTS,
-		CommitTS:     commitTS,
-		PrevCommitTS: pending.commitTS,
-		ReadKeys:     pending.readKeys,
-		Elems:        pending.elems,
+		IsTxn:                true,
+		StartTS:              pending.startTS,
+		CommitTS:             commitTS,
+		PrevCommitTS:         pending.commitTS,
+		ReadKeys:             pending.readKeys,
+		Elems:                pending.elems,
+		ObservedRouteVersion: pending.observedRouteVersion,
 	})
 	if dispErr == nil {
 		return pending.results, false, nil
@@ -2494,6 +3116,9 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 	// Normalize before the typed conflict branch; the generic retry loop keeps
 	// raw wire write conflicts fail-closed for callers without this protection.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
+	if isRedisComposedRouteErr(dispErr) {
+		return nil, false, errors.WithStack(errRedisExecRouteChangedAfterAmbiguousAttempt)
+	}
 	if errors.Is(dispErr, store.ErrWriteConflict) {
 		// Self-inflicted-conflict guard (mirrors dispatchListPushReuse):
 		// the apply might have landed at this fresh commitTS but bubbled
@@ -2516,15 +3141,25 @@ func (r *RedisServer) dispatchExecReuse(ctx context.Context, pending *reusableEx
 		// iteration rebuilds from a fresh snapshot.
 		return nil, true, errors.WithStack(dispErr)
 	}
-	// Still ambiguous (lock / other retryable): the reuse may itself
-	// have landed, so the next retry must probe THIS commit_ts. Only
-	// advance pending.commitTS if retryRedisWrite will actually loop
-	// (non-retryable errors escape to the client; pending is then
-	// discarded with the goroutine).
-	if isRetryableRedisTxnErr(dispErr) {
-		pending.commitTS = commitTS
-	}
+	// TxnLocked did not apply the reuse attempt, and non-retryable errors will
+	// escape the retry loop. In both cases, keep pending.commitTS pointing at
+	// the last ambiguous dispatch so a later retry probes the only commit_ts
+	// that might already have landed.
 	return nil, false, errors.WithStack(dispErr)
+}
+
+func (r *RedisServer) ensureReusableExecRouteStable(pending *reusableExecTxn) error {
+	if pending == nil {
+		return nil
+	}
+	version, tracked := kv.DecodeObservedRouteVersion(pending.observedRouteVersion)
+	if !tracked {
+		return nil
+	}
+	return r.ensureRedisReadFenceRouteStable(redisReadFenceRouteVersion{
+		tracked: true,
+		version: version,
+	})
 }
 
 // runTransactionWithDedup is the option-2 retry loop for MULTI/EXEC.
@@ -2583,6 +3218,21 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 	return results, nil
 }
 
+func (r *RedisServer) prepareExecDispatchWithStableRoute(
+	txn *txnContext,
+	routeVersion redisReadFenceRouteVersion,
+) (preparedTxnDispatch, error) {
+	prepared, err := txn.prepareDispatch()
+	if err != nil {
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		prepared.cancel()
+		return preparedTxnDispatch{cancel: func() {}}, err
+	}
+	return prepared, nil
+}
+
 // firstExecAttempt runs the initial (no-reuse) EXEC attempt: builds the
 // txn snapshot, applies each command to capture the client-visible
 // results, validates the read set, and dispatches. On success returns
@@ -2593,44 +3243,30 @@ func (r *RedisServer) runTransactionWithDedup(queue []redcon.Command) ([]redisRe
 // from runTransactionWithDedup to keep that loop under the cyclop
 // budget; the dedup rationale lives there.
 func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redcon.Command) ([]redisResult, *reusableExecTxn, error) {
-	startTS := r.txnStartTS()
-	readPin := r.pinReadTS(startTS)
+	routeVersion := r.redisReadFenceRouteVersion()
+	fenceTargets := r.queuedCommandReadFenceGroupTargets(queue)
+	startTS, readPin, err := r.redisReadFencedTimestampForTargets(dispatchCtx, fenceTargets, r.txnStartTS)
+	if err != nil {
+		return nil, nil, err
+	}
 	defer readPin.Release()
-
-	txn := &txnContext{
-		server:                r,
-		ctx:                   dispatchCtx,
-		working:               map[string]*txnValue{},
-		replacers:             map[string]*stringReplacement{},
-		listStates:            map[string]*listTxnState{},
-		hashStates:            map[string]*hashTxnState{},
-		zsetStates:            map[string]*zsetTxnState{},
-		ttlStates:             map[string]*ttlTxnState{},
-		readKeys:              map[string][]byte{},
-		deletedKeys:           map[string]struct{}{},
-		logicalDeletes:        map[string][]byte{},
-		hashDeletes:           map[string][]byte{},
-		setDeletes:            map[string][]byte{},
-		hashCreates:           map[string]struct{}{},
-		collectionExpireTypes: map[string]redisValueType{},
-		streamDeletions:       map[string][]byte{},
-		startTS:               startTS,
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return nil, nil, err
 	}
 
-	nextResults := make([]redisResult, 0, len(queue))
-	for _, cmd := range queue {
-		res, err := txn.apply(cmd)
-		if err != nil {
-			return nil, nil, err
-		}
-		nextResults = append(nextResults, res)
+	txn, nextResults, err := r.applyExecQueueAtSnapshot(dispatchCtx, queue, startTS)
+	if err != nil {
+		return nil, nil, err
 	}
 
 	if err := txn.validateReadSet(dispatchCtx); err != nil {
 		return nil, nil, err
 	}
+	if err := r.ensureRedisReadFenceRouteStable(routeVersion); err != nil {
+		return nil, nil, err
+	}
 
-	prepared, err := txn.prepareDispatch()
+	prepared, err := r.prepareExecDispatchWithStableRoute(txn, routeVersion)
 	if err != nil {
 		return nil, nil, err
 	}
@@ -2641,35 +3277,38 @@ func (r *RedisServer) firstExecAttempt(dispatchCtx context.Context, queue []redc
 	}
 
 	group := &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		Elems:    prepared.elems,
-		StartTS:  txn.startTS,
-		CommitTS: prepared.commitTS,
-		ReadKeys: prepared.readKeys,
+		IsTxn:                true,
+		Elems:                prepared.elems,
+		StartTS:              txn.startTS,
+		CommitTS:             prepared.commitTS,
+		ReadKeys:             prepared.readKeys,
+		ObservedRouteVersion: routeVersion.observedRouteVersion(),
 	}
 	if _, dispErr := r.coordinator.Dispatch(prepared.ctx, group); dispErr != nil {
 		// Preserve the exact attempt for a forwarded conflict only after
 		// restoring its typed form. runTransactionWithDedup can then reuse this
 		// write set instead of replaying the EXEC body from a new snapshot.
 		dispErr = normalizeRetryableRedisTxnErr(dispErr)
-		// Only remember the attempt for reuse if retryRedisWrite will
-		// actually loop. Mirrors listPushCoreWithDedup's gating
-		// rationale — errors that escape the loop (transient-leader,
-		// context deadline, FSM apply error) leave pending pointing at
-		// state wasted with the goroutine; ambiguous errors that
-		// escape to the client are out of scope for this loop.
-		if isRetryableRedisTxnErr(dispErr) {
+		// Only remember the attempt when the dispatch outcome is ambiguous.
+		// TxnLocked is retryable, but it did not apply; keeping no pending lets
+		// the next iteration rebuild against the current read-fence route.
+		if isAmbiguousRedisExecDispatchErr(dispErr) {
 			return nil, &reusableExecTxn{
-				elems:    prepared.elems,
-				startTS:  txn.startTS,
-				commitTS: prepared.commitTS,
-				readKeys: prepared.readKeys,
-				results:  nextResults,
+				elems:                prepared.elems,
+				startTS:              txn.startTS,
+				commitTS:             prepared.commitTS,
+				observedRouteVersion: routeVersion.observedRouteVersion(),
+				readKeys:             prepared.readKeys,
+				results:              nextResults,
 			}, errors.WithStack(dispErr)
 		}
 		return nil, nil, errors.WithStack(dispErr)
 	}
 	return nextResults, nil, nil
+}
+
+func isAmbiguousRedisExecDispatchErr(err error) bool {
+	return errors.Is(err, store.ErrWriteConflict)
 }
 
 func (r *RedisServer) txnStartTS() uint64 {

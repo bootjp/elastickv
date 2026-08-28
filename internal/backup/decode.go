@@ -360,6 +360,8 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(S3UploadMetaPrefix), routeS3UploadMeta(S3UploadMetaPrefix)},
 		{[]byte(S3UploadPartPrefix), routeS3UploadMeta(S3UploadPartPrefix)},
 		{[]byte(S3BlobPrefix), routeS3Blob},
+		{[]byte(S3ChunkRefPrefix), routeS3ChunkRef},
+		{[]byte(S3ChunkBlobPrefix), routeS3ChunkBlob},
 		{[]byte(S3GCUploadPrefix), routeInternalDrop},
 		{[]byte(S3RoutePrefix), routeInternalDrop},
 		// SQS
@@ -376,6 +378,7 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(RedisHashMetaDeltaPrefix), routeRedisHashMeta},
 		{[]byte(RedisHashMetaPrefix), routeRedisHashMeta},
 		{[]byte(RedisHashFieldPrefix), routeRedisHashField},
+		{[]byte(RedisHashLegacyBlobPrefix), routeRedisHashLegacy},
 		// Redis list
 		{[]byte(ListMetaDeltaPrefix), routeRedisListMetaDelta},
 		{[]byte(ListMetaPrefix), routeRedisListMeta},
@@ -385,6 +388,7 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(RedisSetMetaDeltaPrefix), routeRedisSetMetaDelta},
 		{[]byte(RedisSetMetaPrefix), routeRedisSetMeta},
 		{[]byte(RedisSetMemberPrefix), routeRedisSetMember},
+		{[]byte(RedisSetLegacyBlobPrefix), routeRedisSetLegacy},
 		// Redis zset
 		{[]byte(RedisZSetMetaDeltaPrefix), routeRedisZSetMetaDelta},
 		{[]byte(RedisZSetMetaPrefix), routeRedisZSetMeta},
@@ -504,6 +508,24 @@ func routeS3Blob(d *dispatcher, k, v []byte) error {
 	}
 	d.counters.S3++
 	return d.s3.HandleBlob(k, v)
+}
+
+func routeS3ChunkRef(d *dispatcher, k, v []byte) error {
+	if d.s3 == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.S3++
+	return d.s3.HandleChunkRef(k, v)
+}
+
+func routeS3ChunkBlob(d *dispatcher, k, v []byte) error {
+	if d.s3 == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.S3++
+	return d.s3.HandleChunkBlob(k, v)
 }
 
 // routeS3UploadMeta returns a handler that forwards a specific
@@ -685,6 +707,24 @@ func routeRedisZSetScore(d *dispatcher, k, v []byte) error {
 	}
 	d.counters.Redis++
 	return d.redis.HandleZSetScore(k, v)
+}
+
+func routeRedisHashLegacy(d *dispatcher, k, v []byte) error {
+	if d.redis == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.Redis++
+	return d.redis.HandleHashLegacyBlob(k, v)
+}
+
+func routeRedisSetLegacy(d *dispatcher, k, v []byte) error {
+	if d.redis == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.Redis++
+	return d.redis.HandleSetLegacyBlob(k, v)
 }
 
 func routeRedisZSetLegacy(d *dispatcher, k, v []byte) error {

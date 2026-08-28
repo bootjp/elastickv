@@ -137,6 +137,15 @@ func latestVisible(vs []VersionedValue, ts uint64) (VersionedValue, bool) {
 	return VersionedValue{}, false
 }
 
+func versionExistsAtOrBefore(vs []VersionedValue, ts uint64) bool {
+	for i := len(vs) - 1; i >= 0; i-- {
+		if vs[i].TS <= ts {
+			return true
+		}
+	}
+	return false
+}
+
 func visibleValue(versions []VersionedValue, ts uint64) ([]byte, bool) {
 	ver, ok := latestVisible(versions, ts)
 	if !ok || ver.Tombstone {
@@ -292,6 +301,21 @@ func (s *mvccStore) ExistsAt(_ context.Context, key []byte, ts uint64) (bool, er
 		return false, nil
 	}
 	return true, nil
+}
+
+func (s *mvccStore) VersionExistsAtOrBefore(_ context.Context, key []byte, ts uint64) (bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if readTSCompacted(ts, s.minRetainedTS) {
+		return false, ErrReadTSCompacted
+	}
+
+	v, ok := s.tree.Get(key)
+	if !ok {
+		return false, nil
+	}
+	versions, _ := v.([]VersionedValue)
+	return versionExistsAtOrBefore(versions, ts), nil
 }
 
 func computeScanCapHint(treeSize, limit int) int {
@@ -674,6 +698,41 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 			return errors.WithStack(ErrUnknownOp)
 		}
 		s.log.InfoContext(ctx, "apply mutation",
+			slog.String("key", string(mut.Key)),
+			slog.Uint64("commit_ts", commitTS),
+			slog.Bool("delete", mut.Op == OpTypeDelete),
+		)
+	}
+
+	return nil
+}
+
+// ApplyMutationsPreservingLastCommitTS validates and writes versions without
+// advancing the store-wide LastCommitTS watermark. This is for local auxiliary
+// data whose timestamps mirror a remote Raft leader's commit order but must not
+// advertise that this replica has applied ordinary Raft entries up to that
+// timestamp.
+func (s *mvccStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
+		return err
+	}
+
+	for _, mut := range mutations {
+		switch mut.Op {
+		case OpTypePut:
+			if err := validateValueSize(mut.Value); err != nil {
+				return err
+			}
+			s.putVersionLocked(mut.Key, mut.Value, commitTS, mut.ExpireAt)
+		case OpTypeDelete:
+			s.deleteVersionLocked(mut.Key, commitTS)
+		default:
+			return errors.WithStack(ErrUnknownOp)
+		}
+		s.log.InfoContext(ctx, "apply mutation preserving last commit timestamp",
 			slog.String("key", string(mut.Key)),
 			slog.Uint64("commit_ts", commitTS),
 			slog.Bool("delete", mut.Op == OpTypeDelete),

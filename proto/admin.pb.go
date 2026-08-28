@@ -128,6 +128,94 @@ func (SampleRole) EnumDescriptor() ([]byte, []int) {
 	return file_admin_proto_rawDescGZIP(), []int{1}
 }
 
+type SetAutoSplitEnabledRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Enabled       bool                   `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetAutoSplitEnabledRequest) Reset() {
+	*x = SetAutoSplitEnabledRequest{}
+	mi := &file_admin_proto_msgTypes[0]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetAutoSplitEnabledRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetAutoSplitEnabledRequest) ProtoMessage() {}
+
+func (x *SetAutoSplitEnabledRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[0]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetAutoSplitEnabledRequest.ProtoReflect.Descriptor instead.
+func (*SetAutoSplitEnabledRequest) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{0}
+}
+
+func (x *SetAutoSplitEnabledRequest) GetEnabled() bool {
+	if x != nil {
+		return x.Enabled
+	}
+	return false
+}
+
+type SetAutoSplitEnabledResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Enabled       bool                   `protobuf:"varint,1,opt,name=enabled,proto3" json:"enabled,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *SetAutoSplitEnabledResponse) Reset() {
+	*x = SetAutoSplitEnabledResponse{}
+	mi := &file_admin_proto_msgTypes[1]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *SetAutoSplitEnabledResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*SetAutoSplitEnabledResponse) ProtoMessage() {}
+
+func (x *SetAutoSplitEnabledResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_admin_proto_msgTypes[1]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use SetAutoSplitEnabledResponse.ProtoReflect.Descriptor instead.
+func (*SetAutoSplitEnabledResponse) Descriptor() ([]byte, []int) {
+	return file_admin_proto_rawDescGZIP(), []int{1}
+}
+
+func (x *SetAutoSplitEnabledResponse) GetEnabled() bool {
+	if x != nil {
+		return x.Enabled
+	}
+	return false
+}
+
 type NodeIdentity struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NodeId        string                 `protobuf:"bytes,1,opt,name=node_id,json=nodeId,proto3" json:"node_id,omitempty"`
@@ -138,7 +226,7 @@ type NodeIdentity struct {
 
 func (x *NodeIdentity) Reset() {
 	*x = NodeIdentity{}
-	mi := &file_admin_proto_msgTypes[0]
+	mi := &file_admin_proto_msgTypes[2]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -150,7 +238,7 @@ func (x *NodeIdentity) String() string {
 func (*NodeIdentity) ProtoMessage() {}
 
 func (x *NodeIdentity) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[0]
+	mi := &file_admin_proto_msgTypes[2]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -163,7 +251,7 @@ func (x *NodeIdentity) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use NodeIdentity.ProtoReflect.Descriptor instead.
 func (*NodeIdentity) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{0}
+	return file_admin_proto_rawDescGZIP(), []int{2}
 }
 
 func (x *NodeIdentity) GetNodeId() string {
@@ -191,7 +279,7 @@ type GroupLeader struct {
 
 func (x *GroupLeader) Reset() {
 	*x = GroupLeader{}
-	mi := &file_admin_proto_msgTypes[1]
+	mi := &file_admin_proto_msgTypes[3]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -203,7 +291,7 @@ func (x *GroupLeader) String() string {
 func (*GroupLeader) ProtoMessage() {}
 
 func (x *GroupLeader) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[1]
+	mi := &file_admin_proto_msgTypes[3]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -216,7 +304,7 @@ func (x *GroupLeader) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GroupLeader.ProtoReflect.Descriptor instead.
 func (*GroupLeader) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{1}
+	return file_admin_proto_rawDescGZIP(), []int{3}
 }
 
 func (x *GroupLeader) GetRaftGroupId() uint64 {
@@ -248,7 +336,7 @@ type GetClusterOverviewRequest struct {
 
 func (x *GetClusterOverviewRequest) Reset() {
 	*x = GetClusterOverviewRequest{}
-	mi := &file_admin_proto_msgTypes[2]
+	mi := &file_admin_proto_msgTypes[4]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -260,7 +348,7 @@ func (x *GetClusterOverviewRequest) String() string {
 func (*GetClusterOverviewRequest) ProtoMessage() {}
 
 func (x *GetClusterOverviewRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[2]
+	mi := &file_admin_proto_msgTypes[4]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -273,7 +361,7 @@ func (x *GetClusterOverviewRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetClusterOverviewRequest.ProtoReflect.Descriptor instead.
 func (*GetClusterOverviewRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{2}
+	return file_admin_proto_rawDescGZIP(), []int{4}
 }
 
 type GetClusterOverviewResponse struct {
@@ -289,7 +377,7 @@ type GetClusterOverviewResponse struct {
 
 func (x *GetClusterOverviewResponse) Reset() {
 	*x = GetClusterOverviewResponse{}
-	mi := &file_admin_proto_msgTypes[3]
+	mi := &file_admin_proto_msgTypes[5]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -301,7 +389,7 @@ func (x *GetClusterOverviewResponse) String() string {
 func (*GetClusterOverviewResponse) ProtoMessage() {}
 
 func (x *GetClusterOverviewResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[3]
+	mi := &file_admin_proto_msgTypes[5]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -314,7 +402,7 @@ func (x *GetClusterOverviewResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetClusterOverviewResponse.ProtoReflect.Descriptor instead.
 func (*GetClusterOverviewResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{3}
+	return file_admin_proto_rawDescGZIP(), []int{5}
 }
 
 func (x *GetClusterOverviewResponse) GetSelf() *NodeIdentity {
@@ -373,7 +461,7 @@ type RaftGroupState struct {
 
 func (x *RaftGroupState) Reset() {
 	*x = RaftGroupState{}
-	mi := &file_admin_proto_msgTypes[4]
+	mi := &file_admin_proto_msgTypes[6]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -385,7 +473,7 @@ func (x *RaftGroupState) String() string {
 func (*RaftGroupState) ProtoMessage() {}
 
 func (x *RaftGroupState) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[4]
+	mi := &file_admin_proto_msgTypes[6]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -398,7 +486,7 @@ func (x *RaftGroupState) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RaftGroupState.ProtoReflect.Descriptor instead.
 func (*RaftGroupState) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{4}
+	return file_admin_proto_rawDescGZIP(), []int{6}
 }
 
 func (x *RaftGroupState) GetRaftGroupId() uint64 {
@@ -458,7 +546,7 @@ type GetRaftGroupsRequest struct {
 
 func (x *GetRaftGroupsRequest) Reset() {
 	*x = GetRaftGroupsRequest{}
-	mi := &file_admin_proto_msgTypes[5]
+	mi := &file_admin_proto_msgTypes[7]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -470,7 +558,7 @@ func (x *GetRaftGroupsRequest) String() string {
 func (*GetRaftGroupsRequest) ProtoMessage() {}
 
 func (x *GetRaftGroupsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[5]
+	mi := &file_admin_proto_msgTypes[7]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -483,7 +571,7 @@ func (x *GetRaftGroupsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRaftGroupsRequest.ProtoReflect.Descriptor instead.
 func (*GetRaftGroupsRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{5}
+	return file_admin_proto_rawDescGZIP(), []int{7}
 }
 
 type GetRaftGroupsResponse struct {
@@ -495,7 +583,7 @@ type GetRaftGroupsResponse struct {
 
 func (x *GetRaftGroupsResponse) Reset() {
 	*x = GetRaftGroupsResponse{}
-	mi := &file_admin_proto_msgTypes[6]
+	mi := &file_admin_proto_msgTypes[8]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -507,7 +595,7 @@ func (x *GetRaftGroupsResponse) String() string {
 func (*GetRaftGroupsResponse) ProtoMessage() {}
 
 func (x *GetRaftGroupsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[6]
+	mi := &file_admin_proto_msgTypes[8]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -520,7 +608,7 @@ func (x *GetRaftGroupsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRaftGroupsResponse.ProtoReflect.Descriptor instead.
 func (*GetRaftGroupsResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{6}
+	return file_admin_proto_rawDescGZIP(), []int{8}
 }
 
 func (x *GetRaftGroupsResponse) GetGroups() []*RaftGroupState {
@@ -547,7 +635,7 @@ type AdapterSummary struct {
 
 func (x *AdapterSummary) Reset() {
 	*x = AdapterSummary{}
-	mi := &file_admin_proto_msgTypes[7]
+	mi := &file_admin_proto_msgTypes[9]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -559,7 +647,7 @@ func (x *AdapterSummary) String() string {
 func (*AdapterSummary) ProtoMessage() {}
 
 func (x *AdapterSummary) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[7]
+	mi := &file_admin_proto_msgTypes[9]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -572,7 +660,7 @@ func (x *AdapterSummary) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use AdapterSummary.ProtoReflect.Descriptor instead.
 func (*AdapterSummary) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{7}
+	return file_admin_proto_rawDescGZIP(), []int{9}
 }
 
 func (x *AdapterSummary) GetAdapter() string {
@@ -646,7 +734,7 @@ type GetAdapterSummaryRequest struct {
 
 func (x *GetAdapterSummaryRequest) Reset() {
 	*x = GetAdapterSummaryRequest{}
-	mi := &file_admin_proto_msgTypes[8]
+	mi := &file_admin_proto_msgTypes[10]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -658,7 +746,7 @@ func (x *GetAdapterSummaryRequest) String() string {
 func (*GetAdapterSummaryRequest) ProtoMessage() {}
 
 func (x *GetAdapterSummaryRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[8]
+	mi := &file_admin_proto_msgTypes[10]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -671,7 +759,7 @@ func (x *GetAdapterSummaryRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAdapterSummaryRequest.ProtoReflect.Descriptor instead.
 func (*GetAdapterSummaryRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{8}
+	return file_admin_proto_rawDescGZIP(), []int{10}
 }
 
 type GetAdapterSummaryResponse struct {
@@ -683,7 +771,7 @@ type GetAdapterSummaryResponse struct {
 
 func (x *GetAdapterSummaryResponse) Reset() {
 	*x = GetAdapterSummaryResponse{}
-	mi := &file_admin_proto_msgTypes[9]
+	mi := &file_admin_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -695,7 +783,7 @@ func (x *GetAdapterSummaryResponse) String() string {
 func (*GetAdapterSummaryResponse) ProtoMessage() {}
 
 func (x *GetAdapterSummaryResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[9]
+	mi := &file_admin_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -708,7 +796,7 @@ func (x *GetAdapterSummaryResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetAdapterSummaryResponse.ProtoReflect.Descriptor instead.
 func (*GetAdapterSummaryResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{9}
+	return file_admin_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *GetAdapterSummaryResponse) GetSummaries() []*AdapterSummary {
@@ -765,7 +853,7 @@ type KeyVizRow struct {
 
 func (x *KeyVizRow) Reset() {
 	*x = KeyVizRow{}
-	mi := &file_admin_proto_msgTypes[10]
+	mi := &file_admin_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -777,7 +865,7 @@ func (x *KeyVizRow) String() string {
 func (*KeyVizRow) ProtoMessage() {}
 
 func (x *KeyVizRow) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[10]
+	mi := &file_admin_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -790,7 +878,7 @@ func (x *KeyVizRow) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyVizRow.ProtoReflect.Descriptor instead.
 func (*KeyVizRow) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{10}
+	return file_admin_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *KeyVizRow) GetBucketId() string {
@@ -903,7 +991,7 @@ type GetKeyVizMatrixRequest struct {
 
 func (x *GetKeyVizMatrixRequest) Reset() {
 	*x = GetKeyVizMatrixRequest{}
-	mi := &file_admin_proto_msgTypes[11]
+	mi := &file_admin_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -915,7 +1003,7 @@ func (x *GetKeyVizMatrixRequest) String() string {
 func (*GetKeyVizMatrixRequest) ProtoMessage() {}
 
 func (x *GetKeyVizMatrixRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[11]
+	mi := &file_admin_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -928,7 +1016,7 @@ func (x *GetKeyVizMatrixRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyVizMatrixRequest.ProtoReflect.Descriptor instead.
 func (*GetKeyVizMatrixRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{11}
+	return file_admin_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *GetKeyVizMatrixRequest) GetSeries() KeyVizSeries {
@@ -969,7 +1057,7 @@ type GetKeyVizMatrixResponse struct {
 
 func (x *GetKeyVizMatrixResponse) Reset() {
 	*x = GetKeyVizMatrixResponse{}
-	mi := &file_admin_proto_msgTypes[12]
+	mi := &file_admin_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -981,7 +1069,7 @@ func (x *GetKeyVizMatrixResponse) String() string {
 func (*GetKeyVizMatrixResponse) ProtoMessage() {}
 
 func (x *GetKeyVizMatrixResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[12]
+	mi := &file_admin_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -994,7 +1082,7 @@ func (x *GetKeyVizMatrixResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetKeyVizMatrixResponse.ProtoReflect.Descriptor instead.
 func (*GetKeyVizMatrixResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{12}
+	return file_admin_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *GetKeyVizMatrixResponse) GetColumnUnixMs() []int64 {
@@ -1024,7 +1112,7 @@ type GetRouteDetailRequest struct {
 
 func (x *GetRouteDetailRequest) Reset() {
 	*x = GetRouteDetailRequest{}
-	mi := &file_admin_proto_msgTypes[13]
+	mi := &file_admin_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1036,7 +1124,7 @@ func (x *GetRouteDetailRequest) String() string {
 func (*GetRouteDetailRequest) ProtoMessage() {}
 
 func (x *GetRouteDetailRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[13]
+	mi := &file_admin_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1049,7 +1137,7 @@ func (x *GetRouteDetailRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRouteDetailRequest.ProtoReflect.Descriptor instead.
 func (*GetRouteDetailRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{13}
+	return file_admin_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *GetRouteDetailRequest) GetBucketId() string {
@@ -1083,7 +1171,7 @@ type GetRouteDetailResponse struct {
 
 func (x *GetRouteDetailResponse) Reset() {
 	*x = GetRouteDetailResponse{}
-	mi := &file_admin_proto_msgTypes[14]
+	mi := &file_admin_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1095,7 +1183,7 @@ func (x *GetRouteDetailResponse) String() string {
 func (*GetRouteDetailResponse) ProtoMessage() {}
 
 func (x *GetRouteDetailResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[14]
+	mi := &file_admin_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1108,7 +1196,7 @@ func (x *GetRouteDetailResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetRouteDetailResponse.ProtoReflect.Descriptor instead.
 func (*GetRouteDetailResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{14}
+	return file_admin_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *GetRouteDetailResponse) GetRow() *KeyVizRow {
@@ -1135,7 +1223,7 @@ type BackupShardApplied struct {
 
 func (x *BackupShardApplied) Reset() {
 	*x = BackupShardApplied{}
-	mi := &file_admin_proto_msgTypes[15]
+	mi := &file_admin_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1147,7 +1235,7 @@ func (x *BackupShardApplied) String() string {
 func (*BackupShardApplied) ProtoMessage() {}
 
 func (x *BackupShardApplied) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[15]
+	mi := &file_admin_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1160,7 +1248,7 @@ func (x *BackupShardApplied) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupShardApplied.ProtoReflect.Descriptor instead.
 func (*BackupShardApplied) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{15}
+	return file_admin_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *BackupShardApplied) GetRaftGroupId() uint64 {
@@ -1189,7 +1277,7 @@ type BackupExpectedKeys struct {
 
 func (x *BackupExpectedKeys) Reset() {
 	*x = BackupExpectedKeys{}
-	mi := &file_admin_proto_msgTypes[16]
+	mi := &file_admin_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1201,7 +1289,7 @@ func (x *BackupExpectedKeys) String() string {
 func (*BackupExpectedKeys) ProtoMessage() {}
 
 func (x *BackupExpectedKeys) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[16]
+	mi := &file_admin_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1214,7 +1302,7 @@ func (x *BackupExpectedKeys) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupExpectedKeys.ProtoReflect.Descriptor instead.
 func (*BackupExpectedKeys) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{16}
+	return file_admin_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *BackupExpectedKeys) GetAdapter() string {
@@ -1261,7 +1349,7 @@ type BeginBackupRequest struct {
 
 func (x *BeginBackupRequest) Reset() {
 	*x = BeginBackupRequest{}
-	mi := &file_admin_proto_msgTypes[17]
+	mi := &file_admin_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1273,7 +1361,7 @@ func (x *BeginBackupRequest) String() string {
 func (*BeginBackupRequest) ProtoMessage() {}
 
 func (x *BeginBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[17]
+	mi := &file_admin_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1286,7 +1374,7 @@ func (x *BeginBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginBackupRequest.ProtoReflect.Descriptor instead.
 func (*BeginBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{17}
+	return file_admin_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *BeginBackupRequest) GetTtlMs() uint64 {
@@ -1329,7 +1417,7 @@ type BeginBackupResponse struct {
 
 func (x *BeginBackupResponse) Reset() {
 	*x = BeginBackupResponse{}
-	mi := &file_admin_proto_msgTypes[18]
+	mi := &file_admin_proto_msgTypes[20]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1341,7 +1429,7 @@ func (x *BeginBackupResponse) String() string {
 func (*BeginBackupResponse) ProtoMessage() {}
 
 func (x *BeginBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[18]
+	mi := &file_admin_proto_msgTypes[20]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1354,7 +1442,7 @@ func (x *BeginBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BeginBackupResponse.ProtoReflect.Descriptor instead.
 func (*BeginBackupResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{18}
+	return file_admin_proto_rawDescGZIP(), []int{20}
 }
 
 func (x *BeginBackupResponse) GetReadTs() uint64 {
@@ -1416,7 +1504,7 @@ type RenewBackupRequest struct {
 
 func (x *RenewBackupRequest) Reset() {
 	*x = RenewBackupRequest{}
-	mi := &file_admin_proto_msgTypes[19]
+	mi := &file_admin_proto_msgTypes[21]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1428,7 +1516,7 @@ func (x *RenewBackupRequest) String() string {
 func (*RenewBackupRequest) ProtoMessage() {}
 
 func (x *RenewBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[19]
+	mi := &file_admin_proto_msgTypes[21]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1441,7 +1529,7 @@ func (x *RenewBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewBackupRequest.ProtoReflect.Descriptor instead.
 func (*RenewBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{19}
+	return file_admin_proto_rawDescGZIP(), []int{21}
 }
 
 func (x *RenewBackupRequest) GetPinToken() []byte {
@@ -1469,7 +1557,7 @@ type RenewBackupResponse struct {
 
 func (x *RenewBackupResponse) Reset() {
 	*x = RenewBackupResponse{}
-	mi := &file_admin_proto_msgTypes[20]
+	mi := &file_admin_proto_msgTypes[22]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1481,7 +1569,7 @@ func (x *RenewBackupResponse) String() string {
 func (*RenewBackupResponse) ProtoMessage() {}
 
 func (x *RenewBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[20]
+	mi := &file_admin_proto_msgTypes[22]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1494,7 +1582,7 @@ func (x *RenewBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RenewBackupResponse.ProtoReflect.Descriptor instead.
 func (*RenewBackupResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{20}
+	return file_admin_proto_rawDescGZIP(), []int{22}
 }
 
 func (x *RenewBackupResponse) GetTtlMsEffective() uint64 {
@@ -1520,7 +1608,7 @@ type EndBackupRequest struct {
 
 func (x *EndBackupRequest) Reset() {
 	*x = EndBackupRequest{}
-	mi := &file_admin_proto_msgTypes[21]
+	mi := &file_admin_proto_msgTypes[23]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1532,7 +1620,7 @@ func (x *EndBackupRequest) String() string {
 func (*EndBackupRequest) ProtoMessage() {}
 
 func (x *EndBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[21]
+	mi := &file_admin_proto_msgTypes[23]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1545,7 +1633,7 @@ func (x *EndBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndBackupRequest.ProtoReflect.Descriptor instead.
 func (*EndBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{21}
+	return file_admin_proto_rawDescGZIP(), []int{23}
 }
 
 func (x *EndBackupRequest) GetPinToken() []byte {
@@ -1563,7 +1651,7 @@ type EndBackupResponse struct {
 
 func (x *EndBackupResponse) Reset() {
 	*x = EndBackupResponse{}
-	mi := &file_admin_proto_msgTypes[22]
+	mi := &file_admin_proto_msgTypes[24]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1575,7 +1663,7 @@ func (x *EndBackupResponse) String() string {
 func (*EndBackupResponse) ProtoMessage() {}
 
 func (x *EndBackupResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[22]
+	mi := &file_admin_proto_msgTypes[24]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1588,7 +1676,7 @@ func (x *EndBackupResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use EndBackupResponse.ProtoReflect.Descriptor instead.
 func (*EndBackupResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{22}
+	return file_admin_proto_rawDescGZIP(), []int{24}
 }
 
 type ListAdaptersAndScopesRequest struct {
@@ -1600,7 +1688,7 @@ type ListAdaptersAndScopesRequest struct {
 
 func (x *ListAdaptersAndScopesRequest) Reset() {
 	*x = ListAdaptersAndScopesRequest{}
-	mi := &file_admin_proto_msgTypes[23]
+	mi := &file_admin_proto_msgTypes[25]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1612,7 +1700,7 @@ func (x *ListAdaptersAndScopesRequest) String() string {
 func (*ListAdaptersAndScopesRequest) ProtoMessage() {}
 
 func (x *ListAdaptersAndScopesRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[23]
+	mi := &file_admin_proto_msgTypes[25]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1625,7 +1713,7 @@ func (x *ListAdaptersAndScopesRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAdaptersAndScopesRequest.ProtoReflect.Descriptor instead.
 func (*ListAdaptersAndScopesRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{23}
+	return file_admin_proto_rawDescGZIP(), []int{25}
 }
 
 func (x *ListAdaptersAndScopesRequest) GetPinToken() []byte {
@@ -1645,7 +1733,7 @@ type BackupScope struct {
 
 func (x *BackupScope) Reset() {
 	*x = BackupScope{}
-	mi := &file_admin_proto_msgTypes[24]
+	mi := &file_admin_proto_msgTypes[26]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1657,7 +1745,7 @@ func (x *BackupScope) String() string {
 func (*BackupScope) ProtoMessage() {}
 
 func (x *BackupScope) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[24]
+	mi := &file_admin_proto_msgTypes[26]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1670,7 +1758,7 @@ func (x *BackupScope) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupScope.ProtoReflect.Descriptor instead.
 func (*BackupScope) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{24}
+	return file_admin_proto_rawDescGZIP(), []int{26}
 }
 
 func (x *BackupScope) GetAdapter() string {
@@ -1696,7 +1784,7 @@ type ListAdaptersAndScopesResponse struct {
 
 func (x *ListAdaptersAndScopesResponse) Reset() {
 	*x = ListAdaptersAndScopesResponse{}
-	mi := &file_admin_proto_msgTypes[25]
+	mi := &file_admin_proto_msgTypes[27]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1708,7 +1796,7 @@ func (x *ListAdaptersAndScopesResponse) String() string {
 func (*ListAdaptersAndScopesResponse) ProtoMessage() {}
 
 func (x *ListAdaptersAndScopesResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[25]
+	mi := &file_admin_proto_msgTypes[27]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1721,7 +1809,7 @@ func (x *ListAdaptersAndScopesResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ListAdaptersAndScopesResponse.ProtoReflect.Descriptor instead.
 func (*ListAdaptersAndScopesResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{25}
+	return file_admin_proto_rawDescGZIP(), []int{27}
 }
 
 func (x *ListAdaptersAndScopesResponse) GetScopes() []*BackupScope {
@@ -1743,7 +1831,7 @@ type StreamBackupRequest struct {
 
 func (x *StreamBackupRequest) Reset() {
 	*x = StreamBackupRequest{}
-	mi := &file_admin_proto_msgTypes[26]
+	mi := &file_admin_proto_msgTypes[28]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1755,7 +1843,7 @@ func (x *StreamBackupRequest) String() string {
 func (*StreamBackupRequest) ProtoMessage() {}
 
 func (x *StreamBackupRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[26]
+	mi := &file_admin_proto_msgTypes[28]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1768,7 +1856,7 @@ func (x *StreamBackupRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamBackupRequest.ProtoReflect.Descriptor instead.
 func (*StreamBackupRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{26}
+	return file_admin_proto_rawDescGZIP(), []int{28}
 }
 
 func (x *StreamBackupRequest) GetPinToken() []byte {
@@ -1795,7 +1883,7 @@ type BackupKV struct {
 
 func (x *BackupKV) Reset() {
 	*x = BackupKV{}
-	mi := &file_admin_proto_msgTypes[27]
+	mi := &file_admin_proto_msgTypes[29]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1807,7 +1895,7 @@ func (x *BackupKV) String() string {
 func (*BackupKV) ProtoMessage() {}
 
 func (x *BackupKV) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[27]
+	mi := &file_admin_proto_msgTypes[29]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1820,7 +1908,7 @@ func (x *BackupKV) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use BackupKV.ProtoReflect.Descriptor instead.
 func (*BackupKV) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{27}
+	return file_admin_proto_rawDescGZIP(), []int{29}
 }
 
 func (x *BackupKV) GetKey() []byte {
@@ -1845,7 +1933,7 @@ type GetNodeVersionRequest struct {
 
 func (x *GetNodeVersionRequest) Reset() {
 	*x = GetNodeVersionRequest{}
-	mi := &file_admin_proto_msgTypes[28]
+	mi := &file_admin_proto_msgTypes[30]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1857,7 +1945,7 @@ func (x *GetNodeVersionRequest) String() string {
 func (*GetNodeVersionRequest) ProtoMessage() {}
 
 func (x *GetNodeVersionRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[28]
+	mi := &file_admin_proto_msgTypes[30]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1870,7 +1958,7 @@ func (x *GetNodeVersionRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeVersionRequest.ProtoReflect.Descriptor instead.
 func (*GetNodeVersionRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{28}
+	return file_admin_proto_rawDescGZIP(), []int{30}
 }
 
 type GetNodeVersionResponse struct {
@@ -1886,7 +1974,7 @@ type GetNodeVersionResponse struct {
 
 func (x *GetNodeVersionResponse) Reset() {
 	*x = GetNodeVersionResponse{}
-	mi := &file_admin_proto_msgTypes[29]
+	mi := &file_admin_proto_msgTypes[31]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1898,7 +1986,7 @@ func (x *GetNodeVersionResponse) String() string {
 func (*GetNodeVersionResponse) ProtoMessage() {}
 
 func (x *GetNodeVersionResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[29]
+	mi := &file_admin_proto_msgTypes[31]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1911,7 +1999,7 @@ func (x *GetNodeVersionResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use GetNodeVersionResponse.ProtoReflect.Descriptor instead.
 func (*GetNodeVersionResponse) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{29}
+	return file_admin_proto_rawDescGZIP(), []int{31}
 }
 
 func (x *GetNodeVersionResponse) GetNodeVersion() string {
@@ -1936,7 +2024,7 @@ type StreamEventsRequest struct {
 
 func (x *StreamEventsRequest) Reset() {
 	*x = StreamEventsRequest{}
-	mi := &file_admin_proto_msgTypes[30]
+	mi := &file_admin_proto_msgTypes[32]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1948,7 +2036,7 @@ func (x *StreamEventsRequest) String() string {
 func (*StreamEventsRequest) ProtoMessage() {}
 
 func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[30]
+	mi := &file_admin_proto_msgTypes[32]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1961,7 +2049,7 @@ func (x *StreamEventsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsRequest.ProtoReflect.Descriptor instead.
 func (*StreamEventsRequest) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{30}
+	return file_admin_proto_rawDescGZIP(), []int{32}
 }
 
 type StreamEventsEvent struct {
@@ -1977,7 +2065,7 @@ type StreamEventsEvent struct {
 
 func (x *StreamEventsEvent) Reset() {
 	*x = StreamEventsEvent{}
-	mi := &file_admin_proto_msgTypes[31]
+	mi := &file_admin_proto_msgTypes[33]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1989,7 +2077,7 @@ func (x *StreamEventsEvent) String() string {
 func (*StreamEventsEvent) ProtoMessage() {}
 
 func (x *StreamEventsEvent) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[31]
+	mi := &file_admin_proto_msgTypes[33]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2002,7 +2090,7 @@ func (x *StreamEventsEvent) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use StreamEventsEvent.ProtoReflect.Descriptor instead.
 func (*StreamEventsEvent) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{31}
+	return file_admin_proto_rawDescGZIP(), []int{33}
 }
 
 func (x *StreamEventsEvent) GetEvent() isStreamEventsEvent_Event {
@@ -2058,7 +2146,7 @@ type RouteTransition struct {
 
 func (x *RouteTransition) Reset() {
 	*x = RouteTransition{}
-	mi := &file_admin_proto_msgTypes[32]
+	mi := &file_admin_proto_msgTypes[34]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2070,7 +2158,7 @@ func (x *RouteTransition) String() string {
 func (*RouteTransition) ProtoMessage() {}
 
 func (x *RouteTransition) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[32]
+	mi := &file_admin_proto_msgTypes[34]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2083,7 +2171,7 @@ func (x *RouteTransition) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RouteTransition.ProtoReflect.Descriptor instead.
 func (*RouteTransition) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{32}
+	return file_admin_proto_rawDescGZIP(), []int{34}
 }
 
 func (x *RouteTransition) GetParentRouteId() uint64 {
@@ -2125,7 +2213,7 @@ type KeyVizColumn struct {
 
 func (x *KeyVizColumn) Reset() {
 	*x = KeyVizColumn{}
-	mi := &file_admin_proto_msgTypes[33]
+	mi := &file_admin_proto_msgTypes[35]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -2137,7 +2225,7 @@ func (x *KeyVizColumn) String() string {
 func (*KeyVizColumn) ProtoMessage() {}
 
 func (x *KeyVizColumn) ProtoReflect() protoreflect.Message {
-	mi := &file_admin_proto_msgTypes[33]
+	mi := &file_admin_proto_msgTypes[35]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -2150,7 +2238,7 @@ func (x *KeyVizColumn) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use KeyVizColumn.ProtoReflect.Descriptor instead.
 func (*KeyVizColumn) Descriptor() ([]byte, []int) {
-	return file_admin_proto_rawDescGZIP(), []int{33}
+	return file_admin_proto_rawDescGZIP(), []int{35}
 }
 
 func (x *KeyVizColumn) GetColumnUnixMs() int64 {
@@ -2178,7 +2266,11 @@ var File_admin_proto protoreflect.FileDescriptor
 
 const file_admin_proto_rawDesc = "" +
 	"\n" +
-	"\vadmin.proto\"J\n" +
+	"\vadmin.proto\"6\n" +
+	"\x1aSetAutoSplitEnabledRequest\x12\x18\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\"7\n" +
+	"\x1bSetAutoSplitEnabledResponse\x12\x18\n" +
+	"\aenabled\x18\x01 \x01(\bR\aenabled\"J\n" +
 	"\fNodeIdentity\x12\x17\n" +
 	"\anode_id\x18\x01 \x01(\tR\x06nodeId\x12!\n" +
 	"\fgrpc_address\x18\x02 \x01(\tR\vgrpcAddress\"x\n" +
@@ -2335,13 +2427,14 @@ const file_admin_proto_rawDesc = "" +
 	"\x17SAMPLE_ROLE_UNSPECIFIED\x10\x00\x12\x1c\n" +
 	"\x18SAMPLE_ROLE_LEADER_WRITE\x10\x01\x12\x1b\n" +
 	"\x17SAMPLE_ROLE_LEADER_READ\x10\x02\x12\x1d\n" +
-	"\x19SAMPLE_ROLE_FOLLOWER_READ\x10\x032\xb5\x06\n" +
+	"\x19SAMPLE_ROLE_FOLLOWER_READ\x10\x032\x89\a\n" +
 	"\x05Admin\x12O\n" +
 	"\x12GetClusterOverview\x12\x1a.GetClusterOverviewRequest\x1a\x1b.GetClusterOverviewResponse\"\x00\x12@\n" +
 	"\rGetRaftGroups\x12\x15.GetRaftGroupsRequest\x1a\x16.GetRaftGroupsResponse\"\x00\x12L\n" +
 	"\x11GetAdapterSummary\x12\x19.GetAdapterSummaryRequest\x1a\x1a.GetAdapterSummaryResponse\"\x00\x12F\n" +
 	"\x0fGetKeyVizMatrix\x12\x17.GetKeyVizMatrixRequest\x1a\x18.GetKeyVizMatrixResponse\"\x00\x12C\n" +
-	"\x0eGetRouteDetail\x12\x16.GetRouteDetailRequest\x1a\x17.GetRouteDetailResponse\"\x00\x12:\n" +
+	"\x0eGetRouteDetail\x12\x16.GetRouteDetailRequest\x1a\x17.GetRouteDetailResponse\"\x00\x12R\n" +
+	"\x13SetAutoSplitEnabled\x12\x1b.SetAutoSplitEnabledRequest\x1a\x1c.SetAutoSplitEnabledResponse\"\x00\x12:\n" +
 	"\vBeginBackup\x12\x13.BeginBackupRequest\x1a\x14.BeginBackupResponse\"\x00\x12:\n" +
 	"\vRenewBackup\x12\x13.RenewBackupRequest\x1a\x14.RenewBackupResponse\"\x00\x124\n" +
 	"\tEndBackup\x12\x11.EndBackupRequest\x1a\x12.EndBackupResponse\"\x00\x12X\n" +
@@ -2363,93 +2456,97 @@ func file_admin_proto_rawDescGZIP() []byte {
 }
 
 var file_admin_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 35)
+var file_admin_proto_msgTypes = make([]protoimpl.MessageInfo, 37)
 var file_admin_proto_goTypes = []any{
 	(KeyVizSeries)(0),                     // 0: KeyVizSeries
 	(SampleRole)(0),                       // 1: SampleRole
-	(*NodeIdentity)(nil),                  // 2: NodeIdentity
-	(*GroupLeader)(nil),                   // 3: GroupLeader
-	(*GetClusterOverviewRequest)(nil),     // 4: GetClusterOverviewRequest
-	(*GetClusterOverviewResponse)(nil),    // 5: GetClusterOverviewResponse
-	(*RaftGroupState)(nil),                // 6: RaftGroupState
-	(*GetRaftGroupsRequest)(nil),          // 7: GetRaftGroupsRequest
-	(*GetRaftGroupsResponse)(nil),         // 8: GetRaftGroupsResponse
-	(*AdapterSummary)(nil),                // 9: AdapterSummary
-	(*GetAdapterSummaryRequest)(nil),      // 10: GetAdapterSummaryRequest
-	(*GetAdapterSummaryResponse)(nil),     // 11: GetAdapterSummaryResponse
-	(*KeyVizRow)(nil),                     // 12: KeyVizRow
-	(*GetKeyVizMatrixRequest)(nil),        // 13: GetKeyVizMatrixRequest
-	(*GetKeyVizMatrixResponse)(nil),       // 14: GetKeyVizMatrixResponse
-	(*GetRouteDetailRequest)(nil),         // 15: GetRouteDetailRequest
-	(*GetRouteDetailResponse)(nil),        // 16: GetRouteDetailResponse
-	(*BackupShardApplied)(nil),            // 17: BackupShardApplied
-	(*BackupExpectedKeys)(nil),            // 18: BackupExpectedKeys
-	(*BeginBackupRequest)(nil),            // 19: BeginBackupRequest
-	(*BeginBackupResponse)(nil),           // 20: BeginBackupResponse
-	(*RenewBackupRequest)(nil),            // 21: RenewBackupRequest
-	(*RenewBackupResponse)(nil),           // 22: RenewBackupResponse
-	(*EndBackupRequest)(nil),              // 23: EndBackupRequest
-	(*EndBackupResponse)(nil),             // 24: EndBackupResponse
-	(*ListAdaptersAndScopesRequest)(nil),  // 25: ListAdaptersAndScopesRequest
-	(*BackupScope)(nil),                   // 26: BackupScope
-	(*ListAdaptersAndScopesResponse)(nil), // 27: ListAdaptersAndScopesResponse
-	(*StreamBackupRequest)(nil),           // 28: StreamBackupRequest
-	(*BackupKV)(nil),                      // 29: BackupKV
-	(*GetNodeVersionRequest)(nil),         // 30: GetNodeVersionRequest
-	(*GetNodeVersionResponse)(nil),        // 31: GetNodeVersionResponse
-	(*StreamEventsRequest)(nil),           // 32: StreamEventsRequest
-	(*StreamEventsEvent)(nil),             // 33: StreamEventsEvent
-	(*RouteTransition)(nil),               // 34: RouteTransition
-	(*KeyVizColumn)(nil),                  // 35: KeyVizColumn
-	nil,                                   // 36: GetClusterOverviewResponse.CapabilitiesEntry
+	(*SetAutoSplitEnabledRequest)(nil),    // 2: SetAutoSplitEnabledRequest
+	(*SetAutoSplitEnabledResponse)(nil),   // 3: SetAutoSplitEnabledResponse
+	(*NodeIdentity)(nil),                  // 4: NodeIdentity
+	(*GroupLeader)(nil),                   // 5: GroupLeader
+	(*GetClusterOverviewRequest)(nil),     // 6: GetClusterOverviewRequest
+	(*GetClusterOverviewResponse)(nil),    // 7: GetClusterOverviewResponse
+	(*RaftGroupState)(nil),                // 8: RaftGroupState
+	(*GetRaftGroupsRequest)(nil),          // 9: GetRaftGroupsRequest
+	(*GetRaftGroupsResponse)(nil),         // 10: GetRaftGroupsResponse
+	(*AdapterSummary)(nil),                // 11: AdapterSummary
+	(*GetAdapterSummaryRequest)(nil),      // 12: GetAdapterSummaryRequest
+	(*GetAdapterSummaryResponse)(nil),     // 13: GetAdapterSummaryResponse
+	(*KeyVizRow)(nil),                     // 14: KeyVizRow
+	(*GetKeyVizMatrixRequest)(nil),        // 15: GetKeyVizMatrixRequest
+	(*GetKeyVizMatrixResponse)(nil),       // 16: GetKeyVizMatrixResponse
+	(*GetRouteDetailRequest)(nil),         // 17: GetRouteDetailRequest
+	(*GetRouteDetailResponse)(nil),        // 18: GetRouteDetailResponse
+	(*BackupShardApplied)(nil),            // 19: BackupShardApplied
+	(*BackupExpectedKeys)(nil),            // 20: BackupExpectedKeys
+	(*BeginBackupRequest)(nil),            // 21: BeginBackupRequest
+	(*BeginBackupResponse)(nil),           // 22: BeginBackupResponse
+	(*RenewBackupRequest)(nil),            // 23: RenewBackupRequest
+	(*RenewBackupResponse)(nil),           // 24: RenewBackupResponse
+	(*EndBackupRequest)(nil),              // 25: EndBackupRequest
+	(*EndBackupResponse)(nil),             // 26: EndBackupResponse
+	(*ListAdaptersAndScopesRequest)(nil),  // 27: ListAdaptersAndScopesRequest
+	(*BackupScope)(nil),                   // 28: BackupScope
+	(*ListAdaptersAndScopesResponse)(nil), // 29: ListAdaptersAndScopesResponse
+	(*StreamBackupRequest)(nil),           // 30: StreamBackupRequest
+	(*BackupKV)(nil),                      // 31: BackupKV
+	(*GetNodeVersionRequest)(nil),         // 32: GetNodeVersionRequest
+	(*GetNodeVersionResponse)(nil),        // 33: GetNodeVersionResponse
+	(*StreamEventsRequest)(nil),           // 34: StreamEventsRequest
+	(*StreamEventsEvent)(nil),             // 35: StreamEventsEvent
+	(*RouteTransition)(nil),               // 36: RouteTransition
+	(*KeyVizColumn)(nil),                  // 37: KeyVizColumn
+	nil,                                   // 38: GetClusterOverviewResponse.CapabilitiesEntry
 }
 var file_admin_proto_depIdxs = []int32{
-	2,  // 0: GetClusterOverviewResponse.self:type_name -> NodeIdentity
-	2,  // 1: GetClusterOverviewResponse.members:type_name -> NodeIdentity
-	3,  // 2: GetClusterOverviewResponse.group_leaders:type_name -> GroupLeader
-	36, // 3: GetClusterOverviewResponse.capabilities:type_name -> GetClusterOverviewResponse.CapabilitiesEntry
-	6,  // 4: GetRaftGroupsResponse.groups:type_name -> RaftGroupState
-	9,  // 5: GetAdapterSummaryResponse.summaries:type_name -> AdapterSummary
+	4,  // 0: GetClusterOverviewResponse.self:type_name -> NodeIdentity
+	4,  // 1: GetClusterOverviewResponse.members:type_name -> NodeIdentity
+	5,  // 2: GetClusterOverviewResponse.group_leaders:type_name -> GroupLeader
+	38, // 3: GetClusterOverviewResponse.capabilities:type_name -> GetClusterOverviewResponse.CapabilitiesEntry
+	8,  // 4: GetRaftGroupsResponse.groups:type_name -> RaftGroupState
+	11, // 5: GetAdapterSummaryResponse.summaries:type_name -> AdapterSummary
 	1,  // 6: KeyVizRow.sample_roles:type_name -> SampleRole
 	0,  // 7: GetKeyVizMatrixRequest.series:type_name -> KeyVizSeries
-	12, // 8: GetKeyVizMatrixResponse.rows:type_name -> KeyVizRow
-	12, // 9: GetRouteDetailResponse.row:type_name -> KeyVizRow
-	9,  // 10: GetRouteDetailResponse.per_adapter:type_name -> AdapterSummary
-	26, // 11: BeginBackupRequest.scopes:type_name -> BackupScope
-	17, // 12: BeginBackupResponse.shards:type_name -> BackupShardApplied
-	18, // 13: BeginBackupResponse.expected_keys:type_name -> BackupExpectedKeys
-	26, // 14: ListAdaptersAndScopesResponse.scopes:type_name -> BackupScope
-	26, // 15: StreamBackupRequest.scopes:type_name -> BackupScope
-	34, // 16: StreamEventsEvent.route_transition:type_name -> RouteTransition
-	35, // 17: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
+	14, // 8: GetKeyVizMatrixResponse.rows:type_name -> KeyVizRow
+	14, // 9: GetRouteDetailResponse.row:type_name -> KeyVizRow
+	11, // 10: GetRouteDetailResponse.per_adapter:type_name -> AdapterSummary
+	28, // 11: BeginBackupRequest.scopes:type_name -> BackupScope
+	19, // 12: BeginBackupResponse.shards:type_name -> BackupShardApplied
+	20, // 13: BeginBackupResponse.expected_keys:type_name -> BackupExpectedKeys
+	28, // 14: ListAdaptersAndScopesResponse.scopes:type_name -> BackupScope
+	28, // 15: StreamBackupRequest.scopes:type_name -> BackupScope
+	36, // 16: StreamEventsEvent.route_transition:type_name -> RouteTransition
+	37, // 17: StreamEventsEvent.keyviz_column:type_name -> KeyVizColumn
 	0,  // 18: KeyVizColumn.series:type_name -> KeyVizSeries
-	12, // 19: KeyVizColumn.rows:type_name -> KeyVizRow
-	4,  // 20: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
-	7,  // 21: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
-	10, // 22: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
-	13, // 23: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
-	15, // 24: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
-	19, // 25: Admin.BeginBackup:input_type -> BeginBackupRequest
-	21, // 26: Admin.RenewBackup:input_type -> RenewBackupRequest
-	23, // 27: Admin.EndBackup:input_type -> EndBackupRequest
-	25, // 28: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
-	28, // 29: Admin.StreamBackup:input_type -> StreamBackupRequest
-	30, // 30: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
-	32, // 31: Admin.StreamEvents:input_type -> StreamEventsRequest
-	5,  // 32: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
-	8,  // 33: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
-	11, // 34: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
-	14, // 35: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
-	16, // 36: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
-	20, // 37: Admin.BeginBackup:output_type -> BeginBackupResponse
-	22, // 38: Admin.RenewBackup:output_type -> RenewBackupResponse
-	24, // 39: Admin.EndBackup:output_type -> EndBackupResponse
-	27, // 40: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
-	29, // 41: Admin.StreamBackup:output_type -> BackupKV
-	31, // 42: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
-	33, // 43: Admin.StreamEvents:output_type -> StreamEventsEvent
-	32, // [32:44] is the sub-list for method output_type
-	20, // [20:32] is the sub-list for method input_type
+	14, // 19: KeyVizColumn.rows:type_name -> KeyVizRow
+	6,  // 20: Admin.GetClusterOverview:input_type -> GetClusterOverviewRequest
+	9,  // 21: Admin.GetRaftGroups:input_type -> GetRaftGroupsRequest
+	12, // 22: Admin.GetAdapterSummary:input_type -> GetAdapterSummaryRequest
+	15, // 23: Admin.GetKeyVizMatrix:input_type -> GetKeyVizMatrixRequest
+	17, // 24: Admin.GetRouteDetail:input_type -> GetRouteDetailRequest
+	2,  // 25: Admin.SetAutoSplitEnabled:input_type -> SetAutoSplitEnabledRequest
+	21, // 26: Admin.BeginBackup:input_type -> BeginBackupRequest
+	23, // 27: Admin.RenewBackup:input_type -> RenewBackupRequest
+	25, // 28: Admin.EndBackup:input_type -> EndBackupRequest
+	27, // 29: Admin.ListAdaptersAndScopes:input_type -> ListAdaptersAndScopesRequest
+	30, // 30: Admin.StreamBackup:input_type -> StreamBackupRequest
+	32, // 31: Admin.GetNodeVersion:input_type -> GetNodeVersionRequest
+	34, // 32: Admin.StreamEvents:input_type -> StreamEventsRequest
+	7,  // 33: Admin.GetClusterOverview:output_type -> GetClusterOverviewResponse
+	10, // 34: Admin.GetRaftGroups:output_type -> GetRaftGroupsResponse
+	13, // 35: Admin.GetAdapterSummary:output_type -> GetAdapterSummaryResponse
+	16, // 36: Admin.GetKeyVizMatrix:output_type -> GetKeyVizMatrixResponse
+	18, // 37: Admin.GetRouteDetail:output_type -> GetRouteDetailResponse
+	3,  // 38: Admin.SetAutoSplitEnabled:output_type -> SetAutoSplitEnabledResponse
+	22, // 39: Admin.BeginBackup:output_type -> BeginBackupResponse
+	24, // 40: Admin.RenewBackup:output_type -> RenewBackupResponse
+	26, // 41: Admin.EndBackup:output_type -> EndBackupResponse
+	29, // 42: Admin.ListAdaptersAndScopes:output_type -> ListAdaptersAndScopesResponse
+	31, // 43: Admin.StreamBackup:output_type -> BackupKV
+	33, // 44: Admin.GetNodeVersion:output_type -> GetNodeVersionResponse
+	35, // 45: Admin.StreamEvents:output_type -> StreamEventsEvent
+	33, // [33:46] is the sub-list for method output_type
+	20, // [20:33] is the sub-list for method input_type
 	20, // [20:20] is the sub-list for extension type_name
 	20, // [20:20] is the sub-list for extension extendee
 	0,  // [0:20] is the sub-list for field type_name
@@ -2460,7 +2557,7 @@ func file_admin_proto_init() {
 	if File_admin_proto != nil {
 		return
 	}
-	file_admin_proto_msgTypes[31].OneofWrappers = []any{
+	file_admin_proto_msgTypes[33].OneofWrappers = []any{
 		(*StreamEventsEvent_RouteTransition)(nil),
 		(*StreamEventsEvent_KeyvizColumn)(nil),
 	}
@@ -2470,7 +2567,7 @@ func file_admin_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_admin_proto_rawDesc), len(file_admin_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   35,
+			NumMessages:   37,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

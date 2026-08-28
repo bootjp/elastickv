@@ -131,28 +131,85 @@ func IsListClaimKey(key []byte) bool {
 
 // ExtractListUserKeyFromDelta extracts the logical user key from a list delta key.
 func ExtractListUserKeyFromDelta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ListMetaDeltaPrefix))
-	if len(trimmed) < wideColKeyLenSize+deltaKeyTSSize+deltaKeySeqSize {
+	trimmed, ok := bytes.CutPrefix(key, []byte(ListMetaDeltaPrefix))
+	if !ok {
 		return nil
 	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(deltaKeyTSSize+deltaKeySeqSize) { //nolint:gosec // constants fit in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractListUserKeyFromLenPrefixedKey(trimmed, deltaKeyTSSize+deltaKeySeqSize)
 }
 
 // ExtractListUserKeyFromClaim extracts the logical user key from a list claim key.
 func ExtractListUserKeyFromClaim(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(ListClaimPrefix))
-	if len(trimmed) < wideColKeyLenSize+sortableInt64Bytes {
+	trimmed, ok := bytes.CutPrefix(key, []byte(ListClaimPrefix))
+	if !ok {
+		return nil
+	}
+	return extractListUserKeyFromLenPrefixedKey(trimmed, sortableInt64Bytes)
+}
+
+// ExtractListUserKeyFromDeltaScanPrefix extracts the logical user key from the
+// exact prefix produced by ListMetaDeltaScanPrefix.
+func ExtractListUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListMetaDeltaPrefix))
+}
+
+// ExtractListUserKeyFromClaimScanPrefix extracts the logical user key from the
+// exact prefix produced by ListClaimScanPrefix.
+func ExtractListUserKeyFromClaimScanPrefix(key []byte) []byte {
+	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListClaimPrefix))
+}
+
+// ExtractListUserKeyFromDeltaScanKey extracts the logical user key from a
+// delta scan prefix, a full delta key, or a scan cursor within that prefix.
+// Unlike ExtractListUserKeyFromDeltaScanPrefix it tolerates trailing bytes,
+// because a resumed scan starts from a cursor inside the prefix rather than
+// from the prefix itself.
+func ExtractListUserKeyFromDeltaScanKey(key []byte) []byte {
+	return extractListUserKeyFromScanKey(key, []byte(ListMetaDeltaPrefix))
+}
+
+// ExtractListUserKeyFromClaimScanKey extracts the logical user key from a
+// claim scan prefix, a full claim key, or a scan cursor within that prefix.
+func ExtractListUserKeyFromClaimScanKey(key []byte) []byte {
+	return extractListUserKeyFromScanKey(key, []byte(ListClaimPrefix))
+}
+
+func extractListUserKeyFromScanKey(key []byte, prefix []byte) []byte {
+	trimmed, ok := bytes.CutPrefix(key, prefix)
+	if !ok {
+		return nil
+	}
+	// suffixLen 0: any bytes past the user key are scan-cursor tail, not a
+	// fixed encoded suffix, so only the length prefix has to be satisfied.
+	return extractListUserKeyFromLenPrefixedKey(trimmed, 0)
+}
+
+func extractListUserKeyFromLenPrefixedScanPrefix(key []byte, prefix []byte) []byte {
+	if !bytes.HasPrefix(key, prefix) {
+		return nil
+	}
+	trimmed := key[len(prefix):]
+	if len(trimmed) < wideColKeyLenSize {
 		return nil
 	}
 	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(sortableInt64Bytes) { //nolint:gosec // constants fit in uint32
+	if uint64(len(trimmed)) != uint64(wideColKeyLenSize)+uint64(ukLen) {
 		return nil
 	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return trimmed[wideColKeyLenSize:]
+}
+
+func extractListUserKeyFromLenPrefixedKey(trimmed []byte, suffixLen int) []byte {
+	if len(trimmed) < wideColKeyLenSize+suffixLen {
+		return nil
+	}
+	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	availableUserKeyBytes := len(trimmed) - wideColKeyLenSize - suffixLen
+	if int64(ukLen) > int64(availableUserKeyBytes) {
+		return nil
+	}
+	userEnd := int64(wideColKeyLenSize) + int64(ukLen)
+	return trimmed[wideColKeyLenSize:userEnd]
 }
 
 // PrefixScanEnd returns the exclusive end key for a prefix scan.

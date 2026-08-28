@@ -70,6 +70,10 @@ func (r *RedisServer) listInlineTTLAt(ctx context.Context, userKey []byte, readT
 	return ttl, true, nil
 }
 
+func isStreamInlineMeta(raw []byte) bool {
+	return len(raw) == redisWideMetaInlineSizeBytes || len(raw) == store.StreamMetaTrimBinarySize
+}
+
 func (r *RedisServer) simpleInlineTTLAt(
 	ctx context.Context,
 	metaKey []byte,
@@ -117,7 +121,7 @@ func (r *RedisServer) streamInlineTTLAt(ctx context.Context, userKey []byte, rea
 		}
 		return nil, false, errors.WithStack(err)
 	}
-	if len(raw) != redisWideMetaInlineSizeBytes {
+	if !isStreamInlineMeta(raw) {
 		return nil, false, nil
 	}
 	meta, err := store.UnmarshalStreamMeta(raw)

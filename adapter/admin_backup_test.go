@@ -1455,3 +1455,67 @@ func TestRequireRenewableBackupToken(t *testing.T) {
 		})
 	}
 }
+
+// EndBackup marks the session closing before it proposes the releases, and
+// those fan out concurrently. A scan admitted after that point can read groups
+// whose pin has already been removed, where compaction is free to drop the
+// pinned versions -- and report success on a dump that is missing them.
+func TestStreamBackupRejectsSessionBeingReleased(t *testing.T) {
+	t.Parallel()
+	store := &backupTestStore{keys: [][]byte{
+		[]byte(logicalbackup.RedisStringPrefix + "a"),
+	}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+
+	srv.backupStateMu.Lock()
+	pinIDs := make([]kv.BackupPinID, 0, len(srv.backupSessions))
+	for pinID := range srv.backupSessions {
+		pinIDs = append(pinIDs, pinID)
+	}
+	srv.backupStateMu.Unlock()
+	require.NotEmpty(t, pinIDs)
+	for _, pinID := range pinIDs {
+		srv.closeBackupSession(pinID)
+	}
+
+	stream := &backupTestStream{ctx: context.Background()}
+	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, stream)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), "being released")
+	require.Empty(t, stream.got, "no record may be streamed against a releasing pin")
+}
+
+// A pin that expires during the final scan page must not be reported as a
+// completed dump: materializeBackupKey treats a compacted-away key as a skip,
+// so the scanner reaches exhaustion with keys silently missing.
+func TestStreamBackupRechecksPinOnExhaustion(t *testing.T) {
+	t.Parallel()
+	const ttl = 30 * time.Millisecond
+	nowMS := atomic.Int64{}
+	nowMS.Store(time.Unix(1_000_000, 0).UnixMilli())
+	store := &backupTestStore{keys: [][]byte{
+		[]byte(logicalbackup.RedisStringPrefix + "a"),
+		[]byte(logicalbackup.RedisStringPrefix + "b"),
+	}}
+	// The pin lapses inside the Next call that reports exhaustion -- the window
+	// the top-of-loop check cannot see.
+	store.onExhaust = func() { nowMS.Add(ttl.Milliseconds()) }
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil,
+		WithAdminBackupConfig(AdminBackupConfig{DefaultTTL: ttl, MinTTL: time.Millisecond, MaxTTL: time.Second}),
+	)
+	srv.SetClock(func() time.Time { return time.UnixMilli(nowMS.Load()) })
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+
+	stream := &backupTestStream{ctx: context.Background()}
+	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, stream)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), "expired")
+	require.Len(t, stream.got, 2, "both records were streamed before the pin lapsed")
+}

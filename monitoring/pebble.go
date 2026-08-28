@@ -16,12 +16,13 @@ import (
 // dashboard.
 //
 // The point-in-time fields (Sublevels, NumFiles, EstimatedDebt,
-// MemTable.*, NumInProgress, BlockCache.Size) are exposed as
-// Prometheus GAUGES — each poll overwrites the previous value.
-// Monotonic fields (Compact.Count, BlockCache.Hits/Misses) are exposed
-// as COUNTERS; the collector emits only the positive delta against the
-// last snapshot so a store reset (Restore/swap) does not produce
-// negative values.
+// MemTable.*, NumInProgress, BlockCache.Size) are exposed as Prometheus
+// GAUGES — each poll overwrites the previous value. LSM / memtable /
+// compaction signals remain group-scoped; the block cache is process-wide and
+// is emitted once per node because all stores share one pebble.Cache.
+// Monotonic fields (Compact.Count, BlockCache.Hits/Misses) are exposed as
+// COUNTERS; the collector emits only the positive delta against the last
+// snapshot so a store reset (Restore/swap) does not produce negative values.
 //
 // Name convention: elastickv_pebble_* to keep a consistent node_id /
 // node_address label prefix with the rest of the registry.
@@ -121,30 +122,30 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 		blockCacheSizeBytes: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_block_cache_size_bytes",
-				Help: "Current bytes in use by Pebble's block cache.",
+				Help: "Current bytes in use by the process-wide Pebble block cache.",
 			},
-			[]string{"group"},
+			nil,
 		),
 		blockCacheCapacityBytes: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_block_cache_capacity_bytes",
-				Help: "Configured maximum size of Pebble's block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.",
+				Help: "Configured maximum size of the process-wide Pebble block cache in bytes. Paired with elastickv_pebble_block_cache_size_bytes so operators can see usage relative to capacity and with the hit/miss counters so they can reason about whether a low hit rate reflects a cold cache or an undersized one.",
 			},
-			[]string{"group"},
+			nil,
 		),
 		blockCacheHitsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_pebble_block_cache_hits_total",
-				Help: "Cumulative block cache hits reported by Pebble.",
+				Help: "Cumulative process-wide block cache hits reported by Pebble.",
 			},
-			[]string{"group"},
+			nil,
 		),
 		blockCacheMissesTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_pebble_block_cache_misses_total",
-				Help: "Cumulative block cache misses reported by Pebble.",
+				Help: "Cumulative process-wide block cache misses reported by Pebble.",
 			},
-			[]string{"group"},
+			nil,
 		),
 		fsmApplySyncMode: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -238,14 +239,18 @@ type PebbleSource struct {
 type PebbleCollector struct {
 	metrics *PebbleMetrics
 
-	mu       sync.Mutex
-	previous map[uint64]pebbleSnapshot
+	mu                 sync.Mutex
+	previous           map[uint64]pebbleSnapshot
+	previousBlockCache pebbleBlockCacheSnapshot
 }
 
 type pebbleSnapshot struct {
-	compactCount     int64
-	blockCacheHits   int64
-	blockCacheMisses int64
+	compactCount int64
+}
+
+type pebbleBlockCacheSnapshot struct {
+	hits   int64
+	misses int64
 }
 
 func newPebbleCollector(metrics *PebbleMetrics) *PebbleCollector {
@@ -293,6 +298,8 @@ func (c *PebbleCollector) observeOnce(sources []PebbleSource) {
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	blockCacheObserved := false
+	blockCacheCapacityObserved := false
 	for _, src := range sources {
 		if src.Source == nil {
 			continue
@@ -302,6 +309,13 @@ func (c *PebbleCollector) observeOnce(sources []PebbleSource) {
 			continue
 		}
 		c.observeSource(src, snap)
+		if !blockCacheObserved {
+			c.observeBlockCache(snap)
+			blockCacheObserved = true
+		}
+		if !blockCacheCapacityObserved {
+			blockCacheCapacityObserved = c.observeBlockCacheCapacity(src)
+		}
 	}
 }
 
@@ -324,35 +338,45 @@ func (c *PebbleCollector) observeSource(src PebbleSource, snap *pebble.Metrics) 
 	c.metrics.memtableSizeBytes.WithLabelValues(group).Set(float64(snap.MemTable.Size))
 	c.metrics.memtableZombieCount.WithLabelValues(group).Set(float64(snap.MemTable.ZombieCount))
 
-	// Block cache gauges: current usage (always) + configured capacity
-	// (when the source exposes it). Capacity is static for the lifetime
-	// of a DB in practice, but we re-read each tick so operators observe
-	// the new value immediately after a restart with a different
-	// ELASTICKV_PEBBLE_CACHE_MB.
-	c.metrics.blockCacheSizeBytes.WithLabelValues(group).Set(float64(snap.BlockCache.Size))
-	if capSrc, ok := src.Source.(PebbleCacheCapacitySource); ok {
-		if capBytes := capSrc.BlockCacheCapacityBytes(); capBytes > 0 {
-			c.metrics.blockCacheCapacityBytes.WithLabelValues(group).Set(float64(capBytes))
-		}
-	}
-
 	// Monotonic counters: emit only the positive delta. A smaller value
 	// means the source was reset (store reopened); rebase silently
 	// without emitting negative.
 	prev := c.previous[src.GroupID]
 	curr := pebbleSnapshot{
-		compactCount:     snap.Compact.Count,
-		blockCacheHits:   snap.BlockCache.Hits,
-		blockCacheMisses: snap.BlockCache.Misses,
+		compactCount: snap.Compact.Count,
 	}
 	if curr.compactCount > prev.compactCount {
 		c.metrics.compactCountTotal.WithLabelValues(group).Add(float64(curr.compactCount - prev.compactCount))
 	}
-	if curr.blockCacheHits > prev.blockCacheHits {
-		c.metrics.blockCacheHitsTotal.WithLabelValues(group).Add(float64(curr.blockCacheHits - prev.blockCacheHits))
-	}
-	if curr.blockCacheMisses > prev.blockCacheMisses {
-		c.metrics.blockCacheMissesTotal.WithLabelValues(group).Add(float64(curr.blockCacheMisses - prev.blockCacheMisses))
-	}
 	c.previous[src.GroupID] = curr
+}
+
+func (c *PebbleCollector) observeBlockCache(snap *pebble.Metrics) {
+	c.metrics.blockCacheSizeBytes.WithLabelValues().Set(float64(snap.BlockCache.Size))
+
+	prev := c.previousBlockCache
+	curr := pebbleBlockCacheSnapshot{
+		hits:   snap.BlockCache.Hits,
+		misses: snap.BlockCache.Misses,
+	}
+	if curr.hits > prev.hits {
+		c.metrics.blockCacheHitsTotal.WithLabelValues().Add(float64(curr.hits - prev.hits))
+	}
+	if curr.misses > prev.misses {
+		c.metrics.blockCacheMissesTotal.WithLabelValues().Add(float64(curr.misses - prev.misses))
+	}
+	c.previousBlockCache = curr
+}
+
+func (c *PebbleCollector) observeBlockCacheCapacity(src PebbleSource) bool {
+	capSrc, ok := src.Source.(PebbleCacheCapacitySource)
+	if !ok {
+		return false
+	}
+	capBytes := capSrc.BlockCacheCapacityBytes()
+	if capBytes <= 0 {
+		return false
+	}
+	c.metrics.blockCacheCapacityBytes.WithLabelValues().Set(float64(capBytes))
+	return true
 }

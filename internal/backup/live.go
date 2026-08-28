@@ -209,10 +209,13 @@ func isRedisBackupKey(key []byte) bool {
 		return false
 	}
 	prefixes := [...]string{
-		RedisHashMetaPrefix, RedisHashFieldPrefix,
-		ListMetaPrefix, ListItemPrefix,
-		RedisSetMetaPrefix, RedisSetMemberPrefix,
-		RedisZSetMetaPrefix, RedisZSetMemberPrefix, RedisZSetLegacyBlobPrefix,
+		RedisHashMetaDeltaPrefix, RedisHashMetaPrefix, RedisHashFieldPrefix,
+		RedisHashLegacyBlobPrefix,
+		ListMetaDeltaPrefix, ListMetaPrefix, ListItemPrefix, ListClaimPrefix,
+		RedisSetMetaDeltaPrefix, RedisSetMetaPrefix, RedisSetMemberPrefix,
+		RedisSetLegacyBlobPrefix,
+		RedisZSetMetaDeltaPrefix, RedisZSetMetaPrefix, RedisZSetMemberPrefix,
+		RedisZSetScorePrefix, RedisZSetLegacyBlobPrefix,
 		RedisStreamMetaPrefix, RedisStreamEntryPrefix,
 		RedisStringPrefix, RedisHLLPrefix, RedisTTLPrefix,
 	}

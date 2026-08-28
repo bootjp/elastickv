@@ -89,6 +89,12 @@ func TestMilestone1SplitRange_EndToEndRefreshAndDataPath(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), splitResp.CatalogVersion)
+	changes, err := catalog.ChangesSince(ctx, initial.Version, 1)
+	require.NoError(t, err)
+	require.Nil(t, changes.Reset)
+	require.Len(t, changes.Deltas, 1)
+	require.Equal(t, splitResp.CatalogVersion, changes.Deltas[0].Version)
+	require.Len(t, changes.Deltas[0].Mutations, 3)
 
 	require.Eventually(t, func() bool {
 		if engine.Version() != splitResp.CatalogVersion {

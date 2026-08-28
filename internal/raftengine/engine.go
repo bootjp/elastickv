@@ -35,6 +35,9 @@ var (
 	// unapplied configuration change, so transfer is rejected until the
 	// membership transition settles.
 	ErrLeadershipTransferConfChangePending = errors.New("raft engine: leadership transfer blocked by pending config change")
+	// ErrMembershipChangePending indicates that a membership proposal is
+	// already present in the local Raft log and has not settled yet.
+	ErrMembershipChangePending = errors.New("raft engine: membership change blocked by pending config change")
 	// ErrEnvelopeCutoverInProgress indicates the §7.1 raft-envelope
 	// cutover barrier is open on this leader and rejecting fresh
 	// USER proposals on the Propose path. The error is the step-1
@@ -49,6 +52,18 @@ var (
 	// ConfChange-time RegisterEncryptionWriter) and never observes
 	// this error.
 	ErrEnvelopeCutoverInProgress = errors.New("raft engine: envelope cutover in progress")
+	// ErrSnapshotDeferred indicates StateMachine.Snapshot declined to
+	// produce a snapshot right now and wants the caller to try again
+	// later. It is the only Snapshot error a caller may treat as
+	// non-fatal: every other one means the state machine could not be
+	// captured and the engine must stop rather than continue against
+	// state it cannot persist. A deferral necessarily also defers the
+	// log truncation that follows a snapshot, so nothing the skipped
+	// snapshot would have recorded is lost -- WAL replay still
+	// reconstructs it. State machines that hold a resource across
+	// snapshots (an open backup pin, for instance) mark their refusal
+	// with this sentinel.
+	ErrSnapshotDeferred = errors.New("raft engine: fsm snapshot deferred")
 )
 
 type State string
@@ -92,6 +107,10 @@ type Status struct {
 	FSMPending        uint64
 	NumPeers          uint64
 	LastContact       time.Duration
+	// ConfigurationIndex is the highest committed membership index durably
+	// published by this node. Operators pass it back as previous_index on the
+	// next membership RPC to reject concurrent topology changes.
+	ConfigurationIndex uint64
 	// LeadTransferee is non-zero on the current leader while a leadership
 	// transfer is in progress, and zero otherwise (including on followers).
 	// Writers should hold new proposals while this is non-zero, since etcd/raft
