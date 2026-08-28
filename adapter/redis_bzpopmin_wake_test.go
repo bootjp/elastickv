@@ -764,3 +764,44 @@ func TestRedis_BZPopMinFullyIndexedZSetAvoidsMemberLoad(t *testing.T) {
 	require.Equal(t, store.ZSetScoreScanPrefix(key), rec.keyScans[1].start)
 	require.Equal(t, 3, rec.keyScans[1].limit)
 }
+
+// ErrDeltaScanTruncated means the metadata length could not be summed from the
+// uncompacted deltas. The coverage proof never reads that length -- it compares
+// member rows against score rows -- so letting truncation veto it sent every pop
+// on a high-churn zset through the full member load, which is the load this
+// branch exists to reduce.
+func TestRedis_BZPopMinTruncatedMetaKeepsCompleteIndexAuthoritative(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	readTS := uint64(10)
+	key := []byte("zset-bzpopmin-truncated-complete")
+
+	base := store.NewMVCCStore()
+	t.Cleanup(func() { _ = base.Close() })
+	seedZSetScoreRowsForTest(t, base, key, readTS, []redisZSetEntry{
+		{Member: "later", Score: 3},
+		{Member: "middle", Score: 2},
+		{Member: "first", Score: 1},
+	})
+	// Enough uncompacted deltas that resolveZSetMeta truncates.
+	delta := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 0})
+	for i := uint32(0); i < store.MaxDeltaScanLimit+1; i++ {
+		require.NoError(t, base.PutAt(ctx, store.ZSetMetaDeltaKey(key, readTS, i), delta, readTS, 0))
+	}
+
+	rec := &bzpopminRecordingStore{MVCCStore: base}
+	server := &RedisServer{store: rec}
+
+	candidate, err := server.bzpopminCandidateAt(ctx, key, readTS)
+	require.NoError(t, err)
+	require.NotNil(t, candidate)
+	require.Equal(t, "first", candidate.entry.Member)
+	require.True(t, candidate.isWide)
+	require.False(t, candidate.isLast)
+
+	// The metadata delta scan and the two-row score probe, and nothing that
+	// loads member values.
+	require.Len(t, rec.scans, 2)
+	require.Equal(t, store.ZSetMetaDeltaScanPrefix(key), rec.scans[0].start)
+	require.Equal(t, store.ZSetScoreScanPrefix(key), rec.scans[1].start)
+}

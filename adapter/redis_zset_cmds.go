@@ -1250,7 +1250,7 @@ func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []by
 		return nil, false, cockerrors.WithStack(err)
 	}
 	candidate, scoreTie := bzpopminScoreCandidateFromKVs(key, scoreKVs)
-	cover, err := r.zsetScoreIndexCoverageAt(ctx, key, readTS, meta)
+	cover, err := r.zsetScoreIndexCoverageAt(ctx, key, readTS)
 	if err != nil {
 		return nil, false, err
 	}
@@ -1286,11 +1286,16 @@ type zsetIndexCoverage struct {
 // Both scans are key-only and bounded. Past the bound the proof would cost as
 // much as the member scan it exists to avoid, so coverage is reported false and
 // the caller's member comparison -- which is correct either way -- decides.
+//
+// Truncated metadata is deliberately not consulted. ErrDeltaScanTruncated means
+// the length could not be summed from the uncompacted deltas, and this proof
+// never reads that length: it compares member rows against score rows. Letting
+// truncation veto the proof sent every pop on a high-churn zset -- exactly the
+// zsets that accumulate deltas -- through the full member load instead.
 func (r *RedisServer) zsetScoreIndexCoverageAt(
 	ctx context.Context,
 	key []byte,
 	readTS uint64,
-	meta bzpopminMetaProbe,
 ) (zsetIndexCoverage, error) {
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberKeys, err := r.store.ScanKeysAt(
@@ -1299,7 +1304,7 @@ func (r *RedisServer) zsetScoreIndexCoverageAt(
 		return zsetIndexCoverage{}, cockerrors.WithStack(err)
 	}
 	cover := zsetIndexCoverage{members: len(memberKeys)}
-	if meta.truncated || len(memberKeys) == 0 || len(memberKeys) > bzpopminIndexProofLimit {
+	if len(memberKeys) == 0 || len(memberKeys) > bzpopminIndexProofLimit {
 		return cover, nil
 	}
 	scorePrefix := store.ZSetScoreScanPrefix(key)
