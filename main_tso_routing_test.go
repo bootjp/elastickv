@@ -634,3 +634,36 @@ func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
 	require.NoError(t, phaseD.authorizeActivation(true, false))
 	require.NoError(t, phaseD.authorizeActivation(true, true))
 }
+
+// The distribution server decides whether a requested activation would change
+// anything by probing the allocator it was handed. main.go hands it the
+// concrete *kv.RaftTSOAllocator, so if that type stops exposing either marker
+// the probe silently reports "still pending" and a node following a marker
+// another leader committed answers PermissionDenied -- stalling allocation
+// cluster-wide. A stub that happens to implement both cannot catch that.
+func TestServerAllocatorExposesDurableMarkerState(t *testing.T) {
+	setTSOModeFlags(t, false, false)
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	fsm := kv.NewTSOStateMachine(clock)
+	engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
+	groups := map[uint64]*kv.ShardGroup{
+		dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+	}
+	coord := newMainTSOCoordinator(clock, groups)
+	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+	require.NotNil(t, wiring.serverAllocator)
+
+	cutover, ok := any(wiring.serverAllocator).(interface{ CutoverActive() bool })
+	require.True(t, ok, "the server allocator must expose the durable cutover marker")
+	phaseD, ok := any(wiring.serverAllocator).(interface{ PhaseDActive() bool })
+	require.True(t, ok, "the server allocator must expose the durable phase-D marker")
+
+	// Nothing is durable yet, so both still read false and a request to activate
+	// them is a genuine activation the gate should see.
+	require.False(t, cutover.CutoverActive())
+	require.False(t, phaseD.PhaseDActive())
+}

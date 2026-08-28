@@ -256,15 +256,17 @@ func (s *DistributionServer) authorizeTSOActivation(activateCutover, activatePha
 
 // pendingTSOActivation narrows a request's activation flags to the markers that
 // are not durable yet.
+// The two markers are probed independently. A single two-method assertion fails
+// entirely when an allocator exposes only one of them, which silently restores
+// the outage this narrowing exists to prevent.
 func (s *DistributionServer) pendingTSOActivation(activateCutover, activatePhaseD bool) (bool, bool) {
-	state, ok := s.timestampAllocator.(interface {
-		CutoverActive() bool
-		PhaseDActive() bool
-	})
-	if !ok {
-		return activateCutover, activatePhaseD
+	if cutover, ok := s.timestampAllocator.(interface{ CutoverActive() bool }); ok && cutover.CutoverActive() {
+		activateCutover = false
 	}
-	return activateCutover && !state.CutoverActive(), activatePhaseD && !state.PhaseDActive()
+	if phaseD, ok := s.timestampAllocator.(interface{ PhaseDActive() bool }); ok && phaseD.PhaseDActive() {
+		activatePhaseD = false
+	}
+	return activateCutover, activatePhaseD
 }
 
 func (s *DistributionServer) legacyTimestampResponse(

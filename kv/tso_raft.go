@@ -448,6 +448,15 @@ func (a *RaftTSOAllocator) ValidateDurableTimestamp(ctx context.Context, timesta
 	return nil
 }
 
+// CutoverActive reports the durable cutover marker. It sits beside PhaseDActive
+// so a caller holding this allocator can tell which markers are already
+// committed without reaching for the state machine itself -- the distribution
+// server needs exactly that to know whether a requested activation would change
+// anything.
+func (a *RaftTSOAllocator) CutoverActive() bool {
+	return a != nil && a.state != nil && a.state.CutoverActive()
+}
+
 func (a *RaftTSOAllocator) PhaseDActive() bool {
 	return a != nil && a.state != nil && a.state.PhaseDActive()
 }
