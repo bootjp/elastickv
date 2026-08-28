@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -129,6 +130,13 @@ const (
 	// response already supports. Same shape as the promotion path's clamp.
 	maxMigrationExportChunkBytes = 32 << 20
 	maxMigrationExportScanBytes  = maxMigrationExportChunkBytes * defaultMigrationExportScanFactor
+
+	// Headroom for proto framing over the payload bytes a page carries: field
+	// tags and length prefixes for at most defaultMigrationExportMaxVersions
+	// entries come to tens of kilobytes, so a mebibyte covers them with room
+	// to spare.
+	migrationExportPageFramingHeadroom = 1 << 20
+	migrationExportPageByteBudget      = internal.GRPCMaxMessageBytes - migrationExportPageFramingHeadroom
 )
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
@@ -220,11 +228,15 @@ func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest,
 		if !result.Done && bytes.Equal(opts.Cursor, result.NextCursor) {
 			return errors.WithStack(status.Error(codes.Internal, "migration export cursor did not progress"))
 		}
-		if err := stream.Send(&pb.ExportRangeVersionsResponse{
+		resp := &pb.ExportRangeVersionsResponse{
 			Versions:   protoMVCCVersionsFromStore(result.Versions),
 			NextCursor: result.NextCursor,
 			Done:       result.Done,
-		}); err != nil {
+		}
+		if err := checkMigrationExportPageSize(resp); err != nil {
+			return err
+		}
+		if err := stream.Send(resp); err != nil {
 			return errors.WithStack(err)
 		}
 		if result.Done {
@@ -232,6 +244,48 @@ func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest,
 		}
 		opts.Cursor = result.NextCursor
 	}
+}
+
+// checkMigrationExportPageSize refuses to send a page the transport cannot
+// carry. The store's MaxBytes budget is only consulted after a version has
+// been appended, and storage accepts values far above the message limit
+// (store.maxSnapshotValueSize is 256 MiB against internal.GRPCMaxMessageBytes'
+// 64 MiB), so a single oversized row can land in an otherwise bounded page.
+// Sending it fails with ResourceExhausted, and so does every retry of the same
+// cursor -- the bracket never completes and the error says nothing about which
+// row is responsible. Naming the row instead keeps the failure diagnosable.
+// Carrying values that large needs a chunked migration wire format, which is a
+// protocol change rather than a fix here.
+func checkMigrationExportPageSize(resp *pb.ExportRangeVersionsResponse) error {
+	if migrationExportPagePayloadBytes(resp) <= migrationExportPageByteBudget {
+		return nil
+	}
+	widest := widestMigrationExportVersion(resp.GetVersions())
+	return errors.WithStack(status.Errorf(codes.FailedPrecondition,
+		"migration export page exceeds the %d byte message limit; key %q holds %d value bytes",
+		internal.GRPCMaxMessageBytes, widest.GetKey(), len(widest.GetValue())))
+}
+
+// migrationExportPagePayloadBytes sums the caller-controlled bytes in a page.
+// It deliberately undercounts the proto framing rather than calling
+// proto.Size, which caches its result inside the message; the budget carries
+// enough headroom to cover the framing of a full page.
+func migrationExportPagePayloadBytes(resp *pb.ExportRangeVersionsResponse) int {
+	total := len(resp.GetNextCursor())
+	for _, version := range resp.GetVersions() {
+		total += len(version.GetKey()) + len(version.GetValue())
+	}
+	return total
+}
+
+func widestMigrationExportVersion(versions []*pb.MVCCVersion) *pb.MVCCVersion {
+	var widest *pb.MVCCVersion
+	for _, version := range versions {
+		if widest == nil || len(version.GetValue()) > len(widest.GetValue()) {
+			widest = version
+		}
+	}
+	return widest
 }
 
 func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeVersionsRequest) (*pb.ImportRangeVersionsResponse, error) {

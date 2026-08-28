@@ -1,11 +1,13 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -658,4 +660,35 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 	_, err = st.GetAt(ctx, staged, 30)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
+}
+
+// Storage accepts values well past the internal gRPC message limit, and the
+// store's byte budget is only consulted after a version has been appended, so
+// one oversized row can land in an otherwise bounded export page. Sending it
+// fails with ResourceExhausted, and so does every retry of the same cursor:
+// the bracket stalls forever on an error that never names the row. The export
+// must refuse the page and say which key is too large.
+func TestInternalExportRangeVersionsRefusesOversizedPage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	huge := bytes.Repeat([]byte{'x'}, internalutil.GRPCMaxMessageBytes+1)
+	require.NoError(t, st.PutAt(ctx, []byte("a"), huge, 10, 0))
+	srv := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+
+	err := srv.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs: 20,
+		RouteStart:  []byte("a"),
+		RouteEnd:    []byte("b"),
+		KeyFamily:   distribution.MigrationFamilyUser,
+		RangeStart:  []byte("a"),
+		RangeEnd:    []byte("b"),
+	}, stream)
+
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), `"a"`)
+	require.Empty(t, stream.responses, "an unsendable page must not be sent")
 }
