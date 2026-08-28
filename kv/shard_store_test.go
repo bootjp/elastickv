@@ -3460,12 +3460,12 @@ func TestLegacyPointRouteKeyIsNotTheCanonicalizationPredicate(t *testing.T) {
 	require.Nil(t, legacyPointRouteKey([]byte("plain")))
 }
 
-// A proxied page is served by a peer's RawScan, which runs it through that
-// peer's ShardStore.ScanAtWithReadFence and canonicalizes it there. The
-// canonical row keeps its physical key, so canonicalizing again locally re-reads
-// every row -- and on this path each of those reads is itself a fenced RPC back
-// to the peer.
-func TestScanAtDoesNotRecanonicalizeProxiedPages(t *testing.T) {
+// A proxied page cannot be assumed canonical. The peer may be running the parent
+// binary, which accepts group_id on RawScanAt and serves rawScanAtExplicitGroup
+// while ignoring the fence and route-bounds fields, and has no canonicalization
+// at all -- so it answers with physical rows. Dropping the local pass would let a
+// legacy hash/set/zset row through that a logical tombstone should suppress.
+func TestScanAtCanonicalizesProxiedPages(t *testing.T) {
 	t.Parallel()
 
 	userKey := []byte("user:key")
@@ -3490,12 +3490,11 @@ func TestScanAtDoesNotRecanonicalizeProxiedPages(t *testing.T) {
 	t.Cleanup(func() { _ = st.Close() })
 
 	start := store.HashFieldScanPrefix(userKey)
-	kvs, err := st.ScanAt(context.Background(), start, prefixScanEnd(start), 10, 20)
+	_, err := st.ScanAt(context.Background(), start, prefixScanEnd(start), 10, 20)
 	require.NoError(t, err)
-	require.Len(t, kvs, len(rows))
 
 	fake.mu.Lock()
 	defer fake.mu.Unlock()
-	require.Zero(t, fake.getCalls,
-		"the peer already canonicalized the page; re-reading each row is one extra RPC per row")
+	require.Equal(t, len(rows), fake.getCalls,
+		"every proxied row must be canonicalized locally until the peer can say it already did")
 }

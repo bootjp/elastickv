@@ -1702,14 +1702,19 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterProxyPage(
 	if err != nil {
 		return nil, nil, err
 	}
-	// Not canonicalized here. proxyRawScanAt reaches a peer's RawScan, which
-	// serves it through ShardStore.ScanAtWithReadFence and canonicalizes the
-	// page there; the canonical row keeps its physical key, so a second pass
-	// would re-read every row -- over the network this time, one fenced RPC
-	// each. Every peer that can serve this range runs this same code: the
-	// canonicalization does not exist on main at all, so there is no older
-	// binary that would return uncanonicalized rows.
-	return filterTxnInternalKVs(kvs), kvs, nil
+	// Canonicalized here even though a peer running this branch already did it
+	// on its side. The peer may be running the parent binary instead: that one
+	// accepts group_id on RawScanAt and serves rawScanAtExplicitGroup while
+	// ignoring the fence and route-bounds fields this request adds, and it has
+	// no canonicalization at all, so it answers with physical rows. Dropping
+	// this pass would let a legacy hash/set/zset row through that a logical
+	// tombstone should have suppressed. It can go once the response can say it
+	// is already canonical.
+	filtered, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(kvs), start, ts, readRouteVersion)
+	if err != nil {
+		return nil, nil, err
+	}
+	return filtered, kvs, nil
 }
 
 func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
@@ -1976,9 +1981,13 @@ func (s *ShardStore) scanRouteAtForwardProxyPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	// Already canonicalized by the peer that served it; see
-	// scanRouteAtDirectionWithReadFenceRouteFilterProxyPage.
-	kvs := filterTxnInternalKVs(raw)
+	// Canonicalized here; see
+	// scanRouteAtDirectionWithReadFenceRouteFilterProxyPage for why a peer's
+	// page cannot be assumed canonical.
+	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
+	if err != nil {
+		return scanRoutePage{}, err
+	}
 	return scanRoutePage{
 		kvs:        kvs,
 		advanceKey: lastKVKey(raw),
@@ -2128,9 +2137,13 @@ func (s *ShardStore) scanRouteAtReverseProxyPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	// Already canonicalized by the peer that served it; see
-	// scanRouteAtDirectionWithReadFenceRouteFilterProxyPage.
-	kvs := filterTxnInternalKVs(raw)
+	// Canonicalized here; see
+	// scanRouteAtDirectionWithReadFenceRouteFilterProxyPage for why a peer's
+	// page cannot be assumed canonical.
+	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterTxnInternalKVs(raw), start, ts, readRouteVersion)
+	if err != nil {
+		return scanRoutePage{}, err
+	}
 	return scanRoutePage{
 		kvs:        kvs,
 		advanceKey: lastKVKey(raw),
