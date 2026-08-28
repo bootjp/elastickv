@@ -355,10 +355,14 @@ func TestHotKeysAggregatorRaceFree(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 	var wgRun sync.WaitGroup
-	wgRun.Add(1)
+	wgRun.Add(2)
 	go func() {
 		defer wgRun.Done()
 		RunHotKeysAggregator(ctx, s)
+	}()
+	go func() {
+		defer wgRun.Done()
+		RunFlusher(ctx, s, s.Step())
 	}()
 
 	var wg sync.WaitGroup
@@ -377,8 +381,8 @@ func TestHotKeysAggregatorRaceFree(t *testing.T) {
 		}(w)
 	}
 	wg.Wait()
-	// Wait for the aggregator to drain the queue and publish at least
-	// one tick-driven snapshot for each route. The previous
+	// Wait for the matrix flusher to request an aligned Top-K snapshot for each
+	// route. The previous
 	// time.Sleep(50ms) raced the aggregator's tick (Step=5ms) on slow
 	// -race CI runners — the Run goroutine could be slow to schedule
 	// at all, leaving hotKeysSnap as its initial nil atomic.Pointer

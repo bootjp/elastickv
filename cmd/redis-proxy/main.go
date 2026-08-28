@@ -7,7 +7,6 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
-	"net/http/pprof"
 	"os"
 	"os/signal"
 	"strings"
@@ -20,11 +19,12 @@ import (
 )
 
 const (
-	sentryFlushTimeout          = 2 * time.Second
-	metricsShutdownTimeout      = 5 * time.Second
-	secondaryConcurrencyDivisor = 2
-	elasticKVDispatchTimeout    = 10 * time.Second
-	backendTimeoutGrace         = time.Second
+	sentryFlushTimeout                = 2 * time.Second
+	metricsShutdownTimeout            = 5 * time.Second
+	secondaryWriteConcurrencyDivisor  = 2
+	secondaryScriptConcurrencyDivisor = 32
+	secondaryScriptConcurrencyCap     = 3
+	maxSecondaryScriptTimeout         = 5 * time.Minute
 )
 
 func main() {
@@ -56,23 +56,23 @@ func run() error {
 	flag.IntVar(&primaryPoolSize, "primary-pool-size", primaryPoolSize, "Primary Redis backend connection pool size")
 	flag.IntVar(&elasticKVPoolSize, "elastickv-pool-size", elasticKVPoolSize, "ElasticKV backend connection pool size")
 	flag.IntVar(&secondaryWriteConcurrency, "secondary-write-concurrency", secondaryWriteConcurrency, "Maximum concurrent asynchronous secondary writes including scripts (0 = half of secondary backend pool size)")
-	flag.IntVar(&secondaryScriptConcurrency, "secondary-script-concurrency", secondaryScriptConcurrency, "Maximum concurrent asynchronous secondary Lua-script writes within the write limit (0 = half of secondary write concurrency)")
+	flag.IntVar(&secondaryScriptConcurrency, "secondary-script-concurrency", secondaryScriptConcurrency, "Maximum concurrent asynchronous secondary Lua-script writes within the write limit (0 = secondary write concurrency / 32, minimum 1, capped at 3)")
 	flag.IntVar(&secondaryBlockingReplayConcurrency, "secondary-blocking-replay-concurrency", secondaryBlockingReplayConcurrency, "Maximum concurrent asynchronous secondary mutating blocking-command replays (0 = capped remaining secondary backend pool capacity after writes)")
 	flag.IntVar(&secondaryWriteQueueSize, "secondary-write-queue-size", secondaryWriteQueueSize, "Maximum queued asynchronous secondary writes (0 = derived from write concurrency)")
 	flag.IntVar(&secondaryScriptQueueSize, "secondary-script-queue-size", secondaryScriptQueueSize, "Maximum queued asynchronous secondary Lua-script writes (0 = derived from script concurrency)")
 	flag.IntVar(&secondaryBlockingReplayQueueSize, "secondary-blocking-replay-queue-size", secondaryBlockingReplayQueueSize, "Maximum queued asynchronous secondary mutating blocking-command replays (0 = derived from blocking replay concurrency)")
 	flag.StringVar(&modeStr, "mode", "dual-write", "Proxy mode: redis-only, dual-write, dual-write-shadow, elastickv-primary, elastickv-only")
 	flag.DurationVar(&cfg.SecondaryTimeout, "secondary-timeout", cfg.SecondaryTimeout, "Secondary write timeout")
+	flag.DurationVar(&cfg.SecondaryScriptTimeout, "secondary-script-timeout", cfg.SecondaryScriptTimeout, "Secondary Lua-script write timeout for Redis or ElasticKV replay, including transaction scripts (0 = secondary-timeout)")
 	flag.DurationVar(&cfg.ShadowTimeout, "shadow-timeout", cfg.ShadowTimeout, "Shadow read timeout")
 	flag.StringVar(&cfg.SentryDSN, "sentry-dsn", cfg.SentryDSN, "Sentry DSN (empty = disabled)")
 	flag.StringVar(&cfg.SentryEnv, "sentry-env", cfg.SentryEnv, "Sentry environment")
 	flag.Float64Var(&cfg.SentrySampleRate, "sentry-sample", cfg.SentrySampleRate, "Sentry sample rate")
 	flag.StringVar(&cfg.MetricsAddr, "metrics", cfg.MetricsAddr, "Prometheus metrics address")
-	flag.StringVar(&cfg.PProfAddr, "pprof", cfg.PProfAddr, "pprof listen address (empty = disabled)")
-	flag.BoolVar(&cfg.RedisOnlyRaw, "redis-only-raw", cfg.RedisOnlyRaw, "Use raw TCP bridging in redis-only mode")
 	flag.Parse()
 
 	mode, resolvedWriteConcurrency, resolvedScriptConcurrency, resolvedBlockingReplayConcurrency, err := resolveRuntimeOptions(
+		cfg,
 		modeStr,
 		primaryPoolSize,
 		elasticKVPoolSize,
@@ -100,12 +100,33 @@ func run() error {
 	sentryReporter := proxy.NewSentryReporter(cfg.SentryDSN, cfg.SentryEnv, cfg.SentrySampleRate, logger)
 	defer sentryReporter.Flush(sentryFlushTimeout)
 
+	// Prometheus
 	reg := prometheus.NewRegistry()
 	metrics := proxy.NewProxyMetrics(reg)
 
-	primary, secondary, err := newBackends(cfg, primaryPoolSize, elasticKVPoolSize, logger)
-	if err != nil {
-		return err
+	// Backends
+	primaryOpts := proxy.DefaultBackendOptions()
+	primaryOpts.DB = cfg.PrimaryDB
+	primaryOpts.Password = cfg.PrimaryPassword
+	primaryOpts.PoolSize = primaryPoolSize
+	secondaryOpts := proxy.DefaultElasticKVBackendOptions()
+	secondaryOpts.DB = cfg.SecondaryDB
+	secondaryOpts.Password = cfg.SecondaryPassword
+	secondaryOpts.PoolSize = elasticKVPoolSize
+
+	secondarySeeds := parseAddrList(cfg.SecondaryAddr)
+	if len(secondarySeeds) == 0 {
+		return fmt.Errorf("at least one secondary address is required")
+	}
+
+	var primary, secondary proxy.Backend
+	switch cfg.Mode {
+	case proxy.ModeElasticKVPrimary, proxy.ModeElasticKVOnly:
+		primary = proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger)
+		secondary = proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts)
+	case proxy.ModeRedisOnly, proxy.ModeDualWrite, proxy.ModeDualWriteShadow:
+		primary = proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts)
+		secondary = proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger)
 	}
 	defer primary.Close()
 	defer secondary.Close()
@@ -118,11 +139,30 @@ func run() error {
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 
-	go serveMetrics(ctx, cfg.MetricsAddr, reg, logger)
-
-	if cfg.PProfAddr != "" {
-		go servePProf(ctx, cfg.PProfAddr, logger)
-	}
+	// Start metrics server
+	go func() {
+		mux := http.NewServeMux()
+		mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
+		var lc net.ListenConfig
+		ln, err := lc.Listen(ctx, "tcp", cfg.MetricsAddr)
+		if err != nil {
+			logger.Error("metrics listen failed", "addr", cfg.MetricsAddr, "err", err)
+			return
+		}
+		metricsSrv := &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+		go func() {
+			<-ctx.Done()
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
+			defer shutdownCancel()
+			if err := metricsSrv.Shutdown(shutdownCtx); err != nil {
+				logger.Warn("metrics server shutdown error", "err", err)
+			}
+		}()
+		logger.Info("metrics server starting", "addr", cfg.MetricsAddr)
+		if err := metricsSrv.Serve(ln); err != nil && err != http.ErrServerClosed {
+			logger.Error("metrics server error", "err", err)
+		}
+	}()
 
 	// Start proxy
 	if err := srv.ListenAndServe(ctx); err != nil {
@@ -131,107 +171,16 @@ func run() error {
 	return nil
 }
 
-func newBackends(cfg proxy.ProxyConfig, primaryPoolSize, elasticKVPoolSize int, logger *slog.Logger) (proxy.Backend, proxy.Backend, error) {
-	primaryOpts := proxy.DefaultBackendOptions()
-	primaryOpts.DB = cfg.PrimaryDB
-	primaryOpts.Password = cfg.PrimaryPassword
-	primaryOpts.PoolSize = primaryPoolSize
-	secondaryOpts := proxy.DefaultElasticKVBackendOptions()
-	secondaryOpts.DB = cfg.SecondaryDB
-	secondaryOpts.Password = cfg.SecondaryPassword
-	secondaryOpts.PoolSize = elasticKVPoolSize
-	alignElasticKVBackendTimeouts(&secondaryOpts, cfg.SecondaryTimeout)
-
-	secondarySeeds := parseAddrList(cfg.SecondaryAddr)
-
-	switch cfg.Mode {
-	case proxy.ModeElasticKVPrimary:
-		if len(secondarySeeds) == 0 {
-			return nil, nil, fmt.Errorf("at least one secondary address is required")
-		}
-		return proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger),
-			proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts), nil
-	case proxy.ModeElasticKVOnly:
-		if len(secondarySeeds) == 0 {
-			return nil, nil, fmt.Errorf("at least one secondary address is required")
-		}
-		return proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger),
-			proxy.NewNoopBackend("redis"), nil
-	case proxy.ModeRedisOnly:
-		return proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts),
-			proxy.NewNoopBackend("elastickv"), nil
-	case proxy.ModeDualWrite, proxy.ModeDualWriteShadow:
-		if len(secondarySeeds) == 0 {
-			return nil, nil, fmt.Errorf("at least one secondary address is required")
-		}
-		return proxy.NewRedisBackendWithOptions(cfg.PrimaryAddr, "redis", primaryOpts),
-			proxy.NewLeaderAwareRedisBackend(secondarySeeds, "elastickv", secondaryOpts, logger), nil
-	default:
-		return nil, nil, fmt.Errorf("unsupported mode: %s", cfg.Mode.String())
-	}
-}
-
-func alignElasticKVBackendTimeouts(opts *proxy.BackendOptions, operationTimeout time.Duration) {
-	if opts == nil {
-		return
-	}
-	floor := elasticKVDispatchTimeout
-	if operationTimeout > floor {
-		floor = operationTimeout
-	}
-	floor += backendTimeoutGrace
-	if opts.ReadTimeout > 0 && opts.ReadTimeout < floor {
-		opts.ReadTimeout = floor
-	}
-	if opts.WriteTimeout > 0 && opts.WriteTimeout < floor {
-		opts.WriteTimeout = floor
-	}
-}
-
-func serveMetrics(ctx context.Context, addr string, reg *prometheus.Registry, logger *slog.Logger) {
-	mux := http.NewServeMux()
-	mux.Handle("/metrics", promhttp.HandlerFor(reg, promhttp.HandlerOpts{}))
-	serveHTTP(ctx, addr, mux, "metrics", logger)
-}
-
-func servePProf(ctx context.Context, addr string, logger *slog.Logger) {
-	mux := http.NewServeMux()
-	mux.HandleFunc("/debug/pprof/", pprof.Index)
-	mux.HandleFunc("/debug/pprof/cmdline", pprof.Cmdline)
-	mux.HandleFunc("/debug/pprof/profile", pprof.Profile)
-	mux.HandleFunc("/debug/pprof/symbol", pprof.Symbol)
-	mux.HandleFunc("/debug/pprof/trace", pprof.Trace)
-	serveHTTP(ctx, addr, mux, "pprof", logger)
-}
-
-func serveHTTP(ctx context.Context, addr string, handler http.Handler, name string, logger *slog.Logger) {
-	var lc net.ListenConfig
-	ln, err := lc.Listen(ctx, "tcp", addr)
-	if err != nil {
-		logger.Error(name+" listen failed", "addr", addr, "err", err)
-		return
-	}
-	srv := &http.Server{Handler: handler, ReadHeaderTimeout: time.Second}
-	go func() {
-		<-ctx.Done()
-		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), metricsShutdownTimeout)
-		defer shutdownCancel()
-		if err := srv.Shutdown(shutdownCtx); err != nil {
-			logger.Warn(name+" server shutdown error", "err", err)
-		}
-	}()
-	logger.Info(name+" server starting", "addr", addr)
-	if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-		logger.Error(name+" server error", "err", err)
-	}
-}
-
 func resolveRuntimeOptions(
+	cfg proxy.ProxyConfig,
 	modeStr string,
 	primaryPoolSize, elasticKVPoolSize int,
 	secondaryWriteConcurrency, secondaryScriptConcurrency, secondaryBlockingReplayConcurrency int,
 	secondaryWriteQueueSize, secondaryScriptQueueSize, secondaryBlockingReplayQueueSize int,
 ) (proxy.ProxyMode, int, int, int, error) {
+	if err := validateRuntimeTimeouts(cfg); err != nil {
+		return 0, 0, 0, 0, err
+	}
 	mode, err := parseRuntimeOptions(
 		modeStr,
 		primaryPoolSize,
@@ -265,6 +214,20 @@ func resolveRuntimeOptions(
 		return 0, 0, 0, 0, err
 	}
 	return mode, writeConcurrency, scriptConcurrency, blockingReplayConcurrency, nil
+}
+
+func validateRuntimeTimeouts(cfg proxy.ProxyConfig) error {
+	if cfg.SecondaryScriptTimeout < 0 {
+		return fmt.Errorf("secondary-script-timeout must be non-negative: %s", cfg.SecondaryScriptTimeout)
+	}
+	effectiveScriptTimeout := cfg.SecondaryScriptTimeout
+	if effectiveScriptTimeout == 0 {
+		effectiveScriptTimeout = cfg.SecondaryTimeout
+	}
+	if effectiveScriptTimeout > maxSecondaryScriptTimeout {
+		return fmt.Errorf("secondary-script-timeout %s exceeds ElasticKV Lua dispatch cap %s", effectiveScriptTimeout, maxSecondaryScriptTimeout)
+	}
+	return nil
 }
 
 func parseRuntimeOptions(
@@ -343,11 +306,15 @@ func secondaryBackendPoolSize(mode proxy.ProxyMode, primaryPoolSize, elasticKVPo
 }
 
 func defaultSecondaryWriteConcurrency(poolSize int) int {
-	return atLeastOne(poolSize / secondaryConcurrencyDivisor)
+	return atLeastOne(poolSize / secondaryWriteConcurrencyDivisor)
 }
 
 func defaultSecondaryScriptConcurrency(writeConcurrency int) int {
-	return atLeastOne(writeConcurrency / secondaryConcurrencyDivisor)
+	concurrency := atLeastOne(writeConcurrency / secondaryScriptConcurrencyDivisor)
+	if concurrency > secondaryScriptConcurrencyCap {
+		return secondaryScriptConcurrencyCap
+	}
+	return concurrency
 }
 
 func defaultSecondaryBlockingReplayConcurrency(poolSize, writeConcurrency int) int {

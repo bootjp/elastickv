@@ -316,7 +316,11 @@ func TestShardStoreScanAtWithReadFence_SkipsOutOfRoutePendingLock(t *testing.T) 
 	require.Equal(t, []byte("right"), kvs[0].Value)
 }
 
-func TestShardStoreScanAtWithReadFence_BoundsForeignLockScan(t *testing.T) {
+// Locks belonging to another logical route must not fail a route-bound scan.
+// The raw budget (routeFilteredRawLockScanLimit) still bounds the paging, but
+// it is large enough to walk past a page of foreign locks and return the rows
+// this route actually owns.
+func TestShardStoreScanAtWithReadFence_PagesPastForeignLocks(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -349,8 +353,10 @@ func TestShardStoreScanAtWithReadFence_BoundsForeignLockScan(t *testing.T) {
 		require.NoError(t, st1.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
 	}
 
-	_, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
-	require.ErrorIs(t, err, ErrTxnLocked)
+	kvs, err := shardStore.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, ^uint64(0), false, 0, shardStore.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
 }
 
 func TestScanTxnLockPagesAtWithRouteFilter_BoundsMatchingLocks(t *testing.T) {
@@ -694,4 +700,93 @@ func TestShardStoreScanAt_FiltersTxnInternalKeysWithoutRaft(t *testing.T) {
 	require.Len(t, kvs, 1)
 	require.Equal(t, userKey, kvs[0].Key)
 	require.Equal(t, []byte("v"), kvs[0].Value)
+}
+
+// A route-bound lock scan walks a physical range shared with other logical
+// routes. Locks that the route filter rejects must not consume the conflict
+// budget, or a migrated-range scan fails with ErrTxnLocked without ever seeing
+// a lock of its own.
+func TestScanTxnLockPagesAtWithRouteFilter_IgnoresOtherRouteLocks(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	rawPrefix := []byte("!redis|meta|")
+	rawEnd := prefixScanEnd(rawPrefix)
+	// One page worth of locks plus one, all under user keys "z...".
+	for i := uint64(0); i <= lockPageLimit; i++ {
+		key := []byte(fmt.Sprintf("!redis|meta|z%04d", i))
+		lock := encodeTxnLock(txnLock{
+			StartTS:     10 + i,
+			TTLExpireAt: ^uint64(0),
+			PrimaryKey:  key,
+		})
+		require.NoError(t, st.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
+	}
+
+	// Route bounds ["a","b") exclude every "z..." user key above.
+	got, err := scanTxnLockPagesAtWithRouteFilter(
+		ctx, st, txnLockKey(rawPrefix), txnLockKey(rawEnd), ^uint64(0),
+		lockPageLimit, []byte("a"), []byte("b"))
+	require.NoError(t, err)
+	require.Empty(t, got)
+}
+
+// The raw cap still fails closed: a scan that cannot page past the unrelated
+// locks within its physical budget reports ErrTxnLocked rather than claiming
+// the range is lock-free.
+func TestScanTxnLockPagesAtWithRouteFilter_RawBudgetStillFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+
+	rawPrefix := []byte("!redis|meta|")
+	rawEnd := prefixScanEnd(rawPrefix)
+	for i := uint64(0); i <= lockPageLimit; i++ {
+		key := []byte(fmt.Sprintf("!redis|meta|z%04d", i))
+		lock := encodeTxnLock(txnLock{
+			StartTS:     10 + i,
+			TTLExpireAt: ^uint64(0),
+			PrimaryKey:  key,
+		})
+		require.NoError(t, st.PutAt(ctx, txnLockKey(key), lock, 10+i, 0))
+	}
+
+	// limit=1 gives a raw budget of routeFilteredLockScanFactor, far below the
+	// first physical page.
+	_, err := scanTxnLockPagesAtWithRouteFilter(
+		ctx, st, txnLockKey(rawPrefix), txnLockKey(rawEnd), ^uint64(0),
+		1, []byte("a"), []byte("b"))
+	require.ErrorIs(t, err, ErrTxnLocked)
+}
+
+func TestRouteFilteredRawLockScanLimit(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		limit int
+		want  int
+	}{
+		{name: "non-positive falls back to one page", limit: 0, want: lockPageLimit},
+		{name: "negative falls back to one page", limit: -1, want: lockPageLimit},
+		{name: "scaled by the factor", limit: 10, want: 10 * routeFilteredLockScanFactor},
+		{name: "clamped at the maximum", limit: maxRouteFilteredLockScan, want: maxRouteFilteredLockScan},
+		{
+			name:  "boundary scales without overflowing the cap",
+			limit: maxRouteFilteredLockScan / routeFilteredLockScanFactor,
+			want:  maxRouteFilteredLockScan,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tt.want, routeFilteredRawLockScanLimit(tt.limit))
+		})
+	}
 }

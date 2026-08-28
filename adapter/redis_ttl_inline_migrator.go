@@ -218,7 +218,7 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	)
 	for _, pair := range kvs {
 		userKey := h.extractUserKey(pair.Key)
-		if userKey == nil || !c.coord.IsLeaderForKey(userKey) {
+		if userKey == nil || !c.coord.IsLeaderForKey(redisUserRouteKey(userKey)) {
 			continue
 		}
 		built, buildErr := h.buildElems(ctx, pair, readTS)

@@ -14,6 +14,41 @@ const (
 	DelPrefix
 )
 
+// ObservedRouteVersionZero encodes a transaction pinned to catalog version 0.
+// The protobuf field's literal zero remains the legacy/unpinned sentinel, so a
+// real version-0 observation needs a distinct value. MaxUint64 is reserved for
+// this internal encoding; normal catalog versions are far below this boundary.
+const ObservedRouteVersionZero = ^uint64(0)
+
+// observedRouteVersionZeroWireEncodingEnabled stays disabled until every Raft
+// member advertises support for ObservedRouteVersionZero. Mixed-version groups
+// must keep literal zero on the wire so old followers do not treat the sentinel
+// as an impossibly new catalog version and diverge from a new leader.
+var observedRouteVersionZeroWireEncodingEnabled = false
+
+// EncodeObservedRouteVersion converts a tracked catalog version into the wire
+// value carried by OperationGroup. Version zero is left as the legacy unpinned
+// zero until the version-zero sentinel is capability-gated across Raft members.
+func EncodeObservedRouteVersion(version uint64) uint64 {
+	if version == 0 && observedRouteVersionZeroWireEncodingEnabled {
+		return ObservedRouteVersionZero
+	}
+	return version
+}
+
+// DecodeObservedRouteVersion converts OperationGroup.ObservedRouteVersion back
+// to a catalog version and reports whether it was explicitly pinned.
+func DecodeObservedRouteVersion(observed uint64) (uint64, bool) {
+	switch observed {
+	case 0:
+		return 0, false
+	case ObservedRouteVersionZero:
+		return 0, true
+	default:
+		return observed, true
+	}
+}
+
 // Elem is an element of a transaction.
 type Elem[T OP] struct {
 	Op    T
@@ -52,12 +87,11 @@ type OperationGroup[T OP] struct {
 	// ReadKeys carries the transaction's read set so the FSM can validate
 	// read-write conflicts atomically with the commit.
 	ReadKeys [][]byte
-	// ObservedRouteVersion is the durable catalog version this
-	// transaction's read set was captured at (typically set on
-	// BeginTxn from distribution.Engine.Version()).  Zero means
-	// "unpinned" — every existing caller leaves it at zero so this
-	// is behaviour-neutral on the M1 plumbing PR.  M3 of the
-	// Composed-1 design
+	// ObservedRouteVersion is the encoded durable catalog version this
+	// transaction's read set was captured at (typically set on BeginTxn
+	// from distribution.Engine.Version()). Zero means "unpinned"; the
+	// version-0 sentinel is decoded for compatibility but is not emitted
+	// until every Raft member advertises support. M3 of the Composed-1 design
 	// (docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md)
 	// will gate the FSM apply path on this version so a route shift
 	// between BeginTxn and Commit is caught before it can produce a

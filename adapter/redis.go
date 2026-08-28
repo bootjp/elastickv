@@ -114,8 +114,15 @@ const (
 	minKeyedArgs        = 2
 )
 
+const cmdElasticKVZRemFast = "ELASTICKV.ZREMFAST"
+
 const (
-	redisDispatchTimeout = 10 * time.Second
+	redisDispatchTimeout = 30 * time.Second
+	// redisLuaDispatchTimeout gives EVAL/EVALSHA enough room for migration
+	// scripts that expand into thousands of Redis calls. Regular commands stay
+	// on redisDispatchTimeout so non-script heavy paths cannot hold worker slots
+	// for the full script replay budget.
+	redisLuaDispatchTimeout = 5 * time.Minute
 	// defaultRedisBlockWaitFallback is the safety-net poll interval for
 	// blocking-command wait loops when no in-process write signal arrives.
 	// Signals cover normal XADD / ZADD / ZINCRBY wakeups immediately; this

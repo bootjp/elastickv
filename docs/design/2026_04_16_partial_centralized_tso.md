@@ -1,11 +1,12 @@
 # Centralized Timestamp Oracle (TSO) Design
 
 - Status: Partial — M1 all-led-group HLC renewal, the M2 reserved-group
-  bootstrap bridge, and the M3-M5 TSO allocator/batch cutover are implemented;
-  the minimal TSO-only FSM and follower redirect/admin exposure remain open
+  bootstrap bridge, the M3-M5 TSO allocator/batch cutover, and the minimal
+  TSO-only FSM are implemented; group-0 timestamp issuance, follower
+  redirect/admin exposure, and shadow validation remain open
 - Author: bootjp
 - Date: 2026-04-16
-- Updated: 2026-07-11
+- Updated: 2026-07-23
 
 ---
 
@@ -44,11 +45,18 @@ Implemented:
    bridge still issues timestamps from the locally led data shard through
    `LocalTSOAllocator`; pinning timestamp issuance to group 0 remains deferred
    until the TSO-leader redirect path exists.
+9. `TSOStateMachine` implements a TSO-only Raft FSM that accepts HLC lease
+   entries, snapshots exactly the physical ceiling as eight big-endian bytes,
+   restores with malformed-input rejection, advances the HLC handoff floor
+   through the committed ceiling, and classifies HLC lease entries as
+   volatile-only for safe cold-start replay. This removes the requirement for
+   group 0 to carry the KV FSM's data store once startup wiring switches to
+   the dedicated FSM.
 
 Remaining:
 
-1. Replace the compatibility bridge FSM with the minimal TSO-only FSM that
-   persists only the HLC ceiling.
+1. Wire group 0 startup to `TSOStateMachine` instead of the compatibility KV
+   FSM and pin production timestamp issuance to the group-0 leader.
 2. Add follower redirect/admin exposure for the dedicated TSO leader.
 3. Add Phase B shadow-read validation before making dedicated TSO the only
    production timestamp path.
@@ -452,6 +460,7 @@ TSO Leader
   ├─ Propose([0x02][ceilingMs]) to TSO Raft group
   │
   └─ TSO FSM.Apply() on all TSO members
+       → HLC.Observe(ceilingMs|maxLogical)
        → HLC.SetPhysicalCeiling(ceilingMs)
          ↳ shared HLC ceiling updated on every node ✅
 ```
@@ -467,8 +476,10 @@ New TSO leader elected via Raft
   ├─ FSM.Restore() or Raft log replay
   │    → physicalCeiling restored to the last committed value
   │
-  └─ HLC.Next() uses max(now, physicalCeiling)
-       → new leader issues timestamps strictly above the old leader's window ✅
+  └─ HLC.NextBatchFenced() rejects the restored exhausted ceiling; group-0
+     timestamp serving stays deferred until it can publish a fresh usable
+     lease window before allocation
+       → new leader does not reuse timestamps from the old leader's window ✅
 ```
 
 ---
@@ -633,7 +644,7 @@ least as large as the maximum shard ceiling.
 | M3 — shipped | Define `TSOAllocator` interface; implement backed by `defaultGroup` | Medium |
 | M4 — shipped | `BatchAllocator` with atomic counter for low-latency timestamp serving | Medium |
 | M5 — shipped for default-group bridge | Coordinator feature-flag cutover via `--tsoEnabled`; shadow validation against a dedicated group remains deferred to M6 | Medium |
-| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; TSO-leader-only timestamp issuance and the minimal `TSOStateMachine` remain open | Low |
+| M6 — partial | Dedicated TSO Raft group (`groupID = 0`) is reserved/bootstrap-capable and warmed by the HLC renewal bridge; minimal `TSOStateMachine` is implemented; TSO-leader-only timestamp issuance remains open | Low |
 | M7 | Phase D legacy cleanup + cross-shard SSI read-timestamp validation via TSO | Low |
 
 ---

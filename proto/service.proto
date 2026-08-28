@@ -71,11 +71,21 @@ message RawDeleteResponse {
 message RawLatestCommitTSRequest {
   bytes key = 1;
   uint64 read_route_version = 2; // stamped by server-side routing for migration read fences
+  uint64 group_id = 3; // optional explicit Raft group for route-specific probes
+  // When non-zero, also answer whether the key has any committed version at or
+  // below this timestamp. Comparing only `ts` cannot tell a tombstone at or
+  // before the read timestamp apart from a newer version above it.
+  uint64 version_visible_at_ts = 4;
 }
 
 message RawLatestCommitTSResponse {
   uint64 ts = 1;
   bool exists = 2;
+  // Answer to version_visible_at_ts. Only meaningful when
+  // version_visible_supported is set; a server that predates the probe leaves
+  // both unset and the caller falls back to comparing `ts`.
+  bool version_visible = 3;
+  bool version_visible_supported = 4;
 }
 
 message RawScanAtRequest {

@@ -30,7 +30,7 @@ production envelope within one growth cycle:
 
 | Dimension | Today's comfortable ceiling | Where the next operator wants to go | Triggering signal |
 | --- | --- | --- | --- |
-| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_partial_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
+| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_implemented_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
 | Region/DC fan-out | Single DC, LAN-tuned etcd/raft (10 ms tick, 100 ms heartbeat, 1 s election), single default-group HLC ceiling | 2–3 regions with active-active per-shard | Disaster-recovery SLO ("survive a region outage with < 30 s data-plane reconvergence") |
 | Bytes per shard | ~1 TB before snapshot transfer / WAL replay becomes operational pain | 5–10 TB per shard, with shard counts in the 100 k range | DynamoDB-compatibility customers ingesting at multi-GiB/s per table |
 | Per-node QPS | Leader-bound write, lease-read scales across shards but only on each shard's leader | 5–10x current per-node throughput; sustained reads from non-leader replicas | Redis-compatibility migration projects ingesting from upstream Redis where the upstream serves reads from replicas |
@@ -349,7 +349,7 @@ control-plane (`*_proposed_*` doc TBD).**
 - M1 standalone but doesn't enable cross-region writes — it just
   makes Raft survive cross-WAN partition.
 - M2 depends on the M2 hotspot-split migration contract
-  (`2026_06_11_proposed_hotspot_split_milestone2_migration.md`)
+  (`2026_06_11_partial_hotspot_split_milestone2_migration.md`)
   being implemented so the monotone-merge primitive exists.
 - M3 depends on M1's region-aware membership and M2's per-region
   ceiling.
@@ -545,7 +545,7 @@ the ceiling shape:
 Composability invariant: **every monotone-merge happens via the
 same `SetPhysicalCeiling` + `Observe` primitive**. The M2
 hotspot-split contract (§6.2.1 of
-`2026_06_11_proposed_hotspot_split_milestone2_migration.md`) is the
+`2026_06_11_partial_hotspot_split_milestone2_migration.md`) is the
 reference implementation; per-region and per-group merges reuse it.
 
 ### 7.2 Capability bits

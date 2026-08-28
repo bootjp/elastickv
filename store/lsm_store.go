@@ -1160,6 +1160,9 @@ func (s *pebbleStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, t
 	defer iter.Close()
 
 	if !iter.SeekGE(seekKey) {
+		if err := iter.Error(); err != nil {
+			return false, errors.WithStack(err)
+		}
 		return false, nil
 	}
 	userKey, _ := decodeKeyView(iter.Key())

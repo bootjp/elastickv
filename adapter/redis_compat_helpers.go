@@ -911,11 +911,11 @@ func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, error) {
-	// Leadership is partitioned by the logical user key, so strip the internal
-	// prefix before asking the coordinator.
+	// Leadership is partitioned by the logical user key, but route through a
+	// Redis wrapper so list-internal-shaped user keys remain literal.
 	routingKey := key
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
-		routingKey = userKey
+		routingKey = redisUserRouteKey(userKey)
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
 		if verify {
@@ -1203,6 +1203,112 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 	elems = append(elems, streamElems...)
 
 	return elems, existed, nil
+}
+
+func (r *RedisServer) deleteLogicalKeyElemsForType(ctx context.Context, key []byte, readTS uint64, typ redisValueType) ([]*kv.Elem[kv.OP], bool, error) {
+	switch typ {
+	case redisTypeNone:
+		return nil, false, nil
+	case redisTypeString:
+		elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+		return elems, true, err
+	case redisTypeList:
+		return r.deleteListLogicalKeyElems(ctx, key, readTS)
+	case redisTypeHash:
+		return r.deleteHashLogicalKeyElems(ctx, key, readTS)
+	case redisTypeSet:
+		return r.deleteSetLogicalKeyElems(ctx, key, readTS)
+	case redisTypeZSet:
+		return r.deleteZSetLogicalKeyElems(ctx, key, readTS)
+	case redisTypeStream:
+		return r.deleteStreamLogicalKeyElems(ctx, key, readTS)
+	}
+	return nil, false, errors.WithStack(errors.AssertionFailedf("unknown redis type %v", typ))
+}
+
+func (r *RedisServer) deleteStringLikeElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for _, internalKey := range [][]byte{
+		redisStrKey(key),
+		key, // legacy bare string key
+		redisHLLKey(key),
+		redisTTLKey(key),
+	} {
+		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if ok {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: internalKey})
+		}
+	}
+	return elems, nil
+}
+
+func (r *RedisServer) deleteListLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	listElems, err := r.deleteListElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, listElems...), true, nil
+}
+
+func (r *RedisServer) deleteHashLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	hashElems, err := r.deleteWideColumnElems(ctx, readTS,
+		store.HashFieldScanPrefix(key), store.HashMetaKey(key), store.HashMetaDeltaScanPrefix(key))
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, hashElems...), true, nil
+}
+
+func (r *RedisServer) deleteSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
+	setElems, err := r.deleteWideColumnElems(ctx, readTS,
+		store.SetMemberScanPrefix(key), store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key))
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, setElems...), true, nil
+}
+
+func (r *RedisServer) deleteZSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
+	zsetElems, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, zsetElems...), true, nil
+}
+
+func (r *RedisServer) deleteStreamLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
+	streamElems, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, streamElems...), true, nil
 }
 
 // deleteStreamWideColumnElems returns delete operations for all stream

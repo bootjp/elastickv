@@ -10,9 +10,10 @@ import (
 
 const (
 	redisPerPeerLimitEnv              = "ELASTICKV_REDIS_PER_PEER_CONNECTIONS"
-	defaultRedisProxyPoolPeerCap      = 64
-	defaultRedisDedicatedPeerHeadroom = 64
-	defaultRedisPerPeerConnectionCap  = defaultRedisProxyPoolPeerCap + defaultRedisDedicatedPeerHeadroom
+	defaultRedisProxyPoolPeerCap      = 192
+	defaultRedisProxyReplicasPerPeer  = 2
+	defaultRedisDedicatedPeerHeadroom = 128
+	defaultRedisPerPeerConnectionCap  = defaultRedisProxyPoolPeerCap*defaultRedisProxyReplicasPerPeer + defaultRedisDedicatedPeerHeadroom
 	redisPeerLimitError               = "ERR max connections per client exceeded"
 	unknownRedisPeer                  = "unknown"
 )
