@@ -314,6 +314,15 @@ func newActiveMainTSOCutover(t *testing.T) (*kv.HLC, *kv.TSOStateMachine, *mainT
 	return clock, fsm, engine, map[uint64]*kv.ShardGroup{dedicatedTSORaftGroupID: group}
 }
 
+// setTSOModeFlags overwrites process-global flag values for the duration of one
+// test.
+//
+// A caller must therefore NOT be parallel. Go runs sequential tests to
+// completion before the parallel ones resume, so a single parallel caller is
+// safe on its own -- but the moment a second one exists the two overwrite each
+// other's flags and -race reports it, which is what happened when
+// TestCoordinatorTSOWiringAuthorizeActivation was first written with
+// t.Parallel(). Every other caller in this file is sequential.
 func setTSOModeFlags(t *testing.T, enabled, shadow bool) {
 	t.Helper()
 	oldEnabled := *tsoEnabled
@@ -581,9 +590,8 @@ func TestInternalTimestampOptionsPreservesPhaseDValidatorThroughStartupGate(t *t
 
 // The activation gate answers from this node's own runtime mode, so a caller
 // cannot drive the group-0 leader past the stage the operator configured.
+// Not parallel: setTSOModeFlags mutates process-global flags.
 func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
-	t.Parallel()
-
 	// No dedicated TSO runtime at all: nothing to authorize against.
 	var bare coordinatorTSOWiring
 	require.NoError(t, bare.authorizeActivation(false, false))
