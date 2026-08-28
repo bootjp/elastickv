@@ -162,7 +162,7 @@ func publishCompletedLiveBackup(
 		return errors.Wrap(context.Cause(ctx), "live backup canceled before manifest publication")
 	}
 	manifest := liveBackupManifest(begin, lease.tokenSnapshot(), scopeSet(result.Scopes), opts)
-	return FinalizeDump(opts.OutputRoot, manifest)
+	return FinalizeDumpContext(ctx, opts.OutputRoot, manifest)
 }
 
 func beginLiveBackup(ctx context.Context, rpc LiveBackupRPC, opts LiveBackupOptions) (*pb.BeginBackupResponse, error) {

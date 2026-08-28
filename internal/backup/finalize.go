@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bytes"
+	"context"
 	"io"
 	"os"
 	"path/filepath"
@@ -14,6 +15,16 @@ import (
 // leaves no manifest, so restore tooling cannot mistake a partial dump for a
 // complete artifact.
 func FinalizeDump(root string, manifest Manifest) error {
+	return FinalizeDumpContext(context.Background(), root, manifest)
+}
+
+// FinalizeDumpContext is FinalizeDump with cancellation. Checksumming reads
+// every byte of the dump, so a run canceled while it is under way would
+// otherwise still publish a manifest and report success -- the caller's
+// preflight check cannot see that far. ctx is honoured during the checksum
+// walk and once more immediately before the manifest rename, which is the
+// point after which the dump counts as complete.
+func FinalizeDumpContext(ctx context.Context, root string, manifest Manifest) error {
 	payload, err := marshalManifestPayload(manifest)
 	if err != nil {
 		return err
@@ -22,8 +33,11 @@ func FinalizeDump(root string, manifest Manifest) error {
 	if err := requireManifestAbsent(manifestPath); err != nil {
 		return err
 	}
-	if err := WriteChecksumsWithVirtualFile(root, ManifestFilename, payload); err != nil {
+	if err := WriteChecksumsWithVirtualFileContext(ctx, root, ManifestFilename, payload); err != nil {
 		return errors.Wrap(err, "write CHECKSUMS")
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.Wrap(err, "live backup canceled before manifest publication")
 	}
 	return publishManifest(root, manifestPath, payload)
 }

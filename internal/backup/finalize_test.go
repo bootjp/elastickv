@@ -1,11 +1,14 @@
 package backup
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 func TestFinalizeDumpChecksumsManifestAndPublishesItLast(t *testing.T) {
@@ -69,4 +72,78 @@ func TestFinalizeDumpRefusesExistingManifest(t *testing.T) {
 	if string(got) != string(existing) {
 		t.Fatalf("manifest content = %q, want %q", got, existing)
 	}
+}
+
+// countdownCancelContext reports "not canceled" for the first n Err calls and
+// canceled after that, so a test can land the cancellation on a specific poll
+// -- here, the one between checksumming and the manifest rename.
+type countdownCancelContext struct {
+	context.Context
+	left int
+	done chan struct{}
+}
+
+func newCountdownCancelContext(n int) *countdownCancelContext {
+	return &countdownCancelContext{Context: context.Background(), left: n, done: make(chan struct{})}
+}
+
+func (c *countdownCancelContext) Err() error {
+	if c.left > 0 {
+		c.left--
+		return nil
+	}
+	select {
+	case <-c.done:
+	default:
+		close(c.done)
+	}
+	return context.Canceled
+}
+
+func (c *countdownCancelContext) Done() <-chan struct{} { return c.done }
+
+// A canceled run must not leave a manifest behind. Checksumming reads every
+// byte of the dump, so cancellation arriving during it has to stop the
+// publication that follows -- the caller's preflight check ran long before.
+func TestFinalizeDumpContextStopsOnCancellation(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "part-0000"), []byte("payload"), 0o600))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := FinalizeDumpContext(ctx, root, validLiveManifest())
+	require.ErrorIs(t, err, context.Canceled)
+	requireNoManifest(t, root)
+}
+
+// Cancellation that lands after the checksum walk but before the rename must
+// still block publication: that rename is what makes the dump count as
+// complete.
+func TestFinalizeDumpContextRechecksBeforePublishing(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(root, "part-0000"), []byte("payload"), 0o600))
+
+	// One poll per walked file, then the pre-rename poll is the canceled one.
+	ctx := newCountdownCancelContext(1)
+	err := FinalizeDumpContext(ctx, root, validLiveManifest())
+	require.ErrorIs(t, err, context.Canceled)
+	requireNoManifest(t, root)
+}
+
+func validLiveManifest() Manifest {
+	manifest := NewPhase0SnapshotManifest(time.Now())
+	manifest.Phase = PhasePhase1LivePinned
+	manifest.Live = &Live{ReadTS: 42}
+	return manifest
+}
+
+func requireNoManifest(t *testing.T, root string) {
+	t.Helper()
+	_, err := os.Lstat(filepath.Join(root, ManifestFilename))
+	require.ErrorIs(t, err, os.ErrNotExist, "a canceled run must not publish a manifest")
 }

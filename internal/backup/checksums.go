@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -65,7 +66,7 @@ var ErrChecksumMismatch = errors.New("backup: checksum mismatch")
 // on this for the "encode → decode round-trip is byte-identical"
 // property.
 func WriteChecksums(root string) error {
-	entries, err := collectChecksumEntries(root)
+	entries, err := collectChecksumEntries(context.Background(), root)
 	if err != nil {
 		return err
 	}
@@ -76,6 +77,14 @@ func WriteChecksums(root string) error {
 // checksum set. Live backup uses this to checksum MANIFEST.json before its
 // final atomic publication, keeping the manifest both checksummed and last.
 func WriteChecksumsWithVirtualFile(root, relPath string, content []byte) error {
+	return WriteChecksumsWithVirtualFileContext(context.Background(), root, relPath, content)
+}
+
+// WriteChecksumsWithVirtualFileContext is WriteChecksumsWithVirtualFile with
+// cancellation. Hashing a dump tree is unbounded work -- it reads every byte
+// the dump wrote -- so a canceled run must stop here rather than keep going
+// and let its caller publish afterwards.
+func WriteChecksumsWithVirtualFileContext(ctx context.Context, root, relPath string, content []byte) error {
 	if !filepath.IsLocal(relPath) || filepath.Clean(relPath) == "." {
 		return errors.Wrapf(ErrChecksumsPathTraversal, "%q", relPath)
 	}
@@ -83,7 +92,7 @@ func WriteChecksumsWithVirtualFile(root, relPath string, content []byte) error {
 	if relPath == CHECKSUMSFilename {
 		return errors.Wrap(ErrChecksumsMalformedLine, "CHECKSUMS cannot list itself")
 	}
-	entries, err := collectChecksumEntries(root)
+	entries, err := collectChecksumEntries(ctx, root)
 	if err != nil {
 		return err
 	}
@@ -190,12 +199,15 @@ type checksumEntry struct {
 // are skipped — sha256sum does not follow them by default and the
 // dump tree should never contain any (the encoders write only
 // regular files).
-func collectChecksumEntries(root string) ([]checksumEntry, error) {
+func collectChecksumEntries(ctx context.Context, root string) ([]checksumEntry, error) {
 	var entries []checksumEntry
 	skipPath := filepath.Join(root, CHECKSUMSFilename)
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return errors.WithStack(err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.WithStack(ctxErr)
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
 			return nil
