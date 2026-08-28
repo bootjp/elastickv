@@ -105,16 +105,10 @@ var (
 // IsReservedControlKey reports whether key lives in a control namespace that no
 // user mutation may write.
 //
-// The staged-data prefix is deliberately excluded: ShardedCoordinator rewrites a
-// user key into MigrationStagedDataKey while its route has staged visibility, so
-// legitimate user writes do arrive under it. Telling those apart from a forged
-// one needs request-level provenance the FSM does not have -- the route state
-// that would distinguish them is refreshed by a polling watcher and so cannot
-// decide an apply.
+// Staged migration data is included in the reserved set. It is populated by the
+// typed migration import/promote paths and by FSM-internal prefix-delete
+// expansion, not by externally supplied RawKV mutations.
 func IsReservedControlKey(key []byte) bool {
-	if bytes.HasPrefix(key, []byte(migrationStagedDataPrefix)) {
-		return false
-	}
 	return reservedControlPrefixIntersects(key, bytes.HasPrefix)
 }
 
@@ -128,7 +122,7 @@ func IsReservedControlKey(key []byte) bool {
 // accept more than the one transaction prefix it takes today, which is a
 // separate change.
 func ReservedControlPrefixIntersects(prefix []byte) bool {
-	if len(prefix) == 0 || bytes.HasPrefix(prefix, []byte(migrationStagedDataPrefix)) {
+	if len(prefix) == 0 {
 		return false
 	}
 	return reservedControlPrefixIntersects(prefix, func(a, b []byte) bool {

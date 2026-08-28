@@ -27,6 +27,7 @@ func TestValidateRawMutationRejectsReservedControlKeys(t *testing.T) {
 		[]byte("!dist|route|0001"),
 		[]byte("!dist|job|7"),
 		[]byte("!dist|jobhist|7"),
+		distribution.MigrationStagedDataKey(7, []byte("victim")),
 		[]byte("!migstage|7|victim"),
 		[]byte("!migwrite|7"),
 		[]byte("!migfence|7"),
@@ -56,6 +57,7 @@ func TestHandleDelPrefixRejectsReservedControlPrefixes(t *testing.T) {
 		[]byte("!dist|"),
 		[]byte("!dist|route|"),
 		[]byte("!dist"),
+		distribution.MigrationStagedDataKey(7, []byte("user:")),
 		[]byte("!migwrite|"),
 		[]byte("!migfence"),
 	} {
@@ -69,10 +71,10 @@ func TestHandleDelPrefixRejectsReservedControlPrefixes(t *testing.T) {
 	require.NoError(t, f.handleDelPrefix(ctx, []byte("user:"), 12))
 }
 
-// ShardedCoordinator rewrites a user key into MigrationStagedDataKey while its
-// route has staged visibility, so legitimate user writes do arrive under the
-// staged prefix. Refusing those would break the migration this branch adds.
-func TestValidateRawMutationAllowsStagedDataKeys(t *testing.T) {
+// Staged migration data is private to typed migration paths. A user-supplied
+// RawKV request must not be able to forge a staged key that promotion later
+// treats as migrated data.
+func TestValidateRawMutationRejectsStagedDataKeys(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -82,7 +84,7 @@ func TestValidateRawMutationAllowsStagedDataKeys(t *testing.T) {
 	require.True(t, ok)
 
 	staged := distribution.MigrationStagedDataKey(7, []byte("user-key"))
-	require.NoError(t, f.validateRawMutationForApply(ctx,
-		&pb.Mutation{Op: pb.Op_PUT, Key: staged, Value: []byte("v")}, nil, 10))
-	require.NoError(t, f.handleDelPrefix(ctx, distribution.MigrationStagedDataKey(7, []byte("user:")), 11))
+	require.ErrorIs(t, f.validateRawMutationForApply(ctx,
+		&pb.Mutation{Op: pb.Op_PUT, Key: staged, Value: []byte("v")}, nil, 10), ErrInvalidRequest)
+	require.ErrorIs(t, f.handleDelPrefix(ctx, distribution.MigrationStagedDataKey(7, []byte("user:")), 11), ErrInvalidRequest)
 }
