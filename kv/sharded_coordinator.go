@@ -3077,9 +3077,10 @@ func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
 }
 
 // renewHLCLeases starts one renewal proposal for every shard group this node
-// currently leads. It does not wait for those proposals before returning; the
-// returned channel closes when the launched proposals finish and exists for
-// tests/diagnostics only.
+// currently leads. A group with an older renewal still in flight is skipped for
+// this tick so slow Raft proposals cannot stack up behind write-heavy traffic;
+// other led groups continue renewing independently. The returned channel closes
+// when the launched proposals finish and exists for tests/diagnostics only.
 func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{} {
 	if ctx == nil {
 		ctx = context.Background()

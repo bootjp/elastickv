@@ -4,13 +4,16 @@
 **Author:** bootjp
 **Date:** 2026-06-12
 
+> **Superseded roadmap index:**
 > This document is retained as the original sequencing and SLO record. It is
 > not an implementation specification and must not be used as the scope for a
 > combined implementation PR. The
 > [2026-06-23 roadmap](2026_06_23_proposed_scaling_roadmap.md) audits the current
 > implementation, closes completed prerequisites, and tracks the remaining
-> work as separate design documents and milestone PRs.
-
+> work as separate design documents and milestone PRs. It is the current
+> ownership and sequencing authority; this historical document does not
+> describe the current implementation status of its milestones.
+>
 > This roadmap captures the scaling work elastickv needs across four
 > subsystems that today have known ceilings and have not yet been
 > designed past those ceilings. The roadmap itself is not a single
@@ -18,8 +21,8 @@
 > sibling `*_proposed_*.md` design that will land later as its own PR.
 > Per CLAUDE.md the design-doc-first workflow applies: each milestone
 > below ships its own `*_proposed_*` doc before its implementation
-> starts; this file is the shared north star and the sequencing
-> constraint between them.
+> starts. The June 23 ownership index now records the authoritative
+> requirement-by-requirement disposition and sequencing constraints.
 
 ## 1. Motivation
 
@@ -84,12 +87,13 @@ Breakage points:
 references anywhere in `kv/`, `distribution/`, or
 `internal/raftengine/etcd/`. Everything is single-region etcd/raft.
 
-HLC is `kv/hlc.go` + `kv/coordinator.go`: physical ceiling is
-Raft-agreed via `ProposeHLCLease`, `hlcPhysicalWindowMs = 3 s`,
-renewed every `hlcRenewalInterval = 1 s` from the **default-group
-leader only** (`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced`
-fails closed with `ErrCeilingExpired` once `wall_now >= ceiling`.
-Wall clock is `time.Now().UnixMilli()` — assumes NTP-synced hosts.
+HLC is `kv/hlc.go` + `kv/coordinator.go` +
+`kv/sharded_coordinator.go`: physical ceiling is Raft-agreed via
+`ProposeHLCLease`, `hlcPhysicalWindowMs = 20 s`, renewed every
+`hlcRenewalInterval = 1 s` by each led shard group
+(`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced` fails closed
+with `ErrCeilingExpired` once `wall_now >= ceiling`. Wall clock is
+`time.Now().UnixMilli()` — assumes NTP-synced hosts.
 
 Raft engine (`internal/raftengine/etcd/engine.go`):
 `defaultTickInterval = 10 ms`, `defaultHeartbeatTick = 10` (100 ms),
@@ -98,10 +102,11 @@ LAN-tuned; would spuriously election-time-out cross-WAN.
 
 Multi-region blockers:
 
-- HLC ceiling is **single-point** — default-group leader proposes
-  every 1 s; cross-region default-group leadership means every
-  shard's persistence-grade ts depends on a cross-WAN propose. 1 s
-  WAN RTT + 1 s renewal interval ≈ no margin against the 3 s window.
+- HLC ceiling renewal is **per Raft group** — each shard group leader
+  proposes every 1 s, so cross-region leadership for that group makes
+  its persistence-grade ts depend on cross-WAN quorum progress. 1 s WAN
+  RTT is now less likely to expire the 20 s window immediately, but
+  every renewal still depends on that group's cross-WAN quorum progress.
 - 100 ms heartbeat / 1 s election timeout cannot run cross-DC.
 - No TrueTime/clockbound integration.
 - Cross-shard txns are blocked (`ErrCrossShardTransactionNotSupported`),
@@ -316,10 +321,10 @@ whole cluster; cross-WAN that is a 1 s RTT cliff. Options surveyed:
   service.** Operationally heavy (needs reliable atomic-clock
   reference per DC); rejected as v1.
 - **Option C — Stretched single ceiling with relaxed window.**
-  Increase `hlcPhysicalWindowMs` to 30 s; renewal still cross-WAN
-  but the failure mode is "slow ts allocation," not "no ts
-  allocation." Useful as a fallback when option A is partially
-  shipped.
+  `hlcPhysicalWindowMs = 20 s` is now the local-resilience baseline.
+  It reduces accidental ceiling expiry under load, but renewal still
+  depends on each route's shard group quorum and is not a complete
+  cross-region design by itself.
 
 V1 = option A. Carries the existing M2 hotspot-split monotone-merge
 contract over the region boundary.
