@@ -84,6 +84,13 @@ func (w *VaultTransitWrapper) Wrap(dek []byte) ([]byte, error) {
 	secret, err := w.logical.WriteWithContext(ctx, w.mount+"/encrypt/"+w.keyName, map[string]interface{}{
 		"plaintext":       base64.StdEncoding.EncodeToString(dek),
 		"associated_data": vaultTransitAAD,
+		// Transit's encrypt endpoint creates the key when it is missing. The
+		// read above cannot close that window: a key deleted or disabled
+		// between the two calls would be silently replaced, this DEK would be
+		// wrapped under the new key material, and every DEK already wrapped
+		// under the old key would stop unwrapping after a restart. Fail the
+		// encrypt instead.
+		"disable_upsert": true,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "kek: Vault Transit encrypt")

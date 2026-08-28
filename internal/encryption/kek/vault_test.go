@@ -52,6 +52,11 @@ func TestVaultTransitWrapperRequestBinding(t *testing.T) {
 	require.Equal(t, "security/transit/encrypt/orders", logical.writePath)
 	require.Equal(t, base64.StdEncoding.EncodeToString(dek), logical.data["plaintext"])
 	require.Equal(t, vaultTransitAAD, logical.data["associated_data"])
+	// Transit upserts a missing key on encrypt. The key existence read above
+	// cannot close the window between the two calls, so the encrypt itself has
+	// to refuse to create one: a replacement key would wrap this DEK under new
+	// material and strand every DEK wrapped under the old one.
+	require.Equal(t, true, logical.data["disable_upsert"])
 
 	plain, err := wrapper.Unwrap(wrapped)
 	require.NoError(t, err)
