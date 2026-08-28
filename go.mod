@@ -19,7 +19,7 @@ require (
 	github.com/getsentry/sentry-go v0.48.0
 	github.com/goccy/go-json v0.10.6
 	github.com/hanwen/go-fuse/v2 v2.11.0
-	github.com/klauspost/compress v1.19.0
+	github.com/klauspost/compress v1.19.2
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.23.2
 	github.com/prometheus/client_model v0.6.2
