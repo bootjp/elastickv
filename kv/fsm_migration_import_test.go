@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -228,4 +229,70 @@ func TestApplyMigrationImportOrdinaryErrorsDoNotHalt(t *testing.T) {
 			require.False(t, errors.Is(err, ErrMigrationImportApply))
 		})
 	}
+}
+
+// MigrationStagedDataKey prepends the staged prefix, the job id, and a
+// separator, so a source key that is itself within store.MaxSnapshotKeySize can
+// exceed it once staged. Storing it anyway would leave the target holding a
+// version no snapshot can carry, and a new or lagging voter could never restore.
+func TestValidateStagedKeySizesRejectsOversizedStagedForm(t *testing.T) {
+	t.Parallel()
+
+	envelope := len(distribution.MigrationStagedDataKey(1, nil))
+	require.Positive(t, envelope)
+
+	// A source key right at the limit: legal on its own, oversized once staged.
+	atLimit := bytes.Repeat([]byte("k"), store.MaxSnapshotKeySize)
+	staged := migrationStoreVersionsFromProto(9, []*pb.MVCCVersion{{Key: atLimit, CommitTs: 10}})
+	require.Len(t, staged, 1)
+	require.Greater(t, len(staged[0].Key), store.MaxSnapshotKeySize)
+	require.ErrorIs(t, validateStagedKeySizes(staged), store.ErrSnapshotKeyTooLarge)
+
+	// With headroom for the envelope it is accepted.
+	fits := bytes.Repeat([]byte("k"), store.MaxSnapshotKeySize-envelope)
+	ok := migrationStoreVersionsFromProto(9, []*pb.MVCCVersion{{Key: fits, CommitTs: 10}})
+	require.Len(t, ok, 1)
+	require.Equal(t, store.MaxSnapshotKeySize, len(ok[0].Key))
+	require.NoError(t, validateStagedKeySizes(ok))
+}
+
+// The rejection must be an ordinary apply error. Halting would wedge apply on
+// every voter over a batch the migrator can simply be told about.
+func TestOversizedStagedKeyIsAnOrdinaryApplyError(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, isMigrationImportOrdinaryApplyError(
+		errors.Wrap(store.ErrSnapshotKeyTooLarge, "staged")))
+}
+
+// The size check has to be wired into the apply path, not merely available: an
+// oversized staged key must be refused before it is written, and refused as an
+// ordinary error so apply is not halted on every voter.
+func TestApplyMigrationImportRejectsOversizedStagedKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { _ = st.Close() })
+	fsm := &kvFSM{store: st, hlc: NewHLC()}
+
+	// Legal on its own, oversized once the staging envelope is added.
+	atLimit := bytes.Repeat([]byte("k"), store.MaxSnapshotKeySize)
+	data, err := proto.Marshal(&pb.ImportRangeVersionsRequest{
+		JobId:     9,
+		BracketId: 1,
+		BatchSeq:  1,
+		Versions:  []*pb.MVCCVersion{{Key: atLimit, CommitTs: 10, Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+
+	applied := fsm.applyMigrationImport(ctx, data)
+	applyErr, ok := applied.(error)
+	require.True(t, ok, "got %T: %v", applied, applied)
+	require.ErrorIs(t, applyErr, store.ErrSnapshotKeyTooLarge)
+	require.NotErrorIs(t, applyErr, ErrMigrationImportApply, "must not halt apply")
+
+	// Nothing was staged.
+	_, getErr := st.GetAt(ctx, distribution.MigrationStagedDataKey(9, atLimit), 100)
+	require.ErrorIs(t, getErr, store.ErrKeyNotFound)
 }

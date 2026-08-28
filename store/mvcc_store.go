@@ -25,8 +25,14 @@ type VersionedValue struct {
 }
 
 const (
-	mvccSnapshotVersion     = uint32(1)
-	maxSnapshotKeySize      = 1 << 20 // 1 MiB per key
+	mvccSnapshotVersion = uint32(1)
+	maxSnapshotKeySize  = 1 << 20 // 1 MiB per key
+	// MaxSnapshotKeySize is the largest key a snapshot can carry. Callers that
+	// wrap a key in an envelope before storing it -- migration staging is the
+	// one today -- need it to reserve headroom, because a key that fits on its
+	// own can stop fitting once wrapped, and the snapshot that would carry it
+	// is then unrestorable.
+	MaxSnapshotKeySize      = maxSnapshotKeySize
 	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
 )
 
