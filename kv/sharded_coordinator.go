@@ -1436,7 +1436,7 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		// keyspace-scan work). Detach cancellation but cap with
 		// verifyLeaderTimeout so a hung Abort cannot leak.
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 		cancel()
 		return nil, errors.WithStack(err)
 	}
@@ -1538,7 +1538,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			// already wrote on prior shards. Otherwise LockResolver
 			// holds the bag.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 			cancel()
 			return nil, errors.WithStack(err)
 		}
@@ -1554,7 +1554,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 		// expired, so the abort needs detached cancellation to
 		// avoid stranding intents.
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 		cancel()
 		return nil, err
 	}
@@ -1794,6 +1794,35 @@ func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64)
 		return 0, nil
 	}
 	return ts, nil
+}
+
+// abortTimestamp obtains the timestamp a rollback record is written under.
+//
+// Deriving commitTS+1 arithmetically claims a value the allocator never handed
+// out. With BatchAllocator that neighbour is still inside the reserved window
+// and goes to the next transaction, so the rollback record and that transaction
+// would share one supposedly global timestamp.
+//
+// The cleanup this feeds must still run when allocation fails: the intents it
+// releases would otherwise sit until LockResolver picks them up, and that path
+// derives its abort timestamp the same way anyway. So the derived value stays
+// as the fallback -- which is what this code used unconditionally before -- and
+// the failure is logged rather than swallowed.
+func (c *ShardedCoordinator) abortTimestamp(ctx context.Context, startTS, commitTS uint64) uint64 {
+	base := max(startTS, commitTS)
+	ts, err := c.nextTxnTSAfter(ctx, base)
+	if err == nil && ts > base {
+		return ts
+	}
+	derived := abortTSFrom(startTS, commitTS)
+	c.logger().WarnContext(ctx,
+		"abort timestamp allocation failed; falling back to a derived timestamp",
+		"start_ts", startTS,
+		"commit_ts", commitTS,
+		"abort_ts", derived,
+		"err", err,
+	)
+	return derived
 }
 
 func abortTSFrom(startTS, commitTS uint64) uint64 {
