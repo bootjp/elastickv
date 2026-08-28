@@ -714,3 +714,69 @@ func TestStampTimestamps_RejectsInconsistentForwardEnvelope(t *testing.T) {
 	})
 	require.NoError(t, err)
 }
+
+// The envelope check has to hold in both directions. A transactional envelope
+// carrying a raw request has that request stamped with the transaction's start
+// timestamp and then applied raw by commitSequential, persisting at that
+// timestamp without ever passing stampRawTimestamps.
+func TestStampTimestamps_RejectsRawRequestInsideTxnEnvelope(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	resolution := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    50,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 60}),
+		}},
+	}
+	raw := &pb.Request{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}}}
+
+	_, err := i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    true,
+		Requests: []*pb.Request{raw, resolution},
+	})
+	require.ErrorIs(t, err, kv.ErrInvalidRequest)
+
+	// The all-transactional batch is unaffected.
+	_, err = i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    true,
+		Requests: []*pb.Request{resolution},
+	})
+	require.NoError(t, err)
+}
+
+// A zero-valued Phase_NONE meta is filled with the selected commit timestamp, so
+// it receives a resolution's legacy exemption just as surely as one that carried
+// the value in. Narrowing only the metas that arrive with a timestamp left that
+// bypass open.
+func TestFillForwardedTxnCommitTS_ZeroValuedOnePhaseMetaBlocksExemption(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	meta := func(phase pb.Phase, commitTS uint64) *pb.Request {
+		return &pb.Request{
+			IsTxn: true,
+			Phase: phase,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}
+	}
+
+	// The one-phase meta carries no timestamp of its own; it would be filled
+	// with the COMMIT's exempt one.
+	mixed := []*pb.Request{meta(pb.Phase_NONE, 0), meta(pb.Phase_COMMIT, 60)}
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), mixed, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+}

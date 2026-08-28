@@ -136,26 +136,40 @@ func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) 
 	// looks at Request.Ts -- and then went down the transactional apply path,
 	// where the FSM takes the persistence timestamp from a transaction meta
 	// nothing validated. Insist the two agree.
-	innerTxn := forwardedBatchIsTxn(req.Requests)
-	if req.IsTxn != innerTxn {
+	if !forwardedBatchMatchesEnvelope(req.IsTxn, req.Requests) {
 		return 0, errors.WithStack(kv.ErrInvalidRequest)
 	}
-	if innerTxn {
+	if req.IsTxn {
 		return i.stampTxnTimestamps(ctx, req.Requests)
 	}
 
 	return 0, i.stampRawTimestamps(ctx, req.Requests)
 }
 
-// forwardedBatchIsTxn mirrors kv.TransactionManager's own test, so the stamping
-// mode and the apply mode are derived from the same evidence.
-func forwardedBatchIsTxn(reqs []*pb.Request) bool {
+// forwardedBatchMatchesEnvelope reports whether every inner request agrees with
+// the envelope's mode.
+//
+// It is not enough to ask whether any request is transactional, the way
+// TransactionManager.Commit does. That test is an OR, so both mixed shapes slip
+// through in one direction or the other:
+//
+//   - a raw envelope holding a transactional request is stamped raw, which only
+//     looks at Request.Ts, then applied transactionally, where the FSM takes the
+//     persistence timestamp from an unvalidated transaction meta;
+//   - a transactional envelope holding a raw request is stamped with the
+//     transaction's start timestamp, then applied raw by commitSequential,
+//     persisting at that timestamp without ever passing stampRawTimestamps.
+//
+// Neither legitimate sender builds a mixed batch -- both set the envelope from
+// reqs[0].IsTxn over a batch the coordinator constructed as all raw or all
+// transactional -- so requiring agreement costs nothing and closes both shapes.
+func forwardedBatchMatchesEnvelope(envelopeIsTxn bool, reqs []*pb.Request) bool {
 	for _, r := range reqs {
-		if r != nil && r.IsTxn {
-			return true
+		if r != nil && r.IsTxn != envelopeIsTxn {
+			return false
 		}
 	}
-	return false
+	return true
 }
 
 func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, error) {
@@ -379,15 +393,17 @@ func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, u
 		if err != nil {
 			continue
 		}
+		// Narrowed for every meta, not only the ones that arrive carrying a
+		// timestamp. commitSequential applies the requests in order, and a
+		// zero-valued Phase_NONE meta is filled with the selected timestamp
+		// below -- so it receives the exemption just as surely as one that
+		// carried the value in, and a one-phase write would persist under a
+		// resolution's exemption either way.
+		resolution = resolution && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT)
 		if meta.CommitTS != 0 {
 			if commitTS != 0 && commitTS != meta.CommitTS {
 				return nil, 0, false, errors.WithStack(kv.ErrInvalidRequest)
 			}
-			// Every meta carrying the timestamp has to be a resolution, not
-			// just the last one seen: commitSequential applies the requests in
-			// order, so a Phase_NONE request batched ahead of a COMMIT would
-			// otherwise persist a one-phase write under the COMMIT's exemption.
-			resolution = resolution && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT)
 			commitTS = meta.CommitTS
 			continue
 		}
