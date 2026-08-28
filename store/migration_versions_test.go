@@ -1279,3 +1279,66 @@ func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
 	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
 	require.ErrorIs(t, err, ErrKeyNotFound)
 }
+
+func TestPebbleRestoreStreamingSnapshotPreservesMigrationPromotionState(t *testing.T) {
+	ctx := context.Background()
+	src := NewMVCCStore()
+	promoter, ok := src.(MigrationPromoter)
+	require.True(t, ok)
+
+	prefix := []byte("stage|")
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, prefix), bytes.HasPrefix(staged, prefix)
+	}
+	require.NoError(t, src.PutAt(ctx, []byte("stage|a"), []byte("va"), 100, 0))
+	require.NoError(t, src.PutAt(ctx, []byte("stage|b"), []byte("vb"), 110, 0))
+
+	first, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       12,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 1,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.False(t, first.Done)
+	require.Equal(t, uint64(1), first.TotalPromotedRows)
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	raw := snapshotBytes(t, snap)
+	require.NoError(t, snap.Close())
+
+	dstDir, err := os.MkdirTemp("", "migration-streaming-snapshot-dst-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dstDir)) })
+	dst, err := NewPebbleStore(dstDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, dst.Close()) })
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+
+	dstPromoter, ok := any(dst).(MigrationPromoter)
+	require.True(t, ok)
+	stateReader, ok := any(dst).(MigrationPromotionStateReader)
+	require.True(t, ok)
+	state, ok, err := stateReader.MigrationPromotionState(ctx, 12)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, state.Done)
+	require.Equal(t, first.NextCursor, state.Cursor)
+	require.Equal(t, uint64(1), state.PromotedRows)
+	require.Equal(t, uint64(100), state.MaxPromotedTS)
+
+	restored, err := dstPromoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       12,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, restored.Done)
+	require.Equal(t, uint64(1), restored.PromotedRows)
+	require.Equal(t, uint64(2), restored.TotalPromotedRows)
+	require.Equal(t, uint64(110), restored.MaxPromotedTS)
+}

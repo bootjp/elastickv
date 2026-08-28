@@ -689,6 +689,9 @@ func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error
 	if err := batch.Set(migrationHLCFloorMetaKeyBytes, encodeMigrationHLCFloors(meta.migrationHLCFloors), nil); err != nil {
 		return errors.WithStack(err)
 	}
+	if err := batch.Set(migrationPromoteMetaKeyBytes, encodeMigrationPromotionStates(meta.migrationPromotions), nil); err != nil {
+		return errors.WithStack(err)
+	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
 }
 
@@ -3385,10 +3388,11 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
 type streamingMVCCRestoreMetadata struct {
-	lastCommitTS       uint64
-	minRetainedTS      uint64
-	migrationAcks      map[migrationAckID]migrationImportAck
-	migrationHLCFloors map[uint64]uint64
+	lastCommitTS        uint64
+	minRetainedTS       uint64
+	migrationAcks       map[migrationAckID]migrationImportAck
+	migrationHLCFloors  map[uint64]uint64
+	migrationPromotions map[uint64]PromotionState
 }
 
 func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, streamingMVCCRestoreMetadata, error) {
@@ -3399,15 +3403,16 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
-	lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, err := readMVCCSnapshotMetadata(body, version)
+	lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, err := readMVCCSnapshotMetadata(body, version)
 	if err != nil {
 		return nil, nil, 0, streamingMVCCRestoreMetadata{}, err
 	}
 	meta := streamingMVCCRestoreMetadata{
-		lastCommitTS:       lastCommitTS,
-		minRetainedTS:      minRetainedTS,
-		migrationAcks:      migrationAcks,
-		migrationHLCFloors: migrationHLCFloors,
+		lastCommitTS:        lastCommitTS,
+		minRetainedTS:       minRetainedTS,
+		migrationAcks:       migrationAcks,
+		migrationHLCFloors:  migrationHLCFloors,
+		migrationPromotions: migrationPromotions,
 	}
 	return body, hash, expectedChecksum, meta, nil
 }

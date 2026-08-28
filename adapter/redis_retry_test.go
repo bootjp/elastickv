@@ -352,6 +352,34 @@ func TestRedisXAddDedupsLandedWireWriteConflict(t *testing.T) {
 	require.Equal(t, int64(1), meta.Length, "the generated XADD entry must not be appended twice")
 }
 
+func TestRedisXAddDedupRouteFenceRetryPreservesPriorProbe(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true)
+	coord.routeFenceAtDispatch = 2
+	srv := &RedisServer{
+		store:            st,
+		coordinator:      coord,
+		scriptCache:      map[string]string{},
+		onePhaseTxnDedup: true,
+	}
+	conn := &recordingConn{}
+
+	srv.xadd(conn, redcon.Command{Args: [][]byte{
+		[]byte(cmdXAdd), []byte("retry:stream"), []byte("*"), []byte("field"), []byte("value"),
+	}})
+
+	require.Empty(t, conn.err)
+	require.NotEmpty(t, conn.bulk)
+	require.Equal(t, 3, coord.dispatches, "attempt 1 landed, route-fenced reuse, then dedup probe retry")
+	require.Equal(t, 1, coord.probeNoOps, "route-fenced reuse must not replace the prior landed probe")
+	meta, found, err := srv.loadStreamMetaAt(context.Background(), []byte("retry:stream"), snapshotTS(coord.Clock(), st))
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, int64(1), meta.Length)
+}
+
 func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 	t.Parallel()
 

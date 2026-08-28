@@ -197,6 +197,74 @@ func TestMVCCStore_SnapshotRestorePreservesMigrationMetadata(t *testing.T) {
 	require.ErrorIs(t, err, ErrKeyNotFound)
 }
 
+func TestMVCCStore_SnapshotRestorePreservesMigrationPromotionState(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+	promoter, ok := any(st).(MigrationPromoter)
+	require.True(t, ok)
+	stateReader, ok := any(st).(MigrationPromotionStateReader)
+	require.True(t, ok)
+
+	prefix := []byte("stage|")
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, prefix), bytes.HasPrefix(staged, prefix)
+	}
+	require.NoError(t, st.PutAt(ctx, []byte("stage|a"), []byte("va"), 100, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("stage|b"), []byte("vb"), 110, 0))
+
+	first, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 1,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.False(t, first.Done)
+	require.Equal(t, uint64(1), first.TotalPromotedRows)
+	require.Equal(t, uint64(100), first.MaxPromotedTS)
+
+	snap, err := st.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+
+	rest, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, rest.Done)
+	require.Equal(t, uint64(2), rest.TotalPromotedRows)
+
+	require.NoError(t, st.Restore(bytes.NewReader(raw)))
+	state, ok, err := stateReader.MigrationPromotionState(ctx, 11)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, state.Done)
+	require.Equal(t, first.NextCursor, state.Cursor)
+	require.Equal(t, uint64(1), state.PromotedRows)
+	require.Equal(t, uint64(100), state.MaxPromotedTS)
+
+	restored, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, restored.Done)
+	require.Equal(t, uint64(1), restored.PromotedRows)
+	require.Equal(t, uint64(2), restored.TotalPromotedRows)
+	require.Equal(t, uint64(110), restored.MaxPromotedTS)
+}
+
 func TestMVCCStore_ApplyMutations_WriteConflict(t *testing.T) {
 	t.Parallel()
 
