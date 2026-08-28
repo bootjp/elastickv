@@ -564,9 +564,9 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
 			return err
 		}
-		if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
-			return err
-		}
+	}
+	if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
+		return err
 	}
 	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
 		return err
@@ -600,11 +600,52 @@ func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uin
 	if err := f.verifyRouteWriteTimestampFloorForPrefix(prefix, commitTS); err != nil {
 		return err
 	}
+	for _, del := range f.stagedVisibilityPrefixDeletesForApply(prefix, txnCommonPrefix) {
+		if err := f.store.DeletePrefixAtRaftAt(ctx, del.prefix, del.excludePrefix, commitTS, 0); err != nil {
+			return errors.WithStack(err)
+		}
+	}
 	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
 	return nil
+}
+
+type fsmStagedVisibilityPrefixDelete struct {
+	prefix        []byte
+	excludePrefix []byte
+}
+
+func (f *kvFSM) stagedVisibilityPrefixDeletesForApply(prefix []byte, excludePrefix []byte) []fsmStagedVisibilityPrefixDelete {
+	if f == nil || f.routes == nil || f.shardGroupID == 0 {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	routes := snap.IntersectingRoutes(start, end)
+	out := make([]fsmStagedVisibilityPrefixDelete, 0, len(routes))
+	seen := make(map[string]struct{}, len(routes))
+	for _, route := range routes {
+		if route.GroupID != f.shardGroupID || !routeHasStagedVisibility(route) {
+			continue
+		}
+		stagedPrefix := distribution.MigrationStagedDataKey(route.MigrationJobID, prefix)
+		var stagedExclude []byte
+		if excludePrefix != nil {
+			stagedExclude = distribution.MigrationStagedDataKey(route.MigrationJobID, excludePrefix)
+		}
+		dedupeKey := string(stagedPrefix) + "\x00" + string(stagedExclude)
+		if _, ok := seen[dedupeKey]; ok {
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
+		out = append(out, fsmStagedVisibilityPrefixDelete{prefix: stagedPrefix, excludePrefix: stagedExclude})
+	}
+	return out
 }
 
 func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
@@ -665,13 +706,9 @@ func (f *kvFSM) verifyRouteWriteTimestampFloorForKey(key []byte, commitTS uint64
 	return nil
 }
 
-func (f *kvFSM) verifyRouteWriteTimestampFloorsForMutations(muts []*pb.Mutation, writeFenceBypassKeys [][]byte, commitTS uint64) error {
-	bypassKeys := writeFenceBypassKeySet(writeFenceBypassKeys)
+func (f *kvFSM) verifyRouteWriteTimestampFloorsForMutations(muts []*pb.Mutation, commitTS uint64) error {
 	for _, mut := range muts {
 		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
-			continue
-		}
-		if _, bypass := bypassKeys[string(mut.Key)]; bypass {
 			continue
 		}
 		if err := f.verifyRouteWriteTimestampFloorForKey(mut.Key, commitTS); err != nil {
@@ -1217,7 +1254,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
-	uniq, err := f.uniqueMutationsAboveFloor(muts, r.GetWriteFenceBypassKeys(), startTS)
+	uniq, err := f.uniqueMutationsAboveFloor(muts, startTS)
 	if err != nil {
 		return err
 	}
@@ -1287,7 +1324,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := f.uniqueMutationsAboveFloor(muts, r.GetWriteFenceBypassKeys(), commitTS)
+	uniq, err := f.uniqueMutationsAboveFloor(muts, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1311,23 +1348,23 @@ func uniqueTxnMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 	return uniq, nil
 }
 
-func (f *kvFSM) uniqueMutationsAboveFloor(muts []*pb.Mutation, writeFenceBypassKeys [][]byte, commitTS uint64) ([]*pb.Mutation, error) {
+func (f *kvFSM) uniqueMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return nil, err
 	}
-	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, writeFenceBypassKeys, commitTS); err != nil {
+	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
 		return nil, err
 	}
 	return uniq, nil
 }
 
-func (f *kvFSM) uniqueTxnMutationsAboveFloor(muts []*pb.Mutation, writeFenceBypassKeys [][]byte, commitTS uint64) ([]*pb.Mutation, error) {
+func (f *kvFSM) uniqueTxnMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
 	uniq, err := uniqueTxnMutations(muts)
 	if err != nil {
 		return nil, err
 	}
-	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, writeFenceBypassKeys, commitTS); err != nil {
+	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
 		return nil, err
 	}
 	return uniq, nil
@@ -1418,7 +1455,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	uniq, err := f.uniqueTxnMutationsAboveFloor(muts, r.GetWriteFenceBypassKeys(), commitTS)
+	uniq, err := f.uniqueTxnMutationsAboveFloor(muts, commitTS)
 	if err != nil {
 		return err
 	}

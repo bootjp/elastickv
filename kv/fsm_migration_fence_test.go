@@ -108,7 +108,7 @@ func TestFSMWriteFenceBypassAllowsMarkedRawPointWrite(t *testing.T) {
 	require.Equal(t, []byte("v"), got)
 }
 
-func TestFSMWriteFenceBypassAllowsRawWriteBelowBypassedRouteFloor(t *testing.T) {
+func TestFSMWriteFenceBypassRejectsRawWriteAtBypassedRouteFloor(t *testing.T) {
 	t.Parallel()
 
 	fsm := newWriteFloorFSM(t)
@@ -116,8 +116,8 @@ func TestFSMWriteFenceBypassAllowsRawWriteBelowBypassedRouteFloor(t *testing.T) 
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
 		WriteFenceBypassKeys: [][]byte{key},
 		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
-	}, 10)
-	require.NoError(t, err)
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
 }
 
 func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
@@ -126,7 +126,7 @@ func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
 	engine := distribution.NewEngine()
 	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
 		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
-		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced, MinWriteTSExclusive: 100},
+		{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 2, State: distribution.RouteStateWriteFenced},
 	})
 	fsm := newComposed1FSM(t, engine, 1)
 	key := []byte("z")
@@ -144,6 +144,24 @@ func TestFSMWriteFenceBypassAllowsPinnedTxnOnNonOwningGroup(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestFSMWriteFenceBypassRejectsPinnedTxnAtBypassedRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFloorFSM(t)
+	key := []byte("!sqs|msg|data|p|partitioned-key")
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn:                true,
+		Phase:                pb.Phase_PREPARE,
+		Ts:                   100,
+		WriteFenceBypassKeys: [][]byte{key},
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
+			{Op: pb.Op_DEL, Key: key},
+		},
+	}, 100)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+}
+
 func TestFSMWriteFenceBypassDoesNotAllowDelPrefix(t *testing.T) {
 	t.Parallel()
 
@@ -154,6 +172,39 @@ func TestFSMWriteFenceBypassDoesNotAllowDelPrefix(t *testing.T) {
 		Mutations:            []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: prefix}},
 	}, 10)
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
+func TestFSMDelPrefixTombstonesStagedVisibilityRowsDuringApply(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+		},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	dropKey := []byte("b/drop")
+	outsideKey := []byte("c/outside")
+	stagedDrop := distribution.MigrationStagedDataKey(9, dropKey)
+	stagedOutside := distribution.MigrationStagedDataKey(9, outsideKey)
+	require.NoError(t, fsm.store.PutAt(ctx, stagedDrop, []byte("drop"), 20, 0))
+	require.NoError(t, fsm.store.PutAt(ctx, stagedOutside, []byte("outside"), 20, 0))
+
+	require.NoError(t, fsm.handleDelPrefix(ctx, []byte("b/"), 101))
+
+	_, err := fsm.store.GetAt(ctx, stagedDrop, 150)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	got, err := fsm.store.GetAt(ctx, stagedOutside, 150)
+	require.NoError(t, err)
+	require.Equal(t, []byte("outside"), got)
 }
 
 func TestFSMRejectsCurrentWriteFenceAfterObservedActiveRawPointWrite(t *testing.T) {
