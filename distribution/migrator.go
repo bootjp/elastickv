@@ -101,6 +101,49 @@ var (
 	ErrMigrationSourceRouteChanged = errors.New("migration source route does not match split job")
 )
 
+// IsReservedControlKey reports whether key lives in a control namespace that no
+// user mutation may write.
+//
+// The staged-data prefix is deliberately excluded: ShardedCoordinator rewrites a
+// user key into MigrationStagedDataKey while its route has staged visibility, so
+// legitimate user writes do arrive under it. Telling those apart from a forged
+// one needs request-level provenance the FSM does not have -- the route state
+// that would distinguish them is refreshed by a polling watcher and so cannot
+// decide an apply.
+func IsReservedControlKey(key []byte) bool {
+	if bytes.HasPrefix(key, []byte(migrationStagedDataPrefix)) {
+		return false
+	}
+	return reservedControlPrefixIntersects(key, bytes.HasPrefix)
+}
+
+// ReservedControlPrefixIntersects reports whether a DEL_PREFIX over prefix is
+// aimed at a control namespace, either because the prefix sits inside one or
+// because it is a partial spelling of one.
+//
+// An empty prefix is exempt. That is the whole-keyspace flush, an operation the
+// caller asked for deliberately, and refusing it would break FLUSHDB. Keeping
+// control keys out of a flush needs the store's prefix-exclusion argument to
+// accept more than the one transaction prefix it takes today, which is a
+// separate change.
+func ReservedControlPrefixIntersects(prefix []byte) bool {
+	if len(prefix) == 0 || bytes.HasPrefix(prefix, []byte(migrationStagedDataPrefix)) {
+		return false
+	}
+	return reservedControlPrefixIntersects(prefix, func(a, b []byte) bool {
+		return bytes.HasPrefix(a, b) || bytes.HasPrefix(b, a)
+	})
+}
+
+func reservedControlPrefixIntersects(key []byte, match func(key, reserved []byte) bool) bool {
+	for _, reserved := range migrationReservedControlPrefixes {
+		if match(key, reserved) {
+			return true
+		}
+	}
+	return false
+}
+
 var migrationReservedControlPrefixes = [][]byte{
 	[]byte("!dist|"),
 	[]byte("!migstage|"),

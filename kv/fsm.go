@@ -553,6 +553,13 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 	if isTxnInternalKey(mut.Key) {
 		return errors.WithStack(ErrInvalidRequest)
 	}
+	// Nor the migration and catalog control namespaces. Those are written only
+	// by the typed internal commands (catalog applies, migration import and
+	// promote), never by a RawKV mutation. The check is a pure function of the
+	// key, so every replica reaches the same verdict for the same entry.
+	if distribution.IsReservedControlKey(mut.Key) {
+		return errors.WithStack(ErrInvalidRequest)
+	}
 	if _, bypass := writeFenceBypassKeys[string(mut.Key)]; !bypass {
 		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
 			return err
@@ -581,6 +588,12 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
+	// DEL_PREFIX never reaches validateRawMutationsForApply, so the control
+	// namespaces are gated here as well. A prefix is refused both when it sits
+	// inside one and when it is broad enough to sweep one up.
+	if distribution.ReservedControlPrefixIntersects(prefix) {
+		return errors.WithStack(ErrInvalidRequest)
+	}
 	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
 		return err
 	}
