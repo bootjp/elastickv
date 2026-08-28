@@ -1229,11 +1229,15 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
+		mut := elemToMutation(elem)
+		if err := c.ensureMutationWriteAllowed(mut, ts); err != nil {
+			return nil, err
+		}
 		requests = append(requests, &pb.Request{
 			IsTxn:     false,
 			Phase:     pb.Phase_NONE,
 			Ts:        ts,
-			Mutations: []*pb.Mutation{elemToMutation(elem)},
+			Mutations: []*pb.Mutation{mut},
 		})
 	}
 
@@ -1311,7 +1315,7 @@ func (c *ShardedCoordinator) dispatchTxn(
 		return nil, err
 	}
 
-	commitTS, err = c.prepareTxnCommitTimestamp(ctx, startTS, commitTS, elems)
+	commitTS, err = c.settleTxnCommitTimestamp(ctx, startTS, commitTS, elems, grouped)
 	if err != nil {
 		return nil, err
 	}
@@ -1328,6 +1332,31 @@ func (c *ShardedCoordinator) dispatchTxn(
 		return nil, err
 	}
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion)
+}
+
+// settleTxnCommitTimestamp resolves the commit timestamp and then applies the
+// two checks that depend on it: the per-element commit-ts patches have to agree
+// with the settled value, and the route write floors have to admit a write at
+// it. Both belong after allocation and before any dispatch, so they travel with
+// the allocation rather than being repeated at each call site.
+func (c *ShardedCoordinator) settleTxnCommitTimestamp(
+	ctx context.Context,
+	startTS uint64,
+	commitTS uint64,
+	elems []*Elem[OP],
+	grouped map[uint64][]*pb.Mutation,
+) (uint64, error) {
+	settled, err := c.prepareTxnCommitTimestamp(ctx, startTS, commitTS, elems)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateElemCommitTSPatches(elems, settled); err != nil {
+		return 0, err
+	}
+	if err := c.ensureGroupedMutationsWriteAllowed(grouped, settled); err != nil {
+		return 0, err
+	}
+	return settled, nil
 }
 
 func (c *ShardedCoordinator) validateCallerSuppliedTxnStart(ctx context.Context, startTS uint64, singleShard, callerSupplied bool) error {
@@ -2018,6 +2047,29 @@ func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte)
 	return verifyLeaderEngineCtx(ctx, engineForGroup(g))
 }
 
+// IsLeaderForGroup reports local leadership for an already-resolved group,
+// skipping the key -> route -> group derivation IsLeaderForKey performs. Read
+// fencing needs this: a fence target's group is known when the target is built,
+// and re-deriving it from the representative key can land on a different group
+// (see ReadFenceTarget).
+func (c *ShardedCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return false
+	}
+	return isLeaderEngine(engineForGroup(g))
+}
+
+// RaftLeaderForGroup returns the Raft leader address for an already-resolved
+// group, the group-keyed counterpart of RaftLeaderForKey.
+func (c *ShardedCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return ""
+	}
+	return leaderAddrFromEngine(engineForGroup(g))
+}
+
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
 	g, ok := c.groupForKey(key)
 	if !ok {
@@ -2054,6 +2106,18 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 		return 0, errors.WithStack(ErrLeaderNotFound)
 	}
 	c.observeRead(ctx, routeID, key)
+	return groupLeaseRead(ctx, g, c.leaseObserver)
+}
+
+// LeaseReadForGroup establishes the lease freshness bound on an already-resolved
+// group. Read fencing knows the group when it builds a ReadFenceTarget, and
+// re-deriving it from the representative key can select a different group, so the
+// fence path uses this instead of LeaseReadForKey.
+func (c *ShardedCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
@@ -2415,11 +2479,17 @@ func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[O
 		if err != nil {
 			return nil, err
 		}
+		muts := grouped[gid]
+		if ts != 0 {
+			if err := c.ensureMutationsWriteAllowed(muts, ts); err != nil {
+				return nil, err
+			}
+		}
 		logs = append(logs, &pb.Request{
 			IsTxn:     false,
 			Phase:     pb.Phase_NONE,
 			Ts:        ts,
-			Mutations: grouped[gid],
+			Mutations: muts,
 		})
 	}
 	return logs, nil
@@ -2442,6 +2512,9 @@ func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs
 			return err
 		}
 		r.Ts = ts
+		if err := c.ensureMutationsWriteAllowed(r.Mutations, r.Ts); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -2458,6 +2531,9 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	}
 	commitTS, err := c.resolveTxnCommitTS(ctx, reqs.StartTS, reqs.CommitTS)
 	if err != nil {
+		return nil, err
+	}
+	if err := c.ensureGroupedMutationsWriteAllowed(grouped, commitTS); err != nil {
 		return nil, err
 	}
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
@@ -2557,6 +2633,90 @@ func (c *ShardedCoordinator) keyVizObserveLabel(label keyviz.Label) keyviz.Label
 		return keyviz.LabelLegacy
 	}
 	return label
+}
+
+func (c *ShardedCoordinator) ensureGroupedMutationsWriteAllowed(grouped map[uint64][]*pb.Mutation, commitTS uint64) error {
+	for _, muts := range grouped {
+		if err := c.ensureMutationsWriteAllowed(muts, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MutationWriteGate rejects raw mutations whose commit timestamp lands at or
+// below the owning route's migration write floor. Follower-forwarded writes are
+// stamped on the leader, outside the coordinator that owns the route table, so
+// the leader-side RPC handler needs this to re-apply the same check.
+type MutationWriteGate interface {
+	EnsureMutationsWriteAllowed([]*pb.Mutation, uint64) error
+}
+
+var _ MutationWriteGate = (*ShardedCoordinator)(nil)
+
+// EnsureMutationsWriteAllowed exposes the route-floor check to the leader-side
+// Internal.Forward handler. It is the same predicate the local stamping path
+// applies, so a forwarded write cannot reach Raft under a floor that a
+// locally-stamped write would have been rejected by.
+func (c *ShardedCoordinator) EnsureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	return c.ensureMutationsWriteAllowed(muts, commitTS)
+}
+
+func (c *ShardedCoordinator) ensureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	if commitTS == 0 {
+		return nil
+	}
+	for _, mut := range muts {
+		if err := c.ensureMutationWriteAllowed(mut, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) ensureMutationWriteAllowed(mut *pb.Mutation, commitTS uint64) error {
+	if c == nil || mut == nil || commitTS == 0 {
+		return nil
+	}
+	switch mut.Op {
+	case pb.Op_DEL_PREFIX:
+		for _, route := range routesForPrefixWriteForEngine(c.engine, mut.Key) {
+			if err := ensureRouteWriteAllowed(route, mut.Key, commitTS); err != nil {
+				return err
+			}
+		}
+		return nil
+	case pb.Op_PUT, pb.Op_DEL:
+		return c.ensurePointMutationWriteAllowed(mut.Key, commitTS)
+	default:
+		return errors.WithStack(ErrInvalidRequest)
+	}
+}
+
+func (c *ShardedCoordinator) ensurePointMutationWriteAllowed(key []byte, commitTS uint64) error {
+	if c.engine == nil {
+		return nil
+	}
+	// Applied before the raw-route lookup below so a fenced user key rejects
+	// its list-delta/claim and stream rows even when the raw key's own route
+	// has no floor.
+	if err := ensureLogicalRouteWriteAllowed(c.engine, key, commitTS); err != nil {
+		return err
+	}
+	route, ok := c.engine.GetRoute(routeKey(key))
+	if !ok {
+		return nil
+	}
+	if c.router != nil {
+		gid, ok := c.router.ResolveGroup(key)
+		if !ok {
+			return errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
+		}
+		if gid != route.GroupID {
+			return nil
+		}
+	}
+	return ensureRouteWriteAllowed(route, key, commitTS)
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label) (map[uint64][]*pb.Mutation, []uint64, error) {
@@ -2712,9 +2872,10 @@ func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
 }
 
 // renewHLCLeases starts one renewal proposal for every shard group this node
-// currently leads. It does not wait for those proposals before returning; the
-// returned channel closes when the launched proposals finish and exists for
-// tests/diagnostics only.
+// currently leads. A group with an older renewal still in flight is skipped for
+// this tick so slow Raft proposals cannot stack up behind write-heavy traffic;
+// other led groups continue renewing independently. The returned channel closes
+// when the launched proposals finish and exists for tests/diagnostics only.
 func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{} {
 	if ctx == nil {
 		ctx = context.Background()

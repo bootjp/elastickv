@@ -2611,6 +2611,7 @@ var _ kv.TimestampAfterAllocator = (*startupGatedCoordinator)(nil)
 var _ kv.AppliedReadTimestampVoucher = (*startupGatedCoordinator)(nil)
 var _ kv.AppliedReadTimestampVoucherRevoker = (*startupGatedCoordinator)(nil)
 var _ kv.AppliedReadTimestampVoucherSupport = (*startupGatedCoordinator)(nil)
+var _ kv.MutationWriteGate = (*startupGatedCoordinator)(nil)
 
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if c.gate != nil && c.gate.blocked() {
@@ -2753,12 +2754,6 @@ func (c startupGatedCoordinator) SupportsAppliedReadTimestampVoucher() bool {
 	return ok
 }
 
-func (c startupGatedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
-	if observer, ok := c.inner.(interface{ ObserveForwardedRequests([]*pb.Request) }); ok {
-		observer.ObserveForwardedRequests(reqs)
-	}
-}
-
 func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
 	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }
@@ -2769,6 +2764,65 @@ func (c startupGatedCoordinator) LeaseReadForKey(ctx context.Context, key []byte
 
 func (c startupGatedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
 	return kv.LeaseReadAllGroupsThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+// IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
+// group-keyed read-fence path. Without them this wrapper silently fails the
+// kv.GroupLeaderRoutableCoordinator assertion in the Redis fence and every
+// target falls back to key resolution, which is exactly the collapse
+// kv.ReadFenceTarget exists to prevent -- and it would not show up in tests that
+// use an unwrapped coordinator.
+func (c startupGatedCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
+	if !ok {
+		return false
+	}
+	return router.IsLeaderForGroup(groupID)
+}
+
+func (c startupGatedCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
+	if !ok {
+		return ""
+	}
+	return router.RaftLeaderForGroup(groupID)
+}
+
+func (c startupGatedCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	if lr, ok := c.inner.(interface {
+		LeaseReadForGroup(context.Context, uint64) (uint64, error)
+	}); ok {
+		return lr.LeaseReadForGroup(ctx, groupID) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+	}
+	// No group-keyed lease read underneath (single-group Coordinate). Fall back
+	// to the plain lease read rather than a key-resolved one: there is no key to
+	// resolve here, and the single group is the one being fenced anyway.
+	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+// Internal.Forward re-applies the route write floor and records forwarded-write
+// samples on the leader. Both reach the handler through an optional-interface
+// probe in internalTimestampOptions, and the value probed there is this wrapper
+// -- not the ShardedCoordinator it holds. Without these two forwards the probe
+// fails, follower-forwarded raw and transactional commits skip the
+// MinWriteTSExclusive check entirely, and forwarded-write sampling goes dark.
+func (c startupGatedCoordinator) EnsureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	gate, ok := c.inner.(kv.MutationWriteGate)
+	if !ok {
+		// Single-group Coordinate owns no route table, so it has no write
+		// floors to enforce. Allowing the write matches the behaviour of
+		// leaving the gate unset.
+		return nil
+	}
+	return gate.EnsureMutationsWriteAllowed(muts, commitTS) //nolint:wrapcheck // Pass through the coordinator's gate error unchanged.
+}
+
+func (c startupGatedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
+	observer, ok := c.inner.(interface{ ObserveForwardedRequests([]*pb.Request) })
+	if !ok {
+		return
+	}
+	observer.ObserveForwardedRequests(reqs)
 }
 
 func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
@@ -3316,6 +3370,14 @@ func internalTimestampOptions(coordinate kv.Coordinator) []adapter.InternalOptio
 	var opts []adapter.InternalOption
 	if alloc, ok := kv.ConfiguredTimestampAllocatorThrough(coordinate); ok {
 		opts = append(opts, adapter.WithInternalTimestampAllocator(alloc))
+	}
+	// Sharded deployments own a route table with migration write floors; the
+	// single-group coordinator has none and its gate allows every write. The
+	// value probed here is whatever main.go handed the adapters, which in the
+	// production path is startupGatedCoordinator -- see the forwards on that
+	// type, without which this probe silently finds nothing.
+	if gate, ok := coordinate.(kv.MutationWriteGate); ok {
+		opts = append(opts, adapter.WithInternalWriteGate(gate))
 	}
 	if observer, ok := coordinate.(interface{ ObserveForwardedRequests([]*pb.Request) }); ok {
 		opts = append(opts, adapter.WithInternalForwardWriteObserver(observer.ObserveForwardedRequests))

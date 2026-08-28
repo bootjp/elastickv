@@ -110,7 +110,7 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 		if !ok {
 			continue
 		}
-		val, err := s.store.getRouteAt(ctx, route, item.key, s.ts)
+		val, err := s.store.getRouteAt(ctx, route, item.key, s.ts, 0)
 		if errors.Is(err, store.ErrKeyNotFound) {
 			continue
 		}

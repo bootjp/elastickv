@@ -114,35 +114,6 @@ func TestFillForwardedTxnCommitTS_AssignsCommitTS(t *testing.T) {
 	require.Equal(t, meta.CommitTS, commitTS)
 }
 
-func TestFillForwardedTxnCommitTS_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
-	t.Parallel()
-
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	i := &Internal{
-		clock:       clock,
-		tsAllocator: internalLegacyRuntimeAllocator{},
-	}
-	startTS := uint64(10)
-	reqs := []*pb.Request{
-		{
-			IsTxn: true,
-			Phase: pb.Phase_COMMIT,
-			Mutations: []*pb.Mutation{
-				{
-					Op:    pb.Op_PUT,
-					Key:   []byte(kv.TxnMetaPrefix),
-					Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 0}),
-				},
-			},
-		},
-	}
-
-	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), reqs, startTS)
-	require.NoError(t, err)
-	require.Greater(t, commitTS, startTS)
-}
-
 func TestFillForwardedTxnCommitTS_PreservesExistingCommitTS(t *testing.T) {
 	t.Parallel()
 
@@ -235,21 +206,6 @@ func TestFillForwardedTxnCommitTS_StampsCommitTSValueOffset(t *testing.T) {
 	require.Zero(t, reqs[0].Mutations[1].CommitTsValueOffset)
 }
 
-func TestStampRawTimestamps_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
-	t.Parallel()
-
-	clock := kv.NewHLC()
-	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
-	i := &Internal{
-		clock:       clock,
-		tsAllocator: internalLegacyRuntimeAllocator{},
-	}
-	reqs := []*pb.Request{{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}}}}
-
-	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
-	require.NotZero(t, reqs[0].Ts)
-}
-
 func TestFillForwardedTxnCommitTS_PrepareAllowsAlreadyStampedOffsets(t *testing.T) {
 	t.Parallel()
 
@@ -317,45 +273,174 @@ func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {
 	require.Equal(t, meta.CommitTS, commitTS)
 }
 
-type internalLegacyRuntimeAllocator struct{}
-
-func (internalLegacyRuntimeAllocator) Next(context.Context) (uint64, error) {
-	return 0, errors.WithStack(kv.ErrTSOAllocatorRequired)
+// recordingWriteGate stands in for the sharded coordinator's route-floor check.
+type recordingWriteGate struct {
+	floor     uint64
+	calls     int
+	lastTS    uint64
+	lastMuts  int
+	rejectErr error
 }
 
-// The dedicated TSO group runs TSOStateMachine, whose Apply halts on any tag it
-// does not recognise. TransactionManager.Commit encodes KV requests with the
-// 0x00 / 0x01 tags, so one forwarded PUT reaching group 0's Internal server
-// would commit an entry that permanently stops group-0 apply and with it all
-// centralized timestamp issuance. Forward must refuse before proposing.
-func TestInternalForward_RejectedOnDedicatedTSOGroup(t *testing.T) {
-	t.Parallel()
-
-	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
-
-	resp, err := i.Forward(context.Background(), &pb.ForwardRequest{
-		Requests: []*pb.Request{{
-			IsTxn:     false,
-			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
-		}},
-	})
-
-	require.ErrorIs(t, err, ErrKVForwardNotSupported)
-	require.Nil(t, resp)
+func (g *recordingWriteGate) EnsureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	g.calls++
+	g.lastTS = commitTS
+	g.lastMuts = len(muts)
+	if commitTS != 0 && commitTS <= g.floor {
+		return g.rejectErr
+	}
+	return nil
 }
 
-// The guard must fire before the leader check so it cannot be masked by
-// ErrNotLeader, and so it is refused on every replica rather than only where a
-// leader would have proposed.
-func TestInternalForward_RejectionPrecedesLeaderCheck(t *testing.T) {
+// A follower cannot stamp a raw write (its stamping path bails out when the
+// group engine is not leader), so the leader assigns the timestamp here. Before
+// the gate existed, that write went to Raft with no route-floor check at all.
+func TestStampRawTimestamps_AppliesRouteFloorToForwardedWrites(t *testing.T) {
 	t.Parallel()
 
-	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
+	rejected := errors.New("route min_write_ts_exclusive rejects commit_ts")
 
-	_, err := i.Forward(context.Background(), &pb.ForwardRequest{})
+	tests := []struct {
+		name      string
+		floor     uint64
+		requestTS uint64
+		wantErr   bool
+	}{
+		{
+			name:      "unstamped write above the floor is admitted",
+			floor:     0,
+			requestTS: 0,
+			wantErr:   false,
+		},
+		{
+			// Any timestamp the leader can mint is at or below this floor.
+			name:      "unstamped write at or below the floor is rejected",
+			floor:     ^uint64(0) - 1,
+			requestTS: 0,
+			wantErr:   true,
+		},
+		{
+			name:      "pre-stamped write below the floor is rejected too",
+			floor:     100,
+			requestTS: 42,
+			wantErr:   true,
+		},
+		{
+			name:      "pre-stamped write above the floor is admitted",
+			floor:     5,
+			requestTS: 42,
+			wantErr:   false,
+		},
+	}
 
-	require.ErrorIs(t, err, ErrKVForwardNotSupported)
-	require.NotErrorIs(t, err, ErrNotLeader)
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			gate := &recordingWriteGate{floor: tt.floor, rejectErr: rejected}
+			i := &Internal{clock: kv.NewHLC(), writeGate: gate}
+			reqs := []*pb.Request{{
+				IsTxn: false,
+				Phase: pb.Phase_NONE,
+				Ts:    tt.requestTS,
+				Mutations: []*pb.Mutation{
+					{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+				},
+			}}
+
+			err := i.stampRawTimestamps(context.Background(), reqs)
+			if tt.wantErr {
+				require.ErrorIs(t, err, rejected)
+			} else {
+				require.NoError(t, err)
+			}
+			require.Equal(t, 1, gate.calls)
+			require.Equal(t, 1, gate.lastMuts)
+			require.NotZero(t, gate.lastTS, "the gate must see the stamped timestamp, not zero")
+			if tt.requestTS != 0 {
+				require.Equal(t, tt.requestTS, gate.lastTS)
+			}
+		})
+	}
+}
+
+// Deployments without a route table (the single-group coordinator) leave the
+// gate unset; stamping must keep working there.
+func TestStampRawTimestamps_WithoutWriteGate(t *testing.T) {
+	t.Parallel()
+
+	i := &Internal{}
+	reqs := []*pb.Request{{
+		IsTxn:     false,
+		Phase:     pb.Phase_NONE,
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+	}}
+
+	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
+	require.NotZero(t, reqs[0].Ts)
+}
+
+func TestStampTxnTimestamps_AppliesRouteFloorToForwardedCommitWrites(t *testing.T) {
+	t.Parallel()
+
+	rejected := errors.New("route min_write_ts_exclusive rejects commit_ts")
+	gate := &recordingWriteGate{floor: 100, rejectErr: rejected}
+	i := &Internal{writeGate: gate}
+	reqs := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("z"), CommitTS: 101})},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+		},
+	}}
+
+	commitTS, err := i.stampTxnTimestamps(context.Background(), reqs)
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(101), commitTS)
+	require.Equal(t, 1, gate.calls)
+	require.Equal(t, uint64(101), gate.lastTS)
+	require.Equal(t, 1, gate.lastMuts, "txn metadata is not a user write and must not be gated")
+
+	gate.floor = 101
+	_, err = i.stampTxnTimestamps(context.Background(), reqs)
+	require.ErrorIs(t, err, rejected)
+}
+
+func TestStampTxnTimestamps_DoesNotGatePrepareOrAbortCleanup(t *testing.T) {
+	t.Parallel()
+
+	rejected := errors.New("route min_write_ts_exclusive rejects commit_ts")
+	gate := &recordingWriteGate{floor: 0, rejectErr: rejected}
+	i := &Internal{writeGate: gate}
+	reqs := []*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_PREPARE,
+			Ts:    10,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("z")})},
+				{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+			},
+		},
+		{
+			IsTxn: true,
+			Phase: pb.Phase_ABORT,
+			Ts:    10,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("z"), CommitTS: 11})},
+				{Op: pb.Op_DEL, Key: []byte("z")},
+			},
+		},
+	}
+
+	commitTS, err := i.stampTxnTimestamps(context.Background(), reqs)
+
+	require.NoError(t, err)
+	require.Equal(t, uint64(11), commitTS)
+	require.Zero(t, gate.calls)
 }
 
 type forwardObserverLeader struct{}
@@ -380,8 +465,83 @@ func (t *forwardObserverTxn) Abort(context.Context, []*pb.Request) (*kv.Transact
 	return &kv.TransactionResponse{}, nil
 }
 
-// phaseDForwardAllocator is the receiver-side view of the dedicated TSO: it
-// allocates above a floor and rejects anything at or below it as pre-Phase-D.
+func TestFillForwardedTxnCommitTS_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
+	t.Parallel()
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	i := &Internal{
+		clock:       clock,
+		tsAllocator: internalLegacyRuntimeAllocator{},
+	}
+	startTS := uint64(10)
+	reqs := []*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{
+				{
+					Op:    pb.Op_PUT,
+					Key:   []byte(kv.TxnMetaPrefix),
+					Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 0}),
+				},
+			},
+		},
+	}
+
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), reqs, startTS)
+	require.NoError(t, err)
+	require.Greater(t, commitTS, startTS)
+}
+
+func TestStampRawTimestamps_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
+	t.Parallel()
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	i := &Internal{
+		clock:       clock,
+		tsAllocator: internalLegacyRuntimeAllocator{},
+	}
+	reqs := []*pb.Request{{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}}}}
+
+	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
+	require.NotZero(t, reqs[0].Ts)
+}
+
+type internalLegacyRuntimeAllocator struct{}
+
+func (internalLegacyRuntimeAllocator) Next(context.Context) (uint64, error) {
+	return 0, errors.WithStack(kv.ErrTSOAllocatorRequired)
+}
+
+func TestInternalForward_RejectedOnDedicatedTSOGroup(t *testing.T) {
+	t.Parallel()
+
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
+
+	resp, err := i.Forward(context.Background(), &pb.ForwardRequest{
+		Requests: []*pb.Request{{
+			IsTxn:     false,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}},
+	})
+
+	require.ErrorIs(t, err, ErrKVForwardNotSupported)
+	require.Nil(t, resp)
+}
+
+func TestInternalForward_RejectionPrecedesLeaderCheck(t *testing.T) {
+	t.Parallel()
+
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
+
+	_, err := i.Forward(context.Background(), &pb.ForwardRequest{})
+
+	require.ErrorIs(t, err, ErrKVForwardNotSupported)
+	require.NotErrorIs(t, err, ErrNotLeader)
+}
+
 type phaseDForwardAllocator struct {
 	floor uint64
 	// ceiling stands in for the allocation floor: anything beyond it has not
@@ -419,11 +579,6 @@ func (a *phaseDForwardAllocator) ValidateDurableTimestamp(_ context.Context, tim
 func (a *phaseDForwardAllocator) PhaseDActive() bool   { return true }
 func (a *phaseDForwardAllocator) PhaseDRequired() bool { return true }
 
-// Internal.Forward preserves a raw Request.Ts somebody else stamped rather than
-// allocating one, and this receiver never reaches the coordinator's own
-// validation. Without a check here a forwarding peer or a direct caller could
-// persist a value group 0 has not allocated yet, and the TSO would later issue
-// the same timestamp.
 func TestStampRawTimestamps_ValidatesForwardedTimestampUnderPhaseD(t *testing.T) {
 	t.Parallel()
 
@@ -449,10 +604,6 @@ func TestStampRawTimestamps_ValidatesForwardedTimestampUnderPhaseD(t *testing.T)
 	require.Equal(t, before, alloc.validateCalls)
 }
 
-// The same for a commit timestamp that arrived already set in the transaction
-// meta: it is the timestamp every mutation in the batch is persisted under. The
-// start timestamp here is post-Phase-D, so this is a current transaction and not
-// the legacy-resolution replay carved out below.
 func TestFillForwardedTxnCommitTS_ValidatesForwardedCommitTSUnderPhaseD(t *testing.T) {
 	t.Parallel()
 
@@ -480,8 +631,6 @@ func TestFillForwardedTxnCommitTS_ValidatesForwardedCommitTSUnderPhaseD(t *testi
 	require.Equal(t, uint64(101), commitTS)
 }
 
-// Without Phase D in force the receiver must keep accepting pre-stamped
-// timestamps exactly as before.
 func TestForwardedTimestamps_UnvalidatedWithoutPhaseD(t *testing.T) {
 	t.Parallel()
 
@@ -491,13 +640,6 @@ func TestForwardedTimestamps_UnvalidatedWithoutPhaseD(t *testing.T) {
 	require.Equal(t, uint64(7), reqs[0].Ts)
 }
 
-// A cross-shard transaction that began before the Phase-D marker can still have
-// unresolved intents when the marker applies. Resolving them replays the commit
-// timestamp the primary already recorded (LockResolver.resolveExpiredLock ->
-// applyTxnResolution), and on a follower that replay travels through
-// Internal.Forward. Rejecting it would leave the transaction partially resolved
-// with its secondary keys locked, and the rollout does not require draining
-// transactions before activating Phase D.
 func TestFillForwardedTxnCommitTS_AllowsPrePhaseDResolutionReplay(t *testing.T) {
 	t.Parallel()
 
@@ -527,9 +669,6 @@ func TestFillForwardedTxnCommitTS_AllowsPrePhaseDResolutionReplay(t *testing.T) 
 	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 }
 
-// The carve-out is only for timestamps below the Phase-D floor. A commit
-// timestamp beyond the allocation floor is the value this check exists to
-// reject, and a pre-Phase-D start timestamp must not launder it.
 func TestFillForwardedTxnCommitTS_StillRejectsUnallocatedCommitTS(t *testing.T) {
 	t.Parallel()
 
@@ -552,11 +691,6 @@ func TestFillForwardedTxnCommitTS_StillRejectsUnallocatedCommitTS(t *testing.T) 
 	require.NotErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 }
 
-// The legacy carve-out is for replaying a commit timestamp the primary already
-// recorded, which only a COMMIT or ABORT resolution does. forwardedTxnMetaMutation
-// also accepts Phase_NONE, and a one-phase transaction chose its own commit
-// timestamp with no recorded intent behind it -- handleOnePhaseTxnRequest would
-// persist it straight away -- so it gets no exemption.
 func TestFillForwardedTxnCommitTS_OnePhaseGetsNoLegacyExemption(t *testing.T) {
 	t.Parallel()
 
@@ -591,10 +725,6 @@ func TestFillForwardedTxnCommitTS_OnePhaseGetsNoLegacyExemption(t *testing.T) {
 	require.Equal(t, uint64(60), commitTS)
 }
 
-// A forwarded PREPARE carries no transaction meta, so the commit-timestamp check
-// never sees it -- but handlePrepareRequest persists the intent at the
-// caller-supplied start timestamp. A caller could otherwise submit
-// AllocationFloor()+1 and let the TSO issue the same value later.
 func TestStampTxnTimestamps_ValidatesForwardedStartTS(t *testing.T) {
 	t.Parallel()
 
@@ -631,10 +761,6 @@ func TestStampTxnTimestamps_ValidatesForwardedStartTS(t *testing.T) {
 	require.Equal(t, uint64(50), legacy[0].Ts)
 }
 
-// commitSequential applies a batch in order, so a Phase_NONE request placed
-// ahead of a COMMIT carrying the same pre-Phase-D commit timestamp would persist
-// a one-phase write under the resolution's exemption. Every meta that carries
-// the timestamp has to be a resolution, not just the last one the loop saw.
 func TestFillForwardedTxnCommitTS_MixedPhaseBatchGetsNoLegacyExemption(t *testing.T) {
 	t.Parallel()
 
@@ -667,12 +793,6 @@ func TestFillForwardedTxnCommitTS_MixedPhaseBatchGetsNoLegacyExemption(t *testin
 	require.Equal(t, uint64(60), commitTS)
 }
 
-// Internal.Forward stamps from the envelope's IsTxn while
-// TransactionManager.Commit applies from the inner requests' own IsTxn. A batch
-// that says raw outside and carries a transactional request inside took the raw
-// stamping path, which only looks at Request.Ts, and then went down the
-// transactional apply path, where the FSM takes the persistence timestamp from a
-// transaction meta nothing validated.
 func TestStampTimestamps_RejectsInconsistentForwardEnvelope(t *testing.T) {
 	t.Parallel()
 
@@ -715,10 +835,6 @@ func TestStampTimestamps_RejectsInconsistentForwardEnvelope(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// The envelope check has to hold in both directions. A transactional envelope
-// carrying a raw request has that request stamped with the transaction's start
-// timestamp and then applied raw by commitSequential, persisting at that
-// timestamp without ever passing stampRawTimestamps.
 func TestStampTimestamps_RejectsRawRequestInsideTxnEnvelope(t *testing.T) {
 	t.Parallel()
 
@@ -751,10 +867,6 @@ func TestStampTimestamps_RejectsRawRequestInsideTxnEnvelope(t *testing.T) {
 	require.NoError(t, err)
 }
 
-// A zero-valued Phase_NONE meta is filled with the selected commit timestamp, so
-// it receives a resolution's legacy exemption just as surely as one that carried
-// the value in. Narrowing only the metas that arrive with a timestamp left that
-// bypass open.
 func TestFillForwardedTxnCommitTS_ZeroValuedOnePhaseMetaBlocksExemption(t *testing.T) {
 	t.Parallel()
 

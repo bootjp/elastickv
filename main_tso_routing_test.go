@@ -184,7 +184,11 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	require.IsType(t, startupGatedCoordinator{}, got)
 	_, err := got.Next(context.Background())
 	require.Error(t, err)
-	require.Len(t, internalTimestampOptions(gated), 2)
+	// startupGatedCoordinator forwards the write gate and the forwarded-write
+	// observer as well as the allocator, so it satisfies all three optional
+	// interfaces and the option count is structural rather than a signal about
+	// which allocator survived. The behavioural checks below are what pin that.
+	require.Len(t, internalTimestampOptions(gated), 3)
 
 	runtimeAllocator := kv.NewDynamicTimestampAllocator(nil)
 	runtimeCoord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(runtimeAllocator)
@@ -195,10 +199,12 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	configured, ok := kv.ConfiguredTimestampAllocatorThrough(runtimeGated)
 	require.True(t, ok)
 	require.Same(t, runtimeAllocator, configured)
-	require.Len(t, internalTimestampOptions(runtimeGated), 2)
+	require.Len(t, internalTimestampOptions(runtimeGated), 3)
 
 	legacy := startupGatedCoordinator{inner: newMainTSOCoordinator(kv.NewHLC(), nil)}
-	require.Len(t, internalTimestampOptions(legacy), 1)
+	// No TSO allocator underneath: only the write gate and the forwarded-write
+	// observer, which the gate wrapper satisfies unconditionally.
+	require.Len(t, internalTimestampOptions(legacy), 2)
 }
 
 func TestInternalTimestampOptionsPreservesForwardObserverThroughStartupGate(t *testing.T) {
@@ -208,7 +214,7 @@ func TestInternalTimestampOptionsPreservesForwardObserverThroughStartupGate(t *t
 	observing := &mainForwardObservingCoordinator{ShardedCoordinator: inner}
 	gated := startupGatedCoordinator{inner: observing}
 	opts := internalTimestampOptions(gated)
-	require.Len(t, opts, 2)
+	require.Len(t, opts, 3)
 
 	txn := &mainForwardTxn{}
 	internal := adapter.NewInternalWithEngine(txn, &mainTSOEngine{state: raftengine.StateLeader}, nil, nil, opts...)
@@ -244,7 +250,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 
 	gated := startupGatedCoordinator{inner: coord, gate: &startupPublicKVGate{}}
 	opts := internalTimestampOptions(gated)
-	require.Len(t, opts, 2)
+	require.Len(t, opts, 3)
 
 	txn := &mainForwardTxn{}
 	internal := adapter.NewInternalWithEngine(txn, engine, nil, nil, opts...)

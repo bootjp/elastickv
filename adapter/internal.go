@@ -26,6 +26,14 @@ func WithKVForwardRejected() InternalOption {
 	}
 }
 
+// WithInternalWriteGate re-applies the coordinator's route-floor check to
+// writes that were forwarded here from a follower.
+func WithInternalWriteGate(gate kv.MutationWriteGate) InternalOption {
+	return func(i *Internal) {
+		i.writeGate = gate
+	}
+}
+
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
 	return func(i *Internal) {
 		i.tsAllocator = alloc
@@ -62,6 +70,7 @@ type Internal struct {
 	clock              *kv.HLC
 	tsAllocator        kv.TimestampAllocator
 	relay              *RedisPubSubRelay
+	writeGate          kv.MutationWriteGate
 	// kvForwardRejected marks a runtime whose state machine cannot apply KV
 	// entries -- the dedicated TSO group. See WithKVForwardRejected.
 	kvForwardRejected    bool
@@ -254,20 +263,39 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 			// Somebody else already stamped this write. It is the timestamp the
 			// value will be persisted under, and this receiver is downstream of
 			// the coordinator that would otherwise have validated it, so check
-			// it here rather than taking it on trust.
+			// it here rather than taking it on trust. The route-floor check
+			// below still runs: validation says the timestamp is allocatable,
+			// not that the route still accepts a write at it.
 			if err := kv.ValidateDurablePersistenceTimestamp(
 				ctx, i.tsAllocator, r.Ts, "stampRawTimestamps: forwarded raw ts"); err != nil {
 				return errors.WithStack(err)
 			}
-			continue
+		} else {
+			ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
+			if err != nil {
+				return err
+			}
+			r.Ts = ts
 		}
-		ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
-		if err != nil {
+		// The follower that forwarded this write could not run the route-floor
+		// check: its own stamping path bails out when the group engine is not
+		// leader, so the timestamp only exists once we assign it here. Without
+		// this the write would reach Raft through the bare TransactionManager
+		// below with no MinWriteTSExclusive check at all. Already-stamped
+		// requests are re-checked too, because the floor may have advanced
+		// since the sender stamped them.
+		if err := i.ensureRawWriteAllowed(r); err != nil {
 			return err
 		}
-		r.Ts = ts
 	}
 	return nil
+}
+
+func (i *Internal) ensureRawWriteAllowed(r *pb.Request) error {
+	if i.writeGate == nil || r == nil {
+		return nil
+	}
+	return errors.WithStack(i.writeGate.EnsureMutationsWriteAllowed(r.Mutations, r.Ts))
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {
@@ -296,7 +324,48 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 		}
 	}
 
-	return i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	commitTS, err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	if err != nil {
+		return 0, err
+	}
+	if err := i.ensureTxnWritesAllowed(reqs, commitTS); err != nil {
+		return 0, err
+	}
+	return commitTS, nil
+}
+
+func (i *Internal) ensureTxnWritesAllowed(reqs []*pb.Request, commitTS uint64) error {
+	if i.writeGate == nil || commitTS == 0 {
+		return nil
+	}
+	for _, r := range reqs {
+		if r == nil || !r.IsTxn {
+			continue
+		}
+		if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE {
+			continue
+		}
+		muts := forwardedTxnUserMutations(r.Mutations)
+		if len(muts) == 0 {
+			continue
+		}
+		if err := i.writeGate.EnsureMutationsWriteAllowed(muts, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func forwardedTxnUserMutations(muts []*pb.Mutation) []*pb.Mutation {
+	out := make([]*pb.Mutation, 0, len(muts))
+	metaPrefix := []byte(kv.TxnMetaPrefix)
+	for _, mut := range muts {
+		if mut == nil || bytes.HasPrefix(mut.Key, metaPrefix) {
+			continue
+		}
+		out = append(out, mut)
+	}
+	return out
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {

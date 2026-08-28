@@ -105,6 +105,12 @@ type Snapshot interface {
 	io.Closer
 }
 
+// VersionPresenceReader reports whether a key has any committed version at or
+// before a read timestamp, including tombstones and expired values.
+type VersionPresenceReader interface {
+	VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error)
+}
+
 // MVCCStore extends Store with multi-version concurrency control helpers.
 // The interface is timestamp-explicit; callers must supply the snapshot or
 // commit timestamp for every operation.

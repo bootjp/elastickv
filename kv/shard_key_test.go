@@ -55,6 +55,102 @@ func TestRouteKey_NormalizesRedisTxnWideFenceKeys(t *testing.T) {
 	}
 }
 
+func TestRouteKey_NormalizesRedisWideColumnKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		store.HashMetaDeltaKey(userKey, 10, 0),
+		store.HashMetaKey(userKey),
+		store.HashFieldKey(userKey, []byte("field")),
+		store.SetMetaDeltaKey(userKey, 11, 0),
+		store.SetMetaKey(userKey),
+		store.SetMemberKey(userKey, []byte("member")),
+		store.ZSetMetaDeltaKey(userKey, 12, 0),
+		store.ZSetMetaKey(userKey),
+		store.ZSetMemberKey(userKey, []byte("member")),
+		store.ZSetScoreKey(userKey, 1.5, []byte("member")),
+	} {
+		require.Equal(t, userKey, routeKey(raw))
+		require.Equal(t, userKey, routeKey(txnLockKey(raw)))
+	}
+}
+
+func TestRouteFilterKey_NormalizesRedisAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	for _, raw := range [][]byte{
+		store.ListMetaDeltaKey(userKey, 10, 0),
+		store.ListClaimKey(userKey, 1),
+		store.StreamMetaKey(userKey),
+		store.StreamEntryKey(userKey, 123, 4),
+	} {
+		require.Equal(t, userKey, routeFilterKey(raw))
+		require.Equal(t, userKey, routeFilterKey(txnLockKey(raw)))
+	}
+}
+
+func TestRedisWideColumnScanRouteRangeFansOutBareFamilyAndCursor(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte(store.HashFieldPrefix)
+	familyEnd := prefixScanEnd(prefix)
+	start := store.HashFieldScanPrefix([]byte("alice"))
+	cursor := append(append([]byte(nil), start...), []byte("field\x00")...)
+
+	for _, tc := range []struct {
+		name  string
+		start []byte
+	}{
+		{name: "bare family", start: prefix},
+		{name: "physical cursor", start: cursor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(tc.start, familyEnd)
+			require.True(t, ok)
+			require.False(t, exact)
+			require.Nil(t, routeStart)
+			require.Nil(t, routeEnd)
+		})
+	}
+
+	routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(start, prefixScanEnd(start))
+	require.True(t, ok)
+	require.True(t, exact)
+	require.Equal(t, []byte("alice"), routeStart)
+	require.Nil(t, routeEnd)
+}
+
+func TestListAuxiliaryScanRouteRangeFansOutBareFamilyAndCursor(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte(store.ListMetaDeltaPrefix)
+	familyEnd := prefixScanEnd(prefix)
+	userPrefix := store.ListMetaDeltaScanPrefix([]byte("alice"))
+	cursor := store.ListMetaDeltaKey([]byte("alice"), 10, 0)
+
+	for _, tc := range []struct {
+		name  string
+		start []byte
+	}{
+		{name: "bare family", start: prefix},
+		{name: "physical cursor", start: cursor},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeStart, exact, ok := listAuxiliaryScanRouteRange(tc.start, familyEnd)
+			require.True(t, ok)
+			require.False(t, exact)
+			require.Nil(t, routeStart)
+		})
+	}
+
+	routeStart, exact, ok := listAuxiliaryScanRouteRange(userPrefix, prefixScanEnd(userPrefix))
+	require.True(t, ok)
+	require.True(t, exact)
+	require.Equal(t, []byte("alice"), routeStart)
+}
+
 func TestRouteKey_NormalizesRedisInternalEmptyUserKey(t *testing.T) {
 	t.Parallel()
 
@@ -68,7 +164,7 @@ func TestRouteKey_NormalizesRedisInternalEmptyUserKey(t *testing.T) {
 	}
 }
 
-func TestRouteKey_NormalizesRedisListDeltaAndClaimKeys(t *testing.T) {
+func TestRouteKey_NormalizesRedisListAndStreamAuxiliaryKeys(t *testing.T) {
 	t.Parallel()
 
 	for _, userKey := range [][]byte{
@@ -82,8 +178,11 @@ func TestRouteKey_NormalizesRedisListDeltaAndClaimKeys(t *testing.T) {
 				store.ListMetaDeltaScanPrefix(userKey),
 				store.ListClaimKey(userKey, 3),
 				store.ListClaimScanPrefix(userKey),
+				store.StreamMetaKey(userKey),
+				store.StreamEntryKey(userKey, 123, 4),
 			} {
 				require.Equal(t, userKey, routeKey(raw))
+				require.Equal(t, userKey, routeKey(txnLockKey(raw)))
 			}
 		})
 	}
@@ -140,4 +239,66 @@ func TestRouteKey_CollapsesDynamoGenerationsToSameTableRoute(t *testing.T) {
 	require.Equal(t, want, routeKey(currentGSIKey))
 	require.Equal(t, want, routeKey(sourceGSIKey),
 		"migration source generation GSI key must route to the same table group as the current generation")
+}
+
+// normalizeRouteKey places stream writes on the logical user-key route. Scans
+// must be projected the same way: if XRANGE/XREAD/XTRIM keep resolving through
+// the raw !stream|entry| prefix, a split that separates the raw prefix from the
+// user key sends the scan to a different group than the XADD that wrote the
+// entries, and the reader silently sees an empty stream.
+func TestStreamScanRouteRangeResolvesThroughUserKey(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("alice")
+	for _, tc := range []struct {
+		name  string
+		start []byte
+	}{
+		{name: "entries", start: store.StreamEntryScanPrefix(userKey)},
+		{name: "meta", start: store.StreamMetaKey(userKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(tc.start, prefixScanEnd(tc.start))
+			require.True(t, ok, "stream scans must be recognized as encoded user-key scans")
+			require.True(t, exact)
+			require.Equal(t, userKey, routeStart)
+			require.Nil(t, routeEnd)
+		})
+	}
+}
+
+// A scan over the bare stream family has no single user key to project onto, so
+// it must fan out to every route rather than silently resolving to one.
+func TestStreamScanRouteRangeFansOutBareFamily(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte(store.StreamEntryPrefix)
+	routeStart, routeEnd, exact, ok := redisWideColumnScanRouteRange(prefix, prefixScanEnd(prefix))
+	require.True(t, ok)
+	require.False(t, exact)
+	require.Nil(t, routeStart)
+	require.Nil(t, routeEnd)
+}
+
+// Stream scans are routed like wide-column scans but must not be dragged
+// through the wide-column canonicalization path: they have no legacy physical
+// form, so the point reads it performs would be pure overhead.
+func TestStreamScansAreNotWideColumnCanonicalizable(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("alice")
+	for _, start := range [][]byte{
+		store.StreamEntryScanPrefix(userKey),
+		store.StreamMetaKey(userKey),
+		[]byte(store.StreamEntryPrefix),
+	} {
+		require.False(t, redisWideColumnCanonicalizableScan(start))
+	}
+	for _, start := range [][]byte{
+		store.HashFieldScanPrefix(userKey),
+		store.ZSetScoreScanPrefix(userKey),
+		[]byte(store.HashFieldPrefix),
+	} {
+		require.True(t, redisWideColumnCanonicalizableScan(start))
+	}
 }

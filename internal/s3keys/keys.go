@@ -413,6 +413,34 @@ func ExtractRouteKey(key []byte) []byte {
 	return out
 }
 
+// BucketScopedRoutePrefix projects a bucket-scoped raw family prefix -- the
+// shape bucketScopedPrefix builds, family bytes followed by the bucket segment
+// and the generation u64 -- onto the object route prefix every key underneath it
+// routes through.
+//
+// It reports false unless the prefix ends exactly at the generation. A shorter
+// prefix can still span more than one bucket or generation, so it has no single
+// route range to project onto, and a longer one reaches into the object segment
+// this function does not parse.
+func BucketScopedRoutePrefix(prefix []byte) ([]byte, bool) {
+	family := objectScopedPrefix(prefix)
+	if family == nil {
+		return nil, false
+	}
+	offset := len(family)
+	bucketEnd, ok := segmentEnd(prefix, offset)
+	if !ok {
+		return nil, false
+	}
+	if _, next, okU64 := readU64(prefix, bucketEnd); !okU64 || next != len(prefix) {
+		return nil, false
+	}
+	out := make([]byte, 0, len(routePrefixBytes)+len(prefix)-len(family))
+	out = append(out, routePrefixBytes...)
+	out = append(out, prefix[len(family):]...)
+	return out, true
+}
+
 func ManifestScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {
 	routeStart, ok := manifestScanBound(start)
 	if !ok {

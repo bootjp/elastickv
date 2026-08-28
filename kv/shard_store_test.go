@@ -1,9 +1,12 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -86,24 +89,60 @@ func TestShardStoreScanAt_IncludesListKeysAcrossShards(t *testing.T) {
 	require.Equal(t, itemKey, kvs[0].Key)
 }
 
-func TestShardStoreReadFenceGroupKeysForRangeIncludesIntersectingRoutes(t *testing.T) {
+// SplitRange normalizes every boundary through kv.RouteKey before storing it
+// (adapter/distribution_server.go), so a boundary governing a Redis wide-column
+// family is always a decoded user key -- never a raw !hs|fld|-prefixed byte
+// string. The fence must therefore cover the group owning the logical user key,
+// plus the legacy raw-prefix group when rows may still be routed that way
+// (redisWideColumnLegacyScanRouteRange contributes that second query).
+//
+// The earlier form of this test split at prefix+'m', a raw-prefixed boundary
+// SplitRange cannot produce, and asserted a raw range intersection. That
+// comparison puts raw storage bytes against decoded user-key boundaries and
+// selects the wrong owning route, so it did not describe a reachable state.
+func TestShardStoreReadFenceGroupKeysForRangeCoversOwningAndLegacyGroups(t *testing.T) {
 	t.Parallel()
 
-	userKey := []byte("hash:fence-routes")
-	prefix := store.HashFieldScanPrefix(userKey)
-	split := append(append([]byte(nil), prefix...), 'm')
+	for _, tc := range []struct {
+		name       string
+		userKey    string
+		wantOwner  uint64
+		wantGroups []uint64
+	}{
+		// "alpha" sorts below the boundary, so the owning group and the legacy
+		// raw-prefix group are the same one and collapse to a single fence key.
+		{name: "owner below boundary", userKey: "alpha", wantOwner: 1, wantGroups: []uint64{1}},
+		// "zebra" sorts above it while the raw !hs|fld| prefix sorts below, so
+		// the two queries land on different groups and both must be fenced.
+		{name: "owner above boundary", userKey: "zebra", wantOwner: 2, wantGroups: []uint64{2, 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	engine := distribution.NewEngine()
-	engine.UpdateRoute([]byte(""), split, 1)
-	engine.UpdateRoute(split, nil, 2)
-	st := NewShardStore(engine, map[uint64]*ShardGroup{
-		1: {},
-		2: {},
-	})
+			prefix := store.HashFieldScanPrefix([]byte(tc.userKey))
+			engine := distribution.NewEngine()
+			engine.UpdateRoute([]byte(""), []byte("m"), 1)
+			engine.UpdateRoute([]byte("m"), nil, 2)
+			st := NewShardStore(engine, map[uint64]*ShardGroup{
+				1: {},
+				2: {},
+			})
 
-	got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+			routes, _ := st.routesForForwardScan(prefix, store.PrefixScanEnd(prefix))
+			gotGroups := make([]uint64, 0, len(routes))
+			for _, route := range routes {
+				gotGroups = append(gotGroups, route.GroupID)
+			}
+			require.Equal(t, tc.wantGroups, gotGroups)
+			require.Equal(t, tc.wantOwner, routes[0].GroupID,
+				"the logical user key's owner must be resolved first")
 
-	require.Equal(t, [][]byte{prefix, split}, got)
+			got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+			require.Len(t, got, len(tc.wantGroups))
+			require.Contains(t, got, prefix,
+				"the queried prefix must be fenced so groupForKey re-derives the owner")
+		})
+	}
 }
 
 func TestShardStoreReadFenceGroupKeysForListRangeUsesStorageRepresentative(t *testing.T) {
@@ -164,18 +203,74 @@ func TestShardStoreScanAt_RoutesListItemScansByUserKey(t *testing.T) {
 	require.Equal(t, k2, kvs[2].Key)
 }
 
-func TestShardStoreLocalStoresUsesStableGroupOrder(t *testing.T) {
+func TestShardStoreScanAtWithReadFence_RoutesListAuxiliaryScansByUserKey(t *testing.T) {
 	t.Parallel()
 
-	first := store.NewMVCCStore()
-	second := store.NewMVCCStore()
-	shards := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
-		20: {Store: second},
-		10: {Store: first},
-		30: nil,
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
 	})
+	shardStore := NewShardStore(engine, groups)
+	userKey := []byte("x")
+	deltaKey := store.ListMetaDeltaKey(userKey, 10, 0)
+	claimKey := store.ListClaimKey(userKey, 1)
+	require.NoError(t, groups[2].Store.PutAt(ctx, deltaKey, []byte("delta"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, claimKey, []byte("claim"), 11, 0))
 
-	require.Equal(t, []store.MVCCStore{first, second}, shards.LocalStores())
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+		key    []byte
+	}{
+		{name: "delta", prefix: store.ListMetaDeltaScanPrefix(userKey), key: deltaKey},
+		{name: "claim", prefix: store.ListClaimScanPrefix(userKey), key: claimKey},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kvs, err := shardStore.ScanAtWithReadFence(
+				ctx, tc.prefix, prefixScanEnd(tc.prefix), 10, ^uint64(0), false, 0, engine.Version(), nil, nil,
+			)
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.key, kvs[0].Key)
+		})
+	}
+}
+
+func TestShardStoreScanAt_RoutesBareListAuxiliaryScansAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	left := store.ListMetaDeltaKey([]byte("anna"), 10, 0)
+	right := store.ListMetaDeltaKey([]byte("zoey"), 11, 0)
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, right, []byte("right"), 11, 0))
+
+	prefix := []byte(store.ListMetaDeltaPrefix)
+	kvs, err := st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, [][]byte{left, right}, [][]byte{kvs[0].Key, kvs[1].Key})
 }
 
 func TestShardStoreScanGroupAt_UsesExplicitGroup(t *testing.T) {
@@ -221,6 +316,636 @@ func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
 
 	_, err = st.GetAt(ctx, key, 7)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStoreWritePathsRejectRouteWriteTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte(""),
+				End:                 nil,
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 10,
+			},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	require.ErrorIs(t, st.PutAt(ctx, []byte("put-stale"), []byte("v"), 10, 0), store.ErrWriteConflict)
+	require.NoError(t, st.PutAt(ctx, []byte("put-fresh"), []byte("v"), 11, 0))
+
+	require.ErrorIs(t, st.DeleteAt(ctx, []byte("delete-stale"), 10), store.ErrWriteConflict)
+	require.NoError(t, st.DeleteAt(ctx, []byte("delete-fresh"), 11))
+
+	require.ErrorIs(t, st.PutWithTTLAt(ctx, []byte("ttl-stale"), []byte("v"), 10, 99), store.ErrWriteConflict)
+	require.NoError(t, st.PutWithTTLAt(ctx, []byte("ttl-fresh"), []byte("v"), 11, 99))
+
+	require.ErrorIs(t, st.ExpireAt(ctx, []byte("expire-stale"), 99, 10), store.ErrWriteConflict)
+	require.NoError(t, st.PutAt(ctx, []byte("expire-fresh"), []byte("v"), 11, 0))
+	require.NoError(t, st.ExpireAt(ctx, []byte("expire-fresh"), 99, 12))
+
+	require.ErrorIs(t, st.ApplyMutations(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("apply-stale"), Value: []byte("v")},
+	}, nil, 0, 10), store.ErrWriteConflict)
+	require.NoError(t, st.ApplyMutations(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("apply-fresh"), Value: []byte("v")},
+	}, nil, 0, 11))
+
+	require.ErrorIs(t, st.ApplyMutationsRaft(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("raft-stale"), Value: []byte("v")},
+	}, nil, 0, 10), store.ErrWriteConflict)
+	require.NoError(t, st.ApplyMutationsRaft(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("raft-fresh"), Value: []byte("v")},
+	}, nil, 0, 11))
+
+	require.ErrorIs(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("raft-at-stale"), Value: []byte("v")},
+	}, nil, 0, 10, 1), store.ErrWriteConflict)
+	require.NoError(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("raft-at-fresh"), Value: []byte("v")},
+	}, nil, 0, 11, 2))
+
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, []byte("prefix-stale"), nil, 10), store.ErrWriteConflict)
+	require.NoError(t, st.DeletePrefixAt(ctx, []byte("prefix-fresh"), nil, 11))
+
+	require.ErrorIs(t, st.DeletePrefixAtRaft(ctx, []byte("raft-prefix-stale"), nil, 10), store.ErrWriteConflict)
+	require.NoError(t, st.DeletePrefixAtRaft(ctx, []byte("raft-prefix-fresh"), nil, 11))
+
+	require.ErrorIs(t, st.DeletePrefixAtRaftAt(ctx, []byte("raft-at-prefix-stale"), nil, 10, 3), store.ErrWriteConflict)
+	require.NoError(t, st.DeletePrefixAtRaftAt(ctx, []byte("raft-at-prefix-fresh"), nil, 11, 4))
+}
+
+func TestShardStoreDeletePrefixChecksRedisLogicalRouteFloors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, []byte(store.HashFieldPrefix), nil, 100), store.ErrWriteConflict)
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, []byte("!lst|"), nil, 100), store.ErrWriteConflict)
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, []byte("!redis|hash|"), nil, 100), store.ErrWriteConflict)
+	require.NoError(t, st.DeletePrefixAt(ctx, store.HashFieldScanPrefix([]byte("alpha")), nil, 100))
+	require.ErrorIs(t, st.DeletePrefixAt(ctx, store.HashFieldScanPrefix([]byte("zulu")), nil, 100), store.ErrWriteConflict)
+	require.NoError(t, st.DeletePrefixAt(ctx, store.HashFieldScanPrefix([]byte("zulu")), nil, 101))
+}
+
+func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
+	t.Parallel()
+
+	fake := &fakeRawKVServer{
+		getResp: &pb.RawGetResponse{
+			Exists: true,
+			Value:  []byte("remote-v"),
+		},
+		scanResp: &pb.RawScanAtResponse{},
+		latestResp: &pb.RawLatestCommitTSResponse{
+			Ts:     42,
+			Exists: true,
+		},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 100,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {
+			Store:  store.NewMVCCStore(),
+			Engine: &stubFollowerEngine{leaderAddr: addr},
+		},
+	})
+	t.Cleanup(func() { _ = st.Close() })
+
+	ctx := context.Background()
+	_, err := st.GetAt(ctx, []byte("k"), 10)
+	require.NoError(t, err)
+	_, _, err = st.LatestCommitTS(ctx, []byte("k"))
+	require.NoError(t, err)
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 79, []byte("a"), []byte("m"))
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(100), fake.lastGetReq.GetReadRouteVersion())
+	require.Equal(t, uint64(100), fake.lastLatestReq.GetReadRouteVersion())
+	require.Equal(t, uint64(1), fake.lastLatestReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, []byte("a"), fake.lastScanReq.GetRouteStart())
+	require.Equal(t, []byte("m"), fake.lastScanReq.GetRouteEnd())
+	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 11)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
+	fake.mu.Unlock()
+
+	_, err = st.ScanKeysAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, 0, 82)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
+	require.True(t, fake.lastScanReq.GetKeysOnly())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 80, []byte{}, []byte{})
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
+	require.True(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 11, false, 0, 81, nil, nil)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
+	require.False(t, fake.lastScanReq.GetRouteBoundsPresent())
+	fake.mu.Unlock()
+
+	_, err = st.ScanAt(ctx, []byte(""), nil, 10, 11)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, uint64(1), fake.lastScanReq.GetGroupId())
+	require.Equal(t, uint64(100), fake.lastScanReq.GetReadRouteVersion())
+}
+
+func TestShardStoreRoutesForScanUsesWideColumnUserKey(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	st := NewShardStore(engine, nil)
+	userKey := []byte("z-user")
+
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+	}{
+		{name: "hash fields", prefix: store.HashFieldScanPrefix(userKey)},
+		{name: "hash deltas", prefix: store.HashMetaDeltaScanPrefix(userKey)},
+		{name: "set members", prefix: store.SetMemberScanPrefix(userKey)},
+		{name: "set deltas", prefix: store.SetMetaDeltaScanPrefix(userKey)},
+		{name: "zset members", prefix: store.ZSetMemberScanPrefix(userKey)},
+		{name: "zset scores", prefix: store.ZSetScoreScanPrefix(userKey)},
+		{name: "zset deltas", prefix: store.ZSetMetaDeltaScanPrefix(userKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			routes, clamp := st.routesForScan(tc.prefix, prefixScanEnd(tc.prefix))
+			require.False(t, clamp)
+			require.Len(t, routes, 2)
+			require.Equal(t, uint64(2), routes[0].GroupID)
+			require.Equal(t, uint64(1), routes[1].GroupID)
+		})
+	}
+}
+
+func TestShardStoreScanAtRoutesWideColumnPrefixesByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	userKey := []byte("z-user")
+
+	for _, tc := range []struct {
+		name   string
+		key    []byte
+		prefix []byte
+	}{
+		{name: "hash field", key: store.HashFieldKey(userKey, []byte("field")), prefix: store.HashFieldScanPrefix(userKey)},
+		{name: "hash delta", key: store.HashMetaDeltaKey(userKey, 10, 1), prefix: store.HashMetaDeltaScanPrefix(userKey)},
+		{name: "set member", key: store.SetMemberKey(userKey, []byte("member")), prefix: store.SetMemberScanPrefix(userKey)},
+		{name: "set delta", key: store.SetMetaDeltaKey(userKey, 11, 1), prefix: store.SetMetaDeltaScanPrefix(userKey)},
+		{name: "zset member", key: store.ZSetMemberKey(userKey, []byte("member")), prefix: store.ZSetMemberScanPrefix(userKey)},
+		{name: "zset score", key: store.ZSetScoreKey(userKey, 1.5, []byte("member")), prefix: store.ZSetScoreScanPrefix(userKey)},
+		{name: "zset delta", key: store.ZSetMetaDeltaKey(userKey, 12, 1), prefix: store.ZSetMetaDeltaScanPrefix(userKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, st.PutAt(ctx, tc.key, []byte("value"), 20, 0))
+			kvs, err := st.ScanAt(ctx, tc.prefix, prefixScanEnd(tc.prefix), 10, 20)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{{Key: tc.key, Value: []byte("value")}}, kvs)
+			_, err = groups[1].Store.GetAt(ctx, tc.key, 20)
+			require.ErrorIs(t, err, store.ErrKeyNotFound)
+		})
+	}
+}
+
+func TestShardStoreReadFenceFailsClosedWhileCatalogVersionIsBehind(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groupStore := store.NewMVCCStore()
+	require.NoError(t, groupStore.PutAt(context.Background(), []byte("k"), []byte("stale"), 1, 0))
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: groupStore}})
+
+	tests := []struct {
+		name string
+		read func(context.Context) error
+	}{
+		{
+			name: "point read",
+			read: func(ctx context.Context) error {
+				_, err := st.GetAtWithReadFence(ctx, []byte("k"), 1, 0, 2)
+				return err
+			},
+		},
+		{
+			name: "latest commit timestamp",
+			read: func(ctx context.Context) error {
+				_, _, err := st.LatestCommitTSWithReadFence(ctx, []byte("k"), 2)
+				return err
+			},
+		},
+		{
+			name: "range scan",
+			read: func(ctx context.Context) error {
+				_, err := st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 1, 1, false, 0, 2, nil, nil)
+				return err
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+			defer cancel()
+			err := tc.read(ctx)
+			require.ErrorIs(t, err, ErrReadRouteVersionUnavailable)
+		})
+	}
+}
+
+func TestShardStoreReadFenceWaitsForCatalogAndReroutesPointRead(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	require.NoError(t, groups[1].Store.PutAt(context.Background(), []byte("k"), []byte("old-owner"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(context.Background(), []byte("k"), []byte("new-owner"), 1, 0))
+	st := NewShardStore(engine, groups)
+
+	applyErr := make(chan error, 1)
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		applyErr <- engine.ApplySnapshot(distribution.CatalogSnapshot{
+			Version: 2,
+			Routes: []distribution.RouteDescriptor{
+				{RouteID: 1, Start: []byte(""), GroupID: 2, State: distribution.RouteStateActive},
+			},
+		})
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	value, err := st.GetAtWithReadFence(ctx, []byte("k"), 1, 0, 2)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new-owner"), value)
+	require.NoError(t, <-applyErr)
+}
+
+func TestShardStoreScanAtWithReadFence_RoutesUsingSuppliedBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	first := []byte("!redis|meta|x")
+	second := []byte("!redis|meta|y")
+	require.NoError(t, groups[2].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, false, 0, st.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, first, kvs[0].Key)
+	require.Equal(t, second, kvs[1].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, true, 0, st.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, second, kvs[0].Key)
+	require.Equal(t, first, kvs[1].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_ScansSameGroupSuppliedBoundsAcrossRouteIntervals(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	first := []byte("!redis|meta|a")
+	second := []byte("!redis|meta|z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, first, []byte("v1"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, second, []byte("v2"), 2, 0))
+
+	for _, tc := range []struct {
+		name       string
+		reverse    bool
+		routeStart []byte
+		routeEnd   []byte
+		want       [][]byte
+	}{
+		{
+			name:       "left interval only",
+			routeStart: []byte("a"),
+			routeEnd:   []byte("z"),
+			want:       [][]byte{first},
+		},
+		{
+			name:       "forward across intervals",
+			routeStart: []byte("a"),
+			want:       [][]byte{first, second},
+		},
+		{
+			name:       "reverse across intervals",
+			reverse:    true,
+			routeStart: []byte("a"),
+			want:       [][]byte{second, first},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 2, tc.reverse, 0, st.ReadRouteVersion(), tc.routeStart, tc.routeEnd)
+			require.NoError(t, err)
+			require.Len(t, kvs, len(tc.want))
+			for i, want := range tc.want {
+				require.Equal(t, want, kvs[i].Key)
+			}
+		})
+	}
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersWideRedisKeysByUserKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!hs|")
+	left := store.HashFieldKey([]byte("alpha"), []byte("f"))
+	right := store.HashFieldKey([]byte("zulu"), []byte("f"))
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, false, 0, st.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 0, st.ReadRouteVersion(), []byte{}, []byte("m"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, left, kvs[0].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersSuppliedBoundsByRouteKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|a")
+	right := []byte("!redis|meta|z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, false, 0, st.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 0, st.ReadRouteVersion(), []byte{}, []byte("m"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, left, kvs[0].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersRedisAuxiliaryBoundsByRouteKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() { _ = groups[1].Store.Close() })
+	st := NewShardStore(engine, groups)
+
+	for _, tc := range []struct {
+		name   string
+		prefix []byte
+		left   []byte
+		right  []byte
+	}{
+		{
+			name:   "list delta",
+			prefix: []byte(store.ListMetaDeltaPrefix),
+			left:   store.ListMetaDeltaKey([]byte("alpha"), 10, 0),
+			right:  store.ListMetaDeltaKey([]byte("zulu"), 11, 0),
+		},
+		{
+			name:   "list claim",
+			prefix: []byte(store.ListClaimPrefix),
+			left:   store.ListClaimKey([]byte("alpha"), 1),
+			right:  store.ListClaimKey([]byte("zulu"), 1),
+		},
+		{
+			name:   "stream meta",
+			prefix: []byte(store.StreamMetaPrefix),
+			left:   store.StreamMetaKey([]byte("alpha")),
+			right:  store.StreamMetaKey([]byte("zulu")),
+		},
+		{
+			name:   "stream entry",
+			prefix: []byte(store.StreamEntryPrefix),
+			left:   store.StreamEntryKey([]byte("alpha"), 1, 0),
+			right:  store.StreamEntryKey([]byte("zulu"), 1, 0),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, groups[1].Store.PutAt(ctx, tc.left, []byte("left"), 1, 0))
+			require.NoError(t, groups[1].Store.PutAt(ctx, tc.right, []byte("right"), 2, 0))
+
+			kvs, err := st.ScanAtWithReadFence(ctx, tc.prefix, prefixScanEnd(tc.prefix), 1, 2, false, 0, st.ReadRouteVersion(), []byte("m"), nil)
+			require.NoError(t, err)
+			require.Len(t, kvs, 1)
+			require.Equal(t, tc.right, kvs[0].Key)
+		})
+	}
+}
+
+func TestShardStoreScanAtWithReadFence_FiltersByEachRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), []byte("z"), 2)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|b")
+	staleRightOnLeftGroup := []byte("!redis|meta|x")
+	right := []byte("!redis|meta|y")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, staleRightOnLeftGroup, []byte("stale"), 2, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, right, []byte("right"), 3, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 10, 3, false, 0, st.ReadRouteVersion(), []byte("a"), []byte("z"))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, left, kvs[0].Key)
+	require.Equal(t, right, kvs[1].Key)
+}
+
+func TestShardStoreScanAtWithReadFence_ServesExplicitGroupReverse(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	rawPrefix := []byte("!redis|meta|")
+	left := []byte("!redis|meta|a")
+	right := []byte("!redis|meta|z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	// An unbounded explicit-group reverse scan is served through the fenced
+	// route path rather than rejected. Rejecting it here only pushed callers
+	// back onto the unfenced ReverseScanGroupAt shortcut in the gRPC server.
+	unbounded, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), nil, nil)
+	require.NoError(t, err)
+	require.Len(t, unbounded, 1)
+	require.Equal(t, right, unbounded[0].Key)
+
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, st.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), []byte("m"), nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+	require.Equal(t, []byte("right"), kvs[0].Value)
 }
 
 func TestShardStoreScanAt_IncludesS3ManifestKeysAcrossShards(t *testing.T) {
@@ -483,7 +1208,7 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T
 	require.NoError(t, g.Store.PutAt(ctx, txnCommitKey([]byte("primary"), 10), []byte("commit"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, []byte(""), nil, 1, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, []byte(""), nil, 1, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
@@ -498,7 +1223,7 @@ func TestShardStoreScanKeysRouteAtLeaderPreservesEmptyKey(t *testing.T) {
 	require.NoError(t, g.Store.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, nil, nil, 2, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, nil, nil, 2, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte(""), []byte("a")}, keys)
 }
@@ -587,7 +1312,7 @@ func TestShardStoreProxyForwardPageAdvancesFromRawPage(t *testing.T) {
 	}
 	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{42: g})
 
-	page, err := st.scanRouteAtForwardPage(ctx, distribution.Route{GroupID: 42}, g, []byte(""), nil, 2, ^uint64(0))
+	page, err := st.scanRouteAtForwardPage(ctx, distribution.Route{GroupID: 42}, g, []byte(""), nil, 2, ^uint64(0), 0, nil, nil)
 	require.NoError(t, err)
 	require.True(t, page.full)
 	require.Equal(t, internalKey, page.advanceKey)
@@ -938,6 +1663,345 @@ func TestShardStoreScanAt_RoutesS3ManifestScansByLogicalObjectKey(t *testing.T) 
 	require.Equal(t, k1, kvs[1].Key)
 }
 
+func TestShardStoreScanAt_RoutesRedisWideColumnPrefixAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("am"), 1)
+	engine.UpdateRoute([]byte("am"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	left := store.HashFieldKey([]byte("alice"), []byte("field"))
+	right := store.HashFieldKey([]byte("amy"), []byte("field"))
+	require.NoError(t, st.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	start := store.HashFieldScanPrefix([]byte("a"))
+	end := prefixScanEnd([]byte(store.HashFieldPrefix))
+	kvs, err := st.ScanAt(ctx, start, end, 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.ElementsMatch(t, [][]byte{left, right}, [][]byte{kvs[0].Key, kvs[1].Key})
+}
+
+func TestShardStoreScanAt_RoutesBareRedisWideColumnFamilyAcrossShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	left := store.HashFieldKey([]byte("anna"), []byte("field"))
+	right := store.HashFieldKey([]byte("zoey"), []byte("field"))
+	require.NoError(t, st.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	prefix := []byte(store.HashFieldPrefix)
+	kvs, err := st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, [][]byte{left, right}, [][]byte{kvs[0].Key, kvs[1].Key})
+}
+
+func TestShardStoreScanAt_RoutesRedisWideColumnCursorAcrossRemainingShards(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	left := store.HashFieldKey([]byte("anna"), []byte("field"))
+	right := store.HashFieldKey([]byte("zoey"), []byte("field"))
+	require.NoError(t, st.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, st.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	prefix := []byte(store.HashFieldPrefix)
+	kvs, err := st.ScanAt(ctx, nextScanCursor(left), prefixScanEnd(prefix), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, [][]byte{right}, [][]byte{kvs[0].Key})
+}
+
+func TestShardStoreScanAt_RoutesExactRedisWideColumnScanToOneShard(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("am"), 1)
+	engine.UpdateRoute([]byte("am"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	start := store.HashFieldScanPrefix([]byte("alice"))
+	routes, clamp, _ := st.routesForScanWithVersion(start, prefixScanEnd(start))
+	require.False(t, clamp)
+	require.Len(t, routes, 1)
+	require.Equal(t, uint64(1), routes[0].GroupID)
+}
+
+func TestShardStoreRoutesForWideColumnBoundedPatternIncludesLegacyRawRoute(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	start := store.HashFieldScanPrefix([]byte("m"))
+	routes, clamp, _ := st.routesForScanWithVersion(start, prefixScanEnd([]byte(store.HashFieldPrefix)))
+	require.False(t, clamp)
+	require.Len(t, routes, 2)
+	require.Equal(t, uint64(2), routes[0].GroupID)
+	require.Equal(t, uint64(1), routes[1].GroupID)
+}
+
+func TestShardStoreRedisWideColumnReadsLegacyRawRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	key := store.HashFieldKey([]byte("zulu"), []byte("field"))
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 5, 0))
+
+	value, err := st.GetAt(ctx, key, 5)
+	require.NoError(t, err)
+	require.Equal(t, []byte("legacy"), value)
+
+	ts, exists, err := st.LatestCommitTS(ctx, key)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(5), ts)
+
+	prefix := store.HashFieldScanPrefix([]byte("zulu"))
+	kvs, err := st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 5)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("legacy"), kvs[0].Value)
+
+	require.NoError(t, st.PutAt(ctx, key, []byte("current"), 6, 0))
+	value, err = st.GetAt(ctx, key, 6)
+	require.NoError(t, err)
+	require.Equal(t, []byte("current"), value)
+
+	ts, exists, err = st.LatestCommitTS(ctx, key)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(6), ts)
+
+	kvs, err = st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 6)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("current"), kvs[0].Value)
+
+	kvs, err = st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 6)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("current"), kvs[0].Value)
+
+	require.NoError(t, st.DeleteAt(ctx, key, 7))
+	_, err = st.GetAt(ctx, key, 7)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	kvs, err = st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 7)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	kvs, err = st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 7)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	require.NoError(t, st.PutAt(ctx, key, []byte("future"), 9, 0))
+	_, err = st.GetAt(ctx, key, 8)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	kvs, err = st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 8)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	value, err = st.GetAt(ctx, key, 9)
+	require.NoError(t, err)
+	require.Equal(t, []byte("future"), value)
+}
+
+func TestShardStoreRedisWideColumnScanRefillsAfterLogicalTombstones(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	userKey := []byte("zulu")
+	a := store.HashFieldKey(userKey, []byte("a"))
+	b := store.HashFieldKey(userKey, []byte("b"))
+	c := store.HashFieldKey(userKey, []byte("c"))
+	d := store.HashFieldKey(userKey, []byte("d"))
+	for _, item := range []struct {
+		key   []byte
+		value []byte
+	}{
+		{key: a, value: []byte("legacy-a")},
+		{key: b, value: []byte("legacy-b")},
+		{key: c, value: []byte("legacy-c")},
+		{key: d, value: []byte("legacy-d")},
+	} {
+		require.NoError(t, groups[1].Store.PutAt(ctx, item.key, item.value, 5, 0))
+	}
+	require.NoError(t, st.DeleteAt(ctx, a, 7))
+	require.NoError(t, st.DeleteAt(ctx, b, 7))
+
+	prefix := store.HashFieldScanPrefix(userKey)
+	kvs, err := st.ScanAt(ctx, prefix, prefixScanEnd(prefix), 2, 7)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, c, kvs[0].Key)
+	require.Equal(t, []byte("legacy-c"), kvs[0].Value)
+	require.Equal(t, d, kvs[1].Key)
+	require.Equal(t, []byte("legacy-d"), kvs[1].Value)
+
+	keys, err := st.ScanKeysAt(ctx, prefix, prefixScanEnd(prefix), 2, 7)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{c, d}, keys)
+}
+
+func TestShardStoreReverseRedisWideColumnScanRefillsAfterLogicalTombstones(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	userKey := []byte("zulu")
+	a := store.HashFieldKey(userKey, []byte("a"))
+	b := store.HashFieldKey(userKey, []byte("b"))
+	c := store.HashFieldKey(userKey, []byte("c"))
+	d := store.HashFieldKey(userKey, []byte("d"))
+	for _, item := range []struct {
+		key   []byte
+		value []byte
+	}{
+		{key: a, value: []byte("legacy-a")},
+		{key: b, value: []byte("legacy-b")},
+		{key: c, value: []byte("legacy-c")},
+		{key: d, value: []byte("legacy-d")},
+	} {
+		require.NoError(t, groups[1].Store.PutAt(ctx, item.key, item.value, 5, 0))
+	}
+	require.NoError(t, st.DeleteAt(ctx, d, 7))
+	require.NoError(t, st.DeleteAt(ctx, c, 7))
+
+	prefix := store.HashFieldScanPrefix(userKey)
+	kvs, err := st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 2, 7)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, b, kvs[0].Key)
+	require.Equal(t, []byte("legacy-b"), kvs[0].Value)
+	require.Equal(t, a, kvs[1].Key)
+	require.Equal(t, []byte("legacy-a"), kvs[1].Value)
+}
+
+func TestShardStoreReverseRedisWideColumnScanPrefersLogicalRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	key := store.HashFieldKey([]byte("zulu"), []byte("field"))
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 5, 0))
+	require.NoError(t, st.PutAt(ctx, key, []byte("current"), 6, 0))
+
+	prefix := store.HashFieldScanPrefix([]byte("zulu"))
+	kvs, err := st.ReverseScanAt(ctx, prefix, prefixScanEnd(prefix), 10, 6)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, []byte("current"), kvs[0].Value)
+}
+
 func TestShardStoreScanAt_RoutesFilesystemChunkScansByChunkRouteKey(t *testing.T) {
 	t.Parallel()
 
@@ -999,14 +2063,20 @@ func TestShardStoreResolveFilesystemHomeSlot(t *testing.T) {
 func TestShardStoreFilesystemGroupIDsReturnsPhysicalGroupsSorted(t *testing.T) {
 	t.Parallel()
 
-	// Real stores: FilesystemGroupIDs enumerates groups that can actually hold
-	// filesystem data, and store-less groups (the dedicated TSO group) are
-	// excluded. This case is about ordering.
-	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+	// Real physical groups own a store; FilesystemGroupIDs skips store-less
+	// ones (the dedicated TSO group is registered without one), so the
+	// placeholder groups this test used need stores to stay physical.
+	groups := map[uint64]*ShardGroup{
 		9: {Store: store.NewMVCCStore()},
 		2: {Store: store.NewMVCCStore()},
 		5: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		for _, g := range groups {
+			_ = g.Store.Close()
+		}
 	})
+	st := NewShardStore(distribution.NewEngine(), groups)
 	require.Equal(t, []uint64{2, 5, 9}, st.FilesystemGroupIDs())
 }
 
@@ -1677,6 +2747,19 @@ func TestScanLockBoundsForKVs_ReverseOrder(t *testing.T) {
 	require.Equal(t, nextScanCursor([]byte("c")), lockEnd)
 }
 
+func TestScanLockBoundsForKVsDirection_ReverseUsesReturnedWindow(t *testing.T) {
+	t.Parallel()
+
+	kvs := []*store.KVPair{
+		{Key: []byte("z"), Value: []byte("vz")},
+		{Key: []byte("y"), Value: []byte("vy")},
+	}
+
+	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, []byte("a"), []byte("zz"), 2, true)
+	require.Equal(t, []byte("y"), lockStart)
+	require.Equal(t, []byte("zz"), lockEnd)
+}
+
 func TestScanLockBoundsForKVs_PreservesOriginalStart(t *testing.T) {
 	t.Parallel()
 
@@ -1736,11 +2819,733 @@ func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testin
 	require.Equal(t, []byte("z"), lockEnd)
 }
 
-// The dedicated TSO group is registered in the ShardStore group map so leader
-// routing and lease renewal can reach it, but it opens no MVCC store. Every
-// scan against it returns ErrKeyNotFound, and the filesystem placement
-// collector treats that as a hard failure -- so it must not be enumerated as a
-// filesystem group at all.
+// Redis list-delta/claim and stream rows are placed by their raw key but are
+// treated as owned by the logical user key by route-bound scans and by
+// prefix-write floors. Point writes checked only the raw-key route, so a fenced
+// user key still accepted its auxiliary rows.
+func TestShardStorePointWriteChecksRedisAuxiliaryLogicalRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			// Raw "!..." keys sort below "m" and land on the unfenced route.
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			// The logical user key "zulu" lands on the fenced route.
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		_ = groups[1].Store.Close()
+		_ = groups[2].Store.Close()
+	})
+	st := NewShardStore(engine, groups)
+
+	fenced := []byte("zulu")
+	unfenced := []byte("alpha")
+
+	tests := []struct {
+		name       string
+		key        []byte
+		commitTS   uint64
+		wantReject bool
+	}{
+		{
+			name:       "list delta under a fenced user key",
+			key:        store.ListMetaDeltaKey(fenced, 10, 0),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "list claim under a fenced user key",
+			key:        store.ListClaimKey(fenced, 1),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "stream meta under a fenced user key",
+			key:        store.StreamMetaKey(fenced),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "stream entry under a fenced user key",
+			key:        store.StreamEntryKey(fenced, 123, 4),
+			commitTS:   100,
+			wantReject: true,
+		},
+		{
+			name:       "stream entry above the fenced floor is admitted",
+			key:        store.StreamEntryKey(fenced, 123, 5),
+			commitTS:   101,
+			wantReject: false,
+		},
+		{
+			name:       "auxiliary row under an unfenced user key is admitted",
+			key:        store.ListMetaDeltaKey(unfenced, 10, 0),
+			commitTS:   100,
+			wantReject: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := st.PutAt(ctx, tt.key, []byte("v"), tt.commitTS, 0)
+			if tt.wantReject {
+				require.ErrorIs(t, err, store.ErrWriteConflict)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
+// The coordinator's admission check must reject the same rows, so a fenced user
+// key's auxiliary writes never reach Raft in the first place.
+func TestShardedCoordinatorRejectsRedisAuxiliaryWriteUnderLogicalFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	c := &ShardedCoordinator{engine: engine}
+
+	fenced := store.StreamEntryKey([]byte("zulu"), 123, 4)
+	require.ErrorIs(t,
+		c.ensureMutationsWriteAllowed([]*pb.Mutation{{Op: pb.Op_PUT, Key: fenced, Value: []byte("v")}}, 100),
+		store.ErrWriteConflict)
+	require.NoError(t,
+		c.ensureMutationsWriteAllowed([]*pb.Mutation{{Op: pb.Op_PUT, Key: fenced, Value: []byte("v")}}, 101))
+}
+
+// A tombstone on the primary route must hide the legacy wide-column value even
+// when a newer version sits above the read timestamp. The remote fallback probe
+// used to compare only the newest commit timestamp, so latest > ts read as "not
+// visible here", the point read fell through to the legacy route, and the
+// snapshot read between the tombstone and the newer write resurrected the old
+// value.
+func TestShardStorePointReadStopsLegacyFallbackOnRemoteTombstone(t *testing.T) {
+	t.Parallel()
+
+	const readTS = uint64(100)
+
+	tests := []struct {
+		name             string
+		versionVisible   bool
+		versionSupported bool
+		wantLegacyValue  bool
+	}{
+		{
+			name:             "leader reports a version visible at the read ts",
+			versionVisible:   true,
+			versionSupported: true,
+			wantLegacyValue:  false,
+		},
+		{
+			name:             "leader reports no version at or before the read ts",
+			versionVisible:   false,
+			versionSupported: true,
+			wantLegacyValue:  true,
+		},
+		{
+			// Pre-upgrade peer: the probe is unanswered, so the caller stops
+			// legacy fallback rather than using the unsafe latest-commit
+			// heuristic.
+			name:             "peer predating the probe stops legacy fallback",
+			versionVisible:   false,
+			versionSupported: false,
+			wantLegacyValue:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			fake := &fakeRawKVServer{
+				getResp: &pb.RawGetResponse{Exists: false},
+				latestResp: &pb.RawLatestCommitTSResponse{
+					// Newer than readTS, which is what defeats the heuristic.
+					Ts:                      readTS + 100,
+					Exists:                  true,
+					VersionVisible:          tt.versionVisible,
+					VersionVisibleSupported: tt.versionSupported,
+				},
+			}
+			addr, stop := startRawKVServer(t, fake)
+			t.Cleanup(stop)
+
+			engine := distribution.NewEngine()
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 5,
+				Routes: []distribution.RouteDescriptor{
+					// Raw "!hs|fld|..." keys sort below "m" and stay on group 2.
+					{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+					// The logical user key "zulu" lives on group 1.
+					{RouteID: 2, Start: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+				},
+			}))
+
+			legacyStore := store.NewMVCCStore()
+			groups := map[uint64]*ShardGroup{
+				1: {Store: store.NewMVCCStore(), Engine: &stubFollowerEngine{leaderAddr: addr}},
+				2: {Store: legacyStore},
+			}
+			st := NewShardStore(engine, groups)
+			t.Cleanup(func() { _ = st.Close() })
+
+			ctx := context.Background()
+			fieldKey := store.HashFieldKey([]byte("zulu"), []byte("f"))
+			require.NoError(t, legacyStore.PutAt(ctx, fieldKey, []byte("legacy"), 1, 0))
+
+			got, err := st.GetAt(ctx, fieldKey, readTS)
+			if tt.wantLegacyValue {
+				require.NoError(t, err)
+				require.Equal(t, []byte("legacy"), got)
+				return
+			}
+			require.ErrorIs(t, err, store.ErrKeyNotFound)
+		})
+	}
+}
+
+// The server half: a group-scoped presence probe is answered from the group's
+// own store, and requests that do not ask leave both response fields unset.
+func TestShardStoreVersionExistsAtOrBeforeGroupWithReadFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: store.NewMVCCStore()}})
+	t.Cleanup(func() { _ = st.Close() })
+
+	key := []byte("k")
+	require.NoError(t, st.PutAt(ctx, key, []byte("v"), 50, 0))
+
+	visible, ok, err := st.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, 1, 100, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, visible)
+
+	visible, ok, err = st.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, 1, 10, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, visible)
+
+	// Unknown group: authoritative "no version" rather than an unanswered probe.
+	visible, ok, err = st.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, 99, 100, 0)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, visible)
+}
+
+// fenceGroupRouter is a Coordinator that only implements the group routing the
+// fence dedup path uses, resolving exactly the way production does: normalize
+// the key first, then look the route up.
+type fenceGroupRouter struct {
+	Coordinator
+	engine *distribution.Engine
+}
+
+func (f *fenceGroupRouter) EngineGroupIDForKey(key []byte) uint64 {
+	route, ok := f.engine.GetRoute(routeKey(key))
+	if !ok {
+		return 0
+	}
+	return route.GroupID
+}
+
+// The fence's representative keys are re-normalized by every downstream
+// consumer (LeaseReadGroupKeys -> EngineGroupIDForKey -> ResolveGroup ->
+// routeKey). For a Redis wide-column range the owner key and the legacy
+// raw-prefix key both normalize to the same user key, so resolving groups from
+// bytes collapses the two into one and leaves the legacy group unfenced. The
+// group id has to survive on the target instead.
+func TestReadFenceTargetsSurviveGroupDedup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {}, 2: {}})
+
+	prefix := store.HashFieldScanPrefix([]byte("zebra"))
+	targets := st.ReadFenceTargetsForRange(prefix, store.PrefixScanEnd(prefix))
+	require.Len(t, targets, 2, "owner group plus legacy raw-prefix group")
+
+	carried := make([]uint64, 0, len(targets))
+	reResolved := make([]uint64, 0, len(targets))
+	for _, target := range targets {
+		carried = append(carried, target.GroupID)
+		route, ok := engine.GetRoute(routeKey(target.Key))
+		require.True(t, ok)
+		reResolved = append(reResolved, route.GroupID)
+	}
+
+	require.ElementsMatch(t, []uint64{2, 1}, carried,
+		"the fence must name both groups")
+	// Re-deriving from bytes is exactly what loses the legacy group; asserting
+	// it here pins why GroupID is carried rather than recomputed.
+	require.Equal(t, []uint64{2, 2}, reResolved,
+		"both representative keys normalize to the owner, so bytes alone are lossy")
+}
+
+// LeaseReadGroupTargets must keep both groups, where the key-only
+// LeaseReadGroupKeys collapses them.
+func TestLeaseReadGroupTargetsKeepsLegacyGroup(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {}, 2: {}})
+	router := &fenceGroupRouter{engine: engine}
+
+	prefix := store.HashFieldScanPrefix([]byte("zebra"))
+	targets := st.ReadFenceTargetsForRange(prefix, store.PrefixScanEnd(prefix))
+
+	kept := LeaseReadGroupTargets(router, targets)
+	keptGroups := make([]uint64, 0, len(kept))
+	for _, target := range kept {
+		keptGroups = append(keptGroups, target.GroupID)
+	}
+	require.ElementsMatch(t, []uint64{2, 1}, keptGroups,
+		"both fenced groups must survive dedup")
+
+	collapsed := LeaseReadGroupKeys(router, st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix)))
+	require.Len(t, collapsed, 1,
+		"the key-only path collapses to one group; this is the gap targets close")
+}
+
+// syntheticGroupRouter mimics Coordinate: EngineGroupIDForKey returns a constant
+// that exists only to collapse single-group deployments to one lease. It is not
+// a real group id and no group map contains it.
+type syntheticGroupRouter struct {
+	Coordinator
+}
+
+func (syntheticGroupRouter) EngineGroupIDForKey([]byte) uint64 { return 1 }
+
+// A point key carries GroupID 0, meaning "resolve from Key". Dedup must not
+// stamp the resolved id onto it: on a single-group Coordinate that id is
+// synthetic, and a later group-routed lease read or leader check would look it
+// up in a group map that has never heard of it and fail closed with
+// ErrLeaderNotFound.
+func TestLeaseReadGroupTargetsKeepsKeyResolutionForPointKeys(t *testing.T) {
+	t.Parallel()
+
+	targets := []ReadFenceTarget{{Key: []byte("!redis|str|k")}}
+	got := LeaseReadGroupTargets(syntheticGroupRouter{}, targets)
+
+	require.Len(t, got, 1)
+	require.Zero(t, got[0].GroupID,
+		"a key-resolved target must stay key-resolved through dedup")
+	require.Equal(t, []byte("!redis|str|k"), got[0].Key)
+}
+
+// A DynamoDB DEL_PREFIX cleanup must be checked against the same route its rows
+// use. Rows route through !ddb|route|table|<table>; if the prefix keeps
+// resolving through the raw !ddb|item| interval, a table whose route carries a
+// migration write floor is skipped entirely and the cleanup installs tombstones
+// below already-migrated versions, leaving the deleted generation's rows behind.
+func TestEnsurePrefixWriteAllowedRoutesDynamoPrefixThroughTableRoute(t *testing.T) {
+	t.Parallel()
+
+	const (
+		fencedTable = "orders"
+		freeTable   = "carts"
+	)
+	tableRoute := func(name string) []byte {
+		return dynamoRouteKey([]byte(DynamoItemPrefix + name + "|1|pk"))
+	}
+	fencedRoute := tableRoute(fencedTable)
+	require.NotNil(t, fencedRoute)
+
+	engine := distribution.NewEngine()
+	// Route 1 owns the raw !ddb|item| interval and carries no floor. Route 2
+	// owns the fenced table's logical route key and does.
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: fencedRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: fencedRoute, End: nil, GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	itemPrefix := []byte(DynamoItemPrefix + fencedTable + "|1|")
+	require.ErrorIs(t,
+		st.ensurePrefixWriteAllowed(itemPrefix, 50),
+		store.ErrWriteConflict,
+		"a cleanup at or below the table route's floor must be rejected",
+	)
+	require.NoError(t, st.ensurePrefixWriteAllowed(itemPrefix, 101))
+
+	gsiPrefix := []byte(DynamoGSIPrefix + fencedTable + "|1|")
+	require.ErrorIs(t, st.ensurePrefixWriteAllowed(gsiPrefix, 50), store.ErrWriteConflict)
+
+	// A table whose logical route has no floor is unaffected.
+	require.NotNil(t, tableRoute(freeTable))
+	require.NoError(t, st.ensurePrefixWriteAllowed([]byte(DynamoItemPrefix+freeTable+"|1|"), 50))
+}
+
+// A prefix that stops before the table terminator can still match several
+// tables, so it must keep fanning out rather than collapsing onto one route.
+func TestEnsurePrefixWriteAllowedFansOutPartialDynamoPrefixes(t *testing.T) {
+	t.Parallel()
+
+	fencedRoute := dynamoRouteKey([]byte(DynamoItemPrefix + "orders|1|pk"))
+	require.NotNil(t, fencedRoute)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: fencedRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: fencedRoute, End: nil, GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	for _, prefix := range [][]byte{
+		[]byte(DynamoItemPrefix),
+		[]byte(DynamoItemPrefix + "order"),
+		[]byte("!ddb|"),
+	} {
+		require.ErrorIs(t, st.ensurePrefixWriteAllowed(prefix, 50), store.ErrWriteConflict,
+			"prefix %q spans the fenced table and must still see its floor", prefix)
+	}
+}
+
+// bucketDeleteSafetyNetElems DEL_PREFIXes six raw S3 families per bucket delete,
+// but every key underneath them routes through !s3route|<bucket><generation>.
+// Checked against the raw interval those six miss the object routes' own write
+// floors, so a cleanup at or below a floor is admitted and its tombstones sit
+// hidden behind migrated object versions -- data retained for a bucket the
+// operator was told is gone.
+func TestEnsurePrefixWriteAllowedRoutesS3BucketPrefixesThroughObjectRoutes(t *testing.T) {
+	t.Parallel()
+
+	const (
+		bucket     = "orders"
+		generation = uint64(3)
+	)
+	bucketRoute := s3keys.RoutePrefixForBucket(bucket, generation)
+	// Every object of this bucket generation sorts under bucketRoute.
+	require.True(t, bytes.HasPrefix(
+		s3keys.ExtractRouteKey(s3keys.ObjectManifestKey(bucket, generation, "a/b")), bucketRoute))
+
+	// !s3route| sorts before !s3|, so the bucket's object route range and the
+	// raw !s3| families are three distinct routes. Only the middle one, which
+	// holds the objects, carries a floor.
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: bucketRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: bucketRoute, End: prefixScanEnd(bucketRoute), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+			{RouteID: 3, Start: prefixScanEnd(bucketRoute), End: nil, GroupID: 3, State: distribution.RouteStateActive},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	for name, prefix := range map[string][]byte{
+		"manifest":   s3keys.ObjectManifestPrefixForBucket(bucket, generation),
+		"uploadMeta": s3keys.UploadMetaPrefixForBucket(bucket, generation),
+		"uploadPart": s3keys.UploadPartPrefixForBucket(bucket, generation),
+		"blob":       s3keys.BlobPrefixForBucket(bucket, generation),
+		"chunkRef":   s3keys.ChunkRefPrefixForBucket(bucket, generation),
+		"gcUpload":   s3keys.GCUploadPrefixForBucket(bucket, generation),
+	} {
+		require.ErrorIs(t, st.ensurePrefixWriteAllowed(prefix, 50), store.ErrWriteConflict,
+			"%s prefix must see the object route floor", name)
+		require.NoError(t, st.ensurePrefixWriteAllowed(prefix, 101), "%s prefix above the floor", name)
+	}
+
+	// The route-space prefix in the same batch already resolved correctly and
+	// must keep doing so.
+	require.ErrorIs(t,
+		st.ensurePrefixWriteAllowed(s3keys.RoutePrefixForBucket(bucket, generation), 50),
+		store.ErrWriteConflict,
+	)
+}
+
+// A bucket whose object routes carry no floor is unaffected, and a prefix that
+// cannot be projected still fans out over the raw interval.
+func TestEnsurePrefixWriteAllowedKeepsS3FanoutForUnprojectablePrefixes(t *testing.T) {
+	t.Parallel()
+
+	bucketRoute := s3keys.RoutePrefixForBucket("orders", 3)
+
+	// The floor is on the raw !s3| interval this time, and the bucket's object
+	// route range is clean.
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: bucketRoute, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: bucketRoute, End: prefixScanEnd(bucketRoute), GroupID: 2, State: distribution.RouteStateActive},
+			{RouteID: 3, Start: prefixScanEnd(bucketRoute), End: nil, GroupID: 3, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	st := &ShardStore{engine: engine}
+
+	// Projectable: only the object route range is consulted, and it has no floor.
+	require.NoError(t, st.ensurePrefixWriteAllowed(s3keys.ObjectManifestPrefixForBucket("orders", 3), 50))
+
+	// Not projectable: the bare family still fans out over the raw interval,
+	// which does carry a floor.
+	require.ErrorIs(t,
+		st.ensurePrefixWriteAllowed([]byte(s3keys.ObjectManifestPrefix), 50),
+		store.ErrWriteConflict,
+	)
+}
+
+// countingGetStore counts the point reads canonicalization performs.
+type countingGetStore struct {
+	store.MVCCStore
+	gets atomic.Int64
+}
+
+func (s *countingGetStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	s.gets.Add(1)
+	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+// Every route page a scan merges has already been through
+// canonicalizeRedisWideColumnScanResults in its local, leader, or proxy page
+// path, and the canonical row keeps the physical key. A second pass over the
+// merged result therefore repeats the point read for every surviving row: 2N
+// reads for a page of N, and on a remote group a fenced RPC each.
+func TestScanAtCanonicalizesWideColumnRowsOnce(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("user:key")
+	fields := [][]byte{[]byte("f1"), []byte("f2"), []byte("f3")}
+
+	newStore := func() (*ShardStore, *countingGetStore) {
+		engine := distribution.NewEngine()
+		engine.UpdateRoute([]byte(""), nil, 1)
+		counting := &countingGetStore{MVCCStore: store.NewMVCCStore()}
+		for _, field := range fields {
+			require.NoError(t, counting.PutAt(ctx, store.HashFieldKey(userKey, field), []byte("v"), 10, 0))
+		}
+		counting.gets.Store(0)
+		return NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: counting}}), counting
+	}
+
+	start := store.HashFieldScanPrefix(userKey)
+	end := prefixScanEnd(start)
+
+	st, counting := newStore()
+	kvs, err := st.ScanAt(ctx, start, end, 10, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, len(fields))
+	require.Equal(t, int64(len(fields)), counting.gets.Load(),
+		"one canonicalizing point read per returned row, not two")
+
+	st, counting = newStore()
+	kvs, err = st.ReverseScanAt(ctx, start, end, 10, 20)
+	require.NoError(t, err)
+	require.Len(t, kvs, len(fields))
+	require.Equal(t, int64(len(fields)), counting.gets.Load(),
+		"the reverse path had the same redundant outer pass")
+}
+
+// normalizeRouteKey places stream writes on the logical user-key route, so
+// metadata written before that normalization sits on the physical !stream|meta|
+// route. A split can put the two on different groups, and a point read that
+// consults only the logical route reports an existing stream as missing -- after
+// which the caller never scans, so the legacy candidate the scan path carries is
+// never reached and commands re-initialize fresh metadata over live entries.
+func TestGetAtReadsLegacyStreamRouteDuringRollingUpgrade(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("z-stream")
+	metaKey := store.StreamMetaKey(userKey)
+	// The physical key and the logical user key land on different routes.
+	require.NotEqual(t, RouteKey(metaKey), metaKey)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			// The raw !stream| prefix sorts below "z", so the physical key is on
+			// the lower route and the user key on the upper one.
+			{RouteID: 1, Start: []byte(""), End: userKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: userKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		for _, g := range groups {
+			_ = g.Store.Close()
+		}
+	})
+	st := NewShardStore(engine, groups)
+
+	// Written by a node that predates the stream route normalization.
+	require.NoError(t, groups[1].Store.PutAt(ctx, metaKey, []byte("legacy-meta"), 10, 0))
+
+	got, err := st.GetAt(ctx, metaKey, 20)
+	require.NoError(t, err, "the stream must not read as missing")
+	require.Equal(t, []byte("legacy-meta"), got)
+}
+
+// A stream entry key gets the same treatment, and the logical route still wins
+// once a value is there.
+func TestGetAtPrefersLogicalStreamRouteWhenBothExist(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	userKey := []byte("z-stream")
+	entryKey := store.StreamEntryKey(userKey, 123, 4)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: userKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: userKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		for _, g := range groups {
+			_ = g.Store.Close()
+		}
+	})
+	st := NewShardStore(engine, groups)
+
+	require.NoError(t, groups[1].Store.PutAt(ctx, entryKey, []byte("legacy"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, entryKey, []byte("current"), 11, 0))
+
+	got, err := st.GetAt(ctx, entryKey, 20)
+	require.NoError(t, err)
+	require.Equal(t, []byte("current"), got)
+}
+
+// The canonicalization predicate answers a different question -- whether a scan
+// row is a physical form needing a point read -- and streams have no such form,
+// so it must stay wide-column only even though the route candidate now covers
+// both.
+func TestLegacyPointRouteKeyIsNotTheCanonicalizationPredicate(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	streamKey := store.StreamMetaKey(userKey)
+	require.NotNil(t, legacyPointRouteKey(streamKey))
+	require.Nil(t, redisWideColumnLegacyPointRouteKey(streamKey))
+
+	hashKey := store.HashFieldKey(userKey, []byte("f"))
+	require.NotNil(t, legacyPointRouteKey(hashKey))
+	require.NotNil(t, redisWideColumnLegacyPointRouteKey(hashKey))
+
+	require.Nil(t, legacyPointRouteKey([]byte("plain")))
+}
+
+// A proxied page cannot be assumed canonical. The peer may be running the parent
+// binary, which accepts group_id on RawScanAt and serves rawScanAtExplicitGroup
+// while ignoring the fence and route-bounds fields, and has no canonicalization
+// at all -- so it answers with physical rows. Dropping the local pass would let a
+// legacy hash/set/zset row through that a logical tombstone should suppress.
+func TestScanAtCanonicalizesProxiedPages(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("user:key")
+	rows := make([]*pb.RawKVPair, 0, 3)
+	for _, field := range [][]byte{[]byte("f1"), []byte("f2"), []byte("f3")} {
+		rows = append(rows, &pb.RawKVPair{Key: store.HashFieldKey(userKey, field), Value: []byte("v")})
+	}
+	fake := &fakeRawKVServer{scanResp: &pb.RawScanAtResponse{Kv: rows}}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore(), Engine: &stubFollowerEngine{leaderAddr: addr}},
+	})
+	t.Cleanup(func() { _ = st.Close() })
+
+	start := store.HashFieldScanPrefix(userKey)
+	_, err := st.ScanAt(context.Background(), start, prefixScanEnd(start), 10, 20)
+	require.NoError(t, err)
+
+	fake.mu.Lock()
+	defer fake.mu.Unlock()
+	require.Equal(t, len(rows), fake.getCalls,
+		"every proxied row must be canonicalized locally until the peer can say it already did")
+}
+
+func TestShardStoreReadFenceGroupKeysForRangeIncludesIntersectingRoutes(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("hash:fence-routes")
+	prefix := store.HashFieldScanPrefix(userKey)
+	split := append(append([]byte(nil), prefix...), 'm')
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), split, 1)
+	engine.UpdateRoute(split, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	})
+
+	got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+
+	// The contract is one representative key per intersecting group, and every
+	// consumer leases them all. Enumeration order is not part of it -- under
+	// wide-column user-key routing the raw range order no longer holds -- so
+	// the set is what this pins.
+	require.ElementsMatch(t, [][]byte{prefix, split}, got)
+}
+
+func TestShardStoreLocalStoresUsesStableGroupOrder(t *testing.T) {
+	t.Parallel()
+
+	first := store.NewMVCCStore()
+	second := store.NewMVCCStore()
+	shards := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		20: {Store: second},
+		10: {Store: first},
+		30: nil,
+	})
+
+	require.Equal(t, []store.MVCCStore{first, second}, shards.LocalStores())
+}
+
 func TestFilesystemGroupIDsSkipsStorelessGroups(t *testing.T) {
 	t.Parallel()
 

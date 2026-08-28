@@ -181,12 +181,13 @@ func (x *RawPutResponse) GetSuccess() bool {
 }
 
 type RawGetRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	Ts            uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`                          // optional read timestamp; if zero, server uses current HLC
-	GroupId       uint64                 `protobuf:"varint,4,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit Raft group for non-range-owned keyspaces
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Key              []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	Ts               uint64                 `protobuf:"varint,3,opt,name=ts,proto3" json:"ts,omitempty"`                                                       // optional read timestamp; if zero, server uses current HLC
+	GroupId          uint64                 `protobuf:"varint,4,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                              // optional explicit Raft group for non-range-owned keyspaces
+	ReadRouteVersion uint64                 `protobuf:"varint,5,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RawGetRequest) Reset() {
@@ -236,6 +237,13 @@ func (x *RawGetRequest) GetTs() uint64 {
 func (x *RawGetRequest) GetGroupId() uint64 {
 	if x != nil {
 		return x.GroupId
+	}
+	return 0
+}
+
+func (x *RawGetRequest) GetReadRouteVersion() uint64 {
+	if x != nil {
+		return x.ReadRouteVersion
 	}
 	return 0
 }
@@ -397,11 +405,18 @@ func (x *RawDeleteResponse) GetSuccess() bool {
 }
 
 type RawLatestCommitTSRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Key           []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
-	GroupId       uint64                 `protobuf:"varint,2,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"` // optional explicit group for leader-fenced watermark reads
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state            protoimpl.MessageState `protogen:"open.v1"`
+	Key              []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
+	ReadRouteVersion uint64                 `protobuf:"varint,2,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
+	// group_id carries both uses: the explicit Raft group for route-specific
+	// probes, and the explicit group a leader-fenced watermark read names.
+	GroupId uint64 `protobuf:"varint,3,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// When non-zero, also answer whether the key has any committed version at or
+	// below this timestamp. Comparing only `ts` cannot tell a tombstone at or
+	// before the read timestamp apart from a newer version above it.
+	VersionVisibleAtTs uint64 `protobuf:"varint,4,opt,name=version_visible_at_ts,json=versionVisibleAtTs,proto3" json:"version_visible_at_ts,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSRequest) Reset() {
@@ -441,6 +456,13 @@ func (x *RawLatestCommitTSRequest) GetKey() []byte {
 	return nil
 }
 
+func (x *RawLatestCommitTSRequest) GetReadRouteVersion() uint64 {
+	if x != nil {
+		return x.ReadRouteVersion
+	}
+	return 0
+}
+
 func (x *RawLatestCommitTSRequest) GetGroupId() uint64 {
 	if x != nil {
 		return x.GroupId
@@ -448,12 +470,26 @@ func (x *RawLatestCommitTSRequest) GetGroupId() uint64 {
 	return 0
 }
 
+func (x *RawLatestCommitTSRequest) GetVersionVisibleAtTs() uint64 {
+	if x != nil {
+		return x.VersionVisibleAtTs
+	}
+	return 0
+}
+
 type RawLatestCommitTSResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ts            uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
-	Exists        bool                   `protobuf:"varint,2,opt,name=exists,proto3" json:"exists,omitempty"`
-	GroupId       uint64                 `protobuf:"varint,3,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                // echoes an explicit group watermark request
-	LeaderFenced  bool                   `protobuf:"varint,4,opt,name=leader_fenced,json=leaderFenced,proto3" json:"leader_fenced,omitempty"` // true only after that group's leader ReadIndex fence
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Ts     uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
+	Exists bool                   `protobuf:"varint,2,opt,name=exists,proto3" json:"exists,omitempty"`
+	// Answer to version_visible_at_ts. Only meaningful when
+	// version_visible_supported is set; a server that predates the probe leaves
+	// both unset and the caller falls back to comparing `ts`.
+	VersionVisible          bool `protobuf:"varint,3,opt,name=version_visible,json=versionVisible,proto3" json:"version_visible,omitempty"`
+	VersionVisibleSupported bool `protobuf:"varint,4,opt,name=version_visible_supported,json=versionVisibleSupported,proto3" json:"version_visible_supported,omitempty"`
+	// 3 and 4 were taken by the version probe on main while this branch was
+	// open, so the watermark fields moved up rather than reusing those tags.
+	GroupId       uint64 `protobuf:"varint,5,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                // echoes an explicit group watermark request
+	LeaderFenced  bool   `protobuf:"varint,6,opt,name=leader_fenced,json=leaderFenced,proto3" json:"leader_fenced,omitempty"` // true only after that group's leader ReadIndex fence
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -502,6 +538,20 @@ func (x *RawLatestCommitTSResponse) GetExists() bool {
 	return false
 }
 
+func (x *RawLatestCommitTSResponse) GetVersionVisible() bool {
+	if x != nil {
+		return x.VersionVisible
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetVersionVisibleSupported() bool {
+	if x != nil {
+		return x.VersionVisibleSupported
+	}
+	return false
+}
+
 func (x *RawLatestCommitTSResponse) GetGroupId() uint64 {
 	if x != nil {
 		return x.GroupId
@@ -517,16 +567,20 @@ func (x *RawLatestCommitTSResponse) GetLeaderFenced() bool {
 }
 
 type RawScanAtRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	StartKey      []byte                 `protobuf:"bytes,1,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"`
-	EndKey        []byte                 `protobuf:"bytes,2,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
-	Limit         int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
-	Ts            uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
-	Reverse       bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
-	GroupId       uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`    // optional explicit Raft group for non-range-owned keyspaces
-	KeysOnly      bool                   `protobuf:"varint,7,opt,name=keys_only,json=keysOnly,proto3" json:"keys_only,omitempty"` // when true, response kv entries omit values
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	StartKey           []byte                 `protobuf:"bytes,1,opt,name=start_key,json=startKey,proto3" json:"start_key,omitempty"`
+	EndKey             []byte                 `protobuf:"bytes,2,opt,name=end_key,json=endKey,proto3" json:"end_key,omitempty"`
+	Limit              int64                  `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"` // validated against host int size; large values may be rejected
+	Ts                 uint64                 `protobuf:"varint,4,opt,name=ts,proto3" json:"ts,omitempty"`       // optional read timestamp; if zero, server uses current HLC
+	Reverse            bool                   `protobuf:"varint,5,opt,name=reverse,proto3" json:"reverse,omitempty"`
+	GroupId            uint64                 `protobuf:"varint,6,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                                     // optional explicit Raft group for non-range-owned keyspaces
+	KeysOnly           bool                   `protobuf:"varint,7,opt,name=keys_only,json=keysOnly,proto3" json:"keys_only,omitempty"`                                  // when true, response kv entries omit values
+	ReadRouteVersion   uint64                 `protobuf:"varint,8,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"`        // stamped by server-side routing for migration read fences
+	RouteStart         []byte                 `protobuf:"bytes,9,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`                             // route-key-normalized inclusive start, when already known
+	RouteEnd           []byte                 `protobuf:"bytes,10,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`                                  // route-key-normalized exclusive end; empty means +infinity
+	RouteBoundsPresent bool                   `protobuf:"varint,11,opt,name=route_bounds_present,json=routeBoundsPresent,proto3" json:"route_bounds_present,omitempty"` // true when route_start/route_end were supplied, including ["", +infinity)
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RawScanAtRequest) Reset() {
@@ -604,6 +658,34 @@ func (x *RawScanAtRequest) GetGroupId() uint64 {
 func (x *RawScanAtRequest) GetKeysOnly() bool {
 	if x != nil {
 		return x.KeysOnly
+	}
+	return false
+}
+
+func (x *RawScanAtRequest) GetReadRouteVersion() uint64 {
+	if x != nil {
+		return x.ReadRouteVersion
+	}
+	return 0
+}
+
+func (x *RawScanAtRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *RawScanAtRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *RawScanAtRequest) GetRouteBoundsPresent() bool {
+	if x != nil {
+		return x.RouteBoundsPresent
 	}
 	return false
 }
@@ -2517,11 +2599,12 @@ const file_service_proto_rawDesc = "" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"M\n" +
 	"\x0eRawPutResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"L\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"z\n" +
 	"\rRawGetRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x0e\n" +
 	"\x02ts\x18\x03 \x01(\x04R\x02ts\x12\x19\n" +
-	"\bgroup_id\x18\x04 \x01(\x04R\agroupId\"b\n" +
+	"\bgroup_id\x18\x04 \x01(\x04R\agroupId\x12,\n" +
+	"\x12read_route_version\x18\x05 \x01(\x04R\x10readRouteVersion\"b\n" +
 	"\x0eRawGetResponse\x12\"\n" +
 	"\rread_at_index\x18\x01 \x01(\x04R\vreadAtIndex\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\x12\x16\n" +
@@ -2530,15 +2613,19 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"G\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xa8\x01\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
-	"\x03key\x18\x01 \x01(\fR\x03key\x12\x19\n" +
-	"\bgroup_id\x18\x02 \x01(\x04R\agroupId\"\x83\x01\n" +
+	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
+	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\x12\x19\n" +
+	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x121\n" +
+	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\"\xe8\x01\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\x12\x19\n" +
-	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x12#\n" +
-	"\rleader_fenced\x18\x04 \x01(\bR\fleaderFenced\"\xc0\x01\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\x12'\n" +
+	"\x0fversion_visible\x18\x03 \x01(\bR\x0eversionVisible\x12:\n" +
+	"\x19version_visible_supported\x18\x04 \x01(\bR\x17versionVisibleSupported\x12\x19\n" +
+	"\bgroup_id\x18\x05 \x01(\x04R\agroupId\x12#\n" +
+	"\rleader_fenced\x18\x06 \x01(\bR\fleaderFenced\"\xde\x02\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
@@ -2546,7 +2633,13 @@ const file_service_proto_rawDesc = "" +
 	"\x02ts\x18\x04 \x01(\x04R\x02ts\x12\x18\n" +
 	"\areverse\x18\x05 \x01(\bR\areverse\x12\x19\n" +
 	"\bgroup_id\x18\x06 \x01(\x04R\agroupId\x12\x1b\n" +
-	"\tkeys_only\x18\a \x01(\bR\bkeysOnly\"3\n" +
+	"\tkeys_only\x18\a \x01(\bR\bkeysOnly\x12,\n" +
+	"\x12read_route_version\x18\b \x01(\x04R\x10readRouteVersion\x12\x1f\n" +
+	"\vroute_start\x18\t \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\n" +
+	" \x01(\fR\brouteEnd\x120\n" +
+	"\x14route_bounds_present\x18\v \x01(\bR\x12routeBoundsPresent\"3\n" +
 	"\tRawKVPair\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x02 \x01(\fR\x05value\"/\n" +
