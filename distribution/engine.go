@@ -25,6 +25,12 @@ type Route struct {
 	GroupID uint64
 	// State tracks control-plane state for this route.
 	State RouteState
+	// StagedVisibilityActive allows serving reads to merge staged migration rows.
+	StagedVisibilityActive bool
+	// MigrationJobID identifies the active staged migration job.
+	MigrationJobID uint64
+	// MinWriteTSExclusive rejects writes at or below the migration cutover floor.
+	MinWriteTSExclusive uint64
 	// Load tracks the number of accesses served by this range.
 	Load uint64
 }
@@ -194,12 +200,15 @@ func routesAfterCatalogDelta(current []Route, delta CatalogDelta) ([]Route, erro
 				load = current.Load
 			}
 			byID[mutation.RouteID] = Route{
-				RouteID: mutation.Route.RouteID,
-				Start:   CloneBytes(mutation.Route.Start),
-				End:     CloneBytes(mutation.Route.End),
-				GroupID: mutation.Route.GroupID,
-				State:   mutation.Route.State,
-				Load:    load,
+				RouteID:                mutation.Route.RouteID,
+				Start:                  CloneBytes(mutation.Route.Start),
+				End:                    CloneBytes(mutation.Route.End),
+				GroupID:                mutation.Route.GroupID,
+				State:                  mutation.Route.State,
+				StagedVisibilityActive: mutation.Route.StagedVisibilityActive,
+				MigrationJobID:         mutation.Route.MigrationJobID,
+				MinWriteTSExclusive:    mutation.Route.MinWriteTSExclusive,
+				Load:                   load,
 			}
 		}
 	}
@@ -407,13 +416,64 @@ func (e *Engine) UpdateRoute(start, end []byte, group uint64) {
 
 // GetRoute finds a route for the given key using right half-open intervals.
 func (e *Engine) GetRoute(key []byte) (Route, bool) {
+	route, _, ok := e.GetRouteWithVersion(key)
+	return route, ok
+}
+
+// GetRouteWithVersion finds a route and returns the catalog version from the
+// same locked snapshot. Callers can use the version as a read-routing fence.
+func (e *Engine) GetRouteWithVersion(key []byte) (Route, uint64, bool) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	idx := e.routeIndex(key)
 	if idx < 0 {
-		return Route{}, false
+		return Route{}, e.catalogVersion, false
 	}
-	return e.routes[idx], true
+	route := e.routes[idx]
+	route.Start = CloneBytes(route.Start)
+	route.End = CloneBytes(route.End)
+	return route, e.catalogVersion, true
+}
+
+// RouteQuery is one lookup for ResolveRoutesWithVersion. Exact resolves the
+// single route containing Start; otherwise every route intersecting
+// [Start, End) is returned.
+type RouteQuery struct {
+	Start []byte
+	End   []byte
+	Exact bool
+}
+
+// ResolveRoutesWithVersion answers every query from a single locked catalog
+// snapshot and returns the one version that produced all of them. Callers that
+// need more than one route candidate must use this instead of repeating
+// GetRouteWithVersion / GetIntersectingRoutesWithVersion: separate calls can
+// straddle a catalog update and pair a stale route with a newer version, which
+// turns that version into a fence the route actually read was never checked
+// against.
+func (e *Engine) ResolveRoutesWithVersion(queries ...RouteQuery) ([][]Route, uint64) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([][]Route, len(queries))
+	for i, q := range queries {
+		if q.Exact {
+			out[i] = e.exactRouteLocked(q.Start)
+			continue
+		}
+		out[i] = e.intersectingRoutesLocked(q.Start, q.End)
+	}
+	return out, e.catalogVersion
+}
+
+func (e *Engine) exactRouteLocked(key []byte) []Route {
+	idx := e.routeIndex(key)
+	if idx < 0 {
+		return nil
+	}
+	route := e.routes[idx]
+	route.Start = CloneBytes(route.Start)
+	route.End = CloneBytes(route.End)
+	return []Route{route}
 }
 
 // AppliedCatalogSnapshot returns the routes the engine is currently serving,
@@ -452,12 +512,15 @@ func (e *Engine) Stats() []Route {
 	stats := make([]Route, len(e.routes))
 	for i, r := range e.routes {
 		stats[i] = Route{
-			RouteID: r.RouteID,
-			Start:   CloneBytes(r.Start),
-			End:     CloneBytes(r.End),
-			GroupID: r.GroupID,
-			State:   r.State,
-			Load:    r.Load,
+			RouteID:                r.RouteID,
+			Start:                  CloneBytes(r.Start),
+			End:                    CloneBytes(r.End),
+			GroupID:                r.GroupID,
+			State:                  r.State,
+			StagedVisibilityActive: r.StagedVisibilityActive,
+			MigrationJobID:         r.MigrationJobID,
+			MinWriteTSExclusive:    r.MinWriteTSExclusive,
+			Load:                   r.Load,
 		}
 	}
 	return stats
@@ -468,9 +531,19 @@ func (e *Engine) Stats() []Route {
 // - rStart < end (or end is nil, meaning unbounded scan)
 // - start < rEnd (or rEnd is nil, meaning unbounded route)
 func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
+	routes, _ := e.GetIntersectingRoutesWithVersion(start, end)
+	return routes
+}
+
+// GetIntersectingRoutesWithVersion returns intersecting routes and the catalog
+// version from the same locked snapshot.
+func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, uint64) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	return e.intersectingRoutesLocked(start, end), e.catalogVersion
+}
 
+func (e *Engine) intersectingRoutesLocked(start, end []byte) []Route {
 	var result []Route
 	for i := range e.routes {
 		r := &e.routes[i]
@@ -485,12 +558,15 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 		}
 		// Route intersects with scan range
 		result = append(result, Route{
-			RouteID: r.RouteID,
-			Start:   CloneBytes(r.Start),
-			End:     CloneBytes(r.End),
-			GroupID: r.GroupID,
-			State:   r.State,
-			Load:    r.Load,
+			RouteID:                r.RouteID,
+			Start:                  CloneBytes(r.Start),
+			End:                    CloneBytes(r.End),
+			GroupID:                r.GroupID,
+			State:                  r.State,
+			StagedVisibilityActive: r.StagedVisibilityActive,
+			MigrationJobID:         r.MigrationJobID,
+			MinWriteTSExclusive:    r.MinWriteTSExclusive,
+			Load:                   r.Load,
 		})
 	}
 	return result
@@ -529,12 +605,15 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 		}
 		seen[rd.RouteID] = struct{}{}
 		out[i] = Route{
-			RouteID: rd.RouteID,
-			Start:   CloneBytes(rd.Start),
-			End:     CloneBytes(rd.End),
-			GroupID: rd.GroupID,
-			State:   rd.State,
-			Load:    0,
+			RouteID:                rd.RouteID,
+			Start:                  CloneBytes(rd.Start),
+			End:                    CloneBytes(rd.End),
+			GroupID:                rd.GroupID,
+			State:                  rd.State,
+			StagedVisibilityActive: rd.StagedVisibilityActive,
+			MigrationJobID:         rd.MigrationJobID,
+			MinWriteTSExclusive:    rd.MinWriteTSExclusive,
+			Load:                   0,
 		}
 	}
 

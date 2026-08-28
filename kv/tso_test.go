@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
@@ -498,6 +499,31 @@ func TestShardedCoordinatorUsesTSOAllocatorForRawTxnAndDelPrefix(t *testing.T) {
 	txnReq := g1Txn.requests[2]
 	require.EqualValues(t, testTSOInitialBase+2, txnReq.Ts)
 	require.EqualValues(t, testTSOInitialBase+3, requestTxnMeta(t, txnReq).CommitTS)
+}
+
+func TestShardedCoordinatorTSORawRejectsRouteWriteTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: testTSOInitialBase},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	alloc := &fakeTSOAllocator{nextBase: testTSOInitialBase, leader: true}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil).WithTSOAllocator(alloc)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("raw")}},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.EqualValues(t, 1, alloc.calls.Load())
+	require.Empty(t, g1Txn.requests)
 }
 
 type fakeTSOAllocator struct {

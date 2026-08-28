@@ -143,6 +143,39 @@ func (c keyVizLabeledCoordinator) LeaseReadAllGroups(ctx context.Context) error 
 	return errors.WithStack(err)
 }
 
+// IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
+// group-keyed read-fence path. The Redis adapter wraps its coordinator with
+// WithKeyVizLabel, so this is the outermost type the fence type-asserts against;
+// omitting these makes every fence target fall back to key resolution and
+// silently re-introduces the legacy wide-column group collapse.
+func (c keyVizLabeledCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	gr, ok := c.inner.(GroupLeaderRoutableCoordinator)
+	if !ok {
+		return false
+	}
+	return gr.IsLeaderForGroup(groupID)
+}
+
+func (c keyVizLabeledCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	gr, ok := c.inner.(GroupLeaderRoutableCoordinator)
+	if !ok {
+		return ""
+	}
+	return gr.RaftLeaderForGroup(groupID)
+}
+
+func (c keyVizLabeledCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	ctx = contextWithKeyVizLabel(ctx, c.label)
+	if lr, ok := c.inner.(interface {
+		LeaseReadForGroup(context.Context, uint64) (uint64, error)
+	}); ok {
+		idx, err := lr.LeaseReadForGroup(ctx, groupID)
+		return idx, errors.WithStack(err)
+	}
+	idx, err := c.inner.LinearizableRead(ctx)
+	return idx, errors.WithStack(err)
+}
+
 func (c keyVizLabeledCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	if gr, ok := c.inner.(GroupRoutableCoordinator); ok {
 		return gr.EngineGroupIDForKey(key)

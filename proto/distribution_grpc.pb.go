@@ -25,6 +25,13 @@ const (
 	Distribution_SplitRange_FullMethodName             = "/Distribution/SplitRange"
 	Distribution_GetCatalogCapabilities_FullMethodName = "/Distribution/GetCatalogCapabilities"
 	Distribution_WatchCatalog_FullMethodName           = "/Distribution/WatchCatalog"
+	Distribution_StartSplitMigration_FullMethodName    = "/Distribution/StartSplitMigration"
+	Distribution_GetRouteOwnership_FullMethodName      = "/Distribution/GetRouteOwnership"
+	Distribution_GetIntersectingRoutes_FullMethodName  = "/Distribution/GetIntersectingRoutes"
+	Distribution_GetSplitJob_FullMethodName            = "/Distribution/GetSplitJob"
+	Distribution_ListSplitJobs_FullMethodName          = "/Distribution/ListSplitJobs"
+	Distribution_AbandonSplitJob_FullMethodName        = "/Distribution/AbandonSplitJob"
+	Distribution_RetrySplitJob_FullMethodName          = "/Distribution/RetrySplitJob"
 )
 
 // DistributionClient is the client API for Distribution service.
@@ -37,6 +44,13 @@ type DistributionClient interface {
 	SplitRange(ctx context.Context, in *SplitRangeRequest, opts ...grpc.CallOption) (*SplitRangeResponse, error)
 	GetCatalogCapabilities(ctx context.Context, in *CatalogCapabilitiesRequest, opts ...grpc.CallOption) (*CatalogCapabilitiesResponse, error)
 	WatchCatalog(ctx context.Context, in *CatalogWatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CatalogWatchEvent], error)
+	StartSplitMigration(ctx context.Context, in *StartSplitMigrationRequest, opts ...grpc.CallOption) (*StartSplitMigrationResponse, error)
+	GetRouteOwnership(ctx context.Context, in *GetRouteOwnershipRequest, opts ...grpc.CallOption) (*GetRouteOwnershipResponse, error)
+	GetIntersectingRoutes(ctx context.Context, in *GetIntersectingRoutesRequest, opts ...grpc.CallOption) (*GetIntersectingRoutesResponse, error)
+	GetSplitJob(ctx context.Context, in *GetSplitJobRequest, opts ...grpc.CallOption) (*GetSplitJobResponse, error)
+	ListSplitJobs(ctx context.Context, in *ListSplitJobsRequest, opts ...grpc.CallOption) (*ListSplitJobsResponse, error)
+	AbandonSplitJob(ctx context.Context, in *AbandonSplitJobRequest, opts ...grpc.CallOption) (*AbandonSplitJobResponse, error)
+	RetrySplitJob(ctx context.Context, in *RetrySplitJobRequest, opts ...grpc.CallOption) (*RetrySplitJobResponse, error)
 }
 
 type distributionClient struct {
@@ -116,6 +130,76 @@ func (c *distributionClient) WatchCatalog(ctx context.Context, in *CatalogWatchR
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Distribution_WatchCatalogClient = grpc.ServerStreamingClient[CatalogWatchEvent]
 
+func (c *distributionClient) StartSplitMigration(ctx context.Context, in *StartSplitMigrationRequest, opts ...grpc.CallOption) (*StartSplitMigrationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(StartSplitMigrationResponse)
+	err := c.cc.Invoke(ctx, Distribution_StartSplitMigration_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) GetRouteOwnership(ctx context.Context, in *GetRouteOwnershipRequest, opts ...grpc.CallOption) (*GetRouteOwnershipResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetRouteOwnershipResponse)
+	err := c.cc.Invoke(ctx, Distribution_GetRouteOwnership_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) GetIntersectingRoutes(ctx context.Context, in *GetIntersectingRoutesRequest, opts ...grpc.CallOption) (*GetIntersectingRoutesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetIntersectingRoutesResponse)
+	err := c.cc.Invoke(ctx, Distribution_GetIntersectingRoutes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) GetSplitJob(ctx context.Context, in *GetSplitJobRequest, opts ...grpc.CallOption) (*GetSplitJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSplitJobResponse)
+	err := c.cc.Invoke(ctx, Distribution_GetSplitJob_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) ListSplitJobs(ctx context.Context, in *ListSplitJobsRequest, opts ...grpc.CallOption) (*ListSplitJobsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListSplitJobsResponse)
+	err := c.cc.Invoke(ctx, Distribution_ListSplitJobs_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) AbandonSplitJob(ctx context.Context, in *AbandonSplitJobRequest, opts ...grpc.CallOption) (*AbandonSplitJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AbandonSplitJobResponse)
+	err := c.cc.Invoke(ctx, Distribution_AbandonSplitJob_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) RetrySplitJob(ctx context.Context, in *RetrySplitJobRequest, opts ...grpc.CallOption) (*RetrySplitJobResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RetrySplitJobResponse)
+	err := c.cc.Invoke(ctx, Distribution_RetrySplitJob_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DistributionServer is the server API for Distribution service.
 // All implementations must embed UnimplementedDistributionServer
 // for forward compatibility.
@@ -126,6 +210,13 @@ type DistributionServer interface {
 	SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error)
 	GetCatalogCapabilities(context.Context, *CatalogCapabilitiesRequest) (*CatalogCapabilitiesResponse, error)
 	WatchCatalog(*CatalogWatchRequest, grpc.ServerStreamingServer[CatalogWatchEvent]) error
+	StartSplitMigration(context.Context, *StartSplitMigrationRequest) (*StartSplitMigrationResponse, error)
+	GetRouteOwnership(context.Context, *GetRouteOwnershipRequest) (*GetRouteOwnershipResponse, error)
+	GetIntersectingRoutes(context.Context, *GetIntersectingRoutesRequest) (*GetIntersectingRoutesResponse, error)
+	GetSplitJob(context.Context, *GetSplitJobRequest) (*GetSplitJobResponse, error)
+	ListSplitJobs(context.Context, *ListSplitJobsRequest) (*ListSplitJobsResponse, error)
+	AbandonSplitJob(context.Context, *AbandonSplitJobRequest) (*AbandonSplitJobResponse, error)
+	RetrySplitJob(context.Context, *RetrySplitJobRequest) (*RetrySplitJobResponse, error)
 	mustEmbedUnimplementedDistributionServer()
 }
 
@@ -153,6 +244,27 @@ func (UnimplementedDistributionServer) GetCatalogCapabilities(context.Context, *
 }
 func (UnimplementedDistributionServer) WatchCatalog(*CatalogWatchRequest, grpc.ServerStreamingServer[CatalogWatchEvent]) error {
 	return status.Error(codes.Unimplemented, "method WatchCatalog not implemented")
+}
+func (UnimplementedDistributionServer) StartSplitMigration(context.Context, *StartSplitMigrationRequest) (*StartSplitMigrationResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method StartSplitMigration not implemented")
+}
+func (UnimplementedDistributionServer) GetRouteOwnership(context.Context, *GetRouteOwnershipRequest) (*GetRouteOwnershipResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetRouteOwnership not implemented")
+}
+func (UnimplementedDistributionServer) GetIntersectingRoutes(context.Context, *GetIntersectingRoutesRequest) (*GetIntersectingRoutesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetIntersectingRoutes not implemented")
+}
+func (UnimplementedDistributionServer) GetSplitJob(context.Context, *GetSplitJobRequest) (*GetSplitJobResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSplitJob not implemented")
+}
+func (UnimplementedDistributionServer) ListSplitJobs(context.Context, *ListSplitJobsRequest) (*ListSplitJobsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListSplitJobs not implemented")
+}
+func (UnimplementedDistributionServer) AbandonSplitJob(context.Context, *AbandonSplitJobRequest) (*AbandonSplitJobResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AbandonSplitJob not implemented")
+}
+func (UnimplementedDistributionServer) RetrySplitJob(context.Context, *RetrySplitJobRequest) (*RetrySplitJobResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RetrySplitJob not implemented")
 }
 func (UnimplementedDistributionServer) mustEmbedUnimplementedDistributionServer() {}
 func (UnimplementedDistributionServer) testEmbeddedByValue()                      {}
@@ -276,6 +388,132 @@ func _Distribution_WatchCatalog_Handler(srv interface{}, stream grpc.ServerStrea
 // This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
 type Distribution_WatchCatalogServer = grpc.ServerStreamingServer[CatalogWatchEvent]
 
+func _Distribution_StartSplitMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(StartSplitMigrationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).StartSplitMigration(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_StartSplitMigration_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).StartSplitMigration(ctx, req.(*StartSplitMigrationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_GetRouteOwnership_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetRouteOwnershipRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).GetRouteOwnership(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_GetRouteOwnership_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).GetRouteOwnership(ctx, req.(*GetRouteOwnershipRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_GetIntersectingRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetIntersectingRoutesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).GetIntersectingRoutes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_GetIntersectingRoutes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).GetIntersectingRoutes(ctx, req.(*GetIntersectingRoutesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_GetSplitJob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSplitJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).GetSplitJob(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_GetSplitJob_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).GetSplitJob(ctx, req.(*GetSplitJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_ListSplitJobs_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListSplitJobsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).ListSplitJobs(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_ListSplitJobs_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).ListSplitJobs(ctx, req.(*ListSplitJobsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_AbandonSplitJob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AbandonSplitJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).AbandonSplitJob(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_AbandonSplitJob_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).AbandonSplitJob(ctx, req.(*AbandonSplitJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_RetrySplitJob_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RetrySplitJobRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).RetrySplitJob(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_RetrySplitJob_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).RetrySplitJob(ctx, req.(*RetrySplitJobRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Distribution_ServiceDesc is the grpc.ServiceDesc for Distribution service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -302,6 +540,34 @@ var Distribution_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "GetCatalogCapabilities",
 			Handler:    _Distribution_GetCatalogCapabilities_Handler,
+		},
+		{
+			MethodName: "StartSplitMigration",
+			Handler:    _Distribution_StartSplitMigration_Handler,
+		},
+		{
+			MethodName: "GetRouteOwnership",
+			Handler:    _Distribution_GetRouteOwnership_Handler,
+		},
+		{
+			MethodName: "GetIntersectingRoutes",
+			Handler:    _Distribution_GetIntersectingRoutes_Handler,
+		},
+		{
+			MethodName: "GetSplitJob",
+			Handler:    _Distribution_GetSplitJob_Handler,
+		},
+		{
+			MethodName: "ListSplitJobs",
+			Handler:    _Distribution_ListSplitJobs_Handler,
+		},
+		{
+			MethodName: "AbandonSplitJob",
+			Handler:    _Distribution_AbandonSplitJob_Handler,
+		},
+		{
+			MethodName: "RetrySplitJob",
+			Handler:    _Distribution_RetrySplitJob_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

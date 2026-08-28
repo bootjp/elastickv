@@ -121,6 +121,35 @@ func TestShardedCoordinator_DelPrefixBroadcastsToAllGroups(t *testing.T) {
 		"same DEL_PREFIX element must use the same timestamp across shards")
 }
 
+func TestShardedCoordinator_DelPrefixRejectsRouteWriteTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive, MinWriteTSExclusive: ^uint64(0)},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: DelPrefix, Key: nil},
+		},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.Empty(t, g1Txn.requests)
+	require.Empty(t, g2Txn.requests)
+}
+
 // TestShardedCoordinator_DelPrefixRejectsTxn verifies that DEL_PREFIX inside
 // a transactional group is rejected.
 func TestShardedCoordinator_DelPrefixRejectsTxn(t *testing.T) {

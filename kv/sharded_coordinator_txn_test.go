@@ -82,6 +82,31 @@ func TestShardedCoordinatorDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 }
 
+func TestShardedCoordinatorDispatchNonTxn_RejectsRouteWriteTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: ^uint64(0)},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v")},
+		},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.Empty(t, g1Txn.requests)
+}
+
 func TestNewShardedCoordinatorCopiesGroupMap(t *testing.T) {
 	t.Parallel()
 
@@ -295,6 +320,45 @@ func TestShardedCoordinatorDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	commitMeta2 := requestTxnMeta(t, g2Txn.requests[1])
 	require.Equal(t, commitTS, commitMeta1.CommitTS)
 	require.Equal(t, commitTS, commitMeta2.CommitTS)
+}
+
+func TestShardedCoordinatorDispatchTxn_RejectsRouteWriteTimestampFloor(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: 20},
+		},
+	}))
+
+	g1Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 20,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v")},
+		},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.Empty(t, g1Txn.requests)
+
+	_, err = coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 21,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("v")},
+		},
+	})
+	require.NoError(t, err)
+	require.Len(t, g1Txn.requests, 1)
 }
 
 func TestCommitSecondaryWithRetry_RetriesAndSucceeds(t *testing.T) {

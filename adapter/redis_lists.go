@@ -771,8 +771,8 @@ func (r *RedisServer) rangeListAt(ctx context.Context, key []byte, startRaw, end
 }
 
 func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, startRaw, endRaw []byte) (uint64, *kv.ActiveTimestampToken, []string, bool, error) {
-	groupKeys := r.redisReadFenceGroupKeys(r.redisTxnReadFenceKeysForRanges(key, redisListReadFenceRanges(key)))
-	proxyKey, ok, err := r.readFenceProxyKey(groupKeys)
+	targets := r.redisReadFenceGroupTargets(r.redisTxnReadFenceTargetsForRanges(key, redisListReadFenceRanges(key)))
+	proxyKey, ok, err := r.readFenceProxyKeyForTargets(targets)
 	if err != nil {
 		return 0, nil, nil, false, err
 	}
@@ -780,7 +780,7 @@ func (r *RedisServer) fenceRangeListReadGroups(ctx context.Context, key []byte, 
 		proxied, err := r.proxyLRange(key, proxyKey, startRaw, endRaw)
 		return 0, nil, proxied, true, err
 	}
-	readTS, readPin, err := r.redisReadFencedTimestamp(ctx, groupKeys, r.readTS)
+	readTS, readPin, err := r.redisReadFencedTimestampForTargets(ctx, targets, r.readTS)
 	if err != nil {
 		return 0, nil, nil, false, err
 	}

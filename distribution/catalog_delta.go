@@ -251,6 +251,9 @@ func catalogDeltaRouteIsZero(route RouteDescriptor) bool {
 		route.GroupID == 0 &&
 		route.State == 0 &&
 		route.ParentRouteID == 0 &&
+		!route.StagedVisibilityActive &&
+		route.MigrationJobID == 0 &&
+		route.MinWriteTSExclusive == 0 &&
 		route.SplitAtHLC == 0
 }
 
