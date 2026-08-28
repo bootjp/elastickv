@@ -430,3 +430,41 @@ func TestStampTxnTimestampsIgnoresMetadataForRouteWriteFloor(t *testing.T) {
 	_, err := i.stampTxnTimestamps(context.Background(), reqs)
 	require.NoError(t, err)
 }
+
+// The export defaults only fill in a bound the request left unset, so without a
+// ceiling one ExportVersions call can scan and decode an arbitrary portion of
+// the source store before producing its next streamed response. For a sparse
+// family or route filter that accepts few rows, math.MaxUint64 removes the only
+// work bound there is.
+func TestExportRangeVersionsOptionsClampOversizedBounds(t *testing.T) {
+	t.Parallel()
+
+	i := &Internal{}
+	opts := i.exportRangeVersionsOptions(&pb.ExportRangeVersionsRequest{
+		ChunkBytes:      ^uint32(0),
+		MaxScannedBytes: ^uint64(0),
+	})
+
+	require.Equal(t, uint64(maxMigrationExportChunkBytes), opts.MaxBytes)
+	require.Equal(t, uint64(maxMigrationExportScanBytes), opts.MaxScannedBytes)
+}
+
+// Unset bounds still take the defaults, and a request under the ceiling passes
+// through so a caller can still ask for smaller chunks.
+func TestExportRangeVersionsOptionsKeepDefaultsAndSmallerRequests(t *testing.T) {
+	t.Parallel()
+
+	i := &Internal{}
+	defaults := i.exportRangeVersionsOptions(&pb.ExportRangeVersionsRequest{})
+	require.Equal(t, uint64(defaultMigrationExportChunkBytes), defaults.MaxBytes)
+	require.Equal(t,
+		uint64(defaultMigrationExportChunkBytes*defaultMigrationExportScanFactor),
+		defaults.MaxScannedBytes)
+
+	smaller := i.exportRangeVersionsOptions(&pb.ExportRangeVersionsRequest{
+		ChunkBytes:      4096,
+		MaxScannedBytes: 8192,
+	})
+	require.Equal(t, uint64(4096), smaller.MaxBytes)
+	require.Equal(t, uint64(8192), smaller.MaxScannedBytes)
+}

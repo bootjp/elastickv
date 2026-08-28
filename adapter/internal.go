@@ -104,6 +104,17 @@ const (
 	defaultMigrationExportChunkBytes  = 4 << 20
 	defaultMigrationExportScanFactor  = 4
 	defaultMigrationExportMaxVersions = 1024
+
+	// Hard server-side ceilings. The defaults above only fill in a bound the
+	// request left unset, so without these a caller could ask one
+	// ExportVersions call to scan and decode an arbitrary portion of the source
+	// store before producing its next streamed response -- for a sparse family
+	// or route filter that accepts few rows, math.MaxUint64 removes the only
+	// work bound there is and the serving leader's I/O and CPU go with it. A
+	// clamped caller simply advances through more cursor rounds, which the
+	// response already supports. Same shape as the promotion path's clamp.
+	maxMigrationExportChunkBytes = 32 << 20
+	maxMigrationExportScanBytes  = maxMigrationExportChunkBytes * defaultMigrationExportScanFactor
 )
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
@@ -422,14 +433,10 @@ func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, labe
 }
 
 func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
-	chunkBytes := uint64(req.GetChunkBytes())
-	if chunkBytes == 0 {
-		chunkBytes = defaultMigrationExportChunkBytes
-	}
-	maxScannedBytes := req.GetMaxScannedBytes()
-	if maxScannedBytes == 0 {
-		maxScannedBytes = chunkBytes * defaultMigrationExportScanFactor
-	}
+	chunkBytes := clampMigrationExportBound(
+		uint64(req.GetChunkBytes()), defaultMigrationExportChunkBytes, maxMigrationExportChunkBytes)
+	maxScannedBytes := clampMigrationExportBound(
+		req.GetMaxScannedBytes(), chunkBytes*defaultMigrationExportScanFactor, maxMigrationExportScanBytes)
 	opts := store.ExportVersionsOptions{
 		StartKey:             req.GetRangeStart(),
 		EndKey:               req.GetRangeEnd(),
@@ -444,6 +451,15 @@ func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest
 		AcceptVersion:        i.migrationExportVersionFilter(req),
 	}
 	return opts
+}
+
+// clampMigrationExportBound resolves one export bound: unset takes the default,
+// anything above the hard ceiling is clamped down to it.
+func clampMigrationExportBound(requested, fallback, ceiling uint64) uint64 {
+	if requested == 0 {
+		return fallback
+	}
+	return min(requested, ceiling)
 }
 
 func (i *Internal) migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
