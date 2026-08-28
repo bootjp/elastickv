@@ -2129,3 +2129,57 @@ func TestValidateBackupSnapshotAtResolvesStatusThroughCapturedRoute(t *testing.T
 	require.NotErrorIs(t, err, ErrTxnLocked,
 		"the committed transaction must resolve through the captured route, not the new owner")
 }
+
+// A captured-route read must go through the same leader fence as every other
+// per-group read. Serving it from the group's local replica means a lagging
+// follower answers "no commit record" for a transaction that is already
+// durably committed, so validation reports it pending and BeginBackup fails
+// with ErrTxnLocked on a clean snapshot -- the wrong-status failure the
+// captured route exists to prevent, caused by replication lag instead of a
+// route move. This node is a follower with no reachable leader, so a fenced
+// read surfaces ErrLeaderNotFound rather than the stale local answer.
+func TestValidateBackupSnapshotAtFencesCapturedRouteReads(t *testing.T) {
+	ctx := context.Background()
+
+	localStore := store.NewMVCCStore()
+	t.Cleanup(func() { _ = localStore.Close() })
+
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		localStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("fenced-key")
+	require.Nil(t, applyBackupTestRequest(t, fsm, &pb.Request{
+		IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 30,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+				PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+			})},
+			{Op: pb.Op_PUT, Key: primary, Value: []byte("v")},
+		},
+	}))
+	require.NoError(t, localStore.PutAt(ctx, txnCommitKey(primary, 30), encodeTxnCommitRecord(40), 40, 0))
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: localStore, Engine: &followerProxyEngine{}},
+	})
+
+	captured := BackupRouteSnapshot{
+		routes: []distribution.Route{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+		scanGroups: []uint64{1},
+	}
+
+	err := shards.ValidateBackupSnapshotAt(ctx, captured, 50, 16)
+	require.ErrorIs(t, err, ErrLeaderNotFound,
+		"the captured-route status read must be fenced, not served from the local replica")
+}

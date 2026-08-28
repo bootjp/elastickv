@@ -287,7 +287,14 @@ func (s *ShardStore) capturedBackupGetAt(
 		if !ok || g == nil || g.Store == nil {
 			break
 		}
-		val, err := g.Store.GetAt(ctx, key, ts)
+		// getRouteAt, not g.Store.GetAt: reading the group's local replica
+		// directly skips the leader fence every other per-group read here goes
+		// through, so on a lagging follower a commit record that is already
+		// durably committed reads as absent -- the transaction reports pending
+		// and BeginBackup fails with ErrTxnLocked on a clean snapshot. That is
+		// the same wrong-status failure this function exists to prevent, just
+		// caused by replication lag instead of a route move.
+		val, err := s.getRouteAt(ctx, route, key, ts)
 		return val, errors.WithStack(err)
 	}
 	return s.GetAt(ctx, key, ts)
