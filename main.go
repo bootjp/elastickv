@@ -2654,7 +2654,8 @@ func startRaftServers(
 	const extraOptsCap = 2
 	enableMutators := encryptionMutatorsEnabled(kekConfigured)
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
-	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, encryptionCapabilityFanout, encWiring)
+	monitorFanout, releaseMonitorConns := buildStorageEnvelopeV2MonitorFanout(runtimes, enableMutators)
+	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
 	adminWriterRegistry := writerRegistryForEncryptionAdmin(runtimes, defaultGroup)
 	recoveryLeaderView, recoveryAppliedIndex := recoveryStateForEncryptionAdmin(runtimes, defaultGroup)
 	for _, rt := range runtimes {

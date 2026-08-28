@@ -32,7 +32,7 @@ func TestStorageEnvelopeV2CapabilityMonitorActivatesOnce(t *testing.T) {
 		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
 			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
 		}}}, nil
-	}, wiring)
+	}, nil, wiring)
 	deadline := time.Now().Add(time.Second)
 	for !wiring.storageEnvelopeV2WritesActive() && time.Now().Before(deadline) {
 		time.Sleep(time.Millisecond)
@@ -63,7 +63,7 @@ func TestStorageEnvelopeV2CapabilityMonitorWaitsForBootstrap(t *testing.T) {
 		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
 			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
 		}}}, nil
-	}, wiring)
+	}, nil, wiring)
 	time.Sleep(20 * time.Millisecond)
 	if wiring.storageEnvelopeV2WritesActive() {
 		t.Fatal("capability monitor activated V2 writes before encryption bootstrap")
@@ -285,5 +285,59 @@ func TestStorageEnvelopeV2ActivationLogsActiveKeyID(t *testing.T) {
 	}
 	if got.Uint64() != uint64(activeKeyID) {
 		t.Fatalf("activation log key_id = %d, want %d", got.Uint64(), activeKeyID)
+	}
+}
+
+// The monitor dials every voter and learner of every group on each attempt and
+// then finishes for good once V2 writes activate. Holding those connections
+// afterwards would leave an idle connection per peer on every node of an
+// encrypted cluster -- an all-to-all mesh built by ordinary startup, for a
+// probe that is over -- so the monitor releases them when it stops.
+func TestStorageEnvelopeV2CapabilityMonitorReleasesConnectionsOnActivation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eg, groupCtx := errgroup.WithContext(ctx)
+	cache := encryption.NewStateCache()
+	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
+	sidecar.Active.Storage = 1
+	cache.RefreshFromSidecar(sidecar)
+	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+
+	released := make(chan struct{})
+	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
+			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
+		}}}, nil
+	}, func() error {
+		close(released)
+		return nil
+	}, wiring)
+
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("capability monitor: %v", err)
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("capability monitor kept its fan-out connections after activating")
+	}
+}
+
+// The monitor's fan-out must not share the cutover's process-lifetime cache:
+// releasing the monitor's connections has to be independent of the RPC that
+// an operator may call at any time.
+func TestStorageEnvelopeV2MonitorFanoutOwnsItsConnections(t *testing.T) {
+	t.Parallel()
+	fn, release := buildStorageEnvelopeV2MonitorFanout(nil, true)
+	if fn == nil || release == nil {
+		t.Fatal("monitor fan-out and its release must both be present when mutators are enabled")
+	}
+	if err := release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if fn, release := buildStorageEnvelopeV2MonitorFanout(nil, false); fn != nil || release != nil {
+		t.Error("monitor fan-out must be absent when encryption mutators are disabled")
 	}
 }

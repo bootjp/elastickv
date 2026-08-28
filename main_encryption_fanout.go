@@ -49,20 +49,48 @@ func buildEncryptionCapabilityFanout(ctx context.Context, eg *errgroup.Group, ru
 	return buildCapabilityFanoutFn(runtimes, fanoutConnCache, capabilityFanoutTimeout)
 }
 
+// buildStorageEnvelopeV2MonitorFanout builds the fan-out the startup monitor
+// uses, on a connection cache of its own, and returns the closer for it.
+//
+// It deliberately does not share buildEncryptionCapabilityFanout's cache. That
+// one is the EnableStorageEnvelope cutover's, held for the process lifetime
+// because an operator can call the RPC at any time. The monitor is different:
+// it dials every voter and learner of every group on each attempt and then
+// finishes for good once V2 writes activate. Sharing the cutover's cache would
+// make ordinary startup on an encrypted cluster leave one idle connection per
+// peer on every node -- an all-to-all mesh, built unconditionally, for a probe
+// that is over. With its own cache the monitor drops those connections when it
+// exits, and the cutover dials again if it is ever used.
+func buildStorageEnvelopeV2MonitorFanout(
+	runtimes []*raftGroupRuntime,
+	enableMutators bool,
+) (adapter.CapabilityFanoutFn, func() error) {
+	if !enableMutators {
+		return nil, nil
+	}
+	connCache := &kv.GRPCConnCache{}
+	return buildCapabilityFanoutFn(runtimes, connCache, capabilityFanoutTimeout), connCache.Close
+}
+
 // startStorageEnvelopeV2CapabilityMonitor keeps encrypted writes on V1 until
 // a fresh live-membership fan-out confirms V2 reader support on every voter
 // and learner. Activation is sticky because existing V2 rows remain part of
 // snapshots after the first V2 write.
+//
+// release, when non-nil, is called once the monitor stops -- on activation or
+// on shutdown -- so the connections the probe opened do not outlive it.
 func startStorageEnvelopeV2CapabilityMonitor(
 	ctx context.Context,
 	eg *errgroup.Group,
 	capabilityFanout adapter.CapabilityFanoutFn,
+	release func() error,
 	wiring encryptionWriteWiring,
 ) {
 	if eg == nil || capabilityFanout == nil || wiring.cache == nil || wiring.storageEnvelopeV2Active == nil {
 		return
 	}
 	eg.Go(func() error {
+		defer releaseCapabilityMonitorConns(release)
 		timer := time.NewTimer(0)
 		defer timer.Stop()
 		for {
@@ -77,6 +105,20 @@ func startStorageEnvelopeV2CapabilityMonitor(
 			timer.Reset(storageEnvelopeV2CapabilityRetryInterval)
 		}
 	})
+}
+
+// releaseCapabilityMonitorConns closes the monitor's connections. A close
+// failure is logged rather than returned: the monitor's own outcome is what
+// the errgroup reports, and a stuck connection must not turn a successful
+// activation into a startup failure.
+func releaseCapabilityMonitorConns(release func() error) {
+	if release == nil {
+		return
+	}
+	if err := release(); err != nil {
+		slog.Warn("encryption: close storage envelope capability monitor connections",
+			slog.String("error", err.Error()))
+	}
 }
 
 func tryActivateStorageEnvelopeV2Writes(
