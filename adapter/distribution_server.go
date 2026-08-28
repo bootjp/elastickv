@@ -29,6 +29,7 @@ type DistributionServer struct {
 	readTracker        *kv.ActiveTimestampTracker
 	watchInterval      time.Duration
 	watchLeader        func() bool
+	tsoActivationGate  func(cutover, phaseD bool) error
 	fsObserver         DistributionFilesystemObserver
 	reloadRetry        struct {
 		attempts int
@@ -45,6 +46,26 @@ type DistributionFilesystemObserver interface {
 }
 
 const DistributionFilePinnedHotspotSplitBoundary = "split_boundary"
+
+// WithDistributionTSOActivationGate authorizes a caller's request to activate
+// the durable cutover or Phase-D marker against this node's own rollout
+// configuration.
+//
+// Those two request booleans commit one-way markers. Distribution is registered
+// on the shared Raft gRPC server and the bearer-token interceptor protects only
+// the Admin service, so without this any caller that can reach the port could
+// drive the group-0 leader through the staged rollout -- committing Phase D
+// before every member supports it, or committing cutover on a node whose
+// coordinator is still on the legacy issuance path. The wire fields say what the
+// caller wants; the gate says what this node is configured to do.
+//
+// Leaving it unset keeps the previous behaviour, which suits tests and the
+// single-node demo.
+func WithDistributionTSOActivationGate(gate func(cutover, phaseD bool) error) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.tsoActivationGate = gate
+	}
+}
 
 // WithDistributionCoordinator configures the coordinator used for Raft-backed
 // catalog mutations in SplitRange.
@@ -176,6 +197,9 @@ func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimest
 	if err != nil {
 		return nil, err
 	}
+	if err := s.authorizeTSOActivation(activateCutover, activatePhaseD); err != nil {
+		return nil, err
+	}
 	if s.timestampAllocator == nil {
 		return s.legacyTimestampResponse(count, minTimestamp, activateCutover, activatePhaseD)
 	}
@@ -206,6 +230,21 @@ func timestampActivationValues(req *pb.GetTimestampRequest) (bool, bool, error) 
 			"phase D activation requires cutover activation"))
 	}
 	return activateCutover, activatePhaseD, nil
+}
+
+// authorizeTSOActivation checks an activation request against this node's own
+// rollout configuration before the one-way marker is committed.
+func (s *DistributionServer) authorizeTSOActivation(activateCutover, activatePhaseD bool) error {
+	if !activateCutover && !activatePhaseD {
+		return nil
+	}
+	if s.tsoActivationGate == nil {
+		return nil
+	}
+	if err := s.tsoActivationGate(activateCutover, activatePhaseD); err != nil {
+		return errors.WithStack(status.Error(codes.PermissionDenied, err.Error()))
+	}
+	return nil
 }
 
 func (s *DistributionServer) legacyTimestampResponse(

@@ -14,6 +14,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -1472,4 +1473,61 @@ type recordingDistributionFilesystemObserver struct {
 
 func (o *recordingDistributionFilesystemObserver) ObserveFilePinnedHotspot(reason string) {
 	o.reasons = append(o.reasons, reason)
+}
+
+// GetTimestamp's activate_cutover / activate_phase_d booleans commit one-way
+// markers, and Distribution sits on the shared Raft gRPC server with no
+// bearer-token interceptor of its own. Trusting the wire fields alone would let
+// any caller that reaches the port drive the group-0 leader through the staged
+// rollout.
+func TestDistributionServerGetTimestamp_AuthorizesActivationLocally(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true}
+	var seen [][2]bool
+	refuse := errors.New("local rollout does not permit this activation")
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(cutover, phaseD bool) error {
+			seen = append(seen, [2]bool{cutover, phaseD})
+			return refuse
+		}),
+	)
+
+	_, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Equal(t, [][2]bool{{true, false}}, seen)
+
+	// A request that activates nothing is not gated at all.
+	seen = nil
+	_, err = s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{Count: 1})
+	require.NoError(t, err)
+	require.Empty(t, seen, "the gate is only consulted for activation requests")
+}
+
+// With the gate satisfied the activation proceeds as before.
+func TestDistributionServerGetTimestamp_PermittedActivationProceeds(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(bool, bool) error { return nil }),
+	)
+
+	resp, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+		ActivatePhaseD:  true,
+	})
+	require.NoError(t, err)
+	require.NotZero(t, resp.GetTimestamp())
 }

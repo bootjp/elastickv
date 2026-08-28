@@ -578,3 +578,51 @@ func TestInternalTimestampOptionsPreservesPhaseDValidatorThroughStartupGate(t *t
 	require.NoError(t,
 		kv.ValidateDurablePersistenceTimestamp(context.Background(), installed, 101, "test"))
 }
+
+// The activation gate answers from this node's own runtime mode, so a caller
+// cannot drive the group-0 leader past the stage the operator configured.
+func TestCoordinatorTSOWiringAuthorizeActivation(t *testing.T) {
+	t.Parallel()
+
+	// No dedicated TSO runtime at all: nothing to authorize against.
+	var bare coordinatorTSOWiring
+	require.NoError(t, bare.authorizeActivation(false, false))
+	require.Error(t, bare.authorizeActivation(true, false))
+	require.Error(t, bare.authorizeActivation(true, true))
+
+	newWiring := func(t *testing.T, mode kv.TSOMode) coordinatorTSOWiring {
+		t.Helper()
+		clock := kv.NewHLC()
+		clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+		fsm := kv.NewTSOStateMachine(clock)
+		engine := &mainTSOEngine{state: raftengine.StateLeader, tsoState: fsm}
+		groups := map[uint64]*kv.ShardGroup{
+			dedicatedTSORaftGroupID: {Engine: engine, TSOState: fsm},
+		}
+		coord := newMainTSOCoordinator(clock, groups)
+		wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{})
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, wiring.Close()) })
+		for next := kv.TSOModeShadow; next <= mode; next++ {
+			require.NoError(t, wiring.runtimeController.ApplyMode(next))
+		}
+		return wiring
+	}
+
+	setTSOModeFlags(t, false, false)
+	path := filepath.Join(t.TempDir(), "tso-mode")
+	require.NoError(t, os.WriteFile(path, []byte("legacy\n"), 0o600))
+	*tsoModeFile = path
+
+	legacy := newWiring(t, kv.TSOModeLegacy)
+	require.Error(t, legacy.authorizeActivation(true, false), "legacy mode may not activate cutover")
+	require.Error(t, legacy.authorizeActivation(true, true))
+
+	cutover := newWiring(t, kv.TSOModeCutover)
+	require.NoError(t, cutover.authorizeActivation(true, false))
+	require.Error(t, cutover.authorizeActivation(true, true), "cutover mode may not activate phase D")
+
+	phaseD := newWiring(t, kv.TSOModePhaseD)
+	require.NoError(t, phaseD.authorizeActivation(true, false))
+	require.NoError(t, phaseD.authorizeActivation(true, true))
+}

@@ -713,6 +713,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		distCatalog,
 		adapter.WithDistributionCoordinator(in.coordinate),
 		adapter.WithDistributionTimestampAllocator(in.tsoWiring.serverAllocator),
+		adapter.WithDistributionTSOActivationGate(in.tsoWiring.authorizeActivation),
 		adapter.WithDistributionActiveTimestampTracker(in.readTracker),
 		adapter.WithCatalogWatchLeaderCheck(func() bool {
 			engine := catalogRuntime.snapshotEngine()
@@ -2201,6 +2202,42 @@ type coordinatorTSOWiring struct {
 	serverAllocator   kv.TSOAllocator
 	routedAllocator   *kv.LeaderRoutedTSOAllocator
 	runtimeController *kv.TSORuntimeController
+}
+
+var (
+	// ErrTSOActivationNotConfigured is returned when a caller asks to activate a
+	// TSO marker on a node that runs no dedicated TSO runtime.
+	ErrTSOActivationNotConfigured = errors.New("tso activation requires a dedicated TSO runtime on this node")
+	// ErrTSOActivationNotPermitted is returned when the request asks for a stage
+	// beyond the one this node is configured for.
+	ErrTSOActivationNotPermitted = errors.New("tso activation is beyond this node's configured rollout stage")
+)
+
+// authorizeActivation reports whether this node's own rollout configuration
+// permits committing the durable cutover or Phase-D marker a caller asked for.
+//
+// The two request booleans on GetTimestamp commit one-way markers, and the
+// Distribution service sits on the shared Raft gRPC server with no bearer-token
+// interceptor of its own. Trusting the wire fields alone would let any caller
+// that reaches the port drive the group-0 leader through the staged rollout --
+// committing Phase D before every member supports it, or committing cutover on
+// a node still issuing through the legacy path. The runtime mode is what the
+// operator configured through --tsoModeFile, so it is the right authority.
+func (w coordinatorTSOWiring) authorizeActivation(cutover, phaseD bool) error {
+	if !cutover && !phaseD {
+		return nil
+	}
+	if w.runtimeController == nil {
+		return errors.WithStack(ErrTSOActivationNotConfigured)
+	}
+	mode := w.runtimeController.CurrentMode()
+	if phaseD && mode < kv.TSOModePhaseD {
+		return errors.Wrapf(ErrTSOActivationNotPermitted, "phase-d activation requires local mode phase-d, have %s", mode)
+	}
+	if cutover && mode < kv.TSOModeCutover {
+		return errors.Wrapf(ErrTSOActivationNotPermitted, "cutover activation requires local mode cutover or later, have %s", mode)
+	}
+	return nil
 }
 
 func (w coordinatorTSOWiring) Close() error {
