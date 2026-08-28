@@ -141,6 +141,17 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(s3keys.BlobPrefix),
 	[]byte(s3keys.ChunkRefPrefix),
 	[]byte(s3keys.GCUploadPrefix),
+	// Chunk blob payloads are peer-local: they are written straight to the
+	// receiving node's Pebble instead of through Raft, and peers pull them by
+	// digest over S3BlobFetch when they apply the matching chunkref. They are
+	// also content-addressed, so one row backs every object whose chunk hashes
+	// the same -- including objects whose route keys are not moving. Exporting
+	// them under the user bracket would both forge a Raft-replicated copy of
+	// state that is deliberately off the log and let the source cleanup drop
+	// blobs unmigrated objects still dereference. They are excluded here with
+	// no family bracket of their own: the blob transport, not the migrator,
+	// puts them on the target's nodes.
+	[]byte(s3keys.ChunkBlobPrefix),
 	fskeys.ChunkAllPrefix(),
 	fskeys.UsageRouteAllPrefix(),
 }
@@ -380,7 +391,8 @@ func MigrationKnownInternalPrefixes() [][]byte {
 }
 
 // IsMigrationKnownInternalKey reports whether a raw key belongs to a concrete
-// internal family owned by an explicit export bracket or by the txn-lock drain.
+// internal family owned by an explicit export bracket, by the txn-lock drain,
+// or by a peer-local store that the migrator must not export at all.
 func IsMigrationKnownInternalKey(key []byte) bool {
 	return hasAnyPrefix(key, migrationInternalFamilyPrefixes)
 }
