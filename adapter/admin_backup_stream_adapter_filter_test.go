@@ -39,9 +39,11 @@ func TestStreamBackupAppliesTheBeginAdapterFilter(t *testing.T) {
 	require.Equal(t, redisKey, stream.got[0].GetKey())
 }
 
-// A malformed key inside an adapter the dump does include must still fail the
-// stream: the filter narrows what is classified, it does not relax classification.
-func TestStreamBackupStillRejectsMalformedKeysInSelectedAdapters(t *testing.T) {
+// The filter narrows which adapters get classified; it does not relax
+// classification inside an included one. A malformed key there fails closed at
+// BeginBackup's own preflight scan, so it never reaches the stream at all --
+// which is why this asserts on BeginBackup rather than on StreamBackup.
+func TestBeginBackupStillRejectsMalformedKeysInSelectedAdapters(t *testing.T) {
 	t.Parallel()
 
 	malformedDDBKey := []byte(logicalbackup.DDBTableMetaPrefix + "!!!")
@@ -51,9 +53,6 @@ func TestStreamBackupStillRejectsMalformedKeysInSelectedAdapters(t *testing.T) {
 	srv := newBackupControlTestServer(t, store,
 		map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
 
-	// Begin itself fails closed on the malformed key once DynamoDB is included,
-	// which is the existing contract; drive the stream through a redis-only
-	// Begin and then widen the request's scopes to reach the stream filter.
 	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"dynamodb"}})
 	require.Error(t, err, "preflight classifies the included adapter strictly")
 	require.Nil(t, begin)
