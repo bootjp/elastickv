@@ -29,12 +29,24 @@ func (s Scope) ID() string {
 // producing an incomplete expected-key baseline.
 var ErrScopeKeyMalformed = errors.New("backup: malformed scoped key")
 
+// ErrScopeOffloadedChunkBlob marks a content-addressed S3 chunk blob. A chunk
+// blob carries no bucket in its key, so there is no scope to stream it under,
+// and skipping it silently would emit an object's manifest and chunk
+// references without the bytes they point at -- a dump whose decoder cannot
+// finalize. The live path fails here instead of producing one that cannot be
+// restored. Reaching this needs S3 blob offload to actually admit PUTs, which
+// stays gated off until the M3 reference-counting and orphan-scanner work
+// lands; emitting these blobs is part of enabling that mode.
+var ErrScopeOffloadedChunkBlob = errors.New("backup: live backup cannot represent an offloaded S3 chunk blob")
+
 // ScopeForKey maps an internal user-data key to its logical backup scope.
 // Internal control-plane keys and derivable indexes return (_, false, nil).
 func ScopeForKey(key []byte) (Scope, bool, error) {
 	switch {
 	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBItemPrefix, DDBGSIPrefix):
 		return scopeForDDBKey(key)
+	case bytes.HasPrefix(key, []byte(S3ChunkBlobPrefix)):
+		return Scope{}, false, errors.WithStack(ErrScopeOffloadedChunkBlob)
 	case hasAnyBackupPrefix(key,
 		S3BucketMetaPrefix, S3ObjectManifestPrefix,
 		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3ChunkRefPrefix,
