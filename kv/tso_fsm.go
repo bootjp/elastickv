@@ -665,15 +665,13 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 		phaseDActive = s.phaseDActive
 		phaseDFloor = s.phaseDFloor
 	}
-	snapshotLen := tsoSnapshotV3Len
-	if phaseDActive {
-		snapshotLen = tsoSnapshotV4Len
-	}
-	buf := make([]byte, snapshotLen)
+	buf := make([]byte, tsoSnapshotLenFor(ceilingMs, allocationFloor, cutoverActive, phaseDActive))
 	if err := encodeTSOCeiling(buf, ceilingMs); err != nil {
 		return 0, err
 	}
-	binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:tsoSnapshotV2Len], allocationFloor)
+	if len(buf) >= tsoSnapshotV2Len {
+		binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:tsoSnapshotV2Len], allocationFloor)
+	}
 	if cutoverActive {
 		buf[tsoSnapshotV2Len] = 1
 	}
@@ -689,6 +687,43 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 		return int64(n), errors.WithStack(io.ErrShortWrite)
 	}
 	return int64(n), nil
+}
+
+// tsoSnapshotLenFor returns the shortest snapshot layout that can carry this
+// state. Each layout is its predecessor plus one trailing field, and only the
+// 8-byte V1 form is one a binary predating the allocation floor will restore:
+// it reads exactly 8 bytes and rejects anything longer as trailing bytes.
+// During the rolling window group 0 carries nothing but HLC lease ceilings --
+// applyLeaseCeiling never touches the allocation floor, and neither the
+// cutover nor the phase-D marker can be set before their envelopes are
+// proposed -- so emitting V1 there keeps a not-yet-upgraded follower able to
+// catch up from a snapshot after log compaction instead of stranding it and
+// putting group 0's quorum at risk.
+func tsoSnapshotLenFor(ceilingMs int64, allocationFloor uint64, cutoverActive, phaseDActive bool) int {
+	switch {
+	case phaseDActive:
+		return tsoSnapshotV4Len
+	case cutoverActive:
+		return tsoSnapshotV3Len
+	case tsoAllocationFloorIsLeaseDerived(ceilingMs, allocationFloor):
+		return tsoSnapshotV1Len
+	default:
+		return tsoSnapshotV2Len
+	}
+}
+
+// tsoAllocationFloorIsLeaseDerived reports whether V1 can carry this floor. A
+// V1 payload has no floor field, and its reader reconstructs exactly
+// tsoLeaseAllocationFloor(ceiling), so a floor already equal to that value
+// round-trips unchanged. A zero floor is the other V1 case: the reader then
+// substitutes the lease-derived value, which is only ever higher. That widens
+// the upper bound ValidateDurableTimestamp accepts, but a zero floor means no
+// allocation-floor envelope has been committed, and neither has the phase-D
+// marker that same window requires -- validation refuses everything with
+// ErrTSOPhaseDInactive until it does. Any other floor is real allocator state
+// that a lease-derived substitute could raise, so it needs V2.
+func tsoAllocationFloorIsLeaseDerived(ceilingMs int64, allocationFloor uint64) bool {
+	return allocationFloor == 0 || allocationFloor == tsoLeaseAllocationFloor(ceilingMs)
 }
 
 func encodeTSOCeiling(dst []byte, ceilingMs int64) error {

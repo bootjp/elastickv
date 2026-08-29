@@ -638,7 +638,7 @@ func (r *RedisServer) redisReadFencedTimestampForTargets(
 	if err := r.leaseRedisReadFenceTargets(ctx, targets); err != nil {
 		return kv.ReadTimestamp{}, nil, err
 	}
-	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, selectTS(), label)
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, r.coordinator, redisFencedSelectTS(selectTS), label)
 	if err != nil {
 		return kv.ReadTimestamp{}, nil, errors.WithStack(err)
 	}
@@ -648,6 +648,25 @@ func (r *RedisServer) redisReadFencedTimestampForTargets(
 		return kv.ReadTimestamp{}, nil, err
 	}
 	return readTimestamp, readPin, nil
+}
+
+// redisFencedSelectTS normalizes the empty-store watermark before it reaches
+// the Phase-D boundary. snapshotTS answers ^uint64(0) for a store with no
+// committed record -- "the latest of everything" for a direct MVCC read -- but
+// BeginReadTimestampThrough rejects both 0 and ^uint64(0) as invalid read
+// timestamps once Phase D is required, so reading a nonexistent key on a fresh
+// cluster would return an error instead of an empty result, and Phase D could
+// never activate from that path. 1 is the floor txnStartTS already uses for
+// the same case: below every real commit, so the read still sees nothing.
+func redisFencedSelectTS(selectTS func() uint64) uint64 {
+	if selectTS == nil {
+		return 1
+	}
+	ts := selectTS()
+	if ts == 0 || ts == ^uint64(0) {
+		return 1
+	}
+	return ts
 }
 
 // MULTI/EXEC/DISCARD handling

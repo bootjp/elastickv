@@ -274,8 +274,8 @@ func TestTSOStateMachineSnapshotWithNilHLCWritesZeroState(t *testing.T) {
 	var buf bytes.Buffer
 	n, err := snap.WriteTo(&buf)
 	require.NoError(t, err)
-	require.EqualValues(t, tsoSnapshotV3Len, n)
-	require.Equal(t, make([]byte, tsoSnapshotV3Len), buf.Bytes())
+	require.EqualValues(t, tsoSnapshotV1Len, n)
+	require.Equal(t, make([]byte, tsoSnapshotV1Len), buf.Bytes())
 }
 
 func TestTSOStateMachineSnapshotRestoreRoundTrip(t *testing.T) {
@@ -335,7 +335,10 @@ func TestTSOStateMachineSnapshotUsesTSOOwnedCeiling(t *testing.T) {
 	targetHLC := NewHLC()
 	require.NoError(t, NewTSOStateMachine(targetHLC).Restore(bytes.NewReader(buf.Bytes())))
 	require.Equal(t, tsoCeiling, targetHLC.PhysicalCeiling())
-	require.Zero(t, targetHLC.Current())
+	// The restored floor is reconstructed from the TSO-owned ceiling, not from
+	// the unrelated HLC value the source clock was carrying.
+	require.Equal(t, tsoLeaseAllocationFloor(tsoCeiling), targetHLC.Current())
+	require.Less(t, targetHLC.Current(), tsoLeaseAllocationFloor(unrelatedCeiling))
 }
 
 func TestTSOStateMachineRestoreRejectsTruncatedSnapshot(t *testing.T) {
@@ -431,9 +434,15 @@ func TestTSOStateMachineRestoreKeepsMonotonicCeiling(t *testing.T) {
 	var snapBuf bytes.Buffer
 	n, err := snap.WriteTo(&snapBuf)
 	require.NoError(t, err)
-	require.EqualValues(t, tsoSnapshotV3Len, n)
+	// The floor is exactly the value a V1 reader reconstructs from the ceiling,
+	// so the shorter layout carries it implicitly and round-trips unchanged.
+	require.EqualValues(t, tsoSnapshotV1Len, n)
 	require.Equal(t, uint64(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[:hlcLeasePayloadLen]))
-	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), binary.BigEndian.Uint64(snapBuf.Bytes()[hlcLeasePayloadLen:tsoSnapshotV2Len]))
+
+	roundTripClock := NewHLC()
+	require.NoError(t, NewTSOStateMachine(roundTripClock).Restore(bytes.NewReader(snapBuf.Bytes())))
+	require.Equal(t, higherCeiling, roundTripClock.PhysicalCeiling())
+	require.Equal(t, tsoLeaseAllocationFloor(higherCeiling), roundTripClock.Current())
 }
 
 func TestTSOStateMachineRestoresLegacyKVFSMSnapshot(t *testing.T) {
@@ -470,10 +479,12 @@ func TestTSOStateMachineRestoresLegacyKVFSMSnapshot(t *testing.T) {
 			var payload bytes.Buffer
 			_, err = got.WriteTo(&payload)
 			require.NoError(t, err)
-			require.Len(t, payload.Bytes(), tsoSnapshotV3Len)
+			// The restored floor is exactly what a V1 reader reconstructs, so
+			// the re-emitted snapshot stays on the layout the previous binary
+			// can still read -- a node that caught up from an old leader must
+			// not become unreadable to its remaining old peers.
+			require.Len(t, payload.Bytes(), tsoSnapshotV1Len)
 			require.Equal(t, uint64(ceilingMs), binary.BigEndian.Uint64(payload.Bytes()[:hlcLeasePayloadLen]))
-			require.Equal(t, tsoLeaseAllocationFloor(ceilingMs), binary.BigEndian.Uint64(payload.Bytes()[hlcLeasePayloadLen:tsoSnapshotV2Len]))
-			require.Zero(t, payload.Bytes()[tsoSnapshotV2Len])
 		})
 	}
 }
@@ -514,7 +525,7 @@ func TestTSOStateMachineSnapshotWriteWrapsShortWrite(t *testing.T) {
 
 	snap := &tsoFSMSnapshot{ceilingMs: 1}
 	n, err := snap.WriteTo(shortTSOWriter{})
-	require.EqualValues(t, tsoSnapshotV3Len-1, n)
+	require.EqualValues(t, tsoSnapshotV1Len-1, n)
 	require.ErrorIs(t, err, io.ErrShortWrite)
 }
 
