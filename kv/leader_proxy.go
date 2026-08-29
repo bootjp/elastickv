@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/metadata"
 )
 
 const leaderForwardTimeout = 5 * time.Second
@@ -29,6 +30,7 @@ const leaderProxyRetryInterval = 25 * time.Millisecond
 type LeaderProxy struct {
 	engine raftengine.Engine
 	tm     *TransactionManager
+	group  *ShardGroup
 
 	connCache      GRPCConnCache
 	forwardBreaker leaderProxyCircuitBreaker
@@ -265,6 +267,49 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 		return nil, ErrInvalidRequest
 	}
 	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
+}
+
+func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {
+	deadline := time.Now().Add(leaderProxyRetryBudget)
+	ctx, cancel := context.WithDeadline(callerCtx, deadline)
+	defer cancel()
+	var lastErr error
+	for time.Now().Before(deadline) {
+		result, err := p.forwardLeaseReadOnce(ctx)
+		if err == nil {
+			return result, nil
+		}
+		lastErr = err
+		if !isTransientLeaderError(err) {
+			return leaseReadResult{}, err
+		}
+		waitLeaderProxyBackoff(ctx, leaderProxyRetryInterval, deadline)
+	}
+	if lastErr == nil {
+		lastErr = ErrLeaderNotFound
+	}
+	return leaseReadResult{}, errors.WithStack(lastErr)
+}
+
+func (p *LeaderProxy) forwardLeaseReadOnce(parentCtx context.Context) (leaseReadResult, error) {
+	addr := leaderAddrFromEngine(p.engine)
+	if addr == "" {
+		return leaseReadResult{}, errors.WithStack(ErrLeaderNotFound)
+	}
+	conn, err := p.connCache.ConnFor(addr)
+	if err != nil {
+		return leaseReadResult{}, err
+	}
+	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
+	defer cancel()
+	if token := p.group.forwardedLeaderReadToken(); token != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+	}
+	resp, err := pb.NewInternalClient(conn).ForwardLeaseRead(ctx, &pb.ForwardLeaseReadRequest{})
+	if err != nil {
+		return leaseReadResult{}, errors.WithStack(err)
+	}
+	return leaseReadResult{appliedIndex: resp.GetAppliedIndex(), lastCommitTS: resp.GetLastCommitTs()}, nil
 }
 
 func (p *LeaderProxy) recordForwardFailure(callerCtx context.Context, identity leaderProxyIdentity, requestID uint64, err error) error {

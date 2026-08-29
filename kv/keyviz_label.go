@@ -143,6 +143,10 @@ func (c keyVizLabeledCoordinator) LeaseReadAllGroups(ctx context.Context) error 
 	return errors.WithStack(err)
 }
 
+func (c keyVizLabeledCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
+	return LeaseReadAllGroupsTimestampThrough(c.inner, ctx)
+}
+
 // IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
 // group-keyed read-fence path. The Redis adapter wraps its coordinator with
 // WithKeyVizLabel, so this is the outermost type the fence type-asserts against;
