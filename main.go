@@ -1600,6 +1600,7 @@ func buildShardGroups(
 		factory:                  factory,
 		proposalObserverForGroup: proposalObserverForGroup,
 		clock:                    clock,
+		readTracker:              readTracker,
 		kekWrapper:               kekWrapper,
 		keystore:                 keystore,
 		sidecarPath:              sidecarPath,
@@ -1631,6 +1632,7 @@ type shardGroupBuilder struct {
 	factory                  raftengine.Factory
 	proposalObserverForGroup func(uint64) kv.ProposalObserver
 	clock                    *kv.HLC
+	readTracker              *kv.ActiveTimestampTracker
 	kekWrapper               kek.Wrapper
 	keystore                 *encryption.Keystore
 	sidecarPath              string
@@ -1679,7 +1681,8 @@ func (b shardGroupBuilder) buildDataGroup(
 		_ = st.Close()
 		return nil, nil, errors.Wrapf(err, "failed to construct encryption applier for group %d", group.id)
 	}
-	sm := kv.NewKvFSMWithHLC(st, b.clock, fsmOptionsForGroup(applier, b.routeEngine, group.id, b.encWiring, b.applyObservers...)...)
+	sm := kv.NewKvFSMWithHLCAndTracker(st, b.clock, b.readTracker,
+		fsmOptionsForGroup(applier, b.routeEngine, group.id, b.encWiring, b.applyObservers...)...)
 	runtime, err := buildRuntimeForGroup(
 		b.raftID, group, b.raftDir, b.multi, bootstrap,
 		bootstrapServers, bootstrapSeed,
