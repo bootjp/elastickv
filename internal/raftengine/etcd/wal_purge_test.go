@@ -213,3 +213,8 @@ func TestSnapshotEveryFromEnv_FallsBackOnInvalid(t *testing.T) {
 	t.Setenv(snapshotEveryEnvVar, "not-a-number")
 	require.Equal(t, uint64(defaultSnapshotEvery), snapshotEveryFromEnv())
 }
+
+func TestEngineSnapshotEveryReadsConfiguredThreshold(t *testing.T) {
+	require.Equal(t, uint64(defaultSnapshotEvery), (&Engine{}).SnapshotEvery())
+	require.Equal(t, uint64(5000), (&Engine{snapshotEvery: 5000}).SnapshotEvery())
+}

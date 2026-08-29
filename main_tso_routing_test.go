@@ -443,6 +443,8 @@ func (e *mainTSOEngine) Configuration(context.Context) (raftengine.Configuration
 	return raftengine.Configuration{}, nil
 }
 
+func (e *mainTSOEngine) SnapshotEvery() uint64 { return 0 }
+
 func (e *mainTSOEngine) Close() error { return nil }
 
 // Legacy warm-up must not narrow timestamp leadership, lease renewal, or lease

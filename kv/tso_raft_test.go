@@ -797,6 +797,8 @@ func (e *recordingTSOEngine) Configuration(context.Context) (raftengine.Configur
 	return raftengine.Configuration{}, nil
 }
 
+func (e *recordingTSOEngine) SnapshotEvery() uint64 { return 0 }
+
 func (e *recordingTSOEngine) Close() error { return nil }
 
 func (e *recordingTSOEngine) setProposeError(err error) {

@@ -19,13 +19,19 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Admin_GetClusterOverview_FullMethodName  = "/Admin/GetClusterOverview"
-	Admin_GetRaftGroups_FullMethodName       = "/Admin/GetRaftGroups"
-	Admin_GetAdapterSummary_FullMethodName   = "/Admin/GetAdapterSummary"
-	Admin_GetKeyVizMatrix_FullMethodName     = "/Admin/GetKeyVizMatrix"
-	Admin_GetRouteDetail_FullMethodName      = "/Admin/GetRouteDetail"
-	Admin_SetAutoSplitEnabled_FullMethodName = "/Admin/SetAutoSplitEnabled"
-	Admin_StreamEvents_FullMethodName        = "/Admin/StreamEvents"
+	Admin_GetClusterOverview_FullMethodName    = "/Admin/GetClusterOverview"
+	Admin_GetRaftGroups_FullMethodName         = "/Admin/GetRaftGroups"
+	Admin_GetAdapterSummary_FullMethodName     = "/Admin/GetAdapterSummary"
+	Admin_GetKeyVizMatrix_FullMethodName       = "/Admin/GetKeyVizMatrix"
+	Admin_GetRouteDetail_FullMethodName        = "/Admin/GetRouteDetail"
+	Admin_SetAutoSplitEnabled_FullMethodName   = "/Admin/SetAutoSplitEnabled"
+	Admin_BeginBackup_FullMethodName           = "/Admin/BeginBackup"
+	Admin_RenewBackup_FullMethodName           = "/Admin/RenewBackup"
+	Admin_EndBackup_FullMethodName             = "/Admin/EndBackup"
+	Admin_ListAdaptersAndScopes_FullMethodName = "/Admin/ListAdaptersAndScopes"
+	Admin_StreamBackup_FullMethodName          = "/Admin/StreamBackup"
+	Admin_GetNodeVersion_FullMethodName        = "/Admin/GetNodeVersion"
+	Admin_StreamEvents_FullMethodName          = "/Admin/StreamEvents"
 )
 
 // AdminClient is the client API for Admin service.
@@ -43,6 +49,12 @@ type AdminClient interface {
 	GetKeyVizMatrix(ctx context.Context, in *GetKeyVizMatrixRequest, opts ...grpc.CallOption) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(ctx context.Context, in *GetRouteDetailRequest, opts ...grpc.CallOption) (*GetRouteDetailResponse, error)
 	SetAutoSplitEnabled(ctx context.Context, in *SetAutoSplitEnabledRequest, opts ...grpc.CallOption) (*SetAutoSplitEnabledResponse, error)
+	BeginBackup(ctx context.Context, in *BeginBackupRequest, opts ...grpc.CallOption) (*BeginBackupResponse, error)
+	RenewBackup(ctx context.Context, in *RenewBackupRequest, opts ...grpc.CallOption) (*RenewBackupResponse, error)
+	EndBackup(ctx context.Context, in *EndBackupRequest, opts ...grpc.CallOption) (*EndBackupResponse, error)
+	ListAdaptersAndScopes(ctx context.Context, in *ListAdaptersAndScopesRequest, opts ...grpc.CallOption) (*ListAdaptersAndScopesResponse, error)
+	StreamBackup(ctx context.Context, in *StreamBackupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupKV], error)
+	GetNodeVersion(ctx context.Context, in *GetNodeVersionRequest, opts ...grpc.CallOption) (*GetNodeVersionResponse, error)
 	StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamEventsEvent], error)
 }
 
@@ -114,9 +126,78 @@ func (c *adminClient) SetAutoSplitEnabled(ctx context.Context, in *SetAutoSplitE
 	return out, nil
 }
 
+func (c *adminClient) BeginBackup(ctx context.Context, in *BeginBackupRequest, opts ...grpc.CallOption) (*BeginBackupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(BeginBackupResponse)
+	err := c.cc.Invoke(ctx, Admin_BeginBackup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) RenewBackup(ctx context.Context, in *RenewBackupRequest, opts ...grpc.CallOption) (*RenewBackupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(RenewBackupResponse)
+	err := c.cc.Invoke(ctx, Admin_RenewBackup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) EndBackup(ctx context.Context, in *EndBackupRequest, opts ...grpc.CallOption) (*EndBackupResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(EndBackupResponse)
+	err := c.cc.Invoke(ctx, Admin_EndBackup_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) ListAdaptersAndScopes(ctx context.Context, in *ListAdaptersAndScopesRequest, opts ...grpc.CallOption) (*ListAdaptersAndScopesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ListAdaptersAndScopesResponse)
+	err := c.cc.Invoke(ctx, Admin_ListAdaptersAndScopes_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *adminClient) StreamBackup(ctx context.Context, in *StreamBackupRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[BackupKV], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Admin_ServiceDesc.Streams[0], Admin_StreamBackup_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[StreamBackupRequest, BackupKV]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Admin_StreamBackupClient = grpc.ServerStreamingClient[BackupKV]
+
+func (c *adminClient) GetNodeVersion(ctx context.Context, in *GetNodeVersionRequest, opts ...grpc.CallOption) (*GetNodeVersionResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetNodeVersionResponse)
+	err := c.cc.Invoke(ctx, Admin_GetNodeVersion_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *adminClient) StreamEvents(ctx context.Context, in *StreamEventsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[StreamEventsEvent], error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
-	stream, err := c.cc.NewStream(ctx, &Admin_ServiceDesc.Streams[0], Admin_StreamEvents_FullMethodName, cOpts...)
+	stream, err := c.cc.NewStream(ctx, &Admin_ServiceDesc.Streams[1], Admin_StreamEvents_FullMethodName, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -148,6 +229,12 @@ type AdminServer interface {
 	GetKeyVizMatrix(context.Context, *GetKeyVizMatrixRequest) (*GetKeyVizMatrixResponse, error)
 	GetRouteDetail(context.Context, *GetRouteDetailRequest) (*GetRouteDetailResponse, error)
 	SetAutoSplitEnabled(context.Context, *SetAutoSplitEnabledRequest) (*SetAutoSplitEnabledResponse, error)
+	BeginBackup(context.Context, *BeginBackupRequest) (*BeginBackupResponse, error)
+	RenewBackup(context.Context, *RenewBackupRequest) (*RenewBackupResponse, error)
+	EndBackup(context.Context, *EndBackupRequest) (*EndBackupResponse, error)
+	ListAdaptersAndScopes(context.Context, *ListAdaptersAndScopesRequest) (*ListAdaptersAndScopesResponse, error)
+	StreamBackup(*StreamBackupRequest, grpc.ServerStreamingServer[BackupKV]) error
+	GetNodeVersion(context.Context, *GetNodeVersionRequest) (*GetNodeVersionResponse, error)
 	StreamEvents(*StreamEventsRequest, grpc.ServerStreamingServer[StreamEventsEvent]) error
 	mustEmbedUnimplementedAdminServer()
 }
@@ -176,6 +263,24 @@ func (UnimplementedAdminServer) GetRouteDetail(context.Context, *GetRouteDetailR
 }
 func (UnimplementedAdminServer) SetAutoSplitEnabled(context.Context, *SetAutoSplitEnabledRequest) (*SetAutoSplitEnabledResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SetAutoSplitEnabled not implemented")
+}
+func (UnimplementedAdminServer) BeginBackup(context.Context, *BeginBackupRequest) (*BeginBackupResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method BeginBackup not implemented")
+}
+func (UnimplementedAdminServer) RenewBackup(context.Context, *RenewBackupRequest) (*RenewBackupResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method RenewBackup not implemented")
+}
+func (UnimplementedAdminServer) EndBackup(context.Context, *EndBackupRequest) (*EndBackupResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method EndBackup not implemented")
+}
+func (UnimplementedAdminServer) ListAdaptersAndScopes(context.Context, *ListAdaptersAndScopesRequest) (*ListAdaptersAndScopesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ListAdaptersAndScopes not implemented")
+}
+func (UnimplementedAdminServer) StreamBackup(*StreamBackupRequest, grpc.ServerStreamingServer[BackupKV]) error {
+	return status.Error(codes.Unimplemented, "method StreamBackup not implemented")
+}
+func (UnimplementedAdminServer) GetNodeVersion(context.Context, *GetNodeVersionRequest) (*GetNodeVersionResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetNodeVersion not implemented")
 }
 func (UnimplementedAdminServer) StreamEvents(*StreamEventsRequest, grpc.ServerStreamingServer[StreamEventsEvent]) error {
 	return status.Error(codes.Unimplemented, "method StreamEvents not implemented")
@@ -309,6 +414,107 @@ func _Admin_SetAutoSplitEnabled_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Admin_BeginBackup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(BeginBackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).BeginBackup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_BeginBackup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).BeginBackup(ctx, req.(*BeginBackupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_RenewBackup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(RenewBackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).RenewBackup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_RenewBackup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).RenewBackup(ctx, req.(*RenewBackupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_EndBackup_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(EndBackupRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).EndBackup(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_EndBackup_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).EndBackup(ctx, req.(*EndBackupRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_ListAdaptersAndScopes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ListAdaptersAndScopesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).ListAdaptersAndScopes(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_ListAdaptersAndScopes_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).ListAdaptersAndScopes(ctx, req.(*ListAdaptersAndScopesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Admin_StreamBackup_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(StreamBackupRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(AdminServer).StreamBackup(m, &grpc.GenericServerStream[StreamBackupRequest, BackupKV]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Admin_StreamBackupServer = grpc.ServerStreamingServer[BackupKV]
+
+func _Admin_GetNodeVersion_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetNodeVersionRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(AdminServer).GetNodeVersion(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Admin_GetNodeVersion_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(AdminServer).GetNodeVersion(ctx, req.(*GetNodeVersionRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Admin_StreamEvents_Handler(srv interface{}, stream grpc.ServerStream) error {
 	m := new(StreamEventsRequest)
 	if err := stream.RecvMsg(m); err != nil {
@@ -351,8 +557,33 @@ var Admin_ServiceDesc = grpc.ServiceDesc{
 			MethodName: "SetAutoSplitEnabled",
 			Handler:    _Admin_SetAutoSplitEnabled_Handler,
 		},
+		{
+			MethodName: "BeginBackup",
+			Handler:    _Admin_BeginBackup_Handler,
+		},
+		{
+			MethodName: "RenewBackup",
+			Handler:    _Admin_RenewBackup_Handler,
+		},
+		{
+			MethodName: "EndBackup",
+			Handler:    _Admin_EndBackup_Handler,
+		},
+		{
+			MethodName: "ListAdaptersAndScopes",
+			Handler:    _Admin_ListAdaptersAndScopes_Handler,
+		},
+		{
+			MethodName: "GetNodeVersion",
+			Handler:    _Admin_GetNodeVersion_Handler,
+		},
 	},
 	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "StreamBackup",
+			Handler:       _Admin_StreamBackup_Handler,
+			ServerStreams: true,
+		},
 		{
 			StreamName:    "StreamEvents",
 			Handler:       _Admin_StreamEvents_Handler,

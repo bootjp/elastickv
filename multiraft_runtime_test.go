@@ -63,6 +63,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesSingleDataGroupDir(t *testing.
 		kv.NewHLC(),
 		nil,
 		nil,
+		nil,
 		"",
 		encryptionWriteWiring{},
 		engine,
@@ -106,6 +107,7 @@ func TestBuildShardGroupsWithDedicatedTSOPreservesLegacyGroupZeroStore(t *testin
 		factory,
 		nil,
 		kv.NewHLC(),
+		kv.NewActiveTimestampTracker(),
 		nil,
 		nil,
 		"",
@@ -147,6 +149,7 @@ func TestBuildShardGroupsClosesEarlierStoresWhenLaterGroupFails(t *testing.T) {
 		factory,
 		nil,
 		kv.NewHLC(),
+		kv.NewActiveTimestampTracker(),
 		nil,
 		nil,
 		"",
@@ -182,6 +185,7 @@ func TestDedicatedTSOGroupContinuesAfterLegacyEncryptionEntry(t *testing.T) {
 		factory,
 		nil,
 		clock,
+		kv.NewActiveTimestampTracker(),
 		nil,
 		nil,
 		"",
@@ -236,7 +240,8 @@ func TestBuildShardGroupsWithEtcdEngineRoutesAcrossGroups(t *testing.T) {
 	factory, err := newRaftFactory(raftEngineEtcd, nil)
 	require.NoError(t, err)
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, raftBootstrapConfig{}, factory, nil, clock, nil, nil, "", encryptionWriteWiring{}, nil)
+	runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, true, raftBootstrapConfig{},
+		factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "", encryptionWriteWiring{}, nil)
 	require.NoError(t, err)
 
 	engine := distribution.NewEngine()
@@ -290,7 +295,9 @@ func TestBuildShardGroupsWithEtcdEngineRestartsAcrossGroups(t *testing.T) {
 	openShardStore := func(bootstrap bool) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, *kv.ShardStore) {
 		factory, err := newRaftFactory(raftEngineEtcd, nil)
 		require.NoError(t, err)
-		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap, raftBootstrapConfig{}, factory, nil, sharedClock, nil, nil, "", encryptionWriteWiring{}, nil)
+		runtimes, shardGroups, err := buildShardGroups("n1", baseDir, groups, true, bootstrap,
+			raftBootstrapConfig{}, factory, nil, sharedClock, kv.NewActiveTimestampTracker(), nil, nil, "",
+			encryptionWriteWiring{}, nil)
 		require.NoError(t, err)
 		shardStore := kv.NewShardStore(engine, shardGroups)
 		return runtimes, shardGroups, shardStore
