@@ -26,6 +26,15 @@ func TestScopeForKey(t *testing.T) {
 		{name: "ddb derived gsi", key: []byte(DDBGSIPrefix + "ignored"), scoped: false},
 		{name: "dynamodb generation counter", key: []byte(DDBTableGenPrefix + enc("deleted")), scoped: false},
 		{name: "s3 generation counter", key: []byte(S3BucketGenPrefix + "deleted"), scoped: false},
+		// An offloaded object's manifest is useless without the chunk
+		// references naming its payload, and the reference key carries the
+		// bucket, so it scopes like any other object-level row.
+		{
+			name:   "s3 chunk reference",
+			key:    s3keys.ChunkRefKey("photos", 1, "cat.jpg", "", 0, 3),
+			want:   Scope{Adapter: "s3", Name: "photos"},
+			scoped: true,
+		},
 		{name: "transaction", key: []byte("!txn|lock|ignored"), scoped: false},
 	}
 	for _, tc := range cases {
