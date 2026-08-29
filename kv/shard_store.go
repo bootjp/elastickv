@@ -2327,19 +2327,17 @@ func (s *ShardStore) s3BucketAuxiliaryOwnerHasVersionAt(
 	ts uint64,
 	readRouteVersion uint64,
 ) (bool, error) {
-	live, liveOK, err := s.ownerRouteHasVersionAtOrBefore(ctx, owner, key, ts, readRouteVersion)
-	if err != nil {
-		return false, err
-	}
-	if live {
-		return true, nil
-	}
 	if !routeHasStagedVisibility(owner) {
-		if !liveOK {
-			return false, ownerVersionProbeUnavailable(owner, key)
+		live, liveOK, err := s.ownerRouteHasVersionAtOrBefore(ctx, owner, key, ts, readRouteVersion)
+		if err != nil {
+			return false, err
 		}
-		return false, nil
+		return existenceProbeResult(live, liveOK, owner, key)
 	}
+	// Staged before live: a live-first existence probe can miss a row that
+	// promotion moves between the two calls -- absent from live before the
+	// move, absent from staged after it -- and report a key that existed
+	// throughout as missing.
 	stagedKey := distribution.MigrationStagedDataKey(owner.MigrationJobID, key)
 	staged, stagedOK, err := s.ownerRouteHasVersionAtOrBefore(ctx, owner, stagedKey, ts, readRouteVersion)
 	if err != nil {
@@ -2348,7 +2346,21 @@ func (s *ShardStore) s3BucketAuxiliaryOwnerHasVersionAt(
 	if staged {
 		return true, nil
 	}
-	if !liveOK || !stagedOK {
+	live, liveOK, err := s.ownerRouteHasVersionAtOrBefore(ctx, owner, key, ts, readRouteVersion)
+	if err != nil {
+		return false, err
+	}
+	return existenceProbeResult(live, liveOK && stagedOK, owner, key)
+}
+
+// existenceProbeResult turns a probe outcome into the (found, error) pair the
+// callers expect: an unanswered probe is an error rather than a "no", because
+// treating an unreachable owner as absent is what silently drops a row.
+func existenceProbeResult(found bool, answered bool, owner distribution.Route, key []byte) (bool, error) {
+	if found {
+		return true, nil
+	}
+	if !answered {
 		return false, ownerVersionProbeUnavailable(owner, key)
 	}
 	return false, nil
@@ -3109,11 +3121,15 @@ func (s *ShardStore) scanRouteWithStagedVisibilityPage(
 	stagedStart, stagedEnd := stagedVisibilityScanBounds(route.MigrationJobID, start, end)
 	window := stagedVisibilityCandidateWindow(limit)
 	for {
-		liveKVs, err := scanVisibleCandidates(ctx, g.Store, start, end, window, ts, reverse)
+		// Staged before live, for the reason on getAtWithStagedVisibility:
+		// promotion only moves rows staged -> live, so reading the shrinking
+		// side first keeps a key that is mid-promotion visible to one of the
+		// two scans.
+		stagedKVs, err := scanVisibleCandidates(ctx, g.Store, stagedStart, stagedEnd, window, ts, reverse)
 		if err != nil {
 			return nil, nil, false, err
 		}
-		stagedKVs, err := scanVisibleCandidates(ctx, g.Store, stagedStart, stagedEnd, window, ts, reverse)
+		liveKVs, err := scanVisibleCandidates(ctx, g.Store, start, end, window, ts, reverse)
 		if err != nil {
 			return nil, nil, false, err
 		}
@@ -3318,15 +3334,16 @@ func (s *ShardStore) latestStagedVisibilityCandidates(
 	ts uint64,
 ) (map[string]store.MVCCVersion, error) {
 	keys := stagedVisibilityCandidateKeys(liveKVs, stagedKVs)
-	liveVersions, err := latestCandidateVersionsAt(ctx, st, keys, ts)
-	if err != nil {
-		return nil, err
-	}
 	stagedKeys := make([][]byte, 0, len(keys))
 	for _, key := range keys {
 		stagedKeys = append(stagedKeys, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
 	}
+	// Staged before live: same promotion ordering as the point read.
 	stagedVersions, err := latestCandidateVersionsAt(ctx, st, stagedKeys, ts)
+	if err != nil {
+		return nil, err
+	}
+	liveVersions, err := latestCandidateVersionsAt(ctx, st, keys, ts)
 	if err != nil {
 		return nil, err
 	}
@@ -3862,12 +3879,16 @@ func (s *ShardStore) expireStagedVisibleAt(
 	expireAt uint64,
 	commitTS uint64,
 ) error {
-	live, liveOK, err := latestMVCCVersionAt(ctx, g.Store, key, commitTS)
+	// Staged before live. Reading live first lets a promotion land in between
+	// and leave the staged probe empty, so the older live payload would be
+	// copied into a fresh version at commitTS -- a permanent rollback of the
+	// value rather than a TTL on the current one.
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
+	staged, stagedOK, err := latestMVCCVersionAt(ctx, g.Store, stagedKey, commitTS)
 	if err != nil {
 		return err
 	}
-	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
-	staged, stagedOK, err := latestMVCCVersionAt(ctx, g.Store, stagedKey, commitTS)
+	live, liveOK, err := latestMVCCVersionAt(ctx, g.Store, key, commitTS)
 	if err != nil {
 		return err
 	}
@@ -3947,14 +3968,17 @@ func (s *ShardStore) LatestCommitTSGroupWithReadFence(ctx context.Context, key [
 }
 
 func (s *ShardStore) localLatestCommitTS(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte) (uint64, bool, error) {
-	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+	if !routeHasStagedVisibility(route) {
+		liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+		return liveTS, liveExists, errors.WithStack(err)
+	}
+	// Staged before live: same promotion ordering as every other pair of
+	// probes across the two namespaces.
+	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
-	if !routeHasStagedVisibility(route) {
-		return liveTS, liveExists, nil
-	}
-	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}

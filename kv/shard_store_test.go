@@ -3913,11 +3913,32 @@ func (s *promotingExportStore) ExportVersions(
 	opts store.ExportVersionsOptions,
 ) (store.ExportVersionsResult, error) {
 	res, err := s.MVCCStore.ExportVersions(ctx, opts)
+	s.fireAfterFirst()
+	return res, err
+}
+
+// ScanAt fires the promotion when the *live* range is scanned. That is the
+// only interleaving that distinguishes the two orderings: live-first means the
+// live scan misses the key and the staged scan that follows misses it too,
+// while staged-first has already captured it before promotion runs.
+func (s *promotingExportStore) ScanAt(
+	ctx context.Context,
+	start, end []byte,
+	limit int,
+	ts uint64,
+) ([]*store.KVPair, error) {
+	kvs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	if !isMigrationStagedDataKey(start) && s.afterFirst != nil {
+		s.fireAfterFirst()
+	}
+	return kvs, err
+}
+
+func (s *promotingExportStore) fireAfterFirst() {
 	s.calls++
 	if s.calls == 1 && s.afterFirst != nil {
 		s.afterFirst()
 	}
-	return res, err
 }
 
 // A promotion batch landing between the staged and live probes must not make a
@@ -3956,4 +3977,71 @@ func TestShardStoreGetAt_StagedVisibilitySurvivesPromotionBetweenProbes(t *testi
 	got, err := st.GetAt(ctx, rawKey, 25)
 	require.NoError(t, err, "a promotion between the probes must not hide the key")
 	require.Equal(t, []byte("staged-only"), got)
+}
+
+// Every place that reads the live and staged namespaces as two separate store
+// calls has to read staged first, for the reason getAtWithStagedVisibility
+// documents. Fixing only the point read left the scan, the TTL winner, and the
+// watermark on the old order, each with its own way of losing the key.
+func TestStagedVisibilityProbesReadStagedFirst(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 1,
+			State: distribution.RouteStateActive, StagedVisibilityActive: true,
+			MigrationJobID: 9, MinWriteTSExclusive: 100,
+		}},
+	}))
+
+	rawKey := []byte("k")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+
+	newStore := func(t *testing.T) (*ShardStore, *promotingExportStore, store.MVCCStore) {
+		t.Helper()
+		inner := store.NewMVCCStore()
+		t.Cleanup(func() { _ = inner.Close() })
+		require.NoError(t, inner.PutAt(ctx, stagedKey, []byte("staged-only"), 20, 0))
+		promoting := &promotingExportStore{MVCCStore: inner}
+		promoting.afterFirst = func() {
+			// The real promotion batch: PromoteVersions moves the staged row to
+			// its live key and removes the staged version physically. Modelling
+			// it with a Delete would write a tombstone that legitimately hides
+			// the key, which is a different scenario.
+			promoter, ok := inner.(store.MigrationPromoter)
+			require.True(t, ok)
+			_, err := promoter.PromoteVersions(ctx, store.PromoteVersionsOptions{
+				JobID:       9,
+				StartKey:    distribution.MigrationStagedDataKeyPrefix(9),
+				EndKey:      prefixScanEnd(distribution.MigrationStagedDataKeyPrefix(9)),
+				MaxVersions: 16,
+				TargetKey: func(staged []byte) ([]byte, bool) {
+					_, raw, ok := distribution.MigrationStagedDataKeyParts(staged)
+					return raw, ok
+				},
+			})
+			require.NoError(t, err)
+		}
+		return NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: promoting}}), promoting, inner
+	}
+
+	t.Run("scan", func(t *testing.T) {
+		t.Parallel()
+		st, _, _ := newStore(t)
+		kvs, err := st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 25)
+		require.NoError(t, err)
+		require.Len(t, kvs, 1, "a promotion between the scans must not drop the key")
+		require.Equal(t, rawKey, kvs[0].Key)
+	})
+
+	t.Run("point read", func(t *testing.T) {
+		t.Parallel()
+		st, _, _ := newStore(t)
+		got, err := st.GetAt(ctx, rawKey, 25)
+		require.NoError(t, err)
+		require.Equal(t, []byte("staged-only"), got)
+	})
 }
