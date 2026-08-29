@@ -138,11 +138,11 @@ func parseRedisLegacyBlobKey(key []byte, prefix string) ([]byte, bool) {
 	if !bytes.HasPrefix(key, []byte(prefix)) {
 		return nil, false
 	}
-	rest := key[len(prefix):]
-	if len(rest) == 0 {
-		return nil, false
-	}
-	return rest, true
+	// An empty remainder is the empty Redis key, which the command paths accept
+	// and which therefore has a stored blob at exactly the family prefix.
+	// Rejecting it as malformed would fail the decoder on data the Redis API
+	// can create. parseZSetLegacyBlobKey already treats it this way.
+	return key[len(prefix):], true
 }
 
 // HandleSetMeta processes one !st|meta|<len><userKey> record. The
