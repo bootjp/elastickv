@@ -79,6 +79,21 @@ func migrationCleanupOptionsFromProto(req *pb.CleanupMigrationRequest, appliedIn
 		MaxScannedBytes: maxScannedBytes,
 		KeyFamily:       req.GetKeyFamily(),
 		AcceptVersion: func(key, value []byte) bool {
+			if IsPartitionedSQSKey(key) {
+				// routeKey collapses every partitioned SQS row to the single
+				// global SQS route key, so a migrated interval covering that
+				// key would look like it owns every partition -- including the
+				// ones the resolver still routes to this group, whose rows the
+				// export never claimed. Deleting those loses messages that are
+				// still being served from here. Apply cannot ask the resolver
+				// which partitions moved: it is process-local config
+				// (--sqsFifoPartitionMap), not replicated, so a per-node answer
+				// would make apply diverge across replicas. Catalog route
+				// cleanup therefore deletes only catalog-routed data and leaves
+				// the resolver-owned keyspace alone; retiring a partition's
+				// rows belongs to the resolver's own migration path.
+				return false
+			}
 			return bracket.ContainsRoutedVersion(key, value, req.GetRouteStart(), req.GetRouteEnd(), routeKey)
 		},
 	}

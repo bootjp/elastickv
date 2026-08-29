@@ -61,7 +61,22 @@ var (
 	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
 	sqsGlobalRouteKey                = []byte(sqsRoutePrefix + "global")
-	sqsConcreteInternalPrefixBytes   = [][]byte{
+	// sqsPartitionedFamilyPrefixBytes is the shape of an HT-FIFO partitioned
+	// SQS row: a message family prefix followed by the partition
+	// discriminator. Only the message families are partitioned; queue
+	// metadata is not. Membership is a pure prefix test over compile-time
+	// constants -- no routing map, no process-local config -- so every
+	// replica answers identically and FSM apply may use it.
+	// TestPartitionedSQSPrefixesAlign pins these against the adapter's
+	// SqsPartitioned*Prefix constants.
+	sqsPartitionedFamilyPrefixBytes = [][]byte{
+		[]byte(sqsMsgDataPrefix + sqsPartitionMarker),
+		[]byte(sqsMsgVisPrefix + sqsPartitionMarker),
+		[]byte(sqsMsgDedupPrefix + sqsPartitionMarker),
+		[]byte(sqsMsgGroupPrefix + sqsPartitionMarker),
+		[]byte(sqsMsgByAgePrefix + sqsPartitionMarker),
+	}
+	sqsConcreteInternalPrefixBytes = [][]byte{
 		[]byte(sqsQueueMetaPrefix),
 		[]byte(sqsQueueGenPrefix),
 		[]byte(sqsQueueSeqPrefix),
@@ -292,6 +307,19 @@ func sqsRouteKey(key []byte) []byte {
 		return nil
 	}
 	return sqsGlobalRouteKey
+}
+
+// IsPartitionedSQSKey reports whether the key carries the HT-FIFO partitioned
+// shape. Routing for those rows is decided by the partition resolver rather
+// than by a catalog route range, and routeKey collapses every one of them to
+// the single global SQS route key.
+func IsPartitionedSQSKey(key []byte) bool {
+	for _, prefix := range sqsPartitionedFamilyPrefixBytes {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func hasSQSConcreteInternalPrefix(key []byte) bool {
