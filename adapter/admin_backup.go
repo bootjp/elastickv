@@ -196,6 +196,11 @@ type backupSession struct {
 	// deadline, still blocking compaction and capacity for a backup that has
 	// already ended, so renewals are refused from that point on.
 	closing bool
+	// generation advances on every accepted renewal. A renewal that fails part
+	// way through its fan-out tears the session down, and that must not undo a
+	// concurrent renewal that already succeeded: the failing attempt only
+	// cleans up while the generation it started from is still current.
+	generation uint64
 }
 
 type preparedBackup struct {
@@ -341,6 +346,14 @@ func (s *AdminServer) pinBackupGroups(
 		if backupCapacityReservationFull(err) {
 			return nil, status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
 		}
+		// A capacity rejection is definitive: nothing was reserved. Any other
+		// error is ambiguous -- the entry may well have committed with only the
+		// response lost, or the context expired after the proposal -- and an
+		// unacknowledged reservation holds one of the few global active-backup
+		// slots until its TTL for a backup no caller ever received. Unreserve is
+		// idempotent and keyed by this pin, so compensating costs nothing when
+		// the reservation never landed.
+		s.compensateBackupRelease(controlGroup, nil, pinID)
 		return nil, status.Errorf(codes.Unavailable, "reserve backup capacity: %v", err)
 	}
 
@@ -434,18 +447,36 @@ func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupReques
 	if err != nil {
 		return nil, err
 	}
+	generation, live := s.backupSessionGeneration(tok)
 	deadline, err := s.renewBackupGroups(ctx, groups, tok.pinID, tok.readTS, ttl)
 	if err != nil {
-		s.compensateBackupRelease(groups[0], groups, tok.pinID)
-		s.forgetBackupSession(tok.pinID)
+		s.abandonFailedRenewal(groups, tok, generation, live)
 		return nil, status.Errorf(codes.Unavailable, "renew backup pin: %v", err)
 	}
 	if err := s.requireRenewableBackupToken(tok); err != nil {
-		s.compensateBackupRelease(groups[0], groups, tok.pinID)
-		s.forgetBackupSession(tok.pinID)
+		s.abandonFailedRenewal(groups, tok, generation, live)
 		return nil, err
 	}
 	return s.finishRenewBackup(groups, tok, ttl, deadline)
+}
+
+// abandonFailedRenewal releases what this attempt may have half-renewed, but
+// only while it still owns the session it started from. A renewal that
+// overlapped a successful one no longer does, and must leave that caller's
+// pins alone.
+func (s *AdminServer) abandonFailedRenewal(
+	groups []backupGroup,
+	tok backupToken,
+	generation uint64,
+	live bool,
+) {
+	if live && !s.forgetBackupSessionAtGeneration(tok.pinID, generation) {
+		return
+	}
+	if !live {
+		s.forgetBackupSession(tok.pinID)
+	}
+	s.compensateBackupRelease(groups[0], groups, tok.pinID)
 }
 
 func (s *AdminServer) finishRenewBackup(
@@ -1174,10 +1205,11 @@ func (s *AdminServer) extendBackupSession(tok backupToken) bool {
 	if !ok || session.closing || session.readTS != tok.readTS {
 		return false
 	}
+	session.generation++
 	if tok.deadline.After(session.deadline) {
 		session.deadline = tok.deadline
-		s.backupSessions[tok.pinID] = session
 	}
+	s.backupSessions[tok.pinID] = session
 	return true
 }
 
@@ -1221,6 +1253,36 @@ func (s *AdminServer) requireRenewableBackupToken(tok backupToken) error {
 		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
 	}
 	return nil
+}
+
+// backupSessionGeneration reports the generation a renewal is starting from.
+// ok is false when there is no live session for the token, in which case there
+// is nothing for a failed renewal to tear down.
+func (s *AdminServer) backupSessionGeneration(tok backupToken) (uint64, bool) {
+	s.backupStateMu.Lock()
+	defer s.backupStateMu.Unlock()
+	session, ok := s.backupSessions[tok.pinID]
+	if !ok || session.readTS != tok.readTS {
+		return 0, false
+	}
+	return session.generation, true
+}
+
+// forgetBackupSessionAtGeneration drops the session only while it is still the
+// one the caller started from. A renewal that failed part way through its
+// fan-out must release the pins it may have half-renewed, but if another
+// renewal has already succeeded in the meantime it owns the session now --
+// tearing it down here would leave that caller holding a token whose pins are
+// gone, with retention free to compact the data underneath it.
+func (s *AdminServer) forgetBackupSessionAtGeneration(pinID kv.BackupPinID, generation uint64) bool {
+	s.backupStateMu.Lock()
+	defer s.backupStateMu.Unlock()
+	session, ok := s.backupSessions[pinID]
+	if !ok || session.generation != generation {
+		return false
+	}
+	delete(s.backupSessions, pinID)
+	return true
 }
 
 func (s *AdminServer) forgetBackupSession(pinID kv.BackupPinID) {
