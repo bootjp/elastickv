@@ -720,9 +720,12 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testi
 
 	probe.mu.Lock()
 	defer probe.mu.Unlock()
-	require.Len(t, probe.latestReqs, 2)
-	require.Equal(t, migratedKey, probe.latestReqs[0].GetKey())
-	require.Equal(t, stagedKey, probe.latestReqs[1].GetKey())
+	// Staged is probed first, and a staged hit answers the question, so the
+	// live probe is never issued. Probing live first would have to fall
+	// through to staged anyway, and that pair is what a concurrent promotion
+	// slips between.
+	require.Len(t, probe.latestReqs, 1)
+	require.Equal(t, stagedKey, probe.latestReqs[0].GetKey())
 	for _, req := range probe.latestReqs {
 		require.Equal(t, uint64(2), req.GetGroupId())
 		require.Equal(t, uint64(77), req.GetReadRouteVersion())
