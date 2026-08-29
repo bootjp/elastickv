@@ -3898,3 +3898,62 @@ func TestExpireAtStillFailsWhenNothingIsVisible(t *testing.T) {
 
 	require.ErrorIs(t, st.ExpireAt(ctx, []byte("absent"), 40, 300), store.ErrKeyNotFound)
 }
+
+// promotingExportStore runs a hook after the first ExportVersions call, which
+// is how a promotion batch is landed exactly between the two probes
+// getAtWithStagedVisibility makes.
+type promotingExportStore struct {
+	store.MVCCStore
+	afterFirst func()
+	calls      int
+}
+
+func (s *promotingExportStore) ExportVersions(
+	ctx context.Context,
+	opts store.ExportVersionsOptions,
+) (store.ExportVersionsResult, error) {
+	res, err := s.MVCCStore.ExportVersions(ctx, opts)
+	s.calls++
+	if s.calls == 1 && s.afterFirst != nil {
+		s.afterFirst()
+	}
+	return res, err
+}
+
+// A promotion batch landing between the staged and live probes must not make a
+// key disappear. Promotion writes the live version and drops the staged alias,
+// so a live-then-staged order misses both sides of a staged-only key: live has
+// not been written yet at the first probe, and the alias is gone by the second.
+func TestShardStoreGetAt_StagedVisibilitySurvivesPromotionBetweenProbes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 1,
+			State: distribution.RouteStateActive, StagedVisibilityActive: true,
+			MigrationJobID: 9, MinWriteTSExclusive: 100,
+		}},
+	}))
+
+	inner := store.NewMVCCStore()
+	t.Cleanup(func() { _ = inner.Close() })
+	rawKey := []byte("k")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, inner.PutAt(ctx, stagedKey, []byte("staged-only"), 20, 0))
+
+	promoting := &promotingExportStore{MVCCStore: inner}
+	promoting.afterFirst = func() {
+		// The promotion batch: the row becomes live at its original commit ts
+		// and the staged alias goes away.
+		require.NoError(t, inner.PutAt(ctx, rawKey, []byte("staged-only"), 20, 0))
+		require.NoError(t, inner.DeleteAt(ctx, stagedKey, 21))
+	}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: promoting}})
+
+	got, err := st.GetAt(ctx, rawKey, 25)
+	require.NoError(t, err, "a promotion between the probes must not hide the key")
+	require.Equal(t, []byte("staged-only"), got)
+}

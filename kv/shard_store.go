@@ -538,12 +538,23 @@ func (s *ShardStore) getAtWithStagedVisibility(ctx context.Context, g *ShardGrou
 	if err := ensureReadTSRetained(g.Store, ts); err != nil {
 		return nil, err
 	}
-	live, liveOK, err := latestMVCCVersionAt(ctx, g.Store, key, ts)
+	// Staged first, then live. The two probes are separate store reads, so a
+	// promotion batch can land between them, and the order decides whether that
+	// is observable. Promotion only ever moves a row staged -> live: the live
+	// set only gains keys, the staged set only loses them. Reading the shrinking
+	// side first and the growing side second means a key present in either at
+	// any instant during the pair is seen by at least one probe.
+	//
+	// The reverse order has two holes. A staged-only key read live-then-staged
+	// misses both sides and returns not-found for a key that existed
+	// throughout; and a key whose staged version is newer than its live one can
+	// return the stale live value when promotion removes the alias in between.
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
+	staged, stagedOK, err := latestMVCCVersionAt(ctx, g.Store, stagedKey, ts)
 	if err != nil {
 		return nil, err
 	}
-	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
-	staged, stagedOK, err := latestMVCCVersionAt(ctx, g.Store, stagedKey, ts)
+	live, liveOK, err := latestMVCCVersionAt(ctx, g.Store, key, ts)
 	if err != nil {
 		return nil, err
 	}
