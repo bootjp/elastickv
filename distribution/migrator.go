@@ -108,6 +108,33 @@ var (
 // Staged migration data is included in the reserved set. It is populated by the
 // typed migration import/promote paths and by FSM-internal prefix-delete
 // expansion, not by externally supplied RawKV mutations.
+// migrationOnlyControlPrefixes are the control namespaces that no coordinator
+// dispatch ever writes: they are produced solely by the typed migration
+// commands (import, promote, fence). The rest of !dist| is excluded, because
+// the control plane commits route and job records through the transactional
+// coordinator -- SplitRange does exactly that.
+var migrationOnlyControlPrefixes = [][]byte{
+	[]byte(migrationStagedDataPrefix),
+	[]byte("!migwrite|"),
+	[]byte("!migfence|"),
+}
+
+// IsMigrationOnlyControlKey reports whether key belongs to a namespace that
+// only the typed migration commands may write. It is the transactional apply
+// path's reserved-key test: the raw path can refuse every control namespace
+// because nothing legitimate writes one as a raw mutation, but the catalog
+// reaches the store through a transaction, so the transactional test has to be
+// the narrower one. A staged-data row is the case that matters -- a client
+// write landing there is promoted as user data.
+func IsMigrationOnlyControlKey(key []byte) bool {
+	for _, prefix := range migrationOnlyControlPrefixes {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 func IsReservedControlKey(key []byte) bool {
 	return reservedControlPrefixIntersects(key, bytes.HasPrefix)
 }

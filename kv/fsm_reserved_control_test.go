@@ -103,8 +103,6 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 	require.True(t, ok)
 
 	for _, key := range [][]byte{
-		[]byte("!dist|meta|version"),
-		[]byte("!dist|route|0001"),
 		distribution.MigrationStagedDataKey(7, []byte("victim")),
 		[]byte("!migwrite|7"),
 		[]byte("!migfence|7"),
@@ -118,12 +116,17 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 			"commit must refuse %q", key)
 	}
 
-	// Ordinary user keys, and the transaction-internal keys the txn paths
-	// legitimately write, are unaffected.
+	// Ordinary user keys, the transaction-internal keys the txn paths
+	// legitimately write, and the catalog records the control plane commits
+	// through the coordinator are unaffected. SplitRange is a transaction that
+	// writes !dist|route| and !dist|meta|, so refusing those here would break
+	// the control plane itself.
 	for _, key := range [][]byte{
 		[]byte("user-key"),
 		txnLockKey([]byte("user-key")),
 		txnIntentKey([]byte("user-key")),
+		[]byte("!dist|route|0001"),
+		[]byte("!dist|meta|version"),
 	} {
 		muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}}
 		_, err := f.uniqueMutationsAboveFloor(muts, 10)
