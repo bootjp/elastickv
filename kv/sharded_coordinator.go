@@ -2592,15 +2592,20 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 }
 
 func (c *ShardedCoordinator) latestCommitTSForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) (uint64, bool, error) {
-	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+	route, ok := c.stagedVisibilityRouteForReadKey(gid, key)
+	if !ok {
+		liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+		return liveTS, liveExists, errors.WithStack(err)
+	}
+	// Staged before live, for the reason on getAtWithStagedVisibility.
+	// Missing the version here is worse than a stale read: OCC would see no
+	// commit above startTS and let the transaction commit on a read it should
+	// have conflicted with.
+	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
-	route, ok := c.stagedVisibilityRouteForReadKey(gid, key)
-	if !ok {
-		return liveTS, liveExists, nil
-	}
-	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}

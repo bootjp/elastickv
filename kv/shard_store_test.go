@@ -3937,6 +3937,16 @@ func (s *promotingExportStore) ScanAt(
 	return kvs, err
 }
 
+// LatestCommitTS fires the promotion on the live-key probe, which is the
+// interleaving that separates the two orderings for the watermark reads.
+func (s *promotingExportStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
+	ts, exists, err := s.MVCCStore.LatestCommitTS(ctx, key)
+	if !isMigrationStagedDataKey(key) && s.afterFirst != nil {
+		s.fireAfterFirst()
+	}
+	return ts, exists, err
+}
+
 func (s *promotingExportStore) fireAfterFirst() {
 	s.calls++
 	if s.calls == 1 && s.afterFirst != nil {
