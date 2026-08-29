@@ -146,6 +146,11 @@ message ImportRangeVersionsRequest {
 
 message ImportRangeVersionsResponse {
   bytes acked_cursor = 1;
+  // Set when the target already held a durable acknowledgement for this
+  // batch_seq and discarded the resent rows. acked_cursor is then the cursor
+  // the target recorded for that batch, which need not be the cursor the
+  // caller just sent.
+  bool duplicate = 2;
 }
 
 message PromoteStagedVersionsRequest {

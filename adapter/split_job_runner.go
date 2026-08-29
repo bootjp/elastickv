@@ -989,18 +989,20 @@ func (s *DistributionServer) copySplitJobStream(
 		}
 		nextCursor := distribution.CloneBytes(resp.GetNextCursor())
 		batchSeq := progress.LastAckedBatchSeq + 1
-		importResp, importErr := target.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
-			JobId:     job.JobID,
-			Versions:  resp.GetVersions(),
-			Cursor:    nextCursor,
-			BracketId: bracket.BracketID,
-			BatchSeq:  batchSeq,
-		})
-		if importErr != nil {
-			return errors.WithStack(importErr)
+		ackedCursor, duplicate, err := importSplitJobChunk(ctx, target, job, bracket, batchSeq, resp.GetVersions(), nextCursor)
+		if err != nil {
+			return err
 		}
-		if !bytes.Equal(importResp.GetAckedCursor(), nextCursor) {
-			return errors.New("split migration import acknowledged a different cursor")
+		if duplicate {
+			// The target already holds this batch durably from an attempt whose
+			// progress this runner never persisted. Its acknowledgement is the
+			// authority on where the copy stands: the source keeps taking writes
+			// while the copy runs, so a replayed chunk can end on a different
+			// boundary, and demanding the boundary match would fail the job on
+			// every retry. Adopt the acknowledged cursor and re-export from it --
+			// the rest of this stream is cut relative to a boundary the target
+			// never accepted.
+			return s.adoptDuplicateImportAck(ctx, job, progressIndex, progress, batchSeq, ackedCursor)
 		}
 		progress.Cursor = nextCursor
 		progress.Done = resp.GetDone()
@@ -1021,6 +1023,62 @@ func (s *DistributionServer) copySplitJobStream(
 			return nil
 		}
 	}
+}
+
+// importSplitJobChunk hands one exported chunk to the target and returns the
+// cursor the target durably holds. duplicate marks an acknowledgement the
+// target had already recorded for this batch sequence, in which case the
+// acknowledged cursor is its own and need not match the one just sent.
+func importSplitJobChunk(
+	ctx context.Context,
+	target SplitMigrationClient,
+	job distribution.SplitJob,
+	bracket distribution.MigrationBracket,
+	batchSeq uint64,
+	versions []*pb.MVCCVersion,
+	nextCursor []byte,
+) ([]byte, bool, error) {
+	resp, err := target.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
+		JobId:     job.JobID,
+		Versions:  versions,
+		Cursor:    nextCursor,
+		BracketId: bracket.BracketID,
+		BatchSeq:  batchSeq,
+	})
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if resp.GetDuplicate() {
+		return resp.GetAckedCursor(), true, nil
+	}
+	if !bytes.Equal(resp.GetAckedCursor(), nextCursor) {
+		return nil, false, errors.New("split migration import acknowledged a different cursor")
+	}
+	return resp.GetAckedCursor(), false, nil
+}
+
+// adoptDuplicateImportAck records the target's durable acknowledgement for a
+// batch the runner re-sent after losing its own progress. Only the cursor and
+// the batch sequence advance: the rows were applied by the earlier attempt, and
+// this runner never observed which of them the target actually accepted, so
+// AcceptedRows and MaxImportedTS stay where they are rather than counting rows
+// twice. Done is likewise left alone -- the replayed export's end-of-range
+// answer describes a chunk the target did not take.
+func (s *DistributionServer) adoptDuplicateImportAck(
+	ctx context.Context,
+	job distribution.SplitJob,
+	progressIndex int,
+	progress distribution.SplitJobBracketProgress,
+	batchSeq uint64,
+	ackedCursor []byte,
+) error {
+	adopted := distribution.CloneBytes(ackedCursor)
+	progress.Cursor = adopted
+	progress.LastAckedBatchSeq = batchSeq
+	job.BracketProgress[progressIndex] = progress
+	job.Cursor = adopted
+	job.UpdatedAtMs = time.Now().UnixMilli()
+	return s.persistSplitJobCopyProgress(ctx, job)
 }
 
 func nextSplitJobBracket(

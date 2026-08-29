@@ -1029,8 +1029,13 @@ func (x *ImportRangeVersionsRequest) GetBatchSeq() uint64 {
 }
 
 type ImportRangeVersionsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AckedCursor   []byte                 `protobuf:"bytes,1,opt,name=acked_cursor,json=ackedCursor,proto3" json:"acked_cursor,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	AckedCursor []byte                 `protobuf:"bytes,1,opt,name=acked_cursor,json=ackedCursor,proto3" json:"acked_cursor,omitempty"`
+	// Set when the target already held a durable acknowledgement for this
+	// batch_seq and discarded the resent rows. acked_cursor is then the cursor
+	// the target recorded for that batch, which need not be the cursor the
+	// caller just sent.
+	Duplicate     bool `protobuf:"varint,2,opt,name=duplicate,proto3" json:"duplicate,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1070,6 +1075,13 @@ func (x *ImportRangeVersionsResponse) GetAckedCursor() []byte {
 		return x.AckedCursor
 	}
 	return nil
+}
+
+func (x *ImportRangeVersionsResponse) GetDuplicate() bool {
+	if x != nil {
+		return x.Duplicate
+	}
+	return false
 }
 
 type PromoteStagedVersionsRequest struct {
@@ -2106,9 +2118,10 @@ const file_internal_proto_rawDesc = "" +
 	"\x06cursor\x18\x03 \x01(\fR\x06cursor\x12\x1d\n" +
 	"\n" +
 	"bracket_id\x18\x04 \x01(\x04R\tbracketId\x12\x1b\n" +
-	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\"@\n" +
+	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\"^\n" +
 	"\x1bImportRangeVersionsResponse\x12!\n" +
-	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor\"\xb9\x01\n" +
+	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor\x12\x1c\n" +
+	"\tduplicate\x18\x02 \x01(\bR\tduplicate\"\xb9\x01\n" +
 	"\x1cPromoteStagedVersionsRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x16\n" +
 	"\x06cursor\x18\x02 \x01(\fR\x06cursor\x12!\n" +

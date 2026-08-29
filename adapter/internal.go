@@ -451,7 +451,7 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	if i.clock != nil && result.MaxImportedTS > 0 {
 		i.clock.Observe(result.MaxImportedTS)
 	}
-	return &pb.ImportRangeVersionsResponse{AckedCursor: result.AckedCursor}, nil
+	return &pb.ImportRangeVersionsResponse{AckedCursor: result.AckedCursor, Duplicate: result.Duplicate}, nil
 }
 
 func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) error {
