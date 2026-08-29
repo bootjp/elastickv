@@ -267,14 +267,7 @@ func (s *DistributionServer) splitJobMigrationClients(ctx context.Context, job d
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	sourceGroupID, routeEnd, ok := splitJobSourceSibling(snapshot.Routes, job)
-	if !ok {
-		if parent, found := findRouteByID(snapshot.Routes, job.SourceRouteID); found {
-			sourceGroupID = parent.GroupID
-			routeEnd = distribution.CloneBytes(parent.End)
-			ok = true
-		}
-	}
+	sourceGroupID, routeEnd, ok := splitJobSourceRouteState(snapshot.Routes, job)
 	if !ok {
 		return nil, nil, nil, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
 	}
@@ -411,11 +404,8 @@ func (s *DistributionServer) splitJobSourceGroupID(ctx context.Context, job dist
 	if err != nil {
 		return 0, err
 	}
-	groupID, _, ok := splitJobSourceSibling(snapshot.Routes, job)
+	groupID, _, ok := splitJobSourceRouteState(snapshot.Routes, job)
 	if !ok {
-		if parent, found := findRouteByID(snapshot.Routes, job.SourceRouteID); found {
-			return parent.GroupID, nil
-		}
 		return 0, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
 	}
 	return groupID, nil
@@ -817,6 +807,33 @@ func splitJobHistoryGCKeys(jobs []distribution.SplitJob, now time.Time) [][]byte
 		}
 	}
 	return keys
+}
+
+// splitJobSourceRouteState resolves the group that still holds the source side
+// of the split, plus the end of the moved range. The live route shape is
+// preferred so a job written before source_group_id existed still resolves;
+// the job's own recorded source group is the last resort, for the case where
+// neither shape survives: once the source child is split again -- which
+// SplitRange permits, the new split being disjoint from the moving range --
+// its grandchildren no longer name the original parent, and that parent is
+// itself already gone. Without the recorded group, cleanup would fail with
+// ErrMigrationSourceRouteChanged on every attempt after cutover and keep the
+// job live with its guards and retention pin held.
+func splitJobSourceRouteState(
+	routes []distribution.RouteDescriptor,
+	job distribution.SplitJob,
+) (uint64, []byte, bool) {
+	sourceGroupID, routeEnd, ok := splitJobSourceSibling(routes, job)
+	if ok {
+		return sourceGroupID, routeEnd, true
+	}
+	if parent, found := findRouteByID(routes, job.SourceRouteID); found {
+		return parent.GroupID, distribution.CloneBytes(parent.End), true
+	}
+	if job.SourceGroupID != 0 {
+		return job.SourceGroupID, routeEnd, true
+	}
+	return 0, nil, false
 }
 
 func splitJobSourceSibling(routes []distribution.RouteDescriptor, job distribution.SplitJob) (uint64, []byte, bool) {
@@ -1541,14 +1558,7 @@ func (s *DistributionServer) splitJobCapabilityControlTargets(ctx context.Contex
 	if err != nil {
 		return splitJobMigrationControlTargets{}, err
 	}
-	sourceGroupID, routeEnd, ok := splitJobSourceSibling(snapshot.Routes, job)
-	if !ok {
-		if parent, found := findRouteByID(snapshot.Routes, job.SourceRouteID); found {
-			sourceGroupID = parent.GroupID
-			routeEnd = distribution.CloneBytes(parent.End)
-			ok = true
-		}
-	}
+	sourceGroupID, routeEnd, ok := splitJobSourceRouteState(snapshot.Routes, job)
 	if !ok {
 		return splitJobMigrationControlTargets{}, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
 	}

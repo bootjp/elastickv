@@ -129,6 +129,10 @@ message SplitJob {
   int64 updated_at_ms = 32;
   int64 terminal_at_ms = 33;
   bool capability_regressed = 34;
+  // Group that still owns the source side of the split. Recorded at plan
+  // time because the route shape it can otherwise be recovered from
+  // disappears once the source child is itself split.
+  uint64 source_group_id = 35;
 }
 
 message ListRoutesRequest {}

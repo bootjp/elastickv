@@ -366,6 +366,14 @@ func InitializeSplitJobPlan(job SplitJob, source RouteDescriptor, nowMs int64) (
 	}
 
 	out := CloneSplitJob(job)
+	if out.SourceGroupID == 0 {
+		// The source side keeps this group for the life of the job. Recording it
+		// now is the only durable handle on it: the sibling route it would
+		// otherwise be read back from is replaced by grandchildren as soon as the
+		// source child is split again, which SplitRange permits because that split
+		// is disjoint from the moving range.
+		out.SourceGroupID = source.GroupID
+	}
 	if out.Phase == SplitJobPhaseNone {
 		out.Phase = SplitJobPhasePlanned
 	}

@@ -137,6 +137,7 @@ type SplitJobBracketProgress struct {
 type SplitJob struct {
 	JobID                            uint64
 	SourceRouteID                    uint64
+	SourceGroupID                    uint64
 	SplitKey                         []byte
 	TargetGroupID                    uint64
 	Phase                            SplitJobPhase
@@ -908,6 +909,7 @@ func CloneSplitJob(job SplitJob) SplitJob {
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
 		CapabilityRegressed:              job.CapabilityRegressed,
+		SourceGroupID:                    job.SourceGroupID,
 	}
 }
 
@@ -953,6 +955,7 @@ func splitJobToProto(job SplitJob) *pb.SplitJob {
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
 		CapabilityRegressed:              job.CapabilityRegressed,
+		SourceGroupId:                    job.SourceGroupID,
 	}
 }
 
@@ -1019,6 +1022,7 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 		UpdatedAtMs:                      msg.GetUpdatedAtMs(),
 		TerminalAtMs:                     msg.GetTerminalAtMs(),
 		CapabilityRegressed:              msg.GetCapabilityRegressed(),
+		SourceGroupID:                    msg.GetSourceGroupId(),
 	}, nil
 }
 
