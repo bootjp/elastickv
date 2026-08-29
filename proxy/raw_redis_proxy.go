@@ -92,13 +92,36 @@ func (p *ProxyServer) handleRawRedisConn(ctx context.Context, client net.Conn) {
 	errCh := make(chan struct{}, rawRedisCopyDirections)
 	go rawCopy(upstream, client, errCh)
 	go rawCopy(client, upstreamReader, errCh)
-	<-errCh
+	// Wait for both directions. Returning on the first one closes the client
+	// and upstream through the deferred closes, which cuts off a response the
+	// reverse copier is still delivering -- the case a one-shot client that
+	// half-closes after writing its command lands in.
+	for range rawRedisCopyDirections {
+		<-errCh
+	}
 }
 
+// rawCopy pumps one direction and then shuts down only that direction's write
+// side. Closing the whole connection here would tear down the reverse copier
+// too, so a client that sends a request and calls shutdown(SHUT_WR) -- valid
+// TCP, and what one-shot clients do -- would never receive its reply. The
+// full close is left to handleRawRedisConn's deferred closes, which run once
+// both directions are finished.
 func rawCopy(dst net.Conn, src io.Reader, done chan<- struct{}) {
 	_, _ = io.Copy(dst, src)
-	_ = dst.Close()
+	closeWriteOrConn(dst)
 	done <- struct{}{}
+}
+
+// closeWriteOrConn half-closes dst when the transport supports it (TCP does),
+// and falls back to a full close otherwise so a non-TCP transport still
+// terminates rather than hanging.
+func closeWriteOrConn(dst net.Conn) {
+	if cw, ok := dst.(interface{ CloseWrite() error }); ok {
+		_ = cw.CloseWrite()
+		return
+	}
+	_ = dst.Close()
 }
 
 func (p *ProxyServer) prepareRawRedisUpstream(upstream net.Conn, upstreamReader *bufio.Reader) error {

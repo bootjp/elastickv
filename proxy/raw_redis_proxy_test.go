@@ -2,11 +2,13 @@ package proxy
 
 import (
 	"bufio"
+	"context"
 	"io"
 	"net"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -74,4 +76,75 @@ func readRawRedisTestCommand(r *bufio.Reader) ([]string, error) {
 		out = append(out, string(arg[:size]))
 	}
 	return out, nil
+}
+
+// A client that writes its command and then half-closes its write side is
+// valid TCP and is what one-shot clients do. Closing the whole upstream
+// connection when that direction reaches EOF tears down the reverse copier
+// too, so the reply never arrives.
+func TestHandleRawRedisConnDeliversReplyAfterClientHalfClose(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	var lc net.ListenConfig
+	upstreamLn, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer upstreamLn.Close()
+
+	go func() {
+		conn, acceptErr := upstreamLn.Accept()
+		if acceptErr != nil {
+			return
+		}
+		defer conn.Close()
+		// Drain the request, then answer after the client has half-closed.
+		buf := make([]byte, 64)
+		if _, readErr := conn.Read(buf); readErr != nil {
+			return
+		}
+		_, _ = conn.Write([]byte("+PONG\r\n"))
+		// Hold the connection open until the proxy tears it down, so the
+		// reply is the only thing the client is waiting for.
+		_, _ = io.Copy(io.Discard, conn)
+	}()
+
+	clientLn, err := lc.Listen(ctx, "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer clientLn.Close()
+
+	p := &ProxyServer{
+		cfg:     ProxyConfig{PrimaryAddr: upstreamLn.Addr().String()},
+		metrics: newTestMetrics(),
+		logger:  testLogger,
+	}
+
+	served := make(chan struct{})
+	go func() {
+		conn, acceptErr := clientLn.Accept()
+		if acceptErr != nil {
+			close(served)
+			return
+		}
+		p.handleRawRedisConn(ctx, conn)
+		close(served)
+	}()
+
+	var dialer net.Dialer
+	client, err := dialer.DialContext(ctx, "tcp", clientLn.Addr().String())
+	require.NoError(t, err)
+	defer client.Close()
+
+	_, err = client.Write(rawRedisCommand("PING"))
+	require.NoError(t, err)
+	tcpClient, ok := client.(*net.TCPConn)
+	require.True(t, ok)
+	require.NoError(t, tcpClient.CloseWrite())
+
+	require.NoError(t, client.SetReadDeadline(time.Now().Add(5*time.Second)))
+	reply, err := bufio.NewReader(client).ReadString('\n')
+	require.NoError(t, err, "the reply must survive the client's half-close")
+	require.Equal(t, "+PONG\r\n", reply)
+
+	_ = client.Close()
+	<-served
 }

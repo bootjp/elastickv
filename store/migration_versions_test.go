@@ -89,29 +89,6 @@ func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
 	})
 }
 
-func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
-	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
-		ctx := context.Background()
-		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("eligible"), 20, 0))
-		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("too-new"), 30, 0))
-		accepted := false
-
-		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			MaxCommitTSInclusive: 25,
-			MaxVersions:          1,
-			AcceptVersion: func(_ []byte, _ []byte) bool {
-				if accepted {
-					return false
-				}
-				accepted = true
-				return true
-			},
-		})
-		require.NoError(t, err)
-		require.Equal(t, []MVCCVersion{{Key: []byte("k"), CommitTS: 20, Value: []byte("eligible")}}, result.Versions)
-	})
-}
-
 func TestExportVersionsCursorResumesWithinHotKey(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -444,72 +421,6 @@ func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidExportCursor)
 		require.Empty(t, res.Versions)
 	})
-}
-
-func TestExportVersionsSkippedCursorBeforeStartResumesAtStartKey(t *testing.T) {
-	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
-		ctx := context.Background()
-		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
-		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m20"), 20, 0))
-
-		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			StartKey:    []byte("m"),
-			EndKey:      []byte("z"),
-			Cursor:      encodeExportCursor([]byte("a"), 10, exportCursorTagSkippedKey),
-			MaxVersions: 10,
-		})
-		require.NoError(t, err)
-		require.True(t, res.Done)
-		require.Equal(t, []MVCCVersion{{Key: []byte("m"), CommitTS: 20, Value: []byte("m20")}}, res.Versions)
-	})
-}
-
-func TestValidateExportCursorForRangeRejectsSkippedCursorInsideRange(t *testing.T) {
-	t.Parallel()
-
-	err := ValidateExportCursorForRange(
-		encodeExportCursor([]byte("stage|k"), 10, exportCursorTagSkippedKey),
-		[]byte("stage|"),
-		PrefixScanEnd([]byte("stage|")),
-	)
-	require.ErrorIs(t, err, ErrInvalidExportCursor)
-
-	err = ValidateExportCursorForRange(
-		encodeExportCursor([]byte("outside|k"), 10, exportCursorTagSkippedKey),
-		[]byte("stage|"),
-		PrefixScanEnd([]byte("stage|")),
-	)
-	require.NoError(t, err)
-}
-
-func TestValidatePromotionCursorForRangeAcceptsOnlyEmittedPositions(t *testing.T) {
-	t.Parallel()
-
-	prefix := []byte("stage|")
-	key := []byte("stage|k")
-	for _, tc := range []struct {
-		name    string
-		cursor  []byte
-		wantErr bool
-	}{
-		{name: "empty cursor"},
-		{name: "emitted cursor", cursor: encodeExportCursor(key, 10, exportCursorTagEmitted)},
-		{name: "scanned cursor", cursor: encodeExportCursor(key, 10, exportCursorTagScanned), wantErr: true},
-		{name: "pruned-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagPrunedKey), wantErr: true},
-		{name: "skipped-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagSkippedKey), wantErr: true},
-		{name: "emitted cursor outside range", cursor: encodeExportCursor([]byte("other|k"), 10, exportCursorTagEmitted), wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			err := ValidatePromotionCursorForRange(tc.cursor, prefix, PrefixScanEnd(prefix))
-			if tc.wantErr {
-				require.ErrorIs(t, err, ErrInvalidExportCursor)
-				return
-			}
-			require.NoError(t, err)
-		})
-	}
 }
 
 func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T) {
@@ -921,6 +832,203 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 	})
 }
 
+func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-import-persist-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("persisted"),
+		Versions:  []MVCCVersion{{Key: []byte("k"), CommitTS: 99, Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	floor, err := reopened.MigrationHLCFloor(ctx, 9)
+	require.NoError(t, err)
+	require.Equal(t, uint64(99), floor)
+	res, err := reopened.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("different"),
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("persisted"), res.AckedCursor)
+}
+
+func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
+	ctx := context.Background()
+	srcDir, err := os.MkdirTemp("", "migration-snapshot-src-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(srcDir)) })
+	src, err := NewPebbleStore(srcDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, src.Close()) })
+
+	_, err = src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("stale"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	raw := snapshotBytes(t, snap)
+	require.NoError(t, snap.Close())
+
+	dstDir, err := os.MkdirTemp("", "migration-snapshot-dst-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dstDir)) })
+	dst, err := NewPebbleStore(dstDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, dst.Close()) })
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+
+	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("stale"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+}
+
+// A migration driver that leaves MaxVersions unset must not be told the
+// bracket is complete. Answering Done for a zero budget lets it record a
+// non-empty range as fully copied and proceed to cutover without moving a
+// single version.
+func TestExportVersionsRejectsZeroVersionBudget(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v"), 10, 0))
+
+		for _, budget := range []int{0, -1} {
+			got, err := st.ExportVersions(ctx, ExportVersionsOptions{
+				MaxVersions:          budget,
+				MaxCommitTSInclusive: 100,
+				EndKey:               []byte("z"),
+			})
+			require.ErrorIs(t, err, ErrInvalidExportBudget, "budget %d", budget)
+			require.False(t, got.Done, "a refused export must not report completion")
+			require.Empty(t, got.Versions)
+		}
+	})
+}
+
+func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("eligible"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("too-new"), 30, 0))
+		accepted := false
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxCommitTSInclusive: 25,
+			MaxVersions:          1,
+			AcceptVersion: func(_ []byte, _ []byte) bool {
+				if accepted {
+					return false
+				}
+				accepted = true
+				return true
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []MVCCVersion{{Key: []byte("k"), CommitTS: 20, Value: []byte("eligible")}}, result.Versions)
+	})
+}
+
+func TestExportVersionsSkippedCursorBeforeStartResumesAtStartKey(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m20"), 20, 0))
+
+		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("m"),
+			EndKey:      []byte("z"),
+			Cursor:      encodeExportCursor([]byte("a"), 10, exportCursorTagSkippedKey),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, res.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("m"), CommitTS: 20, Value: []byte("m20")}}, res.Versions)
+	})
+}
+
+func TestValidateExportCursorForRangeRejectsSkippedCursorInsideRange(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateExportCursorForRange(
+		encodeExportCursor([]byte("stage|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.ErrorIs(t, err, ErrInvalidExportCursor)
+
+	err = ValidateExportCursorForRange(
+		encodeExportCursor([]byte("outside|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.NoError(t, err)
+}
+
+func TestValidatePromotionCursorForRangeAcceptsOnlyEmittedPositions(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte("stage|")
+	key := []byte("stage|k")
+	for _, tc := range []struct {
+		name    string
+		cursor  []byte
+		wantErr bool
+	}{
+		{name: "empty cursor"},
+		{name: "emitted cursor", cursor: encodeExportCursor(key, 10, exportCursorTagEmitted)},
+		{name: "scanned cursor", cursor: encodeExportCursor(key, 10, exportCursorTagScanned), wantErr: true},
+		{name: "pruned-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagPrunedKey), wantErr: true},
+		{name: "skipped-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagSkippedKey), wantErr: true},
+		{name: "emitted cursor outside range", cursor: encodeExportCursor([]byte("other|k"), 10, exportCursorTagEmitted), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidatePromotionCursorForRange(tc.cursor, prefix, PrefixScanEnd(prefix))
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrInvalidExportCursor)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
+}
+
 func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -1194,92 +1302,6 @@ func TestPromotionStateCodecPreservesMaxPromotedTS(t *testing.T) {
 	require.Equal(t, "old-error", decoded.LastError)
 }
 
-func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
-	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "migration-import-persist-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-
-	st, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     9,
-		BracketID: 4,
-		BatchSeq:  1,
-		Cursor:    []byte("persisted"),
-		Versions:  []MVCCVersion{{Key: []byte("k"), CommitTS: 99, Value: []byte("v")}},
-	})
-	require.NoError(t, err)
-	require.NoError(t, st.Close())
-
-	reopened, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, reopened.Close()) }()
-	floor, err := reopened.MigrationHLCFloor(ctx, 9)
-	require.NoError(t, err)
-	require.Equal(t, uint64(99), floor)
-	res, err := reopened.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     9,
-		BracketID: 4,
-		BatchSeq:  1,
-		Cursor:    []byte("different"),
-	})
-	require.NoError(t, err)
-	require.True(t, res.Duplicate)
-	require.Equal(t, []byte("persisted"), res.AckedCursor)
-}
-
-func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
-	ctx := context.Background()
-	srcDir, err := os.MkdirTemp("", "migration-snapshot-src-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(srcDir)) })
-	src, err := NewPebbleStore(srcDir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, src.Close()) })
-
-	_, err = src.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     7,
-		BracketID: 3,
-		BatchSeq:  1,
-		Cursor:    []byte("stale"),
-		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
-	})
-	require.NoError(t, err)
-	snap, err := src.Snapshot()
-	require.NoError(t, err)
-	raw := snapshotBytes(t, snap)
-	require.NoError(t, snap.Close())
-
-	dstDir, err := os.MkdirTemp("", "migration-snapshot-dst-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dstDir)) })
-	dst, err := NewPebbleStore(dstDir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, dst.Close()) })
-	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
-
-	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v50"), val)
-	floor, err := dst.MigrationHLCFloor(ctx, 7)
-	require.NoError(t, err)
-	require.Equal(t, uint64(50), floor)
-
-	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     7,
-		BracketID: 3,
-		BatchSeq:  1,
-		Cursor:    []byte("fresh"),
-		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
-	})
-	require.NoError(t, err)
-	require.True(t, res.Duplicate)
-	require.Equal(t, []byte("stale"), res.AckedCursor)
-	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
-	require.ErrorIs(t, err, ErrKeyNotFound)
-}
-
 func TestPebbleRestoreStreamingSnapshotPreservesMigrationPromotionState(t *testing.T) {
 	ctx := context.Background()
 	src := NewMVCCStore()
@@ -1343,11 +1365,6 @@ func TestPebbleRestoreStreamingSnapshotPreservesMigrationPromotionState(t *testi
 	require.Equal(t, uint64(110), restored.MaxPromotedTS)
 }
 
-// MaxBytes is checked after a row is appended, so a page can overshoot its
-// budget by the whole size of its last row. A 3 MiB page followed by a 61 MiB
-// row therefore builds a 64 MiB page that the migration transport refuses --
-// and the same cursor rebuilds it on every retry. Each row fits on its own, so
-// the page must stop before the row that would overshoot.
 func TestExportVersionsSplitsBeforeOverflowingTheByteBudget(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -1379,8 +1396,6 @@ func TestExportVersionsSplitsBeforeOverflowingTheByteBudget(t *testing.T) {
 	})
 }
 
-// A single row larger than the whole budget still goes out: a page holding
-// nothing has to make progress, or the cursor never advances.
 func TestExportVersionsEmitsSingleOversizedRow(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()

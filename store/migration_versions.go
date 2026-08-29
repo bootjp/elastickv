@@ -426,7 +426,7 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 		return ExportVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
-		return ExportVersionsResult{Done: true}, nil
+		return ExportVersionsResult{}, errors.WithStack(ErrInvalidExportBudget)
 	}
 
 	s.mtx.RLock()

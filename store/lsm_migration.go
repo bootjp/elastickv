@@ -23,7 +23,7 @@ func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersi
 		return ExportVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
-		return ExportVersionsResult{Done: true}, nil
+		return ExportVersionsResult{}, errors.WithStack(ErrInvalidExportBudget)
 	}
 
 	iter, err := s.db.NewIter(pebbleExportIterOptions(opts))

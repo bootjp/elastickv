@@ -30,6 +30,12 @@ var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
 var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
 var ErrValueTooLarge = errors.New("value too large")
 var ErrInvalidExportCursor = errors.New("invalid export cursor")
+
+// ErrInvalidExportBudget rejects an export asked for with no version budget.
+// Answering Done for a zero budget lets a migration driver record a non-empty
+// bracket as fully copied and move on to cutover, so the completion signal must
+// never be the answer to "you gave me nothing to fill".
+var ErrInvalidExportBudget = errors.New("migration export requires a positive version budget")
 var ErrImportBatchGap = errors.New("migration import batch gap")
 
 // ErrInvalidImportVersion marks a migration import version that is malformed
