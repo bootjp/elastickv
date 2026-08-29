@@ -581,21 +581,8 @@ func (s *AdminServer) StreamBackup(
 	req *pb.StreamBackupRequest,
 	stream grpc.ServerStreamingServer[pb.BackupKV],
 ) error {
-	if err := s.requireBackupControl(); err != nil {
-		return err
-	}
-	tok, err := s.decodeBackupToken(req.GetPinToken())
+	tok, routes, selection, err := s.resolveBackupStreamSession(req)
 	if err != nil {
-		return err
-	}
-	if _, err := s.backupGroupsForToken(tok); err != nil {
-		return err
-	}
-	routes, err := s.backupRouteSnapshotForToken(tok)
-	if err != nil {
-		return err
-	}
-	if err := s.requireLiveBackupSession(tok); err != nil {
 		return err
 	}
 	selected, err := selectedBackupScopes(req.GetScopes())
@@ -606,7 +593,7 @@ func (s *AdminServer) StreamBackup(
 	if scanner == nil {
 		return status.Errorf(codes.Unavailable, "%s", "backup scanner is nil")
 	}
-	scanErr := streamBackupRecords(stream, scanner, selected, func() error {
+	scanErr := streamBackupRecords(stream, scanner, selection, selected, func() error {
 		return s.requireLiveBackupSession(tok)
 	})
 	if err := finishBackupScan(stream.Context(), scanner, scanErr); err != nil {
@@ -616,6 +603,41 @@ func (s *AdminServer) StreamBackup(
 		return status.Errorf(codes.Internal, "close backup scanner: %v", err)
 	}
 	return nil
+}
+
+// resolveBackupStreamSession validates the pin token against this endpoint and
+// returns the session state the stream needs: the pinned route snapshot and the
+// adapter/scope selection recorded at BeginBackup.
+func (s *AdminServer) resolveBackupStreamSession(
+	req *pb.StreamBackupRequest,
+) (backupToken, kv.BackupRouteSnapshot, backupBaselineSelection, error) {
+	var (
+		tok       backupToken
+		routes    kv.BackupRouteSnapshot
+		selection backupBaselineSelection
+	)
+	if err := s.requireBackupControl(); err != nil {
+		return tok, routes, selection, err
+	}
+	tok, err := s.decodeBackupToken(req.GetPinToken())
+	if err != nil {
+		return tok, routes, selection, err
+	}
+	if _, err := s.backupGroupsForToken(tok); err != nil {
+		return tok, routes, selection, err
+	}
+	routes, err = s.backupRouteSnapshotForToken(tok)
+	if err != nil {
+		return tok, routes, selection, err
+	}
+	if err := s.requireLiveBackupSession(tok); err != nil {
+		return tok, routes, selection, err
+	}
+	selection, err = s.backupSelectionForToken(tok)
+	if err != nil {
+		return tok, routes, selection, err
+	}
+	return tok, routes, selection, nil
 }
 
 func (s *AdminServer) newBackupStreamScanner(
@@ -636,6 +658,7 @@ func (s *AdminServer) newBackupStreamScanner(
 func streamBackupRecords(
 	stream grpc.ServerStreamingServer[pb.BackupKV],
 	scanner kv.BackupScanner,
+	selection backupBaselineSelection,
 	selected map[logicalbackup.Scope]bool,
 	requireLive func() error,
 ) error {
@@ -654,7 +677,7 @@ func streamBackupRecords(
 			// produces exhaustion with keys silently missing.
 			return requireLive()
 		}
-		selectedRecord, err := backupRecordSelected(pair, selected)
+		selectedRecord, err := backupRecordSelected(pair, selection, selected)
 		if err != nil {
 			return err
 		}
@@ -670,9 +693,26 @@ func streamBackupRecords(
 	}
 }
 
-func backupRecordSelected(pair *store.KVPair, selected map[logicalbackup.Scope]bool) (bool, error) {
+func backupRecordSelected(
+	pair *store.KVPair,
+	selection backupBaselineSelection,
+	selected map[logicalbackup.Scope]bool,
+) (bool, error) {
 	if pair == nil {
 		return false, status.Errorf(codes.Internal, "%s", "backup scanner returned a nil record")
+	}
+	// The session's adapter filter is applied ahead of strict classification,
+	// the same order the baseline scan uses. Without it a dump that excludes an
+	// adapter passes both preflight scans and then aborts mid-stream on a
+	// malformed or future-format key in that excluded adapter -- a key it was
+	// never going to send.
+	adapters := selection.adapters
+	if adapters == (logicalbackup.AdapterSet{}) {
+		adapters = logicalbackup.AllAdapters()
+	}
+	adapter, known := logicalbackup.AdapterForKey(pair.Key)
+	if !known || !logicalbackup.AdapterEnabled(adapters, adapter) {
+		return false, nil
 	}
 	return backupKeySelected(pair.Key, selected)
 }

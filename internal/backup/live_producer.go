@@ -356,14 +356,30 @@ func dumpPinnedBackup(
 	if finalizeErr != nil {
 		return LiveBackupResult{ReadTS: begin.GetReadTs(), Scopes: sortedScopeSet(selected)}, finalizeErr
 	}
-	actual, err = decoder.FinalizedScopeCounts(actual)
+	finalized, err := decoder.FinalizedScopeCounts(actual)
 	if err != nil {
 		return LiveBackupResult{ReadTS: begin.GetReadTs(), Scopes: sortedScopeSet(selected), Counters: counters}, err
 	}
-	if err := validateExpectedLiveCounts(selected, actual, begin.GetExpectedKeys()); err != nil {
+	if err := validateExpectedLiveCounts(selected, comparableLiveCounts(begin, actual, finalized), begin.GetExpectedKeys()); err != nil {
 		return LiveBackupResult{ReadTS: begin.GetReadTs(), Scopes: sortedScopeSet(selected), Counters: counters}, err
 	}
 	return LiveBackupResult{ReadTS: begin.GetReadTs(), Scopes: sortedScopeSet(selected), Counters: counters}, nil
+}
+
+// comparableLiveCounts picks the tally that means the same thing as the
+// server's baseline. A v2 server counts its baseline through the same encoders
+// as the dump (LiveScopeCounter), so the finalized retained-record totals are
+// the right numerator. A v1 server counts every raw scoped key, including the
+// records those encoders consolidate away -- stale S3 and DynamoDB
+// generations, expired SQS messages, orphan Redis TTL keys -- so comparing
+// finalized totals against it understates the dump by however many leftovers
+// the cluster holds and reports a shortfall on a stream that was complete.
+// The raw streamed tally is the matching denominator there.
+func comparableLiveCounts(begin *pb.BeginBackupResponse, streamed, finalized map[Scope]uint64) map[Scope]uint64 {
+	if begin.GetBackupProtocolVersion() >= backupProtocolVersionScopedBaseline {
+		return finalized
+	}
+	return streamed
 }
 
 func streamSelectedBackup(
