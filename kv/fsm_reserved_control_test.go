@@ -88,3 +88,47 @@ func TestValidateRawMutationRejectsStagedDataKeys(t *testing.T) {
 		&pb.Mutation{Op: pb.Op_PUT, Key: staged, Value: []byte("v")}, nil, 10), ErrInvalidRequest)
 	require.ErrorIs(t, f.handleDelPrefix(ctx, distribution.MigrationStagedDataKey(7, []byte("user:")), 11), ErrInvalidRequest)
 }
+
+// The transactional paths reach the store through their own helpers, which did
+// not carry the reserved-key check the raw path has. A TransactionalKV request
+// could therefore write catalog or staged-migration state directly, and a
+// forged !migstage|<job>| row is promoted as user data when the same group is
+// the migration target.
+func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { _ = st.Close() })
+	f, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	for _, key := range [][]byte{
+		[]byte("!dist|meta|version"),
+		[]byte("!dist|route|0001"),
+		distribution.MigrationStagedDataKey(7, []byte("victim")),
+		[]byte("!migwrite|7"),
+		[]byte("!migfence|7"),
+	} {
+		muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}}
+		_, err := f.uniqueMutationsAboveFloor(muts, 10)
+		require.ErrorIs(t, err, ErrInvalidRequest,
+			"prepare/one-phase must refuse %q", key)
+		_, err = f.uniqueTxnMutationsAboveFloor(muts, 10)
+		require.ErrorIs(t, err, ErrInvalidRequest,
+			"commit must refuse %q", key)
+	}
+
+	// Ordinary user keys, and the transaction-internal keys the txn paths
+	// legitimately write, are unaffected.
+	for _, key := range [][]byte{
+		[]byte("user-key"),
+		txnLockKey([]byte("user-key")),
+		txnIntentKey([]byte("user-key")),
+	} {
+		muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}}
+		_, err := f.uniqueMutationsAboveFloor(muts, 10)
+		require.NoError(t, err, "key %q must be accepted", key)
+		_, err = f.uniqueTxnMutationsAboveFloor(muts, 10)
+		require.NoError(t, err, "key %q must be accepted", key)
+	}
+}

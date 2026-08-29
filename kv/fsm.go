@@ -1358,15 +1358,43 @@ func (f *kvFSM) uniqueMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) 
 	if err != nil {
 		return nil, err
 	}
+	if err := rejectReservedControlMutations(uniq); err != nil {
+		return nil, err
+	}
 	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
 		return nil, err
 	}
 	return uniq, nil
 }
 
+// rejectReservedControlMutations keeps the catalog and migration control
+// namespaces out of client writes. validateRawMutationForApply already refuses
+// them on the raw path; the transactional paths reached the store without the
+// check, so a TransactionalKV request could write !dist| or !migstage| state
+// directly -- and a forged !dist|migstage|<job>| row is promoted as user data
+// when the same group is a migration target.
+//
+// The verdict is a pure function of the key, so every replica reaches it for
+// the same entry. Typed internal commands (catalog apply, migration import and
+// promote) do not pass through here and keep writing these namespaces.
+func rejectReservedControlMutations(muts []*pb.Mutation) error {
+	for _, mut := range muts {
+		if mut == nil {
+			continue
+		}
+		if distribution.IsReservedControlKey(mut.Key) {
+			return errors.WithStack(ErrInvalidRequest)
+		}
+	}
+	return nil
+}
+
 func (f *kvFSM) uniqueTxnMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
 	uniq, err := uniqueTxnMutations(muts)
 	if err != nil {
+		return nil, err
+	}
+	if err := rejectReservedControlMutations(uniq); err != nil {
 		return nil, err
 	}
 	if err := f.verifyRouteWriteTimestampFloorsForMutations(uniq, commitTS); err != nil {
