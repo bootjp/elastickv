@@ -6,7 +6,9 @@ import (
 	"path/filepath"
 	"sort"
 
+	pb "github.com/bootjp/elastickv/proto"
 	cockroachdberr "github.com/cockroachdb/errors"
+	gproto "google.golang.org/protobuf/proto"
 )
 
 // Redis set encoder. Translates raw !st|... snapshot records into the
@@ -26,7 +28,25 @@ const (
 	RedisSetMetaPrefix      = "!st|meta|"
 	RedisSetMemberPrefix    = "!st|mem|"
 	RedisSetMetaDeltaPrefix = "!st|meta|d|"
+
+	// RedisSetLegacyBlobPrefix is the consolidated single-key layout the live
+	// store still reads for sets that predate the wide-column migration:
+	// adapter/redis_set_cmds.go's buildSetLegacyMigrationElems falls back to
+	// !redis|set|<userKey> until the next write migrates the key. A dump that
+	// skipped it would silently omit those sets.
+	RedisSetLegacyBlobPrefix = "!redis|set|"
 )
+
+// redisSetLegacyProtoPrefix is the 4-byte magic the live store writes ahead of
+// the pb.RedisSetValue body (adapter/redis_storage_codec.go's
+// storedRedisSetProtoPrefix). Duplicated rather than imported because the
+// backup package must not depend on the adapter; a rename on the live side
+// surfaces as ErrRedisInvalidSetLegacyBlob on any real dump.
+var redisSetLegacyProtoPrefix = []byte{0x00, 'R', 'S', 0x01}
+
+// ErrRedisInvalidSetLegacyBlob is returned when a !redis|set| value is not a
+// magic-prefixed pb.RedisSetValue.
+var ErrRedisInvalidSetLegacyBlob = cockroachdberr.New("backup: invalid !redis|set| value")
 
 // ErrRedisInvalidSetMeta is returned when an !st|meta| value is not
 // the expected big-endian member count, optionally followed by inline TTL.
@@ -41,13 +61,88 @@ var ErrRedisInvalidSetKey = cockroachdberr.New("backup: malformed !st| key")
 // HandleSetMember calls collapse idempotently (a snapshot iterator
 // that re-emits a member is harmless — Redis sets are mathematical
 // sets, not multisets).
+//
+// sawWide records whether any wide-column row (!st|meta| or !st|mem|) has been
+// seen for the user key. The live read path treats those as authoritative and
+// consults the !redis|set| blob only when none exist, so a store holding both
+// layouts for one key must drop the legacy members rather than union stale
+// ones onto the source of truth.
 type redisSetState struct {
 	metaSeen       bool
 	declaredLen    int64
 	members        map[string]struct{}
+	sawWide        bool
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
+}
+
+// markSetWide flips sawWide and, on the first wide-column row for this key,
+// drops any members a legacy blob deposited first. The map is reused rather
+// than reallocated so the nil-vs-empty contract for an empty-but-meta-seen set
+// stays as it was.
+func (r *RedisDB) markSetWide(st *redisSetState) {
+	if st.sawWide {
+		return
+	}
+	st.sawWide = true
+	for k := range st.members {
+		delete(st.members, k)
+	}
+}
+
+// HandleSetLegacyBlob processes one !redis|set|<userKey> record: the
+// consolidated layout the live store still reads for unmigrated sets. The
+// value is a magic-prefixed pb.RedisSetValue carrying every member.
+//
+// Scan-order note: "!redis|set|" sorts before "!st|", so in a Pebble-ordered
+// dump this handler normally runs first and any later wide-column row clears
+// what it deposited through markSetWide. The reverse order (custom dispatcher
+// or replay) drops the blob here instead.
+func (r *RedisDB) HandleSetLegacyBlob(key, value []byte) error {
+	userKey, ok := parseRedisLegacyBlobKey(key, RedisSetLegacyBlobPrefix)
+	if !ok {
+		return cockroachdberr.Wrapf(ErrRedisInvalidSetLegacyBlob, "key: %q", key)
+	}
+	members, err := decodeSetLegacyBlobValue(value)
+	if err != nil {
+		return err
+	}
+	st := r.setState(userKey)
+	if st.sawWide {
+		return nil
+	}
+	for _, member := range members {
+		st.members[member] = struct{}{}
+	}
+	return nil
+}
+
+func decodeSetLegacyBlobValue(value []byte) ([]string, error) {
+	if !bytes.HasPrefix(value, redisSetLegacyProtoPrefix) {
+		return nil, cockroachdberr.Wrapf(ErrRedisInvalidSetLegacyBlob,
+			"missing or corrupt magic prefix (len=%d)", len(value))
+	}
+	msg := &pb.RedisSetValue{}
+	if err := gproto.Unmarshal(value[len(redisSetLegacyProtoPrefix):], msg); err != nil {
+		return nil, cockroachdberr.Wrapf(ErrRedisInvalidSetLegacyBlob, "unmarshal: %v", err)
+	}
+	return msg.GetMembers(), nil
+}
+
+// parseRedisLegacyBlobKey strips a consolidated-layout prefix and returns the
+// user-key bytes. Unlike the wide-column keys there is no userKeyLen header --
+// the live store appends the user key directly -- so an empty remainder is the
+// only malformed shape.
+func parseRedisLegacyBlobKey(key []byte, prefix string) ([]byte, bool) {
+	if !bytes.HasPrefix(key, []byte(prefix)) {
+		return nil, false
+	}
+	// An empty remainder is the empty Redis key, which the command paths accept
+	// and which therefore has a stored blob at exactly the family prefix.
+	// Rejecting it as malformed would fail the decoder on data the Redis API
+	// can create. parseZSetLegacyBlobKey already treats it this way.
+	return key[len(prefix):], true
 }
 
 // HandleSetMeta processes one !st|meta|<len><userKey> record. The
@@ -80,6 +175,7 @@ func (r *RedisDB) HandleSetMeta(key, value []byte) error {
 		return err
 	}
 	st := r.setState(userKey)
+	r.markSetWide(st)
 	st.declaredLen = declaredLen
 	st.metaSeen = true
 	if inlineTTL {
@@ -101,6 +197,7 @@ func (r *RedisDB) HandleSetMember(key, _ []byte) error {
 		return cockroachdberr.Wrapf(ErrRedisInvalidSetKey, "member key: %q", key)
 	}
 	st := r.setState(userKey)
+	r.markSetWide(st)
 	st.members[string(member)] = struct{}{}
 	return nil
 }

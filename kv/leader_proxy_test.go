@@ -101,7 +101,8 @@ func (s *stubFollowerEngine) Status() raftengine.Status {
 func (s *stubFollowerEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (s *stubFollowerEngine) Close() error { return nil }
+func (s *stubFollowerEngine) SnapshotEvery() uint64 { return 10_000 }
+func (s *stubFollowerEngine) Close() error          { return nil }
 
 func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 	t.Parallel()
@@ -224,7 +225,8 @@ func (e *togglingFollowerEngine) Status() raftengine.Status {
 func (e *togglingFollowerEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (e *togglingFollowerEngine) Close() error { return nil }
+func (e *togglingFollowerEngine) SnapshotEvery() uint64 { return 10_000 }
+func (e *togglingFollowerEngine) Close() error          { return nil }
 
 func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 	t.Parallel()

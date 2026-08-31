@@ -66,6 +66,7 @@ func (e *fakeLeaseEngine) Status() raftengine.Status {
 func (e *fakeLeaseEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
+func (e *fakeLeaseEngine) SnapshotEvery() uint64 { return 10_000 }
 func (e *fakeLeaseEngine) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	e.proposeCalls.Add(1)
 	if e.proposeCtxHook != nil {
@@ -173,6 +174,7 @@ func (e *nonLeaseEngine) Status() raftengine.Status {
 func (e *nonLeaseEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
+func (e *nonLeaseEngine) SnapshotEvery() uint64 { return 10_000 }
 func (e *nonLeaseEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return &raftengine.ProposalResult{}, nil
 }

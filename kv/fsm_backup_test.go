@@ -1,0 +1,557 @@
+package kv
+
+import (
+	"bytes"
+	"context"
+	"testing"
+	"time"
+
+	"github.com/bootjp/elastickv/internal/raftengine"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
+)
+
+func TestApplyBackupUsesSharedTracker(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+	pinID := backupTrackerTestPinID(1)
+	now := time.Now()
+	firstDeadline := time.UnixMilli(now.Add(time.Hour).UnixMilli())
+	secondDeadline := time.UnixMilli(now.Add(2 * time.Hour).UnixMilli())
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID:    pinID,
+		ReadTS:   42,
+		Deadline: firstDeadline,
+	}))))
+	require.Equal(t, 1, tracker.ActiveBackupPinCount())
+	require.Equal(t, uint64(42), tracker.Oldest())
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupExtendEntry(BackupExtendEntry{
+		PinID:    pinID,
+		Deadline: secondDeadline,
+	}))))
+	gotDeadline, ok := tracker.BackupPinDeadline(pinID)
+	require.True(t, ok)
+	require.Equal(t, secondDeadline, gotDeadline)
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReleaseEntry(BackupReleaseEntry{PinID: pinID}))))
+	require.Equal(t, 0, tracker.ActiveBackupPinCount())
+	require.Equal(t, uint64(0), tracker.Oldest())
+}
+
+func TestApplyBackupWithoutTrackerHalts(t *testing.T) {
+	fsm, ok := NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	err := haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID:    backupTrackerTestPinID(1),
+		ReadTS:   42,
+		Deadline: time.UnixMilli(5000),
+	})))
+	require.True(t, errors.Is(err, ErrBackupApply), "err = %v", err)
+}
+
+func TestApplyBackupUnknownSubtypeHalts(t *testing.T) {
+	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+
+	err := haltApplyOf(fsm.Apply([]byte{raftEncodeBackup, 0xff}))
+	require.True(t, errors.Is(err, ErrBackupApply), "err = %v", err)
+	require.True(t, errors.Is(err, ErrBackupWireSubtype), "err = %v", err)
+}
+
+func TestApplyBackupInvalidPinReturnsNonFatalError(t *testing.T) {
+	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+
+	resp := fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID:    BackupPinID{},
+		ReadTS:   42,
+		Deadline: time.UnixMilli(5000),
+	}))
+	require.NoError(t, haltApplyOf(resp))
+	respErr, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, respErr, ErrInvalidBackupPin)
+}
+
+func TestApplyBackupLimitDoesNotDropCommittedPins(t *testing.T) {
+	tracker := NewActiveTimestampTracker(
+		WithActiveTimestampTrackerSweepInterval(0),
+		WithActiveTimestampTrackerMaxBackupPins(1),
+	)
+	fsm := newBackupTestFSM(t, tracker)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID:    backupTrackerTestPinID(1),
+		ReadTS:   42,
+		Deadline: time.Now().Add(time.Hour),
+	}))))
+
+	resp := fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID:    backupTrackerTestPinID(2),
+		ReadTS:   43,
+		Deadline: time.Now().Add(2 * time.Hour),
+	}))
+
+	require.NoError(t, haltApplyOf(resp))
+	require.Nil(t, resp)
+	require.Equal(t, 2, tracker.ActiveBackupPinCount())
+	require.Equal(t, uint64(42), tracker.Oldest())
+}
+
+func TestApplyBackupMissingExtendIsNoop(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+
+	resp := fsm.Apply(EncodeBackupExtendEntry(BackupExtendEntry{
+		PinID:    backupTrackerTestPinID(1),
+		Deadline: time.Now().Add(time.Hour),
+	}))
+
+	require.NoError(t, haltApplyOf(resp))
+	require.Nil(t, resp)
+	require.Equal(t, 0, tracker.ActiveBackupPinCount())
+}
+
+func TestApplyBackupExpiredExtendRestoresCommittedFence(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+	pinID := backupTrackerTestPinID(1)
+	require.NoError(t, tracker.PinWithDeadline(pinID, 42, time.Now().Add(-time.Millisecond)))
+
+	resp := fsm.Apply(EncodeBackupExtendEntry(BackupExtendEntry{
+		PinID:    pinID,
+		Deadline: time.Now().Add(time.Hour),
+	}))
+
+	require.NoError(t, haltApplyOf(resp))
+	require.Nil(t, resp)
+	require.Equal(t, 1, tracker.ActiveBackupPinCount())
+	require.Equal(t, uint64(42), tracker.Oldest())
+}
+
+func TestApplyBackupObservesPinnedReadTimestamp(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	hlc := NewHLC()
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		store.NewMVCCStore(), hlc, tracker, WithRouteHistory(nil, 1),
+	).(*kvFSM)
+	require.True(t, ok)
+	readTS := hlc.Next() + 10_000
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+	require.GreaterOrEqual(t, hlc.Current(), readTS)
+}
+
+func TestApplyBackupFencesPreallocatedWrites(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+	readTS := uint64(100)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+
+	tests := []struct {
+		name string
+		req  *pb.Request
+	}{
+		{
+			name: "raw",
+			req: &pb.Request{Ts: readTS - 1, Mutations: []*pb.Mutation{{
+				Op: pb.Op_PUT, Key: []byte("raw"), Value: []byte("stale"),
+			}}},
+		},
+		{
+			name: "one phase",
+			req: &pb.Request{IsTxn: true, Phase: pb.Phase_NONE, Ts: readTS - 2, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("one-phase"), CommitTS: readTS - 1,
+				})},
+				{Op: pb.Op_PUT, Key: []byte("one-phase"), Value: []byte("stale")},
+			}},
+		},
+		{
+			name: "prepare",
+			req: &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: readTS - 1, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: []byte("prepare"), LockTTLms: defaultTxnLockTTLms,
+				})},
+				{Op: pb.Op_PUT, Key: []byte("prepare"), Value: []byte("stale")},
+			}},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			requireBackupTimestampFenced(t, applyBackupTestRequest(t, fsm, tc.req))
+		})
+	}
+}
+
+func TestApplyBackupReserveDoesNotInstallTimestampFloor(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSM(t, tracker)
+	readTS := uint64(100)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+
+	require.Nil(t, applyBackupTestRequest(t, fsm, &pb.Request{Ts: readTS - 1, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: []byte("reserved-only"), Value: []byte("allowed"),
+	}}}))
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))))
+	requireBackupTimestampFenced(t, applyBackupTestRequest(t, fsm, &pb.Request{Ts: readTS - 1, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: []byte("after-pin"), Value: []byte("blocked"),
+	}}}))
+}
+
+func TestBackupTimestampFloorKeyRejectsRawMutation(t *testing.T) {
+	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+	resp := applyBackupTestRequest(t, fsm, &pb.Request{Ts: 10, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: bytes.Clone(backupTimestampFloorKey), Value: make([]byte, backupTimestampFloorValueSize),
+	}}})
+	err, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+func TestApplyBackupAllowsResolutionOfPrePinTransaction(t *testing.T) {
+	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+	primary := []byte("primary")
+	startTS := uint64(30)
+	commitTS := uint64(40)
+	prepare := &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: startTS, Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+			PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+		})},
+		{Op: pb.Op_PUT, Key: primary, Value: []byte("committed")},
+	}}
+	require.Nil(t, applyBackupTestRequest(t, fsm, prepare))
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: 50, Deadline: time.Now().Add(time.Hour),
+	}))))
+	commit := &pb.Request{IsTxn: true, Phase: pb.Phase_COMMIT, Ts: startTS, Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+			PrimaryKey: primary, CommitTS: commitTS,
+		})},
+		{Op: pb.Op_PUT, Key: primary},
+	}}
+	require.Nil(t, applyBackupTestRequest(t, fsm, commit))
+	value, err := fsm.store.GetAt(context.Background(), primary, 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("committed"), value)
+}
+
+func TestBackupTimestampFloorSurvivesSnapshotRestore(t *testing.T) {
+	srcStore := store.NewMVCCStore()
+	src, ok := NewKvFSMWithHLCAndTracker(
+		srcStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+	require.NoError(t, haltApplyOf(src.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: 75, Deadline: time.Now().Add(time.Hour),
+	}))))
+	snapshot, err := srcStore.Snapshot()
+	require.NoError(t, err)
+	defer snapshot.Close()
+	var raw bytes.Buffer
+	_, err = snapshot.WriteTo(&raw)
+	require.NoError(t, err)
+
+	dstStore := store.NewMVCCStore()
+	dst, ok := NewKvFSMWithHLCAndTracker(
+		dstStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+	require.NoError(t, dst.Restore(bytes.NewReader(raw.Bytes())))
+	requireBackupTimestampFenced(t, applyBackupTestRequest(t, dst, &pb.Request{Ts: 74, Mutations: []*pb.Mutation{{
+		Op: pb.Op_PUT, Key: []byte("late"), Value: []byte("stale"),
+	}}}))
+}
+
+func TestFSMSnapshotRejectsActiveBackupPin(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSMWithGroup(t, tracker, 7)
+	pinID := backupTrackerTestPinID(1)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: pinID, ReadTS: 75, Deadline: time.Now().Add(time.Hour),
+	}))))
+
+	_, err := fsm.Snapshot()
+	require.ErrorIs(t, err, ErrBackupSnapshotBlocked)
+	// The refusal must reach the engine as a deferral. Without this mark the
+	// etcd run loop treats it like any other Snapshot error: drainReady
+	// propagates it, the loop calls fail(), and the replica exits -- so an
+	// open backup pin plus ordinary writes would take replicas down instead of
+	// postponing compaction.
+	require.ErrorIs(t, err, raftengine.ErrSnapshotDeferred)
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReleaseEntry(BackupReleaseEntry{PinID: pinID}))))
+	snapshot, err := fsm.Snapshot()
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+}
+
+func TestBackupTimestampFloorRejectsDelayedRaftProposal(t *testing.T) {
+	st := store.NewMVCCStore()
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	r, stop := newSingleRaft(t, "backup-floor-delayed", NewKvFSMWithHLCAndTracker(st, NewHLC(), tracker))
+	t.Cleanup(stop)
+	readTS := uint64(500)
+	result, err := r.ProposeAdmin(context.Background(), EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(1), ReadTS: readTS, Deadline: time.Now().Add(time.Hour),
+	}))
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Nil(t, result.Response)
+
+	txn := NewTransactionWithProposer(r)
+	_, err = txn.Commit(context.Background(), []*pb.Request{{
+		Ts: readTS - 1,
+		Mutations: []*pb.Mutation{{
+			Op: pb.Op_PUT, Key: []byte("delayed"), Value: []byte("stale"),
+		}},
+	}})
+	require.ErrorIs(t, err, ErrBackupTimestampFenced)
+	_, err = st.GetAt(context.Background(), []byte("delayed"), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func applyBackupTestRequest(t *testing.T, fsm *kvFSM, req *pb.Request) any {
+	t.Helper()
+	payload, err := marshalRaftCommand([]*pb.Request{req})
+	require.NoError(t, err)
+	return fsm.Apply(payload)
+}
+
+func requireBackupTimestampFenced(t *testing.T, resp any) {
+	t.Helper()
+	err, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, err, ErrBackupTimestampFenced)
+}
+
+func TestApplyBackupReserveEnforcesCapacityAndUnreserveReleases(t *testing.T) {
+	tracker := NewActiveTimestampTracker(
+		WithActiveTimestampTrackerSweepInterval(0),
+		WithActiveTimestampTrackerMaxBackupPins(1),
+	)
+	fsm := newBackupTestFSM(t, tracker)
+	deadline := time.Now().Add(time.Hour)
+	first := backupTrackerTestPinID(1)
+	second := backupTrackerTestPinID(2)
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: first, ReadTS: 42, Deadline: deadline,
+	}))))
+	resp := fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: second, ReadTS: 43, Deadline: deadline,
+	}))
+	require.NoError(t, haltApplyOf(resp))
+	respErr, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, respErr, ErrTooManyActiveBackups)
+
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupUnreserveEntry(BackupUnreserveEntry{PinID: first}))))
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupReserveEntry(BackupReserveEntry{
+		PinID: second, ReadTS: 43, Deadline: deadline,
+	}))))
+}
+
+func TestApplyBackupZeroDeadlineReturnsNonFatalError(t *testing.T) {
+	fsm := newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+
+	resp := fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID:    backupTrackerTestPinID(1),
+		ReadTS:   42,
+		Deadline: time.Time{},
+	}))
+
+	require.NoError(t, haltApplyOf(resp))
+	respErr, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, respErr, ErrInvalidBackupPin)
+}
+
+func TestApplyBackupPinsAreScopedByRaftGroup(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm1 := newBackupTestFSMWithGroup(t, tracker, 1)
+	fsm2 := newBackupTestFSMWithGroup(t, tracker, 2)
+	pinID := backupTrackerTestPinID(1)
+	entry := BackupPinEntry{
+		PinID:    pinID,
+		ReadTS:   42,
+		Deadline: time.Now().Add(time.Hour),
+	}
+
+	require.NoError(t, haltApplyOf(fsm1.Apply(EncodeBackupPinEntry(entry))))
+	require.NoError(t, haltApplyOf(fsm2.Apply(EncodeBackupPinEntry(entry))))
+	require.Equal(t, 2, tracker.ActiveBackupPinCount())
+
+	require.NoError(t, haltApplyOf(fsm1.Apply(EncodeBackupReleaseEntry(BackupReleaseEntry{PinID: pinID}))))
+	require.Equal(t, 1, tracker.ActiveBackupPinCount())
+	_, ok := tracker.BackupPinDeadlineForGroup(pinID, 1)
+	require.False(t, ok)
+	_, ok = tracker.BackupPinDeadlineForGroup(pinID, 2)
+	require.True(t, ok)
+}
+
+func TestBackupPayloadIsVolatileOnly(t *testing.T) {
+	fsm := &kvFSM{}
+	pinID := backupTrackerTestPinID(1)
+
+	require.True(t, fsm.IsVolatileOnlyPayload(EncodeBackupPinEntry(BackupPinEntry{
+		PinID:    pinID,
+		ReadTS:   42,
+		Deadline: time.UnixMilli(5000),
+	})))
+	require.False(t, fsm.IsVolatileOnlyPayload(nil))
+	require.False(t, fsm.IsVolatileOnlyPayload([]byte{raftEncodeSingle}))
+	require.False(t, fsm.IsVolatileOnlyPayload([]byte{0x03}))
+}
+
+func newBackupTestFSM(t *testing.T, tracker *ActiveTimestampTracker) *kvFSM {
+	t.Helper()
+	fsm, ok := NewKvFSMWithHLCAndTracker(store.NewMVCCStore(), NewHLC(), tracker).(*kvFSM)
+	require.True(t, ok)
+	return fsm
+}
+
+func newBackupTestFSMWithGroup(t *testing.T, tracker *ActiveTimestampTracker, groupID uint64) *kvFSM {
+	t.Helper()
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		store.NewMVCCStore(),
+		NewHLC(),
+		tracker,
+		WithRouteHistory(nil, groupID),
+	).(*kvFSM)
+	require.True(t, ok)
+	return fsm
+}
+
+// The cold-start volatile-replay path classifies backup payloads as volatile so
+// a post-snapshot pin/release is reconstructed. That is only safe because a
+// backup entry the FSM cannot apply still returns a HaltApply response, which
+// the engine inspects before its duplicate early-return. These cases pin that
+// contract: classification stays true (the entry is delivered, not dropped),
+// and Apply reports a halt rather than a silent no-op.
+func TestBackupPayloadsHaltApplyWhenUnapplicable(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		fsm     func(t *testing.T) *kvFSM
+		payload []byte
+	}{
+		{
+			name: "malformed backup payload",
+			fsm: func(t *testing.T) *kvFSM {
+				t.Helper()
+				return newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+			},
+			payload: []byte{raftEncodeBackup, 0xff},
+		},
+		{
+			name: "unknown future backup subtype",
+			fsm: func(t *testing.T) *kvFSM {
+				t.Helper()
+				return newBackupTestFSM(t, NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)))
+			},
+			// 0x7f is not one of the pin/extend/release/reserve/unreserve subtypes.
+			payload: append([]byte{raftEncodeBackup, 0x7f}, make([]byte, backupPinIDBytes)...),
+		},
+		{
+			name: "backup entry with no tracker wired",
+			fsm: func(t *testing.T) *kvFSM {
+				t.Helper()
+				fsm, ok := NewKvFSMWithHLC(store.NewMVCCStore(), NewHLC()).(*kvFSM)
+				require.True(t, ok)
+				return fsm
+			},
+			payload: EncodeBackupPinEntry(BackupPinEntry{
+				PinID:    backupTrackerTestPinID(9),
+				ReadTS:   42,
+				Deadline: time.Now().Add(time.Hour),
+			}),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			fsm := tt.fsm(t)
+
+			require.True(t, fsm.IsVolatileOnlyPayload(tt.payload),
+				"the entry must still be delivered to Apply, not dropped as a duplicate")
+
+			resp := fsm.Apply(tt.payload)
+			halter, ok := resp.(interface{ HaltApply() error })
+			require.True(t, ok, "Apply must return a HaltApply response, got %T", resp)
+			require.Error(t, halter.HaltApply(),
+				"an unapplicable backup entry must halt the apply loop instead of advancing past it")
+		})
+	}
+}
+
+// A follower that applied a BackupPin but not its BackupRelease can catch up
+// from a snapshot the leader took after the release. That snapshot carries no
+// pin state and both log entries are already compacted, so the stale pin would
+// otherwise keep blocking compaction and snapshots on this replica -- and keep
+// consuming backup capacity -- until its deadline lapsed.
+func TestFSMRestoreClearsStaleBackupPins(t *testing.T) {
+	const groupID = uint64(7)
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSMWithGroup(t, tracker, groupID)
+	pinID := backupTrackerTestPinID(1)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: pinID, ReadTS: 75, Deadline: time.Now().Add(time.Hour),
+	}))))
+	require.Equal(t, uint64(75), tracker.OldestBackupForGroup(groupID))
+
+	// A snapshot taken on a replica with no pin, restored here.
+	source := newBackupTestFSMWithGroup(t, NewActiveTimestampTracker(
+		WithActiveTimestampTrackerSweepInterval(0)), groupID)
+	snapshot, err := source.Snapshot()
+	require.NoError(t, err)
+	var raw bytes.Buffer
+	_, err = snapshot.WriteTo(&raw)
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+
+	require.NoError(t, fsm.Restore(bytes.NewReader(raw.Bytes())))
+	require.Zero(t, tracker.OldestBackupForGroup(groupID),
+		"a restored snapshot must not leave this group's volatile pins behind")
+
+	// The snapshot itself must now be possible again -- the pin was what
+	// refused it.
+	restored, err := fsm.Snapshot()
+	require.NoError(t, err)
+	require.NoError(t, restored.Close())
+}
+
+// Only the restoring group's pins are dropped. A pin another group holds in
+// the shared tracker is unrelated to this group's snapshot.
+func TestFSMRestoreKeepsOtherGroupsBackupPins(t *testing.T) {
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm := newBackupTestFSMWithGroup(t, tracker, 7)
+	require.NoError(t, tracker.ApplyPinWithDeadlineForGroup(
+		backupTrackerTestPinID(2), 9, 60, time.Now().Add(time.Hour)))
+
+	source := newBackupTestFSMWithGroup(t, NewActiveTimestampTracker(
+		WithActiveTimestampTrackerSweepInterval(0)), 7)
+	snapshot, err := source.Snapshot()
+	require.NoError(t, err)
+	var raw bytes.Buffer
+	_, err = snapshot.WriteTo(&raw)
+	require.NoError(t, err)
+	require.NoError(t, snapshot.Close())
+
+	require.NoError(t, fsm.Restore(bytes.NewReader(raw.Bytes())))
+	require.Equal(t, uint64(60), tracker.OldestBackupForGroup(9),
+		"another group's pin must survive this group's restore")
+}
