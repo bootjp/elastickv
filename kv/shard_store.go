@@ -746,10 +746,7 @@ func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end 
 	}
 	if reverse {
 		if groupID != 0 {
-			if routeScanBoundsPresent(routeStart, routeEnd) {
-				return s.scanExplicitGroupAtWithReadFence(ctx, groupID, start, end, limit, ts, true, readRouteVersion, routeStart, routeEnd)
-			}
-			return nil, errors.WithStack(store.ErrNotSupported)
+			return s.scanExplicitGroupAtWithReadFence(ctx, groupID, start, end, limit, ts, true, readRouteVersion, routeStart, routeEnd)
 		}
 		return s.reverseScanAtWithReadFence(ctx, start, end, limit, ts, readRouteVersion, routeStart, routeEnd)
 	}
@@ -945,13 +942,7 @@ func (s *ShardStore) scanExplicitGroupRoutesAtWithReadFence(ctx context.Context,
 
 // ReverseScanGroupAt reverse-scans a range on the explicitly selected Raft group.
 func (s *ShardStore) ReverseScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	if limit <= 0 {
-		return []*store.KVPair{}, nil
-	}
-	return s.scanRouteAtDirectionWithReadFence(
-		ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, true,
-		0, nil, nil,
-	)
+	return s.scanExplicitGroupAtWithReadFence(ctx, groupID, start, end, limit, ts, true, 0, nil, nil)
 }
 
 // ScanGroupKeysAt scans keys on the explicitly selected Raft group without

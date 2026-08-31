@@ -872,11 +872,25 @@ func TestShardStoreExplicitGroupReads_MergeStagedVisibility(t *testing.T) {
 		{Key: []byte("c"), Value: []byte("staged-c")},
 	}, kvs)
 
+	kvs, err = st.ReverseScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 35)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("c"), Value: []byte("staged-c")},
+		{Key: []byte("b"), Value: []byte("staged-b")},
+	}, kvs)
+
 	kvs, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 35, false, 1, 0, []byte("a"), []byte("z"))
 	require.NoError(t, err)
 	require.Equal(t, []*store.KVPair{
 		{Key: []byte("b"), Value: []byte("staged-b")},
 		{Key: []byte("c"), Value: []byte("staged-c")},
+	}, kvs)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 35, true, 1, 0, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("c"), Value: []byte("staged-c")},
+		{Key: []byte("b"), Value: []byte("staged-b")},
 	}, kvs)
 }
 
@@ -1895,10 +1909,13 @@ func TestShardStoreScanAtWithReadFence_AllowsExplicitGroupRouteBoundReverse(t *t
 	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
 	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
 
-	_, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), nil, nil)
-	require.ErrorIs(t, err, store.ErrNotSupported)
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), nil, nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+	require.Equal(t, []byte("right"), kvs[0].Value)
 
-	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, st.ReadRouteVersion(), []byte("m"), nil)
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, st.ReadRouteVersion(), []byte("m"), nil)
 	require.NoError(t, err)
 	require.Empty(t, kvs)
 
