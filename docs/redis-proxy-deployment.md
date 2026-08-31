@@ -100,6 +100,7 @@ docker run --rm \
   -elastickv-pool-size 192 \
   -secondary-write-concurrency 96 \
   -secondary-script-concurrency 3 \
+  -secondary-blocking-replay-concurrency 32 \
   -mode dual-write-shadow \
   -secondary-timeout 30s \
   -secondary-script-timeout 5m \
@@ -125,6 +126,7 @@ services:
       - -elastickv-pool-size=192
       - -secondary-write-concurrency=96
       - -secondary-script-concurrency=3
+      - -secondary-blocking-replay-concurrency=32
       - -mode=dual-write-shadow
       - -metrics=:9191
     depends_on:
@@ -374,7 +376,7 @@ Available at `/metrics` on the address specified by `-metrics`.
 | `proxy_divergences_total` | Counter | Shadow read mismatches (labels: command, kind) |
 | `proxy_migration_gap_total` | Counter | Expected mismatches from incomplete migration (labels: command) |
 | `proxy_async_drops_total` | Counter | Async operations dropped due to backpressure |
-| `proxy_async_drops_by_queue_total{queue,reason}` | Counter | Drops split by `write`/`script`/`shadow` and `queue_full`/`expired` |
+| `proxy_async_drops_by_queue_total{queue,reason}` | Counter | Drops split by `write`/`script`/`blocking`/`shadow` and `queue_full`/`expired` |
 | `proxy_async_queue_depth{queue}` | Gauge | Async operations waiting for worker capacity |
 | `proxy_async_queue_capacity{queue}` | Gauge | Configured queue capacity |
 | `proxy_async_queue_delay_seconds{queue}` | Histogram | Time spent waiting for worker capacity |
@@ -424,6 +426,7 @@ groups:
 | Read timeout | Redis: 3s, ElasticKV: 3s | Default backend read timeout. Async secondary replays override the per-call read timeout with the remaining queue deadline; blocking commands add a 10s read grace to their requested wait |
 | Write timeout | 3s | Backend write timeout |
 | Async write concurrency fallback | 4096 | Package fallback; the command derives a lower limit from backend pool size |
+| Async blocking replay concurrency cap | 32 | Command-derived maximum for mutating blocking-command replays after normal writes reserve pool capacity |
 | Shadow read goroutine limit | 1024 | Max concurrent shadow comparisons |
 | PubSub compare window | 2s | Message matching window |
 | PubSub sweep interval | 500ms | Expired message scan interval |
@@ -442,7 +445,7 @@ Recommended shutdown order: `redis-proxy -> application -> Redis / ElasticKV`.
 ## Troubleshooting
 
 ### Secondary writes are falling behind
-- Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` before increasing concurrency.
+- Check `proxy_async_queue_depth`, `proxy_async_queue_delay_seconds`, and `proxy_async_drops_by_queue_total` by queue before increasing concurrency. A sustained `blocking` queue means BZPOP/XREAD replay work is lagging behind normal writes.
 - Check `proxy_backend_pool_pending_requests` and the `waits`/`timeouts` pool events. Pool waits mean concurrency is too high for the configured pool.
 - Keep `ELASTICKV_REDIS_PER_PEER_CONNECTIONS` at least `proxy replicas sharing one client IP * -elastickv-pool-size + 128`; PubSub and shadow PubSub use dedicated connections outside the command pool, and detached PubSub sockets may remain counted until cleanup. With the HA compose defaults, use at least `512`. Keep `-secondary-write-concurrency` at or below the pool size.
 - Successful `BZPOPMIN` / `BZPOPMAX` calls are replayed to ElasticKV as an internal fast ZREM variant on the normal write queue. Regular client `ZREM` still keeps Redis wrong-type behavior; stale BZPOP replays avoid wide type scans. Timeout/null blocking responses are not replayed because the primary made no mutation.

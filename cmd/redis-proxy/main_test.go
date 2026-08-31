@@ -129,7 +129,7 @@ func TestDeriveSecondaryConcurrency(t *testing.T) {
 			wantBlockingConcurrency: 32,
 		},
 		{
-			name:                    "large remaining pool caps blocking replay",
+			name:                    "large remaining pool caps blocking replay at production default",
 			mode:                    proxy.ModeDualWrite,
 			primaryPoolSize:         128,
 			elasticKVPoolSize:       144,
