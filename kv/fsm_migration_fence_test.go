@@ -354,6 +354,33 @@ func TestFSMRejectsObservedWriteFencedS3BucketAuxiliaryPointWrite(t *testing.T) 
 	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
 
+func TestFSMIgnoresRawRouteFenceForS3BucketAuxiliaryWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliaryFenceRoutes(bucket, 1, 1)
+	routes[1].State = distribution.RouteStateActive
+	routes[2].State = distribution.RouteStateWriteFenced
+	applyComposed1Snapshot(t, engine, 1, routes)
+
+	rawRoute, ok := engine.GetRoute(routeKey(key))
+	require.True(t, ok)
+	require.Equal(t, distribution.RouteStateWriteFenced, rawRoute.State)
+	auxStart, auxEnd, ok := s3BucketAuxiliaryRouteRange(key)
+	require.True(t, ok)
+	auxRoutes := engine.GetIntersectingRoutes(auxStart, auxEnd)
+	require.NotEmpty(t, auxRoutes)
+	require.Equal(t, distribution.RouteStateActive, auxRoutes[0].State)
+
+	fsm := newComposed1FSM(t, engine, 1)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("meta")}},
+	}, 100)
+	require.NoError(t, err)
+}
+
 func TestFSMComposed1UsesS3BucketAuxiliaryRouteOwner(t *testing.T) {
 	t.Parallel()
 

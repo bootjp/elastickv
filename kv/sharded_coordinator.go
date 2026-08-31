@@ -1267,18 +1267,18 @@ func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
 	if c.partitionResolverRecognisesPointKey(key) {
 		return nil
 	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if ok {
+		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+			if route.State == distribution.RouteStateWriteFenced {
+				return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+			}
+		}
+		return nil
+	}
 	rkey := routeKey(key)
 	if route, ok := c.engine.GetRoute(rkey); ok && route.State == distribution.RouteStateWriteFenced {
 		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
-	}
-	start, end, ok := s3BucketAuxiliaryRouteRange(key)
-	if !ok {
-		return nil
-	}
-	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-		if route.State == distribution.RouteStateWriteFenced {
-			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
-		}
 	}
 	return nil
 }

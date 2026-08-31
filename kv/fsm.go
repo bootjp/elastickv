@@ -694,12 +694,15 @@ func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
 	if !ok {
 		return nil
 	}
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		if snap.WriteFencedIntersects(start, end) {
+			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+		}
+		return nil
+	}
 	rkey := routeKey(key)
 	if snap.WriteFencedForKey(rkey) {
 		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
-	}
-	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok && snap.WriteFencedIntersects(start, end) {
-		return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
 	}
 	return nil
 }
@@ -1183,17 +1186,19 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys
 		if _, ok := bypassKeys[string(mut.Key)]; ok {
 			continue
 		}
+		if start, end, ok := s3BucketAuxiliaryRouteRange(mut.Key); ok {
+			if snap.WriteFencedIntersects(start, end) {
+				return errors.Wrapf(ErrRouteWriteFenced,
+					"%s-version v=%d: key %q route range [%q,%q)",
+					phase, snapVer, mut.Key, start, end)
+			}
+			continue
+		}
 		rKey := routeKey(mut.Key)
 		if snap.WriteFencedForKey(rKey) {
 			return errors.Wrapf(ErrRouteWriteFenced,
 				"%s-version v=%d: key %q routeKey %q",
 				phase, snapVer, mut.Key, rKey)
-		}
-		start, end, ok := s3BucketAuxiliaryRouteRange(mut.Key)
-		if ok && snap.WriteFencedIntersects(start, end) {
-			return errors.Wrapf(ErrRouteWriteFenced,
-				"%s-version v=%d: key %q route range [%q,%q)",
-				phase, snapVer, mut.Key, start, end)
 		}
 	}
 	return nil
