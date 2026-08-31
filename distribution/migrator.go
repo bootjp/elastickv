@@ -65,14 +65,18 @@ const (
 	migrationTxnSuccessPrefix  = "!txn|ok|"
 	migrationTxnMetaPrefix     = "!txn|meta|"
 	migrationTxnLockPrefix     = "!txn|lock|"
-	migrationRedisPrefix       = "!redis|"
-	migrationHashPrefix        = "!hs|"
-	migrationSetPrefix         = "!st|"
-	migrationZSetPrefix        = "!zs|"
-	migrationDynamoMetaPrefix  = "!ddb|meta|table|"
-	migrationDynamoGenPrefix   = "!ddb|meta|gen|"
-	migrationDynamoItemPrefix  = "!ddb|item|"
-	migrationDynamoGSIPrefix   = "!ddb|gsi|"
+	// Keep this literal in sync with kv.backupTimestampFloorKey. distribution
+	// cannot import kv without a cycle, and only this exact control key is
+	// reserved; user keys under !txn|backup| remain migratable.
+	migrationTxnBackupTimestampFloorKey = "!txn|backup|timestamp_floor"
+	migrationRedisPrefix                = "!redis|"
+	migrationHashPrefix                 = "!hs|"
+	migrationSetPrefix                  = "!st|"
+	migrationZSetPrefix                 = "!zs|"
+	migrationDynamoMetaPrefix           = "!ddb|meta|table|"
+	migrationDynamoGenPrefix            = "!ddb|meta|gen|"
+	migrationDynamoItemPrefix           = "!ddb|item|"
+	migrationDynamoGSIPrefix            = "!ddb|gsi|"
 )
 
 const (
@@ -154,6 +158,10 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(s3keys.ChunkBlobPrefix),
 	fskeys.ChunkAllPrefix(),
 	fskeys.UsageRouteAllPrefix(),
+}
+
+var migrationInternalExactKeys = [][]byte{
+	[]byte(migrationTxnBackupTimestampFloorKey),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -394,7 +402,8 @@ func MigrationKnownInternalPrefixes() [][]byte {
 // internal family owned by an explicit export bracket, by the txn-lock drain,
 // or by a peer-local store that the migrator must not export at all.
 func IsMigrationKnownInternalKey(key []byte) bool {
-	return hasAnyPrefix(key, migrationInternalFamilyPrefixes)
+	return hasAnyPrefix(key, migrationInternalFamilyPrefixes) ||
+		hasAnyExactKey(key, migrationInternalExactKeys)
 }
 
 // ValidateMigrationRouteRange rejects route intervals that intersect reserved
@@ -546,6 +555,15 @@ func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
 func hasAnyPrefix(key []byte, prefixes [][]byte) bool {
 	for _, prefix := range prefixes {
 		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyExactKey(key []byte, keys [][]byte) bool {
+	for _, exact := range keys {
+		if bytes.Equal(key, exact) {
 			return true
 		}
 	}

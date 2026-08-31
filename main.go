@@ -3400,10 +3400,24 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 			continue
 		}
 		if rt.spec.id == groupID {
-			return distribution.NewCatalogStore(rt.store)
+			return distribution.NewCatalogStore(rt.store, distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)))
 		}
 	}
 	return nil
+}
+
+func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationStoreResolver {
+	return func(groupID uint64) (store.MVCCStore, error) {
+		for _, rt := range runtimes {
+			if rt == nil || rt.store == nil {
+				continue
+			}
+			if rt.spec.id == groupID {
+				return rt.store, nil
+			}
+		}
+		return nil, errors.Newf("migration target store is not available for group %d", groupID)
+	}
 }
 
 func setupDistributionCatalog(

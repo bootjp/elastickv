@@ -98,13 +98,25 @@ type CatalogSnapshot struct {
 type CatalogStore struct {
 	store                        store.MVCCStore
 	allowRouteDescriptorV2Writes bool
+	migrationStoreForGroup       CatalogMigrationStoreResolver
 }
 
 type CatalogStoreOption func(*CatalogStore)
 
+// CatalogMigrationStoreResolver resolves the local MVCC store for a data group.
+type CatalogMigrationStoreResolver func(groupID uint64) (store.MVCCStore, error)
+
 func WithCatalogRouteDescriptorV2Writes(enabled bool) CatalogStoreOption {
 	return func(s *CatalogStore) {
 		s.allowRouteDescriptorV2Writes = enabled
+	}
+}
+
+// WithCatalogMigrationStoreResolver makes split-job finalization retire
+// target-local migration metadata from the target data group store.
+func WithCatalogMigrationStoreResolver(resolver CatalogMigrationStoreResolver) CatalogStoreOption {
+	return func(s *CatalogStore) {
+		s.migrationStoreForGroup = resolver
 	}
 }
 

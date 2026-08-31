@@ -409,15 +409,18 @@ func TestCatalogStoreMoveSplitJobToHistoryIsIdempotentByJobID(t *testing.T) {
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryRetiresMigrationMetadata(t *testing.T) {
-	st := store.NewMVCCStore()
-	cs := NewCatalogStore(st)
 	ctx := context.Background()
 	job := sampleSplitJob(14)
+	targetStore := store.NewMVCCStore()
+	cs := NewCatalogStore(
+		store.NewMVCCStore(),
+		WithCatalogMigrationStoreResolver(testCatalogMigrationStoreResolver(job.TargetGroupID, targetStore)),
+	)
 
 	if err := cs.CreateSplitJob(ctx, job); err != nil {
 		t.Fatalf("create split job: %v", err)
 	}
-	importSplitJobMigrationMetadata(t, ctx, st, job.JobID, "stale-progress", "job14", 50)
+	importSplitJobMigrationMetadata(t, ctx, targetStore, job.JobID, "stale-progress", "job14", 50)
 
 	terminal := job
 	terminal.Phase = SplitJobPhaseDone
@@ -426,15 +429,18 @@ func TestCatalogStoreMoveSplitJobToHistoryRetiresMigrationMetadata(t *testing.T)
 		t.Fatalf("move split job to history: %v", err)
 	}
 
-	assertSplitJobMigrationMetadataRetired(t, ctx, st, job.JobID, "fresh-progress")
-	assertStoreValueAt(t, ctx, st, "job14", 50, "imported")
+	assertSplitJobMigrationMetadataRetired(t, ctx, targetStore, job.JobID, "fresh-progress")
+	assertStoreValueAt(t, ctx, targetStore, "job14", 50, "imported")
 }
 
 func TestCatalogStoreMoveSplitJobToHistoryRetiresMetadataOnIdempotentRetry(t *testing.T) {
-	st := store.NewMVCCStore()
-	cs := NewCatalogStore(st)
 	ctx := context.Background()
 	job := sampleSplitJob(15)
+	targetStore := store.NewMVCCStore()
+	cs := NewCatalogStore(
+		store.NewMVCCStore(),
+		WithCatalogMigrationStoreResolver(testCatalogMigrationStoreResolver(job.TargetGroupID, targetStore)),
+	)
 
 	if err := cs.CreateSplitJob(ctx, job); err != nil {
 		t.Fatalf("create split job: %v", err)
@@ -445,13 +451,22 @@ func TestCatalogStoreMoveSplitJobToHistoryRetiresMetadataOnIdempotentRetry(t *te
 	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
 		t.Fatalf("move split job to history: %v", err)
 	}
-	importSplitJobMigrationMetadata(t, ctx, st, job.JobID, "retry-stale-progress", "job15", 60)
+	importSplitJobMigrationMetadata(t, ctx, targetStore, job.JobID, "retry-stale-progress", "job15", 60)
 
 	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
 		t.Fatalf("retry move split job to history: %v", err)
 	}
 
-	assertSplitJobMigrationMetadataRetired(t, ctx, st, job.JobID, "retry-fresh-progress")
+	assertSplitJobMigrationMetadataRetired(t, ctx, targetStore, job.JobID, "retry-fresh-progress")
+}
+
+func testCatalogMigrationStoreResolver(targetGroupID uint64, targetStore store.MVCCStore) CatalogMigrationStoreResolver {
+	return func(groupID uint64) (store.MVCCStore, error) {
+		if groupID == targetGroupID {
+			return targetStore, nil
+		}
+		return nil, errors.Newf("unexpected group %d", groupID)
+	}
 }
 
 func importSplitJobMigrationMetadata(
