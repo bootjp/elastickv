@@ -225,11 +225,10 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 	defer cancel()
 
 	prefix := h.deltaKeyPrefixFn(req.userKey)
-	end := store.PrefixScanEnd(prefix)
 	totalCompacted, done := 0, false
 	for !done {
 		var n int
-		n, done = c.compactUrgentKeyBatch(tickCtx, req, h, prefix, end)
+		n, done = c.compactUrgentKeyBatch(tickCtx, req, h, prefix)
 		totalCompacted += n
 		if n == 0 {
 			break
@@ -246,13 +245,12 @@ func (c *DeltaCompactor) compactUrgentKey(ctx context.Context, req urgentCompact
 // Returns (n, done): n is the number of delta keys processed in this batch;
 // done is true when the remaining delta count is at or below MaxDeltaScanLimit
 // (the key is now readable).
-func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix, end []byte) (int, bool) {
+func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCompactionRequest, h *collectionDeltaHandler, prefix []byte) (int, bool) {
 	// Use a fresh readTS each iteration so we observe the committed state from
 	// the previous compaction pass and do not re-scan already-deleted delta keys.
 	readTS := snapshotTS(c.coord.Clock(), c.st)
 
-	// Scan one extra beyond MaxDeltaScanLimit to detect whether more remain.
-	kvs, err := c.st.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
+	kvs, truncated, err := scanAcceptedDeltaKVsAt(ctx, c.st, prefix, store.MaxDeltaScanLimit, readTS, h.acceptDeltaKV)
 	if err != nil {
 		c.logger.WarnContext(ctx, "delta compactor urgent: scan failed",
 			"type", req.typeName, "key", string(req.userKey), "error", err)
@@ -273,8 +271,7 @@ func (c *DeltaCompactor) compactUrgentKeyBatch(ctx context.Context, req urgentCo
 			"type", req.typeName, "key", string(req.userKey), "error", err)
 		return 0, true
 	}
-	// Fewer than MaxDeltaScanLimit+1 results means no more deltas remain; key is readable.
-	return len(kvs), len(kvs) <= store.MaxDeltaScanLimit
+	return len(kvs), !truncated
 }
 
 // SyncOnce runs one compaction pass. The IsLeader() guard avoids the
@@ -416,6 +413,7 @@ type collectionDeltaHandler struct {
 	typeName       string
 	prefix         []byte
 	extractUserKey func(key []byte) []byte
+	acceptDeltaKV  func(*store.KVPair) bool
 	// deltaKeyPrefixFn returns the prefix that covers all delta keys for a single
 	// user key. Used by compactUrgentKey to perform a targeted single-key scan.
 	deltaKeyPrefixFn func(userKey []byte) []byte
@@ -426,6 +424,7 @@ type collectionDeltaHandler struct {
 func (c *DeltaCompactor) allHandlers() []collectionDeltaHandler {
 	return []collectionDeltaHandler{
 		c.listHandler(),
+		c.legacyListHandler(),
 		c.hashHandler(),
 		c.setHandler(),
 		c.zsetHandler(),
@@ -485,8 +484,11 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 		return err
 	}
 
+	rawKVs := kvs
+	kvs = filterDeltaKVs(rawKVs, h.acceptDeltaKV)
 	byKey, ukOrder := c.groupByUserKey(kvs, h.extractUserKey)
 	lastScannedKey := c.splitGuardCursor(byKey, ukOrder, kvs, truncated)
+	lastScannedKey = deltaCompactorCursorAfterFiltering(rawKVs, kvs, lastScannedKey, truncated, h.extractUserKey)
 
 	allElems := c.buildBatchElems(ctx, h, byKey, ukOrder, readTS)
 
@@ -500,8 +502,114 @@ func (c *DeltaCompactor) compactHandler(ctx context.Context, h collectionDeltaHa
 	return nil
 }
 
+func deltaCompactorCursorAfterFiltering(
+	rawKVs, acceptedKVs []*store.KVPair,
+	lastScannedKey []byte,
+	truncated bool,
+	extractUserKey func([]byte) []byte,
+) []byte {
+	if !truncated || len(rawKVs) == 0 {
+		return lastScannedKey
+	}
+	if len(acceptedKVs) == 0 {
+		return rawKVs[len(rawKVs)-1].Key
+	}
+	lastAcceptedKey := acceptedKVs[len(acceptedKVs)-1].Key
+	switch {
+	case len(lastScannedKey) == 0:
+		if prev := rawKeyBeforeAcceptedTail(rawKVs, acceptedKVs, lastAcceptedKey, extractUserKey); len(prev) > 0 {
+			return prev
+		}
+		if rawPageHasRejectedTailAfter(rawKVs, lastAcceptedKey) {
+			return rawKVs[len(rawKVs)-1].Key
+		}
+	case !bytes.Equal(lastScannedKey, lastAcceptedKey) && rawPageHasRejectedTailAfter(rawKVs, lastAcceptedKey):
+		return rawKVs[len(rawKVs)-1].Key
+	}
+	return lastScannedKey
+}
+
+func rawPageHasRejectedTailAfter(rawKVs []*store.KVPair, acceptedKey []byte) bool {
+	if len(rawKVs) == 0 || len(acceptedKey) == 0 {
+		return false
+	}
+	for i := len(rawKVs) - 1; i >= 0; i-- {
+		if rawKVs[i] != nil && bytes.Equal(rawKVs[i].Key, acceptedKey) {
+			return i < len(rawKVs)-1
+		}
+	}
+	return false
+}
+
+func rawKeyBeforeAcceptedTail(
+	rawKVs, acceptedKVs []*store.KVPair,
+	acceptedKey []byte,
+	extractUserKey func([]byte) []byte,
+) []byte {
+	if len(rawKVs) < 2 || len(acceptedKey) == 0 {
+		return nil
+	}
+	last := len(rawKVs) - 1
+	if rawKVs[last] == nil || !bytes.Equal(rawKVs[last].Key, acceptedKey) {
+		return nil
+	}
+	acceptedUserKey := []byte(nil)
+	if extractUserKey != nil {
+		acceptedUserKey = extractUserKey(acceptedKey)
+	}
+	acceptedKeys := deltaCompactorAcceptedKeySet(acceptedKVs)
+	for i := last - 1; i >= 0; i-- {
+		if rawKVs[i] == nil {
+			continue
+		}
+		if deltaCompactorSameAcceptedTailUser(rawKVs[i].Key, acceptedKeys, acceptedUserKey, extractUserKey) {
+			continue
+		}
+		return rawKVs[i].Key
+	}
+	return nil
+}
+
+func deltaCompactorAcceptedKeySet(acceptedKVs []*store.KVPair) map[string]struct{} {
+	acceptedKeys := make(map[string]struct{}, len(acceptedKVs))
+	for _, kvp := range acceptedKVs {
+		if kvp != nil {
+			acceptedKeys[string(kvp.Key)] = struct{}{}
+		}
+	}
+	return acceptedKeys
+}
+
+func deltaCompactorSameAcceptedTailUser(
+	rawKey []byte,
+	acceptedKeys map[string]struct{},
+	acceptedUserKey []byte,
+	extractUserKey func([]byte) []byte,
+) bool {
+	if len(acceptedUserKey) == 0 || extractUserKey == nil {
+		return false
+	}
+	if _, accepted := acceptedKeys[string(rawKey)]; !accepted {
+		return false
+	}
+	return bytes.Equal(extractUserKey(rawKey), acceptedUserKey)
+}
+
 // groupByUserKey groups KVPairs by their user key, returning both the map and
 // the unique user keys in lexicographic (scan) order.
+func filterDeltaKVs(kvs []*store.KVPair, accept func(*store.KVPair) bool) []*store.KVPair {
+	if accept == nil || len(kvs) == 0 {
+		return kvs
+	}
+	out := kvs[:0]
+	for _, pair := range kvs {
+		if accept(pair) {
+			out = append(out, pair)
+		}
+	}
+	return out
+}
+
 func (c *DeltaCompactor) groupByUserKey(kvs []*store.KVPair, extractUserKey func([]byte) []byte) (map[string][]*store.KVPair, []string) {
 	byKey := make(map[string][]*store.KVPair)
 	var ukOrder []string
@@ -716,12 +824,36 @@ func (c *DeltaCompactor) listHandler() collectionDeltaHandler {
 		typeName:         "list",
 		prefix:           []byte(store.ListMetaDeltaPrefix),
 		extractUserKey:   store.ExtractListUserKeyFromDelta,
+		acceptDeltaKV:    isListMetaDeltaKV,
 		deltaKeyPrefixFn: store.ListMetaDeltaScanPrefix,
 		buildElems:       c.buildListCompactElems,
 	}
 }
 
+func (c *DeltaCompactor) legacyListHandler() collectionDeltaHandler {
+	return collectionDeltaHandler{
+		typeName:         "list-legacy",
+		prefix:           []byte(store.LegacyListMetaDeltaPrefix),
+		extractUserKey:   store.ExtractLegacyListUserKeyFromDelta,
+		acceptDeltaKV:    isListMetaDeltaKV,
+		deltaKeyPrefixFn: store.LegacyListMetaDeltaScanPrefix,
+		buildElems:       c.buildLegacyListCompactElems,
+	}
+}
+
+func isListMetaDeltaKV(pair *store.KVPair) bool {
+	return pair != nil && store.IsListMetaDeltaValue(pair.Value)
+}
+
 func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	return c.buildListCompactElemsWithDeltaPrefix(ctx, userKey, deltaKVs, readTS, store.ListMetaDeltaScanPrefix(userKey))
+}
+
+func (c *DeltaCompactor) buildLegacyListCompactElems(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	return c.buildListCompactElemsWithDeltaPrefix(ctx, userKey, deltaKVs, readTS, store.LegacyListMetaDeltaScanPrefix(userKey))
+}
+
+func (c *DeltaCompactor) buildListCompactElemsWithDeltaPrefix(ctx context.Context, userKey []byte, deltaKVs []*store.KVPair, readTS uint64, deltaScanPrefix []byte) ([]*kv.Elem[kv.OP], error) {
 	// Read base metadata (may not exist if all state is in deltas).
 	baseMeta, rawBaseMeta, err := c.loadListBaseMeta(ctx, userKey, readTS)
 	if err != nil {
@@ -729,7 +861,7 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	}
 	expireAt, err := compactedMetaExpireAt(
 		ctx, c.st, userKey, readTS, rawBaseMeta, redisWideMetaInlineSizeBytes, baseMeta.ExpireAt,
-		deltaKVs, store.ListMetaDeltaScanPrefix(userKey),
+		deltaKVs, deltaScanPrefix,
 	)
 	if err != nil {
 		return nil, err
@@ -773,7 +905,7 @@ func (c *DeltaCompactor) buildListCompactElems(ctx context.Context, userKey []by
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs)+len(claimElems))
 	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key), GroupID: d.RouteGroupID})
 	}
 	return append(elems, claimElems...), nil
 }
@@ -946,7 +1078,7 @@ func foldSimpleLenDeltas(
 	elems := make([]*kv.Elem[kv.OP], 0, 1+len(deltaKVs))
 	elems = append(elems, metaElem)
 	for _, d := range deltaKVs {
-		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key)})
+		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(d.Key), GroupID: d.RouteGroupID})
 	}
 	return elems, nil
 }

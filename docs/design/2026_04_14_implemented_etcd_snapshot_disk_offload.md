@@ -5,7 +5,7 @@
 ### Observed Symptoms
 
 Clusters using the etcd engine exhibit large memory spikes across all nodes at snapshot
-creation intervals (`defaultSnapshotEvery = 10,000` entries). The spike magnitude scales
+creation intervals (`defaultSnapshotEvery = 100,000` entries). The spike magnitude scales
 with FSM data size, and simultaneous spikes across multiple nodes compound the pressure.
 
 ### Root Cause
@@ -34,7 +34,7 @@ storage.CreateSnapshot(applied, &confState, payload)
 ```
 
 `MemoryStorage` holds `raftpb.Snapshot.Data = payload` until the next snapshot is created
-(i.e., until another 10,000 entries are processed), keeping the full FSM export resident
+(i.e., until another 100,000 entries are processed), keeping the full FSM export resident
 in memory the entire time.
 
 #### Problem 3: Re-allocation when sending to followers

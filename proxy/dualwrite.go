@@ -362,24 +362,42 @@ func (d *DualWriter) Blocking(ctx context.Context, cmd string, args [][]byte) (a
 	d.metrics.CommandTotal.WithLabelValues(cmd, d.primary.Name(), "ok").Inc()
 
 	if d.hasSecondaryWrite() {
-		if replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, resp, d.secondary); ok {
-			d.goTranslatedBlockingReplay(func(ctx context.Context) {
-				d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
-					initialDelay:        blockingReplayInitialDelay,
-					noEffectRetryWindow: blockingReplayNoEffectRetryWindow,
-					deadlineAsMiss:      true,
-				})
-			})
-		} else if shouldReplayBlockingToSecondary(cmd, resp) && blockingResultMayHaveMutated(resp, err) {
-			d.goBlockingReplay(func(ctx context.Context) {
-				sCtx, cancel := context.WithTimeout(ctx, time.Second)
-				defer cancel()
-				d.secondary.Do(sCtx, iArgs...)
-			})
-		}
+		d.replaySecondaryBlocking(cmd, args, iArgs, resp, err)
 	}
 
 	return resp, err //nolint:wrapcheck // redis.Nil must pass through unwrapped for callers to detect nil replies
+}
+
+func (d *DualWriter) replaySecondaryBlocking(cmd string, args [][]byte, iArgs []any, resp any, primaryErr error) {
+	replayCmd, replayArgs, ok := secondaryBlockingReplay(cmd, args, resp, d.secondary)
+	if ok {
+		replay := func(ctx context.Context) {
+			if strings.EqualFold(replayCmd, cmdNameXREADGROUP) {
+				d.writeSecondary(ctx, replayCmd, replayArgs)
+				return
+			}
+			d.writeSecondaryPositiveIntWithOptions(ctx, replayCmd, replayArgs, positiveIntReplayOptions{
+				initialDelay:        blockingReplayInitialDelay,
+				noEffectRetryWindow: blockingReplayNoEffectRetryWindow,
+				deadlineAsMiss:      true,
+			})
+		}
+		if translatedBlockingReplayUsesWriteQueue(replayCmd) {
+			d.goTranslatedBlockingReplay(replay)
+			return
+		}
+		d.goBlockingReplay(replay)
+		return
+	}
+
+	if !shouldReplayBlockingToSecondary(cmd, resp) || !blockingResultMayHaveMutated(resp, primaryErr) {
+		return
+	}
+	d.goBlockingReplay(func(ctx context.Context) {
+		sCtx, cancel := context.WithTimeout(ctx, time.Second)
+		defer cancel()
+		d.secondary.Do(sCtx, iArgs...)
+	})
 }
 
 func blockingResultMayHaveMutated(resp any, err error) bool {

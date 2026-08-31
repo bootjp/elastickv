@@ -50,7 +50,14 @@ func isRetryableRedisTxnErr(err error) bool {
 func isReusableRedisTxnErr(err error) bool {
 	return errors.Is(err, store.ErrWriteConflict) ||
 		errors.Is(err, kv.ErrTxnLocked) ||
-		wireRedisTxnErrKind(err) == redisTxnWireErrLocked
+		wireRedisTxnErrKind(err) == redisTxnWireErrLocked ||
+		isRouteWriteFencedError(err)
+}
+
+func shouldPreserveRedisTxnAttempt(err error) bool {
+	return isRetryableRedisTxnErr(err) &&
+		!isRouteWriteFencedError(err) &&
+		!isRedisComposedRouteErr(err)
 }
 
 func isRedisComposedRouteErr(err error) bool {

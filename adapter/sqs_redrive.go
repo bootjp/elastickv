@@ -237,7 +237,7 @@ func (s *SQSServer) redriveCandidateToDLQ(
 		return false, err
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		if isRetryableTransactWriteError(err) {
+		if isIgnorableTransactRaceError(err) {
 			return true, nil
 		}
 		return false, errors.WithStack(err)

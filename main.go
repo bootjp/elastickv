@@ -1965,10 +1965,6 @@ type serversInput struct {
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
-	var (
-		roleStore admin.RoleStore
-		connCache *kv.GRPCConnCache
-	)
 	adminGRPCEnabled := *adminTokenFile != "" || *adminInsecureNoAuth
 	// roleStore is gated on *adminEnabled. With admin HTTP disabled, building
 	// it is wasted work AND a security regression risk: a non-empty
@@ -1979,7 +1975,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	//
 	// connCache is also used by the gRPC Admin GetNodeVersion probe, so create
 	// it when either admin HTTP or gRPC Admin is enabled.
-	connCache = prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled)
+	connCache := prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled)
 	adminServer, adminGRPCOpts, err := setupAdminService(
 		*raftId, *myAddr, in.runtimes, in.shardGroups, in.bootstrapServers,
 		in.shardStore, in.distCatalog, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
@@ -1988,10 +1984,11 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	if err != nil {
 		return err
 	}
-	if *adminEnabled {
-		roleStore = roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
-	}
+	roleStore := startupRoleStoreFromFlags(*adminEnabled)
 	publicKVGate := &startupPublicKVGate{}
+	if in.distServer != nil {
+		in.distServer.SetReadGate(publicKVGate.blocked)
+	}
 	installHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
 	adapterCoordinate := startupGatedCoordinator{
 		inner: in.coordinate,
@@ -2101,6 +2098,13 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		in.coordinate,
 		in.metricsRegistry.FileSystemObserver(),
 	)
+}
+
+func startupRoleStoreFromFlags(enabled bool) admin.RoleStore {
+	if !enabled {
+		return nil
+	}
+	return roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
 }
 
 const raftJoinReadyPollInterval = 100 * time.Millisecond
@@ -3396,10 +3400,24 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 			continue
 		}
 		if rt.spec.id == groupID {
-			return distribution.NewCatalogStore(rt.store)
+			return distribution.NewCatalogStore(rt.store, distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)))
 		}
 	}
 	return nil
+}
+
+func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationStoreResolver {
+	return func(groupID uint64) (store.MVCCStore, error) {
+		for _, rt := range runtimes {
+			if rt == nil || rt.store == nil {
+				continue
+			}
+			if rt.spec.id == groupID {
+				return rt.store, nil
+			}
+		}
+		return nil, errors.Newf("migration target store is not available for group %d", groupID)
+	}
 }
 
 func setupDistributionCatalog(

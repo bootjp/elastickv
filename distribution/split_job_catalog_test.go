@@ -408,6 +408,128 @@ func TestCatalogStoreMoveSplitJobToHistoryIsIdempotentByJobID(t *testing.T) {
 	assertSplitJobEqual(t, terminal, jobs[0])
 }
 
+func TestCatalogStoreMoveSplitJobToHistoryRetiresMigrationMetadata(t *testing.T) {
+	ctx := context.Background()
+	job := sampleSplitJob(14)
+	targetStore := store.NewMVCCStore()
+	cs := NewCatalogStore(
+		store.NewMVCCStore(),
+		WithCatalogMigrationStoreResolver(testCatalogMigrationStoreResolver(job.TargetGroupID, targetStore)),
+	)
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	importSplitJobMigrationMetadata(t, ctx, targetStore, job.JobID, "stale-progress", "job14", 50)
+
+	terminal := job
+	terminal.Phase = SplitJobPhaseDone
+	terminal.TerminalAtMs = 1000
+	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
+		t.Fatalf("move split job to history: %v", err)
+	}
+
+	assertSplitJobMigrationMetadataRetired(t, ctx, targetStore, job.JobID, "fresh-progress")
+	assertStoreValueAt(t, ctx, targetStore, "job14", 50, "imported")
+}
+
+func TestCatalogStoreMoveSplitJobToHistoryRetiresMetadataOnIdempotentRetry(t *testing.T) {
+	ctx := context.Background()
+	job := sampleSplitJob(15)
+	targetStore := store.NewMVCCStore()
+	cs := NewCatalogStore(
+		store.NewMVCCStore(),
+		WithCatalogMigrationStoreResolver(testCatalogMigrationStoreResolver(job.TargetGroupID, targetStore)),
+	)
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	terminal := job
+	terminal.Phase = SplitJobPhaseDone
+	terminal.TerminalAtMs = 1000
+	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
+		t.Fatalf("move split job to history: %v", err)
+	}
+	importSplitJobMigrationMetadata(t, ctx, targetStore, job.JobID, "retry-stale-progress", "job15", 60)
+
+	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
+		t.Fatalf("retry move split job to history: %v", err)
+	}
+
+	assertSplitJobMigrationMetadataRetired(t, ctx, targetStore, job.JobID, "retry-fresh-progress")
+}
+
+func testCatalogMigrationStoreResolver(targetGroupID uint64, targetStore store.MVCCStore) CatalogMigrationStoreResolver {
+	return func(groupID uint64) (store.MVCCStore, error) {
+		if groupID == targetGroupID {
+			return targetStore, nil
+		}
+		return nil, errors.Newf("unexpected group %d", groupID)
+	}
+}
+
+func importSplitJobMigrationMetadata(
+	t *testing.T,
+	ctx context.Context,
+	st store.MVCCStore,
+	jobID uint64,
+	cursor string,
+	key string,
+	commitTS uint64,
+) {
+	t.Helper()
+	_, err := st.ImportVersions(ctx, store.ImportVersionsOptions{
+		JobID:     jobID,
+		BracketID: 1,
+		BatchSeq:  1,
+		Cursor:    []byte(cursor),
+		Versions: []store.MVCCVersion{
+			{Key: []byte(key), CommitTS: commitTS, Value: []byte("imported")},
+		},
+	})
+	if err != nil {
+		t.Fatalf("import migration metadata: %v", err)
+	}
+}
+
+func assertSplitJobMigrationMetadataRetired(t *testing.T, ctx context.Context, st store.MVCCStore, jobID uint64, cursor string) {
+	t.Helper()
+	floor, err := st.MigrationHLCFloor(ctx, jobID)
+	if err != nil {
+		t.Fatalf("migration hlc floor: %v", err)
+	}
+	if floor != 0 {
+		t.Fatalf("expected migration HLC floor to be retired, got %d", floor)
+	}
+	res, err := st.ImportVersions(ctx, store.ImportVersionsOptions{
+		JobID:     jobID,
+		BracketID: 1,
+		BatchSeq:  1,
+		Cursor:    []byte(cursor),
+	})
+	if err != nil {
+		t.Fatalf("reimport retired batch: %v", err)
+	}
+	if res.Duplicate {
+		t.Fatal("expected retired import ack to allow a fresh batch")
+	}
+	if string(res.AckedCursor) != cursor {
+		t.Fatalf("expected fresh cursor %q, got %q", cursor, res.AckedCursor)
+	}
+}
+
+func assertStoreValueAt(t *testing.T, ctx context.Context, st store.MVCCStore, key string, ts uint64, value string) {
+	t.Helper()
+	val, err := st.GetAt(ctx, []byte(key), ts)
+	if err != nil {
+		t.Fatalf("read imported data: %v", err)
+	}
+	if string(val) != value {
+		t.Fatalf("expected imported data to remain, got %q", val)
+	}
+}
+
 func TestCatalogStoreMoveSplitJobToHistoryRejectsStaleExpectedJob(t *testing.T) {
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()

@@ -423,7 +423,7 @@ func expiredTTLIndexPrecedesDeltaOnlyCollection(
 	if err != nil || baseExists {
 		return false, err
 	}
-	prefix, ok := collectionMetaDeltaScanPrefix(userKey, typ)
+	prefixes, ok := collectionMetaDeltaScanPrefixes(userKey, typ)
 	if !ok {
 		return false, nil
 	}
@@ -431,26 +431,61 @@ func expiredTTLIndexPrecedesDeltaOnlyCollection(
 	if err != nil || !found {
 		return false, err
 	}
-	deltas, err := scanner.scanDeltaKVs(ctx, prefix, readTS)
-	if err != nil {
-		if errors.Is(err, ErrDeltaScanTruncated) {
-			return false, nil
-		}
-		return false, err
-	}
-	return legacyTTLPrecedesAllMetaDeltas(ttlCommitTS, deltas, prefix), nil
+	return legacyTTLPrecedesCollectionMetaDeltas(ctx, scanner, userKey, prefixes, ttlCommitTS, readTS)
 }
 
-func collectionMetaDeltaScanPrefix(userKey []byte, typ redisValueType) ([]byte, bool) {
+func legacyTTLPrecedesCollectionMetaDeltas(
+	ctx context.Context,
+	scanner redisDeltaKVScanner,
+	userKey []byte,
+	prefixes [][]byte,
+	ttlCommitTS uint64,
+	readTS uint64,
+) (bool, error) {
+	found := false
+	for _, prefix := range prefixes {
+		deltas, err := scanner.scanDeltaKVs(ctx, prefix, readTS)
+		if err != nil {
+			if errors.Is(err, ErrDeltaScanTruncated) {
+				return false, nil
+			}
+			return false, err
+		}
+		if isLegacyListMetaDeltaPrefix(prefix) {
+			deltas = filterLegacyListMetaDeltas(deltas, userKey)
+		}
+		minDeltaTS, ok := minMetaDeltaCommitTS(deltas, prefix)
+		if !ok {
+			continue
+		}
+		found = true
+		if ttlCommitTS >= minDeltaTS {
+			return false, nil
+		}
+	}
+	return found, nil
+}
+
+func filterLegacyListMetaDeltas(deltas []*store.KVPair, userKey []byte) []*store.KVPair {
+	filtered := deltas[:0]
+	for _, pair := range deltas {
+		if legacyListDeltaPairForUserKey(pair, userKey) {
+			filtered = append(filtered, pair)
+		}
+	}
+	return filtered
+}
+
+func collectionMetaDeltaScanPrefixes(userKey []byte, typ redisValueType) ([][]byte, bool) {
 	switch typ {
 	case redisTypeList:
-		return store.ListMetaDeltaScanPrefix(userKey), true
+		return store.ListMetaDeltaScanPrefixes(userKey), true
 	case redisTypeHash:
-		return store.HashMetaDeltaScanPrefix(userKey), true
+		return [][]byte{store.HashMetaDeltaScanPrefix(userKey)}, true
 	case redisTypeSet:
-		return store.SetMetaDeltaScanPrefix(userKey), true
+		return [][]byte{store.SetMetaDeltaScanPrefix(userKey)}, true
 	case redisTypeZSet:
-		return store.ZSetMetaDeltaScanPrefix(userKey), true
+		return [][]byte{store.ZSetMetaDeltaScanPrefix(userKey)}, true
 	case redisTypeNone, redisTypeString, redisTypeStream:
 		return nil, false
 	}
@@ -657,10 +692,10 @@ func (c *DeltaCompactor) migrateListTTLInlineElems(ctx context.Context, pair *st
 }
 
 func isListMetaMigrationDelta(pair *store.KVPair) bool {
-	if pair == nil || !store.IsListMetaDeltaKey(pair.Key) {
+	if pair == nil || !store.IsListMetaDeltaValue(pair.Value) {
 		return false
 	}
-	return len(pair.Value) != redisWideMetaLegacySizeBytes && len(pair.Value) != redisWideMetaInlineSizeBytes
+	return store.IsListMetaDeltaKey(pair.Key) || store.ExtractLegacyListUserKeyFromDelta(pair.Key) != nil
 }
 
 func (c *DeltaCompactor) migrateStreamTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {

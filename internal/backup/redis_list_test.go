@@ -40,12 +40,26 @@ func listItemKey(userKey string, seq int64) []byte {
 }
 
 // listMetaDeltaKey mirrors store.ListMetaDeltaKey:
-// !lst|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>.
+// !lst|delta|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>.
 // The shape is irrelevant to the encoder (it skips deltas), but we
 // build a well-formed key here so the dispatcher integration test
 // would exercise the same byte sequence the live store emits.
 func listMetaDeltaKey(userKey string, commitTS uint64, seqInTxn uint32) []byte {
 	out := []byte(ListMetaDeltaPrefix)
+	var l [4]byte
+	binary.BigEndian.PutUint32(l[:], uint32(len(userKey))) //nolint:gosec
+	out = append(out, l[:]...)
+	out = append(out, userKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	out = append(out, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(out, seq[:]...)
+}
+
+func legacyListMetaDeltaKey(userKey string, commitTS uint64, seqInTxn uint32) []byte {
+	out := []byte(LegacyListMetaDeltaPrefix)
 	var l [4]byte
 	binary.BigEndian.PutUint32(l[:], uint32(len(userKey))) //nolint:gosec
 	out = append(out, l[:]...)
@@ -187,6 +201,45 @@ func TestRedisDB_ListEmptyListStillEmitsFile(t *testing.T) {
 	}
 }
 
+func TestRedisDB_ListLegacyDeltaIsSkippedButDeltaLookingMetaIsPreserved(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	if err := db.HandleListMeta(legacyListMetaDeltaKey("q", 10, 0), make([]byte, listMetaDeltaBinarySize)); err != nil {
+		t.Fatal(err)
+	}
+	userKey := string(deltaLookingListMetaUserKeyForBackup([]byte("real"), 11, 1))
+	if err := db.HandleListMeta(listMetaKey(userKey), listMetaValue(0, 1)); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.HandleListItem(listItemKey(userKey, 0), []byte("v")); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Finalize(); err != nil {
+		t.Fatal(err)
+	}
+
+	got := readListJSON(t, filepath.Join(root, "redis", "db_0", "lists", EncodeSegment([]byte(userKey))+".json"))
+	assertListItems(t, got, []any{"v"})
+	if _, err := os.Stat(filepath.Join(root, "redis", "db_0", "lists", "q.json")); !os.IsNotExist(err) {
+		t.Fatalf("legacy delta must not emit q.json: stat err=%v", err)
+	}
+}
+
+func deltaLookingListMetaUserKeyForBackup(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
+	key = append(key, "d|"...)
+	var lenPrefix [4]byte
+	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
+	key = append(key, lenPrefix[:]...)
+	key = append(key, fakeUserKey...)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
+}
+
 // TestRedisDB_ListTTLInlinedFromScanIndex pins that !redis|ttl| records
 // for a list user key fold into the list's JSON `expire_at_ms` rather
 // than landing in a separate sidecar (the strings/HLL pattern). A
@@ -275,10 +328,9 @@ func TestRedisDB_ListBinaryItemUsesBase64Envelope(t *testing.T) {
 }
 
 // TestRedisDB_ListHandleListMetaSkipsDeltaKey pins that the
-// !lst|meta|d|... family is silently skipped by HandleListMeta. Without
+// !lst|delta|... family is silently skipped by HandleListMeta. Without
 // this, parsing the delta's userKeyLen prefix as the start of a
-// userKey would corrupt the lists map. Mirrors the hash delta-key
-// guard (Codex P1 round 14 PR #725).
+// userKey would corrupt the lists map. Mirrors the hash delta-key guard.
 func TestRedisDB_ListHandleListMetaSkipsDeltaKey(t *testing.T) {
 	t.Parallel()
 	db, _ := newRedisDB(t)
@@ -353,7 +405,7 @@ func TestRedisDB_ListRejectsMalformedMetaValueLength(t *testing.T) {
 // firing the declared-vs-observed length mismatch warning (because
 // metaSeen=false means we have no "declared" baseline to compare
 // against). Mirrors the items-as-source-of-truth contract that
-// makes the !lst|meta|d| delta family safe to skip.
+// makes the !lst|delta| delta family safe to skip.
 func TestRedisDB_ListItemsWithoutMetaStillEmitsFile(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
