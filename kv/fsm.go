@@ -1201,8 +1201,11 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys
 		if _, ok := bypassKeys[string(mut.Key)]; ok {
 			continue
 		}
-		if checked, err := verifyS3BucketAuxiliaryWriteFenceFromSnapshot(mut.Key, snap, snapVer, phase); checked || err != nil {
-			return err
+		if checked, err := verifyS3BucketAuxiliaryWriteFenceFromSnapshot(mut.Key, snap, snapVer, phase); checked {
+			if err != nil {
+				return err
+			}
+			continue
 		}
 		rKey := routeKey(mut.Key)
 		if snap.WriteFencedForKey(rKey) {

@@ -395,6 +395,29 @@ func TestFSMIgnoresRawRouteFenceForS3BucketAuxiliaryWrite(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestFSMContinuesWriteFenceValidationAfterS3BucketAuxiliaryWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	fsm := newWriteFencedFSM(t)
+
+	err := fsm.handleTxnRequest(context.Background(), &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_PREPARE,
+		Ts:    10,
+		Mutations: []*pb.Mutation{
+			{
+				Op:    pb.Op_PUT,
+				Key:   []byte(txnMetaPrefix),
+				Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), LockTTLms: defaultTxnLockTTLms}),
+			},
+			{Op: pb.Op_PUT, Key: s3keys.BucketMetaKey(bucket), Value: []byte("meta")},
+			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
+		},
+	}, 10)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
 func TestFSMIgnoresNonOwnerS3BucketAuxiliaryFenceForPointWrite(t *testing.T) {
 	t.Parallel()
 
