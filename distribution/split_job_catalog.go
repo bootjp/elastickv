@@ -448,7 +448,7 @@ func (s *CatalogStore) MoveSplitJobToHistory(ctx context.Context, expected Split
 		return err
 	}
 	readTS := s.store.LastCommitTS()
-	if applied, err := s.splitJobHistoryMoveApplied(ctx, job.JobID, readTS); err != nil || applied {
+	if applied, err := s.finishAppliedSplitJobHistoryMove(ctx, job.JobID, readTS); err != nil || applied {
 		return err
 	}
 	if err := s.expectLiveSplitJobAt(ctx, job.JobID, expectedRaw, readTS); err != nil {
@@ -463,7 +463,31 @@ func (s *CatalogStore) MoveSplitJobToHistory(ctx context.Context, expected Split
 		Op:  store.OpTypeDelete,
 		Key: CatalogSplitJobKey(job.JobID),
 	})
-	return s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(job.JobID)}, mutations)
+	if err := s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(job.JobID)}, mutations); err != nil {
+		return err
+	}
+	return s.retireSplitJobMigrationMetadata(ctx, job.JobID)
+}
+
+func (s *CatalogStore) finishAppliedSplitJobHistoryMove(ctx context.Context, jobID, readTS uint64) (bool, error) {
+	applied, err := s.splitJobHistoryMoveApplied(ctx, jobID, readTS)
+	if err != nil {
+		return false, err
+	}
+	if !applied {
+		return false, nil
+	}
+	if err := s.retireSplitJobMigrationMetadata(ctx, jobID); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *CatalogStore) retireSplitJobMigrationMetadata(ctx context.Context, jobID uint64) error {
+	if err := s.store.RetireMigration(ctx, jobID); err != nil && !errors.Is(err, store.ErrNotSupported) {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func validateSplitJobHistoryMove(expected SplitJob, job SplitJob) error {

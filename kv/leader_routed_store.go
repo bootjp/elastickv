@@ -729,6 +729,13 @@ func (s *LeaderRoutedStore) MigrationHLCFloor(ctx context.Context, jobID uint64)
 	return floor, errors.WithStack(err)
 }
 
+func (s *LeaderRoutedStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.RetireMigration(ctx, jobID))
+}
+
 func (s *LeaderRoutedStore) Snapshot() (store.Snapshot, error) {
 	if s == nil || s.local == nil {
 		return nil, errors.WithStack(store.ErrNotSupported)

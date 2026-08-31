@@ -55,7 +55,9 @@ func isReusableRedisTxnErr(err error) bool {
 }
 
 func shouldPreserveRedisTxnAttempt(err error) bool {
-	return isRetryableRedisTxnErr(err) && !isRouteWriteFencedError(err)
+	return isRetryableRedisTxnErr(err) &&
+		!isRouteWriteFencedError(err) &&
+		!isRedisComposedRouteErr(err)
 }
 
 func isRedisComposedRouteErr(err error) bool {

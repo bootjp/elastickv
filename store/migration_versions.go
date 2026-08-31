@@ -526,3 +526,18 @@ func (s *mvccStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, 
 	defer s.mtx.RUnlock()
 	return s.migrationHLCFloors[jobID], nil
 }
+
+func (s *mvccStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	for id := range s.migrationAcks {
+		if id.jobID == jobID {
+			delete(s.migrationAcks, id)
+		}
+	}
+	delete(s.migrationHLCFloors, jobID)
+	return nil
+}

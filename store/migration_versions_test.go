@@ -831,6 +831,80 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 	})
 }
 
+func TestRetireMigrationRemovesOnlySelectedJobMetadata(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		_, err := st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("job1-bracket2"),
+			Versions:  []MVCCVersion{{Key: []byte("job1-a"), CommitTS: 10, Value: []byte("v10")}},
+		})
+		require.NoError(t, err)
+		_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 3,
+			BatchSeq:  1,
+			Cursor:    []byte("job1-bracket3"),
+			Versions:  []MVCCVersion{{Key: []byte("job1-b"), CommitTS: 20, Value: []byte("v20")}},
+		})
+		require.NoError(t, err)
+		_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     2,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("job2-bracket2"),
+			Versions:  []MVCCVersion{{Key: []byte("job2-a"), CommitTS: 30, Value: []byte("v30")}},
+		})
+		require.NoError(t, err)
+
+		floor, err := st.MigrationHLCFloor(ctx, 1)
+		require.NoError(t, err)
+		require.Equal(t, uint64(20), floor)
+		floor, err = st.MigrationHLCFloor(ctx, 2)
+		require.NoError(t, err)
+		require.Equal(t, uint64(30), floor)
+
+		require.NoError(t, st.RetireMigration(ctx, 1))
+
+		floor, err = st.MigrationHLCFloor(ctx, 1)
+		require.NoError(t, err)
+		require.Zero(t, floor)
+		floor, err = st.MigrationHLCFloor(ctx, 2)
+		require.NoError(t, err)
+		require.Equal(t, uint64(30), floor)
+
+		res, err := st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("job1-new"),
+			Versions:  []MVCCVersion{{Key: []byte("job1-new"), CommitTS: 40, Value: []byte("v40")}},
+		})
+		require.NoError(t, err)
+		require.False(t, res.Duplicate)
+		require.Equal(t, []byte("job1-new"), res.AckedCursor)
+
+		res, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     2,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("job2-changed"),
+		})
+		require.NoError(t, err)
+		require.True(t, res.Duplicate)
+		require.Equal(t, []byte("job2-bracket2"), res.AckedCursor)
+
+		val, err := st.GetAt(ctx, []byte("job1-a"), 10)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v10"), val)
+		val, err = st.GetAt(ctx, []byte("job1-b"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v20"), val)
+	})
+}
+
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
 	ctx := context.Background()
 	dir, err := os.MkdirTemp("", "migration-import-persist-*")
@@ -864,6 +938,64 @@ func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, res.Duplicate)
 	require.Equal(t, []byte("persisted"), res.AckedCursor)
+}
+
+func TestPebbleRetireMigrationPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-retire-persist-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("retired"),
+		Versions:  []MVCCVersion{{Key: []byte("retired-k"), CommitTS: 99, Value: []byte("v99")}},
+	})
+	require.NoError(t, err)
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     10,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("kept"),
+		Versions:  []MVCCVersion{{Key: []byte("kept-k"), CommitTS: 109, Value: []byte("v109")}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.RetireMigration(ctx, 9))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	floor, err := reopened.MigrationHLCFloor(ctx, 9)
+	require.NoError(t, err)
+	require.Zero(t, floor)
+	floor, err = reopened.MigrationHLCFloor(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, uint64(109), floor)
+
+	res, err := reopened.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("retired-fresh"),
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, []byte("retired-fresh"), res.AckedCursor)
+
+	res, err = reopened.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     10,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("kept-changed"),
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("kept"), res.AckedCursor)
 }
 
 func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
