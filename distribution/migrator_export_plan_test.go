@@ -436,6 +436,7 @@ func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 	for _, raw := range [][]byte{
 		[]byte(migrationTxnIntentPrefix + "k"),
 		[]byte(migrationTxnSuccessPrefix + "k"),
+		[]byte(migrationTxnBackupTimestampFloorKey),
 		[]byte(store.ListClaimPrefix + "k"),
 		[]byte(store.HashFieldPrefix + "k"),
 		[]byte(store.StreamEntryPrefix + "k"),
@@ -449,6 +450,7 @@ func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 
 	for _, raw := range [][]byte{
 		[]byte("!txn|foo"),
+		[]byte("!txn|backup|customer"),
 		[]byte("!stream|foo"),
 		[]byte("!ddb|foo"),
 		[]byte("!sqs|foo"),

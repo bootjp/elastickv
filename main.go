@@ -56,11 +56,19 @@ const (
 	etcdMaxSizePerMsg     = 1 << 20
 	etcdMaxInflightMsg    = 1024
 	defaultTSOBatchSize   = 256
+	defaultBackupTTL      = 30 * time.Minute
+	defaultBackupMaxTTL   = time.Hour
+	defaultBackupDeadline = 5 * time.Second
+	defaultBackupHeadroom = 1000
+	defaultBackupPageSize = 1024
+	defaultBackupPinLimit = 4
 
 	defaultFilesystemRootMode              = 0o755
 	defaultFilesystemPlacementScanInterval = 30 * time.Second
 	defaultFilesystemLeaseReapInterval     = 30 * time.Second
 )
+
+var errInvalidLiveBackupConfig = errors.New("invalid live backup configuration")
 
 func newRaftFactory(engineType raftEngineType, coldStartObs raftengine.ColdStartObserver) (raftengine.Factory, error) {
 	switch engineType {
@@ -161,9 +169,18 @@ var (
 	// below — both can be enabled simultaneously, and operators can pick
 	// whichever auth path they need (gRPC bearer token vs. HTTP cookies +
 	// SigV4 access keys).
-	adminTokenFile      = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
-	adminInsecureNoAuth = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
-	s3BlobPeerTokenFile = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
+	adminTokenFile                = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
+	adminInsecureNoAuth           = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	s3BlobPeerTokenFile           = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
+	backupDefaultTTL              = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
+	backupMaxTTL                  = flag.Duration("backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
+	backupBeginDeadline           = flag.Duration("backupBeginDeadline", defaultBackupDeadline, "Deadline for live-backup peer gates and pin fan-out")
+	backupSnapshotHeadroomEntries = flag.Uint64(
+		"backupSnapshotHeadroomEntries", defaultBackupHeadroom,
+		"Minimum Raft entries remaining before the next snapshot when a live backup begins",
+	)
+	backupScanPageSize  = flag.Int("backupScanPageSize", defaultBackupPageSize, "Count-only scan page size used by live-backup baselines")
+	backupMaxActivePins = flag.Int("backupMaxActivePins", defaultBackupPinLimit, "Maximum concurrent logical live-backup pins")
 
 	// Admin HTTP listener flags (PR #545's parallel work merged into
 	// main; serves the cookie/SigV4-authenticated admin dashboard).
@@ -410,7 +427,7 @@ func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Co
 }
 
 func run() error {
-	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs()
 	if err != nil {
 		return err
 	}
@@ -458,6 +475,7 @@ func run() error {
 	}
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
+	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(*backupMaxActivePins))
 	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.s3BlobBackfillConfig)
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
@@ -485,6 +503,7 @@ func run() error {
 		keystore,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
+		readTracker,
 		cfg.engine,
 		redisApplyObserver,
 		s3BlobBackfiller,
@@ -508,9 +527,9 @@ func run() error {
 
 	cleanup := internalutil.CleanupStack{}
 	defer cleanup.Run()
+	cleanup.Add(readTracker.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
-	readTracker := kv.NewActiveTimestampTracker()
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
@@ -521,12 +540,19 @@ func run() error {
 	cleanup.Add(cancel)
 	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup)
 	sampler := buildKeyVizSampler()
+	sqsPartitionResolver := buildSQSPartitionResolver(cfg.sqsFifoPartitionMap)
+	shardStore.WithPartitionResolver(sqsPartitionResolver)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
 		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
-		WithPartitionResolver(buildSQSPartitionResolver(cfg.sqsFifoPartitionMap))
+		WithPartitionResolver(sqsPartitionResolver)
+	if err := configureCoordinatorTSO(coordinate); err != nil {
+		return err
+	}
+	readTracker.SetBackupTimestampFloorObserver(coordinate.ObserveTimestampFloor)
+
 	// SQS HT-FIFO §8 leadership-refusal: install per-group
 	// observers that step the local node down via
 	// TransferLeadership when it acquires (or already holds)
@@ -569,6 +595,7 @@ func run() error {
 	}
 	defaultRuntime := distStartup.defaultRuntime
 	distServer := distStartup.distServer
+	distCatalog := distStartup.distCatalog
 	autoSplitRuntime := distStartup.autoSplitRuntime
 
 	// Stage 7c §3.1: build the encryption-aware
@@ -596,7 +623,7 @@ func run() error {
 		ctx: runCtx, eg: eg, cancel: cancel, lc: &lc,
 		runtimes: runtimes, shardGroups: shardGroups, bootstrapServers: bootstrapCfg.adminSeed(cfg.defaultGroup),
 		shardStore: shardStore, coordinate: coordinate,
-		distServer: distServer, readTracker: readTracker,
+		distServer: distServer, distCatalog: distCatalog, readTracker: readTracker,
 		metricsRegistry: metricsRegistry, cfg: cfg,
 		redisApplyObserver:              redisApplyObserver,
 		cleanup:                         &cleanup,
@@ -621,6 +648,47 @@ func run() error {
 	return nil
 }
 
+func resolveValidatedRuntimeInputs() (runtimeConfig, raftEngineType, raftBootstrapConfig, bool, error) {
+	cfg, engineType, bootstrapCfg, bootstrap, err := resolveRuntimeInputs()
+	if err != nil {
+		return runtimeConfig{}, "", raftBootstrapConfig{}, false, err
+	}
+	err = validateLiveBackupConfig(
+		*backupDefaultTTL, *backupMaxTTL, *backupBeginDeadline,
+		*backupSnapshotHeadroomEntries, *backupScanPageSize, *backupMaxActivePins,
+	)
+	return cfg, engineType, bootstrapCfg, bootstrap, err
+}
+
+func validateLiveBackupConfig(
+	defaultTTL time.Duration,
+	maxTTL time.Duration,
+	beginDeadline time.Duration,
+	snapshotHeadroom uint64,
+	scanPageSize int,
+	maxActivePins int,
+) error {
+	const minTTL = time.Minute
+	switch {
+	case defaultTTL < minTTL:
+		return errors.Wrapf(errInvalidLiveBackupConfig, "backupDefaultTTL must be at least %s", minTTL)
+	case maxTTL < minTTL:
+		return errors.Wrapf(errInvalidLiveBackupConfig, "backupMaxTTL must be at least %s", minTTL)
+	case defaultTTL > maxTTL:
+		return errors.Wrap(errInvalidLiveBackupConfig, "backupDefaultTTL must not exceed backupMaxTTL")
+	case beginDeadline <= 0:
+		return errors.Wrap(errInvalidLiveBackupConfig, "backupBeginDeadline must be positive")
+	case snapshotHeadroom == 0:
+		return errors.Wrap(errInvalidLiveBackupConfig, "backupSnapshotHeadroomEntries must be positive")
+	case scanPageSize <= 0:
+		return errors.Wrap(errInvalidLiveBackupConfig, "backupScanPageSize must be positive")
+	case maxActivePins <= 0:
+		return errors.Wrap(errInvalidLiveBackupConfig, "backupMaxActivePins must be positive")
+	default:
+		return nil
+	}
+}
+
 type distributionStartupInput struct {
 	ctx             context.Context
 	eg              *errgroup.Group
@@ -640,8 +708,12 @@ type distributionStartupInput struct {
 }
 
 type distributionStartup struct {
-	defaultRuntime   *raftGroupRuntime
-	distServer       *adapter.DistributionServer
+	defaultRuntime *raftGroupRuntime
+	distServer     *adapter.DistributionServer
+	// distCatalog is the durable route catalog the admin backup store reads
+	// to capture a route snapshot at a pinned timestamp. It is built here, so
+	// it has to travel back out rather than be rebuilt at the call site.
+	distCatalog      *distribution.CatalogStore
 	autoSplitRuntime adapter.AutoSplitRuntime
 }
 
@@ -699,6 +771,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	return distributionStartup{
 		defaultRuntime:   defaultRuntime,
 		distServer:       distServer,
+		distCatalog:      distCatalog,
 		autoSplitRuntime: autoSplitRuntime,
 	}, nil
 }
@@ -1467,6 +1540,7 @@ func buildShardGroups(
 	factory raftengine.Factory,
 	proposalObserverForGroup func(uint64) kv.ProposalObserver,
 	clock *kv.HLC,
+	readTracker *kv.ActiveTimestampTracker,
 	kekWrapper kek.Wrapper,
 	keystore *encryption.Keystore,
 	sidecarPath string,
@@ -1545,7 +1619,8 @@ func buildShardGroups(
 		// work. At M2 the FSM stores both but does not consult them;
 		// see docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md
 		// §M2.
-		sm := kv.NewKvFSMWithHLC(st, clock, fsmOptionsForGroup(applier, routeEngine, g.id, encWiring, applyObservers...)...)
+		sm := kv.NewKvFSMWithHLCAndTracker(st, clock, readTracker,
+			fsmOptionsForGroup(applier, routeEngine, g.id, encWiring, applyObservers...)...)
 		groupBootstrap, groupBootstrapServers, groupBootstrapSeed := bootstrapSettingsForGroup(bootstrapCfg, g.id, bootstrap)
 		runtime, err := buildRuntimeForGroup(
 			raftID, g, raftDir, multi, groupBootstrap,
@@ -1859,6 +1934,7 @@ type serversInput struct {
 	shardStore         *kv.ShardStore
 	coordinate         kv.Coordinator
 	distServer         *adapter.DistributionServer
+	distCatalog        *distribution.CatalogStore
 	readTracker        *kv.ActiveTimestampTracker
 	metricsRegistry    *monitoring.Registry
 	cfg                runtimeConfig
@@ -1889,51 +1965,26 @@ type serversInput struct {
 // to catch up, prepares the public listeners, waits for any requested startup
 // rotation, then starts serving public traffic.
 func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter, in serversInput) error {
+	adminGRPCEnabled := *adminTokenFile != "" || *adminInsecureNoAuth
+	// roleStore is gated on *adminEnabled. With admin HTTP disabled, building
+	// it is wasted work AND a security regression risk: a non-empty
+	// -adminFullAccessKeys flag would otherwise still flip
+	// forwardDeps.readyForRegistration() to true, registering the leader-side
+	// gRPC AdminForward service and re-exposing the table-write surface a
+	// follower-direct admin call could reach (P1/Major review on #648).
+	//
+	// connCache is also used by the gRPC Admin GetNodeVersion probe, so create
+	// it when either admin HTTP or gRPC Admin is enabled.
+	connCache := prepareAdminConnCache(in.ctx, in.eg, *adminEnabled || adminGRPCEnabled)
 	adminServer, adminGRPCOpts, err := setupAdminService(
-		*raftId,
-		*myAddr,
-		in.runtimes,
-		in.bootstrapServers,
-		in.keyvizSampler,
+		*raftId, *myAddr, in.runtimes, in.shardGroups, in.bootstrapServers,
+		in.shardStore, in.distCatalog, in.coordinate, in.readTracker, in.keyvizSampler, connCache,
 		in.autoSplitRuntime,
 	)
 	if err != nil {
 		return err
 	}
-	// roleStore + connCache are gated on *adminEnabled. With admin
-	// disabled, building either is wasted work AND a security
-	// regression risk: a non-empty -adminFullAccessKeys flag would
-	// otherwise still flip forwardDeps.readyForRegistration() to
-	// true, registering the leader-side gRPC AdminForward service
-	// and re-exposing the table-write surface a follower-direct
-	// admin call could reach (P1/Major review on #648).
-	// The HTTP admin listener already short-circuits in
-	// prepareAdminFromFlags when *adminEnabled is false; the gRPC path
-	// must do the same.
-	var (
-		roleStore admin.RoleStore
-		connCache *kv.GRPCConnCache
-	)
-	if *adminEnabled {
-		roleStore = roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
-		// connCache is shared between the follower-side LeaderForwarder
-		// (built inside prepareAdminFromFlags) and any future bridge that
-		// dials the leader's gRPC ports. Keeping a single instance per
-		// process means the two paths re-use TLS / HTTP/2 connections
-		// rather than each maintaining a parallel pool. The shutdown
-		// goroutine drains the cache on context cancellation so the
-		// accumulated HTTP/2 connections are not leaked when the
-		// process exits gracefully (Claude review on #648).
-		connCache = &kv.GRPCConnCache{}
-		cache := connCache
-		in.eg.Go(func() error {
-			<-in.ctx.Done()
-			if err := cache.Close(); err != nil {
-				return errors.Wrap(err, "close admin gRPC connection cache")
-			}
-			return nil
-		})
-	}
+	roleStore := startupRoleStoreFromFlags(*adminEnabled)
 	publicKVGate := &startupPublicKVGate{}
 	if in.distServer != nil {
 		in.distServer.SetReadGate(publicKVGate.blocked)
@@ -2048,6 +2099,13 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		in.coordinate,
 		in.metricsRegistry.FileSystemObserver(),
 	)
+}
+
+func startupRoleStoreFromFlags(enabled bool) admin.RoleStore {
+	if !enabled {
+		return nil
+	}
+	return roleStoreFromFlags(parseCSV(*adminFullAccessKeys), parseCSV(*adminReadOnlyAccessKeys))
 }
 
 const raftJoinReadyPollInterval = 100 * time.Millisecond
@@ -2171,8 +2229,14 @@ func startHLCLeaseRenewal(ctx context.Context, eg *errgroup.Group, coordinate kv
 func setupAdminService(
 	nodeID, grpcAddress string,
 	runtimes []*raftGroupRuntime,
+	shardGroups map[uint64]*kv.ShardGroup,
 	bootstrapServers []raftengine.Server,
+	shardStore *kv.ShardStore,
+	distCatalog *distribution.CatalogStore,
+	coordinate kv.Coordinator,
+	readTracker *kv.ActiveTimestampTracker,
 	keyvizSampler *keyviz.MemSampler,
+	connCache *kv.GRPCConnCache,
 	autoSplitRuntime adapter.AutoSplitRuntime,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	members := adminMembersFromBootstrap(nodeID, bootstrapServers)
@@ -2189,6 +2253,11 @@ func setupAdminService(
 		adapter.S3BlobOffloadEnabledFromEnv(),
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
+		connCache,
+		adminBackupDependencies{
+			store:      &adminBackupStore{ShardStore: shardStore, catalog: distCatalog},
+			shardStore: shardStore, coordinate: coordinate, tracker: readTracker,
+		},
 	)
 	if err != nil {
 		return nil, adminGRPCInterceptors{}, err
@@ -2198,6 +2267,15 @@ func setupAdminService(
 	}
 	for _, rt := range runtimes {
 		srv.RegisterGroup(rt.spec.id, rt.engine)
+		if group := shardGroups[rt.spec.id]; group != nil {
+			group.SetLeaderReadToken(icept.token)
+			srv.RegisterBackupProposer(rt.spec.id, kv.NewLeaderAdminProposer(
+				rt.engine,
+				group.Proposer(),
+				connCache,
+				kv.WithLeaderAdminToken(icept.token),
+			))
+		}
 	}
 	// Only register a real sampler. Passing a typed-nil *MemSampler
 	// would store a non-nil interface and make GetKeyVizMatrix
@@ -2271,6 +2349,7 @@ func adminMembersFromBootstrap(selfID string, servers []raftengine.Server) []ada
 type adminGRPCInterceptors struct {
 	unary              []grpc.UnaryServerInterceptor
 	stream             []grpc.StreamServerInterceptor
+	token              string
 	s3BlobFetchEnabled bool
 }
 
@@ -2286,6 +2365,7 @@ type startupGatedCoordinator struct {
 var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
 var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.AllGroupsLeaseTimestampCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.RaftMembershipCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.TimestampAllocator = (*startupGatedCoordinator)(nil)
@@ -2369,6 +2449,10 @@ func (c startupGatedCoordinator) LeaseReadForKey(ctx context.Context, key []byte
 
 func (c startupGatedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
 	return kv.LeaseReadAllGroupsThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+}
+
+func (c startupGatedCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
+	return kv.LeaseReadAllGroupsTimestampThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }
 
 // IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
@@ -2531,6 +2615,26 @@ func startupRotationGatedMethod(fullMethod string) bool {
 // service is intentionally disabled. It is mutually exclusive with
 // --adminInsecureNoAuth so operators have to opt into the unauthenticated
 // mode explicitly.
+type adminBackupDependencies struct {
+	store      adapter.BackupStore
+	shardStore *kv.ShardStore
+	coordinate kv.Coordinator
+	tracker    *kv.ActiveTimestampTracker
+}
+
+type adminBackupStore struct {
+	*kv.ShardStore
+	catalog *distribution.CatalogStore
+}
+
+func (s *adminBackupStore) CaptureBackupRouteSnapshotAt(ctx context.Context, ts uint64) (kv.BackupRouteSnapshot, error) {
+	if s == nil {
+		return kv.BackupRouteSnapshot{}, errors.New("backup store is unavailable")
+	}
+	snapshot, err := kv.CaptureBackupRouteSnapshotAt(ctx, s.catalog, ts)
+	return snapshot, errors.Wrap(err, "capture backup route snapshot")
+}
+
 func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
@@ -2538,6 +2642,8 @@ func configureAdminService(
 	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
+	connCache *kv.GRPCConnCache,
+	backupDeps ...adminBackupDependencies,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
 	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath)
 	if err != nil {
@@ -2545,13 +2651,19 @@ func configureAdminService(
 	}
 	var srv *adapter.AdminServer
 	if auth.adminEnabled {
-		srv = adapter.NewAdminServer(self, members)
+		// adminServerOptions carries the live-backup dependencies and the
+		// admin token the backup proposer forwards with, so the options have
+		// to be built here rather than at NewAdminServer's bare call.
+		opts := adminServerOptions(auth.adminToken, insecureNoAuth, connCache, backupDeps)
+		srv = adapter.NewAdminServer(self, members, opts...)
 		srv.SetCapability(
 			adapter.S3BlobOffloadCapabilityName,
 			s3BlobOffloadAdminCapability(auth.adminToken, auth.peerToken, s3BlobOffloadEnabled),
 		)
 	}
-	var icept adminGRPCInterceptors
+	// token is what setupAdminService hands to SetLeaderReadToken and the
+	// per-group backup proposer, so it has to survive the interceptor build.
+	icept := adminGRPCInterceptors{token: auth.adminToken}
 	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
 	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
 	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
@@ -2607,6 +2719,124 @@ func appendGRPCBearerInterceptors(
 
 func s3BlobOffloadAdminCapability(adminToken, peerToken string, enabled bool) bool {
 	return adapter.S3BlobOffloadLocalCapability() && enabled && adminToken != "" && peerToken != ""
+}
+
+func adminServerOptions(
+	token string,
+	insecureNoAuth bool,
+	connCache *kv.GRPCConnCache,
+	backupDeps []adminBackupDependencies,
+) []adapter.AdminOption {
+	opts := []adapter.AdminOption{adapter.WithAdminNodeVersion(buildVersion())}
+	if probe := adminLeaderVersionProbe(connCache); probe != nil {
+		opts = append(opts, adapter.WithAdminLeaderVersionProbe(probe))
+	}
+	if len(backupDeps) > 0 {
+		deps := backupDeps[0]
+		tokenKey := []byte(token)
+		if insecureNoAuth {
+			tokenKey = []byte("elastickv-insecure-live-backup-token-v1")
+		}
+		opts = append(opts,
+			adapter.WithAdminBackupControl(
+				deps.store,
+				adminBackupReadFence(deps.coordinate, deps.shardStore),
+				adminBackupPeerProbe(connCache),
+				deps.tracker,
+				tokenKey,
+			),
+			adapter.WithAdminBackupConfig(adapter.AdminBackupConfig{
+				DefaultTTL:              *backupDefaultTTL,
+				MinTTL:                  time.Minute,
+				MaxTTL:                  *backupMaxTTL,
+				BeginDeadline:           *backupBeginDeadline,
+				SnapshotHeadroomEntries: *backupSnapshotHeadroomEntries,
+				ScanPageSize:            *backupScanPageSize,
+			}),
+		)
+	}
+	return opts
+}
+
+func adminBackupReadFence(coordinate kv.Coordinator, shardStore *kv.ShardStore) adapter.BackupReadFence {
+	if coordinate == nil || shardStore == nil || coordinate.Clock() == nil {
+		return nil
+	}
+	return func(ctx context.Context) (uint64, error) {
+		clock := coordinate.Clock()
+		leaderCommitTS, err := kv.LeaseReadAllGroupsTimestampThrough(coordinate, ctx)
+		if err != nil {
+			return 0, errors.Wrap(err, "backup: fence raft groups")
+		}
+		lastCommitTS := shardStore.LastCommitTS()
+		if leaderCommitTS > lastCommitTS {
+			lastCommitTS = leaderCommitTS
+		}
+		clock.Observe(lastCommitTS)
+		readTS, err := allocateBackupReadTimestamp(ctx, coordinate, lastCommitTS)
+		if err != nil {
+			return 0, errors.Wrap(err, "backup: issue read timestamp")
+		}
+		return readTS, nil
+	}
+}
+
+func allocateBackupReadTimestamp(ctx context.Context, coordinate kv.Coordinator, min uint64) (uint64, error) {
+	if alloc, ok := coordinate.(kv.TimestampAfterAllocator); ok {
+		return alloc.NextAfter(ctx, min) //nolint:wrapcheck // Canonical coordinator/TSO error.
+	}
+	if alloc, ok := coordinate.(kv.TimestampAllocator); ok {
+		ts, err := alloc.Next(ctx)
+		if err != nil {
+			return 0, err //nolint:wrapcheck // Wrapped at the backup call site.
+		}
+		if ts <= min {
+			return 0, errors.Errorf("timestamp allocator returned %d, not after %d", ts, min)
+		}
+		return ts, nil
+	}
+	clock := coordinate.Clock()
+	if clock == nil {
+		return 0, errors.New("backup timestamp allocator is unavailable")
+	}
+	clock.Observe(min)
+	return clock.NextFenced() //nolint:wrapcheck // Wrapped at the backup call site.
+}
+
+func adminBackupPeerProbe(connCache *kv.GRPCConnCache) adapter.BackupPeerProbe {
+	if connCache == nil {
+		return nil
+	}
+	return func(ctx context.Context, address string) (adapter.BackupPeerVersion, error) {
+		conn, err := connCache.ConnFor(address)
+		if err != nil {
+			return adapter.BackupPeerVersion{}, errors.Wrap(err, "backup peer probe: dial peer")
+		}
+		resp, err := pb.NewAdminClient(conn).GetNodeVersion(ctx, &pb.GetNodeVersionRequest{})
+		if err != nil {
+			return adapter.BackupPeerVersion{}, errors.Wrap(err, "backup peer probe: get node version")
+		}
+		return adapter.BackupPeerVersion{
+			NodeVersion: resp.GetNodeVersion(), BackupProtocolVersion: resp.GetBackupProtocolVersion(),
+		}, nil
+	}
+}
+
+func adminLeaderVersionProbe(connCache *kv.GRPCConnCache) adapter.LeaderVersionProbe {
+	if connCache == nil {
+		return nil
+	}
+	return func(ctx context.Context, address string) (string, error) {
+		conn, err := connCache.ConnFor(address)
+		if err != nil {
+			return "", errors.Wrap(err, "admin leader version probe: dial peer")
+		}
+		resp, err := pb.NewAdminClient(conn).GetNodeVersion(ctx, &pb.GetNodeVersionRequest{})
+		if err != nil {
+			return "", errors.Wrap(err, "admin leader version probe: get node version")
+		}
+		return resp.GetNodeVersion(), nil
+	}
 }
 
 // loadAdminTokenFile materialises --adminTokenFile with a strict upper bound
@@ -2867,6 +3097,7 @@ func startRaftServers(
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
+		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id])
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -2880,8 +3111,7 @@ func startRaftServers(
 			rt.engine,
 			coordinate.Clock(),
 			relay,
-			append(
-				internalTimestampOptions(coordinate),
+			append(internalOpts,
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
@@ -2954,6 +3184,22 @@ func startRaftServers(
 		})
 	}
 	return nil
+}
+
+func internalServerOptions(
+	coordinate kv.Coordinator,
+	adminServer *adapter.AdminServer,
+	proposer raftengine.Proposer,
+	group *kv.ShardGroup,
+) []adapter.InternalOption {
+	opts := internalTimestampOptions(coordinate)
+	if adminServer != nil {
+		opts = append(opts, adapter.WithInternalAdminProposer(proposer))
+	}
+	if group != nil && group.Store != nil {
+		opts = append(opts, adapter.WithInternalLastCommitTimestamp(group.Store.LastCommitTS))
+	}
+	return opts
 }
 
 func registerAdminServerIfPresent(gs grpc.ServiceRegistrar, adminServer *adapter.AdminServer) {
@@ -3160,10 +3406,24 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 			continue
 		}
 		if rt.spec.id == groupID {
-			return distribution.NewCatalogStore(rt.store)
+			return distribution.NewCatalogStore(rt.store, distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)))
 		}
 	}
 	return nil
+}
+
+func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationStoreResolver {
+	return func(groupID uint64) (store.MVCCStore, error) {
+		for _, rt := range runtimes {
+			if rt == nil || rt.store == nil {
+				continue
+			}
+			if rt.spec.id == groupID {
+				return rt.store, nil
+			}
+		}
+		return nil, errors.Newf("migration target store is not available for group %d", groupID)
+	}
 }
 
 func setupDistributionCatalog(
@@ -3473,6 +3733,21 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		return r.startupFailure(err)
 	}
 	return nil
+}
+
+func prepareAdminConnCache(ctx context.Context, eg *errgroup.Group, enabled bool) *kv.GRPCConnCache {
+	if !enabled {
+		return nil
+	}
+	connCache := &kv.GRPCConnCache{}
+	eg.Go(func() error {
+		<-ctx.Done()
+		if err := connCache.Close(); err != nil {
+			return errors.Wrap(err, "close admin gRPC connection cache")
+		}
+		return nil
+	})
+	return connCache
 }
 
 func (r *runtimeServerRunner) prepareAdminForwardServers() error {

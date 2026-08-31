@@ -20,6 +20,8 @@ const _ = grpc.SupportPackageIsVersion9
 
 const (
 	Internal_Forward_FullMethodName               = "/Internal/Forward"
+	Internal_ForwardAdminProposal_FullMethodName  = "/Internal/ForwardAdminProposal"
+	Internal_ForwardLeaseRead_FullMethodName      = "/Internal/ForwardLeaseRead"
 	Internal_RelayPublish_FullMethodName          = "/Internal/RelayPublish"
 	Internal_ExportRangeVersions_FullMethodName   = "/Internal/ExportRangeVersions"
 	Internal_ImportRangeVersions_FullMethodName   = "/Internal/ImportRangeVersions"
@@ -32,6 +34,8 @@ const (
 type InternalClient interface {
 	// for internal leader redirect only
 	Forward(ctx context.Context, in *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
+	ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error)
+	ForwardLeaseRead(ctx context.Context, in *ForwardLeaseReadRequest, opts ...grpc.CallOption) (*ForwardLeaseReadResponse, error)
 	RelayPublish(ctx context.Context, in *RelayPublishRequest, opts ...grpc.CallOption) (*RelayPublishResponse, error)
 	ExportRangeVersions(ctx context.Context, in *ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRangeVersionsResponse], error)
 	ImportRangeVersions(ctx context.Context, in *ImportRangeVersionsRequest, opts ...grpc.CallOption) (*ImportRangeVersionsResponse, error)
@@ -50,6 +54,26 @@ func (c *internalClient) Forward(ctx context.Context, in *ForwardRequest, opts .
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ForwardResponse)
 	err := c.cc.Invoke(ctx, Internal_Forward_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardAdminProposalResponse)
+	err := c.cc.Invoke(ctx, Internal_ForwardAdminProposal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ForwardLeaseRead(ctx context.Context, in *ForwardLeaseReadRequest, opts ...grpc.CallOption) (*ForwardLeaseReadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardLeaseReadResponse)
+	err := c.cc.Invoke(ctx, Internal_ForwardLeaseRead_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -111,6 +135,8 @@ func (c *internalClient) PromoteStagedVersions(ctx context.Context, in *PromoteS
 type InternalServer interface {
 	// for internal leader redirect only
 	Forward(context.Context, *ForwardRequest) (*ForwardResponse, error)
+	ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error)
+	ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error)
 	RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error)
 	ExportRangeVersions(*ExportRangeVersionsRequest, grpc.ServerStreamingServer[ExportRangeVersionsResponse]) error
 	ImportRangeVersions(context.Context, *ImportRangeVersionsRequest) (*ImportRangeVersionsResponse, error)
@@ -127,6 +153,12 @@ type UnimplementedInternalServer struct{}
 
 func (UnimplementedInternalServer) Forward(context.Context, *ForwardRequest) (*ForwardResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Forward not implemented")
+}
+func (UnimplementedInternalServer) ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForwardAdminProposal not implemented")
+}
+func (UnimplementedInternalServer) ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForwardLeaseRead not implemented")
 }
 func (UnimplementedInternalServer) RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RelayPublish not implemented")
@@ -175,6 +207,42 @@ func _Internal_Forward_Handler(srv interface{}, ctx context.Context, dec func(in
 	}
 	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
 		return srv.(InternalServer).Forward(ctx, req.(*ForwardRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ForwardAdminProposal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardAdminProposalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ForwardAdminProposal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ForwardAdminProposal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ForwardAdminProposal(ctx, req.(*ForwardAdminProposalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ForwardLeaseRead_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardLeaseReadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ForwardLeaseRead(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ForwardLeaseRead_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ForwardLeaseRead(ctx, req.(*ForwardLeaseReadRequest))
 	}
 	return interceptor(ctx, in, info, handler)
 }
@@ -254,6 +322,14 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "Forward",
 			Handler:    _Internal_Forward_Handler,
+		},
+		{
+			MethodName: "ForwardAdminProposal",
+			Handler:    _Internal_ForwardAdminProposal_Handler,
+		},
+		{
+			MethodName: "ForwardLeaseRead",
+			Handler:    _Internal_ForwardLeaseRead_Handler,
 		},
 		{
 			MethodName: "RelayPublish",

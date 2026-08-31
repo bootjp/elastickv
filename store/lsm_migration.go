@@ -578,3 +578,50 @@ func (s *pebbleStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64
 	}
 	return floor, nil
 }
+
+func (s *pebbleStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
+
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := s.stageRetireMigrationImportAcks(batch, jobID); err != nil {
+		return err
+	}
+	if err := s.stageRetireMigrationHLCFloor(batch, jobID); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(s.directApplyWriteOpts()))
+}
+
+func (s *pebbleStore) stageRetireMigrationImportAcks(batch *pebble.Batch, jobID uint64) error {
+	acks, err := s.readMigrationImportAcks()
+	if err != nil {
+		return err
+	}
+	for id := range acks {
+		if id.jobID == jobID {
+			delete(acks, id)
+		}
+	}
+	return stageMigrationMetadataMap(batch, migrationAckMetaKeyBytes, len(acks), encodeMigrationImportAcks(acks))
+}
+
+func (s *pebbleStore) stageRetireMigrationHLCFloor(batch *pebble.Batch, jobID uint64) error {
+	floors, err := s.readMigrationHLCFloors()
+	if err != nil {
+		return err
+	}
+	delete(floors, jobID)
+	return stageMigrationMetadataMap(batch, migrationHLCFloorMetaKeyBytes, len(floors), encodeMigrationHLCFloors(floors))
+}
+
+func stageMigrationMetadataMap(batch *pebble.Batch, key []byte, entries int, encoded []byte) error {
+	if entries == 0 {
+		return errors.WithStack(batch.Delete(key, nil))
+	}
+	return errors.WithStack(batch.Set(key, encoded, nil))
+}

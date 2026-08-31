@@ -361,6 +361,9 @@ type MVCCStore interface {
 	// MigrationHLCFloor returns the full-HLC target-local migration floor
 	// persisted by ImportVersions for jobID.
 	MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error)
+	// RetireMigration removes target-local import progress metadata for a
+	// completed migration job. Data imported by the job is left intact.
+	RetireMigration(ctx context.Context, jobID uint64) error
 	Snapshot() (Snapshot, error)
 	Restore(buf io.Reader) error
 	Close() error
