@@ -16,7 +16,7 @@ func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOpt
 		return ExportVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
-		return ExportVersionsResult{Done: true}, nil
+		return ExportVersionsResult{}, errors.WithStack(ErrInvalidExportBudget)
 	}
 
 	s.dbMu.RLock()

@@ -916,3 +916,25 @@ func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
 	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
 	require.ErrorIs(t, err, ErrKeyNotFound)
 }
+
+// A migration driver that leaves MaxVersions unset must not be told the
+// bracket is complete. Answering Done for a zero budget lets it record a
+// non-empty range as fully copied and proceed to cutover without moving a
+// single version.
+func TestExportVersionsRejectsZeroVersionBudget(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v"), 10, 0))
+
+		for _, budget := range []int{0, -1} {
+			got, err := st.ExportVersions(ctx, ExportVersionsOptions{
+				MaxVersions:          budget,
+				MaxCommitTSInclusive: 100,
+				EndKey:               []byte("z"),
+			})
+			require.ErrorIs(t, err, ErrInvalidExportBudget, "budget %d", budget)
+			require.False(t, got.Done, "a refused export must not report completion")
+			require.Empty(t, got.Versions)
+		}
+	})
+}

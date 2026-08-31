@@ -564,3 +564,40 @@ func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []
 	binary.BigEndian.PutUint32(seq[:], seqInTxn)
 	return append(key, seq[:]...)
 }
+
+// !s3|chunkblob| rows never travel with a migration. They are written outside
+// Raft directly to the receiving node's Pebble and pulled by peers over
+// S3BlobFetch, and they are content-addressed, so a single row backs every
+// object whose chunk hashes the same -- objects that are not moving included.
+// No bracket may claim them: the user bracket would export them by their raw
+// digest route, which forges a replicated copy of deliberately unreplicated
+// state and lets a later source cleanup delete blobs that unmigrated objects
+// still dereference.
+func TestPlanExportBracketsExcludesPeerLocalChunkBlobs(t *testing.T) {
+	t.Parallel()
+
+	var digest [32]byte
+	digest[0] = 0xab
+	blobKey := s3keys.ChunkBlobKey(digest)
+
+	brackets, err := PlanExportBrackets([]byte(s3keys.ChunkBlobPrefix), []byte("!s4|"))
+	require.NoError(t, err)
+	require.NotEmpty(t, brackets)
+
+	for _, bracket := range brackets {
+		require.False(t, bracket.ContainsRawKey(blobKey),
+			"family %d must not export peer-local chunk blob %q", bracket.Family, blobKey)
+	}
+	require.True(t, IsMigrationKnownInternalKey(blobKey))
+
+	// The neighbouring replicated S3 families keep their own brackets, so the
+	// exclusion is scoped to the blob payloads alone.
+	refKey := []byte(s3keys.ChunkRefPrefix + "b|o|u|1|1")
+	matched := false
+	for _, bracket := range brackets {
+		if bracket.Family == MigrationFamilyS3ChunkRef && bracket.ContainsRawKey(refKey) {
+			matched = true
+		}
+	}
+	require.True(t, matched, "chunkref stays owned by its own export bracket")
+}
