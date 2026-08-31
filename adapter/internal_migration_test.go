@@ -278,8 +278,8 @@ func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T)
 			prefix:     s3keys.BucketMetaPrefix,
 			keyFor:     s3keys.BucketMetaKey,
 			value:      []byte("meta"),
-			routeStart: s3keys.RouteKey("bucket-b", 0, ""),
-			routeEnd:   s3keys.RouteKey("bucket-c", 0, ""),
+			routeStart: s3keys.RoutePrefixForBucketAnyGeneration("bucket-b"),
+			routeEnd:   testPrefixScanEnd(s3keys.RoutePrefixForBucketAnyGeneration("bucket-b")),
 		},
 		{
 			name:       "bucket generation",
@@ -287,8 +287,8 @@ func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T)
 			prefix:     s3keys.BucketGenerationPrefix,
 			keyFor:     s3keys.BucketGenerationKey,
 			value:      []byte("generation"),
-			routeStart: s3keys.RouteKey("bucket-b", 0, ""),
-			routeEnd:   s3keys.RouteKey("bucket-c", 0, ""),
+			routeStart: s3keys.RoutePrefixForBucketAnyGeneration("bucket-b"),
+			routeEnd:   testPrefixScanEnd(s3keys.RoutePrefixForBucketAnyGeneration("bucket-b")),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -333,7 +333,7 @@ func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing
 	stream := &captureExportRangeVersionsStream{ctx: ctx}
 	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
 		MaxCommitTs:     20,
-		RouteStart:      s3keys.RouteKey("bucket-z", 0, ""),
+		RouteStart:      s3keys.RoutePrefixForBucketAnyGeneration("bucket-z"),
 		RouteEnd:        []byte{},
 		KeyFamily:       distribution.MigrationFamilyS3BucketMeta,
 		RangeStart:      []byte(s3keys.BucketMetaPrefix),
@@ -347,7 +347,7 @@ func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing
 	}, stream.responses[0].GetVersions())
 }
 
-func TestInternalExportRangeVersionsIncludesS3BucketAuxiliaryForBucketRouteIntersection(t *testing.T) {
+func TestInternalExportRangeVersionsSkipsS3BucketAuxiliaryForNonOwnerRouteSlice(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -392,9 +392,7 @@ func TestInternalExportRangeVersionsIncludesS3BucketAuxiliaryForBucketRouteInter
 			}, stream)
 			require.NoError(t, err)
 			require.Len(t, stream.responses, 1)
-			require.Equal(t, []*pb.MVCCVersion{
-				{Key: tc.key, CommitTs: 10, Value: tc.value, KeyFamily: tc.family},
-			}, stream.responses[0].GetVersions())
+			require.Empty(t, stream.responses[0].GetVersions())
 		})
 	}
 }

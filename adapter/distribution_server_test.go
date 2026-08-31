@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -57,6 +58,27 @@ func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) 
 	require.NoError(t, err)
 	require.Equal(t, routeKey, resp.Start)
 	require.Equal(t, uint64(2), resp.RaftGroupId)
+}
+
+func TestDistributionServerGetRoute_NormalizesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	bucket := "bucket-a"
+	routeKey := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+
+	s := NewDistributionServer(engine, nil)
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		resp, err := s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: key})
+		require.NoError(t, err)
+		require.Equal(t, routeKey, resp.Start)
+		require.Equal(t, uint64(2), resp.RaftGroupId)
+	}
 }
 
 func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
@@ -1437,4 +1459,35 @@ func TestDistributionServerGetRouteOwnership_NormalizesFilesystemChunkKeys(t *te
 	require.Equal(t, uint64(2), resp.Route.RaftGroupId,
 		"the chunk must resolve to its logical route owner, not the raw-prefix owner")
 	require.Equal(t, uint64(2), resp.Route.RouteId)
+}
+
+func TestDistributionServerGetRouteOwnership_NormalizesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	bucket := "bucket-a"
+	routeKey := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 3,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		resp, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+			Key:            key,
+			CatalogVersion: 3,
+		})
+		require.NoError(t, err)
+		require.True(t, resp.Found)
+		require.Equal(t, uint64(2), resp.Route.RaftGroupId,
+			"bucket auxiliary keys must resolve to the bucket route owner, not the raw-prefix owner")
+		require.Equal(t, uint64(2), resp.Route.RouteId)
+	}
 }

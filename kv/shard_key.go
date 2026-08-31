@@ -115,6 +115,12 @@ func RouteKey(key []byte) []byte {
 	return routeKey(key)
 }
 
+// RouteOwnershipKey normalizes a stored key to the catalog key used when
+// answering route ownership queries.
+func RouteOwnershipKey(key []byte) []byte {
+	return routeOwnershipKey(key)
+}
+
 func routeKey(key []byte) []byte {
 	if key == nil {
 		return nil
@@ -123,6 +129,16 @@ func routeKey(key []byte) []byte {
 		return normalizeRouteKey(embedded)
 	}
 	return normalizeRouteKey(key)
+}
+
+func routeOwnershipKey(key []byte) []byte {
+	if bucket, ok := s3keys.ParseBucketMetaKey(key); ok {
+		return s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	}
+	if bucket, ok := s3keys.ParseBucketGenerationKey(key); ok {
+		return s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	}
+	return routeKey(key)
 }
 
 func routeFilterKey(key []byte) []byte {

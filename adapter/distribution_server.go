@@ -168,7 +168,7 @@ func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteReque
 	if err := s.requireReadReady(); err != nil {
 		return nil, err
 	}
-	r, ok := s.engine.GetRoute(kv.RouteKey(req.Key))
+	r, ok := s.engine.GetRoute(kv.RouteOwnershipKey(req.Key))
 	if !ok {
 		return &pb.GetRouteResponse{}, nil
 	}
@@ -214,7 +214,7 @@ func (s *DistributionServer) GetRouteOwnership(ctx context.Context, req *pb.GetR
 	// so looking the raw bytes up in the snapshot answers with the owner of
 	// the raw family prefix instead of the group that actually owned the key
 	// at that catalog version.
-	route, ok := snapshot.RouteOf(kv.RouteKey(req.GetKey()))
+	route, ok := snapshot.RouteOf(kv.RouteOwnershipKey(req.GetKey()))
 	if !ok {
 		return &pb.GetRouteOwnershipResponse{
 			CatalogVersion: snapshot.Version(),

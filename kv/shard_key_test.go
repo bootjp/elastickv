@@ -32,6 +32,14 @@ func TestRouteKey_NormalizesTxnWrappedS3Key(t *testing.T) {
 	require.Equal(t, s3keys.RouteKey("bucket-a", 7, "path/to/object"), routeKey(txnLockKey(embedded)))
 }
 
+func TestRouteOwnershipKey_NormalizesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	want := s3keys.RoutePrefixForBucketAnyGeneration("bucket-a")
+	require.Equal(t, want, RouteOwnershipKey(s3keys.BucketMetaKey("bucket-a")))
+	require.Equal(t, want, RouteOwnershipKey(s3keys.BucketGenerationKey("bucket-a")))
+}
+
 func TestRouteKey_NormalizesFilesystemChunkKey(t *testing.T) {
 	t.Parallel()
 

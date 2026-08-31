@@ -716,15 +716,16 @@ func migrationFamilyRequiresDecodedS3(family uint32) bool {
 
 func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
 	allowRawRouteMatch := !s3BucketRouteBounds(routeStart, routeEnd)
+	rawRouteFilter := kv.RouteKeyFilter(routeStart, routeEnd)
 	return func(rawKey []byte) bool {
 		bucket, ok := decodedS3BucketName(family, rawKey)
 		if !ok {
 			return false
 		}
-		if allowRawRouteMatch && kv.RouteKeyFilter(routeStart, routeEnd)(rawKey) {
+		if allowRawRouteMatch && rawRouteFilter(rawKey) {
 			return true
 		}
-		return decodedS3BucketRouteIntersects(bucket, routeStart, routeEnd)
+		return decodedS3BucketRouteSelected(bucket, routeStart, routeEnd)
 	}
 }
 
@@ -733,9 +734,9 @@ func s3BucketRouteBounds(routeStart, routeEnd []byte) bool {
 		bytes.HasPrefix(routeEnd, []byte(s3keys.RoutePrefix))
 }
 
-func decodedS3BucketRouteIntersects(bucket string, routeStart, routeEnd []byte) bool {
+func decodedS3BucketRouteSelected(bucket string, routeStart, routeEnd []byte) bool {
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+	return keyInRouteRange(bucketRouteStart, routeStart, routeEnd)
 }
 
 func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
@@ -746,6 +747,13 @@ func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
 		return false
 	}
 	return true
+}
+
+func keyInRouteRange(key, start, end []byte) bool {
+	if bytes.Compare(key, start) < 0 {
+		return false
+	}
+	return len(end) == 0 || bytes.Compare(key, end) < 0
 }
 
 func decodedS3BucketName(family uint32, rawKey []byte) (string, bool) {
