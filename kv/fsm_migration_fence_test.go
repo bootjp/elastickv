@@ -126,6 +126,7 @@ func TestFSMWriteFenceBypassRejectsRawWriteAtBypassedRouteFloor(t *testing.T) {
 	fsm := newWriteFloorFSM(t)
 	key := []byte("!sqs|msg|data|p|partitioned-key")
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		ObservedRouteVersion: 1,
 		WriteFenceBypassKeys: [][]byte{key},
 		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}},
 	}, 100)
@@ -165,6 +166,7 @@ func TestFSMWriteFenceBypassRejectsPinnedTxnAtBypassedRouteFloor(t *testing.T) {
 		IsTxn:                true,
 		Phase:                pb.Phase_PREPARE,
 		Ts:                   100,
+		ObservedRouteVersion: 1,
 		WriteFenceBypassKeys: [][]byte{key},
 		Mutations: []*pb.Mutation{
 			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, LockTTLms: defaultTxnLockTTLms})},
@@ -605,7 +607,8 @@ func TestFSMRejectsRawPointWriteAtMigrationTimestampFloorDuringApply(t *testing.
 	ctx := context.Background()
 	fsm := newWriteFloorFSM(t)
 	err := fsm.handleRawRequest(ctx, &pb.Request{
-		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("replayed")}},
+		ObservedRouteVersion: 1,
+		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("replayed")}},
 	}, 100)
 	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
 	_, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
@@ -620,7 +623,8 @@ func TestFSMRejectsDelPrefixAtMigrationTimestampFloorDuringApply(t *testing.T) {
 	require.NoError(t, fsm.store.PutAt(ctx, []byte("z"), []byte("v"), 10, 0))
 
 	err := fsm.handleRawRequest(ctx, &pb.Request{
-		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("z")}},
+		ObservedRouteVersion: 1,
+		Mutations:            []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: []byte("z")}},
 	}, 100)
 	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
 
@@ -635,9 +639,10 @@ func TestFSMRejectsOnePhaseTxnAtMigrationTimestampFloorDuringApply(t *testing.T)
 	ctx := context.Background()
 	fsm := newWriteFloorFSM(t)
 	req := &pb.Request{
-		IsTxn: true,
-		Phase: pb.Phase_NONE,
-		Ts:    90,
+		IsTxn:                true,
+		Phase:                pb.Phase_NONE,
+		Ts:                   90,
+		ObservedRouteVersion: 1,
 		Mutations: []*pb.Mutation{
 			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), CommitTS: 100})},
 			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("low")},
@@ -655,13 +660,38 @@ func TestFSMRejectsPrepareAtMigrationTimestampFloorDuringApply(t *testing.T) {
 	ctx := context.Background()
 	fsm := newWriteFloorFSM(t)
 	prepare := &pb.Request{
-		IsTxn: true,
-		Phase: pb.Phase_PREPARE,
-		Ts:    90,
+		IsTxn:                true,
+		Phase:                pb.Phase_PREPARE,
+		Ts:                   90,
+		ObservedRouteVersion: 1,
 		Mutations: []*pb.Mutation{
 			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("z"), LockTTLms: defaultTxnLockTTLms})},
 			{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("v")},
 		},
 	}
 	require.ErrorIs(t, fsm.handleTxnRequest(ctx, prepare, 90), ErrRouteWriteTimestampTooLow)
+}
+
+func TestFSMTimestampFloorUsesObservedSnapshotDuringApply(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	applyComposed1Snapshot(t, engine, 2, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: ^uint64(0)},
+	})
+
+	err := fsm.handleRawRequest(ctx, &pb.Request{
+		ObservedRouteVersion: 1,
+		Mutations:            []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("z"), Value: []byte("proposed-before-floor")}},
+	}, 100)
+	require.NoError(t, err)
+
+	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("proposed-before-floor"), got)
 }

@@ -32,13 +32,13 @@ func TestValidateRawMutationRejectsReservedControlKeys(t *testing.T) {
 		[]byte("!migwrite|7"),
 		[]byte("!migfence|7"),
 	} {
-		err := f.validateRawMutationForApply(ctx, &pb.Mutation{Op: pb.Op_PUT, Key: key, Value: []byte("v")}, nil, 10)
+		err := f.validateRawMutationForApply(ctx, &pb.Mutation{Op: pb.Op_PUT, Key: key, Value: []byte("v")}, nil, 10, nil)
 		require.ErrorIs(t, err, ErrInvalidRequest, "key %q must be refused", key)
 	}
 
 	// Ordinary user keys are unaffected.
 	require.NoError(t, f.validateRawMutationForApply(ctx,
-		&pb.Mutation{Op: pb.Op_PUT, Key: []byte("user-key"), Value: []byte("v")}, nil, 10))
+		&pb.Mutation{Op: pb.Op_PUT, Key: []byte("user-key"), Value: []byte("v")}, nil, 10, nil))
 }
 
 // DEL_PREFIX never reaches validateRawMutationsForApply, so it is gated in
@@ -85,7 +85,7 @@ func TestValidateRawMutationRejectsStagedDataKeys(t *testing.T) {
 
 	staged := distribution.MigrationStagedDataKey(7, []byte("user-key"))
 	require.ErrorIs(t, f.validateRawMutationForApply(ctx,
-		&pb.Mutation{Op: pb.Op_PUT, Key: staged, Value: []byte("v")}, nil, 10), ErrInvalidRequest)
+		&pb.Mutation{Op: pb.Op_PUT, Key: staged, Value: []byte("v")}, nil, 10, nil), ErrInvalidRequest)
 	require.ErrorIs(t, f.handleDelPrefix(ctx, distribution.MigrationStagedDataKey(7, []byte("user:")), 11), ErrInvalidRequest)
 }
 
