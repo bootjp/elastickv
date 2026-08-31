@@ -73,24 +73,15 @@ func TestOnePhaseDedup_NoOpsWhenPriorAttemptLandedAsStagedVersion(t *testing.T) 
 	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	engine := distribution.NewEngine()
-	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
-		RouteID:                1,
-		Start:                  []byte("a"),
-		End:                    []byte("z"),
-		GroupID:                1,
-		State:                  distribution.RouteStateActive,
-		StagedVisibilityActive: true,
-		MigrationJobID:         9,
-	}})
-	fsmIface := NewKvFSMWithHLC(st, NewHLC(), WithRouteHistory(WrapDistributionEngine(engine), 1))
-	fsm, ok := fsmIface.(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	key := []byte("list-item")
 	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("v"), 20, 0))
 
-	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(30, 40, 20, key, []byte("v"))))
+	req := onePhaseReq(30, 40, 20, key, []byte("v"))
+	req.ReadKeys = [][]byte{distribution.MigrationStagedDataKey(9, key)}
+	require.NoError(t, applyFSMRequest(t, fsm, req))
 
 	at40, err := st.CommittedVersionAt(ctx, key, 40)
 	require.NoError(t, err)
@@ -104,26 +95,16 @@ func TestOnePhaseDedup_NoOpsWhenS3AuxiliaryPriorAttemptLandedAsStagedVersion(t *
 	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
-	engine := distribution.NewEngine()
 	const bucket = "bucket-a"
-	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{{
-		RouteID:                1,
-		Start:                  routeStart,
-		End:                    prefixScanEnd(routeStart),
-		GroupID:                1,
-		State:                  distribution.RouteStateActive,
-		StagedVisibilityActive: true,
-		MigrationJobID:         9,
-	}})
-	fsmIface := NewKvFSMWithHLC(st, NewHLC(), WithRouteHistory(WrapDistributionEngine(engine), 1))
-	fsm, ok := fsmIface.(*kvFSM)
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
 	key := s3keys.BucketMetaKey(bucket)
 	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("v"), 20, 0))
 
-	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(30, 40, 20, key, []byte("v"))))
+	req := onePhaseReq(30, 40, 20, key, []byte("v"))
+	req.ReadKeys = [][]byte{distribution.MigrationStagedDataKey(9, key)}
+	require.NoError(t, applyFSMRequest(t, fsm, req))
 
 	at40, err := st.CommittedVersionAt(ctx, key, 40)
 	require.NoError(t, err)

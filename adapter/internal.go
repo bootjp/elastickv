@@ -276,16 +276,14 @@ func (i *Internal) validateExportRangeVersionsRequest(req *pb.ExportRangeVersion
 	if req.GetKeyFamily() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export key_family is required"))
 	}
-	if exportRangeVersionsRequestFullyUnbounded(req) {
-		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires a raw or route bound"))
+	if exportRangeVersionsRequestRouteUnbounded(req) {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires route bounds"))
 	}
 	return nil
 }
 
-func exportRangeVersionsRequestFullyUnbounded(req *pb.ExportRangeVersionsRequest) bool {
-	return len(req.GetRangeStart()) == 0 &&
-		len(req.GetRangeEnd()) == 0 &&
-		len(req.GetRouteStart()) == 0 &&
+func exportRangeVersionsRequestRouteUnbounded(req *pb.ExportRangeVersionsRequest) bool {
+	return len(req.GetRouteStart()) == 0 &&
 		len(req.GetRouteEnd()) == 0
 }
 

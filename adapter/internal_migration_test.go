@@ -243,6 +243,16 @@ func TestInternalExportRangeVersionsRejectsUnboundedExport(t *testing.T) {
 	}, stream)
 	require.Error(t, err)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	stream = &captureExportRangeVersionsStream{ctx: context.Background()}
+	err = internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs: 20,
+		KeyFamily:   distribution.MigrationFamilyUser,
+		RangeStart:  []byte("a"),
+		RangeEnd:    []byte("b"),
+	}, stream)
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T) {
@@ -440,6 +450,8 @@ func TestInternalExportRangeVersionsUsesPartitionResolverGroup(t *testing.T) {
 	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
 		MaxCommitTs:     20,
 		KeyFamily:       distribution.MigrationFamilySQSPartitionedMessageData,
+		RouteStart:      []byte("!sqs|route|global"),
+		RouteEnd:        testPrefixScanEnd([]byte("!sqs|route|global")),
 		RangeStart:      prefix,
 		RangeEnd:        testPrefixScanEnd(prefix),
 		MaxScannedBytes: 1 << 20,
