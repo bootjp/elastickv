@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -460,6 +461,66 @@ func TestInternalExportRangeVersionsUsesPartitionResolverGroup(t *testing.T) {
 	require.Len(t, stream.responses, 1)
 	require.Equal(t, []*pb.MVCCVersion{
 		{Key: p1, CommitTs: 10, Value: []byte("p1"), KeyFamily: distribution.MigrationFamilySQSPartitionedMessageData},
+	}, stream.responses[0].GetVersions())
+}
+
+func TestInternalExportRangeVersionsDerivesFilesystemChunkScanBoundsFromRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	routeKey := fskeys.ChunkRouteKey(10, 20)
+	inRouteChunk := fskeys.ChunkKey(10, 20, 3)
+	outRouteChunk := fskeys.ChunkKey(10, 21, 3)
+	require.NoError(t, st.PutAt(ctx, inRouteChunk, []byte("chunk"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, outRouteChunk, []byte("skip"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      routeKey,
+		RouteEnd:        testPrefixScanEnd(routeKey),
+		KeyFamily:       distribution.MigrationFamilyFilesystemChunk,
+		RangeStart:      routeKey,
+		RangeEnd:        testPrefixScanEnd(routeKey),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: inRouteChunk, CommitTs: 10, Value: []byte("chunk"), KeyFamily: distribution.MigrationFamilyFilesystemChunk},
+	}, stream.responses[0].GetVersions())
+}
+
+func TestInternalExportRangeVersionsDerivesFilesystemUsageScanBoundsFromRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	routeKey := fskeys.ChunkRouteKey(10, 20)
+	inRouteUsage := fskeys.UsageRouteKey(routeKey)
+	outRouteUsage := fskeys.UsageRouteKey(fskeys.ChunkRouteKey(10, 21))
+	require.NoError(t, st.PutAt(ctx, inRouteUsage, []byte("usage"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, outRouteUsage, []byte("skip"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      routeKey,
+		RouteEnd:        testPrefixScanEnd(routeKey),
+		KeyFamily:       distribution.MigrationFamilyFilesystemUsage,
+		RangeStart:      routeKey,
+		RangeEnd:        testPrefixScanEnd(routeKey),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: inRouteUsage, CommitTs: 10, Value: []byte("usage"), KeyFamily: distribution.MigrationFamilyFilesystemUsage},
 	}, stream.responses[0].GetVersions())
 }
 

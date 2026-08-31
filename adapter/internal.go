@@ -8,6 +8,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -577,9 +578,10 @@ func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest
 		uint64(req.GetChunkBytes()), defaultMigrationExportChunkBytes, maxMigrationExportChunkBytes)
 	maxScannedBytes := clampMigrationExportBound(
 		req.GetMaxScannedBytes(), chunkBytes*defaultMigrationExportScanFactor, maxMigrationExportScanBytes)
+	startKey, endKey := migrationExportScanBounds(req)
 	opts := store.ExportVersionsOptions{
-		StartKey:             req.GetRangeStart(),
-		EndKey:               req.GetRangeEnd(),
+		StartKey:             startKey,
+		EndKey:               endKey,
 		MinCommitTSExclusive: req.GetMinCommitTs(),
 		MaxCommitTSInclusive: req.GetMaxCommitTs(),
 		Cursor:               req.GetCursor(),
@@ -591,6 +593,68 @@ func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest
 		AcceptVersion:        i.migrationExportVersionFilter(req),
 	}
 	return opts
+}
+
+func migrationExportScanBounds(req *pb.ExportRangeVersionsRequest) ([]byte, []byte) {
+	start := bytes.Clone(req.GetRangeStart())
+	end := bytes.Clone(req.GetRangeEnd())
+	switch req.GetKeyFamily() {
+	case distribution.MigrationFamilyFilesystemChunk:
+		if bytes.HasPrefix(start, fskeys.ChunkAllPrefix()) {
+			return start, end
+		}
+		if scanStart, scanEnd, ok := filesystemChunkExportScanBounds(req.GetRouteStart(), req.GetRouteEnd()); ok {
+			return scanStart, scanEnd
+		}
+		return fskeys.ChunkAllPrefix(), prefixScanEnd(fskeys.ChunkAllPrefix())
+	case distribution.MigrationFamilyFilesystemUsage:
+		if bytes.HasPrefix(start, fskeys.UsageRouteAllPrefix()) {
+			return start, end
+		}
+		return filesystemUsageExportScanBounds(req.GetRouteStart(), req.GetRouteEnd())
+	default:
+		return start, end
+	}
+}
+
+func filesystemChunkExportScanBounds(routeStart, routeEnd []byte) ([]byte, []byte, bool) {
+	routePrefix := fskeys.ChunkRouteAllPrefix()
+	routeDomainEnd := prefixScanEnd(routePrefix)
+	if !rangesIntersect(routeStart, routeEnd, routePrefix, routeDomainEnd) {
+		return fskeys.ChunkAllPrefix(), fskeys.ChunkAllPrefix(), true
+	}
+	rawPrefix := fskeys.ChunkAllPrefix()
+	rawDomainEnd := prefixScanEnd(rawPrefix)
+	start := rawPrefix
+	if len(routeStart) > 0 && bytes.Compare(routeStart, routePrefix) > 0 {
+		if !bytes.HasPrefix(routeStart, routePrefix) {
+			return nil, nil, false
+		}
+		start = append(bytes.Clone(rawPrefix), routeStart[len(routePrefix):]...)
+	}
+	end := rawDomainEnd
+	if len(routeEnd) > 0 && bytes.Compare(routeEnd, routeDomainEnd) < 0 {
+		if bytes.Compare(routeEnd, routePrefix) <= 0 {
+			return rawPrefix, rawPrefix, true
+		}
+		if !bytes.HasPrefix(routeEnd, routePrefix) {
+			return nil, nil, false
+		}
+		end = append(bytes.Clone(rawPrefix), routeEnd[len(routePrefix):]...)
+	}
+	return bytes.Clone(start), bytes.Clone(end), true
+}
+
+func filesystemUsageExportScanBounds(routeStart, routeEnd []byte) ([]byte, []byte) {
+	start := fskeys.UsageRouteAllPrefix()
+	if len(routeStart) > 0 {
+		start = fskeys.UsageRouteKey(routeStart)
+	}
+	end := prefixScanEnd(fskeys.UsageRouteAllPrefix())
+	if len(routeEnd) > 0 {
+		end = fskeys.UsageRouteKey(routeEnd)
+	}
+	return start, end
 }
 
 // clampMigrationExportBound resolves one export bound: unset takes the default,
@@ -628,10 +692,11 @@ func (i *Internal) migrationExportVersionFilter(req *pb.ExportRangeVersionsReque
 
 func migrationExportBracket(req *pb.ExportRangeVersionsRequest) distribution.MigrationBracket {
 	excludeKnownInternal := req.GetExcludeKnownInternal() || req.GetKeyFamily() == distribution.MigrationFamilyUser
+	start, end := migrationExportScanBounds(req)
 	return distribution.MigrationBracket{
 		Family:               req.GetKeyFamily(),
-		Start:                bytes.Clone(req.GetRangeStart()),
-		End:                  bytes.Clone(req.GetRangeEnd()),
+		Start:                start,
+		End:                  end,
 		ExcludeKnownInternal: excludeKnownInternal,
 		ExcludePrefixes:      cloneByteSlices(req.GetExcludePrefixes()),
 	}
