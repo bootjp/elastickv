@@ -1269,10 +1269,9 @@ func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
 	}
 	start, end, ok := s3BucketAuxiliaryRouteRange(key)
 	if ok {
-		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-			if route.State == distribution.RouteStateWriteFenced {
-				return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
-			}
+		route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
+		if found && route.State == distribution.RouteStateWriteFenced {
+			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
 		}
 		return nil
 	}
@@ -1383,13 +1382,12 @@ func (c *ShardedCoordinator) rejectS3BucketAuxiliaryWriteTimestampFloor(key []by
 	if !ok {
 		return false, nil
 	}
-	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
-			return true, errors.Join(
-				errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive),
-				store.NewWriteConflictError(key),
-			)
-		}
+	route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
+	if found && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+		return true, errors.Join(
+			errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive),
+			store.NewWriteConflictError(key),
+		)
 	}
 	return true, nil
 }

@@ -597,6 +597,37 @@ func TestShardedCoordinatorIgnoresRawRouteFenceForS3BucketAuxiliaryWrite(t *test
 	require.Len(t, g2Txn.requests, 1)
 }
 
+func TestShardedCoordinatorIgnoresNonOwnerS3BucketAuxiliaryFenceForPointWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliarySplitRoutes(bucket, 1, 2, 3)
+	routes[2].State = distribution.RouteStateWriteFenced
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  routes,
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 22}}}
+	g3Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+		3: {Txn: g3Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, g1Txn.requests)
+	require.Len(t, g2Txn.requests, 1)
+	require.Empty(t, g3Txn.requests)
+}
+
 func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteAtMigrationTimestampFloor(t *testing.T) {
 	t.Parallel()
 
@@ -631,6 +662,37 @@ func TestShardedCoordinatorRejectsS3BucketAuxiliaryPointWriteAtMigrationTimestam
 		require.Empty(t, g1Txn.requests, "coordinator must reject before proposing to the raw-key shard")
 		require.Empty(t, g2Txn.requests, "coordinator must reject before proposing to the floor-fenced shard")
 	}
+}
+
+func TestShardedCoordinatorIgnoresNonOwnerS3BucketAuxiliaryFloorForPointWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-b"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliarySplitRoutes(bucket, 1, 2, 3)
+	routes[2].MinWriteTSExclusive = ^uint64(0)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  routes,
+	}))
+
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 22}}}
+	g3Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+		3: {Txn: g3Txn},
+	}, 1, NewHLC(), nil)
+
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: key, Value: []byte("meta")}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, g1Txn.requests)
+	require.Len(t, g2Txn.requests, 1)
+	require.Empty(t, g3Txn.requests)
 }
 
 func TestShardedCoordinatorRejectsDelPrefixIntersectingWriteFencedRoute(t *testing.T) {

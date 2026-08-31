@@ -53,6 +53,18 @@ func s3BucketAuxiliaryFenceRoutes(bucket string, rawGroupID, fencedGroupID uint6
 	}
 }
 
+func s3BucketAuxiliarySplitRoutes(bucket string, rawGroupID, ownerGroupID, splitGroupID uint64) []distribution.RouteDescriptor {
+	start := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	split := append(append([]byte(nil), start...), 'm')
+	end := prefixScanEnd(start)
+	return []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: start, GroupID: rawGroupID, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: start, End: split, GroupID: ownerGroupID, State: distribution.RouteStateActive},
+		{RouteID: 3, Start: split, End: end, GroupID: splitGroupID, State: distribution.RouteStateActive},
+		{RouteID: 4, Start: end, End: nil, GroupID: rawGroupID, State: distribution.RouteStateActive},
+	}
+}
+
 func newS3BucketAuxiliaryWriteFencedFSM(t *testing.T, bucket string) *kvFSM {
 	t.Helper()
 
@@ -381,6 +393,30 @@ func TestFSMIgnoresRawRouteFenceForS3BucketAuxiliaryWrite(t *testing.T) {
 	require.NoError(t, err)
 }
 
+func TestFSMIgnoresNonOwnerS3BucketAuxiliaryFenceForPointWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliarySplitRoutes(bucket, 5, 1, 1)
+	routes[2].State = distribution.RouteStateWriteFenced
+	applyComposed1Snapshot(t, engine, 1, routes)
+
+	auxStart, auxEnd, ok := s3BucketAuxiliaryRouteRange(key)
+	require.True(t, ok)
+	auxRoutes := engine.GetIntersectingRoutes(auxStart, auxEnd)
+	require.Len(t, auxRoutes, 2)
+	require.Equal(t, distribution.RouteStateActive, auxRoutes[0].State)
+	require.Equal(t, distribution.RouteStateWriteFenced, auxRoutes[1].State)
+
+	fsm := newComposed1FSM(t, engine, 1)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("meta")}},
+	}, 100)
+	require.NoError(t, err)
+}
+
 func TestFSMComposed1UsesS3BucketAuxiliaryRouteOwner(t *testing.T) {
 	t.Parallel()
 
@@ -422,6 +458,30 @@ func TestFSMIgnoresRawRouteFloorForS3BucketAuxiliaryWrite(t *testing.T) {
 	auxRoutes := engine.GetIntersectingRoutes(auxStart, auxEnd)
 	require.NotEmpty(t, auxRoutes)
 	require.Zero(t, auxRoutes[0].MinWriteTSExclusive)
+
+	fsm := newComposed1FSM(t, engine, 1)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("meta")}},
+	}, 100)
+	require.NoError(t, err)
+}
+
+func TestFSMIgnoresNonOwnerS3BucketAuxiliaryFloorForPointWrite(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-b"
+	key := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	routes := s3BucketAuxiliarySplitRoutes(bucket, 1, 1, 1)
+	routes[2].MinWriteTSExclusive = ^uint64(0)
+	applyComposed1Snapshot(t, engine, 1, routes)
+
+	auxStart, auxEnd, ok := s3BucketAuxiliaryRouteRange(key)
+	require.True(t, ok)
+	auxRoutes := engine.GetIntersectingRoutes(auxStart, auxEnd)
+	require.Len(t, auxRoutes, 2)
+	require.Zero(t, auxRoutes[0].MinWriteTSExclusive)
+	require.Equal(t, ^uint64(0), auxRoutes[1].MinWriteTSExclusive)
 
 	fsm := newComposed1FSM(t, engine, 1)
 	err := fsm.handleRawRequest(context.Background(), &pb.Request{

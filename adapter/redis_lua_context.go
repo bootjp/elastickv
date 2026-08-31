@@ -3808,11 +3808,18 @@ func (c *luaScriptContext) rawStartTypeForCommitPlan(ctx context.Context, key []
 	if err != nil {
 		return redisTypeNone, err
 	}
+	c.rememberRawTypeAtStart(k, typ)
+	return typ, nil
+}
+
+func (c *luaScriptContext) rememberRawTypeAtStart(key string, typ redisValueType) {
 	if c.rawTypeAtStart == nil {
 		c.rawTypeAtStart = map[string]redisValueType{}
 	}
-	c.rawTypeAtStart[k] = typ
-	return typ, nil
+	if _, ok := c.rawTypeAtStart[key]; !ok && len(c.rawTypeAtStart) >= maxNegativeTypeCacheEntries {
+		return
+	}
+	c.rawTypeAtStart[key] = typ
 }
 
 func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType, preserveExisting bool) [][]byte {

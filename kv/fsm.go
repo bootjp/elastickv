@@ -695,7 +695,8 @@ func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
 		return nil
 	}
 	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
-		if snap.WriteFencedIntersects(start, end) {
+		route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, snap.IntersectingRoutes(start, end))
+		if found && route.State == distribution.RouteStateWriteFenced {
 			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
 		}
 		return nil
@@ -731,10 +732,9 @@ func (f *kvFSM) verifyRouteWriteTimestampFloorForKey(key []byte, commitTS uint64
 		return nil
 	}
 	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
-		for _, route := range snap.IntersectingRoutes(start, end) {
-			if err := verifyRouteWriteTimestampFloorForRange(route, key, start, end, commitTS); err != nil {
-				return err
-			}
+		route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, snap.IntersectingRoutes(start, end))
+		if found {
+			return verifyRouteWriteTimestampFloorForRange(route, key, start, end, commitTS)
 		}
 		return nil
 	}
@@ -1186,13 +1186,8 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys
 		if _, ok := bypassKeys[string(mut.Key)]; ok {
 			continue
 		}
-		if start, end, ok := s3BucketAuxiliaryRouteRange(mut.Key); ok {
-			if snap.WriteFencedIntersects(start, end) {
-				return errors.Wrapf(ErrRouteWriteFenced,
-					"%s-version v=%d: key %q route range [%q,%q)",
-					phase, snapVer, mut.Key, start, end)
-			}
-			continue
+		if checked, err := verifyS3BucketAuxiliaryWriteFenceFromSnapshot(mut.Key, snap, snapVer, phase); checked || err != nil {
+			return err
 		}
 		rKey := routeKey(mut.Key)
 		if snap.WriteFencedForKey(rKey) {
@@ -1202,6 +1197,20 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys
 		}
 	}
 	return nil
+}
+
+func verifyS3BucketAuxiliaryWriteFenceFromSnapshot(key []byte, snap RouteSnapshot, snapVer uint64, phase string) (bool, error) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return false, nil
+	}
+	route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, snap.IntersectingRoutes(start, end))
+	if found && route.State == distribution.RouteStateWriteFenced {
+		return true, errors.Wrapf(ErrRouteWriteFenced,
+			"%s-version v=%d: key %q route range [%q,%q)",
+			phase, snapVer, key, start, end)
+	}
+	return true, nil
 }
 
 func writeFenceBypassKeySet(keys [][]byte) map[string]struct{} {
