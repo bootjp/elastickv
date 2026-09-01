@@ -150,6 +150,33 @@ func TestInternalExportRangeVersionsUsesStoreAndRouteFilter(t *testing.T) {
 	}, stream.responses[0].GetVersions())
 }
 
+func TestInternalExportRangeVersionsExcludesPeerLocalChunkBlobsFromUserFamily(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	var digest [32]byte
+	digest[0] = 0xab
+	blobKey := s3keys.ChunkBlobKey(digest)
+	require.NoError(t, st.PutAt(ctx, blobKey, []byte("peer-local"), 10, 0))
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      []byte(s3keys.ChunkBlobPrefix),
+		RouteEnd:        []byte("!s4|"),
+		KeyFamily:       distribution.MigrationFamilyUser,
+		RangeStart:      []byte(s3keys.ChunkBlobPrefix),
+		RangeEnd:        testPrefixScanEnd([]byte(s3keys.ChunkBlobPrefix)),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.True(t, stream.responses[0].GetDone())
+	require.Empty(t, stream.responses[0].GetVersions())
+}
+
 func TestInternalExportRangeVersionsUsesValueAwareLegacyListDeltaRouteFilter(t *testing.T) {
 	t.Parallel()
 
