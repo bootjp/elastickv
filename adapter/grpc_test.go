@@ -894,6 +894,49 @@ func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
 	require.Equal(t, []byte("z"), st.scanEnd)
 }
 
+func TestGRPCServer_RawScanAt_KeysOnlyExplicitGroupMergesStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	group := &kvstore.ShardGroup{Store: store.NewMVCCStore()}
+	shards := kvstore.NewShardStore(engine, map[uint64]*kvstore.ShardGroup{1: group})
+	t.Cleanup(func() { require.NoError(t, shards.Close()) })
+
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-b"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("c")), []byte("staged-c"), 30, 0))
+
+	s := NewGRPCServer(shards, nil)
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       35,
+		GroupId:  1,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []*pb.RawKVPair{
+		{Key: []byte("b")},
+		{Key: []byte("c")},
+	}, resp.GetKv())
+}
+
 func TestGRPCServer_RawScanAt_ReverseKeysOnlyUsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 

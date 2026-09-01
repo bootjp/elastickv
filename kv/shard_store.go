@@ -797,7 +797,7 @@ func (s *ShardStore) ScanKeysAtWithReadFence(ctx context.Context, start []byte, 
 		return keysFromKVs(kvs), nil
 	}
 	if groupID != 0 {
-		return s.scanKeyRouteAtWithReadFence(ctx, distribution.Route{GroupID: groupID}, start, end, limit, ts, true, readRouteVersion)
+		return s.scanExplicitGroupKeysAtWithReadFence(ctx, groupID, start, end, limit, ts, readRouteVersion, nil, nil)
 	}
 
 	routes, clampToRoutes, routeVersion := s.routesForScanWithVersion(start, end)
@@ -1703,7 +1703,7 @@ func filesystemChunkScanOverlap(start []byte, end []byte) ([]byte, []byte, bool)
 
 func (s *ShardStore) scanKeyRoutesAtWithReadFence(ctx context.Context, routes []distribution.Route, start []byte, end []byte, limit int, ts uint64, clampToRoutes bool, readRouteVersion uint64) ([][]byte, error) {
 	out := make([][]byte, 0)
-	seenGroups := make(map[uint64]struct{})
+	seenRoutes := make(map[repeatedRawScanRouteKey]struct{})
 	filterUsageOwners := !clampToRoutes && filesystemUsageScanOverlap(start, end)
 	for _, route := range routes {
 		scanStart := start
@@ -1712,10 +1712,11 @@ func (s *ShardStore) scanKeyRoutesAtWithReadFence(ctx context.Context, routes []
 			scanStart = clampScanStart(start, route.Start)
 			scanEnd = clampScanEnd(end, route.End)
 		} else {
-			if _, seen := seenGroups[route.GroupID]; seen {
+			dedupeKey := repeatedRawScanRouteDedupeKey(route)
+			if _, seen := seenRoutes[dedupeKey]; seen {
 				continue
 			}
-			seenGroups[route.GroupID] = struct{}{}
+			seenRoutes[dedupeKey] = struct{}{}
 		}
 
 		var keys [][]byte
@@ -1740,6 +1741,20 @@ func (s *ShardStore) scanKeyRoutesAtWithReadFence(ctx context.Context, routes []
 		out = mergeAndTrimScanKeys(out, keys, limit)
 	}
 	return out, nil
+}
+
+func (s *ShardStore) scanExplicitGroupKeysAtWithReadFence(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([][]byte, error) {
+	if limit <= 0 {
+		return [][]byte{}, nil
+	}
+	routes, clampToRoutes, err := s.routesForExplicitGroupScanWithRouteBounds(groupID, start, end, routeStart, routeEnd)
+	if err != nil {
+		return nil, err
+	}
+	if !clampToRoutes && !routeScanBoundsPresent(routeStart, routeEnd) {
+		routes, _ = prepareUnclampedRawScanRoutes(routes, false)
+	}
+	return s.scanKeyRoutesAtWithReadFence(ctx, routes, start, end, limit, ts, clampToRoutes, readRouteVersion)
 }
 
 func (s *ShardStore) filterFilesystemUsageKVsForGroup(kvs []*store.KVPair, groupID uint64) []*store.KVPair {

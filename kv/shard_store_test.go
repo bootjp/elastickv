@@ -872,6 +872,10 @@ func TestShardStoreExplicitGroupReads_MergeStagedVisibility(t *testing.T) {
 		{Key: []byte("c"), Value: []byte("staged-c")},
 	}, kvs)
 
+	keys, err := st.ScanKeysAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 35, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("b"), []byte("c")}, keys)
+
 	kvs, err = st.ReverseScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 35)
 	require.NoError(t, err)
 	require.Equal(t, []*store.KVPair{
