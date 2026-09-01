@@ -1221,6 +1221,41 @@ func (s *recordingVersionPresenceStore) VersionExistsAtOrBeforeGroupWithReadFenc
 	return s.visible, s.supported, nil
 }
 
+type recordingVersionPresenceBatchStore struct {
+	store.MVCCStore
+
+	visible              map[string]bool
+	supported            bool
+	calls                int
+	lastKeys             [][]byte
+	lastGroup            uint64
+	lastTS               uint64
+	lastReadRouteVersion uint64
+}
+
+func cloneBytes2D(keys [][]byte) [][]byte {
+	out := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, append([]byte(nil), key...))
+	}
+	return out
+}
+
+func (s *recordingVersionPresenceBatchStore) VersionsExistAtOrBeforeGroupWithReadFence(
+	_ context.Context, keys [][]byte, groupID uint64, ts uint64, readRouteVersion uint64,
+) ([]bool, bool, error) {
+	s.calls++
+	s.lastKeys = cloneBytes2D(keys)
+	s.lastGroup = groupID
+	s.lastTS = ts
+	s.lastReadRouteVersion = readRouteVersion
+	out := make([]bool, len(keys))
+	for i, key := range keys {
+		out[i] = s.visible[string(key)]
+	}
+	return out, s.supported, nil
+}
+
 // version_visible_at_ts is optional: only a request that asks gets an answer,
 // and a store that cannot answer must not look like "no version exists".
 func TestGRPCServer_RawLatestCommitTS_VersionVisibleProbe(t *testing.T) {
@@ -1296,4 +1331,55 @@ func TestGRPCServer_RawLatestCommitTS_VersionVisibleProbe(t *testing.T) {
 			require.Equal(t, tt.visibleAtTS, st.lastTS)
 		})
 	}
+}
+
+func TestGRPCServer_RawLatestCommitTS_BatchVersionVisibleProbe(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingVersionPresenceBatchStore{
+		MVCCStore: store.NewMVCCStore(),
+		visible:   map[string]bool{"a": true, "b": false},
+		supported: true,
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{
+		KeyBatch:           pb.EncodeRawLatestCommitTSKeyBatch([][]byte{[]byte("a"), []byte("b")}),
+		GroupId:            42,
+		ReadRouteVersion:   77,
+		VersionVisibleAtTs: 100,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []bool{true, false}, resp.GetVersionVisibleResults())
+	require.True(t, resp.GetVersionVisibleSupported())
+	require.Equal(t, 1, st.calls)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, st.lastKeys)
+	require.Equal(t, uint64(42), st.lastGroup)
+	require.Equal(t, uint64(100), st.lastTS)
+	require.Equal(t, uint64(77), st.lastReadRouteVersion)
+}
+
+func TestGRPCServer_RawLatestCommitTS_RejectsOversizedBatchBeforeProbe(t *testing.T) {
+	t.Parallel()
+
+	keys := make([][]byte, maxGRPCScanLimit+1)
+	for i := range keys {
+		keys[i] = []byte("k")
+	}
+	st := &recordingVersionPresenceBatchStore{
+		MVCCStore: store.NewMVCCStore(),
+		visible:   map[string]bool{},
+		supported: true,
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{
+		KeyBatch:           pb.EncodeRawLatestCommitTSKeyBatch(keys),
+		VersionVisibleAtTs: 100,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Zero(t, st.calls)
 }

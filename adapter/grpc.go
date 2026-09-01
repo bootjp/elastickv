@@ -194,7 +194,7 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 		return nil, err
 	}
 	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
-	if len(req.GetKeys()) > 0 {
+	if len(req.GetKeyBatch()) > 0 {
 		visible, visibleSupported, err := r.rawVersionsVisibleAt(ctx, req, readRouteVersion)
 		if err != nil {
 			return nil, errors.WithStack(err)
@@ -252,7 +252,10 @@ func (r *GRPCServer) rawLatestCommitTSSingle(ctx context.Context, req *pb.RawLat
 }
 
 func (r *GRPCServer) rawVersionsVisibleAt(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) ([]bool, bool, error) {
-	keys := req.GetKeys()
+	keys, err := pb.DecodeRawLatestCommitTSKeyBatch(req.GetKeyBatch(), maxGRPCScanLimit)
+	if err != nil {
+		return nil, false, errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
+	}
 	out := make([]bool, len(keys))
 	at := req.GetVersionVisibleAtTs()
 	if at == 0 {

@@ -2608,7 +2608,7 @@ func (s *ShardStore) routeHasVersionsAtOrBeforeRemote(
 	rpcCtx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
 	defer cancel()
 	resp, err := cli.RawLatestCommitTS(rpcCtx, &pb.RawLatestCommitTSRequest{
-		Keys:               cloneKeyBatch(keys),
+		KeyBatch:           pb.EncodeRawLatestCommitTSKeyBatch(keys),
 		ReadRouteVersion:   readRouteVersion,
 		GroupId:            route.GroupID,
 		VersionVisibleAtTs: ts,
@@ -2644,14 +2644,6 @@ func (s *ShardStore) routeVersionPresenceClient(route distribution.Route) (pb.Ra
 		return nil, false, err
 	}
 	return pb.NewRawKVClient(conn), true, nil
-}
-
-func cloneKeyBatch(keys [][]byte) [][]byte {
-	out := make([][]byte, 0, len(keys))
-	for _, key := range keys {
-		out = append(out, bytes.Clone(key))
-	}
-	return out
 }
 
 func routeMatchesS3BucketAuxiliaryOwner(route distribution.Route, owner distribution.Route) bool {

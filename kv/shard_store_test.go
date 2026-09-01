@@ -673,12 +673,16 @@ func (s *versionVisibleRawKVServer) RawLatestCommitTS(_ context.Context, req *pb
 	defer s.mu.Unlock()
 	s.latestReqs = append(s.latestReqs, &pb.RawLatestCommitTSRequest{
 		Key:                bytes.Clone(req.GetKey()),
-		Keys:               cloneKeyBatch(req.GetKeys()),
+		KeyBatch:           bytes.Clone(req.GetKeyBatch()),
 		GroupId:            req.GetGroupId(),
 		ReadRouteVersion:   req.GetReadRouteVersion(),
 		VersionVisibleAtTs: req.GetVersionVisibleAtTs(),
 	})
-	if keys := req.GetKeys(); len(keys) > 0 {
+	keys, err := pb.DecodeRawLatestCommitTSKeyBatch(req.GetKeyBatch(), store.MaxDeltaScanLimit+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) > 0 {
 		results := make([]bool, len(keys))
 		for i, key := range keys {
 			results[i] = s.visible[string(key)]
@@ -736,7 +740,9 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testi
 	// through to staged anyway, and that pair is what a concurrent promotion
 	// slips between.
 	require.Len(t, probe.latestReqs, 1)
-	require.Equal(t, [][]byte{stagedKey}, probe.latestReqs[0].GetKeys())
+	keys, err := pb.DecodeRawLatestCommitTSKeyBatch(probe.latestReqs[0].GetKeyBatch(), store.MaxDeltaScanLimit+1)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{stagedKey}, keys)
 	for _, req := range probe.latestReqs {
 		require.Equal(t, uint64(2), req.GetGroupId())
 		require.Equal(t, uint64(77), req.GetReadRouteVersion())
@@ -792,11 +798,13 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeBatchesFollowerChecks(t *testing.T
 	require.Equal(t, uint64(2), probe.latestReqs[0].GetGroupId())
 	require.Equal(t, uint64(77), probe.latestReqs[0].GetReadRouteVersion())
 	require.Equal(t, uint64(30), probe.latestReqs[0].GetVersionVisibleAtTs())
+	decodedKeys, err := pb.DecodeRawLatestCommitTSKeyBatch(probe.latestReqs[0].GetKeyBatch(), store.MaxDeltaScanLimit+1)
+	require.NoError(t, err)
 	require.Equal(t, [][]byte{
 		distribution.MigrationStagedDataKey(9, keys[0]),
 		distribution.MigrationStagedDataKey(9, keys[1]),
 		distribution.MigrationStagedDataKey(9, keys[2]),
-	}, probe.latestReqs[0].GetKeys())
+	}, decodedKeys)
 }
 
 func TestShardStoreS3BucketAuxiliaryOwnerProbeFailsWhenLeaderUnavailable(t *testing.T) {

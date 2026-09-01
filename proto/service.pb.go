@@ -413,10 +413,10 @@ type RawLatestCommitTSRequest struct {
 	// below this timestamp. Comparing only `ts` cannot tell a tombstone at or
 	// before the read timestamp apart from a newer version above it.
 	VersionVisibleAtTs uint64 `protobuf:"varint,4,opt,name=version_visible_at_ts,json=versionVisibleAtTs,proto3" json:"version_visible_at_ts,omitempty"`
-	// Optional batch form for version_visible_at_ts probes. Used by routed scan
-	// filters to avoid issuing one leader RPC per candidate key. The response
-	// carries version_visible_results in the same order.
-	Keys          [][]byte `protobuf:"bytes,5,rep,name=keys,proto3" json:"keys,omitempty"`
+	// Optional batch form for version_visible_at_ts probes. Encoded as a single
+	// bounded key_batch blob so untrusted clients cannot expand one request into
+	// an unbounded repeated-bytes slice before the service enforces page limits.
+	KeyBatch      []byte `protobuf:"bytes,5,opt,name=key_batch,json=keyBatch,proto3" json:"key_batch,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -479,9 +479,9 @@ func (x *RawLatestCommitTSRequest) GetVersionVisibleAtTs() uint64 {
 	return 0
 }
 
-func (x *RawLatestCommitTSRequest) GetKeys() [][]byte {
+func (x *RawLatestCommitTSRequest) GetKeyBatch() []byte {
 	if x != nil {
-		return x.Keys
+		return x.KeyBatch
 	}
 	return nil
 }
@@ -2612,13 +2612,13 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xbc\x01\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xc5\x01\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
 	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\x12\x19\n" +
 	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x121\n" +
-	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\x12\x12\n" +
-	"\x04keys\x18\x05 \x03(\fR\x04keys\"\xe0\x01\n" +
+	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\x12\x1b\n" +
+	"\tkey_batch\x18\x05 \x01(\fR\bkeyBatch\"\xe0\x01\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
 	"\x06exists\x18\x02 \x01(\bR\x06exists\x12'\n" +
