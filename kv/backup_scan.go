@@ -586,7 +586,25 @@ func (s *ShardStore) routeForRoutedKey(item routedScanKey, routes []distribution
 	if item.partitionOnly {
 		return distribution.Route{}, false, nil
 	}
+	if route, ok, handled := s3BucketAuxiliaryBackupRouteForRoutedKey(item, routes); handled {
+		return route, ok, nil
+	}
 	return byteRangeRouteForRoutedKey(item, routes)
+}
+
+func s3BucketAuxiliaryBackupRouteForRoutedKey(item routedScanKey, routes []distribution.Route) (distribution.Route, bool, bool) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(item.key)
+	if !ok {
+		return distribution.Route{}, false, false
+	}
+	owner, ok := s3BucketAuxiliaryOwnerRouteFromRange(start, end, routes)
+	if !ok {
+		return distribution.Route{}, false, false
+	}
+	if owner.GroupID != item.route.GroupID {
+		return distribution.Route{}, false, true
+	}
+	return owner, true, true
 }
 
 func (s *ShardStore) partitionRouteForRoutedKey(item routedScanKey) (distribution.Route, bool, bool, error) {
