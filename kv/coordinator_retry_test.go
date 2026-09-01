@@ -40,7 +40,8 @@ func (stubLeaderEngine) Status() raftengine.Status {
 func (stubLeaderEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
-func (stubLeaderEngine) Close() error { return nil }
+func (stubLeaderEngine) SnapshotEvery() uint64 { return 10_000 }
+func (stubLeaderEngine) Close() error          { return nil }
 
 // scriptedTransactional returns the error registered in errs for the
 // 0-indexed call that triggered Commit; calls without a registered
@@ -97,7 +98,8 @@ func TestIsTransientLeaderError_Classification(t *testing.T) {
 			fmt.Errorf("rpc error: code = Unknown desc = raft engine: leadership lost"), true},
 		{"unrelated error", errors.New("write conflict"), false},
 		{"validation error", errors.New("invalid request"), false},
-		// Codex P2 regression: before the HasSuffix switch this was
+		{"leader proxy circuit open", cerrors.WithStack(ErrLeaderProxyCircuitOpen), false},
+		// P2 regression: before the HasSuffix switch this was
 		// misclassified as transient because the substring matcher
 		// saw "not leader" in the middle. store.WriteConflictError
 		// literally formats as "key: <user-key>: write conflict",
@@ -115,6 +117,12 @@ func TestIsTransientLeaderError_Classification(t *testing.T) {
 			require.Equal(t, tc.want, isTransientLeaderError(tc.err))
 		})
 	}
+}
+
+func TestShouldRetryDispatchDoesNotRetryLeaderProxyCircuitOpen(t *testing.T) {
+	t.Parallel()
+
+	require.False(t, shouldRetryDispatch(cerrors.WithStack(ErrLeaderProxyCircuitOpen)))
 }
 
 // newRetryCoordinate wires a Coordinate against stubLeaderEngine and the
@@ -303,7 +311,7 @@ func TestIsTransientLeaderError_PinsRealSentinels(t *testing.T) {
 }
 
 // TestFinalDispatchErr_PrefersTransientOnBudgetExpiry pins the
-// Codex-P2 fix: when Dispatch's bounded retry budget fires
+// P2 fix: when Dispatch's bounded retry budget fires
 // mid-attempt, dispatchOnce returns a context.DeadlineExceeded
 // propagated from boundedCtx rather than a genuine failure. The
 // gRPC caller should see the last transient leader error collected

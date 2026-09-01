@@ -33,7 +33,7 @@ func (r *RedisServer) proxyDel(keys [][]byte) (int64, error) {
 	// Group keys by leader Redis address.
 	byAddr := make(map[string][]string)
 	for _, k := range keys {
-		leader := r.coordinator.RaftLeaderForKey(k)
+		leader := r.coordinator.RaftLeaderForKey(redisUserRouteKey(k))
 		if leader == "" {
 			return 0, ErrLeaderNotFound
 		}

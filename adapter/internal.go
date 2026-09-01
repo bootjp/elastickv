@@ -8,13 +8,46 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type InternalOption func(*Internal)
 
+// WithInternalWriteGate re-applies the coordinator's route-floor check to
+// writes that were forwarded here from a follower.
+func WithInternalWriteGate(gate kv.MutationWriteGate) InternalOption {
+	return func(i *Internal) {
+		i.writeGate = gate
+	}
+}
+
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
 	return func(i *Internal) {
 		i.tsAllocator = alloc
+	}
+}
+
+func WithInternalAdminProposer(proposer raftengine.Proposer) InternalOption {
+	return func(i *Internal) {
+		i.adminProposer = proposer
+	}
+}
+
+func WithInternalLastCommitTimestamp(reader func() uint64) InternalOption {
+	return func(i *Internal) {
+		i.lastCommitTimestamp = reader
+	}
+}
+
+// ForwardWriteObserver observes successfully committed leader-side forwarded
+// writes. It lets the autosplit sampler account for writes that entered through
+// followers without coupling adapter.Internal to keyviz.
+type ForwardWriteObserver func([]*pb.Request)
+
+func WithInternalForwardWriteObserver(observer ForwardWriteObserver) InternalOption {
+	return func(i *Internal) {
+		i.forwardWriteObserver = observer
 	}
 }
 
@@ -32,11 +65,15 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader             raftengine.LeaderView
-	transactionManager kv.Transactional
-	clock              *kv.HLC
-	tsAllocator        kv.TimestampAllocator
-	relay              *RedisPubSubRelay
+	leader               raftengine.LeaderView
+	transactionManager   kv.Transactional
+	clock                *kv.HLC
+	tsAllocator          kv.TimestampAllocator
+	adminProposer        raftengine.Proposer
+	lastCommitTimestamp  func() uint64
+	relay                *RedisPubSubRelay
+	writeGate            kv.MutationWriteGate
+	forwardWriteObserver ForwardWriteObserver
 
 	pb.UnimplementedInternalServer
 }
@@ -70,12 +107,72 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 			CommitIndex: 0,
 		}, errors.WithStack(err)
 	}
+	if i.forwardWriteObserver != nil {
+		i.forwardWriteObserver(req.GetRequests())
+	}
 
 	return &pb.ForwardResponse{
 		Success:     true,
 		CommitIndex: r.CommitIndex,
 		CommitTs:    commitTS,
 	}, nil
+}
+
+func (i *Internal) ForwardAdminProposal(
+	ctx context.Context,
+	req *pb.ForwardAdminProposalRequest,
+) (*pb.ForwardAdminProposalResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if err := i.leader.VerifyLeader(ctx); err != nil {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if i.adminProposer == nil {
+		return nil, errors.New("admin proposer is unavailable")
+	}
+	result, err := i.adminProposer.ProposeAdmin(ctx, req.GetPayload())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := forwardedAdminProposalResponseError(result); err != nil {
+		return nil, err
+	}
+	return &pb.ForwardAdminProposalResponse{CommitIndex: result.CommitIndex}, nil
+}
+
+func (i *Internal) ForwardLeaseRead(
+	ctx context.Context,
+	_ *pb.ForwardLeaseReadRequest,
+) (*pb.ForwardLeaseReadResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	index, err := i.leader.LinearizableRead(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	lastCommitTS := uint64(0)
+	if i.lastCommitTimestamp != nil {
+		lastCommitTS = i.lastCommitTimestamp()
+	}
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: index, LastCommitTs: lastCommitTS}, nil
+}
+
+func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) error {
+	if result == nil {
+		return errors.New("admin proposal returned nil result")
+	}
+	if result.Response == nil {
+		return nil
+	}
+	if err, ok := result.Response.(error); ok {
+		if errors.Is(err, kv.ErrTooManyActiveBackups) {
+			return status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
+		}
+		return errors.WithStack(err)
+	}
+	return errors.Errorf("unexpected admin proposal response %T", result.Response)
 }
 
 func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) (*pb.RelayPublishResponse, error) {
@@ -162,16 +259,32 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 		if r == nil {
 			continue
 		}
-		if r.Ts != 0 {
-			continue
+		if r.Ts == 0 {
+			ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
+			if err != nil {
+				return err
+			}
+			r.Ts = ts
 		}
-		ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
-		if err != nil {
+		// The follower that forwarded this write could not run the route-floor
+		// check: its own stamping path bails out when the group engine is not
+		// leader, so the timestamp only exists once we assign it here. Without
+		// this the write would reach Raft through the bare TransactionManager
+		// below with no MinWriteTSExclusive check at all. Already-stamped
+		// requests are re-checked too, because the floor may have advanced
+		// since the sender stamped them.
+		if err := i.ensureRawWriteAllowed(r); err != nil {
 			return err
 		}
-		r.Ts = ts
 	}
 	return nil
+}
+
+func (i *Internal) ensureRawWriteAllowed(r *pb.Request) error {
+	if i.writeGate == nil || r == nil {
+		return nil
+	}
+	return errors.WithStack(i.writeGate.EnsureMutationsWriteAllowed(r.Mutations, r.Ts))
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {
@@ -194,7 +307,48 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 		}
 	}
 
-	return i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	commitTS, err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
+	if err != nil {
+		return 0, err
+	}
+	if err := i.ensureTxnWritesAllowed(reqs, commitTS); err != nil {
+		return 0, err
+	}
+	return commitTS, nil
+}
+
+func (i *Internal) ensureTxnWritesAllowed(reqs []*pb.Request, commitTS uint64) error {
+	if i.writeGate == nil || commitTS == 0 {
+		return nil
+	}
+	for _, r := range reqs {
+		if r == nil || !r.IsTxn {
+			continue
+		}
+		if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE {
+			continue
+		}
+		muts := forwardedTxnUserMutations(r.Mutations)
+		if len(muts) == 0 {
+			continue
+		}
+		if err := i.writeGate.EnsureMutationsWriteAllowed(muts, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func forwardedTxnUserMutations(muts []*pb.Mutation) []*pb.Mutation {
+	out := make([]*pb.Mutation, 0, len(muts))
+	metaPrefix := []byte(kv.TxnMetaPrefix)
+	for _, mut := range muts {
+		if mut == nil || bytes.HasPrefix(mut.Key, metaPrefix) {
+			continue
+		}
+		out = append(out, mut)
+	}
+	return out
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {

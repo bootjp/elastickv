@@ -38,7 +38,7 @@ func startS3Server(
 	s3Server, _, err := prepareS3Server(
 		ctx, lc, s3Addr, shardStore, coordinate, leaderS3, region,
 		credentialsFile, pathStyleOnly, readTracker, putAdmissionObserver,
-		blobOffloadObserver,
+		blobOffloadObserver, nil,
 	)
 	if err != nil {
 		return nil, err
@@ -60,10 +60,11 @@ func prepareS3Server(
 	readTracker *kv.ActiveTimestampTracker,
 	putAdmissionObserver adapter.S3PutAdmissionObserver,
 	blobOffloadObserver adapter.S3BlobOffloadObserver,
+	blobBackfiller *adapter.S3BlobBackfiller,
 ) (*adapter.S3Server, net.Listener, error) {
 	s3Server, err := newS3Server(
 		s3Addr, shardStore, coordinate, leaderS3, region, credentialsFile,
-		pathStyleOnly, readTracker, putAdmissionObserver, blobOffloadObserver, nil, nil,
+		pathStyleOnly, readTracker, putAdmissionObserver, blobOffloadObserver, nil, nil, blobBackfiller,
 	)
 	if err != nil {
 		return nil, nil, err
@@ -88,19 +89,21 @@ func newS3Server(
 	blobOffloadObserver adapter.S3BlobOffloadObserver,
 	blobCluster adapter.S3BlobCluster,
 	blobPushBlocked func() bool,
+	blobBackfiller *adapter.S3BlobBackfiller,
 ) (*adapter.S3Server, error) {
 	s3Addr = strings.TrimSpace(s3Addr)
-	if s3Addr == "" {
+	peerOnly := s3Addr == "" && blobCluster != nil && blobBackfiller != nil
+	if s3Addr == "" && !peerOnly {
 		// (nil, nil) is the explicit "S3 disabled" signal — the empty
 		// flag value is a valid configuration, not an error. The
 		// nilnil linter is not enabled in .golangci.yaml so no
 		// suppression directive is needed.
 		return nil, nil
 	}
-	if !pathStyleOnly {
+	if s3Addr != "" && !pathStyleOnly {
 		return nil, errors.New("virtual-hosted style S3 requests are not implemented")
 	}
-	staticCreds, err := loadS3StaticCredentials(credentialsFile)
+	staticCreds, err := loadS3StaticCredentialsForAddress(s3Addr, credentialsFile)
 	if err != nil {
 		return nil, err
 	}
@@ -116,6 +119,7 @@ func newS3Server(
 		adapter.WithS3BlobOffloadObserver(blobOffloadObserver),
 		adapter.WithS3BlobMinReplicas(minReplicas),
 		adapter.WithS3BlobPushBlocked(blobPushBlocked),
+		adapter.WithS3BlobBackfiller(blobBackfiller),
 	}
 	if blobCluster != nil {
 		options = append(options, adapter.WithS3BlobCluster(blobCluster))
@@ -158,6 +162,11 @@ func runS3Server(ctx context.Context, eg *errgroup.Group, s3Server *adapter.S3Se
 		return nil
 	})
 	eg.Go(func() error {
+		if err := s3Server.StartBlobBackfill(ctx); err != nil {
+			s3Server.Stop()
+			runDoneCancel()
+			return errors.WithStack(err)
+		}
 		err := s3Server.Run()
 		runDoneCancel()
 		if err == nil || errors.Is(err, net.ErrClosed) {
@@ -165,6 +174,32 @@ func runS3Server(ctx context.Context, eg *errgroup.Group, s3Server *adapter.S3Se
 		}
 		return errors.WithStack(err)
 	})
+}
+
+func runS3BlobBackfillOnly(ctx context.Context, eg *errgroup.Group, s3Server *adapter.S3Server) {
+	if s3Server == nil {
+		return
+	}
+	eg.Go(func() error {
+		if err := s3Server.StartBlobBackfill(ctx); err != nil {
+			s3Server.Stop()
+			return errors.WithStack(err)
+		}
+		<-ctx.Done()
+		s3Server.Stop()
+		return nil
+	})
+}
+
+func s3BlobNodeEnabled(s3Address, peerTokenFile string) bool {
+	return strings.TrimSpace(s3Address) != "" || strings.TrimSpace(peerTokenFile) != ""
+}
+
+func loadS3StaticCredentialsForAddress(s3Address, credentialsFile string) (map[string]string, error) {
+	if s3Address == "" {
+		return nil, nil
+	}
+	return loadS3StaticCredentials(credentialsFile)
 }
 
 func loadS3StaticCredentials(path string) (map[string]string, error) {

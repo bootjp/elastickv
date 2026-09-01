@@ -258,7 +258,9 @@ func (r *RedisServer) probeStringTypes(ctx context.Context, key []byte, readTS u
 }
 
 // probeListType detects lists via the base meta key or any delta key.
-// Delta scan is bounded to 1 result.
+// Current-format delta scans are bounded to 1 result. Legacy deltas overlap
+// old list-meta shapes, so they first take the same cheap probe and only page
+// when the first row proves that ambiguous legacy decoding is actually needed.
 func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
 	metaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
 	if err != nil {
@@ -267,16 +269,57 @@ func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint
 	if metaExists {
 		return redisTypeList, true, nil
 	}
-	deltaPrefix := store.ListMetaDeltaScanPrefix(key)
-	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
-	if err != nil {
-		return redisTypeNone, false, errors.WithStack(err)
-	}
-	if len(deltaKVs) > 0 {
-		return redisTypeList, true, nil
+	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
+		found, err := r.listMetaDeltaExistsAt(ctx, key, deltaPrefix, readTS)
+		if err != nil {
+			return redisTypeNone, false, err
+		}
+		if found {
+			return redisTypeList, true, nil
+		}
 	}
 	return redisTypeNone, false, nil
+}
+
+func (r *RedisServer) listMetaDeltaExistsAt(ctx context.Context, key []byte, deltaPrefix []byte, readTS uint64) (bool, error) {
+	deltaEnd := store.PrefixScanEnd(deltaPrefix)
+	if isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		return r.legacyListMetaDeltaExistsAt(ctx, key, deltaPrefix, deltaEnd, readTS)
+	}
+	deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return len(deltaKVs) > 0, nil
+}
+
+func (r *RedisServer) legacyListMetaDeltaExistsAt(ctx context.Context, key []byte, deltaPrefix []byte, deltaEnd []byte, readTS uint64) (bool, error) {
+	firstKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if len(firstKVs) == 0 {
+		return false, nil
+	}
+	if legacyListDeltaPairForUserKey(firstKVs[0], key) {
+		return true, nil
+	}
+	cursor := deltaPrefix
+	for {
+		deltaKVs, err := r.store.ScanAt(ctx, cursor, deltaEnd, store.MaxDeltaScanLimit, readTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		for _, pair := range deltaKVs {
+			if legacyListDeltaPairForUserKey(pair, key) {
+				return true, nil
+			}
+		}
+		if len(deltaKVs) < store.MaxDeltaScanLimit {
+			return false, nil
+		}
+		cursor = append(bytes.Clone(deltaKVs[len(deltaKVs)-1].Key), 0)
+	}
 }
 
 // probeLegacyCollectionTypes checks for single-blob hash/set/zset/stream
@@ -388,7 +431,7 @@ func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS ui
 // appeared between iterations is invisible to this fast path; the
 // blocking command's fallback-timer wake (which uses the slow
 // keyTypeAtExpect) is the safety net that detects it within
-// ~redisBlockWaitFallback (100ms).
+// roughly one configured block fallback interval.
 //
 // Compared to keyTypeAtExpect on the empty-key case
 // (probeExpectedType -> false -> rawKeyTypeAt slow path = ~19
@@ -677,7 +720,7 @@ func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint6
 	if !metaFound {
 		return redisStreamValue{}, nil
 	}
-	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
+	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta)
 	if err != nil {
 		return redisStreamValue{}, err
 	}
@@ -714,14 +757,14 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 // stream; callers need not distinguish it from a missing stream.
 // When expectedLen > 0 we cap the scan at meta.Length plus slack,
 // matching existing store ScanAt semantics for non-positive limits.
-func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
+func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, meta store.StreamMeta) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	limit := scanStreamEntriesLimit(expectedLen)
-	if limit == 0 && expectedLen <= 0 {
+	limit := scanStreamEntriesLimit(meta.Length)
+	if limit == 0 && meta.Length <= 0 {
 		return []redisStreamEntry{}, nil
 	}
-	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
+	kvs, err := r.store.ScanAt(ctx, store.StreamEntryScanStart(key, meta), end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -884,11 +927,11 @@ func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, error) {
-	// Leadership is partitioned by the logical user key, so strip the internal
-	// prefix before asking the coordinator.
+	// Leadership is partitioned by the logical user key, but route through a
+	// Redis wrapper so list-internal-shaped user keys remain literal.
 	routingKey := key
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
-		routingKey = userKey
+		routingKey = redisUserRouteKey(userKey)
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
 		if verify {
@@ -931,12 +974,14 @@ func (r *RedisServer) deleteListElems(ctx context.Context, key []byte, readTS ui
 	}
 	// Always delete the base meta key (no-op tombstone if it doesn't exist).
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: listMetaKey(key)})
-	// Delete all delta keys (paginated).
-	deltaElems, err := r.scanAllDeltaElems(ctx, store.ListMetaDeltaScanPrefix(key), readTS)
-	if err != nil {
-		return nil, err
+	// Delete all delta keys (paginated), including the pre-upgrade prefix.
+	for _, deltaPrefix := range store.ListMetaDeltaScanPrefixes(key) {
+		deltaElems, err := r.scanListDeltaDelElems(ctx, key, deltaPrefix, readTS)
+		if err != nil {
+			return nil, err
+		}
+		elems = append(elems, deltaElems...)
 	}
-	elems = append(elems, deltaElems...)
 	// Delete all claim keys (paginated).
 	claimElems, err := r.scanAllDeltaElems(ctx, store.ListClaimScanPrefix(key), readTS)
 	if err != nil {
@@ -968,7 +1013,7 @@ func (r *RedisServer) scanListItemDelElems(ctx context.Context, key []byte, read
 			if len(elems)+1 > maxWideColumnItems {
 				return nil, errors.Wrapf(ErrCollectionTooLarge, "list %q exceeds %d items", key, maxWideColumnItems)
 			}
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key), GroupID: pair.RouteGroupID})
 		}
 		if len(itemKVs) < store.MaxDeltaScanLimit {
 			break
@@ -983,6 +1028,24 @@ func (r *RedisServer) scanListItemDelElems(ctx context.Context, key []byte, read
 // MaxDeltaScanLimit entries. Total results are capped at maxWideColumnItems
 // to prevent unbounded memory growth if the compactor falls behind.
 func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	return r.scanAllDeltaElemsFiltered(ctx, deltaPrefix, readTS, nil)
+}
+
+func (r *RedisServer) scanListDeltaDelElems(ctx context.Context, key []byte, deltaPrefix []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	if !isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		return r.scanAllDeltaElems(ctx, deltaPrefix, readTS)
+	}
+	return r.scanAllDeltaElemsFiltered(ctx, deltaPrefix, readTS, func(pair *store.KVPair) bool {
+		return legacyListDeltaPairForUserKey(pair, key)
+	})
+}
+
+func (r *RedisServer) scanAllDeltaElemsFiltered(
+	ctx context.Context,
+	deltaPrefix []byte,
+	readTS uint64,
+	include func(*store.KVPair) bool,
+) ([]*kv.Elem[kv.OP], error) {
 	const cursorAdv = byte(0x00) // appended to advance past the last scanned key
 	var elems []*kv.Elem[kv.OP]
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
@@ -992,13 +1055,15 @@ func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte,
 		if scanErr != nil {
 			return nil, errors.WithStack(scanErr)
 		}
-		// Check before appending so len(elems) never exceeds maxWideColumnItems
-		// by more than one scan page.
-		if len(elems)+len(deltaKVs) > maxWideColumnItems {
-			return nil, errors.Wrapf(ErrCollectionTooLarge, "delta key count exceeds %d", maxWideColumnItems)
-		}
 		for _, pair := range deltaKVs {
-			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: pair.Key})
+			if include != nil && !include(pair) {
+				continue
+			}
+			// Check before appending so len(elems) never exceeds maxWideColumnItems.
+			if len(elems)+1 > maxWideColumnItems {
+				return nil, errors.Wrapf(ErrCollectionTooLarge, "delta key count exceeds %d", maxWideColumnItems)
+			}
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: bytes.Clone(pair.Key), GroupID: pair.RouteGroupID})
 		}
 		if len(deltaKVs) < store.MaxDeltaScanLimit {
 			break
@@ -1006,6 +1071,50 @@ func (r *RedisServer) scanAllDeltaElems(ctx context.Context, deltaPrefix []byte,
 		deltaCursor = append(bytes.Clone(deltaKVs[len(deltaKVs)-1].Key), cursorAdv)
 	}
 	return elems, nil
+}
+
+func scanAcceptedDeltaKVsAt(
+	ctx context.Context,
+	st store.MVCCStore,
+	prefix []byte,
+	limit int,
+	readTS uint64,
+	accept func(*store.KVPair) bool,
+) ([]*store.KVPair, bool, error) {
+	const cursorAdv = byte(0x00)
+	end := store.PrefixScanEnd(prefix)
+	cursor := prefix
+	out := make([]*store.KVPair, 0, limit)
+	for {
+		rawKVs, err := st.ScanAt(ctx, cursor, end, limit+1, readTS)
+		if err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		for _, pair := range rawKVs {
+			if accept != nil && !accept(pair) {
+				continue
+			}
+			out = append(out, pair)
+			if len(out) > limit {
+				return out, true, nil
+			}
+		}
+		if len(rawKVs) < limit+1 {
+			return out, false, nil
+		}
+		cursor = append(bytes.Clone(rawKVs[len(rawKVs)-1].Key), cursorAdv)
+	}
+}
+
+func isLegacyListMetaDeltaPrefix(prefix []byte) bool {
+	return bytes.HasPrefix(prefix, []byte(store.LegacyListMetaDeltaPrefix))
+}
+
+func legacyListDeltaPairForUserKey(pair *store.KVPair, userKey []byte) bool {
+	if pair == nil || !store.IsListMetaDeltaValue(pair.Value) {
+		return false
+	}
+	return bytes.Equal(store.ExtractLegacyListUserKeyFromDelta(pair.Key), userKey)
 }
 
 // deleteWideColumnElems returns delete operations for all wide-column field/member keys,
@@ -1110,6 +1219,112 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 	elems = append(elems, streamElems...)
 
 	return elems, existed, nil
+}
+
+func (r *RedisServer) deleteLogicalKeyElemsForType(ctx context.Context, key []byte, readTS uint64, typ redisValueType) ([]*kv.Elem[kv.OP], bool, error) {
+	switch typ {
+	case redisTypeNone:
+		return nil, false, nil
+	case redisTypeString:
+		elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+		return elems, true, err
+	case redisTypeList:
+		return r.deleteListLogicalKeyElems(ctx, key, readTS)
+	case redisTypeHash:
+		return r.deleteHashLogicalKeyElems(ctx, key, readTS)
+	case redisTypeSet:
+		return r.deleteSetLogicalKeyElems(ctx, key, readTS)
+	case redisTypeZSet:
+		return r.deleteZSetLogicalKeyElems(ctx, key, readTS)
+	case redisTypeStream:
+		return r.deleteStreamLogicalKeyElems(ctx, key, readTS)
+	}
+	return nil, false, errors.WithStack(errors.AssertionFailedf("unknown redis type %v", typ))
+}
+
+func (r *RedisServer) deleteStringLikeElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for _, internalKey := range [][]byte{
+		redisStrKey(key),
+		key, // legacy bare string key
+		redisHLLKey(key),
+		redisTTLKey(key),
+	} {
+		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if ok {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: internalKey})
+		}
+	}
+	return elems, nil
+}
+
+func (r *RedisServer) deleteListLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	listElems, err := r.deleteListElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, listElems...), true, nil
+}
+
+func (r *RedisServer) deleteHashLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	hashElems, err := r.deleteWideColumnElems(ctx, readTS,
+		store.HashFieldScanPrefix(key), store.HashMetaKey(key), store.HashMetaDeltaScanPrefix(key))
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, hashElems...), true, nil
+}
+
+func (r *RedisServer) deleteSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
+	setElems, err := r.deleteWideColumnElems(ctx, readTS,
+		store.SetMemberScanPrefix(key), store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key))
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, setElems...), true, nil
+}
+
+func (r *RedisServer) deleteZSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
+	zsetElems, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, zsetElems...), true, nil
+}
+
+func (r *RedisServer) deleteStreamLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
+	streamElems, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, streamElems...), true, nil
 }
 
 // deleteStreamWideColumnElems returns delete operations for all stream
@@ -1265,29 +1480,82 @@ func minRedisInt(a, b int) int {
 
 // aggregateLenDeltas scans delta keys under prefix and sums the LenDelta values
 // via unmarshalDelta. Returns (sum, hasDeltas, error).
-// ErrDeltaScanTruncated is returned when the scan hits MaxDeltaScanLimit.
-func (r *RedisServer) aggregateLenDeltas(ctx context.Context, prefix []byte, readTS uint64, unmarshalDelta func([]byte) (int64, error)) (int64, bool, error) {
+// ErrDeltaScanTruncated is returned when accepted deltas exceed MaxDeltaScanLimit.
+func (r *RedisServer) aggregateLenDeltas(
+	ctx context.Context,
+	prefix []byte,
+	readTS uint64,
+	scanCap *deltaScanCap,
+	unmarshalDelta func(key []byte, value []byte) (int64, bool, error),
+) (int64, bool, error) {
+	const cursorAdv = byte(0x00)
 	end := store.PrefixScanEnd(prefix)
-	// Scan one extra key beyond the limit so we can distinguish "exactly
-	// MaxDeltaScanLimit results" (no truncation) from "more than MaxDeltaScanLimit
-	// results" (truncated). Without the +1, a collection with exactly
-	// MaxDeltaScanLimit deltas would incorrectly trigger ErrDeltaScanTruncated.
-	deltas, err := r.store.ScanAt(ctx, prefix, end, store.MaxDeltaScanLimit+1, readTS)
-	if err != nil {
-		return 0, false, errors.WithStack(err)
-	}
-	if len(deltas) > store.MaxDeltaScanLimit {
-		return 0, false, ErrDeltaScanTruncated
-	}
 	var sum int64
-	for _, d := range deltas {
-		delta, err := unmarshalDelta(d.Value)
+	var any bool
+	cursor := prefix
+	for {
+		deltas, err := r.store.ScanAt(ctx, cursor, end, store.MaxDeltaScanLimit+1, readTS)
 		if err != nil {
 			return 0, false, errors.WithStack(err)
 		}
-		sum += delta
+		for _, d := range deltas {
+			delta, include, err := unmarshalDelta(d.Key, d.Value)
+			if err != nil {
+				return 0, false, errors.WithStack(err)
+			}
+			if !include {
+				continue
+			}
+			if scanCap == nil {
+				scanCap = &deltaScanCap{}
+			}
+			if !scanCap.accept() {
+				return 0, false, ErrDeltaScanTruncated
+			}
+			any = true
+			sum += delta
+		}
+		if len(deltas) < store.MaxDeltaScanLimit+1 {
+			break
+		}
+		cursor = append(bytes.Clone(deltas[len(deltas)-1].Key), cursorAdv)
 	}
-	return sum, len(deltas) > 0, nil
+	return sum, any, nil
+}
+
+type deltaScanCap struct {
+	accepted int
+}
+
+func (c *deltaScanCap) accept() bool {
+	c.accepted++
+	return c.accepted <= store.MaxDeltaScanLimit
+}
+
+func (r *RedisServer) aggregateListMetaDeltas(ctx context.Context, key []byte, readTS uint64, applyDelta func(store.ListMetaDelta)) (int64, bool, error) {
+	var total int64
+	var any bool
+	scanCap := &deltaScanCap{}
+	for _, prefix := range store.ListMetaDeltaScanPrefixes(key) {
+		legacy := isLegacyListMetaDeltaPrefix(prefix)
+		lenSum, hasDeltas, err := r.aggregateLenDeltas(ctx, prefix, readTS, scanCap, func(deltaKey []byte, b []byte) (int64, bool, error) {
+			if legacy && (!store.IsListMetaDeltaValue(b) || !bytes.Equal(store.ExtractLegacyListUserKeyFromDelta(deltaKey), key)) {
+				return 0, false, nil
+			}
+			d, unmarshalErr := store.UnmarshalListMetaDelta(b)
+			if unmarshalErr != nil {
+				return 0, false, errors.WithStack(unmarshalErr)
+			}
+			applyDelta(d)
+			return d.LenDelta, true, nil
+		})
+		if err != nil {
+			return 0, false, err
+		}
+		total += lenSum
+		any = any || hasDeltas
+	}
+	return total, any, nil
 }
 
 // resolveListMeta aggregates the base list metadata with all uncompacted Delta keys
@@ -1301,15 +1569,13 @@ func (r *RedisServer) resolveListMeta(ctx context.Context, key []byte, readTS ui
 
 	// 2. Scan and aggregate delta keys.
 	// The closure also captures baseMeta to accumulate the list-specific HeadDelta.
-	prefix := store.ListMetaDeltaScanPrefix(key)
-	lenSum, hasDeltas, err := r.aggregateLenDeltas(ctx, prefix, readTS, func(b []byte) (int64, error) {
-		d, unmarshalErr := store.UnmarshalListMetaDelta(b)
+	lenSum, hasDeltas, err := r.aggregateListMetaDeltas(ctx, key, readTS, func(d store.ListMetaDelta) {
 		baseMeta.Head += d.HeadDelta
-		return d.LenDelta, errors.WithStack(unmarshalErr)
 	})
 	if err != nil {
 		if errors.Is(err, ErrDeltaScanTruncated) {
 			r.triggerUrgentCompaction("list", key)
+			r.triggerUrgentCompaction("list-legacy", key)
 		}
 		return store.ListMeta{}, false, err
 	}
@@ -1351,7 +1617,10 @@ func (r *RedisServer) resolveCollectionLen(
 		}
 	}
 
-	deltaSum, hasDeltas, err := r.aggregateLenDeltas(ctx, deltaPrefix, readTS, unmarshalDelta)
+	deltaSum, hasDeltas, err := r.aggregateLenDeltas(ctx, deltaPrefix, readTS, nil, func(_ []byte, value []byte) (int64, bool, error) {
+		delta, err := unmarshalDelta(value)
+		return delta, true, err
+	})
 	if err != nil {
 		return 0, false, err
 	}

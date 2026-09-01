@@ -19,8 +19,12 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Internal_Forward_FullMethodName      = "/Internal/Forward"
-	Internal_RelayPublish_FullMethodName = "/Internal/RelayPublish"
+	Internal_Forward_FullMethodName              = "/Internal/Forward"
+	Internal_ForwardAdminProposal_FullMethodName = "/Internal/ForwardAdminProposal"
+	Internal_ForwardLeaseRead_FullMethodName     = "/Internal/ForwardLeaseRead"
+	Internal_RelayPublish_FullMethodName         = "/Internal/RelayPublish"
+	Internal_ExportRangeVersions_FullMethodName  = "/Internal/ExportRangeVersions"
+	Internal_ImportRangeVersions_FullMethodName  = "/Internal/ImportRangeVersions"
 )
 
 // InternalClient is the client API for Internal service.
@@ -29,7 +33,11 @@ const (
 type InternalClient interface {
 	// for internal leader redirect only
 	Forward(ctx context.Context, in *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
+	ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error)
+	ForwardLeaseRead(ctx context.Context, in *ForwardLeaseReadRequest, opts ...grpc.CallOption) (*ForwardLeaseReadResponse, error)
 	RelayPublish(ctx context.Context, in *RelayPublishRequest, opts ...grpc.CallOption) (*RelayPublishResponse, error)
+	ExportRangeVersions(ctx context.Context, in *ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRangeVersionsResponse], error)
+	ImportRangeVersions(ctx context.Context, in *ImportRangeVersionsRequest, opts ...grpc.CallOption) (*ImportRangeVersionsResponse, error)
 }
 
 type internalClient struct {
@@ -50,10 +58,59 @@ func (c *internalClient) Forward(ctx context.Context, in *ForwardRequest, opts .
 	return out, nil
 }
 
+func (c *internalClient) ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardAdminProposalResponse)
+	err := c.cc.Invoke(ctx, Internal_ForwardAdminProposal_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ForwardLeaseRead(ctx context.Context, in *ForwardLeaseReadRequest, opts ...grpc.CallOption) (*ForwardLeaseReadResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ForwardLeaseReadResponse)
+	err := c.cc.Invoke(ctx, Internal_ForwardLeaseRead_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *internalClient) RelayPublish(ctx context.Context, in *RelayPublishRequest, opts ...grpc.CallOption) (*RelayPublishResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(RelayPublishResponse)
 	err := c.cc.Invoke(ctx, Internal_RelayPublish_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) ExportRangeVersions(ctx context.Context, in *ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRangeVersionsResponse], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Internal_ServiceDesc.Streams[0], Internal_ExportRangeVersions_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[ExportRangeVersionsRequest, ExportRangeVersionsResponse]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Internal_ExportRangeVersionsClient = grpc.ServerStreamingClient[ExportRangeVersionsResponse]
+
+func (c *internalClient) ImportRangeVersions(ctx context.Context, in *ImportRangeVersionsRequest, opts ...grpc.CallOption) (*ImportRangeVersionsResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ImportRangeVersionsResponse)
+	err := c.cc.Invoke(ctx, Internal_ImportRangeVersions_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +123,11 @@ func (c *internalClient) RelayPublish(ctx context.Context, in *RelayPublishReque
 type InternalServer interface {
 	// for internal leader redirect only
 	Forward(context.Context, *ForwardRequest) (*ForwardResponse, error)
+	ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error)
+	ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error)
 	RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error)
+	ExportRangeVersions(*ExportRangeVersionsRequest, grpc.ServerStreamingServer[ExportRangeVersionsResponse]) error
+	ImportRangeVersions(context.Context, *ImportRangeVersionsRequest) (*ImportRangeVersionsResponse, error)
 	mustEmbedUnimplementedInternalServer()
 }
 
@@ -80,8 +141,20 @@ type UnimplementedInternalServer struct{}
 func (UnimplementedInternalServer) Forward(context.Context, *ForwardRequest) (*ForwardResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method Forward not implemented")
 }
+func (UnimplementedInternalServer) ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForwardAdminProposal not implemented")
+}
+func (UnimplementedInternalServer) ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ForwardLeaseRead not implemented")
+}
 func (UnimplementedInternalServer) RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RelayPublish not implemented")
+}
+func (UnimplementedInternalServer) ExportRangeVersions(*ExportRangeVersionsRequest, grpc.ServerStreamingServer[ExportRangeVersionsResponse]) error {
+	return status.Error(codes.Unimplemented, "method ExportRangeVersions not implemented")
+}
+func (UnimplementedInternalServer) ImportRangeVersions(context.Context, *ImportRangeVersionsRequest) (*ImportRangeVersionsResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ImportRangeVersions not implemented")
 }
 func (UnimplementedInternalServer) mustEmbedUnimplementedInternalServer() {}
 func (UnimplementedInternalServer) testEmbeddedByValue()                  {}
@@ -122,6 +195,42 @@ func _Internal_Forward_Handler(srv interface{}, ctx context.Context, dec func(in
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_ForwardAdminProposal_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardAdminProposalRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ForwardAdminProposal(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ForwardAdminProposal_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ForwardAdminProposal(ctx, req.(*ForwardAdminProposalRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Internal_ForwardLeaseRead_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ForwardLeaseReadRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ForwardLeaseRead(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ForwardLeaseRead_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ForwardLeaseRead(ctx, req.(*ForwardLeaseReadRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Internal_RelayPublish_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RelayPublishRequest)
 	if err := dec(in); err != nil {
@@ -140,6 +249,35 @@ func _Internal_RelayPublish_Handler(srv interface{}, ctx context.Context, dec fu
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_ExportRangeVersions_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(ExportRangeVersionsRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(InternalServer).ExportRangeVersions(m, &grpc.GenericServerStream[ExportRangeVersionsRequest, ExportRangeVersionsResponse]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Internal_ExportRangeVersionsServer = grpc.ServerStreamingServer[ExportRangeVersionsResponse]
+
+func _Internal_ImportRangeVersions_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ImportRangeVersionsRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).ImportRangeVersions(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_ImportRangeVersions_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).ImportRangeVersions(ctx, req.(*ImportRangeVersionsRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Internal_ServiceDesc is the grpc.ServiceDesc for Internal service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -152,10 +290,28 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Internal_Forward_Handler,
 		},
 		{
+			MethodName: "ForwardAdminProposal",
+			Handler:    _Internal_ForwardAdminProposal_Handler,
+		},
+		{
+			MethodName: "ForwardLeaseRead",
+			Handler:    _Internal_ForwardLeaseRead_Handler,
+		},
+		{
 			MethodName: "RelayPublish",
 			Handler:    _Internal_RelayPublish_Handler,
 		},
+		{
+			MethodName: "ImportRangeVersions",
+			Handler:    _Internal_ImportRangeVersions_Handler,
+		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "ExportRangeVersions",
+			Handler:       _Internal_ExportRangeVersions_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "internal.proto",
 }

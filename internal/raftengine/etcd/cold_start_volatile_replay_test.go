@@ -2,6 +2,7 @@ package etcd
 
 import (
 	"bytes"
+	"errors"
 	"io"
 	"sync/atomic"
 	"testing"
@@ -195,5 +196,62 @@ func TestApplyNormalCommitted_DuplicateWithoutClassifier_DropsAll(t *testing.T) 
 	}
 	if e.applied != 200 {
 		t.Fatalf("e.applied advanced unexpectedly: %d, want 200", e.applied)
+	}
+}
+
+// haltingVolatileFakeFSM classifies its tag as volatile-only but then returns a
+// HaltApply response, mirroring kvFSM.applyBackup on an undecodable backup
+// payload or a backup entry with no tracker wired.
+type haltingVolatileFakeFSM struct {
+	calls atomic.Int32
+	err   error
+}
+
+func (f *haltingVolatileFakeFSM) Apply(_ []byte) any {
+	f.calls.Add(1)
+	return haltingApplyResponse{err: f.err}
+}
+
+func (f *haltingVolatileFakeFSM) Snapshot() (Snapshot, error) { return nil, nil }
+func (f *haltingVolatileFakeFSM) Restore(_ io.Reader) error   { return nil }
+
+func (f *haltingVolatileFakeFSM) IsVolatileOnlyPayload(payload []byte) bool {
+	return len(payload) > 0 && payload[0] == 0x0e
+}
+
+type haltingApplyResponse struct{ err error }
+
+func (h haltingApplyResponse) HaltApply() error { return h.err }
+
+var _ raftengine.VolatileEntryClassifier = (*haltingVolatileFakeFSM)(nil)
+
+// A volatile-only entry replayed on the cold-start duplicate path still has its
+// Apply response inspected for HaltApply, so an FSM that cannot apply the entry
+// halts the apply loop rather than letting the engine seed past it silently.
+// applyNormalCommitted runs the HaltApply check before the `if duplicate`
+// early-return, which is what makes this hold on the duplicate path too.
+func TestApplyNormalCommitted_VolatileDuplicateHonorsHaltApply(t *testing.T) {
+	t.Parallel()
+
+	halt := errors.New("fsm cannot apply this entry")
+	fsm := &haltingVolatileFakeFSM{err: halt}
+	e := newTestEngine(fsm, nil, nil)
+	e.applied = 200
+
+	entry := raftpb.Entry{
+		Type:  entryTypePtr(raftpb.EntryNormal),
+		Index: uint64Ptr(150), // <= e.applied → duplicate/volatile replay path
+		Data:  encodeProposalEnvelope(42, []byte{0x0e, 0xff}),
+	}
+
+	err := e.applyNormalCommitted(entry)
+	if err == nil {
+		t.Fatal("applyNormalCommitted advanced past a halting volatile duplicate")
+	}
+	if !errors.Is(err, halt) {
+		t.Fatalf("err = %v, want it to wrap %v", err, halt)
+	}
+	if got := fsm.calls.Load(); got != 1 {
+		t.Fatalf("fsm.Apply calls = %d, want 1", got)
 	}
 }

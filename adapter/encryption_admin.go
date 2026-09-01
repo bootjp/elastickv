@@ -30,9 +30,9 @@ import (
 type EncryptionAdminServer struct {
 	sidecarPath        string
 	fullNodeID         uint64
-	writerRegistry     encryption.WriterRegistryStore
 	buildSHA           string
 	latestAppliedIndex func() uint64
+	writerRegistry     encryption.WriterRegistryStore
 	// proposer is the raw raft proposer used for cleartext-only
 	// control entries. The EnableRaftEnvelope cutover marker MUST
 	// use this path so the marker at index == cutover remains
@@ -46,10 +46,12 @@ type EncryptionAdminServer struct {
 	// the raft envelope.
 	postCutoverProposer raftengine.Proposer
 	leaderView          raftengine.LeaderView
-	// recoveryLeaderView is the authority for sidecar/registry recovery.
-	// In multi-group deployments it points at the default group even when
-	// this server is registered on another group's listener.
-	recoveryLeaderView raftengine.LeaderView
+	// registryLeaderView is the leadership oracle for read-repair
+	// responses that include writer-registry projections. Production
+	// wiring points this at the default group even when the gRPC
+	// listener belongs to a non-default group, because registry rows
+	// are default-group control-plane state.
+	registryLeaderView raftengine.LeaderView
 	// capabilityFanout, when wired, runs the §4 Voters ∪ Learners
 	// fan-out before the §7.1 Phase 1 cutover entry is proposed.
 	// A nil value short-circuits EnableStorageEnvelope with
@@ -187,19 +189,6 @@ func WithEncryptionAdminFullNodeID(id uint64) EncryptionAdminServerOption {
 	}
 }
 
-// WithEncryptionAdminWriterRegistry wires the §4.1 writer-registry
-// store that read-only sidecar recovery RPCs use to project
-// writer_registry_for_caller. A nil argument is a no-op so tests and
-// encryption-disabled nodes keep the pre-Stage-7 empty-map posture.
-func WithEncryptionAdminWriterRegistry(reg encryption.WriterRegistryStore) EncryptionAdminServerOption {
-	return func(s *EncryptionAdminServer) {
-		if reg == nil {
-			return
-		}
-		s.writerRegistry = reg
-	}
-}
-
 // WithEncryptionAdminBuildSHA overrides the auto-detected
 // runtime/debug build SHA. Tests use this to pin a deterministic
 // value; production wiring leaves it empty.
@@ -218,6 +207,19 @@ func WithEncryptionAdminBuildSHA(sha string) EncryptionAdminServerOption {
 func WithEncryptionAdminLatestAppliedIndex(fn func() uint64) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
 		s.latestAppliedIndex = fn
+	}
+}
+
+// WithEncryptionAdminWriterRegistry wires the durable writer-registry
+// store used by §5.5 sidecar-resync responses to report the
+// leader-recorded local_epoch for the requesting node. A nil value
+// preserves the older read-only posture and returns an empty map.
+func WithEncryptionAdminWriterRegistry(reg encryption.WriterRegistryStore) EncryptionAdminServerOption {
+	return func(s *EncryptionAdminServer) {
+		if reg == nil {
+			return
+		}
+		s.writerRegistry = reg
 	}
 }
 
@@ -276,14 +278,17 @@ func WithEncryptionAdminLeaderView(v raftengine.LeaderView) EncryptionAdminServe
 	}
 }
 
-// WithEncryptionAdminRecoveryLeaderView registers the default-group
-// leadership oracle used by ResyncSidecar. A nil value preserves the
-// single-group fallback to leaderView.
-func WithEncryptionAdminRecoveryLeaderView(v raftengine.LeaderView) EncryptionAdminServerOption {
+// WithEncryptionAdminRegistryLeaderView registers the leadership
+// oracle used before sidecar-state RPCs read writer-registry
+// projections. Multi-group production wiring uses the default
+// group leader view here so a non-default group listener cannot
+// serve projection data from a stale default-group follower.
+func WithEncryptionAdminRegistryLeaderView(v raftengine.LeaderView) EncryptionAdminServerOption {
 	return func(s *EncryptionAdminServer) {
-		if v != nil {
-			s.recoveryLeaderView = v
+		if v == nil {
+			return
 		}
+		s.registryLeaderView = v
 	}
 }
 
@@ -332,6 +337,9 @@ func NewEncryptionAdminServer(opts ...EncryptionAdminServerOption) *EncryptionAd
 	if s.postCutoverProposer == nil {
 		s.postCutoverProposer = s.proposer
 	}
+	if s.registryLeaderView == nil {
+		s.registryLeaderView = s.leaderView
+	}
 	return s
 }
 
@@ -371,16 +379,12 @@ func (s *EncryptionAdminServer) Validate() error {
 // case so the empty epoch never reaches the writer registry.
 func (s *EncryptionAdminServer) GetCapability(_ context.Context, _ *pb.Empty) (*pb.CapabilityReport, error) {
 	if s.sidecarPath == "" {
-		return &pb.CapabilityReport{
-			BuildSha:                 s.buildSHA,
-			StorageEnvelopeV2Capable: true,
-		}, nil
+		return &pb.CapabilityReport{BuildSha: s.buildSHA}, nil
 	}
 	report := &pb.CapabilityReport{
-		EncryptionCapable:        true,
-		StorageEnvelopeV2Capable: true,
-		BuildSha:                 s.buildSHA,
-		FullNodeId:               s.fullNodeID,
+		EncryptionCapable: true,
+		BuildSha:          s.buildSHA,
+		FullNodeId:        s.fullNodeID,
 		// LocalEpoch stays at 0 until Stage 7 wires the §4.1
 		// writer-registry counter. The §5.6 step 1a pre-check
 		// happens before any DEK exists, so 0 is the correct
@@ -407,21 +411,42 @@ func (s *EncryptionAdminServer) GetCapability(_ context.Context, _ *pb.Empty) (*
 // pointers; the wrapped material is leakage-safe because it is
 // KEK-wrapped, which is the same property the on-disk sidecar has.
 //
-// When the writer registry is wired, writer_registry_for_caller
-// carries this node's recorded last_seen_local_epoch per sidecar DEK.
-// Unwired tests and encryption-disabled nodes keep the historical
-// empty non-nil map.
-func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) (*pb.SidecarStateReport, error) {
+// GetSidecarState has no caller-id request field, so the
+// writer_registry_for_caller map is populated for this server's own
+// fullNodeID only when both fullNodeID and writerRegistry are wired
+// and the registry leader view can satisfy an applied read. Followers
+// still return their local sidecar snapshot with an empty projection so
+// encryption status remains available from any node. The
+// follower-repair flow that needs a remote caller projection uses
+// ResyncSidecar, whose request carries caller_full_node_id.
+func (s *EncryptionAdminServer) GetSidecarState(ctx context.Context, _ *pb.Empty) (*pb.SidecarStateReport, error) {
 	if s.sidecarPath == "" {
 		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
+	}
+	projectRegistryForCaller, err := s.canProjectWriterRegistryForCaller(ctx, s.fullNodeID)
+	if err != nil {
+		return nil, err
 	}
 	sc, err := encryption.ReadSidecar(s.sidecarPath)
 	if err != nil {
 		return nil, statusFromSidecarErr(err)
 	}
-	writerRegistry, err := s.writerRegistryForCaller(sc, s.fullNodeID, codes.Internal)
-	if err != nil {
-		return nil, err
+	registryForCaller := map[uint32]uint32{}
+	if projectRegistryForCaller {
+		// Bootstrap and rotation apply writes keys.json before it
+		// inserts the matching writer-registry rows. Re-fence after
+		// selecting the sidecar snapshot so the projection cannot lag
+		// behind the DEK set returned in this response.
+		projectRegistryForCaller, err = s.canProjectWriterRegistryForCaller(ctx, s.fullNodeID)
+		if err != nil {
+			return nil, err
+		}
+	}
+	if projectRegistryForCaller {
+		registryForCaller, err = s.writerRegistryForCaller(sc, s.fullNodeID)
+		if err != nil {
+			return nil, err
+		}
 	}
 	resp := &pb.SidecarStateReport{
 		ActiveStorageId:          sc.Active.Storage,
@@ -430,9 +455,22 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 		RaftEnvelopeCutoverIndex: sc.RaftEnvelopeCutoverIndex,
 		LatestAppliedIndex:       s.appliedIndex(sc.RaftAppliedIndex),
 		WrappedDeksById:          wrappedDEKMap(sc),
-		WriterRegistryForCaller:  writerRegistry,
+		WriterRegistryForCaller:  registryForCaller,
 	}
 	return resp, nil
+}
+
+func (s *EncryptionAdminServer) canProjectWriterRegistryForCaller(ctx context.Context, callerFullNodeID uint64) (bool, error) {
+	if s.writerRegistry == nil || callerFullNodeID == 0 {
+		return false, nil
+	}
+	if err := s.requireRegistryLeader(ctx); err != nil {
+		if status.Code(err) == codes.FailedPrecondition {
+			return false, nil
+		}
+		return false, err
+	}
+	return true, nil
 }
 
 // ResyncSidecar is the §5.5 follower-repair RPC. The follower asks
@@ -440,15 +478,19 @@ func (s *EncryptionAdminServer) GetSidecarState(_ context.Context, _ *pb.Empty) 
 // sidecar that fell behind a Raft-log compaction window. The RPC is
 // read-only on the server side; no Raft proposal is involved.
 //
-// Leader-only via requireLeader, which calls VerifyLeader(ctx) to
-// confirm leadership through a Raft ReadIndex round-trip. Without
-// the quorum check a partitioned former leader (State() still
-// reports StateLeader pre-step-down) could ship stale wrapped-DEK
-// state to a recovering follower and silently overwrite recent
-// rotations.
+// Leader-only via requireRegistryLeader, which calls LinearizableRead(ctx)
+// to confirm leadership and wait until the returned ReadIndex has applied
+// locally before registry projections are read. The handler also repeats
+// the applied fence after loading keys.json, because bootstrap and rotation
+// apply writes the sidecar before the matching writer-registry rows.
 func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.ResyncSidecarRequest) (*pb.ResyncSidecarResponse, error) {
-	if err := s.requireRecoveryLeader(ctx); err != nil {
+	if err := s.requireRegistryLeader(ctx); err != nil {
 		return nil, err
+	}
+	callerFullNodeID := req.GetCallerFullNodeId()
+	if callerFullNodeID == 0 {
+		return nil, grpcStatusError(codes.InvalidArgument,
+			"encryption: caller_full_node_id must be non-zero")
 	}
 	if s.sidecarPath == "" {
 		return nil, grpcStatusError(codes.FailedPrecondition, "encryption: sidecar path is not configured on this node")
@@ -457,11 +499,10 @@ func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.Resyn
 	if err != nil {
 		return nil, statusFromSidecarErr(err)
 	}
-	var callerFullNodeID uint64
-	if req != nil {
-		callerFullNodeID = req.GetCallerFullNodeId()
+	if err := s.requireRegistryLeader(ctx); err != nil {
+		return nil, err
 	}
-	writerRegistry, err := s.writerRegistryForCaller(sc, callerFullNodeID, codes.InvalidArgument)
+	registryForCaller, err := s.writerRegistryForCaller(sc, callerFullNodeID)
 	if err != nil {
 		return nil, err
 	}
@@ -470,30 +511,23 @@ func (s *EncryptionAdminServer) ResyncSidecar(ctx context.Context, req *pb.Resyn
 		ActiveStorageId:          sc.Active.Storage,
 		ActiveRaftId:             sc.Active.Raft,
 		LeaderLatestAppliedIndex: s.appliedIndex(sc.RaftAppliedIndex),
-		WriterRegistryForCaller:  writerRegistry,
+		WriterRegistryForCaller:  registryForCaller,
 	}, nil
 }
 
-func (s *EncryptionAdminServer) writerRegistryForCaller(sc *encryption.Sidecar, fullNodeID uint64, missingIDCode codes.Code) (map[uint32]uint32, error) {
+func (s *EncryptionAdminServer) writerRegistryForCaller(sc *encryption.Sidecar, callerFullNodeID uint64) (map[uint32]uint32, error) {
 	out := map[uint32]uint32{}
-	if s.writerRegistry == nil {
+	if s.writerRegistry == nil || callerFullNodeID == 0 {
 		return out, nil
 	}
-	if fullNodeID == 0 {
-		return nil, grpcStatusError(missingIDCode,
-			"encryption: full_node_id is required to project writer_registry_for_caller")
-	}
-	nodeID16 := encryption.NodeID16(fullNodeID)
-	for idStr := range sc.Keys {
-		dekID, err := parseSidecarKeyID(idStr)
+	nodeID16 := encryption.NodeID16(callerFullNodeID)
+	for dekID := range wrappedDEKMap(sc) {
+		key := encryption.RegistryKey(dekID, nodeID16)
+		raw, ok, err := s.writerRegistry.GetRegistryRow(key)
 		if err != nil {
 			return nil, grpcStatusErrorf(codes.Internal,
-				"encryption: sidecar key id %q could not be projected into writer registry: %v", idStr, err)
-		}
-		raw, ok, err := s.writerRegistry.GetRegistryRow(encryption.RegistryKey(dekID, nodeID16))
-		if err != nil {
-			return nil, grpcStatusErrorf(codes.Internal,
-				"encryption: read writer registry row for dek_id=%d full_node_id=%#x: %v", dekID, fullNodeID, err)
+				"encryption: read writer registry for dek_id=%d caller_full_node_id=%d: %v",
+				dekID, callerFullNodeID, err)
 		}
 		if !ok {
 			continue
@@ -501,12 +535,13 @@ func (s *EncryptionAdminServer) writerRegistryForCaller(sc *encryption.Sidecar, 
 		row, err := encryption.DecodeRegistryValue(raw)
 		if err != nil {
 			return nil, grpcStatusErrorf(codes.Internal,
-				"encryption: decode writer registry row for dek_id=%d full_node_id=%#x: %v", dekID, fullNodeID, err)
+				"encryption: decode writer registry for dek_id=%d caller_full_node_id=%d: %v",
+				dekID, callerFullNodeID, err)
 		}
-		if row.FullNodeID != fullNodeID {
+		if row.FullNodeID != callerFullNodeID {
 			return nil, grpcStatusErrorf(codes.Internal,
-				"encryption: writer registry node_id collision for dek_id=%d caller_full_node_id=%#x registry_full_node_id=%#x",
-				dekID, fullNodeID, row.FullNodeID)
+				"encryption: writer registry node-id collision for dek_id=%d node_id16=%#04x (row full_node_id=%d, caller_full_node_id=%d)",
+				dekID, nodeID16, row.FullNodeID, callerFullNodeID)
 		}
 		out[dekID] = uint32(row.LastSeenLocalEpoch)
 	}
@@ -1926,62 +1961,53 @@ func proposeErrorToStatus(err error, opcode byte) error {
 //  2. Quorum confirmation: VerifyLeader(ctx) does a ReadIndex
 //     round-trip so a *partitioned former leader* whose
 //     State() still reports StateLeader (the local view has
-//     not stepped down yet) cannot serve mutating RPCs or
-//     ResyncSidecar against stale local state. Without this,
-//     a follower's recovery flow could pull an outdated DEK
-//     set from a stranded leader and miss recent rotations.
+//     not stepped down yet) cannot serve mutating RPCs against
+//     stale local state.
 func (s *EncryptionAdminServer) requireLeader(ctx context.Context) error {
-	return requireEncryptionLeader(ctx, s.leaderView)
+	return requireLeaderView(ctx, s.leaderView)
 }
 
-func (s *EncryptionAdminServer) requireRecoveryLeader(ctx context.Context) error {
-	view := s.recoveryLeaderView
-	if view == nil {
-		view = s.leaderView
+func (s *EncryptionAdminServer) requireRegistryLeader(ctx context.Context) error {
+	return requireAppliedLeaderView(ctx, s.registryLeaderView)
+}
+
+func requireLeaderView(ctx context.Context, leaderView raftengine.LeaderView) error {
+	if leaderView == nil {
+		return nil
 	}
-	if err := requireEncryptionLeader(ctx, view); err != nil {
+	if err := requireLeaderState(leaderView); err != nil {
 		return err
 	}
-	if view == nil {
-		return nil
-	}
-	// Leadership is not enough here. VerifyLeader confirms quorum through a
-	// ReadIndex round-trip but submits it with waitApplied=false, and
-	// handleReadStates completes such a request as soon as the index is known
-	// -- it never waits for this node's FSM to reach it. A leader that has
-	// committed a newer writer registration but has not applied it yet
-	// therefore passes, and the registry read below returns the older
-	// last_seen_local_epoch. A recovering caller with a rolled-back sidecar
-	// would then choose an epoch that is too low.
-	//
-	// LinearizableRead blocks until the returned index is safe to read from the
-	// local FSM, which is the barrier this projection needs. It is applied only
-	// to the recovery path; the other mutator RPCs keep the VerifyLeader-only
-	// posture through requireEncryptionLeader.
-	if _, err := view.LinearizableRead(ctx); err != nil {
+	if err := leaderView.VerifyLeader(ctx); err != nil {
 		return verifyLeaderErrorToStatus(err)
 	}
-
 	return nil
 }
 
-func requireEncryptionLeader(ctx context.Context, view raftengine.LeaderView) error {
-	if view == nil {
+func requireAppliedLeaderView(ctx context.Context, leaderView raftengine.LeaderView) error {
+	if leaderView == nil {
 		return nil
 	}
-	if view.State() != raftengine.StateLeader {
-		leader := view.Leader()
-		if leader.ID == "" && leader.Address == "" {
-			return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
-		}
-		return grpcStatusErrorf(codes.FailedPrecondition,
-			"encryption: not leader (current leader id=%q address=%q)",
-			leader.ID, leader.Address)
+	if err := requireLeaderState(leaderView); err != nil {
+		return err
 	}
-	if err := view.VerifyLeader(ctx); err != nil {
-		return verifyLeaderErrorToStatus(err)
+	if _, err := leaderView.LinearizableRead(ctx); err != nil {
+		return linearizableReadErrorToStatus(err)
 	}
 	return nil
+}
+
+func requireLeaderState(leaderView raftengine.LeaderView) error {
+	if leaderView.State() == raftengine.StateLeader {
+		return nil
+	}
+	leader := leaderView.Leader()
+	if leader.ID == "" && leader.Address == "" {
+		return grpcStatusError(codes.FailedPrecondition, "encryption: not leader (no known leader)")
+	}
+	return grpcStatusErrorf(codes.FailedPrecondition,
+		"encryption: not leader (current leader id=%q address=%q)",
+		leader.ID, leader.Address)
 }
 
 // verifyLeaderErrorToStatus maps LeaderView.VerifyLeader errors to
@@ -2001,6 +2027,20 @@ func verifyLeaderErrorToStatus(err error) error {
 	default:
 		return grpcStatusErrorf(codes.FailedPrecondition,
 			"encryption: VerifyLeader failed, refusing to act on stale-leader state: %v", err)
+	}
+}
+
+func linearizableReadErrorToStatus(err error) error {
+	switch {
+	case errors.Is(err, context.Canceled):
+		return grpcStatusErrorf(codes.Canceled,
+			"encryption: LinearizableRead canceled: %v", err)
+	case errors.Is(err, context.DeadlineExceeded):
+		return grpcStatusErrorf(codes.DeadlineExceeded,
+			"encryption: LinearizableRead deadline exceeded: %v", err)
+	default:
+		return grpcStatusErrorf(codes.FailedPrecondition,
+			"encryption: LinearizableRead failed, refusing to read stale registry state: %v", err)
 	}
 }
 

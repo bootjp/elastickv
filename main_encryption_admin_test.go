@@ -3,12 +3,15 @@ package main
 import (
 	"context"
 	"net"
+	"path/filepath"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -42,29 +45,6 @@ func (stubEncryptionAdminEngine) LinearizableRead(context.Context) (uint64, erro
 	return 0, nil
 }
 
-type stubEncryptionAdminRegistry struct {
-	name string
-}
-
-type stubEncryptionRecoveryEngine struct {
-	raftengine.Engine
-	applied uint64
-}
-
-func (s *stubEncryptionRecoveryEngine) AppliedIndex() uint64 {
-	return s.applied
-}
-
-func (stubEncryptionAdminRegistry) GetRegistryRow([]byte) ([]byte, bool, error) {
-	return nil, false, nil
-}
-
-func (stubEncryptionAdminRegistry) SetRegistryRow(_, _ []byte) error {
-	return nil
-}
-
-var _ encryption.WriterRegistryStore = stubEncryptionAdminRegistry{}
-
 // TestEncryptionAdminFullNodeID_DistinctPerRaftId pins the
 // PR760 r1 Codex P1 regression: full_node_id must be derived from
 // --raftId (per-node-stable) and NOT from the Raft group id
@@ -89,68 +69,114 @@ func TestEncryptionAdminFullNodeID_DistinctPerRaftId(t *testing.T) {
 	}
 }
 
-func TestWriterRegistryForEncryptionAdminUsesDefaultGroup(t *testing.T) {
-	defaultRegistry := stubEncryptionAdminRegistry{name: "default"}
-	otherRegistry := stubEncryptionAdminRegistry{name: "other"}
-	runtimes := []*raftGroupRuntime{
-		{spec: groupSpec{id: 2}, writerRegistry: otherRegistry},
-		{spec: groupSpec{id: 1}, writerRegistry: defaultRegistry},
+func TestEncryptionAdminDefaultWriterRegistryUsesDefaultGroupStore(t *testing.T) {
+	t.Parallel()
+
+	defaultStore := newEncryptionAdminRegistryTestStore(t, "default")
+	otherStore := newEncryptionAdminRegistryTestStore(t, "other")
+	groups := map[uint64]*kv.ShardGroup{
+		1: {Store: defaultStore},
+		2: {Store: otherStore},
 	}
 
-	got := writerRegistryForEncryptionAdmin(runtimes, 1)
-	if got != defaultRegistry {
-		t.Fatalf("writerRegistryForEncryptionAdmin selected %#v, want default group registry %#v", got, defaultRegistry)
+	reg, err := encryptionAdminDefaultWriterRegistry("keys.json", groups, 1)
+	if err != nil {
+		t.Fatalf("encryptionAdminDefaultWriterRegistry: %v", err)
+	}
+	key := encryption.RegistryKey(7, encryption.NodeID16(0xCAFE))
+	value := encryption.EncodeRegistryValue(encryption.RegistryValue{
+		FullNodeID:          0xCAFE,
+		FirstSeenLocalEpoch: 3,
+		LastSeenLocalEpoch:  3,
+	})
+	if err := reg.SetRegistryRow(key, value); err != nil {
+		t.Fatalf("SetRegistryRow: %v", err)
+	}
+
+	defaultReg, err := store.WriterRegistryFor(defaultStore)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor(default): %v", err)
+	}
+	got, ok, err := defaultReg.GetRegistryRow(key)
+	if err != nil {
+		t.Fatalf("GetRegistryRow(default): %v", err)
+	}
+	if !ok || string(got) != string(value) {
+		t.Fatalf("default registry row ok=%v value=%x, want %x", ok, got, value)
+	}
+
+	otherReg, err := store.WriterRegistryFor(otherStore)
+	if err != nil {
+		t.Fatalf("WriterRegistryFor(other): %v", err)
+	}
+	if got, ok, err := otherReg.GetRegistryRow(key); err != nil {
+		t.Fatalf("GetRegistryRow(other): %v", err)
+	} else if ok {
+		t.Fatalf("non-default registry unexpectedly has row value=%x", got)
 	}
 }
 
-func TestWriterRegistryForEncryptionAdminMissingDefaultGroup(t *testing.T) {
-	got := writerRegistryForEncryptionAdmin([]*raftGroupRuntime{
-		{spec: groupSpec{id: 2}, writerRegistry: stubEncryptionAdminRegistry{name: "other"}},
-	}, 1)
-	if got != nil {
-		t.Fatalf("writerRegistryForEncryptionAdmin selected %#v, want nil when default group runtime is missing", got)
+func TestEncryptionAdminDefaultRuntimeOptionsUsesDefaultGroupRuntime(t *testing.T) {
+	t.Parallel()
+
+	defaultEngine := &stubEngineForProposerTest{}
+	otherEngine := &stubEngineForProposerTest{}
+	defaultGroup := &kv.ShardGroup{Engine: defaultEngine}
+	otherGroup := &kv.ShardGroup{Engine: otherEngine}
+	_ = kv.NewLeaderProxyForShardGroup(defaultGroup)
+	_ = kv.NewLeaderProxyForShardGroup(otherGroup)
+
+	got, err := encryptionAdminDefaultRuntimeOptions(
+		[]*raftGroupRuntime{
+			{spec: groupSpec{id: 1}, engine: defaultEngine},
+			{spec: groupSpec{id: 2}, engine: otherEngine},
+		},
+		map[uint64]*kv.ShardGroup{
+			1: defaultGroup,
+			2: otherGroup,
+		},
+		1,
+		true,
+	)
+	if err != nil {
+		t.Fatalf("encryptionAdminDefaultRuntimeOptions: %v", err)
+	}
+	if got.engine != encryptionAdminEngine(defaultEngine) {
+		t.Fatalf("engine=%T, want default group engine", got.engine)
+	}
+	if got.postCutoverProposer != defaultGroup.Proposer() {
+		t.Error("postCutoverProposer did not use the default group's wrap-aware proposer")
+	}
+	if got.postCutoverProposer == otherGroup.Proposer() {
+		t.Error("postCutoverProposer unexpectedly used the non-default group's proposer")
 	}
 }
 
-func TestEncryptionAdminMutatorAuthorityOnlyDefaultGroup(t *testing.T) {
-	if encryptionAdminMutatorAuthority(true, 2, 1) {
-		t.Fatal("non-default group received encryption mutator authority")
+func TestEncryptionAdminDefaultRuntimeOptionsRequiresDefaultRuntime(t *testing.T) {
+	t.Parallel()
+
+	if _, err := encryptionAdminDefaultRuntimeOptions(nil, nil, 7, true); err == nil {
+		t.Fatal("missing required default runtime returned nil error")
 	}
-	if !encryptionAdminMutatorAuthority(true, 1, 1) {
-		t.Fatal("default group did not receive encryption mutator authority")
-	}
-	if encryptionAdminMutatorAuthority(false, 1, 1) {
-		t.Fatal("disabled encryption mutators received authority")
+	if _, err := encryptionAdminDefaultRuntimeOptions(nil, nil, 7, false); err != nil {
+		t.Fatalf("missing optional default runtime returned error: %v", err)
 	}
 }
 
-func TestRecoveryStateForEncryptionAdminUsesDefaultGroup(t *testing.T) {
-	defaultEngine := &stubEncryptionRecoveryEngine{applied: 41}
-	otherEngine := &stubEncryptionRecoveryEngine{applied: 99}
-	runtimes := []*raftGroupRuntime{
-		{spec: groupSpec{id: 2}, engine: otherEngine},
-		{spec: groupSpec{id: 1}, engine: defaultEngine},
+func newEncryptionAdminRegistryTestStore(t *testing.T, name string) store.MVCCStore {
+	t.Helper()
+	st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), name+".db"))
+	if err != nil {
+		t.Fatalf("NewPebbleStore(%s): %v", name, err)
 	}
-
-	leaderView, appliedIndex := recoveryStateForEncryptionAdmin(runtimes, 1)
-	if leaderView != defaultEngine {
-		t.Fatalf("recoveryStateForEncryptionAdmin selected %T, want default group engine", leaderView)
-	}
-	if appliedIndex == nil {
-		t.Fatal("recoveryStateForEncryptionAdmin returned a nil applied-index callback")
-	}
-	if got := appliedIndex(); got != 41 {
-		t.Fatalf("recoveryStateForEncryptionAdmin applied index = %d, want 41", got)
-	}
-}
-
-func TestRecoveryStateForEncryptionAdminMissingDefaultGroup(t *testing.T) {
-	leaderView, appliedIndex := recoveryStateForEncryptionAdmin([]*raftGroupRuntime{
-		{spec: groupSpec{id: 2}, engine: &stubEncryptionRecoveryEngine{applied: 99}},
-	}, 1)
-	if leaderView != nil || appliedIndex != nil {
-		t.Fatalf("recoveryStateForEncryptionAdmin returned leader=%T callback-present=%t, want both nil", leaderView, appliedIndex != nil)
-	}
+	t.Cleanup(func() {
+		if closer, ok := st.(interface{ Close() error }); ok {
+			if err := closer.Close(); err != nil {
+				t.Fatalf("close %s store: %v", name, err)
+			}
+		}
+	})
+	return st
 }
 
 // TestEncryptionAdmin_MutatingRPCRefusedWhenGateOff pins the
@@ -226,7 +252,7 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 	t.Helper()
 	listener := bufconn.Listen(1024 * 1024)
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, 1, "", enableMutators, engine, nil)
+	registerEncryptionAdminServer(gs, newEncryptionAdminServer(1, "", enableMutators, engine, nil, nil, nil))
 	go func() { _ = gs.Serve(listener) }()
 	t.Cleanup(gs.Stop)
 	conn, err := grpc.NewClient(
@@ -252,7 +278,7 @@ func callBootstrapAgainstNewServer(t *testing.T, enableMutators bool, engine enc
 
 func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
 	gs := grpc.NewServer()
-	registerEncryptionAdminServer(gs, 1, "", false, nil, nil)
+	registerEncryptionAdminServer(gs, newEncryptionAdminServer(1, "", false, nil, nil, nil, nil))
 	info := gs.GetServiceInfo()
 	if _, ok := info["EncryptionAdmin"]; !ok {
 		var registered []string
@@ -260,5 +286,19 @@ func TestRegisterEncryptionAdminServer_Registers(t *testing.T) {
 			registered = append(registered, name)
 		}
 		t.Fatalf("EncryptionAdmin not registered; got services=%v", registered)
+	}
+}
+
+func TestRegisterEncryptionAdminServer_CanReuseInstance(t *testing.T) {
+	srv := newEncryptionAdminServer(1, "", false, nil, nil, nil, nil)
+	first := grpc.NewServer()
+	second := grpc.NewServer()
+	registerEncryptionAdminServer(first, srv)
+	registerEncryptionAdminServer(second, srv)
+	if _, ok := first.GetServiceInfo()["EncryptionAdmin"]; !ok {
+		t.Fatal("EncryptionAdmin service not registered on first gRPC server")
+	}
+	if _, ok := second.GetServiceInfo()["EncryptionAdmin"]; !ok {
+		t.Fatal("EncryptionAdmin service not registered on second gRPC server")
 	}
 }

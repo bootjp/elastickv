@@ -217,7 +217,7 @@ func TestRedisLua_RPopLPushKeepsRemainingSparseHeadItem(t *testing.T) {
 	require.Equal(t, []string{"job-2"}, dstValues)
 }
 
-func TestRedisLua_RPopLPushFailsOnTooManyPhysicalTailTombstones(t *testing.T) {
+func TestRedisLua_RPopLPushScansPastPhysicalTailTombstones(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -226,6 +226,8 @@ func TestRedisLua_RPopLPushFailsOnTooManyPhysicalTailTombstones(t *testing.T) {
 	dst := []byte("bull:test:active:tombstone-tail")
 	largeLen := int64(luaSparseListPopScanLimit) + 2
 	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: largeLen, Tail: largeLen})
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 0), []byte("job-1"), 2, 0))
+	seedListPrefixCollider(t, r, ctx, src, 0)
 	commitTS := uint64(3)
 	for seq := int64(1); seq <= int64(luaSparseListPopScanLimit)+1; seq++ {
 		require.NoError(t, r.store.DeleteAt(ctx, listItemKey(src, seq), commitTS))
@@ -236,8 +238,140 @@ func TestRedisLua_RPopLPushFailsOnTooManyPhysicalTailTombstones(t *testing.T) {
 	require.NoError(t, err)
 	defer scriptCtx.Close()
 
+	reply, err := scriptCtx.cmdRPopLPush([]string{string(src), string(dst)})
+	require.NoError(t, err)
+	require.Equal(t, luaReplyString, reply.kind)
+	require.Equal(t, "job-1", reply.text)
+	require.NoError(t, scriptCtx.commit())
+
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(ctx, src, readTS)
+	require.NoError(t, err)
+	require.Equal(t, redisTypeNone, typ)
+	dstValues, err := r.listValuesAt(ctx, dst, readTS)
+	require.NoError(t, err)
+	require.Equal(t, []string{"job-1"}, dstValues)
+}
+
+func TestRedisLua_LPopScansPastPhysicalHeadTombstones(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r := newListPopTestServer(t)
+	src := []byte("bull:test:wait:tombstone-head")
+	largeLen := int64(luaSparseListPopScanLimit) + 2
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: largeLen, Tail: largeLen})
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, largeLen-1), []byte("job-1"), 2, 0))
+	seedListPrefixCollider(t, r, ctx, src, 0)
+	commitTS := uint64(3)
+	for seq := int64(0); seq <= int64(luaSparseListPopScanLimit); seq++ {
+		require.NoError(t, r.store.DeleteAt(ctx, listItemKey(src, seq), commitTS))
+		commitTS++
+	}
+
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	reply, err := scriptCtx.cmdLPop([]string{string(src)})
+	require.NoError(t, err)
+	require.Equal(t, luaReplyString, reply.kind)
+	require.Equal(t, "job-1", reply.text)
+	require.NoError(t, scriptCtx.commit())
+
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(ctx, src, readTS)
+	require.NoError(t, err)
+	require.Equal(t, redisTypeNone, typ)
+}
+
+func TestRedisLua_RPopLPushDeletesPhysicalTombstoneOnlyList(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	r := newListPopTestServer(t)
+	src := []byte("bull:test:wait:tombstone-only")
+	dst := []byte("bull:test:active:tombstone-only")
+	largeLen := int64(luaSparseListPopScanLimit) + 2
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: largeLen, Tail: largeLen})
+	commitTS := uint64(2)
+	for seq := int64(0); seq <= int64(luaSparseListPopScanLimit)+1; seq++ {
+		require.NoError(t, r.store.DeleteAt(ctx, listItemKey(src, seq), commitTS))
+		commitTS++
+	}
+
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	reply, err := scriptCtx.cmdRPopLPush([]string{string(src), string(dst)})
+	require.NoError(t, err)
+	require.Equal(t, luaReplyNil, reply.kind)
+	require.NoError(t, scriptCtx.commit())
+
+	readTS := r.readTS()
+	typ, err := r.keyTypeAt(ctx, src, readTS)
+	require.NoError(t, err)
+	require.Equal(t, redisTypeNone, typ)
+	dstValues, err := r.listValuesAt(ctx, dst, readTS)
+	require.NoError(t, err)
+	require.Empty(t, dstValues)
+}
+
+func TestRedisLua_RPopLPushSyntheticPhysicalLimitFailsClosed(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := store.NewMVCCStore()
+	st := noExactFallbackPhysicalLimitStore{MVCCStore: base}
+	coord := newLocalAdapterCoordinator(st)
+	r := NewRedisServer(nil, "", st, coord, nil, nil)
+	src := []byte("bull:test:wait:synthetic-limit")
+	dst := []byte("bull:test:active:synthetic-limit")
+	seedListMeta(t, r, src, store.ListMeta{Head: 0, Len: 1, Tail: 1})
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(src, 0), []byte("job-1"), 2, 0))
+
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
 	_, err = scriptCtx.cmdRPopLPush([]string{string(src), string(dst)})
 	require.ErrorIs(t, err, ErrCollectionTooLarge)
+}
+
+func TestRedisLua_ListExactFallbackPinsRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := []byte("bull:test:wait:route-pin")
+	meta := store.ListMeta{Head: 0, Len: 2, Tail: 2}
+	startKey := listItemKey(src, 0)
+	endKey := listItemKey(src, 2)
+
+	collider := append([]byte{}, src...)
+	collider = append(collider, listItemKey(src, 0)[len(store.ListItemPrefix)+len(src):]...)
+	collider = append(collider, 'x')
+	st := &routePinnedExactScanStore{
+		MVCCStore:      store.NewMVCCStore(),
+		t:              t,
+		wantRouteStart: src,
+		wantRouteEnd:   prefixScanEnd(src),
+		pages: [][]*store.KVPair{
+			{{Key: listItemKey(collider, 0), Value: []byte("other-list-job")}},
+			{{Key: listItemKey(src, 1), Value: []byte("job-1")}},
+		},
+	}
+	r := NewRedisServer(nil, "", st, newLocalAdapterCoordinator(st), nil, nil)
+	scriptCtx, err := newLuaScriptContext(ctx, r)
+	require.NoError(t, err)
+	defer scriptCtx.Close()
+
+	item, ok, err := scriptCtx.scanListItemWindowExact(src, meta, startKey, endKey, true)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, int64(1), item.index)
+	require.Equal(t, "job-1", item.value)
+	require.Equal(t, 2, st.calls)
 }
 
 func TestRedisLua_RPopLPushDeletesLargeSparseListWithoutItems(t *testing.T) {
@@ -274,4 +408,62 @@ func seedListMeta(t *testing.T, r *RedisServer, key []byte, meta store.ListMeta)
 	raw, err := store.MarshalListMeta(meta)
 	require.NoError(t, err)
 	require.NoError(t, r.store.PutAt(context.Background(), store.ListMetaKey(key), raw, 1, 0))
+}
+
+func seedListPrefixCollider(t *testing.T, r *RedisServer, ctx context.Context, key []byte, seq int64) {
+	t.Helper()
+
+	collider := append([]byte{}, key...)
+	collider = append(collider, listItemKey(key, seq)[len(store.ListItemPrefix)+len(key):]...)
+	collider = append(collider, 'x')
+	require.NoError(t, r.store.PutAt(ctx, listItemKey(collider, 0), []byte("other-list-job"), 2, 0))
+}
+
+type noExactFallbackPhysicalLimitStore struct {
+	store.MVCCStore
+}
+
+func (s noExactFallbackPhysicalLimitStore) ScanAtPhysicalLimit(context.Context, []byte, []byte, int, int, uint64) ([]*store.KVPair, bool, error) {
+	return nil, true, nil
+}
+
+func (s noExactFallbackPhysicalLimitStore) ReverseScanAtPhysicalLimit(context.Context, []byte, []byte, int, int, uint64) ([]*store.KVPair, bool, error) {
+	return nil, true, nil
+}
+
+func (s noExactFallbackPhysicalLimitStore) AllowExactScanFallbackAfterPhysicalLimit(context.Context, []byte, []byte, int, int, uint64, bool) bool {
+	return false
+}
+
+type routePinnedExactScanStore struct {
+	store.MVCCStore
+	t              *testing.T
+	wantRouteStart []byte
+	wantRouteEnd   []byte
+	pages          [][]*store.KVPair
+	calls          int
+}
+
+func (s *routePinnedExactScanStore) ScanAtWithReadFence(
+	_ context.Context,
+	_ []byte,
+	_ []byte,
+	_ int,
+	_ uint64,
+	_ bool,
+	_ uint64,
+	_ uint64,
+	routeStart []byte,
+	routeEnd []byte,
+) ([]*store.KVPair, error) {
+	s.t.Helper()
+	require.Equal(s.t, s.wantRouteStart, routeStart)
+	require.Equal(s.t, s.wantRouteEnd, routeEnd)
+	if s.calls >= len(s.pages) {
+		s.calls++
+		return nil, nil
+	}
+	page := s.pages[s.calls]
+	s.calls++
+	return page, nil
 }

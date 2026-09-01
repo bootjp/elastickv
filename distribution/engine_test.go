@@ -86,6 +86,76 @@ func TestNewEngineWithDefaultRoute(t *testing.T) {
 	}
 }
 
+func TestEngineApplySnapshot_PreservesMigrationRouteFields(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes: []RouteDescriptor{
+			{
+				RouteID:                7,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                2,
+				State:                  RouteStateMigratingTarget,
+				StagedVisibilityActive: true,
+				MigrationJobID:         42,
+				MinWriteTSExclusive:    99,
+			},
+		},
+	})
+	if err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	route, ok := e.GetRoute([]byte("m"))
+	if !ok {
+		t.Fatal("expected route")
+	}
+	requireMigrationRouteFields(t, "GetRoute", route)
+
+	stats := e.Stats()
+	if len(stats) != 1 {
+		t.Fatalf("expected 1 stat route, got %d", len(stats))
+	}
+	requireMigrationRouteFields(t, "Stats", stats[0])
+
+	intersections := e.GetIntersectingRoutes([]byte("b"), []byte("c"))
+	if len(intersections) != 1 {
+		t.Fatalf("expected 1 intersecting route, got %d", len(intersections))
+	}
+	requireMigrationRouteFields(t, "GetIntersectingRoutes", intersections[0])
+
+	snapshot, ok := e.Current()
+	if !ok {
+		t.Fatal("expected current history snapshot")
+	}
+	historyRoute, ok := snapshot.RouteOf([]byte("m"))
+	if !ok {
+		t.Fatal("expected history route")
+	}
+	requireMigrationRouteFields(t, "RouteHistorySnapshot.RouteOf", historyRoute)
+	historyIntersections := snapshot.IntersectingRoutes([]byte("b"), []byte("c"))
+	if len(historyIntersections) != 1 {
+		t.Fatalf("expected 1 history intersecting route, got %d", len(historyIntersections))
+	}
+	requireMigrationRouteFields(t, "RouteHistorySnapshot.IntersectingRoutes", historyIntersections[0])
+}
+
+func requireMigrationRouteFields(t *testing.T, label string, route Route) {
+	t.Helper()
+	if !route.StagedVisibilityActive {
+		t.Fatalf("%s lost staged visibility: %+v", label, route)
+	}
+	if route.MigrationJobID != 42 {
+		t.Fatalf("%s lost migration job id: %+v", label, route)
+	}
+	if route.MinWriteTSExclusive != 99 {
+		t.Fatalf("%s lost min write ts: %+v", label, route)
+	}
+}
+
 func TestEngineGetIntersectingRoutes(t *testing.T) {
 	e := NewEngine()
 	e.UpdateRoute([]byte("a"), []byte("m"), 1)
@@ -189,6 +259,31 @@ func TestEngineApplySnapshot_ReplacesRoutesAndVersion(t *testing.T) {
 	}
 	if stats[1].RouteID != 11 || stats[1].State != RouteStateWriteFenced {
 		t.Fatalf("unexpected second route metadata: %+v", stats[1])
+	}
+}
+
+func TestEngineRouteLookupsReturnMatchingCatalogVersion(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 12,
+		Routes: []RouteDescriptor{
+			{RouteID: 10, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 11, Start: []byte("m"), GroupID: 2, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("apply snapshot: %v", err)
+	}
+
+	route, version, ok := e.GetRouteWithVersion([]byte("z"))
+	if !ok || route.GroupID != 2 || version != 12 {
+		t.Fatalf("unexpected atomic route lookup: route=%+v version=%d ok=%v", route, version, ok)
+	}
+
+	routes, version := e.GetIntersectingRoutesWithVersion([]byte("a"), []byte("z"))
+	if len(routes) != 2 || version != 12 {
+		t.Fatalf("unexpected atomic range lookup: routes=%+v version=%d", routes, version)
 	}
 }
 
@@ -573,5 +668,109 @@ func TestEngineSnapshotAt_BareEngineHasNoHistory(t *testing.T) {
 	}
 	if _, ok := e.SnapshotAt(1); ok {
 		t.Fatal("bare engine has no history ring; SnapshotAt should always be false")
+	}
+}
+
+func TestResolveRoutesWithVersion_SharesOneSnapshot(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 7,
+		Routes: []RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), GroupID: 2, State: RouteStateActive},
+		},
+	}); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	resolved, version := e.ResolveRoutesWithVersion(
+		RouteQuery{Start: []byte("a"), Exact: true},
+		RouteQuery{Start: []byte("z"), Exact: true},
+		RouteQuery{Start: []byte(""), End: nil},
+	)
+	if version != 7 {
+		t.Fatalf("version=%d, want 7", version)
+	}
+	if len(resolved) != 3 {
+		t.Fatalf("len(resolved)=%d, want 3", len(resolved))
+	}
+	if len(resolved[0]) != 1 || resolved[0][0].GroupID != 1 {
+		t.Fatalf("exact lookup for \"a\" = %+v, want one route on group 1", resolved[0])
+	}
+	if len(resolved[1]) != 1 || resolved[1][0].GroupID != 2 {
+		t.Fatalf("exact lookup for \"z\" = %+v, want one route on group 2", resolved[1])
+	}
+	if len(resolved[2]) != 2 {
+		t.Fatalf("full-range lookup returned %d routes, want 2", len(resolved[2]))
+	}
+}
+
+func TestResolveRoutesWithVersion_MissingRouteYieldsEmpty(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	resolved, version := e.ResolveRoutesWithVersion(RouteQuery{Start: []byte("a"), Exact: true})
+	if version != 0 {
+		t.Fatalf("version=%d, want 0", version)
+	}
+	if len(resolved) != 1 || len(resolved[0]) != 0 {
+		t.Fatalf("resolved=%+v, want one empty result", resolved)
+	}
+}
+
+// A reader must never observe two keys resolved against different catalog
+// versions. Every snapshot below maps both keys to the same group, so a mixed
+// pair proves the lookups straddled an update.
+func TestResolveRoutesWithVersion_NeverStraddlesACatalogUpdate(t *testing.T) {
+	t.Parallel()
+
+	e := NewEngine()
+	if err := e.ApplySnapshot(CatalogSnapshot{
+		Version: 1,
+		Routes:  []RouteDescriptor{{RouteID: 1, Start: []byte(""), GroupID: 1, State: RouteStateActive}},
+	}); err != nil {
+		t.Fatalf("ApplySnapshot: %v", err)
+	}
+
+	done := make(chan struct{})
+	var writer sync.WaitGroup
+	writer.Add(1)
+	go func() {
+		defer writer.Done()
+		for version := uint64(2); ; version++ {
+			select {
+			case <-done:
+				return
+			default:
+			}
+			group := uint64(1)
+			if version%2 == 0 {
+				group = 2
+			}
+			_ = e.ApplySnapshot(CatalogSnapshot{
+				Version: version,
+				Routes:  []RouteDescriptor{{RouteID: 1, Start: []byte(""), GroupID: group, State: RouteStateActive}},
+			})
+		}
+	}()
+	defer func() {
+		close(done)
+		writer.Wait()
+	}()
+
+	for range 2000 {
+		resolved, _ := e.ResolveRoutesWithVersion(
+			RouteQuery{Start: []byte("a"), Exact: true},
+			RouteQuery{Start: []byte("z"), Exact: true},
+		)
+		if len(resolved[0]) != 1 || len(resolved[1]) != 1 {
+			t.Fatalf("resolved=%+v, want one route per query", resolved)
+		}
+		if resolved[0][0].GroupID != resolved[1][0].GroupID {
+			t.Fatalf("keys resolved against different snapshots: %d vs %d",
+				resolved[0][0].GroupID, resolved[1][0].GroupID)
+		}
 	}
 }

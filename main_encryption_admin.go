@@ -6,6 +6,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 )
@@ -14,7 +15,7 @@ import (
 // readback. Returns true iff THIS NODE has all three of:
 //
 //   - --encryption-enabled (explicit operator opt-in)
-//   - a KEK source loaded (file, URI, or test/CI environment source, so ApplyBootstrap
+//   - --kekFile non-empty (KEK source loaded so ApplyBootstrap
 //     / ApplyRotation can KEK-unwrap)
 //   - --encryptionSidecarPath non-empty (so the applier can
 //     crash-durably persist Active.{Storage,Raft} + keys[])
@@ -66,33 +67,6 @@ func encryptionMutatorsEnabled(kekConfigured bool) bool {
 	return *encryptionEnabled && kekConfigured && *encryptionSidecarPath != ""
 }
 
-func encryptionAdminMutatorAuthority(enabled bool, groupID, defaultGroup uint64) bool {
-	return enabled && groupID == defaultGroup
-}
-
-func encryptionAdminOptionsForRuntime(
-	mutatorAuthority bool,
-	rt *raftGroupRuntime,
-	shardGroups map[uint64]*kv.ShardGroup,
-	writerRegistry encryption.WriterRegistryStore,
-	recoveryLeaderView raftengine.LeaderView,
-	recoveryAppliedIndex func() uint64,
-	encWiring encryptionWriteWiring,
-) []adapter.EncryptionAdminServerOption {
-	opts := []adapter.EncryptionAdminServerOption{
-		adapter.WithEncryptionAdminWriterRegistry(writerRegistry),
-		adapter.WithEncryptionAdminRecoveryLeaderView(recoveryLeaderView),
-		adapter.WithEncryptionAdminLatestAppliedIndex(recoveryAppliedIndex),
-	}
-	if !mutatorAuthority {
-		return opts
-	}
-	return append(opts,
-		adapter.WithEncryptionAdminPostCutoverProposer(proposerForGroup(rt, shardGroups)),
-		adapter.WithEncryptionAdminCutoverBarrier(encWiring.raftEnvelope.barrier()),
-	)
-}
-
 // encryptionAdminEngine is the subset of raftengine.Engine the
 // EncryptionAdminServer needs: a Proposer (for the mutating RPCs)
 // and a LeaderView (for the requireLeader gate). Every shard's
@@ -105,11 +79,53 @@ type encryptionAdminEngine interface {
 	raftengine.LeaderView
 }
 
-// registerEncryptionAdminServer constructs and registers an
-// EncryptionAdminServer on the supplied gRPC server. The function
-// is intentionally per-shard: the §7.1 Phase-0 GetCapability
-// fan-out polls every member, and the §5.1 sidecar contents are
-// per-node.
+func encryptionAdminWriterRegistry(sidecarPath string, st store.MVCCStore, groupID uint64) (encryption.WriterRegistryStore, error) {
+	if sidecarPath == "" {
+		return nil, nil
+	}
+	reg, err := store.WriterRegistryFor(st)
+	if err != nil {
+		return nil, errors.Wrapf(err, "failed to construct encryption admin writer registry for group %d", groupID)
+	}
+	return reg, nil
+}
+
+func encryptionAdminDefaultWriterRegistry(sidecarPath string, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64) (encryption.WriterRegistryStore, error) {
+	if sidecarPath == "" {
+		return nil, nil
+	}
+	defaultGroup := shardGroups[defaultGroupID]
+	if defaultGroup == nil || defaultGroup.Store == nil {
+		return nil, errors.Errorf("failed to construct encryption admin writer registry: default group %d store is unavailable", defaultGroupID)
+	}
+	return encryptionAdminWriterRegistry(sidecarPath, defaultGroup.Store, defaultGroupID)
+}
+
+type encryptionAdminRuntimeOptions struct {
+	engine              encryptionAdminEngine
+	latestAppliedIndex  func() uint64
+	postCutoverProposer raftengine.Proposer
+}
+
+func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGroups map[uint64]*kv.ShardGroup, defaultGroupID uint64, requireDefault bool) (encryptionAdminRuntimeOptions, error) {
+	defaultRuntime := findDefaultGroupRuntime(runtimes, defaultGroupID)
+	if defaultRuntime == nil || defaultRuntime.engine == nil {
+		if requireDefault {
+			return encryptionAdminRuntimeOptions{}, errors.Errorf("failed to wire encryption admin default group %d: runtime is unavailable", defaultGroupID)
+		}
+		return encryptionAdminRuntimeOptions{}, nil
+	}
+	return encryptionAdminRuntimeOptions{
+		engine:              defaultRuntime.engine,
+		latestAppliedIndex:  appliedIndexForEngine(defaultRuntime.engine),
+		postCutoverProposer: postCutoverProposerForRuntime(defaultRuntime, shardGroups),
+	}, nil
+}
+
+// newEncryptionAdminServer constructs the per-node EncryptionAdminServer.
+// Production registers the returned instance on every group listener so
+// the default-group admin runtime also shares its cutover serialization
+// and unsafe-cutover latch across those frontends.
 //
 // fullNodeID MUST be per-node-stable (every replica of the same
 // group sees a distinct value), NOT the Raft group id (which is
@@ -123,14 +139,18 @@ type encryptionAdminEngine interface {
 //
 // Stage 6B-2: the mutator wiring (Proposer + LeaderView) is now
 // gated on the supplied enableMutators boolean, which the caller
-// in main.go computes as (--encryption-enabled AND loaded KEK
+// in main.go computes as (--encryption-enabled AND --kekFile
 // non-empty AND engine non-nil). When enableMutators is false,
 // Proposer + LeaderView stay unwired and EncryptionAdminServer's
 // BootstrapEncryption / RotateDEK / RegisterEncryptionWriter
 // short-circuit at the gRPC boundary with FailedPrecondition —
 // identical to the Stage 5D posture. When enableMutators is
 // true, both options are wired and the mutators reach the §6.3
-// applier through the supplied engine. Callers may append a
+// applier through the supplied engine. In multi-group production
+// wiring the supplied engine is the default-group engine for every
+// per-group listener, because writer-registry rows and the sidecar
+// applied-index contract are default-group control-plane state.
+// Callers may append a
 // wrap-aware post-cutover proposer option so non-cutover admin
 // entries wrap after EnableRaftEnvelope while the cutover marker
 // itself remains on the raw engine path.
@@ -142,7 +162,7 @@ type encryptionAdminEngine interface {
 //     means the cluster has explicitly chosen NOT to participate
 //     in the §7.1 rollout, so mutator RPCs MUST refuse even on
 //     a fully-keyed binary.
-//   - kekConfigured means a file, URI, or environment KEK source is loaded;
+//   - --kekFile being non-empty means a KEK source is loaded;
 //     without it, a mutator that committed would land in the
 //     applier with no KEK and return ErrKEKNotConfigured from
 //     the §6.3 HaltApply path — that is fail-closed but it
@@ -160,12 +180,21 @@ type encryptionAdminEngine interface {
 // (the §7.1 cutover refuses with ErrCapabilityCheckFailed);
 // when set, capability probing reads the §5.1 keys.json and
 // reports encryption_capable=true.
-func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, extraOpts ...adapter.EncryptionAdminServerOption) {
+func newEncryptionAdminServer(fullNodeID uint64, sidecarPath string, enableMutators bool, engine encryptionAdminEngine, capabilityFanout adapter.CapabilityFanoutFn, writerRegistry encryption.WriterRegistryStore, latestAppliedIndex func() uint64, extraOpts ...adapter.EncryptionAdminServerOption) *adapter.EncryptionAdminServer {
 	opts := []adapter.EncryptionAdminServerOption{
 		adapter.WithEncryptionAdminFullNodeID(fullNodeID),
 	}
 	if sidecarPath != "" {
 		opts = append(opts, adapter.WithEncryptionAdminSidecarPath(sidecarPath))
+	}
+	if latestAppliedIndex != nil {
+		opts = append(opts, adapter.WithEncryptionAdminLatestAppliedIndex(latestAppliedIndex))
+	}
+	if writerRegistry != nil {
+		opts = append(opts, adapter.WithEncryptionAdminWriterRegistry(writerRegistry))
+		if engine != nil {
+			opts = append(opts, adapter.WithEncryptionAdminRegistryLeaderView(engine))
+		}
 	}
 	if enableMutators && engine != nil {
 		opts = append(opts,
@@ -179,13 +208,15 @@ func registerEncryptionAdminServer(gs *grpc.Server, fullNodeID uint64, sidecarPa
 		if capabilityFanout != nil {
 			opts = append(opts, adapter.WithEncryptionAdminCapabilityFanout(capabilityFanout))
 		}
+		opts = append(opts, extraOpts...)
 	}
-	// Read-only recovery options are valid on every shard listener. The caller
-	// only includes mutator-specific options for the default-group authority.
-	opts = append(opts, extraOpts...)
 	srv := adapter.NewEncryptionAdminServer(opts...)
 	if err := srv.Validate(); err != nil {
 		panic(errors.Wrap(err, "encryption admin server validation"))
 	}
+	return srv
+}
+
+func registerEncryptionAdminServer(gs *grpc.Server, srv pb.EncryptionAdminServer) {
 	pb.RegisterEncryptionAdminServer(gs, srv)
 }

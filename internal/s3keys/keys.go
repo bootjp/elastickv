@@ -84,6 +84,17 @@ func ParseBucketMetaKey(key []byte) (string, bool) {
 	return string(segment), true
 }
 
+func ParseBucketGenerationKey(key []byte) (string, bool) {
+	if !bytes.HasPrefix(key, bucketGenerationPrefixBytes) {
+		return "", false
+	}
+	segment, next, ok := decodeSegment(key, len(bucketGenerationPrefixBytes))
+	if !ok || next != len(key) {
+		return "", false
+	}
+	return string(segment), true
+}
+
 func ObjectManifestKey(bucket string, generation uint64, object string) []byte {
 	return buildObjectKey(objectManifestPrefixBytes, bucket, generation, object, "", 0, 0)
 }
@@ -270,6 +281,50 @@ func RoutePrefixForBucket(bucket string, generation uint64) []byte {
 	return bucketScopedPrefix(routePrefixBytes, bucket, generation)
 }
 
+func RoutePrefixForBucketAnyGeneration(bucket string) []byte {
+	out := make([]byte, 0, len(RoutePrefix)+len(bucket)+segmentEscapeOverhead)
+	out = append(out, routePrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	return out
+}
+
+func BucketGenerationRoutePrefixForCleanupPrefix(prefix []byte) ([]byte, bool) {
+	familyPrefix := bucketGenerationFamilyPrefix(prefix)
+	if familyPrefix == nil {
+		return nil, false
+	}
+	bucketRaw, next, ok := decodeSegment(prefix, len(familyPrefix))
+	if !ok {
+		return nil, false
+	}
+	generation, next, ok := readU64(prefix, next)
+	if !ok || next != len(prefix) {
+		return nil, false
+	}
+	return RoutePrefixForBucket(string(bucketRaw), generation), true
+}
+
+func bucketGenerationFamilyPrefix(key []byte) []byte {
+	switch {
+	case bytes.HasPrefix(key, objectManifestPrefixBytes):
+		return objectManifestPrefixBytes
+	case bytes.HasPrefix(key, uploadMetaPrefixBytes):
+		return uploadMetaPrefixBytes
+	case bytes.HasPrefix(key, uploadPartPrefixBytes):
+		return uploadPartPrefixBytes
+	case bytes.HasPrefix(key, blobPrefixBytes):
+		return blobPrefixBytes
+	case bytes.HasPrefix(key, chunkRefPrefixBytes):
+		return chunkRefPrefixBytes
+	case bytes.HasPrefix(key, gcUploadPrefixBytes):
+		return gcUploadPrefixBytes
+	case bytes.HasPrefix(key, routePrefixBytes):
+		return routePrefixBytes
+	default:
+		return nil
+	}
+}
+
 func bucketScopedPrefix(prefix []byte, bucket string, generation uint64) []byte {
 	out := make([]byte, 0, len(prefix)+len(bucket)+u64Bytes+segmentEscapeOverhead)
 	out = append(out, prefix...)
@@ -411,6 +466,34 @@ func ExtractRouteKey(key []byte) []byte {
 	out = append(out, routePrefixBytes...)
 	out = append(out, key[len(prefix):objectEnd]...)
 	return out
+}
+
+// BucketScopedRoutePrefix projects a bucket-scoped raw family prefix -- the
+// shape bucketScopedPrefix builds, family bytes followed by the bucket segment
+// and the generation u64 -- onto the object route prefix every key underneath it
+// routes through.
+//
+// It reports false unless the prefix ends exactly at the generation. A shorter
+// prefix can still span more than one bucket or generation, so it has no single
+// route range to project onto, and a longer one reaches into the object segment
+// this function does not parse.
+func BucketScopedRoutePrefix(prefix []byte) ([]byte, bool) {
+	family := objectScopedPrefix(prefix)
+	if family == nil {
+		return nil, false
+	}
+	offset := len(family)
+	bucketEnd, ok := segmentEnd(prefix, offset)
+	if !ok {
+		return nil, false
+	}
+	if _, next, okU64 := readU64(prefix, bucketEnd); !okU64 || next != len(prefix) {
+		return nil, false
+	}
+	out := make([]byte, 0, len(routePrefixBytes)+len(prefix)-len(family))
+	out = append(out, routePrefixBytes...)
+	out = append(out, prefix[len(family):]...)
+	return out, true
 }
 
 func ManifestScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {

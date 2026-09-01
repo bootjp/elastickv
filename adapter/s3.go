@@ -119,6 +119,7 @@ type S3Server struct {
 	blobLocalStores      S3BlobLocalStoreResolver
 	blobMinReplicas      int
 	blobPushBlocked      func() bool
+	blobBackfiller       *S3BlobBackfiller
 }
 
 type s3BucketMeta struct {
@@ -193,6 +194,10 @@ func writeS3ResponseOrInternalError(w http.ResponseWriter, err error) {
 	var responseErr *s3ResponseError
 	if errors.As(err, &responseErr) {
 		writeS3Error(w, responseErr.Status, responseErr.Code, responseErr.Message, responseErr.Bucket, responseErr.Key)
+		return
+	}
+	if isS3ServiceUnavailable(err) {
+		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", "", "")
 		return
 	}
 	writeS3InternalError(w, err)
@@ -402,12 +407,22 @@ func (s *S3Server) Run() error {
 }
 
 func (s *S3Server) Stop() {
+	if s != nil && s.blobBackfiller != nil {
+		s.blobBackfiller.Stop()
+	}
 	if s != nil && s.blobCluster != nil {
 		_ = s.blobCluster.Close()
 	}
 	if s != nil && s.httpServer != nil {
 		_ = s.httpServer.Shutdown(context.Background())
 	}
+}
+
+func (s *S3Server) StartBlobBackfill(ctx context.Context) error {
+	if s == nil || s.blobBackfiller == nil {
+		return nil
+	}
+	return s.blobBackfiller.Start(ctx, s)
 }
 
 func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
@@ -747,9 +762,12 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		writeS3MutationError(w, err, bucket, "")
 		return
 	}
-	// Phase 2: best-effort DEL_PREFIX safety net. See
-	// AdminDeleteBucket / runBucketDeleteSafetyNet for the contract.
-	s.runBucketDeleteSafetyNet(r.Context(), bucket, deletedGeneration)
+	// Phase 2: DEL_PREFIX safety net. See AdminDeleteBucket /
+	// runBucketDeleteSafetyNet for the contract.
+	if err := s.runBucketDeleteSafetyNet(r.Context(), bucket, deletedGeneration); err != nil {
+		writeS3MutationError(w, err, bucket, "")
+		return
+	}
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -1229,7 +1247,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 			{Op: kv.Put, Key: s3keys.GCUploadKey(bucket, meta.Generation, objectKey, uploadID), Value: body},
 		},
 	}); err != nil {
-		writeS3InternalError(w, err)
+		writeS3MutationError(w, err, bucket, objectKey)
 		return
 	}
 	writeS3XML(w, http.StatusOK, s3InitiateMultipartUploadResult{
@@ -1494,7 +1512,7 @@ func (s *S3Server) cleanupPartBlobsAsync(
 			if len(pending) == 0 {
 				return
 			}
-			if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+			if err := s.dispatchS3CleanupBatch(ctx, pending); err != nil {
 				slog.ErrorContext(ctx, "cleanupPartBlobsAsync: coordinator dispatch failed",
 					"bucket", bucket,
 					"object_key", objectKey,
@@ -1565,7 +1583,7 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 		for _, kvp := range kvs {
 			pending = append(pending, &kv.Elem[kv.OP]{Op: kv.Del, Key: kvp.Key})
 		}
-		if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pending}); err != nil {
+		if err := s.dispatchS3CleanupBatch(ctx, pending); err != nil {
 			slog.ErrorContext(ctx, "deleteByPrefix: dispatch failed",
 				"bucket", bucket, "generation", generation,
 				"object_key", objectKey, "upload_id", uploadID, "err", err)
@@ -1573,6 +1591,13 @@ func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket str
 		}
 		cursor = nextScanCursor(kvs[len(kvs)-1].Key)
 	}
+}
+
+func (s *S3Server) dispatchS3CleanupBatch(ctx context.Context, elems []*kv.Elem[kv.OP]) error {
+	return s.retryS3Mutation(ctx, func() error {
+		_, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: elems})
+		return errors.WithStack(err)
+	})
 }
 
 func parseS3MaxParts(raw string) int {
@@ -2512,7 +2537,7 @@ func (s *S3Server) nextTxnCommitTS(ctx context.Context, startTS uint64) (uint64,
 }
 
 func isRetryableS3MutationErr(err error) bool {
-	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked)
+	return errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked) || isRouteWriteFencedError(err)
 }
 
 func waitS3RetryBackoff(ctx context.Context, delay time.Duration) bool {
@@ -2567,11 +2592,15 @@ func writeS3MutationError(w http.ResponseWriter, err error, bucket string, key s
 		writeS3Error(w, http.StatusConflict, "OperationAborted", "conflicting conditional operation in progress", bucket, key)
 		return
 	}
-	if status.Code(errors.Cause(err)) == codes.Unavailable {
+	if isS3ServiceUnavailable(err) {
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "service unavailable", bucket, key)
 		return
 	}
 	writeS3InternalError(w, err)
+}
+
+func isS3ServiceUnavailable(err error) bool {
+	return errors.Is(err, kv.ErrLeaderProxyCircuitOpen) || status.Code(errors.Cause(err)) == codes.Unavailable
 }
 
 var errUnsupportedCannedAcl = errors.New("unsupported canned ACL")

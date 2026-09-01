@@ -60,9 +60,10 @@ const (
 	// from shrinking the shared inbound queue enough to drop heartbeats.
 	minInboundQueueCapacity = 128
 	// priorityStepQueueCapacity is the inbound control-plane queue size.
-	// Heartbeats, votes, read-index responses, and timeout-now messages are
-	// tiny but time-sensitive; keeping them off the bulk stepCh prevents a
-	// MsgApp burst from forcing followers into avoidable elections.
+	// Heartbeats, votes, read-index responses, timeout-now messages, and
+	// received snapshot tokens are tiny but time-sensitive; keeping them off the
+	// bulk stepCh prevents a MsgApp burst from forcing followers into avoidable
+	// elections or rejecting a catch-up snapshot after its payload was streamed.
 	priorityStepQueueCapacity = 1024
 	// priorityStepBurstLimit bounds consecutive non-blocking priority drains
 	// so a sustained control-message stream cannot starve Tick, proposals, or
@@ -71,8 +72,8 @@ const (
 	priorityStepBurstLimit = 64
 	// defaultHeartbeatBufPerPeer is the capacity of the priority dispatch channel.
 	// It carries low-frequency control traffic: heartbeats, votes, read-index,
-	// leader-transfer, and their corresponding response messages
-	// (MsgHeartbeatResp, MsgReadIndexResp, MsgVoteResp, MsgPreVoteResp).
+	// leader-transfer, and their corresponding response messages except for
+	// MsgHeartbeatResp, which uses its own coalescing response lane.
 	// MsgAppResp is intentionally kept in the normal channel: followers — the
 	// only senders of MsgAppResp — do not send MsgApp, so there is no
 	// head-of-line blocking risk there.
@@ -84,8 +85,21 @@ const (
 	// upside is that a ~5 s transient pause (election-timeout scale)
 	// no longer drops heartbeats and forces the peers' lease to expire.
 	defaultHeartbeatBufPerPeer = 512
+	// defaultReadIndexRespBufPerPeer sizes the dedicated follower-to-leader
+	// ReadIndex heartbeat response lane. etcd/raft encodes ReadIndex
+	// completions as MsgHeartbeatResp messages with Context set; unlike plain
+	// heartbeat acks, each context is tied to a caller waiting in handleRead
+	// and must not be coalesced or dropped behind superseded empty acks.
+	defaultReadIndexRespBufPerPeer = 512
+	// defaultHeartbeatRespBufPerPeer sizes the dedicated follower-to-leader
+	// heartbeat response lane. When a follower is receiving a large snapshot,
+	// the leader may continue to send heartbeats while the follower's outbound
+	// transport is slow. Heartbeat responses are superseded by newer heartbeat
+	// responses for the same peer, so enqueueDispatchMessage coalesces this lane
+	// instead of reporting a dropped raft message and starving the leader lease.
+	defaultHeartbeatRespBufPerPeer = 128
 	// defaultSnapshotLaneBufPerPeer sizes the per-peer MsgSnap lane when the
-	// 4-lane dispatcher mode is enabled (see ELASTICKV_RAFT_DISPATCHER_LANES).
+	// opt-in multi-lane dispatcher is enabled (see ELASTICKV_RAFT_DISPATCHER_LANES).
 	// MsgSnap is rare and bulky; 4 is enough to absorb a retry or two without
 	// holding up MsgApp replication behind a multi-MiB payload.
 	defaultSnapshotLaneBufPerPeer = 4
@@ -93,11 +107,11 @@ const (
 	// types not classified as heartbeat/replication/snapshot (e.g. surprise
 	// locally-addressed control types). Small buffer: traffic volume is tiny.
 	defaultOtherLaneBufPerPeer = 16
-	// dispatcherLanesEnvVar toggles the 4-lane dispatcher (heartbeat /
-	// replication / snapshot / other). When unset or "0", the legacy
-	// 2-lane layout (heartbeat + normal) is used. Opt-in by design: the
-	// raft hot path is high blast radius and a regression here can cause
-	// cluster-wide elections.
+	// dispatcherLanesEnvVar toggles the multi-lane dispatcher (heartbeat /
+	// heartbeatResp / replication / snapshot / other). When unset or "0", the
+	// legacy 3-lane layout (heartbeat + heartbeatResp + normal) is used.
+	// Opt-in by design: the raft hot path is high blast radius and a regression
+	// here can cause cluster-wide elections.
 	dispatcherLanesEnvVar = "ELASTICKV_RAFT_DISPATCHER_LANES"
 	// preVoteEnvVar permits an operator to temporarily disable raft
 	// pre-vote during manual quorum recovery. It defaults to enabled.
@@ -105,10 +119,10 @@ const (
 	// defaultSnapshotEvery is the fallback trigger threshold: take an FSM
 	// snapshot once the applied index has advanced this many entries past
 	// the last snapshot's index. etcd/raft itself uses 10_000 as a default,
-	// but with fat proposal payloads (e.g. Lua scripts) this can produce a
-	// multi-GiB WAL between snapshots. Operators can lower via
+	// but multi-GiB FSM snapshots can take tens of seconds to persist and
+	// contend with the Raft hot path. Operators can lower or raise via
 	// ELASTICKV_RAFT_SNAPSHOT_COUNT without a rebuild.
-	defaultSnapshotEvery     = 10_000
+	defaultSnapshotEvery     = 100_000
 	snapshotEveryEnvVar      = "ELASTICKV_RAFT_SNAPSHOT_COUNT"
 	defaultSnapshotQueueSize = 1
 	defaultAdminPollInterval = 10 * time.Millisecond
@@ -143,6 +157,7 @@ var (
 	errLeadershipTransferNoHealthyTarget   = errors.Mark(errors.New("etcd raft leadership transfer has no healthy target"), raftengine.ErrLeadershipTransferNoHealthyTarget)
 	errLeadershipTransferTargetNotCaughtUp = errors.Mark(errors.New("etcd raft leadership transfer target is not caught up"), raftengine.ErrLeadershipTransferTargetNotCaughtUp)
 	errLeadershipTransferConfChangePending = errors.Mark(errors.New("etcd raft leadership transfer blocked by pending config change"), raftengine.ErrLeadershipTransferConfChangePending)
+	errMembershipConfChangePending         = errors.Mark(errors.New("etcd raft membership change blocked by pending config change"), raftengine.ErrMembershipChangePending)
 	errTooManyPendingConfigs               = errors.New("etcd raft engine has too many pending config changes")
 	errPromoteLearnerNotLearner            = errors.New("etcd raft promote-learner target is not a learner")
 	errPromoteLearnerNoProgress            = errors.New("etcd raft promote-learner target has no leader-side progress entry")
@@ -322,16 +337,17 @@ type Engine struct {
 
 	nextRequestID atomic.Uint64
 
-	proposeCh         chan proposalRequest
-	readCh            chan readRequest
-	adminCh           chan adminRequest
-	stepCh            chan raftpb.Message
-	priorityStepCh    chan raftpb.Message
-	priorityStepBurst int
-	dispatchReportCh  chan dispatchReport
-	peerDispatchers   map[uint64]*peerQueues
-	perPeerQueueSize  int
-	// dispatcherLanesEnabled toggles the 4-lane dispatcher layout. Captured
+	proposeCh                    chan proposalRequest
+	readCh                       chan readRequest
+	adminCh                      chan adminRequest
+	stepCh                       chan raftpb.Message
+	priorityStepCh               chan raftpb.Message
+	priorityStepBurst            int
+	dispatchReportCh             chan dispatchReport
+	deferredReadyDispatchReports []dispatchReport
+	peerDispatchers              map[uint64]*peerQueues
+	perPeerQueueSize             int
+	// dispatcherLanesEnabled toggles the opt-in multi-lane dispatcher layout. Captured
 	// once at Open from ELASTICKV_RAFT_DISPATCHER_LANES so the run-time code
 	// path is branch-free per message and does not need to re-read env vars.
 	dispatcherLanesEnabled bool
@@ -354,7 +370,10 @@ type Engine struct {
 	snapshotStopCh chan struct{}
 	closeCh        chan struct{}
 	doneCh         chan struct{}
-	startedCh      chan struct{}
+	// startedCh is closed after startup has drained committed Ready entries.
+	// Multi-node Open must return before this so callers can register the
+	// transport listener; service startup waits through WaitStarted instead.
+	startedCh chan struct{}
 
 	leaderReady  chan struct{}
 	leaderOnce   sync.Once
@@ -408,6 +427,8 @@ type Engine struct {
 	snapshotMu                     sync.Mutex
 	protectedReceivedFSMSnaps      map[uint64]int
 	pendingReceivedFSMSnapshotStep map[uint64]int
+	pendingReceivedFSMReleaseIndex atomic.Uint64
+	pendingReceivedFSMReleaseRun   atomic.Bool
 
 	dispatchDropCount  atomic.Uint64
 	dispatchErrorCount atomic.Uint64
@@ -568,22 +589,25 @@ type dispatchRequest struct {
 // peerQueues holds separate dispatch channels per peer so that heartbeats
 // are never blocked behind large log-entry RPCs.
 //
-// Legacy 2-lane layout (default): heartbeat + normal.
+// Legacy 4-lane layout (default): heartbeat + heartbeatResp +
+// readIndexResp + normal.
 //
-// 4-lane layout (opt-in via ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat +
-// replication (MsgApp/MsgAppResp) + snapshot (MsgSnap) + other. Each lane
-// gets its own goroutine so a bulky MsgSnap transfer cannot stall MsgApp
-// replication and vice versa. Per-peer ordering within a given message type
-// is preserved because a single peer's MsgApp stream all share one lane and
-// one worker.
+// 6-lane layout (opt-in via ELASTICKV_RAFT_DISPATCHER_LANES=1): heartbeat +
+// heartbeatResp + readIndexResp + replication (MsgApp/MsgAppResp) + snapshot
+// (MsgSnap) + other. Each lane gets its own goroutine so a bulky MsgSnap
+// transfer cannot stall MsgApp replication and vice versa. Per-peer ordering
+// within a given message type is preserved because a single peer's MsgApp
+// stream all share one lane and one worker.
 type peerQueues struct {
-	normal      chan dispatchRequest
-	heartbeat   chan dispatchRequest
-	replication chan dispatchRequest // 4-lane mode only; nil otherwise
-	snapshot    chan dispatchRequest // 4-lane mode only; nil otherwise
-	other       chan dispatchRequest // 4-lane mode only; nil otherwise
-	ctx         context.Context
-	cancel      context.CancelFunc
+	normal        chan dispatchRequest
+	heartbeat     chan dispatchRequest
+	heartbeatResp chan dispatchRequest
+	readIndexResp chan dispatchRequest
+	replication   chan dispatchRequest // 6-lane mode only; nil otherwise
+	snapshot      chan dispatchRequest // 6-lane mode only; nil otherwise
+	other         chan dispatchRequest // 6-lane mode only; nil otherwise
+	ctx           context.Context
+	cancel        context.CancelFunc
 }
 
 type preparedOpenState struct {
@@ -957,17 +981,43 @@ func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64)
 }
 
 func waitForOpen(ctx context.Context, engine *Engine, waitForLeader bool) (*Engine, error) {
+	if err := waitForOpenSignal(ctx, engine, engine.startedCh); err != nil {
+		return nil, err
+	}
+	if !waitForLeader {
+		return engine, nil
+	}
+	if err := waitForOpenSignal(ctx, engine, engine.leaderReady); err != nil {
+		return nil, err
+	}
+	return engine, nil
+}
+
+func (e *Engine) WaitStarted(ctx context.Context) error {
+	if e == nil {
+		return errors.WithStack(errNilEngine)
+	}
+	return waitForEngineSignal(ctx, e, e.startedCh, false)
+}
+
+func waitForOpenSignal(ctx context.Context, engine *Engine, ready <-chan struct{}) error {
+	return waitForEngineSignal(ctx, engine, ready, true)
+}
+
+func waitForEngineSignal(ctx context.Context, engine *Engine, ready <-chan struct{}, closeOnCancel bool) error {
 	select {
 	case <-ctx.Done():
-		_ = engine.Close()
-		return nil, errors.WithStack(ctx.Err())
-	case <-engine.openReady(waitForLeader):
-		return engine, nil
+		if closeOnCancel {
+			_ = engine.Close()
+		}
+		return errors.WithStack(ctx.Err())
+	case <-ready:
+		return nil
 	case <-engine.doneCh:
 		if err := engine.currentError(); err != nil {
-			return nil, err
+			return err
 		}
-		return nil, errors.WithStack(errClosed)
+		return errors.WithStack(errClosed)
 	}
 }
 
@@ -1280,12 +1330,11 @@ func (e *Engine) recordDispatchErrorCode(code string) uint64 {
 }
 
 // StepQueueFullCount returns the total number of inbound raft messages
-// that could not be enqueued into the selected inbound step queue
-// because the channel was at capacity. This is the "etcd raft inbound
-// step queue is full" signal from the task description: a spike
-// indicates the local raft loop is starved, usually by something
-// blocking the apply path such as
-// the pre-#560 rawKeyTypeAt seek storm.
+// that found the selected inbound step queue at capacity. Blocking inbound
+// message classes wait for space after incrementing this counter; best-effort
+// classes still return errStepQueueFull. A spike indicates the local raft loop
+// is starved, usually by something blocking the apply path such as the
+// pre-#560 rawKeyTypeAt seek storm.
 func (e *Engine) StepQueueFullCount() uint64 {
 	if e == nil {
 		return 0
@@ -1777,6 +1826,10 @@ func (e *Engine) run() {
 		e.fail(err)
 		return
 	}
+	if err := e.persistStartupAppliedIndex(); err != nil {
+		e.fail(err)
+		return
+	}
 	e.markStarted()
 
 	for {
@@ -1889,13 +1942,14 @@ func (e *Engine) tryReceivePriorityStep() (raftpb.Message, bool) {
 	}
 }
 
-// dispatchReport is posted by the dispatch workers when a transport send
-// to a peer fails; the engine goroutine drains these and informs etcd/raft
-// via rawNode so follower Progress leaves StateReplicate / StateSnapshot on
-// unreachable peers and does not silently stall.
+// dispatchReport is posted by the dispatch workers after a transport send
+// completes or fails; the engine goroutine drains these and informs etcd/raft
+// via rawNode so follower Progress leaves StateReplicate / StateSnapshot and
+// does not silently stall.
 type dispatchReport struct {
-	to      uint64
-	msgType raftpb.MessageType
+	to             uint64
+	msgType        raftpb.MessageType
+	snapshotFinish bool
 }
 
 func (e *Engine) handleDispatchReport(report dispatchReport) {
@@ -1908,19 +1962,24 @@ func (e *Engine) handleDispatchReport(report dispatchReport) {
 	// peer from StateReplicate to StateProbe so the next heartbeat response
 	// drives a fresh sendAppend attempt.
 	if report.msgType == raftpb.MsgSnap {
-		e.rawNode.ReportSnapshot(report.to, etcdraft.SnapshotFailure)
+		status := etcdraft.SnapshotFailure
+		if report.snapshotFinish {
+			status = etcdraft.SnapshotFinish
+		}
+		e.rawNode.ReportSnapshot(report.to, status)
 		return
 	}
 	e.rawNode.ReportUnreachable(report.to)
 }
 
-// postDispatchReport delivers a dispatch failure to the event loop without
-// blocking the caller. Dispatch workers use it for transport failures, and the
-// event loop uses it for local queue drops before transport. If the channel is
-// full (unlikely — the buffer is sized to MaxInflightMsg), the report is
-// dropped and logged; this is acceptable because raft will retry on the next
-// tick and we only need eventual consistency between transport state and
-// Progress state.
+// postDispatchReport delivers a dispatch outcome to the event loop without
+// blocking the caller. Dispatch workers use it for transport completion or
+// failures, and the event loop uses it for local queue drops before transport.
+// If the channel is full (unlikely — the buffer is sized to MaxInflightMsg),
+// the report is dropped and logged; this is acceptable because raft will retry
+// on the next tick and we only need eventual consistency between transport
+// state and Progress state. MsgSnap reports are the exception; see
+// postReliableDispatchReport.
 func (e *Engine) postDispatchReport(report dispatchReport) {
 	select {
 	case e.dispatchReportCh <- report:
@@ -1930,6 +1989,21 @@ func (e *Engine) postDispatchReport(report dispatchReport) {
 			"to", report.to,
 			"type", report.msgType.String(),
 		)
+	}
+}
+
+// postReliableDispatchReport delivers a dispatch outcome that must not be
+// dropped. SnapshotFinish and SnapshotFailure are not eventually consistent
+// with ordinary unreachable reports: if either is lost, raft can keep the
+// follower's Progress in StateSnapshot after the follower accepted or missed
+// the snapshot.
+func (e *Engine) postReliableDispatchReport(report dispatchReport) {
+	if e.dispatchReportCh == nil {
+		return
+	}
+	select {
+	case e.dispatchReportCh <- report:
+	case <-e.closeCh:
 	}
 }
 
@@ -2074,9 +2148,17 @@ func (e *Engine) handlePromoteLearner(req adminRequest) {
 
 // proposeMembershipChange wraps the encode + storePendingConfig +
 // ProposeConfChange dance shared by AddVoter / AddLearner /
-// PromoteLearner. The caller has already validated the leader and
+// PromoteLearner / RemoveServer. The caller has already validated the leader and
 // prevIndex preconditions in handleAdmin.
 func (e *Engine) proposeMembershipChange(req adminRequest, changeType raftpb.ConfChangeType, peer Peer) {
+	if err := e.reconcilePendingConfChangeFence(); err != nil {
+		req.done <- adminResult{err: err}
+		return
+	}
+	if e.hasPendingConfChange() {
+		req.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
+		return
+	}
 	contextBytes, err := encodeConfChangeContext(req.id, peer)
 	if err != nil {
 		req.done <- adminResult{err: err}
@@ -2106,24 +2188,7 @@ func (e *Engine) handleRemoveServer(req adminRequest) {
 		req.done <- adminResult{err: errors.Wrapf(errTransportPeerUnknown, "id=%q", req.peer.ID)}
 		return
 	}
-	contextBytes, err := encodeConfChangeContext(req.id, peer)
-	if err != nil {
-		req.done <- adminResult{err: err}
-		return
-	}
-	cc := raftpb.ConfChange{
-		Type:    confChangeTypePtr(raftpb.ConfChangeRemoveNode),
-		NodeId:  uint64Ptr(peer.NodeID),
-		Context: contextBytes,
-	}
-	if err := e.storePendingConfig(req); err != nil {
-		req.done <- adminResult{err: err}
-		return
-	}
-	if err := e.rawNode.ProposeConfChange(&cc); err != nil {
-		e.cancelPendingConfig(req.id)
-		req.done <- adminResult{err: errors.WithStack(err)}
-	}
+	e.proposeMembershipChange(req, raftpb.ConfChangeRemoveNode, peer)
 }
 
 func (e *Engine) handleTransferLeadership(req adminRequest) {
@@ -2226,6 +2291,7 @@ func (e *Engine) drainReady() error {
 		e.releaseProtectedReceivedFSMSnapshotsUpTo(e.appliedIndex.Load())
 		e.handleReadStates(rd.ReadStates)
 		e.rawNode.Advance(rd)
+		e.flushDeferredDispatchReports()
 		if err := e.maybePersistLocalSnapshot(); err != nil {
 			return err
 		}
@@ -2266,6 +2332,9 @@ func (e *Engine) persistReadyWithSnapshotLocked(rd etcdraft.Ready) error {
 	if err := persistReadyToWAL(e.persist, rd); err != nil {
 		return err
 	}
+	if err := e.persistReceivedSnapshotAppliedIndex(rd.Snapshot); err != nil {
+		return err
+	}
 	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(snapshotIndex(rd.Snapshot))
 	return nil
 }
@@ -2299,6 +2368,7 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 	commitBeforeStep := e.rawNode.Status().GetCommit()
 	if err := e.rawNode.Step(&msg); err != nil {
 		if errors.Is(err, etcdraft.ErrStepPeerNotFound) {
+			e.removeReceivedFSMSnapshotToken(msg)
 			e.unprotectReceivedFSMSnapshotToken(msg)
 			return
 		}
@@ -2306,9 +2376,11 @@ func (e *Engine) handleStep(msg raftpb.Message) {
 		return
 	}
 	if e.unprotectReceivedFSMSnapshotTokenIfCommitted(msg, commitBeforeStep) {
+		e.removeReceivedFSMSnapshotToken(msg)
 		return
 	}
 	if !e.rawNode.HasReady() {
+		e.removeReceivedFSMSnapshotToken(msg)
 		e.unprotectReceivedFSMSnapshotToken(msg)
 		return
 	}
@@ -2425,11 +2497,14 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
-	ch := e.selectDispatchLane(pd, msg.GetType())
+	ch := e.selectDispatchLaneForMessage(pd, msg)
 	// Avoid the expensive deep-clone in prepareDispatchRequest when the channel
 	// is already full. The len/cap check is safe here because this function is
 	// only ever called from the single engine event-loop goroutine.
 	if len(ch) >= cap(ch) {
+		if msg.GetType() == raftpb.MsgHeartbeatResp && coalesceHeartbeatResp(ch, msg) {
+			return nil
+		}
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
@@ -2444,12 +2519,65 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	}
 }
 
+func coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
+	if ch == nil || cap(ch) == 0 {
+		return false
+	}
+	n := len(ch)
+	if n == 0 {
+		return false
+	}
+
+	drained := make([]dispatchRequest, 0, n)
+	replaced := false
+	for i := 0; i < n; i++ {
+		req, ok := tryReceiveDispatchRequest(ch)
+		if !ok {
+			break
+		}
+		if !replaced && req.msg.GetType() == raftpb.MsgHeartbeatResp && len(req.msg.GetContext()) == 0 {
+			closeDispatchRequest(req)
+			drained = append(drained, prepareDispatchRequest(msg))
+			replaced = true
+			continue
+		}
+		drained = append(drained, req)
+	}
+	for _, req := range drained {
+		restoreDispatchRequest(ch, req)
+	}
+	return replaced
+}
+
+func tryReceiveDispatchRequest(ch chan dispatchRequest) (dispatchRequest, bool) {
+	select {
+	case req := <-ch:
+		return req, true
+	default:
+		return dispatchRequest{}, false
+	}
+}
+
+func restoreDispatchRequest(ch chan dispatchRequest, req dispatchRequest) {
+	select {
+	case ch <- req:
+	default:
+		closeDispatchRequest(req)
+	}
+}
+
+func closeDispatchRequest(req dispatchRequest) {
+	if err := req.Close(); err != nil {
+		slog.Error("etcd raft dispatch: failed to close request", "err", err)
+	}
+}
+
 // isPriorityMsg returns true for small, low-frequency control messages that
 // must not be queued behind large MsgApp payloads in the normal channel.
 // MsgAppResp is intentionally excluded: it is sent by followers, which never
 // send MsgApp, so it faces no head-of-line blocking in the normal channel.
-// Keeping it out of the priority queue preserves the low-frequency invariant
-// that justifies defaultHeartbeatBufPerPeer = 64.
+// Keeping MsgHeartbeatResp on its own coalescing lane preserves the
+// low-frequency invariant that justifies defaultHeartbeatBufPerPeer.
 func isPriorityMsg(t raftpb.MessageType) bool {
 	return t == raftpb.MsgHeartbeat || t == raftpb.MsgHeartbeatResp ||
 		t == raftpb.MsgReadIndex || t == raftpb.MsgReadIndexResp ||
@@ -2458,12 +2586,32 @@ func isPriorityMsg(t raftpb.MessageType) bool {
 		t == raftpb.MsgTimeoutNow
 }
 
+func isInboundPriorityMsg(t raftpb.MessageType) bool {
+	return isPriorityMsg(t) || t == raftpb.MsgSnap
+}
+
+func isBlockingInboundStepMsg(t raftpb.MessageType) bool {
+	return t == raftpb.MsgSnap || t == raftpb.MsgApp || t == raftpb.MsgAppResp
+}
+
 // selectDispatchLane picks the per-peer channel for msgType. In the legacy
-// 2-lane layout it returns pd.heartbeat for priority control traffic and
-// pd.normal for everything else. In the 4-lane layout it additionally
-// partitions the non-heartbeat traffic so that MsgApp/MsgAppResp and MsgSnap
-// do not share a goroutine and cannot block each other.
+// layout it returns pd.heartbeatResp for MsgHeartbeatResp, pd.heartbeat for
+// other priority control traffic, and pd.normal for everything else. In the
+// opt-in multi-lane layout it additionally partitions the non-heartbeat traffic
+// so that MsgApp/MsgAppResp and MsgSnap do not share a goroutine and cannot
+// block each other.
+func (e *Engine) selectDispatchLaneForMessage(pd *peerQueues, msg raftpb.Message) chan dispatchRequest {
+	msgType := msg.GetType()
+	if msgType == raftpb.MsgHeartbeatResp && len(msg.GetContext()) > 0 && pd.readIndexResp != nil {
+		return pd.readIndexResp
+	}
+	return e.selectDispatchLane(pd, msgType)
+}
+
 func (e *Engine) selectDispatchLane(pd *peerQueues, msgType raftpb.MessageType) chan dispatchRequest {
+	if msgType == raftpb.MsgHeartbeatResp && pd.heartbeatResp != nil {
+		return pd.heartbeatResp
+	}
 	// Priority control traffic (heartbeats, votes, read-index, timeout-now)
 	// always rides the heartbeat lane in both layouts so it keeps its
 	// low-latency treatment and is never stuck behind MsgApp payloads.
@@ -2531,15 +2679,6 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 		if err != nil {
 			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.GetMetadata().GetIndex())
 		}
-		// B3/follow-up: also call SetDurableAppliedIndex(tok.Index) here
-		// after Restore so peer-after-InstallSnapshot populates the meta
-		// key. The local-snapshot persist path already bumps the live
-		// store (engine.persistLocalSnapshotPayload), but the receiving
-		// node's restored store inherits the pre-bump value embedded in
-		// the snapshot artifact. Design Non-Goals §
-		// docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md#non-goals
-		// scopes this out of Branch 2; see PR #915 round-4/5 codex P2 on
-		// engine.go:4077 for the rationale.
 		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
 			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
 		}
@@ -2549,7 +2688,6 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
 		}
 	}
-
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
 			snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm())
@@ -2596,12 +2734,15 @@ func (e *Engine) applyReadyEntries(entries []*raftpb.Entry) error {
 	if len(entries) == 0 {
 		return nil
 	}
+	if err := e.storage.Append(entries); err != nil {
+		return errors.WithStack(err)
+	}
 	for _, entry := range entries {
 		if entry.GetType() == raftpb.EntryConfChange || entry.GetType() == raftpb.EntryConfChangeV2 {
 			e.markPendingConfChange(entry.GetIndex())
 		}
 	}
-	return errors.WithStack(e.storage.Append(entries))
+	return e.reconcilePendingConfChangeFence()
 }
 
 func (e *Engine) restorePendingConfChangeFenceFromStorage(applied uint64) error {
@@ -2680,6 +2821,9 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	}
 	snapshot, err := e.fsm.Snapshot()
 	if err != nil {
+		if snapshotDeferred(err, "local snapshot", e.applied) {
+			return nil
+		}
 		return errors.WithStack(err)
 	}
 
@@ -2688,6 +2832,23 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 		snapshot: snapshot,
 	}
 	return e.enqueueSnapshotRequest(req)
+}
+
+// snapshotDeferred reports whether a StateMachine.Snapshot error is the state
+// machine asking to be snapshotted later rather than a failure to capture it.
+// Every other Snapshot error stays fatal: the run loop calls fail() and the
+// replica exits, which is right when the state machine genuinely cannot be
+// captured and wrong when it is merely holding the snapshot back.
+func snapshotDeferred(err error, site string, index uint64) bool {
+	if !errors.Is(err, raftengine.ErrSnapshotDeferred) {
+		return false
+	}
+	slog.Warn("etcd raft engine: fsm deferred a snapshot",
+		"site", site,
+		"index", index,
+		"error", err,
+	)
+	return true
 }
 
 func (e *Engine) enqueueSnapshotRequest(req snapshotRequest) error {
@@ -3220,6 +3381,9 @@ func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState)
 
 	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
+		if snapshotDeferred(err, "config snapshot", index) {
+			return nil
+		}
 		return err
 	}
 	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
@@ -3256,6 +3420,14 @@ func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, pe
 
 	payload, err := e.snapshotPayloadLocked(index)
 	if err != nil {
+		// A deferred snapshot leaves configIndex where it is, so the next
+		// config change (or the first one after the deferral clears) persists
+		// the state again. Nothing is lost meanwhile: no snapshot means no log
+		// truncation, so replay still reaches this ConfState, and the peer
+		// metadata written above is allowed to lead the persisted snapshot.
+		if snapshotDeferred(err, "config state snapshot", index) {
+			return nil
+		}
 		return err
 	}
 	if err := e.persistConfigSnapshotPayloadLocked(index, confState, payload); err != nil {
@@ -3330,6 +3502,9 @@ func (e *Engine) protectReceivedFSMSnapshot(index uint64) bool {
 	if e.protectedReceivedFSMSnaps == nil {
 		e.protectedReceivedFSMSnaps = make(map[uint64]int, 1)
 	}
+	if e.protectedReceivedFSMSnaps[index] > 0 {
+		return false
+	}
 	e.protectedReceivedFSMSnaps[index]++
 	return true
 }
@@ -3370,9 +3545,46 @@ func (e *Engine) releaseProtectedReceivedFSMSnapshotsUpTo(index uint64) {
 	if index == 0 {
 		return
 	}
-	e.snapshotMu.Lock()
+	if !e.snapshotMu.TryLock() {
+		e.scheduleProtectedReceivedFSMSnapshotRelease(index)
+		return
+	}
 	defer e.snapshotMu.Unlock()
 	e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+}
+
+func (e *Engine) scheduleProtectedReceivedFSMSnapshotRelease(index uint64) {
+	for {
+		prev := e.pendingReceivedFSMReleaseIndex.Load()
+		if index <= prev {
+			break
+		}
+		if e.pendingReceivedFSMReleaseIndex.CompareAndSwap(prev, index) {
+			break
+		}
+	}
+	if e.pendingReceivedFSMReleaseRun.CompareAndSwap(false, true) {
+		go e.drainPendingProtectedReceivedFSMSnapshotRelease()
+	}
+}
+
+func (e *Engine) drainPendingProtectedReceivedFSMSnapshotRelease() {
+	for {
+		index := e.pendingReceivedFSMReleaseIndex.Swap(0)
+		if index != 0 {
+			e.snapshotMu.Lock()
+			e.releaseProtectedReceivedFSMSnapshotsUpToLocked(index)
+			e.snapshotMu.Unlock()
+		}
+
+		e.pendingReceivedFSMReleaseRun.Store(false)
+		if e.pendingReceivedFSMReleaseIndex.Load() == 0 {
+			return
+		}
+		if !e.pendingReceivedFSMReleaseRun.CompareAndSwap(false, true) {
+			return
+		}
+	}
 }
 
 func (e *Engine) unprotectReceivedFSMSnapshotTokenIfApplied(msg raftpb.Message) {
@@ -3416,6 +3628,7 @@ func (e *Engine) releaseIgnoredReceivedFSMSnapshotSteps(rd etcdraft.Ready) {
 		if index == readySnapshotIndex {
 			continue
 		}
+		e.removeReceivedFSMSnapshotIndex(index)
 		for i := 0; i < count; i++ {
 			e.unprotectReceivedFSMSnapshot(index)
 		}
@@ -3428,6 +3641,23 @@ func (e *Engine) unprotectReceivedFSMSnapshotToken(msg raftpb.Message) {
 		return
 	}
 	e.unprotectReceivedFSMSnapshot(index)
+}
+
+func (e *Engine) removeReceivedFSMSnapshotToken(msg raftpb.Message) {
+	index, ok := receivedFSMSnapshotTokenIndex(msg)
+	if !ok {
+		return
+	}
+	e.removeReceivedFSMSnapshotIndex(index)
+}
+
+func (e *Engine) removeReceivedFSMSnapshotIndex(index uint64) {
+	if e == nil || e.fsmSnapDir == "" || index == 0 {
+		return
+	}
+	e.snapshotMu.Lock()
+	defer e.snapshotMu.Unlock()
+	removeWithWarn(fsmSnapPath(e.fsmSnapDir, index), "ignored received fsm snapshot")
 }
 
 func receivedFSMSnapshotTokenIndex(msg raftpb.Message) (uint64, bool) {
@@ -3521,29 +3751,60 @@ func (e *Engine) createConfigSnapshot(index uint64, confState raftpb.ConfState, 
 	}
 }
 
+// setDurableAppliedIndex pins the FSM's durable applied index to a
+// known raft log index. FSMs that do not expose
+// raftengine.AppliedIndexWriter silently no-op; the skip optimisation
+// falls back to full restore for them (legacy test fakes, in-memory
+// backends).
+func (e *Engine) setDurableAppliedIndex(index uint64) error {
+	w, ok := e.fsm.(raftengine.AppliedIndexWriter)
+	if !ok {
+		return nil
+	}
+	return errors.WithStack(w.SetDurableAppliedIndex(index))
+}
+
 // bumpDurableAppliedIndexBeforeSave pins the FSM's durable applied
 // index to `index` BEFORE the engine calls persist.SaveSnap, so a
 // successful snapshot persist always implies LastAppliedIndex >=
 // snap.Metadata.Index — closes the HLC-lease-only / encryption-only
 // fallback (PR #910 design §6).
 //
-// FSMs that do not expose raftengine.AppliedIndexWriter silently
-// no-op; the skip optimisation falls back to full restore for them
-// (legacy test fakes, in-memory backends). pebble.Sync is forced on
-// the writer side regardless of ELASTICKV_FSM_SYNC_MODE — once
-// persist.SaveSnap returns, WAL compaction discards every log entry
-// at or before snap.Metadata.Index, so there is no source to replay
-// the meta key bump from.
+// pebble.Sync is forced on the writer side regardless of
+// ELASTICKV_FSM_SYNC_MODE — once persist.SaveSnap returns, WAL
+// compaction discards every log entry at or before snap.Metadata.Index,
+// so there is no source to replay the meta key bump from.
 //
 // Used by BOTH snapshot persist sites: persistCreatedSnapshot (this
 // file) and e.persistLocalSnapshotPayload (the steady-state
 // SnapshotCount-triggered hot path).
 func (e *Engine) bumpDurableAppliedIndexBeforeSave(index uint64) error {
-	w, ok := e.fsm.(raftengine.AppliedIndexWriter)
-	if !ok {
+	return e.setDurableAppliedIndex(index)
+}
+
+func (e *Engine) persistStartupAppliedIndex() error {
+	if e.applied == 0 {
 		return nil
 	}
-	return errors.WithStack(w.SetDurableAppliedIndex(index))
+	return e.setDurableAppliedIndex(e.applied)
+}
+
+// persistReceivedSnapshotAppliedIndex runs only after persistReadyToWAL has
+// saved the incoming raft snapshot. A crash before this point must fall back to
+// a full FSM restore instead of letting the FSM meta index get ahead of the
+// local durable raft snapshot.
+func (e *Engine) persistReceivedSnapshotAppliedIndex(snapshot *raftpb.Snapshot) error {
+	if etcdraft.IsEmptySnap(snapshot) {
+		return nil
+	}
+	index := snapshot.GetMetadata().GetIndex()
+	if index == 0 {
+		return nil
+	}
+	if err := e.setDurableAppliedIndex(index); err != nil {
+		return errors.Wrapf(err, "persist durable applied index from snapshot index=%d", index)
+	}
+	return nil
 }
 
 func (e *Engine) persistCreatedSnapshot(snap raftpb.Snapshot) error {
@@ -3608,18 +3869,19 @@ func (e *Engine) refreshStatus() {
 	leader := e.leaderInfo(basic.Lead)
 
 	status := raftengine.Status{
-		State:             state,
-		Leader:            leader,
-		Term:              basic.GetTerm(),
-		CommitIndex:       basic.GetCommit(),
-		AppliedIndex:      e.applied,
-		LastLogIndex:      lastLogIndex,
-		LastSnapshotIndex: snapshot.GetMetadata().GetIndex(),
-		FSMPending:        pendingEntries(basic.GetCommit(), e.applied),
-		NumPeers:          numRemoteServers(config.Servers, e.localID),
-		LastContact:       lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
-		LeadTransferee:    basic.LeadTransferee,
-		PendingConfChange: e.hasPendingConfChange(),
+		State:              state,
+		Leader:             leader,
+		Term:               basic.GetTerm(),
+		CommitIndex:        basic.GetCommit(),
+		AppliedIndex:       e.applied,
+		LastLogIndex:       lastLogIndex,
+		LastSnapshotIndex:  snapshot.GetMetadata().GetIndex(),
+		FSMPending:         pendingEntries(basic.GetCommit(), e.applied),
+		NumPeers:           numRemoteServers(config.Servers, e.localID),
+		LastContact:        lastContactFor(state, basic.Lead, e.lastLeaderContactFrom, e.lastLeaderContactAt),
+		ConfigurationIndex: e.currentConfigIndex(),
+		LeadTransferee:     basic.LeadTransferee,
+		PendingConfChange:  e.hasPendingConfChange(),
 	}
 
 	e.mu.Lock()
@@ -3677,13 +3939,6 @@ func (e *Engine) refreshStatus() {
 
 func (e *Engine) markStarted() {
 	e.startOnce.Do(func() { close(e.startedCh) })
-}
-
-func (e *Engine) openReady(waitForLeader bool) <-chan struct{} {
-	if waitForLeader {
-		return e.leaderReady
-	}
-	return e.startedCh
 }
 
 func (e *Engine) requestShutdown() {
@@ -3969,6 +4224,64 @@ func (e *Engine) clearPendingConfChange(appliedIndex uint64) {
 
 func (e *Engine) hasPendingConfChange() bool {
 	return e.pendingConfChangeIndex.Load() != 0
+}
+
+// reconcilePendingConfChangeFence drops a volatile fence when a later Ready
+// proves that the proposal at that index was overwritten after leadership
+// loss. A missing index is not enough: the proposal may still live only in
+// raft's unstable log, so the fence remains until storage covers the index.
+func (e *Engine) reconcilePendingConfChangeFence() error {
+	pending := e.pendingConfChangeIndex.Load()
+	if pending == 0 {
+		return nil
+	}
+	if e.storage == nil {
+		return nil
+	}
+	if e.appliedIndex.Load() >= pending {
+		e.clearPendingConfChange(pending)
+		return nil
+	}
+	covered, isConfChange, err := e.persistedPendingConfChange(pending)
+	if err != nil {
+		return err
+	}
+	if !covered {
+		return nil
+	}
+	if !isConfChange {
+		e.pendingConfChangeIndex.CompareAndSwap(pending, 0)
+	}
+	return nil
+}
+
+func (e *Engine) persistedPendingConfChange(index uint64) (bool, bool, error) {
+	firstIndex, err := e.storage.FirstIndex()
+	if err != nil {
+		return false, false, errors.Wrap(err, "reconcile pending conf-change fence: first index")
+	}
+	lastIndex, err := e.storage.LastIndex()
+	if err != nil {
+		return false, false, errors.Wrap(err, "reconcile pending conf-change fence: last index")
+	}
+	if lastIndex < index {
+		return false, false, nil
+	}
+	if index < firstIndex {
+		return true, false, nil
+	}
+	if index == math.MaxUint64 {
+		return false, false, errors.New("reconcile pending conf-change fence: index overflows half-open range")
+	}
+	entries, err := e.storage.Entries(index, index+1, math.MaxUint64)
+	if err != nil {
+		return false, false, errors.Wrapf(err, "reconcile pending conf-change fence: entry %d", index)
+	}
+	if len(entries) != 1 {
+		return false, false, errors.Errorf("reconcile pending conf-change fence: expected one entry at %d, got %d", index, len(entries))
+	}
+	entryType := entries[0].GetType()
+	return true, entryType == raftpb.EntryConfChange || entryType == raftpb.EntryConfChangeV2, nil
 }
 
 func (e *Engine) shouldCampaignSingleNode() bool {
@@ -4302,9 +4615,10 @@ func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
 }
 
 func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
-	ch := e.stepCh
-	if isPriorityMsg(msg.GetType()) && e.priorityStepCh != nil {
-		ch = e.priorityStepCh
+	ch := e.stepChannelFor(msg.GetType())
+
+	if isBlockingInboundStepMsg(msg.GetType()) {
+		return e.enqueueBlockingStep(ctx, ch, msg)
 	}
 
 	select {
@@ -4317,6 +4631,31 @@ func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
 	default:
 		e.stepQueueFullCount.Add(1)
 		return errors.WithStack(errStepQueueFull)
+	}
+}
+
+func (e *Engine) stepChannelFor(msgType raftpb.MessageType) chan raftpb.Message {
+	if isInboundPriorityMsg(msgType) && e.priorityStepCh != nil {
+		return e.priorityStepCh
+	}
+	return e.stepCh
+}
+
+func (e *Engine) enqueueBlockingStep(ctx context.Context, ch chan raftpb.Message, msg raftpb.Message) error {
+	select {
+	case ch <- msg:
+		return nil
+	default:
+		e.stepQueueFullCount.Add(1)
+	}
+
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-e.doneCh:
+		return e.currentErrorOrClosed()
+	case ch <- msg:
+		return nil
 	}
 }
 
@@ -4372,24 +4711,27 @@ func (e *Engine) startPeerDispatcher(nodeID uint64) {
 	}
 	ctx, cancel := context.WithCancel(baseCtx)
 	pd := &peerQueues{
-		heartbeat: make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
-		ctx:       ctx,
-		cancel:    cancel,
+		heartbeat:     make(chan dispatchRequest, defaultHeartbeatBufPerPeer),
+		heartbeatResp: make(chan dispatchRequest, defaultHeartbeatRespBufPerPeer),
+		readIndexResp: make(chan dispatchRequest, defaultReadIndexRespBufPerPeer),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	var workers []chan dispatchRequest
 	if e.dispatcherLanesEnabled {
-		// 4-lane layout: split MsgApp/MsgAppResp (replication), MsgSnap
-		// (snapshot), and misc (other) onto independent goroutines so a
-		// bulky snapshot transfer cannot stall replication. Each channel
-		// still serves a single peer, so within-type ordering (the raft
-		// invariant we care about for MsgApp) is preserved.
+		// 6-lane layout: split MsgHeartbeatResp, ReadIndex heartbeat
+		// responses, MsgApp/MsgAppResp (replication), MsgSnap (snapshot), and
+		// misc (other) onto independent goroutines so a bulky snapshot transfer
+		// cannot stall replication or follower heartbeat responses. Each channel
+		// still serves a single peer, so within-type ordering (the raft invariant
+		// we care about for MsgApp) is preserved.
 		pd.replication = make(chan dispatchRequest, size)
 		pd.snapshot = make(chan dispatchRequest, defaultSnapshotLaneBufPerPeer)
 		pd.other = make(chan dispatchRequest, defaultOtherLaneBufPerPeer)
-		workers = []chan dispatchRequest{pd.heartbeat, pd.replication, pd.snapshot, pd.other}
+		workers = []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.readIndexResp, pd.replication, pd.snapshot, pd.other}
 	} else {
 		pd.normal = make(chan dispatchRequest, size)
-		workers = []chan dispatchRequest{pd.normal, pd.heartbeat}
+		workers = []chan dispatchRequest{pd.normal, pd.heartbeat, pd.heartbeatResp, pd.readIndexResp}
 	}
 	e.peerDispatchers[nodeID] = pd
 	e.dispatchWG.Add(len(workers))
@@ -4423,6 +4765,12 @@ func (e *Engine) snapshotThreshold() uint64 {
 	return e.snapshotEvery
 }
 
+// SnapshotEvery returns the configured FSM-snapshot trigger threshold for
+// admin/control-plane code that needs to reason about snapshot headroom.
+func (e *Engine) SnapshotEvery() uint64 {
+	return e.snapshotThreshold()
+}
+
 // snapshotEveryFromEnv returns the FSM-snapshot trigger threshold (in applied
 // raft entries past the last snapshot). Operators can override via
 // ELASTICKV_RAFT_SNAPSHOT_COUNT; invalid or missing values fall back to
@@ -4446,7 +4794,7 @@ func snapshotEveryFromEnv() uint64 {
 	return n
 }
 
-// dispatcherLanesEnabledFromEnv returns true when the 4-lane dispatcher has
+// dispatcherLanesEnabledFromEnv returns true when the multi-lane dispatcher has
 // been explicitly opted into via ELASTICKV_RAFT_DISPATCHER_LANES. The value
 // is parsed with strconv.ParseBool, which accepts the standard tokens
 // (1, t, T, TRUE, true, True enable; 0, f, F, FALSE, false, False disable).
@@ -4475,10 +4823,10 @@ func preVoteEnabledFromEnv() bool {
 }
 
 // closePeerLanes closes every non-nil dispatch channel on pd so that the
-// drain loops in runDispatchWorker exit. It is safe to call with either the
-// 2-lane or 4-lane layout because unused lanes are nil.
+// drain loops in runDispatchWorker exit. It is safe to call with any dispatch
+// layout because unused lanes are nil.
 func closePeerLanes(pd *peerQueues) {
-	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.normal, pd.replication, pd.snapshot, pd.other} {
+	for _, ch := range []chan dispatchRequest{pd.heartbeat, pd.heartbeatResp, pd.readIndexResp, pd.normal, pd.replication, pd.snapshot, pd.other} {
 		if ch != nil {
 			close(ch)
 		}
@@ -4517,7 +4865,11 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	if err := req.Close(); err != nil {
 		slog.Error("etcd raft dispatch: failed to close request", "err", err)
 	}
-	if dispatchErr == nil || errors.Is(dispatchErr, ctx.Err()) {
+	if dispatchErr == nil {
+		e.reportSuccessfulDispatch(req.msg)
+		return
+	}
+	if errors.Is(dispatchErr, ctx.Err()) {
 		return
 	}
 	code := dispatchErrorCodeOf(dispatchErr)
@@ -4536,7 +4888,18 @@ func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest)
 	// out of StateReplicate / StateSnapshot. Without this the leader keeps
 	// Progress stuck and never retries sendAppend/sendSnap for the peer,
 	// leaving the follower indefinitely stale even after heartbeats resume.
-	e.postDispatchReport(dispatchReport{to: req.msg.GetTo(), msgType: req.msg.GetType()})
+	e.reportFailedDispatch(req.msg)
+}
+
+func (e *Engine) reportSuccessfulDispatch(msg raftpb.Message) {
+	if msg.GetType() != raftpb.MsgSnap {
+		return
+	}
+	e.postReliableDispatchReport(dispatchReport{
+		to:             msg.GetTo(),
+		msgType:        msg.GetType(),
+		snapshotFinish: true,
+	})
 }
 
 func (e *Engine) stopDispatchWorkers() {
@@ -4888,10 +5251,39 @@ func (e *Engine) recordDroppedDispatch(msg raftpb.Message) {
 }
 
 func (e *Engine) reportDroppedDispatch(msg raftpb.Message) {
+	report := dispatchReport{to: msg.GetTo(), msgType: msg.GetType()}
+	if msg.GetType() == raftpb.MsgSnap {
+		e.deferReadyDispatchReport(report)
+		return
+	}
 	if e.dispatchReportCh == nil {
 		return
 	}
-	e.postDispatchReport(dispatchReport{to: msg.GetTo(), msgType: msg.GetType()})
+	e.postDispatchReport(report)
+}
+
+func (e *Engine) reportFailedDispatch(msg raftpb.Message) {
+	report := dispatchReport{to: msg.GetTo(), msgType: msg.GetType()}
+	if msg.GetType() == raftpb.MsgSnap {
+		e.postReliableDispatchReport(report)
+		return
+	}
+	e.postDispatchReport(report)
+}
+
+func (e *Engine) deferReadyDispatchReport(report dispatchReport) {
+	e.deferredReadyDispatchReports = append(e.deferredReadyDispatchReports, report)
+}
+
+func (e *Engine) flushDeferredDispatchReports() {
+	if len(e.deferredReadyDispatchReports) == 0 {
+		return
+	}
+	reports := e.deferredReadyDispatchReports
+	e.deferredReadyDispatchReports = nil
+	for _, report := range reports {
+		e.handleDispatchReport(report)
+	}
 }
 
 // dispatchErrorCodeOf extracts the grpc status code name from err, or

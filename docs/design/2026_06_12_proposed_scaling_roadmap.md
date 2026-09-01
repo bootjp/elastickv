@@ -4,13 +4,16 @@
 **Author:** bootjp
 **Date:** 2026-06-12
 
+> **Superseded roadmap index:**
 > This document is retained as the original sequencing and SLO record. It is
 > not an implementation specification and must not be used as the scope for a
 > combined implementation PR. The
 > [2026-06-23 roadmap](2026_06_23_proposed_scaling_roadmap.md) audits the current
 > implementation, closes completed prerequisites, and tracks the remaining
-> work as separate design documents and milestone PRs.
-
+> work as separate design documents and milestone PRs. It is the current
+> ownership and sequencing authority; this historical document does not
+> describe the current implementation status of its milestones.
+>
 > This roadmap captures the scaling work elastickv needs across four
 > subsystems that today have known ceilings and have not yet been
 > designed past those ceilings. The roadmap itself is not a single
@@ -18,8 +21,8 @@
 > sibling `*_proposed_*.md` design that will land later as its own PR.
 > Per CLAUDE.md the design-doc-first workflow applies: each milestone
 > below ships its own `*_proposed_*` doc before its implementation
-> starts; this file is the shared north star and the sequencing
-> constraint between them.
+> starts. The June 23 ownership index now records the authoritative
+> requirement-by-requirement disposition and sequencing constraints.
 
 ## 1. Motivation
 
@@ -30,7 +33,7 @@ production envelope within one growth cycle:
 
 | Dimension | Today's comfortable ceiling | Where the next operator wants to go | Triggering signal |
 | --- | --- | --- | --- |
-| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_partial_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
+| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_implemented_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
 | Region/DC fan-out | Single DC, LAN-tuned etcd/raft (10 ms tick, 100 ms heartbeat, 1 s election), single default-group HLC ceiling | 2–3 regions with active-active per-shard | Disaster-recovery SLO ("survive a region outage with < 30 s data-plane reconvergence") |
 | Bytes per shard | ~1 TB before snapshot transfer / WAL replay becomes operational pain | 5–10 TB per shard, with shard counts in the 100 k range | DynamoDB-compatibility customers ingesting at multi-GiB/s per table |
 | Per-node QPS | Leader-bound write, lease-read scales across shards but only on each shard's leader | 5–10x current per-node throughput; sustained reads from non-leader replicas | Redis-compatibility migration projects ingesting from upstream Redis where the upstream serves reads from replicas |
@@ -84,12 +87,13 @@ Breakage points:
 references anywhere in `kv/`, `distribution/`, or
 `internal/raftengine/etcd/`. Everything is single-region etcd/raft.
 
-HLC is `kv/hlc.go` + `kv/coordinator.go`: physical ceiling is
-Raft-agreed via `ProposeHLCLease`, `hlcPhysicalWindowMs = 3 s`,
-renewed every `hlcRenewalInterval = 1 s` from the **default-group
-leader only** (`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced`
-fails closed with `ErrCeilingExpired` once `wall_now >= ceiling`.
-Wall clock is `time.Now().UnixMilli()` — assumes NTP-synced hosts.
+HLC is `kv/hlc.go` + `kv/coordinator.go` +
+`kv/sharded_coordinator.go`: physical ceiling is Raft-agreed via
+`ProposeHLCLease`, `hlcPhysicalWindowMs = 20 s`, renewed every
+`hlcRenewalInterval = 1 s` by each led shard group
+(`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced` fails closed
+with `ErrCeilingExpired` once `wall_now >= ceiling`. Wall clock is
+`time.Now().UnixMilli()` — assumes NTP-synced hosts.
 
 Raft engine (`internal/raftengine/etcd/engine.go`):
 `defaultTickInterval = 10 ms`, `defaultHeartbeatTick = 10` (100 ms),
@@ -98,10 +102,11 @@ LAN-tuned; would spuriously election-time-out cross-WAN.
 
 Multi-region blockers:
 
-- HLC ceiling is **single-point** — default-group leader proposes
-  every 1 s; cross-region default-group leadership means every
-  shard's persistence-grade ts depends on a cross-WAN propose. 1 s
-  WAN RTT + 1 s renewal interval ≈ no margin against the 3 s window.
+- HLC ceiling renewal is **per Raft group** — each shard group leader
+  proposes every 1 s, so cross-region leadership for that group makes
+  its persistence-grade ts depend on cross-WAN quorum progress. 1 s WAN
+  RTT is now less likely to expire the 20 s window immediately, but
+  every renewal still depends on that group's cross-WAN quorum progress.
 - 100 ms heartbeat / 1 s election timeout cannot run cross-DC.
 - No TrueTime/clockbound integration.
 - Cross-shard txns are blocked (`ErrCrossShardTransactionNotSupported`),
@@ -135,7 +140,7 @@ Storage breakage at 1–10 TB/shard:
 - Snapshot transfer is a single-stream full-iter scan; at 1 TB it
   is hours, pins SSTs (blocks compaction reclamation), and any raft
   snapshot transfer serializes through it.
-- WAL replay between `defaultSnapshotEvery = 10 000` raft entries
+- WAL replay between `defaultSnapshotEvery = 100 000` raft entries
   can be multi-GiB; with `pebble.Sync` durability path the replay
   is tens of minutes.
 - Pebble L0CompactionThreshold / LBaseMaxBytes / compaction
@@ -316,10 +321,10 @@ whole cluster; cross-WAN that is a 1 s RTT cliff. Options surveyed:
   service.** Operationally heavy (needs reliable atomic-clock
   reference per DC); rejected as v1.
 - **Option C — Stretched single ceiling with relaxed window.**
-  Increase `hlcPhysicalWindowMs` to 30 s; renewal still cross-WAN
-  but the failure mode is "slow ts allocation," not "no ts
-  allocation." Useful as a fallback when option A is partially
-  shipped.
+  `hlcPhysicalWindowMs = 20 s` is now the local-resilience baseline.
+  It reduces accidental ceiling expiry under load, but renewal still
+  depends on each route's shard group quorum and is not a complete
+  cross-region design by itself.
 
 V1 = option A. Carries the existing M2 hotspot-split monotone-merge
 contract over the region boundary.
@@ -349,7 +354,7 @@ control-plane (`*_proposed_*` doc TBD).**
 - M1 standalone but doesn't enable cross-region writes — it just
   makes Raft survive cross-WAN partition.
 - M2 depends on the M2 hotspot-split migration contract
-  (`2026_06_11_proposed_hotspot_split_milestone2_migration.md`)
+  (`2026_06_11_partial_hotspot_split_milestone2_migration.md`)
   being implemented so the monotone-merge primitive exists.
 - M3 depends on M1's region-aware membership and M2's per-region
   ceiling.
@@ -409,7 +414,7 @@ TBD).**
   reuses the existing TTL helper path.
 
 **M4 — Disaster-recovery snapshot offload
-([`2026_07_19_proposed_physical_snapshot_object_offload.md`](2026_07_19_proposed_physical_snapshot_object_offload.md)).**
+([`2026_07_19_partial_physical_snapshot_object_offload.md`](2026_07_19_partial_physical_snapshot_object_offload.md)).**
 - Periodic per-shard Pebble snapshot uploaded to an S3-compatible
   bucket (the S3 adapter already speaks the protocol).
 - Restore is `s3 fetch → pebble.Ingest`; combined with M1's
@@ -545,7 +550,7 @@ the ceiling shape:
 Composability invariant: **every monotone-merge happens via the
 same `SetPhysicalCeiling` + `Observe` primitive**. The M2
 hotspot-split contract (§6.2.1 of
-`2026_06_11_proposed_hotspot_split_milestone2_migration.md`) is the
+`2026_06_11_partial_hotspot_split_milestone2_migration.md`) is the
 reference implementation; per-region and per-group merges reuse it.
 
 ### 7.2 Capability bits

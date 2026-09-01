@@ -14,11 +14,11 @@
 //
 // Hot-path properties (see design §5.1, §10):
 //
-//   - Observe is a single atomic.Pointer[routeTable].Load, a plain map
-//     lookup against an immutable snapshot, and at most two
-//     atomic.AddUint64 calls (one for the count, one for bytes —
-//     skipped when both keyLen and valueLen are zero). No allocation,
-//     no mutex.
+//   - With hot-key tracking disabled, Observe is a single
+//     atomic.Pointer[routeTable].Load, a plain map lookup against an immutable
+//     snapshot, and at most two atomic.AddUint64 calls. Hot-key tracking adds a
+//     read lock to writes so sampled events stay aligned with their counter
+//     window.
 //   - Flush drains the per-route counters with atomic.SwapUint64; no
 //     pointer retirement, so a late writer cannot race past the snapshot
 //     and lose counts.
@@ -31,6 +31,7 @@ package keyviz
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"log/slog"
 	"math"
@@ -201,6 +202,11 @@ type MemSamplerOptions struct {
 type MemSampler struct {
 	opts MemSamplerOptions
 	now  func() time.Time
+	// flushMu serializes explicit and background flushes, protects the
+	// committed window lower boundary, and aligns enabled hot-key events with
+	// the counter window drained by that flush.
+	flushMu     sync.RWMutex
+	lastFlushAt time.Time
 
 	// table holds the immutable map of currently-tracked routes. The
 	// hot path Observe() does a single Load + map lookup; mutations
@@ -425,10 +431,15 @@ func (s *routeSlot) snapshotMeta() (start, end []byte, aggregate bool, members [
 	return
 }
 
-// MatrixColumn is one slice of the heatmap at a single flush time.
+// MatrixColumn is one committed heatmap window.
 type MatrixColumn struct {
-	At   time.Time
-	Rows []MatrixRow
+	// WindowStart and At delimit the committed half-open sampler
+	// interval. Rows and HotKeys contain evidence drained for
+	// (WindowStart, At].
+	WindowStart time.Time
+	At          time.Time
+	Rows        []MatrixRow
+	HotKeys     []KeyvizHotKeysSnapshot
 }
 
 // MatrixRow is a single route or virtual bucket's counter snapshot
@@ -509,10 +520,11 @@ func NewMemSampler(opts MemSamplerOptions) *MemSampler {
 		now = time.Now
 	}
 	s := &MemSampler{
-		opts:       opts,
-		now:        now,
-		history:    newRingBuffer(opts.HistoryColumns),
-		groupTerms: map[uint64]uint64{},
+		opts:        opts,
+		now:         now,
+		history:     newRingBuffer(opts.HistoryColumns),
+		groupTerms:  map[uint64]uint64{},
+		lastFlushAt: now(),
 	}
 	s.table.Store(newEmptyRouteTable())
 	if opts.HotKeysEnabled {
@@ -651,6 +663,14 @@ func (s *MemSampler) Observe(routeID uint64, key []byte, op Op, valueLen int, la
 	if s == nil {
 		return
 	}
+	if s.hotKeys != nil && op == OpWrite {
+		s.flushMu.RLock()
+		defer s.flushMu.RUnlock()
+	}
+	s.observe(routeID, key, op, valueLen, label)
+}
+
+func (s *MemSampler) observe(routeID uint64, key []byte, op Op, valueLen int, label Label) {
 	if !s.opts.KeyVizLabelsEnabled {
 		label = LabelLegacy
 	}
@@ -1205,7 +1225,37 @@ func (s *MemSampler) Flush() {
 	if s == nil {
 		return
 	}
-	col := MatrixColumn{At: s.now()}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+	s.flushAtLocked(s.now(), nil)
+}
+
+func (s *MemSampler) flushWindow(ctx context.Context, at time.Time) bool {
+	if s == nil {
+		return true
+	}
+	s.flushMu.Lock()
+	defer s.flushMu.Unlock()
+
+	var hotKeys []KeyvizHotKeysSnapshot
+	if s.hotKeys != nil {
+		var ok bool
+		hotKeys, ok = s.hotKeys.snapshotWindow(ctx, s.lastFlushAt, at)
+		if !ok {
+			return false
+		}
+	}
+	s.flushAtLocked(at, hotKeys)
+	return true
+}
+
+func (s *MemSampler) flushAtLocked(at time.Time, hotKeys []KeyvizHotKeysSnapshot) {
+	col := MatrixColumn{
+		WindowStart: s.lastFlushAt,
+		At:          at,
+		HotKeys:     hotKeys,
+	}
+	s.lastFlushAt = at
 	// Snapshot the per-group leader-term map once at the top of
 	// Flush so every row in this column sees a consistent view, even
 	// if SetLeaderTerm fires concurrently. Later rows can never
@@ -1229,6 +1279,9 @@ func (s *MemSampler) Flush() {
 	})
 
 	s.historyMu.Lock()
+	if !col.WindowStart.Before(col.At) {
+		col.WindowStart = col.At.Add(-s.opts.Step)
+	}
 	s.history.Push(col)
 	s.historyMu.Unlock()
 }

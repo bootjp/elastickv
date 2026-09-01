@@ -399,6 +399,96 @@ func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(wireErr))
 }
 
+func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
+	t.Parallel()
+
+	wireErr := errors.WithStack(status.Error(codes.Aborted,
+		"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error()))
+	attempts := 0
+	srv := &RedisServer{}
+	err := srv.retryRedisWrite(context.Background(), func() error {
+		attempts++
+		if attempts == 1 {
+			return wireErr
+		}
+		return nil
+	})
+
+	require.NoError(t, err)
+	require.Equal(t, 2, attempts)
+}
+
+func TestComposedRouteErrorsAreRetryableButDoNotPreserveAttempts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "typed violation", err: kv.ErrComposed1Violation},
+		{name: "typed gc", err: kv.ErrComposed1VersionGCd},
+		{
+			name: "wire violation",
+			err: errors.WithStack(status.Error(codes.Aborted,
+				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error())),
+		},
+		{
+			name: "wire gc",
+			err: errors.WithStack(status.Error(codes.Aborted,
+				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1VersionGCd.Error())),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.True(t, isRetryableRedisTxnErr(tt.err))
+			require.False(t, shouldPreserveRedisTxnAttempt(tt.err))
+		})
+	}
+}
+
+func TestRetryRedisWriteDoesNotTreatComposedSentinelInWireConflictKeyAsRouteError(t *testing.T) {
+	t.Parallel()
+
+	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			t.Parallel()
+			wireErr := errors.WithStack(status.Error(codes.Unknown,
+				store.NewWriteConflictError([]byte("retry:"+sentinel.Error())).Error()))
+			attempts := 0
+			srv := &RedisServer{}
+
+			err := srv.retryRedisWrite(context.Background(), func() error {
+				attempts++
+				return wireErr
+			})
+
+			require.ErrorIs(t, err, store.ErrWriteConflict)
+			require.NotErrorIs(t, err, sentinel)
+			require.Equal(t, 1, attempts)
+		})
+	}
+}
+
+func TestNormalizeRetryableRedisTxnErrPrefersWireTxnKeyEnvelope(t *testing.T) {
+	t.Parallel()
+
+	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			t.Parallel()
+			wireErr := errors.WithStack(status.Error(codes.Aborted,
+				kv.NewTxnLockedError([]byte("locked:"+sentinel.Error())).Error()))
+
+			err := normalizeRetryableRedisTxnErr(wireErr)
+
+			require.ErrorIs(t, err, kv.ErrTxnLocked)
+			require.NotErrorIs(t, err, sentinel)
+		})
+	}
+}
+
 func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 	t.Parallel()
 
@@ -550,6 +640,7 @@ func TestRetryPolicyForRedisTxnErr(t *testing.T) {
 
 	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(store.ErrWriteConflict))
 	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrTxnLocked))
+	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrRouteWriteFenced))
 }
 
 // TestZCard_LegacyBlobZSet verifies that ZCARD inside a Lua script returns the
@@ -748,4 +839,57 @@ func TestZRemDeletesWideColumnRows(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, []redisZSetEntry{{Member: "b", Score: 2.0}}, zset.Entries)
+}
+
+func TestElasticKVZRemFastSkipsWrongTypeMiss(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("internal:zremfast:string")
+	require.NoError(t, st.PutAt(ctx, redisStrKey(key), encodeRedisStr([]byte("value"), nil), 1, 0))
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock.Observe(1)
+	srv := NewRedisServer(nil, "", st, coord, nil, nil)
+
+	normalConn := &recordingConn{}
+	srv.zrem(normalConn, redcon.Command{Args: [][]byte{[]byte("ZREM"), key, []byte("member")}})
+	require.Contains(t, normalConn.err, wrongTypeMessage)
+
+	fastConn := &recordingConn{}
+	srv.elasticKVZRemFast(fastConn, redcon.Command{Args: [][]byte{[]byte(cmdElasticKVZRemFast), key, []byte("member")}})
+	require.Empty(t, fastConn.err)
+	require.Equal(t, int64(0), fastConn.int)
+}
+
+func TestElasticKVZRemFastRemovesLegacyBlobZSet(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	key := []byte("internal:zremfast:legacy")
+	payload, err := marshalZSetValue(redisZSetValue{
+		Entries: []redisZSetEntry{
+			{Member: "a", Score: 1},
+			{Member: "b", Score: 2},
+		},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.PutAt(ctx, redisZSetKey(key), payload, 1, 0))
+
+	coord := newRetryOnceCoordinator(st)
+	coord.clock.Observe(1)
+	srv := NewRedisServer(nil, "", st, coord, nil, nil)
+
+	conn := &recordingConn{}
+	srv.elasticKVZRemFast(conn, redcon.Command{Args: [][]byte{[]byte(cmdElasticKVZRemFast), key, []byte("a")}})
+
+	require.Empty(t, conn.err)
+	require.Equal(t, int64(1), conn.int)
+
+	zset, exists, err := srv.loadZSetAt(ctx, key, snapshotTS(coord.clock, st))
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, []redisZSetEntry{{Member: "b", Score: 2}}, zset.Entries)
 }

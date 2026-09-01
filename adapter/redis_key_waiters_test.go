@@ -110,7 +110,7 @@ func TestKeyWaiterRegistry_SignalFullDowngradesCoalescedFastSignal(t *testing.T)
 	reg.Signal([]byte("k"))
 	reg.SignalFull([]byte("k"))
 
-	fast := waitForBlockedCommandUpdate(context.Background(), w, time.Now().Add(time.Second))
+	fast := waitForBlockedCommandUpdate(context.Background(), w, time.Now().Add(time.Second), defaultRedisBlockWaitFallback)
 	if fast {
 		t.Fatal("SignalFull must force the next wake to use the full re-check")
 	}

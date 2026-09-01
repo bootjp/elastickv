@@ -54,6 +54,10 @@ const (
 	leaderChurnRetryTimeout = 5 * time.Second
 	// leaderChurnRetryInterval is the poll interval between retries.
 	leaderChurnRetryInterval = 50 * time.Millisecond
+
+	// testRedisBlockWaitFallback preserves the short wait-loop fallback in
+	// integration tests while production defaults to a coarser interval.
+	testRedisBlockWaitFallback = 100 * time.Millisecond
 )
 
 func newTestFactory() raftengine.Factory {
@@ -654,6 +658,7 @@ func setupNodes(t *testing.T, ctx context.Context, n int, ports []portsAdress) (
 		go func() { _ = dc.Run(opsCtx) }()
 		rd := NewRedisServer(redisSock, port.redisAddress, routedStore, coordinator, leaderRedisMap, relay,
 			WithRedisCompactor(dc),
+			WithRedisBlockWaitFallback(testRedisBlockWaitFallback),
 		)
 		go func(server *RedisServer) {
 			assert.NoError(t, server.Run())

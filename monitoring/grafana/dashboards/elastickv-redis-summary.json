@@ -1683,7 +1683,7 @@
           ],
           "title": "Raft Queue Saturation (stepCh full / outbound drops / errors)",
           "type": "timeseries",
-          "description": "Counter rates from the etcd raft engine. step-queue-full means inbound messages from remote peers were dropped because the local raft loop was too slow to consume the selected step queue (the 'etcd raft inbound step queue is full' log line). dispatch-dropped means outbound messages were discarded before transport because the per-peer channel was full. dispatch-errors means transport delivery failed. The pre-#560 seek storm caused all three to spike together; watch for them to fall after the rollout and stay flat."
+          "description": "Counter rates from the etcd raft engine. step-queue-full means inbound messages from remote peers found the selected step queue full; blocking replication messages now wait for space, while best-effort message classes may still be rejected. dispatch-dropped means outbound messages were discarded before transport because the per-peer channel was full. dispatch-errors means transport delivery failed. The pre-#560 seek storm caused all three to spike together; watch for them to fall after the rollout and stay flat."
         },
         {
           "datasource": "$datasource",

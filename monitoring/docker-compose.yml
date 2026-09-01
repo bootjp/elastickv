@@ -1,6 +1,6 @@
 services:
   prometheus:
-    image: prom/prometheus:v3.13.1
+    image: prom/prometheus:v3.14.0
     command:
       - --config.file=/etc/prometheus/prometheus.yml
       - --storage.tsdb.path=/prometheus
@@ -13,7 +13,7 @@ services:
       - "host.docker.internal:host-gateway"
 
   grafana:
-    image: grafana/grafana:13.1.0
+    image: grafana/grafana:13.2.0
     depends_on:
       - prometheus
     ports:

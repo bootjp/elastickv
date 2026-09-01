@@ -75,3 +75,26 @@ func TestExtractStreamUserKeyFromEntry_RoundTrip(t *testing.T) {
 		t.Fatalf("round trip: want %q, got %q", want, got)
 	}
 }
+
+func TestExtractStreamUserKeyFromEntryScanPrefix_RoundTrip(t *testing.T) {
+	t.Parallel()
+	want := []byte("entry-scan-user-key")
+	if got := ExtractStreamUserKeyFromEntryScanPrefix(StreamEntryScanPrefix(want)); !bytes.Equal(got, want) {
+		t.Fatalf("scan prefix round trip: want %q, got %q", want, got)
+	}
+}
+
+func TestExtractStreamUserKeyRejectsForeignPrefixes(t *testing.T) {
+	t.Parallel()
+
+	key := append([]byte{0, 0, 0, 1}, 'x')
+	if got := ExtractStreamUserKeyFromMeta(key); got != nil {
+		t.Fatalf("meta extractor accepted non-stream key: %q", got)
+	}
+	if got := ExtractStreamUserKeyFromEntry(key); got != nil {
+		t.Fatalf("entry extractor accepted non-stream key: %q", got)
+	}
+	if got := ExtractStreamUserKeyFromEntryScanPrefix(key); got != nil {
+		t.Fatalf("entry scan extractor accepted non-stream key: %q", got)
+	}
+}

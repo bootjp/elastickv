@@ -122,6 +122,15 @@ func WithS3BlobPushBlocked(blocked func() bool) S3ServerOption {
 	}
 }
 
+func WithS3BlobBackfiller(backfiller *S3BlobBackfiller) S3ServerOption {
+	return func(server *S3Server) {
+		if server == nil {
+			return
+		}
+		server.blobBackfiller = backfiller
+	}
+}
+
 // S3BlobMinReplicasFromEnv returns zero when the dynamic Raft-quorum default
 // should be used. Explicit values below two are rejected because a leader-only
 // chunkblob is weaker than the legacy Raft data path.

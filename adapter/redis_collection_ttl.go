@@ -70,6 +70,10 @@ func (r *RedisServer) listInlineTTLAt(ctx context.Context, userKey []byte, readT
 	return ttl, true, nil
 }
 
+func isStreamInlineMeta(raw []byte) bool {
+	return len(raw) == redisWideMetaInlineSizeBytes || len(raw) == store.StreamMetaTrimBinarySize
+}
+
 func (r *RedisServer) simpleInlineTTLAt(
 	ctx context.Context,
 	metaKey []byte,
@@ -117,7 +121,7 @@ func (r *RedisServer) streamInlineTTLAt(ctx context.Context, userKey []byte, rea
 		}
 		return nil, false, errors.WithStack(err)
 	}
-	if len(raw) != redisWideMetaInlineSizeBytes {
+	if !isStreamInlineMeta(raw) {
 		return nil, false, nil
 	}
 	meta, err := store.UnmarshalStreamMeta(raw)
@@ -340,8 +344,7 @@ func (r *RedisServer) listMetaExpireElems(ctx context.Context, key []byte, readT
 	if err != nil {
 		return nil, false, err
 	}
-	prefix := store.ListMetaDeltaScanPrefix(key)
-	deltas, err := r.scanDeltaKVs(ctx, prefix, readTS)
+	deltas, err := r.scanListMetaDeltaKVs(ctx, key, readTS)
 	if err != nil {
 		return r.listMetaExpireScanErr(key, meta, exists, expireAtMs, err)
 	}
@@ -379,6 +382,7 @@ func (r *RedisServer) listMetaExpireScanErr(
 		return nil, false, err
 	}
 	r.triggerUrgentCompaction("list", key)
+	r.triggerUrgentCompaction("list-legacy", key)
 	if exists {
 		return listMetaTTLUpdateElem(key, meta, expireAtMs)
 	}
@@ -512,6 +516,28 @@ func (r *RedisServer) scanDeltaKVs(ctx context.Context, prefix []byte, readTS ui
 	}
 	if len(deltas) > store.MaxDeltaScanLimit {
 		return nil, ErrDeltaScanTruncated
+	}
+	return deltas, nil
+}
+
+func (r *RedisServer) scanListMetaDeltaKVs(ctx context.Context, userKey []byte, readTS uint64) ([]*store.KVPair, error) {
+	deltas := make([]*store.KVPair, 0, store.MaxDeltaScanLimit)
+	for _, prefix := range store.ListMetaDeltaScanPrefixes(userKey) {
+		accept := func(*store.KVPair) bool { return true }
+		if isLegacyListMetaDeltaPrefix(prefix) {
+			accept = func(pair *store.KVPair) bool {
+				return legacyListDeltaPairForUserKey(pair, userKey)
+			}
+		}
+		remaining := store.MaxDeltaScanLimit - len(deltas)
+		found, truncated, err := scanAcceptedDeltaKVsAt(ctx, r.store, prefix, remaining, readTS, accept)
+		if err != nil {
+			return nil, err
+		}
+		if truncated {
+			return nil, ErrDeltaScanTruncated
+		}
+		deltas = append(deltas, found...)
 	}
 	return deltas, nil
 }

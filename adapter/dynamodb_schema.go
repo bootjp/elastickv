@@ -349,16 +349,36 @@ func (d *DynamoDBServer) cleanupDeletedTableGeneration(ctx context.Context, tabl
 	// scans and writes tombstones locally, avoiding the enumerate-then-batch-
 	// delete loop that previously required many Raft proposals.
 	for _, prefix := range prefixes {
+		if err := d.dispatchDeletedTableCleanupPrefix(ctx, prefix); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (d *DynamoDBServer) dispatchDeletedTableCleanupPrefix(ctx context.Context, prefix []byte) error {
+	backoff := transactRetryInitialBackoff
+	deadline := time.Now().Add(transactRetryMaxDuration)
+	var lastErr error
+	for range transactRetryMaxAttempts {
 		_, err := d.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.DelPrefix, Key: prefix},
 			},
 		})
-		if err != nil {
+		if err == nil {
+			return nil
+		}
+		if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
 		}
+		lastErr = err
+		if waitErr := waitRetryWithDeadline(ctx, deadline, backoff); waitErr != nil {
+			return errors.Wrap(errors.Join(waitErr, lastErr), "dynamodb delete table cleanup retry canceled")
+		}
+		backoff = nextTransactRetryBackoff(backoff)
 	}
-	return nil
+	return errors.WithStack(lastErr)
 }
 
 func (d *DynamoDBServer) dispatchDeleteBatch(ctx context.Context, keys [][]byte) error {

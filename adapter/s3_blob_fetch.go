@@ -81,7 +81,7 @@ func (s *S3BlobFetchServer) FetchChunkBlob(req *pb.FetchChunkBlobRequest, stream
 	if err != nil {
 		return err
 	}
-	if err := s.verifyChunkBlobDigest(digest, payload, codes.InvalidArgument); err != nil {
+	if err := s.verifyChunkBlobDigest(digest, payload); err != nil {
 		return err
 	}
 	return sendChunkBlobPayload(stream, payload)
@@ -130,7 +130,7 @@ func (s *S3BlobFetchServer) PushChunkBlob(stream pb.S3BlobFetch_PushChunkBlobSer
 	if err != nil {
 		return err
 	}
-	if err := s.verifyChunkBlobDigest(digest, payload, codes.InvalidArgument); err != nil {
+	if err := s.verifyChunkBlobDigest(digest, payload); err != nil {
 		return err
 	}
 	if err := s.ensurePushAllowed(); err != nil {
@@ -181,6 +181,80 @@ func (s *S3BlobFetchServer) storeChunkBlob(
 		s.observeCommitTS(commitTS)
 		return nil
 	}
+}
+
+// repairChunkBlob stores a peer-verified payload without requiring a follower
+// to allocate a cluster timestamp. A corrupt local version may already be at
+// or beyond the replicated chunkref timestamp, so repairs advance only this
+// peer-local key while preserving the store-wide MVCC watermark.
+func (s *S3BlobFetchServer) repairChunkBlob(
+	ctx context.Context,
+	digest [s3ChunkBlobSHA256Bytes]byte,
+	payload []byte,
+	minCommitTS uint64,
+) error {
+	if minCommitTS == 0 {
+		return s3BlobFetchStatus(codes.InvalidArgument, "missing s3 chunkblob repair timestamp")
+	}
+	if err := s.verifyChunkBlobDigest(digest, payload); err != nil {
+		return err
+	}
+	key := s3keys.ChunkBlobKey(digest)
+	for {
+		if err := s.ensurePushAllowed(); err != nil {
+			return err
+		}
+		startTS, repairTS, done, err := s.chunkBlobRepairVersion(ctx, key, payload, minCommitTS)
+		if err != nil {
+			return err
+		}
+		if done {
+			return nil
+		}
+		if err := s.applyChunkBlobUntilRegistered(ctx, key, payload, startTS, repairTS); err != nil {
+			retry, repairErr := normalizeS3ChunkBlobRepairError(err)
+			if retry {
+				continue
+			}
+			return repairErr
+		}
+		return nil
+	}
+}
+
+func (s *S3BlobFetchServer) chunkBlobRepairVersion(
+	ctx context.Context,
+	key, payload []byte,
+	minCommitTS uint64,
+) (uint64, uint64, bool, error) {
+	latestTS, exists, err := s.latestChunkBlobTS(ctx, key)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	existing, currentExists, err := s.currentChunkBlobPayload(ctx, key)
+	if err != nil {
+		return 0, 0, false, err
+	}
+	if currentExists && bytes.Equal(existing, payload) {
+		return 0, 0, true, nil
+	}
+	if !exists || minCommitTS > latestTS {
+		return latestTS, minCommitTS, false, nil
+	}
+	if latestTS == math.MaxUint64 {
+		return 0, 0, false, s3BlobFetchStatus(codes.FailedPrecondition, "s3 chunkblob repair timestamp is exhausted")
+	}
+	return latestTS, latestTS + 1, false, nil
+}
+
+func normalizeS3ChunkBlobRepairError(err error) (bool, error) {
+	if errors.Is(err, store.ErrWriteConflict) {
+		return true, nil
+	}
+	if code := status.Code(err); code != codes.Unknown {
+		return false, err
+	}
+	return false, s3BlobFetchStatusf(codes.Internal, "repair s3 chunkblob: %v", err)
 }
 
 func (s *S3BlobFetchServer) retryAfterChunkBlobWriteConflict(
@@ -244,7 +318,7 @@ func (s *S3BlobFetchServer) chunkBlobAlreadyStored(
 	if bytes.Equal(existing, payload) {
 		return true, nil
 	}
-	if err := s.verifyChunkBlobDigest(digest, existing, codes.InvalidArgument); err != nil {
+	if err := s.verifyChunkBlobDigest(digest, existing); err != nil {
 		return false, err
 	}
 	return false, s3BlobFetchStatus(codes.InvalidArgument, "s3 chunkblob already exists with different payload")
@@ -440,13 +514,13 @@ func (s *s3ChunkBlobReceiveState) applyDigest(raw []byte) error {
 	return nil
 }
 
-func (s *S3BlobFetchServer) verifyChunkBlobDigest(expected [s3ChunkBlobSHA256Bytes]byte, payload []byte, code codes.Code) error {
+func (s *S3BlobFetchServer) verifyChunkBlobDigest(expected [s3ChunkBlobSHA256Bytes]byte, payload []byte) error {
 	actual := sha256.Sum256(payload)
 	if actual == expected {
 		return nil
 	}
 	s.observeSHAMismatch()
-	return s3BlobFetchStatus(code, "s3 chunkblob sha256 mismatch")
+	return s3BlobFetchStatus(codes.InvalidArgument, "s3 chunkblob sha256 mismatch")
 }
 
 func s3ChunkBlobDigest(raw []byte) ([s3ChunkBlobSHA256Bytes]byte, error) {

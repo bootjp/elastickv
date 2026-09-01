@@ -24,3 +24,19 @@ func TestEnabledEnv(t *testing.T) {
 		}
 	})
 }
+
+func TestRedisDeltaCompactorEnv(t *testing.T) {
+	t.Run("default enabled", func(t *testing.T) {
+		t.Setenv(redisDeltaCompactorEnabledEnvVar, "")
+		if newRedisDeltaCompactorIfEnabled(nil, nil) == nil {
+			t.Fatal("newRedisDeltaCompactorIfEnabled() = nil, want compactor")
+		}
+	})
+
+	t.Run("false disables", func(t *testing.T) {
+		t.Setenv(redisDeltaCompactorEnabledEnvVar, "false")
+		if newRedisDeltaCompactorIfEnabled(nil, nil) != nil {
+			t.Fatal("newRedisDeltaCompactorIfEnabled() returned compactor, want nil")
+		}
+	})
+}
