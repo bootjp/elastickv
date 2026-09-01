@@ -3406,7 +3406,10 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 			continue
 		}
 		if rt.spec.id == groupID {
-			return distribution.NewCatalogStore(rt.store, distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)))
+			return distribution.NewCatalogStore(rt.store,
+				distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)),
+				distribution.WithCatalogMigrationRetireResolver(catalogMigrationRetireResolver(runtimes)),
+			)
 		}
 	}
 	return nil
@@ -3423,6 +3426,36 @@ func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.Ca
 			}
 		}
 		return nil, errors.Newf("migration target store is not available for group %d", groupID)
+	}
+}
+
+func catalogMigrationRetireResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationRetireResolver {
+	return func(ctx context.Context, groupID, jobID uint64) error {
+		for _, rt := range runtimes {
+			if rt == nil || rt.spec.id != groupID {
+				continue
+			}
+			engine := rt.snapshotEngine()
+			if engine == nil {
+				break
+			}
+			cmd, err := kv.MarshalMigrationRetireCommand(jobID)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			result, err := engine.Propose(ctx, cmd)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			if result == nil {
+				return errors.Newf("migration retire proposal returned nil result for group %d job %d", groupID, jobID)
+			}
+			if err, ok := result.Response.(error); ok {
+				return errors.WithStack(err)
+			}
+			return nil
+		}
+		return errors.Newf("migration target engine is not available for group %d", groupID)
 	}
 }
 

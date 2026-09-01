@@ -709,3 +709,7 @@ func (s *mvccStore) RetireMigration(ctx context.Context, jobID uint64) error {
 	delete(s.migrationPromotions, jobID)
 	return nil
 }
+
+func (s *mvccStore) RetireMigrationRaft(ctx context.Context, jobID, _ uint64) error {
+	return s.RetireMigration(ctx, jobID)
+}

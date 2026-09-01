@@ -408,6 +408,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return f.applyHLCLease(data[1:]), true
 	case data[0] == raftEncodeMigrationImport:
 		return f.applyMigrationImport(ctx, data[1:]), true
+	case data[0] == raftEncodeMigrationRetire:
+		return f.applyMigrationRetire(ctx, data[1:]), true
 	case data[0] == raftEncodeMigrationPromote:
 		return f.applyMigrationPromote(ctx, data[1:]), true
 	case data[0] == raftEncodeBackup:
@@ -447,6 +449,9 @@ const (
 	// batch. Every target voter applies the raw MVCC versions, import ack, and
 	// migration HLC floor before the RPC handler returns success.
 	raftEncodeMigrationImport byte = 0x09
+	// raftEncodeMigrationRetire carries target-group metadata retirement for a
+	// completed migration job. Every target voter drops import/progress state.
+	raftEncodeMigrationRetire byte = 0x0c
 	// raftEncodeMigrationPromote carries a target-group range-migration staged
 	// data promotion chunk. Every target voter atomically copies staged MVCC
 	// versions into the live keyspace and removes the promoted staged rows.

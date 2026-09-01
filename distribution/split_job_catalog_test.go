@@ -433,6 +433,47 @@ func TestCatalogStoreMoveSplitJobToHistoryRetiresMigrationMetadata(t *testing.T)
 	assertStoreValueAt(t, ctx, targetStore, "job14", 50, "imported")
 }
 
+func TestCatalogStoreMoveSplitJobToHistoryUsesMigrationRetireResolver(t *testing.T) {
+	ctx := context.Background()
+	job := sampleSplitJob(14)
+	var calls []struct {
+		groupID uint64
+		jobID   uint64
+	}
+	cs := NewCatalogStore(
+		store.NewMVCCStore(),
+		WithCatalogMigrationRetireResolver(func(_ context.Context, groupID, jobID uint64) error {
+			calls = append(calls, struct {
+				groupID uint64
+				jobID   uint64
+			}{groupID: groupID, jobID: jobID})
+			return nil
+		}),
+	)
+
+	if err := cs.CreateSplitJob(ctx, job); err != nil {
+		t.Fatalf("create split job: %v", err)
+	}
+	terminal := job
+	terminal.Phase = SplitJobPhaseDone
+	terminal.TerminalAtMs = 1000
+	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
+		t.Fatalf("move split job to history: %v", err)
+	}
+	if err := cs.MoveSplitJobToHistory(ctx, job, terminal); err != nil {
+		t.Fatalf("retry move split job to history: %v", err)
+	}
+
+	if len(calls) != 2 {
+		t.Fatalf("expected two retire resolver calls, got %d", len(calls))
+	}
+	for _, call := range calls {
+		if call.groupID != job.TargetGroupID || call.jobID != job.JobID {
+			t.Fatalf("unexpected retire resolver call: %+v", call)
+		}
+	}
+}
+
 func TestCatalogStoreMoveSplitJobToHistoryRetiresMetadataOnIdempotentRetry(t *testing.T) {
 	ctx := context.Background()
 	job := sampleSplitJob(15)

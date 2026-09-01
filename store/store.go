@@ -364,6 +364,10 @@ type MVCCStore interface {
 	// RetireMigration removes target-local import progress metadata for a
 	// completed migration job. Data imported by the job is left intact.
 	RetireMigration(ctx context.Context, jobID uint64) error
+	// RetireMigrationRaft is the raft-apply variant of RetireMigration. When
+	// appliedIndex is non-zero, the implementation must durably bundle
+	// metaAppliedIndex with the metadata retirement batch.
+	RetireMigrationRaft(ctx context.Context, jobID, appliedIndex uint64) error
 	Snapshot() (Snapshot, error)
 	Restore(buf io.Reader) error
 	Close() error

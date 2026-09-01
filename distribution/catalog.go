@@ -99,12 +99,17 @@ type CatalogStore struct {
 	store                        store.MVCCStore
 	allowRouteDescriptorV2Writes bool
 	migrationStoreForGroup       CatalogMigrationStoreResolver
+	migrationRetireForGroup      CatalogMigrationRetireResolver
 }
 
 type CatalogStoreOption func(*CatalogStore)
 
 // CatalogMigrationStoreResolver resolves the local MVCC store for a data group.
 type CatalogMigrationStoreResolver func(groupID uint64) (store.MVCCStore, error)
+
+// CatalogMigrationRetireResolver retires migration metadata through the target
+// data group's replicated apply path.
+type CatalogMigrationRetireResolver func(ctx context.Context, groupID, jobID uint64) error
 
 func WithCatalogRouteDescriptorV2Writes(enabled bool) CatalogStoreOption {
 	return func(s *CatalogStore) {
@@ -117,6 +122,14 @@ func WithCatalogRouteDescriptorV2Writes(enabled bool) CatalogStoreOption {
 func WithCatalogMigrationStoreResolver(resolver CatalogMigrationStoreResolver) CatalogStoreOption {
 	return func(s *CatalogStore) {
 		s.migrationStoreForGroup = resolver
+	}
+}
+
+// WithCatalogMigrationRetireResolver makes split-job finalization retire
+// target-local migration metadata through the target data group Raft log.
+func WithCatalogMigrationRetireResolver(resolver CatalogMigrationRetireResolver) CatalogStoreOption {
+	return func(s *CatalogStore) {
+		s.migrationRetireForGroup = resolver
 	}
 }
 

@@ -580,6 +580,14 @@ func (s *pebbleStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64
 }
 
 func (s *pebbleStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	return s.retireMigrationWithOpts(ctx, jobID, s.directApplyWriteOpts(), 0)
+}
+
+func (s *pebbleStore) RetireMigrationRaft(ctx context.Context, jobID, appliedIndex uint64) error {
+	return s.retireMigrationWithOpts(ctx, jobID, s.raftApplyWriteOpts(), appliedIndex)
+}
+
+func (s *pebbleStore) retireMigrationWithOpts(ctx context.Context, jobID uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
@@ -597,7 +605,10 @@ func (s *pebbleStore) RetireMigration(ctx context.Context, jobID uint64) error {
 	if err := s.stageRetireMigrationPromotionState(batch, jobID); err != nil {
 		return err
 	}
-	return errors.WithStack(batch.Commit(s.directApplyWriteOpts()))
+	if err := stagePebbleAppliedIndex(batch, appliedIndex); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(writeOpts))
 }
 
 func (s *pebbleStore) stageRetireMigrationImportAcks(batch *pebble.Batch, jobID uint64) error {

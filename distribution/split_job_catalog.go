@@ -484,6 +484,12 @@ func (s *CatalogStore) finishAppliedSplitJobHistoryMove(ctx context.Context, job
 }
 
 func (s *CatalogStore) retireSplitJobMigrationMetadata(ctx context.Context, job SplitJob) error {
+	if s.migrationRetireForGroup != nil {
+		if err := s.migrationRetireForGroup(ctx, job.TargetGroupID, job.JobID); err != nil && !errors.Is(err, store.ErrNotSupported) {
+			return errors.WithStack(err)
+		}
+		return nil
+	}
 	st, err := s.migrationMetadataStore(job.TargetGroupID)
 	if err != nil {
 		return err

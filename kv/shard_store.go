@@ -5615,6 +5615,10 @@ func (s *ShardStore) RetireMigration(context.Context, uint64) error {
 	return store.ErrNotSupported
 }
 
+func (s *ShardStore) RetireMigrationRaft(context.Context, uint64, uint64) error {
+	return store.ErrNotSupported
+}
+
 func (s *ShardStore) Restore(_ io.Reader) error {
 	return store.ErrNotSupported
 }
