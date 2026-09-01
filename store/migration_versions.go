@@ -706,5 +706,6 @@ func (s *mvccStore) RetireMigration(ctx context.Context, jobID uint64) error {
 		}
 	}
 	delete(s.migrationHLCFloors, jobID)
+	delete(s.migrationPromotions, jobID)
 	return nil
 }

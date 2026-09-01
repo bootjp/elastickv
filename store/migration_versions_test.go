@@ -835,6 +835,9 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 func TestRetireMigrationRemovesOnlySelectedJobMetadata(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
+		seedPromotionState(t, ctx, st, 1, []byte("stage|job1|"), []byte("job1-promoted"))
+		seedPromotionState(t, ctx, st, 2, []byte("stage|job2|"), []byte("job2-promoted"))
+
 		_, err := st.ImportVersions(ctx, ImportVersionsOptions{
 			JobID:     1,
 			BracketID: 2,
@@ -875,6 +878,14 @@ func TestRetireMigrationRemovesOnlySelectedJobMetadata(t *testing.T) {
 		floor, err = st.MigrationHLCFloor(ctx, 2)
 		require.NoError(t, err)
 		require.Equal(t, uint64(30), floor)
+		stateReader, ok := st.(MigrationPromotionStateReader)
+		require.True(t, ok)
+		_, ok = migrationPromotionState(t, ctx, stateReader, 1)
+		require.False(t, ok)
+		state, ok := migrationPromotionState(t, ctx, stateReader, 2)
+		require.True(t, ok)
+		require.True(t, state.Done)
+		require.Equal(t, uint64(1), state.PromotedRows)
 
 		res, err := st.ImportVersions(ctx, ImportVersionsOptions{
 			JobID:     1,
@@ -904,6 +915,31 @@ func TestRetireMigrationRemovesOnlySelectedJobMetadata(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, []byte("v20"), val)
 	})
+}
+
+func seedPromotionState(t *testing.T, ctx context.Context, st MVCCStore, jobID uint64, prefix []byte, target []byte) {
+	t.Helper()
+	promoter, ok := st.(MigrationPromoter)
+	require.True(t, ok)
+	require.NoError(t, st.PutAt(ctx, append(bytes.Clone(prefix), 'k'), []byte("v"), 10+jobID, 0))
+	result, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       jobID,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey: func(staged []byte) ([]byte, bool) {
+			return target, bytes.HasPrefix(staged, prefix)
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, result.Done)
+}
+
+func migrationPromotionState(t *testing.T, ctx context.Context, reader MigrationPromotionStateReader, jobID uint64) (PromotionState, bool) {
+	t.Helper()
+	state, ok, err := reader.MigrationPromotionState(ctx, jobID)
+	require.NoError(t, err)
+	return state, ok
 }
 
 func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
@@ -965,6 +1001,8 @@ func TestPebbleRetireMigrationPersistsAcrossReopen(t *testing.T) {
 		Versions:  []MVCCVersion{{Key: []byte("kept-k"), CommitTS: 109, Value: []byte("v109")}},
 	})
 	require.NoError(t, err)
+	seedPromotionState(t, ctx, st, 9, []byte("stage|job9|"), []byte("job9-promoted"))
+	seedPromotionState(t, ctx, st, 10, []byte("stage|job10|"), []byte("job10-promoted"))
 	require.NoError(t, st.RetireMigration(ctx, 9))
 	require.NoError(t, st.Close())
 
@@ -977,6 +1015,14 @@ func TestPebbleRetireMigrationPersistsAcrossReopen(t *testing.T) {
 	floor, err = reopened.MigrationHLCFloor(ctx, 10)
 	require.NoError(t, err)
 	require.Equal(t, uint64(109), floor)
+	stateReader, ok := reopened.(MigrationPromotionStateReader)
+	require.True(t, ok)
+	_, ok = migrationPromotionState(t, ctx, stateReader, 9)
+	require.False(t, ok)
+	state, ok := migrationPromotionState(t, ctx, stateReader, 10)
+	require.True(t, ok)
+	require.True(t, state.Done)
+	require.Equal(t, uint64(1), state.PromotedRows)
 
 	res, err := reopened.ImportVersions(ctx, ImportVersionsOptions{
 		JobID:     9,

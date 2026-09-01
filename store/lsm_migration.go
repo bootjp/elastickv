@@ -594,6 +594,9 @@ func (s *pebbleStore) RetireMigration(ctx context.Context, jobID uint64) error {
 	if err := s.stageRetireMigrationHLCFloor(batch, jobID); err != nil {
 		return err
 	}
+	if err := s.stageRetireMigrationPromotionState(batch, jobID); err != nil {
+		return err
+	}
 	return errors.WithStack(batch.Commit(s.directApplyWriteOpts()))
 }
 
@@ -617,6 +620,15 @@ func (s *pebbleStore) stageRetireMigrationHLCFloor(batch *pebble.Batch, jobID ui
 	}
 	delete(floors, jobID)
 	return stageMigrationMetadataMap(batch, migrationHLCFloorMetaKeyBytes, len(floors), encodeMigrationHLCFloors(floors))
+}
+
+func (s *pebbleStore) stageRetireMigrationPromotionState(batch *pebble.Batch, jobID uint64) error {
+	states, err := s.readPebblePromotionStates()
+	if err != nil {
+		return err
+	}
+	delete(states, jobID)
+	return stageMigrationMetadataMap(batch, migrationPromoteMetaKeyBytes, len(states), encodeMigrationPromotionStates(states))
 }
 
 func stageMigrationMetadataMap(batch *pebble.Batch, key []byte, entries int, encoded []byte) error {
