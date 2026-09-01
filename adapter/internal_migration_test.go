@@ -490,6 +490,103 @@ func TestInternalExportRangeVersionsUsesPartitionResolverGroup(t *testing.T) {
 	}, stream.responses[0].GetVersions())
 }
 
+func TestInternalExportRangeVersionsResolvesTxnWrappedPartitionedSQSKeysByEmbeddedOwner(t *testing.T) {
+	t.Parallel()
+
+	wrapWithStartTS := func(prefix string, userKey []byte) []byte {
+		var raw [8]byte
+		binary.BigEndian.PutUint64(raw[:], 77)
+		key := append([]byte(prefix), userKey...)
+		return append(key, raw[:]...)
+	}
+	cases := []struct {
+		name   string
+		family uint32
+		prefix []byte
+		wrap   func([]byte) []byte
+	}{
+		{
+			name:   "intent",
+			family: distribution.MigrationFamilyTxnIntent,
+			prefix: []byte("!txn|int|"),
+			wrap: func(userKey []byte) []byte {
+				return append([]byte("!txn|int|"), userKey...)
+			},
+		},
+		{
+			name:   "commit",
+			family: distribution.MigrationFamilyTxnCommit,
+			prefix: []byte("!txn|cmt|"),
+			wrap: func(userKey []byte) []byte {
+				return wrapWithStartTS("!txn|cmt|", userKey)
+			},
+		},
+		{
+			name:   "rollback",
+			family: distribution.MigrationFamilyTxnRollback,
+			prefix: []byte("!txn|rb|"),
+			wrap: func(userKey []byte) []byte {
+				return wrapWithStartTS("!txn|rb|", userKey)
+			},
+		},
+		{
+			name:   "success",
+			family: distribution.MigrationFamilyTxnSuccess,
+			prefix: []byte("!txn|ok|"),
+			wrap: func(userKey []byte) []byte {
+				return kv.TxnSuccessMarkerKey(userKey, 77, 88, []byte("primary"))
+			},
+		},
+		{
+			name:   "meta",
+			family: distribution.MigrationFamilyTxnMeta,
+			prefix: []byte(kv.TxnMetaPrefix),
+			wrap: func(userKey []byte) []byte {
+				return append([]byte(kv.TxnMetaPrefix), userKey...)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := store.NewMVCCStore()
+			resolver := NewSQSPartitionResolver(map[string][]uint64{
+				"orders.fifo": {10, 11},
+			})
+			internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+				WithInternalStore(st),
+				WithInternalMigrationExportRouting(11, resolver),
+			)
+
+			p0 := tc.wrap(sqsPartitionedMsgDataKey("orders.fifo", 0, 1, "msg-0"))
+			p1 := tc.wrap(sqsPartitionedMsgDataKey("orders.fifo", 1, 1, "msg-1"))
+			unknown := tc.wrap(sqsPartitionedMsgDataKey("unknown.fifo", 0, 1, "msg-unknown"))
+			require.NoError(t, st.PutAt(ctx, p0, []byte("p0"), 10, 0))
+			require.NoError(t, st.PutAt(ctx, p1, []byte("p1"), 10, 0))
+			require.NoError(t, st.PutAt(ctx, unknown, []byte("unknown"), 10, 0))
+
+			stream := &captureExportRangeVersionsStream{ctx: ctx}
+			err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+				MaxCommitTs:     20,
+				KeyFamily:       tc.family,
+				RouteStart:      []byte("!sqs|route|global"),
+				RouteEnd:        testPrefixScanEnd([]byte("!sqs|route|global")),
+				RangeStart:      tc.prefix,
+				RangeEnd:        testPrefixScanEnd(tc.prefix),
+				MaxScannedBytes: 1 << 20,
+			}, stream)
+			require.NoError(t, err)
+			require.Len(t, stream.responses, 1)
+			require.Equal(t, []*pb.MVCCVersion{
+				{Key: p1, CommitTs: 10, Value: []byte("p1"), KeyFamily: tc.family},
+			}, stream.responses[0].GetVersions())
+		})
+	}
+}
+
 func TestInternalExportRangeVersionsDerivesFilesystemChunkScanBoundsFromRouteBounds(t *testing.T) {
 	t.Parallel()
 
