@@ -67,6 +67,47 @@ func TestBackupScannerDropsStaleS3BucketAuxiliaryAfterOwnerTombstone(t *testing.
 	require.Equal(t, []byte("raw-owned"), got[0].Value)
 }
 
+func TestBackupScannersPreserveRawOnlyS3BucketAuxiliaryWhenOwnerHasNoVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := s3keys.BucketMetaKey("bucket-a")
+	st := newBackupScannerS3AuxiliaryStore(t)
+
+	require.NoError(t, st.groups[1].Store.PutAt(ctx, key, []byte("raw-only"), 10, 0))
+	snapshot := st.CaptureBackupRouteSnapshot(nil, nil)
+
+	keyScanner := NewBackupKeyScannerAtSnapshot(st, snapshot, 30, 10)
+	defer keyScanner.Close()
+	keys := collectBackupKeyScannerKeys(t, keyScanner)
+	require.Equal(t, [][]byte{key}, keys)
+
+	valueScanner := NewBackupScannerAtSnapshot(st, snapshot, 30, 10)
+	defer valueScanner.Close()
+	got := collectBackupScannerValues(t, valueScanner)
+	require.Len(t, got, 1)
+	require.Equal(t, key, got[0].Key)
+	require.Equal(t, []byte("raw-only"), got[0].Value)
+}
+
+func TestValidateBackupSnapshotAtReadsS3AuxiliaryTxnDecisionFromOwnerRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	primary := s3keys.BucketMetaKey("bucket-a")
+	st := newBackupScannerS3AuxiliaryStore(t)
+
+	require.NoError(t, st.groups[1].Store.PutAt(ctx, txnLockKey([]byte("secondary")), encodeTxnLock(txnLock{
+		StartTS:     30,
+		TTLExpireAt: 100,
+		PrimaryKey:  primary,
+	}), 30, 0))
+	require.NoError(t, st.groups[2].Store.PutAt(ctx, txnCommitKey(primary, 30), encodeTxnCommitRecord(40), 40, 0))
+
+	err := st.ValidateBackupSnapshotAt(ctx, st.CaptureBackupRouteSnapshot(nil, nil), 50, 16)
+	require.NotErrorIs(t, err, ErrTxnLocked)
+}
+
 func newBackupScannerS3AuxiliaryStore(t *testing.T) *ShardStore {
 	t.Helper()
 	engine := distribution.NewEngine()
@@ -92,5 +133,19 @@ func collectBackupScannerValues(t *testing.T, scanner BackupScanner) []*store.KV
 			return got
 		}
 		got = append(got, pair)
+	}
+}
+
+func collectBackupKeyScannerKeys(t *testing.T, scanner BackupKeyScanner) [][]byte {
+	t.Helper()
+	ctx := context.Background()
+	var got [][]byte
+	for {
+		key, ok, err := scanner.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			return got
+		}
+		got = append(got, key)
 	}
 }

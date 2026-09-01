@@ -279,6 +279,13 @@ func (s *ShardStore) capturedBackupGetAt(
 	key []byte,
 	ts uint64,
 ) ([]byte, error) {
+	if route, ok, err := s.s3BucketAuxiliaryCapturedBackupRouteForKey(ctx, snapshot.routes, key, ts); err != nil {
+		return nil, err
+	} else if ok {
+		val, err := s.getRouteAt(ctx, route, key, ts, 0)
+		return val, errors.WithStack(err)
+	}
+
 	rkey := routeKey(key)
 	for _, route := range snapshot.routes {
 		if !routeContainsKey(route, rkey) {
@@ -301,6 +308,26 @@ func (s *ShardStore) capturedBackupGetAt(
 		return val, errors.WithStack(err)
 	}
 	return s.GetAt(ctx, key, ts)
+}
+
+func (s *ShardStore) s3BucketAuxiliaryCapturedBackupRouteForKey(
+	ctx context.Context,
+	routes []distribution.Route,
+	key []byte,
+	ts uint64,
+) (distribution.Route, bool, error) {
+	owner, ok := s3BucketAuxiliaryBackupOwnerRoute(key, routes)
+	if !ok {
+		return distribution.Route{}, false, nil
+	}
+	hasVersion, err := s.s3BucketAuxiliaryBackupOwnerHasVersionAt(ctx, owner, key, ts)
+	if err != nil {
+		return distribution.Route{}, false, err
+	}
+	if !hasVersion {
+		return distribution.Route{}, false, nil
+	}
+	return owner, true, nil
 }
 
 func (s *ShardStore) txnCommitTSAt(
@@ -491,7 +518,7 @@ func (s *backupKeyScanner) loadNextPage(ctx context.Context) error {
 	}
 	s.page = s.page[:0]
 	for _, item := range keys {
-		if _, ok, err := s.store.routeForRoutedKey(item, s.routes); err != nil {
+		if _, ok, err := s.store.routeForRoutedKey(ctx, item, s.routes, s.ts); err != nil {
 			return err
 		} else if ok {
 			s.page = append(s.page, item)
@@ -549,7 +576,7 @@ func (s *backupScanner) loadNextPage(ctx context.Context) error {
 }
 
 func (s *backupScanner) materializeBackupKey(ctx context.Context, item routedScanKey) (*store.KVPair, bool, error) {
-	route, ok, err := s.materializeRouteForKey(item)
+	route, ok, err := s.materializeRouteForKey(ctx, item)
 	if err != nil {
 		return nil, false, err
 	}
@@ -575,36 +602,67 @@ func (s *backupScanner) materializeBackupKey(ctx context.Context, item routedSca
 	return &store.KVPair{Key: bytes.Clone(item.key), Value: bytes.Clone(val)}, true, nil
 }
 
-func (s *backupScanner) materializeRouteForKey(item routedScanKey) (distribution.Route, bool, error) {
-	return s.store.routeForRoutedKey(item, s.routes)
+func (s *backupScanner) materializeRouteForKey(ctx context.Context, item routedScanKey) (distribution.Route, bool, error) {
+	return s.store.routeForRoutedKey(ctx, item, s.routes, s.ts)
 }
 
-func (s *ShardStore) routeForRoutedKey(item routedScanKey, routes []distribution.Route) (distribution.Route, bool, error) {
+func (s *ShardStore) routeForRoutedKey(ctx context.Context, item routedScanKey, routes []distribution.Route, ts uint64) (distribution.Route, bool, error) {
 	if route, ok, handled, err := s.partitionRouteForRoutedKey(item); handled || err != nil {
 		return route, ok, err
 	}
 	if item.partitionOnly {
 		return distribution.Route{}, false, nil
 	}
-	if route, ok, handled := s3BucketAuxiliaryBackupRouteForRoutedKey(item, routes); handled {
-		return route, ok, nil
+	if route, ok, handled, err := s.s3BucketAuxiliaryBackupRouteForRoutedKey(ctx, item, routes, ts); handled || err != nil {
+		return route, ok, err
 	}
 	return byteRangeRouteForRoutedKey(item, routes)
 }
 
-func s3BucketAuxiliaryBackupRouteForRoutedKey(item routedScanKey, routes []distribution.Route) (distribution.Route, bool, bool) {
-	start, end, ok := s3BucketAuxiliaryRouteRange(item.key)
+func (s *ShardStore) s3BucketAuxiliaryBackupRouteForRoutedKey(ctx context.Context, item routedScanKey, routes []distribution.Route, ts uint64) (distribution.Route, bool, bool, error) {
+	owner, ok := s3BucketAuxiliaryBackupOwnerRoute(item.key, routes)
 	if !ok {
-		return distribution.Route{}, false, false
+		return distribution.Route{}, false, false, nil
 	}
-	owner, ok := s3BucketAuxiliaryOwnerRouteFromRange(start, end, routes)
+	if item.route.GroupID == owner.GroupID {
+		return owner, true, true, nil
+	}
+	hasVersion, err := s.s3BucketAuxiliaryBackupOwnerHasVersionAt(ctx, owner, item.key, ts)
+	if err != nil {
+		return distribution.Route{}, false, true, err
+	}
+	if hasVersion {
+		return distribution.Route{}, false, true, nil
+	}
+	return item.route, true, true, nil
+}
+
+func s3BucketAuxiliaryBackupOwnerRoute(key []byte, routes []distribution.Route) (distribution.Route, bool) {
+	probeKey := key
+	if embedded, ok := txnRouteKey(key); ok {
+		probeKey = embedded
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(probeKey)
 	if !ok {
-		return distribution.Route{}, false, false
+		return distribution.Route{}, false
 	}
-	if owner.GroupID != item.route.GroupID {
-		return distribution.Route{}, false, true
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, routes)
+}
+
+func (s *ShardStore) s3BucketAuxiliaryBackupOwnerHasVersionAt(
+	ctx context.Context,
+	owner distribution.Route,
+	key []byte,
+	ts uint64,
+) (bool, error) {
+	covered, err := s.s3BucketAuxiliaryOwnerHasVersionsAt(ctx, owner, [][]byte{key}, ts, 0)
+	if err != nil {
+		return false, err
 	}
-	return owner, true, true
+	if len(covered) != 1 {
+		return false, errors.WithStack(errors.Newf("s3 auxiliary owner version probe returned %d results for 1 key", len(covered)))
+	}
+	return covered[0], nil
 }
 
 func (s *ShardStore) partitionRouteForRoutedKey(item routedScanKey) (distribution.Route, bool, bool, error) {
@@ -796,7 +854,7 @@ func (s *ShardStore) appendBackupScanRouteKeysAt(
 	if err != nil {
 		return nil, err
 	}
-	return s.mergeAndTrimRoutedScanKeys(out, routedScanKeys(route, keys, partitionOnly), routes, limit)
+	return s.mergeAndTrimRoutedScanKeys(ctx, out, routedScanKeys(route, keys, partitionOnly), routes, ts, limit)
 }
 
 func routedScanKeys(route distribution.Route, keys [][]byte, partitionOnly bool) []routedScanKey {
@@ -811,9 +869,11 @@ func routedScanKeys(route distribution.Route, keys [][]byte, partitionOnly bool)
 }
 
 func (s *ShardStore) mergeAndTrimRoutedScanKeys(
+	ctx context.Context,
 	out []routedScanKey,
 	keys []routedScanKey,
 	routes []distribution.Route,
+	ts uint64,
 	limit int,
 ) ([]routedScanKey, error) {
 	if len(keys) == 0 {
@@ -829,7 +889,7 @@ func (s *ShardStore) mergeAndTrimRoutedScanKeys(
 			continue
 		}
 		if write > 0 && bytes.Equal(out[write-1].key, item.key) {
-			preferred, err := s.preferredRoutedScanKey(out[write-1], item, routes)
+			preferred, err := s.preferredRoutedScanKey(ctx, out[write-1], item, routes, ts)
 			if err != nil {
 				return nil, err
 			}
@@ -857,12 +917,12 @@ func (s *ShardStore) mergeAndTrimRoutedScanKeys(
 // owner is authoritative. Dropping either half regresses a real case: without
 // the ownership test a stale copy can win, and without the fallback the first
 // group enumerated always wins even when a later group is the live owner.
-func (s *ShardStore) preferredRoutedScanKey(current, candidate routedScanKey, routes []distribution.Route) (routedScanKey, error) {
-	_, currentOwned, err := s.routeForRoutedKey(current, routes)
+func (s *ShardStore) preferredRoutedScanKey(ctx context.Context, current, candidate routedScanKey, routes []distribution.Route, ts uint64) (routedScanKey, error) {
+	_, currentOwned, err := s.routeForRoutedKey(ctx, current, routes, ts)
 	if err != nil {
 		return routedScanKey{}, err
 	}
-	_, candidateOwned, err := s.routeForRoutedKey(candidate, routes)
+	_, candidateOwned, err := s.routeForRoutedKey(ctx, candidate, routes, ts)
 	if err != nil {
 		return routedScanKey{}, err
 	}
