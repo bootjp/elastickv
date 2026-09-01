@@ -132,6 +132,9 @@ func routeKey(key []byte) []byte {
 }
 
 func routeOwnershipKey(key []byte) []byte {
+	if embedded, ok := txnRouteKey(key); ok {
+		key = embedded
+	}
 	if bucket, ok := s3keys.ParseBucketMetaKey(key); ok {
 		return s3keys.RoutePrefixForBucketAnyGeneration(bucket)
 	}
