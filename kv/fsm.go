@@ -12,6 +12,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
@@ -815,6 +816,9 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	if start, ok := dynamoExactCleanupRouteKey(prefix); ok {
 		return start, routePointRangeEnd(start)
 	}
+	if start, end, ok := fskeys.ChunkScanRouteBounds(prefix, prefixScanEnd(prefix)); ok {
+		return start, end
+	}
 	if routeKeyspaceWideRawPrefix(prefix) {
 		return []byte(""), nil
 	}
@@ -896,6 +900,7 @@ var routeMappedRawPrefixes = append([][]byte{
 	[]byte(s3keys.BlobPrefix),
 	[]byte(s3keys.GCUploadPrefix),
 	[]byte(s3keys.RoutePrefix),
+	fskeys.UsageRouteAllPrefix(),
 }, sqsConcreteInternalPrefixBytes...)
 
 var ErrNotImplemented = errors.New("not implemented")

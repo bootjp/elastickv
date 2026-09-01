@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -219,6 +220,80 @@ func TestFSMDelPrefixTombstonesStagedVisibilityRowsDuringApply(t *testing.T) {
 	got, err := fsm.store.GetAt(ctx, stagedOutside, 150)
 	require.NoError(t, err)
 	require.Equal(t, []byte("outside"), got)
+}
+
+func TestFSMDelPrefixRoutesFilesystemChunkPrefixThroughVirtualRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	home := uint64(11)
+	inode := uint64(22)
+	chunkPrefix := fskeys.ChunkPrefix(home, inode)
+	chunkRoute := fskeys.ChunkRouteKey(home, inode)
+	chunkRouteEnd := prefixScanEnd(chunkRoute)
+	chunkRawAll := fskeys.ChunkAllPrefix()
+	chunkRawEnd := prefixScanEnd(chunkRawAll)
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: chunkRawAll, GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: chunkRawAll, End: chunkRawEnd, GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 3, Start: chunkRawEnd, End: chunkRoute, GroupID: 1, State: distribution.RouteStateActive},
+		{
+			RouteID:                4,
+			Start:                  chunkRoute,
+			End:                    chunkRouteEnd,
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+		},
+		{RouteID: 5, Start: chunkRouteEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+	stagedChunk := distribution.MigrationStagedDataKey(9, fskeys.ChunkKey(home, inode, 0))
+	require.NoError(t, fsm.store.PutAt(ctx, stagedChunk, []byte("chunk"), 20, 0))
+
+	require.NoError(t, fsm.handleDelPrefix(ctx, chunkPrefix, 101))
+
+	_, err := fsm.store.GetAt(ctx, stagedChunk, 150)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestFSMRejectsFilesystemChunkDelPrefixAgainstVirtualRouteFence(t *testing.T) {
+	t.Parallel()
+
+	home := uint64(11)
+	inode := uint64(22)
+	chunkRoute := fskeys.ChunkRouteKey(home, inode)
+	chunkRouteEnd := prefixScanEnd(chunkRoute)
+	chunkRawAll := fskeys.ChunkAllPrefix()
+	chunkRawEnd := prefixScanEnd(chunkRawAll)
+
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: chunkRawAll, GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: chunkRawAll, End: chunkRawEnd, GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 3, Start: chunkRawEnd, End: chunkRoute, GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 4, Start: chunkRoute, End: chunkRouteEnd, GroupID: 1, State: distribution.RouteStateWriteFenced},
+		{RouteID: 5, Start: chunkRouteEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+	})
+	fsm := newComposed1FSM(t, engine, 1)
+
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: fskeys.ChunkPrefix(home, inode)}},
+	}, 10)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
+}
+
+func TestFSMRejectsFilesystemUsageRoutePrefixWhenAnyOwnerRouteIsWriteFenced(t *testing.T) {
+	t.Parallel()
+
+	fsm := newWriteFencedFSM(t)
+	err := fsm.handleRawRequest(context.Background(), &pb.Request{
+		Mutations: []*pb.Mutation{{Op: pb.Op_DEL_PREFIX, Key: fskeys.UsageRouteAllPrefix()}},
+	}, 10)
+	require.ErrorIs(t, err, ErrRouteWriteFenced)
 }
 
 type recordingPrefixDeleteStore struct {
