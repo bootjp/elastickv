@@ -318,7 +318,7 @@ func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T)
 	}
 }
 
-func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing.T) {
+func TestInternalExportRangeVersionsDecodedS3MixedRoutePreservesRawRangeMatches(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -326,9 +326,9 @@ func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing
 	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
 
 	inRouteKey := s3keys.BucketMetaKey("bucket-z")
-	outRouteKey := s3keys.BucketMetaKey("bucket-a")
+	rawRangeKey := s3keys.BucketMetaKey("bucket-a")
 	require.NoError(t, st.PutAt(ctx, inRouteKey, []byte("meta-z"), 10, 0))
-	require.NoError(t, st.PutAt(ctx, outRouteKey, []byte("skip"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, rawRangeKey, []byte("meta-a"), 10, 0))
 
 	stream := &captureExportRangeVersionsStream{ctx: ctx}
 	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
@@ -343,6 +343,7 @@ func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing
 	require.NoError(t, err)
 	require.Len(t, stream.responses, 1)
 	require.Equal(t, []*pb.MVCCVersion{
+		{Key: rawRangeKey, CommitTs: 10, Value: []byte("meta-a"), KeyFamily: distribution.MigrationFamilyS3BucketMeta},
 		{Key: inRouteKey, CommitTs: 10, Value: []byte("meta-z"), KeyFamily: distribution.MigrationFamilyS3BucketMeta},
 	}, stream.responses[0].GetVersions())
 }

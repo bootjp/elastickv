@@ -715,23 +715,16 @@ func migrationFamilyRequiresDecodedS3(family uint32) bool {
 }
 
 func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
-	allowRawRouteMatch := !s3BucketRouteBounds(routeStart, routeEnd)
-	rawRouteFilter := kv.RouteKeyFilter(routeStart, routeEnd)
 	return func(rawKey []byte) bool {
 		bucket, ok := decodedS3BucketName(family, rawKey)
 		if !ok {
 			return false
 		}
-		if allowRawRouteMatch && rawRouteFilter(rawKey) {
+		if keyInRouteRange(rawKey, routeStart, routeEnd) {
 			return true
 		}
 		return decodedS3BucketRouteSelected(bucket, routeStart, routeEnd)
 	}
-}
-
-func s3BucketRouteBounds(routeStart, routeEnd []byte) bool {
-	return bytes.HasPrefix(routeStart, []byte(s3keys.RoutePrefix)) ||
-		bytes.HasPrefix(routeEnd, []byte(s3keys.RoutePrefix))
 }
 
 func decodedS3BucketRouteSelected(bucket string, routeStart, routeEnd []byte) bool {
