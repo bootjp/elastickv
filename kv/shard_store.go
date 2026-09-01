@@ -2318,87 +2318,340 @@ func (s *ShardStore) filterS3AuxiliaryKVsOwnedByRoute(
 	ts uint64,
 	readRouteVersion uint64,
 ) ([]*store.KVPair, error) {
-	out := make([]*store.KVPair, 0, len(kvs))
-	for _, kvp := range kvs {
+	include, batches := s3BucketAuxiliaryOwnerProbePlan(kvs, routes, route)
+	if err := s.applyS3BucketAuxiliaryOwnerProbeBatches(ctx, include, batches, ts, readRouteVersion); err != nil {
+		return nil, err
+	}
+	return includedKVs(kvs, include), nil
+}
+
+func s3BucketAuxiliaryOwnerProbePlan(
+	kvs []*store.KVPair,
+	routes []distribution.Route,
+	route distribution.Route,
+) ([]bool, map[s3BucketAuxiliaryOwnerProbeRouteKey]*s3BucketAuxiliaryOwnerProbeBatch) {
+	include := make([]bool, len(kvs))
+	batches := make(map[s3BucketAuxiliaryOwnerProbeRouteKey]*s3BucketAuxiliaryOwnerProbeBatch)
+	for i, kvp := range kvs {
 		if kvp == nil {
 			continue
 		}
 		owner, auxiliary := s3BucketAuxiliaryOwnerRoute(kvp.Key, routes)
 		if auxiliary && !routeMatchesS3BucketAuxiliaryOwner(route, owner) {
-			covered, err := s.s3BucketAuxiliaryOwnerHasVersionAt(ctx, owner, kvp.Key, ts, readRouteVersion)
-			if err != nil {
-				return nil, err
+			key := s3BucketAuxiliaryOwnerProbeRouteKeyFor(owner)
+			batch := batches[key]
+			if batch == nil {
+				batch = &s3BucketAuxiliaryOwnerProbeBatch{owner: owner}
+				batches[key] = batch
 			}
-			if covered {
+			batch.probes = append(batch.probes, s3BucketAuxiliaryOwnerProbe{index: i, key: kvp.Key})
+			continue
+		}
+		include[i] = true
+	}
+	return include, batches
+}
+
+func (s *ShardStore) applyS3BucketAuxiliaryOwnerProbeBatches(
+	ctx context.Context,
+	include []bool,
+	batches map[s3BucketAuxiliaryOwnerProbeRouteKey]*s3BucketAuxiliaryOwnerProbeBatch,
+	ts uint64,
+	readRouteVersion uint64,
+) error {
+	for _, batch := range batches {
+		keys := batch.probeKeys()
+		covered, err := s.s3BucketAuxiliaryOwnerHasVersionsAt(ctx, batch.owner, keys, ts, readRouteVersion)
+		if err != nil {
+			return err
+		}
+		if len(covered) != len(batch.probes) {
+			return errors.WithStack(errors.Newf("s3 auxiliary owner version probe returned %d results for %d keys", len(covered), len(batch.probes)))
+		}
+		for i, found := range covered {
+			if found {
 				continue
 			}
+			include[batch.probes[i].index] = true
 		}
-		out = append(out, kvp)
+	}
+	return nil
+}
+
+func includedKVs(kvs []*store.KVPair, include []bool) []*store.KVPair {
+	out := make([]*store.KVPair, 0, len(kvs))
+	for i, kvp := range kvs {
+		if include[i] {
+			out = append(out, kvp)
+		}
+	}
+	return out
+}
+
+type s3BucketAuxiliaryOwnerProbe struct {
+	index int
+	key   []byte
+}
+
+type s3BucketAuxiliaryOwnerProbeBatch struct {
+	owner  distribution.Route
+	probes []s3BucketAuxiliaryOwnerProbe
+}
+
+func (b *s3BucketAuxiliaryOwnerProbeBatch) probeKeys() [][]byte {
+	keys := make([][]byte, 0, len(b.probes))
+	for _, probe := range b.probes {
+		keys = append(keys, probe.key)
+	}
+	return keys
+}
+
+type s3BucketAuxiliaryOwnerProbeRouteKey struct {
+	groupID        uint64
+	routeID        uint64
+	staged         bool
+	migrationJobID uint64
+	routeStart     string
+	routeEnd       string
+}
+
+func s3BucketAuxiliaryOwnerProbeRouteKeyFor(route distribution.Route) s3BucketAuxiliaryOwnerProbeRouteKey {
+	return s3BucketAuxiliaryOwnerProbeRouteKey{
+		groupID:        route.GroupID,
+		routeID:        route.RouteID,
+		staged:         routeHasStagedVisibility(route),
+		migrationJobID: route.MigrationJobID,
+		routeStart:     string(route.Start),
+		routeEnd:       string(route.End),
+	}
+}
+
+func (s *ShardStore) s3BucketAuxiliaryOwnerHasVersionsAt(
+	ctx context.Context,
+	owner distribution.Route,
+	keys [][]byte,
+	ts uint64,
+	readRouteVersion uint64,
+) ([]bool, error) {
+	if !routeHasStagedVisibility(owner) {
+		return s.s3BucketAuxiliaryLiveOwnerHasVersionsAt(ctx, owner, keys, ts, readRouteVersion)
+	}
+	return s.s3BucketAuxiliaryStagedOwnerHasVersionsAt(ctx, owner, keys, ts, readRouteVersion)
+}
+
+func (s *ShardStore) s3BucketAuxiliaryLiveOwnerHasVersionsAt(
+	ctx context.Context,
+	owner distribution.Route,
+	keys [][]byte,
+	ts uint64,
+	readRouteVersion uint64,
+) ([]bool, error) {
+	visible, ok, err := s.ownerRouteHasVersionsAtOrBefore(ctx, owner, keys, ts, readRouteVersion)
+	if err != nil {
+		return nil, err
+	}
+	return existenceProbeResults(visible, ok, owner, keys)
+}
+
+func (s *ShardStore) s3BucketAuxiliaryStagedOwnerHasVersionsAt(
+	ctx context.Context,
+	owner distribution.Route,
+	keys [][]byte,
+	ts uint64,
+	readRouteVersion uint64,
+) ([]bool, error) {
+	stagedKeys := s3BucketAuxiliaryStagedDataKeys(owner, keys)
+	staged, stagedOK, err := s.ownerRouteHasVersionsAtOrBefore(ctx, owner, stagedKeys, ts, readRouteVersion)
+	if err != nil {
+		return nil, err
+	}
+
+	out, liveKeys, liveIndex := s3BucketAuxiliaryLiveProbePlan(keys, staged)
+	if len(liveKeys) == 0 {
+		return out, nil
+	}
+
+	live, liveOK, err := s.ownerRouteHasVersionsAtOrBefore(ctx, owner, liveKeys, ts, readRouteVersion)
+	if err != nil {
+		return nil, err
+	}
+	if err := applyS3BucketAuxiliaryLiveProbeResults(out, live, liveIndex, liveKeys, owner, stagedOK && liveOK); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
 
-func (s *ShardStore) s3BucketAuxiliaryOwnerHasVersionAt(
-	ctx context.Context,
-	owner distribution.Route,
-	key []byte,
-	ts uint64,
-	readRouteVersion uint64,
-) (bool, error) {
-	if !routeHasStagedVisibility(owner) {
-		live, liveOK, err := s.ownerRouteHasVersionAtOrBefore(ctx, owner, key, ts, readRouteVersion)
-		if err != nil {
-			return false, err
-		}
-		return existenceProbeResult(live, liveOK, owner, key)
+func s3BucketAuxiliaryStagedDataKeys(owner distribution.Route, keys [][]byte) [][]byte {
+	stagedKeys := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		stagedKeys = append(stagedKeys, distribution.MigrationStagedDataKey(owner.MigrationJobID, key))
 	}
-	// Staged before live: a live-first existence probe can miss a row that
-	// promotion moves between the two calls -- absent from live before the
-	// move, absent from staged after it -- and report a key that existed
-	// throughout as missing.
-	stagedKey := distribution.MigrationStagedDataKey(owner.MigrationJobID, key)
-	staged, stagedOK, err := s.ownerRouteHasVersionAtOrBefore(ctx, owner, stagedKey, ts, readRouteVersion)
-	if err != nil {
-		return false, err
-	}
-	if staged {
-		return true, nil
-	}
-	live, liveOK, err := s.ownerRouteHasVersionAtOrBefore(ctx, owner, key, ts, readRouteVersion)
-	if err != nil {
-		return false, err
-	}
-	return existenceProbeResult(live, liveOK && stagedOK, owner, key)
+	return stagedKeys
 }
 
-// existenceProbeResult turns a probe outcome into the (found, error) pair the
-// callers expect: an unanswered probe is an error rather than a "no", because
-// treating an unreachable owner as absent is what silently drops a row.
-func existenceProbeResult(found bool, answered bool, owner distribution.Route, key []byte) (bool, error) {
-	if found {
-		return true, nil
+func s3BucketAuxiliaryLiveProbePlan(keys [][]byte, staged []bool) ([]bool, [][]byte, []int) {
+	out := make([]bool, len(keys))
+	liveKeys := make([][]byte, 0, len(keys))
+	liveIndex := make([]int, 0, len(keys))
+	for i, found := range staged {
+		if found {
+			out[i] = true
+			continue
+		}
+		liveKeys = append(liveKeys, keys[i])
+		liveIndex = append(liveIndex, i)
 	}
-	if !answered {
-		return false, ownerVersionProbeUnavailable(owner, key)
+	return out, liveKeys, liveIndex
+}
+
+func applyS3BucketAuxiliaryLiveProbeResults(
+	out []bool,
+	live []bool,
+	liveIndex []int,
+	liveKeys [][]byte,
+	owner distribution.Route,
+	answered bool,
+) error {
+	for i, found := range live {
+		if found {
+			out[liveIndex[i]] = true
+			continue
+		}
+		if !answered {
+			return ownerVersionProbeUnavailable(owner, liveKeys[i])
+		}
 	}
-	return false, nil
+	return nil
+}
+
+func existenceProbeResults(found []bool, answered bool, owner distribution.Route, keys [][]byte) ([]bool, error) {
+	if answered {
+		return found, nil
+	}
+	for i, visible := range found {
+		if visible {
+			continue
+		}
+		return nil, ownerVersionProbeUnavailable(owner, keys[i])
+	}
+	return found, nil
 }
 
 func ownerVersionProbeUnavailable(route distribution.Route, key []byte) error {
 	return errors.Wrapf(ErrLeaderNotFound, "s3 auxiliary owner version probe unavailable group_id=%d key=%q", route.GroupID, key)
 }
 
-func (s *ShardStore) ownerRouteHasVersionAtOrBefore(
+func (s *ShardStore) ownerRouteHasVersionsAtOrBefore(
 	ctx context.Context,
 	owner distribution.Route,
-	key []byte,
+	keys [][]byte,
 	ts uint64,
 	readRouteVersion uint64,
-) (bool, bool, error) {
-	if exists, ok, err := s.routeHasVersionAtOrBefore(ctx, owner, key, ts); ok || err != nil {
+) ([]bool, bool, error) {
+	if exists, ok, err := s.routeHasVersionsAtOrBefore(ctx, owner, keys, ts); ok || err != nil {
 		return exists, ok, err
 	}
-	return s.routeHasVersionAtOrBeforeRemote(ctx, owner, key, ts, readRouteVersion)
+	return s.routeHasVersionsAtOrBeforeRemote(ctx, owner, keys, ts, readRouteVersion)
+}
+
+func (s *ShardStore) routeHasVersionsAtOrBefore(
+	ctx context.Context,
+	route distribution.Route,
+	keys [][]byte,
+	ts uint64,
+) ([]bool, bool, error) {
+	out := make([]bool, len(keys))
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g.Store == nil {
+		return out, true, nil
+	}
+	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
+		return out, false, nil
+	}
+	exists, err := versionsExistAtOrBefore(ctx, g.Store, keys, ts)
+	return exists, true, errors.WithStack(err)
+}
+
+func versionsExistAtOrBefore(ctx context.Context, st store.MVCCStore, keys [][]byte, ts uint64) ([]bool, error) {
+	out := make([]bool, len(keys))
+	versions, err := latestCandidateVersionsAt(ctx, st, keys, ts)
+	if err != nil {
+		return nil, err
+	}
+	for i, key := range keys {
+		_, out[i] = versions[string(key)]
+	}
+	return out, nil
+}
+
+func (s *ShardStore) routeHasVersionsAtOrBeforeRemote(
+	ctx context.Context,
+	route distribution.Route,
+	keys [][]byte,
+	ts uint64,
+	readRouteVersion uint64,
+) ([]bool, bool, error) {
+	out := make([]bool, len(keys))
+	if len(keys) == 0 {
+		return out, true, nil
+	}
+	if ts == 0 {
+		return out, false, nil
+	}
+	cli, ok, err := s.routeVersionPresenceClient(route)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return out, false, nil
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
+	resp, err := cli.RawLatestCommitTS(rpcCtx, &pb.RawLatestCommitTSRequest{
+		Keys:               cloneKeyBatch(keys),
+		ReadRouteVersion:   readRouteVersion,
+		GroupId:            route.GroupID,
+		VersionVisibleAtTs: ts,
+	})
+	if err != nil {
+		return nil, false, errors.WithStack(err)
+	}
+	if !resp.GetVersionVisibleSupported() {
+		return out, false, nil
+	}
+	visible := resp.GetVersionVisibleResults()
+	if len(visible) != len(keys) {
+		return nil, false, errors.WithStack(errors.Newf("s3 auxiliary owner version probe returned %d results for %d keys", len(visible), len(keys)))
+	}
+	return append([]bool(nil), visible...), true, nil
+}
+
+func (s *ShardStore) routeVersionPresenceClient(route distribution.Route) (pb.RawKVClient, bool, error) {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil {
+		return nil, false, nil
+	}
+	engine := engineForGroup(g)
+	if engine == nil {
+		return nil, false, nil
+	}
+	addr := leaderAddrFromEngine(engine)
+	if addr == "" {
+		return nil, false, nil
+	}
+	conn, err := s.connCache.ConnFor(addr)
+	if err != nil {
+		return nil, false, err
+	}
+	return pb.NewRawKVClient(conn), true, nil
+}
+
+func cloneKeyBatch(keys [][]byte) [][]byte {
+	out := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, bytes.Clone(key))
+	}
+	return out
 }
 
 func routeMatchesS3BucketAuxiliaryOwner(route distribution.Route, owner distribution.Route) bool {
@@ -3983,6 +4236,35 @@ func (s *ShardStore) LatestCommitTSGroupWithReadFence(ctx context.Context, key [
 	}
 
 	return s.proxyLatestCommitTSGroup(ctx, g, key, groupID, readRouteVersion)
+}
+
+func (s *ShardStore) VersionsExistAtOrBeforeGroupWithReadFence(ctx context.Context, keys [][]byte, groupID uint64, ts uint64, readRouteVersion uint64) ([]bool, bool, error) {
+	if groupID == 0 {
+		return s.versionsExistAtOrBeforeWithReadFence(ctx, keys, ts, readRouteVersion)
+	}
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, false, err
+	}
+	return s.routeHasVersionsAtOrBefore(ctx, distribution.Route{GroupID: groupID}, keys, ts)
+}
+
+func (s *ShardStore) versionsExistAtOrBeforeWithReadFence(ctx context.Context, keys [][]byte, ts uint64, readRouteVersion uint64) ([]bool, bool, error) {
+	out := make([]bool, len(keys))
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, false, err
+	}
+	for i, key := range keys {
+		route, _, _, ok := s.routeAndGroupForKeyWithVersion(key)
+		if !ok {
+			continue
+		}
+		exists, answered, err := s.routeHasVersionsAtOrBefore(ctx, route, [][]byte{key}, ts)
+		if err != nil || !answered {
+			return out, answered, err
+		}
+		out[i] = exists[0]
+	}
+	return out, true, nil
 }
 
 func (s *ShardStore) localLatestCommitTS(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte) (uint64, bool, error) {

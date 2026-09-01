@@ -673,10 +673,21 @@ func (s *versionVisibleRawKVServer) RawLatestCommitTS(_ context.Context, req *pb
 	defer s.mu.Unlock()
 	s.latestReqs = append(s.latestReqs, &pb.RawLatestCommitTSRequest{
 		Key:                bytes.Clone(req.GetKey()),
+		Keys:               cloneKeyBatch(req.GetKeys()),
 		GroupId:            req.GetGroupId(),
 		ReadRouteVersion:   req.GetReadRouteVersion(),
 		VersionVisibleAtTs: req.GetVersionVisibleAtTs(),
 	})
+	if keys := req.GetKeys(); len(keys) > 0 {
+		results := make([]bool, len(keys))
+		for i, key := range keys {
+			results[i] = s.visible[string(key)]
+		}
+		return &pb.RawLatestCommitTSResponse{
+			VersionVisibleResults:   results,
+			VersionVisibleSupported: true,
+		}, nil
+	}
 	return &pb.RawLatestCommitTSResponse{
 		VersionVisible:          s.visible[string(req.GetKey())],
 		VersionVisibleSupported: true,
@@ -725,12 +736,67 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testi
 	// through to staged anyway, and that pair is what a concurrent promotion
 	// slips between.
 	require.Len(t, probe.latestReqs, 1)
-	require.Equal(t, stagedKey, probe.latestReqs[0].GetKey())
+	require.Equal(t, [][]byte{stagedKey}, probe.latestReqs[0].GetKeys())
 	for _, req := range probe.latestReqs {
 		require.Equal(t, uint64(2), req.GetGroupId())
 		require.Equal(t, uint64(77), req.GetReadRouteVersion())
 		require.Equal(t, uint64(30), req.GetVersionVisibleAtTs())
 	}
+}
+
+func TestShardStoreS3BucketAuxiliaryOwnerProbeBatchesFollowerChecks(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	keys := [][]byte{
+		s3keys.BucketMetaKey("bucket-a"),
+		s3keys.BucketMetaKey("bucket-b"),
+		s3keys.BucketMetaKey("bucket-c"),
+	}
+	probe := &versionVisibleRawKVServer{visible: map[string]bool{}}
+	for _, key := range keys {
+		probe.visible[string(distribution.MigrationStagedDataKey(9, key))] = true
+	}
+	addr, stop := startRawKVServer(t, probe)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte(s3keys.RoutePrefix), GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID: 2, Start: []byte(s3keys.RoutePrefix), End: prefixScanEnd([]byte(s3keys.RoutePrefix)),
+				GroupID: 2, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9,
+			},
+			{RouteID: 3, Start: prefixScanEnd([]byte(s3keys.RoutePrefix)), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore(), Engine: &followerProxyEngine{leader: addr}},
+	}
+	st := NewShardStore(engine, groups)
+	for _, key := range keys {
+		require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("stale-source"), 10, 0))
+	}
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	kvs, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 0, 77, nil, nil)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	require.Len(t, probe.latestReqs, 1)
+	require.Equal(t, uint64(2), probe.latestReqs[0].GetGroupId())
+	require.Equal(t, uint64(77), probe.latestReqs[0].GetReadRouteVersion())
+	require.Equal(t, uint64(30), probe.latestReqs[0].GetVersionVisibleAtTs())
+	require.Equal(t, [][]byte{
+		distribution.MigrationStagedDataKey(9, keys[0]),
+		distribution.MigrationStagedDataKey(9, keys[1]),
+		distribution.MigrationStagedDataKey(9, keys[2]),
+	}, probe.latestReqs[0].GetKeys())
 }
 
 func TestShardStoreS3BucketAuxiliaryOwnerProbeFailsWhenLeaderUnavailable(t *testing.T) {

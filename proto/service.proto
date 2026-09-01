@@ -76,6 +76,10 @@ message RawLatestCommitTSRequest {
   // below this timestamp. Comparing only `ts` cannot tell a tombstone at or
   // before the read timestamp apart from a newer version above it.
   uint64 version_visible_at_ts = 4;
+  // Optional batch form for version_visible_at_ts probes. Used by routed scan
+  // filters to avoid issuing one leader RPC per candidate key. The response
+  // carries version_visible_results in the same order.
+  repeated bytes keys = 5;
 }
 
 message RawLatestCommitTSResponse {
@@ -86,6 +90,7 @@ message RawLatestCommitTSResponse {
   // both unset and the caller falls back to comparing `ts`.
   bool version_visible = 3;
   bool version_visible_supported = 4;
+  repeated bool version_visible_results = 5;
 }
 
 message RawScanAtRequest {

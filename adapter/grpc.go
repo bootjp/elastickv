@@ -76,6 +76,10 @@ type rawVersionPresenceReader interface {
 	VersionExistsAtOrBeforeGroupWithReadFence(ctx context.Context, key []byte, groupID uint64, ts uint64, readRouteVersion uint64) (bool, bool, error)
 }
 
+type rawVersionPresenceBatchReader interface {
+	VersionsExistAtOrBeforeGroupWithReadFence(ctx context.Context, keys [][]byte, groupID uint64, ts uint64, readRouteVersion uint64) ([]bool, bool, error)
+}
+
 type rawGroupReverseScanner interface {
 	ReverseScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
 }
@@ -189,6 +193,21 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 	if err := r.requireReadReady(); err != nil {
 		return nil, err
 	}
+	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
+	if len(req.GetKeys()) > 0 {
+		visible, visibleSupported, err := r.rawVersionsVisibleAt(ctx, req, readRouteVersion)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return &pb.RawLatestCommitTSResponse{
+			VersionVisibleResults:   visible,
+			VersionVisibleSupported: visibleSupported,
+		}, nil
+	}
+	return r.rawLatestCommitTSSingle(ctx, req, readRouteVersion)
+}
+
+func (r *GRPCServer) rawLatestCommitTSSingle(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) (*pb.RawLatestCommitTSResponse, error) {
 	key := req.GetKey()
 	if len(key) == 0 {
 		// No key: return the store's global last-committed watermark.
@@ -204,7 +223,6 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 	var ts uint64
 	var exists bool
 	var err error
-	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
 	if groupID := req.GetGroupId(); groupID != 0 {
 		groupReader, ok := r.store.(rawGroupCommitTSReader)
 		if !ok {
@@ -231,6 +249,34 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 		VersionVisible:          visible,
 		VersionVisibleSupported: visibleSupported,
 	}, nil
+}
+
+func (r *GRPCServer) rawVersionsVisibleAt(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) ([]bool, bool, error) {
+	keys := req.GetKeys()
+	out := make([]bool, len(keys))
+	at := req.GetVersionVisibleAtTs()
+	if at == 0 {
+		return out, false, nil
+	}
+	if reader, ok := r.store.(rawVersionPresenceBatchReader); ok {
+		visible, supported, err := reader.VersionsExistAtOrBeforeGroupWithReadFence(ctx, keys, req.GetGroupId(), at, readRouteVersion)
+		return visible, supported, errors.WithStack(err)
+	}
+	reader, ok := r.store.(rawVersionPresenceReader)
+	if !ok {
+		return out, false, nil
+	}
+	for i, key := range keys {
+		visible, supported, err := reader.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, req.GetGroupId(), at, readRouteVersion)
+		if err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		if !supported {
+			return out, false, nil
+		}
+		out[i] = visible
+	}
+	return out, true, nil
 }
 
 // rawVersionVisibleAt answers the optional version_visible_at_ts probe. The
