@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -66,4 +67,35 @@ func TestValidateReadKeysOnShardReadsStagedBeforeLive(t *testing.T) {
 		"a promotion between the probes must not hide the conflicting commit")
 	require.Equal(t, uint64(60), ts)
 	require.Greater(t, ts, uint64(50), "the read must still conflict with startTS=50")
+}
+
+func TestValidateReadKeysOnShardUsesS3BucketAuxiliaryOwnerForStagedProbe(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+
+	rawKey := s3keys.BucketMetaKey(bucket)
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	ownerStore := store.NewMVCCStore()
+	t.Cleanup(func() { _ = ownerStore.Close() })
+	require.NoError(t, ownerStore.PutAt(ctx, stagedKey, []byte("staged"), 60, 0))
+
+	c := &ShardedCoordinator{
+		engine: engine,
+		groups: map[uint64]*ShardGroup{
+			1: {Store: store.NewMVCCStore()},
+			2: {Store: ownerStore},
+		},
+	}
+
+	ts, exists, err := c.latestCommitTSForReadKeyOnShard(ctx, 2, c.groups[2], rawKey)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(60), ts)
 }

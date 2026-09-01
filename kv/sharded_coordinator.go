@@ -2721,6 +2721,9 @@ func (c *ShardedCoordinator) stagedVisibilityRouteForReadKey(gid uint64, key []b
 	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
 		return distribution.Route{}, false
 	}
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
+		return route, route.GroupID == gid && routeHasStagedVisibility(route)
+	}
 	route, ok := c.engine.GetRoute(routeKey(key))
 	return route, ok && route.GroupID == gid && routeHasStagedVisibility(route)
 }
