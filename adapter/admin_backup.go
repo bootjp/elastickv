@@ -343,17 +343,19 @@ func (s *AdminServer) pinBackupGroups(
 ) (map[uint64]uint64, error) {
 	reserveEntry := kv.EncodeBackupReserveEntry(kv.BackupReserveEntry{PinID: pinID, ReadTS: readTS, Deadline: deadline})
 	if _, _, err := proposeBackupAll(ctx, []backupGroup{controlGroup}, reserveEntry); err != nil {
-		if backupCapacityReservationFull(err) {
+		// Only a definitive capacity rejection proves nothing was reserved.
+		// Every other error is ambiguous -- the entry may well have committed
+		// with only the response lost, or the context expired after the
+		// proposal -- and an unacknowledged reservation holds one of the few
+		// global active-backup slots until its TTL for a backup no caller ever
+		// received. Unreserve is idempotent and keyed by this pin, so
+		// compensating costs nothing when the reservation never landed.
+		if !backupCapacityRejectionDefinitive(err) {
+			s.compensateBackupRelease(controlGroup, nil, pinID)
+		}
+		if backupCapacityRejectionReported(err) {
 			return nil, status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
 		}
-		// A capacity rejection is definitive: nothing was reserved. Any other
-		// error is ambiguous -- the entry may well have committed with only the
-		// response lost, or the context expired after the proposal -- and an
-		// unacknowledged reservation holds one of the few global active-backup
-		// slots until its TTL for a backup no caller ever received. Unreserve is
-		// idempotent and keyed by this pin, so compensating costs nothing when
-		// the reservation never landed.
-		s.compensateBackupRelease(controlGroup, nil, pinID)
 		return nil, status.Errorf(codes.Unavailable, "reserve backup capacity: %v", err)
 	}
 
@@ -464,13 +466,20 @@ func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupReques
 // only while it still owns the session it started from. A renewal that
 // overlapped a successful one no longer does, and must leave that caller's
 // pins alone.
+//
+// A session that has *disappeared* is not the same case. EndBackup can remove
+// it while this renewal is in flight, and the reserve or partial pin fan-out
+// can then commit behind that release and stay active until the new TTL,
+// holding one of the few global backup slots and blocking compaction. Only a
+// still-live session at a different generation proves another caller owns the
+// pins, so that is the one outcome that skips compensation.
 func (s *AdminServer) abandonFailedRenewal(
 	groups []backupGroup,
 	tok backupToken,
 	generation uint64,
 	live bool,
 ) {
-	if live && !s.forgetBackupSessionAtGeneration(tok.pinID, generation) {
+	if live && s.forgetBackupSessionAtGeneration(tok.pinID, generation) == backupSessionOwnershipTaken {
 		return
 	}
 	if !live {
@@ -963,7 +972,23 @@ func backupProposalGroupError(groupID uint64, err error) error {
 	return errors.Wrapf(err, "raft group %d", groupID)
 }
 
-func backupCapacityReservationFull(err error) bool {
+// backupCapacityRejectionDefinitive reports whether the reserve failure proves
+// nothing was reserved, which is the only case where skipping the compensating
+// unreserve is safe. Only a local apply response carries
+// kv.ErrTooManyActiveBackups as a Go error. backupProposalGroupError re-stamps
+// *any* ResourceExhausted status -- including one produced by a transport,
+// proxy, or server-side quota layer -- so a bare code is ambiguous and must be
+// compensated.
+func backupCapacityRejectionDefinitive(err error) bool {
+	return errors.Is(err, kv.ErrTooManyActiveBackups)
+}
+
+// backupCapacityRejectionReported reports whether the caller should see
+// ResourceExhausted rather than Unavailable. A forwarded capacity rejection
+// loses its Go error across the RPC boundary but keeps its status code, so the
+// code still drives the client-facing answer even though it no longer proves
+// enough to skip compensation.
+func backupCapacityRejectionReported(err error) bool {
 	return errors.Is(err, kv.ErrTooManyActiveBackups) || status.Code(err) == codes.ResourceExhausted
 }
 
@@ -1268,21 +1293,42 @@ func (s *AdminServer) backupSessionGeneration(tok backupToken) (uint64, bool) {
 	return session.generation, true
 }
 
+// backupSessionOwnership distinguishes the two reasons a generation-guarded
+// drop can decline. Only backupSessionOwnershipTaken proves someone else owns
+// the pins; backupSessionOwnershipAbsent means EndBackup already removed the
+// session, and the caller must still compensate for whatever it half-renewed.
+type backupSessionOwnership int
+
+const (
+	// backupSessionOwnershipAbsent: no session at this pin id any more.
+	backupSessionOwnershipAbsent backupSessionOwnership = iota
+	// backupSessionOwnershipTaken: a newer generation owns the session.
+	backupSessionOwnershipTaken
+	// backupSessionOwnershipDropped: the caller's own session was removed.
+	backupSessionOwnershipDropped
+)
+
 // forgetBackupSessionAtGeneration drops the session only while it is still the
 // one the caller started from. A renewal that failed part way through its
 // fan-out must release the pins it may have half-renewed, but if another
 // renewal has already succeeded in the meantime it owns the session now --
 // tearing it down here would leave that caller holding a token whose pins are
 // gone, with retention free to compact the data underneath it.
-func (s *AdminServer) forgetBackupSessionAtGeneration(pinID kv.BackupPinID, generation uint64) bool {
+func (s *AdminServer) forgetBackupSessionAtGeneration(
+	pinID kv.BackupPinID,
+	generation uint64,
+) backupSessionOwnership {
 	s.backupStateMu.Lock()
 	defer s.backupStateMu.Unlock()
 	session, ok := s.backupSessions[pinID]
-	if !ok || session.generation != generation {
-		return false
+	if !ok {
+		return backupSessionOwnershipAbsent
+	}
+	if session.generation != generation {
+		return backupSessionOwnershipTaken
 	}
 	delete(s.backupSessions, pinID)
-	return true
+	return backupSessionOwnershipDropped
 }
 
 func (s *AdminServer) forgetBackupSession(pinID kv.BackupPinID) {
