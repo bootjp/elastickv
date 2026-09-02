@@ -585,7 +585,11 @@ func (s *AdminServer) StreamBackup(
 	if err != nil {
 		return err
 	}
-	selected, err := selectedBackupScopes(req.GetScopes())
+	requested, err := selectedBackupScopes(req.GetScopes())
+	if err != nil {
+		return err
+	}
+	selected, err := backupStreamScopes(selection, requested)
 	if err != nil {
 		return err
 	}
@@ -748,6 +752,44 @@ func backupContextStreamError(err error) error {
 	default:
 		return nil
 	}
+}
+
+// backupStreamScopes resolves the scope set a stream may actually send.
+//
+// BeginBackup's selection is what expected_keys and the preflight retained-count
+// scan were computed over, so the stream cannot reach outside it: a client that
+// begins with redis/db_0 and then asks for redis/db_1 would receive data the
+// integrity baseline never covered. A stream-requested scope outside the Begin
+// selection is refused rather than silently dropped, because it means the two
+// requests disagree and the caller needs to know.
+//
+// An empty Begin selection means "every scope", so any requested subset is
+// valid; an empty stream request inherits the Begin selection unchanged.
+func backupStreamScopes(
+	selection backupBaselineSelection,
+	requested map[logicalbackup.Scope]bool,
+) (map[logicalbackup.Scope]bool, error) {
+	if len(selection.scopes) == 0 {
+		return requested, nil
+	}
+	if len(requested) == 0 {
+		return selection.scopes, nil
+	}
+	out := make(map[logicalbackup.Scope]bool, len(requested))
+	for scope, want := range requested {
+		if !want {
+			continue
+		}
+		if !selection.scopes[scope] {
+			return nil, status.Errorf(
+				codes.InvalidArgument,
+				"backup scope %s/%s was not part of the BeginBackup selection",
+				scope.Adapter, scope.Name,
+			)
+		}
+		out[scope] = true
+	}
+	return out, nil
 }
 
 func selectedBackupScopes(scopes []*pb.BackupScope) (map[logicalbackup.Scope]bool, error) {
