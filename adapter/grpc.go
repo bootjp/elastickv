@@ -232,25 +232,10 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 		}, nil
 	}
 
-	var ts uint64
-	var exists bool
-	var err error
 	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
-	if groupID := req.GetGroupId(); groupID != 0 {
-		groupReader, ok := r.store.(rawGroupCommitTSReader)
-		if !ok {
-			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp for an explicit group requires a group-aware store"))
-		}
-		ts, exists, err = groupReader.LatestCommitTSGroupWithReadFence(ctx, key, groupID, readRouteVersion)
-	} else if fenceReader, ok := r.store.(rawReadFenceCommitTSReader); ok {
-		ts, exists, err = fenceReader.LatestCommitTSWithReadFence(ctx, key, readRouteVersion)
-	} else if req.GetReadRouteVersion() != 0 {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp with read fence requires a read-fence-aware store"))
-	} else {
-		ts, exists, err = r.store.LatestCommitTS(ctx, key)
-	}
+	ts, exists, err := r.rawKeyCommitTS(ctx, req, key, readRouteVersion)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 	visible, visibleSupported, err := r.rawVersionVisibleAt(ctx, req, readRouteVersion)
 	if err != nil {
@@ -262,6 +247,36 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 		VersionVisible:          visible,
 		VersionVisibleSupported: visibleSupported,
 	}, nil
+}
+
+// rawKeyCommitTS resolves the per-key latest commit timestamp through whichever
+// reader the store implements: an explicit group, a read-fence-aware store, or
+// the plain reader. Split out of RawLatestCommitTS to keep that handler inside
+// the cyclop budget once the readiness gate and the group-watermark branch both
+// landed in front of it.
+func (r *GRPCServer) rawKeyCommitTS(
+	ctx context.Context,
+	req *pb.RawLatestCommitTSRequest,
+	key []byte,
+	readRouteVersion uint64,
+) (uint64, bool, error) {
+	if groupID := req.GetGroupId(); groupID != 0 {
+		groupReader, ok := r.store.(rawGroupCommitTSReader)
+		if !ok {
+			return 0, false, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp for an explicit group requires a group-aware store"))
+		}
+		ts, exists, err := groupReader.LatestCommitTSGroupWithReadFence(ctx, key, groupID, readRouteVersion)
+		return ts, exists, errors.WithStack(err)
+	}
+	if fenceReader, ok := r.store.(rawReadFenceCommitTSReader); ok {
+		ts, exists, err := fenceReader.LatestCommitTSWithReadFence(ctx, key, readRouteVersion)
+		return ts, exists, errors.WithStack(err)
+	}
+	if req.GetReadRouteVersion() != 0 {
+		return 0, false, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp with read fence requires a read-fence-aware store"))
+	}
+	ts, exists, err := r.store.LatestCommitTS(ctx, key)
+	return ts, exists, errors.WithStack(err)
 }
 
 // rawVersionVisibleAt answers the optional version_visible_at_ts probe. The
