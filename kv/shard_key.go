@@ -40,6 +40,16 @@ const (
 	// family (!sqs|queue|meta|, !sqs|msg|vis|, etc.). Used by
 	// sqsRouteKey to dispatch the routing decision.
 	sqsInternalPrefix = "!sqs|"
+
+	sqsQueueMetaPrefix      = "!sqs|queue|meta|"
+	sqsQueueGenPrefix       = "!sqs|queue|gen|"
+	sqsQueueSeqPrefix       = "!sqs|queue|seq|"
+	sqsQueueTombstonePrefix = "!sqs|queue|tombstone|"
+	sqsMsgDataPrefix        = "!sqs|msg|data|"
+	sqsMsgVisPrefix         = "!sqs|msg|vis|"
+	sqsMsgDedupPrefix       = "!sqs|msg|dedup|"
+	sqsMsgGroupPrefix       = "!sqs|msg|group|"
+	sqsMsgByAgePrefix       = "!sqs|msg|byage|"
 )
 
 var (
@@ -48,8 +58,19 @@ var (
 	dynamoTableGenerationPrefixBytes = []byte(DynamoTableGenerationPrefix)
 	dynamoItemPrefixBytes            = []byte(DynamoItemPrefix)
 	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
-	sqsRoutePrefixBytes              = []byte(sqsRoutePrefix)
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
+	sqsGlobalRouteKey                = []byte(sqsRoutePrefix + "global")
+	sqsConcreteInternalPrefixBytes   = [][]byte{
+		[]byte(sqsQueueMetaPrefix),
+		[]byte(sqsQueueGenPrefix),
+		[]byte(sqsQueueSeqPrefix),
+		[]byte(sqsQueueTombstonePrefix),
+		[]byte(sqsMsgDataPrefix),
+		[]byte(sqsMsgVisPrefix),
+		[]byte(sqsMsgDedupPrefix),
+		[]byte(sqsMsgGroupPrefix),
+		[]byte(sqsMsgByAgePrefix),
+	}
 	// Families whose physical keys can still appear in a scan result and need a
 	// point-read canonicalization.
 	redisWideColumnScanPrefixes = [][]byte{
@@ -143,17 +164,17 @@ func normalizeRouteKey(key []byte) []byte {
 }
 
 func listRouteKey(key []byte) []byte {
-	if store.IsListMetaDeltaKey(key) {
-		if user := store.ExtractListUserKeyFromDelta(key); user != nil {
-			return user
-		}
-		return store.ExtractListUserKeyFromDeltaScanPrefix(key)
+	if user := store.ExtractListUserKeyFromDelta(key); user != nil {
+		return user
 	}
-	if store.IsListClaimKey(key) {
-		if user := store.ExtractListUserKeyFromClaim(key); user != nil {
-			return user
-		}
-		return store.ExtractListUserKeyFromClaimScanPrefix(key)
+	if user := store.ExtractListUserKeyFromDeltaScanPrefix(key); user != nil {
+		return user
+	}
+	if user := store.ExtractListUserKeyFromClaim(key); user != nil {
+		return user
+	}
+	if user := store.ExtractListUserKeyFromClaimScanPrefix(key); user != nil {
+		return user
 	}
 	if user := store.ExtractListUserKey(key); user != nil {
 		return user
@@ -418,19 +439,24 @@ func dynamoRouteTableKey(tableSegment []byte) []byte {
 	return out
 }
 
-// sqsRouteKey maps any !sqs|... internal key to a stable route key so
-// multi-shard deployments that partition by user-key range still land
-// every SQS mutation on a configured group. Milestone 1 collapses all
-// SQS keys to a single !sqs|route|global route — this keeps the
-// catalog and every queue's message keyspace on the same group, which
-// is the minimum needed for FIFO group-lock semantics (landing later)
-// to work. When per-queue sharding is implemented it will live here.
+// sqsRouteKey maps concrete persisted !sqs|... storage prefixes to a stable
+// route key. Adapter-looking raw user keys such as !sqs|foo intentionally stay
+// on their raw route and migrate through the user-key bracket.
 func sqsRouteKey(key []byte) []byte {
 	if !bytes.HasPrefix(key, sqsInternalPrefixBytes) {
 		return nil
 	}
-	out := make([]byte, 0, len(sqsRoutePrefixBytes)+len("global"))
-	out = append(out, sqsRoutePrefixBytes...)
-	out = append(out, []byte("global")...)
-	return out
+	if !hasSQSConcreteInternalPrefix(key) {
+		return nil
+	}
+	return sqsGlobalRouteKey
+}
+
+func hasSQSConcreteInternalPrefix(key []byte) bool {
+	for _, prefix := range sqsConcreteInternalPrefixBytes {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
 }

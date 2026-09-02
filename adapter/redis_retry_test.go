@@ -441,6 +441,37 @@ func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
 	require.Equal(t, 2, attempts)
 }
 
+func TestComposedRouteErrorsAreRetryableButDoNotPreserveAttempts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "typed violation", err: kv.ErrComposed1Violation},
+		{name: "typed gc", err: kv.ErrComposed1VersionGCd},
+		{
+			name: "wire violation",
+			err: errors.WithStack(status.Error(codes.Aborted,
+				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error())),
+		},
+		{
+			name: "wire gc",
+			err: errors.WithStack(status.Error(codes.Aborted,
+				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1VersionGCd.Error())),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			require.True(t, isRetryableRedisTxnErr(tt.err))
+			require.False(t, shouldPreserveRedisTxnAttempt(tt.err))
+		})
+	}
+}
+
 func TestRetryRedisWriteDoesNotTreatComposedSentinelInWireConflictKeyAsRouteError(t *testing.T) {
 	t.Parallel()
 
@@ -632,6 +663,7 @@ func TestRetryPolicyForRedisTxnErr(t *testing.T) {
 
 	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(store.ErrWriteConflict))
 	require.Equal(t, redisTxnLockedRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrTxnLocked))
+	require.Equal(t, redisWriteConflictRetryPolicy, retryPolicyForRedisTxnErr(kv.ErrRouteWriteFenced))
 }
 
 // TestZCard_LegacyBlobZSet verifies that ZCARD inside a Lua script returns the

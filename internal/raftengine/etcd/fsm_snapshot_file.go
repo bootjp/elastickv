@@ -46,12 +46,20 @@ const (
 	// fsmWriteBufSize is the bufio.Writer buffer size used when writing .fsm files.
 	fsmWriteBufSize = 1 << 20 // 1 MiB
 
+	// defaultMaxRetainedFSMSnapshotBytes bounds retained .fsm payload bytes
+	// after successful snapshot publication. Large production FSM snapshots can
+	// be tens of GiB; keeping defaultMaxSnapFiles full copies leaves too little
+	// headroom for the next receive-side spool.
+	defaultMaxRetainedFSMSnapshotBytes = int64(16 << 30) // 16 GiB
+
 	// fsmMaxInMemPayload is the maximum payload size that readFSMSnapshotPayload
 	// will materialise into memory. Larger snapshots must use the streaming path
 	// (openFSMSnapshotPayloadReader) to avoid OOM. 1 GiB is chosen as a generous
 	// upper bound; real FSM payloads for this workload are typically much smaller.
 	fsmMaxInMemPayload = int64(1 << 30) // 1 GiB
 )
+
+const maxRetainedFSMSnapshotBytesEnvVar = "ELASTICKV_RAFT_MAX_RETAINED_FSM_SNAPSHOT_BYTES"
 
 var (
 	snapshotTokenMagic = [snapshotTokenMagicLen]byte{'E', 'K', 'V', 'T'}
@@ -353,6 +361,18 @@ func restoreAndComputeCRC(f *os.File, fileSize int64, fsm StateMachine) (uint32,
 	return h.Sum32(), nil
 }
 
+func computeFSMSnapshotPayloadCRC(f *os.File, fileSize int64) (uint32, error) {
+	if _, err := f.Seek(0, io.SeekStart); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	payloadSize := fileSize - fsmFooterSize
+	h := crc32.New(crc32cTable)
+	if _, err := io.CopyN(h, f, payloadSize); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return h.Sum32(), nil
+}
+
 // verifyFSMSnapshotFile performs a read-only CRC check without restoring the FSM.
 // Used for startup orphan detection. Pass tokenCRC=0 to skip the token comparison.
 func verifyFSMSnapshotFile(path string, tokenCRC uint32) error {
@@ -619,6 +639,7 @@ type snapFileCandidate struct {
 	index      uint64
 	restorable bool
 	walValid   bool
+	tokenCRC   uint32
 }
 
 type prewriteSnapshotRetention struct {
@@ -655,7 +676,7 @@ func purgeOlderSnapshotPairsBeforeWrite(
 		return candidates[i].index < candidates[j].index
 	})
 
-	retention := keepRestorablePrewriteSnapshots(candidates)
+	retention := keepVerifiedPrewriteSnapshots(fsmSnapDir, candidates)
 	var combined error
 	combined = errors.CombineErrors(combined, purgeUnretainedPrewriteSnapshots(snapDir, fsmSnapDir, candidates, retention))
 	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBeforeIndex(
@@ -746,6 +767,69 @@ func keepRestorablePrewriteSnapshots(candidates []snapFileCandidate) prewriteSna
 	return retention
 }
 
+func keepVerifiedPrewriteSnapshots(fsmSnapDir string, candidates []snapFileCandidate) prewriteSnapshotRetention {
+	retention := keepRestorablePrewriteSnapshots(candidates)
+	if fsmSnapDir == "" || len(candidates) <= prewriteSnapKeep {
+		return retention
+	}
+	for {
+		if !invalidateUnverifiedRetainedPrewriteSnapshots(fsmSnapDir, candidates, retention) {
+			return retention
+		}
+		retention = keepRestorablePrewriteSnapshots(candidates)
+		if !retentionHasRestorable(candidates, retention) {
+			return keepAllPrewriteSnapshots(candidates)
+		}
+	}
+}
+
+func invalidateUnverifiedRetainedPrewriteSnapshots(
+	fsmSnapDir string,
+	candidates []snapFileCandidate,
+	retention prewriteSnapshotRetention,
+) bool {
+	invalidated := false
+	for i := range candidates {
+		candidate := &candidates[i]
+		if !candidate.restorable || !retention.keep[candidate.name] || !retainedPrewriteSnapshotPrunesOlder(candidates, retention, *candidate) {
+			continue
+		}
+		if verifyFSMSnapshotFileWithToken(fsmSnapPath(fsmSnapDir, candidate.index), candidate.tokenCRC, true) == nil {
+			continue
+		}
+		candidate.restorable = false
+		invalidated = true
+	}
+	return invalidated
+}
+
+func retainedPrewriteSnapshotPrunesOlder(candidates []snapFileCandidate, retention prewriteSnapshotRetention, retained snapFileCandidate) bool {
+	for _, candidate := range candidates {
+		if candidate.index >= retained.index || retention.keep[candidate.name] {
+			continue
+		}
+		return true
+	}
+	return false
+}
+
+func retentionHasRestorable(candidates []snapFileCandidate, retention prewriteSnapshotRetention) bool {
+	for _, candidate := range candidates {
+		if candidate.restorable && retention.keep[candidate.name] {
+			return true
+		}
+	}
+	return false
+}
+
+func keepAllPrewriteSnapshots(candidates []snapFileCandidate) prewriteSnapshotRetention {
+	retention := prewriteSnapshotRetention{keep: make(map[string]bool, len(candidates))}
+	for _, candidate := range candidates {
+		retention.keep[candidate.name] = true
+	}
+	return retention
+}
+
 func keepNewestMatchingPrewriteSnapshots(
 	candidates []snapFileCandidate,
 	retention *prewriteSnapshotRetention,
@@ -813,25 +897,56 @@ func collectPrewriteSnapCandidates(
 		if index == 0 || index >= nextIndex {
 			continue
 		}
+		restorable, tokenCRC := fsmSnapshotPairRestorable(snapDir, fsmSnapDir, e.Name(), term, index)
 		candidates = append(candidates, snapFileCandidate{
 			name:       e.Name(),
 			index:      index,
-			restorable: fsmSnapshotPairRestorable(snapDir, fsmSnapDir, e.Name(), term, index),
+			restorable: restorable,
 			walValid:   walValidIndexes == nil || walValidIndexes[walSnapshotKey{term: term, index: index}],
+			tokenCRC:   tokenCRC,
 		})
 	}
 	return candidates
 }
 
-func fsmSnapshotPairRestorable(snapDir, fsmSnapDir, snapName string, term, index uint64) bool {
+func fsmSnapshotPairRestorable(snapDir, fsmSnapDir, snapName string, term, index uint64) (bool, uint32) {
 	if fsmSnapDir == "" {
-		return false
+		return false, 0
 	}
 	tok, ok := snapshotTokenFromSnapFile(snapDir, snapName, term, index)
 	if !ok {
-		return false
+		return false, 0
 	}
-	return verifyFSMSnapshotFileWithToken(fsmSnapPath(fsmSnapDir, index), tok.CRC32C, true) == nil
+	// Prewrite cleanup runs on the snapshot receive hot path before gRPC starts
+	// draining payload chunks. Only do a footer/token check here; full-payload
+	// CRC remains in the actual restore/open paths.
+	return fsmSnapshotFooterMatchesToken(fsmSnapPath(fsmSnapDir, index), tok.CRC32C) == nil, tok.CRC32C
+}
+
+func fsmSnapshotFooterMatchesToken(path string, tokenCRC uint32) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return statFSMFileError(err)
+	}
+	defer f.Close()
+
+	info, err := f.Stat()
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if info.Size() < fsmMinFileSize {
+		return errors.Wrapf(ErrFSMSnapshotTooSmall,
+			"file too small: %d bytes (minimum %d)", info.Size(), fsmMinFileSize)
+	}
+	footer, err := readFSMFooter(f, info.Size())
+	if err != nil {
+		return err
+	}
+	if footer != tokenCRC {
+		return errors.Wrapf(ErrFSMSnapshotTokenCRC,
+			"path=%s footer=%08x token=%08x", path, footer, tokenCRC)
+	}
+	return nil
 }
 
 func snapshotTokenFromSnapFile(snapDir, snapName string, term, index uint64) (snapshotToken, bool) {
@@ -986,7 +1101,7 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	}
 
 	snaps := collectSnapNames(entries)
-	if len(snaps) <= defaultMaxSnapFiles {
+	if len(snaps) == 0 {
 		return nil
 	}
 	// Sort explicitly: os.ReadDir returns lexicographic order on most systems,
@@ -994,8 +1109,12 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	// hex, so lexicographic == chronological order (oldest first).
 	sort.Strings(snaps)
 
+	maxKeep := retainedSnapshotFileLimit(snaps, fsmSnapDir)
+	if len(snaps) <= maxKeep {
+		return nil
+	}
 	var combined error
-	for _, name := range snaps[:len(snaps)-defaultMaxSnapFiles] {
+	for _, name := range snaps[:len(snaps)-maxKeep] {
 		if err := purgeSnapPair(snapDir, fsmSnapDir, name); err != nil {
 			combined = errors.CombineErrors(combined, err)
 		}
@@ -1004,6 +1123,60 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	combined = errors.CombineErrors(combined, syncDirIfExists(snapDir))
 	combined = errors.CombineErrors(combined, syncDirIfExists(fsmSnapDir))
 	return errors.WithStack(combined)
+}
+
+func retainedSnapshotFileLimit(snaps []string, fsmSnapDir string) int {
+	maxKeep := defaultMaxSnapFiles
+	if maxKeep < 1 {
+		maxKeep = 1
+	}
+	if maxKeep > len(snaps) {
+		maxKeep = len(snaps)
+	}
+	if fsmSnapDir == "" {
+		return maxKeep
+	}
+	budget := maxRetainedFSMSnapshotBytes()
+	if budget <= 0 {
+		return maxKeep
+	}
+	for maxKeep > 1 && retainedFSMSnapshotBytes(snaps[len(snaps)-maxKeep:], fsmSnapDir) > budget {
+		maxKeep--
+	}
+	return maxKeep
+}
+
+func maxRetainedFSMSnapshotBytes() int64 {
+	raw := strings.TrimSpace(os.Getenv(maxRetainedFSMSnapshotBytesEnvVar))
+	if raw == "" {
+		return defaultMaxRetainedFSMSnapshotBytes
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil {
+		slog.Warn("invalid max retained FSM snapshot bytes; using default",
+			"env", maxRetainedFSMSnapshotBytesEnvVar,
+			"value", raw,
+			"error", err,
+		)
+		return defaultMaxRetainedFSMSnapshotBytes
+	}
+	return n
+}
+
+func retainedFSMSnapshotBytes(snaps []string, fsmSnapDir string) int64 {
+	var total int64
+	for _, name := range snaps {
+		idx := parseSnapFileIndex(name)
+		if idx == 0 {
+			continue
+		}
+		info, err := os.Stat(fsmSnapPath(fsmSnapDir, idx))
+		if err != nil {
+			continue
+		}
+		total += info.Size()
+	}
+	return total
 }
 
 func collectSnapNames(entries []os.DirEntry) []string {

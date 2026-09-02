@@ -403,7 +403,7 @@ func (r *RedisServer) firstXAddAttempt(
 	// This path owns the exact ID and write set, so it can safely restore a
 	// forwarded conflict to its typed form before entering retryRedisWrite.
 	dispErr = normalizeRetryableRedisTxnErr(dispErr)
-	if !isReusableRedisTxnErr(dispErr) {
+	if !shouldPreserveRedisTxnAttempt(dispErr) {
 		return "", nil, cockerrors.WithStack(dispErr)
 	}
 	return "", &reusableXAdd{
@@ -460,7 +460,7 @@ func (r *RedisServer) dispatchXAddReuse(
 		}
 		return "", true, cockerrors.WithStack(dispErr)
 	}
-	if isReusableRedisTxnErr(dispErr) {
+	if shouldPreserveRedisTxnAttempt(dispErr) {
 		// A lock response did not apply, but carrying the fresh commitTS keeps
 		// the retry correct if a future retryable transport shape is added.
 		pending.commitTS = commitTS

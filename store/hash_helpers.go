@@ -160,40 +160,21 @@ func IsHashMetaDeltaKey(key []byte) bool {
 
 // ExtractHashUserKeyFromMeta extracts the logical user key from a hash meta key.
 func ExtractHashUserKeyFromMeta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(HashMetaPrefix))
-	if len(trimmed) < wideColKeyLenSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(HashMetaPrefix), 0, true)
 }
 
 // ExtractHashUserKeyFromField extracts the logical user key from a hash field key.
 func ExtractHashUserKeyFromField(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(HashFieldPrefix))
-	if len(trimmed) < wideColKeyLenSize {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen { //nolint:gosec // wideColKeyLenSize fits in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(HashFieldPrefix), 0, false)
 }
 
 // ExtractHashUserKeyFromDelta extracts the logical user key from a hash delta key.
 func ExtractHashUserKeyFromDelta(key []byte) []byte {
-	trimmed := bytes.TrimPrefix(key, []byte(HashMetaDeltaPrefix))
-	minLen := wideColKeyLenSize + deltaKeyTSSize + deltaKeySeqSize
-	if len(trimmed) < minLen {
-		return nil
-	}
-	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
-	if uint32(len(trimmed)) < uint32(wideColKeyLenSize)+ukLen+uint32(deltaKeyTSSize+deltaKeySeqSize) { //nolint:gosec // constants fit in uint32
-		return nil
-	}
-	return trimmed[wideColKeyLenSize : wideColKeyLenSize+ukLen]
+	return extractWideColumnUserKey(key, []byte(HashMetaDeltaPrefix), deltaKeyTSSize+deltaKeySeqSize, true)
+}
+
+// ExtractHashUserKeyFromDeltaScanPrefix extracts the user key from a hash
+// metadata delta scan start/prefix.
+func ExtractHashUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractWideColumnUserKey(key, []byte(HashMetaDeltaPrefix), 0, false)
 }

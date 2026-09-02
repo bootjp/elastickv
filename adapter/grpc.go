@@ -25,6 +25,7 @@ type GRPCServer struct {
 	grpcTranscoder *grpcTranscoder
 	coordinator    kv.Coordinator
 	store          store.MVCCStore
+	readBlocked    func() bool
 
 	closeStore bool
 	closeOnce  sync.Once
@@ -93,6 +94,12 @@ func WithCloseStore() GRPCServerOption {
 	}
 }
 
+func WithGRPCReadGate(blocked func() bool) GRPCServerOption {
+	return func(s *GRPCServer) {
+		s.readBlocked = blocked
+	}
+}
+
 func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator, opts ...GRPCServerOption) *GRPCServer {
 	s := &GRPCServer{
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
@@ -109,6 +116,14 @@ func NewGRPCServer(store store.MVCCStore, coordinate kv.Coordinator, opts ...GRP
 		opt(s)
 	}
 	return s
+}
+
+func (r *GRPCServer) requireReadReady() error {
+	if r != nil && r.readBlocked != nil && r.readBlocked() {
+		//nolint:wrapcheck // Preserve the gRPC status code for startup readers.
+		return status.Error(codes.Unavailable, "startup rotation has not completed")
+	}
+	return nil
 }
 
 func (r *GRPCServer) Close() error {
@@ -134,6 +149,9 @@ func (r *GRPCServer) clock() *kv.HLC {
 }
 
 func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	if err := r.requireReadReady(); err != nil {
+		return nil, err
+	}
 	readTS := req.GetTs()
 	if readTS == 0 {
 		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
@@ -193,6 +211,9 @@ func (r *GRPCServer) rawGroupWatermark(ctx context.Context, groupID uint64) (*pb
 }
 
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+	if err := r.requireReadReady(); err != nil {
+		return nil, err
+	}
 	// A group id with no key is the leader-fenced group watermark. With a key
 	// it selects the group for a per-key read instead, further down -- the two
 	// share the field, so the key is what tells them apart.
@@ -260,6 +281,9 @@ func (r *GRPCServer) rawVersionVisibleAt(ctx context.Context, req *pb.RawLatestC
 }
 
 func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+	if err := r.requireReadReady(); err != nil {
+		return nil, err
+	}
 	limit64 := req.GetLimit()
 	limit, err := rawScanLimit(limit64)
 	if err != nil {
@@ -595,6 +619,9 @@ func (r *GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutRespon
 }
 
 func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetResponse, error) {
+	if err := r.requireReadReady(); err != nil {
+		return nil, err
+	}
 	h := murmur3.New64()
 	if _, err := h.Write(req.Key); err != nil {
 		return nil, errors.WithStack(err)
@@ -642,6 +669,9 @@ func (r *GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.Del
 }
 
 func (r *GRPCServer) Scan(ctx context.Context, req *pb.ScanRequest) (*pb.ScanResponse, error) {
+	if err := r.requireReadReady(); err != nil {
+		return nil, err
+	}
 	limit, err := internal.Uint64ToInt(req.Limit)
 	if err != nil {
 		return &pb.ScanResponse{

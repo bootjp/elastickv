@@ -59,6 +59,10 @@ func NewProxyServer(cfg ProxyConfig, dual *DualWriter, metrics *ProxyMetrics, se
 
 // ListenAndServe starts the redcon proxy server.
 func (p *ProxyServer) ListenAndServe(ctx context.Context) error {
+	if p.cfg.RedisOnlyRaw && p.cfg.Mode == ModeRedisOnly {
+		return p.listenAndServeRawRedis(ctx)
+	}
+
 	p.shutdownCtx = ctx
 
 	var lc net.ListenConfig

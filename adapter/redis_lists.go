@@ -272,7 +272,7 @@ func (r *RedisServer) dispatchListPushReuse(ctx context.Context, key []byte, pen
 	// (non-retryable errors escape to the client; pending is then
 	// discarded with the goroutine, so the update is wasted and the
 	// stale value would be misleading if some future caller reads it).
-	if isReusableRedisTxnErr(dispErr) {
+	if shouldPreserveRedisTxnAttempt(dispErr) {
 		pending.commitTS = commitTS
 	}
 	return 0, false, errors.WithStack(dispErr)
@@ -448,7 +448,7 @@ func (r *RedisServer) listPushCoreWithDedup(ctx context.Context, key []byte, val
 		// retryRedisWrite's retry predicate; ambiguous errors that escape
 		// to the client are a separate problem space (cross-request
 		// idempotency cache) and out of scope for this design.
-		if isReusableRedisTxnErr(dispErr) {
+		if shouldPreserveRedisTxnAttempt(dispErr) {
 			pending = &reusableListPush{
 				ops:           ops,
 				startTS:       startTS,

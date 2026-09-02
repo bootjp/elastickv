@@ -237,7 +237,7 @@ func (s *SQSServer) redriveCandidateToDLQ(
 		return false, err
 	}
 	if _, err := kv.DispatchWithReadTimestamp(ctx, s.coordinator, req); err != nil {
-		if isRetryableTransactWriteError(err) {
+		if isIgnorableTransactRaceError(err) {
 			return true, nil
 		}
 		return false, errors.WithStack(err)

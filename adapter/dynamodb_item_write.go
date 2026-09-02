@@ -297,7 +297,7 @@ func (d *DynamoDBServer) itemWriteFirstAttempt(
 	plan.req.CommitTS = commitTS
 	if dispErr := d.commitItemWrite(ctx, readTimestamp, plan.req); dispErr != nil {
 		// dispErr is already wrapped by commitItemWrite; return it raw.
-		if isRetryableTransactWriteError(dispErr) {
+		if shouldPreserveTransactWriteAttempt(dispErr) {
 			return nil, &reusableItemWrite{
 				plan:          plan,
 				readTimestamp: readTimestamp,
@@ -332,10 +332,13 @@ func (d *DynamoDBServer) itemWriteReuseAttempt(
 		return d.resolveReuseWriteConflict(ctx, tableName, pending, commitTS, dispErr)
 	}
 	if isRetryableTransactWriteError(dispErr) {
-		// Still ambiguous (e.g. TxnLocked): this reuse may itself have landed,
-		// so the next retry must probe THIS commit_ts. dispErr is already
-		// wrapped by commitItemWrite; return it raw.
-		pending.commitTS = commitTS
+		// Still ambiguous (e.g. TxnLocked): this reuse may itself have
+		// landed, so the next retry must probe THIS commit_ts. Route-fence
+		// rejections are retryable but happen before this write set can apply,
+		// so keep the older witness.
+		if shouldPreserveTransactWriteAttempt(dispErr) {
+			pending.commitTS = commitTS
+		}
 		return nil, pending, dispErr
 	}
 	return nil, nil, dispErr
