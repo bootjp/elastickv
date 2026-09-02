@@ -946,6 +946,47 @@ func (c *ShardedCoordinator) anyResolverClaimedKey(elems []*Elem[OP]) bool {
 	return false
 }
 
+func (c *ShardedCoordinator) partitionResolverClaimsPointKey(key []byte) bool {
+	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
+		return false
+	}
+	_, ok := c.router.partitionResolver.ResolveGroup(key)
+	return ok
+}
+
+func (c *ShardedCoordinator) writeFenceBypassKeysForElems(elems []*Elem[OP]) [][]byte {
+	if len(elems) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(elems))
+	for _, elem := range elems {
+		if elem == nil || elem.Op == DelPrefix || (elem.GroupID == 0 && !c.partitionResolverClaimsPointKey(elem.Key)) {
+			continue
+		}
+		out = append(out, bytes.Clone(elem.Key))
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) writeFenceBypassKeysByGroup(elems []*Elem[OP]) map[uint64][][]byte {
+	out := make(map[uint64][][]byte)
+	for _, elem := range elems {
+		if elem == nil || elem.Op == DelPrefix {
+			continue
+		}
+		gid := elem.GroupID
+		if gid == 0 {
+			var ok bool
+			gid, ok = c.router.ResolveGroup(elem.Key)
+			if !ok || !c.partitionResolverClaimsPointKey(elem.Key) {
+				continue
+			}
+		}
+		out[gid] = append(out[gid], bytes.Clone(elem.Key))
+	}
+	return out
+}
+
 func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
 	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
 
@@ -1072,6 +1113,9 @@ func isComposed1RetryableError(err error) bool {
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
 func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if hasExplicitGroupElem(reqs.Elems) {
+		return c.dispatchExplicitGroupNonTxn(ctx, reqs)
+	}
 	logs, err := c.requestLogs(ctx, reqs)
 	if err != nil {
 		return nil, err
@@ -1081,6 +1125,37 @@ func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *Operation
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: r.CommitIndex}, nil
+}
+
+func hasExplicitGroupElem(elems []*Elem[OP]) bool {
+	for _, elem := range elems {
+		if elem != nil && elem.GroupID != 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	logs, gids, err := c.rawLogsWithGroups(ctx, reqs)
+	if err != nil {
+		return nil, err
+	}
+	var maxIndex uint64
+	for i, gid := range gids {
+		g, err := c.txnGroupForID(gid)
+		if err != nil {
+			return nil, err
+		}
+		resp, err := g.Txn.Commit(ctx, []*pb.Request{logs[i]})
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if resp != nil && resp.CommitIndex > maxIndex {
+			maxIndex = resp.CommitIndex
+		}
+	}
+	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
 // hasDelPrefixElem returns true if any element is a DelPrefix operation.
@@ -1191,6 +1266,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if err != nil {
 		return nil, err
 	}
+	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(elems)
 	primaryKey := primaryKeyForElems(elems)
 	if len(primaryKey) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
@@ -1203,7 +1279,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if err := ValidateElemCommitTSPatches(elems, commitTS); err != nil {
 		return nil, err
 	}
-	if err := c.ensureGroupedMutationsWriteAllowed(grouped, commitTS); err != nil {
+	if err := c.ensureGroupedMutationsWriteAllowedWithBypass(grouped, commitTS, bypassKeysByGroup); err != nil {
 		return nil, err
 	}
 
@@ -1213,12 +1289,12 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 		// If any read key belongs to a different shard the 2PC path is required
 		// so that validateReadOnlyShards can issue a linearizable read barrier,
 		// preserving SSI.
-		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion)
+		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion, c.writeFenceBypassKeysForElems(elems))
 	}
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
-	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion)
+	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup)
 }
 
 // dispatchMultiShardTxn runs the 2PC path. Extracted from dispatchTxn to keep
@@ -1226,7 +1302,7 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 // P2 round-10) was added; the multi-shard branch already carries five linear
 // error checks (groupReadKeys, prewrite, commitPrimary, abortCleanup,
 // commitSecondaries) that pushed the parent over the 10-edge limit.
-func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) (*CoordinateResponse, error) {
 	// Fail-closed when a retry carries the option-2 dedup probe key but its
 	// write set / read set spans shards (codex P2 round-10 "reject retries
 	// that leave the one-phase path"). The 2PC log builders only encode
@@ -1249,12 +1325,12 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if err != nil {
 		return nil, err
 	}
-	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion)
+	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
 		return nil, err
 	}
 
-	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, commitTS, observedRouteVersion)
+	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, gids, commitTS, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
 		// abortPreparedTxn must run even when ctx was the reason
 		// commitPrimaryTxn failed — otherwise prewrite intents on
@@ -1281,7 +1357,7 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	// reachable by readers on the new owner.  Both directions are
 	// silent partial commits; surfacing the error is the only honest
 	// posture (codex P1 on d8487672 + 6202b964, PR #900).
-	maxIndex, err = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion)
+	maxIndex, err = c.commitSecondaryTxns(ctx, startTS, primaryGid, primaryKey, grouped, gids, commitTS, maxIndex, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1318,7 +1394,7 @@ func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) b
 	return true
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
@@ -1328,7 +1404,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	// carries the one-phase dedup probe key for a retry that reuses a failed
 	// attempt's write set.
 	resp, err := g.Txn.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion, writeFenceBypassKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1344,7 +1420,7 @@ type preparedGroup struct {
 	keys []*pb.Mutation
 }
 
-func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64) ([]preparedGroup, error) {
+func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) ([]preparedGroup, error) {
 	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
 	prepared := make([]preparedGroup, 0, len(gids))
 
@@ -1360,6 +1436,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			Mutations:            append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
 			ReadKeys:             groupedReadKeys[gid],
 			ObservedRouteVersion: observedRouteVersion,
+			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		}
 		if _, err := g.Txn.Commit(ctx, []*pb.Request{req}); err != nil {
 			// Same WithoutCancel pattern as dispatchTxn's
@@ -1393,9 +1470,9 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 	return prepared, nil
 }
 
-func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, commitTS uint64, observedRouteVersion uint64) (uint64, uint64, error) {
-	primaryGid := c.engineGroupIDForKey(primaryKey)
-	if primaryGid == 0 {
+func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) (uint64, uint64, error) {
+	primaryGid, ok := primaryGroupIDForKey(primaryKey, grouped, gids)
+	if !ok {
 		return 0, 0, errors.WithStack(ErrInvalidRequest)
 	}
 
@@ -1412,6 +1489,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 		Ts:                   startTS,
 		Mutations:            append([]*pb.Mutation{meta}, keys...),
 		ObservedRouteVersion: observedRouteVersion,
+		WriteFenceBypassKeys: bypassKeysByGroup[primaryGid],
 	}
 
 	r, err := g.Txn.Commit(ctx, []*pb.Request{req})
@@ -1424,7 +1502,18 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 	return primaryGid, r.CommitIndex, nil
 }
 
-func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64) (uint64, error) {
+func primaryGroupIDForKey(primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64) (uint64, bool) {
+	for _, gid := range gids {
+		for _, mut := range grouped[gid] {
+			if mut != nil && bytes.Equal(mut.Key, primaryKey) {
+				return gid, true
+			}
+		}
+	}
+	return 0, false
+}
+
+func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS uint64, primaryGid uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, commitTS uint64, maxIndex uint64, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) (uint64, error) {
 	// Secondary commits are best-effort for non-Composed-1 errors:
 	// if a shard is unavailable after the primary commits, read-time
 	// lock resolution will commit the remaining secondaries based on
@@ -1461,6 +1550,7 @@ func (c *ShardedCoordinator) commitSecondaryTxns(ctx context.Context, startTS ui
 			Ts:                   startTS,
 			Mutations:            append([]*pb.Mutation{meta}, keyMutations(grouped[gid])...),
 			ObservedRouteVersion: observedRouteVersion,
+			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		}
 		r, err := commitSecondaryWithRetry(ctx, g, req)
 		if err != nil {
@@ -2283,31 +2373,38 @@ func (c *ShardedCoordinator) requestLogs(ctx context.Context, reqs *OperationGro
 }
 
 func (c *ShardedCoordinator) rawLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
+	logs, _, err := c.rawLogsWithGroups(ctx, reqs)
+	return logs, err
+}
+
+func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, []uint64, error) {
 	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
+	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(reqs.Elems)
 
 	logs := make([]*pb.Request, 0, len(gids))
 	for _, gid := range gids {
 		ts, err := c.rawLogTimestamp(ctx)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
 		muts := grouped[gid]
 		if ts != 0 {
-			if err := c.ensureMutationsWriteAllowed(muts, ts); err != nil {
-				return nil, err
+			if err := c.ensureMutationsWriteAllowedWithBypass(muts, ts, bypassKeysByGroup[gid]); err != nil {
+				return nil, nil, err
 			}
 		}
 		logs = append(logs, &pb.Request{
-			IsTxn:     false,
-			Phase:     pb.Phase_NONE,
-			Ts:        ts,
-			Mutations: muts,
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			Ts:                   ts,
+			Mutations:            muts,
+			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		})
 	}
-	return logs, nil
+	return logs, gids, nil
 }
 
 func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {
@@ -2327,7 +2424,7 @@ func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs
 			return err
 		}
 		r.Ts = ts
-		if err := c.ensureMutationsWriteAllowed(r.Mutations, r.Ts); err != nil {
+		if err := c.ensureMutationsWriteAllowedWithBypass(r.Mutations, r.Ts, r.GetWriteFenceBypassKeys()); err != nil {
 			return err
 		}
 	}
@@ -2348,13 +2445,14 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	if err != nil {
 		return nil, err
 	}
-	if err := c.ensureGroupedMutationsWriteAllowed(grouped, commitTS); err != nil {
+	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(reqs.Elems)
+	if err := c.ensureGroupedMutationsWriteAllowedWithBypass(grouped, commitTS, bypassKeysByGroup); err != nil {
 		return nil, err
 	}
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
-	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion)
+	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion, bypassKeysByGroup)
 }
 
 // observeMutation: counted pre-commit, so a mutation that subsequently
@@ -2450,9 +2548,9 @@ func (c *ShardedCoordinator) keyVizObserveLabel(label keyviz.Label) keyviz.Label
 	return label
 }
 
-func (c *ShardedCoordinator) ensureGroupedMutationsWriteAllowed(grouped map[uint64][]*pb.Mutation, commitTS uint64) error {
-	for _, muts := range grouped {
-		if err := c.ensureMutationsWriteAllowed(muts, commitTS); err != nil {
+func (c *ShardedCoordinator) ensureGroupedMutationsWriteAllowedWithBypass(grouped map[uint64][]*pb.Mutation, commitTS uint64, bypassKeysByGroup map[uint64][][]byte) error {
+	for gid, muts := range grouped {
+		if err := c.ensureMutationsWriteAllowedWithBypass(muts, commitTS, bypassKeysByGroup[gid]); err != nil {
 			return err
 		}
 	}
@@ -2478,10 +2576,20 @@ func (c *ShardedCoordinator) EnsureMutationsWriteAllowed(muts []*pb.Mutation, co
 }
 
 func (c *ShardedCoordinator) ensureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	return c.ensureMutationsWriteAllowedWithBypass(muts, commitTS, nil)
+}
+
+func (c *ShardedCoordinator) ensureMutationsWriteAllowedWithBypass(muts []*pb.Mutation, commitTS uint64, bypassKeys [][]byte) error {
 	if commitTS == 0 {
 		return nil
 	}
+	bypass := writeFenceBypassKeySet(bypassKeys)
 	for _, mut := range muts {
+		if mut != nil {
+			if _, ok := bypass[string(mut.Key)]; ok {
+				continue
+			}
+		}
 		if err := c.ensureMutationWriteAllowed(mut, commitTS); err != nil {
 			return err
 		}
@@ -2541,9 +2649,15 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 			return nil, nil, ErrInvalidRequest
 		}
 		mut := elemToMutation(req)
-		gid, ok := c.router.ResolveGroup(mut.Key)
-		if !ok {
-			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
+		gid := req.GroupID
+		if gid == 0 {
+			var ok bool
+			gid, ok = c.router.ResolveGroup(mut.Key)
+			if !ok {
+				return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
+			}
+		} else if _, ok := c.groups[gid]; !ok {
+			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no shard group %d for key %q", gid, mut.Key)
 		}
 		// Engine RouteID for keyviz observation; partition-resolved
 		// keys observe under the !sqs|route|global RouteID until
@@ -2563,7 +2677,7 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 	return grouped, gids, nil
 }
 
-func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64, observedRouteVersion uint64) ([]*pb.Request, error) {
+func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Mutation, gids []uint64, observedRouteVersion uint64, writeFenceBypassKeysByGroup map[uint64][][]byte) ([]*pb.Request, error) {
 	logs := make([]*pb.Request, 0, len(gids)*txnPhaseCount)
 	for _, gid := range gids {
 		muts := grouped[gid]
@@ -2580,6 +2694,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: 0})},
 				}, muts...),
 				ObservedRouteVersion: observedRouteVersion,
+				WriteFenceBypassKeys: writeFenceBypassKeysByGroup[gid],
 			},
 			&pb.Request{
 				IsTxn: true,
@@ -2589,6 +2704,7 @@ func buildTxnLogs(startTS uint64, commitTS uint64, grouped map[uint64][]*pb.Muta
 					{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, LockTTLms: 0, CommitTS: commitTS})},
 				}, keys...),
 				ObservedRouteVersion: observedRouteVersion,
+				WriteFenceBypassKeys: writeFenceBypassKeysByGroup[gid],
 			},
 		)
 	}

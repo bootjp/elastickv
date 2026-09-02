@@ -1288,7 +1288,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	// carries the option-2 one-phase dedup probe key for a retry that reuses
 	// a failed attempt's write set.
 	r, err := c.transactionManager.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primary, reqs, readKeys, observedRouteVersion),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primary, reqs, readKeys, observedRouteVersion, nil),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1542,7 +1542,7 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 		commitTS = 0
 	}
 	return []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(reqs.StartTS, commitTS, reqs.PrevCommitTS, primary, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion),
+		onePhaseTxnRequestWithPrevCommit(reqs.StartTS, commitTS, reqs.PrevCommitTS, primary, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion, nil),
 	}, nil
 }
 
@@ -1601,7 +1601,7 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 // route catalog snapshot at txn-begin (M1 plumbing, see
 // docs/design/2026_05_29_implemented_composed1_cross_group_commit_guard.md).
 // Zero is the legacy "unpinned" sentinel.
-func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) *pb.Request {
+func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, primaryKey []byte, reqs []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) *pb.Request {
 	muts := make([]*pb.Mutation, 0, len(reqs)+1)
 	muts = append(muts, &pb.Mutation{
 		Op:    pb.Op_PUT,
@@ -1624,6 +1624,7 @@ func onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS uint64, pr
 		Mutations:            muts,
 		ReadKeys:             readKeys,
 		ObservedRouteVersion: observedRouteVersion,
+		WriteFenceBypassKeys: writeFenceBypassKeys,
 	}
 }
 

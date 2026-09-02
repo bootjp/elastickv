@@ -4,6 +4,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -30,6 +31,10 @@ const defaultMaxSnapshotPayloadBytes int64 = 16 << 30 // 16 GiB
 
 const maxSnapshotPayloadBytesEnvVar = "ELASTICKV_RAFT_MAX_SNAPSHOT_PAYLOAD_BYTES"
 
+const snapshotSpoolMinFreeBytesEnvVar = "ELASTICKV_RAFT_SNAPSHOT_SPOOL_MIN_FREE_BYTES"
+
+const defaultReceiveSnapshotSpoolMinFreeBytes int64 = 1 << 30 // 1 GiB
+
 // resolveMaxSnapshotPayloadBytes evaluates the env override once per spool
 // creation. Snapshots are infrequent enough that one Getenv + ParseInt per
 // spool is invisible in profiles, and resolving at construction means tests
@@ -48,7 +53,23 @@ func resolveMaxSnapshotPayloadBytes() int64 {
 	return n
 }
 
+func resolveSnapshotSpoolMinFreeBytes(defaultBytes int64) int64 {
+	v := strings.TrimSpace(os.Getenv(snapshotSpoolMinFreeBytesEnvVar))
+	if v == "" {
+		return defaultBytes
+	}
+	n, err := strconv.ParseInt(v, 10, 64)
+	if err != nil || n < 0 {
+		slog.Warn("invalid ELASTICKV_RAFT_SNAPSHOT_SPOOL_MIN_FREE_BYTES; using default",
+			"value", v, "default_bytes", defaultBytes)
+		return defaultBytes
+	}
+	return n
+}
+
 var errSnapshotPayloadTooLarge = errors.New("etcd raft snapshot payload exceeds limit")
+
+var errSnapshotSpoolDiskHeadroom = errors.New("etcd raft snapshot spool insufficient disk headroom")
 
 // snapshotSyncDir indirects fsync-on-directory through a package var so a
 // fault-injection test can simulate "rename succeeded but the fsync that
@@ -57,24 +78,43 @@ var errSnapshotPayloadTooLarge = errors.New("etcd raft snapshot payload exceeds 
 // and without an injection seam there's no portable way to reproduce it.
 var snapshotSyncDir = syncDir
 
+var snapshotSpoolAvailableBytes = snapshotSpoolAvailableBytesFS
+
 const snapshotSpoolPattern = "elastickv-etcd-snapshot-*"
 
 type snapshotSpool struct {
-	file    *os.File
-	path    string
-	size    int64
-	maxSize int64
+	file         *os.File
+	path         string
+	size         int64
+	maxSize      int64
+	minFreeBytes int64
 }
 
 func newSnapshotSpool(dir string) (*snapshotSpool, error) {
+	return newSnapshotSpoolWithLimits(dir, resolveMaxSnapshotPayloadBytes(), 0)
+}
+
+func newReceiveSnapshotSpool(dir string) (*snapshotSpool, error) {
+	maxSize := resolveMaxSnapshotPayloadBytes()
+	// Keep a fixed emergency reserve after receive-side spooling. Tying this
+	// reserve to the configured maximum snapshot size made the default 16 GiB
+	// cap also require 16 GiB of free space after every chunk; production nodes
+	// with enough space for a real 13 GiB FSM snapshot were rejecting the stream
+	// around 4 GiB and retrying forever. Operators that restore into a layout
+	// needing a larger reserve can still raise it with the env knob.
+	return newSnapshotSpoolWithLimits(dir, maxSize, resolveSnapshotSpoolMinFreeBytes(defaultReceiveSnapshotSpoolMinFreeBytes))
+}
+
+func newSnapshotSpoolWithLimits(dir string, maxSize, minFreeBytes int64) (*snapshotSpool, error) {
 	file, err := os.CreateTemp(dir, snapshotSpoolPattern)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
 	return &snapshotSpool{
-		file:    file,
-		path:    file.Name(),
-		maxSize: resolveMaxSnapshotPayloadBytes(),
+		file:         file,
+		path:         file.Name(),
+		maxSize:      maxSize,
+		minFreeBytes: minFreeBytes,
 	}, nil
 }
 
@@ -87,12 +127,40 @@ func (s *snapshotSpool) Write(p []byte) (int, error) {
 	if int64(len(p)) > s.maxSize-s.size {
 		return 0, errors.Wrapf(errSnapshotPayloadTooLarge, "adding %d bytes to current %d would exceed limit %d", len(p), s.size, s.maxSize)
 	}
+	if err := s.checkDiskHeadroom(len(p)); err != nil {
+		return 0, err
+	}
 	n, err := s.file.Write(p)
 	s.size += int64(n)
 	if err != nil {
 		return n, errors.WithStack(err)
 	}
 	return n, nil
+}
+
+func (s *snapshotSpool) checkDiskHeadroom(writeBytes int) error {
+	if writeBytes <= 0 || s.minFreeBytes <= 0 {
+		return nil
+	}
+	available, err := snapshotSpoolAvailableBytes(filepath.Dir(s.path))
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if available < 0 {
+		available = 0
+	}
+	if s.minFreeBytes > math.MaxInt64-int64(writeBytes) {
+		return errors.Wrapf(errSnapshotSpoolDiskHeadroom,
+			"write_bytes=%d min_free_bytes=%d available_bytes=%d",
+			writeBytes, s.minFreeBytes, available)
+	}
+	required := s.minFreeBytes + int64(writeBytes)
+	if available < required {
+		return errors.Wrapf(errSnapshotSpoolDiskHeadroom,
+			"write_bytes=%d min_free_bytes=%d available_bytes=%d",
+			writeBytes, s.minFreeBytes, available)
+	}
+	return nil
 }
 
 func (s *snapshotSpool) Bytes() ([]byte, error) {
@@ -160,6 +228,9 @@ func (s *snapshotSpool) FinalizeAsFSMFile(fsmSnapDir string, index uint64, crc32
 	//      so Close() is a no-op. Without the per-step clear, Close()
 	//      would attempt os.Remove(s.path) and surface a misleading
 	//      ErrNotExist that buries the real syncDir error.
+	if err := s.checkDiskHeadroom(fsmFooterSize); err != nil {
+		return err
+	}
 	if err := binary.Write(s.file, binary.BigEndian, crc32c); err != nil {
 		return errors.WithStack(err)
 	}

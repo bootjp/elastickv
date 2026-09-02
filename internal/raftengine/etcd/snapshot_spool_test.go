@@ -22,6 +22,7 @@ func TestSnapshotSpool_DefaultCapAcceptsRealisticFSM(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping: writes 1.5 GiB to a temp file")
 	}
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "0")
 	dir := t.TempDir()
 	spool, err := newSnapshotSpool(dir)
 	require.NoError(t, err)
@@ -66,6 +67,7 @@ func TestSnapshotSpool_DefaultCapAcceptsRealisticFSM(t *testing.T) {
 func TestSnapshotSpool_OverrideViaEnv(t *testing.T) {
 	const spoolCap = int64(4096)
 	t.Setenv(maxSnapshotPayloadBytesEnvVar, strconv.FormatInt(spoolCap, 10))
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "0")
 
 	spool, err := newSnapshotSpool(t.TempDir())
 	require.NoError(t, err)
@@ -93,6 +95,59 @@ func TestSnapshotSpool_OverrideInvalidFallsBack(t *testing.T) {
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = spool.Close() })
 	require.Equal(t, defaultMaxSnapshotPayloadBytes, spool.maxSize)
+}
+
+func TestSnapshotSpoolDefaultReserveUsesFixedEmergencyHeadroom(t *testing.T) {
+	const spoolCap = int64(4096)
+	t.Setenv(maxSnapshotPayloadBytesEnvVar, strconv.FormatInt(spoolCap, 10))
+
+	spool, err := newReceiveSnapshotSpool(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = spool.Close() })
+
+	require.Equal(t, spoolCap, spool.maxSize)
+	require.Equal(t, defaultReceiveSnapshotSpoolMinFreeBytes, spool.minFreeBytes)
+}
+
+func TestSnapshotSpoolMaterializeDoesNotReserveDiskHeadroom(t *testing.T) {
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "1024")
+	originalAvailable := snapshotSpoolAvailableBytes
+	snapshotSpoolAvailableBytes = func(string) (int64, error) {
+		return 0, nil
+	}
+	t.Cleanup(func() { snapshotSpoolAvailableBytes = originalAvailable })
+
+	spool, err := newSnapshotSpool(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = spool.Close() })
+
+	n, err := spool.Write([]byte("x"))
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.Equal(t, int64(1), spool.size)
+}
+
+func TestSnapshotSpoolRejectsWhenReserveWouldBeConsumed(t *testing.T) {
+	t.Setenv(snapshotSpoolMinFreeBytesEnvVar, "1024")
+	originalAvailable := snapshotSpoolAvailableBytes
+	snapshotSpoolAvailableBytes = func(string) (int64, error) {
+		return 1024, nil
+	}
+	t.Cleanup(func() { snapshotSpoolAvailableBytes = originalAvailable })
+
+	spool, err := newReceiveSnapshotSpool(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = spool.Close() })
+
+	n, err := spool.Write([]byte("x"))
+	require.Zero(t, n)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, errSnapshotSpoolDiskHeadroom), "got %v", err)
+	require.Zero(t, spool.size)
+
+	info, statErr := spool.file.Stat()
+	require.NoError(t, statErr)
+	require.Zero(t, info.Size(), "headroom rejection must happen before writing bytes")
 }
 
 // TestFinalizeAsFSMFile_PostFinalizeCloseIsNoop pins the gemini-medium
@@ -317,6 +372,48 @@ func TestPurgeOldSnapFiles(t *testing.T) {
 	// Non-snap file preserved.
 	_, err = os.Stat(other)
 	require.NoError(t, err)
+}
+
+func TestPurgeOldSnapFilesHonorsFSMByteBudget(t *testing.T) {
+	t.Setenv(maxRetainedFSMSnapshotBytesEnvVar, "100")
+
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	for i := uint64(1); i <= 3; i++ {
+		index := i * 10000
+		createSnapFile(t, snapDir, index)
+		require.NoError(t, os.WriteFile(fsmSnapPath(fsmSnapDir, index), bytes.Repeat([]byte("x"), 60), 0o600))
+	}
+
+	require.NoError(t, purgeOldSnapshotFiles(snapDir, fsmSnapDir))
+
+	require.NoFileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(10000))))
+	require.NoFileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(20000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(30000))))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 10000))
+	require.NoFileExists(t, fsmSnapPath(fsmSnapDir, 20000))
+	require.FileExists(t, fsmSnapPath(fsmSnapDir, 30000))
+}
+
+func TestPurgeOldSnapFilesBudgetCanBeDisabled(t *testing.T) {
+	t.Setenv(maxRetainedFSMSnapshotBytesEnvVar, "0")
+
+	snapDir := t.TempDir()
+	fsmSnapDir := t.TempDir()
+
+	for i := uint64(1); i <= 4; i++ {
+		index := i * 10000
+		createSnapFile(t, snapDir, index)
+		require.NoError(t, os.WriteFile(fsmSnapPath(fsmSnapDir, index), bytes.Repeat([]byte("x"), 60), 0o600))
+	}
+
+	require.NoError(t, purgeOldSnapshotFiles(snapDir, fsmSnapDir))
+
+	require.NoFileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(10000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(20000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(30000))))
+	require.FileExists(t, filepath.Join(snapDir, fmt.Sprintf("%016x-%016x.snap", 1, uint64(40000))))
 }
 
 func TestPurgeOldSnapFilesUnderLimit(t *testing.T) {

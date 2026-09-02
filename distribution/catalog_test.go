@@ -66,7 +66,7 @@ func TestRouteDescriptorCodecRoundTrip(t *testing.T) {
 		t.Fatalf("encode route: %v", err)
 	}
 	if raw[0] != catalogRouteCodecVersionV2 {
-		t.Fatalf("split route encoded version = %d, want v2", raw[0])
+		t.Fatalf("zero-M2 route encoded version = %d, want v2", raw[0])
 	}
 	got, err := DecodeRouteDescriptor(raw)
 	if err != nil {
@@ -90,7 +90,7 @@ func TestRouteDescriptorCodecRoundTripNilEnd(t *testing.T) {
 		t.Fatalf("encode route: %v", err)
 	}
 	if raw[0] != catalogRouteCodecVersionV2 {
-		t.Fatalf("split nil-end route encoded version = %d, want v2", raw[0])
+		t.Fatalf("zero-M2 nil-end route encoded version = %d, want v2", raw[0])
 	}
 	got, err := DecodeRouteDescriptor(raw)
 	if err != nil {
@@ -912,8 +912,16 @@ func TestCatalogStoreApplySaveMutations_UsesMonotonicCommitTS(t *testing.T) {
 func assertRouteEqual(t *testing.T, want, got RouteDescriptor) {
 	t.Helper()
 	assertRouteIdentityEqual(t, want, got)
-	assertRouteMetadataEqual(t, want, got)
-	assertRouteBoundsEqual(t, want, got)
+	assertRouteMigrationEqual(t, want, got)
+	if want.State != got.State {
+		t.Fatalf("state mismatch: want %d, got %d", want.State, got.State)
+	}
+	if !bytes.Equal(want.Start, got.Start) {
+		t.Fatalf("start mismatch: want %q, got %q", want.Start, got.Start)
+	}
+	if !bytes.Equal(want.End, got.End) {
+		t.Fatalf("end mismatch: want %q, got %q", want.End, got.End)
+	}
 }
 
 func assertRouteIdentityEqual(t *testing.T, want, got RouteDescriptor) {
@@ -927,16 +935,10 @@ func assertRouteIdentityEqual(t *testing.T, want, got RouteDescriptor) {
 	if want.ParentRouteID != got.ParentRouteID {
 		t.Fatalf("parent route id mismatch: want %d, got %d", want.ParentRouteID, got.ParentRouteID)
 	}
-	if want.State != got.State {
-		t.Fatalf("state mismatch: want %d, got %d", want.State, got.State)
-	}
 }
 
-func assertRouteMetadataEqual(t *testing.T, want, got RouteDescriptor) {
+func assertRouteMigrationEqual(t *testing.T, want, got RouteDescriptor) {
 	t.Helper()
-	if want.SplitAtHLC != got.SplitAtHLC {
-		t.Fatalf("split at HLC mismatch: want %d, got %d", want.SplitAtHLC, got.SplitAtHLC)
-	}
 	if want.StagedVisibilityActive != got.StagedVisibilityActive {
 		t.Fatalf("staged visibility mismatch: want %v, got %v", want.StagedVisibilityActive, got.StagedVisibilityActive)
 	}
@@ -946,15 +948,8 @@ func assertRouteMetadataEqual(t *testing.T, want, got RouteDescriptor) {
 	if want.MinWriteTSExclusive != got.MinWriteTSExclusive {
 		t.Fatalf("min write ts mismatch: want %d, got %d", want.MinWriteTSExclusive, got.MinWriteTSExclusive)
 	}
-}
-
-func assertRouteBoundsEqual(t *testing.T, want, got RouteDescriptor) {
-	t.Helper()
-	if !bytes.Equal(want.Start, got.Start) {
-		t.Fatalf("start mismatch: want %q, got %q", want.Start, got.Start)
-	}
-	if !bytes.Equal(want.End, got.End) {
-		t.Fatalf("end mismatch: want %q, got %q", want.End, got.End)
+	if want.SplitAtHLC != got.SplitAtHLC {
+		t.Fatalf("split at HLC mismatch: want %d, got %d", want.SplitAtHLC, got.SplitAtHLC)
 	}
 }
 

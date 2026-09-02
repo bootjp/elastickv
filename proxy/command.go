@@ -16,8 +16,9 @@ const (
 )
 
 const (
-	cmdNameAUTH   = "AUTH"
-	cmdNameSELECT = "SELECT"
+	cmdNameAUTH       = "AUTH"
+	cmdNameSELECT     = "SELECT"
+	cmdNameXREADGROUP = "XREADGROUP"
 )
 
 var commandTable = map[string]CommandCategory{
@@ -243,7 +244,7 @@ func ClassifyCommand(name string, args [][]byte) CommandCategory {
 	upper := strings.ToUpper(name)
 
 	// Special case: XREAD/XREADGROUP with BLOCK
-	if upper == "XREAD" || upper == "XREADGROUP" {
+	if upper == "XREAD" || upper == cmdNameXREADGROUP {
 		for _, arg := range args {
 			if strings.ToUpper(string(arg)) == "BLOCK" {
 				return CmdBlocking

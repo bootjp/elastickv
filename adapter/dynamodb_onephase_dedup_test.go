@@ -113,6 +113,24 @@ func TestItemWriteDedup_LandedPriorAttempt_NoDuplicate(t *testing.T) {
 	require.Equal(t, 1, coord.probeNoOps, "the reuse must dedup via the FSM exact-ts probe")
 }
 
+func TestItemWriteDedup_RouteFenceRetryPreservesPriorProbe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true) // dispatch 1 lands then errors
+	coord.routeFenceAtDispatch = 2
+	schema, server := newDedupItemWriteServer(st, coord, true)
+	seedDedupItem(t, st, schema, "1", "2")
+
+	plan, err := server.updateItemWithRetry(ctx, appendListInput())
+	require.NoError(t, err)
+	require.NotNil(t, plan)
+
+	require.Equal(t, []string{"1", "2", "3"}, readListValues(t, server, schema))
+	require.Equal(t, 3, coord.dispatches, "attempt 1 landed, route-fenced reuse, then dedup probe retry")
+	require.Equal(t, 1, coord.probeNoOps, "route-fenced reuse must not replace the prior landed probe")
+}
+
 // TestItemWriteDedup_PriorAttemptDidNotLand_Applies: attempt 1 pre-rejects
 // (definitely did not commit); the reuse's probe misses, so it applies the
 // reused write set at a fresh commit_ts. One element, no duplicate.

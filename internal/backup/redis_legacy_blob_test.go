@@ -1,6 +1,7 @@
 package backup
 
 import (
+	"os"
 	"path/filepath"
 	"testing"
 
@@ -115,8 +116,35 @@ func TestRedisDB_LegacyBlobsRejectMissingMagic(t *testing.T) {
 		ErrRedisInvalidHashLegacyBlob)
 	require.ErrorIs(t, db.HandleSetLegacyBlob(setLegacyBlobKey("s"), []byte("garbage")),
 		ErrRedisInvalidSetLegacyBlob)
+	// A key that is only the family prefix is the *empty* Redis key, which the
+	// command paths accept, so it is the value that has to be rejected here --
+	// not the key.
 	require.ErrorIs(t, db.HandleHashLegacyBlob([]byte(RedisHashLegacyBlobPrefix), nil),
 		ErrRedisInvalidHashLegacyBlob)
 	require.ErrorIs(t, db.HandleSetLegacyBlob([]byte(RedisSetLegacyBlobPrefix), nil),
 		ErrRedisInvalidSetLegacyBlob)
+	// A key missing the prefix entirely is what "malformed key" means.
+	require.ErrorIs(t, db.HandleHashLegacyBlob([]byte("!redis|other|k"),
+		encodeHashLegacyBlobValue(t, map[string]string{"f": "v"})), ErrRedisInvalidHashLegacyBlob)
+	require.ErrorIs(t, db.HandleSetLegacyBlob([]byte("!redis|other|k"),
+		encodeSetLegacyBlobValue(t, []string{"m"})), ErrRedisInvalidSetLegacyBlob)
+}
+
+// The empty Redis key is legal, so its legacy blob is stored at exactly the
+// family prefix. Treating that as malformed fails the dump on data the Redis
+// API can create; the zset parser has always accepted it.
+func TestRedisDB_LegacyBlobsAcceptTheEmptyKey(t *testing.T) {
+	t.Parallel()
+	db, root := newRedisDB(t)
+	require.NoError(t, db.HandleHashLegacyBlob([]byte(RedisHashLegacyBlobPrefix),
+		encodeHashLegacyBlobValue(t, map[string]string{"f": "v"})))
+	require.NoError(t, db.HandleSetLegacyBlob([]byte(RedisSetLegacyBlobPrefix),
+		encodeSetLegacyBlobValue(t, []string{"m"})))
+	require.NoError(t, db.Finalize())
+
+	entries, err := os.ReadDir(filepath.Join(root, "redis", "db_0", "hashes"))
+	require.NoError(t, err)
+	require.Len(t, entries, 1, "the empty-key hash must be written")
+	got := readHashJSON(t, filepath.Join(root, "redis", "db_0", "hashes", entries[0].Name()))
+	require.Equal(t, "v", hashFieldByName(t, got, "f"))
 }

@@ -67,6 +67,12 @@ func (b *mockBackend) CallCount() int {
 	return len(b.calls)
 }
 
+func (b *mockBackend) Calls() [][]any {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([][]any(nil), b.calls...)
+}
+
 // Helper to create a doFunc that returns a specific value.
 func makeCmd(val any, err error) func(ctx context.Context, args ...any) *redis.Cmd {
 	return func(ctx context.Context, args ...any) *redis.Cmd {
@@ -972,6 +978,193 @@ func TestDualWriter_Blocking_DoesNotReplayNoEffectBZPop(t *testing.T) {
 
 	assert.Equal(t, 0, secondary.CallCount())
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncQueueDepth.WithLabelValues(asyncQueueBlocking)), 0.001)
+}
+
+func TestDualWriter_Blocking_ReplaysListPopAsLRem(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		resp []any
+		want [][]any
+	}{
+		{
+			name: "BLPOP removes first matching element",
+			cmd:  "BLPOP",
+			resp: []any{[]byte("queue"), []byte("job-1")},
+			want: [][]any{{[]byte("LREM"), []byte("queue"), int64(1), []byte("job-1")}},
+		},
+		{
+			name: "BRPOP removes last matching element",
+			cmd:  "BRPOP",
+			resp: []any{[]byte("queue"), []byte("job-2")},
+			want: [][]any{{[]byte("LREM"), []byte("queue"), int64(-1), []byte("job-2")}},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{name: "primary", returnValue: tc.resp}
+			secondary := newMockBackend("secondary")
+			secondary.doFunc = makeCmd(int64(1), nil)
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{
+				Mode:                               ModeDualWrite,
+				SecondaryTimeout:                   10 * time.Second,
+				SecondaryBlockingReplayConcurrency: 1,
+			}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), tc.cmd, [][]byte{[]byte(tc.cmd), []byte("queue"), []byte("5")})
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, tc.want, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("LREM", "secondary", "ok")), 0.001)
+		})
+	}
+}
+
+func TestDualWriter_Blocking_ReplaysListMoveAsEval(t *testing.T) {
+	tests := []struct {
+		name string
+		cmd  string
+		args [][]byte
+		resp any
+		want []any
+	}{
+		{
+			name: "BRPOPLPUSH removes source tail and pushes destination head",
+			cmd:  "BRPOPLPUSH",
+			args: [][]byte{[]byte("BRPOPLPUSH"), []byte("source"), []byte("dest"), []byte("5")},
+			resp: []byte("job-1"),
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMoveReplayScript,
+				int64(2),
+				[]byte("source"),
+				[]byte("dest"),
+				int64(-1),
+				[]byte("LEFT"),
+				[]byte("job-1"),
+			},
+		},
+		{
+			name: "BLMOVE mirrors requested source and destination sides",
+			cmd:  "BLMOVE",
+			args: [][]byte{
+				[]byte("BLMOVE"), []byte("source"), []byte("dest"),
+				[]byte("LEFT"), []byte("RIGHT"), []byte("5"),
+			},
+			resp: "job-2",
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMoveReplayScript,
+				int64(2),
+				[]byte("source"),
+				[]byte("dest"),
+				int64(1),
+				[]byte("RIGHT"),
+				[]byte("job-2"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{name: "primary", returnValue: tc.resp}
+			secondary := newMockBackend("secondary")
+			secondary.doFunc = makeCmd(int64(1), nil)
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{
+				Mode:                               ModeDualWrite,
+				SecondaryTimeout:                   10 * time.Second,
+				SecondaryBlockingReplayConcurrency: 1,
+			}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), tc.cmd, tc.args)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, [][]any{tc.want}, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("EVAL", "secondary", "ok")), 0.001)
+		})
+	}
+}
+
+func TestDualWriter_Blocking_ReplaysBLMPopAsEval(t *testing.T) {
+	tests := []struct {
+		name string
+		args [][]byte
+		resp any
+		want []any
+	}{
+		{
+			name: "left pop removes returned values from head side",
+			args: [][]byte{
+				[]byte("BLMPOP"), []byte("5"), []byte("2"),
+				[]byte("queue-a"), []byte("queue-b"), []byte("LEFT"),
+				[]byte("COUNT"), []byte("2"),
+			},
+			resp: []any{[]byte("queue-b"), []any{[]byte("job-1"), []byte("job-2")}},
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMultiPopReplayScript,
+				int64(1),
+				[]byte("queue-b"),
+				int64(1),
+				[]byte("job-1"),
+				[]byte("job-2"),
+			},
+		},
+		{
+			name: "right pop removes returned values from tail side",
+			args: [][]byte{
+				[]byte("BLMPOP"), []byte("5"), []byte("1"),
+				[]byte("queue"), []byte("RIGHT"),
+			},
+			resp: []any{"queue", []string{"job-3"}},
+			want: []any{
+				[]byte("EVAL"),
+				blockingListMultiPopReplayScript,
+				int64(1),
+				[]byte("queue"),
+				int64(-1),
+				[]byte("job-3"),
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			primary := &timeoutCapturingBackend{name: "primary", returnValue: tc.resp}
+			secondary := newMockBackend("secondary")
+			secondary.doFunc = makeCmd(int64(1), nil)
+
+			metrics := newTestMetrics()
+			cfg := ProxyConfig{
+				Mode:                               ModeDualWrite,
+				SecondaryTimeout:                   10 * time.Second,
+				SecondaryBlockingReplayConcurrency: 1,
+			}
+			d := NewDualWriter(primary, secondary, cfg, metrics, newTestSentry(), testLogger)
+
+			resp, err := d.Blocking(context.Background(), "BLMPOP", tc.args)
+			assert.NoError(t, err)
+			assert.Equal(t, tc.resp, resp)
+			d.Close()
+
+			assert.Equal(t, [][]any{tc.want}, secondary.Calls())
+			assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
+			assert.InDelta(t, 1, testutil.ToFloat64(metrics.CommandTotal.WithLabelValues("EVAL", "secondary", "ok")), 0.001)
+		})
+	}
 }
 
 func TestNoEffectReplayRetryLimitIncludesJitterBudget(t *testing.T) {

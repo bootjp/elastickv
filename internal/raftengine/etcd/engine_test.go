@@ -108,6 +108,24 @@ type blockingSnapshotStateMachine struct {
 	release chan struct{}
 }
 
+type blockingApplyStateMachine struct {
+	started   chan struct{}
+	release   chan struct{}
+	startOnce sync.Once
+}
+
+type recordingStartupApplyStateMachine struct {
+	*blockingApplyStateMachine
+	rec *applyIndexOrderRecorder
+}
+
+func (s *recordingStartupApplyStateMachine) SetDurableAppliedIndex(idx uint64) error {
+	if s.rec != nil {
+		s.rec.record("bump", idx)
+	}
+	return nil
+}
+
 type blockingSnapshot struct {
 	started chan struct{}
 	release chan struct{}
@@ -139,6 +157,21 @@ func (s *testSnapshot) Close() error {
 
 func (s *blockingSnapshotStateMachine) Apply(data []byte) any {
 	return string(data)
+}
+
+func (s *blockingApplyStateMachine) Apply(data []byte) any {
+	s.startOnce.Do(func() { close(s.started) })
+	<-s.release
+	return string(data)
+}
+
+func (s *blockingApplyStateMachine) Snapshot() (Snapshot, error) {
+	return &testSnapshot{}, nil
+}
+
+func (s *blockingApplyStateMachine) Restore(r io.Reader) error {
+	_, err := io.Copy(io.Discard, r)
+	return err
 }
 
 func (s *blockingSnapshotStateMachine) Snapshot() (Snapshot, error) {
@@ -570,7 +603,7 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 	require.NoError(t, <-errCh)
 }
 
-func TestEnqueueStepReturnsQueueFull(t *testing.T) {
+func TestEnqueueStepBestEffortReturnsQueueFull(t *testing.T) {
 	engine := &Engine{
 		doneCh: make(chan struct{}),
 		stepCh: make(chan raftpb.Message, 1),
@@ -579,18 +612,64 @@ func TestEnqueueStepReturnsQueueFull(t *testing.T) {
 
 	require.Equal(t, uint64(0), engine.StepQueueFullCount())
 
-	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgStorageAppend)})
 	require.Error(t, err)
 	require.True(t, errors.Is(err, errStepQueueFull))
 
 	// The Prometheus hot-path dashboard relies on StepQueueFullCount
-	// advancing exactly once per rejected enqueue so the scraped rate
-	// equals the true drop rate, not a multiple of it.
+	// advancing exactly once per full enqueue attempt so the scraped
+	// rate equals the true congestion rate, not a multiple of it.
 	require.Equal(t, uint64(1), engine.StepQueueFullCount())
 
-	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgStorageAppend)})
 	require.Error(t, err)
 	require.Equal(t, uint64(2), engine.StepQueueFullCount())
+}
+
+func TestEnqueueStepMsgAppWaitsForQueueSlot(t *testing.T) {
+	engine := &Engine{
+		doneCh: make(chan struct{}),
+		stepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)}
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	}()
+
+	select {
+	case err := <-errCh:
+		t.Fatalf("MsgApp enqueue returned before the queue had room: %v", err)
+	case <-time.After(20 * time.Millisecond):
+	}
+	require.Equal(t, uint64(1), engine.StepQueueFullCount())
+
+	firstMsg := <-engine.stepCh
+	require.Equal(t, raftpb.MsgHeartbeat, firstMsg.GetType())
+	select {
+	case err := <-errCh:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		t.Fatal("MsgApp enqueue did not resume after the queue had room")
+	}
+	nextMsg := <-engine.stepCh
+	require.Equal(t, raftpb.MsgApp, nextMsg.GetType())
+}
+
+func TestEnqueueStepMsgAppReturnsContextDeadlineWhenQueueStaysFull(t *testing.T) {
+	engine := &Engine{
+		doneCh: make(chan struct{}),
+		stepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err := engine.enqueueStep(ctx, raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, context.DeadlineExceeded))
+	require.Equal(t, uint64(1), engine.StepQueueFullCount())
 }
 
 func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
@@ -612,10 +691,34 @@ func TestEnqueueStepPriorityBypassesFullBulkQueue(t *testing.T) {
 		t.Fatal("priority heartbeat was not enqueued")
 	}
 
-	err = engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
+	defer cancel()
+	err = engine.enqueueStep(ctx, raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)})
 	require.Error(t, err)
-	require.True(t, errors.Is(err, errStepQueueFull))
+	require.True(t, errors.Is(err, context.DeadlineExceeded))
 	require.Equal(t, uint64(1), engine.StepQueueFullCount())
+}
+
+func TestEnqueueStepSnapshotBypassesFullBulkQueue(t *testing.T) {
+	engine := &Engine{
+		doneCh:         make(chan struct{}),
+		stepCh:         make(chan raftpb.Message, 1),
+		priorityStepCh: make(chan raftpb.Message, 1),
+	}
+	engine.stepCh <- raftpb.Message{Type: messageTypePtr(raftpb.MsgApp)}
+
+	err := engine.enqueueStep(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap)})
+	require.NoError(t, err)
+	require.Equal(t, uint64(0), engine.StepQueueFullCount())
+
+	select {
+	case msg := <-engine.priorityStepCh:
+		require.Equal(t, raftpb.MsgSnap, msg.GetType())
+	default:
+		t.Fatal("snapshot step was not enqueued on the priority queue")
+	}
+
+	require.Len(t, engine.stepCh, 1)
 }
 
 func TestHandleEventDrainsPriorityStepBeforeBulkStep(t *testing.T) {
@@ -800,6 +903,58 @@ func TestSendMessagesDoesNotBlockWhenDispatchQueueIsFull(t *testing.T) {
 	}
 }
 
+func TestReportFailedDispatchReliablyQueuesMsgSnapFailure(t *testing.T) {
+	engine := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+	engine.dispatchReportCh <- dispatchReport{to: 2, msgType: raftpb.MsgHeartbeat}
+
+	done := make(chan struct{})
+	go func() {
+		engine.reportFailedDispatch(raftpb.Message{
+			Type: messageTypePtr(raftpb.MsgSnap),
+			To:   uint64Ptr(3),
+		})
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		t.Fatal("MsgSnap failure report must wait instead of dropping when report channel is full")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	<-engine.dispatchReportCh
+	requireSignal(t, done, time.Second, "MsgSnap failure report was not delivered after report channel drained")
+	report := <-engine.dispatchReportCh
+	require.Equal(t, uint64(3), report.to)
+	require.Equal(t, raftpb.MsgSnap, report.msgType)
+	require.False(t, report.snapshotFinish)
+}
+
+func TestReportDroppedDispatchDefersMsgSnapUntilReadyAdvanced(t *testing.T) {
+	engine := &Engine{
+		dispatchReportCh: make(chan dispatchReport, 1),
+		closeCh:          make(chan struct{}),
+	}
+	queued := dispatchReport{to: 2, msgType: raftpb.MsgHeartbeat}
+	engine.dispatchReportCh <- queued
+
+	engine.reportDroppedDispatch(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgSnap),
+		To:   uint64Ptr(3),
+	})
+
+	require.Equal(t, queued, <-engine.dispatchReportCh)
+	select {
+	case report := <-engine.dispatchReportCh:
+		t.Fatalf("dropped MsgSnap report should not enqueue from the event loop: %+v", report)
+	default:
+	}
+	require.Equal(t, []dispatchReport{{to: 3, msgType: raftpb.MsgSnap}}, engine.deferredReadyDispatchReports)
+}
+
 func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
@@ -864,6 +1019,8 @@ func TestUpsertPeerStartsDispatcherAndAcceptsMessages(t *testing.T) {
 	pd, ok := engine.peerDispatchers[2]
 	require.True(t, ok, "dispatcher must be created on upsert")
 	require.Equal(t, defaultHeartbeatBufPerPeer, cap(pd.heartbeat))
+	require.Equal(t, defaultHeartbeatRespBufPerPeer, cap(pd.heartbeatResp))
+	require.Equal(t, defaultReadIndexRespBufPerPeer, cap(pd.readIndexResp))
 	require.Equal(t, 4, cap(pd.normal))
 
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}))
@@ -883,10 +1040,12 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 	stopCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	pd := &peerQueues{
-		normal:    make(chan dispatchRequest, 4),
-		heartbeat: make(chan dispatchRequest, 4),
-		ctx:       ctx,
-		cancel:    cancel,
+		normal:        make(chan dispatchRequest, 4),
+		heartbeat:     make(chan dispatchRequest, 4),
+		heartbeatResp: make(chan dispatchRequest, 4),
+		readIndexResp: make(chan dispatchRequest, 4),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	engine := &Engine{
 		nodeID:          1,
@@ -894,9 +1053,11 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 		peerDispatchers: map[uint64]*peerQueues{2: pd},
 		dispatchStopCh:  stopCh,
 	}
-	engine.dispatchWG.Add(2)
+	engine.dispatchWG.Add(4)
 	go engine.runDispatchWorker(ctx, pd.normal)
 	go engine.runDispatchWorker(ctx, pd.heartbeat)
+	go engine.runDispatchWorker(ctx, pd.heartbeatResp)
+	go engine.runDispatchWorker(ctx, pd.readIndexResp)
 
 	engine.removePeer(2)
 
@@ -1404,6 +1565,148 @@ func TestPrepareDispatchRequestClonesSnapshotPayload(t *testing.T) {
 	require.Equal(t, []uint64{1, 2}, req.msg.Snapshot.GetMetadata().GetConfState().GetVoters())
 }
 
+func TestEnqueueDispatchMessageCoalescesPlainHeartbeatResponses(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 1),
+	}
+	engine := &Engine{
+		nodeID: 1,
+		peerDispatchers: map[uint64]*peerQueues{
+			2: pd,
+		},
+	}
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:   uint64Ptr(2),
+	})
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("new"),
+	}))
+
+	require.Zero(t, engine.DispatchDropCount())
+	require.Len(t, pd.heartbeatResp, 1)
+	req := <-pd.heartbeatResp
+	require.Equal(t, raftpb.MsgHeartbeatResp, req.msg.GetType())
+	require.Equal(t, []byte("new"), req.msg.Context)
+}
+
+func TestEnqueueDispatchMessagePreservesReadIndexHeartbeatResponses(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 1),
+	}
+	engine := &Engine{
+		nodeID: 1,
+		peerDispatchers: map[uint64]*peerQueues{
+			2: pd,
+		},
+	}
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index"),
+	})
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type: messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:   uint64Ptr(2),
+	}))
+
+	require.Equal(t, uint64(1), engine.DispatchDropCount())
+	require.Len(t, pd.heartbeatResp, 1)
+	req := <-pd.heartbeatResp
+	require.Equal(t, raftpb.MsgHeartbeatResp, req.msg.GetType())
+	require.Equal(t, []byte("read-index"), req.msg.Context)
+}
+
+func TestEnqueueDispatchMessageCoalescesPlainHeartbeatBehindReadIndex(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 3),
+	}
+	engine := &Engine{
+		nodeID: 1,
+		peerDispatchers: map[uint64]*peerQueues{
+			2: pd,
+		},
+	}
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index"),
+	})
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:    uint64Ptr(2),
+		Index: uint64Ptr(10),
+	})
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:    uint64Ptr(2),
+		Index: uint64Ptr(11),
+	})
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type:  messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:    uint64Ptr(2),
+		Index: uint64Ptr(99),
+	}))
+
+	require.Zero(t, engine.DispatchDropCount())
+	require.Len(t, pd.heartbeatResp, 3)
+	req := <-pd.heartbeatResp
+	require.Equal(t, []byte("read-index"), req.msg.Context)
+	req = <-pd.heartbeatResp
+	require.Equal(t, uint64(99), req.msg.GetIndex())
+	req = <-pd.heartbeatResp
+	require.Equal(t, uint64(11), req.msg.GetIndex())
+}
+
+func TestEnqueueDispatchMessagePreservesIncomingReadIndexHeartbeatWhenRespLaneFull(t *testing.T) {
+	t.Parallel()
+	pd := &peerQueues{
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 2),
+		readIndexResp: make(chan dispatchRequest, 1),
+	}
+	engine := &Engine{
+		nodeID: 1,
+		peerDispatchers: map[uint64]*peerQueues{
+			2: pd,
+		},
+	}
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index-a"),
+	})
+	pd.heartbeatResp <- prepareDispatchRequest(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index-b"),
+	})
+
+	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		To:      uint64Ptr(2),
+		Context: []byte("read-index-c"),
+	}))
+
+	require.Zero(t, engine.DispatchDropCount())
+	require.Len(t, pd.heartbeatResp, 2)
+	require.Len(t, pd.readIndexResp, 1)
+	req := <-pd.readIndexResp
+	require.Equal(t, raftpb.MsgHeartbeatResp, req.msg.GetType())
+	require.Equal(t, []byte("read-index-c"), req.msg.Context)
+}
+
 func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(5, 2, []uint64{1}, nil)
@@ -1442,6 +1745,154 @@ func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	})
 
 	require.Equal(t, [][]byte{[]byte("snap"), []byte("tail")}, fsm.Applied())
+}
+
+func TestOpenMultiNodeWaitsForCommittedTailDrain(t *testing.T) {
+	dir := t.TempDir()
+	peers := []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}
+	require.NoError(t, saveStateFile(stateFilePath(dir), persistedState{
+		HardState: testHardState(2, 2),
+		Snapshot:  raftTestSnapshot(1, 1, []uint64{1, 2}, mustEncodeSnapshotData(t, nil)),
+		Entries: []raftpb.Entry{{
+			Type:  entryTypePtr(raftpb.EntryNormal),
+			Term:  uint64Ptr(2),
+			Index: uint64Ptr(2),
+			Data:  encodeProposalEnvelope(1, []byte("tail")),
+		}},
+	}))
+
+	rec := &applyIndexOrderRecorder{}
+	fsm := &recordingStartupApplyStateMachine{
+		blockingApplyStateMachine: &blockingApplyStateMachine{
+			started: make(chan struct{}),
+			release: make(chan struct{}),
+		},
+		rec: rec,
+	}
+	done := make(chan openResult, 1)
+	go func() {
+		engine, err := Open(context.Background(), OpenConfig{
+			NodeID:       1,
+			LocalID:      "n1",
+			LocalAddress: "127.0.0.1:7001",
+			DataDir:      dir,
+			Peers:        peers,
+			StateMachine: fsm,
+		})
+		done <- openResult{engine: engine, err: err}
+	}()
+
+	requireSignal(t, fsm.started, time.Second, "startup committed tail was not being applied")
+	requireNoOpenResult(t, done, 20*time.Millisecond, "multi-node Open returned before committed tail drain completed")
+
+	close(fsm.release)
+
+	result := requireOpenResult(t, done, time.Second, "multi-node Open did not return after committed tail drain completed")
+	require.NoError(t, result.err)
+	require.NotNil(t, result.engine)
+	defer func() {
+		require.NoError(t, result.engine.Close())
+	}()
+
+	require.NoError(t, result.engine.WaitStarted(context.Background()))
+	requireSignal(t, result.engine.startedCh, time.Second, "engine did not mark started after committed tail drain completed")
+	require.Equal(t, []orderEvent{{kind: "bump", index: 2}}, rec.snapshot(),
+		"startup must persist the committed tail applied index before marking the engine started")
+}
+
+type openResult struct {
+	engine *Engine
+	err    error
+}
+
+func requireOpenResult(t *testing.T, ch <-chan openResult, timeout time.Duration, msg string) openResult {
+	t.Helper()
+	select {
+	case result := <-ch:
+		return result
+	case <-time.After(timeout):
+		t.Fatal(msg)
+		return openResult{}
+	}
+}
+
+func requireNoOpenResult(t *testing.T, ch <-chan openResult, timeout time.Duration, msg string) {
+	t.Helper()
+	select {
+	case result := <-ch:
+		if result.engine != nil {
+			_ = result.engine.Close()
+		}
+		if result.err != nil {
+			t.Fatalf("%s: Open returned error: %v", msg, result.err)
+		}
+		t.Fatal(msg)
+	case <-time.After(timeout):
+	}
+}
+
+func requireSignal(t *testing.T, ch <-chan struct{}, timeout time.Duration, msg string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(timeout):
+		t.Fatal(msg)
+	}
+}
+
+func TestWaitStartedTimeoutDoesNotCloseEngine(t *testing.T) {
+	engine := &Engine{
+		startedCh: make(chan struct{}),
+		doneCh:    make(chan struct{}),
+		closeCh:   make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	err := engine.WaitStarted(ctx)
+	require.ErrorIs(t, err, context.Canceled)
+	select {
+	case <-engine.closeCh:
+		t.Fatal("WaitStarted timeout must not close an already-returned engine")
+	default:
+	}
+}
+
+func TestWaitForOpenCanceledContextClosesMultiNodeEngine(t *testing.T) {
+	engine := &Engine{
+		doneCh:  make(chan struct{}),
+		closeCh: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	type result struct {
+		engine *Engine
+		err    error
+	}
+	resultCh := make(chan result, 1)
+	go func() {
+		opened, err := waitForOpen(ctx, engine, false)
+		resultCh <- result{engine: opened, err: err}
+	}()
+
+	select {
+	case <-engine.closeCh:
+	case <-time.After(time.Second):
+		t.Fatal("canceled multi-node Open must close the engine before returning")
+	}
+	close(engine.doneCh)
+
+	select {
+	case got := <-resultCh:
+		require.Nil(t, got.engine)
+		require.ErrorIs(t, got.err, context.Canceled)
+	case <-time.After(time.Second):
+		t.Fatal("waitForOpen did not return after Close completed")
+	}
 }
 
 func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
@@ -2038,20 +2489,23 @@ func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferConfChangePending), raftengine.ErrLeadershipTransferConfChangePending))
 }
 
-// TestSelectDispatchLane_LegacyTwoLane verifies that, when the 4-lane
-// dispatcher is disabled (default), messages are routed exactly as before:
-// priority control traffic → heartbeat lane, everything else → normal lane.
-func TestSelectDispatchLane_LegacyTwoLane(t *testing.T) {
+// TestSelectDispatchLane_LegacyThreeLane verifies that, when the opt-in
+// multi-lane dispatcher is disabled (default), priority control traffic uses
+// the heartbeat lane, heartbeat responses use their coalescing response lane,
+// and everything else uses the normal lane.
+func TestSelectDispatchLane_LegacyThreeLane(t *testing.T) {
 	t.Parallel()
 	engine := &Engine{dispatcherLanesEnabled: false}
 	pd := &peerQueues{
-		normal:    make(chan dispatchRequest, 1),
-		heartbeat: make(chan dispatchRequest, 1),
+		normal:        make(chan dispatchRequest, 1),
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 1),
+		readIndexResp: make(chan dispatchRequest, 1),
 	}
 
 	cases := map[raftpb.MessageType]chan dispatchRequest{
 		raftpb.MsgHeartbeat:     pd.heartbeat,
-		raftpb.MsgHeartbeatResp: pd.heartbeat,
+		raftpb.MsgHeartbeatResp: pd.heartbeatResp,
 		raftpb.MsgReadIndex:     pd.heartbeat,
 		raftpb.MsgReadIndexResp: pd.heartbeat,
 		raftpb.MsgVote:          pd.heartbeat,
@@ -2067,24 +2521,32 @@ func TestSelectDispatchLane_LegacyTwoLane(t *testing.T) {
 		got := engine.selectDispatchLane(pd, mt)
 		require.Equalf(t, want, got, "legacy mode routing for %s", mt)
 	}
+	got := engine.selectDispatchLaneForMessage(pd, raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		Context: []byte("read-index"),
+	})
+	require.Equal(t, pd.readIndexResp, got)
 }
 
-// TestSelectDispatchLane_FourLane verifies that, when ELASTICKV_RAFT_DISPATCHER_LANES
+// TestSelectDispatchLane_FiveLane verifies that, when ELASTICKV_RAFT_DISPATCHER_LANES
 // is enabled, MsgApp/MsgAppResp goes to the replication lane, MsgSnap goes to
-// the snapshot lane, and heartbeats/votes/read-index share the priority lane.
-func TestSelectDispatchLane_FourLane(t *testing.T) {
+// the snapshot lane, heartbeat responses get their own lane, and
+// heartbeats/votes/read-index share the priority lane.
+func TestSelectDispatchLane_FiveLane(t *testing.T) {
 	t.Parallel()
 	engine := &Engine{dispatcherLanesEnabled: true}
 	pd := &peerQueues{
-		heartbeat:   make(chan dispatchRequest, 1),
-		replication: make(chan dispatchRequest, 1),
-		snapshot:    make(chan dispatchRequest, 1),
-		other:       make(chan dispatchRequest, 1),
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 1),
+		readIndexResp: make(chan dispatchRequest, 1),
+		replication:   make(chan dispatchRequest, 1),
+		snapshot:      make(chan dispatchRequest, 1),
+		other:         make(chan dispatchRequest, 1),
 	}
 
 	cases := map[raftpb.MessageType]chan dispatchRequest{
 		raftpb.MsgHeartbeat:     pd.heartbeat,
-		raftpb.MsgHeartbeatResp: pd.heartbeat,
+		raftpb.MsgHeartbeatResp: pd.heartbeatResp,
 		raftpb.MsgVote:          pd.heartbeat,
 		raftpb.MsgVoteResp:      pd.heartbeat,
 		raftpb.MsgPreVote:       pd.heartbeat,
@@ -2098,8 +2560,13 @@ func TestSelectDispatchLane_FourLane(t *testing.T) {
 	}
 	for mt, want := range cases {
 		got := engine.selectDispatchLane(pd, mt)
-		require.Equalf(t, want, got, "4-lane mode routing for %s", mt)
+		require.Equalf(t, want, got, "multi-lane mode routing for %s", mt)
 	}
+	got := engine.selectDispatchLaneForMessage(pd, raftpb.Message{
+		Type:    messageTypePtr(raftpb.MsgHeartbeatResp),
+		Context: []byte("read-index"),
+	})
+	require.Equal(t, pd.readIndexResp, got)
 }
 
 // TestSelectDispatchLane_MsgPropReachesDefaultFallback verifies that MsgProp,
@@ -2111,10 +2578,12 @@ func TestSelectDispatchLane_MsgPropReachesDefaultFallback(t *testing.T) {
 	t.Parallel()
 	engine := &Engine{nodeID: 1, dispatcherLanesEnabled: true}
 	pd := &peerQueues{
-		heartbeat:   make(chan dispatchRequest, 1),
-		replication: make(chan dispatchRequest, 1),
-		snapshot:    make(chan dispatchRequest, 1),
-		other:       make(chan dispatchRequest, 1),
+		heartbeat:     make(chan dispatchRequest, 1),
+		heartbeatResp: make(chan dispatchRequest, 1),
+		readIndexResp: make(chan dispatchRequest, 1),
+		replication:   make(chan dispatchRequest, 1),
+		snapshot:      make(chan dispatchRequest, 1),
+		other:         make(chan dispatchRequest, 1),
 	}
 	require.NotPanics(t, func() {
 		got := engine.selectDispatchLane(pd, raftpb.MsgProp)
@@ -2122,11 +2591,11 @@ func TestSelectDispatchLane_MsgPropReachesDefaultFallback(t *testing.T) {
 	})
 }
 
-// TestFourLaneDispatcher_SnapshotDoesNotBlockReplication exercises the key
-// correctness invariant for the 4-lane layout: a stuck MsgSnap transfer must
+// TestMultiLaneDispatcher_SnapshotDoesNotBlockReplication exercises the key
+// correctness invariant for the multi-lane layout: a stuck MsgSnap transfer must
 // not prevent MsgApp from being dispatched, because they now run on
 // independent goroutines.
-func TestFourLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
+func TestMultiLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
 
@@ -2179,19 +2648,20 @@ func TestFourLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 	engine.dispatchWG.Wait()
 }
 
-// TestFourLaneDispatcher_RemovePeerClosesAllLanes confirms removePeer closes
+// TestMultiLaneDispatcher_RemovePeerClosesAllLanes confirms removePeer closes
 // every lane (not just normal/heartbeat) so no worker goroutine leaks under
-// the opt-in 4-lane layout.
-func TestFourLaneDispatcher_RemovePeerClosesAllLanes(t *testing.T) {
+// the opt-in multi-lane layout.
+func TestMultiLaneDispatcher_RemovePeerClosesAllLanes(t *testing.T) {
 	stopCh := make(chan struct{})
 	ctx, cancel := context.WithCancel(context.Background())
 	pd := &peerQueues{
-		heartbeat:   make(chan dispatchRequest, 4),
-		replication: make(chan dispatchRequest, 4),
-		snapshot:    make(chan dispatchRequest, 4),
-		other:       make(chan dispatchRequest, 4),
-		ctx:         ctx,
-		cancel:      cancel,
+		heartbeat:     make(chan dispatchRequest, 4),
+		heartbeatResp: make(chan dispatchRequest, 4),
+		replication:   make(chan dispatchRequest, 4),
+		snapshot:      make(chan dispatchRequest, 4),
+		other:         make(chan dispatchRequest, 4),
+		ctx:           ctx,
+		cancel:        cancel,
 	}
 	engine := &Engine{
 		nodeID:                 1,
@@ -2200,8 +2670,9 @@ func TestFourLaneDispatcher_RemovePeerClosesAllLanes(t *testing.T) {
 		dispatchStopCh:         stopCh,
 		dispatcherLanesEnabled: true,
 	}
-	engine.dispatchWG.Add(4)
+	engine.dispatchWG.Add(5)
 	go engine.runDispatchWorker(ctx, pd.heartbeat)
+	go engine.runDispatchWorker(ctx, pd.heartbeatResp)
 	go engine.runDispatchWorker(ctx, pd.replication)
 	go engine.runDispatchWorker(ctx, pd.snapshot)
 	go engine.runDispatchWorker(ctx, pd.other)
@@ -2216,7 +2687,7 @@ func TestFourLaneDispatcher_RemovePeerClosesAllLanes(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(time.Second):
-		t.Fatal("4-lane dispatch workers did not exit after peer removal")
+		t.Fatal("multi-lane dispatch workers did not exit after peer removal")
 	}
 
 	// Subsequent sends to the removed peer must be dropped without panic.

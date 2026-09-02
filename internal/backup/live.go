@@ -36,15 +36,28 @@ func (s Scope) ID() string {
 // producing an incomplete expected-key baseline.
 var ErrScopeKeyMalformed = errors.New("backup: malformed scoped key")
 
+// ErrScopeOffloadedChunkBlob marks a content-addressed S3 chunk blob. A chunk
+// blob carries no bucket in its key, so there is no scope to stream it under,
+// and skipping it silently would emit an object's manifest and chunk
+// references without the bytes they point at -- a dump whose decoder cannot
+// finalize. The live path fails here instead of producing one that cannot be
+// restored. Reaching this needs S3 blob offload to actually admit PUTs, which
+// stays gated off until the M3 reference-counting and orphan-scanner work
+// lands; emitting these blobs is part of enabling that mode.
+var ErrScopeOffloadedChunkBlob = errors.New("backup: live backup cannot represent an offloaded S3 chunk blob")
+
 // ScopeForKey maps an internal user-data key to its logical backup scope.
 // Internal control-plane keys and derivable indexes return (_, false, nil).
 func ScopeForKey(key []byte) (Scope, bool, error) {
 	switch {
 	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBItemPrefix, DDBGSIPrefix):
 		return scopeForDDBKey(key)
+	case bytes.HasPrefix(key, []byte(S3ChunkBlobPrefix)):
+		return Scope{}, false, errors.WithStack(ErrScopeOffloadedChunkBlob)
 	case hasAnyBackupPrefix(key,
 		S3BucketMetaPrefix, S3ObjectManifestPrefix,
-		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3GCUploadPrefix, S3RoutePrefix,
+		S3UploadMetaPrefix, S3UploadPartPrefix, S3BlobPrefix, S3ChunkRefPrefix,
+		S3GCUploadPrefix, S3RoutePrefix,
 	):
 		return scopeForS3Key(key)
 	case hasAnyBackupPrefix(key,
@@ -132,6 +145,12 @@ func scopeForS3Key(key []byte) (Scope, bool, error) {
 		return Scope{}, false, nil
 	case bytes.HasPrefix(key, []byte(S3BlobPrefix)):
 		bucket, _, _, _, _, _, _, ok := s3keys.ParseBlobKey(key)
+		return parsedS3Scope(bucket, ok, key)
+	case bytes.HasPrefix(key, []byte(S3ChunkRefPrefix)):
+		// An offloaded object's manifest is useless without the chunk
+		// references that name its payload, and the reference key carries the
+		// bucket, so it scopes like every other object-level row.
+		bucket, _, _, _, _, _, ok := s3keys.ParseChunkRefKey(key)
 		return parsedS3Scope(bucket, ok, key)
 	case bytes.HasPrefix(key, []byte(S3GCUploadPrefix)), bytes.HasPrefix(key, []byte(S3RoutePrefix)):
 		return Scope{}, false, nil

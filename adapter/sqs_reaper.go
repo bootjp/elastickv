@@ -664,7 +664,7 @@ func (s *SQSServer) reapOneRecord(ctx context.Context, queueName string, meta *s
 		return err
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		if isRetryableTransactWriteError(err) {
+		if isIgnorableTransactRaceError(err) {
 			return nil
 		}
 		return errors.WithStack(err)
@@ -873,7 +873,7 @@ func (s *SQSServer) dispatchDedupDelete(ctx context.Context, key []byte, readTS 
 		},
 	}
 	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
-		if isRetryableTransactWriteError(err) {
+		if isIgnorableTransactRaceError(err) {
 			return nil
 		}
 		return errors.WithStack(err)

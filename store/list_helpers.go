@@ -11,8 +11,13 @@ import (
 // Delta/Claim key constants.
 const (
 	// ListMetaDeltaPrefix is the prefix for all list metadata delta keys.
-	// Layout: !lst|meta|d|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>
-	ListMetaDeltaPrefix = "!lst|meta|d|"
+	// Layout: !lst|delta|<userKeyLen(4)><userKey><commitTS(8)><seqInTxn(4)>
+	ListMetaDeltaPrefix = "!lst|delta|"
+
+	// LegacyListMetaDeltaPrefix is the pre-upgrade list metadata delta prefix.
+	// Writers use ListMetaDeltaPrefix, but readers and compactors keep scanning
+	// this prefix until old uncompacted deltas have been drained.
+	LegacyListMetaDeltaPrefix = "!lst|meta|d|"
 
 	// ListClaimPrefix is the prefix for list claim keys used by POP operations.
 	// Layout: !lst|claim|<userKeyLen(4)><userKey><seq(8-byte sortable)>
@@ -85,8 +90,27 @@ func ListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
 
 // ListMetaDeltaScanPrefix returns the prefix used to scan all delta keys for a userKey.
 func ListMetaDeltaScanPrefix(userKey []byte) []byte {
-	buf := make([]byte, 0, len(ListMetaDeltaPrefix)+wideColKeyLenSize+len(userKey))
-	buf = append(buf, ListMetaDeltaPrefix...)
+	return listMetaDeltaScanPrefixFor(ListMetaDeltaPrefix, userKey)
+}
+
+// LegacyListMetaDeltaScanPrefix returns the pre-upgrade delta scan prefix for a userKey.
+func LegacyListMetaDeltaScanPrefix(userKey []byte) []byte {
+	return listMetaDeltaScanPrefixFor(LegacyListMetaDeltaPrefix, userKey)
+}
+
+// ListMetaDeltaScanPrefixes returns all prefixes that may contain visible list
+// metadata deltas for userKey. New writers emit only ListMetaDeltaPrefix, but
+// upgrade reads must include LegacyListMetaDeltaPrefix until compaction drains it.
+func ListMetaDeltaScanPrefixes(userKey []byte) [][]byte {
+	return [][]byte{
+		ListMetaDeltaScanPrefix(userKey),
+		LegacyListMetaDeltaScanPrefix(userKey),
+	}
+}
+
+func listMetaDeltaScanPrefixFor(prefix string, userKey []byte) []byte {
+	buf := make([]byte, 0, len(prefix)+wideColKeyLenSize+len(userKey))
+	buf = append(buf, prefix...)
 	var kl [4]byte
 	binary.BigEndian.PutUint32(kl[:], uint32(len(userKey))) //nolint:gosec // len is bounded by max slice size
 	buf = append(buf, kl[:]...)
@@ -121,7 +145,7 @@ func ListClaimScanPrefix(userKey []byte) []byte {
 
 // IsListMetaDeltaKey reports whether the key is a list metadata delta key.
 func IsListMetaDeltaKey(key []byte) bool {
-	return bytes.HasPrefix(key, []byte(ListMetaDeltaPrefix))
+	return ExtractListUserKeyFromDelta(key) != nil
 }
 
 // IsListClaimKey reports whether the key is a list claim key.
@@ -135,7 +159,31 @@ func ExtractListUserKeyFromDelta(key []byte) []byte {
 	if !ok {
 		return nil
 	}
-	return extractListUserKeyFromLenPrefixedKey(trimmed, deltaKeyTSSize+deltaKeySeqSize)
+	return extractListUserKeyFromLenPrefixedExactKey(trimmed, deltaKeyTSSize+deltaKeySeqSize)
+}
+
+// ExtractLegacyListUserKeyFromDelta extracts the user key from an old
+// !lst|meta|d| delta key. Callers that only have a key must be careful: this
+// legacy layout overlaps with base !lst|meta| keys whose user key begins with
+// d|. Prefer using it when the associated value is known to be a delta value.
+func ExtractLegacyListUserKeyFromDelta(key []byte) []byte {
+	trimmed, ok := bytes.CutPrefix(key, []byte(LegacyListMetaDeltaPrefix))
+	if !ok {
+		return nil
+	}
+	return extractListUserKeyFromLenPrefixedExactKey(trimmed, deltaKeyTSSize+deltaKeySeqSize)
+}
+
+// ExtractListUserKeyFromDeltaScanPrefix extracts the user key from a new-list
+// delta scan start/prefix.
+func ExtractListUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListMetaDeltaPrefix))
+}
+
+// ExtractLegacyListUserKeyFromDeltaScanPrefix extracts the user key from a
+// legacy-list delta scan start/prefix.
+func ExtractLegacyListUserKeyFromDeltaScanPrefix(key []byte) []byte {
+	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(LegacyListMetaDeltaPrefix))
 }
 
 // ExtractListUserKeyFromClaim extracts the logical user key from a list claim key.
@@ -144,19 +192,38 @@ func ExtractListUserKeyFromClaim(key []byte) []byte {
 	if !ok {
 		return nil
 	}
-	return extractListUserKeyFromLenPrefixedKey(trimmed, sortableInt64Bytes)
-}
-
-// ExtractListUserKeyFromDeltaScanPrefix extracts the logical user key from the
-// exact prefix produced by ListMetaDeltaScanPrefix.
-func ExtractListUserKeyFromDeltaScanPrefix(key []byte) []byte {
-	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListMetaDeltaPrefix))
+	return extractListUserKeyFromLenPrefixedExactKey(trimmed, sortableInt64Bytes)
 }
 
 // ExtractListUserKeyFromClaimScanPrefix extracts the logical user key from the
 // exact prefix produced by ListClaimScanPrefix.
 func ExtractListUserKeyFromClaimScanPrefix(key []byte) []byte {
 	return extractListUserKeyFromLenPrefixedScanPrefix(key, []byte(ListClaimPrefix))
+}
+
+// IsListMetaDeltaValue reports whether value has the fixed delta encoding.
+func IsListMetaDeltaValue(value []byte) bool {
+	return len(value) == listDeltaSizeBytes
+}
+
+func extractWideColumnUserKey(key, prefix []byte, suffixLen uint64, exactLen bool) []byte {
+	if !bytes.HasPrefix(key, prefix) {
+		return nil
+	}
+	trimmed := key[len(prefix):]
+	if uint64(len(trimmed)) < uint64(wideColKeyLenSize)+suffixLen {
+		return nil
+	}
+	ukLen := binary.BigEndian.Uint32(trimmed[:wideColKeyLenSize])
+	userEnd := uint64(wideColKeyLenSize) + uint64(ukLen)
+	minLen := userEnd + suffixLen
+	if minLen > uint64(len(trimmed)) {
+		return nil
+	}
+	if exactLen && minLen != uint64(len(trimmed)) {
+		return nil
+	}
+	return trimmed[wideColKeyLenSize:int(userEnd)] //nolint:gosec // userEnd is bounded by len(trimmed) above.
 }
 
 // ExtractListUserKeyFromDeltaScanKey extracts the logical user key from a
@@ -199,6 +266,17 @@ func extractListUserKeyFromLenPrefixedScanPrefix(key []byte, prefix []byte) []by
 	return trimmed[wideColKeyLenSize:]
 }
 
+func extractListUserKeyFromLenPrefixedExactKey(trimmed []byte, suffixLen int) []byte {
+	userKey := extractListUserKeyFromLenPrefixedKey(trimmed, suffixLen)
+	if userKey == nil {
+		return nil
+	}
+	if len(trimmed) != wideColKeyLenSize+len(userKey)+suffixLen {
+		return nil
+	}
+	return userKey
+}
+
 func extractListUserKeyFromLenPrefixedKey(trimmed []byte, suffixLen int) []byte {
 	if len(trimmed) < wideColKeyLenSize+suffixLen {
 		return nil
@@ -208,7 +286,7 @@ func extractListUserKeyFromLenPrefixedKey(trimmed []byte, suffixLen int) []byte 
 	if int64(ukLen) > int64(availableUserKeyBytes) {
 		return nil
 	}
-	userEnd := int64(wideColKeyLenSize) + int64(ukLen)
+	userEnd := int64(wideColKeyLenSize) + int64(ukLen) //nolint:gosec // ukLen is bounded by availableUserKeyBytes above.
 	return trimmed[wideColKeyLenSize:userEnd]
 }
 
