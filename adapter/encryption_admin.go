@@ -379,12 +379,23 @@ func (s *EncryptionAdminServer) Validate() error {
 // case so the empty epoch never reaches the writer registry.
 func (s *EncryptionAdminServer) GetCapability(_ context.Context, _ *pb.Empty) (*pb.CapabilityReport, error) {
 	if s.sidecarPath == "" {
-		return &pb.CapabilityReport{BuildSha: s.buildSHA}, nil
+		return &pb.CapabilityReport{
+			BuildSha: s.buildSHA,
+			// storage_envelope_v2_capable is a build capability, not a
+			// deployment one: this binary's envelope decoder accepts
+			// EnvelopeVersionV2, so it reports true even on a node that
+			// was never started with --encryption-enabled. Both consumers
+			// AND it with encryption_capable, so reporting it here never
+			// loosens a gate — it only keeps the field's meaning ("can
+			// this peer read a V2 envelope") honest.
+			StorageEnvelopeV2Capable: true,
+		}, nil
 	}
 	report := &pb.CapabilityReport{
-		EncryptionCapable: true,
-		BuildSha:          s.buildSHA,
-		FullNodeId:        s.fullNodeID,
+		EncryptionCapable:        true,
+		BuildSha:                 s.buildSHA,
+		FullNodeId:               s.fullNodeID,
+		StorageEnvelopeV2Capable: true,
 		// LocalEpoch stays at 0 until Stage 7 wires the §4.1
 		// writer-registry counter. The §5.6 step 1a pre-check
 		// happens before any DEK exists, so 0 is the correct

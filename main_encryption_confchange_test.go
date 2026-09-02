@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -375,5 +377,65 @@ func TestEncryptionWriteWiringEncryptionConfigured(t *testing.T) {
 	on := encryptionWriteWiring{cache: encryption.NewStateCache(), cipher: &encryption.Cipher{}}
 	if !on.encryptionConfigured() {
 		t.Fatal("wiring with a cipher did not report encryption configured")
+	}
+}
+
+// TestProbeStorageEnvelopeV2CapabilityAgainstRealAdminServer drives the
+// membership gate against the production CapabilityReport producer rather
+// than a hand-written stub. Every other probe test in this file builds its
+// own *pb.CapabilityReport, so all of them stayed green while the real
+// adapter.EncryptionAdminServer left storage_envelope_v2_capable at the
+// protobuf default and the gate rejected every AddVoter/AddLearner in an
+// encryption-configured cluster.
+func TestProbeStorageEnvelopeV2CapabilityAgainstRealAdminServer(t *testing.T) {
+	t.Parallel()
+	srv := adapter.NewEncryptionAdminServer(
+		adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+		adapter.WithEncryptionAdminFullNodeID(stubDerivedNodeID),
+	)
+	err := probeStorageEnvelopeV2CapabilityWithRPC(
+		context.Background(),
+		"member:50051",
+		stubDerivedNodeID,
+		time.Second,
+		func(ctx context.Context, _ string) (*pb.CapabilityReport, error) {
+			//nolint:wrapcheck // the production RPC path returns the server error verbatim.
+			return srv.GetCapability(ctx, &pb.Empty{})
+		},
+	)
+	if err != nil {
+		t.Fatalf("capability probe against the real admin server: %v", err)
+	}
+}
+
+// TestEncryptionPreRegisterAcceptsRealAdminServerCapability closes the same
+// loop one layer up: the interceptor's default probe wiring must accept a
+// peer served by the production GetCapability implementation.
+func TestEncryptionPreRegisterAcceptsRealAdminServerCapability(t *testing.T) {
+	t.Parallel()
+	srv := adapter.NewEncryptionAdminServer(
+		adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+		adapter.WithEncryptionAdminFullNodeID(stubDerivedNodeID),
+	)
+	probe := func(ctx context.Context, address string, expected uint64) error {
+		return probeStorageEnvelopeV2CapabilityWithRPC(
+			ctx, address, expected, time.Second,
+			func(ctx context.Context, _ string) (*pb.CapabilityReport, error) {
+				//nolint:wrapcheck // the production RPC path returns the server error verbatim.
+				return srv.GetCapability(ctx, &pb.Empty{})
+			},
+		)
+	}
+	st := newRegistrationTestStore(t)
+	pre := newEncryptionPreRegister(
+		&kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st},
+		encryption.NewStateCache(),
+		"",
+		stubDeriveNodeID,
+		probe,
+	)
+	if err := pre.PreAddMember(context.Background(), "raftN", "raftN:50051"); err != nil {
+		t.Fatalf("PreAddMember with a real-server capability probe: %v", err)
 	}
 }

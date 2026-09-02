@@ -4,17 +4,21 @@ import (
 	"context"
 	"errors"
 	"log/slog"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	pb "github.com/bootjp/elastickv/proto"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
 
 func TestStorageEnvelopeV2CapabilityMonitorActivatesOnce(t *testing.T) {
@@ -339,5 +343,63 @@ func TestStorageEnvelopeV2MonitorFanoutOwnsItsConnections(t *testing.T) {
 
 	if fn, release := buildStorageEnvelopeV2MonitorFanout(nil, false); fn != nil || release != nil {
 		t.Error("monitor fan-out must be absent when encryption mutators are disabled")
+	}
+}
+
+// realServerEncryptionAdminClient adapts the production
+// adapter.EncryptionAdminServer to the pb.EncryptionAdminClient interface
+// admin.CapabilityFanout dials, so the fan-out sees the same
+// CapabilityReport a running node would serve.
+type realServerEncryptionAdminClient struct {
+	pb.EncryptionAdminClient
+	srv *adapter.EncryptionAdminServer
+}
+
+func (c realServerEncryptionAdminClient) GetCapability(
+	ctx context.Context, _ *pb.Empty, _ ...grpc.CallOption,
+) (*pb.CapabilityReport, error) {
+	//nolint:wrapcheck // the gRPC client returns the server's error verbatim.
+	return c.srv.GetCapability(ctx, &pb.Empty{})
+}
+
+// TestCapabilityFanoutAgainstRealAdminServerActivatesV2 pins the second
+// consumer of storage_envelope_v2_capable. Every other test in this file
+// hand-builds admin.CapabilityVerdict values with the flag already set, so
+// they all stayed green while the production GetCapability left the field at
+// the protobuf default and V2 compressed writes could never latch on.
+func TestCapabilityFanoutAgainstRealAdminServerActivatesV2(t *testing.T) {
+	t.Parallel()
+	const (
+		nodeA uint64 = 0xA1
+		nodeB uint64 = 0xB2
+	)
+	servers := map[string]*adapter.EncryptionAdminServer{
+		"n1:50051": adapter.NewEncryptionAdminServer(
+			adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+			adapter.WithEncryptionAdminFullNodeID(nodeA),
+		),
+		"n2:50051": adapter.NewEncryptionAdminServer(
+			adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+			adapter.WithEncryptionAdminFullNodeID(nodeB),
+		),
+	}
+	dial := func(_ context.Context, address string) (pb.EncryptionAdminClient, func(), error) {
+		srv, ok := servers[address]
+		if !ok {
+			return nil, nil, errors.New("no server at " + address)
+		}
+		return realServerEncryptionAdminClient{srv: srv}, func() {}, nil
+	}
+	routes := admin.RouteSnapshot{Groups: []admin.RouteGroup{{
+		GroupID:  0,
+		Voters:   []admin.RouteMember{{FullNodeID: nodeA, Address: "n1:50051"}},
+		Learners: []admin.RouteMember{{FullNodeID: nodeB, Address: "n2:50051"}},
+	}}}
+	result, err := admin.CapabilityFanout(context.Background(), routes, dial, time.Second)
+	if err != nil {
+		t.Fatalf("CapabilityFanout: %v", err)
+	}
+	if !result.StorageEnvelopeV2Ready() {
+		t.Fatalf("StorageEnvelopeV2Ready=false against real admin servers; verdicts=%+v", result.Verdicts)
 	}
 }
