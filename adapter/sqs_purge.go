@@ -91,7 +91,11 @@ func (s *SQSServer) purgeQueueWithRetry(ctx context.Context, queueName string) (
 // pre-bump and post-bump generations so the caller can audit-log the
 // committed value without a second meta read.
 func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bool, uint64, uint64, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs purge queue: begin read timestamp")
+	if err != nil {
+		return false, 0, 0, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return false, 0, 0, errors.WithStack(err)
@@ -156,7 +160,8 @@ func (s *SQSServer) tryPurgeQueueOnce(ctx context.Context, queueName string) (bo
 			{Op: kv.Put, Key: tombstoneKey, Value: tombstoneValue},
 		},
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		return false, 0, 0, errors.WithStack(err)
 	}
 	return true, lastGen, meta.Generation, nil

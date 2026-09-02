@@ -71,7 +71,9 @@ message RawDeleteResponse {
 message RawLatestCommitTSRequest {
   bytes key = 1;
   uint64 read_route_version = 2; // stamped by server-side routing for migration read fences
-  uint64 group_id = 3; // optional explicit Raft group for route-specific probes
+  // group_id carries both uses: the explicit Raft group for route-specific
+  // probes, and the explicit group a leader-fenced watermark read names.
+  uint64 group_id = 3;
   // When non-zero, also answer whether the key has any committed version at or
   // below this timestamp. Comparing only `ts` cannot tell a tombstone at or
   // before the read timestamp apart from a newer version above it.
@@ -86,6 +88,10 @@ message RawLatestCommitTSResponse {
   // both unset and the caller falls back to comparing `ts`.
   bool version_visible = 3;
   bool version_visible_supported = 4;
+  // 3 and 4 were taken by the version probe on main while this branch was
+  // open, so the watermark fields moved up rather than reusing those tags.
+  uint64 group_id = 5; // echoes an explicit group watermark request
+  bool leader_fenced = 6; // true only after that group's leader ReadIndex fence
 }
 
 message RawScanAtRequest {

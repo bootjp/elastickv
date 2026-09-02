@@ -626,10 +626,12 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 	}
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(r.Context(), readTS)
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 create bucket: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
+		readTS = readTimestamp.Timestamp()
+		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -674,7 +676,8 @@ func (s *S3Server) createBucket(w http.ResponseWriter, r *http.Request, bucket s
 				{Op: kv.Put, Key: s3keys.BucketGenerationKey(bucket), Value: encodeS3Generation(nextGeneration)},
 			},
 		}
-		_, err = s.coordinator.Dispatch(r.Context(), req)
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req)
 		return errors.WithStack(err)
 	})
 	if err != nil {
@@ -705,10 +708,12 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 	var deletedGeneration uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(r.Context(), readTS)
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete bucket: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
+		readTS = readTimestamp.Timestamp()
+		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -747,7 +752,8 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		// groups (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast).
 		// See AdminDeleteBucket's doc comment for the full
 		// rationale.
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems:   []*kv.Elem[kv.OP]{{Op: kv.Del, Key: s3keys.BucketMetaKey(bucket)}},
@@ -856,10 +862,12 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(r.Context(), readTS)
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 put bucket acl: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
+		readTS = readTimestamp.Timestamp()
+		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -881,7 +889,8 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -1138,10 +1147,12 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(r.Context(), readTS)
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
+		readTS = readTimestamp.Timestamp()
+		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -1168,7 +1179,8 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 			cleanupManifest = nil
 			return nil
 		}
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -1194,6 +1206,12 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 
 func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
 	readTS := s.readTS()
+	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 create multipart upload: begin read timestamp")
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	readTS = readTimestamp.Timestamp()
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
@@ -1208,11 +1226,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 	}
 
 	uploadID := newS3UploadID(s.clock())
-	startTS, err := s.txnStartTS(r.Context(), readTS)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
+	startTS := readTS
 	commitTS, err := s.nextTxnCommitTS(r.Context(), startTS)
 	if err != nil {
 		writeS3InternalError(w, err)
@@ -1237,7 +1251,8 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 		writeS3InternalError(w, err)
 		return
 	}
-	if _, err := s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -1329,10 +1344,12 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
 		readTS := s.readTS()
-		startTS, err := s.txnStartTS(r.Context(), readTS)
+		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 abort multipart upload: begin read timestamp")
 		if err != nil {
 			return errors.Wrap(err, "s3: allocate startTS for mutation")
 		}
+		readTS = readTimestamp.Timestamp()
+		startTS := readTS
 		readPin := s.pinReadTS(readTS)
 		defer readPin.Release()
 
@@ -1366,7 +1383,8 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 		}
 
 		// Transactional delete with startTS fencing — conflicts with concurrent Complete.
-		_, err = s.coordinator.Dispatch(r.Context(), &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
 			StartTS: startTS,
 			Elems: []*kv.Elem[kv.OP]{
@@ -2501,6 +2519,24 @@ func (s *S3Server) txnStartTS(ctx context.Context, readTS uint64) (uint64, error
 		return 0, errors.WithStack(err)
 	}
 	return ts, nil
+}
+
+func (s *S3Server) beginTxnReadTimestamp(ctx context.Context, readTS uint64, label string) (kv.ReadTimestamp, error) {
+	if readTS == ^uint64(0) {
+		if alloc, ok := kv.TimestampAllocatorThrough(s.coordinator); ok {
+			if phaseD, phaseDOK := alloc.(kv.TSOPhaseDState); phaseDOK && (phaseD.PhaseDRequired() || phaseD.PhaseDActive()) {
+				readTS = 1
+				readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, readTS, label)
+				return readTimestamp, errors.WithStack(err)
+			}
+		}
+	}
+	startTS, err := s.txnStartTS(ctx, readTS)
+	if err != nil {
+		return kv.ReadTimestamp{}, err
+	}
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, startTS, label)
+	return readTimestamp, errors.WithStack(err)
 }
 
 // newS3UploadID generates an upload identifier for multipart uploads.

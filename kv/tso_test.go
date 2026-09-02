@@ -363,6 +363,96 @@ func TestNextTimestampAfterThroughUsesAllocatorFloor(t *testing.T) {
 	require.EqualValues(t, testTSOInitialBase+6, got)
 }
 
+func TestBeginReadTimestampThroughPreservesLegacyBeforePhaseD(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test read timestamp")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Zero(t, alloc.nextCalls.Load())
+	require.Zero(t, alloc.validateCalls.Load())
+}
+
+func TestBeginReadTimestampThroughValidatesAppliedWatermarkDuringPhaseD(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDActive: true, phaseDRequired: true}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test read timestamp")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Zero(t, alloc.nextCalls.Load())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+	require.Equal(t, uint64(42), alloc.validated.Load())
+}
+
+func TestBeginReadTimestampThroughFailsClosedOnValidationError(t *testing.T) {
+	alloc := &phaseDTestAllocator{
+		next:           testTSOInitialBase,
+		phaseDActive:   true,
+		phaseDRequired: true,
+		validateErr:    ErrTSOTimestampInvalid,
+	}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	_, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test read timestamp")
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid)
+	require.Zero(t, alloc.nextCalls.Load())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
+func TestBeginReadTimestampThroughActivatesPhaseDBeforeValidation(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDRequired: true}
+	coord := &Coordinate{tsAllocator: alloc}
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test phase D activation")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Equal(t, uint64(1), alloc.nextCalls.Load())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
+func TestBatchAllocatorDropsPrePhaseDWindowAfterActivation(t *testing.T) {
+	raw := &phaseDWindowTSO{nextBase: testTSOInitialBase, leader: true}
+	alloc, err := NewBatchAllocator(raw, testTSOBatchSize)
+	require.NoError(t, err)
+
+	first, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(testTSOInitialBase), first)
+	raw.phaseD = true
+	raw.floor = testTSOInitialBase + testTSOBatchSize - 1
+
+	readTS, err := alloc.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(testTSOInitialBase+testTSOBatchSize), readTS)
+	require.Equal(t, uint64(2), raw.calls.Load())
+}
+
+func TestBeginReadTimestampThroughFindsAllocatorBehindKeyVizDecorator(t *testing.T) {
+	alloc := &phaseDTestAllocator{next: testTSOInitialBase, phaseDActive: true, phaseDRequired: true}
+	coord := WithKeyVizLabel(&Coordinate{tsAllocator: alloc}, keyviz.LabelRedis)
+
+	readTS, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test decorated read timestamp")
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), readTS.Timestamp())
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
+func TestBeginReadTimestampThroughRejectsDecoratorWithoutInnerVoucher(t *testing.T) {
+	alloc := &phaseDTestAllocator{
+		next:           testTSOInitialBase,
+		phaseDActive:   true,
+		phaseDRequired: true,
+		validateErr:    ErrTSOTimestampPrePhaseD,
+	}
+	coord := WithKeyVizLabel(&noVoucherTSOCoordinator{alloc: alloc, clock: NewHLC()}, keyviz.LabelRedis)
+
+	_, err := BeginReadTimestampThrough(context.Background(), coord, 42, "test decorated read timestamp")
+	require.ErrorIs(t, err, ErrTSOProtocolUnsupported)
+	require.Equal(t, uint64(1), alloc.validateCalls.Load())
+}
+
 func TestKeyVizLabeledCoordinatorRecoversExpiredHLCCeiling(t *testing.T) {
 	t.Parallel()
 	clock := NewHLC()
@@ -564,6 +654,71 @@ type fakeTSOAllocator struct {
 	leader   bool
 }
 
+type phaseDTestAllocator struct {
+	next           uint64
+	phaseDActive   bool
+	phaseDRequired bool
+	validateErr    error
+	nextCalls      atomic.Uint64
+	validateCalls  atomic.Uint64
+	validated      atomic.Uint64
+}
+
+func (a *phaseDTestAllocator) Next(context.Context) (uint64, error) {
+	a.nextCalls.Add(1)
+	return a.next, nil
+}
+
+func (a *phaseDTestAllocator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	a.nextCalls.Add(1)
+	if a.next <= min {
+		return min + 1, nil
+	}
+	return a.next, nil
+}
+
+func (a *phaseDTestAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	a.validateCalls.Add(1)
+	a.validated.Store(timestamp)
+	return a.validateErr
+}
+
+func (a *phaseDTestAllocator) PhaseDActive() bool   { return a.phaseDActive }
+func (a *phaseDTestAllocator) PhaseDRequired() bool { return a.phaseDRequired }
+
+type phaseDWindowTSO struct {
+	nextBase uint64
+	floor    uint64
+	phaseD   bool
+	leader   bool
+	calls    atomic.Uint64
+}
+
+func (a *phaseDWindowTSO) Next(ctx context.Context) (uint64, error) {
+	return a.NextBatch(ctx, 1)
+}
+
+func (a *phaseDWindowTSO) NextBatch(_ context.Context, n int) (uint64, error) {
+	a.calls.Add(1)
+	base := a.nextBase
+	a.nextBase += uint64(n) //nolint:gosec // positive test batch size.
+	return base, nil
+}
+
+func (a *phaseDWindowTSO) IsLeader() bool { return a.leader }
+
+func (a *phaseDWindowTSO) RunLeaseRenewal(ctx context.Context) { <-ctx.Done() }
+
+func (a *phaseDWindowTSO) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	if timestamp <= a.floor {
+		return ErrTSOTimestampInvalid
+	}
+	return nil
+}
+
+func (a *phaseDWindowTSO) PhaseDActive() bool   { return a.phaseD }
+func (a *phaseDWindowTSO) PhaseDRequired() bool { return a.phaseD }
+
 func (f *fakeTSOAllocator) Next(ctx context.Context) (uint64, error) {
 	return f.NextBatch(ctx, 1)
 }
@@ -600,6 +755,33 @@ type fakeTSOCoordinator struct {
 	recoverCalls    atomic.Uint64
 	recoverHLCLease func(context.Context) error
 }
+
+type noVoucherTSOCoordinator struct {
+	alloc TimestampAllocator
+	clock *HLC
+}
+
+func (c *noVoucherTSOCoordinator) Dispatch(context.Context, *OperationGroup[OP]) (*CoordinateResponse, error) {
+	return nil, errors.New("dispatch not implemented")
+}
+
+func (c *noVoucherTSOCoordinator) IsLeader() bool { return true }
+
+func (c *noVoucherTSOCoordinator) VerifyLeader(context.Context) error { return nil }
+
+func (c *noVoucherTSOCoordinator) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
+
+func (c *noVoucherTSOCoordinator) RaftLeader() string { return "" }
+
+func (c *noVoucherTSOCoordinator) IsLeaderForKey([]byte) bool { return true }
+
+func (c *noVoucherTSOCoordinator) VerifyLeaderForKey(context.Context, []byte) error { return nil }
+
+func (c *noVoucherTSOCoordinator) RaftLeaderForKey([]byte) string { return "" }
+
+func (c *noVoucherTSOCoordinator) Clock() *HLC { return c.clock }
+
+func (c *noVoucherTSOCoordinator) TimestampAllocator() TimestampAllocator { return c.alloc }
 
 func (f *fakeTSOCoordinator) IsLeader() bool {
 	return f.leader.Load()
@@ -657,4 +839,95 @@ func (f *renewingTSOCoordinator) RecoverHLCLease(context.Context) error {
 	}
 	f.clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	return nil
+}
+
+// mutableTSOCutoverState is the durable, consensus-owned group-0 migration
+// state as the coordinator sees it. The marker can be applied long after
+// startup -- by a --tsoModeFile reload or by another node -- so the flag flips
+// while the coordinator is already serving.
+type mutableTSOCutoverState struct {
+	cutover atomic.Bool
+	phaseD  atomic.Bool
+}
+
+func (s *mutableTSOCutoverState) CutoverActive() bool { return s.cutover.Load() }
+func (s *mutableTSOCutoverState) PhaseDActive() bool  { return s.phaseD.Load() }
+
+// A deployment that starts in legacy warm-up never calls WithTimestampGroup:
+// pinning up front would narrow lease renewal to group 0 while persistence
+// timestamps still come from the data groups. When the Phase-D marker lands
+// afterwards, the coordinator must pin group 0 anyway. Leaving it unpinned made
+// shouldRenewHLCGroup retire every data group with no timestamp group to renew
+// instead, so every ceiling expired and issuance failed with ErrCeilingExpired.
+func TestShardedCoordinatorPinsCandidateTimestampGroupOnPhaseD(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	state := &mutableTSOCutoverState{}
+	groups := map[uint64]*ShardGroup{
+		0: {Engine: stubLeaderEngine{}},
+		1: {Engine: stubLeaderEngine{}},
+		2: {Engine: stubLeaderEngine{}},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).
+		WithAllShardGroups(1, 2).
+		WithTSOCutoverState(state).
+		WithTimestampGroupCandidate(0)
+
+	// Legacy warm-up: the data groups still own renewal and the reserved group
+	// must not be treated as the timestamp leader.
+	require.Equal(t, []uint64{1, 2}, coord.timestampLeaseRenewalGroupIDs())
+	require.True(t, coord.shouldRenewHLCGroup(1, groups[1]))
+	require.True(t, coord.shouldRenewHLCGroup(2, groups[2]))
+
+	// The marker applies while the process is running.
+	state.cutover.Store(true)
+	state.phaseD.Store(true)
+
+	require.Equal(t, []uint64{0}, coord.timestampLeaseRenewalGroupIDs(),
+		"group 0 must own renewal once Phase D is active")
+	require.True(t, coord.shouldRenewHLCGroup(0, groups[0]),
+		"the timestamp group must keep renewing its own ceiling")
+	require.False(t, coord.shouldRenewHLCGroup(1, groups[1]))
+	require.False(t, coord.shouldRenewHLCGroup(2, groups[2]))
+
+	targets := coord.hlcLeaseRecoveryTargets()
+	require.Len(t, targets, 1)
+	require.Equal(t, uint64(0), targets[0].gid)
+}
+
+// Without a candidate there is no group to hand renewal to, so retiring the
+// data groups would leave nothing renewing any ceiling at all. Keep renewing
+// rather than expiring the whole cluster.
+func TestShardedCoordinatorKeepsRenewingWithoutTimestampGroupUnderPhaseD(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	state := &mutableTSOCutoverState{}
+	state.cutover.Store(true)
+	state.phaseD.Store(true)
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: stubLeaderEngine{}},
+		2: {Engine: stubLeaderEngine{}},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).
+		WithTSOCutoverState(state)
+
+	require.True(t, coord.shouldRenewHLCGroup(1, groups[1]))
+	require.True(t, coord.shouldRenewHLCGroup(2, groups[2]))
+}
+
+// WithTimestampGroup keeps pinning immediately, candidate or not.
+func TestShardedCoordinatorExplicitTimestampGroupStillPinsWithoutPhaseD(t *testing.T) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+
+	groups := map[uint64]*ShardGroup{
+		0: {Engine: stubLeaderEngine{}},
+		1: {Engine: &stubFollowerEngine{}},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).WithTimestampGroup(0)
+
+	require.Equal(t, []uint64{0}, coord.timestampLeaseRenewalGroupIDs())
+	require.True(t, coord.IsTimestampLeader())
 }

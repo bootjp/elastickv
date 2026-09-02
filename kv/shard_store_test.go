@@ -2063,11 +2063,20 @@ func TestShardStoreResolveFilesystemHomeSlot(t *testing.T) {
 func TestShardStoreFilesystemGroupIDsReturnsPhysicalGroupsSorted(t *testing.T) {
 	t.Parallel()
 
-	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
-		9: {},
-		2: {},
-		5: {},
+	// Real physical groups own a store; FilesystemGroupIDs skips store-less
+	// ones (the dedicated TSO group is registered without one), so the
+	// placeholder groups this test used need stores to stay physical.
+	groups := map[uint64]*ShardGroup{
+		9: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+		5: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		for _, g := range groups {
+			_ = g.Store.Close()
+		}
 	})
+	st := NewShardStore(distribution.NewEngine(), groups)
 	require.Equal(t, []uint64{2, 5, 9}, st.FilesystemGroupIDs())
 }
 
@@ -3497,6 +3506,63 @@ func TestScanAtCanonicalizesProxiedPages(t *testing.T) {
 	defer fake.mu.Unlock()
 	require.Equal(t, len(rows), fake.getCalls,
 		"every proxied row must be canonicalized locally until the peer can say it already did")
+}
+
+func TestShardStoreReadFenceGroupKeysForRangeIncludesIntersectingRoutes(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("hash:fence-routes")
+	prefix := store.HashFieldScanPrefix(userKey)
+	split := append(append([]byte(nil), prefix...), 'm')
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), split, 1)
+	engine.UpdateRoute(split, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	})
+
+	got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+
+	// The contract is one representative key per intersecting group, and every
+	// consumer leases them all. Enumeration order is not part of it -- under
+	// wide-column user-key routing the raw range order no longer holds -- so
+	// the set is what this pins.
+	require.ElementsMatch(t, [][]byte{prefix, split}, got)
+}
+
+func TestShardStoreLocalStoresUsesStableGroupOrder(t *testing.T) {
+	t.Parallel()
+
+	first := store.NewMVCCStore()
+	second := store.NewMVCCStore()
+	shards := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		20: {Store: second},
+		10: {Store: first},
+		30: nil,
+	})
+
+	require.Equal(t, []store.MVCCStore{first, second}, shards.LocalStores())
+}
+
+func TestFilesystemGroupIDsSkipsStorelessGroups(t *testing.T) {
+	t.Parallel()
+
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		0: {},                            // dedicated TSO group: no Store
+		1: {Store: store.NewMVCCStore()}, // data group
+		2: nil,                           // defensive: nil group
+	})
+
+	require.Equal(t, []uint64{1}, st.FilesystemGroupIDs())
+
+	// Scanning a store-less group is a no-op rather than an error, so
+	// enumerating it never broke collection -- it just cost one pointless scan
+	// per group per collection. Pinned here so the rationale is not overstated.
+	page, err := st.ScanGroupAt(context.Background(), 0, []byte("a"), []byte("b"), 10, 1)
+	require.NoError(t, err)
+	require.Empty(t, page)
 }
 
 func (e *followerProxyEngine) SnapshotEvery() uint64 { return 0 }

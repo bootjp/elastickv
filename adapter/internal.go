@@ -14,6 +14,20 @@ import (
 
 type InternalOption func(*Internal)
 
+// WithKVForwardRejected refuses Forward before it can propose.
+//
+// The dedicated TSO group runs TSOStateMachine, whose Apply halts on any tag it
+// does not recognise. TransactionManager.Commit encodes KV requests with the
+// 0x00 / 0x01 tags, so a single forwarded PUT reaching this group's Internal
+// server would commit an entry that permanently stops group-0 apply -- and with
+// it all centralized timestamp issuance. The registration loop wires an Internal
+// server for every runtime, so the refusal has to live here.
+func WithKVForwardRejected() InternalOption {
+	return func(i *Internal) {
+		i.kvForwardRejected = true
+	}
+}
+
 // WithInternalWriteGate re-applies the coordinator's route-floor check to
 // writes that were forwarded here from a follower.
 func WithInternalWriteGate(gate kv.MutationWriteGate) InternalOption {
@@ -65,14 +79,17 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader               raftengine.LeaderView
-	transactionManager   kv.Transactional
-	clock                *kv.HLC
-	tsAllocator          kv.TimestampAllocator
-	adminProposer        raftengine.Proposer
-	lastCommitTimestamp  func() uint64
-	relay                *RedisPubSubRelay
-	writeGate            kv.MutationWriteGate
+	leader              raftengine.LeaderView
+	transactionManager  kv.Transactional
+	clock               *kv.HLC
+	tsAllocator         kv.TimestampAllocator
+	adminProposer       raftengine.Proposer
+	lastCommitTimestamp func() uint64
+	relay               *RedisPubSubRelay
+	writeGate           kv.MutationWriteGate
+	// kvForwardRejected marks a runtime whose state machine cannot apply KV
+	// entries -- the dedicated TSO group. See WithKVForwardRejected.
+	kvForwardRejected    bool
 	forwardWriteObserver ForwardWriteObserver
 
 	pb.UnimplementedInternalServer
@@ -81,10 +98,16 @@ type Internal struct {
 var _ pb.InternalServer = (*Internal)(nil)
 
 var ErrNotLeader = errors.New("not leader")
+var ErrKVForwardNotSupported = errors.New("kv forward not supported on this raft group")
 var ErrLeaderNotFound = errors.New("leader not found")
 var ErrTxnTimestampOverflow = errors.New("txn timestamp overflow")
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+	// Before the leader check, so a non-leader gets the accurate reason and a
+	// leader can never reach stampTimestamps and propose.
+	if i.kvForwardRejected {
+		return nil, errors.WithStack(ErrKVForwardNotSupported)
+	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
@@ -188,6 +211,16 @@ func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) 
 	if req == nil {
 		return 0, nil
 	}
+	// The envelope flag decides how the batch is stamped, but
+	// TransactionManager.Commit decides how it is applied from the inner
+	// requests' own IsTxn. A batch that says raw on the outside and carries a
+	// transactional request inside took the raw stamping path -- which only ever
+	// looks at Request.Ts -- and then went down the transactional apply path,
+	// where the FSM takes the persistence timestamp from a transaction meta
+	// nothing validated. Insist the two agree.
+	if !forwardedBatchMatchesEnvelope(req.IsTxn, req.Requests) {
+		return 0, errors.WithStack(kv.ErrInvalidRequest)
+	}
 	if req.IsTxn {
 		return i.stampTxnTimestamps(ctx, req.Requests)
 	}
@@ -195,14 +228,46 @@ func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) 
 	return 0, i.stampRawTimestamps(ctx, req.Requests)
 }
 
+// forwardedBatchMatchesEnvelope reports whether every inner request agrees with
+// the envelope's mode.
+//
+// It is not enough to ask whether any request is transactional, the way
+// TransactionManager.Commit does. That test is an OR, so both mixed shapes slip
+// through in one direction or the other:
+//
+//   - a raw envelope holding a transactional request is stamped raw, which only
+//     looks at Request.Ts, then applied transactionally, where the FSM takes the
+//     persistence timestamp from an unvalidated transaction meta;
+//   - a transactional envelope holding a raw request is stamped with the
+//     transaction's start timestamp, then applied raw by commitSequential,
+//     persisting at that timestamp without ever passing stampRawTimestamps.
+//
+// Neither legitimate sender builds a mixed batch -- both set the envelope from
+// reqs[0].IsTxn over a batch the coordinator constructed as all raw or all
+// transactional -- so requiring agreement costs nothing and closes both shapes.
+func forwardedBatchMatchesEnvelope(envelopeIsTxn bool, reqs []*pb.Request) bool {
+	for _, r := range reqs {
+		if r != nil && r.IsTxn != envelopeIsTxn {
+			return false
+		}
+	}
+	return true
+}
+
 func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, error) {
 	if i.tsAllocator != nil {
 		ts, err := i.tsAllocator.Next(ctx)
-		if err != nil {
+		if err == nil {
+			return ts, nil
+		}
+		if !errors.Is(err, kv.ErrTSOAllocatorRequired) {
 			return 0, errors.Wrap(err, label)
 		}
-		return ts, nil
 	}
+	return i.nextLegacyTimestamp(label)
+}
+
+func (i *Internal) nextLegacyTimestamp(label string) (uint64, error) {
 	if i.clock == nil {
 		return 1, nil
 	}
@@ -218,15 +283,23 @@ func (i *Internal) nextTimestampAfter(ctx context.Context, min uint64, label str
 		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
 	}
 	if i.tsAllocator != nil {
-		return i.nextTimestampAfterFromAllocator(ctx, min, label)
+		ts, err := i.nextTimestampAfterFromAllocator(ctx, min, label)
+		if err == nil {
+			return ts, nil
+		}
+		if !errors.Is(err, kv.ErrTSOAllocatorRequired) {
+			return 0, err
+		}
 	}
+	return i.nextLegacyTimestampAfter(min, label)
+}
+
+func (i *Internal) nextLegacyTimestampAfter(min uint64, label string) (uint64, error) {
 	if i.clock == nil {
 		return min + 1, nil
 	}
-	if i.clock != nil {
-		i.clock.Observe(min)
-	}
-	ts, err := i.nextTimestamp(ctx, label)
+	i.clock.Observe(min)
+	ts, err := i.nextLegacyTimestamp(label)
 	if err != nil {
 		return 0, err
 	}
@@ -259,7 +332,18 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 		if r == nil {
 			continue
 		}
-		if r.Ts == 0 {
+		if r.Ts != 0 {
+			// Somebody else already stamped this write. It is the timestamp the
+			// value will be persisted under, and this receiver is downstream of
+			// the coordinator that would otherwise have validated it, so check
+			// it here rather than taking it on trust. The route-floor check
+			// below still runs: validation says the timestamp is allocatable,
+			// not that the route still accepts a write at it.
+			if err := kv.ValidateDurablePersistenceTimestamp(
+				ctx, i.tsAllocator, r.Ts, "stampRawTimestamps: forwarded raw ts"); err != nil {
+				return errors.WithStack(err)
+			}
+		} else {
 			ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
 			if err != nil {
 				return err
@@ -295,6 +379,12 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 			return 0, err
 		}
 		startTS = ts
+	} else if err := kv.ValidateForwardedTxnStartTimestamp(
+		ctx, i.tsAllocator, startTS, "stampTxnTimestamps: forwarded start ts"); err != nil {
+		// A PREPARE carries no transaction meta, so the commit-timestamp check
+		// below never sees it -- yet handlePrepareRequest persists the intent at
+		// this value.
+		return 0, errors.WithStack(err)
 	}
 	if startTS == ^uint64(0) {
 		return 0, errors.WithStack(ErrTxnTimestampOverflow)
@@ -382,7 +472,7 @@ type forwardedTxnMetaToUpdate struct {
 }
 
 func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Request, startTS uint64) (uint64, error) {
-	metaMutations, commitTS, err := collectForwardedTxnMetas(reqs)
+	metaMutations, commitTS, resolution, err := collectForwardedTxnMetas(reqs)
 	if err != nil {
 		return 0, err
 	}
@@ -392,6 +482,15 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		if err != nil {
 			return 0, err
 		}
+	} else if err := kv.ValidateForwardedTxnCommitTimestamp(
+		ctx, i.tsAllocator, startTS, commitTS, resolution,
+		"fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
+		// A commit timestamp that arrived already set in the transaction meta
+		// is the timestamp every mutation in this batch is persisted under, and
+		// it never passed through the coordinator's own validation. A legacy
+		// transaction still being resolved replays a pre-Phase-D pair, which the
+		// validator admits; see ValidateForwardedTxnCommitTimestamp.
+		return 0, errors.WithStack(err)
 	}
 
 	for _, item := range metaMutations {
@@ -416,9 +515,16 @@ func stampRequestMutationCommitTS(reqs []*pb.Request, commitTS uint64) error {
 	return nil
 }
 
-func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, error) {
+// collectForwardedTxnMetas also reports whether an already-set commit timestamp
+// arrived on a resolution request. Only COMMIT and ABORT replay a timestamp the
+// primary recorded; Phase_NONE is a one-phase transaction that chose its own and
+// has no recorded intent behind it.
+func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, bool, error) {
 	metaMutations := make([]forwardedTxnMetaToUpdate, 0, len(reqs))
 	var commitTS uint64
+	// Starts true and is narrowed by every meta that carries the timestamp; a
+	// batch with no such meta leaves commitTS zero, and the caller allocates.
+	resolution := true
 	prefix := []byte(kv.TxnMetaPrefix)
 	for _, r := range reqs {
 		m, ok := forwardedTxnMetaMutation(r, prefix)
@@ -429,16 +535,23 @@ func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, u
 		if err != nil {
 			continue
 		}
+		// Narrowed for every meta, not only the ones that arrive carrying a
+		// timestamp. commitSequential applies the requests in order, and a
+		// zero-valued Phase_NONE meta is filled with the selected timestamp
+		// below -- so it receives the exemption just as surely as one that
+		// carried the value in, and a one-phase write would persist under a
+		// resolution's exemption either way.
+		resolution = resolution && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT)
 		if meta.CommitTS != 0 {
 			if commitTS != 0 && commitTS != meta.CommitTS {
-				return nil, 0, errors.WithStack(kv.ErrInvalidRequest)
+				return nil, 0, false, errors.WithStack(kv.ErrInvalidRequest)
 			}
 			commitTS = meta.CommitTS
 			continue
 		}
 		metaMutations = append(metaMutations, forwardedTxnMetaToUpdate{m: m, meta: meta})
 	}
-	return metaMutations, commitTS, nil
+	return metaMutations, commitTS, resolution, nil
 }
 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded

@@ -117,6 +117,18 @@ placement or failover.
 | M4 resolver work delegation | Unimplemented and unowned | Write `*_proposed_lock_resolver_delegation.md`; own snapshot assignment, leader-vouched decisions, duplicate work, failover, admission, and Raft apply boundaries. It also needs a focused per-group HLC tick capability and preflight contract, such as `cap_per_group_hlc_v1`, before resolver work can move away from process-local ticking |
 | M5 leader-proxy circuit breaker | Implemented on `main` | `2026_07_19_implemented_leader_proxy_circuit_breaker.md` (PR #1132, `56e36e94`) owns the data-plane breaker in `kv/leader_proxy_breaker.go` plus retry budget, leader-identity reset, half-open behavior, and adapter error mapping |
 
+- **Per-group HLC vs centralized TSO.** The centralized TSO design
+  (`docs/design/2026_04_16_implemented_centralized_tso.md`) has shipped M1-M8:
+  all-led-group compatibility renewal, the dedicated group-0 FSM, leader-routed
+  durable windows, one-way cutover and Phase D, runtime mode reload, and
+  operational gates. The shared ordering source is available for cross-node
+  cross-group transactions. Deployments that remain in `legacy` still have
+  only per-node monotonicity; before enabling multiple coordinator nodes for
+  cross-group issuance, they must complete the documented `shadow -> cutover`
+  sequence. `LeaderProxy.Commit` / `Internal.Forward` preserve non-zero
+  timestamps, and one `startTS` remains shared by every transaction participant.
+  Phase D additionally validates a caller-supplied cross-shard `StartTS` at the
+  group-0 leader before commit allocation.
 The admin package's existing `ErrLeaderUnavailable` mapping was never evidence
 for the data-plane breaker; that gap was closed separately by PR #1132, which
 added `kv/leader_proxy_breaker.go` and its adapter error mapping.
@@ -224,5 +236,172 @@ promote. The shared Pebble block cache row names PR #1082 as its only canonical
 owner and treats that work as complete, so under the first clause alone this
 roadmap could never become eligible for promotion no matter what else shipped.
 
+### Gap 6 — Connection / transport scaling (streaming transport soak)
+**Problem.** Raft inter-node messages previously used unary gRPC per message
+(`docs/design/2026_04_18_implemented_raft_grpc_streaming_transport.md` §1),
+which paid a full RTT per send. The implemented `SendStream` transport removes
+that bottleneck, but multi-node multi-group (Gap 1) still needs transport soak
+coverage under real cross-node traffic. **Rough milestones:** (M1) run transport
+soak with multi-node multi-group traffic. (M2) decide whether the optional
+biased-select multiplexing worker from the implemented transport doc is needed.
+The blob-fetch RPC in the S3 offload doc (§3.6) can reuse the same
+chunked-streaming abstraction. **Depends-on:** Gap 1 for realistic traffic;
+value scales with Gap 1.
+
+### Gap 7 — Auto group lifecycle (longest-term)
+**Problem.** Groups are static (`--raftGroups`). Elastic scale-out (add node →
+auto-create/rebalance groups) needs automatic group creation + membership
+orchestration, an explicit non-goal everywhere today (§2(e)). **Rough
+milestones:** out of near-term scope; sketch only. **Depends-on:** Gaps 1, 4,
+5 all in place (you cannot auto-create groups before you can stand up
+multi-node groups, move ranges between them, and merge fragments).
+
+---
+
+## 4. Sequencing (dependency-ordered rollout)
+
+The ordering is driven by unblock-edges, not by perceived value in isolation.
+
+1. **HLC per-group ceiling renewal fix** (TSO doc §6 / M1). Smallest correct
+   change; closes the cross-group monotonicity gap (§1.5) *before* the
+   topology that exposes it exists. Land first so each group remains safe when
+   replicas move across nodes, but do not enable cross-group transactions whose
+   timestamps can be allocated by more than one coordinator node until step 11
+   (or its single-oracle bridge) lands.
+2. **Multi-node multi-group bootstrap** (Gap 1, implemented in
+   `2026_06_14_implemented_multinode_multigroup_bootstrap.md`). The root
+   topology unblocker for (b), (c), (e), Gap 3, Gap 4 is now in-tree; downstream
+   work can build on groups whose voters span more than one node.
+3. **Leader balance scheduler** (PR #953). Its PR0 is exactly Gap 1; PR1
+   (observe-only) can land against today's single-voter topology, but the
+   transfer-issuing PR2–PR3 are blocked on step 2. So: PR #953 PR1 in
+   parallel with step 2; PR2–PR3 after.
+4. **Hotspot split M2 migration plane** (PR #945). The data-movement
+   mechanism every later data-balance/merge step reuses. Independent of the
+   multi-node work for its own correctness (it moves ranges between groups
+   that already exist), so it can proceed in parallel with steps 2–3, but its
+   *value* compounds once groups span nodes.
+5. **Hotspot split M3 automation** (PR #951). Drives detection off keyviz;
+   delivers same-group auto-split standalone (does not require M2), and picks
+   a least-loaded target once M2 lands. After step 4 for the cross-group case.
+6. **Shared Pebble cache** (Gap 2). Needed once split + multi-node lets a node
+   hold many groups; land before pushing high group counts in production.
+7. **Follower / learner reads** (Gap 3). After step 2 (remote replicas exist)
+   and the learner primitive (already in-tree).
+8. **Region balance scheduler** (Gap 4). After step 4 (migration plane), step 2
+   (multi-node), and a replica-placement / membership-change design that can
+   reshape groups when existing target groups share the same voter set.
+   Complement to step 3's leader balance.
+9. **Range merge** (Gap 5). After step 4 for cross-group merge.
+10. **Streaming transport** (Gap 6). Any time after step 2 makes inter-node
+    Raft traffic significant; pairs with the S3 blob-fetch RPC.
+11. **Dedicated TSO group** (TSO doc M6–M8 / OQ-1 resolved) — implemented as
+    the shared ordering source for cross-node, cross-group transactions. The
+    remaining sequencing constraint is operational: deployments still running
+    in `legacy` retain only the per-node HLC guarantee from step 1, while
+    multi-node cross-group issuance requires completing the documented
+    `shadow -> cutover -> phase-d` gate so both `startTS` and `commitTS` come
+    from group 0 and caller-supplied timestamps are validated against its
+    durable allocation floor.
+12. **Auto group lifecycle** (Gap 7) — long-term, after 2/4/8/9.
+
+In-flight PRs map cleanly: **#955** is step 2 (Gap 1 bootstrap proposal),
+**#953** is step 3 (and its PR0 = step 2's intent), **#945** is step 4,
+**#951** is step 5.
+
+### 4.1 Rolling-upgrade and live-cutover guardrails
+
+This roadmap does not introduce a cluster-version Raft entry as part of the
+first sequencing slice; that broader coordination protocol should be its own
+design if needed. The near-term mitigation is layered:
+
+1. **Capability-gated admin operations.** `raftadmin` / coordinator admin RPCs
+   that enable multi-node bootstrap, leader transfers, follower reads,
+   migration/import, write fences, learner admission/promotion, or a cross-group
+   timestamp bridge must first observe that every current voter and every target
+   learner/voter/server involved advertises the matching capability. Mixed
+   binary clusters run in compatibility mode with these features disabled.
+2. **Operator-driven in-place expansion.** For clusters that can tolerate a
+   controlled maintenance window, upgrade all binaries first, verify capability
+   convergence, then expand one group at a time by adding a new replica as a
+   learner (`AddLearner`), waiting for its match/apply watermark to catch up,
+   and promoting it with the learner-promotion path. Keep the old single-voter
+   leader serving until the learner is caught up and promoted; reserve direct
+   `AddVoter` for bootstrap/offline fully-caught-up peers, not live in-place
+   expansion. Do not permit a flag-only restart to reinterpret an existing
+   single-voter group as multi-voter.
+3. **Blue/green or bridge/proxy cutover for zero-downtime moves.** Deployments
+   that cannot accept the in-place operational window should use a fresh
+   multi-node cluster plus a temporary bridge/proxy mode: dual-write or
+   write-through to both sides, shadow-read / compare, then flip reads and retire
+   the old cluster. This mirrors the existing Redis migration pattern and the
+   TSO doc's feature-flagged shadow phase, without forcing every bootstrap PR to
+   carry a full migration coordinator.
+4. **Deferred complex protocol.** If the capability checks above are too weak for
+   a later feature, the fix is not to overload this roadmap; write a separate
+   cluster-version / rolling-upgrade design and make that feature depend on it.
+
+---
+
+## 5. Open Questions
+
+1. **Centralized TSO ordering status.** OQ-1 is resolved for the timestamp
+   oracle itself: the dedicated TSO group is now the shared source for
+   cross-node, cross-group `startTS` / `commitTS` once a deployment completes
+   the `shadow -> cutover -> phase-d` sequence. Step 1 remains necessary as the
+   legacy compatibility floor, but it is no longer the answer for multi-node
+   cross-group issuance. In `legacy`, timestamps are still drawn from each
+   coordinator node's local HLC and the old per-node limitation applies. After
+   cutover, coordinator-owned timestamps route through group 0, follower
+   timestamp requests redirect to the TSO leader, Phase D validates
+   caller-supplied cross-shard timestamps against the durable allocation floor,
+   and pre-D applied read watermarks use bounded vouchers at dispatch.
+
+   A separate guardrail remains outside OQ-1: cross-group txns with read-only
+   participant shards still rely on `validateReadOnlyShards`, whose
+   linearizable-barrier-to-`LatestCommitTS` check is not made stronger merely by
+   moving timestamp issuance to group 0. Enabling additional multi-node
+   read-only-shard shapes must still either reject those shapes or land the
+   dedicated read-validation phase described above.
+2. **Shared cache (Gap 2) vs per-group isolation (workload isolation doc).** A
+   single shared block cache trades isolation for density: one hot group can
+   evict a latency-sensitive group's working set. How does Gap 2's per-group
+   fairness reconcile with the workload-isolation proposal's CPU-side
+   reservations? They are the memory- and CPU-axis siblings and should share a
+   resource-accounting vocabulary.
+3. **Merge (Gap 5) and unresolved prepares.** Merge must unify two MVCC
+   histories *and* two `!txn|…` keyspaces. What is the fence/drain protocol
+   that guarantees no in-flight prepare on either side is lost across the
+   merge cutover? (M2's split drain is the starting point but split bisects one
+   history; merge unifies two.)
+4. **Region balance (Gap 4) signal.** Count-based (ranges per node) like
+   leader balance v1, or size/load-weighted from keyviz from day one? Leader
+   balance chose count-first; data balance may need size from the start
+   because a 1 GiB range and a 1 KiB range are not interchangeable.
+5. **Follower-read staleness contract (Gap 3).** What bound does the adapter
+   surface advertise — bounded-staleness with an explicit lag, or
+   read-your-writes only? This determines whether the leader-issued read-ts
+   pipeline needs a per-client session token.
+6. **Auto group lifecycle (Gap 7) trigger.** What signal creates a new group —
+   node join, aggregate range count crossing a threshold, or operator action?
+   Premature auto-creation interacts badly with merge (create/merge thrash).
+7. **Live cutover / rolling-upgrade strategy for the single-node→multi-node
+   transition (Gap 1).** Moving a deployment from "one process hosts every
+   group, each single-voter" to genuine multi-node multi-group is a topology
+   change, not just a flag flip: a group that bootstrapped single-member must
+   add remote replicas as learners, wait for catch-up, and promote them through
+   the learner-promotion path (the primitives exist, §2(e)); direct live
+   `AddVoter` remains reserved for bootstrap/offline fully caught-up peers as
+   in §4.1. The cluster may run mixed binary versions mid-upgrade. What is the
+   supported path — operator-driven learner-add/promote expansion of an
+   existing single-voter group, blue/green with a dual-write proxy
+   (`proxy/`, the existing Redis-migration pattern), or a fresh cluster +
+   data migration? §4.1 defines the interim guardrails — capability-gated admin
+   operations, in-place expansion only after all binaries advertise support,
+   and bridge/proxy cutover for zero-downtime deployments — but PR #955 must
+   choose the supported default path and spell out rollback. (Note: the TSO
+   doc §7 already specifies a phased dual-write/shadow-read/feature-flag
+   cutover for the *timestamp* migration; the bootstrap cutover should mirror
+   that structure.)
 An *open* pull request, a code primitive, or a superseded roadmap paragraph is
 still not sufficient evidence of completion.
