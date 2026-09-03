@@ -4,15 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	stderrors "errors"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
@@ -101,6 +106,244 @@ func TestDistributionServerGetTimestamp_IsMonotonic(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Greater(t, second.Timestamp, first.Timestamp)
+}
+
+func TestDistributionServerGetTimestamp_UsesDedicatedBatchAllocator(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 101, leader: true}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+	)
+	resp, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:        8,
+		MinTimestamp: 100,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(101), resp.GetTimestamp())
+	require.True(t, resp.GetCommittedByDedicatedTso())
+	require.Equal(t, 8, alloc.count)
+	require.Equal(t, uint64(100), alloc.min)
+}
+
+func TestDistributionServerGetTimestamp_CommitsCutoverAndReturnsPriorFloor(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 501, previousFloor: 499, leader: true}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+	)
+	resp, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		MinTimestamp:    500,
+		ActivateCutover: true,
+	})
+	require.NoError(t, err)
+	require.True(t, alloc.activate)
+	require.True(t, resp.GetCutoverActive())
+	require.Equal(t, uint64(499), resp.GetPreviousAllocationFloor())
+}
+
+func TestDistributionServerGetTimestamp_CommitsPhaseDAndReturnsFloor(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 501, previousFloor: 499, leader: true}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+	)
+	resp, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		MinTimestamp:    500,
+		ActivateCutover: true,
+		ActivatePhaseD:  true,
+	})
+	require.NoError(t, err)
+	require.True(t, alloc.activate)
+	require.True(t, alloc.activatePhaseD)
+	require.True(t, resp.GetCutoverActive())
+	require.True(t, resp.GetPhaseDActive())
+	require.Equal(t, uint64(499), resp.GetPhaseDFloor())
+}
+
+func TestDistributionServerGetTimestamp_RejectsPhaseDWithoutCutover(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(&distributionTSOAllocator{leader: true}),
+	)
+	_, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{ActivatePhaseD: true})
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestDistributionServerValidateTimestamp(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{
+		base:        501,
+		leader:      true,
+		phaseD:      true,
+		phaseDFloor: 499,
+	}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+	)
+	resp, err := s.ValidateTimestamp(context.Background(), &pb.ValidateTimestampRequest{Timestamp: 500})
+	require.NoError(t, err)
+	require.True(t, resp.GetValid())
+	require.True(t, resp.GetPhaseDActive())
+	require.Equal(t, uint64(499), resp.GetPhaseDFloor())
+	require.Equal(t, uint64(501), resp.GetAllocationFloor())
+
+	_, err = s.ValidateTimestamp(context.Background(), &pb.ValidateTimestampRequest{Timestamp: 499})
+	require.Equal(t, codes.OutOfRange, status.Code(err))
+}
+
+func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
+	serverAlloc := &distributionTSOAllocator{
+		base:        701,
+		leader:      true,
+		phaseD:      true,
+		phaseDFloor: 699,
+	}
+	addr := serveDistributionTestServer(t, NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(serverAlloc),
+	))
+	routed, err := kv.NewLeaderRoutedTSOAllocator(
+		&distributionTSOAllocator{leader: false},
+		distributionLeaderView{addr: addr},
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, routed.Close()) })
+
+	require.NoError(t, routed.ValidateDurableTimestamp(context.Background(), 700))
+	err = routed.ValidateDurableTimestamp(context.Background(), 699)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+}
+
+func TestDistributionServerGetTimestamp_RejectsFollower(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{err: kv.ErrTSONotLeader}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+	)
+	_, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{Count: 1})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+func TestDistributionServerGetTimestamp_RejectsUnsupportedBatch(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(distribution.NewEngine(), nil)
+	_, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{Count: 2})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+
+	_, err = s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{Count: uint32(kv.MaxTSOBatchSize + 1)})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+}
+
+func TestDistributionServerGetTimestamp_RejectsMinimumWithoutReservationMetadata(t *testing.T) {
+	t.Parallel()
+
+	allocator := &distributionTSOAllocator{base: 101, leader: true}
+	server := NewDistributionServer(distribution.NewEngine(), nil,
+		WithDistributionTimestampAllocator(&batchOnlyDistributionTSOAllocator{delegate: allocator}))
+
+	_, err := server.GetTimestamp(context.Background(), &pb.GetTimestampRequest{MinTimestamp: 100})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+func TestDistributionServerGetTimestamp_LeaderRoutedRPC(t *testing.T) {
+	serverAlloc := &distributionTSOAllocator{base: 501, leader: true}
+	addr := serveDistributionTestServer(t, NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(serverAlloc),
+	))
+
+	local := &distributionTSOAllocator{leader: false}
+	routed, err := kv.NewLeaderRoutedTSOAllocator(local, distributionLeaderView{addr: addr})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, routed.Close()) })
+
+	base, err := routed.NextBatchAfter(context.Background(), 4, 500)
+	require.NoError(t, err)
+	require.Equal(t, uint64(501), base)
+	require.Equal(t, 4, serverAlloc.count)
+	require.Equal(t, uint64(500), serverAlloc.min)
+}
+
+func TestDistributionServerGetTimestamp_LeaderRoutedRejectsLegacyServer(t *testing.T) {
+	addr := serveDistributionTestServer(t, NewDistributionServer(distribution.NewEngine(), nil))
+	local := &distributionTSOAllocator{leader: false}
+	routed, err := kv.NewLeaderRoutedTSOAllocator(local, distributionLeaderView{addr: addr})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, routed.Close()) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
+	defer cancel()
+	_, err = routed.NextBatch(ctx, 4)
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+}
+
+func TestDistributionServerGetTimestamp_LeaderRoutedActivatesCutover(t *testing.T) {
+	serverAlloc := &distributionTSOAllocator{base: 701, previousFloor: 699, leader: true}
+	addr := serveDistributionTestServer(t, NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(serverAlloc),
+	))
+
+	local := &distributionTSOAllocator{leader: false}
+	routed, err := kv.NewLeaderRoutedTSOAllocator(
+		local,
+		distributionLeaderView{addr: addr},
+		kv.WithTSOCutoverActivation(),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, routed.Close()) })
+
+	base, err := routed.Next(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(701), base)
+	require.True(t, serverAlloc.activate)
+}
+
+func serveDistributionTestServer(t *testing.T, server *DistributionServer) string {
+	t.Helper()
+	listener, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	grpcServer := grpc.NewServer()
+	pb.RegisterDistributionServer(grpcServer, server)
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- grpcServer.Serve(listener) }()
+	t.Cleanup(func() {
+		grpcServer.Stop()
+		_ = listener.Close()
+		err := <-serveErr
+		if err != nil {
+			require.ErrorIs(t, err, grpc.ErrServerStopped)
+		}
+	})
+	return listener.Addr().String()
 }
 
 func TestNewDistributionServer_DefaultCatalogReloadRetryPolicy(t *testing.T) {
@@ -700,6 +943,54 @@ func TestDistributionServerSplitRange_UsesCoordinatorForCatalogWrites(t *testing
 	require.Equal(t, coordinator.lastCommitTS, changes.Deltas[0].Mutations[2].Route.SplitAtHLC)
 }
 
+func TestDistributionServerSplitRange_PhaseDReadsAtValidatedAppliedWatermark(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	baseStore := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(baseStore)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{
+			RouteID: 1,
+			Start:   []byte(""),
+			End:     []byte("m"),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		},
+		{
+			RouteID: 2,
+			Start:   []byte("m"),
+			End:     nil,
+			GroupID: 2,
+			State:   distribution.RouteStateActive,
+		},
+	})
+	require.NoError(t, err)
+	legacyFloor := catalog.LatestCommitTS()
+	allocator := &distributionTSOAllocator{
+		base:        legacyFloor + 100,
+		leader:      true,
+		phaseD:      true,
+		phaseDFloor: legacyFloor,
+	}
+	coordinator := newDistributionCoordinatorStub(baseStore, true)
+	coordinator.allocator = allocator
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		catalog,
+		WithDistributionCoordinator(coordinator),
+	)
+
+	_, err = s.SplitRange(ctx, &pb.SplitRangeRequest{
+		ExpectedCatalogVersion: saved.Version,
+		RouteId:                1,
+		SplitKey:               []byte("g"),
+	})
+	require.NoError(t, err)
+	require.Equal(t, legacyFloor, coordinator.lastStartTS)
+	require.Equal(t, 1, coordinator.vouchCalls)
+}
+
 func TestDistributionServerSplitRange_UsesPersistentNextRouteID(t *testing.T) {
 	t.Parallel()
 
@@ -1018,6 +1309,7 @@ func seededDistributionServerWithoutCoordinator(t *testing.T) (*DistributionServ
 
 type distributionCoordinatorStub struct {
 	store                 store.MVCCStore
+	allocator             kv.TimestampAllocator
 	leader                bool
 	clock                 *kv.HLC
 	nextTS                uint64
@@ -1030,6 +1322,19 @@ type distributionCoordinatorStub struct {
 	asyncApplyDone        chan error
 	asyncApplyDelay       time.Duration
 	dispatchCalls         int
+	vouchCalls            int
+	// dispatchErr, when set, fails every Dispatch so callers' retry and
+	// error-propagation paths can be exercised.
+	dispatchErr error
+}
+
+func (s *distributionCoordinatorStub) TimestampAllocator() kv.TimestampAllocator {
+	return s.allocator
+}
+
+func (s *distributionCoordinatorStub) VouchAppliedReadTimestamp(uint64, kv.AppliedReadTimestampVoucherRef) error {
+	s.vouchCalls++
+	return nil
 }
 
 func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributionCoordinatorStub {
@@ -1043,6 +1348,10 @@ func newDistributionCoordinatorStub(st store.MVCCStore, leader bool) *distributi
 func (s *distributionCoordinatorStub) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if err := s.validateDispatch(reqs); err != nil {
 		return nil, err
+	}
+	if s.dispatchErr != nil {
+		s.dispatchCalls++
+		return nil, s.dispatchErr
 	}
 	s.dispatchCalls++
 	s.lastRequestedCommitTS = reqs.CommitTS
@@ -1243,10 +1552,258 @@ func (s *distributionCoordinatorStub) LeaseReadForKey(ctx context.Context, _ []b
 	return s.LinearizableRead(ctx)
 }
 
+type distributionTSOAllocator struct {
+	base           uint64
+	previousFloor  uint64
+	count          int
+	min            uint64
+	err            error
+	leader         bool
+	activate       bool
+	activatePhaseD bool
+	cutover        bool
+	phaseD         bool
+	phaseDFloor    uint64
+}
+
+type batchOnlyDistributionTSOAllocator struct {
+	delegate *distributionTSOAllocator
+}
+
+func (a *batchOnlyDistributionTSOAllocator) Next(ctx context.Context) (uint64, error) {
+	return a.delegate.Next(ctx)
+}
+
+func (a *batchOnlyDistributionTSOAllocator) NextBatch(ctx context.Context, n int) (uint64, error) {
+	return a.delegate.NextBatch(ctx, n)
+}
+
+func (a *batchOnlyDistributionTSOAllocator) IsLeader() bool {
+	return a.delegate.IsLeader()
+}
+
+func (a *batchOnlyDistributionTSOAllocator) RunLeaseRenewal(ctx context.Context) {
+	a.delegate.RunLeaseRenewal(ctx)
+}
+
+func (a *distributionTSOAllocator) Next(ctx context.Context) (uint64, error) {
+	return a.NextBatch(ctx, 1)
+}
+
+func (a *distributionTSOAllocator) NextBatch(_ context.Context, n int) (uint64, error) {
+	a.count = n
+	if a.err != nil {
+		return 0, a.err
+	}
+	return a.base, nil
+}
+
+func (a *distributionTSOAllocator) NextBatchAfter(_ context.Context, n int, min uint64) (uint64, error) {
+	a.count = n
+	a.min = min
+	if a.err != nil {
+		return 0, a.err
+	}
+	return a.base, nil
+}
+
+func (a *distributionTSOAllocator) ReserveBatchAfter(
+	_ context.Context,
+	n int,
+	min uint64,
+	activate bool,
+	activatePhaseD bool,
+) (kv.TSOReservation, error) {
+	a.count = n
+	a.min = min
+	a.activate = activate
+	a.activatePhaseD = activatePhaseD
+	if a.err != nil {
+		return kv.TSOReservation{}, a.err
+	}
+	if activate {
+		a.cutover = true
+	}
+	if activatePhaseD {
+		a.phaseD = true
+		a.phaseDFloor = a.previousFloor
+	}
+	return kv.TSOReservation{
+		Base:                    a.base,
+		Count:                   n,
+		PreviousAllocationFloor: a.previousFloor,
+		CutoverActive:           a.cutover,
+		PhaseDActive:            a.phaseD,
+		PhaseDFloor:             a.phaseDFloor,
+	}, nil
+}
+
+func (a *distributionTSOAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	if a.err != nil {
+		return a.err
+	}
+	if !a.phaseD || timestamp == 0 || timestamp > a.base {
+		return kv.ErrTSOTimestampInvalid
+	}
+	if timestamp <= a.phaseDFloor {
+		return stderrors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
+	}
+	return nil
+}
+
+func (a *distributionTSOAllocator) PhaseDFloor() uint64 { return a.phaseDFloor }
+
+func (a *distributionTSOAllocator) AllocationFloor() uint64 { return a.base }
+
+func (a *distributionTSOAllocator) CutoverActive() bool { return a.cutover }
+
+func (a *distributionTSOAllocator) PhaseDActive() bool { return a.phaseD }
+
+func (a *distributionTSOAllocator) PhaseDRequired() bool { return a.phaseD }
+
+func (a *distributionTSOAllocator) IsLeader() bool { return a.leader }
+
+func (a *distributionTSOAllocator) RunLeaseRenewal(ctx context.Context) {
+	<-ctx.Done()
+}
+
+type distributionLeaderView struct {
+	addr string
+}
+
+func (distributionLeaderView) State() raftengine.State { return raftengine.StateFollower }
+
+func (v distributionLeaderView) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "leader", Address: v.addr}
+}
+
+func (distributionLeaderView) VerifyLeader(context.Context) error {
+	return raftengine.ErrNotLeader
+}
+
+func (distributionLeaderView) LinearizableRead(context.Context) (uint64, error) {
+	return 0, raftengine.ErrNotLeader
+}
+
 type recordingDistributionFilesystemObserver struct {
 	reasons []string
 }
 
 func (o *recordingDistributionFilesystemObserver) ObserveFilePinnedHotspot(reason string) {
 	o.reasons = append(o.reasons, reason)
+}
+
+// GetTimestamp's activate_cutover / activate_phase_d booleans commit one-way
+// markers, and Distribution sits on the shared Raft gRPC server with no
+// bearer-token interceptor of its own. Trusting the wire fields alone would let
+// any caller that reaches the port drive the group-0 leader through the staged
+// rollout.
+func TestDistributionServerGetTimestamp_AuthorizesActivationLocally(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true}
+	var seen [][2]bool
+	refuse := errors.New("local rollout does not permit this activation")
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(cutover, phaseD bool) error {
+			seen = append(seen, [2]bool{cutover, phaseD})
+			return refuse
+		}),
+	)
+
+	_, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Equal(t, [][2]bool{{true, false}}, seen)
+
+	// A request that activates nothing is not gated at all.
+	seen = nil
+	_, err = s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{Count: 1})
+	require.NoError(t, err)
+	require.Empty(t, seen, "the gate is only consulted for activation requests")
+}
+
+// With the gate satisfied the activation proceeds as before.
+func TestDistributionServerGetTimestamp_PermittedActivationProceeds(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true}
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(bool, bool) error { return nil }),
+	)
+
+	resp, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+		ActivatePhaseD:  true,
+	})
+	require.NoError(t, err)
+	require.NotZero(t, resp.GetTimestamp())
+}
+
+// A marker another leader already committed is not an activation request. This
+// node's mode file can still name the preceding stage until its next reload, and
+// refusing would answer every reservation with PermissionDenied -- which
+// isTransientTSORouteError does not retry -- stalling allocation and writes
+// cluster-wide until the local configuration caught up.
+func TestDistributionServerGetTimestamp_AlreadyDurableMarkerSkipsTheGate(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true, cutover: true, phaseD: true}
+	var calls int
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(bool, bool) error {
+			calls++
+			return errors.New("local rollout has not reached this stage yet")
+		}),
+	)
+
+	resp, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+		ActivatePhaseD:  true,
+	})
+	require.NoError(t, err)
+	require.NotZero(t, resp.GetTimestamp())
+	require.Zero(t, calls, "both markers are already durable, so nothing is being activated")
+}
+
+// A marker that is not durable yet is still gated, and only the pending half is
+// presented to the gate.
+func TestDistributionServerGetTimestamp_GatesOnlyThePendingMarker(t *testing.T) {
+	t.Parallel()
+
+	alloc := &distributionTSOAllocator{base: 701, leader: true, cutover: true}
+	var seen [][2]bool
+	s := NewDistributionServer(
+		distribution.NewEngine(),
+		nil,
+		WithDistributionTimestampAllocator(alloc),
+		WithDistributionTSOActivationGate(func(cutover, phaseD bool) error {
+			seen = append(seen, [2]bool{cutover, phaseD})
+			return errors.New("local rollout has not reached phase d")
+		}),
+	)
+
+	_, err := s.GetTimestamp(context.Background(), &pb.GetTimestampRequest{
+		Count:           1,
+		ActivateCutover: true,
+		ActivatePhaseD:  true,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.PermissionDenied, status.Code(err))
+	require.Equal(t, [][2]bool{{false, true}}, seen,
+		"cutover is already durable; only phase D is still an activation")
 }

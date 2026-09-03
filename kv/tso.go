@@ -11,11 +11,19 @@ import (
 
 const defaultTSOLeaderPollInterval = 25 * time.Millisecond
 
+// MaxTSOBatchSize is the largest consecutive timestamp window accepted by a
+// TSO allocator or the Distribution.GetTimestamp RPC.
+const MaxTSOBatchSize = maxHLCBatchSize
+
 var (
-	ErrTSOAllocatorRequired = errors.New("tso: allocator is required")
-	ErrTSOCoordinatorNil    = errors.New("tso: coordinator is required")
-	ErrTSOClockNil          = errors.New("tso: coordinator clock is nil")
-	ErrInvalidTSOBatchSize  = errors.New("tso: invalid batch size")
+	ErrTSOAllocatorRequired  = errors.New("tso: allocator is required")
+	ErrTSOCoordinatorNil     = errors.New("tso: coordinator is required")
+	ErrTSOClockNil           = errors.New("tso: coordinator clock is nil")
+	ErrInvalidTSOBatchSize   = errors.New("tso: invalid batch size")
+	ErrTSOPhaseDInactive     = errors.New("tso: phase D is not active")
+	ErrTSOTimestampInvalid   = errors.New("tso: timestamp is not a durable phase-D allocation")
+	ErrTSOTimestampPrePhaseD = errors.New("tso: timestamp predates phase D")
+	ErrTSOReadVoucherLimit   = errors.New("tso: applied read timestamp voucher limit reached")
 
 	errHLCLeaseRecoveryUnavailable = errors.New("hlc lease recovery unavailable")
 	errHLCLeaseRecoveryBlocked     = errors.New("hlc lease recovery blocked")
@@ -37,8 +45,170 @@ type TimestampAllocator interface {
 	Next(ctx context.Context) (uint64, error)
 }
 
+// TimestampAllocatorProvider lets coordinator decorators preserve access to
+// the configured allocator without making the decorator itself an allocator.
+type TimestampAllocatorProvider interface {
+	TimestampAllocator() TimestampAllocator
+}
+
+// ConfiguredTimestampAllocatorProvider lets coordinator decorators expose the
+// configured allocator without resolving runtime-mode wrappers. Long-lived
+// services use this to keep a DynamicTimestampAllocator reference while the
+// active mode is still legacy.
+type ConfiguredTimestampAllocatorProvider interface {
+	ConfiguredTimestampAllocator() TimestampAllocator
+}
+
 type TimestampAfterAllocator interface {
 	NextAfter(ctx context.Context, min uint64) (uint64, error)
+}
+
+// DurableTimestampValidator verifies that a timestamp belongs to the durable
+// post-Phase-D allocation range owned by the dedicated TSO group.
+type DurableTimestampValidator interface {
+	ValidateDurableTimestamp(context.Context, uint64) error
+}
+
+// TSOPhaseDState exposes the one-way Phase-D state to coordinators and adapter
+// migration helpers without coupling them to TSOStateMachine.
+type TSOPhaseDState interface {
+	PhaseDActive() bool
+	PhaseDRequired() bool
+}
+
+// AppliedReadTimestampVoucher records an adapter-provided applied watermark.
+// It is a process-local capability used only to distinguish audited adapter
+// snapshots from arbitrary caller-supplied StartTS values during Phase D.
+type AppliedReadTimestampVoucher interface {
+	VouchAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef) error
+}
+
+// AppliedReadTimestampVoucherRevoker removes an unused voucher registration.
+// Decorators that forward VouchAppliedReadTimestamp should forward revocation
+// too so pre-dispatch gates cannot leak inner-coordinator voucher entries.
+type AppliedReadTimestampVoucherRevoker interface {
+	RevokeAppliedReadTimestamp(uint64, AppliedReadTimestampVoucherRef)
+}
+
+// AppliedReadTimestampVoucherSupport lets coordinator decorators expose whether
+// the inner coordinator can actually consume prepared vouchers.
+type AppliedReadTimestampVoucherSupport interface {
+	SupportsAppliedReadTimestampVoucher() bool
+}
+
+// AppliedReadTimestampVoucherRef is an opaque process-local dispatch
+// capability. Only this package can mint a non-zero ref.
+type AppliedReadTimestampVoucherRef struct {
+	id uint64
+}
+
+// ReadTimestamp is the adapter-side result of beginning a transaction snapshot.
+// When it represents an applied pre-Phase-D watermark, it also carries a
+// process-local capability. The ReadTimestamp is intentionally reusable by
+// adapter helpers that perform several writes against the same audited read
+// boundary: each DispatchWithReadTimestamp call mints a distinct one-use
+// coordinator voucher, and unused prepared vouchers are revoked after that
+// dispatch attempt. The capability cannot be constructed outside this package
+// because both the timestamp and voucher state are private.
+type ReadTimestamp struct {
+	timestamp uint64
+	voucher   *appliedReadDispatchVoucher
+}
+
+func (t ReadTimestamp) Timestamp() uint64 {
+	return t.timestamp
+}
+
+func (t ReadTimestamp) voucherRef() (AppliedReadTimestampVoucherRef, bool) {
+	if t.voucher == nil || t.voucher.ref.id == 0 {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	return t.voucher.ref, true
+}
+
+var nextAppliedReadDispatchVoucherID atomic.Uint64
+
+type appliedReadDispatchVoucher struct {
+	ref AppliedReadTimestampVoucherRef
+}
+
+type appliedReadDispatchVoucherContextKey struct{}
+
+// WithDispatchVoucher binds this read timestamp's process-local capability to
+// ctx. A timestamp without a voucher is still bound so it shadows any parent
+// capability instead of accidentally inheriting authority for an older read.
+func (t ReadTimestamp) WithDispatchVoucher(ctx context.Context) context.Context {
+	return context.WithValue(nonNilTSOContext(ctx), appliedReadDispatchVoucherContextKey{}, t)
+}
+
+func appliedReadTimestampVoucherRefFromContext(ctx context.Context, timestamp uint64) (AppliedReadTimestampVoucherRef, bool) {
+	if ctx == nil {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	readTimestamp, ok := ctx.Value(appliedReadDispatchVoucherContextKey{}).(ReadTimestamp)
+	if !ok || readTimestamp.timestamp != timestamp {
+		return AppliedReadTimestampVoucherRef{}, false
+	}
+	return readTimestamp.voucherRef()
+}
+
+// DispatchWithReadTimestamp dispatches an OCC operation under the reusable
+// applied-read capability bound by ReadTimestamp.WithDispatchVoucher. Each call
+// reserves one distinct token tied to that bound capability immediately before
+// dispatching, so a same-valued StartTS from another request cannot consume it
+// and overlapping dispatches cannot revoke each other's authorization.
+func DispatchWithReadTimestamp(
+	ctx context.Context,
+	coord Coordinator,
+	reqs *OperationGroup[OP],
+) (*CoordinateResponse, error) {
+	if ctx == nil {
+		resp, err := coord.Dispatch(ctx, reqs)
+		return resp, errors.WithStack(err)
+	}
+	readTimestamp, ok := ctx.Value(appliedReadDispatchVoucherContextKey{}).(ReadTimestamp)
+	if !ok || readTimestamp.voucher == nil {
+		resp, err := coord.Dispatch(ctx, reqs)
+		return resp, errors.WithStack(err)
+	}
+	if reqs == nil || reqs.StartTS != readTimestamp.timestamp {
+		return nil, errors.WithStack(ErrTSOTimestampInvalid)
+	}
+	preparedReadTimestamp, revoke, err := readTimestamp.voucher.prepare(coord, readTimestamp.timestamp)
+	if err != nil {
+		return nil, err
+	}
+	defer revoke()
+	dispatchCtx := preparedReadTimestamp.WithDispatchVoucher(ctx)
+	resp, err := coord.Dispatch(dispatchCtx, reqs)
+	return resp, errors.WithStack(err)
+}
+
+func newAppliedReadDispatchVoucher() *appliedReadDispatchVoucher {
+	id := nextAppliedReadDispatchVoucherID.Add(1)
+	if id == 0 {
+		id = nextAppliedReadDispatchVoucherID.Add(1)
+	}
+	return &appliedReadDispatchVoucher{ref: AppliedReadTimestampVoucherRef{id: id}}
+}
+
+func (v *appliedReadDispatchVoucher) prepare(coord Coordinator, timestamp uint64) (ReadTimestamp, func(), error) {
+	voucher, ok := coord.(AppliedReadTimestampVoucher)
+	if !ok {
+		return ReadTimestamp{}, nil, errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	preparedVoucher := newAppliedReadDispatchVoucher()
+	if err := voucher.VouchAppliedReadTimestamp(timestamp, preparedVoucher.ref); err != nil {
+		return ReadTimestamp{}, nil, errors.WithStack(err)
+	}
+	revoke := func() {}
+	if revoker, ok := coord.(AppliedReadTimestampVoucherRevoker); ok {
+		ref := preparedVoucher.ref
+		revoke = func() {
+			revoker.RevokeAppliedReadTimestamp(timestamp, ref)
+		}
+	}
+	return ReadTimestamp{timestamp: timestamp, voucher: preparedVoucher}, revoke, nil
 }
 
 type tsoBatchAfterAllocator interface {
@@ -95,22 +265,277 @@ func NextTimestampAfterThrough(ctx context.Context, coord Coordinator, startTS u
 	return nextTimestampAfterObserved(ctx, coord, clock, startTS, label)
 }
 
-func coordinatorTimestampAllocator(coord Coordinator) (TimestampAllocator, bool) {
+// TimestampAllocatorThrough returns the currently active allocator behind a
+// coordinator or coordinator decorator. A runtime allocator in legacy mode is
+// intentionally hidden so normal write paths use the coordinator HLC fallback.
+func TimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
+	if provider, ok := coord.(TimestampAllocatorProvider); ok {
+		return resolveTimestampAllocator(provider.TimestampAllocator())
+	}
 	switch c := coord.(type) {
 	case *Coordinate:
-		if c != nil && c.tsAllocator != nil {
-			return c.tsAllocator, true
+		if c != nil {
+			return resolveTimestampAllocator(c.tsAllocator)
 		}
 		return nil, false
 	case *ShardedCoordinator:
-		if c != nil && c.tsAllocator != nil {
-			return c.tsAllocator, true
+		if c != nil {
+			return resolveTimestampAllocator(c.tsAllocator)
 		}
 		return nil, false
 	default:
 		alloc, ok := coord.(TimestampAllocator)
+		if !ok {
+			return nil, false
+		}
+		return resolveTimestampAllocator(alloc)
+	}
+}
+
+// ConfiguredTimestampAllocatorThrough returns the configured allocator without
+// resolving runtime-mode decorators. It is used by long-lived internal servers
+// that must keep a DynamicTimestampAllocator reference across later mode-file
+// reloads while still falling back to HLC when that allocator reports legacy.
+// ValidateDurablePersistenceTimestamp checks a caller-supplied persistence
+// timestamp against the Phase-D durable contract.
+//
+// It exists for receiver paths that accept a timestamp somebody else stamped --
+// Internal.Forward preserves a nonzero raw Request.Ts and an already-set
+// transaction-meta CommitTS rather than allocating one -- and that therefore
+// never reach ShardedCoordinator.prepareTxnCommitTimestamp, where the
+// coordinator validates the timestamps it is handed. Without this a forwarding
+// peer or a direct caller could persist AllocationFloor()+1 before group 0
+// allocates it, and the TSO would later issue the same value.
+//
+// A zero timestamp means "unset"; the caller allocates one and that path is
+// already validated. When Phase D is not in force this is a no-op.
+func ValidateDurablePersistenceTimestamp(ctx context.Context, alloc TimestampAllocator, timestamp uint64, label string) error {
+	if alloc == nil || timestamp == 0 {
+		return nil
+	}
+	validator, _, required, err := phaseDTimestampValidator(alloc)
+	if err != nil {
+		return errors.Wrap(err, label)
+	}
+	if !required {
+		return nil
+	}
+	if err := validator.ValidateDurableTimestamp(nonNilTSOContext(ctx), timestamp); err != nil {
+		return errors.Wrap(err, label)
+	}
+	return nil
+}
+
+// ValidateForwardedTxnCommitTimestamp validates the commit timestamp of a
+// forwarded transaction whose caller already stamped it.
+//
+// It is ValidateDurablePersistenceTimestamp with one carve-out: a commit
+// timestamp that predates Phase D is accepted when the transaction's own start
+// timestamp predates Phase D too.
+//
+// That case is a legacy transaction still being resolved. A cross-shard
+// transaction that began before the Phase-D marker can have unresolved intents
+// when the marker applies, and resolving them replays the commit timestamp the
+// primary already recorded (LockResolver.resolveExpiredLock ->
+// applyTxnResolution). On a follower that replay travels through
+// Internal.Forward, so rejecting it would leave the transaction partially
+// resolved with its secondary keys locked, and the rollout does not require
+// draining transactions before activating Phase D.
+//
+// The carve-out cannot be used to claim a timestamp group 0 has not issued yet,
+// which is what the check exists to prevent: both values sit at or below the
+// Phase-D floor, and group 0 only ever issues above it. A timestamp beyond the
+// allocation floor fails with a plain ErrTSOTimestampInvalid and is still
+// rejected here.
+func ValidateForwardedTxnCommitTimestamp(
+	ctx context.Context,
+	alloc TimestampAllocator,
+	startTS uint64,
+	commitTS uint64,
+	resolution bool,
+	label string,
+) error {
+	err := ValidateDurablePersistenceTimestamp(ctx, alloc, commitTS, label)
+	if err == nil || !errors.Is(err, ErrTSOTimestampPrePhaseD) {
+		return err
+	}
+	// The carve-out is for replaying a commit timestamp the primary already
+	// recorded, which only a COMMIT or ABORT resolution does. A one-phase
+	// transaction (Phase_NONE) carries a commit timestamp it chose itself and
+	// has no recorded intent behind it, so it gets no exemption.
+	if !resolution || startTS == 0 {
+		return err
+	}
+	startErr := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
+	if startErr != nil && errors.Is(startErr, ErrTSOTimestampPrePhaseD) {
+		return nil
+	}
+	return err
+}
+
+// ValidateForwardedTxnStartTimestamp validates a start timestamp a forwarded
+// transaction arrived with.
+//
+// Internal.Forward keeps a nonzero Request.Ts rather than allocating one, and a
+// PREPARE carries no transaction meta, so the commit-timestamp check never sees
+// it -- yet handlePrepareRequest persists the intent at that value. A caller
+// could otherwise submit AllocationFloor()+1, persist state at a timestamp
+// group 0 has not issued, and let the TSO issue the same value later.
+//
+// A start timestamp that predates Phase D is allowed: a transaction that began
+// before the marker is still entitled to prepare and resolve its intents, and
+// group 0 only ever issues above the floor, so nothing it issues can collide.
+func ValidateForwardedTxnStartTimestamp(
+	ctx context.Context,
+	alloc TimestampAllocator,
+	startTS uint64,
+	label string,
+) error {
+	err := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
+	if err == nil || errors.Is(err, ErrTSOTimestampPrePhaseD) {
+		return nil
+	}
+	return err
+}
+
+func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
+	if provider, ok := coord.(ConfiguredTimestampAllocatorProvider); ok {
+		alloc := provider.ConfiguredTimestampAllocator()
+		return alloc, alloc != nil
+	}
+	if provider, ok := coord.(TimestampAllocatorProvider); ok {
+		alloc := provider.TimestampAllocator()
+		return alloc, alloc != nil
+	}
+	switch c := coord.(type) {
+	case *Coordinate:
+		if c == nil || c.tsAllocator == nil {
+			return nil, false
+		}
+		return c.tsAllocator, true
+	case *ShardedCoordinator:
+		if c == nil || c.tsAllocator == nil {
+			return nil, false
+		}
+		return c.tsAllocator, true
+	default:
+		alloc, ok := coord.(TimestampAllocator)
 		return alloc, ok
 	}
+}
+
+type currentTimestampAllocatorProvider interface {
+	currentTimestampAllocator() TimestampAllocator
+}
+
+func resolveTimestampAllocator(alloc TimestampAllocator) (TimestampAllocator, bool) {
+	for range 4 {
+		provider, ok := alloc.(currentTimestampAllocatorProvider)
+		if !ok {
+			return alloc, alloc != nil
+		}
+		alloc = provider.currentTimestampAllocator()
+	}
+	return alloc, alloc != nil
+}
+
+func coordinatorTimestampAllocator(coord Coordinator) (TimestampAllocator, bool) {
+	return TimestampAllocatorThrough(coord)
+}
+
+// BeginReadTimestampThrough preserves the caller's applied-snapshot watermark.
+// Once Phase D is requested, this boundary activates it before validation. An
+// applied pre-D watermark receives a bounded one-use coordinator voucher;
+// arbitrary caller timestamps remain subject to group-0 numeric validation.
+// The returned timestamp must be used for every read and OperationGroup.StartTS.
+func BeginReadTimestampThrough(
+	ctx context.Context,
+	coord Coordinator,
+	legacyTimestamp uint64,
+	label string,
+) (ReadTimestamp, error) {
+	alloc, ok := coordinatorTimestampAllocator(coord)
+	if !ok {
+		return ReadTimestamp{timestamp: legacyTimestamp}, nil
+	}
+	validator, phaseD, phaseDRequired, err := phaseDTimestampValidator(alloc)
+	if err != nil {
+		return ReadTimestamp{}, errors.Wrap(err, label)
+	}
+	if !phaseDRequired {
+		return ReadTimestamp{timestamp: legacyTimestamp}, nil
+	}
+	if legacyTimestamp == 0 || legacyTimestamp == ^uint64(0) {
+		return ReadTimestamp{}, errors.Wrap(ErrTSOTimestampInvalid, label)
+	}
+	if err := activatePhaseDForRead(ctx, alloc, phaseD, label); err != nil {
+		return ReadTimestamp{}, err
+	}
+	vouched, err := validateAppliedReadTimestamp(ctx, coord, validator, legacyTimestamp, label)
+	if err != nil {
+		return ReadTimestamp{}, err
+	}
+	readTimestamp := ReadTimestamp{timestamp: legacyTimestamp}
+	if vouched {
+		readTimestamp.voucher = newAppliedReadDispatchVoucher()
+	}
+	return readTimestamp, nil
+}
+
+func activatePhaseDForRead(
+	ctx context.Context,
+	alloc TimestampAllocator,
+	phaseD TSOPhaseDState,
+	label string,
+) error {
+	if phaseD.PhaseDActive() {
+		return nil
+	}
+	// Reserve and discard one post-D timestamp to commit the marker. The
+	// caller's applied watermark remains the read snapshot; using this fresh
+	// allocation for reads could run ahead of data-group apply.
+	_, err := nextTimestampFromAllocator(nonNilTSOContext(ctx), alloc, label+": activate phase D")
+	return err
+}
+
+func validateAppliedReadTimestamp(
+	ctx context.Context,
+	coord Coordinator,
+	validator DurableTimestampValidator,
+	timestamp uint64,
+	label string,
+) (bool, error) {
+	err := validator.ValidateDurableTimestamp(nonNilTSOContext(ctx), timestamp)
+	if err == nil {
+		return false, nil
+	}
+	if !errors.Is(err, ErrTSOTimestampPrePhaseD) {
+		return false, errors.Wrap(err, label)
+	}
+	if !supportsAppliedReadTimestampVoucher(coord) {
+		return false, errors.Wrap(ErrTSOProtocolUnsupported, label+": applied read voucher unavailable")
+	}
+	return true, nil
+}
+
+func supportsAppliedReadTimestampVoucher(coord Coordinator) bool {
+	if support, ok := coord.(AppliedReadTimestampVoucherSupport); ok {
+		return support.SupportsAppliedReadTimestampVoucher()
+	}
+	_, ok := coord.(AppliedReadTimestampVoucher)
+	return ok
+}
+
+func phaseDTimestampValidator(alloc TimestampAllocator) (DurableTimestampValidator, TSOPhaseDState, bool, error) {
+	phaseD, ok := alloc.(TSOPhaseDState)
+	if !ok || (!phaseD.PhaseDRequired() && !phaseD.PhaseDActive()) {
+		return nil, nil, false, nil
+	}
+	validator, ok := alloc.(DurableTimestampValidator)
+	if !ok {
+		return nil, phaseD, false, ErrTSOProtocolUnsupported
+	}
+	return validator, phaseD, true, nil
 }
 
 func nextTimestampFromAllocator(ctx context.Context, alloc TimestampAllocator, label string) (uint64, error) {
@@ -292,8 +717,8 @@ func (a *LocalTSOAllocator) NextBatchAfter(ctx context.Context, n int, min uint6
 }
 
 func (a *LocalTSOAllocator) nextBatchAfter(ctx context.Context, n int, min uint64) (uint64, error) {
-	if n <= 0 {
-		return 0, errors.WithStack(ErrInvalidTSOBatchSize)
+	if err := validateTSOMinimumWindow(min, n); err != nil {
+		return 0, err
 	}
 	if err := a.waitLeader(ctx); err != nil {
 		return 0, err
@@ -360,10 +785,11 @@ type windowSnapshot struct {
 // TSOAllocator. The hot path is lock-free: callers claim a slot with atomic Add
 // on the currently published window.
 type BatchAllocator struct {
-	tso       TSOAllocator
-	batchSize int
-	win       atomic.Pointer[windowSnapshot]
-	epoch     atomic.Uint64
+	tso        TSOAllocator
+	batchSize  int
+	win        atomic.Pointer[windowSnapshot]
+	epoch      atomic.Uint64
+	phaseDSeen atomic.Bool
 
 	mu         sync.Mutex
 	refillDone chan struct{}
@@ -398,18 +824,59 @@ func (b *BatchAllocator) NextAfter(ctx context.Context, min uint64) (uint64, err
 	return b.nextAfter(ctx, min)
 }
 
+func (b *BatchAllocator) ValidateDurableTimestamp(ctx context.Context, timestamp uint64) error {
+	validator, ok := b.tso.(DurableTimestampValidator)
+	if !ok {
+		return errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	return errors.WithStack(validator.ValidateDurableTimestamp(ctx, timestamp))
+}
+
+func (b *BatchAllocator) PhaseDActive() bool {
+	state, ok := b.tso.(TSOPhaseDState)
+	return ok && state.PhaseDActive()
+}
+
+func (b *BatchAllocator) PhaseDRequired() bool {
+	state, ok := b.tso.(TSOPhaseDState)
+	return ok && state.PhaseDRequired()
+}
+
 func (b *BatchAllocator) nextAfter(ctx context.Context, min uint64) (uint64, error) {
 	for {
 		if err := ctxErr(ctx); err != nil {
 			return 0, err
 		}
+		phaseDAtStart, invalidated := b.ensurePhaseDTransition()
+		if invalidated {
+			continue
+		}
 		if ts, ok := b.tryWindowAfter(min); ok {
+			phaseDAfterClaim, invalidated := b.ensurePhaseDTransition()
+			if invalidated || phaseDAfterClaim != phaseDAtStart {
+				continue
+			}
 			return ts, nil
 		}
 		if err := b.refill(ctx, min); err != nil {
 			return 0, err
 		}
 	}
+}
+
+func (b *BatchAllocator) ensurePhaseDTransition() (required, invalidated bool) {
+	if !b.PhaseDRequired() {
+		return false, false
+	}
+	if b.phaseDSeen.Load() {
+		return true, false
+	}
+	// Publish phaseDSeen only after the old epoch is invalidated. Concurrent
+	// callers may invalidate redundantly, but none can observe the transition as
+	// complete while a pre-Phase-D window is still current.
+	b.Invalidate()
+	b.phaseDSeen.CompareAndSwap(false, true)
+	return true, true
 }
 
 func (b *BatchAllocator) tryWindowAfter(min uint64) (uint64, bool) {

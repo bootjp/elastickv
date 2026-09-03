@@ -695,14 +695,15 @@ func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in tra
 
 func (d *DynamoDBServer) runTransactWriteAttempt(
 	ctx context.Context,
-	reqs *kv.OperationGroup[kv.OP],
+	reqs *preparedTransactWriteItemsRequest,
 	generations map[string]uint64,
 	cleanupKeys [][]byte,
 ) (bool, error, error) {
-	if len(reqs.Elems) == 0 {
+	if len(reqs.group.Elems) == 0 {
 		return true, nil, nil
 	}
-	if _, err := d.coordinator.Dispatch(ctx, reqs); err != nil {
+	dispatchCtx := reqs.readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, reqs.group); err != nil {
 		wrapped := errors.WithStack(err)
 		if !isRetryableTransactWriteError(err) {
 			return false, nil, wrapped
@@ -723,7 +724,12 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 	return false, nil, nil
 }
 
-func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*kv.OperationGroup[kv.OP], map[string]uint64, [][]byte, error) {
+type preparedTransactWriteItemsRequest struct {
+	readTimestamp kv.ReadTimestamp
+	group         *kv.OperationGroup[kv.OP]
+}
+
+func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*preparedTransactWriteItemsRequest, map[string]uint64, [][]byte, error) {
 	tableNames, err := collectTransactWriteTableNames(in)
 	if err != nil {
 		return nil, nil, nil, err
@@ -733,7 +739,11 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 			return nil, nil, nil, err
 		}
 	}
-	readTS := d.nextTxnReadTS()
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb transact-write: begin read timestamp")
+	if err != nil {
+		return nil, nil, nil, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	reqs := &kv.OperationGroup[kv.OP]{
 		IsTxn: true,
 		// Keep transaction start aligned with the snapshot used to evaluate
@@ -752,7 +762,10 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 			return nil, nil, nil, err
 		}
 	}
-	return reqs, tableGenerations, cleanup, nil
+	return &preparedTransactWriteItemsRequest{
+		readTimestamp: readTimestamp,
+		group:         reqs,
+	}, tableGenerations, cleanup, nil
 }
 
 // processTransactWriteItem validates and plans a single item within a

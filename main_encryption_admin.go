@@ -79,6 +79,20 @@ type encryptionAdminEngine interface {
 	raftengine.LeaderView
 }
 
+// encryptionAdminWiringForGroup keeps the read-only capability service on the
+// dedicated TSO listener while withholding every mutating proposal path. The
+// TSO FSM has no encryption applier or writer registry, so allowing a mutator
+// to propose there would commit an entry that cannot update dedicated TSO
+// state. The engine remains available as a LeaderView so ResyncSidecar keeps
+// its quorum-confirmed leader-only freshness contract. Data groups retain the
+// normal flag-driven mutator wiring.
+func encryptionAdminWiringForGroup(groupID uint64, enableMutators bool, engine encryptionAdminEngine) (bool, encryptionAdminEngine) {
+	if groupID == dedicatedTSORaftGroupID {
+		return false, engine
+	}
+	return enableMutators, engine
+}
+
 func encryptionAdminWriterRegistry(sidecarPath string, st store.MVCCStore, groupID uint64) (encryption.WriterRegistryStore, error) {
 	if sidecarPath == "" {
 		return nil, nil
@@ -137,20 +151,18 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGro
 // number — Codex r1 P1 on PR #760 caught the original wiring
 // passing the shard id by mistake.
 //
-// Stage 6B-2: the mutator wiring (Proposer + LeaderView) is now
-// gated on the supplied enableMutators boolean, which the caller
-// in main.go computes as (--encryption-enabled AND --kekFile
-// non-empty AND engine non-nil). When enableMutators is false,
-// Proposer + LeaderView stay unwired and EncryptionAdminServer's
-// BootstrapEncryption / RotateDEK / RegisterEncryptionWriter
-// short-circuit at the gRPC boundary with FailedPrecondition —
-// identical to the Stage 5D posture. When enableMutators is
-// true, both options are wired and the mutators reach the §6.3
-// applier through the supplied engine. In multi-group production
-// wiring the supplied engine is the default-group engine for every
-// per-group listener, because writer-registry rows and the sidecar
-// applied-index contract are default-group control-plane state.
-// Callers may append a
+// Stage 6B-2 gates the mutating Proposer on enableMutators, which
+// the caller in main.go computes as (--encryption-enabled AND
+// --kekFile non-empty AND engine non-nil). The LeaderView remains
+// wired whenever an engine is present because read-only recovery
+// RPCs also require quorum-confirmed leader freshness. In multi-group
+// production wiring the supplied engine is the default-group engine
+// for every per-group listener, because writer-registry rows and the
+// sidecar applied-index contract are default-group control-plane state.
+// When enableMutators is false, BootstrapEncryption / RotateDEK /
+// RegisterEncryptionWriter short-circuit at the gRPC boundary with
+// FailedPrecondition. When true, the proposer reaches the §6.3
+// applier through the supplied engine. Callers may append a
 // wrap-aware post-cutover proposer option so non-cutover admin
 // entries wrap after EnableRaftEnvelope while the cutover marker
 // itself remains on the raw engine path.
@@ -171,9 +183,9 @@ func encryptionAdminDefaultRuntimeOptions(runtimes []*raftGroupRuntime, shardGro
 //     practice.
 //
 // Validate() panics on a misconfiguration that wires a proposer
-// without a LeaderView. The wiring below pairs both options
-// together (both wired iff enableMutators) so the invariant
-// holds by construction.
+// without a LeaderView. The wiring below always pairs a mutating
+// proposer with the engine's LeaderView, while permitting a
+// LeaderView-only read surface.
 //
 // sidecarPath controls only the read-only capability surface:
 // when empty, GetCapability reports encryption_capable=false
@@ -187,6 +199,9 @@ func newEncryptionAdminServer(fullNodeID uint64, sidecarPath string, enableMutat
 	if sidecarPath != "" {
 		opts = append(opts, adapter.WithEncryptionAdminSidecarPath(sidecarPath))
 	}
+	if engine != nil {
+		opts = append(opts, adapter.WithEncryptionAdminLeaderView(engine))
+	}
 	if latestAppliedIndex != nil {
 		opts = append(opts, adapter.WithEncryptionAdminLatestAppliedIndex(latestAppliedIndex))
 	}
@@ -199,11 +214,10 @@ func newEncryptionAdminServer(fullNodeID uint64, sidecarPath string, enableMutat
 	if enableMutators && engine != nil {
 		opts = append(opts,
 			adapter.WithEncryptionAdminProposer(engine),
-			adapter.WithEncryptionAdminLeaderView(engine),
 		)
 		// The §4 capability fan-out is only meaningful when the
 		// cutover mutator is reachable (same enableMutators gate as
-		// the Proposer/LeaderView). Without it the cutover RPC
+		// the Proposer). Without it the cutover RPC
 		// refuses with the §4 "fan-out not wired" FailedPrecondition.
 		if capabilityFanout != nil {
 			opts = append(opts, adapter.WithEncryptionAdminCapabilityFanout(capabilityFanout))

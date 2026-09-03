@@ -441,6 +441,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 		pb.TransactionalKV_Get_FullMethodName,
 		pb.Internal_Forward_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
+		pb.Distribution_GetTimestamp_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
 		pb.RaftAdmin_AddLearner_FullMethodName,
@@ -627,20 +628,45 @@ func TestStartupGatedCoordinator_ForwardsTimestampCapabilities(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("recover failed")
 	inner := &stubStartupCoordinator{clock: kv.NewHLC(), recoverErr: sentinel}
+	blocked := true
+	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
+	gate.markReady()
 	coord := startupGatedCoordinator{
 		inner: inner,
-		gate:  &startupPublicKVGate{blockMutator: func() bool { return true }},
+		gate:  gate,
 	}
 
+	assertStartupGatedTimestampBlocked(t, coord)
+	blocked = false
+	assertStartupGatedTimestampForwarding(t, coord, inner, sentinel)
+}
+
+func assertStartupGatedTimestampBlocked(t *testing.T, coord startupGatedCoordinator) {
+	t.Helper()
+	if _, err := coord.Next(context.Background()); status.Code(err) != codes.Unavailable {
+		t.Fatalf("blocked Next() err=%v, want Unavailable", err)
+	}
+	if _, err := coord.NextAfter(context.Background(), 200); status.Code(err) != codes.Unavailable {
+		t.Fatalf("blocked NextAfter() err=%v, want Unavailable", err)
+	}
+}
+
+func assertStartupGatedTimestampForwarding(
+	t *testing.T,
+	coord startupGatedCoordinator,
+	inner *stubStartupCoordinator,
+	recoverErr error,
+) {
+	t.Helper()
 	ts, err := coord.Next(context.Background())
 	if err != nil || ts != 101 {
-		t.Fatalf("Next() = (%d, %v), want (101, nil)", ts, err)
+		t.Fatalf("Next() after unblock = (%d, %v), want (101, nil)", ts, err)
 	}
 	next, err := coord.NextAfter(context.Background(), 200)
 	if err != nil || next != 201 {
-		t.Fatalf("NextAfter() = (%d, %v), want (201, nil)", next, err)
+		t.Fatalf("NextAfter() after unblock = (%d, %v), want (201, nil)", next, err)
 	}
-	if err := coord.RecoverHLCLease(context.Background()); !errors.Is(err, sentinel) {
+	if err := coord.RecoverHLCLease(context.Background()); !errors.Is(err, recoverErr) {
 		t.Fatalf("RecoverHLCLease() err=%v, want sentinel", err)
 	}
 	if got := inner.nextCalls.Load(); got != 1 {
