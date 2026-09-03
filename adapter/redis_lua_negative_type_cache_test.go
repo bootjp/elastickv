@@ -156,17 +156,19 @@ func TestLuaNegativeTypeCache_BoundedSize(t *testing.T) {
 	sc, err := newLuaScriptContext(ctx, nodes[0].redisServer)
 	require.NoError(t, err)
 	defer sc.Close()
+	const cacheLimit = 4
+	sc.negativeTypeLimit = cacheLimit
 
 	// Probe cap+overflow unique missing keys. Each probe is a miss
 	// (redisTypeNone); only the first `cap` should be memoized.
-	const overflow = 50
-	total := maxNegativeTypeCacheEntries + overflow
+	const overflow = 2
+	total := cacheLimit + overflow
 	for i := 0; i < total; i++ {
 		typ, kerr := sc.keyType([]byte(fmt.Sprintf("lua:neg:cap:%d", i)))
 		require.NoError(t, kerr)
 		require.Equal(t, redisTypeNone, typ)
 	}
-	require.Equal(t, maxNegativeTypeCacheEntries, len(sc.negativeType),
+	require.Equal(t, cacheLimit, len(sc.negativeType),
 		"negativeType map must be capped at maxNegativeTypeCacheEntries")
 
 	// Each unique key above required exactly one probe on first access.
@@ -182,11 +184,11 @@ func TestLuaNegativeTypeCache_BoundedSize(t *testing.T) {
 	require.Equal(t, total, sc.keyTypeProbeCount,
 		"a key inserted before the cap must remain cached")
 
-	overflowKey := []byte(fmt.Sprintf("lua:neg:cap:%d", maxNegativeTypeCacheEntries+1))
+	overflowKey := []byte(fmt.Sprintf("lua:neg:cap:%d", cacheLimit+1))
 	_, kerr = sc.keyType(overflowKey)
 	require.NoError(t, kerr)
 	require.Equal(t, total+1, sc.keyTypeProbeCount,
 		"a key probed after the cap was reached must fall back to the server probe")
-	require.Equal(t, maxNegativeTypeCacheEntries, len(sc.negativeType),
+	require.Equal(t, cacheLimit, len(sc.negativeType),
 		"fallback probe must NOT grow the bounded cache")
 }

@@ -125,7 +125,7 @@ func (s *Server) addMember(
 	// Stage 7c pre-registers encryption metadata before proposing membership.
 	// Keep that pre-step and the proposal inside the same serialized region.
 	if s.interceptor != nil {
-		if err := s.interceptor.PreAddMember(ctx, id); err != nil {
+		if err := s.interceptor.PreAddMember(ctx, id, address); err != nil {
 			return nil, adminError(err)
 		}
 	}

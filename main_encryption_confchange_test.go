@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"path/filepath"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -20,21 +23,37 @@ const stubDerivedNodeID uint64 = 0xCAFEF00DDEADBEEF
 
 func stubDeriveNodeID(string) uint64 { return stubDerivedNodeID }
 
-// TestEncryptionPreRegister_PreBootstrapSkips pins design §5.2: when
-// the StateCache reports (0, false) — no active storage DEK, either
-// pre-bootstrap or encryption-disabled — PreAddMember returns nil
-// without proposing or reading the registry.
-func TestEncryptionPreRegister_PreBootstrapSkips(t *testing.T) {
+func allowStorageEnvelopeV2Capability(context.Context, string, uint64) error { return nil }
+
+// TestEncryptionPreRegister_PreBootstrapProbesThenSkipsRegistry pins that
+// pre-bootstrap joins still prove V2 reader support before returning without
+// a registry proposal. This prevents a later sticky V2 latch from racing an
+// incompatible membership addition.
+func TestEncryptionPreRegister_PreBootstrapProbesThenSkipsRegistry(t *testing.T) {
 	t.Parallel()
 	cache := encryption.NewStateCache() // zero-value: ActiveStorageKeyID()=(0,false)
 	st := newRegistrationTestStore(t)
 	defaultGroup := &kv.ShardGroup{Store: st}
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, defaultGroup, cache, "", stubDeriveNodeID)
+	var probedFullNodeID uint64
+	pre := newEncryptionPreRegister(
+		&kv.ShardedCoordinator{},
+		defaultGroup,
+		cache,
+		"",
+		stubDeriveNodeID,
+		func(_ context.Context, _ string, fullNodeID uint64) error {
+			probedFullNodeID = fullNodeID
+			return nil
+		},
+	)
 	if pre == nil {
 		t.Fatal("newEncryptionPreRegister returned nil despite non-nil cache+group")
 	}
-	if err := pre.PreAddMember(context.Background(), "n1"); err != nil {
-		t.Errorf("PreAddMember should skip pre-bootstrap: got %v", err)
+	if err := pre.PreAddMember(context.Background(), "n1", "n1:50051"); err != nil {
+		t.Errorf("PreAddMember should skip registry work pre-bootstrap: got %v", err)
+	}
+	if probedFullNodeID != stubDerivedNodeID {
+		t.Fatalf("capability probe full node id = %d, want %d", probedFullNodeID, stubDerivedNodeID)
 	}
 }
 
@@ -85,9 +104,90 @@ func TestEncryptionPreRegister_IdempotentWhenRowExists(t *testing.T) {
 	sc.Active.Storage = testRegDEKID
 	cache.RefreshFromSidecar(sc)
 
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID)
-	if err := pre.PreAddMember(context.Background(), "raftN"); err != nil {
+	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID, allowStorageEnvelopeV2Capability)
+	if err := pre.PreAddMember(context.Background(), "raftN", "raftN:50051"); err != nil {
 		t.Errorf("PreAddMember should skip when matching row exists: got %v", err)
+	}
+}
+
+func TestEncryptionPreRegister_RejectsMemberWithoutV2Capability(t *testing.T) {
+	t.Parallel()
+	st := newRegistrationTestStore(t)
+	cache := encryption.NewStateCache()
+	sc := &encryption.Sidecar{Version: encryption.SidecarVersion, StorageEnvelopeActive: true}
+	sc.Active.Storage = testRegDEKID
+	cache.RefreshFromSidecar(sc)
+	sentinel := errors.New("old binary")
+	var probedAddress string
+	pre := newEncryptionPreRegister(
+		&kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st},
+		cache,
+		"",
+		stubDeriveNodeID,
+		func(_ context.Context, address string, fullNodeID uint64) error {
+			probedAddress = address
+			if fullNodeID != stubDerivedNodeID {
+				t.Fatalf("capability probe full node id = %d, want %d", fullNodeID, stubDerivedNodeID)
+			}
+			return sentinel
+		},
+	)
+	err := pre.PreAddMember(context.Background(), "old", "old:50051")
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("PreAddMember error = %v, want capability error", err)
+	}
+	if probedAddress != "old:50051" {
+		t.Fatalf("capability probe address = %q, want old:50051", probedAddress)
+	}
+	reg, regErr := store.WriterRegistryFor(st)
+	if regErr != nil {
+		t.Fatalf("WriterRegistryFor: %v", regErr)
+	}
+	if _, ok, regErr := reg.GetRegistryRow(encryption.RegistryKey(testRegDEKID, encryption.NodeID16(stubDerivedNodeID))); regErr != nil || ok {
+		t.Fatalf("registry changed before capability acceptance: present=%t err=%v", ok, regErr)
+	}
+}
+
+func TestProbeStorageEnvelopeV2CapabilityTimesOut(t *testing.T) {
+	t.Parallel()
+	const timeout = 20 * time.Millisecond
+	started := time.Now()
+	err := probeStorageEnvelopeV2CapabilityWithRPC(
+		context.Background(),
+		"unreachable:50051",
+		stubDerivedNodeID,
+		timeout,
+		func(ctx context.Context, _ string) (*pb.CapabilityReport, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	)
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("capability probe error = %v, want deadline exceeded", err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("capability probe elapsed = %v, want bounded return", elapsed)
+	}
+}
+
+func TestProbeStorageEnvelopeV2CapabilityRejectsNodeIDMismatch(t *testing.T) {
+	t.Parallel()
+	err := probeStorageEnvelopeV2CapabilityWithRPC(
+		context.Background(),
+		"other:50051",
+		stubDerivedNodeID,
+		time.Second,
+		func(context.Context, string) (*pb.CapabilityReport, error) {
+			return &pb.CapabilityReport{
+				FullNodeId:               stubDerivedNodeID + 1,
+				EncryptionCapable:        true,
+				StorageEnvelopeV2Capable: true,
+			}, nil
+		},
+	)
+	if !errors.Is(err, errMemberCapabilityIDMismatch) {
+		t.Fatalf("capability probe error = %v, want node id mismatch", err)
 	}
 }
 
@@ -127,8 +227,8 @@ func TestEncryptionPreRegister_Uint16CollisionReturnsTypedError(t *testing.T) {
 	}
 	collidingDerive := func(string) uint64 { return collidingFullNodeID }
 
-	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", collidingDerive)
-	err = pre.PreAddMember(context.Background(), "raftN")
+	pre := newEncryptionPreRegister(&kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", collidingDerive, allowStorageEnvelopeV2Capability)
+	err = pre.PreAddMember(context.Background(), "raftN", "raftN:50051")
 	if !errors.Is(err, encryption.ErrWriterUint16Collision) {
 		t.Errorf("PreAddMember on §6.1 collision: want ErrWriterUint16Collision, got %v", err)
 	}
@@ -226,5 +326,116 @@ func TestProposeWriterRegistrationBlockingOnCutover_LeaderUsesPropose(t *testing
 	}
 	if proposer.proposeAdminCalls != 0 {
 		t.Fatalf("ProposeAdmin calls = %d, want 0", proposer.proposeAdminCalls)
+	}
+}
+
+// A cluster without encryption still has a defaulted StateCache and a default
+// group store, so the interceptor must be gated on encryption actually being
+// configured. Otherwise its V2 capability probe runs on plain deployments and
+// AddVoter/AddLearner fail against nodes that have no sidecar.
+func TestNewEncryptionConfChangeInterceptorGatedOnEncryptionConfigured(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	t.Cleanup(func() { _ = st.Close() })
+	cache := encryption.NewStateCache()
+
+	if got := newEncryptionConfChangeInterceptor(
+		false, &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID,
+		allowStorageEnvelopeV2Capability,
+	); got != nil {
+		t.Fatalf("interceptor = %v, want nil when encryption is not configured", got)
+	}
+
+	if got := newEncryptionConfChangeInterceptor(
+		true, &kv.ShardedCoordinator{}, &kv.ShardGroup{Store: st}, cache, "", stubDeriveNodeID,
+		allowStorageEnvelopeV2Capability,
+	); got == nil {
+		t.Fatal("interceptor = nil, want a pre-register step when encryption is configured")
+	}
+
+	// The nil guards inside newEncryptionPreRegister still apply.
+	if got := newEncryptionConfChangeInterceptor(
+		true, nil, nil, nil, "", nil,
+	); got != nil {
+		t.Fatalf("interceptor = %v, want nil when the dependencies are missing", got)
+	}
+}
+
+func TestEncryptionWriteWiringEncryptionConfigured(t *testing.T) {
+	t.Parallel()
+
+	var off encryptionWriteWiring
+	if off.encryptionConfigured() {
+		t.Fatal("zero wiring reported encryption configured")
+	}
+	// The cache is always populated, so it must not be what decides.
+	defaulted := encryptionWriteWiring{cache: encryption.NewStateCache()}
+	if defaulted.encryptionConfigured() {
+		t.Fatal("a defaulted cache alone reported encryption configured")
+	}
+	on := encryptionWriteWiring{cache: encryption.NewStateCache(), cipher: &encryption.Cipher{}}
+	if !on.encryptionConfigured() {
+		t.Fatal("wiring with a cipher did not report encryption configured")
+	}
+}
+
+// TestProbeStorageEnvelopeV2CapabilityAgainstRealAdminServer drives the
+// membership gate against the production CapabilityReport producer rather
+// than a hand-written stub. Every other probe test in this file builds its
+// own *pb.CapabilityReport, so all of them stayed green while the real
+// adapter.EncryptionAdminServer left storage_envelope_v2_capable at the
+// protobuf default and the gate rejected every AddVoter/AddLearner in an
+// encryption-configured cluster.
+func TestProbeStorageEnvelopeV2CapabilityAgainstRealAdminServer(t *testing.T) {
+	t.Parallel()
+	srv := adapter.NewEncryptionAdminServer(
+		adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+		adapter.WithEncryptionAdminFullNodeID(stubDerivedNodeID),
+	)
+	err := probeStorageEnvelopeV2CapabilityWithRPC(
+		context.Background(),
+		"member:50051",
+		stubDerivedNodeID,
+		time.Second,
+		func(ctx context.Context, _ string) (*pb.CapabilityReport, error) {
+			//nolint:wrapcheck // the production RPC path returns the server error verbatim.
+			return srv.GetCapability(ctx, &pb.Empty{})
+		},
+	)
+	if err != nil {
+		t.Fatalf("capability probe against the real admin server: %v", err)
+	}
+}
+
+// TestEncryptionPreRegisterAcceptsRealAdminServerCapability closes the same
+// loop one layer up: the interceptor's default probe wiring must accept a
+// peer served by the production GetCapability implementation.
+func TestEncryptionPreRegisterAcceptsRealAdminServerCapability(t *testing.T) {
+	t.Parallel()
+	srv := adapter.NewEncryptionAdminServer(
+		adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+		adapter.WithEncryptionAdminFullNodeID(stubDerivedNodeID),
+	)
+	probe := func(ctx context.Context, address string, expected uint64) error {
+		return probeStorageEnvelopeV2CapabilityWithRPC(
+			ctx, address, expected, time.Second,
+			func(ctx context.Context, _ string) (*pb.CapabilityReport, error) {
+				//nolint:wrapcheck // the production RPC path returns the server error verbatim.
+				return srv.GetCapability(ctx, &pb.Empty{})
+			},
+		)
+	}
+	st := newRegistrationTestStore(t)
+	pre := newEncryptionPreRegister(
+		&kv.ShardedCoordinator{},
+		&kv.ShardGroup{Store: st},
+		encryption.NewStateCache(),
+		"",
+		stubDeriveNodeID,
+		probe,
+	)
+	if err := pre.PreAddMember(context.Background(), "raftN", "raftN:50051"); err != nil {
+		t.Fatalf("PreAddMember with a real-server capability probe: %v", err)
 	}
 }

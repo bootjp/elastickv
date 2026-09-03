@@ -12,6 +12,24 @@ import (
 	"google.golang.org/grpc"
 )
 
+func TestCapabilityFanoutResultStorageEnvelopeV2Ready(t *testing.T) {
+	t.Parallel()
+	ready := CapabilityFanoutResult{Verdicts: []CapabilityVerdict{
+		{Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true},
+		{Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true},
+	}}
+	if !ready.StorageEnvelopeV2Ready() {
+		t.Fatal("all-capable fan-out did not enable V2")
+	}
+	ready.Verdicts[1].StorageEnvelopeV2Capable = false
+	if ready.StorageEnvelopeV2Ready() {
+		t.Fatal("old-binary capability omission enabled V2")
+	}
+	if (CapabilityFanoutResult{}).StorageEnvelopeV2Ready() {
+		t.Fatal("empty fan-out enabled V2")
+	}
+}
+
 // stubEncryptionAdminClient is a minimal in-test client that
 // implements only the methods CapabilityFanout actually invokes
 // (GetCapability). Every other method panics so that an accidental
@@ -80,9 +98,9 @@ func (s *stubDial) dial(_ context.Context, addr string) (pb.EncryptionAdminClien
 func TestCapabilityFanout_AllCapable(t *testing.T) {
 	t.Parallel()
 	stub := newStubDial()
-	stub.addOK("n1:9000", &pb.CapabilityReport{FullNodeId: 1, EncryptionCapable: true, SidecarPresent: true, BuildSha: "abc"})
-	stub.addOK("n2:9000", &pb.CapabilityReport{FullNodeId: 2, EncryptionCapable: true, SidecarPresent: true, BuildSha: "abc"})
-	stub.addOK("n3:9000", &pb.CapabilityReport{FullNodeId: 3, EncryptionCapable: true, SidecarPresent: true, BuildSha: "abc"})
+	stub.addOK("n1:9000", &pb.CapabilityReport{FullNodeId: 1, EncryptionCapable: true, StorageEnvelopeV2Capable: true, SidecarPresent: true, BuildSha: "abc"})
+	stub.addOK("n2:9000", &pb.CapabilityReport{FullNodeId: 2, EncryptionCapable: true, StorageEnvelopeV2Capable: true, SidecarPresent: true, BuildSha: "abc"})
+	stub.addOK("n3:9000", &pb.CapabilityReport{FullNodeId: 3, EncryptionCapable: true, StorageEnvelopeV2Capable: true, SidecarPresent: true, BuildSha: "abc"})
 
 	snapshot := RouteSnapshot{Groups: []RouteGroup{{
 		GroupID: 1,
@@ -104,9 +122,32 @@ func TestCapabilityFanout_AllCapable(t *testing.T) {
 		t.Fatalf("expected 3 verdicts, got %d: %+v", len(res.Verdicts), res.Verdicts)
 	}
 	for _, v := range res.Verdicts {
-		if !v.Reachable || !v.EncryptionCapable {
-			t.Errorf("verdict %+v should be Reachable && EncryptionCapable", v)
+		if !v.Reachable || !v.EncryptionCapable || !v.StorageEnvelopeV2Capable {
+			t.Errorf("verdict %+v should carry all advertised capabilities", v)
 		}
+	}
+	if !res.StorageEnvelopeV2Ready() {
+		t.Fatal("all-capable probe results did not enable V2 readiness")
+	}
+}
+
+func TestCapabilityFanout_OldBinaryKeepsV2NotReady(t *testing.T) {
+	t.Parallel()
+	stub := newStubDial()
+	stub.addOK("new:9000", &pb.CapabilityReport{FullNodeId: 1, EncryptionCapable: true, StorageEnvelopeV2Capable: true})
+	stub.addOK("old:9000", &pb.CapabilityReport{FullNodeId: 2, EncryptionCapable: true})
+	res, err := CapabilityFanout(context.Background(), RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters:  []RouteMember{{FullNodeID: 1, Address: "new:9000"}, {FullNodeID: 2, Address: "old:9000"}},
+	}}}, stub.dial, time.Second)
+	if err != nil {
+		t.Fatalf("CapabilityFanout: %v", err)
+	}
+	if !res.OK {
+		t.Fatal("old V1 reader should remain encryption-capable")
+	}
+	if res.StorageEnvelopeV2Ready() {
+		t.Fatal("old binary without the new proto field enabled V2 writes")
 	}
 }
 
@@ -509,5 +550,76 @@ func TestCapabilityFanout_EmptySnapshot(t *testing.T) {
 	}
 	if len(res.Verdicts) != 0 {
 		t.Errorf("expected zero verdicts, got %d", len(res.Verdicts))
+	}
+}
+
+// An unset responder id is a mismatch too. A node with no sidecar answers
+// GetCapability with full_node_id=0 and storage_envelope_v2_capable=true, so
+// exempting zero let an unidentified responder hand its V2 capability to the
+// member the snapshot expected -- exactly the stale-routing / shared-address
+// case the guard above exists to reject.
+func TestCapabilityFanout_ZeroResponderIDFailsClosed(t *testing.T) {
+	t.Parallel()
+	stub := newStubDial()
+	stub.addOK("n2:9000", &pb.CapabilityReport{
+		FullNodeId:               0,
+		EncryptionCapable:        true,
+		SidecarPresent:           true,
+		StorageEnvelopeV2Capable: true,
+	})
+
+	snapshot := RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters:  []RouteMember{{FullNodeID: 2, Address: "n2:9000"}},
+	}}}
+
+	res, err := CapabilityFanout(context.Background(), snapshot, stub.dial, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if res.OK {
+		t.Fatal("expected OK=false when the responder reports no full_node_id")
+	}
+	if len(res.Verdicts) != 1 {
+		t.Fatalf("expected 1 verdict, got %d", len(res.Verdicts))
+	}
+	v := res.Verdicts[0]
+	if v.Reachable {
+		t.Errorf("expected Reachable=false for an unidentified responder, got %+v", v)
+	}
+	if v.Err == nil {
+		t.Error("expected Err to be set for an unidentified responder")
+	}
+	if res.StorageEnvelopeV2Ready() {
+		t.Error("an unidentified responder must not make the cluster look V2-ready")
+	}
+}
+
+// A member the snapshot itself cannot identify still probes normally: the guard
+// only fires when the snapshot knows the expected id.
+func TestCapabilityFanout_UnknownExpectedIDStillProbes(t *testing.T) {
+	t.Parallel()
+	stub := newStubDial()
+	stub.addOK("n3:9000", &pb.CapabilityReport{
+		FullNodeId:               0,
+		EncryptionCapable:        true,
+		SidecarPresent:           true,
+		StorageEnvelopeV2Capable: true,
+	})
+
+	snapshot := RouteSnapshot{Groups: []RouteGroup{{
+		GroupID: 1,
+		Voters:  []RouteMember{{FullNodeID: 0, Address: "n3:9000"}},
+	}}}
+
+	res, err := CapabilityFanout(context.Background(), snapshot, stub.dial, time.Second)
+	if err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	if len(res.Verdicts) != 1 {
+		t.Fatalf("expected 1 verdict, got %d", len(res.Verdicts))
+	}
+	if !res.Verdicts[0].Reachable {
+		t.Errorf("expected Reachable=true when the snapshot has no expected id, got %+v", res.Verdicts[0])
 	}
 }

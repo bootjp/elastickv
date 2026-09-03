@@ -39,6 +39,12 @@ func TestEncryptionAdmin_GetCapability_NoSidecarPath(t *testing.T) {
 	if got.BuildSha != "test-sha" {
 		t.Errorf("BuildSha=%q, want %q", got.BuildSha, "test-sha")
 	}
+	// storage_envelope_v2_capable answers "can this binary read a V2
+	// envelope", which is a build property. Reporting it here is safe
+	// because every consumer ANDs it with encryption_capable.
+	if !got.StorageEnvelopeV2Capable {
+		t.Errorf("StorageEnvelopeV2Capable=false, want true — this binary decodes EnvelopeVersionV2")
+	}
 }
 
 func TestEncryptionAdmin_GetCapability_SidecarMissing(t *testing.T) {
@@ -63,6 +69,12 @@ func TestEncryptionAdmin_GetCapability_SidecarMissing(t *testing.T) {
 	}
 	if got.SidecarPresent {
 		t.Errorf("SidecarPresent=true, want false when sidecar file is missing")
+	}
+	// The §7.1 membership gate (main_encryption_confchange.go) refuses
+	// every AddVoter/AddLearner unless the joining peer reports this,
+	// so a Phase-0 node that omits it cannot be added to the cluster.
+	if !got.StorageEnvelopeV2Capable {
+		t.Errorf("StorageEnvelopeV2Capable=false, want true on a Phase-0 encryption-capable node")
 	}
 }
 

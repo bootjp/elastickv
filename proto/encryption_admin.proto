@@ -67,6 +67,9 @@ message CapabilityReport {
   bool   sidecar_present    = 3;
   uint64 full_node_id       = 4;
   uint32 local_epoch        = 5; // MUST be <= 0xFFFF on the wire.
+  // Old binaries omit this field and therefore decode as false. Writers must
+  // keep emitting V1 envelopes until every voter and learner reports true.
+  bool storage_envelope_v2_capable = 6;
 }
 
 // SidecarStateReport is the §5.5 compaction-fallback RPC. Served on

@@ -215,22 +215,22 @@ var (
 	//
 	// Mutating RPCs (BootstrapEncryption / RotateDEK /
 	// RegisterEncryptionWriter) are gated by Stage 6B-2 on the
-	// AND of --encryption-enabled and --kekFile being non-empty.
+	// AND of --encryption-enabled and a successfully loaded KEK source.
 	// Setting --encryptionSidecarPath ALONE no longer enables
 	// mutators; the operator must explicitly opt in to encryption
 	// AND supply a KEK source. With either gate condition false,
 	// registerEncryptionAdminServer omits the Proposer + LeaderView
 	// options and every mutator short-circuits at the gRPC boundary
 	// with FailedPrecondition before any Raft proposal is created.
-	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs (Bootstrap / RotateDEK / RegisterEncryptionWriter) are additionally gated on this flag being non-empty AND --encryption-enabled AND --kekFile being non-empty (all three required so the applier's WithKEK + WithKeystore + WithSidecarPath options are all wired before mutators can commit).")
+	encryptionSidecarPath = flag.String("encryptionSidecarPath", "", "§5.1 keys.json path; enables read-only EncryptionAdmin capability probing. Mutating RPCs additionally require --encryption-enabled and one loaded KEK source.")
 
 	// Stage 6B-2: cluster-wide encryption opt-in flag. The mutating
 	// EncryptionAdmin RPCs (BootstrapEncryption, RotateDEK,
 	// RegisterEncryptionWriter) become reachable only when this
-	// flag is set AND --kekFile points at a valid KEK source.
+	// flag is set AND exactly one configured KEK source loads successfully.
 	// Default off; pre-Stage-6 clusters and operators who have
 	// not yet committed to encryption are unaffected.
-	encryptionEnabled = flag.Bool("encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires --kekFile to be set; without that, mutators still refuse with FailedPrecondition. Default off.")
+	encryptionEnabled = flag.Bool("encryption-enabled", false, "§6.5 opt-in to encryption-mutating EncryptionAdmin RPCs. Requires exactly one KEK source from --kekFile, --kekUri, or ELASTICKV_KEK_BASE64. Default off.")
 
 	// Stage 6F: operator-requested DEK rotation at boot. The flag is
 	// intentionally a request, not a guarantee: only the leader of the
@@ -239,15 +239,14 @@ var (
 	// leadership during this process uptime.
 	encryptionRotateOnStartup = flag.Bool("encryption-rotate-on-startup", false, "§6.5 request a one-shot DEK rotation after this node becomes leader of the default Raft group. Safe for rolling restarts: followers keep the request in memory and only fire if they acquire leadership during this process uptime.")
 
-	// Stage 6B-2: KEK source. The KEK never appears in elastickv's
+	// KEK sources. The KEK never appears in elastickv's
 	// data dir; it is held externally and exercised only at process
-	// boot and at DEK bootstrap/rotation per §5.1. Stage 6B-2 ships
-	// only the file-backed wrapper (kek.FileWrapper); KMS providers
-	// (--kekUri) land in Stage 9. Empty disables KEK loading; the
+	// boot and at DEK bootstrap/rotation per §5.1. Empty disables KEK loading; the
 	// applier's ApplyBootstrap and ApplyRotation paths then return
 	// ErrKEKNotConfigured at apply time, which is masked at the
 	// RPC boundary by the mutator gate documented above.
 	kekFile = flag.String("kekFile", "", "§5.1 KEK file path (32 raw bytes, owner-only mode). When set, the file-backed kek.Wrapper is constructed at startup and threaded into the §6.3 EncryptionApplier so ApplyBootstrap and ApplyRotation can KEK-unwrap.")
+	kekURI  = flag.String("kekUri", "", "§5.1 remote KEK URI: aws-kms://<key-arn>, gcp-kms://<crypto-key-resource>, or vault-transit://<mount>/<key>. Mutually exclusive with --kekFile and ELASTICKV_KEK_BASE64.")
 
 	// Key visualizer sampler flags. The sampler runs entirely in-memory
 	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
@@ -471,7 +470,7 @@ func run() error {
 	//     visible to every shard's storage cipher.
 	//
 	// Both are nil-safe in the applier path: WithKEK / WithKeystore
-	// are only attached to the applier when --kekFile is non-empty
+	// are only attached to the applier when a KEK source is loaded
 	// (else the applier stays in the Stage 6A posture where
 	// ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured).
 	kekWrapper, err := loadKEKAfterPreNonceStartupGuards(cfg)
@@ -617,7 +616,8 @@ func run() error {
 	// *kv.ShardedCoordinator and *kv.ShardGroup are available. Returns
 	// nil when encryption is not wired (no StateCache or no default
 	// group), in which case raftadmin.Server skips the pre-step.
-	encryptionConfChangeInterceptor := newEncryptionPreRegister(
+	encryptionConfChangeInterceptor := newEncryptionConfChangeInterceptor(
+		encWiring.encryptionConfigured(),
 		coordinate, shardGroups[cfg.defaultGroup], encWiring.cache, *encryptionSidecarPath, etcdraftengine.DeriveNodeID)
 	rotateOnStartupDeregister, waitRotateOnStartup := installEncryptionRotateOnStartup(
 		runCtx,
@@ -643,6 +643,7 @@ func run() error {
 		cleanup:                         &cleanup,
 		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
+		kekConfigured:                   kekWrapper != nil,
 		keyvizSampler:                   sampler,
 		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
@@ -1814,7 +1815,7 @@ func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
 	return loadKEKAndRunStartupGuards()
 }
 
-// loadKEKAndRunStartupGuards loads the file-backed KEK wrapper and
+// loadKEKAndRunStartupGuards loads the configured KEK wrapper and
 // runs the §9.1 startup-refusal guards (Stage 6C-1) BEFORE
 // buildShardGroups constructs any Raft engine or storage state. The
 // two operations are paired in a single helper because the guards
@@ -1843,29 +1844,39 @@ func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
 	}
 	if err := encryption.CheckStartupGuards(encryption.StartupConfig{
 		EncryptionEnabled: *encryptionEnabled,
-		KEKConfigured:     *kekFile != "",
+		KEKConfigured:     kekWrapper != nil,
 		KEK:               kekWrapper,
 		SidecarPath:       *encryptionSidecarPath,
 	}); err != nil {
 		return nil, errors.Wrap(err, "encryption startup guards refused process start")
 	}
+	if err := verifyKEKBeforeMutators(kekWrapper); err != nil {
+		return nil, err
+	}
 	return kekWrapper, nil
 }
 
-// loadKEKWrapperFromFlag constructs the file-backed KEK wrapper
-// from the --kekFile flag, returning nil if the flag is empty.
+func verifyKEKBeforeMutators(wrapper kek.Wrapper) error {
+	if !*encryptionEnabled || *encryptionSidecarPath == "" || wrapper == nil {
+		return nil
+	}
+	if err := kek.VerifyWrapper(wrapper); err != nil {
+		return errors.Wrap(err, "encryption KEK preflight refused process start")
+	}
+	return nil
+}
+
+// loadKEKWrapperFromFlag constructs the configured KEK wrapper from the
+// mutually-exclusive file, URI, or environment source.
 // Returns the kek.Wrapper interface rather than the concrete
 // *kek.FileWrapper so the call site (buildShardGroups → applier)
 // stays decoupled from the file-mode provider — Stage 9 KMS
 // providers (AWS KMS, GCP KMS, Vault) will satisfy the same
 // interface and slot in without rewriting the dispatch site.
 func loadKEKWrapperFromFlag() (kek.Wrapper, error) {
-	if *kekFile == "" {
-		return nil, nil
-	}
-	w, err := kek.NewFileWrapper(*kekFile)
+	w, err := kek.NewWrapperFromSources(context.Background(), *kekFile, *kekURI)
 	if err != nil {
-		return nil, errors.Wrapf(err, "failed to load KEK from %s", *kekFile)
+		return nil, errors.Wrap(err, "failed to load KEK source")
 	}
 	return w, nil
 }
@@ -2020,6 +2031,7 @@ type serversInput struct {
 	metricsRegistry    *monitoring.Registry
 	cfg                runtimeConfig
 	encWiring          encryptionWriteWiring
+	kekConfigured      bool
 	redisApplyObserver *adapter.RedisApplyObserver
 	cleanup            *internalutil.CleanupStack
 	s3BlobBackfiller   *adapter.S3BlobBackfiller
@@ -2092,6 +2104,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		pubsubRelay:        adapter.NewRedisPubSubRelay(),
 		readTracker:        in.readTracker,
 		encWiring:          in.encWiring,
+		kekConfigured:      in.kekConfigured,
 		defaultGroupID:     in.cfg.defaultGroup,
 		redisApplyObserver: in.redisApplyObserver,
 		s3BlobBackfiller:   in.s3BlobBackfiller,
@@ -3466,13 +3479,16 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	kekConfigured bool,
 	defaultGroupID uint64,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
 	s3BlobPushBlocked func() bool,
 ) error {
 	forwardLogger := slog.Default().With(slog.String("component", "admin"))
-	enableMutators := encryptionMutatorsEnabled()
+	enableMutators := encryptionMutatorsEnabled(kekConfigured)
 	encryptionCapabilityFanout := buildEncryptionCapabilityFanout(ctx, eg, runtimes, enableMutators)
+	monitorFanout, releaseMonitorConns := buildStorageEnvelopeV2MonitorFanout(runtimes, enableMutators)
+	startStorageEnvelopeV2CapabilityMonitor(ctx, eg, monitorFanout, releaseMonitorConns, encWiring)
 	writerRegistry, err := encryptionAdminDefaultWriterRegistry(*encryptionSidecarPath, shardGroups, defaultGroupID)
 	if err != nil {
 		return err
@@ -3998,6 +4014,7 @@ type runtimeServerRunner struct {
 	redisApplyObserver              *adapter.RedisApplyObserver
 	s3BlobBackfiller                *adapter.S3BlobBackfiller
 	encWiring                       encryptionWriteWiring
+	kekConfigured                   bool
 	defaultGroupID                  uint64
 	dynamoAddress                   string
 	leaderDynamo                    map[string]string
@@ -4118,6 +4135,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		r.kekConfigured,
 		r.defaultGroupID,
 		r.metricsRegistry.S3BlobOffloadObserver(),
 		s3BlobPushBlocked,

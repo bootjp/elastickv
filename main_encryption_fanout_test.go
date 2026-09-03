@@ -3,11 +3,83 @@ package main
 import (
 	"context"
 	"errors"
+	"log/slog"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
+	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	pb "github.com/bootjp/elastickv/proto"
+	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
+
+func TestStorageEnvelopeV2CapabilityMonitorActivatesOnce(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, groupCtx := errgroup.WithContext(ctx)
+	cache := encryption.NewStateCache()
+	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
+	sidecar.Active.Storage = 1
+	cache.RefreshFromSidecar(sidecar)
+	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+	var calls atomic.Int32
+	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+		calls.Add(1)
+		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
+			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
+		}}}, nil
+	}, nil, wiring)
+	deadline := time.Now().Add(time.Second)
+	for !wiring.storageEnvelopeV2WritesActive() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	if !wiring.storageEnvelopeV2WritesActive() {
+		t.Fatal("capability monitor did not activate V2 writes")
+	}
+	cancel()
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("capability monitor: %v", err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("capability monitor calls = %d, want one sticky activation", got)
+	}
+}
+
+func TestStorageEnvelopeV2CapabilityMonitorWaitsForBootstrap(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, groupCtx := errgroup.WithContext(ctx)
+	wiring := encryptionWriteWiring{
+		cache:                   encryption.NewStateCache(),
+		storageEnvelopeV2Active: &atomic.Bool{},
+	}
+	var calls atomic.Int32
+	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+		calls.Add(1)
+		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
+			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
+		}}}, nil
+	}, nil, wiring)
+	time.Sleep(20 * time.Millisecond)
+	if wiring.storageEnvelopeV2WritesActive() {
+		t.Fatal("capability monitor activated V2 writes before encryption bootstrap")
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("capability fanout calls before bootstrap = %d, want zero", got)
+	}
+	cancel()
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("capability monitor: %v", err)
+	}
+}
 
 // stubConfigReader is a configReader for the snapshot-builder tests.
 type stubConfigReader struct {
@@ -129,5 +201,205 @@ func TestRouteSnapshotFromSources_ConfigurationErrorFailsClosed(t *testing.T) {
 	}
 	if !errors.Is(err, boom) {
 		t.Errorf("error does not wrap the Configuration failure: %v", err)
+	}
+}
+
+// capturingLogHandler collects records so a test can assert on the
+// structured attributes of a specific log line. Parallel tests may log
+// into the same handler once it is installed as the default, so access
+// is mutex-guarded and lookups match on message.
+type capturingLogHandler struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *capturingLogHandler) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *capturingLogHandler) Handle(_ context.Context, rec slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.records = append(h.records, rec.Clone())
+
+	return nil
+}
+
+func (h *capturingLogHandler) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *capturingLogHandler) WithGroup(string) slog.Handler      { return h }
+
+// attrFor returns the named attribute of the first record whose message
+// contains want.
+func (h *capturingLogHandler) attrFor(want, attr string) (slog.Value, bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	for _, rec := range h.records {
+		if !strings.Contains(rec.Message, want) {
+			continue
+		}
+		var found slog.Value
+		var ok bool
+		rec.Attrs(func(a slog.Attr) bool {
+			if a.Key == attr {
+				found, ok = a.Value, true
+
+				return false
+			}
+
+			return true
+		})
+
+		return found, ok
+	}
+
+	return slog.Value{}, false
+}
+
+// Activating V2 writes is an operationally significant, sticky state
+// change, so the log line has to name the active storage DEK it
+// activated against.
+func TestStorageEnvelopeV2ActivationLogsActiveKeyID(t *testing.T) {
+	const activeKeyID uint32 = 42
+
+	handler := &capturingLogHandler{}
+	previous := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	t.Cleanup(func() { slog.SetDefault(previous) })
+
+	cache := encryption.NewStateCache()
+	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
+	sidecar.Active.Storage = activeKeyID
+	cache.RefreshFromSidecar(sidecar)
+	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+
+	activated := tryActivateStorageEnvelopeV2Writes(
+		context.Background(),
+		func(context.Context) (admin.CapabilityFanoutResult, error) {
+			return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
+				Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
+			}}}, nil
+		},
+		wiring,
+	)
+	if !activated {
+		t.Fatal("tryActivateStorageEnvelopeV2Writes did not activate")
+	}
+
+	got, ok := handler.attrFor("enabled V2 storage envelope writes", "key_id")
+	if !ok {
+		t.Fatal("activation log is missing the key_id attribute")
+	}
+	if got.Uint64() != uint64(activeKeyID) {
+		t.Fatalf("activation log key_id = %d, want %d", got.Uint64(), activeKeyID)
+	}
+}
+
+// The monitor dials every voter and learner of every group on each attempt and
+// then finishes for good once V2 writes activate. Holding those connections
+// afterwards would leave an idle connection per peer on every node of an
+// encrypted cluster -- an all-to-all mesh built by ordinary startup, for a
+// probe that is over -- so the monitor releases them when it stops.
+func TestStorageEnvelopeV2CapabilityMonitorReleasesConnectionsOnActivation(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	eg, groupCtx := errgroup.WithContext(ctx)
+	cache := encryption.NewStateCache()
+	sidecar := &encryption.Sidecar{Version: encryption.SidecarVersion}
+	sidecar.Active.Storage = 1
+	cache.RefreshFromSidecar(sidecar)
+	wiring := encryptionWriteWiring{cache: cache, storageEnvelopeV2Active: &atomic.Bool{}}
+
+	released := make(chan struct{})
+	startStorageEnvelopeV2CapabilityMonitor(groupCtx, eg, func(context.Context) (admin.CapabilityFanoutResult, error) {
+		return admin.CapabilityFanoutResult{Verdicts: []admin.CapabilityVerdict{{
+			Reachable: true, EncryptionCapable: true, StorageEnvelopeV2Capable: true,
+		}}}, nil
+	}, func() error {
+		close(released)
+		return nil
+	}, wiring)
+
+	if err := eg.Wait(); err != nil {
+		t.Fatalf("capability monitor: %v", err)
+	}
+	select {
+	case <-released:
+	default:
+		t.Fatal("capability monitor kept its fan-out connections after activating")
+	}
+}
+
+// The monitor's fan-out must not share the cutover's process-lifetime cache:
+// releasing the monitor's connections has to be independent of the RPC that
+// an operator may call at any time.
+func TestStorageEnvelopeV2MonitorFanoutOwnsItsConnections(t *testing.T) {
+	t.Parallel()
+	fn, release := buildStorageEnvelopeV2MonitorFanout(nil, true)
+	if fn == nil || release == nil {
+		t.Fatal("monitor fan-out and its release must both be present when mutators are enabled")
+	}
+	if err := release(); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+
+	if fn, release := buildStorageEnvelopeV2MonitorFanout(nil, false); fn != nil || release != nil {
+		t.Error("monitor fan-out must be absent when encryption mutators are disabled")
+	}
+}
+
+// realServerEncryptionAdminClient adapts the production
+// adapter.EncryptionAdminServer to the pb.EncryptionAdminClient interface
+// admin.CapabilityFanout dials, so the fan-out sees the same
+// CapabilityReport a running node would serve.
+type realServerEncryptionAdminClient struct {
+	pb.EncryptionAdminClient
+	srv *adapter.EncryptionAdminServer
+}
+
+func (c realServerEncryptionAdminClient) GetCapability(
+	ctx context.Context, _ *pb.Empty, _ ...grpc.CallOption,
+) (*pb.CapabilityReport, error) {
+	//nolint:wrapcheck // the gRPC client returns the server's error verbatim.
+	return c.srv.GetCapability(ctx, &pb.Empty{})
+}
+
+// TestCapabilityFanoutAgainstRealAdminServerActivatesV2 pins the second
+// consumer of storage_envelope_v2_capable. Every other test in this file
+// hand-builds admin.CapabilityVerdict values with the flag already set, so
+// they all stayed green while the production GetCapability left the field at
+// the protobuf default and V2 compressed writes could never latch on.
+func TestCapabilityFanoutAgainstRealAdminServerActivatesV2(t *testing.T) {
+	t.Parallel()
+	const (
+		nodeA uint64 = 0xA1
+		nodeB uint64 = 0xB2
+	)
+	servers := map[string]*adapter.EncryptionAdminServer{
+		"n1:50051": adapter.NewEncryptionAdminServer(
+			adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+			adapter.WithEncryptionAdminFullNodeID(nodeA),
+		),
+		"n2:50051": adapter.NewEncryptionAdminServer(
+			adapter.WithEncryptionAdminSidecarPath(filepath.Join(t.TempDir(), "keys.json")),
+			adapter.WithEncryptionAdminFullNodeID(nodeB),
+		),
+	}
+	dial := func(_ context.Context, address string) (pb.EncryptionAdminClient, func(), error) {
+		srv, ok := servers[address]
+		if !ok {
+			return nil, nil, errors.New("no server at " + address)
+		}
+		return realServerEncryptionAdminClient{srv: srv}, func() {}, nil
+	}
+	routes := admin.RouteSnapshot{Groups: []admin.RouteGroup{{
+		GroupID:  0,
+		Voters:   []admin.RouteMember{{FullNodeID: nodeA, Address: "n1:50051"}},
+		Learners: []admin.RouteMember{{FullNodeID: nodeB, Address: "n2:50051"}},
+	}}}
+	result, err := admin.CapabilityFanout(context.Background(), routes, dial, time.Second)
+	if err != nil {
+		t.Fatalf("CapabilityFanout: %v", err)
+	}
+	if !result.StorageEnvelopeV2Ready() {
+		t.Fatalf("StorageEnvelopeV2Ready=false against real admin servers; verdicts=%+v", result.Verdicts)
 	}
 }

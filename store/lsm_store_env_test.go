@@ -144,7 +144,7 @@ func TestSetSmallPebbleCacheForTestRestores(t *testing.T) {
 // and that Unref is safe for each borrowed store/open reference.
 func TestDefaultPebbleOptionsCarriesCache(t *testing.T) {
 	setSmallPebbleCacheForTest(t)
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(false)
 	require.NotNil(t, cache)
 	require.Same(t, cache, opts.Cache)
 	require.Equal(t, int64(16)<<20, cache.MaxSize())
@@ -153,9 +153,9 @@ func TestDefaultPebbleOptionsCarriesCache(t *testing.T) {
 
 func TestDefaultPebbleOptionsSharesProcessCache(t *testing.T) {
 	setSmallPebbleCacheForTest(t)
-	opts1, cache1 := defaultPebbleOptionsWithCache()
+	opts1, cache1 := defaultPebbleOptionsWithCache(false)
 	defer cache1.Unref()
-	opts2, cache2 := defaultPebbleOptionsWithCache()
+	opts2, cache2 := defaultPebbleOptionsWithCache(false)
 	defer cache2.Unref()
 
 	require.Same(t, cache1, cache2)
@@ -173,7 +173,7 @@ func TestDefaultPebbleOptionsSharesProcessCacheConcurrently(t *testing.T) {
 	for range borrowers {
 		go func() {
 			defer wg.Done()
-			_, cache := defaultPebbleOptionsWithCache()
+			_, cache := defaultPebbleOptionsWithCache(false)
 			caches <- cache
 		}()
 	}

@@ -289,6 +289,11 @@ type pebbleStore struct {
 	// fixtures depend on that posture and the 6D-6 production wiring
 	// in main.go is what flips the gate on.
 	storageEnvelopeActive StorageEnvelopeActive
+	// storageEnvelopeV2Active is the rolling-upgrade reader-capability
+	// gate for compressed V2 envelopes. Production keeps it false until
+	// every voter and learner advertises V2 support. A nil closure keeps
+	// the pre-gate embedded/test behavior.
+	storageEnvelopeV2Active StorageEnvelopeV2Active
 	// storageRegistered is the Stage 7a-2 §4.1 registration gate. When
 	// wired, the DIRECT write path (PutAt / ExpireAt / ApplyMutations)
 	// refuses to emit an encrypted envelope — returning
@@ -338,7 +343,7 @@ func WithSSTIngestSnapshots(enabled bool) PebbleStoreOption {
 // store/open reference and returns it to the caller. The caller MUST Unref the
 // returned cache after the DB is closed (or after pebble.Open fails), matching
 // the lifetime rules used by NewPebbleStore, Restore, and temp restore DBs.
-func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
+func defaultPebbleOptionsWithCache(disableCompression bool) (*pebble.Options, *pebble.Cache) {
 	cache := processPebbleCacheRef()
 	opts := &pebble.Options{
 		FS:                 vfs.Default,
@@ -348,6 +353,14 @@ func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
 	// Enable automatic compactions and apply all other Pebble defaults.
 	// EnsureDefaults leaves Cache alone because we already set it.
 	opts.EnsureDefaults()
+	if disableCompression {
+		// Storage-envelope payloads are compressed before encryption. The
+		// resulting ciphertext is high entropy, so Pebble block compression
+		// only burns CPU and cannot recover additional space.
+		opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
+			return pebble.DBCompressionNone
+		})
+	}
 	return opts, cache
 }
 
@@ -388,7 +401,7 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		return nil, err
 	}
 
-	pebbleOpts, cache := defaultPebbleOptionsWithCache()
+	pebbleOpts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	db, err := pebble.Open(dir, pebbleOpts)
 	if err != nil {
 		cache.Unref()
@@ -1118,7 +1131,7 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		plain, err := s.decryptForKey(k, sv, sv.Value)
+		plain, flag, err := s.decryptAuthenticatedForKey(k, sv, sv.Value)
 		if err != nil {
 			return nil, err
 		}
@@ -1128,7 +1141,7 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 		if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
 			return nil, ErrKeyNotFound
 		}
-		return plain, nil
+		return finishAuthenticatedValue(plain, flag)
 	}
 	return nil, ErrKeyNotFound
 }
@@ -1314,15 +1327,20 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 	// per-value AAD authenticates the header bits we are about to
 	// branch on. See readVisibleVersion for the matching rationale:
 	// a flipped tombstone or lowered expireAt would otherwise force
-	// a silent skip on an encrypted entry.
-	plain, err := s.decryptForKey(iter.Key(), sv, sv.Value)
+	// a silent skip on an encrypted entry. Decompression is deferred
+	// past the checks so a skipped version never pays the expansion.
+	plain, flag, err := s.decryptAuthenticatedForKey(iter.Key(), sv, sv.Value)
 	if err != nil {
 		return nil, err
 	}
 	if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
+		value, finishErr := finishAuthenticatedValue(plain, flag)
+		if finishErr != nil {
+			return nil, finishErr
+		}
 		return &KVPair{
 			Key:   userKey,
-			Value: plain,
+			Value: value,
 		}, nil
 	}
 	return nil, nil
@@ -1339,7 +1357,7 @@ func (s *pebbleStore) foundValueVisible(iter *pebble.Iterator, ts uint64) (bool,
 	// This intentionally also runs for cleartext-labelled rows so the
 	// cleartext rebadge guard rejects encrypted envelopes whose encState bit
 	// was flipped before we branch on tombstone or expireAt.
-	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+	if err := s.authenticateForKey(iter.Key(), sv, sv.Value); err != nil {
 		return false, err
 	}
 	return !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts), nil
@@ -2701,12 +2719,12 @@ func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, ve
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	// decryptForKey authenticates the value-header bytes when the
+	// authenticateForKey authenticates the value-header bytes when the
 	// entry is encrypted (cleartext entries no-op except for the
 	// rebadge guard). We discard the plaintext — we only need the
 	// authentication side-effect; tombstone / expireAt visibility
 	// is then decided on now-trusted bytes.
-	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+	if err := s.authenticateForKey(iter.Key(), sv, sv.Value); err != nil {
 		return false, err
 	}
 	if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {
@@ -3215,7 +3233,7 @@ func (s *pebbleStore) reopenFreshDB() error {
 	if err := os.MkdirAll(s.dir, dirPerms); err != nil {
 		return errors.WithStack(err)
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	db, err := pebble.Open(s.dir, opts)
 	if err != nil {
 		cache.Unref()
@@ -3286,7 +3304,7 @@ func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
 		return err
 	}
 
-	if err := writeNativeSnapshotToTempDir(r, tmpDir, ts); err != nil {
+	if err := writeNativeSnapshotToTempDir(r, tmpDir, ts, s.cipher != nil); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return err
 	}
@@ -3328,8 +3346,8 @@ func makeSiblingTempDir(dir, tag string) (string, error) {
 // writeNativeSnapshotToTempDir writes batch-loop entries from r into a fresh
 // Pebble database at tmpDir, persists ts as the lastCommitTS meta-key, then
 // closes the database.
-func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
-	opts, cache := defaultPebbleOptionsWithCache()
+func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64, disableCompression bool) error {
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	tmpDB, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()
@@ -3388,12 +3406,12 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 	return body, hash, expectedChecksum, meta, nil
 }
 
-func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, meta streamingMVCCRestoreMetadata) (string, error) {
+func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, meta streamingMVCCRestoreMetadata, disableCompression bool) (string, error) {
 	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return "", errors.WithStack(err)
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	tmpDB, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()
@@ -3433,7 +3451,7 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 		return err
 	}
 
-	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, meta)
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, meta, s.cipher != nil)
 	if err != nil {
 		return err
 	}
@@ -3517,7 +3535,7 @@ func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSn
 }
 
 func (s *pebbleStore) reopenStoreDB(dir string) error {
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	db, err := pebble.Open(dir, opts)
 	if err != nil {
 		cache.Unref()
