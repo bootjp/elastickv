@@ -109,6 +109,7 @@ type redisStreamState struct {
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
+	externalTTL    bool
 }
 
 // HandleStreamMeta processes one !stream|meta|<userKey> record.
@@ -161,6 +162,11 @@ func (r *RedisDB) HandleStreamEntry(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamKey, "entry key: %q", key)
 	}
+	if r.countOnly {
+		st := r.streamState(userKey)
+		st.entries = append(st.entries, redisStreamEntry{ms: ms, seq: seq})
+		return nil
+	}
 	fields, err := decodeStreamEntryValue(value)
 	if err != nil {
 		return err
@@ -190,6 +196,7 @@ func (r *RedisDB) streamState(userKey []byte) *redisStreamState {
 	if expireAtMs, ok := r.claimPendingTTL(userKey); ok {
 		st.expireAtMs = expireAtMs
 		st.hasTTL = true
+		st.externalTTL = true
 	}
 	r.streams[uk] = st
 	r.kindByKey[uk] = redisKindStream

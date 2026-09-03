@@ -2,6 +2,7 @@ package backup
 
 import (
 	"bufio"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -24,7 +25,10 @@ import (
 // arbitrarily-long "line" — that is the OOM vector the gemini
 // security-high finding on PR #810 flagged when the previous
 // implementation slurped the whole file via os.ReadFile.
-const maxChecksumLineLen = 8 * 1024
+const (
+	maxChecksumLineLen = 8 * 1024
+	checksumFileMode   = 0o600
+)
 
 // CHECKSUMSFilename is the on-disk name of the dump-tree-wide
 // sha256sum(1)-compatible checksum file. Stored at the dump root so
@@ -62,14 +66,55 @@ var ErrChecksumMismatch = errors.New("backup: checksum mismatch")
 // on this for the "encode → decode round-trip is byte-identical"
 // property.
 func WriteChecksums(root string) error {
-	entries, err := collectChecksumEntries(root)
+	entries, err := collectChecksumEntries(context.Background(), root)
 	if err != nil {
 		return err
 	}
+	return writeChecksumEntries(root, entries, false)
+}
+
+// WriteChecksumsWithVirtualFile includes one not-yet-published file in the
+// checksum set. Live backup uses this to checksum MANIFEST.json before its
+// final atomic publication, keeping the manifest both checksummed and last.
+func WriteChecksumsWithVirtualFile(root, relPath string, content []byte) error {
+	return WriteChecksumsWithVirtualFileContext(context.Background(), root, relPath, content)
+}
+
+// WriteChecksumsWithVirtualFileContext is WriteChecksumsWithVirtualFile with
+// cancellation. Hashing a dump tree is unbounded work -- it reads every byte
+// the dump wrote -- so a canceled run must stop here rather than keep going
+// and let its caller publish afterwards.
+func WriteChecksumsWithVirtualFileContext(ctx context.Context, root, relPath string, content []byte) error {
+	if !filepath.IsLocal(relPath) || filepath.Clean(relPath) == "." {
+		return errors.Wrapf(ErrChecksumsPathTraversal, "%q", relPath)
+	}
+	relPath = filepath.ToSlash(filepath.Clean(relPath))
+	if relPath == CHECKSUMSFilename {
+		return errors.Wrap(ErrChecksumsMalformedLine, "CHECKSUMS cannot list itself")
+	}
+	entries, err := collectChecksumEntries(ctx, root)
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.relPath == relPath {
+			return errors.Wrapf(ErrChecksumsMalformedLine, "virtual file already exists: %s", relPath)
+		}
+	}
+	sum := sha256.Sum256(content)
+	entries = append(entries, checksumEntry{hex: hex.EncodeToString(sum[:]), relPath: relPath})
+	return writeChecksumEntries(root, entries, true)
+}
+
+func writeChecksumEntries(root string, entries []checksumEntry, exclusive bool) error {
 	sort.Slice(entries, func(i, j int) bool {
 		return entries[i].relPath < entries[j].relPath
 	})
-	out, err := os.Create(filepath.Join(root, CHECKSUMSFilename)) //nolint:gosec // operator-supplied output dir
+	flags := os.O_WRONLY | os.O_CREATE | os.O_TRUNC
+	if exclusive {
+		flags = os.O_WRONLY | os.O_CREATE | os.O_EXCL
+	}
+	out, err := os.OpenFile(filepath.Join(root, CHECKSUMSFilename), flags, checksumFileMode) //nolint:gosec // operator-supplied output dir
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -154,12 +199,15 @@ type checksumEntry struct {
 // are skipped — sha256sum does not follow them by default and the
 // dump tree should never contain any (the encoders write only
 // regular files).
-func collectChecksumEntries(root string) ([]checksumEntry, error) {
+func collectChecksumEntries(ctx context.Context, root string) ([]checksumEntry, error) {
 	var entries []checksumEntry
 	skipPath := filepath.Join(root, CHECKSUMSFilename)
 	walkErr := filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
 		if err != nil {
 			return errors.WithStack(err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.WithStack(ctxErr)
 		}
 		if d.IsDir() || !d.Type().IsRegular() {
 			return nil

@@ -193,10 +193,9 @@ var ErrUnknownAdapter = errors.New("unknown adapter name")
 // flag value is neither per-item nor jsonl.
 var ErrBundleModeInvalid = errors.New("invalid --dynamodb-bundle-mode")
 
-// parseBundleMode validates the --dynamodb-bundle-mode value. The
-// underlying encoder rejects bundleJSONL=true at Finalize time
-// (the JSONL path is a Phase 0b follow-up), but we still accept
-// the flag now so the CLI surface is stable across that change.
+// parseBundleMode validates the --dynamodb-bundle-mode value. JSONL uses the
+// encoder's default 64 MiB part size; the live producer additionally exposes a
+// per-run size override.
 func parseBundleMode(mode string) (bool, error) {
 	switch mode {
 	case "per-item", "":
