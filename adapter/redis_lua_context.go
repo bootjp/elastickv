@@ -16,9 +16,10 @@ import (
 )
 
 type luaScriptContext struct {
-	server  *RedisServer
-	startTS uint64
-	readPin *kv.ActiveTimestampToken
+	server        *RedisServer
+	startTS       uint64
+	readTimestamp kv.ReadTimestamp
+	readPin       *kv.ActiveTimestampToken
 
 	// ctx is the request-scoped context captured at newLuaScriptContext
 	// time. New cmd* handlers should propagate it into store operations
@@ -286,10 +287,15 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	if _, err := kv.LeaseReadThrough(server.coordinator, ctx); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	startTS := server.readTS()
+	readTimestamp, err := server.beginTxnReadTimestamp(ctx, "redis lua: begin read timestamp")
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	startTS := readTimestamp.Timestamp()
 	return &luaScriptContext{
 		server:         server,
 		startTS:        startTS,
+		readTimestamp:  readTimestamp,
 		readPin:        server.pinReadTS(startTS),
 		ctx:            ctx,
 		touched:        map[string]struct{}{},
@@ -3674,7 +3680,8 @@ func (c *luaScriptContext) commit() error {
 		return nil
 	}
 
-	if _, err := c.server.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := c.readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, c.server.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  luaCommitFloor(c.startTS),
 		CommitTS: commitTS,

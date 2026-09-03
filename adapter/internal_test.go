@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/binary"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
@@ -462,6 +463,434 @@ func (t *forwardObserverTxn) Commit(_ context.Context, reqs []*pb.Request) (*kv.
 
 func (t *forwardObserverTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
 	return &kv.TransactionResponse{}, nil
+}
+
+func TestFillForwardedTxnCommitTS_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
+	t.Parallel()
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	i := &Internal{
+		clock:       clock,
+		tsAllocator: internalLegacyRuntimeAllocator{},
+	}
+	startTS := uint64(10)
+	reqs := []*pb.Request{
+		{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{
+				{
+					Op:    pb.Op_PUT,
+					Key:   []byte(kv.TxnMetaPrefix),
+					Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 0}),
+				},
+			},
+		},
+	}
+
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), reqs, startTS)
+	require.NoError(t, err)
+	require.Greater(t, commitTS, startTS)
+}
+
+func TestStampRawTimestamps_FallsBackWhenRuntimeAllocatorLegacy(t *testing.T) {
+	t.Parallel()
+
+	clock := kv.NewHLC()
+	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
+	i := &Internal{
+		clock:       clock,
+		tsAllocator: internalLegacyRuntimeAllocator{},
+	}
+	reqs := []*pb.Request{{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}}}}
+
+	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
+	require.NotZero(t, reqs[0].Ts)
+}
+
+type internalLegacyRuntimeAllocator struct{}
+
+func (internalLegacyRuntimeAllocator) Next(context.Context) (uint64, error) {
+	return 0, errors.WithStack(kv.ErrTSOAllocatorRequired)
+}
+
+func TestInternalForward_RejectedOnDedicatedTSOGroup(t *testing.T) {
+	t.Parallel()
+
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
+
+	resp, err := i.Forward(context.Background(), &pb.ForwardRequest{
+		Requests: []*pb.Request{{
+			IsTxn:     false,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}},
+	})
+
+	require.ErrorIs(t, err, ErrKVForwardNotSupported)
+	require.Nil(t, resp)
+}
+
+func TestInternalForward_RejectionPrecedesLeaderCheck(t *testing.T) {
+	t.Parallel()
+
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithKVForwardRejected())
+
+	_, err := i.Forward(context.Background(), &pb.ForwardRequest{})
+
+	require.ErrorIs(t, err, ErrKVForwardNotSupported)
+	require.NotErrorIs(t, err, ErrNotLeader)
+}
+
+type phaseDForwardAllocator struct {
+	floor uint64
+	// ceiling stands in for the allocation floor: anything beyond it has not
+	// been issued by group 0 yet. Zero means unbounded.
+	ceiling       uint64
+	next          uint64
+	validateCalls int
+}
+
+func (a *phaseDForwardAllocator) Next(context.Context) (uint64, error) {
+	a.next++
+	return a.floor + a.next, nil
+}
+
+func (a *phaseDForwardAllocator) NextAfter(_ context.Context, minTS uint64) (uint64, error) {
+	a.next++
+	ts := a.floor + a.next
+	if ts <= minTS {
+		ts = minTS + 1
+	}
+	return ts, nil
+}
+
+func (a *phaseDForwardAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	a.validateCalls++
+	if timestamp == 0 || (a.ceiling != 0 && timestamp > a.ceiling) {
+		return kv.ErrTSOTimestampInvalid
+	}
+	if timestamp <= a.floor {
+		return errors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
+	}
+	return nil
+}
+
+func (a *phaseDForwardAllocator) PhaseDActive() bool   { return true }
+func (a *phaseDForwardAllocator) PhaseDRequired() bool { return true }
+
+func TestStampRawTimestamps_ValidatesForwardedTimestampUnderPhaseD(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	stale := []*pb.Request{{Ts: 50, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	err := i.stampRawTimestamps(context.Background(), stale)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+	require.Equal(t, 1, alloc.validateCalls)
+
+	// A timestamp the allocator vouches for still passes through unchanged.
+	fresh := []*pb.Request{{Ts: 101, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	require.NoError(t, i.stampRawTimestamps(context.Background(), fresh))
+	require.Equal(t, uint64(101), fresh[0].Ts)
+
+	// An unset timestamp is allocated, not validated.
+	before := alloc.validateCalls
+	unset := []*pb.Request{{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	require.NoError(t, i.stampRawTimestamps(context.Background(), unset))
+	require.NotZero(t, unset[0].Ts)
+	require.Equal(t, before, alloc.validateCalls)
+}
+
+func TestFillForwardedTxnCommitTS_ValidatesForwardedCommitTSUnderPhaseD(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	stamped := func(commitTS uint64) []*pb.Request {
+		return []*pb.Request{{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}}
+	}
+
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(50), 150)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), stamped(101), 150)
+	require.NoError(t, err)
+	require.Equal(t, uint64(101), commitTS)
+}
+
+func TestForwardedTimestamps_UnvalidatedWithoutPhaseD(t *testing.T) {
+	t.Parallel()
+
+	i := &Internal{}
+	reqs := []*pb.Request{{Ts: 7, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k")}}}}
+	require.NoError(t, i.stampRawTimestamps(context.Background(), reqs))
+	require.Equal(t, uint64(7), reqs[0].Ts)
+}
+
+func TestFillForwardedTxnCommitTS_AllowsPrePhaseDResolutionReplay(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	resolution := func(commitTS uint64) []*pb.Request {
+		return []*pb.Request{{
+			IsTxn: true,
+			Phase: pb.Phase_COMMIT,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}}
+	}
+
+	// Both halves predate Phase D: the whole transaction belongs to the legacy
+	// era, so group 0 can never re-issue either value.
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), resolution(60), 50)
+	require.NoError(t, err)
+	require.Equal(t, uint64(60), commitTS)
+
+	// A post-Phase-D transaction may not claim a pre-Phase-D commit timestamp.
+	_, err = i.fillForwardedTxnCommitTS(context.Background(), resolution(60), 150)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+}
+
+func TestFillForwardedTxnCommitTS_StillRejectsUnallocatedCommitTS(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	reqs := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 5_000}),
+		}},
+	}}
+
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), reqs, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+	require.NotErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+}
+
+func TestFillForwardedTxnCommitTS_OnePhaseGetsNoLegacyExemption(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	onePhase := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 60}),
+		}},
+	}}
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), onePhase, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	// The same pair on an ABORT resolution is still admitted.
+	abort := []*pb.Request{{
+		IsTxn: true,
+		Phase: pb.Phase_ABORT,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 60}),
+		}},
+	}}
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), abort, 50)
+	require.NoError(t, err)
+	require.Equal(t, uint64(60), commitTS)
+}
+
+func TestStampTxnTimestamps_ValidatesForwardedStartTS(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	prepare := func(startTS uint64) []*pb.Request {
+		return []*pb.Request{{
+			IsTxn:     true,
+			Phase:     pb.Phase_PREPARE,
+			Ts:        startTS,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}}
+	}
+
+	// Beyond the allocation floor: group 0 has not issued this.
+	_, err := i.stampTxnTimestamps(context.Background(), prepare(5_000))
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+	require.NotErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	// An allocated one passes through unchanged. stampTxnTimestamps returns the
+	// commit timestamp, which a PREPARE has none of, so the start timestamp is
+	// read back off the request it was stamped onto.
+	reqs := prepare(150)
+	_, err = i.stampTxnTimestamps(context.Background(), reqs)
+	require.NoError(t, err)
+	require.Equal(t, uint64(150), reqs[0].Ts)
+
+	// A transaction that began before Phase D may still prepare its intents.
+	legacy := prepare(50)
+	_, err = i.stampTxnTimestamps(context.Background(), legacy)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), legacy[0].Ts)
+}
+
+func TestFillForwardedTxnCommitTS_MixedPhaseBatchGetsNoLegacyExemption(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	meta := func(phase pb.Phase, commitTS uint64) *pb.Request {
+		return &pb.Request{
+			IsTxn: true,
+			Phase: phase,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}
+	}
+
+	// One-phase first, resolution second: the batch must not inherit the
+	// resolution's exemption.
+	mixed := []*pb.Request{meta(pb.Phase_NONE, 60), meta(pb.Phase_COMMIT, 60)}
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), mixed, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
+
+	// Resolutions only still pass.
+	resolutions := []*pb.Request{meta(pb.Phase_ABORT, 60), meta(pb.Phase_COMMIT, 60)}
+	commitTS, err := i.fillForwardedTxnCommitTS(context.Background(), resolutions, 50)
+	require.NoError(t, err)
+	require.Equal(t, uint64(60), commitTS)
+}
+
+func TestStampTimestamps_RejectsInconsistentForwardEnvelope(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	inner := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_NONE,
+		Ts:    150,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 5_000}),
+		}},
+	}
+
+	_, err := i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    false,
+		Requests: []*pb.Request{inner},
+	})
+	require.ErrorIs(t, err, kv.ErrInvalidRequest)
+
+	// The consistent envelope reaches the transactional path, where the meta's
+	// unissued commit timestamp is caught.
+	_, err = i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    true,
+		Requests: []*pb.Request{inner},
+	})
+	require.ErrorIs(t, err, kv.ErrTSOTimestampInvalid)
+
+	// A genuinely raw envelope is unaffected.
+	_, err = i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn: false,
+		Requests: []*pb.Request{{
+			Ts:        150,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+		}},
+	})
+	require.NoError(t, err)
+}
+
+func TestStampTimestamps_RejectsRawRequestInsideTxnEnvelope(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	resolution := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    50,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte(kv.TxnMetaPrefix),
+			Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: 60}),
+		}},
+	}
+	raw := &pb.Request{Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}}}
+
+	_, err := i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    true,
+		Requests: []*pb.Request{raw, resolution},
+	})
+	require.ErrorIs(t, err, kv.ErrInvalidRequest)
+
+	// The all-transactional batch is unaffected.
+	_, err = i.stampTimestamps(context.Background(), &pb.ForwardRequest{
+		IsTxn:    true,
+		Requests: []*pb.Request{resolution},
+	})
+	require.NoError(t, err)
+}
+
+func TestFillForwardedTxnCommitTS_ZeroValuedOnePhaseMetaBlocksExemption(t *testing.T) {
+	t.Parallel()
+
+	alloc := &phaseDForwardAllocator{floor: 100}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+
+	meta := func(phase pb.Phase, commitTS uint64) *pb.Request {
+		return &pb.Request{
+			IsTxn: true,
+			Phase: phase,
+			Mutations: []*pb.Mutation{{
+				Op:    pb.Op_PUT,
+				Key:   []byte(kv.TxnMetaPrefix),
+				Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k"), CommitTS: commitTS}),
+			}},
+		}
+	}
+
+	// The one-phase meta carries no timestamp of its own; it would be filled
+	// with the COMMIT's exempt one.
+	mixed := []*pb.Request{meta(pb.Phase_NONE, 0), meta(pb.Phase_COMMIT, 60)}
+	_, err := i.fillForwardedTxnCommitTS(context.Background(), mixed, 50)
+	require.Error(t, err)
+	require.ErrorIs(t, err, kv.ErrTSOTimestampPrePhaseD)
 }
 
 // The export defaults only fill in a bound the request left unset, so without a

@@ -181,7 +181,11 @@ func (s *SQSServer) trySendMessageBatchOnce(
 	entries []sqsSendMessageBatchEntryInput,
 	identities []sqsSendIdentity,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, bool, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs send message batch: begin read timestamp")
+	if err != nil {
+		return nil, nil, false, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return nil, nil, false, errors.WithStack(err)
@@ -192,7 +196,7 @@ func (s *SQSServer) trySendMessageBatchOnce(
 	if meta.IsFIFO {
 		return s.sendBatchFifoEntries(ctx, queueName, meta, entries)
 	}
-	return s.sendBatchStandardOnce(ctx, queueName, meta, entries, identities, readTS)
+	return s.sendBatchStandardOnce(ctx, queueName, meta, entries, identities, readTimestamp)
 }
 
 // sendBatchStandardOnce is the original single-OCC fast path for
@@ -204,8 +208,9 @@ func (s *SQSServer) sendBatchStandardOnce(
 	meta *sqsQueueMeta,
 	entries []sqsSendMessageBatchEntryInput,
 	identities []sqsSendIdentity,
-	readTS uint64,
+	readTimestamp kv.ReadTimestamp,
 ) ([]sqsSendMessageBatchResultEntry, []sqsBatchResultErrorEntry, bool, error) {
+	readTS := readTimestamp.Timestamp()
 	successful := make([]sqsSendMessageBatchResultEntry, 0, len(entries))
 	failed := make([]sqsBatchResultErrorEntry, 0)
 	// Each entry produces three OCC ops: data, vis, byage. Pre-sizing
@@ -254,7 +259,8 @@ func (s *SQSServer) sendBatchStandardOnce(
 		ReadKeys: [][]byte{sqsQueueMetaKey(queueName), sqsQueueGenKey(queueName)},
 		Elems:    elems,
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil, nil, true, nil
 		}
@@ -367,12 +373,16 @@ func (s *SQSServer) runFifoSendWithRetry(
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := s.nextTxnReadTS(ctx)
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs fifo send: begin read timestamp")
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		meta, dedupID, delay, err := s.resolveFreshFifoSnapshot(ctx, queueName, in, readTS)
 		if err != nil {
 			return nil, err
 		}
-		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTS)
+		resp, retry, err := s.sendFifoMessage(ctx, queueName, meta, in, dedupID, delay, readTimestamp)
 		if err != nil {
 			return nil, err
 		}

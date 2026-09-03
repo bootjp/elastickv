@@ -115,6 +115,11 @@ func (d *DynamoDBServer) nextTxnReadTS() uint64 {
 	return maxTS
 }
 
+func (d *DynamoDBServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, d.coordinator, d.nextTxnReadTS(), label)
+	return readTimestamp, errors.WithStack(err)
+}
+
 func (d *DynamoDBServer) pinReadTS(ts uint64) *kv.ActiveTimestampToken {
 	if d == nil || d.readTracker == nil {
 		return &kv.ActiveTimestampToken{}

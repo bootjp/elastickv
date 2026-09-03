@@ -88,6 +88,10 @@ type rawGroupKeyScanner interface {
 	ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error)
 }
 
+type rawGroupCommitFloorReader interface {
+	GroupCommittedTimestampFloor(ctx context.Context, groupID uint64) (uint64, error)
+}
+
 func WithCloseStore() GRPCServerOption {
 	return func(s *GRPCServer) {
 		s.closeStore = true
@@ -189,6 +193,27 @@ func (r *GRPCServer) RawGet(ctx context.Context, req *pb.RawGetRequest) (*pb.Raw
 	return &pb.RawGetResponse{Value: v, Exists: true}, nil
 }
 
+// rawGroupWatermark answers the keyless leader-fenced watermark for one Raft
+// group. LeaderFenced is set because the floor is read behind that group's own
+// leader fence, which is what makes it usable as a read watermark.
+func (r *GRPCServer) rawGroupWatermark(ctx context.Context, groupID uint64) (*pb.RawLatestCommitTSResponse, error) {
+	reader, ok := r.store.(rawGroupCommitFloorReader)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition,
+			"group watermark requires a group-aware store"))
+	}
+	ts, err := reader.GroupCommittedTimestampFloor(ctx, groupID)
+	if err != nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
+	}
+	return &pb.RawLatestCommitTSResponse{
+		Ts:           ts,
+		Exists:       ts > 0,
+		GroupId:      groupID,
+		LeaderFenced: true,
+	}, nil
+}
+
 func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
 	if err := r.requireReadReady(); err != nil {
 		return nil, err
@@ -208,6 +233,13 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 }
 
 func (r *GRPCServer) rawLatestCommitTSSingle(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) (*pb.RawLatestCommitTSResponse, error) {
+	// A group id with no key is the leader-fenced group watermark. With a key
+	// it selects the group for a per-key read instead, further down -- the two
+	// share the field, so the key is what tells them apart. A key_batch request
+	// never reaches here, so this stays a single-key decision.
+	if groupID := req.GetGroupId(); groupID != 0 && len(req.GetKey()) == 0 {
+		return r.rawGroupWatermark(ctx, groupID)
+	}
 	key := req.GetKey()
 	if len(key) == 0 {
 		// No key: return the store's global last-committed watermark.
@@ -220,24 +252,9 @@ func (r *GRPCServer) rawLatestCommitTSSingle(ctx context.Context, req *pb.RawLat
 		}, nil
 	}
 
-	var ts uint64
-	var exists bool
-	var err error
-	if groupID := req.GetGroupId(); groupID != 0 {
-		groupReader, ok := r.store.(rawGroupCommitTSReader)
-		if !ok {
-			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp for an explicit group requires a group-aware store"))
-		}
-		ts, exists, err = groupReader.LatestCommitTSGroupWithReadFence(ctx, key, groupID, readRouteVersion)
-	} else if fenceReader, ok := r.store.(rawReadFenceCommitTSReader); ok {
-		ts, exists, err = fenceReader.LatestCommitTSWithReadFence(ctx, key, readRouteVersion)
-	} else if req.GetReadRouteVersion() != 0 {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp with read fence requires a read-fence-aware store"))
-	} else {
-		ts, exists, err = r.store.LatestCommitTS(ctx, key)
-	}
+	ts, exists, err := r.rawKeyCommitTS(ctx, req, key, readRouteVersion)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return nil, err
 	}
 	visible, visibleSupported, err := r.rawVersionVisibleAt(ctx, req, readRouteVersion)
 	if err != nil {
@@ -282,6 +299,36 @@ func (r *GRPCServer) rawVersionsVisibleAt(ctx context.Context, req *pb.RawLatest
 	return out, true, nil
 }
 
+// rawKeyCommitTS resolves the per-key latest commit timestamp through whichever
+// reader the store implements: an explicit group, a read-fence-aware store, or
+// the plain reader. Split out of RawLatestCommitTS to keep that handler inside
+// the cyclop budget once the readiness gate and the group-watermark branch both
+// landed in front of it.
+func (r *GRPCServer) rawKeyCommitTS(
+	ctx context.Context,
+	req *pb.RawLatestCommitTSRequest,
+	key []byte,
+	readRouteVersion uint64,
+) (uint64, bool, error) {
+	if groupID := req.GetGroupId(); groupID != 0 {
+		groupReader, ok := r.store.(rawGroupCommitTSReader)
+		if !ok {
+			return 0, false, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp for an explicit group requires a group-aware store"))
+		}
+		ts, exists, err := groupReader.LatestCommitTSGroupWithReadFence(ctx, key, groupID, readRouteVersion)
+		return ts, exists, errors.WithStack(err)
+	}
+	if fenceReader, ok := r.store.(rawReadFenceCommitTSReader); ok {
+		ts, exists, err := fenceReader.LatestCommitTSWithReadFence(ctx, key, readRouteVersion)
+		return ts, exists, errors.WithStack(err)
+	}
+	if req.GetReadRouteVersion() != 0 {
+		return 0, false, errors.WithStack(status.Error(codes.FailedPrecondition, "latest commit timestamp with read fence requires a read-fence-aware store"))
+	}
+	ts, exists, err := r.store.LatestCommitTS(ctx, key)
+	return ts, exists, errors.WithStack(err)
+}
+
 // rawVersionVisibleAt answers the optional version_visible_at_ts probe. The
 // second bool tells the caller whether this server answered it at all, so a
 // store that cannot check presence never looks like "no version exists".
@@ -312,7 +359,6 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	if readTS == 0 {
 		readTS = globalSnapshotTS(ctx, r.clock(), r.store)
 	}
-
 	if req.GetKeysOnly() {
 		keys, err := r.rawScanKeysAt(ctx, req, limit, readTS)
 		if err != nil {
@@ -325,7 +371,6 @@ func (r *GRPCServer) RawScanAt(ctx context.Context, req *pb.RawScanAtRequest) (*
 	if err != nil {
 		return rawScanErrorResponse(err)
 	}
-
 	return &pb.RawScanAtResponse{Kv: rawKvPairs(res)}, nil
 }
 

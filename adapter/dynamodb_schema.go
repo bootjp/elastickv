@@ -183,7 +183,11 @@ func (d *DynamoDBServer) createTableWithRetry(ctx context.Context, tableName str
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := d.nextTxnReadTS()
+		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb create table: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		exists, err := d.tableExistsAt(ctx, tableName, readTS)
 		if err != nil {
 			return err
@@ -199,10 +203,11 @@ func (d *DynamoDBServer) createTableWithRetry(ctx context.Context, tableName str
 		if err != nil {
 			return err
 		}
-		if _, err := d.coordinator.Dispatch(ctx, req); err == nil {
+		req.StartTS = readTS
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
 			return nil
-		}
-		if !isRetryableTransactWriteError(err) {
+		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
@@ -293,7 +298,11 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := d.nextTxnReadTS()
+		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb delete table: begin read timestamp")
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTS)
 		if err != nil {
 			return errors.WithStack(err)
@@ -304,12 +313,13 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 
 		req := &kv.OperationGroup[kv.OP]{
 			IsTxn:   true,
-			StartTS: 0,
+			StartTS: readTS,
 			Elems: []*kv.Elem[kv.OP]{
 				{Op: kv.Del, Key: dynamoTableMetaKey(tableName)},
 			},
 		}
-		if _, err := d.coordinator.Dispatch(ctx, req); err != nil {
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return errors.WithStack(err)
 			}

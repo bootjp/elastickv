@@ -878,6 +878,11 @@ func (s *SQSServer) nextTxnReadTS(ctx context.Context) uint64 {
 	return maxTS
 }
 
+func (s *SQSServer) beginTxnReadTimestamp(ctx context.Context, label string) (kv.ReadTimestamp, error) {
+	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, s.nextTxnReadTS(ctx), label)
+	return readTimestamp, errors.WithStack(err)
+}
+
 func (s *SQSServer) loadQueueMetaAt(ctx context.Context, queueName string, ts uint64) (*sqsQueueMeta, bool, error) {
 	b, err := s.store.GetAt(ctx, sqsQueueMetaKey(queueName), ts)
 	if err != nil {
@@ -983,11 +988,11 @@ func (s *SQSServer) createQueueWithRetry(ctx context.Context, requested *sqsQueu
 // with the requested attributes, false means the dispatch hit a retryable
 // conflict and should be retried after backoff.
 func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueMeta) (bool, error) {
-	readTS := s.nextTxnReadTS(ctx)
-	existing, exists, err := s.loadQueueMetaAt(ctx, requested.Name, readTS)
+	readTimestamp, existing, exists, err := s.createQueueSnapshot(ctx, requested.Name)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
+	readTS := readTimestamp.Timestamp()
 	if exists {
 		if attributesEqual(existing, requested) {
 			return true, nil
@@ -1057,7 +1062,8 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// against the newly-created incarnation publish gauges newer
 	// than the cleanup cutoff below.
 	throttleResetCutoff := s.beginThrottleReset(requested.Name)
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		return false, errors.WithStack(err)
 	}
 	// Drop any throttle bucket that survived a delete-then-create
@@ -1077,6 +1083,21 @@ func (s *SQSServer) tryCreateQueueOnce(ctx context.Context, requested *sqsQueueM
 	// ties new-queue routing to old-queue history).
 	s.dropReceiveFanoutCounter(requested.Name)
 	return true, nil
+}
+
+func (s *SQSServer) createQueueSnapshot(
+	ctx context.Context,
+	queueName string,
+) (kv.ReadTimestamp, *sqsQueueMeta, bool, error) {
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs create queue: begin read timestamp")
+	if err != nil {
+		return kv.ReadTimestamp{}, nil, false, errors.WithStack(err)
+	}
+	existing, exists, err := s.loadQueueMetaAt(ctx, queueName, readTimestamp.Timestamp())
+	if err != nil {
+		return kv.ReadTimestamp{}, nil, false, errors.WithStack(err)
+	}
+	return readTimestamp, existing, exists, nil
 }
 
 func (s *SQSServer) deleteQueue(w http.ResponseWriter, r *http.Request) {
@@ -1124,7 +1145,11 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTS := s.nextTxnReadTS(ctx)
+		readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs delete queue: begin read timestamp")
+		if err != nil {
+			return 0, errors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
 		existing, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 		if err != nil {
 			return 0, errors.WithStack(err)
@@ -1170,7 +1195,8 @@ func (s *SQSServer) deleteQueueWithRetry(ctx context.Context, queueName string) 
 		// A same-name CreateQueue that commits immediately afterward can
 		// then publish token gauges newer than this stale delete cleanup.
 		throttleResetCutoff := s.beginThrottleReset(queueName)
-		if _, err := s.coordinator.Dispatch(ctx, req); err == nil {
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err == nil {
 			return throttleResetCutoff, nil
 		} else if !isRetryableTransactWriteError(err) {
 			return 0, errors.WithStack(err)
@@ -1656,7 +1682,11 @@ func applyAndValidateSetAttributes(meta *sqsQueueMeta, attrs map[string]string) 
 // successful Dispatch so post-commit request-path gauges are not removed by
 // the caller's cleanup.
 func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName string, attrs map[string]string) (bool, *sqsQueueThrottle, []string, uint64, bool, error) {
-	readTS := s.nextTxnReadTS(ctx)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, "sqs set queue attributes: begin read timestamp")
+	if err != nil {
+		return false, nil, nil, 0, false, errors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	meta, exists, err := s.loadQueueMetaAt(ctx, queueName, readTS)
 	if err != nil {
 		return false, nil, nil, 0, false, errors.WithStack(err)
@@ -1702,7 +1732,8 @@ func (s *SQSServer) trySetQueueAttributesOnce(ctx context.Context, queueName str
 		// this commit must publish a gauge newer than the cleanup cutoff.
 		throttleResetCutoff = s.beginThrottleReset(queueName)
 	}
-	if _, err := s.coordinator.Dispatch(ctx, req); err != nil {
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		return false, nil, nil, 0, false, errors.WithStack(err)
 	}
 	return throttleChanged, postThrottle, resetActions, throttleResetCutoff, true, nil
