@@ -86,12 +86,13 @@ type RouteSnapshot struct {
 // per the §8 failure-modes table, but the verdict separates them so
 // the operator-facing error message can name the precise reason.
 type CapabilityVerdict struct {
-	FullNodeID        uint64
-	EncryptionCapable bool
-	BuildSHA          string
-	SidecarPresent    bool
-	Reachable         bool
-	Err               error
+	FullNodeID               uint64
+	EncryptionCapable        bool
+	StorageEnvelopeV2Capable bool
+	BuildSHA                 string
+	SidecarPresent           bool
+	Reachable                bool
+	Err                      error
 }
 
 // CapabilityFanoutResult is the aggregated outcome. OK is true iff
@@ -105,6 +106,21 @@ type CapabilityVerdict struct {
 type CapabilityFanoutResult struct {
 	Verdicts []CapabilityVerdict
 	OK       bool
+}
+
+// StorageEnvelopeV2Ready reports whether every probed member can read V2
+// storage envelopes. Missing fields from an older binary decode as false, so
+// the transition stays fail-closed throughout a rolling upgrade.
+func (r CapabilityFanoutResult) StorageEnvelopeV2Ready() bool {
+	if len(r.Verdicts) == 0 {
+		return false
+	}
+	for _, verdict := range r.Verdicts {
+		if !verdict.Reachable || !verdict.EncryptionCapable || !verdict.StorageEnvelopeV2Capable {
+			return false
+		}
+	}
+	return true
 }
 
 // DialFunc opens a connection to one node's admin endpoint and
@@ -336,13 +352,22 @@ func probeCapability(ctx context.Context, member RouteMember, dial DialFunc) Cap
 	// different full_node_id than the one the snapshot expected.
 	// Accepting the response would credit the expected member as
 	// verified despite no member-X ever answering. Fail closed.
-	if member.FullNodeID != 0 && report.GetFullNodeId() != 0 && report.GetFullNodeId() != member.FullNodeID {
+	//
+	// An unset id counts as a mismatch. A node with no sidecar answers
+	// GetCapability with full_node_id=0 and storage_envelope_v2_capable=true,
+	// so exempting zero let an unidentified responder hand its V2 capability
+	// to the member the snapshot expected. This path only gates activation on
+	// a cluster that already has an active storage DEK, where every correctly
+	// configured member reports a derived non-zero id, so a zero here means
+	// the expected member was never actually confirmed.
+	if member.FullNodeID != 0 && report.GetFullNodeId() != member.FullNodeID {
 		verdict.Err = pkgerrors.Wrapf(errCapabilityFanoutMismatchedResponder,
 			"%s: expected full_node_id=%d got %d", member.Address, member.FullNodeID, report.GetFullNodeId())
 		return verdict
 	}
 	verdict.Reachable = true
 	verdict.EncryptionCapable = report.GetEncryptionCapable()
+	verdict.StorageEnvelopeV2Capable = report.GetStorageEnvelopeV2Capable()
 	verdict.BuildSHA = report.GetBuildSha()
 	verdict.SidecarPresent = report.GetSidecarPresent()
 	if report.GetFullNodeId() != 0 {

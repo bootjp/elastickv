@@ -485,10 +485,10 @@ type recordingInterceptor struct {
 	preHook func(raftID string) // optional callback; useful for ordering assertions
 }
 
-func (r *recordingInterceptor) PreAddMember(_ context.Context, raftID string) error {
+func (r *recordingInterceptor) PreAddMember(_ context.Context, raftID, address string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls = append(r.calls, raftID)
+	r.calls = append(r.calls, raftID+"@"+address)
 	if r.preHook != nil {
 		r.preHook(raftID)
 	}
@@ -510,7 +510,7 @@ func TestServer_AddVoter_InvokesInterceptorBeforeConfChange(t *testing.T) {
 	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
-	require.Equal(t, []string{"n42"}, interceptor.calls)
+	require.Equal(t, []string{"n42@127.0.0.1:9999"}, interceptor.calls)
 	require.Equal(t, []string{"preAdd", "addVoter"}, order)
 	require.Equal(t, 1, len(engine.addVoterCalls))
 }
@@ -527,7 +527,7 @@ func TestServer_AddVoter_InterceptorErrorAbortsConfChange(t *testing.T) {
 	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
 	require.Error(t, err)
 	require.Nil(t, resp)
-	require.Equal(t, []string{"n42"}, interceptor.calls)
+	require.Equal(t, []string{"n42@127.0.0.1:9999"}, interceptor.calls)
 	require.Equal(t, 0, len(engine.addVoterCalls), "engine.AddVoter must NOT be called when PreAddMember errs")
 }
 
@@ -633,7 +633,7 @@ func TestServer_AddLearner_InterceptorContract(t *testing.T) {
 		server := NewServerWithInterceptor(engine, interceptor)
 		_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "l1", Address: "127.0.0.1:9000"})
 		require.NoError(t, err)
-		require.Equal(t, []string{"l1"}, interceptor.calls)
+		require.Equal(t, []string{"l1@127.0.0.1:9000"}, interceptor.calls)
 		require.Equal(t, 1, len(engine.addLearnerCalls))
 	})
 	t.Run("interceptor error aborts", func(t *testing.T) {

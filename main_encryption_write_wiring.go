@@ -136,10 +136,22 @@ func (w encryptionWriteWiring) attachRaftEnvelopeGroup(groupID uint64, sg *kv.Sh
 //     legacy cleartext mode. When non-nil they are wired into every
 //     shard's PebbleStore; the gate still keeps writes cleartext
 //     until a Bootstrap + EnableStorageEnvelope has flipped the cache.
+//
+// encryptionConfigured reports whether this process actually has encryption
+// wired: buildEncryptionWriteWiring only builds a cipher when encryption is
+// enabled AND a KEK wrapper AND a sidecar path are all present. The cache is
+// always non-nil, so it cannot be used for this test.
+func (w encryptionWriteWiring) encryptionConfigured() bool {
+	return w.cipher != nil
+}
+
 type encryptionWriteWiring struct {
 	cache        *encryption.StateCache
 	cipher       *encryption.Cipher
 	nonceFactory store.NonceFactory
+	// storageEnvelopeV2Active stays false until the live membership fan-out
+	// confirms that every voter and learner can read compressed V2 envelopes.
+	storageEnvelopeV2Active *atomic.Bool
 	// epoch is the §4.1 local_epoch this process load pinned into the
 	// nonce factory (the value BumpLocalEpoch advanced to, or 0 in the
 	// pre-bootstrap case). Stage 7a's process-start registration
@@ -194,6 +206,7 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 	return []store.PebbleStoreOption{
 		store.WithEncryption(w.cipher, w.nonceFactory, w.cache.ActiveStorageKeyID),
 		store.WithStorageEnvelopeGate(w.cache.StorageEnvelopeActive),
+		store.WithStorageEnvelopeV2Gate(w.storageEnvelopeV2WritesActive),
 		// Stage 7a-2 §4.1 direct-path registration gate: the store
 		// refuses to emit an encrypted envelope on a self-originated
 		// write (catalog bootstrap Save) until this load's writer
@@ -203,6 +216,16 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 		// fail-OPEN fallback, so unregistered loads are gated — see the
 		// Registered() doc for the deferred runtime-registration cases.
 		store.WithStorageRegistrationGate(w.cache.Registered),
+	}
+}
+
+func (w encryptionWriteWiring) storageEnvelopeV2WritesActive() bool {
+	return w.storageEnvelopeV2Active != nil && w.storageEnvelopeV2Active.Load()
+}
+
+func (w encryptionWriteWiring) activateStorageEnvelopeV2Writes() {
+	if w.storageEnvelopeV2Active != nil {
+		w.storageEnvelopeV2Active.Store(true)
 	}
 }
 
@@ -261,6 +284,7 @@ func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath stri
 	fullNodeID := etcdraftengine.DeriveNodeID(raftID)
 	nodeID := encryption.NodeID16(fullNodeID)
 	w.cipher = cipher
+	w.storageEnvelopeV2Active = &atomic.Bool{}
 	w.epoch = epoch
 	w.raftEpoch = raftEpoch
 	w.nonceFactory = encryption.NewDeterministicNonceFactory(nodeID, epoch)

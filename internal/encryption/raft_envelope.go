@@ -88,6 +88,7 @@ func WrapRaftPayload(c *Cipher, keyID uint32, nonce, payload []byte) ([]byte, er
 //
 //   - ErrEnvelopeShort: encoded shorter than HeaderSize+TagSize
 //   - ErrEnvelopeVersion: unknown version byte
+//   - ErrEnvelopeFlag: a storage-only or unknown flag bit is present
 //   - ErrUnknownKeyID: DEK is not loaded (retired or sidecar missing)
 //   - ErrIntegrity: GCM tag mismatch (tampered envelope, wrong DEK,
 //     or layer confusion with a storage envelope)
@@ -103,6 +104,14 @@ func UnwrapRaftPayload(c *Cipher, encoded []byte) ([]byte, error) {
 	env, err := DecodeEnvelope(encoded)
 	if err != nil {
 		return nil, errors.Wrap(err, "encryption: raft envelope decode")
+	}
+	if env.Flag != 0 {
+		return nil, errors.Wrapf(ErrEnvelopeFlag,
+			"encryption: raft envelope flag must be 0x00, got 0x%02x", env.Flag)
+	}
+	if env.Version != EnvelopeVersionV1 {
+		return nil, errors.Wrapf(ErrEnvelopeVersion,
+			"encryption: raft envelope version must be 0x%02x, got 0x%02x", EnvelopeVersionV1, env.Version)
 	}
 	aad := BuildRaftAAD(env.Version, env.KeyID)
 	plain, err := c.Decrypt(env.Body, aad, env.KeyID, env.Nonce[:])

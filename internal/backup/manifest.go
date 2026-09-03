@@ -28,6 +28,9 @@ import (
 // constant.
 const CurrentFormatVersion uint32 = 1
 
+// ManifestFilename is the final commit marker for a complete logical dump.
+const ManifestFilename = "MANIFEST.json"
+
 const (
 	// PhasePhase0SnapshotDecode marks dumps produced by Phase 0a (offline
 	// snapshot decoder).
@@ -88,6 +91,14 @@ type Live struct {
 	PinTokenSHA256 string `json:"pin_token_sha256,omitempty"`
 }
 
+// LiveShard records the Raft apply point acknowledged while the live pin was
+// installed. It is audit metadata; readers still use Live.ReadTS as the
+// consistency boundary.
+type LiveShard struct {
+	RaftGroupID  uint64 `json:"raft_group_id"`
+	AppliedIndex uint64 `json:"applied_index"`
+}
+
 // Adapters lists which scopes were dumped per adapter. The pointer
 // values express two distinguishable on-disk states:
 //
@@ -141,15 +152,18 @@ type Exclusions struct {
 // Manifest is the on-disk MANIFEST.json structure. Field tags match the
 // spec in docs/design/2026_04_29_proposed_snapshot_logical_decoder.md.
 type Manifest struct {
-	FormatVersion    uint32  `json:"format_version"`
-	Phase            string  `json:"phase"`
-	ElastickvVersion string  `json:"elastickv_version,omitempty"`
-	ClusterID        string  `json:"cluster_id,omitempty"`
-	SnapshotIndex    uint64  `json:"snapshot_index,omitempty"`
-	LastCommitTS     uint64  `json:"last_commit_ts,omitempty"`
-	WallTimeISO      string  `json:"wall_time_iso"`
-	Source           *Source `json:"source,omitempty"`
-	Live             *Live   `json:"live,omitempty"`
+	FormatVersion       uint32      `json:"format_version"`
+	Phase               string      `json:"phase"`
+	ElastickvVersion    string      `json:"elastickv_version,omitempty"`
+	ClusterID           string      `json:"cluster_id,omitempty"`
+	SnapshotIndex       uint64      `json:"snapshot_index,omitempty"`
+	LastCommitTS        uint64      `json:"last_commit_ts,omitempty"`
+	Shards              []LiveShard `json:"shards,omitempty"`
+	BackupTSTTLMS       uint64      `json:"backup_ts_ttl_ms,omitempty"`
+	MaxActiveBackupPins uint32      `json:"max_active_backup_pins,omitempty"`
+	WallTimeISO         string      `json:"wall_time_iso"`
+	Source              *Source     `json:"source,omitempty"`
+	Live                *Live       `json:"live,omitempty"`
 	// Adapters and Exclusions are pointer types so ReadManifest can
 	// distinguish "section omitted entirely" (a corrupted or
 	// truncated dump that should fail validation) from "section

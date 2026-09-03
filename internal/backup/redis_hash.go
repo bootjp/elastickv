@@ -61,10 +61,15 @@ var ErrRedisInvalidHashKey = cockroachdberr.New("backup: malformed !hs| key")
 // a store holding both layouts for one key must drop the legacy entries
 // rather than merge stale ones over the source of truth.
 type redisHashState struct {
-	declaredLen    int64
-	metaSeen       bool
-	fields         map[string][]byte // field-name → field-value bytes
-	sawWide        bool
+	declaredLen int64
+	metaSeen    bool
+	fields      map[string][]byte // field-name → field-value bytes
+	sawWide     bool
+	// legacySeen records a !redis|hash| blob observed with no wide-column row.
+	// The count-only baseline never decodes the blob, so the field count stays
+	// empty and this is what keeps the key counted as the one stored record it
+	// is. Mirrors redisZSetState.legacySeen.
+	legacySeen     bool
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
@@ -98,6 +103,15 @@ func (r *RedisDB) HandleHashLegacyBlob(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidHashLegacyBlob, "key: %q", key)
 	}
+	if r.countOnly {
+		// The baseline counts keys without their values, so decoding is both
+		// unnecessary and impossible here -- value is nil on this path.
+		st := r.hashState(userKey)
+		if !st.sawWide {
+			st.legacySeen = true
+		}
+		return nil
+	}
 	entries, err := decodeHashLegacyBlobValue(value)
 	if err != nil {
 		return err
@@ -106,6 +120,7 @@ func (r *RedisDB) HandleHashLegacyBlob(key, value []byte) error {
 	if st.sawWide {
 		return nil
 	}
+	st.legacySeen = true
 	for field, fieldValue := range entries {
 		st.fields[field] = []byte(fieldValue)
 	}

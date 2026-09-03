@@ -112,6 +112,7 @@ type redisZSetState struct {
 	declaredLen    int64
 	members        map[string]float64
 	sawWide        bool
+	legacySeen     bool
 	expireAtMs     uint64
 	hasTTL         bool
 	inlineTTLOwned bool
@@ -180,6 +181,12 @@ func (r *RedisDB) HandleZSetMember(key, value []byte) error {
 	userKey, member, ok := parseZSetMemberKey(key)
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidZSetKey, "member key: %q", key)
+	}
+	if r.countOnly {
+		st := r.zsetState(userKey)
+		r.markZSetWide(st)
+		st.members[string(member)] = 0
+		return nil
 	}
 	if len(value) != redisZSetScoreSize {
 		return cockroachdberr.Wrapf(ErrRedisInvalidZSetMember,
@@ -273,6 +280,13 @@ func (r *RedisDB) HandleZSetLegacyBlob(key, value []byte) error {
 	if !ok {
 		return cockroachdberr.Wrapf(ErrRedisInvalidZSetLegacyBlob, "key: %q", key)
 	}
+	if r.countOnly {
+		st := r.zsetState(userKey)
+		if !st.sawWide {
+			st.legacySeen = true
+		}
+		return nil
+	}
 	entries, err := decodeZSetLegacyBlobValue(value)
 	if err != nil {
 		return err
@@ -287,6 +301,7 @@ func (r *RedisDB) HandleZSetLegacyBlob(key, value []byte) error {
 		// would surface stale post-migration leftovers in the dump.
 		return nil
 	}
+	st.legacySeen = true
 	for _, e := range entries {
 		st.members[e.member] = e.score
 	}

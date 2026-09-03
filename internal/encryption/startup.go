@@ -28,7 +28,7 @@ type StartupConfig struct {
 	// (downgrade prevention).
 	EncryptionEnabled bool
 
-	// KEKConfigured is true iff --kekFile is non-empty. The KEK
+	// KEKConfigured is true iff one configured KEK source loaded. The KEK
 	// itself is supplied via KEK below; KEKConfigured exists
 	// independently so the helper can distinguish "operator did
 	// not supply a KEK source" from "supplied but failed to load"
@@ -203,7 +203,7 @@ func guardSidecarWithoutFlag(cfg StartupConfig, sidecarPresent bool) error {
 }
 
 // guardKEKRequired fires when the operator turned on
-// --encryption-enabled without supplying --kekFile. A flag-on /
+// --encryption-enabled without supplying a KEK source. A flag-on /
 // KEK-off node would refuse every mutator at the Stage 6B-2 RPC
 // gate AND HaltApply if a mutator ever did commit, neither of
 // which matches the operator's stated intent. Fail fast at startup.
@@ -220,7 +220,7 @@ func guardKEKRequired(cfg StartupConfig) error {
 // guardKEKMatchesSidecar attempts to KEK-unwrap every wrapped DEK
 // in the sidecar. A single failure fires ErrKEKMismatch with the
 // offending key_id annotated — the classic operator error here is
-// "wrong --kekFile points at a key from a different cluster" and
+// "the configured KEK belongs to a different cluster" and
 // the key_id identifies which DEK could not be unwrapped, which is
 // almost always enough to root-cause.
 //

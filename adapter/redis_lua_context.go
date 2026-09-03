@@ -50,7 +50,8 @@ type luaScriptContext struct {
 	// buggy script from probing unbounded unique non-existent keys and
 	// blowing up memory. Once full, further misses fall back to the
 	// server-side probe (still correct, just not cached).
-	negativeType map[string]bool
+	negativeType      map[string]bool
+	negativeTypeLimit int
 
 	// rawTypeAtStart caches the TTL-unfiltered type observed at startTS. Commit
 	// planning needs this raw type to decide whether a logically absent key has
@@ -293,24 +294,25 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 	}
 	startTS := readTimestamp.Timestamp()
 	return &luaScriptContext{
-		server:         server,
-		startTS:        startTS,
-		readTimestamp:  readTimestamp,
-		readPin:        server.pinReadTS(startTS),
-		ctx:            ctx,
-		touched:        map[string]struct{}{},
-		readKeys:       map[string][]byte{},
-		deleted:        map[string]bool{},
-		everDeleted:    map[string]bool{},
-		negativeType:   map[string]bool{},
-		rawTypeAtStart: map[string]redisValueType{},
-		strings:        map[string]*luaStringState{},
-		lists:          map[string]*luaListState{},
-		hashes:         map[string]*luaHashState{},
-		sets:           map[string]*luaSetState{},
-		zsets:          map[string]*luaZSetState{},
-		streams:        map[string]*luaStreamState{},
-		ttls:           map[string]*luaTTLState{},
+		server:            server,
+		startTS:           startTS,
+		readTimestamp:     readTimestamp,
+		readPin:           server.pinReadTS(startTS),
+		ctx:               ctx,
+		touched:           map[string]struct{}{},
+		readKeys:          map[string][]byte{},
+		deleted:           map[string]bool{},
+		everDeleted:       map[string]bool{},
+		negativeType:      map[string]bool{},
+		negativeTypeLimit: maxNegativeTypeCacheEntries,
+		rawTypeAtStart:    map[string]redisValueType{},
+		strings:           map[string]*luaStringState{},
+		lists:             map[string]*luaListState{},
+		hashes:            map[string]*luaHashState{},
+		sets:              map[string]*luaSetState{},
+		zsets:             map[string]*luaZSetState{},
+		streams:           map[string]*luaStreamState{},
+		ttls:              map[string]*luaTTLState{},
 	}, nil
 }
 
@@ -571,7 +573,7 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 }
 
 func (c *luaScriptContext) rememberNegativeType(key []byte) {
-	if len(c.negativeType) >= maxNegativeTypeCacheEntries {
+	if len(c.negativeType) >= c.effectiveNegativeTypeLimit() {
 		return
 	}
 	// Pin the absence result for the rest of this Eval so repeated
@@ -582,6 +584,13 @@ func (c *luaScriptContext) rememberNegativeType(key []byte) {
 	// unboundedly; once full, subsequent misses correctly fall through to
 	// the server probe without caching.
 	c.negativeType[string(key)] = true
+}
+
+func (c *luaScriptContext) effectiveNegativeTypeLimit() int {
+	if c.negativeTypeLimit > 0 {
+		return c.negativeTypeLimit
+	}
+	return maxNegativeTypeCacheEntries
 }
 
 func (c *luaScriptContext) ensureKeyNotExpired(key []byte) error {

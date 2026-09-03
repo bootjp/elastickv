@@ -94,6 +94,7 @@ type SQSEncoder struct {
 	outRoot            string
 	includeSideRecords bool
 	preserveVisibility bool
+	countOnly          bool
 
 	// queues is keyed by the base64url-encoded queue name (the on-disk
 	// segment in the !sqs|queue|meta|<seg> key). Pending messages are
@@ -121,6 +122,10 @@ type sqsQueueState struct {
 	// means we have an orphan-only queue and the orphan branch
 	// already drops messages). Codex P1 round 10.
 	activeGen uint64
+	genSeen   bool
+	// messageCounts is populated only in count-only mode, where baseline
+	// scans must avoid materializing message bodies.
+	messageCounts map[uint64]uint64
 	// internalBuf accumulates side records in their on-disk shape if
 	// includeSideRecords is on. Each line is the encoded prefix +
 	// hex(rest-of-key) + value (b64) — implementation-grade detail
@@ -283,6 +288,11 @@ func (s *SQSEncoder) WithPreserveVisibility(on bool) *SQSEncoder {
 	return s
 }
 
+func (s *SQSEncoder) WithCountOnly(on bool) *SQSEncoder {
+	s.countOnly = on
+	return s
+}
+
 // WithWarnSink wires a structured warning hook (same shape as
 // RedisDB.WithWarnSink). Used for orphan messages and unresolvable side
 // records.
@@ -336,7 +346,9 @@ func (s *SQSEncoder) HandleQueueGen(key, value []byte) error {
 	if err != nil {
 		return errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
-	s.queueState(encoded).activeGen = gen
+	st := s.queueState(encoded)
+	st.activeGen = gen
+	st.genSeen = true
 	return nil
 }
 
@@ -345,9 +357,17 @@ func (s *SQSEncoder) HandleQueueGen(key, value []byte) error {
 // the per-queue routing key; the message is buffered until Finalize so it
 // can be sorted and emitted in send-order.
 func (s *SQSEncoder) HandleMessageData(key, value []byte) error {
-	encQueue, partition, isPartitioned, err := parseSQSMessageDataKey(key)
+	encQueue, partition, isPartitioned, generation, err := parseSQSMessageDataKeyWithGeneration(key)
 	if err != nil {
 		return err
+	}
+	if s.countOnly {
+		st := s.queueState(encQueue)
+		if st.messageCounts == nil {
+			st.messageCounts = make(map[uint64]uint64)
+		}
+		st.messageCounts[generation]++
+		return nil
 	}
 	rec, err := decodeSQSMessageValue(value)
 	if err != nil {
@@ -437,6 +457,38 @@ func (s *SQSEncoder) Finalize() error {
 		}
 	}
 	return firstErr
+}
+
+// RetainedRecordCounts reports source records represented by each emitted
+// queue after metadata and generation filtering.
+func (s *SQSEncoder) RetainedRecordCounts() map[string]uint64 {
+	out := make(map[string]uint64, len(s.queues))
+	for _, st := range s.queues {
+		if st.meta == nil {
+			continue
+		}
+		count := uint64(1)
+		if st.genSeen {
+			count++
+		}
+		out[st.name] = count + retainedSQSMessageCount(st)
+	}
+	return out
+}
+
+func retainedSQSMessageCount(st *sqsQueueState) uint64 {
+	if st.messageCounts != nil {
+		if st.activeGen == 0 {
+			var total uint64
+			for _, count := range st.messageCounts {
+				total += count
+			}
+			return total
+		}
+		return st.messageCounts[st.activeGen]
+	}
+	visible, _ := filterStaleGenMessages(st.messages, st.activeGen)
+	return uint64(len(visible))
 }
 
 // flushOrphanQueueSideRecords emits buffered side records for a queue
@@ -565,16 +617,23 @@ func stripPrefixSegment(key, prefix []byte) (string, error) {
 // Boundary detection (partitioned): the queue segment is terminated by
 // a literal '|' before the fixed-width partition u32. Codex P1 round 9.
 func parseSQSMessageDataKey(key []byte) (encQueue string, partition uint32, isPartitioned bool, err error) {
+	encQueue, partition, isPartitioned, _, err = parseSQSMessageDataKeyWithGeneration(key)
+	return encQueue, partition, isPartitioned, err
+}
+
+func parseSQSMessageDataKeyWithGeneration(
+	key []byte,
+) (encQueue string, partition uint32, isPartitioned bool, generation uint64, err error) {
 	rest, err := stripPrefixSegment(key, []byte(SQSMsgDataPrefix))
 	if err != nil {
-		return "", 0, false, err
+		return "", 0, false, 0, err
 	}
 	if isPartitionedRest(rest) {
-		enc, part, perr := parseSQSPartitionedQueueAndTrailer(rest, true /*hasMsgID*/, key)
+		enc, part, gen, perr := parseSQSPartitionedQueueAndTrailer(rest, true /*hasMsgID*/, key)
 		if perr != nil {
-			return "", 0, false, perr
+			return "", 0, false, 0, perr
 		}
-		return enc, part, true, nil
+		return enc, part, true, gen, nil
 	}
 	idx := scanBase64URLBoundary(rest)
 	// idx == 0 -> no queue segment; idx+genBytes >= len(rest) -> no
@@ -582,21 +641,22 @@ func parseSQSMessageDataKey(key []byte) (encQueue string, partition uint32, isPa
 	// AWS SQS message IDs are non-empty by construction, so an empty
 	// msg-id segment can never be a legitimate snapshot record.
 	if idx == 0 || idx+genBytes >= len(rest) {
-		return "", 0, false, errors.Wrapf(ErrSQSMalformedKey,
+		return "", 0, false, 0, errors.Wrapf(ErrSQSMalformedKey,
 			"queue segment or message-id segment not found in %q", key)
 	}
 	enc := rest[:idx]
 	if _, err := base64.RawURLEncoding.DecodeString(enc); err != nil {
-		return "", 0, false, errors.Wrap(ErrSQSMalformedKey, err.Error())
+		return "", 0, false, 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
 	// Validate the msg-id segment decodes too; if it doesn't, the
 	// boundary detection got it wrong and we surface an error rather
 	// than emit a record under a wrong queue.
 	encMsgID := rest[idx+genBytes:]
 	if _, err := base64.RawURLEncoding.DecodeString(encMsgID); err != nil {
-		return "", 0, false, errors.Wrap(ErrSQSMalformedKey, err.Error())
+		return "", 0, false, 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
-	return enc, 0, false, nil
+	gen := binary.BigEndian.Uint64([]byte(rest[idx : idx+genBytes]))
+	return enc, 0, false, gen, nil
 }
 
 // parseSQSGenericKey is a coarse parser for the side-record prefixes
@@ -614,7 +674,7 @@ func parseSQSGenericKey(key []byte, prefix string) (string, error) {
 		// Side-record dispatch routes by queue only — the partition
 		// trailer is parsed for validation but the value is discarded
 		// here. M5-3 design doc §"Decoder lift" pins this contract.
-		encQueue, _, perr := parseSQSPartitionedQueueAndTrailer(rest, false /*hasMsgID*/, key)
+		encQueue, _, _, perr := parseSQSPartitionedQueueAndTrailer(rest, false /*hasMsgID*/, key)
 		if perr != nil {
 			return "", perr
 		}
@@ -652,39 +712,41 @@ func isPartitionedRest(rest string) bool {
 //
 // Anything else surfaces ErrSQSMalformedKey rather than emitting
 // records under a wrong queue.
-func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey []byte) (string, uint32, error) {
+func parseSQSPartitionedQueueAndTrailer(rest string, hasMsgID bool, originalKey []byte) (string, uint32, uint64, error) {
 	body := rest[len(sqsPartitionedDiscriminator):]
 	terminator := strings.IndexByte(body, '|')
 	if terminator <= 0 {
-		return "", 0, errors.Wrapf(ErrSQSMalformedKey,
+		return "", 0, 0, errors.Wrapf(ErrSQSMalformedKey,
 			"partitioned key missing queue terminator in %q", originalKey)
 	}
 	encQueue := body[:terminator]
 	if _, err := base64.RawURLEncoding.DecodeString(encQueue); err != nil {
-		return "", 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
+		return "", 0, 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
 	}
 	trailer := body[terminator+1:]
 	const fixedTrailerBytes = sqsPartitionBytes + genBytes
 	if hasMsgID {
 		// Need partition+gen plus at least 1 byte of msg-id.
 		if len(trailer) <= fixedTrailerBytes {
-			return "", 0, errors.Wrapf(ErrSQSMalformedKey,
+			return "", 0, 0, errors.Wrapf(ErrSQSMalformedKey,
 				"partitioned msg-data key missing message-id in %q", originalKey)
 		}
 		encMsgID := trailer[fixedTrailerBytes:]
 		if _, err := base64.RawURLEncoding.DecodeString(encMsgID); err != nil {
-			return "", 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
+			return "", 0, 0, errors.Wrap(ErrSQSMalformedKey, err.Error())
 		}
 		partition := binary.BigEndian.Uint32([]byte(trailer[:sqsPartitionBytes]))
-		return encQueue, partition, nil
+		gen := binary.BigEndian.Uint64([]byte(trailer[sqsPartitionBytes:fixedTrailerBytes]))
+		return encQueue, partition, gen, nil
 	}
 	// Side records: trailer must carry at least partition+gen.
 	if len(trailer) < fixedTrailerBytes {
-		return "", 0, errors.Wrapf(ErrSQSMalformedKey,
+		return "", 0, 0, errors.Wrapf(ErrSQSMalformedKey,
 			"partitioned side-record key trailer truncated in %q", originalKey)
 	}
 	partition := binary.BigEndian.Uint32([]byte(trailer[:sqsPartitionBytes]))
-	return encQueue, partition, nil
+	gen := binary.BigEndian.Uint64([]byte(trailer[sqsPartitionBytes:fixedTrailerBytes]))
+	return encQueue, partition, gen, nil
 }
 
 // scanBase64URLBoundary returns the index of the first byte in s that is

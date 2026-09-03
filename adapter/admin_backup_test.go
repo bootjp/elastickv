@@ -1,8 +1,10 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	stderrors "errors"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,7 @@ import (
 
 	logicalbackup "github.com/bootjp/elastickv/internal/backup"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	kvstore "github.com/bootjp/elastickv/store"
@@ -123,6 +126,10 @@ type backupTestStore struct {
 	captureErr   error
 	validateErr  error
 	valueKeys    [][]byte
+	values       map[string][]byte
+	// dropValueKeys hides keys from the value pass only, simulating a key that
+	// vanished between the key-only baseline scan and the metadata scan.
+	dropValueKeys map[string]bool
 }
 
 func (s *backupTestStore) ValidateBackupSnapshotAt(context.Context, kv.BackupRouteSnapshot, uint64, int) error {
@@ -184,11 +191,58 @@ func (s *backupTestStore) newBackupScannerAtSnapshot(ts uint64, keyFilter kv.Bac
 				continue
 			}
 		}
+		if s.dropValueKeys[string(key)] {
+			continue
+		}
 		s.valueKeys = append(s.valueKeys, append([]byte(nil), key...))
-		pairs = append(pairs, &kvstore.KVPair{Key: append([]byte(nil), key...), Value: []byte("value")})
+		value := s.values[string(key)]
+		if value == nil {
+			value = backupTestDefaultValueForKey(key)
+		}
+		pairs = append(pairs, &kvstore.KVPair{Key: append([]byte(nil), key...), Value: append([]byte(nil), value...)})
 	}
+	onExhaust := s.onExhaust
+	delay := s.scanDelay
 	closeErr := s.pairCloseErr
-	return &backupPairScanner{pairs: pairs, err: filterErr, closeErr: closeErr, onExhaust: s.onExhaust}
+	return &backupPairScanner{pairs: pairs, err: filterErr, onExhaust: onExhaust, delay: delay, closeErr: closeErr}
+}
+
+func backupTestDefaultValueForKey(key []byte) []byte {
+	scope, scoped, err := logicalbackup.ScopeForKey(key)
+	if err != nil || !scoped {
+		return []byte("value")
+	}
+	if scope.Adapter != "dynamodb" {
+		return []byte("value")
+	}
+	if bytes.HasPrefix(key, []byte(logicalbackup.DDBTableMetaPrefix)) {
+		value, err := encodeStoredDynamoTableSchema(&dynamoTableSchema{
+			TableName:            scope.Name,
+			AttributeDefinitions: map[string]string{"id": "S"},
+			PrimaryKey:           dynamoKeySchema{HashKey: "id"},
+			Generation:           1,
+		})
+		if err != nil {
+			panic(err)
+		}
+		return value
+	}
+	if bytes.HasPrefix(key, []byte(logicalbackup.DDBItemPrefix)) {
+		id := "value"
+		value, err := encodeStoredDynamoItem(map[string]attributeValue{"id": {S: &id}})
+		if err != nil {
+			panic(err)
+		}
+		return value
+	}
+	return []byte("value")
+}
+
+func backupTestJSON(t *testing.T, v any) []byte {
+	t.Helper()
+	out, err := json.Marshal(v)
+	require.NoError(t, err)
+	return out
 }
 
 type backupSliceScanner struct {
@@ -232,9 +286,10 @@ type backupPairScanner struct {
 	pairs     []*kvstore.KVPair
 	index     int
 	err       error
-	closeErr  error
 	onExhaust func()
 	once      sync.Once
+	delay     time.Duration
+	closeErr  error
 }
 
 func (s *backupPairScanner) Next(ctx context.Context) (*kvstore.KVPair, bool, error) {
@@ -245,6 +300,15 @@ func (s *backupPairScanner) Next(ctx context.Context) (*kvstore.KVPair, bool, er
 		err := s.err
 		s.err = nil
 		return nil, false, err
+	}
+	if s.delay > 0 && s.index < len(s.pairs) {
+		timer := time.NewTimer(s.delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, false, ctx.Err()
+		case <-timer.C:
+		}
 	}
 	if s.index >= len(s.pairs) {
 		s.once.Do(func() {
@@ -355,6 +419,176 @@ func TestBeginBackupLifecycleAndBaselineAtPinnedTimestamp(t *testing.T) {
 	for _, ts := range store.readTS {
 		require.Equal(t, uint64(42), ts)
 	}
+}
+
+func TestBeginBackupExpectedKeysUseRetainedCounts(t *testing.T) {
+	t.Parallel()
+	const table = "orders"
+	activeID := "active"
+	staleID := "stale"
+	schema, err := encodeStoredDynamoTableSchema(&dynamoTableSchema{
+		TableName:            table,
+		AttributeDefinitions: map[string]string{"id": "S"},
+		PrimaryKey:           dynamoKeySchema{HashKey: "id"},
+		Generation:           2,
+	})
+	require.NoError(t, err)
+	activeItem, err := encodeStoredDynamoItem(map[string]attributeValue{"id": {S: &activeID}})
+	require.NoError(t, err)
+	staleItem, err := encodeStoredDynamoItem(map[string]attributeValue{"id": {S: &staleID}})
+	require.NoError(t, err)
+	schemaKey := logicalbackup.EncodeDDBTableMetaKey(table)
+	activeKey := logicalbackup.EncodeDDBItemKey(table, 2, activeID, "")
+	staleKey := logicalbackup.EncodeDDBItemKey(table, 1, staleID, "")
+	store := &backupTestStore{
+		keys: [][]byte{staleKey, activeKey, schemaKey},
+		values: map[string][]byte{
+			string(schemaKey): schema,
+			string(activeKey): activeItem,
+			string(staleKey):  staleItem,
+		},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	require.Len(t, begin.GetExpectedKeys(), 1)
+	require.Equal(t, "dynamodb", begin.GetExpectedKeys()[0].GetAdapter())
+	require.Equal(t, table, begin.GetExpectedKeys()[0].GetScope())
+	require.EqualValues(t, 2, begin.GetExpectedKeys()[0].GetKeyCount())
+	require.Equal(t, [][]byte{schemaKey}, store.valueKeys)
+}
+
+func TestBeginBackupExpectedKeysAvoidMaterializingBlobValues(t *testing.T) {
+	t.Parallel()
+	const (
+		bucket   = "photos"
+		object   = "large.bin"
+		uploadID = "upload-1"
+	)
+	bucketKey := s3keys.BucketMetaKey(bucket)
+	manifestKey := s3keys.ObjectManifestKey(bucket, 1, object)
+	blobKey := s3keys.BlobKey(bucket, 1, object, uploadID, 1, 0)
+	store := &backupTestStore{
+		keys: [][]byte{bucketKey, manifestKey, blobKey},
+		values: map[string][]byte{
+			string(bucketKey): backupTestJSON(t, map[string]any{
+				"bucket_name": bucket,
+				"generation":  1,
+			}),
+			string(manifestKey): backupTestJSON(t, map[string]any{
+				"upload_id": uploadID,
+				"parts": []map[string]any{{
+					"part_no":     1,
+					"chunk_count": 1,
+				}},
+			}),
+			string(blobKey): []byte("large-blob-body"),
+		},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"s3"}})
+	require.NoError(t, err)
+	require.Len(t, begin.GetExpectedKeys(), 1)
+	require.Equal(t, "s3", begin.GetExpectedKeys()[0].GetAdapter())
+	require.Equal(t, bucket, begin.GetExpectedKeys()[0].GetScope())
+	require.EqualValues(t, 3, begin.GetExpectedKeys()[0].GetKeyCount())
+	require.Equal(t, [][]byte{bucketKey, manifestKey}, store.valueKeys)
+}
+
+func TestBeginBackupExpectedKeysAvoidMaterializingRedisPayloadValues(t *testing.T) {
+	t.Parallel()
+	stringKey := redisStrKey([]byte("str"))
+	hllKey := redisHLLKey([]byte("hll"))
+	ttlKey := redisTTLKey([]byte("str"))
+	hashMetaKey := kvstore.HashMetaKey([]byte("hash"))
+	hashFieldKey := kvstore.HashFieldKey([]byte("hash"), []byte("field"))
+	listMetaKey := kvstore.ListMetaKey([]byte("list"))
+	listItemKey := kvstore.ListItemKey([]byte("list"), 1)
+	setMetaKey := kvstore.SetMetaKey([]byte("set"))
+	setMemberKey := kvstore.SetMemberKey([]byte("set"), []byte("member"))
+	zsetLegacyKey := redisZSetKey([]byte("zset"))
+	zsetMetaKey := kvstore.ZSetMetaKey([]byte("zset"))
+	zsetMemberKey := kvstore.ZSetMemberKey([]byte("zset"), []byte("member"))
+	streamMetaKey := kvstore.StreamMetaKey([]byte("stream"))
+	streamEntryKey := kvstore.StreamEntryKey([]byte("stream"), 1, 0)
+	listMeta, err := kvstore.MarshalListMeta(kvstore.ListMeta{Head: 0, Tail: 1, Len: 1})
+	require.NoError(t, err)
+	streamMeta, err := kvstore.MarshalStreamMeta(kvstore.StreamMeta{Length: 1, LastMs: 1})
+	require.NoError(t, err)
+	store := &backupTestStore{
+		keys: [][]byte{
+			stringKey,
+			hllKey,
+			ttlKey,
+			hashMetaKey,
+			hashFieldKey,
+			listMetaKey,
+			listItemKey,
+			setMetaKey,
+			setMemberKey,
+			zsetLegacyKey,
+			zsetMetaKey,
+			zsetMemberKey,
+			streamMetaKey,
+			streamEntryKey,
+		},
+		values: map[string][]byte{
+			string(stringKey):      bytes.Repeat([]byte("s"), 1<<20),
+			string(hllKey):         bytes.Repeat([]byte("h"), 1<<20),
+			string(ttlKey):         encodeRedisTTL(time.Now().Add(time.Hour)),
+			string(hashMetaKey):    kvstore.MarshalHashMeta(kvstore.HashMeta{Len: 1}),
+			string(hashFieldKey):   bytes.Repeat([]byte("f"), 1<<20),
+			string(listMetaKey):    listMeta,
+			string(listItemKey):    bytes.Repeat([]byte("l"), 1<<20),
+			string(setMetaKey):     kvstore.MarshalSetMeta(kvstore.SetMeta{Len: 1}),
+			string(zsetLegacyKey):  bytes.Repeat([]byte("z"), 1<<20),
+			string(zsetMetaKey):    kvstore.MarshalZSetMeta(kvstore.ZSetMeta{Len: 1}),
+			string(zsetMemberKey):  kvstore.MarshalZSetScore(1),
+			string(streamMetaKey):  streamMeta,
+			string(streamEntryKey): bytes.Repeat([]byte("x"), 1<<20),
+		},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"redis"}})
+	require.NoError(t, err)
+	require.Len(t, begin.GetExpectedKeys(), 1)
+	require.Equal(t, "redis", begin.GetExpectedKeys()[0].GetAdapter())
+	require.Equal(t, "db_0", begin.GetExpectedKeys()[0].GetScope())
+	require.EqualValues(t, 13, begin.GetExpectedKeys()[0].GetKeyCount())
+	require.Equal(t, [][]byte{
+		ttlKey,
+		hashMetaKey,
+		listMetaKey,
+		setMetaKey,
+		zsetMetaKey,
+		streamMetaKey,
+	}, store.valueKeys)
+}
+
+func TestBeginBackupBaselineSkipsUnselectedAdapterValues(t *testing.T) {
+	t.Parallel()
+	schemaKey := logicalbackup.EncodeDDBTableMetaKey("orders")
+	store := &backupTestStore{
+		keys:   [][]byte{schemaKey},
+		values: map[string][]byte{string(schemaKey): []byte("future-format")},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"redis"}})
+	require.NoError(t, err)
+	require.Empty(t, begin.GetExpectedKeys())
+	require.Empty(t, store.valueKeys)
 }
 
 func TestSnapshotBackupGroupsExcludesReservedTSOGroup(t *testing.T) {
@@ -493,6 +727,9 @@ func TestStreamBackupUsesPinTimestampAndScopeFilter(t *testing.T) {
 	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
 	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
 	require.NoError(t, err)
+	store.mu.Lock()
+	store.valueKeys = nil
+	store.mu.Unlock()
 
 	stream := &backupTestStream{ctx: context.Background()}
 	err = srv.StreamBackup(&pb.StreamBackupRequest{
@@ -643,7 +880,7 @@ func TestStreamBackupFailsClosedWithoutPinnedRouteSnapshot(t *testing.T) {
 
 func TestListBackupScopesReportsScannerCloseError(t *testing.T) {
 	t.Parallel()
-	store := &backupTestStore{keys: [][]byte{[]byte(logicalbackup.RedisStringPrefix + "key")}}
+	store := &backupTestStore{keys: [][]byte{logicalbackup.EncodeDDBTableMetaKey("orders")}}
 	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
 	proposer := newBackupTestProposer()
 	srv := newBackupControlTestServer(t, store, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
@@ -651,7 +888,7 @@ func TestListBackupScopesReportsScannerCloseError(t *testing.T) {
 	require.NoError(t, err)
 
 	store.mu.Lock()
-	store.keyCloseErr = stderrors.New("close failed")
+	store.pairCloseErr = stderrors.New("close failed")
 	store.mu.Unlock()
 	_, err = srv.ListAdaptersAndScopes(context.Background(), &pb.ListAdaptersAndScopesRequest{PinToken: begin.GetPinToken()})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
@@ -899,7 +1136,7 @@ func TestBackupTokenDeadlineRotatesAndFailsClosed(t *testing.T) {
 	_, err = srv.ListAdaptersAndScopes(context.Background(), &pb.ListAdaptersAndScopesRequest{PinToken: begin.GetPinToken()})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	err = srv.StreamBackup(&pb.StreamBackupRequest{PinToken: begin.GetPinToken()}, &backupTestStream{ctx: context.Background()})
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.NoError(t, err, "streams use the renewed server-side session deadline")
 
 	_, err = srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: renewed.GetPinToken()})
 	require.NoError(t, err)
@@ -994,6 +1231,131 @@ func TestBeginBackupMapsForwardedCapacityReservationStatusToResourceExhausted(t 
 
 	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
+}
+
+func TestBackupBaselineSelectionNarrowsAdaptersToScopes(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		adapters []string
+		scopes   []*pb.BackupScope
+		want     logicalbackup.AdapterSet
+	}{
+		{
+			name: "no filter keeps every adapter",
+			want: logicalbackup.AllAdapters(),
+		},
+		{
+			name:   "scopes alone narrow the default all-adapter set",
+			scopes: []*pb.BackupScope{{Adapter: "redis", Scope: "db_0"}},
+			want:   logicalbackup.AdapterSet{Redis: true},
+		},
+		{
+			name:     "explicit adapters intersect with scopes",
+			adapters: []string{"redis", "s3"},
+			scopes:   []*pb.BackupScope{{Adapter: "redis", Scope: "db_0"}},
+			want:     logicalbackup.AdapterSet{Redis: true},
+		},
+		{
+			name:     "adapters without scopes are untouched",
+			adapters: []string{"redis", "s3"},
+			want:     logicalbackup.AdapterSet{Redis: true, S3: true},
+		},
+		{
+			name: "scopes across adapters keep both",
+			scopes: []*pb.BackupScope{
+				{Adapter: "redis", Scope: "db_0"},
+				{Adapter: "sqs", Scope: "jobs"},
+			},
+			want: logicalbackup.AdapterSet{Redis: true, SQS: true},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := backupBaselineSelectionFromBeginRequest(&pb.BeginBackupRequest{
+				Adapters: tt.adapters,
+				Scopes:   tt.scopes,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.want, got.adapters)
+		})
+	}
+}
+
+func TestBeginBackupScopedDumpIgnoresUnrequestedAdapterKeys(t *testing.T) {
+	t.Parallel()
+
+	// A DynamoDB key the classifier cannot parse. A redis-scoped dump must
+	// never look at it, so BeginBackup has to succeed.
+	brokenKey := append(append([]byte(nil), logicalbackup.DDBTableMetaPrefix...), 0xff)
+	store := &backupTestStore{keys: [][]byte{brokenKey}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{
+		Scopes: []*pb.BackupScope{{Adapter: "redis", Scope: "db_0"}},
+	})
+	require.NoError(t, err)
+	require.Empty(t, begin.GetExpectedKeys())
+}
+
+func TestBeginBackupAdvertisesScopedBaselineProtocol(t *testing.T) {
+	t.Parallel()
+
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, &backupTestStore{},
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	require.Equal(t, backupProtocolVersionV2, begin.GetBackupProtocolVersion())
+}
+
+func TestListAdaptersAndScopesReusesBeginSelection(t *testing.T) {
+	t.Parallel()
+
+	// Same broken DynamoDB key: the listing pass must honor the redis-only
+	// selection recorded by BeginBackup instead of rescanning all adapters.
+	brokenKey := append(append([]byte(nil), logicalbackup.DDBTableMetaPrefix...), 0xff)
+	store := &backupTestStore{keys: [][]byte{brokenKey}}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{Adapters: []string{"redis"}})
+	require.NoError(t, err)
+
+	listed, err := srv.ListAdaptersAndScopes(context.Background(), &pb.ListAdaptersAndScopesRequest{
+		PinToken: begin.GetPinToken(),
+	})
+	require.NoError(t, err)
+	require.Empty(t, listed.GetScopes())
+}
+
+func TestBeginBackupFailsWhenBaselineMetadataKeyDisappears(t *testing.T) {
+	t.Parallel()
+
+	schemaKey := logicalbackup.EncodeDDBTableMetaKey("orders")
+	store := &backupTestStore{
+		keys:          [][]byte{schemaKey},
+		dropValueKeys: map[string]bool{string(schemaKey): true},
+	}
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	srv := newBackupControlTestServer(t, store,
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: newBackupTestProposer()}, nil)
+
+	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), "disappeared between scan passes")
 }
 
 // EndBackup must refuse renewals from the moment it starts releasing. Leaving
