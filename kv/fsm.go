@@ -555,8 +555,25 @@ func requestCommitTS(r *pb.Request) (uint64, error) {
 	return commitTS, nil
 }
 
+// ErrTargetReadinessApply marks an apply that could not prove target-staged
+// readiness. It is deliberately a halt rather than an ordinary response: the
+// entry is already committed, so a voter that returns an ordinary error here
+// advances its applied index and permanently skips a write the rest of the
+// cluster performed.
+//
+// The underlying readiness check still reads the catalog watcher's current view
+// (f.routes.Current()), which is process-local: it arrives over the cross-group
+// catalog stream with no ordering relationship to this Raft log, so two voters
+// at the same index can legitimately disagree. Halting converts that silent
+// divergence into a loud stop. It does not make apply deterministic -- see
+// docs/design/2026_09_05_proposed_apply_time_readiness_evidence.md for that.
+var ErrTargetReadinessApply = errors.New("target staged readiness: FSM apply could not prove readiness; halting apply")
+
 func (f *kvFSM) applyRequest(ctx context.Context, r *pb.Request) any {
 	if err := f.applyRequestErr(ctx, r); err != nil {
+		if errors.Is(err, ErrRouteCutoverPending) {
+			return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: apply target readiness"))
+		}
 		return err
 	}
 	return nil

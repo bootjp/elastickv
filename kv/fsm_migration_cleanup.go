@@ -11,6 +11,13 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
+// ErrMigrationCleanupApply marks a replica-local cleanup failure. Import,
+// promote and retire already halt on their equivalents; cleanup returning an
+// ordinary error let the Raft engine advance the applied index past a committed
+// entry that this voter never performed, so it would silently keep versions the
+// rest of the cluster deleted.
+var ErrMigrationCleanupApply = errors.New("migration cleanup: FSM apply failed; halting apply")
+
 // MarshalMigrationCleanupCommand encodes a bounded cleanup operation for Raft.
 func MarshalMigrationCleanupCommand(req *pb.CleanupMigrationRequest) ([]byte, error) {
 	if req == nil {
@@ -33,16 +40,34 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 	}
 	cleaner, ok := f.store.(store.MigrationCleaner)
 	if !ok {
-		return errors.WithStack(store.ErrNotSupported)
+		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrMigrationCleanupApply), "kv/fsm: migration cleanup store"))
 	}
 	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA {
-		return errors.WithStack(cleaner.ClearMigrationState(ctx, req.GetJobId(), f.pendingApplyIdx))
+		if err := cleaner.ClearMigrationState(ctx, req.GetJobId(), f.pendingApplyIdx); err != nil {
+			return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: clear migration state"))
+		}
+		return nil
 	}
 	result, err := cleaner.CleanupVersions(ctx, migrationCleanupOptionsFromProto(req, f.pendingApplyIdx))
 	if err != nil {
-		return errors.WithStack(err)
+		if isMigrationCleanupOrdinaryApplyError(err) {
+			return errors.Wrap(err, "kv/fsm: apply migration cleanup")
+		}
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: apply migration cleanup"))
 	}
 	return result
+}
+
+// isMigrationCleanupOrdinaryApplyError separates deterministic verdicts on the
+// request itself -- every replica reaches them for the same entry, so they are
+// safe to return as an ordinary response -- from replica-local store failures
+// (Pebble read, decrypt, batch, commit), which must halt rather than let this
+// voter skip a committed cleanup.
+func isMigrationCleanupOrdinaryApplyError(err error) bool {
+	return errors.Is(err, ErrInvalidRequest) ||
+		errors.Is(err, store.ErrInvalidImportVersion) ||
+		errors.Is(err, store.ErrValueTooLarge) ||
+		errors.Is(err, store.ErrSnapshotKeyTooLarge)
 }
 
 func migrationCleanupOptionsFromProto(req *pb.CleanupMigrationRequest, appliedIndex uint64) store.CleanupVersionsOptions {

@@ -425,8 +425,25 @@ func (b MigrationBracket) containsDecodedS3Route(rawKey, routeStart, routeEnd []
 	if routeKeyInRange(rawKey, routeStart, routeEnd) {
 		return true
 	}
+	return S3BucketAuxiliaryRouteSelected(bucket, routeStart, routeEnd)
+}
+
+// S3BucketAuxiliaryRouteSelected reports whether the slice [routeStart,routeEnd)
+// is the OWNER of a bucket's auxiliary rows -- its metadata and generation keys.
+//
+// Ownership is point containment of the bucket's route start, not intersection.
+// A split inside a bucket's route interval leaves that bucket's auxiliary rows
+// with the preceding slice, so exactly one slice claims them. Intersection would
+// let every slice overlapping the bucket claim the same rows, which duplicates
+// them on export and -- far worse -- lets CLEANUP delete rows a moving slice
+// never exported and does not own.
+//
+// This is the single definition. adapter's export filter and the migration
+// bracket both route through it precisely so they cannot drift apart again:
+// export and cleanup disagreeing about ownership is silent data loss.
+func S3BucketAuxiliaryRouteSelected(bucket string, routeStart, routeEnd []byte) bool {
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+	return routeKeyInRange(bucketRouteStart, routeStart, normalizeMigrationRouteEnd(routeEnd))
 }
 
 func (b MigrationBracket) decodedS3Bucket(rawKey []byte) (string, bool) {

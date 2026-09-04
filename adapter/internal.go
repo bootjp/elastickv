@@ -1174,9 +1174,11 @@ func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func
 	}
 }
 
+// decodedS3BucketRouteSelected delegates to the one definition of bucket
+// auxiliary ownership. Keeping a second copy here is how the export filter and
+// the cleanup bracket drifted apart in the first place.
 func decodedS3BucketRouteSelected(bucket string, routeStart, routeEnd []byte) bool {
-	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return keyInRouteRange(bucketRouteStart, routeStart, routeEnd)
+	return distribution.S3BucketAuxiliaryRouteSelected(bucket, routeStart, routeEnd)
 }
 
 func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
