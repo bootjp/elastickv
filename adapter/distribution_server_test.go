@@ -12,6 +12,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -64,11 +65,37 @@ func TestDistributionServerGetRoute_NormalizesFilesystemChunkKeys(t *testing.T) 
 	require.Equal(t, uint64(2), resp.RaftGroupId)
 }
 
+func TestDistributionServerGetRoute_NormalizesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	bucket := "bucket-a"
+	routeKey := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), routeKey, 1)
+	engine.UpdateRoute(routeKey, nil, 2)
+
+	s := NewDistributionServer(engine, nil)
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		resp, err := s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: key})
+		require.NoError(t, err)
+		require.Equal(t, routeKey, resp.Start)
+		require.Equal(t, uint64(2), resp.RaftGroupId)
+	}
+}
+
 func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
 	t.Parallel()
 
 	engine := distribution.NewEngine()
-	engine.UpdateRoute([]byte("a"), nil, 1)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
 	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
 	_, err := catalog.Save(context.Background(), 0, []distribution.RouteDescriptor{
 		{RouteID: 1, Start: []byte("a"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
@@ -86,10 +113,36 @@ func TestDistributionServerRouteReadsHonorStartupGate(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, codes.Unavailable, status.Code(err))
 
+	_, err = s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("a"),
+		CatalogVersion: engine.Version(),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("a"),
+		End:            []byte("z"),
+		CatalogVersion: engine.Version(),
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.Unavailable, status.Code(err))
+
 	blocked = false
 	_, err = s.GetRoute(context.Background(), &pb.GetRouteRequest{Key: []byte("a")})
 	require.NoError(t, err)
 	_, err = s.ListRoutes(context.Background(), &pb.ListRoutesRequest{})
+	require.NoError(t, err)
+	_, err = s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("a"),
+		CatalogVersion: engine.Version(),
+	})
+	require.NoError(t, err)
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("a"),
+		End:            []byte("z"),
+		CatalogVersion: engine.Version(),
+	})
 	require.NoError(t, err)
 }
 
@@ -423,6 +476,130 @@ func TestDistributionServerListRoutes_RequiresCatalog(t *testing.T) {
 	require.Error(t, err)
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	require.ErrorContains(t, err, errDistributionCatalogNotConfigured.Error())
+}
+
+func TestDistributionServerGetRouteOwnership_UsesExactVersionSnapshot(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 7,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID:                2,
+				Start:                  []byte("m"),
+				End:                    nil,
+				GroupID:                2,
+				State:                  distribution.RouteStateMigratingTarget,
+				StagedVisibilityActive: true,
+				MigrationJobID:         44,
+				MinWriteTSExclusive:    55,
+			},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("t"),
+		CatalogVersion: 7,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Found)
+	require.Equal(t, uint64(7), resp.CatalogVersion)
+	require.Equal(t, uint64(2), resp.Route.RouteId)
+	require.Equal(t, uint64(2), resp.Route.RaftGroupId)
+	require.Equal(t, pb.RouteState_ROUTE_STATE_MIGRATING_TARGET, resp.Route.State)
+	require.True(t, resp.Route.StagedVisibilityActive)
+	require.Equal(t, uint64(44), resp.Route.MigrationJobId)
+	require.Equal(t, uint64(55), resp.Route.MinWriteTsExclusive)
+
+	miss, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("0"),
+		CatalogVersion: 7,
+	})
+	require.NoError(t, err)
+	require.False(t, miss.Found)
+	require.Equal(t, uint64(7), miss.CatalogVersion)
+	require.Nil(t, miss.Route)
+}
+
+func TestDistributionServerGetIntersectingRoutes_UsesExactVersionSnapshot(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 9,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte("g"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("g"), End: []byte("m"), GroupID: 2, State: distribution.RouteStateWriteFenced},
+			{RouteID: 3, Start: []byte("m"), End: nil, GroupID: 3, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("f"),
+		End:            []byte("z"),
+		CatalogVersion: 9,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(9), resp.CatalogVersion)
+	require.Len(t, resp.Routes, 3)
+	require.Equal(t, []uint64{1, 2, 3}, []uint64{resp.Routes[0].RouteId, resp.Routes[1].RouteId, resp.Routes[2].RouteId})
+
+	rightOpen, err := s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte("m"),
+		End:            nil,
+		CatalogVersion: 9,
+	})
+	require.NoError(t, err)
+	require.Len(t, rightOpen.Routes, 1)
+	require.Equal(t, uint64(3), rightOpen.Routes[0].RouteId)
+}
+
+func TestDistributionServerOwnershipRPCs_RejectUnknownCatalogVersion(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	_, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            []byte("a"),
+		CatalogVersion: 2,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.NotFound, status.Code(err))
+	require.ErrorContains(t, err, errDistributionCatalogVersionNotFound.Error())
+
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{
+		Start:          []byte(""),
+		CatalogVersion: 2,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.NotFound, status.Code(err))
+	require.ErrorContains(t, err, errDistributionCatalogVersionNotFound.Error())
+}
+
+func TestDistributionServerOwnershipRPCs_RequireEngine(t *testing.T) {
+	t.Parallel()
+
+	s := NewDistributionServer(nil, nil)
+	_, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{CatalogVersion: 1})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, errDistributionEngineNotConfigured.Error())
+
+	_, err = s.GetIntersectingRoutes(context.Background(), &pb.GetIntersectingRoutesRequest{CatalogVersion: 1})
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.ErrorContains(t, err, errDistributionEngineNotConfigured.Error())
 }
 
 func TestDistributionServerSplitRange_Success(t *testing.T) {
@@ -1806,4 +1983,68 @@ func TestDistributionServerGetTimestamp_GatesOnlyThePendingMarker(t *testing.T) 
 	require.Equal(t, codes.PermissionDenied, status.Code(err))
 	require.Equal(t, [][2]bool{{false, true}}, seen,
 		"cutover is already durable; only phase D is still an activation")
+}
+
+// GetRouteOwnership answers the historical owner of a key, so it has to
+// normalize the same way GetRoute does. An internal storage key -- here a
+// filesystem chunk -- routes by its logical !fs|route|chk| key, and the raw
+// !fs|chk| bytes sort into a different route entirely. Without normalization
+// the RPC reports the raw-prefix owner rather than the group that owned the
+// key at that catalog version.
+func TestDistributionServerGetRouteOwnership_NormalizesFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
+
+	home := uint64(11)
+	inode := uint64(22)
+	routeKey := fskeys.ChunkRouteKey(home, inode)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 3,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	resp, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+		Key:            fskeys.ChunkKey(home, inode, 99),
+		CatalogVersion: 3,
+	})
+	require.NoError(t, err)
+	require.True(t, resp.Found)
+	require.Equal(t, uint64(2), resp.Route.RaftGroupId,
+		"the chunk must resolve to its logical route owner, not the raw-prefix owner")
+	require.Equal(t, uint64(2), resp.Route.RouteId)
+}
+
+func TestDistributionServerGetRouteOwnership_NormalizesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	bucket := "bucket-a"
+	routeKey := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 3,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeKey, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeKey, End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+
+	s := NewDistributionServer(engine, nil)
+	for _, key := range [][]byte{
+		s3keys.BucketMetaKey(bucket),
+		s3keys.BucketGenerationKey(bucket),
+	} {
+		resp, err := s.GetRouteOwnership(context.Background(), &pb.GetRouteOwnershipRequest{
+			Key:            key,
+			CatalogVersion: 3,
+		})
+		require.NoError(t, err)
+		require.True(t, resp.Found)
+		require.Equal(t, uint64(2), resp.Route.RaftGroupId,
+			"bucket auxiliary keys must resolve to the bucket route owner, not the raw-prefix owner")
+		require.Equal(t, uint64(2), resp.Route.RouteId)
+	}
 }

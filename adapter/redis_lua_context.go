@@ -53,6 +53,11 @@ type luaScriptContext struct {
 	negativeType      map[string]bool
 	negativeTypeLimit int
 
+	// rawTypeAtStart caches the TTL-unfiltered type observed at startTS. Commit
+	// planning needs this raw type to decide whether a logically absent key has
+	// expired physical rows that must be cleaned up before recreation.
+	rawTypeAtStart map[string]redisValueType
+
 	// keyTypeProbeCount counts how many times the server-side keyTypeAt
 	// helper was invoked during this Eval. Only read by tests via
 	// luaScriptContext methods; ordinary production code never reads it.
@@ -300,6 +305,7 @@ func newLuaScriptContext(ctx context.Context, server *RedisServer) (*luaScriptCo
 		everDeleted:       map[string]bool{},
 		negativeType:      map[string]bool{},
 		negativeTypeLimit: maxNegativeTypeCacheEntries,
+		rawTypeAtStart:    map[string]redisValueType{},
 		strings:           map[string]*luaStringState{},
 		lists:             map[string]*luaListState{},
 		hashes:            map[string]*luaHashState{},
@@ -552,22 +558,32 @@ func (c *luaScriptContext) keyType(key []byte) (redisValueType, error) {
 	}
 
 	c.keyTypeProbeCount++
-	typ, err := c.server.keyTypeAt(c.scriptCtx(), key, c.startTS)
+	rawTyp, err := c.rawStartTypeForCommitPlan(c.scriptCtx(), key)
 	if err != nil {
 		return redisTypeNone, err
 	}
-	if typ == redisTypeNone && len(c.negativeType) < c.effectiveNegativeTypeLimit() {
-		// Pin the absence result for the rest of this Eval so repeated
-		// BullMQ-style polling of a missing key (e.g. a "delayed" zset)
-		// does not re-run the ~8-seek rawKeyTypeAt probe on every
-		// redis.call.
-		//
-		// Bounded to keep adversarial scripts from growing the map
-		// unboundedly; once full, subsequent misses correctly fall
-		// through to the server probe without caching.
-		c.negativeType[string(key)] = true
+	typ, err := c.server.applyTTLFilter(c.scriptCtx(), key, c.startTS, rawTyp)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	if typ == redisTypeNone {
+		c.rememberNegativeType(key)
 	}
 	return typ, nil
+}
+
+func (c *luaScriptContext) rememberNegativeType(key []byte) {
+	if len(c.negativeType) >= c.effectiveNegativeTypeLimit() {
+		return
+	}
+	// Pin the absence result for the rest of this Eval so repeated
+	// BullMQ-style polling of a missing key (e.g. a "delayed" zset) does
+	// not re-run the ~8-seek rawKeyTypeAt probe on every redis.call.
+	//
+	// Bounded to keep adversarial scripts from growing the map
+	// unboundedly; once full, subsequent misses correctly fall through to
+	// the server probe without caching.
+	c.negativeType[string(key)] = true
 }
 
 func (c *luaScriptContext) effectiveNegativeTypeLimit() int {
@@ -3765,7 +3781,7 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 	}
 
 	keyBytes := []byte(key)
-	rawStartType, err := c.server.rawKeyTypeAt(ctx, keyBytes, c.startTS)
+	rawStartType, err := c.rawStartTypeForCommitPlan(ctx, keyBytes)
 	if err != nil {
 		return luaKeyPlan{}, err
 	}
@@ -3797,6 +3813,29 @@ func (c *luaScriptContext) commitPlanForKey(ctx context.Context, key string, com
 		preserveExisting:    valuePlan.preserveExisting,
 		inlineMetaRewritten: valuePlan.inlineMetaRewritten,
 	}, nil
+}
+
+func (c *luaScriptContext) rawStartTypeForCommitPlan(ctx context.Context, key []byte) (redisValueType, error) {
+	k := string(key)
+	if typ, ok := c.rawTypeAtStart[k]; ok {
+		return typ, nil
+	}
+	typ, err := c.server.rawKeyTypeAt(ctx, key, c.startTS)
+	if err != nil {
+		return redisTypeNone, err
+	}
+	c.rememberRawTypeAtStart(k, typ)
+	return typ, nil
+}
+
+func (c *luaScriptContext) rememberRawTypeAtStart(key string, typ redisValueType) {
+	if c.rawTypeAtStart == nil {
+		c.rawTypeAtStart = map[string]redisValueType{}
+	}
+	if _, ok := c.rawTypeAtStart[key]; !ok && len(c.rawTypeAtStart) >= maxNegativeTypeCacheEntries {
+		return
+	}
+	c.rawTypeAtStart[key] = typ
 }
 
 func luaWideFenceReadKeysForPlan(key []byte, finalType, startType redisValueType, preserveExisting bool) [][]byte {

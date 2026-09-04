@@ -154,6 +154,7 @@ var (
 	errDistributionNotLeader              = errors.New("not leader for distribution catalog")
 	errDistributionCoordinatorRequired    = errors.New("distribution coordinator is not configured")
 	errDistributionEngineNotConfigured    = errors.New("distribution engine is not configured")
+	errDistributionCatalogVersionNotFound = errors.New("route catalog version not found")
 	errDistributionCatalogMutationInvalid = errors.New("catalog store mutation is invalid")
 )
 
@@ -198,7 +199,7 @@ func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteReque
 	if err := s.requireReadReady(); err != nil {
 		return nil, err
 	}
-	r, ok := s.engine.GetRoute(kv.RouteKey(req.Key))
+	r, ok := s.engine.GetRoute(kv.RouteOwnershipKey(req.Key))
 	if !ok {
 		return &pb.GetRouteResponse{}, nil
 	}
@@ -440,6 +441,67 @@ func (s *DistributionServer) ListRoutes(ctx context.Context, req *pb.ListRoutesR
 		CatalogVersion: snapshot.Version,
 		Routes:         toProtoRouteDescriptors(snapshot.Routes),
 	}, nil
+}
+
+func (s *DistributionServer) GetRouteOwnership(ctx context.Context, req *pb.GetRouteOwnershipRequest) (*pb.GetRouteOwnershipResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
+	snapshot, err := s.routeSnapshotAt(req.GetCatalogVersion())
+	if err != nil {
+		return nil, err
+	}
+	// Normalized exactly like GetRoute above. An internal storage key -- a
+	// filesystem chunk, a Redis collection row -- routes by its logical key,
+	// so looking the raw bytes up in the snapshot answers with the owner of
+	// the raw family prefix instead of the group that actually owned the key
+	// at that catalog version.
+	route, ok := snapshot.RouteOf(kv.RouteOwnershipKey(req.GetKey()))
+	if !ok {
+		return &pb.GetRouteOwnershipResponse{
+			CatalogVersion: snapshot.Version(),
+			Found:          false,
+		}, nil
+	}
+	return &pb.GetRouteOwnershipResponse{
+		Route:          toProtoRoute(route),
+		CatalogVersion: snapshot.Version(),
+		Found:          true,
+	}, nil
+}
+
+func (s *DistributionServer) GetIntersectingRoutes(ctx context.Context, req *pb.GetIntersectingRoutesRequest) (*pb.GetIntersectingRoutesResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
+	snapshot, err := s.routeSnapshotAt(req.GetCatalogVersion())
+	if err != nil {
+		return nil, err
+	}
+	end := req.GetEnd()
+	if len(end) == 0 {
+		end = nil
+	}
+	routes := snapshot.IntersectingRoutes(req.GetStart(), end)
+	out := make([]*pb.RouteDescriptor, 0, len(routes))
+	for _, route := range routes {
+		out = append(out, toProtoRoute(route))
+	}
+	return &pb.GetIntersectingRoutesResponse{
+		Routes:         out,
+		CatalogVersion: snapshot.Version(),
+	}, nil
+}
+
+func (s *DistributionServer) routeSnapshotAt(version uint64) (distribution.RouteHistorySnapshot, error) {
+	if s.engine == nil {
+		return distribution.RouteHistorySnapshot{}, grpcStatusError(codes.FailedPrecondition, errDistributionEngineNotConfigured.Error())
+	}
+	snapshot, ok := s.engine.SnapshotAt(version)
+	if !ok {
+		return distribution.RouteHistorySnapshot{}, grpcStatusErrorf(codes.NotFound, "%s: %d", errDistributionCatalogVersionNotFound, version)
+	}
+	return snapshot, nil
 }
 
 // GetCatalogCapabilities negotiates the durable delta-watch protocol.
@@ -1162,6 +1224,19 @@ func toProtoRouteDescriptor(route distribution.RouteDescriptor) *pb.RouteDescrip
 		MigrationJobId:         route.MigrationJobID,
 		MinWriteTsExclusive:    route.MinWriteTSExclusive,
 		SplitAtHlc:             route.SplitAtHLC,
+	}
+}
+
+func toProtoRoute(route distribution.Route) *pb.RouteDescriptor {
+	return &pb.RouteDescriptor{
+		RouteId:                route.RouteID,
+		Start:                  distribution.CloneBytes(route.Start),
+		End:                    distribution.CloneBytes(route.End),
+		RaftGroupId:            route.GroupID,
+		State:                  toProtoRouteState(route.State),
+		StagedVisibilityActive: route.StagedVisibilityActive,
+		MigrationJobId:         route.MigrationJobID,
+		MinWriteTsExclusive:    route.MinWriteTSExclusive,
 	}
 }
 

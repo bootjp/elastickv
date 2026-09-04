@@ -2,6 +2,7 @@ package kv
 
 import (
 	"encoding/base64"
+	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -29,6 +30,16 @@ func TestRouteKey_NormalizesTxnWrappedS3Key(t *testing.T) {
 
 	embedded := s3keys.UploadPartKey("bucket-a", 7, "path/to/object", "upload-1", 3)
 	require.Equal(t, s3keys.RouteKey("bucket-a", 7, "path/to/object"), routeKey(txnLockKey(embedded)))
+}
+
+func TestRouteOwnershipKey_NormalizesS3BucketAuxiliaryKeys(t *testing.T) {
+	t.Parallel()
+
+	want := s3keys.RoutePrefixForBucketAnyGeneration("bucket-a")
+	require.Equal(t, want, RouteOwnershipKey(s3keys.BucketMetaKey("bucket-a")))
+	require.Equal(t, want, RouteOwnershipKey(s3keys.BucketGenerationKey("bucket-a")))
+	require.Equal(t, want, RouteOwnershipKey(txnLockKey(s3keys.BucketMetaKey("bucket-a"))))
+	require.Equal(t, want, RouteOwnershipKey(txnLockKey(s3keys.BucketGenerationKey("bucket-a"))))
 }
 
 func TestRouteKey_NormalizesFilesystemChunkKey(t *testing.T) {
@@ -301,4 +312,15 @@ func TestStreamScansAreNotWideColumnCanonicalizable(t *testing.T) {
 	} {
 		require.True(t, redisWideColumnCanonicalizableScan(start))
 	}
+}
+
+func legacyListMetaDeltaKey(userKey []byte, commitTS uint64) []byte {
+	const seqInTxn = uint32(1)
+	key := store.LegacyListMetaDeltaScanPrefix(userKey)
+	var ts [8]byte
+	binary.BigEndian.PutUint64(ts[:], commitTS)
+	key = append(key, ts[:]...)
+	var seq [4]byte
+	binary.BigEndian.PutUint32(seq[:], seqInTxn)
+	return append(key, seq[:]...)
 }

@@ -1,0 +1,496 @@
+package store
+
+import (
+	"bytes"
+	"context"
+	"encoding/binary"
+
+	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/pebble/v2"
+)
+
+const (
+	migrationPromotionDoneFlag          byte = 1
+	migrationPromotionStateVersion2Flag byte = 1 << 7
+)
+
+type promotedVersion struct {
+	staged MVCCVersion
+	target MVCCVersion
+}
+
+func validatePromoteVersionsOptions(opts PromoteVersionsOptions) error {
+	if opts.TargetKey == nil {
+		return errors.New("migration promote target key mapper is required")
+	}
+	return nil
+}
+
+func promotedVersionsFromStaged(opts PromoteVersionsOptions, versions []MVCCVersion) ([]promotedVersion, PromoteVersionsResult, error) {
+	out := make([]promotedVersion, 0, len(versions))
+	result := PromoteVersionsResult{PromotedRows: uint64(len(versions))} //nolint:gosec // len is bounded by MaxVersions.
+	for _, staged := range versions {
+		targetKey, ok := opts.TargetKey(staged.Key)
+		if !ok {
+			return nil, PromoteVersionsResult{}, errors.WithStack(errors.Newf("migration promote target key rejected staged key %q", string(staged.Key)))
+		}
+		target := MVCCVersion{
+			Key:       bytes.Clone(targetKey),
+			CommitTS:  staged.CommitTS,
+			Tombstone: staged.Tombstone,
+			Value:     bytes.Clone(staged.Value),
+			KeyFamily: staged.KeyFamily,
+			ExpireAt:  staged.ExpireAt,
+		}
+		if err := validateImportVersion(target); err != nil {
+			return nil, PromoteVersionsResult{}, err
+		}
+		result.PromotedBytes += versionExportSize(target.Key, len(target.Value))
+		if target.CommitTS > result.MaxPromotedTS {
+			result.MaxPromotedTS = target.CommitTS
+		}
+		out = append(out, promotedVersion{
+			staged: staged,
+			target: target,
+		})
+	}
+	return out, result, nil
+}
+
+func (s *mvccStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error) {
+	if err := validatePromoteVersionsOptions(opts); err != nil {
+		return PromoteVersionsResult{}, err
+	}
+	if opts.MaxVersions <= 0 {
+		return PromoteVersionsResult{Done: true}, nil
+	}
+
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+
+	state, cursor := s.promotionStateAndCursorLocked(opts)
+	if opts.JobID != 0 && state.Done {
+		return PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows, MaxPromotedTS: state.MaxPromotedTS}, nil
+	}
+	exported, toPromote, promoted, err := s.planMemoryPromotionLocked(ctx, opts, cursor)
+	if err != nil {
+		return PromoteVersionsResult{}, err
+	}
+	s.applyMemoryPromotionLocked(toPromote)
+	result, updatedState := finishPromotionResult(opts, state, exported, promoted)
+	if result.MaxPromotedTS > s.lastCommitTS {
+		s.lastCommitTS = result.MaxPromotedTS
+	}
+	if updatedState != nil {
+		s.migrationPromotions[opts.JobID] = clonePromotionState(*updatedState)
+	}
+	return result, nil
+}
+
+func (s *mvccStore) planMemoryPromotionLocked(
+	ctx context.Context,
+	opts PromoteVersionsOptions,
+	cursor []byte,
+) (ExportVersionsResult, []promotedVersion, PromoteVersionsResult, error) {
+	exportOpts := normalizeExportVersionsOptions(ExportVersionsOptions{
+		StartKey:        opts.StartKey,
+		EndKey:          opts.EndKey,
+		Cursor:          cursor,
+		MaxVersions:     opts.MaxVersions,
+		MaxBytes:        opts.MaxBytes,
+		MaxScannedBytes: opts.MaxScannedBytes,
+	})
+	pos, err := decodeExportCursorForOptions(exportOpts)
+	if err != nil {
+		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
+	}
+	exported, err := s.exportMemoryVersionsLocked(ctx, exportOpts, pos)
+	if err != nil {
+		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
+	}
+	toPromote, promoted, err := promotedVersionsFromStaged(opts, exported.Versions)
+	return exported, toPromote, promoted, err
+}
+
+func (s *mvccStore) applyMemoryPromotionLocked(toPromote []promotedVersion) {
+	for _, version := range toPromote {
+		if version.target.Tombstone {
+			s.deleteVersionLocked(version.target.Key, version.target.CommitTS)
+		} else {
+			s.putVersionLocked(version.target.Key, version.target.Value, version.target.CommitTS, version.target.ExpireAt)
+		}
+		s.removeVersionLocked(version.staged.Key, version.staged.CommitTS)
+	}
+}
+
+func (s *mvccStore) promotionStateAndCursorLocked(opts PromoteVersionsOptions) (PromotionState, []byte) {
+	if opts.JobID == 0 {
+		return PromotionState{}, opts.Cursor
+	}
+	state, ok := s.migrationPromotions[opts.JobID]
+	if !ok {
+		return PromotionState{}, nil
+	}
+	state = clonePromotionState(state)
+	return state, state.Cursor
+}
+
+func (s *mvccStore) MigrationPromotionState(_ context.Context, jobID uint64) (PromotionState, bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	state, ok := s.migrationPromotions[jobID]
+	return clonePromotionState(state), ok, nil
+}
+
+func (s *mvccStore) exportMemoryVersionsLocked(ctx context.Context, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
+	result := newExportVersionsResult(opts.MaxVersions)
+	it := s.tree.Iterator()
+	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
+		result.Done = true
+		return result, nil
+	}
+	for ok := true; ok; ok = it.Next() {
+		key, keyOK := it.Key().([]byte)
+		if err := checkExportKey(ctx, key, keyOK, opts.EndKey); err != nil {
+			if errors.Is(err, errExportReachedEnd) {
+				result.Done = true
+				result.NextCursor = nil
+				return result, nil
+			}
+			return ExportVersionsResult{}, err
+		}
+		if !keyOK {
+			continue
+		}
+		done, err := exportMemoryIteratorKey(ctx, opts, pos, key, it.Value(), &result)
+		if err != nil || !done {
+			return result, err
+		}
+	}
+	result.Done = true
+	result.NextCursor = nil
+	return result, nil
+}
+
+func (s *mvccStore) removeVersionLocked(key []byte, commitTS uint64) bool {
+	existing, ok := s.tree.Get(key)
+	if !ok {
+		return false
+	}
+	versions, _ := existing.([]VersionedValue)
+	idx := findVersionIndex(versions, commitTS)
+	if idx < 0 {
+		return false
+	}
+	next := make([]VersionedValue, len(versions)-1)
+	copy(next, versions[:idx])
+	copy(next[idx:], versions[idx+1:])
+	if len(next) == 0 {
+		s.tree.Remove(key)
+		return true
+	}
+	s.tree.Put(bytes.Clone(key), next)
+	return true
+}
+
+func findVersionIndex(versions []VersionedValue, commitTS uint64) int {
+	for i := range versions {
+		if versions[i].TS == commitTS {
+			return i
+		}
+	}
+	return -1
+}
+
+func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error) {
+	if err := validatePromoteVersionsOptions(opts); err != nil {
+		return PromoteVersionsResult{}, err
+	}
+	if opts.MaxVersions <= 0 {
+		return PromoteVersionsResult{Done: true}, nil
+	}
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
+	state, cursor, err := s.pebblePromotionStateAndCursor(opts)
+	if err != nil {
+		return PromoteVersionsResult{}, err
+	}
+	writeOpts := s.promotionWriteOpts(opts.AppliedIndex)
+	if opts.JobID != 0 && state.Done {
+		result := PromoteVersionsResult{Done: true, TotalPromotedRows: state.PromotedRows, MaxPromotedTS: state.MaxPromotedTS}
+		return s.finishPebblePromotion(nil, opts.JobID, nil, result, opts.AppliedIndex, state.MaxPromotedTS, writeOpts)
+	}
+	opts.Cursor = cursor
+	exported, toPromote, promoted, err := s.planPebblePromotionLocked(ctx, opts)
+	if err != nil {
+		return PromoteVersionsResult{}, err
+	}
+	result, stateToWrite := finishPromotionResult(opts, state, exported, promoted)
+	return s.finishPebblePromotion(
+		toPromote,
+		opts.JobID,
+		stateToWrite,
+		result,
+		opts.AppliedIndex,
+		result.MaxPromotedTS,
+		writeOpts,
+	)
+}
+
+func (s *pebbleStore) promotionWriteOpts(appliedIndex uint64) *pebble.WriteOptions {
+	if appliedIndex > 0 {
+		return s.raftApplyWriteOpts()
+	}
+	return s.directApplyWriteOpts()
+}
+
+func (s *pebbleStore) finishPebblePromotion(
+	toPromote []promotedVersion,
+	jobID uint64,
+	stateToWrite *PromotionState,
+	result PromoteVersionsResult,
+	appliedIndex uint64,
+	maxPromotedTS uint64,
+	writeOpts *pebble.WriteOptions,
+) (PromoteVersionsResult, error) {
+	if len(toPromote) == 0 && stateToWrite == nil && appliedIndex == 0 && maxPromotedTS == 0 {
+		return result, nil
+	}
+	if err := s.commitPebblePromoteVersions(
+		toPromote,
+		jobID,
+		stateToWrite,
+		appliedIndex,
+		maxPromotedTS,
+		writeOpts,
+	); err != nil {
+		return PromoteVersionsResult{}, err
+	}
+	return result, nil
+}
+
+func (s *pebbleStore) planPebblePromotionLocked(
+	ctx context.Context,
+	opts PromoteVersionsOptions,
+) (ExportVersionsResult, []promotedVersion, PromoteVersionsResult, error) {
+	exported, err := s.exportVersionsLocked(ctx, ExportVersionsOptions{
+		StartKey:        opts.StartKey,
+		EndKey:          opts.EndKey,
+		Cursor:          opts.Cursor,
+		MaxVersions:     opts.MaxVersions,
+		MaxBytes:        opts.MaxBytes,
+		MaxScannedBytes: opts.MaxScannedBytes,
+	})
+	if err != nil {
+		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
+	}
+	toPromote, promoted, err := promotedVersionsFromStaged(opts, exported.Versions)
+	return exported, toPromote, promoted, err
+}
+
+func finishPromotionResult(
+	opts PromoteVersionsOptions,
+	state PromotionState,
+	exported ExportVersionsResult,
+	promoted PromoteVersionsResult,
+) (PromoteVersionsResult, *PromotionState) {
+	promoted.NextCursor = exported.NextCursor
+	promoted.Done = exported.Done
+	promoted.ScannedBytes = exported.ScannedBytes
+	promoted.TotalPromotedRows = promoted.PromotedRows
+	if opts.JobID == 0 {
+		return promoted, nil
+	}
+	state.Cursor = bytes.Clone(exported.NextCursor)
+	state.Done = exported.Done
+	state.PromotedRows += promoted.PromotedRows
+	if promoted.MaxPromotedTS > state.MaxPromotedTS {
+		state.MaxPromotedTS = promoted.MaxPromotedTS
+	}
+	state.LastError = ""
+	promoted.TotalPromotedRows = state.PromotedRows
+	promoted.MaxPromotedTS = state.MaxPromotedTS
+	return promoted, &state
+}
+
+func (s *pebbleStore) pebblePromotionStateAndCursor(opts PromoteVersionsOptions) (PromotionState, []byte, error) {
+	if opts.JobID == 0 {
+		return PromotionState{}, opts.Cursor, nil
+	}
+	state, ok, err := s.readPebblePromotionState(opts.JobID)
+	if err != nil {
+		return PromotionState{}, nil, err
+	}
+	if !ok {
+		return PromotionState{}, nil, nil
+	}
+	return state, state.Cursor, nil
+}
+
+func (s *pebbleStore) MigrationPromotionState(_ context.Context, jobID uint64) (PromotionState, bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	return s.readPebblePromotionState(jobID)
+}
+
+func (s *pebbleStore) readPebblePromotionState(jobID uint64) (PromotionState, bool, error) {
+	states, err := s.readPebblePromotionStates()
+	if err != nil {
+		return PromotionState{}, false, err
+	}
+	state, ok := states[jobID]
+	return clonePromotionState(state), ok, nil
+}
+
+func (s *pebbleStore) readPebblePromotionStates() (map[uint64]PromotionState, error) {
+	val, closer, err := s.db.Get(migrationPromoteMetaKeyBytes)
+	if err != nil {
+		if errors.Is(err, pebble.ErrNotFound) {
+			return make(map[uint64]PromotionState), nil
+		}
+		return nil, errors.WithStack(err)
+	}
+	defer func() { _ = closer.Close() }()
+	states, ok := decodeMigrationPromotionStates(val)
+	if !ok {
+		return nil, errors.New("corrupt migration promotion state metadata")
+	}
+	return states, nil
+}
+
+func (s *pebbleStore) stagePebblePromotionState(batch *pebble.Batch, jobID uint64, state PromotionState) error {
+	states, err := s.readPebblePromotionStates()
+	if err != nil {
+		return err
+	}
+	states[jobID] = clonePromotionState(state)
+	return errors.WithStack(batch.Set(migrationPromoteMetaKeyBytes, encodeMigrationPromotionStates(states), nil))
+}
+
+func (s *pebbleStore) commitPebblePromoteVersions(
+	versions []promotedVersion,
+	jobID uint64,
+	state *PromotionState,
+	appliedIndex uint64,
+	maxPromotedTS uint64,
+	writeOpts *pebble.WriteOptions,
+) error {
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	targets := make([]MVCCVersion, 0, len(versions))
+	for _, version := range versions {
+		targets = append(targets, version.target)
+	}
+	// Promotion is replayed from the Raft FSM, so it must not fail closed on
+	// this node's local writer-registration state.
+	if err := s.applyImportVersionsBatch(batch, targets, false); err != nil {
+		return err
+	}
+	for _, version := range versions {
+		if err := batch.Delete(encodeKey(version.staged.Key, version.staged.CommitTS), nil); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	if state != nil {
+		if err := s.stagePebblePromotionState(batch, jobID, *state); err != nil {
+			return err
+		}
+	}
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
+	}
+	return s.commitPebblePromotionBatch(batch, maxPromotedTS, writeOpts)
+}
+
+func (s *pebbleStore) commitPebblePromotionBatch(
+	batch *pebble.Batch,
+	maxPromotedTS uint64,
+	writeOpts *pebble.WriteOptions,
+) error {
+	if maxPromotedTS > 0 {
+		s.mtx.Lock()
+		defer s.mtx.Unlock()
+		newLastTS := s.lastCommitTS
+		if maxPromotedTS > newLastTS {
+			newLastTS = maxPromotedTS
+		}
+		if err := setPebbleUint64InBatch(batch, metaLastCommitTSBytes, newLastTS); err != nil {
+			return err
+		}
+		if err := batch.Commit(writeOpts); err != nil {
+			return errors.WithStack(err)
+		}
+		s.updateLastCommitTS(newLastTS)
+		return nil
+	}
+	if err := batch.Commit(writeOpts); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func encodePromotionState(state PromotionState) []byte {
+	buf := make([]byte, 0, 1+2*migrationUint64Bytes+binary.MaxVarintLen64*2+len(state.Cursor)+len(state.LastError))
+	flags := migrationPromotionStateVersion2Flag
+	if state.Done {
+		flags |= migrationPromotionDoneFlag
+	}
+	buf = append(buf, flags)
+	buf = binary.BigEndian.AppendUint64(buf, state.PromotedRows)
+	buf = binary.BigEndian.AppendUint64(buf, state.MaxPromotedTS)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(state.Cursor)))
+	buf = append(buf, state.Cursor...)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(state.LastError)))
+	buf = append(buf, state.LastError...)
+	return buf
+}
+
+func decodePromotionState(data []byte) (PromotionState, bool) {
+	if len(data) < 1+migrationUint64Bytes {
+		return PromotionState{}, false
+	}
+	flags := data[0]
+	state := PromotionState{
+		Done:         flags&migrationPromotionDoneFlag != 0,
+		PromotedRows: binary.BigEndian.Uint64(data[1 : 1+migrationUint64Bytes]),
+	}
+	rest := data[1+migrationUint64Bytes:]
+	if flags&migrationPromotionStateVersion2Flag != 0 {
+		if len(rest) < migrationUint64Bytes {
+			return PromotionState{}, false
+		}
+		state.MaxPromotedTS = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+		rest = rest[migrationUint64Bytes:]
+	}
+	cursorLen, n := binary.Uvarint(rest)
+	if n <= 0 || cursorLen > lenAsUint64(len(rest[n:])) {
+		return PromotionState{}, false
+	}
+	rest = rest[n:]
+	cursorEnd := int(cursorLen) //nolint:gosec // bounded by len(rest) above.
+	state.Cursor = bytes.Clone(rest[:cursorEnd])
+	rest = rest[cursorEnd:]
+	errLen, n := binary.Uvarint(rest)
+	if n <= 0 || errLen != lenAsUint64(len(rest[n:])) {
+		return PromotionState{}, false
+	}
+	state.LastError = string(rest[n:])
+	return state, true
+}
+
+func clonePromotionState(state PromotionState) PromotionState {
+	state.Cursor = bytes.Clone(state.Cursor)
+	return state
+}
+
+var _ MigrationPromoter = (*mvccStore)(nil)
+var _ MigrationPromoter = (*pebbleStore)(nil)
+var _ MigrationPromotionStateReader = (*mvccStore)(nil)
+var _ MigrationPromotionStateReader = (*pebbleStore)(nil)

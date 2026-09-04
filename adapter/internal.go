@@ -3,10 +3,17 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"os"
+	"strings"
 
+	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -42,6 +49,37 @@ func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption 
 	}
 }
 
+func WithInternalStore(st store.MVCCStore) InternalOption {
+	return func(i *Internal) {
+		i.store = st
+	}
+}
+
+func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption {
+	return func(i *Internal) {
+		i.migrationProposer = proposer
+	}
+}
+
+func WithInternalMigrationImportGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationImportGate = gate
+	}
+}
+
+func WithInternalMigrationPromoteGate(gate func(context.Context) error) InternalOption {
+	return func(i *Internal) {
+		i.migrationPromoteGate = gate
+	}
+}
+
+func WithInternalMigrationExportRouting(groupID uint64, resolver kv.PartitionResolver) InternalOption {
+	return func(i *Internal) {
+		i.migrationExportGroupID = groupID
+		i.migrationExportResolver = resolver
+	}
+}
+
 func WithInternalAdminProposer(proposer raftengine.Proposer) InternalOption {
 	return func(i *Internal) {
 		i.adminProposer = proposer
@@ -67,10 +105,12 @@ func WithInternalForwardWriteObserver(observer ForwardWriteObserver) InternalOpt
 
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
-		leader:             leader,
-		transactionManager: txm,
-		clock:              clock,
-		relay:              relay,
+		leader:               leader,
+		transactionManager:   txm,
+		clock:                clock,
+		relay:                relay,
+		migrationImportGate:  defaultMigrationImportGate,
+		migrationPromoteGate: defaultMigrationPromoteGate,
 	}
 	for _, opt := range opts {
 		opt(i)
@@ -79,14 +119,20 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader              raftengine.LeaderView
-	transactionManager  kv.Transactional
-	clock               *kv.HLC
-	tsAllocator         kv.TimestampAllocator
-	adminProposer       raftengine.Proposer
-	lastCommitTimestamp func() uint64
-	relay               *RedisPubSubRelay
-	writeGate           kv.MutationWriteGate
+	leader                  raftengine.LeaderView
+	transactionManager      kv.Transactional
+	clock                   *kv.HLC
+	tsAllocator             kv.TimestampAllocator
+	adminProposer           raftengine.Proposer
+	lastCommitTimestamp     func() uint64
+	relay                   *RedisPubSubRelay
+	store                   store.MVCCStore
+	migrationProposer       raftengine.Proposer
+	migrationImportGate     func(context.Context) error
+	migrationPromoteGate    func(context.Context) error
+	migrationExportGroupID  uint64
+	migrationExportResolver kv.PartitionResolver
+	writeGate               kv.MutationWriteGate
 	// kvForwardRejected marks a runtime whose state machine cannot apply KV
 	// entries -- the dedicated TSO group. See WithKVForwardRejected.
 	kvForwardRejected    bool
@@ -101,6 +147,30 @@ var ErrNotLeader = errors.New("not leader")
 var ErrKVForwardNotSupported = errors.New("kv forward not supported on this raft group")
 var ErrLeaderNotFound = errors.New("leader not found")
 var ErrTxnTimestampOverflow = errors.New("txn timestamp overflow")
+
+const (
+	defaultMigrationExportChunkBytes  = 4 << 20
+	defaultMigrationExportScanFactor  = 4
+	defaultMigrationExportMaxVersions = 1024
+
+	// Hard server-side ceilings. The defaults above only fill in a bound the
+	// request left unset, so without these a caller could ask one
+	// ExportVersions call to scan and decode an arbitrary portion of the source
+	// store before producing its next streamed response -- for a sparse family
+	// or route filter that accepts few rows, math.MaxUint64 removes the only
+	// work bound there is and the serving leader's I/O and CPU go with it. A
+	// clamped caller simply advances through more cursor rounds, which the
+	// response already supports. Same shape as the promotion path's clamp.
+	maxMigrationExportChunkBytes = 32 << 20
+	maxMigrationExportScanBytes  = maxMigrationExportChunkBytes * defaultMigrationExportScanFactor
+
+	// Headroom for proto framing over the payload bytes a page carries: field
+	// tags and length prefixes for at most defaultMigrationExportMaxVersions
+	// entries come to tens of kilobytes, so a mebibyte covers them with room
+	// to spare.
+	migrationExportPageFramingHeadroom = 1 << 20
+	migrationExportPageByteBudget      = internal.GRPCMaxMessageBytes - migrationExportPageFramingHeadroom
+)
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
 	// Before the leader check, so a non-leader gets the accurate reason and a
@@ -205,6 +275,538 @@ func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) 
 	return &pb.RelayPublishResponse{
 		Subscribers: i.relay.Publish(req.Channel, req.Message),
 	}, nil
+}
+
+func (i *Internal) ExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
+	if err := i.validateExportRangeVersionsRequest(req); err != nil {
+		return err
+	}
+	if err := i.verifyInternalLeaderApplied(stream.Context()); err != nil {
+		return err
+	}
+	return i.streamExportRangeVersions(req, stream)
+}
+
+func (i *Internal) validateExportRangeVersionsRequest(req *pb.ExportRangeVersionsRequest) error {
+	if req == nil {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "export range versions request is nil"))
+	}
+	if i.store == nil {
+		return errors.WithStack(status.Error(codes.FailedPrecondition, "migration export store is not configured"))
+	}
+	if req.GetMaxCommitTs() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export max_commit_ts is required"))
+	}
+	if req.GetKeyFamily() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export key_family is required"))
+	}
+	if exportRangeVersionsRequestRouteUnbounded(req) {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires route bounds"))
+	}
+	return nil
+}
+
+func exportRangeVersionsRequestRouteUnbounded(req *pb.ExportRangeVersionsRequest) bool {
+	return len(req.GetRouteStart()) == 0 &&
+		len(req.GetRouteEnd()) == 0
+}
+
+func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest, stream pb.Internal_ExportRangeVersionsServer) error {
+	opts := i.exportRangeVersionsOptions(req)
+	for {
+		result, err := i.store.ExportVersions(stream.Context(), opts)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		if !result.Done && bytes.Equal(opts.Cursor, result.NextCursor) {
+			return errors.WithStack(status.Error(codes.Internal, "migration export cursor did not progress"))
+		}
+		resp := &pb.ExportRangeVersionsResponse{
+			Versions:   protoMVCCVersionsFromStore(result.Versions),
+			NextCursor: result.NextCursor,
+			Done:       result.Done,
+		}
+		if err := checkMigrationExportPageSize(resp); err != nil {
+			return err
+		}
+		if err := stream.Send(resp); err != nil {
+			return errors.WithStack(err)
+		}
+		if result.Done {
+			return nil
+		}
+		opts.Cursor = result.NextCursor
+	}
+}
+
+// checkMigrationExportPageSize refuses to send a page the transport cannot
+// carry. The store's MaxBytes budget is only consulted after a version has
+// been appended, and storage accepts values far above the message limit
+// (store.maxSnapshotValueSize is 256 MiB against internal.GRPCMaxMessageBytes'
+// 64 MiB), so a single oversized row can land in an otherwise bounded page.
+// Sending it fails with ResourceExhausted, and so does every retry of the same
+// cursor -- the bracket never completes and the error says nothing about which
+// row is responsible. Naming the row instead keeps the failure diagnosable.
+// Carrying values that large needs a chunked migration wire format, which is a
+// protocol change rather than a fix here.
+func checkMigrationExportPageSize(resp *pb.ExportRangeVersionsResponse) error {
+	if migrationExportPagePayloadBytes(resp) <= migrationExportPageByteBudget {
+		return nil
+	}
+	widest := widestMigrationExportVersion(resp.GetVersions())
+	return errors.WithStack(status.Errorf(codes.FailedPrecondition,
+		"migration export page exceeds the %d byte message limit; key %q holds %d value bytes",
+		internal.GRPCMaxMessageBytes, widest.GetKey(), len(widest.GetValue())))
+}
+
+// migrationExportPagePayloadBytes sums the caller-controlled bytes in a page.
+// It deliberately undercounts the proto framing rather than calling
+// proto.Size, which caches its result inside the message; the budget carries
+// enough headroom to cover the framing of a full page.
+func migrationExportPagePayloadBytes(resp *pb.ExportRangeVersionsResponse) int {
+	total := len(resp.GetNextCursor())
+	for _, version := range resp.GetVersions() {
+		total += len(version.GetKey()) + len(version.GetValue())
+	}
+	return total
+}
+
+func widestMigrationExportVersion(versions []*pb.MVCCVersion) *pb.MVCCVersion {
+	var widest *pb.MVCCVersion
+	for _, version := range versions {
+		if widest == nil || len(version.GetValue()) > len(widest.GetValue()) {
+			widest = version
+		}
+	}
+	return widest
+}
+
+func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeVersionsRequest) (*pb.ImportRangeVersionsResponse, error) {
+	if req == nil {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "import range versions request is nil"))
+	}
+	if err := validateImportRangeVersionsRequest(req); err != nil {
+		return nil, err
+	}
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import proposer is not configured"))
+	}
+	if err := i.verifyInternalLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := i.verifyMigrationImportEnabled(ctx); err != nil {
+		return nil, err
+	}
+	result, err := i.proposeMigrationImport(ctx, req)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if i.clock != nil && result.MaxImportedTS > 0 {
+		i.clock.Observe(result.MaxImportedTS)
+	}
+	return &pb.ImportRangeVersionsResponse{AckedCursor: result.AckedCursor}, nil
+}
+
+func validateImportRangeVersionsRequest(req *pb.ImportRangeVersionsRequest) error {
+	if req.GetJobId() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions job_id is required"))
+	}
+	if req.GetBracketId() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "import range versions bracket_id is required"))
+	}
+	return nil
+}
+
+func (i *Internal) verifyMigrationImportEnabled(ctx context.Context) error {
+	if i.migrationImportGate == nil {
+		return nil
+	}
+	if err := i.migrationImportGate(ctx); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteStagedVersionsRequest) (*pb.PromoteStagedVersionsResponse, error) {
+	if req == nil {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "promote staged versions request is nil"))
+	}
+	if req.GetJobId() == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "promote staged versions job_id is required"))
+	}
+	if i.migrationProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote proposer is not configured"))
+	}
+	if err := i.verifyInternalLeader(ctx); err != nil {
+		return nil, err
+	}
+	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
+		return nil, err
+	}
+	if err := validatePromoteStagedVersionsRequest(req); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	result, err := i.proposeMigrationPromote(ctx, req)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if i.clock != nil && result.MaxPromotedTS > 0 {
+		i.clock.Observe(result.MaxPromotedTS)
+	}
+	return &pb.PromoteStagedVersionsResponse{
+		NextCursor:    result.NextCursor,
+		Done:          result.Done,
+		PromotedRows:  result.PromotedRows,
+		MaxPromotedTs: result.MaxPromotedTS,
+	}, nil
+}
+
+func (i *Internal) verifyMigrationPromoteEnabled(ctx context.Context) error {
+	if i.migrationPromoteGate == nil {
+		return nil
+	}
+	if err := i.migrationPromoteGate(ctx); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func validatePromoteStagedVersionsRequest(req *pb.PromoteStagedVersionsRequest) error {
+	prefix := distribution.MigrationStagedDataKeyPrefix(req.GetJobId())
+	if err := store.ValidatePromotionCursorForRange(req.GetCursor(), prefix, store.PrefixScanEnd(prefix)); err != nil {
+		if errors.Is(err, store.ErrInvalidExportCursor) {
+			return errors.WithStack(status.Error(codes.InvalidArgument, store.ErrInvalidExportCursor.Error()))
+		}
+		return errors.WithStack(status.Errorf(codes.Internal, "validate promote cursor: %v", err))
+	}
+	return nil
+}
+
+func defaultMigrationImportGate(context.Context) error {
+	if migrationImportOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration import opcode is disabled; enable after every voter is running a build that supports migration import"))
+}
+
+func migrationImportOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE")
+}
+
+func defaultMigrationPromoteGate(context.Context) error {
+	if migrationPromoteOpcodeEnabledFromEnv() {
+		return nil
+	}
+	return errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote opcode is disabled; enable after every voter is running a build that supports migration promotion"))
+}
+
+func migrationPromoteOpcodeEnabledFromEnv() bool {
+	return envFlagEnabled("ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE")
+}
+
+func envFlagEnabled(name string) bool {
+	switch strings.ToLower(strings.TrimSpace(os.Getenv(name))) {
+	case "1", "true", "yes", "on":
+		return true
+	default:
+		return false
+	}
+}
+
+func (i *Internal) verifyInternalLeader(ctx context.Context) error {
+	if i.leader == nil {
+		return errors.WithStack(ErrNotLeader)
+	}
+	if i.leader.State() != raftengine.StateLeader {
+		return errors.WithStack(ErrNotLeader)
+	}
+	if err := i.leader.VerifyLeader(ctx); err != nil {
+		return errors.WithStack(ErrNotLeader)
+	}
+	return nil
+}
+
+func (i *Internal) verifyInternalLeaderApplied(ctx context.Context) error {
+	if i.leader == nil {
+		return errors.WithStack(ErrNotLeader)
+	}
+	if i.leader.State() != raftengine.StateLeader {
+		return errors.WithStack(ErrNotLeader)
+	}
+	_, err := i.leader.LinearizableRead(ctx)
+	return errors.WithStack(err)
+}
+
+func (i *Internal) proposeMigrationImport(ctx context.Context, req *pb.ImportRangeVersionsRequest) (store.ImportVersionsResult, error) {
+	cmd, err := kv.MarshalMigrationImportCommand(req)
+	if err != nil {
+		return store.ImportVersionsResult{}, errors.WithStack(err)
+	}
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "migration import")
+	if err != nil {
+		return store.ImportVersionsResult{}, errors.WithStack(err)
+	}
+	switch resp := resp.(type) {
+	case store.ImportVersionsResult:
+		return resp, nil
+	case *store.ImportVersionsResult:
+		if resp == nil {
+			return store.ImportVersionsResult{}, errors.New("migration import apply returned nil result")
+		}
+		return *resp, nil
+	case error:
+		return store.ImportVersionsResult{}, errors.WithStack(resp)
+	default:
+		return store.ImportVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration import apply response type %T", resp))
+	}
+}
+
+func (i *Internal) proposeMigrationPromote(ctx context.Context, req *pb.PromoteStagedVersionsRequest) (store.PromoteVersionsResult, error) {
+	cmd, err := kv.MarshalMigrationPromoteCommand(req)
+	if err != nil {
+		return store.PromoteVersionsResult{}, errors.WithStack(err)
+	}
+	resp, err := i.proposeMigrationCommand(ctx, cmd, "migration promote")
+	if err != nil {
+		return store.PromoteVersionsResult{}, errors.WithStack(err)
+	}
+	switch resp := resp.(type) {
+	case store.PromoteVersionsResult:
+		return resp, nil
+	case *store.PromoteVersionsResult:
+		if resp == nil {
+			return store.PromoteVersionsResult{}, errors.New("migration promote apply returned nil result")
+		}
+		return *resp, nil
+	case error:
+		return store.PromoteVersionsResult{}, errors.WithStack(resp)
+	default:
+		return store.PromoteVersionsResult{}, errors.WithStack(errors.Newf("unexpected migration promote apply response type %T", resp))
+	}
+}
+
+func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, label string) (any, error) {
+	result, err := i.migrationProposer.Propose(ctx, cmd)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if result == nil {
+		return nil, errors.WithStack(errors.Newf("%s proposal returned nil result", label))
+	}
+	return result.Response, nil
+}
+
+func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
+	chunkBytes := clampMigrationExportBound(
+		uint64(req.GetChunkBytes()), defaultMigrationExportChunkBytes, maxMigrationExportChunkBytes)
+	maxScannedBytes := clampMigrationExportBound(
+		req.GetMaxScannedBytes(), chunkBytes*defaultMigrationExportScanFactor, maxMigrationExportScanBytes)
+	startKey, endKey := migrationExportScanBounds(req)
+	opts := store.ExportVersionsOptions{
+		StartKey:             startKey,
+		EndKey:               endKey,
+		MinCommitTSExclusive: req.GetMinCommitTs(),
+		MaxCommitTSInclusive: req.GetMaxCommitTs(),
+		Cursor:               req.GetCursor(),
+		MaxVersions:          defaultMigrationExportMaxVersions,
+		MaxBytes:             chunkBytes,
+		MaxScannedBytes:      maxScannedBytes,
+		KeyFamily:            req.GetKeyFamily(),
+		AcceptKey:            i.migrationExportFilter(req),
+		AcceptVersion:        i.migrationExportVersionFilter(req),
+	}
+	return opts
+}
+
+func migrationExportScanBounds(req *pb.ExportRangeVersionsRequest) ([]byte, []byte) {
+	start := bytes.Clone(req.GetRangeStart())
+	end := bytes.Clone(req.GetRangeEnd())
+	switch req.GetKeyFamily() {
+	case distribution.MigrationFamilyFilesystemChunk:
+		if bytes.HasPrefix(start, fskeys.ChunkAllPrefix()) {
+			return start, end
+		}
+		if scanStart, scanEnd, ok := filesystemChunkExportScanBounds(req.GetRouteStart(), req.GetRouteEnd()); ok {
+			return scanStart, scanEnd
+		}
+		return fskeys.ChunkAllPrefix(), prefixScanEnd(fskeys.ChunkAllPrefix())
+	case distribution.MigrationFamilyFilesystemUsage:
+		if bytes.HasPrefix(start, fskeys.UsageRouteAllPrefix()) {
+			return start, end
+		}
+		return filesystemUsageExportScanBounds(req.GetRouteStart(), req.GetRouteEnd())
+	default:
+		return start, end
+	}
+}
+
+func filesystemChunkExportScanBounds(routeStart, routeEnd []byte) ([]byte, []byte, bool) {
+	routePrefix := fskeys.ChunkRouteAllPrefix()
+	routeDomainEnd := prefixScanEnd(routePrefix)
+	if !rangesIntersect(routeStart, routeEnd, routePrefix, routeDomainEnd) {
+		return fskeys.ChunkAllPrefix(), fskeys.ChunkAllPrefix(), true
+	}
+	rawPrefix := fskeys.ChunkAllPrefix()
+	rawDomainEnd := prefixScanEnd(rawPrefix)
+	start := rawPrefix
+	if len(routeStart) > 0 && bytes.Compare(routeStart, routePrefix) > 0 {
+		if !bytes.HasPrefix(routeStart, routePrefix) {
+			return nil, nil, false
+		}
+		start = append(bytes.Clone(rawPrefix), routeStart[len(routePrefix):]...)
+	}
+	end := rawDomainEnd
+	if len(routeEnd) > 0 && bytes.Compare(routeEnd, routeDomainEnd) < 0 {
+		if bytes.Compare(routeEnd, routePrefix) <= 0 {
+			return rawPrefix, rawPrefix, true
+		}
+		if !bytes.HasPrefix(routeEnd, routePrefix) {
+			return nil, nil, false
+		}
+		end = append(bytes.Clone(rawPrefix), routeEnd[len(routePrefix):]...)
+	}
+	return bytes.Clone(start), bytes.Clone(end), true
+}
+
+func filesystemUsageExportScanBounds(routeStart, routeEnd []byte) ([]byte, []byte) {
+	start := fskeys.UsageRouteAllPrefix()
+	if len(routeStart) > 0 {
+		start = fskeys.UsageRouteKey(routeStart)
+	}
+	end := prefixScanEnd(fskeys.UsageRouteAllPrefix())
+	if len(routeEnd) > 0 {
+		end = fskeys.UsageRouteKey(routeEnd)
+	}
+	return start, end
+}
+
+// clampMigrationExportBound resolves one export bound: unset takes the default,
+// anything above the hard ceiling is clamped down to it.
+func clampMigrationExportBound(requested, fallback, ceiling uint64) uint64 {
+	if requested == 0 {
+		return fallback
+	}
+	return min(requested, ceiling)
+}
+
+func (i *Internal) migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
+	bracket := migrationExportBracket(req)
+	if req.GetKeyFamily() == distribution.MigrationFamilyLegacyListMetaDelta {
+		return bracket.ContainsRawKey
+	}
+	routeFilter := i.migrationExportRouteFilter(req)
+	if migrationFamilyRequiresDecodedS3(req.GetKeyFamily()) {
+		routeFilter = decodedS3BucketRouteFilter(req.GetKeyFamily(), req.GetRouteStart(), req.GetRouteEnd())
+	}
+	return func(rawKey []byte) bool {
+		return bracket.ContainsRawKey(rawKey) && routeFilter(rawKey)
+	}
+}
+
+func (i *Internal) migrationExportVersionFilter(req *pb.ExportRangeVersionsRequest) func([]byte, []byte) bool {
+	if req.GetKeyFamily() != distribution.MigrationFamilyLegacyListMetaDelta {
+		return nil
+	}
+	bracket := migrationExportBracket(req)
+	return func(rawKey, value []byte) bool {
+		return bracket.ContainsRoutedVersion(rawKey, value, req.GetRouteStart(), req.GetRouteEnd(), nil)
+	}
+}
+
+func migrationExportBracket(req *pb.ExportRangeVersionsRequest) distribution.MigrationBracket {
+	excludeKnownInternal := req.GetExcludeKnownInternal() || req.GetKeyFamily() == distribution.MigrationFamilyUser
+	start, end := migrationExportScanBounds(req)
+	return distribution.MigrationBracket{
+		Family:               req.GetKeyFamily(),
+		Start:                start,
+		End:                  end,
+		ExcludeKnownInternal: excludeKnownInternal,
+		ExcludePrefixes:      cloneByteSlices(req.GetExcludePrefixes()),
+	}
+}
+
+func (i *Internal) migrationExportRouteFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
+	if i != nil && i.migrationExportGroupID != 0 && i.migrationExportResolver != nil {
+		return kv.RouteKeyFilterForGroup(req.GetRouteStart(), req.GetRouteEnd(), i.migrationExportGroupID, i.migrationExportResolver)
+	}
+	return kv.RouteKeyFilter(req.GetRouteStart(), req.GetRouteEnd())
+}
+
+func migrationFamilyRequiresDecodedS3(family uint32) bool {
+	return family == distribution.MigrationFamilyS3BucketMeta ||
+		family == distribution.MigrationFamilyS3BucketGeneration
+}
+
+func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
+	return func(rawKey []byte) bool {
+		bucket, ok := decodedS3BucketName(family, rawKey)
+		if !ok {
+			return false
+		}
+		if keyInRouteRange(rawKey, routeStart, routeEnd) {
+			return true
+		}
+		return decodedS3BucketRouteSelected(bucket, routeStart, routeEnd)
+	}
+}
+
+func decodedS3BucketRouteSelected(bucket string, routeStart, routeEnd []byte) bool {
+	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	return keyInRouteRange(bucketRouteStart, routeStart, routeEnd)
+}
+
+func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
+	if len(aEnd) > 0 && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if len(bEnd) > 0 && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
+}
+
+func keyInRouteRange(key, start, end []byte) bool {
+	if bytes.Compare(key, start) < 0 {
+		return false
+	}
+	return len(end) == 0 || bytes.Compare(key, end) < 0
+}
+
+func decodedS3BucketName(family uint32, rawKey []byte) (string, bool) {
+	switch family {
+	case distribution.MigrationFamilyS3BucketMeta:
+		return s3keys.ParseBucketMetaKey(rawKey)
+	case distribution.MigrationFamilyS3BucketGeneration:
+		return s3keys.ParseBucketGenerationKey(rawKey)
+	default:
+		return "", false
+	}
+}
+
+func cloneByteSlices(in [][]byte) [][]byte {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make([][]byte, len(in))
+	for i := range in {
+		out[i] = bytes.Clone(in[i])
+	}
+	return out
+}
+
+func protoMVCCVersionsFromStore(in []store.MVCCVersion) []*pb.MVCCVersion {
+	out := make([]*pb.MVCCVersion, 0, len(in))
+	for _, version := range in {
+		out = append(out, &pb.MVCCVersion{
+			Key:       bytes.Clone(version.Key),
+			CommitTs:  version.CommitTS,
+			Tombstone: version.Tombstone,
+			Value:     bytes.Clone(version.Value),
+			KeyFamily: version.KeyFamily,
+			ExpireAt:  version.ExpireAt,
+		})
+	}
+	return out
 }
 
 func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) (uint64, error) {

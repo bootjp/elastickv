@@ -415,8 +415,12 @@ type RawLatestCommitTSRequest struct {
 	// below this timestamp. Comparing only `ts` cannot tell a tombstone at or
 	// before the read timestamp apart from a newer version above it.
 	VersionVisibleAtTs uint64 `protobuf:"varint,4,opt,name=version_visible_at_ts,json=versionVisibleAtTs,proto3" json:"version_visible_at_ts,omitempty"`
-	unknownFields      protoimpl.UnknownFields
-	sizeCache          protoimpl.SizeCache
+	// Optional batch form for version_visible_at_ts probes. Encoded as a single
+	// bounded key_batch blob so untrusted clients cannot expand one request into
+	// an unbounded repeated-bytes slice before the service enforces page limits.
+	KeyBatch      []byte `protobuf:"bytes,5,opt,name=key_batch,json=keyBatch,proto3" json:"key_batch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSRequest) Reset() {
@@ -477,6 +481,13 @@ func (x *RawLatestCommitTSRequest) GetVersionVisibleAtTs() uint64 {
 	return 0
 }
 
+func (x *RawLatestCommitTSRequest) GetKeyBatch() []byte {
+	if x != nil {
+		return x.KeyBatch
+	}
+	return nil
+}
+
 type RawLatestCommitTSResponse struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Ts     uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
@@ -488,10 +499,14 @@ type RawLatestCommitTSResponse struct {
 	VersionVisibleSupported bool `protobuf:"varint,4,opt,name=version_visible_supported,json=versionVisibleSupported,proto3" json:"version_visible_supported,omitempty"`
 	// 3 and 4 were taken by the version probe on main while this branch was
 	// open, so the watermark fields moved up rather than reusing those tags.
-	GroupId       uint64 `protobuf:"varint,5,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                // echoes an explicit group watermark request
-	LeaderFenced  bool   `protobuf:"varint,6,opt,name=leader_fenced,json=leaderFenced,proto3" json:"leader_fenced,omitempty"` // true only after that group's leader ReadIndex fence
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	GroupId      uint64 `protobuf:"varint,5,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                // echoes an explicit group watermark request
+	LeaderFenced bool   `protobuf:"varint,6,opt,name=leader_fenced,json=leaderFenced,proto3" json:"leader_fenced,omitempty"` // true only after that group's leader ReadIndex fence
+	// Batch answer to key_batch. 5 and 6 shipped on main as the group watermark
+	// while this branch was open, so the batch results take the next free tag
+	// rather than colliding with a released wire format.
+	VersionVisibleResults []bool `protobuf:"varint,7,rep,packed,name=version_visible_results,json=versionVisibleResults,proto3" json:"version_visible_results,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSResponse) Reset() {
@@ -564,6 +579,13 @@ func (x *RawLatestCommitTSResponse) GetLeaderFenced() bool {
 		return x.LeaderFenced
 	}
 	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetVersionVisibleResults() []bool {
+	if x != nil {
+		return x.VersionVisibleResults
+	}
+	return nil
 }
 
 type RawScanAtRequest struct {
@@ -2613,19 +2635,21 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xa8\x01\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xc5\x01\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
 	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\x12\x19\n" +
 	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x121\n" +
-	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\"\xe8\x01\n" +
+	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\x12\x1b\n" +
+	"\tkey_batch\x18\x05 \x01(\fR\bkeyBatch\"\xa0\x02\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
 	"\x06exists\x18\x02 \x01(\bR\x06exists\x12'\n" +
 	"\x0fversion_visible\x18\x03 \x01(\bR\x0eversionVisible\x12:\n" +
 	"\x19version_visible_supported\x18\x04 \x01(\bR\x17versionVisibleSupported\x12\x19\n" +
 	"\bgroup_id\x18\x05 \x01(\x04R\agroupId\x12#\n" +
-	"\rleader_fenced\x18\x06 \x01(\bR\fleaderFenced\"\xde\x02\n" +
+	"\rleader_fenced\x18\x06 \x01(\bR\fleaderFenced\x126\n" +
+	"\x17version_visible_results\x18\a \x03(\bR\x15versionVisibleResults\"\xde\x02\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +

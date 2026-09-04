@@ -61,6 +61,14 @@ func (s distributionRouteSnapshot) OwnerOf(key []byte) (uint64, bool) {
 	return s.snap.OwnerOf(key)
 }
 
+func (s distributionRouteSnapshot) RouteOf(key []byte) (distribution.Route, bool) {
+	return s.snap.RouteOf(key)
+}
+
+func (s distributionRouteSnapshot) IntersectingRoutes(start, end []byte) []distribution.Route {
+	return s.snap.IntersectingRoutes(start, end)
+}
+
 func (s distributionRouteSnapshot) WriteFencedForKey(key []byte) bool {
 	route, ok := s.snap.RouteOf(key)
 	return ok && route.State == distribution.RouteStateWriteFenced

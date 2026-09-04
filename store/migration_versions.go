@@ -18,6 +18,7 @@ const (
 
 	migrationAckMetaKey      = "_migack"
 	migrationHLCFloorMetaKey = "_mighlc"
+	migrationPromoteMetaKey  = "_migpromote"
 	migrationMetadataVersion = 1
 
 	migrationAckPrefix                 = "!migstage|ack|"
@@ -29,6 +30,7 @@ const (
 var (
 	migrationAckMetaKeyBytes      = []byte(migrationAckMetaKey)
 	migrationHLCFloorMetaKeyBytes = []byte(migrationHLCFloorMetaKey)
+	migrationPromoteMetaKeyBytes  = []byte(migrationPromoteMetaKey)
 )
 
 type exportCursorPosition struct {
@@ -89,6 +91,54 @@ func decodeExportCursor(cursor []byte) (exportCursorPosition, error) {
 	return exportCursorPosition{key: key, commitTS: commitTS, tag: tag, hasKey: true}, nil
 }
 
+// ValidateExportCursorForRange verifies that an export cursor decodes and
+// resumes inside the supplied key interval. Skipped-key cursors are accepted
+// only when they describe a key outside the interval.
+func ValidateExportCursorForRange(cursor, startKey, endKey []byte) error {
+	pos, err := decodeExportCursor(cursor)
+	if err != nil {
+		return err
+	}
+	return validateExportCursorPositionForRange(pos, startKey, endKey)
+}
+
+// ValidatePromotionCursorForRange verifies a promotion cursor before it is
+// proposed to Raft. Promotion scans emit only accepted positions, so callers
+// must not resume from sparse-scan-only cursor tags.
+func ValidatePromotionCursorForRange(cursor, startKey, endKey []byte) error {
+	pos, err := decodeExportCursor(cursor)
+	if err != nil {
+		return err
+	}
+	if !pos.hasKey {
+		return nil
+	}
+	if pos.tag != exportCursorTagEmitted {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return validateExportCursorPositionForRange(pos, startKey, endKey)
+}
+
+func validateExportCursorPositionForRange(pos exportCursorPosition, startKey, endKey []byte) error {
+	if !pos.hasKey {
+		return nil
+	}
+	if pos.tag == exportCursorTagSkippedKey {
+		opts := ExportVersionsOptions{StartKey: startKey, EndKey: endKey}
+		if !exportSkippedCursorOutsideRange(opts, pos.key) {
+			return errors.WithStack(ErrInvalidExportCursor)
+		}
+		return nil
+	}
+	if startKey != nil && bytes.Compare(pos.key, startKey) < 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	if endKey != nil && bytes.Compare(pos.key, endKey) >= 0 {
+		return errors.WithStack(ErrInvalidExportCursor)
+	}
+	return nil
+}
+
 func decodeExportCursorForOptions(opts ExportVersionsOptions) (exportCursorPosition, error) {
 	pos, err := decodeExportCursor(opts.Cursor)
 	if err != nil {
@@ -97,7 +147,7 @@ func decodeExportCursorForOptions(opts ExportVersionsOptions) (exportCursorPosit
 	if err := validateExportCursorRange(opts, pos); err != nil {
 		return exportCursorPosition{}, err
 	}
-	return pos, nil
+	return normalizeExportCursorPositionForRange(opts, pos), nil
 }
 
 func validateExportCursorRange(opts ExportVersionsOptions, pos exportCursorPosition) error {
@@ -124,6 +174,16 @@ func exportSkippedCursorOutsideRange(opts ExportVersionsOptions, key []byte) boo
 		(opts.EndKey != nil && bytes.Compare(key, opts.EndKey) >= 0)
 }
 
+func normalizeExportCursorPositionForRange(opts ExportVersionsOptions, pos exportCursorPosition) exportCursorPosition {
+	if !pos.hasKey || pos.tag != exportCursorTagSkippedKey || opts.StartKey == nil {
+		return pos
+	}
+	if bytes.Compare(pos.key, opts.StartKey) >= 0 {
+		return pos
+	}
+	return exportCursorPosition{}
+}
+
 func normalizeExportVersionsOptions(opts ExportVersionsOptions) ExportVersionsOptions {
 	if opts.EndKey != nil && len(opts.EndKey) == 0 {
 		opts.EndKey = nil
@@ -145,7 +205,8 @@ func exportUsesSparseScanBudget(opts ExportVersionsOptions) bool {
 
 func isMigrationMetadataKey(rawKey []byte) bool {
 	return bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
-		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes)
+		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes)
 }
 
 func encodeMigrationImportAcks(acks map[migrationAckID]migrationImportAck) []byte {
@@ -250,16 +311,71 @@ func decodeMigrationHLCFloors(data []byte) (map[uint64]uint64, bool) {
 	return floors, len(rest) == 0
 }
 
+func encodeMigrationPromotionStates(states map[uint64]PromotionState) []byte {
+	jobIDs := make([]uint64, 0, len(states))
+	for jobID := range states {
+		jobIDs = append(jobIDs, jobID)
+	}
+	sort.Slice(jobIDs, func(i, j int) bool { return jobIDs[i] < jobIDs[j] })
+
+	buf := make([]byte, 0, 1+binary.MaxVarintLen64+len(jobIDs)*(migrationUint64Bytes+binary.MaxVarintLen64))
+	buf = append(buf, migrationMetadataVersion)
+	buf = binary.AppendUvarint(buf, lenAsUint64(len(jobIDs)))
+	for _, jobID := range jobIDs {
+		encoded := encodePromotionState(states[jobID])
+		buf = binary.BigEndian.AppendUint64(buf, jobID)
+		buf = binary.AppendUvarint(buf, lenAsUint64(len(encoded)))
+		buf = append(buf, encoded...)
+	}
+	return buf
+}
+
+func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, bool) {
+	if len(data) == 0 || data[0] != migrationMetadataVersion {
+		return nil, false
+	}
+	rest := data[1:]
+	count, n := binary.Uvarint(rest)
+	if n <= 0 {
+		return nil, false
+	}
+	rest = rest[n:]
+	states := make(map[uint64]PromotionState)
+	for i := uint64(0); i < count; i++ {
+		if len(rest) < migrationUint64Bytes {
+			return nil, false
+		}
+		jobID := binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
+		rest = rest[migrationUint64Bytes:]
+		stateLen, n := binary.Uvarint(rest)
+		if n <= 0 {
+			return nil, false
+		}
+		rest = rest[n:]
+		if stateLen > lenAsUint64(len(rest)) {
+			return nil, false
+		}
+		stateEnd := int(stateLen) //nolint:gosec // bounded by len(rest) above.
+		state, ok := decodePromotionState(rest[:stateEnd])
+		if !ok {
+			return nil, false
+		}
+		states[jobID] = state
+		rest = rest[stateEnd:]
+	}
+	return states, len(rest) == 0
+}
+
 func validateImportVersion(version MVCCVersion) error {
 	if version.CommitTS == 0 {
-		return errors.New("migration import version has zero commit_ts")
+		return errors.Wrap(ErrInvalidImportVersion, "migration import version has zero commit_ts")
 	}
 	if version.Tombstone {
 		if version.ExpireAt != 0 {
-			return errors.New("migration import tombstone carries expire_at")
+			return errors.Wrap(ErrInvalidImportVersion, "migration import tombstone carries expire_at")
 		}
 		if len(version.Value) != 0 {
-			return errors.New("migration import tombstone carries value")
+			return errors.Wrap(ErrInvalidImportVersion, "migration import tombstone carries value")
 		}
 		return nil
 	}
@@ -394,24 +510,53 @@ func exportMemoryIteratorKey(
 	return exportMemoryVersionsForKey(ctx, opts, cursorCommitTS, key, versions, result)
 }
 
+// exportPageWouldOverflow reports whether adding one more row of valueLen
+// bytes would push a page that already holds rows past its byte budget.
+// MaxBytes is otherwise only consulted after a row has been appended, so a
+// page can overshoot it by the whole size of its last row. That overshoot is
+// what pushes an otherwise ordinary page past the migration transport limit --
+// a 3 MiB page followed by a 61 MiB row -- and the same cursor rebuilds the
+// same page on every retry. Stopping first leaves the oversized row to start
+// the next page, where it is alone and within the transport limit; a row too
+// large even alone still goes through, because a page that holds nothing yet
+// has to make progress.
+func exportPageWouldOverflow(opts ExportVersionsOptions, result *ExportVersionsResult, key []byte, valueLen int) bool {
+	if opts.MaxBytes == 0 || len(result.Versions) == 0 {
+		return false
+	}
+	return result.ExportedBytes+versionExportSize(key, valueLen) > opts.MaxBytes
+}
+
 func finishExportIfLimited(opts ExportVersionsOptions, result *ExportVersionsResult) bool {
 	return len(result.Versions) >= opts.MaxVersions ||
 		(opts.MaxBytes > 0 && result.ExportedBytes >= opts.MaxBytes) ||
 		(opts.MaxScannedBytes > 0 && result.ScannedBytes >= opts.MaxScannedBytes)
 }
 
-func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version VersionedValue, result *ExportVersionsResult) byte {
+// appendMemoryExportVersion returns the cursor tag for this version and, as
+// deferred, whether the page had to stop before it. AcceptVersion is called at
+// most once per version here: it is not required to be a pure predicate, so
+// the page-size guard sits after the filters rather than re-running them.
+func appendMemoryExportVersion(
+	opts ExportVersionsOptions,
+	key []byte,
+	version VersionedValue,
+	result *ExportVersionsResult,
+) (byte, bool) {
 	if shouldSkipMigrationExportKey(key) {
-		return exportCursorTagScanned
+		return exportCursorTagScanned, false
 	}
 	if opts.AcceptKey != nil && !opts.AcceptKey(key) {
-		return exportCursorTagScanned
-	}
-	if opts.AcceptVersion != nil && !opts.AcceptVersion(key, version.Value) {
-		return exportCursorTagScanned
+		return exportCursorTagScanned, false
 	}
 	if opts.MaxCommitTSInclusive != 0 && version.TS > opts.MaxCommitTSInclusive {
-		return exportCursorTagScanned
+		return exportCursorTagScanned, false
+	}
+	if opts.AcceptVersion != nil && !opts.AcceptVersion(key, version.Value) {
+		return exportCursorTagScanned, false
+	}
+	if exportPageWouldOverflow(opts, result, key, len(version.Value)) {
+		return exportCursorTagScanned, true
 	}
 	result.Versions = append(result.Versions, MVCCVersion{
 		Key:       bytes.Clone(key),
@@ -423,7 +568,7 @@ func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version V
 	})
 	result.ExportedBytes += versionExportSize(key, len(version.Value))
 	result.AcceptedRows++
-	return exportCursorTagEmitted
+	return exportCursorTagEmitted, false
 }
 
 func shouldSkipMigrationExportKey(key []byte) bool {
@@ -444,12 +589,23 @@ func shouldSkipMemoryVersion(cursorCommitTS uint64, version VersionedValue) bool
 	return cursorCommitTS != 0 && version.TS >= cursorCommitTS
 }
 
-func exportMemoryVersion(opts ExportVersionsOptions, cursorCommitTS uint64, key []byte, version VersionedValue, result *ExportVersionsResult) bool {
+// exportMemoryVersion returns (continue, deferred): deferred means the page is
+// full for this version and it must start the next one.
+func exportMemoryVersion(
+	opts ExportVersionsOptions,
+	cursorCommitTS uint64,
+	key []byte,
+	version VersionedValue,
+	result *ExportVersionsResult,
+) (bool, bool) {
 	if shouldSkipMemoryVersion(cursorCommitTS, version) {
-		return true
+		return true, false
 	}
-	tag := appendMemoryExportVersion(opts, key, version, result)
-	return finishMemoryExportPosition(opts, key, version, tag, result)
+	tag, deferred := appendMemoryExportVersion(opts, key, version, result)
+	if deferred {
+		return false, true
+	}
+	return finishMemoryExportPosition(opts, key, version, tag, result), false
 }
 
 func exportMemoryVersionsForKey(
@@ -473,7 +629,14 @@ func exportMemoryVersionsForKey(
 			}
 			return true, nil
 		}
-		if !exportMemoryVersion(opts, cursorCommitTS, key, versions[i], result) {
+		cont, deferred := exportMemoryVersion(opts, cursorCommitTS, key, versions[i], result)
+		if deferred {
+			// The page is full for this row. The cursor still points at the row
+			// before it, so the next page starts here and carries it alone.
+			result.Done = false
+			return false, nil
+		}
+		if !cont {
 			return !finishExportIfLimited(opts, result), nil
 		}
 		if !result.Done && finishExportIfLimited(opts, result) {
@@ -521,6 +684,10 @@ func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
 }
 
+func (s *mvccStore) ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	return s.ImportVersions(ctx, opts)
+}
+
 func (s *mvccStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
@@ -539,5 +706,10 @@ func (s *mvccStore) RetireMigration(ctx context.Context, jobID uint64) error {
 		}
 	}
 	delete(s.migrationHLCFloors, jobID)
+	delete(s.migrationPromotions, jobID)
 	return nil
+}
+
+func (s *mvccStore) RetireMigrationRaft(ctx context.Context, jobID, _ uint64) error {
+	return s.RetireMigration(ctx, jobID)
 }

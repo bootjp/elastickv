@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -47,6 +48,158 @@ func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (
 
 func (s *recordingTransactional) Abort(_ context.Context, _ []*pb.Request) (*TransactionResponse, error) {
 	return &TransactionResponse{}, nil
+}
+
+func TestShardedCoordinatorValidateReadKeysOnShard_UsesStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	st := store.NewMVCCStore()
+	readKey := []byte("k")
+	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, readKey), []byte("staged"), 20, 0))
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Engine: stubLeaderEngine{}, Store: st},
+	}, 1, NewHLC(), nil)
+
+	err := coord.validateReadKeysOnShard(ctx, 1, [][]byte{readKey}, 10)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+}
+
+func TestShardedCoordinatorDispatchTxn_AddsStagedReadKeyAlias(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	readKey := []byte("k")
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 101,
+		Elems:    []*Elem[OP]{{Op: Put, Key: []byte("m"), Value: []byte("write")}},
+		ReadKeys: [][]byte{readKey},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Equal(t, [][]byte{
+		readKey,
+		distribution.MigrationStagedDataKey(9, readKey),
+		distribution.MigrationStagedDataKey(9, []byte("m")),
+	}, txn.requests[0].ReadKeys)
+}
+
+func TestShardedCoordinatorDispatchTxn_AddsStagedWriteKeyAlias(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: txn},
+	}, 1, NewHLC(), nil)
+
+	writeKey := []byte("k")
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 101,
+		Elems:    []*Elem[OP]{{Op: Put, Key: writeKey, Value: []byte("write")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, txn.requests, 1)
+	require.Equal(t, [][]byte{
+		distribution.MigrationStagedDataKey(9, writeKey),
+	}, txn.requests[0].ReadKeys)
+}
+
+func TestShardedCoordinatorPrewrite_AddsStagedWriteKeyAlias(t *testing.T) {
+	t.Parallel()
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("m"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+			{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	g1Txn := &recordingTransactional{}
+	g2Txn := &recordingTransactional{}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+
+	writeKey := []byte("b")
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn:    true,
+		StartTS:  10,
+		CommitTS: 101,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: writeKey, Value: []byte("write-b")},
+			{Op: Put, Key: []byte("x"), Value: []byte("write-x")},
+		},
+	})
+	require.NoError(t, err)
+	require.NotEmpty(t, g1Txn.requests)
+	require.NotEmpty(t, g2Txn.requests)
+	require.Equal(t, [][]byte{
+		distribution.MigrationStagedDataKey(9, writeKey),
+	}, g1Txn.requests[0].ReadKeys)
+	require.Empty(t, g2Txn.requests[0].ReadKeys)
 }
 
 func cloneTxnRequest(req *pb.Request) *pb.Request {
@@ -902,43 +1055,24 @@ func TestShardedCoordinatorDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	require.Equal(t, commitTS, commitMeta2.CommitTS)
 }
 
-func TestShardedCoordinatorDispatchTxn_RejectsRouteWriteTimestampFloor(t *testing.T) {
+func TestShardedCoordinatorDispatchTxn_RejectsMigrationTimestampFloor(t *testing.T) {
 	t.Parallel()
 
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
-		Routes: []distribution.RouteDescriptor{
-			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: 20},
-		},
-	}))
-
 	g1Txn := &recordingTransactional{}
-	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+	coord := NewShardedCoordinator(newMigrationFloorEngine(t, 100), map[uint64]*ShardGroup{
 		1: {Txn: g1Txn},
 	}, 1, NewHLC(), nil)
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		IsTxn:    true,
-		StartTS:  10,
-		CommitTS: 20,
+		StartTS:  90,
+		CommitTS: 100,
 		Elems: []*Elem[OP]{
-			{Op: Put, Key: []byte("b"), Value: []byte("v")},
+			{Op: Put, Key: []byte("z"), Value: []byte("v")},
 		},
 	})
-	require.ErrorIs(t, err, store.ErrWriteConflict)
-	require.Empty(t, g1Txn.requests)
-
-	_, err = coord.Dispatch(context.Background(), &OperationGroup[OP]{
-		IsTxn:    true,
-		StartTS:  10,
-		CommitTS: 21,
-		Elems: []*Elem[OP]{
-			{Op: Put, Key: []byte("b"), Value: []byte("v")},
-		},
-	})
-	require.NoError(t, err)
-	require.Len(t, g1Txn.requests, 1)
+	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.Empty(t, g1Txn.requests, "coordinator must reject before preparing a floor-violating txn")
 }
 
 func TestCommitSecondaryWithRetry_RetriesAndSucceeds(t *testing.T) {
@@ -1068,6 +1202,51 @@ func TestGroupReadKeysByShardID_FailsClosedOnUnroutable(t *testing.T) {
 			"would drop the key from OCC validation and break SSI")
 	require.Nil(t, grouped)
 	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+func TestGroupReadKeysByShardID_RoutesS3BucketAuxiliaryToStagedOwner(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	}, 1, NewHLC(), nil)
+
+	key := s3keys.BucketMetaKey(bucket)
+	grouped, err := coord.groupReadKeysByShardID([][]byte{key})
+	require.NoError(t, err)
+	require.Empty(t, grouped[1])
+	require.Equal(t, [][]byte{
+		key,
+		distribution.MigrationStagedDataKey(9, key),
+	}, grouped[2])
+}
+
+func TestGroupReadKeysByShardID_RoutesS3BucketAuxiliaryToPromotedOwner(t *testing.T) {
+	t.Parallel()
+
+	const bucket = "bucket-a"
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryPromotedRoutes(),
+	}))
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	}, 1, NewHLC(), nil)
+
+	key := s3keys.BucketMetaKey(bucket)
+	grouped, err := coord.groupReadKeysByShardID([][]byte{key})
+	require.NoError(t, err)
+	require.Empty(t, grouped[1])
+	require.Equal(t, [][]byte{key}, grouped[2])
 }
 
 // ---------------------------------------------------------------------------
@@ -1375,4 +1554,45 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPropagatesObservedRouteVersion(
 				"apply-time gate for every cross-shard txn",
 			req.Phase)
 	}
+}
+
+// In partition-resolved keyspaces such as HT-FIFO SQS, routeKey collapses a
+// concrete partition key onto the global SQS route, so that route's write floor
+// is not the key's floor. rejectWriteFencedPointKey already exempts these keys;
+// the timestamp-floor precheck must match, or it rejects writes the fence
+// precheck deliberately lets through.
+func TestShardedCoordinatorFloorPrecheckSkipsResolverOwnedKeys(t *testing.T) {
+	t.Parallel()
+
+	const partitionKey = "!sqs|msg|data|p|queue|7"
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			// The route routeKey() collapses partition keys onto, carrying a floor.
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: 100},
+		},
+	}))
+	c := NewShardedCoordinator(engine, map[uint64]*ShardGroup{1: {}}, 1, NewHLC(), nil)
+
+	// Without a resolver the floor applies, which is what makes the exemption
+	// below meaningful rather than vacuous.
+	require.ErrorIs(t,
+		c.rejectWriteTimestampFloorPointKey([]byte(partitionKey), 100),
+		ErrRouteWriteTimestampTooLow)
+
+	c.WithPartitionResolver(&fakePartitionResolver{
+		routes:           map[string]uint64{partitionKey: 1},
+		recognisedPrefix: []byte("!sqs|msg|data|p|"),
+	})
+
+	require.NoError(t,
+		c.rejectWriteTimestampFloorPointKey([]byte(partitionKey), 100),
+		"a resolver-owned key must not be judged by the route routeKey collapses it onto")
+
+	// A key the resolver does not own still gets the floor.
+	require.ErrorIs(t,
+		c.rejectWriteTimestampFloorPointKey([]byte("ordinary-key"), 100),
+		ErrRouteWriteTimestampTooLow)
 }

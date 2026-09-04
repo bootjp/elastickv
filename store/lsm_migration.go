@@ -10,6 +10,13 @@ import (
 )
 
 func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+
+	return s.exportVersionsLocked(ctx, opts)
+}
+
+func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersionsOptions) (ExportVersionsResult, error) {
 	opts = normalizeExportVersionsOptions(opts)
 	pos, err := decodeExportCursorForOptions(opts)
 	if err != nil {
@@ -18,9 +25,6 @@ func (s *pebbleStore) ExportVersions(ctx context.Context, opts ExportVersionsOpt
 	if opts.MaxVersions <= 0 {
 		return ExportVersionsResult{}, errors.WithStack(ErrInvalidExportBudget)
 	}
-
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 
 	iter, err := s.db.NewIter(pebbleExportIterOptions(opts))
 	if err != nil {
@@ -248,26 +252,17 @@ func (s *pebbleStore) exportPebbleVersion(
 	commitTS uint64,
 	result *ExportVersionsResult,
 ) (bool, error) {
-	tag := exportCursorTagScanned
 	rawValue := iter.Value()
 	result.ScannedBytes += versionExportSize(userKey, len(rawValue))
+	tag := exportCursorTagScanned
 	if shouldExportPebbleVersion(opts, userKey, commitTS) {
-		version, err := s.decodeExportedPebbleVersion(iter, userKey, commitTS, opts.KeyFamily)
-		if err != nil {
+		emitted, cont, err := s.appendExportedPebbleVersion(iter, opts, userKey, commitTS, result)
+		if err != nil || !cont {
 			return false, err
 		}
-		if opts.AcceptVersion != nil && !opts.AcceptVersion(version.Key, version.Value) {
-			result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
-			if finishExportIfLimited(opts, result) {
-				result.Done = false
-				return false, nil
-			}
-			return true, nil
+		if emitted {
+			tag = exportCursorTagEmitted
 		}
-		result.Versions = append(result.Versions, version)
-		result.ExportedBytes += versionExportSize(userKey, len(version.Value))
-		result.AcceptedRows++
-		tag = exportCursorTagEmitted
 	}
 	result.NextCursor = encodeExportCursor(userKey, commitTS, tag)
 	if finishExportIfLimited(opts, result) {
@@ -275,6 +270,41 @@ func (s *pebbleStore) exportPebbleVersion(
 		return false, nil
 	}
 	return true, nil
+}
+
+// appendExportedPebbleVersion decodes the version at the iterator and puts it
+// on the page. It returns emitted=false when a filter rejected the version,
+// and cont=false when the page had to stop: either because the row would push
+// a page that already holds rows past its byte budget -- the cursor stays on
+// the previous row so this one starts the next page -- or because a rejected
+// version finished the chunk.
+func (s *pebbleStore) appendExportedPebbleVersion(
+	iter *pebble.Iterator,
+	opts ExportVersionsOptions,
+	userKey []byte,
+	commitTS uint64,
+	result *ExportVersionsResult,
+) (emitted bool, cont bool, err error) {
+	version, err := s.decodeExportedPebbleVersion(iter, userKey, commitTS, opts.KeyFamily)
+	if err != nil {
+		return false, false, err
+	}
+	if opts.AcceptVersion != nil && !opts.AcceptVersion(version.Key, version.Value) {
+		result.NextCursor = encodeExportCursor(userKey, commitTS, exportCursorTagScanned)
+		if finishExportIfLimited(opts, result) {
+			result.Done = false
+			return false, false, nil
+		}
+		return false, true, nil
+	}
+	if exportPageWouldOverflow(opts, result, userKey, len(version.Value)) {
+		result.Done = false
+		return false, false, nil
+	}
+	result.Versions = append(result.Versions, version)
+	result.ExportedBytes += versionExportSize(userKey, len(version.Value))
+	result.AcceptedRows++
+	return true, true, nil
 }
 
 func shouldExportPebbleVersion(opts ExportVersionsOptions, userKey []byte, commitTS uint64) bool {
@@ -310,6 +340,14 @@ func (s *pebbleStore) decodeExportedPebbleVersion(iter *pebble.Iterator, userKey
 }
 
 func (s *pebbleStore) ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	return s.importVersionsWithOpts(ctx, opts, s.directApplyWriteOpts(), true)
+}
+
+func (s *pebbleStore) ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
+	return s.importVersionsWithOpts(ctx, opts, s.raftApplyWriteOpts(), false)
+}
+
+func (s *pebbleStore) importVersionsWithOpts(ctx context.Context, opts ImportVersionsOptions, writeOpts *pebble.WriteOptions, gateRegistration bool) (ImportVersionsResult, error) {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -321,11 +359,14 @@ func (s *pebbleStore) ImportVersions(ctx context.Context, opts ImportVersionsOpt
 		return ImportVersionsResult{}, err
 	}
 	if duplicate {
+		if err := s.commitPebbleImportAppliedIndex(opts.AppliedIndex, writeOpts); err != nil {
+			return ImportVersionsResult{}, err
+		}
 		return ImportVersionsResult{AckedCursor: ackedCursor, Duplicate: true}, nil
 	}
 
 	batchMax := importBatchMaxTS(opts.Versions)
-	if err := s.commitPebbleImportBatch(opts, batchMax); err != nil {
+	if err := s.commitPebbleImportBatch(opts, batchMax, writeOpts, gateRegistration); err != nil {
 		return ImportVersionsResult{}, errors.WithStack(err)
 	}
 	s.log.InfoContext(ctx, "import_versions",
@@ -336,6 +377,18 @@ func (s *pebbleStore) ImportVersions(ctx context.Context, opts ImportVersionsOpt
 		"max_imported_ts", batchMax,
 	)
 	return ImportVersionsResult{AckedCursor: bytes.Clone(opts.Cursor), MaxImportedTS: batchMax}, nil
+}
+
+func (s *pebbleStore) commitPebbleImportAppliedIndex(appliedIndex uint64, writeOpts *pebble.WriteOptions) error {
+	if appliedIndex == 0 {
+		return nil
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(writeOpts))
 }
 
 func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (bool, []byte, error) {
@@ -358,10 +411,10 @@ func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (boo
 	return false, nil, nil
 }
 
-func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64) error {
+func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchMax uint64, writeOpts *pebble.WriteOptions, gateRegistration bool) error {
 	batch := s.db.NewBatch()
 	defer batch.Close()
-	if err := s.applyImportVersionsBatch(batch, opts.Versions); err != nil {
+	if err := s.applyImportVersionsBatch(batch, opts.Versions, gateRegistration); err != nil {
 		return err
 	}
 	if err := s.stageMigrationImportAck(batch, opts.JobID, opts.BracketID, migrationImportAck{
@@ -375,13 +428,23 @@ func (s *pebbleStore) commitPebbleImportBatch(opts ImportVersionsOptions, batchM
 		return err
 	}
 	defer unlock()
-	if err := batch.Commit(s.directApplyWriteOpts()); err != nil {
+	if err := stagePebbleAppliedIndex(batch, opts.AppliedIndex); err != nil {
+		return err
+	}
+	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
 	if batchMax > 0 {
 		s.lastCommitTS = newLastTS
 	}
 	return nil
+}
+
+func stagePebbleAppliedIndex(batch *pebble.Batch, appliedIndex uint64) error {
+	if appliedIndex == 0 {
+		return nil
+	}
+	return setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex)
 }
 
 func (s *pebbleStore) stageMigrationImportAck(batch *pebble.Batch, jobID, bracketID uint64, ack migrationImportAck) error {
@@ -403,7 +466,7 @@ func (s *pebbleStore) stageMigrationClockMetadataIfNeeded(batch *pebble.Batch, j
 	return s.stageMigrationClockMetadata(batch, jobID, batchMax)
 }
 
-func (s *pebbleStore) applyImportVersionsBatch(batch *pebble.Batch, versions []MVCCVersion) error {
+func (s *pebbleStore) applyImportVersionsBatch(batch *pebble.Batch, versions []MVCCVersion, gateRegistration bool) error {
 	for _, version := range versions {
 		k, err := encodePebbleUserVersionKey(version.Key, version.CommitTS)
 		if err != nil {
@@ -413,7 +476,7 @@ func (s *pebbleStore) applyImportVersionsBatch(batch *pebble.Batch, versions []M
 		if version.Tombstone {
 			encoded = encodeValue(nil, true, 0, encStateCleartext)
 		} else {
-			body, encState, err := s.encryptForKey(k, version.Value, version.ExpireAt, true)
+			body, encState, err := s.encryptForKey(k, version.Value, version.ExpireAt, gateRegistration)
 			if err != nil {
 				return err
 			}
@@ -517,6 +580,14 @@ func (s *pebbleStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64
 }
 
 func (s *pebbleStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	return s.retireMigrationWithOpts(ctx, jobID, s.directApplyWriteOpts(), 0)
+}
+
+func (s *pebbleStore) RetireMigrationRaft(ctx context.Context, jobID, appliedIndex uint64) error {
+	return s.retireMigrationWithOpts(ctx, jobID, s.raftApplyWriteOpts(), appliedIndex)
+}
+
+func (s *pebbleStore) retireMigrationWithOpts(ctx context.Context, jobID uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
@@ -531,7 +602,13 @@ func (s *pebbleStore) RetireMigration(ctx context.Context, jobID uint64) error {
 	if err := s.stageRetireMigrationHLCFloor(batch, jobID); err != nil {
 		return err
 	}
-	return errors.WithStack(batch.Commit(s.directApplyWriteOpts()))
+	if err := s.stageRetireMigrationPromotionState(batch, jobID); err != nil {
+		return err
+	}
+	if err := stagePebbleAppliedIndex(batch, appliedIndex); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(writeOpts))
 }
 
 func (s *pebbleStore) stageRetireMigrationImportAcks(batch *pebble.Batch, jobID uint64) error {
@@ -554,6 +631,15 @@ func (s *pebbleStore) stageRetireMigrationHLCFloor(batch *pebble.Batch, jobID ui
 	}
 	delete(floors, jobID)
 	return stageMigrationMetadataMap(batch, migrationHLCFloorMetaKeyBytes, len(floors), encodeMigrationHLCFloors(floors))
+}
+
+func (s *pebbleStore) stageRetireMigrationPromotionState(batch *pebble.Batch, jobID uint64) error {
+	states, err := s.readPebblePromotionStates()
+	if err != nil {
+		return err
+	}
+	delete(states, jobID)
+	return stageMigrationMetadataMap(batch, migrationPromoteMetaKeyBytes, len(states), encodeMigrationPromotionStates(states))
 }
 
 func stageMigrationMetadataMap(batch *pebble.Batch, key []byte, entries int, encoded []byte) error {

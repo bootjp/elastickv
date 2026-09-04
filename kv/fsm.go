@@ -10,7 +10,9 @@ import (
 	"os"
 	"sync/atomic"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
@@ -139,6 +141,10 @@ type RouteSnapshot interface {
 	// OwnerOf returns the Raft group ID that owned key at this
 	// snapshot's version.  (0, false) when no route covered key.
 	OwnerOf(key []byte) (uint64, bool)
+	// RouteOf returns the complete route descriptor covering key.
+	RouteOf(key []byte) (distribution.Route, bool)
+	// IntersectingRoutes returns every route intersecting [start, end).
+	IntersectingRoutes(start, end []byte) []distribution.Route
 	// WriteFencedForKey reports whether key is currently inside a
 	// WriteFenced route in this snapshot.
 	WriteFencedForKey(key []byte) bool
@@ -306,6 +312,8 @@ var ErrUnknownRequestType = errors.New("unknown request type")
 // catches up to the promoted owner.
 var ErrRouteWriteFenced = errors.New("route is write-fenced; retry after route migration")
 
+var ErrRouteWriteTimestampTooLow = errors.New("route write timestamp is below migration floor")
+
 // ErrComposed1Violation is returned by verifyComposed1 when the
 // transaction's commit cannot proceed on this Raft group because the
 // txn's read-set or write-set keys are not owned by this group at
@@ -346,11 +354,10 @@ func (f *kvFSM) Apply(data []byte) any {
 	if f.backupFloorLoadErr != nil {
 		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
 	}
-	if resp, handled := f.applyReservedOpcode(data); handled {
+	ctx := context.TODO()
+	if resp, handled := f.applyReservedOpcode(ctx, data); handled {
 		return resp
 	}
-
-	ctx := context.TODO()
 
 	reqs, err := decodeRaftRequests(data)
 	if err != nil {
@@ -392,13 +399,19 @@ func (f *kvFSM) Apply(data []byte) any {
 // opcode with ErrEncryptionApply, which the engine's HaltApply seam
 // recognises as a halt — same fail-closed shape as the Stage 3
 // raft-envelope unwrap path.
-func (f *kvFSM) applyReservedOpcode(data []byte) (any, bool) {
+func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool) {
 	if len(data) == 0 {
 		return nil, false
 	}
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeMigrationImport:
+		return f.applyMigrationImport(ctx, data[1:]), true
+	case data[0] == raftEncodeMigrationRetire:
+		return f.applyMigrationRetire(ctx, data[1:]), true
+	case data[0] == raftEncodeMigrationPromote:
+		return f.applyMigrationPromote(ctx, data[1:]), true
 	case data[0] == raftEncodeBackup:
 		return f.applyBackup(data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
@@ -432,6 +445,17 @@ const (
 	// These entries do not touch the MVCC store; they only advance the shared HLC
 	// physicalCeiling so the logical counter can continue to increment in memory.
 	raftEncodeHLCLease byte = 0x02
+	// raftEncodeMigrationImport carries a target-group range-migration import
+	// batch. Every target voter applies the raw MVCC versions, import ack, and
+	// migration HLC floor before the RPC handler returns success.
+	raftEncodeMigrationImport byte = 0x09
+	// raftEncodeMigrationRetire carries target-group metadata retirement for a
+	// completed migration job. Every target voter drops import/progress state.
+	raftEncodeMigrationRetire byte = 0x0c
+	// raftEncodeMigrationPromote carries a target-group range-migration staged
+	// data promotion chunk. Every target voter atomically copies staged MVCC
+	// versions into the live keyspace and removes the promoted staged rows.
+	raftEncodeMigrationPromote byte = 0x0b
 )
 
 func decodeRaftRequests(data []byte) ([]*pb.Request, error) {
@@ -526,23 +550,18 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	if err := f.verifyWriteFence(r); err != nil {
 		return err
 	}
+	floorSnap, err := f.routeFloorSnapshotForRequest(r)
+	if err != nil {
+		return err
+	}
 	// DEL_PREFIX mutations are handled by the store's DeletePrefixAt which
 	// scans and writes tombstones locally. A DEL_PREFIX request must be the
 	// sole mutation in a request (enforced by the coordinator's toRawRequest).
 	if hasDelPrefix, prefix := extractDelPrefix(r.Mutations); hasDelPrefix {
-		return f.handleDelPrefix(ctx, prefix, commitTS)
+		return f.handleDelPrefixWithFloorSnapshot(ctx, prefix, commitTS, floorSnap)
 	}
 
-	for _, mut := range r.Mutations {
-		if mut == nil || len(mut.Key) == 0 {
-			return errors.WithStack(ErrInvalidRequest)
-		}
-		// Raw requests should not mutate txn-internal keys.
-		if isTxnInternalKey(mut.Key) {
-			return errors.WithStack(ErrInvalidRequest)
-		}
-	}
-	if err := f.assertNoConflictingTxnLocks(ctx, r.Mutations, nil, 0); err != nil {
+	if err := f.validateRawMutationsForApply(ctx, r, commitTS, floorSnap); err != nil {
 		return err
 	}
 
@@ -556,6 +575,45 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObservers(commitTS, r.Mutations)
+	return nil
+}
+
+func (f *kvFSM) validateRawMutationsForApply(ctx context.Context, r *pb.Request, commitTS uint64, floorSnap RouteSnapshot) error {
+	bypassKeys := writeFenceBypassKeySet(r.GetWriteFenceBypassKeys())
+	for _, mut := range r.GetMutations() {
+		if err := f.validateRawMutationForApply(ctx, mut, bypassKeys, commitTS, floorSnap); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutation, writeFenceBypassKeys map[string]struct{}, commitTS uint64, floorSnap RouteSnapshot) error {
+	if mut == nil || len(mut.Key) == 0 {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	// Raw requests should not mutate txn-internal keys.
+	if isTxnInternalKey(mut.Key) {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	// Nor the migration and catalog control namespaces. Those are written only
+	// by the typed internal commands (catalog applies, migration import and
+	// promote), never by a RawKV mutation. The check is a pure function of the
+	// key, so every replica reaches the same verdict for the same entry.
+	if distribution.IsReservedControlKey(mut.Key) {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	if _, bypass := writeFenceBypassKeys[string(mut.Key)]; !bypass {
+		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+			return err
+		}
+	}
+	if err := verifyRouteWriteTimestampFloorForKeyFromSnapshot(floorSnap, mut.Key, commitTS); err != nil {
+		return err
+	}
+	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -573,11 +631,184 @@ func extractDelPrefix(muts []*pb.Mutation) (bool, []byte) {
 // handleDelPrefix delegates prefix deletion to the store. Transaction-internal
 // keys are always excluded to preserve transactional integrity.
 func (f *kvFSM) handleDelPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
-	if err := f.store.DeletePrefixAtRaftAt(ctx, prefix, txnCommonPrefix, commitTS, f.pendingApplyIdx); err != nil {
+	return f.handleDelPrefixWithFloorSnapshot(ctx, prefix, commitTS, nil)
+}
+
+func (f *kvFSM) handleDelPrefixWithFloorSnapshot(ctx context.Context, prefix []byte, commitTS uint64, floorSnap RouteSnapshot) error {
+	// DEL_PREFIX never reaches validateRawMutationsForApply, so the control
+	// namespaces are gated here as well. A prefix is refused both when it sits
+	// inside one and when it is broad enough to sweep one up.
+	if distribution.ReservedControlPrefixIntersects(prefix) {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	if err := f.verifyRouteNotFencedForPrefix(prefix); err != nil {
+		return err
+	}
+	if err := verifyRouteWriteTimestampFloorForPrefixFromSnapshot(floorSnap, prefix, commitTS); err != nil {
+		return err
+	}
+	deletes := []store.PrefixDelete{{
+		Prefix:        prefix,
+		ExcludePrefix: txnCommonPrefix,
+	}}
+	for _, del := range f.stagedVisibilityPrefixDeletesForApply(prefix, txnCommonPrefix) {
+		deletes = append(deletes, store.PrefixDelete{
+			Prefix:        del.prefix,
+			ExcludePrefix: del.excludePrefix,
+		})
+	}
+	if err := f.store.DeletePrefixesAtRaftAt(ctx, deletes, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObserver(commitTS, pb.Op_DEL_PREFIX, prefix)
 	return nil
+}
+
+func (f *kvFSM) routeFloorSnapshotForRequest(r *pb.Request) (RouteSnapshot, error) {
+	if f.routes == nil || f.shardGroupID == 0 {
+		return nil, nil
+	}
+	observedVer, pinned := DecodeObservedRouteVersion(r.GetObservedRouteVersion())
+	if !pinned {
+		return nil, nil
+	}
+	snap, ok := f.routes.SnapshotAt(observedVer)
+	if !ok {
+		return nil, errors.WithStack(ErrComposed1VersionGCd)
+	}
+	return snap, nil
+}
+
+type fsmStagedVisibilityPrefixDelete struct {
+	prefix        []byte
+	excludePrefix []byte
+}
+
+func (f *kvFSM) stagedVisibilityPrefixDeletesForApply(prefix []byte, excludePrefix []byte) []fsmStagedVisibilityPrefixDelete {
+	if f == nil || f.routes == nil || f.shardGroupID == 0 {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	routes := snap.IntersectingRoutes(start, end)
+	out := make([]fsmStagedVisibilityPrefixDelete, 0, len(routes))
+	seen := make(map[string]struct{}, len(routes))
+	for _, route := range routes {
+		if route.GroupID != f.shardGroupID || !routeHasStagedVisibility(route) {
+			continue
+		}
+		stagedPrefix := distribution.MigrationStagedDataKey(route.MigrationJobID, prefix)
+		var stagedExclude []byte
+		if excludePrefix != nil {
+			stagedExclude = distribution.MigrationStagedDataKey(route.MigrationJobID, excludePrefix)
+		}
+		dedupeKey := string(stagedPrefix) + "\x00" + string(stagedExclude)
+		if _, ok := seen[dedupeKey]; ok {
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
+		out = append(out, fsmStagedVisibilityPrefixDelete{prefix: stagedPrefix, excludePrefix: stagedExclude})
+	}
+	return out
+}
+
+func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
+	if f.routes == nil {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, snap.IntersectingRoutes(start, end))
+		if found && route.State == distribution.RouteStateWriteFenced {
+			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+		}
+		return nil
+	}
+	rkey := routeKey(key)
+	if snap.WriteFencedForKey(rkey) {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
+	}
+	return nil
+}
+
+func (f *kvFSM) verifyRouteNotFencedForPrefix(prefix []byte) error {
+	if f.routes == nil {
+		return nil
+	}
+	snap, ok := f.routes.Current()
+	if !ok {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	if !snap.WriteFencedIntersects(start, end) {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", prefix, start, end)
+}
+
+func verifyRouteWriteTimestampFloorForKeyFromSnapshot(snap RouteSnapshot, key []byte, commitTS uint64) error {
+	if snap == nil || commitTS == 0 {
+		return nil
+	}
+	if start, end, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, snap.IntersectingRoutes(start, end))
+		if found {
+			return verifyRouteWriteTimestampFloorForRange(route, key, start, end, commitTS)
+		}
+		return nil
+	}
+	rkey := routeKey(key)
+	if route, ok := snap.RouteOf(rkey); ok {
+		if err := verifyRouteWriteTimestampFloorForRoute(route, key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyRouteWriteTimestampFloorsForMutationsFromSnapshot(snap RouteSnapshot, muts []*pb.Mutation, commitTS uint64) error {
+	for _, mut := range muts {
+		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
+			continue
+		}
+		if err := verifyRouteWriteTimestampFloorForKeyFromSnapshot(snap, mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyRouteWriteTimestampFloorForPrefixFromSnapshot(snap RouteSnapshot, prefix []byte, commitTS uint64) error {
+	if snap == nil || commitTS == 0 {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	for _, route := range snap.IntersectingRoutes(start, end) {
+		if err := verifyRouteWriteTimestampFloorForRange(route, prefix, start, end, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func verifyRouteWriteTimestampFloorForRoute(route distribution.Route, key []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, routeKey(key), commitTS, route.MinWriteTSExclusive)
+}
+
+func verifyRouteWriteTimestampFloorForRange(route distribution.Route, key, start, end []byte, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
 }
 
 func routePrefixRange(prefix []byte) ([]byte, []byte) {
@@ -590,11 +821,19 @@ func routePrefixRange(prefix []byte) ([]byte, []byte) {
 	if start, ok := dynamoExactCleanupRouteKey(prefix); ok {
 		return start, routePointRangeEnd(start)
 	}
+	if start, end, ok := fskeys.ChunkScanRouteBounds(prefix, prefixScanEnd(prefix)); ok {
+		return start, end
+	}
 	if routeKeyspaceWideRawPrefix(prefix) {
 		return []byte(""), nil
 	}
 	start := routeKey(prefix)
 	return start, prefixScanEnd(start)
+}
+
+// RoutePrefixRange maps a raw key prefix to the routed key range it may touch.
+func RoutePrefixRange(prefix []byte) ([]byte, []byte) {
+	return routePrefixRange(prefix)
 }
 
 func dynamoExactCleanupRouteKey(prefix []byte) ([]byte, bool) {
@@ -666,6 +905,7 @@ var routeMappedRawPrefixes = append([][]byte{
 	[]byte(s3keys.BlobPrefix),
 	[]byte(s3keys.GCUploadPrefix),
 	[]byte(s3keys.RoutePrefix),
+	fskeys.UsageRouteAllPrefix(),
 }, sqsConcreteInternalPrefixBytes...)
 
 var ErrNotImplemented = errors.New("not implemented")
@@ -971,20 +1211,34 @@ func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys
 		if _, ok := bypassKeys[string(mut.Key)]; ok {
 			continue
 		}
+		if checked, err := verifyS3BucketAuxiliaryWriteFenceFromSnapshot(mut.Key, snap, snapVer, phase); checked {
+			if err != nil {
+				return err
+			}
+			continue
+		}
 		rKey := routeKey(mut.Key)
 		if snap.WriteFencedForKey(rKey) {
 			return errors.Wrapf(ErrRouteWriteFenced,
 				"%s-version v=%d: key %q routeKey %q",
 				phase, snapVer, mut.Key, rKey)
 		}
-		start, end, ok := s3BucketAuxiliaryRouteRange(mut.Key)
-		if ok && snap.WriteFencedIntersects(start, end) {
-			return errors.Wrapf(ErrRouteWriteFenced,
-				"%s-version v=%d: key %q route range [%q,%q)",
-				phase, snapVer, mut.Key, start, end)
-		}
 	}
 	return nil
+}
+
+func verifyS3BucketAuxiliaryWriteFenceFromSnapshot(key []byte, snap RouteSnapshot, snapVer uint64, phase string) (bool, error) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return false, nil
+	}
+	route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, snap.IntersectingRoutes(start, end))
+	if found && route.State == distribution.RouteStateWriteFenced {
+		return true, errors.Wrapf(ErrRouteWriteFenced,
+			"%s-version v=%d: key %q route range [%q,%q)",
+			phase, snapVer, key, start, end)
+	}
+	return true, nil
 }
 
 func writeFenceBypassKeySet(keys [][]byte) map[string]struct{} {
@@ -1018,19 +1272,22 @@ func (f *kvFSM) verifyOwnerFromSnapshot(mutations []*pb.Mutation, bypassKeys map
 		if _, ok := bypassKeys[string(mut.Key)]; ok {
 			continue
 		}
-		// routeKey-normalize before OwnerOf so the gate routes the
-		// same way as ShardRouter.ResolveGroup — raw adapter keys
-		// and route catalog ranges live in different lex bands
-		// (issue #930).
-		rKey := routeKey(mut.Key)
-		owner, found := snap.OwnerOf(rKey)
+		ownerKey := composed1OwnerKey(mut.Key)
+		owner, found := snap.OwnerOf(ownerKey)
 		if !found || owner != f.shardGroupID {
 			return errors.Wrapf(ErrComposed1Violation,
 				"%s-version v=%d: key %q (routeKey %q) owned by group %d (found=%v); this FSM serves group %d",
-				phase, snapVer, mut.Key, rKey, owner, found, f.shardGroupID)
+				phase, snapVer, mut.Key, ownerKey, owner, found, f.shardGroupID)
 		}
 	}
 	return nil
+}
+
+func composed1OwnerKey(key []byte) []byte {
+	if start, _, ok := s3BucketAuxiliaryRouteRange(key); ok {
+		return start
+	}
+	return routeKey(key)
 }
 
 func (f *kvFSM) validateConflicts(ctx context.Context, muts []*pb.Mutation, startTS uint64) error {
@@ -1094,7 +1351,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueMutationsAboveFloorForRequest(r, muts, startTS)
 	if err != nil {
 		return err
 	}
@@ -1145,7 +1402,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// duplicate (the very :duplicate-elements anomaly), so no-op the whole
 	// apply and let the adapter reconstruct the prior result.
 	//
-	// Determinism note (codex P1 round-11): the underlying CommittedVersionAt
+	// Determinism note: the underlying CommittedVersionAt
 	// intentionally does NOT enforce the retention watermark — branching FSM
 	// apply on the per-replica minRetainedTS would let replicas with stale
 	// retention surface ErrReadTSCompacted and skip dedup while replicas that
@@ -1156,7 +1413,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// applying this log entry. The retention-window > max-retry-latency
 	// invariant prevents the rare case where a real never-landed retry
 	// arrives with PrevCommitTS below pebble's compacted floor.
-	dedup, err := f.dedupProbeOnePhase(ctx, meta)
+	dedup, err := f.dedupProbeOnePhase(ctx, meta, r.ReadKeys)
 	if err != nil {
 		return err
 	}
@@ -1164,7 +1421,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueMutationsAboveFloorForRequest(r, muts, commitTS)
 	if err != nil {
 		return err
 	}
@@ -1180,6 +1437,90 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	return nil
 }
 
+func uniqueTxnMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+func (f *kvFSM) uniqueMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+	return f.uniqueMutationsAboveFloorWithSnapshot(muts, commitTS, nil)
+}
+
+func (f *kvFSM) uniqueMutationsAboveFloorForRequest(r *pb.Request, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+	floorSnap, err := f.routeFloorSnapshotForRequest(r)
+	if err != nil {
+		return nil, err
+	}
+	return f.uniqueMutationsAboveFloorWithSnapshot(muts, commitTS, floorSnap)
+}
+
+func (f *kvFSM) uniqueMutationsAboveFloorWithSnapshot(muts []*pb.Mutation, commitTS uint64, floorSnap RouteSnapshot) ([]*pb.Mutation, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectReservedControlMutations(uniq); err != nil {
+		return nil, err
+	}
+	if err := verifyRouteWriteTimestampFloorsForMutationsFromSnapshot(floorSnap, uniq, commitTS); err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
+// rejectReservedControlMutations keeps the migration-only control namespaces
+// out of transactional writes. validateRawMutationForApply refuses every
+// control namespace on the raw path, but the transactional paths cannot: the
+// control plane commits catalog route and job records through the coordinator,
+// so SplitRange itself is a transaction writing !dist|route| and !dist|meta|.
+// The narrower test still closes the case that matters -- a client write
+// landing under !dist|migstage|<job>| is promoted as user data when the same
+// group is a migration target.
+//
+// The verdict is a pure function of the key, so every replica reaches it for
+// the same entry. The typed migration commands (import, promote, fence) do not
+// pass through here and keep writing these namespaces.
+func rejectReservedControlMutations(muts []*pb.Mutation) error {
+	for _, mut := range muts {
+		if mut == nil {
+			continue
+		}
+		if distribution.IsMigrationOnlyControlKey(mut.Key) {
+			return errors.WithStack(ErrInvalidRequest)
+		}
+	}
+	return nil
+}
+
+func (f *kvFSM) uniqueTxnMutationsAboveFloor(muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+	return f.uniqueTxnMutationsAboveFloorWithSnapshot(muts, commitTS, nil)
+}
+
+func (f *kvFSM) uniqueTxnMutationsAboveFloorForRequest(r *pb.Request, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
+	floorSnap, err := f.routeFloorSnapshotForRequest(r)
+	if err != nil {
+		return nil, err
+	}
+	return f.uniqueTxnMutationsAboveFloorWithSnapshot(muts, commitTS, floorSnap)
+}
+
+func (f *kvFSM) uniqueTxnMutationsAboveFloorWithSnapshot(muts []*pb.Mutation, commitTS uint64, floorSnap RouteSnapshot) ([]*pb.Mutation, error) {
+	uniq, err := uniqueTxnMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectReservedControlMutations(uniq); err != nil {
+		return nil, err
+	}
+	if err := verifyRouteWriteTimestampFloorsForMutationsFromSnapshot(floorSnap, uniq, commitTS); err != nil {
+		return nil, err
+	}
+	return uniq, nil
+}
+
 // dedupProbeOnePhase decides whether handleOnePhaseTxnRequest should no-op
 // because the entry is a retry whose prior attempt already landed. Extracted
 // to keep handleOnePhaseTxnRequest under the cyclop budget; the determinism
@@ -1188,7 +1529,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 // Returns (true, nil) → the entry must no-op (prior attempt landed).
 // Returns (false, nil) → fall through to normal apply.
 // Returns (false, err) → propagate err; apply must not proceed.
-func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, error) {
+func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [][]byte) (bool, error) {
 	if meta.PrevCommitTS == 0 {
 		return false, nil
 	}
@@ -1196,7 +1537,51 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta) (bool, err
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	return landed, nil
+	if landed {
+		return true, nil
+	}
+	for _, stagedKey := range stagedVisibilityKeysForReadAlias(readKeys, meta.PrimaryKey, meta.PrimaryKey) {
+		landed, err = f.store.CommittedVersionAt(ctx, stagedKey, meta.PrevCommitTS)
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		if landed {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func stagedVisibilityJobIDsForReadAlias(readKeys [][]byte, aliasRawKey []byte) []uint64 {
+	if len(readKeys) == 0 {
+		return nil
+	}
+	var out []uint64
+	seen := make(map[uint64]struct{})
+	for _, readKey := range readKeys {
+		jobID, rawKey, ok := distribution.MigrationStagedDataKeyParts(readKey)
+		if !ok || jobID == 0 || !bytes.Equal(rawKey, aliasRawKey) {
+			continue
+		}
+		if _, ok := seen[jobID]; ok {
+			continue
+		}
+		seen[jobID] = struct{}{}
+		out = append(out, jobID)
+	}
+	return out
+}
+
+func stagedVisibilityKeysForReadAlias(readKeys [][]byte, aliasRawKey, stagedRawKey []byte) [][]byte {
+	jobIDs := stagedVisibilityJobIDsForReadAlias(readKeys, aliasRawKey)
+	if len(jobIDs) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(jobIDs))
+	for _, jobID := range jobIDs {
+		out = append(out, distribution.MigrationStagedDataKey(jobID, stagedRawKey))
+	}
+	return out
 }
 
 func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
@@ -1215,15 +1600,15 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if len(meta.PrimaryKey) == 0 {
 		return errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
-	applyStartTS, err := f.commitApplyStartTS(ctx, meta.PrimaryKey, startTS, commitTS)
+	applyStartTS, err := f.commitApplyStartTS(ctx, meta.PrimaryKey, startTS, commitTS, r.ReadKeys)
 	if err != nil {
 		return err
 	}
-	uniq, err := uniqueMutations(muts)
+	uniq, err := f.uniqueTxnMutationsAboveFloorForRequest(r, muts, commitTS)
 	if err != nil {
 		return err
 	}
-	storeMuts, err := f.buildCommitStoreMutations(ctx, uniq, meta, startTS, commitTS)
+	storeMuts, err := f.buildCommitStoreMutations(ctx, uniq, meta, startTS, commitTS, r.ReadKeys)
 	if err != nil {
 		return err
 	}
@@ -1246,10 +1631,16 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 // ErrTxnAlreadyAborted. Together with the commit-record check in
 // appendRollbackRecord, this enforces the invariant that at most one of
 // {rollback marker, commit record} is present for any (primaryKey, startTS).
-func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, startTS, commitTS uint64) (uint64, error) {
+func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, startTS, commitTS uint64, readKeys [][]byte) (uint64, error) {
 	recordedCommitTS, committed, err := f.txnCommitTS(ctx, primaryKey, startTS)
 	if err != nil {
 		return 0, err
+	}
+	if !committed {
+		recordedCommitTS, committed, err = f.stagedTxnCommitTS(ctx, primaryKey, startTS, readKeys)
+		if err != nil {
+			return 0, err
+		}
 	}
 	if !committed {
 		// No commit record yet: reject if a rollback marker is present.
@@ -1258,6 +1649,13 @@ func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, start
 		exists, rerr := f.store.ExistsAt(ctx, txnRollbackKey(primaryKey, startTS), ^uint64(0))
 		if rerr != nil {
 			return 0, errors.WithStack(rerr)
+		}
+		if exists {
+			return 0, errors.WithStack(ErrTxnAlreadyAborted)
+		}
+		exists, rerr = f.stagedTxnRecordExists(ctx, primaryKey, txnRollbackKey(primaryKey, startTS), readKeys)
+		if rerr != nil {
+			return 0, rerr
 		}
 		if exists {
 			return 0, errors.WithStack(ErrTxnAlreadyAborted)
@@ -1333,19 +1731,19 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 	// abort for a secondary key (same primaryKey, same startTS) would
 	// see the marker already present and must still clean up that
 	// secondary's lock/intent. Idempotency is enforced per-key in
-	// shouldClearAbortKey (lock-missing ⇒ nothing to do) and for the
+	// abortCleanupMutationsForKey (lock-missing ⇒ nothing to do) and for the
 	// rollback-marker Put in appendRollbackRecord.
 
 	uniq, err := uniqueMutations(muts)
 	if err != nil {
 		return err
 	}
-	storeMuts, abortingPrimary, err := f.buildAbortCleanupStoreMutations(ctx, uniq, meta.PrimaryKey, startTS)
+	storeMuts, abortingPrimary, err := f.buildAbortCleanupStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, r.ReadKeys)
 	if err != nil {
 		return err
 	}
 	if abortingPrimary {
-		if err := f.appendRollbackRecord(ctx, meta.PrimaryKey, startTS, &storeMuts); err != nil {
+		if err := f.appendRollbackRecord(ctx, meta.PrimaryKey, startTS, &storeMuts, r.ReadKeys); err != nil {
 			return err
 		}
 	}
@@ -1384,7 +1782,7 @@ func (f *kvFSM) buildOnePhaseStoreMutations(ctx context.Context, muts []*pb.Muta
 	return storeMuts, nil
 }
 
-func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutation, meta TxnMeta, startTS, commitTS uint64) ([]*store.KVPairMutation, error) {
+func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutation, meta TxnMeta, startTS, commitTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, error) {
 	storeMuts := make([]*store.KVPairMutation, 0, len(muts)*txnCommitStoreMutationFactor+txnCommitStoreMutationSlack)
 
 	committingPrimary := false
@@ -1394,7 +1792,7 @@ func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutati
 			committingPrimary = true
 		}
 
-		keyMuts, err := f.commitTxnKeyMutations(ctx, key, meta.PrimaryKey, startTS)
+		keyMuts, err := f.commitTxnKeyMutations(ctx, key, meta.PrimaryKey, startTS, readKeys)
 		if err != nil {
 			return nil, err
 		}
@@ -1412,7 +1810,7 @@ func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutati
 	return storeMuts, nil
 }
 
-func (f *kvFSM) buildAbortCleanupStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS uint64) ([]*store.KVPairMutation, bool, error) {
+func (f *kvFSM) buildAbortCleanupStoreMutations(ctx context.Context, muts []*pb.Mutation, primaryKey []byte, startTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, bool, error) {
 	storeMuts := make([]*store.KVPairMutation, 0, len(muts)*txnAbortStoreMutationFactor)
 	abortingPrimary := false
 	for _, mut := range muts {
@@ -1421,18 +1819,16 @@ func (f *kvFSM) buildAbortCleanupStoreMutations(ctx context.Context, muts []*pb.
 			abortingPrimary = true
 		}
 
-		shouldClear, err := f.shouldClearAbortKey(ctx, key, primaryKey, startTS)
+		cleanupMuts, err := f.abortCleanupMutationsForKey(ctx, key, primaryKey, startTS, readKeys)
 		if err != nil {
 			return nil, false, err
 		}
-		if shouldClear {
-			storeMuts = append(storeMuts, txnCleanupMutations(key)...)
-		}
+		storeMuts = append(storeMuts, cleanupMuts...)
 	}
 	return storeMuts, abortingPrimary, nil
 }
 
-func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, startTS uint64, storeMuts *[]*store.KVPairMutation) error {
+func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, startTS uint64, storeMuts *[]*store.KVPairMutation, readKeys [][]byte) error {
 	// Desired invariant: for any (primaryKey, startTS) pair, at most
 	// one of {rollback marker, commit record} is present. The invariant
 	// holds when aborts/commits flow through the symmetric guards in
@@ -1451,6 +1847,12 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	if !markerPresent {
+		markerPresent, err = f.stagedTxnRecordExists(ctx, primaryKey, txnRollbackKey(primaryKey, startTS), readKeys)
+		if err != nil {
+			return err
+		}
+	}
 
 	// Verify the invariant regardless of marker presence: if a commit
 	// record is present for this (primaryKey, startTS), refuse to
@@ -1460,6 +1862,12 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 	commitExists, err := f.store.ExistsAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0))
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if !commitExists {
+		commitExists, err = f.stagedTxnRecordExists(ctx, primaryKey, txnCommitKey(primaryKey, startTS), readKeys)
+		if err != nil {
+			return err
+		}
 	}
 	if commitExists {
 		return errors.WithStack(ErrTxnAlreadyCommitted)
@@ -1478,7 +1886,37 @@ func (f *kvFSM) appendRollbackRecord(ctx context.Context, primaryKey []byte, sta
 }
 
 func (f *kvFSM) txnCommitTS(ctx context.Context, primaryKey []byte, startTS uint64) (uint64, bool, error) {
-	b, err := f.store.GetAt(ctx, txnCommitKey(primaryKey, startTS), ^uint64(0))
+	return f.txnCommitTSAtKey(ctx, txnCommitKey(primaryKey, startTS))
+}
+
+func (f *kvFSM) stagedTxnCommitTS(ctx context.Context, primaryKey []byte, startTS uint64, readKeys [][]byte) (uint64, bool, error) {
+	for _, key := range stagedVisibilityKeysForReadAlias(readKeys, primaryKey, txnCommitKey(primaryKey, startTS)) {
+		commitTS, committed, err := f.txnCommitTSAtKey(ctx, key)
+		if err != nil {
+			return 0, false, err
+		}
+		if committed {
+			return commitTS, true, nil
+		}
+	}
+	return 0, false, nil
+}
+
+func (f *kvFSM) stagedTxnRecordExists(ctx context.Context, primaryKey, recordKey []byte, readKeys [][]byte) (bool, error) {
+	for _, key := range stagedVisibilityKeysForReadAlias(readKeys, primaryKey, recordKey) {
+		exists, err := f.store.ExistsAt(ctx, key, ^uint64(0))
+		if err != nil {
+			return false, errors.WithStack(err)
+		}
+		if exists {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func (f *kvFSM) txnCommitTSAtKey(ctx context.Context, key []byte) (uint64, bool, error) {
+	b, err := f.store.GetAt(ctx, key, ^uint64(0))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 0, false, nil
@@ -1529,15 +1967,38 @@ func txnIntentFromPBMutation(mut *pb.Mutation, startTS uint64) (txnIntent, error
 	}
 }
 
-func txnCleanupMutations(key []byte) []*store.KVPairMutation {
+func txnCleanupMutationsForKeys(lockKey, intentKey []byte) []*store.KVPairMutation {
 	return []*store.KVPairMutation{
-		{Op: store.OpTypeDelete, Key: txnLockKey(key)},
-		{Op: store.OpTypeDelete, Key: txnIntentKey(key)},
+		{Op: store.OpTypeDelete, Key: lockKey},
+		{Op: store.OpTypeDelete, Key: intentKey},
 	}
 }
 
-func (f *kvFSM) txnLockForCommit(ctx context.Context, key []byte) (txnLock, bool, error) {
-	lockBytes, err := f.store.GetAt(ctx, txnLockKey(key), ^uint64(0))
+func (f *kvFSM) txnLockForMutationKey(ctx context.Context, key []byte, readKeys [][]byte) (txnLock, []byte, []byte, bool, error) {
+	lockKey := txnLockKey(key)
+	intentKey := txnIntentKey(key)
+	lock, ok, err := f.txnLockAtKey(ctx, lockKey)
+	if err != nil || ok {
+		return lock, lockKey, intentKey, ok, err
+	}
+	for _, stagedLockKey := range stagedVisibilityKeysForReadAlias(readKeys, key, lockKey) {
+		jobID, _, ok := distribution.MigrationStagedDataKeyParts(stagedLockKey)
+		if !ok {
+			continue
+		}
+		lock, ok, err := f.txnLockAtKey(ctx, stagedLockKey)
+		if err != nil {
+			return txnLock{}, nil, nil, false, err
+		}
+		if ok {
+			return lock, stagedLockKey, distribution.MigrationStagedDataKey(jobID, intentKey), true, nil
+		}
+	}
+	return txnLock{}, nil, nil, false, nil
+}
+
+func (f *kvFSM) txnLockAtKey(ctx context.Context, key []byte) (txnLock, bool, error) {
+	lockBytes, err := f.store.GetAt(ctx, key, ^uint64(0))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return txnLock{}, false, nil
@@ -1551,8 +2012,8 @@ func (f *kvFSM) txnLockForCommit(ctx context.Context, key []byte) (txnLock, bool
 	return lock, true, nil
 }
 
-func (f *kvFSM) txnIntentForCommit(ctx context.Context, key []byte) (txnIntent, bool, error) {
-	intentBytes, err := f.store.GetAt(ctx, txnIntentKey(key), ^uint64(0))
+func (f *kvFSM) txnIntentForCommit(ctx context.Context, intentKey []byte) (txnIntent, bool, error) {
+	intentBytes, err := f.store.GetAt(ctx, intentKey, ^uint64(0))
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return txnIntent{}, false, nil
@@ -1577,8 +2038,8 @@ func storeMutationForIntent(key []byte, intent txnIntent) (*store.KVPairMutation
 	}
 }
 
-func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byte, startTS uint64) ([]*store.KVPairMutation, error) {
-	lock, ok, err := f.txnLockForCommit(ctx, key)
+func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byte, startTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, error) {
+	lock, lockKey, intentKey, ok, err := f.txnLockForMutationKey(ctx, key, readKeys)
 	if err != nil {
 		return nil, err
 	}
@@ -1593,7 +2054,7 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 		return nil, errors.Wrapf(ErrTxnInvalidMeta, "lock primary_key mismatch for key %s", string(key))
 	}
 
-	intent, ok, err := f.txnIntentForCommit(ctx, key)
+	intent, ok, err := f.txnIntentForCommit(ctx, intentKey)
 	if err != nil {
 		return nil, err
 	}
@@ -1609,37 +2070,33 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 		}
 		out = append(out, mut)
 	}
-	out = append(out, txnCleanupMutations(key)...)
+	out = append(out, txnCleanupMutationsForKeys(lockKey, intentKey)...)
 	return out, nil
 }
 
-// shouldClearAbortKey reports whether this abort request must emit
-// cleanup (lock+intent Delete) mutations for key. It returns false
+// abortCleanupMutationsForKey reports whether this abort request must emit
+// cleanup (lock+intent Delete) mutations for key. It returns nil
 // when the lock is already missing: lock/intent are always written
 // and deleted together in a single ApplyMutations batch
 // (lock missing ⇔ intent missing), so missing lock means either
 // cleanup already ran for this (startTS, primaryKey) or the key was
 // never prepared. Emitting Deletes on already-tombstoned keys would
 // trigger MVCC write conflicts and has no observable effect.
-func (f *kvFSM) shouldClearAbortKey(ctx context.Context, key, primaryKey []byte, startTS uint64) (bool, error) {
-	lockBytes, err := f.store.GetAt(ctx, txnLockKey(key), ^uint64(0))
+func (f *kvFSM) abortCleanupMutationsForKey(ctx context.Context, key, primaryKey []byte, startTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, error) {
+	lock, lockKey, intentKey, ok, err := f.txnLockForMutationKey(ctx, key, readKeys)
 	if err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return false, nil
-		}
-		return false, errors.WithStack(err)
+		return nil, err
 	}
-	lock, derr := decodeTxnLock(lockBytes)
-	if derr != nil {
-		return false, errors.WithStack(derr)
+	if !ok {
+		return nil, nil
 	}
 	if lock.StartTS != startTS {
-		return false, nil
+		return nil, nil
 	}
 	if !bytes.Equal(lock.PrimaryKey, primaryKey) {
-		return false, errors.Wrapf(ErrTxnInvalidMeta, "abort primary_key mismatch for key %s", string(key))
+		return nil, errors.Wrapf(ErrTxnInvalidMeta, "abort primary_key mismatch for key %s", string(key))
 	}
-	return true, nil
+	return txnCleanupMutationsForKeys(lockKey, intentKey), nil
 }
 
 func (f *kvFSM) assertNoConflictingTxnLock(ctx context.Context, key, primaryKey []byte, startTS uint64) error {

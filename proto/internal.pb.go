@@ -750,6 +750,15 @@ type ExportRangeVersionsRequest struct {
 	RouteStart      []byte                 `protobuf:"bytes,7,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
 	RouteEnd        []byte                 `protobuf:"bytes,8,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
 	MaxScannedBytes uint64                 `protobuf:"varint,9,opt,name=max_scanned_bytes,json=maxScannedBytes,proto3" json:"max_scanned_bytes,omitempty"`
+	// Migration bracket family tag copied into exported MVCCVersion.key_family.
+	// Zero is invalid on the RPC path: callers must pass the bracket family they
+	// are exporting so target promotion can keep family-specific metadata.
+	KeyFamily uint32 `protobuf:"varint,10,opt,name=key_family,json=keyFamily,proto3" json:"key_family,omitempty"`
+	// Applies the user-bracket exclusion list for known internal families.
+	ExcludeKnownInternal bool `protobuf:"varint,11,opt,name=exclude_known_internal,json=excludeKnownInternal,proto3" json:"exclude_known_internal,omitempty"`
+	// Bracket-local raw-prefix exclusions, e.g. non-partitioned SQS brackets
+	// excluding their partitioned subprefixes.
+	ExcludePrefixes [][]byte `protobuf:"bytes,12,rep,name=exclude_prefixes,json=excludePrefixes,proto3" json:"exclude_prefixes,omitempty"`
 	unknownFields   protoimpl.UnknownFields
 	sizeCache       protoimpl.SizeCache
 }
@@ -845,6 +854,27 @@ func (x *ExportRangeVersionsRequest) GetMaxScannedBytes() uint64 {
 		return x.MaxScannedBytes
 	}
 	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetKeyFamily() uint32 {
+	if x != nil {
+		return x.KeyFamily
+	}
+	return 0
+}
+
+func (x *ExportRangeVersionsRequest) GetExcludeKnownInternal() bool {
+	if x != nil {
+		return x.ExcludeKnownInternal
+	}
+	return false
+}
+
+func (x *ExportRangeVersionsRequest) GetExcludePrefixes() [][]byte {
+	if x != nil {
+		return x.ExcludePrefixes
+	}
+	return nil
 }
 
 type ExportRangeVersionsResponse struct {
@@ -1111,6 +1141,150 @@ func (x *ImportRangeVersionsResponse) GetAckedCursor() []byte {
 	return nil
 }
 
+type PromoteStagedVersionsRequest struct {
+	state           protoimpl.MessageState `protogen:"open.v1"`
+	JobId           uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Cursor          []byte                 `protobuf:"bytes,2,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	MaxVersions     uint32                 `protobuf:"varint,3,opt,name=max_versions,json=maxVersions,proto3" json:"max_versions,omitempty"`
+	MaxBytes        uint64                 `protobuf:"varint,4,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	MaxScannedBytes uint64                 `protobuf:"varint,5,opt,name=max_scanned_bytes,json=maxScannedBytes,proto3" json:"max_scanned_bytes,omitempty"`
+	unknownFields   protoimpl.UnknownFields
+	sizeCache       protoimpl.SizeCache
+}
+
+func (x *PromoteStagedVersionsRequest) Reset() {
+	*x = PromoteStagedVersionsRequest{}
+	mi := &file_internal_proto_msgTypes[16]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PromoteStagedVersionsRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PromoteStagedVersionsRequest) ProtoMessage() {}
+
+func (x *PromoteStagedVersionsRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[16]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PromoteStagedVersionsRequest.ProtoReflect.Descriptor instead.
+func (*PromoteStagedVersionsRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{16}
+}
+
+func (x *PromoteStagedVersionsRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *PromoteStagedVersionsRequest) GetCursor() []byte {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *PromoteStagedVersionsRequest) GetMaxVersions() uint32 {
+	if x != nil {
+		return x.MaxVersions
+	}
+	return 0
+}
+
+func (x *PromoteStagedVersionsRequest) GetMaxBytes() uint64 {
+	if x != nil {
+		return x.MaxBytes
+	}
+	return 0
+}
+
+func (x *PromoteStagedVersionsRequest) GetMaxScannedBytes() uint64 {
+	if x != nil {
+		return x.MaxScannedBytes
+	}
+	return 0
+}
+
+type PromoteStagedVersionsResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NextCursor    []byte                 `protobuf:"bytes,1,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	Done          bool                   `protobuf:"varint,2,opt,name=done,proto3" json:"done,omitempty"`
+	PromotedRows  uint64                 `protobuf:"varint,3,opt,name=promoted_rows,json=promotedRows,proto3" json:"promoted_rows,omitempty"`
+	MaxPromotedTs uint64                 `protobuf:"varint,4,opt,name=max_promoted_ts,json=maxPromotedTs,proto3" json:"max_promoted_ts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PromoteStagedVersionsResponse) Reset() {
+	*x = PromoteStagedVersionsResponse{}
+	mi := &file_internal_proto_msgTypes[17]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PromoteStagedVersionsResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PromoteStagedVersionsResponse) ProtoMessage() {}
+
+func (x *PromoteStagedVersionsResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[17]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PromoteStagedVersionsResponse.ProtoReflect.Descriptor instead.
+func (*PromoteStagedVersionsResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{17}
+}
+
+func (x *PromoteStagedVersionsResponse) GetNextCursor() []byte {
+	if x != nil {
+		return x.NextCursor
+	}
+	return nil
+}
+
+func (x *PromoteStagedVersionsResponse) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *PromoteStagedVersionsResponse) GetPromotedRows() uint64 {
+	if x != nil {
+		return x.PromotedRows
+	}
+	return 0
+}
+
+func (x *PromoteStagedVersionsResponse) GetMaxPromotedTs() uint64 {
+	if x != nil {
+		return x.MaxPromotedTs
+	}
+	return 0
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -1150,7 +1324,7 @@ const file_internal_proto_rawDesc = "" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
 	"\x14RelayPublishResponse\x12 \n" +
-	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers\"\xc5\x02\n" +
+	"\vsubscribers\x18\x01 \x01(\x03R\vsubscribers\"\xc5\x03\n" +
 	"\x1aExportRangeVersionsRequest\x12\x1f\n" +
 	"\vrange_start\x18\x01 \x01(\fR\n" +
 	"rangeStart\x12\x1b\n" +
@@ -1163,7 +1337,12 @@ const file_internal_proto_rawDesc = "" +
 	"\vroute_start\x18\a \x01(\fR\n" +
 	"routeStart\x12\x1b\n" +
 	"\troute_end\x18\b \x01(\fR\brouteEnd\x12*\n" +
-	"\x11max_scanned_bytes\x18\t \x01(\x04R\x0fmaxScannedBytes\"|\n" +
+	"\x11max_scanned_bytes\x18\t \x01(\x04R\x0fmaxScannedBytes\x12\x1d\n" +
+	"\n" +
+	"key_family\x18\n" +
+	" \x01(\rR\tkeyFamily\x124\n" +
+	"\x16exclude_known_internal\x18\v \x01(\bR\x14excludeKnownInternal\x12)\n" +
+	"\x10exclude_prefixes\x18\f \x03(\fR\x0fexcludePrefixes\"|\n" +
 	"\x1bExportRangeVersionsResponse\x12(\n" +
 	"\bversions\x18\x01 \x03(\v2\f.MVCCVersionR\bversions\x12\x1f\n" +
 	"\vnext_cursor\x18\x02 \x01(\fR\n" +
@@ -1185,7 +1364,19 @@ const file_internal_proto_rawDesc = "" +
 	"bracket_id\x18\x04 \x01(\x04R\tbracketId\x12\x1b\n" +
 	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\"@\n" +
 	"\x1bImportRangeVersionsResponse\x12!\n" +
-	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor*&\n" +
+	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor\"\xb9\x01\n" +
+	"\x1cPromoteStagedVersionsRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x16\n" +
+	"\x06cursor\x18\x02 \x01(\fR\x06cursor\x12!\n" +
+	"\fmax_versions\x18\x03 \x01(\rR\vmaxVersions\x12\x1b\n" +
+	"\tmax_bytes\x18\x04 \x01(\x04R\bmaxBytes\x12*\n" +
+	"\x11max_scanned_bytes\x18\x05 \x01(\x04R\x0fmaxScannedBytes\"\xa1\x01\n" +
+	"\x1dPromoteStagedVersionsResponse\x12\x1f\n" +
+	"\vnext_cursor\x18\x01 \x01(\fR\n" +
+	"nextCursor\x12\x12\n" +
+	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
+	"\rpromoted_rows\x18\x03 \x01(\x04R\fpromotedRows\x12&\n" +
+	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -1196,14 +1387,15 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032\xc5\x03\n" +
+	"\x05ABORT\x10\x032\x9f\x04\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
 	"\x10ForwardLeaseRead\x12\x18.ForwardLeaseReadRequest\x1a\x19.ForwardLeaseReadResponse\"\x00\x12=\n" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
 	"\x13ExportRangeVersions\x12\x1b.ExportRangeVersionsRequest\x1a\x1c.ExportRangeVersionsResponse\"\x000\x01\x12R\n" +
-	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00\x12X\n" +
+	"\x15PromoteStagedVersions\x12\x1d.PromoteStagedVersionsRequest\x1a\x1e.PromoteStagedVersionsResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -1218,26 +1410,28 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 16)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
 var file_internal_proto_goTypes = []any{
-	(Op)(0),                              // 0: Op
-	(Phase)(0),                           // 1: Phase
-	(*Mutation)(nil),                     // 2: Mutation
-	(*Request)(nil),                      // 3: Request
-	(*RaftCommand)(nil),                  // 4: RaftCommand
-	(*ForwardRequest)(nil),               // 5: ForwardRequest
-	(*ForwardResponse)(nil),              // 6: ForwardResponse
-	(*ForwardAdminProposalRequest)(nil),  // 7: ForwardAdminProposalRequest
-	(*ForwardAdminProposalResponse)(nil), // 8: ForwardAdminProposalResponse
-	(*ForwardLeaseReadRequest)(nil),      // 9: ForwardLeaseReadRequest
-	(*ForwardLeaseReadResponse)(nil),     // 10: ForwardLeaseReadResponse
-	(*RelayPublishRequest)(nil),          // 11: RelayPublishRequest
-	(*RelayPublishResponse)(nil),         // 12: RelayPublishResponse
-	(*ExportRangeVersionsRequest)(nil),   // 13: ExportRangeVersionsRequest
-	(*ExportRangeVersionsResponse)(nil),  // 14: ExportRangeVersionsResponse
-	(*MVCCVersion)(nil),                  // 15: MVCCVersion
-	(*ImportRangeVersionsRequest)(nil),   // 16: ImportRangeVersionsRequest
-	(*ImportRangeVersionsResponse)(nil),  // 17: ImportRangeVersionsResponse
+	(Op)(0),                               // 0: Op
+	(Phase)(0),                            // 1: Phase
+	(*Mutation)(nil),                      // 2: Mutation
+	(*Request)(nil),                       // 3: Request
+	(*RaftCommand)(nil),                   // 4: RaftCommand
+	(*ForwardRequest)(nil),                // 5: ForwardRequest
+	(*ForwardResponse)(nil),               // 6: ForwardResponse
+	(*ForwardAdminProposalRequest)(nil),   // 7: ForwardAdminProposalRequest
+	(*ForwardAdminProposalResponse)(nil),  // 8: ForwardAdminProposalResponse
+	(*ForwardLeaseReadRequest)(nil),       // 9: ForwardLeaseReadRequest
+	(*ForwardLeaseReadResponse)(nil),      // 10: ForwardLeaseReadResponse
+	(*RelayPublishRequest)(nil),           // 11: RelayPublishRequest
+	(*RelayPublishResponse)(nil),          // 12: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),    // 13: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil),   // 14: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                   // 15: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),    // 16: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil),   // 17: ImportRangeVersionsResponse
+	(*PromoteStagedVersionsRequest)(nil),  // 18: PromoteStagedVersionsRequest
+	(*PromoteStagedVersionsResponse)(nil), // 19: PromoteStagedVersionsResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -1253,14 +1447,16 @@ var file_internal_proto_depIdxs = []int32{
 	11, // 10: Internal.RelayPublish:input_type -> RelayPublishRequest
 	13, // 11: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
 	16, // 12: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	6,  // 13: Internal.Forward:output_type -> ForwardResponse
-	8,  // 14: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	10, // 15: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	12, // 16: Internal.RelayPublish:output_type -> RelayPublishResponse
-	14, // 17: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	17, // 18: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	13, // [13:19] is the sub-list for method output_type
-	7,  // [7:13] is the sub-list for method input_type
+	18, // 13: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	6,  // 14: Internal.Forward:output_type -> ForwardResponse
+	8,  // 15: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	10, // 16: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	12, // 17: Internal.RelayPublish:output_type -> RelayPublishResponse
+	14, // 18: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	17, // 19: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	19, // 20: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	14, // [14:21] is the sub-list for method output_type
+	7,  // [7:14] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
 	7,  // [7:7] is the sub-list for extension extendee
 	0,  // [0:7] is the sub-list for field type_name
@@ -1277,7 +1473,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   16,
+			NumMessages:   18,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

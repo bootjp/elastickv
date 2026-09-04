@@ -799,6 +799,9 @@ func TestS3Server_ShardedStoreRoutesBucketAndObjectData(t *testing.T) {
 	readTS := shardStore.LastCommitTS()
 	var err error
 	_, err = store1.GetAt(ctx, s3keys.BucketMetaKey("bucket-a"), readTS)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+
+	_, err = store2.GetAt(ctx, s3keys.BucketMetaKey("bucket-a"), readTS)
 	require.NoError(t, err)
 
 	_, err = store1.GetAt(ctx, s3keys.ObjectManifestKey("bucket-a", 1, "dir/file.txt"), readTS)

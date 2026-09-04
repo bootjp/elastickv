@@ -728,7 +728,7 @@ func startRuntimeServersWithBoundListeners(
 	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, listeners.grpc); err != nil {
+	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
@@ -757,7 +757,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	for _, rt := range runtimes {
-		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, listeners.grpc[rt.spec.id]); err != nil {
+		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc[rt.spec.id]); err != nil {
 			return waitErrgroupAfterStartupFailure(cancel, eg, err)
 		}
 	}
@@ -775,6 +775,7 @@ func startBoundGRPCServer(
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
 	relay *adapter.RedisPubSubRelay,
+	sqsPartitionResolver kv.PartitionResolver,
 	listener net.Listener,
 ) error {
 	if rt == nil || rt.engine == nil {
@@ -789,7 +790,15 @@ func startBoundGRPCServer(
 	grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 	pb.RegisterRawKVServer(gs, grpcSvc)
 	pb.RegisterTransactionalKVServer(gs, grpcSvc)
-	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(trx, rt.engine, coordinate.Clock(), relay))
+	pb.RegisterInternalServer(gs, adapter.NewInternalWithEngine(
+		trx,
+		rt.engine,
+		coordinate.Clock(),
+		relay,
+		adapter.WithInternalStore(rt.store),
+		adapter.WithInternalMigrationProposer(rt.engine),
+		adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
+	))
 	pb.RegisterDistributionServer(gs, distServer)
 	rt.registerGRPC(gs)
 	internalraftadmin.RegisterOperationalServices(ctx, gs, rt.engine, []string{"RawKV"})

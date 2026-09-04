@@ -192,3 +192,27 @@ func TestLuaNegativeTypeCache_BoundedSize(t *testing.T) {
 	require.Equal(t, cacheLimit, len(sc.negativeType),
 		"fallback probe must NOT grow the bounded cache")
 }
+
+func TestLuaRawTypeAtStartCache_BoundedSize(t *testing.T) {
+	t.Parallel()
+
+	sc := &luaScriptContext{rawTypeAtStart: map[string]redisValueType{}}
+
+	const overflow = 50
+	total := maxNegativeTypeCacheEntries + overflow
+	for i := 0; i < total; i++ {
+		sc.rememberRawTypeAtStart(fmt.Sprintf("lua:rawtype:cap:%d", i), redisTypeNone)
+	}
+	require.Equal(t, maxNegativeTypeCacheEntries, len(sc.rawTypeAtStart),
+		"rawTypeAtStart map must be capped at maxNegativeTypeCacheEntries")
+
+	cachedKey := "lua:rawtype:cap:0"
+	require.Equal(t, redisTypeNone, sc.rawTypeAtStart[cachedKey])
+
+	overflowKey := fmt.Sprintf("lua:rawtype:cap:%d", maxNegativeTypeCacheEntries+1)
+	_, ok := sc.rawTypeAtStart[overflowKey]
+	require.False(t, ok, "a key probed after the cap must fall back to a later server probe")
+	sc.rememberRawTypeAtStart(overflowKey, redisTypeNone)
+	require.Equal(t, maxNegativeTypeCacheEntries, len(sc.rawTypeAtStart),
+		"fallback raw type probe must NOT grow the bounded cache")
+}

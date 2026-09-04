@@ -2097,6 +2097,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		shardStore:         in.shardStore,
 		coordinate:         adapterCoordinate,
 		distServer:         in.distServer,
+		routeEngine:        in.cfg.engine,
 		adminServer:        adminServer,
 		adminGRPCOpts:      adminGRPCOpts,
 		redisAddress:       *redisAddr,
@@ -3480,6 +3481,7 @@ func startRaftServers(
 	forwardDeps adminForwardServerDeps,
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
+	sqsPartitionResolver kv.PartitionResolver,
 	kekConfigured bool,
 	defaultGroupID uint64,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
@@ -3529,7 +3531,11 @@ func startRaftServers(
 			rt.engine,
 			coordinate.Clock(),
 			relay,
-			internalOpts...,
+			append(internalOpts,
+				adapter.WithInternalStore(rt.store),
+				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
+				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
+			)...,
 		))
 		pb.RegisterDistributionServer(gs, distServer)
 		registerAdminServerIfPresent(gs, adminServer)
@@ -3824,7 +3830,10 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 			continue
 		}
 		if rt.spec.id == groupID {
-			return distribution.NewCatalogStore(rt.store, distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)))
+			return distribution.NewCatalogStore(rt.store,
+				distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)),
+				distribution.WithCatalogMigrationRetireResolver(catalogMigrationRetireResolver(runtimes)),
+			)
 		}
 	}
 	return nil
@@ -3841,6 +3850,36 @@ func catalogMigrationStoreResolver(runtimes []*raftGroupRuntime) distribution.Ca
 			}
 		}
 		return nil, errors.Newf("migration target store is not available for group %d", groupID)
+	}
+}
+
+func catalogMigrationRetireResolver(runtimes []*raftGroupRuntime) distribution.CatalogMigrationRetireResolver {
+	return func(ctx context.Context, groupID, jobID uint64) error {
+		for _, rt := range runtimes {
+			if rt == nil || rt.spec.id != groupID {
+				continue
+			}
+			engine := rt.snapshotEngine()
+			if engine == nil {
+				break
+			}
+			cmd, err := kv.MarshalMigrationRetireCommand(jobID)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			result, err := engine.Propose(ctx, cmd)
+			if err != nil {
+				return errors.WithStack(err)
+			}
+			if result == nil {
+				return errors.Newf("migration retire proposal returned nil result for group %d job %d", groupID, jobID)
+			}
+			if err, ok := result.Response.(error); ok {
+				return errors.WithStack(err)
+			}
+			return nil
+		}
+		return errors.Newf("migration target engine is not available for group %d", groupID)
 	}
 }
 
@@ -4006,6 +4045,7 @@ type runtimeServerRunner struct {
 	shardStore                      *kv.ShardStore
 	coordinate                      kv.Coordinator
 	distServer                      *adapter.DistributionServer
+	routeEngine                     *distribution.Engine
 	adminServer                     *adapter.AdminServer
 	adminGRPCOpts                   adminGRPCInterceptors
 	redisAddress                    string
@@ -4118,6 +4158,10 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		buckets: newBucketsSource(r.s3Server),
 		roles:   r.roleStore,
 	}
+	var sqsPartitionResolver kv.PartitionResolver
+	if r.sqsPartitionResolver != nil {
+		sqsPartitionResolver = r.sqsPartitionResolver
+	}
 	if err := startRaftServers(
 		r.ctx,
 		r.lc,
@@ -4136,6 +4180,7 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		forwardDeps,
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
+		sqsPartitionResolver,
 		r.kekConfigured,
 		r.defaultGroupID,
 		r.metricsRegistry.S3BlobOffloadObserver(),

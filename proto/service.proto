@@ -78,6 +78,10 @@ message RawLatestCommitTSRequest {
   // below this timestamp. Comparing only `ts` cannot tell a tombstone at or
   // before the read timestamp apart from a newer version above it.
   uint64 version_visible_at_ts = 4;
+  // Optional batch form for version_visible_at_ts probes. Encoded as a single
+  // bounded key_batch blob so untrusted clients cannot expand one request into
+  // an unbounded repeated-bytes slice before the service enforces page limits.
+  bytes key_batch = 5;
 }
 
 message RawLatestCommitTSResponse {
@@ -92,6 +96,10 @@ message RawLatestCommitTSResponse {
   // open, so the watermark fields moved up rather than reusing those tags.
   uint64 group_id = 5; // echoes an explicit group watermark request
   bool leader_fenced = 6; // true only after that group's leader ReadIndex fence
+  // Batch answer to key_batch. 5 and 6 shipped on main as the group watermark
+  // while this branch was open, so the batch results take the next free tag
+  // rather than colliding with a released wire format.
+  repeated bool version_visible_results = 7;
 }
 
 message RawScanAtRequest {

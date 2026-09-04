@@ -4,6 +4,8 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -65,6 +67,51 @@ func TestOnePhaseDedup_NoOpsWhenPriorAttemptLanded(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, uint64(20), latest, "newest version must remain attempt 1's at 20")
+}
+
+func TestOnePhaseDedup_NoOpsWhenPriorAttemptLandedAsStagedVersion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	key := []byte("list-item")
+	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("v"), 20, 0))
+
+	req := onePhaseReq(30, 40, 20, key, []byte("v"))
+	req.ReadKeys = [][]byte{distribution.MigrationStagedDataKey(9, key)}
+	require.NoError(t, applyFSMRequest(t, fsm, req))
+
+	at40, err := st.CommittedVersionAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.False(t, at40, "retry must not write a live version when the prior attempt is staged")
+	stagedAt20, err := st.CommittedVersionAt(ctx, distribution.MigrationStagedDataKey(9, key), 20)
+	require.NoError(t, err)
+	require.True(t, stagedAt20)
+}
+
+func TestOnePhaseDedup_NoOpsWhenS3AuxiliaryPriorAttemptLandedAsStagedVersion(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	const bucket = "bucket-a"
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	key := s3keys.BucketMetaKey(bucket)
+	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("v"), 20, 0))
+
+	req := onePhaseReq(30, 40, 20, key, []byte("v"))
+	req.ReadKeys = [][]byte{distribution.MigrationStagedDataKey(9, key)}
+	require.NoError(t, applyFSMRequest(t, fsm, req))
+
+	at40, err := st.CommittedVersionAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.False(t, at40, "retry must not write a live S3 auxiliary version when the prior attempt is staged")
+	stagedAt20, err := st.CommittedVersionAt(ctx, distribution.MigrationStagedDataKey(9, key), 20)
+	require.NoError(t, err)
+	require.True(t, stagedAt20)
 }
 
 // TestOnePhaseDedup_AppliesWhenPriorAttemptDidNotLand covers the truncated /

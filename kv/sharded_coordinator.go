@@ -951,13 +951,6 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 		return nil, err
 	}
 
-	// DEL_PREFIX cannot be routed to a single shard because the prefix may
-	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
-	// operation to every shard group so each FSM scans locally.
-	if hasDelPrefixElem(reqs.Elems) {
-		return c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems)
-	}
-
 	// Capture whether the caller supplied a non-zero StartTS BEFORE
 	// the coordinator-allocates-on-zero branch below mutates the
 	// field.  A caller-supplied StartTS names a specific snapshot
@@ -989,10 +982,27 @@ func (c *ShardedCoordinator) Dispatch(ctx context.Context, reqs *OperationGroup[
 	}
 
 	if reqs.IsTxn {
+		if resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs); handled {
+			return resp, err
+		}
 		return c.dispatchTxnWithComposed1Retry(ctx, reqs, callerSuppliedStartTS)
 	}
 
-	return c.dispatchNonTxn(ctx, reqs)
+	return c.dispatchRawWithComposed1Retry(ctx, reqs)
+}
+
+func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, bool, error) {
+	// DEL_PREFIX cannot be routed to a single shard because the prefix may
+	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
+	// operation to every shard group so each FSM scans locally.
+	if hasDelPrefixElem(reqs.Elems) {
+		resp, err := c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems, reqs.ObservedRouteVersion)
+		return resp, true, err
+	}
+	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
+		return nil, true, err
+	}
+	return nil, false, nil
 }
 
 // dispatchTxnWithComposed1Retry runs the M4 Composed-1 retry loop
@@ -1096,47 +1106,6 @@ func (c *ShardedCoordinator) anyResolverClaimedKey(elems []*Elem[OP]) bool {
 		}
 	}
 	return false
-}
-
-func (c *ShardedCoordinator) partitionResolverClaimsPointKey(key []byte) bool {
-	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
-		return false
-	}
-	_, ok := c.router.partitionResolver.ResolveGroup(key)
-	return ok
-}
-
-func (c *ShardedCoordinator) writeFenceBypassKeysForElems(elems []*Elem[OP]) [][]byte {
-	if len(elems) == 0 {
-		return nil
-	}
-	out := make([][]byte, 0, len(elems))
-	for _, elem := range elems {
-		if elem == nil || elem.Op == DelPrefix || (elem.GroupID == 0 && !c.partitionResolverClaimsPointKey(elem.Key)) {
-			continue
-		}
-		out = append(out, bytes.Clone(elem.Key))
-	}
-	return out
-}
-
-func (c *ShardedCoordinator) writeFenceBypassKeysByGroup(elems []*Elem[OP]) map[uint64][][]byte {
-	out := make(map[uint64][][]byte)
-	for _, elem := range elems {
-		if elem == nil || elem.Op == DelPrefix {
-			continue
-		}
-		gid := elem.GroupID
-		if gid == 0 {
-			var ok bool
-			gid, ok = c.router.ResolveGroup(elem.Key)
-			if !ok || !c.partitionResolverClaimsPointKey(elem.Key) {
-				continue
-			}
-		}
-		out[gid] = append(out[gid], bytes.Clone(elem.Key))
-	}
-	return out
 }
 
 func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
@@ -1275,6 +1244,9 @@ func isComposed1RetryableError(err error) bool {
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
 func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
+		return nil, err
+	}
 	if hasExplicitGroupElem(reqs.Elems) {
 		return c.dispatchExplicitGroupNonTxn(ctx, reqs)
 	}
@@ -1320,6 +1292,61 @@ func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, re
 	return &CoordinateResponse{CommitIndex: maxIndex}, nil
 }
 
+func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
+		resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs)
+		if !handled {
+			resp, err = c.dispatchNonTxn(ctx, reqs)
+		}
+		if err == nil {
+			return resp, nil
+		}
+		if !errors.Is(err, ErrComposed1VersionGCd) || attempt == composed1RetryAttempts || c.engine == nil {
+			return resp, err
+		}
+		if !c.canRetryRawVersionGC(reqs) {
+			return resp, err
+		}
+		reqs.ObservedRouteVersion = c.engine.Version()
+	}
+	return nil, errors.WithStack(ErrInvalidRequest)
+}
+
+func (c *ShardedCoordinator) canRetryRawVersionGC(reqs *OperationGroup[OP]) bool {
+	if c == nil || c.router == nil || reqs == nil || hasDelPrefixElem(reqs.Elems) {
+		return false
+	}
+	var (
+		firstGID uint64
+		seen     bool
+	)
+	for _, elem := range reqs.Elems {
+		gid, ok := c.rawElemGroupID(elem)
+		if !ok {
+			return false
+		}
+		if !seen {
+			firstGID = gid
+			seen = true
+			continue
+		}
+		if gid != firstGID {
+			return false
+		}
+	}
+	return seen
+}
+
+func (c *ShardedCoordinator) rawElemGroupID(elem *Elem[OP]) (uint64, bool) {
+	if elem == nil {
+		return 0, false
+	}
+	if elem.GroupID != 0 {
+		return elem.GroupID, true
+	}
+	return c.router.ResolveGroup(elem.Key)
+}
+
 // hasDelPrefixElem returns true if any element is a DelPrefix operation.
 func hasDelPrefixElem(elems []*Elem[OP]) bool {
 	for _, e := range elems {
@@ -1347,16 +1374,22 @@ func validateDelPrefixOnly(elems []*Elem[OP]) error {
 // pb.Request (the FSM's extractDelPrefix processes only the first DEL_PREFIX
 // mutation per request). All requests are batched into a single Commit call
 // per shard group.
-func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isTxn bool, elems []*Elem[OP], observedRouteVersion uint64) (*CoordinateResponse, error) {
 	if isTxn {
 		return nil, errors.Wrap(ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
 	}
 	if err := validateDelPrefixOnly(elems); err != nil {
 		return nil, err
 	}
+	if err := c.rejectWriteFencedDelPrefixes(elems); err != nil {
+		return nil, err
+	}
 
 	ts, err := c.allocateTimestamp(ctx, "allocate DEL_PREFIX broadcast ts")
 	if err != nil {
+		return nil, err
+	}
+	if err := c.rejectWriteTimestampFloorDelPrefixes(elems, ts); err != nil {
 		return nil, err
 	}
 	requests := make([]*pb.Request, 0, len(elems))
@@ -1366,14 +1399,195 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 			return nil, err
 		}
 		requests = append(requests, &pb.Request{
-			IsTxn:     false,
-			Phase:     pb.Phase_NONE,
-			Ts:        ts,
-			Mutations: []*pb.Mutation{mut},
+			IsTxn:                false,
+			Phase:                pb.Phase_NONE,
+			Ts:                   ts,
+			Mutations:            []*pb.Mutation{mut},
+			ObservedRouteVersion: observedRouteVersion,
 		})
 	}
 
 	return c.broadcastToAllGroups(ctx, requests)
+}
+
+func (c *ShardedCoordinator) rejectWriteFencedPointElems(elems []*Elem[OP]) error {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil || elem.GroupID != 0 {
+			continue
+		}
+		if err := c.rejectWriteFencedPointKey(elem.Key); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
+	if c.partitionResolverRecognisesPointKey(key) {
+		return nil
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if ok {
+		route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
+		if found && route.State == distribution.RouteStateWriteFenced {
+			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+		}
+		return nil
+	}
+	rkey := routeKey(key)
+	if route, ok := c.engine.GetRoute(rkey); ok && route.State == distribution.RouteStateWriteFenced {
+		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) partitionResolverRecognisesPointKey(key []byte) bool {
+	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
+		return false
+	}
+	if _, ok := c.router.partitionResolver.ResolveGroup(key); ok {
+		return true
+	}
+	return c.router.partitionResolver.RecognisesPartitionedKey(key)
+}
+
+func (c *ShardedCoordinator) writeFenceBypassKeysForElems(elems []*Elem[OP]) [][]byte {
+	if len(elems) == 0 {
+		return nil
+	}
+	out := make([][]byte, 0, len(elems))
+	for _, elem := range elems {
+		if elem == nil || elem.Op == DelPrefix || (elem.GroupID == 0 && !c.partitionResolverClaimsPointKey(elem.Key)) {
+			continue
+		}
+		out = append(out, bytes.Clone(elem.Key))
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) writeFenceBypassKeysByGroup(elems []*Elem[OP]) map[uint64][][]byte {
+	out := make(map[uint64][][]byte)
+	for _, elem := range elems {
+		if elem == nil || elem.Op == DelPrefix {
+			continue
+		}
+		gid := elem.GroupID
+		if gid == 0 {
+			var ok bool
+			gid, ok = c.router.ResolveGroup(elem.Key)
+			if !ok || !c.partitionResolverClaimsPointKey(elem.Key) {
+				continue
+			}
+		}
+		out[gid] = append(out[gid], bytes.Clone(elem.Key))
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) partitionResolverClaimsPointKey(key []byte) bool {
+	if c == nil || c.router == nil || c.router.partitionResolver == nil || len(key) == 0 {
+		return false
+	}
+	_, ok := c.router.partitionResolver.ResolveGroup(key)
+	return ok
+}
+
+func (c *ShardedCoordinator) rejectWriteFencedDelPrefixes(elems []*Elem[OP]) error {
+	if c == nil || c.engine == nil {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		start, end := routePrefixRange(elem.Key)
+		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+			if route.State == distribution.RouteStateWriteFenced {
+				return errors.Wrapf(ErrRouteWriteFenced, "prefix %q route range [%q,%q)", elem.Key, start, end)
+			}
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorPointKey(key []byte, commitTS uint64) error {
+	if c == nil || c.engine == nil || commitTS == 0 {
+		return nil
+	}
+	if c.skipPointWriteTimestampFloor(key) {
+		return nil
+	}
+	if err := ensureLogicalRouteWriteAllowed(c.engine, key, commitTS); err != nil {
+		return err
+	}
+	if checked, err := c.rejectS3BucketAuxiliaryWriteTimestampFloor(key, commitTS); checked || err != nil {
+		return err
+	}
+	return c.rejectRawRouteWriteTimestampFloor(key, commitTS)
+}
+
+func (c *ShardedCoordinator) skipPointWriteTimestampFloor(key []byte) bool {
+	// Same exemption rejectWriteFencedPointKey applies, and for the same
+	// reason: in partition-resolved keyspaces such as HT-FIFO SQS, routeKey
+	// collapses a concrete partition key onto the global SQS route, so that
+	// route's floor is not this key's floor. Applying it here rejected writes
+	// the write-fence precheck deliberately lets through, and the Raft-side
+	// gate already covers these keys through the resolver's own routing.
+	return c.partitionResolverRecognisesPointKey(key) || isTxnInternalKey(key)
+}
+
+func (c *ShardedCoordinator) rejectS3BucketAuxiliaryWriteTimestampFloor(key []byte, commitTS uint64) (bool, error) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return false, nil
+	}
+	route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
+	if found && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+		return true, errors.Join(
+			errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive),
+			store.NewWriteConflictError(key),
+		)
+	}
+	return true, nil
+}
+
+func (c *ShardedCoordinator) rejectRawRouteWriteTimestampFloor(key []byte, commitTS uint64) error {
+	rkey := routeKey(key)
+	if route, ok := c.engine.GetRoute(rkey); ok && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+		return routeWriteTimestampFloorError(route, key, commitTS)
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefixes(elems []*Elem[OP], commitTS uint64) error {
+	if c == nil || c.engine == nil || commitTS == 0 {
+		return nil
+	}
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		if err := c.rejectWriteTimestampFloorDelPrefix(elem.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefix(prefix []byte, commitTS uint64) error {
+	start, end := routePrefixRange(prefix)
+	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+			return errors.Join(
+				errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", prefix, start, end, commitTS, route.MinWriteTSExclusive),
+				store.NewWriteConflictError(prefix),
+			)
+		}
+	}
+	return nil
 }
 
 // broadcastToAllGroups sends the same set of requests to every configured
@@ -1585,6 +1799,10 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if err != nil {
 		return nil, err
 	}
+	groupedReadKeys = c.groupedReadKeysWithStagedVisibilityMutationAliases(groupedReadKeys, grouped)
+	if groupedReadKeyCount(groupedReadKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
 		return nil, err
@@ -1655,6 +1873,11 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	if err != nil {
 		return nil, err
 	}
+	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
+	readKeys = c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, elems)
+	if len(readKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu. prevCommitTS, when set,
 	// carries the one-phase dedup probe key for a retry that reuses a failed
@@ -1669,6 +1892,48 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 		return &CoordinateResponse{}, nil
 	}
 	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
+}
+
+func (c *ShardedCoordinator) readKeysWithStagedVisibilityAliasesForGroup(gid uint64, readKeys [][]byte) [][]byte {
+	if len(readKeys) == 0 {
+		return readKeys
+	}
+	var out [][]byte
+	for _, key := range readKeys {
+		alias, ok := c.stagedVisibilityReadKeyAlias(gid, key)
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = append([][]byte(nil), readKeys...)
+		}
+		out = append(out, alias)
+	}
+	if out == nil {
+		return readKeys
+	}
+	return out
+}
+
+func (c *ShardedCoordinator) readKeysWithStagedVisibilityMutationAliasesForGroup(gid uint64, readKeys [][]byte, elems []*Elem[OP]) [][]byte {
+	var out [][]byte
+	for _, elem := range elems {
+		if elem == nil {
+			continue
+		}
+		alias, ok := c.stagedVisibilityReadKeyAlias(gid, elem.Key)
+		if !ok {
+			continue
+		}
+		if out == nil {
+			out = append([][]byte(nil), readKeys...)
+		}
+		out = append(out, alias)
+	}
+	if out == nil {
+		return readKeys
+	}
+	return out
 }
 
 type preparedGroup struct {
@@ -2515,7 +2780,7 @@ func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
 // catalog RouteID for !sqs|route|global. Partition-aware keyviz
 // is a Phase 3.D follow-up.
 func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGroup, bool) {
-	gid, ok := c.router.ResolveGroup(key)
+	gid, routeID, ok := c.resolveGroupAndRouteForKey(key)
 	if !ok {
 		return 0, nil, false
 	}
@@ -2523,19 +2788,41 @@ func (c *ShardedCoordinator) routeAndGroupForKey(key []byte) (uint64, *ShardGrou
 	if !ok {
 		return 0, nil, false
 	}
-	var routeID uint64
-	if route, found := c.engine.GetRoute(routeKey(key)); found {
-		routeID = route.RouteID
-	}
 	return routeID, g, true
 }
 
 func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
-	gid, ok := c.router.ResolveGroup(key)
+	gid, _, ok := c.resolveGroupAndRouteForKey(key)
 	if !ok {
 		return 0
 	}
 	return gid
+}
+
+func (c *ShardedCoordinator) resolveGroupAndRouteForKey(key []byte) (uint64, uint64, bool) {
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
+		return route.GroupID, route.RouteID, true
+	}
+	gid, ok := c.router.ResolveGroup(key)
+	if !ok {
+		return 0, 0, false
+	}
+	var routeID uint64
+	if route, found := c.engine.GetRoute(routeKey(key)); found {
+		routeID = route.RouteID
+	}
+	return gid, routeID, true
+}
+
+func (c *ShardedCoordinator) s3BucketAuxiliaryOwnerRouteForKey(key []byte) (distribution.Route, bool) {
+	if c == nil || c.engine == nil {
+		return distribution.Route{}, false
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return distribution.Route{}, false
+	}
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
 }
 
 // EngineGroupIDForKey reports the Raft group ID that owns key, or 0 when
@@ -2569,7 +2856,7 @@ func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint
 	}
 	grouped := make(map[uint64][][]byte)
 	for _, key := range readKeys {
-		gid, ok := c.router.ResolveGroup(key)
+		gid, _, ok := c.resolveGroupAndRouteForKey(key)
 		if !ok || gid == 0 {
 			return nil, errors.Wrapf(ErrInvalidRequest,
 				"no route for txn read key %q — recognised-but-"+
@@ -2577,8 +2864,63 @@ func (c *ShardedCoordinator) groupReadKeysByShardID(readKeys [][]byte) (map[uint
 					"preserve OCC read-set integrity", key)
 		}
 		grouped[gid] = append(grouped[gid], key)
+		if alias, ok := c.stagedVisibilityReadKeyAlias(gid, key); ok {
+			grouped[gid] = append(grouped[gid], alias)
+		}
 	}
 	return grouped, nil
+}
+
+func (c *ShardedCoordinator) groupedReadKeysWithStagedVisibilityMutationAliases(groupedReadKeys map[uint64][][]byte, groupedMutations map[uint64][]*pb.Mutation) map[uint64][][]byte {
+	out := groupedReadKeys
+	for gid, muts := range groupedMutations {
+		for _, mut := range muts {
+			if mut == nil {
+				continue
+			}
+			alias, ok := c.stagedVisibilityReadKeyAlias(gid, mut.Key)
+			if !ok {
+				continue
+			}
+			if out == nil {
+				out = make(map[uint64][][]byte)
+			}
+			out[gid] = append(out[gid], alias)
+		}
+	}
+	return out
+}
+
+func groupedReadKeyCount(grouped map[uint64][][]byte) int {
+	var count int
+	for _, keys := range grouped {
+		count += len(keys)
+	}
+	return count
+}
+
+func (c *ShardedCoordinator) stagedVisibilityReadKeyAlias(gid uint64, key []byte) ([]byte, bool) {
+	if c == nil || c.engine == nil || len(key) == 0 {
+		return nil, false
+	}
+	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
+		return nil, false
+	}
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
+		return stagedVisibilityReadKeyAliasForRoute(gid, key, route)
+	}
+	route, ok := c.engine.GetRoute(routeKey(key))
+	if !ok {
+		return nil, false
+	}
+	return stagedVisibilityReadKeyAliasForRoute(gid, key, route)
+}
+
+func stagedVisibilityReadKeyAliasForRoute(gid uint64, key []byte, route distribution.Route) ([]byte, bool) {
+	if route.GroupID != gid || !routeHasStagedVisibility(route) {
+		return nil, false
+	}
+	return distribution.MigrationStagedDataKey(route.MigrationJobID, key), true
 }
 
 // validateReadOnlyShards checks read-write conflicts on shards that have
@@ -2630,7 +2972,7 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		return errors.WithStack(err)
 	}
 	for _, key := range keys {
-		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+		ts, exists, err := c.latestCommitTSForReadKeyOnShard(ctx, gid, g, key)
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -2639,6 +2981,51 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 		}
 	}
 	return nil
+}
+
+func (c *ShardedCoordinator) latestCommitTSForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) (uint64, bool, error) {
+	route, ok := c.stagedVisibilityRouteForReadKey(gid, key)
+	if !ok {
+		liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+		return liveTS, liveExists, errors.WithStack(err)
+	}
+	// Staged before live, for the reason on getAtWithStagedVisibility.
+	// Missing the version here is worse than a stale read: OCC would see no
+	// commit above startTS and let the transaction commit on a read it should
+	// have conflicted with.
+	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+	if err != nil {
+		return 0, false, errors.WithStack(err)
+	}
+	return maxStagedVisibilityLatestCommitTS(liveTS, liveExists, stagedTS, stagedExists), liveExists || stagedExists, nil
+}
+
+func (c *ShardedCoordinator) stagedVisibilityRouteForReadKey(gid uint64, key []byte) (distribution.Route, bool) {
+	if c == nil || c.engine == nil {
+		return distribution.Route{}, false
+	}
+	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
+		return distribution.Route{}, false
+	}
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
+		return route, route.GroupID == gid && routeHasStagedVisibility(route)
+	}
+	route, ok := c.engine.GetRoute(routeKey(key))
+	return route, ok && route.GroupID == gid && routeHasStagedVisibility(route)
+}
+
+func maxStagedVisibilityLatestCommitTS(liveTS uint64, liveExists bool, stagedTS uint64, stagedExists bool) uint64 {
+	if !liveExists {
+		return stagedTS
+	}
+	if !stagedExists || liveTS > stagedTS {
+		return liveTS
+	}
+	return stagedTS
 }
 
 var _ Coordinator = (*ShardedCoordinator)(nil)
@@ -2691,10 +3078,36 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
 			Phase:                pb.Phase_NONE,
 			Ts:                   ts,
 			Mutations:            muts,
+			ObservedRouteVersion: reqs.ObservedRouteVersion,
 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		})
 	}
 	return logs, gids, nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commitTS uint64) error {
+	if c == nil || c.engine == nil || commitTS == 0 {
+		return nil
+	}
+	for _, mut := range muts {
+		if err := c.rejectWriteTimestampFloorMutation(mut, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) rejectWriteTimestampFloorMutation(mut *pb.Mutation, commitTS uint64) error {
+	if mut == nil {
+		return nil
+	}
+	if mut.GetOp() == pb.Op_DEL_PREFIX {
+		return c.rejectWriteTimestampFloorDelPrefix(mut.Key, commitTS)
+	}
+	if len(mut.Key) == 0 {
+		return nil
+	}
+	return c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS)
 }
 
 func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {
@@ -2900,36 +3313,10 @@ func (c *ShardedCoordinator) ensureMutationWriteAllowed(mut *pb.Mutation, commit
 		}
 		return nil
 	case pb.Op_PUT, pb.Op_DEL:
-		return c.ensurePointMutationWriteAllowed(mut.Key, commitTS)
+		return c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS)
 	default:
 		return errors.WithStack(ErrInvalidRequest)
 	}
-}
-
-func (c *ShardedCoordinator) ensurePointMutationWriteAllowed(key []byte, commitTS uint64) error {
-	if c.engine == nil {
-		return nil
-	}
-	// Applied before the raw-route lookup below so a fenced user key rejects
-	// its list-delta/claim and stream rows even when the raw key's own route
-	// has no floor.
-	if err := ensureLogicalRouteWriteAllowed(c.engine, key, commitTS); err != nil {
-		return err
-	}
-	route, ok := c.engine.GetRoute(routeKey(key))
-	if !ok {
-		return nil
-	}
-	if c.router != nil {
-		gid, ok := c.router.ResolveGroup(key)
-		if !ok {
-			return errors.Wrapf(ErrInvalidRequest, "no route for key %q", key)
-		}
-		if gid != route.GroupID {
-			return nil
-		}
-	}
-	return ensureRouteWriteAllowed(route, key, commitTS)
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label) (map[uint64][]*pb.Mutation, []uint64, error) {
@@ -2940,21 +3327,18 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 		}
 		mut := elemToMutation(req)
 		gid := req.GroupID
+		_, routeID, routeOK := c.resolveGroupAndRouteForKey(mut.Key)
 		if gid == 0 {
-			var ok bool
-			gid, ok = c.router.ResolveGroup(mut.Key)
+			resolvedGID, resolvedRouteID, ok := c.resolveGroupAndRouteForKey(mut.Key)
 			if !ok {
 				return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 			}
+			gid = resolvedGID
+			routeID = resolvedRouteID
 		} else if _, ok := c.groups[gid]; !ok {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no shard group %d for key %q", gid, mut.Key)
-		}
-		// Engine RouteID for keyviz observation; partition-resolved
-		// keys observe under the !sqs|route|global RouteID until
-		// partition-aware keyviz lands.
-		var routeID uint64
-		if route, found := c.engine.GetRoute(routeKey(mut.Key)); found {
-			routeID = route.RouteID
+		} else if !routeOK {
+			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
 		}
 		c.observeMutation(routeID, mut, label)
 		grouped[gid] = append(grouped[gid], mut)

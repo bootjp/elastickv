@@ -25,10 +25,27 @@ type VersionedValue struct {
 }
 
 const (
-	mvccSnapshotVersionV1   = uint32(1)
-	mvccSnapshotVersion     = uint32(2)
-	maxSnapshotKeySize      = 1 << 20 // 1 MiB per key
-	maxSnapshotVersionCount = 1 << 20 // 1M versions per key
+	mvccSnapshotVersionV1 = uint32(1)
+	mvccSnapshotVersionV2 = uint32(2)
+	mvccSnapshotVersionV3 = uint32(3)
+	maxSnapshotKeySize    = 1 << 20 // 1 MiB per logical key
+	// maxSnapshotInternalKeyEnvelope reserves snapshot headroom for internal
+	// stored-key envelopes such as migration staging. Logical source keys keep
+	// the full maxSnapshotKeySize budget so existing snapshot-valid rows remain
+	// migratable.
+	maxSnapshotInternalKeyEnvelope = 32
+	maxSnapshotStoredKeySize       = maxSnapshotKeySize + maxSnapshotInternalKeyEnvelope
+
+	// MaxSnapshotKeySize is the largest logical/source key size guaranteed to
+	// round-trip through snapshots.
+	MaxSnapshotKeySize = maxSnapshotKeySize
+	// MaxSnapshotInternalKeyEnvelope is the stored-key envelope headroom
+	// snapshots reserve for internal namespaces.
+	MaxSnapshotInternalKeyEnvelope = maxSnapshotInternalKeyEnvelope
+	// MaxSnapshotStoredKeySize is the largest physical stored key a snapshot can
+	// carry after adding a bounded internal envelope to a logical key.
+	MaxSnapshotStoredKeySize = maxSnapshotStoredKeySize
+	maxSnapshotVersionCount  = 1 << 20 // 1M versions per key
 )
 
 // maxSnapshotValueSize caps the allowed size of a single value during streaming
@@ -61,13 +78,14 @@ func byteSliceComparator(a, b any) int {
 // mvccStore is an in-memory MVCC implementation backed by a treemap for
 // deterministic iteration order and range scans.
 type mvccStore struct {
-	tree               *treemap.Map // key []byte -> []VersionedValue
-	mtx                sync.RWMutex
-	log                *slog.Logger
-	lastCommitTS       uint64
-	minRetainedTS      uint64
-	migrationAcks      map[migrationAckID]migrationImportAck
-	migrationHLCFloors map[uint64]uint64
+	tree                *treemap.Map // key []byte -> []VersionedValue
+	mtx                 sync.RWMutex
+	log                 *slog.Logger
+	lastCommitTS        uint64
+	minRetainedTS       uint64
+	migrationAcks       map[migrationAckID]migrationImportAck
+	migrationHLCFloors  map[uint64]uint64
+	migrationPromotions map[uint64]PromotionState
 	// writeConflicts mirrors the per-(kind, key_prefix) counter from
 	// the pebble-backed store so the in-memory implementation shows up
 	// in the same Prometheus series (even if the counts are usually
@@ -114,9 +132,10 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		migrationAcks:      make(map[migrationAckID]migrationImportAck),
-		migrationHLCFloors: make(map[uint64]uint64),
-		writeConflicts:     newWriteConflictCounter(),
+		migrationAcks:       make(map[migrationAckID]migrationImportAck),
+		migrationHLCFloors:  make(map[uint64]uint64),
+		migrationPromotions: make(map[uint64]PromotionState),
+		writeConflicts:      newWriteConflictCounter(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -787,10 +806,22 @@ func (s *mvccStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, exclu
 // DeletePrefixAtRaftAt satisfies the MVCCStore interface — see
 // ApplyMutationsRaftAt for the appliedIndex disposition rationale.
 func (s *mvccStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, _ uint64) error {
-	return s.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS)
+	return s.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, 0)
+}
+
+func (s *mvccStore) DeletePrefixesAtRaftAt(_ context.Context, deletes []PrefixDelete, commitTS, _ uint64) error {
+	return s.deletePrefixesAt(deletes, commitTS)
 }
 
 func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.deletePrefixesAt([]PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS)
+}
+
+func (s *mvccStore) deletePrefixesAt(deletes []PrefixDelete, commitTS uint64) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
@@ -798,29 +829,9 @@ func (s *mvccStore) DeletePrefixAt(_ context.Context, prefix []byte, excludePref
 
 	// Collect matching keys first since we cannot modify the tree while iterating.
 	var toDelete [][]byte
-	it := s.tree.Iterator()
-	var started bool
-	if len(prefix) > 0 {
-		started = seekForwardIteratorStart(s.tree, &it, prefix)
-	} else {
-		started = it.First()
-	}
-	for ok := started; ok; ok = it.Next() {
-		k, keyOK := it.Key().([]byte)
-		if !keyOK {
-			continue
-		}
-		if len(prefix) > 0 && !bytes.HasPrefix(k, prefix) {
-			break
-		}
-		if len(excludePrefix) > 0 && bytes.HasPrefix(k, excludePrefix) {
-			continue
-		}
-		versions, _ := it.Value().([]VersionedValue)
-		if _, visible := visibleValue(versions, commitTS); !visible {
-			continue
-		}
-		toDelete = append(toDelete, k)
+	seen := make(map[string]struct{})
+	for _, del := range deletes {
+		toDelete = s.collectDeletePrefixKeysLocked(del, commitTS, seen, toDelete)
 	}
 
 	for _, k := range toDelete {
@@ -903,12 +914,20 @@ func isStreamingMVCCSnapshot(r *bufio.Reader) (bool, error) {
 }
 
 func (s *mvccStore) writeSnapshotFile(f *os.File) error {
-	checksumOffset, err := writeMVCCSnapshotHeader(f)
+	// The version and the body are chosen under one lock: the version depends on
+	// which metadata maps are populated, so releasing between the header and the
+	// body would let a concurrent migration write a body the header does not
+	// describe.
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+
+	version := mvccSnapshotVersionForState(s.migrationAcks, s.migrationHLCFloors, s.migrationPromotions)
+	checksumOffset, err := writeMVCCSnapshotHeader(f, version)
 	if err != nil {
 		return err
 	}
 
-	sum, err := s.writeSnapshotBody(f)
+	sum, err := s.writeSnapshotBodyLocked(f, version)
 	if err != nil {
 		return err
 	}
@@ -916,11 +935,33 @@ func (s *mvccStore) writeSnapshotFile(f *os.File) error {
 	return finalizeMVCCSnapshotFile(f, checksumOffset, sum)
 }
 
-func writeMVCCSnapshotHeader(f *os.File) (int64, error) {
+// mvccSnapshotVersionForState returns the oldest snapshot layout that can carry
+// this state. Every version is its predecessor plus one trailing metadata
+// field, so a store holding none of that metadata still emits the layout older
+// binaries already parse. Emitting the newest layout unconditionally would
+// strand a not-yet-upgraded follower mid-rolling-upgrade on a snapshot it
+// rejects as unsupported, even on a cluster where the migration opcodes have
+// never been enabled and there is nothing extra to carry.
+func mvccSnapshotVersionForState(
+	acks map[migrationAckID]migrationImportAck,
+	floors map[uint64]uint64,
+	promotions map[uint64]PromotionState,
+) uint32 {
+	switch {
+	case len(promotions) > 0:
+		return mvccSnapshotVersionV3
+	case len(acks) > 0 || len(floors) > 0:
+		return mvccSnapshotVersionV2
+	default:
+		return mvccSnapshotVersionV1
+	}
+}
+
+func writeMVCCSnapshotHeader(f *os.File, version uint32) (int64, error) {
 	if _, err := f.Write(mvccSnapshotMagic[:]); err != nil {
 		return 0, errors.WithStack(err)
 	}
-	if err := binary.Write(f, binary.LittleEndian, mvccSnapshotVersion); err != nil {
+	if err := binary.Write(f, binary.LittleEndian, version); err != nil {
 		return 0, errors.WithStack(err)
 	}
 	checksumOffset, err := f.Seek(0, io.SeekCurrent)
@@ -933,24 +974,20 @@ func writeMVCCSnapshotHeader(f *os.File) (int64, error) {
 	return checksumOffset, nil
 }
 
-func (s *mvccStore) writeSnapshotBody(f *os.File) (uint32, error) {
+func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32, error) {
 	hash := crc32.NewIEEE()
 	bw := bufio.NewWriter(f)
 	w := io.MultiWriter(bw, hash)
 
-	s.mtx.RLock()
-	defer s.mtx.RUnlock()
-
-	if err := binary.Write(w, binary.LittleEndian, s.lastCommitTS); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	if err := binary.Write(w, binary.LittleEndian, s.minRetainedTS); err != nil {
-		return 0, errors.WithStack(err)
-	}
-	if err := writeMVCCSnapshotBytes(w, encodeMigrationImportAcks(s.migrationAcks)); err != nil {
-		return 0, err
-	}
-	if err := writeMVCCSnapshotBytes(w, encodeMigrationHLCFloors(s.migrationHLCFloors)); err != nil {
+	if err := writeMVCCSnapshotMetadata(
+		w,
+		version,
+		s.lastCommitTS,
+		s.minRetainedTS,
+		s.migrationAcks,
+		s.migrationHLCFloors,
+		s.migrationPromotions,
+	); err != nil {
 		return 0, err
 	}
 	iter := s.tree.Iterator()
@@ -971,6 +1008,39 @@ func (s *mvccStore) writeSnapshotBody(f *os.File) (uint32, error) {
 		return 0, errors.WithStack(err)
 	}
 	return hash.Sum32(), nil
+}
+
+func writeMVCCSnapshotMetadata(
+	w io.Writer,
+	version uint32,
+	lastCommitTS uint64,
+	minRetainedTS uint64,
+	migrationAcks map[migrationAckID]migrationImportAck,
+	migrationHLCFloors map[uint64]uint64,
+	migrationPromotions map[uint64]PromotionState,
+) error {
+	if err := binary.Write(w, binary.LittleEndian, lastCommitTS); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := binary.Write(w, binary.LittleEndian, minRetainedTS); err != nil {
+		return errors.WithStack(err)
+	}
+	if version == mvccSnapshotVersionV1 {
+		return nil
+	}
+	if err := writeMVCCSnapshotBytes(w, encodeMigrationImportAcks(migrationAcks)); err != nil {
+		return err
+	}
+	if err := writeMVCCSnapshotBytes(w, encodeMigrationHLCFloors(migrationHLCFloors)); err != nil {
+		return err
+	}
+	if version < mvccSnapshotVersionV3 {
+		return nil
+	}
+	if err := writeMVCCSnapshotBytes(w, encodeMigrationPromotionStates(migrationPromotions)); err != nil {
+		return err
+	}
+	return nil
 }
 
 func finalizeMVCCSnapshotFile(f *os.File, checksumOffset int64, sum uint32) error {
@@ -1033,6 +1103,39 @@ func writeMVCCSnapshotVersion(w io.Writer, version VersionedValue) error {
 	return nil
 }
 
+func (s *mvccStore) collectDeletePrefixKeysLocked(del PrefixDelete, commitTS uint64, seen map[string]struct{}, toDelete [][]byte) [][]byte {
+	it := s.tree.Iterator()
+	var started bool
+	if len(del.Prefix) > 0 {
+		started = seekForwardIteratorStart(s.tree, &it, del.Prefix)
+	} else {
+		started = it.First()
+	}
+	for ok := started; ok; ok = it.Next() {
+		k, keyOK := it.Key().([]byte)
+		if !keyOK {
+			continue
+		}
+		if len(del.Prefix) > 0 && !bytes.HasPrefix(k, del.Prefix) {
+			break
+		}
+		if len(del.ExcludePrefix) > 0 && bytes.HasPrefix(k, del.ExcludePrefix) {
+			continue
+		}
+		versions, _ := it.Value().([]VersionedValue)
+		if _, visible := visibleValue(versions, commitTS); !visible {
+			continue
+		}
+		dedupeKey := string(k)
+		if _, ok := seen[dedupeKey]; ok {
+			continue
+		}
+		seen[dedupeKey] = struct{}{}
+		toDelete = append(toDelete, bytes.Clone(k))
+	}
+	return toDelete
+}
+
 func mvccSnapshotTombstoneByte(tombstone bool) byte {
 	if tombstone {
 		return 1
@@ -1046,7 +1149,7 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 		return err
 	}
 
-	tree, lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, actual, err := restoreStreamingMVCCSnapshotBody(r, version)
+	tree, lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, actual, err := restoreStreamingMVCCSnapshotBody(r, version)
 	if err != nil {
 		return err
 	}
@@ -1061,6 +1164,7 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.minRetainedTS = minRetainedTS
 	s.migrationAcks = migrationAcks
 	s.migrationHLCFloors = migrationHLCFloors
+	s.migrationPromotions = migrationPromotions
 	return nil
 }
 
@@ -1077,7 +1181,7 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
-	if version != mvccSnapshotVersionV1 && version != mvccSnapshotVersion {
+	if version != mvccSnapshotVersionV1 && version != mvccSnapshotVersionV2 && version != mvccSnapshotVersionV3 {
 		return 0, 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
 	}
 
@@ -1088,55 +1192,86 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	return version, expected, nil
 }
 
-func restoreStreamingMVCCSnapshotBody(r io.Reader, version uint32) (*treemap.Map, uint64, uint64, map[migrationAckID]migrationImportAck, map[uint64]uint64, uint32, error) {
+func restoreStreamingMVCCSnapshotBody(
+	r io.Reader,
+	version uint32,
+) (*treemap.Map, uint64, uint64, map[migrationAckID]migrationImportAck, map[uint64]uint64, map[uint64]PromotionState, uint32, error) {
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
 
-	lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, err := readMVCCSnapshotMetadata(body, version)
+	lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, err := readMVCCSnapshotMetadata(body, version)
 	if err != nil {
-		return nil, 0, 0, nil, nil, 0, err
+		return nil, 0, 0, nil, nil, nil, 0, err
 	}
 
 	tree, err := readMVCCSnapshotTree(body)
 	if err != nil {
-		return nil, 0, 0, nil, nil, 0, err
+		return nil, 0, 0, nil, nil, nil, 0, err
 	}
 
-	return tree, lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, hash.Sum32(), nil
+	return tree, lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, hash.Sum32(), nil
 }
 
-func readMVCCSnapshotMetadata(r io.Reader, version uint32) (uint64, uint64, map[migrationAckID]migrationImportAck, map[uint64]uint64, error) {
+func readMVCCSnapshotMetadata(
+	r io.Reader,
+	version uint32,
+) (uint64, uint64, map[migrationAckID]migrationImportAck, map[uint64]uint64, map[uint64]PromotionState, error) {
 	var lastCommitTS uint64
 	if err := binary.Read(r, binary.LittleEndian, &lastCommitTS); err != nil {
-		return 0, 0, nil, nil, errors.WithStack(err)
+		return 0, 0, nil, nil, nil, errors.WithStack(err)
 	}
 	var minRetainedTS uint64
 	if err := binary.Read(r, binary.LittleEndian, &minRetainedTS); err != nil {
-		return 0, 0, nil, nil, errors.WithStack(err)
+		return 0, 0, nil, nil, nil, errors.WithStack(err)
 	}
 	if version == mvccSnapshotVersionV1 {
-		return lastCommitTS, minRetainedTS, make(map[migrationAckID]migrationImportAck), make(map[uint64]uint64), nil
+		return lastCommitTS,
+			minRetainedTS,
+			make(map[migrationAckID]migrationImportAck),
+			make(map[uint64]uint64),
+			make(map[uint64]PromotionState),
+			nil
 	}
 
 	ackData, err := readMVCCSnapshotBytes(r, "snapshot migration acks")
 	if err != nil {
-		return 0, 0, nil, nil, err
+		return 0, 0, nil, nil, nil, err
 	}
 	migrationAcks, ok := decodeMigrationImportAcks(ackData)
 	if !ok {
-		return 0, 0, nil, nil, errors.New("invalid snapshot migration acks")
+		return 0, 0, nil, nil, nil, errors.New("invalid snapshot migration acks")
 	}
 
 	floorData, err := readMVCCSnapshotBytes(r, "snapshot migration hlc floors")
 	if err != nil {
-		return 0, 0, nil, nil, err
+		return 0, 0, nil, nil, nil, err
 	}
 	migrationHLCFloors, ok := decodeMigrationHLCFloors(floorData)
 	if !ok {
-		return 0, 0, nil, nil, errors.New("invalid snapshot migration hlc floors")
+		return 0, 0, nil, nil, nil, errors.New("invalid snapshot migration hlc floors")
 	}
 
-	return lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, nil
+	migrationPromotions, err := readMVCCSnapshotPromotionMetadata(r, version)
+	if err != nil {
+		return 0, 0, nil, nil, nil, err
+	}
+
+	return lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, nil
+}
+
+func readMVCCSnapshotPromotionMetadata(r io.Reader, version uint32) (map[uint64]PromotionState, error) {
+	if version < mvccSnapshotVersionV3 {
+		return make(map[uint64]PromotionState), nil
+	}
+	promotionData, err := readMVCCSnapshotBytes(r, "snapshot migration promotions")
+	if err != nil {
+		return nil, err
+	}
+	migrationPromotions, ok := decodeMigrationPromotionStates(promotionData)
+	if !ok {
+		return nil, errors.New("invalid snapshot migration promotions")
+	}
+	return migrationPromotions, nil
 }
 
 func readMVCCSnapshotBytes(r io.Reader, field string) ([]byte, error) {
@@ -1177,8 +1312,8 @@ func readMVCCSnapshotEntry(r io.Reader) ([]byte, []VersionedValue, bool, error) 
 		}
 		return nil, nil, false, errors.WithStack(err)
 	}
-	if keyLen > maxSnapshotKeySize {
-		return nil, nil, false, errors.Wrapf(ErrSnapshotKeyTooLarge, "%d > %d", keyLen, maxSnapshotKeySize)
+	if keyLen > maxSnapshotStoredKeySize {
+		return nil, nil, false, errors.Wrapf(ErrSnapshotKeyTooLarge, "%d > %d", keyLen, maxSnapshotStoredKeySize)
 	}
 
 	key := make([]byte, keyLen)

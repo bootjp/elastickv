@@ -1,6 +1,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
@@ -114,6 +115,65 @@ func TestDirectApplyWriteOpts_AlwaysSync(t *testing.T) {
 		require.Same(t, pebble.Sync, ps.raftApplyWriteOpts())
 		require.Same(t, pebble.Sync, ps.directApplyWriteOpts())
 	})
+}
+
+func TestPromoteVersionsWriteOptsFollowApplyContext(t *testing.T) {
+	t.Run("raft-applied promotion observes nosync", func(t *testing.T) {
+		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.NoSync, fsmSyncModeNoSync)
+		defer ps.Close()
+
+		require.Same(t, pebble.NoSync, ps.promotionWriteOpts(123),
+			"promotion with an applied index must use raft apply write options")
+	})
+
+	t.Run("direct promotion stays sync", func(t *testing.T) {
+		ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, t.TempDir(), pebble.NoSync, fsmSyncModeNoSync)
+		defer ps.Close()
+
+		require.Same(t, pebble.Sync, ps.promotionWriteOpts(0),
+			"promotion without an applied index has no raft durability backstop")
+	})
+}
+
+func TestPromoteVersionsRaftNoSyncFunctionalEquivalence(t *testing.T) {
+	dir := t.TempDir()
+	ps := newPebbleStoreWithFSMApplyWriteOptsForTest(t, dir, pebble.NoSync, fsmSyncModeNoSync)
+	defer ps.Close()
+
+	ctx := context.Background()
+	stage := func(raw string) []byte {
+		return append([]byte("stage|"), []byte(raw)...)
+	}
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, []byte("stage|")), bytes.HasPrefix(staged, []byte("stage|"))
+	}
+	prefix := []byte("stage|")
+
+	require.NoError(t, ps.PutAt(ctx, stage("k"), []byte("v10"), 10, 0))
+
+	const entryIdx uint64 = 88
+	result, err := ps.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:        12,
+		AppliedIndex: entryIdx,
+		StartKey:     prefix,
+		EndKey:       PrefixScanEnd(prefix),
+		MaxVersions:  10,
+		TargetKey:    targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, result.Done)
+	require.Equal(t, uint64(1), result.PromotedRows)
+
+	val, err := ps.GetAt(ctx, []byte("k"), 10)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v10"), val)
+	_, err = ps.GetAt(ctx, stage("k"), 10)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present)
+	require.Equal(t, entryIdx, got)
 }
 
 // TestDirectApplyMutations_NoSyncConfigured_StillWritesDurably is the

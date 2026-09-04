@@ -38,6 +38,13 @@ var ErrInvalidExportCursor = errors.New("invalid export cursor")
 var ErrInvalidExportBudget = errors.New("migration export requires a positive version budget")
 var ErrImportBatchGap = errors.New("migration import batch gap")
 
+// ErrInvalidImportVersion marks a migration import version that is malformed
+// on its face (zero commit_ts, a tombstone carrying a value or expire_at).
+// It is a property of the request bytes, so every replica applying the same
+// Raft entry reaches the same verdict -- which is what lets kv/fsm classify
+// it as an ordinary apply error instead of halting the apply loop.
+var ErrInvalidImportVersion = errors.New("invalid migration import version")
+
 // validateValueSize returns ErrValueTooLarge when the value exceeds maxSnapshotValueSize.
 func validateValueSize(value []byte) error {
 	if len(value) > maxSnapshotValueSize {
@@ -74,6 +81,12 @@ type KVPair struct {
 	Key          []byte
 	Value        []byte
 	RouteGroupID uint64
+}
+
+// PrefixDelete describes one prefix tombstone operation in a batched apply.
+type PrefixDelete struct {
+	Prefix        []byte
+	ExcludePrefix []byte
 }
 
 // MVCCVersion is a raw committed MVCC version for range migration.
@@ -114,11 +127,14 @@ type ExportVersionsResult struct {
 
 // ImportVersionsOptions applies one idempotent migration-import batch.
 type ImportVersionsOptions struct {
-	JobID     uint64
-	BracketID uint64
-	BatchSeq  uint64
-	Versions  []MVCCVersion
-	Cursor    []byte
+	JobID uint64
+	// AppliedIndex is the optional Raft entry index to bundle with Pebble
+	// import batches as metaAppliedIndex. Zero leaves the meta key unchanged.
+	AppliedIndex uint64
+	BracketID    uint64
+	BatchSeq     uint64
+	Versions     []MVCCVersion
+	Cursor       []byte
 }
 
 // ImportVersionsResult reports the cursor durably acknowledged by the target.
@@ -126,6 +142,53 @@ type ImportVersionsResult struct {
 	AckedCursor   []byte
 	MaxImportedTS uint64
 	Duplicate     bool
+}
+
+// PromoteVersionsOptions atomically copies staged MVCC versions to their
+// target keys and physically removes the staged versions.
+type PromoteVersionsOptions struct {
+	JobID uint64
+	// AppliedIndex is the optional Raft entry index to bundle with Pebble
+	// promotion batches as metaAppliedIndex. Zero leaves the meta key unchanged.
+	AppliedIndex    uint64
+	StartKey        []byte
+	EndKey          []byte
+	Cursor          []byte
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	TargetKey       func(stagedKey []byte) ([]byte, bool)
+}
+
+// PromoteVersionsResult reports one resumable staged-version promotion chunk.
+type PromoteVersionsResult struct {
+	NextCursor        []byte
+	Done              bool
+	PromotedRows      uint64
+	TotalPromotedRows uint64
+	PromotedBytes     uint64
+	MaxPromotedTS     uint64
+	ScannedBytes      uint64
+}
+
+// PromotionState is the target-local durable cursor for staged data promotion.
+type PromotionState struct {
+	Cursor        []byte
+	Done          bool
+	PromotedRows  uint64
+	MaxPromotedTS uint64
+	LastError     string
+}
+
+// MigrationPromoter is implemented by stores that can promote staged range
+// migration data into the live keyspace.
+type MigrationPromoter interface {
+	PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error)
+}
+
+// MigrationPromotionStateReader reads target-local staged promotion state.
+type MigrationPromotionStateReader interface {
+	MigrationPromotionState(ctx context.Context, jobID uint64) (PromotionState, bool, error)
 }
 
 // OpType describes a mutation kind.
@@ -269,6 +332,11 @@ type MVCCStore interface {
 	// bundles metaAppliedIndex in that batch so DEL_PREFIX entries
 	// also advance the meta key. PR #910 design §2 "why both leaves".
 	DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error
+	// DeletePrefixesAtRaftAt applies several prefix deletes in one
+	// raft-apply batch. It is used when one logical raft command must
+	// tombstone multiple physical namespaces without exposing a partial
+	// apply or advancing metaAppliedIndex separately from any tombstone.
+	DeletePrefixesAtRaftAt(ctx context.Context, deletes []PrefixDelete, commitTS, appliedIndex uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
 	// WriteConflictCountsByPrefix returns a snapshot of the MVCC
@@ -285,12 +353,21 @@ type MVCCStore interface {
 	// ImportVersions applies a migration import batch idempotently by
 	// (jobID, bracketID, batchSeq), preserving tombstones and expireAt.
 	ImportVersions(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
+	// ImportVersionsRaft is the raft-apply variant of ImportVersions. It
+	// preserves the same idempotency contract while using the FSM write path.
+	// When opts.AppliedIndex is non-zero, the implementation must durably
+	// bundle metaAppliedIndex with the import batch.
+	ImportVersionsRaft(ctx context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error)
 	// MigrationHLCFloor returns the full-HLC target-local migration floor
 	// persisted by ImportVersions for jobID.
 	MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error)
 	// RetireMigration removes target-local import progress metadata for a
 	// completed migration job. Data imported by the job is left intact.
 	RetireMigration(ctx context.Context, jobID uint64) error
+	// RetireMigrationRaft is the raft-apply variant of RetireMigration. When
+	// appliedIndex is non-zero, the implementation must durably bundle
+	// metaAppliedIndex with the metadata retirement batch.
+	RetireMigrationRaft(ctx context.Context, jobID, appliedIndex uint64) error
 	Snapshot() (Snapshot, error)
 	Restore(buf io.Reader) error
 	Close() error

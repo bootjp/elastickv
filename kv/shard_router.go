@@ -134,6 +134,9 @@ func (s *ShardRouter) ResolveGroup(rawKey []byte) (uint64, bool) {
 			return 0, false
 		}
 	}
+	if route, ok := s.s3BucketAuxiliaryOwnerRouteForKey(rawKey); ok {
+		return route.GroupID, true
+	}
 	// Engine routes against the user-key view of the byte-range
 	// space; routeKey may rewrite SQS / DynamoDB / Redis-internal
 	// keys to a stable per-table or per-namespace route key so the
@@ -143,6 +146,17 @@ func (s *ShardRouter) ResolveGroup(rawKey []byte) (uint64, bool) {
 		return 0, false
 	}
 	return route.GroupID, true
+}
+
+func (s *ShardRouter) s3BucketAuxiliaryOwnerRouteForKey(rawKey []byte) (distribution.Route, bool) {
+	if s == nil || s.engine == nil {
+		return distribution.Route{}, false
+	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(rawKey)
+	if !ok {
+		return distribution.Route{}, false
+	}
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, s.engine.GetIntersectingRoutes(start, end))
 }
 
 // Register associates a raft group ID with its transactional manager and store.

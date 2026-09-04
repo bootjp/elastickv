@@ -465,6 +465,29 @@ func TestMigrationKnownInternalPrefixesAreConcreteOnly(t *testing.T) {
 	require.False(t, bytes.Equal(prefixes[0], MigrationKnownInternalPrefixes()[0]), "prefix list must be cloned")
 }
 
+func TestMigrationStagedDataKeyRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	raw := []byte("user|raw")
+	key := MigrationStagedDataKey(42, raw)
+	require.LessOrEqual(t, len(MigrationStagedDataKey(42, nil)), store.MaxSnapshotInternalKeyEnvelope)
+	require.True(t, IsMigrationStagedDataKey(key))
+	require.True(t, bytes.HasPrefix(key, MigrationStagedDataKeyPrefix(42)))
+	require.False(t, IsMigrationStagedDataKey([]byte("!dist|migstage|short")))
+
+	jobID, original, ok := MigrationStagedDataKeyParts(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(42), jobID)
+	require.Equal(t, []byte("user|raw"), original)
+
+	raw[0] = 'X'
+	original[0] = 'Y'
+	jobID, original, ok = MigrationStagedDataKeyParts(key)
+	require.True(t, ok)
+	require.Equal(t, uint64(42), jobID)
+	require.Equal(t, []byte("user|raw"), original)
+}
+
 func TestValidateMigrationRouteRangeRejectsReservedControlPrefixes(t *testing.T) {
 	t.Parallel()
 
@@ -565,6 +588,100 @@ func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []
 	var seq [4]byte
 	binary.BigEndian.PutUint32(seq[:], seqInTxn)
 	return append(key, seq[:]...)
+}
+
+// File chunk payloads live under !fs|chk| but route through a virtual
+// !fs|route|chk| key. "!fs|chk|" sorts below "!fs|route|chk|", so a
+// filesystem-chunk route's user bracket -- whose raw interval IS the virtual
+// route range -- never reaches the payloads. Without a dedicated bracket the
+// export found nothing, yet the migration completed and was promoted, losing
+// every chunk of the moved files on a cross-group split.
+func TestPlanMigrationBracketsCoversFilesystemChunkPayloads(t *testing.T) {
+	t.Parallel()
+
+	routeStart := fskeys.ChunkRouteKey(0, 1)
+	routeEnd := fskeys.ChunkRouteKey(0, 9)
+	brackets, err := PlanMigrationBrackets(routeStart, routeEnd)
+	require.NoError(t, err)
+
+	var chunk *MigrationBracket
+	for i := range brackets {
+		if brackets[i].Family == MigrationFamilyFilesystemChunk {
+			chunk = &brackets[i]
+
+			break
+		}
+	}
+	require.NotNil(t, chunk, "the plan must carry a filesystem chunk bracket")
+	require.Equal(t, fskeys.ChunkAllPrefix(), chunk.Start,
+		"the bracket must scan the raw chunk prefix, not the virtual route range")
+	require.True(t, chunk.RequiresRouteKeyCheck,
+		"raw chunk keys must still be filtered through the logical route")
+
+	// The gap this closes: the raw payload prefix sorts below the virtual route
+	// interval, so the user bracket's raw range cannot reach it.
+	require.Negative(t, bytes.Compare(fskeys.ChunkAllPrefix(), routeStart),
+		"chunk payloads sort below the virtual route interval")
+}
+
+// Invariant: every family bracket's scan prefix must also be excluded from the
+// user bracket. Both filters accept the same raw row otherwise -- the family
+// bracket by prefix and the user bracket by normalized route key -- so the rows
+// are exported and proposed through Raft twice under separate bracket IDs.
+//
+// This is written as an invariant rather than a per-family case because the
+// filesystem chunk family was added without its exclusion and nothing caught it.
+func TestEveryFamilyBracketPrefixIsExcludedFromUserBracket(t *testing.T) {
+	t.Parallel()
+
+	for _, bracket := range migrationFamilyBrackets() {
+		if bracket.DrainOnly {
+			continue
+		}
+		require.True(t, IsMigrationKnownInternalKey(bracket.Start),
+			"family %d prefix %q must be in migrationInternalFamilyPrefixes, "+
+				"otherwise the user bracket exports the same rows a second time",
+			bracket.Family, bracket.Start)
+	}
+}
+
+// Per-route usage counters live at !fs|usage|route|<encoded route> and
+// normalize back to the embedded logical route key, so their raw key sits
+// outside a user route's interval exactly like chunk payloads. Without a
+// bracket the counter stayed on the source: after cutover the usage scan
+// filtered that copy out because its logical owner had become the target,
+// while target-side updates began from zero, so StatFS undercounted.
+func TestPlanMigrationBracketsCoversFilesystemUsageCounters(t *testing.T) {
+	t.Parallel()
+
+	routeStart := []byte("a")
+	routeEnd := []byte("z")
+	brackets, err := PlanMigrationBrackets(routeStart, routeEnd)
+	require.NoError(t, err)
+
+	var usage *MigrationBracket
+	for i := range brackets {
+		if brackets[i].Family == MigrationFamilyFilesystemUsage {
+			usage = &brackets[i]
+
+			break
+		}
+	}
+	require.NotNil(t, usage, "the plan must carry a filesystem usage bracket")
+	require.Equal(t, fskeys.UsageRouteAllPrefix(), usage.Start,
+		"the bracket must scan the raw usage prefix, not the logical route range")
+	require.True(t, usage.RequiresRouteKeyCheck,
+		"raw usage keys must still be filtered through their embedded route")
+
+	// The gap this closes: the raw counter key sorts outside a user route
+	// interval, so the user bracket cannot reach it.
+	require.Negative(t, bytes.Compare(fskeys.UsageRouteAllPrefix(), routeStart),
+		"usage counters sort below a user route interval")
+
+	// And it must round-trip: a counter for a key inside the interval
+	// normalizes back into that interval, so the route filter keeps it.
+	counter := fskeys.UsageRouteKey([]byte("customers"))
+	require.Equal(t, []byte("customers"), fskeys.ExtractRouteKey(counter))
 }
 
 // !s3|chunkblob| rows never travel with a migration. They are written outside

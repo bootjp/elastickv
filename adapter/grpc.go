@@ -76,6 +76,10 @@ type rawVersionPresenceReader interface {
 	VersionExistsAtOrBeforeGroupWithReadFence(ctx context.Context, key []byte, groupID uint64, ts uint64, readRouteVersion uint64) (bool, bool, error)
 }
 
+type rawVersionPresenceBatchReader interface {
+	VersionsExistAtOrBeforeGroupWithReadFence(ctx context.Context, keys [][]byte, groupID uint64, ts uint64, readRouteVersion uint64) ([]bool, bool, error)
+}
+
 type rawGroupReverseScanner interface {
 	ReverseScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
 }
@@ -214,9 +218,25 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 	if err := r.requireReadReady(); err != nil {
 		return nil, err
 	}
+	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
+	if len(req.GetKeyBatch()) > 0 {
+		visible, visibleSupported, err := r.rawVersionsVisibleAt(ctx, req, readRouteVersion)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return &pb.RawLatestCommitTSResponse{
+			VersionVisibleResults:   visible,
+			VersionVisibleSupported: visibleSupported,
+		}, nil
+	}
+	return r.rawLatestCommitTSSingle(ctx, req, readRouteVersion)
+}
+
+func (r *GRPCServer) rawLatestCommitTSSingle(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) (*pb.RawLatestCommitTSResponse, error) {
 	// A group id with no key is the leader-fenced group watermark. With a key
 	// it selects the group for a per-key read instead, further down -- the two
-	// share the field, so the key is what tells them apart.
+	// share the field, so the key is what tells them apart. A key_batch request
+	// never reaches here, so this stays a single-key decision.
 	if groupID := req.GetGroupId(); groupID != 0 && len(req.GetKey()) == 0 {
 		return r.rawGroupWatermark(ctx, groupID)
 	}
@@ -232,7 +252,6 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 		}, nil
 	}
 
-	readRouteVersion := r.readRouteVersion(req.GetReadRouteVersion())
 	ts, exists, err := r.rawKeyCommitTS(ctx, req, key, readRouteVersion)
 	if err != nil {
 		return nil, err
@@ -247,6 +266,37 @@ func (r *GRPCServer) RawLatestCommitTS(ctx context.Context, req *pb.RawLatestCom
 		VersionVisible:          visible,
 		VersionVisibleSupported: visibleSupported,
 	}, nil
+}
+
+func (r *GRPCServer) rawVersionsVisibleAt(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) ([]bool, bool, error) {
+	keys, err := pb.DecodeRawLatestCommitTSKeyBatch(req.GetKeyBatch(), maxGRPCScanLimit)
+	if err != nil {
+		return nil, false, errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
+	}
+	out := make([]bool, len(keys))
+	at := req.GetVersionVisibleAtTs()
+	if at == 0 {
+		return out, false, nil
+	}
+	if reader, ok := r.store.(rawVersionPresenceBatchReader); ok {
+		visible, supported, err := reader.VersionsExistAtOrBeforeGroupWithReadFence(ctx, keys, req.GetGroupId(), at, readRouteVersion)
+		return visible, supported, errors.WithStack(err)
+	}
+	reader, ok := r.store.(rawVersionPresenceReader)
+	if !ok {
+		return out, false, nil
+	}
+	for i, key := range keys {
+		visible, supported, err := reader.VersionExistsAtOrBeforeGroupWithReadFence(ctx, key, req.GetGroupId(), at, readRouteVersion)
+		if err != nil {
+			return nil, false, errors.WithStack(err)
+		}
+		if !supported {
+			return out, false, nil
+		}
+		out[i] = visible
+	}
+	return out, true, nil
 }
 
 // rawKeyCommitTS resolves the per-key latest commit timestamp through whichever
