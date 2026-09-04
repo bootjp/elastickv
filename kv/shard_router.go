@@ -134,7 +134,7 @@ func (s *ShardRouter) ResolveGroup(rawKey []byte) (uint64, bool) {
 			return 0, false
 		}
 	}
-	if route, ok := s.stagedVisibilityRouteForS3BucketAuxiliaryKey(rawKey); ok {
+	if route, ok := s.s3BucketAuxiliaryOwnerRouteForKey(rawKey); ok {
 		return route.GroupID, true
 	}
 	// Engine routes against the user-key view of the byte-range
@@ -148,7 +148,7 @@ func (s *ShardRouter) ResolveGroup(rawKey []byte) (uint64, bool) {
 	return route.GroupID, true
 }
 
-func (s *ShardRouter) stagedVisibilityRouteForS3BucketAuxiliaryKey(rawKey []byte) (distribution.Route, bool) {
+func (s *ShardRouter) s3BucketAuxiliaryOwnerRouteForKey(rawKey []byte) (distribution.Route, bool) {
 	if s == nil || s.engine == nil {
 		return distribution.Route{}, false
 	}
@@ -156,12 +156,7 @@ func (s *ShardRouter) stagedVisibilityRouteForS3BucketAuxiliaryKey(rawKey []byte
 	if !ok {
 		return distribution.Route{}, false
 	}
-	for _, route := range s.engine.GetIntersectingRoutes(start, end) {
-		if routeHasStagedVisibility(route) {
-			return route, true
-		}
-	}
-	return distribution.Route{}, false
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, s.engine.GetIntersectingRoutes(start, end))
 }
 
 // Register associates a raft group ID with its transactional manager and store.

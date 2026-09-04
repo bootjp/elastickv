@@ -71,6 +71,7 @@ var (
 	ErrEngineSnapshotDuplicateID  = errors.New("engine snapshot has duplicate route id")
 	ErrEngineSnapshotRouteOverlap = errors.New("engine snapshot has overlapping routes")
 	ErrEngineSnapshotRouteOrder   = errors.New("engine snapshot has invalid route order")
+	ErrEngineDeltaVersionGap      = errors.New("engine catalog delta version is not contiguous")
 )
 
 // NewEngine creates an Engine with no hotspot splitting.
@@ -135,6 +136,95 @@ func (e *Engine) ApplySnapshot(snapshot CatalogSnapshot) error {
 	e.catalogVersion = snapshot.Version
 	e.recordHistorySnapshotLocked()
 	return nil
+}
+
+// ApplyDelta atomically publishes one contiguous catalog transition. Readers
+// observe either the complete previous route table or the complete next table.
+func (e *Engine) ApplyDelta(delta CatalogDelta) error {
+	if err := validateCatalogDelta(delta); err != nil {
+		return err
+	}
+
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	apply, err := validateEngineDeltaVersion(delta, e.catalogVersion)
+	if err != nil {
+		return err
+	}
+	if !apply {
+		return nil
+	}
+	next, err := routesAfterCatalogDelta(e.routes, delta)
+	if err != nil {
+		return err
+	}
+	e.routes = next
+	e.catalogVersion = delta.Version
+	e.recordHistorySnapshotLocked()
+	return nil
+}
+
+func validateEngineDeltaVersion(delta CatalogDelta, currentVersion uint64) (bool, error) {
+	if delta.Version < currentVersion {
+		return false, staleSnapshotVersionErr(delta.Version, currentVersion)
+	}
+	if delta.Version == currentVersion {
+		return false, nil
+	}
+	if delta.PreviousVersion != currentVersion {
+		return false, errors.Wrapf(
+			ErrEngineDeltaVersionGap,
+			"delta %d follows %d, engine is at %d",
+			delta.Version,
+			delta.PreviousVersion,
+			currentVersion,
+		)
+	}
+	return true, nil
+}
+
+func routesAfterCatalogDelta(current []Route, delta CatalogDelta) ([]Route, error) {
+	byID := make(map[uint64]Route, len(current)+len(delta.Mutations))
+	for _, route := range current {
+		if delta.PreviousVersion == 0 && route.RouteID == 0 {
+			continue
+		}
+		byID[route.RouteID] = route
+	}
+	for _, mutation := range delta.Mutations {
+		switch mutation.Op {
+		case CatalogMutationDelete:
+			delete(byID, mutation.RouteID)
+		case CatalogMutationUpsert:
+			load := uint64(0)
+			if current, ok := byID[mutation.RouteID]; ok {
+				load = current.Load
+			}
+			byID[mutation.RouteID] = Route{
+				RouteID:                mutation.Route.RouteID,
+				Start:                  CloneBytes(mutation.Route.Start),
+				End:                    CloneBytes(mutation.Route.End),
+				GroupID:                mutation.Route.GroupID,
+				State:                  mutation.Route.State,
+				StagedVisibilityActive: mutation.Route.StagedVisibilityActive,
+				MigrationJobID:         mutation.Route.MigrationJobID,
+				MinWriteTSExclusive:    mutation.Route.MinWriteTSExclusive,
+				Load:                   load,
+			}
+		}
+	}
+
+	next := make([]Route, 0, len(byID))
+	for _, route := range byID {
+		next = append(next, route)
+	}
+	sort.Slice(next, func(i, j int) bool {
+		return bytes.Compare(next[i].Start, next[j].Start) < 0
+	})
+	if err := validateRouteOrder(next); err != nil {
+		return nil, err
+	}
+	return next, nil
 }
 
 // RouteHistorySnapshot is a point-in-time view of the route catalog at
@@ -376,6 +466,71 @@ func (e *Engine) GetRouteWithVersion(key []byte) (Route, uint64, bool) {
 	return route, e.catalogVersion, true
 }
 
+// RouteQuery is one lookup for ResolveRoutesWithVersion. Exact resolves the
+// single route containing Start; otherwise every route intersecting
+// [Start, End) is returned.
+type RouteQuery struct {
+	Start []byte
+	End   []byte
+	Exact bool
+}
+
+// ResolveRoutesWithVersion answers every query from a single locked catalog
+// snapshot and returns the one version that produced all of them. Callers that
+// need more than one route candidate must use this instead of repeating
+// GetRouteWithVersion / GetIntersectingRoutesWithVersion: separate calls can
+// straddle a catalog update and pair a stale route with a newer version, which
+// turns that version into a fence the route actually read was never checked
+// against.
+func (e *Engine) ResolveRoutesWithVersion(queries ...RouteQuery) ([][]Route, uint64) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([][]Route, len(queries))
+	for i, q := range queries {
+		if q.Exact {
+			out[i] = e.exactRouteLocked(q.Start)
+			continue
+		}
+		out[i] = e.intersectingRoutesLocked(q.Start, q.End)
+	}
+	return out, e.catalogVersion
+}
+
+func (e *Engine) exactRouteLocked(key []byte) []Route {
+	idx := e.routeIndex(key)
+	if idx < 0 {
+		return nil
+	}
+	route := e.routes[idx]
+	route.Start = CloneBytes(route.Start)
+	route.End = CloneBytes(route.End)
+	return []Route{route}
+}
+
+// AppliedCatalogSnapshot returns the routes the engine is currently serving,
+// paired with the catalog version they were applied at. It is the engine's own
+// view rather than the persisted catalog's, which is what a caller mid-catch-up
+// needs: the store may already be several delta batches ahead.
+//
+// ReadTS is left zero because these routes come from applied deltas, not from a
+// point-in-time catalog read.
+func (e *Engine) AppliedCatalogSnapshot() CatalogSnapshot {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	routes := make([]RouteDescriptor, 0, len(e.routes))
+	for i := range e.routes {
+		r := &e.routes[i]
+		routes = append(routes, RouteDescriptor{
+			RouteID: r.RouteID,
+			Start:   CloneBytes(r.Start),
+			End:     CloneBytes(r.End),
+			GroupID: r.GroupID,
+			State:   r.State,
+		})
+	}
+	return CatalogSnapshot{Version: e.catalogVersion, Routes: routes}
+}
+
 // NextTimestamp returns a monotonic increasing timestamp.
 func (e *Engine) NextTimestamp() uint64 {
 	return e.ts.Add(1)
@@ -406,7 +561,10 @@ func (e *Engine) GetIntersectingRoutes(start, end []byte) []Route {
 func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, uint64) {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
+	return e.intersectingRoutesLocked(start, end), e.catalogVersion
+}
 
+func (e *Engine) intersectingRoutesLocked(start, end []byte) []Route {
 	var result []Route
 	for i := range e.routes {
 		r := &e.routes[i]
@@ -422,7 +580,7 @@ func (e *Engine) GetIntersectingRoutesWithVersion(start, end []byte) ([]Route, u
 		// Route intersects with scan range
 		result = append(result, cloneRoute(*r))
 	}
-	return result, e.catalogVersion
+	return result
 }
 
 func cloneRoute(r Route) Route {
@@ -495,6 +653,13 @@ func routesFromCatalog(routes []RouteDescriptor) ([]Route, error) {
 		return nil, err
 	}
 	return out, nil
+}
+
+// RoutesFromCatalogSnapshot validates and materializes the immutable route
+// view contained in a durable catalog snapshot. Callers that need ownership
+// as of an MVCC timestamp must use this view instead of the live Engine.
+func RoutesFromCatalogSnapshot(snapshot CatalogSnapshot) ([]Route, error) {
+	return routesFromCatalog(snapshot.Routes)
 }
 
 func validateRouteOrder(routes []Route) error {

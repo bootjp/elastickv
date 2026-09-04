@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -53,6 +54,12 @@ const (
 	MigrationFamilyS3Blob
 	MigrationFamilyS3GCUpload
 	MigrationFamilyLegacyListMetaDelta
+	MigrationFamilyS3ChunkRef
+	// MigrationFamilyFilesystemChunk is appended last on purpose: the values
+	// above are the migration wire contract, so inserting anywhere earlier
+	// would renumber families that peers already use.
+	MigrationFamilyFilesystemChunk
+	MigrationFamilyFilesystemUsage
 )
 
 const (
@@ -62,15 +69,19 @@ const (
 	migrationTxnSuccessPrefix  = "!txn|ok|"
 	migrationTxnMetaPrefix     = "!txn|meta|"
 	migrationTxnLockPrefix     = "!txn|lock|"
-	migrationRedisPrefix       = "!redis|"
-	migrationHashPrefix        = "!hs|"
-	migrationSetPrefix         = "!st|"
-	migrationZSetPrefix        = "!zs|"
-	migrationDynamoMetaPrefix  = "!ddb|meta|table|"
-	migrationDynamoGenPrefix   = "!ddb|meta|gen|"
-	migrationDynamoItemPrefix  = "!ddb|item|"
-	migrationDynamoGSIPrefix   = "!ddb|gsi|"
-	migrationStagedDataPrefix  = "!dist|migstage|"
+	// Keep this literal in sync with kv.backupTimestampFloorKey. distribution
+	// cannot import kv without a cycle, and only this exact control key is
+	// reserved; user keys under !txn|backup| remain migratable.
+	migrationTxnBackupTimestampFloorKey = "!txn|backup|timestamp_floor"
+	migrationRedisPrefix                = "!redis|"
+	migrationHashPrefix                 = "!hs|"
+	migrationSetPrefix                  = "!st|"
+	migrationZSetPrefix                 = "!zs|"
+	migrationDynamoMetaPrefix           = "!ddb|meta|table|"
+	migrationDynamoGenPrefix            = "!ddb|meta|gen|"
+	migrationDynamoItemPrefix           = "!ddb|item|"
+	migrationDynamoGSIPrefix            = "!ddb|gsi|"
+	migrationStagedDataPrefix           = "!dist|migstage|"
 )
 
 const (
@@ -94,6 +105,70 @@ var (
 	ErrMigrationDataMoveRequired   = errors.New("migration data move is not implemented")
 	ErrMigrationSourceRouteChanged = errors.New("migration source route does not match split job")
 )
+
+// IsReservedControlKey reports whether key lives in a control namespace that no
+// user mutation may write.
+//
+// Staged migration data is included in the reserved set. It is populated by the
+// typed migration import/promote paths and by FSM-internal prefix-delete
+// expansion, not by externally supplied RawKV mutations.
+// migrationOnlyControlPrefixes are the control namespaces that no coordinator
+// dispatch ever writes: they are produced solely by the typed migration
+// commands (import, promote, fence). The rest of !dist| is excluded, because
+// the control plane commits route and job records through the transactional
+// coordinator -- SplitRange does exactly that.
+var migrationOnlyControlPrefixes = [][]byte{
+	[]byte(migrationStagedDataPrefix),
+	[]byte("!migwrite|"),
+	[]byte("!migfence|"),
+}
+
+// IsMigrationOnlyControlKey reports whether key belongs to a namespace that
+// only the typed migration commands may write. It is the transactional apply
+// path's reserved-key test: the raw path can refuse every control namespace
+// because nothing legitimate writes one as a raw mutation, but the catalog
+// reaches the store through a transaction, so the transactional test has to be
+// the narrower one. A staged-data row is the case that matters -- a client
+// write landing there is promoted as user data.
+func IsMigrationOnlyControlKey(key []byte) bool {
+	for _, prefix := range migrationOnlyControlPrefixes {
+		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func IsReservedControlKey(key []byte) bool {
+	return reservedControlPrefixIntersects(key, bytes.HasPrefix)
+}
+
+// ReservedControlPrefixIntersects reports whether a DEL_PREFIX over prefix is
+// aimed at a control namespace, either because the prefix sits inside one or
+// because it is a partial spelling of one.
+//
+// An empty prefix is exempt. That is the whole-keyspace flush, an operation the
+// caller asked for deliberately, and refusing it would break FLUSHDB. Keeping
+// control keys out of a flush needs the store's prefix-exclusion argument to
+// accept more than the one transaction prefix it takes today, which is a
+// separate change.
+func ReservedControlPrefixIntersects(prefix []byte) bool {
+	if len(prefix) == 0 {
+		return false
+	}
+	return reservedControlPrefixIntersects(prefix, func(a, b []byte) bool {
+		return bytes.HasPrefix(a, b) || bytes.HasPrefix(b, a)
+	})
+}
+
+func reservedControlPrefixIntersects(key []byte, match func(key, reserved []byte) bool) bool {
+	for _, reserved := range migrationReservedControlPrefixes {
+		if match(key, reserved) {
+			return true
+		}
+	}
+	return false
+}
 
 var migrationReservedControlPrefixes = [][]byte{
 	[]byte("!dist|"),
@@ -139,7 +214,30 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(s3keys.UploadMetaPrefix),
 	[]byte(s3keys.UploadPartPrefix),
 	[]byte(s3keys.BlobPrefix),
+	[]byte(s3keys.ChunkRefPrefix),
 	[]byte(s3keys.GCUploadPrefix),
+	// Every family bracket's prefix belongs here so the user bracket does not
+	// also export those rows. A filesystem-chunk route interval can span both
+	// the raw !fs|chk| key and its normalized !fs|route|chk| route, and both
+	// route filters accept the row, so omitting this exported every chunk
+	// version twice under two bracket IDs.
+	// Chunk blob payloads are peer-local: they are written straight to the
+	// receiving node's Pebble instead of through Raft, and peers pull them by
+	// digest over S3BlobFetch when they apply the matching chunkref. They are
+	// also content-addressed, so one row backs every object whose chunk hashes
+	// the same -- including objects whose route keys are not moving. Exporting
+	// them under the user bracket would both forge a Raft-replicated copy of
+	// state that is deliberately off the log and let the source cleanup drop
+	// blobs unmigrated objects still dereference. They are excluded here with
+	// no family bracket of their own: the blob transport, not the migrator,
+	// puts them on the target's nodes.
+	[]byte(s3keys.ChunkBlobPrefix),
+	fskeys.ChunkAllPrefix(),
+	fskeys.UsageRouteAllPrefix(),
+}
+
+var migrationInternalExactKeys = [][]byte{
+	[]byte(migrationTxnBackupTimestampFloorKey),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -417,9 +515,11 @@ func MigrationKnownInternalPrefixes() [][]byte {
 }
 
 // IsMigrationKnownInternalKey reports whether a raw key belongs to a concrete
-// internal family owned by an explicit export bracket or by the txn-lock drain.
+// internal family owned by an explicit export bracket, by the txn-lock drain,
+// or by a peer-local store that the migrator must not export at all.
 func IsMigrationKnownInternalKey(key []byte) bool {
-	return hasAnyPrefix(key, migrationInternalFamilyPrefixes)
+	return hasAnyPrefix(key, migrationInternalFamilyPrefixes) ||
+		hasAnyExactKey(key, migrationInternalExactKeys)
 }
 
 // ValidateMigrationRouteRange rejects route intervals that intersect reserved
@@ -484,7 +584,24 @@ func migrationFamilyBrackets() []MigrationBracket {
 		{family: MigrationFamilyS3UploadMeta, prefix: s3keys.UploadMetaPrefix},
 		{family: MigrationFamilyS3UploadPart, prefix: s3keys.UploadPartPrefix},
 		{family: MigrationFamilyS3Blob, prefix: s3keys.BlobPrefix},
+		{family: MigrationFamilyS3ChunkRef, prefix: s3keys.ChunkRefPrefix},
 		{family: MigrationFamilyS3GCUpload, prefix: s3keys.GCUploadPrefix},
+		// File chunk payloads live under !fs|chk| but route through a virtual
+		// !fs|route|chk| key via fskeys.ExtractRouteKey. "!fs|chk|" sorts below
+		// "!fs|route|chk|", so the user bracket's raw interval never reaches
+		// them and, without this bracket, a cross-group split completed and
+		// promoted while every chunk of the moved files stayed behind. The
+		// default route-key check in migrationBracketRouteCheck applies the
+		// logical route filter to the raw scan.
+		{family: MigrationFamilyFilesystemChunk, prefix: string(fskeys.ChunkAllPrefix())},
+		// Per-route usage counters are stored at !fs|usage|route|<encoded route>
+		// and normalize back to the embedded logical route key, so like chunks
+		// their raw key sits outside the user bracket's interval. Without this
+		// bracket the counter stayed on the source: after cutover the usage scan
+		// filtered that copy out because its logical owner had become the
+		// target, while target-side updates began from zero, so StatFS
+		// undercounted existing files and bytes.
+		{family: MigrationFamilyFilesystemUsage, prefix: string(fskeys.UsageRouteAllPrefix())},
 	}
 
 	out := make([]MigrationBracket, 0, len(defs))
@@ -568,6 +685,15 @@ func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
 func hasAnyPrefix(key []byte, prefixes [][]byte) bool {
 	for _, prefix := range prefixes {
 		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func hasAnyExactKey(key []byte, keys [][]byte) bool {
+	for _, exact := range keys {
+		if bytes.Equal(key, exact) {
 			return true
 		}
 	}

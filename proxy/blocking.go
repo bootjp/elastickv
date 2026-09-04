@@ -23,6 +23,11 @@ const (
 )
 
 const (
+	elasticKVZRemFastCommand = "ELASTICKV.ZREMFAST"
+	zremReplayCommand        = "ZREM"
+)
+
+const (
 	blockingListSideLeft  = "LEFT"
 	blockingListSideRight = "RIGHT"
 )
@@ -51,6 +56,14 @@ return removed
 
 type blockingTimeoutBackend interface {
 	DoWithTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd
+}
+
+type readTimeoutBackend interface {
+	DoWithReadTimeout(ctx context.Context, timeout time.Duration, args ...any) *redis.Cmd
+}
+
+type pipelineReadTimeoutBackend interface {
+	PipelineWithReadTimeout(ctx context.Context, timeout time.Duration, cmds [][]any) ([]*redis.Cmd, error)
 }
 
 func blockingCommandTimeout(cmd string, args [][]byte) time.Duration {
@@ -91,7 +104,14 @@ func parseBlockingMillisecondsArg(raw []byte) time.Duration {
 	return time.Duration(millis) * time.Millisecond
 }
 
-func blockingReplayCommand(cmd string, args [][]byte, resp any) (string, []any, bool) {
+func shouldReplayBlockingToSecondary(cmd string, resp any) bool {
+	if !blockingResponseHasEffect(resp) {
+		return false
+	}
+	return !strings.EqualFold(cmd, "XREAD")
+}
+
+func secondaryBlockingReplay(cmd string, args [][]byte, resp any, secondary Backend) (string, []any, bool) {
 	switch strings.ToUpper(cmd) {
 	case "BLPOP":
 		return blockingListPopReplay(1, resp)
@@ -104,10 +124,61 @@ func blockingReplayCommand(cmd string, args [][]byte, resp any) (string, []any, 
 	case "BLMPOP":
 		return blockingBLMPopReplay(args, resp)
 	case "BZPOPMIN", "BZPOPMAX":
-		return blockingZSetPopReplay(resp)
+		key, member, ok := zsetPopKeyMember(resp)
+		if !ok {
+			return "", nil, false
+		}
+		replayCmd := zremReplayCommandForSecondary(secondary)
+		return replayCmd, []any{replayCmd, key, member}, true
+	case cmdNameXREADGROUP:
+		return blockingXReadGroupReplay(args, resp)
 	default:
 		return "", nil, false
 	}
+}
+
+func translatedBlockingReplayUsesWriteQueue(cmd string) bool {
+	return strings.EqualFold(cmd, zremReplayCommand) || strings.EqualFold(cmd, elasticKVZRemFastCommand)
+}
+
+func zremReplayCommandForSecondary(secondary Backend) string {
+	if secondary != nil && strings.EqualFold(secondary.Name(), "elastickv") {
+		return elasticKVZRemFastCommand
+	}
+	return zremReplayCommand
+}
+
+func zsetPopKeyMember(resp any) (any, any, bool) {
+	arr, ok := resp.([]any)
+	if !ok || len(arr) < 2 || arr[0] == nil || arr[1] == nil {
+		return nil, nil, false
+	}
+	return arr[0], arr[1], true
+}
+
+func blockingXReadGroupReplay(args [][]byte, resp any) (string, []any, bool) {
+	if !xreadGroupResponseHasEntries(resp) {
+		return "", nil, false
+	}
+	return cmdNameXREADGROUP, bytesArgsToInterfaces(args), true
+}
+
+func xreadGroupResponseHasEntries(resp any) bool {
+	streams, ok := redisArray(resp)
+	if !ok {
+		return false
+	}
+	for _, stream := range streams {
+		parts, ok := redisArray(stream)
+		if !ok || len(parts) < 2 {
+			continue
+		}
+		entries, ok := redisArray(parts[1])
+		if ok && len(entries) > 0 {
+			return true
+		}
+	}
+	return false
 }
 
 func blockingListPopReplay(count int64, resp any) (string, []any, bool) {
@@ -121,19 +192,6 @@ func blockingListPopReplay(count int64, resp any) (string, []any, bool) {
 		return "", nil, false
 	}
 	return "LREM", []any{[]byte("LREM"), key, count, value}, true
-}
-
-func blockingZSetPopReplay(resp any) (string, []any, bool) {
-	parts, ok := redisArray(resp)
-	if !ok || len(parts) < blockingMultiPopMinArgs {
-		return "", nil, false
-	}
-	key, keyOK := redisArg(parts[0])
-	member, memberOK := redisArg(parts[1])
-	if !keyOK || !memberOK {
-		return "", nil, false
-	}
-	return "ZREM", []any{[]byte("ZREM"), key, member}, true
 }
 
 func blockingBLMoveReplay(args [][]byte, resp any) (string, []any, bool) {
@@ -293,4 +351,12 @@ func redisArg(v any) (any, bool) {
 	default:
 		return []byte(fmt.Sprint(x)), true
 	}
+}
+
+func blockingResponseHasEffect(resp any) bool {
+	if resp == nil {
+		return false
+	}
+	arr, ok := resp.([]any)
+	return !ok || len(arr) > 0
 }

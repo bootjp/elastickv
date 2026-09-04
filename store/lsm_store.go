@@ -55,23 +55,35 @@ const (
 
 	// maxPebbleEncodedKeySize is the limit for encoded Pebble on-disk keys,
 	// which are the user key concatenated with the 8-byte inverted timestamp.
-	// Using maxSnapshotKeySize+timestampSize (instead of just maxSnapshotKeySize)
-	// avoids rejecting keys that are valid at the user-key level but slightly
-	// exceed maxSnapshotKeySize once the timestamp suffix is appended.
-	maxPebbleEncodedKeySize = maxSnapshotKeySize + timestampSize
+	// Using maxSnapshotStoredKeySize+timestampSize avoids rejecting logical keys
+	// that fit maxSnapshotKeySize but gain a bounded internal envelope before the
+	// timestamp suffix is appended.
+	maxPebbleEncodedKeySize = maxSnapshotStoredKeySize + timestampSize
 
-	// defaultPebbleCacheBytes is the default Pebble block-cache capacity per
-	// store. Pebble's built-in EnsureDefaults() supplies only 8 MiB, which
-	// is far too small for our workloads: production observed a block-cache
-	// hit rate of 0.003% (1.8B misses vs 58k hits) because the working set
-	// evicted faster than it filled. 256 MiB is a conservative baseline per
-	// shard; operators can override via ELASTICKV_PEBBLE_CACHE_MB.
+	// defaultPebbleCacheBytes is the fallback process-wide Pebble block-cache
+	// capacity when the node's effective memory budget cannot be discovered.
+	// Pebble's built-in EnsureDefaults() supplies only 8 MiB, which is far too
+	// small for our workloads: production observed a block-cache hit rate of
+	// 0.003% (1.8B misses vs 58k hits) because the working set evicted faster
+	// than it filled. Operators can set ELASTICKV_PEBBLE_CACHE_MB to override
+	// the percentage-based default with an absolute capacity.
 	defaultPebbleCacheBytes int64 = 256 << 20
 
-	// pebbleCacheMBEnv is the env var operators use to override the per-store
-	// Pebble block-cache capacity. Units are MiB, integer only. Malformed or
-	// out-of-range values fall back to the default.
+	// pebbleCacheMBEnv is the env var operators use to override the
+	// process-wide Pebble block-cache capacity. Units are MiB, integer only.
+	// Malformed or out-of-range values fall through to percentage sizing.
 	pebbleCacheMBEnv = "ELASTICKV_PEBBLE_CACHE_MB"
+
+	// pebbleCachePercentEnv controls the percentage (1..90) of the node's
+	// hard memory capacity reserved for the shared cache when no absolute MiB
+	// override is set. Linux uses the smallest positive cgroup ancestor limit
+	// or physical-memory size; GOMEMLIMIT remains a Go heap soft limit.
+	pebbleCachePercentEnv = "ELASTICKV_PEBBLE_CACHE_PERCENT"
+
+	defaultPebbleCachePercent = 25
+	pebbleCachePercentMin     = 1
+	pebbleCachePercentMax     = 90
+	percentScale              = 100
 
 	// pebbleCacheMBMin / pebbleCacheMBMax define the accepted range for the
 	// env override. Values below the 8 MiB floor or above the 64 GiB ceiling
@@ -124,19 +136,24 @@ const (
 	conflictCheckLargeBatchThreshold     = 1024
 )
 
-// pebbleCacheBytes is the effective per-store Pebble block-cache capacity,
+// pebbleCacheBytes is the effective process-wide Pebble block-cache capacity,
 // resolved once at process start. Exposed as a package variable so tests can
-// swap it via setPebbleCacheBytesForTest; production code treats it as
+// swap it via setSmallPebbleCacheForTest; production code treats it as
 // read-only after init().
-//
-// TODO(perf/pebble): introduce a process-wide shared cache plumbed through
-// NewPebbleStore so all shards on a node share one LRU eviction pool rather
-// than each carrying an independent 256 MiB budget. That requires changing
-// NewPebbleStore's signature and is deferred to a follow-up PR.
 var pebbleCacheBytes = defaultPebbleCacheBytes
 
+var (
+	processPebbleCacheMu    sync.Mutex
+	processPebbleCache      *pebble.Cache
+	processPebbleCacheBytes int64
+)
+
 func init() {
-	pebbleCacheBytes = resolvePebbleCacheBytes(os.Getenv(pebbleCacheMBEnv))
+	pebbleCacheBytes = resolvePebbleCacheBytes(
+		os.Getenv(pebbleCacheMBEnv),
+		os.Getenv(pebbleCachePercentEnv),
+		effectiveMemoryBudgetBytes(),
+	)
 }
 
 // resolveFSMApplyWriteOpts parses an ELASTICKV_FSM_SYNC_MODE value and
@@ -156,26 +173,49 @@ func resolveFSMApplyWriteOpts(envVal string) (*pebble.WriteOptions, string) {
 	}
 }
 
-// resolvePebbleCacheBytes parses an ELASTICKV_PEBBLE_CACHE_MB value and
-// returns the resolved cache size in bytes. Empty, malformed, or
-// out-of-range values are rejected and fall back to the default rather
-// than being clamped to the nearest bound. "0" is below the 8 MiB floor
-// and therefore also falls back to the default.
-func resolvePebbleCacheBytes(envVal string) int64 {
-	if envVal == "" {
+// resolvePebbleCacheBytes resolves the process-wide cache capacity. A valid
+// absolute MiB override wins. Otherwise the configured percentage (25% by
+// default) is applied to the node's effective memory budget. Malformed or
+// out-of-range settings fall back to the percentage default, and an unknown
+// memory budget falls back to defaultPebbleCacheBytes.
+func resolvePebbleCacheBytes(mbEnvVal, percentEnvVal string, memoryBudgetBytes int64) int64 {
+	if absoluteBytes := resolvePebbleCacheAbsoluteBytes(mbEnvVal); absoluteBytes > 0 {
+		return absoluteBytes
+	}
+
+	if memoryBudgetBytes <= 0 {
 		return defaultPebbleCacheBytes
 	}
+
+	cacheBytes := memoryBudgetBytes / percentScale * int64(resolvePebbleCachePercent(percentEnvVal))
+	minimumBytes := int64(pebbleCacheMBMin) << mebibyteShift
+	if cacheBytes < minimumBytes {
+		return minimumBytes
+	}
+	return cacheBytes
+}
+
+func resolvePebbleCacheAbsoluteBytes(envVal string) int64 {
 	mb, err := strconv.Atoi(envVal)
-	if err != nil {
-		return defaultPebbleCacheBytes
-	}
-	if mb < pebbleCacheMBMin || mb > pebbleCacheMBMax {
-		return defaultPebbleCacheBytes
+	if envVal == "" || err != nil || mb < pebbleCacheMBMin || mb > pebbleCacheMBMax {
+		return 0
 	}
 	return int64(mb) << mebibyteShift
 }
 
+func resolvePebbleCachePercent(envVal string) int {
+	configured, err := strconv.Atoi(envVal)
+	if envVal == "" || err != nil || configured < pebbleCachePercentMin || configured > pebbleCachePercentMax {
+		return defaultPebbleCachePercent
+	}
+	return configured
+}
+
 var metaLastCommitTSBytes = []byte(metaLastCommitTS)
+
+var localAuxiliaryMVCCPrefixes = [][]byte{
+	[]byte("!s3|chunkblob|"),
+}
 var metaMinRetainedTSBytes = []byte(metaMinRetainedTS)
 var metaPendingMinRetainedTSBytes = []byte(metaPendingMinRetainedTS)
 var metaAppliedIndexBytes = []byte(metaAppliedIndex)
@@ -209,6 +249,12 @@ type pebbleStore struct {
 	applyMu                 sync.Mutex // serializes ApplyMutations: conflict check → commit
 	maintenanceMu           sync.Mutex
 	dir                     string
+	// sstIngestSnapshots enables the cluster-wide opt-in snapshot format
+	// implemented in snapshot_pebble_sst.go. Receivers always understand the
+	// format; senders keep the legacy stream by default for rolling-upgrade
+	// compatibility with older binaries.
+	sstIngestSnapshots       bool
+	sstIngestTargetFileBytes uint64
 	// writeConflicts tracks per-(kind, key_prefix) OCC conflict counts
 	// detected inside ApplyMutations. Polled by the monitoring
 	// WriteConflictCollector; not part of the authoritative OCC path.
@@ -244,6 +290,11 @@ type pebbleStore struct {
 	// fixtures depend on that posture and the 6D-6 production wiring
 	// in main.go is what flips the gate on.
 	storageEnvelopeActive StorageEnvelopeActive
+	// storageEnvelopeV2Active is the rolling-upgrade reader-capability
+	// gate for compressed V2 envelopes. Production keeps it false until
+	// every voter and learner advertises V2 support. A nil closure keeps
+	// the pre-gate embedded/test behavior.
+	storageEnvelopeV2Active StorageEnvelopeV2Active
 	// storageRegistered is the Stage 7a-2 §4.1 registration gate. When
 	// wired, the DIRECT write path (PutAt / ExpireAt / ApplyMutations)
 	// refuses to emit an encrypted envelope — returning
@@ -271,23 +322,30 @@ func WithPebbleLogger(l *slog.Logger) PebbleStoreOption {
 	}
 }
 
+// WithSSTIngestSnapshots controls whether Snapshot emits the SST-ingest
+// format. It is primarily useful for tests and embedded callers; production
+// resolves ELASTICKV_PEBBLE_SST_INGEST_SNAPSHOT at store construction time.
+func WithSSTIngestSnapshots(enabled bool) PebbleStoreOption {
+	return func(s *pebbleStore) {
+		s.sstIngestSnapshots = enabled
+	}
+}
+
 // defaultPebbleOptionsWithCache returns the standard Pebble options used
 // throughout the store (including restores) to ensure consistent behaviour
 // between a freshly opened and a restored/swapped-in database, along with
-// the owned *pebble.Cache handle.
+// the store-owned *pebble.Cache reference.
 //
 // FormatMajorVersion is pinned to ratchet v1-era DBs above pebble v2's
 // FormatMinSupported (FormatFlushableIngest) before the v2 upgrade lands.
 //
-// The returned options carry a freshly-allocated block cache sized from
-// pebbleCacheBytes. pebble.NewCache hands back a refcounted Cache with
-// ref=1; pebble.Open adds one reference, so the caller MUST Unref the
-// returned cache after the DB is closed (or after pebble.Open fails) to
-// fully release the memory. Callers that only need *pebble.Options should
-// still take the cache handle and defer its Unref to avoid leaking a
-// 256 MiB (default) allocation per call.
-func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
-	cache := pebble.NewCache(pebbleCacheBytes)
+// The returned options carry a process-wide shared block cache sized from
+// pebbleCacheBytes. The process holds one base reference; each call adds one
+// store/open reference and returns it to the caller. The caller MUST Unref the
+// returned cache after the DB is closed (or after pebble.Open fails), matching
+// the lifetime rules used by NewPebbleStore, Restore, and temp restore DBs.
+func defaultPebbleOptionsWithCache(disableCompression bool) (*pebble.Options, *pebble.Cache) {
+	cache := processPebbleCacheRef()
 	opts := &pebble.Options{
 		FS:                 vfs.Default,
 		FormatMajorVersion: pebble.FormatVirtualSSTables,
@@ -296,7 +354,31 @@ func defaultPebbleOptionsWithCache() (*pebble.Options, *pebble.Cache) {
 	// Enable automatic compactions and apply all other Pebble defaults.
 	// EnsureDefaults leaves Cache alone because we already set it.
 	opts.EnsureDefaults()
+	if disableCompression {
+		// Storage-envelope payloads are compressed before encryption. The
+		// resulting ciphertext is high entropy, so Pebble block compression
+		// only burns CPU and cannot recover additional space.
+		opts.ApplyCompressionSettings(func() pebble.DBCompressionSettings {
+			return pebble.DBCompressionNone
+		})
+	}
 	return opts, cache
+}
+
+func processPebbleCacheRef() *pebble.Cache {
+	processPebbleCacheMu.Lock()
+	defer processPebbleCacheMu.Unlock()
+
+	if processPebbleCache == nil || processPebbleCacheBytes != pebbleCacheBytes {
+		old := processPebbleCache
+		processPebbleCache = pebble.NewCache(pebbleCacheBytes)
+		processPebbleCacheBytes = pebbleCacheBytes
+		if old != nil {
+			old.Unref()
+		}
+	}
+	processPebbleCache.Ref()
+	return processPebbleCache
 }
 
 // NewPebbleStore creates a new Pebble-backed MVCC store.
@@ -307,15 +389,20 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		log: slog.New(slog.NewJSONHandler(os.Stdout, &slog.HandlerOptions{
 			Level: slog.LevelWarn,
 		})),
-		writeConflicts:        newWriteConflictCounter(),
-		fsmApplyWriteOpts:     fsmOpts,
-		fsmApplySyncModeLabel: fsmLabel,
+		writeConflicts:           newWriteConflictCounter(),
+		fsmApplyWriteOpts:        fsmOpts,
+		fsmApplySyncModeLabel:    fsmLabel,
+		sstIngestSnapshots:       resolveSSTIngestSnapshots(os.Getenv(sstIngestSnapshotEnv)),
+		sstIngestTargetFileBytes: defaultSSTIngestTargetFileSize,
 	}
 	for _, opt := range opts {
 		opt(s)
 	}
+	if err := cleanupPebbleSnapshotArtifacts(dir); err != nil {
+		return nil, err
+	}
 
-	pebbleOpts, cache := defaultPebbleOptionsWithCache()
+	pebbleOpts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	db, err := pebble.Open(dir, pebbleOpts)
 	if err != nil {
 		cache.Unref()
@@ -324,11 +411,9 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 	s.db = db
 	s.cache = cache
 
-	// cleanupOnInitFail closes the just-opened DB and releases our creator
-	// reference on the cache so that a partially corrupt store (where the
-	// metadata scans below fail) does not leak the ~256 MiB cache
-	// allocation. Also nil's out the store pointers so a zero-valued
-	// pebbleStore does not linger with stale refs.
+	// cleanupOnInitFail closes the just-opened DB and releases this open's
+	// borrowed cache reference when a metadata scan fails. Also nil out the
+	// store pointers so a zero-valued pebbleStore does not retain stale refs.
 	cleanupOnInitFail := func() {
 		_ = db.Close()
 		cache.Unref()
@@ -364,6 +449,13 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
 	s.migrationReadinessCache = readinessStates
+	// A backup is only stale after the live directory has opened and its
+	// metadata has been read successfully. Before this point it is the recovery
+	// source for a process crash between the two restore renames.
+	if err := cleanupPebbleRestoreBackups(dir); err != nil {
+		cleanupOnInitFail()
+		return nil, err
+	}
 
 	return s, nil
 }
@@ -593,23 +685,39 @@ func writePebbleUint64(db *pebble.DB, key []byte, value uint64, opts *pebble.Wri
 	return errors.WithStack(db.Set(key, buf[:], opts))
 }
 
-// writeTempDBMetadata writes lastCommitTS and minRetainedTS atomically in a
-// single synced batch so that both values are either fully durable or fully
-// absent after a crash.  This is critical for restore paths that swap a
-// temporary Pebble directory into place: losing lastCommitTS could allow
-// future commits to reuse timestamps, violating monotonic ordering.
-func writeTempDBMetadata(db *pebble.DB, lastCommitTS, minRetainedTS uint64) error {
+// writeTempDBMetadata writes restore metadata atomically in a single synced
+// batch so every field is either fully durable or fully absent after a crash.
+// This is critical for restore paths that swap a temporary Pebble directory
+// into place: losing lastCommitTS could allow future commits to reuse
+// timestamps, violating monotonic ordering.
+func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error {
 	batch := db.NewBatch()
 	defer func() { _ = batch.Close() }()
 
 	var buf [timestampSize]byte
-	binary.LittleEndian.PutUint64(buf[:], lastCommitTS)
+	binary.LittleEndian.PutUint64(buf[:], meta.lastCommitTS)
 	if err := batch.Set(metaLastCommitTSBytes, buf[:], nil); err != nil {
 		return errors.WithStack(err)
 	}
-	binary.LittleEndian.PutUint64(buf[:], minRetainedTS)
+	binary.LittleEndian.PutUint64(buf[:], meta.minRetainedTS)
 	if err := batch.Set(metaMinRetainedTSBytes, buf[:], nil); err != nil {
 		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationAckMetaKeyBytes, encodeMigrationImportAcks(meta.migrationAcks), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationHLCFloorMetaKeyBytes, encodeMigrationHLCFloors(meta.migrationHLCFloors), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationPromoteMetaKeyBytes, encodeMigrationPromotionStates(meta.migrationPromotions), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	// Readiness states live one row per job rather than in a single meta key,
+	// so they are staged into the same batch instead of a separate write.
+	for _, state := range meta.migrationReadiness {
+		if err := batch.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), nil); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
 }
@@ -688,6 +796,9 @@ func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
 		if userKey == nil {
 			continue
 		}
+		if isLocalAuxiliaryMVCCKey(userKey) {
+			continue
+		}
 		if ts > maxTS {
 			maxTS = ts
 		}
@@ -696,6 +807,15 @@ func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
 		return 0, errors.WithStack(err)
 	}
 	return maxTS, nil
+}
+
+func isLocalAuxiliaryMVCCKey(userKey []byte) bool {
+	for _, prefix := range localAuxiliaryMVCCPrefixes {
+		if bytes.HasPrefix(userKey, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *pebbleStore) findMinRetainedTS() (uint64, error) {
@@ -1028,7 +1148,7 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
-		plain, err := s.decryptForKey(k, sv, sv.Value)
+		plain, flag, err := s.decryptAuthenticatedForKey(k, sv, sv.Value)
 		if err != nil {
 			return nil, err
 		}
@@ -1038,7 +1158,7 @@ func (s *pebbleStore) readVisibleVersion(iter *pebble.Iterator, key []byte, ts u
 		if sv.ExpireAt != 0 && sv.ExpireAt <= ts {
 			return nil, ErrKeyNotFound
 		}
-		return plain, nil
+		return finishAuthenticatedValue(plain, flag)
 	}
 	return nil, ErrKeyNotFound
 }
@@ -1047,6 +1167,36 @@ func (s *pebbleStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte,
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	return s.getAt(ctx, key, ts)
+}
+
+func (s *pebbleStore) VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := ctx.Err(); err != nil {
+		return false, errors.WithStack(err)
+	}
+	if readTSCompacted(ts, s.effectiveMinRetainedTS()) {
+		return false, ErrReadTSCompacted
+	}
+
+	seekKey := encodeKey(key, ts)
+	iter, err := s.db.NewIter(&pebble.IterOptions{
+		LowerBound: seekKey,
+		UpperBound: keyUpperBound(key),
+	})
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	defer iter.Close()
+
+	if !iter.SeekGE(seekKey) {
+		if err := iter.Error(); err != nil {
+			return false, errors.WithStack(err)
+		}
+		return false, nil
+	}
+	userKey, _ := decodeKeyView(iter.Key())
+	return bytes.Equal(userKey, key), nil
 }
 
 func (s *pebbleStore) GetAtBatch(ctx context.Context, keys [][]byte, ts uint64) (map[string][]byte, error) {
@@ -1194,15 +1344,20 @@ func (s *pebbleStore) processFoundValue(iter *pebble.Iterator, userKey []byte, t
 	// per-value AAD authenticates the header bits we are about to
 	// branch on. See readVisibleVersion for the matching rationale:
 	// a flipped tombstone or lowered expireAt would otherwise force
-	// a silent skip on an encrypted entry.
-	plain, err := s.decryptForKey(iter.Key(), sv, sv.Value)
+	// a silent skip on an encrypted entry. Decompression is deferred
+	// past the checks so a skipped version never pays the expansion.
+	plain, flag, err := s.decryptAuthenticatedForKey(iter.Key(), sv, sv.Value)
 	if err != nil {
 		return nil, err
 	}
 	if !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts) {
+		value, finishErr := finishAuthenticatedValue(plain, flag)
+		if finishErr != nil {
+			return nil, finishErr
+		}
 		return &KVPair{
 			Key:   userKey,
-			Value: plain,
+			Value: value,
 		}, nil
 	}
 	return nil, nil
@@ -1219,7 +1374,7 @@ func (s *pebbleStore) foundValueVisible(iter *pebble.Iterator, ts uint64) (bool,
 	// This intentionally also runs for cleartext-labelled rows so the
 	// cleartext rebadge guard rejects encrypted envelopes whose encState bit
 	// was flipped before we branch on tombstone or expireAt.
-	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+	if err := s.authenticateForKey(iter.Key(), sv, sv.Value); err != nil {
 		return false, err
 	}
 	return !sv.Tombstone && (sv.ExpireAt == 0 || sv.ExpireAt > ts), nil
@@ -2181,7 +2336,14 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	// registration commits.
 	// appliedIndex=0: direct path has no raft index; the leaf treats 0 as
 	// "do not write metaAppliedIndex" so the meta key stays unchanged.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, true)
+}
+
+// ApplyMutationsPreservingLastCommitTS is a direct, durable write path for
+// local auxiliary MVCC keys that must not advance the store-wide safe snapshot
+// watermark. It still uses pebble.Sync and the direct writer-registration gate.
+func (s *pebbleStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, false)
 }
 
 // ApplyMutationsRaft is the raft-apply commit path. Durability is governed
@@ -2210,7 +2372,7 @@ func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPai
 	// land here; their LastAppliedIndex() will stay behind the snapshot
 	// pointer and the skip optimisation will fall back to full restore
 	// for them. Preferred path is ApplyMutationsRaftAt.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0, true)
 }
 
 // ApplyMutationsRaftAt is ApplyMutationsRaft with the raft entry
@@ -2222,7 +2384,7 @@ func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPai
 // Production callers (kvFSM.applyXxx with f.pendingApplyIdx) SHOULD
 // pass the entry.Index value the engine delivered via SetApplyIndex.
 func (s *pebbleStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex, true)
 }
 
 func (s *pebbleStore) raftApplyAlreadyLandedLocked(mutations []*KVPairMutation, commitTS uint64) (bool, error) {
@@ -2315,8 +2477,8 @@ func (s *pebbleStore) hasCommitsAfter(startTS uint64) bool {
 	return s.lastCommitTS > startTS
 }
 
-func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
-	if !s.hasCommitsAfter(startTS) {
+func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64, force bool) error {
+	if !force && !s.hasCommitsAfter(startTS) {
 		return nil
 	}
 	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
@@ -2325,7 +2487,7 @@ func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPa
 	return s.checkReadConflicts(ctx, readKeys, startTS)
 }
 
-func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64) error {
+func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64, advanceLastCommitTS bool) error {
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
@@ -2348,12 +2510,41 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	// Keep OCC at the store boundary: callers pass the read snapshot via
 	// startTS/readKeys, and leader-issued commit timestamps alone do not prove
 	// the read set is still current.
-	if err := s.checkApplyConflicts(ctx, mutations, readKeys, startTS); err != nil {
+	if err := s.checkApplyConflicts(ctx, mutations, readKeys, startTS, !advanceLastCommitTS); err != nil {
 		return err
 	}
 
 	if err := s.applyMutationsBatch(b, mutations, commitTS, gateRegistration); err != nil {
 		return err
+	}
+
+	newLastTS, unlockLastCommitTS, err := s.stageLastCommitTSInBatch(b, commitTS, advanceLastCommitTS)
+	if err != nil {
+		return err
+	}
+	defer unlockLastCommitTS()
+	// Bundle metaAppliedIndex in the same batch as the data + commitTS
+	// meta key so a crash either commits all three atomically or none.
+	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
+	// or ApplyMutationsRaft); they leave the key unchanged.
+	if appliedIndex > 0 {
+		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
+			return err
+		}
+	}
+	if err := b.Commit(writeOpts); err != nil {
+		return errors.WithStack(err)
+	}
+	if advanceLastCommitTS {
+		s.updateLastCommitTS(newLastTS)
+	}
+
+	return nil
+}
+
+func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, func(), error) {
+	if !advance {
+		return 0, func() {}, nil
 	}
 
 	// Hold mtx across read → batch-set → commit → in-memory update so that a
@@ -2367,26 +2558,9 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	}
 	if err := setPebbleUint64InBatch(b, metaLastCommitTSBytes, newLastTS); err != nil {
 		s.mtx.Unlock()
-		return err
+		return 0, nil, err
 	}
-	// Bundle metaAppliedIndex in the same batch as the data + commitTS
-	// meta key so a crash either commits all three atomically or none.
-	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
-	// or ApplyMutationsRaft); they leave the key unchanged.
-	if appliedIndex > 0 {
-		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
-			s.mtx.Unlock()
-			return err
-		}
-	}
-	if err := b.Commit(writeOpts); err != nil {
-		s.mtx.Unlock()
-		return errors.WithStack(err)
-	}
-	s.updateLastCommitTS(newLastTS)
-	s.mtx.Unlock()
-
-	return nil
+	return newLastTS, s.mtx.Unlock, nil
 }
 
 // DeletePrefixAt atomically deletes all visible keys matching prefix by writing
@@ -2399,7 +2573,7 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 // ELASTICKV_FSM_SYNC_MODE=nosync. Raft-apply callers must use
 // DeletePrefixAtRaft instead.
 func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.directApplyWriteOpts(), 0)
+	return s.deletePrefixesAtWithOpts(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, s.directApplyWriteOpts(), 0)
 }
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt. Durability
@@ -2410,7 +2584,7 @@ func (s *pebbleStore) DeletePrefixAt(ctx context.Context, prefix []byte, exclude
 // DeletePrefixAtRaftAt to bundle metaAppliedIndex atomically — see
 // PR #910 design §2 "why both leaves".
 func (s *pebbleStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), 0)
+	return s.deletePrefixesAtWithOpts(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, s.raftApplyWriteOpts(), 0)
 }
 
 // DeletePrefixAtRaftAt is DeletePrefixAtRaft with the raft entry
@@ -2421,24 +2595,25 @@ func (s *pebbleStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, exc
 // LastAppliedIndex behind the true applied count for any workload
 // that uses DEL_PREFIX. PR #910 design §2.
 func (s *pebbleStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
-	return s.deletePrefixAtWithOpts(ctx, prefix, excludePrefix, commitTS, s.raftApplyWriteOpts(), appliedIndex)
+	return s.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, appliedIndex)
 }
 
-func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, excludePrefix []byte, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
+func (s *pebbleStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []PrefixDelete, commitTS, appliedIndex uint64) error {
+	return s.deletePrefixesAtWithOpts(ctx, deletes, commitTS, s.raftApplyWriteOpts(), appliedIndex)
+}
+
+func (s *pebbleStore) deletePrefixesAtWithOpts(_ context.Context, deletes []PrefixDelete, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 
-	var lowerBound []byte
-	if len(prefix) > 0 {
-		lowerBound = encodeKey(prefix, math.MaxUint64)
-	}
-
-	iter, err := s.db.NewIter(&pebble.IterOptions{
-		LowerBound: lowerBound,
-	})
+	iter, err := s.newDeletePrefixesIterator(deletes)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -2447,10 +2622,34 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 	batch := s.db.NewBatch()
 	defer batch.Close()
 
-	if err := s.scanDeletePrefix(iter, batch, prefix, excludePrefix, commitTS); err != nil {
+	if err := s.stageDeletePrefixes(iter, batch, deletes, commitTS); err != nil {
 		return err
 	}
+	return s.commitDeletePrefixesBatch(batch, commitTS, writeOpts, appliedIndex)
+}
 
+func (s *pebbleStore) newDeletePrefixesIterator(deletes []PrefixDelete) (*pebble.Iterator, error) {
+	var lowerBound []byte
+	if len(deletes) == 1 && len(deletes[0].Prefix) > 0 {
+		lowerBound = encodeKey(deletes[0].Prefix, math.MaxUint64)
+	}
+	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lowerBound})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	return iter, nil
+}
+
+func (s *pebbleStore) stageDeletePrefixes(iter *pebble.Iterator, batch *pebble.Batch, deletes []PrefixDelete, commitTS uint64) error {
+	for _, del := range deletes {
+		if err := s.scanDeletePrefix(iter, batch, del.Prefix, del.ExcludePrefix, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *pebbleStore) commitDeletePrefixesBatch(batch *pebble.Batch, commitTS uint64, writeOpts *pebble.WriteOptions, appliedIndex uint64) error {
 	// Persist lastCommitTS update atomically with the tombstones.
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -2475,7 +2674,6 @@ func (s *pebbleStore) deletePrefixAtWithOpts(_ context.Context, prefix []byte, e
 		return errors.WithStack(err)
 	}
 	s.updateLastCommitTS(newLastTS)
-
 	return nil
 }
 
@@ -2562,12 +2760,12 @@ func (s *pebbleStore) isVisibleLiveKey(iter *pebble.Iterator, userKey []byte, ve
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	// decryptForKey authenticates the value-header bytes when the
+	// authenticateForKey authenticates the value-header bytes when the
 	// entry is encrypted (cleartext entries no-op except for the
 	// rebadge guard). We discard the plaintext — we only need the
 	// authentication side-effect; tombstone / expireAt visibility
 	// is then decided on now-trusted bytes.
-	if _, err := s.decryptForKey(iter.Key(), sv, sv.Value); err != nil {
+	if err := s.authenticateForKey(iter.Key(), sv, sv.Value); err != nil {
 		return false, err
 	}
 	if sv.Tombstone || (sv.ExpireAt != 0 && sv.ExpireAt <= commitTS) {
@@ -2824,6 +3022,9 @@ func (s *pebbleStore) Compact(ctx context.Context, minTS uint64) error {
 }
 
 func (s *pebbleStore) Snapshot() (Snapshot, error) {
+	if s.sstIngestSnapshots {
+		return s.newSSTIngestSnapshot()
+	}
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	snap := s.db.NewSnapshot()
@@ -3019,6 +3220,8 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 		// Native Pebble format: restorePebbleNativeAtomic performs a temp-dir
 		// swap so the existing DB is preserved if the restore fails midway.
 		return s.restorePebbleNativeAtomic(br)
+	case bytes.Equal(header, pebbleSSTIngestSnapshotMagic[:]):
+		return s.restorePebbleSSTIngestAtomic(br)
 	case bytes.Equal(header, mvccSnapshotMagic[:]):
 		// Streaming MVCC format: restoreFromStreamingMVCC performs an atomic
 		// temp-dir swap, so the existing DB is preserved until checksum
@@ -3072,7 +3275,7 @@ func (s *pebbleStore) reopenFreshDB() error {
 	if err := os.MkdirAll(s.dir, dirPerms); err != nil {
 		return errors.WithStack(err)
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
 	db, err := pebble.Open(s.dir, opts)
 	if err != nil {
 		cache.Unref()
@@ -3143,7 +3346,7 @@ func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
 		return err
 	}
 
-	if err := writeNativeSnapshotToTempDir(r, tmpDir, ts); err != nil {
+	if err := writeNativeSnapshotToTempDir(r, tmpDir, ts, s.cipher != nil); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return err
 	}
@@ -3185,16 +3388,16 @@ func makeSiblingTempDir(dir, tag string) (string, error) {
 // writeNativeSnapshotToTempDir writes batch-loop entries from r into a fresh
 // Pebble database at tmpDir, persists ts as the lastCommitTS meta-key, then
 // closes the database.
-func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
-	opts, cache := defaultPebbleOptionsWithCache()
+func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64, disableCompression bool) error {
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	tmpDB, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()
 		return errors.WithStack(err)
 	}
 	// The tmpDB is discarded once swapInTempDB renames its directory over
-	// s.dir (which reopens with a fresh cache), so release our creator ref
-	// as soon as we're done writing to avoid leaking per-snapshot caches.
+	// s.dir, so release this temporary open's borrowed cache reference when
+	// the helper returns. The destination reopen borrows its own reference.
 	defer cache.Unref()
 
 	if err := restoreBatchLoopInto(r, tmpDB); err != nil {
@@ -3217,70 +3420,58 @@ func writeNativeSnapshotToTempDir(r io.Reader, tmpDir string, ts uint64) error {
 // Entries are written to a temporary Pebble directory and only swapped into
 // place after the CRC32 checksum is verified, preserving the existing store
 // on failure.
-func readStreamingMVCCRestoreHeader(
-	r io.Reader,
-) (io.Reader, hash.Hash32, uint32, uint64, uint64, []TargetStagedReadinessState, map[migrationAckID]migrationImportAck, map[uint64]uint64, error) {
-	expectedChecksum, version, err := readMVCCSnapshotHeader(r)
+type streamingMVCCRestoreMetadata struct {
+	lastCommitTS        uint64
+	minRetainedTS       uint64
+	migrationAcks       map[migrationAckID]migrationImportAck
+	migrationHLCFloors  map[uint64]uint64
+	migrationPromotions map[uint64]PromotionState
+	migrationReadiness  []TargetStagedReadinessState
+}
+
+func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, streamingMVCCRestoreMetadata, error) {
+	version, expectedChecksum, err := readMVCCSnapshotHeader(r)
 	if err != nil {
-		return nil, nil, 0, 0, 0, nil, nil, nil, err
+		return nil, nil, 0, streamingMVCCRestoreMetadata{}, err
 	}
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
-	lastCommitTS, minRetainedTS, err := readMVCCSnapshotMetadata(body)
+	lastCommitTS, minRetainedTS, snapshotMeta, err := readMVCCSnapshotMetadata(body, version)
 	if err != nil {
-		return nil, nil, 0, 0, 0, nil, nil, nil, err
+		return nil, nil, 0, streamingMVCCRestoreMetadata{}, err
 	}
-	readinessStates, err := readMVCCSnapshotReadinessStates(body, version)
-	if err != nil {
-		return nil, nil, 0, 0, 0, nil, nil, nil, err
+	meta := streamingMVCCRestoreMetadata{
+		lastCommitTS:        lastCommitTS,
+		minRetainedTS:       minRetainedTS,
+		migrationAcks:       snapshotMeta.acks,
+		migrationHLCFloors:  snapshotMeta.floors,
+		migrationPromotions: snapshotMeta.promotions,
+		migrationReadiness:  snapshotMeta.readiness,
 	}
-	bufferedBody := bufio.NewReader(body)
-	importAcks, hlcFloors, err := readMVCCSnapshotMigrationMetadata(bufferedBody, version)
-	if err != nil {
-		return nil, nil, 0, 0, 0, nil, nil, nil, err
-	}
-	return bufferedBody, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, importAcks, hlcFloors, nil
+	return body, hash, expectedChecksum, meta, nil
 }
 
-func writeStreamingMVCCRestoreTempDB(
-	dir string,
-	body io.Reader,
-	hash hash.Hash32,
-	expectedChecksum uint32,
-	lastCommitTS uint64,
-	minRetainedTS uint64,
-	readinessStates []TargetStagedReadinessState,
-	importAcks map[migrationAckID]migrationImportAck,
-	hlcFloors map[uint64]uint64,
-) (string, error) {
+func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash32, expectedChecksum uint32, meta streamingMVCCRestoreMetadata, disableCompression bool) (string, error) {
 	tmpDir := filepath.Clean(dir) + ".restore-tmp"
 	if err := os.RemoveAll(tmpDir); err != nil {
 		return "", errors.WithStack(err)
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
+	opts, cache := defaultPebbleOptionsWithCache(disableCompression)
 	tmpDB, err := pebble.Open(tmpDir, opts)
 	if err != nil {
 		cache.Unref()
 		return "", errors.WithStack(err)
 	}
 	// As in writeNativeSnapshotToTempDir, the tmpDB is discarded once the
-	// directory is renamed, so drop our creator ref when this helper
-	// returns. swapInTempDB reopens with a fresh cache.
+	// directory is renamed, so drop this temporary open's borrowed cache
+	// reference when the helper returns. swapInTempDB borrows its own ref.
 	defer cache.Unref()
 	cleanupTmp := func() {
 		_ = tmpDB.Close()
 		_ = os.RemoveAll(tmpDir)
 	}
 
-	if err := writePebbleTargetReadinessStates(tmpDB, readinessStates); err != nil {
-		cleanupTmp()
-		return "", err
-	}
-	if err := writePebbleMigrationImportMetadata(tmpDB, importAcks, hlcFloors); err != nil {
-		cleanupTmp()
-		return "", err
-	}
 	if err := writeMVCCEntriesToDB(body, tmpDB); err != nil {
 		cleanupTmp()
 		return "", err
@@ -3289,7 +3480,7 @@ func writeStreamingMVCCRestoreTempDB(
 		cleanupTmp()
 		return "", errors.WithStack(ErrInvalidChecksum)
 	}
-	if err := writeTempDBMetadata(tmpDB, lastCommitTS, minRetainedTS); err != nil {
+	if err := writeTempDBMetadata(tmpDB, meta); err != nil {
 		cleanupTmp()
 		return "", err
 	}
@@ -3300,50 +3491,13 @@ func writeStreamingMVCCRestoreTempDB(
 	return tmpDir, nil
 }
 
-func writePebbleTargetReadinessStates(db *pebble.DB, states []TargetStagedReadinessState) error {
-	for _, state := range states {
-		if err := db.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), pebble.NoSync); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	return nil
-}
-
-func writePebbleMigrationImportMetadata(
-	db *pebble.DB,
-	acks map[migrationAckID]migrationImportAck,
-	floors map[uint64]uint64,
-) error {
-	if len(acks) != 0 {
-		if err := db.Set(migrationAckMetaKeyBytes, encodeMigrationImportAcks(acks), pebble.NoSync); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	if len(floors) != 0 {
-		if err := db.Set(migrationHLCFloorMetaKeyBytes, encodeMigrationHLCFloors(floors), pebble.NoSync); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	return nil
-}
-
 func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
-	body, hash, expectedChecksum, lastCommitTS, minRetainedTS, readinessStates, importAcks, hlcFloors, err := readStreamingMVCCRestoreHeader(r)
+	body, hash, expectedChecksum, meta, err := readStreamingMVCCRestoreHeader(r)
 	if err != nil {
 		return err
 	}
 
-	tmpDir, err := writeStreamingMVCCRestoreTempDB(
-		s.dir,
-		body,
-		hash,
-		expectedChecksum,
-		lastCommitTS,
-		minRetainedTS,
-		readinessStates,
-		importAcks,
-		hlcFloors,
-	)
+	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, meta, s.cipher != nil)
 	if err != nil {
 		return err
 	}
@@ -3378,68 +3532,106 @@ func writeMVCCEntriesToDB(body io.Reader, db *pebble.DB) error {
 	return commitSnapshotBatch(batch, pebble.Sync)
 }
 
-// swapInTempDB closes the current DB, removes its directory, and renames tmpDir
-// to s.dir, then reopens the DB. The caller is responsible for closing tmpDB
-// before calling this.
+// swapInTempDB closes the current DB and atomically exchanges its directory
+// with tmpDir. The old directory remains as a same-filesystem rollback point
+// until the replacement has opened and its metadata has been verified.
 func (s *pebbleStore) swapInTempDB(tmpDir string) error {
+	return s.swapInTempDBWithMetadata(tmpDir, nil)
+}
+
+func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSnapshotMetadata) error {
+	backupDir, err := makeSiblingTempDir(s.dir, "restore-backup")
+	if err != nil {
+		_ = os.RemoveAll(tmpDir)
+		return err
+	}
 	if err := s.db.Close(); err != nil {
 		_ = os.RemoveAll(tmpDir)
+		_ = os.RemoveAll(backupDir)
 		return errors.WithStack(err)
 	}
 	if s.cache != nil {
 		s.cache.Unref()
 		s.cache = nil
 	}
-	if err := os.RemoveAll(s.dir); err != nil {
+	s.db = nil
+	if err := os.Rename(s.dir, backupDir); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
+		_ = os.RemoveAll(backupDir)
+		return errors.Join(errors.WithStack(err), s.reopenStoreDB(s.dir))
 	}
 	if err := os.Rename(tmpDir, s.dir); err != nil {
 		_ = os.RemoveAll(tmpDir)
-		return errors.WithStack(err)
+		return errors.Join(errors.WithStack(err), s.restoreSwapBackup(backupDir))
 	}
-	opts, cache := defaultPebbleOptionsWithCache()
-	newDB, err := pebble.Open(s.dir, opts)
+	if err := s.reopenStoreDB(s.dir); err != nil {
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
+	}
+	lastCommitTS, minRetainedTS, pendingMinRetainedTS, err := s.metadataAfterSwap(expected)
 	if err != nil {
-		cache.Unref()
-		return errors.WithStack(err)
-	}
-	s.db = newDB
-	s.cache = cache
-	// cleanupOnSwapFail mirrors the cleanup in NewPebbleStore: release the
-	// creator ref on the freshly-opened cache so a failed metadata read
-	// does not pin a ~256 MiB cache on the store across restore retries.
-	cleanupOnSwapFail := func() {
-		_ = newDB.Close()
-		cache.Unref()
-		s.db = nil
-		s.cache = nil
-	}
-	lastCommitTS, err := s.findMaxCommitTS()
-	if err != nil {
-		cleanupOnSwapFail()
-		return err
-	}
-	minRetainedTS, err := s.findMinRetainedTS()
-	if err != nil {
-		cleanupOnSwapFail()
-		return err
-	}
-	pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
-	if err != nil {
-		cleanupOnSwapFail()
-		return err
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
 	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
 	if err != nil {
-		cleanupOnSwapFail()
-		return err
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
 	s.migrationReadinessCache = readinessStates
+	if err := os.RemoveAll(backupDir); err != nil {
+		s.log.Warn("failed to remove restore backup", "path", backupDir, "error", err)
+	}
 	return nil
+}
+
+func (s *pebbleStore) reopenStoreDB(dir string) error {
+	opts, cache := defaultPebbleOptionsWithCache(s.cipher != nil)
+	db, err := pebble.Open(dir, opts)
+	if err != nil {
+		cache.Unref()
+		return errors.WithStack(err)
+	}
+	s.db = db
+	s.cache = cache
+	return nil
+}
+
+func (s *pebbleStore) restoreSwapBackup(backupDir string) error {
+	var cleanupErr error
+	if s.db != nil {
+		cleanupErr = s.db.Close()
+		s.db = nil
+	}
+	if s.cache != nil {
+		s.cache.Unref()
+		s.cache = nil
+	}
+	removeErr := os.RemoveAll(s.dir)
+	renameErr := os.Rename(backupDir, s.dir)
+	if renameErr != nil {
+		return errors.Join(errors.WithStack(cleanupErr), errors.WithStack(removeErr), errors.WithStack(renameErr))
+	}
+	return errors.Join(errors.WithStack(cleanupErr), errors.WithStack(removeErr), s.reopenStoreDB(s.dir))
+}
+
+func (s *pebbleStore) metadataAfterSwap(expected *pebbleSnapshotMetadata) (uint64, uint64, uint64, error) {
+	if expected == nil {
+		lastCommitTS, err := s.findMaxCommitTS()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		minRetainedTS, err := s.findMinRetainedTS()
+		if err != nil {
+			return 0, 0, 0, err
+		}
+		pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
+		return lastCommitTS, minRetainedTS, pendingMinRetainedTS, err
+	}
+	if err := verifyPebbleSnapshotMetadata(s.db, *expected); err != nil {
+		return 0, 0, 0, err
+	}
+	return expected.LastCommitTS, expected.MinRetainedTS, expected.PendingMinRetainedTS, nil
 }
 
 func (s *pebbleStore) Close() error {
@@ -3450,11 +3642,10 @@ func (s *pebbleStore) Close() error {
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
 	err := s.db.Close()
-	// Release our creator reference on the block cache so the memory is
-	// freed once pebble has also dropped its internal reference (which
-	// Close does). Safe to call after a Close error: Unref is
-	// idempotent-friendly in that s.cache is only nilled out here, and
-	// Close() is not expected to be called twice.
+	// Release this store's borrowed block-cache reference after Pebble has
+	// dropped its internal handle. The process base reference keeps the shared
+	// cache alive for other stores; nil prevents a second Close from unrefing
+	// this store's reference twice.
 	if s.cache != nil {
 		s.cache.Unref()
 		s.cache = nil

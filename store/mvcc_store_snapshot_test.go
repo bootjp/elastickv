@@ -22,7 +22,6 @@ func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 	defer snap.Close()
 
 	raw := snapshotBytes(t, snap)
-	require.Equal(t, mvccSnapshotLegacyVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
 
 	// Mutate source after snapshot so restore must reflect snapshot point-in-time.
 	require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v3"), 30, 0))
@@ -40,121 +39,25 @@ func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 	require.Equal(t, []byte("v2"), v)
 }
 
-func TestMVCCStore_SnapshotRestorePreservesTargetReadiness(t *testing.T) {
+func TestMVCCStore_SnapshotRestoreMaxStoredKey(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	src := newTestMVCCStore(t)
-
-	stale := TargetStagedReadinessState{
-		JobID:                  8,
-		RouteStart:             []byte("old"),
-		RouteEnd:               []byte("oldz"),
-		ExpectedCutoverVersion: 1,
-		MigrationJobID:         8,
-		MinWriteTSExclusive:    80,
-		Armed:                  true,
-	}
-	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, stale))
-
-	snapState := TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             []byte("a"),
-		RouteEnd:               []byte("z"),
-		ExpectedCutoverVersion: 12,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-	}
-	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, snapState))
+	key := bytes.Repeat([]byte("k"), MaxSnapshotStoredKeySize)
+	require.NoError(t, src.PutAt(ctx, key, []byte("v"), 10, 0))
 
 	snap, err := src.Snapshot()
 	require.NoError(t, err)
 	defer snap.Close()
 	raw := snapshotBytes(t, snap)
-	require.Equal(t, mvccSnapshotVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
-
-	dst := newTestMVCCStore(t)
-	require.NoError(t, dst.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{
-		JobID:                  77,
-		RouteStart:             []byte("dst-only"),
-		RouteEnd:               []byte("dst-z"),
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         77,
-		MinWriteTSExclusive:    700,
-		Armed:                  true,
-	}))
-
-	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
-	states, err := dst.MigrationTargetReadinessStates(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []TargetStagedReadinessState{stale, snapState}, states)
-
-	states[0].RouteStart[0] = 'x'
-	states, err = dst.MigrationTargetReadinessStates(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []byte("old"), states[0].RouteStart)
-}
-
-func TestMVCCStore_SnapshotRestorePreservesMigrationImportMetadata(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	src := newTestMVCCStore(t)
-	res, err := src.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     7,
-		BracketID: 3,
-		BatchSeq:  1,
-		Cursor:    []byte("c1"),
-		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
-	})
-	require.NoError(t, err)
-	require.False(t, res.Duplicate)
-
-	snap, err := src.Snapshot()
-	require.NoError(t, err)
-	defer snap.Close()
-	raw := snapshotBytes(t, snap)
-	require.Equal(t, mvccSnapshotVersion, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
 
 	dst := newTestMVCCStore(t)
 	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
-	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v50"), val)
-	floor, err := dst.MigrationHLCFloor(ctx, 7)
-	require.NoError(t, err)
-	require.Equal(t, uint64(50), floor)
-	present, err := dst.MigrationImportMetadataPresent(ctx, 7)
-	require.NoError(t, err)
-	require.True(t, present)
 
-	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     7,
-		BracketID: 3,
-		BatchSeq:  1,
-		Cursor:    []byte("fresh"),
-		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
-	})
+	got, err := dst.GetAt(ctx, key, 10)
 	require.NoError(t, err)
-	require.True(t, res.Duplicate)
-	require.Equal(t, []byte("c1"), res.AckedCursor)
-	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
-	require.ErrorIs(t, err, ErrKeyNotFound)
-
-	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     7,
-		BracketID: 3,
-		BatchSeq:  2,
-		Cursor:    []byte("c2"),
-		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
-	})
-	require.NoError(t, err)
-	require.False(t, res.Duplicate)
-	require.Equal(t, []byte("c2"), res.AckedCursor)
-	val, err = dst.GetAt(ctx, []byte("fresh"), 60)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v60"), val)
+	require.Equal(t, []byte("v"), got)
 }
 
 func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
@@ -264,6 +167,126 @@ func TestMVCCStore_RestoreClearsMigrationMetadata(t *testing.T) {
 	require.Equal(t, []byte("fresh"), res.AckedCursor)
 }
 
+func TestMVCCStore_SnapshotRestorePreservesMigrationMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+	res, err := st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("snap-cursor"),
+		Versions:  []MVCCVersion{{Key: []byte("imported"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, uint64(50), res.MaxImportedTS)
+
+	snap, err := st.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  2,
+		Cursor:    []byte("post-snapshot-cursor"),
+		Versions:  []MVCCVersion{{Key: []byte("post-snapshot"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, st.Restore(bytes.NewReader(raw)))
+	floor, err := st.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+
+	_, err = st.GetAt(ctx, []byte("post-snapshot"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	res, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("ignored"),
+		Versions:  []MVCCVersion{{Key: []byte("duplicate"), CommitTS: 70, Value: []byte("v70")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("snap-cursor"), res.AckedCursor)
+	_, err = st.GetAt(ctx, []byte("duplicate"), 70)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+}
+
+func TestMVCCStore_SnapshotRestorePreservesMigrationPromotionState(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTestMVCCStore(t)
+	promoter, ok := any(st).(MigrationPromoter)
+	require.True(t, ok)
+	stateReader, ok := any(st).(MigrationPromotionStateReader)
+	require.True(t, ok)
+
+	prefix := []byte("stage|")
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, prefix), bytes.HasPrefix(staged, prefix)
+	}
+	require.NoError(t, st.PutAt(ctx, []byte("stage|a"), []byte("va"), 100, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("stage|b"), []byte("vb"), 110, 0))
+
+	first, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 1,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.False(t, first.Done)
+	require.Equal(t, uint64(1), first.TotalPromotedRows)
+	require.Equal(t, uint64(100), first.MaxPromotedTS)
+
+	snap, err := st.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+
+	rest, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, rest.Done)
+	require.Equal(t, uint64(2), rest.TotalPromotedRows)
+
+	require.NoError(t, st.Restore(bytes.NewReader(raw)))
+	state, ok, err := stateReader.MigrationPromotionState(ctx, 11)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.False(t, state.Done)
+	require.Equal(t, first.NextCursor, state.Cursor)
+	require.Equal(t, uint64(1), state.PromotedRows)
+	require.Equal(t, uint64(100), state.MaxPromotedTS)
+
+	restored, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       11,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
+	})
+	require.NoError(t, err)
+	require.True(t, restored.Done)
+	require.Equal(t, uint64(1), restored.PromotedRows)
+	require.Equal(t, uint64(2), restored.TotalPromotedRows)
+	require.Equal(t, uint64(110), restored.MaxPromotedTS)
+}
+
 func TestMVCCStore_ApplyMutations_WriteConflict(t *testing.T) {
 	t.Parallel()
 
@@ -296,4 +319,121 @@ func snapshotBytes(t *testing.T, snap Snapshot) []byte {
 	_, err := snap.WriteTo(&buf)
 	require.NoError(t, err)
 	return buf.Bytes()
+}
+
+func TestMVCCStore_SnapshotRestorePreservesTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := newTestMVCCStore(t)
+
+	stale := TargetStagedReadinessState{
+		JobID:                  8,
+		RouteStart:             []byte("old"),
+		RouteEnd:               []byte("oldz"),
+		ExpectedCutoverVersion: 1,
+		MigrationJobID:         8,
+		MinWriteTSExclusive:    80,
+		Armed:                  true,
+	}
+	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, stale))
+
+	snapState := TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 12,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}
+	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, snapState))
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotVersionV4, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
+
+	dst := newTestMVCCStore(t)
+	require.NoError(t, dst.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{
+		JobID:                  77,
+		RouteStart:             []byte("dst-only"),
+		RouteEnd:               []byte("dst-z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         77,
+		MinWriteTSExclusive:    700,
+		Armed:                  true,
+	}))
+
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+	states, err := dst.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{stale, snapState}, states)
+
+	states[0].RouteStart[0] = 'x'
+	states, err = dst.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), states[0].RouteStart)
+}
+
+func TestMVCCStore_SnapshotRestorePreservesMigrationImportMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := newTestMVCCStore(t)
+	res, err := src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("c1"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotVersionV2, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
+
+	dst := newTestMVCCStore(t)
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+	present, err := dst.MigrationImportMetadataPresent(ctx, 7)
+	require.NoError(t, err)
+	require.True(t, present)
+
+	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("c1"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  2,
+		Cursor:    []byte("c2"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, []byte("c2"), res.AckedCursor)
+	val, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v60"), val)
 }

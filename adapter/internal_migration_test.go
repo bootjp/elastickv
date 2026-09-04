@@ -1,11 +1,14 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -147,6 +150,33 @@ func TestInternalExportRangeVersionsUsesStoreAndRouteFilter(t *testing.T) {
 	}, stream.responses[0].GetVersions())
 }
 
+func TestInternalExportRangeVersionsExcludesPeerLocalChunkBlobsFromUserFamily(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	var digest [32]byte
+	digest[0] = 0xab
+	blobKey := s3keys.ChunkBlobKey(digest)
+	require.NoError(t, st.PutAt(ctx, blobKey, []byte("peer-local"), 10, 0))
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      []byte(s3keys.ChunkBlobPrefix),
+		RouteEnd:        []byte("!s4|"),
+		KeyFamily:       distribution.MigrationFamilyUser,
+		RangeStart:      []byte(s3keys.ChunkBlobPrefix),
+		RangeEnd:        testPrefixScanEnd([]byte(s3keys.ChunkBlobPrefix)),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.True(t, stream.responses[0].GetDone())
+	require.Empty(t, stream.responses[0].GetVersions())
+}
+
 func TestInternalExportRangeVersionsUsesValueAwareLegacyListDeltaRouteFilter(t *testing.T) {
 	t.Parallel()
 
@@ -241,6 +271,16 @@ func TestInternalExportRangeVersionsRejectsUnboundedExport(t *testing.T) {
 	}, stream)
 	require.Error(t, err)
 	require.Equal(t, codes.InvalidArgument, status.Code(err))
+
+	stream = &captureExportRangeVersionsStream{ctx: context.Background()}
+	err = internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs: 20,
+		KeyFamily:   distribution.MigrationFamilyUser,
+		RangeStart:  []byte("a"),
+		RangeEnd:    []byte("b"),
+	}, stream)
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
 }
 
 func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T) {
@@ -265,8 +305,8 @@ func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T)
 			prefix:     s3keys.BucketMetaPrefix,
 			keyFor:     s3keys.BucketMetaKey,
 			value:      []byte("meta"),
-			routeStart: s3keys.RouteKey("bucket-b", 0, ""),
-			routeEnd:   s3keys.RouteKey("bucket-c", 0, ""),
+			routeStart: s3keys.RoutePrefixForBucketAnyGeneration("bucket-b"),
+			routeEnd:   testPrefixScanEnd(s3keys.RoutePrefixForBucketAnyGeneration("bucket-b")),
 		},
 		{
 			name:       "bucket generation",
@@ -274,8 +314,8 @@ func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T)
 			prefix:     s3keys.BucketGenerationPrefix,
 			keyFor:     s3keys.BucketGenerationKey,
 			value:      []byte("generation"),
-			routeStart: s3keys.RouteKey("bucket-b", 0, ""),
-			routeEnd:   s3keys.RouteKey("bucket-c", 0, ""),
+			routeStart: s3keys.RoutePrefixForBucketAnyGeneration("bucket-b"),
+			routeEnd:   testPrefixScanEnd(s3keys.RoutePrefixForBucketAnyGeneration("bucket-b")),
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -305,7 +345,7 @@ func TestInternalExportRangeVersionsUsesDecodedS3BucketRouteFilter(t *testing.T)
 	}
 }
 
-func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing.T) {
+func TestInternalExportRangeVersionsDecodedS3MixedRoutePreservesRawRangeMatches(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -313,14 +353,14 @@ func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing
 	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
 
 	inRouteKey := s3keys.BucketMetaKey("bucket-z")
-	outRouteKey := s3keys.BucketMetaKey("bucket-a")
+	rawRangeKey := s3keys.BucketMetaKey("bucket-a")
 	require.NoError(t, st.PutAt(ctx, inRouteKey, []byte("meta-z"), 10, 0))
-	require.NoError(t, st.PutAt(ctx, outRouteKey, []byte("skip"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, rawRangeKey, []byte("meta-a"), 10, 0))
 
 	stream := &captureExportRangeVersionsStream{ctx: ctx}
 	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
 		MaxCommitTs:     20,
-		RouteStart:      s3keys.RouteKey("bucket-z", 0, ""),
+		RouteStart:      s3keys.RoutePrefixForBucketAnyGeneration("bucket-z"),
 		RouteEnd:        []byte{},
 		KeyFamily:       distribution.MigrationFamilyS3BucketMeta,
 		RangeStart:      []byte(s3keys.BucketMetaPrefix),
@@ -330,11 +370,12 @@ func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing
 	require.NoError(t, err)
 	require.Len(t, stream.responses, 1)
 	require.Equal(t, []*pb.MVCCVersion{
+		{Key: rawRangeKey, CommitTs: 10, Value: []byte("meta-a"), KeyFamily: distribution.MigrationFamilyS3BucketMeta},
 		{Key: inRouteKey, CommitTs: 10, Value: []byte("meta-z"), KeyFamily: distribution.MigrationFamilyS3BucketMeta},
 	}, stream.responses[0].GetVersions())
 }
 
-func TestInternalExportRangeVersionsIncludesS3BucketAuxiliaryForBucketRouteIntersection(t *testing.T) {
+func TestInternalExportRangeVersionsSkipsS3BucketAuxiliaryForNonOwnerRouteSlice(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -379,9 +420,7 @@ func TestInternalExportRangeVersionsIncludesS3BucketAuxiliaryForBucketRouteInter
 			}, stream)
 			require.NoError(t, err)
 			require.Len(t, stream.responses, 1)
-			require.Equal(t, []*pb.MVCCVersion{
-				{Key: tc.key, CommitTs: 10, Value: tc.value, KeyFamily: tc.family},
-			}, stream.responses[0].GetVersions())
+			require.Empty(t, stream.responses[0].GetVersions())
 		})
 	}
 }
@@ -438,6 +477,8 @@ func TestInternalExportRangeVersionsUsesPartitionResolverGroup(t *testing.T) {
 	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
 		MaxCommitTs:     20,
 		KeyFamily:       distribution.MigrationFamilySQSPartitionedMessageData,
+		RouteStart:      []byte("!sqs|route|global"),
+		RouteEnd:        testPrefixScanEnd([]byte("!sqs|route|global")),
 		RangeStart:      prefix,
 		RangeEnd:        testPrefixScanEnd(prefix),
 		MaxScannedBytes: 1 << 20,
@@ -446,6 +487,163 @@ func TestInternalExportRangeVersionsUsesPartitionResolverGroup(t *testing.T) {
 	require.Len(t, stream.responses, 1)
 	require.Equal(t, []*pb.MVCCVersion{
 		{Key: p1, CommitTs: 10, Value: []byte("p1"), KeyFamily: distribution.MigrationFamilySQSPartitionedMessageData},
+	}, stream.responses[0].GetVersions())
+}
+
+func TestInternalExportRangeVersionsResolvesTxnWrappedPartitionedSQSKeysByEmbeddedOwner(t *testing.T) {
+	t.Parallel()
+
+	wrapWithStartTS := func(prefix string, userKey []byte) []byte {
+		var raw [8]byte
+		binary.BigEndian.PutUint64(raw[:], 77)
+		key := append([]byte(prefix), userKey...)
+		return append(key, raw[:]...)
+	}
+	cases := []struct {
+		name   string
+		family uint32
+		prefix []byte
+		wrap   func([]byte) []byte
+	}{
+		{
+			name:   "intent",
+			family: distribution.MigrationFamilyTxnIntent,
+			prefix: []byte("!txn|int|"),
+			wrap: func(userKey []byte) []byte {
+				return append([]byte("!txn|int|"), userKey...)
+			},
+		},
+		{
+			name:   "commit",
+			family: distribution.MigrationFamilyTxnCommit,
+			prefix: []byte("!txn|cmt|"),
+			wrap: func(userKey []byte) []byte {
+				return wrapWithStartTS("!txn|cmt|", userKey)
+			},
+		},
+		{
+			name:   "rollback",
+			family: distribution.MigrationFamilyTxnRollback,
+			prefix: []byte("!txn|rb|"),
+			wrap: func(userKey []byte) []byte {
+				return wrapWithStartTS("!txn|rb|", userKey)
+			},
+		},
+		{
+			name:   "success",
+			family: distribution.MigrationFamilyTxnSuccess,
+			prefix: []byte("!txn|ok|"),
+			wrap: func(userKey []byte) []byte {
+				return kv.TxnSuccessMarkerKey(userKey, 77, 88, []byte("primary"))
+			},
+		},
+		{
+			name:   "meta",
+			family: distribution.MigrationFamilyTxnMeta,
+			prefix: []byte(kv.TxnMetaPrefix),
+			wrap: func(userKey []byte) []byte {
+				return append([]byte(kv.TxnMetaPrefix), userKey...)
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := store.NewMVCCStore()
+			resolver := NewSQSPartitionResolver(map[string][]uint64{
+				"orders.fifo": {10, 11},
+			})
+			internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+				WithInternalStore(st),
+				WithInternalMigrationExportRouting(11, resolver),
+			)
+
+			p0 := tc.wrap(sqsPartitionedMsgDataKey("orders.fifo", 0, 1, "msg-0"))
+			p1 := tc.wrap(sqsPartitionedMsgDataKey("orders.fifo", 1, 1, "msg-1"))
+			unknown := tc.wrap(sqsPartitionedMsgDataKey("unknown.fifo", 0, 1, "msg-unknown"))
+			require.NoError(t, st.PutAt(ctx, p0, []byte("p0"), 10, 0))
+			require.NoError(t, st.PutAt(ctx, p1, []byte("p1"), 10, 0))
+			require.NoError(t, st.PutAt(ctx, unknown, []byte("unknown"), 10, 0))
+
+			stream := &captureExportRangeVersionsStream{ctx: ctx}
+			err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+				MaxCommitTs:     20,
+				KeyFamily:       tc.family,
+				RouteStart:      []byte("!sqs|route|global"),
+				RouteEnd:        testPrefixScanEnd([]byte("!sqs|route|global")),
+				RangeStart:      tc.prefix,
+				RangeEnd:        testPrefixScanEnd(tc.prefix),
+				MaxScannedBytes: 1 << 20,
+			}, stream)
+			require.NoError(t, err)
+			require.Len(t, stream.responses, 1)
+			require.Equal(t, []*pb.MVCCVersion{
+				{Key: p1, CommitTs: 10, Value: []byte("p1"), KeyFamily: tc.family},
+			}, stream.responses[0].GetVersions())
+		})
+	}
+}
+
+func TestInternalExportRangeVersionsDerivesFilesystemChunkScanBoundsFromRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	routeKey := fskeys.ChunkRouteKey(10, 20)
+	inRouteChunk := fskeys.ChunkKey(10, 20, 3)
+	outRouteChunk := fskeys.ChunkKey(10, 21, 3)
+	require.NoError(t, st.PutAt(ctx, inRouteChunk, []byte("chunk"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, outRouteChunk, []byte("skip"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      routeKey,
+		RouteEnd:        testPrefixScanEnd(routeKey),
+		KeyFamily:       distribution.MigrationFamilyFilesystemChunk,
+		RangeStart:      routeKey,
+		RangeEnd:        testPrefixScanEnd(routeKey),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: inRouteChunk, CommitTs: 10, Value: []byte("chunk"), KeyFamily: distribution.MigrationFamilyFilesystemChunk},
+	}, stream.responses[0].GetVersions())
+}
+
+func TestInternalExportRangeVersionsDerivesFilesystemUsageScanBoundsFromRouteBounds(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	routeKey := fskeys.ChunkRouteKey(10, 20)
+	inRouteUsage := fskeys.UsageRouteKey(routeKey)
+	outRouteUsage := fskeys.UsageRouteKey(fskeys.ChunkRouteKey(10, 21))
+	require.NoError(t, st.PutAt(ctx, inRouteUsage, []byte("usage"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, outRouteUsage, []byte("skip"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      routeKey,
+		RouteEnd:        testPrefixScanEnd(routeKey),
+		KeyFamily:       distribution.MigrationFamilyFilesystemUsage,
+		RangeStart:      routeKey,
+		RangeEnd:        testPrefixScanEnd(routeKey),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: inRouteUsage, CommitTs: 10, Value: []byte("usage"), KeyFamily: distribution.MigrationFamilyFilesystemUsage},
 	}, stream.responses[0].GetVersions())
 }
 
@@ -658,6 +856,118 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 	_, err = st.GetAt(ctx, staged, 30)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 	require.GreaterOrEqual(t, clock.Current(), uint64(30))
+}
+
+// Storage accepts values well past the internal gRPC message limit, and the
+// store's byte budget is only consulted after a version has been appended, so
+// one oversized row can land in an otherwise bounded export page. Sending it
+// fails with ResourceExhausted, and so does every retry of the same cursor:
+// the bracket stalls forever on an error that never names the row. The export
+// must refuse the page and say which key is too large.
+func TestInternalExportRangeVersionsRefusesOversizedPage(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	huge := bytes.Repeat([]byte{'x'}, internalutil.GRPCMaxMessageBytes+1)
+	require.NoError(t, st.PutAt(ctx, []byte("a"), huge, 10, 0))
+	srv := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+
+	err := srv.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs: 20,
+		RouteStart:  []byte("a"),
+		RouteEnd:    []byte("b"),
+		KeyFamily:   distribution.MigrationFamilyUser,
+		RangeStart:  []byte("a"),
+		RangeEnd:    []byte("b"),
+	}, stream)
+
+	require.Error(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Contains(t, err.Error(), `"a"`)
+	require.Empty(t, stream.responses, "an unsendable page must not be sent")
+}
+
+func TestInternalExportRangeVersionsDecodedS3EmptyRouteEndIsUnbounded(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	inRouteKey := s3keys.BucketMetaKey("bucket-z")
+	outRouteKey := s3keys.BucketMetaKey("bucket-a")
+	require.NoError(t, st.PutAt(ctx, inRouteKey, []byte("meta-z"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, outRouteKey, []byte("skip"), 10, 0))
+
+	stream := &captureExportRangeVersionsStream{ctx: ctx}
+	err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+		MaxCommitTs:     20,
+		RouteStart:      s3keys.RouteKey("bucket-z", 0, ""),
+		RouteEnd:        []byte{},
+		KeyFamily:       distribution.MigrationFamilyS3BucketMeta,
+		RangeStart:      []byte(s3keys.BucketMetaPrefix),
+		RangeEnd:        testPrefixScanEnd([]byte(s3keys.BucketMetaPrefix)),
+		MaxScannedBytes: 1 << 20,
+	}, stream)
+	require.NoError(t, err)
+	require.Len(t, stream.responses, 1)
+	require.Equal(t, []*pb.MVCCVersion{
+		{Key: inRouteKey, CommitTs: 10, Value: []byte("meta-z"), KeyFamily: distribution.MigrationFamilyS3BucketMeta},
+	}, stream.responses[0].GetVersions())
+}
+
+func TestInternalExportRangeVersionsIncludesS3BucketAuxiliaryForBucketRouteIntersection(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))
+
+	const bucket = "bucket-b"
+	for _, tc := range []struct {
+		name   string
+		family uint32
+		prefix string
+		key    []byte
+		value  []byte
+	}{
+		{
+			name:   "bucket meta",
+			family: distribution.MigrationFamilyS3BucketMeta,
+			prefix: s3keys.BucketMetaPrefix,
+			key:    s3keys.BucketMetaKey(bucket),
+			value:  []byte("meta"),
+		},
+		{
+			name:   "bucket generation",
+			family: distribution.MigrationFamilyS3BucketGeneration,
+			prefix: s3keys.BucketGenerationPrefix,
+			key:    s3keys.BucketGenerationKey(bucket),
+			value:  []byte("generation"),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.NoError(t, st.PutAt(ctx, tc.key, tc.value, 10, 0))
+
+			stream := &captureExportRangeVersionsStream{ctx: ctx}
+			err := internal.ExportRangeVersions(&pb.ExportRangeVersionsRequest{
+				MaxCommitTs:     20,
+				RouteStart:      s3keys.RouteKey(bucket, 7, "m"),
+				RouteEnd:        s3keys.RouteKey(bucket, 7, "z"),
+				KeyFamily:       tc.family,
+				RangeStart:      []byte(tc.prefix),
+				RangeEnd:        testPrefixScanEnd([]byte(tc.prefix)),
+				MaxScannedBytes: 1 << 20,
+			}, stream)
+			require.NoError(t, err)
+			require.Len(t, stream.responses, 1)
+			require.Equal(t, []*pb.MVCCVersion{
+				{Key: tc.key, CommitTs: 10, Value: tc.value, KeyFamily: tc.family},
+			}, stream.responses[0].GetVersions())
+		})
+	}
 }
 
 func TestInternalApplyTargetStagedReadinessBypassesOpcodeGateForSafetyGuard(t *testing.T) {

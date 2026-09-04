@@ -94,3 +94,62 @@ func TestApplyMigrationPromoteInvalidCursorReturnsOrdinaryError(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrInvalidExportCursor)
 	require.False(t, errors.Is(err, ErrMigrationPromoteApply))
 }
+
+// PromoteStagedVersions runs inside FSM apply, synchronously, on every voter.
+// The per-chunk bounds arrive in the Raft command, so a request that names an
+// oversized batch makes one apply load, re-encrypt, and commit that much staged
+// data in a single Pebble batch on every replica at once. The defaults only fill
+// in unset bounds, so they are not limits; the hard ceilings are.
+func TestMigrationPromoteOptionsClampOversizedBounds(t *testing.T) {
+	t.Parallel()
+
+	opts := migrationPromoteOptionsFromProto(&pb.PromoteStagedVersionsRequest{
+		JobId:           9,
+		MaxVersions:     1 << 30,
+		MaxBytes:        1 << 40,
+		MaxScannedBytes: 1 << 42,
+	}, 7)
+
+	require.Equal(t, maxMigrationPromoteMaxVersions, opts.MaxVersions)
+	require.Equal(t, uint64(maxMigrationPromoteMaxBytes), opts.MaxBytes)
+	require.Equal(t, uint64(maxMigrationPromoteMaxScannedBytes), opts.MaxScannedBytes)
+	require.Equal(t, uint64(7), opts.AppliedIndex)
+}
+
+// Unset bounds still take the defaults, and a request under the ceiling is
+// passed through unchanged so a caller can still ask for smaller chunks.
+func TestMigrationPromoteOptionsKeepDefaultsAndSmallerRequests(t *testing.T) {
+	t.Parallel()
+
+	defaults := migrationPromoteOptionsFromProto(&pb.PromoteStagedVersionsRequest{JobId: 9}, 0)
+	require.Equal(t, defaultMigrationPromoteMaxVersions, defaults.MaxVersions)
+	require.Equal(t, uint64(defaultMigrationPromoteMaxBytes), defaults.MaxBytes)
+	require.Equal(t, uint64(defaultMigrationPromoteMaxScannedBytes), defaults.MaxScannedBytes)
+
+	smaller := migrationPromoteOptionsFromProto(&pb.PromoteStagedVersionsRequest{
+		JobId:           9,
+		MaxVersions:     16,
+		MaxBytes:        1024,
+		MaxScannedBytes: 4096,
+	}, 0)
+	require.Equal(t, 16, smaller.MaxVersions)
+	require.Equal(t, uint64(1024), smaller.MaxBytes)
+	require.Equal(t, uint64(4096), smaller.MaxScannedBytes)
+}
+
+// The clamp has to be a pure function of the command so every replica derives
+// the same bounds from the same entry and apply stays deterministic.
+func TestMigrationPromoteOptionsAreDeterministicPerCommand(t *testing.T) {
+	t.Parallel()
+
+	req := &pb.PromoteStagedVersionsRequest{JobId: 9, MaxVersions: 1 << 30, MaxBytes: 1 << 40}
+	first := migrationPromoteOptionsFromProto(req, 11)
+	second := migrationPromoteOptionsFromProto(req, 11)
+	// PromoteVersionsOptions carries a closure, which never compares equal, so
+	// the bounds this clamp owns are compared directly.
+	require.Equal(t, first.MaxVersions, second.MaxVersions)
+	require.Equal(t, first.MaxBytes, second.MaxBytes)
+	require.Equal(t, first.MaxScannedBytes, second.MaxScannedBytes)
+	require.Equal(t, first.StartKey, second.StartKey)
+	require.Equal(t, first.EndKey, second.EndKey)
+}

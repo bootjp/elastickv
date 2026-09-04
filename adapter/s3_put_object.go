@@ -7,24 +7,29 @@ import (
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 type s3PutObjectState struct {
-	startTS  uint64
-	meta     *s3BucketMeta
-	headKey  []byte
-	previous *s3ObjectManifest
-	uploadID string
-	readPin  *kv.ActiveTimestampToken
+	startTS       uint64
+	readTimestamp kv.ReadTimestamp
+	meta          *s3BucketMeta
+	headKey       []byte
+	previous      *s3ObjectManifest
+	uploadID      string
+	readPin       *kv.ActiveTimestampToken
 }
 
 func (s *S3Server) prepareS3PutObject(ctx context.Context, request *http.Request, bucket, objectKey string) (*s3PutObjectState, error) {
 	readTS := s.readTS()
-	startTS, err := s.txnStartTS(ctx, readTS)
+	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 put object: begin read timestamp")
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	state := &s3PutObjectState{startTS: startTS, readPin: s.pinReadTS(readTS)}
+	readTS = readTimestamp.Timestamp()
+	startTS := readTS
+	state := &s3PutObjectState{startTS: startTS, readTimestamp: readTimestamp, readPin: s.pinReadTS(readTS)}
 	prepared := false
 	defer func() {
 		if !prepared {
@@ -53,7 +58,7 @@ func (s *S3Server) prepareS3PutObject(ctx context.Context, request *http.Request
 	return state, nil
 }
 
-func (s *S3Server) uploadS3ObjectData(ctx context.Context, request *http.Request, streamBody *s3StreamingBody, state *s3PutObjectState, bucket, objectKey, expectedPayloadSHA string) (s3ChunkUploadResult, *s3PutBodyError, error) {
+func (s *S3Server) uploadS3ObjectData(ctx context.Context, request *http.Request, streamBody *s3StreamingBody, state *s3PutObjectState, bucket, objectKey, expectedPayloadSHA string, offloaded bool) (s3ChunkUploadResult, *s3PutBodyError, error) {
 	payloadChecksum := expectedPayloadSHA
 	if isS3PayloadMarker(payloadChecksum) {
 		payloadChecksum = ""
@@ -67,11 +72,19 @@ func (s *S3Server) uploadS3ObjectData(ctx context.Context, request *http.Request
 		chunkKey: func(chunkNo uint64) []byte {
 			return s3keys.BlobKey(bucket, state.meta.Generation, objectKey, state.uploadID, 1, chunkNo)
 		},
+		chunkRefKey: func(chunkNo uint64) []byte {
+			return s3keys.ChunkRefKey(bucket, state.meta.Generation, objectKey, state.uploadID, 1, chunkNo)
+		},
+		offloaded: offloaded,
 	})
 }
 
 func (s *S3Server) cleanupS3PutObjectChunks(ctx context.Context, state *s3PutObjectState, upload s3ChunkUploadResult, bucket, objectKey string) {
-	part := s3ObjectPart{PartNo: 1, ChunkSizes: upload.ChunkSizes[:upload.PersistedChunks]}
+	chunkSizes := upload.ChunkSizes
+	if !upload.Offloaded {
+		chunkSizes = upload.ChunkSizes[:upload.PersistedChunks]
+	}
+	part := s3ObjectPart{PartNo: 1, ChunkSizes: chunkSizes, Offloaded: upload.Offloaded}
 	manifest := &s3ObjectManifest{UploadID: state.uploadID}
 	if len(part.ChunkSizes) > 0 {
 		manifest.Parts = []s3ObjectPart{part}
@@ -98,7 +111,7 @@ func (s *S3Server) commitS3PutObject(ctx context.Context, request *http.Request,
 	if upload.SizeBytes > 0 {
 		manifest.Parts = []s3ObjectPart{{
 			PartNo: 1, ETag: upload.ETag, SizeBytes: upload.SizeBytes,
-			ChunkCount: upload.ChunkCount, ChunkSizes: upload.ChunkSizes,
+			ChunkCount: upload.ChunkCount, ChunkSizes: upload.ChunkSizes, Offloaded: upload.Offloaded,
 		}}
 	}
 	body, err := encodeS3ObjectManifest(manifest)
@@ -109,14 +122,17 @@ func (s *S3Server) commitS3PutObject(ctx context.Context, request *http.Request,
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
-	_, err = s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	elems := append([]*kv.Elem[kv.OP](nil), upload.ChunkRefElems...)
+	elems = append(elems,
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
+		&kv.Elem[kv.OP]{Op: kv.Put, Key: state.headKey, Value: body},
+	)
+	dispatchCtx := state.readTimestamp.WithDispatchVoucher(ctx)
+	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  state.startTS,
 		CommitTS: commitTS,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
-			{Op: kv.Put, Key: state.headKey, Value: body},
-		},
+		Elems:    elems,
 	})
 	return true, errors.WithStack(err)
 }
@@ -136,6 +152,10 @@ func (s *S3Server) writeS3ChunkUploadError(w http.ResponseWriter, bodyErr *s3Put
 	}
 	if errors.Is(err, errS3PutAdmissionExhausted) {
 		writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
+		return
+	}
+	if status.Code(err) == codes.Unavailable {
+		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "chunkblob durability is temporarily unavailable", bucket, objectKey)
 		return
 	}
 	writeS3ResponseOrInternalError(w, err)

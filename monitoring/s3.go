@@ -47,6 +47,8 @@ type S3Metrics struct {
 	chunkBlobReplicationDegraded prometheus.Counter
 	chunkBlobSHAMismatches       prometheus.Counter
 	chunkBlobUnrecoverableReads  prometheus.Counter
+	chunkBlobBackfillQueueDepth  prometheus.Gauge
+	chunkBlobBackfillResults     *prometheus.CounterVec
 }
 
 func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
@@ -97,6 +99,19 @@ func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 				Help: "Total S3 chunkblob reads that could not recover the referenced content from any available peer.",
 			},
 		),
+		chunkBlobBackfillQueueDepth: prometheus.NewGauge(
+			prometheus.GaugeOpts{
+				Name: "elastickv_s3_chunkblob_backfill_queue_depth",
+				Help: "Current number of S3 chunkrefs queued for asynchronous local blob backfill.",
+			},
+		),
+		chunkBlobBackfillResults: prometheus.NewCounterVec(
+			prometheus.CounterOpts{
+				Name: "elastickv_s3_chunkblob_backfill_results_total",
+				Help: "Total S3 chunkblob backfill outcomes.",
+			},
+			[]string{"result"},
+		),
 	}
 	registerer.MustRegister(
 		m.putAdmissionInflightBytes,
@@ -106,6 +121,8 @@ func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 		m.chunkBlobReplicationDegraded,
 		m.chunkBlobSHAMismatches,
 		m.chunkBlobUnrecoverableReads,
+		m.chunkBlobBackfillQueueDepth,
+		m.chunkBlobBackfillResults,
 	)
 	return m
 }
@@ -169,6 +186,29 @@ func (m *S3Metrics) ObserveS3ChunkBlobUnrecoverable() {
 		return
 	}
 	m.chunkBlobUnrecoverableReads.Inc()
+}
+
+func (m *S3Metrics) ObserveS3ChunkBlobBackfillQueueDepth(depth int) {
+	if m == nil {
+		return
+	}
+	m.chunkBlobBackfillQueueDepth.Set(float64(max(0, depth)))
+}
+
+func (m *S3Metrics) ObserveS3ChunkBlobBackfillResult(result string) {
+	if m == nil {
+		return
+	}
+	m.chunkBlobBackfillResults.WithLabelValues(normalizeS3BlobBackfillResult(result)).Inc()
+}
+
+func normalizeS3BlobBackfillResult(result string) string {
+	switch result {
+	case "fetched", "local_hit", "gone", "failed", "queue_drop":
+		return result
+	default:
+		return s3BlobOffloadModeUnknown
+	}
 }
 
 func normalizeS3PutAdmissionStage(stage string) string {

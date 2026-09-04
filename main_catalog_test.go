@@ -342,6 +342,8 @@ type capabilityConfigEngine struct {
 	leader raftengine.LeaderInfo
 }
 
+func (e capabilityConfigEngine) SnapshotEvery() uint64 { return 0 }
+
 func (e capabilityConfigEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
 	return nil, nil
 }

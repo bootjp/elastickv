@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -211,6 +212,94 @@ func TestCommitIsIdempotentAfterCommitRecordExists(t *testing.T) {
 	gotCommitTS, err := decodeTxnCommitRecord(commitRecord)
 	require.NoError(t, err)
 	require.Equal(t, commitTS, gotCommitTS)
+}
+
+func TestCommitApplyStartTSUsesStagedCommitRecord(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("pk")
+	startTS := uint64(10)
+	commitTS := uint64(20)
+	readKeys := [][]byte{distribution.MigrationStagedDataKey(9, primary)}
+	stagedCommitKey := distribution.MigrationStagedDataKey(9, txnCommitKey(primary, startTS))
+	require.NoError(t, st.PutAt(ctx, stagedCommitKey, encodeTxnCommitRecord(commitTS), commitTS, 0))
+
+	applyStartTS, err := fsm.commitApplyStartTS(ctx, primary, startTS, commitTS, readKeys)
+	require.NoError(t, err)
+	require.Equal(t, commitTS, applyStartTS)
+}
+
+func TestCommitRejectsStagedRollbackRecord(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("pk")
+	startTS := uint64(10)
+	commitTS := uint64(20)
+	readKeys := [][]byte{distribution.MigrationStagedDataKey(9, primary)}
+	stagedRollbackKey := distribution.MigrationStagedDataKey(9, txnRollbackKey(primary, startTS))
+	require.NoError(t, st.PutAt(ctx, stagedRollbackKey, encodeTxnRollbackRecord(), startTS, 0))
+
+	_, err := fsm.commitApplyStartTS(ctx, primary, startTS, commitTS, readKeys)
+	require.Error(t, err)
+	require.ErrorIs(t, err, ErrTxnAlreadyAborted)
+}
+
+func TestCommitCleansUpStagedPreparedArtifacts(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("pk")
+	startTS := uint64(10)
+	commitTS := uint64(20)
+	jobID := uint64(9)
+	stagedLockKey := distribution.MigrationStagedDataKey(jobID, txnLockKey(primary))
+	stagedIntentKey := distribution.MigrationStagedDataKey(jobID, txnIntentKey(primary))
+	require.NoError(t, st.PutAt(ctx, stagedLockKey, encodeTxnLock(txnLock{
+		StartTS:      startTS,
+		PrimaryKey:   primary,
+		IsPrimaryKey: true,
+	}), startTS, 0))
+	require.NoError(t, st.PutAt(ctx, stagedIntentKey, encodeTxnIntent(txnIntent{
+		StartTS: startTS,
+		Op:      txnIntentOpPut,
+		Value:   []byte("v"),
+	}), startTS, 0))
+
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		ReadKeys: [][]byte{
+			distribution.MigrationStagedDataKey(jobID, primary),
+		},
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primary, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: primary},
+		},
+	}
+	require.NoError(t, applyFSMRequest(t, fsm, commit))
+
+	value, err := st.GetAt(ctx, primary, ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), value)
+	_, err = st.GetAt(ctx, stagedLockKey, ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = st.GetAt(ctx, stagedIntentKey, ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 func TestCommitIsIdempotentOnSecondaryShardWhenKeyAlreadyCommitted(t *testing.T) {

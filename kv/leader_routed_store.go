@@ -434,6 +434,9 @@ func (s *LeaderRoutedStore) ScanKeysAtWithReadFence(ctx context.Context, start [
 	}
 	ok, fenceTS := s.leaderFenceTS(ctx, start)
 	if ok {
+		if readRouteVersion != 0 {
+			return nil, errors.WithStack(store.ErrNotSupported)
+		}
 		keys, err := s.local.ScanKeysAt(ctx, start, end, limit, max(ts, fenceTS))
 		return keys, errors.WithStack(err)
 	}
@@ -591,6 +594,13 @@ func (s *LeaderRoutedStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []b
 	return errors.WithStack(s.local.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex))
 }
 
+func (s *LeaderRoutedStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []store.PrefixDelete, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.DeletePrefixesAtRaftAt(ctx, deletes, commitTS, appliedIndex))
+}
+
 // LastAppliedIndex forwards to the local store when it implements
 // raftengine.AppliedIndexReader. Defensive: in production today the
 // kvFSM holds a *pebbleStore directly (not a LeaderRoutedStore — that
@@ -732,6 +742,20 @@ func (s *LeaderRoutedStore) MigrationHLCFloor(ctx context.Context, jobID uint64)
 	}
 	floor, err := s.local.MigrationHLCFloor(ctx, jobID)
 	return floor, errors.WithStack(err)
+}
+
+func (s *LeaderRoutedStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.RetireMigration(ctx, jobID))
+}
+
+func (s *LeaderRoutedStore) RetireMigrationRaft(ctx context.Context, jobID, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.RetireMigrationRaft(ctx, jobID, appliedIndex))
 }
 
 func (s *LeaderRoutedStore) Snapshot() (store.Snapshot, error) {

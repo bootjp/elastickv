@@ -30,7 +30,20 @@ var ErrSnapshotKeyTooLarge = errors.New("mvcc snapshot key too large")
 var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count too large")
 var ErrValueTooLarge = errors.New("value too large")
 var ErrInvalidExportCursor = errors.New("invalid export cursor")
+
+// ErrInvalidExportBudget rejects an export asked for with no version budget.
+// Answering Done for a zero budget lets a migration driver record a non-empty
+// bracket as fully copied and move on to cutover, so the completion signal must
+// never be the answer to "you gave me nothing to fill".
+var ErrInvalidExportBudget = errors.New("migration export requires a positive version budget")
 var ErrImportBatchGap = errors.New("migration import batch gap")
+
+// ErrInvalidImportVersion marks a migration import version that is malformed
+// on its face (zero commit_ts, a tombstone carrying a value or expire_at).
+// It is a property of the request bytes, so every replica applying the same
+// Raft entry reaches the same verdict -- which is what lets kv/fsm classify
+// it as an ordinary apply error instead of halting the apply loop.
+var ErrInvalidImportVersion = errors.New("invalid migration import version")
 
 // validateValueSize returns ErrValueTooLarge when the value exceeds maxSnapshotValueSize.
 func validateValueSize(value []byte) error {
@@ -68,6 +81,12 @@ type KVPair struct {
 	Key          []byte
 	Value        []byte
 	RouteGroupID uint64
+}
+
+// PrefixDelete describes one prefix tombstone operation in a batched apply.
+type PrefixDelete struct {
+	Prefix        []byte
+	ExcludePrefix []byte
 }
 
 // MVCCVersion is a raw committed MVCC version for range migration.
@@ -290,6 +309,12 @@ type Snapshot interface {
 	io.Closer
 }
 
+// VersionPresenceReader reports whether a key has any committed version at or
+// before a read timestamp, including tombstones and expired values.
+type VersionPresenceReader interface {
+	VersionExistsAtOrBefore(ctx context.Context, key []byte, ts uint64) (bool, error)
+}
+
 // MVCCStore extends Store with multi-version concurrency control helpers.
 // The interface is timestamp-explicit; callers must supply the snapshot or
 // commit timestamp for every operation.
@@ -383,6 +408,11 @@ type MVCCStore interface {
 	// bundles metaAppliedIndex in that batch so DEL_PREFIX entries
 	// also advance the meta key. PR #910 design §2 "why both leaves".
 	DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error
+	// DeletePrefixesAtRaftAt applies several prefix deletes in one
+	// raft-apply batch. It is used when one logical raft command must
+	// tombstone multiple physical namespaces without exposing a partial
+	// apply or advancing metaAppliedIndex separately from any tombstone.
+	DeletePrefixesAtRaftAt(ctx context.Context, deletes []PrefixDelete, commitTS, appliedIndex uint64) error
 	// LastCommitTS returns the highest commit timestamp applied on this node.
 	LastCommitTS() uint64
 	// WriteConflictCountsByPrefix returns a snapshot of the MVCC
@@ -407,6 +437,13 @@ type MVCCStore interface {
 	// MigrationHLCFloor returns the full-HLC target-local migration floor
 	// persisted by ImportVersions for jobID.
 	MigrationHLCFloor(ctx context.Context, jobID uint64) (uint64, error)
+	// RetireMigration removes target-local import progress metadata for a
+	// completed migration job. Data imported by the job is left intact.
+	RetireMigration(ctx context.Context, jobID uint64) error
+	// RetireMigrationRaft is the raft-apply variant of RetireMigration. When
+	// appliedIndex is non-zero, the implementation must durably bundle
+	// metaAppliedIndex with the metadata retirement batch.
+	RetireMigrationRaft(ctx context.Context, jobID, appliedIndex uint64) error
 	Snapshot() (Snapshot, error)
 	Restore(buf io.Reader) error
 	Close() error

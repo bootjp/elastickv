@@ -258,7 +258,9 @@ func (r *RedisServer) probeStringTypes(ctx context.Context, key []byte, readTS u
 }
 
 // probeListType detects lists via the base meta key or any delta key.
-// Delta scan is bounded to 1 result.
+// Current-format delta scans are bounded to 1 result. Legacy deltas overlap
+// old list-meta shapes, so they first take the same cheap probe and only page
+// when the first row proves that ambiguous legacy decoding is actually needed.
 func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint64) (redisValueType, bool, error) {
 	metaExists, err := r.store.ExistsAt(ctx, store.ListMetaKey(key), readTS)
 	if err != nil {
@@ -281,12 +283,26 @@ func (r *RedisServer) probeListType(ctx context.Context, key []byte, readTS uint
 
 func (r *RedisServer) listMetaDeltaExistsAt(ctx context.Context, key []byte, deltaPrefix []byte, readTS uint64) (bool, error) {
 	deltaEnd := store.PrefixScanEnd(deltaPrefix)
-	if !isLegacyListMetaDeltaPrefix(deltaPrefix) {
-		deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
-		if err != nil {
-			return false, errors.WithStack(err)
-		}
-		return len(deltaKVs) > 0, nil
+	if isLegacyListMetaDeltaPrefix(deltaPrefix) {
+		return r.legacyListMetaDeltaExistsAt(ctx, key, deltaPrefix, deltaEnd, readTS)
+	}
+	deltaKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return len(deltaKVs) > 0, nil
+}
+
+func (r *RedisServer) legacyListMetaDeltaExistsAt(ctx context.Context, key []byte, deltaPrefix []byte, deltaEnd []byte, readTS uint64) (bool, error) {
+	firstKVs, err := r.store.ScanAt(ctx, deltaPrefix, deltaEnd, 1, readTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if len(firstKVs) == 0 {
+		return false, nil
+	}
+	if legacyListDeltaPairForUserKey(firstKVs[0], key) {
+		return true, nil
 	}
 	cursor := deltaPrefix
 	for {
@@ -415,7 +431,7 @@ func (r *RedisServer) keyTypeAtExpect(ctx context.Context, key []byte, readTS ui
 // appeared between iterations is invisible to this fast path; the
 // blocking command's fallback-timer wake (which uses the slow
 // keyTypeAtExpect) is the safety net that detects it within
-// ~redisBlockWaitFallback (100ms).
+// roughly one configured block fallback interval.
 //
 // Compared to keyTypeAtExpect on the empty-key case
 // (probeExpectedType -> false -> rawKeyTypeAt slow path = ~19
@@ -704,7 +720,7 @@ func (r *RedisServer) loadStreamAt(ctx context.Context, key []byte, readTS uint6
 	if !metaFound {
 		return redisStreamValue{}, nil
 	}
-	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta.Length)
+	entries, err := r.scanStreamEntriesAt(ctx, key, readTS, meta)
 	if err != nil {
 		return redisStreamValue{}, err
 	}
@@ -741,14 +757,14 @@ func (r *RedisServer) loadStreamMetaAt(ctx context.Context, key []byte, readTS u
 // stream; callers need not distinguish it from a missing stream.
 // When expectedLen > 0 we cap the scan at meta.Length plus slack,
 // matching existing store ScanAt semantics for non-positive limits.
-func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, expectedLen int64) ([]redisStreamEntry, error) {
+func (r *RedisServer) scanStreamEntriesAt(ctx context.Context, key []byte, readTS uint64, meta store.StreamMeta) ([]redisStreamEntry, error) {
 	prefix := store.StreamEntryScanPrefix(key)
 	end := store.PrefixScanEnd(prefix)
-	limit := scanStreamEntriesLimit(expectedLen)
-	if limit == 0 && expectedLen <= 0 {
+	limit := scanStreamEntriesLimit(meta.Length)
+	if limit == 0 && meta.Length <= 0 {
 		return []redisStreamEntry{}, nil
 	}
-	kvs, err := r.store.ScanAt(ctx, prefix, end, limit, readTS)
+	kvs, err := r.store.ScanAt(ctx, store.StreamEntryScanStart(key, meta), end, limit, readTS)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -799,6 +815,23 @@ func (r *RedisServer) dispatchElems(ctx context.Context, isTxn bool, startTS uin
 	}
 	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
 		IsTxn:   isTxn,
+		StartTS: startTS,
+		Elems:   elems,
+	})
+	return errors.WithStack(err)
+}
+
+func (r *RedisServer) dispatchReadTimestampElems(ctx context.Context, readTimestamp kv.ReadTimestamp, elems []*kv.Elem[kv.OP]) error {
+	if len(elems) == 0 {
+		return nil
+	}
+	startTS := readTimestamp.Timestamp()
+	if startTS == ^uint64(0) {
+		startTS = 0
+	}
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
 		StartTS: startTS,
 		Elems:   elems,
 	})
@@ -911,11 +944,11 @@ func (r *RedisServer) snapshotGetAt(key []byte, readTS uint64) ([]byte, error) {
 }
 
 func (r *RedisServer) doGetAt(key []byte, readTS uint64, verify bool) ([]byte, error) {
-	// Leadership is partitioned by the logical user key, so strip the internal
-	// prefix before asking the coordinator.
+	// Leadership is partitioned by the logical user key, but route through a
+	// Redis wrapper so list-internal-shaped user keys remain literal.
 	routingKey := key
 	if userKey := extractRedisInternalUserKey(key); userKey != nil {
-		routingKey = userKey
+		routingKey = redisUserRouteKey(userKey)
 	}
 	if r.coordinator.IsLeaderForKey(routingKey) {
 		if verify {
@@ -1205,6 +1238,112 @@ func (r *RedisServer) deleteLogicalKeyElems(ctx context.Context, key []byte, rea
 	return elems, existed, nil
 }
 
+func (r *RedisServer) deleteLogicalKeyElemsForType(ctx context.Context, key []byte, readTS uint64, typ redisValueType) ([]*kv.Elem[kv.OP], bool, error) {
+	switch typ {
+	case redisTypeNone:
+		return nil, false, nil
+	case redisTypeString:
+		elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+		return elems, true, err
+	case redisTypeList:
+		return r.deleteListLogicalKeyElems(ctx, key, readTS)
+	case redisTypeHash:
+		return r.deleteHashLogicalKeyElems(ctx, key, readTS)
+	case redisTypeSet:
+		return r.deleteSetLogicalKeyElems(ctx, key, readTS)
+	case redisTypeZSet:
+		return r.deleteZSetLogicalKeyElems(ctx, key, readTS)
+	case redisTypeStream:
+		return r.deleteStreamLogicalKeyElems(ctx, key, readTS)
+	}
+	return nil, false, errors.WithStack(errors.AssertionFailedf("unknown redis type %v", typ))
+}
+
+func (r *RedisServer) deleteStringLikeElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], error) {
+	var elems []*kv.Elem[kv.OP]
+	for _, internalKey := range [][]byte{
+		redisStrKey(key),
+		key, // legacy bare string key
+		redisHLLKey(key),
+		redisTTLKey(key),
+	} {
+		ok, err := r.store.ExistsAt(ctx, internalKey, readTS)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if ok {
+			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: internalKey})
+		}
+	}
+	return elems, nil
+}
+
+func (r *RedisServer) deleteListLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	listElems, err := r.deleteListElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, listElems...), true, nil
+}
+
+func (r *RedisServer) deleteHashLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
+	hashElems, err := r.deleteWideColumnElems(ctx, readTS,
+		store.HashFieldScanPrefix(key), store.HashMetaKey(key), store.HashMetaDeltaScanPrefix(key))
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, hashElems...), true, nil
+}
+
+func (r *RedisServer) deleteSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisSetKey(key)})
+	setElems, err := r.deleteWideColumnElems(ctx, readTS,
+		store.SetMemberScanPrefix(key), store.SetMetaKey(key), store.SetMetaDeltaScanPrefix(key))
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, setElems...), true, nil
+}
+
+func (r *RedisServer) deleteZSetLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisZSetKey(key)})
+	zsetElems, err := r.deleteZSetWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, zsetElems...), true, nil
+}
+
+func (r *RedisServer) deleteStreamLogicalKeyElems(ctx context.Context, key []byte, readTS uint64) ([]*kv.Elem[kv.OP], bool, error) {
+	elems, err := r.deleteStringLikeElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisStreamKey(key)})
+	streamElems, err := r.deleteStreamWideColumnElems(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	return append(elems, streamElems...), true, nil
+}
+
 // deleteStreamWideColumnElems returns delete operations for all stream
 // wide-column keys: the meta key (if it exists) and every entry under the
 // entry scan prefix. Total results are capped at maxWideColumnItems to
@@ -1265,14 +1404,15 @@ func (r *RedisServer) listValuesAt(ctx context.Context, key []byte, readTS uint6
 	return r.fetchListRange(ctx, key, meta, 0, meta.Len-1, readTS)
 }
 
-func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uint64, values []string) error {
+func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, values []string) error {
+	readTS := readTimestamp.Timestamp()
 	elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 	if err != nil {
 		return err
 	}
 
 	if len(values) == 0 {
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
 
 	rawValues := make([][]byte, 0, len(values))
@@ -1289,7 +1429,8 @@ func (r *RedisServer) rewriteListTxn(ctx context.Context, key []byte, readTS uin
 		return err
 	}
 	elems = append(elems, ops...)
-	_, err = r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,

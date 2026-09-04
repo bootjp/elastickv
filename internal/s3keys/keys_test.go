@@ -325,6 +325,25 @@ func TestChunkRefKey_RoundTripAndRouteKey(t *testing.T) {
 	require.Equal(t, RouteKey(bucket, 11, object), ExtractRouteKey(key))
 }
 
+func TestVersionedChunkRefKey_RoundTrip(t *testing.T) {
+	t.Parallel()
+
+	key := VersionedChunkRefKey("bucket", 11, "object", "upload", 7, 3, 99)
+	bucket, generation, object, uploadID, partNo, chunkNo, partVersion, ok := ParseVersionedChunkRefKey(key)
+	require.True(t, ok)
+	require.Equal(t, "bucket", bucket)
+	require.Equal(t, uint64(11), generation)
+	require.Equal(t, "object", object)
+	require.Equal(t, "upload", uploadID)
+	require.Equal(t, uint64(7), partNo)
+	require.Equal(t, uint64(3), chunkNo)
+	require.Equal(t, uint64(99), partVersion)
+	require.Equal(t, RouteKey("bucket", 11, "object"), ExtractRouteKey(key))
+
+	unversioned := VersionedChunkRefKey("bucket", 11, "object", "upload", 7, 3, 0)
+	require.Equal(t, ChunkRefKey("bucket", 11, "object", "upload", 7, 3), unversioned)
+}
+
 func TestChunkBlobKey_RoundTrip(t *testing.T) {
 	t.Parallel()
 
@@ -355,6 +374,28 @@ func TestChunkRefValue_RoundTrip(t *testing.T) {
 	require.Equal(t, "node-a", got.SourcePeer)
 }
 
+func TestChunkRefValueV2_RoundTripWriteTimeReplicas(t *testing.T) {
+	t.Parallel()
+
+	sum := sha256.Sum256([]byte("chunk data"))
+	want := ChunkRefValue{
+		ContentSHA256: sum,
+		Size:          1234,
+		SourcePeer:    "node-a",
+		ReplicaPeers: []ChunkRefPeer{
+			{NodeID: "node-a", Address: "10.0.0.1:50051"},
+			{NodeID: "node-b", Address: "10.0.0.2:50051"},
+		},
+	}
+	value, err := EncodeChunkRefValue(want)
+	require.NoError(t, err)
+	require.Equal(t, chunkRefValueVersionV2, value[0])
+
+	got, ok := DecodeChunkRefValue(value)
+	require.True(t, ok)
+	require.Equal(t, want, got)
+}
+
 func TestChunkRefValue_RejectsMalformedValues(t *testing.T) {
 	t.Parallel()
 
@@ -372,6 +413,19 @@ func TestChunkRefValue_RejectsMalformedValues(t *testing.T) {
 		_, ok := DecodeChunkRefValue(malformed)
 		require.False(t, ok, "value %x should be rejected", malformed)
 	}
+
+	v2, err := EncodeChunkRefValue(ChunkRefValue{
+		ContentSHA256: sum,
+		Size:          1,
+		SourcePeer:    "n1",
+		ReplicaPeers:  []ChunkRefPeer{{NodeID: "n1", Address: "n1:50051"}},
+	})
+	require.NoError(t, err)
+	replicaCountOffset := chunkRefValueFixedBytes + len("n1")
+	v2[replicaCountOffset] = 0xff
+	v2[replicaCountOffset+1] = 0xff
+	_, ok := DecodeChunkRefValue(v2)
+	require.False(t, ok, "impossible replica count must be rejected before allocation")
 }
 
 // TestPerBucketPrefixes_IsolateByBucketAndGeneration covers the
@@ -478,5 +532,92 @@ func TestPerBucketPrefixes_IsolateByBucketAndGeneration(t *testing.T) {
 					"orphans from old generation must stay isolated when bucket is recreated",
 				tc.name, bucket, otherGen, bucket, gen)
 		})
+	}
+}
+
+func TestBucketGenerationRoutePrefixForCleanupPrefixIncludesChunkRefs(t *testing.T) {
+	t.Parallel()
+
+	prefix := ChunkRefPrefixForBucket("bucket-a", 7)
+	got, ok := BucketGenerationRoutePrefixForCleanupPrefix(prefix)
+
+	require.True(t, ok)
+	require.Equal(t, RoutePrefixForBucket("bucket-a", 7), got)
+}
+
+func TestBucketScopedRoutePrefix_ProjectsEveryDeleteFamily(t *testing.T) {
+	const (
+		bucket     = "bkt"
+		generation = uint64(3)
+	)
+	want := RoutePrefixForBucket(bucket, generation)
+
+	for name, prefix := range map[string][]byte{
+		"manifest":   ObjectManifestPrefixForBucket(bucket, generation),
+		"uploadMeta": UploadMetaPrefixForBucket(bucket, generation),
+		"uploadPart": UploadPartPrefixForBucket(bucket, generation),
+		"blob":       BlobPrefixForBucket(bucket, generation),
+		"chunkRef":   ChunkRefPrefixForBucket(bucket, generation),
+		"gcUpload":   GCUploadPrefixForBucket(bucket, generation),
+	} {
+		got, ok := BucketScopedRoutePrefix(prefix)
+		if !ok {
+			t.Fatalf("%s: prefix must project onto the object route range", name)
+		}
+		if !bytes.Equal(got, want) {
+			t.Fatalf("%s: got %q want %q", name, got, want)
+		}
+	}
+}
+
+// Every key the projection claims to cover must actually sort under the route
+// prefix it produces, otherwise the write floor it admits against is the wrong
+// one.
+func TestBucketScopedRoutePrefix_CoversTheKeysUnderIt(t *testing.T) {
+	const (
+		bucket     = "bkt"
+		generation = uint64(3)
+	)
+	routePrefix, ok := BucketScopedRoutePrefix(ObjectManifestPrefixForBucket(bucket, generation))
+	if !ok {
+		t.Fatal("manifest prefix must project")
+	}
+	for _, key := range [][]byte{
+		ObjectManifestKey(bucket, generation, "a/b"),
+		UploadMetaKey(bucket, generation, "a/b", "u1"),
+		UploadPartKey(bucket, generation, "a/b", "u1", 2),
+		BlobKey(bucket, generation, "a/b", "u1", 2, 3),
+		ChunkRefKey(bucket, generation, "a/b", "u1", 2, 3),
+		GCUploadKey(bucket, generation, "a/b", "u1"),
+	} {
+		route := ExtractRouteKey(key)
+		if route == nil {
+			t.Fatalf("key %q has no route key", key)
+		}
+		if !bytes.HasPrefix(route, routePrefix) {
+			t.Fatalf("route %q is not under %q", route, routePrefix)
+		}
+	}
+}
+
+// A prefix that stops before the generation still spans several generations, and
+// one that reaches into the object segment is not this function's shape. Both
+// must decline rather than collapse onto a single route range.
+func TestBucketScopedRoutePrefix_RejectsPartialAndDeeperPrefixes(t *testing.T) {
+	const (
+		bucket     = "bkt"
+		generation = uint64(3)
+	)
+	full := ObjectManifestPrefixForBucket(bucket, generation)
+	for name, prefix := range map[string][]byte{
+		"bare family":        []byte(ObjectManifestPrefix),
+		"partial bucket":     full[:len(ObjectManifestPrefix)+1],
+		"missing generation": full[:len(full)-1],
+		"object scoped":      ObjectManifestKey(bucket, generation, "a/b"),
+		"other family":       []byte(BucketMetaPrefix),
+	} {
+		if _, ok := BucketScopedRoutePrefix(prefix); ok {
+			t.Fatalf("%s: prefix %q must not project", name, prefix)
+		}
 	}
 }

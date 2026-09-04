@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/binary"
 	"errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
@@ -51,12 +52,28 @@ type dedupTestCoordinator struct {
 	// before the FSM dedup probe or apply. It is retryable but cannot be
 	// treated as an ambiguous landing.
 	routeFenceAtDispatch int
-	dispatches           int
-	probeNoOps           int
+	// composedErrAtDispatch makes the named dispatch return a Composed-1 route
+	// error before the FSM dedup probe or apply. It is retryable but cannot be
+	// treated as an ambiguous landing.
+	composedErrAtDispatch int
+	dispatches            int
+	probeNoOps            int
 	// beforeDispatch, if set, runs at the start of each Dispatch with the
 	// 1-based dispatch number — lets a test inject a concurrent commit
 	// between the adapter's attempts.
 	beforeDispatch func(n int)
+}
+
+type phaseDDedupTestCoordinator struct {
+	*dedupTestCoordinator
+	alloc   *phaseDDedupAllocator
+	vouches atomic.Uint64
+}
+
+type phaseDDedupAllocator struct {
+	next          atomic.Uint64
+	validateCalls atomic.Uint64
+	phaseDFloor   uint64
 }
 
 func newDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bool) *dedupTestCoordinator {
@@ -66,6 +83,53 @@ func newDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bo
 		ambiguousLands:        lands,
 	}
 }
+
+func newPhaseDDedupTestCoordinator(st store.MVCCStore, ambiguousDispatch int, lands bool) *phaseDDedupTestCoordinator {
+	return &phaseDDedupTestCoordinator{
+		dedupTestCoordinator: newDedupTestCoordinator(st, ambiguousDispatch, lands),
+		alloc:                &phaseDDedupAllocator{phaseDFloor: 10},
+	}
+}
+
+func (c *phaseDDedupTestCoordinator) TimestampAllocator() kv.TimestampAllocator {
+	return c.alloc
+}
+
+func (c *phaseDDedupTestCoordinator) VouchAppliedReadTimestamp(uint64, kv.AppliedReadTimestampVoucherRef) error {
+	c.vouches.Add(1)
+	return nil
+}
+
+func (a *phaseDDedupAllocator) Next(ctx context.Context) (uint64, error) {
+	return a.NextAfter(ctx, 0)
+}
+
+func (a *phaseDDedupAllocator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	for {
+		cur := a.next.Load()
+		next := cur + 1
+		if next <= min {
+			next = min + 1
+		}
+		if a.next.CompareAndSwap(cur, next) {
+			return next, nil
+		}
+	}
+}
+
+func (a *phaseDDedupAllocator) ValidateDurableTimestamp(_ context.Context, timestamp uint64) error {
+	a.validateCalls.Add(1)
+	if timestamp == 0 {
+		return kv.ErrTSOTimestampInvalid
+	}
+	if timestamp <= a.phaseDFloor {
+		return errors.Join(kv.ErrTSOTimestampInvalid, kv.ErrTSOTimestampPrePhaseD)
+	}
+	return nil
+}
+
+func (a *phaseDDedupAllocator) PhaseDActive() bool   { return true }
+func (a *phaseDDedupAllocator) PhaseDRequired() bool { return true }
 
 func TestResolveListMetaReadsLegacyDeltaPrefix(t *testing.T) {
 	t.Parallel()
@@ -291,6 +355,9 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 	if c.shouldRouteFence(n) {
 		return nil, kv.ErrRouteWriteFenced
 	}
+	if c.shouldComposedRouteError(n) {
+		return nil, kv.ErrComposed1Violation
+	}
 	if handled, resp, err := c.maybeProbe(ctx, req); handled {
 		return resp, err
 	}
@@ -328,6 +395,10 @@ func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.
 
 func (c *dedupTestCoordinator) shouldRouteFence(dispatch int) bool {
 	return dispatch == c.routeFenceAtDispatch
+}
+
+func (c *dedupTestCoordinator) shouldComposedRouteError(dispatch int) bool {
+	return dispatch == c.composedErrAtDispatch
 }
 
 func (c *dedupTestCoordinator) preApplyError(dispatch int) error {
@@ -438,6 +509,27 @@ func TestListPushDedup_RouteFenceRetryPreservesPriorProbe(t *testing.T) {
 	meta, _, err := srv.resolveListMeta(ctx, key, readTS)
 	require.NoError(t, err)
 	require.Equal(t, int64(1), meta.Len, "route-fence retry must not append a duplicate")
+}
+
+func TestListPushDedup_ComposedRetryPreservesPriorProbe(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := newDedupTestCoordinator(st, 1, true)
+	coord.composedErrAtDispatch = 2
+	srv := &RedisServer{store: st, coordinator: coord, scriptCache: map[string]string{}, onePhaseTxnDedup: true}
+
+	key := []byte("mylist")
+	n, err := srv.listRPush(ctx, key, [][]byte{[]byte("v")})
+	require.NoError(t, err)
+	require.Equal(t, int64(1), n)
+	require.Equal(t, 3, coord.dispatches, "attempt 1 landed, Composed-1 rejected reuse, then dedup probe retry")
+	require.Equal(t, 1, coord.probeNoOps, "Composed-1 retry must not replace the prior landed probe")
+
+	readTS := snapshotTS(coord.Clock(), st)
+	meta, _, err := srv.resolveListMeta(ctx, key, readTS)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len, "Composed-1 retry must not append a duplicate")
 }
 
 // TestListPushDedup_PriorAttemptDidNotLand_Applies covers the truncated case:

@@ -378,14 +378,14 @@ func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, boo
 
 func validateImportVersion(version MVCCVersion) error {
 	if version.CommitTS == 0 {
-		return errors.New("migration import version has zero commit_ts")
+		return errors.Wrap(ErrInvalidImportVersion, "migration import version has zero commit_ts")
 	}
 	if version.Tombstone {
 		if version.ExpireAt != 0 {
-			return errors.New("migration import tombstone carries expire_at")
+			return errors.Wrap(ErrInvalidImportVersion, "migration import tombstone carries expire_at")
 		}
 		if len(version.Value) != 0 {
-			return errors.New("migration import tombstone carries value")
+			return errors.Wrap(ErrInvalidImportVersion, "migration import tombstone carries value")
 		}
 		return nil
 	}
@@ -436,7 +436,7 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 		return ExportVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
-		return ExportVersionsResult{Done: true}, nil
+		return ExportVersionsResult{}, errors.WithStack(ErrInvalidExportBudget)
 	}
 
 	s.mtx.RLock()
@@ -541,24 +541,53 @@ func exportMemoryIteratorKey(
 	return exportMemoryVersionsForKey(ctx, opts, cursorCommitTS, key, versions, result)
 }
 
+// exportPageWouldOverflow reports whether adding one more row of valueLen
+// bytes would push a page that already holds rows past its byte budget.
+// MaxBytes is otherwise only consulted after a row has been appended, so a
+// page can overshoot it by the whole size of its last row. That overshoot is
+// what pushes an otherwise ordinary page past the migration transport limit --
+// a 3 MiB page followed by a 61 MiB row -- and the same cursor rebuilds the
+// same page on every retry. Stopping first leaves the oversized row to start
+// the next page, where it is alone and within the transport limit; a row too
+// large even alone still goes through, because a page that holds nothing yet
+// has to make progress.
+func exportPageWouldOverflow(opts ExportVersionsOptions, result *ExportVersionsResult, key []byte, valueLen int) bool {
+	if opts.MaxBytes == 0 || len(result.Versions) == 0 {
+		return false
+	}
+	return result.ExportedBytes+versionExportSize(key, valueLen) > opts.MaxBytes
+}
+
 func finishExportIfLimited(opts ExportVersionsOptions, result *ExportVersionsResult) bool {
 	return len(result.Versions) >= opts.MaxVersions ||
 		(opts.MaxBytes > 0 && result.ExportedBytes >= opts.MaxBytes) ||
 		(opts.MaxScannedBytes > 0 && result.ScannedBytes >= opts.MaxScannedBytes)
 }
 
-func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version VersionedValue, result *ExportVersionsResult) byte {
+// appendMemoryExportVersion returns the cursor tag for this version and, as
+// deferred, whether the page had to stop before it. AcceptVersion is called at
+// most once per version here: it is not required to be a pure predicate, so
+// the page-size guard sits after the filters rather than re-running them.
+func appendMemoryExportVersion(
+	opts ExportVersionsOptions,
+	key []byte,
+	version VersionedValue,
+	result *ExportVersionsResult,
+) (byte, bool) {
 	if shouldSkipMigrationExportKey(key) {
-		return exportCursorTagScanned
+		return exportCursorTagScanned, false
 	}
 	if opts.AcceptKey != nil && !opts.AcceptKey(key) {
-		return exportCursorTagScanned
+		return exportCursorTagScanned, false
 	}
 	if opts.MaxCommitTSInclusive != 0 && version.TS > opts.MaxCommitTSInclusive {
-		return exportCursorTagScanned
+		return exportCursorTagScanned, false
 	}
 	if opts.AcceptVersion != nil && !opts.AcceptVersion(key, version.Value) {
-		return exportCursorTagScanned
+		return exportCursorTagScanned, false
+	}
+	if exportPageWouldOverflow(opts, result, key, len(version.Value)) {
+		return exportCursorTagScanned, true
 	}
 	result.Versions = append(result.Versions, MVCCVersion{
 		Key:       bytes.Clone(key),
@@ -570,7 +599,7 @@ func appendMemoryExportVersion(opts ExportVersionsOptions, key []byte, version V
 	})
 	result.ExportedBytes += versionExportSize(key, len(version.Value))
 	result.AcceptedRows++
-	return exportCursorTagEmitted
+	return exportCursorTagEmitted, false
 }
 
 func shouldSkipMigrationExportKey(key []byte) bool {
@@ -591,12 +620,23 @@ func shouldSkipMemoryVersion(cursorCommitTS uint64, version VersionedValue) bool
 	return cursorCommitTS != 0 && version.TS >= cursorCommitTS
 }
 
-func exportMemoryVersion(opts ExportVersionsOptions, cursorCommitTS uint64, key []byte, version VersionedValue, result *ExportVersionsResult) bool {
+// exportMemoryVersion returns (continue, deferred): deferred means the page is
+// full for this version and it must start the next one.
+func exportMemoryVersion(
+	opts ExportVersionsOptions,
+	cursorCommitTS uint64,
+	key []byte,
+	version VersionedValue,
+	result *ExportVersionsResult,
+) (bool, bool) {
 	if shouldSkipMemoryVersion(cursorCommitTS, version) {
-		return true
+		return true, false
 	}
-	tag := appendMemoryExportVersion(opts, key, version, result)
-	return finishMemoryExportPosition(opts, key, version, tag, result)
+	tag, deferred := appendMemoryExportVersion(opts, key, version, result)
+	if deferred {
+		return false, true
+	}
+	return finishMemoryExportPosition(opts, key, version, tag, result), false
 }
 
 func exportMemoryVersionsForKey(
@@ -620,7 +660,14 @@ func exportMemoryVersionsForKey(
 			}
 			return true, nil
 		}
-		if !exportMemoryVersion(opts, cursorCommitTS, key, versions[i], result) {
+		cont, deferred := exportMemoryVersion(opts, cursorCommitTS, key, versions[i], result)
+		if deferred {
+			// The page is full for this row. The cursor still points at the row
+			// before it, so the next page starts here and carries it alone.
+			result.Done = false
+			return false, nil
+		}
+		if !cont {
 			return !finishExportIfLimited(opts, result), nil
 		}
 		if !result.Done && finishExportIfLimited(opts, result) {
@@ -690,4 +737,24 @@ func (s *mvccStore) MigrationImportMetadataPresent(_ context.Context, jobID uint
 		}
 	}
 	return false, nil
+}
+
+func (s *mvccStore) RetireMigration(ctx context.Context, jobID uint64) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	for id := range s.migrationAcks {
+		if id.jobID == jobID {
+			delete(s.migrationAcks, id)
+		}
+	}
+	delete(s.migrationHLCFloors, jobID)
+	delete(s.migrationPromotions, jobID)
+	return nil
+}
+
+func (s *mvccStore) RetireMigrationRaft(ctx context.Context, jobID, _ uint64) error {
+	return s.RetireMigration(ctx, jobID)
 }

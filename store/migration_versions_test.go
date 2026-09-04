@@ -57,42 +57,6 @@ func TestExportVersionsPreservesRawVersionMetadata(t *testing.T) {
 	})
 }
 
-func TestExportVersionsReadTSPreservesCompactionErrors(t *testing.T) {
-	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
-		ctx := context.Background()
-		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
-		retention, ok := st.(RetentionController)
-		require.True(t, ok)
-		retention.SetMinRetainedTS(20)
-
-		_, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			StartKey:             []byte("k"),
-			EndKey:               []byte("l"),
-			MaxCommitTSInclusive: 15,
-			ReadTS:               15,
-			MaxVersions:          10,
-		})
-		require.ErrorIs(t, err, ErrReadTSCompacted)
-
-		_, err = st.ExportVersions(ctx, ExportVersionsOptions{
-			StartKey:             []byte("k"),
-			EndKey:               []byte("l"),
-			MaxCommitTSInclusive: 15,
-			MaxVersions:          10,
-		})
-		require.ErrorIs(t, err, ErrReadTSCompacted)
-
-		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			StartKey:             []byte("k"),
-			EndKey:               []byte("l"),
-			MaxCommitTSInclusive: 25,
-			MaxVersions:          10,
-		})
-		require.NoError(t, err)
-		require.Len(t, result.Versions, 1)
-	})
-}
-
 func TestExportVersionsExcludesTxnLocks(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
@@ -122,29 +86,6 @@ func TestExportVersionsAcceptVersionFiltersByValue(t *testing.T) {
 		require.NoError(t, err)
 		require.True(t, result.Done)
 		require.Equal(t, []MVCCVersion{{Key: []byte("keep"), CommitTS: 20, Value: []byte("legacy-delta")}}, result.Versions)
-	})
-}
-
-func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
-	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
-		ctx := context.Background()
-		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("eligible"), 20, 0))
-		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("too-new"), 30, 0))
-		accepted := false
-
-		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			MaxCommitTSInclusive: 25,
-			MaxVersions:          1,
-			AcceptVersion: func(_ []byte, _ []byte) bool {
-				if accepted {
-					return false
-				}
-				accepted = true
-				return true
-			},
-		})
-		require.NoError(t, err)
-		require.Equal(t, []MVCCVersion{{Key: []byte("k"), CommitTS: 20, Value: []byte("eligible")}}, result.Versions)
 	})
 }
 
@@ -480,72 +421,6 @@ func TestExportVersionsRejectsCursorOutsideRequestedRange(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidExportCursor)
 		require.Empty(t, res.Versions)
 	})
-}
-
-func TestExportVersionsSkippedCursorBeforeStartResumesAtStartKey(t *testing.T) {
-	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
-		ctx := context.Background()
-		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
-		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m20"), 20, 0))
-
-		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			StartKey:    []byte("m"),
-			EndKey:      []byte("z"),
-			Cursor:      encodeExportCursor([]byte("a"), 10, exportCursorTagSkippedKey),
-			MaxVersions: 10,
-		})
-		require.NoError(t, err)
-		require.True(t, res.Done)
-		require.Equal(t, []MVCCVersion{{Key: []byte("m"), CommitTS: 20, Value: []byte("m20")}}, res.Versions)
-	})
-}
-
-func TestValidateExportCursorForRangeRejectsSkippedCursorInsideRange(t *testing.T) {
-	t.Parallel()
-
-	err := ValidateExportCursorForRange(
-		encodeExportCursor([]byte("stage|k"), 10, exportCursorTagSkippedKey),
-		[]byte("stage|"),
-		PrefixScanEnd([]byte("stage|")),
-	)
-	require.ErrorIs(t, err, ErrInvalidExportCursor)
-
-	err = ValidateExportCursorForRange(
-		encodeExportCursor([]byte("outside|k"), 10, exportCursorTagSkippedKey),
-		[]byte("stage|"),
-		PrefixScanEnd([]byte("stage|")),
-	)
-	require.NoError(t, err)
-}
-
-func TestValidatePromotionCursorForRangeAcceptsOnlyEmittedPositions(t *testing.T) {
-	t.Parallel()
-
-	prefix := []byte("stage|")
-	key := []byte("stage|k")
-	for _, tc := range []struct {
-		name    string
-		cursor  []byte
-		wantErr bool
-	}{
-		{name: "empty cursor"},
-		{name: "emitted cursor", cursor: encodeExportCursor(key, 10, exportCursorTagEmitted)},
-		{name: "scanned cursor", cursor: encodeExportCursor(key, 10, exportCursorTagScanned), wantErr: true},
-		{name: "pruned-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagPrunedKey), wantErr: true},
-		{name: "skipped-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagSkippedKey), wantErr: true},
-		{name: "emitted cursor outside range", cursor: encodeExportCursor([]byte("other|k"), 10, exportCursorTagEmitted), wantErr: true},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			err := ValidatePromotionCursorForRange(tc.cursor, prefix, PrefixScanEnd(prefix))
-			if tc.wantErr {
-				require.ErrorIs(t, err, ErrInvalidExportCursor)
-				return
-			}
-			require.NoError(t, err)
-		})
-	}
 }
 
 func TestExportVersionsDoesNotTreatMigrationPrefixUserKeyAsMetadata(t *testing.T) {
@@ -957,36 +832,379 @@ func TestImportVersionsIdempotencyAndMetadata(t *testing.T) {
 	})
 }
 
-func TestMigrationImportMetadataPresentClearsWithMigrationState(t *testing.T) {
+func TestRetireMigrationRemovesOnlySelectedJobMetadata(t *testing.T) {
 	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
 		ctx := context.Background()
-		reader, ok := st.(MigrationImportMetadataReader)
-		require.True(t, ok)
-		cleaner, ok := st.(MigrationCleaner)
-		require.True(t, ok)
+		seedPromotionState(t, ctx, st, 1, []byte("stage|job1|"), []byte("job1-promoted"))
+		seedPromotionState(t, ctx, st, 2, []byte("stage|job2|"), []byte("job2-promoted"))
 
-		present, err := reader.MigrationImportMetadataPresent(ctx, 1)
-		require.NoError(t, err)
-		require.False(t, present)
-		_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		_, err := st.ImportVersions(ctx, ImportVersionsOptions{
 			JobID:     1,
 			BracketID: 2,
 			BatchSeq:  1,
-			Cursor:    []byte("ack-only"),
+			Cursor:    []byte("job1-bracket2"),
+			Versions:  []MVCCVersion{{Key: []byte("job1-a"), CommitTS: 10, Value: []byte("v10")}},
 		})
 		require.NoError(t, err)
-		present, err = reader.MigrationImportMetadataPresent(ctx, 1)
+		_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 3,
+			BatchSeq:  1,
+			Cursor:    []byte("job1-bracket3"),
+			Versions:  []MVCCVersion{{Key: []byte("job1-b"), CommitTS: 20, Value: []byte("v20")}},
+		})
 		require.NoError(t, err)
-		require.True(t, present)
-		present, err = reader.MigrationImportMetadataPresent(ctx, 2)
+		_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     2,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("job2-bracket2"),
+			Versions:  []MVCCVersion{{Key: []byte("job2-a"), CommitTS: 30, Value: []byte("v30")}},
+		})
 		require.NoError(t, err)
-		require.False(t, present)
 
-		require.NoError(t, cleaner.ClearMigrationState(ctx, 1, 0))
-		present, err = reader.MigrationImportMetadataPresent(ctx, 1)
+		floor, err := st.MigrationHLCFloor(ctx, 1)
 		require.NoError(t, err)
-		require.False(t, present)
+		require.Equal(t, uint64(20), floor)
+		floor, err = st.MigrationHLCFloor(ctx, 2)
+		require.NoError(t, err)
+		require.Equal(t, uint64(30), floor)
+
+		require.NoError(t, st.RetireMigration(ctx, 1))
+
+		floor, err = st.MigrationHLCFloor(ctx, 1)
+		require.NoError(t, err)
+		require.Zero(t, floor)
+		floor, err = st.MigrationHLCFloor(ctx, 2)
+		require.NoError(t, err)
+		require.Equal(t, uint64(30), floor)
+		stateReader, ok := st.(MigrationPromotionStateReader)
+		require.True(t, ok)
+		_, ok = migrationPromotionState(t, ctx, stateReader, 1)
+		require.False(t, ok)
+		state, ok := migrationPromotionState(t, ctx, stateReader, 2)
+		require.True(t, ok)
+		require.True(t, state.Done)
+		require.Equal(t, uint64(1), state.PromotedRows)
+
+		res, err := st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("job1-new"),
+			Versions:  []MVCCVersion{{Key: []byte("job1-new"), CommitTS: 40, Value: []byte("v40")}},
+		})
+		require.NoError(t, err)
+		require.False(t, res.Duplicate)
+		require.Equal(t, []byte("job1-new"), res.AckedCursor)
+
+		res, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     2,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("job2-changed"),
+		})
+		require.NoError(t, err)
+		require.True(t, res.Duplicate)
+		require.Equal(t, []byte("job2-bracket2"), res.AckedCursor)
+
+		val, err := st.GetAt(ctx, []byte("job1-a"), 10)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v10"), val)
+		val, err = st.GetAt(ctx, []byte("job1-b"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v20"), val)
 	})
+}
+
+func seedPromotionState(t *testing.T, ctx context.Context, st MVCCStore, jobID uint64, prefix []byte, target []byte) {
+	t.Helper()
+	promoter, ok := st.(MigrationPromoter)
+	require.True(t, ok)
+	require.NoError(t, st.PutAt(ctx, append(bytes.Clone(prefix), 'k'), []byte("v"), 10+jobID, 0))
+	result, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       jobID,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey: func(staged []byte) ([]byte, bool) {
+			return target, bytes.HasPrefix(staged, prefix)
+		},
+	})
+	require.NoError(t, err)
+	require.True(t, result.Done)
+}
+
+func migrationPromotionState(t *testing.T, ctx context.Context, reader MigrationPromotionStateReader, jobID uint64) (PromotionState, bool) {
+	t.Helper()
+	state, ok, err := reader.MigrationPromotionState(ctx, jobID)
+	require.NoError(t, err)
+	return state, ok
+}
+
+func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-import-persist-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("persisted"),
+		Versions:  []MVCCVersion{{Key: []byte("k"), CommitTS: 99, Value: []byte("v")}},
+	})
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	floor, err := reopened.MigrationHLCFloor(ctx, 9)
+	require.NoError(t, err)
+	require.Equal(t, uint64(99), floor)
+	res, err := reopened.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("different"),
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("persisted"), res.AckedCursor)
+}
+
+func TestPebbleRetireMigrationPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-retire-persist-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("retired"),
+		Versions:  []MVCCVersion{{Key: []byte("retired-k"), CommitTS: 99, Value: []byte("v99")}},
+	})
+	require.NoError(t, err)
+	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     10,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("kept"),
+		Versions:  []MVCCVersion{{Key: []byte("kept-k"), CommitTS: 109, Value: []byte("v109")}},
+	})
+	require.NoError(t, err)
+	seedPromotionState(t, ctx, st, 9, []byte("stage|job9|"), []byte("job9-promoted"))
+	seedPromotionState(t, ctx, st, 10, []byte("stage|job10|"), []byte("job10-promoted"))
+	require.NoError(t, st.RetireMigration(ctx, 9))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	defer func() { require.NoError(t, reopened.Close()) }()
+	floor, err := reopened.MigrationHLCFloor(ctx, 9)
+	require.NoError(t, err)
+	require.Zero(t, floor)
+	floor, err = reopened.MigrationHLCFloor(ctx, 10)
+	require.NoError(t, err)
+	require.Equal(t, uint64(109), floor)
+	stateReader, ok := reopened.(MigrationPromotionStateReader)
+	require.True(t, ok)
+	_, ok = migrationPromotionState(t, ctx, stateReader, 9)
+	require.False(t, ok)
+	state, ok := migrationPromotionState(t, ctx, stateReader, 10)
+	require.True(t, ok)
+	require.True(t, state.Done)
+	require.Equal(t, uint64(1), state.PromotedRows)
+
+	res, err := reopened.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("retired-fresh"),
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, []byte("retired-fresh"), res.AckedCursor)
+
+	res, err = reopened.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     10,
+		BracketID: 4,
+		BatchSeq:  1,
+		Cursor:    []byte("kept-changed"),
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("kept"), res.AckedCursor)
+}
+
+func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
+	ctx := context.Background()
+	srcDir, err := os.MkdirTemp("", "migration-snapshot-src-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(srcDir)) })
+	src, err := NewPebbleStore(srcDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, src.Close()) })
+
+	_, err = src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("stale"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	raw := snapshotBytes(t, snap)
+	require.NoError(t, snap.Close())
+
+	dstDir, err := os.MkdirTemp("", "migration-snapshot-dst-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dstDir)) })
+	dst, err := NewPebbleStore(dstDir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, dst.Close()) })
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+
+	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("stale"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+}
+
+// A migration driver that leaves MaxVersions unset must not be told the
+// bracket is complete. Answering Done for a zero budget lets it record a
+// non-empty range as fully copied and proceed to cutover without moving a
+// single version.
+func TestExportVersionsRejectsZeroVersionBudget(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("v"), 10, 0))
+
+		for _, budget := range []int{0, -1} {
+			got, err := st.ExportVersions(ctx, ExportVersionsOptions{
+				MaxVersions:          budget,
+				MaxCommitTSInclusive: 100,
+				EndKey:               []byte("z"),
+			})
+			require.ErrorIs(t, err, ErrInvalidExportBudget, "budget %d", budget)
+			require.False(t, got.Done, "a refused export must not report completion")
+			require.Empty(t, got.Versions)
+		}
+	})
+}
+
+func TestExportVersionsAppliesTimestampBoundBeforeAcceptVersion(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("eligible"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("too-new"), 30, 0))
+		accepted := false
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxCommitTSInclusive: 25,
+			MaxVersions:          1,
+			AcceptVersion: func(_ []byte, _ []byte) bool {
+				if accepted {
+					return false
+				}
+				accepted = true
+				return true
+			},
+		})
+		require.NoError(t, err)
+		require.Equal(t, []MVCCVersion{{Key: []byte("k"), CommitTS: 20, Value: []byte("eligible")}}, result.Versions)
+	})
+}
+
+func TestExportVersionsSkippedCursorBeforeStartResumesAtStartKey(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("a10"), 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("m"), []byte("m20"), 20, 0))
+
+		res, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("m"),
+			EndKey:      []byte("z"),
+			Cursor:      encodeExportCursor([]byte("a"), 10, exportCursorTagSkippedKey),
+			MaxVersions: 10,
+		})
+		require.NoError(t, err)
+		require.True(t, res.Done)
+		require.Equal(t, []MVCCVersion{{Key: []byte("m"), CommitTS: 20, Value: []byte("m20")}}, res.Versions)
+	})
+}
+
+func TestValidateExportCursorForRangeRejectsSkippedCursorInsideRange(t *testing.T) {
+	t.Parallel()
+
+	err := ValidateExportCursorForRange(
+		encodeExportCursor([]byte("stage|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.ErrorIs(t, err, ErrInvalidExportCursor)
+
+	err = ValidateExportCursorForRange(
+		encodeExportCursor([]byte("outside|k"), 10, exportCursorTagSkippedKey),
+		[]byte("stage|"),
+		PrefixScanEnd([]byte("stage|")),
+	)
+	require.NoError(t, err)
+}
+
+func TestValidatePromotionCursorForRangeAcceptsOnlyEmittedPositions(t *testing.T) {
+	t.Parallel()
+
+	prefix := []byte("stage|")
+	key := []byte("stage|k")
+	for _, tc := range []struct {
+		name    string
+		cursor  []byte
+		wantErr bool
+	}{
+		{name: "empty cursor"},
+		{name: "emitted cursor", cursor: encodeExportCursor(key, 10, exportCursorTagEmitted)},
+		{name: "scanned cursor", cursor: encodeExportCursor(key, 10, exportCursorTagScanned), wantErr: true},
+		{name: "pruned-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagPrunedKey), wantErr: true},
+		{name: "skipped-key cursor", cursor: encodeExportCursor(key, 10, exportCursorTagSkippedKey), wantErr: true},
+		{name: "emitted cursor outside range", cursor: encodeExportCursor([]byte("other|k"), 10, exportCursorTagEmitted), wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := ValidatePromotionCursorForRange(tc.cursor, prefix, PrefixScanEnd(prefix))
+			if tc.wantErr {
+				require.ErrorIs(t, err, ErrInvalidExportCursor)
+				return
+			}
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
@@ -1099,138 +1317,6 @@ func TestPromoteVersionsMovesStagedVersionsAndDeletesStagedRows(t *testing.T) {
 		require.True(t, stagedLeft.Done)
 		require.Empty(t, stagedLeft.Versions)
 	})
-}
-
-func TestTargetStagedReadinessStatePersistsAndIsCloned(t *testing.T) {
-	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
-		ctx := context.Background()
-		writer, ok := st.(MigrationTargetReadinessWriter)
-		require.True(t, ok)
-		reader, ok := st.(MigrationTargetReadinessReader)
-		require.True(t, ok)
-
-		state := TargetStagedReadinessState{
-			JobID:                  9,
-			RouteStart:             []byte("a"),
-			RouteEnd:               []byte("z"),
-			ExpectedCutoverVersion: 12,
-			MigrationJobID:         9,
-			MinWriteTSExclusive:    100,
-			Armed:                  true,
-		}
-		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
-
-		states, err := reader.MigrationTargetReadinessStates(ctx)
-		require.NoError(t, err)
-		require.Equal(t, []TargetStagedReadinessState{state}, states)
-
-		states[0].RouteStart[0] = 'x'
-		states, err = reader.MigrationTargetReadinessStates(ctx)
-		require.NoError(t, err)
-		require.Equal(t, []byte("a"), states[0].RouteStart)
-
-		updated := state
-		updated.MinWriteTSExclusive = 101
-		updated.RouteStart = []byte("b")
-		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, updated))
-
-		states, err = reader.MigrationTargetReadinessStates(ctx)
-		require.NoError(t, err)
-		require.Equal(t, []TargetStagedReadinessState{updated}, states)
-
-		exported, err := st.ExportVersions(ctx, ExportVersionsOptions{
-			StartKey:    []byte("!"),
-			EndKey:      []byte("~"),
-			MaxVersions: 100,
-		})
-		require.NoError(t, err)
-		require.Empty(t, exported.Versions)
-	})
-}
-
-func TestTargetStagedReadinessRejectsArmedStateWithoutWriteFloor(t *testing.T) {
-	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
-		writer, ok := st.(MigrationTargetReadinessWriter)
-		require.True(t, ok)
-
-		err := writer.ApplyTargetStagedReadiness(context.Background(), TargetStagedReadinessState{
-			JobID:                  9,
-			RouteStart:             []byte("a"),
-			RouteEnd:               []byte("z"),
-			ExpectedCutoverVersion: 12,
-			MigrationJobID:         9,
-			Armed:                  true,
-		})
-		require.ErrorContains(t, err, "min_write_ts_exclusive")
-	})
-}
-
-func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
-	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "migration-ready-persist-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-
-	st, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	state := TargetStagedReadinessState{
-		JobID:                  11,
-		RouteStart:             []byte("m"),
-		RouteEnd:               nil,
-		ExpectedCutoverVersion: 22,
-		MigrationJobID:         11,
-		MinWriteTSExclusive:    333,
-		Armed:                  true,
-	}
-	writer, ok := st.(MigrationTargetReadinessWriter)
-	require.True(t, ok)
-	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
-	require.NoError(t, st.Close())
-
-	reopened, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
-	reader, ok := reopened.(MigrationTargetReadinessReader)
-	require.True(t, ok)
-	states, err := reader.MigrationTargetReadinessStates(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []TargetStagedReadinessState{state}, states)
-}
-
-func TestPebbleTargetStagedReadinessIgnoresNonRecordPrefixKeys(t *testing.T) {
-	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "migration-ready-prefix-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-
-	st, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	state := TargetStagedReadinessState{
-		JobID:                  11,
-		RouteStart:             []byte("m"),
-		RouteEnd:               nil,
-		ExpectedCutoverVersion: 22,
-		MigrationJobID:         11,
-		MinWriteTSExclusive:    333,
-		Armed:                  true,
-	}
-	writer, ok := st.(MigrationTargetReadinessWriter)
-	require.True(t, ok)
-	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
-	pebbleStore, ok := st.(*pebbleStore)
-	require.True(t, ok)
-	junkKey := append([]byte(migrationReadyPrefix), []byte("side-record")...)
-	require.NoError(t, pebbleStore.db.Set(junkKey, []byte("not-readiness-state"), pebbleStore.directApplyWriteOpts()))
-	require.NoError(t, st.Close())
-
-	reopened, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
-	reader, ok := reopened.(MigrationTargetReadinessReader)
-	require.True(t, ok)
-	states, err := reader.MigrationTargetReadinessStates(ctx)
-	require.NoError(t, err)
-	require.Equal(t, []TargetStagedReadinessState{state}, states)
 }
 
 func TestPromoteVersionsIgnoresClientCursorWhenStateMissing(t *testing.T) {
@@ -1394,64 +1480,36 @@ func TestPromotionStateCodecPreservesMaxPromotedTS(t *testing.T) {
 	require.Equal(t, "old-error", decoded.LastError)
 }
 
-func TestPebbleImportMetadataPersistsAcrossReopen(t *testing.T) {
+func TestPebbleRestoreStreamingSnapshotPreservesMigrationPromotionState(t *testing.T) {
 	ctx := context.Background()
-	dir, err := os.MkdirTemp("", "migration-import-persist-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+	src := NewMVCCStore()
+	promoter, ok := src.(MigrationPromoter)
+	require.True(t, ok)
 
-	st, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	_, err = st.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     9,
-		BracketID: 4,
-		BatchSeq:  1,
-		Cursor:    []byte("persisted"),
-		Versions:  []MVCCVersion{{Key: []byte("k"), CommitTS: 99, Value: []byte("v")}},
+	prefix := []byte("stage|")
+	targetKey := func(staged []byte) ([]byte, bool) {
+		return bytes.TrimPrefix(staged, prefix), bytes.HasPrefix(staged, prefix)
+	}
+	require.NoError(t, src.PutAt(ctx, []byte("stage|a"), []byte("va"), 100, 0))
+	require.NoError(t, src.PutAt(ctx, []byte("stage|b"), []byte("vb"), 110, 0))
+
+	first, err := promoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       12,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 1,
+		TargetKey:   targetKey,
 	})
 	require.NoError(t, err)
-	require.NoError(t, st.Close())
+	require.False(t, first.Done)
+	require.Equal(t, uint64(1), first.TotalPromotedRows)
 
-	reopened, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer func() { require.NoError(t, reopened.Close()) }()
-	floor, err := reopened.MigrationHLCFloor(ctx, 9)
-	require.NoError(t, err)
-	require.Equal(t, uint64(99), floor)
-	res, err := reopened.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     9,
-		BracketID: 4,
-		BatchSeq:  1,
-		Cursor:    []byte("different"),
-	})
-	require.NoError(t, err)
-	require.True(t, res.Duplicate)
-	require.Equal(t, []byte("persisted"), res.AckedCursor)
-}
-
-func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
-	ctx := context.Background()
-	srcDir, err := os.MkdirTemp("", "migration-snapshot-src-*")
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, os.RemoveAll(srcDir)) })
-	src, err := NewPebbleStore(srcDir)
-	require.NoError(t, err)
-	t.Cleanup(func() { require.NoError(t, src.Close()) })
-
-	_, err = src.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     7,
-		BracketID: 3,
-		BatchSeq:  1,
-		Cursor:    []byte("stale"),
-		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
-	})
-	require.NoError(t, err)
 	snap, err := src.Snapshot()
 	require.NoError(t, err)
 	raw := snapshotBytes(t, snap)
 	require.NoError(t, snap.Close())
 
-	dstDir, err := os.MkdirTemp("", "migration-snapshot-dst-*")
+	dstDir, err := os.MkdirTemp("", "migration-streaming-snapshot-dst-*")
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dstDir)) })
 	dst, err := NewPebbleStore(dstDir)
@@ -1459,25 +1517,280 @@ func TestPebbleSnapshotPreservesMigrationMetadata(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, dst.Close()) })
 	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
 
-	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	dstPromoter, ok := any(dst).(MigrationPromoter)
+	require.True(t, ok)
+	stateReader, ok := any(dst).(MigrationPromotionStateReader)
+	require.True(t, ok)
+	state, ok, err := stateReader.MigrationPromotionState(ctx, 12)
 	require.NoError(t, err)
-	require.Equal(t, []byte("v50"), val)
-	floor, err := dst.MigrationHLCFloor(ctx, 7)
-	require.NoError(t, err)
-	require.Equal(t, uint64(50), floor)
+	require.True(t, ok)
+	require.False(t, state.Done)
+	require.Equal(t, first.NextCursor, state.Cursor)
+	require.Equal(t, uint64(1), state.PromotedRows)
+	require.Equal(t, uint64(100), state.MaxPromotedTS)
 
-	res, err := dst.ImportVersions(ctx, ImportVersionsOptions{
-		JobID:     7,
-		BracketID: 3,
-		BatchSeq:  1,
-		Cursor:    []byte("fresh"),
-		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	restored, err := dstPromoter.PromoteVersions(ctx, PromoteVersionsOptions{
+		JobID:       12,
+		StartKey:    prefix,
+		EndKey:      PrefixScanEnd(prefix),
+		MaxVersions: 10,
+		TargetKey:   targetKey,
 	})
 	require.NoError(t, err)
-	require.True(t, res.Duplicate)
-	require.Equal(t, []byte("stale"), res.AckedCursor)
-	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
-	require.ErrorIs(t, err, ErrKeyNotFound)
+	require.True(t, restored.Done)
+	require.Equal(t, uint64(1), restored.PromotedRows)
+	require.Equal(t, uint64(2), restored.TotalPromotedRows)
+	require.Equal(t, uint64(110), restored.MaxPromotedTS)
+}
+
+func TestExportVersionsSplitsBeforeOverflowingTheByteBudget(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+
+		small := bytes.Repeat([]byte("s"), 1<<10)
+		large := bytes.Repeat([]byte("l"), 8<<10)
+		require.NoError(t, st.PutAt(ctx, []byte("a"), small, 10, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("b"), large, 11, 0))
+
+		opts := ExportVersionsOptions{
+			MaxVersions:          16,
+			MaxBytes:             4 << 10,
+			MaxCommitTSInclusive: 100,
+			EndKey:               []byte("z"),
+		}
+		first, err := st.ExportVersions(ctx, opts)
+		require.NoError(t, err)
+		require.False(t, first.Done)
+		require.Len(t, first.Versions, 1, "the oversized row must not join this page")
+		require.Equal(t, []byte("a"), first.Versions[0].Key)
+		require.LessOrEqual(t, first.ExportedBytes, opts.MaxBytes, "the page stays inside its budget")
+
+		opts.Cursor = first.NextCursor
+		second, err := st.ExportVersions(ctx, opts)
+		require.NoError(t, err)
+		require.Len(t, second.Versions, 1, "the oversized row goes out alone")
+		require.Equal(t, []byte("b"), second.Versions[0].Key)
+		require.Equal(t, large, second.Versions[0].Value)
+	})
+}
+
+func TestExportVersionsEmitsSingleOversizedRow(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+
+		huge := bytes.Repeat([]byte("h"), 8<<10)
+		require.NoError(t, st.PutAt(ctx, []byte("a"), huge, 10, 0))
+
+		got, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			MaxVersions:          16,
+			MaxBytes:             1 << 10,
+			MaxCommitTSInclusive: 100,
+			EndKey:               []byte("z"),
+		})
+		require.NoError(t, err)
+		require.Len(t, got.Versions, 1)
+		require.Equal(t, huge, got.Versions[0].Value)
+	})
+}
+
+func TestExportVersionsReadTSPreservesCompactionErrors(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
+		retention, ok := st.(RetentionController)
+		require.True(t, ok)
+		retention.SetMinRetainedTS(20)
+
+		_, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 15,
+			ReadTS:               15,
+			MaxVersions:          10,
+		})
+		require.ErrorIs(t, err, ErrReadTSCompacted)
+
+		_, err = st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 15,
+			MaxVersions:          10,
+		})
+		require.ErrorIs(t, err, ErrReadTSCompacted)
+
+		result, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:             []byte("k"),
+			EndKey:               []byte("l"),
+			MaxCommitTSInclusive: 25,
+			MaxVersions:          10,
+		})
+		require.NoError(t, err)
+		require.Len(t, result.Versions, 1)
+	})
+}
+
+func TestMigrationImportMetadataPresentClearsWithMigrationState(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		reader, ok := st.(MigrationImportMetadataReader)
+		require.True(t, ok)
+		cleaner, ok := st.(MigrationCleaner)
+		require.True(t, ok)
+
+		present, err := reader.MigrationImportMetadataPresent(ctx, 1)
+		require.NoError(t, err)
+		require.False(t, present)
+		_, err = st.ImportVersions(ctx, ImportVersionsOptions{
+			JobID:     1,
+			BracketID: 2,
+			BatchSeq:  1,
+			Cursor:    []byte("ack-only"),
+		})
+		require.NoError(t, err)
+		present, err = reader.MigrationImportMetadataPresent(ctx, 1)
+		require.NoError(t, err)
+		require.True(t, present)
+		present, err = reader.MigrationImportMetadataPresent(ctx, 2)
+		require.NoError(t, err)
+		require.False(t, present)
+
+		require.NoError(t, cleaner.ClearMigrationState(ctx, 1, 0))
+		present, err = reader.MigrationImportMetadataPresent(ctx, 1)
+		require.NoError(t, err)
+		require.False(t, present)
+	})
+}
+
+func TestTargetStagedReadinessStatePersistsAndIsCloned(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		ctx := context.Background()
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+		reader, ok := st.(MigrationTargetReadinessReader)
+		require.True(t, ok)
+
+		state := TargetStagedReadinessState{
+			JobID:                  9,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 12,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+			Armed:                  true,
+		}
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+
+		states, err := reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []TargetStagedReadinessState{state}, states)
+
+		states[0].RouteStart[0] = 'x'
+		states, err = reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []byte("a"), states[0].RouteStart)
+
+		updated := state
+		updated.MinWriteTSExclusive = 101
+		updated.RouteStart = []byte("b")
+		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, updated))
+
+		states, err = reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Equal(t, []TargetStagedReadinessState{updated}, states)
+
+		exported, err := st.ExportVersions(ctx, ExportVersionsOptions{
+			StartKey:    []byte("!"),
+			EndKey:      []byte("~"),
+			MaxVersions: 100,
+		})
+		require.NoError(t, err)
+		require.Empty(t, exported.Versions)
+	})
+}
+
+func TestTargetStagedReadinessRejectsArmedStateWithoutWriteFloor(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		writer, ok := st.(MigrationTargetReadinessWriter)
+		require.True(t, ok)
+
+		err := writer.ApplyTargetStagedReadiness(context.Background(), TargetStagedReadinessState{
+			JobID:                  9,
+			RouteStart:             []byte("a"),
+			RouteEnd:               []byte("z"),
+			ExpectedCutoverVersion: 12,
+			MigrationJobID:         9,
+			Armed:                  true,
+		})
+		require.ErrorContains(t, err, "min_write_ts_exclusive")
+	})
+}
+
+func TestPebbleTargetStagedReadinessPersistsAcrossReopen(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-ready-persist-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	state := TargetStagedReadinessState{
+		JobID:                  11,
+		RouteStart:             []byte("m"),
+		RouteEnd:               nil,
+		ExpectedCutoverVersion: 22,
+		MigrationJobID:         11,
+		MinWriteTSExclusive:    333,
+		Armed:                  true,
+	}
+	writer, ok := st.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	reader, ok := reopened.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{state}, states)
+}
+
+func TestPebbleTargetStagedReadinessIgnoresNonRecordPrefixKeys(t *testing.T) {
+	ctx := context.Background()
+	dir, err := os.MkdirTemp("", "migration-ready-prefix-*")
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
+
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	state := TargetStagedReadinessState{
+		JobID:                  11,
+		RouteStart:             []byte("m"),
+		RouteEnd:               nil,
+		ExpectedCutoverVersion: 22,
+		MigrationJobID:         11,
+		MinWriteTSExclusive:    333,
+		Armed:                  true,
+	}
+	writer, ok := st.(MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, state))
+	pebbleStore, ok := st.(*pebbleStore)
+	require.True(t, ok)
+	junkKey := append([]byte(migrationReadyPrefix), []byte("side-record")...)
+	require.NoError(t, pebbleStore.db.Set(junkKey, []byte("not-readiness-state"), pebbleStore.directApplyWriteOpts()))
+	require.NoError(t, st.Close())
+
+	reopened, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, reopened.Close()) })
+	reader, ok := reopened.(MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{state}, states)
 }
 
 func TestCleanupVersionsRemovesOnlySelectedCommittedVersions(t *testing.T) {

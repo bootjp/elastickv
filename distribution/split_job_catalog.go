@@ -451,7 +451,7 @@ func (s *CatalogStore) MoveSplitJobToHistory(ctx context.Context, expected Split
 		return err
 	}
 	readTS := s.store.LastCommitTS()
-	if applied, err := s.splitJobHistoryMoveApplied(ctx, job.JobID, readTS); err != nil || applied {
+	if applied, err := s.finishAppliedSplitJobHistoryMove(ctx, job.JobID, readTS); err != nil || applied {
 		return err
 	}
 	if err := s.expectLiveSplitJobAt(ctx, job.JobID, expectedRaw, readTS); err != nil {
@@ -466,7 +466,55 @@ func (s *CatalogStore) MoveSplitJobToHistory(ctx context.Context, expected Split
 		Op:  store.OpTypeDelete,
 		Key: CatalogSplitJobKey(job.JobID),
 	})
-	return s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(job.JobID)}, mutations)
+	if err := s.applySplitJobMutations(ctx, readTS, [][]byte{CatalogSplitJobKey(job.JobID)}, mutations); err != nil {
+		return err
+	}
+	return s.retireSplitJobMigrationMetadata(ctx, job)
+}
+
+func (s *CatalogStore) finishAppliedSplitJobHistoryMove(ctx context.Context, jobID, readTS uint64) (bool, error) {
+	appliedJob, applied, err := s.splitJobHistoryMoveApplied(ctx, jobID, readTS)
+	if err != nil {
+		return false, err
+	}
+	if !applied {
+		return false, nil
+	}
+	if err := s.retireSplitJobMigrationMetadata(ctx, appliedJob); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *CatalogStore) retireSplitJobMigrationMetadata(ctx context.Context, job SplitJob) error {
+	if s.migrationRetireForGroup != nil {
+		if err := s.migrationRetireForGroup(ctx, job.TargetGroupID, job.JobID); err != nil && !errors.Is(err, store.ErrNotSupported) {
+			return errors.WithStack(err)
+		}
+		return nil
+	}
+	st, err := s.migrationMetadataStore(job.TargetGroupID)
+	if err != nil {
+		return err
+	}
+	if err := st.RetireMigration(ctx, job.JobID); err != nil && !errors.Is(err, store.ErrNotSupported) {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func (s *CatalogStore) migrationMetadataStore(groupID uint64) (store.MVCCStore, error) {
+	if s.migrationStoreForGroup == nil {
+		return s.store, nil
+	}
+	st, err := s.migrationStoreForGroup(groupID)
+	if err != nil {
+		return nil, err
+	}
+	if st == nil {
+		return nil, errors.WithStack(errors.Newf("migration metadata store is not available for group %d", groupID))
+	}
+	return st, nil
 }
 
 func validateSplitJobHistoryMove(expected SplitJob, job SplitJob) error {
@@ -479,18 +527,19 @@ func validateSplitJobHistoryMove(expected SplitJob, job SplitJob) error {
 	return nil
 }
 
-func (s *CatalogStore) splitJobHistoryMoveApplied(ctx context.Context, jobID uint64, ts uint64) (bool, error) {
-	if _, found, err := s.historySplitJobAt(ctx, jobID, ts); err != nil {
-		return false, err
+func (s *CatalogStore) splitJobHistoryMoveApplied(ctx context.Context, jobID uint64, ts uint64) (SplitJob, bool, error) {
+	historyJob, found, err := s.historySplitJobAt(ctx, jobID, ts)
+	if err != nil {
+		return SplitJob{}, false, err
 	} else if !found {
-		return false, nil
+		return SplitJob{}, false, nil
 	}
 	if _, liveFound, err := s.liveSplitJobAt(ctx, jobID, ts); err != nil {
-		return false, err
+		return SplitJob{}, false, err
 	} else if liveFound {
-		return false, errors.WithStack(ErrCatalogSplitJobConflict)
+		return SplitJob{}, false, errors.WithStack(ErrCatalogSplitJobConflict)
 	}
-	return true, nil
+	return historyJob, true, nil
 }
 
 // DeleteSplitJob deletes a live split job.

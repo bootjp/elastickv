@@ -17,22 +17,18 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 	defer shutdown(nodes)
 
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-	defer func() { _ = rdb.Close() }()
-
-	server := nodes[0].redisServer
 	ttl := 30 * time.Second
 	cases := []struct {
 		name     string
 		keyBase  string
-		create   func(string) error
+		create   func(*redis.Client, string) error
 		metaKey  func([]byte) []byte
 		expireAt func([]byte) (uint64, error)
 	}{
 		{
 			name:    "hash",
 			keyBase: "ttl:inline:hash",
-			create:  func(key string) error { return rdb.HSet(ctx, key, "field", "value").Err() },
+			create:  func(rdb *redis.Client, key string) error { return rdb.HSet(ctx, key, "field", "value").Err() },
 			metaKey: store.HashMetaKey,
 			expireAt: func(raw []byte) (uint64, error) {
 				meta, err := store.UnmarshalHashMeta(raw)
@@ -42,7 +38,7 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		{
 			name:    "set",
 			keyBase: "ttl:inline:set",
-			create:  func(key string) error { return rdb.SAdd(ctx, key, "member").Err() },
+			create:  func(rdb *redis.Client, key string) error { return rdb.SAdd(ctx, key, "member").Err() },
 			metaKey: store.SetMetaKey,
 			expireAt: func(raw []byte) (uint64, error) {
 				meta, err := store.UnmarshalSetMeta(raw)
@@ -52,7 +48,7 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		{
 			name:    "zset",
 			keyBase: "ttl:inline:zset",
-			create: func(key string) error {
+			create: func(rdb *redis.Client, key string) error {
 				return rdb.ZAdd(ctx, key, redis.Z{Score: 1, Member: "member"}).Err()
 			},
 			metaKey: store.ZSetMetaKey,
@@ -64,7 +60,7 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		{
 			name:    "list",
 			keyBase: "ttl:inline:list",
-			create:  func(key string) error { return rdb.RPush(ctx, key, "item").Err() },
+			create:  func(rdb *redis.Client, key string) error { return rdb.RPush(ctx, key, "item").Err() },
 			metaKey: store.ListMetaKey,
 			expireAt: func(raw []byte) (uint64, error) {
 				meta, err := store.UnmarshalListMeta(raw)
@@ -74,7 +70,7 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		{
 			name:    "stream",
 			keyBase: "ttl:inline:stream",
-			create: func(key string) error {
+			create: func(rdb *redis.Client, key string) error {
 				return rdb.XAdd(ctx, &redis.XAddArgs{
 					Stream: key,
 					Values: map[string]any{"field": "value"},
@@ -89,17 +85,17 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 	}
 	modes := []struct {
 		name   string
-		expire func(string) error
+		expire func(*redis.Client, string) error
 	}{
 		{
 			name: "direct",
-			expire: func(key string) error {
+			expire: func(rdb *redis.Client, key string) error {
 				return rdb.PExpire(ctx, key, ttl).Err()
 			},
 		},
 		{
 			name: "multi",
-			expire: func(key string) error {
+			expire: func(rdb *redis.Client, key string) error {
 				pipe := rdb.TxPipeline()
 				pipe.PExpire(ctx, key, ttl)
 				_, err := pipe.Exec(ctx)
@@ -108,7 +104,7 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		},
 		{
 			name: "lua",
-			expire: func(key string) error {
+			expire: func(rdb *redis.Client, key string) error {
 				_, err := rdb.Eval(ctx, `return redis.call("pexpire", KEYS[1], ARGV[1])`, []string{key}, int(ttl/time.Millisecond)).Result()
 				return err
 			},
@@ -119,8 +115,29 @@ func TestRedisCollectionExpireWritesInlineMetaTTL(t *testing.T) {
 		for _, mode := range modes {
 			t.Run(tc.name+"/"+mode.name, func(t *testing.T) {
 				key := tc.keyBase + ":" + mode.name
-				require.NoError(t, tc.create(key))
-				require.NoError(t, mode.expire(key))
+				require.NoError(t, retryNotLeader(ctx, func() error {
+					leaderRDB, _, err := redisClientAndServerForCurrentLeader(t, nodes)
+					if err != nil {
+						return err
+					}
+					defer func() { _ = leaderRDB.Close() }()
+					return tc.create(leaderRDB, key)
+				}))
+
+				var server *RedisServer
+				require.NoError(t, retryNotLeader(ctx, func() error {
+					leaderRDB, leaderServer, err := redisClientAndServerForCurrentLeader(t, nodes)
+					if err != nil {
+						return err
+					}
+					defer func() { _ = leaderRDB.Close() }()
+					if err := mode.expire(leaderRDB, key); err != nil {
+						return err
+					}
+					server = leaderServer
+					return nil
+				}))
+				require.NotNil(t, server)
 
 				readTS := server.readTS()
 				raw, err := server.store.GetAt(ctx, tc.metaKey([]byte(key)), readTS)
@@ -175,6 +192,22 @@ func TestExpiredTTLIndexPrecedesLegacyListDeltaOnlyCollection(t *testing.T) {
 
 	require.NoError(t, err)
 	require.True(t, stale)
+}
+
+func redisClientAndServerForCurrentLeader(t *testing.T, nodes []Node) (*redis.Client, *RedisServer, error) {
+	t.Helper()
+	for _, view := range nodes {
+		leaderAddr := view.engine.Leader().Address
+		if leaderAddr == "" {
+			continue
+		}
+		for _, n := range nodes {
+			if n.raftAddress == leaderAddr {
+				return redis.NewClient(&redis.Options{Addr: n.redisAddress}), n.redisServer, nil
+			}
+		}
+	}
+	return nil, nil, ErrLeaderNotFound
 }
 
 func TestRedisCollectionExpireHandlesLegacyBlobs(t *testing.T) {
@@ -342,6 +375,7 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 		deltaKey     func([]byte, uint64) []byte
 		deltaValue   []byte
 		metaExpireAt func([]byte) (uint64, error)
+		urgentTypes  []string
 	}{
 		{
 			name:    "list",
@@ -361,6 +395,7 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 				meta, err := store.UnmarshalListMeta(raw)
 				return meta.ExpireAt, err
 			},
+			urgentTypes: []string{"list", "list-legacy"},
 		},
 		{
 			name:    "hash",
@@ -378,6 +413,7 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 				meta, err := store.UnmarshalHashMeta(raw)
 				return meta.ExpireAt, err
 			},
+			urgentTypes: []string{"hash"},
 		},
 		{
 			name:    "set",
@@ -395,6 +431,7 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 				meta, err := store.UnmarshalSetMeta(raw)
 				return meta.ExpireAt, err
 			},
+			urgentTypes: []string{"set"},
 		},
 		{
 			name:    "zset",
@@ -412,6 +449,7 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 				meta, err := store.UnmarshalZSetMeta(raw)
 				return meta.ExpireAt, err
 			},
+			urgentTypes: []string{"zset"},
 		},
 	}
 
@@ -447,13 +485,7 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 			ttl, err := decodeRedisTTL(rawTTL)
 			require.NoError(t, err)
 			require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(ttl))
-			select {
-			case req := <-compactor.urgentCh:
-				require.Equal(t, tc.name, req.typeName)
-				require.Equal(t, key, req.userKey)
-			default:
-				t.Fatalf("expected urgent compaction request for %s", tc.name)
-			}
+			requireUrgentCompactionRequests(t, compactor, key, tc.urgentTypes...)
 		})
 	}
 }
@@ -464,34 +496,39 @@ func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections
 	ctx := context.Background()
 	expireAt := time.Now().Add(time.Hour)
 	cases := []struct {
-		name       string
-		typ        redisValueType
-		deltaKey   func([]byte, uint64) []byte
-		deltaValue []byte
+		name        string
+		typ         redisValueType
+		deltaKey    func([]byte, uint64) []byte
+		deltaValue  []byte
+		urgentTypes []string
 	}{
 		{
-			name:       "list",
-			typ:        redisTypeList,
-			deltaKey:   func(key []byte, ts uint64) []byte { return store.ListMetaDeltaKey(key, ts, 0) },
-			deltaValue: store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}),
+			name:        "list",
+			typ:         redisTypeList,
+			deltaKey:    func(key []byte, ts uint64) []byte { return store.ListMetaDeltaKey(key, ts, 0) },
+			deltaValue:  store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}),
+			urgentTypes: []string{"list", "list-legacy"},
 		},
 		{
-			name:       "hash",
-			typ:        redisTypeHash,
-			deltaKey:   func(key []byte, ts uint64) []byte { return store.HashMetaDeltaKey(key, ts, 0) },
-			deltaValue: store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+			name:        "hash",
+			typ:         redisTypeHash,
+			deltaKey:    func(key []byte, ts uint64) []byte { return store.HashMetaDeltaKey(key, ts, 0) },
+			deltaValue:  store.MarshalHashMetaDelta(store.HashMetaDelta{LenDelta: 1}),
+			urgentTypes: []string{"hash"},
 		},
 		{
-			name:       "set",
-			typ:        redisTypeSet,
-			deltaKey:   func(key []byte, ts uint64) []byte { return store.SetMetaDeltaKey(key, ts, 0) },
-			deltaValue: store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+			name:        "set",
+			typ:         redisTypeSet,
+			deltaKey:    func(key []byte, ts uint64) []byte { return store.SetMetaDeltaKey(key, ts, 0) },
+			deltaValue:  store.MarshalSetMetaDelta(store.SetMetaDelta{LenDelta: 1}),
+			urgentTypes: []string{"set"},
 		},
 		{
-			name:       "zset",
-			typ:        redisTypeZSet,
-			deltaKey:   func(key []byte, ts uint64) []byte { return store.ZSetMetaDeltaKey(key, ts, 0) },
-			deltaValue: store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+			name:        "zset",
+			typ:         redisTypeZSet,
+			deltaKey:    func(key []byte, ts uint64) []byte { return store.ZSetMetaDeltaKey(key, ts, 0) },
+			deltaValue:  store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: 1}),
+			urgentTypes: []string{"zset"},
 		},
 	}
 
@@ -514,14 +551,21 @@ func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections
 			_, err = st.GetAt(ctx, redisTTLKey(key), st.LastCommitTS())
 			require.ErrorIs(t, err, store.ErrKeyNotFound)
 
-			select {
-			case req := <-compactor.urgentCh:
-				require.Equal(t, tc.name, req.typeName)
-				require.Equal(t, key, req.userKey)
-			default:
-				t.Fatalf("expected urgent compaction request for %s", tc.name)
-			}
+			requireUrgentCompactionRequests(t, compactor, key, tc.urgentTypes...)
 		})
+	}
+}
+
+func requireUrgentCompactionRequests(t *testing.T, compactor *DeltaCompactor, key []byte, typeNames ...string) {
+	t.Helper()
+	for _, typeName := range typeNames {
+		select {
+		case req := <-compactor.urgentCh:
+			require.Equal(t, typeName, req.typeName)
+			require.Equal(t, key, req.userKey)
+		default:
+			t.Fatalf("expected urgent compaction request for %s", typeName)
+		}
 	}
 }
 

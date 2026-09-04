@@ -21,8 +21,11 @@ const _ = grpc.SupportPackageIsVersion9
 const (
 	Distribution_GetRoute_FullMethodName                    = "/Distribution/GetRoute"
 	Distribution_GetTimestamp_FullMethodName                = "/Distribution/GetTimestamp"
+	Distribution_ValidateTimestamp_FullMethodName           = "/Distribution/ValidateTimestamp"
 	Distribution_ListRoutes_FullMethodName                  = "/Distribution/ListRoutes"
 	Distribution_SplitRange_FullMethodName                  = "/Distribution/SplitRange"
+	Distribution_GetCatalogCapabilities_FullMethodName      = "/Distribution/GetCatalogCapabilities"
+	Distribution_WatchCatalog_FullMethodName                = "/Distribution/WatchCatalog"
 	Distribution_StartSplitMigration_FullMethodName         = "/Distribution/StartSplitMigration"
 	Distribution_GetSplitMigrationCapability_FullMethodName = "/Distribution/GetSplitMigrationCapability"
 	Distribution_GetRouteOwnership_FullMethodName           = "/Distribution/GetRouteOwnership"
@@ -39,8 +42,11 @@ const (
 type DistributionClient interface {
 	GetRoute(ctx context.Context, in *GetRouteRequest, opts ...grpc.CallOption) (*GetRouteResponse, error)
 	GetTimestamp(ctx context.Context, in *GetTimestampRequest, opts ...grpc.CallOption) (*GetTimestampResponse, error)
+	ValidateTimestamp(ctx context.Context, in *ValidateTimestampRequest, opts ...grpc.CallOption) (*ValidateTimestampResponse, error)
 	ListRoutes(ctx context.Context, in *ListRoutesRequest, opts ...grpc.CallOption) (*ListRoutesResponse, error)
 	SplitRange(ctx context.Context, in *SplitRangeRequest, opts ...grpc.CallOption) (*SplitRangeResponse, error)
+	GetCatalogCapabilities(ctx context.Context, in *CatalogCapabilitiesRequest, opts ...grpc.CallOption) (*CatalogCapabilitiesResponse, error)
+	WatchCatalog(ctx context.Context, in *CatalogWatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CatalogWatchEvent], error)
 	StartSplitMigration(ctx context.Context, in *StartSplitMigrationRequest, opts ...grpc.CallOption) (*StartSplitMigrationResponse, error)
 	GetSplitMigrationCapability(ctx context.Context, in *GetSplitMigrationCapabilityRequest, opts ...grpc.CallOption) (*GetSplitMigrationCapabilityResponse, error)
 	GetRouteOwnership(ctx context.Context, in *GetRouteOwnershipRequest, opts ...grpc.CallOption) (*GetRouteOwnershipResponse, error)
@@ -79,6 +85,16 @@ func (c *distributionClient) GetTimestamp(ctx context.Context, in *GetTimestampR
 	return out, nil
 }
 
+func (c *distributionClient) ValidateTimestamp(ctx context.Context, in *ValidateTimestampRequest, opts ...grpc.CallOption) (*ValidateTimestampResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(ValidateTimestampResponse)
+	err := c.cc.Invoke(ctx, Distribution_ValidateTimestamp_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *distributionClient) ListRoutes(ctx context.Context, in *ListRoutesRequest, opts ...grpc.CallOption) (*ListRoutesResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ListRoutesResponse)
@@ -98,6 +114,35 @@ func (c *distributionClient) SplitRange(ctx context.Context, in *SplitRangeReque
 	}
 	return out, nil
 }
+
+func (c *distributionClient) GetCatalogCapabilities(ctx context.Context, in *CatalogCapabilitiesRequest, opts ...grpc.CallOption) (*CatalogCapabilitiesResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(CatalogCapabilitiesResponse)
+	err := c.cc.Invoke(ctx, Distribution_GetCatalogCapabilities_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *distributionClient) WatchCatalog(ctx context.Context, in *CatalogWatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CatalogWatchEvent], error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	stream, err := c.cc.NewStream(ctx, &Distribution_ServiceDesc.Streams[0], Distribution_WatchCatalog_FullMethodName, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	x := &grpc.GenericClientStream[CatalogWatchRequest, CatalogWatchEvent]{ClientStream: stream}
+	if err := x.ClientStream.SendMsg(in); err != nil {
+		return nil, err
+	}
+	if err := x.ClientStream.CloseSend(); err != nil {
+		return nil, err
+	}
+	return x, nil
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Distribution_WatchCatalogClient = grpc.ServerStreamingClient[CatalogWatchEvent]
 
 func (c *distributionClient) StartSplitMigration(ctx context.Context, in *StartSplitMigrationRequest, opts ...grpc.CallOption) (*StartSplitMigrationResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
@@ -185,8 +230,11 @@ func (c *distributionClient) RetrySplitJob(ctx context.Context, in *RetrySplitJo
 type DistributionServer interface {
 	GetRoute(context.Context, *GetRouteRequest) (*GetRouteResponse, error)
 	GetTimestamp(context.Context, *GetTimestampRequest) (*GetTimestampResponse, error)
+	ValidateTimestamp(context.Context, *ValidateTimestampRequest) (*ValidateTimestampResponse, error)
 	ListRoutes(context.Context, *ListRoutesRequest) (*ListRoutesResponse, error)
 	SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error)
+	GetCatalogCapabilities(context.Context, *CatalogCapabilitiesRequest) (*CatalogCapabilitiesResponse, error)
+	WatchCatalog(*CatalogWatchRequest, grpc.ServerStreamingServer[CatalogWatchEvent]) error
 	StartSplitMigration(context.Context, *StartSplitMigrationRequest) (*StartSplitMigrationResponse, error)
 	GetSplitMigrationCapability(context.Context, *GetSplitMigrationCapabilityRequest) (*GetSplitMigrationCapabilityResponse, error)
 	GetRouteOwnership(context.Context, *GetRouteOwnershipRequest) (*GetRouteOwnershipResponse, error)
@@ -211,11 +259,20 @@ func (UnimplementedDistributionServer) GetRoute(context.Context, *GetRouteReques
 func (UnimplementedDistributionServer) GetTimestamp(context.Context, *GetTimestampRequest) (*GetTimestampResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetTimestamp not implemented")
 }
+func (UnimplementedDistributionServer) ValidateTimestamp(context.Context, *ValidateTimestampRequest) (*ValidateTimestampResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method ValidateTimestamp not implemented")
+}
 func (UnimplementedDistributionServer) ListRoutes(context.Context, *ListRoutesRequest) (*ListRoutesResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ListRoutes not implemented")
 }
 func (UnimplementedDistributionServer) SplitRange(context.Context, *SplitRangeRequest) (*SplitRangeResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method SplitRange not implemented")
+}
+func (UnimplementedDistributionServer) GetCatalogCapabilities(context.Context, *CatalogCapabilitiesRequest) (*CatalogCapabilitiesResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetCatalogCapabilities not implemented")
+}
+func (UnimplementedDistributionServer) WatchCatalog(*CatalogWatchRequest, grpc.ServerStreamingServer[CatalogWatchEvent]) error {
+	return status.Error(codes.Unimplemented, "method WatchCatalog not implemented")
 }
 func (UnimplementedDistributionServer) StartSplitMigration(context.Context, *StartSplitMigrationRequest) (*StartSplitMigrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartSplitMigration not implemented")
@@ -298,6 +355,24 @@ func _Distribution_GetTimestamp_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Distribution_ValidateTimestamp_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(ValidateTimestampRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).ValidateTimestamp(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_ValidateTimestamp_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).ValidateTimestamp(ctx, req.(*ValidateTimestampRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Distribution_ListRoutes_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(ListRoutesRequest)
 	if err := dec(in); err != nil {
@@ -333,6 +408,35 @@ func _Distribution_SplitRange_Handler(srv interface{}, ctx context.Context, dec 
 	}
 	return interceptor(ctx, in, info, handler)
 }
+
+func _Distribution_GetCatalogCapabilities_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(CatalogCapabilitiesRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).GetCatalogCapabilities(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_GetCatalogCapabilities_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).GetCatalogCapabilities(ctx, req.(*CatalogCapabilitiesRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
+func _Distribution_WatchCatalog_Handler(srv interface{}, stream grpc.ServerStream) error {
+	m := new(CatalogWatchRequest)
+	if err := stream.RecvMsg(m); err != nil {
+		return err
+	}
+	return srv.(DistributionServer).WatchCatalog(m, &grpc.GenericServerStream[CatalogWatchRequest, CatalogWatchEvent]{ServerStream: stream})
+}
+
+// This type alias is provided for backwards compatibility with existing code that references the prior non-generic stream type by name.
+type Distribution_WatchCatalogServer = grpc.ServerStreamingServer[CatalogWatchEvent]
 
 func _Distribution_StartSplitMigration_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(StartSplitMigrationRequest)
@@ -494,12 +598,20 @@ var Distribution_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Distribution_GetTimestamp_Handler,
 		},
 		{
+			MethodName: "ValidateTimestamp",
+			Handler:    _Distribution_ValidateTimestamp_Handler,
+		},
+		{
 			MethodName: "ListRoutes",
 			Handler:    _Distribution_ListRoutes_Handler,
 		},
 		{
 			MethodName: "SplitRange",
 			Handler:    _Distribution_SplitRange_Handler,
+		},
+		{
+			MethodName: "GetCatalogCapabilities",
+			Handler:    _Distribution_GetCatalogCapabilities_Handler,
 		},
 		{
 			MethodName: "StartSplitMigration",
@@ -534,6 +646,12 @@ var Distribution_ServiceDesc = grpc.ServiceDesc{
 			Handler:    _Distribution_RetrySplitJob_Handler,
 		},
 	},
-	Streams:  []grpc.StreamDesc{},
+	Streams: []grpc.StreamDesc{
+		{
+			StreamName:    "WatchCatalog",
+			Handler:       _Distribution_WatchCatalog_Handler,
+			ServerStreams: true,
+		},
+	},
 	Metadata: "distribution.proto",
 }

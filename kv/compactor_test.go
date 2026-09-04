@@ -56,15 +56,6 @@ type metricsCapturingStore struct {
 	metrics *pebble.Metrics
 }
 
-type migrationPinnedCompactionStore struct {
-	deadlineCapturingStore
-	states []store.TargetStagedReadinessState
-}
-
-func (s *migrationPinnedCompactionStore) MigrationTargetReadinessStates(context.Context) ([]store.TargetStagedReadinessState, error) {
-	return s.states, nil
-}
-
 func (s *metricsCapturingStore) Metrics() *pebble.Metrics {
 	return s.metrics
 }
@@ -155,67 +146,74 @@ func TestFSMCompactorRespectsPinnedTimestamp(t *testing.T) {
 	require.Equal(t, []byte("v20"), val)
 }
 
-func TestFSMCompactorRespectsMigrationRetentionPin(t *testing.T) {
-	t.Parallel()
+func TestBeginBackupBlocksCompactor(t *testing.T) {
+	st := store.NewMVCCStore()
+	ctx := context.Background()
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v20"), 20, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v30"), 30, 0))
 
-	st := &migrationPinnedCompactionStore{
-		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: ^uint64(0)},
-		states: []store.TargetStagedReadinessState{{
-			JobID:               1,
-			MigrationJobID:      1,
-			MinWriteTSExclusive: 1,
-			Armed:               true,
-			RetentionPinTS:      42,
-		}},
-	}
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	fsm, ok := NewKvFSMWithHLCAndTracker(st, NewHLC(), tracker, WithRouteHistory(nil, 1)).(*kvFSM)
+	require.True(t, ok)
+	require.NoError(t, haltApplyOf(fsm.Apply(EncodeBackupPinEntry(BackupPinEntry{
+		PinID: backupTrackerTestPinID(7), ReadTS: 20, Deadline: time.Now().Add(time.Hour),
+	}))))
+
 	compactor := NewFSMCompactor(
 		[]FSMCompactRuntime{{
 			GroupID: 1,
 			StatusReader: fakeRaftStatus{status: raftengine.Status{
-				State:        raftengine.StateFollower,
-				AppliedIndex: 1,
-				CommitIndex:  1,
+				State: raftengine.StateFollower, AppliedIndex: 10, CommitIndex: 10,
 			}},
 			Store: st,
 		}},
 		WithFSMCompactorInterval(time.Hour),
 		WithFSMCompactorRetentionWindow(time.Millisecond),
+		WithFSMCompactorActiveTimestampTracker(tracker),
 	)
-
-	require.NoError(t, compactor.SyncOnce(context.Background()))
-	require.True(t, st.compactCalled)
-	require.Equal(t, uint64(42), st.compactMinTS)
+	require.NoError(t, compactor.SyncOnce(ctx))
+	value, err := st.GetAt(ctx, []byte("k"), 20)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v20"), value)
 }
 
-func TestFSMCompactorIgnoresDisarmedMigrationRetentionPin(t *testing.T) {
-	t.Parallel()
-
-	st := &migrationPinnedCompactionStore{
-		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: ^uint64(0)},
-		states: []store.TargetStagedReadinessState{{
-			JobID:               1,
-			MigrationJobID:      1,
-			MinWriteTSExclusive: 1,
-			RetentionPinTS:      42,
-		}},
+func TestFSMCompactorScopesBackupPinsByGroup(t *testing.T) {
+	ctx := context.Background()
+	stores := map[uint64]store.MVCCStore{1: store.NewMVCCStore(), 2: store.NewMVCCStore()}
+	for _, st := range stores {
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v20"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v30"), 30, 0))
 	}
-	compactor := NewFSMCompactor(
-		[]FSMCompactRuntime{{
-			GroupID: 1,
+
+	tracker := NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0))
+	require.NoError(t, tracker.PinWithDeadlineForGroup(
+		backupTrackerTestPinID(1), 1, 20, time.Now().Add(time.Hour),
+	))
+	runtimes := make([]FSMCompactRuntime, 0, len(stores))
+	for groupID, st := range stores {
+		runtimes = append(runtimes, FSMCompactRuntime{
+			GroupID: groupID,
 			StatusReader: fakeRaftStatus{status: raftengine.Status{
-				State:        raftengine.StateFollower,
-				AppliedIndex: 1,
-				CommitIndex:  1,
+				State: raftengine.StateFollower, AppliedIndex: 10, CommitIndex: 10,
 			}},
 			Store: st,
-		}},
+		})
+	}
+	compactor := NewFSMCompactor(
+		runtimes,
+		WithFSMCompactorActiveTimestampTracker(tracker),
 		WithFSMCompactorInterval(time.Hour),
 		WithFSMCompactorRetentionWindow(time.Millisecond),
 	)
 
-	require.NoError(t, compactor.SyncOnce(context.Background()))
-	require.True(t, st.compactCalled)
-	require.Greater(t, st.compactMinTS, uint64(42))
+	require.NoError(t, compactor.SyncOnce(ctx))
+
+	value, err := stores[1].GetAt(ctx, []byte("k"), 20)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v20"), value)
+	_, err = stores[2].GetAt(ctx, []byte("k"), 20)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
 }
 
 func TestFSMCompactorSkipsLaggingRuntime(t *testing.T) {
@@ -548,4 +546,76 @@ func TestFSMCompactorCompactsEligiblePebbleRuntime(t *testing.T) {
 	val, err := st.GetAt(ctx, []byte("k"), 30)
 	require.NoError(t, err)
 	require.Equal(t, []byte("v30"), val)
+}
+
+type migrationPinnedCompactionStore struct {
+	deadlineCapturingStore
+	states []store.TargetStagedReadinessState
+}
+
+func (s *migrationPinnedCompactionStore) MigrationTargetReadinessStates(context.Context) ([]store.TargetStagedReadinessState, error) {
+	return s.states, nil
+}
+
+func TestFSMCompactorRespectsMigrationRetentionPin(t *testing.T) {
+	t.Parallel()
+
+	st := &migrationPinnedCompactionStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: ^uint64(0)},
+		states: []store.TargetStagedReadinessState{{
+			JobID:               1,
+			MigrationJobID:      1,
+			MinWriteTSExclusive: 1,
+			Armed:               true,
+			RetentionPinTS:      42,
+		}},
+	}
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				AppliedIndex: 1,
+				CommitIndex:  1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+	)
+
+	require.NoError(t, compactor.SyncOnce(context.Background()))
+	require.True(t, st.compactCalled)
+	require.Equal(t, uint64(42), st.compactMinTS)
+}
+
+func TestFSMCompactorIgnoresDisarmedMigrationRetentionPin(t *testing.T) {
+	t.Parallel()
+
+	st := &migrationPinnedCompactionStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: ^uint64(0)},
+		states: []store.TargetStagedReadinessState{{
+			JobID:               1,
+			MigrationJobID:      1,
+			MinWriteTSExclusive: 1,
+			RetentionPinTS:      42,
+		}},
+	}
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				AppliedIndex: 1,
+				CommitIndex:  1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+	)
+
+	require.NoError(t, compactor.SyncOnce(context.Background()))
+	require.True(t, st.compactCalled)
+	require.Greater(t, st.compactMinTS, uint64(42))
 }

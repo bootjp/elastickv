@@ -210,6 +210,53 @@ func TestImportVersionsRaft_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, []byte("v100"), val, "duplicate import must not rewrite the acknowledged batch")
 }
 
+func TestRetireMigrationRaft_BundlesMetaAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	_, err := ps.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 1,
+		BatchSeq:  1,
+		Cursor:    []byte("old"),
+		Versions: []MVCCVersion{
+			{Key: []byte("stage|k"), CommitTS: 100, Value: []byte("v100")},
+		},
+	})
+	require.NoError(t, err)
+	seedPromotionState(t, ctx, ps, 9, []byte("promote|"), []byte("promoted"))
+
+	const entryIdx uint64 = 125
+	require.NoError(t, ps.RetireMigrationRaft(ctx, 9, entryIdx))
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "RetireMigrationRaft must persist metaAppliedIndex")
+	require.Equal(t, entryIdx, got)
+
+	floor, err := ps.MigrationHLCFloor(ctx, 9)
+	require.NoError(t, err)
+	require.Zero(t, floor)
+	state, ok, err := ps.MigrationPromotionState(ctx, 9)
+	require.NoError(t, err)
+	require.False(t, ok, "promotion state must be retired, got %+v", state)
+
+	again, err := ps.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     9,
+		BracketID: 1,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+	})
+	require.NoError(t, err)
+	require.False(t, again.Duplicate, "retired import ack must not force duplicate detection")
+	require.Equal(t, []byte("fresh"), again.AckedCursor)
+
+	val, err := ps.GetAt(ctx, []byte("stage|k"), 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v100"), val, "retirement must leave imported data intact")
+}
+
 func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.T) {
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
@@ -338,6 +385,38 @@ func TestDeletePrefixAtRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 	got, present, err := ps.LastAppliedIndex()
 	require.NoError(t, err)
 	require.True(t, present, "DeletePrefixAtRaftAt must persist metaAppliedIndex")
+	require.Equal(t, entryIdx, got)
+}
+
+func TestDeletePrefixesAtRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+
+	const seedTS uint64 = 50
+	require.NoError(t, ps.ApplyMutations(ctx, []*KVPairMutation{
+		{Op: OpTypePut, Key: []byte("p/k1"), Value: []byte("v")},
+		{Op: OpTypePut, Key: []byte("q/drop"), Value: []byte("v")},
+		{Op: OpTypePut, Key: []byte("q/keep"), Value: []byte("v")},
+	}, nil, seedTS, seedTS))
+
+	const entryIdx uint64 = 100
+	require.NoError(t, ps.DeletePrefixesAtRaftAt(ctx, []PrefixDelete{
+		{Prefix: []byte("p/")},
+		{Prefix: []byte("q/"), ExcludePrefix: []byte("q/keep")},
+	}, 200, entryIdx))
+
+	_, err := ps.GetAt(ctx, []byte("p/k1"), 250)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	_, err = ps.GetAt(ctx, []byte("q/drop"), 250)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+	gotVal, err := ps.GetAt(ctx, []byte("q/keep"), 250)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), gotVal)
+
+	got, present, err := ps.LastAppliedIndex()
+	require.NoError(t, err)
+	require.True(t, present, "DeletePrefixesAtRaftAt must persist metaAppliedIndex")
 	require.Equal(t, entryIdx, got)
 }
 

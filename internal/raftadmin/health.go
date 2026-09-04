@@ -37,6 +37,20 @@ func RegisterOperationalServicesWithInterceptor(
 	serviceNames []string,
 	interceptor MembershipChangeInterceptor,
 ) {
+	RegisterOperationalServicesWithInterceptorAndStaticServing(ctx, gs, engine, serviceNames, nil, interceptor)
+}
+
+// RegisterOperationalServicesWithInterceptorAndStaticServing registers
+// leader-gated operational service health plus peer-local services that should
+// stay SERVING on followers.
+func RegisterOperationalServicesWithInterceptorAndStaticServing(
+	ctx context.Context,
+	gs *grpc.Server,
+	engine raftengine.Engine,
+	leaderServiceNames []string,
+	staticServingServiceNames []string,
+	interceptor MembershipChangeInterceptor,
+) {
 	if gs == nil {
 		return
 	}
@@ -48,7 +62,18 @@ func RegisterOperationalServicesWithInterceptor(
 
 	healthSrv := health.NewServer()
 	healthpb.RegisterHealthServer(gs, healthSrv)
-	go observeLeaderHealth(ctx, engine, healthSrv, serviceNames, healthPollInterval())
+	go observeStaticServingHealth(ctx, healthSrv, staticServingServiceNames)
+	go observeLeaderHealth(ctx, engine, healthSrv, leaderServiceNames, healthPollInterval())
+}
+
+func observeStaticServingHealth(ctx context.Context, healthSrv *health.Server, serviceNames []string) {
+	services := dedupeNamedServices(serviceNames)
+	if len(services) == 0 {
+		return
+	}
+	setHealthStatus(healthSrv, services, healthpb.HealthCheckResponse_SERVING)
+	<-ctx.Done()
+	setHealthStatus(healthSrv, services, healthpb.HealthCheckResponse_NOT_SERVING)
 }
 
 func observeLeaderHealth(ctx context.Context, engine raftengine.Engine, healthSrv *health.Server, serviceNames []string, pollInterval time.Duration) {
@@ -116,6 +141,22 @@ func dedupeServices(serviceNames []string) []string {
 	seen := map[string]struct{}{"": {}}
 	services := []string{""}
 	for _, name := range serviceNames {
+		if _, ok := seen[name]; ok {
+			continue
+		}
+		seen[name] = struct{}{}
+		services = append(services, name)
+	}
+	return services
+}
+
+func dedupeNamedServices(serviceNames []string) []string {
+	seen := map[string]struct{}{}
+	services := make([]string, 0, len(serviceNames))
+	for _, name := range serviceNames {
+		if name == "" {
+			continue
+		}
 		if _, ok := seen[name]; ok {
 			continue
 		}

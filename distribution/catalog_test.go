@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 func TestCatalogVersionCodecRoundTrip(t *testing.T) {
@@ -495,6 +496,33 @@ func TestCatalogStoreSaveAndSnapshot(t *testing.T) {
 	assertRouteEqual(t, saved.Routes[1], snapshot.Routes[1])
 }
 
+func TestCatalogStoreSnapshotAtPreservesRequestedVersion(t *testing.T) {
+	cs := NewCatalogStore(store.NewMVCCStore())
+	ctx := context.Background()
+	first, err := cs.Save(ctx, 0, []RouteDescriptor{{
+		RouteID: 1,
+		Start:   []byte(""),
+		GroupID: 1,
+		State:   RouteStateActive,
+	}})
+	require.NoError(t, err)
+	firstTS := cs.LatestCommitTS()
+	_, err = cs.Save(ctx, first.Version, []RouteDescriptor{{
+		RouteID: 2,
+		Start:   []byte(""),
+		GroupID: 2,
+		State:   RouteStateActive,
+	}})
+	require.NoError(t, err)
+
+	snapshot, err := cs.SnapshotAt(ctx, firstTS)
+	require.NoError(t, err)
+	require.Equal(t, first.Version, snapshot.Version)
+	require.Equal(t, firstTS, snapshot.ReadTS)
+	require.Equal(t, uint64(1), snapshot.Routes[0].RouteID)
+	require.GreaterOrEqual(t, cs.LatestCommitTS(), firstTS)
+}
+
 func TestCatalogStoreSaveAndSnapshotSortsRoutesByStart(t *testing.T) {
 	cs := NewCatalogStore(store.NewMVCCStore())
 	ctx := context.Background()
@@ -959,6 +987,9 @@ func encodeRouteDescriptorV1ForTest(t *testing.T, route RouteDescriptor) []byte 
 	raw, err := EncodeRouteDescriptor(route)
 	if err != nil {
 		t.Fatalf("encode route: %v", err)
+	}
+	if raw[0] == catalogRouteCodecVersionV1 {
+		return raw
 	}
 	if len(raw) < catalogUint64Bytes+1 {
 		t.Fatalf("encoded route too short: %d", len(raw))

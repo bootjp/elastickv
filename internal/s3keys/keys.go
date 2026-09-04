@@ -115,6 +115,25 @@ func ChunkRefKey(bucket string, generation uint64, object string, uploadID strin
 	return buildObjectKey(chunkRefPrefixBytes, bucket, generation, object, uploadID, partNo, chunkNo)
 }
 
+// VersionedChunkRefKey returns the chunk reference key for one immutable part
+// attempt. A zero version preserves the original key shape for existing data
+// and single PUTs whose upload ID is already unique.
+func VersionedChunkRefKey(bucket string, generation uint64, object string, uploadID string, partNo uint64, chunkNo uint64, partVersion uint64) []byte {
+	if partVersion == 0 {
+		return ChunkRefKey(bucket, generation, object, uploadID, partNo, chunkNo)
+	}
+	out := make([]byte, 0, len(ChunkRefPrefix)+len(bucket)+len(object)+len(uploadID)+buildObjectExtraBytes+4*u64Bytes)
+	out = append(out, chunkRefPrefixBytes...)
+	out = append(out, EncodeSegment([]byte(bucket))...)
+	out = appendU64(out, generation)
+	out = append(out, EncodeSegment([]byte(object))...)
+	out = append(out, EncodeSegment([]byte(uploadID))...)
+	out = appendU64(out, partNo)
+	out = appendU64(out, chunkNo)
+	out = appendU64(out, partVersion)
+	return out
+}
+
 // VersionedBlobKey returns the blob key for a specific part attempt identified by
 // partVersion (typically the part's commit timestamp). When partVersion is 0 the
 // result is identical to BlobKey, preserving backward compatibility with data
@@ -295,6 +314,8 @@ func bucketGenerationFamilyPrefix(key []byte) []byte {
 		return uploadPartPrefixBytes
 	case bytes.HasPrefix(key, blobPrefixBytes):
 		return blobPrefixBytes
+	case bytes.HasPrefix(key, chunkRefPrefixBytes):
+		return chunkRefPrefixBytes
 	case bytes.HasPrefix(key, gcUploadPrefixBytes):
 		return gcUploadPrefixBytes
 	case bytes.HasPrefix(key, routePrefixBytes):
@@ -445,6 +466,34 @@ func ExtractRouteKey(key []byte) []byte {
 	out = append(out, routePrefixBytes...)
 	out = append(out, key[len(prefix):objectEnd]...)
 	return out
+}
+
+// BucketScopedRoutePrefix projects a bucket-scoped raw family prefix -- the
+// shape bucketScopedPrefix builds, family bytes followed by the bucket segment
+// and the generation u64 -- onto the object route prefix every key underneath it
+// routes through.
+//
+// It reports false unless the prefix ends exactly at the generation. A shorter
+// prefix can still span more than one bucket or generation, so it has no single
+// route range to project onto, and a longer one reaches into the object segment
+// this function does not parse.
+func BucketScopedRoutePrefix(prefix []byte) ([]byte, bool) {
+	family := objectScopedPrefix(prefix)
+	if family == nil {
+		return nil, false
+	}
+	offset := len(family)
+	bucketEnd, ok := segmentEnd(prefix, offset)
+	if !ok {
+		return nil, false
+	}
+	if _, next, okU64 := readU64(prefix, bucketEnd); !okU64 || next != len(prefix) {
+		return nil, false
+	}
+	out := make([]byte, 0, len(routePrefixBytes)+len(prefix)-len(family))
+	out = append(out, routePrefixBytes...)
+	out = append(out, prefix[len(family):]...)
+	return out, true
 }
 
 func ManifestScanRouteBounds(start []byte, end []byte) ([]byte, []byte, bool) {

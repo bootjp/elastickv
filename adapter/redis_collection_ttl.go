@@ -70,6 +70,10 @@ func (r *RedisServer) listInlineTTLAt(ctx context.Context, userKey []byte, readT
 	return ttl, true, nil
 }
 
+func isStreamInlineMeta(raw []byte) bool {
+	return len(raw) == redisWideMetaInlineSizeBytes || len(raw) == store.StreamMetaTrimBinarySize
+}
+
 func (r *RedisServer) simpleInlineTTLAt(
 	ctx context.Context,
 	metaKey []byte,
@@ -117,7 +121,7 @@ func (r *RedisServer) streamInlineTTLAt(ctx context.Context, userKey []byte, rea
 		}
 		return nil, false, errors.WithStack(err)
 	}
-	if len(raw) != redisWideMetaInlineSizeBytes {
+	if !isStreamInlineMeta(raw) {
 		return nil, false, nil
 	}
 	meta, err := store.UnmarshalStreamMeta(raw)
@@ -142,6 +146,23 @@ func (r *RedisServer) dispatchCollectionExpire(
 	}
 	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)})
 	return true, r.dispatchElems(ctx, true, readTS, elems)
+}
+
+func (r *RedisServer) dispatchCollectionExpireReadTimestamp(
+	ctx context.Context,
+	key []byte,
+	readTimestamp kv.ReadTimestamp,
+	typ redisValueType,
+	expireAt time.Time,
+) (bool, error) {
+	readTS := readTimestamp.Timestamp()
+	ttlMs := redisExpireAtMillis(expireAt)
+	elems, ok, err := r.collectionExpireElems(ctx, key, readTS, typ, ttlMs)
+	if err != nil || !ok {
+		return ok, err
+	}
+	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)})
+	return true, r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 }
 
 func (r *RedisServer) collectionExpireElems(
@@ -378,6 +399,7 @@ func (r *RedisServer) listMetaExpireScanErr(
 		return nil, false, err
 	}
 	r.triggerUrgentCompaction("list", key)
+	r.triggerUrgentCompaction("list-legacy", key)
 	if exists {
 		return listMetaTTLUpdateElem(key, meta, expireAtMs)
 	}

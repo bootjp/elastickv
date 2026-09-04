@@ -18,13 +18,18 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/cockroachdb/errors/secondary"
 )
 
 type ShardGroup struct {
 	Engine raftengine.Engine
 	Store  store.MVCCStore
 	Txn    Transactional
-	lease  leaseState
+	// TSOState is set only for reserved group 0. Keeping the applied floor and
+	// cutover marker next to the group's engine lets the leader allocator read
+	// consensus-owned state without treating the shared HLC mirror as durable.
+	TSOState *TSOStateMachine
+	lease    leaseState
 	// lp caches the Engine's optional LeaseProvider capability so the
 	// groupLeaseRead / maybeRefresh hot paths test a single field for
 	// nil instead of performing an interface type assertion per call.
@@ -60,6 +65,34 @@ type ShardGroup struct {
 	// NewLeaderProxyForShardGroup), so the no-wrap default keeps
 	// working.
 	proposer raftengine.Proposer
+	// leaderRead forwards a read barrier to this group's current leader when
+	// the local replica is a follower. It is installed with the LeaderProxy.
+	leaderRead func(context.Context) (leaseReadResult, error)
+	// leaderReadToken authenticates follower-to-leader lease-read RPCs. Admin
+	// service setup publishes it once before the public listeners are opened.
+	leaderReadToken atomic.Pointer[string]
+}
+
+// SetLeaderReadToken configures the bearer token used by forwarded lease-read
+// RPCs. An empty token preserves explicitly configured insecure admin mode.
+func (g *ShardGroup) SetLeaderReadToken(token string) {
+	if token == "" {
+		g.leaderReadToken.Store(nil)
+		return
+	}
+	t := token
+	g.leaderReadToken.Store(&t)
+}
+
+func (g *ShardGroup) forwardedLeaderReadToken() string {
+	if g == nil {
+		return ""
+	}
+	token := g.leaderReadToken.Load()
+	if token == nil {
+		return ""
+	}
+	return *token
 }
 
 // Proposer returns the wrap-aware proposer chain installed by
@@ -207,10 +240,13 @@ func NewLeaderProxyForShardGroup(g *ShardGroup, opts ...TransactionOption) *Lead
 	// (codex P2 round-1); routing both paths through the same
 	// proposer closes that hole.
 	g.proposer = newDynamicWrappedProposer(g.Engine, &g.raftPayloadWrap)
-	return &LeaderProxy{
+	p := &LeaderProxy{
 		engine: g.Engine,
 		tm:     NewTransactionWithProposer(g.proposer, opts...),
+		group:  g,
 	}
+	g.leaderRead = p.forwardLeaseRead
+	return p
 }
 
 // leaseRefreshingTxn wraps a Transactional so every Commit / Abort that
@@ -360,7 +396,8 @@ const (
 	// surfaces unchanged so the client (or a wrapping retry harness in
 	// the adapter) sees the failure rather than the coordinator spinning
 	// on a persistent route shift.
-	composed1RetryAttempts = 1
+	composed1RetryAttempts         = 1
+	maxAppliedReadTimestampVouches = 4096
 )
 
 // ShardedCoordinator routes operations to shard-specific raft groups.
@@ -375,11 +412,30 @@ type ShardedCoordinator struct {
 	// coordinator-owned persistence timestamp. Nil preserves the legacy shared
 	// HLC path.
 	tsAllocator TimestampAllocator
+	// timestampFloor is the highest replicated backup cut observed by this
+	// process. It deduplicates the same cut as each local shard applies its pin.
+	timestampFloor atomic.Uint64
 	// timestampGroup pins IsTimestampLeader to a dedicated Raft group when
 	// timestampGroupConfigured is true. Nil/false preserves the M3 bridge
 	// behavior where any locally-led shard group can issue TSO timestamps.
 	timestampGroup           uint64
 	timestampGroupConfigured bool
+	// timestampGroupCandidate is the group WithTimestampGroup would pin once
+	// the dedicated allocator takes over. It is recorded at startup even while
+	// the deployment is still in legacy warm-up so that a Phase-D marker
+	// applied later -- through the durable, consensus-owned cutover state
+	// rather than a process-local mode flag -- can pin it without a racy
+	// runtime mutation. See effectiveTimestampGroup.
+	timestampGroupCandidate    uint64
+	timestampGroupCandidateSet bool
+	// tsoCutoverState is consensus-owned group-0 migration state. Phase D uses
+	// it to retire data-shard HLC renewal and reject legacy cross-shard startTS.
+	tsoCutoverState interface {
+		CutoverActive() bool
+		PhaseDActive() bool
+	}
+	appliedReadVoucherMu sync.Mutex
+	appliedReadVouchers  map[appliedReadVoucherKey]uint64
 	// allShardGroupIDs, when configured, is the explicit set of data groups
 	// that whole-keyspace operations must visit. It lets callers keep
 	// non-data groups (for example a reserved timestamp group) in c.groups
@@ -408,6 +464,7 @@ type ShardedCoordinator struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
+	hlcRecoveryMu     sync.Mutex
 	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
 	// another background HLC lease proposal for the same group on the next tick.
 	hlcRenewalMu       sync.Mutex
@@ -418,6 +475,11 @@ type ShardedCoordinator struct {
 	// commits. nil when encryption is off / no registration is pending
 	// (the common case — ungated). See RegistrationGate.
 	registrationGate *RegistrationGate
+}
+
+type appliedReadVoucherKey struct {
+	timestamp uint64
+	ref       AppliedReadTimestampVoucherRef
 }
 
 // RegistrationGate carries the Stage 7a §4.1 registration-before-
@@ -463,6 +525,107 @@ func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *Sharded
 	return c
 }
 
+// TimestampAllocator exposes the configured allocator to coordinator
+// decorators without widening the Coordinator interface.
+func (c *ShardedCoordinator) TimestampAllocator() TimestampAllocator {
+	if c == nil {
+		return nil
+	}
+	return c.tsAllocator
+}
+
+// VouchAppliedReadTimestamp records one use of an audited adapter watermark.
+// The bounded map prevents abandoned requests from growing process memory.
+func (c *ShardedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
+		return errors.WithStack(ErrTSOTimestampInvalid)
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	if c.appliedReadVouchers == nil {
+		c.appliedReadVouchers = make(map[appliedReadVoucherKey]uint64)
+	}
+	if uses, ok := c.appliedReadVouchers[key]; ok {
+		c.appliedReadVouchers[key] = uses + 1
+		return nil
+	}
+	if len(c.appliedReadVouchers) >= maxAppliedReadTimestampVouches {
+		return errors.WithStack(ErrTSOReadVoucherLimit)
+	}
+	c.appliedReadVouchers[key] = 1
+	return nil
+}
+
+// RevokeAppliedReadTimestamp removes one prepared voucher that did not reach
+// ShardedCoordinator dispatch validation, for example because an outer
+// coordinator decorator rejected the dispatch first.
+func (c *ShardedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
+	if c == nil || timestamp == 0 || timestamp == ^uint64(0) || ref.id == 0 {
+		return
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	uses, ok := c.appliedReadVouchers[key]
+	if !ok {
+		return
+	}
+	if uses <= 1 {
+		delete(c.appliedReadVouchers, key)
+		return
+	}
+	c.appliedReadVouchers[key] = uses - 1
+}
+
+func (c *ShardedCoordinator) SupportsAppliedReadTimestampVoucher() bool { return true }
+
+func (c *ShardedCoordinator) consumeAppliedReadTimestampVoucher(ctx context.Context, timestamp uint64) bool {
+	if c == nil {
+		return false
+	}
+	ref, ok := appliedReadTimestampVoucherRefFromContext(ctx, timestamp)
+	if !ok {
+		return false
+	}
+	key := appliedReadVoucherKey{timestamp: timestamp, ref: ref}
+	c.appliedReadVoucherMu.Lock()
+	defer c.appliedReadVoucherMu.Unlock()
+	uses, ok := c.appliedReadVouchers[key]
+	if !ok {
+		return false
+	}
+	if uses <= 1 {
+		delete(c.appliedReadVouchers, key)
+	} else {
+		c.appliedReadVouchers[key] = uses - 1
+	}
+	return true
+}
+
+// ObserveTimestampFloor advances the process clock past a replicated backup
+// cut and invalidates any cached TSO batch that could still contain values at
+// or below it. Claims returned before invalidation remain protected by the
+// FSM's durable backup timestamp floor.
+func (c *ShardedCoordinator) ObserveTimestampFloor(ts uint64) {
+	if c == nil || ts == 0 {
+		return
+	}
+	for {
+		floor := c.timestampFloor.Load()
+		if ts <= floor {
+			return
+		}
+		if c.timestampFloor.CompareAndSwap(floor, ts) {
+			break
+		}
+	}
+	if c.clock != nil {
+		c.clock.Observe(ts)
+	}
+	invalidateTimestampWindow(c.tsAllocator)
+}
+
 // WithTimestampGroup pins timestamp issuance leadership to one Raft group.
 // Callers should only enable this once a data-shard leader can redirect
 // timestamp allocation to that group; otherwise data leaders would stop being
@@ -470,6 +633,54 @@ func (c *ShardedCoordinator) WithTSOAllocator(alloc TimestampAllocator) *Sharded
 func (c *ShardedCoordinator) WithTimestampGroup(groupID uint64) *ShardedCoordinator {
 	c.timestampGroup = groupID
 	c.timestampGroupConfigured = true
+	c.timestampGroupCandidate = groupID
+	c.timestampGroupCandidateSet = true
+	return c
+}
+
+// WithTimestampGroupCandidate records the group that owns timestamp issuance
+// once the dedicated allocator takes over, without pinning it yet.
+//
+// A deployment can start in legacy warm-up and advance to Phase D later, either
+// by reloading --tsoModeFile or by another node proposing the marker. The
+// warm-up contract forbids pinning up front: while persistence timestamps still
+// come from the data groups' local HLC path, narrowing lease renewal to the
+// timestamp group would let a group-0 quorum loss expire healthy data groups'
+// ceilings. But leaving the group unknown is worse once Phase D activates --
+// shouldRenewHLCGroup then retires every data group and finds no timestamp
+// group to renew instead, so every ceiling expires and issuance fails with
+// ErrCeilingExpired. Recording the candidate here lets effectiveTimestampGroup
+// pin it exactly when PhaseDActive flips, with no runtime mutation of the
+// coordinator.
+func (c *ShardedCoordinator) WithTimestampGroupCandidate(groupID uint64) *ShardedCoordinator {
+	c.timestampGroupCandidate = groupID
+	c.timestampGroupCandidateSet = true
+	return c
+}
+
+// effectiveTimestampGroup reports the group that currently owns HLC lease
+// renewal, leadership, and recovery, and whether one is pinned at all.
+func (c *ShardedCoordinator) effectiveTimestampGroup() (uint64, bool) {
+	if c == nil {
+		return 0, false
+	}
+	if c.timestampGroupConfigured {
+		return c.timestampGroup, true
+	}
+	if c.timestampGroupCandidateSet && c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() {
+		return c.timestampGroupCandidate, true
+	}
+	return 0, false
+}
+
+// WithTSOCutoverState wires the durable group-0 migration state. The state is
+// read dynamically so a marker applied after startup changes renewal and
+// validation behavior without a process-local mode race.
+func (c *ShardedCoordinator) WithTSOCutoverState(state interface {
+	CutoverActive() bool
+	PhaseDActive() bool
+}) *ShardedCoordinator {
+	c.tsoCutoverState = state
 	return c
 }
 
@@ -654,6 +865,13 @@ func (c *ShardedCoordinator) WithPartitionResolver(r PartitionResolver) *Sharded
 // The defaultGroup is used for non-keyed leader checks.
 func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*ShardGroup, defaultGroup uint64, clock *HLC, st store.MVCCStore) *ShardedCoordinator {
 	router := NewShardRouter(engine)
+	ownedGroups := map[uint64]*ShardGroup(nil)
+	if groups != nil {
+		ownedGroups = make(map[uint64]*ShardGroup, len(groups))
+		for gid, group := range groups {
+			ownedGroups[gid] = group
+		}
+	}
 	// Construct the coordinator before wrapping the per-shard
 	// Transactionals so each leaseRefreshingTxn can back-reference it
 	// for the §4.1 registration barrier (the gate is installed later
@@ -661,14 +879,14 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 	c := &ShardedCoordinator{
 		engine:       engine,
 		router:       router,
-		groups:       groups,
+		groups:       ownedGroups,
 		defaultGroup: defaultGroup,
 		clock:        clock,
 		store:        st,
 		log:          slog.Default(),
 	}
 	var deregisters []func()
-	for gid, g := range groups {
+	for gid, g := range ownedGroups {
 		// Wrap Txn so every successful Commit/Abort refreshes the
 		// per-shard lease. Leave nil transactions unchanged, and skip
 		// if already wrapped so repeat calls don't stack wrappers.
@@ -678,7 +896,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 				// supports repeat construction by not stacking
 				// wrappers): point the existing wrapper at the NEW
 				// coordinator so Commit consults the freshly-installed
-				// registration gate, not a stale one (codex P2).
+				// registration gate, not a stale one.
 				existing.coord = c
 			} else {
 				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}
@@ -846,17 +1064,16 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 //     gate spuriously rejects resolver-routed commits even when
 //     the resolver picked the correct gid.  Skip the auto-pin
 //     for any resolver-recognised key; the request flows with
-//     ObservedRouteVersion=0 and the Composed-1 owner gate
-//     short-circuits — restoring the pre-auto-pin behaviour for
-//     resolver-routed txns.  Resolver-aware M3 is M5+ work (PR #900).
+//     ObservedRouteVersion=0 and the M3 gate short-circuits —
+//     restoring the pre-auto-pin behaviour for resolver-routed
+//     txns.  Resolver-aware M3 is M5+ work (codex P1 on
+//     6a458a28, PR #900).
 //
 // The non-auto-pin case (request flows with ObservedRouteVersion=0,
-// Composed-1 owner gate short-circuits) is the safe non-regressing
-// posture for non-migrated callers — the owner gate cannot
-// retroactively pin reads it was not present for.  The write-fence
-// gate still checks the current route snapshot at apply time.
-// Adapters that want full M3 owner protection must migrate to pin at
-// BeginTxn per §4.1.
+// M3 gate short-circuits) is the safe non-regressing posture for
+// non-migrated callers — the gate cannot retroactively pin reads
+// it was not present for.  Adapters that want M3 protection must
+// migrate to pin at BeginTxn per §4.1.
 //
 // Extracted from dispatchTxnWithComposed1Retry to keep its
 // cyclomatic complexity in the cyclop budget.
@@ -867,7 +1084,7 @@ func (c *ShardedCoordinator) maybeAutoPinObservedRouteVersion(reqs *OperationGro
 	if c.anyResolverClaimedKey(reqs.Elems) {
 		return
 	}
-	reqs.ObservedRouteVersion = c.engine.Version()
+	reqs.ObservedRouteVersion = EncodeObservedRouteVersion(c.engine.Version())
 }
 
 // anyResolverClaimedKey reports whether any element's key is
@@ -895,7 +1112,17 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
-		resp, err := c.dispatchTxn(ctx, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.Elems, reqs.ReadKeys, reqs.ObservedRouteVersion, reqs.KeyVizLabel)
+		resp, err := c.dispatchTxn(
+			ctx,
+			reqs.StartTS,
+			reqs.CommitTS,
+			reqs.PrevCommitTS,
+			reqs.Elems,
+			reqs.ReadKeys,
+			reqs.ObservedRouteVersion,
+			reqs.KeyVizLabel,
+			callerSuppliedStartTS,
+		)
 		if err == nil {
 			return resp, nil
 		}
@@ -945,7 +1172,7 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 		// so a key whose owning group changed since the last
 		// attempt naturally lands on the new group's FSM.
 		if c.engine != nil {
-			reqs.ObservedRouteVersion = c.engine.Version()
+			reqs.ObservedRouteVersion = EncodeObservedRouteVersion(c.engine.Version())
 		}
 		// Clear the timestamps so the next attempt allocates a
 		// fresh pair against the post-shift HLC.  The OCC
@@ -1017,6 +1244,9 @@ func isComposed1RetryableError(err error) bool {
 // shard router. Extracted from Dispatch to keep that method's branch
 // count within the cyclop budget after the 7a registration gate landed.
 func (c *ShardedCoordinator) dispatchNonTxn(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if err := c.rejectWriteFencedPointElems(reqs.Elems); err != nil {
+		return nil, err
+	}
 	if hasExplicitGroupElem(reqs.Elems) {
 		return c.dispatchExplicitGroupNonTxn(ctx, reqs)
 	}
@@ -1167,11 +1397,15 @@ func (c *ShardedCoordinator) dispatchDelPrefixBroadcast(ctx context.Context, isT
 	}
 	requests := make([]*pb.Request, 0, len(elems))
 	for _, elem := range elems {
+		mut := elemToMutation(elem)
+		if err := c.ensureMutationWriteAllowed(mut, ts); err != nil {
+			return nil, err
+		}
 		requests = append(requests, &pb.Request{
 			IsTxn:                false,
 			Phase:                pb.Phase_NONE,
 			Ts:                   ts,
-			Mutations:            []*pb.Mutation{elemToMutation(elem)},
+			Mutations:            []*pb.Mutation{mut},
 			ObservedRouteVersion: observedRouteVersion,
 		})
 	}
@@ -1198,18 +1432,17 @@ func (c *ShardedCoordinator) rejectWriteFencedPointKey(key []byte) error {
 	if c.partitionResolverRecognisesPointKey(key) {
 		return nil
 	}
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if ok {
+		route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
+		if found && route.State == distribution.RouteStateWriteFenced {
+			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
+		}
+		return nil
+	}
 	rkey := routeKey(key)
 	if route, ok := c.engine.GetRoute(rkey); ok && route.State == distribution.RouteStateWriteFenced {
 		return errors.Wrapf(ErrRouteWriteFenced, "key %q routeKey %q", key, rkey)
-	}
-	start, end, ok := s3BucketAuxiliaryRouteRange(key)
-	if !ok {
-		return nil
-	}
-	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-		if route.State == distribution.RouteStateWriteFenced {
-			return errors.Wrapf(ErrRouteWriteFenced, "key %q route range [%q,%q)", key, start, end)
-		}
 	}
 	return nil
 }
@@ -1299,34 +1532,51 @@ func (c *ShardedCoordinator) rejectDelPrefixesWithoutTargetReadinessProof(ctx co
 	return nil
 }
 
-func (c *ShardedCoordinator) rejectWriteTimestampFloorPointElems(elems []*Elem[OP], commitTS uint64) error {
+func (c *ShardedCoordinator) rejectWriteTimestampFloorPointKey(key []byte, commitTS uint64) error {
 	if c == nil || c.engine == nil || commitTS == 0 {
 		return nil
 	}
-	for _, elem := range elems {
-		if elem == nil || len(elem.Key) == 0 {
-			continue
-		}
-		if err := c.rejectWriteTimestampFloorPointKey(elem.Key, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *ShardedCoordinator) rejectWriteTimestampFloorPointKey(key []byte, commitTS uint64) error {
-	start, end, ok := s3BucketAuxiliaryRouteRange(key)
-	if ok {
-		for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-			if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
-				return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive)
-			}
-		}
+	if c.skipPointWriteTimestampFloor(key) {
 		return nil
 	}
+	if err := ensureLogicalRouteWriteAllowed(c.engine, key, commitTS); err != nil {
+		return err
+	}
+	if checked, err := c.rejectS3BucketAuxiliaryWriteTimestampFloor(key, commitTS); checked || err != nil {
+		return err
+	}
+	return c.rejectRawRouteWriteTimestampFloor(key, commitTS)
+}
+
+func (c *ShardedCoordinator) skipPointWriteTimestampFloor(key []byte) bool {
+	// Same exemption rejectWriteFencedPointKey applies, and for the same
+	// reason: in partition-resolved keyspaces such as HT-FIFO SQS, routeKey
+	// collapses a concrete partition key onto the global SQS route, so that
+	// route's floor is not this key's floor. Applying it here rejected writes
+	// the write-fence precheck deliberately lets through, and the Raft-side
+	// gate already covers these keys through the resolver's own routing.
+	return c.partitionResolverRecognisesPointKey(key) || isTxnInternalKey(key)
+}
+
+func (c *ShardedCoordinator) rejectS3BucketAuxiliaryWriteTimestampFloor(key []byte, commitTS uint64) (bool, error) {
+	start, end, ok := s3BucketAuxiliaryRouteRange(key)
+	if !ok {
+		return false, nil
+	}
+	route, found := s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
+	if found && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+		return true, errors.Join(
+			errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q route range [%q,%q) commit_ts=%d floor=%d", key, start, end, commitTS, route.MinWriteTSExclusive),
+			store.NewWriteConflictError(key),
+		)
+	}
+	return true, nil
+}
+
+func (c *ShardedCoordinator) rejectRawRouteWriteTimestampFloor(key []byte, commitTS uint64) error {
 	rkey := routeKey(key)
 	if route, ok := c.engine.GetRoute(rkey); ok && route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
-		return errors.Wrapf(ErrRouteWriteTimestampTooLow, "key %q routeKey %q commit_ts=%d floor=%d", key, rkey, commitTS, route.MinWriteTSExclusive)
+		return routeWriteTimestampFloorError(route, key, commitTS)
 	}
 	return nil
 }
@@ -1350,7 +1600,10 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorDelPrefix(prefix []byte, c
 	start, end := routePrefixRange(prefix)
 	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
 		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
-			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", prefix, start, end, commitTS, route.MinWriteTSExclusive)
+			return errors.Join(
+				errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", prefix, start, end, commitTS, route.MinWriteTSExclusive),
+				store.NewWriteConflictError(prefix),
+			)
 		}
 	}
 	return nil
@@ -1400,7 +1653,17 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 	return &CoordinateResponse{CommitIndex: maxIndex.Load()}, nil
 }
 
-func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, commitTS uint64, prevCommitTS uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, label keyviz.Label) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchTxn(
+	ctx context.Context,
+	startTS uint64,
+	commitTS uint64,
+	prevCommitTS uint64,
+	elems []*Elem[OP],
+	readKeys [][]byte,
+	observedRouteVersion uint64,
+	label keyviz.Label,
+	callerSuppliedStartTS bool,
+) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -1413,25 +1676,23 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	if len(primaryKey) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
+	singleShard := len(gids) == 1 && c.allReadKeysInShard(readKeys, gids[0])
+	if err := c.validateCallerSuppliedTxnStart(ctx, startTS, singleShard, callerSuppliedStartTS); err != nil {
+		return nil, err
+	}
 
-	commitTS, err = c.resolveTxnCommitTS(ctx, startTS, commitTS)
+	commitTS, err = c.settleTxnCommitTimestamp(ctx, startTS, commitTS, elems, grouped, bypassKeysByGroup)
 	if err != nil {
 		return nil, err
 	}
-	if err := ValidateElemCommitTSPatches(elems, commitTS); err != nil {
-		return nil, err
-	}
-	if err := c.rejectWriteTimestampFloorPointElems(elems, commitTS); err != nil {
-		return nil, err
-	}
 
-	if len(gids) == 1 && c.allReadKeysInShard(readKeys, gids[0]) {
+	if singleShard {
 		// Fast path: all mutations and read keys are in a single shard.
 		// Use the one-phase path without allocating a grouped-read-keys map.
 		// If any read key belongs to a different shard the 2PC path is required
 		// so that validateReadOnlyShards can issue a linearizable read barrier,
 		// preserving SSI.
-		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion)
+		return c.dispatchSingleShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion, c.writeFenceBypassKeysForElems(elems))
 	}
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
@@ -1439,9 +1700,99 @@ func (c *ShardedCoordinator) dispatchTxn(ctx context.Context, startTS uint64, co
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup)
 }
 
+// settleTxnCommitTimestamp resolves the commit timestamp and then applies the
+// two checks that depend on it: the per-element commit-ts patches have to agree
+// with the settled value, and the route write floors have to admit a write at
+// it. Both belong after allocation and before any dispatch, so they travel with
+// the allocation rather than being repeated at each call site.
+func (c *ShardedCoordinator) settleTxnCommitTimestamp(
+	ctx context.Context,
+	startTS uint64,
+	commitTS uint64,
+	elems []*Elem[OP],
+	grouped map[uint64][]*pb.Mutation,
+	bypassKeysByGroup map[uint64][][]byte,
+) (uint64, error) {
+	settled, err := c.prepareTxnCommitTimestamp(ctx, startTS, commitTS, elems)
+	if err != nil {
+		return 0, err
+	}
+	if err := ValidateElemCommitTSPatches(elems, settled); err != nil {
+		return 0, err
+	}
+	if err := c.ensureGroupedMutationsWriteAllowedWithBypass(grouped, settled, bypassKeysByGroup); err != nil {
+		return 0, err
+	}
+	return settled, nil
+}
+
+func (c *ShardedCoordinator) validateCallerSuppliedTxnStart(ctx context.Context, startTS uint64, singleShard, callerSupplied bool) error {
+	if !callerSupplied {
+		return nil
+	}
+	if c.consumeAppliedReadTimestampVoucher(ctx, startTS) || singleShard {
+		return nil
+	}
+	return c.validateCrossShardReadTimestamp(ctx, startTS)
+}
+
+func (c *ShardedCoordinator) prepareTxnCommitTimestamp(ctx context.Context, startTS, commitTS uint64, elems []*Elem[OP]) (uint64, error) {
+	callerSuppliedCommitTS := commitTS != 0
+	resolved, err := c.resolveTxnCommitTS(ctx, startTS, commitTS)
+	if err != nil {
+		return 0, err
+	}
+	if callerSuppliedCommitTS {
+		if err := c.validateCallerSuppliedTxnCommit(ctx, resolved); err != nil {
+			return 0, err
+		}
+		if c.clock != nil {
+			// Only publish caller-provided CommitTS after Phase-D validation.
+			// Observe is permanent, so an invalid future commit timestamp must
+			// not poison later local HLC issuance.
+			c.clock.Observe(resolved)
+		}
+	}
+	if err := ValidateElemCommitTSPatches(elems, resolved); err != nil {
+		return 0, err
+	}
+	return resolved, nil
+}
+
+func (c *ShardedCoordinator) validateCallerSuppliedTxnCommit(ctx context.Context, commitTS uint64) error {
+	validator, _, required, err := phaseDTimestampValidator(c.tsAllocator)
+	if err != nil {
+		return errors.Wrap(err, "caller-supplied commit timestamp validator is unavailable")
+	}
+	if !required {
+		return nil
+	}
+	if err := validator.ValidateDurableTimestamp(ctx, commitTS); err != nil {
+		return errors.Wrap(err, "validate caller-supplied commit timestamp")
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) validateCrossShardReadTimestamp(
+	ctx context.Context,
+	startTS uint64,
+) error {
+	validator, _, required, err := phaseDTimestampValidator(c.tsAllocator)
+	if err != nil {
+		return errors.Wrap(err, "cross-shard read timestamp validator is unavailable")
+	}
+	if !required {
+		return nil
+	}
+	if err := validator.ValidateDurableTimestamp(ctx, startTS); err != nil {
+		return errors.Wrap(err, "validate cross-shard read/start timestamp")
+	}
+	return nil
+}
+
 // dispatchMultiShardTxn runs the 2PC path. Extracted from dispatchTxn to keep
-// that function under the cyclop budget after the prevCommitTS reject (codex
-// P2 round-10) was added; the multi-shard branch already carries five linear
+// that function under the cyclop budget after the prevCommitTS reject was
+// added; the multi-shard branch already carries five linear
 // error checks (groupReadKeys, prewrite, commitPrimary, abortCleanup,
 // commitSecondaries) that pushed the parent over the 10-edge limit.
 func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, readKeys [][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) (*CoordinateResponse, error) {
@@ -1485,7 +1836,7 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		// keyspace-scan work). Detach cancellation but cap with
 		// verifyLeaderTimeout so a hung Abort cannot leak.
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 		cancel()
 		return nil, errors.WithStack(err)
 	}
@@ -1517,10 +1868,6 @@ func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, co
 			return 0, err
 		}
 		commitTS = next
-	} else if c.clock != nil {
-		// Observe caller-provided commitTS to keep the HLC monotonic; without
-		// this the clock could later issue timestamps smaller than commitTS.
-		c.clock.Observe(commitTS)
 	}
 	if commitTS == 0 || commitTS <= startTS {
 		return 0, errors.WithStack(ErrTxnCommitTSRequired)
@@ -1540,7 +1887,7 @@ func (c *ShardedCoordinator) allReadKeysInShard(readKeys [][]byte, gid uint64) b
 	return true
 }
 
-func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, error) {
+func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) (*CoordinateResponse, error) {
 	g, err := c.txnGroupForID(gid)
 	if err != nil {
 		return nil, err
@@ -1555,7 +1902,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 	// carries the one-phase dedup probe key for a retry that reuses a failed
 	// attempt's write set.
 	resp, err := g.Txn.Commit(ctx, []*pb.Request{
-		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion, c.writeFenceBypassKeysForElems(elems)),
+		onePhaseTxnRequestWithPrevCommit(startTS, commitTS, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion, writeFenceBypassKeys),
 	})
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1639,7 +1986,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			// already wrote on prior shards. Otherwise LockResolver
 			// holds the bag.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 			cancel()
 			return nil, errors.WithStack(err)
 		}
@@ -1655,7 +2002,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 		// expired, so the abort needs detached cancellation to
 		// avoid stranding intents.
 		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, abortTSFrom(startTS, commitTS))
+		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 		cancel()
 		return nil, err
 	}
@@ -1853,11 +2200,15 @@ func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label s
 	if min == ^uint64(0) {
 		return 0, errors.Wrap(ErrTxnCommitTSRequired, label)
 	}
-	if c.tsAllocator != nil {
+	if allocator, ok := resolveTimestampAllocator(c.tsAllocator); ok {
 		if min > 0 {
-			return nextTimestampAfterFromAllocator(ctx, c.tsAllocator, min, label)
+			return nextTimestampAfterFromAllocator(ctx, allocator, min, label)
 		}
-		return nextTimestampFromAllocator(ctx, c.tsAllocator, label)
+		return nextTimestampFromAllocator(ctx, allocator, label)
+	}
+	if c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() {
+		return 0, errors.Wrap(ErrTSOAllocatorRequired,
+			"legacy HLC issuance is disabled by durable TSO phase D")
 	}
 	if c.clock == nil {
 		return 0, errors.Wrap(ErrTSOClockNil, label)
@@ -1865,11 +2216,7 @@ func (c *ShardedCoordinator) allocateTimestampAfter(ctx context.Context, label s
 	if min > 0 {
 		c.clock.Observe(min)
 	}
-	ts, err := c.clock.NextFenced()
-	if err != nil {
-		return 0, errors.Wrap(err, label)
-	}
-	return ts, nil
+	return nextFencedWithRecovery(ctx, c.clock, c, label)
 }
 
 // Next makes ShardedCoordinator usable as a TimestampAllocator for adapter
@@ -1883,7 +2230,8 @@ func (c *ShardedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64,
 }
 
 func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64) (uint64, error) {
-	if c.clock == nil && c.tsAllocator == nil {
+	_, allocatorConfigured := resolveTimestampAllocator(c.tsAllocator)
+	if c.clock == nil && !allocatorConfigured {
 		nextTS := startTS + 1
 		if nextTS == 0 {
 			return 0, nil
@@ -1907,6 +2255,34 @@ func (c *ShardedCoordinator) nextTxnTSAfter(ctx context.Context, startTS uint64)
 		return 0, nil
 	}
 	return ts, nil
+}
+
+// abortTimestamp obtains the timestamp a rollback record is written under.
+//
+// Deriving commitTS+1 arithmetically claims a value the allocator never handed
+// out. With BatchAllocator that neighbour is still inside the reserved window
+// and goes to the next transaction, so the rollback record and that transaction
+// would share one supposedly global timestamp.
+//
+// Returning zero when allocation fails leaves the rollback undone --
+// abortPreparedTxn skips a zero timestamp -- and the prewrite intents wait for
+// LockResolver. That is the lesser harm. Persisting the derived neighbour
+// anyway would write a value the allocator never issued, and a later refill can
+// hand that same value to another transaction; a warning log does not make the
+// persisted timestamp safe.
+func (c *ShardedCoordinator) abortTimestamp(ctx context.Context, startTS, commitTS uint64) uint64 {
+	base := max(startTS, commitTS)
+	ts, err := c.nextTxnTSAfter(ctx, base)
+	if err == nil && ts > base {
+		return ts
+	}
+	c.logger().WarnContext(ctx,
+		"abort timestamp allocation failed; leaving intents for the lock resolver",
+		"start_ts", startTS,
+		"commit_ts", commitTS,
+		"err", err,
+	)
+	return 0
 }
 
 func abortTSFrom(startTS, commitTS uint64) uint64 {
@@ -1945,7 +2321,8 @@ func (c *ShardedCoordinator) nextStartTS(ctx context.Context, elems []*Elem[OP])
 	if c.clock != nil && maxTS > 0 {
 		c.clock.Observe(maxTS)
 	}
-	if c.clock == nil && c.tsAllocator == nil {
+	_, allocatorConfigured := resolveTimestampAllocator(c.tsAllocator)
+	if c.clock == nil && !allocatorConfigured {
 		return maxTS + 1, nil
 	}
 	ts, err := c.allocateTimestampAfter(ctx, "allocate sharded startTS", maxTS)
@@ -1983,8 +2360,8 @@ func (c *ShardedCoordinator) IsTimestampLeader() bool {
 	if c == nil {
 		return false
 	}
-	if c.timestampGroupConfigured {
-		return isLeaderEngine(engineForGroup(c.groups[c.timestampGroup]))
+	if groupID, ok := c.effectiveTimestampGroup(); ok {
+		return isLeaderEngine(engineForGroup(c.groups[groupID]))
 	}
 	for _, groupID := range c.timestampBridgeCandidateGroupIDs() {
 		if isLeaderEngine(engineForGroup(c.groups[groupID])) {
@@ -2019,6 +2396,22 @@ func (c *ShardedCoordinator) timestampBridgeCandidateGroupIDs() []uint64 {
 	}
 	slices.Sort(ids)
 	return ids
+}
+
+// LocalLeaderGroupIDs returns the configured data shard groups this process
+// currently leads. Background maintenance uses this to avoid issuing
+// whole-keyspace scans from every node and proxying those scans back to the
+// same hot leaders.
+func (c *ShardedCoordinator) LocalLeaderGroupIDs() []uint64 {
+	ids := c.timestampBridgeCandidateGroupIDs()
+	out := make([]uint64, 0, len(ids))
+	for _, gid := range ids {
+		g, ok := c.groups[gid]
+		if ok && isLeaderEngine(engineForGroup(g)) {
+			out = append(out, gid)
+		}
+	}
+	return out
 }
 
 func (c *ShardedCoordinator) invalidateTimestampWindow() {
@@ -2060,12 +2453,53 @@ func (c *ShardedCoordinator) IsLeaderForKey(key []byte) bool {
 	return isLeaderEngine(engineForGroup(g))
 }
 
+// LeadershipForKey reports local leadership and Raft term for key's group.
+func (c *ShardedCoordinator) LeadershipForKey(key []byte) (bool, uint64) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return false, 0
+	}
+	return leadershipForEngine(engineForGroup(g))
+}
+
+// GroupLeadership reports local leadership and Raft term for groupID.
+func (c *ShardedCoordinator) GroupLeadership(groupID uint64) (bool, uint64) {
+	g, ok := c.groups[groupID]
+	if !ok {
+		return false, 0
+	}
+	return leadershipForEngine(engineForGroup(g))
+}
+
 func (c *ShardedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
 	g, ok := c.groupForKey(key)
 	if !ok {
 		return errors.WithStack(ErrLeaderNotFound)
 	}
 	return verifyLeaderEngineCtx(ctx, engineForGroup(g))
+}
+
+// IsLeaderForGroup reports local leadership for an already-resolved group,
+// skipping the key -> route -> group derivation IsLeaderForKey performs. Read
+// fencing needs this: a fence target's group is known when the target is built,
+// and re-deriving it from the representative key can land on a different group
+// (see ReadFenceTarget).
+func (c *ShardedCoordinator) IsLeaderForGroup(groupID uint64) bool {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return false
+	}
+	return isLeaderEngine(engineForGroup(g))
+}
+
+// RaftLeaderForGroup returns the Raft leader address for an already-resolved
+// group, the group-keyed counterpart of RaftLeaderForKey.
+func (c *ShardedCoordinator) RaftLeaderForGroup(groupID uint64) string {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return ""
+	}
+	return leaderAddrFromEngine(engineForGroup(g))
 }
 
 func (c *ShardedCoordinator) RaftLeaderForKey(key []byte) string {
@@ -2107,6 +2541,18 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 	return groupLeaseRead(ctx, g, c.leaseObserver)
 }
 
+// LeaseReadForGroup establishes the lease freshness bound on an already-resolved
+// group. Read fencing knows the group when it builds a ReadFenceTarget, and
+// re-deriving it from the representative key can select a different group, so the
+// fence path uses this instead of LeaseReadForKey.
+func (c *ShardedCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
+	g, ok := c.groups[groupID]
+	if !ok || g == nil {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	return groupLeaseRead(ctx, g, c.leaseObserver)
+}
+
 // LeaseReadAllGroups establishes the lease freshness bound on every configured
 // all-shard data group. Multi-shard reads (Scan, GSI/whole-table Query) visit
 // all intersecting data routes across all groups (see ShardStore.ScanAt), so
@@ -2117,16 +2563,28 @@ func (c *ShardedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (u
 // but correctness does not depend on it because every configured group must
 // succeed.
 func (c *ShardedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
+	_, err := c.LeaseReadAllGroupsTimestamp(ctx)
+	return err
+}
+
+// LeaseReadAllGroupsTimestamp fences every data-group leader and returns the
+// maximum commit timestamp observed after those barriers.
+func (c *ShardedCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
 	groups, err := c.allShardGroups()
 	if err != nil {
-		return err
+		return 0, err
 	}
+	var maxCommitTS uint64
 	for _, g := range groups {
-		if _, err := groupLeaseRead(ctx, g, c.leaseObserver); err != nil {
-			return errors.WithStack(err)
+		result, err := groupLeaseReadResult(ctx, g, c.leaseObserver)
+		if err != nil {
+			return 0, errors.WithStack(err)
+		}
+		if result.lastCommitTS > maxCommitTS {
+			maxCommitTS = result.lastCommitTS
 		}
 	}
-	return nil
+	return maxCommitTS, nil
 }
 
 func (c *ShardedCoordinator) allShardGroups() ([]*ShardGroup, error) {
@@ -2176,20 +2634,58 @@ func observeLeaseRead(observer LeaseReadObserver, hit bool) {
 	}
 }
 
+func shouldForwardGroupLeaseRead(g *ShardGroup, engine raftengine.Engine) bool {
+	return g != nil && g.leaderRead != nil && engine != nil && engine.State() != raftengine.StateLeader
+}
+
+type leaseReadResult struct {
+	appliedIndex uint64
+	lastCommitTS uint64
+}
+
+func localLeaseReadResult(g *ShardGroup, appliedIndex uint64) leaseReadResult {
+	result := leaseReadResult{appliedIndex: appliedIndex}
+	if g != nil && g.Store != nil {
+		result.lastCommitTS = g.Store.LastCommitTS()
+	}
+	return result
+}
+
+func handleGroupLeaseReadError(ctx context.Context, g *ShardGroup, err error) (leaseReadResult, error) {
+	if g != nil && isLeadershipLossError(err) {
+		g.lease.invalidate()
+	}
+	if g != nil && g.leaderRead != nil && isTransientLeaderError(err) {
+		return g.leaderRead(ctx)
+	}
+	return leaseReadResult{}, err
+}
+
 func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (uint64, error) {
+	result, err := groupLeaseReadResult(ctx, g, observer)
+	return result.appliedIndex, err
+}
+
+func groupLeaseReadResult(ctx context.Context, g *ShardGroup, observer LeaseReadObserver) (leaseReadResult, error) {
 	engine := engineForGroup(g)
+	if shouldForwardGroupLeaseRead(g, engine) {
+		observeLeaseRead(observer, false)
+		return g.leaderRead(ctx)
+	}
 	// g.lp caches the LeaseProvider assertion done once at construction
 	// (NewShardedCoordinator); a nil group or an engine without the
 	// capability falls through to the linearizable slow path. The nil-g
 	// guard preserves engineForGroup's nil-safety since g.lp would panic
 	// on a nil receiver.
 	if g == nil || g.lp == nil {
-		return linearizableReadEngineCtx(ctx, engine)
+		idx, err := linearizableReadEngineCtx(ctx, engine)
+		return localLeaseReadResult(g, idx), err
 	}
 	lp := g.lp
 	leaseDur := lp.LeaseDuration()
 	if leaseDur <= 0 {
-		return linearizableReadEngineCtx(ctx, engine)
+		idx, err := linearizableReadEngineCtx(ctx, engine)
+		return localLeaseReadResult(g, idx), err
 	}
 	// Single monoclock.Now() sample so primary/secondary/extension
 	// all see the same monotonic-raw instant. Clock-skew safety
@@ -2198,27 +2694,85 @@ func groupLeaseRead(ctx context.Context, g *ShardGroup, observer LeaseReadObserv
 	state := engine.State()
 	if engineLeaseAckValid(state, lp.LastQuorumAck(), now, leaseDur) {
 		observeLeaseRead(observer, true)
-		return lp.AppliedIndex(), nil
+		return localLeaseReadResult(g, lp.AppliedIndex()), nil
 	}
 	expectedGen := g.lease.generation()
 	if g.lease.valid(now) && state == raftengine.StateLeader {
 		observeLeaseRead(observer, true)
-		return lp.AppliedIndex(), nil
+		return localLeaseReadResult(g, lp.AppliedIndex()), nil
 	}
 	observeLeaseRead(observer, false)
 	idx, err := linearizableReadEngineCtx(ctx, engine)
 	if err != nil {
-		if isLeadershipLossError(err) {
-			g.lease.invalidate()
-		}
-		return 0, err
+		return handleGroupLeaseReadError(ctx, g, err)
 	}
 	g.lease.extend(now.Add(leaseDur), expectedGen)
-	return idx, nil
+	return localLeaseReadResult(g, idx), nil
 }
 
 func (c *ShardedCoordinator) Clock() *HLC {
 	return c.clock
+}
+
+// RaftMembers returns every configured Raft endpoint across all local groups.
+// Endpoints, rather than node IDs, are deduplicated because one process can
+// expose a distinct listener per group. The stable sort keeps capability-cache
+// fingerprints deterministic despite map iteration order.
+func (c *ShardedCoordinator) RaftMembers(ctx context.Context) ([]RaftMember, error) {
+	if c == nil || len(c.groups) == 0 {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	membersByEndpoint := make(map[string]RaftMember)
+	for _, group := range c.groups {
+		members, err := raftMembersForGroup(ctx, group)
+		if err != nil {
+			return nil, err
+		}
+		for _, member := range members {
+			endpoint := member.NodeID + "\x00" + member.Address
+			membersByEndpoint[endpoint] = member
+		}
+	}
+	endpoints := make([]string, 0, len(membersByEndpoint))
+	for endpoint := range membersByEndpoint {
+		endpoints = append(endpoints, endpoint)
+	}
+	slices.Sort(endpoints)
+	members := make([]RaftMember, 0, len(endpoints))
+	for _, endpoint := range endpoints {
+		members = append(members, membersByEndpoint[endpoint])
+	}
+	return members, nil
+}
+
+// RaftMembersForKey returns a stable value copy of the current configuration
+// for the key's owning group. It is intentionally membership-only: callers do
+// not gain access to the mutable ShardGroup or its local store.
+func (c *ShardedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]RaftMember, error) {
+	g, ok := c.groupForKey(key)
+	if !ok {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	return raftMembersForGroup(ctx, g)
+}
+
+func raftMembersForGroup(ctx context.Context, group *ShardGroup) ([]RaftMember, error) {
+	if group == nil || group.Engine == nil {
+		return nil, errors.WithStack(ErrLeaderNotFound)
+	}
+	cfg, err := group.Engine.Configuration(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	members := make([]RaftMember, 0, len(cfg.Servers))
+	for _, server := range cfg.Servers {
+		members = append(members, RaftMember{
+			NodeID:   server.ID,
+			Address:  server.Address,
+			Suffrage: server.Suffrage,
+		})
+	}
+	return members, nil
 }
 
 func (c *ShardedCoordinator) groupForKey(key []byte) (*ShardGroup, bool) {
@@ -2265,7 +2819,7 @@ func (c *ShardedCoordinator) engineGroupIDForKey(key []byte) uint64 {
 }
 
 func (c *ShardedCoordinator) resolveGroupAndRouteForKey(key []byte) (uint64, uint64, bool) {
-	if route, ok := c.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
 		return route.GroupID, route.RouteID, true
 	}
 	gid, ok := c.router.ResolveGroup(key)
@@ -2279,7 +2833,7 @@ func (c *ShardedCoordinator) resolveGroupAndRouteForKey(key []byte) (uint64, uin
 	return gid, routeID, true
 }
 
-func (c *ShardedCoordinator) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []byte) (distribution.Route, bool) {
+func (c *ShardedCoordinator) s3BucketAuxiliaryOwnerRouteForKey(key []byte) (distribution.Route, bool) {
 	if c == nil || c.engine == nil {
 		return distribution.Route{}, false
 	}
@@ -2287,12 +2841,7 @@ func (c *ShardedCoordinator) stagedVisibilityRouteForS3BucketAuxiliaryKey(key []
 	if !ok {
 		return distribution.Route{}, false
 	}
-	for _, route := range c.engine.GetIntersectingRoutes(start, end) {
-		if routeHasStagedVisibility(route) {
-			return route, true
-		}
-	}
-	return distribution.Route{}, false
+	return s3BucketAuxiliaryOwnerRouteFromRange(start, end, c.engine.GetIntersectingRoutes(start, end))
 }
 
 // EngineGroupIDForKey reports the Raft group ID that owns key, or 0 when
@@ -2376,14 +2925,18 @@ func (c *ShardedCoordinator) stagedVisibilityReadKeyAlias(gid uint64, key []byte
 	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
 		return nil, false
 	}
-	if route, ok := c.stagedVisibilityRouteForS3BucketAuxiliaryKey(key); ok {
-		if route.GroupID != gid {
-			return nil, false
-		}
-		return distribution.MigrationStagedDataKey(route.MigrationJobID, key), true
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
+		return stagedVisibilityReadKeyAliasForRoute(gid, key, route)
 	}
 	route, ok := c.engine.GetRoute(routeKey(key))
-	if !ok || route.GroupID != gid || !routeHasStagedVisibility(route) {
+	if !ok {
+		return nil, false
+	}
+	return stagedVisibilityReadKeyAliasForRoute(gid, key, route)
+}
+
+func stagedVisibilityReadKeyAliasForRoute(gid uint64, key []byte, route distribution.Route) ([]byte, bool) {
+	if route.GroupID != gid || !routeHasStagedVisibility(route) {
 		return nil, false
 	}
 	return distribution.MigrationStagedDataKey(route.MigrationJobID, key), true
@@ -2493,15 +3046,20 @@ func (c *ShardedCoordinator) currentShardRoutesForRouteRange(gid uint64, routeSt
 }
 
 func (c *ShardedCoordinator) latestCommitTSForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) (uint64, bool, error) {
-	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+	route, ok := c.stagedVisibilityRouteForReadKey(gid, key)
+	if !ok {
+		liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
+		return liveTS, liveExists, errors.WithStack(err)
+	}
+	// Staged before live, for the reason on getAtWithStagedVisibility.
+	// Missing the version here is worse than a stale read: OCC would see no
+	// commit above startTS and let the transaction commit on a read it should
+	// have conflicted with.
+	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
-	route, ok := c.stagedVisibilityRouteForReadKey(gid, key)
-	if !ok {
-		return liveTS, liveExists, nil
-	}
-	stagedTS, stagedExists, err := g.Store.LatestCommitTS(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+	liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
 	if err != nil {
 		return 0, false, errors.WithStack(err)
 	}
@@ -2514,6 +3072,9 @@ func (c *ShardedCoordinator) stagedVisibilityRouteForReadKey(gid uint64, key []b
 	}
 	if _, _, ok := distribution.MigrationStagedDataKeyParts(key); ok {
 		return distribution.Route{}, false
+	}
+	if route, ok := c.s3BucketAuxiliaryOwnerRouteForKey(key); ok {
+		return route, route.GroupID == gid && routeHasStagedVisibility(route)
 	}
 	route, ok := c.engine.GetRoute(routeKey(key))
 	return route, ok && route.GroupID == gid && routeHasStagedVisibility(route)
@@ -2560,22 +3121,25 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
 	if err != nil {
 		return nil, nil, err
 	}
-
 	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(reqs.Elems)
+
 	logs := make([]*pb.Request, 0, len(gids))
 	for _, gid := range gids {
 		ts, err := c.rawLogTimestamp(ctx)
 		if err != nil {
 			return nil, nil, err
 		}
-		if err := c.rejectWriteTimestampFloorMutations(grouped[gid], ts); err != nil {
-			return nil, nil, err
+		muts := grouped[gid]
+		if ts != 0 {
+			if err := c.ensureMutationsWriteAllowedWithBypass(muts, ts, bypassKeysByGroup[gid]); err != nil {
+				return nil, nil, err
+			}
 		}
 		logs = append(logs, &pb.Request{
 			IsTxn:                false,
 			Phase:                pb.Phase_NONE,
 			Ts:                   ts,
-			Mutations:            grouped[gid],
+			Mutations:            muts,
 			ObservedRouteVersion: reqs.ObservedRouteVersion,
 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		})
@@ -2588,27 +3152,28 @@ func (c *ShardedCoordinator) rejectWriteTimestampFloorMutations(muts []*pb.Mutat
 		return nil
 	}
 	for _, mut := range muts {
-		if mut == nil {
-			continue
-		}
-		if mut.GetOp() == pb.Op_DEL_PREFIX {
-			if err := c.rejectWriteTimestampFloorDelPrefix(mut.Key, commitTS); err != nil {
-				return err
-			}
-			continue
-		}
-		if len(mut.Key) == 0 {
-			continue
-		}
-		if err := c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS); err != nil {
+		if err := c.rejectWriteTimestampFloorMutation(mut, commitTS); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+func (c *ShardedCoordinator) rejectWriteTimestampFloorMutation(mut *pb.Mutation, commitTS uint64) error {
+	if mut == nil {
+		return nil
+	}
+	if mut.GetOp() == pb.Op_DEL_PREFIX {
+		return c.rejectWriteTimestampFloorDelPrefix(mut.Key, commitTS)
+	}
+	if len(mut.Key) == 0 {
+		return nil
+	}
+	return c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS)
+}
+
 func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {
-	if c.tsAllocator != nil {
+	if _, ok := resolveTimestampAllocator(c.tsAllocator); ok {
 		return 0, nil
 	}
 	return c.allocateTimestamp(ctx, "allocate sharded raw log ts")
@@ -2624,7 +3189,7 @@ func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs
 			return err
 		}
 		r.Ts = ts
-		if err := c.rejectWriteTimestampFloorMutations(r.Mutations, r.Ts); err != nil {
+		if err := c.ensureMutationsWriteAllowedWithBypass(r.Mutations, r.Ts, r.GetWriteFenceBypassKeys()); err != nil {
 			return err
 		}
 	}
@@ -2645,10 +3210,13 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	if err != nil {
 		return nil, err
 	}
+	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(reqs.Elems)
+	if err := c.ensureGroupedMutationsWriteAllowedWithBypass(grouped, commitTS, bypassKeysByGroup); err != nil {
+		return nil, err
+	}
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
-	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(reqs.Elems)
 	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion, bypassKeysByGroup)
 }
 
@@ -2659,10 +3227,52 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 // path allocation-free. Reads have their own observeReadKey helper
 // (LinearizableReadForKey / LeaseReadForKey).
 func (c *ShardedCoordinator) observeMutation(routeID uint64, mut *pb.Mutation, label keyviz.Label) {
-	if c.sampler == nil {
+	if c == nil || c.sampler == nil || mut == nil {
 		return
 	}
-	c.sampler.Observe(routeID, mut.Key, keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
+	// Sample under the route key, not the raw storage key. routeID was resolved
+	// with routeKey and the sampler's sub-buckets are laid out on catalog route
+	// boundaries, which live in the normalized keyspace. Feeding the raw key
+	// here bucketed adapter traffic against the wrong bounds -- Redis user key
+	// "z" arrives as "!redis|str|z", which sorts before a route starting at
+	// "m", so every write clamped into the first sub-bucket and autosplit chose
+	// a boundary near the route start instead of the hot user key.
+	c.sampler.Observe(routeID, routeKey(mut.Key), keyviz.OpWrite, len(mut.Value), c.keyVizObserveLabel(label))
+}
+
+// ObserveForwardedRequests records committed leader-side sampling evidence for
+// writes that entered through a shard follower and were committed via
+// Internal.Forward on this shard leader.
+func (c *ShardedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
+	if c == nil || c.sampler == nil {
+		return
+	}
+	for _, req := range reqs {
+		if req == nil || !forwardedRequestRecordsUserWrites(req) {
+			continue
+		}
+		for _, mut := range req.Mutations {
+			if mut == nil || isTxnMetaKey(mut.Key) {
+				continue
+			}
+			routeID, _, ok := c.routeAndGroupForKey(mut.Key)
+			if !ok {
+				continue
+			}
+			c.observeMutation(routeID, mut, keyviz.LabelLegacy)
+		}
+	}
+}
+
+// forwardedRequestRecordsUserWrites reports whether a forwarded request carries
+// writes that should count as hot-key evidence.
+//
+// An ABORT cleanup still lists the user keys after the txn metadata so the FSM
+// can clear their intents, but those writes were rolled back. Counting them
+// would let a follower-routed transaction that aborts manufacture hot-key
+// evidence, and the autosplit scheduler would split on cleanup traffic.
+func forwardedRequestRecordsUserWrites(req *pb.Request) bool {
+	return req.GetPhase() != pb.Phase_ABORT
 }
 
 // observeRead records a single linearizable / lease read against the
@@ -2686,7 +3296,14 @@ func (c *ShardedCoordinator) observeRead(ctx context.Context, routeID uint64, ke
 	if c.sampler == nil {
 		return
 	}
-	c.sampler.Observe(routeID, key, keyviz.OpRead, 0, c.keyVizObserveLabel(keyVizLabelFromContext(ctx)))
+	// Normalized for the same reason observeMutation normalizes: routeID was
+	// resolved through routeKey, and the sampler's sub-buckets are laid out on
+	// catalog route boundaries, which live in the normalized keyspace. A raw
+	// adapter key -- a DynamoDB item key, a Redis route wrapper -- sorts in a
+	// different keyspace than those boundaries, so read-heavy traffic bucketed
+	// against the wrong bounds and could pick a split boundary unrelated to the
+	// hot logical key.
+	c.sampler.Observe(routeID, routeKey(key), keyviz.OpRead, 0, c.keyVizObserveLabel(keyVizLabelFromContext(ctx)))
 }
 
 func (c *ShardedCoordinator) keyVizObserveLabel(label keyviz.Label) keyviz.Label {
@@ -2694,6 +3311,74 @@ func (c *ShardedCoordinator) keyVizObserveLabel(label keyviz.Label) keyviz.Label
 		return keyviz.LabelLegacy
 	}
 	return label
+}
+
+func (c *ShardedCoordinator) ensureGroupedMutationsWriteAllowedWithBypass(grouped map[uint64][]*pb.Mutation, commitTS uint64, bypassKeysByGroup map[uint64][][]byte) error {
+	for gid, muts := range grouped {
+		if err := c.ensureMutationsWriteAllowedWithBypass(muts, commitTS, bypassKeysByGroup[gid]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// MutationWriteGate rejects raw mutations whose commit timestamp lands at or
+// below the owning route's migration write floor. Follower-forwarded writes are
+// stamped on the leader, outside the coordinator that owns the route table, so
+// the leader-side RPC handler needs this to re-apply the same check.
+type MutationWriteGate interface {
+	EnsureMutationsWriteAllowed([]*pb.Mutation, uint64) error
+}
+
+var _ MutationWriteGate = (*ShardedCoordinator)(nil)
+
+// EnsureMutationsWriteAllowed exposes the route-floor check to the leader-side
+// Internal.Forward handler. It is the same predicate the local stamping path
+// applies, so a forwarded write cannot reach Raft under a floor that a
+// locally-stamped write would have been rejected by.
+func (c *ShardedCoordinator) EnsureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	return c.ensureMutationsWriteAllowed(muts, commitTS)
+}
+
+func (c *ShardedCoordinator) ensureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
+	return c.ensureMutationsWriteAllowedWithBypass(muts, commitTS, nil)
+}
+
+func (c *ShardedCoordinator) ensureMutationsWriteAllowedWithBypass(muts []*pb.Mutation, commitTS uint64, bypassKeys [][]byte) error {
+	if commitTS == 0 {
+		return nil
+	}
+	bypass := writeFenceBypassKeySet(bypassKeys)
+	for _, mut := range muts {
+		if mut != nil {
+			if _, ok := bypass[string(mut.Key)]; ok {
+				continue
+			}
+		}
+		if err := c.ensureMutationWriteAllowed(mut, commitTS); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (c *ShardedCoordinator) ensureMutationWriteAllowed(mut *pb.Mutation, commitTS uint64) error {
+	if c == nil || mut == nil || commitTS == 0 {
+		return nil
+	}
+	switch mut.Op {
+	case pb.Op_DEL_PREFIX:
+		for _, route := range routesForPrefixWriteForEngine(c.engine, mut.Key) {
+			if err := ensureRouteWriteAllowed(route, mut.Key, commitTS); err != nil {
+				return err
+			}
+		}
+		return nil
+	case pb.Op_PUT, pb.Op_DEL:
+		return c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS)
+	default:
+		return errors.WithStack(ErrInvalidRequest)
+	}
 }
 
 func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label) (map[uint64][]*pb.Mutation, []uint64, error) {
@@ -2819,10 +3504,45 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 	}
 }
 
+func (c *ShardedCoordinator) ProposeHLCLease(ctx context.Context, ceilingMs int64) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	var firstErr error
+	for _, gid := range c.timestampLeaseRenewalGroupIDs() {
+		group := c.groups[gid]
+		if group == nil || group.Engine == nil || group.Engine.State() != raftengine.StateLeader {
+			continue
+		}
+		if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+			if firstErr == nil {
+				firstErr = errors.Wrapf(err, "hlc lease renewal group %d", gid)
+			}
+			continue
+		}
+		return nil
+	}
+	if firstErr != nil {
+		return firstErr
+	}
+	return errors.WithStack(ErrLeaderNotFound)
+}
+
+func (c *ShardedCoordinator) timestampLeaseRenewalGroupIDs() []uint64 {
+	if c == nil {
+		return nil
+	}
+	if groupID, ok := c.effectiveTimestampGroup(); ok {
+		return []uint64{groupID}
+	}
+	return c.timestampBridgeCandidateGroupIDs()
+}
+
 // renewHLCLeases starts one renewal proposal for every shard group this node
-// currently leads. It does not wait for those proposals before returning; the
-// returned channel closes when the launched proposals finish and exists for
-// tests/diagnostics only.
+// currently leads. A group with an older renewal still in flight is skipped for
+// this tick so slow Raft proposals cannot stack up behind write-heavy traffic;
+// other led groups continue renewing independently. The returned channel closes
+// when the launched proposals finish and exists for tests/diagnostics only.
 func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{} {
 	if ctx == nil {
 		ctx = context.Background()
@@ -2830,10 +3550,7 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 	done := make(chan struct{})
 	var wg sync.WaitGroup
 	for gid, group := range c.groups {
-		if group == nil || group.Engine == nil {
-			continue
-		}
-		if group.Engine.State() != raftengine.StateLeader {
+		if !c.shouldRenewHLCGroup(gid, group) {
 			continue
 		}
 		if !c.startHLCLeaseRenewal(gid) {
@@ -2843,7 +3560,7 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		go func(gid uint64, group *ShardGroup) {
 			defer wg.Done()
 			defer c.finishHLCLeaseRenewal(gid)
-			pctx, cancel := context.WithTimeout(ctx, hlcRenewalTimeout)
+			pctx, cancel := context.WithTimeout(ctx, hlcRenewalProposalTimeout)
 			defer cancel()
 			c.renewHLCLease(pctx, gid, group)
 		}(gid, group)
@@ -2853,6 +3570,19 @@ func (c *ShardedCoordinator) renewHLCLeases(ctx context.Context) <-chan struct{}
 		close(done)
 	}()
 	return done
+}
+
+func (c *ShardedCoordinator) shouldRenewHLCGroup(gid uint64, group *ShardGroup) bool {
+	if c.tsoCutoverState != nil && c.tsoCutoverState.PhaseDActive() {
+		timestampGroup, ok := c.effectiveTimestampGroup()
+		// With no timestamp group to fall back on, retiring every data group
+		// would leave nothing renewing any ceiling at all. Keep renewing rather
+		// than expiring the whole cluster.
+		if ok && gid != timestampGroup {
+			return false
+		}
+	}
+	return shardGroupAcceptingWrites(group)
 }
 
 func (c *ShardedCoordinator) startHLCLeaseRenewal(gid uint64) bool {
@@ -2897,8 +3627,109 @@ func (c *ShardedCoordinator) finishHLCLeaseRenewal(gid uint64) {
 // the callback latency window. Non-leadership errors (no quorum,
 // validation) are NOT leadership signals and must not tear down a warm
 // lease -- doing so would force every read onto the slow path.
+func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
+	if c == nil || c.clock == nil {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	c.hlcRecoveryMu.Lock()
+	defer c.hlcRecoveryMu.Unlock()
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
+		return errors.WithStack(errHLCLeaseRecoveryBlocked)
+	}
+	targets := c.hlcLeaseRecoveryTargets()
+	if len(targets) == 0 {
+		return errors.WithStack(errHLCLeaseRecoveryUnavailable)
+	}
+	rctx, cancel := hlcRecoveryContext(ctx)
+	defer cancel()
+	return c.recoverHLCLeaseTargets(rctx, targets, time.Now().UnixMilli()+hlcPhysicalWindowMs)
+}
+
+func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets []hlcLeaseRecoveryTarget, ceilingMs int64) error {
+	errCh := make(chan error, len(targets))
+	var wg sync.WaitGroup
+	var recoveryErr error
+	for _, target := range targets {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if err := c.proposeHLCLeaseForGroup(ctx, target.group, ceilingMs); err != nil {
+				errCh <- errors.Wrapf(err, "recover hlc lease group %d", target.gid)
+			}
+		}()
+	}
+	wg.Wait()
+	close(errCh)
+	for err := range errCh {
+		recoveryErr = combineHLCRecoveryErrors(recoveryErr, err)
+	}
+	if !hlcCeilingExpired(c.clock) {
+		return nil
+	}
+	return hlcRecoveryFailedError(recoveryErr)
+}
+
+func combineHLCRecoveryErrors(first error, next error) error {
+	if first == nil {
+		return next
+	}
+	return errors.Wrap(secondary.CombineErrors(first, next), "combine hlc recovery errors")
+}
+
+func hlcRecoveryFailedError(recoveryErr error) error {
+	expiredErr := errors.Wrap(ErrCeilingExpired, "recover hlc lease did not advance ceiling")
+	if recoveryErr != nil {
+		return errors.Wrap(secondary.CombineErrors(expiredErr, recoveryErr), "recover hlc lease failed")
+	}
+	return expiredErr
+}
+
+type hlcLeaseRecoveryTarget struct {
+	gid   uint64
+	group *ShardGroup
+}
+
+func (c *ShardedCoordinator) hlcLeaseRecoveryTargets() []hlcLeaseRecoveryTarget {
+	if c == nil {
+		return nil
+	}
+	if timestampGroup, ok := c.effectiveTimestampGroup(); ok {
+		group := c.groups[timestampGroup]
+		if !shardGroupAcceptingWrites(group) {
+			return nil
+		}
+		return []hlcLeaseRecoveryTarget{{gid: timestampGroup, group: group}}
+	}
+	ids := c.timestampBridgeCandidateGroupIDs()
+	targets := make([]hlcLeaseRecoveryTarget, 0, len(ids))
+	for _, gid := range ids {
+		group := c.groups[gid]
+		if shardGroupAcceptingWrites(group) {
+			targets = append(targets, hlcLeaseRecoveryTarget{gid: gid, group: group})
+		}
+	}
+	return targets
+}
+
+func shardGroupAcceptingWrites(group *ShardGroup) bool {
+	return group != nil && group.Engine != nil && isLeaderAcceptingWrites(group.Engine)
+}
+
 func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, group *ShardGroup) {
 	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	if err := c.proposeHLCLeaseForGroup(ctx, group, ceilingMs); err != nil {
+		c.logger().WarnContext(ctx, "hlc lease renewal failed",
+			slog.Uint64("group_id", gid),
+			slog.Int64("ceiling_ms", ceilingMs),
+			slog.Any("err", err),
+		)
+	}
+}
+
+func (c *ShardedCoordinator) proposeHLCLeaseForGroup(ctx context.Context, group *ShardGroup, ceilingMs int64) error {
 	start := monoclock.Now()
 	expectedGen := group.lease.generation()
 	// Route through the ShardGroup's wrap-aware proposer chain — NOT a
@@ -2911,16 +3742,12 @@ func (c *ShardedCoordinator) renewHLCLease(ctx context.Context, gid uint64, grou
 		if isLeadershipLossError(err) {
 			group.lease.invalidate()
 		}
-		c.logger().WarnContext(ctx, "hlc lease renewal failed",
-			slog.Uint64("group_id", gid),
-			slog.Int64("ceiling_ms", ceilingMs),
-			slog.Any("err", err),
-		)
-		return
+		return errors.WithStack(err)
 	}
 	if lp, ok := group.Engine.(raftengine.LeaseProvider); ok {
 		group.lease.extend(start.Add(lp.LeaseDuration()), expectedGen)
 	}
+	return nil
 }
 
 func keyMutations(muts []*pb.Mutation) []*pb.Mutation {

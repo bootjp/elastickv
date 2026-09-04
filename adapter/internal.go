@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -31,6 +33,28 @@ const (
 )
 
 type InternalOption func(*Internal)
+
+// WithKVForwardRejected refuses Forward before it can propose.
+//
+// The dedicated TSO group runs TSOStateMachine, whose Apply halts on any tag it
+// does not recognise. TransactionManager.Commit encodes KV requests with the
+// 0x00 / 0x01 tags, so a single forwarded PUT reaching this group's Internal
+// server would commit an entry that permanently stops group-0 apply -- and with
+// it all centralized timestamp issuance. The registration loop wires an Internal
+// server for every runtime, so the refusal has to live here.
+func WithKVForwardRejected() InternalOption {
+	return func(i *Internal) {
+		i.kvForwardRejected = true
+	}
+}
+
+// WithInternalWriteGate re-applies the coordinator's route-floor check to
+// writes that were forwarded here from a follower.
+func WithInternalWriteGate(gate kv.MutationWriteGate) InternalOption {
+	return func(i *Internal) {
+		i.writeGate = gate
+	}
+}
 
 func WithInternalTimestampAllocator(alloc kv.TimestampAllocator) InternalOption {
 	return func(i *Internal) {
@@ -87,6 +111,29 @@ func WithInternalMigrationExportRouting(groupID uint64, resolver kv.PartitionRes
 	}
 }
 
+func WithInternalAdminProposer(proposer raftengine.Proposer) InternalOption {
+	return func(i *Internal) {
+		i.adminProposer = proposer
+	}
+}
+
+func WithInternalLastCommitTimestamp(reader func() uint64) InternalOption {
+	return func(i *Internal) {
+		i.lastCommitTimestamp = reader
+	}
+}
+
+// ForwardWriteObserver observes successfully committed leader-side forwarded
+// writes. It lets the autosplit sampler account for writes that entered through
+// followers without coupling adapter.Internal to keyviz.
+type ForwardWriteObserver func([]*pb.Request)
+
+func WithInternalForwardWriteObserver(observer ForwardWriteObserver) InternalOption {
+	return func(i *Internal) {
+		i.forwardWriteObserver = observer
+	}
+}
+
 func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, clock *kv.HLC, relay *RedisPubSubRelay, opts ...InternalOption) *Internal {
 	i := &Internal{
 		leader:               leader,
@@ -108,6 +155,8 @@ type Internal struct {
 	transactionManager      kv.Transactional
 	clock                   *kv.HLC
 	tsAllocator             kv.TimestampAllocator
+	adminProposer           raftengine.Proposer
+	lastCommitTimestamp     func() uint64
 	relay                   *RedisPubSubRelay
 	store                   store.MVCCStore
 	migrationProposer       raftengine.Proposer
@@ -118,6 +167,11 @@ type Internal struct {
 	readTracker             *kv.ActiveTimestampTracker
 	migrationExportGroupID  uint64
 	migrationExportResolver kv.PartitionResolver
+	writeGate               kv.MutationWriteGate
+	// kvForwardRejected marks a runtime whose state machine cannot apply KV
+	// entries -- the dedicated TSO group. See WithKVForwardRejected.
+	kvForwardRejected    bool
+	forwardWriteObserver ForwardWriteObserver
 
 	pb.UnimplementedInternalServer
 }
@@ -125,6 +179,7 @@ type Internal struct {
 var _ pb.InternalServer = (*Internal)(nil)
 
 var ErrNotLeader = errors.New("not leader")
+var ErrKVForwardNotSupported = errors.New("kv forward not supported on this raft group")
 var ErrLeaderNotFound = errors.New("leader not found")
 var ErrTxnTimestampOverflow = errors.New("txn timestamp overflow")
 
@@ -132,9 +187,32 @@ const (
 	defaultMigrationExportChunkBytes  = 4 << 20
 	defaultMigrationExportScanFactor  = 4
 	defaultMigrationExportMaxVersions = 1024
+
+	// Hard server-side ceilings. The defaults above only fill in a bound the
+	// request left unset, so without these a caller could ask one
+	// ExportVersions call to scan and decode an arbitrary portion of the source
+	// store before producing its next streamed response -- for a sparse family
+	// or route filter that accepts few rows, math.MaxUint64 removes the only
+	// work bound there is and the serving leader's I/O and CPU go with it. A
+	// clamped caller simply advances through more cursor rounds, which the
+	// response already supports. Same shape as the promotion path's clamp.
+	maxMigrationExportChunkBytes = 32 << 20
+	maxMigrationExportScanBytes  = maxMigrationExportChunkBytes * defaultMigrationExportScanFactor
+
+	// Headroom for proto framing over the payload bytes a page carries: field
+	// tags and length prefixes for at most defaultMigrationExportMaxVersions
+	// entries come to tens of kilobytes, so a mebibyte covers them with room
+	// to spare.
+	migrationExportPageFramingHeadroom = 1 << 20
+	migrationExportPageByteBudget      = internal.GRPCMaxMessageBytes - migrationExportPageFramingHeadroom
 )
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
+	// Before the leader check, so a non-leader gets the accurate reason and a
+	// leader can never reach stampTimestamps and propose.
+	if i.kvForwardRejected {
+		return nil, errors.WithStack(ErrKVForwardNotSupported)
+	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
@@ -156,6 +234,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 			Success:     false,
 			CommitIndex: 0,
 		}, errors.WithStack(err)
+	}
+	if i.forwardWriteObserver != nil {
+		i.forwardWriteObserver(req.GetRequests())
 	}
 
 	return &pb.ForwardResponse{
@@ -359,6 +440,63 @@ func normalizeOptionalEnd(end []byte) []byte {
 	return end
 }
 
+func (i *Internal) ForwardAdminProposal(
+	ctx context.Context,
+	req *pb.ForwardAdminProposalRequest,
+) (*pb.ForwardAdminProposalResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if err := i.leader.VerifyLeader(ctx); err != nil {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	if i.adminProposer == nil {
+		return nil, errors.New("admin proposer is unavailable")
+	}
+	result, err := i.adminProposer.ProposeAdmin(ctx, req.GetPayload())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := forwardedAdminProposalResponseError(result); err != nil {
+		return nil, err
+	}
+	return &pb.ForwardAdminProposalResponse{CommitIndex: result.CommitIndex}, nil
+}
+
+func (i *Internal) ForwardLeaseRead(
+	ctx context.Context,
+	_ *pb.ForwardLeaseReadRequest,
+) (*pb.ForwardLeaseReadResponse, error) {
+	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
+		return nil, errors.WithStack(ErrNotLeader)
+	}
+	index, err := i.leader.LinearizableRead(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	lastCommitTS := uint64(0)
+	if i.lastCommitTimestamp != nil {
+		lastCommitTS = i.lastCommitTimestamp()
+	}
+	return &pb.ForwardLeaseReadResponse{AppliedIndex: index, LastCommitTs: lastCommitTS}, nil
+}
+
+func forwardedAdminProposalResponseError(result *raftengine.ProposalResult) error {
+	if result == nil {
+		return errors.New("admin proposal returned nil result")
+	}
+	if result.Response == nil {
+		return nil
+	}
+	if err, ok := result.Response.(error); ok {
+		if errors.Is(err, kv.ErrTooManyActiveBackups) {
+			return status.Errorf(codes.ResourceExhausted, "%s", kv.ErrTooManyActiveBackups)
+		}
+		return errors.WithStack(err)
+	}
+	return errors.Errorf("unexpected admin proposal response %T", result.Response)
+}
+
 func (i *Internal) RelayPublish(_ context.Context, req *pb.RelayPublishRequest) (*pb.RelayPublishResponse, error) {
 	if req == nil || i.relay == nil {
 		return &pb.RelayPublishResponse{}, nil
@@ -391,16 +529,14 @@ func (i *Internal) validateExportRangeVersionsRequest(req *pb.ExportRangeVersion
 	if req.GetKeyFamily() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export key_family is required"))
 	}
-	if exportRangeVersionsRequestFullyUnbounded(req) {
-		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires a raw or route bound"))
+	if exportRangeVersionsRequestRouteUnbounded(req) {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "migration export requires route bounds"))
 	}
 	return nil
 }
 
-func exportRangeVersionsRequestFullyUnbounded(req *pb.ExportRangeVersionsRequest) bool {
-	return len(req.GetRangeStart()) == 0 &&
-		len(req.GetRangeEnd()) == 0 &&
-		len(req.GetRouteStart()) == 0 &&
+func exportRangeVersionsRequestRouteUnbounded(req *pb.ExportRangeVersionsRequest) bool {
+	return len(req.GetRouteStart()) == 0 &&
 		len(req.GetRouteEnd()) == 0
 }
 
@@ -414,11 +550,15 @@ func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest,
 		if !result.Done && bytes.Equal(opts.Cursor, result.NextCursor) {
 			return errors.WithStack(status.Error(codes.Internal, "migration export cursor did not progress"))
 		}
-		if err := stream.Send(&pb.ExportRangeVersionsResponse{
+		resp := &pb.ExportRangeVersionsResponse{
 			Versions:   protoMVCCVersionsFromStore(result.Versions),
 			NextCursor: result.NextCursor,
 			Done:       result.Done,
-		}); err != nil {
+		}
+		if err := checkMigrationExportPageSize(resp); err != nil {
+			return err
+		}
+		if err := stream.Send(resp); err != nil {
 			return errors.WithStack(err)
 		}
 		if result.Done {
@@ -426,6 +566,48 @@ func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest,
 		}
 		opts.Cursor = result.NextCursor
 	}
+}
+
+// checkMigrationExportPageSize refuses to send a page the transport cannot
+// carry. The store's MaxBytes budget is only consulted after a version has
+// been appended, and storage accepts values far above the message limit
+// (store.maxSnapshotValueSize is 256 MiB against internal.GRPCMaxMessageBytes'
+// 64 MiB), so a single oversized row can land in an otherwise bounded page.
+// Sending it fails with ResourceExhausted, and so does every retry of the same
+// cursor -- the bracket never completes and the error says nothing about which
+// row is responsible. Naming the row instead keeps the failure diagnosable.
+// Carrying values that large needs a chunked migration wire format, which is a
+// protocol change rather than a fix here.
+func checkMigrationExportPageSize(resp *pb.ExportRangeVersionsResponse) error {
+	if migrationExportPagePayloadBytes(resp) <= migrationExportPageByteBudget {
+		return nil
+	}
+	widest := widestMigrationExportVersion(resp.GetVersions())
+	return errors.WithStack(status.Errorf(codes.FailedPrecondition,
+		"migration export page exceeds the %d byte message limit; key %q holds %d value bytes",
+		internal.GRPCMaxMessageBytes, widest.GetKey(), len(widest.GetValue())))
+}
+
+// migrationExportPagePayloadBytes sums the caller-controlled bytes in a page.
+// It deliberately undercounts the proto framing rather than calling
+// proto.Size, which caches its result inside the message; the budget carries
+// enough headroom to cover the framing of a full page.
+func migrationExportPagePayloadBytes(resp *pb.ExportRangeVersionsResponse) int {
+	total := len(resp.GetNextCursor())
+	for _, version := range resp.GetVersions() {
+		total += len(version.GetKey()) + len(version.GetValue())
+	}
+	return total
+}
+
+func widestMigrationExportVersion(versions []*pb.MVCCVersion) *pb.MVCCVersion {
+	var widest *pb.MVCCVersion
+	for _, version := range versions {
+		if widest == nil || len(version.GetValue()) > len(widest.GetValue()) {
+			widest = version
+		}
+	}
+	return widest
 }
 
 func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeVersionsRequest) (*pb.ImportRangeVersionsResponse, error) {
@@ -839,17 +1021,14 @@ func (i *Internal) proposeMigrationCommand(ctx context.Context, cmd []byte, labe
 }
 
 func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest) store.ExportVersionsOptions {
-	chunkBytes := uint64(req.GetChunkBytes())
-	if chunkBytes == 0 {
-		chunkBytes = defaultMigrationExportChunkBytes
-	}
-	maxScannedBytes := req.GetMaxScannedBytes()
-	if maxScannedBytes == 0 {
-		maxScannedBytes = chunkBytes * defaultMigrationExportScanFactor
-	}
+	chunkBytes := clampMigrationExportBound(
+		uint64(req.GetChunkBytes()), defaultMigrationExportChunkBytes, maxMigrationExportChunkBytes)
+	maxScannedBytes := clampMigrationExportBound(
+		req.GetMaxScannedBytes(), chunkBytes*defaultMigrationExportScanFactor, maxMigrationExportScanBytes)
+	startKey, endKey := migrationExportScanBounds(req)
 	opts := store.ExportVersionsOptions{
-		StartKey:             req.GetRangeStart(),
-		EndKey:               req.GetRangeEnd(),
+		StartKey:             startKey,
+		EndKey:               endKey,
 		MinCommitTSExclusive: req.GetMinCommitTs(),
 		MaxCommitTSInclusive: req.GetMaxCommitTs(),
 		Cursor:               req.GetCursor(),
@@ -861,6 +1040,77 @@ func (i *Internal) exportRangeVersionsOptions(req *pb.ExportRangeVersionsRequest
 		AcceptVersion:        i.migrationExportVersionFilter(req),
 	}
 	return opts
+}
+
+func migrationExportScanBounds(req *pb.ExportRangeVersionsRequest) ([]byte, []byte) {
+	start := bytes.Clone(req.GetRangeStart())
+	end := bytes.Clone(req.GetRangeEnd())
+	switch req.GetKeyFamily() {
+	case distribution.MigrationFamilyFilesystemChunk:
+		if bytes.HasPrefix(start, fskeys.ChunkAllPrefix()) {
+			return start, end
+		}
+		if scanStart, scanEnd, ok := filesystemChunkExportScanBounds(req.GetRouteStart(), req.GetRouteEnd()); ok {
+			return scanStart, scanEnd
+		}
+		return fskeys.ChunkAllPrefix(), prefixScanEnd(fskeys.ChunkAllPrefix())
+	case distribution.MigrationFamilyFilesystemUsage:
+		if bytes.HasPrefix(start, fskeys.UsageRouteAllPrefix()) {
+			return start, end
+		}
+		return filesystemUsageExportScanBounds(req.GetRouteStart(), req.GetRouteEnd())
+	default:
+		return start, end
+	}
+}
+
+func filesystemChunkExportScanBounds(routeStart, routeEnd []byte) ([]byte, []byte, bool) {
+	routePrefix := fskeys.ChunkRouteAllPrefix()
+	routeDomainEnd := prefixScanEnd(routePrefix)
+	if !rangesIntersect(routeStart, routeEnd, routePrefix, routeDomainEnd) {
+		return fskeys.ChunkAllPrefix(), fskeys.ChunkAllPrefix(), true
+	}
+	rawPrefix := fskeys.ChunkAllPrefix()
+	rawDomainEnd := prefixScanEnd(rawPrefix)
+	start := rawPrefix
+	if len(routeStart) > 0 && bytes.Compare(routeStart, routePrefix) > 0 {
+		if !bytes.HasPrefix(routeStart, routePrefix) {
+			return nil, nil, false
+		}
+		start = append(bytes.Clone(rawPrefix), routeStart[len(routePrefix):]...)
+	}
+	end := rawDomainEnd
+	if len(routeEnd) > 0 && bytes.Compare(routeEnd, routeDomainEnd) < 0 {
+		if bytes.Compare(routeEnd, routePrefix) <= 0 {
+			return rawPrefix, rawPrefix, true
+		}
+		if !bytes.HasPrefix(routeEnd, routePrefix) {
+			return nil, nil, false
+		}
+		end = append(bytes.Clone(rawPrefix), routeEnd[len(routePrefix):]...)
+	}
+	return bytes.Clone(start), bytes.Clone(end), true
+}
+
+func filesystemUsageExportScanBounds(routeStart, routeEnd []byte) ([]byte, []byte) {
+	start := fskeys.UsageRouteAllPrefix()
+	if len(routeStart) > 0 {
+		start = fskeys.UsageRouteKey(routeStart)
+	}
+	end := prefixScanEnd(fskeys.UsageRouteAllPrefix())
+	if len(routeEnd) > 0 {
+		end = fskeys.UsageRouteKey(routeEnd)
+	}
+	return start, end
+}
+
+// clampMigrationExportBound resolves one export bound: unset takes the default,
+// anything above the hard ceiling is clamped down to it.
+func clampMigrationExportBound(requested, fallback, ceiling uint64) uint64 {
+	if requested == 0 {
+		return fallback
+	}
+	return min(requested, ceiling)
 }
 
 func (i *Internal) migrationExportFilter(req *pb.ExportRangeVersionsRequest) func([]byte) bool {
@@ -889,10 +1139,11 @@ func (i *Internal) migrationExportVersionFilter(req *pb.ExportRangeVersionsReque
 
 func migrationExportBracket(req *pb.ExportRangeVersionsRequest) distribution.MigrationBracket {
 	excludeKnownInternal := req.GetExcludeKnownInternal() || req.GetKeyFamily() == distribution.MigrationFamilyUser
+	start, end := migrationExportScanBounds(req)
 	return distribution.MigrationBracket{
 		Family:               req.GetKeyFamily(),
-		Start:                bytes.Clone(req.GetRangeStart()),
-		End:                  bytes.Clone(req.GetRangeEnd()),
+		Start:                start,
+		End:                  end,
 		ExcludeKnownInternal: excludeKnownInternal,
 		ExcludePrefixes:      cloneByteSlices(req.GetExcludePrefixes()),
 	}
@@ -911,27 +1162,21 @@ func migrationFamilyRequiresDecodedS3(family uint32) bool {
 }
 
 func decodedS3BucketRouteFilter(family uint32, routeStart, routeEnd []byte) func([]byte) bool {
-	allowRawRouteMatch := !s3BucketRouteBounds(routeStart, routeEnd)
 	return func(rawKey []byte) bool {
 		bucket, ok := decodedS3BucketName(family, rawKey)
 		if !ok {
 			return false
 		}
-		if allowRawRouteMatch && kv.RouteKeyFilter(routeStart, routeEnd)(rawKey) {
+		if keyInRouteRange(rawKey, routeStart, routeEnd) {
 			return true
 		}
-		return decodedS3BucketRouteIntersects(bucket, routeStart, routeEnd)
+		return decodedS3BucketRouteSelected(bucket, routeStart, routeEnd)
 	}
 }
 
-func s3BucketRouteBounds(routeStart, routeEnd []byte) bool {
-	return bytes.HasPrefix(routeStart, []byte(s3keys.RoutePrefix)) ||
-		bytes.HasPrefix(routeEnd, []byte(s3keys.RoutePrefix))
-}
-
-func decodedS3BucketRouteIntersects(bucket string, routeStart, routeEnd []byte) bool {
+func decodedS3BucketRouteSelected(bucket string, routeStart, routeEnd []byte) bool {
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+	return keyInRouteRange(bucketRouteStart, routeStart, routeEnd)
 }
 
 func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
@@ -942,6 +1187,13 @@ func rangesIntersect(aStart, aEnd, bStart, bEnd []byte) bool {
 		return false
 	}
 	return true
+}
+
+func keyInRouteRange(key, start, end []byte) bool {
+	if bytes.Compare(key, start) < 0 {
+		return false
+	}
+	return len(end) == 0 || bytes.Compare(key, end) < 0
 }
 
 func decodedS3BucketName(family uint32, rawKey []byte) (string, bool) {
@@ -985,6 +1237,16 @@ func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) 
 	if req == nil {
 		return 0, nil
 	}
+	// The envelope flag decides how the batch is stamped, but
+	// TransactionManager.Commit decides how it is applied from the inner
+	// requests' own IsTxn. A batch that says raw on the outside and carries a
+	// transactional request inside took the raw stamping path -- which only ever
+	// looks at Request.Ts -- and then went down the transactional apply path,
+	// where the FSM takes the persistence timestamp from a transaction meta
+	// nothing validated. Insist the two agree.
+	if !forwardedBatchMatchesEnvelope(req.IsTxn, req.Requests) {
+		return 0, errors.WithStack(kv.ErrInvalidRequest)
+	}
 	if req.IsTxn {
 		return i.stampTxnTimestamps(ctx, req.Requests)
 	}
@@ -992,14 +1254,46 @@ func (i *Internal) stampTimestamps(ctx context.Context, req *pb.ForwardRequest) 
 	return 0, i.stampRawTimestamps(ctx, req.Requests)
 }
 
+// forwardedBatchMatchesEnvelope reports whether every inner request agrees with
+// the envelope's mode.
+//
+// It is not enough to ask whether any request is transactional, the way
+// TransactionManager.Commit does. That test is an OR, so both mixed shapes slip
+// through in one direction or the other:
+//
+//   - a raw envelope holding a transactional request is stamped raw, which only
+//     looks at Request.Ts, then applied transactionally, where the FSM takes the
+//     persistence timestamp from an unvalidated transaction meta;
+//   - a transactional envelope holding a raw request is stamped with the
+//     transaction's start timestamp, then applied raw by commitSequential,
+//     persisting at that timestamp without ever passing stampRawTimestamps.
+//
+// Neither legitimate sender builds a mixed batch -- both set the envelope from
+// reqs[0].IsTxn over a batch the coordinator constructed as all raw or all
+// transactional -- so requiring agreement costs nothing and closes both shapes.
+func forwardedBatchMatchesEnvelope(envelopeIsTxn bool, reqs []*pb.Request) bool {
+	for _, r := range reqs {
+		if r != nil && r.IsTxn != envelopeIsTxn {
+			return false
+		}
+	}
+	return true
+}
+
 func (i *Internal) nextTimestamp(ctx context.Context, label string) (uint64, error) {
 	if i.tsAllocator != nil {
 		ts, err := i.tsAllocator.Next(ctx)
-		if err != nil {
+		if err == nil {
+			return ts, nil
+		}
+		if !errors.Is(err, kv.ErrTSOAllocatorRequired) {
 			return 0, errors.Wrap(err, label)
 		}
-		return ts, nil
 	}
+	return i.nextLegacyTimestamp(label)
+}
+
+func (i *Internal) nextLegacyTimestamp(label string) (uint64, error) {
 	if i.clock == nil {
 		return 1, nil
 	}
@@ -1015,15 +1309,23 @@ func (i *Internal) nextTimestampAfter(ctx context.Context, min uint64, label str
 		return 0, errors.Wrap(kv.ErrTxnCommitTSRequired, label)
 	}
 	if i.tsAllocator != nil {
-		return i.nextTimestampAfterFromAllocator(ctx, min, label)
+		ts, err := i.nextTimestampAfterFromAllocator(ctx, min, label)
+		if err == nil {
+			return ts, nil
+		}
+		if !errors.Is(err, kv.ErrTSOAllocatorRequired) {
+			return 0, err
+		}
 	}
+	return i.nextLegacyTimestampAfter(min, label)
+}
+
+func (i *Internal) nextLegacyTimestampAfter(min uint64, label string) (uint64, error) {
 	if i.clock == nil {
 		return min + 1, nil
 	}
-	if i.clock != nil {
-		i.clock.Observe(min)
-	}
-	ts, err := i.nextTimestamp(ctx, label)
+	i.clock.Observe(min)
+	ts, err := i.nextLegacyTimestamp(label)
 	if err != nil {
 		return 0, err
 	}
@@ -1056,73 +1358,43 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 		if r == nil {
 			continue
 		}
-		if r.Ts == 0 {
+		if r.Ts != 0 {
+			// Somebody else already stamped this write. It is the timestamp the
+			// value will be persisted under, and this receiver is downstream of
+			// the coordinator that would otherwise have validated it, so check
+			// it here rather than taking it on trust. The route-floor check
+			// below still runs: validation says the timestamp is allocatable,
+			// not that the route still accepts a write at it.
+			if err := kv.ValidateDurablePersistenceTimestamp(
+				ctx, i.tsAllocator, r.Ts, "stampRawTimestamps: forwarded raw ts"); err != nil {
+				return errors.WithStack(err)
+			}
+		} else {
 			ts, err := i.nextTimestamp(ctx, "stampRawTimestamps")
 			if err != nil {
 				return err
 			}
 			r.Ts = ts
 		}
-		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, r.Ts); err != nil {
+		// The follower that forwarded this write could not run the route-floor
+		// check: its own stamping path bails out when the group engine is not
+		// leader, so the timestamp only exists once we assign it here. Without
+		// this the write would reach Raft through the bare TransactionManager
+		// below with no MinWriteTSExclusive check at all. Already-stamped
+		// requests are re-checked too, because the floor may have advanced
+		// since the sender stamped them.
+		if err := i.ensureRawWriteAllowed(r); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (i *Internal) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commitTS uint64) error {
-	if i == nil || i.routeEngine == nil || commitTS == 0 {
+func (i *Internal) ensureRawWriteAllowed(r *pb.Request) error {
+	if i.writeGate == nil || r == nil {
 		return nil
 	}
-	routes := i.routeEngine.Stats()
-	for _, mut := range muts {
-		if mut == nil || forwardedTxnControlMutation(mut) || (len(mut.Key) == 0 && mut.GetOp() != pb.Op_DEL_PREFIX) {
-			continue
-		}
-		if err := rejectMutationBelowRouteWriteFloor(routes, mut, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func rejectMutationBelowRouteWriteFloor(routes []distribution.Route, mut *pb.Mutation, commitTS uint64) error {
-	for _, route := range routes {
-		if routeWriteTimestampFloorApplies(route, mut, commitTS) {
-			return errors.Wrapf(kv.ErrRouteWriteTimestampTooLow, "key %q commit_ts=%d floor=%d", mut.Key, commitTS, route.MinWriteTSExclusive)
-		}
-	}
-	return nil
-}
-
-func forwardedTxnControlMutation(mut *pb.Mutation) bool {
-	return mut != nil && bytes.HasPrefix(mut.GetKey(), []byte(kv.TxnKeyPrefix))
-}
-
-func routeWriteTimestampFloorApplies(route distribution.Route, mut *pb.Mutation, commitTS uint64) bool {
-	if route.MinWriteTSExclusive == 0 || commitTS > route.MinWriteTSExclusive {
-		return false
-	}
-	if mut.GetOp() == pb.Op_DEL_PREFIX {
-		start, end := kv.RoutePrefixRange(mut.GetKey())
-		return rangesIntersect(route.Start, route.End, start, end)
-	}
-	if start, end, ok := forwardedS3BucketAuxiliaryRouteRange(mut.GetKey()); ok {
-		return rangesIntersect(route.Start, route.End, start, end)
-	}
-	return kv.RouteKeyFilter(route.Start, route.End)(mut.GetKey())
-}
-
-func forwardedS3BucketAuxiliaryRouteRange(key []byte) ([]byte, []byte, bool) {
-	bucket, ok := s3keys.ParseBucketMetaKey(key)
-	if !ok {
-		bucket, ok = s3keys.ParseBucketGenerationKey(key)
-	}
-	if !ok {
-		return nil, nil, false
-	}
-	start := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return start, prefixScanEnd(start), true
+	return errors.WithStack(i.writeGate.EnsureMutationsWriteAllowed(r.Mutations, r.Ts))
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {
@@ -1133,6 +1405,12 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 			return 0, err
 		}
 		startTS = ts
+	} else if err := kv.ValidateForwardedTxnStartTimestamp(
+		ctx, i.tsAllocator, startTS, "stampTxnTimestamps: forwarded start ts"); err != nil {
+		// A PREPARE carries no transaction meta, so the commit-timestamp check
+		// below never sees it -- yet handlePrepareRequest persists the intent at
+		// this value.
+		return 0, errors.WithStack(err)
 	}
 	if startTS == ^uint64(0) {
 		return 0, errors.WithStack(ErrTxnTimestampOverflow)
@@ -1149,10 +1427,44 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 	if err != nil {
 		return 0, err
 	}
-	if err := i.rejectWriteTimestampFloorTxnRequests(reqs); err != nil {
+	if err := i.ensureTxnWritesAllowed(reqs, commitTS); err != nil {
 		return 0, err
 	}
 	return commitTS, nil
+}
+
+func (i *Internal) ensureTxnWritesAllowed(reqs []*pb.Request, commitTS uint64) error {
+	if i.writeGate == nil || commitTS == 0 {
+		return nil
+	}
+	for _, r := range reqs {
+		if r == nil || !r.IsTxn {
+			continue
+		}
+		if r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE {
+			continue
+		}
+		muts := forwardedTxnUserMutations(r.Mutations)
+		if len(muts) == 0 {
+			continue
+		}
+		if err := i.writeGate.EnsureMutationsWriteAllowed(muts, commitTS); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+func forwardedTxnUserMutations(muts []*pb.Mutation) []*pb.Mutation {
+	out := make([]*pb.Mutation, 0, len(muts))
+	metaPrefix := []byte(kv.TxnMetaPrefix)
+	for _, mut := range muts {
+		if mut == nil || bytes.HasPrefix(mut.Key, metaPrefix) {
+			continue
+		}
+		out = append(out, mut)
+	}
+	return out
 }
 
 func forwardedTxnStartTS(reqs []*pb.Request) uint64 {
@@ -1186,7 +1498,7 @@ type forwardedTxnMetaToUpdate struct {
 }
 
 func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Request, startTS uint64) (uint64, error) {
-	metaMutations, commitTS, err := collectForwardedTxnMetas(reqs)
+	metaMutations, commitTS, resolution, err := collectForwardedTxnMetas(reqs)
 	if err != nil {
 		return 0, err
 	}
@@ -1196,6 +1508,15 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		if err != nil {
 			return 0, err
 		}
+	} else if err := kv.ValidateForwardedTxnCommitTimestamp(
+		ctx, i.tsAllocator, startTS, commitTS, resolution,
+		"fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
+		// A commit timestamp that arrived already set in the transaction meta
+		// is the timestamp every mutation in this batch is persisted under, and
+		// it never passed through the coordinator's own validation. A legacy
+		// transaction still being resolved replays a pre-Phase-D pair, which the
+		// validator admits; see ValidateForwardedTxnCommitTimestamp.
+		return 0, errors.WithStack(err)
 	}
 
 	for _, item := range metaMutations {
@@ -1220,9 +1541,16 @@ func stampRequestMutationCommitTS(reqs []*pb.Request, commitTS uint64) error {
 	return nil
 }
 
-func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, error) {
+// collectForwardedTxnMetas also reports whether an already-set commit timestamp
+// arrived on a resolution request. Only COMMIT and ABORT replay a timestamp the
+// primary recorded; Phase_NONE is a one-phase transaction that chose its own and
+// has no recorded intent behind it.
+func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, uint64, bool, error) {
 	metaMutations := make([]forwardedTxnMetaToUpdate, 0, len(reqs))
 	var commitTS uint64
+	// Starts true and is narrowed by every meta that carries the timestamp; a
+	// batch with no such meta leaves commitTS zero, and the caller allocates.
+	resolution := true
 	prefix := []byte(kv.TxnMetaPrefix)
 	for _, r := range reqs {
 		m, ok := forwardedTxnMetaMutation(r, prefix)
@@ -1233,44 +1561,23 @@ func collectForwardedTxnMetas(reqs []*pb.Request) ([]forwardedTxnMetaToUpdate, u
 		if err != nil {
 			continue
 		}
+		// Narrowed for every meta, not only the ones that arrive carrying a
+		// timestamp. commitSequential applies the requests in order, and a
+		// zero-valued Phase_NONE meta is filled with the selected timestamp
+		// below -- so it receives the exemption just as surely as one that
+		// carried the value in, and a one-phase write would persist under a
+		// resolution's exemption either way.
+		resolution = resolution && (r.Phase == pb.Phase_COMMIT || r.Phase == pb.Phase_ABORT)
 		if meta.CommitTS != 0 {
 			if commitTS != 0 && commitTS != meta.CommitTS {
-				return nil, 0, errors.WithStack(kv.ErrInvalidRequest)
+				return nil, 0, false, errors.WithStack(kv.ErrInvalidRequest)
 			}
 			commitTS = meta.CommitTS
 			continue
 		}
 		metaMutations = append(metaMutations, forwardedTxnMetaToUpdate{m: m, meta: meta})
 	}
-	return metaMutations, commitTS, nil
-}
-
-func (i *Internal) rejectWriteTimestampFloorTxnRequests(reqs []*pb.Request) error {
-	for _, r := range reqs {
-		commitTS, ok := forwardedTxnRequestCommitTS(r)
-		if !ok {
-			continue
-		}
-		if err := i.rejectWriteTimestampFloorMutations(r.Mutations, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func forwardedTxnRequestCommitTS(r *pb.Request) (uint64, bool) {
-	if r == nil || (r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_NONE) {
-		return 0, false
-	}
-	m, ok := forwardedTxnMetaMutation(r, []byte(kv.TxnMetaPrefix))
-	if !ok {
-		return 0, false
-	}
-	meta, err := kv.DecodeTxnMeta(m.Value)
-	if err != nil || meta.CommitTS == 0 {
-		return 0, false
-	}
-	return meta.CommitTS, true
+	return metaMutations, commitTS, resolution, nil
 }
 
 // forwardedTxnCommitTS allocates a commit timestamp for a forwarded

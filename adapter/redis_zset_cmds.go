@@ -27,7 +27,22 @@ type bzpopminResult struct {
 	entry redisZSetEntry
 }
 
-const zsetOpsPerEntry = 2
+type bzpopminCandidate struct {
+	entry     redisZSetEntry
+	remaining []redisZSetEntry
+	isWide    bool
+	isLast    bool
+}
+
+const (
+	zsetOpsPerEntry        = 2
+	bzpopminScoreScanLimit = 2
+	// bzpopminIndexProofLimit bounds the key-only scan that proves the score
+	// index covers every member. Past it the proof would cost as much as the
+	// member scan it exists to avoid, so the probe reports "not authoritative"
+	// and lets the member comparison decide instead.
+	bzpopminIndexProofLimit = 4096
+)
 
 // buildZSetLegacyMigrationElems returns ops that atomically migrate a legacy
 // !redis|zset| blob to wide-column !zs|mem| + !zs|scr| keys. Returns nil if no
@@ -600,7 +615,11 @@ func (r *RedisServer) applyZAddPair(ctx context.Context, key []byte, p zaddPair,
 }
 
 func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, pairs []zaddPair) (int, error) {
-	readTS := r.readTS()
+	readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis zadd: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	base, err := r.prepareZSetWriteBase(ctx, key, readTS, len(pairs))
 	if err != nil {
 		return 0, err
@@ -645,7 +664,7 @@ func (r *RedisServer) zaddTxn(ctx context.Context, key []byte, flags zaddFlags, 
 		})
 	}
 
-	return added, r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
+	return added, r.dispatchAndSignalZSet(ctx, readTimestamp, commitTS, elems, key,
 		redisTxnWideCreateReadKeys(key, base.typ, redisTxnWideZSetFenceKey))
 }
 
@@ -700,12 +719,15 @@ func (r *RedisServer) prepareZSetWriteBase(ctx context.Context, key []byte, read
 // dispatch error path.
 func (r *RedisServer) dispatchAndSignalZSet(
 	ctx context.Context,
-	readTS, commitTS uint64,
+	readTimestamp kv.ReadTimestamp,
+	commitTS uint64,
 	elems []*kv.Elem[kv.OP],
 	zsetKey []byte,
 	readKeys [][]byte,
 ) error {
-	_, err := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	readTS := readTimestamp.Timestamp()
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  normalizeStartTS(readTS),
 		CommitTS: commitTS,
@@ -722,7 +744,11 @@ func (r *RedisServer) dispatchAndSignalZSet(
 // zincrbyTxn performs one attempt of ZINCRBY in wide-column format.
 // Returns the new score after applying increment.
 func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string, increment float64) (float64, error) {
-	readTS := r.readTS()
+	readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis zincrby: begin read timestamp")
+	if err != nil {
+		return 0, cockerrors.WithStack(err)
+	}
+	readTS := readTimestamp.Timestamp()
 	base, err := r.prepareZSetWriteBase(ctx, key, readTS, 0)
 	if err != nil {
 		return 0, err
@@ -763,7 +789,7 @@ func (r *RedisServer) zincrbyTxn(ctx context.Context, key []byte, member string,
 			Value: deltaVal,
 		})
 	}
-	if err := r.dispatchAndSignalZSet(ctx, readTS, commitTS, elems, key,
+	if err := r.dispatchAndSignalZSet(ctx, readTimestamp, commitTS, elems, key,
 		redisTxnWideCreateReadKeys(key, base.typ, redisTxnWideZSetFenceKey)); err != nil {
 		return 0, err
 	}
@@ -843,13 +869,14 @@ func removeZSetMembers(members map[string]float64, rawMembers [][]byte) []redisZ
 	return removed
 }
 
-func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, readTS uint64, entries []redisZSetEntry) error {
+func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, entries []redisZSetEntry) error {
+	readTS := readTimestamp.Timestamp()
 	if len(entries) == 0 {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
 
 	memberPrefix := store.ZSetMemberScanPrefix(key)
@@ -883,7 +910,8 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 				Key:   store.ZSetMetaDeltaKey(key, commitTS, 0),
 				Value: deltaVal,
 			})
-			_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+			dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+			_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 				IsTxn:    true,
 				StartTS:  startTS,
 				CommitTS: commitTS,
@@ -892,25 +920,26 @@ func (r *RedisServer) persistZSetEntriesTxn(ctx context.Context, key []byte, rea
 			})
 			return cockerrors.WithStack(dispatchErr)
 		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
 
 	payload, err := marshalZSetValue(redisZSetValue{Entries: entries})
 	if err != nil {
 		return err
 	}
-	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+	return r.dispatchReadTimestampElems(ctx, readTimestamp, []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
 	})
 }
 
-func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, readTS uint64, removed, remaining []redisZSetEntry) error {
+func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, removed, remaining []redisZSetEntry) error {
+	readTS := readTimestamp.Timestamp()
 	if len(remaining) == 0 {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
 	memberPrefix := store.ZSetMemberScanPrefix(key)
 	memberEnd := store.PrefixScanEnd(memberPrefix)
@@ -919,7 +948,7 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 		return cockerrors.WithStack(err)
 	}
 	if len(probeKVs) == 0 {
-		return r.persistZSetEntriesTxn(ctx, key, readTS, remaining)
+		return r.persistZSetEntriesTxn(ctx, key, readTimestamp, remaining)
 	}
 	startTS := normalizeStartTS(readTS)
 	commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistZSetRemovalsTxn: allocate commitTS")
@@ -941,7 +970,8 @@ func (r *RedisServer) persistZSetRemovalsTxn(ctx context.Context, key []byte, re
 		Value: deltaVal,
 	})
 	elems = append(elems, redisTxnWideZSetFenceElem(key))
-	_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 		IsTxn:    true,
 		StartTS:  startTS,
 		CommitTS: commitTS,
@@ -1009,6 +1039,14 @@ func (r *RedisServer) zrangeRead(conn redcon.Conn, key []byte, start, stop int, 
 }
 
 func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, false)
+}
+
+func (r *RedisServer) elasticKVZRemFast(conn redcon.Conn, cmd redcon.Command) {
+	r.zremWithTypeProbe(conn, cmd, true)
+}
+
+func (r *RedisServer) zremWithTypeProbe(conn redcon.Conn, cmd redcon.Command, fastMiss bool) {
 	if r.proxyToLeader(conn, cmd, cmd.Args[1]) {
 		return
 	}
@@ -1016,8 +1054,12 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis zrem: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
+		typ, err := r.zremTypeAt(ctx, cmd.Args[1], readTS, fastMiss)
 		if err != nil {
 			return err
 		}
@@ -1038,12 +1080,34 @@ func (r *RedisServer) zrem(conn redcon.Conn, cmd redcon.Command) {
 		if removed == 0 {
 			return nil
 		}
-		return r.persistZSetRemovalsTxn(ctx, cmd.Args[1], readTS, removedEntries, zsetMapToEntries(members))
+		return r.persistZSetRemovalsTxn(ctx, cmd.Args[1], readTimestamp, removedEntries, zsetMapToEntries(members))
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(removed)
+}
+
+func (r *RedisServer) zremTypeAt(ctx context.Context, key []byte, readTS uint64, fastMiss bool) (redisValueType, error) {
+	if !fastMiss {
+		return r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+	}
+	typ, err := r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
+	if err != nil || typ != redisTypeNone {
+		return typ, err
+	}
+	return r.legacyZSetTypeAt(ctx, key, readTS)
+}
+
+func (r *RedisServer) legacyZSetTypeAt(ctx context.Context, key []byte, readTS uint64) (redisValueType, error) {
+	exists, err := r.store.ExistsAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		return redisTypeNone, cockerrors.WithStack(err)
+	}
+	if !exists {
+		return redisTypeNone, nil
+	}
+	return r.applyTTLFilter(ctx, key, readTS, redisTypeZSet)
 }
 
 func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
@@ -1065,21 +1129,18 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 	defer cancel()
 	var removed int
 	if err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		typ, err := r.keyTypeAtExpect(ctx, cmd.Args[1], readTS, redisTypeZSet)
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis zremrangebyrank: begin read timestamp")
+		if err != nil {
+			return cockerrors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
+		value, exists, err := r.zsetMutationValueAt(ctx, cmd.Args[1], readTS)
 		if err != nil {
 			return err
 		}
-		if typ == redisTypeNone {
+		if !exists {
 			removed = 0
 			return nil
-		}
-		if typ != redisTypeZSet {
-			return wrongTypeError()
-		}
-		value, _, err := r.loadZSetAt(ctx, cmd.Args[1], readTS)
-		if err != nil {
-			return err
 		}
 		s, e := normalizeRankRange(start, stop, len(value.Entries))
 		if e < s {
@@ -1090,12 +1151,31 @@ func (r *RedisServer) zremrangebyrank(conn redcon.Conn, cmd redcon.Command) {
 		remaining = append(remaining, value.Entries[e+1:]...)
 		removedEntries := append([]redisZSetEntry(nil), value.Entries[s:e+1]...)
 		removed = len(removedEntries)
-		return r.persistZSetRemovalsTxn(ctx, cmd.Args[1], readTS, removedEntries, remaining)
+		return r.persistZSetRemovalsTxn(ctx, cmd.Args[1], readTimestamp, removedEntries, remaining)
 	}); err != nil {
 		writeRedisError(conn, err)
 		return
 	}
 	conn.WriteInt(removed)
+}
+
+func (r *RedisServer) zsetMutationValueAt(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+) (redisZSetValue, bool, error) {
+	typ, err := r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+	if err != nil {
+		return redisZSetValue{}, false, err
+	}
+	if typ == redisTypeNone {
+		return redisZSetValue{}, false, nil
+	}
+	if typ != redisTypeZSet {
+		return redisZSetValue{}, false, wrongTypeError()
+	}
+	value, _, err := r.loadZSetAt(ctx, key, readTS)
+	return value, true, err
 }
 
 // tryBZPopMinWithMode runs one BZPOPMIN attempt against key. The
@@ -1110,16 +1190,20 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 	defer cancel()
 	var result *bzpopminResult
 	err := r.retryRedisWrite(ctx, func() error {
-		readTS := r.readTS()
-		var typ redisValueType
-		var err error
-		if fast {
-			typ, err = r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
-		} else {
-			typ, err = r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
-		}
+		readTimestamp, err := r.beginTxnReadTimestamp(ctx, "redis bzpopmin: begin read timestamp")
 		if err != nil {
-			return err
+			return cockerrors.WithStack(err)
+		}
+		readTS := readTimestamp.Timestamp()
+		var typ redisValueType
+		var typeErr error
+		if fast {
+			typ, typeErr = r.keyTypeAtExpectFast(ctx, key, readTS, redisTypeZSet)
+		} else {
+			typ, typeErr = r.keyTypeAtExpect(ctx, key, readTS, redisTypeZSet)
+		}
+		if typeErr != nil {
+			return typeErr
 		}
 		if typ == redisTypeNone {
 			result = nil
@@ -1128,44 +1212,272 @@ func (r *RedisServer) tryBZPopMinWithMode(key []byte, fast bool) (*bzpopminResul
 		if typ != redisTypeZSet {
 			return wrongTypeError()
 		}
-		value, _, err := r.loadZSetAt(ctx, key, readTS)
+		candidate, err := r.bzpopminCandidateAt(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		if len(value.Entries) == 0 {
+		if candidate == nil {
 			result = nil
 			return nil
 		}
-		popped := value.Entries[0]
-		remaining := append([]redisZSetEntry(nil), value.Entries[1:]...)
-
-		// Detect wide-column storage.
-		memberPrefix := store.ZSetMemberScanPrefix(key)
-		memberEnd := store.PrefixScanEnd(memberPrefix)
-		probeKVs, probeErr := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
-		if probeErr != nil {
-			return cockerrors.WithStack(probeErr)
-		}
-		isWide := len(probeKVs) > 0
-
-		if err := r.persistBZPopMinResult(ctx, key, readTS, popped, remaining, isWide); err != nil {
+		if err := r.persistBZPopMinResult(ctx, key, readTimestamp, candidate); err != nil {
 			return err
 		}
-		result = &bzpopminResult{key: key, entry: popped}
+		result = &bzpopminResult{key: key, entry: candidate.entry}
 		return nil
 	})
 	return result, err
 }
 
-func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, readTS uint64, popped redisZSetEntry, remaining []redisZSetEntry, isWide bool) error {
-	if len(remaining) == 0 {
+func (r *RedisServer) bzpopminCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+	scoreCandidate, scoreDecisionFinal, err := r.bzpopminWideScoreCandidateAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if scoreDecisionFinal {
+		return scoreCandidate, nil
+	}
+	memberCandidate, err := r.bzpopminMemberOnlyCandidateAt(ctx, key, readTS)
+	if err != nil {
+		return nil, err
+	}
+	if scoreCandidate != nil && memberCandidate != nil {
+		if zsetEntryLess(scoreCandidate.entry, memberCandidate.entry) {
+			return scoreCandidate, nil
+		}
+		return memberCandidate, nil
+	}
+	if scoreCandidate != nil {
+		return scoreCandidate, nil
+	}
+	if memberCandidate != nil {
+		return memberCandidate, nil
+	}
+	return r.bzpopminLegacyCandidateAt(ctx, key, readTS)
+}
+
+func zsetEntryLess(left, right redisZSetEntry) bool {
+	if left.Score != right.Score {
+		return left.Score < right.Score
+	}
+	return left.Member < right.Member
+}
+
+// bzpopminWideScoreCandidateAt probes the score index and reports whether that
+// probe is authoritative for BZPOPMIN. The index owns the ordering only when it
+// holds a row for every member the metadata counts, and even then not for
+// same-score ties, where Pebble's MVCC suffix can sort prefix-related members
+// after longer members.
+//
+// A visible base zset meta row does not establish that coverage. Ordinary delta
+// compaction (DeltaCompactor.zsetHandler -> foldSimpleLenDeltas) folds ZADD
+// length deltas into a fresh base meta row and deletes the deltas; it never
+// creates the score rows an older member-only wide zset is missing. Taking that
+// compacted row as proof let BZPOPMIN return an indexed member ahead of a lower
+// unindexed one, and -- once the folded length reached one -- let
+// persistBZPopMinResult delete the whole logical key, unindexed members
+// included.
+func (r *RedisServer) bzpopminWideScoreCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, bool, error) {
+	meta, err := r.bzpopminMetaProbeAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	scorePrefix := store.ZSetScoreScanPrefix(key)
+	scoreEnd := store.PrefixScanEnd(scorePrefix)
+	scoreKVs, err := r.store.ScanAt(ctx, scorePrefix, scoreEnd, bzpopminScoreScanLimit, readTS)
+	if err != nil {
+		return nil, false, cockerrors.WithStack(err)
+	}
+	candidate, scoreTie := bzpopminScoreCandidateFromKVs(key, scoreKVs)
+	cover, err := r.zsetScoreIndexCoverageAt(ctx, key, readTS)
+	if err != nil {
+		return nil, false, err
+	}
+	if candidate != nil {
+		candidate.isLast = cover.complete && cover.members == 1
+		return candidate, cover.complete && !scoreTie, nil
+	}
+	// No score rows at all. Reporting the key empty is only safe when no member
+	// row is hiding outside the index either. baseExists stays in the condition
+	// so a legacy blob, which has no base meta row, still reaches
+	// bzpopminLegacyCandidateAt.
+	return nil, meta.baseExists && !meta.truncated && meta.len == 0 && cover.members == 0, nil
+}
+
+// zsetIndexCoverage is what the score index can be trusted for.
+type zsetIndexCoverage struct {
+	// complete is true when the score index holds a row for every member row.
+	complete bool
+	// members is the member-row count, capped just above the proof limit.
+	members int
+}
+
+// zsetScoreIndexCoverageAt compares the score index against the member rows.
+//
+// The member rows are the ground truth: every wide-zset writer emits one per
+// member, so a member without a score row is a member the index cannot order.
+// The metadata length is not usable for this. An older member-only wide zset
+// carries no base meta row, so its members are not counted at all; a later ZADD
+// adds a length delta, and delta compaction folds that delta into a base row
+// whose length counts only the members added since. Comparing the index against
+// that length compares two undercounts and concludes coverage that is not there.
+//
+// Both scans are key-only and bounded. Past the bound the proof would cost as
+// much as the member scan it exists to avoid, so coverage is reported false and
+// the caller's member comparison -- which is correct either way -- decides.
+//
+// Truncated metadata is deliberately not consulted. ErrDeltaScanTruncated means
+// the length could not be summed from the uncompacted deltas, and this proof
+// never reads that length: it compares member rows against score rows. Letting
+// truncation veto the proof sent every pop on a high-churn zset -- exactly the
+// zsets that accumulate deltas -- through the full member load instead.
+func (r *RedisServer) zsetScoreIndexCoverageAt(
+	ctx context.Context,
+	key []byte,
+	readTS uint64,
+) (zsetIndexCoverage, error) {
+	memberPrefix := store.ZSetMemberScanPrefix(key)
+	memberKeys, err := r.store.ScanKeysAt(
+		ctx, memberPrefix, store.PrefixScanEnd(memberPrefix), bzpopminIndexProofLimit+1, readTS)
+	if err != nil {
+		return zsetIndexCoverage{}, cockerrors.WithStack(err)
+	}
+	cover := zsetIndexCoverage{members: len(memberKeys)}
+	if len(memberKeys) == 0 || len(memberKeys) > bzpopminIndexProofLimit {
+		return cover, nil
+	}
+	scorePrefix := store.ZSetScoreScanPrefix(key)
+	scoreKeys, err := r.store.ScanKeysAt(
+		ctx, scorePrefix, store.PrefixScanEnd(scorePrefix), len(memberKeys), readTS)
+	if err != nil {
+		return zsetIndexCoverage{}, cockerrors.WithStack(err)
+	}
+	cover.complete = len(scoreKeys) >= len(memberKeys)
+	return cover, nil
+}
+
+type bzpopminMetaProbe struct {
+	len        int64
+	baseExists bool
+	truncated  bool
+}
+
+func (r *RedisServer) bzpopminMetaProbeAt(ctx context.Context, key []byte, readTS uint64) (bzpopminMetaProbe, error) {
+	metaLen, metaExists, err := r.resolveZSetMeta(ctx, key, readTS)
+	if err != nil && !errors.Is(err, ErrDeltaScanTruncated) {
+		return bzpopminMetaProbe{}, err
+	}
+	baseExists, baseErr := r.zsetBaseMetaExistsAt(ctx, key, readTS)
+	if baseErr != nil {
+		return bzpopminMetaProbe{}, baseErr
+	}
+	return bzpopminMetaProbe{
+		len:        metaLen,
+		baseExists: metaExists && baseExists,
+		truncated:  errors.Is(err, ErrDeltaScanTruncated),
+	}, nil
+}
+
+func (r *RedisServer) zsetBaseMetaExistsAt(ctx context.Context, key []byte, readTS uint64) (bool, error) {
+	_, err := r.store.GetAt(ctx, store.ZSetMetaKey(key), readTS)
+	if cockerrors.Is(err, store.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, cockerrors.WithStack(err)
+	}
+	return true, nil
+}
+
+func bzpopminScoreCandidateFromKVs(key []byte, scoreKVs []*store.KVPair) (*bzpopminCandidate, bool) {
+	var first *redisZSetEntry
+	for _, kv := range scoreKVs {
+		score, member, ok := store.ExtractZSetScoreAndMember(kv.Key, key)
+		if !ok {
+			continue
+		}
+		entry := redisZSetEntry{Member: string(member), Score: score}
+		if first == nil {
+			first = &entry
+			continue
+		}
+		return &bzpopminCandidate{entry: *first, isWide: true}, first.Score == score
+	}
+	if first == nil {
+		return nil, false
+	}
+	return &bzpopminCandidate{entry: *first, isWide: true}, false
+}
+
+func (r *RedisServer) bzpopminMemberOnlyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+	memberPrefix := store.ZSetMemberScanPrefix(key)
+	memberEnd := store.PrefixScanEnd(memberPrefix)
+	memberKVs, err := r.store.ScanAt(ctx, memberPrefix, memberEnd, 1, readTS)
+	if err != nil {
+		return nil, cockerrors.WithStack(err)
+	}
+	if len(memberKVs) > 0 {
+		value, loadErr := r.loadZSetMembersAt(ctx, key, readTS)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		if len(value.Entries) == 0 {
+			return nil, nil
+		}
+		return &bzpopminCandidate{
+			entry:     value.Entries[0],
+			remaining: append([]redisZSetEntry(nil), value.Entries[1:]...),
+			isWide:    true,
+			isLast:    len(value.Entries) == 1,
+		}, nil
+	}
+	return nil, nil
+}
+
+func (r *RedisServer) bzpopminLegacyCandidateAt(ctx context.Context, key []byte, readTS uint64) (*bzpopminCandidate, error) {
+	raw, err := r.store.GetAt(ctx, redisZSetKey(key), readTS)
+	if err != nil {
+		if cockerrors.Is(err, store.ErrKeyNotFound) {
+			return nil, nil
+		}
+		return nil, cockerrors.WithStack(err)
+	}
+	value, err := unmarshalZSetValue(raw)
+	if err != nil {
+		return nil, err
+	}
+	if len(value.Entries) == 0 {
+		return nil, nil
+	}
+	return &bzpopminCandidate{
+		entry:     value.Entries[0],
+		remaining: append([]redisZSetEntry(nil), value.Entries[1:]...),
+		isLast:    len(value.Entries) == 1,
+	}, nil
+}
+
+// persistBZPopMinResult takes the ReadTimestamp rather than a bare uint64: the
+// write it dispatches has to carry the dispatch voucher for the timestamp the
+// pop was decided at, or the coordinator cannot tell this commit apart from one
+// that picked its own read timestamp.
+func (r *RedisServer) persistBZPopMinResult(
+	ctx context.Context,
+	key []byte,
+	readTimestamp kv.ReadTimestamp,
+	candidate *bzpopminCandidate,
+) error {
+	if candidate == nil {
+		return nil
+	}
+	readTS := readTimestamp.Timestamp()
+	if candidate.isLast {
 		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
 		if err != nil {
 			return err
 		}
-		return r.dispatchElems(ctx, true, readTS, elems)
+		return r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
 	}
-	if isWide {
+	if candidate.isWide {
 		// Wide-column: delete the popped member key + score index, emit delta -1.
 		startTS := normalizeStartTS(readTS)
 		commitTS, err := r.nextCommitTSAfter(ctx, startTS, "persistBZPopMinResult: allocate commitTS")
@@ -1174,12 +1486,13 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		}
 		deltaVal := store.MarshalZSetMetaDelta(store.ZSetMetaDelta{LenDelta: -1})
 		elems := []*kv.Elem[kv.OP]{
-			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(popped.Member))},
-			{Op: kv.Del, Key: store.ZSetScoreKey(key, popped.Score, []byte(popped.Member))},
+			{Op: kv.Del, Key: store.ZSetMemberKey(key, []byte(candidate.entry.Member))},
+			{Op: kv.Del, Key: store.ZSetScoreKey(key, candidate.entry.Score, []byte(candidate.entry.Member))},
 			{Op: kv.Put, Key: store.ZSetMetaDeltaKey(key, commitTS, 0), Value: deltaVal},
 			redisTxnWideZSetFenceElem(key),
 		}
-		_, dispatchErr := r.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{
+		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+		_, dispatchErr := kv.DispatchWithReadTimestamp(dispatchCtx, r.coordinator, &kv.OperationGroup[kv.OP]{
 			IsTxn:    true,
 			StartTS:  startTS,
 			CommitTS: commitTS,
@@ -1189,11 +1502,11 @@ func (r *RedisServer) persistBZPopMinResult(ctx context.Context, key []byte, rea
 		return cockerrors.WithStack(dispatchErr)
 	}
 	// Legacy blob: write back all remaining entries.
-	payload, err := marshalZSetValue(redisZSetValue{Entries: remaining})
+	payload, err := marshalZSetValue(redisZSetValue{Entries: candidate.remaining})
 	if err != nil {
 		return err
 	}
-	return r.dispatchElems(ctx, true, readTS, []*kv.Elem[kv.OP]{
+	return r.dispatchReadTimestampElems(ctx, readTimestamp, []*kv.Elem[kv.OP]{
 		{Op: kv.Put, Key: redisZSetKey(key), Value: payload},
 	})
 }
@@ -1245,9 +1558,9 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 	// full, starving the fallback timer and letting a wrongType
 	// write on a co-registered key (multi-key BZPOPMIN) go
 	// undetected for the entire BLOCK window. Demoting `fast` back
-	// to false after redisBlockWaitFallback elapses since the last
+	// to false after the configured block fallback elapses since the last
 	// full check restores the #666 ceiling: WRONGTYPE on any
-	// registered key surfaces within ~one fallback interval (100 ms)
+	// registered key surfaces within ~one fallback interval
 	// regardless of signal rate. See
 	// TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad for the
 	// regression scenario.
@@ -1275,8 +1588,8 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			conn.WriteNull()
 			return
 		}
-		signaled := waitForBlockedCommandUpdate(handlerCtx, w, deadline)
-		fast = signaled && time.Since(lastFullCheck) < redisBlockWaitFallback
+		signaled := waitForBlockedCommandUpdate(handlerCtx, w, deadline, r.blockWaitFallback)
+		fast = signaled && time.Since(lastFullCheck) < r.blockWaitFallback
 	}
 }
 
@@ -1325,8 +1638,11 @@ func (r *RedisServer) bzpopminTryAllKeys(conn redcon.Conn, keys [][]byte, fast b
 // because writes that bypass fast-safe Signal (Lua flush, follower-applied
 // entries, wrongType-introducing commands) may be observable only through those
 // paths.
-func waitForBlockedCommandUpdate(handlerCtx context.Context, waiter *keyWaiter, deadline time.Time) bool {
-	fallback := redisBlockWaitFallback
+func waitForBlockedCommandUpdate(handlerCtx context.Context, waiter *keyWaiter, deadline time.Time, fallbackInterval time.Duration) bool {
+	fallback := fallbackInterval
+	if fallback <= 0 {
+		fallback = defaultRedisBlockWaitFallback
+	}
 	if remaining := time.Until(deadline); remaining < fallback {
 		fallback = remaining
 	}

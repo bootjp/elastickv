@@ -27,6 +27,12 @@ import (
 	"google.golang.org/grpc/reflection"
 )
 
+const (
+	bootstrapE2EWaitTimeout       = 20 * time.Second
+	bootstrapE2EWaitInterval      = 100 * time.Millisecond
+	bootstrapE2ERPCRequestTimeout = 2 * time.Second
+)
+
 type bootstrapE2EEndpoint struct {
 	id         string
 	raftAddr   string
@@ -57,9 +63,13 @@ type bootstrapE2ENode struct {
 	id       string
 	runtimes []*raftGroupRuntime
 
-	shardStore *kv.ShardStore
-	cancel     context.CancelFunc
-	eg         *errgroup.Group
+	shardStore  *kv.ShardStore
+	coordinate  *kv.ShardedCoordinator
+	distEngine  *distribution.Engine
+	distCatalog *distribution.CatalogStore
+	distServer  *adapter.DistributionServer
+	cancel      context.CancelFunc
+	eg          *errgroup.Group
 }
 
 func (n *bootstrapE2ENode) engine() raftengine.Engine {
@@ -98,6 +108,10 @@ func (n *bootstrapE2ENode) close() error {
 		_ = n.shardStore.Close()
 		n.shardStore = nil
 	}
+	if n.coordinate != nil {
+		_ = n.coordinate.Close()
+		n.coordinate = nil
+	}
 	for _, rt := range n.runtimes {
 		if rt != nil {
 			rt.Close()
@@ -123,8 +137,8 @@ func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
 			t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 
 			expected := bootstrapExpectedConfiguration(endpoints)
-			waitForBootstrapClusterConfig(t, nodes, expected, waitTimeout, waitInterval)
-			leaderIdx := waitForSingleLeader(t, nodes, waitTimeout, waitInterval)
+			waitForBootstrapClusterConfig(t, nodes, expected)
+			leaderIdx := waitForSingleLeader(t, nodes)
 
 			clients, conns := rawKVClients(t, endpoints)
 			t.Cleanup(func() { closeGRPCConns(conns) })
@@ -137,7 +151,7 @@ func TestRaftBootstrapMembers_E2E_FixedClusterWithoutAddVoter(t *testing.T) {
 			// may not be ready immediately, causing "context canceled while waiting
 			// for connections to become ready".
 			require.Eventually(t, func() bool {
-				return rawPutWithTimeout(clients[writerIdx], key, value, rpcTimeout) == nil
+				return rawPutWithTimeout(clients[writerIdx], key, value) == nil
 			}, waitTimeout, waitInterval)
 
 			for i := range clients {
@@ -168,8 +182,8 @@ func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 	t.Cleanup(func() { closeBootstrapE2ENodes(t, nodes) })
 
 	expected := bootstrapExpectedConfiguration(endpoints)
-	waitForBootstrapClusterConfig(t, nodes, expected, waitTimeout, waitInterval)
-	leaderIdx := waitForSingleLeader(t, nodes, waitTimeout, waitInterval)
+	waitForBootstrapClusterConfig(t, nodes, expected)
+	leaderIdx := waitForSingleLeader(t, nodes)
 
 	clients, conns := rawKVClients(t, endpoints)
 	defer closeGRPCConns(conns)
@@ -179,8 +193,8 @@ func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 	// Retry the first Put: the gRPC connection to a freshly started node may not
 	// be ready immediately, causing "context canceled while waiting for connections".
 	require.Eventually(t, func() bool {
-		return rawPutWithTimeout(clients[(leaderIdx+1)%len(clients)], keyA, valueA, rpcTimeout) == nil
-	}, waitTimeout, waitInterval)
+		return rawPutWithTimeout(clients[(leaderIdx+1)%len(clients)], keyA, valueA) == nil
+	}, bootstrapE2EWaitTimeout, waitInterval)
 	waitForValueOnAllClients(t, clients, keyA, valueA, waitTimeout, waitInterval, rpcTimeout)
 
 	require.NoError(t, nodes[leaderIdx].close())
@@ -189,8 +203,8 @@ func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 	require.NoError(t, err)
 	nodes[leaderIdx] = restartedNode
 
-	waitForBootstrapClusterConfig(t, nodes, expected, waitTimeout, waitInterval)
-	leaderIdx = waitForSingleLeader(t, nodes, waitTimeout, waitInterval)
+	waitForBootstrapClusterConfig(t, nodes, expected)
+	leaderIdx = waitForSingleLeader(t, nodes)
 
 	restartedClients, restartedConns := rawKVClients(t, endpoints)
 	defer closeGRPCConns(restartedConns)
@@ -199,8 +213,8 @@ func TestRaftBootstrapMembers_E2E_EtcdLeaderRestartRecovery(t *testing.T) {
 	keyB := []byte("bootstrap-etcd-restart-key-b")
 	valueB := []byte("bootstrap-etcd-restart-value-b")
 	require.Eventually(t, func() bool {
-		return rawPutWithTimeout(restartedClients[(leaderIdx+1)%len(restartedClients)], keyB, valueB, rpcTimeout) == nil
-	}, waitTimeout, waitInterval)
+		return rawPutWithTimeout(restartedClients[(leaderIdx+1)%len(restartedClients)], keyB, valueB) == nil
+	}, bootstrapE2EWaitTimeout, waitInterval)
 	waitForValueOnAllClients(t, restartedClients, keyB, valueB, waitTimeout, waitInterval, rpcTimeout)
 }
 
@@ -541,7 +555,9 @@ func startBootstrapE2ENode(
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, raftBootstrapConfig{legacyServers: bootstrapServers}, factory, nil, clock, nil, nil, "", encryptionWriteWiring{}, cfg.engine)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap,
+		raftBootstrapConfig{legacyServers: bootstrapServers}, factory, nil, clock, kv.NewActiveTimestampTracker(),
+		nil, nil, "", encryptionWriteWiring{}, cfg.engine)
 	if err != nil {
 		return nil, err
 	}
@@ -578,7 +594,6 @@ func startBootstrapE2ENode(
 		shardStore,
 		coordinate,
 		distServer,
-		cfg.engine,
 		cfg.leaderRedis,
 		listeners,
 	)
@@ -591,11 +606,15 @@ func startBootstrapE2ENode(
 	}
 
 	return &bootstrapE2ENode{
-		id:         ep.id,
-		runtimes:   runtimes,
-		shardStore: shardStore,
-		cancel:     cancel,
-		eg:         eg,
+		id:          ep.id,
+		runtimes:    runtimes,
+		shardStore:  shardStore,
+		coordinate:  coordinate,
+		distEngine:  cfg.engine,
+		distCatalog: distCatalog,
+		distServer:  distServer,
+		cancel:      cancel,
+		eg:          eg,
 	}, nil
 }
 
@@ -625,7 +644,9 @@ func startBootstrapE2EMultiGroupNode(
 		return nil, err
 	}
 	clock := kv.NewHLC()
-	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap, bootstrapCfg, factory, nil, clock, nil, nil, "", encryptionWriteWiring{}, cfg.engine)
+	runtimes, shardGroups, err := buildShardGroups(ep.id, baseDir, cfg.groups, cfg.multi, bootstrap,
+		bootstrapCfg, factory, nil, clock, kv.NewActiveTimestampTracker(), nil, nil, "",
+		encryptionWriteWiring{}, cfg.engine)
 	if err != nil {
 		return nil, err
 	}
@@ -662,7 +683,6 @@ func startBootstrapE2EMultiGroupNode(
 		shardStore,
 		coordinate,
 		distServer,
-		cfg.engine,
 		cfg.leaderRedis,
 		listeners,
 	)
@@ -675,11 +695,15 @@ func startBootstrapE2EMultiGroupNode(
 	}
 
 	return &bootstrapE2ENode{
-		id:         ep.id,
-		runtimes:   runtimes,
-		shardStore: shardStore,
-		cancel:     cancel,
-		eg:         eg,
+		id:          ep.id,
+		runtimes:    runtimes,
+		shardStore:  shardStore,
+		coordinate:  coordinate,
+		distEngine:  cfg.engine,
+		distCatalog: distCatalog,
+		distServer:  distServer,
+		cancel:      cancel,
+		eg:          eg,
 	}, nil
 }
 
@@ -691,7 +715,6 @@ func startRuntimeServersWithBoundListeners(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
-	routeEngine *distribution.Engine,
 	leaderRedis map[string]string,
 	listeners bootstrapE2EListeners,
 ) error {
@@ -705,7 +728,7 @@ func startRuntimeServersWithBoundListeners(
 	if err := startBoundRedisServer(ctx, eg, listeners.redis, shardStore, coordinate, leaderRedis, redisAddr, relay); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
-	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, nil, listeners.grpc); err != nil {
+	if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc); err != nil {
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	if err := startBoundDynamoDBServer(ctx, eg, listeners.dynamo, shardStore, coordinate); err != nil {
@@ -722,7 +745,6 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
-	routeEngine *distribution.Engine,
 	leaderRedis map[string]string,
 	listeners bootstrapE2EMultiGroupListeners,
 ) error {
@@ -735,7 +757,7 @@ func startRuntimeServersWithBoundMultiGroupListeners(
 		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	for _, rt := range runtimes {
-		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, routeEngine, relay, nil, listeners.grpc[rt.spec.id]); err != nil {
+		if err := startBoundGRPCServer(ctx, eg, rt, shardStore, coordinate, distServer, relay, nil, listeners.grpc[rt.spec.id]); err != nil {
 			return waitErrgroupAfterStartupFailure(cancel, eg, err)
 		}
 	}
@@ -752,7 +774,6 @@ func startBoundGRPCServer(
 	shardStore *kv.ShardStore,
 	coordinate kv.Coordinator,
 	distServer *adapter.DistributionServer,
-	routeEngine *distribution.Engine,
 	relay *adapter.RedisPubSubRelay,
 	sqsPartitionResolver kv.PartitionResolver,
 	listener net.Listener,
@@ -776,7 +797,6 @@ func startBoundGRPCServer(
 		relay,
 		adapter.WithInternalStore(rt.store),
 		adapter.WithInternalMigrationProposer(rt.engine),
-		adapter.WithInternalRouteEngine(routeEngine),
 		adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 	))
 	pb.RegisterDistributionServer(gs, distServer)
@@ -887,7 +907,7 @@ func closeBootstrapE2ENodes(t *testing.T, nodes []*bootstrapE2ENode) {
 	}
 }
 
-func waitForBootstrapClusterConfig(t *testing.T, nodes []*bootstrapE2ENode, expected raftengine.Configuration, waitTimeout, waitInterval time.Duration) {
+func waitForBootstrapClusterConfig(t *testing.T, nodes []*bootstrapE2ENode, expected raftengine.Configuration) {
 	t.Helper()
 
 	require.Eventually(t, func() bool {
@@ -910,7 +930,7 @@ func waitForBootstrapClusterConfig(t *testing.T, nodes []*bootstrapE2ENode, expe
 			}
 		}
 		return true
-	}, waitTimeout, waitInterval)
+	}, bootstrapE2EWaitTimeout, bootstrapE2EWaitInterval)
 }
 
 func waitForMultiGroupBootstrapClusterConfig(
@@ -954,7 +974,7 @@ func waitForMultiGroupBootstrapClusterConfig(
 	}, waitTimeout, waitInterval)
 }
 
-func waitForSingleLeader(t *testing.T, nodes []*bootstrapE2ENode, waitTimeout, waitInterval time.Duration) int {
+func waitForSingleLeader(t *testing.T, nodes []*bootstrapE2ENode) int {
 	t.Helper()
 
 	leaderIdx := -1
@@ -976,7 +996,7 @@ func waitForSingleLeader(t *testing.T, nodes []*bootstrapE2ENode, waitTimeout, w
 		}
 		leaderIdx = idx
 		return true
-	}, waitTimeout, waitInterval)
+	}, bootstrapE2EWaitTimeout, bootstrapE2EWaitInterval)
 	return leaderIdx
 }
 
@@ -1066,8 +1086,8 @@ func rawKVClients(t *testing.T, endpoints []bootstrapE2EEndpoint) ([]pb.RawKVCli
 	return clients, conns
 }
 
-func rawPutWithTimeout(client pb.RawKVClient, key []byte, value []byte, timeout time.Duration) error {
-	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+func rawPutWithTimeout(client pb.RawKVClient, key []byte, value []byte) error {
+	ctx, cancel := context.WithTimeout(context.Background(), bootstrapE2ERPCRequestTimeout)
 	defer cancel()
 	_, err := client.RawPut(ctx, &pb.RawPutRequest{Key: key, Value: value})
 	return err

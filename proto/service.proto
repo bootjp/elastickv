@@ -71,11 +71,35 @@ message RawDeleteResponse {
 message RawLatestCommitTSRequest {
   bytes key = 1;
   uint64 read_route_version = 2; // stamped by server-side routing for migration read fences
+  // group_id carries both uses: the explicit Raft group for route-specific
+  // probes, and the explicit group a leader-fenced watermark read names.
+  uint64 group_id = 3;
+  // When non-zero, also answer whether the key has any committed version at or
+  // below this timestamp. Comparing only `ts` cannot tell a tombstone at or
+  // before the read timestamp apart from a newer version above it.
+  uint64 version_visible_at_ts = 4;
+  // Optional batch form for version_visible_at_ts probes. Encoded as a single
+  // bounded key_batch blob so untrusted clients cannot expand one request into
+  // an unbounded repeated-bytes slice before the service enforces page limits.
+  bytes key_batch = 5;
 }
 
 message RawLatestCommitTSResponse {
   uint64 ts = 1;
   bool exists = 2;
+  // Answer to version_visible_at_ts. Only meaningful when
+  // version_visible_supported is set; a server that predates the probe leaves
+  // both unset and the caller falls back to comparing `ts`.
+  bool version_visible = 3;
+  bool version_visible_supported = 4;
+  // 3 and 4 were taken by the version probe on main while this branch was
+  // open, so the watermark fields moved up rather than reusing those tags.
+  uint64 group_id = 5; // echoes an explicit group watermark request
+  bool leader_fenced = 6; // true only after that group's leader ReadIndex fence
+  // Batch answer to key_batch. 5 and 6 shipped on main as the group watermark
+  // while this branch was open, so the batch results take the next free tag
+  // rather than colliding with a released wire format.
+  repeated bool version_visible_results = 7;
 }
 
 message RawScanAtRequest {
@@ -195,9 +219,6 @@ enum RaftAdminState {
 message RaftAdminStatusRequest {}
 
 message RaftAdminStatusResponse {
-  reserved 12, 13;
-  reserved "configuration_index", "pending_conf_change";
-
   RaftAdminState state = 1;
   string leader_id = 2;
   string leader_address = 3;
@@ -209,6 +230,8 @@ message RaftAdminStatusResponse {
   uint64 fsm_pending = 9;
   uint64 num_peers = 10;
   int64 last_contact_nanos = 11;
+  uint64 configuration_index = 12;
+  bool pending_conf_change = 13;
 }
 
 message RaftAdminConfigurationRequest {}

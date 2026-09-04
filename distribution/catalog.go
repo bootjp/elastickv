@@ -98,13 +98,38 @@ type CatalogSnapshot struct {
 type CatalogStore struct {
 	store                        store.MVCCStore
 	allowRouteDescriptorV2Writes bool
+	migrationStoreForGroup       CatalogMigrationStoreResolver
+	migrationRetireForGroup      CatalogMigrationRetireResolver
 }
 
 type CatalogStoreOption func(*CatalogStore)
 
+// CatalogMigrationStoreResolver resolves the local MVCC store for a data group.
+type CatalogMigrationStoreResolver func(groupID uint64) (store.MVCCStore, error)
+
+// CatalogMigrationRetireResolver retires migration metadata through the target
+// data group's replicated apply path.
+type CatalogMigrationRetireResolver func(ctx context.Context, groupID, jobID uint64) error
+
 func WithCatalogRouteDescriptorV2Writes(enabled bool) CatalogStoreOption {
 	return func(s *CatalogStore) {
 		s.allowRouteDescriptorV2Writes = enabled
+	}
+}
+
+// WithCatalogMigrationStoreResolver makes split-job finalization retire
+// target-local migration metadata from the target data group store.
+func WithCatalogMigrationStoreResolver(resolver CatalogMigrationStoreResolver) CatalogStoreOption {
+	return func(s *CatalogStore) {
+		s.migrationStoreForGroup = resolver
+	}
+}
+
+// WithCatalogMigrationRetireResolver makes split-job finalization retire
+// target-local migration metadata through the target data group Raft log.
+func WithCatalogMigrationRetireResolver(resolver CatalogMigrationRetireResolver) CatalogStoreOption {
+	return func(s *CatalogStore) {
+		s.migrationRetireForGroup = resolver
 	}
 }
 
@@ -286,6 +311,16 @@ func (s *CatalogStore) Snapshot(ctx context.Context) (CatalogSnapshot, error) {
 		return CatalogSnapshot{}, err
 	}
 	return s.SnapshotAt(ctx, s.store.LastCommitTS())
+}
+
+// LatestCommitTS returns the local catalog store watermark without reading
+// catalog data. Callers use it as the pre-Phase-D legacy timestamp input before
+// selecting the transaction snapshot through the dedicated TSO.
+func (s *CatalogStore) LatestCommitTS() uint64 {
+	if s == nil || s.store == nil {
+		return 0
+	}
+	return s.store.LastCommitTS()
 }
 
 // SnapshotAt reads a consistent route catalog snapshot at a specific MVCC
@@ -692,6 +727,15 @@ func (s *CatalogStore) buildSaveMutations(ctx context.Context, plan *savePlan) (
 	if err != nil {
 		return nil, err
 	}
+	delta, err := buildCatalogDelta(existingRoutes, plan.routes, plan.nextVersion-1, plan.nextVersion)
+	if err != nil {
+		return nil, err
+	}
+	deltaMutations, err := s.BuildDeltaMutationsAt(ctx, plan.readTS, delta)
+	if err != nil {
+		return nil, err
+	}
+	mutations = append(mutations, deltaMutations...)
 	mutations = append(mutations, &store.KVPairMutation{
 		Op:    store.OpTypePut,
 		Key:   CatalogVersionKey(),

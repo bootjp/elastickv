@@ -408,8 +408,19 @@ type RawLatestCommitTSRequest struct {
 	state            protoimpl.MessageState `protogen:"open.v1"`
 	Key              []byte                 `protobuf:"bytes,1,opt,name=key,proto3" json:"key,omitempty"`
 	ReadRouteVersion uint64                 `protobuf:"varint,2,opt,name=read_route_version,json=readRouteVersion,proto3" json:"read_route_version,omitempty"` // stamped by server-side routing for migration read fences
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// group_id carries both uses: the explicit Raft group for route-specific
+	// probes, and the explicit group a leader-fenced watermark read names.
+	GroupId uint64 `protobuf:"varint,3,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`
+	// When non-zero, also answer whether the key has any committed version at or
+	// below this timestamp. Comparing only `ts` cannot tell a tombstone at or
+	// before the read timestamp apart from a newer version above it.
+	VersionVisibleAtTs uint64 `protobuf:"varint,4,opt,name=version_visible_at_ts,json=versionVisibleAtTs,proto3" json:"version_visible_at_ts,omitempty"`
+	// Optional batch form for version_visible_at_ts probes. Encoded as a single
+	// bounded key_batch blob so untrusted clients cannot expand one request into
+	// an unbounded repeated-bytes slice before the service enforces page limits.
+	KeyBatch      []byte `protobuf:"bytes,5,opt,name=key_batch,json=keyBatch,proto3" json:"key_batch,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSRequest) Reset() {
@@ -456,12 +467,46 @@ func (x *RawLatestCommitTSRequest) GetReadRouteVersion() uint64 {
 	return 0
 }
 
+func (x *RawLatestCommitTSRequest) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *RawLatestCommitTSRequest) GetVersionVisibleAtTs() uint64 {
+	if x != nil {
+		return x.VersionVisibleAtTs
+	}
+	return 0
+}
+
+func (x *RawLatestCommitTSRequest) GetKeyBatch() []byte {
+	if x != nil {
+		return x.KeyBatch
+	}
+	return nil
+}
+
 type RawLatestCommitTSResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Ts            uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
-	Exists        bool                   `protobuf:"varint,2,opt,name=exists,proto3" json:"exists,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state  protoimpl.MessageState `protogen:"open.v1"`
+	Ts     uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
+	Exists bool                   `protobuf:"varint,2,opt,name=exists,proto3" json:"exists,omitempty"`
+	// Answer to version_visible_at_ts. Only meaningful when
+	// version_visible_supported is set; a server that predates the probe leaves
+	// both unset and the caller falls back to comparing `ts`.
+	VersionVisible          bool `protobuf:"varint,3,opt,name=version_visible,json=versionVisible,proto3" json:"version_visible,omitempty"`
+	VersionVisibleSupported bool `protobuf:"varint,4,opt,name=version_visible_supported,json=versionVisibleSupported,proto3" json:"version_visible_supported,omitempty"`
+	// 3 and 4 were taken by the version probe on main while this branch was
+	// open, so the watermark fields moved up rather than reusing those tags.
+	GroupId      uint64 `protobuf:"varint,5,opt,name=group_id,json=groupId,proto3" json:"group_id,omitempty"`                // echoes an explicit group watermark request
+	LeaderFenced bool   `protobuf:"varint,6,opt,name=leader_fenced,json=leaderFenced,proto3" json:"leader_fenced,omitempty"` // true only after that group's leader ReadIndex fence
+	// Batch answer to key_batch. 5 and 6 shipped on main as the group watermark
+	// while this branch was open, so the batch results take the next free tag
+	// rather than colliding with a released wire format.
+	VersionVisibleResults []bool `protobuf:"varint,7,rep,packed,name=version_visible_results,json=versionVisibleResults,proto3" json:"version_visible_results,omitempty"`
+	unknownFields         protoimpl.UnknownFields
+	sizeCache             protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSResponse) Reset() {
@@ -506,6 +551,41 @@ func (x *RawLatestCommitTSResponse) GetExists() bool {
 		return x.Exists
 	}
 	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetVersionVisible() bool {
+	if x != nil {
+		return x.VersionVisible
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetVersionVisibleSupported() bool {
+	if x != nil {
+		return x.VersionVisibleSupported
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetGroupId() uint64 {
+	if x != nil {
+		return x.GroupId
+	}
+	return 0
+}
+
+func (x *RawLatestCommitTSResponse) GetLeaderFenced() bool {
+	if x != nil {
+		return x.LeaderFenced
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetVersionVisibleResults() []bool {
+	if x != nil {
+		return x.VersionVisibleResults
+	}
+	return nil
 }
 
 type RawScanAtRequest struct {
@@ -1585,20 +1665,22 @@ func (*RaftAdminStatusRequest) Descriptor() ([]byte, []int) {
 }
 
 type RaftAdminStatusResponse struct {
-	state             protoimpl.MessageState `protogen:"open.v1"`
-	State             RaftAdminState         `protobuf:"varint,1,opt,name=state,proto3,enum=RaftAdminState" json:"state,omitempty"`
-	LeaderId          string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
-	LeaderAddress     string                 `protobuf:"bytes,3,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
-	Term              uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
-	CommitIndex       uint64                 `protobuf:"varint,5,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
-	AppliedIndex      uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
-	LastLogIndex      uint64                 `protobuf:"varint,7,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
-	LastSnapshotIndex uint64                 `protobuf:"varint,8,opt,name=last_snapshot_index,json=lastSnapshotIndex,proto3" json:"last_snapshot_index,omitempty"`
-	FsmPending        uint64                 `protobuf:"varint,9,opt,name=fsm_pending,json=fsmPending,proto3" json:"fsm_pending,omitempty"`
-	NumPeers          uint64                 `protobuf:"varint,10,opt,name=num_peers,json=numPeers,proto3" json:"num_peers,omitempty"`
-	LastContactNanos  int64                  `protobuf:"varint,11,opt,name=last_contact_nanos,json=lastContactNanos,proto3" json:"last_contact_nanos,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state              protoimpl.MessageState `protogen:"open.v1"`
+	State              RaftAdminState         `protobuf:"varint,1,opt,name=state,proto3,enum=RaftAdminState" json:"state,omitempty"`
+	LeaderId           string                 `protobuf:"bytes,2,opt,name=leader_id,json=leaderId,proto3" json:"leader_id,omitempty"`
+	LeaderAddress      string                 `protobuf:"bytes,3,opt,name=leader_address,json=leaderAddress,proto3" json:"leader_address,omitempty"`
+	Term               uint64                 `protobuf:"varint,4,opt,name=term,proto3" json:"term,omitempty"`
+	CommitIndex        uint64                 `protobuf:"varint,5,opt,name=commit_index,json=commitIndex,proto3" json:"commit_index,omitempty"`
+	AppliedIndex       uint64                 `protobuf:"varint,6,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	LastLogIndex       uint64                 `protobuf:"varint,7,opt,name=last_log_index,json=lastLogIndex,proto3" json:"last_log_index,omitempty"`
+	LastSnapshotIndex  uint64                 `protobuf:"varint,8,opt,name=last_snapshot_index,json=lastSnapshotIndex,proto3" json:"last_snapshot_index,omitempty"`
+	FsmPending         uint64                 `protobuf:"varint,9,opt,name=fsm_pending,json=fsmPending,proto3" json:"fsm_pending,omitempty"`
+	NumPeers           uint64                 `protobuf:"varint,10,opt,name=num_peers,json=numPeers,proto3" json:"num_peers,omitempty"`
+	LastContactNanos   int64                  `protobuf:"varint,11,opt,name=last_contact_nanos,json=lastContactNanos,proto3" json:"last_contact_nanos,omitempty"`
+	ConfigurationIndex uint64                 `protobuf:"varint,12,opt,name=configuration_index,json=configurationIndex,proto3" json:"configuration_index,omitempty"`
+	PendingConfChange  bool                   `protobuf:"varint,13,opt,name=pending_conf_change,json=pendingConfChange,proto3" json:"pending_conf_change,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
 }
 
 func (x *RaftAdminStatusResponse) Reset() {
@@ -1706,6 +1788,20 @@ func (x *RaftAdminStatusResponse) GetLastContactNanos() int64 {
 		return x.LastContactNanos
 	}
 	return 0
+}
+
+func (x *RaftAdminStatusResponse) GetConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ConfigurationIndex
+	}
+	return 0
+}
+
+func (x *RaftAdminStatusResponse) GetPendingConfChange() bool {
+	if x != nil {
+		return x.PendingConfChange
+	}
+	return false
 }
 
 type RaftAdminConfigurationRequest struct {
@@ -2539,13 +2635,21 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"Z\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xc5\x01\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
-	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\"C\n" +
+	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\x12\x19\n" +
+	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x121\n" +
+	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\x12\x1b\n" +
+	"\tkey_batch\x18\x05 \x01(\fR\bkeyBatch\"\xa0\x02\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
-	"\x06exists\x18\x02 \x01(\bR\x06exists\"\xde\x02\n" +
+	"\x06exists\x18\x02 \x01(\bR\x06exists\x12'\n" +
+	"\x0fversion_visible\x18\x03 \x01(\bR\x0eversionVisible\x12:\n" +
+	"\x19version_visible_supported\x18\x04 \x01(\bR\x17versionVisibleSupported\x12\x19\n" +
+	"\bgroup_id\x18\x05 \x01(\x04R\agroupId\x12#\n" +
+	"\rleader_fenced\x18\x06 \x01(\bR\fleaderFenced\x126\n" +
+	"\x17version_visible_results\x18\a \x03(\bR\x15versionVisibleResults\"\xde\x02\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +
@@ -2614,7 +2718,7 @@ const file_service_proto_rawDesc = "" +
 	"\bstart_ts\x18\x01 \x01(\x04R\astartTs\",\n" +
 	"\x10RollbackResponse\x12\x18\n" +
 	"\asuccess\x18\x01 \x01(\bR\asuccess\"\x18\n" +
-	"\x16RaftAdminStatusRequest\"\xd8\x03\n" +
+	"\x16RaftAdminStatusRequest\"\x83\x04\n" +
 	"\x17RaftAdminStatusResponse\x12%\n" +
 	"\x05state\x18\x01 \x01(\x0e2\x0f.RaftAdminStateR\x05state\x12\x1b\n" +
 	"\tleader_id\x18\x02 \x01(\tR\bleaderId\x12%\n" +
@@ -2628,7 +2732,9 @@ const file_service_proto_rawDesc = "" +
 	"fsmPending\x12\x1b\n" +
 	"\tnum_peers\x18\n" +
 	" \x01(\x04R\bnumPeers\x12,\n" +
-	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanosJ\x04\b\f\x10\rJ\x04\b\r\x10\x0eR\x13configuration_indexR\x13pending_conf_change\"\x1f\n" +
+	"\x12last_contact_nanos\x18\v \x01(\x03R\x10lastContactNanos\x12/\n" +
+	"\x13configuration_index\x18\f \x01(\x04R\x12configurationIndex\x12.\n" +
+	"\x13pending_conf_change\x18\r \x01(\bR\x11pendingConfChange\"\x1f\n" +
 	"\x1dRaftAdminConfigurationRequest\"W\n" +
 	"\x0fRaftAdminMember\x12\x0e\n" +
 	"\x02id\x18\x01 \x01(\tR\x02id\x12\x18\n" +

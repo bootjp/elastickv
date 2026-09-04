@@ -199,8 +199,8 @@ cannot check them as state invariants.
     independently reach `ceiling + 1` before a fresh ceiling is
     renewed, the new leader's first `Next()` can tie or undercut the
     old leader's last commit. Bounding inter-node skew to less than
-    one ceiling window (< 15s with the current `hlcPhysicalWindowMs =
-    15000ms`) keeps the window wide enough that the new leader cannot
+    one ceiling window (< 20s with the current `hlcPhysicalWindowMs =
+    20000ms`) keeps the window wide enough that the new leader cannot
     independently reach the overflow value before a renewal applies.
     Should be surfaced in operator docs as a cluster prerequisite.
   - **(ii) Logical-counter handoff.** The 16-bit logical half of the HLC
@@ -244,33 +244,28 @@ cannot check them as state invariants.
   - **(iii) Commit-time ceiling fencing.** Bounded skew (i) and logical
     handoff (ii) are not enough on their own: a leader that misses
     `RunHLCLeaseRenewal` for longer than `hlcPhysicalWindowMs` (e.g.
-    partitioned from the quorum that owns the ceiling group — in the
-    `ShardedCoordinator` the ceiling group is always
-    `c.defaultGroup`, per `kv/sharded_coordinator.go`, so the failure
-    scenario is: a node that is leader of a non-default shard but
-    partitioned from the default group's quorum) but remains a Raft
-    leader will continue advancing its wall clock past the last
-    committed ceiling and can still issue persistence timestamps. A
-    subsequent leader that has only restored the same stale ceiling
-    and has a lagging wall clock can then issue a strictly smaller
-    timestamp, violating HLC-4. The spec therefore requires every
-    `Next()` that backs a persistence ts to be gated on
-    `wall_now < physicalCeiling[n]` (the same `physicalCeiling[n]`
-    variable as §3, matching `kv/hlc.go`'s field); a leader whose
-    ceiling has expired must either re-apply a fresh ceiling via
-    Raft before committing, or refuse to commit (fail-closed). The
-    current implementation in `kv/sharded_coordinator.go`
-    `RunHLCLeaseRenewal` only logs renewal failures and dispatch
-    paths call `HLC.Next()` without checking ceiling freshness — this
-    is the second design gap the spec is meant to surface. As with
-    (ii), if the gap is real, TLC will produce a counterexample for
-    HLC-4 under a model that lets renewals fail. **Availability
-    note.** The fail-closed behaviour means a leader partitioned
-    from the default group's quorum for longer than
-    `hlcPhysicalWindowMs` cannot serve any persistence timestamp —
-    every client commit is rejected until renewal succeeds. This is
-    a CP, not AP, trade-off and operators must size
-    `hlcPhysicalWindowMs` (currently 15s) relative to expected
+    partitioned from the quorum for a shard group whose timestamps it
+    renews) but remains a Raft leader can advance wall clock past the
+    last committed ceiling. A subsequent leader that has only restored
+    the same stale ceiling and has a lagging wall clock can then issue a
+    strictly smaller timestamp, violating HLC-4, unless persistence-grade
+    allocation fails closed. The spec therefore requires every timestamp
+    that backs persistence to be gated on `wall_now < physicalCeiling[n]`
+    (the same `physicalCeiling[n]` variable as §3, matching `kv/hlc.go`'s
+    field). The current implementation renews HLC leases per led shard
+    group through `ShardedCoordinator.RunHLCLeaseRenewal`, and persistence
+    allocation uses `NextFenced`; if the ceiling is expired or the
+    logical half is exhausted before a fresh renewal applies, the
+    committing path refuses with `ErrCeilingExpired` and may use
+    `RecoverHLCLease` to synchronously propose a fresh ceiling before
+    retrying. As with (ii), TLC must still model failed renewals because
+    the availability outcome is a client-visible rejection, not silent
+    timestamp issuance. **Availability note.** The fail-closed behaviour
+    means a shard leader partitioned from that shard group's quorum for
+    longer than `hlcPhysicalWindowMs` cannot serve any persistence
+    timestamp — every client commit on that group is rejected until
+    renewal succeeds. This is a CP, not AP, trade-off and operators must size
+    `hlcPhysicalWindowMs` (currently 20s) relative to expected
     partition duration; see §9 risk 7.
 
 ### 5.2 OCC
@@ -661,12 +656,11 @@ does not keep this document in `partial`.
    mitigation, the doc lifecycle (Section 8.2) ties promotion to specs
    landing, so a stale `partial` status is a visible signal.
 
-5. **Choice of TSO model.** The HLC spec models the current
-   per-shard-leader ceiling. The centralized TSO proposal
-   (`2026_04_16_partial_centralized_tso.md`) would change that. The two
-   docs are independent; if/when centralized TSO lands, `HLC.tla` (or a
-   sibling `TSO.tla`) is updated as part of that PR. We do **not** block
-   this proposal on the TSO decision.
+5. **Choice of TSO model.** The HLC spec continues to model the compatibility
+   per-shard-leader ceiling, while the implemented centralized TSO
+   (`2026_04_16_implemented_centralized_tso.md`) owns the production ordering
+   path. A sibling `TSO.tla` remains an independent future extension; runtime
+   transition safety is pinned by the TSO FSM, routing, reload, and race tests.
 
 6. **TLC tool licensing and binary distribution.** `tla2tools.jar` is
    MIT-licensed but not in any package manager we already depend on.
@@ -674,21 +668,20 @@ does not keep this document in `partial`.
    specific version and checksum.
 
 7. **Fail-closed availability under partition.** HLC-4 precondition
-   (iii) makes the ceiling-fence behaviour normative: a leader
-   partitioned from the default group's quorum for longer than
-   `hlcPhysicalWindowMs` (currently 15s) cannot serve any persistence
-   timestamp, so client commits are rejected until renewal succeeds.
-   This is a CP, not AP, trade-off and is a stricter regime than the
-   current implementation (which silently keeps issuing). Mitigation:
-   the M1 spec encodes the fence as an **action guard** on
-   `IssueTimestamp` (`ENABLED ⇔ wallNow[n] < physicalCeiling[n]`, per
-   §8.1 — `ASSUME` is only valid for constant predicates and does not
-   apply here); the follow-up implementation PR that adds the fence
-   to `HLC.Next()` /
-   `ShardedCoordinator.RunHLCLeaseRenewal` must (a) surface the new
-   error in operator-visible metrics and (b) document the
-   `hlcPhysicalWindowMs` tuning guidance — operators sizing the
-   window must trade it against expected partition duration.
+   (iii) makes the ceiling-fence behaviour normative: a shard leader
+   partitioned from that shard group's quorum for longer than
+   `hlcPhysicalWindowMs` (currently 20s) cannot serve persistence
+   timestamps for that group. Persistence allocation goes through
+   `NextFenced`; when renewal has not advanced the ceiling in time,
+   client commits fail closed with `ErrCeilingExpired` unless
+   `RecoverHLCLease` can synchronously apply a fresh ceiling. This is
+   a CP, not AP, trade-off. Mitigation: the M1 spec encodes the fence
+   as an **action guard** on `IssueTimestamp`
+   (`ENABLED ⇔ wallNow[n] < physicalCeiling[n]`, per §8.1 — `ASSUME`
+   is only valid for constant predicates and does not apply here);
+   implementation surfaces the rejection via `NextFencedRejections`
+   and operator docs must keep `hlcPhysicalWindowMs` tuning guidance
+   tied to expected partition duration and renewal latency.
 
 ---
 
@@ -716,8 +709,8 @@ does not keep this document in `partial`.
 - `distribution/engine.go`, `distribution/catalog.go`,
   `distribution/watcher.go` — route catalog.
 - `docs/architecture_overview.md` — system-level diagrams.
-- `docs/design/2026_04_16_partial_centralized_tso.md` — the TSO proposal
-  that this spec is independent of (Section 9, risk 5).
+- `docs/design/2026_04_16_implemented_centralized_tso.md` — the implemented TSO
+  design that this spec is independent of (Section 9, risk 5).
 - Diego Ongaro's Raft TLA+ specification — reference for the abstract
   `Raft.tla` interface.
 - CockroachDB and TiDB MVCC / HLC TLA+ models — public prior art for

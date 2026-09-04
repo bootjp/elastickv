@@ -3,7 +3,6 @@ package kv
 import (
 	"bytes"
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"testing"
@@ -15,6 +14,7 @@ import (
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,84 +49,6 @@ func newStagedVisibilityShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
 	}))
 	group := &ShardGroup{Store: store.NewMVCCStore()}
 	return NewShardStore(engine, map[uint64]*ShardGroup{1: group}), group
-}
-
-func applyTargetReadiness(t *testing.T, group *ShardGroup) {
-	t.Helper()
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             []byte("a"),
-		RouteEnd:               []byte("z"),
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-	})
-}
-
-func applyTargetReadinessState(t *testing.T, group *ShardGroup, state store.TargetStagedReadinessState) {
-	t.Helper()
-	writer, ok := group.Store.(store.MigrationTargetReadinessWriter)
-	require.True(t, ok)
-	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), state))
-}
-
-func newReadinessShardStore(t *testing.T, route distribution.RouteDescriptor) (*ShardStore, *ShardGroup) {
-	t.Helper()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes:  []distribution.RouteDescriptor{route},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	return NewShardStore(engine, map[uint64]*ShardGroup{route.GroupID: group}), group
-}
-
-type readinessFenceEngine struct {
-	state              raftengine.State
-	onLinearizableRead func()
-}
-
-func (e *readinessFenceEngine) State() raftengine.State {
-	if e.state != "" {
-		return e.state
-	}
-	return raftengine.StateFollower
-}
-
-func (e *readinessFenceEngine) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{ID: "leader"}
-}
-
-func (e *readinessFenceEngine) VerifyLeader(context.Context) error {
-	return nil
-}
-
-func (e *readinessFenceEngine) LinearizableRead(context.Context) (uint64, error) {
-	if e.onLinearizableRead != nil {
-		e.onLinearizableRead()
-	}
-	return 1, nil
-}
-
-func (e *readinessFenceEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
-	return nil, errors.New("unexpected propose")
-}
-
-func (e *readinessFenceEngine) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
-	return nil, errors.New("unexpected propose admin")
-}
-
-func (e *readinessFenceEngine) Status() raftengine.Status {
-	return raftengine.Status{State: e.State()}
-}
-
-func (e *readinessFenceEngine) Configuration(context.Context) (raftengine.Configuration, error) {
-	return raftengine.Configuration{}, nil
-}
-
-func (e *readinessFenceEngine) Close() error {
-	return nil
 }
 
 func newStagedVisibilityPebbleShardStore(t *testing.T) (*ShardStore, *ShardGroup) {
@@ -179,320 +101,6 @@ func TestShardStoreGetAt_MergesStagedVisibility(t *testing.T) {
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
-func TestShardStoreCommittedVersionAtChecksStagedVisibilityKey(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newStagedVisibilityShardStore(t)
-	rawKey := []byte("k")
-	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, rawKey), []byte("staged"), 77, 0))
-
-	landed, err := st.CommittedVersionAt(ctx, rawKey, 77)
-	require.NoError(t, err)
-	require.True(t, landed)
-}
-
-func TestShardStoreCommittedVersionAtChecksTargetReadiness(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 77, 0))
-
-	landed, err := st.CommittedVersionAt(ctx, []byte("k"), 77)
-	require.False(t, landed)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreSourceReadFenceRejectsPointRead(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:               10,
-		RouteStart:          []byte("m"),
-		RouteEnd:            []byte("z"),
-		MigrationJobID:      10,
-		MinWriteTSExclusive: 50,
-		Armed:               true,
-		SourceWriteFence:    true,
-		SourceReadFence:     true,
-		RetentionPinTS:      40,
-	})
-	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
-
-	_, err := st.GetAt(ctx, []byte("n"), 60)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-
-	_, err = st.ScanAt(ctx, []byte("m"), []byte("z"), 60, 0)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-// keys_only reads take a different path than value scans and used to skip the
-// readiness proof entirely, so an armed source read fence still handed back
-// keys from the old source -- and an armed target guard handed back live-only
-// or empty keys while the catalog watcher lagged. Both the routed and the
-// explicit-group form must fail closed the same way ScanAt does.
-func TestShardStoreSourceReadFenceRejectsKeyOnlyScan(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:               10,
-		RouteStart:          []byte("m"),
-		RouteEnd:            []byte("z"),
-		MigrationJobID:      10,
-		MinWriteTSExclusive: 50,
-		Armed:               true,
-		SourceWriteFence:    true,
-		SourceReadFence:     true,
-		RetentionPinTS:      40,
-	})
-	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
-
-	_, err := st.ScanKeysAt(ctx, []byte("m"), []byte("z"), 60, 0)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-
-	_, err = st.ScanKeysAtWithReadFence(ctx, []byte("m"), []byte("z"), 60, 0, 1, 0)
-	require.ErrorIs(t, err, ErrRouteCutoverPending,
-		"an explicit source group is exactly the case the fence exists for")
-}
-
-func TestShardStoreSourceWriteFenceKeepsReadsAvailable(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:               10,
-		RouteStart:          []byte("m"),
-		RouteEnd:            []byte("z"),
-		MigrationJobID:      10,
-		MinWriteTSExclusive: 50,
-		Armed:               true,
-		SourceWriteFence:    true,
-		RetentionPinTS:      40,
-	})
-	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
-
-	got, err := st.GetAt(ctx, []byte("n"), 60)
-	require.NoError(t, err)
-	require.Equal(t, []byte("live"), got)
-}
-
-func TestShardStoreCommittedVersionAtRechecksTargetReadinessAfterFence(t *testing.T) {
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	group.Engine = &readinessFenceEngine{
-		onLinearizableRead: func() {
-			applyTargetReadiness(t, group)
-		},
-	}
-	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 77, 0))
-
-	landed, err := st.CommittedVersionAt(ctx, []byte("k"), 77)
-	require.False(t, landed)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreTargetReadinessFailsClosedWithoutDescriptorProof(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadiness(t, group)
-
-	_, err := st.GetAt(ctx, []byte("k"), 120)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-
-	err = st.PutAt(ctx, []byte("k"), []byte("v"), 120, 0)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreTargetReadinessNormalizesInternalKeyRange(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadiness(t, group)
-
-	itemKey := store.ListItemKey([]byte("b"), 0)
-	require.NoError(t, group.Store.PutAt(ctx, itemKey, []byte("item"), 120, 0))
-
-	_, err := st.GetAt(ctx, itemKey, 120)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreTargetReadinessAcceptsStagedDescriptor(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newStagedVisibilityShardStore(t)
-	applyTargetReadiness(t, group)
-	rawKey := []byte("k")
-	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, rawKey), []byte("staged"), 120, 0))
-
-	got, err := st.GetAt(ctx, rawKey, 130)
-	require.NoError(t, err)
-	require.Equal(t, []byte("staged"), got)
-}
-
-func TestShardStoreTargetReadinessAcceptsClearedDescriptorAndRetainsFloor(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID:             1,
-		Start:               []byte("a"),
-		End:                 []byte("z"),
-		GroupID:             1,
-		State:               distribution.RouteStateActive,
-		MinWriteTSExclusive: 100,
-	})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 120, 0))
-
-	got, err := st.GetAt(ctx, []byte("k"), 130)
-	require.NoError(t, err)
-	require.Equal(t, []byte("live"), got)
-
-	err = st.PutAt(ctx, []byte("k"), []byte("low"), 100, 0)
-	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
-
-	err = st.ExpireAt(ctx, []byte("k"), 200, 100)
-	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
-
-	err = st.ApplyMutations(ctx, []*store.KVPairMutation{{
-		Op:    store.OpTypePut,
-		Key:   []byte("n"),
-		Value: []byte("low"),
-	}}, nil, 0, 100)
-	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
-
-	err = st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0)
-	require.NoError(t, err)
-
-	err = st.ApplyMutations(ctx, []*store.KVPairMutation{{
-		Op:    store.OpTypePut,
-		Key:   []byte("n"),
-		Value: []byte("ok"),
-	}}, nil, 0, 101)
-	require.NoError(t, err)
-}
-
-func TestShardStoreTargetReadinessRejectsClearedDescriptorBeforeCutoverVersion(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID:             1,
-			Start:               []byte("a"),
-			End:                 []byte("z"),
-			GroupID:             1,
-			State:               distribution.RouteStateActive,
-			MinWriteTSExclusive: 100,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 120, 0))
-
-	_, err := st.GetAt(ctx, []byte("k"), 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreTargetReadinessUsesSingleCatalogSnapshotProof(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID:             1,
-			Start:               []byte("a"),
-			End:                 []byte("z"),
-			GroupID:             1,
-			State:               distribution.RouteStateActive,
-			MinWriteTSExclusive: 100,
-		}},
-	}))
-	staleRoute, ok := engine.GetRoute([]byte("b"))
-	require.True(t, ok)
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-old"), 80, 0))
-	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-new"), 120, 0))
-
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID:                1,
-			Start:                  []byte("a"),
-			End:                    []byte("z"),
-			GroupID:                1,
-			State:                  distribution.RouteStateActive,
-			StagedVisibilityActive: true,
-			MigrationJobID:         9,
-			MinWriteTSExclusive:    100,
-		}},
-	}))
-
-	got, err := shards.localGetAt(ctx, group, staleRoute, []byte("b"), 130)
-	require.NoError(t, err)
-	require.Equal(t, []byte("staged-new"), got)
-}
-
 func TestShardStoreGetAt_MergesStagedVisibilityPebbleExactKey(t *testing.T) {
 	t.Parallel()
 
@@ -507,224 +115,6 @@ func TestShardStoreGetAt_MergesStagedVisibilityPebbleExactKey(t *testing.T) {
 	got, err := st.GetAt(ctx, rawKey, 25)
 	require.NoError(t, err)
 	require.Equal(t, []byte("staged-new"), got)
-}
-
-func TestShardStoreDeletePrefixAtUsesReadinessProofRouteFloor(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID: 1,
-			Start:   []byte("a"),
-			End:     []byte("z"),
-			GroupID: 1,
-			State:   distribution.RouteStateActive,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live"), 80, 0))
-
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID:                1,
-			Start:                  []byte("a"),
-			End:                    []byte("z"),
-			GroupID:                1,
-			State:                  distribution.RouteStateActive,
-			StagedVisibilityActive: true,
-			MigrationJobID:         9,
-			MinWriteTSExclusive:    100,
-		}},
-	}))
-
-	err := shards.DeletePrefixAt(ctx, []byte("b"), nil, 100)
-	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
-
-	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("live"), got)
-}
-
-func TestShardStoreDeletePrefixAtUsesReadinessProofRouteForStagedCleanup(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID:             1,
-			Start:               []byte("a"),
-			End:                 []byte("z"),
-			GroupID:             1,
-			State:               distribution.RouteStateActive,
-			MinWriteTSExclusive: 100,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
-	applyTargetReadiness(t, group)
-	stagedKey := distribution.MigrationStagedDataKey(9, []byte("b"))
-	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))
-
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID:                1,
-			Start:                  []byte("a"),
-			End:                    []byte("z"),
-			GroupID:                1,
-			State:                  distribution.RouteStateActive,
-			StagedVisibilityActive: true,
-			MigrationJobID:         9,
-			MinWriteTSExclusive:    100,
-		}},
-	}))
-
-	require.NoError(t, shards.DeletePrefixAt(ctx, []byte("b"), nil, 130))
-
-	_, err := group.Store.GetAt(ctx, stagedKey, 140)
-	require.ErrorIs(t, err, store.ErrKeyNotFound)
-	_, err = shards.GetAt(ctx, []byte("b"), 140)
-	require.ErrorIs(t, err, store.ErrKeyNotFound)
-}
-
-func TestShardStoreExplicitGroupReadUsesRouteProofForReadiness(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID:             1,
-		Start:               []byte("a"),
-		End:                 []byte("z"),
-		GroupID:             42,
-		State:               distribution.RouteStateActive,
-		MinWriteTSExclusive: 100,
-	})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live"), 120, 0))
-	require.NoError(t, group.Store.PutAt(ctx, []byte("c"), []byte("scan"), 121, 0))
-
-	got, err := st.GetGroupAt(ctx, 42, []byte("b"), 130)
-	require.NoError(t, err)
-	require.Equal(t, []byte("live"), got)
-
-	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
-	require.NoError(t, err)
-	require.Len(t, kvs, 2)
-}
-
-func TestShardStoreScanGroupAtChecksEveryCoveredRoute(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{
-			{
-				RouteID:             1,
-				Start:               []byte("a"),
-				End:                 []byte("m"),
-				GroupID:             42,
-				State:               distribution.RouteStateActive,
-				MinWriteTSExclusive: 100,
-			},
-			{
-				RouteID: 2,
-				Start:   []byte("m"),
-				End:     []byte("z"),
-				GroupID: 42,
-				State:   distribution.RouteStateActive,
-			},
-		},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             []byte("m"),
-		RouteEnd:               []byte("z"),
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-	})
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("left"), 120, 0))
-	require.NoError(t, group.Store.PutAt(ctx, []byte("x"), []byte("right"), 120, 0))
-
-	_, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreScanGroupAtClampsSingleMatchedRoute(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID: 1,
-			Start:   []byte("m"),
-			End:     []byte("z"),
-			GroupID: 42,
-			State:   distribution.RouteStateActive,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("outside"), 7, 0))
-	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("inside"), 7, 0))
-
-	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 7)
-	require.NoError(t, err)
-	require.Equal(t, []*store.KVPair{{Key: []byte("n"), Value: []byte("inside")}}, kvs)
-}
-
-func TestShardStoreScanGroupAtSplitsCoveredRoutesForStagedVisibility(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{
-			{
-				RouteID: 1,
-				Start:   []byte("a"),
-				End:     []byte("m"),
-				GroupID: 42,
-				State:   distribution.RouteStateActive,
-			},
-			{
-				RouteID:                2,
-				Start:                  []byte("m"),
-				End:                    []byte("z"),
-				GroupID:                42,
-				State:                  distribution.RouteStateActive,
-				StagedVisibilityActive: true,
-				MigrationJobID:         10,
-			},
-		},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("left-live"), 110, 0))
-	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(10, []byte("x")), []byte("right-staged"), 120, 0))
-
-	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
-	require.NoError(t, err)
-	require.Equal(t, []*store.KVPair{
-		{Key: []byte("b"), Value: []byte("left-live")},
-		{Key: []byte("x"), Value: []byte("right-staged")},
-	}, kvs)
 }
 
 func TestShardStoreGetAt_MergesStagedVisibilityForS3BucketAuxiliary(t *testing.T) {
@@ -770,229 +160,209 @@ func TestShardStoreGetAt_MergesStagedVisibilityForS3BucketAuxiliary(t *testing.T
 	}
 }
 
-func TestShardStorePhysicalLimitScanChecksTargetReadiness(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadiness(t, group)
-
-	userKey := []byte("b")
-	start := store.ListItemKey(userKey, 0)
-	end := store.ListItemKey(userKey, 2)
-	require.NoError(t, group.Store.PutAt(ctx, start, []byte("v"), 120, 0))
-
-	_, _, err := st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStorePhysicalLimitScanRechecksTargetReadinessAfterFence(t *testing.T) {
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	group.Engine = &readinessFenceEngine{
-		state: raftengine.StateLeader,
-		onLinearizableRead: func() {
-			applyTargetReadiness(t, group)
-		},
-	}
-
-	userKey := []byte("b")
-	start := store.ListItemKey(userKey, 0)
-	end := store.ListItemKey(userKey, 2)
-	require.NoError(t, group.Store.PutAt(ctx, start, []byte("v"), 120, 0))
-
-	_, _, err := st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreS3ManifestScanChecksTargetReadinessInRouteSpace(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
-	end := prefixScanEnd(start)
-	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
-	require.True(t, ok)
-
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID: 1,
-			Start:   routeStart,
-			End:     routeEnd,
-			GroupID: 1,
-			State:   distribution.RouteStateActive,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             routeStart,
-		RouteEnd:               routeEnd,
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-	})
-
-	key := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-0")
-	require.NoError(t, group.Store.PutAt(ctx, key, []byte("manifest"), 120, 0))
-
-	_, err := st.ScanAt(ctx, start, end, 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-	_, _, err = st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreS3BucketAuxiliaryScanChecksSourceReadFenceInRouteSpace(t *testing.T) {
+func TestShardStoreGetAt_RoutesS3BucketAuxiliaryToPromotedOwner(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	const bucket = "bucket-a"
-	start := []byte(s3keys.BucketMetaPrefix)
-	end := prefixScanEnd(start)
-	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	routeEnd := prefixScanEnd(routeStart)
-
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID: 1,
-			Start:   routeStart,
-			End:     routeEnd,
-			GroupID: 42,
-			State:   distribution.RouteStateActive,
-		}},
+		Version: 1,
+		Routes:  s3BucketAuxiliaryPromotedRoutes(),
 	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             routeStart,
-		RouteEnd:               routeEnd,
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-		SourceWriteFence:       true,
-		SourceReadFence:        true,
-		RetentionPinTS:         90,
-	})
-	require.NoError(t, group.Store.PutAt(ctx, s3keys.BucketMetaKey(bucket), []byte("meta"), 120, 0))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	key := s3keys.BucketMetaKey(bucket)
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("promoted-target"), 20, 0))
 
-	_, err := st.ScanGroupAt(ctx, 42, start, end, 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	got, err := st.GetAt(ctx, key, 30)
+	require.NoError(t, err)
+	require.Equal(t, []byte("promoted-target"), got)
 }
 
-func TestShardStoreFilesystemChunkScanChecksSourceReadFenceInRouteSpace(t *testing.T) {
+func TestShardStoreS3BucketAuxiliaryScanFiltersStagedRoutesToBucketRange(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
-	const homeSlot uint64 = 11
-	const inode uint64 = 22
-	start := fskeys.ChunkPrefix(homeSlot, inode)
-	end := prefixScanEnd(start)
-	routeStart := fskeys.ChunkRouteKey(homeSlot, inode)
-	routeEnd := prefixScanEnd(routeStart)
-
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID: 1,
-			Start:   routeStart,
-			End:     routeEnd,
-			GroupID: 42,
-			State:   distribution.RouteStateActive,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             routeStart,
-		RouteEnd:               routeEnd,
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-		SourceWriteFence:       true,
-		SourceReadFence:        true,
-		RetentionPinTS:         90,
-	})
-	require.NoError(t, group.Store.PutAt(ctx, fskeys.ChunkKey(homeSlot, inode, 0), []byte("chunk"), 120, 0))
-
-	_, err := st.ScanAt(ctx, start, end, 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-	_, err = st.ScanGroupAt(ctx, 42, start, end, 10, 130)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-}
-
-func TestShardStoreTargetReadinessSkipsNonOverlappingGuardForScannedRoute(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "a/")
-	end := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
-	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
-	require.True(t, ok)
-	routeBoundary, _, ok := s3keys.ManifestScanRouteBounds(
-		s3keys.ObjectManifestScanStart("bucket-a", 1, "m/"),
-		end,
+	const (
+		bucketA = "bucket-a"
+		bucketB = "bucket-b"
+		bucketC = "bucket-c"
 	)
-	require.True(t, ok)
+	routeStartA := s3keys.RoutePrefixForBucketAnyGeneration(bucketA)
+	routeEndA := prefixScanEnd(routeStartA)
+	routeStartB := s3keys.RoutePrefixForBucketAnyGeneration(bucketB)
+	routeEndB := prefixScanEnd(routeStartB)
+	require.Less(t, bytes.Compare(routeStartA, routeStartB), 0)
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
+		Version: 1,
 		Routes: []distribution.RouteDescriptor{
-			{
-				RouteID:             1,
-				Start:               routeStart,
-				End:                 routeBoundary,
-				GroupID:             1,
-				State:               distribution.RouteStateActive,
-				MinWriteTSExclusive: 100,
-			},
-			{
-				RouteID: 2,
-				Start:   routeBoundary,
-				End:     routeEnd,
-				GroupID: 1,
-				State:   distribution.RouteStateActive,
-			},
+			{RouteID: 1, Start: []byte(""), End: routeStartA, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeStartA, End: routeEndA, GroupID: 1, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9},
+			{RouteID: 3, Start: routeEndA, End: routeStartB, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 4, Start: routeStartB, End: routeEndB, GroupID: 1, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 10},
+			{RouteID: 5, Start: routeEndB, End: nil, GroupID: 1, State: distribution.RouteStateActive},
 		},
 	}))
 	group := &ShardGroup{Store: store.NewMVCCStore()}
 	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             routeStart,
-		RouteEnd:               routeBoundary,
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-	})
 
-	kvs, err := st.ScanAt(ctx, start, end, 10, 130)
+	keyA := s3keys.BucketMetaKey(bucketA)
+	keyB := s3keys.BucketMetaKey(bucketB)
+	keyC := s3keys.BucketMetaKey(bucketC)
+	require.NoError(t, group.Store.PutAt(ctx, keyA, []byte("live-a"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, keyB, []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, keyC, []byte("live-c"), 10, 0))
+
+	exactA, err := st.ScanAt(ctx, keyA, prefixScanEnd(keyA), 10, 20)
 	require.NoError(t, err)
-	require.Empty(t, kvs)
+	require.Equal(t, []*store.KVPair{{Key: keyA, Value: []byte("live-a")}}, exactA)
+
+	all, err := st.ScanAt(ctx, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), 10, 20)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: keyA, Value: []byte("live-a")},
+		{Key: keyB, Value: []byte("live-b")},
+		{Key: keyC, Value: []byte("live-c")},
+	}, all)
+
+	reverseAll, err := st.ReverseScanAt(ctx, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), 10, 20)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: keyC, Value: []byte("live-c")},
+		{Key: keyB, Value: []byte("live-b")},
+		{Key: keyA, Value: []byte("live-a")},
+	}, reverseAll)
+}
+
+func TestShardStoreS3BucketAuxiliaryScanUsesPromotedOwner(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const (
+		migratedBucket = "bucket-a"
+		otherBucket    = "bucket-z"
+	)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes:  s3BucketAuxiliaryPromotedRoutes(),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	migratedKey := s3keys.BucketMetaKey(migratedBucket)
+	otherKey := s3keys.BucketMetaKey(otherBucket)
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, migratedKey, []byte("promoted-target"), 20, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, otherKey, []byte("raw-owner"), 15, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	end := prefixScanEnd(start)
+	kvs, err := st.ScanAt(ctx, start, end, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: migratedKey, Value: []byte("promoted-target")},
+		{Key: otherKey, Value: []byte("raw-owner")},
+	}, kvs)
+
+	reverse, err := st.ReverseScanAt(ctx, start, end, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: otherKey, Value: []byte("raw-owner")},
+		{Key: migratedKey, Value: []byte("promoted-target")},
+	}, reverse)
+}
+
+func TestShardStoreS3BucketAuxiliaryScanPreservesLegacyRawOnlyRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	for _, tc := range []struct {
+		name     string
+		prefix   string
+		keyFor   func(string) []byte
+		value    []byte
+		rawValue []byte
+	}{
+		{name: "bucket meta", prefix: s3keys.BucketMetaPrefix, keyFor: s3keys.BucketMetaKey, value: []byte("legacy-meta"), rawValue: []byte("raw-meta")},
+		{name: "bucket generation", prefix: s3keys.BucketGenerationPrefix, keyFor: s3keys.BucketGenerationKey, value: []byte("legacy-generation"), rawValue: []byte("raw-generation")},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const (
+				migratedBucket = "bucket-a"
+				otherBucket    = "bucket-z"
+			)
+			engine := distribution.NewEngine()
+			require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+				Version: 1,
+				Routes:  s3BucketAuxiliaryPromotedRoutes(),
+			}))
+			groups := map[uint64]*ShardGroup{
+				1: {Store: store.NewMVCCStore()},
+				2: {Store: store.NewMVCCStore()},
+			}
+			st := NewShardStore(engine, groups)
+			migratedKey := tc.keyFor(migratedBucket)
+			otherKey := tc.keyFor(otherBucket)
+			require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, tc.value, 10, 0))
+			require.NoError(t, groups[1].Store.PutAt(ctx, otherKey, tc.rawValue, 15, 0))
+
+			start := []byte(tc.prefix)
+			end := prefixScanEnd(start)
+			kvs, err := st.ScanAt(ctx, start, end, 10, 30)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{
+				{Key: migratedKey, Value: tc.value},
+				{Key: otherKey, Value: tc.rawValue},
+			}, kvs)
+
+			reverse, err := st.ReverseScanAt(ctx, start, end, 10, 30)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{
+				{Key: otherKey, Value: tc.rawValue},
+				{Key: migratedKey, Value: tc.value},
+			}, reverse)
+
+			exact, err := st.ScanAt(ctx, migratedKey, prefixScanEnd(migratedKey), 10, 30)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{{Key: migratedKey, Value: tc.value}}, exact)
+		})
+	}
+}
+
+func TestShardStoreRouteBoundedS3BucketAuxiliaryScanKeepsStagedRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeStart, End: routeEnd, GroupID: 1, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9},
+			{RouteID: 3, Start: routeEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	key := s3keys.BucketMetaKey(bucket)
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, key), []byte("staged"), 20, 0))
+
+	kvs, err := st.ScanAtWithReadFence(ctx, []byte(s3keys.BucketMetaPrefix), prefixScanEnd([]byte(s3keys.BucketMetaPrefix)), 10, 25, false, 0, 1, routeStart, routeEnd)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("staged")}}, kvs)
 }
 
 func TestShardStoreRejectsS3BucketAuxiliaryWriteAtMigrationTimestampFloor(t *testing.T) {
@@ -1044,176 +414,6 @@ func TestShardStoreRejectsS3BucketAuxiliaryWriteAtMigrationTimestampFloor(t *tes
 		require.ErrorIs(t, st.PutAt(ctx, key, []byte("v"), 100, 0), ErrRouteWriteTimestampTooLow)
 		require.ErrorIs(t, st.ApplyMutations(ctx, []*store.KVPairMutation{{Op: store.OpTypePut, Key: key, Value: []byte("v")}}, nil, 90, 100), ErrRouteWriteTimestampTooLow)
 	}
-}
-
-func TestShardStoreExplicitGroupS3ManifestScanUsesRouteProofForReadiness(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
-	end := prefixScanEnd(start)
-	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
-	require.True(t, ok)
-
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID:             1,
-			Start:               routeStart,
-			End:                 routeEnd,
-			GroupID:             42,
-			State:               distribution.RouteStateActive,
-			MinWriteTSExclusive: 100,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
-	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
-		JobID:                  9,
-		RouteStart:             routeStart,
-		RouteEnd:               routeEnd,
-		ExpectedCutoverVersion: 2,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    100,
-		Armed:                  true,
-	})
-
-	key := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-0")
-	require.NoError(t, group.Store.PutAt(ctx, key, []byte("manifest"), 120, 0))
-
-	kvs, err := st.ScanGroupAt(ctx, 42, start, end, 10, 130)
-	require.NoError(t, err)
-	require.Len(t, kvs, 1)
-	require.Equal(t, key, kvs[0].Key)
-}
-
-func TestShardStoreDeletePrefixAtChecksTargetReadinessBeforeDelete(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
-
-	err := st.DeletePrefixAt(ctx, []byte("b"), nil, 120)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-
-	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
-}
-
-func TestShardStoreDeletePrefixAtRaftChecksTargetReadinessBeforeDelete(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
-
-	err := st.DeletePrefixAtRaft(ctx, []byte("b"), nil, 120)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-
-	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
-}
-
-func TestShardStoreDeletePrefixAtRaftAtChecksTargetReadinessBeforeDelete(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
-		RouteID: 1,
-		Start:   []byte("a"),
-		End:     []byte("z"),
-		GroupID: 1,
-		State:   distribution.RouteStateActive,
-	})
-	applyTargetReadiness(t, group)
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
-
-	err := st.DeletePrefixAtRaftAt(ctx, []byte("b"), nil, 120, 10)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-
-	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
-}
-
-func TestShardStoreDeletePrefixAtFailsClosedWithoutRouteProof(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 2,
-		Routes: []distribution.RouteDescriptor{{
-			RouteID: 1,
-			Start:   []byte("m"),
-			End:     []byte("z"),
-			GroupID: 1,
-			State:   distribution.RouteStateActive,
-		}},
-	}))
-	group := &ShardGroup{Store: store.NewMVCCStore()}
-	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
-	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
-
-	err := st.DeletePrefixAt(ctx, []byte("b"), nil, 120)
-	require.ErrorIs(t, err, ErrRouteCutoverPending)
-
-	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
-	require.NoError(t, getErr)
-	require.Equal(t, []byte("v"), got)
-}
-
-func TestShardStoreDeletePrefixAtTombstonesStagedVisibilityRows(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newStagedVisibilityShardStore(t)
-	rawKey := []byte("b")
-	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
-	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))
-
-	require.NoError(t, st.DeletePrefixAt(ctx, rawKey, nil, 130))
-
-	_, err := st.GetAt(ctx, rawKey, 140)
-	require.ErrorIs(t, err, store.ErrKeyNotFound)
-	_, err = group.Store.GetAt(ctx, stagedKey, 140)
-	require.ErrorIs(t, err, store.ErrKeyNotFound)
-}
-
-func TestShardStoreDeletePrefixAtRaftAtAdvancesApplyIndexOnlyOnLiveDelete(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newStagedVisibilityShardStore(t)
-	recording := &deletePrefixIndexRecordingStore{MVCCStore: group.Store}
-	group.Store = recording
-	rawKey := []byte("b")
-	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
-	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))
-
-	require.NoError(t, st.DeletePrefixAtRaftAt(ctx, rawKey, nil, 130, 88))
-
-	require.Equal(t, []uint64{0, 88}, recording.deletePrefixIndexes)
-	require.Equal(t, stagedKey, recording.deletePrefixPrefixes[0])
-	require.Equal(t, rawKey, recording.deletePrefixPrefixes[1])
 }
 
 func TestShardStoreStagedVisibilityReadTSCompacted(t *testing.T) {
@@ -1315,23 +515,6 @@ func TestShardStoreScanAt_FiltersStagedShadowRowsFromLiveCandidates(t *testing.T
 	kvs, err := st.ScanAt(ctx, []byte(""), nil, 10, 30)
 	require.NoError(t, err)
 	require.Equal(t, []*store.KVPair{{Key: rawKey, Value: []byte("staged")}}, kvs)
-}
-
-func TestShardStoreStagedVisibilityPreservesCompactionErrors(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, group := newStagedVisibilityShardStore(t)
-	retention, ok := group.Store.(store.RetentionController)
-	require.True(t, ok)
-	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged"), 10, 0))
-	retention.SetMinRetainedTS(20)
-
-	_, err := st.GetAt(ctx, []byte("b"), 15)
-	require.ErrorIs(t, err, store.ErrReadTSCompacted)
-
-	_, err = st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 15)
-	require.ErrorIs(t, err, store.ErrReadTSCompacted)
 }
 
 func TestShardStoreScanAt_PreservesNonStagedRoutesDuringBroadStagedVisibilityScan(t *testing.T) {
@@ -1470,6 +653,212 @@ func TestShardStoreS3BucketAuxiliaryScanHonorsStagedTombstone(t *testing.T) {
 	require.Empty(t, kvs)
 }
 
+type versionVisibleRawKVServer struct {
+	pb.UnimplementedRawKVServer
+
+	mu         sync.Mutex
+	visible    map[string]bool
+	latestReqs []*pb.RawLatestCommitTSRequest
+}
+
+func (s *versionVisibleRawKVServer) RawGet(context.Context, *pb.RawGetRequest) (*pb.RawGetResponse, error) {
+	return &pb.RawGetResponse{}, nil
+}
+
+func (s *versionVisibleRawKVServer) RawScanAt(context.Context, *pb.RawScanAtRequest) (*pb.RawScanAtResponse, error) {
+	return &pb.RawScanAtResponse{}, nil
+}
+
+func (s *versionVisibleRawKVServer) RawLatestCommitTS(_ context.Context, req *pb.RawLatestCommitTSRequest) (*pb.RawLatestCommitTSResponse, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.latestReqs = append(s.latestReqs, &pb.RawLatestCommitTSRequest{
+		Key:                bytes.Clone(req.GetKey()),
+		KeyBatch:           bytes.Clone(req.GetKeyBatch()),
+		GroupId:            req.GetGroupId(),
+		ReadRouteVersion:   req.GetReadRouteVersion(),
+		VersionVisibleAtTs: req.GetVersionVisibleAtTs(),
+	})
+	keys, err := pb.DecodeRawLatestCommitTSKeyBatch(req.GetKeyBatch(), store.MaxDeltaScanLimit+1)
+	if err != nil {
+		return nil, err
+	}
+	if len(keys) > 0 {
+		results := make([]bool, len(keys))
+		for i, key := range keys {
+			results[i] = s.visible[string(key)]
+		}
+		return &pb.RawLatestCommitTSResponse{
+			VersionVisibleResults:   results,
+			VersionVisibleSupported: true,
+		}, nil
+	}
+	return &pb.RawLatestCommitTSResponse{
+		VersionVisible:          s.visible[string(req.GetKey())],
+		VersionVisibleSupported: true,
+	}, nil
+}
+
+func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	migratedKey := s3keys.BucketMetaKey(bucket)
+	stagedKey := distribution.MigrationStagedDataKey(9, migratedKey)
+	probe := &versionVisibleRawKVServer{
+		visible: map[string]bool{string(stagedKey): true},
+	}
+	addr, stop := startRawKVServer(t, probe)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {
+			Store:  store.NewMVCCStore(),
+			Engine: &followerProxyEngine{leader: addr},
+		},
+	}
+	st := NewShardStore(engine, groups)
+	visibleKey := s3keys.BucketMetaKey("bucket-z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, visibleKey, []byte("visible"), 10, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	kvs, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 0, 77, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: visibleKey, Value: []byte("visible")}}, kvs)
+
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	// Staged is probed first, and a staged hit answers the question, so the
+	// live probe is never issued. Probing live first would have to fall
+	// through to staged anyway, and that pair is what a concurrent promotion
+	// slips between.
+	require.Len(t, probe.latestReqs, 1)
+	keys, err := pb.DecodeRawLatestCommitTSKeyBatch(probe.latestReqs[0].GetKeyBatch(), store.MaxDeltaScanLimit+1)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{stagedKey}, keys)
+	for _, req := range probe.latestReqs {
+		require.Equal(t, uint64(2), req.GetGroupId())
+		require.Equal(t, uint64(77), req.GetReadRouteVersion())
+		require.Equal(t, uint64(30), req.GetVersionVisibleAtTs())
+	}
+}
+
+func TestShardStoreS3BucketAuxiliaryOwnerProbeBatchesFollowerChecks(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	keys := [][]byte{
+		s3keys.BucketMetaKey("bucket-a"),
+		s3keys.BucketMetaKey("bucket-b"),
+		s3keys.BucketMetaKey("bucket-c"),
+	}
+	probe := &versionVisibleRawKVServer{visible: map[string]bool{}}
+	for _, key := range keys {
+		probe.visible[string(distribution.MigrationStagedDataKey(9, key))] = true
+	}
+	addr, stop := startRawKVServer(t, probe)
+	t.Cleanup(stop)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: []byte(s3keys.RoutePrefix), GroupID: 1, State: distribution.RouteStateActive},
+			{
+				RouteID: 2, Start: []byte(s3keys.RoutePrefix), End: prefixScanEnd([]byte(s3keys.RoutePrefix)),
+				GroupID: 2, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9,
+			},
+			{RouteID: 3, Start: prefixScanEnd([]byte(s3keys.RoutePrefix)), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore(), Engine: &followerProxyEngine{leader: addr}},
+	}
+	st := NewShardStore(engine, groups)
+	for _, key := range keys {
+		require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("stale-source"), 10, 0))
+	}
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	kvs, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 0, 77, nil, nil)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+
+	probe.mu.Lock()
+	defer probe.mu.Unlock()
+	require.Len(t, probe.latestReqs, 1)
+	require.Equal(t, uint64(2), probe.latestReqs[0].GetGroupId())
+	require.Equal(t, uint64(77), probe.latestReqs[0].GetReadRouteVersion())
+	require.Equal(t, uint64(30), probe.latestReqs[0].GetVersionVisibleAtTs())
+	decodedKeys, err := pb.DecodeRawLatestCommitTSKeyBatch(probe.latestReqs[0].GetKeyBatch(), store.MaxDeltaScanLimit+1)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{
+		distribution.MigrationStagedDataKey(9, keys[0]),
+		distribution.MigrationStagedDataKey(9, keys[1]),
+		distribution.MigrationStagedDataKey(9, keys[2]),
+	}, decodedKeys)
+}
+
+func TestShardStoreS3BucketAuxiliaryOwnerProbeFailsWhenLeaderUnavailable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	migratedKey := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {
+			Store:  store.NewMVCCStore(),
+			Engine: &followerProxyEngine{},
+		},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	_, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 0, 77, nil, nil)
+	require.ErrorIs(t, err, ErrLeaderNotFound)
+}
+
+func TestShardStoreExplicitGroupS3BucketAuxiliaryScanKeepsOwnerRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	migratedKey := s3keys.BucketMetaKey(bucket)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 77,
+		Routes:  s3BucketAuxiliaryStagedRoutes(bucket, 1, 2),
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, migratedKey, []byte("stale-source"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, migratedKey), []byte("owner"), 20, 0))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	kvs, err := st.ScanAtWithReadFence(ctx, start, prefixScanEnd(start), 10, 30, false, 1, 77, nil, nil)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+}
+
 func TestShardStoreGetAt_ContinuesLatestVersionExportPages(t *testing.T) {
 	t.Parallel()
 
@@ -1557,6 +946,31 @@ func TestShardStoreExplicitGroupReads_MergeStagedVisibility(t *testing.T) {
 		{Key: []byte("b"), Value: []byte("staged-b")},
 		{Key: []byte("c"), Value: []byte("staged-c")},
 	}, kvs)
+
+	keys, err := st.ScanKeysAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 35, 1, 0)
+	require.NoError(t, err)
+	require.Equal(t, [][]byte{[]byte("b"), []byte("c")}, keys)
+
+	kvs, err = st.ReverseScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 35)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("c"), Value: []byte("staged-c")},
+		{Key: []byte("b"), Value: []byte("staged-b")},
+	}, kvs)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 35, false, 1, 0, []byte("a"), []byte("z"))
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b"), Value: []byte("staged-b")},
+		{Key: []byte("c"), Value: []byte("staged-c")},
+	}, kvs)
+
+	kvs, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 35, true, 1, 0, nil, nil)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("c"), Value: []byte("staged-c")},
+		{Key: []byte("b"), Value: []byte("staged-b")},
+	}, kvs)
 }
 
 func TestShardStoreExplicitGroupReads_FailClosedWhenRouteMovedToStagedGroup(t *testing.T) {
@@ -1633,12 +1047,14 @@ func TestShardStoreExplicitGroupRead_IgnoresUnrelatedStagedRoutes(t *testing.T) 
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
 		Version: 1,
 		Routes: []distribution.RouteDescriptor{
-			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+			// The read's own range is owned by the group it names, so the
+			// staged route below is genuinely unrelated to it.
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
 			{
 				RouteID:                2,
 				Start:                  []byte("m"),
 				End:                    []byte("z"),
-				GroupID:                1,
+				GroupID:                2,
 				State:                  distribution.RouteStateActive,
 				StagedVisibilityActive: true,
 				MigrationJobID:         9,
@@ -1811,22 +1227,6 @@ func TestShardStoreRejectsWritesAtMigrationTimestampFloor(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0))
 }
 
-func TestShardStoreRaftApplySkipsPointMigrationTimestampFloorButGuardsPrefixDeletes(t *testing.T) {
-	t.Parallel()
-
-	ctx := context.Background()
-	st, _ := newStagedVisibilityShardStore(t)
-
-	require.NoError(t, st.ApplyMutationsRaft(ctx, []*store.KVPairMutation{
-		{Op: store.OpTypePut, Key: []byte("k-raft"), Value: []byte("v")},
-	}, nil, 90, 100))
-	require.NoError(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
-		{Op: store.OpTypePut, Key: []byte("k-raft-at"), Value: []byte("v")},
-	}, nil, 90, 100, 1))
-	require.ErrorIs(t, st.DeletePrefixAtRaft(ctx, []byte("k-raft"), nil, 100), ErrRouteWriteTimestampTooLow)
-	require.ErrorIs(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2), ErrRouteWriteTimestampTooLow)
-}
-
 type followerProxyEngine struct {
 	leader string
 }
@@ -1943,7 +1343,7 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 		legacyRouting bool
 	}{
 		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
-		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
+		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1961,6 +1361,26 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 			require.Equal(t, tc.key, kvs[0].Key)
 		})
 	}
+}
+
+func TestShardStoreScanAt_BroadLegacyListDeltaScansAllRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTwoRouteShardStoreForScanTest()
+	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+	leftKey := legacyListMetaDeltaKey([]byte("left-list"), 10)
+	rightKey := legacyListMetaDeltaKey([]byte("right-list"), 11)
+	require.NoError(t, st.groups[1].Store.PutAt(ctx, leftKey, deltaValue, 1, 0))
+	require.NoError(t, st.groups[2].Store.PutAt(ctx, rightKey, deltaValue, 1, 0))
+
+	kvs, err := st.ScanAt(ctx, []byte(store.LegacyListMetaDeltaPrefix), store.PrefixScanEnd([]byte(store.LegacyListMetaDeltaPrefix)), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.Equal(t, leftKey, kvs[0].Key)
+	require.Equal(t, uint64(1), kvs[0].RouteGroupID)
+	require.Equal(t, rightKey, kvs[1].Key)
+	require.Equal(t, uint64(2), kvs[1].RouteGroupID)
 }
 
 func TestShardStoreScanAt_RoutesWideColumnScansByUserKey(t *testing.T) {
@@ -2035,6 +1455,34 @@ func TestShardStoreScanGroupAt_DoesNotClampRouteMappedRawBounds(t *testing.T) {
 	ctx := context.Background()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 42)
+	groups := map[uint64]*ShardGroup{
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	start := []byte("!sqs|msg|vis|p|")
+	key := []byte("!sqs|msg|vis|p|orders|partition-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("msg-2"), 7, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, start, prefixScanEnd(start), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("msg-2")}}, kvs)
+}
+
+func TestShardStoreScanGroupAt_DeduplicatesRouteMappedSameGroupSplits(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	routeEnd := prefixScanEnd(sqsGlobalRouteKey)
+	split := append(bytes.Clone(sqsGlobalRouteKey), 'm')
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: sqsGlobalRouteKey, End: split, GroupID: 42, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: split, End: routeEnd, GroupID: 42, State: distribution.RouteStateActive},
+		},
+	}))
 	groups := map[uint64]*ShardGroup{
 		42: {Store: store.NewMVCCStore()},
 	}
@@ -2190,8 +1638,9 @@ func TestShardStoreRoutesForScanUsesWideColumnUserKey(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			routes, clamp := st.routesForScan(tc.prefix, prefixScanEnd(tc.prefix))
 			require.False(t, clamp)
-			require.Len(t, routes, 1)
+			require.Len(t, routes, 2)
 			require.Equal(t, uint64(2), routes[0].GroupID)
+			require.Equal(t, uint64(1), routes[1].GroupID)
 		})
 	}
 }
@@ -2523,10 +1972,13 @@ func TestShardStoreScanAtWithReadFence_AllowsExplicitGroupRouteBoundReverse(t *t
 	require.NoError(t, groups[1].Store.PutAt(ctx, left, []byte("left"), 1, 0))
 	require.NoError(t, groups[1].Store.PutAt(ctx, right, []byte("right"), 2, 0))
 
-	_, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), nil, nil)
-	require.ErrorIs(t, err, store.ErrNotSupported)
+	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), 1, 2, true, 1, st.ReadRouteVersion(), nil, nil)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, right, kvs[0].Key)
+	require.Equal(t, []byte("right"), kvs[0].Value)
 
-	kvs, err := st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, st.ReadRouteVersion(), []byte("m"), nil)
+	kvs, err = st.ScanAtWithReadFence(ctx, rawPrefix, prefixScanEnd(rawPrefix), -1, 2, true, 1, st.ReadRouteVersion(), []byte("m"), nil)
 	require.NoError(t, err)
 	require.Empty(t, kvs)
 
@@ -2797,7 +2249,7 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterTxnInternalKeys(t *testing.T
 	require.NoError(t, g.Store.PutAt(ctx, txnCommitKey([]byte("primary"), 10), []byte("commit"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
@@ -2814,7 +2266,7 @@ func TestShardStoreScanKeysRouteAtLeaderRefillsAfterStagedControlKeys(t *testing
 	require.NoError(t, g.Store.PutAt(ctx, stagedKey, []byte("internal"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("visible"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, []byte(""), nil, 1, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte("a")}, keys)
 }
@@ -2829,7 +2281,7 @@ func TestShardStoreScanKeysRouteAtLeaderPreservesEmptyKey(t *testing.T) {
 	require.NoError(t, g.Store.PutAt(ctx, []byte(""), []byte("empty"), 1, 0))
 	require.NoError(t, g.Store.PutAt(ctx, []byte("a"), []byte("va"), 2, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, nil, nil, 2, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, distribution.Route{GroupID: 1}, nil, nil, 2, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{[]byte(""), []byte("a")}, keys)
 }
@@ -2848,7 +2300,7 @@ func TestShardStoreScanKeysRouteAtLeaderIncludesStagedOnlyKeys(t *testing.T) {
 	key := []byte("staged-key")
 	require.NoError(t, g.Store.PutAt(ctx, distribution.MigrationStagedDataKey(route.MigrationJobID, key), []byte("value"), 1, 0))
 
-	keys, err := st.scanKeysRouteAtLeader(ctx, g, route, []byte(""), nil, 10, ^uint64(0))
+	keys, err := st.scanKeysRouteAtLeader(ctx, g, route, []byte(""), nil, 10, ^uint64(0), 0)
 	require.NoError(t, err)
 	require.Equal(t, [][]byte{key}, keys)
 }
@@ -3527,11 +2979,20 @@ func TestShardStoreResolveFilesystemHomeSlot(t *testing.T) {
 func TestShardStoreFilesystemGroupIDsReturnsPhysicalGroupsSorted(t *testing.T) {
 	t.Parallel()
 
-	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
-		9: {},
-		2: {},
-		5: {},
+	// Real physical groups own a store; FilesystemGroupIDs skips store-less
+	// ones (the dedicated TSO group is registered without one), so the
+	// placeholder groups this test used need stores to stay physical.
+	groups := map[uint64]*ShardGroup{
+		9: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+		5: {Store: store.NewMVCCStore()},
+	}
+	t.Cleanup(func() {
+		for _, g := range groups {
+			_ = g.Store.Close()
+		}
 	})
+	st := NewShardStore(distribution.NewEngine(), groups)
 	require.Equal(t, []uint64{2, 5, 9}, st.FilesystemGroupIDs())
 }
 
@@ -4273,3 +3734,1992 @@ func TestScanLockBoundsForKVs_ReverseInternalOnlyPageUsesOriginalRange(t *testin
 	require.Equal(t, []byte(""), lockStart)
 	require.Equal(t, []byte("z"), lockEnd)
 }
+
+// Reverse-scan counterpart of TestShardStoreS3BucketAuxiliaryScanHonorsStagedTombstone.
+// A staged tombstone must hide the stale live row from the old raw route in both
+// scan directions, not just forward.
+func TestShardStoreS3BucketAuxiliaryReverseScanHonorsStagedTombstone(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const migratedBucket = "bucket-a"
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(migratedBucket)
+	routeEnd := prefixScanEnd(routeStart)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: routeStart, GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: routeStart, End: routeEnd, GroupID: 2, State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9},
+			{RouteID: 3, Start: routeEnd, End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	deletedKey := s3keys.BucketMetaKey(migratedBucket)
+	visibleKey := s3keys.BucketMetaKey("bucket-z")
+	require.NoError(t, groups[1].Store.PutAt(ctx, deletedKey, []byte("stale"), 10, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, visibleKey, []byte("visible"), 10, 0))
+	require.NoError(t, groups[2].Store.DeleteAt(ctx, distribution.MigrationStagedDataKey(9, deletedKey), 20))
+
+	start := []byte(s3keys.BucketMetaPrefix)
+	end := prefixScanEnd(start)
+
+	// Reverse over the whole family: the tombstoned bucket must not appear.
+	kvs, err := st.ReverseScanAt(ctx, start, end, 10, 30)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: visibleKey, Value: []byte("visible")}}, kvs)
+
+	// Reverse scoped to the tombstoned bucket alone.
+	kvs, err = st.ReverseScanAt(ctx, deletedKey, prefixScanEnd(deletedKey), 10, 30)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+}
+
+// An exact per-user-key legacy delta scan must carry RouteGroupID too. Redis
+// cleanup and compaction build their deletes as {Del, pair.Key, GroupID:
+// pair.RouteGroupID}; a zero GroupID routes the delete by the raw
+// "!lst|meta|d|..." key instead of the logical list key, so after a split it
+// lands on the wrong shard and the stale delta survives.
+func TestShardStoreScanAt_ExactLegacyListDeltaScanMarksRouteGroup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newTwoRouteShardStoreForScanTest()
+	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
+
+	// "right-list" sorts into the second route's group.
+	userKey := []byte("right-list")
+	key := legacyListMetaDeltaKey(userKey, 11)
+	require.NoError(t, st.groups[2].Store.PutAt(ctx, key, deltaValue, 1, 0))
+
+	scanStart := store.LegacyListMetaDeltaScanPrefix(userKey)
+	require.False(t, isBroadLegacyListDeltaScan(scanStart),
+		"this test is only meaningful for the exact-scan shape")
+
+	kvs, err := st.ScanAt(ctx, scanStart, store.PrefixScanEnd(scanStart), 10, ^uint64(0))
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, key, kvs[0].Key)
+	require.Equal(t, uint64(2), kvs[0].RouteGroupID,
+		"an exact legacy delta scan must still report the owning route group")
+}
+
+// A coordinator that has not yet applied a promotion keeps forwarding the
+// pre-cutover source group. Once StagedVisibilityActive is cleared the source's
+// former range belongs to the target, and the staged-visibility rejection stops
+// covering the request -- exactly while the source's pre-cutover MVCC is still
+// sitting there waiting for cleanup. Serving that is a stale read, so the
+// mismatch must fail closed instead.
+func TestShardStoreExplicitGroupRead_FailsClosedAfterPromotionClearsStaging(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			// Promotion completed: the range now belongs to group 2 and the
+			// staged-visibility flag is gone.
+			{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("b"), []byte("pre-cutover"), 10, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("b"), []byte("post-cutover"), 20, 0))
+
+	_, err := st.GetGroupAt(ctx, 1, []byte("b"), 25)
+	require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
+
+	_, err = st.ScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 25)
+	require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
+
+	_, err = st.ScanAtWithReadFence(ctx, []byte("a"), []byte("z"), 10, 25, false, 1, 0, []byte("a"), []byte("z"))
+	require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
+
+	// The group the catalog does name still serves the post-cutover value.
+	got, err := st.GetGroupAt(ctx, 2, []byte("b"), 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("post-cutover"), got)
+}
+
+// SQS resolves its owning group through the (queue, partition) resolver rather
+// than the byte-range catalog, so a catalog route naming another group must not
+// reject those reads.
+func TestShardStoreExplicitGroupRead_AllowsResolverOwnedKeysOnMismatch(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1:  {Store: store.NewMVCCStore()},
+		42: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	key := []byte("!sqs|msg|data|p|orders|partition-2|msg-2")
+	require.NoError(t, groups[42].Store.PutAt(ctx, key, []byte("payload"), 7, 0))
+
+	got, err := st.GetGroupAt(ctx, 42, key, 7)
+	require.NoError(t, err)
+	require.Equal(t, []byte("payload"), got)
+
+	start := []byte("!sqs|msg|data|p|orders|partition-2|")
+	kvs, err := st.ScanGroupAt(ctx, 42, start, prefixScanEnd(start), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("payload")}}, kvs)
+}
+
+// Filesystem placement stats scan the whole chunk keyspace once per filesystem
+// group, so most of those groups are not the catalog owner of the range. The
+// explicit-group gate must let them through the way it lets SQS through.
+func TestShardStoreExplicitGroupScan_AllowsFilesystemChunkKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+
+	chunkKey := fskeys.ChunkKey(3, 7, 0)
+	require.NoError(t, groups[2].Store.PutAt(ctx, chunkKey, []byte("chunk"), 7, 0))
+
+	start := fskeys.ChunkAllPrefix()
+	kvs, err := st.ScanGroupAt(ctx, 2, start, prefixScanEnd(start), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: chunkKey, Value: []byte("chunk")}}, kvs)
+}
+
+// Between cutover and promotion a key can be visible through its staged alias
+// while the live key holds nothing. Both store implementations read the live key
+// first and return ErrKeyNotFound when it is absent, so an expiration issued in
+// that window failed for a value the same route serves happily through GetAt.
+func TestExpireAtAppliesToStagedOnlyValues(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+
+	key := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx,
+		distribution.MigrationStagedDataKey(9, key), []byte("staged-b"), 20, 0))
+
+	// The value is visible even though the live key has nothing.
+	got, err := st.GetAt(ctx, key, 25)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), got)
+
+	// The expiry is in the future relative to the commit timestamp, so the value
+	// survives; the point is that ExpireAt no longer fails outright.
+	require.NoError(t, st.ExpireAt(ctx, key, 5_000, 300))
+
+	got, err = st.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), got)
+
+	// The expiration was recorded as a live MVCC version, which is where every
+	// other post-cutover write goes.
+	live, err := group.Store.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), live)
+
+	// And it takes effect once the read passes the expiry.
+	_, err = st.GetAt(ctx, key, 6_000)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestExpireAtUsesNewerStagedValueOverLiveValue(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+
+	key := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx,
+		distribution.MigrationStagedDataKey(9, key), []byte("staged-b"), 20, 0))
+
+	require.NoError(t, st.ExpireAt(ctx, key, 5_000, 300))
+
+	got, err := st.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), got)
+
+	live, err := group.Store.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-b"), live)
+}
+
+func TestExpireAtHonorsNewerStagedTombstone(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+
+	key := []byte("b")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.DeleteAt(ctx, distribution.MigrationStagedDataKey(9, key), 20))
+
+	require.ErrorIs(t, st.ExpireAt(ctx, key, 5_000, 300), store.ErrKeyNotFound)
+
+	_, err := st.GetAt(ctx, key, 300)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	live, err := group.Store.GetAt(ctx, key, 300)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live-b"), live)
+}
+
+// A key with nothing on either side still reports ErrKeyNotFound.
+func TestExpireAtStillFailsWhenNothingIsVisible(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, _ := newStagedVisibilityShardStore(t)
+
+	require.ErrorIs(t, st.ExpireAt(ctx, []byte("absent"), 40, 300), store.ErrKeyNotFound)
+}
+
+// promotingExportStore runs a hook after the first ExportVersions call, which
+// is how a promotion batch is landed exactly between the two probes
+// getAtWithStagedVisibility makes.
+type promotingExportStore struct {
+	store.MVCCStore
+	afterFirst func()
+	calls      int
+}
+
+func (s *promotingExportStore) ExportVersions(
+	ctx context.Context,
+	opts store.ExportVersionsOptions,
+) (store.ExportVersionsResult, error) {
+	res, err := s.MVCCStore.ExportVersions(ctx, opts)
+	s.fireAfterFirst()
+	return res, err
+}
+
+// ScanAt fires the promotion when the *live* range is scanned. That is the
+// only interleaving that distinguishes the two orderings: live-first means the
+// live scan misses the key and the staged scan that follows misses it too,
+// while staged-first has already captured it before promotion runs.
+func (s *promotingExportStore) ScanAt(
+	ctx context.Context,
+	start, end []byte,
+	limit int,
+	ts uint64,
+) ([]*store.KVPair, error) {
+	kvs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	if !isMigrationStagedDataKey(start) && s.afterFirst != nil {
+		s.fireAfterFirst()
+	}
+	return kvs, err
+}
+
+// LatestCommitTS fires the promotion on the live-key probe, which is the
+// interleaving that separates the two orderings for the watermark reads.
+func (s *promotingExportStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bool, error) {
+	ts, exists, err := s.MVCCStore.LatestCommitTS(ctx, key)
+	if !isMigrationStagedDataKey(key) && s.afterFirst != nil {
+		s.fireAfterFirst()
+	}
+	return ts, exists, err
+}
+
+func (s *promotingExportStore) fireAfterFirst() {
+	s.calls++
+	if s.calls == 1 && s.afterFirst != nil {
+		s.afterFirst()
+	}
+}
+
+// A promotion batch landing between the staged and live probes must not make a
+// key disappear. Promotion writes the live version and drops the staged alias,
+// so a live-then-staged order misses both sides of a staged-only key: live has
+// not been written yet at the first probe, and the alias is gone by the second.
+func TestShardStoreGetAt_StagedVisibilitySurvivesPromotionBetweenProbes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 1,
+			State: distribution.RouteStateActive, StagedVisibilityActive: true,
+			MigrationJobID: 9, MinWriteTSExclusive: 100,
+		}},
+	}))
+
+	inner := store.NewMVCCStore()
+	t.Cleanup(func() { _ = inner.Close() })
+	rawKey := []byte("k")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, inner.PutAt(ctx, stagedKey, []byte("staged-only"), 20, 0))
+
+	promoting := &promotingExportStore{MVCCStore: inner}
+	promoting.afterFirst = func() {
+		// The promotion batch: the row becomes live at its original commit ts
+		// and the staged alias goes away.
+		require.NoError(t, inner.PutAt(ctx, rawKey, []byte("staged-only"), 20, 0))
+		require.NoError(t, inner.DeleteAt(ctx, stagedKey, 21))
+	}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: promoting}})
+
+	got, err := st.GetAt(ctx, rawKey, 25)
+	require.NoError(t, err, "a promotion between the probes must not hide the key")
+	require.Equal(t, []byte("staged-only"), got)
+}
+
+// Every place that reads the live and staged namespaces as two separate store
+// calls has to read staged first, for the reason getAtWithStagedVisibility
+// documents. Fixing only the point read left the scan, the TTL winner, and the
+// watermark on the old order, each with its own way of losing the key.
+func TestStagedVisibilityProbesReadStagedFirst(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 1,
+			State: distribution.RouteStateActive, StagedVisibilityActive: true,
+			MigrationJobID: 9, MinWriteTSExclusive: 100,
+		}},
+	}))
+
+	rawKey := []byte("k")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+
+	newStore := func(t *testing.T) (*ShardStore, *promotingExportStore, store.MVCCStore) {
+		t.Helper()
+		inner := store.NewMVCCStore()
+		t.Cleanup(func() { _ = inner.Close() })
+		require.NoError(t, inner.PutAt(ctx, stagedKey, []byte("staged-only"), 20, 0))
+		promoting := &promotingExportStore{MVCCStore: inner}
+		promoting.afterFirst = func() {
+			// The real promotion batch: PromoteVersions moves the staged row to
+			// its live key and removes the staged version physically. Modelling
+			// it with a Delete would write a tombstone that legitimately hides
+			// the key, which is a different scenario.
+			promoter, ok := inner.(store.MigrationPromoter)
+			require.True(t, ok)
+			_, err := promoter.PromoteVersions(ctx, store.PromoteVersionsOptions{
+				JobID:       9,
+				StartKey:    distribution.MigrationStagedDataKeyPrefix(9),
+				EndKey:      prefixScanEnd(distribution.MigrationStagedDataKeyPrefix(9)),
+				MaxVersions: 16,
+				TargetKey: func(staged []byte) ([]byte, bool) {
+					_, raw, ok := distribution.MigrationStagedDataKeyParts(staged)
+					return raw, ok
+				},
+			})
+			require.NoError(t, err)
+		}
+		return NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: promoting}}), promoting, inner
+	}
+
+	t.Run("scan", func(t *testing.T) {
+		t.Parallel()
+		st, _, _ := newStore(t)
+		kvs, err := st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 25)
+		require.NoError(t, err)
+		require.Len(t, kvs, 1, "a promotion between the scans must not drop the key")
+		require.Equal(t, rawKey, kvs[0].Key)
+	})
+
+	t.Run("point read", func(t *testing.T) {
+		t.Parallel()
+		st, _, _ := newStore(t)
+		got, err := st.GetAt(ctx, rawKey, 25)
+		require.NoError(t, err)
+		require.Equal(t, []byte("staged-only"), got)
+	})
+}
+
+func TestShardStoreReadFenceGroupKeysForRangeIncludesIntersectingRoutes(t *testing.T) {
+	t.Parallel()
+
+	userKey := []byte("hash:fence-routes")
+	prefix := store.HashFieldScanPrefix(userKey)
+	split := append(append([]byte(nil), prefix...), 'm')
+
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), split, 1)
+	engine.UpdateRoute(split, nil, 2)
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {},
+		2: {},
+	})
+
+	got := st.ReadFenceGroupKeysForRange(prefix, store.PrefixScanEnd(prefix))
+
+	// The contract is one representative key per intersecting group, and every
+	// consumer leases them all. Enumeration order is not part of it -- under
+	// wide-column user-key routing the raw range order no longer holds -- so
+	// the set is what this pins.
+	require.ElementsMatch(t, [][]byte{prefix, split}, got)
+}
+
+func TestShardStoreLocalStoresUsesStableGroupOrder(t *testing.T) {
+	t.Parallel()
+
+	first := store.NewMVCCStore()
+	second := store.NewMVCCStore()
+	shards := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		20: {Store: second},
+		10: {Store: first},
+		30: nil,
+	})
+
+	require.Equal(t, []store.MVCCStore{first, second}, shards.LocalStores())
+}
+
+func TestFilesystemGroupIDsSkipsStorelessGroups(t *testing.T) {
+	t.Parallel()
+
+	st := NewShardStore(distribution.NewEngine(), map[uint64]*ShardGroup{
+		0: {},                            // dedicated TSO group: no Store
+		1: {Store: store.NewMVCCStore()}, // data group
+		2: nil,                           // defensive: nil group
+	})
+
+	require.Equal(t, []uint64{1}, st.FilesystemGroupIDs())
+
+	// Scanning a store-less group is a no-op rather than an error, so
+	// enumerating it never broke collection -- it just cost one pointless scan
+	// per group per collection. Pinned here so the rationale is not overstated.
+	page, err := st.ScanGroupAt(context.Background(), 0, []byte("a"), []byte("b"), 10, 1)
+	require.NoError(t, err)
+	require.Empty(t, page)
+}
+
+func (e *followerProxyEngine) SnapshotEvery() uint64 { return 0 }
+
+func TestBackupKeyScannerPaging(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	commitTS := uint64(1)
+	for _, key := range [][]byte{[]byte("a"), []byte("b"), []byte("x"), []byte("z")} {
+		require.NoError(t, st.PutAt(ctx, key, []byte("value-not-materialized"), commitTS, 0))
+		commitTS++
+	}
+
+	sc := st.NewBackupKeyScanner([]byte(""), nil, ^uint64(0), 2)
+	defer sc.Close()
+	var got [][]byte
+	for {
+		key, ok, err := sc.Next(ctx)
+		require.NoError(t, err)
+		if !ok {
+			break
+		}
+		got = append(got, key)
+	}
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b"), []byte("x"), []byte("z")}, got)
+}
+
+func TestBackupKeyScannerFiltersStaleOffRouteKeys(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	groups := map[uint64]*ShardGroup{1: {Store: store.NewMVCCStore()}}
+	st := NewShardStore(distribution.NewEngine(), groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("stale"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("x"), []byte("owned"), 2, 0))
+	scanner := &backupKeyScanner{
+		store: st, routes: []distribution.Route{{Start: []byte("m"), GroupID: 1}},
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer scanner.Close()
+
+	key, ok, err := scanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("x"), key)
+	_, ok, err = scanner.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+}
+
+func TestBackupScannerReusesCapturedRouteSnapshot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(engine, groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("pinned-owner"), 1, 0))
+	snapshot := st.CaptureBackupRouteSnapshot(nil, nil)
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("a"), []byte("live-owner"), 2, 0))
+
+	scanner := st.NewBackupScannerAtSnapshot(snapshot, ^uint64(0), 1)
+	defer scanner.Close()
+	pair, ok, err := scanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("pinned-owner"), pair.Value)
+}
+
+func TestCaptureBackupRouteSnapshotAtUsesDurableCatalogTimestamp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	catalog := distribution.NewCatalogStore(groups[1].Store)
+	old, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.ApplySnapshot(old))
+	oldReadTS := groups[1].Store.LastCommitTS()
+	current, err := catalog.Save(ctx, old.Version, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+	require.NoError(t, engine.ApplySnapshot(current))
+
+	snapshot, err := CaptureBackupRouteSnapshotAt(ctx, catalog, oldReadTS)
+	require.NoError(t, err)
+	require.Len(t, snapshot.routes, 2)
+	require.Equal(t, uint64(1), snapshot.routes[0].GroupID)
+	require.Equal(t, uint64(2), snapshot.routes[1].GroupID)
+}
+
+func TestCaptureBackupRouteSnapshotAtReadsRowsFromCatalogOwner(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	owner := store.NewMVCCStore()
+	wronglyRouted := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(owner)
+	saved, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2, State: distribution.RouteStateActive},
+	})
+	require.NoError(t, err)
+
+	// A live shard router could send the reserved route-row prefix to group 2.
+	// The backup reader must stay on the durable catalog owner instead.
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 2)
+	_ = NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: owner},
+		2: {Store: wronglyRouted},
+	})
+
+	snapshot, err := CaptureBackupRouteSnapshotAt(ctx, catalog, owner.LastCommitTS())
+	require.NoError(t, err)
+	require.Len(t, snapshot.routes, len(saved.Routes))
+	require.Equal(t, uint64(1), snapshot.routes[0].GroupID)
+	require.Equal(t, uint64(2), snapshot.routes[1].GroupID)
+}
+
+func TestValidateBackupSnapshotAtRejectsPreparedInsert(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		st, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+	primary := []byte("insert-only")
+	prepare := &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 30, Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+			PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+		})},
+		{Op: pb.Op_PUT, Key: primary, Value: []byte("pending")},
+	}}
+	require.Nil(t, applyBackupTestRequest(t, fsm, prepare))
+
+	engine := distribution.NewEngineWithDefaultRoute()
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: st}})
+	snapshot := shards.CaptureBackupRouteSnapshot(nil, nil)
+	err := shards.ValidateBackupSnapshotAt(ctx, snapshot, 50, 16)
+	require.ErrorIs(t, err, ErrTxnLocked)
+}
+
+func TestValidateBackupSnapshotAtRejectsPostCutTxnDecision(t *testing.T) {
+	ctx := context.Background()
+	tests := []struct {
+		name  string
+		phase pb.Phase
+	}{
+		{name: "commit", phase: pb.Phase_COMMIT},
+		{name: "rollback", phase: pb.Phase_ABORT},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewMVCCStore()
+			fsm, ok := NewKvFSMWithHLCAndTracker(
+				st, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+			).(*kvFSM)
+			require.True(t, ok)
+			primary := []byte("post-cut-" + tc.name)
+			prepare := &pb.Request{IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 30, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+				})},
+				{Op: pb.Op_PUT, Key: primary, Value: []byte("pending")},
+			}}
+			require.Nil(t, applyBackupTestRequest(t, fsm, prepare))
+			decision := &pb.Request{IsTxn: true, Phase: tc.phase, Ts: 30, Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+					PrimaryKey: primary, CommitTS: 60,
+				})},
+				{Op: pb.Op_PUT, Key: primary},
+			}}
+			require.Nil(t, applyBackupTestRequest(t, fsm, decision))
+
+			engine := distribution.NewEngineWithDefaultRoute()
+			shards := NewShardStore(engine, map[uint64]*ShardGroup{1: {Store: st}})
+			snapshot := shards.CaptureBackupRouteSnapshot(nil, nil)
+			err := shards.ValidateBackupSnapshotAt(ctx, snapshot, 50, 16)
+			require.ErrorIs(t, err, ErrTxnLocked)
+		})
+	}
+}
+
+func TestBackupScannersPreferCapturedOwnerForDuplicateKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups)
+	require.NoError(t, groups[2].Store.PutAt(ctx, []byte("a"), []byte("captured-owner"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("a"), []byte("stale-owner"), 1, 0))
+	routes := []distribution.Route{
+		{RouteID: 2, Start: []byte(""), End: []byte("m"), GroupID: 2},
+		{RouteID: 1, Start: []byte("m"), GroupID: 1},
+	}
+
+	keyScanner := &backupKeyScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer keyScanner.Close()
+	key, ok, err := keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), key)
+	_, ok, err = keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	valueScanner := &backupScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer valueScanner.Close()
+	pair, ok, err := valueScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("a"), pair.Key)
+	require.Equal(t, []byte("captured-owner"), pair.Value)
+}
+
+func TestBackupScannerKeepsPartitionResolvedOwnerForSQSKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("!sqs|msg|data|p|orders|partition-2|msg-2")
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups).
+		WithPartitionResolver(&fakePartitionResolver{
+			routes:           map[string]uint64{string(key): 2},
+			recognisedPrefix: []byte("!sqs|msg|data|p|"),
+		})
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("stale-engine-owner"), 1, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("partition-owner"), 2, 0))
+	routes := []distribution.Route{
+		{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	}
+
+	keyScanner := &backupKeyScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer keyScanner.Close()
+	gotKey, ok, err := keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, key, gotKey)
+	_, ok, err = keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.False(t, ok)
+
+	valueScanner := &backupScanner{
+		store: st, routes: routes, clampToRoutes: false,
+		cursor: []byte(""), ts: ^uint64(0), pageSize: 1,
+	}
+	defer valueScanner.Close()
+	pair, ok, err := valueScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, key, pair.Key)
+	require.Equal(t, []byte("partition-owner"), pair.Value)
+}
+
+func TestBackupScannersIncludePartitionOnlyGroups(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("!sqs|msg|data|p|orders|partition-2|msg-2")
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups).
+		WithPartitionResolver(&fakePartitionResolver{
+			routes:           map[string]uint64{string(key): 2},
+			recognisedPrefix: []byte("!sqs|msg|data|p|"),
+		})
+	require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("partition-only"), 1, 0))
+	snapshot := BackupRouteSnapshotWithScanGroups(BackupRouteSnapshot{
+		routes: []distribution.Route{{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1}},
+	}, []uint64{1, 2})
+
+	keyScanner := st.NewBackupKeyScannerAtSnapshot(snapshot, ^uint64(0), 1)
+	defer keyScanner.Close()
+	gotKey, ok, err := keyScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, key, gotKey)
+
+	valueScanner := st.NewBackupScannerAtSnapshot(snapshot, ^uint64(0), 1)
+	defer valueScanner.Close()
+	pair, ok, err := valueScanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, key, pair.Key)
+	require.Equal(t, []byte("partition-only"), pair.Value)
+}
+
+func TestFilteredBackupScannerAppliesFilterAfterOwnership(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups)
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("bad"), []byte("stale-off-route"), 1, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, []byte("x"), []byte("owned"), 2, 0))
+	scanner := &backupScanner{
+		store: st,
+		routes: []distribution.Route{
+			{RouteID: 1, Start: []byte("m"), GroupID: 1},
+		},
+		cursor:   []byte(""),
+		ts:       ^uint64(0),
+		pageSize: 1,
+		keyFilter: func(key []byte) (bool, error) {
+			if string(key) == "bad" {
+				return false, ErrInvalidRequest
+			}
+			return true, nil
+		},
+	}
+	defer scanner.Close()
+
+	pair, ok, err := scanner.Next(ctx)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, []byte("x"), pair.Key)
+	require.Equal(t, []byte("owned"), pair.Value)
+}
+
+func TestBackupScannerFailsClosedOnUnresolvedPartitionedSQSKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	key := []byte("!sqs|msg|data|p|orders|partition-9|msg-9")
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+	}
+	st := NewShardStore(distribution.NewEngine(), groups).
+		WithPartitionResolver(&fakePartitionResolver{
+			routes:           map[string]uint64{},
+			recognisedPrefix: []byte("!sqs|msg|data|p|"),
+		})
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("unresolved"), 1, 0))
+	scanner := &backupScanner{
+		store: st,
+		routes: []distribution.Route{
+			{RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1},
+		},
+		clampToRoutes: false,
+		cursor:        []byte(""),
+		ts:            ^uint64(0),
+		pageSize:      1,
+	}
+	defer scanner.Close()
+
+	_, _, err := scanner.Next(ctx)
+	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
+func TestValidateBackupSnapshotAtResolvesStatusThroughCapturedRoute(t *testing.T) {
+	ctx := context.Background()
+
+	oldStore := store.NewMVCCStore()
+	t.Cleanup(func() { _ = oldStore.Close() })
+	newStore := store.NewMVCCStore()
+	t.Cleanup(func() { _ = newStore.Close() })
+
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		oldStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("moved-key")
+	require.Nil(t, applyBackupTestRequest(t, fsm, &pb.Request{
+		IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 30,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+				PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+			})},
+			{Op: pb.Op_PUT, Key: primary, Value: []byte("v")},
+		},
+	}))
+	// Record the commit decision directly so the lock row survives the scan.
+	// This is the shape the finding is about: validation still sees a lock and
+	// must consult the primary's commit record to learn it is already resolved.
+	require.NoError(t, oldStore.PutAt(ctx, txnCommitKey(primary, 30), encodeTxnCommitRecord(40), 40, 0))
+
+	// Live routing now sends the primary key to group 2, which holds none of
+	// the transaction's records; the captured snapshot still points at group 1.
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: oldStore},
+		2: {Store: newStore},
+	})
+
+	captured := BackupRouteSnapshot{
+		routes: []distribution.Route{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+		scanGroups: []uint64{1},
+	}
+
+	err := shards.ValidateBackupSnapshotAt(ctx, captured, 50, 16)
+	// This harness wires no proposer, so applying the resolution itself fails
+	// with ErrNotSupported. What matters is which way the status resolved: the
+	// transaction must be recognised as already committed rather than reported
+	// as still pending, which is what ErrTxnLocked would mean.
+	require.NotErrorIs(t, err, ErrTxnLocked,
+		"the committed transaction must resolve through the captured route, not the new owner")
+}
+
+func TestValidateBackupSnapshotAtFencesCapturedRouteReads(t *testing.T) {
+	ctx := context.Background()
+
+	localStore := store.NewMVCCStore()
+	t.Cleanup(func() { _ = localStore.Close() })
+
+	fsm, ok := NewKvFSMWithHLCAndTracker(
+		localStore, NewHLC(), NewActiveTimestampTracker(WithActiveTimestampTrackerSweepInterval(0)),
+	).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("fenced-key")
+	require.Nil(t, applyBackupTestRequest(t, fsm, &pb.Request{
+		IsTxn: true, Phase: pb.Phase_PREPARE, Ts: 30,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{
+				PrimaryKey: primary, LockTTLms: defaultTxnLockTTLms,
+			})},
+			{Op: pb.Op_PUT, Key: primary, Value: []byte("v")},
+		},
+	}))
+	require.NoError(t, localStore.PutAt(ctx, txnCommitKey(primary, 30), encodeTxnCommitRecord(40), 40, 0))
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: localStore, Engine: &followerProxyEngine{}},
+	})
+
+	captured := BackupRouteSnapshot{
+		routes: []distribution.Route{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+		scanGroups: []uint64{1},
+	}
+
+	err := shards.ValidateBackupSnapshotAt(ctx, captured, 50, 16)
+	require.ErrorIs(t, err, ErrLeaderNotFound,
+		"the captured-route status read must be fenced, not served from the local replica")
+}
+
+func applyTargetReadiness(t *testing.T, group *ShardGroup) {
+	t.Helper()
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+}
+
+func applyTargetReadinessState(t *testing.T, group *ShardGroup, state store.TargetStagedReadinessState) {
+	t.Helper()
+	writer, ok := group.Store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+	require.NoError(t, writer.ApplyTargetStagedReadiness(context.Background(), state))
+}
+
+func newReadinessShardStore(t *testing.T, route distribution.RouteDescriptor) (*ShardStore, *ShardGroup) {
+	t.Helper()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes:  []distribution.RouteDescriptor{route},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	return NewShardStore(engine, map[uint64]*ShardGroup{route.GroupID: group}), group
+}
+
+type readinessFenceEngine struct {
+	state              raftengine.State
+	onLinearizableRead func()
+}
+
+func TestShardStoreCommittedVersionAtChecksStagedVisibilityKey(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	rawKey := []byte("k")
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, rawKey), []byte("staged"), 77, 0))
+
+	landed, err := st.CommittedVersionAt(ctx, rawKey, 77)
+	require.NoError(t, err)
+	require.True(t, landed)
+}
+
+func TestShardStoreCommittedVersionAtChecksTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 77, 0))
+
+	landed, err := st.CommittedVersionAt(ctx, []byte("k"), 77)
+	require.False(t, landed)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreSourceReadFenceRejectsPointRead(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:               10,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      10,
+		MinWriteTSExclusive: 50,
+		Armed:               true,
+		SourceWriteFence:    true,
+		SourceReadFence:     true,
+		RetentionPinTS:      40,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
+
+	_, err := st.GetAt(ctx, []byte("n"), 60)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, err = st.ScanAt(ctx, []byte("m"), []byte("z"), 60, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+// keys_only reads take a different path than value scans and used to skip the
+// readiness proof entirely, so an armed source read fence still handed back
+// keys from the old source -- and an armed target guard handed back live-only
+// or empty keys while the catalog watcher lagged. Both the routed and the
+// explicit-group form must fail closed the same way ScanAt does.
+func TestShardStoreSourceReadFenceRejectsKeyOnlyScan(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:               10,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      10,
+		MinWriteTSExclusive: 50,
+		Armed:               true,
+		SourceWriteFence:    true,
+		SourceReadFence:     true,
+		RetentionPinTS:      40,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
+
+	_, err := st.ScanKeysAt(ctx, []byte("m"), []byte("z"), 60, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, err = st.ScanKeysAtWithReadFence(ctx, []byte("m"), []byte("z"), 60, 0, 1, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending,
+		"an explicit source group is exactly the case the fence exists for")
+}
+
+func TestShardStoreSourceWriteFenceKeepsReadsAvailable(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:               10,
+		RouteStart:          []byte("m"),
+		RouteEnd:            []byte("z"),
+		MigrationJobID:      10,
+		MinWriteTSExclusive: 50,
+		Armed:               true,
+		SourceWriteFence:    true,
+		RetentionPinTS:      40,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("live"), 60, 0))
+
+	got, err := st.GetAt(ctx, []byte("n"), 60)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live"), got)
+}
+
+func TestShardStoreCommittedVersionAtRechecksTargetReadinessAfterFence(t *testing.T) {
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	group.Engine = &readinessFenceEngine{
+		onLinearizableRead: func() {
+			applyTargetReadiness(t, group)
+		},
+	}
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 77, 0))
+
+	landed, err := st.CommittedVersionAt(ctx, []byte("k"), 77)
+	require.False(t, landed)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreTargetReadinessFailsClosedWithoutDescriptorProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+
+	_, err := st.GetAt(ctx, []byte("k"), 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	err = st.PutAt(ctx, []byte("k"), []byte("v"), 120, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreTargetReadinessNormalizesInternalKeyRange(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+
+	itemKey := store.ListItemKey([]byte("b"), 0)
+	require.NoError(t, group.Store.PutAt(ctx, itemKey, []byte("item"), 120, 0))
+
+	_, err := st.GetAt(ctx, itemKey, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreTargetReadinessAcceptsStagedDescriptor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	applyTargetReadiness(t, group)
+	rawKey := []byte("k")
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, rawKey), []byte("staged"), 120, 0))
+
+	got, err := st.GetAt(ctx, rawKey, 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged"), got)
+}
+
+func TestShardStoreTargetReadinessAcceptsClearedDescriptorAndRetainsFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("a"),
+		End:                 []byte("z"),
+		GroupID:             1,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 120, 0))
+
+	got, err := st.GetAt(ctx, []byte("k"), 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live"), got)
+
+	err = st.PutAt(ctx, []byte("k"), []byte("low"), 100, 0)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	err = st.ExpireAt(ctx, []byte("k"), 200, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	err = st.ApplyMutations(ctx, []*store.KVPairMutation{{
+		Op:    store.OpTypePut,
+		Key:   []byte("n"),
+		Value: []byte("low"),
+	}}, nil, 0, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	err = st.PutAt(ctx, []byte("k"), []byte("ok"), 101, 0)
+	require.NoError(t, err)
+
+	err = st.ApplyMutations(ctx, []*store.KVPairMutation{{
+		Op:    store.OpTypePut,
+		Key:   []byte("n"),
+		Value: []byte("ok"),
+	}}, nil, 0, 101)
+	require.NoError(t, err)
+}
+
+func TestShardStoreTargetReadinessRejectsClearedDescriptorBeforeCutoverVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("k"), []byte("live"), 120, 0))
+
+	_, err := st.GetAt(ctx, []byte("k"), 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreTargetReadinessUsesSingleCatalogSnapshotProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	staleRoute, ok := engine.GetRoute([]byte("b"))
+	require.True(t, ok)
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-old"), 80, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-new"), 120, 0))
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+		}},
+	}))
+
+	got, err := shards.localGetAt(ctx, group, staleRoute, []byte("b"), 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("staged-new"), got)
+}
+
+func TestShardStoreDeletePrefixAtUsesReadinessProofRouteFloor(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte("a"),
+			End:     []byte("z"),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live"), 80, 0))
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+		}},
+	}))
+
+	err := shards.DeletePrefixAt(ctx, []byte("b"), nil, 100)
+	require.ErrorIs(t, err, ErrRouteWriteBelowFloor)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("live"), got)
+}
+
+func TestShardStoreDeletePrefixAtUsesReadinessProofRouteForStagedCleanup(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               []byte("a"),
+			End:                 []byte("z"),
+			GroupID:             1,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadiness(t, group)
+	stagedKey := distribution.MigrationStagedDataKey(9, []byte("b"))
+	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))
+
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:                1,
+			Start:                  []byte("a"),
+			End:                    []byte("z"),
+			GroupID:                1,
+			State:                  distribution.RouteStateActive,
+			StagedVisibilityActive: true,
+			MigrationJobID:         9,
+			MinWriteTSExclusive:    100,
+		}},
+	}))
+
+	require.NoError(t, shards.DeletePrefixAt(ctx, []byte("b"), nil, 130))
+
+	_, err := group.Store.GetAt(ctx, stagedKey, 140)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = shards.GetAt(ctx, []byte("b"), 140)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStoreExplicitGroupReadUsesRouteProofForReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID:             1,
+		Start:               []byte("a"),
+		End:                 []byte("z"),
+		GroupID:             42,
+		State:               distribution.RouteStateActive,
+		MinWriteTSExclusive: 100,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live"), 120, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("c"), []byte("scan"), 121, 0))
+
+	got, err := st.GetGroupAt(ctx, 42, []byte("b"), 130)
+	require.NoError(t, err)
+	require.Equal(t, []byte("live"), got)
+
+	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+}
+
+func TestShardStoreScanGroupAtChecksEveryCoveredRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               []byte("a"),
+				End:                 []byte("m"),
+				GroupID:             42,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+			{
+				RouteID: 2,
+				Start:   []byte("m"),
+				End:     []byte("z"),
+				GroupID: 42,
+				State:   distribution.RouteStateActive,
+			},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("m"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("left"), 120, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("x"), []byte("right"), 120, 0))
+
+	_, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreScanGroupAtClampsSingleMatchedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte("m"),
+			End:     []byte("z"),
+			GroupID: 42,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("outside"), 7, 0))
+	require.NoError(t, group.Store.PutAt(ctx, []byte("n"), []byte("inside"), 7, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 7)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: []byte("n"), Value: []byte("inside")}}, kvs)
+}
+
+func TestShardStoreScanGroupAtSplitsCoveredRoutesForStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID: 1,
+				Start:   []byte("a"),
+				End:     []byte("m"),
+				GroupID: 42,
+				State:   distribution.RouteStateActive,
+			},
+			{
+				RouteID:                2,
+				Start:                  []byte("m"),
+				End:                    []byte("z"),
+				GroupID:                42,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         10,
+			},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("left-live"), 110, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(10, []byte("x")), []byte("right-staged"), 120, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, []byte("a"), []byte("z"), 10, 130)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{
+		{Key: []byte("b"), Value: []byte("left-live")},
+		{Key: []byte("x"), Value: []byte("right-staged")},
+	}, kvs)
+}
+
+func TestShardStorePhysicalLimitScanChecksTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+
+	userKey := []byte("b")
+	start := store.ListItemKey(userKey, 0)
+	end := store.ListItemKey(userKey, 2)
+	require.NoError(t, group.Store.PutAt(ctx, start, []byte("v"), 120, 0))
+
+	_, _, err := st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStorePhysicalLimitScanRechecksTargetReadinessAfterFence(t *testing.T) {
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	group.Engine = &readinessFenceEngine{
+		state: raftengine.StateLeader,
+		onLinearizableRead: func() {
+			applyTargetReadiness(t, group)
+		},
+	}
+
+	userKey := []byte("b")
+	start := store.ListItemKey(userKey, 0)
+	end := store.ListItemKey(userKey, 2)
+	require.NoError(t, group.Store.PutAt(ctx, start, []byte("v"), 120, 0))
+
+	_, _, err := st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreS3ManifestScanChecksTargetReadinessInRouteSpace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
+	end := prefixScanEnd(start)
+	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
+	require.True(t, ok)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     routeEnd,
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	key := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-0")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("manifest"), 120, 0))
+
+	_, err := st.ScanAt(ctx, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	_, _, err = st.ScanAtPhysicalLimit(ctx, start, end, 10, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreS3BucketAuxiliaryScanChecksSourceReadFenceInRouteSpace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const bucket = "bucket-a"
+	start := []byte(s3keys.BucketMetaPrefix)
+	end := prefixScanEnd(start)
+	routeStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
+	routeEnd := prefixScanEnd(routeStart)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     routeEnd,
+			GroupID: 42,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+		SourceWriteFence:       true,
+		SourceReadFence:        true,
+		RetentionPinTS:         90,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, s3keys.BucketMetaKey(bucket), []byte("meta"), 120, 0))
+
+	_, err := st.ScanGroupAt(ctx, 42, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreFilesystemChunkScanChecksSourceReadFenceInRouteSpace(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const homeSlot uint64 = 11
+	const inode uint64 = 22
+	start := fskeys.ChunkPrefix(homeSlot, inode)
+	end := prefixScanEnd(start)
+	routeStart := fskeys.ChunkRouteKey(homeSlot, inode)
+	routeEnd := prefixScanEnd(routeStart)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   routeStart,
+			End:     routeEnd,
+			GroupID: 42,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+		SourceWriteFence:       true,
+		SourceReadFence:        true,
+		RetentionPinTS:         90,
+	})
+	require.NoError(t, group.Store.PutAt(ctx, fskeys.ChunkKey(homeSlot, inode, 0), []byte("chunk"), 120, 0))
+
+	_, err := st.ScanAt(ctx, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+	_, err = st.ScanGroupAt(ctx, 42, start, end, 10, 130)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+}
+
+func TestShardStoreTargetReadinessSkipsNonOverlappingGuardForScannedRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "a/")
+	end := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
+	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
+	require.True(t, ok)
+	routeBoundary, _, ok := s3keys.ManifestScanRouteBounds(
+		s3keys.ObjectManifestScanStart("bucket-a", 1, "m/"),
+		end,
+	)
+	require.True(t, ok)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:             1,
+				Start:               routeStart,
+				End:                 routeBoundary,
+				GroupID:             1,
+				State:               distribution.RouteStateActive,
+				MinWriteTSExclusive: 100,
+			},
+			{
+				RouteID: 2,
+				Start:   routeBoundary,
+				End:     routeEnd,
+				GroupID: 1,
+				State:   distribution.RouteStateActive,
+			},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeBoundary,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	kvs, err := st.ScanAt(ctx, start, end, 10, 130)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
+}
+
+func TestShardStoreExplicitGroupS3ManifestScanUsesRouteProofForReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	start := s3keys.ObjectManifestScanStart("bucket-a", 1, "z/")
+	end := prefixScanEnd(start)
+	routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end)
+	require.True(t, ok)
+
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID:             1,
+			Start:               routeStart,
+			End:                 routeEnd,
+			GroupID:             42,
+			State:               distribution.RouteStateActive,
+			MinWriteTSExclusive: 100,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{42: group})
+	applyTargetReadinessState(t, group, store.TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             routeStart,
+		RouteEnd:               routeEnd,
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	})
+
+	key := s3keys.ObjectManifestKey("bucket-a", 1, "z/object-0")
+	require.NoError(t, group.Store.PutAt(ctx, key, []byte("manifest"), 120, 0))
+
+	kvs, err := st.ScanGroupAt(ctx, 42, start, end, 10, 130)
+	require.NoError(t, err)
+	require.Len(t, kvs, 1)
+	require.Equal(t, key, kvs[0].Key)
+}
+
+func TestShardStoreDeletePrefixAtChecksTargetReadinessBeforeDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
+
+	err := st.DeletePrefixAt(ctx, []byte("b"), nil, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestShardStoreDeletePrefixAtRaftChecksTargetReadinessBeforeDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
+
+	err := st.DeletePrefixAtRaft(ctx, []byte("b"), nil, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestShardStoreDeletePrefixAtRaftAtChecksTargetReadinessBeforeDelete(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newReadinessShardStore(t, distribution.RouteDescriptor{
+		RouteID: 1,
+		Start:   []byte("a"),
+		End:     []byte("z"),
+		GroupID: 1,
+		State:   distribution.RouteStateActive,
+	})
+	applyTargetReadiness(t, group)
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
+
+	err := st.DeletePrefixAtRaftAt(ctx, []byte("b"), nil, 120, 10)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestShardStoreDeletePrefixAtFailsClosedWithoutRouteProof(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 2,
+		Routes: []distribution.RouteDescriptor{{
+			RouteID: 1,
+			Start:   []byte("m"),
+			End:     []byte("z"),
+			GroupID: 1,
+			State:   distribution.RouteStateActive,
+		}},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("v"), 1, 0))
+
+	err := st.DeletePrefixAt(ctx, []byte("b"), nil, 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	got, getErr := group.Store.GetAt(ctx, []byte("b"), ^uint64(0))
+	require.NoError(t, getErr)
+	require.Equal(t, []byte("v"), got)
+}
+
+func TestShardStoreDeletePrefixAtTombstonesStagedVisibilityRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	rawKey := []byte("b")
+	stagedKey := distribution.MigrationStagedDataKey(9, rawKey)
+	require.NoError(t, group.Store.PutAt(ctx, stagedKey, []byte("staged"), 120, 0))
+
+	require.NoError(t, st.DeletePrefixAt(ctx, rawKey, nil, 130))
+
+	_, err := st.GetAt(ctx, rawKey, 140)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = group.Store.GetAt(ctx, stagedKey, 140)
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestShardStoreStagedVisibilityPreservesCompactionErrors(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, group := newStagedVisibilityShardStore(t)
+	retention, ok := group.Store.(store.RetentionController)
+	require.True(t, ok)
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged"), 10, 0))
+	retention.SetMinRetainedTS(20)
+
+	_, err := st.GetAt(ctx, []byte("b"), 15)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
+
+	_, err = st.ScanAt(ctx, []byte("a"), []byte("z"), 10, 15)
+	require.ErrorIs(t, err, store.ErrReadTSCompacted)
+}
+
+func TestShardStoreRaftApplySkipsPointMigrationTimestampFloorButGuardsPrefixDeletes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, _ := newStagedVisibilityShardStore(t)
+
+	require.NoError(t, st.ApplyMutationsRaft(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("k-raft"), Value: []byte("v")},
+	}, nil, 90, 100))
+	require.NoError(t, st.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{
+		{Op: store.OpTypePut, Key: []byte("k-raft-at"), Value: []byte("v")},
+	}, nil, 90, 100, 1))
+	require.ErrorIs(t, st.DeletePrefixAtRaft(ctx, []byte("k-raft"), nil, 100), ErrRouteWriteTimestampTooLow)
+	require.ErrorIs(t, st.DeletePrefixAtRaftAt(ctx, []byte("k-raft-at"), nil, 100, 2), ErrRouteWriteTimestampTooLow)
+}
+
+func (e *readinessFenceEngine) State() raftengine.State {
+	if e.state != "" {
+		return e.state
+	}
+	return raftengine.StateFollower
+}
+
+func (e *readinessFenceEngine) Leader() raftengine.LeaderInfo {
+	return raftengine.LeaderInfo{ID: "leader"}
+}
+
+func (e *readinessFenceEngine) VerifyLeader(context.Context) error {
+	return nil
+}
+
+func (e *readinessFenceEngine) LinearizableRead(context.Context) (uint64, error) {
+	if e.onLinearizableRead != nil {
+		e.onLinearizableRead()
+	}
+	return 1, nil
+}
+
+func (e *readinessFenceEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, errors.New("unexpected propose")
+}
+
+func (e *readinessFenceEngine) ProposeAdmin(context.Context, []byte) (*raftengine.ProposalResult, error) {
+	return nil, errors.New("unexpected propose admin")
+}
+
+func (e *readinessFenceEngine) Status() raftengine.Status {
+	return raftengine.Status{State: e.State()}
+}
+
+func (e *readinessFenceEngine) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+
+func (e *readinessFenceEngine) Close() error {
+	return nil
+}
+
+func (e *readinessFenceEngine) SnapshotEvery() uint64 { return 0 }

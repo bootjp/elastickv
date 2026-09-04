@@ -19,26 +19,140 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
+	"google.golang.org/grpc"
 )
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", false, "", false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
 	if srv != nil || !icept.empty() {
 		t.Fatalf("disabled service should return nil server and empty interceptors; got %v %+v", srv, icept)
 	}
+}
+
+func TestValidateLiveBackupConfig(t *testing.T) {
+	t.Parallel()
+	require.NoError(t, validateLiveBackupConfig(30*time.Minute, time.Hour, 5*time.Second, 1000, 1024, 4))
+	tests := []struct {
+		name                              string
+		defaultTTL, maxTTL, beginDeadline time.Duration
+		headroom                          uint64
+		pageSize, maxPins                 int
+	}{
+		{name: "short default ttl", defaultTTL: time.Second, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, pageSize: 1, maxPins: 1},
+		{name: "default exceeds max", defaultTTL: 2 * time.Hour, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, pageSize: 1, maxPins: 1},
+		{name: "zero begin deadline", defaultTTL: time.Minute, maxTTL: time.Hour, headroom: 1, pageSize: 1, maxPins: 1},
+		{name: "zero headroom", defaultTTL: time.Minute, maxTTL: time.Hour, beginDeadline: time.Second, pageSize: 1, maxPins: 1},
+		{name: "zero page", defaultTTL: time.Minute, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, maxPins: 1},
+		{name: "zero pins", defaultTTL: time.Minute, maxTTL: time.Hour, beginDeadline: time.Second, headroom: 1, pageSize: 1},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Error(t, validateLiveBackupConfig(
+				tc.defaultTTL, tc.maxTTL, tc.beginDeadline, tc.headroom, tc.pageSize, tc.maxPins,
+			))
+		})
+	}
+}
+
+type backupFenceOrderCoordinator struct {
+	stubStartupCoordinator
+	timestampDuringBarrier uint64
+	onBarrier              func(uint64)
+}
+
+type backupFenceTSOCoordinator struct {
+	stubStartupCoordinator
+	min            uint64
+	nextAfter      uint64
+	barriers       atomic.Int32
+	barrierErr     error
+	nextErr        error
+	afterErr       error
+	leaderCommitTS uint64
+}
+
+func (c *backupFenceTSOCoordinator) LeaseReadAllGroups(context.Context) error {
+	c.barriers.Add(1)
+	return c.barrierErr
+}
+
+func (c *backupFenceTSOCoordinator) LeaseReadAllGroupsTimestamp(context.Context) (uint64, error) {
+	c.barriers.Add(1)
+	return c.leaderCommitTS, c.barrierErr
+}
+
+func (c *backupFenceTSOCoordinator) Next(context.Context) (uint64, error) {
+	return c.nextAfter, c.nextErr
+}
+
+func (c *backupFenceTSOCoordinator) NextAfter(_ context.Context, min uint64) (uint64, error) {
+	c.min = min
+	return c.nextAfter, c.afterErr
+}
+
+func (c *backupFenceOrderCoordinator) LeaseReadAllGroups(context.Context) error {
+	ts, err := c.Clock().NextFenced()
+	if err != nil {
+		return err
+	}
+	c.timestampDuringBarrier = ts
+	if c.onBarrier != nil {
+		c.onBarrier(ts)
+	}
+	return nil
+}
+
+func TestAdminBackupReadFenceAllocatesTimestampAfterBarrier(t *testing.T) {
+	t.Parallel()
+	coordinate := &backupFenceOrderCoordinator{}
+	groupStore := store.NewMVCCStore()
+	shardStore := kv.NewShardStore(distribution.NewEngineWithDefaultRoute(), map[uint64]*kv.ShardGroup{
+		1: {Store: groupStore},
+	})
+	coordinate.onBarrier = func(ts uint64) {
+		require.NoError(t, groupStore.PutAt(context.Background(), []byte("committed"), []byte("value"), ts, 0))
+	}
+	fence := adminBackupReadFence(coordinate, shardStore)
+	require.NotNil(t, fence)
+
+	readTS, err := fence(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, coordinate.timestampDuringBarrier, shardStore.LastCommitTS())
+	require.Greater(t, readTS, coordinate.timestampDuringBarrier)
+}
+
+func TestAdminBackupReadFenceUsesCoordinatorTimestampAllocator(t *testing.T) {
+	t.Parallel()
+	coordinate := &backupFenceTSOCoordinator{nextAfter: 9_000, leaderCommitTS: 8_000}
+	groupStore := store.NewMVCCStore()
+	require.NoError(t, groupStore.PutAt(context.Background(), []byte("committed"), []byte("value"), 7_000, 0))
+	shardStore := kv.NewShardStore(distribution.NewEngineWithDefaultRoute(), map[uint64]*kv.ShardGroup{
+		1: {Store: groupStore},
+	})
+	fence := adminBackupReadFence(coordinate, shardStore)
+
+	readTS, err := fence(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(9_000), readTS)
+	require.Equal(t, uint64(8_000), coordinate.min)
+	require.Equal(t, int32(1), coordinate.barriers.Load())
 }
 
 func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
@@ -48,7 +162,7 @@ func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := configureAdminService(tokPath, true, adapter.NodeIdentity{}, nil); err == nil {
+	if _, _, err := configureAdminService(tokPath, true, "", false, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected mutual-exclusion error")
 	}
 }
@@ -57,25 +171,80 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	tokPath := filepath.Join(dir, "t")
+	peerPath := filepath.Join(dir, "peer")
 	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, icept, err := configureAdminService(tokPath, false, peerPath, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
 	if srv == nil {
 		t.Fatal("expected an AdminServer instance")
 	}
-	// Expect one unary + one stream interceptor for the admin-token gate.
-	if len(icept.unary) != 1 || len(icept.stream) != 1 {
-		t.Fatalf("expected 1 unary + 1 stream interceptor, got %d + %d", len(icept.unary), len(icept.stream))
+	if len(icept.unary) != 2 || len(icept.stream) != 2 {
+		t.Fatalf("expected separate admin and peer interceptors, got %d + %d", len(icept.unary), len(icept.stream))
+	}
+	if !icept.s3BlobFetchEnabled {
+		t.Fatal("token-authenticated configuration should enable S3BlobFetch")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if !overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("enabled authenticated configuration should advertise S3 blob offload")
+	}
+}
+
+func TestConfigureAdminServiceRejectsSharedAdminAndPeerToken(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	adminPath := filepath.Join(dir, "admin")
+	peerPath := filepath.Join(dir, "peer")
+	for _, path := range []string{adminPath, peerPath} {
+		if err := os.WriteFile(path, []byte("same-secret\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := configureAdminService(adminPath, false, peerPath, true, adapter.NodeIdentity{}, nil, nil); err == nil {
+		t.Fatal("expected shared admin and peer token to be rejected")
+	}
+}
+
+func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	tokPath := filepath.Join(dir, "t")
+	peerPath := filepath.Join(dir, "peer")
+	if err := os.WriteFile(tokPath, []byte("hunter2\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, icept, err := configureAdminService(tokPath, false, peerPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	if err != nil {
+		t.Fatalf("configureAdminService: %v", err)
+	}
+	if !icept.s3BlobFetchEnabled {
+		t.Fatal("rollback mode must retain authenticated blob reads")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("disabled rollout flag must remove S3 blob offload capability")
 	}
 }
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", true, adapter.NodeIdentity{NodeID: "n1"}, nil)
+	srv, icept, err := configureAdminService("", true, "", true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
@@ -85,7 +254,105 @@ func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	if !icept.empty() {
 		t.Fatalf("insecure mode should not attach interceptors, got %+v", icept)
 	}
+	if icept.s3BlobFetchEnabled {
+		t.Fatal("insecure admin mode must not expose S3BlobFetch")
+	}
+	overview, err := srv.GetClusterOverview(context.Background(), &pb.GetClusterOverviewRequest{})
+	if err != nil {
+		t.Fatalf("GetClusterOverview: %v", err)
+	}
+	if overview.GetCapabilities()[adapter.S3BlobOffloadCapabilityName] {
+		t.Fatal("insecure admin mode must not advertise S3 blob offload capability")
+	}
 }
+
+func TestConfigureAdminServiceWiresLeaderVersionProbe(t *testing.T) {
+	t.Parallel()
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	remote := adapter.NewAdminServer(
+		adapter.NodeIdentity{NodeID: "n2", GRPCAddress: lis.Addr().String()},
+		nil,
+		adapter.WithAdminNodeVersion("v-remote"),
+	)
+	gs := grpc.NewServer()
+	pb.RegisterAdminServer(gs, remote)
+	serveErr := make(chan error, 1)
+	go func() {
+		serveErr <- gs.Serve(lis)
+	}()
+	t.Cleanup(func() {
+		gs.Stop()
+		_ = lis.Close()
+		<-serveErr
+	})
+
+	var cache kv.GRPCConnCache
+	t.Cleanup(func() { require.NoError(t, cache.Close()) })
+	srv, _, err := configureAdminService(
+		"",
+		true,
+		"",
+		false,
+		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
+		nil,
+		&cache,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+	srv.RegisterGroup(1, adminVersionProbeGroup{leader: raftengine.LeaderInfo{
+		ID:      "n2",
+		Address: lis.Addr().String(),
+	}})
+
+	resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+	require.NoError(t, err)
+	require.Len(t, resp.Groups, 1)
+	require.Empty(t, resp.Groups[0].LeaderNodeVersion)
+	require.Eventually(t, func() bool {
+		resp, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
+		return err == nil && len(resp.Groups) == 1 && resp.Groups[0].LeaderNodeVersion == "v-remote"
+	}, time.Second, 10*time.Millisecond)
+}
+
+func TestConfigureAdminServiceUsesStampedBuildVersion(t *testing.T) {
+	old := adminBuildVersion
+	adminBuildVersion = "v-admin-test"
+	t.Cleanup(func() { adminBuildVersion = old })
+
+	if got := buildVersion(); got != "v-admin-test" {
+		t.Fatalf("buildVersion = %q, want v-admin-test", got)
+	}
+	srv, _, err := configureAdminService(
+		"",
+		true,
+		"",
+		false,
+		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
+		nil,
+		nil,
+	)
+	require.NoError(t, err)
+	require.NotNil(t, srv)
+	resp, err := srv.GetNodeVersion(context.Background(), &pb.GetNodeVersionRequest{})
+	require.NoError(t, err)
+	require.Equal(t, "v-admin-test", resp.GetNodeVersion())
+}
+
+type adminVersionProbeGroup struct {
+	leader raftengine.LeaderInfo
+}
+
+func (g adminVersionProbeGroup) Status() raftengine.Status {
+	return raftengine.Status{Leader: g.leader}
+}
+
+func (adminVersionProbeGroup) Configuration(context.Context) (raftengine.Configuration, error) {
+	return raftengine.Configuration{}, nil
+}
+
+func (adminVersionProbeGroup) SnapshotEvery() uint64 { return 0 }
 
 func TestAdminMembersFromBootstrapExcludesSelf(t *testing.T) {
 	t.Parallel()
@@ -370,13 +637,14 @@ func writeSelfSignedCert(t *testing.T) (string, string) {
 // bridge maps transient leader-churn errors from the kv coordinator
 // (which AdminCreateTable/AdminDeleteTable can return after their
 // initial isVerifiedDynamoLeader check) to admin.ErrTablesNotLeader
-// rather than the generic 500 fallthrough. Codex P2 on PR #634.
+// rather than the generic 500 fallthrough. P2 review on PR #634.
 func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 	cases := []struct {
 		name string
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},
@@ -394,7 +662,7 @@ func TestTranslateAdminTablesError_LeaderChurn(t *testing.T) {
 }
 
 // TestTranslateAdminTablesError_LeaderPhraseInMiddleOfMessage covers
-// the false-positive class Codex P2 flagged: a message that
+// the false-positive class P2 review flagged: a message that
 // happens to contain a leader phrase NOT at the suffix must NOT
 // be classified as leader-churn. Switching from strings.Contains
 // to strings.HasSuffix is what makes this test pass.
@@ -428,8 +696,8 @@ func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
 }
 
 // TestTranslateAdminItemsError_LeaderChurn is the items-tier
-// counterpart of TestTranslateAdminTablesError_LeaderChurn — Codex
-// P2 on PR #813 flagged that translateAdminItemsError did not
+// counterpart of TestTranslateAdminTablesError_LeaderChurn — P2
+// review on PR #813 flagged that translateAdminItemsError did not
 // classify transient leader-churn errors as 503/retryable, so an
 // election mid-AdminPutItem / AdminGetItem would 500 instead of
 // surfacing through the SPA's retry path.
@@ -439,6 +707,7 @@ func TestTranslateAdminItemsError_LeaderChurn(t *testing.T) {
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},
@@ -496,6 +765,7 @@ func TestTranslateAdminQueuesError_LeaderChurn(t *testing.T) {
 		in   error
 	}{
 		{"kv.ErrLeaderNotFound", kv.ErrLeaderNotFound},
+		{"kv.ErrLeaderProxyCircuitOpen", kv.ErrLeaderProxyCircuitOpen},
 		{"adapter.ErrNotLeader", adapter.ErrNotLeader},
 		{"adapter.ErrLeaderNotFound", adapter.ErrLeaderNotFound},
 		{"wrapped not leader", errors.New("dispatch failed: not leader")},

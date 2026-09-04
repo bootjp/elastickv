@@ -7,6 +7,8 @@ import (
 	"testing"
 
 	_ "github.com/Jille/grpc-multi-resolver"
+	"github.com/bootjp/elastickv/distribution"
+	kvstore "github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/assert"
@@ -34,6 +36,8 @@ const (
 	grpcSequenceFullIterations  = 9999
 	grpcSequenceShortIterations = 256
 )
+
+var _ rawGroupCommitTSReader = (*kvstore.ShardStore)(nil)
 
 func grpcSequenceIterations(t testing.TB) int {
 	t.Helper()
@@ -142,11 +146,39 @@ func TestGRPCServer_RawLatestCommitTS_EmptyKeyReturnsGlobalWatermark(t *testing.
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(77), resp.GetTs())
 	assert.True(t, resp.GetExists())
+	assert.Zero(t, resp.GetGroupId())
+	assert.False(t, resp.GetLeaderFenced())
 
 	// Non-empty key should still work as before.
 	resp, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k")})
 	assert.NoError(t, err)
 	assert.Equal(t, uint64(77), resp.GetTs())
+}
+
+func TestGRPCServer_RawLatestCommitTS_ExplicitGroupUsesLeaderFencedReader(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingRawGroupStore{
+		MVCCStore: store.NewMVCCStore(),
+		floorTS:   88,
+	}
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{GroupId: 7})
+	require.NoError(t, err)
+	require.Equal(t, uint64(88), resp.GetTs())
+	require.True(t, resp.GetExists())
+	require.Equal(t, uint64(7), resp.GetGroupId())
+	require.True(t, resp.GetLeaderFenced())
+	require.Equal(t, uint64(7), st.floorGroupID)
+}
+
+func TestGRPCServer_RawLatestCommitTS_ExplicitGroupRequiresAwareStore(t *testing.T) {
+	t.Parallel()
+
+	s := NewGRPCServer(store.NewMVCCStore(), nil)
+	_, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{GroupId: 1})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
 func TestGRPCServer_RawScanAt_RejectsOversizedLimit(t *testing.T) {
@@ -172,7 +204,14 @@ type recordingRawGroupStore struct {
 	keyScanGroup bool
 	fallbackGet  bool
 	fallbackScan bool
+	floorGroupID uint64
+	floorTS      uint64
 	reverseScan  bool
+}
+
+func (s *recordingRawGroupStore) GroupCommittedTimestampFloor(_ context.Context, groupID uint64) (uint64, error) {
+	s.floorGroupID = groupID
+	return s.floorTS, nil
 }
 
 func (s *recordingRawGroupStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
@@ -260,6 +299,8 @@ type recordingRawReadFenceStore struct {
 	routeVersion             uint64
 	getReadRouteVersion      uint64
 	latestReadRouteVersion   uint64
+	latestGroupID            uint64
+	latestGroupReadVersion   uint64
 	scanReadRouteVersion     uint64
 	scanReadRouteStart       []byte
 	scanReadRouteEnd         []byte
@@ -272,6 +313,43 @@ type recordingRawReadFenceStore struct {
 	callerSuppliedGetSeen    uint64
 	callerSuppliedScanSeen   uint64
 	callerSuppliedLatestSeen uint64
+}
+
+type recordingReadFenceGroupStore struct {
+	*recordingRawGroupStore
+
+	readFenceScanCalled     bool
+	readFenceReadRouteVer   uint64
+	readFenceScanGroupID    uint64
+	readFenceScanReverse    bool
+	readFenceRouteBoundsSet bool
+}
+
+func (s *recordingReadFenceGroupStore) ReadRouteVersion() uint64 {
+	return 55
+}
+
+func (s *recordingReadFenceGroupStore) ScanAtWithReadFence(
+	ctx context.Context,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	reverse bool,
+	groupID uint64,
+	readRouteVersion uint64,
+	routeStart []byte,
+	routeEnd []byte,
+) ([]*store.KVPair, error) {
+	s.readFenceScanCalled = true
+	s.readFenceReadRouteVer = readRouteVersion
+	s.readFenceScanGroupID = groupID
+	s.readFenceScanReverse = reverse
+	s.readFenceRouteBoundsSet = routeStart != nil || routeEnd != nil
+	if reverse {
+		return s.ReverseScanGroupAt(ctx, groupID, start, end, limit, ts)
+	}
+	return s.ScanGroupAt(ctx, groupID, start, end, limit, ts)
 }
 
 func (s *recordingRawReadFenceStore) ReadRouteVersion() uint64 {
@@ -292,6 +370,12 @@ func (s *recordingRawReadFenceStore) LatestCommitTSWithReadFence(_ context.Conte
 		s.callerSuppliedLatestSeen = readRouteVersion
 	}
 	return 10, true, nil
+}
+
+func (s *recordingRawReadFenceStore) LatestCommitTSGroupWithReadFence(_ context.Context, _ []byte, groupID uint64, readRouteVersion uint64) (uint64, bool, error) {
+	s.latestGroupID = groupID
+	s.latestGroupReadVersion = readRouteVersion
+	return 11, true, nil
 }
 
 func (s *recordingRawReadFenceStore) ScanAtWithReadFence(_ context.Context, start []byte, _ []byte, _ int, _ uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
@@ -340,34 +424,53 @@ func TestGRPCServer_RawReadFenceHelpersStampCurrentRouteVersion(t *testing.T) {
 	require.Equal(t, uint64(55), st.scanReadRouteVersion)
 }
 
-func TestGRPCServer_ReadsHonorStartupGate(t *testing.T) {
+func TestGRPCServer_RawLatestCommitTS_UsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 
-	blocked := true
-	s := NewGRPCServer(store.NewMVCCStore(), nil, WithGRPCReadGate(func() bool { return blocked }))
 	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
 
-	_, err := s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10})
-	require.Error(t, err)
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	_, err = s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{})
-	require.Error(t, err)
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	_, err = s.RawScanAt(ctx, &pb.RawScanAtRequest{Limit: 10, Ts: 10})
-	require.Error(t, err)
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	_, err = s.Get(ctx, &pb.GetRequest{Key: []byte("k")})
-	require.Error(t, err)
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	_, err = s.Scan(ctx, &pb.ScanRequest{Limit: 10})
-	require.Error(t, err)
-	require.Equal(t, codes.Unavailable, status.Code(err))
+	resp, err := s.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k"), GroupId: 42, ReadRouteVersion: 98})
+	require.NoError(t, err)
+	require.True(t, resp.GetExists())
+	require.Equal(t, uint64(11), resp.GetTs())
+	require.Equal(t, uint64(42), st.latestGroupID)
+	require.Equal(t, uint64(98), st.latestGroupReadVersion)
+	require.Zero(t, st.latestReadRouteVersion)
+}
 
-	blocked = false
-	_, err = s.RawGet(ctx, &pb.RawGetRequest{Key: []byte("k"), Ts: 10})
+func TestGRPCServer_RawLatestCommitTS_ExplicitGroupShardStoreVersionProbe(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte(""), End: nil, GroupID: 42, State: distribution.RouteStateActive},
+		},
+	}))
+	groupStore := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, groupStore.Close()) })
+	key := []byte("!dist|migstage|probe|k")
+	require.NoError(t, groupStore.PutAt(ctx, key, []byte("v"), 10, 0))
+	shards := kvstore.NewShardStore(engine, map[uint64]*kvstore.ShardGroup{
+		42: {Store: groupStore},
+	})
+	server := NewGRPCServer(shards, nil)
+
+	resp, err := server.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{
+		Key:                key,
+		GroupId:            42,
+		ReadRouteVersion:   1,
+		VersionVisibleAtTs: 10,
+	})
 	require.NoError(t, err)
-	_, err = s.Scan(ctx, &pb.ScanRequest{Limit: 10})
-	require.NoError(t, err)
+	require.True(t, resp.GetExists())
+	require.Equal(t, uint64(10), resp.GetTs())
+	require.True(t, resp.GetVersionVisibleSupported())
+	require.True(t, resp.GetVersionVisible())
 }
 
 func TestGRPCServer_RawReadFenceHelpersKeepCallerRouteVersion(t *testing.T) {
@@ -587,13 +690,16 @@ func TestGRPCServer_RawPointReadsRequireReadFenceAwareStore(t *testing.T) {
 	}
 }
 
-func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceStore(t *testing.T) {
+func TestGRPCServer_RawScanAt_GroupedReverseGoesThroughReadFenceStore(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
 	s := NewGRPCServer(st, nil)
 
+	// An unbounded grouped reverse scan used to be rejected here while a store
+	// that was also group-aware skipped the fence entirely. Both shapes now
+	// reach the fence-aware store with the server-stamped route version.
 	_, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
 		StartKey: []byte("a"),
 		EndKey:   []byte("z"),
@@ -602,9 +708,10 @@ func TestGRPCServer_RawScanAt_GroupedReverseStaysInvalidArgumentWithReadFenceSto
 		GroupId:  42,
 		Reverse:  true,
 	})
-	require.Error(t, err)
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
-	require.Zero(t, st.scanReadRouteVersion)
+	require.NoError(t, err)
+	require.Equal(t, uint64(55), st.scanReadRouteVersion)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.True(t, st.scanReverse)
 }
 
 func TestGRPCServer_RawScanAt_AllowsRouteBoundGroupedReverseWithReadFenceStore(t *testing.T) {
@@ -631,6 +738,40 @@ func TestGRPCServer_RawScanAt_AllowsRouteBoundGroupedReverseWithReadFenceStore(t
 	require.Equal(t, []byte("m"), st.scanReadRouteStart)
 	require.NotNil(t, st.scanReadRouteEnd)
 	require.Empty(t, st.scanReadRouteEnd)
+}
+
+func TestGRPCServer_RawScanAt_AllowsRouteBoundGroupedReverseWithShardStore(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), nil, 1)
+	mvcc := store.NewMVCCStore()
+	t.Cleanup(func() { _ = mvcc.Close() })
+	st := kvstore.NewShardStore(engine, map[uint64]*kvstore.ShardGroup{
+		1: {Store: mvcc},
+	})
+	s := NewGRPCServer(st, nil)
+
+	left := []byte("!redis|meta|a")
+	right := []byte("!redis|meta|z")
+	require.NoError(t, mvcc.PutAt(ctx, left, []byte("left"), 1, 0))
+	require.NoError(t, mvcc.PutAt(ctx, right, []byte("right"), 2, 0))
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey:           []byte("!redis|meta|"),
+		EndKey:             []byte("!redis|meta}"),
+		Limit:              1,
+		Ts:                 2,
+		GroupId:            1,
+		Reverse:            true,
+		RouteStart:         []byte("m"),
+		RouteBoundsPresent: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.Kv, 1)
+	require.Equal(t, right, resp.Kv[0].Key)
+	require.Equal(t, []byte("right"), resp.Kv[0].Value)
 }
 
 func TestGRPCServer_RawScanAt_KeysOnlyWithRouteBoundsUsesReadFence(t *testing.T) {
@@ -714,6 +855,53 @@ func TestGRPCServer_RawScanAt_UsesExplicitGroupForReverse(t *testing.T) {
 	require.Equal(t, []byte("a"), resp.GetKv()[1].Key)
 }
 
+func TestGRPCServer_RawScanAt_ReadFenceAwareStoreFencesExplicitGroupReverse(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name     string
+		keysOnly bool
+	}{
+		{name: "values"},
+		{name: "keys-only", keysOnly: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := &recordingReadFenceGroupStore{
+				recordingRawGroupStore: &recordingRawGroupStore{MVCCStore: store.NewMVCCStore()},
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("va"), 9, 0))
+			require.NoError(t, st.PutAt(ctx, []byte("b"), []byte("vb"), 10, 0))
+			s := NewGRPCServer(st, nil)
+
+			resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+				StartKey: []byte("a"),
+				EndKey:   []byte("z"),
+				Limit:    10,
+				Ts:       10,
+				Reverse:  true,
+				GroupId:  42,
+				KeysOnly: tc.keysOnly,
+			})
+			require.NoError(t, err)
+			require.Len(t, resp.GetKv(), 2)
+			require.Equal(t, []byte("b"), resp.GetKv()[0].GetKey())
+			require.Equal(t, []byte("a"), resp.GetKv()[1].GetKey())
+			require.True(t, st.reverseScan)
+			require.False(t, st.fallbackScan)
+			require.True(t, st.readFenceScanCalled)
+			require.Equal(t, uint64(55), st.readFenceReadRouteVer)
+			require.Equal(t, uint64(42), st.readFenceScanGroupID)
+			require.True(t, st.readFenceScanReverse)
+			require.False(t, st.readFenceRouteBoundsSet)
+			require.Equal(t, uint64(42), st.scanGroupID)
+		})
+	}
+}
+
 func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 
@@ -739,6 +927,70 @@ func TestGRPCServer_RawScanAt_KeysOnlyUsesExplicitGroup(t *testing.T) {
 	require.Equal(t, uint64(42), st.scanGroupID)
 	require.Equal(t, []byte("a"), st.scanStart)
 	require.Equal(t, []byte("z"), st.scanEnd)
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyFallbackOmitsValues(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("a"), []byte("large-value"), 9, 0))
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       9,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Len(t, resp.GetKv(), 1)
+	require.Equal(t, []byte("a"), resp.GetKv()[0].GetKey())
+	require.Empty(t, resp.GetKv()[0].GetValue())
+}
+
+func TestGRPCServer_RawScanAt_KeysOnlyExplicitGroupMergesStagedVisibility(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID:                1,
+				Start:                  []byte("a"),
+				End:                    []byte("z"),
+				GroupID:                1,
+				State:                  distribution.RouteStateActive,
+				StagedVisibilityActive: true,
+				MigrationJobID:         9,
+			},
+		},
+	}))
+	group := &kvstore.ShardGroup{Store: store.NewMVCCStore()}
+	shards := kvstore.NewShardStore(engine, map[uint64]*kvstore.ShardGroup{1: group})
+	t.Cleanup(func() { require.NoError(t, shards.Close()) })
+
+	require.NoError(t, group.Store.PutAt(ctx, []byte("b"), []byte("live-b"), 10, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-b"), 20, 0))
+	require.NoError(t, group.Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("c")), []byte("staged-c"), 30, 0))
+
+	s := NewGRPCServer(shards, nil)
+	resp, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       35,
+		GroupId:  1,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []*pb.RawKVPair{
+		{Key: []byte("b")},
+		{Key: []byte("c")},
+	}, resp.GetKv())
 }
 
 func TestGRPCServer_RawScanAt_ReverseKeysOnlyUsesExplicitGroup(t *testing.T) {
@@ -956,4 +1208,234 @@ func transactionalKVClient(t *testing.T, hosts []string) pb.TransactionalKVClien
 
 	assert.NoError(t, err)
 	return pb.NewTransactionalKVClient(conn)
+}
+
+// A grouped reverse key-scan must reach the fence-aware store too. The
+// keys-only path had the same legacy shortcut ahead of the fence check.
+func TestGRPCServer_RawScanAt_GroupedReverseKeysOnlyStampsReadRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey: []byte("a"),
+		EndKey:   []byte("z"),
+		Limit:    10,
+		Ts:       10,
+		GroupId:  42,
+		Reverse:  true,
+		KeysOnly: true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(55), st.scanReadRouteVersion)
+	require.Equal(t, uint64(42), st.scanGroupID)
+	require.True(t, st.scanReverse)
+}
+
+// A caller-supplied read_route_version must not be lowered by the server for
+// grouped reverse scans either.
+func TestGRPCServer_RawScanAt_GroupedReversePreservesCallerReadRouteVersion(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := &recordingRawReadFenceStore{MVCCStore: store.NewMVCCStore(), routeVersion: 55}
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawScanAt(ctx, &pb.RawScanAtRequest{
+		StartKey:         []byte("a"),
+		EndKey:           []byte("z"),
+		Limit:            10,
+		Ts:               10,
+		GroupId:          42,
+		Reverse:          true,
+		ReadRouteVersion: 97,
+	})
+	require.NoError(t, err)
+	require.Equal(t, uint64(97), st.scanReadRouteVersion)
+}
+
+type recordingVersionPresenceStore struct {
+	store.MVCCStore
+
+	visible   bool
+	supported bool
+	calls     int
+	lastKey   []byte
+	lastGroup uint64
+	lastTS    uint64
+}
+
+func (s *recordingVersionPresenceStore) VersionExistsAtOrBeforeGroupWithReadFence(
+	_ context.Context, key []byte, groupID uint64, ts uint64, _ uint64,
+) (bool, bool, error) {
+	s.calls++
+	s.lastKey = append([]byte(nil), key...)
+	s.lastGroup = groupID
+	s.lastTS = ts
+	return s.visible, s.supported, nil
+}
+
+type recordingVersionPresenceBatchStore struct {
+	store.MVCCStore
+
+	visible              map[string]bool
+	supported            bool
+	calls                int
+	lastKeys             [][]byte
+	lastGroup            uint64
+	lastTS               uint64
+	lastReadRouteVersion uint64
+}
+
+func cloneBytes2D(keys [][]byte) [][]byte {
+	out := make([][]byte, 0, len(keys))
+	for _, key := range keys {
+		out = append(out, append([]byte(nil), key...))
+	}
+	return out
+}
+
+func (s *recordingVersionPresenceBatchStore) VersionsExistAtOrBeforeGroupWithReadFence(
+	_ context.Context, keys [][]byte, groupID uint64, ts uint64, readRouteVersion uint64,
+) ([]bool, bool, error) {
+	s.calls++
+	s.lastKeys = cloneBytes2D(keys)
+	s.lastGroup = groupID
+	s.lastTS = ts
+	s.lastReadRouteVersion = readRouteVersion
+	out := make([]bool, len(keys))
+	for i, key := range keys {
+		out[i] = s.visible[string(key)]
+	}
+	return out, s.supported, nil
+}
+
+// version_visible_at_ts is optional: only a request that asks gets an answer,
+// and a store that cannot answer must not look like "no version exists".
+func TestGRPCServer_RawLatestCommitTS_VersionVisibleProbe(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name           string
+		visibleAtTS    uint64
+		storeVisible   bool
+		storeSupported bool
+		wantCalls      int
+		wantVisible    bool
+		wantSupported  bool
+	}{
+		{
+			name:        "no probe requested",
+			visibleAtTS: 0,
+			wantCalls:   0,
+		},
+		{
+			name:           "version visible at the read timestamp",
+			visibleAtTS:    100,
+			storeVisible:   true,
+			storeSupported: true,
+			wantCalls:      1,
+			wantVisible:    true,
+			wantSupported:  true,
+		},
+		{
+			name:           "no version at or before the read timestamp",
+			visibleAtTS:    100,
+			storeVisible:   false,
+			storeSupported: true,
+			wantCalls:      1,
+			wantVisible:    false,
+			wantSupported:  true,
+		},
+		{
+			name:           "store cannot answer authoritatively",
+			visibleAtTS:    100,
+			storeVisible:   false,
+			storeSupported: false,
+			wantCalls:      1,
+			wantVisible:    false,
+			wantSupported:  false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			st := &recordingVersionPresenceStore{
+				MVCCStore: store.NewMVCCStore(),
+				visible:   tt.storeVisible,
+				supported: tt.storeSupported,
+			}
+			t.Cleanup(func() { _ = st.Close() })
+			s := NewGRPCServer(st, nil)
+
+			resp, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{
+				Key:                []byte("k"),
+				VersionVisibleAtTs: tt.visibleAtTS,
+			})
+			require.NoError(t, err)
+			require.Equal(t, tt.wantVisible, resp.GetVersionVisible())
+			require.Equal(t, tt.wantSupported, resp.GetVersionVisibleSupported())
+			require.Equal(t, tt.wantCalls, st.calls)
+			if tt.wantCalls == 0 {
+				return
+			}
+			require.Equal(t, []byte("k"), st.lastKey)
+			require.Equal(t, tt.visibleAtTS, st.lastTS)
+		})
+	}
+}
+
+func TestGRPCServer_RawLatestCommitTS_BatchVersionVisibleProbe(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingVersionPresenceBatchStore{
+		MVCCStore: store.NewMVCCStore(),
+		visible:   map[string]bool{"a": true, "b": false},
+		supported: true,
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	s := NewGRPCServer(st, nil)
+
+	resp, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{
+		KeyBatch:           pb.EncodeRawLatestCommitTSKeyBatch([][]byte{[]byte("a"), []byte("b")}),
+		GroupId:            42,
+		ReadRouteVersion:   77,
+		VersionVisibleAtTs: 100,
+	})
+	require.NoError(t, err)
+	require.Equal(t, []bool{true, false}, resp.GetVersionVisibleResults())
+	require.True(t, resp.GetVersionVisibleSupported())
+	require.Equal(t, 1, st.calls)
+	require.Equal(t, [][]byte{[]byte("a"), []byte("b")}, st.lastKeys)
+	require.Equal(t, uint64(42), st.lastGroup)
+	require.Equal(t, uint64(100), st.lastTS)
+	require.Equal(t, uint64(77), st.lastReadRouteVersion)
+}
+
+func TestGRPCServer_RawLatestCommitTS_RejectsOversizedBatchBeforeProbe(t *testing.T) {
+	t.Parallel()
+
+	keys := make([][]byte, maxGRPCScanLimit+1)
+	for i := range keys {
+		keys[i] = []byte("k")
+	}
+	st := &recordingVersionPresenceBatchStore{
+		MVCCStore: store.NewMVCCStore(),
+		visible:   map[string]bool{},
+		supported: true,
+	}
+	t.Cleanup(func() { _ = st.Close() })
+	s := NewGRPCServer(st, nil)
+
+	_, err := s.RawLatestCommitTS(context.Background(), &pb.RawLatestCommitTSRequest{
+		KeyBatch:           pb.EncodeRawLatestCommitTSKeyBatch(keys),
+		VersionVisibleAtTs: 100,
+	})
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Zero(t, st.calls)
 }

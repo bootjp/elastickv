@@ -87,11 +87,18 @@ type DecodeOptions struct {
 	// DynamoDBBundleJSONL switches the DynamoDB encoder to the JSONL
 	// bundle layout (`items/data-<part>.jsonl`).
 	DynamoDBBundleJSONL bool
+	// DynamoDBBundleSizeBytes caps each JSONL part. Zero uses 64 MiB.
+	DynamoDBBundleSizeBytes int64
 
 	// WarnSink, when non-nil, receives structured warnings from the
 	// per-adapter encoders ("redis_orphan_ttl", "ddb_orphan_items",
 	// ...). The dispatcher itself does not emit warnings.
 	WarnSink func(event string, fields ...any)
+
+	// countOnly builds adapter state for retained-record accounting without
+	// writing dump files. It is intentionally unexported: callers use
+	// LiveScopeCounter instead of depending on dispatcher internals.
+	countOnly bool
 }
 
 // DecodeCounters reports per-class entry counts after a successful
@@ -185,56 +192,83 @@ type dispatcher struct {
 // validation it runs is the *parameter* validation; filesystem
 // existence / permission errors surface later, on first write.
 func newDispatcher(opts DecodeOptions) (*dispatcher, error) {
-	if opts.OutRoot == "" {
-		return nil, errors.Wrap(ErrDecodeOptionsInvalid, "OutRoot required")
+	opts, err := normalizeDecodeOptions(opts)
+	if err != nil {
+		return nil, err
 	}
 	d := &dispatcher{opts: opts}
 	if opts.Adapters.DynamoDB {
 		d.ddb = NewDDBEncoder(opts.OutRoot).
 			WithBundleJSONL(opts.DynamoDBBundleJSONL).
+			WithBundleSizeBytes(opts.DynamoDBBundleSizeBytes).
+			WithCountOnly(opts.countOnly).
 			WithWarnSink(opts.WarnSink)
 	}
 	if opts.Adapters.S3 {
-		scratch := opts.ScratchRoot
-		if scratch == "" {
-			// NEVER default scratch to OutRoot — S3Encoder.Finalize
-			// runs os.RemoveAll(scratchRoot/s3/) and OutRoot also
-			// holds the *final* assembled bodies at <OutRoot>/s3/.
-			// Sharing the root would wipe the dump immediately after
-			// it lands (gemini r1 security-high on PR #806). The
-			// dedicated `.scratch` subtree keeps the two trees
-			// disjoint regardless of where OutRoot points.
-			scratch = filepath.Join(opts.OutRoot, ".scratch")
+		s3, err := newS3DecodeEncoder(opts)
+		if err != nil {
+			return nil, err
 		}
-		// Belt-and-braces on the operator-supplied path: the
-		// default-path fix above only protects empty ScratchRoot;
-		// a CLI invocation that passes --scratch-root=$OUT explicitly
-		// would still let Finalize wipe the dump (Codex r3 P1 on
-		// PR #806). Fail fast on cleaned-equal paths so the
-		// misconfiguration surfaces as ErrDecodeOptionsInvalid
-		// rather than as silent data loss after a long decode.
-		if filepath.Clean(scratch) == filepath.Clean(opts.OutRoot) {
-			return nil, errors.Wrap(ErrDecodeOptionsInvalid,
-				"ScratchRoot must not equal OutRoot: S3Encoder.Finalize "+
-					"would os.RemoveAll the final <OutRoot>/s3/ tree")
-		}
-		d.s3 = NewS3Encoder(opts.OutRoot, scratch).
-			WithIncludeIncompleteUploads(opts.IncludeIncompleteUploads).
-			WithIncludeOrphans(opts.IncludeOrphans).
-			WithRenameCollisions(opts.RenameS3Collisions).
-			WithWarnSink(opts.WarnSink)
+		d.s3 = s3
 	}
 	if opts.Adapters.Redis {
 		d.redis = NewRedisDB(opts.OutRoot, opts.RedisDBIndex).
+			WithCountOnly(opts.countOnly).
 			WithWarnSink(opts.WarnSink)
 	}
 	if opts.Adapters.SQS {
 		d.sqs = NewSQSEncoder(opts.OutRoot).
 			WithIncludeSideRecords(opts.IncludeSQSSideRecords).
 			WithPreserveVisibility(opts.PreserveSQSVisibility).
+			WithCountOnly(opts.countOnly).
 			WithWarnSink(opts.WarnSink)
 	}
 	return d, nil
+}
+
+func normalizeDecodeOptions(opts DecodeOptions) (DecodeOptions, error) {
+	if opts.OutRoot == "" && !opts.countOnly {
+		return DecodeOptions{}, errors.Wrap(ErrDecodeOptionsInvalid, "OutRoot required")
+	}
+	if opts.OutRoot == "" {
+		opts.OutRoot = "."
+	}
+	if opts.DynamoDBBundleSizeBytes < 0 {
+		return DecodeOptions{}, errors.Wrap(ErrDecodeOptionsInvalid, "DynamoDBBundleSizeBytes must not be negative")
+	}
+	return opts, nil
+}
+
+func newS3DecodeEncoder(opts DecodeOptions) (*S3Encoder, error) {
+	scratch := opts.ScratchRoot
+	if scratch == "" {
+		// NEVER default scratch to OutRoot — S3Encoder.Finalize
+		// runs os.RemoveAll(scratchRoot/s3/) and OutRoot also
+		// holds the *final* assembled bodies at <OutRoot>/s3/.
+		// Sharing the root would wipe the dump immediately after
+		// it lands (gemini r1 security-high on PR #806). The
+		// dedicated `.scratch` subtree keeps the two trees
+		// disjoint regardless of where OutRoot points.
+		scratch = filepath.Join(opts.OutRoot, ".scratch")
+	}
+	// Belt-and-braces on the operator-supplied path: the
+	// default-path fix above only protects empty ScratchRoot;
+	// a CLI invocation that passes --scratch-root=$OUT explicitly
+	// would still let Finalize wipe the dump (Codex r3 P1 on
+	// PR #806). Fail fast on cleaned-equal paths so the
+	// misconfiguration surfaces as ErrDecodeOptionsInvalid
+	// rather than as silent data loss after a long decode.
+	if filepath.Clean(scratch) == filepath.Clean(opts.OutRoot) {
+		return nil, errors.Wrap(ErrDecodeOptionsInvalid,
+			"ScratchRoot must not equal OutRoot: S3Encoder.Finalize "+
+				"would os.RemoveAll the final <OutRoot>/s3/ tree")
+	}
+	return NewS3Encoder(opts.OutRoot, scratch).
+		WithIncludeIncompleteUploads(opts.IncludeIncompleteUploads).
+		WithIncludeOrphans(opts.IncludeOrphans).
+		WithRenameCollisions(opts.RenameS3Collisions).
+		WithCountOnly(opts.countOnly).
+		WithWarnSink(opts.WarnSink), nil
 }
 
 // handleEntry is the per-entry hook ReadSnapshot calls. Tombstones
@@ -326,6 +360,8 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(S3UploadMetaPrefix), routeS3UploadMeta(S3UploadMetaPrefix)},
 		{[]byte(S3UploadPartPrefix), routeS3UploadMeta(S3UploadPartPrefix)},
 		{[]byte(S3BlobPrefix), routeS3Blob},
+		{[]byte(S3ChunkRefPrefix), routeS3ChunkRef},
+		{[]byte(S3ChunkBlobPrefix), routeS3ChunkBlob},
 		{[]byte(S3GCUploadPrefix), routeInternalDrop},
 		{[]byte(S3RoutePrefix), routeInternalDrop},
 		// SQS
@@ -342,6 +378,7 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(RedisHashMetaDeltaPrefix), routeRedisHashMeta},
 		{[]byte(RedisHashMetaPrefix), routeRedisHashMeta},
 		{[]byte(RedisHashFieldPrefix), routeRedisHashField},
+		{[]byte(RedisHashLegacyBlobPrefix), routeRedisHashLegacy},
 		// Redis list
 		{[]byte(ListMetaDeltaPrefix), routeRedisListMetaDelta},
 		{[]byte(ListMetaPrefix), routeRedisListMeta},
@@ -351,6 +388,7 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(RedisSetMetaDeltaPrefix), routeRedisSetMetaDelta},
 		{[]byte(RedisSetMetaPrefix), routeRedisSetMeta},
 		{[]byte(RedisSetMemberPrefix), routeRedisSetMember},
+		{[]byte(RedisSetLegacyBlobPrefix), routeRedisSetLegacy},
 		// Redis zset
 		{[]byte(RedisZSetMetaDeltaPrefix), routeRedisZSetMetaDelta},
 		{[]byte(RedisZSetMetaPrefix), routeRedisZSetMeta},
@@ -470,6 +508,24 @@ func routeS3Blob(d *dispatcher, k, v []byte) error {
 	}
 	d.counters.S3++
 	return d.s3.HandleBlob(k, v)
+}
+
+func routeS3ChunkRef(d *dispatcher, k, v []byte) error {
+	if d.s3 == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.S3++
+	return d.s3.HandleChunkRef(k, v)
+}
+
+func routeS3ChunkBlob(d *dispatcher, k, v []byte) error {
+	if d.s3 == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.S3++
+	return d.s3.HandleChunkBlob(k, v)
 }
 
 // routeS3UploadMeta returns a handler that forwards a specific
@@ -651,6 +707,24 @@ func routeRedisZSetScore(d *dispatcher, k, v []byte) error {
 	}
 	d.counters.Redis++
 	return d.redis.HandleZSetScore(k, v)
+}
+
+func routeRedisHashLegacy(d *dispatcher, k, v []byte) error {
+	if d.redis == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.Redis++
+	return d.redis.HandleHashLegacyBlob(k, v)
+}
+
+func routeRedisSetLegacy(d *dispatcher, k, v []byte) error {
+	if d.redis == nil {
+		d.counters.Internal++
+		return nil
+	}
+	d.counters.Redis++
+	return d.redis.HandleSetLegacyBlob(k, v)
 }
 
 func routeRedisZSetLegacy(d *dispatcher, k, v []byte) error {

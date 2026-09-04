@@ -1282,7 +1282,20 @@ func (s *DistributionServer) ensureSplitJobCatalogFence(
 	}
 	left, right := splitCatalogRoutes(sourceRoute, job.SplitKey, leftID, rightID, job.FenceTS)
 	right.State = distribution.RouteStateWriteFenced
-	snapshot, err = s.saveSplitResultViaCoordinator(ctx, snapshot.ReadTS, snapshot.Version, sourceRoute.RouteID, nil, left, right)
+	// The catalog write goes through the coordinator, so it needs a real read
+	// timestamp token rather than the bare snapshot.ReadTS: the dispatch below
+	// consumes its voucher. Pinned at the snapshot the fence was planned from.
+	readTimestamp, err := kv.BeginReadTimestampThrough(
+		ctx,
+		s.coordinator,
+		snapshot.ReadTS,
+		"split job catalog fence: begin read timestamp",
+	)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, grpcStatusErrorf(
+			codes.Internal, "begin split job fence snapshot: %v", err)
+	}
+	snapshot, err = s.saveSplitResultViaCoordinator(ctx, readTimestamp, snapshot.Version, sourceRoute.RouteID, nil, left, right)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, err
 	}

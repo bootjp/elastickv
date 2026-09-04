@@ -108,6 +108,8 @@ func (f *fakeEngine) Configuration(context.Context) (raftengine.Configuration, e
 	return f.config, nil
 }
 
+func (f *fakeEngine) SnapshotEvery() uint64 { return 10_000 }
+
 func (f *fakeEngine) CheckServing(context.Context) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -202,14 +204,16 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 				ID:      "node-1",
 				Address: "127.0.0.1:50051",
 			},
-			Term:              7,
-			CommitIndex:       10,
-			AppliedIndex:      9,
-			LastLogIndex:      12,
-			LastSnapshotIndex: 8,
-			FSMPending:        1,
-			NumPeers:          2,
-			LastContact:       0,
+			Term:               7,
+			CommitIndex:        10,
+			AppliedIndex:       9,
+			LastLogIndex:       12,
+			LastSnapshotIndex:  8,
+			FSMPending:         1,
+			NumPeers:           2,
+			LastContact:        0,
+			ConfigurationIndex: 6,
+			PendingConfChange:  true,
 		},
 		config: raftengine.Configuration{
 			Servers: []raftengine.Server{
@@ -225,6 +229,11 @@ func TestServerMapsEngineAdminMethods(t *testing.T) {
 	require.Equal(t, pb.RaftAdminState_RAFT_ADMIN_STATE_LEADER, statusResp.State)
 	require.Equal(t, "node-1", statusResp.LeaderId)
 	require.Equal(t, uint64(10), statusResp.CommitIndex)
+	require.Equal(t, uint64(6), statusResp.ConfigurationIndex)
+	require.True(t, statusResp.PendingConfChange)
+	engine.mu.Lock()
+	engine.status.PendingConfChange = false
+	engine.mu.Unlock()
 
 	cfgResp, err := server.Configuration(context.Background(), &pb.RaftAdminConfigurationRequest{})
 	require.NoError(t, err)
@@ -360,6 +369,45 @@ func TestRegisterOperationalServicesPublishesLeaderHealth(t *testing.T) {
 	}, 5*time.Second, 50*time.Millisecond)
 }
 
+func TestRegisterOperationalServicesPublishesStaticServingHealth(t *testing.T) {
+	t.Parallel()
+
+	engine := &fakeEngine{
+		status:  raftengine.Status{State: raftengine.StateFollower},
+		serving: false,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	listener := bufconn.Listen(1024 * 1024)
+	server := grpc.NewServer()
+	RegisterOperationalServicesWithInterceptorAndStaticServing(ctx, server, engine, []string{"RawKV"}, []string{"S3BlobFetch"}, nil)
+	go func() {
+		_ = server.Serve(listener)
+	}()
+	t.Cleanup(server.Stop)
+
+	conn, err := grpc.NewClient(
+		"passthrough:///bufnet",
+		grpc.WithContextDialer(func(context.Context, string) (net.Conn, error) {
+			return listener.Dial()
+		}),
+		grpc.WithTransportCredentials(insecure.NewCredentials()),
+	)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+
+	client := healthpb.NewHealthClient(conn)
+	require.Eventually(t, func() bool {
+		resp, checkErr := client.Check(context.Background(), &healthpb.HealthCheckRequest{Service: "S3BlobFetch"})
+		return checkErr == nil && resp.Status == healthpb.HealthCheckResponse_SERVING
+	}, 5*time.Second, 50*time.Millisecond)
+	require.Eventually(t, func() bool {
+		resp, checkErr := client.Check(context.Background(), &healthpb.HealthCheckRequest{Service: "RawKV"})
+		return checkErr == nil && resp.Status == healthpb.HealthCheckResponse_NOT_SERVING
+	}, 5*time.Second, 50*time.Millisecond)
+}
+
 type stateOnlyEngine struct {
 	state raftengine.State
 }
@@ -389,6 +437,8 @@ func (s stateOnlyEngine) Status() raftengine.Status { return raftengine.Status{S
 func (s stateOnlyEngine) Configuration(context.Context) (raftengine.Configuration, error) {
 	return raftengine.Configuration{}, nil
 }
+
+func (s stateOnlyEngine) SnapshotEvery() uint64 { return 10_000 }
 
 func TestCurrentHealthStatusFallsBackToLocalState(t *testing.T) {
 	t.Parallel()
@@ -435,10 +485,10 @@ type recordingInterceptor struct {
 	preHook func(raftID string) // optional callback; useful for ordering assertions
 }
 
-func (r *recordingInterceptor) PreAddMember(_ context.Context, raftID string) error {
+func (r *recordingInterceptor) PreAddMember(_ context.Context, raftID, address string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.calls = append(r.calls, raftID)
+	r.calls = append(r.calls, raftID+"@"+address)
 	if r.preHook != nil {
 		r.preHook(raftID)
 	}
@@ -460,7 +510,7 @@ func TestServer_AddVoter_InvokesInterceptorBeforeConfChange(t *testing.T) {
 	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
-	require.Equal(t, []string{"n42"}, interceptor.calls)
+	require.Equal(t, []string{"n42@127.0.0.1:9999"}, interceptor.calls)
 	require.Equal(t, []string{"preAdd", "addVoter"}, order)
 	require.Equal(t, 1, len(engine.addVoterCalls))
 }
@@ -477,7 +527,7 @@ func TestServer_AddVoter_InterceptorErrorAbortsConfChange(t *testing.T) {
 	resp, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
 	require.Error(t, err)
 	require.Nil(t, resp)
-	require.Equal(t, []string{"n42"}, interceptor.calls)
+	require.Equal(t, []string{"n42@127.0.0.1:9999"}, interceptor.calls)
 	require.Equal(t, 0, len(engine.addVoterCalls), "engine.AddVoter must NOT be called when PreAddMember errs")
 }
 
@@ -495,6 +545,82 @@ func TestServer_AddVoter_NilInterceptorSkipsPreStep(t *testing.T) {
 	require.Equal(t, 1, len(engine.addVoterCalls))
 }
 
+func TestServer_AddMemberRejectsPendingConfigBeforeInterceptor(t *testing.T) {
+	t.Parallel()
+
+	for _, test := range []struct {
+		name string
+		call func(*Server) error
+	}{
+		{
+			name: "voter",
+			call: func(server *Server) error {
+				_, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n42", Address: "127.0.0.1:9999"})
+				return err
+			},
+		},
+		{
+			name: "learner",
+			call: func(server *Server) error {
+				_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "n42", Address: "127.0.0.1:9999"})
+				return err
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			engine := &fakeEngine{status: raftengine.Status{PendingConfChange: true}}
+			interceptor := &recordingInterceptor{}
+			server := NewServerWithInterceptor(engine, interceptor)
+
+			err := test.call(server)
+			require.Equal(t, codes.FailedPrecondition, status.Code(err))
+			require.ErrorContains(t, err, raftengine.ErrMembershipChangePending.Error())
+			require.Empty(t, interceptor.calls)
+			require.Empty(t, engine.addVoterCalls)
+			require.Empty(t, engine.addLearnerCalls)
+		})
+	}
+}
+
+func TestServerSerializesMembershipInterceptorAndProposal(t *testing.T) {
+	t.Parallel()
+
+	firstProposalEntered := make(chan struct{})
+	releaseFirstProposal := make(chan struct{})
+	interceptorCalls := make(chan string, 2)
+	engine := &fakeEngine{addVoterHook: func() {
+		close(firstProposalEntered)
+		<-releaseFirstProposal
+	}}
+	interceptor := &recordingInterceptor{preHook: func(id string) { interceptorCalls <- id }}
+	server := NewServerWithInterceptor(engine, interceptor)
+
+	firstDone := make(chan error, 1)
+	go func() {
+		_, err := server.AddVoter(context.Background(), &pb.RaftAdminAddVoterRequest{Id: "n1", Address: "127.0.0.1:9001"})
+		firstDone <- err
+	}()
+	require.Equal(t, "n1", <-interceptorCalls)
+	<-firstProposalEntered
+
+	secondDone := make(chan error, 1)
+	go func() {
+		_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "n2", Address: "127.0.0.1:9002"})
+		secondDone <- err
+	}()
+	select {
+	case id := <-interceptorCalls:
+		require.Failf(t, "concurrent interceptor ran", "interceptor for %s ran before the first membership proposal completed", id)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(releaseFirstProposal)
+	require.NoError(t, <-firstDone)
+	require.Equal(t, "n2", <-interceptorCalls)
+	require.NoError(t, <-secondDone)
+}
+
 // TestServer_AddLearner_InterceptorContract is the symmetric set for
 // AddLearner — combined into one test since the behavior mirrors
 // AddVoter exactly.
@@ -507,7 +633,7 @@ func TestServer_AddLearner_InterceptorContract(t *testing.T) {
 		server := NewServerWithInterceptor(engine, interceptor)
 		_, err := server.AddLearner(context.Background(), &pb.RaftAdminAddLearnerRequest{Id: "l1", Address: "127.0.0.1:9000"})
 		require.NoError(t, err)
-		require.Equal(t, []string{"l1"}, interceptor.calls)
+		require.Equal(t, []string{"l1@127.0.0.1:9000"}, interceptor.calls)
 		require.Equal(t, 1, len(engine.addLearnerCalls))
 	})
 	t.Run("interceptor error aborts", func(t *testing.T) {
