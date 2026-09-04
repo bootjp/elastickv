@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	stderrors "errors"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -40,6 +41,10 @@ func TestRenewBackupKeepsAConcurrentlyRenewedSession(t *testing.T) {
 	tok, err := srv.decodeBackupToken(begin.GetPinToken())
 	require.NoError(t, err)
 
+	// onPropose runs on the goroutine proposeBackupAll spawns per group, so it
+	// must not call require: t.FailNow is only defined on the test goroutine.
+	// Record the outcome and assert it below.
+	var extended atomic.Bool
 	proposer.mu.Lock()
 	proposer.failures[backupSubtypePin] = 8
 	proposer.transportError[backupSubtypePin] = stderrors.New("leader unavailable")
@@ -50,12 +55,13 @@ func TestRenewBackupKeepsAConcurrentlyRenewedSession(t *testing.T) {
 		// Exactly once, and only after RenewBackup has read the generation it
 		// will compare against.
 		proposer.onPropose = nil
-		require.True(t, srv.extendBackupSession(tok))
+		extended.Store(srv.extendBackupSession(tok))
 	}
 	proposer.mu.Unlock()
 
 	_, err = srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
 	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.True(t, extended.Load(), "the concurrent renewal must have extended the session")
 
 	// The session the concurrent renewal owns must survive, and no release or
 	// unreserve may have been proposed on its behalf.
@@ -215,4 +221,56 @@ func TestBeginBackupSkipsUnreserveOnDefinitiveCapacityRejection(t *testing.T) {
 	require.Equal(t, codes.ResourceExhausted, status.Code(err))
 	require.NotContains(t, proposer.subtypes(), backupSubtypeUnreserve,
 		"a definitive capacity rejection reserved nothing")
+}
+
+// A newer generation only proves someone else owns the pins while the session
+// is still live. If EndBackup has marked it closing, no renewal will ever own
+// it again -- that is precisely what the closing flag exists to express -- so a
+// failed renewal that raced both a successful renewal and EndBackup must still
+// compensate. Skipping it leaves the reserve or partial pins this attempt
+// committed active until their TTL, after EndBackup already released, blocking
+// compaction and holding a global backup slot for an ended backup.
+func TestRenewBackupCompensatesWhenTheSessionIsClosing(t *testing.T) {
+	t.Parallel()
+
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(
+		t,
+		&backupTestStore{},
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: proposer},
+		nil,
+	)
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	tok, err := srv.decodeBackupToken(begin.GetPinToken())
+	require.NoError(t, err)
+
+	// See the note above about require in this callback.
+	var extended atomic.Bool
+	proposer.mu.Lock()
+	proposer.failures[backupSubtypePin] = 8
+	proposer.transportError[backupSubtypePin] = stderrors.New("leader unavailable")
+	proposer.onPropose = func(subtype byte, _ uint64) {
+		if subtype != backupSubtypeReserve {
+			return
+		}
+		proposer.onPropose = nil
+		// A concurrent renewal lands (advancing the generation) and EndBackup
+		// then starts tearing the session down, both after this renewal read
+		// the generation it will be compared against.
+		extended.Store(srv.extendBackupSession(tok))
+		srv.closeBackupSession(tok.pinID)
+	}
+	proposer.mu.Unlock()
+
+	_, err = srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
+	require.Equal(t, codes.Unavailable, status.Code(err))
+	require.True(t, extended.Load(), "the concurrent renewal must have extended the session")
+
+	require.Contains(t, proposer.subtypes(), backupSubtypeRelease,
+		"a closing session has no renewal owner; the failed attempt must still release")
+	require.Contains(t, proposer.subtypes(), backupSubtypeUnreserve,
+		"a closing session has no renewal owner; the failed attempt must still unreserve")
 }

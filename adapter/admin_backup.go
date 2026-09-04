@@ -1304,6 +1304,9 @@ const (
 	backupSessionOwnershipAbsent backupSessionOwnership = iota
 	// backupSessionOwnershipTaken: a newer generation owns the session.
 	backupSessionOwnershipTaken
+	// backupSessionOwnershipClosing: EndBackup is tearing the session down, so
+	// no renewal owns its pins even if the generation has moved on.
+	backupSessionOwnershipClosing
 	// backupSessionOwnershipDropped: the caller's own session was removed.
 	backupSessionOwnershipDropped
 )
@@ -1323,6 +1326,15 @@ func (s *AdminServer) forgetBackupSessionAtGeneration(
 	session, ok := s.backupSessions[pinID]
 	if !ok {
 		return backupSessionOwnershipAbsent
+	}
+	// A closing session is being torn down by EndBackup, which has already
+	// proposed (or is proposing) its releases. Nothing will renew it again, so
+	// there is no owner to preserve and a newer generation does not make this
+	// attempt's half-committed reserve or pins someone else's problem -- that is
+	// the leak the closing flag exists to prevent. The entry is left in place
+	// for EndBackup's own deferred cleanup rather than deleted from under it.
+	if session.closing {
+		return backupSessionOwnershipClosing
 	}
 	if session.generation != generation {
 		return backupSessionOwnershipTaken
