@@ -1512,7 +1512,13 @@ type distributionCoordinatorStub struct {
 }
 
 func (s *distributionCoordinatorStub) TimestampAllocator() kv.TimestampAllocator {
-	return s.allocator
+	if s.allocator != nil {
+		return s.allocator
+	}
+	// With no explicit allocator the stub allocates for itself, so tests that
+	// drive timestampNext / assert on timestampCalls see their own values
+	// rather than a real clock.
+	return s
 }
 
 func (s *distributionCoordinatorStub) VouchAppliedReadTimestamp(uint64, kv.AppliedReadTimestampVoucherRef) error {

@@ -25,17 +25,17 @@ import (
 
 // DistributionServer serves distribution related gRPC APIs.
 type DistributionServer struct {
-	mu                 sync.Mutex
-	engine             *distribution.Engine
-	catalog            *distribution.CatalogStore
-	coordinator        kv.Coordinator
-	timestampAllocator kv.TSOAllocator
-	readTracker        *kv.ActiveTimestampTracker
-	watchInterval      time.Duration
-	watchLeader        func() bool
-	tsoActivationGate  func(cutover, phaseD bool) error
-	fsObserver         DistributionFilesystemObserver
-	readBlocked        func() bool
+	mu                          sync.Mutex
+	engine                      *distribution.Engine
+	catalog                     *distribution.CatalogStore
+	coordinator                 kv.Coordinator
+	timestampAllocator          kv.TSOAllocator
+	readTracker                 *kv.ActiveTimestampTracker
+	watchInterval               time.Duration
+	watchLeader                 func() bool
+	tsoActivationGate           func(cutover, phaseD bool) error
+	fsObserver                  DistributionFilesystemObserver
+	readBlocked                 func() bool
 	migrationCapabilityGate     SplitMigrationCapabilityGate
 	splitJobRunnerReady         bool
 	splitJobRunnerReadinessGate SplitMigrationCapabilityGate
@@ -44,7 +44,7 @@ type DistributionServer struct {
 	splitMigrationVoterFactory  SplitMigrationVoterFactory
 	knownRaftGroups             map[uint64]struct{}
 	splitJobHistoryGCLast       time.Time
-	reloadRetry        struct {
+	reloadRetry                 struct {
 		attempts int
 		interval time.Duration
 	}
