@@ -5664,32 +5664,31 @@ func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) 
 
 // DeletePrefixAt applies a prefix delete to every shard in the store.
 func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
-		return err
-	}
-	routes, err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS)
-	if err != nil {
-		return err
-	}
-	for groupID, g := range s.groups {
-		if g == nil || g.Store == nil {
-			continue
-		}
-		deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
-			return g.Store.DeletePrefixAt(ctx, stagedPrefix, stagedExcludePrefix, commitTS)
-		}
-		if err := deleteStagedVisibilityPrefixes(routesForGroupID(routes, groupID), prefix, excludePrefix, deleteStagedPrefix); err != nil {
-			return err
-		}
-		if err := g.Store.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	return nil
+	return s.deletePrefixEverywhere(ctx, prefix, excludePrefix, commitTS,
+		func(g *ShardGroup, p, exclude []byte) error {
+			return g.Store.DeletePrefixAt(ctx, p, exclude, commitTS)
+		})
 }
 
 // DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
 func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.deletePrefixEverywhere(ctx, prefix, excludePrefix, commitTS,
+		func(g *ShardGroup, p, exclude []byte) error {
+			return g.Store.DeletePrefixAtRaft(ctx, p, exclude, commitTS)
+		})
+}
+
+// deletePrefixEverywhere is the shared body of DeletePrefixAt and
+// DeletePrefixAtRaft: prove the floors and migration readiness once, then let
+// each group delete its staged aliases before the live prefix. Only the
+// per-group delete call differs between the two.
+func (s *ShardStore) deletePrefixEverywhere(
+	ctx context.Context,
+	prefix []byte,
+	excludePrefix []byte,
+	commitTS uint64,
+	deleteOne func(g *ShardGroup, prefix, excludePrefix []byte) error,
+) error {
 	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
 		return err
 	}
@@ -5702,12 +5701,12 @@ func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excl
 			continue
 		}
 		deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
-			return g.Store.DeletePrefixAtRaft(ctx, stagedPrefix, stagedExcludePrefix, commitTS)
+			return deleteOne(g, stagedPrefix, stagedExcludePrefix)
 		}
 		if err := deleteStagedVisibilityPrefixes(routesForGroupID(routes, groupID), prefix, excludePrefix, deleteStagedPrefix); err != nil {
 			return err
 		}
-		if err := g.Store.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS); err != nil {
+		if err := deleteOne(g, prefix, excludePrefix); err != nil {
 			return errors.WithStack(err)
 		}
 	}

@@ -415,20 +415,30 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
-	case data[0] == raftEncodeMigrationImport:
-		return f.applyMigrationImport(ctx, data[1:]), true
-	case data[0] == raftEncodeMigrationRetire:
-		return f.applyMigrationRetire(ctx, data[1:]), true
-	case data[0] == raftEncodeMigrationPromote:
-		return f.applyMigrationPromote(ctx, data[1:]), true
 	case data[0] == raftEncodeBackup:
 		return f.applyBackup(data[1:]), true
-	case data[0] == raftEncodeTargetReadiness:
-		return f.applyTargetStagedReadiness(ctx, data[1:]), true
-	case data[0] == raftEncodeMigrationCleanup:
-		return f.applyMigrationCleanup(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
+	default:
+		return f.applyMigrationOpcode(ctx, data)
+	}
+}
+
+// applyMigrationOpcode handles the range-migration half of the reserved opcode
+// space. Split out of applyReservedOpcode purely to keep that switch inside the
+// cyclop budget; the two together are still one flat dispatch.
+func (f *kvFSM) applyMigrationOpcode(ctx context.Context, data []byte) (any, bool) {
+	switch data[0] {
+	case raftEncodeMigrationImport:
+		return f.applyMigrationImport(ctx, data[1:]), true
+	case raftEncodeMigrationRetire:
+		return f.applyMigrationRetire(ctx, data[1:]), true
+	case raftEncodeMigrationPromote:
+		return f.applyMigrationPromote(ctx, data[1:]), true
+	case raftEncodeTargetReadiness:
+		return f.applyTargetStagedReadiness(ctx, data[1:]), true
+	case raftEncodeMigrationCleanup:
+		return f.applyMigrationCleanup(ctx, data[1:]), true
 	default:
 		return nil, false
 	}
@@ -636,15 +646,34 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 	if distribution.IsReservedControlKey(mut.Key) {
 		return errors.WithStack(ErrInvalidRequest)
 	}
-	if err := f.verifySourceWriteFenceForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
+	if err := f.verifyRawMutationFencesAndFloors(ctx, mut.Key, writeFenceBypassKeys, commitTS, floorSnap); err != nil {
 		return err
 	}
-	if _, bypass := writeFenceBypassKeys[string(mut.Key)]; !bypass {
-		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
+		return err
+	}
+	return nil
+}
+
+// verifyRawMutationFencesAndFloors runs the fence, floor and migration-readiness
+// gates for one raw mutation key. Split out of validateRawMutationForApply to
+// keep that function inside the cyclop budget.
+func (f *kvFSM) verifyRawMutationFencesAndFloors(
+	ctx context.Context,
+	key []byte,
+	writeFenceBypassKeys map[string]struct{},
+	commitTS uint64,
+	floorSnap RouteSnapshot,
+) error {
+	if err := f.verifySourceWriteFenceForRange(ctx, key, nextScanCursor(key)); err != nil {
+		return err
+	}
+	if _, bypass := writeFenceBypassKeys[string(key)]; !bypass {
+		if err := f.verifyRouteNotFencedForKey(key); err != nil {
 			return err
 		}
 	}
-	if err := verifyRouteWriteTimestampFloorForKeyFromSnapshot(floorSnap, mut.Key, commitTS); err != nil {
+	if err := verifyRouteWriteTimestampFloorForKeyFromSnapshot(floorSnap, key, commitTS); err != nil {
 		return err
 	}
 	// A pinned request is governed by its observed snapshot alone -- that is the
@@ -652,17 +681,11 @@ func (f *kvFSM) validateRawMutationForApply(ctx context.Context, mut *pb.Mutatio
 	// writes the pinned view admits. An unpinned apply has no observed view, so
 	// the current snapshot's floor is the only one that can bound it.
 	if floorSnap == nil {
-		if err := f.verifyRouteWriteFloorForKey(mut.Key, commitTS); err != nil {
+		if err := f.verifyRouteWriteFloorForKey(key, commitTS); err != nil {
 			return err
 		}
 	}
-	if err := f.verifyTargetReadinessForRange(ctx, mut.Key, nextScanCursor(mut.Key)); err != nil {
-		return err
-	}
-	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, nil, 0); err != nil {
-		return err
-	}
-	return nil
+	return f.verifyTargetReadinessForRange(ctx, key, nextScanCursor(key))
 }
 
 // extractDelPrefix checks if the mutations contain a DEL_PREFIX operation.
@@ -2221,20 +2244,6 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 		return nil
 	}
 	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, startTS, abortTS, f.pendingApplyIdx))
-}
-
-func (f *kvFSM) uniqueMutationsAboveWriteFloor(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {
-	uniq, err := uniqueMutations(muts)
-	if err != nil {
-		return nil, err
-	}
-	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
-		return nil, err
-	}
-	if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {
-		return nil, err
-	}
-	return uniq, nil
 }
 
 func (f *kvFSM) uniqueAbortCleanupMutations(_ context.Context, muts []*pb.Mutation) ([]*pb.Mutation, error) {

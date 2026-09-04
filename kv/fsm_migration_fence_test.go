@@ -5,13 +5,12 @@ import (
 	"context"
 	"testing"
 
-	"github.com/cockroachdb/errors"
-
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -810,29 +809,6 @@ func TestFSMTimestampFloorUsesObservedSnapshotDuringApply(t *testing.T) {
 	got, getErr := fsm.store.GetAt(ctx, []byte("z"), ^uint64(0))
 	require.NoError(t, getErr)
 	require.Equal(t, []byte("proposed-before-floor"), got)
-}
-
-type deletePrefixIndexRecordingStore struct {
-	store.MVCCStore
-
-	deletePrefixIndexes  []uint64
-	deletePrefixPrefixes [][]byte
-}
-
-func (s *deletePrefixIndexRecordingStore) MigrationTargetReadinessStates(ctx context.Context) ([]store.TargetStagedReadinessState, error) {
-	reader, ok := s.MVCCStore.(store.MigrationTargetReadinessReader)
-	if !ok {
-		return nil, nil
-	}
-	return reader.MigrationTargetReadinessStates(ctx)
-}
-
-func (s *deletePrefixIndexRecordingStore) ApplyTargetStagedReadiness(ctx context.Context, state store.TargetStagedReadinessState) error {
-	writer, ok := s.MVCCStore.(store.MigrationTargetReadinessWriter)
-	if !ok {
-		return store.ErrNotSupported
-	}
-	return writer.ApplyTargetStagedReadiness(ctx, state)
 }
 
 func newTargetReadinessFSM(t *testing.T, route distribution.RouteDescriptor) *kvFSM {
@@ -1803,10 +1779,4 @@ func TestFSMAbortCleanupBypassesTargetReadiness(t *testing.T) {
 	require.ErrorIs(t, lockErr, store.ErrKeyNotFound)
 	_, intentErr := fsm.store.GetAt(ctx, txnIntentKey(primaryKey), ^uint64(0))
 	require.ErrorIs(t, intentErr, store.ErrKeyNotFound)
-}
-
-func (s *deletePrefixIndexRecordingStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
-	s.deletePrefixIndexes = append(s.deletePrefixIndexes, appliedIndex)
-	s.deletePrefixPrefixes = append(s.deletePrefixPrefixes, append([]byte(nil), prefix...))
-	return s.MVCCStore.DeletePrefixAtRaftAt(ctx, prefix, excludePrefix, commitTS, appliedIndex)
 }
