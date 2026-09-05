@@ -16,7 +16,7 @@ require (
 	github.com/cockroachdb/pebble/v2 v2.1.7
 	github.com/coreos/go-semver v0.3.1
 	github.com/emirpasic/gods v1.18.1
-	github.com/getsentry/sentry-go v0.48.0
+	github.com/getsentry/sentry-go v0.49.0
 	github.com/goccy/go-json v0.10.6
 	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/klauspost/compress v1.19.2
