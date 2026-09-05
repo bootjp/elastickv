@@ -439,7 +439,15 @@ func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupReques
 	if err != nil {
 		return nil, err
 	}
-	if err := s.requireRenewableBackupToken(tok); err != nil {
+	// Admission and ownership capture must be one critical section. Reading the
+	// generation later -- after the route snapshot and group lookups -- let a
+	// renewal that completed in that window advance the generation first, so
+	// this attempt recorded the *other* renewal's generation as its own. Its
+	// failure path then saw an unchanged generation, concluded it still owned
+	// the session, and released pins the other caller had already been handed a
+	// valid token for.
+	generation, live, err := s.admitBackupRenewal(tok)
+	if err != nil {
 		return nil, err
 	}
 	if _, err := s.backupRouteSnapshotForToken(tok); err != nil {
@@ -449,7 +457,6 @@ func (s *AdminServer) RenewBackup(ctx context.Context, req *pb.RenewBackupReques
 	if err != nil {
 		return nil, err
 	}
-	generation, live := s.backupSessionGeneration(tok)
 	deadline, err := s.renewBackupGroups(ctx, groups, tok.pinID, tok.readTS, ttl)
 	if err != nil {
 		s.abandonFailedRenewal(groups, tok, generation, live)
@@ -1263,6 +1270,33 @@ func (s *AdminServer) closeBackupSession(pinID kv.BackupPinID) {
 // holding only the old token, and rejecting it would strand the backup without
 // a current token even though its pin is still live and still fencing
 // retention.
+// admitBackupRenewal is requireRenewableBackupToken plus the generation this
+// attempt is starting from, both read under one hold of backupStateMu so no
+// concurrent renewal can advance the generation between the two.
+func (s *AdminServer) admitBackupRenewal(tok backupToken) (uint64, bool, error) {
+	now := s.nowSnapshot()
+	s.backupStateMu.Lock()
+	defer s.backupStateMu.Unlock()
+	session, ok := s.backupSessions[tok.pinID]
+	if ok && session.closing {
+		return 0, false, status.Errorf(codes.FailedPrecondition, "%s", "backup pin is being released")
+	}
+	// live means: a session exists at this pin and its read timestamp still
+	// matches the token, i.e. this attempt has a session to own.
+	live := ok && session.readTS == tok.readTS
+	generation := uint64(0)
+	if live {
+		generation = session.generation
+	}
+	if !tok.deadline.IsZero() && now.Before(tok.deadline) {
+		return generation, live, nil
+	}
+	if !ok || session.readTS != tok.readTS || !now.Before(session.deadline) {
+		return 0, false, status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
+	}
+	return generation, live, nil
+}
+
 func (s *AdminServer) requireRenewableBackupToken(tok backupToken) error {
 	now := s.nowSnapshot()
 	s.backupStateMu.Lock()
@@ -1278,19 +1312,6 @@ func (s *AdminServer) requireRenewableBackupToken(tok backupToken) error {
 		return status.Errorf(codes.FailedPrecondition, "%s", "backup pin token has expired")
 	}
 	return nil
-}
-
-// backupSessionGeneration reports the generation a renewal is starting from.
-// ok is false when there is no live session for the token, in which case there
-// is nothing for a failed renewal to tear down.
-func (s *AdminServer) backupSessionGeneration(tok backupToken) (uint64, bool) {
-	s.backupStateMu.Lock()
-	defer s.backupStateMu.Unlock()
-	session, ok := s.backupSessions[tok.pinID]
-	if !ok || session.readTS != tok.readTS {
-		return 0, false
-	}
-	return session.generation, true
 }
 
 // backupSessionOwnership distinguishes the two reasons a generation-guarded

@@ -274,3 +274,48 @@ func TestRenewBackupCompensatesWhenTheSessionIsClosing(t *testing.T) {
 	require.Contains(t, proposer.subtypes(), backupSubtypeUnreserve,
 		"a closing session has no renewal owner; the failed attempt must still unreserve")
 }
+
+// A renewal owns the generation it was ADMITTED with. Reading the generation
+// later -- after the route snapshot and group lookups, as this originally did --
+// let a renewal that completed in that window advance it first, so this attempt
+// recorded the other renewal's generation as its own. Its failure path then saw
+// an unchanged generation, concluded it still owned the session, and released
+// pins the other caller had already been handed a valid renewed token for,
+// letting compaction proceed underneath a live backup.
+//
+// admitBackupRenewal reads admission and ownership under one hold of
+// backupStateMu, so the generation cannot move between them. This asserts the
+// consequence: once another renewal completes, the admitted generation is stale
+// and the failure path must classify the session as owned by someone else.
+func TestBackupRenewalOwnsTheGenerationItWasAdmittedWith(t *testing.T) {
+	t.Parallel()
+
+	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
+	proposer := newBackupTestProposer()
+	srv := newBackupControlTestServer(
+		t,
+		&backupTestStore{},
+		map[uint64]*backupTestGroup{1: group},
+		map[uint64]*backupTestProposer{1: proposer},
+		nil,
+	)
+	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
+	require.NoError(t, err)
+	tok, err := srv.decodeBackupToken(begin.GetPinToken())
+	require.NoError(t, err)
+
+	// Renewal A is admitted and captures the generation it starts from.
+	admitted, live, err := srv.admitBackupRenewal(tok)
+	require.NoError(t, err)
+	require.True(t, live)
+
+	// Renewal B completes and is handed a valid renewed token.
+	require.True(t, srv.extendBackupSession(tok))
+
+	// A now fails. The session belongs to B, so A must leave B's pins alone.
+	require.Equal(t, backupSessionOwnershipTaken,
+		srv.forgetBackupSessionAtGeneration(tok.pinID, admitted),
+		"a renewal that captured its generation late would see B's generation as its own and release B's pins")
+	require.NotContains(t, proposer.subtypes(), backupSubtypeRelease)
+	require.NotContains(t, proposer.subtypes(), backupSubtypeUnreserve)
+}
