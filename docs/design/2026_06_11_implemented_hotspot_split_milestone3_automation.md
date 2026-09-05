@@ -11,7 +11,7 @@ Date: 2026-06-11
 Updated: 2026-07-23
 
 Parent: [2026_02_18_partial_hotspot_shard_split.md](2026_02_18_partial_hotspot_shard_split.md) §12 "Milestone 3: Automation" (1. Access aggregation, 2. Hotspot detector, 3. Auto-split scheduler with cooldown/hysteresis).
-Sibling: [2026_06_11_partial_hotspot_split_milestone2_migration.md](2026_06_11_partial_hotspot_split_milestone2_migration.md) (M2 — migration plane). M3 composes with M2 but does **not** depend on it for first value (see §2, §6).
+Sibling: [2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md) (M2 — migration plane). M3 composes with M2 but does **not** depend on it for first value (see §2, §6).
 
 ## 1. Background
 
