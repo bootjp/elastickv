@@ -35,12 +35,17 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 	}
 	writer, ok := f.store.(store.MigrationTargetReadinessWriter)
 	if !ok {
-		return errors.WithStack(store.ErrNotSupported)
+		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrTargetReadinessApply), "kv/fsm: target staged readiness store"))
 	}
 	state := targetStagedReadinessStateFromProto(req)
 	state = f.preserveMigrationTrackerMinimum(ctx, state)
 	if err := applyTargetStagedReadinessAt(ctx, writer, state, f.pendingApplyIdx); err != nil {
-		return errors.WithStack(err)
+		// Persisting the guard is a local Pebble write. A replica that returns
+		// an ordinary error here advances past the entry without installing the
+		// source fence, write tracker or target guard that healthy replicas
+		// installed, and then accepts user writes they reject -- divergence the
+		// runner's voter probe cannot repair after the fact.
+		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: persist target staged readiness"))
 	}
 	return nil
 }

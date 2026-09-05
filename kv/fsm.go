@@ -569,14 +569,39 @@ func requestCommitTS(r *pb.Request) (uint64, error) {
 // docs/design/2026_09_05_proposed_apply_time_readiness_evidence.md for that.
 var ErrTargetReadinessApply = errors.New("target staged readiness: FSM apply could not prove readiness; halting apply")
 
+// errTargetReadinessUnproven marks the ONE ErrRouteCutoverPending verdict that
+// depends on process-local state: the target-readiness proof, which reads the
+// catalog watcher's current view.
+//
+// The source-read fence returns the same sentinel but is a replicated,
+// deterministic verdict -- every replica reads the same readiness states from
+// its own store and reaches the same answer -- so it is an ordinary transaction
+// rejection. Halting on it would stop every source replica during a normal
+// cutover, which is why the halt keys off this mark rather than off
+// ErrRouteCutoverPending itself.
+var errTargetReadinessUnproven = errors.New("target staged readiness unproven from the local catalog view")
+
 func (f *kvFSM) applyRequest(ctx context.Context, r *pb.Request) any {
 	if err := f.applyRequestErr(ctx, r); err != nil {
-		if errors.Is(err, ErrRouteCutoverPending) {
-			return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: apply target readiness"))
-		}
-		return err
+		return applyErrorResponse(err)
 	}
 	return nil
+}
+
+// applyErrorResponse decides whether an apply error is an ordinary rejection or
+// has to halt this replica.
+//
+// Only a verdict that depended on process-local state halts: the replica cannot
+// know whether its peers reached the same answer, so advancing past the entry
+// risks silent divergence. Every deterministic rejection -- route fences,
+// timestamp floors, malformed requests -- stays ordinary, because every replica
+// reaches it for the same entry and halting would stop the group during normal
+// operation.
+func applyErrorResponse(err error) any {
+	if errors.Is(err, errTargetReadinessUnproven) {
+		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: apply target readiness"))
+	}
+	return err
 }
 
 func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
@@ -1065,7 +1090,10 @@ func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart [
 	if targetReadinessStatesSatisfied(states, routes, routeStart, routeEnd, f.shardGroupID, catalogVersion, proof) {
 		return routes, nil
 	}
-	return nil, errors.WithStack(ErrRouteCutoverPending)
+	// This verdict rests on routes/catalogVersion, which came from the catalog
+	// watcher's current view -- process-local. Mark it so apply can halt on this
+	// one and only this one; see errTargetReadinessUnproven.
+	return nil, errors.WithStack(errors.Mark(ErrRouteCutoverPending, errTargetReadinessUnproven))
 }
 
 func (f *kvFSM) currentShardRoutesForRouteRange(routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
