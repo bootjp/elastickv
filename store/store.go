@@ -31,6 +31,12 @@ var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count to
 var ErrValueTooLarge = errors.New("value too large")
 var ErrInvalidExportCursor = errors.New("invalid export cursor")
 
+// ErrInvalidReadinessState marks a target-staged-readiness state that fails
+// validation. Validation is a pure function of the request, so every replica
+// reaches the same verdict for the same entry: apply must return it as an
+// ordinary rejection rather than halting the group over one malformed RPC.
+var ErrInvalidReadinessState = errors.New("invalid target staged readiness state")
+
 // ErrInvalidExportBudget rejects an export asked for with no version budget.
 // Answering Done for a zero budget lets a migration driver record a non-empty
 // bracket as fully copied and move on to cutover, so the completion signal must

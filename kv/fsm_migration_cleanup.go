@@ -66,6 +66,10 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 func isMigrationCleanupOrdinaryApplyError(err error) bool {
 	return errors.Is(err, ErrInvalidRequest) ||
 		errors.Is(err, store.ErrInvalidImportVersion) ||
+		// A malformed or out-of-range cursor is decided from the request alone,
+		// so every replica rejects it identically.
+		errors.Is(err, store.ErrInvalidExportCursor) ||
+		errors.Is(err, store.ErrInvalidExportBudget) ||
 		errors.Is(err, store.ErrValueTooLarge) ||
 		errors.Is(err, store.ErrSnapshotKeyTooLarge)
 }

@@ -40,8 +40,14 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 	state := targetStagedReadinessStateFromProto(req)
 	state = f.preserveMigrationTrackerMinimum(ctx, state)
 	if err := applyTargetStagedReadinessAt(ctx, writer, state, f.pendingApplyIdx); err != nil {
-		// Persisting the guard is a local Pebble write. A replica that returns
-		// an ordinary error here advances past the entry without installing the
+		// Validation is a pure function of the entry, so every replica rejects
+		// the same malformed request. Halting on it would let one bad internal
+		// RPC stop the group instead of returning InvalidArgument to its caller.
+		if errors.Is(err, store.ErrInvalidReadinessState) {
+			return errors.Wrap(err, "kv/fsm: target staged readiness")
+		}
+		// Anything else is a local Pebble write. A replica that returns an
+		// ordinary error here advances past the entry without installing the
 		// source fence, write tracker or target guard that healthy replicas
 		// installed, and then accepts user writes they reject -- divergence the
 		// runner's voter probe cannot repair after the fact.

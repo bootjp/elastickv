@@ -19,29 +19,36 @@ const (
 	targetReadinessTrackWrites    byte = 4
 )
 
+// invalidReadinessState marks a validation verdict so apply can tell it apart
+// from a replica-local persistence failure: the former is a pure function of
+// the request and must stay an ordinary rejection, the latter must halt.
+func invalidReadinessState(msg string) error {
+	return errors.WithStack(errors.Mark(errors.New(msg), ErrInvalidReadinessState))
+}
+
 func validateTargetStagedReadinessState(state TargetStagedReadinessState) error {
 	switch {
 	case state.JobID == 0:
-		return errors.New("target staged readiness job_id is required")
+		return invalidReadinessState("target staged readiness job_id is required")
 	case state.MigrationJobID == 0:
-		return errors.New("target staged readiness migration_job_id is required")
+		return invalidReadinessState("target staged readiness migration_job_id is required")
 	case state.Armed && state.MinWriteTSExclusive == 0:
-		return errors.New("target staged readiness min_write_ts_exclusive is required when armed")
+		return invalidReadinessState("target staged readiness min_write_ts_exclusive is required when armed")
 	case state.RouteEnd != nil && bytes.Compare(state.RouteStart, state.RouteEnd) >= 0:
-		return errors.New("target staged readiness route range is invalid")
+		return invalidReadinessState("target staged readiness route range is invalid")
 	}
 	return validateSourceMigrationControlState(state)
 }
 
 func validateSourceMigrationControlState(state TargetStagedReadinessState) error {
 	if state.SourceReadFence && !state.SourceWriteFence {
-		return errors.New("source read fence requires source write fence")
+		return invalidReadinessState("source read fence requires source write fence")
 	}
 	if (state.SourceWriteFence || state.SourceReadFence) && state.RetentionPinTS == 0 {
-		return errors.New("source migration control retention pin is required")
+		return invalidReadinessState("source migration control retention pin is required")
 	}
 	if state.TrackWrites && state.RetentionPinTS == 0 {
-		return errors.New("migration write tracker retention pin is required")
+		return invalidReadinessState("migration write tracker retention pin is required")
 	}
 	return nil
 }

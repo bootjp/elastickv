@@ -110,3 +110,67 @@ func TestApplyErrorResponseHaltsOnlyOnUnprovenLocalReadiness(t *testing.T) {
 	require.Error(t, halt, "an unprovable local readiness verdict must halt")
 	require.True(t, errors.Is(halt, ErrTargetReadinessApply), "got %v", halt)
 }
+
+// readinessReadFailureStore fails only the readiness states READ.
+type readinessReadFailureStore struct {
+	store.MVCCStore
+	err error
+}
+
+func (s *readinessReadFailureStore) MigrationTargetReadinessStates(context.Context) ([]store.TargetStagedReadinessState, error) {
+	return nil, s.err
+}
+
+// The three sites below are the same rule seen from both directions, which is
+// why they are pinned together: only a verdict that depended on process-local
+// state halts, and every deterministic verdict stays an ordinary rejection.
+// Classifying per call site rather than by that rule is what produced a halt
+// that was simultaneously too wide (validation, cursors) and too narrow (local
+// read failures).
+func TestApplyHaltBoundaryFollowsProcessLocalityNotCallSite(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	local := errors.New("pebble: background error")
+
+	t.Run("local readiness read failure halts", func(t *testing.T) {
+		t.Parallel()
+		fsm := &kvFSM{store: &readinessReadFailureStore{MVCCStore: store.NewMVCCStore(), err: local}}
+		_, err := fsm.targetReadyRoutesForRouteRange(ctx, []byte("a"), []byte("z"))
+		require.Error(t, err)
+		require.True(t, errors.Is(err, errTargetReadinessUnproven),
+			"a read that failed on this replica only must halt, not advance past the entry")
+		halt := haltApplyOf(applyErrorResponse(err))
+		require.Error(t, halt)
+	})
+
+	t.Run("malformed readiness request stays ordinary", func(t *testing.T) {
+		t.Parallel()
+		// track_writes without a retention pin: the store rejects it
+		// deterministically, so every replica reaches the same verdict.
+		fsm := &kvFSM{store: store.NewMVCCStore()}
+		cmd, err := MarshalTargetStagedReadinessCommand(&pb.TargetStagedReadinessRequest{
+			JobId:          9,
+			MigrationJobId: 9,
+			RouteStart:     []byte("a"),
+			RouteEnd:       []byte("z"),
+			TrackWrites:    true,
+		})
+		require.NoError(t, err)
+
+		resp := fsm.Apply(cmd)
+		require.NoError(t, haltApplyOf(resp),
+			"one malformed internal RPC must not stop the raft group")
+		respErr, ok := resp.(error)
+		require.True(t, ok, "the request is still rejected, got %T", resp)
+		require.True(t, errors.Is(respErr, store.ErrInvalidReadinessState), "got %v", respErr)
+	})
+
+	t.Run("invalid cleanup cursor stays ordinary", func(t *testing.T) {
+		t.Parallel()
+		require.True(t, isMigrationCleanupOrdinaryApplyError(errors.Mark(errors.New("x"), store.ErrInvalidExportCursor)),
+			"a cursor verdict is decided from the request alone")
+		require.False(t, isMigrationCleanupOrdinaryApplyError(local),
+			"a local store failure is not an ordinary verdict")
+	})
+}

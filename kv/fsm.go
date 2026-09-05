@@ -1082,7 +1082,11 @@ func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart [
 	}
 	states, err := reader.MigrationTargetReadinessStates(ctx)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		// A local store read that failed on this replica only. Returning it as
+		// an ordinary error lets this voter advance past an entry its healthy
+		// peers applied, so it is marked for the same halt as the unprovable
+		// verdict below.
+		return nil, errors.WithStack(errors.Mark(err, errTargetReadinessUnproven))
 	}
 	if len(states) == 0 {
 		return routes, nil
