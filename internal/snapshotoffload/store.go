@@ -20,6 +20,13 @@ type ObjectStore interface {
 	HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error)
 }
 
+// ObjectRefresher updates an already-verified object's store metadata while
+// preserving its content. Publish uses this when it reuses a content-addressed
+// payload, so retention's payload grace window applies to the new publish too.
+type ObjectRefresher interface {
+	RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error)
+}
+
 // ObjectRef is one object seen by ListObjects.
 //
 // UpdatedAt is the object store's own last-modified time, not a value
@@ -151,8 +158,9 @@ type PutOptions struct {
 }
 
 type ObjectInfo struct {
-	Key  string
-	Size int64
+	Key       string
+	Size      int64
+	UpdatedAt time.Time
 	// SHA256 is optional for metadata-only Head/Get paths; PutObject returns it
 	// when the writer verified the committed content.
 	SHA256               string
@@ -190,6 +198,25 @@ func (s *LocalStore) PutObject(ctx context.Context, key string, body io.Reader, 
 	}
 	defer func() { _ = os.Remove(tmpPath) }()
 	return s.commitTempObject(key, tmpPath, finalPath, info)
+}
+
+func (s *LocalStore) RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error) {
+	if err := validatePutOptions(opts); err != nil {
+		return ObjectInfo{}, err
+	}
+	finalPath, err := s.pathForKey(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(finalPath), localStoreDirPerm); err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	tmpPath, info, err := writeLocalObjectTemp(ctx, filepath.Dir(finalPath), key, body, opts)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	return s.replaceObject(key, tmpPath, finalPath, info)
 }
 
 func (s *LocalStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
@@ -255,8 +282,9 @@ func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, erro
 		return ObjectInfo{}, errors.Wrapf(ErrInvalidOptions, "object %s is not a regular file", key)
 	}
 	return ObjectInfo{
-		Key:  normalizeObjectKey(key),
-		Size: stat.Size(),
+		Key:       normalizeObjectKey(key),
+		Size:      stat.Size(),
+		UpdatedAt: stat.ModTime(),
 	}, nil
 }
 
@@ -281,9 +309,10 @@ func (s *LocalStore) hashedObjectInfoForPath(key, objectPath string) (ObjectInfo
 		return ObjectInfo{}, errors.WithStack(err)
 	}
 	return ObjectInfo{
-		Key:    normalizeObjectKey(key),
-		Size:   stat.Size(),
-		SHA256: hex.EncodeToString(sum.Sum(nil)),
+		Key:       normalizeObjectKey(key),
+		Size:      stat.Size(),
+		UpdatedAt: stat.ModTime(),
+		SHA256:    hex.EncodeToString(sum.Sum(nil)),
 	}, nil
 }
 
@@ -342,7 +371,17 @@ func (s *LocalStore) commitTempObject(key, tmpPath, finalPath string, expected O
 		}
 		return ObjectInfo{}, errors.WithStack(err)
 	}
-	return expected, nil
+	return s.verifyExistingObject(key, finalPath, expected)
+}
+
+func (s *LocalStore) replaceObject(key, tmpPath, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	if err := syncDir(filepath.Dir(finalPath)); err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	return s.verifyExistingObject(key, finalPath, expected)
 }
 
 func (s *LocalStore) verifyExistingObject(key, finalPath string, expected ObjectInfo) (ObjectInfo, error) {

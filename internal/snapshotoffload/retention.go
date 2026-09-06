@@ -2,7 +2,6 @@ package snapshotoffload
 
 import (
 	"context"
-	"io"
 	"log/slog"
 	"path"
 	"sort"
@@ -45,6 +44,8 @@ const (
 	// The grace period must therefore exceed the longest plausible
 	// publish duration.
 	DefaultPayloadGrace = 24 * time.Hour
+
+	payloadKeyRelativeParts = 2
 )
 
 // RetentionPolicy is the per-prefix retention rule.
@@ -152,12 +153,17 @@ func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
 	}
 
 	survivors, expired := g.partition(scan)
+	payloadSkipReason := g.payloadPhaseBlockedBy(scan)
+	var payloadRefs []ObjectRef
+	if payloadSkipReason == "" {
+		payloadRefs, err = g.listPayloadObjects(ctx)
+		if err != nil {
+			return result, err
+		}
+	}
 
 	for _, key := range expired {
 		if err := g.store.DeleteObject(ctx, key); err != nil {
-			// Report what was already deleted alongside the error so
-			// the caller can see the pass was partial.
-			result.ManifestsDeleted = append(result.ManifestsDeleted, key)
 			return result, errors.Wrapf(err, "retention: delete manifest %s", key)
 		}
 		result.ManifestsDeleted = append(result.ManifestsDeleted, key)
@@ -165,16 +171,16 @@ func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
 			"manifest_key", key)
 	}
 
-	if reason := g.payloadPhaseBlockedBy(scan); reason != "" {
+	if payloadSkipReason != "" {
 		result.PayloadPhaseSkipped = true
-		result.SkipReason = reason
+		result.SkipReason = payloadSkipReason
 		g.log.Warn("snapshot offload payload reclamation skipped",
-			"reason", reason,
+			"reason", payloadSkipReason,
 			"malformed_manifests", len(scan.malformed))
 		return result, nil
 	}
 
-	deleted, err := g.reclaimPayloads(ctx, survivors)
+	deleted, err := g.reclaimPayloads(ctx, survivors, payloadRefs)
 	result.PayloadsDeleted = deleted
 	if err != nil {
 		return result, err
@@ -199,6 +205,27 @@ type scannedManifest struct {
 	createdAt time.Time
 }
 
+type malformedManifestError struct {
+	err error
+}
+
+func (e *malformedManifestError) Error() string {
+	return e.err.Error()
+}
+
+func (e *malformedManifestError) Unwrap() error {
+	return e.err
+}
+
+func malformedManifest(err error) error {
+	return &malformedManifestError{err: err}
+}
+
+func isMalformedManifest(err error) bool {
+	var target *malformedManifestError
+	return errors.As(err, &target)
+}
+
 func (g *GC) scanManifests(ctx context.Context) (manifestScan, error) {
 	groupsPrefix := path.Join(g.prefix, "v1", "groups")
 	refs, err := g.store.ListObjects(ctx, groupsPrefix)
@@ -212,8 +239,11 @@ func (g *GC) scanManifests(ctx context.Context) (manifestScan, error) {
 			continue
 		}
 		scan.scanned++
-		manifest, err := g.loadManifest(ctx, ref.Key)
+		manifest, err := g.loadManifest(ctx, ref)
 		if err != nil {
+			if !isMalformedManifest(err) {
+				return manifestScan{}, errors.Wrapf(err, "retention: load manifest %s", ref.Key)
+			}
 			// §5: malformed manifests are reported and excluded from
 			// deletion. They also block payload reclamation entirely
 			// (see payloadPhaseBlockedBy) because an unparseable
@@ -232,19 +262,30 @@ func (g *GC) scanManifests(ctx context.Context) (manifestScan, error) {
 	return scan, nil
 }
 
-func (g *GC) loadManifest(ctx context.Context, key string) (Manifest, error) {
-	body, _, err := g.store.GetObject(ctx, key)
+func (g *GC) loadManifest(ctx context.Context, ref ObjectRef) (Manifest, error) {
+	if ref.Size > maxManifestBytes {
+		return Manifest{}, malformedManifest(errors.Wrapf(ErrInvalidOptions,
+			"manifest %s exceeds %d bytes", ref.Key, maxManifestBytes))
+	}
+	body, _, err := g.store.GetObject(ctx, ref.Key)
 	if err != nil {
-		return Manifest{}, errors.Wrapf(err, "get manifest %s", key)
+		return Manifest{}, errors.Wrapf(err, "get manifest %s", ref.Key)
 	}
 	defer func() { _ = body.Close() }()
-	data, err := io.ReadAll(body)
+	data, err := readLimitedManifest(ctx, body)
 	if err != nil {
-		return Manifest{}, errors.Wrapf(err, "read manifest %s", key)
+		if errors.Is(err, ErrInvalidOptions) {
+			return Manifest{}, malformedManifest(errors.Wrapf(err, "read manifest %s", ref.Key))
+		}
+		return Manifest{}, errors.Wrapf(err, "read manifest %s", ref.Key)
 	}
 	manifest, err := DecodeManifest(data)
 	if err != nil {
-		return Manifest{}, errors.Wrapf(err, "decode manifest %s", key)
+		return Manifest{}, malformedManifest(errors.Wrapf(err, "decode manifest %s", ref.Key))
+	}
+	if normalizeObjectKey(ref.Key) != normalizeObjectKey(manifest.ManifestKey) {
+		return Manifest{}, malformedManifest(errors.Wrapf(ErrIntegrity,
+			"manifest key mismatch: listed %s, body says %s", ref.Key, manifest.ManifestKey))
 	}
 	return manifest, nil
 }
@@ -314,59 +355,123 @@ func (g *GC) payloadPhaseBlockedBy(scan manifestScan) string {
 	return ""
 }
 
-// reclaimPayloads is §5 phase 2: rebuild the live SHA set from every
-// surviving manifest across every group, then delete only payload
-// objects that are both unreferenced and older than the grace period.
-func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest) ([]string, error) {
-	live := make(map[string]struct{}, len(survivors))
-	for _, entry := range survivors {
-		live[entry.manifest.Payload.SHA256] = struct{}{}
-	}
-
+func (g *GC) listPayloadObjects(ctx context.Context) ([]ObjectRef, error) {
 	payloadsPrefix := path.Join(g.prefix, "v1", "payloads")
 	refs, err := g.store.ListObjects(ctx, payloadsPrefix)
 	if err != nil {
 		return nil, errors.Wrap(err, "retention: list payloads")
 	}
+	return refs, nil
+}
+
+// reclaimPayloads is §5 phase 2: rebuild the live object-key set from
+// every surviving manifest across every group, then delete only
+// payload objects that are both unreferenced and older than the grace
+// period.
+func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, refs []ObjectRef) ([]string, error) {
+	live := make(map[string]struct{}, len(survivors))
+	for _, entry := range survivors {
+		live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
+	}
 
 	graceCutoff := g.now().Add(-g.policy.PayloadGrace)
 	var deleted []string
 	for _, ref := range refs {
-		sha, ok := payloadSHAFromKey(ref.Key)
+		key, ok, err := g.reclaimPayload(ctx, live, graceCutoff, ref)
+		if err != nil {
+			return deleted, err
+		}
 		if !ok {
-			// An object under the payload prefix that does not parse
-			// as a payload key is left alone: it is not ours to
-			// reclaim and may belong to a future layout version.
-			g.log.Warn("snapshot offload retention skipped unrecognized payload object",
-				"object_key", ref.Key)
 			continue
 		}
-		if _, referenced := live[sha]; referenced {
-			continue
-		}
-		if !ref.UpdatedAt.Before(graceCutoff) {
-			// Inside the grace window: this is very likely a
-			// payload-first upload whose manifest has not committed
-			// yet. Deleting it would break an in-flight publish.
-			continue
-		}
-		if err := g.store.DeleteObject(ctx, ref.Key); err != nil {
-			return deleted, errors.Wrapf(err, "retention: delete payload %s", ref.Key)
-		}
-		deleted = append(deleted, ref.Key)
-		g.log.Info("snapshot offload retention reclaimed payload",
-			"object_key", ref.Key, "sha256", sha)
+		deleted = append(deleted, key)
 	}
 	sort.Strings(deleted)
 	return deleted, nil
+}
+
+func (g *GC) reclaimPayload(
+	ctx context.Context,
+	live map[string]struct{},
+	graceCutoff time.Time,
+	ref ObjectRef,
+) (string, bool, error) {
+	sha, ok := payloadSHAFromKey(g.prefix, ref.Key)
+	if !ok {
+		g.log.Warn("snapshot offload retention skipped unrecognized payload object",
+			"object_key", ref.Key)
+		return "", false, nil
+	}
+	if payloadKeyIsLive(live, ref.Key) || !beforeGraceCutoff(ref.UpdatedAt, graceCutoff) {
+		return "", false, nil
+	}
+	if referenced, err := g.payloadCurrentlyReferenced(ctx, ref.Key); err != nil {
+		return "", false, errors.Wrapf(err, "retention: revalidate payload %s", ref.Key)
+	} else if referenced {
+		return "", false, nil
+	}
+	info, exists, err := g.store.HeadObject(ctx, ref.Key)
+	if err != nil {
+		return "", false, errors.Wrapf(err, "retention: head payload %s", ref.Key)
+	}
+	if !exists || !beforeGraceCutoff(info.UpdatedAt, graceCutoff) {
+		return "", false, nil
+	}
+	if err := g.store.DeleteObject(ctx, ref.Key); err != nil {
+		return "", false, errors.Wrapf(err, "retention: delete payload %s", ref.Key)
+	}
+	g.log.Info("snapshot offload retention reclaimed payload",
+		"object_key", ref.Key, "sha256", sha)
+	return ref.Key, true, nil
+}
+
+func payloadKeyIsLive(live map[string]struct{}, key string) bool {
+	_, ok := live[normalizeObjectKey(key)]
+	return ok
+}
+
+func beforeGraceCutoff(updatedAt, graceCutoff time.Time) bool {
+	return !updatedAt.IsZero() && updatedAt.Before(graceCutoff)
+}
+
+func (g *GC) payloadCurrentlyReferenced(ctx context.Context, key string) (bool, error) {
+	scan, err := g.scanManifests(ctx)
+	if err != nil {
+		return false, err
+	}
+	if g.payloadPhaseBlockedBy(scan) != "" {
+		return true, nil
+	}
+	target := normalizeObjectKey(key)
+	for _, manifests := range scan.byGroup {
+		for _, entry := range manifests {
+			if normalizeObjectKey(entry.manifest.Payload.Key) == target {
+				return true, nil
+			}
+		}
+	}
+	return false, nil
 }
 
 // payloadSHAFromKey recovers the content hash from a payload object
 // key laid out as <prefix>/v1/payloads/sha256/<xx>/<sha><suffix>.
 // It verifies the two-character shard directory matches the hash so a
 // hand-placed object cannot masquerade as a payload.
-func payloadSHAFromKey(key string) (string, bool) {
-	base := path.Base(key)
+func payloadSHAFromKey(prefix, key string) (string, bool) {
+	normalized := normalizeObjectKey(key)
+	if normalized != key {
+		return "", false
+	}
+	payloadsPrefix := path.Join(cleanObjectPrefix(prefix), "v1", "payloads", "sha256")
+	rel, ok := strings.CutPrefix(normalized, payloadsPrefix+"/")
+	if !ok {
+		return "", false
+	}
+	parts := strings.Split(rel, "/")
+	if len(parts) != payloadKeyRelativeParts {
+		return "", false
+	}
+	base := parts[1]
 	if !strings.HasSuffix(base, payloadObjectSuffix) {
 		return "", false
 	}
@@ -374,7 +479,7 @@ func payloadSHAFromKey(key string) (string, bool) {
 	if !isSHA256Hex(sha) {
 		return "", false
 	}
-	if shard := path.Base(path.Dir(key)); shard != sha[:2] {
+	if shard := parts[0]; shard != sha[:2] {
 		return "", false
 	}
 	return sha, true

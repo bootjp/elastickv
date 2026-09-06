@@ -132,7 +132,7 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, opt
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	if err := s.putObjectIfAbsent(ctx, normalized, body, opts); err != nil {
+	if err := s.putObject(ctx, normalized, body, opts, true); err != nil {
 		if errors.Is(err, ErrObjectConflict) {
 			return ObjectInfo{}, err
 		}
@@ -144,20 +144,41 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, opt
 	return s.verifyS3PutObject(ctx, normalized, opts)
 }
 
-func (s *S3Store) putObjectIfAbsent(ctx context.Context, key string, body io.Reader, opts PutOptions) error {
-	return s.putObjectWithRetry(key, body, func() error {
+func (s *S3Store) RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error) {
+	if err := validatePutOptions(opts); err != nil {
+		return ObjectInfo{}, err
+	}
+	normalized, err := validateStoreObjectKey(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := s.putObject(ctx, normalized, body, opts, false); err != nil {
+		return ObjectInfo{}, err
+	}
+	return s.verifyS3PutObject(ctx, normalized, opts)
+}
+
+func (s *S3Store) putObject(ctx context.Context, key string, body io.Reader, opts PutOptions, ifAbsent bool) error {
+	put := func() error {
 		if opts.Size > s.multipartThreshold {
-			return s.putMultipartIfAbsent(ctx, key, body, opts)
+			return s.putMultipart(ctx, key, body, opts, ifAbsent)
 		}
 		input, err := s.putObjectInput(key, body, opts)
 		if err != nil {
 			return err
 		}
+		if !ifAbsent {
+			input.IfNoneMatch = nil
+		}
 		if _, err = s.client.PutObject(ctx, input); err != nil {
 			return errors.Wrap(err, "put s3 object")
 		}
 		return nil
-	})
+	}
+	if !ifAbsent {
+		return put()
+	}
+	return s.putObjectWithRetry(key, body, put)
 }
 
 func (s *S3Store) putObjectWithRetry(
@@ -184,11 +205,12 @@ func (s *S3Store) putObjectWithRetry(
 		key, s3ConditionalWriteRetries)
 }
 
-func (s *S3Store) putMultipartIfAbsent(
+func (s *S3Store) putMultipart(
 	ctx context.Context,
 	key string,
 	body io.Reader,
 	opts PutOptions,
+	ifAbsent bool,
 ) (retErr error) {
 	partSize, err := multipartPartSize(opts.Size, s.multipartPartSize)
 	if err != nil {
@@ -208,7 +230,7 @@ func (s *S3Store) putMultipartIfAbsent(
 	if err != nil {
 		return err
 	}
-	if err := s.completeMultipartUpload(ctx, key, uploadID, opts.Size, parts); err != nil {
+	if err := s.completeMultipartUpload(ctx, key, uploadID, opts.Size, parts, ifAbsent); err != nil {
 		return err
 	}
 	completed = true
@@ -413,17 +435,21 @@ func (s *S3Store) completeMultipartUpload(
 	uploadID string,
 	size int64,
 	parts []types.CompletedPart,
+	ifAbsent bool,
 ) error {
-	_, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	input := &s3.CompleteMultipartUploadInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(key),
 		UploadId:      aws.String(uploadID),
-		IfNoneMatch:   aws.String("*"),
 		MpuObjectSize: aws.Int64(size),
 		MultipartUpload: &types.CompletedMultipartUpload{
 			Parts: parts,
 		},
-	})
+	}
+	if ifAbsent {
+		input.IfNoneMatch = aws.String("*")
+	}
+	_, err := s.client.CompleteMultipartUpload(ctx, input)
 	if err != nil {
 		return errors.Wrap(err, "complete s3 multipart upload")
 	}
@@ -513,6 +539,7 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, Obj
 		out.Metadata,
 		out.ChecksumSHA256,
 		out.ChecksumType,
+		out.LastModified,
 		out.ServerSideEncryption,
 		out.SSEKMSKeyId,
 	)
@@ -552,6 +579,7 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (ObjectInfo, bool,
 		out.Metadata,
 		out.ChecksumSHA256,
 		out.ChecksumType,
+		out.LastModified,
 		out.ServerSideEncryption,
 		out.SSEKMSKeyId,
 	)
@@ -680,6 +708,7 @@ func s3ObjectInfo(
 	metadata map[string]string,
 	checksumSHA256 *string,
 	checksumType types.ChecksumType,
+	updatedAt *time.Time,
 	encryption types.ServerSideEncryption,
 	kmsKeyID *string,
 ) (ObjectInfo, error) {
@@ -693,6 +722,7 @@ func s3ObjectInfo(
 	return ObjectInfo{
 		Key:                  key,
 		Size:                 *contentLength,
+		UpdatedAt:            aws.ToTime(updatedAt),
 		SHA256:               sha,
 		ServerSideEncryption: string(encryption),
 		SSEKMSKeyID:          aws.ToString(kmsKeyID),
@@ -894,29 +924,22 @@ func (s *S3Store) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, 
 	if s == nil || s.client == nil {
 		return nil, errors.Wrap(ErrInvalidOptions, "object store is required")
 	}
-	listPrefix := cleanObjectPrefix(prefix)
-	if listPrefix == "." {
-		listPrefix = ""
-	}
+	listPrefix := s3ListSubtreePrefix(prefix)
 
 	var (
-		refs  []ObjectRef
-		token *string
+		refs       []ObjectRef
+		token      *string
+		seenTokens = make(map[string]struct{})
 	)
 	for {
-		if err := ctx.Err(); err != nil {
-			return nil, errors.WithStack(err)
-		}
-		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
-			Bucket:            aws.String(s.bucket),
-			Prefix:            aws.String(listPrefix),
-			ContinuationToken: token,
-			MaxKeys:           aws.Int32(listObjectsPageLimit),
-		})
+		out, err := s.listObjectsPage(ctx, listPrefix, token)
 		if err != nil {
 			return nil, errors.Wrapf(err, "list objects under %q", prefix)
 		}
-		refs = appendListedObjects(refs, out)
+		refs, err = appendListedObjects(refs, out, listPrefix)
+		if err != nil {
+			return nil, err
+		}
 
 		next, more, err := nextListPageToken(out, prefix)
 		if err != nil {
@@ -925,17 +948,64 @@ func (s *S3Store) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, 
 		if !more {
 			return refs, nil
 		}
+		if err := rememberListToken(seenTokens, prefix, next); err != nil {
+			return nil, err
+		}
 		token = next
 	}
 }
 
+func s3ListSubtreePrefix(prefix string) string {
+	listPrefix := cleanObjectPrefix(prefix)
+	if listPrefix == "." {
+		return ""
+	}
+	return listPrefix + "/"
+}
+
+func (s *S3Store) listObjectsPage(
+	ctx context.Context,
+	prefix string,
+	token *string,
+) (*s3.ListObjectsV2Output, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:            aws.String(s.bucket),
+		Prefix:            aws.String(prefix),
+		ContinuationToken: token,
+		MaxKeys:           aws.Int32(listObjectsPageLimit),
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "list s3 objects page")
+	}
+	return out, nil
+}
+
+func rememberListToken(seen map[string]struct{}, prefix string, token *string) error {
+	if _, ok := seen[*token]; ok {
+		return errors.Wrapf(ErrIntegrity,
+			"list objects under %q returned non-advancing continuation token %q", prefix, *token)
+	}
+	seen[*token] = struct{}{}
+	return nil
+}
+
 // appendListedObjects converts one ListObjectsV2 page into ObjectRefs.
-func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output) []ObjectRef {
+func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output, listPrefix string) ([]ObjectRef, error) {
 	for _, obj := range out.Contents {
 		if obj.Key == nil {
 			continue
 		}
-		ref := ObjectRef{Key: normalizeObjectKey(*obj.Key)}
+		key := *obj.Key
+		if listPrefix != "" && !strings.HasPrefix(key, listPrefix) {
+			return nil, errors.Wrapf(ErrIntegrity, "listed object %q outside prefix %q", key, listPrefix)
+		}
+		if normalizeObjectKey(key) != key {
+			return nil, errors.Wrapf(ErrIntegrity, "listed object key %q is not canonical", key)
+		}
+		ref := ObjectRef{Key: key}
 		if obj.Size != nil {
 			ref.Size = *obj.Size
 		}
@@ -944,7 +1014,7 @@ func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output) []Object
 		}
 		refs = append(refs, ref)
 	}
-	return refs
+	return refs, nil
 }
 
 // nextListPageToken reports whether another page follows and returns

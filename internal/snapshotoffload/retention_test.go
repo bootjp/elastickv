@@ -3,6 +3,7 @@ package snapshotoffload
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path"
 	"path/filepath"
@@ -96,6 +97,20 @@ func (f *gcFixture) publishManifest(
 	require.NoError(t, err)
 	f.setMTime(t, mKey, f.now.Add(-age))
 	return manifest
+}
+
+func (f *gcFixture) writeManifest(t *testing.T, manifest Manifest, age time.Duration) {
+	t.Helper()
+	encoded, sum, err := manifest.MarshalCanonical()
+	require.NoError(t, err)
+	manifest.ManifestSHA256 = sum
+	_, err = f.store.PutObject(context.Background(), manifest.ManifestKey, bytes.NewReader(encoded), PutOptions{
+		Size:        int64(len(encoded)),
+		SHA256:      hexSHA256Bytes(encoded),
+		ContentType: "application/json",
+	})
+	require.NoError(t, err)
+	f.setMTime(t, manifest.ManifestKey, f.now.Add(-age))
 }
 
 // writeMalformedManifest plants an object that lands in the manifest
@@ -294,6 +309,134 @@ func TestGCDoesNotReclaimPayloadInsideGracePeriod(t *testing.T) {
 	require.True(t, f.exists(t, keep.Payload.Key))
 }
 
+func TestPutPayloadRefreshesReusedObjectMTime(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	ctx := context.Background()
+	payload := []byte("payload-reused-by-a-new-manifest")
+	sha := hexSHA256Bytes(payload)
+	key, err := payloadKey(retentionPrefix, sha)
+	require.NoError(t, err)
+	_, err = f.store.PutObject(ctx, key, bytes.NewReader(payload), PutOptions{
+		Size:   int64(len(payload)),
+		SHA256: sha,
+	})
+	require.NoError(t, err)
+	oldMTime := f.now.Add(-365 * 24 * time.Hour)
+	f.setMTime(t, key, oldMTime)
+
+	file, err := os.CreateTemp(t.TempDir(), "payload-*.fsm")
+	require.NoError(t, err)
+	defer func() { require.NoError(t, file.Close()) }()
+	_, err = file.Write(payload)
+	require.NoError(t, err)
+
+	require.NoError(t, putPayload(ctx, f.store, key, file, int64(len(payload)), sha))
+	info, ok, err := f.store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.True(t, info.UpdatedAt.After(oldMTime),
+		"reusing a content-addressed payload must refresh the store timestamp for GC grace")
+}
+
+func TestGCRevalidatesPayloadReferenceCommittedAfterInitialPayloadList(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	ctx := context.Background()
+	payload := []byte("orphan-that-becomes-referenced")
+	sha := hexSHA256Bytes(payload)
+	key, err := payloadKey(retentionPrefix, sha)
+	require.NoError(t, err)
+	_, err = f.store.PutObject(ctx, key, bytes.NewReader(payload), PutOptions{
+		Size:   int64(len(payload)),
+		SHA256: sha,
+	})
+	require.NoError(t, err)
+	f.setMTime(t, key, f.now.Add(-365*24*time.Hour))
+
+	mKey, err := manifestKey(retentionPrefix, 1, 10, 2)
+	require.NoError(t, err)
+	injectedManifest := Manifest{
+		SchemaVersion: ManifestSchemaVersion,
+		CreatedAt:     f.now,
+		SourceCluster: retentionPrefix,
+		GroupID:       1,
+		SnapshotIndex: 10,
+		SnapshotTerm:  2,
+		ConfState:     ManifestConfState{Voters: []uint64{1}},
+		Payload: PayloadDescriptor{
+			Key:    key,
+			Bytes:  int64(len(payload)),
+			SHA256: sha,
+		},
+		ManifestKey: mKey,
+	}
+	store := &manifestDuringPayloadListStore{
+		RetentionStore: f.store,
+		inject: func() {
+			f.writeManifest(t, injectedManifest, 0)
+		},
+	}
+	gc, err := NewGC(GCOptions{
+		Store:  store,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(ctx)
+	require.NoError(t, err)
+	require.Empty(t, result.PayloadsDeleted)
+	require.True(t, f.exists(t, key),
+		"a payload referenced by a manifest committed after the initial scan must survive")
+}
+
+func TestGCLiveSetUsesReferencedPayloadKeys(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	ctx := context.Background()
+	keySHA := hexSHA256Bytes([]byte("key-hash"))
+	body := []byte("payload-body-with-a-different-hash")
+	bodySHA := hexSHA256Bytes(body)
+	key, err := payloadKey(retentionPrefix, keySHA)
+	require.NoError(t, err)
+	_, err = f.store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: bodySHA,
+	})
+	require.NoError(t, err)
+	f.setMTime(t, key, f.now.Add(-365*24*time.Hour))
+
+	mKey, err := manifestKey(retentionPrefix, 1, 10, 2)
+	require.NoError(t, err)
+	f.writeManifest(t, Manifest{
+		SchemaVersion: ManifestSchemaVersion,
+		CreatedAt:     f.now.Add(-365 * 24 * time.Hour),
+		SourceCluster: retentionPrefix,
+		GroupID:       1,
+		SnapshotIndex: 10,
+		SnapshotTerm:  2,
+		ConfState:     ManifestConfState{Voters: []uint64{1}},
+		Payload: PayloadDescriptor{
+			Key:    key,
+			Bytes:  int64(len(body)),
+			SHA256: bodySHA,
+		},
+		ManifestKey: mKey,
+	}, 365*24*time.Hour)
+
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
+	result, err := gc.RunOnce(ctx)
+	require.NoError(t, err)
+	require.Empty(t, result.PayloadsDeleted)
+	require.True(t, f.exists(t, key),
+		"retention must keep the exact object key a surviving manifest restores from")
+}
+
 // TestGCPerformsNoDeletesWhenListingFails pins §5's
 // "listing failure performs no deletes".
 func TestGCPerformsNoDeletesWhenListingFails(t *testing.T) {
@@ -318,6 +461,82 @@ func TestGCPerformsNoDeletesWhenListingFails(t *testing.T) {
 	require.Zero(t, failing.deletes, "a failed scan must delete nothing")
 	require.True(t, f.exists(t, m1.ManifestKey))
 	require.True(t, f.exists(t, m2.ManifestKey))
+}
+
+func TestGCPerformsNoDeletesWhenPayloadListingFails(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	m1 := f.publishManifest(t, 1, 10, []byte("gen-1"), year)
+	m2 := f.publishManifest(t, 1, 20, []byte("gen-2"), year)
+
+	failing := &failingListStore{RetentionStore: f.store, failOn: "v1/payloads"}
+	gc, err := NewGC(GCOptions{
+		Store:  failing,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	_, err = gc.RunOnce(context.Background())
+	require.Error(t, err)
+	require.Zero(t, failing.deletes, "payload listing must complete before any destructive delete")
+	require.True(t, f.exists(t, m1.ManifestKey))
+	require.True(t, f.exists(t, m2.ManifestKey))
+}
+
+func TestGCAbortsOnManifestTransportFailure(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	m1 := f.publishManifest(t, 1, 10, []byte("gen-1"), year)
+	m2 := f.publishManifest(t, 1, 20, []byte("gen-2"), year)
+
+	failing := &failingGetStore{RetentionStore: f.store, failKey: m1.ManifestKey}
+	gc, err := NewGC(GCOptions{
+		Store:  failing,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	_, err = gc.RunOnce(context.Background())
+	require.Error(t, err)
+	require.Zero(t, failing.deletes, "manifest transport failure must abort before deletes")
+	require.True(t, f.exists(t, m1.ManifestKey))
+	require.True(t, f.exists(t, m2.ManifestKey))
+}
+
+func TestGCTreatsManifestKeyMismatchAsMalformed(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	source := f.publishManifest(t, 1, 10, []byte("payload"), 365*24*time.Hour)
+	body, _, err := f.store.GetObject(context.Background(), source.ManifestKey)
+	require.NoError(t, err)
+	raw, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.NoError(t, body.Close())
+
+	wrongKey, err := manifestKey(retentionPrefix, 2, 99, 2)
+	require.NoError(t, err)
+	_, err = f.store.PutObject(context.Background(), wrongKey, bytes.NewReader(raw), PutOptions{
+		Size:        int64(len(raw)),
+		SHA256:      hexSHA256Bytes(raw),
+		ContentType: "application/json",
+	})
+	require.NoError(t, err)
+
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.True(t, result.PayloadPhaseSkipped)
+	require.Equal(t, []string{wrongKey}, result.MalformedManifests)
+	require.True(t, f.exists(t, wrongKey))
 }
 
 // TestGCLeavesUnrecognizedObjectsUnderPayloadPrefix guards against
@@ -355,16 +574,22 @@ func TestPayloadSHAFromKeyRejectsMismatchedShard(t *testing.T) {
 	good, err := payloadKey(retentionPrefix, sha)
 	require.NoError(t, err)
 
-	got, ok := payloadSHAFromKey(good)
+	got, ok := payloadSHAFromKey(retentionPrefix, good)
 	require.True(t, ok)
 	require.Equal(t, sha, got)
 
 	wrongShard := strings.Replace(good, "/"+sha[:2]+"/", "/zz/", 1)
-	_, ok = payloadSHAFromKey(wrongShard)
+	_, ok = payloadSHAFromKey(retentionPrefix, wrongShard)
 	require.False(t, ok, "shard directory must agree with the content hash")
 
-	_, ok = payloadSHAFromKey("cluster-a/v1/payloads/sha256/ab/short.fsm")
+	_, ok = payloadSHAFromKey(retentionPrefix, "cluster-a/v1/payloads/sha256/ab/short.fsm")
 	require.False(t, ok)
+
+	_, ok = payloadSHAFromKey(retentionPrefix, "cluster-a/v1/payloads/archive/"+sha[:2]+"/"+sha+payloadObjectSuffix)
+	require.False(t, ok, "only the canonical payloads/sha256 layout is reclaimable")
+
+	_, ok = payloadSHAFromKey(retentionPrefix, "cluster-b/v1/payloads/sha256/"+sha[:2]+"/"+sha+payloadObjectSuffix)
+	require.False(t, ok, "payload keys from another prefix must not be reclaimed")
 }
 
 func TestGCOverEmptyPrefixIsACleanNoOp(t *testing.T) {
@@ -415,6 +640,42 @@ func (s *failingListStore) ListObjects(ctx context.Context, prefix string) ([]Ob
 func (s *failingListStore) DeleteObject(ctx context.Context, key string) error {
 	s.deletes++
 	return s.RetentionStore.DeleteObject(ctx, key)
+}
+
+type failingGetStore struct {
+	RetentionStore
+	failKey string
+	deletes int
+}
+
+func (s *failingGetStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
+	if normalizeObjectKey(key) == normalizeObjectKey(s.failKey) {
+		return nil, ObjectInfo{}, errors.New("manifest transport unavailable")
+	}
+	return s.RetentionStore.GetObject(ctx, key)
+}
+
+func (s *failingGetStore) DeleteObject(ctx context.Context, key string) error {
+	s.deletes++
+	return s.RetentionStore.DeleteObject(ctx, key)
+}
+
+type manifestDuringPayloadListStore struct {
+	RetentionStore
+	inject   func()
+	injected bool
+}
+
+func (s *manifestDuringPayloadListStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	refs, err := s.RetentionStore.ListObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if !s.injected && strings.Contains(prefix, "v1/payloads") {
+		s.injected = true
+		s.inject()
+	}
+	return refs, nil
 }
 
 // TestGCRetainsNewestEvenWhenPolicyWouldNotPins the §9 invariant
