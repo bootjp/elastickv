@@ -39,6 +39,8 @@ type S3ObjectClient interface {
 	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
 	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
 	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
 type S3StoreConfig struct {
@@ -872,4 +874,112 @@ func isS3ConditionalConflict(err error) bool {
 		return false
 	}
 	return apiErr.ErrorCode() == "ConditionalRequestConflict"
+}
+
+var _ RetentionStore = (*S3Store)(nil)
+
+// listObjectsPageLimit bounds a single ListObjectsV2 page. The AWS
+// maximum is 1000; naming it keeps the mnd linter satisfied and the
+// intent legible.
+const listObjectsPageLimit int32 = 1000
+
+// ListObjects pages through every object under prefix.
+//
+// Per the RetentionStore contract this is all-or-error: any page
+// failure returns an error and no partial slice, because §5 makes
+// "an incomplete scan performs no deletes" a safety property. A
+// truncated listing would make a live payload look unreferenced and
+// let phase 2 delete data a committed manifest still points at.
+func (s *S3Store) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	if s == nil || s.client == nil {
+		return nil, errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	listPrefix := cleanObjectPrefix(prefix)
+	if listPrefix == "." {
+		listPrefix = ""
+	}
+
+	var (
+		refs  []ObjectRef
+		token *string
+	)
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+			Bucket:            aws.String(s.bucket),
+			Prefix:            aws.String(listPrefix),
+			ContinuationToken: token,
+			MaxKeys:           aws.Int32(listObjectsPageLimit),
+		})
+		if err != nil {
+			return nil, errors.Wrapf(err, "list objects under %q", prefix)
+		}
+		refs = appendListedObjects(refs, out)
+
+		next, more, err := nextListPageToken(out, prefix)
+		if err != nil {
+			return nil, err
+		}
+		if !more {
+			return refs, nil
+		}
+		token = next
+	}
+}
+
+// appendListedObjects converts one ListObjectsV2 page into ObjectRefs.
+func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output) []ObjectRef {
+	for _, obj := range out.Contents {
+		if obj.Key == nil {
+			continue
+		}
+		ref := ObjectRef{Key: normalizeObjectKey(*obj.Key)}
+		if obj.Size != nil {
+			ref.Size = *obj.Size
+		}
+		if obj.LastModified != nil {
+			ref.UpdatedAt = *obj.LastModified
+		}
+		refs = append(refs, ref)
+	}
+	return refs
+}
+
+// nextListPageToken reports whether another page follows and returns
+// its continuation token.
+//
+// A truncated page with no continuation token cannot be continued and
+// would otherwise loop forever re-reading page one. §5 requires
+// pagination failure to fail closed, so it becomes an error rather
+// than a silently short listing.
+func nextListPageToken(out *s3.ListObjectsV2Output, prefix string) (*string, bool, error) {
+	if out.IsTruncated == nil || !*out.IsTruncated {
+		return nil, false, nil
+	}
+	if out.NextContinuationToken == nil || *out.NextContinuationToken == "" {
+		return nil, false, errors.Wrapf(ErrIntegrity,
+			"list objects under %q returned a truncated page with no continuation token", prefix)
+	}
+	return out.NextContinuationToken, true, nil
+}
+
+// DeleteObject removes one object. S3 delete is idempotent, so an
+// already-absent key is not an error.
+func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
+	if s == nil || s.client == nil {
+		return errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	normalized, err := validateStoreObjectKey(key)
+	if err != nil {
+		return err
+	}
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(normalized),
+	}); err != nil {
+		return errors.Wrapf(err, "delete object %s", key)
+	}
+	return nil
 }

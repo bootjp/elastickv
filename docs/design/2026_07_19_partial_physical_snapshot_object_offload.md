@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1 implemented; M2/M3 pending
+Status: Partial — M0/M1 implemented; M2 pending; M3 retention/GC implemented, remaining M3 items pending
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-07-23
@@ -48,7 +48,7 @@ The M1 object-store-neutral substrate now adds:
 - `cmd/elastickv-snapshot-offload publish` and `restore` for local and
   S3-backed operator workflows.
 
-The runtime scheduler and retention/GC remain pending.
+The runtime scheduler remains pending. Retention/GC is implemented per §5; the remaining M3 items (restore drills, corruption tests, multi-node acceptance, operator documentation) are pending.
 
 ## 2. Safety boundary
 
@@ -165,7 +165,7 @@ permissions below the configured prefix.
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Pending |
-| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Pending |
+| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: the §5 two-phase retention/GC (`retention.go`) with `RetentionStore` list/delete on both the local and S3 stores. Restore drills, corruption tests, multi-node acceptance, and operational documentation remain pending. |
 
 The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to

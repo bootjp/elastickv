@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/cockroachdb/errors"
 )
@@ -17,6 +18,130 @@ type ObjectStore interface {
 	PutObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error)
 	GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error)
 	HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error)
+}
+
+// ObjectRef is one object seen by ListObjects.
+//
+// UpdatedAt is the object store's own last-modified time, not a value
+// carried inside the object. Retention uses it only for the phase-2
+// payload grace period, where the question is "has this object been
+// sitting unreferenced long enough", which is a property of the store
+// rather than of the snapshot.
+type ObjectRef struct {
+	Key       string
+	Size      int64
+	UpdatedAt time.Time
+}
+
+// RetentionStore is an ObjectStore that also supports the listing and
+// deletion that retention/GC needs (design §5).
+//
+// It is a separate interface rather than extra methods on ObjectStore
+// so the publish and restore paths keep working against a store that
+// can only put/get/head, while GC is a compile-time error to construct
+// over such a store. A silently-no-op GC would be far worse: retention
+// would appear configured while the bucket grew without bound.
+//
+// ListObjects is all-or-error by contract: it MUST return every object
+// under prefix or a non-nil error. §5 makes no-deletes-on-partial-scan
+// a safety property, and a lister that silently truncated a page would
+// make live payloads look unreferenced.
+type RetentionStore interface {
+	ObjectStore
+	ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error)
+	DeleteObject(ctx context.Context, key string) error
+}
+
+var _ RetentionStore = (*LocalStore)(nil)
+
+// ListObjects walks the local root below prefix. Directories and
+// irregular files are skipped; the returned keys are slash-separated
+// and relative to the store root, matching the keys PutObject accepts.
+func (s *LocalStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	if s == nil {
+		return nil, errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	root := s.root
+	if cleaned := cleanObjectPrefix(prefix); cleaned != "." {
+		root = filepath.Join(s.root, filepath.FromSlash(cleaned))
+	}
+	var refs []ObjectRef
+	walk := func(walkPath string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return s.walkEntryError(walkPath, root, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.WithStack(ctxErr)
+		}
+		ref, ok, refErr := s.objectRefForWalkEntry(walkPath, entry)
+		if refErr != nil {
+			return refErr
+		}
+		if ok {
+			refs = append(refs, ref)
+		}
+		return nil
+	}
+	if err := filepath.WalkDir(root, walk); err != nil {
+		return nil, errors.Wrapf(err, "list objects under %q", prefix)
+	}
+	return refs, nil
+}
+
+// walkEntryError translates a WalkDir error. A missing root is an
+// empty listing, not a failure: a bucket that has never been published
+// to has no group tree yet, and GC over it must be a clean no-op.
+func (s *LocalStore) walkEntryError(walkPath, root string, err error) error {
+	if os.IsNotExist(err) && walkPath == root {
+		return filepath.SkipAll
+	}
+	return errors.WithStack(err)
+}
+
+// objectRefForWalkEntry converts one walk entry into an ObjectRef,
+// reporting ok=false for entries that are not objects (directories,
+// sockets, symlinks, and the in-progress ".put-*" temp files
+// PutObject creates).
+func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (ObjectRef, bool, error) {
+	if entry.IsDir() || !entry.Type().IsRegular() {
+		return ObjectRef{}, false, nil
+	}
+	if strings.HasPrefix(entry.Name(), ".put-") {
+		return ObjectRef{}, false, nil
+	}
+	info, err := entry.Info()
+	if err != nil {
+		return ObjectRef{}, false, errors.WithStack(err)
+	}
+	rel, err := filepath.Rel(s.root, walkPath)
+	if err != nil {
+		return ObjectRef{}, false, errors.WithStack(err)
+	}
+	return ObjectRef{
+		Key:       filepath.ToSlash(rel),
+		Size:      info.Size(),
+		UpdatedAt: info.ModTime(),
+	}, true, nil
+}
+
+// DeleteObject removes one object. A already-absent object is not an
+// error: GC must be idempotent across retries and a concurrent
+// reclamation of the same key is a benign race.
+func (s *LocalStore) DeleteObject(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	objectPath, err := s.pathForKey(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "delete object %s", key)
+	}
+	return nil
 }
 
 type PutOptions struct {

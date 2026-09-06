@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -375,6 +377,12 @@ type fakeS3Client struct {
 	nextUploadID         int
 	uploadedParts        int
 	multipartCompletes   int
+	// Retention/GC listing controls.
+	listPageSize              int
+	listOmitContinuationToken bool
+	listErr                   error
+	listModTime               time.Time
+	deletes                   []string
 }
 
 type fakeS3Object struct {
@@ -726,6 +734,70 @@ func fakeS3ChecksumForMode(mode types.ChecksumMode, obj fakeS3Object) (*string, 
 	return obj.checksum, obj.checksumType
 }
 
+// listMaxKeys lets a test force pagination without uploading 1000
+// objects; zero means "use the request's MaxKeys".
+func (c *fakeS3Client) ListObjectsV2(
+	_ context.Context, input *s3.ListObjectsV2Input, _ ...func(*s3.Options),
+) (*s3.ListObjectsV2Output, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.listErr != nil {
+		return nil, c.listErr
+	}
+
+	bucketPrefix := aws.ToString(input.Bucket) + "/"
+	wantPrefix := aws.ToString(input.Prefix)
+	keys := make([]string, 0, len(c.objects))
+	for stored := range c.objects {
+		key, ok := strings.CutPrefix(stored, bucketPrefix)
+		if !ok || !strings.HasPrefix(key, wantPrefix) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+
+	start := 0
+	if token := aws.ToString(input.ContinuationToken); token != "" {
+		start = sort.SearchStrings(keys, token)
+	}
+	pageSize := c.listPageSize
+	if pageSize <= 0 {
+		pageSize = len(keys)
+	}
+	end := min(start+pageSize, len(keys))
+
+	contents := make([]types.Object, 0, end-start)
+	for _, key := range keys[start:end] {
+		obj := c.objects[bucketPrefix+key]
+		contents = append(contents, types.Object{
+			Key:          aws.String(key),
+			Size:         aws.Int64(int64(len(obj.body))),
+			LastModified: aws.Time(c.listModTime),
+		})
+	}
+	out := &s3.ListObjectsV2Output{Contents: contents}
+	if end < len(keys) {
+		out.IsTruncated = aws.Bool(true)
+		if !c.listOmitContinuationToken {
+			out.NextContinuationToken = aws.String(keys[end])
+		} else {
+			out.IsTruncated = aws.Bool(true)
+		}
+	}
+	return out, nil
+}
+
+func (c *fakeS3Client) DeleteObject(
+	_ context.Context, input *s3.DeleteObjectInput, _ ...func(*s3.Options),
+) (*s3.DeleteObjectOutput, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deletes = append(c.deletes, aws.ToString(input.Key))
+	delete(c.objects, fakeS3ClientKey(input.Bucket, input.Key))
+	return &s3.DeleteObjectOutput{}, nil
+}
+
 func fakeS3ClientKey(bucket *string, key *string) string {
 	return aws.ToString(bucket) + "/" + aws.ToString(key)
 }
@@ -736,4 +808,88 @@ func cloneStringPtr(value *string) *string {
 	}
 	cloned := *value
 	return &cloned
+}
+
+// TestS3StoreListObjectsPagesThroughEveryPage proves the lister
+// honours its all-or-error contract across pages. Retention's phase-2
+// safety depends on a complete listing: a payload missed by a
+// truncated page would look unreferenced and be reclaimed while a
+// committed manifest still points at it.
+func TestS3StoreListObjectsPagesThroughEveryPage(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	client.listPageSize = 2
+	client.listModTime = time.Unix(1_700_000_000, 0).UTC()
+	store := newTestS3Store(t, client)
+
+	want := make([]string, 0, 5)
+	for i := range 5 {
+		key := fmt.Sprintf("cluster-a/v1/payloads/obj-%d.fsm", i)
+		body := []byte(key)
+		_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+			Size:   int64(len(body)),
+			SHA256: hexSHA256Bytes(body),
+		})
+		require.NoError(t, err)
+		want = append(want, key)
+	}
+
+	refs, err := store.ListObjects(ctx, "cluster-a/v1/payloads")
+	require.NoError(t, err)
+
+	got := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		got = append(got, ref.Key)
+		require.Equal(t, client.listModTime, ref.UpdatedAt)
+	}
+	sort.Strings(got)
+	require.Equal(t, want, got, "every page must be returned")
+}
+
+// TestS3StoreListObjectsFailsClosedOnTruncatedPageWithoutToken pins
+// the pagination-failure branch: a truncated response with no
+// continuation token cannot be continued, so the lister must error
+// rather than return the partial set it has.
+func TestS3StoreListObjectsFailsClosedOnTruncatedPageWithoutToken(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	client.listPageSize = 1
+	client.listOmitContinuationToken = true
+	store := newTestS3Store(t, client)
+
+	for i := range 3 {
+		key := fmt.Sprintf("cluster-a/v1/payloads/obj-%d.fsm", i)
+		body := []byte(key)
+		_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+			Size:   int64(len(body)),
+			SHA256: hexSHA256Bytes(body),
+		})
+		require.NoError(t, err)
+	}
+
+	refs, err := store.ListObjects(ctx, "cluster-a/v1/payloads")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrIntegrity))
+	require.Nil(t, refs, "a partial listing must never be returned")
+}
+
+func TestS3StoreDeleteObjectIsIdempotentAndValidatesKeys(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+
+	body := []byte("payload")
+	key := "cluster-a/v1/payloads/gone.fsm"
+	_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: hexSHA256Bytes(body),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.DeleteObject(ctx, key))
+	// Deleting an absent key must stay a no-op so GC is retry-safe.
+	require.NoError(t, store.DeleteObject(ctx, key))
+	require.Equal(t, []string{key, key}, client.deletes)
+
+	require.ErrorIs(t, store.DeleteObject(ctx, "../escape"), ErrInvalidOptions)
 }
