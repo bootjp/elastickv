@@ -25,6 +25,13 @@ type PublishOptions struct {
 	BinaryVersion string
 	CreatedAt     time.Time
 	SpoolDir      string
+	// VerifyLeader, when set, is re-checked immediately before the manifest is
+	// committed. §4 requires leadership to hold at that instant, not merely when
+	// the snapshot was opened: spooling a multi-gigabyte payload takes long
+	// enough to lose an election. Failing here can leave an unreferenced
+	// content-addressed payload, which GC reclaims, but never a committed
+	// manifest naming a snapshot this node no longer had the right to publish.
+	VerifyLeader func(context.Context) error
 }
 
 func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manifest, error) {
@@ -56,12 +63,30 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	if err := putPayload(ctx, opts.Store, payloadObjectKey, payloadFile, payloadBytes, payloadSHA); err != nil {
 		return nil, err
 	}
+	return commitManifest(ctx, opts, metadata, payloadObjectKey, payloadSHA)
+}
+
+// commitManifest builds, validates and commits the manifest once the payload is
+// durable. Split out of PublishPersistedSnapshot to keep that function inside
+// the cyclop budget after the leadership re-check landed.
+func commitManifest(
+	ctx context.Context,
+	opts PublishOptions,
+	metadata etcdraftengine.PersistedSnapshotExportMetadata,
+	payloadObjectKey string,
+	payloadSHA string,
+) (*Manifest, error) {
 	manifest, err := buildManifest(opts, metadata, payloadObjectKey, payloadSHA)
 	if err != nil {
 		return nil, err
 	}
 	if err := validateManifest(*manifest); err != nil {
 		return nil, err
+	}
+	if opts.VerifyLeader != nil {
+		if err := opts.VerifyLeader(ctx); err != nil {
+			return nil, errors.Wrap(err, "snapshot offload: leadership lost before manifest commit")
+		}
 	}
 	if err := putManifest(ctx, opts.Store, manifest, opts.CreatedAt.IsZero()); err != nil {
 		return nil, err
