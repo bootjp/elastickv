@@ -524,6 +524,7 @@ func (c *fakeS3Client) HeadObject(_ context.Context, input *s3.HeadObjectInput, 
 		LastModified:         aws.Time(obj.modifiedAt),
 		ServerSideEncryption: obj.serverSideEncryption,
 		SSEKMSKeyId:          obj.kmsKeyID,
+		ETag:                 aws.String(fakeS3ETag(obj.body)),
 	}, nil
 }
 
@@ -804,6 +805,7 @@ func (c *fakeS3Client) listPageContentsLocked(bucketPrefix string, keys []string
 			Key:          aws.String(key),
 			Size:         aws.Int64(int64(len(obj.body))),
 			LastModified: aws.Time(modifiedAt),
+			ETag:         aws.String(fakeS3ETag(obj.body)),
 		})
 	}
 	return contents
@@ -853,8 +855,27 @@ func (c *fakeS3Client) DeleteObject(
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deletes = append(c.deletes, aws.ToString(input.Key))
-	delete(c.objects, fakeS3ClientKey(input.Bucket, input.Key))
+	storeKey := fakeS3ClientKey(input.Bucket, input.Key)
+	if want := aws.ToString(input.IfMatch); want != "" {
+		obj, ok := c.objects[storeKey]
+		if !ok {
+			return nil, &types.NotFound{}
+		}
+		if fakeS3ETag(obj.body) != want {
+			return nil, &smithy.GenericAPIError{
+				Code:    "PreconditionFailed",
+				Message: "At least one of the pre-conditions you specified did not hold",
+			}
+		}
+	}
+	delete(c.objects, storeKey)
 	return &s3.DeleteObjectOutput{}, nil
+}
+
+// fakeS3ETag derives a stable ETag from the object bytes, matching
+// S3's single-part semantics closely enough for the If-Match tests.
+func fakeS3ETag(body []byte) string {
+	return `"` + hexSHA256Bytes(body)[:32] + `"`
 }
 
 func fakeS3ClientKey(bucket *string, key *string) string {
@@ -1000,4 +1021,55 @@ func TestS3StoreDeleteObjectIsIdempotentAndValidatesKeys(t *testing.T) {
 	require.Equal(t, []string{key, key}, client.deletes)
 
 	require.ErrorIs(t, store.DeleteObject(ctx, "../escape"), ErrInvalidOptions)
+}
+
+// TestS3StoreConditionalDeleteUsesIfMatchAndMapsPreconditionFailure
+// covers the exact compare-and-delete the retention race fix depends
+// on: S3 must be asked to delete only the version GC validated, and a
+// 412 must surface as ErrObjectModified so GC treats it as a skip
+// rather than a failure.
+func TestS3StoreConditionalDeleteUsesIfMatchAndMapsPreconditionFailure(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+
+	key := "cluster-a/v1/payloads/sha256/ab/cond.fsm"
+	body := []byte("payload bytes")
+	_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: hexSHA256Bytes(body),
+	})
+	require.NoError(t, err)
+
+	info, ok, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotEmpty(t, info.ETag, "the store must carry the version token forward")
+
+	// A stale precondition must be refused, and must not delete.
+	err = store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{ETag: `"not-the-current-version"`})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrObjectModified))
+	_, stillThere, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, stillThere, "a failed precondition must leave the object in place")
+
+	// The observed version deletes.
+	require.NoError(t, store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{ETag: info.ETag}))
+	_, gone, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.False(t, gone)
+}
+
+// TestS3StoreConditionalDeleteRefusesAnEmptyPrecondition stops a
+// silent downgrade to an unconditional delete when neither an etag nor
+// a last-modified time is available.
+func TestS3StoreConditionalDeleteRefusesAnEmptyPrecondition(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+
+	err := store.DeleteObjectIfUnmodified(ctx, "cluster-a/v1/payloads/sha256/ab/x.fsm", DeletePrecondition{})
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.Empty(t, client.deletes, "an unusable precondition must not reach the store")
 }

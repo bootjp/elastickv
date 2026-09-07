@@ -9,6 +9,7 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -38,6 +39,26 @@ type ObjectRef struct {
 	Key       string
 	Size      int64
 	UpdatedAt time.Time
+	// ETag is the store's opaque version token for the exact bytes
+	// observed. It is the precondition DeleteObjectIfUnmodified uses
+	// to make reclamation a compare-and-delete rather than a
+	// check-then-delete. Empty when the store cannot supply one, in
+	// which case the size + mtime pair is the fallback precondition.
+	ETag string
+}
+
+// DeletePrecondition is the state a caller observed for an object,
+// used to make deletion conditional on the object not having changed
+// since.
+type DeletePrecondition struct {
+	ETag      string
+	Size      int64
+	UpdatedAt time.Time
+}
+
+// PreconditionFor returns the precondition describing ref.
+func PreconditionFor(ref ObjectRef) DeletePrecondition {
+	return DeletePrecondition{ETag: ref.ETag, Size: ref.Size, UpdatedAt: ref.UpdatedAt}
 }
 
 // RetentionStore is an ObjectStore that also supports the listing and
@@ -57,6 +78,19 @@ type RetentionStore interface {
 	ObjectStore
 	ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error)
 	DeleteObject(ctx context.Context, key string) error
+
+	// DeleteObjectIfUnmodified deletes key only if it still matches
+	// cond, and returns ErrObjectModified otherwise.
+	//
+	// This is what makes payload reclamation safe against a
+	// concurrent publish. The grace window alone is not enough: a
+	// publisher that reuses a content-addressed payload refreshes the
+	// object to restart its grace, and an unconditional delete can
+	// still land between GC observing the old state and the publisher
+	// committing its manifest — leaving a committed manifest pointing
+	// at bytes that no longer exist. Making the delete conditional on
+	// the exact state GC validated turns that race into a skip.
+	DeleteObjectIfUnmodified(ctx context.Context, key string, cond DeletePrecondition) error
 }
 
 var _ RetentionStore = (*LocalStore)(nil)
@@ -134,6 +168,38 @@ func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (
 	}, true, nil
 }
 
+// DeleteObjectIfUnmodified removes key only when it still matches
+// cond. See the RetentionStore contract for why the condition matters.
+func (s *LocalStore) DeleteObjectIfUnmodified(ctx context.Context, key string, cond DeletePrecondition) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	objectPath, err := s.pathForKey(key)
+	if err != nil {
+		return err
+	}
+
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+
+	stat, err := os.Stat(objectPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Already gone: the caller's intent is satisfied.
+			return nil
+		}
+		return errors.Wrapf(err, "stat object %s", key)
+	}
+	if stat.Size() != cond.Size || !stat.ModTime().Equal(cond.UpdatedAt) {
+		return errors.Wrapf(ErrObjectModified,
+			"object %s changed since it was validated for deletion", key)
+	}
+	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "delete object %s", key)
+	}
+	return nil
+}
+
 // DeleteObject removes one object. A already-absent object is not an
 // error: GC must be idempotent across retries and a concurrent
 // reclamation of the same key is a benign race.
@@ -166,10 +232,21 @@ type ObjectInfo struct {
 	SHA256               string
 	ServerSideEncryption string
 	SSEKMSKeyID          string
+	// ETag is the store's opaque version token, when it supplies one.
+	// Retention uses it as the compare-and-delete precondition.
+	ETag string
 }
 
 type LocalStore struct {
 	root string
+	// deleteMu serialises conditional deletes against refreshes made
+	// through this same store value. Within one process that makes
+	// compare-and-delete atomic. It cannot coordinate two processes
+	// sharing a directory — POSIX has no compare-and-unlink — so a
+	// cross-process local deployment keeps the residual race that the
+	// S3 store closes with If-Match. LocalStore is the dev/test and
+	// single-writer store; production offload targets S3.
+	deleteMu sync.Mutex
 }
 
 const localStoreDirPerm = 0o755
@@ -216,6 +293,11 @@ func (s *LocalStore) RefreshObject(ctx context.Context, key string, body io.Read
 		return ObjectInfo{}, err
 	}
 	defer func() { _ = os.Remove(tmpPath) }()
+	// Held across the replace so an in-process reclamation of this
+	// same payload cannot land between a validating stat and the
+	// unlink. See DeleteObjectIfUnmodified.
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
 	return s.replaceObject(key, tmpPath, finalPath, info)
 }
 

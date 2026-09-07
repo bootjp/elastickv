@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -551,6 +552,7 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, Obj
 		_ = out.Body.Close()
 		return nil, ObjectInfo{}, err
 	}
+	info.ETag = aws.ToString(out.ETag)
 	return out.Body, info, nil
 }
 
@@ -589,6 +591,9 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (ObjectInfo, bool,
 	if err := s.validateS3ObjectEncryption(normalized, info); err != nil {
 		return ObjectInfo{}, false, err
 	}
+	// Carried so retention can use it as the compare-and-delete
+	// precondition on DeleteObjectIfUnmodified.
+	info.ETag = aws.ToString(out.ETag)
 	return info, true, nil
 }
 
@@ -1052,4 +1057,58 @@ func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
 		return errors.Wrapf(err, "delete object %s", key)
 	}
 	return nil
+}
+
+// DeleteObjectIfUnmodified deletes key only when it still matches
+// cond, mapping S3's 412 precondition failure to ErrObjectModified.
+//
+// When cond carries an ETag this is an exact compare-and-delete via
+// If-Match. Without one it falls back to If-Match-Last-Modified-Time
+// plus If-Match-Size, which is the same contract at coarser
+// resolution. A store that honours neither would silently degrade to
+// an unconditional delete, so an empty condition is refused instead.
+func (s *S3Store) DeleteObjectIfUnmodified(ctx context.Context, key string, cond DeletePrecondition) error {
+	if s == nil || s.client == nil {
+		return errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	normalized, err := validateStoreObjectKey(key)
+	if err != nil {
+		return err
+	}
+	input := &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(normalized),
+	}
+	switch {
+	case strings.TrimSpace(cond.ETag) != "":
+		input.IfMatch = aws.String(cond.ETag)
+	case !cond.UpdatedAt.IsZero():
+		input.IfMatchLastModifiedTime = aws.Time(cond.UpdatedAt)
+		input.IfMatchSize = aws.Int64(cond.Size)
+	default:
+		return errors.Wrapf(ErrInvalidOptions,
+			"conditional delete of %s requires an etag or a last-modified time", key)
+	}
+	if _, err := s.client.DeleteObject(ctx, input); err != nil {
+		if isPreconditionFailed(err) {
+			return errors.Wrapf(ErrObjectModified,
+				"object %s changed since it was validated for deletion", key)
+		}
+		return errors.Wrapf(err, "conditional delete object %s", key)
+	}
+	return nil
+}
+
+// isPreconditionFailed reports whether err is S3's 412 response to a
+// failed If-Match on delete.
+func isPreconditionFailed(err error) bool {
+	var responseErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &responseErr) && responseErr.HTTPStatusCode() == http.StatusPreconditionFailed {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "PreconditionFailed"
+	}
+	return false
 }

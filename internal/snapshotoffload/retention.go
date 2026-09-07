@@ -87,6 +87,15 @@ type GCResult struct {
 	// SkipReason explains PayloadPhaseSkipped in operator-facing
 	// terms. Empty when the phase ran.
 	SkipReason string
+	// ManifestsClaimedConcurrently counts expired manifests whose
+	// compare-and-delete lost to a concurrent publish rewriting the
+	// same key (an idempotent republish of the same index/term).
+	ManifestsClaimedConcurrently int
+	// PayloadsClaimedConcurrently counts payloads that were eligible
+	// for reclamation but whose compare-and-delete lost to a
+	// concurrent publish reusing them. A steady non-zero value is
+	// healthy dedup traffic, not an error.
+	PayloadsClaimedConcurrently int
 }
 
 // GC implements the §5 retention and payload-reclamation passes over
@@ -162,13 +171,16 @@ func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
 		}
 	}
 
-	for _, key := range expired {
-		if err := g.store.DeleteObject(ctx, key); err != nil {
-			return result, errors.Wrapf(err, "retention: delete manifest %s", key)
+	for _, entry := range expired {
+		deleted, err := g.compareAndDeleteManifest(ctx, entry)
+		if err != nil {
+			return result, err
 		}
-		result.ManifestsDeleted = append(result.ManifestsDeleted, key)
-		g.log.Info("snapshot offload retention deleted manifest",
-			"manifest_key", key)
+		if !deleted {
+			result.ManifestsClaimedConcurrently++
+			continue
+		}
+		result.ManifestsDeleted = append(result.ManifestsDeleted, entry.key)
 	}
 
 	if payloadSkipReason != "" {
@@ -180,8 +192,9 @@ func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
 		return result, nil
 	}
 
-	deleted, err := g.reclaimPayloads(ctx, survivors, payloadRefs)
+	deleted, claimed, err := g.reclaimPayloads(ctx, survivors, payloadRefs)
 	result.PayloadsDeleted = deleted
+	result.PayloadsClaimedConcurrently = claimed
 	if err != nil {
 		return result, err
 	}
@@ -196,7 +209,14 @@ type manifestScan struct {
 }
 
 type scannedManifest struct {
-	key      string
+	key string
+	// ref is the object state observed when the manifest was listed.
+	// It is the compare-and-delete precondition for phase 1, for the
+	// same reason phase 2 needs one: an idempotent publish retry can
+	// rewrite this exact key between the retention decision and the
+	// delete, and an unconditional delete would then remove a
+	// manifest the publisher believes it just committed.
+	ref      ObjectRef
 	manifest Manifest
 	// createdAt is the manifest's own CreatedAt. The object store's
 	// mtime is deliberately NOT used here: a bucket copy or a
@@ -255,6 +275,7 @@ func (g *GC) scanManifests(ctx context.Context) (manifestScan, error) {
 		}
 		scan.byGroup[manifest.GroupID] = append(scan.byGroup[manifest.GroupID], scannedManifest{
 			key:       ref.Key,
+			ref:       ref,
 			manifest:  manifest,
 			createdAt: manifest.CreatedAt,
 		})
@@ -292,10 +313,10 @@ func (g *GC) loadManifest(ctx context.Context, ref ObjectRef) (Manifest, error) 
 
 // partition splits every scanned manifest into survivors and the keys
 // phase 1 may delete.
-func (g *GC) partition(scan manifestScan) ([]scannedManifest, []string) {
+func (g *GC) partition(scan manifestScan) ([]scannedManifest, []scannedManifest) {
 	var (
 		survivors []scannedManifest
-		expired   []string
+		expired   []scannedManifest
 	)
 	cutoff := g.now().Add(-g.policy.MaxAge)
 
@@ -313,10 +334,10 @@ func (g *GC) partition(scan manifestScan) ([]scannedManifest, []string) {
 				survivors = append(survivors, entry)
 				continue
 			}
-			expired = append(expired, entry.key)
+			expired = append(expired, entry)
 		}
 	}
-	sort.Strings(expired)
+	sort.Slice(expired, func(i, j int) bool { return expired[i].key < expired[j].key })
 	return survivors, expired
 }
 
@@ -368,18 +389,27 @@ func (g *GC) listPayloadObjects(ctx context.Context) ([]ObjectRef, error) {
 // every surviving manifest across every group, then delete only
 // payload objects that are both unreferenced and older than the grace
 // period.
-func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, refs []ObjectRef) ([]string, error) {
+func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, refs []ObjectRef) ([]string, int, error) {
 	live := make(map[string]struct{}, len(survivors))
 	for _, entry := range survivors {
 		live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
 	}
 
 	graceCutoff := g.now().Add(-g.policy.PayloadGrace)
-	var deleted []string
+	var (
+		deleted []string
+		claimed int
+	)
 	for _, ref := range refs {
 		key, ok, err := g.reclaimPayload(ctx, live, graceCutoff, ref)
 		if err != nil {
-			return deleted, err
+			// A payload claimed by a concurrent publish is a normal
+			// outcome, not a failure: skip it and keep going.
+			if errors.Is(err, errObjectClaimed) {
+				claimed++
+				continue
+			}
+			return deleted, claimed, err
 		}
 		if !ok {
 			continue
@@ -387,7 +417,7 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 		deleted = append(deleted, key)
 	}
 	sort.Strings(deleted)
-	return deleted, nil
+	return deleted, claimed, nil
 }
 
 func (g *GC) reclaimPayload(
@@ -417,12 +447,75 @@ func (g *GC) reclaimPayload(
 	if !exists || !beforeGraceCutoff(info.UpdatedAt, graceCutoff) {
 		return "", false, nil
 	}
-	if err := g.store.DeleteObject(ctx, ref.Key); err != nil {
-		return "", false, errors.Wrapf(err, "retention: delete payload %s", ref.Key)
+	if err := g.compareAndDeletePayload(ctx, refreshed(ref, info), sha); err != nil {
+		return "", false, err
 	}
 	g.log.Info("snapshot offload retention reclaimed payload",
 		"object_key", ref.Key, "sha256", sha)
 	return ref.Key, true, nil
+}
+
+// compareAndDeleteManifest deletes an expired manifest only if it
+// still matches the state the scan observed. It reports deleted=false
+// (not an error) when a concurrent publish rewrote the key, since
+// leaving a just-republished manifest in place is the correct outcome.
+func (g *GC) compareAndDeleteManifest(ctx context.Context, entry scannedManifest) (bool, error) {
+	err := g.store.DeleteObjectIfUnmodified(ctx, entry.key, PreconditionFor(entry.ref))
+	switch {
+	case err == nil:
+		g.log.Info("snapshot offload retention deleted manifest",
+			"manifest_key", entry.key)
+		return true, nil
+	case errors.Is(err, ErrObjectModified):
+		g.log.Info("snapshot offload retention skipped manifest rewritten by a concurrent publish",
+			"manifest_key", entry.key)
+		return false, nil
+	default:
+		return false, errors.Wrapf(err, "retention: delete manifest %s", entry.key)
+	}
+}
+
+// compareAndDeletePayload deletes the payload only if it still matches
+// the state reclaimPayload validated.
+//
+// An unconditional delete here would still lose the race with a
+// publisher that reuses this payload: it can refresh the object and
+// commit a manifest between the validating head and this call, leaving
+// a committed manifest pointing at deleted bytes.
+func (g *GC) compareAndDeletePayload(ctx context.Context, ref ObjectRef, sha string) error {
+	err := g.store.DeleteObjectIfUnmodified(ctx, ref.Key, PreconditionFor(ref))
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, ErrObjectModified):
+		// A concurrent publish claimed the payload. Not an error:
+		// leaving it alone is the correct outcome, and the next pass
+		// reclaims it if it really is garbage.
+		g.log.Info("snapshot offload retention skipped payload claimed by a concurrent publish",
+			"object_key", ref.Key, "sha256", sha)
+		return errObjectClaimed
+	default:
+		return errors.Wrapf(err, "retention: delete payload %s", ref.Key)
+	}
+}
+
+// errObjectClaimed marks the benign "a publisher took this payload
+// back" outcome so the caller can count it without treating it as a
+// failure. It never escapes reclaimPayloads.
+var errObjectClaimed = errors.New("snapshot offload: payload claimed by a concurrent publish")
+
+// refreshed merges the freshly-headed state into the listed ref so the
+// delete precondition describes what was actually validated, not the
+// possibly-staler listing.
+func refreshed(ref ObjectRef, info ObjectInfo) ObjectRef {
+	ref.Size = info.Size
+	if !info.UpdatedAt.IsZero() {
+		ref.UpdatedAt = info.UpdatedAt
+	}
+	if info.ETag != "" {
+		ref.ETag = info.ETag
+	}
+	return ref
 }
 
 func payloadKeyIsLive(live map[string]struct{}, key string) bool {

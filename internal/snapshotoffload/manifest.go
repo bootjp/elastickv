@@ -22,6 +22,12 @@ var (
 	ErrIntegrity      = errors.New("snapshot offload: integrity check failed")
 	ErrObjectConflict = errors.New("snapshot offload: object conflict")
 	ErrObjectNotFound = errors.New("snapshot offload: object not found")
+
+	// ErrObjectModified is returned by DeleteObjectIfUnmodified when
+	// the object changed after the caller validated it. For retention
+	// this is not a failure: it means a concurrent publish claimed the
+	// payload, so the correct response is to leave it alone.
+	ErrObjectModified = errors.New("snapshot offload: object modified since validation")
 )
 
 type Manifest struct {

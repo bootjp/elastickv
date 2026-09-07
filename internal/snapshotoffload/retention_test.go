@@ -727,3 +727,175 @@ func TestLocalStoreListObjectsSkipsInProgressPutTempFiles(t *testing.T) {
 	}
 	require.FileExists(t, leftover, "listing must not delete the leftover either")
 }
+
+// racingPublishStore simulates the concurrent-publish race the P1
+// review identified: a publisher reuses a content-addressed payload
+// and refreshes it in the window between GC validating the object and
+// GC deleting it. The refresh happens inside the HeadObject call, so
+// the state GC validated is already stale by the time it deletes.
+type racingPublishStore struct {
+	RetentionStore
+	target      string
+	refresh     func()
+	refreshed   bool
+	unconAppend *[]string
+}
+
+func (s *racingPublishStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
+	info, ok, err := s.RetentionStore.HeadObject(ctx, key)
+	if err == nil && ok && key == s.target && !s.refreshed {
+		// GC has now validated the object. The publisher lands its
+		// refresh right here, before GC issues the delete.
+		s.refreshed = true
+		s.refresh()
+	}
+	return info, ok, err
+}
+
+func (s *racingPublishStore) DeleteObject(ctx context.Context, key string) error {
+	if s.unconAppend != nil {
+		*s.unconAppend = append(*s.unconAppend, key)
+	}
+	return s.RetentionStore.DeleteObject(ctx, key)
+}
+
+// TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish is the
+// regression test for the P1 concurrent-publication race.
+//
+// Sequence: GC decides a payload is unreferenced and past grace, and
+// validates it. A publisher that is reusing the same content-addressed
+// payload then refreshes the object (restarting its grace) and is
+// about to commit a manifest naming it. If GC's delete is
+// unconditional it lands anyway, and the publisher commits a manifest
+// pointing at bytes that no longer exist.
+//
+// The compare-and-delete precondition turns that into a skip.
+func TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	// A newer manifest keeps the group alive; the older one is
+	// trimmed, leaving its payload unreferenced and past grace.
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	orphan := f.publishManifest(t, 1, 10, []byte("reused-by-a-concurrent-publish"), year)
+
+	racing := &racingPublishStore{
+		RetentionStore: f.store,
+		target:         orphan.Payload.Key,
+		refresh: func() {
+			// The publisher's refresh: same bytes, fresh mtime.
+			f.setMTime(t, orphan.Payload.Key, f.now)
+		},
+	}
+
+	gc, err := NewGC(GCOptions{
+		Store:  racing,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+
+	require.True(t, f.exists(t, orphan.Payload.Key),
+		"a payload refreshed by a concurrent publish must survive GC")
+	require.NotContains(t, result.PayloadsDeleted, orphan.Payload.Key)
+	require.Equal(t, 1, result.PayloadsClaimedConcurrently,
+		"the lost compare-and-delete must be reported, not silently dropped")
+}
+
+// TestLocalStoreConditionalDeleteRejectsChangedObject exercises the
+// precondition directly.
+func TestLocalStoreConditionalDeleteRejectsChangedObject(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	ctx := context.Background()
+	key := "cluster-a/v1/payloads/sha256/ab/cond.fsm"
+	body := []byte("payload bytes")
+	_, err := f.store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: hexSHA256Bytes(body),
+	})
+	require.NoError(t, err)
+	f.setMTime(t, key, f.now.Add(-time.Hour))
+
+	stale := DeletePrecondition{Size: int64(len(body)), UpdatedAt: f.now.Add(-time.Hour)}
+
+	// The object moves under the caller's feet.
+	f.setMTime(t, key, f.now)
+	err = f.store.DeleteObjectIfUnmodified(ctx, key, stale)
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrObjectModified))
+	require.True(t, f.exists(t, key), "a failed precondition must not delete")
+
+	// With the current state it succeeds.
+	current := DeletePrecondition{Size: int64(len(body)), UpdatedAt: f.now}
+	require.NoError(t, f.store.DeleteObjectIfUnmodified(ctx, key, current))
+	require.False(t, f.exists(t, key))
+
+	// Already-absent stays a no-op so GC is retry-safe.
+	require.NoError(t, f.store.DeleteObjectIfUnmodified(ctx, key, current))
+}
+
+// manifestRewritingStore rewrites an expired manifest between the scan
+// that decided to delete it and the delete itself, modelling an
+// idempotent publish retry that republishes the same index/term.
+type manifestRewritingStore struct {
+	RetentionStore
+	target  string
+	rewrite func()
+	done    bool
+}
+
+func (s *manifestRewritingStore) DeleteObjectIfUnmodified(
+	ctx context.Context, key string, cond DeletePrecondition,
+) error {
+	if key == s.target && !s.done {
+		s.done = true
+		s.rewrite()
+	}
+	return s.RetentionStore.DeleteObjectIfUnmodified(ctx, key, cond)
+}
+
+// TestGCDoesNotDeleteManifestRewrittenByAConcurrentPublish is the
+// phase-1 sibling of the payload race. Manifest keys are deterministic
+// in (group, index, term), so an idempotent republish rewrites the
+// exact key retention is about to remove. Deleting it anyway would
+// drop a manifest the publisher believes it just committed.
+func TestGCDoesNotDeleteManifestRewrittenByAConcurrentPublish(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	stale := f.publishManifest(t, 1, 10, []byte("republished"), year)
+
+	rewriting := &manifestRewritingStore{
+		RetentionStore: f.store,
+		target:         stale.ManifestKey,
+		rewrite: func() {
+			// The publisher's idempotent rewrite: same key, fresh mtime.
+			f.setMTime(t, stale.ManifestKey, f.now)
+		},
+	}
+
+	gc, err := NewGC(GCOptions{
+		Store:  rewriting,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+
+	require.True(t, f.exists(t, stale.ManifestKey),
+		"a manifest rewritten by a concurrent publish must survive GC")
+	require.NotContains(t, result.ManifestsDeleted, stale.ManifestKey)
+	require.Equal(t, 1, result.ManifestsClaimedConcurrently)
+}
