@@ -65,11 +65,12 @@ func TestSchedulerSkipsGroupsThisNodeDoesNotLead(t *testing.T) {
 	store := newTestLocalStore(t, filepath.Join(root, "objects"))
 	obs := &recordingObserver{}
 
-	s := NewScheduler(store, []OffloadGroup{{
-		GroupID:  7,
-		DataDir:  dataDir,
-		IsLeader: func() bool { return false },
-	}}, "cluster-a", "cluster-a", "test", WithSchedulerObserver(obs))
+	s := newTestScheduler(t, store, []OffloadGroup{{
+		GroupID:      7,
+		DataDir:      dataDir,
+		IsLeader:     func() bool { return false },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}, WithSchedulerObserver(obs))
 
 	s.SyncOnce(context.Background())
 
@@ -92,12 +93,12 @@ func TestSchedulerDoesNotCommitManifestWhenLeadershipIsLostWhileSpooling(t *test
 	obs := &recordingObserver{}
 	lost := errors.New("leadership lost")
 
-	s := NewScheduler(store, []OffloadGroup{{
+	s := newTestScheduler(t, store, []OffloadGroup{{
 		GroupID:      7,
 		DataDir:      dataDir,
 		IsLeader:     func() bool { return true },
 		VerifyLeader: func(context.Context) error { return lost },
-	}}, "cluster-a", "cluster-a", "test", WithSchedulerObserver(obs))
+	}}, WithSchedulerObserver(obs))
 
 	s.SyncOnce(context.Background())
 
@@ -123,16 +124,21 @@ func TestSchedulerPublishesOnceAndIsIdempotentAcrossRestart(t *testing.T) {
 	dataDir := seedSchedulerGroup(t, root, "g")
 	store := newTestLocalStore(t, filepath.Join(root, "objects"))
 	obs := &recordingObserver{}
-	groups := []OffloadGroup{{GroupID: 7, DataDir: dataDir, IsLeader: func() bool { return true }}}
+	groups := []OffloadGroup{{
+		GroupID:      7,
+		DataDir:      dataDir,
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}
 
-	s := NewScheduler(store, groups, "cluster-a", "cluster-a", "test", WithSchedulerObserver(obs))
+	s := newTestScheduler(t, store, groups, WithSchedulerObserver(obs))
 	s.SyncOnce(context.Background())
 	require.Equal(t, uint64(42), s.LastPublishedIndex(7))
 
 	// Same process, second scan.
 	s.SyncOnce(context.Background())
 	// A different process that has published nothing itself.
-	restarted := NewScheduler(store, groups, "cluster-a", "cluster-a", "test", WithSchedulerObserver(obs))
+	restarted := newTestScheduler(t, store, groups, WithSchedulerObserver(obs))
 	require.Zero(t, restarted.LastPublishedIndex(7), "a fresh process starts with no local record")
 	restarted.SyncOnce(context.Background())
 
@@ -168,10 +174,11 @@ func TestSchedulerBoundsConcurrentUploads(t *testing.T) {
 				inFlight.Add(-1)
 				return true
 			},
+			VerifyLeader: func(context.Context) error { return nil },
 		})
 	}
 
-	s := NewScheduler(store, groups, "cluster-a", "cluster-a", "test")
+	s := newTestScheduler(t, store, groups)
 	s.SyncOnce(context.Background())
 
 	require.Equal(t, int64(1), peak.Load(), "default concurrency is one upload per process")
@@ -190,9 +197,12 @@ func TestSchedulerTreatsCancellationAsShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 
-	s := NewScheduler(store, []OffloadGroup{{
-		GroupID: 7, DataDir: dataDir, IsLeader: func() bool { return true },
-	}}, "cluster-a", "cluster-a", "test", WithSchedulerObserver(obs))
+	s := newTestScheduler(t, store, []OffloadGroup{{
+		GroupID:      7,
+		DataDir:      dataDir,
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}, WithSchedulerObserver(obs))
 	s.SyncOnce(ctx)
 
 	published, _, failed := obs.snapshot()
@@ -203,7 +213,81 @@ func TestSchedulerTreatsCancellationAsShutdown(t *testing.T) {
 func TestSchedulerRunRequiresStoreAndSourceCluster(t *testing.T) {
 	t.Parallel()
 
-	require.ErrorIs(t, NewScheduler(nil, nil, "p", "c", "v").Run(context.Background()), ErrInvalidOptions)
+	_, err := NewScheduler(nil, nil, "p", "c", "v")
+	require.ErrorIs(t, err, ErrInvalidOptions)
 	store := newTestLocalStore(t, t.TempDir())
-	require.ErrorIs(t, NewScheduler(store, nil, "p", "", "v").Run(context.Background()), ErrInvalidOptions)
+	_, err = NewScheduler(store, nil, "p", "", "v")
+	require.ErrorIs(t, err, ErrInvalidOptions)
+}
+
+// newTestScheduler builds a valid scheduler and fails the test if the
+// configuration is rejected.
+func newTestScheduler(
+	t *testing.T, store ObjectStore, groups []OffloadGroup, opts ...SchedulerOption,
+) *Scheduler {
+	t.Helper()
+	s, err := NewScheduler(store, groups, "cluster-a", "cluster-a", "test", opts...)
+	require.NoError(t, err)
+	return s
+}
+
+// TestSchedulerRejectsGroupsMissingALeadershipCallback is the P1 guard:
+// a nil callback previously meant "publishable", so a miswired
+// scheduler would publish a manifest from a follower — silently, and
+// exactly against the guarantee the scheduler exists to provide.
+func TestSchedulerRejectsGroupsMissingALeadershipCallback(t *testing.T) {
+	t.Parallel()
+
+	store := newTestLocalStore(t, t.TempDir())
+	valid := OffloadGroup{
+		GroupID:      7,
+		DataDir:      t.TempDir(),
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}
+
+	missingIsLeader := valid
+	missingIsLeader.IsLeader = nil
+	_, err := NewScheduler(store, []OffloadGroup{missingIsLeader}, "p", "c", "v")
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.ErrorContains(t, err, "IsLeader")
+
+	missingVerify := valid
+	missingVerify.VerifyLeader = nil
+	_, err = NewScheduler(store, []OffloadGroup{missingVerify}, "p", "c", "v")
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.ErrorContains(t, err, "VerifyLeader")
+
+	// The fully-wired group is accepted.
+	_, err = NewScheduler(store, []OffloadGroup{valid}, "p", "c", "v")
+	require.NoError(t, err)
+}
+
+// TestSchedulerSkipsRepublishingAnUnchangedSnapshot is the P1
+// efficiency guard: an unchanged snapshot must not be re-spooled and
+// re-hashed on every tick. The skip has to happen before the payload
+// is read, so it is observable as a skip rather than a publish.
+func TestSchedulerSkipsRepublishingAnUnchangedSnapshot(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dataDir := seedSchedulerGroup(t, root, "g")
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	obs := &recordingObserver{}
+	groups := []OffloadGroup{{
+		GroupID:      7,
+		DataDir:      dataDir,
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}
+
+	s := newTestScheduler(t, store, groups, WithSchedulerObserver(obs))
+	s.SyncOnce(context.Background())
+	s.SyncOnce(context.Background())
+	s.SyncOnce(context.Background())
+
+	published, skipped, failed := obs.snapshot()
+	require.Empty(t, failed)
+	require.Len(t, published, 1, "an unchanged snapshot must be published exactly once")
+	require.Equal(t, []string{"already_published", "already_published"}, skipped)
 }

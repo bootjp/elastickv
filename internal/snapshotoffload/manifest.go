@@ -22,6 +22,12 @@ var (
 	ErrIntegrity      = errors.New("snapshot offload: integrity check failed")
 	ErrObjectConflict = errors.New("snapshot offload: object conflict")
 	ErrObjectNotFound = errors.New("snapshot offload: object not found")
+
+	// ErrSnapshotNotNewer reports that the persisted snapshot is not
+	// newer than the caller's high-water mark, so nothing was
+	// published. It is a normal outcome for a scheduler tick over an
+	// unchanged snapshot, not a failure.
+	ErrSnapshotNotNewer = errors.New("snapshot offload: persisted snapshot is not newer than the last published index")
 )
 
 type Manifest struct {

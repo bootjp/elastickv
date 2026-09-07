@@ -126,7 +126,12 @@ func WithSchedulerSpoolDir(dir string) SchedulerOption {
 
 // NewScheduler builds the offload scheduler. It is opt-in: callers construct it
 // only when object offload is configured.
-func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluster, binaryVersion string, opts ...SchedulerOption) *Scheduler {
+// NewScheduler validates its configuration eagerly so an invalid
+// scheduler cannot be constructed at all. In particular every group
+// must supply both leadership callbacks: SyncOnce is exported and does
+// not re-validate, so a nil callback that survived construction would
+// be a follower publishing a manifest.
+func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluster, binaryVersion string, opts ...SchedulerOption) (*Scheduler, error) {
 	s := &Scheduler{
 		groups:      groups,
 		store:       store,
@@ -144,7 +149,10 @@ func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluste
 	for _, opt := range opts {
 		opt(s)
 	}
-	return s
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	return s, nil
 }
 
 func (s *Scheduler) validate() error {
@@ -153,6 +161,21 @@ func (s *Scheduler) validate() error {
 		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires an object store")
 	case s.sourceName == "":
 		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires a source cluster name")
+	}
+	// Both leadership callbacks are mandatory. Treating a nil callback
+	// as "leader" would let a miswired scheduler publish from a
+	// follower, which is the one thing this scheduler exists to
+	// prevent — and it would do so silently. Fail at construction
+	// instead, where the operator sees it.
+	for _, group := range s.groups {
+		switch {
+		case group.IsLeader == nil:
+			return errors.Wrapf(ErrInvalidOptions,
+				"snapshot offload group %d requires an IsLeader callback", group.GroupID)
+		case group.VerifyLeader == nil:
+			return errors.Wrapf(ErrInvalidOptions,
+				"snapshot offload group %d requires a VerifyLeader callback", group.GroupID)
+		}
 	}
 	return nil
 }
@@ -213,8 +236,16 @@ func (s *Scheduler) SyncOnce(ctx context.Context) {
 }
 
 func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
-	// Cheap pre-check first: a follower must not even open the snapshot.
-	if group.IsLeader != nil && !group.IsLeader() {
+	// Cheap pre-check first: a follower must not even open the
+	// snapshot. NewScheduler rejects a nil callback, so this is
+	// defence in depth for a Scheduler built by some other route:
+	// unknown leadership is treated as "not leader", never as
+	// permission to publish.
+	if group.IsLeader == nil || group.VerifyLeader == nil {
+		s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "leadership_unknown")
+		return
+	}
+	if !group.IsLeader() {
 		s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "not_leader")
 		return
 	}
@@ -228,9 +259,17 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 		BinaryVersion: s.binVersion,
 		SpoolDir:      s.spoolDir,
 		VerifyLeader:  group.VerifyLeader,
+		// Suppress the whole spool when this node has already
+		// published this index. Without it an unchanged snapshot is
+		// fully re-read and re-hashed on every tick.
+		SkipIfNotNewerThan: s.publishedIndex(group.GroupID),
 	})
 	if err != nil {
 		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, ErrSnapshotNotNewer) {
+			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "already_published")
 			return
 		}
 		s.observer.ObserveSnapshotOffloadFailed(group.GroupID, err)
@@ -241,6 +280,16 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 	s.markPublished(group.GroupID, manifest.SnapshotIndex)
 	s.observer.ObserveSnapshotOffloadPublished(
 		group.GroupID, manifest.SnapshotIndex, manifest.Payload.Bytes, s.now().Sub(started))
+}
+
+// publishedIndex returns this process's high-water mark for a group.
+// It is intentionally in-memory only: a restart re-publishes once,
+// which the object store's content addressing makes cheap and which
+// keeps the scheduler from needing durable state of its own.
+func (s *Scheduler) publishedIndex(groupID uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.published[groupID]
 }
 
 func (s *Scheduler) markPublished(groupID, index uint64) {

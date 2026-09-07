@@ -32,6 +32,17 @@ type PublishOptions struct {
 	// content-addressed payload, which GC reclaims, but never a committed
 	// manifest naming a snapshot this node no longer had the right to publish.
 	VerifyLeader func(context.Context) error
+	// SkipIfNotNewerThan suppresses the publish when the persisted
+	// snapshot's index is not greater than this value. Zero disables
+	// the check.
+	//
+	// The comparison happens after the export is opened but BEFORE
+	// the payload is spooled, which is the whole point: a scheduler
+	// that ticks every 15 minutes over an unchanged snapshot would
+	// otherwise re-read, re-hash and re-fsync a multi-gigabyte
+	// payload every tick just to discover the object store already
+	// has it.
+	SkipIfNotNewerThan uint64
 }
 
 func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manifest, error) {
@@ -45,6 +56,10 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	defer func() { _ = export.Close() }()
 
 	metadata := export.Metadata()
+	if opts.SkipIfNotNewerThan > 0 && metadata.Index <= opts.SkipIfNotNewerThan {
+		return nil, errors.Wrapf(ErrSnapshotNotNewer,
+			"persisted snapshot index %d is not newer than %d", metadata.Index, opts.SkipIfNotNewerThan)
+	}
 	payloadFile, payloadSHA, payloadBytes, err := spoolExport(ctx, export, publishSpoolDir(opts))
 	if err != nil {
 		return nil, err
