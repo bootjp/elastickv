@@ -254,10 +254,21 @@ func (g *GC) scanManifests(ctx context.Context) (manifestScan, error) {
 	}
 
 	scan := manifestScan{byGroup: make(map[uint64][]scannedManifest)}
+	seen := make(map[string]struct{}, len(refs))
 	for _, ref := range refs {
 		if !strings.HasSuffix(ref.Key, manifestObjectSuffix) {
 			continue
 		}
+		// A store that returns the same key twice — overlapping pages
+		// from an S3-compatible endpoint while objects change — would
+		// otherwise be counted as two generations of the same
+		// manifest. With MinGenerations 1 one copy lands in survivors
+		// and the other in expired, so phase 1 would delete the very
+		// key chosen as the group's newest restore point.
+		if _, dup := seen[ref.Key]; dup {
+			continue
+		}
+		seen[ref.Key] = struct{}{}
 		scan.scanned++
 		manifest, err := g.loadManifest(ctx, ref)
 		if err != nil {
@@ -307,6 +318,22 @@ func (g *GC) loadManifest(ctx context.Context, ref ObjectRef) (Manifest, error) 
 	if normalizeObjectKey(ref.Key) != normalizeObjectKey(manifest.ManifestKey) {
 		return Manifest{}, malformedManifest(errors.Wrapf(ErrIntegrity,
 			"manifest key mismatch: listed %s, body says %s", ref.Key, manifest.ManifestKey))
+	}
+	// Self-consistency is not enough: a body may agree with its own
+	// ManifestKey while its group/index/term disagree with the path it
+	// is stored under. Retention groups and orders by the BODY, so a
+	// high-index body claiming group 2 parked under a group-1 path
+	// would consume group 2's retained-generation slots and get its
+	// real newest manifests deleted. Re-derive the canonical key and
+	// treat any disagreement as malformed.
+	canonical, err := manifestKey(g.prefix, manifest.GroupID, manifest.SnapshotIndex, manifest.SnapshotTerm)
+	if err != nil {
+		return Manifest{}, malformedManifest(errors.Wrapf(err, "derive canonical key for %s", ref.Key))
+	}
+	if normalizeObjectKey(ref.Key) != normalizeObjectKey(canonical) {
+		return Manifest{}, malformedManifest(errors.Wrapf(ErrIntegrity,
+			"manifest %s is stored off its canonical path %s (group=%d index=%d term=%d)",
+			ref.Key, canonical, manifest.GroupID, manifest.SnapshotIndex, manifest.SnapshotTerm))
 	}
 	return manifest, nil
 }
@@ -395,6 +422,23 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 		live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
 	}
 
+	// One revalidation pass for the whole phase, taken AFTER the
+	// payload listing so a manifest committed between the two is
+	// visible. Doing this per payload turns a stale-payload backlog
+	// into N listings and O(N×M) reads.
+	fresh, safe, err := g.revalidateLiveKeys(ctx)
+	if err != nil {
+		return nil, 0, err
+	}
+	if !safe {
+		// A malformed manifest appeared since phase 1; the live set
+		// can no longer be proven complete, so reclaim nothing.
+		return nil, 0, nil
+	}
+	for key := range fresh {
+		live[key] = struct{}{}
+	}
+
 	graceCutoff := g.now().Add(-g.policy.PayloadGrace)
 	var (
 		deleted []string
@@ -433,11 +477,6 @@ func (g *GC) reclaimPayload(
 		return "", false, nil
 	}
 	if payloadKeyIsLive(live, ref.Key) || !beforeGraceCutoff(ref.UpdatedAt, graceCutoff) {
-		return "", false, nil
-	}
-	if referenced, err := g.payloadCurrentlyReferenced(ctx, ref.Key); err != nil {
-		return "", false, errors.Wrapf(err, "retention: revalidate payload %s", ref.Key)
-	} else if referenced {
 		return "", false, nil
 	}
 	info, exists, err := g.store.HeadObject(ctx, ref.Key)
@@ -527,23 +566,34 @@ func beforeGraceCutoff(updatedAt, graceCutoff time.Time) bool {
 	return !updatedAt.IsZero() && updatedAt.Before(graceCutoff)
 }
 
-func (g *GC) payloadCurrentlyReferenced(ctx context.Context, key string) (bool, error) {
+// revalidateLiveKeys re-reads the manifest tree ONCE, after the payload
+// listing, and returns the set of payload keys it still references.
+//
+// The freshness matters: the live set used for the delete decision must
+// be at least as new as the payload listing, or a manifest committed
+// between the two would look absent. But it must be rebuilt once per
+// pass, not once per payload — a prefix with a large stale-payload
+// backlog would otherwise issue N listings and O(N×M) object reads and
+// never finish its first cleanup.
+//
+// A second return of false means the re-scan itself found the prefix
+// unsafe to reclaim from (a malformed manifest appeared), in which case
+// the caller must skip the phase entirely.
+func (g *GC) revalidateLiveKeys(ctx context.Context) (map[string]struct{}, bool, error) {
 	scan, err := g.scanManifests(ctx)
 	if err != nil {
-		return false, err
+		return nil, false, err
 	}
 	if g.payloadPhaseBlockedBy(scan) != "" {
-		return true, nil
+		return nil, false, nil
 	}
-	target := normalizeObjectKey(key)
+	live := make(map[string]struct{}, scan.scanned)
 	for _, manifests := range scan.byGroup {
 		for _, entry := range manifests {
-			if normalizeObjectKey(entry.manifest.Payload.Key) == target {
-				return true, nil
-			}
+			live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
 		}
 	}
-	return false, nil
+	return live, true, nil
 }
 
 // payloadSHAFromKey recovers the content hash from a payload object

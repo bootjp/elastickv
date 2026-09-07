@@ -1042,6 +1042,17 @@ func nextListPageToken(out *s3.ListObjectsV2Output, prefix string) (*string, boo
 
 // DeleteObject removes one object. S3 delete is idempotent, so an
 // already-absent key is not an error.
+//
+// Versioned buckets: a delete without a VersionId only writes a delete
+// marker, so the bytes survive as a noncurrent version that later
+// ListObjectsV2 scans cannot see. Retention would then report
+// successful reclamation while storage kept growing. Reclaiming those
+// versions requires enumerating them (ListObjectVersions) and deleting
+// each VersionId, which this store deliberately does not do — whether
+// to enumerate versions, refuse versioned buckets outright, or require
+// a noncurrent-version lifecycle policy is a deployment decision. Until
+// that is settled, a versioned backup bucket MUST carry a
+// noncurrent-version expiration lifecycle rule.
 func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
 	if s == nil || s.client == nil {
 		return errors.Wrap(ErrInvalidOptions, "object store is required")

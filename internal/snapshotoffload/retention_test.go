@@ -3,11 +3,13 @@ package snapshotoffload
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -898,4 +900,159 @@ func TestGCDoesNotDeleteManifestRewrittenByAConcurrentPublish(t *testing.T) {
 		"a manifest rewritten by a concurrent publish must survive GC")
 	require.NotContains(t, result.ManifestsDeleted, stale.ManifestKey)
 	require.Equal(t, 1, result.ManifestsClaimedConcurrently)
+}
+
+// countingListStore counts ListObjects calls so a test can assert the
+// revalidation pass is per-phase, not per-payload.
+type countingListStore struct {
+	RetentionStore
+	mu    sync.Mutex
+	lists int
+}
+
+func (s *countingListStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	s.mu.Lock()
+	s.lists++
+	s.mu.Unlock()
+	return s.RetentionStore.ListObjects(ctx, prefix)
+}
+
+// TestGCRevalidatesReferencesOncePerPassNotPerPayload pins the cost
+// shape. Revalidating inside the per-payload loop turns a stale-payload
+// backlog into N listings and O(N×M) object reads, so the first cleanup
+// of a realistically accumulated backlog never finishes.
+func TestGCRevalidatesReferencesOncePerPassNotPerPayload(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 100, []byte("current"), year)
+	// Eight orphaned payloads, all eligible for reclamation.
+	for i := range uint64(8) {
+		f.publishManifest(t, 1, 10+i, []byte(fmt.Sprintf("orphan-%d", i)), year)
+	}
+
+	counting := &countingListStore{RetentionStore: f.store}
+	gc, err := NewGC(GCOptions{
+		Store:  counting,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.NotEmpty(t, result.PayloadsDeleted, "the fixture must actually reclaim something")
+
+	counting.mu.Lock()
+	defer counting.mu.Unlock()
+	// One manifest listing (phase 1) + one payload listing + one
+	// revalidation listing. The bound is what matters: it must not
+	// grow with the number of reclaimable payloads.
+	require.LessOrEqual(t, counting.lists, 4,
+		"listings must be bounded per pass, not proportional to the payload backlog")
+}
+
+// TestGCRejectsAManifestStoredOffItsCanonicalPath closes a retention
+// hijack: retention groups and orders by the manifest BODY, so a
+// high-index body claiming group 2 parked under a group-1 path would
+// consume group 2's retained-generation slots and get group 2's real
+// newest manifests deleted.
+func TestGCRejectsAManifestStoredOffItsCanonicalPath(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	ctx := context.Background()
+	year := 365 * 24 * time.Hour
+	victim := f.publishManifest(t, 2, 5, []byte("group-2-only-restore-point"), year)
+
+	// A manifest whose body claims group 2 at a very high index, but
+	// which is stored under group 1's path. Its self-hash is valid and
+	// its ManifestKey matches where it lives.
+	hijackKey, err := manifestKey(retentionPrefix, 1, 9000, 2)
+	require.NoError(t, err)
+	payloadSHA := hexSHA256Bytes([]byte("hijack"))
+	pKey, err := payloadKey(retentionPrefix, payloadSHA)
+	require.NoError(t, err)
+	hijack := Manifest{
+		SchemaVersion: ManifestSchemaVersion,
+		CreatedAt:     f.now,
+		SourceCluster: retentionPrefix,
+		GroupID:       2, // body claims group 2 ...
+		SnapshotIndex: 9000,
+		SnapshotTerm:  2,
+		ConfState:     ManifestConfState{Voters: []uint64{1}},
+		Payload:       PayloadDescriptor{Key: pKey, Bytes: 6, SHA256: payloadSHA},
+		ManifestKey:   hijackKey, // ... but lives under group 1's path
+	}
+	encoded, _, err := hijack.MarshalCanonical()
+	require.NoError(t, err)
+	_, err = f.store.PutObject(ctx, hijackKey, bytes.NewReader(encoded), PutOptions{
+		Size:   int64(len(encoded)),
+		SHA256: hexSHA256Bytes(encoded),
+	})
+	require.NoError(t, err)
+
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+
+	require.Contains(t, result.MalformedManifests, hijackKey,
+		"a manifest off its canonical path must be classified malformed")
+	require.True(t, f.exists(t, victim.ManifestKey),
+		"group 2's real manifest must not be displaced by the hijack")
+	require.True(t, result.PayloadPhaseSkipped,
+		"a malformed manifest blocks reclamation")
+}
+
+// duplicateListingStore returns one manifest key twice, modelling an
+// S3-compatible endpoint producing overlapping pages while objects
+// change underneath the scan.
+type duplicateListingStore struct {
+	RetentionStore
+	target string
+}
+
+func (s *duplicateListingStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	refs, err := s.RetentionStore.ListObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	for _, ref := range refs {
+		if ref.Key == s.target {
+			refs = append(refs, ref)
+			break
+		}
+	}
+	return refs, nil
+}
+
+// TestGCDeduplicatesListedManifestKeys is the duplicate-page guard.
+// Two copies of the same key would be counted as two generations: with
+// MinGenerations 1 one lands in survivors and the other in expired, so
+// phase 1 would delete the exact key chosen as the group's newest
+// restore point.
+func TestGCDeduplicatesListedManifestKeys(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	only := f.publishManifest(t, 1, 10, []byte("sole-restore-point"), 365*24*time.Hour)
+
+	dup := &duplicateListingStore{RetentionStore: f.store, target: only.ManifestKey}
+	gc, err := NewGC(GCOptions{
+		Store:  dup,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+
+	require.Empty(t, result.ManifestsDeleted)
+	require.True(t, f.exists(t, only.ManifestKey),
+		"a duplicated listing entry must not make a group's newest manifest deletable")
+	require.Equal(t, 1, result.ManifestsScanned, "duplicates must be collapsed")
 }

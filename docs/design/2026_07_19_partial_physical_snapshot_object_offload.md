@@ -152,6 +152,16 @@ credentials provider, schedule, retention count/window, upload concurrency,
 and server-side encryption mode. Static secrets must use file or environment
 providers and must not appear in process arguments or manifests.
 
+**Versioned buckets.** Retention deletes by key, not by version. On a
+bucket with S3 versioning enabled a keyed delete only writes a delete
+marker, so the bytes persist as a noncurrent version that later
+listings cannot see: GC reports successful reclamation while storage
+grows without bound. A versioned backup bucket therefore requires a
+noncurrent-version expiration lifecycle rule. Whether to instead
+enumerate and delete versions directly, or to refuse versioned buckets
+at startup, is an open operational decision tracked with the remaining
+M3 work.
+
 Storage-envelope encryption protects values but not all physical keys and
 metadata. The external bucket therefore requires private ACLs, TLS, and
 server-side encryption (SSE-S3 or SSE-KMS). Anonymous reads and writes are a
@@ -165,7 +175,7 @@ permissions below the configured prefix.
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Pending |
-| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: the §5 two-phase retention/GC (`retention.go`) with `RetentionStore` list/delete on both the local and S3 stores. Restore drills, corruption tests, multi-node acceptance, and operational documentation remain pending. |
+| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: the §5 two-phase retention/GC (`retention.go`) with `RetentionStore` list/delete on both the local and S3 stores. Restore drills, corruption tests, multi-node acceptance, operational documentation, and the §7 versioned-bucket decision remain pending. |
 
 The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to
