@@ -477,6 +477,11 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// §9.2 elastickv_encryption_kek_unwrap_seconds. Decorating here —
+	// the single place the KEK source is loaded — means every unwrap
+	// path (startup hydration, bootstrap apply, rotation apply) is
+	// timed without each one needing its own instrumentation.
+	kekUnwrapper := monitoring.NewTimedKEKUnwrapper(kekWrapper, metricsRegistry.KEKUnwrapObserver())
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
 	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(*backupMaxActivePins))
@@ -503,7 +508,7 @@ func run() error {
 			return metricsRegistry.RaftProposalObserver(groupID)
 		},
 		clock,
-		kekWrapper,
+		kekUnwrapper,
 		keystore,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
@@ -804,7 +809,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	if err != nil {
 		return distributionStartup{}, err
 	}
-	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock)
+	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock, in.encWiring.cache)
 	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
 	return distributionStartup{
 		defaultRuntime:   defaultRuntime,
@@ -3304,7 +3309,13 @@ func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context
 // on top of the running raft runtimes. Kept separate from run() so
 // the latter stays under the cyclop complexity budget and so new
 // collectors can be added without widening run() further.
-func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime, clock *kv.HLC) {
+func startMonitoringCollectors(
+	ctx context.Context,
+	reg *monitoring.Registry,
+	runtimes []*raftGroupRuntime,
+	clock *kv.HLC,
+	encryptionState monitoring.EncryptionStateSource,
+) {
 	reg.RaftObserver().Start(ctx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
 	if collector := reg.DispatchCollector(); collector != nil {
 		collector.Start(ctx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
@@ -3317,6 +3328,9 @@ func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, ru
 	}
 	if obs := reg.HLCObserver(); obs != nil && clock != nil {
 		obs.Start(ctx, clock, raftMetricsObserveInterval)
+	}
+	if obs := reg.EncryptionStateObserver(); obs != nil {
+		obs.Start(ctx, encryptionState, raftMetricsObserveInterval)
 	}
 }
 

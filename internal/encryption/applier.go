@@ -228,6 +228,15 @@ type StateCache struct {
 	// activeStorageDEKID and re-registers, which Registered()'s
 	// equality check handles without a reset.
 	registeredStorageDEKID atomic.Uint32
+	// activeRaftDEKID mirrors sidecar.Active.Raft, and
+	// sidecarRaftAppliedIndex mirrors sidecar.RaftAppliedIndex.
+	// Neither participates in a decision: they exist so the §9.2
+	// observability collector can read current sidecar state without
+	// doing file I/O on a metrics tick. They are refreshed by the
+	// same RefreshFromSidecar call that maintains the decision
+	// mirrors above, so they cannot drift from them.
+	activeRaftDEKID         atomic.Uint32
+	sidecarRaftAppliedIndex atomic.Uint64
 }
 
 // NewStateCache returns a zero-initialised StateCache. The
@@ -250,6 +259,31 @@ func (c *StateCache) RefreshFromSidecar(sc *Sidecar) {
 	}
 	c.activeStorageDEKID.Store(sc.Active.Storage)
 	c.storageEnvelopeActive.Store(sc.StorageEnvelopeActive)
+	c.activeRaftDEKID.Store(sc.Active.Raft)
+	c.sidecarRaftAppliedIndex.Store(sc.RaftAppliedIndex)
+}
+
+// ActiveRaftKeyID returns the current sidecar.Active.Raft DEK id.
+// Observability only — the raft envelope path resolves its own key id
+// through the raft envelope runtime, not through this mirror.
+func (c *StateCache) ActiveRaftKeyID() (uint32, bool) {
+	if c == nil {
+		return 0, false
+	}
+	id := c.activeRaftDEKID.Load()
+	return id, id != 0
+}
+
+// SidecarRaftAppliedIndex returns the sidecar's last persisted
+// raft_applied_index. §5.5 uses a persistent gap between this and the
+// FSM applied index as the sidecar-divergence signal, and §9.2
+// exposes it as elastickv_encryption_sidecar_raft_index so an
+// operator can alert on that gap.
+func (c *StateCache) SidecarRaftAppliedIndex() uint64 {
+	if c == nil {
+		return 0
+	}
+	return c.sidecarRaftAppliedIndex.Load()
 }
 
 // ActiveStorageKeyID returns the current sidecar.Active.Storage DEK

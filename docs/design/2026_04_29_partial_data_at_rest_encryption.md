@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8, 9A–9B, and 9C-1 shipped (5E deferred); remaining Stage 9 work open
+Status: Partial — Stages 0–8, 9A–9B, 9C-1, and 9C-2 shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -35,7 +35,8 @@ Date: 2026-04-29
 | 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, the remaining §9.2 metrics (`active_dek_id`, `last_proposed_index_per_raft_dek`, `kek_unwrap_seconds`, `sidecar_raft_index`), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
+| 9C-2 | Sidecar/KEK observability: `active_dek_id{purpose}`, `sidecar_raft_index`, `kek_unwrap_seconds` (§9.2) | shipped | — |
+| 9C+ | Rotation budget/rewrap/retire/rewrite, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
@@ -2527,10 +2528,12 @@ relevant flag and runbook section.
 
 New metrics (Stage 9C-1 shipped the three emitted by the storage
 envelope path — `decrypt_failures_total`, `writes_per_dek`, and
-`value_overhead_bytes`. The remaining four are owned by the rotation /
-sidecar / KEK subsystems and land with their milestones; they are
-deliberately NOT registered yet, so an operator cannot mistake an
-always-zero series for a healthy signal):
+`value_overhead_bytes`. Stage 9C-2 shipped the three with live
+sidecar/KEK sources — `active_dek_id`, `sidecar_raft_index`, and
+`kek_unwrap_seconds`. Only `last_proposed_index_per_raft_dek` remains:
+it needs the §5.4 raft-DEK Wrap path, so it is deliberately NOT
+registered yet — an always-zero series is worse than an absent one,
+because an operator could mistake it for a healthy signal):
 
 - `elastickv_encryption_active_dek_id{purpose}` — gauge, label is
   storage/raft.
