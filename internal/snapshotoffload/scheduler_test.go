@@ -2,6 +2,7 @@ package snapshotoffload
 
 import (
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"sync"
@@ -408,4 +409,122 @@ func TestPublishReusesACommittedManifestAcrossABinaryUpgrade(t *testing.T) {
 	require.Equal(t, first.SnapshotIndex, second.SnapshotIndex)
 	require.Equal(t, "v1.0.0", second.BinaryVersion,
 		"the committed manifest keeps the publishing binary's version as the audit record")
+}
+
+// TestSchedulerRejectsInvalidGroupAndClusterConfiguration keeps static
+// misconfiguration a startup error instead of a recurring per-interval
+// failure metric.
+func TestSchedulerRejectsInvalidGroupAndClusterConfiguration(t *testing.T) {
+	t.Parallel()
+
+	store := newTestLocalStore(t, t.TempDir())
+	valid := OffloadGroup{
+		GroupID:      7,
+		DataDir:      t.TempDir(),
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}
+
+	noDataDir := valid
+	noDataDir.DataDir = "   "
+	_, err := NewScheduler(store, []OffloadGroup{noDataDir}, "p", "cluster-a", "v")
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.ErrorContains(t, err, "data dir")
+
+	// A whitespace-only cluster name passes a bare != "" test but
+	// buildManifest trims it away, so artifacts would be published
+	// without the source-cluster identity the scheduler requires.
+	_, err = NewScheduler(store, []OffloadGroup{valid}, "p", "   ", "v")
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.ErrorContains(t, err, "source cluster")
+}
+
+// TestSchedulerReportsRemoteObjectLossAsAFailure separates the two
+// not-found cases. A group with no local snapshot is a skip; an object
+// disappearing from the store mid-publish is a real failure, and
+// collapsing them would silence the second.
+func TestSchedulerReportsRemoteObjectLossAsAFailure(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dataDir := seedSchedulerGroup(t, root, "remoteloss")
+	obs := &recordingObserver{}
+	store := &objectLosingStore{ObjectStore: newTestLocalStore(t, filepath.Join(root, "objects"))}
+
+	s := newTestScheduler(t, store, []OffloadGroup{{
+		GroupID:      7,
+		DataDir:      dataDir,
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}, WithSchedulerObserver(obs))
+	s.SyncOnce(context.Background())
+
+	published, skipped, failed := obs.snapshot()
+	require.Empty(t, published)
+	require.NotEmpty(t, failed, "a vanished remote object is an outage, not a quiet skip")
+	require.NotContains(t, skipped, "no_persisted_snapshot")
+}
+
+// objectLosingStore makes every object read report not-found, standing
+// in for an object deleted between the head and the get.
+type objectLosingStore struct {
+	ObjectStore
+}
+
+func (s *objectLosingStore) PutObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s vanished", key)
+}
+
+// TestSchedulerSingleFlightsAGroupAcrossOverlappingScans pins that the
+// aggregate upload limiter is not enough: with concurrency above one,
+// two overlapping scans could each take a slot for the SAME group,
+// read the same high-water mark, and both spool and upload the same
+// snapshot.
+func TestSchedulerSingleFlightsAGroupAcrossOverlappingScans(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dataDir := seedSchedulerGroup(t, root, "singleflight")
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	obs := &recordingObserver{}
+
+	var concurrentEntries, peak atomic.Int64
+	groups := []OffloadGroup{{
+		GroupID: 7,
+		DataDir: dataDir,
+		IsLeader: func() bool {
+			cur := concurrentEntries.Add(1)
+			for {
+				old := peak.Load()
+				if cur <= old || peak.CompareAndSwap(old, cur) {
+					break
+				}
+			}
+			time.Sleep(5 * time.Millisecond)
+			concurrentEntries.Add(-1)
+			return true
+		},
+		VerifyLeader: func(context.Context) error { return nil },
+	}}
+
+	s := newTestScheduler(t, store, groups,
+		WithSchedulerObserver(obs), WithSchedulerConcurrency(4))
+
+	var wg sync.WaitGroup
+	for range 4 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.SyncOnce(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(1), peak.Load(),
+		"one group must never be published by two scans at once")
+	published, _, failed := obs.snapshot()
+	require.Empty(t, failed)
+	require.Len(t, published, 1, "the same snapshot must be uploaded once, not once per scan")
 }

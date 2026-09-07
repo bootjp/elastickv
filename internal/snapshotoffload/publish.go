@@ -115,7 +115,7 @@ func openPublishExport(dataDir string) (*etcdraftengine.PersistedSnapshotExport,
 		return nil, errors.Wrap(err, "open persisted snapshot export")
 	}
 	if !ok {
-		return nil, errors.Wrap(ErrObjectNotFound, "no persisted snapshot available")
+		return nil, errors.WithStack(ErrNoPersistedSnapshot)
 	}
 	return export, nil
 }

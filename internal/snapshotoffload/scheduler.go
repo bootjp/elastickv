@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
+	"strings"
 	"sync"
 	"time"
 
@@ -41,6 +42,14 @@ type Scheduler struct {
 	// the Run loop's pass. Allocating it per scan would give each its
 	// own full allowance.
 	uploads chan struct{}
+	// inFlight holds the groups currently being published. The
+	// semaphore bounds AGGREGATE work, not work per group: with
+	// concurrency above one, two overlapping scans can each take a
+	// slot for the SAME group, read the same high-water mark before
+	// either records a publish, and both spool and upload the same
+	// multi-gigabyte snapshot. Single-flighting per group is what
+	// makes a group's publish idempotent under overlap.
+	inFlight map[uint64]struct{}
 }
 
 // OffloadGroup is one local Raft group the scheduler may publish for.
@@ -150,6 +159,7 @@ func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluste
 		logger:      slog.Default().With(slog.String("component", "snapshot-offload")),
 		now:         time.Now,
 		published:   make(map[uint64]uint64),
+		inFlight:    make(map[uint64]struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -167,6 +177,11 @@ func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluste
 }
 
 func (s *Scheduler) validate() error {
+	// Trim before checking: a whitespace-only name passes a bare !=
+	// "" test but buildManifest trims it to empty, so the scheduler
+	// would publish artifacts without the source-cluster identity it
+	// requires.
+	s.sourceName = strings.TrimSpace(s.sourceName)
 	switch {
 	case s.store == nil:
 		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires an object store")
@@ -180,6 +195,12 @@ func (s *Scheduler) validate() error {
 	// instead, where the operator sees it.
 	for _, group := range s.groups {
 		switch {
+		case strings.TrimSpace(group.DataDir) == "":
+			// Otherwise every publish fails validatePublishOptions at
+			// runtime, turning a static misconfiguration into a
+			// recurring failure metric instead of a startup error.
+			return errors.Wrapf(ErrInvalidOptions,
+				"snapshot offload group %d requires a data dir", group.GroupID)
 		case group.IsLeader == nil:
 			return errors.Wrapf(ErrInvalidOptions,
 				"snapshot offload group %d requires an IsLeader callback", group.GroupID)
@@ -260,6 +281,11 @@ func (s *Scheduler) scan(ctx context.Context, stagger bool) {
 				return
 			}
 			defer func() { <-s.uploads }()
+			if !s.beginGroup(g.GroupID) {
+				s.observer.ObserveSnapshotOffloadSkipped(g.GroupID, "already_in_flight")
+				return
+			}
+			defer s.endGroup(g.GroupID)
 			s.publishGroup(ctx, g)
 		}(group)
 	}
@@ -320,12 +346,16 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "already_published")
 			return
 		}
-		if errors.Is(err, ErrObjectNotFound) {
+		if errors.Is(err, ErrNoPersistedSnapshot) {
 			// A young or lightly-used group has not persisted its
 			// first snapshot yet. That is a normal scan outcome, not
 			// an outage: reporting it as a failure would emit a
 			// warning and a failure metric every interval until Raft
 			// eventually snapshots.
+			//
+			// Matched on its own sentinel, NOT on ErrObjectNotFound:
+			// an object disappearing from the store mid-publish is a
+			// genuine failure and must stay one.
 			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "no_persisted_snapshot")
 			return
 		}
@@ -337,6 +367,24 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 	s.markPublished(group.GroupID, manifest.SnapshotIndex)
 	s.observer.ObserveSnapshotOffloadPublished(
 		group.GroupID, manifest.SnapshotIndex, manifest.Payload.Bytes, s.now().Sub(started))
+}
+
+// beginGroup claims a group for publishing, reporting false when
+// another scan already holds it.
+func (s *Scheduler) beginGroup(groupID uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, busy := s.inFlight[groupID]; busy {
+		return false
+	}
+	s.inFlight[groupID] = struct{}{}
+	return true
+}
+
+func (s *Scheduler) endGroup(groupID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inFlight, groupID)
 }
 
 // publishedIndex returns this process's high-water mark for a group.
