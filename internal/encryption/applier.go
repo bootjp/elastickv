@@ -896,8 +896,26 @@ func (a *Applier) writeBootstrapSidecar(raftIdx uint64, p fsmwire.BootstrapPaylo
 		Created:    createdAt,
 		LocalEpoch: 0,
 	}
+	if err := a.persistSidecar(sc, "bootstrap"); err != nil {
+		return err
+	}
+	return nil
+}
+
+// persistSidecar writes the sidecar and, on success, refreshes the
+// StateCache mirrors from the same value.
+//
+// Every apply path that persists the sidecar must go through this.
+// Pairing the two here rather than at each call site is deliberate:
+// the no-op branches (stale DEKID, already-active cutover) advance and
+// persist RaftAppliedIndex but have no other work to do, and each one
+// that forgot to refresh left the cache — and therefore the §9.2
+// elastickv_encryption_sidecar_raft_index gauge — behind the durable
+// sidecar until the next fresh mutation or restart, which reads as a
+// false sidecar-divergence signal.
+func (a *Applier) persistSidecar(sc *Sidecar, context string) error {
 	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-		return errors.Wrap(err, "applier: write sidecar for bootstrap")
+		return errors.Wrapf(err, "applier: write sidecar for %s", context)
 	}
 	a.stateCache.RefreshFromSidecar(sc)
 	return nil
@@ -1123,10 +1141,7 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	// flipping the cutover fields.
 	if p.DEKID != sc.Active.Storage {
 		advanceRaftAppliedIndex(sc, raftIdx)
-		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-			return errors.Wrap(err, "applier: write sidecar for stale-dekid cutover no-op")
-		}
-		return nil
+		return a.persistSidecar(sc, "stale-dekid cutover no-op")
 	}
 	// §2.1 constraint #4 — idempotency. Preserve the original
 	// StorageEnvelopeCutoverIndex; only advance the generic
@@ -1143,10 +1158,7 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	// registration-before-sidecar reordering landed in 74a504c8.
 	if sc.StorageEnvelopeActive {
 		advanceRaftAppliedIndex(sc, raftIdx)
-		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-			return errors.Wrap(err, "applier: write sidecar for already-active cutover no-op")
-		}
-		return nil
+		return a.persistSidecar(sc, "already-active cutover no-op")
 	}
 	// Fresh successful apply.
 	//
@@ -1182,10 +1194,9 @@ func (a *Applier) applyEnableStorageEnvelope(raftIdx uint64, p fsmwire.RotationP
 	sc.StorageEnvelopeActive = true
 	sc.StorageEnvelopeCutoverIndex = raftIdx
 	advanceRaftAppliedIndex(sc, raftIdx)
-	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-		return errors.Wrap(err, "applier: write sidecar for cutover")
+	if err := a.persistSidecar(sc, "cutover"); err != nil {
+		return err
 	}
-	a.stateCache.RefreshFromSidecar(sc)
 	return nil
 }
 
@@ -1311,8 +1322,8 @@ func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayl
 	// separate bool flag).
 	if sc.RaftEnvelopeCutoverIndex != 0 {
 		advanceRaftAppliedIndex(sc, raftIdx)
-		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-			return errors.Wrap(err, "applier: write sidecar for already-active raft-cutover no-op")
+		if err := a.persistSidecar(sc, "already-active raft-cutover no-op"); err != nil {
+			return err
 		}
 		// Installer takes the CURRENT sc.Active.Raft, NOT the
 		// replayed p.DEKID — the wrap closure must key to the
@@ -1329,10 +1340,7 @@ func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayl
 	// flipping the cutover field.
 	if p.DEKID != sc.Active.Raft {
 		advanceRaftAppliedIndex(sc, raftIdx)
-		if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-			return errors.Wrap(err, "applier: write sidecar for stale-dekid raft-cutover no-op")
-		}
-		return nil
+		return a.persistSidecar(sc, "stale-dekid raft-cutover no-op")
 	}
 	// Fresh successful apply. Crash-recovery ordering follows
 	// the storage variant: ApplyRegistration runs BEFORE
@@ -1348,10 +1356,9 @@ func (a *Applier) applyEnableRaftEnvelope(raftIdx uint64, p fsmwire.RotationPayl
 	}
 	sc.RaftEnvelopeCutoverIndex = raftIdx
 	advanceRaftAppliedIndex(sc, raftIdx)
-	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-		return errors.Wrap(err, "applier: write sidecar for raft cutover")
+	if err := a.persistSidecar(sc, "raft cutover"); err != nil {
+		return err
 	}
-	a.stateCache.RefreshFromSidecar(sc)
 	// Stage 6E-2e-1 BLOCKER (b) — publish the wrap closure on every
 	// replica's local FSM apply so a follower that becomes leader
 	// post-cutover already has wrap active without needing the
@@ -1433,10 +1440,9 @@ func (a *Applier) writeRotationSidecar(raftIdx uint64, p fsmwire.RotationPayload
 		Created:    a.now().UTC().Format(time.RFC3339),
 		LocalEpoch: keyLocalEpoch,
 	}
-	if err := WriteSidecar(a.sidecarPath, sc); err != nil {
-		return nil, errors.Wrap(err, "applier: write sidecar for rotation")
+	if err := a.persistSidecar(sc, "rotation"); err != nil {
+		return nil, err
 	}
-	a.stateCache.RefreshFromSidecar(sc)
 	return sc, nil
 }
 

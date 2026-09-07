@@ -473,15 +473,13 @@ func run() error {
 	// are only attached to the applier when a KEK source is loaded
 	// (else the applier stays in the Stage 6A posture where
 	// ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured).
-	kekWrapper, err := loadKEKAfterPreNonceStartupGuards(cfg)
+	// The KEK source is decorated for §9.2
+	// elastickv_encryption_kek_unwrap_seconds inside this call, before
+	// the startup guards run their own unwraps.
+	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, metricsRegistry.KEKUnwrapObserver())
 	if err != nil {
 		return err
 	}
-	// §9.2 elastickv_encryption_kek_unwrap_seconds. Decorating here —
-	// the single place the KEK source is loaded — means every unwrap
-	// path (startup hydration, bootstrap apply, rotation apply) is
-	// timed without each one needing its own instrumentation.
-	kekUnwrapper := monitoring.NewTimedKEKUnwrapper(kekWrapper, metricsRegistry.KEKUnwrapObserver())
 	keystore := encryption.NewKeystore()
 	redisApplyObserver := adapter.NewRedisApplyObserver()
 	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(*backupMaxActivePins))
@@ -631,7 +629,7 @@ func run() error {
 		defaultRuntime,
 		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
 		*encryptionSidecarPath,
-		kekWrapper,
+		kekUnwrapper,
 		encWiring.raftEnvelope,
 		etcdraftengine.DeriveNodeID(*raftId),
 		encWiring.epoch,
@@ -649,7 +647,7 @@ func run() error {
 		cleanup:                         &cleanup,
 		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
-		kekConfigured:                   kekWrapper != nil,
+		kekConfigured:                   kekUnwrapper != nil,
 		keyvizSampler:                   sampler,
 		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
@@ -1806,7 +1804,9 @@ func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
 	return applied.AppliedIndex
 }
 
-func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
+func loadKEKAfterPreNonceStartupGuards(
+	cfg runtimeConfig, unwrapObserver monitoring.KEKUnwrapObserver,
+) (kek.Wrapper, error) {
 	if err := checkEnvelopeCutoverDivergenceBeforeNonceBump(
 		*raftId,
 		*raftDir,
@@ -1818,7 +1818,7 @@ func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
 	); err != nil {
 		return nil, err
 	}
-	return loadKEKAndRunStartupGuards()
+	return loadKEKAndRunStartupGuards(unwrapObserver)
 }
 
 // loadKEKAndRunStartupGuards loads the configured KEK wrapper and
@@ -1843,11 +1843,18 @@ func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
 // buildShardGroupsWithEncryptionWiring, still before Raft engine
 // startup; the sidecar-behind-raft-log gap guard remains later
 // because it needs an opened engine's applied index and scanner.
-func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
+func loadKEKAndRunStartupGuards(unwrapObserver monitoring.KEKUnwrapObserver) (kek.Wrapper, error) {
 	kekWrapper, err := loadKEKWrapperFromFlag()
 	if err != nil {
 		return nil, err
 	}
+	// Decorate BEFORE the guards run. CheckStartupGuards and
+	// kek.VerifyWrapper both perform real unwrap round trips — on a
+	// fresh node the preflight unwrap can be the only one that ever
+	// happens — so decorating after them would leave
+	// elastickv_encryption_kek_unwrap_seconds empty despite completed
+	// KMS calls.
+	kekWrapper = monitoring.NewTimedKEKUnwrapper(kekWrapper, unwrapObserver)
 	if err := encryption.CheckStartupGuards(encryption.StartupConfig{
 		EncryptionEnabled: *encryptionEnabled,
 		KEKConfigured:     kekWrapper != nil,
