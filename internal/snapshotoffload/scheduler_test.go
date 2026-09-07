@@ -291,3 +291,121 @@ func TestSchedulerSkipsRepublishingAnUnchangedSnapshot(t *testing.T) {
 	require.Len(t, published, 1, "an unchanged snapshot must be published exactly once")
 	require.Equal(t, []string{"already_published", "already_published"}, skipped)
 }
+
+// TestSchedulerSharesTheUploadLimitAcrossConcurrentScans pins that the
+// limiter belongs to the scheduler, not to one scan. An operator-forced
+// SyncOnce can overlap the Run loop's pass, and a per-scan semaphore
+// would hand each its own full allowance — two uploads under a
+// configured limit of one.
+func TestSchedulerSharesTheUploadLimitAcrossConcurrentScans(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	var inFlight, peak atomic.Int64
+
+	groups := make([]OffloadGroup, 0, 4)
+	for i := range 4 {
+		groupID := uint64(i) + 1 //nolint:gosec // loop index over a 4-element fixture.
+		dir := seedSchedulerGroup(t, root, "shared"+string(rune('a'+i)))
+		groups = append(groups, OffloadGroup{
+			GroupID: groupID,
+			DataDir: dir,
+			IsLeader: func() bool {
+				cur := inFlight.Add(1)
+				for {
+					old := peak.Load()
+					if cur <= old || peak.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+				time.Sleep(2 * time.Millisecond)
+				inFlight.Add(-1)
+				return true
+			},
+			VerifyLeader: func(context.Context) error { return nil },
+		})
+	}
+
+	s := newTestScheduler(t, store, groups)
+
+	// Two overlapping scans on the same scheduler.
+	var wg sync.WaitGroup
+	for range 2 {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			s.SyncOnce(context.Background())
+		}()
+	}
+	wg.Wait()
+
+	require.Equal(t, int64(1), peak.Load(),
+		"overlapping scans must share the configured upload limit")
+}
+
+// TestSchedulerTreatsAbsentPersistedSnapshotAsASkip covers a young or
+// lightly-used group: Raft has not produced a snapshot yet, which is a
+// normal scan outcome. Reporting it as a failure would emit a warning
+// and a failure metric every interval until Raft eventually snapshots.
+func TestSchedulerTreatsAbsentPersistedSnapshotAsASkip(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	obs := &recordingObserver{}
+
+	// A data dir with no persisted snapshot at all.
+	empty := filepath.Join(root, "empty-group")
+	require.NoError(t, os.MkdirAll(empty, 0o755))
+
+	s := newTestScheduler(t, store, []OffloadGroup{{
+		GroupID:      7,
+		DataDir:      empty,
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}, WithSchedulerObserver(obs))
+	s.SyncOnce(context.Background())
+
+	published, skipped, failed := obs.snapshot()
+	require.Empty(t, published)
+	require.Empty(t, failed, "a group with no snapshot yet is not an outage")
+	require.Equal(t, []string{"no_persisted_snapshot"}, skipped)
+}
+
+// TestPublishReusesACommittedManifestAcrossABinaryUpgrade pins the
+// upgrade retry path: a process that restarts on a new binary and
+// republishes an index it has not published locally must reuse the
+// committed manifest instead of conflicting with it. Otherwise every
+// scan fails until Raft happens to produce a new snapshot.
+func TestPublishReusesACommittedManifestAcrossABinaryUpgrade(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dataDir := seedSchedulerGroup(t, root, "upgrade")
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	first, err := PublishPersistedSnapshot(context.Background(), PublishOptions{
+		Store:         store,
+		DataDir:       dataDir,
+		Prefix:        "cluster-a",
+		GroupID:       7,
+		SourceCluster: "cluster-a",
+		BinaryVersion: "v1.0.0",
+	})
+	require.NoError(t, err)
+
+	// Same snapshot, newer binary.
+	second, err := PublishPersistedSnapshot(context.Background(), PublishOptions{
+		Store:         store,
+		DataDir:       dataDir,
+		Prefix:        "cluster-a",
+		GroupID:       7,
+		SourceCluster: "cluster-a",
+		BinaryVersion: "v2.0.0",
+	})
+	require.NoError(t, err, "an upgraded binary must reuse the committed manifest")
+	require.Equal(t, first.SnapshotIndex, second.SnapshotIndex)
+	require.Equal(t, "v1.0.0", second.BinaryVersion,
+		"the committed manifest keeps the publishing binary's version as the audit record")
+}

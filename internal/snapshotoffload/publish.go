@@ -271,9 +271,22 @@ func manifestMatchesCandidate(existing Manifest, candidate Manifest, reuseExisti
 	return reflect.DeepEqual(existing, candidate)
 }
 
+// sameManifestExceptCreation compares a retry's candidate against the
+// committed manifest, ignoring the fields that legitimately differ
+// between two publishes of the SAME snapshot.
+//
+// BinaryVersion is one of them. It records which binary published the
+// artifact, not anything about the snapshot itself, so after an
+// upgrade a process that republishes an index it has not yet published
+// locally would otherwise conflict with the manifest the previous
+// binary committed — and keep failing every scan until Raft happens to
+// produce a new snapshot. The committed manifest keeps the original
+// publisher's version, which is the correct audit record for the
+// bytes that actually exist.
 func sameManifestExceptCreation(existing Manifest, candidate Manifest) bool {
 	candidate.CreatedAt = existing.CreatedAt
 	candidate.ManifestSHA256 = existing.ManifestSHA256
+	candidate.BinaryVersion = existing.BinaryVersion
 	return reflect.DeepEqual(existing, candidate)
 }
 

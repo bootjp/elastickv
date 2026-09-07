@@ -36,6 +36,11 @@ type Scheduler struct {
 	// store, not from this map.
 	mu        sync.Mutex
 	published map[uint64]uint64
+	// uploads bounds concurrent uploads across every scan on this
+	// scheduler, including an operator-forced SyncOnce that overlaps
+	// the Run loop's pass. Allocating it per scan would give each its
+	// own full allowance.
+	uploads chan struct{}
 }
 
 // OffloadGroup is one local Raft group the scheduler may publish for.
@@ -152,6 +157,12 @@ func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluste
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
+	// One limiter for the scheduler, not one per scan: an
+	// operator-forced SyncOnce can overlap the pass running from Run,
+	// and a per-scan semaphore would grant each its own full
+	// allowance — two concurrent uploads under a configured limit of
+	// one.
+	s.uploads = make(chan struct{}, s.concurrency)
 	return s, nil
 }
 
@@ -198,23 +209,40 @@ func (s *Scheduler) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-timer.C:
-			s.SyncOnce(ctx)
+			s.scan(ctx, true)
 			timer.Reset(s.nextDelay())
 		}
 	}
 }
 
 func (s *Scheduler) nextDelay() time.Duration {
+	return s.interval + s.jitterSlice()
+}
+
+// jitterSlice returns a uniform duration in [0, jitter), or zero when
+// jitter is disabled. Both the inter-scan delay and the per-group
+// stagger draw from it, so the weak-RNG exemption is stated once:
+// this is load spreading, never a security decision.
+func (s *Scheduler) jitterSlice() time.Duration {
 	if s.jitter <= 0 {
-		return s.interval
+		return 0
 	}
-	return s.interval + time.Duration(rand.Int64N(int64(s.jitter))) //nolint:gosec // scheduling jitter, not a security decision.
+	return time.Duration(rand.Int64N(int64(s.jitter))) //nolint:gosec // scheduling jitter, not a security decision.
 }
 
 // SyncOnce runs one scan across every local group, bounded by the upload
 // concurrency limit. Exported so tests and operators can force a pass.
 func (s *Scheduler) SyncOnce(ctx context.Context) {
-	sem := make(chan struct{}, s.concurrency)
+	// No stagger: SyncOnce is the "scan now" entry point (operator
+	// action, tests), and delaying it by up to a jitter window would
+	// make an explicit request take minutes to start.
+	s.scan(ctx, false)
+}
+
+// scan runs one pass. stagger spreads group starts across the jitter
+// window so a multi-group process does not begin every upload on the
+// same tick; it is used only by the Run loop.
+func (s *Scheduler) scan(ctx context.Context, stagger bool) {
 	var wg sync.WaitGroup
 	for _, group := range s.groups {
 		if ctx.Err() != nil {
@@ -223,16 +251,36 @@ func (s *Scheduler) SyncOnce(ctx context.Context) {
 		wg.Add(1)
 		go func(g OffloadGroup) {
 			defer wg.Done()
+			if stagger && !s.sleepStagger(ctx) {
+				return
+			}
 			select {
-			case sem <- struct{}{}:
+			case s.uploads <- struct{}{}:
 			case <-ctx.Done():
 				return
 			}
-			defer func() { <-sem }()
+			defer func() { <-s.uploads }()
 			s.publishGroup(ctx, g)
 		}(group)
 	}
 	wg.Wait()
+}
+
+// sleepStagger waits a random slice of the jitter window. It reports
+// false when ctx ended first, so the caller abandons the group.
+func (s *Scheduler) sleepStagger(ctx context.Context) bool {
+	slice := s.jitterSlice()
+	if slice <= 0 {
+		return true
+	}
+	timer := time.NewTimer(slice)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
@@ -270,6 +318,15 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 		}
 		if errors.Is(err, ErrSnapshotNotNewer) {
 			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "already_published")
+			return
+		}
+		if errors.Is(err, ErrObjectNotFound) {
+			// A young or lightly-used group has not persisted its
+			// first snapshot yet. That is a normal scan outcome, not
+			// an outage: reporting it as a failure would emit a
+			// warning and a failure metric every interval until Raft
+			// eventually snapshots.
+			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "no_persisted_snapshot")
 			return
 		}
 		s.observer.ObserveSnapshotOffloadFailed(group.GroupID, err)
