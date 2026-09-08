@@ -51,8 +51,9 @@ The M1 object-store-neutral substrate now adds:
 The runtime scheduler is implemented and wired into main.go, opt-in via
 `--snapshotOffloadBucket` (or `--snapshotOffloadLocalDir`). Retention/GC
 is implemented per §5. Restore drills and corruption tests are in place;
-multi-node acceptance, operator documentation, and the §7
-versioned-bucket decision remain pending.
+multi-node acceptance and the §7 versioned-bucket decision remain
+pending; the operator runbook is at
+[`../snapshot_offload_operations.md`](../snapshot_offload_operations.md).
 
 ## 2. Safety boundary
 
