@@ -244,7 +244,7 @@ func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
 	candidate := existing
 	candidate.CreatedAt = time.Unix(401, 0).UTC()
 	racingStore := &headMissOnceStore{ObjectStore: store, key: key}
-	require.NoError(t, putManifest(ctx, racingStore, &candidate, true))
+	require.NoError(t, putManifest(ctx, racingStore, &candidate, true, nil))
 	require.Equal(t, existing.CreatedAt, candidate.CreatedAt)
 	require.NotEmpty(t, candidate.ManifestSHA256)
 }
@@ -661,4 +661,66 @@ func (s *headMissOnceStore) HeadObject(ctx context.Context, key string) (ObjectI
 
 func singlePeer() []etcdraftengine.Peer {
 	return []etcdraftengine.Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:12001"}}
+}
+
+// headOrderingStore records the order of remote calls so a test can
+// prove the leadership recheck happens after the manifest absence
+// probe rather than before it.
+type headOrderingStore struct {
+	ObjectStore
+	manifestKey string
+	calls       []string
+}
+
+func (s *headOrderingStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
+	if key == s.manifestKey {
+		s.calls = append(s.calls, "head-manifest")
+	}
+	return s.ObjectStore.HeadObject(ctx, key)
+}
+
+func (s *headOrderingStore) PutObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	if key == s.manifestKey {
+		s.calls = append(s.calls, "put-manifest")
+	}
+	return s.ObjectStore.PutObject(ctx, key, body, opts)
+}
+
+// TestPublishVerifiesLeadershipAfterTheManifestAbsenceProbe pins the §4
+// ordering. The absence probe is a remote read with latency nothing in
+// the caller controls; checking leadership before it leaves a window in
+// which a node demoted during that read still commits a manifest —
+// exactly the guarantee the scheduler exists to provide.
+func TestPublishVerifiesLeadershipAfterTheManifestAbsenceProbe(t *testing.T) {
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1ordering-payload")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 31, 6, singlePeer())
+	local := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	key, err := manifestKey("cluster-a", 1, 31, 6)
+	require.NoError(t, err)
+	ordering := &headOrderingStore{ObjectStore: local, manifestKey: key}
+
+	var verifiedAfter []string
+	_, err = PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         ordering,
+		DataDir:       sourceDataDir,
+		Prefix:        "cluster-a",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+		VerifyLeader: func(context.Context) error {
+			// Snapshot the calls seen so far at verification time.
+			verifiedAfter = append([]string(nil), ordering.calls...)
+			return nil
+		},
+	})
+	require.NoError(t, err)
+
+	require.Contains(t, verifiedAfter, "head-manifest",
+		"leadership must be re-verified AFTER the manifest absence probe")
+	require.NotContains(t, verifiedAfter, "put-manifest",
+		"and before the manifest object is created")
 }
