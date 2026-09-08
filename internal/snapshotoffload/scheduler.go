@@ -164,6 +164,11 @@ func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluste
 	for _, opt := range opts {
 		opt(s)
 	}
+	// Trim once here, before the scheduler escapes: a whitespace-only
+	// name passes a bare != "" test but buildManifest trims it to
+	// empty, so the scheduler would publish artifacts without the
+	// source-cluster identity it requires.
+	s.sourceName = strings.TrimSpace(s.sourceName)
 	if err := s.validate(); err != nil {
 		return nil, err
 	}
@@ -177,11 +182,10 @@ func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluste
 }
 
 func (s *Scheduler) validate() error {
-	// Trim before checking: a whitespace-only name passes a bare !=
-	// "" test but buildManifest trims it to empty, so the scheduler
-	// would publish artifacts without the source-cluster identity it
-	// requires.
-	s.sourceName = strings.TrimSpace(s.sourceName)
+	// validate is pure: Run calls it too, and mutating shared
+	// configuration there would race a concurrent operator SyncOnce
+	// reading sourceName to build PublishOptions. The trim happens
+	// once in NewScheduler, before the scheduler is published.
 	switch {
 	case s.store == nil:
 		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires an object store")
@@ -332,7 +336,7 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 		SourceCluster: s.sourceName,
 		BinaryVersion: s.binVersion,
 		SpoolDir:      s.spoolDir,
-		VerifyLeader:  group.VerifyLeader,
+		VerifyLeader:  s.boundedVerifyLeader(group.VerifyLeader),
 		// Suppress the whole spool when this node has already
 		// published this index. Without it an unchanged snapshot is
 		// fully re-read and re-hashed on every tick.
@@ -367,6 +371,28 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 	s.markPublished(group.GroupID, manifest.SnapshotIndex)
 	s.observer.ObserveSnapshotOffloadPublished(
 		group.GroupID, manifest.SnapshotIndex, manifest.Payload.Bytes, s.now().Sub(started))
+}
+
+// verifyLeaderTimeout bounds one pre-commit leadership recheck. It
+// matches the deadline the coordinator's own ReadIndex wrappers use.
+const verifyLeaderTimeout = 5 * time.Second
+
+// boundedVerifyLeader gives each leadership recheck its own deadline.
+//
+// The callback contract does not require callers to wrap their engine
+// method, and a raw etcd Engine.VerifyLeader issues a ReadIndex that,
+// during quorum loss, waits until its context expires. Handed the
+// long-lived Run context that expires only at shutdown, a scan would
+// block forever and no later snapshot would ever be scheduled.
+func (s *Scheduler) boundedVerifyLeader(verify func(context.Context) error) func(context.Context) error {
+	if verify == nil {
+		return nil
+	}
+	return func(ctx context.Context) error {
+		bounded, cancel := context.WithTimeout(ctx, verifyLeaderTimeout)
+		defer cancel()
+		return verify(bounded)
+	}
 }
 
 // beginGroup claims a group for publishing, reporting false when

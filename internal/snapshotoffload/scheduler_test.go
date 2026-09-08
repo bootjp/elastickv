@@ -528,3 +528,109 @@ func TestSchedulerSingleFlightsAGroupAcrossOverlappingScans(t *testing.T) {
 	require.Empty(t, failed)
 	require.Len(t, published, 1, "the same snapshot must be uploaded once, not once per scan")
 }
+
+// TestSchedulerBoundsTheLeadershipRecheck pins that the pre-commit
+// leadership recheck gets its own deadline.
+//
+// The callback contract does not require callers to wrap their engine
+// method, and a raw etcd Engine.VerifyLeader issues a ReadIndex that
+// waits out its context during quorum loss. Handed the long-lived Run
+// context — which expires only at shutdown — a scan would block
+// forever and no later snapshot would ever be scheduled.
+func TestSchedulerBoundsTheLeadershipRecheck(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dataDir := seedSchedulerGroup(t, root, "bounded")
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	obs := &recordingObserver{}
+
+	gotDeadline := make(chan bool, 1)
+	s := newTestScheduler(t, store, []OffloadGroup{{
+		GroupID:  7,
+		DataDir:  dataDir,
+		IsLeader: func() bool { return true },
+		VerifyLeader: func(ctx context.Context) error {
+			_, ok := ctx.Deadline()
+			select {
+			case gotDeadline <- ok:
+			default:
+			}
+			return nil
+		},
+	}}, WithSchedulerObserver(obs))
+
+	// A context with no deadline of its own, like the Run context.
+	s.SyncOnce(context.Background())
+
+	select {
+	case ok := <-gotDeadline:
+		require.True(t, ok,
+			"the leadership recheck must run under its own deadline, not the caller's open-ended context")
+	default:
+		t.Fatal("VerifyLeader was never invoked")
+	}
+}
+
+// TestSchedulerValidateDoesNotMutateSharedConfiguration guards the
+// data race: Run calls validate too, and an operator SyncOnce launched
+// right after Run reads sourceName to build PublishOptions.
+func TestSchedulerValidateDoesNotMutateSharedConfiguration(t *testing.T) {
+	t.Parallel()
+
+	store := newTestLocalStore(t, t.TempDir())
+	s, err := NewScheduler(store, nil, "p", "  cluster-a  ", "v")
+	require.NoError(t, err)
+	require.Equal(t, "cluster-a", s.sourceName, "the trim must happen once, at construction")
+
+	// Plant an untrimmed value and re-validate. Asserting that the
+	// post-construction value is already trimmed proves nothing —
+	// it is trimmed either way. What must hold is that validate,
+	// which Run also calls while a concurrent SyncOnce reads
+	// sourceName, performs no write at all.
+	s.sourceName = "  padded  "
+	require.NoError(t, s.validate())
+	require.Equal(t, "  padded  ", s.sourceName,
+		"validate must not write shared configuration; Run calls it while SyncOnce reads")
+}
+
+// TestSchedulerRunAndSyncOnceAreRaceFree is the guard for mutating
+// shared configuration during validation. Run calls validate too, and
+// launching SyncOnce right after Run — the natural way to avoid
+// waiting out the first interval — has publishGroup reading
+// sourceName while validate would be writing it.
+//
+// Run validates once at startup, so the overlap window is narrow and
+// this test is a smoke check rather than a deterministic reproduction;
+// TestSchedulerValidateDoesNotMutateSharedConfiguration pins the
+// property itself.
+func TestSchedulerRunAndSyncOnceAreRaceFree(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	dataDir := seedSchedulerGroup(t, root, "racefree")
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	s := newTestScheduler(t, store, []OffloadGroup{{
+		GroupID:      7,
+		DataDir:      dataDir,
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}, WithSchedulerInterval(time.Millisecond), WithSchedulerJitter(0))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_ = s.Run(ctx)
+	}()
+	// Overlap an operator-forced scan with the Run loop's validation.
+	for range 20 {
+		s.SyncOnce(ctx)
+	}
+	cancel()
+	wg.Wait()
+}
