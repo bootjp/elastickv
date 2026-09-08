@@ -180,7 +180,11 @@ func (s *LocalStore) listRootForPrefix(prefix string) (string, error) {
 	if cleaned == "." {
 		return s.root, nil
 	}
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+	// cleanObjectPrefix uses path (slash) semantics, but filepath.Join
+	// below interprets the platform separator — so on Windows a
+	// prefix like `..\sibling` would survive a slash-only check and
+	// then escape the root. Reject the native form too.
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.ContainsRune(cleaned, '\\') {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object prefix %q", prefix)
 	}
 	return filepath.Join(s.root, filepath.FromSlash(cleaned)), nil
@@ -215,7 +219,10 @@ func (s *LocalStore) DeleteObjectIfUnmodified(ctx context.Context, key string, c
 	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
 		return errors.Wrapf(err, "delete object %s", key)
 	}
-	return nil
+	// Persist the unlink before reporting success. Without the
+	// directory sync a crash can resurrect an object GC already
+	// counted as reclaimed.
+	return syncDir(filepath.Dir(objectPath))
 }
 
 // DeleteObject removes one object. A already-absent object is not an
@@ -232,7 +239,10 @@ func (s *LocalStore) DeleteObject(ctx context.Context, key string) error {
 	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
 		return errors.Wrapf(err, "delete object %s", key)
 	}
-	return nil
+	// Persist the unlink before reporting success. Without the
+	// directory sync a crash can resurrect an object GC already
+	// counted as reclaimed.
+	return syncDir(filepath.Dir(objectPath))
 }
 
 type PutOptions struct {

@@ -316,10 +316,20 @@ func putPayload(ctx context.Context, store ObjectStore, key string, file *os.Fil
 	return validatePayloadObjectInfo(key, info, opts)
 }
 
+// refreshExistingPayload restarts a reused payload's retention grace by
+// rewriting it.
+//
+// A store that cannot refresh is a hard error, not a silent skip. The
+// §5 two-pass sweep detects a reuse precisely BECAUSE the refresh moves
+// the object's mtime; if nothing moves, retention sees an untouched
+// object, sweeps it, and the publisher commits a manifest naming bytes
+// that no longer exist. Failing here costs one publish; skipping
+// quietly costs the backup.
 func refreshExistingPayload(ctx context.Context, store ObjectStore, key string, file *os.File, opts PutOptions) error {
 	refresher, ok := store.(ObjectRefresher)
 	if !ok {
-		return nil
+		return errors.Wrapf(ErrInvalidOptions,
+			"object store cannot refresh existing payload %s; reuse would leave it eligible for reclamation", key)
 	}
 	if err := seekPayloadFile(file); err != nil {
 		return err

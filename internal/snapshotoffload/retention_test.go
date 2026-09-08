@@ -1204,3 +1204,86 @@ func TestLocalStoreListObjectsRejectsTraversingPrefixes(t *testing.T) {
 		require.NotContains(t, ref.Key, "outside.txt")
 	}
 }
+
+// nonRefreshingStore exposes only ObjectStore, so a type assertion to
+// ObjectRefresher fails — the shape a decorator that forwards a narrow
+// interface produces.
+type nonRefreshingStore struct {
+	put  func(context.Context, string, io.Reader, PutOptions) (ObjectInfo, error)
+	get  func(context.Context, string) (io.ReadCloser, ObjectInfo, error)
+	head func(context.Context, string) (ObjectInfo, bool, error)
+}
+
+func (s nonRefreshingStore) PutObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return s.put(ctx, key, body, opts)
+}
+
+func (s nonRefreshingStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
+	return s.get(ctx, key)
+}
+
+func (s nonRefreshingStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
+	return s.head(ctx, key)
+}
+
+// TestRefreshExistingPayloadFailsWhenTheStoreCannotRefresh is the
+// regression for a silent no-op that would defeat the whole two-pass
+// sweep.
+//
+// The sweep detects a reuse precisely BECAUSE the refresh moves the
+// object's mtime. A store that cannot refresh left the object
+// untouched, so retention would see it as quiet, reclaim it, and the
+// publisher would commit a manifest naming bytes that no longer exist.
+func TestRefreshExistingPayloadFailsWhenTheStoreCannotRefresh(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	payload := []byte("payload-that-would-be-silently-unrefreshed")
+	sha := hexSHA256Bytes(payload)
+	key, err := payloadKey(retentionPrefix, sha)
+	require.NoError(t, err)
+
+	spool := filepath.Join(t.TempDir(), "payload.fsm")
+	require.NoError(t, os.WriteFile(spool, payload, 0o600))
+	file, err := os.Open(spool)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = file.Close() })
+
+	narrow := nonRefreshingStore{
+		put:  f.store.PutObject,
+		get:  f.store.GetObject,
+		head: f.store.HeadObject,
+	}
+	// The store really is not an ObjectRefresher.
+	_, refreshable := ObjectStore(narrow).(ObjectRefresher)
+	require.False(t, refreshable)
+
+	err = refreshExistingPayload(context.Background(), narrow, key, file, PutOptions{
+		Size:   int64(len(payload)),
+		SHA256: sha,
+	})
+	require.Error(t, err, "a store that cannot refresh must fail closed, not skip silently")
+	require.True(t, errors.Is(err, ErrInvalidOptions))
+
+	// The real local store refreshes, so publishing still works.
+	require.NoError(t, refreshExistingPayload(context.Background(), f.store, key, file, PutOptions{
+		Size:   int64(len(payload)),
+		SHA256: sha,
+	}))
+}
+
+// TestLocalStoreListObjectsRejectsNativeSeparatorTraversal covers the
+// Windows form: cleanObjectPrefix uses path (slash) semantics but
+// filepath.Join interprets the platform separator, so a backslash
+// prefix would survive a slash-only check and then escape the root.
+func TestLocalStoreListObjectsRejectsNativeSeparatorTraversal(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	for _, prefix := range []string{`..\sibling`, `a\..\..\b`, `\\..\\x`} {
+		_, err := f.store.ListObjects(context.Background(), prefix)
+		require.ErrorIs(t, err, ErrInvalidOptions, "prefix %q must be rejected", prefix)
+	}
+}
