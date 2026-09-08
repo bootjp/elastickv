@@ -121,6 +121,26 @@ window. GC runs in two phases:
 2. after a grace period, rebuild the live payload SHA set from all remaining
    manifests and delete only payload objects with no live reference.
 
+Payload reclamation is **two-pass mark-and-sweep**. A pass that finds a
+payload unreferenced and past its grace *marks* it; only a later pass
+that finds the same object unchanged, with the mark aged past
+`MinMarkAge`, deletes it.
+
+The second pass is required because a publisher reusing a
+content-addressed payload refreshes it by rewriting **identical
+bytes**, and no conditional-delete primitive on a general-purpose S3
+bucket detects that: `If-Match` compares a content-derived ETag, which
+identical bytes leave unchanged, and `IfMatchLastModifiedTime` /
+`IfMatchSize` are directory-buckets only. A single-pass GC could
+therefore delete a payload between the publisher refreshing it and its
+manifest committing. Spanning two passes means any publish shorter than
+the inter-pass interval is observed — through the refreshed mtime or
+the newly committed manifest — before the sweep. `MinMarkAge` must
+therefore exceed the longest plausible publish.
+
+The mark state is in-memory and per-process. Losing it on restart
+delays reclamation by one pass and never advances it.
+
 Malformed manifests fail closed: they are reported and excluded from both
 automatic manifest deletion and payload reclamation. Listing failure,
 pagination failure, or an incomplete group scan performs no deletes. This

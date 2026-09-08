@@ -6,6 +6,7 @@ import (
 	"path"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -36,6 +37,12 @@ const (
 	// even when that exceeds MinGenerations.
 	DefaultMaxAge = 14 * 24 * time.Hour
 
+	// DefaultMinMarkAge is the default two-pass sweep delay. It
+	// matches DefaultPayloadGrace because both bound the same thing:
+	// the longest plausible time between a publisher touching a
+	// payload and its manifest committing.
+	DefaultMinMarkAge = 24 * time.Hour
+
 	// DefaultPayloadGrace is the §5 phase-2 delay before an
 	// unreferenced payload may be reclaimed. It covers the window in
 	// which a payload has been uploaded (payload-first publish) but
@@ -58,6 +65,18 @@ type RetentionPolicy struct {
 	MinGenerations int
 	MaxAge         time.Duration
 	PayloadGrace   time.Duration
+	// MinMarkAge is the §5 two-pass sweep delay: a payload must have
+	// been marked for at least this long, and must not have changed
+	// since the mark, before it may be reclaimed.
+	//
+	// It exists because no conditional-delete primitive on a
+	// general-purpose S3 bucket can detect a content-preserving
+	// refresh: `If-Match` compares a content-derived ETag, which a
+	// republish of identical bytes leaves untouched, and
+	// `IfMatchLastModifiedTime` is directory-buckets only. Comparing
+	// the object's observed state ACROSS passes is what detects that
+	// refresh, so it must exceed the longest plausible publish.
+	MinMarkAge time.Duration
 }
 
 func (p RetentionPolicy) withDefaults() RetentionPolicy {
@@ -69,6 +88,9 @@ func (p RetentionPolicy) withDefaults() RetentionPolicy {
 	}
 	if p.PayloadGrace <= 0 {
 		p.PayloadGrace = DefaultPayloadGrace
+	}
+	if p.MinMarkAge <= 0 {
+		p.MinMarkAge = DefaultMinMarkAge
 	}
 	return p
 }
@@ -91,6 +113,10 @@ type GCResult struct {
 	// compare-and-delete lost to a concurrent publish rewriting the
 	// same key (an idempotent republish of the same index/term).
 	ManifestsClaimedConcurrently int
+	// PayloadsAwaitingSweep counts payloads that are eligible for
+	// reclamation but are still serving the §5 two-pass sweep delay.
+	// A steady non-zero value on a busy prefix is normal.
+	PayloadsAwaitingSweep int
 	// PayloadsClaimedConcurrently counts payloads that were eligible
 	// for reclamation but whose compare-and-delete lost to a
 	// concurrent publish reusing them. A steady non-zero value is
@@ -106,6 +132,35 @@ type GC struct {
 	policy RetentionPolicy
 	now    func() time.Time
 	log    *slog.Logger
+
+	// marks is the §5 two-pass sweep state: the first pass that finds
+	// a payload unreferenced and past grace records what it saw, and
+	// only a LATER pass that finds the same object unchanged may
+	// delete it. A publisher that refreshes the payload anywhere
+	// between the two passes changes its mtime, which invalidates the
+	// mark and spares the object — the coordination that a
+	// content-derived ETag precondition cannot provide.
+	//
+	// The state is in-memory and per-process. Losing it on restart is
+	// safe in the only direction that matters: reclamation is delayed
+	// by one more pass, never advanced.
+	marksMu sync.Mutex
+	marks   map[string]payloadMark
+}
+
+// payloadMark records the state of a payload when it was first seen
+// eligible for reclamation.
+type payloadMark struct {
+	at        time.Time
+	size      int64
+	updatedAt time.Time
+}
+
+// matches reports whether ref is the same object state that was
+// marked. Any difference means the object was rewritten since — the
+// signal that a publisher reused it.
+func (m payloadMark) matches(ref ObjectRef) bool {
+	return m.size == ref.Size && m.updatedAt.Equal(ref.UpdatedAt)
 }
 
 // GCOptions configures NewGC.
@@ -137,6 +192,7 @@ func NewGC(opts GCOptions) (*GC, error) {
 		policy: opts.Policy.withDefaults(),
 		now:    now,
 		log:    log,
+		marks:  make(map[string]payloadMark),
 	}, nil
 }
 
@@ -192,9 +248,10 @@ func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
 		return result, nil
 	}
 
-	deleted, claimed, err := g.reclaimPayloads(ctx, survivors, payloadRefs)
+	deleted, claimed, marked, err := g.reclaimPayloads(ctx, survivors, payloadRefs)
 	result.PayloadsDeleted = deleted
 	result.PayloadsClaimedConcurrently = claimed
+	result.PayloadsAwaitingSweep = marked
 	if err != nil {
 		return result, err
 	}
@@ -416,7 +473,7 @@ func (g *GC) listPayloadObjects(ctx context.Context) ([]ObjectRef, error) {
 // every surviving manifest across every group, then delete only
 // payload objects that are both unreferenced and older than the grace
 // period.
-func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, refs []ObjectRef) ([]string, int, error) {
+func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, refs []ObjectRef) ([]string, int, int, error) {
 	live := make(map[string]struct{}, len(survivors))
 	for _, entry := range survivors {
 		live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
@@ -428,12 +485,12 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 	// into N listings and O(N×M) reads.
 	fresh, safe, err := g.revalidateLiveKeys(ctx)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, 0, err
 	}
 	if !safe {
 		// A malformed manifest appeared since phase 1; the live set
 		// can no longer be proven complete, so reclaim nothing.
-		return nil, 0, nil
+		return nil, 0, 0, nil
 	}
 	for key := range fresh {
 		live[key] = struct{}{}
@@ -443,6 +500,7 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 	var (
 		deleted []string
 		claimed int
+		marked  int
 	)
 	for _, ref := range refs {
 		key, ok, err := g.reclaimPayload(ctx, live, graceCutoff, ref)
@@ -453,7 +511,11 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 				claimed++
 				continue
 			}
-			return deleted, claimed, err
+			if errors.Is(err, errPayloadMarked) {
+				marked++
+				continue
+			}
+			return deleted, claimed, marked, err
 		}
 		if !ok {
 			continue
@@ -461,7 +523,7 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 		deleted = append(deleted, key)
 	}
 	sort.Strings(deleted)
-	return deleted, claimed, nil
+	return deleted, claimed, marked, nil
 }
 
 func (g *GC) reclaimPayload(
@@ -477,22 +539,90 @@ func (g *GC) reclaimPayload(
 		return "", false, nil
 	}
 	if payloadKeyIsLive(live, ref.Key) || !beforeGraceCutoff(ref.UpdatedAt, graceCutoff) {
+		// Referenced again, or freshly touched: forget any mark so a
+		// later eligibility has to serve its own full sweep delay.
+		g.dropMark(ref.Key)
 		return "", false, nil
+	}
+	if !g.sweepable(ref) {
+		return "", false, errPayloadMarked
 	}
 	info, exists, err := g.store.HeadObject(ctx, ref.Key)
 	if err != nil {
 		return "", false, errors.Wrapf(err, "retention: head payload %s", ref.Key)
 	}
 	if !exists || !beforeGraceCutoff(info.UpdatedAt, graceCutoff) {
+		g.dropMark(ref.Key)
 		return "", false, nil
 	}
 	if err := g.compareAndDeletePayload(ctx, refreshed(ref, info), sha); err != nil {
 		return "", false, err
 	}
+	g.dropMark(ref.Key)
 	g.log.Info("snapshot offload retention reclaimed payload",
 		"object_key", ref.Key, "sha256", sha)
 	return ref.Key, true, nil
 }
+
+// sweepable implements the §5 two-pass rule. It reports true only when
+// this payload was marked on an earlier pass, has not changed since,
+// and the mark has aged past MinMarkAge. Otherwise it (re-)marks the
+// object and reports false.
+//
+// The DELAY is the protection: a publisher that refreshes a reused
+// payload and then commits its manifest completes well inside one
+// inter-pass interval, so the sweep pass sees the refreshed mtime (via
+// the grace check) or the new manifest (via the live set) and spares
+// the object. A single-pass GC had no such window.
+//
+// The state comparison is a secondary consistency check rather than
+// the primary mechanism: because a refresh sets mtime to now, the
+// grace check already rejects a refreshed object on its own. Keeping
+// the comparison makes a mark mean "this exact object state has been
+// quiet", so a mark can never be honoured for bytes that changed
+// underneath it — including a size change that left mtime untouched,
+// which the grace check alone would miss.
+func (g *GC) sweepable(ref ObjectRef) bool {
+	now := g.now()
+
+	g.marksMu.Lock()
+	defer g.marksMu.Unlock()
+
+	mark, marked := g.marks[ref.Key]
+	if !marked || !mark.matches(ref) {
+		if marked {
+			g.log.Info("snapshot offload retention re-marked a payload that changed since the last pass",
+				"object_key", ref.Key)
+		}
+		g.marks[ref.Key] = payloadMark{at: now, size: ref.Size, updatedAt: ref.UpdatedAt}
+		return false
+	}
+	return now.Sub(mark.at) >= g.policy.MinMarkAge
+}
+
+func (g *GC) dropMark(key string) {
+	g.marksMu.Lock()
+	defer g.marksMu.Unlock()
+	delete(g.marks, key)
+}
+
+// MarkedPayloads returns the payload keys currently held under a sweep
+// mark. Exposed for operator tooling and tests; the set is per-process
+// and advisory.
+func (g *GC) MarkedPayloads() []string {
+	g.marksMu.Lock()
+	defer g.marksMu.Unlock()
+	keys := make([]string, 0, len(g.marks))
+	for key := range g.marks {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// errPayloadMarked reports that a payload is waiting out its sweep
+// delay. It never escapes reclaimPayloads.
+var errPayloadMarked = errors.New("snapshot offload: payload marked, awaiting the sweep delay")
 
 // compareAndDeleteManifest deletes an expired manifest only if it
 // still matches the state the scan observed. It reports deleted=false

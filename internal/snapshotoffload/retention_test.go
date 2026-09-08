@@ -40,6 +40,9 @@ func newGCFixture(t *testing.T) *gcFixture {
 
 func (f *gcFixture) gc(t *testing.T, policy RetentionPolicy) *GC {
 	t.Helper()
+	if policy.MinMarkAge <= 0 {
+		policy.MinMarkAge = time.Hour
+	}
 	gc, err := NewGC(GCOptions{
 		Store:  f.store,
 		Prefix: retentionPrefix,
@@ -48,6 +51,26 @@ func (f *gcFixture) gc(t *testing.T, policy RetentionPolicy) *GC {
 	})
 	require.NoError(t, err)
 	return gc
+}
+
+// sweep runs the two passes the §5 mark-and-sweep requires: the first
+// trims manifests and MARKS eligible payloads, then the clock advances
+// past MinMarkAge and the second reclaims them.
+//
+// Manifest trimming is single-pass (phase 1) and payload reclamation
+// is two-pass, so both results are returned: assert manifests on the
+// first, payloads on the second.
+func (f *gcFixture) sweep(t *testing.T, gc *GC) (GCResult, GCResult) {
+	t.Helper()
+	first, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, first.PayloadsDeleted,
+		"the first pass must only mark payloads, never delete them")
+
+	f.now = f.now.Add(2 * time.Hour)
+	second, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	return first, second
 }
 
 // publishManifest writes a manifest object and (unless the payload is
@@ -176,8 +199,7 @@ func TestGCRetainsMinGenerationsAndDeletesBeyondBothBounds(t *testing.T) {
 	m4 := f.publishManifest(t, 1, 40, []byte("gen-4"), year)
 
 	gc := f.gc(t, RetentionPolicy{MinGenerations: 2, MaxAge: time.Hour, PayloadGrace: time.Hour})
-	result, err := gc.RunOnce(context.Background())
-	require.NoError(t, err)
+	trim, reclaim := f.sweep(t, gc)
 
 	// Newest two survive; the two older ones are beyond MinGenerations
 	// and beyond MaxAge, so both go.
@@ -185,14 +207,14 @@ func TestGCRetainsMinGenerationsAndDeletesBeyondBothBounds(t *testing.T) {
 	require.True(t, f.exists(t, m3.ManifestKey))
 	require.False(t, f.exists(t, m2.ManifestKey))
 	require.False(t, f.exists(t, m1.ManifestKey))
-	require.Len(t, result.ManifestsDeleted, 2)
+	require.Len(t, trim.ManifestsDeleted, 2)
 
 	// Their payloads are unreferenced and past grace, so phase 2 takes them.
 	require.False(t, f.exists(t, m1.Payload.Key))
 	require.False(t, f.exists(t, m2.Payload.Key))
 	require.True(t, f.exists(t, m3.Payload.Key))
 	require.True(t, f.exists(t, m4.Payload.Key))
-	require.Len(t, result.PayloadsDeleted, 2)
+	require.Len(t, reclaim.PayloadsDeleted, 2)
 }
 
 func TestGCRetainsManifestsInsideMaxAgeBeyondMinGenerations(t *testing.T) {
@@ -730,83 +752,98 @@ func TestLocalStoreListObjectsSkipsInProgressPutTempFiles(t *testing.T) {
 	require.FileExists(t, leftover, "listing must not delete the leftover either")
 }
 
-// racingPublishStore simulates the concurrent-publish race the P1
-// review identified: a publisher reuses a content-addressed payload
-// and refreshes it in the window between GC validating the object and
-// GC deleting it. The refresh happens inside the HeadObject call, so
-// the state GC validated is already stale by the time it deletes.
-type racingPublishStore struct {
-	RetentionStore
-	target      string
-	refresh     func()
-	refreshed   bool
-	unconAppend *[]string
-}
-
-func (s *racingPublishStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
-	info, ok, err := s.RetentionStore.HeadObject(ctx, key)
-	if err == nil && ok && key == s.target && !s.refreshed {
-		// GC has now validated the object. The publisher lands its
-		// refresh right here, before GC issues the delete.
-		s.refreshed = true
-		s.refresh()
-	}
-	return info, ok, err
-}
-
-func (s *racingPublishStore) DeleteObject(ctx context.Context, key string) error {
-	if s.unconAppend != nil {
-		*s.unconAppend = append(*s.unconAppend, key)
-	}
-	return s.RetentionStore.DeleteObject(ctx, key)
-}
-
 // TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish is the
-// regression test for the P1 concurrent-publication race.
+// regression test for the concurrent-publication race.
 //
-// Sequence: GC decides a payload is unreferenced and past grace, and
-// validates it. A publisher that is reusing the same content-addressed
-// payload then refreshes the object (restarting its grace) and is
-// about to commit a manifest naming it. If GC's delete is
-// unconditional it lands anyway, and the publisher commits a manifest
-// pointing at bytes that no longer exist.
+// A publisher reusing a content-addressed payload refreshes it —
+// rewriting IDENTICAL bytes — and then commits a manifest naming it.
+// No conditional-delete primitive on a general-purpose S3 bucket
+// detects that: `If-Match` compares a content-derived ETag, which
+// identical bytes leave unchanged, and `IfMatchLastModifiedTime` is
+// directory-buckets only.
 //
-// The compare-and-delete precondition turns that into a skip.
+// The §5 two-pass rule is what closes it: the refresh moves the
+// object's mtime, so the sweep pass sees state that differs from the
+// mark and re-marks instead of deleting.
 func TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish(t *testing.T) {
 	t.Parallel()
 
 	f := newGCFixture(t)
 	year := 365 * 24 * time.Hour
-	// A newer manifest keeps the group alive; the older one is
-	// trimmed, leaving its payload unreferenced and past grace.
 	f.publishManifest(t, 1, 30, []byte("current"), year)
 	orphan := f.publishManifest(t, 1, 10, []byte("reused-by-a-concurrent-publish"), year)
 
-	racing := &racingPublishStore{
-		RetentionStore: f.store,
-		target:         orphan.Payload.Key,
-		refresh: func() {
-			// The publisher's refresh: same bytes, fresh mtime.
-			f.setMTime(t, orphan.Payload.Key, f.now)
-		},
-	}
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
 
-	gc, err := NewGC(GCOptions{
-		Store:  racing,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
-	})
+	// Pass 1: the payload becomes eligible and is marked.
+	first, err := gc.RunOnce(context.Background())
 	require.NoError(t, err)
+	require.Empty(t, first.PayloadsDeleted)
+	require.Equal(t, 1, first.PayloadsAwaitingSweep)
+	require.Contains(t, gc.MarkedPayloads(), orphan.Payload.Key)
 
-	result, err := gc.RunOnce(context.Background())
+	// Between the passes a publisher reuses the payload: same bytes,
+	// fresh mtime. This is the event no ETag precondition can see.
+	f.now = f.now.Add(2 * time.Hour)
+	f.setMTime(t, orphan.Payload.Key, f.now)
+
+	// Pass 2: the state no longer matches the mark, so the payload is
+	// re-marked rather than reclaimed.
+	second, err := gc.RunOnce(context.Background())
 	require.NoError(t, err)
+	require.Empty(t, second.PayloadsDeleted,
+		"a payload refreshed between passes must not be reclaimed")
+	require.True(t, f.exists(t, orphan.Payload.Key))
+}
 
-	require.True(t, f.exists(t, orphan.Payload.Key),
-		"a payload refreshed by a concurrent publish must survive GC")
-	require.NotContains(t, result.PayloadsDeleted, orphan.Payload.Key)
-	require.Equal(t, 1, result.PayloadsClaimedConcurrently,
-		"the lost compare-and-delete must be reported, not silently dropped")
+// TestGCReclaimsAfterTwoQuietPasses is the complement: a payload that
+// nobody touches across both passes is reclaimed, so the two-pass rule
+// delays collection rather than preventing it.
+func TestGCReclaimsAfterTwoQuietPasses(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	orphan := f.publishManifest(t, 1, 10, []byte("genuinely-garbage"), year)
+
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
+	_, reclaim := f.sweep(t, gc)
+
+	require.Contains(t, reclaim.PayloadsDeleted, orphan.Payload.Key)
+	require.False(t, f.exists(t, orphan.Payload.Key))
+	require.NotContains(t, gc.MarkedPayloads(), orphan.Payload.Key,
+		"a reclaimed payload must not leave its mark behind")
+}
+
+// TestGCDropsTheMarkWhenAPayloadBecomesReferencedAgain covers the
+// other invalidation path: a payload that a new manifest starts naming
+// must lose its mark, so a later eligibility serves a full fresh delay
+// rather than inheriting a stale one.
+func TestGCDropsTheMarkWhenAPayloadBecomesReferencedAgain(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	reused := []byte("about-to-be-referenced-again")
+	orphan := f.publishManifest(t, 1, 10, reused, year)
+
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
+	_, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, gc.MarkedPayloads(), orphan.Payload.Key)
+
+	// A new manifest in another group now references the same content.
+	f.now = f.now.Add(2 * time.Hour)
+	f.publishManifest(t, 2, 5, reused, 0)
+
+	second, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Empty(t, second.PayloadsDeleted)
+	require.NotContains(t, gc.MarkedPayloads(), orphan.Payload.Key,
+		"a payload that is referenced again must lose its mark")
+	require.True(t, f.exists(t, orphan.Payload.Key))
 }
 
 // TestLocalStoreConditionalDeleteRejectsChangedObject exercises the
@@ -936,10 +973,24 @@ func TestGCRevalidatesReferencesOncePerPassNotPerPayload(t *testing.T) {
 	gc, err := NewGC(GCOptions{
 		Store:  counting,
 		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		Policy: RetentionPolicy{
+			MinGenerations: 1, MaxAge: time.Hour,
+			PayloadGrace: time.Hour, MinMarkAge: time.Hour,
+		},
+		Now: func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
+
+	// Pass 1 marks; pass 2 (after the sweep delay) reclaims. Count
+	// listings for the reclaiming pass only, so the bound is measured
+	// against a pass that does the full amount of work.
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	f.now = f.now.Add(2 * time.Hour)
+
+	counting.mu.Lock()
+	counting.lists = 0
+	counting.mu.Unlock()
 
 	result, err := gc.RunOnce(context.Background())
 	require.NoError(t, err)
@@ -1055,4 +1106,48 @@ func TestGCDeduplicatesListedManifestKeys(t *testing.T) {
 	require.True(t, f.exists(t, only.ManifestKey),
 		"a duplicated listing entry must not make a group's newest manifest deletable")
 	require.Equal(t, 1, result.ManifestsScanned, "duplicates must be collapsed")
+}
+
+// TestGCSweepableRequiresTheMarkedStateToBeUnchanged pins the mark's
+// state comparison directly.
+//
+// It needs its own test because the end-to-end race test does NOT
+// exercise it: a refresh sets mtime to now, so the grace check rejects
+// the object before the mark is ever consulted. The case the
+// comparison uniquely covers is a change that leaves mtime untouched —
+// here a size change — which the grace check cannot see.
+func TestGCSweepableRequiresTheMarkedStateToBeUnchanged(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	gc := f.gc(t, RetentionPolicy{
+		MinGenerations: 1, MaxAge: time.Hour,
+		PayloadGrace: time.Hour, MinMarkAge: time.Hour,
+	})
+
+	ref := ObjectRef{
+		Key:       "cluster-a/v1/payloads/sha256/ab/x.fsm",
+		Size:      100,
+		UpdatedAt: f.now.Add(-365 * 24 * time.Hour),
+	}
+
+	// First observation marks it.
+	require.False(t, gc.sweepable(ref), "the first pass must only mark")
+	require.Equal(t, []string{ref.Key}, gc.MarkedPayloads())
+
+	// Same state, past the sweep delay: now sweepable.
+	f.now = f.now.Add(2 * time.Hour)
+	require.True(t, gc.sweepable(ref))
+
+	// Size changed while mtime stayed put: the mark must be discarded
+	// and the delay restarted, even though the object still looks old.
+	changed := ref
+	changed.Size = 101
+	require.False(t, gc.sweepable(changed),
+		"a mark must not be honoured for bytes that changed underneath it")
+
+	// And the restarted mark serves a full fresh delay.
+	require.False(t, gc.sweepable(changed))
+	f.now = f.now.Add(2 * time.Hour)
+	require.True(t, gc.sweepable(changed))
 }
