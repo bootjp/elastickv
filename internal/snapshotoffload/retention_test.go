@@ -1151,3 +1151,56 @@ func TestGCSweepableRequiresTheMarkedStateToBeUnchanged(t *testing.T) {
 	f.now = f.now.Add(2 * time.Hour)
 	require.True(t, gc.sweepable(changed))
 }
+
+// TestGCPrunesMarksForPayloadsThatVanished stops the mark set growing
+// without bound. A payload removed by another GC process or a bucket
+// lifecycle rule never passes through reclaimPayload again, so no
+// dropMark call can reach it.
+func TestGCPrunesMarksForPayloadsThatVanished(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	orphan := f.publishManifest(t, 1, 10, []byte("removed-externally"), year)
+
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
+	_, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.Contains(t, gc.MarkedPayloads(), orphan.Payload.Key)
+
+	// Something else reclaims the object between passes.
+	require.NoError(t, f.store.DeleteObject(context.Background(), orphan.Payload.Key))
+
+	f.now = f.now.Add(2 * time.Hour)
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.NotContains(t, gc.MarkedPayloads(), orphan.Payload.Key,
+		"a mark for an object absent from a complete listing must be pruned")
+	require.Empty(t, gc.MarkedPayloads())
+}
+
+// TestLocalStoreListObjectsRejectsTraversingPrefixes keeps a listing
+// inside the store root. Every other local-store operation rejects the
+// equivalent key through pathForKey; listing must not be the one path
+// that leaks an ancestor tree's names, sizes and timestamps.
+func TestLocalStoreListObjectsRejectsTraversingPrefixes(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	// A file in the parent of the store root, which must stay unseen.
+	outside := filepath.Join(filepath.Dir(f.root), "outside.txt")
+	require.NoError(t, os.WriteFile(outside, []byte("not yours"), 0o600))
+
+	for _, prefix := range []string{"..", "../", "../sibling", "  ..  "} {
+		_, err := f.store.ListObjects(context.Background(), prefix)
+		require.ErrorIs(t, err, ErrInvalidOptions, "prefix %q must be rejected", prefix)
+	}
+
+	// A normal prefix still works.
+	refs, err := f.store.ListObjects(context.Background(), retentionPrefix)
+	require.NoError(t, err)
+	for _, ref := range refs {
+		require.NotContains(t, ref.Key, "outside.txt")
+	}
+}

@@ -105,9 +105,9 @@ func (s *LocalStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRe
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	root := s.root
-	if cleaned := cleanObjectPrefix(prefix); cleaned != "." {
-		root = filepath.Join(s.root, filepath.FromSlash(cleaned))
+	root, err := s.listRootForPrefix(prefix)
+	if err != nil {
+		return nil, err
 	}
 	var refs []ObjectRef
 	walk := func(walkPath string, entry os.DirEntry, err error) error {
@@ -166,6 +166,24 @@ func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (
 		Size:      info.Size(),
 		UpdatedAt: info.ModTime(),
 	}, true, nil
+}
+
+// listRootForPrefix resolves the directory a listing should walk.
+//
+// cleanObjectPrefix preserves ".." segments, so joining it blindly
+// would let a traversing prefix enumerate an ancestor or sibling tree
+// and leak those files' names, sizes and timestamps — while every
+// other local-store operation rejects the equivalent key through
+// pathForKey.
+func (s *LocalStore) listRootForPrefix(prefix string) (string, error) {
+	cleaned := cleanObjectPrefix(prefix)
+	if cleaned == "." {
+		return s.root, nil
+	}
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", errors.Wrapf(ErrInvalidOptions, "invalid object prefix %q", prefix)
+	}
+	return filepath.Join(s.root, filepath.FromSlash(cleaned)), nil
 }
 
 // DeleteObjectIfUnmodified removes key only when it still matches

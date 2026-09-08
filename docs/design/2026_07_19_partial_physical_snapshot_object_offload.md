@@ -139,7 +139,18 @@ the newly committed manifest — before the sweep. `MinMarkAge` must
 therefore exceed the longest plausible publish.
 
 The mark state is in-memory and per-process. Losing it on restart
-delays reclamation by one pass and never advances it.
+delays reclamation by one pass and never advances it. Marks for objects
+absent from a pass's (complete) listing are pruned, so external
+reclamation cannot leak them.
+
+**Accepted residual.** A refresh that begins *inside* the sweep pass —
+after the revalidation and head, before the delete — is still not
+observed, because no general-purpose-bucket precondition can detect a
+content-preserving rewrite. Closing that last window needs a claim or
+lease protocol and a new key prefix; two-pass mark-and-sweep was chosen
+over that on the grounds that a publish completing entirely within the
+gap between two adjacent object-store calls is not a realistic
+scenario, while the layout change is a permanent cost.
 
 Malformed manifests fail closed: they are reported and excluded from both
 automatic manifest deletion and payload reclamation. Listing failure,

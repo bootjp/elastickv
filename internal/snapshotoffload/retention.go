@@ -523,7 +523,30 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 		deleted = append(deleted, key)
 	}
 	sort.Strings(deleted)
+	// Drop marks for payloads no longer in the listing. Without this,
+	// a payload removed by another GC process or a bucket lifecycle
+	// rule never passes through reclaimPayload again, so no dropMark
+	// call can reach it and its mark leaks for the process's lifetime.
+	g.pruneMarks(refs)
 	return deleted, claimed, marked, nil
+}
+
+// pruneMarks discards marks whose object was absent from the listing
+// this pass. refs is the COMPLETE payload listing (ListObjects is
+// all-or-error), so absence is authoritative.
+func (g *GC) pruneMarks(refs []ObjectRef) {
+	present := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		present[ref.Key] = struct{}{}
+	}
+
+	g.marksMu.Lock()
+	defer g.marksMu.Unlock()
+	for key := range g.marks {
+		if _, ok := present[key]; !ok {
+			delete(g.marks, key)
+		}
+	}
 }
 
 func (g *GC) reclaimPayload(
