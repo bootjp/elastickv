@@ -1855,6 +1855,15 @@ func loadKEKAndRunStartupGuards(unwrapObserver monitoring.KEKUnwrapObserver) (ke
 	// elastickv_encryption_kek_unwrap_seconds empty despite completed
 	// KMS calls.
 	kekWrapper = monitoring.NewTimedKEKUnwrapper(kekWrapper, unwrapObserver)
+	// Memoize unwraps across the startup phase. The §9.1 guards and
+	// HydrateKeystoreFromSidecar each unwrap every wrapped DEK, which
+	// was free under the file KEK but is a doubled network round-trip
+	// per DEK now that Stage 9B shipped the KMS providers.
+	//
+	// The cache sits OUTSIDE the timer on purpose: a cache hit must
+	// not be recorded as a zero-duration KMS call, which would flatten
+	// elastickv_encryption_kek_unwrap_seconds.
+	kekWrapper = encryption.NewStartupUnwrapCache(kekWrapper)
 	if err := encryption.CheckStartupGuards(encryption.StartupConfig{
 		EncryptionEnabled: *encryptionEnabled,
 		KEKConfigured:     kekWrapper != nil,
