@@ -268,32 +268,63 @@ func (s *Scheduler) SyncOnce(ctx context.Context) {
 // window so a multi-group process does not begin every upload on the
 // same tick; it is used only by the Run loop.
 func (s *Scheduler) scan(ctx context.Context, stagger bool) {
+	// A bounded worker pool, not one goroutine per group. A process
+	// hosting many groups would otherwise stack an O(group-count)
+	// burst of goroutines — and, on a staggered scan, one timer each —
+	// every interval, before the upload semaphore ever applies.
+	work := make(chan OffloadGroup)
+	workers := min(s.concurrency, len(s.groups))
+
 	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for g := range work {
+				if ctx.Err() != nil {
+					return
+				}
+				if stagger && !s.sleepStagger(ctx) {
+					return
+				}
+				s.publishGroupBounded(ctx, g)
+			}
+		}()
+	}
+
 	for _, group := range s.groups {
 		if ctx.Err() != nil {
 			break
 		}
-		wg.Add(1)
-		go func(g OffloadGroup) {
-			defer wg.Done()
-			if stagger && !s.sleepStagger(ctx) {
-				return
-			}
-			select {
-			case s.uploads <- struct{}{}:
-			case <-ctx.Done():
-				return
-			}
-			defer func() { <-s.uploads }()
-			if !s.beginGroup(g.GroupID) {
-				s.observer.ObserveSnapshotOffloadSkipped(g.GroupID, "already_in_flight")
-				return
-			}
-			defer s.endGroup(g.GroupID)
-			s.publishGroup(ctx, g)
-		}(group)
+		select {
+		case work <- group:
+		case <-ctx.Done():
+		}
 	}
+	close(work)
 	wg.Wait()
+}
+
+// publishGroupBounded takes the process-wide upload slot and the
+// per-group single-flight claim, then publishes.
+//
+// The semaphore is still needed alongside the worker pool: the pool
+// bounds one scan's goroutines, while the semaphore bounds uploads
+// across concurrent scans (an operator SyncOnce overlapping Run).
+func (s *Scheduler) publishGroupBounded(ctx context.Context, group OffloadGroup) {
+	select {
+	case s.uploads <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() { <-s.uploads }()
+
+	if !s.beginGroup(group.GroupID) {
+		s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "already_in_flight")
+		return
+	}
+	defer s.endGroup(group.GroupID)
+	s.publishGroup(ctx, group)
 }
 
 // sleepStagger waits a random slice of the jitter window. It reports

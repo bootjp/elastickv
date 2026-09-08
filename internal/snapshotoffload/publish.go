@@ -98,12 +98,7 @@ func commitManifest(
 	if err := validateManifest(*manifest); err != nil {
 		return nil, err
 	}
-	if opts.VerifyLeader != nil {
-		if err := opts.VerifyLeader(ctx); err != nil {
-			return nil, errors.Wrap(err, "snapshot offload: leadership lost before manifest commit")
-		}
-	}
-	if err := putManifest(ctx, opts.Store, manifest, opts.CreatedAt.IsZero()); err != nil {
+	if err := putManifest(ctx, opts.Store, manifest, opts.CreatedAt.IsZero(), opts.VerifyLeader); err != nil {
 		return nil, err
 	}
 	return manifest, nil
@@ -153,7 +148,13 @@ func buildManifest(
 	}, nil
 }
 
-func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest, reuseExistingCreatedAt bool) error {
+func putManifest(
+	ctx context.Context,
+	store ObjectStore,
+	manifest *Manifest,
+	reuseExistingCreatedAt bool,
+	verifyLeader func(context.Context) error,
+) error {
 	data, manifestSHA, err := manifest.MarshalCanonical()
 	if err != nil {
 		return err
@@ -164,6 +165,17 @@ func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest, reu
 		return err
 	} else if exists {
 		return nil
+	}
+	// §4: leadership must hold at the instant the manifest is created,
+	// not merely before the absence probe above. That probe is a remote
+	// read whose latency is unbounded by anything the caller controls,
+	// so checking before it leaves a window in which a demoted node
+	// still commits a manifest — precisely the guarantee this
+	// scheduler exists to provide.
+	if verifyLeader != nil {
+		if err := verifyLeader(ctx); err != nil {
+			return errors.Wrap(err, "snapshot offload: leadership lost before manifest commit")
+		}
 	}
 	if err := createManifestObject(ctx, store, manifest, data, size, objectSHA, reuseExistingCreatedAt); err != nil {
 		return err

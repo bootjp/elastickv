@@ -2,9 +2,11 @@ package snapshotoffload
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -633,4 +635,64 @@ func TestSchedulerRunAndSyncOnceAreRaceFree(t *testing.T) {
 	}
 	cancel()
 	wg.Wait()
+}
+
+// TestSchedulerBoundsScanGoroutines pins that a scan does not stack one
+// goroutine per group. A process hosting many groups would otherwise
+// burst O(group-count) stacks — and, on a staggered scan, one timer
+// each — every interval, before the upload semaphore ever applies.
+func TestSchedulerBoundsScanGoroutines(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	const groupCount = 40
+	var concurrent, peak, peakGoroutines atomic.Int64
+	groups := make([]OffloadGroup, 0, groupCount)
+	for i := range groupCount {
+		groupID := uint64(i) + 1 //nolint:gosec // loop index over a fixed-size fixture.
+		dir := seedSchedulerGroup(t, root, fmt.Sprintf("bounded-%d", i))
+		groups = append(groups, OffloadGroup{
+			GroupID: groupID,
+			DataDir: dir,
+			IsLeader: func() bool {
+				cur := concurrent.Add(1)
+				for {
+					old := peak.Load()
+					if cur <= old || peak.CompareAndSwap(old, cur) {
+						break
+					}
+				}
+				// Sample goroutines DURING the scan. With one
+				// goroutine per group the surplus sit parked on the
+				// upload semaphore and are invisible once SyncOnce
+				// has returned.
+				live := int64(runtime.NumGoroutine())
+				for {
+					old := peakGoroutines.Load()
+					if live <= old || peakGoroutines.CompareAndSwap(old, live) {
+						break
+					}
+				}
+				time.Sleep(time.Millisecond)
+				concurrent.Add(-1)
+				return true
+			},
+			VerifyLeader: func(context.Context) error { return nil },
+		})
+	}
+
+	const concurrency = 3
+	s := newTestScheduler(t, store, groups, WithSchedulerConcurrency(concurrency))
+
+	before := int64(runtime.NumGoroutine())
+	s.SyncOnce(context.Background())
+
+	require.LessOrEqual(t, peak.Load(), int64(concurrency),
+		"in-flight group work must stay within the configured concurrency")
+	// A per-group goroutine scan would park groupCount-concurrency
+	// goroutines on the semaphore; a pool adds only `workers`.
+	require.Less(t, peakGoroutines.Load(), before+int64(groupCount)/2,
+		"a scan must not stack one goroutine per group")
 }
