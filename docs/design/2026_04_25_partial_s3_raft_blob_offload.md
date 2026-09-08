@@ -633,7 +633,7 @@ capability-advertising peers exists.
 | M0 | Spike: prove the chunkref + chunkblob keyspaces under a feature flag with 1 % traffic. Measure local Pebble write amp & blob fetch latency. | Implemented. |
 | M1 | PUT path emits chunkrefs through Raft; chunkblob writes go directly to local Pebble. **`FetchChunkBlob` and `PushChunkBlob` RPCs ship in this milestone** because both M1 PUT (semi-synchronous push) and M1 GET (proxy-on-miss) depend on them — without them M1 GET could only serve local-hit or 503. | Implemented behind the GC-readiness gate. |
 | M2 | Async fetch worker pool for follower apply (catch-up after a long absence). Independent of M1's synchronous `FetchChunkBlob` use on the GET path. SHA verification + retry from alternate peer on mismatch. | Partially implemented: fetch/backfill helpers exist; production enablement remains gated by M3. |
-| M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | Open. |
+| M3 | Reference-count + grace-period GC (the queue-based scheme in §3.5). | In progress: the §3.5 keyspaces (`!s3|chunkref-rc|`, `!s3|chunkblob-gc-queue|`) and their codecs are implemented in `internal/s3keys/chunkblob_gc.go`. The txn-side RC maintenance, the node-local sweeper, and the orphan scan remain open. |
 | M4 | Migrator: rewrite legacy `BlobKey` data in the background. Off by default until M0-M3 burn in for 30 days in production. | Open. |
 
 Acceptance criteria for M3 (the milestone that flips `ELASTICKV_S3_BLOB_OFFLOAD=true` by default):
