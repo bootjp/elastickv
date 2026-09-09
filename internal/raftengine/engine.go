@@ -120,6 +120,37 @@ type Status struct {
 	// in the local raft log and has not yet applied. Leadership transfer
 	// is rejected while this is true.
 	PendingConfChange bool
+	// PerPeer reports each remote replica's replication progress as
+	// the LEADER sees it, keyed by numeric node id. It is nil on a
+	// follower, where raft tracks no progress for anyone else — an
+	// empty map there would be indistinguishable from "the leader
+	// knows about no peers".
+	//
+	// It exists so an operator can choose PromoteLearner's
+	// min_applied_index from the learner's actual Match instead of
+	// guessing: guessing high fails the precondition and guessing low
+	// promotes a replica that has not caught up.
+	PerPeer map[uint64]PeerProgress
+}
+
+// PeerProgress is one remote replica's replication progress from the
+// leader's tracker.
+type PeerProgress struct {
+	// Match is the highest log index known to be replicated to this
+	// peer. This is the value PromoteLearner's min_applied_index is
+	// compared against.
+	Match uint64
+	// Next is the next index the leader will send to this peer.
+	Next uint64
+	// IsLearner reports whether raft currently tracks this peer as a
+	// learner. It comes from the leader's live tracker rather than
+	// from the peers file, so it reflects what raft will actually do
+	// rather than what was last persisted.
+	IsLearner bool
+	// RecentActive reports whether the peer has responded since the
+	// last election-timeout check. A learner that is caught up but
+	// inactive is not a safe promotion target.
+	RecentActive bool
 }
 
 type ProposalResult struct {

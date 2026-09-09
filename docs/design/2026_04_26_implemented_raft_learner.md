@@ -874,7 +874,10 @@ single-process 3-node demo cluster, attaches a learner via
   changes).
 - Promote precondition: surface `Progress[nodeID].Match` in
   `Status.PerPeer` so an operator can choose `min_applied_index`
-  without guessing.
+  without guessing. **Implemented** — `Status.PerPeer` reports each
+  remote replica's `Match`/`Next`/`IsLearner`/`RecentActive` from the
+  leader's tracker, and is nil on a follower. Exposing it over the
+  RaftAdmin `Status` RPC needs a proto change and is a follow-up.
 - Decision gate for follower-served reads: write a separate proposal,
   do not extend this one.
 
@@ -884,8 +887,8 @@ join-as-learner alarm, monitoring suffrage labels, promotion precondition
 checks against leader `Progress.Match`, and the operator runbook
 (`docs/raft_learner_operations.md`). Remaining Milestone 3 hardening is not
 claimed shipped here: the learner attach/promote-under-partition Jepsen
-workload and a first-class `Status.PerPeer` progress field are still open, and
-follower-served read routing remains a separate proposal.
+workload is still open, and follower-served read routing remains a separate
+proposal. The `Status.PerPeer` progress field has since landed (see §6).
 
 ## 7. Risks
 
