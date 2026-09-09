@@ -272,7 +272,7 @@ func (s *Scheduler) scan(ctx context.Context, stagger bool) {
 	// hosting many groups would otherwise stack an O(group-count)
 	// burst of goroutines — and, on a staggered scan, one timer each —
 	// every interval, before the upload semaphore ever applies.
-	work := make(chan OffloadGroup)
+	work := make(chan staggeredGroup)
 	workers := min(s.concurrency, len(s.groups))
 
 	var wg sync.WaitGroup
@@ -284,20 +284,31 @@ func (s *Scheduler) scan(ctx context.Context, stagger bool) {
 				if ctx.Err() != nil {
 					return
 				}
-				if stagger && !s.sleepStagger(ctx) {
+				if !s.waitForStart(ctx, g.startAt) {
 					return
 				}
-				s.publishGroupBounded(ctx, g)
+				s.publishGroupBounded(ctx, g.group)
 			}
 		}()
 	}
 
+	// Every start time is an offset from ONE scan start, not a fresh
+	// sleep per group. Sleeping a full jitter slice before each group
+	// makes the delays accumulate: with the default single worker and
+	// a 3m45s jitter, 100 groups would add hours before the last
+	// upload, and Run does not arm the next interval until the scan
+	// returns — so later groups could go unvisited indefinitely.
+	scanStart := s.now()
 	for _, group := range s.groups {
 		if ctx.Err() != nil {
 			break
 		}
+		entry := staggeredGroup{group: group}
+		if stagger {
+			entry.startAt = scanStart.Add(s.jitterSlice())
+		}
 		select {
-		case work <- group:
+		case work <- entry:
 		case <-ctx.Done():
 		}
 	}
@@ -327,14 +338,29 @@ func (s *Scheduler) publishGroupBounded(ctx context.Context, group OffloadGroup)
 	s.publishGroup(ctx, group)
 }
 
-// sleepStagger waits a random slice of the jitter window. It reports
-// false when ctx ended first, so the caller abandons the group.
-func (s *Scheduler) sleepStagger(ctx context.Context) bool {
-	slice := s.jitterSlice()
-	if slice <= 0 {
+// staggeredGroup pairs a group with the absolute instant its work may
+// begin. Carrying the instant rather than a duration is what keeps
+// every start inside a single jitter window: a worker that is already
+// past a group's start time proceeds immediately instead of sleeping
+// again.
+type staggeredGroup struct {
+	group   OffloadGroup
+	startAt time.Time
+}
+
+// waitForStart blocks until startAt. A zero startAt, or one already in
+// the past because earlier groups took longer than the offset, returns
+// immediately. It reports false when ctx ended first, so the caller
+// abandons the group.
+func (s *Scheduler) waitForStart(ctx context.Context, startAt time.Time) bool {
+	if startAt.IsZero() {
 		return true
 	}
-	timer := time.NewTimer(slice)
+	delay := startAt.Sub(s.now())
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
 	defer timer.Stop()
 	select {
 	case <-timer.C:
