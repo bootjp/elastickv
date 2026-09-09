@@ -696,3 +696,56 @@ func TestSchedulerBoundsScanGoroutines(t *testing.T) {
 	require.Less(t, peakGoroutines.Load(), before+int64(groupCount)/2,
 		"a scan must not stack one goroutine per group")
 }
+
+// TestSchedulerStaggerDoesNotAccumulateAcrossGroups pins that every
+// group start lands inside ONE jitter window.
+//
+// Sleeping a fresh jitter slice before each group makes the delays
+// compound: with the default single worker and a 3m45s jitter, 100
+// groups would push the last upload hours out, and Run does not arm
+// the next interval until the scan returns — so later groups could go
+// unvisited indefinitely.
+func TestSchedulerStaggerDoesNotAccumulateAcrossGroups(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+
+	const groupCount = 12
+	groups := make([]OffloadGroup, 0, groupCount)
+	for i := range groupCount {
+		groupID := uint64(i) + 1 //nolint:gosec // loop index over a fixed-size fixture.
+		dir := seedSchedulerGroup(t, root, fmt.Sprintf("stagger-%d", i))
+		groups = append(groups, OffloadGroup{
+			GroupID:      groupID,
+			DataDir:      dir,
+			IsLeader:     func() bool { return true },
+			VerifyLeader: func(context.Context) error { return nil },
+		})
+	}
+
+	const jitter = 300 * time.Millisecond
+	s := newTestScheduler(t, store, groups, WithSchedulerJitter(jitter))
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Baseline: the same scan with no stagger, so the comparison is
+	// against this fixture's real publish cost rather than a guess.
+	baselineStart := time.Now()
+	s.scan(ctx, false)
+	baseline := time.Since(baselineStart)
+
+	// A second scan republishes nothing (the high-water mark short-
+	// circuits it), so this measures scheduling overhead almost alone.
+	staggeredStart := time.Now()
+	s.scan(ctx, true)
+	staggered := time.Since(staggeredStart)
+
+	// One shared window adds at most ~jitter over the baseline.
+	// Sleeping a fresh slice per group would add groupCount*jitter/2
+	// ≈ 1.8s here; allow 3x jitter of slack for scheduling noise and
+	// the bound still separates the two by a wide margin.
+	require.Less(t, staggered, baseline+3*jitter,
+		"stagger must offset group starts from one scan start, not sleep a fresh slice per group")
+}
