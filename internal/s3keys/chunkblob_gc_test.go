@@ -59,14 +59,53 @@ func TestParseChunkRefRCKeyRejectsMalformed(t *testing.T) {
 func TestChunkRefRCValueFailsClosedOnMalformedValue(t *testing.T) {
 	t.Parallel()
 
-	got, ok := s3keys.DecodeChunkRefRC(s3keys.EncodeChunkRefRC(7))
+	got, ok := s3keys.DecodeChunkRefRC(s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 7}))
 	require.True(t, ok)
-	require.Equal(t, uint64(7), got)
+	require.Equal(t, uint64(7), got.Count)
+	require.False(t, got.Queued())
 
-	for _, bad := range [][]byte{nil, {}, {0x01}, make([]byte, 7), make([]byte, 9)} {
+	for _, bad := range [][]byte{nil, {}, {0x01}, make([]byte, 8), make([]byte, 15), make([]byte, 17)} {
 		_, ok := s3keys.DecodeChunkRefRC(bad)
-		require.False(t, ok, "a malformed count must not decode to zero")
+		require.False(t, ok, "a malformed record must not decode to a zero count")
 	}
+}
+
+// TestChunkRefRCCarriesTheQueueTimestamp pins the field that makes the
+// §3.5 re-reference path implementable.
+//
+// When a SHA is referenced again after its count reached zero, the
+// same txn must delete the existing GC-queue entry. That key embeds the
+// eligibility timestamp, which the re-referencing txn has no other way
+// to learn — so the count record has to carry it. Without it the txn
+// cannot name the key it must delete, and a stale queue entry would
+// point the sweeper at a blob that is live again.
+func TestChunkRefRCCarriesTheQueueTimestamp(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("payload")
+	const queuedAt = uint64(1_700_000_000_000_000_000)
+
+	// Count dropped to zero: the txn records when, and queues.
+	zeroed := s3keys.ChunkRefRC{Count: 0, QueuedAtNanos: queuedAt}
+	decoded, ok := s3keys.DecodeChunkRefRC(s3keys.EncodeChunkRefRC(zeroed))
+	require.True(t, ok)
+	require.Zero(t, decoded.Count)
+	require.True(t, decoded.Queued())
+
+	// A re-referencing txn can now reconstruct the exact queue key it
+	// has to delete.
+	require.Equal(t,
+		s3keys.ChunkBlobGCQueueKey(queuedAt, sha),
+		s3keys.ChunkBlobGCQueueKey(decoded.QueuedAtNanos, sha),
+		"the recorded timestamp must reproduce the queue key exactly")
+
+	// Re-referenced: count back above zero, no queue entry.
+	live := s3keys.ChunkRefRC{Count: 1}
+	decoded, ok = s3keys.DecodeChunkRefRC(s3keys.EncodeChunkRefRC(live))
+	require.True(t, ok)
+	require.Equal(t, uint64(1), decoded.Count)
+	require.False(t, decoded.Queued(),
+		"a live SHA must not claim a queue entry")
 }
 
 func TestChunkBlobGCQueueKeyRoundTrip(t *testing.T) {

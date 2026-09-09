@@ -25,6 +25,10 @@ const (
 	ChunkRefRCPrefix       = "!s3|chunkref-rc|"
 	ChunkBlobGCQueuePrefix = "!s3|chunkblob-gc-queue|"
 
+	// chunkRefRCValueBytes is the fixed width of an encoded
+	// ChunkRefRC: the count followed by the queue timestamp.
+	chunkRefRCValueBytes = 2 * u64Bytes
+
 	// chunkBlobGCQueueSeparator delimits the timestamp from the SHA.
 	// It must sort below every hex digit so the scan-end key built
 	// from a bare timestamp excludes that timestamp's own entries
@@ -55,23 +59,44 @@ func ParseChunkRefRCKey(key []byte) ([chunkBlobSHA256Bytes]byte, bool) {
 	return decodeSHAHex(key[len(chunkRefRCPrefixBytes):], sha)
 }
 
-// EncodeChunkRefRC encodes a reference count.
-func EncodeChunkRefRC(count uint64) []byte {
-	out := make([]byte, u64Bytes)
-	binary.BigEndian.PutUint64(out, count)
-	return out
+// ChunkRefRC is the reference-count record for one content hash.
+//
+// QueuedAtNanos carries the timestamp of this SHA's GC-queue entry, or
+// zero when it has none. It is part of the VALUE because §3.5 requires
+// a txn that re-references a SHA to delete the queue entry atomically
+// with incrementing the count — and the queue key embeds the
+// eligibility timestamp, which that txn has no other way to learn.
+// Without it the re-referencing txn cannot name the key it must
+// delete, leaving a stale entry that points the sweeper at a blob
+// which is once again live.
+type ChunkRefRC struct {
+	Count         uint64
+	QueuedAtNanos uint64
 }
 
-// DecodeChunkRefRC decodes a reference count. A missing key and an
-// explicit zero are equivalent to the caller — both mean "no live
-// reference" — but a malformed value is not, so it fails closed
+// Queued reports whether this SHA currently has a GC-queue entry.
+func (r ChunkRefRC) Queued() bool { return r.QueuedAtNanos != 0 }
+
+// EncodeChunkRefRC encodes a reference-count record.
+func EncodeChunkRefRC(rc ChunkRefRC) []byte {
+	out := make([]byte, 0, chunkRefRCValueBytes)
+	out = binary.BigEndian.AppendUint64(out, rc.Count)
+	return binary.BigEndian.AppendUint64(out, rc.QueuedAtNanos)
+}
+
+// DecodeChunkRefRC decodes a reference-count record. A missing key and
+// an explicit zero count are equivalent to the caller — both mean "no
+// live reference" — but a malformed value is not, so it fails closed
 // rather than defaulting to zero and making a live blob look
 // collectable.
-func DecodeChunkRefRC(value []byte) (uint64, bool) {
-	if len(value) != u64Bytes {
-		return 0, false
+func DecodeChunkRefRC(value []byte) (ChunkRefRC, bool) {
+	if len(value) != chunkRefRCValueBytes {
+		return ChunkRefRC{}, false
 	}
-	return binary.BigEndian.Uint64(value), true
+	return ChunkRefRC{
+		Count:         binary.BigEndian.Uint64(value[:u64Bytes]),
+		QueuedAtNanos: binary.BigEndian.Uint64(value[u64Bytes:]),
+	}, true
 }
 
 // ChunkBlobGCQueueKey builds the eligibility-queue key for a content
