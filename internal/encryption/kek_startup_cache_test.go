@@ -156,13 +156,34 @@ func TestStartupUnwrapCacheResetDropsKeyMaterial(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, 1, concrete.Len())
 
-	concrete.Reset()
+	concrete.Seal()
 	require.Zero(t, concrete.Len())
 
-	// After a reset the provider is consulted again.
+	// After sealing the provider is consulted again...
 	_, err = cache.Unwrap([]byte("wrapped"))
 	require.NoError(t, err)
 	require.Equal(t, 2, inner.count())
+
+	// ...and, crucially, the result is NOT memoized. The wrapper is
+	// retained by every applier for the process lifetime, so a cache
+	// that kept storing would accumulate a plaintext copy of every DEK
+	// a later rotation unwraps.
+	require.Zero(t, concrete.Len(), "a sealed cache must not resume memoizing")
+	_, err = cache.Unwrap([]byte("wrapped"))
+	require.NoError(t, err)
+	require.Equal(t, 3, inner.count(), "every post-seal unwrap must reach the provider")
+}
+
+// TestSealStartupUnwrapCacheIsSafeOnAnUndecoratedSource covers the
+// production call site, which seals without knowing whether the KEK
+// source was decorated at all.
+func TestSealStartupUnwrapCacheIsSafeOnAnUndecoratedSource(t *testing.T) {
+	t.Parallel()
+
+	require.NotPanics(t, func() {
+		encryption.SealStartupUnwrapCache(nil)
+		encryption.SealStartupUnwrapCache(&countingKEK{})
+	})
 }
 
 // TestStartupUnwrapCacheDelegatesWrapAndName pins that the decorator

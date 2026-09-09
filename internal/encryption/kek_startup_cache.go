@@ -33,6 +33,11 @@ type StartupUnwrapCache struct {
 
 	mu      sync.Mutex
 	entries map[string][]byte
+	// sealed stops memoizing once startup is done. Without it the
+	// cache is not merely holding stale entries — it keeps growing,
+	// retaining a plaintext copy of every DEK a later rotation
+	// unwraps, for the process lifetime.
+	sealed bool
 }
 
 // NewStartupUnwrapCache wraps inner, and returns a genuinely nil
@@ -108,9 +113,15 @@ func (c *StartupUnwrapCache) load(wrapped []byte) ([]byte, bool) {
 	return append([]byte(nil), dek...), true
 }
 
+// store memoizes an unwrap unless the cache has been sealed. After
+// sealing, later unwraps (rotation applies) go straight to the
+// provider and leave no plaintext behind here.
 func (c *StartupUnwrapCache) store(wrapped, dek []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.sealed {
+		return
+	}
 	c.entries[string(wrapped)] = append([]byte(nil), dek...)
 }
 
@@ -129,18 +140,33 @@ func (c *StartupUnwrapCache) Wrap(dek []byte) ([]byte, error) {
 // showing the real KEK source.
 func (c *StartupUnwrapCache) Name() string { return c.inner.Name() }
 
-// Reset zeroes and drops every cached DEK. Call it once startup has
-// hydrated the keystore; later unwraps (rotation applies) go straight
-// to the provider.
-func (c *StartupUnwrapCache) Reset() {
+// Seal zeroes every cached DEK and stops further memoization. Call it
+// once startup has hydrated the keystore.
+//
+// Clearing alone would not be enough: the same wrapper is retained by
+// every applier for the process lifetime, so a cache that kept
+// memoizing would accumulate a plaintext copy of every DEK a later
+// rotation unwraps. Sealing bounds the window to startup, which is the
+// only place the duplicate unwrap it exists to remove occurs.
+func (c *StartupUnwrapCache) Seal() {
 	if c == nil {
 		return
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.sealed = true
 	for key, dek := range c.entries {
 		zeroBytes(dek)
 		delete(c.entries, key)
+	}
+}
+
+// SealStartupUnwrapCache seals w when it is a StartupUnwrapCache, and
+// is a no-op otherwise. Lets the caller seal without knowing whether
+// the KEK source was decorated.
+func SealStartupUnwrapCache(w kek.Wrapper) {
+	if cache, ok := w.(*StartupUnwrapCache); ok {
+		cache.Seal()
 	}
 }
 

@@ -525,6 +525,12 @@ func run() error {
 	); err != nil {
 		return err
 	}
+	// Startup has hydrated every keystore, so the KEK unwrap cache has
+	// served its purpose. Seal it: the same wrapper is retained by
+	// every applier for the process lifetime, and an unsealed cache
+	// would keep a plaintext copy of every DEK a later rotation
+	// unwraps.
+	encryption.SealStartupUnwrapCache(kekUnwrapper)
 
 	// Record the active FSM apply sync mode so operators can see on the
 	// /metrics endpoint which durability posture this node is running in.
