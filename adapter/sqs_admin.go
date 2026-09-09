@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"log/slog"
 	"sort"
 	"strconv"
 	"strings"
@@ -316,16 +317,20 @@ func (e *PurgeInProgressError) Is(target error) bool {
 //   - ErrAdminSQSValidation      — empty / whitespace name
 func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipal, name string) (AdminPurgeResult, error) {
 	if !principal.Role.canWrite() {
+		s.observeAdminPurge(name, adminOutcomeForbidden)
 		return AdminPurgeResult{}, ErrAdminForbidden
 	}
 	if !isVerifiedSQSLeader(ctx, s.coordinator) {
+		s.observeAdminPurge(name, adminOutcomeNotLeader)
 		return AdminPurgeResult{}, ErrAdminNotLeader
 	}
 	if strings.TrimSpace(name) == "" {
+		s.observeAdminPurge(name, adminOutcomeValidation)
 		return AdminPurgeResult{}, ErrAdminSQSValidation
 	}
 	oldGen, newGen, err := s.purgeQueueWithRetry(ctx, name)
 	if err != nil {
+		s.observeAdminPurge(name, adminPurgeOutcomeForError(err))
 		var rateLimit *purgeRateLimitedError
 		if errors.As(err, &rateLimit) {
 			return AdminPurgeResult{}, &PurgeInProgressError{RetryAfter: rateLimit.remaining}
@@ -335,7 +340,67 @@ func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipa
 		}
 		return AdminPurgeResult{}, errors.Wrap(err, "admin purge queue")
 	}
+	s.observeAdminPurge(name, adminOutcomeOK)
+	// §3.6 audit line. Deliberately lean: subject, role, queue and the
+	// two generations are everything needed to reconstruct
+	// who-purged-what-when. The generations come from the committed
+	// OCC round rather than a pre/post read, so they cannot report a
+	// pair of values that never existed as one consistent state.
+	slog.InfoContext(ctx, "admin.sqs.purge_queue",
+		// AdminPrincipal carries AccessKey, not the design's
+		// "subject": the access key ID is the identity the admin
+		// surface authenticates, and it is an identifier rather than
+		// a secret (the signing key never appears here).
+		slog.String("access_key", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("queue", name),
+		slog.Uint64("generation_before", oldGen),
+		slog.Uint64("generation_after", newGen))
 	return AdminPurgeResult{GenerationBefore: oldGen, GenerationAfter: newGen}, nil
+}
+
+// Outcome labels for the §3.6 admin counters, mirrored from
+// monitoring so the adapter does not import it at this boundary.
+const (
+	adminOutcomeOK              = "ok"
+	adminOutcomeForbidden       = "forbidden"
+	adminOutcomeNotLeader       = "not_leader"
+	adminOutcomeNotFound        = "not_found"
+	adminOutcomeValidation      = "validation"
+	adminOutcomePurgeInProgress = "purge_in_progress"
+	// NOTE: no "throttled" here — the admin peek throttle is a
+	// separate deferred follow-up, and declaring the label before a
+	// call site exists would imply coverage the code does not have.
+	adminOutcomeInternalError = "internal_error"
+)
+
+// adminPurgeOutcomeForError classifies a purge failure by SENTINEL,
+// never by message text: an error-string label would let one recurring
+// failure grow the series set without bound.
+func adminPurgeOutcomeForError(err error) string {
+	var rateLimit *purgeRateLimitedError
+	switch {
+	case errors.As(err, &rateLimit):
+		return adminOutcomePurgeInProgress
+	case isSQSAdminQueueDoesNotExist(err):
+		return adminOutcomeNotFound
+	default:
+		return adminOutcomeInternalError
+	}
+}
+
+func (s *SQSServer) observeAdminPurge(queue, outcome string) {
+	if s == nil || s.adminObserver == nil {
+		return
+	}
+	s.adminObserver.ObserveAdminPurgeQueue(queue, outcome)
+}
+
+func (s *SQSServer) observeAdminPeek(queue, outcome string) {
+	if s == nil || s.adminObserver == nil {
+		return
+	}
+	s.adminObserver.ObserveAdminPeekQueue(queue, outcome)
 }
 
 // AdminSetQueueAttributes is the SigV4-bypass counterpart to

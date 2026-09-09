@@ -43,6 +43,13 @@ func prepareSQSServer(
 	if o, ok := partitionObserver.(adapter.SQSThrottleObserver); ok {
 		throttleObserver = o
 	}
+	// The registry's SQSMetrics satisfies all three observer
+	// interfaces; derive the admin one the same way rather than
+	// widening this function's signature.
+	var adminObserver adapter.SQSAdminObserver
+	if o, ok := partitionObserver.(adapter.SQSAdminObserver); ok {
+		adminObserver = o
+	}
 	sqsServer := adapter.NewSQSServer(
 		sqsL,
 		shardStore,
@@ -53,6 +60,7 @@ func prepareSQSServer(
 		adapter.WithSQSPartitionResolver(partitionResolver),
 		adapter.WithSQSPartitionObserver(partitionObserver),
 		adapter.WithSQSThrottleObserver(throttleObserver),
+		adapter.WithSQSAdminObserver(adminObserver),
 	)
 	return sqsServer, sqsL, nil
 }

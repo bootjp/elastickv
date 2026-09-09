@@ -214,6 +214,10 @@ type SQSServer struct {
 	// nil on non-monitored fixtures; observeThrottleDecision is
 	// nil-safe so the request path pays one branch when unwired.
 	throttleObserver SQSThrottleObserver
+	// adminObserver records the §3.6 admin purge / peek counters.
+	// nil on non-monitored fixtures; the increment helpers are
+	// nil-safe so an unwired server pays one branch.
+	adminObserver SQSAdminObserver
 }
 
 // SQSPartitionObserver is the metrics-package interface
@@ -222,6 +226,14 @@ type SQSServer struct {
 // matches the existing observer pattern for DynamoDB / Redis.
 type SQSPartitionObserver interface {
 	ObservePartitionMessage(queue string, partition uint32, action string)
+}
+
+// SQSAdminObserver is the metrics-package interface
+// (monitoring.SQSMetrics) re-declared here so the adapter does not
+// import monitoring at the package boundary.
+type SQSAdminObserver interface {
+	ObserveAdminPurgeQueue(queue string, outcome string)
+	ObserveAdminPeekQueue(queue string, outcome string)
 }
 
 // SQSThrottleObserver is the metrics-package interface
@@ -274,6 +286,15 @@ func WithSQSLeaderMap(m map[string]string) SQSServerOption {
 		s.leaderSQS = make(map[string]string, len(m))
 		for k, v := range m {
 			s.leaderSQS[k] = v
+		}
+	}
+}
+
+// WithSQSAdminObserver installs the §3.6 admin purge / peek counters.
+func WithSQSAdminObserver(o SQSAdminObserver) SQSServerOption {
+	return func(s *SQSServer) {
+		if o != nil {
+			s.adminObserver = o
 		}
 	}
 }
