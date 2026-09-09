@@ -123,3 +123,37 @@ func testLogger(t *testing.T) *slog.Logger {
 	t.Helper()
 	return slog.New(slog.NewTextHandler(io.Discard, nil))
 }
+
+// TestRunbookRestorePathsMatchGroupDataDir keeps the operations
+// runbook's `--data-dir` table honest against the function the server
+// actually uses.
+//
+// A wrong path here is not a cosmetic doc bug: an operator following
+// it during disaster recovery restores into a directory the server
+// never opens, startup finds the per-group directories empty, and the
+// restore is silently ignored.
+func TestRunbookRestorePathsMatchGroupDataDir(t *testing.T) {
+	t.Parallel()
+
+	const raftDir = "/var/lib/elastickv"
+	const raftID = "n1"
+
+	tests := []struct {
+		name    string
+		groupID uint64
+		multi   bool
+		want    string
+	}{
+		{name: "multi-group", groupID: 1, multi: true, want: "/var/lib/elastickv/n1/group-1"},
+		{name: "multi-group higher id", groupID: 7, multi: true, want: "/var/lib/elastickv/n1/group-7"},
+		{name: "single group", groupID: 1, multi: false, want: "/var/lib/elastickv/n1"},
+		{name: "single node group zero", groupID: 0, multi: false, want: "/var/lib/elastickv/n1/group-0"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, groupDataDir(raftDir, raftID, tc.groupID, tc.multi),
+				"docs/snapshot_offload_operations.md documents this path for restore")
+		})
+	}
+}

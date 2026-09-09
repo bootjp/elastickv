@@ -162,15 +162,33 @@ mistakenly points a restore at a live node.
 # 1. Find the generation to restore.
 elastickv-snapshot-offload publish --help   # same store flags as below
 
-# 2. Restore into a fresh directory.
+# 2. Restore each group into ITS OWN directory (see the path rule below).
 elastickv-snapshot-offload restore \
   --store=s3 --s3-bucket=my-backup-bucket --s3-region=ap-northeast-1 \
   --manifest-key='elastickv/v1/groups/1/snapshots/00000000000000004211-00000000000000000007.json' \
-  --data-dir=/var/lib/elastickv/n1 \
+  --data-dir=/var/lib/elastickv/n1/group-1 \
   --peers='n1=10.0.0.1:50051,n2=10.0.0.2:50051,n3=10.0.0.3:50051'
 
-# 3. Start the node normally against the restored directory.
+# 3. Repeat for every group the node hosts, then start it normally.
 ```
+
+### The `--data-dir` path must match what the server will open
+
+`--data-dir` is the **per-group** directory, not the node's `--raftDir`.
+The server derives it as:
+
+| Deployment | Group | Directory |
+|---|---|---|
+| multi-group (`--raftRedisMap` etc.) | any group *G* | `<raftDir>/<raftID>/group-<G>` |
+| single group | the default group | `<raftDir>/<raftID>` |
+| single-node, group 0 | 0 | `<raftDir>/<raftID>/group-0` |
+
+Restoring a multi-group node into `<raftDir>/<raftID>` puts the data
+where the server never looks: startup finds the per-group directories
+empty and the restore is silently ignored. **A multi-group recovery
+must restore every group's manifest into its own `group-<G>`
+directory** — one `restore` invocation per group — or the node comes
+back with only the groups you happened to place correctly.
 
 Restore verifies exact length and SHA-256 before the payload is accepted, then
 fsyncs and atomically renames it into place. Any integrity failure leaves the
