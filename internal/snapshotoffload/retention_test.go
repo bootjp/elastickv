@@ -1287,3 +1287,41 @@ func TestLocalStoreListObjectsRejectsNativeSeparatorTraversal(t *testing.T) {
 		require.ErrorIs(t, err, ErrInvalidOptions, "prefix %q must be rejected", prefix)
 	}
 }
+
+// TestLocalStoreRejectsTraversalOnEveryObjectOperation is the sibling
+// sweep for the prefix fix. The traversal guard was first applied only
+// to ListObjects, leaving the direct key path — Get/Head/Put and both
+// deletes — able to resolve outside the root on a native separator.
+func TestLocalStoreRejectsTraversalOnEveryObjectOperation(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	ctx := context.Background()
+
+	// A file just outside the store root that must stay untouched.
+	outside := filepath.Join(filepath.Dir(f.root), "victim.txt")
+	require.NoError(t, os.WriteFile(outside, []byte("not yours"), 0o600))
+
+	for _, key := range []string{"..", `..\victim.txt`, `a\..\..\victim.txt`, "../victim.txt"} {
+		t.Run(key, func(t *testing.T) {
+			_, err := f.store.PutObject(ctx, key, bytes.NewReader(nil), PutOptions{
+				SHA256: hexSHA256Bytes(nil),
+			})
+			require.ErrorIs(t, err, ErrInvalidOptions, "PutObject")
+
+			_, _, err = f.store.GetObject(ctx, key)
+			require.ErrorIs(t, err, ErrInvalidOptions, "GetObject")
+
+			_, _, err = f.store.HeadObject(ctx, key)
+			require.ErrorIs(t, err, ErrInvalidOptions, "HeadObject")
+
+			require.ErrorIs(t, f.store.DeleteObject(ctx, key), ErrInvalidOptions, "DeleteObject")
+
+			require.ErrorIs(t,
+				f.store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{Size: 9}),
+				ErrInvalidOptions, "DeleteObjectIfUnmodified")
+		})
+	}
+
+	require.FileExists(t, outside, "no operation may reach outside the store root")
+}

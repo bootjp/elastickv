@@ -184,7 +184,7 @@ func (s *LocalStore) listRootForPrefix(prefix string) (string, error) {
 	// below interprets the platform separator — so on Windows a
 	// prefix like `..\sibling` would survive a slash-only check and
 	// then escape the root. Reject the native form too.
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") || strings.ContainsRune(cleaned, '\\') {
+	if !objectPathSegmentIsSafe(cleaned) {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object prefix %q", prefix)
 	}
 	return filepath.Join(s.root, filepath.FromSlash(cleaned)), nil
@@ -374,10 +374,33 @@ func (s *LocalStore) pathForKey(key string) (string, error) {
 		return "", errors.Wrap(ErrInvalidOptions, "object store is required")
 	}
 	normalized := normalizeObjectKey(key)
-	if normalized == "" || normalized == "." || normalized == ".." || strings.HasPrefix(normalized, "../") {
+	if !objectPathSegmentIsSafe(normalized) {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object key %q", key)
 	}
 	return filepath.Join(s.root, filepath.FromSlash(normalized)), nil
+}
+
+// objectPathSegmentIsSafe reports whether a normalized key or prefix
+// stays inside the store root once joined.
+//
+// The backslash check is not redundant on the slash-only forms:
+// normalizeObjectKey uses path (slash) semantics, so `..\victim`
+// survives every "/"-based test, and filepath.Join then interprets the
+// backslash on Windows and resolves outside the root. Both the key
+// path (Get/Head/Put/Delete) and the prefix path (ListObjects) route
+// through this, so a fix here cannot be applied to one and missed on
+// the other.
+func objectPathSegmentIsSafe(normalized string) bool {
+	switch {
+	case normalized == "", normalized == ".", normalized == "..":
+		return false
+	case strings.HasPrefix(normalized, "../"):
+		return false
+	case strings.ContainsRune(normalized, '\\'):
+		return false
+	default:
+		return true
+	}
 }
 
 func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, error) {
