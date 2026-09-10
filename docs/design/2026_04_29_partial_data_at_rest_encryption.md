@@ -34,7 +34,8 @@ Date: 2026-04-29
 | 8 | Snapshot header v2 (§4.4); WAL coverage closure (§4.3 / §4.6) | shipped | [`2026_05_29_implemented_8a_snapshot_header_v2.md`](2026_05_29_implemented_8a_snapshot_header_v2.md) + [`2026_06_01_implemented_8b_wal_coverage_closure.md`](2026_06_01_implemented_8b_wal_coverage_closure.md) |
 | 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, metrics, remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8, §9.2) | open | — |
+| 9C-5 | §5.4 DEK retirement eligibility: the storage criteria (rewrite cursor, values-per-DEK, minRetainedTS) and the WAL-driven raft criteria (log start index, snapshot cutover), both cluster-wide with no override | shipped | — |
+| 9C+ | Rotation rewrap and the rewrite job itself, admission-control wiring, remaining benchmarks (§5.2, §5.4, §6.5, §8) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
