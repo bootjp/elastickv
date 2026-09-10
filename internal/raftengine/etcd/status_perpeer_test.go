@@ -51,11 +51,46 @@ func TestStatusPerPeerReportsLearnerProgressOnTheLeader(t *testing.T) {
 		"progress must come from the live tracker, which knows this peer is a learner")
 	require.GreaterOrEqual(t, progress.Next, progress.Match)
 
-	// The reported Match is a usable min_applied_index: promotion with
-	// it must satisfy the precondition rather than be rejected.
-	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, 0, progress.Match, false)
+	// The CORRECT use: watch Match climb to a target and pass the
+	// TARGET. Passing the learner's own current Match would satisfy
+	// the engine's Match >= minAppliedIndex check by construction,
+	// turning the precondition into a no-op that promotes a lagging
+	// replica into the voter quorum.
+	var target uint64
+	require.Eventually(t, func() bool {
+		status := leader.engine.Status()
+		target = status.CommitIndex
+		p, ok := status.PerPeer[learnerNodeID]
+		return ok && target > 0 && p.Match >= target
+	}, 10*time.Second, 25*time.Millisecond,
+		"the learner must be observed catching up to the leader's commit index")
+
+	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, 0, target, false)
 	require.NoError(t, err,
-		"the Match reported by PerPeer must be accepted as min_applied_index")
+		"promotion at the observed catch-up target must satisfy the precondition")
+}
+
+// TestStatusPerPeerIsEmptyNotNilOnAPeerlessLeader pins the other half
+// of the nil-versus-empty contract. A single-node leader has no remote
+// replicas, but it IS the leader — reporting nil would make it
+// indistinguishable from a follower to any consumer testing
+// PerPeer == nil.
+func TestStatusPerPeerIsEmptyNotNilOnAPeerlessLeader(t *testing.T) {
+	nodes, peers := newTransportTestNodes(t, 1)
+	startTransportTestServers(nodes, peers)
+	t.Cleanup(func() { cleanupTransportTestNodes(t, nodes) })
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	require.NoError(t, openTransportTestNode(ctx, nodes[0], peers[:1], true))
+	leader := waitForLeaderNode(t, nodes[:1])
+
+	status := leader.engine.Status()
+	require.Equal(t, raftengine.StateLeader, status.State)
+	require.NotNil(t, status.PerPeer,
+		"a leader with no remote replicas must report an empty map, not nil")
+	require.Empty(t, status.PerPeer)
 }
 
 // TestStatusPerPeerIsNilOnAFollower pins the nil-versus-empty

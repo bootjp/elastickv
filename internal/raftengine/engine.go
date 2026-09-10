@@ -126,10 +126,23 @@ type Status struct {
 	// empty map there would be indistinguishable from "the leader
 	// knows about no peers".
 	//
-	// It exists so an operator can choose PromoteLearner's
-	// min_applied_index from the learner's actual Match instead of
-	// guessing: guessing high fails the precondition and guessing low
-	// promotes a replica that has not caught up.
+	// It exists so an operator can decide WHEN a learner is ready to
+	// promote, by watching its Match climb toward a target — the same
+	// status snapshot's CommitIndex is the natural one.
+	//
+	// Do NOT pass a learner's current Match straight back as
+	// PromoteLearner's min_applied_index. The engine checks
+	// Match >= minAppliedIndex, so the learner's own present value
+	// satisfies it by construction and the precondition becomes a
+	// no-op: a replica sitting at Match=10 against a leader committed
+	// through 100 would be promoted, joining the voter quorum before
+	// it has caught up and potentially stalling writes or cutting
+	// fault tolerance immediately. Compare Match against the target,
+	// then pass the TARGET.
+	//
+	// It is nil on a follower and non-nil (possibly empty) on a
+	// leader, so PerPeer == nil distinguishes "not the leader" from
+	// "leader with no remote replicas".
 	PerPeer map[uint64]PeerProgress
 }
 
@@ -137,8 +150,9 @@ type Status struct {
 // leader's tracker.
 type PeerProgress struct {
 	// Match is the highest log index known to be replicated to this
-	// peer. This is the value PromoteLearner's min_applied_index is
-	// compared against.
+	// peer. PromoteLearner compares it against the min_applied_index
+	// the caller supplies — which must be a catch-up TARGET, not this
+	// value; see PerPeer's note.
 	Match uint64
 	// Next is the next index the leader will send to this peer.
 	Next uint64

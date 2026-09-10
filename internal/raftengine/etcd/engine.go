@@ -3874,15 +3874,17 @@ func (e *Engine) peerProgress(state raftengine.State) map[uint64]raftengine.Peer
 	if state != raftengine.StateLeader {
 		return nil
 	}
-	var out map[uint64]raftengine.PeerProgress
+	// Allocated up front, not lazily inside the visitor: a
+	// single-node leader visits only itself, which is skipped, and a
+	// lazily-built map would leave a healthy peerless leader
+	// reporting nil — indistinguishable from a follower to any
+	// consumer testing PerPeer == nil.
+	out := make(map[uint64]raftengine.PeerProgress)
 	e.rawNode.WithProgress(func(id uint64, _ etcdraft.ProgressType, pr tracker.Progress) {
 		if id == e.nodeID {
 			// The leader's own entry tracks itself; operators care
 			// about remote replicas.
 			return
-		}
-		if out == nil {
-			out = make(map[uint64]raftengine.PeerProgress)
 		}
 		out[id] = raftengine.PeerProgress{
 			Match:        pr.Match,

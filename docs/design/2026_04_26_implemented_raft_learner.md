@@ -876,7 +876,12 @@ single-process 3-node demo cluster, attaches a learner via
   `Status.PerPeer` so an operator can choose `min_applied_index`
   without guessing. **Implemented** — `Status.PerPeer` reports each
   remote replica's `Match`/`Next`/`IsLearner`/`RecentActive` from the
-  leader's tracker, and is nil on a follower. Exposing it over the
+  leader's tracker, and is nil on a follower (non-nil, possibly empty,
+  on a leader). Operators watch `Match` climb to a target such as the
+  same snapshot's `CommitIndex` and pass the TARGET as
+  `min_applied_index`: passing the learner's own current `Match` would
+  satisfy the engine's `Match >= minAppliedIndex` check by
+  construction and promote a lagging replica. Exposing it over the
   RaftAdmin `Status` RPC needs a proto change and is a follow-up.
 - Decision gate for follower-served reads: write a separate proposal,
   do not extend this one.
