@@ -15,6 +15,22 @@
 (def ^:private transport-metrics-file "/var/log/elastickv-transport-metrics.prom")
 (def ^:private pid-file "/var/run/elastickv.pid")
 (def ^:private server-bin (str bin-dir "/elastickv"))
+
+;; §8.4 acceptance gate: the encrypted-cluster run reuses the EXISTING
+;; Redis and DynamoDB workloads rather than adding a new one —
+;; encryption is consistency-transparent (same input bytes, different
+;; output bytes, apply still deterministic), so what has to be built is
+;; the ability to stand the cluster up encrypted, not a new checker.
+(def ^:private kek-file (str data-dir "/kek.bin"))
+(def ^:private sidecar-file (str data-dir "/keys.json"))
+
+;; kek-bytes is the §5.1 KEK: exactly 32 raw bytes, owner-only mode.
+;; A fixed test value, not a generated one — every node in the cluster
+;; must unwrap the same sidecar, and a per-node random KEK would make
+;; the cluster refuse to start with ErrKEKMismatch, which is a far more
+;; confusing failure than a hardcoded test key.
+(def ^:private kek-test-bytes
+  (apply str (repeat 32 "k")))
 (def ^:private raftadmin-bin (str bin-dir "/raftadmin"))
 
 (def ^:private build-dir
@@ -62,6 +78,19 @@
         (c/upload (str build-dir "/" bin) (str bin-dir "/" bin))
         (c/exec :chmod "755" (str bin-dir "/" bin))))))
 
+(defn- provision-kek!
+  "Writes the §5.1 KEK file with owner-only permissions.
+
+  Runs before start-node! because --encryption-enabled refuses to start
+  without a readable KEK source, and the refusal happens during startup
+  guards — well before anything the workload could observe."
+  [node]
+  (c/on node
+    (c/su
+      (c/exec :mkdir :-p data-dir)
+      (c/exec :bash :-c (str "printf '%s' '" kek-test-bytes "' > " kek-file))
+      (c/exec :chmod "600" kek-file))))
+
 (defn- node-addr
   "Returns host:port for the node and port."
   [node port]
@@ -103,8 +132,41 @@
 (defn- build-raft-dynamo-map [nodes grpc-port dynamo-port raft-groups]
   (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
+(defn server-args
+  "Builds the elastickv server argv for one node.
+
+  Extracted from start-node! as a pure function so the flag set — and
+  in particular whether encryption is actually switched on — is
+  testable without SSH. A --encryption run that silently produced an
+  UNENCRYPTED cluster would report PASS and be recorded as evidence for
+  the §8.4 acceptance gate, which is worse than having no gate."
+  [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
+           raft-redis-map raft-dynamo-map raft-groups shard-ranges
+           encryption bootstrap?]}]
+  (cond-> ["--address" grpc
+           "--redisAddress" redis
+           "--raftId" (name node)
+           "--raftDataDir" data-dir
+           "--raftEngine" (or raft-engine "etcd")
+           "--raftRedisMap" raft-redis-map]
+    dynamo (conj "--dynamoAddress" dynamo
+                 "--raftDynamoMap" raft-dynamo-map)
+    s3 (conj "--s3Address" s3)
+    sqs (conj "--sqsAddress" sqs)
+    (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
+    (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
+    (seq shard-ranges) (conj "--shardRanges" shard-ranges)
+    ;; Sidecar path alone only enables read-only capability probing; the
+    ;; mutating RPCs the bootstrap needs also require
+    ;; --encryption-enabled AND a KEK source, so the three travel
+    ;; together or not at all.
+    encryption (conj "--encryptionSidecarPath" sidecar-file
+                     "--encryption-enabled"
+                     "--kekFile" kek-file)
+    bootstrap? (conj "--raftBootstrap")))
+
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env encryption]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -123,20 +185,12 @@
         raft-dynamo-map (when dynamo
                           (build-raft-dynamo-map (:nodes test) grpc-port dynamo-port raft-groups))
         bootstrap? (= node bootstrap-node)
-        args (cond-> ["--address" grpc
-                      "--redisAddress" redis
-                      "--raftId" (name node)
-                      "--raftDataDir" data-dir
-                      "--raftEngine" (or raft-engine "etcd")
-                      "--raftRedisMap" raft-redis-map]
-               dynamo (conj "--dynamoAddress" dynamo
-                            "--raftDynamoMap" raft-dynamo-map)
-               s3 (conj "--s3Address" s3)
-               sqs (conj "--sqsAddress" sqs)
-               (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
-               (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
-               (seq shard-ranges) (conj "--shardRanges" shard-ranges)
-               bootstrap? (conj "--raftBootstrap"))
+        args (server-args
+               {:node node :grpc grpc :redis redis :dynamo dynamo :s3 s3 :sqs sqs
+                :sqs-region sqs-region :data-dir data-dir :raft-engine raft-engine
+                :raft-redis-map raft-redis-map :raft-dynamo-map raft-dynamo-map
+                :raft-groups raft-groups :shard-ranges shard-ranges
+                :encryption encryption :bootstrap? bootstrap?})
         daemon-opts (cond-> {:chdir bin-dir
                              :logfile log-file
                              :pidfile pid-file
@@ -194,6 +248,8 @@
       (c/su
         (c/exec :mkdir :-p data-dir)
         (c/exec :rm :-f log-file transport-metrics-file)))
+    (when (:encryption opts)
+      (provision-kek! node))
     (start-node! test node (merge {:data-dir data-dir
                                    :grpc-port (or (:grpc-port opts) 50051)
                                    :redis-port (or (:redis-port opts) 6379)
