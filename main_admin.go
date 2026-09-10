@@ -763,9 +763,9 @@ func (b *dynamoTablesBridge) AdminGetItem(ctx context.Context, principal admin.A
 	return &admin.AdminItem{Attributes: adapterToAdminAttributeMap(item.Attributes)}, true, nil
 }
 
-func (b *dynamoTablesBridge) AdminPutItem(ctx context.Context, principal admin.AuthPrincipal, table string, item admin.AdminItem) error {
+func (b *dynamoTablesBridge) AdminPutItem(ctx context.Context, principal admin.AuthPrincipal, table string, key map[string]admin.AdminAttributeValue, item admin.AdminItem) error {
 	adapterItem := adapter.AdminItem{Attributes: adminToAdapterAttributeMap(item.Attributes)}
-	if err := b.server.AdminPutItem(ctx, convertAdminPrincipal(principal), table, adapterItem); err != nil {
+	if err := b.server.AdminPutItem(ctx, convertAdminPrincipal(principal), table, adminToAdapterAttributeMap(key), adapterItem); err != nil {
 		return translateAdminItemsError(err)
 	}
 	return nil

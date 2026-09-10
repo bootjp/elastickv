@@ -120,7 +120,7 @@ func itemMatchesKey(attrs, key map[string]AdminAttributeValue) bool {
 	return true
 }
 
-func (s *stubItemsSource) AdminPutItem(_ context.Context, principal AuthPrincipal, table string, item AdminItem) error {
+func (s *stubItemsSource) AdminPutItem(_ context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue, item AdminItem) error {
 	s.lastPutPrincipal = principal
 	if s.nextErr != nil {
 		err := s.nextErr

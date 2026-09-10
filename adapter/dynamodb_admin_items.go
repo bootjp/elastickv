@@ -312,7 +312,13 @@ func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal 
 //   - ErrAdminNotLeader        — follower
 //   - ErrAdminDynamoNotFound   — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
-func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrincipal, tableName string, item AdminItem) error {
+func (d *DynamoDBServer) AdminPutItem(
+	ctx context.Context,
+	principal AdminPrincipal,
+	tableName string,
+	pathKey map[string]AdminAttributeValue,
+	item AdminItem,
+) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -331,12 +337,61 @@ func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrinci
 	if err := validateAdminAttributeMapKinds(item.Attributes); err != nil {
 		return err
 	}
+	if err := d.assertPathKeyCoversPrimaryKey(ctx, tableName, pathKey); err != nil {
+		return err
+	}
 	in := putItemInput{
 		TableName: tableName,
 		Item:      adminToInternalAttributeMap(item.Attributes),
 	}
 	if _, err := d.putItemWithRetry(ctx, in); err != nil {
 		return translateDynamoAdminError(err)
+	}
+	return nil
+}
+
+// assertPathKeyCoversPrimaryKey rejects a PUT whose URL key does not
+// name every primary-key attribute the table's schema declares.
+//
+// The HTTP layer already checks that each attribute IT received in the
+// URL is present in the body with the same value, but it has no schema
+// access — so it cannot tell that a composite-key table's URL segment
+// carried only the hash key while the body supplied the range key. The
+// write would then land on a row the URL never fully identified, which
+// is the difference between "update the item this URL names" and
+// "create some other item".
+//
+// Only the adapter can make that judgement, which is why the URL key
+// is plumbed down here rather than validated above.
+func (d *DynamoDBServer) assertPathKeyCoversPrimaryKey(
+	ctx context.Context, tableName string, pathKey map[string]AdminAttributeValue,
+) error {
+	schema, exists, err := d.loadTableSchema(ctx, tableName)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if !exists {
+		return ErrAdminDynamoNotFound
+	}
+
+	required := []string{schema.PrimaryKey.HashKey}
+	if schema.PrimaryKey.RangeKey != "" {
+		required = append(required, schema.PrimaryKey.RangeKey)
+	}
+	for _, name := range required {
+		if _, ok := pathKey[name]; !ok {
+			return errors.Wrapf(ErrAdminDynamoValidation,
+				"path key is missing primary key attribute %q", name)
+		}
+	}
+	// Reject extras too: a URL key carrying an attribute the schema
+	// does not treat as part of the primary key means the caller and
+	// the table disagree about identity, and silently ignoring it
+	// would let the mismatch through.
+	if len(pathKey) != len(required) {
+		return errors.Wrapf(ErrAdminDynamoValidation,
+			"path key declares %d attributes but the primary key has %d",
+			len(pathKey), len(required))
 	}
 	return nil
 }

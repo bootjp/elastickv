@@ -247,7 +247,7 @@ func (h *DynamoHandler) handleItemPut(w http.ResponseWriter, r *http.Request, ta
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if err := h.source.AdminPutItem(r.Context(), principal, table, item); err != nil {
+	if err := h.source.AdminPutItem(r.Context(), principal, table, key, item); err != nil {
 		h.writeItemsError(w, r, "put", table, err)
 		return
 	}

@@ -79,7 +79,11 @@ type TablesSource interface {
 	// adapter package's Admin*Item methods.
 	AdminScanItems(ctx context.Context, principal AuthPrincipal, table string, opts AdminScanItemsOptions) (AdminScanItemsResult, error)
 	AdminGetItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) (*AdminItem, bool, error)
-	AdminPutItem(ctx context.Context, principal AuthPrincipal, table string, item AdminItem) error
+	// AdminPutItem receives the URL key alongside the body so the
+	// adapter — which has schema access the HTTP layer lacks — can
+	// verify the key names every primary-key attribute the table
+	// declares.
+	AdminPutItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue, item AdminItem) error
 	AdminDeleteItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) error
 }
 

@@ -37,6 +37,18 @@ func createTableForItemTests(t *testing.T, srv *DynamoDBServer, name string) {
 	require.NoError(t, err)
 }
 
+// putItemForTest derives the URL path key from the item's "id"
+// attribute, matching the single-hash-key schema
+// createTableForItemTests installs. AdminPutItem now takes the URL key
+// so it can verify the caller named every primary-key attribute.
+func putItemForTest(ctx context.Context, srv *DynamoDBServer, table string, item AdminItem) error {
+	key := map[string]AdminAttributeValue{}
+	if id, ok := item.Attributes["id"]; ok {
+		key["id"] = id
+	}
+	return srv.AdminPutItem(ctx, fullAdminPrincipal, table, key, item)
+}
+
 // TestDynamoDB_AdminPutItem_HappyPath pins the basic write contract:
 // PutItem followed by GetItem returns the stored attributes.
 func TestDynamoDB_AdminPutItem_HappyPath(t *testing.T) {
@@ -53,7 +65,7 @@ func TestDynamoDB_AdminPutItem_HappyPath(t *testing.T) {
 		"active": boolAttr(true),
 		"age":    numberAttr(42),
 	}}
-	require.NoError(t, srv.AdminPutItem(ctx, fullAdminPrincipal, "puttable", item))
+	require.NoError(t, putItemForTest(ctx, srv, "puttable", item))
 
 	got, exists, err := srv.AdminGetItem(ctx, fullAdminPrincipal, "puttable", map[string]AdminAttributeValue{"id": stringAttr("alpha")})
 	require.NoError(t, err)
@@ -101,7 +113,7 @@ func TestDynamoDB_AdminDeleteItem_HappyPath(t *testing.T) {
 	createTableForItemTests(t, srv, "deltable")
 
 	key := map[string]AdminAttributeValue{"id": stringAttr("k1")}
-	require.NoError(t, srv.AdminPutItem(ctx, fullAdminPrincipal, "deltable", AdminItem{Attributes: key}))
+	require.NoError(t, putItemForTest(ctx, srv, "deltable", AdminItem{Attributes: key}))
 	require.NoError(t, srv.AdminDeleteItem(ctx, fullAdminPrincipal, "deltable", key))
 
 	_, exists, err := srv.AdminGetItem(ctx, fullAdminPrincipal, "deltable", key)
@@ -121,8 +133,7 @@ func TestDynamoDB_AdminScanTable_HappyPath(t *testing.T) {
 	createTableForItemTests(t, srv, "scantable")
 
 	for _, id := range []string{"a", "b", "c"} {
-		require.NoError(t, srv.AdminPutItem(ctx, fullAdminPrincipal, "scantable",
-			AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr(id)}}))
+		require.NoError(t, putItemForTest(ctx, srv, "scantable", AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr(id)}}))
 	}
 
 	res, err := srv.AdminScanTable(ctx, fullAdminPrincipal, "scantable", AdminScanOptions{})
@@ -149,8 +160,7 @@ func TestDynamoDB_AdminScanTable_LimitClamping(t *testing.T) {
 	createTableForItemTests(t, srv, "limittable")
 
 	for i := range 5 {
-		require.NoError(t, srv.AdminPutItem(ctx, fullAdminPrincipal, "limittable",
-			AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("row-" + strconv.Itoa(i))}}))
+		require.NoError(t, putItemForTest(ctx, srv, "limittable", AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("row-" + strconv.Itoa(i))}}))
 	}
 
 	// Limit=2 — under the cap, exact match.
@@ -178,8 +188,7 @@ func TestDynamoDB_AdminScanTable_CursorRoundTrip(t *testing.T) {
 
 	const sent = 7
 	for i := range sent {
-		require.NoError(t, srv.AdminPutItem(ctx, fullAdminPrincipal, "cursortable",
-			AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("k" + strconv.Itoa(i))}}))
+		require.NoError(t, putItemForTest(ctx, srv, "cursortable", AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("k" + strconv.Itoa(i))}}))
 	}
 
 	pageA, err := srv.AdminScanTable(ctx, fullAdminPrincipal, "cursortable", AdminScanOptions{Limit: 3})
@@ -208,7 +217,7 @@ func TestDynamoDB_AdminPutItem_ReadOnlyForbidden(t *testing.T) {
 	srv := nodes[0].dynamoServer
 	createTableForItemTests(t, srv, "rotable")
 
-	err := srv.AdminPutItem(context.Background(), readOnlyAdminPrincipal, "rotable",
+	err := srv.AdminPutItem(context.Background(), readOnlyAdminPrincipal, "rotable", nil,
 		AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("x")}})
 	require.True(t, errors.Is(err, ErrAdminForbidden))
 }
@@ -247,7 +256,7 @@ func TestDynamoDB_AdminPutItem_EmptyTableName(t *testing.T) {
 	defer shutdown(nodes)
 	srv := nodes[0].dynamoServer
 
-	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "  ",
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "  ", nil,
 		AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("x")}})
 	require.True(t, errors.Is(err, ErrAdminDynamoValidation))
 }
@@ -307,7 +316,7 @@ func TestDynamoDB_AdminPutItem_MissingTable(t *testing.T) {
 	defer shutdown(nodes)
 	srv := nodes[0].dynamoServer
 
-	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "ghost",
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "ghost", nil,
 		AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("x")}})
 	require.True(t, errors.Is(err, ErrAdminDynamoNotFound),
 		"want ErrAdminDynamoNotFound; got %v", err)
@@ -386,7 +395,7 @@ func TestDynamoDB_AdminPutItem_RejectsDeepNesting(t *testing.T) {
 	for range maxAttributeValueNestingDepth {
 		cur = AdminAttributeValue{L: []AdminAttributeValue{cur}}
 	}
-	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "deep",
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "deep", nil,
 		AdminItem{Attributes: map[string]AdminAttributeValue{
 			"id":   stringAttr("k"),
 			"deep": cur,
@@ -540,7 +549,7 @@ func TestDynamoDB_AdminPutItem_RejectsZeroFieldAttribute(t *testing.T) {
 	srv := nodes[0].dynamoServer
 	createTableForItemTests(t, srv, "zerokind")
 
-	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "zerokind",
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "zerokind", nil,
 		AdminItem{Attributes: map[string]AdminAttributeValue{
 			"id":    stringAttr("k"),
 			"empty": {}, // no kind field set
@@ -560,7 +569,7 @@ func TestDynamoDB_AdminPutItem_RejectsMultiFieldAttribute(t *testing.T) {
 
 	s := "x"
 	n := "1"
-	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "multikind",
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "multikind", nil,
 		AdminItem{Attributes: map[string]AdminAttributeValue{
 			"id":  stringAttr("k"),
 			"bad": {S: &s, N: &n},
@@ -582,7 +591,7 @@ func TestDynamoDB_AdminPutItem_RejectsNullFalse(t *testing.T) {
 	createTableForItemTests(t, srv, "nullfalse")
 
 	falseVal := false
-	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "nullfalse",
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "nullfalse", nil,
 		AdminItem{Attributes: map[string]AdminAttributeValue{
 			"id":  stringAttr("k"),
 			"bad": {NULL: &falseVal},
@@ -593,9 +602,89 @@ func TestDynamoDB_AdminPutItem_RejectsNullFalse(t *testing.T) {
 	// Sanity: NULL=true is valid and round-trips.
 	trueVal := true
 	err = srv.AdminPutItem(context.Background(), fullAdminPrincipal, "nullfalse",
+		map[string]AdminAttributeValue{"id": stringAttr("k")},
 		AdminItem{Attributes: map[string]AdminAttributeValue{
 			"id":   stringAttr("k"),
 			"good": {NULL: &trueVal},
 		}})
 	require.NoError(t, err, "NULL=true must be accepted")
+}
+
+// TestDynamoDB_AdminPutItem_RejectsPathKeyThatMissesThePrimaryKey
+// closes the gap the data-browser design tracked separately: the HTTP
+// layer verifies that each attribute IT received in the URL matches
+// the body, but has no schema access, so it cannot tell that the URL
+// named only part of a composite primary key. The write would then
+// land on a row the URL never fully identified.
+func TestDynamoDB_AdminPutItem_RejectsPathKeyThatMissesThePrimaryKey(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	ctx := context.Background()
+
+	_, err := srv.AdminCreateTable(ctx, fullAdminPrincipal, AdminCreateTableInput{
+		TableName:    "composite",
+		PartitionKey: AdminAttribute{Name: "pk", Type: "S"},
+		SortKey:      &AdminAttribute{Name: "sk", Type: "S"},
+	})
+	require.NoError(t, err)
+
+	item := AdminItem{Attributes: map[string]AdminAttributeValue{
+		"pk":   stringAttr("tenant-1"),
+		"sk":   stringAttr("order-9"),
+		"note": stringAttr("hello"),
+	}}
+
+	// URL named only the hash key: the body's sk decides which row is
+	// written, which is not the row the URL identifies.
+	err = srv.AdminPutItem(ctx, fullAdminPrincipal, "composite",
+		map[string]AdminAttributeValue{"pk": stringAttr("tenant-1")}, item)
+	require.ErrorIs(t, err, ErrAdminDynamoValidation)
+
+	// The full key is accepted.
+	require.NoError(t, srv.AdminPutItem(ctx, fullAdminPrincipal, "composite",
+		map[string]AdminAttributeValue{
+			"pk": stringAttr("tenant-1"),
+			"sk": stringAttr("order-9"),
+		}, item))
+}
+
+// TestDynamoDB_AdminPutItem_RejectsPathKeyWithExtraAttributes covers
+// the other direction: a URL key carrying an attribute the schema does
+// not treat as part of the primary key means the caller and the table
+// disagree about identity.
+func TestDynamoDB_AdminPutItem_RejectsPathKeyWithExtraAttributes(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	ctx := context.Background()
+	createTableForItemTests(t, srv, "extrakey")
+
+	item := AdminItem{Attributes: map[string]AdminAttributeValue{
+		"id":   stringAttr("a"),
+		"name": stringAttr("Alice"),
+	}}
+	err := srv.AdminPutItem(ctx, fullAdminPrincipal, "extrakey",
+		map[string]AdminAttributeValue{
+			"id":   stringAttr("a"),
+			"name": stringAttr("Alice"), // not part of the primary key
+		}, item)
+	require.ErrorIs(t, err, ErrAdminDynamoValidation)
+}
+
+// TestDynamoDB_AdminPutItem_ReportsMissingTable pins that the schema
+// lookup the key check performs surfaces an absent table as not-found
+// rather than as a validation error.
+func TestDynamoDB_AdminPutItem_ReportsMissingTable(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "no-such-table",
+		map[string]AdminAttributeValue{"id": stringAttr("a")},
+		AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("a")}})
+	require.ErrorIs(t, err, ErrAdminDynamoNotFound)
 }
