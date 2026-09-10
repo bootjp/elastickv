@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/hex"
+	"time"
 )
 
 // Reference counting and GC eligibility for content-addressed
@@ -11,8 +12,16 @@ import (
 //
 // Two keyspaces, both Raft-replicated:
 //
-//	!s3|chunkref-rc|<sha-hex>                    -> uint64 reference count
+//	!s3|chunkref-rc|<sha-hex>                    -> ChunkRefRC
 //	!s3|chunkblob-gc-queue|<commitTS>|<sha-hex>  -> empty
+//
+// Every timestamp here is an elastickv HLC commit timestamp —
+// (UnixMilli << HLCLogicalBits) | logical — NOT Unix nanoseconds. The
+// queue key is built from the commitTS of the txn that drove the
+// reference count to zero, so the sweeper's grace boundary has to be
+// expressed in the same domain. Mixing the two silently produces a
+// boundary off by roughly six orders of magnitude, which would either
+// sweep everything immediately or never sweep at all.
 //
 // The queue key carries the commit timestamp in its NAME rather than
 // its value, and that is the whole point: a counter sitting at zero
@@ -24,6 +33,13 @@ import (
 const (
 	ChunkRefRCPrefix       = "!s3|chunkref-rc|"
 	ChunkBlobGCQueuePrefix = "!s3|chunkblob-gc-queue|"
+
+	// hlcLogicalBits mirrors kv.HLCLogicalBits. It is duplicated
+	// rather than imported because internal/s3keys cannot import kv
+	// without a cycle (kv -> distribution -> s3keys). The external
+	// test asserts the two stay equal, so the duplication cannot
+	// drift silently.
+	hlcLogicalBits = 16
 
 	// chunkRefRCValueBytes is the fixed width of an encoded
 	// ChunkRefRC: the count followed by the queue timestamp.
@@ -61,7 +77,7 @@ func ParseChunkRefRCKey(key []byte) ([chunkBlobSHA256Bytes]byte, bool) {
 
 // ChunkRefRC is the reference-count record for one content hash.
 //
-// QueuedAtNanos carries the timestamp of this SHA's GC-queue entry, or
+// QueuedAtTS carries the timestamp of this SHA's GC-queue entry, or
 // zero when it has none. It is part of the VALUE because §3.5 requires
 // a txn that re-references a SHA to delete the queue entry atomically
 // with incrementing the count — and the queue key embeds the
@@ -70,18 +86,18 @@ func ParseChunkRefRCKey(key []byte) ([chunkBlobSHA256Bytes]byte, bool) {
 // delete, leaving a stale entry that points the sweeper at a blob
 // which is once again live.
 type ChunkRefRC struct {
-	Count         uint64
-	QueuedAtNanos uint64
+	Count      uint64
+	QueuedAtTS uint64
 }
 
 // Queued reports whether this SHA currently has a GC-queue entry.
-func (r ChunkRefRC) Queued() bool { return r.QueuedAtNanos != 0 }
+func (r ChunkRefRC) Queued() bool { return r.QueuedAtTS != 0 }
 
 // EncodeChunkRefRC encodes a reference-count record.
 func EncodeChunkRefRC(rc ChunkRefRC) []byte {
 	out := make([]byte, 0, chunkRefRCValueBytes)
 	out = binary.BigEndian.AppendUint64(out, rc.Count)
-	return binary.BigEndian.AppendUint64(out, rc.QueuedAtNanos)
+	return binary.BigEndian.AppendUint64(out, rc.QueuedAtTS)
 }
 
 // DecodeChunkRefRC decodes a reference-count record. A missing key and
@@ -94,22 +110,27 @@ func DecodeChunkRefRC(value []byte) (ChunkRefRC, bool) {
 		return ChunkRefRC{}, false
 	}
 	return ChunkRefRC{
-		Count:         binary.BigEndian.Uint64(value[:u64Bytes]),
-		QueuedAtNanos: binary.BigEndian.Uint64(value[u64Bytes:]),
+		Count:      binary.BigEndian.Uint64(value[:u64Bytes]),
+		QueuedAtTS: binary.BigEndian.Uint64(value[u64Bytes:]),
 	}, true
 }
 
 // ChunkBlobGCQueueKey builds the eligibility-queue key for a content
-// hash that became unreferenced at commitTSNanos.
+// hash that became unreferenced at commitTS.
 //
 // The timestamp is fixed-width big-endian so the queue sorts by
 // eligibility time; a decimal or variable-width encoding would order
 // 9 after 10 and silently break the grace-boundary scan.
-func ChunkBlobGCQueueKey(commitTSNanos uint64, contentSHA256 [chunkBlobSHA256Bytes]byte) []byte {
+// A zero commitTS is rejected by the caller contract: ChunkRefRC uses
+// zero as its "no queue entry" sentinel, so a record genuinely queued
+// at timestamp zero would report Queued() == false and its entry would
+// become unreachable. A real HLC commit timestamp is never zero — the
+// physical half is Unix milliseconds — so this costs nothing.
+func ChunkBlobGCQueueKey(commitTS uint64, contentSHA256 [chunkBlobSHA256Bytes]byte) []byte {
 	out := make([]byte, 0,
 		len(ChunkBlobGCQueuePrefix)+u64Bytes+1+chunkBlobSHA256HexBytes)
 	out = append(out, chunkBlobGCQueuePrefixBytes...)
-	out = binary.BigEndian.AppendUint64(out, commitTSNanos)
+	out = binary.BigEndian.AppendUint64(out, commitTS)
 	out = append(out, chunkBlobGCQueueSeparator)
 	return hex.AppendEncode(out, contentSHA256[:])
 }
@@ -128,12 +149,12 @@ func ParseChunkBlobGCQueueKey(key []byte) (uint64, [chunkBlobSHA256Bytes]byte, b
 	if rest[u64Bytes] != chunkBlobGCQueueSeparator {
 		return 0, sha, false
 	}
-	commitTSNanos := binary.BigEndian.Uint64(rest[:u64Bytes])
+	commitTS := binary.BigEndian.Uint64(rest[:u64Bytes])
 	sha, ok := decodeSHAHex(rest[u64Bytes+1:], sha)
 	if !ok {
 		return 0, sha, false
 	}
-	return commitTSNanos, sha, true
+	return commitTS, sha, true
 }
 
 // ChunkBlobGCQueueScanStart is the inclusive lower bound for a sweeper
@@ -144,16 +165,20 @@ func ChunkBlobGCQueueScanStart() []byte {
 
 // ChunkBlobGCQueueScanEnd is the EXCLUSIVE upper bound for a sweeper
 // scan covering everything that became eligible strictly before
-// boundaryNanos.
+// boundaryTS.
 //
-// Exclusivity matters: passing `now` would sweep a blob that became
-// eligible this instant, skipping the grace window entirely. Callers
-// pass `now - gracePeriod`, and an entry stamped exactly at the
-// boundary is excluded — it has not yet served the full grace.
-func ChunkBlobGCQueueScanEnd(boundaryNanos uint64) []byte {
+// boundaryTS is an HLC commit timestamp, not a Unix nanosecond count.
+// Build it with ChunkBlobGCGraceBoundary rather than from
+// time.Now().UnixNano(), which is a different domain entirely.
+//
+// Exclusivity matters: passing the current timestamp would sweep a
+// blob that became eligible this instant, skipping the grace window
+// entirely. An entry stamped exactly at the boundary is excluded — it
+// has not yet served the full grace.
+func ChunkBlobGCQueueScanEnd(boundaryTS uint64) []byte {
 	out := make([]byte, 0, len(ChunkBlobGCQueuePrefix)+u64Bytes)
 	out = append(out, chunkBlobGCQueuePrefixBytes...)
-	return binary.BigEndian.AppendUint64(out, boundaryNanos)
+	return binary.BigEndian.AppendUint64(out, boundaryTS)
 }
 
 // decodeSHAHex decodes a lowercase hex SHA-256 of the exact expected
@@ -167,4 +192,29 @@ func decodeSHAHex(encoded []byte, sha [chunkBlobSHA256Bytes]byte) ([chunkBlobSHA
 		return sha, false
 	}
 	return sha, true
+}
+
+// ChunkBlobGCGraceBoundary converts a wall-clock grace period into the
+// HLC boundary timestamp a sweeper passes to ChunkBlobGCQueueScanEnd.
+//
+// It exists so callers never have to open-code the HLC layout, which
+// is where the domain confusion would creep in: the queue keys carry
+// HLC commit timestamps, so subtracting a duration means subtracting
+// milliseconds from the PHYSICAL half, not nanoseconds from the whole
+// value.
+//
+// A grace period that reaches back past the epoch clamps to zero
+// rather than wrapping, so an absurd configuration sweeps nothing
+// instead of sweeping everything.
+func ChunkBlobGCGraceBoundary(nowTS uint64, grace time.Duration) uint64 {
+	physicalMs := nowTS >> hlcLogicalBits
+	graceMs := uint64(0)
+	if ms := grace.Milliseconds(); ms > 0 {
+		// Guarded above zero, so the conversion cannot go negative.
+		graceMs = uint64(ms)
+	}
+	if graceMs >= physicalMs {
+		return 0
+	}
+	return (physicalMs - graceMs) << hlcLogicalBits
 }

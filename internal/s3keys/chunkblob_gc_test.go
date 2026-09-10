@@ -7,8 +7,10 @@ import (
 	"math"
 	"sort"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -86,7 +88,7 @@ func TestChunkRefRCCarriesTheQueueTimestamp(t *testing.T) {
 	const queuedAt = uint64(1_700_000_000_000_000_000)
 
 	// Count dropped to zero: the txn records when, and queues.
-	zeroed := s3keys.ChunkRefRC{Count: 0, QueuedAtNanos: queuedAt}
+	zeroed := s3keys.ChunkRefRC{Count: 0, QueuedAtTS: queuedAt}
 	decoded, ok := s3keys.DecodeChunkRefRC(s3keys.EncodeChunkRefRC(zeroed))
 	require.True(t, ok)
 	require.Zero(t, decoded.Count)
@@ -96,7 +98,7 @@ func TestChunkRefRCCarriesTheQueueTimestamp(t *testing.T) {
 	// has to delete.
 	require.Equal(t,
 		s3keys.ChunkBlobGCQueueKey(queuedAt, sha),
-		s3keys.ChunkBlobGCQueueKey(decoded.QueuedAtNanos, sha),
+		s3keys.ChunkBlobGCQueueKey(decoded.QueuedAtTS, sha),
 		"the recorded timestamp must reproduce the queue key exactly")
 
 	// Re-referenced: count back above zero, no queue entry.
@@ -129,7 +131,7 @@ func TestChunkBlobGCQueueKeyRoundTrip(t *testing.T) {
 func TestChunkBlobGCQueueSortsByEligibilityTime(t *testing.T) {
 	t.Parallel()
 
-	timestamps := []uint64{0, 1, 9, 10, 99, 100, 1 << 32, math.MaxUint64 - 1, math.MaxUint64}
+	timestamps := []uint64{1, 9, 10, 99, 100, 1 << 32, math.MaxUint64 - 1, math.MaxUint64}
 	keys := make([][]byte, 0, len(timestamps))
 	for i, ts := range timestamps {
 		keys = append(keys, s3keys.ChunkBlobGCQueueKey(ts, testSHA(fmt.Sprintf("blob-%d", i))))
@@ -170,15 +172,67 @@ func TestChunkBlobGCQueueScanEndIsExclusive(t *testing.T) {
 }
 
 // TestChunkBlobGCQueueScanStartCoversTheWholeQueue guards the lower
-// bound: a blob that became eligible at timestamp zero must still be
-// swept rather than sorting below the scan.
+// bound: the earliest possible entry must sort at or after the scan
+// start rather than below it.
 func TestChunkBlobGCQueueScanStartCoversTheWholeQueue(t *testing.T) {
 	t.Parallel()
 
 	start := s3keys.ChunkBlobGCQueueScanStart()
-	earliest := s3keys.ChunkBlobGCQueueKey(0, testSHA("earliest"))
+	earliest := s3keys.ChunkBlobGCQueueKey(1, testSHA("earliest"))
 	require.LessOrEqual(t, bytes.Compare(start, earliest), 0)
-	require.Negative(t, bytes.Compare(earliest, s3keys.ChunkBlobGCQueueScanEnd(1)))
+	require.Negative(t, bytes.Compare(earliest, s3keys.ChunkBlobGCQueueScanEnd(2)))
+}
+
+// TestHLCLogicalBitsMatchesKV pins the duplicated constant.
+// internal/s3keys cannot import kv (kv -> distribution -> s3keys), so
+// the shift width is mirrored locally; this external test closes the
+// loop so the two cannot drift apart silently and leave the grace
+// boundary computing against the wrong field width.
+func TestHLCLogicalBitsMatchesKV(t *testing.T) {
+	t.Parallel()
+
+	// Derived rather than read directly: a commit timestamp whose
+	// physical half is 1 ms must shift down to exactly 1.
+	oneMs := uint64(1) << kv.HLCLogicalBits
+	require.Equal(t, uint64(1),
+		s3keys.ChunkBlobGCGraceBoundary(oneMs, 0)>>kv.HLCLogicalBits,
+		"s3keys' mirrored HLC logical width must match kv.HLCLogicalBits")
+}
+
+// TestChunkBlobGCGraceBoundaryWorksInTheHLCDomain pins that the grace
+// boundary is computed against HLC commit timestamps, not Unix
+// nanoseconds. Subtracting a duration means subtracting milliseconds
+// from the PHYSICAL half; treating the whole value as nanoseconds
+// would be off by orders of magnitude and either sweep everything
+// immediately or never sweep at all.
+func TestChunkBlobGCGraceBoundaryWorksInTheHLCDomain(t *testing.T) {
+	t.Parallel()
+
+	nowMs := uint64(1_700_000_000_000)
+	nowTS := nowMs << kv.HLCLogicalBits
+
+	boundary := s3keys.ChunkBlobGCGraceBoundary(nowTS, time.Hour)
+	require.Equal(t, (nowMs-3_600_000)<<kv.HLCLogicalBits, boundary)
+
+	// An entry committed before the boundary falls inside the scan;
+	// one committed after it does not.
+	sha := testSHA("payload")
+	inside := s3keys.ChunkBlobGCQueueKey(boundary-1, sha)
+	outside := s3keys.ChunkBlobGCQueueKey(nowTS, sha)
+	end := s3keys.ChunkBlobGCQueueScanEnd(boundary)
+	require.Negative(t, bytes.Compare(inside, end))
+	require.Positive(t, bytes.Compare(outside, end))
+}
+
+// TestChunkBlobGCGraceBoundaryClampsAtTheEpoch pins that an absurd
+// grace period sweeps NOTHING rather than wrapping around to sweep
+// everything.
+func TestChunkBlobGCGraceBoundaryClampsAtTheEpoch(t *testing.T) {
+	t.Parallel()
+
+	nowTS := uint64(1_000) << kv.HLCLogicalBits
+	require.Zero(t, s3keys.ChunkBlobGCGraceBoundary(nowTS, 999*time.Hour))
+	require.Zero(t, s3keys.ChunkBlobGCGraceBoundary(0, time.Hour))
 }
 
 func TestParseChunkBlobGCQueueKeyRejectsMalformed(t *testing.T) {
