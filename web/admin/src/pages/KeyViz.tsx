@@ -534,7 +534,20 @@ interface RowDetailProps {
   index: number;
 }
 
+// subRangeLabel renders "sub-range i/K" for a sub-divided route, or
+// null when the route is not sub-divided.
+//
+// It keys off sub_bucket_count rather than sub_bucket because bucket
+// zero of a sub-divided route has index 0, which omitempty strips from
+// the JSON — testing the index would hide exactly the first sub-range.
+export function subRangeLabel(row: KeyVizRow): string | null {
+  const count = row.sub_bucket_count ?? 0;
+  if (count <= 1) return null;
+  return `sub-range ${(row.sub_bucket ?? 0) + 1}/${count}`;
+}
+
 function RowDetail({ row, index }: RowDetailProps) {
+  const subRange = subRangeLabel(row);
   const total = row.values.reduce((a, b) => a + b, 0);
   return (
     <div className="card text-sm">
@@ -542,6 +555,14 @@ function RowDetail({ row, index }: RowDetailProps) {
         <span className="text-xs text-muted">Row {index}</span>
         <span className="font-mono">{row.bucket_id}</span>
         {row.aggregate && <span className="pill-muted text-xs">aggregate</span>}
+        {subRange && (
+          <span
+            className="pill-muted text-xs"
+            title="This route is split into order-preserving sub-ranges by --keyvizKeyBucketsPerRoute. Start/End below are the narrowed bounds of this sub-range, not the whole route."
+          >
+            {subRange}
+          </span>
+        )}
         {row.conflict && (
           <span
             className="pill-muted text-xs"
@@ -552,9 +573,9 @@ function RowDetail({ row, index }: RowDetailProps) {
         )}
       </div>
       <dl className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
-        <dt className="text-muted">Start</dt>
+        <dt className="text-muted">{subRange ? "Sub-range start" : "Start"}</dt>
         <dd className="font-mono break-all">{decodePreview(row.start)}</dd>
-        <dt className="text-muted">End</dt>
+        <dt className="text-muted">{subRange ? "Sub-range end" : "End"}</dt>
         <dd className="font-mono break-all">{decodePreview(row.end)}</dd>
         <dt className="text-muted">Routes</dt>
         <dd className="font-mono">
