@@ -125,28 +125,50 @@ func NewChunkBlobSweeper(opts ChunkBlobSweeperOptions) (*ChunkBlobSweeper, error
 	case opts.NowTS == nil:
 		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "chunkblob sweeper requires an HLC clock")
 	}
-	s := &ChunkBlobSweeper{
+	timing := resolveGCLoopTiming(
+		opts.GracePeriod, opts.Interval,
+		DefaultChunkBlobGCGracePeriod, DefaultChunkBlobGCInterval, opts.Logger)
+	observer := opts.Observer
+	if observer == nil {
+		observer = nopSweepObserver{}
+	}
+	return &ChunkBlobSweeper{
 		store:    opts.Store,
 		local:    opts.Local,
-		grace:    opts.GracePeriod,
-		interval: opts.Interval,
+		grace:    timing.grace,
+		interval: timing.interval,
 		nowTS:    opts.NowTS,
-		observer: opts.Observer,
-		logger:   opts.Logger,
+		observer: observer,
+		logger:   timing.logger,
+	}, nil
+}
+
+// gcLoopTiming is the cadence/logging configuration both GC loops
+// share. Factored out because the sweeper and the orphan scanner
+// only in their defaults, and duplicating the resolution invites the
+// two from drifting apart.
+type gcLoopTiming struct {
+	grace    time.Duration
+	interval time.Duration
+	logger   *slog.Logger
+}
+
+// resolveGCLoopTiming applies the caller's values, falling back to the
+// supplied defaults for anything non-positive.
+func resolveGCLoopTiming(
+	grace, interval, defaultGrace, defaultInterval time.Duration, logger *slog.Logger,
+) gcLoopTiming {
+	out := gcLoopTiming{grace: grace, interval: interval, logger: logger}
+	if out.grace <= 0 {
+		out.grace = defaultGrace
 	}
-	if s.grace <= 0 {
-		s.grace = DefaultChunkBlobGCGracePeriod
+	if out.interval <= 0 {
+		out.interval = defaultInterval
 	}
-	if s.interval <= 0 {
-		s.interval = DefaultChunkBlobGCInterval
+	if out.logger == nil {
+		out.logger = slog.Default()
 	}
-	if s.observer == nil {
-		s.observer = nopSweepObserver{}
-	}
-	if s.logger == nil {
-		s.logger = slog.Default()
-	}
-	return s, nil
+	return out
 }
 
 // Run sweeps on the configured interval until ctx is cancelled.
