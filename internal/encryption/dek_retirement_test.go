@@ -19,11 +19,11 @@ func readyStorage(node string, minRetained uint64) encryption.StorageRetirementR
 	}
 }
 
-func readyRaft(node string, compact, cutover uint64) encryption.RaftRetirementReport {
+func readyRaft(node string, compact, snapshot uint64) encryption.RaftRetirementReport {
 	return encryption.RaftRetirementReport{
-		NodeID:               node,
-		LogCompactIndex:      compact,
-		SnapshotCutoverIndex: cutover,
+		NodeID:          node,
+		LogCompactIndex: compact,
+		SnapshotIndex:   snapshot,
 	}
 }
 
@@ -239,4 +239,98 @@ func TestRetirementBlockersNameEveryOffendingNode(t *testing.T) {
 	joined := d.Blockers[0] + d.Blockers[1]
 	require.Contains(t, joined, "n1")
 	require.Contains(t, joined, "n3")
+}
+
+// TestRaftRetirementStaysReachableAcrossSuccessiveRotations is the
+// regression test for the criterion's signal.
+//
+// §5.4's parenthetical says the snapshot check should read the FSM
+// snapshot header's raft_envelope_cutover_index. That value is the
+// one-shot Phase-2 enablement index: applier.go preserves the original
+// across every later rotation and kv/fsm.go copies the unchanged value
+// into each new snapshot header, so it stays frozen at the enablement
+// index forever. Sourcing the criterion from it makes every
+// post-cutover rotation permanently ineligible — no raft DEK could ever
+// be retired, which defeats the whole classifier.
+//
+// SnapshotIndex is the snapshot's own Raft index, so it advances with
+// every snapshot install and the criterion is reachable.
+func TestRaftRetirementStaysReachableAcrossSuccessiveRotations(t *testing.T) {
+	t.Parallel()
+
+	// Phase-2 was enabled at index 50 and never moves again.
+	const frozenCutoverIndex = uint64(50)
+
+	// Two rotations have happened since.
+	for _, rotationIndex := range []uint64{400, 900} {
+		require.Less(t, frozenCutoverIndex, rotationIndex,
+			"the frozen cutover index cannot reach rotation %d, so a criterion "+
+				"sourced from it is unsatisfiable by construction", rotationIndex)
+
+		// A snapshot taken after the rotation satisfies the criterion.
+		snapshotIndex := rotationIndex + 10
+		d, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
+			[]encryption.RaftRetirementReport{
+				readyRaft("n1", rotationIndex+1, snapshotIndex),
+				readyRaft("n2", rotationIndex+1, snapshotIndex),
+				readyRaft("n3", rotationIndex+1, snapshotIndex),
+			}, rotationIndex-1, rotationIndex)
+		require.NoError(t, err)
+		require.True(t, d.Eligible,
+			"rotation %d must become retirable once every node has snapshotted past it; blockers: %v",
+			rotationIndex, d.Blockers)
+
+		// Boundary: a snapshot exactly at the rotation index is enough,
+		// because a restore from it replays only later entries.
+		d, err = encryption.ClassifyRaftDEKRetirement(retireMembers,
+			[]encryption.RaftRetirementReport{
+				readyRaft("n1", rotationIndex+1, rotationIndex),
+				readyRaft("n2", rotationIndex+1, rotationIndex),
+				readyRaft("n3", rotationIndex+1, rotationIndex),
+			}, rotationIndex-1, rotationIndex)
+		require.NoError(t, err)
+		require.True(t, d.Eligible, "blockers: %v", d.Blockers)
+	}
+}
+
+// TestRetirementRefusesDuplicateNodeReports pins the fail-closed
+// handling of an ambiguous report set.
+//
+// Collapsing reports into a map is last-write-wins, so a node that
+// reported a blocker and then reported ready would be recorded as ready
+// while coverage still looked complete — eligibility would depend on
+// the order the reports arrived. Both classifiers must refuse instead.
+func TestRetirementRefusesDuplicateNodeReports(t *testing.T) {
+	t.Parallel()
+
+	t.Run("storage: a blocker followed by a ready report", func(t *testing.T) {
+		t.Parallel()
+
+		blocked := readyStorage("n2", 200)
+		blocked.ValuesPerDEK = 7
+
+		_, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+			[]encryption.StorageRetirementReport{
+				readyStorage("n1", 200),
+				blocked,
+				readyStorage("n2", 200), // duplicate: would win and hide the blocker
+				readyStorage("n3", 200),
+			}, 100)
+		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+	})
+
+	t.Run("raft: a blocker followed by a ready report", func(t *testing.T) {
+		t.Parallel()
+
+		blocked := readyRaft("n2", 1, 1000)
+
+		_, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
+			[]encryption.RaftRetirementReport{
+				readyRaft("n1", 500, 1000),
+				blocked,
+				readyRaft("n2", 500, 1000), // duplicate: would win and hide the blocker
+				readyRaft("n3", 500, 1000),
+			}, 100, 900)
+		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+	})
 }

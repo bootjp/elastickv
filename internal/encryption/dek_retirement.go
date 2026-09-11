@@ -70,11 +70,30 @@ type RaftRetirementReport struct {
 	// etcd_raft_log_compact_index. It must be STRICTLY greater than
 	// the largest index ever proposed under the retiring DEK.
 	LogCompactIndex uint64
-	// SnapshotCutoverIndex is the raft_envelope_cutover_index carried
-	// by this node's last committed FSM snapshot header. A node
-	// restored from an older snapshot would replay entries that still
-	// need the retiring DEK.
-	SnapshotCutoverIndex uint64
+	// SnapshotIndex is the Raft index of this node's last committed
+	// snapshot (raftpb.SnapshotMetadata.Index). It must be at least the
+	// rotation index: restoring from a snapshot taken BEFORE the
+	// rotation replays the entries between the snapshot and the
+	// rotation, and those were proposed under the retiring DEK.
+	//
+	// NOT the sidecar's raft_envelope_cutover_index, which §5.4's
+	// parenthetical names. That value is the one-shot Phase-2
+	// enablement index: applier.go preserves the original across every
+	// later rotation, and kv/fsm.go copies the unchanged value into
+	// each new snapshot header. It can therefore never be "past the
+	// rotation entry" for any post-cutover rotation, so a criterion
+	// built on it classifies the retiring raft DEK ineligible forever
+	// and no raft DEK could ever be retired.
+	//
+	// The cutover index also does not mean what that criterion needs.
+	// Per §4.4 the FSM snapshot stream "is ciphertext by construction"
+	// from the storage layer and "no additional wrapping is required at
+	// the snapshot layer" — a snapshot is not encrypted under any raft
+	// DEK, so "taken under the new raft DEK" can only be about which
+	// entries a restore would replay. That is exactly what the
+	// snapshot's own index expresses, and it advances with every
+	// snapshot install.
+	SnapshotIndex uint64
 }
 
 // RetirementDecision is the classifier's answer.
@@ -117,9 +136,12 @@ func ClassifyStorageDEKRetirement(
 ) (RetirementDecision, error) {
 	byNode := make(map[string]StorageRetirementReport, len(reports))
 	for _, r := range reports {
+		if _, dup := byNode[r.NodeID]; dup {
+			return RetirementDecision{}, duplicateReportErr(r.NodeID)
+		}
 		byNode[r.NodeID] = r
 	}
-	if err := requireFullCoverage(members, len(byNode), func(n string) bool {
+	if err := requireFullCoverage(members, func(n string) bool {
 		_, ok := byNode[n]
 		return ok
 	}); err != nil {
@@ -160,9 +182,12 @@ func ClassifyRaftDEKRetirement(
 ) (RetirementDecision, error) {
 	byNode := make(map[string]RaftRetirementReport, len(reports))
 	for _, r := range reports {
+		if _, dup := byNode[r.NodeID]; dup {
+			return RetirementDecision{}, duplicateReportErr(r.NodeID)
+		}
 		byNode[r.NodeID] = r
 	}
-	if err := requireFullCoverage(members, len(byNode), func(n string) bool {
+	if err := requireFullCoverage(members, func(n string) bool {
 		_, ok := byNode[n]
 		return ok
 	}); err != nil {
@@ -180,23 +205,45 @@ func ClassifyRaftDEKRetirement(
 				fmt.Sprintf("%s: raft log start index %d has not passed proposed index %d",
 					node, r.LogCompactIndex, largestProposedIndex))
 		}
-		if r.SnapshotCutoverIndex < rotationIndex {
+		if r.SnapshotIndex < rotationIndex {
 			blockers = append(blockers,
-				fmt.Sprintf("%s: last snapshot predates the rotation (cutover %d < rotation %d)",
-					node, r.SnapshotCutoverIndex, rotationIndex))
+				fmt.Sprintf("%s: last snapshot predates the rotation (snapshot %d < rotation %d)",
+					node, r.SnapshotIndex, rotationIndex))
 		}
 	}
 	sort.Strings(blockers)
 	return RetirementDecision{Eligible: len(blockers) == 0, Blockers: blockers}, nil
 }
 
+// duplicateReportErr rejects a report set containing the same node
+// twice.
+//
+// Collapsing duplicates into a map is last-write-wins, so a node that
+// reported a blocker and then reported ready would be recorded as
+// ready, and coverage would still be complete because the map holds one
+// entry per unique node. Eligibility would then depend on the order the
+// reports arrived. Since the whole point of this classifier is that
+// unloading a DEK with any live reference loses data, an ambiguous
+// report set fails closed instead.
+func duplicateReportErr(nodeID string) error {
+	return errors.Wrapf(ErrIncompleteRetirementReport,
+		"node %s reported more than once", nodeID)
+}
+
 // requireFullCoverage rejects a report set that does not cover every
 // member, and a membership list that is empty.
+//
+// Duplicates are caught by the callers, not here. This function
+// previously compared the number of unique reporting nodes against the
+// membership size, which cannot detect a duplicate at all: if every
+// member is covered, the unique count equals the membership size
+// whether or not a node reported twice, and if a member is missing the
+// `missing` check above already fires.
 //
 // An empty membership is refused rather than treated as trivially
 // satisfied: "no members reported a problem" is not evidence when
 // nobody was asked.
-func requireFullCoverage(members []string, reported int, covered func(string) bool) error {
+func requireFullCoverage(members []string, covered func(string) bool) error {
 	if len(members) == 0 {
 		return errors.Wrap(ErrIncompleteRetirementReport, "cluster membership is empty")
 	}
@@ -209,9 +256,6 @@ func requireFullCoverage(members []string, reported int, covered func(string) bo
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		return errors.Wrapf(ErrIncompleteRetirementReport, "no report from %v", missing)
-	}
-	if reported < len(members) {
-		return errors.Wrap(ErrIncompleteRetirementReport, "duplicate reports for some members")
 	}
 	return nil
 }
