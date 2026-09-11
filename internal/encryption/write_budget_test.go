@@ -2,6 +2,7 @@ package encryption_test
 
 import (
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -64,10 +65,14 @@ func TestWriteBudgetFailsClosedPastTheCeiling(t *testing.T) {
 	t.Parallel()
 
 	b := encryption.NewWriteBudget(10)
-	// Threshold is 9; drive the counter to the ceiling directly.
+	// Threshold is 9, so nine writes are allowed and the tenth is
+	// refused. (Before the threshold arithmetic was fixed this
+	// ceiling produced a threshold of 0 and the comment was false:
+	// every write here was refused and the test asserted nothing.)
 	for range 10 {
 		b.Record(1)
 	}
+	require.Equal(t, uint64(9), b.Used(1))
 	// Even having crossed into rotate territory, the verdict must
 	// never become Allow again.
 	for range 50 {
@@ -114,8 +119,13 @@ func TestWriteBudgetDefaultCeilingMatchesTheDesign(t *testing.T) {
 	require.Equal(t, uint64(1)<<32, encryption.DefaultWriteBudgetCeiling)
 
 	b := encryption.NewWriteBudget(0)
-	// Threshold is 90% of 2^32.
-	require.Equal(t, uint64(1)<<32/100*90, b.Remaining(1))
+	// Threshold is 90% of 2^32, stated as the specification rather than
+	// as the implementation's expression. The previous form here was
+	// `1<<32/100*90`, which mirrored the production division order and
+	// therefore could not catch an error in it: it asserted the lossy
+	// 3865470480 instead of the exact 3865470566.
+	require.Equal(t, uint64(1)<<32*9/10, b.Remaining(1))
+	require.Equal(t, uint64(3865470566), b.Remaining(1))
 }
 
 // TestWriteBudgetIsRaceFree exercises the hot path from many
@@ -165,4 +175,114 @@ func TestWriteBudgetVerdictStringsAreStable(t *testing.T) {
 	require.Equal(t, "allow", encryption.WriteBudgetAllow.String())
 	require.Equal(t, "rotate", encryption.WriteBudgetRotate.String())
 	require.Equal(t, "exhausted", encryption.WriteBudgetExhausted.String())
+}
+
+// TestWriteBudgetRefusedWritesDoNotConsumeBudgetUnderConcurrency is the
+// concurrent form of TestWriteBudgetDoesNotCountRefusedWrites, which
+// only ever exercised the sequential path and so passed while refused
+// writes were being counted.
+//
+// Load-then-Add admits every writer that read a count below the
+// threshold; they all increment, so writers that are subsequently
+// refused still spend budget. Sequentially the bug is invisible -- the
+// Load sees the threshold and returns first -- so only sustained
+// contention at the boundary exposes it.
+//
+// The invariant asserted here is the one that makes the overshoot
+// impossible: the counter can never exceed the refusal threshold,
+// because only a write that won the CAS is recorded. That also means
+// the number of permitted writes equals the threshold exactly, no
+// matter how many writers raced.
+func TestWriteBudgetRefusedWritesDoNotConsumeBudgetUnderConcurrency(t *testing.T) {
+	t.Parallel()
+
+	const (
+		ceiling   = uint64(10000)
+		threshold = uint64(9000)
+		racers    = 64
+		trials    = 20
+	)
+
+	for trial := range trials {
+		b := encryption.NewWriteBudget(ceiling)
+
+		// Every racer hammers Record until it is refused, so the
+		// writers contending at the boundary are many and arrive
+		// continuously rather than in one staged burst.
+		var allowed atomic.Uint64
+		var wg sync.WaitGroup
+		for range racers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for b.Record(1).Allowed() {
+					allowed.Add(1)
+				}
+			}()
+		}
+		wg.Wait()
+
+		require.LessOrEqual(t, b.Used(1), threshold,
+			"trial %d: the counter passed the refusal threshold, so refused "+
+				"writes consumed budget", trial)
+		require.Equal(t, threshold, allowed.Load(),
+			"trial %d: exactly the threshold many writes may be permitted", trial)
+		require.Equal(t, allowed.Load(), b.Used(1),
+			"trial %d: the counter must record permitted writes and nothing else", trial)
+	}
+}
+
+// TestWriteBudgetThresholdIsNinetyPercent pins the threshold arithmetic
+// across ceilings that are not multiples of 100, where dividing before
+// multiplying silently collapsed the budget.
+func TestWriteBudgetThresholdIsNinetyPercent(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name    string
+		ceiling uint64
+		want    uint64
+	}{
+		{"design default 2^32", encryption.DefaultWriteBudgetCeiling, 3865470566},
+		{"exact multiple of 100", 100, 90},
+		{"not a multiple of 100", 199, 179},
+		{"just under 100", 99, 89},
+		{"single digit", 10, 9},
+		{"smallest with a nonzero 90%", 2, 1},
+		{"degenerate ceiling of 1 still allows one write", 1, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			b := encryption.NewWriteBudget(tc.ceiling)
+			// Remaining from a fresh budget is the threshold.
+			require.Equal(t, tc.want, b.Remaining(1))
+		})
+	}
+}
+
+// TestWriteBudgetTinyCeilingDoesNotWedgeTheDEK covers the anti-wedge
+// guard. A ceiling whose 90% point floors to zero would refuse the very
+// first write, so the cluster would propose rotations forever and never
+// issue a write under the new DEK either.
+func TestWriteBudgetTinyCeilingDoesNotWedgeTheDEK(t *testing.T) {
+	t.Parallel()
+
+	for ceiling := uint64(1); ceiling <= 9; ceiling++ {
+		b := encryption.NewWriteBudget(ceiling)
+		require.True(t, b.Record(1).Allowed(),
+			"ceiling %d must allow at least one write", ceiling)
+	}
+}
+
+// TestWriteBudgetReachesExhaustedAtADegenerateCeiling covers the
+// ceiling branch, which atomic reservation otherwise makes unreachable:
+// with a ceiling of 1 the threshold equals the ceiling, so the counter
+// does land on it.
+func TestWriteBudgetReachesExhaustedAtADegenerateCeiling(t *testing.T) {
+	t.Parallel()
+
+	b := encryption.NewWriteBudget(1)
+	require.Equal(t, encryption.WriteBudgetAllow, b.Record(1))
+	require.Equal(t, encryption.WriteBudgetExhausted, b.Record(1))
 }
