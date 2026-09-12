@@ -3,8 +3,10 @@ package main
 import (
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/cockroachdb/errors"
 )
 
 // stubEngineForProposerTest satisfies raftengine.Engine at the
@@ -90,5 +92,39 @@ func TestProposerForGroup_FallsBackToEngineWhenShardGroupNil(t *testing.T) {
 	got := proposerForGroup(rt, map[uint64]*kv.ShardGroup{7: nil})
 	if got != raftengine.Proposer(engine) {
 		t.Errorf("proposerForGroup did not fall back to rt.engine for nil shardGroup entry; got %T, want raw engine", got)
+	}
+}
+
+func TestSplitPromotionTargetLeaderResolverUsesTargetGroup(t *testing.T) {
+	t.Parallel()
+
+	source := capabilityConfigEngine{leader: raftengine.LeaderInfo{Address: "source:50051"}}
+	target := capabilityConfigEngine{leader: raftengine.LeaderInfo{Address: "target:50051"}}
+	resolve := splitPromotionTargetLeaderResolver(map[uint64]*kv.ShardGroup{
+		1: {Engine: source},
+		2: {Engine: target},
+	})
+
+	addr, err := resolve(distribution.SplitJob{
+		SplitKey:      []byte("m"),
+		TargetGroupID: 2,
+	})
+	if err != nil {
+		t.Fatalf("resolve returned error: %v", err)
+	}
+	if addr != "target:50051" {
+		t.Fatalf("resolve returned %q, want target leader address", addr)
+	}
+}
+
+func TestSplitPromotionTargetLeaderResolverRejectsMissingLeader(t *testing.T) {
+	t.Parallel()
+
+	resolve := splitPromotionTargetLeaderResolver(map[uint64]*kv.ShardGroup{
+		2: {Engine: capabilityConfigEngine{}},
+	})
+	_, err := resolve(distribution.SplitJob{TargetGroupID: 2})
+	if !errors.Is(err, kv.ErrLeaderNotFound) {
+		t.Fatalf("resolve error = %v, want ErrLeaderNotFound", err)
 	}
 }

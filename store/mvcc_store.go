@@ -28,6 +28,7 @@ const (
 	mvccSnapshotVersionV1 = uint32(1)
 	mvccSnapshotVersionV2 = uint32(2)
 	mvccSnapshotVersionV3 = uint32(3)
+	mvccSnapshotVersionV4 = uint32(4)
 	maxSnapshotKeySize    = 1 << 20 // 1 MiB per logical key
 	// maxSnapshotInternalKeyEnvelope reserves snapshot headroom for internal
 	// stored-key envelopes such as migration staging. Logical source keys keep
@@ -86,6 +87,10 @@ type mvccStore struct {
 	migrationAcks       map[migrationAckID]migrationImportAck
 	migrationHLCFloors  map[uint64]uint64
 	migrationPromotions map[uint64]PromotionState
+	migrationReadiness  map[uint64]TargetStagedReadinessState
+	// migrationReadinessCache is the snapshot-order projection of
+	// migrationReadiness; it is what the V4 trailer serialises.
+	migrationReadinessCache []TargetStagedReadinessState
 	// writeConflicts mirrors the per-(kind, key_prefix) counter from
 	// the pebble-backed store so the in-memory implementation shows up
 	// in the same Prometheus series (even if the counts are usually
@@ -135,6 +140,7 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 		migrationAcks:       make(map[migrationAckID]migrationImportAck),
 		migrationHLCFloors:  make(map[uint64]uint64),
 		migrationPromotions: make(map[uint64]PromotionState),
+		migrationReadiness:  make(map[uint64]TargetStagedReadinessState),
 		writeConflicts:      newWriteConflictCounter(),
 	}
 	for _, opt := range opts {
@@ -921,7 +927,8 @@ func (s *mvccStore) writeSnapshotFile(f *os.File) error {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 
-	version := mvccSnapshotVersionForState(s.migrationAcks, s.migrationHLCFloors, s.migrationPromotions)
+	version := mvccSnapshotVersionForState(
+		s.migrationAcks, s.migrationHLCFloors, s.migrationPromotions, s.migrationReadinessCache)
 	checksumOffset, err := writeMVCCSnapshotHeader(f, version)
 	if err != nil {
 		return err
@@ -946,8 +953,11 @@ func mvccSnapshotVersionForState(
 	acks map[migrationAckID]migrationImportAck,
 	floors map[uint64]uint64,
 	promotions map[uint64]PromotionState,
+	readiness []TargetStagedReadinessState,
 ) uint32 {
 	switch {
+	case len(readiness) > 0:
+		return mvccSnapshotVersionV4
 	case len(promotions) > 0:
 		return mvccSnapshotVersionV3
 	case len(acks) > 0 || len(floors) > 0:
@@ -987,6 +997,7 @@ func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32,
 		s.migrationAcks,
 		s.migrationHLCFloors,
 		s.migrationPromotions,
+		s.migrationReadinessCache,
 	); err != nil {
 		return 0, err
 	}
@@ -1018,6 +1029,7 @@ func writeMVCCSnapshotMetadata(
 	migrationAcks map[migrationAckID]migrationImportAck,
 	migrationHLCFloors map[uint64]uint64,
 	migrationPromotions map[uint64]PromotionState,
+	migrationReadiness []TargetStagedReadinessState,
 ) error {
 	if err := binary.Write(w, binary.LittleEndian, lastCommitTS); err != nil {
 		return errors.WithStack(err)
@@ -1039,6 +1051,25 @@ func writeMVCCSnapshotMetadata(
 	}
 	if err := writeMVCCSnapshotBytes(w, encodeMigrationPromotionStates(migrationPromotions)); err != nil {
 		return err
+	}
+	if version < mvccSnapshotVersionV4 {
+		return nil
+	}
+	return writeMVCCSnapshotReadinessStates(w, migrationReadiness)
+}
+
+// writeMVCCSnapshotReadinessStates emits the V4 trailer: a count followed by
+// one length-prefixed encoded state each. The states are stored as a sequence
+// rather than one opaque blob so a corrupt entry is localised to its own
+// record instead of failing the whole map decode.
+func writeMVCCSnapshotReadinessStates(w io.Writer, states []TargetStagedReadinessState) error {
+	if err := binary.Write(w, binary.LittleEndian, uint64(len(states))); err != nil {
+		return errors.WithStack(err)
+	}
+	for _, state := range states {
+		if err := writeMVCCSnapshotBytes(w, encodeTargetStagedReadinessState(state)); err != nil {
+			return err
+		}
 	}
 	return nil
 }
@@ -1149,7 +1180,7 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 		return err
 	}
 
-	tree, lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, actual, err := restoreStreamingMVCCSnapshotBody(r, version)
+	tree, lastCommitTS, minRetainedTS, meta, actual, err := restoreStreamingMVCCSnapshotBody(r, version)
 	if err != nil {
 		return err
 	}
@@ -1162,9 +1193,11 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.tree = tree
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
-	s.migrationAcks = migrationAcks
-	s.migrationHLCFloors = migrationHLCFloors
-	s.migrationPromotions = migrationPromotions
+	s.migrationAcks = meta.acks
+	s.migrationHLCFloors = meta.floors
+	s.migrationPromotions = meta.promotions
+	s.migrationReadiness = targetReadinessStateMap(meta.readiness)
+	s.migrationReadinessCache = cloneTargetStagedReadinessStates(meta.readiness)
 	return nil
 }
 
@@ -1181,7 +1214,10 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
-	if version != mvccSnapshotVersionV1 && version != mvccSnapshotVersionV2 && version != mvccSnapshotVersionV3 {
+	if version != mvccSnapshotVersionV1 &&
+		version != mvccSnapshotVersionV2 &&
+		version != mvccSnapshotVersionV3 &&
+		version != mvccSnapshotVersionV4 {
 		return 0, 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
 	}
 
@@ -1195,68 +1231,132 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 func restoreStreamingMVCCSnapshotBody(
 	r io.Reader,
 	version uint32,
-) (*treemap.Map, uint64, uint64, map[migrationAckID]migrationImportAck, map[uint64]uint64, map[uint64]PromotionState, uint32, error) {
+) (*treemap.Map, uint64, uint64, mvccSnapshotMigrationMetadata, uint32, error) {
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
 
-	lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, err := readMVCCSnapshotMetadata(body, version)
+	lastCommitTS, minRetainedTS, meta, err := readMVCCSnapshotMetadata(body, version)
 	if err != nil {
-		return nil, 0, 0, nil, nil, nil, 0, err
+		return nil, 0, 0, mvccSnapshotMigrationMetadata{}, 0, err
 	}
 
 	tree, err := readMVCCSnapshotTree(body)
 	if err != nil {
-		return nil, 0, 0, nil, nil, nil, 0, err
+		return nil, 0, 0, mvccSnapshotMigrationMetadata{}, 0, err
 	}
 
-	return tree, lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, hash.Sum32(), nil
+	return tree, lastCommitTS, minRetainedTS, meta, hash.Sum32(), nil
 }
 
 func readMVCCSnapshotMetadata(
 	r io.Reader,
 	version uint32,
-) (uint64, uint64, map[migrationAckID]migrationImportAck, map[uint64]uint64, map[uint64]PromotionState, error) {
+) (uint64, uint64, mvccSnapshotMigrationMetadata, error) {
 	var lastCommitTS uint64
 	if err := binary.Read(r, binary.LittleEndian, &lastCommitTS); err != nil {
-		return 0, 0, nil, nil, nil, errors.WithStack(err)
+		return 0, 0, mvccSnapshotMigrationMetadata{}, errors.WithStack(err)
 	}
 	var minRetainedTS uint64
 	if err := binary.Read(r, binary.LittleEndian, &minRetainedTS); err != nil {
-		return 0, 0, nil, nil, nil, errors.WithStack(err)
+		return 0, 0, mvccSnapshotMigrationMetadata{}, errors.WithStack(err)
 	}
 	if version == mvccSnapshotVersionV1 {
-		return lastCommitTS,
-			minRetainedTS,
-			make(map[migrationAckID]migrationImportAck),
-			make(map[uint64]uint64),
-			make(map[uint64]PromotionState),
-			nil
+		return lastCommitTS, minRetainedTS, emptyMVCCSnapshotMigrationMetadata(), nil
 	}
 
 	ackData, err := readMVCCSnapshotBytes(r, "snapshot migration acks")
 	if err != nil {
-		return 0, 0, nil, nil, nil, err
+		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
 	migrationAcks, ok := decodeMigrationImportAcks(ackData)
 	if !ok {
-		return 0, 0, nil, nil, nil, errors.New("invalid snapshot migration acks")
+		return 0, 0, mvccSnapshotMigrationMetadata{}, errors.New("invalid snapshot migration acks")
 	}
 
 	floorData, err := readMVCCSnapshotBytes(r, "snapshot migration hlc floors")
 	if err != nil {
-		return 0, 0, nil, nil, nil, err
+		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
 	migrationHLCFloors, ok := decodeMigrationHLCFloors(floorData)
 	if !ok {
-		return 0, 0, nil, nil, nil, errors.New("invalid snapshot migration hlc floors")
+		return 0, 0, mvccSnapshotMigrationMetadata{}, errors.New("invalid snapshot migration hlc floors")
 	}
 
 	migrationPromotions, err := readMVCCSnapshotPromotionMetadata(r, version)
 	if err != nil {
-		return 0, 0, nil, nil, nil, err
+		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
 
-	return lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, nil
+	migrationReadiness, err := readMVCCSnapshotReadinessStates(r, version)
+	if err != nil {
+		return 0, 0, mvccSnapshotMigrationMetadata{}, err
+	}
+
+	return lastCommitTS, minRetainedTS, mvccSnapshotMigrationMetadata{
+		acks:       migrationAcks,
+		floors:     migrationHLCFloors,
+		promotions: migrationPromotions,
+		readiness:  migrationReadiness,
+	}, nil
+}
+
+// mvccSnapshotMigrationMetadata is the version-layered trailer that follows
+// (lastCommitTS, minRetainedTS). Each version adds exactly one field to its
+// predecessor: V2 adds acks+floors, V3 adds promotions, V4 adds readiness.
+// Bundling them keeps the reader/restore signatures from growing a return
+// value per layer.
+type mvccSnapshotMigrationMetadata struct {
+	acks       map[migrationAckID]migrationImportAck
+	floors     map[uint64]uint64
+	promotions map[uint64]PromotionState
+	readiness  []TargetStagedReadinessState
+}
+
+func emptyMVCCSnapshotMigrationMetadata() mvccSnapshotMigrationMetadata {
+	return mvccSnapshotMigrationMetadata{
+		acks:       make(map[migrationAckID]migrationImportAck),
+		floors:     make(map[uint64]uint64),
+		promotions: make(map[uint64]PromotionState),
+	}
+}
+
+// readMVCCSnapshotReadinessStates mirrors writeMVCCSnapshotReadinessStates.
+// Pre-V4 snapshots carry no trailer, so the target rebuilds its readiness view
+// from the migration catalog instead of the snapshot.
+func readMVCCSnapshotReadinessStates(r io.Reader, version uint32) ([]TargetStagedReadinessState, error) {
+	if version < mvccSnapshotVersionV4 {
+		return nil, nil
+	}
+	var count uint64
+	if err := binary.Read(r, binary.LittleEndian, &count); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if count > maxSnapshotVersionCount {
+		return nil, errors.Wrapf(ErrSnapshotVersionCountTooLarge, "readiness states %d > %d", count, maxSnapshotVersionCount)
+	}
+	states := make([]TargetStagedReadinessState, 0, count)
+	for range count {
+		encoded, err := readMVCCSnapshotBytes(r, "snapshot migration readiness state")
+		if err != nil {
+			return nil, err
+		}
+		state, ok := decodeTargetStagedReadinessState(encoded)
+		if !ok {
+			return nil, errors.New("invalid snapshot migration readiness state")
+		}
+		states = append(states, state)
+	}
+	sortTargetStagedReadinessStates(states)
+	return states, nil
+}
+
+func targetReadinessStateMap(states []TargetStagedReadinessState) map[uint64]TargetStagedReadinessState {
+	out := make(map[uint64]TargetStagedReadinessState, len(states))
+	for _, state := range states {
+		cloned := cloneTargetStagedReadinessState(state)
+		out[cloned.JobID] = cloned
+	}
+	return out
 }
 
 func readMVCCSnapshotPromotionMetadata(r io.Reader, version uint32) (map[uint64]PromotionState, error) {

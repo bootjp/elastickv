@@ -547,3 +547,75 @@ func TestFSMCompactorCompactsEligiblePebbleRuntime(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("v30"), val)
 }
+
+type migrationPinnedCompactionStore struct {
+	deadlineCapturingStore
+	states []store.TargetStagedReadinessState
+}
+
+func (s *migrationPinnedCompactionStore) MigrationTargetReadinessStates(context.Context) ([]store.TargetStagedReadinessState, error) {
+	return s.states, nil
+}
+
+func TestFSMCompactorRespectsMigrationRetentionPin(t *testing.T) {
+	t.Parallel()
+
+	st := &migrationPinnedCompactionStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: ^uint64(0)},
+		states: []store.TargetStagedReadinessState{{
+			JobID:               1,
+			MigrationJobID:      1,
+			MinWriteTSExclusive: 1,
+			Armed:               true,
+			RetentionPinTS:      42,
+		}},
+	}
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				AppliedIndex: 1,
+				CommitIndex:  1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+	)
+
+	require.NoError(t, compactor.SyncOnce(context.Background()))
+	require.True(t, st.compactCalled)
+	require.Equal(t, uint64(42), st.compactMinTS)
+}
+
+func TestFSMCompactorIgnoresDisarmedMigrationRetentionPin(t *testing.T) {
+	t.Parallel()
+
+	st := &migrationPinnedCompactionStore{
+		deadlineCapturingStore: deadlineCapturingStore{lastCommitTS: ^uint64(0)},
+		states: []store.TargetStagedReadinessState{{
+			JobID:               1,
+			MigrationJobID:      1,
+			MinWriteTSExclusive: 1,
+			RetentionPinTS:      42,
+		}},
+	}
+	compactor := NewFSMCompactor(
+		[]FSMCompactRuntime{{
+			GroupID: 1,
+			StatusReader: fakeRaftStatus{status: raftengine.Status{
+				State:        raftengine.StateFollower,
+				AppliedIndex: 1,
+				CommitIndex:  1,
+			}},
+			Store: st,
+		}},
+		WithFSMCompactorInterval(time.Hour),
+		WithFSMCompactorRetentionWindow(time.Millisecond),
+	)
+
+	require.NoError(t, compactor.SyncOnce(context.Background()))
+	require.True(t, st.compactCalled)
+	require.Greater(t, st.compactMinTS, uint64(42))
+}

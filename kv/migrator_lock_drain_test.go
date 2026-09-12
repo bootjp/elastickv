@@ -27,6 +27,7 @@ func TestPendingTxnLocksInRouteFiltersLocksByRouteKey(t *testing.T) {
 		TTLExpireAt:  99,
 		PrimaryKey:   itemKey,
 		IsPrimaryKey: true,
+		CommitTS:     101,
 	})
 	require.NoError(t, st.PutAt(ctx, txnLockKey(itemKey), lock, 1, 0))
 	require.NoError(t, st.PutAt(ctx, txnLockKey(outsideKey), encodeTxnLock(txnLock{
@@ -40,6 +41,7 @@ func TestPendingTxnLocksInRouteFiltersLocksByRouteKey(t *testing.T) {
 	require.Equal(t, itemKey, pending[0].UserKey)
 	require.Equal(t, uint64(11), pending[0].StartTS)
 	require.Equal(t, uint64(99), pending[0].TTLExpireAt)
+	require.Equal(t, uint64(101), pending[0].CommitTS)
 	require.True(t, pending[0].IsPrimaryKey)
 	require.Equal(t, txnLockKey(itemKey), pending[0].LockKey)
 }

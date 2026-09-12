@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -126,4 +127,54 @@ func TestDecodeTxnMetaV2RejectsTrailingBytes(t *testing.T) {
 
 	_, err := DecodeTxnMeta(encoded)
 	require.ErrorContains(t, err, "unexpected trailing bytes")
+}
+
+func TestTxnLockCommitTSRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	lock := txnLock{
+		StartTS:      11,
+		TTLExpireAt:  99,
+		PrimaryKey:   []byte("primary"),
+		IsPrimaryKey: true,
+		CommitTS:     101,
+	}
+	encoded := encodeTxnLock(lock)
+
+	require.Equal(t, txnLockVersion, encoded[0])
+	require.Equal(t, txnLockFlagPrimary|txnLockFlagCommitTS, encoded[17])
+	require.Equal(t, lock.CommitTS, binary.BigEndian.Uint64(encoded[len(encoded)-uint64FieldSize:]))
+
+	decoded, err := decodeTxnLock(encoded)
+	require.NoError(t, err)
+	require.Equal(t, lock, decoded)
+}
+
+func TestTxnLockLegacyRoundTripOmitsCommitTS(t *testing.T) {
+	t.Parallel()
+
+	lock := txnLock{
+		StartTS:      11,
+		TTLExpireAt:  99,
+		PrimaryKey:   []byte("primary"),
+		IsPrimaryKey: true,
+	}
+	encoded := encodeTxnLock(lock)
+
+	require.Equal(t, txnLockFlagPrimary, encoded[17])
+	require.Len(t, encoded, 1+uint64FieldSize+uint64FieldSize+1+uint64FieldSize+len(lock.PrimaryKey))
+
+	decoded, err := decodeTxnLock(encoded)
+	require.NoError(t, err)
+	require.Equal(t, lock, decoded)
+}
+
+func TestDecodeTxnLockRejectsInvalidOptionalCommitTS(t *testing.T) {
+	t.Parallel()
+
+	encoded := encodeTxnLock(txnLock{StartTS: 11, PrimaryKey: []byte("primary")})
+	encoded[17] |= txnLockFlagCommitTS
+
+	_, err := decodeTxnLock(encoded)
+	require.ErrorContains(t, err, "commit ts truncated")
 }

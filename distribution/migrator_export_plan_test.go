@@ -199,22 +199,36 @@ func TestMigrationBracketContainsRoutedKeyForS3BucketAuxiliaryState(t *testing.T
 	require.NoError(t, err)
 	byFamily := bracketsByFamily(brackets)
 
+	// A slice strictly inside bucket-b's route interval. It overlaps the bucket
+	// but does not contain the bucket's route start, so it is NOT the owner of
+	// bucket-b's auxiliary rows -- the preceding slice is.
+	//
+	// This previously expected true, i.e. any overlapping slice claimed the
+	// bucket's metadata. That rule cannot be right for a single row describing
+	// the whole bucket: it cannot travel with a partial object range, and every
+	// overlapping slice claiming it means the export duplicates it and CLEANUP
+	// deletes rows a slice never exported. Ownership is point containment of the
+	// bucket route start; see S3BucketAuxiliaryRouteSelected.
 	routeStart := s3keys.RouteKey("bucket-b", 7, "a")
 	routeEnd := s3keys.RouteKey("bucket-b", 7, "z")
+	ownerStart := s3keys.RoutePrefixForBucketAnyGeneration("bucket-b")
 	for _, tc := range []struct {
-		name   string
-		family uint32
-		key    []byte
-		want   bool
+		name       string
+		family     uint32
+		key        []byte
+		start, end []byte
+		want       bool
 	}{
-		{name: "meta same bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-b"), want: true},
-		{name: "generation same bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-b"), want: true},
-		{name: "meta different bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-c"), want: false},
-		{name: "generation different bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-c"), want: false},
+		{name: "meta inside slice is not the owner", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-b"), start: routeStart, end: routeEnd, want: false},
+		{name: "generation inside slice is not the owner", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-b"), start: routeStart, end: routeEnd, want: false},
+		{name: "meta owning slice", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-b"), start: ownerStart, end: routeEnd, want: true},
+		{name: "generation owning slice", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-b"), start: ownerStart, end: routeEnd, want: true},
+		{name: "meta different bucket", family: MigrationFamilyS3BucketMeta, key: s3keys.BucketMetaKey("bucket-c"), start: routeStart, end: routeEnd, want: false},
+		{name: "generation different bucket", family: MigrationFamilyS3BucketGeneration, key: s3keys.BucketGenerationKey("bucket-c"), start: routeStart, end: routeEnd, want: false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := byFamily[tc.family].ContainsRoutedKey(tc.key, routeStart, routeEnd, s3keys.ExtractRouteKey)
+			got := byFamily[tc.family].ContainsRoutedKey(tc.key, tc.start, tc.end, s3keys.ExtractRouteKey)
 			require.Equal(t, tc.want, got)
 		})
 	}
