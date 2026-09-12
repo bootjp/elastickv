@@ -107,7 +107,7 @@ func (s *stubTablesSource) AdminGetItem(_ context.Context, _ AuthPrincipal, _ st
 	return nil, false, nil
 }
 
-func (s *stubTablesSource) AdminPutItem(_ context.Context, _ AuthPrincipal, _ string, _ AdminItem) error {
+func (s *stubTablesSource) AdminPutItem(_ context.Context, _ AuthPrincipal, _ string, _ map[string]AdminAttributeValue, _ AdminItem) error {
 	return nil
 }
 

@@ -24,7 +24,7 @@ Final milestone landed 2026-05-24. All six phases shipped between
 Notable in-flight design adjustments documented from PR review:
 - Empty `L` / `M` Dynamo attributes preserve their type tag on the wire via a custom `MarshalJSON` (Gemini medium, Codex P1 on #813). The struct tags stay as `omitempty`-decorated documentation; the custom marshal overrides.
 - Path-segment validation decodes via `url.PathUnescape` before validating, so tables named e.g. `foo bar` are reachable as `/tables/foo%20bar` while `%2F` / `%2e%2e` still close the path-traversal class (Codex P1 on #813).
-- The HTTP layer cannot reject a body that declares MORE primary-key columns than the URL key (no schema access); the principled fix (plumb the URL key into `AdminPutItem` so the adapter can compare against the schema-derived primary key) crosses the Phase-2a adapter boundary and is tracked separately (Codex P2 on #813).
+- ~~The HTTP layer cannot reject a body that declares MORE primary-key columns than the URL key~~ — **fixed.** The URL key is now plumbed into `AdminPutItem`, which loads the table schema and requires the key to name exactly the primary-key attributes (hash, plus range when the table has one). A URL naming only part of a composite key, or carrying an attribute the schema does not treat as part of the primary key, is rejected with `ErrAdminDynamoValidation` (Codex P2 on #813).
 - SPA bundle output (`internal/admin/dist/assets/*`) stays `.gitignored`; CI rebuilds from source on every release.
 
 ---

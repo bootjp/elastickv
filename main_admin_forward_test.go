@@ -258,7 +258,7 @@ func (dummyTablesSource) AdminGetItem(_ context.Context, _ admin.AuthPrincipal, 
 	panic("dummyTablesSource.AdminGetItem should not be invoked")
 }
 
-func (dummyTablesSource) AdminPutItem(_ context.Context, _ admin.AuthPrincipal, _ string, _ admin.AdminItem) error {
+func (dummyTablesSource) AdminPutItem(_ context.Context, _ admin.AuthPrincipal, _ string, _ map[string]admin.AdminAttributeValue, _ admin.AdminItem) error {
 	panic("dummyTablesSource.AdminPutItem should not be invoked")
 }
 
