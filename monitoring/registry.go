@@ -31,6 +31,7 @@ type Registry struct {
 	coldStartObs  *ColdStartObserver
 	tso           *TSOMetrics
 	tsoObserver   *TSOObserver
+	encryption    *EncryptionMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -63,6 +64,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.coldStartObs = newColdStartObserver(r.coldStart)
 	r.tso = newTSOMetrics(registerer)
 	r.tsoObserver = newTSOObserver(r.tso)
+	r.encryption = newEncryptionMetrics(registerer)
 	return r
 }
 
@@ -291,4 +293,18 @@ func (r *Registry) TSOObserver() *TSOObserver {
 		return nil
 	}
 	return r.tsoObserver
+}
+
+// EncryptionObserver returns the data-at-rest encryption observer
+// backed by this registry. The storage layer receives it through
+// store.WithEncryptionObserver and calls it on every envelope emit
+// and every decrypt-path failure (encryption design doc §9.2).
+//
+// Returns nil for a nil registry so a node running without metrics
+// wires a nil observer rather than a panicking stub.
+func (r *Registry) EncryptionObserver() EncryptionObserver {
+	if r == nil || r.encryption == nil {
+		return nil
+	}
+	return r.encryption
 }

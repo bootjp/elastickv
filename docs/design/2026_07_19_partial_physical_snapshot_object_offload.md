@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1 implemented; M2 pending; M3 retention/GC implemented, remaining M3 items pending
+Status: Partial — M0/M1/M2 implemented; M3 retention/GC implemented, remaining M3 items pending
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-07-23
@@ -205,7 +205,7 @@ permissions below the configured prefix.
 |---|---|---|
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
-| M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Pending |
+| M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Not yet wired into `main.go` — the runtime flags are M3. |
 | M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: the §5 two-phase retention/GC (`retention.go`) with `RetentionStore` list/delete on both the local and S3 stores. Restore corruption drills are implemented (`restore_corruption_test.go`: truncated, over-length, missing and tampered-descriptor payloads, plus a positive restore-into-fresh-dir drill). Multi-node acceptance, operational documentation, and the §7 versioned-bucket decision remain pending. |
 
 The filename and header remain `partial` until M1-M3 complete the central

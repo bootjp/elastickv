@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8 and 9A–9B shipped (5E deferred); remaining Stage 9 work open
+Status: Partial — Stages 0–8, 9A–9B, and 9C-1 shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -34,7 +34,8 @@ Date: 2026-04-29
 | 8 | Snapshot header v2 (§4.4); WAL coverage closure (§4.3 / §4.6) | shipped | [`2026_05_29_implemented_8a_snapshot_header_v2.md`](2026_05_29_implemented_8a_snapshot_header_v2.md) + [`2026_06_01_implemented_8b_wal_coverage_closure.md`](2026_06_01_implemented_8b_wal_coverage_closure.md) |
 | 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, metrics, remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8, §9.2) | open | — |
+| 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
+| 9C+ | Rotation budget/rewrap/retire/rewrite, the remaining §9.2 metrics (`active_dek_id`, `last_proposed_index_per_raft_dek`, `kek_unwrap_seconds`, `sidecar_raft_index`), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
@@ -2524,7 +2525,12 @@ relevant flag and runbook section.
 
 ### 9.2 Observability
 
-New metrics:
+New metrics (Stage 9C-1 shipped the three emitted by the storage
+envelope path — `decrypt_failures_total`, `writes_per_dek`, and
+`value_overhead_bytes`. The remaining four are owned by the rotation /
+sidecar / KEK subsystems and land with their milestones; they are
+deliberately NOT registered yet, so an operator cannot mistake an
+always-zero series for a healthy signal):
 
 - `elastickv_encryption_active_dek_id{purpose}` — gauge, label is
   storage/raft.
