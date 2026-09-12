@@ -109,3 +109,102 @@ func TestSplitJobSourceRouteStateReportsAnUnresolvableSource(t *testing.T) {
 	_, _, ok := splitJobSourceRouteState(routes, job)
 	require.False(t, ok)
 }
+
+// TestSplitJobSourceGroupBackfillRecordsTheGroupWhileTheShapeStillAnswers pins
+// the repair for a job persisted before source_group_id existed.
+//
+// InitializeSplitJobPlan records the field for every job it creates, but it runs
+// only at plan time: a legacy job decodes as zero and is never re-planned, so
+// nothing populated it. It is needed in exactly the state where the route shape
+// stops answering, so it has to be written while the shape still does.
+func TestSplitJobSourceGroupBackfillRecordsTheGroupWhileTheShapeStillAnswers(t *testing.T) {
+	t.Parallel()
+
+	legacy := splitJobForSourceGroupTest(t)
+	legacy.SourceGroupID = 0
+	legacy.Phase = distribution.SplitJobPhaseBackfill
+
+	intact := []distribution.RouteDescriptor{
+		{RouteID: 2, ParentRouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 7},
+		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
+	}
+
+	groupID, needed := splitJobSourceGroupBackfill(intact, legacy)
+	require.True(t, needed, "a legacy job must be repaired while the shape answers")
+	require.Equal(t, uint64(7), groupID)
+
+	// The degraded shape from TestSplitJobSourceRouteStateReportsAnUnresolvableSource,
+	// which that test pins as unresolvable for a zero-field job.
+	degraded := []distribution.RouteDescriptor{
+		{RouteID: 4, ParentRouteID: 2, Start: []byte("a"), End: []byte("f"), GroupID: 7},
+		{RouteID: 5, ParentRouteID: 2, Start: []byte("f"), End: []byte("m"), GroupID: 7},
+		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
+	}
+	_, _, ok := splitJobSourceRouteState(degraded, legacy)
+	require.False(t, ok, "precondition: the zero-field job cannot resolve the degraded shape")
+
+	// Once the backfill has been recorded, the same degraded shape resolves, so
+	// CLEANUP no longer fails with ErrMigrationSourceRouteChanged forever while
+	// holding the job's guards and retention pin.
+	repaired := legacy
+	repaired.SourceGroupID = groupID
+	resolvedGroup, routeEnd, ok := splitJobSourceRouteState(degraded, repaired)
+	require.True(t, ok)
+	require.Equal(t, uint64(7), resolvedGroup)
+	require.Equal(t, []byte("z"), routeEnd, "the moved range still bounds the cleanup")
+}
+
+// TestSplitJobSourceGroupBackfillSkipsWhatItMustNotWrite covers every case that
+// must not produce a catalog write.
+func TestSplitJobSourceGroupBackfillSkipsWhatItMustNotWrite(t *testing.T) {
+	t.Parallel()
+
+	intact := []distribution.RouteDescriptor{
+		{RouteID: 2, ParentRouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 7},
+		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
+	}
+	degraded := []distribution.RouteDescriptor{
+		{RouteID: 4, ParentRouteID: 2, Start: []byte("a"), End: []byte("f"), GroupID: 7},
+		{RouteID: 5, ParentRouteID: 2, Start: []byte("f"), End: []byte("m"), GroupID: 7},
+		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
+	}
+
+	t.Run("the field is already recorded", func(t *testing.T) {
+		t.Parallel()
+		job := splitJobForSourceGroupTest(t)
+		job.Phase = distribution.SplitJobPhaseCleanup
+		require.Equal(t, uint64(7), job.SourceGroupID)
+
+		_, needed := splitJobSourceGroupBackfill(intact, job)
+		require.False(t, needed)
+	})
+
+	for _, phase := range []distribution.SplitJobPhase{
+		distribution.SplitJobPhaseNone,
+		distribution.SplitJobPhaseDone,
+		distribution.SplitJobPhaseFailed,
+		distribution.SplitJobPhaseAbandoned,
+	} {
+		t.Run("terminal phase never reads the field", func(t *testing.T) {
+			t.Parallel()
+			job := splitJobForSourceGroupTest(t)
+			job.SourceGroupID = 0
+			job.Phase = phase
+
+			_, needed := splitJobSourceGroupBackfill(intact, job)
+			require.False(t, needed, "phase %v", phase)
+		})
+	}
+
+	t.Run("the shape cannot answer either", func(t *testing.T) {
+		t.Parallel()
+		job := splitJobForSourceGroupTest(t)
+		job.SourceGroupID = 0
+		job.Phase = distribution.SplitJobPhaseCleanup
+
+		// Nothing to record, and the phase must surface the real error rather
+		// than a backfill failure.
+		_, needed := splitJobSourceGroupBackfill(degraded, job)
+		require.False(t, needed)
+	})
+}

@@ -192,10 +192,111 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 	if s.splitMigrationClientFactory == nil {
 		return errors.New("split migration client factory is not configured")
 	}
+	job, err := s.backfillSplitJobSourceGroup(ctx, job)
+	if err != nil {
+		return err
+	}
 	if job.Phase == distribution.SplitJobPhaseBackfill || job.Phase == distribution.SplitJobPhaseDeltaCopy {
 		return s.runSplitJobCopyPhase(ctx, job)
 	}
 	return s.runSplitJobControlPhase(ctx, job)
+}
+
+// backfillSplitJobSourceGroup records SourceGroupID on a job that predates the
+// field, while the live route shape can still supply it.
+//
+// InitializeSplitJobPlan fills the field for every job it creates, but it runs
+// only at plan time: a job persisted by an earlier binary decodes as zero and is
+// never re-planned, so nothing ever populates it.
+//
+// That matters because the field is the last-resort handle
+// splitJobSourceRouteState falls back to, and it is needed in exactly the state
+// where the route shape stops answering -- once FENCE has replaced the parent
+// AND the source child has been split again (which SplitRange permits, the new
+// split being disjoint from the moving range), the grandchildren no longer name
+// the original parent and the parent itself is gone. A legacy job that reached
+// that state could never resolve its source again: CLEANUP failed with
+// ErrMigrationSourceRouteChanged on every attempt and held the job, its guards
+// and its retention pin indefinitely.
+//
+// Backfilling before the phase runs closes the window, because while the job is
+// still progressing the route shape does resolve, so the durable value is
+// written long before anything needs it. The write is a no-op once the field is
+// set, and is skipped for phases that will never read it.
+func (s *DistributionServer) backfillSplitJobSourceGroup(
+	ctx context.Context,
+	job distribution.SplitJob,
+) (distribution.SplitJob, error) {
+	if job.SourceGroupID != 0 || !splitJobPhaseNeedsSourceGroup(job.Phase) {
+		return job, nil
+	}
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return job, err
+	}
+	groupID, needed := splitJobSourceGroupBackfill(snapshot.Routes, job)
+	if !needed {
+		return job, nil
+	}
+	if err := s.updateSplitJobViaCoordinator(ctx, job.JobID,
+		func(current distribution.SplitJob) (distribution.SplitJob, error) {
+			if current.SourceGroupID != 0 {
+				return current, nil
+			}
+			next := distribution.CloneSplitJob(current)
+			next.SourceGroupID = groupID
+			next.UpdatedAtMs = time.Now().UnixMilli()
+			return next, nil
+		}); err != nil {
+		return job, err
+	}
+	job.SourceGroupID = groupID
+	return job, nil
+}
+
+// splitJobSourceGroupBackfill decides whether job needs its SourceGroupID
+// recorded, and which group to record.
+//
+// Kept separate from the catalog write so the decision is testable without a
+// live catalog or coordinator: every case that must NOT write -- the field
+// already set, a phase that will never read it, a route shape that cannot
+// answer -- is a pure-function case.
+func splitJobSourceGroupBackfill(
+	routes []distribution.RouteDescriptor,
+	job distribution.SplitJob,
+) (uint64, bool) {
+	if job.SourceGroupID != 0 || !splitJobPhaseNeedsSourceGroup(job.Phase) {
+		return 0, false
+	}
+	groupID, _, ok := splitJobSourceRouteState(routes, job)
+	if !ok || groupID == 0 {
+		// The shape cannot answer either. Leave the job alone and let the phase
+		// surface the real error rather than masking it as a backfill failure.
+		return 0, false
+	}
+	return groupID, true
+}
+
+// splitJobPhaseNeedsSourceGroup reports whether a job in this phase can still
+// reach a source-side operation, and therefore whether it is worth recording the
+// source group for it. Terminal and unplanned phases never read the field.
+func splitJobPhaseNeedsSourceGroup(phase distribution.SplitJobPhase) bool {
+	switch phase {
+	case distribution.SplitJobPhasePlanned,
+		distribution.SplitJobPhaseBackfill,
+		distribution.SplitJobPhaseDeltaCopy,
+		distribution.SplitJobPhaseFence,
+		distribution.SplitJobPhaseCutover,
+		distribution.SplitJobPhaseCleanup,
+		distribution.SplitJobPhaseAbandoning:
+		return true
+	case distribution.SplitJobPhaseNone,
+		distribution.SplitJobPhaseDone,
+		distribution.SplitJobPhaseFailed,
+		distribution.SplitJobPhaseAbandoned:
+		return false
+	}
+	return false
 }
 
 func (s *DistributionServer) runSplitJobCopyPhase(ctx context.Context, job distribution.SplitJob) error {

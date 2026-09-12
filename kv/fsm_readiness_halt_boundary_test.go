@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/proto"
 )
 
 // readinessWriteFailureStore fails only the readiness persistence write.
@@ -173,4 +174,68 @@ func TestApplyHaltBoundaryFollowsProcessLocalityNotCallSite(t *testing.T) {
 		require.False(t, isMigrationCleanupOrdinaryApplyError(local),
 			"a local store failure is not an ordinary verdict")
 	})
+}
+
+// TestApplyHaltsOnUnprovenReadinessInsideABatchedCommand closes the gap
+// between the halt decision and the call site that has to honour it.
+//
+// The tests above exercise applyErrorResponse directly, so they pass whether or
+// not Apply actually routes through it. Apply has two paths: a single request
+// goes through applyRequest -> applyErrorResponse, while concurrent raw commits
+// coalesced into one multi-request Raft command went through applyRequestErr
+// and had every error recorded as a per-request result. An unproven local
+// readiness verdict in a coalesced write therefore advanced this voter's
+// applied index while its peers applied the write -- the committed-state
+// divergence the halt exists to prevent, reachable only through batching.
+func TestApplyHaltsOnUnprovenReadinessInsideABatchedCommand(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	fsm := newTargetReadinessFSM(t, distribution.RouteDescriptor{
+		RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 1,
+		State: distribution.RouteStateActive,
+	})
+	writer, ok := fsm.store.(store.MigrationTargetReadinessWriter)
+	require.True(t, ok)
+
+	// A guard expecting a cutover version this replica's catalog view has not
+	// reached: the "a peer may be ahead of me" case, which cannot be proven
+	// locally. No fence flags, because targetReadinessStatesSatisfied skips
+	// fenced states.
+	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, store.TargetStagedReadinessState{
+		JobID:                  10,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 99,
+		MigrationJobID:         10,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}))
+
+	// Confirm the precondition through the real verifier, so this test cannot
+	// pass by failing for some unrelated reason.
+	_, readinessErr := fsm.targetReadyRoutesForRouteRange(ctx, []byte("a"), []byte("z"))
+	// cockroachdb's errors.Is, not require.ErrorIs: the sentinel is attached
+	// with errors.Mark, which the stdlib traversal does not follow.
+	require.True(t, errors.Is(readinessErr, errTargetReadinessUnproven),
+		"precondition: the guard must produce an unprovable local verdict, got %v", readinessErr)
+
+	cmd := &pb.RaftCommand{
+		Requests: []*pb.Request{
+			{Ts: 200, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("v1")}}},
+			{Ts: 201, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("c"), Value: []byte("v2")}}},
+		},
+	}
+	data, err := proto.Marshal(cmd)
+	require.NoError(t, err)
+
+	resp := fsm.Apply(data)
+	_, perRequestResults := resp.(*fsmApplyResponse)
+	require.False(t, perRequestResults,
+		"a batched apply carrying an unproven readiness verdict must halt, not "+
+			"return per-request results and advance the applied index")
+
+	halt := haltApplyOf(resp)
+	require.Error(t, halt, "the batch path must produce a halt response")
+	require.True(t, errors.Is(halt, ErrTargetReadinessApply), "got %v", halt)
 }

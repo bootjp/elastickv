@@ -383,6 +383,19 @@ func (f *kvFSM) Apply(data []byte) any {
 		if err == nil {
 			continue
 		}
+		// A batched request gets the same halt classification as a
+		// single one. Packaging a process-local verdict as an ordinary
+		// per-request result lets this voter advance its applied index
+		// while its peers apply the write -- exactly the committed-state
+		// divergence ErrTargetReadinessApply exists to convert into a
+		// loud stop.
+		//
+		// Stop at the first one rather than finishing the batch: the
+		// remaining requests would be applied from an entry this
+		// replica already knows it cannot agree on.
+		if halt := haltResponseFor(err); halt != nil {
+			return halt
+		}
 		resp.results[i] = err
 		hasError = true
 	}
@@ -598,10 +611,24 @@ func (f *kvFSM) applyRequest(ctx context.Context, r *pb.Request) any {
 // reaches it for the same entry and halting would stop the group during normal
 // operation.
 func applyErrorResponse(err error) any {
+	if halt := haltResponseFor(err); halt != nil {
+		return halt
+	}
+	return err
+}
+
+// haltResponseFor returns the halt response for an apply error that must stop
+// this replica, or nil when the error is an ordinary rejection.
+//
+// Both Apply paths -- the single-request one and the batch loop -- consult this
+// so the classification cannot drift between them. It did: the batch loop used
+// to record every error as a per-request result, so a coalesced write carrying
+// an unproven readiness verdict advanced the applied index instead of halting.
+func haltResponseFor(err error) *haltApplyResponse {
 	if errors.Is(err, errTargetReadinessUnproven) {
 		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: apply target readiness"))
 	}
-	return err
+	return nil
 }
 
 func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
