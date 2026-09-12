@@ -35,7 +35,8 @@ Date: 2026-04-29
 | 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, the remaining §9.2 metrics (`active_dek_id`, `last_proposed_index_per_raft_dek`, `kek_unwrap_seconds`, `sidecar_raft_index`), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
+| 9C-5 | §5.4 DEK retirement eligibility: the storage criteria (rewrite cursor, values-per-DEK, minRetainedTS) and the WAL-driven raft criteria (log start index, last committed snapshot index), both cluster-wide with no override | shipped | — |
+| 9C+ | Rotation budget/rewrap/retire/rewrite, the remaining §9.2 metrics (`active_dek_id`, `last_proposed_index_per_raft_dek`, `kek_unwrap_seconds`, `sidecar_raft_index`), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8, §9.2) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
@@ -1271,12 +1272,39 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
      `elastickv_encryption_last_proposed_index_per_raft_dek{key_id}`,
      updated on every leader Wrap. The former is exposed as
      `etcd_raft_log_compact_index` per node.
-   - Every node's last committed Raft snapshot must have
-     been **taken under the new raft DEK** (i.e., its FSM
-     snapshot header §4.4 carries
-     `raft_envelope_cutover_index` past the rotation entry).
-     A node restored from an older snapshot would replay
-     entries that still need the retiring DEK to decode.
+   - Every node's last committed Raft snapshot must be **at
+     or past the rotation entry's index**. A node restored
+     from an older snapshot replays the entries between that
+     snapshot and the rotation, and those were proposed under
+     the retiring DEK.
+
+     The signal is the snapshot's own Raft index
+     (`raftpb.SnapshotMetadata.Index`), which advances with
+     every snapshot install.
+
+     **Corrected from an earlier revision of this section,**
+     which said the check reads the §4.4 FSM snapshot
+     header's `raft_envelope_cutover_index`. That field cannot
+     express this criterion, for two independent reasons:
+
+     - It is the one-shot Phase-2 *enablement* index.
+       `applier.go` preserves the original value across every
+       later rotation (`if sc.RaftEnvelopeCutoverIndex != 0`
+       takes the already-active branch and advances only
+       `RaftAppliedIndex`), and `kv/fsm.go` copies the
+       unchanged value into each new snapshot header. It is
+       therefore frozen and can never be "past the rotation
+       entry" for any post-cutover rotation — so the criterion
+       would classify the retiring raft DEK ineligible forever
+       and no raft DEK could ever be retired.
+     - "Taken under the new raft DEK" is not a property a
+       snapshot has. Per §4.4 the FSM snapshot stream "is
+       ciphertext by construction" from the storage layer and
+       "no additional wrapping is required at the snapshot
+       layer" — a snapshot is not encrypted under any *raft*
+       DEK. What matters is only which entries a restore from
+       it would replay, which is what the snapshot's index
+       states directly.
 
    Without the WAL guard, retiring a raft DEK while the WAL
    still contains entries encrypted under it would cause
