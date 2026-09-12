@@ -1,6 +1,6 @@
 module github.com/bootjp/elastickv
 
-go 1.26
+go 1.26.0
 
 toolchain go1.26.6
 
@@ -33,7 +33,7 @@ require (
 	go.etcd.io/etcd/server/v3 v3.7.1
 	go.etcd.io/raft/v3 v3.7.0
 	go.uber.org/zap v1.28.0
-	golang.org/x/sync v0.22.0
+	golang.org/x/sync v0.23.0
 	golang.org/x/sys v0.47.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
