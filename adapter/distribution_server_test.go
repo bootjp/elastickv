@@ -3393,6 +3393,13 @@ func promotionCompleteDistributionJob() distribution.SplitJob {
 		SplitKey:      []byte("m"),
 		TargetGroupID: 2,
 		Phase:         distribution.SplitJobPhaseCleanup,
+		// Set because InitializeSplitJobPlan records it for every job it
+		// creates, so a job that reached CLEANUP always carries it. Leaving it
+		// zero made this fixture a legacy job, which runSplitJobPhase repairs
+		// with an extra catalog write -- the dispatch count below is about
+		// promotion, not about that repair. The repair itself is covered by
+		// TestSplitJobSourceGroupBackfillRecordsTheGroupWhileTheShapeStillAnswers.
+		SourceGroupID: 1,
 	}
 }
 
