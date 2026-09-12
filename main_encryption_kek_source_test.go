@@ -77,7 +77,7 @@ func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {
 	dir := t.TempDir()
 	sidecarPath := dir + "/keys.json"
 	keystore := encryption.NewKeystore()
-	wiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wrapper, keystore, []groupSpec{{id: 1}})
+	wiring, err := buildEncryptionWriteWiring(true, "n1", sidecarPath, wrapper, keystore, []groupSpec{{id: 1}}, nil)
 	require.NoError(t, err)
 	source, err := store.NewPebbleStore(dir+"/source", wiring.pebbleOptions()...)
 	require.NoError(t, err)

@@ -22,6 +22,20 @@ var (
 	ErrIntegrity      = errors.New("snapshot offload: integrity check failed")
 	ErrObjectConflict = errors.New("snapshot offload: object conflict")
 	ErrObjectNotFound = errors.New("snapshot offload: object not found")
+
+	// ErrNoPersistedSnapshot reports that the LOCAL data dir has no
+	// persisted snapshot yet. It is deliberately distinct from
+	// ErrObjectNotFound: a young group that has not snapshotted is a
+	// normal scan outcome, whereas an object vanishing from the store
+	// mid-publish is a real failure, and collapsing the two would
+	// silence the second.
+	ErrNoPersistedSnapshot = errors.New("snapshot offload: no persisted snapshot available")
+
+	// ErrSnapshotNotNewer reports that the persisted snapshot is not
+	// newer than the caller's high-water mark, so nothing was
+	// published. It is a normal outcome for a scheduler tick over an
+	// unchanged snapshot, not a failure.
+	ErrSnapshotNotNewer = errors.New("snapshot offload: persisted snapshot is not newer than the last published index")
 )
 
 type Manifest struct {

@@ -101,6 +101,11 @@ func classifyError(err error) int {
 	switch {
 	case errors.Is(err, snapshotoffload.ErrIntegrity),
 		errors.Is(err, snapshotoffload.ErrObjectNotFound),
+		// Splitting ErrNoPersistedSnapshot out of ErrObjectNotFound
+		// must not change the CLI contract: automation distinguishes
+		// "missing/invalid snapshot data" (2) from "bad invocation"
+		// (1), and a data dir with no snapshot is the former.
+		errors.Is(err, snapshotoffload.ErrNoPersistedSnapshot),
 		errors.Is(err, etcd.ErrExternalSnapshotRestoreInvalid),
 		errors.Is(err, etcd.ErrExternalSnapshotRestoreSHA256):
 		return exitDataErr
