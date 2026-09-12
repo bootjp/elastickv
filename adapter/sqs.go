@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -218,6 +219,12 @@ type SQSServer struct {
 	// nil on non-monitored fixtures; the increment helpers are
 	// nil-safe so an unwired server pays one branch.
 	adminObserver SQSAdminObserver
+	// adminAuditLogger is where the §3.6 admin audit lines go. Defaults
+	// to slog.Default(); production installs the component="admin" child
+	// logger so these records land in the same destination, with the same
+	// attributes, as every other admin audit entry rather than bypassing
+	// it through the process-wide default.
+	adminAuditLogger *slog.Logger
 }
 
 // SQSPartitionObserver is the metrics-package interface
@@ -295,6 +302,16 @@ func WithSQSAdminObserver(o SQSAdminObserver) SQSServerOption {
 	return func(s *SQSServer) {
 		if o != nil {
 			s.adminObserver = o
+		}
+	}
+}
+
+// WithSQSAdminAuditLogger routes the §3.6 admin audit lines to the
+// supplied logger instead of slog.Default(). No-ops on nil.
+func WithSQSAdminAuditLogger(l *slog.Logger) SQSServerOption {
+	return func(s *SQSServer) {
+		if l != nil {
+			s.adminAuditLogger = l
 		}
 	}
 }

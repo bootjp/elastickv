@@ -235,6 +235,21 @@ type sqsQueuesBridge struct {
 	server *adapter.SQSServer
 }
 
+// AdminQueueObserver satisfies admin.AdminQueueObserverSource so the admin
+// handler's pre-dispatch rejections are counted on the same metrics the
+// adapter uses. Returns nil when the server has no observer, which
+// WithAdminQueueObserver treats as "do not count".
+func (b *sqsQueuesBridge) AdminQueueObserver() admin.AdminQueueObserver {
+	if b == nil || b.server == nil {
+		return nil
+	}
+	observer := b.server.AdminObserver()
+	if observer == nil {
+		return nil
+	}
+	return observer
+}
+
 func (b *sqsQueuesBridge) AdminListQueues(ctx context.Context) ([]string, error) {
 	return b.server.AdminListQueues(ctx) //nolint:wrapcheck // pure pass-through; adapter owns the error context.
 }

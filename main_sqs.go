@@ -61,6 +61,11 @@ func prepareSQSServer(
 		adapter.WithSQSPartitionObserver(partitionObserver),
 		adapter.WithSQSThrottleObserver(throttleObserver),
 		adapter.WithSQSAdminObserver(adminObserver),
+		// Same component="admin" child logger the admin HTTP server uses,
+		// so the §3.6 purge audit lines land in the configured audit
+		// destination with its attributes instead of going out through the
+		// process-wide slog.Default().
+		adapter.WithSQSAdminAuditLogger(slog.Default().With(slog.String("component", "admin"))),
 	)
 	return sqsServer, sqsL, nil
 }

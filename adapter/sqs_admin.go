@@ -317,20 +317,26 @@ func (e *PurgeInProgressError) Is(target error) bool {
 //   - ErrAdminSQSValidation      — empty / whitespace name
 func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipal, name string) (AdminPurgeResult, error) {
 	if !principal.Role.canWrite() {
-		s.observeAdminPurge(name, adminOutcomeForbidden)
+		s.recordAdminPurge(ctx, principal, name, adminOutcomeForbidden)
 		return AdminPurgeResult{}, ErrAdminForbidden
 	}
 	if !isVerifiedSQSLeader(ctx, s.coordinator) {
-		s.observeAdminPurge(name, adminOutcomeNotLeader)
+		s.recordAdminPurge(ctx, principal, name, adminOutcomeNotLeader)
 		return AdminPurgeResult{}, ErrAdminNotLeader
 	}
 	if strings.TrimSpace(name) == "" {
-		s.observeAdminPurge(name, adminOutcomeValidation)
+		s.recordAdminPurge(ctx, principal, name, adminOutcomeValidation)
 		return AdminPurgeResult{}, ErrAdminSQSValidation
 	}
 	oldGen, newGen, err := s.purgeQueueWithRetry(ctx, name)
 	if err != nil {
-		s.observeAdminPurge(name, adminPurgeOutcomeForError(err))
+		// Every refusal gets the operation-specific audit record, not
+		// just the counter. A repeated purge inside the 60-second window
+		// used to return from here with no admin.sqs.purge_queue line at
+		// all, leaving only the generic HTTP audit middleware's status
+		// and path -- which cannot say WHY it was refused, and so cannot
+		// answer the question the §3.6 signal exists for.
+		s.recordAdminPurge(ctx, principal, name, adminPurgeOutcomeForError(err))
 		var rateLimit *purgeRateLimitedError
 		if errors.As(err, &rateLimit) {
 			return AdminPurgeResult{}, &PurgeInProgressError{RetryAfter: rateLimit.remaining}
@@ -340,13 +346,32 @@ func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipa
 		}
 		return AdminPurgeResult{}, errors.Wrap(err, "admin purge queue")
 	}
-	s.observeAdminPurge(name, adminOutcomeOK)
-	// §3.6 audit line. Deliberately lean: subject, role, queue and the
-	// two generations are everything needed to reconstruct
-	// who-purged-what-when. The generations come from the committed
-	// OCC round rather than a pre/post read, so they cannot report a
-	// pair of values that never existed as one consistent state.
-	slog.InfoContext(ctx, "admin.sqs.purge_queue",
+	s.recordAdminPurge(ctx, principal, name, adminOutcomeOK,
+		slog.Uint64("generation_before", oldGen),
+		slog.Uint64("generation_after", newGen))
+	return AdminPurgeResult{GenerationBefore: oldGen, GenerationAfter: newGen}, nil
+}
+
+// recordAdminPurge emits the §3.6 audit line and bumps the counter for one
+// purge outcome.
+//
+// Both in one place so an exit path cannot record the metric and skip the
+// audit, which is how the purge-in-progress refusal ended up counted but
+// never audited. Generation attributes are passed only by the success path:
+// a refusal has no committed generation pair, and inventing one would put a
+// state that never existed into the audit trail.
+func (s *SQSServer) recordAdminPurge(
+	ctx context.Context,
+	principal AdminPrincipal,
+	name string,
+	outcome string,
+	extra ...slog.Attr,
+) {
+	s.observeAdminPurge(name, outcome)
+	// access_key, role, queue, outcome.
+	const baseAuditAttrs = 4
+	attrs := make([]any, 0, len(extra)+baseAuditAttrs)
+	attrs = append(attrs,
 		// AdminPrincipal carries AccessKey, not the design's
 		// "subject": the access key ID is the identity the admin
 		// surface authenticates, and it is an identifier rather than
@@ -354,9 +379,20 @@ func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipa
 		slog.String("access_key", principal.AccessKey),
 		slog.String("role", string(principal.Role)),
 		slog.String("queue", name),
-		slog.Uint64("generation_before", oldGen),
-		slog.Uint64("generation_after", newGen))
-	return AdminPurgeResult{GenerationBefore: oldGen, GenerationAfter: newGen}, nil
+		slog.String("outcome", outcome))
+	for _, attr := range extra {
+		attrs = append(attrs, attr)
+	}
+	s.adminLogger().InfoContext(ctx, "admin.sqs.purge_queue", attrs...)
+}
+
+// adminLogger returns the configured audit destination, falling back to the
+// process default so a server built without the option still audits.
+func (s *SQSServer) adminLogger() *slog.Logger {
+	if s == nil || s.adminAuditLogger == nil {
+		return slog.Default()
+	}
+	return s.adminAuditLogger
 }
 
 // Outcome labels for the §3.6 admin counters, mirrored from
@@ -387,6 +423,16 @@ func adminPurgeOutcomeForError(err error) string {
 	default:
 		return adminOutcomeInternalError
 	}
+}
+
+// AdminObserver exposes the §3.6 counters so the admin HTTP handler can
+// record the rejections it serves before reaching this adapter. Returns nil
+// on a server built without an observer.
+func (s *SQSServer) AdminObserver() SQSAdminObserver {
+	if s == nil {
+		return nil
+	}
+	return s.adminObserver
 }
 
 func (s *SQSServer) observeAdminPurge(queue, outcome string) {
