@@ -32,6 +32,13 @@
 (def ^:private kek-test-bytes
   (apply str (repeat 32 "k")))
 (def ^:private raftadmin-bin (str bin-dir "/raftadmin"))
+(def ^:private admin-bin (str bin-dir "/elastickv-admin"))
+(def ^:private encryption-setup-bin (str bin-dir "/jepsen-encryption-setup"))
+
+;; §5.2 DEK ids for the bootstrap. Any non-zero pair that differs is valid;
+;; bootstrap rejects zero and rejects the two being equal.
+(def ^:private storage-dek-id 1)
+(def ^:private raft-dek-id 2)
 
 (def ^:private build-dir
   ;; local (control node) directory for built binaries
@@ -54,7 +61,9 @@
                      "GOPATH" "/home/vagrant/go"
                      "GOCACHE" "/home/vagrant/.cache/go-build"})]
     (doseq [[out-cmd args] [["elastickv" ["go" "build" "-o" (str build-dir "/elastickv") "./cmd/server"]]
-                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]]]
+                            ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]
+                            ["elastickv-admin" ["go" "build" "-o" (str build-dir "/elastickv-admin") "./cmd/elastickv-admin"]]
+                            ["jepsen-encryption-setup" ["go" "build" "-o" (str build-dir "/jepsen-encryption-setup") "./cmd/jepsen-encryption-setup"]]]]
       (let [{:keys [exit err]} (apply sh/sh (concat args [:env env :dir root]))]
         (when-not (zero? exit)
           (throw (ex-info (str "failed to build " out-cmd) {:err err})))))))
@@ -74,7 +83,7 @@
   (c/on node
     (c/su
       (c/exec :mkdir :-p bin-dir)
-      (doseq [bin ["elastickv" "raftadmin"]]
+      (doseq [bin ["elastickv" "raftadmin" "elastickv-admin" "jepsen-encryption-setup"]]
         (c/upload (str build-dir "/" bin) (str bin-dir "/" bin))
         (c/exec :chmod "755" (str bin-dir "/" bin))))))
 
@@ -239,6 +248,110 @@
       (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
               raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
 
+(defn encryption-endpoint
+  "Returns the gRPC address the EncryptionAdmin RPCs must be sent to.
+
+  The bootstrap and cutover entries are proposed through the DEFAULT Raft
+  group, so a multi-group deployment must be addressed on that group's port
+  rather than on whichever port happens to be first in the map. group-ids is
+  sorted, so the lowest group id is the default one."
+  [node grpc-port raft-groups]
+  (if (seq raft-groups)
+    (group-addr node raft-groups (first (group-ids raft-groups)))
+    (node-addr node grpc-port)))
+
+(defn bootstrap-args
+  "argv for `elastickv-admin encryption bootstrap`.
+
+  The writer batch comes from --discover-from rather than hand-written
+  --writer entries: §5.6 step 1a requires one registry entry per member, and
+  polling GetCapability is the only way to learn each node's real full_node_id
+  and local_epoch. A hand-written batch would go stale the moment a node
+  restarted and bumped its epoch."
+  [endpoint peer-endpoints wrapped-storage wrapped-raft]
+  (concat [admin-bin "encryption" "bootstrap"
+           (str "--endpoint=" endpoint)
+           (str "--storage-dek-id=" storage-dek-id)
+           (str "--raft-dek-id=" raft-dek-id)
+           (str "--wrapped-storage-dek=" wrapped-storage)
+           (str "--wrapped-raft-dek=" wrapped-raft)]
+          (map #(str "--discover-from=" %) peer-endpoints)))
+
+(defn enable-storage-envelope-args
+  "argv for `elastickv-admin encryption enable-storage-envelope`.
+
+  This is the step that actually makes writes ciphertext: --encryption-enabled
+  only opens the mutator RPCs, and buildEncryptionWriteWiring keeps the store
+  gate closed until this entry applies."
+  [endpoint full-node-id local-epoch]
+  [admin-bin "encryption" "enable-storage-envelope"
+   (str "--endpoint=" endpoint)
+   (str "--proposer-node-id=" full-node-id)
+   (str "--proposer-local-epoch=" local-epoch)])
+
+(defn parse-encryption-status
+  "Parses `elastickv-admin encryption status` output into a map.
+
+  Returns :full-node-id and :local-epoch (needed as the proposer identity for
+  the cutover) and :storage-envelope-active (the only thing that proves the
+  cluster is storing ciphertext)."
+  [out]
+  (let [field (fn [k] (second (re-find (re-pattern (str "(?m)^\\s*" k ":\\s*(\\S+)\\s*$")) out)))
+        num   (fn [k] (some-> (field k) Long/parseLong))]
+    {:full-node-id            (num "full_node_id")
+     :local-epoch             (num "local_epoch")
+     :storage-envelope-active (= "true" (field "storage_envelope_active"))}))
+
+(defn- encryption-status
+  [node endpoint]
+  (parse-encryption-status
+    (c/on node (c/su (c/exec admin-bin "encryption" "status" (str "--endpoint=" endpoint))))))
+
+(defn- wrap-fresh-dek!
+  "Returns a base64 KEK-wrapped DEK, generated on the node."
+  [node]
+  (clojure.string/trim
+    (c/on node (c/su (c/exec encryption-setup-bin (str "--kek-file=" kek-file))))))
+
+(defn- activate-encryption!
+  "Bootstraps the DEKs and performs the §7.1 Phase-1 storage cutover, then
+  VERIFIES it applied.
+
+  The verification is the point. --encryption-enabled only enables the
+  EncryptionAdmin mutator RPCs; buildEncryptionWriteWiring deliberately keeps
+  the store's envelope gate closed until BOTH BootstrapEncryption and
+  EnableStorageEnvelope have applied. Without these calls every workload ran
+  against a cleartext cluster and could still report PASS -- which, as the §8.4
+  gate's own rationale says, is worse than having no gate, because the run gets
+  recorded as encryption evidence. So a cluster that does not report
+  storage_envelope_active here must fail setup rather than proceed."
+  [test node grpc-port raft-groups]
+  (let [endpoint  (encryption-endpoint node grpc-port raft-groups)
+        peers     (map #(encryption-endpoint % grpc-port raft-groups) (:nodes test))
+        wrapped-s (wrap-fresh-dek! node)
+        wrapped-r (wrap-fresh-dek! node)]
+    (info "bootstrapping encryption" endpoint)
+    (c/on node (c/su (apply c/exec (bootstrap-args endpoint peers wrapped-s wrapped-r))))
+    (let [{:keys [full-node-id local-epoch]} (encryption-status node endpoint)]
+      (when-not full-node-id
+        (throw (ex-info "encryption status did not report a full_node_id"
+                        {:endpoint endpoint})))
+      (info "enabling storage envelope" endpoint full-node-id local-epoch)
+      (c/on node (c/su (apply c/exec (enable-storage-envelope-args
+                                       endpoint full-node-id (or local-epoch 0))))))
+    ;; Every node must report the cutover, not just the proposer: a node that
+    ;; has not applied it is still writing cleartext, and the workload would be
+    ;; measuring a half-encrypted cluster.
+    (doseq [peer (:nodes test)]
+      (let [peer-endpoint (encryption-endpoint peer grpc-port raft-groups)]
+        (util/await-fn
+          (fn []
+            (when (:storage-envelope-active (encryption-status node peer-endpoint))
+              true))
+          {:timeout 60000
+           :log-message (str "waiting for storage envelope cutover on " peer)})))
+    (info "encryption active on every node")))
+
 (defrecord ElastickvDB [opts]
   db/DB
   (setup! [_ test node]
@@ -281,7 +394,14 @@
                   (warn t "retrying join for" peer)
                   nil)))
             {:timeout 120000
-             :log-message (str "joining " peer)}))))
+             :log-message (str "joining " peer)}))
+        ;; After membership, not before: the bootstrap's writer batch needs a
+        ;; registry entry for every member (§5.6 step 1a), and the cutover's
+        ;; capability gate requires every voter to report encryption-capable.
+        ;; Running this against a single-node cluster would register one writer
+        ;; and then refuse the cutover once the peers joined.
+        (when (:encryption opts)
+          (activate-encryption! test node grpc-port raft-groups))))
     (info "node started" node))
 
   (teardown! [_ _test node]

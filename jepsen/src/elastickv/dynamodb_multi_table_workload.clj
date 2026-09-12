@@ -521,7 +521,8 @@
                                   :dynamo-port  node->port
                                   :raft-groups  (:raft-groups opts)
                                   :shard-ranges (:shard-ranges opts)
-                                  :server-env   (:server-env opts)}))
+                                  :server-env   (:server-env opts)
+                                  :encryption   (:encryption opts)}))
          rate         (double (or (:rate opts) 5))
          time-limit   (or (:time-limit opts) 30)
          faults       (if local?
