@@ -3,6 +3,8 @@ package s3keys
 import (
 	"context"
 	"log/slog"
+	"math"
+	"sync"
 	"time"
 
 	"github.com/cockroachdb/errors"
@@ -130,6 +132,20 @@ func ClassifyChunkBlobOrphan(
 	return ChunkBlobOrphanDecision{Verdict: OrphanReclaim, Reason: OrphanReasonSweeperCrashed}
 }
 
+// chunkRefRCIsZero reports whether the RC record decodes to a count of zero.
+//
+// This is the only state in which the GC-queue lookup can change the verdict:
+// an absent record is already reclaimable, a positive count is already
+// retained, and an undecodable one is already kept. Callers use it to avoid
+// paying for a replicated read that cannot matter.
+func chunkRefRCIsZero(rcValue []byte, rcFound bool) bool {
+	if !rcFound {
+		return false
+	}
+	rc, ok := DecodeChunkRefRC(rcValue)
+	return ok && rc.Count == 0
+}
+
 // ChunkBlobOrphanStore is the replicated state the scan consults.
 type ChunkBlobOrphanStore interface {
 	ReadChunkRefRC(ctx context.Context, sha [chunkBlobSHA256Bytes]byte) ([]byte, bool, error)
@@ -143,7 +159,22 @@ type ChunkBlobOrphanStore interface {
 type ChunkBlobOrphanLocalStore interface {
 	// ListLocalChunkBlobs enumerates this node's chunkblobs.
 	ListLocalChunkBlobs(ctx context.Context) ([]LocalChunkBlob, error)
-	DeleteChunkBlob(ctx context.Context, sha [chunkBlobSHA256Bytes]byte) error
+	// DeleteChunkBlobIfUnchanged unlinks the blob only if it is still the
+	// payload written at writtenAtTS, reporting false when it is not.
+	//
+	// Conditional, not a plain delete, because a PUT that reuses this SHA
+	// re-anchors the local payload before committing its chunkref: a
+	// rewrite therefore moves WrittenAtTS and this refuses, sparing bytes
+	// the PUT has already acknowledged as durable. An unconditional unlink
+	// had no interlock at all -- the scan's reads are from before the PUT
+	// committed, so it would remove a now-live payload.
+	//
+	// The implementation must compare and unlink atomically with respect to
+	// the local writer; a read-then-delete would reopen the same window it
+	// exists to close.
+	DeleteChunkBlobIfUnchanged(
+		ctx context.Context, sha [chunkBlobSHA256Bytes]byte, writtenAtTS uint64,
+	) (bool, error)
 }
 
 // ChunkBlobOrphanObserver receives per-blob outcomes.
@@ -165,6 +196,37 @@ type ChunkBlobOrphanScanner struct {
 	nowTS    func() uint64
 	observer ChunkBlobOrphanObserver
 	logger   *slog.Logger
+
+	// marks is the two-pass sweep state, the same shape the snapshot-offload
+	// retention GC uses. The first pass that finds a blob reclaimable records
+	// what it saw; only a LATER pass that finds the same blob still
+	// reclaimable and unchanged may unlink it.
+	//
+	// The delay is the protection. The scan's RC read happens before a
+	// concurrent PUT commits its chunkref, so a single-pass scan could decide
+	// "orphan" and then unlink bytes the PUT had just referenced. Requiring a
+	// second pass means any reference committed between the two is read back
+	// as a positive count and the blob is spared.
+	//
+	// The state is in-memory and per-process. Losing it on restart is safe in
+	// the only direction that matters: reclamation is delayed by one more
+	// pass, never advanced.
+	marksMu sync.Mutex
+	marks   map[[chunkBlobSHA256Bytes]byte]orphanMark
+}
+
+// orphanMark records what a pass saw when it first found a blob reclaimable.
+type orphanMark struct {
+	atTS        uint64
+	writtenAtTS uint64
+	reason      string
+}
+
+// matches reports whether blob is the same payload that was marked. A
+// different WrittenAtTS means a PUT rewrote it since, which invalidates the
+// mark outright.
+func (m orphanMark) matches(blob LocalChunkBlob) bool {
+	return m.writtenAtTS == blob.WrittenAtTS
 }
 
 // ChunkBlobOrphanScannerOptions configures NewChunkBlobOrphanScanner.
@@ -202,6 +264,7 @@ func NewChunkBlobOrphanScanner(opts ChunkBlobOrphanScannerOptions) (*ChunkBlobOr
 		nowTS:    opts.NowTS,
 		observer: observer,
 		logger:   timing.logger,
+		marks:    make(map[[chunkBlobSHA256Bytes]byte]orphanMark),
 	}, nil
 }
 
@@ -240,13 +303,26 @@ func (s *ChunkBlobOrphanScanner) ScanOnce(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "orphan scan: list local chunkblobs")
 	}
+	// Per-blob failures are collected, not returned immediately. With a
+	// stable listing order, returning here ended every hourly pass at the
+	// same blob, so one blob that consistently failed an RC read, a queue
+	// lookup or an unlink starved every later orphan indefinitely and local
+	// disk grew without bound. The pass still reports failure afterwards, so
+	// the error is surfaced rather than swallowed.
+	var failures []error
 	for _, blob := range blobs {
 		if sweepCancelled(ctx) {
 			break
 		}
 		if err := s.scanBlob(ctx, blob, boundary); err != nil {
-			return err
+			s.logger.WarnContext(ctx, "chunkblob orphan scan: blob failed, continuing",
+				slog.String("err", err.Error()))
+			failures = append(failures, err)
 		}
+	}
+	if len(failures) > 0 {
+		return errors.Wrapf(errors.Join(failures...),
+			"orphan scan: %d of %d blobs failed", len(failures), len(blobs))
 	}
 	return nil
 }
@@ -267,10 +343,14 @@ func (s *ChunkBlobOrphanScanner) scanBlob(
 		return errors.Wrapf(err, "orphan scan: read reference count for %x", blob.ContentSHA256[:4])
 	}
 	queueFound := false
-	if rcFound {
-		// Only consulted when a record exists: with no record at all
-		// the §3.5 criterion is already satisfied and the extra read
-		// would be wasted.
+	if chunkRefRCIsZero(rcValue, rcFound) {
+		// Consulted ONLY for a decodable zero count, because that is the
+		// only state where the answer can change the verdict. Gating on
+		// rcFound alone meant every old, healthy, still-referenced blob
+		// paid for a replicated queue read before the classifier looked
+		// at its count -- making the hourly scan's read cost
+		// proportional to the whole retained dataset instead of to the
+		// blobs that could actually be orphans.
 		queueFound, err = s.store.GCQueueEntryExists(ctx, blob.ContentSHA256)
 		if err != nil {
 			return errors.Wrapf(err, "orphan scan: queue lookup for %x", blob.ContentSHA256[:4])
@@ -280,12 +360,88 @@ func (s *ChunkBlobOrphanScanner) scanBlob(
 	decision := ClassifyChunkBlobOrphan(blob, boundary, rcValue, rcFound, queueFound)
 	s.observer.ObserveChunkBlobOrphan(decision.Verdict, decision.Reason)
 	if decision.Verdict != OrphanReclaim {
+		s.dropMark(blob.ContentSHA256)
 		return nil
 	}
-	if err := s.local.DeleteChunkBlob(ctx, blob.ContentSHA256); err != nil {
+	if !s.reclaimable(blob, decision.Reason) {
+		// Marked on this pass; a later pass decides. Counted as a keep so
+		// the metric does not report a reclaim that has not happened.
+		return nil
+	}
+	unlinked, err := s.local.DeleteChunkBlobIfUnchanged(ctx, blob.ContentSHA256, blob.WrittenAtTS)
+	if err != nil {
 		return errors.Wrapf(err, "orphan scan: delete local blob %x", blob.ContentSHA256[:4])
+	}
+	s.dropMark(blob.ContentSHA256)
+	if !unlinked {
+		// The payload was rewritten between the listing and the unlink, so
+		// a PUT re-anchored it. Leaving it is the whole point of the
+		// condition.
+		s.logger.InfoContext(ctx, "chunkblob orphan spared: payload changed under the scan",
+			slog.String("reason", decision.Reason))
+		return nil
 	}
 	s.logger.InfoContext(ctx, "chunkblob orphan reclaimed",
 		slog.String("reason", decision.Reason))
 	return nil
+}
+
+// reclaimable implements the two-pass rule: true only when this blob was
+// marked on an earlier pass, is unchanged since, and the mark has aged at
+// least one scan interval. Otherwise it (re-)marks and reports false.
+func (s *ChunkBlobOrphanScanner) reclaimable(blob LocalChunkBlob, reason string) bool {
+	now := s.nowTS()
+
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+
+	mark, marked := s.marks[blob.ContentSHA256]
+	if !marked || !mark.matches(blob) {
+		s.marks[blob.ContentSHA256] = orphanMark{
+			atTS:        now,
+			writtenAtTS: blob.WrittenAtTS,
+			reason:      reason,
+		}
+		return false
+	}
+	// One full scan interval, measured in the HLC physical domain so it
+	// compares against the same timestamps the age gate uses.
+	return hlcElapsed(mark.atTS, now) >= s.interval
+}
+
+// hlcElapsed returns the wall time between two HLC timestamps from their
+// physical halves. The logical counter is in-memory only and represents no
+// duration, so it is deliberately discarded.
+func hlcElapsed(fromTS, toTS uint64) time.Duration {
+	fromMs := fromTS >> hlcLogicalBits
+	toMs := toTS >> hlcLogicalBits
+	if toMs <= fromMs {
+		return 0
+	}
+	deltaMs := toMs - fromMs
+	// A delta this large cannot arise inside one process lifetime; clamping
+	// keeps the conversion to a signed Duration total rather than wrapping.
+	if deltaMs > math.MaxInt64/uint64(time.Millisecond) {
+		return time.Duration(math.MaxInt64)
+	}
+	return time.Duration(deltaMs) * time.Millisecond //nolint:gosec // clamped above
+}
+
+func (s *ChunkBlobOrphanScanner) dropMark(sha [chunkBlobSHA256Bytes]byte) {
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+	delete(s.marks, sha)
+}
+
+// MarkedOrphans returns the SHAs currently held under a sweep mark. Exposed
+// for tests and operator tooling; the set is per-process.
+func (s *ChunkBlobOrphanScanner) MarkedOrphans() [][chunkBlobSHA256Bytes]byte {
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+
+	out := make([][chunkBlobSHA256Bytes]byte, 0, len(s.marks))
+	for sha := range s.marks {
+		out = append(out, sha)
+	}
+	return out
 }
