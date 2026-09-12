@@ -38,6 +38,7 @@ func buildShardGroupsWithEncryptionWiring(
 	encryptionEnabled bool,
 	readTracker *kv.ActiveTimestampTracker,
 	routeEngine *distribution.Engine,
+	encryptionObserver store.EncryptionObserver,
 	applyObservers ...kv.ApplyObserver,
 ) ([]*raftGroupRuntime, map[uint64]*kv.ShardGroup, encryptionWriteWiring, error) {
 	if guardErr := checkEncryptionMembershipStartupGuardsBeforeEngine(encryptionMembershipStartupGuardInput{
@@ -52,7 +53,7 @@ func buildShardGroupsWithEncryptionWiring(
 	}); guardErr != nil {
 		return nil, nil, encryptionWriteWiring{}, guardErr
 	}
-	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore, groups)
+	encWiring, err := buildEncryptionWriteWiring(encryptionEnabled, raftID, sidecarPath, kekWrapper, keystore, groups, encryptionObserver)
 	if err != nil {
 		return nil, nil, encryptionWriteWiring{}, err
 	}
@@ -177,6 +178,10 @@ type encryptionWriteWiring struct {
 	// raftRegistration gates raft-envelope wrapping until this load has
 	// committed a writer-registry row for (active raft DEK, raftEpoch).
 	raftRegistration *raftRegistrationGate
+	// encryptionObserver receives the §9.2 storage-envelope telemetry.
+	// nil on a node without a metrics registry; the store treats that
+	// as "no telemetry" rather than as an error.
+	encryptionObserver store.EncryptionObserver
 }
 
 // withDefaultedCache returns a copy of w with a non-nil StateCache.
@@ -216,6 +221,10 @@ func (w encryptionWriteWiring) pebbleOptions() []store.PebbleStoreOption {
 		// fail-OPEN fallback, so unregistered loads are gated — see the
 		// Registered() doc for the deferred runtime-registration cases.
 		store.WithStorageRegistrationGate(w.cache.Registered),
+		// §9.2 telemetry. Metrics-only: nothing in the storage
+		// path reads it back, so a nil observer changes no bytes
+		// and no apply outcome.
+		store.WithEncryptionObserver(w.encryptionObserver),
 	}
 }
 
@@ -252,8 +261,8 @@ func (w encryptionWriteWiring) activateStorageEnvelopeV2Writes() {
 // future runtime Bootstrap assigns to the freshly minted DEK, which is that
 // DEK's first-ever use and therefore nonce-safe; a later restart will then
 // take the bump path.
-func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, groups []groupSpec) (encryptionWriteWiring, error) {
-	w := encryptionWriteWiring{cache: encryption.NewStateCache()}
+func buildEncryptionWriteWiring(encryptionEnabled bool, raftID, sidecarPath string, kekWrapper encryption.KEKUnwrapper, keystore *encryption.Keystore, groups []groupSpec, encryptionObserver store.EncryptionObserver) (encryptionWriteWiring, error) {
+	w := encryptionWriteWiring{cache: encryption.NewStateCache(), encryptionObserver: encryptionObserver}
 	if !encryptionEnabled || kekWrapper == nil || sidecarPath == "" {
 		return w, nil
 	}

@@ -1,0 +1,498 @@
+package snapshotoffload
+
+import (
+	"context"
+	"log/slog"
+	"math/rand/v2"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/cockroachdb/errors"
+)
+
+// Scheduler is the §4 leader-only publisher: each process scans its own Raft
+// groups on an interval and offloads a persisted snapshot when one exists that
+// has not been published yet.
+//
+// It never asks the state machine for a snapshot. Snapshot cadence stays owned
+// by the Raft engine, so this milestone can only publish what the engine has
+// already persisted -- an offload that forced its own snapshot would change
+// compaction behaviour, which §10 lists as a non-goal.
+type Scheduler struct {
+	groups      []OffloadGroup
+	store       ObjectStore
+	prefix      string
+	sourceName  string
+	binVersion  string
+	spoolDir    string
+	interval    time.Duration
+	jitter      time.Duration
+	concurrency int
+	observer    SchedulerObserver
+	logger      *slog.Logger
+	now         func() time.Time
+	// published caches the highest index this process has published per group.
+	// It is an optimisation only: restart idempotency comes from the object
+	// store, not from this map.
+	mu        sync.Mutex
+	published map[uint64]uint64
+	// uploads bounds concurrent uploads across every scan on this
+	// scheduler, including an operator-forced SyncOnce that overlaps
+	// the Run loop's pass. Allocating it per scan would give each its
+	// own full allowance.
+	uploads chan struct{}
+	// inFlight holds the groups currently being published. The
+	// semaphore bounds AGGREGATE work, not work per group: with
+	// concurrency above one, two overlapping scans can each take a
+	// slot for the SAME group, read the same high-water mark before
+	// either records a publish, and both spool and upload the same
+	// multi-gigabyte snapshot. Single-flighting per group is what
+	// makes a group's publish idempotent under overlap.
+	inFlight map[uint64]struct{}
+}
+
+// OffloadGroup is one local Raft group the scheduler may publish for.
+type OffloadGroup struct {
+	GroupID uint64
+	DataDir string
+	// IsLeader is the cheap pre-check made before opening the snapshot.
+	IsLeader func() bool
+	// VerifyLeader is the authoritative check, re-run immediately before the
+	// manifest is committed. See PublishOptions.VerifyLeader.
+	VerifyLeader func(context.Context) error
+}
+
+// SchedulerObserver receives per-attempt outcomes for metrics.
+type SchedulerObserver interface {
+	ObserveSnapshotOffloadPublished(groupID, index uint64, payloadBytes int64, elapsed time.Duration)
+	ObserveSnapshotOffloadSkipped(groupID uint64, reason string)
+	ObserveSnapshotOffloadFailed(groupID uint64, err error)
+}
+
+type nopSchedulerObserver struct{}
+
+func (nopSchedulerObserver) ObserveSnapshotOffloadPublished(uint64, uint64, int64, time.Duration) {}
+func (nopSchedulerObserver) ObserveSnapshotOffloadSkipped(uint64, string)                         {}
+func (nopSchedulerObserver) ObserveSnapshotOffloadFailed(uint64, error)                           {}
+
+// Default scheduling parameters from §4.
+const (
+	DefaultSchedulerInterval    = 15 * time.Minute
+	DefaultSchedulerConcurrency = 1
+)
+
+type SchedulerOption func(*Scheduler)
+
+func WithSchedulerInterval(d time.Duration) SchedulerOption {
+	return func(s *Scheduler) {
+		if d > 0 {
+			s.interval = d
+		}
+	}
+}
+
+// WithSchedulerJitter spreads multi-group work so every group in a process does
+// not contend for the upload slot on the same tick.
+func WithSchedulerJitter(d time.Duration) SchedulerOption {
+	return func(s *Scheduler) {
+		if d >= 0 {
+			s.jitter = d
+		}
+	}
+}
+
+func WithSchedulerConcurrency(n int) SchedulerOption {
+	return func(s *Scheduler) {
+		if n > 0 {
+			s.concurrency = n
+		}
+	}
+}
+
+func WithSchedulerObserver(o SchedulerObserver) SchedulerOption {
+	return func(s *Scheduler) {
+		if o != nil {
+			s.observer = o
+		}
+	}
+}
+
+func WithSchedulerLogger(l *slog.Logger) SchedulerOption {
+	return func(s *Scheduler) {
+		if l != nil {
+			s.logger = l
+		}
+	}
+}
+
+func WithSchedulerClock(now func() time.Time) SchedulerOption {
+	return func(s *Scheduler) {
+		if now != nil {
+			s.now = now
+		}
+	}
+}
+
+func WithSchedulerSpoolDir(dir string) SchedulerOption {
+	return func(s *Scheduler) { s.spoolDir = dir }
+}
+
+// NewScheduler builds the offload scheduler. It is opt-in: callers construct it
+// only when object offload is configured.
+// NewScheduler validates its configuration eagerly so an invalid
+// scheduler cannot be constructed at all. In particular every group
+// must supply both leadership callbacks: SyncOnce is exported and does
+// not re-validate, so a nil callback that survived construction would
+// be a follower publishing a manifest.
+func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluster, binaryVersion string, opts ...SchedulerOption) (*Scheduler, error) {
+	s := &Scheduler{
+		groups:      groups,
+		store:       store,
+		prefix:      prefix,
+		sourceName:  sourceCluster,
+		binVersion:  binaryVersion,
+		interval:    DefaultSchedulerInterval,
+		jitter:      DefaultSchedulerInterval / 4, //nolint:mnd // a quarter interval spreads groups without doubling the period.
+		concurrency: DefaultSchedulerConcurrency,
+		observer:    nopSchedulerObserver{},
+		logger:      slog.Default().With(slog.String("component", "snapshot-offload")),
+		now:         time.Now,
+		published:   make(map[uint64]uint64),
+		inFlight:    make(map[uint64]struct{}),
+	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	// Trim once here, before the scheduler escapes: a whitespace-only
+	// name passes a bare != "" test but buildManifest trims it to
+	// empty, so the scheduler would publish artifacts without the
+	// source-cluster identity it requires.
+	s.sourceName = strings.TrimSpace(s.sourceName)
+	if err := s.validate(); err != nil {
+		return nil, err
+	}
+	// One limiter for the scheduler, not one per scan: an
+	// operator-forced SyncOnce can overlap the pass running from Run,
+	// and a per-scan semaphore would grant each its own full
+	// allowance — two concurrent uploads under a configured limit of
+	// one.
+	s.uploads = make(chan struct{}, s.concurrency)
+	return s, nil
+}
+
+func (s *Scheduler) validate() error {
+	// validate is pure: Run calls it too, and mutating shared
+	// configuration there would race a concurrent operator SyncOnce
+	// reading sourceName to build PublishOptions. The trim happens
+	// once in NewScheduler, before the scheduler is published.
+	switch {
+	case s.store == nil:
+		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires an object store")
+	case s.sourceName == "":
+		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires a source cluster name")
+	}
+	// Both leadership callbacks are mandatory. Treating a nil callback
+	// as "leader" would let a miswired scheduler publish from a
+	// follower, which is the one thing this scheduler exists to
+	// prevent — and it would do so silently. Fail at construction
+	// instead, where the operator sees it.
+	for _, group := range s.groups {
+		switch {
+		case strings.TrimSpace(group.DataDir) == "":
+			// Otherwise every publish fails validatePublishOptions at
+			// runtime, turning a static misconfiguration into a
+			// recurring failure metric instead of a startup error.
+			return errors.Wrapf(ErrInvalidOptions,
+				"snapshot offload group %d requires a data dir", group.GroupID)
+		case group.IsLeader == nil:
+			return errors.Wrapf(ErrInvalidOptions,
+				"snapshot offload group %d requires an IsLeader callback", group.GroupID)
+		case group.VerifyLeader == nil:
+			return errors.Wrapf(ErrInvalidOptions,
+				"snapshot offload group %d requires a VerifyLeader callback", group.GroupID)
+		}
+	}
+	return nil
+}
+
+// Run scans on the configured interval until ctx is cancelled. Cancellation is
+// the only stop condition; a failing group is retried on the next tick rather
+// than tearing the loop down, because an object store outage must not stop the
+// process.
+func (s *Scheduler) Run(ctx context.Context) error {
+	if ctx == nil {
+		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler context is required")
+	}
+	if err := s.validate(); err != nil {
+		return err
+	}
+	timer := time.NewTimer(s.nextDelay())
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case <-timer.C:
+			s.scan(ctx, true)
+			timer.Reset(s.nextDelay())
+		}
+	}
+}
+
+func (s *Scheduler) nextDelay() time.Duration {
+	return s.interval + s.jitterSlice()
+}
+
+// jitterSlice returns a uniform duration in [0, jitter), or zero when
+// jitter is disabled. Both the inter-scan delay and the per-group
+// stagger draw from it, so the weak-RNG exemption is stated once:
+// this is load spreading, never a security decision.
+func (s *Scheduler) jitterSlice() time.Duration {
+	if s.jitter <= 0 {
+		return 0
+	}
+	return time.Duration(rand.Int64N(int64(s.jitter))) //nolint:gosec // scheduling jitter, not a security decision.
+}
+
+// SyncOnce runs one scan across every local group, bounded by the upload
+// concurrency limit. Exported so tests and operators can force a pass.
+func (s *Scheduler) SyncOnce(ctx context.Context) {
+	// No stagger: SyncOnce is the "scan now" entry point (operator
+	// action, tests), and delaying it by up to a jitter window would
+	// make an explicit request take minutes to start.
+	s.scan(ctx, false)
+}
+
+// scan runs one pass. stagger spreads group starts across the jitter
+// window so a multi-group process does not begin every upload on the
+// same tick; it is used only by the Run loop.
+func (s *Scheduler) scan(ctx context.Context, stagger bool) {
+	// A bounded worker pool, not one goroutine per group. A process
+	// hosting many groups would otherwise stack an O(group-count)
+	// burst of goroutines — and, on a staggered scan, one timer each —
+	// every interval, before the upload semaphore ever applies.
+	work := make(chan staggeredGroup)
+	workers := min(s.concurrency, len(s.groups))
+
+	var wg sync.WaitGroup
+	for range workers {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for g := range work {
+				if ctx.Err() != nil {
+					return
+				}
+				if !s.waitForStart(ctx, g.startAt) {
+					return
+				}
+				s.publishGroupBounded(ctx, g.group)
+			}
+		}()
+	}
+
+	// Every start time is an offset from ONE scan start, not a fresh
+	// sleep per group. Sleeping a full jitter slice before each group
+	// makes the delays accumulate: with the default single worker and
+	// a 3m45s jitter, 100 groups would add hours before the last
+	// upload, and Run does not arm the next interval until the scan
+	// returns — so later groups could go unvisited indefinitely.
+	scanStart := s.now()
+	for _, group := range s.groups {
+		if ctx.Err() != nil {
+			break
+		}
+		entry := staggeredGroup{group: group}
+		if stagger {
+			entry.startAt = scanStart.Add(s.jitterSlice())
+		}
+		select {
+		case work <- entry:
+		case <-ctx.Done():
+		}
+	}
+	close(work)
+	wg.Wait()
+}
+
+// publishGroupBounded takes the process-wide upload slot and the
+// per-group single-flight claim, then publishes.
+//
+// The semaphore is still needed alongside the worker pool: the pool
+// bounds one scan's goroutines, while the semaphore bounds uploads
+// across concurrent scans (an operator SyncOnce overlapping Run).
+func (s *Scheduler) publishGroupBounded(ctx context.Context, group OffloadGroup) {
+	select {
+	case s.uploads <- struct{}{}:
+	case <-ctx.Done():
+		return
+	}
+	defer func() { <-s.uploads }()
+
+	if !s.beginGroup(group.GroupID) {
+		s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "already_in_flight")
+		return
+	}
+	defer s.endGroup(group.GroupID)
+	s.publishGroup(ctx, group)
+}
+
+// staggeredGroup pairs a group with the absolute instant its work may
+// begin. Carrying the instant rather than a duration is what keeps
+// every start inside a single jitter window: a worker that is already
+// past a group's start time proceeds immediately instead of sleeping
+// again.
+type staggeredGroup struct {
+	group   OffloadGroup
+	startAt time.Time
+}
+
+// waitForStart blocks until startAt. A zero startAt, or one already in
+// the past because earlier groups took longer than the offset, returns
+// immediately. It reports false when ctx ended first, so the caller
+// abandons the group.
+func (s *Scheduler) waitForStart(ctx context.Context, startAt time.Time) bool {
+	if startAt.IsZero() {
+		return true
+	}
+	delay := startAt.Sub(s.now())
+	if delay <= 0 {
+		return true
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
+	// Cheap pre-check first: a follower must not even open the
+	// snapshot. NewScheduler rejects a nil callback, so this is
+	// defence in depth for a Scheduler built by some other route:
+	// unknown leadership is treated as "not leader", never as
+	// permission to publish.
+	if group.IsLeader == nil || group.VerifyLeader == nil {
+		s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "leadership_unknown")
+		return
+	}
+	if !group.IsLeader() {
+		s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "not_leader")
+		return
+	}
+	started := s.now()
+	manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         s.store,
+		DataDir:       group.DataDir,
+		Prefix:        s.prefix,
+		GroupID:       group.GroupID,
+		SourceCluster: s.sourceName,
+		BinaryVersion: s.binVersion,
+		SpoolDir:      s.spoolDir,
+		VerifyLeader:  s.boundedVerifyLeader(group.VerifyLeader),
+		// Suppress the whole spool when this node has already
+		// published this index. Without it an unchanged snapshot is
+		// fully re-read and re-hashed on every tick.
+		SkipIfNotNewerThan: s.publishedIndex(group.GroupID),
+	})
+	if err != nil {
+		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+			return
+		}
+		if errors.Is(err, ErrSnapshotNotNewer) {
+			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "already_published")
+			return
+		}
+		if errors.Is(err, ErrNoPersistedSnapshot) {
+			// A young or lightly-used group has not persisted its
+			// first snapshot yet. That is a normal scan outcome, not
+			// an outage: reporting it as a failure would emit a
+			// warning and a failure metric every interval until Raft
+			// eventually snapshots.
+			//
+			// Matched on its own sentinel, NOT on ErrObjectNotFound:
+			// an object disappearing from the store mid-publish is a
+			// genuine failure and must stay one.
+			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "no_persisted_snapshot")
+			return
+		}
+		s.observer.ObserveSnapshotOffloadFailed(group.GroupID, err)
+		s.logger.WarnContext(ctx, "snapshot offload publish failed",
+			slog.Uint64("group_id", group.GroupID), slog.String("error", err.Error()))
+		return
+	}
+	s.markPublished(group.GroupID, manifest.SnapshotIndex)
+	s.observer.ObserveSnapshotOffloadPublished(
+		group.GroupID, manifest.SnapshotIndex, manifest.Payload.Bytes, s.now().Sub(started))
+}
+
+// verifyLeaderTimeout bounds one pre-commit leadership recheck. It
+// matches the deadline the coordinator's own ReadIndex wrappers use.
+const verifyLeaderTimeout = 5 * time.Second
+
+// boundedVerifyLeader gives each leadership recheck its own deadline.
+//
+// The callback contract does not require callers to wrap their engine
+// method, and a raw etcd Engine.VerifyLeader issues a ReadIndex that,
+// during quorum loss, waits until its context expires. Handed the
+// long-lived Run context that expires only at shutdown, a scan would
+// block forever and no later snapshot would ever be scheduled.
+func (s *Scheduler) boundedVerifyLeader(verify func(context.Context) error) func(context.Context) error {
+	if verify == nil {
+		return nil
+	}
+	return func(ctx context.Context) error {
+		bounded, cancel := context.WithTimeout(ctx, verifyLeaderTimeout)
+		defer cancel()
+		return verify(bounded)
+	}
+}
+
+// beginGroup claims a group for publishing, reporting false when
+// another scan already holds it.
+func (s *Scheduler) beginGroup(groupID uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if _, busy := s.inFlight[groupID]; busy {
+		return false
+	}
+	s.inFlight[groupID] = struct{}{}
+	return true
+}
+
+func (s *Scheduler) endGroup(groupID uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	delete(s.inFlight, groupID)
+}
+
+// publishedIndex returns this process's high-water mark for a group.
+// It is intentionally in-memory only: a restart re-publishes once,
+// which the object store's content addressing makes cheap and which
+// keeps the scheduler from needing durable state of its own.
+func (s *Scheduler) publishedIndex(groupID uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.published[groupID]
+}
+
+func (s *Scheduler) markPublished(groupID, index uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if index > s.published[groupID] {
+		s.published[groupID] = index
+	}
+}
+
+// LastPublishedIndex reports the highest index this process has published for a
+// group. Zero means "nothing published by this process", not "nothing
+// published": another node or a previous run may hold newer manifests.
+func (s *Scheduler) LastPublishedIndex(groupID uint64) uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.published[groupID]
+}
