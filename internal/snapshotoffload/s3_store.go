@@ -1031,6 +1031,17 @@ func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output, listPref
 // than a silently short listing.
 func nextListPageToken(out *s3.ListObjectsV2Output, prefix string) (*string, bool, error) {
 	if out.IsTruncated == nil || !*out.IsTruncated {
+		// A page that says "complete" while still handing back a
+		// continuation token is self-contradictory, and believing the
+		// flag discards every later page. For a GC live-set scan that is
+		// not a cosmetic truncation: a manifest missed here leaves the
+		// payload it references unprotected, and retention reclaims data
+		// a restore still needs. Fail closed like every other pagination
+		// failure in §5 rather than returning a short listing.
+		if out.NextContinuationToken != nil && *out.NextContinuationToken != "" {
+			return nil, false, errors.Wrapf(ErrIntegrity,
+				"list objects under %q reported a complete page with a continuation token", prefix)
+		}
 		return nil, false, nil
 	}
 	if out.NextContinuationToken == nil || *out.NextContinuationToken == "" {

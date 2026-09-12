@@ -372,8 +372,20 @@ func (g *GC) loadManifest(ctx context.Context, ref ObjectRef) (Manifest, error) 
 	if err != nil {
 		return Manifest{}, malformedManifest(errors.Wrapf(err, "decode manifest %s", ref.Key))
 	}
+	if err := verifyManifestPaths(g.prefix, ref, manifest); err != nil {
+		return Manifest{}, err
+	}
+	return manifest, nil
+}
+
+// verifyManifestPaths rejects a manifest whose recorded keys disagree with the
+// canonical paths its own body implies.
+//
+// Split out of loadManifest so the three checks read as one rule rather than
+// accumulating inline branches.
+func verifyManifestPaths(prefix string, ref ObjectRef, manifest Manifest) error {
 	if normalizeObjectKey(ref.Key) != normalizeObjectKey(manifest.ManifestKey) {
-		return Manifest{}, malformedManifest(errors.Wrapf(ErrIntegrity,
+		return malformedManifest(errors.Wrapf(ErrIntegrity,
 			"manifest key mismatch: listed %s, body says %s", ref.Key, manifest.ManifestKey))
 	}
 	// Self-consistency is not enough: a body may agree with its own
@@ -383,16 +395,31 @@ func (g *GC) loadManifest(ctx context.Context, ref ObjectRef) (Manifest, error) 
 	// would consume group 2's retained-generation slots and get its
 	// real newest manifests deleted. Re-derive the canonical key and
 	// treat any disagreement as malformed.
-	canonical, err := manifestKey(g.prefix, manifest.GroupID, manifest.SnapshotIndex, manifest.SnapshotTerm)
+	canonical, err := manifestKey(prefix, manifest.GroupID, manifest.SnapshotIndex, manifest.SnapshotTerm)
 	if err != nil {
-		return Manifest{}, malformedManifest(errors.Wrapf(err, "derive canonical key for %s", ref.Key))
+		return malformedManifest(errors.Wrapf(err, "derive canonical key for %s", ref.Key))
 	}
 	if normalizeObjectKey(ref.Key) != normalizeObjectKey(canonical) {
-		return Manifest{}, malformedManifest(errors.Wrapf(ErrIntegrity,
+		return malformedManifest(errors.Wrapf(ErrIntegrity,
 			"manifest %s is stored off its canonical path %s (group=%d index=%d term=%d)",
 			ref.Key, canonical, manifest.GroupID, manifest.SnapshotIndex, manifest.SnapshotTerm))
 	}
-	return manifest, nil
+	// The payload reference has to be canonical for THIS prefix too. A
+	// manifest under prefix A naming a payload under prefix B records the
+	// exact B key in A's live set, but A's scan never lists B -- and B's
+	// scan cannot see A's manifest, so B eventually reclaims a payload A
+	// still needs and A's restore breaks. Re-deriving the key makes a
+	// cross-prefix reference malformed instead of a latent data loss.
+	canonicalPayload, err := payloadKey(prefix, manifest.Payload.SHA256)
+	if err != nil {
+		return malformedManifest(errors.Wrapf(err, "derive canonical payload key for %s", ref.Key))
+	}
+	if normalizeObjectKey(manifest.Payload.Key) != normalizeObjectKey(canonicalPayload) {
+		return malformedManifest(errors.Wrapf(ErrIntegrity,
+			"manifest %s references payload %s outside its own prefix (canonical %s)",
+			ref.Key, manifest.Payload.Key, canonicalPayload))
+	}
+	return nil
 }
 
 // partition splits every scanned manifest into survivors and the keys

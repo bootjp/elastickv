@@ -187,7 +187,11 @@ func (s *LocalStore) listRootForPrefix(prefix string) (string, error) {
 	if !objectPathSegmentIsSafe(cleaned) {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object prefix %q", prefix)
 	}
-	return filepath.Join(s.root, filepath.FromSlash(cleaned)), nil
+	joined := filepath.Join(s.root, filepath.FromSlash(cleaned))
+	if !objectPathWithinRoot(s.root, joined) {
+		return "", errors.Wrapf(ErrInvalidOptions, "object prefix %q resolves outside the store root", prefix)
+	}
+	return joined, nil
 }
 
 // DeleteObjectIfUnmodified removes key only when it still matches
@@ -377,7 +381,11 @@ func (s *LocalStore) pathForKey(key string) (string, error) {
 	if !objectPathSegmentIsSafe(normalized) {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object key %q", key)
 	}
-	return filepath.Join(s.root, filepath.FromSlash(normalized)), nil
+	joined := filepath.Join(s.root, filepath.FromSlash(normalized))
+	if !objectPathWithinRoot(s.root, joined) {
+		return "", errors.Wrapf(ErrInvalidOptions, "object key %q resolves outside the store root", key)
+	}
+	return joined, nil
 }
 
 // objectPathSegmentIsSafe reports whether a normalized key or prefix
@@ -398,9 +406,73 @@ func objectPathSegmentIsSafe(normalized string) bool {
 		return false
 	case strings.ContainsRune(normalized, '\\'):
 		return false
+	case strings.HasPrefix(normalized, "/"):
+		// normalizeObjectKey trims ONE leading slash, so `//victim`
+		// arrives here as `/victim`: relative by none of the checks
+		// above, but rooted. filepath.Join("C:", "/victim") resolves to
+		// `C:\victim` against a drive-relative root, outside the store.
+		// A rooted key is never legitimate -- object keys are relative
+		// to the root by definition -- so reject rather than re-trim.
+		return false
+	case volumeQualified(normalized):
+		return false
 	default:
 		return true
 	}
+}
+
+// volumeQualified reports whether the first path segment carries a
+// Windows volume, as in `C:` or `C:foo`.
+//
+// filepath.VolumeName is deliberately not used: it returns "" on
+// non-Windows, so a test running on Linux or macOS would pass against a
+// key that escapes on Windows. The check is spelled out so it behaves
+// identically on every platform.
+func volumeQualified(normalized string) bool {
+	first := normalized
+	if idx := strings.IndexByte(first, '/'); idx >= 0 {
+		first = first[:idx]
+	}
+	idx := strings.IndexByte(first, ':')
+	if idx < 0 {
+		return false
+	}
+	// A single letter before the colon is a drive designator. Anything
+	// else containing a colon is still refused below by the caller's
+	// containment check, but keys like `a:b` are not volume-qualified.
+	return idx == 1 && isASCIILetter(first[0])
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// objectPathWithinRoot reports whether joined actually resolves inside
+// root.
+//
+// This is the backstop for the character-level checks above: those
+// enumerate the escapes we know about, and this one states the property
+// we actually need. filepath.Rel answers it using the platform's own
+// separator and volume rules, so an escape neither check anticipated
+// still fails here instead of reaching the filesystem.
+//
+// It is deliberately unreachable today: every escape currently known is
+// refused earlier by objectPathSegmentIsSafe, so no input reaches the
+// store and trips this instead. That is the intended relationship
+// between the two layers, not a missing case -- a test that exercised
+// this through pathForKey would mean the character checks had a hole.
+// TestObjectPathWithinRootIsTheBackstop therefore covers the function
+// directly; if it ever starts firing in production, the character
+// checks need a new case rather than this one being relaxed.
+func objectPathWithinRoot(root, joined string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(joined))
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, error) {

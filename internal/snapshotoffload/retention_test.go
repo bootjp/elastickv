@@ -1282,7 +1282,20 @@ func TestLocalStoreListObjectsRejectsNativeSeparatorTraversal(t *testing.T) {
 	t.Parallel()
 
 	f := newGCFixture(t)
-	for _, prefix := range []string{`..\sibling`, `a\..\..\b`, `\\..\\x`} {
+	for _, prefix := range []string{
+		`..\sibling`, `a\..\..\b`, `\\..\\x`,
+		// Volume-qualified prefixes escape the root the same way keys do,
+		// so the shared guard has to refuse them on both paths -- fixing
+		// one and leaving the other is how the original traversal bug
+		// got in.
+		//
+		// Rooted prefixes are NOT listed: cleanObjectPrefix uses
+		// strings.Trim("/"), which strips every leading slash, so
+		// `//sibling` is already the legitimate prefix `sibling`. Only
+		// normalizeObjectKey has the rooted problem, because it trims a
+		// single slash with TrimPrefix.
+		`C:/sibling`, "C:sibling",
+	} {
 		_, err := f.store.ListObjects(context.Background(), prefix)
 		require.ErrorIs(t, err, ErrInvalidOptions, "prefix %q must be rejected", prefix)
 	}
@@ -1302,7 +1315,17 @@ func TestLocalStoreRejectsTraversalOnEveryObjectOperation(t *testing.T) {
 	outside := filepath.Join(filepath.Dir(f.root), "victim.txt")
 	require.NoError(t, os.WriteFile(outside, []byte("not yours"), 0o600))
 
-	for _, key := range []string{"..", `..\victim.txt`, `a\..\..\victim.txt`, "../victim.txt"} {
+	for _, key := range []string{
+		"..", `..\victim.txt`, `a\..\..\victim.txt`, "../victim.txt",
+		// normalizeObjectKey trims ONE leading slash, so these arrive as
+		// rooted paths that every relative check above accepts.
+		// filepath.Join against a drive-relative root such as `C:`
+		// resolves `/victim.txt` to `C:\victim.txt`, outside the store,
+		// and the delete methods would then remove an arbitrary file.
+		"//victim.txt", "///victim.txt", "//..//victim.txt",
+		// Volume-qualified keys escape the same way.
+		`C:/victim.txt`, "C:victim.txt",
+	} {
 		t.Run(key, func(t *testing.T) {
 			_, err := f.store.PutObject(ctx, key, bytes.NewReader(nil), PutOptions{
 				SHA256: hexSHA256Bytes(nil),
@@ -1324,4 +1347,128 @@ func TestLocalStoreRejectsTraversalOnEveryObjectOperation(t *testing.T) {
 	}
 
 	require.FileExists(t, outside, "no operation may reach outside the store root")
+}
+
+// TestObjectPathSegmentIsSafeRejectsRootedAndVolumeQualifiedKeys states the
+// character-level guard directly, because the escape it closes is
+// platform-specific: filepath.Join("C:", "/victim") resolves outside the root
+// on Windows but harmlessly inside it on POSIX, so a test that only exercised
+// the store through the filesystem would pass on CI while Windows stayed
+// exposed.
+func TestObjectPathSegmentIsSafeRejectsRootedAndVolumeQualifiedKeys(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		normalized string
+		safe       bool
+	}{
+		// Rooted: what normalizeObjectKey produces from `//victim`.
+		{"/victim", false},
+		{"/", false},
+		// Volume-qualified.
+		{"C:", false},
+		{"C:victim", false},
+		{"c:/victim", false},
+		// A single character before the colon is indistinguishable from a
+		// drive designator, so it is refused rather than guessed at.
+		{"a:b", false},
+		// A multi-character prefix cannot be a drive, so namespaced keys
+		// stay legal.
+		{"ns:key/part", true},
+		{"sha256:abc/def", true},
+		// Ordinary keys are unaffected.
+		{"manifests/2026/snap.json", true},
+		{"snap.json", true},
+		// Still rejected from before.
+		{"", false},
+		{".", false},
+		{"..", false},
+		{"../victim", false},
+		{`..\victim`, false},
+	} {
+		t.Run(tc.normalized, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.safe, objectPathSegmentIsSafe(tc.normalized))
+		})
+	}
+}
+
+// TestObjectPathWithinRootIsTheBackstop pins the containment check, which states
+// the property the character checks only approximate: whatever the key looked
+// like, the joined path has to land under the root.
+func TestObjectPathWithinRootIsTheBackstop(t *testing.T) {
+	t.Parallel()
+
+	root := filepath.Join("/srv", "snapshots")
+	require.True(t, objectPathWithinRoot(root, filepath.Join(root, "a", "b.json")))
+	require.True(t, objectPathWithinRoot(root, filepath.Join(root, "a.json")))
+
+	// The root itself is not an object path.
+	require.False(t, objectPathWithinRoot(root, root))
+	// A sibling directory sharing a name prefix must not count as inside.
+	require.False(t, objectPathWithinRoot(root, filepath.Join("/srv", "snapshots-evil", "a.json")))
+	require.False(t, objectPathWithinRoot(root, filepath.Join("/srv", "other", "a.json")))
+	require.False(t, objectPathWithinRoot(root, filepath.Join("/", "victim.txt")))
+}
+
+// TestGCRejectsAManifestReferencingAPayloadOutsideItsPrefix closes a
+// cross-prefix data-loss path.
+//
+// Manifest-key verification re-derives the canonical MANIFEST path, but the
+// payload reference was taken on trust. A manifest under prefix A naming a
+// payload under prefix B records the exact B key in A's live set — and A's scan
+// never lists B, while B's scan cannot see A's manifest. B therefore reclaims a
+// payload A still references, and A's restore breaks with a missing payload.
+func TestGCRejectsAManifestReferencingAPayloadOutsideItsPrefix(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	ctx := context.Background()
+	good := f.publishManifest(t, 1, 10, []byte("inside"), time.Minute)
+
+	// A manifest at a fresh but fully canonical path: correct group, index,
+	// term and manifest key, self-consistent body. Only the payload reference
+	// points outside this prefix, so every other verification step passes and
+	// this isolates the payload check.
+	const (
+		crossGroup = uint64(1)
+		crossIndex = uint64(12)
+		crossTerm  = uint64(2)
+	)
+	mKey, err := manifestKey(retentionPrefix, crossGroup, crossIndex, crossTerm)
+	require.NoError(t, err)
+	elsewhere := []byte("elsewhere")
+	elsewhereSHA := hexSHA256Bytes(elsewhere)
+	foreign, err := payloadKey("other-cluster", elsewhereSHA)
+	require.NoError(t, err)
+	canonical, err := payloadKey(retentionPrefix, elsewhereSHA)
+	require.NoError(t, err)
+	require.NotEqual(t, canonical, foreign, "the fixture must actually cross a prefix")
+
+	f.writeManifest(t, Manifest{
+		SchemaVersion: ManifestSchemaVersion,
+		CreatedAt:     f.now.Add(-time.Minute),
+		SourceCluster: retentionPrefix,
+		GroupID:       crossGroup,
+		SnapshotIndex: crossIndex,
+		SnapshotTerm:  crossTerm,
+		ConfState:     ManifestConfState{Voters: []uint64{1}},
+		Payload: PayloadDescriptor{
+			Key:    foreign,
+			Bytes:  int64(len(elsewhere)),
+			SHA256: elsewhereSHA,
+		},
+		ManifestKey: mKey,
+	}, time.Minute)
+
+	gc := f.gc(t, RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour})
+	result, err := gc.RunOnce(ctx)
+	require.NoError(t, err)
+
+	require.Contains(t, result.MalformedManifests, mKey,
+		"a payload reference outside this prefix must be classified malformed")
+	require.True(t, result.PayloadPhaseSkipped,
+		"a malformed manifest must block reclamation")
+	require.True(t, f.exists(t, good.Payload.Key),
+		"no payload may be reclaimed while a manifest is unreadable")
 }

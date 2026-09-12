@@ -1073,3 +1073,63 @@ func TestS3StoreConditionalDeleteRefusesAnEmptyPrecondition(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidOptions)
 	require.Empty(t, client.deletes, "an unusable precondition must not reach the store")
 }
+
+// TestNextListPageTokenRejectsACompletePageCarryingAToken pins the fail-closed
+// handling of a self-contradictory S3 listing response.
+//
+// An endpoint that reports IsTruncated=false while still returning a
+// continuation token has more pages. Believing the flag drops them, and for the
+// GC live-set scan a dropped page means a manifest is never seen — so the
+// payload it references is absent from the live set and retention reclaims data
+// a restore still needs.
+func TestNextListPageTokenRejectsACompletePageCarryingAToken(t *testing.T) {
+	t.Parallel()
+
+	token := "page-2"
+	truthy := true
+	falsy := false
+
+	t.Run("complete with a token is a contradiction", func(t *testing.T) {
+		t.Parallel()
+		_, more, err := nextListPageToken(&s3.ListObjectsV2Output{
+			IsTruncated:           &falsy,
+			NextContinuationToken: &token,
+		}, "p")
+		require.ErrorIs(t, err, ErrIntegrity)
+		require.False(t, more)
+	})
+
+	t.Run("omitted IsTruncated with a token is the same contradiction", func(t *testing.T) {
+		t.Parallel()
+		_, more, err := nextListPageToken(&s3.ListObjectsV2Output{
+			NextContinuationToken: &token,
+		}, "p")
+		require.ErrorIs(t, err, ErrIntegrity)
+		require.False(t, more)
+	})
+
+	t.Run("genuinely complete stays complete", func(t *testing.T) {
+		t.Parallel()
+		next, more, err := nextListPageToken(&s3.ListObjectsV2Output{IsTruncated: &falsy}, "p")
+		require.NoError(t, err)
+		require.False(t, more)
+		require.Nil(t, next)
+	})
+
+	t.Run("truncated with a token continues", func(t *testing.T) {
+		t.Parallel()
+		next, more, err := nextListPageToken(&s3.ListObjectsV2Output{
+			IsTruncated:           &truthy,
+			NextContinuationToken: &token,
+		}, "p")
+		require.NoError(t, err)
+		require.True(t, more)
+		require.Equal(t, token, *next)
+	})
+
+	t.Run("truncated without a token still fails closed", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := nextListPageToken(&s3.ListObjectsV2Output{IsTruncated: &truthy}, "p")
+		require.ErrorIs(t, err, ErrIntegrity)
+	})
+}
