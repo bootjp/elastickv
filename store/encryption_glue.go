@@ -201,6 +201,35 @@ var ErrWriterNotRegistered = errors.New("store: storage envelope active but writ
 // store stays in legacy cleartext-only mode). This keeps the
 // option backwards-compatible with every existing NewPebbleStore
 // caller and keeps the Stage 2 wiring trivially reversible.
+// EncryptionObserver receives the design-doc §9.2 encryption
+// telemetry from the storage envelope path. monitoring.EncryptionMetrics
+// implements it; the store declares its own interface so the store
+// package does not depend on monitoring.
+//
+// Implementations MUST be safe for concurrent use and MUST NOT block:
+// both methods are called with storage write/read latency on the line.
+type EncryptionObserver interface {
+	// ObserveEncryptionDecryptFailure reports one envelope that
+	// failed to decode or authenticate. reason is one of the
+	// encryption.DecryptFailureReason* constants.
+	ObserveEncryptionDecryptFailure(reason string)
+	// ObserveEncryptionWrite reports one emitted envelope: the DEK
+	// it was sealed under, the plaintext size, and the size of the
+	// bytes actually stored.
+	ObserveEncryptionWrite(keyID uint32, plaintextBytes, payloadBytes int)
+}
+
+// WithEncryptionObserver wires the §9.2 metrics observer. Optional:
+// a store without one behaves identically, minus the telemetry.
+func WithEncryptionObserver(obs EncryptionObserver) PebbleStoreOption {
+	return func(s *pebbleStore) {
+		if obs == nil {
+			return
+		}
+		s.encryptionObserver = obs
+	}
+}
+
 func WithEncryption(cipher *encryption.Cipher, nf NonceFactory, activeKeyID ActiveStorageKeyID) PebbleStoreOption {
 	return func(s *pebbleStore) {
 		if cipher == nil || nf == nil || activeKeyID == nil {
@@ -399,6 +428,12 @@ func (s *pebbleStore) encryptForKey(pebbleKey, plaintext []byte, expireAt uint64
 	if err != nil {
 		return nil, 0, errors.Wrap(err, "store: encode envelope")
 	}
+	if s.encryptionObserver != nil {
+		// Reported against the caller's plaintext, not the
+		// post-compression payload, so the histogram shows the
+		// overhead the caller actually paid for this value.
+		s.encryptionObserver.ObserveEncryptionWrite(keyID, len(plaintext), len(encoded))
+	}
 	return encoded, encStateEncrypted, nil
 }
 
@@ -465,6 +500,7 @@ func (s *pebbleStore) decryptAuthenticatedForKey(pebbleKey []byte, sv storedValu
 	}
 	env, err := encryption.DecodeEnvelope(body)
 	if err != nil {
+		s.observeDecryptFailure(err)
 		return nil, 0, errors.Wrap(err, "store: decode envelope")
 	}
 	var hdr [valueHeaderSize]byte
@@ -472,6 +508,7 @@ func (s *pebbleStore) decryptAuthenticatedForKey(pebbleKey []byte, sv storedValu
 	aad := buildStorageAAD(env.Version, env.Flag, env.KeyID, hdr[:], pebbleKey)
 	plain, err := s.cipher.Decrypt(env.Body, aad, env.KeyID, env.Nonce[:])
 	if err != nil {
+		s.observeDecryptFailure(err)
 		if errors.Is(err, encryption.ErrIntegrity) {
 			return nil, 0, errors.Wrap(
 				errors.WithSecondaryError(ErrEncryptedReadIntegrity, err),
@@ -480,6 +517,22 @@ func (s *pebbleStore) decryptAuthenticatedForKey(pebbleKey []byte, sv storedValu
 		return nil, 0, errors.Wrap(err, "store: decrypt value")
 	}
 	return plain, env.Flag, nil
+}
+
+// observeDecryptFailure classifies err into its §9.2 reason label and
+// counts it. Kept as one helper so every decrypt-path failure is
+// classified by the same mapping — the read path has two distinct
+// failure points (envelope decode, GCM open) and classifying them
+// separately is how the reason set drifts apart.
+func (s *pebbleStore) observeDecryptFailure(err error) {
+	if s.encryptionObserver == nil {
+		return
+	}
+	reason, ok := encryption.DecryptFailureReason(err)
+	if !ok {
+		return
+	}
+	s.encryptionObserver.ObserveEncryptionDecryptFailure(reason)
 }
 
 // finishAuthenticatedValue expands an authenticated plaintext and normalizes
@@ -624,6 +677,13 @@ func (s *pebbleStore) rejectRebadgedEnvelope(pebbleKey []byte, sv storedValue, b
 				var hdr [valueHeaderSize]byte
 				writeValueHeaderBytes(hdr[:], false /*canonical*/, candidateExpire, encStateEncrypted)
 				aad := buildStorageAAD(candidate.version, candidate.flag, kid, hdr[:], pebbleKey)
+				// Deliberately NOT reported to
+				// encryptionObserver: this loop trial-decrypts
+				// against every loaded DEK, and a tag mismatch
+				// is the EXPECTED result for genuine cleartext.
+				// Counting it would increment the paging-grade
+				// §9.2 decrypt_failures counter on essentially
+				// every cleartext read.
 				if _, err := s.cipher.Decrypt(ct, aad, kid, nonce); err == nil {
 					return errors.Wrap(ErrEncryptedReadIntegrity,
 						"store: cleartext-labelled value verifies as a relabeled envelope under a loaded DEK")
