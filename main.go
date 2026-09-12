@@ -806,6 +806,16 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	}
 	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock)
 	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
+	// §4 physical snapshot offload. Opt-in, and a hard error when
+	// configured-but-unbuildable: an operator who set a backup
+	// destination and silently got no backups is worse off than one
+	// whose node refused to start.
+	if err := startSnapshotOffload(
+		in.ctx, in.eg, in.runtimes, *raftDir, in.raftID, in.cfg.multi,
+		in.metricsRegistry.SnapshotOffloadObserver(), slog.Default(),
+	); err != nil {
+		return distributionStartup{}, err
+	}
 	return distributionStartup{
 		defaultRuntime:   defaultRuntime,
 		distServer:       distServer,

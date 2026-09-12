@@ -20,6 +20,23 @@ type RestoreOptions struct {
 	Manifest    *Manifest
 	DataDir     string
 	Peers       []etcdraftengine.Peer
+
+	// ExpectGroupID is the Raft group the operator believes this data
+	// directory belongs to. Required.
+	//
+	// Nothing downstream carries the group's identity: the restored
+	// artifacts record index, term, peers and payload hash, but the group
+	// comes only from the manifest, and startup derives the group from the
+	// directory layout instead. So a group-2 manifest restored into a
+	// group-1 data directory produces a perfectly valid-looking
+	// directory that startup then loads as group 1 -- the wrong physical
+	// FSM under another group's routing identity, with no error anywhere.
+	// The only place that mistake can be caught is here, against what the
+	// operator says they intended.
+	//
+	// A pointer because group 0 is a real group (the dedicated TSO group),
+	// so zero cannot double as "unset".
+	ExpectGroupID *uint64
 }
 
 const (
@@ -87,6 +104,11 @@ func prepareRestorePayload(ctx context.Context, opts RestoreOptions) (Manifest, 
 		return Manifest{}, "", nil, err
 	}
 	if err := validateManifest(manifest); err != nil {
+		return Manifest{}, "", nil, err
+	}
+	// Before the download and before the destination exists, so a
+	// mistaken manifest key costs nothing and leaves nothing behind.
+	if err := checkRestoreGroup(manifest, opts.ExpectGroupID); err != nil {
 		return Manifest{}, "", nil, err
 	}
 	if err := checkRestorePreflight(ctx, opts.DataDir); err != nil {
@@ -210,9 +232,25 @@ func validateRestoreOptions(opts RestoreOptions) error {
 		return errors.Wrap(ErrInvalidOptions, "data dir is required")
 	case len(opts.Peers) == 0:
 		return errors.Wrap(ErrInvalidOptions, "restore peers are required")
+	case opts.ExpectGroupID == nil:
+		return errors.Wrap(ErrInvalidOptions, "expected raft group id is required")
 	default:
 		return validateRestorePeers(opts.Peers)
 	}
+}
+
+// checkRestoreGroup rejects a manifest belonging to a different group than
+// the operator asked to restore.
+func checkRestoreGroup(manifest Manifest, expect *uint64) error {
+	if expect == nil {
+		return errors.Wrap(ErrInvalidOptions, "expected raft group id is required")
+	}
+	if manifest.GroupID != *expect {
+		return errors.Wrapf(ErrRestoreGroupMismatch,
+			"manifest %s belongs to group %d, not the requested group %d",
+			manifest.ManifestKey, manifest.GroupID, *expect)
+	}
+	return nil
 }
 
 func validateRestorePeers(peers []etcdraftengine.Peer) error {
