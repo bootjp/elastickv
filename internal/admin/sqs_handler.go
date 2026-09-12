@@ -197,6 +197,40 @@ type SqsHandler struct {
 	source QueuesSource
 	roles  RoleStore
 	logger *slog.Logger
+	// admin counts the §3.6 purge / peek outcomes that never reach the
+	// adapter. Authorization, path and query-parameter rejections all
+	// return from the handler before AdminPurgeQueue / AdminPeekQueue
+	// runs, so without this the advertised forbidden and validation
+	// outcomes were absent from the metric for the most common cases --
+	// under-reporting exactly the rejections an operator is looking for.
+	admin AdminQueueObserver
+}
+
+// AdminQueueObserver counts admin queue-operation outcomes.
+//
+// Declared here so the handler can record its own pre-dispatch exits
+// without importing the adapter; *monitoring.SQSMetrics satisfies it
+// structurally, so production passes the same counters the adapter uses and
+// the two halves of each metric cannot drift apart.
+type AdminQueueObserver interface {
+	ObserveAdminPurgeQueue(queue string, outcome string)
+	ObserveAdminPeekQueue(queue string, outcome string)
+}
+
+// AdminQueueObserverSource is the optional capability a QueuesSource can
+// implement to hand the handler the counters it already records through.
+type AdminQueueObserverSource interface {
+	AdminQueueObserver() AdminQueueObserver
+}
+
+// adminQueueObserverFrom returns the source's counters, or nil when the
+// source does not expose any.
+func adminQueueObserverFrom(source QueuesSource) AdminQueueObserver {
+	provider, ok := source.(AdminQueueObserverSource)
+	if !ok {
+		return nil
+	}
+	return provider.AdminQueueObserver()
 }
 
 // NewSqsHandler binds the source and seeds logging with
@@ -215,6 +249,33 @@ func (h *SqsHandler) WithLogger(l *slog.Logger) *SqsHandler {
 	}
 	h.logger = l
 	return h
+}
+
+// WithAdminQueueObserver installs the §3.6 counters so the handler can
+// record the rejections it serves itself. No-ops on nil; the handler then
+// records nothing and the adapter-side outcomes are unaffected.
+func (h *SqsHandler) WithAdminQueueObserver(o AdminQueueObserver) *SqsHandler {
+	if o == nil {
+		return h
+	}
+	h.admin = o
+	return h
+}
+
+// observePurgeRejection records a purge outcome decided in the handler.
+func (h *SqsHandler) observePurgeRejection(name, outcome string) {
+	if h.admin == nil {
+		return
+	}
+	h.admin.ObserveAdminPurgeQueue(name, outcome)
+}
+
+// observePeekRejection records a peek outcome decided in the handler.
+func (h *SqsHandler) observePeekRejection(name, outcome string) {
+	if h.admin == nil {
+		return
+	}
+	h.admin.ObserveAdminPeekQueue(name, outcome)
 }
 
 // WithRoleStore enables per-request role revalidation on the delete
@@ -395,6 +456,14 @@ func (h *SqsHandler) dispatchAttributesResource(w http.ResponseWriter, r *http.R
 	}
 }
 
+// The handler-side half of the §3.6 outcome vocabulary. Kept to the two
+// values the handler can actually decide, and spelled identically to the
+// adapter's so a dashboard does not see two spellings of one outcome.
+const (
+	adminQueueOutcomeForbidden  = "forbidden"
+	adminQueueOutcomeValidation = "validation"
+)
+
 // isValidSqsPathSegment enforces the step-4 rules. Every segment is
 // rejected if it is empty, contains a percent sign (closes the
 // %2F / %252F / %2e / %2E / %2E%2E percent-encoded slash and
@@ -535,10 +604,12 @@ func (h *SqsHandler) handleSetAttributes(w http.ResponseWriter, r *http.Request,
 func (h *SqsHandler) handlePeek(w http.ResponseWriter, r *http.Request, name string) {
 	principal, ok := h.principalForReadSensitive(w, r)
 	if !ok {
+		h.observePeekRejection(name, adminQueueOutcomeForbidden)
 		return
 	}
 	opts, ok := parsePeekQueryParams(w, r)
 	if !ok {
+		h.observePeekRejection(name, adminQueueOutcomeValidation)
 		return
 	}
 	result, err := h.source.AdminPeekQueue(r.Context(), principal, name, opts)
@@ -594,9 +665,11 @@ func parsePeekQueryParams(w http.ResponseWriter, r *http.Request) (PeekMessageOp
 func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name string) {
 	principal, ok := h.principalForWriteOnPurge(w, r)
 	if !ok {
+		h.observePurgeRejection(name, adminQueueOutcomeForbidden)
 		return
 	}
 	if strings.TrimSpace(name) == "" {
+		h.observePurgeRejection(name, adminQueueOutcomeValidation)
 		writeJSONError(w, http.StatusBadRequest, "invalid_queue_name", "queue name is required")
 		return
 	}
