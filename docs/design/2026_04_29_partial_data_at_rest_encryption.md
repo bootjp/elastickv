@@ -35,7 +35,8 @@ Date: 2026-04-29
 | 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, the remaining §9.2 metrics (`active_dek_id`, `last_proposed_index_per_raft_dek`, `kek_unwrap_seconds`, `sidecar_raft_index`), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
+| 9C-6 | §5.4 rewrite-job decisions: `ClassifyMVCCRewrite` (which MVCC versions a rotation must re-encrypt, iterating `(user_key, version_ts)` rather than `user_key`, so history under the retiring DEK is not left behind) and `RewriteThrottle` (the `--rate=N MiB/s` inter-batch yield, computed on cumulative bytes so a stalled job cannot bank idle time and burst). Decision layer only — no store, no clock, no Raft. | shipped | — |
+| 9C+ | Rotation budget/rewrap/retire, the rewrite job's execution half, admission-control wiring, the remaining §9.2 metrics (`active_dek_id`, `last_proposed_index_per_raft_dek`, `kek_unwrap_seconds`, `sidecar_raft_index`), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8, §9.2) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
