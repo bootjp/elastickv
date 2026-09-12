@@ -349,6 +349,12 @@ export interface KeyVizRow {
   route_ids?: number[];
   route_ids_truncated?: boolean;
   route_count: number;
+  // Present only when the route is genuinely sub-divided
+  // (sub_bucket_count > 1). Test sub_bucket_count, never sub_bucket:
+  // bucket zero of a sub-divided route legitimately has index 0 and
+  // is omitted from the JSON by omitempty.
+  sub_bucket?: number;
+  sub_bucket_count?: number;
   values: number[];
   // Row-level conflict flag — the OR of conflicts[]. True when ≥2
   // nodes reported a different non-zero value for the same cell,
