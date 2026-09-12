@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -39,6 +40,8 @@ type S3ObjectClient interface {
 	UploadPart(context.Context, *s3.UploadPartInput, ...func(*s3.Options)) (*s3.UploadPartOutput, error)
 	CompleteMultipartUpload(context.Context, *s3.CompleteMultipartUploadInput, ...func(*s3.Options)) (*s3.CompleteMultipartUploadOutput, error)
 	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
+	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
+	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
 }
 
 type S3StoreConfig struct {
@@ -130,7 +133,7 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, opt
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	if err := s.putObjectIfAbsent(ctx, normalized, body, opts); err != nil {
+	if err := s.putObject(ctx, normalized, body, opts, true); err != nil {
 		if errors.Is(err, ErrObjectConflict) {
 			return ObjectInfo{}, err
 		}
@@ -142,20 +145,41 @@ func (s *S3Store) PutObject(ctx context.Context, key string, body io.Reader, opt
 	return s.verifyS3PutObject(ctx, normalized, opts)
 }
 
-func (s *S3Store) putObjectIfAbsent(ctx context.Context, key string, body io.Reader, opts PutOptions) error {
-	return s.putObjectWithRetry(key, body, func() error {
+func (s *S3Store) RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error) {
+	if err := validatePutOptions(opts); err != nil {
+		return ObjectInfo{}, err
+	}
+	normalized, err := validateStoreObjectKey(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := s.putObject(ctx, normalized, body, opts, false); err != nil {
+		return ObjectInfo{}, err
+	}
+	return s.verifyS3PutObject(ctx, normalized, opts)
+}
+
+func (s *S3Store) putObject(ctx context.Context, key string, body io.Reader, opts PutOptions, ifAbsent bool) error {
+	put := func() error {
 		if opts.Size > s.multipartThreshold {
-			return s.putMultipartIfAbsent(ctx, key, body, opts)
+			return s.putMultipart(ctx, key, body, opts, ifAbsent)
 		}
 		input, err := s.putObjectInput(key, body, opts)
 		if err != nil {
 			return err
 		}
+		if !ifAbsent {
+			input.IfNoneMatch = nil
+		}
 		if _, err = s.client.PutObject(ctx, input); err != nil {
 			return errors.Wrap(err, "put s3 object")
 		}
 		return nil
-	})
+	}
+	if !ifAbsent {
+		return put()
+	}
+	return s.putObjectWithRetry(key, body, put)
 }
 
 func (s *S3Store) putObjectWithRetry(
@@ -182,11 +206,12 @@ func (s *S3Store) putObjectWithRetry(
 		key, s3ConditionalWriteRetries)
 }
 
-func (s *S3Store) putMultipartIfAbsent(
+func (s *S3Store) putMultipart(
 	ctx context.Context,
 	key string,
 	body io.Reader,
 	opts PutOptions,
+	ifAbsent bool,
 ) (retErr error) {
 	partSize, err := multipartPartSize(opts.Size, s.multipartPartSize)
 	if err != nil {
@@ -206,7 +231,7 @@ func (s *S3Store) putMultipartIfAbsent(
 	if err != nil {
 		return err
 	}
-	if err := s.completeMultipartUpload(ctx, key, uploadID, opts.Size, parts); err != nil {
+	if err := s.completeMultipartUpload(ctx, key, uploadID, opts.Size, parts, ifAbsent); err != nil {
 		return err
 	}
 	completed = true
@@ -411,17 +436,21 @@ func (s *S3Store) completeMultipartUpload(
 	uploadID string,
 	size int64,
 	parts []types.CompletedPart,
+	ifAbsent bool,
 ) error {
-	_, err := s.client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+	input := &s3.CompleteMultipartUploadInput{
 		Bucket:        aws.String(s.bucket),
 		Key:           aws.String(key),
 		UploadId:      aws.String(uploadID),
-		IfNoneMatch:   aws.String("*"),
 		MpuObjectSize: aws.Int64(size),
 		MultipartUpload: &types.CompletedMultipartUpload{
 			Parts: parts,
 		},
-	})
+	}
+	if ifAbsent {
+		input.IfNoneMatch = aws.String("*")
+	}
+	_, err := s.client.CompleteMultipartUpload(ctx, input)
 	if err != nil {
 		return errors.Wrap(err, "complete s3 multipart upload")
 	}
@@ -511,6 +540,7 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, Obj
 		out.Metadata,
 		out.ChecksumSHA256,
 		out.ChecksumType,
+		out.LastModified,
 		out.ServerSideEncryption,
 		out.SSEKMSKeyId,
 	)
@@ -522,6 +552,7 @@ func (s *S3Store) GetObject(ctx context.Context, key string) (io.ReadCloser, Obj
 		_ = out.Body.Close()
 		return nil, ObjectInfo{}, err
 	}
+	info.ETag = aws.ToString(out.ETag)
 	return out.Body, info, nil
 }
 
@@ -550,6 +581,7 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (ObjectInfo, bool,
 		out.Metadata,
 		out.ChecksumSHA256,
 		out.ChecksumType,
+		out.LastModified,
 		out.ServerSideEncryption,
 		out.SSEKMSKeyId,
 	)
@@ -559,6 +591,9 @@ func (s *S3Store) HeadObject(ctx context.Context, key string) (ObjectInfo, bool,
 	if err := s.validateS3ObjectEncryption(normalized, info); err != nil {
 		return ObjectInfo{}, false, err
 	}
+	// Carried so retention can use it as the compare-and-delete
+	// precondition on DeleteObjectIfUnmodified.
+	info.ETag = aws.ToString(out.ETag)
 	return info, true, nil
 }
 
@@ -678,6 +713,7 @@ func s3ObjectInfo(
 	metadata map[string]string,
 	checksumSHA256 *string,
 	checksumType types.ChecksumType,
+	updatedAt *time.Time,
 	encryption types.ServerSideEncryption,
 	kmsKeyID *string,
 ) (ObjectInfo, error) {
@@ -691,6 +727,7 @@ func s3ObjectInfo(
 	return ObjectInfo{
 		Key:                  key,
 		Size:                 *contentLength,
+		UpdatedAt:            aws.ToTime(updatedAt),
 		SHA256:               sha,
 		ServerSideEncryption: string(encryption),
 		SSEKMSKeyID:          aws.ToString(kmsKeyID),
@@ -872,4 +909,228 @@ func isS3ConditionalConflict(err error) bool {
 		return false
 	}
 	return apiErr.ErrorCode() == "ConditionalRequestConflict"
+}
+
+var _ RetentionStore = (*S3Store)(nil)
+
+// listObjectsPageLimit bounds a single ListObjectsV2 page. The AWS
+// maximum is 1000; naming it keeps the mnd linter satisfied and the
+// intent legible.
+const listObjectsPageLimit int32 = 1000
+
+// ListObjects pages through every object under prefix.
+//
+// Per the RetentionStore contract this is all-or-error: any page
+// failure returns an error and no partial slice, because §5 makes
+// "an incomplete scan performs no deletes" a safety property. A
+// truncated listing would make a live payload look unreferenced and
+// let phase 2 delete data a committed manifest still points at.
+func (s *S3Store) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	if s == nil || s.client == nil {
+		return nil, errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	listPrefix := s3ListSubtreePrefix(prefix)
+
+	var (
+		refs       []ObjectRef
+		token      *string
+		seenTokens = make(map[string]struct{})
+	)
+	for {
+		out, err := s.listObjectsPage(ctx, listPrefix, token)
+		if err != nil {
+			return nil, errors.Wrapf(err, "list objects under %q", prefix)
+		}
+		refs, err = appendListedObjects(refs, out, listPrefix)
+		if err != nil {
+			return nil, err
+		}
+
+		next, more, err := nextListPageToken(out, prefix)
+		if err != nil {
+			return nil, err
+		}
+		if !more {
+			return refs, nil
+		}
+		if err := rememberListToken(seenTokens, prefix, next); err != nil {
+			return nil, err
+		}
+		token = next
+	}
+}
+
+func s3ListSubtreePrefix(prefix string) string {
+	listPrefix := cleanObjectPrefix(prefix)
+	if listPrefix == "." {
+		return ""
+	}
+	return listPrefix + "/"
+}
+
+func (s *S3Store) listObjectsPage(
+	ctx context.Context,
+	prefix string,
+	token *string,
+) (*s3.ListObjectsV2Output, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	out, err := s.client.ListObjectsV2(ctx, &s3.ListObjectsV2Input{
+		Bucket:            aws.String(s.bucket),
+		Prefix:            aws.String(prefix),
+		ContinuationToken: token,
+		MaxKeys:           aws.Int32(listObjectsPageLimit),
+	})
+	if err != nil {
+		return nil, errors.Wrap(err, "list s3 objects page")
+	}
+	return out, nil
+}
+
+func rememberListToken(seen map[string]struct{}, prefix string, token *string) error {
+	if _, ok := seen[*token]; ok {
+		return errors.Wrapf(ErrIntegrity,
+			"list objects under %q returned non-advancing continuation token %q", prefix, *token)
+	}
+	seen[*token] = struct{}{}
+	return nil
+}
+
+// appendListedObjects converts one ListObjectsV2 page into ObjectRefs.
+func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output, listPrefix string) ([]ObjectRef, error) {
+	for _, obj := range out.Contents {
+		if obj.Key == nil {
+			continue
+		}
+		key := *obj.Key
+		if listPrefix != "" && !strings.HasPrefix(key, listPrefix) {
+			return nil, errors.Wrapf(ErrIntegrity, "listed object %q outside prefix %q", key, listPrefix)
+		}
+		if normalizeObjectKey(key) != key {
+			return nil, errors.Wrapf(ErrIntegrity, "listed object key %q is not canonical", key)
+		}
+		ref := ObjectRef{Key: key}
+		if obj.Size != nil {
+			ref.Size = *obj.Size
+		}
+		if obj.LastModified != nil {
+			ref.UpdatedAt = *obj.LastModified
+		}
+		refs = append(refs, ref)
+	}
+	return refs, nil
+}
+
+// nextListPageToken reports whether another page follows and returns
+// its continuation token.
+//
+// A truncated page with no continuation token cannot be continued and
+// would otherwise loop forever re-reading page one. §5 requires
+// pagination failure to fail closed, so it becomes an error rather
+// than a silently short listing.
+func nextListPageToken(out *s3.ListObjectsV2Output, prefix string) (*string, bool, error) {
+	if out.IsTruncated == nil || !*out.IsTruncated {
+		// A page that says "complete" while still handing back a
+		// continuation token is self-contradictory, and believing the
+		// flag discards every later page. For a GC live-set scan that is
+		// not a cosmetic truncation: a manifest missed here leaves the
+		// payload it references unprotected, and retention reclaims data
+		// a restore still needs. Fail closed like every other pagination
+		// failure in §5 rather than returning a short listing.
+		if out.NextContinuationToken != nil && *out.NextContinuationToken != "" {
+			return nil, false, errors.Wrapf(ErrIntegrity,
+				"list objects under %q reported a complete page with a continuation token", prefix)
+		}
+		return nil, false, nil
+	}
+	if out.NextContinuationToken == nil || *out.NextContinuationToken == "" {
+		return nil, false, errors.Wrapf(ErrIntegrity,
+			"list objects under %q returned a truncated page with no continuation token", prefix)
+	}
+	return out.NextContinuationToken, true, nil
+}
+
+// DeleteObject removes one object. S3 delete is idempotent, so an
+// already-absent key is not an error.
+//
+// Versioned buckets: a delete without a VersionId only writes a delete
+// marker, so the bytes survive as a noncurrent version that later
+// ListObjectsV2 scans cannot see. Retention would then report
+// successful reclamation while storage kept growing. Reclaiming those
+// versions requires enumerating them (ListObjectVersions) and deleting
+// each VersionId, which this store deliberately does not do — whether
+// to enumerate versions, refuse versioned buckets outright, or require
+// a noncurrent-version lifecycle policy is a deployment decision. Until
+// that is settled, a versioned backup bucket MUST carry a
+// noncurrent-version expiration lifecycle rule.
+func (s *S3Store) DeleteObject(ctx context.Context, key string) error {
+	if s == nil || s.client == nil {
+		return errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	normalized, err := validateStoreObjectKey(key)
+	if err != nil {
+		return err
+	}
+	if _, err := s.client.DeleteObject(ctx, &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(normalized),
+	}); err != nil {
+		return errors.Wrapf(err, "delete object %s", key)
+	}
+	return nil
+}
+
+// DeleteObjectIfUnmodified deletes key only when it still matches
+// cond, mapping S3's 412 precondition failure to ErrObjectModified.
+//
+// When cond carries an ETag this is an exact compare-and-delete via
+// If-Match. Without one it falls back to If-Match-Last-Modified-Time
+// plus If-Match-Size, which is the same contract at coarser
+// resolution. A store that honours neither would silently degrade to
+// an unconditional delete, so an empty condition is refused instead.
+func (s *S3Store) DeleteObjectIfUnmodified(ctx context.Context, key string, cond DeletePrecondition) error {
+	if s == nil || s.client == nil {
+		return errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	normalized, err := validateStoreObjectKey(key)
+	if err != nil {
+		return err
+	}
+	input := &s3.DeleteObjectInput{
+		Bucket: aws.String(s.bucket),
+		Key:    aws.String(normalized),
+	}
+	switch {
+	case strings.TrimSpace(cond.ETag) != "":
+		input.IfMatch = aws.String(cond.ETag)
+	case !cond.UpdatedAt.IsZero():
+		input.IfMatchLastModifiedTime = aws.Time(cond.UpdatedAt)
+		input.IfMatchSize = aws.Int64(cond.Size)
+	default:
+		return errors.Wrapf(ErrInvalidOptions,
+			"conditional delete of %s requires an etag or a last-modified time", key)
+	}
+	if _, err := s.client.DeleteObject(ctx, input); err != nil {
+		if isPreconditionFailed(err) {
+			return errors.Wrapf(ErrObjectModified,
+				"object %s changed since it was validated for deletion", key)
+		}
+		return errors.Wrapf(err, "conditional delete object %s", key)
+	}
+	return nil
+}
+
+// isPreconditionFailed reports whether err is S3's 412 response to a
+// failed If-Match on delete.
+func isPreconditionFailed(err error) bool {
+	var responseErr interface{ HTTPStatusCode() int }
+	if errors.As(err, &responseErr) && responseErr.HTTPStatusCode() == http.StatusPreconditionFailed {
+		return true
+	}
+	var apiErr smithy.APIError
+	if errors.As(err, &apiErr) {
+		return apiErr.ErrorCode() == "PreconditionFailed"
+	}
+	return false
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -15,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
 	"github.com/aws/smithy-go"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -72,12 +74,14 @@ func TestS3StorePutHeadGetPreservesIntegrityMetadata(t *testing.T) {
 	require.True(t, ok)
 	require.Equal(t, int64(len(body)), head.Size)
 	require.Equal(t, sha, head.SHA256)
+	require.False(t, head.UpdatedAt.IsZero())
 	require.Equal(t, types.ChecksumModeEnabled, fake.lastHeadObjectChecksumMode())
 
 	reader, gotInfo, err := store.GetObject(ctx, "snapshots/body.fsm")
 	require.NoError(t, err)
 	defer func() { require.NoError(t, reader.Close()) }()
 	require.Equal(t, sha, gotInfo.SHA256)
+	require.Equal(t, head.UpdatedAt, gotInfo.UpdatedAt)
 	require.Equal(t, types.ChecksumModeEnabled, fake.lastGetObjectChecksumMode())
 	gotBody, err := io.ReadAll(reader)
 	require.NoError(t, err)
@@ -131,7 +135,7 @@ func TestS3StoreConflictHashesExistingObjectWithoutIntegrityMetadata(t *testing.
 	key := "snapshots/body.fsm"
 	body := []byte("same-body")
 	sha := hexSHA256Bytes(body)
-	fake.putRawObject("backup-bucket", key, body, nil, nil)
+	fake.putRawObject(key, body, nil, nil)
 
 	info, err := store.PutObject(ctx, key, strings.NewReader("not-read-on-conflict"), PutOptions{
 		Size:   int64(len(body)),
@@ -149,7 +153,7 @@ func TestS3StoreConflictRejectsExistingObjectWithoutIntegrityMetadataMismatch(t 
 	key := "snapshots/body.fsm"
 	existing := []byte("aaaa")
 	candidate := []byte("bbbb")
-	fake.putRawObject("backup-bucket", key, existing, nil, nil)
+	fake.putRawObject(key, existing, nil, nil)
 
 	_, err := store.PutObject(ctx, key, strings.NewReader("not-read-on-conflict"), PutOptions{
 		Size:   int64(len(candidate)),
@@ -296,7 +300,7 @@ func TestS3StoreHeadAndGetRequestChecksumModeForFullObjectValidation(t *testing.
 	metadataSHA := hexSHA256Bytes([]byte("metadata-body"))
 	fullObjectChecksum, err := sha256HexToBase64(hexSHA256Bytes([]byte("full-object-body")))
 	require.NoError(t, err)
-	fake.putRawObject("backup-bucket", key, []byte("body"), map[string]string{
+	fake.putRawObject(key, []byte("body"), map[string]string{
 		s3MetadataSHA256: metadataSHA,
 	}, aws.String(fullObjectChecksum), types.ChecksumTypeFullObject)
 
@@ -375,6 +379,14 @@ type fakeS3Client struct {
 	nextUploadID         int
 	uploadedParts        int
 	multipartCompletes   int
+	// Retention/GC listing controls.
+	listPageSize                int
+	listOmitContinuationToken   bool
+	listRepeatContinuationToken bool
+	listErr                     error
+	listModTime                 time.Time
+	listPrefixes                []string
+	deletes                     []string
 }
 
 type fakeS3Object struct {
@@ -384,6 +396,7 @@ type fakeS3Object struct {
 	checksumType         types.ChecksumType
 	serverSideEncryption types.ServerSideEncryption
 	kmsKeyID             *string
+	modifiedAt           time.Time
 }
 
 type fakeMultipartUpload struct {
@@ -485,6 +498,7 @@ func (c *fakeS3Client) PutObject(_ context.Context, input *s3.PutObjectInput, _ 
 		checksumType:         s3ChecksumTypeForSHA(input.ChecksumSHA256),
 		serverSideEncryption: input.ServerSideEncryption,
 		kmsKeyID:             input.SSEKMSKeyId,
+		modifiedAt:           time.Now().UTC(),
 	}
 	return &s3.PutObjectOutput{}, nil
 }
@@ -507,8 +521,10 @@ func (c *fakeS3Client) HeadObject(_ context.Context, input *s3.HeadObjectInput, 
 		Metadata:             metadata,
 		ChecksumSHA256:       checksum,
 		ChecksumType:         checksumType,
+		LastModified:         aws.Time(obj.modifiedAt),
 		ServerSideEncryption: obj.serverSideEncryption,
 		SSEKMSKeyId:          obj.kmsKeyID,
+		ETag:                 aws.String(fakeS3ETag(obj.body)),
 	}, nil
 }
 
@@ -532,6 +548,7 @@ func (c *fakeS3Client) GetObject(_ context.Context, input *s3.GetObjectInput, _ 
 		Metadata:             metadata,
 		ChecksumSHA256:       checksum,
 		ChecksumType:         checksumType,
+		LastModified:         aws.Time(obj.modifiedAt),
 		ServerSideEncryption: obj.serverSideEncryption,
 		SSEKMSKeyId:          obj.kmsKeyID,
 	}, nil
@@ -615,6 +632,7 @@ func (c *fakeS3Client) CompleteMultipartUpload(
 		checksumType:         s3ChecksumTypeForSHA(upload.checksum),
 		serverSideEncryption: upload.serverSideEncryption,
 		kmsKeyID:             upload.kmsKeyID,
+		modifiedAt:           time.Now().UTC(),
 	}
 	c.multipartCompletes++
 	delete(c.multipart, uploadID)
@@ -692,7 +710,7 @@ func (c *fakeS3Client) getAttempts() int {
 	return c.gets
 }
 
-func (c *fakeS3Client) putRawObject(bucket string, key string, body []byte, metadata map[string]string, checksum *string, checksumType ...types.ChecksumType) {
+func (c *fakeS3Client) putRawObject(key string, body []byte, metadata map[string]string, checksum *string, checksumType ...types.ChecksumType) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	clonedMetadata := make(map[string]string, len(metadata))
@@ -703,12 +721,13 @@ func (c *fakeS3Client) putRawObject(bucket string, key string, body []byte, meta
 	if len(checksumType) > 0 {
 		storedChecksumType = checksumType[0]
 	}
-	c.objects[bucket+"/"+key] = fakeS3Object{
+	c.objects["backup-bucket/"+key] = fakeS3Object{
 		body:                 append([]byte(nil), body...),
 		metadata:             clonedMetadata,
 		checksum:             checksum,
 		checksumType:         storedChecksumType,
 		serverSideEncryption: types.ServerSideEncryptionAes256,
+		modifiedAt:           time.Now().UTC(),
 	}
 }
 
@@ -726,6 +745,139 @@ func fakeS3ChecksumForMode(mode types.ChecksumMode, obj fakeS3Object) (*string, 
 	return obj.checksum, obj.checksumType
 }
 
+// listMaxKeys lets a test force pagination without uploading 1000
+// objects; zero means "use the request's MaxKeys".
+func (c *fakeS3Client) ListObjectsV2(
+	_ context.Context, input *s3.ListObjectsV2Input, _ ...func(*s3.Options),
+) (*s3.ListObjectsV2Output, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.listErr != nil {
+		return nil, c.listErr
+	}
+
+	bucketPrefix := aws.ToString(input.Bucket) + "/"
+	wantPrefix := aws.ToString(input.Prefix)
+	c.listPrefixes = append(c.listPrefixes, wantPrefix)
+	keys := c.listObjectKeysLocked(bucketPrefix, wantPrefix)
+	start, end := c.listPageBounds(keys, input.ContinuationToken)
+	out := &s3.ListObjectsV2Output{
+		Contents: c.listPageContentsLocked(bucketPrefix, keys[start:end]),
+	}
+	c.setListContinuation(out, input, keys, start, end)
+	return out, nil
+}
+
+func (c *fakeS3Client) listObjectKeysLocked(bucketPrefix, wantPrefix string) []string {
+	keys := make([]string, 0, len(c.objects))
+	for stored := range c.objects {
+		key, ok := strings.CutPrefix(stored, bucketPrefix)
+		if !ok || !strings.HasPrefix(key, wantPrefix) {
+			continue
+		}
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+func (c *fakeS3Client) listPageBounds(keys []string, token *string) (int, int) {
+	start := 0
+	if value := aws.ToString(token); value != "" {
+		start = sort.SearchStrings(keys, value)
+	}
+	pageSize := c.listPageSize
+	if pageSize <= 0 {
+		pageSize = len(keys)
+	}
+	return start, min(start+pageSize, len(keys))
+}
+
+func (c *fakeS3Client) listPageContentsLocked(bucketPrefix string, keys []string) []types.Object {
+	contents := make([]types.Object, 0, len(keys))
+	for _, key := range keys {
+		obj := c.objects[bucketPrefix+key]
+		modifiedAt := obj.modifiedAt
+		if !c.listModTime.IsZero() {
+			modifiedAt = c.listModTime
+		}
+		contents = append(contents, types.Object{
+			Key:          aws.String(key),
+			Size:         aws.Int64(int64(len(obj.body))),
+			LastModified: aws.Time(modifiedAt),
+			ETag:         aws.String(fakeS3ETag(obj.body)),
+		})
+	}
+	return contents
+}
+
+func (c *fakeS3Client) setListContinuation(
+	out *s3.ListObjectsV2Output,
+	input *s3.ListObjectsV2Input,
+	keys []string,
+	start int,
+	end int,
+) {
+	if end >= len(keys) {
+		return
+	}
+	out.IsTruncated = aws.Bool(true)
+	if c.listOmitContinuationToken {
+		return
+	}
+	out.NextContinuationToken = aws.String(c.nextListContinuationToken(input, keys, start, end))
+}
+
+func (c *fakeS3Client) nextListContinuationToken(
+	input *s3.ListObjectsV2Input,
+	keys []string,
+	start int,
+	end int,
+) string {
+	if !c.listRepeatContinuationToken {
+		return keys[end]
+	}
+	if token := aws.ToString(input.ContinuationToken); token != "" {
+		return token
+	}
+	return keys[start]
+}
+
+func (c *fakeS3Client) listedPrefixes() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.listPrefixes...)
+}
+
+func (c *fakeS3Client) DeleteObject(
+	_ context.Context, input *s3.DeleteObjectInput, _ ...func(*s3.Options),
+) (*s3.DeleteObjectOutput, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deletes = append(c.deletes, aws.ToString(input.Key))
+	storeKey := fakeS3ClientKey(input.Bucket, input.Key)
+	if want := aws.ToString(input.IfMatch); want != "" {
+		obj, ok := c.objects[storeKey]
+		if !ok {
+			return nil, &types.NotFound{}
+		}
+		if fakeS3ETag(obj.body) != want {
+			return nil, &smithy.GenericAPIError{
+				Code:    "PreconditionFailed",
+				Message: "At least one of the pre-conditions you specified did not hold",
+			}
+		}
+	}
+	delete(c.objects, storeKey)
+	return &s3.DeleteObjectOutput{}, nil
+}
+
+// fakeS3ETag derives a stable ETag from the object bytes, matching
+// S3's single-part semantics closely enough for the If-Match tests.
+func fakeS3ETag(body []byte) string {
+	return `"` + hexSHA256Bytes(body)[:32] + `"`
+}
+
 func fakeS3ClientKey(bucket *string, key *string) string {
 	return aws.ToString(bucket) + "/" + aws.ToString(key)
 }
@@ -736,4 +888,248 @@ func cloneStringPtr(value *string) *string {
 	}
 	cloned := *value
 	return &cloned
+}
+
+// TestS3StoreListObjectsPagesThroughEveryPage proves the lister
+// honours its all-or-error contract across pages. Retention's phase-2
+// safety depends on a complete listing: a payload missed by a
+// truncated page would look unreferenced and be reclaimed while a
+// committed manifest still points at it.
+func TestS3StoreListObjectsPagesThroughEveryPage(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	client.listPageSize = 2
+	client.listModTime = time.Unix(1_700_000_000, 0).UTC()
+	store := newTestS3Store(t, client)
+
+	want := make([]string, 0, 5)
+	for i := range 5 {
+		key := fmt.Sprintf("cluster-a/v1/payloads/obj-%d.fsm", i)
+		body := []byte(key)
+		_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+			Size:   int64(len(body)),
+			SHA256: hexSHA256Bytes(body),
+		})
+		require.NoError(t, err)
+		want = append(want, key)
+	}
+
+	refs, err := store.ListObjects(ctx, "cluster-a/v1/payloads")
+	require.NoError(t, err)
+
+	got := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		got = append(got, ref.Key)
+		require.Equal(t, client.listModTime, ref.UpdatedAt)
+	}
+	sort.Strings(got)
+	require.Equal(t, want, got, "every page must be returned")
+}
+
+func TestS3StoreListObjectsDelimitsSubtreePrefix(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+	realKey := "cluster-a/v1/payloads/obj.fsm"
+	siblingKey := "cluster-a/v1/payloads-archive/obj.fsm"
+	client.putRawObject(realKey, []byte("real"), nil, nil)
+	client.putRawObject(siblingKey, []byte("sibling"), nil, nil)
+
+	refs, err := store.ListObjects(ctx, "cluster-a/v1/payloads")
+	require.NoError(t, err)
+
+	require.Len(t, refs, 1)
+	require.Equal(t, realKey, refs[0].Key)
+	require.Equal(t, int64(len("real")), refs[0].Size)
+	require.False(t, refs[0].UpdatedAt.IsZero())
+	require.Equal(t, []string{"cluster-a/v1/payloads/"}, client.listedPrefixes())
+}
+
+// TestS3StoreListObjectsFailsClosedOnTruncatedPageWithoutToken pins
+// the pagination-failure branch: a truncated response with no
+// continuation token cannot be continued, so the lister must error
+// rather than return the partial set it has.
+func TestS3StoreListObjectsFailsClosedOnTruncatedPageWithoutToken(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	client.listPageSize = 1
+	client.listOmitContinuationToken = true
+	store := newTestS3Store(t, client)
+
+	for i := range 3 {
+		key := fmt.Sprintf("cluster-a/v1/payloads/obj-%d.fsm", i)
+		body := []byte(key)
+		_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+			Size:   int64(len(body)),
+			SHA256: hexSHA256Bytes(body),
+		})
+		require.NoError(t, err)
+	}
+
+	refs, err := store.ListObjects(ctx, "cluster-a/v1/payloads")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrIntegrity))
+	require.Nil(t, refs, "a partial listing must never be returned")
+}
+
+func TestS3StoreListObjectsRejectsNonAdvancingContinuationToken(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	client.listPageSize = 1
+	client.listRepeatContinuationToken = true
+	store := newTestS3Store(t, client)
+
+	for i := range 3 {
+		key := fmt.Sprintf("cluster-a/v1/payloads/obj-%d.fsm", i)
+		client.putRawObject(key, []byte(key), nil, nil)
+	}
+
+	refs, err := store.ListObjects(ctx, "cluster-a/v1/payloads")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrIntegrity))
+	require.Nil(t, refs, "a non-advancing token must fail closed")
+}
+
+func TestS3StoreListObjectsRejectsNoncanonicalKeys(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+	client.putRawObject("cluster-a/v1/payloads//obj.fsm", []byte("body"), nil, nil)
+
+	refs, err := store.ListObjects(ctx, "cluster-a/v1/payloads")
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrIntegrity))
+	require.Nil(t, refs, "a canonicalized alias must not be returned with another key's identity")
+}
+
+func TestS3StoreDeleteObjectIsIdempotentAndValidatesKeys(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+
+	body := []byte("payload")
+	key := "cluster-a/v1/payloads/gone.fsm"
+	_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: hexSHA256Bytes(body),
+	})
+	require.NoError(t, err)
+
+	require.NoError(t, store.DeleteObject(ctx, key))
+	// Deleting an absent key must stay a no-op so GC is retry-safe.
+	require.NoError(t, store.DeleteObject(ctx, key))
+	require.Equal(t, []string{key, key}, client.deletes)
+
+	require.ErrorIs(t, store.DeleteObject(ctx, "../escape"), ErrInvalidOptions)
+}
+
+// TestS3StoreConditionalDeleteUsesIfMatchAndMapsPreconditionFailure
+// covers the exact compare-and-delete the retention race fix depends
+// on: S3 must be asked to delete only the version GC validated, and a
+// 412 must surface as ErrObjectModified so GC treats it as a skip
+// rather than a failure.
+func TestS3StoreConditionalDeleteUsesIfMatchAndMapsPreconditionFailure(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+
+	key := "cluster-a/v1/payloads/sha256/ab/cond.fsm"
+	body := []byte("payload bytes")
+	_, err := store.PutObject(ctx, key, bytes.NewReader(body), PutOptions{
+		Size:   int64(len(body)),
+		SHA256: hexSHA256Bytes(body),
+	})
+	require.NoError(t, err)
+
+	info, ok, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.NotEmpty(t, info.ETag, "the store must carry the version token forward")
+
+	// A stale precondition must be refused, and must not delete.
+	err = store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{ETag: `"not-the-current-version"`})
+	require.Error(t, err)
+	require.True(t, errors.Is(err, ErrObjectModified))
+	_, stillThere, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, stillThere, "a failed precondition must leave the object in place")
+
+	// The observed version deletes.
+	require.NoError(t, store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{ETag: info.ETag}))
+	_, gone, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.False(t, gone)
+}
+
+// TestS3StoreConditionalDeleteRefusesAnEmptyPrecondition stops a
+// silent downgrade to an unconditional delete when neither an etag nor
+// a last-modified time is available.
+func TestS3StoreConditionalDeleteRefusesAnEmptyPrecondition(t *testing.T) {
+	ctx := context.Background()
+	client := newFakeS3Client()
+	store := newTestS3Store(t, client)
+
+	err := store.DeleteObjectIfUnmodified(ctx, "cluster-a/v1/payloads/sha256/ab/x.fsm", DeletePrecondition{})
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.Empty(t, client.deletes, "an unusable precondition must not reach the store")
+}
+
+// TestNextListPageTokenRejectsACompletePageCarryingAToken pins the fail-closed
+// handling of a self-contradictory S3 listing response.
+//
+// An endpoint that reports IsTruncated=false while still returning a
+// continuation token has more pages. Believing the flag drops them, and for the
+// GC live-set scan a dropped page means a manifest is never seen — so the
+// payload it references is absent from the live set and retention reclaims data
+// a restore still needs.
+func TestNextListPageTokenRejectsACompletePageCarryingAToken(t *testing.T) {
+	t.Parallel()
+
+	token := "page-2"
+	truthy := true
+	falsy := false
+
+	t.Run("complete with a token is a contradiction", func(t *testing.T) {
+		t.Parallel()
+		_, more, err := nextListPageToken(&s3.ListObjectsV2Output{
+			IsTruncated:           &falsy,
+			NextContinuationToken: &token,
+		}, "p")
+		require.ErrorIs(t, err, ErrIntegrity)
+		require.False(t, more)
+	})
+
+	t.Run("omitted IsTruncated with a token is the same contradiction", func(t *testing.T) {
+		t.Parallel()
+		_, more, err := nextListPageToken(&s3.ListObjectsV2Output{
+			NextContinuationToken: &token,
+		}, "p")
+		require.ErrorIs(t, err, ErrIntegrity)
+		require.False(t, more)
+	})
+
+	t.Run("genuinely complete stays complete", func(t *testing.T) {
+		t.Parallel()
+		next, more, err := nextListPageToken(&s3.ListObjectsV2Output{IsTruncated: &falsy}, "p")
+		require.NoError(t, err)
+		require.False(t, more)
+		require.Nil(t, next)
+	})
+
+	t.Run("truncated with a token continues", func(t *testing.T) {
+		t.Parallel()
+		next, more, err := nextListPageToken(&s3.ListObjectsV2Output{
+			IsTruncated:           &truthy,
+			NextContinuationToken: &token,
+		}, "p")
+		require.NoError(t, err)
+		require.True(t, more)
+		require.Equal(t, token, *next)
+	})
+
+	t.Run("truncated without a token still fails closed", func(t *testing.T) {
+		t.Parallel()
+		_, _, err := nextListPageToken(&s3.ListObjectsV2Output{IsTruncated: &truthy}, "p")
+		require.ErrorIs(t, err, ErrIntegrity)
+	})
 }

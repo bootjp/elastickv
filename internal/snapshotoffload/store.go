@@ -9,6 +9,8 @@ import (
 	"path"
 	"path/filepath"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/cockroachdb/errors"
 )
@@ -19,6 +21,234 @@ type ObjectStore interface {
 	HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error)
 }
 
+// ObjectRefresher updates an already-verified object's store metadata while
+// preserving its content. Publish uses this when it reuses a content-addressed
+// payload, so retention's payload grace window applies to the new publish too.
+type ObjectRefresher interface {
+	RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error)
+}
+
+// ObjectRef is one object seen by ListObjects.
+//
+// UpdatedAt is the object store's own last-modified time, not a value
+// carried inside the object. Retention uses it only for the phase-2
+// payload grace period, where the question is "has this object been
+// sitting unreferenced long enough", which is a property of the store
+// rather than of the snapshot.
+type ObjectRef struct {
+	Key       string
+	Size      int64
+	UpdatedAt time.Time
+	// ETag is the store's opaque version token for the exact bytes
+	// observed. It is the precondition DeleteObjectIfUnmodified uses
+	// to make reclamation a compare-and-delete rather than a
+	// check-then-delete. Empty when the store cannot supply one, in
+	// which case the size + mtime pair is the fallback precondition.
+	ETag string
+}
+
+// DeletePrecondition is the state a caller observed for an object,
+// used to make deletion conditional on the object not having changed
+// since.
+type DeletePrecondition struct {
+	ETag      string
+	Size      int64
+	UpdatedAt time.Time
+}
+
+// PreconditionFor returns the precondition describing ref.
+func PreconditionFor(ref ObjectRef) DeletePrecondition {
+	return DeletePrecondition{ETag: ref.ETag, Size: ref.Size, UpdatedAt: ref.UpdatedAt}
+}
+
+// RetentionStore is an ObjectStore that also supports the listing and
+// deletion that retention/GC needs (design §5).
+//
+// It is a separate interface rather than extra methods on ObjectStore
+// so the publish and restore paths keep working against a store that
+// can only put/get/head, while GC is a compile-time error to construct
+// over such a store. A silently-no-op GC would be far worse: retention
+// would appear configured while the bucket grew without bound.
+//
+// ListObjects is all-or-error by contract: it MUST return every object
+// under prefix or a non-nil error. §5 makes no-deletes-on-partial-scan
+// a safety property, and a lister that silently truncated a page would
+// make live payloads look unreferenced.
+type RetentionStore interface {
+	ObjectStore
+	ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error)
+	DeleteObject(ctx context.Context, key string) error
+
+	// DeleteObjectIfUnmodified deletes key only if it still matches
+	// cond, and returns ErrObjectModified otherwise.
+	//
+	// This is what makes payload reclamation safe against a
+	// concurrent publish. The grace window alone is not enough: a
+	// publisher that reuses a content-addressed payload refreshes the
+	// object to restart its grace, and an unconditional delete can
+	// still land between GC observing the old state and the publisher
+	// committing its manifest — leaving a committed manifest pointing
+	// at bytes that no longer exist. Making the delete conditional on
+	// the exact state GC validated turns that race into a skip.
+	DeleteObjectIfUnmodified(ctx context.Context, key string, cond DeletePrecondition) error
+}
+
+var _ RetentionStore = (*LocalStore)(nil)
+
+// ListObjects walks the local root below prefix. Directories and
+// irregular files are skipped; the returned keys are slash-separated
+// and relative to the store root, matching the keys PutObject accepts.
+func (s *LocalStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	if s == nil {
+		return nil, errors.Wrap(ErrInvalidOptions, "object store is required")
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	root, err := s.listRootForPrefix(prefix)
+	if err != nil {
+		return nil, err
+	}
+	var refs []ObjectRef
+	walk := func(walkPath string, entry os.DirEntry, err error) error {
+		if err != nil {
+			return s.walkEntryError(walkPath, root, err)
+		}
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return errors.WithStack(ctxErr)
+		}
+		ref, ok, refErr := s.objectRefForWalkEntry(walkPath, entry)
+		if refErr != nil {
+			return refErr
+		}
+		if ok {
+			refs = append(refs, ref)
+		}
+		return nil
+	}
+	if err := filepath.WalkDir(root, walk); err != nil {
+		return nil, errors.Wrapf(err, "list objects under %q", prefix)
+	}
+	return refs, nil
+}
+
+// walkEntryError translates a WalkDir error. A missing root is an
+// empty listing, not a failure: a bucket that has never been published
+// to has no group tree yet, and GC over it must be a clean no-op.
+func (s *LocalStore) walkEntryError(walkPath, root string, err error) error {
+	if os.IsNotExist(err) && walkPath == root {
+		return filepath.SkipAll
+	}
+	return errors.WithStack(err)
+}
+
+// objectRefForWalkEntry converts one walk entry into an ObjectRef,
+// reporting ok=false for entries that are not objects (directories,
+// sockets, symlinks, and the in-progress ".put-*" temp files
+// PutObject creates).
+func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (ObjectRef, bool, error) {
+	if entry.IsDir() || !entry.Type().IsRegular() {
+		return ObjectRef{}, false, nil
+	}
+	if strings.HasPrefix(entry.Name(), ".put-") {
+		return ObjectRef{}, false, nil
+	}
+	info, err := entry.Info()
+	if err != nil {
+		return ObjectRef{}, false, errors.WithStack(err)
+	}
+	rel, err := filepath.Rel(s.root, walkPath)
+	if err != nil {
+		return ObjectRef{}, false, errors.WithStack(err)
+	}
+	return ObjectRef{
+		Key:       filepath.ToSlash(rel),
+		Size:      info.Size(),
+		UpdatedAt: info.ModTime(),
+	}, true, nil
+}
+
+// listRootForPrefix resolves the directory a listing should walk.
+//
+// cleanObjectPrefix preserves ".." segments, so joining it blindly
+// would let a traversing prefix enumerate an ancestor or sibling tree
+// and leak those files' names, sizes and timestamps — while every
+// other local-store operation rejects the equivalent key through
+// pathForKey.
+func (s *LocalStore) listRootForPrefix(prefix string) (string, error) {
+	cleaned := cleanObjectPrefix(prefix)
+	if cleaned == "." {
+		return s.root, nil
+	}
+	// cleanObjectPrefix uses path (slash) semantics, but filepath.Join
+	// below interprets the platform separator — so on Windows a
+	// prefix like `..\sibling` would survive a slash-only check and
+	// then escape the root. Reject the native form too.
+	if !objectPathSegmentIsSafe(cleaned) {
+		return "", errors.Wrapf(ErrInvalidOptions, "invalid object prefix %q", prefix)
+	}
+	joined := filepath.Join(s.root, filepath.FromSlash(cleaned))
+	if !objectPathWithinRoot(s.root, joined) {
+		return "", errors.Wrapf(ErrInvalidOptions, "object prefix %q resolves outside the store root", prefix)
+	}
+	return joined, nil
+}
+
+// DeleteObjectIfUnmodified removes key only when it still matches
+// cond. See the RetentionStore contract for why the condition matters.
+func (s *LocalStore) DeleteObjectIfUnmodified(ctx context.Context, key string, cond DeletePrecondition) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	objectPath, err := s.pathForKey(key)
+	if err != nil {
+		return err
+	}
+
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+
+	stat, err := os.Stat(objectPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Already gone: the caller's intent is satisfied.
+			return nil
+		}
+		return errors.Wrapf(err, "stat object %s", key)
+	}
+	if stat.Size() != cond.Size || !stat.ModTime().Equal(cond.UpdatedAt) {
+		return errors.Wrapf(ErrObjectModified,
+			"object %s changed since it was validated for deletion", key)
+	}
+	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "delete object %s", key)
+	}
+	// Persist the unlink before reporting success. Without the
+	// directory sync a crash can resurrect an object GC already
+	// counted as reclaimed.
+	return syncDir(filepath.Dir(objectPath))
+}
+
+// DeleteObject removes one object. A already-absent object is not an
+// error: GC must be idempotent across retries and a concurrent
+// reclamation of the same key is a benign race.
+func (s *LocalStore) DeleteObject(ctx context.Context, key string) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	objectPath, err := s.pathForKey(key)
+	if err != nil {
+		return err
+	}
+	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "delete object %s", key)
+	}
+	// Persist the unlink before reporting success. Without the
+	// directory sync a crash can resurrect an object GC already
+	// counted as reclaimed.
+	return syncDir(filepath.Dir(objectPath))
+}
+
 type PutOptions struct {
 	Size        int64
 	SHA256      string
@@ -26,17 +256,29 @@ type PutOptions struct {
 }
 
 type ObjectInfo struct {
-	Key  string
-	Size int64
+	Key       string
+	Size      int64
+	UpdatedAt time.Time
 	// SHA256 is optional for metadata-only Head/Get paths; PutObject returns it
 	// when the writer verified the committed content.
 	SHA256               string
 	ServerSideEncryption string
 	SSEKMSKeyID          string
+	// ETag is the store's opaque version token, when it supplies one.
+	// Retention uses it as the compare-and-delete precondition.
+	ETag string
 }
 
 type LocalStore struct {
 	root string
+	// deleteMu serialises conditional deletes against refreshes made
+	// through this same store value. Within one process that makes
+	// compare-and-delete atomic. It cannot coordinate two processes
+	// sharing a directory — POSIX has no compare-and-unlink — so a
+	// cross-process local deployment keeps the residual race that the
+	// S3 store closes with If-Match. LocalStore is the dev/test and
+	// single-writer store; production offload targets S3.
+	deleteMu sync.Mutex
 }
 
 const localStoreDirPerm = 0o755
@@ -65,6 +307,30 @@ func (s *LocalStore) PutObject(ctx context.Context, key string, body io.Reader, 
 	}
 	defer func() { _ = os.Remove(tmpPath) }()
 	return s.commitTempObject(key, tmpPath, finalPath, info)
+}
+
+func (s *LocalStore) RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error) {
+	if err := validatePutOptions(opts); err != nil {
+		return ObjectInfo{}, err
+	}
+	finalPath, err := s.pathForKey(key)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := os.MkdirAll(filepath.Dir(finalPath), localStoreDirPerm); err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	tmpPath, info, err := writeLocalObjectTemp(ctx, filepath.Dir(finalPath), key, body, opts)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer func() { _ = os.Remove(tmpPath) }()
+	// Held across the replace so an in-process reclamation of this
+	// same payload cannot land between a validating stat and the
+	// unlink. See DeleteObjectIfUnmodified.
+	s.deleteMu.Lock()
+	defer s.deleteMu.Unlock()
+	return s.replaceObject(key, tmpPath, finalPath, info)
 }
 
 func (s *LocalStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
@@ -112,10 +378,101 @@ func (s *LocalStore) pathForKey(key string) (string, error) {
 		return "", errors.Wrap(ErrInvalidOptions, "object store is required")
 	}
 	normalized := normalizeObjectKey(key)
-	if normalized == "" || normalized == "." || normalized == ".." || strings.HasPrefix(normalized, "../") {
+	if !objectPathSegmentIsSafe(normalized) {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object key %q", key)
 	}
-	return filepath.Join(s.root, filepath.FromSlash(normalized)), nil
+	joined := filepath.Join(s.root, filepath.FromSlash(normalized))
+	if !objectPathWithinRoot(s.root, joined) {
+		return "", errors.Wrapf(ErrInvalidOptions, "object key %q resolves outside the store root", key)
+	}
+	return joined, nil
+}
+
+// objectPathSegmentIsSafe reports whether a normalized key or prefix
+// stays inside the store root once joined.
+//
+// The backslash check is not redundant on the slash-only forms:
+// normalizeObjectKey uses path (slash) semantics, so `..\victim`
+// survives every "/"-based test, and filepath.Join then interprets the
+// backslash on Windows and resolves outside the root. Both the key
+// path (Get/Head/Put/Delete) and the prefix path (ListObjects) route
+// through this, so a fix here cannot be applied to one and missed on
+// the other.
+func objectPathSegmentIsSafe(normalized string) bool {
+	switch {
+	case normalized == "", normalized == ".", normalized == "..":
+		return false
+	case strings.HasPrefix(normalized, "../"):
+		return false
+	case strings.ContainsRune(normalized, '\\'):
+		return false
+	case strings.HasPrefix(normalized, "/"):
+		// normalizeObjectKey trims ONE leading slash, so `//victim`
+		// arrives here as `/victim`: relative by none of the checks
+		// above, but rooted. filepath.Join("C:", "/victim") resolves to
+		// `C:\victim` against a drive-relative root, outside the store.
+		// A rooted key is never legitimate -- object keys are relative
+		// to the root by definition -- so reject rather than re-trim.
+		return false
+	case volumeQualified(normalized):
+		return false
+	default:
+		return true
+	}
+}
+
+// volumeQualified reports whether the first path segment carries a
+// Windows volume, as in `C:` or `C:foo`.
+//
+// filepath.VolumeName is deliberately not used: it returns "" on
+// non-Windows, so a test running on Linux or macOS would pass against a
+// key that escapes on Windows. The check is spelled out so it behaves
+// identically on every platform.
+func volumeQualified(normalized string) bool {
+	first := normalized
+	if idx := strings.IndexByte(first, '/'); idx >= 0 {
+		first = first[:idx]
+	}
+	idx := strings.IndexByte(first, ':')
+	if idx < 0 {
+		return false
+	}
+	// A single letter before the colon is a drive designator. Anything
+	// else containing a colon is still refused below by the caller's
+	// containment check, but keys like `a:b` are not volume-qualified.
+	return idx == 1 && isASCIILetter(first[0])
+}
+
+func isASCIILetter(c byte) bool {
+	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// objectPathWithinRoot reports whether joined actually resolves inside
+// root.
+//
+// This is the backstop for the character-level checks above: those
+// enumerate the escapes we know about, and this one states the property
+// we actually need. filepath.Rel answers it using the platform's own
+// separator and volume rules, so an escape neither check anticipated
+// still fails here instead of reaching the filesystem.
+//
+// It is deliberately unreachable today: every escape currently known is
+// refused earlier by objectPathSegmentIsSafe, so no input reaches the
+// store and trips this instead. That is the intended relationship
+// between the two layers, not a missing case -- a test that exercised
+// this through pathForKey would mean the character checks had a hole.
+// TestObjectPathWithinRootIsTheBackstop therefore covers the function
+// directly; if it ever starts firing in production, the character
+// checks need a new case rather than this one being relaxed.
+func objectPathWithinRoot(root, joined string) bool {
+	rel, err := filepath.Rel(filepath.Clean(root), filepath.Clean(joined))
+	if err != nil {
+		return false
+	}
+	if rel == "." || rel == ".." {
+		return false
+	}
+	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
 func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, error) {
@@ -130,8 +487,9 @@ func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, erro
 		return ObjectInfo{}, errors.Wrapf(ErrInvalidOptions, "object %s is not a regular file", key)
 	}
 	return ObjectInfo{
-		Key:  normalizeObjectKey(key),
-		Size: stat.Size(),
+		Key:       normalizeObjectKey(key),
+		Size:      stat.Size(),
+		UpdatedAt: stat.ModTime(),
 	}, nil
 }
 
@@ -156,9 +514,10 @@ func (s *LocalStore) hashedObjectInfoForPath(key, objectPath string) (ObjectInfo
 		return ObjectInfo{}, errors.WithStack(err)
 	}
 	return ObjectInfo{
-		Key:    normalizeObjectKey(key),
-		Size:   stat.Size(),
-		SHA256: hex.EncodeToString(sum.Sum(nil)),
+		Key:       normalizeObjectKey(key),
+		Size:      stat.Size(),
+		UpdatedAt: stat.ModTime(),
+		SHA256:    hex.EncodeToString(sum.Sum(nil)),
 	}, nil
 }
 
@@ -217,7 +576,17 @@ func (s *LocalStore) commitTempObject(key, tmpPath, finalPath string, expected O
 		}
 		return ObjectInfo{}, errors.WithStack(err)
 	}
-	return expected, nil
+	return s.verifyExistingObject(key, finalPath, expected)
+}
+
+func (s *LocalStore) replaceObject(key, tmpPath, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
+	if err := os.Rename(tmpPath, finalPath); err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	if err := syncDir(filepath.Dir(finalPath)); err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	return s.verifyExistingObject(key, finalPath, expected)
 }
 
 func (s *LocalStore) verifyExistingObject(key, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
