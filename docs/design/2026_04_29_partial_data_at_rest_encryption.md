@@ -2445,6 +2445,15 @@ different output bytes; FSM apply still deterministic), so no new
 Jepsen workload is required. A pass under the existing suite is the
 acceptance gate.
 
+**Implemented.** `lein test :only ...` aside, any workload accepts
+`--encryption`, which provisions the §5.1 KEK file on each node and
+starts the server with `--encryption-enabled`, `--kekFile` and
+`--encryptionSidecarPath`. The switch defaults off so the existing
+unencrypted runs are unchanged, and `server-args` is a pure function so
+a test can assert the flags actually reach the server — a `--encryption`
+run that silently produced an unencrypted cluster would report PASS and
+be recorded as evidence for this gate.
+
 ---
 
 ## 9. Operational concerns

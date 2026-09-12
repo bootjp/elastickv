@@ -495,7 +495,8 @@
                                 :sqs-port     node->port
                                 :sqs-region   sqs-region
                                 :raft-groups  (:raft-groups opts)
-                                :shard-ranges (:shard-ranges opts)}))
+                                :shard-ranges (:shard-ranges opts)
+                                :encryption   (:encryption opts)}))
          rate       (double (or (:rate opts) 5))
          time-limit (or (:time-limit opts) 30)
          ;; Drain must outlast the visibility-timeout window plus a
