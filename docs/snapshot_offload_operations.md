@@ -167,28 +167,69 @@ elastickv-snapshot-offload restore \
   --store=s3 --s3-bucket=my-backup-bucket --s3-region=ap-northeast-1 \
   --manifest-key='elastickv/v1/groups/1/snapshots/00000000000000004211-00000000000000000007.json' \
   --data-dir=/var/lib/elastickv/n1/group-1 \
+  --expect-group=1 \
   --peers='n1=10.0.0.1:50051,n2=10.0.0.2:50051,n3=10.0.0.3:50051'
 
 # 3. Repeat for every group the node hosts, then start it normally.
 ```
+
+### Every flag that says "group" must say the SAME group
+
+`--manifest-key`, `--data-dir`, `--expect-group` and `--peers` are four
+independent statements about which group you are restoring. Three of them
+used to be uncheckable against each other:
+
+- **`--expect-group` is required and is the only cross-check.** Nothing in
+  the restored directory records which group the data came from — the
+  artifacts carry index, term, peers and payload hash, and startup derives
+  the group from the directory layout. So pasting group 2's manifest key
+  into a group-1 restore produced a valid-looking directory that startup
+  then loaded as group 1: the wrong physical FSM under another group's
+  routing identity, with no error anywhere. The restore is now refused,
+  before the download and before the destination is created, so a mistaken
+  key costs nothing and leaves nothing behind.
+- **`--peers` must be that group's peer map, not group 1's.** Each group
+  has its own listener addresses from `--raftGroups` / `--raftGroupPeers`,
+  and restore persists the supplied peers into that group's data
+  directory. Copying the `:50051` endpoints from the example above into
+  every invocation leaves the other groups trying to reach the wrong Raft
+  endpoints, and they never form a quorum. Re-derive the peer list per
+  group the same way you re-derive the manifest key and the data dir.
 
 ### The `--data-dir` path must match what the server will open
 
 `--data-dir` is the **per-group** directory, not the node's `--raftDir`.
 The server derives it as:
 
-| Deployment | Group | Directory |
-|---|---|---|
-| multi-group (`--raftRedisMap` etc.) | any group *G* | `<raftDir>/<raftID>/group-<G>` |
-| single group | the default group | `<raftDir>/<raftID>` |
-| single-node, group 0 | 0 | `<raftDir>/<raftID>/group-0` |
+The rule the server actually applies (`groupDataDir`) is:
 
-Restoring a multi-group node into `<raftDir>/<raftID>` puts the data
-where the server never looks: startup finds the per-group directories
-empty and the restore is silently ignored. **A multi-group recovery
-must restore every group's manifest into its own `group-<G>`
-directory** — one `restore` invocation per group — or the node comes
-back with only the groups you happened to place correctly.
+- **group 0 always** gets `<raftDir>/<raftID>/group-0`.
+- **every other group** gets `group-<G>` **only when the node hosts more
+  than one _data_ group**, and `<raftDir>/<raftID>` otherwise.
+
+"More than one data group" is the exact condition, because
+`dataGroupsNeedMultiDirs` counts data groups and **excludes group 0**:
+
+| Deployment (`--raftGroups`) | Group | Directory |
+|---|---|---|
+| two or more data groups, e.g. `1,2` | any group *G* | `<raftDir>/<raftID>/group-<G>` |
+| a single data group, e.g. `1` | 1 | `<raftDir>/<raftID>` |
+| dedicated TSO **plus one** data group, e.g. `0,1` | 0 | `<raftDir>/<raftID>/group-0` |
+| dedicated TSO **plus one** data group, e.g. `0,1` | 1 | `<raftDir>/<raftID>` — **not** `group-1` |
+| dedicated TSO plus two or more data groups, e.g. `0,1,2` | any group *G* | `<raftDir>/<raftID>/group-<G>` |
+
+The fourth row is the one that catches people out. A node running the
+dedicated TSO group alongside a single data group *looks* multi-group —
+two entries in `--raftGroups` — but only group 0 is parked under
+`group-0`; the data group still opens `<raftDir>/<raftID>` directly.
+Restoring it into `group-1` puts the data where startup never looks.
+
+That is the general failure in both directions: a directory the server
+does not open is not an error, it is an empty group. Startup finds
+nothing, the restore is silently ignored, and the node comes back with
+only the groups you happened to place correctly. **Check the table per
+group before each invocation** rather than assuming one rule for the
+whole node.
 
 Restore verifies exact length and SHA-256 before the payload is accepted, then
 fsyncs and atomically renames it into place. Any integrity failure leaves the

@@ -58,6 +58,7 @@ func TestPublishAndRestorePhysicalSnapshotRoundTrip(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 9, ID: "n9", Address: "127.0.0.1:19009"},
 		},
+		ExpectGroupID: expectGroup(manifest.GroupID),
 	})
 	require.NoError(t, err)
 	require.Equal(t, int64(len(payload)), result.PayloadBytes)
@@ -95,10 +96,11 @@ func TestRestoreRejectsCorruptPayloadAndLeavesDestinationAbsent(t *testing.T) {
 
 	restoreDataDir := filepath.Join(root, "restored")
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:       store,
-		ManifestKey: manifest.ManifestKey,
-		DataDir:     restoreDataDir,
-		Peers:       singlePeer(),
+		Store:         store,
+		ManifestKey:   manifest.ManifestKey,
+		DataDir:       restoreDataDir,
+		Peers:         singlePeer(),
+		ExpectGroupID: expectGroup(manifest.GroupID),
 	})
 	require.ErrorIs(t, err, ErrIntegrity)
 	_, statErr := os.Stat(restoreDataDir)
@@ -376,10 +378,11 @@ func TestRestoreInlineManifestRejectsStaleSelfHashBeforePayloadDownload(t *testi
 	tracked := &countingObjectStore{ObjectStore: store}
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:    tracked,
-		Manifest: &tampered,
-		DataDir:  filepath.Join(root, "restored"),
-		Peers:    singlePeer(),
+		Store:         tracked,
+		Manifest:      &tampered,
+		DataDir:       filepath.Join(root, "restored"),
+		Peers:         singlePeer(),
+		ExpectGroupID: expectGroup(tampered.GroupID),
 	})
 	require.ErrorIs(t, err, ErrIntegrity)
 	require.Zero(t, tracked.getObjectCalls)
@@ -480,10 +483,11 @@ func TestRestorePreflightsExistingDestinationBeforePayloadDownload(t *testing.T)
 	require.NoError(t, os.Mkdir(restoreDataDir, 0o755))
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:       store,
-		ManifestKey: manifest.ManifestKey,
-		DataDir:     restoreDataDir,
-		Peers:       singlePeer(),
+		Store:         store,
+		ManifestKey:   manifest.ManifestKey,
+		DataDir:       restoreDataDir,
+		Peers:         singlePeer(),
+		ExpectGroupID: expectGroup(manifest.GroupID),
 	})
 	require.ErrorIs(t, err, etcdraftengine.ErrExternalSnapshotRestoreExists)
 }
@@ -511,6 +515,7 @@ func TestRestoreRejectsInvalidPeersBeforePayloadDownload(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 0, ID: "n0", Address: "127.0.0.1:12000"},
 		},
+		ExpectGroupID: expectGroup(manifest.GroupID),
 	})
 	require.ErrorIs(t, err, ErrInvalidOptions)
 	require.Zero(t, tracked.getObjectCalls)
@@ -534,10 +539,11 @@ func TestRestoreHonorsCancelledContextBeforePayloadDownload(t *testing.T) {
 	tracked := &countingObjectStore{ObjectStore: store}
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:    tracked,
-		Manifest: manifest,
-		DataDir:  filepath.Join(root, "restored"),
-		Peers:    singlePeer(),
+		Store:         tracked,
+		Manifest:      manifest,
+		DataDir:       filepath.Join(root, "restored"),
+		Peers:         singlePeer(),
+		ExpectGroupID: expectGroup(manifest.GroupID),
 	})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, tracked.getObjectCalls)
@@ -723,4 +729,11 @@ func TestPublishVerifiesLeadershipAfterTheManifestAbsenceProbe(t *testing.T) {
 		"leadership must be re-verified AFTER the manifest absence probe")
 	require.NotContains(t, verifiedAfter, "put-manifest",
 		"and before the manifest object is created")
+}
+
+// expectGroup is the RestoreOptions.ExpectGroupID helper. The field is a
+// pointer because group 0 is a real group (the dedicated TSO group), so zero
+// cannot double as "not supplied".
+func expectGroup(groupID uint64) *uint64 {
+	return &groupID
 }

@@ -46,6 +46,7 @@ func TestPublishAndRestorePhysicalSnapshotRoundTripWithS3Store(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002"},
 		},
+		ExpectGroupID: expectGroup(manifest.GroupID),
 	})
 	require.NoError(t, err)
 	require.Equal(t, manifest.Payload.SHA256, result.PayloadSHA256)

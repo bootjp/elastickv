@@ -19,9 +19,15 @@ const (
 
 var (
 	ErrInvalidOptions = errors.New("snapshot offload: invalid options")
-	ErrIntegrity      = errors.New("snapshot offload: integrity check failed")
-	ErrObjectConflict = errors.New("snapshot offload: object conflict")
-	ErrObjectNotFound = errors.New("snapshot offload: object not found")
+
+	// ErrRestoreGroupMismatch reports a restore whose manifest belongs to a
+	// different Raft group than the operator named. It is deliberately its
+	// own sentinel: an operator repeating the restore command across groups
+	// needs to see "wrong group", not a generic invalid-options error.
+	ErrRestoreGroupMismatch = errors.New("snapshot offload: manifest group does not match the requested group")
+	ErrIntegrity            = errors.New("snapshot offload: integrity check failed")
+	ErrObjectConflict       = errors.New("snapshot offload: object conflict")
+	ErrObjectNotFound       = errors.New("snapshot offload: object not found")
 
 	// ErrNoPersistedSnapshot reports that the LOCAL data dir has no
 	// persisted snapshot yet. It is deliberately distinct from

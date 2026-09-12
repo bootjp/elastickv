@@ -157,3 +157,84 @@ func TestRunbookRestorePathsMatchGroupDataDir(t *testing.T) {
 		})
 	}
 }
+
+// TestRunbookRestorePathsFollowFromTheGroupTopology pins the runbook table the
+// way an operator actually reads it: from --raftGroups to a directory.
+//
+// TestRunbookRestorePathsMatchGroupDataDir above takes `multi` as an input, so
+// it cannot catch the case where a reader derives the wrong `multi` in the first
+// place — and that is the case that bites. dataGroupsNeedMultiDirs counts DATA
+// groups and excludes group 0, so a node running the dedicated TSO group
+// alongside a single data group has two entries in --raftGroups but is NOT
+// multi-dir: group 0 lands in group-0 while the data group opens
+// <raftDir>/<raftID> directly. Restoring that data group into group-1 puts it
+// where startup never looks, and an empty group is not an error.
+func TestRunbookRestorePathsFollowFromTheGroupTopology(t *testing.T) {
+	t.Parallel()
+
+	const (
+		raftDir = "/var/lib/elastickv"
+		raftID  = "n1"
+	)
+	spec := func(ids ...uint64) []groupSpec {
+		out := make([]groupSpec, 0, len(ids))
+		for _, id := range ids {
+			out = append(out, groupSpec{id: id, address: "127.0.0.1:50051"})
+		}
+		return out
+	}
+
+	for _, tc := range []struct {
+		name    string
+		groups  []groupSpec
+		groupID uint64
+		want    string
+	}{
+		{
+			name:   "two data groups: each gets its own dir",
+			groups: spec(1, 2), groupID: 1,
+			want: "/var/lib/elastickv/n1/group-1",
+		},
+		{
+			name:   "two data groups: the second one too",
+			groups: spec(1, 2), groupID: 2,
+			want: "/var/lib/elastickv/n1/group-2",
+		},
+		{
+			name:   "a single data group opens the node dir",
+			groups: spec(1), groupID: 1,
+			want: "/var/lib/elastickv/n1",
+		},
+		{
+			name:   "dedicated TSO plus one data group: group 0 is always group-0",
+			groups: spec(0, 1), groupID: 0,
+			want: "/var/lib/elastickv/n1/group-0",
+		},
+		{
+			// The row that catches people out: two --raftGroups entries but
+			// only one DATA group, so this is not a multi-dir deployment.
+			name:   "dedicated TSO plus one data group: the data group is NOT group-1",
+			groups: spec(0, 1), groupID: 1,
+			want: "/var/lib/elastickv/n1",
+		},
+		{
+			name:   "dedicated TSO plus two data groups is multi-dir again",
+			groups: spec(0, 1, 2), groupID: 1,
+			want: "/var/lib/elastickv/n1/group-1",
+		},
+		{
+			name:   "dedicated TSO plus two data groups: group 0 unchanged",
+			groups: spec(0, 1, 2), groupID: 0,
+			want: "/var/lib/elastickv/n1/group-0",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			// requested=true is the operator asking for per-group dirs; the
+			// topology decides whether that takes effect.
+			multi := effectiveMultiDataDirs(tc.groups, true)
+			require.Equal(t, tc.want, groupDataDir(raftDir, raftID, tc.groupID, multi),
+				"docs/snapshot_offload_operations.md documents this path for restore")
+		})
+	}
+}
