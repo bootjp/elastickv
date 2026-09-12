@@ -62,6 +62,39 @@
         (c/upload (str build-dir "/" bin) (str bin-dir "/" bin))
         (c/exec :chmod "755" (str bin-dir "/" bin))))))
 
+(defn raftadmin-binary
+  "Path to the uploaded raftadmin helper. Exposed so workloads that drive
+  membership changes do not each hardcode it."
+  []
+  raftadmin-bin)
+
+(defn parse-raft-status
+  "Parses `raftadmin status` output into a keyword map.
+
+  Numeric fields come back as longs and quoted strings unquoted, so a caller
+  can ask for :commit_index or :applied_index without re-deriving the format."
+  [out]
+  (->> (clojure.string/split-lines (or out ""))
+       (keep (fn [line]
+               (when-let [[_ k v] (re-matches #"\s*([a-z_]+):\s+(.*)" line)]
+                 (let [v (clojure.string/trim v)]
+                   [(keyword k)
+                    (cond
+                      (re-matches #"-?\d+" v) (Long/parseLong v)
+                      (and (> (count v) 1)
+                           (clojure.string/starts-with? v "\"")
+                           (clojure.string/ends-with? v "\""))
+                      (subs v 1 (dec (count v)))
+                      :else v)]))))
+       (into {})))
+
+(defn raft-status
+  "Runs `raftadmin status` from node against addr and returns the parsed map."
+  [node addr]
+  (parse-raft-status
+    (c/on node (c/su (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
+                             raftadmin-bin addr "status")))))
+
 (defn- node-addr
   "Returns host:port for the node and port."
   [node port]
@@ -176,6 +209,13 @@
                 "for i in $(seq 1 60); do if nc -z -w 1 $1 $2; then exit 0; fi; sleep 1; done; echo \\\"Timed out waiting for $1:$2\\\"; exit 1"
                 "--" (name node) (str p))))))
 
+(defn voter-peers
+  "The peers setup! joins as voters: every node after the bootstrap one,
+  minus any reserved learner candidate."
+  [nodes reserved]
+  (let [reserved (when reserved (name reserved))]
+    (vec (remove #(= reserved (name %)) (rest nodes)))))
+
 (defn- join-node!
   "Join peer into cluster via raftadmin, executed on bootstrap node."
   [bootstrap-node leader-addr peer-id peer-addr]
@@ -203,7 +243,11 @@
       (let [raft-groups (:raft-groups opts)
             grpc-port (or (:grpc-port opts) 50051)
             group-ids (when (seq raft-groups) (group-ids raft-groups))]
-        (doseq [peer (rest (:nodes test))]
+        ;; A reserved node is deliberately NOT made a voter, so a learner
+        ;; workload has a non-member to attach. Without this every node is a
+        ;; voter before the workload starts and :add-learner has nothing to
+        ;; act on.
+        (doseq [peer (voter-peers (:nodes test) (:reserve-learner opts))]
           (util/await-fn
             (fn []
               (try

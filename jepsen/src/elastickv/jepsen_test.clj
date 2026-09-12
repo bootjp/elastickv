@@ -1,6 +1,7 @@
 (ns elastickv.jepsen-test
   (:gen-class)
-  (:require [elastickv.redis-workload :as redis-workload]
+  (:require [elastickv.learner-workload :as learner-workload]
+            [elastickv.redis-workload :as redis-workload]
             [elastickv.redis-zset-safety-workload :as zset-safety-workload]
             [elastickv.dynamodb-workload :as dynamodb-workload]
             [elastickv.dynamodb-types-workload :as dynamodb-types-workload]
@@ -28,6 +29,10 @@
   ([] (elastickv-zset-safety-test {}))
   ([opts] (zset-safety-workload/elastickv-zset-safety-test opts)))
 
+(defn elastickv-learner-test
+  ([] (elastickv-learner-test {}))
+  ([opts] (learner-workload/elastickv-learner-test opts)))
+
 (def ^:private test-fns
   "Map of user-facing test names to their constructor fns. The first
   positional CLI arg selects which workload runs; if absent or unknown,
@@ -36,7 +41,8 @@
   {"elastickv-test"             elastickv-test
    "elastickv-zset-safety-test" elastickv-zset-safety-test
    "elastickv-dynamodb-test"    elastickv-dynamodb-test
-   "elastickv-s3-test"          elastickv-s3-test})
+   "elastickv-s3-test"          elastickv-s3-test
+   "elastickv-learner-test"     elastickv-learner-test})
 
 (defn elastickv-sqs-htfifo-test
   "HT-FIFO Jepsen test (PR 7b). Run via the workload's own -main:
