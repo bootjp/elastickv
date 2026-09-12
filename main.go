@@ -509,6 +509,7 @@ func run() error {
 		*encryptionEnabled,
 		readTracker,
 		cfg.engine,
+		metricsRegistry.EncryptionObserver(),
 		redisApplyObserver,
 		s3BlobBackfiller,
 	)
