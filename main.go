@@ -473,7 +473,10 @@ func run() error {
 	// are only attached to the applier when a KEK source is loaded
 	// (else the applier stays in the Stage 6A posture where
 	// ApplyBootstrap / ApplyRotation return ErrKEKNotConfigured).
-	kekWrapper, err := loadKEKAfterPreNonceStartupGuards(cfg)
+	// The KEK source is decorated for §9.2
+	// elastickv_encryption_kek_unwrap_seconds inside this call, before
+	// the startup guards run their own unwraps.
+	kekUnwrapper, err := loadKEKAfterPreNonceStartupGuards(cfg, metricsRegistry.KEKUnwrapObserver())
 	if err != nil {
 		return err
 	}
@@ -503,7 +506,7 @@ func run() error {
 			return metricsRegistry.RaftProposalObserver(groupID)
 		},
 		clock,
-		kekWrapper,
+		kekUnwrapper,
 		keystore,
 		*encryptionSidecarPath,
 		*encryptionEnabled,
@@ -626,7 +629,7 @@ func run() error {
 		defaultRuntime,
 		postCutoverProposerForRuntime(defaultRuntime, shardGroups),
 		*encryptionSidecarPath,
-		kekWrapper,
+		kekUnwrapper,
 		encWiring.raftEnvelope,
 		etcdraftengine.DeriveNodeID(*raftId),
 		encWiring.epoch,
@@ -644,7 +647,7 @@ func run() error {
 		cleanup:                         &cleanup,
 		s3BlobBackfiller:                s3BlobBackfiller,
 		encWiring:                       encWiring,
-		kekConfigured:                   kekWrapper != nil,
+		kekConfigured:                   kekUnwrapper != nil,
 		keyvizSampler:                   sampler,
 		autoSplitRuntime:                autoSplitRuntime,
 		encryptionConfChangeInterceptor: encryptionConfChangeInterceptor,
@@ -804,7 +807,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	if err != nil {
 		return distributionStartup{}, err
 	}
-	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock)
+	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock, in.encWiring.cache)
 	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
 	return distributionStartup{
 		defaultRuntime:   defaultRuntime,
@@ -1801,7 +1804,9 @@ func appliedIndexForEngine(engine raftengine.Engine) func() uint64 {
 	return applied.AppliedIndex
 }
 
-func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
+func loadKEKAfterPreNonceStartupGuards(
+	cfg runtimeConfig, unwrapObserver monitoring.KEKUnwrapObserver,
+) (kek.Wrapper, error) {
 	if err := checkEnvelopeCutoverDivergenceBeforeNonceBump(
 		*raftId,
 		*raftDir,
@@ -1813,7 +1818,7 @@ func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
 	); err != nil {
 		return nil, err
 	}
-	return loadKEKAndRunStartupGuards()
+	return loadKEKAndRunStartupGuards(unwrapObserver)
 }
 
 // loadKEKAndRunStartupGuards loads the configured KEK wrapper and
@@ -1838,11 +1843,18 @@ func loadKEKAfterPreNonceStartupGuards(cfg runtimeConfig) (kek.Wrapper, error) {
 // buildShardGroupsWithEncryptionWiring, still before Raft engine
 // startup; the sidecar-behind-raft-log gap guard remains later
 // because it needs an opened engine's applied index and scanner.
-func loadKEKAndRunStartupGuards() (kek.Wrapper, error) {
+func loadKEKAndRunStartupGuards(unwrapObserver monitoring.KEKUnwrapObserver) (kek.Wrapper, error) {
 	kekWrapper, err := loadKEKWrapperFromFlag()
 	if err != nil {
 		return nil, err
 	}
+	// Decorate BEFORE the guards run. CheckStartupGuards and
+	// kek.VerifyWrapper both perform real unwrap round trips — on a
+	// fresh node the preflight unwrap can be the only one that ever
+	// happens — so decorating after them would leave
+	// elastickv_encryption_kek_unwrap_seconds empty despite completed
+	// KMS calls.
+	kekWrapper = monitoring.NewTimedKEKUnwrapper(kekWrapper, unwrapObserver)
 	if err := encryption.CheckStartupGuards(encryption.StartupConfig{
 		EncryptionEnabled: *encryptionEnabled,
 		KEKConfigured:     kekWrapper != nil,
@@ -3304,7 +3316,13 @@ func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context
 // on top of the running raft runtimes. Kept separate from run() so
 // the latter stays under the cyclop complexity budget and so new
 // collectors can be added without widening run() further.
-func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, runtimes []*raftGroupRuntime, clock *kv.HLC) {
+func startMonitoringCollectors(
+	ctx context.Context,
+	reg *monitoring.Registry,
+	runtimes []*raftGroupRuntime,
+	clock *kv.HLC,
+	encryptionState monitoring.EncryptionStateSource,
+) {
 	reg.RaftObserver().Start(ctx, raftMonitorRuntimes(runtimes), raftMetricsObserveInterval)
 	if collector := reg.DispatchCollector(); collector != nil {
 		collector.Start(ctx, dispatchMonitorSources(runtimes), raftMetricsObserveInterval)
@@ -3317,6 +3335,9 @@ func startMonitoringCollectors(ctx context.Context, reg *monitoring.Registry, ru
 	}
 	if obs := reg.HLCObserver(); obs != nil && clock != nil {
 		obs.Start(ctx, clock, raftMetricsObserveInterval)
+	}
+	if obs := reg.EncryptionStateObserver(); obs != nil {
+		obs.Start(ctx, encryptionState, raftMetricsObserveInterval)
 	}
 }
 

@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/kek"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
+	"github.com/stretchr/testify/require"
 )
 
 // wiringEncryptionObserver records the §9.2 observations the production
@@ -119,4 +123,55 @@ func TestMetricsRegistryEncryptionObserverSatisfiesStoreInterface(t *testing.T) 
 	}
 	obs.ObserveEncryptionWrite(1, 10, 42)
 	obs.ObserveEncryptionDecryptFailure(encryption.DecryptFailureReasonTagMismatch)
+}
+
+// countingKEKObserver records how many unwraps were timed.
+type countingKEKObserver struct {
+	mu    sync.Mutex
+	count int
+}
+
+func (o *countingKEKObserver) ObserveEncryptionKEKUnwrap(time.Duration) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.count++
+}
+
+func (o *countingKEKObserver) total() int {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	return o.count
+}
+
+// TestTimedKEKUnwrapperCoversStartupPreflightUnwraps pins the
+// decoration ORDER. loadKEKAndRunStartupGuards runs CheckStartupGuards
+// and kek.VerifyWrapper, both of which perform real unwrap round trips
+// — on a fresh node the preflight unwrap can be the only one that ever
+// happens. Decorating after those guards would leave
+// elastickv_encryption_kek_unwrap_seconds empty despite completed KMS
+// calls, so the decorator must wrap the source before they run.
+func TestTimedKEKUnwrapperCoversStartupPreflightUnwraps(t *testing.T) {
+	t.Parallel()
+
+	obs := &countingKEKObserver{}
+	timed := monitoring.NewTimedKEKUnwrapper(preflightKEK{}, obs)
+	require.NotNil(t, timed)
+
+	// Both preflight paths unwrap through the decorated source.
+	require.NoError(t, kek.VerifyWrapper(timed))
+	require.Positive(t, obs.total(),
+		"the startup preflight unwrap must be timed, not bypass the decorator")
+}
+
+// preflightKEK is a minimal kek.Wrapper for the decoration-order test.
+type preflightKEK struct{}
+
+func (preflightKEK) Name() string { return "preflight-fake" }
+
+func (preflightKEK) Wrap(dek []byte) ([]byte, error) {
+	return append([]byte("w:"), dek...), nil
+}
+
+func (preflightKEK) Unwrap(wrapped []byte) ([]byte, error) {
+	return bytes.TrimPrefix(wrapped, []byte("w:")), nil
 }
