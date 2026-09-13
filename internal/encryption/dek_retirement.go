@@ -2,6 +2,7 @@ package encryption
 
 import (
 	"fmt"
+	"slices"
 	"sort"
 
 	"github.com/cockroachdb/errors"
@@ -46,9 +47,27 @@ var ErrRaftDEKWALStillReferences = errors.New("encryption: raft WAL still refere
 // against an unloaded DEK.
 var ErrIncompleteRetirementReport = errors.New("encryption: retirement report does not cover every cluster member")
 
+// ErrRetiringDEKStillActive reports an attempt to retire the DEK that is
+// still selected for writes or proposals.
+//
+// Its own sentinel because it is not "not yet eligible": every retention
+// criterion can legitimately pass for the ACTIVE key -- an empty cluster
+// reports a complete rewrite cursor, zero values and an advanced retention
+// floor for the key it is still writing under -- and unloading it breaks the
+// next write or proposal rather than an old read.
+var ErrRetiringDEKStillActive = errors.New(
+	"encryption: refusing to retire the DEK that is still active")
+
 // StorageRetirementReport is one node's view of a storage DEK.
 type StorageRetirementReport struct {
 	NodeID string
+	// ReportedKeyID is the DEK this report describes. Checked against the
+	// key being retired: a report gathered for a different key says nothing
+	// about this one, and accepting it silently would judge the wrong DEK.
+	ReportedKeyID uint32
+	// ActiveKeyID is the storage DEK this node is currently writing under.
+	// A successor must be active and must differ from the retiring key.
+	ActiveKeyID uint32
 	// RewriteCursorComplete is true when the rewrite job has reached
 	// the end of the keyspace on this node.
 	RewriteCursorComplete bool
@@ -62,9 +81,51 @@ type StorageRetirementReport struct {
 	MinRetainedTS uint64
 }
 
+// RaftGroupRetirementReport is one node's view of ONE Raft group.
+//
+// Per group, because Raft log and snapshot indexes live in independent
+// per-group index spaces while the raft DEK is cluster-wide: the runtime
+// installs one wrap on every attached ShardGroup
+// (raftEnvelopeRuntime.installFromApply loops over r.groups). Judging the
+// shared DEK from a single group's indexes leaves every other group
+// unchecked, and aggregating across groups with a minimum is worse still --
+// a quiet low-index group stays permanently below a busy group's boundary
+// even after all of its old-key entries are gone, so the DEK could never be
+// retired.
+type RaftGroupRetirementReport struct {
+	GroupID uint64
+	// LogCompactIndex is this node's persisted Raft log start index for
+	// THIS group -- the lower bound of un-truncated entries, exposed as
+	// etcd_raft_log_compact_index. It must be STRICTLY greater than the
+	// largest index ever proposed under the retiring DEK in this group.
+	LogCompactIndex uint64
+	// SnapshotIndex is the Raft index of this group's last committed
+	// snapshot. See RaftRetirementReport.SnapshotIndex for why it is the
+	// snapshot's own index rather than raft_envelope_cutover_index.
+	SnapshotIndex uint64
+}
+
+// RaftGroupBoundary is the old-key high-water mark for one Raft group.
+type RaftGroupBoundary struct {
+	// LargestProposedIndex is the largest log index ever proposed under the
+	// retiring DEK in this group.
+	LargestProposedIndex uint64
+	// RotationIndex is the index of the rotation entry that installed the
+	// successor in this group.
+	RotationIndex uint64
+}
+
 // RaftRetirementReport is one node's view of a raft DEK.
 type RaftRetirementReport struct {
 	NodeID string
+	// ReportedKeyID is the DEK this report describes, checked against the
+	// key being retired.
+	ReportedKeyID uint32
+	// ActiveKeyID is the raft DEK this node currently proposes under.
+	ActiveKeyID uint32
+	// Groups is this node's per-group view. Every group the node hosts must
+	// be present, because the DEK is shared across all of them.
+	Groups []RaftGroupRetirementReport
 	// LogCompactIndex is this node's persisted Raft log start index —
 	// the lower bound of un-truncated entries, exposed as
 	// etcd_raft_log_compact_index. It must be STRICTLY greater than
@@ -98,6 +159,9 @@ type RaftRetirementReport struct {
 
 // RetirementDecision is the classifier's answer.
 type RetirementDecision struct {
+	// Purpose records which classifier produced this decision, so Err can
+	// pick the matching sentinel without being told.
+	Purpose string
 	// Eligible is true only when every criterion holds on every node.
 	Eligible bool
 	// Blockers names each node that is not yet ready and why, so an
@@ -106,17 +170,30 @@ type RetirementDecision struct {
 	Blockers []string
 }
 
-// Err returns the sentinel matching this decision, or nil when
-// eligible. Callers surface this from `retire-dek`.
-func (d RetirementDecision) Err(purpose string) error {
+// Err returns the sentinel matching this decision, or nil when eligible.
+// Callers surface this from `retire-dek`.
+//
+// The sentinel comes from the CLASSIFIER that produced the decision, recorded
+// in Purpose, not from an argument. Selecting it from a caller-supplied string
+// meant a misspelled or omitted purpose silently reported a blocked raft
+// decision as ErrDEKStillReferenced -- sending the operator to the
+// rewrite/MVCC remediation for a WAL blocker, and vice versa.
+func (d RetirementDecision) Err() error {
 	if d.Eligible {
 		return nil
 	}
-	base := ErrDEKStillReferenced
-	if purpose == RetirementPurposeRaft {
-		base = ErrRaftDEKWALStillReferences
+	switch d.Purpose {
+	case RetirementPurposeStorage:
+		return errors.Wrapf(ErrDEKStillReferenced, "blockers: %v", d.Blockers)
+	case RetirementPurposeRaft:
+		return errors.Wrapf(ErrRaftDEKWALStillReferences, "blockers: %v", d.Blockers)
+	default:
+		// Unreachable through the classifiers, which always set Purpose. A
+		// zero-value decision reaching here is a wiring bug, and guessing a
+		// sentinel would point the operator at the wrong remediation.
+		return errors.Wrapf(ErrIncompleteRetirementReport,
+			"decision has no purpose; blockers: %v", d.Blockers)
 	}
-	return errors.Wrapf(base, "blockers: %v", d.Blockers)
 }
 
 // Purposes accepted by the classifier.
@@ -132,8 +209,12 @@ const (
 // required from each, because "cluster-wide" cannot be established
 // from a subset.
 func ClassifyStorageDEKRetirement(
-	members []string, reports []StorageRetirementReport, largestCommitTS uint64,
+	members []string, reports []StorageRetirementReport, retiringKeyID uint32, largestCommitTS uint64,
 ) (RetirementDecision, error) {
+	if retiringKeyID == 0 {
+		return RetirementDecision{}, errors.Wrap(ErrIncompleteRetirementReport,
+			"retiring key id is required")
+	}
 	byNode := make(map[string]StorageRetirementReport, len(reports))
 	for _, r := range reports {
 		if _, dup := byNode[r.NodeID]; dup {
@@ -151,6 +232,9 @@ func ClassifyStorageDEKRetirement(
 	var blockers []string
 	for _, node := range members {
 		r := byNode[node]
+		if err := checkReportKeyBinding(node, r.ReportedKeyID, r.ActiveKeyID, retiringKeyID); err != nil {
+			return RetirementDecision{}, err
+		}
 		if !r.RewriteCursorComplete {
 			blockers = append(blockers,
 				fmt.Sprintf("%s: rewrite cursor has not reached the end of the keyspace", node))
@@ -168,7 +252,11 @@ func ClassifyStorageDEKRetirement(
 		}
 	}
 	sort.Strings(blockers)
-	return RetirementDecision{Eligible: len(blockers) == 0, Blockers: blockers}, nil
+	return RetirementDecision{
+		Purpose:  RetirementPurposeStorage,
+		Eligible: len(blockers) == 0,
+		Blockers: blockers,
+	}, nil
 }
 
 // ClassifyRaftDEKRetirement applies the §5.4 raft criteria.
@@ -178,8 +266,18 @@ func ClassifyStorageDEKRetirement(
 // installed its successor.
 func ClassifyRaftDEKRetirement(
 	members []string, reports []RaftRetirementReport,
-	largestProposedIndex, rotationIndex uint64,
+	retiringKeyID uint32, boundaries map[uint64]RaftGroupBoundary,
 ) (RetirementDecision, error) {
+	if retiringKeyID == 0 {
+		return RetirementDecision{}, errors.Wrap(ErrIncompleteRetirementReport,
+			"retiring key id is required")
+	}
+	if len(boundaries) == 0 {
+		// No boundaries means no group's old-key high-water mark is known,
+		// so nothing can be verified. "Nothing to check" is not "safe".
+		return RetirementDecision{}, errors.Wrap(ErrIncompleteRetirementReport,
+			"per-group raft boundaries are required")
+	}
 	byNode := make(map[string]RaftRetirementReport, len(reports))
 	for _, r := range reports {
 		if _, dup := byNode[r.NodeID]; dup {
@@ -197,22 +295,103 @@ func ClassifyRaftDEKRetirement(
 	var blockers []string
 	for _, node := range members {
 		r := byNode[node]
-		// Strictly greater, per §5.4: an index EQUAL to the largest
-		// proposed one means that entry is still un-truncated and
-		// would be replayed.
-		if r.LogCompactIndex <= largestProposedIndex {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: raft log start index %d has not passed proposed index %d",
-					node, r.LogCompactIndex, largestProposedIndex))
+		if err := checkReportKeyBinding(node, r.ReportedKeyID, r.ActiveKeyID, retiringKeyID); err != nil {
+			return RetirementDecision{}, err
 		}
-		if r.SnapshotIndex < rotationIndex {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: last snapshot predates the rotation (snapshot %d < rotation %d)",
-					node, r.SnapshotIndex, rotationIndex))
+		nodeBlockers, err := raftGroupBlockers(node, r.Groups, boundaries)
+		if err != nil {
+			return RetirementDecision{}, err
 		}
+		blockers = append(blockers, nodeBlockers...)
 	}
 	sort.Strings(blockers)
-	return RetirementDecision{Eligible: len(blockers) == 0, Blockers: blockers}, nil
+	return RetirementDecision{
+		Purpose:  RetirementPurposeRaft,
+		Eligible: len(blockers) == 0,
+		Blockers: blockers,
+	}, nil
+}
+
+// checkReportKeyBinding rejects a report that does not describe the DEK being
+// retired, or that shows the retiring DEK still active.
+//
+// Both are fatal rather than blockers: a report for another key is not
+// evidence about this one, and "still active" is a different operator mistake
+// from "not yet eligible" -- every retention criterion can pass for the active
+// key, and unloading it breaks the next write rather than an old read.
+func checkReportKeyBinding(node string, reported, active, retiring uint32) error {
+	if reported != retiring {
+		return errors.Wrapf(ErrIncompleteRetirementReport,
+			"node %s reported on key %d, not the key being retired (%d)",
+			node, reported, retiring)
+	}
+	if active == retiring {
+		return errors.Wrapf(ErrRetiringDEKStillActive,
+			"node %s still has key %d active", node, retiring)
+	}
+	if active == 0 {
+		return errors.Wrapf(ErrRetiringDEKStillActive,
+			"node %s reports no active successor key", node)
+	}
+	return nil
+}
+
+// raftGroupBlockers applies the §5.4 raft criteria to every group the node
+// hosts, against that group's own boundary.
+//
+// A node that omits a group with a known boundary is an incomplete report, not
+// a passing one: the DEK is installed on every group, so an unreported group
+// is an unverified one.
+func raftGroupBlockers(
+	node string,
+	groups []RaftGroupRetirementReport,
+	boundaries map[uint64]RaftGroupBoundary,
+) ([]string, error) {
+	byGroup := make(map[uint64]RaftGroupRetirementReport, len(groups))
+	for _, g := range groups {
+		if _, dup := byGroup[g.GroupID]; dup {
+			return nil, errors.Wrapf(ErrIncompleteRetirementReport,
+				"node %s reported group %d more than once", node, g.GroupID)
+		}
+		byGroup[g.GroupID] = g
+	}
+	var missing []uint64
+	for groupID := range boundaries {
+		if _, ok := byGroup[groupID]; !ok {
+			missing = append(missing, groupID)
+		}
+	}
+	if len(missing) > 0 {
+		slices.Sort(missing)
+		return nil, errors.Wrapf(ErrIncompleteRetirementReport,
+			"node %s did not report groups %v", node, missing)
+	}
+
+	groupIDs := make([]uint64, 0, len(boundaries))
+	for groupID := range boundaries {
+		groupIDs = append(groupIDs, groupID)
+	}
+	slices.Sort(groupIDs)
+
+	var blockers []string
+	for _, groupID := range groupIDs {
+		boundary := boundaries[groupID]
+		g := byGroup[groupID]
+		// Strictly greater, per §5.4: an index EQUAL to the largest
+		// proposed one means that entry is still un-truncated and would be
+		// replayed.
+		if g.LogCompactIndex <= boundary.LargestProposedIndex {
+			blockers = append(blockers,
+				fmt.Sprintf("%s group %d: raft log start index %d has not passed proposed index %d",
+					node, groupID, g.LogCompactIndex, boundary.LargestProposedIndex))
+		}
+		if g.SnapshotIndex < boundary.RotationIndex {
+			blockers = append(blockers,
+				fmt.Sprintf("%s group %d: last snapshot predates the rotation (snapshot %d < rotation %d)",
+					node, groupID, g.SnapshotIndex, boundary.RotationIndex))
+		}
+	}
+	return blockers, nil
 }
 
 // duplicateReportErr rejects a report set containing the same node

@@ -10,20 +10,44 @@ import (
 
 var retireMembers = []string{"n1", "n2", "n3"}
 
+// retiringKeyID / successorKeyID: the reports must name the key under test and
+// show a different key active, or the classifier refuses outright.
+const (
+	retiringKeyID  = uint32(7)
+	successorKeyID = uint32(8)
+)
+
+// retireGroup is the single Raft group most cases use; multi-group behaviour
+// has its own tests.
+const retireGroup = uint64(1)
+
 func readyStorage(node string, minRetained uint64) encryption.StorageRetirementReport {
 	return encryption.StorageRetirementReport{
 		NodeID:                node,
+		ReportedKeyID:         retiringKeyID,
+		ActiveKeyID:           successorKeyID,
 		RewriteCursorComplete: true,
 		ValuesPerDEK:          0,
 		MinRetainedTS:         minRetained,
 	}
 }
 
+func boundaries(largestProposed, rotation uint64) map[uint64]encryption.RaftGroupBoundary {
+	return map[uint64]encryption.RaftGroupBoundary{
+		retireGroup: {LargestProposedIndex: largestProposed, RotationIndex: rotation},
+	}
+}
+
 func readyRaft(node string, compact, snapshot uint64) encryption.RaftRetirementReport {
 	return encryption.RaftRetirementReport{
-		NodeID:          node,
-		LogCompactIndex: compact,
-		SnapshotIndex:   snapshot,
+		NodeID:        node,
+		ReportedKeyID: retiringKeyID,
+		ActiveKeyID:   successorKeyID,
+		Groups: []encryption.RaftGroupRetirementReport{{
+			GroupID:         retireGroup,
+			LogCompactIndex: compact,
+			SnapshotIndex:   snapshot,
+		}},
 	}
 }
 
@@ -37,11 +61,11 @@ func TestStorageRetirementEligibleWhenEveryCriterionHolds(t *testing.T) {
 	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
-		}, 100)
+		}, retiringKeyID, 100)
 	require.NoError(t, err)
 	require.True(t, d.Eligible)
 	require.Empty(t, d.Blockers)
-	require.NoError(t, d.Err(encryption.RetirementPurposeStorage))
+	require.NoError(t, d.Err())
 }
 
 // TestStorageRetirementRefusesWhileAnyNodeStillHoldsValues pins the
@@ -56,12 +80,12 @@ func TestStorageRetirementRefusesWhileAnyNodeStillHoldsValues(t *testing.T) {
 	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), behind, readyStorage("n3", 200),
-		}, 100)
+		}, retiringKeyID, 100)
 	require.NoError(t, err)
 	require.False(t, d.Eligible)
 	require.Len(t, d.Blockers, 1)
 	require.Contains(t, d.Blockers[0], "n2")
-	require.True(t, errors.Is(d.Err(encryption.RetirementPurposeStorage),
+	require.True(t, errors.Is(d.Err(),
 		encryption.ErrDEKStillReferenced))
 }
 
@@ -74,7 +98,7 @@ func TestStorageRetirementRefusesWhileTheRewriteIsIncomplete(t *testing.T) {
 	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), readyStorage("n2", 200), partial,
-		}, 100)
+		}, retiringKeyID, 100)
 	require.NoError(t, err)
 	require.False(t, d.Eligible)
 }
@@ -92,7 +116,7 @@ func TestStorageRetirementRequiresMinRetainedTSStrictlyPastTheCommitTS(t *testin
 			readyStorage("n1", largestCommitTS),
 			readyStorage("n2", largestCommitTS),
 			readyStorage("n3", largestCommitTS),
-		}, largestCommitTS)
+		}, retiringKeyID, largestCommitTS)
 	require.NoError(t, err)
 	require.False(t, equal.Eligible,
 		"minRetainedTS equal to the commit_ts still admits a read at that version")
@@ -102,7 +126,7 @@ func TestStorageRetirementRequiresMinRetainedTSStrictlyPastTheCommitTS(t *testin
 			readyStorage("n1", largestCommitTS+1),
 			readyStorage("n2", largestCommitTS+1),
 			readyStorage("n3", largestCommitTS+1),
-		}, largestCommitTS)
+		}, retiringKeyID, largestCommitTS)
 	require.NoError(t, err)
 	require.True(t, past.Eligible)
 }
@@ -117,10 +141,10 @@ func TestRaftRetirementEligibleWhenWALAndSnapshotsHavePassed(t *testing.T) {
 	d, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
 		[]encryption.RaftRetirementReport{
 			readyRaft("n1", 500, 400), readyRaft("n2", 500, 400), readyRaft("n3", 500, 400),
-		}, 300, 350)
+		}, retiringKeyID, boundaries(300, 350))
 	require.NoError(t, err)
 	require.True(t, d.Eligible)
-	require.NoError(t, d.Err(encryption.RetirementPurposeRaft))
+	require.NoError(t, d.Err())
 }
 
 // TestRaftRetirementRefusesWhileTheWALStillHoldsEntries is the failure
@@ -135,10 +159,10 @@ func TestRaftRetirementRefusesWhileTheWALStillHoldsEntries(t *testing.T) {
 	d, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
 		[]encryption.RaftRetirementReport{
 			readyRaft("n1", 500, 400), lagging, readyRaft("n3", 500, 400),
-		}, 300, 350)
+		}, retiringKeyID, boundaries(300, 350))
 	require.NoError(t, err)
 	require.False(t, d.Eligible)
-	require.True(t, errors.Is(d.Err(encryption.RetirementPurposeRaft),
+	require.True(t, errors.Is(d.Err(),
 		encryption.ErrRaftDEKWALStillReferences),
 		"the raft path has its own sentinel so the runbook points at the WAL, not the rewrite")
 }
@@ -154,14 +178,14 @@ func TestRaftRetirementRequiresTheCompactIndexStrictlyPast(t *testing.T) {
 	equal, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
 		[]encryption.RaftRetirementReport{
 			readyRaft("n1", proposed, 400), readyRaft("n2", proposed, 400), readyRaft("n3", proposed, 400),
-		}, proposed, 350)
+		}, retiringKeyID, boundaries(proposed, 350))
 	require.NoError(t, err)
 	require.False(t, equal.Eligible)
 
 	past, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
 		[]encryption.RaftRetirementReport{
 			readyRaft("n1", proposed+1, 400), readyRaft("n2", proposed+1, 400), readyRaft("n3", proposed+1, 400),
-		}, proposed, 350)
+		}, retiringKeyID, boundaries(proposed, 350))
 	require.NoError(t, err)
 	require.True(t, past.Eligible)
 }
@@ -177,7 +201,7 @@ func TestRaftRetirementRefusesASnapshotPredatingTheRotation(t *testing.T) {
 	d, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
 		[]encryption.RaftRetirementReport{
 			readyRaft("n1", 500, 400), readyRaft("n2", 500, 400), stale,
-		}, 300, 350)
+		}, retiringKeyID, boundaries(300, 350))
 	require.NoError(t, err)
 	require.False(t, d.Eligible)
 	require.Contains(t, d.Blockers[0], "n3")
@@ -195,7 +219,7 @@ func TestRetirementRefusesAPartialReport(t *testing.T) {
 	_, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), readyStorage("n2", 200),
-		}, 100)
+		}, retiringKeyID, 100)
 	require.Error(t, err)
 	require.True(t, errors.Is(err, encryption.ErrIncompleteRetirementReport))
 	require.ErrorContains(t, err, "n3")
@@ -203,7 +227,7 @@ func TestRetirementRefusesAPartialReport(t *testing.T) {
 	_, err = encryption.ClassifyRaftDEKRetirement(retireMembers,
 		[]encryption.RaftRetirementReport{
 			readyRaft("n1", 500, 400), readyRaft("n2", 500, 400),
-		}, 300, 350)
+		}, retiringKeyID, boundaries(300, 350))
 	require.Error(t, err)
 	require.True(t, errors.Is(err, encryption.ErrIncompleteRetirementReport))
 }
@@ -213,10 +237,10 @@ func TestRetirementRefusesAPartialReport(t *testing.T) {
 func TestRetirementRefusesAnEmptyMembership(t *testing.T) {
 	t.Parallel()
 
-	_, err := encryption.ClassifyStorageDEKRetirement(nil, nil, 100)
+	_, err := encryption.ClassifyStorageDEKRetirement(nil, nil, retiringKeyID, 100)
 	require.True(t, errors.Is(err, encryption.ErrIncompleteRetirementReport))
 
-	_, err = encryption.ClassifyRaftDEKRetirement(nil, nil, 300, 350)
+	_, err = encryption.ClassifyRaftDEKRetirement(nil, nil, retiringKeyID, boundaries(300, 350))
 	require.True(t, errors.Is(err, encryption.ErrIncompleteRetirementReport))
 }
 
@@ -232,7 +256,7 @@ func TestRetirementBlockersNameEveryOffendingNode(t *testing.T) {
 	bad3.RewriteCursorComplete = false
 
 	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
-		[]encryption.StorageRetirementReport{bad1, readyStorage("n2", 200), bad3}, 100)
+		[]encryption.StorageRetirementReport{bad1, readyStorage("n2", 200), bad3}, retiringKeyID, 100)
 	require.NoError(t, err)
 	require.False(t, d.Eligible)
 	require.Len(t, d.Blockers, 2)
@@ -274,7 +298,7 @@ func TestRaftRetirementStaysReachableAcrossSuccessiveRotations(t *testing.T) {
 				readyRaft("n1", rotationIndex+1, snapshotIndex),
 				readyRaft("n2", rotationIndex+1, snapshotIndex),
 				readyRaft("n3", rotationIndex+1, snapshotIndex),
-			}, rotationIndex-1, rotationIndex)
+			}, retiringKeyID, boundaries(rotationIndex-1, rotationIndex))
 		require.NoError(t, err)
 		require.True(t, d.Eligible,
 			"rotation %d must become retirable once every node has snapshotted past it; blockers: %v",
@@ -287,7 +311,7 @@ func TestRaftRetirementStaysReachableAcrossSuccessiveRotations(t *testing.T) {
 				readyRaft("n1", rotationIndex+1, rotationIndex),
 				readyRaft("n2", rotationIndex+1, rotationIndex),
 				readyRaft("n3", rotationIndex+1, rotationIndex),
-			}, rotationIndex-1, rotationIndex)
+			}, retiringKeyID, boundaries(rotationIndex-1, rotationIndex))
 		require.NoError(t, err)
 		require.True(t, d.Eligible, "blockers: %v", d.Blockers)
 	}
@@ -315,7 +339,7 @@ func TestRetirementRefusesDuplicateNodeReports(t *testing.T) {
 				blocked,
 				readyStorage("n2", 200), // duplicate: would win and hide the blocker
 				readyStorage("n3", 200),
-			}, 100)
+			}, retiringKeyID, 100)
 		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
 	})
 
@@ -330,7 +354,259 @@ func TestRetirementRefusesDuplicateNodeReports(t *testing.T) {
 				blocked,
 				readyRaft("n2", 500, 1000), // duplicate: would win and hide the blocker
 				readyRaft("n3", 500, 1000),
-			}, 100, 900)
+			}, retiringKeyID, boundaries(100, 900))
 		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
 	})
+}
+
+// ---------------------------------------------------------------------------
+// The retiring key must not be the active one
+// ---------------------------------------------------------------------------
+
+// TestRetirementRefusesTheStillActiveDEK pins the guard against unloading the
+// key still selected for writes.
+//
+// Every retention criterion can legitimately pass for the ACTIVE key: an empty
+// cluster reports a complete rewrite cursor, zero values and an advanced
+// retention floor for the key it is still writing under. The classifiers saw
+// neither the retiring key nor each node's active key, so they returned
+// eligible and a retire command would unload the live key — breaking the next
+// write or proposal rather than an old read.
+func TestRetirementRefusesTheStillActiveDEK(t *testing.T) {
+	t.Parallel()
+
+	t.Run("storage: the retiring key is still active", func(t *testing.T) {
+		t.Parallel()
+
+		reports := []encryption.StorageRetirementReport{
+			readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
+		}
+		// Every criterion passes; only the active key is wrong.
+		reports[1].ActiveKeyID = retiringKeyID
+
+		_, err := encryption.ClassifyStorageDEKRetirement(
+			retireMembers, reports, retiringKeyID, 100)
+		require.ErrorIs(t, err, encryption.ErrRetiringDEKStillActive)
+	})
+
+	t.Run("raft: the retiring key is still active", func(t *testing.T) {
+		t.Parallel()
+
+		reports := []encryption.RaftRetirementReport{
+			readyRaft("n1", 500, 1000), readyRaft("n2", 500, 1000), readyRaft("n3", 500, 1000),
+		}
+		reports[2].ActiveKeyID = retiringKeyID
+
+		_, err := encryption.ClassifyRaftDEKRetirement(
+			retireMembers, reports, retiringKeyID, boundaries(100, 900))
+		require.ErrorIs(t, err, encryption.ErrRetiringDEKStillActive)
+	})
+
+	t.Run("a node with no successor active is refused", func(t *testing.T) {
+		t.Parallel()
+
+		reports := []encryption.StorageRetirementReport{
+			readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
+		}
+		// Zero means "no key active", which cannot be treated as a successor.
+		reports[0].ActiveKeyID = 0
+
+		_, err := encryption.ClassifyStorageDEKRetirement(
+			retireMembers, reports, retiringKeyID, 100)
+		require.ErrorIs(t, err, encryption.ErrRetiringDEKStillActive)
+	})
+}
+
+// TestRetirementRefusesAReportForAnotherKey pins the binding between the report
+// and the key being retired: a report gathered for a different DEK says nothing
+// about this one, and accepting it silently judges the wrong key.
+func TestRetirementRefusesAReportForAnotherKey(t *testing.T) {
+	t.Parallel()
+
+	reports := []encryption.StorageRetirementReport{
+		readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
+	}
+	reports[1].ReportedKeyID = retiringKeyID + 99
+
+	_, err := encryption.ClassifyStorageDEKRetirement(
+		retireMembers, reports, retiringKeyID, 100)
+	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+}
+
+func TestRetirementRequiresTheRetiringKeyID(t *testing.T) {
+	t.Parallel()
+
+	_, err := encryption.ClassifyStorageDEKRetirement(retireMembers, nil, 0, 100)
+	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+
+	_, err = encryption.ClassifyRaftDEKRetirement(
+		retireMembers, nil, 0, boundaries(100, 200))
+	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+}
+
+// ---------------------------------------------------------------------------
+// Raft boundaries are per group
+// ---------------------------------------------------------------------------
+
+func multiGroupRaft(node string, groups ...encryption.RaftGroupRetirementReport) encryption.RaftRetirementReport {
+	return encryption.RaftRetirementReport{
+		NodeID:        node,
+		ReportedKeyID: retiringKeyID,
+		ActiveKeyID:   successorKeyID,
+		Groups:        groups,
+	}
+}
+
+// TestRaftRetirementChecksEveryGroupAgainstItsOwnBoundary is the multi-shard
+// regression.
+//
+// The raft DEK is cluster-wide — raftEnvelopeRuntime.installFromApply sets the
+// same wrap on every attached ShardGroup — but Raft log and snapshot indexes
+// live in independent per-group index spaces. Judging the shared DEK from one
+// group's indexes left every other group unchecked, so a group whose WAL still
+// held old-key entries could not block retirement.
+func TestRaftRetirementChecksEveryGroupAgainstItsOwnBoundary(t *testing.T) {
+	t.Parallel()
+
+	bounds := map[uint64]encryption.RaftGroupBoundary{
+		// A busy group with high indexes...
+		1: {LargestProposedIndex: 10_000, RotationIndex: 9_000},
+		// ...and a quiet one whose indexes are far lower.
+		2: {LargestProposedIndex: 40, RotationIndex: 30},
+	}
+
+	t.Run("every group past its own boundary is eligible", func(t *testing.T) {
+		t.Parallel()
+
+		reports := make([]encryption.RaftRetirementReport, 0, len(retireMembers))
+		for _, node := range retireMembers {
+			reports = append(reports, multiGroupRaft(node,
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500},
+				encryption.RaftGroupRetirementReport{GroupID: 2, LogCompactIndex: 41, SnapshotIndex: 35},
+			))
+		}
+
+		d, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID, bounds)
+		require.NoError(t, err)
+		require.True(t, d.Eligible,
+			"the quiet group must be judged against ITS OWN low boundary, not the busy "+
+				"group's: a global minimum would keep it permanently behind; blockers: %v",
+			d.Blockers)
+	})
+
+	t.Run("a group still behind its boundary blocks retirement", func(t *testing.T) {
+		t.Parallel()
+
+		reports := make([]encryption.RaftRetirementReport, 0, len(retireMembers))
+		for _, node := range retireMembers {
+			reports = append(reports, multiGroupRaft(node,
+				// Group 1 is ready...
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500},
+				// ...group 2's WAL still holds entries proposed under the key.
+				encryption.RaftGroupRetirementReport{GroupID: 2, LogCompactIndex: 20, SnapshotIndex: 35},
+			))
+		}
+
+		d, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID, bounds)
+		require.NoError(t, err)
+		require.False(t, d.Eligible,
+			"an unready group must block the shared DEK even when other groups are ready")
+		require.Len(t, d.Blockers, len(retireMembers))
+		require.Contains(t, d.Blockers[0], "group 2")
+	})
+
+	t.Run("a node that omits a group is an incomplete report", func(t *testing.T) {
+		t.Parallel()
+
+		reports := []encryption.RaftRetirementReport{
+			multiGroupRaft("n1",
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500},
+				encryption.RaftGroupRetirementReport{GroupID: 2, LogCompactIndex: 41, SnapshotIndex: 35}),
+			// n2 reports only group 1, so group 2 is unverified on that node.
+			multiGroupRaft("n2",
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500}),
+			multiGroupRaft("n3",
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500},
+				encryption.RaftGroupRetirementReport{GroupID: 2, LogCompactIndex: 41, SnapshotIndex: 35}),
+		}
+
+		_, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID, bounds)
+		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+	})
+
+	t.Run("a duplicate group on one node is refused", func(t *testing.T) {
+		t.Parallel()
+
+		reports := []encryption.RaftRetirementReport{
+			multiGroupRaft("n1",
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 5, SnapshotIndex: 1},
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500}),
+			multiGroupRaft("n2",
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500}),
+			multiGroupRaft("n3",
+				encryption.RaftGroupRetirementReport{GroupID: 1, LogCompactIndex: 10_001, SnapshotIndex: 9_500}),
+		}
+
+		_, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID,
+			map[uint64]encryption.RaftGroupBoundary{1: {LargestProposedIndex: 10_000, RotationIndex: 9_000}})
+		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+	})
+}
+
+func TestRaftRetirementRequiresPerGroupBoundaries(t *testing.T) {
+	t.Parallel()
+
+	// No boundaries means no group's old-key high-water mark is known.
+	// "Nothing to check" must not read as "safe".
+	_, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
+		[]encryption.RaftRetirementReport{
+			readyRaft("n1", 500, 1000), readyRaft("n2", 500, 1000), readyRaft("n3", 500, 1000),
+		}, retiringKeyID, nil)
+	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+}
+
+// ---------------------------------------------------------------------------
+// The sentinel follows the classifier, not an argument
+// ---------------------------------------------------------------------------
+
+// TestRetirementErrSentinelComesFromTheClassifier pins that each blocked
+// decision reports its own sentinel.
+//
+// Err used to pick from a caller-supplied purpose string, defaulting to the
+// storage sentinel for anything unrecognised — so a blocked RAFT decision
+// passed a misspelled or omitted purpose sent the operator to the rewrite/MVCC
+// remediation for what is actually a WAL blocker.
+func TestRetirementErrSentinelComesFromTheClassifier(t *testing.T) {
+	t.Parallel()
+
+	storage, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+		[]encryption.StorageRetirementReport{
+			readyStorage("n1", 1), readyStorage("n2", 1), readyStorage("n3", 1),
+		}, retiringKeyID, 100)
+	require.NoError(t, err)
+	require.False(t, storage.Eligible)
+	require.ErrorIs(t, storage.Err(), encryption.ErrDEKStillReferenced)
+	require.NotErrorIs(t, storage.Err(), encryption.ErrRaftDEKWALStillReferences)
+
+	raft, err := encryption.ClassifyRaftDEKRetirement(retireMembers,
+		[]encryption.RaftRetirementReport{
+			readyRaft("n1", 10, 1000), readyRaft("n2", 10, 1000), readyRaft("n3", 10, 1000),
+		}, retiringKeyID, boundaries(500, 900))
+	require.NoError(t, err)
+	require.False(t, raft.Eligible)
+	require.ErrorIs(t, raft.Err(), encryption.ErrRaftDEKWALStillReferences,
+		"a WAL blocker must not be reported as an MVCC one")
+	require.NotErrorIs(t, raft.Err(), encryption.ErrDEKStillReferenced)
+}
+
+// A decision with no purpose is a wiring bug, and guessing a sentinel would
+// point the operator at the wrong remediation.
+func TestRetirementErrRefusesToGuessAPurpose(t *testing.T) {
+	t.Parallel()
+
+	blocked := encryption.RetirementDecision{Blockers: []string{"n1: something"}}
+	require.ErrorIs(t, blocked.Err(), encryption.ErrIncompleteRetirementReport)
+
+	eligible := encryption.RetirementDecision{Eligible: true}
+	require.NoError(t, eligible.Err(), "an eligible decision has no error whatever its purpose")
 }

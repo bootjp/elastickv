@@ -35,7 +35,7 @@ Date: 2026-04-29
 | 9A | Compress-then-encrypt, authenticated compression flag, encrypted-store Pebble compression policy, storage benchmark (§6.4, §8.3) | shipped | `2026_07_18_implemented_9a_encryption_compression.md` |
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
-| 9C-5 | §5.4 DEK retirement eligibility: the storage criteria (rewrite cursor, values-per-DEK, minRetainedTS) and the WAL-driven raft criteria (log start index, last committed snapshot index), both cluster-wide with no override | shipped | — |
+| 9C-5 | §5.4 DEK retirement eligibility: the storage criteria (rewrite cursor, values-per-DEK, minRetainedTS) and the WAL-driven raft criteria (log start index, last committed snapshot index) evaluated **per Raft group**, since log indexes are per-group index spaces while the raft DEK is installed on every group. Reports are bound to the key being retired and must show a different key active, so the live DEK cannot be unloaded. Cluster-wide, no override. | shipped | — |
 | 9C+ | Rotation budget/rewrap/retire/rewrite, the remaining §9.2 metrics (`active_dek_id`, `last_proposed_index_per_raft_dek`, `kek_unwrap_seconds`, `sidecar_raft_index`), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8, §9.2) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
@@ -1286,6 +1286,29 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
      which said the check reads the §4.4 FSM snapshot
      header's `raft_envelope_cutover_index`. That field cannot
      express this criterion, for two independent reasons:
+
+     The criterion is evaluated **per Raft group**. Log and
+     snapshot indexes live in independent per-group index
+     spaces, while the raft DEK is cluster-wide — the runtime
+     installs one wrap on every attached `ShardGroup`. Judging
+     the shared DEK from a single group's indexes leaves the
+     other groups unchecked; aggregating across groups with a
+     minimum is worse, because a quiet low-index group stays
+     permanently below a busy group's boundary even after all
+     of its old-key entries are gone, so the DEK could never
+     be retired at all.
+
+     **Retirement also refuses the ACTIVE key.** Every
+     criterion above can legitimately pass for the key still
+     selected for writes — an empty cluster reports a complete
+     rewrite cursor, zero values and an advanced retention
+     floor for its active storage DEK — so each node's report
+     names the key it describes and the key it currently
+     writes under, and `retire-dek` refuses unless a different
+     successor is active everywhere. Unloading the active key
+     breaks the next write or proposal rather than an old
+     read, which is why this is its own refusal
+     (`ErrRetiringDEKStillActive`) and not a blocker.
 
      - It is the one-shot Phase-2 *enablement* index.
        `applier.go` preserves the original value across every
