@@ -552,7 +552,19 @@ type rowMergeAcc struct {
 	routeIDsTruncated bool
 	routeCount        uint64
 	label             string
-	cells             []cellMergeAcc
+	// subBucket / subBucketCount carry the §K sub-range identity through the
+	// merge. Without them every merged response omitted both, so
+	// subRangeLabel returned null and the sub-range label and narrowed
+	// Start/End captions vanished specifically in the cluster-wide view --
+	// the one view where an operator is most likely to be looking.
+	//
+	// A nonzero value from ANY peer wins: during a rolling upgrade the
+	// bucket is reported by both old peers (which omit the fields) and new
+	// ones, and taking the first peer's zero would discard what the upgraded
+	// peers know.
+	subBucket      int
+	subBucketCount int
+	cells          []cellMergeAcc
 }
 
 // cellMergeAcc tracks merge state for one (bucket, column) cell.
@@ -630,10 +642,18 @@ func mergeRowInto(
 			routeIDsTruncated: row.RouteIDsTruncated,
 			routeCount:        row.RouteCount,
 			label:             row.Label,
+			subBucket:         row.SubBucket,
+			subBucketCount:    row.SubBucketCount,
 			cells:             make([]cellMergeAcc, mergedWidth),
 		}
 		accByBucket[row.BucketID] = acc
 		*bucketOrder = append(*bucketOrder, row.BucketID)
+	}
+	// Accept sub-range metadata from any peer that reports it, so one legacy
+	// peer in the fan-out cannot blank it for the whole row.
+	if acc.subBucketCount == 0 && row.SubBucketCount != 0 {
+		acc.subBucket = row.SubBucket
+		acc.subBucketCount = row.SubBucketCount
 	}
 	for j, ts := range srcColumns {
 		idx, ok := indexByColumn[ts]
@@ -748,6 +768,8 @@ func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 	row := KeyVizRow{
 		BucketID:          acc.bucketID,
 		Label:             acc.label,
+		SubBucket:         acc.subBucket,
+		SubBucketCount:    acc.subBucketCount,
 		Start:             acc.start,
 		End:               acc.end,
 		Aggregate:         acc.aggregate,
