@@ -208,7 +208,18 @@ func TestRunLiveBackupValidatesBaselineScopeMissingFromList(t *testing.T) {
 func TestRunLiveBackupRenewalFailureCancelsStreamAndReleasesPin(t *testing.T) {
 	t.Parallel()
 	rpc := successfulLiveBackupRPC()
-	rpc.begin.TtlMsEffective = 9
+	// The TTL has to leave the renewal timer room to fire BEFORE the pin
+	// deadline passes, because the two produce the same ErrLiveBackupRenewal
+	// by different routes and this test is about the RPC-failure one (it sets
+	// renewErr; the deadline route has its own test).
+	//
+	// The timer fires at ttl/liveBackupRenewalDivisor, and
+	// liveBackupRenewalAttemptTimeout refuses with "renewal deadline has
+	// expired" -- before calling RenewBackup at all -- once the remaining TTL
+	// is gone. At 9ms the timer fired at 3ms with 6ms of slack, so a
+	// scheduling hiccup on a loaded machine took the deadline route instead
+	// and renewCalls stayed 0 (measured: 4 failures per 400 runs).
+	rpc.begin.TtlMsEffective = 300
 	rpc.renewErr = errors.New("leader election")
 	rpc.blockStream = true
 	root := filepath.Join(t.TempDir(), "dump")

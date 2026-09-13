@@ -354,7 +354,29 @@ func TestDistributionServerGetTimestamp_LeaderRoutedRejectsLegacyServer(t *testi
 	ctx, cancel := context.WithTimeout(context.Background(), 75*time.Millisecond)
 	defer cancel()
 	_, err = routed.NextBatch(ctx, 4)
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	requireDeadlineExceeded(t, err)
+}
+
+// requireDeadlineExceeded asserts the call failed because its deadline expired,
+// accepting either representation the deadline can take.
+//
+// Which one comes back is a timing detail, not a behavioural difference: if the
+// context expires before the RPC is handed to gRPC the error IS
+// context.DeadlineExceeded, but if the RPC is already in flight gRPC returns a
+// status error with codes.DeadlineExceeded instead — and a gRPC status error
+// does not satisfy errors.Is(context.DeadlineExceeded). Asserting only the
+// first made this test fail about 1.5% of the time (measured 3 failures in 200
+// runs) whenever the deadline happened to land on the far side of that
+// boundary.
+func requireDeadlineExceeded(t *testing.T, err error) {
+	t.Helper()
+
+	require.Error(t, err, "the call must fail once its deadline expires")
+	if errors.Is(err, context.DeadlineExceeded) {
+		return
+	}
+	require.Equal(t, codes.DeadlineExceeded, status.Code(err),
+		"want a deadline failure in either representation, got %v", err)
 }
 
 func TestDistributionServerGetTimestamp_LeaderRoutedActivatesCutover(t *testing.T) {
