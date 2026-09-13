@@ -103,6 +103,17 @@ type KeyVizRow struct {
 	// merged row) so omitempty keeps it off the wire; otherwise
 	// len == len(Values). Conflict is the OR of this slice.
 	Conflicts []bool `json:"conflicts,omitempty"`
+	// SubBucket / SubBucketCount expose the order-preserving sub-range
+	// position within a route, so the SPA can label a sub-row as
+	// "sub-range i/K" instead of leaving the operator to parse the
+	// "#i" suffix out of BucketID.
+	//
+	// Both are omitted unless the route is genuinely sub-divided
+	// (SubBucketCount > 1), matching bucketIDFor: at the K=1 default,
+	// for aggregate rows, and for degenerate slots the wire is byte
+	// -identical to before, so an older SPA sees no change.
+	SubBucket      int `json:"sub_bucket,omitempty"`
+	SubBucketCount int `json:"sub_bucket_count,omitempty"`
 	// RaftGroupIDs[j] and LeaderTerms[j] carry the route's Raft
 	// identity at the time column j was flushed (parallel to
 	// Values[]). Phase 2-C+ fan-out uses
@@ -409,6 +420,8 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *KeyVizRow {
 	}
 	row := &KeyVizRow{
 		BucketID:          bucketIDFor(mr),
+		SubBucket:         subBucketIndexFor(mr),
+		SubBucketCount:    subBucketCountFor(mr),
 		Label:             string(mr.Label),
 		Start:             append([]byte(nil), mr.Start...),
 		End:               append([]byte(nil), mr.End...),
@@ -426,6 +439,28 @@ func newKeyVizRowFrom(mr keyviz.MatrixRow, numCols int) *KeyVizRow {
 		row.RouteIDs = append([]uint64(nil), mr.MemberRoutes...)
 	}
 	return row
+}
+
+// subBucketIndexFor and subBucketCountFor mirror bucketIDFor's
+// "genuinely sub-divided" test, so the two cannot disagree about
+// whether a row is a sub-range: a bucket_id carrying "#i" always has
+// the matching fields, and one without always omits them.
+func subBucketIndexFor(mr keyviz.MatrixRow) int {
+	if !isSubDividedRow(mr) {
+		return 0
+	}
+	return mr.SubBucket
+}
+
+func subBucketCountFor(mr keyviz.MatrixRow) int {
+	if !isSubDividedRow(mr) {
+		return 0
+	}
+	return mr.SubBucketCount
+}
+
+func isSubDividedRow(mr keyviz.MatrixRow) bool {
+	return !mr.Aggregate && mr.SubBucketCount > 1
 }
 
 func bucketIDFor(mr keyviz.MatrixRow) string {

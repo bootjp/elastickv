@@ -116,3 +116,94 @@ func TestMergeKeyVizMatricesMixedKCoexist(t *testing.T) {
 	require.Equal(t, []uint64{25}, byID["route:1#0"])
 	require.Equal(t, []uint64{15}, byID["route:1#1"])
 }
+
+// TestMergeKeyVizMatricesCarriesSubRangeMetadata is the fan-out regression.
+//
+// rowMergeAcc retained neither SubBucket nor SubBucketCount, so every merged
+// response serialized both as omitted: subRangeLabel returned null and the
+// sub-range label plus the narrowed Start/End captions disappeared specifically
+// in the cluster-wide view — the one view where an operator is most likely to be
+// looking at sub-divided routes.
+func TestMergeKeyVizMatricesCarriesSubRangeMetadata(t *testing.T) {
+	t.Parallel()
+
+	col := []int64{1_700_000_000_000}
+	subRow := func(id string, sub int, values []uint64) KeyVizRow {
+		return KeyVizRow{
+			BucketID: id, Start: []byte{byte(sub * 0x10)}, End: []byte{byte((sub + 1) * 0x10)},
+			SubBucket: sub, SubBucketCount: 2, Values: values,
+		}
+	}
+	peerA := KeyVizMatrix{
+		ColumnUnixMs: col, Series: keyVizSeriesWrites,
+		Rows: []KeyVizRow{subRow("route:1#0", 0, []uint64{5}), subRow("route:1#1", 1, []uint64{7})},
+	}
+	peerB := KeyVizMatrix{
+		ColumnUnixMs: col, Series: keyVizSeriesWrites,
+		Rows: []KeyVizRow{subRow("route:1#0", 0, []uint64{3}), subRow("route:1#1", 1, []uint64{2})},
+	}
+
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{peerA, peerB}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 2)
+
+	byID := map[string]KeyVizRow{}
+	for _, r := range merged.Rows {
+		byID[r.BucketID] = r
+	}
+	require.Equal(t, 0, byID["route:1#0"].SubBucket)
+	require.Equal(t, 2, byID["route:1#0"].SubBucketCount,
+		"a merged row must keep its sub-range identity, or the SPA renders no label")
+	require.Equal(t, 1, byID["route:1#1"].SubBucket)
+	require.Equal(t, 2, byID["route:1#1"].SubBucketCount)
+}
+
+// TestMergeKeyVizMatricesTakesSubRangeMetadataFromAnyPeer covers the rolling
+// upgrade: during one, a bucket is reported by peers that omit the fields and
+// peers that populate them. Taking the first peer's zero would blank the row for
+// the whole cluster, so a nonzero value from any peer wins.
+func TestMergeKeyVizMatricesTakesSubRangeMetadataFromAnyPeer(t *testing.T) {
+	t.Parallel()
+
+	col := []int64{1_700_000_000_000}
+	// The legacy peer is FIRST, so the accumulator is seeded from it.
+	legacyPeer := KeyVizMatrix{
+		ColumnUnixMs: col, Series: keyVizSeriesWrites,
+		Rows: []KeyVizRow{{
+			BucketID: "route:1#1", Start: []byte{0x10}, End: []byte{0x20}, Values: []uint64{4},
+		}},
+	}
+	upgradedPeer := KeyVizMatrix{
+		ColumnUnixMs: col, Series: keyVizSeriesWrites,
+		Rows: []KeyVizRow{{
+			BucketID: "route:1#1", Start: []byte{0x10}, End: []byte{0x20},
+			SubBucket: 1, SubBucketCount: 2, Values: []uint64{6},
+		}},
+	}
+
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{legacyPeer, upgradedPeer}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Equal(t, 1, merged.Rows[0].SubBucket)
+	require.Equal(t, 2, merged.Rows[0].SubBucketCount,
+		"one legacy peer must not blank the sub-range identity the upgraded peers report")
+}
+
+// A route that is not sub-divided must stay byte-identical on the wire, so an
+// older SPA sees no change.
+func TestMergeKeyVizMatricesOmitsSubRangeMetadataWhenAbsent(t *testing.T) {
+	t.Parallel()
+
+	col := []int64{1_700_000_000_000}
+	peer := func(v uint64) KeyVizMatrix {
+		return KeyVizMatrix{
+			ColumnUnixMs: col, Series: keyVizSeriesWrites,
+			Rows: []KeyVizRow{{
+				BucketID: "route:1", Start: []byte{0x00}, End: []byte{0x20}, Values: []uint64{v},
+			}},
+		}
+	}
+
+	merged := mergeKeyVizMatrices([]KeyVizMatrix{peer(1), peer(2)}, keyVizSeriesWrites)
+	require.Len(t, merged.Rows, 1)
+	require.Zero(t, merged.Rows[0].SubBucket)
+	require.Zero(t, merged.Rows[0].SubBucketCount)
+}
