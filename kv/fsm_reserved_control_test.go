@@ -108,10 +108,10 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 		[]byte("!migfence|7"),
 	} {
 		muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}}
-		_, err := f.uniqueMutationsAboveFloor(muts, 10)
+		_, err := f.uniqueMutationsAboveFloor(context.Background(), muts, 10)
 		require.ErrorIs(t, err, ErrInvalidRequest,
 			"prepare/one-phase must refuse %q", key)
-		_, err = f.uniqueTxnMutationsAboveFloor(muts, 10)
+		_, err = f.uniqueTxnMutationsAboveFloor(context.Background(), muts, 10)
 		require.ErrorIs(t, err, ErrInvalidRequest,
 			"commit must refuse %q", key)
 	}
@@ -129,9 +129,9 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 		[]byte("!dist|meta|version"),
 	} {
 		muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}}
-		_, err := f.uniqueMutationsAboveFloor(muts, 10)
+		_, err := f.uniqueMutationsAboveFloor(context.Background(), muts, 10)
 		require.NoError(t, err, "key %q must be accepted", key)
-		_, err = f.uniqueTxnMutationsAboveFloor(muts, 10)
+		_, err = f.uniqueTxnMutationsAboveFloor(context.Background(), muts, 10)
 		require.NoError(t, err, "key %q must be accepted", key)
 	}
 }

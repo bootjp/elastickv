@@ -41,10 +41,12 @@ type ShardStore struct {
 
 var (
 	ErrCrossShardMutationBatchNotSupported     = errors.New("cross-shard mutation batches are not supported")
+	ErrRouteCutoverPending                     = errors.New("route cutover pending")
 	ErrExplicitGroupStagedVisibilityUnresolved = errors.New("explicit group read cannot resolve staged visibility route")
 	ErrExplicitGroupRouteOwnerMismatch         = errors.New("explicit group read does not own the requested key range")
 	ErrReadRouteVersionUnavailable             = errors.New("read route version is not locally available")
 	ErrFilesystemPlacementTargetNotFound       = errors.New("filesystem placement target group has no routable home slot")
+	ErrRouteWriteBelowFloor                    = ErrRouteWriteTimestampTooLow
 )
 
 var ErrTSOCommitFloorUnavailable = errors.New("tso: authoritative data-group commit floor is unavailable")
@@ -483,6 +485,11 @@ func isLinearizableRaftLeader(ctx context.Context, engine raftengine.LeaderView)
 }
 
 func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return nil, err
+	}
 	if !isTxnInternalKey(key) {
 		if err := s.maybeResolveTxnLock(ctx, g, key, ts); err != nil {
 			return nil, err
@@ -492,6 +499,11 @@ func (s *ShardStore) leaderGetAt(ctx context.Context, g *ShardGroup, route distr
 }
 
 func (s *ShardStore) localGetAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64) ([]byte, error) {
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return nil, err
+	}
 	if routeHasStagedVisibility(route) {
 		return s.getAtWithStagedVisibility(ctx, g, route, key, ts)
 	}
@@ -504,6 +516,197 @@ func (s *ShardStore) localGetAt(ctx context.Context, g *ShardGroup, route distri
 
 func routeHasStagedVisibility(route distribution.Route) bool {
 	return route.StagedVisibilityActive && route.MigrationJobID != 0
+}
+
+func routeSatisfiesTargetReadiness(route distribution.Route, ready store.TargetStagedReadinessState, catalogVersion uint64) bool {
+	if !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
+		return false
+	}
+	if route.MinWriteTSExclusive < ready.MinWriteTSExclusive {
+		return false
+	}
+	if route.StagedVisibilityActive {
+		return route.MigrationJobID == ready.MigrationJobID
+	}
+	if route.MigrationJobID != 0 {
+		return false
+	}
+	return ready.ExpectedCutoverVersion == 0 || catalogVersion >= ready.ExpectedCutoverVersion
+}
+
+func (s *ShardStore) targetReadyRouteForRange(ctx context.Context, g *ShardGroup, route distribution.Route, start []byte, end []byte) (distribution.Route, error) {
+	routeStart, routeEnd := readinessRouteRangeForScan(start, end)
+	return s.targetReadyRouteForRouteRange(ctx, g, route, routeStart, routeEnd)
+}
+
+func (s *ShardStore) verifyTargetReadinessForRange(ctx context.Context, g *ShardGroup, route distribution.Route, start []byte, end []byte) error {
+	_, err := s.targetReadyRouteForRange(ctx, g, route, start, end)
+	return err
+}
+
+func (s *ShardStore) targetReadyRouteForRouteRange(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte) (distribution.Route, error) {
+	routes, err := s.targetReadyRoutesForRouteRange(ctx, g, route, routeStart, routeEnd)
+	if err != nil {
+		return route, err
+	}
+	if len(routes) == 1 {
+		return routes[0], nil
+	}
+	return route, nil
+}
+
+func (s *ShardStore) targetReadyRoutesForRouteRange(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte) ([]distribution.Route, error) {
+	if g == nil || g.Store == nil {
+		return []distribution.Route{route}, nil
+	}
+	reader, ok := g.Store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return []distribution.Route{route}, nil
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if sourceReadFenceApplies(states, routeStart, routeEnd) {
+		return nil, errors.WithStack(ErrRouteCutoverPending)
+	}
+	applicable := targetReadinessApplicableStates(states, route, routeStart, routeEnd)
+	if len(applicable) == 0 {
+		return []distribution.Route{route}, nil
+	}
+
+	proofRoutes, catalogVersion, ok := s.readinessProofRoutes(route, routeStart, routeEnd)
+	if !ok {
+		return nil, errors.WithStack(ErrRouteCutoverPending)
+	}
+	if !readinessProofSatisfiesStates(applicable, proofRoutes, route.GroupID, catalogVersion) {
+		return nil, errors.WithStack(ErrRouteCutoverPending)
+	}
+	return proofRoutes, nil
+}
+
+func targetReadinessApplicableStates(
+	states []store.TargetStagedReadinessState,
+	route distribution.Route,
+	routeStart []byte,
+	routeEnd []byte,
+) []store.TargetStagedReadinessState {
+	applicable := make([]store.TargetStagedReadinessState, 0, len(states))
+	for _, ready := range states {
+		if ready.SourceWriteFence || ready.SourceReadFence || ready.TrackWrites {
+			continue
+		}
+		if targetReadinessAppliesToRoute(route, routeStart, routeEnd, ready) {
+			applicable = append(applicable, ready)
+		}
+	}
+	return applicable
+}
+
+func sourceReadFenceApplies(states []store.TargetStagedReadinessState, routeStart []byte, routeEnd []byte) bool {
+	for _, state := range states {
+		if state.Armed && state.SourceReadFence && routeRangeIntersects(routeStart, routeEnd, state.RouteStart, state.RouteEnd) {
+			return true
+		}
+	}
+	return false
+}
+
+func readinessProofSatisfiesStates(
+	states []store.TargetStagedReadinessState,
+	routes []distribution.Route,
+	groupID uint64,
+	catalogVersion uint64,
+) bool {
+	for _, ready := range states {
+		if !routesSatisfyTargetReadiness(routes, ready, groupID, catalogVersion) {
+			return false
+		}
+	}
+	return true
+}
+
+func (s *ShardStore) verifyTargetReadinessForRouteRange(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte) error {
+	_, err := s.targetReadyRouteForRouteRange(ctx, g, route, routeStart, routeEnd)
+	return err
+}
+
+func (s *ShardStore) readinessProofRoutes(route distribution.Route, routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
+	if s == nil || s.engine == nil {
+		return []distribution.Route{route}, 0, true
+	}
+	snap, ok := s.engine.Current()
+	if !ok {
+		return nil, 0, false
+	}
+	routes := snap.IntersectingRoutes(routeStart, routeEnd)
+	proof := routes[:0]
+	for _, candidate := range routes {
+		if candidate.GroupID != route.GroupID {
+			continue
+		}
+		if (route.Start != nil || route.End != nil || route.RouteID != 0) &&
+			!routeRangeIntersects(candidate.Start, candidate.End, route.Start, route.End) {
+			continue
+		}
+		proof = append(proof, candidate)
+	}
+	return proof, snap.Version(), len(proof) > 0
+}
+
+func targetReadinessAppliesToRoute(route distribution.Route, routeStart []byte, routeEnd []byte, ready store.TargetStagedReadinessState) bool {
+	if !ready.Armed || !routeRangeIntersects(routeStart, routeEnd, ready.RouteStart, ready.RouteEnd) {
+		return false
+	}
+	if route.RouteID != 0 && !routeRangeIntersects(route.Start, route.End, ready.RouteStart, ready.RouteEnd) {
+		return false
+	}
+	return true
+}
+
+func readinessRouteRange(start []byte, end []byte) ([]byte, []byte) {
+	if routeStart, routeEnd, ok := s3BucketAuxiliaryRouteRange(start); ok && (end == nil || bytes.Equal(end, nextScanCursor(start))) {
+		return routeStart, routeEnd
+	}
+	routeStart := routeKey(start)
+	if end == nil {
+		return routeStart, nil
+	}
+	routeEnd := routeKey(end)
+	if bytes.Compare(routeEnd, routeStart) <= 0 {
+		routeEnd = nextScanCursor(routeStart)
+	}
+	return routeStart, routeEnd
+}
+
+func readinessRouteRangeForScan(start []byte, end []byte) ([]byte, []byte) {
+	if routeStart, routeEnd, ok := s3keys.ManifestScanRouteBounds(start, end); ok {
+		return routeStart, routeEnd
+	}
+	if s3BucketAuxiliaryScanBounds(start, end) {
+		return s3BucketAuxiliaryScanRouteRange(start, end)
+	}
+	if routeStart, routeEnd, ok := fskeys.ChunkScanRouteBounds(start, end); ok {
+		return routeStart, routeEnd
+	}
+	return readinessRouteRange(start, end)
+}
+
+func verifyRouteWriteFloor(route distribution.Route, commitTS uint64) error {
+	if route.MinWriteTSExclusive == 0 || commitTS == 0 || commitTS > route.MinWriteTSExclusive {
+		return nil
+	}
+	return errors.Wrapf(ErrRouteWriteBelowFloor, "commit_ts %d <= floor %d", commitTS, route.MinWriteTSExclusive)
+}
+
+func routeRangeIntersects(aStart, aEnd, bStart, bEnd []byte) bool {
+	if aEnd != nil && bytes.Compare(aEnd, bStart) <= 0 {
+		return false
+	}
+	if bEnd != nil && bytes.Compare(bEnd, aStart) <= 0 {
+		return false
+	}
+	return true
 }
 
 func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distribution.Route, error) {
@@ -620,6 +823,7 @@ func latestMVCCVersionAt(ctx context.Context, st store.MVCCStore, key []byte, ts
 		StartKey:             key,
 		EndKey:               exactKeyScanEnd(key),
 		MaxCommitTSInclusive: ts,
+		ReadTS:               ts,
 		MaxVersions:          1,
 		MaxScannedBytes:      0,
 		MinCommitTSExclusive: 0,
@@ -704,19 +908,20 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 // pending.length fast-path during churn. Mirrors LeaderRoutedStore's fix
 // for codex P1 #796.
 func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
-	g, ok := s.groupForKey(key)
+	route, g, ok := s.routeAndGroupForKey(key)
 	if !ok || g.Store == nil {
 		return false, nil
+	}
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return false, err
 	}
 	// engineForGroup may be nil in test fixtures that wire ShardStore
 	// without raft; preserve the existing local-only fallback there.
 	engine := engineForGroup(g)
 	if engine == nil {
-		exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
-		if err != nil {
-			return false, errors.WithStack(err)
-		}
-		return exists, nil
+		return committedVersionAtForRoute(ctx, g.Store, route, key, commitTS)
 	}
 	if !isLinearizableRaftLeader(ctx, engine) && !tryEngineLinearizableFence(ctx, engine) {
 		// Not the linearizable leader for this group AND the ReadIndex
@@ -726,7 +931,23 @@ func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitT
 		// serialization.
 		return false, nil
 	}
-	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return false, err
+	}
+	return committedVersionAtForRoute(ctx, g.Store, route, key, commitTS)
+}
+
+func committedVersionAtForRoute(ctx context.Context, st store.MVCCStore, route distribution.Route, key []byte, commitTS uint64) (bool, error) {
+	exists, err := st.CommittedVersionAt(ctx, key, commitTS)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if exists || !routeHasStagedVisibility(route) {
+		return exists, nil
+	}
+	stagedKey := distribution.MigrationStagedDataKey(route.MigrationJobID, key)
+	exists, err = st.CommittedVersionAt(ctx, stagedKey, commitTS)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
@@ -910,6 +1131,10 @@ func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, group
 	}
 	routes, clampToRoutes, err := s.routesForExplicitGroupScanWithRouteBounds(groupID, start, end, routeStart, routeEnd)
 	if err != nil {
+		return nil, err
+	}
+	readinessStart, readinessEnd := readinessRouteRangeForScan(start, end)
+	if err := s.verifyExplicitGroupRoutesForRange(ctx, groupID, routes, readinessStart, readinessEnd); err != nil {
 		return nil, err
 	}
 	routeFilterPresent := routeScanBoundsPresent(routeStart, routeEnd)
@@ -1970,6 +2195,15 @@ func (s *ShardStore) scanKeyRouteAtWithReadFence(
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g == nil || g.Store == nil {
 		return nil, nil
+	}
+
+	// keys_only reads need the same readiness proof as value scans. Without it
+	// an armed source read fence still hands back old-source keys, and an armed
+	// target guard hands back live-only or empty keys while the catalog watcher
+	// lags -- the exact windows scanRouteAtDirection proves its way out of.
+	route, err := s.targetReadyRouteForRange(ctx, g, route, start, end)
+	if err != nil {
+		return nil, err
 	}
 
 	if engineForGroup(g) == nil {
@@ -3203,6 +3437,11 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 		return nil, false, nil
 	}
 	markRouteGroup := shouldMarkRouteGroupOnScan(start, false, nil, nil)
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, start, end)
+	if err != nil {
+		return nil, false, err
+	}
 
 	if engineForGroup(g) == nil {
 		if routeHasStagedVisibility(route) {
@@ -3217,17 +3456,35 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 	}
 
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
-		if routeHasStagedVisibility(route) {
-			kvs, err := s.scanRouteAtLeader(ctx, g, route, start, end, visibleLimit, ts, reverse)
-			return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), false, err
-		}
-		kvs, limitReached, err := s.scanRouteAtLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
+		kvs, limitReached, err := s.scanReadyLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
 		return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), limitReached, err
 	}
 
 	// RawScanAt cannot enforce physicalLimit, so report truncation and let
 	// callers fail closed instead of proxying an unbounded physical scan.
 	return nil, true, nil
+}
+
+func (s *ShardStore) scanReadyLeaderPhysicalLimit(
+	ctx context.Context,
+	g *ShardGroup,
+	route distribution.Route,
+	start []byte,
+	end []byte,
+	visibleLimit int,
+	physicalLimit int,
+	ts uint64,
+	reverse bool,
+) ([]*store.KVPair, bool, error) {
+	route, err := s.targetReadyRouteForRange(ctx, g, route, start, end)
+	if err != nil {
+		return nil, false, err
+	}
+	if routeHasStagedVisibility(route) {
+		kvs, err := s.scanRouteAtLeader(ctx, g, route, start, end, visibleLimit, ts, reverse)
+		return kvs, false, err
+	}
+	return s.scanRouteAtLeaderPhysicalLimit(ctx, g, route, start, end, visibleLimit, physicalLimit, ts, reverse)
 }
 
 func scanLocalPhysicalLimit(
@@ -3280,6 +3537,11 @@ func (s *ShardStore) scanRouteLocal(
 	ts uint64,
 	reverse bool,
 ) ([]*store.KVPair, error) {
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, start, end)
+	if err != nil {
+		return nil, err
+	}
 	if routeHasStagedVisibility(route) {
 		return s.scanRouteWithStagedVisibility(ctx, g, route, start, end, limit, ts, reverse)
 	}
@@ -3302,6 +3564,11 @@ func (s *ShardStore) scanRouteAtLeaderPhysicalLimit(
 	ts uint64,
 	reverse bool,
 ) ([]*store.KVPair, bool, error) {
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, start, end)
+	if err != nil {
+		return nil, false, err
+	}
 	kvs, limitReached, err := scanLocalPhysicalLimit(ctx, g.Store, start, end, visibleLimit, physicalLimit, ts, reverse)
 	if err != nil {
 		return nil, limitReached, errors.WithStack(err)
@@ -3325,10 +3592,12 @@ func (s *ShardStore) scanRouteAtLeader(
 	ts uint64,
 	reverse bool,
 ) ([]*store.KVPair, error) {
-	var (
-		kvs []*store.KVPair
-		err error
-	)
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, start, end)
+	if err != nil {
+		return nil, err
+	}
+	var kvs []*store.KVPair
 	switch {
 	case routeHasStagedVisibility(route):
 		kvs, err = s.scanRouteWithStagedVisibility(ctx, g, route, start, end, limit, ts, reverse)
@@ -4090,8 +4359,13 @@ func clampScanEnd(end []byte, routeEnd []byte) []byte {
 
 func (s *ShardStore) PutAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
 	route, g, ok := s.routeAndGroupForKey(key)
-	if !ok || g.Store == nil {
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return err
 	}
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
 		return err
@@ -4104,8 +4378,13 @@ func (s *ShardStore) PutAt(ctx context.Context, key []byte, value []byte, commit
 
 func (s *ShardStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) error {
 	route, g, ok := s.routeAndGroupForKey(key)
-	if !ok || g.Store == nil {
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return err
 	}
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
 		return err
@@ -4118,8 +4397,13 @@ func (s *ShardStore) DeleteAt(ctx context.Context, key []byte, commitTS uint64) 
 
 func (s *ShardStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte, commitTS uint64, expireAt uint64) error {
 	route, g, ok := s.routeAndGroupForKey(key)
-	if !ok || g.Store == nil {
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return err
 	}
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
 		return err
@@ -4132,8 +4416,13 @@ func (s *ShardStore) PutWithTTLAt(ctx context.Context, key []byte, value []byte,
 
 func (s *ShardStore) ExpireAt(ctx context.Context, key []byte, expireAt uint64, commitTS uint64) error {
 	route, g, ok := s.routeAndGroupForKey(key)
-	if !ok || g.Store == nil {
+	if !ok || g == nil || g.Store == nil {
 		return store.ErrNotSupported
+	}
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return err
 	}
 	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
 		return err
@@ -4281,6 +4570,10 @@ func (s *ShardStore) versionsExistAtOrBeforeWithReadFence(ctx context.Context, k
 }
 
 func (s *ShardStore) localLatestCommitTS(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte) (uint64, bool, error) {
+	route, err := s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return 0, false, err
+	}
 	if !routeHasStagedVisibility(route) {
 		liveTS, liveExists, err := g.Store.LatestCommitTS(ctx, key)
 		return liveTS, liveExists, errors.WithStack(err)
@@ -5025,9 +5318,46 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
 		return err
 	}
+	if err := s.verifyMutationRoutes(ctx, mutations, readKeys, commitTS); err != nil {
+		return err
+	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
 	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
 	return errors.WithStack(group.Store.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS))
+}
+
+func (s *ShardStore) verifyMutationRoutes(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, commitTS uint64) error {
+	for _, mut := range mutations {
+		if err := s.verifyMutationWriteRoute(ctx, mut.Key, commitTS); err != nil {
+			return err
+		}
+	}
+	for _, key := range readKeys {
+		route, g, ok := s.routeAndGroupForKey(key)
+		if !ok || g == nil || g.Store == nil {
+			return store.ErrNotSupported
+		}
+		if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (s *ShardStore) verifyMutationWriteRoute(ctx context.Context, key []byte, commitTS uint64) error {
+	route, g, ok := s.routeAndGroupForKey(key)
+	if !ok || g == nil || g.Store == nil {
+		return store.ErrNotSupported
+	}
+	var err error
+	route, err = s.targetReadyRouteForRange(ctx, g, route, key, nextScanCursor(key))
+	if err != nil {
+		return err
+	}
+	if err := ensureRouteWriteTimestampFloor(route, key, commitTS); err != nil {
+		return err
+	}
+	return s.ensureS3BucketAuxiliaryWriteTimestampFloor(key, commitTS)
 }
 
 // ApplyMutationsRaft is the raft-apply variant; see store.MVCCStore for the
@@ -5035,9 +5365,6 @@ func (s *ShardStore) ApplyMutations(ctx context.Context, mutations []*store.KVPa
 func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	group, err := s.resolveSingleShardGroup(mutations)
 	if err != nil || group == nil {
-		return err
-	}
-	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
@@ -5051,9 +5378,6 @@ func (s *ShardStore) ApplyMutationsRaft(ctx context.Context, mutations []*store.
 func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
 	group, err := s.resolveSingleShardGroup(mutations)
 	if err != nil || group == nil {
-		return err
-	}
-	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
 		return err
 	}
 	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
@@ -5340,19 +5664,113 @@ func (s *ShardStore) resolveSingleShardGroup(mutations []*store.KVPairMutation) 
 
 // DeletePrefixAt applies a prefix delete to every shard in the store.
 func (s *ShardStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.deletePrefixEverywhere(ctx, prefix, excludePrefix, commitTS,
+		func(g *ShardGroup, p, exclude []byte) error {
+			return g.Store.DeletePrefixAt(ctx, p, exclude, commitTS)
+		})
+}
+
+// DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
+func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
+	return s.deletePrefixEverywhere(ctx, prefix, excludePrefix, commitTS,
+		func(g *ShardGroup, p, exclude []byte) error {
+			return g.Store.DeletePrefixAtRaft(ctx, p, exclude, commitTS)
+		})
+}
+
+// deletePrefixEverywhere is the shared body of DeletePrefixAt and
+// DeletePrefixAtRaft: prove the floors and migration readiness once, then let
+// each group delete its staged aliases before the live prefix. Only the
+// per-group delete call differs between the two.
+func (s *ShardStore) deletePrefixEverywhere(
+	ctx context.Context,
+	prefix []byte,
+	excludePrefix []byte,
+	commitTS uint64,
+	deleteOne func(g *ShardGroup, prefix, excludePrefix []byte) error,
+) error {
 	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
 		return err
+	}
+	routes, err := s.verifyPrefixDeleteRoutes(ctx, prefix, commitTS)
+	if err != nil {
+		return err
+	}
+	for groupID, g := range s.groups {
+		if g == nil || g.Store == nil {
+			continue
+		}
+		deleteStagedPrefix := func(stagedPrefix []byte, stagedExcludePrefix []byte) error {
+			return deleteOne(g, stagedPrefix, stagedExcludePrefix)
+		}
+		if err := deleteStagedVisibilityPrefixes(routesForGroupID(routes, groupID), prefix, excludePrefix, deleteStagedPrefix); err != nil {
+			return err
+		}
+		if err := deleteOne(g, prefix, excludePrefix); err != nil {
+			return errors.WithStack(err)
+		}
+	}
+	return nil
+}
+
+// DeletePrefixAtRaftAt is the raft-entry-index-aware variant. The
+// caller's raft entry index applies only to the local group whose
+// FSM is driving this apply; on a multi-group ShardStore, fanning
+// the SAME index across other groups would corrupt their
+// metaAppliedIndex. The single-group case (the common case for an
+// FSM-local DeletePrefixAtRaft path) gets the correct bundling; the
+// multi-group broadcast case is treated as "passive" — peer groups
+// receive the prefix-delete without a meta-key bump (their own raft
+// applies will catch up the index on the next mutation).
+//
+// In practice the FSM call sites that issue raft-DeletePrefix
+// operate against a single group's store; the multi-group ShardStore
+// is the receiver only when an aggregate (admin / coordinator) path
+// is replaying a global FLUSHALL, which is not raft-applied.
+func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
+	return s.DeletePrefixesAtRaftAt(ctx, []store.PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, appliedIndex)
+}
+
+func (s *ShardStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []store.PrefixDelete, commitTS, appliedIndex uint64) error {
+	if len(deletes) == 0 {
+		return nil
+	}
+	stagedByGroup := make(map[*ShardGroup][]store.PrefixDelete)
+	for _, del := range deletes {
+		// Migration readiness and source fences are proved before any floor or
+		// staged planning: a prefix delete that sweeps a range mid-cutover must
+		// be refused, not merely floor-checked.
+		if _, err := s.verifyPrefixDeleteRoutes(ctx, del.Prefix, commitTS); err != nil {
+			return err
+		}
+		if err := s.ensurePrefixWriteTimestampFloors(del.Prefix, commitTS); err != nil {
+			return err
+		}
+		for _, staged := range s.stagedVisibilityPrefixDeletes(del.Prefix, del.ExcludePrefix) {
+			stagedByGroup[staged.group] = append(stagedByGroup[staged.group], store.PrefixDelete{
+				Prefix:        staged.prefix,
+				ExcludePrefix: staged.excludePrefix,
+			})
+		}
 	}
 	for _, g := range s.groups {
 		if g == nil || g.Store == nil {
 			continue
 		}
-		if err := g.Store.DeletePrefixAt(ctx, prefix, excludePrefix, commitTS); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	for _, del := range s.stagedVisibilityPrefixDeletes(prefix, excludePrefix) {
-		if err := del.group.Store.DeletePrefixAt(ctx, del.prefix, del.excludePrefix, commitTS); err != nil {
+		groupDeletes := make([]store.PrefixDelete, 0, len(deletes)+len(stagedByGroup[g]))
+		groupDeletes = append(groupDeletes, deletes...)
+		groupDeletes = append(groupDeletes, stagedByGroup[g]...)
+		// Pass appliedIndex through to every group. In the
+		// single-group call-path (the production raft-apply case)
+		// this is correct: appliedIndex IS that group's raft entry
+		// index. In a hypothetical multi-group call, only one group
+		// would see the matching index and the rest would treat it
+		// as a non-monotonic stray write — but the rest of the
+		// raft-apply contract (single FSM per raft log) makes that
+		// case impossible to reach in production. Tests that
+		// exercise ShardStore.DeletePrefixAtRaftAt across multiple
+		// groups MUST pass appliedIndex=0 to opt out.
+		if err := g.Store.DeletePrefixesAtRaftAt(ctx, groupDeletes, commitTS, appliedIndex); err != nil {
 			return errors.WithStack(err)
 		}
 	}
@@ -5363,6 +5781,19 @@ type stagedVisibilityPrefixDelete struct {
 	group         *ShardGroup
 	prefix        []byte
 	excludePrefix []byte
+}
+
+func (s *ShardStore) ensurePrefixWriteTimestampFloors(prefix []byte, commitTS uint64) error {
+	if s == nil || s.engine == nil || commitTS == 0 {
+		return nil
+	}
+	start, end := routePrefixRange(prefix)
+	for _, route := range s.engine.GetIntersectingRoutes(start, end) {
+		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
+			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", prefix, start, end, commitTS, route.MinWriteTSExclusive)
+		}
+	}
+	return nil
 }
 
 func (s *ShardStore) stagedVisibilityPrefixDeletes(prefix []byte, excludePrefix []byte) []stagedVisibilityPrefixDelete {
@@ -5396,92 +5827,69 @@ func (s *ShardStore) stagedVisibilityPrefixDeletes(prefix []byte, excludePrefix 
 	return out
 }
 
-func (s *ShardStore) ensurePrefixWriteTimestampFloors(prefix []byte, commitTS uint64) error {
-	if s == nil || s.engine == nil || commitTS == 0 {
-		return nil
+func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte, commitTS uint64) ([]distribution.Route, error) {
+	if s == nil || s.engine == nil {
+		return nil, nil
 	}
-	start, end := routePrefixRange(prefix)
-	for _, route := range s.engine.GetIntersectingRoutes(start, end) {
-		if route.MinWriteTSExclusive != 0 && commitTS <= route.MinWriteTSExclusive {
-			return errors.Wrapf(ErrRouteWriteTimestampTooLow, "prefix %q route range [%q,%q) commit_ts=%d floor=%d", prefix, start, end, commitTS, route.MinWriteTSExclusive)
+	routeStart, routeEnd := routePrefixRange(prefix)
+	routes := s.engine.GetIntersectingRoutes(routeStart, routeEnd)
+	if len(routes) == 0 {
+		return nil, errors.WithStack(ErrRouteCutoverPending)
+	}
+	verified := make([]distribution.Route, 0, len(routes))
+	for _, route := range routes {
+		g, ok := s.groupForID(route.GroupID)
+		if !ok || g == nil || g.Store == nil {
+			return nil, store.ErrNotSupported
 		}
+		proofRoutes, err := s.verifyPrefixDeleteRoute(ctx, g, route, routeStart, routeEnd, commitTS)
+		if err != nil {
+			return nil, err
+		}
+		verified = append(verified, proofRoutes...)
 	}
-	return nil
+	return verified, nil
 }
 
-// DeletePrefixAtRaft is the raft-apply variant of DeletePrefixAt.
-func (s *ShardStore) DeletePrefixAtRaft(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
-	if err := s.ensurePrefixWriteTimestampFloors(prefix, commitTS); err != nil {
-		return err
+func (s *ShardStore) verifyPrefixDeleteRoute(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte, commitTS uint64) ([]distribution.Route, error) {
+	proofRoutes, err := s.targetReadyRoutesForRouteRange(ctx, g, route, routeStart, routeEnd)
+	if err != nil {
+		return nil, err
 	}
-	for _, g := range s.groups {
-		if g == nil || g.Store == nil {
+	for _, proofRoute := range proofRoutes {
+		if err := verifyRouteWriteFloor(proofRoute, commitTS); err != nil {
+			return nil, err
+		}
+	}
+	return proofRoutes, nil
+}
+
+func routesForGroupID(routes []distribution.Route, groupID uint64) []distribution.Route {
+	out := make([]distribution.Route, 0, len(routes))
+	for _, route := range routes {
+		if route.GroupID == groupID {
+			out = append(out, route)
+		}
+	}
+	return out
+}
+
+func deleteStagedVisibilityPrefixes(routes []distribution.Route, prefix []byte, excludePrefix []byte, deletePrefix func([]byte, []byte) error) error {
+	seen := make(map[uint64]struct{})
+	for _, route := range routes {
+		if !routeHasStagedVisibility(route) {
 			continue
 		}
-		if err := g.Store.DeletePrefixAtRaft(ctx, prefix, excludePrefix, commitTS); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	for _, del := range s.stagedVisibilityPrefixDeletes(prefix, excludePrefix) {
-		if err := del.group.Store.DeletePrefixAtRaft(ctx, del.prefix, del.excludePrefix, commitTS); err != nil {
-			return errors.WithStack(err)
-		}
-	}
-	return nil
-}
-
-// DeletePrefixAtRaftAt is the raft-entry-index-aware variant. The
-// caller's raft entry index applies only to the local group whose
-// FSM is driving this apply; on a multi-group ShardStore, fanning
-// the SAME index across other groups would corrupt their
-// metaAppliedIndex. The single-group case (the common case for an
-// FSM-local DeletePrefixAtRaft path) gets the correct bundling; the
-// multi-group broadcast case is treated as "passive" — peer groups
-// receive the prefix-delete without a meta-key bump (their own raft
-// applies will catch up the index on the next mutation).
-//
-// In practice the FSM call sites that issue raft-DeletePrefix
-// operate against a single group's store; the multi-group ShardStore
-// is the receiver only when an aggregate (admin / coordinator) path
-// is replaying a global FLUSHALL, which is not raft-applied.
-func (s *ShardStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS, appliedIndex uint64) error {
-	return s.DeletePrefixesAtRaftAt(ctx, []store.PrefixDelete{{Prefix: prefix, ExcludePrefix: excludePrefix}}, commitTS, appliedIndex)
-}
-
-func (s *ShardStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []store.PrefixDelete, commitTS, appliedIndex uint64) error {
-	if len(deletes) == 0 {
-		return nil
-	}
-	stagedByGroup := make(map[*ShardGroup][]store.PrefixDelete)
-	for _, del := range deletes {
-		if err := s.ensurePrefixWriteTimestampFloors(del.Prefix, commitTS); err != nil {
-			return err
-		}
-		for _, staged := range s.stagedVisibilityPrefixDeletes(del.Prefix, del.ExcludePrefix) {
-			stagedByGroup[staged.group] = append(stagedByGroup[staged.group], store.PrefixDelete{
-				Prefix:        staged.prefix,
-				ExcludePrefix: staged.excludePrefix,
-			})
-		}
-	}
-	for _, g := range s.groups {
-		if g == nil || g.Store == nil {
+		if _, ok := seen[route.MigrationJobID]; ok {
 			continue
 		}
-		groupDeletes := make([]store.PrefixDelete, 0, len(deletes)+len(stagedByGroup[g]))
-		groupDeletes = append(groupDeletes, deletes...)
-		groupDeletes = append(groupDeletes, stagedByGroup[g]...)
-		// Pass appliedIndex through to every group. In the
-		// single-group call-path (the production raft-apply case)
-		// this is correct: appliedIndex IS that group's raft entry
-		// index. In a hypothetical multi-group call, only one group
-		// would see the matching index and the rest would treat it
-		// as a non-monotonic stray write — but the rest of the
-		// raft-apply contract (single FSM per raft log) makes that
-		// case impossible to reach in production. Tests that
-		// exercise ShardStore.DeletePrefixAtRaftAt across multiple
-		// groups MUST pass appliedIndex=0 to opt out.
-		if err := g.Store.DeletePrefixesAtRaftAt(ctx, groupDeletes, commitTS, appliedIndex); err != nil {
+		seen[route.MigrationJobID] = struct{}{}
+		stagedPrefix := distribution.MigrationStagedDataKey(route.MigrationJobID, prefix)
+		var stagedExcludePrefix []byte
+		if len(excludePrefix) > 0 {
+			stagedExcludePrefix = distribution.MigrationStagedDataKey(route.MigrationJobID, excludePrefix)
+		}
+		if err := deletePrefix(stagedPrefix, stagedExcludePrefix); err != nil {
 			return errors.WithStack(err)
 		}
 	}
@@ -5817,6 +6225,22 @@ func (s *ShardStore) closeGroup(g *ShardGroup) error {
 func (s *ShardStore) groupForKey(key []byte) (*ShardGroup, bool) {
 	_, g, ok := s.routeAndGroupForKey(key)
 	return g, ok
+}
+
+func (s *ShardStore) verifyExplicitGroupRoutesForRange(ctx context.Context, groupID uint64, routes []distribution.Route, routeStart []byte, routeEnd []byte) error {
+	g, ok := s.groupForID(groupID)
+	if !ok || g == nil || g.Store == nil {
+		// A store-less group (the dedicated TSO group) holds no rows, so there
+		// is no migration readiness to prove and nothing a scan could return.
+		// Refusing here would turn an empty scan into an error.
+		return nil
+	}
+	for _, route := range routes {
+		if err := s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (s *ShardStore) routeAndGroupForKey(key []byte) (distribution.Route, *ShardGroup, bool) {

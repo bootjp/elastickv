@@ -19,20 +19,21 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Distribution_GetRoute_FullMethodName               = "/Distribution/GetRoute"
-	Distribution_GetTimestamp_FullMethodName           = "/Distribution/GetTimestamp"
-	Distribution_ValidateTimestamp_FullMethodName      = "/Distribution/ValidateTimestamp"
-	Distribution_ListRoutes_FullMethodName             = "/Distribution/ListRoutes"
-	Distribution_SplitRange_FullMethodName             = "/Distribution/SplitRange"
-	Distribution_GetCatalogCapabilities_FullMethodName = "/Distribution/GetCatalogCapabilities"
-	Distribution_WatchCatalog_FullMethodName           = "/Distribution/WatchCatalog"
-	Distribution_StartSplitMigration_FullMethodName    = "/Distribution/StartSplitMigration"
-	Distribution_GetRouteOwnership_FullMethodName      = "/Distribution/GetRouteOwnership"
-	Distribution_GetIntersectingRoutes_FullMethodName  = "/Distribution/GetIntersectingRoutes"
-	Distribution_GetSplitJob_FullMethodName            = "/Distribution/GetSplitJob"
-	Distribution_ListSplitJobs_FullMethodName          = "/Distribution/ListSplitJobs"
-	Distribution_AbandonSplitJob_FullMethodName        = "/Distribution/AbandonSplitJob"
-	Distribution_RetrySplitJob_FullMethodName          = "/Distribution/RetrySplitJob"
+	Distribution_GetRoute_FullMethodName                    = "/Distribution/GetRoute"
+	Distribution_GetTimestamp_FullMethodName                = "/Distribution/GetTimestamp"
+	Distribution_ValidateTimestamp_FullMethodName           = "/Distribution/ValidateTimestamp"
+	Distribution_ListRoutes_FullMethodName                  = "/Distribution/ListRoutes"
+	Distribution_SplitRange_FullMethodName                  = "/Distribution/SplitRange"
+	Distribution_GetCatalogCapabilities_FullMethodName      = "/Distribution/GetCatalogCapabilities"
+	Distribution_WatchCatalog_FullMethodName                = "/Distribution/WatchCatalog"
+	Distribution_StartSplitMigration_FullMethodName         = "/Distribution/StartSplitMigration"
+	Distribution_GetSplitMigrationCapability_FullMethodName = "/Distribution/GetSplitMigrationCapability"
+	Distribution_GetRouteOwnership_FullMethodName           = "/Distribution/GetRouteOwnership"
+	Distribution_GetIntersectingRoutes_FullMethodName       = "/Distribution/GetIntersectingRoutes"
+	Distribution_GetSplitJob_FullMethodName                 = "/Distribution/GetSplitJob"
+	Distribution_ListSplitJobs_FullMethodName               = "/Distribution/ListSplitJobs"
+	Distribution_AbandonSplitJob_FullMethodName             = "/Distribution/AbandonSplitJob"
+	Distribution_RetrySplitJob_FullMethodName               = "/Distribution/RetrySplitJob"
 )
 
 // DistributionClient is the client API for Distribution service.
@@ -47,6 +48,7 @@ type DistributionClient interface {
 	GetCatalogCapabilities(ctx context.Context, in *CatalogCapabilitiesRequest, opts ...grpc.CallOption) (*CatalogCapabilitiesResponse, error)
 	WatchCatalog(ctx context.Context, in *CatalogWatchRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[CatalogWatchEvent], error)
 	StartSplitMigration(ctx context.Context, in *StartSplitMigrationRequest, opts ...grpc.CallOption) (*StartSplitMigrationResponse, error)
+	GetSplitMigrationCapability(ctx context.Context, in *GetSplitMigrationCapabilityRequest, opts ...grpc.CallOption) (*GetSplitMigrationCapabilityResponse, error)
 	GetRouteOwnership(ctx context.Context, in *GetRouteOwnershipRequest, opts ...grpc.CallOption) (*GetRouteOwnershipResponse, error)
 	GetIntersectingRoutes(ctx context.Context, in *GetIntersectingRoutesRequest, opts ...grpc.CallOption) (*GetIntersectingRoutesResponse, error)
 	GetSplitJob(ctx context.Context, in *GetSplitJobRequest, opts ...grpc.CallOption) (*GetSplitJobResponse, error)
@@ -152,6 +154,16 @@ func (c *distributionClient) StartSplitMigration(ctx context.Context, in *StartS
 	return out, nil
 }
 
+func (c *distributionClient) GetSplitMigrationCapability(ctx context.Context, in *GetSplitMigrationCapabilityRequest, opts ...grpc.CallOption) (*GetSplitMigrationCapabilityResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(GetSplitMigrationCapabilityResponse)
+	err := c.cc.Invoke(ctx, Distribution_GetSplitMigrationCapability_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 func (c *distributionClient) GetRouteOwnership(ctx context.Context, in *GetRouteOwnershipRequest, opts ...grpc.CallOption) (*GetRouteOwnershipResponse, error) {
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(GetRouteOwnershipResponse)
@@ -224,6 +236,7 @@ type DistributionServer interface {
 	GetCatalogCapabilities(context.Context, *CatalogCapabilitiesRequest) (*CatalogCapabilitiesResponse, error)
 	WatchCatalog(*CatalogWatchRequest, grpc.ServerStreamingServer[CatalogWatchEvent]) error
 	StartSplitMigration(context.Context, *StartSplitMigrationRequest) (*StartSplitMigrationResponse, error)
+	GetSplitMigrationCapability(context.Context, *GetSplitMigrationCapabilityRequest) (*GetSplitMigrationCapabilityResponse, error)
 	GetRouteOwnership(context.Context, *GetRouteOwnershipRequest) (*GetRouteOwnershipResponse, error)
 	GetIntersectingRoutes(context.Context, *GetIntersectingRoutesRequest) (*GetIntersectingRoutesResponse, error)
 	GetSplitJob(context.Context, *GetSplitJobRequest) (*GetSplitJobResponse, error)
@@ -263,6 +276,9 @@ func (UnimplementedDistributionServer) WatchCatalog(*CatalogWatchRequest, grpc.S
 }
 func (UnimplementedDistributionServer) StartSplitMigration(context.Context, *StartSplitMigrationRequest) (*StartSplitMigrationResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method StartSplitMigration not implemented")
+}
+func (UnimplementedDistributionServer) GetSplitMigrationCapability(context.Context, *GetSplitMigrationCapabilityRequest) (*GetSplitMigrationCapabilityResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetSplitMigrationCapability not implemented")
 }
 func (UnimplementedDistributionServer) GetRouteOwnership(context.Context, *GetRouteOwnershipRequest) (*GetRouteOwnershipResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method GetRouteOwnership not implemented")
@@ -440,6 +456,24 @@ func _Distribution_StartSplitMigration_Handler(srv interface{}, ctx context.Cont
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Distribution_GetSplitMigrationCapability_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(GetSplitMigrationCapabilityRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).GetSplitMigrationCapability(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_GetSplitMigrationCapability_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).GetSplitMigrationCapability(ctx, req.(*GetSplitMigrationCapabilityRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Distribution_GetRouteOwnership_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(GetRouteOwnershipRequest)
 	if err := dec(in); err != nil {
@@ -582,6 +616,10 @@ var Distribution_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "StartSplitMigration",
 			Handler:    _Distribution_StartSplitMigration_Handler,
+		},
+		{
+			MethodName: "GetSplitMigrationCapability",
+			Handler:    _Distribution_GetSplitMigrationCapability_Handler,
 		},
 		{
 			MethodName: "GetRouteOwnership",

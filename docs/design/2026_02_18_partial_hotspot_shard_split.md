@@ -10,7 +10,7 @@ Current implementation status (updated August 22, 2026):
   `SplitRange` are implemented.
 - M2 has the SplitJob catalog substrate (`distribution/split_job_catalog.go`)
   and codec/list/history tests, tracked in
-  [`2026_06_11_partial_hotspot_split_milestone2_migration.md`](2026_06_11_partial_hotspot_split_milestone2_migration.md);
+  [`2026_06_11_implemented_hotspot_split_milestone2_migration.md`](2026_06_11_implemented_hotspot_split_milestone2_migration.md);
   the actual migration RPC, export/import, fence, cutover, promotion, and
   cleanup workflow are still open.
 - Standalone M3 auto-split is implemented: keyviz supplies the sole load signal,
@@ -298,6 +298,14 @@ Add RPCs:
 1. MVCC range export/import
 2. Job phases: BACKFILL/FENCE/DELTA/CUTOVER
 3. Manual split with target-group relocation
+
+Status: implemented. The production runner advances durable cross-group jobs
+through BACKFILL, FENCE, DELTA_COPY, CUTOVER, CLEANUP, and `DONE`; current-voter
+readiness and cleanup barriers protect leadership changes; and the deterministic
+Jepsen workload covers the split alongside leader-kill and partition packages.
+The completed M2 contract is recorded in
+[`2026_06_11_implemented_hotspot_split_milestone2_migration.md`](2026_06_11_implemented_hotspot_split_milestone2_migration.md)
+and its final runner/lifecycle slice landed in PR #1096.
 
 ### Milestone 3: Automation
 

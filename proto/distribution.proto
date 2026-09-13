@@ -11,6 +11,7 @@ service Distribution {
   rpc GetCatalogCapabilities (CatalogCapabilitiesRequest) returns (CatalogCapabilitiesResponse) {}
   rpc WatchCatalog (CatalogWatchRequest) returns (stream CatalogWatchEvent) {}
   rpc StartSplitMigration (StartSplitMigrationRequest) returns (StartSplitMigrationResponse) {}
+  rpc GetSplitMigrationCapability (GetSplitMigrationCapabilityRequest) returns (GetSplitMigrationCapabilityResponse) {}
   rpc GetRouteOwnership (GetRouteOwnershipRequest) returns (GetRouteOwnershipResponse) {}
   rpc GetIntersectingRoutes (GetIntersectingRoutesRequest) returns (GetIntersectingRoutesResponse) {}
   rpc GetSplitJob (GetSplitJobRequest) returns (GetSplitJobResponse) {}
@@ -171,6 +172,11 @@ message SplitJob {
   int64 started_at_ms = 31;
   int64 updated_at_ms = 32;
   int64 terminal_at_ms = 33;
+  bool capability_regressed = 34;
+  // Group that still owns the source side of the split. Recorded at plan
+  // time because the route shape it can otherwise be recovered from
+  // disappears once the source child is itself split.
+  uint64 source_group_id = 35;
 }
 
 message ListRoutesRequest {}
@@ -248,6 +254,13 @@ message StartSplitMigrationRequest {
 message StartSplitMigrationResponse {
   uint64 catalog_version = 1;
   uint64 job_id = 2;
+}
+
+message GetSplitMigrationCapabilityRequest {}
+
+message GetSplitMigrationCapabilityResponse {
+  bool migration_capable = 1;
+  repeated string capabilities = 2;
 }
 
 message GetRouteOwnershipRequest {

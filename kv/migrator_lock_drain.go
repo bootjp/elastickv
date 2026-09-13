@@ -18,6 +18,7 @@ type TxnLockDrainEntry struct {
 	TTLExpireAt  uint64
 	PrimaryKey   []byte
 	IsPrimaryKey bool
+	CommitTS     uint64
 }
 
 // PendingTxnLocksInRoute scans the txn-lock namespace and filters each lock by
@@ -88,5 +89,6 @@ func txnLockDrainEntry(kvp *store.KVPair, filter func([]byte) bool) (TxnLockDrai
 		TTLExpireAt:  lock.TTLExpireAt,
 		PrimaryKey:   bytes.Clone(lock.PrimaryKey),
 		IsPrimaryKey: lock.IsPrimaryKey,
+		CommitTS:     lock.CommitTS,
 	}, true, nil
 }

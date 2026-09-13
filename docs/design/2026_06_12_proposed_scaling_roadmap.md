@@ -4,16 +4,13 @@
 **Author:** bootjp
 **Date:** 2026-06-12
 
-> **Superseded roadmap index:**
 > This document is retained as the original sequencing and SLO record. It is
 > not an implementation specification and must not be used as the scope for a
 > combined implementation PR. The
 > [2026-06-23 roadmap](2026_06_23_proposed_scaling_roadmap.md) audits the current
 > implementation, closes completed prerequisites, and tracks the remaining
-> work as separate design documents and milestone PRs. It is the current
-> ownership and sequencing authority; this historical document does not
-> describe the current implementation status of its milestones.
->
+> work as separate design documents and milestone PRs.
+
 > This roadmap captures the scaling work elastickv needs across four
 > subsystems that today have known ceilings and have not yet been
 > designed past those ceilings. The roadmap itself is not a single
@@ -21,8 +18,8 @@
 > sibling `*_proposed_*.md` design that will land later as its own PR.
 > Per CLAUDE.md the design-doc-first workflow applies: each milestone
 > below ships its own `*_proposed_*` doc before its implementation
-> starts. The June 23 ownership index now records the authoritative
-> requirement-by-requirement disposition and sequencing constraints.
+> starts; this file is the shared north star and the sequencing
+> constraint between them.
 
 ## 1. Motivation
 
@@ -33,7 +30,7 @@ production envelope within one growth cycle:
 
 | Dimension | Today's comfortable ceiling | Where the next operator wants to go | Triggering signal |
 | --- | --- | --- | --- |
-| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_implemented_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
+| Routes (shards) per cluster | ~10 k (binary search + 100 ms watcher + history ring of 32 versions) | 100 k–1 M routes | hotspot-split-M3 automation (`docs/design/2026_06_11_partial_hotspot_split_milestone3_automation.md`) generates routes faster than the catalog watcher can fan out at scale |
 | Region/DC fan-out | Single DC, LAN-tuned etcd/raft (10 ms tick, 100 ms heartbeat, 1 s election), single default-group HLC ceiling | 2–3 regions with active-active per-shard | Disaster-recovery SLO ("survive a region outage with < 30 s data-plane reconvergence") |
 | Bytes per shard | ~1 TB before snapshot transfer / WAL replay becomes operational pain | 5–10 TB per shard, with shard counts in the 100 k range | DynamoDB-compatibility customers ingesting at multi-GiB/s per table |
 | Per-node QPS | Leader-bound write, lease-read scales across shards but only on each shard's leader | 5–10x current per-node throughput; sustained reads from non-leader replicas | Redis-compatibility migration projects ingesting from upstream Redis where the upstream serves reads from replicas |
@@ -87,13 +84,12 @@ Breakage points:
 references anywhere in `kv/`, `distribution/`, or
 `internal/raftengine/etcd/`. Everything is single-region etcd/raft.
 
-HLC is `kv/hlc.go` + `kv/coordinator.go` +
-`kv/sharded_coordinator.go`: physical ceiling is Raft-agreed via
-`ProposeHLCLease`, `hlcPhysicalWindowMs = 20 s`, renewed every
-`hlcRenewalInterval = 1 s` by each led shard group
-(`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced` fails closed
-with `ErrCeilingExpired` once `wall_now >= ceiling`. Wall clock is
-`time.Now().UnixMilli()` — assumes NTP-synced hosts.
+HLC is `kv/hlc.go` + `kv/coordinator.go`: physical ceiling is
+Raft-agreed via `ProposeHLCLease`, `hlcPhysicalWindowMs = 3 s`,
+renewed every `hlcRenewalInterval = 1 s` from the **default-group
+leader only** (`ShardedCoordinator.RunHLCLeaseRenewal`). `NextFenced`
+fails closed with `ErrCeilingExpired` once `wall_now >= ceiling`.
+Wall clock is `time.Now().UnixMilli()` — assumes NTP-synced hosts.
 
 Raft engine (`internal/raftengine/etcd/engine.go`):
 `defaultTickInterval = 10 ms`, `defaultHeartbeatTick = 10` (100 ms),
@@ -102,11 +98,10 @@ LAN-tuned; would spuriously election-time-out cross-WAN.
 
 Multi-region blockers:
 
-- HLC ceiling renewal is **per Raft group** — each shard group leader
-  proposes every 1 s, so cross-region leadership for that group makes
-  its persistence-grade ts depend on cross-WAN quorum progress. 1 s WAN
-  RTT is now less likely to expire the 20 s window immediately, but
-  every renewal still depends on that group's cross-WAN quorum progress.
+- HLC ceiling is **single-point** — default-group leader proposes
+  every 1 s; cross-region default-group leadership means every
+  shard's persistence-grade ts depends on a cross-WAN propose. 1 s
+  WAN RTT + 1 s renewal interval ≈ no margin against the 3 s window.
 - 100 ms heartbeat / 1 s election timeout cannot run cross-DC.
 - No TrueTime/clockbound integration.
 - Cross-shard txns are blocked (`ErrCrossShardTransactionNotSupported`),
@@ -114,14 +109,10 @@ Multi-region blockers:
 
 ### 2.3 Storage tier (Pebble)
 
-`store/lsm_store.go`: per-shard `pebble.Open`, process-wide shared block cache
-sized to 25% of the node's hard memory capacity by default and shared by all
-stores in the process. Linux uses the minimum positive cgroup limit found from
-the process leaf through every ancestor, bounded by physical RAM. `GOMEMLIMIT`
-is not used as a total RSS budget because the Pebble cache is off-heap.
-`ELASTICKV_PEBBLE_CACHE_PERCENT` changes the hard-capacity fraction;
-`ELASTICKV_PEBBLE_CACHE_MB` is the absolute-capacity override. WAL sync via
-`ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on FSM apply; `nosync` opt-in).
+`store/lsm_store.go`: per-shard `pebble.Open`, default block cache
+`defaultPebbleCacheBytes = 256 MiB` **per store** (not shared).
+WAL sync via `ELASTICKV_FSM_SYNC_MODE` (default `pebble.Sync` on
+FSM apply; `nosync` opt-in).
 
 `store/mvcc_store.go`: encoded as `UserKey ++ 0x00 ++ inverted_TS`,
 `maxSnapshotVersionCount = 1 M`, `maxSnapshotValueSize = 256 MiB`.
@@ -145,9 +136,8 @@ Storage breakage at 1–10 TB/shard:
   is tens of minutes.
 - Pebble L0CompactionThreshold / LBaseMaxBytes / compaction
   concurrency are defaults; write-heavy shards hit stall thresholds.
-  Shared block cache M1 has landed, so resident block-cache memory is capped per
-  process rather than N × 256 MiB. Shared memtable / compaction concurrency
-  budgeting and per-group cache fairness remain open.
+  256 MiB block cache per shard × N shards/node = N × 256 MiB
+  resident memory (shared-cache TODO not landed).
 - MVCC retention 30 min + per-key 1 M version cap means a key
   written ≥ 555/s for 30 min trips the cap; compactor runs every
   5 min so read tail latency spikes during accumulation.
@@ -321,10 +311,10 @@ whole cluster; cross-WAN that is a 1 s RTT cliff. Options surveyed:
   service.** Operationally heavy (needs reliable atomic-clock
   reference per DC); rejected as v1.
 - **Option C — Stretched single ceiling with relaxed window.**
-  `hlcPhysicalWindowMs = 20 s` is now the local-resilience baseline.
-  It reduces accidental ceiling expiry under load, but renewal still
-  depends on each route's shard group quorum and is not a complete
-  cross-region design by itself.
+  Increase `hlcPhysicalWindowMs` to 30 s; renewal still cross-WAN
+  but the failure mode is "slow ts allocation," not "no ts
+  allocation." Useful as a fallback when option A is partially
+  shipped.
 
 V1 = option A. Carries the existing M2 hotspot-split monotone-merge
 contract over the region boundary.
@@ -353,9 +343,9 @@ control-plane (`*_proposed_*` doc TBD).**
 
 - M1 standalone but doesn't enable cross-region writes — it just
   makes Raft survive cross-WAN partition.
-- M2 depends on the M2 hotspot-split migration contract
-  (`2026_06_11_partial_hotspot_split_milestone2_migration.md`)
-  being implemented so the monotone-merge primitive exists.
+- M2's hotspot-split migration dependency is implemented in
+  [2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md), including
+  the monotone-merge primitive.
 - M3 depends on M1's region-aware membership and M2's per-region
   ceiling.
 - M4 depends on M2 and M3.
@@ -374,8 +364,7 @@ control-plane (`*_proposed_*` doc TBD).**
 
 ### 5.2 Design — milestones
 
-**M1 — SST ingest snapshot transfer
-([focused design](2026_07_19_implemented_pebble_sst_ingest_snapshot_transfer.md)).**
+**M1 — SST ingest snapshot transfer (`*_proposed_*` doc TBD).**
 - Replace `pebbleSnapshot.WriteTo`'s full-iter stream with
   **Pebble SST-level snapshot transfer**: leader takes a
   Pebble snapshot, copies the live SSTs (+ memtable flush) as
@@ -384,12 +373,11 @@ control-plane (`*_proposed_*` doc TBD).**
   work.
 - Streamed in parallel across the leader's outgoing transport.
 
-**M2 — Shared block-cache follow-ups + per-shard tuning (`*_proposed_*` doc
+**M2 — Shared block cache + per-shard tuning (`*_proposed_*` doc
 TBD).**
-- M1 shared block cache has landed: one `pebble.Cache` per process is shared
-  across all shards' stores, defaults to 25% of the node's effective memory
-  budget, and supports percentage or absolute-MiB operator overrides.
-- Add shared memtable / compaction concurrency budgets across stores.
+- Land the existing shared-cache TODO: one `pebble.Cache` per node
+  shared across all shards' stores, sized as a per-node config
+  fraction of available RAM (default 25%).
 - Surface `L0CompactionThreshold`, `LBaseMaxBytes`,
   `MaxConcurrentCompactions` as per-shard config so a write-heavy
   shard can be tuned without touching the cluster default.
@@ -413,8 +401,8 @@ TBD).**
   rows) so they do not pile up in L0 between compactor runs —
   reuses the existing TTL helper path.
 
-**M4 — Disaster-recovery snapshot offload
-([`2026_07_19_partial_physical_snapshot_object_offload.md`](2026_07_19_partial_physical_snapshot_object_offload.md)).**
+**M4 — Disaster-recovery snapshot offload (`*_proposed_*` doc
+TBD).**
 - Periodic per-shard Pebble snapshot uploaded to an S3-compatible
   bucket (the S3 adapter already speaks the protocol).
 - Restore is `s3 fetch → pebble.Ingest`; combined with M1's
@@ -550,7 +538,7 @@ the ceiling shape:
 Composability invariant: **every monotone-merge happens via the
 same `SetPhysicalCeiling` + `Observe` primitive**. The M2
 hotspot-split contract (§6.2.1 of
-`2026_06_11_partial_hotspot_split_milestone2_migration.md`) is the
+[2026_06_11_implemented_hotspot_split_milestone2_migration.md](2026_06_11_implemented_hotspot_split_milestone2_migration.md)) is the
 reference implementation; per-region and per-group merges reuse it.
 
 ### 7.2 Capability bits
