@@ -1179,16 +1179,10 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 			cleanupManifest = nil
 			return nil
 		}
-		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-			IsTxn:   true,
-			StartTS: startTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: headKey},
-			},
-		})
-		if err != nil {
-			return errors.WithStack(err)
+		if err := s.dispatchConditionalObjectDelete(
+			r, readTimestamp, startTS, headKey, manifest, bucket, objectKey,
+		); err != nil {
+			return err
 		}
 		cleanupManifest = manifest
 		generation = meta.Generation
@@ -2738,6 +2732,66 @@ func validateS3PutPreconditions(r *http.Request, previous *s3ObjectManifest) err
 		if previous == nil || strings.Trim(ifMatch, `"`) != previous.ETag {
 			return errors.New("etag precondition failed")
 		}
+	}
+	return nil
+}
+
+// dispatchConditionalObjectDelete evaluates If-Match against the manifest the
+// surrounding transaction already loaded, then removes the head key.
+//
+// DELETE honours If-Match, like PUT does via validateS3PutPreconditions.
+// Accepting the header and deleting anyway is worse than not supporting it: a
+// caller that reads an object, decides it is reclaimable, and sends a
+// conditional delete believes the condition protects it against a concurrent
+// rewrite. It did not -- the object was removed whatever its current ETag -- so
+// the rewrite was silently lost.
+func (s *S3Server) dispatchConditionalObjectDelete(
+	r *http.Request,
+	readTimestamp kv.ReadTimestamp,
+	startTS uint64,
+	headKey []byte,
+	manifest *s3ObjectManifest,
+	bucket, objectKey string,
+) error {
+	if err := validateS3DeletePreconditions(r, manifest); err != nil {
+		return newS3ResponseError(http.StatusPreconditionFailed, "PreconditionFailed",
+			err.Error(), bucket, objectKey)
+	}
+	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: headKey},
+		},
+	}); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// validateS3DeletePreconditions enforces If-Match on DELETE.
+//
+// Separate from validateS3PutPreconditions because the two headers mean
+// different things on a delete: If-Match is a guard against removing a
+// version the caller has not seen, while If-None-Match: * ("only if
+// absent") is meaningless for an operation whose whole purpose is to
+// remove something that exists, so it is not honoured here.
+//
+// previous is the manifest the surrounding transaction already loaded at
+// its read timestamp, so the comparison is against the same version the
+// delete will remove -- not a separately-read one that could have moved
+// in between.
+func validateS3DeletePreconditions(r *http.Request, previous *s3ObjectManifest) error {
+	if r == nil || previous == nil {
+		return nil
+	}
+	ifMatch := strings.TrimSpace(r.Header.Get("If-Match"))
+	if ifMatch == "" {
+		return nil
+	}
+	if strings.Trim(ifMatch, `"`) != previous.ETag {
+		return errors.New("etag precondition failed")
 	}
 	return nil
 }
