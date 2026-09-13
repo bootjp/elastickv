@@ -125,7 +125,8 @@
                       (ekdb/db {:grpc-port (or (:grpc-port opts) 50051)
                                 :redis-port node->port
                                 :raft-groups (:raft-groups opts)
-                                :shard-ranges (:shard-ranges opts)}))
+                                :shard-ranges (:shard-ranges opts)
+                                :encryption (:encryption opts)}))
          rate       (double (or (:rate opts) 5))
          time-limit (or (:time-limit opts) 30)
          faults     (if local?
