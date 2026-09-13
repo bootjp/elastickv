@@ -215,41 +215,67 @@ func (s *SQSServer) AdminPeekQueue(
 	opts AdminPeekMessageOptions,
 ) ([]AdminPeekedMessage, string, error) {
 	if !principal.Role.canRead() {
+		s.observeAdminPeek(name, adminOutcomeForbidden)
 		return nil, "", ErrAdminForbidden
 	}
 	if !isVerifiedSQSLeader(ctx, s.coordinator) {
+		s.observeAdminPeek(name, adminOutcomeNotLeader)
 		return nil, "", ErrAdminNotLeader
 	}
 	if strings.TrimSpace(name) == "" {
+		s.observeAdminPeek(name, adminOutcomeValidation)
 		return nil, "", ErrAdminSQSValidation
 	}
 	limit := clampPeekLimit(opts.Limit)
 	bodyMaxBytes := clampPeekBodyBytes(opts.BodyMaxBytes)
 	cursor, err := decodePeekCursor(opts.Cursor)
 	if err != nil {
+		s.observeAdminPeek(name, adminPeekOutcomeForError(err))
 		return nil, "", err
 	}
 	readTS := s.nextTxnReadTS(ctx)
 	meta, exists, err := s.loadQueueMetaAt(ctx, name, readTS)
 	if err != nil {
+		s.observeAdminPeek(name, adminPeekOutcomeForError(err))
 		return nil, "", errors.WithStack(err)
 	}
 	if !exists {
+		s.observeAdminPeek(name, adminOutcomeNotFound)
 		return nil, "", ErrAdminSQSNotFound
 	}
 	cursor, err = preparePeekCursor(cursor, meta, name, s.peekStartPartition(name, cursor, meta))
 	if err != nil {
+		s.observeAdminPeek(name, adminPeekOutcomeForError(err))
 		return nil, "", err
 	}
 	rows, nextCursor, err := s.walkPeek(ctx, name, meta, readTS, cursor, limit, bodyMaxBytes)
 	if err != nil {
+		s.observeAdminPeek(name, adminPeekOutcomeForError(err))
 		return nil, "", err
 	}
 	encoded, err := encodePeekCursor(nextCursor)
 	if err != nil {
+		s.observeAdminPeek(name, adminPeekOutcomeForError(err))
 		return nil, "", err
 	}
+	s.observeAdminPeek(name, adminOutcomeOK)
 	return rows, encoded, nil
+}
+
+// adminPeekOutcomeForError classifies a peek failure by SENTINEL,
+// never by message text — an error-string label would let one
+// recurring failure grow the series set without bound.
+func adminPeekOutcomeForError(err error) string {
+	switch {
+	case errors.Is(err, ErrAdminSQSValidation):
+		return adminOutcomeValidation
+	case errors.Is(err, ErrAdminSQSNotFound):
+		return adminOutcomeNotFound
+	case isSQSAdminQueueDoesNotExist(err):
+		return adminOutcomeNotFound
+	default:
+		return adminOutcomeInternalError
+	}
 }
 
 // peekStartPartition returns the starting partition for a fresh peek

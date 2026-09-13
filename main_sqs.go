@@ -43,6 +43,13 @@ func prepareSQSServer(
 	if o, ok := partitionObserver.(adapter.SQSThrottleObserver); ok {
 		throttleObserver = o
 	}
+	// The registry's SQSMetrics satisfies all three observer
+	// interfaces; derive the admin one the same way rather than
+	// widening this function's signature.
+	var adminObserver adapter.SQSAdminObserver
+	if o, ok := partitionObserver.(adapter.SQSAdminObserver); ok {
+		adminObserver = o
+	}
 	sqsServer := adapter.NewSQSServer(
 		sqsL,
 		shardStore,
@@ -53,6 +60,12 @@ func prepareSQSServer(
 		adapter.WithSQSPartitionResolver(partitionResolver),
 		adapter.WithSQSPartitionObserver(partitionObserver),
 		adapter.WithSQSThrottleObserver(throttleObserver),
+		adapter.WithSQSAdminObserver(adminObserver),
+		// Same component="admin" child logger the admin HTTP server uses,
+		// so the §3.6 purge audit lines land in the configured audit
+		// destination with its attributes instead of going out through the
+		// process-wide slog.Default().
+		adapter.WithSQSAdminAuditLogger(slog.Default().With(slog.String("component", "admin"))),
 	)
 	return sqsServer, sqsL, nil
 }
