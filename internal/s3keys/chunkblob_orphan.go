@@ -320,11 +320,32 @@ func (s *ChunkBlobOrphanScanner) ScanOnce(ctx context.Context) error {
 			failures = append(failures, err)
 		}
 	}
+	// Marks for blobs that have left the listing are dropped: otherwise a
+	// blob reclaimed (or removed by any other path) keeps its entry for the
+	// life of the process, so a long-running node accumulates one per
+	// reclaimed blob forever.
+	s.pruneMarks(blobs)
 	if len(failures) > 0 {
 		return errors.Wrapf(errors.Join(failures...),
 			"orphan scan: %d of %d blobs failed", len(failures), len(blobs))
 	}
 	return nil
+}
+
+// pruneMarks discards marks whose blob was absent from this listing.
+func (s *ChunkBlobOrphanScanner) pruneMarks(blobs []LocalChunkBlob) {
+	listed := make(map[[chunkBlobSHA256Bytes]byte]struct{}, len(blobs))
+	for _, blob := range blobs {
+		listed[blob.ContentSHA256] = struct{}{}
+	}
+
+	s.marksMu.Lock()
+	defer s.marksMu.Unlock()
+	for sha := range s.marks {
+		if _, ok := listed[sha]; !ok {
+			delete(s.marks, sha)
+		}
+	}
 }
 
 func (s *ChunkBlobOrphanScanner) scanBlob(

@@ -76,7 +76,25 @@ type ChunkBlobSweepStore interface {
 // ChunkBlobLocalStore is the node-local half: the chunkblob payload in
 // Pebble, never written through Raft.
 type ChunkBlobLocalStore interface {
-	DeleteChunkBlob(ctx context.Context, sha [chunkBlobSHA256Bytes]byte) error
+	// ChunkBlobWrittenAt returns when this node wrote the payload, as an
+	// HLC timestamp, and whether it is present. Read BEFORE the Raft
+	// phase so the unlink afterwards can be conditioned on the state the
+	// sweep actually observed.
+	ChunkBlobWrittenAt(ctx context.Context, sha [chunkBlobSHA256Bytes]byte) (uint64, bool, error)
+
+	// DeleteChunkBlobIfUnchanged unlinks the blob only if it is still the
+	// payload written at writtenAtTS, reporting false when it is not.
+	//
+	// Conditional because DeleteGCQueueEntryIfUnreferenced guarantees a
+	// zero reference count only up to ITS OWN commit. A PUT that reuses
+	// the SHA immediately afterwards re-anchors the payload and commits a
+	// reference, and an unconditional unlink then removes bytes that PUT
+	// has already acknowledged as durable. Same contract as
+	// ChunkBlobOrphanLocalStore: the comparison and the unlink must be
+	// atomic with respect to the local writer.
+	DeleteChunkBlobIfUnchanged(
+		ctx context.Context, sha [chunkBlobSHA256Bytes]byte, writtenAtTS uint64,
+	) (bool, error)
 }
 
 // ChunkBlobSweepObserver receives per-entry outcomes.
@@ -215,6 +233,12 @@ func (s *ChunkBlobSweeper) SweepOnce(ctx context.Context) error {
 	if err != nil {
 		return errors.Wrap(err, "chunkblob gc: scan queue")
 	}
+	// Per-entry failures are collected, not returned immediately. The scan
+	// is time-ordered, so one entry that persistently fails its RC read,
+	// its stale-entry delete or its conditional Raft delete came back
+	// first on every pass and starved every later entry indefinitely. The
+	// pass still reports failure afterwards. Same rule as the orphan scan.
+	var failures []error
 	for _, entry := range entries {
 		// Stop cleanly on cancellation: the remaining entries stay
 		// queued and the next pass picks them up, so an interrupted
@@ -223,8 +247,14 @@ func (s *ChunkBlobSweeper) SweepOnce(ctx context.Context) error {
 			break
 		}
 		if err := s.sweepEntry(ctx, entry); err != nil {
-			return err
+			s.logger.WarnContext(ctx, "chunkblob gc: entry failed, continuing",
+				slog.String("err", err.Error()))
+			failures = append(failures, err)
 		}
+	}
+	if len(failures) > 0 {
+		return errors.Wrapf(errors.Join(failures...),
+			"chunkblob gc: %d of %d queue entries failed", len(failures), len(entries))
 	}
 	return nil
 }
@@ -265,6 +295,12 @@ func (s *ChunkBlobSweeper) sweepEntry(ctx context.Context, entry ChunkBlobGCQueu
 // inverts that into a bounded local space leak — the entry is gone but
 // the blob is still on disk — which the orphan scan reclaims.
 func (s *ChunkBlobSweeper) reclaim(ctx context.Context, entry ChunkBlobGCQueueEntry) error {
+	// Observed BEFORE the Raft phase, so it describes the payload this
+	// sweep decided about rather than whatever is on disk afterwards.
+	writtenAtTS, present, err := s.local.ChunkBlobWrittenAt(ctx, entry.ContentSHA256)
+	if err != nil {
+		return errors.Wrapf(err, "chunkblob gc: stat local blob %x", entry.ContentSHA256[:4])
+	}
 	if err := s.store.DeleteGCQueueEntryIfUnreferenced(ctx, entry); err != nil {
 		if errors.Is(err, ErrQueueEntryChanged) {
 			// Another sweeper won, or a re-reference txn committed
@@ -275,12 +311,26 @@ func (s *ChunkBlobSweeper) reclaim(ctx context.Context, entry ChunkBlobGCQueueEn
 		}
 		return errors.Wrapf(err, "chunkblob gc: conditional queue delete for %x", entry.ContentSHA256[:4])
 	}
-	// Reaching here means the conditional delete committed, which
-	// implies the reference count was zero at its read timestamp and
-	// stayed zero through its commit window — the blob is genuinely
-	// unreachable.
-	if err := s.local.DeleteChunkBlob(ctx, entry.ContentSHA256); err != nil {
+	if !present {
+		// Nothing local to unlink; the queue entry is now gone, which is
+		// the whole remaining work.
+		return nil
+	}
+	// The conditional delete committing proves the reference count was
+	// zero through ITS commit window -- and no further. A PUT reusing this
+	// SHA can re-anchor the payload and commit a reference immediately
+	// afterwards, so the unlink stays conditional on the state observed
+	// above; a mismatch means exactly that happened.
+	unlinked, err := s.local.DeleteChunkBlobIfUnchanged(ctx, entry.ContentSHA256, writtenAtTS)
+	if err != nil {
 		return errors.Wrapf(err, "chunkblob gc: local delete for %x", entry.ContentSHA256[:4])
+	}
+	if !unlinked {
+		// A normal concurrent-update conflict, not a failure: the payload
+		// was re-anchored and is live again. The queue entry is gone, and
+		// the re-anchoring PUT owns the new reference.
+		s.observer.ObserveChunkBlobSweepRaceLost()
+		s.logger.InfoContext(ctx, "chunkblob gc: payload re-anchored under the sweep; left in place")
 	}
 	return nil
 }

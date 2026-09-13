@@ -21,6 +21,9 @@ type fakeSweepStore struct {
 	condDeleteErr error
 	unconDeletes  int
 	condDeletes   int
+	// rcErrs fails the RC read for specific SHAs, modelling an entry that
+	// fails on every pass.
+	rcErrs map[[32]byte]error
 }
 
 func (f *fakeSweepStore) ScanGCQueue(_ context.Context, _, _ []byte) ([]s3keys.ChunkBlobGCQueueEntry, error) {
@@ -33,6 +36,9 @@ func (f *fakeSweepStore) ScanGCQueue(_ context.Context, _, _ []byte) ([]s3keys.C
 
 func (f *fakeSweepStore) ReadChunkRefRC(_ context.Context, sha [32]byte) ([]byte, bool, error) {
 	f.calls = append(f.calls, "read-rc")
+	if err, failing := f.rcErrs[sha]; failing {
+		return nil, false, err
+	}
 	v, ok := f.rc[sha]
 	return v, ok, nil
 }
@@ -52,17 +58,76 @@ func (f *fakeSweepStore) DeleteGCQueueEntry(_ context.Context, _ s3keys.ChunkBlo
 type fakeLocalStore struct {
 	calls   *[]string
 	deletes [][32]byte
+	// attempts records every conditional unlink, refused ones included, so
+	// a test can tell "never attempted" from "attempted and refused".
+	attempts []uint64
+	// writtenAt is the payload's HLC write time; absent means no local blob.
+	writtenAt map[[32]byte]uint64
+	// reanchored names SHAs a PUT rewrote after the sweep observed them.
+	reanchored map[[32]byte]struct{}
+	statErr    error
+	deleteErr  error
 }
 
-func (f *fakeLocalStore) DeleteChunkBlob(_ context.Context, sha [32]byte) error {
+func (f *fakeLocalStore) ChunkBlobWrittenAt(_ context.Context, sha [32]byte) (uint64, bool, error) {
+	*f.calls = append(*f.calls, "local-stat")
+	if f.statErr != nil {
+		return 0, false, f.statErr
+	}
+	if f.writtenAt == nil {
+		// Default fixture: the blob exists with a fixed write time.
+		return 1, true, nil
+	}
+	ts, ok := f.writtenAt[sha]
+	return ts, ok, nil
+}
+
+func (f *fakeLocalStore) DeleteChunkBlobIfUnchanged(
+	_ context.Context, sha [32]byte, writtenAtTS uint64,
+) (bool, error) {
 	*f.calls = append(*f.calls, "local-delete")
+	f.attempts = append(f.attempts, writtenAtTS)
+	if f.deleteErr != nil {
+		return false, f.deleteErr
+	}
+	if _, changed := f.reanchored[sha]; changed {
+		return false, nil
+	}
 	f.deletes = append(f.deletes, sha)
-	return nil
+	return true, nil
 }
 
-func newSweeperFixture(t *testing.T, store *fakeSweepStore) (*s3keys.ChunkBlobSweeper, *fakeLocalStore) {
+// recordingSweepObserver captures what the sweeper concluded, as opposed to
+// what the fakes were asked to do. That difference matters: a sweeper that
+// ignores a refused conditional delete still leaves `deletes` empty, because
+// the fake controls that field -- only the sweeper's own race-lost
+// observation distinguishes "refused and handled" from "refused and ignored".
+type recordingSweepObserver struct {
+	verdicts []string
+	raceLost int
+}
+
+func (o *recordingSweepObserver) ObserveChunkBlobSweep(_ s3keys.ChunkBlobSweepVerdict, reason string) {
+	o.verdicts = append(o.verdicts, reason)
+}
+
+func (o *recordingSweepObserver) ObserveChunkBlobSweepRaceLost() {
+	o.raceLost++
+}
+
+func newSweeperFixture(
+	t *testing.T, store *fakeSweepStore,
+) (*s3keys.ChunkBlobSweeper, *fakeLocalStore) {
+	sweeper, local, _ := newObservedSweeperFixture(t, store)
+	return sweeper, local
+}
+
+func newObservedSweeperFixture(t *testing.T, store *fakeSweepStore) (
+	*s3keys.ChunkBlobSweeper, *fakeLocalStore, *recordingSweepObserver,
+) {
 	t.Helper()
 	local := &fakeLocalStore{calls: &store.calls}
+	observer := &recordingSweepObserver{}
 	// An HLC "now" far enough ahead that every fixture entry has served
 	// its grace window.
 	nowTS := (uint64(1_700_000_000_000) + 7_200_000) << 16
@@ -71,9 +136,10 @@ func newSweeperFixture(t *testing.T, store *fakeSweepStore) (*s3keys.ChunkBlobSw
 		Local:       local,
 		GracePeriod: time.Hour,
 		NowTS:       func() uint64 { return nowTS },
+		Observer:    observer,
 	})
 	require.NoError(t, err)
-	return sweeper, local
+	return sweeper, local, observer
 }
 
 func queuedEntry(sha [32]byte) s3keys.ChunkBlobGCQueueEntry {
@@ -105,9 +171,12 @@ func TestSweeperRunsTheRaftPhaseBeforeTheLocalDelete(t *testing.T) {
 	require.NoError(t, sweeper.SweepOnce(context.Background()))
 
 	require.Equal(t,
-		[]string{"scan", "read-rc", "raft-conditional-delete", "local-delete"},
+		[]string{"scan", "read-rc", "local-stat", "raft-conditional-delete", "local-delete"},
 		store.calls,
-		"the replicated conditional delete must commit before the local unlink")
+		"the replicated conditional delete must commit before the local unlink, "+
+			"and the payload state the unlink is conditioned on must be observed "+
+			"BEFORE that commit -- read afterwards it would already include a "+
+			"re-anchoring PUT and the condition could not refuse it")
 	require.Equal(t, [][32]byte{sha}, local.deletes)
 }
 
@@ -255,4 +324,93 @@ func TestNewChunkBlobSweeperValidatesItsCollaborators(t *testing.T) {
 
 	_, err = s3keys.NewChunkBlobSweeper(valid)
 	require.NoError(t, err)
+}
+
+// TestSweeperSparesAPayloadReAnchoredAfterTheRaftPhase closes the window
+// DeleteGCQueueEntryIfUnreferenced cannot.
+//
+// That conditional delete proves the reference count was zero only through ITS
+// OWN commit. A PUT that reuses the SHA immediately afterwards re-anchors the
+// payload and commits a reference, and the unconditional local unlink then
+// removed bytes the PUT had already acknowledged as durable.
+func TestSweeperSparesAPayloadReAnchoredAfterTheRaftPhase(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("re-anchored")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 0, QueuedAtTS: entry.CommitTS}),
+		},
+	}
+	sweeper, local, observer := newObservedSweeperFixture(t, store)
+	local.writtenAt = map[[32]byte]uint64{sha: 4242}
+	local.reanchored = map[[32]byte]struct{}{sha: {}}
+
+	require.NoError(t, sweeper.SweepOnce(context.Background()),
+		"a re-anchored payload is a normal conflict, not a sweep failure")
+
+	require.Equal(t, []uint64{4242}, local.attempts,
+		"the unlink must be conditioned on the state observed before the Raft phase")
+	require.Empty(t, local.deletes,
+		"a payload re-anchored after the Raft phase must not be unlinked")
+
+	// The sweeper must also ACT on the refusal rather than ignore the
+	// result: a caller that treats every conditional delete as successful
+	// passes the assertions above, because the fake controls `deletes`.
+	// The race-lost observation is the sweeper's own record of what it
+	// concluded, so it distinguishes the two.
+	require.Equal(t, 1, observer.raceLost,
+		"a refused unlink must be recorded as a lost race, not treated as a reclaim")
+}
+
+// TestSweeperContinuesPastAFailingEntry is the starvation regression, the
+// sibling of the orphan scan's.
+//
+// The queue scan is time-ordered, so returning on the first per-entry error
+// came back to the same entry on every pass and starved every later entry
+// indefinitely.
+func TestSweeperContinuesPastAFailingEntry(t *testing.T) {
+	t.Parallel()
+
+	failing := testSHA("failing")
+	ok := testSHA("reclaimable")
+	failingEntry := queuedEntry(failing)
+	okEntry := queuedEntry(ok)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{failingEntry, okEntry},
+		rc: map[[32]byte][]byte{
+			ok: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 0, QueuedAtTS: okEntry.CommitTS}),
+		},
+		rcErrs: map[[32]byte]error{failing: errors.New("pebble: read failed")},
+	}
+	sweeper, local := newSweeperFixture(t, store)
+
+	require.Error(t, sweeper.SweepOnce(context.Background()),
+		"the pass must still report the per-entry failure")
+	require.Equal(t, [][32]byte{ok}, local.deletes,
+		"an entry queued after the failing one must still be reclaimed")
+}
+
+// A blob already absent locally still needs its queue entry cleared, and must
+// not be reported as an unlink.
+func TestSweeperClearsTheQueueEntryWhenNoLocalBlobRemains(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("already-gone")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 0, QueuedAtTS: entry.CommitTS}),
+		},
+	}
+	sweeper, local := newSweeperFixture(t, store)
+	local.writtenAt = map[[32]byte]uint64{}
+
+	require.NoError(t, sweeper.SweepOnce(context.Background()))
+	require.Empty(t, local.attempts, "there is nothing to unlink")
+	require.Contains(t, store.calls, "raft-conditional-delete",
+		"the queue entry must still be cleared")
 }
