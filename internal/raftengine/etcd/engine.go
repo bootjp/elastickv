@@ -23,6 +23,7 @@ import (
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/tracker"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -3858,6 +3859,43 @@ func (e *Engine) resolveReadyReads() {
 	}
 }
 
+// peerProgress snapshots the leader's replication tracker.
+//
+// Only the leader tracks progress, so a follower returns nil rather
+// than an empty map: the two would otherwise be indistinguishable, and
+// an operator reading an empty map on a follower could conclude the
+// cluster has no peers.
+//
+// rawNode.WithProgress is used instead of rawNode.Status() because
+// this runs on every Ready: Status() deep-copies the whole progress
+// map plus the config, while WithProgress visits in place and lets us
+// allocate exactly one small map sized to the peer count.
+func (e *Engine) peerProgress(state raftengine.State) map[uint64]raftengine.PeerProgress {
+	if state != raftengine.StateLeader {
+		return nil
+	}
+	// Allocated up front, not lazily inside the visitor: a
+	// single-node leader visits only itself, which is skipped, and a
+	// lazily-built map would leave a healthy peerless leader
+	// reporting nil — indistinguishable from a follower to any
+	// consumer testing PerPeer == nil.
+	out := make(map[uint64]raftengine.PeerProgress)
+	e.rawNode.WithProgress(func(id uint64, _ etcdraft.ProgressType, pr tracker.Progress) {
+		if id == e.nodeID {
+			// The leader's own entry tracks itself; operators care
+			// about remote replicas.
+			return
+		}
+		out[id] = raftengine.PeerProgress{
+			Match:        pr.Match,
+			Next:         pr.Next,
+			IsLearner:    pr.IsLearner,
+			RecentActive: pr.RecentActive,
+		}
+	})
+	return out
+}
+
 func (e *Engine) refreshStatus() {
 	previous := e.Status().State
 	basic := e.rawNode.BasicStatus()
@@ -3882,6 +3920,7 @@ func (e *Engine) refreshStatus() {
 		ConfigurationIndex: e.currentConfigIndex(),
 		LeadTransferee:     basic.LeadTransferee,
 		PendingConfChange:  e.hasPendingConfChange(),
+		PerPeer:            e.peerProgress(state),
 	}
 
 	e.mu.Lock()
