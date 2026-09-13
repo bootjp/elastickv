@@ -58,7 +58,8 @@ func TestPublishAndRestorePhysicalSnapshotRoundTrip(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 9, ID: "n9", Address: "127.0.0.1:19009"},
 		},
-		ExpectGroupID: expectGroup(manifest.GroupID),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.NoError(t, err)
 	require.Equal(t, int64(len(payload)), result.PayloadBytes)
@@ -96,11 +97,12 @@ func TestRestoreRejectsCorruptPayloadAndLeavesDestinationAbsent(t *testing.T) {
 
 	restoreDataDir := filepath.Join(root, "restored")
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:         store,
-		ManifestKey:   manifest.ManifestKey,
-		DataDir:       restoreDataDir,
-		Peers:         singlePeer(),
-		ExpectGroupID: expectGroup(manifest.GroupID),
+		Store:               store,
+		ManifestKey:         manifest.ManifestKey,
+		DataDir:             restoreDataDir,
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, ErrIntegrity)
 	_, statErr := os.Stat(restoreDataDir)
@@ -378,11 +380,12 @@ func TestRestoreInlineManifestRejectsStaleSelfHashBeforePayloadDownload(t *testi
 	tracked := &countingObjectStore{ObjectStore: store}
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:         tracked,
-		Manifest:      &tampered,
-		DataDir:       filepath.Join(root, "restored"),
-		Peers:         singlePeer(),
-		ExpectGroupID: expectGroup(tampered.GroupID),
+		Store:               tracked,
+		Manifest:            &tampered,
+		DataDir:             filepath.Join(root, "restored"),
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(tampered.GroupID),
+		ExpectSourceCluster: tampered.SourceCluster,
 	})
 	require.ErrorIs(t, err, ErrIntegrity)
 	require.Zero(t, tracked.getObjectCalls)
@@ -483,11 +486,12 @@ func TestRestorePreflightsExistingDestinationBeforePayloadDownload(t *testing.T)
 	require.NoError(t, os.Mkdir(restoreDataDir, 0o755))
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:         store,
-		ManifestKey:   manifest.ManifestKey,
-		DataDir:       restoreDataDir,
-		Peers:         singlePeer(),
-		ExpectGroupID: expectGroup(manifest.GroupID),
+		Store:               store,
+		ManifestKey:         manifest.ManifestKey,
+		DataDir:             restoreDataDir,
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, etcdraftengine.ErrExternalSnapshotRestoreExists)
 }
@@ -515,7 +519,8 @@ func TestRestoreRejectsInvalidPeersBeforePayloadDownload(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 0, ID: "n0", Address: "127.0.0.1:12000"},
 		},
-		ExpectGroupID: expectGroup(manifest.GroupID),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, ErrInvalidOptions)
 	require.Zero(t, tracked.getObjectCalls)
@@ -539,11 +544,12 @@ func TestRestoreHonorsCancelledContextBeforePayloadDownload(t *testing.T) {
 	tracked := &countingObjectStore{ObjectStore: store}
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:         tracked,
-		Manifest:      manifest,
-		DataDir:       filepath.Join(root, "restored"),
-		Peers:         singlePeer(),
-		ExpectGroupID: expectGroup(manifest.GroupID),
+		Store:               tracked,
+		Manifest:            manifest,
+		DataDir:             filepath.Join(root, "restored"),
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, tracked.getObjectCalls)
@@ -736,4 +742,119 @@ func TestPublishVerifiesLeadershipAfterTheManifestAbsenceProbe(t *testing.T) {
 // cannot double as "not supplied".
 func expectGroup(groupID uint64) *uint64 {
 	return &groupID
+}
+
+// TestCleanStaleSpoolFilesRemovesOrphansFromAKilledProcess covers the spool
+// leak.
+//
+// spoolExport removes its file with a defer, which never runs if the process is
+// killed or the host loses power mid-publish. Nothing else removed them, so
+// repeated crashes during large snapshots accumulated full payload copies until
+// the spool volume filled.
+func TestCleanStaleSpoolFilesRemovesOrphansFromAKilledProcess(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "elastickv-snapshot-offload-123456.fsm")
+	require.NoError(t, os.WriteFile(orphan, []byte("payload"), 0o600))
+
+	// Files that are not spool files must be left alone: the spool dir can be
+	// shared, and deleting an unrelated file would be far worse than the leak.
+	unrelated := filepath.Join(dir, "keep-me.txt")
+	require.NoError(t, os.WriteFile(unrelated, []byte("data"), 0o600))
+	manifest := filepath.Join(dir, "manifest.json")
+	require.NoError(t, os.WriteFile(manifest, []byte("{}"), 0o600))
+
+	removed, err := CleanStaleSpoolFiles(dir, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []string{orphan}, removed)
+
+	require.NoFileExists(t, orphan)
+	require.FileExists(t, unrelated)
+	require.FileExists(t, manifest)
+}
+
+// A file newer than the cutoff may belong to a concurrently running publish, so
+// it must survive: deleting it would break a live upload to fix a leak.
+func TestCleanStaleSpoolFilesSparesAFileNewerThanTheCutoff(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	inFlight := filepath.Join(dir, "elastickv-snapshot-offload-inflight.fsm")
+	require.NoError(t, os.WriteFile(inFlight, []byte("partial"), 0o600))
+
+	removed, err := CleanStaleSpoolFiles(dir, time.Now().Add(-time.Hour))
+	require.NoError(t, err)
+	require.Empty(t, removed)
+	require.FileExists(t, inFlight)
+}
+
+// A missing spool dir is not an error: offload may never have run.
+func TestCleanStaleSpoolFilesToleratesAMissingDirectory(t *testing.T) {
+	t.Parallel()
+
+	removed, err := CleanStaleSpoolFiles(filepath.Join(t.TempDir(), "absent"), time.Now())
+	require.NoError(t, err)
+	require.Empty(t, removed)
+}
+
+func TestCleanStaleSpoolFilesRequiresADirectory(t *testing.T) {
+	t.Parallel()
+
+	_, err := CleanStaleSpoolFiles("  ", time.Now())
+	require.ErrorIs(t, err, ErrInvalidOptions)
+}
+
+// TestSpoolDirForMatchesWhatAPublishUses pins that a caller cleaning the spool
+// dir targets the same directory a publish writes into -- a cleaner pointed at
+// the wrong path silently does nothing.
+func TestSpoolDirForMatchesWhatAPublishUses(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t,
+		filepath.Join("/srv", "raft", ".snapshot-offload-spool"),
+		SpoolDirFor("", "/srv/raft/n1"),
+		"the default spool dir is a sibling of the data dir, so it shares its filesystem "+
+			"and the spooled payload can be renamed rather than copied")
+	require.Equal(t, filepath.Clean("/spool"), SpoolDirFor("/spool", "/srv/raft/n1"),
+		"an explicit spool dir wins")
+}
+
+// TestRestoreRejectsAnotherClustersManifestBeforeTheDownload pins that the
+// cluster check, like the group check, runs before the payload download and
+// before the destination is created.
+func TestRestoreRejectsAnotherClustersManifestBeforeTheDownload(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-for-cross-cluster-restore")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 31, 11, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "shared-bucket",
+		GroupID:       1,
+		SourceCluster: "cluster-b",
+	})
+	require.NoError(t, err)
+
+	tracked := &countingObjectStore{ObjectStore: store}
+	dest := filepath.Join(root, "restored")
+	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
+		Store:    tracked,
+		Manifest: manifest,
+		DataDir:  dest,
+		Peers:    singlePeer(),
+		// The group MATCHES; only the cluster identity differs, which is the
+		// case the group check alone cannot catch.
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: "cluster-a",
+	})
+	require.ErrorIs(t, err, ErrRestoreSourceClusterMismatch)
+	require.Zero(t, tracked.getObjectCalls,
+		"the payload must not be downloaded for a manifest from another cluster")
+	_, statErr := os.Stat(dest)
+	require.True(t, os.IsNotExist(statErr), "the destination must not be created")
 }

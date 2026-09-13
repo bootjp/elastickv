@@ -238,3 +238,54 @@ func TestRunbookRestorePathsFollowFromTheGroupTopology(t *testing.T) {
 		})
 	}
 }
+
+// TestRejectPlaintextOffloadEndpoint pins the transport requirement.
+//
+// The design and the runbook both require TLS for the external bucket, and this
+// path carries whole snapshot payloads plus the credentials used to write them.
+// An http:// endpoint was forwarded straight to the AWS client, so the
+// downgrade was invisible until someone captured the traffic.
+func TestRejectPlaintextOffloadEndpoint(t *testing.T) {
+	restore := func(endpoint string, allow bool) func() {
+		prevEndpoint := *snapshotOffloadEndpoint
+		prevAllow := *snapshotOffloadAllowInsecureEndpoint
+		*snapshotOffloadEndpoint = endpoint
+		*snapshotOffloadAllowInsecureEndpoint = allow
+		return func() {
+			*snapshotOffloadEndpoint = prevEndpoint
+			*snapshotOffloadAllowInsecureEndpoint = prevAllow
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		endpoint string
+		allow    bool
+		wantErr  bool
+	}{
+		{name: "https is accepted", endpoint: "https://s3.example.com", wantErr: false},
+		{name: "uppercase HTTPS is accepted", endpoint: "HTTPS://s3.example.com", wantErr: false},
+		{name: "empty means the AWS default, which is https", endpoint: "", wantErr: false},
+		{name: "http is refused", endpoint: "http://s3.example.com", wantErr: true},
+		{
+			// The AWS SDK resolves a scheme-less endpoint as http, so it is
+			// refused rather than assumed safe.
+			name: "scheme-less host:port is refused", endpoint: "s3.example.com:9000", wantErr: true,
+		},
+		{
+			name:     "http with the explicit development opt-in is allowed",
+			endpoint: "http://127.0.0.1:9000", allow: true, wantErr: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			defer restore(tc.endpoint, tc.allow)()
+			err := rejectPlaintextOffloadEndpoint()
+			if tc.wantErr {
+				require.Error(t, err, "endpoint %q", tc.endpoint)
+				require.ErrorIs(t, err, snapshotoffload.ErrInvalidOptions)
+				return
+			}
+			require.NoError(t, err, "endpoint %q", tc.endpoint)
+		})
+	}
+}

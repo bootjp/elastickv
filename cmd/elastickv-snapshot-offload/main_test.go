@@ -53,6 +53,7 @@ func TestSnapshotOffloadCLIPublishAndRestoreLocal(t *testing.T) {
 		// The publish above used --group-id 2, so this is the group this
 		// data dir is for.
 		"--expect-group", "2",
+		"--expect-source-cluster", "cluster-cli",
 	}, io.Discard, logger)
 	require.NoError(t, err)
 	require.Equal(t, exitSuccess, code)
@@ -236,6 +237,7 @@ func TestSnapshotOffloadCLIRestoreRefusesAnotherGroupsManifest(t *testing.T) {
 		"--peers", "n1=127.0.0.1:12001",
 		// The operator means group 1, but pasted group 2's manifest key.
 		"--expect-group", "1",
+		"--expect-source-cluster", "cluster-cli",
 	}, io.Discard, logger)
 	require.Error(t, err)
 	require.ErrorIs(t, err, snapshotoffload.ErrRestoreGroupMismatch)
@@ -279,6 +281,7 @@ func TestSnapshotOffloadCLIRestoreAcceptsGroupZero(t *testing.T) {
 		"--data-dir", "/tmp/restored",
 		"--peers", "n1=127.0.0.1:12001",
 		"--expect-group", "0",
+		"--expect-source-cluster", "cluster-cli",
 	})
 	require.NoError(t, err)
 	require.Equal(t, uint64(0), cfg.expectGroupID)
@@ -294,6 +297,79 @@ func TestSnapshotOffloadCLIRestoreRejectsANonNumericGroup(t *testing.T) {
 		"--data-dir", "/tmp/restored",
 		"--peers", "n1=127.0.0.1:12001",
 		"--expect-group", "one",
+		"--expect-source-cluster", "cluster-cli",
 	})
 	require.Error(t, err)
+}
+
+// TestSnapshotOffloadCLIRestoreRefusesAnotherClustersManifest covers the gap
+// --expect-group alone leaves.
+//
+// One bucket can hold backups from several clusters, even under different
+// prefixes. A manifest from another cluster for the SAME group id passes the
+// group check, and the restore then produces a structurally valid directory
+// that startup loads as this cluster's FSM. Nothing downstream records the
+// source cluster, so this is the only place the mistake is detectable.
+func TestSnapshotOffloadCLIRestoreRefusesAnotherClustersManifest(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	root := t.TempDir()
+	objectRoot := filepath.Join(root, "objects")
+	sourceDataDir := seedCLISnapshot(t, root, []byte("EKVTHLC1other-cluster-payload"), 60, 9)
+
+	var stdout bytes.Buffer
+	code, err := run(ctx, []string{
+		commandPublish,
+		"--store", storeLocal,
+		"--local-root", objectRoot,
+		"--data-dir", sourceDataDir,
+		"--prefix", "shared-bucket",
+		"--group-id", "1",
+		"--source-cluster", "cluster-b",
+		"--binary-version", "test-version",
+	}, &stdout, logger)
+	require.NoError(t, err)
+	require.Equal(t, exitSuccess, code)
+
+	manifest, err := snapshotoffload.DecodeManifest(stdout.Bytes())
+	require.NoError(t, err)
+	require.Equal(t, "cluster-b", manifest.SourceCluster)
+	require.Equal(t, uint64(1), manifest.GroupID)
+
+	restoreDataDir := filepath.Join(root, "restored-into-cluster-a")
+	code, err = run(ctx, []string{
+		commandRestore,
+		"--store", storeLocal,
+		"--local-root", objectRoot,
+		"--manifest-key", manifest.ManifestKey,
+		"--data-dir", restoreDataDir,
+		"--peers", "n1=127.0.0.1:12001",
+		// The group matches, so only the cluster identity can catch this.
+		"--expect-group", "1",
+		"--expect-source-cluster", "cluster-a",
+	}, io.Discard, logger)
+	require.Error(t, err)
+	require.ErrorIs(t, err, snapshotoffload.ErrRestoreSourceClusterMismatch)
+	require.Equal(t, exitUserErr, code)
+
+	_, statErr := os.Stat(restoreDataDir)
+	require.True(t, os.IsNotExist(statErr),
+		"a refused restore must not create the destination")
+}
+
+func TestSnapshotOffloadCLIRestoreRequiresAnExpectedSourceCluster(t *testing.T) {
+	t.Parallel()
+
+	_, err := parseRestoreFlags([]string{
+		"--store", storeLocal,
+		"--local-root", "/tmp/objects",
+		"--manifest-key", "k",
+		"--data-dir", "/tmp/restored",
+		"--peers", "n1=127.0.0.1:12001",
+		"--expect-group", "1",
+	})
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "--expect-source-cluster is required")
 }

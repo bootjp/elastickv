@@ -4,7 +4,9 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"net/url"
 	"strings"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
@@ -50,6 +52,42 @@ var (
 		"source cluster identity recorded in every manifest; required when offload is enabled")
 )
 
+// snapshotOffloadAllowInsecureEndpoint is the narrow development opt-in for a
+// plaintext offload endpoint. Off by default, and named so it cannot be
+// mistaken for a tuning knob.
+var snapshotOffloadAllowInsecureEndpoint = flag.Bool("snapshotOffloadAllowInsecureEndpoint", false,
+	"allow a plaintext http:// --snapshotOffloadEndpoint. DEVELOPMENT ONLY: snapshot "+
+		"payloads and session credentials would cross the network unencrypted.")
+
+// rejectPlaintextOffloadEndpoint refuses an http:// endpoint unless the
+// operator explicitly opted in.
+//
+// The design and the runbook both require TLS for the external bucket, and
+// this path carries whole snapshot payloads plus the session credentials used
+// to write them. An endpoint that silently downgraded to plaintext is the kind
+// of misconfiguration that is invisible until someone captures the traffic, so
+// it fails startup instead.
+func rejectPlaintextOffloadEndpoint() error {
+	endpoint := strings.TrimSpace(*snapshotOffloadEndpoint)
+	if endpoint == "" || *snapshotOffloadAllowInsecureEndpoint {
+		return nil
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil {
+		return errors.Wrapf(err, "parse --snapshotOffloadEndpoint %q", endpoint)
+	}
+	// A scheme-less host:port is ambiguous rather than known-plaintext, but
+	// the AWS SDK resolves it as http, so it is refused too.
+	if !strings.EqualFold(parsed.Scheme, "https") {
+		return errors.Wrapf(snapshotoffload.ErrInvalidOptions,
+			"--snapshotOffloadEndpoint %q is not https; snapshot payloads and credentials "+
+				"would cross the network unencrypted. Pass an https:// endpoint, or "+
+				"--snapshotOffloadAllowInsecureEndpoint for local development only",
+			endpoint)
+	}
+	return nil
+}
+
 // snapshotOffloadEnabled reports whether the operator configured a
 // destination. Checked before any other offload flag is validated so a
 // node that never opts in cannot fail startup on offload config.
@@ -78,6 +116,9 @@ func buildSnapshotOffloadStore(ctx context.Context) (snapshotoffload.ObjectStore
 		}
 		return store, nil
 	}
+	if err := rejectPlaintextOffloadEndpoint(); err != nil {
+		return nil, err
+	}
 	store, err := snapshotoffload.NewS3Store(ctx, snapshotoffload.S3StoreConfig{
 		Bucket:               bucket,
 		Region:               strings.TrimSpace(*snapshotOffloadRegion),
@@ -99,6 +140,39 @@ func buildSnapshotOffloadStore(ctx context.Context) (snapshotoffload.ObjectStore
 // the scheduler outlives startup and races Close(), so a direct field
 // read would be a data race. A runtime whose engine has been cleared
 // reports "not leader", which fails closed.
+// cleanStaleOffloadSpool removes leftover spool files from every directory
+// this process would publish through.
+//
+// Failures are logged, not fatal: an undeletable spool file is a disk-space
+// problem, and refusing to serve because of one would be a worse outcome than
+// the leak it guards against.
+func cleanStaleOffloadSpool(
+	runtimes []*raftGroupRuntime,
+	raftDir, raftID string,
+	multi bool,
+	logger *slog.Logger,
+) {
+	configured := strings.TrimSpace(*snapshotOffloadSpoolDir)
+	seen := make(map[string]struct{})
+	now := time.Now()
+	for _, group := range snapshotOffloadGroups(runtimes, raftDir, raftID, multi) {
+		dir := snapshotoffload.SpoolDirFor(configured, group.DataDir)
+		if _, done := seen[dir]; done {
+			continue
+		}
+		seen[dir] = struct{}{}
+		removed, err := snapshotoffload.CleanStaleSpoolFiles(dir, now)
+		if err != nil {
+			logger.Warn("snapshot offload: could not clean stale spool files",
+				slog.String("spool_dir", dir), slog.Any("err", err))
+		}
+		if len(removed) > 0 {
+			logger.Info("snapshot offload: removed stale spool files",
+				slog.String("spool_dir", dir), slog.Int("files", len(removed)))
+		}
+	}
+}
+
 func snapshotOffloadGroups(
 	runtimes []*raftGroupRuntime, raftDir, raftID string, multi bool,
 ) []snapshotoffload.OffloadGroup {
@@ -191,6 +265,13 @@ func startSnapshotOffload(
 	if err != nil {
 		return errors.Wrap(err, "snapshot offload: scheduler")
 	}
+
+	// Before the scheduler starts: spool files left by a killed process are
+	// full payload copies, and nothing else removed them, so repeated crashes
+	// during large snapshots filled the spool volume. Safe to do here
+	// because no publish of THIS process has begun, so every existing file
+	// belongs to a previous one.
+	cleanStaleOffloadSpool(runtimes, raftDir, raftID, multi, logger)
 
 	logger.Info("snapshot offload enabled",
 		slog.Int("groups", len(runtimes)),

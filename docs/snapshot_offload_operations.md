@@ -168,16 +168,25 @@ elastickv-snapshot-offload restore \
   --manifest-key='elastickv/v1/groups/1/snapshots/00000000000000004211-00000000000000000007.json' \
   --data-dir=/var/lib/elastickv/n1/group-1 \
   --expect-group=1 \
+  --expect-source-cluster=prod-tokyo \
   --peers='n1=10.0.0.1:50051,n2=10.0.0.2:50051,n3=10.0.0.3:50051'
 
 # 3. Repeat for every group the node hosts, then start it normally.
 ```
 
-### Every flag that says "group" must say the SAME group
+### Every flag that names the target must name the SAME target
 
-`--manifest-key`, `--data-dir`, `--expect-group` and `--peers` are four
-independent statements about which group you are restoring. Three of them
-used to be uncheckable against each other:
+`--manifest-key`, `--data-dir`, `--expect-group`, `--expect-source-cluster`
+and `--peers` are five independent statements about what you are restoring.
+Most of them used to be uncheckable against each other:
+
+- **`--expect-source-cluster` is required.** The group check is not enough
+  when one bucket holds backups from several clusters, even under
+  different prefixes: another cluster's manifest for the *same* group id
+  passes it, and the restore produces a valid-looking directory that
+  startup loads as this cluster's FSM. Nothing downstream records the
+  source cluster, so this is the only place that mistake is detectable.
+  It must match the `--source-cluster` the publish used.
 
 - **`--expect-group` is required and is the only cross-check.** Nothing in
   the restored directory records which group the data came from — the
@@ -230,6 +239,22 @@ nothing, the restore is silently ignored, and the node comes back with
 only the groups you happened to place correctly. **Check the table per
 group before each invocation** rather than assuming one rule for the
 whole node.
+
+### Transport and spool hygiene
+
+- **`--snapshotOffloadEndpoint` must be `https://`.** The node refuses a
+  plaintext endpoint at startup: this path carries whole snapshot payloads
+  and the credentials used to write them, and a silent downgrade is
+  invisible until someone captures the traffic. For a local MinIO during
+  development, pass `--snapshotOffloadAllowInsecureEndpoint` explicitly.
+- **Stale spool files are cleaned at startup.** A publish spools the
+  payload to `<parent of data dir>/.snapshot-offload-spool` (or
+  `--snapshotOffloadSpoolDir`) and removes it on completion; a process
+  killed mid-publish leaves the file behind. Offload startup removes
+  leftovers before scheduling, so repeated crashes during large snapshots
+  no longer accumulate full payload copies. Budget the spool volume for
+  one in-flight payload per concurrent upload
+  (`--snapshotOffloadConcurrency`).
 
 Restore verifies exact length and SHA-256 before the payload is accepted, then
 fsyncs and atomically renames it into place. Any integrity failure leaves the

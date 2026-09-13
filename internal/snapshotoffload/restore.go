@@ -37,6 +37,17 @@ type RestoreOptions struct {
 	// A pointer because group 0 is a real group (the dedicated TSO group),
 	// so zero cannot double as "unset".
 	ExpectGroupID *uint64
+
+	// ExpectSourceCluster is the cluster the operator believes this manifest
+	// came from. Required.
+	//
+	// The group check alone is not enough when one bucket holds backups from
+	// several clusters, even under different prefixes: another cluster's
+	// manifest for the SAME group id passes it, and the restore produces a
+	// structurally valid directory that startup then loads as this cluster's
+	// FSM. Nothing downstream records the source cluster either, so this is
+	// the only place the mistake is detectable.
+	ExpectSourceCluster string
 }
 
 const (
@@ -109,6 +120,9 @@ func prepareRestorePayload(ctx context.Context, opts RestoreOptions) (Manifest, 
 	// Before the download and before the destination exists, so a
 	// mistaken manifest key costs nothing and leaves nothing behind.
 	if err := checkRestoreGroup(manifest, opts.ExpectGroupID); err != nil {
+		return Manifest{}, "", nil, err
+	}
+	if err := checkRestoreSourceCluster(manifest, opts.ExpectSourceCluster); err != nil {
 		return Manifest{}, "", nil, err
 	}
 	if err := checkRestorePreflight(ctx, opts.DataDir); err != nil {
@@ -234,6 +248,8 @@ func validateRestoreOptions(opts RestoreOptions) error {
 		return errors.Wrap(ErrInvalidOptions, "restore peers are required")
 	case opts.ExpectGroupID == nil:
 		return errors.Wrap(ErrInvalidOptions, "expected raft group id is required")
+	case stringsTrim(opts.ExpectSourceCluster) == "":
+		return errors.Wrap(ErrInvalidOptions, "expected source cluster is required")
 	default:
 		return validateRestorePeers(opts.Peers)
 	}
@@ -249,6 +265,21 @@ func checkRestoreGroup(manifest Manifest, expect *uint64) error {
 		return errors.Wrapf(ErrRestoreGroupMismatch,
 			"manifest %s belongs to group %d, not the requested group %d",
 			manifest.ManifestKey, manifest.GroupID, *expect)
+	}
+	return nil
+}
+
+// checkRestoreSourceCluster rejects a manifest published by a different
+// cluster than the operator named.
+func checkRestoreSourceCluster(manifest Manifest, expect string) error {
+	expect = stringsTrim(expect)
+	if expect == "" {
+		return errors.Wrap(ErrInvalidOptions, "expected source cluster is required")
+	}
+	if stringsTrim(manifest.SourceCluster) != expect {
+		return errors.Wrapf(ErrRestoreSourceClusterMismatch,
+			"manifest %s was published by cluster %q, not the requested %q",
+			manifest.ManifestKey, manifest.SourceCluster, expect)
 	}
 	return nil
 }
