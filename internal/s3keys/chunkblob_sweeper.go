@@ -49,22 +49,47 @@ type ChunkBlobGCQueueEntry struct {
 // ChunkBlobSweepStore is the replicated half: the GC queue and the
 // reference counts, both read and written through Raft.
 type ChunkBlobSweepStore interface {
-	// ScanGCQueue returns every queue entry in [startKey, endKey).
-	// It must be all-or-error: a partial scan would simply delay
-	// entries to the next pass, which is safe, but a scan that
-	// silently truncated mid-range while reporting success would hide
-	// a persistent backlog.
-	ScanGCQueue(ctx context.Context, startKey, endKey []byte) ([]ChunkBlobGCQueueEntry, error)
+	// ScanGCQueue returns up to limit queue entries from [startKey, endKey),
+	// plus the key to resume from when more remain.
+	//
+	// Paged, because the eligible range is unbounded: an outage or a large
+	// object-deletion workload can leave millions of expired entries, and
+	// materialising them all before the sweeper reclaims even the first one
+	// can OOM the process -- leaving the backlog permanently untouched,
+	// which is the opposite of what a GC pass is for.
+	//
+	// Each PAGE must still be all-or-error. A short page is fine -- the
+	// remaining entries are picked up by the continuation key or the next
+	// pass -- but a page that silently truncated while reporting success
+	// would hide a persistent backlog.
+	//
+	// nextStartKey is nil when the range is exhausted.
+	ScanGCQueue(
+		ctx context.Context, startKey, endKey []byte, limit int,
+	) (entries []ChunkBlobGCQueueEntry, nextStartKey []byte, err error)
 
 	// ReadChunkRefRC returns the raw reference-count value and
 	// whether the key exists. Raw bytes, so the classifier can tell
 	// an undecodable record from an absent one.
 	ReadChunkRefRC(ctx context.Context, sha [chunkBlobSHA256Bytes]byte) ([]byte, bool, error)
 
-	// DeleteGCQueueEntryIfUnreferenced deletes the queue entry only if
-	// it still exists AND the reference count is still zero, returning
-	// ErrQueueEntryChanged otherwise. Concurrent sweepers serialise
-	// here on the queue key's write-write conflict.
+	// DeleteGCQueueEntryIfUnreferenced deletes the queue entry AND the
+	// zero-count reference record, in ONE txn, only if the entry still
+	// exists and the count is still zero; ErrQueueEntryChanged otherwise.
+	// Concurrent sweepers serialise here on the queue key's write-write
+	// conflict.
+	//
+	// The RC record goes with the entry because nothing else ever removed
+	// it: the planner persists a count-zero record when the last reference
+	// drops, and reclamation deleted only the queue entry and the local
+	// payload. A workload that creates and deletes unique chunks therefore
+	// left one permanent Raft-replicated key per content hash, so the live
+	// MVCC state and every snapshot grew without bound despite blob GC
+	// working correctly.
+	//
+	// Atomically with the entry, not as a second txn: a crash between two
+	// txns would leave either a queue entry for a blob with no RC record,
+	// or the same unbounded leak this removes.
 	DeleteGCQueueEntryIfUnreferenced(ctx context.Context, entry ChunkBlobGCQueueEntry) error
 
 	// DeleteGCQueueEntry deletes the entry unconditionally. Used only
@@ -117,7 +142,14 @@ type ChunkBlobSweeper struct {
 	nowTS    func() uint64
 	observer ChunkBlobSweepObserver
 	logger   *slog.Logger
+	pageSize int
 }
+
+// DefaultChunkBlobGCPageSize bounds one queue-scan page.
+//
+// Chosen so the sweeper's memory is independent of the backlog: a
+// million-entry queue becomes slow to drain rather than impossible to load.
+const DefaultChunkBlobGCPageSize = 1024
 
 // ChunkBlobSweeperOptions configures NewChunkBlobSweeper.
 //
@@ -132,6 +164,9 @@ type ChunkBlobSweeperOptions struct {
 	NowTS       func() uint64
 	Observer    ChunkBlobSweepObserver
 	Logger      *slog.Logger
+	// PageSize bounds one queue-scan page; zero uses
+	// DefaultChunkBlobGCPageSize.
+	PageSize int
 }
 
 func NewChunkBlobSweeper(opts ChunkBlobSweeperOptions) (*ChunkBlobSweeper, error) {
@@ -158,7 +193,18 @@ func NewChunkBlobSweeper(opts ChunkBlobSweeperOptions) (*ChunkBlobSweeper, error
 		nowTS:    opts.NowTS,
 		observer: observer,
 		logger:   timing.logger,
+		pageSize: pageSizeOrDefault(opts.PageSize),
 	}, nil
+}
+
+// pageSizeOrDefault defaults and floors the scan page size. A non-positive
+// value would make the scan return nothing and the sweeper spin without
+// reclaiming, so it is treated as "unset".
+func pageSizeOrDefault(size int) int {
+	if size <= 0 {
+		return DefaultChunkBlobGCPageSize
+	}
+	return size
 }
 
 // gcLoopTiming is the cadence/logging configuration both GC loops
@@ -228,11 +274,49 @@ func (s *ChunkBlobSweeper) SweepOnce(ctx context.Context) error {
 		// Nothing can have served a full grace window yet.
 		return nil
 	}
-	entries, err := s.store.ScanGCQueue(ctx,
-		ChunkBlobGCQueueScanStart(), ChunkBlobGCQueueScanEnd(boundary))
-	if err != nil {
-		return errors.Wrap(err, "chunkblob gc: scan queue")
+	return s.sweepPages(ctx, boundary)
+}
+
+// sweepPages walks the eligible range a page at a time.
+//
+// A bounded page keeps the sweeper's memory independent of the backlog, so a
+// million-entry queue is slow to drain rather than fatal to load.
+func (s *ChunkBlobSweeper) sweepPages(ctx context.Context, boundary uint64) error {
+	var (
+		failures []error
+		scanned  int
+		startKey = ChunkBlobGCQueueScanStart()
+		endKey   = ChunkBlobGCQueueScanEnd(boundary)
+	)
+	// Cancellation ends the walk between pages; the remaining entries stay
+	// queued for the next pass, so an interrupted sweep costs a delay rather
+	// than a lost reclaim.
+	for !sweepCancelled(ctx) {
+		entries, next, err := s.store.ScanGCQueue(ctx, startKey, endKey, s.pageSize)
+		if err != nil {
+			failures = append(failures, errors.Wrap(err, "chunkblob gc: scan queue"))
+			break
+		}
+		scanned += len(entries)
+		pageFailures, cancelled := s.sweepPage(ctx, entries)
+		failures = append(failures, pageFailures...)
+		if cancelled || len(next) == 0 {
+			break
+		}
+		startKey = next
 	}
+	if len(failures) > 0 {
+		return errors.Wrapf(errors.Join(failures...),
+			"chunkblob gc: %d failures over %d queue entries", len(failures), scanned)
+	}
+	return nil
+}
+
+// sweepPage sweeps one page, returning its failures and whether the context was
+// cancelled mid-page.
+func (s *ChunkBlobSweeper) sweepPage(
+	ctx context.Context, entries []ChunkBlobGCQueueEntry,
+) ([]error, bool) {
 	// Per-entry failures are collected, not returned immediately. The scan
 	// is time-ordered, so one entry that persistently fails its RC read,
 	// its stale-entry delete or its conditional Raft delete came back
@@ -244,7 +328,7 @@ func (s *ChunkBlobSweeper) SweepOnce(ctx context.Context) error {
 		// queued and the next pass picks them up, so an interrupted
 		// sweep costs a delay rather than a lost reclaim.
 		if sweepCancelled(ctx) {
-			break
+			return failures, true
 		}
 		if err := s.sweepEntry(ctx, entry); err != nil {
 			s.logger.WarnContext(ctx, "chunkblob gc: entry failed, continuing",
@@ -252,11 +336,7 @@ func (s *ChunkBlobSweeper) SweepOnce(ctx context.Context) error {
 			failures = append(failures, err)
 		}
 	}
-	if len(failures) > 0 {
-		return errors.Wrapf(errors.Join(failures...),
-			"chunkblob gc: %d of %d queue entries failed", len(failures), len(entries))
-	}
-	return nil
+	return failures, false
 }
 
 // sweepEntry classifies and executes one entry.

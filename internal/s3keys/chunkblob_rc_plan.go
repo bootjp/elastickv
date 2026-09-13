@@ -74,8 +74,19 @@ func PlanChunkRefRCMutations(
 	if commitTS == 0 {
 		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "commit timestamp is required")
 	}
-	out := make([]ChunkRefRCMutation, 0, len(deltas)*maxMutationsPerDelta)
-	for _, delta := range deltas {
+	// Deltas are aggregated per SHA before planning. Without this, each
+	// iteration reads the SAME `current` value, so two deltas of Added:1 for
+	// one SHA each planned a write of Count:1 -- the second overwriting the
+	// first -- instead of the Count:2 the txn actually requires. A chunk
+	// referenced twice in one request would then be one reference short, and
+	// the next delete would drive it to zero while a live chunkref still
+	// pointed at it.
+	aggregated, err := aggregateChunkRefDeltas(deltas)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ChunkRefRCMutation, 0, len(aggregated)*maxMutationsPerDelta)
+	for _, delta := range aggregated {
 		planned, err := planOneChunkRefDelta(delta, current[delta.ContentSHA256], commitTS)
 		if err != nil {
 			return nil, err
@@ -83,6 +94,55 @@ func PlanChunkRefRCMutations(
 		out = append(out, planned...)
 	}
 	return out, nil
+}
+
+// aggregateChunkRefDeltas folds repeated SHAs into one delta, preserving first
+// appearance order so the planned mutations stay deterministic.
+//
+// Added and Removed are summed rather than netted here: planOneChunkRefDelta
+// needs both to run the §3.5 underflow check against `existing.Count + Added`,
+// and netting first would hide a removal that exceeds what the txn itself adds.
+func aggregateChunkRefDeltas(deltas []ChunkRefDelta) ([]ChunkRefDelta, error) {
+	order := make([][chunkBlobSHA256Bytes]byte, 0, len(deltas))
+	merged := make(map[[chunkBlobSHA256Bytes]byte]ChunkRefDelta, len(deltas))
+	for _, delta := range deltas {
+		prev, seen := merged[delta.ContentSHA256]
+		if !seen {
+			order = append(order, delta.ContentSHA256)
+			merged[delta.ContentSHA256] = delta
+			continue
+		}
+		added, err := addChunkRefCount(prev.Added, delta.Added, delta.ContentSHA256)
+		if err != nil {
+			return nil, err
+		}
+		removed, err := addChunkRefCount(prev.Removed, delta.Removed, delta.ContentSHA256)
+		if err != nil {
+			return nil, err
+		}
+		merged[delta.ContentSHA256] = ChunkRefDelta{
+			ContentSHA256: delta.ContentSHA256,
+			Added:         added,
+			Removed:       removed,
+		}
+	}
+	out := make([]ChunkRefDelta, 0, len(order))
+	for _, sha := range order {
+		out = append(out, merged[sha])
+	}
+	return out, nil
+}
+
+// addChunkRefCount sums two counts, refusing an overflow rather than wrapping
+// into a smaller number -- which would understate the reference count and let a
+// later delete reclaim a live blob.
+func addChunkRefCount(a, b uint64, sha [chunkBlobSHA256Bytes]byte) (uint64, error) {
+	sum := a + b
+	if sum < a {
+		return 0, errors.Wrapf(ErrInvalidChunkRefPlan,
+			"reference count overflow for sha=%x", sha[:4])
+	}
+	return sum, nil
 }
 
 // ErrInvalidChunkRefPlan reports a malformed planning request.

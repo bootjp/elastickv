@@ -2,6 +2,8 @@ package s3keys_test
 
 import (
 	"context"
+	"fmt"
+	"strconv"
 	"testing"
 	"time"
 
@@ -23,15 +25,41 @@ type fakeSweepStore struct {
 	condDeletes   int
 	// rcErrs fails the RC read for specific SHAs, modelling an entry that
 	// fails on every pass.
-	rcErrs map[[32]byte]error
+	rcErrs    map[[32]byte]error
+	scanCalls int
+	lastLimit int
 }
 
-func (f *fakeSweepStore) ScanGCQueue(_ context.Context, _, _ []byte) ([]s3keys.ChunkBlobGCQueueEntry, error) {
+// ScanGCQueue pages the fixture's entries, modelling a real store: the page
+// boundary is the index encoded in the continuation key, so a test can assert
+// the sweeper actually follows it rather than re-reading page one.
+func (f *fakeSweepStore) ScanGCQueue(
+	_ context.Context, startKey, _ []byte, limit int,
+) ([]s3keys.ChunkBlobGCQueueEntry, []byte, error) {
 	f.calls = append(f.calls, "scan")
+	f.scanCalls++
+	f.lastLimit = limit
 	if f.scanErr != nil {
-		return nil, f.scanErr
+		return nil, nil, f.scanErr
 	}
-	return f.entries, nil
+	from := 0
+	if len(startKey) > 0 {
+		if parsed, err := strconv.Atoi(string(startKey)); err == nil {
+			from = parsed
+		}
+	}
+	if from >= len(f.entries) {
+		return nil, nil, nil
+	}
+	to := from + limit
+	if to > len(f.entries) {
+		to = len(f.entries)
+	}
+	var next []byte
+	if to < len(f.entries) {
+		next = []byte(strconv.Itoa(to))
+	}
+	return f.entries[from:to], next, nil
 }
 
 func (f *fakeSweepStore) ReadChunkRefRC(_ context.Context, sha [32]byte) ([]byte, bool, error) {
@@ -43,10 +71,19 @@ func (f *fakeSweepStore) ReadChunkRefRC(_ context.Context, sha [32]byte) ([]byte
 	return v, ok, nil
 }
 
-func (f *fakeSweepStore) DeleteGCQueueEntryIfUnreferenced(_ context.Context, _ s3keys.ChunkBlobGCQueueEntry) error {
+// DeleteGCQueueEntryIfUnreferenced models the real contract: ONE txn removes
+// both the queue entry and the zero-count RC record, so a test can assert the
+// record does not survive reclamation.
+func (f *fakeSweepStore) DeleteGCQueueEntryIfUnreferenced(
+	_ context.Context, entry s3keys.ChunkBlobGCQueueEntry,
+) error {
 	f.calls = append(f.calls, "raft-conditional-delete")
 	f.condDeletes++
-	return f.condDeleteErr
+	if f.condDeleteErr != nil {
+		return f.condDeleteErr
+	}
+	delete(f.rc, entry.ContentSHA256)
+	return nil
 }
 
 func (f *fakeSweepStore) DeleteGCQueueEntry(_ context.Context, _ s3keys.ChunkBlobGCQueueEntry) error {
@@ -122,7 +159,21 @@ func newSweeperFixture(
 	return sweeper, local
 }
 
+func newObservedSweeperFixtureWithPageSize(t *testing.T, store *fakeSweepStore, pageSize int) (
+	*s3keys.ChunkBlobSweeper, *fakeLocalStore, *recordingSweepObserver,
+) {
+	t.Helper()
+	return newSweeperFixtureWith(t, store, pageSize)
+}
+
 func newObservedSweeperFixture(t *testing.T, store *fakeSweepStore) (
+	*s3keys.ChunkBlobSweeper, *fakeLocalStore, *recordingSweepObserver,
+) {
+	t.Helper()
+	return newSweeperFixtureWith(t, store, 0)
+}
+
+func newSweeperFixtureWith(t *testing.T, store *fakeSweepStore, pageSize int) (
 	*s3keys.ChunkBlobSweeper, *fakeLocalStore, *recordingSweepObserver,
 ) {
 	t.Helper()
@@ -137,6 +188,7 @@ func newObservedSweeperFixture(t *testing.T, store *fakeSweepStore) (
 		GracePeriod: time.Hour,
 		NowTS:       func() uint64 { return nowTS },
 		Observer:    observer,
+		PageSize:    pageSize,
 	})
 	require.NoError(t, err)
 	return sweeper, local, observer
@@ -413,4 +465,94 @@ func TestSweeperClearsTheQueueEntryWhenNoLocalBlobRemains(t *testing.T) {
 	require.Empty(t, local.attempts, "there is nothing to unlink")
 	require.Contains(t, store.calls, "raft-conditional-delete",
 		"the queue entry must still be cleared")
+}
+
+// TestSweeperPagesTheEligibleQueue pins the bounded scan.
+//
+// The scan API used to require the implementation to materialise the whole
+// eligible range in one slice before the sweeper could reclaim even the first
+// entry. An outage or a large object-deletion workload can leave millions of
+// expired entries, so that spike can OOM the process and leave the backlog
+// permanently untouched — the opposite of what a GC pass is for.
+func TestSweeperPagesTheEligibleQueue(t *testing.T) {
+	t.Parallel()
+
+	const total = 7
+	const pageSize = 3
+
+	entries := make([]s3keys.ChunkBlobGCQueueEntry, 0, total)
+	rc := make(map[[32]byte][]byte, total)
+	for i := range total {
+		sha := testSHA(fmt.Sprintf("queued-%d", i))
+		entry := queuedEntry(sha)
+		entries = append(entries, entry)
+		rc[sha] = s3keys.EncodeChunkRefRC(
+			s3keys.ChunkRefRC{Count: 0, QueuedAtTS: entry.CommitTS})
+	}
+	store := &fakeSweepStore{entries: entries, rc: rc}
+
+	sweeper, local, _ := newObservedSweeperFixtureWithPageSize(t, store, pageSize)
+	require.NoError(t, sweeper.SweepOnce(context.Background()))
+
+	require.Equal(t, pageSize, store.lastLimit, "the scan must be bounded")
+	require.Equal(t, 3, store.scanCalls,
+		"7 entries at a page size of 3 is two full pages, a partial page, and no more")
+	require.Len(t, local.deletes, total,
+		"every entry must still be reclaimed: paging changes the memory profile, "+
+			"not the work done")
+}
+
+// A non-positive page size must not make the scan return nothing and the
+// sweeper spin without reclaiming.
+func TestSweeperPageSizeDefaults(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("one")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 0, QueuedAtTS: entry.CommitTS}),
+		},
+	}
+	sweeper, local, _ := newObservedSweeperFixtureWithPageSize(t, store, 0)
+	require.NoError(t, sweeper.SweepOnce(context.Background()))
+
+	require.Equal(t, s3keys.DefaultChunkBlobGCPageSize, store.lastLimit)
+	require.Len(t, local.deletes, 1)
+}
+
+// TestSweeperReclaimDeletesTheZeroCountRecord documents the contract that stops
+// the RC keyspace growing without bound.
+//
+// The planner persists a count-zero RC record when the last reference drops, and
+// reclamation deleted only the queue entry and the local payload — so nothing
+// ever removed that key. A workload creating and deleting unique chunks left one
+// permanent Raft-replicated record per content hash, growing the live MVCC state
+// and every snapshot despite blob GC working correctly.
+//
+// The deletion is part of DeleteGCQueueEntryIfUnreferenced's single txn rather
+// than a second one: a crash between two txns would leave either a queue entry
+// for a blob with no RC record, or the same leak.
+func TestSweeperReclaimDeletesTheZeroCountRecord(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("reclaimed")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 0, QueuedAtTS: entry.CommitTS}),
+		},
+	}
+	sweeper, local, _ := newObservedSweeperFixture(t, store)
+	require.NoError(t, sweeper.SweepOnce(context.Background()))
+
+	require.Equal(t, [][32]byte{sha}, local.deletes)
+	require.Equal(t, 1, store.condDeletes,
+		"exactly one conditional txn must carry both the queue entry and the "+
+			"zero-count record")
+	require.NotContains(t, store.rc, sha,
+		"the zero-count reference record must not survive reclamation, or the RC "+
+			"keyspace grows without bound")
 }

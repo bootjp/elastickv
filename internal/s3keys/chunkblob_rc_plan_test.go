@@ -206,3 +206,82 @@ func TestPlanRequiresACommitTimestamp(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, s3keys.ErrInvalidChunkRefPlan))
 }
+
+// TestPlanAggregatesRepeatedSHAs is the duplicate-delta regression.
+//
+// Each iteration read the SAME `current` value, so two deltas of Added:1 for one
+// SHA each planned a write of Count:1 — the second overwriting the first —
+// instead of the Count:2 the txn requires. A chunk referenced twice in one
+// request would then be one reference short, and the next delete would drive it
+// to zero while a live chunkref still pointed at it.
+func TestPlanAggregatesRepeatedSHAs(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("referenced-twice")
+
+	t.Run("two adds in one txn count as two references", func(t *testing.T) {
+		t.Parallel()
+
+		plan, err := s3keys.PlanChunkRefRCMutations([]s3keys.ChunkRefDelta{
+			{ContentSHA256: sha, Added: 1},
+			{ContentSHA256: sha, Added: 1},
+		}, nil, planCommitTS)
+		require.NoError(t, err)
+		require.Len(t, plan, 1, "one SHA means one RC write, not one per delta")
+		requireRCValue(t, plan, sha, s3keys.ChunkRefRC{Count: 2})
+	})
+
+	t.Run("an add and a remove net out without queueing", func(t *testing.T) {
+		t.Parallel()
+
+		// Net zero against an existing count of 1: still reachable, so the
+		// blob must not be queued for GC.
+		plan, err := s3keys.PlanChunkRefRCMutations([]s3keys.ChunkRefDelta{
+			{ContentSHA256: sha, Added: 1},
+			{ContentSHA256: sha, Removed: 1},
+		}, map[[32]byte]s3keys.ChunkRefRC{sha: {Count: 1}}, planCommitTS)
+		require.NoError(t, err)
+		requireRCValue(t, plan, sha, s3keys.ChunkRefRC{Count: 1})
+		_, queued := findMutation(t, plan, s3keys.ChunkBlobGCQueueKey(planCommitTS, sha))
+		require.False(t, queued,
+			"a blob that is still reachable must not be queued for GC")
+	})
+
+	t.Run("the underflow check sees the aggregate, not one delta", func(t *testing.T) {
+		t.Parallel()
+
+		// Two removals against a count of 1: the first alone looks legal, so
+		// netting per delta would accept this. The aggregate is an underflow.
+		_, err := s3keys.PlanChunkRefRCMutations([]s3keys.ChunkRefDelta{
+			{ContentSHA256: sha, Removed: 1},
+			{ContentSHA256: sha, Removed: 1},
+		}, map[[32]byte]s3keys.ChunkRefRC{sha: {Count: 1}}, planCommitTS)
+		require.ErrorIs(t, err, s3keys.ErrChunkRefRCUnderflow)
+	})
+
+	t.Run("distinct SHAs keep their own plans in first-appearance order", func(t *testing.T) {
+		t.Parallel()
+
+		other := testSHA("other")
+		plan, err := s3keys.PlanChunkRefRCMutations([]s3keys.ChunkRefDelta{
+			{ContentSHA256: sha, Added: 1},
+			{ContentSHA256: other, Added: 1},
+			{ContentSHA256: sha, Added: 1},
+		}, nil, planCommitTS)
+		require.NoError(t, err)
+		requireRCValue(t, plan, sha, s3keys.ChunkRefRC{Count: 2})
+		requireRCValue(t, plan, other, s3keys.ChunkRefRC{Count: 1})
+	})
+
+	t.Run("a count overflow fails closed", func(t *testing.T) {
+		t.Parallel()
+
+		// Wrapping would understate the reference count and let a later delete
+		// reclaim a live blob.
+		_, err := s3keys.PlanChunkRefRCMutations([]s3keys.ChunkRefDelta{
+			{ContentSHA256: sha, Added: ^uint64(0)},
+			{ContentSHA256: sha, Added: 1},
+		}, nil, planCommitTS)
+		require.ErrorIs(t, err, s3keys.ErrInvalidChunkRefPlan)
+	})
+}
