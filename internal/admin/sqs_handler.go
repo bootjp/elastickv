@@ -270,6 +270,25 @@ func (h *SqsHandler) observePurgeRejection(name, outcome string) {
 	h.admin.ObserveAdminPurgeQueue(name, outcome)
 }
 
+// recordPurgeRejection counts AND audits a purge refused before the adapter.
+//
+// The same pairing the adapter uses, for the same reason: an exit that records
+// the counter and skips the audit leaves the §3.6 signal silent about exactly
+// the attempts an operator is looking for. Field names match the adapter's
+// record so both halves of admin.sqs.purge_queue parse identically.
+func (h *SqsHandler) recordPurgeRejection(r *http.Request, name, outcome string) {
+	h.observePurgeRejection(name, outcome)
+
+	accessKey := ""
+	if principal, ok := PrincipalFromContext(r.Context()); ok {
+		accessKey = principal.AccessKey
+	}
+	h.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin.sqs.purge_queue",
+		slog.String("access_key", accessKey),
+		slog.String("queue", name),
+		slog.String("outcome", outcome))
+}
+
 // observePeekRejection records a peek outcome decided in the handler.
 func (h *SqsHandler) observePeekRejection(name, outcome string) {
 	if h.admin == nil {
@@ -329,9 +348,39 @@ func (h *SqsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	segments, ok := h.parseSqsRouteSegments(w, escaped)
 	if !ok {
+		// §3.6 counts invalid paths as validation failures, and the route
+		// never reaches the per-operation handlers, so the outcome has to be
+		// attributed here. The path and method name the intended operation
+		// even when the path is malformed -- `/queues/orders//messages` with
+		// DELETE is a purge attempt whatever else is wrong with it.
+		h.observeRouteRejection(r, escaped, adminQueueOutcomeValidation)
 		return
 	}
 	h.dispatchSqsRoute(w, r, segments)
+}
+
+// observeRouteRejection records an outcome for a request rejected before the
+// router could identify its handler.
+//
+// The queue name is unusable by definition here, so the counter is recorded
+// with an empty queue label rather than a guess parsed out of a path the
+// validator just refused. The METHOD still identifies the operation, which is
+// what the §3.6 series is keyed on.
+func (h *SqsHandler) observeRouteRejection(r *http.Request, escaped, outcome string) {
+	if h.admin == nil {
+		return
+	}
+	if !strings.Contains(escaped, "/"+sqsSubResourceMessages) {
+		// Not a messages route, so neither purge nor peek: queue CRUD has no
+		// §3.6 counter of its own.
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		h.admin.ObserveAdminPurgeQueue("", outcome)
+	case http.MethodGet:
+		h.admin.ObserveAdminPeekQueue("", outcome)
+	}
 }
 
 // serveCollectionRoot handles the .../queues and .../queues/ paths
@@ -456,13 +505,29 @@ func (h *SqsHandler) dispatchAttributesResource(w http.ResponseWriter, r *http.R
 	}
 }
 
-// The handler-side half of the §3.6 outcome vocabulary. Kept to the two
-// values the handler can actually decide, and spelled identically to the
-// adapter's so a dashboard does not see two spellings of one outcome.
+// The handler-side half of the §3.6 outcome vocabulary, spelled identically
+// to the adapter's so a dashboard does not see two spellings of one outcome.
 const (
-	adminQueueOutcomeForbidden  = "forbidden"
-	adminQueueOutcomeValidation = "validation"
+	adminQueueOutcomeForbidden     = "forbidden"
+	adminQueueOutcomeValidation    = "validation"
+	adminQueueOutcomeInternalError = "internal_error"
 )
+
+// gateOutcome classifies why a principal gate refused.
+//
+// A boolean was not enough: a missing session principal is a WIRING fault that
+// writes 500 internal, but it was counted as `forbidden`, which both hid the
+// fault from the internal_error series and reported an authorization rejection
+// that never happened.
+type gateOutcome string
+
+const (
+	gateAllowed  gateOutcome = ""
+	gateForbid   gateOutcome = adminQueueOutcomeForbidden
+	gateInternal gateOutcome = adminQueueOutcomeInternalError
+)
+
+func (o gateOutcome) ok() bool { return o == gateAllowed }
 
 // isValidSqsPathSegment enforces the step-4 rules. Every segment is
 // rejected if it is empty, contains a percent sign (closes the
@@ -602,9 +667,9 @@ func (h *SqsHandler) handleSetAttributes(w http.ResponseWriter, r *http.Request,
 // TypeScript client adapter does the case translation at the
 // request boundary.
 func (h *SqsHandler) handlePeek(w http.ResponseWriter, r *http.Request, name string) {
-	principal, ok := h.principalForReadSensitive(w, r)
-	if !ok {
-		h.observePeekRejection(name, adminQueueOutcomeForbidden)
+	principal, outcome := h.gateReadSensitive(w, r)
+	if !outcome.ok() {
+		h.observePeekRejection(name, string(outcome))
 		return
 	}
 	opts, ok := parsePeekQueryParams(w, r)
@@ -663,13 +728,19 @@ func parsePeekQueryParams(w http.ResponseWriter, r *http.Request) (PeekMessageOp
 // 60-second rate limit surfaces as 429 with the Retry-After header
 // and a retry_after_seconds JSON body via writeQueuesError.
 func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name string) {
-	principal, ok := h.principalForWriteOnPurge(w, r)
-	if !ok {
-		h.observePurgeRejection(name, adminQueueOutcomeForbidden)
+	principal, outcome := h.gateWriteOnPurge(w, r)
+	if !outcome.ok() {
+		// Counted AND audited. The adapter owns the audit line for everything
+		// that reaches it, but a refusal here never gets there, so the
+		// operation-specific record has to come from this side -- otherwise an
+		// unauthorized purge attempt appears in the counter and in the generic
+		// HTTP audit, but never in admin.sqs.purge_queue, which is the record
+		// an operator greps.
+		h.recordPurgeRejection(r, name, string(outcome))
 		return
 	}
 	if strings.TrimSpace(name) == "" {
-		h.observePurgeRejection(name, adminQueueOutcomeValidation)
+		h.recordPurgeRejection(r, name, adminQueueOutcomeValidation)
 		writeJSONError(w, http.StatusBadRequest, "invalid_queue_name", "queue name is required")
 		return
 	}
@@ -681,52 +752,55 @@ func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name st
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// principalForReadSensitive gates peek (and any future read endpoint
-// that surfaces stored payload content). Mirrors principalForWrite's
-// live-role re-check pattern but accepts the lower RoleReadOnly
-// tier. List / Describe themselves stay on the looser session-auth
-// gate because their output is queue metadata already shown on the
-// SPA's queue list page; peek diverges because the payload is the
-// stored message bodies themselves (Codex r9 P1 on the design doc
-// flagged the security-class distinction).
-func (h *SqsHandler) principalForReadSensitive(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
+// gateReadSensitive gates peek (and any future read endpoint that surfaces
+// stored payload content). Mirrors gateWrite's live-role re-check pattern but
+// accepts the lower RoleReadOnly tier. List / Describe themselves stay on the
+// looser session-auth gate because their output is queue metadata already shown
+// on the SPA's queue list page; peek diverges because the payload is the stored
+// message bodies themselves, which is a different security class.
+//
+// The refusal is CLASSIFIED rather than a bare false, so a missing principal is
+// counted as the wiring fault it is rather than as an authorization rejection.
+func (h *SqsHandler) gateReadSensitive(
+	w http.ResponseWriter, r *http.Request,
+) (AuthPrincipal, gateOutcome) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
 		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
-		return AuthPrincipal{}, false
+		return AuthPrincipal{}, gateInternal
 	}
 	if h.roles != nil {
 		live, exists := h.roles.LookupRole(principal.AccessKey)
 		if !exists {
 			writeJSONError(w, http.StatusForbidden, "forbidden",
 				"this access key is not authorised to read queue contents")
-			return AuthPrincipal{}, false
+			return AuthPrincipal{}, gateForbid
 		}
 		if !live.AllowsRead() {
 			writeJSONError(w, http.StatusForbidden, "forbidden",
 				"this access key is not authorised to read queue contents")
-			return AuthPrincipal{}, false
+			return AuthPrincipal{}, gateForbid
 		}
 		principal.Role = live
 	} else if !principal.Role.AllowsRead() {
 		writeJSONError(w, http.StatusForbidden, "forbidden",
 			"this access key is not authorised to read queue contents")
-		return AuthPrincipal{}, false
+		return AuthPrincipal{}, gateForbid
 	}
-	return principal, true
+	return principal, gateAllowed
 }
 
-// principalForWriteOnPurge wraps principalForWrite with the verb the
-// purge handler wants on rejection messages. Without this, an
-// operator clicking Purge sees a 403 body saying "not authorised to
-// delete queues" (the SqsHandler's principalForWrite was authored
-// before the purge handler existed). Claude r1 caught the misleading
-// wording.
-func (h *SqsHandler) principalForWriteOnPurge(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
-	return h.principalForWrite(w, r, "purge messages")
+// gateWriteOnPurge wraps gateWrite with the verb the purge handler wants on
+// rejection messages. Without it, an operator clicking Purge sees a 403 body
+// saying "not authorised to delete queues", because the shared write gate
+// predates the purge handler.
+// gateWriteOnPurge gates purge, with the refusal classified so the caller can
+// count and audit the right outcome.
+func (h *SqsHandler) gateWriteOnPurge(w http.ResponseWriter, r *http.Request) (AuthPrincipal, gateOutcome) {
+	return h.gateWrite(w, r, "purge messages")
 }
 
-// principalForWrite resolves the live role from the RoleStore (when
+// gateWrite resolves the live role from the RoleStore (when
 // configured), gates the request, and returns the principal with the
 // **live** role overridden in place — so the role that flows downstream
 // to the adapter is the one the operator currently has, not whatever
@@ -749,13 +823,24 @@ func (h *SqsHandler) principalForWriteOnPurge(w http.ResponseWriter, r *http.Req
 // by indirection (forbidden response is the same shape regardless
 // of leadership state).
 func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request, action string) (AuthPrincipal, bool) {
+	principal, outcome := h.gateWrite(w, r, action)
+	return principal, outcome.ok()
+}
+
+// gateWrite is principalForWrite with the refusal classified. The 500 path is
+// reported as internal_error rather than forbidden: counting a wiring fault as
+// an authorization rejection hides it from the internal_error series and
+// reports a denial that never happened.
+func (h *SqsHandler) gateWrite(
+	w http.ResponseWriter, r *http.Request, action string,
+) (AuthPrincipal, gateOutcome) {
 	principal, ok := PrincipalFromContext(r.Context())
 	if !ok {
 		// SessionAuth runs before this handler, so a missing
 		// principal is a wiring bug. 500 rather than 401 since
 		// 401 would be misleading — the request was authenticated.
 		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
-		return AuthPrincipal{}, false
+		return AuthPrincipal{}, gateInternal
 	}
 	if h.roles != nil {
 		live, exists := h.roles.LookupRole(principal.AccessKey)
@@ -765,12 +850,12 @@ func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request, a
 			// the JWT claimed.
 			writeJSONError(w, http.StatusForbidden, "forbidden",
 				"this access key is not authorised to "+action)
-			return AuthPrincipal{}, false
+			return AuthPrincipal{}, gateForbid
 		}
 		if !live.AllowsWrite() {
 			writeJSONError(w, http.StatusForbidden, "forbidden",
 				"this access key is not authorised to "+action)
-			return AuthPrincipal{}, false
+			return AuthPrincipal{}, gateForbid
 		}
 		// Forward the live role downstream so the adapter
 		// re-check sees the same role the handler gated on.
@@ -781,9 +866,9 @@ func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request, a
 	} else if !principal.Role.AllowsWrite() {
 		writeJSONError(w, http.StatusForbidden, "forbidden",
 			"this access key is not authorised to "+action)
-		return AuthPrincipal{}, false
+		return AuthPrincipal{}, gateForbid
 	}
-	return principal, true
+	return principal, gateAllowed
 }
 
 // writeQueuesError translates a QueuesSource error onto an HTTP
