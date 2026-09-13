@@ -286,3 +286,62 @@ func TestWriteBudgetReachesExhaustedAtADegenerateCeiling(t *testing.T) {
 	require.Equal(t, encryption.WriteBudgetAllow, b.Record(1))
 	require.Equal(t, encryption.WriteBudgetExhausted, b.Record(1))
 }
+
+// TestWriteBudgetNilReceiverAgreesAcrossItsAPIs pins that the unwired state
+// reads the same way from every method.
+//
+// Record returns Allow on a nil budget, but Remaining returned 0 — which this
+// type documents as "rotation is due". Any admission check or dashboard keyed
+// on `Remaining(k) == 0` therefore demanded rotation on every unconfigured node
+// forever, while the write verdict said Allow. The two APIs disagreed about the
+// same receiver.
+func TestWriteBudgetNilReceiverAgreesAcrossItsAPIs(t *testing.T) {
+	t.Parallel()
+
+	var b *encryption.WriteBudget
+
+	require.True(t, b.Record(1).Allowed(), "an unwired budget does not refuse writes")
+	require.Equal(t, encryption.RemainingUnlimited, b.Remaining(1),
+		"so it must not report rotation due either")
+	require.NotZero(t, b.Remaining(1),
+		"zero is the rotation-due signal and must not double as not-configured")
+	require.Zero(t, b.Used(1))
+}
+
+// TestWriteBudgetZeroValueIsUsable covers a WriteBudget declared or embedded
+// without NewWriteBudget.
+//
+// Record assigned into a nil counters map and panicked, which is surprising
+// precisely because this type tolerates a nil receiver and its other methods
+// tolerate a zero value. The zero value now behaves as the §5.2 default rather
+// than as a ceiling of zero, which would have refused the first write.
+func TestWriteBudgetZeroValueIsUsable(t *testing.T) {
+	t.Parallel()
+
+	t.Run("Record does not panic and applies the default ceiling", func(t *testing.T) {
+		t.Parallel()
+
+		var b encryption.WriteBudget
+		require.True(t, b.Record(1).Allowed(),
+			"a zero-value budget must not refuse the first write")
+		require.Equal(t, uint64(1), b.Used(1))
+	})
+
+	t.Run("Remaining reports the default threshold", func(t *testing.T) {
+		t.Parallel()
+
+		var b encryption.WriteBudget
+		var configured = encryption.NewWriteBudget(0)
+		require.Equal(t, configured.Remaining(1), b.Remaining(1),
+			"the zero value must agree with an explicitly default-constructed budget")
+	})
+
+	t.Run("an embedded zero value works too", func(t *testing.T) {
+		t.Parallel()
+
+		type holder struct{ budget encryption.WriteBudget }
+		var h holder
+		require.True(t, h.budget.Record(9).Allowed())
+		require.Equal(t, uint64(1), h.budget.Used(9))
+	})
+}

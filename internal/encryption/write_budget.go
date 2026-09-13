@@ -142,6 +142,8 @@ func (b *WriteBudget) Record(keyID uint32) WriteBudgetVerdict {
 	if b == nil {
 		return WriteBudgetAllow
 	}
+	ceiling := b.ceilingOrDefault()
+	threshold := b.refusalThresholdOrDefault()
 	counter := b.counterFor(keyID)
 	// The slot is RESERVED with CAS rather than incremented after the
 	// fact. Load-then-Add lets every writer that read a count below the
@@ -153,10 +155,10 @@ func (b *WriteBudget) Record(keyID uint32) WriteBudgetVerdict {
 	// step, so the counter only ever records writes that were allowed.
 	for {
 		used := counter.Load()
-		if used >= b.ceiling {
+		if used >= ceiling {
 			return WriteBudgetExhausted
 		}
-		if used >= b.threshold {
+		if used >= threshold {
 			return WriteBudgetRotate
 		}
 		if counter.CompareAndSwap(used, used+1) {
@@ -179,17 +181,52 @@ func (b *WriteBudget) Used(keyID uint32) uint64 {
 	return counter.Load()
 }
 
-// Remaining reports how many writes keyID may still issue before the
-// refusal threshold. Zero means rotation is due.
+// RemainingUnlimited is what Remaining reports for a budget that is not
+// wired, so a caller testing `Remaining(k) == 0` cannot read "no budget
+// configured" as "rotation due".
+//
+// Zero was wrong for that state, and wrong in the dangerous direction:
+// Record on a nil budget returns Allow, so the two APIs disagreed and any
+// admission or dashboard check keyed on Remaining would demand rotation on
+// every unconfigured node forever.
+const RemainingUnlimited = ^uint64(0)
+
+// Remaining reports how many writes keyID may still issue before the refusal
+// threshold. Zero means rotation is due; RemainingUnlimited means no budget
+// is configured, matching Record's Allow on the same receiver.
 func (b *WriteBudget) Remaining(keyID uint32) uint64 {
 	if b == nil {
-		return 0
+		return RemainingUnlimited
 	}
+	threshold := b.refusalThresholdOrDefault()
 	used := b.Used(keyID)
-	if used >= b.threshold {
+	if used >= threshold {
 		return 0
 	}
-	return b.threshold - used
+	return threshold - used
+}
+
+// refusalThresholdOrDefault is the threshold, derived on demand for a
+// zero-value budget.
+//
+// A WriteBudget declared or embedded without NewWriteBudget has a zero
+// threshold and a zero ceiling, which would refuse the first write. Treating
+// the zero value as "the §5.2 default" matches what every other method on this
+// type does with an unconfigured receiver: behave sanely rather than punish the
+// caller for a construction detail.
+func (b *WriteBudget) refusalThresholdOrDefault() uint64 {
+	if b.threshold != 0 {
+		return b.threshold
+	}
+	return refusalThreshold(b.ceilingOrDefault())
+}
+
+// ceilingOrDefault is the ceiling, defaulted for a zero-value budget.
+func (b *WriteBudget) ceilingOrDefault() uint64 {
+	if b.ceiling != 0 {
+		return b.ceiling
+	}
+	return DefaultWriteBudgetCeiling
 }
 
 // Forget drops the counter for a retired DEK.
@@ -222,6 +259,14 @@ func (b *WriteBudget) counterFor(keyID uint32) *atomic.Uint64 {
 	defer b.mu.Unlock()
 	if counter, ok := b.counters[keyID]; ok {
 		return counter
+	}
+	if b.counters == nil {
+		// A zero-value budget -- declared or embedded rather than built by
+		// NewWriteBudget -- reaches here with a nil map, and assigning into
+		// one panics. Surprising precisely because every other method on this
+		// type tolerates an unconfigured receiver, so it is initialised here
+		// instead of panicking on a construction detail.
+		b.counters = make(map[uint32]*atomic.Uint64, 1)
 	}
 	counter = &atomic.Uint64{}
 	b.counters[keyID] = counter
