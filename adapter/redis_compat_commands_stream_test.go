@@ -208,17 +208,32 @@ func TestRedis_StreamXReadBlockChecksWrongTypeAtDeadline(t *testing.T) {
 		streams []redis.XStream
 		err     error
 	}
+	// The block window has to be long enough that waiter registration plus the
+	// SET both land well inside it. The wrong-type check runs when the
+	// deadline fires, so a SET that arrives after it gets the ordinary
+	// block-timeout nil instead -- which is what this test then reports as
+	// `"redis: nil" does not contain "WRONGTYPE"`. At a 2s block that budget
+	// was shared with a registration wait also bounded at 2s, so a loaded
+	// machine could consume the whole window before the SET was sent.
+	const (
+		blockWindow       = 6 * time.Second
+		waiterRegistering = time.Second
+	)
+
 	resultCh := make(chan readResult, 1)
 	go func() {
 		streams, err := rdbReader.XRead(ctx, &redis.XReadArgs{
 			Streams: []string{key, "$"},
 			Count:   1,
-			Block:   2 * time.Second,
+			Block:   blockWindow,
 		}).Result()
 		resultCh <- readResult{streams: streams, err: err}
 	}()
 
-	requireStreamWaiterRegistered(t, nodes[0].redisServer.streamWaiters, key)
+	// Bounded well below the block window, and fatal on its own, so a slow
+	// registration fails as "the waiter never appeared" rather than surfacing
+	// later as a confusing nil read.
+	requireStreamWaiterRegistered(t, nodes[0].redisServer.streamWaiters, key, waiterRegistering)
 	require.NoError(t, rdbWriter.Set(ctx, key, "now-a-string", 0).Err())
 
 	select {
@@ -226,12 +241,20 @@ func TestRedis_StreamXReadBlockChecksWrongTypeAtDeadline(t *testing.T) {
 		require.Error(t, res.err)
 		require.Contains(t, res.err.Error(), "WRONGTYPE")
 		require.Empty(t, res.streams)
-	case <-time.After(4 * time.Second):
+	case <-time.After(blockWindow + 2*time.Second):
 		t.Fatal("XREAD BLOCK did not return after wrong-type overwrite")
 	}
 }
 
-func requireStreamWaiterRegistered(t *testing.T, reg *keyWaiterRegistry, key string) {
+// requireStreamWaiterRegistered waits for key's blocking reader to appear.
+//
+// The timeout is a parameter because a caller whose assertion depends on acting
+// BEFORE the reader's block deadline must bound this well under that deadline;
+// sharing one budget between the two is how a slow machine turned a wrong-type
+// assertion into a plain block timeout.
+func requireStreamWaiterRegistered(
+	t *testing.T, reg *keyWaiterRegistry, key string, timeout time.Duration,
+) {
 	t.Helper()
 	require.Eventually(t, func() bool {
 		if reg == nil {
@@ -240,7 +263,8 @@ func requireStreamWaiterRegistered(t *testing.T, reg *keyWaiterRegistry, key str
 		reg.mu.Lock()
 		defer reg.mu.Unlock()
 		return len(reg.waiters[key]) > 0
-	}, 2*time.Second, 10*time.Millisecond)
+	}, timeout, 10*time.Millisecond,
+		"stream waiter for %q never registered within %s", key, timeout)
 }
 
 // TestRedis_StreamCommandsRejectWrongType locks down the wrongType
