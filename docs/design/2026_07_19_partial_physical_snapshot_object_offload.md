@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1/M2 implemented; M3 pending
+Status: Partial — M0/M1/M2 implemented; M3 retention/GC implemented, remaining M3 items pending
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-07-23
@@ -48,7 +48,7 @@ The M1 object-store-neutral substrate now adds:
 - `cmd/elastickv-snapshot-offload publish` and `restore` for local and
   S3-backed operator workflows.
 
-The runtime scheduler and retention/GC remain pending.
+The runtime scheduler remains pending. Retention/GC is implemented per §5; the remaining M3 items (restore drills, corruption tests, multi-node acceptance, operator documentation) are pending.
 
 ## 2. Safety boundary
 
@@ -121,6 +121,37 @@ window. GC runs in two phases:
 2. after a grace period, rebuild the live payload SHA set from all remaining
    manifests and delete only payload objects with no live reference.
 
+Payload reclamation is **two-pass mark-and-sweep**. A pass that finds a
+payload unreferenced and past its grace *marks* it; only a later pass
+that finds the same object unchanged, with the mark aged past
+`MinMarkAge`, deletes it.
+
+The second pass is required because a publisher reusing a
+content-addressed payload refreshes it by rewriting **identical
+bytes**, and no conditional-delete primitive on a general-purpose S3
+bucket detects that: `If-Match` compares a content-derived ETag, which
+identical bytes leave unchanged, and `IfMatchLastModifiedTime` /
+`IfMatchSize` are directory-buckets only. A single-pass GC could
+therefore delete a payload between the publisher refreshing it and its
+manifest committing. Spanning two passes means any publish shorter than
+the inter-pass interval is observed — through the refreshed mtime or
+the newly committed manifest — before the sweep. `MinMarkAge` must
+therefore exceed the longest plausible publish.
+
+The mark state is in-memory and per-process. Losing it on restart
+delays reclamation by one pass and never advances it. Marks for objects
+absent from a pass's (complete) listing are pruned, so external
+reclamation cannot leak them.
+
+**Accepted residual.** A refresh that begins *inside* the sweep pass —
+after the revalidation and head, before the delete — is still not
+observed, because no general-purpose-bucket precondition can detect a
+content-preserving rewrite. Closing that last window needs a claim or
+lease protocol and a new key prefix; two-pass mark-and-sweep was chosen
+over that on the grounds that a publish completing entirely within the
+gap between two adjacent object-store calls is not a realistic
+scenario, while the layout change is a permanent cost.
+
 Malformed manifests fail closed: they are reported and excluded from both
 automatic manifest deletion and payload reclamation. Listing failure,
 pagination failure, or an incomplete group scan performs no deletes. This
@@ -152,6 +183,16 @@ credentials provider, schedule, retention count/window, upload concurrency,
 and server-side encryption mode. Static secrets must use file or environment
 providers and must not appear in process arguments or manifests.
 
+**Versioned buckets.** Retention deletes by key, not by version. On a
+bucket with S3 versioning enabled a keyed delete only writes a delete
+marker, so the bytes persist as a noncurrent version that later
+listings cannot see: GC reports successful reclamation while storage
+grows without bound. A versioned backup bucket therefore requires a
+noncurrent-version expiration lifecycle rule. Whether to instead
+enumerate and delete versions directly, or to refuse versioned buckets
+at startup, is an open operational decision tracked with the remaining
+M3 work.
+
 Storage-envelope encryption protects values but not all physical keys and
 metadata. The external bucket therefore requires private ACLs, TLS, and
 server-side encryption (SSE-S3 or SSE-KMS). Anonymous reads and writes are a
@@ -165,7 +206,7 @@ permissions below the configured prefix.
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Not yet wired into `main.go` — the runtime flags are M3. |
-| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Pending |
+| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: the §5 two-phase retention/GC (`retention.go`) with `RetentionStore` list/delete on both the local and S3 stores. Restore corruption drills are implemented (`restore_corruption_test.go`: truncated, over-length, missing and tampered-descriptor payloads, plus a positive restore-into-fresh-dir drill). Multi-node acceptance, operational documentation, and the §7 versioned-bucket decision remain pending. |
 
 The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to

@@ -23,6 +23,12 @@ var (
 	ErrObjectConflict = errors.New("snapshot offload: object conflict")
 	ErrObjectNotFound = errors.New("snapshot offload: object not found")
 
+	// ErrObjectModified is returned by DeleteObjectIfUnmodified when
+	// the object changed after the caller validated it. For retention
+	// this is not a failure: it means a concurrent publish claimed the
+	// payload, so the correct response is to leave it alone.
+	ErrObjectModified = errors.New("snapshot offload: object modified since validation")
+
 	// ErrNoPersistedSnapshot reports that the LOCAL data dir has no
 	// persisted snapshot yet. It is deliberately distinct from
 	// ErrObjectNotFound: a young group that has not snapshotted is a
