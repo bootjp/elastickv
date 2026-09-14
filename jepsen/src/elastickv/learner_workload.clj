@@ -72,6 +72,18 @@
 ;; Pure history analysis
 ;; ---------------------------------------------------------------------------
 
+(defn successful-promotions
+  "Promotions that reported :ok.
+
+  The coverage gate counts these, not every completion: a history with a
+  :fail or :info promotion had a positive promotion count while every safety
+  predicate -- which all filter to :ok -- saw nothing, so a run in which no
+  learner was ever promoted was reported valid."
+  [history]
+  (->> history
+       (filter #(and (= :promote-learner (:f %)) (= :ok (:type %))))
+       vec))
+
 (defn completed-promotions
   "Every :promote-learner COMPLETION.
 
@@ -156,12 +168,24 @@
        (sort-by :time)
        last))
 
-(defn- first-ok-read-after
+(defn- first-ok-read-invoked-after
+  "The first successful read whose INVOCATION happened after t.
+
+  Invocation, not completion: with concurrent workers a read invoked before the
+  promotion can linearize against the old value and return after it. Selecting
+  on completion time picks up exactly that read and reports the acknowledged
+  write as lost, so the pairing has to start from the invoke event."
   [history t]
-  (->> history
-       (filter #(and (= :read (:f %)) (= :ok (:type %)) (> (:time %) t)))
-       (sort-by :time)
-       first))
+  (let [invoked-after (->> history
+                           (filter #(and (= :read (:f %)) (= :invoke (:type %))
+                                         (> (:time %) t)))
+                           (map :process)
+                           set)]
+    (->> history
+         (filter #(and (= :read (:f %)) (= :ok (:type %)) (> (:time %) t)
+                       (contains? invoked-after (:process %))))
+         (sort-by :time)
+         first)))
 
 (defn- writes-invoked-between
   [history from to]
@@ -191,7 +215,7 @@
        (keep (fn [promotion]
                (let [t     (:time promotion)
                      write (last-ok-write-before history t)
-                     read  (first-ok-read-after history t)]
+                     read  (first-ok-read-invoked-after history t)]
                  ;; A read's :value is the map {:lease? b :value n}, so the
                  ;; register value has to be unwrapped before comparing it
                  ;; with the write's scalar.
@@ -203,6 +227,18 @@
                      {:promotion      (:value promotion)
                       :acked-write    (:value write)
                       :observed-after observed})))))
+       vec))
+
+(defn promotions-without-post-read-evidence
+  "Successful promotions with no unambiguous successful read after them.
+
+  lost-writes-across-promotions SKIPS a promotion it cannot pair with a later
+  read, which happens when catch-up finishes near the time limit. Counting
+  reads anywhere in the history hid that: the run passed having observed no
+  post-promotion state at all."
+  [history]
+  (->> (successful-promotions history)
+       (remove #(some? (first-ok-read-invoked-after history (:time %))))
        vec))
 
 (defn learner-partition-windows
@@ -223,6 +259,40 @@
                 (let [t (:time start)]
                   [t (or (first (filter #(> % t) stops)) Long/MAX_VALUE)])))
          vec)))
+
+;; A lease read served from the leader's lease answers in about the time of a
+;; local Pebble lookup. Losing the fast path makes it take a Raft round trip
+;; instead, which is a different order of magnitude -- so a bound well above
+;; normal service time and well below a round trip separates them without
+;; being sensitive to ordinary jitter.
+(def default-lease-read-budget-ms 250)
+
+(defn slow-lease-reads
+  "Lease reads that SUCCEEDED but took longer than the budget while only
+  learners were partitioned.
+
+  Failures alone cannot detect this regression. A Redis GET calls
+  LeaseReadForKeyThrough, and when the lease is unavailable kv/raft_engine.go
+  transparently falls back to LinearizableRead -- so with the voters connected
+  the read still succeeds, and a failure-only check stays empty through exactly
+  the quorum-ack regression it claims to catch. What changes is the LATENCY, so
+  that is what is measured."
+  ([history] (slow-lease-reads history default-lease-read-budget-ms))
+  ([history budget-ms]
+   (let [windows (learner-partition-windows history)]
+     (if (empty? windows)
+       []
+       (->> history
+            (filter #(and (= :read (:f %))
+                          (= :ok (:type %))
+                          (true? (:lease? (:value %)))
+                          (number? (:latency-ms (:value %)))
+                          (> (:latency-ms (:value %)) budget-ms)))
+            (filter (fn [op]
+                      (some (fn [[start stop]]
+                              (and (>= (:time op) start) (<= (:time op) stop)))
+                            windows)))
+            vec)))))
 
 (defn learner-partition-read-failures
   "Lease reads that failed while only learners were partitioned.
@@ -265,12 +335,14 @@
   []
   (reify checker/Checker
     (check [_ _test history _opts]
-      (let [promotions   (completed-promotions history)
+      (let [promotions   (successful-promotions history)
             premature    (premature-promotions history)
             unmeasurable (unmeasurable-promotions history)
             unsampled    (promotions-without-a-sampled-target history)
+            no-evidence  (promotions-without-post-read-evidence history)
             lost         (lost-writes-across-promotions history)
             stalls       (learner-partition-read-failures history)
+            slow         (slow-lease-reads history)
             writes       (count (filter #(and (= :write (:f %)) (= :ok (:type %))) history))
             reads        (count (filter #(and (= :read (:f %)) (= :ok (:type %))) history))]
         (when (seq premature)
@@ -283,16 +355,20 @@
                                     (empty? premature)
                                     (empty? unmeasurable)
                                     (empty? unsampled)
+                                    (empty? no-evidence)
                                     (empty? lost)
-                                    (empty? stalls))
+                                    (empty? stalls)
+                                    (empty? slow))
          :promotions           (count promotions)
          :ok-writes            writes
          :ok-reads             reads
          :premature-promotions premature
          :unmeasurable-promotions unmeasurable
          :unsampled-targets    unsampled
+         :promotions-without-post-read-evidence no-evidence
          :lost-writes          lost
-         :learner-read-failures stalls}))))
+         :learner-read-failures stalls
+         :slow-lease-reads     slow}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Client
@@ -340,12 +416,25 @@
                           {:target target :applied applied}))
           :else (do (Thread/sleep (long catch-up-poll-ms)) (recur)))))))
 
-(defrecord LearnerClient [node->port leader-addr conn]
+(defn- redis-conn
+  [node->port test node]
+  (let [port (get node->port node 6379)
+        host (or (:redis-host test) (name node))]
+    {:pool {} :spec {:host host :port port :timeout-ms 10000}}))
+
+(defrecord LearnerClient [node->port leader-addr conn leaseConn]
   client/Client
   (open! [this test node]
-    (let [port (get node->port node 6379)
-          host (or (:redis-host test) (name node))]
-      (assoc this :conn {:pool {} :spec {:host host :port port :timeout-ms 10000}})))
+    (assoc this
+           :conn (redis-conn node->port test node)
+           ;; Lease probes go to a CONNECTED VOTER, not to this worker's own
+           ;; node. A GET issued through the isolated learner has to proxy to
+           ;; the leader across the partition and can fail even when the
+           ;; leader's lease is perfectly healthy -- the checker would then
+           ;; read client placement as a quorum-ack regression. Ordinary
+           ;; register traffic stays distributed; only the lease measurement
+           ;; is pinned.
+           :leaseConn (redis-conn node->port test (first (:nodes test)))))
 
   (close! [this _test] this)
   (setup! [_this _test])
@@ -358,16 +447,29 @@
           addr   (or leader-addr (str leader ":50051"))]
       (try
         (case (:f op)
-          :write (do (wcar conn (car/set register-key (:value op)))
-                     (assoc op :type :ok))
+          ;; The reply is CHECKED. Carmine returns nil or a Throwable value on
+          ;; missing, protocol and some error-reply paths, and treating those
+          ;; as acknowledged would let the checker call an unconfirmed write
+          ;; durable -- producing either a false loss or a false preservation
+          ;; later. Anything that is not "OK" is :info (indeterminate), which
+          ;; is what an unacknowledged write actually is.
+          :write (let [reply (wcar conn (car/set register-key (:value op)))]
+                   (if (= "OK" (some-> reply str))
+                     (assoc op :type :ok)
+                     (assoc op :type :info :error {:unexpected-reply reply})))
 
-          ;; :lease? marks the read as one the leader may serve from its
-          ;; lease, which is the path a learner wrongly counted in
-          ;; quorumAckTracker would break.
-          :read (let [v (wcar conn (car/get register-key))]
+          ;; :lease? marks the read as one the leader may serve from its lease,
+          ;; which is the path a learner wrongly counted in quorumAckTracker
+          ;; would break. :latency-ms is recorded because losing the fast path
+          ;; does not fail the read -- the engine falls back to
+          ;; LinearizableRead -- it makes it take a Raft round trip.
+          :read (let [started (System/nanoTime)
+                      v       (wcar (:leaseConn this) (car/get register-key))
+                      elapsed (/ (double (- (System/nanoTime) started)) 1e6)]
                   (assoc op :type :ok
-                            :value {:lease? true
-                                    :value  (when v (Long/parseLong (str v)))}))
+                            :value {:lease?     true
+                                    :latency-ms elapsed
+                                    :value      (when v (Long/parseLong (str v)))}))
 
           :add-learner
           (let [candidate (name (:value op))]
@@ -392,7 +494,15 @@
                               :target-source   :leader-commit-index
                               :match           applied})))
         (catch Exception e
-          (assoc op :type :fail :error (.getMessage e)))))))
+          ;; A failed READ keeps its :lease? marker. Returning the bare op left
+          ;; every real read exception without it, so
+          ;; learner-partition-read-failures filtered them all out and the
+          ;; lease regression could never invalidate a run.
+          (if (= :read (:f op))
+            (assoc op :type :fail
+                      :value {:lease? true}
+                      :error (.getMessage e))
+            (assoc op :type :fail :error (.getMessage e))))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Nemesis
@@ -403,22 +513,49 @@
 
   That is the shape the quorum property needs: voters retain quorum among
   themselves, so anything that degrades must be attributable to the learner
-  being counted where it should not be."
+  being counted where it should not be.
+
+  Implemented directly rather than via nemesis/partitioner, which dispatches on
+  :start and :stop. Feeding it :start-partition / :stop-partition matched no
+  branch, so the learner was never isolated and the partition workload ran with
+  no fault at all -- and its :value would have been taken as the grudge itself,
+  which is not one."
   [nodes]
-  (let [learner (learner-candidate nodes)]
-    (nemesis/partitioner
-      (fn [_test _nodes]
-        (nemesis/complete-grudge [[learner] (voter-nodes nodes)])))))
+  (let [learner (learner-candidate nodes)
+        grudge  (nemesis/complete-grudge [[learner] (voter-nodes nodes)])]
+    (reify nemesis/Nemesis
+      (setup! [this test]
+        (net/heal! (:net test) test)
+        this)
+
+      (invoke! [_this test op]
+        (case (:f op)
+          :start-partition (do (net/drop-all! test grudge)
+                               (assoc op :value {:scope    :learners-only
+                                                 :isolated [learner]}))
+          :stop-partition  (do (net/heal! (:net test) test)
+                               (assoc op :value {:scope :learners-only
+                                                 :healed true}))
+          (assoc op :value :unsupported)))
+
+      (teardown! [_this test]
+        (net/heal! (:net test) test)))))
 
 (defn learner-nemesis-generator
-  "start-partition / stop-partition pairs, each start tagged :learners-only so
-  the checker can pair it with its own stop."
+  "ONE start-partition / stop-partition pair, tagged :learners-only.
+
+  Not a cycle. The promotion converts the candidate into a voter, so a later
+  window carrying the same :learners-only label is isolating a node that now
+  counts toward quorum: later failures or latency would be attributed to
+  learner handling, and on a small cluster the isolation could remove a
+  legitimate voter quorum outright. The single window is opened before the
+  promotion phase and closed before it runs."
   []
   ;; A seq is a generator in Jepsen 0.3.x; gen/seq was removed.
-  (cycle [(gen/sleep 5)
-          {:type :info :f :start-partition :value {:scope :learners-only}}
-          (gen/sleep 10)
-          {:type :info :f :stop-partition :value {:scope :learners-only}}]))
+  [(gen/sleep 2)
+   {:type :info :f :start-partition}
+   (gen/sleep 4)
+   {:type :info :f :stop-partition}])
 
 ;; ---------------------------------------------------------------------------
 ;; Generator
@@ -466,6 +603,10 @@
                           (repeat (count nodes) redis-port) nodes))]
      {:name        "elastickv-learner"
       :nodes       nodes
+      ;; Carried into the test map so LearnerClient.open! can honour it.
+      ;; Without this a programmatic caller could not override the host, and
+      ;; local or port-mapped runs tried to resolve each logical node name.
+      :redis-host  (:redis-host opts)
       :db          db
       :os          (if local? os/noop debian/os)
       :net         (if local? net/noop net/iptables)
@@ -475,7 +616,7 @@
                           (when local? {:dummy true})
                           (:ssh opts))
       :remote      control/ssh
-      :client      (->LearnerClient ports nil nil)
+      :client      (->LearnerClient ports nil nil nil)
       :nemesis     (if local? nemesis/noop (learner-partition-nemesis nodes))
       ;; Jepsen 0.3.x cannot fressian-serialize some final generators.
       :final-generator nil
@@ -492,10 +633,23 @@
       :grpc-port   grpc-port
       :ports       ports})))
 
+(defn prepare-learner-opts
+  "Normalise parsed CLI options for elastickv-learner-test.
+
+  Not `identity`. run-workload! hands the raw parsed map straight through, and
+  common-cli-opts leaves :nodes as the comma-separated STRING it came from -- so
+  the constructor treated a string as a node collection: learner-candidate
+  returned its last character, the port map was keyed by characters, and the
+  resulting Jepsen :nodes was invalid. parse-common-opts splits it, and the host
+  override is copied to :redis-host so the client can honour it."
+  [options]
+  (let [options (cli/parse-common-opts options nil)]
+    (assoc options :redis-host (:host options))))
+
 (defn -main
   "Runnable entry point. Without one, neither invocation form could select
   this workload: the namespace had no -main, and the shared dispatcher in
   elastickv.jepsen-test neither required it nor listed it, so passing its
   name fell through to the Redis test."
   [& args]
-  (cli/run-workload! args cli/common-cli-opts identity elastickv-learner-test))
+  (cli/run-workload! args cli/common-cli-opts prepare-learner-opts elastickv-learner-test))

@@ -11,7 +11,8 @@
             [elastickv.db :as ekdb]
             [elastickv.jepsen-test :as jt]
             [elastickv.learner-workload :as lw]
-            [jepsen.checker :as checker]))
+            [jepsen.checker :as checker]
+            [jepsen.nemesis]))
 
 (defn- check [history]
   (checker/check (lw/learner-safety-checker) {} history {}))
@@ -33,8 +34,17 @@
   (concat healthy-prefix
           [{:type :invoke :f :promote-learner :value "n5" :time 50 :process 0}
            (promotion {} 60)
+           ;; Invoked AFTER the promotion completed, which is what makes this
+           ;; read evidence about post-promotion state.
            {:type :invoke :f :read :time 70 :process 0}
            {:type :ok     :f :read :value {:lease? true :value 1} :time 80 :process 0}]))
+
+;; A post-promotion read, invoke and completion, for histories whose subject is
+;; some other property but which still have to satisfy the coverage gate.
+(defn- post-promotion-read
+  ([t] (post-promotion-read t 1))
+  ([t v] [{:type :invoke :f :read :time t :process 0}
+          {:type :ok :f :read :value {:lease? true :value v} :time (inc t) :process 0}]))
 
 (deftest healthy-history-is-valid
   (is (:valid? (check (healthy-history)))))
@@ -56,7 +66,8 @@
   (let [r (check (concat healthy-prefix
                          [(promotion {:catch-up-target 100
                                       :match 100
-                                      :leader-commit-index 100000} 60)]))]
+                                      :leader-commit-index 100000} 60)]
+                         (post-promotion-read 70)))]
     (is (:valid? r)
         "a learner that reached its sampled target is caught up, whatever the leader did since")))
 
@@ -165,6 +176,7 @@
 (deftest a-read-failure-outside-any-window-is-not-attributed-to-the-learner
   (let [r (check (concat healthy-prefix
                          [(promotion {} 50)]
+                         (post-promotion-read 60)
                          (partition-window 100 200)
                          [{:type :invoke :f :read :time 500}
                           {:type :fail   :f :read :value {:lease? true} :time 510}]))]
@@ -245,3 +257,157 @@
     (is (= 4211 (:commit_index got)))
     (is (= 4207 (:applied_index got)))
     (is (= "n1" (:leader_id got)))))
+
+;; ---------------------------------------------------------------------------
+;; Round 3: the workload has to be able to run, and each property has to be
+;; able to fire. Every test below names the way the previous revision passed
+;; wrongly.
+;; ---------------------------------------------------------------------------
+
+(deftest coverage-requires-a-successful-promotion
+  ;; The gate counted every completion, so a history with good reads and writes
+  ;; plus a FAILED promotion had a positive count while every safety predicate
+  ;; — which all filter to :ok — saw nothing. A run in which no learner was
+  ;; ever promoted was reported valid.
+  (let [failed (check (concat healthy-prefix
+                              [{:type :invoke :f :promote-learner :value "n5" :time 50}
+                               {:type :fail :f :promote-learner :time 60}]
+                              (post-promotion-read 70)))]
+    (is (false? (:valid? failed)))
+    (is (zero? (:promotions failed))
+        "a failed promotion is not a promotion")))
+
+(deftest a-promotion-with-no-read-after-it-is-invalid
+  ;; lost-writes-across-promotions SILENTLY SKIPS a promotion it cannot pair
+  ;; with a later read, which happens when catch-up finishes near the time
+  ;; limit. Counting reads anywhere in the history hid that: the run passed
+  ;; having observed no post-promotion state at all.
+  (let [r (check (concat healthy-prefix [(promotion {} 60)]))]
+    (is (false? (:valid? r)))
+    (is (= 1 (count (:promotions-without-post-read-evidence r))))))
+
+(deftest a-read-invoked-before-the-promotion-is-not-post-promotion-evidence
+  ;; With concurrent workers a read invoked before the promotion can linearize
+  ;; against the old value and return after it. Selecting on completion time
+  ;; alone picked up exactly that read — both accepting it as evidence and
+  ;; reporting the acknowledged write as lost.
+  (let [r (check [{:type :invoke :f :write :value 7 :time 10}
+                  {:type :ok     :f :write :value 7 :time 20}
+                  ;; Invoked BEFORE the promotion, returns after it.
+                  {:type :invoke :f :read :time 30 :process 1}
+                  {:type :invoke :f :promote-learner :value "n5" :time 40}
+                  (promotion {} 50)
+                  {:type :ok :f :read :value {:lease? true :value 7} :time 60 :process 1}])]
+    (is (false? (:valid? r)))
+    (is (= 1 (count (:promotions-without-post-read-evidence r)))
+        "a read that started before the promotion proves nothing about after it")
+    (is (empty? (:lost-writes r))
+        "and it must not be mistaken for a lost write either")))
+
+(deftest a-slow-lease-read-under-learner-isolation-is-rejected
+  ;; Failures alone cannot detect the quorum-ack regression: a Redis GET calls
+  ;; LeaseReadForKeyThrough, and when the lease is unavailable the engine falls
+  ;; back to LinearizableRead transparently — so with the voters connected the
+  ;; read SUCCEEDS and a failure-only check stays empty through exactly the
+  ;; regression it claims to catch. What changes is the latency.
+  (let [r (check (concat healthy-prefix
+                         [(promotion {} 50)]
+                         (post-promotion-read 60)
+                         (partition-window 100 200)
+                         [{:type :invoke :f :read :time 120}
+                          {:type :ok :f :read :time 130
+                           :value {:lease? true :latency-ms 900.0 :value 1}}]))]
+    (is (false? (:valid? r)))
+    (is (= 1 (count (:slow-lease-reads r)))
+        "a lease read that fell back to a Raft round trip must fail the run")))
+
+(deftest a-fast-lease-read-under-learner-isolation-is-fine
+  (let [r (check (concat healthy-prefix
+                         [(promotion {} 50)]
+                         (post-promotion-read 60)
+                         (partition-window 100 200)
+                         [{:type :invoke :f :read :time 120}
+                          {:type :ok :f :read :time 130
+                           :value {:lease? true :latency-ms 3.0 :value 1}}]))]
+    (is (:valid? r) (str "slow=" (:slow-lease-reads r)))))
+
+(deftest a-slow-lease-read-outside-the-window-is-not-attributed-to-the-learner
+  (let [r (check (concat healthy-prefix
+                         [(promotion {} 50)]
+                         (post-promotion-read 60)
+                         (partition-window 100 200)
+                         [{:type :invoke :f :read :time 500}
+                          {:type :ok :f :read :time 510
+                           :value {:lease? true :latency-ms 900.0 :value 1}}]))]
+    (is (:valid? r) (str "slow=" (:slow-lease-reads r)))))
+
+(deftest the-nemesis-handles-the-operations-the-generator-emits
+  ;; jepsen.nemesis/partitioner dispatches on :start and :stop. Feeding it
+  ;; :start-partition / :stop-partition matched no branch, so the learner was
+  ;; never isolated and the partition workload ran with no fault at all — and
+  ;; its :value would have been taken as the grudge, which is not one.
+  (let [nodes ["n1" "n2" "n3" "n4" "n5"]
+        emitted (->> (lw/learner-nemesis-generator)
+                     (tree-seq coll? seq)
+                     (keep #(when (map? %) (:f %)))
+                     set)]
+    (is (= #{:start-partition :stop-partition} emitted))
+    ;; And the nemesis must claim exactly those.
+    (let [n (lw/learner-partition-nemesis nodes)]
+      (is (some? n))
+      (is (satisfies? jepsen.nemesis/Nemesis n)))))
+
+(deftest the-learner-partition-runs-once-not-in-a-cycle
+  ;; The promotion converts the candidate into a voter, so a later window
+  ;; carrying the same :learners-only label isolates a node that now counts
+  ;; toward quorum: failures and latency after that are not learner behaviour,
+  ;; and on a small cluster the isolation can remove a legitimate voter quorum.
+  (let [ops (->> (lw/learner-nemesis-generator)
+                 (tree-seq coll? seq)
+                 (keep #(when (map? %) (:f %))))]
+    (is (= 1 (count (filter #{:start-partition} ops))))
+    (is (= 1 (count (filter #{:stop-partition} ops))))))
+
+(deftest cli-options-are-parsed-before-the-workload-is-constructed
+  ;; run-workload! hands the raw parsed map straight through, and
+  ;; common-cli-opts leaves :nodes as the comma-separated STRING. With identity
+  ;; as the preparation fn the constructor treated that string as a node
+  ;; collection: learner-candidate returned its last character and the port map
+  ;; was keyed by characters.
+  (let [prepared (lw/prepare-learner-opts {:nodes "n1,n2,n3" :faults ""})]
+    (is (= ["n1" "n2" "n3"] (:nodes prepared))
+        "a comma-separated string must be split before it reaches the constructor")
+    (is (= "n3" (lw/learner-candidate (:nodes prepared))))))
+
+(deftest the-redis-host-override-reaches-the-test-map
+  ;; LearnerClient.open! reads :redis-host from the completed test map, so the
+  ;; constructor has to carry it; otherwise a programmatic caller could not
+  ;; override the host and local runs tried to resolve each logical node name.
+  (let [t (lw/elastickv-learner-test {:nodes ["n1" "n2" "n3"] :redis-host "127.0.0.1"})]
+    (is (= "127.0.0.1" (:redis-host t)))))
+
+(deftest the-reserved-candidate-starts-with-a-join-configuration
+  ;; Reserving the candidate only kept it out of the add_voter loop; it still
+  ;; launched as a fresh non-bootstrap process with no peers, which the etcd
+  ;; engine refuses (errNoPeersConfigured), so it exited before :add-learner
+  ;; could attach it.
+  (let [args (set (ekdb/server-args {:node "n5" :grpc "n5:50051" :redis "n5:6379"
+                                     :data-dir "/var/lib/elastickv"
+                                     :raft-redis-map "n5=n5:6379"
+                                     :join-as-learner true
+                                     :join-members "n1=n1:50051,n2=n2:50051"}))]
+    (is (contains? args "--raftJoinAsLearner"))
+    (is (contains? args "--raftJoinMembers"))
+    (is (contains? args "n1=n1:50051,n2=n2:50051")))
+
+  ;; The candidate itself is excluded from the members it discovers: it is
+  ;; joining, not already a member.
+  (is (= "n1=n1:50051,n2=n2:50051"
+         (ekdb/join-members-arg ["n1" "n2" "n5"] "n5" 50051)))
+
+  ;; An ordinary voter gets neither flag.
+  (let [args (set (ekdb/server-args {:node "n2" :grpc "n2:50051" :redis "n2:6379"
+                                     :data-dir "/var/lib/elastickv"
+                                     :raft-redis-map "n2=n2:6379"}))]
+    (is (not (contains? args "--raftJoinAsLearner")))
+    (is (not (contains? args "--raftJoinMembers")))))
