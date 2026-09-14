@@ -858,3 +858,44 @@ func TestRestoreRejectsAnotherClustersManifestBeforeTheDownload(t *testing.T) {
 	_, statErr := os.Stat(dest)
 	require.True(t, os.IsNotExist(statErr), "the destination must not be created")
 }
+
+// TestCleanStaleSpoolFilesTreatsTheDirectoryAsAPathNotAPattern is the glob
+// regression.
+//
+// filepath.Glob interprets the whole joined path as a pattern, so a configured
+// spool dir containing a metacharacter — /tmp/spool[12] — matched /tmp/spool1
+// and /tmp/spool2 and deleted the spool files under THOSE, while the directory
+// the operator actually configured was never examined. A configured path is a
+// path.
+func TestCleanStaleSpoolFilesTreatsTheDirectoryAsAPathNotAPattern(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	// The configured directory, whose name contains glob metacharacters.
+	configured := filepath.Join(root, "spool[12]")
+	require.NoError(t, os.MkdirAll(configured, 0o750))
+	mine := filepath.Join(configured, "elastickv-snapshot-offload-mine.fsm")
+	require.NoError(t, os.WriteFile(mine, []byte("mine"), 0o600))
+
+	// Directories the pattern would have matched instead. Their files must be
+	// untouched: they belong to someone else.
+	var bystanders []string
+	for _, name := range []string{"spool1", "spool2"} {
+		dir := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(dir, 0o750))
+		f := filepath.Join(dir, "elastickv-snapshot-offload-theirs.fsm")
+		require.NoError(t, os.WriteFile(f, []byte("theirs"), 0o600))
+		bystanders = append(bystanders, f)
+	}
+
+	removed, err := CleanStaleSpoolFiles(configured, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []string{mine}, removed,
+		"only the configured directory's own spool file may be removed")
+
+	require.NoFileExists(t, mine)
+	for _, f := range bystanders {
+		require.FileExists(t, f,
+			"a directory that merely MATCHES the configured name is not the configured directory")
+	}
+}

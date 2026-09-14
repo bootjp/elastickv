@@ -341,27 +341,48 @@ func CleanStaleSpoolFiles(spoolDir string, olderThan time.Time) ([]string, error
 	if spoolDir == "" {
 		return nil, errors.Wrap(ErrInvalidOptions, "spool dir is required")
 	}
-	matches, err := filepath.Glob(filepath.Join(filepath.Clean(spoolDir), spoolFilePattern))
+	// The directory is READ, not globbed. filepath.Glob interprets the whole
+	// joined path as a pattern, so a configured spool dir containing a glob
+	// metacharacter -- /tmp/spool[12] -- would match /tmp/spool1 and
+	// /tmp/spool2 and delete files under THOSE, while the real
+	// /tmp/spool[12] was never examined. A configured path is a path, never a
+	// pattern; only the entry names are matched against the pattern.
+	spoolDir = filepath.Clean(spoolDir)
+	entries, err := os.ReadDir(spoolDir)
 	if err != nil {
-		return nil, errors.Wrapf(err, "glob spool dir %s", spoolDir)
+		if os.IsNotExist(err) {
+			// Offload may never have run here.
+			return nil, nil
+		}
+		return nil, errors.Wrapf(err, "read spool dir %s", spoolDir)
 	}
 	var (
 		removed  []string
 		failures []error
+		examined int
 	)
-	for _, match := range matches {
-		gone, err := removeStaleSpoolFile(match, olderThan)
+	for _, entry := range entries {
+		matched, err := filepath.Match(spoolFilePattern, entry.Name())
+		if err != nil {
+			return removed, errors.Wrapf(err, "match spool pattern %q", spoolFilePattern)
+		}
+		if !matched {
+			continue
+		}
+		examined++
+		path := filepath.Join(spoolDir, entry.Name())
+		gone, err := removeStaleSpoolFile(path, olderThan)
 		if err != nil {
 			failures = append(failures, err)
 			continue
 		}
 		if gone {
-			removed = append(removed, match)
+			removed = append(removed, path)
 		}
 	}
 	if len(failures) > 0 {
 		return removed, errors.Wrapf(errors.Join(failures...),
-			"clean spool dir %s: %d of %d files failed", spoolDir, len(failures), len(matches))
+			"clean spool dir %s: %d of %d files failed", spoolDir, len(failures), examined)
 	}
 	return removed, nil
 }
