@@ -1472,3 +1472,66 @@ func TestGCRejectsAManifestReferencingAPayloadOutsideItsPrefix(t *testing.T) {
 	require.True(t, f.exists(t, good.Payload.Key),
 		"no payload may be reclaimed while a manifest is unreadable")
 }
+
+// TestLocalStoreDeleteDoesNotFollowASymlinkOutOfTheRoot closes the gap the
+// lexical containment check cannot.
+//
+// objectPathWithinRoot compares strings, so it cannot see a symlink: if any
+// ancestor under the root is one — or is swapped for one between the listing
+// and the delete — os.Remove follows it and unlinks a file outside the
+// configured root. The character checks cannot close that, because the path
+// they validated is still the path being passed; it is the resolution that
+// differs.
+func TestLocalStoreDeleteDoesNotFollowASymlinkOutOfTheRoot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := t.TempDir()
+	root := filepath.Join(base, "store")
+	require.NoError(t, os.MkdirAll(root, 0o750))
+
+	// A file outside the store that must survive.
+	outside := filepath.Join(base, "outside")
+	require.NoError(t, os.MkdirAll(outside, 0o750))
+	victim := filepath.Join(outside, "victim.txt")
+	require.NoError(t, os.WriteFile(victim, []byte("not yours"), 0o600))
+
+	// An in-root directory that is really a symlink pointing out of the root.
+	// Every lexical check passes for "escape/victim.txt": no "..", no
+	// backslash, not rooted, and the joined path is under the root.
+	require.NoError(t, os.Symlink(outside, filepath.Join(root, "escape")))
+
+	store, err := NewLocalStore(root)
+	require.NoError(t, err)
+
+	err = store.DeleteObject(ctx, "escape/victim.txt")
+	require.Error(t, err, "a delete that resolves through a symlink out of the root must fail")
+	require.FileExists(t, victim,
+		"the file outside the store root must survive: os.Root refuses to traverse out of it")
+
+	require.Error(t,
+		store.DeleteObjectIfUnmodified(ctx, "escape/victim.txt", DeletePrecondition{Size: 9}),
+		"the conditional delete shares the same escape")
+	require.FileExists(t, victim)
+}
+
+// An ordinary nested key still deletes, so the descriptor-relative path did not
+// simply break deletion.
+func TestLocalStoreDeleteStillRemovesANestedObject(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	store, err := NewLocalStore(root)
+	require.NoError(t, err)
+
+	_, err = store.PutObject(ctx, "a/b/c.json", bytes.NewReader([]byte("{}")), PutOptions{
+		Size:   2,
+		SHA256: hexSHA256Bytes([]byte("{}")),
+	})
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(root, "a", "b", "c.json"))
+
+	require.NoError(t, store.DeleteObject(ctx, "a/b/c.json"))
+	require.NoFileExists(t, filepath.Join(root, "a", "b", "c.json"))
+}

@@ -220,7 +220,11 @@ func (s *LocalStore) DeleteObjectIfUnmodified(ctx context.Context, key string, c
 		return errors.Wrapf(ErrObjectModified,
 			"object %s changed since it was validated for deletion", key)
 	}
-	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
+	relPath, err := s.relPathForKey(key)
+	if err != nil {
+		return err
+	}
+	if err := s.removeWithinRoot(relPath); err != nil {
 		return errors.Wrapf(err, "delete object %s", key)
 	}
 	// Persist the unlink before reporting success. Without the
@@ -240,7 +244,11 @@ func (s *LocalStore) DeleteObject(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	if err := os.Remove(objectPath); err != nil && !os.IsNotExist(err) {
+	relPath, err := s.relPathForKey(key)
+	if err != nil {
+		return err
+	}
+	if err := s.removeWithinRoot(relPath); err != nil {
 		return errors.Wrapf(err, "delete object %s", key)
 	}
 	// Persist the unlink before reporting success. Without the
@@ -445,6 +453,44 @@ func volumeQualified(normalized string) bool {
 
 func isASCIILetter(c byte) bool {
 	return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// removeWithinRoot unlinks relPath RELATIVE TO the store root, through a
+// descriptor that cannot escape it.
+//
+// objectPathWithinRoot is lexical, so it cannot see a symlink: if any ancestor
+// under the root is a symlink -- or is swapped for one between the listing and
+// the delete -- os.Remove follows it and unlinks a file outside the configured
+// root. The character checks cannot close that, because the path they
+// validated is still the path being passed; it is the RESOLUTION that differs.
+//
+// os.Root resolves every component against the opened root descriptor and
+// refuses to traverse out of it, so the check and the operation can no longer
+// disagree.
+func (s *LocalStore) removeWithinRoot(relPath string) error {
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		return errors.Wrapf(err, "open store root %s", s.root)
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.Remove(relPath); err != nil && !os.IsNotExist(err) {
+		return errors.Wrapf(err, "remove %s within store root", relPath)
+	}
+	return nil
+}
+
+// relPathForKey is pathForKey's root-relative half, for the
+// descriptor-relative operations that resolve against the root themselves.
+func (s *LocalStore) relPathForKey(key string) (string, error) {
+	full, err := s.pathForKey(key)
+	if err != nil {
+		return "", err
+	}
+	rel, err := filepath.Rel(filepath.Clean(s.root), full)
+	if err != nil {
+		return "", errors.Wrapf(ErrInvalidOptions, "object key %q is not under the store root", key)
+	}
+	return rel, nil
 }
 
 // objectPathWithinRoot reports whether joined actually resolves inside
