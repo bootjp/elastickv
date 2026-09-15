@@ -1,6 +1,6 @@
 # Closing the pre-Phase-D resolution carve-out
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-09-02
 
@@ -123,6 +123,50 @@ Costs and open problems:
 window for the same-group case, where the primary record is locally readable,
 and falls back to §4.2's bound when it is not.
 
+## 4a. Decision (2026-09-15)
+
+**§4.3**, with §4.1 where the primary record is readable and §4.2's bound
+everywhere else. Answers to §5 in order:
+
+1. §4.3. §4.1 alone has no verdict when the primary is remote, and §4.2 alone
+   never consults durable evidence even when it is sitting there.
+2. A leader that cannot read the primary falls back to the window rather than
+   refusing or issuing a second RPC. Refusing breaks legitimate cross-shard
+   legacy resolution, and a second RPC puts a round trip on the write path to
+   close a window that is already bounded.
+3. `grace` is one hour on top of `maxTxnLockTTLms`. It absorbs clock skew
+   between nodes and the spread of a rolling Phase-D activation, both of which
+   can make a legitimately in-flight transaction look older than it is. Too
+   small strands long-TTL transactions; too large only extends a window that is
+   already bounded, so it errs long.
+4. `ABORT` is always a window decision, even when the primary is local. Its
+   timestamp is synthesised by `abortTSFrom`, so no record can support it, and
+   requiring one would refuse every legitimate abort resolution.
+
+On the wall-clock objection raised in §4.2: the bound is an **admission**
+decision about whether a request may create state, not an ordering decision
+about where that state sorts. No visibility, OCC or MVCC comparison consults
+it, and a clock that is wrong only widens or narrows who may create a pre-D
+intent — it can never place a write at the wrong point in the timestamp order.
+Skew costs availability for legacy resolution, never correctness.
+
+### What has shipped
+
+§4.2 is wired: `ValidateForwardedTxnStartTimestamp` admits a pre-Phase-D start
+only inside the window, which removes step 1 of the attack — the ability to
+create a fresh pre-D intent after the marker. An allocator that cannot report
+the floor leaves the window open, because a missing signal must not turn a
+narrowing into a refusal.
+
+§4.1's decision is implemented and tested as `ClassifyPrePhaseDCommit`, but is
+**not yet wired**. It needs a signal the commit-validation path does not
+currently have: whether this node can definitively read the primary's record,
+as distinct from simply not finding one. `ShardStore.primaryTxnRecordedStatus`
+already draws that distinction with its `done` return, and exposing it to the
+forwarded-commit path is the remaining work. Wiring it without that signal
+would make a remote primary indistinguishable from a missing record and refuse
+exactly the cross-shard resolutions §4.1 is careful to preserve.
+
 ## 5. Open questions for review
 
 1. Is the acceptable answer §4.2 alone (cheap, no cross-group read, bounded by a
@@ -136,6 +180,5 @@ and falls back to §4.2's bound when it is not.
 4. Should the `ABORT` path get its own rule, given its timestamp is synthesised
    rather than recorded?
 
-Until this is settled the carve-out stays as written, with this document as the
-record of why. It is narrower than main's behaviour, and widening it is not
-possible without also changing `ValidateForwardedTxnStartTimestamp`.
+Settled in §4a. The carve-out is now bounded by §4.2; §4.1 remains to be wired
+behind a local-primary readability signal.
