@@ -73,6 +73,18 @@ type ShardGroup struct {
 	leaderReadToken atomic.Pointer[string]
 }
 
+// SetPeerForwardToken configures the bearer token peers attach to forwarded
+// Internal RPCs.
+//
+// Named for the whole peer-forward surface rather than for lease reads alone,
+// because the write forward carries it too: Internal.Forward persists at a
+// caller-supplied timestamp, and leaving it the one unauthenticated forward
+// made it the cheapest way to reach that path.
+func (g *ShardGroup) SetPeerForwardToken(token string) { g.SetLeaderReadToken(token) }
+
+// peerForwardToken is the token to attach to an outbound forwarded RPC.
+func (g *ShardGroup) peerForwardToken() string { return g.forwardedLeaderReadToken() }
+
 // SetLeaderReadToken configures the bearer token used by forwarded lease-read
 // RPCs. An empty token preserves explicitly configured insecure admin mode.
 func (g *ShardGroup) SetLeaderReadToken(token string) {

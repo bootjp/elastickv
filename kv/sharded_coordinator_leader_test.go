@@ -176,3 +176,98 @@ func TestShardedCoordinatorLeaseReadAllGroups_EmptyGroups(t *testing.T) {
 
 	require.ErrorIs(t, coord.LeaseReadAllGroups(context.Background()), ErrLeaderNotFound)
 }
+
+// writeForwardServer records the credentials a forwarded WRITE arrives with.
+type writeForwardServer struct {
+	pb.UnimplementedInternalServer
+	calls         atomic.Int32
+	mu            sync.Mutex
+	authorization []string
+}
+
+func (s *writeForwardServer) Forward(
+	ctx context.Context,
+	_ *pb.ForwardRequest,
+) (*pb.ForwardResponse, error) {
+	s.calls.Add(1)
+	md, _ := metadata.FromIncomingContext(ctx)
+	s.mu.Lock()
+	s.authorization = append([]string(nil), md.Get("authorization")...)
+	s.mu.Unlock()
+	return &pb.ForwardResponse{Success: true, CommitIndex: 1}, nil
+}
+
+func newWriteForwardFixture(t *testing.T, token string) (*ShardGroup, *writeForwardServer) {
+	t.Helper()
+
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	service := &writeForwardServer{}
+	server := grpc.NewServer()
+	pb.RegisterInternalServer(server, service)
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = lis.Close()
+	})
+
+	follower := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
+	group := &ShardGroup{Engine: follower, Store: store.NewMVCCStore()}
+	proxy := NewLeaderProxyForShardGroup(group)
+	t.Cleanup(func() { require.NoError(t, proxy.Close()) })
+	group.Txn = proxy
+	if token != "" {
+		group.SetPeerForwardToken(token)
+	}
+	return group, service
+}
+
+// TestForwardedWriteCarriesThePeerToken is the client half of §3.3 of
+// docs/design/2026_08_29_proposed_tso_batch_slot_claims.md.
+//
+// Putting Internal.Forward behind the admin token is only half a change:
+// without the credential on the outbound side, protecting the method would
+// break every forwarded write instead of authenticating it. The lease-read
+// forward already attached it; the write forward did not, which is what left
+// the timestamp-validation path reachable without one.
+func TestForwardedWriteCarriesThePeerToken(t *testing.T) {
+	t.Parallel()
+
+	group, service := newWriteForwardFixture(t, "admin-secret")
+
+	proxy, ok := group.Txn.(*LeaderProxy)
+	require.True(t, ok)
+	_, err := proxy.forward(context.Background(), context.Background(),
+		[]*pb.Request{{IsTxn: false, Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+		}}}, 1)
+	require.NoError(t, err)
+
+	require.Equal(t, int32(1), service.calls.Load())
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	require.Equal(t, []string{"Bearer admin-secret"}, service.authorization,
+		"a forwarded write must carry the peer token, or authenticating the method "+
+			"would break forwarding instead of protecting it")
+}
+
+// An unconfigured cluster attaches nothing, which mirrors the server side
+// disabling enforcement for an empty token: both ends behave exactly as before.
+func TestForwardedWriteWithoutATokenAttachesNothing(t *testing.T) {
+	t.Parallel()
+
+	group, service := newWriteForwardFixture(t, "")
+
+	proxy, ok := group.Txn.(*LeaderProxy)
+	require.True(t, ok)
+	_, err := proxy.forward(context.Background(), context.Background(),
+		[]*pb.Request{{IsTxn: false, Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+		}}}, 2)
+	require.NoError(t, err)
+
+	service.mu.Lock()
+	defer service.mu.Unlock()
+	require.Empty(t, service.authorization)
+}

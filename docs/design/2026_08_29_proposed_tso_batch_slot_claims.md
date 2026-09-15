@@ -94,6 +94,43 @@ Phase-D path and therefore an operator-visible tradeoff, not an implementation
 detail. **This document exists to get that tradeoff decided before either lands.**
 3.3 should be tracked separately.
 
+## 4a. Decision (2026-09-15)
+
+**Phase D stays batched.** §3.1 is rejected as an interim: `CLAUDE.md` states
+that no Raft round trip per `Next()` is a design invariant — it is what batching
+exists for — and §3.1 would violate it on exactly the Phase-D path. Trading a
+throughput regression for a window that narrows but does not close is not worth
+that.
+
+§3.2 remains the fix and needs its own proposal, because the claim record is a
+wire/on-disk decision (§5 questions 2 and 3).
+
+Landed now, both decision-independent:
+
+- **§3.3 for `Internal.Forward`.** It was the only forward outside
+  `adminTokenProtectedMethod` while `ForwardAdminProposal` and
+  `ForwardLeaseRead` were inside it, which made it the cheapest route to the
+  validation path for anything with peer-port reach. Both halves shipped: the
+  server gate, and the token on the outbound write forward — protecting the
+  method without the credential would have broken forwarding rather than
+  authenticated it. An empty token still disables both ends, so an unconfigured
+  cluster is unaffected.
+
+  `RelayPublish`, `ExportRangeVersions`, `ImportRangeVersions` and
+  `PromoteStagedVersions` remain outside the gate. Each needs the same
+  two-sided treatment, and their clients are built through the migration
+  factory rather than in this package, so they are tracked separately rather
+  than half-wired here.
+
+- **§6's invariant tests that do not depend on the option chosen.** Uniqueness
+  across concurrent allocators (direct and batched) and strict monotonicity:
+  these must hold under §3.1, §3.2 or neither, so they are the fixed point any
+  of those changes has to preserve.
+
+Deliberately **not** added: a test asserting that an unclaimed slot inside a
+committed window is refused. It is not refused today — that is the hole — and
+asserting current behaviour there would lock in the bug.
+
 ## 5. Open questions
 
 1. Is a per-timestamp group-0 round trip acceptable on the Phase-D path as an

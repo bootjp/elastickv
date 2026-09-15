@@ -255,6 +255,16 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	ctx, cancel := context.WithTimeout(parentCtx, leaderForwardTimeout)
 	defer cancel()
 
+	// The write forward carries the peer token, as the lease-read forward
+	// already did. Internal.Forward persists at a caller-supplied timestamp,
+	// so it was the cheapest unauthenticated route to that path. An empty
+	// token attaches nothing, which matches the server side disabling
+	// enforcement for an empty token -- an unconfigured cluster behaves
+	// exactly as before, on both ends.
+	if token := p.group.peerForwardToken(); token != "" {
+		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
+	}
+
 	resp, err := cli.Forward(ctx, &pb.ForwardRequest{
 		IsTxn:    reqs[0].IsTxn,
 		Requests: reqs,

@@ -763,7 +763,13 @@ var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 func adminTokenProtectedMethod(fullMethod string) bool {
 	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
 		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName ||
-		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName
+		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName ||
+		// Internal.Forward persists at a caller-supplied timestamp, so it
+		// reaches the durable-timestamp validation path directly. It was the
+		// only forward left outside this gate while its two siblings were
+		// inside it, which made it the cheapest way to that path for anything
+		// with peer-port reach.
+		fullMethod == pb.Internal_Forward_FullMethodName
 }
 
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing
