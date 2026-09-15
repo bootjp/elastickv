@@ -1147,3 +1147,31 @@ func TestCollectLiveMembersHonoursCtxCancel(t *testing.T) {
 		t.Fatal("collectLiveMembers blocked past 1s despite cancelled ctx — wg.Wait() regression?")
 	}
 }
+
+// TestInternalForwardIsBehindTheAdminToken closes §3.3 of
+// docs/design/2026_08_29_proposed_tso_batch_slot_claims.md for the method that
+// document names.
+//
+// Internal.Forward persists at a caller-supplied timestamp, so it reaches the
+// durable-timestamp validation path directly — and it was the one forward left
+// outside the gate while ForwardAdminProposal and ForwardLeaseRead were inside
+// it, which made it the cheapest route to that path for anything with
+// peer-port reach.
+//
+// This narrows WHO can reach the path; it does not close the unclaimed-slot
+// window itself, which is what the rest of that design doc is about.
+func TestInternalForwardIsBehindTheAdminToken(t *testing.T) {
+	t.Parallel()
+
+	require.True(t, adminTokenProtectedMethod(pb.Internal_Forward_FullMethodName),
+		"the write forward reaches the timestamp validation path and must be authenticated")
+
+	// Its siblings were already protected; they must stay so.
+	require.True(t, adminTokenProtectedMethod(pb.Internal_ForwardAdminProposal_FullMethodName))
+	require.True(t, adminTokenProtectedMethod(pb.Internal_ForwardLeaseRead_FullMethodName))
+
+	// The admin surface is unchanged.
+	require.True(t, adminTokenProtectedMethod("/Admin/Whatever"))
+	require.False(t, adminTokenProtectedMethod("/RawKV/Put"),
+		"client-facing services keep their own auth; this gate is for the peer surface")
+}
