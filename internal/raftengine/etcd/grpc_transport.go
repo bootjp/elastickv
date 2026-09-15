@@ -518,7 +518,8 @@ func (t *GRPCTransport) streamFSMSnapshot(ctx context.Context, msg raftpb.Messag
 	// receiver-side total when a follower fails to restore. A mismatch points
 	// at transport truncation; a match points at a format/parsing issue.
 	counter := &countingReadCloser{inner: rc}
-	if err := sendSnapshotReaderChunks(stream, header, counter, t.chunkSize()); err != nil {
+	if err := sendSnapshotReaderChunks(stream, header, counter, t.chunkSize()); err != nil &&
+		!errors.Is(err, io.EOF) {
 		return err
 	}
 	if _, err := stream.CloseAndRecv(); err != nil {
@@ -1019,7 +1020,8 @@ func (t *GRPCTransport) sendSnapshot(ctx context.Context, msg raftpb.Message) er
 		return errors.WithStack(err)
 	}
 
-	if err := sendSnapshotChunks(stream, header, payload, t.chunkSize()); err != nil {
+	if err := sendSnapshotChunks(stream, header, payload, t.chunkSize()); err != nil &&
+		!errors.Is(err, io.EOF) {
 		return err
 	}
 	if _, err := stream.CloseAndRecv(); err != nil {
@@ -1047,7 +1049,8 @@ func (t *GRPCTransport) sendSnapshotSpool(ctx context.Context, msg raftpb.Messag
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if err := sendSnapshotReaderChunks(stream, header, reader, t.chunkSize()); err != nil {
+	if err := sendSnapshotReaderChunks(stream, header, reader, t.chunkSize()); err != nil &&
+		!errors.Is(err, io.EOF) {
 		return err
 	}
 	if _, err := stream.CloseAndRecv(); err != nil {
@@ -1170,6 +1173,11 @@ func sendSnapshotChunks(stream pb.EtcdRaft_SendSnapshotClient, header []byte, pa
 	return nil
 }
 
+// sendSnapshotChunk returns io.EOF unchanged when the receiver has already
+// terminated the stream. That is gRPC's signal that the real status is waiting
+// on the receive side, so callers must fall through to CloseAndRecv rather than
+// return it -- a follower that rejected the snapshot should appear in the log
+// as its actual reason, not as a bare EOF.
 func sendSnapshotChunk(stream pb.EtcdRaft_SendSnapshotClient, chunk *pb.EtcdRaftSnapshotChunk) error {
 	if err := stream.Send(chunk); err != nil {
 		return errors.WithStack(err)
