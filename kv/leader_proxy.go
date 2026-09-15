@@ -261,6 +261,19 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	// token attaches nothing, which matches the server side disabling
 	// enforcement for an empty token -- an unconfigured cluster behaves
 	// exactly as before, on both ends.
+	//
+	// Rolling upgrades: a node still running an older binary does not attach
+	// this header, so its forwards are refused by an upgraded leader until it
+	// is upgraded too. Upgrade every node before relying on the gate; see
+	// docs/design/2026_08_29_partial_tso_batch_slot_claims.md.
+	//
+	// The token travels in cleartext. Every peer dial in this process uses
+	// internal.GRPCDialOptions, which is insecure-only -- there is no peer-TLS
+	// option anywhere in the server -- so the Raft traffic beside it is equally
+	// readable. That makes the token a barrier against reaching the peer port,
+	// not against observing it, and withholding it on an insecure connection
+	// would disable the gate everywhere rather than harden it. Confidentiality
+	// needs peer mTLS, which is tracked separately.
 	if token := p.group.peerForwardToken(); token != "" {
 		ctx = metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+token)
 	}

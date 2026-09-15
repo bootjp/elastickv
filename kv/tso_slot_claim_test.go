@@ -56,6 +56,7 @@ func TestTSOIssuesEachTimestampAtMostOnceUnderConcurrency(t *testing.T) {
 		perWorker  = 64
 	)
 	issued := make([][]uint64, goroutines)
+	failures := make([][]error, goroutines)
 	var wg sync.WaitGroup
 	for g := range goroutines {
 		wg.Add(1)
@@ -65,6 +66,11 @@ func TestTSOIssuesEachTimestampAtMostOnceUnderConcurrency(t *testing.T) {
 			for range perWorker {
 				ts, err := alloc.Next(context.Background())
 				if err != nil {
+					// Collected rather than skipped: uniqueness over whatever
+					// happened to succeed is satisfied by a single timestamp,
+					// so a fixture that failed almost every call would still
+					// look like a passing uniqueness property.
+					failures[g] = append(failures[g], err)
 					continue
 				}
 				mine = append(mine, ts)
@@ -76,13 +82,15 @@ func TestTSOIssuesEachTimestampAtMostOnceUnderConcurrency(t *testing.T) {
 
 	seen := make(map[uint64]int, goroutines*perWorker)
 	total := 0
-	for _, mine := range issued {
+	for g, mine := range issued {
+		require.Empty(t, failures[g], "issuance must not fail under concurrency")
 		for _, ts := range mine {
 			seen[ts]++
 			total++
 		}
 	}
-	require.Positive(t, total, "the fixture must actually issue timestamps")
+	require.Equal(t, goroutines*perWorker, total,
+		"every request must have produced a timestamp")
 	for ts, count := range seen {
 		require.Equal(t, 1, count,
 			"timestamp %d was issued %d times; two writes sharing one commit_ts can "+
@@ -98,26 +106,33 @@ func TestBatchAllocatorIssuesEachTimestampAtMostOnce(t *testing.T) {
 	t.Parallel()
 
 	alloc, _ := newSlotClaimTSOFixture(t)
-	batch, err := NewBatchAllocator(alloc, 16)
-	require.NoError(t, err)
 
 	const (
-		goroutines = 8
+		allocators = 8
 		perWorker  = 64
 	)
+	// One BatchAllocator per goroutine, all backed by the same TSO state. A
+	// single shared allocator serialises every reservation behind its own
+	// refill mutex, which makes the interesting failure -- two node-local
+	// allocators handed overlapping windows -- unreachable. Separate
+	// allocators are what production has: one per node, one shared service.
 	var (
 		mu    sync.Mutex
-		seen  = make(map[uint64]int, goroutines*perWorker)
+		seen  = make(map[uint64]int, allocators*perWorker)
 		total int
 		wg    sync.WaitGroup
 	)
-	for range goroutines {
+	failures := make([][]error, allocators)
+	for a := range allocators {
+		batch, err := NewBatchAllocator(alloc, 16)
+		require.NoError(t, err)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
 			for range perWorker {
 				ts, err := batch.Next(context.Background())
 				if err != nil {
+					failures[a] = append(failures[a], err)
 					continue
 				}
 				mu.Lock()
@@ -129,10 +144,35 @@ func TestBatchAllocatorIssuesEachTimestampAtMostOnce(t *testing.T) {
 	}
 	wg.Wait()
 
-	require.Positive(t, total)
+	for a := range allocators {
+		require.Empty(t, failures[a], "batched issuance must not fail under concurrency")
+	}
+	require.Equal(t, allocators*perWorker, total,
+		"every request must have produced a timestamp")
 	for ts, count := range seen {
 		require.Equal(t, 1, count,
 			"batched issuance handed timestamp %d out %d times", ts, count)
+	}
+}
+
+// Uniqueness alone would accept a window handed out backwards, so the batched
+// path needs the ordering half too. Sequential on purpose: interleaving two
+// allocators has no total order to assert, while a single allocator handing out
+// its own window must never go backwards.
+func TestBatchAllocatorIssuanceIsStrictlyMonotonic(t *testing.T) {
+	t.Parallel()
+
+	alloc, _ := newSlotClaimTSOFixture(t)
+	batch, err := NewBatchAllocator(alloc, 16)
+	require.NoError(t, err)
+
+	prev := uint64(0)
+	for range 256 {
+		ts, err := batch.Next(context.Background())
+		require.NoError(t, err)
+		require.Greater(t, ts, prev,
+			"batched issuance must be strictly increasing, including across refills")
+		prev = ts
 	}
 }
 
@@ -164,6 +204,14 @@ func TestValidateDurableTimestampRefusesBeyondTheAllocationFloor(t *testing.T) {
 	alloc, fsm := newSlotClaimTSOFixture(t)
 	ctx := context.Background()
 
+	// Phase D has to be active before the bound is even consulted:
+	// ValidateDurableTimestamp refuses an inactive state first, so on an
+	// unactivated fixture every timestamp is refused for the wrong reason and
+	// the assertion below would hold with the bound deleted.
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+	require.Nil(t, fsm.Apply(marshalTSOPhaseD(1)))
+	require.True(t, fsm.PhaseDActive())
+
 	// Issue one so a window is committed.
 	issued, err := alloc.Next(ctx)
 	require.NoError(t, err)
@@ -171,8 +219,15 @@ func TestValidateDurableTimestampRefusesBeyondTheAllocationFloor(t *testing.T) {
 	end := fsm.AllocationFloor()
 	require.GreaterOrEqual(t, end, issued)
 
-	require.Error(t, alloc.ValidateDurableTimestamp(ctx, end+1),
+	// A timestamp inside the committed window validates, which is what makes
+	// the two refusals below about the bound rather than about the state.
+	require.NoError(t, alloc.ValidateDurableTimestamp(ctx, issued))
+
+	err = alloc.ValidateDurableTimestamp(ctx, end+1)
+	require.ErrorIs(t, err, ErrTSOTimestampInvalid,
 		"a timestamp past the highest committed window end was never issued")
-	require.Error(t, alloc.ValidateDurableTimestamp(ctx, 0),
+	require.NotErrorIs(t, err, ErrTSOPhaseDInactive)
+
+	require.ErrorIs(t, alloc.ValidateDurableTimestamp(ctx, 0), ErrTSOTimestampInvalid,
 		"zero is not a timestamp")
 }

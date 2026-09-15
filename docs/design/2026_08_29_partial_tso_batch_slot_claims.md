@@ -1,6 +1,6 @@
 # TSO Batch Slot Claims
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-08-29
 
@@ -39,11 +39,16 @@ one timestamp. That breaks the uniqueness OCC ordering assumes: the conflict
 check is `latestTS(key) > startTS`, and two commits sharing a timestamp can each
 read the other as not-newer.
 
-**Exposure.** `adminTokenProtectedMethod` (`adapter/admin_grpc.go:515`) matches
-only the `/Admin/` prefix, so `Internal.Forward` is not behind the admin token.
-This is peer-port reach, not public-client reach, but it is unauthenticated at
-the gRPC layer, and the window is open for as long as the batch survives —
-unbounded under low write traffic.
+**Exposure (as of 2026-08-29; closed by §4a).** `adminTokenProtectedMethod`
+(`adapter/admin_grpc.go`) matched only the `/Admin/` prefix, so `Internal.Forward`
+was not behind the admin token. That was peer-port reach, not public-client
+reach, but it was unauthenticated at the gRPC layer, and the window stayed open
+for as long as the batch survived — unbounded under low write traffic.
+
+§4a closed this route: `Internal.Forward` is now inside the gate and the write
+forward carries the token. The underlying hole below is untouched — a caller who
+does hold the token can still persist at an unclaimed slot — which is why §3.2
+is still the fix.
 
 ## 2. Non-goals
 
@@ -116,6 +121,28 @@ Landed now, both decision-independent:
   authenticated it. An empty token still disables both ends, so an unconfigured
   cluster is unaffected.
 
+  **Rolling upgrades.** Both halves ship in one binary, but a cluster does not
+  upgrade in one step. In a cluster that already has an admin token configured,
+  a node still running the older binary does not attach the header, so once an
+  upgraded node becomes group leader, writes entering an older follower and
+  forwarded to it are refused with `Unauthenticated` until that follower is
+  upgraded. **Upgrade every node before relying on the gate.** This is the same
+  window `ForwardLeaseRead` already shipped with -- it is gated server-side and
+  attaches the token, with no staged flag -- so this follows the established
+  rollout rather than inventing a second mechanism for the sibling RPC. A
+  cluster with no admin token configured is unaffected on both ends.
+
+  **The token is not confidential.** Every peer dial goes through
+  `internal.GRPCDialOptions`, which is `insecure.NewCredentials()` only; the
+  server has no peer-TLS option at all. So the bearer token crosses the node
+  network in cleartext -- as does the Raft traffic beside it, which an observer
+  on that network can already read and inject. The gate therefore raises the
+  bar against *reaching* the peer port, not against *observing* it, which is
+  the right reading of what §1's exposure was: unauthenticated reach to the
+  durable-timestamp validation path. Withholding the token on an insecure
+  connection would disable the gate in every existing deployment rather than
+  harden it, so confidentiality is left to peer mTLS, tracked separately.
+
   `RelayPublish`, `ExportRangeVersions`, `ImportRangeVersions` and
   `PromoteStagedVersions` remain outside the gate. Each needs the same
   two-sided treatment, and their clients are built through the migration
@@ -131,10 +158,18 @@ Deliberately **not** added: a test asserting that an unclaimed slot inside a
 committed window is refused. It is not refused today — that is the hole — and
 asserting current behaviour there would lock in the bug.
 
+### Lifecycle
+
+This document is `_partial_`: §3.3 and the decision-independent half of §6 have
+shipped, while §3.2 — the durable per-slot claim that actually closes the hole —
+has not. It becomes `_implemented_` only when a claim record lands and the
+unclaimed-slot test in §6 can be written as a passing assertion.
+
 ## 5. Open questions
 
-1. Is a per-timestamp group-0 round trip acceptable on the Phase-D path as an
-   interim, or should Phase D stay batched until 3.2 ships?
+1. ~~Is a per-timestamp group-0 round trip acceptable on the Phase-D path as an
+   interim, or should Phase D stay batched until 3.2 ships?~~ **Resolved in §4a
+   (2026-09-15): Phase D stays batched; §3.1 is rejected.**
 2. Should a claim be per-timestamp or a per-owner watermark? A watermark is far
    cheaper and still refuses any slot ahead of what an owner actually issued.
 3. What is the retention story for claims across leadership change and snapshot?
