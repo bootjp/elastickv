@@ -1,11 +1,14 @@
 package monitoring
 
 import (
+	"context"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/cockroachdb/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -165,4 +168,227 @@ func TestRegistryExposesEncryptionObserver(t *testing.T) {
 
 	var nilRegistry *Registry
 	require.Nil(t, nilRegistry.EncryptionObserver())
+}
+
+// fakeEncryptionState drives the §9.2 sidecar gauges.
+type fakeEncryptionState struct {
+	storageID uint32
+	raftID    uint32
+	raftIndex uint64
+}
+
+func (f fakeEncryptionState) ActiveStorageKeyID() (uint32, bool) {
+	return f.storageID, f.storageID != 0
+}
+
+func (f fakeEncryptionState) ActiveRaftKeyID() (uint32, bool) {
+	return f.raftID, f.raftID != 0
+}
+
+func (f fakeEncryptionState) SidecarRaftAppliedIndex() uint64 { return f.raftIndex }
+
+// TestEncryptionMetricsPublishPreBootstrapPostureAtConstruction pins
+// that both purpose series exist from process start. Without it an
+// alert on active_dek_id == 0 could not tell "not bootstrapped" from
+// "this node never reported", which are very different incidents.
+func TestEncryptionMetricsPublishPreBootstrapPostureAtConstruction(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	metrics := newEncryptionMetrics(reg)
+
+	require.NoError(t, testutil.GatherAndCompare(
+		reg,
+		strings.NewReader(`
+# HELP elastickv_encryption_active_dek_id Currently active DEK id per purpose; 0 means the cluster has not bootstrapped that purpose.
+# TYPE elastickv_encryption_active_dek_id gauge
+elastickv_encryption_active_dek_id{purpose="raft"} 0
+elastickv_encryption_active_dek_id{purpose="storage"} 0
+`),
+		"elastickv_encryption_active_dek_id",
+	))
+	require.NotNil(t, metrics)
+}
+
+func TestEncryptionMetricsObserveSidecarState(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	metrics := newEncryptionMetrics(reg)
+
+	metrics.observeState(fakeEncryptionState{storageID: 7, raftID: 8, raftIndex: 4211})
+
+	require.NoError(t, testutil.GatherAndCompare(
+		reg,
+		strings.NewReader(`
+# HELP elastickv_encryption_active_dek_id Currently active DEK id per purpose; 0 means the cluster has not bootstrapped that purpose.
+# TYPE elastickv_encryption_active_dek_id gauge
+elastickv_encryption_active_dek_id{purpose="raft"} 8
+elastickv_encryption_active_dek_id{purpose="storage"} 7
+# HELP elastickv_encryption_sidecar_raft_index The encryption sidecar's persisted raft_applied_index. A persistent gap below the FSM applied index is the sidecar-divergence signal.
+# TYPE elastickv_encryption_sidecar_raft_index gauge
+elastickv_encryption_sidecar_raft_index 4211
+`),
+		"elastickv_encryption_active_dek_id",
+		"elastickv_encryption_sidecar_raft_index",
+	))
+}
+
+// TestEncryptionStateObserverSamplesImmediatelyAndOnTick covers the
+// startup case: an operator restarting a node must not wait a full
+// interval before the gauges reflect reality.
+func TestEncryptionStateObserverSamplesImmediatelyAndOnTick(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	metrics := newEncryptionMetrics(reg)
+	observer := newEncryptionStateObserver(metrics)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	observer.Start(ctx, fakeEncryptionState{storageID: 3, raftID: 4, raftIndex: 99}, time.Hour)
+
+	// No tick has fired; the immediate sample must already be visible.
+	require.InDelta(t, 3.0, testutil.ToFloat64(
+		metrics.activeDEKID.WithLabelValues(encryptionPurposeStorage)), 0.0001)
+	require.InDelta(t, 4.0, testutil.ToFloat64(
+		metrics.activeDEKID.WithLabelValues(encryptionPurposeRaft)), 0.0001)
+	require.InDelta(t, 99.0, testutil.ToFloat64(metrics.sidecarRaftIdx), 0.0001)
+}
+
+func TestEncryptionStateObserverIsInertWithoutSource(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	observer := newEncryptionStateObserver(newEncryptionMetrics(reg))
+
+	var nilObserver *EncryptionStateObserver
+	require.NotPanics(t, func() {
+		observer.Start(context.Background(), nil, time.Second)
+		nilObserver.Start(context.Background(), fakeEncryptionState{}, time.Second)
+	})
+}
+
+// fakeKEK is a kek.Wrapper whose Unwrap can be made slow and failing.
+type fakeKEK struct {
+	unwrapErr error
+	calls     int
+}
+
+func (k *fakeKEK) Wrap(dek []byte) ([]byte, error) { return append([]byte("w:"), dek...), nil }
+func (k *fakeKEK) Name() string                    { return "fake" }
+func (k *fakeKEK) Unwrap(wrapped []byte) ([]byte, error) {
+	k.calls++
+	if k.unwrapErr != nil {
+		return nil, k.unwrapErr
+	}
+	return append([]byte("u:"), wrapped...), nil
+}
+
+func TestTimedKEKUnwrapperRecordsLatencyAndDelegates(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	metrics := newEncryptionMetrics(reg)
+	inner := &fakeKEK{}
+
+	timed := NewTimedKEKUnwrapper(inner, metrics)
+	require.NotNil(t, timed)
+
+	// Drive a deterministic 250ms round trip.
+	decorator, ok := timed.(*TimedKEKUnwrapper)
+	require.True(t, ok)
+	base := time.Unix(1_700_000_000, 0)
+	step := 0
+	decorator.now = func() time.Time {
+		step++
+		if step == 1 {
+			return base
+		}
+		return base.Add(250 * time.Millisecond)
+	}
+
+	out, err := timed.Unwrap([]byte("dek"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("u:dek"), out)
+	require.Equal(t, 1, inner.calls)
+
+	// Name and Wrap must pass through untouched.
+	require.Equal(t, "fake", timed.Name())
+	wrapped, err := timed.Wrap([]byte("dek"))
+	require.NoError(t, err)
+	require.Equal(t, []byte("w:dek"), wrapped)
+
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	var sum float64
+	for _, family := range families {
+		if family.GetName() == "elastickv_encryption_kek_unwrap_seconds" {
+			sum = family.GetMetric()[0].GetHistogram().GetSampleSum()
+		}
+	}
+	require.InDelta(t, 0.25, sum, 0.0001)
+}
+
+// TestTimedKEKUnwrapperTimesAndPreservesFailures pins two things at
+// once: a failing unwrap is still timed (a KMS outage shows up as slow
+// errors, and dropping them would hide the signal), and the decorator
+// stays transparent to errors.Is so the startup guards that match
+// ErrKEKMismatch keep working through it.
+func TestTimedKEKUnwrapperTimesAndPreservesFailures(t *testing.T) {
+	t.Parallel()
+
+	reg := prometheus.NewRegistry()
+	metrics := newEncryptionMetrics(reg)
+	sentinel := encryption.ErrKEKMismatch
+	timed := NewTimedKEKUnwrapper(&fakeKEK{unwrapErr: sentinel}, metrics)
+
+	_, err := timed.Unwrap([]byte("dek"))
+	require.Error(t, err)
+	require.True(t, errors.Is(err, sentinel),
+		"the decorator must not hide the inner typed error from the startup guards")
+
+	require.Equal(t, uint64(1), gatheredHistogramCount(t, reg, "elastickv_encryption_kek_unwrap_seconds"),
+		"a failed unwrap must still be timed")
+}
+
+// gatheredHistogramCount returns a histogram's observation count.
+// CollectAndCount is the wrong tool here: it counts SERIES, and a
+// histogram is one series whether or not anything was observed.
+func gatheredHistogramCount(t *testing.T, reg *prometheus.Registry, name string) uint64 {
+	t.Helper()
+	families, err := reg.Gather()
+	require.NoError(t, err)
+	for _, family := range families {
+		if family.GetName() != name {
+			continue
+		}
+		require.Len(t, family.GetMetric(), 1)
+		return family.GetMetric()[0].GetHistogram().GetSampleCount()
+	}
+	t.Fatalf("histogram %s not registered", name)
+	return 0
+}
+
+func TestNewTimedKEKUnwrapperReturnsInnerWhenNotObservable(t *testing.T) {
+	t.Parallel()
+
+	inner := &fakeKEK{}
+	require.Same(t, inner, NewTimedKEKUnwrapper(inner, nil),
+		"a node without metrics must keep the undecorated source")
+
+	var nilRegistry *Registry
+	require.Nil(t, NewTimedKEKUnwrapper(nil, nilRegistry.KEKUnwrapObserver()))
+}
+
+func TestRegistryExposesEncryptionStateAndKEKObservers(t *testing.T) {
+	t.Parallel()
+
+	reg := NewRegistry("n1", "127.0.0.1:1")
+	require.NotNil(t, reg.EncryptionStateObserver())
+	require.NotNil(t, reg.KEKUnwrapObserver())
+
+	var nilRegistry *Registry
+	require.Nil(t, nilRegistry.EncryptionStateObserver())
+	require.Nil(t, nilRegistry.KEKUnwrapObserver())
 }
