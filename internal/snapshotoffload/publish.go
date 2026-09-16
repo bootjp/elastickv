@@ -359,23 +359,62 @@ func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotEx
 }
 
 func putPayload(ctx context.Context, store ObjectStore, key string, file *os.File, size int64, sha string) error {
-	if exists, err := verifyExistingStoreObject(ctx, store, key, size, sha); err != nil {
-		return errors.Wrap(err, "verify existing snapshot payload")
-	} else if exists {
-		return nil
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return errors.WithStack(err)
-	}
-	info, err := store.PutObject(ctx, key, file, PutOptions{
+	opts := PutOptions{
 		Size:        size,
 		SHA256:      sha,
 		ContentType: "application/octet-stream",
-	})
+	}
+	exists, err := verifyExistingStoreObject(ctx, store, key, size, sha)
+	if err != nil {
+		return errors.Wrap(err, "verify existing snapshot payload")
+	}
+	if exists {
+		return refreshExistingPayload(ctx, store, key, file, opts)
+	}
+	if err := seekPayloadFile(file); err != nil {
+		return err
+	}
+	info, err := store.PutObject(ctx, key, file, opts)
 	if err != nil {
 		return errors.Wrap(err, "put snapshot payload")
 	}
-	if info.Size != size || (info.SHA256 != "" && info.SHA256 != sha) {
+	return validatePayloadObjectInfo(key, info, opts)
+}
+
+// refreshExistingPayload restarts a reused payload's retention grace by
+// rewriting it.
+//
+// A store that cannot refresh is a hard error, not a silent skip. The
+// §5 two-pass sweep detects a reuse precisely BECAUSE the refresh moves
+// the object's mtime; if nothing moves, retention sees an untouched
+// object, sweeps it, and the publisher commits a manifest naming bytes
+// that no longer exist. Failing here costs one publish; skipping
+// quietly costs the backup.
+func refreshExistingPayload(ctx context.Context, store ObjectStore, key string, file *os.File, opts PutOptions) error {
+	refresher, ok := store.(ObjectRefresher)
+	if !ok {
+		return errors.Wrapf(ErrInvalidOptions,
+			"object store cannot refresh existing payload %s; reuse would leave it eligible for reclamation", key)
+	}
+	if err := seekPayloadFile(file); err != nil {
+		return err
+	}
+	info, err := refresher.RefreshObject(ctx, key, file, opts)
+	if err != nil {
+		return errors.Wrap(err, "refresh existing snapshot payload")
+	}
+	return validatePayloadObjectInfo(key, info, opts)
+}
+
+func seekPayloadFile(file *os.File) error {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func validatePayloadObjectInfo(key string, info ObjectInfo, opts PutOptions) error {
+	if info.Size != opts.Size || (info.SHA256 != "" && info.SHA256 != opts.SHA256) {
 		return errors.Wrapf(ErrIntegrity, "payload object %s remote integrity mismatch", key)
 	}
 	return nil
