@@ -363,6 +363,8 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(S3ChunkRefPrefix), routeS3ChunkRef},
 		{[]byte(S3ChunkBlobPrefix), routeS3ChunkBlob},
 		{[]byte(S3GCUploadPrefix), routeInternalDrop},
+		{[]byte(S3ChunkRefRCPrefix), routeInternalDrop},
+		{[]byte(S3ChunkBlobGCQueuePrefix), routeInternalDrop},
 		{[]byte(S3RoutePrefix), routeInternalDrop},
 		// SQS
 		{[]byte(SQSQueueMetaPrefix), routeSQSQueueMeta},

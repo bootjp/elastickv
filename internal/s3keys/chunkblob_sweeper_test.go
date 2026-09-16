@@ -28,6 +28,9 @@ type fakeSweepStore struct {
 	rcErrs    map[[32]byte]error
 	scanCalls int
 	lastLimit int
+	// metaClears records the SHAs whose stale queue metadata was cleared,
+	// so a test can tell the atomic clear apart from a bare key delete.
+	metaClears [][32]byte
 }
 
 // ScanGCQueue pages the fixture's entries, modelling a real store: the page
@@ -89,6 +92,23 @@ func (f *fakeSweepStore) DeleteGCQueueEntryIfUnreferenced(
 func (f *fakeSweepStore) DeleteGCQueueEntry(_ context.Context, _ s3keys.ChunkBlobGCQueueEntry) error {
 	f.calls = append(f.calls, "raft-unconditional-delete")
 	f.unconDeletes++
+	return nil
+}
+
+// ClearGCQueueMetadata models the real contract: one txn removes the queue key
+// AND rewrites the RC record with QueuedAtTS zeroed, so a test can assert the
+// record no longer claims a queue entry.
+func (f *fakeSweepStore) ClearGCQueueMetadata(
+	_ context.Context, entry s3keys.ChunkBlobGCQueueEntry,
+) error {
+	f.calls = append(f.calls, "raft-clear-queue-metadata")
+	f.metaClears = append(f.metaClears, entry.ContentSHA256)
+	if raw, ok := f.rc[entry.ContentSHA256]; ok {
+		if rc, decoded := s3keys.DecodeChunkRefRC(raw); decoded {
+			rc.QueuedAtTS = 0
+			f.rc[entry.ContentSHA256] = s3keys.EncodeChunkRefRC(rc)
+		}
+	}
 	return nil
 }
 
@@ -555,4 +575,151 @@ func TestSweeperReclaimDeletesTheZeroCountRecord(t *testing.T) {
 	require.NotContains(t, store.rc, sha,
 		"the zero-count reference record must not survive reclamation, or the RC "+
 			"keyspace grows without bound")
+}
+
+// TestSweeperDoesNotUnlinkAPayloadWrittenAfterTheEntry closes the in-flight
+// PUT window.
+//
+// The conditional unlink only detects a write that lands AFTER the sweeper's
+// stat. A PUT that re-anchors the SHA just before the stat and commits its
+// chunkref afterwards passes everything: the stat reads the PUT's new
+// timestamp, the conditional Raft delete still sees the old zero count, and
+// the conditional unlink matches the very timestamp the PUT wrote. The bytes
+// go, and the PUT then commits a reference to nothing.
+//
+// A blob that legitimately became unreferenced at entry.CommitTS was written
+// strictly before it, so a payload at or after that timestamp belongs to a
+// later PUT.
+func TestSweeperDoesNotUnlinkAPayloadWrittenAfterTheEntry(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("reanchored-before-stat")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 0, QueuedAtTS: entry.CommitTS}),
+		},
+	}
+	sweeper, local, obs := newObservedSweeperFixture(t, store)
+	// The PUT already wrote the payload; its chunkref has not committed.
+	local.writtenAt = map[[32]byte]uint64{sha: entry.CommitTS + 1}
+
+	require.NoError(t, sweeper.SweepOnce(context.Background()),
+		"a re-anchored payload is a normal outcome, not a sweep failure")
+	require.Empty(t, local.deletes, "the in-flight PUT's payload must survive")
+	require.Empty(t, local.attempts, "the unlink must not even be attempted")
+	require.Zero(t, store.condDeletes,
+		"and the queue entry must stay, so the next pass sees the PUT's committed count")
+	require.Positive(t, obs.raceLost)
+}
+
+// The boundary: a payload written strictly before the entry is the one the
+// entry describes, and is reclaimed normally.
+func TestSweeperReclaimsAPayloadWrittenBeforeTheEntry(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("genuinely-dead")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 0, QueuedAtTS: entry.CommitTS}),
+		},
+	}
+	sweeper, local := newSweeperFixture(t, store)
+	local.writtenAt = map[[32]byte]uint64{sha: entry.CommitTS - 1}
+
+	require.NoError(t, sweeper.SweepOnce(context.Background()))
+	require.Equal(t, [][32]byte{sha}, local.deletes)
+}
+
+// TestSweeperClearsQueueMetadataOnALiveRecord keeps a re-referenced blob
+// reachable by the sweeper.
+//
+// Removing only the queue key leaves the RC record claiming an entry that no
+// longer exists. PlanChunkRefRCMutations reads that claim: when the last
+// reference is later removed it takes the already-queued branch, preserves the
+// stale timestamp and writes NO replacement queue key, so the blob never
+// re-enters the queue and only the orphan scan can reclaim it -- on its own
+// interval rather than the GC grace period.
+func TestSweeperClearsQueueMetadataOnALiveRecord(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("referenced-again-same-entry")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			// Live again, and the record still points at THIS entry.
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 1, QueuedAtTS: entry.CommitTS}),
+		},
+	}
+	sweeper, local := newSweeperFixture(t, store)
+
+	require.NoError(t, sweeper.SweepOnce(context.Background()))
+	require.Equal(t, [][32]byte{sha}, store.metaClears,
+		"the timestamp must be cleared with the key, atomically")
+	require.Zero(t, store.unconDeletes, "a bare key delete would strand the blob")
+	require.Empty(t, local.deletes, "a referenced blob must survive")
+
+	rc, ok := s3keys.DecodeChunkRefRC(store.rc[sha])
+	require.True(t, ok)
+	require.False(t, rc.Queued(),
+		"the record must no longer claim a queue entry, or the next dereference "+
+			"preserves the stale timestamp and inserts no replacement key")
+}
+
+// A SUPERSEDED entry is the opposite case: the record points at a NEWER entry
+// that is still serving its own grace window, so its timestamp must survive.
+func TestSweeperKeepsQueueMetadataForASupersededEntry(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("superseded")
+	entry := queuedEntry(sha)
+	store := &fakeSweepStore{
+		entries: []s3keys.ChunkBlobGCQueueEntry{entry},
+		rc: map[[32]byte][]byte{
+			sha: s3keys.EncodeChunkRefRC(s3keys.ChunkRefRC{Count: 1, QueuedAtTS: entry.CommitTS + 99}),
+		},
+	}
+	sweeper, _ := newSweeperFixture(t, store)
+
+	require.NoError(t, sweeper.SweepOnce(context.Background()))
+	require.Empty(t, store.metaClears, "the newer entry's timestamp is not ours to clear")
+	require.Equal(t, 1, store.unconDeletes)
+
+	rc, ok := s3keys.DecodeChunkRefRC(store.rc[sha])
+	require.True(t, ok)
+	require.Equal(t, entry.CommitTS+99, rc.QueuedAtTS)
+}
+
+// TestSweeperBoundsRetainedFailures pins that a broad failure over a large
+// backlog does not retain one wrapped error per entry.
+//
+// Paging the scan bounded the entries held at once but not the errors, so a
+// million-entry backlog whose RC reads all fail could still exhaust memory
+// before the join. Every failure is still counted; only the detail is sampled.
+func TestSweeperBoundsRetainedFailures(t *testing.T) {
+	t.Parallel()
+
+	const entries = 500
+	store := &fakeSweepStore{rc: map[[32]byte][]byte{}, rcErrs: map[[32]byte]error{}}
+	for i := range entries {
+		sha := testSHA("bulk-" + strconv.Itoa(i))
+		store.entries = append(store.entries, queuedEntry(sha))
+		store.rcErrs[sha] = errors.New("rc read unavailable")
+	}
+	sweeper, _, _ := newObservedSweeperFixtureWithPageSize(t, store, 50)
+
+	err := sweeper.SweepOnce(context.Background())
+	require.Error(t, err)
+	require.ErrorContains(t, err, "500 failures",
+		"every failure must still be counted")
+	// The retained detail must be strictly smaller than the failure count,
+	// which is the whole property: "showing 500" would also contain the word
+	// "showing" while retaining one error per entry.
+	require.ErrorContains(t, err, fmt.Sprintf("(showing %d)", s3keys.MaxRetainedSweepFailures))
+	require.Less(t, s3keys.MaxRetainedSweepFailures, entries,
+		"the cap has to bite for this fixture to test anything")
 }

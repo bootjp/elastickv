@@ -35,6 +35,23 @@ const (
 	// because the blob is referenced again or because a newer entry
 	// supersedes this one.
 	SweepDropQueueEntryOnly
+
+	// SweepClearStaleQueueMetadata deletes the queue entry AND clears
+	// QueuedAtTS on the live RC record, atomically.
+	//
+	// Dropping only the key leaves the record claiming a queue entry that
+	// no longer exists, and PlanChunkRefRCMutations reads that claim: when
+	// the last reference is later removed it takes the `existing.Queued()`
+	// branch, preserves the stale timestamp, and inserts NO replacement
+	// queue key. The blob then never re-enters the queue, so the sweeper
+	// never sees it again and only the orphan scan can reclaim it -- on its
+	// own independently configurable interval rather than the GC grace
+	// period this keyspace exists to enforce.
+	//
+	// Distinct from SweepDropQueueEntryOnly because a SUPERSEDED entry must
+	// keep its timestamp: there the record points at a newer entry that is
+	// still serving its own grace window.
+	SweepClearStaleQueueMetadata
 )
 
 func (v ChunkBlobSweepVerdict) String() string {
@@ -43,6 +60,8 @@ func (v ChunkBlobSweepVerdict) String() string {
 		return "reclaim"
 	case SweepDropQueueEntryOnly:
 		return "drop_queue_entry_only"
+	case SweepClearStaleQueueMetadata:
+		return "clear_stale_queue_metadata"
 	case SweepSkip:
 		return "skip"
 	default:
@@ -98,6 +117,18 @@ func ClassifyChunkBlobSweep(entryTS uint64, rcValue []byte, rcFound bool) ChunkB
 		// §3.5(c): referenced again. The entry is stale — either a
 		// re-reference txn failed to remove it or this sweeper raced
 		// one. Drop the entry, keep the blob.
+		if rc.Queued() && rc.QueuedAtTS == entryTS {
+			// The record still points at THIS entry, so clearing the
+			// timestamp alongside the key is what makes the record
+			// consistent again. Leaving it set strands the blob outside
+			// the queue for good; see SweepClearStaleQueueMetadata.
+			return ChunkBlobSweepDecision{
+				Verdict: SweepClearStaleQueueMetadata,
+				Reason:  SweepReasonReferencedAgain,
+			}
+		}
+		// The record points somewhere else (or nowhere). Only the key is
+		// ours to remove.
 		return ChunkBlobSweepDecision{
 			Verdict: SweepDropQueueEntryOnly,
 			Reason:  SweepReasonReferencedAgain,

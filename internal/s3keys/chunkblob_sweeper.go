@@ -96,7 +96,26 @@ type ChunkBlobSweepStore interface {
 	// for the §3.5(c) stale-entry path, where the blob is explicitly
 	// being left in place.
 	DeleteGCQueueEntry(ctx context.Context, entry ChunkBlobGCQueueEntry) error
+
+	// ClearGCQueueMetadata deletes the entry AND clears QueuedAtTS on the
+	// live RC record in ONE transaction.
+	//
+	// Atomic because the two halves are only consistent together. Between
+	// them the record would claim a queue entry that does not exist, and a
+	// dereference landing in that window takes
+	// PlanChunkRefRCMutations' already-queued branch: it preserves the
+	// stale timestamp and writes no replacement queue key, stranding the
+	// blob outside the queue permanently.
+	ClearGCQueueMetadata(ctx context.Context, entry ChunkBlobGCQueueEntry) error
 }
+
+// maxRetainedSweepFailures caps how many per-entry errors one pass keeps for
+// its joined return value. Every failure is still counted; only the detail is
+// sampled, because a backlog large enough to matter is also large enough for
+// one error per entry to be the memory problem rather than the diagnosis.
+// Exported so a test can assert the cap actually bites rather than
+// hard-coding a number that could drift past the fixture size.
+const MaxRetainedSweepFailures = 64
 
 // ChunkBlobLocalStore is the node-local half: the chunkblob payload in
 // Pebble, never written through Raft.
@@ -283,10 +302,11 @@ func (s *ChunkBlobSweeper) SweepOnce(ctx context.Context) error {
 // million-entry queue is slow to drain rather than fatal to load.
 func (s *ChunkBlobSweeper) sweepPages(ctx context.Context, boundary uint64) error {
 	var (
-		failures []error
-		scanned  int
-		startKey = ChunkBlobGCQueueScanStart()
-		endKey   = ChunkBlobGCQueueScanEnd(boundary)
+		failures     []error
+		failureCount int
+		scanned      int
+		startKey     = ChunkBlobGCQueueScanStart()
+		endKey       = ChunkBlobGCQueueScanEnd(boundary)
 	)
 	// Cancellation ends the walk between pages; the remaining entries stay
 	// queued for the next pass, so an interrupted sweep costs a delay rather
@@ -295,19 +315,30 @@ func (s *ChunkBlobSweeper) sweepPages(ctx context.Context, boundary uint64) erro
 		entries, next, err := s.store.ScanGCQueue(ctx, startKey, endKey, s.pageSize)
 		if err != nil {
 			failures = append(failures, errors.Wrap(err, "chunkblob gc: scan queue"))
+			failureCount++
 			break
 		}
 		scanned += len(entries)
 		pageFailures, cancelled := s.sweepPage(ctx, entries)
-		failures = append(failures, pageFailures...)
+		failureCount += len(pageFailures)
+		// Counted in full, retained as a bounded sample. Paging the scan
+		// bounded the entries held at once but not the errors: a large
+		// eligible backlog hitting a broad per-entry failure -- RC reads
+		// failing while queue scans keep working -- accumulated one wrapped
+		// error per queued entry across every page, so a million-entry
+		// backlog could still exhaust memory before the join.
+		if room := MaxRetainedSweepFailures - len(failures); room > 0 {
+			failures = append(failures, pageFailures[:min(room, len(pageFailures))]...)
+		}
 		if cancelled || len(next) == 0 {
 			break
 		}
 		startKey = next
 	}
-	if len(failures) > 0 {
+	if failureCount > 0 {
 		return errors.Wrapf(errors.Join(failures...),
-			"chunkblob gc: %d failures over %d queue entries", len(failures), scanned)
+			"chunkblob gc: %d failures over %d queue entries (showing %d)",
+			failureCount, scanned, len(failures))
 	}
 	return nil
 }
@@ -358,6 +389,11 @@ func (s *ChunkBlobSweeper) sweepEntry(ctx context.Context, entry ChunkBlobGCQueu
 			return errors.Wrapf(err, "chunkblob gc: drop stale queue entry for %x", entry.ContentSHA256[:4])
 		}
 		return nil
+	case SweepClearStaleQueueMetadata:
+		if err := s.store.ClearGCQueueMetadata(ctx, entry); err != nil {
+			return errors.Wrapf(err, "chunkblob gc: clear stale queue metadata for %x", entry.ContentSHA256[:4])
+		}
+		return nil
 	case SweepReclaim:
 		return s.reclaim(ctx, entry)
 	default:
@@ -380,6 +416,25 @@ func (s *ChunkBlobSweeper) reclaim(ctx context.Context, entry ChunkBlobGCQueueEn
 	writtenAtTS, present, err := s.local.ChunkBlobWrittenAt(ctx, entry.ContentSHA256)
 	if err != nil {
 		return errors.Wrapf(err, "chunkblob gc: stat local blob %x", entry.ContentSHA256[:4])
+	}
+	// A payload written at or after the moment this blob became reclaimable
+	// belongs to a LATER PUT, whose reference may not have committed yet.
+	//
+	// DeleteChunkBlobIfUnchanged cannot catch that on its own: it only
+	// detects a write that lands after this stat. A PUT that re-anchors the
+	// SHA just BEFORE the stat and commits its chunkref afterwards passes
+	// every check -- the stat sees the PUT's new timestamp, the conditional
+	// Raft delete still reads the old zero count, and the conditional unlink
+	// matches the very timestamp the PUT wrote. The bytes go, and the PUT
+	// then commits a reference to nothing.
+	//
+	// Comparing against the queue entry's own commit timestamp closes that:
+	// a blob that legitimately became unreferenced at entry.CommitTS was
+	// written strictly before it. Leaving the entry in place is safe -- the
+	// next pass reads the PUT's committed count and takes the stale path.
+	if present && writtenAtTS >= entry.CommitTS {
+		s.observer.ObserveChunkBlobSweepRaceLost()
+		return nil
 	}
 	if err := s.store.DeleteGCQueueEntryIfUnreferenced(ctx, entry); err != nil {
 		if errors.Is(err, ErrQueueEntryChanged) {

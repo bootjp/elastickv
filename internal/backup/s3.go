@@ -30,7 +30,14 @@ const (
 	S3ChunkRefPrefix       = s3keys.ChunkRefPrefix
 	S3ChunkBlobPrefix      = s3keys.ChunkBlobPrefix
 	S3GCUploadPrefix       = s3keys.GCUploadPrefix
-	S3RoutePrefix          = s3keys.RoutePrefix
+	// Raft-replicated operational keyspaces for chunkblob GC. They appear
+	// in physical snapshots, so the decoder has to recognise them: an
+	// unrouted prefix counts as Unknown, which this package defines as the
+	// format-skew/corruption signal, and an ordinary snapshot from a
+	// GC-enabled cluster would report false corruption.
+	S3ChunkRefRCPrefix       = s3keys.ChunkRefRCPrefix
+	S3ChunkBlobGCQueuePrefix = s3keys.ChunkBlobGCQueuePrefix
+	S3RoutePrefix            = s3keys.RoutePrefix
 )
 
 // S3MetaSuffixReserved is the sidecar suffix per the design doc. A user
