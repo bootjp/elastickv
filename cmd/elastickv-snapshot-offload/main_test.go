@@ -71,6 +71,7 @@ func TestSnapshotOffloadCLIRequiresLocalRoot(t *testing.T) {
 		"--store", storeLocal,
 		"--data-dir", "data",
 		"--group-id", "1",
+		"--source-cluster", "prod-tokyo",
 	}, io.Discard, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.ErrorContains(t, err, "--local-root is required")
 	require.Equal(t, exitUserErr, code)
@@ -105,6 +106,7 @@ func TestSnapshotOffloadCLIS3KMSRequiresAWSKMS(t *testing.T) {
 		"--s3-kms-key-id", "key-id",
 		"--data-dir", "data",
 		"--group-id", "1",
+		"--source-cluster", "prod-tokyo",
 	})
 	require.NoError(t, err)
 
@@ -115,6 +117,7 @@ func TestSnapshotOffloadCLIS3KMSRequiresAWSKMS(t *testing.T) {
 		"--s3-kms-key-id", "key-id",
 		"--data-dir", "data",
 		"--group-id", "1",
+		"--source-cluster", "prod-tokyo",
 	})
 	require.ErrorContains(t, err, "s3 KMS key id requires aws:kms encryption")
 }
@@ -372,4 +375,38 @@ func TestSnapshotOffloadCLIRestoreRequiresAnExpectedSourceCluster(t *testing.T) 
 	})
 	require.Error(t, err)
 	require.Contains(t, err.Error(), "--expect-source-cluster is required")
+}
+
+// TestSnapshotOffloadCLIPublishRequiresASourceClusterForEveryGroup pins that
+// publish and restore agree on this flag.
+//
+// It used to be required only for group 0. restore rejects an empty
+// --expect-source-cluster outright and then compares it against the manifest's
+// own SourceCluster, so a manifest published without one can never match: a
+// nonzero-group backup taken with this CLI was unrestorable by it. Relaxing
+// the restore side instead would give back the wrong-cluster restore that
+// check exists to prevent.
+func TestSnapshotOffloadCLIPublishRequiresASourceClusterForEveryGroup(t *testing.T) {
+	t.Parallel()
+
+	for _, group := range []string{"0", "1", "7"} {
+		_, err := parsePublishFlags([]string{
+			"--store", storeLocal,
+			"--local-root", "/tmp/objects",
+			"--data-dir", "data",
+			"--group-id", group,
+		})
+		require.ErrorContains(t, err, "--source-cluster is required",
+			"group %s must not be able to publish an unrestorable manifest", group)
+
+		cfg, err := parsePublishFlags([]string{
+			"--store", storeLocal,
+			"--local-root", "/tmp/objects",
+			"--data-dir", "data",
+			"--group-id", group,
+			"--source-cluster", "prod-tokyo",
+		})
+		require.NoError(t, err)
+		require.Equal(t, "prod-tokyo", cfg.sourceCluster)
+	}
 }

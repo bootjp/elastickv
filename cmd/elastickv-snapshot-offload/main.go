@@ -129,7 +129,7 @@ func parsePublishFlags(argv []string) (*publishConfig, error) {
 	fs.StringVar(&cfg.dataDir, "data-dir", "", "Source raft data directory containing a persisted snapshot (required)")
 	fs.StringVar(&cfg.prefix, "prefix", "", "Object key prefix for published snapshot objects")
 	fs.Uint64Var(&cfg.groupID, "group-id", 0, "Raft group ID recorded in the manifest")
-	fs.StringVar(&cfg.sourceCluster, "source-cluster", "", "Source cluster identifier (required for group 0 manifests)")
+	fs.StringVar(&cfg.sourceCluster, "source-cluster", "", "Source cluster identifier (required; restore matches it against the manifest)")
 	fs.StringVar(&cfg.binaryVersion, "binary-version", "", "Binary version recorded in the manifest")
 	fs.StringVar(&cfg.spoolDir, "spool-dir", "", "Temporary spool directory for the payload stream")
 	if err := fs.Parse(argv); err != nil {
@@ -141,8 +141,14 @@ func parsePublishFlags(argv []string) (*publishConfig, error) {
 	if strings.TrimSpace(cfg.dataDir) == "" {
 		return nil, errors.New("--data-dir is required")
 	}
-	if cfg.groupID == 0 && strings.TrimSpace(cfg.sourceCluster) == "" {
-		return nil, errors.New("--source-cluster is required when --group-id is 0")
+	// Required for EVERY group, not just group 0. restore rejects an empty
+	// --expect-source-cluster outright and then compares it against the
+	// manifest's own value, so a manifest published without one can never
+	// match: a nonzero-group backup taken with this CLI would be
+	// unrestorable by it. Relaxing the restore side instead would give back
+	// the wrong-cluster restore that check exists to prevent.
+	if strings.TrimSpace(cfg.sourceCluster) == "" {
+		return nil, errors.New("--source-cluster is required")
 	}
 	if err := validateStoreFlags(cfg.store); err != nil {
 		return nil, err
