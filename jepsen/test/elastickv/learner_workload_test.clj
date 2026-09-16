@@ -21,7 +21,21 @@
   [{:type :invoke :f :write :value 1 :time 10 :process 0}
    {:type :ok     :f :write :value 1 :time 20 :process 0}
    {:type :invoke :f :read  :time 30 :process 0}
-   {:type :ok     :f :read  :value {:lease? true :value 1} :time 40 :process 0}])
+   {:type :ok     :f :read  :value {:lease? true :value 1} :time 40 :process 0}
+   ;; The min_applied_index probe, REFUSED. A :fail here is the property
+   ;; holding: the live promotion path waits for catch-up first, so this is
+   ;; the only op that can present the server with a violation to reject.
+   {:type :invoke :f :promote-learner-early :value "n5" :time 42 :process 0}
+   {:type :fail   :f :promote-learner-early :time 44 :process 0
+    :error "min_applied_index not reached"}])
+
+(def ^:private probe-refused
+  "The min_applied_index probe, refused. Histories that are not about the
+  probe still have to carry it: a run that never asked proves nothing about
+  enforcement, so the checker treats an absent probe as a failure."
+  [{:type :invoke :f :promote-learner-early :value "n5" :time 1 :process 9}
+   {:type :fail   :f :promote-learner-early :time 2 :process 9
+    :error "min_applied_index not reached"}])
 
 (defn- promotion
   [m time]
@@ -103,50 +117,58 @@
 ;; ---------------------------------------------------------------------------
 
 (deftest a-write-lost-across-a-promotion-is-rejected
-  (let [r (check [{:type :invoke :f :write :value 7 :time 10}
-                  {:type :ok     :f :write :value 7 :time 20}
-                  {:type :invoke :f :promote-learner :value "n5" :time 30}
-                  (promotion {} 40)
-                  {:type :invoke :f :read :time 50}
-                  {:type :ok     :f :read :value {:lease? true :value 3} :time 60}])]
+  (let [r (check (concat probe-refused
+                         [{:type :invoke :f :write :value 7 :time 10}
+                          {:type :ok     :f :write :value 7 :time 20}
+                          {:type :invoke :f :promote-learner :value "n5" :time 30}
+                          (promotion {} 40)
+                          {:type :invoke :f :read :time 50}
+                          {:type :ok :f :read :value {:lease? true :value 3} :time 60}]))]
     (is (false? (:valid? r)))
     (is (= 1 (count (:lost-writes r))))))
 
 (deftest an-overwritten-value-is-not-a-lost-write
   ;; Set subtraction reported 1 as lost in this legal register history merely
   ;; because it was overwritten before anyone read it.
-  (let [r (check [{:type :invoke :f :write :value 1 :time 10}
-                  {:type :ok     :f :write :value 1 :time 20}
-                  {:type :invoke :f :write :value 2 :time 30}
-                  {:type :ok     :f :write :value 2 :time 40}
-                  {:type :invoke :f :promote-learner :value "n5" :time 50}
-                  (promotion {} 60)
-                  {:type :invoke :f :read :time 70}
-                  {:type :ok     :f :read :value {:lease? true :value 2} :time 80}])]
+  (let [r (check (concat probe-refused
+                         [{:type :invoke :f :write :value 1 :time 10}
+                          {:type :ok     :f :write :value 1 :time 20}
+                          {:type :invoke :f :write :value 2 :time 30}
+                          {:type :ok     :f :write :value 2 :time 40}
+                          {:type :invoke :f :promote-learner :value "n5" :time 50}
+                          (promotion {} 60)
+                          {:type :invoke :f :read :time 70}
+                          {:type :ok :f :read :value {:lease? true :value 2} :time 80}]))]
     (is (:valid? r) (str "lost-writes=" (:lost-writes r)))))
 
 (deftest a-concurrent-write-makes-the-expected-value-ambiguous-not-wrong
   ;; With another write in flight between the acked write and the read, the
   ;; register's value is not pinned, so no conclusion is drawn rather than a
   ;; false loss being reported.
-  (let [r (check [{:type :invoke :f :write :value 1 :time 10}
-                  {:type :ok     :f :write :value 1 :time 20}
-                  {:type :invoke :f :promote-learner :value "n5" :time 30}
-                  (promotion {} 40)
-                  {:type :invoke :f :write :value 9 :time 50}
-                  {:type :invoke :f :read :time 60}
-                  {:type :ok     :f :read :value {:lease? true :value 9} :time 70}])]
+  (let [r (check (concat probe-refused
+                         [{:type :invoke :f :write :value 1 :time 10}
+                          {:type :ok     :f :write :value 1 :time 20}
+                          {:type :invoke :f :promote-learner :value "n5" :time 30}
+                          (promotion {} 40)
+                          {:type :invoke :f :write :value 9 :time 50}
+                          {:type :invoke :f :read :time 60}
+                          {:type :ok :f :read :value {:lease? true :value 9} :time 70}]))]
     (is (:valid? r) (str "lost-writes=" (:lost-writes r)))))
 
 ;; ---------------------------------------------------------------------------
 ;; 3. A learner never counts toward the lease
 ;; ---------------------------------------------------------------------------
 
-(defn- partition-window [start stop]
-  [{:type :info :process :nemesis :f :start-partition
-    :value {:scope :learners-only} :time start}
-   {:type :info :process :nemesis :f :stop-partition
-    :value {:scope :learners-only} :time stop}])
+(defn- partition-window
+  "A learners-only window carrying the lease counters the nemesis samples at
+  its edges. The default delta is a healthy one: reads were served from the
+  lease (hit moved) and none fell back (miss did not)."
+  ([start stop] (partition-window start stop {:hit 10 :miss 0} {:hit 14 :miss 0}))
+  ([start stop before after]
+   [{:type :info :process :nemesis :f :start-partition
+     :value {:scope :learners-only :lease-counters before} :time start}
+    {:type :info :process :nemesis :f :stop-partition
+     :value {:scope :learners-only :lease-counters after} :time stop}]))
 
 (deftest a-lease-read-failing-under-learner-isolation-is-rejected
   ;; Reads, not writes: quorumAckTracker feeds LastQuorumAck and the
@@ -304,34 +326,35 @@
     (is (empty? (:lost-writes r))
         "and it must not be mistaken for a lost write either")))
 
-(deftest a-slow-lease-read-under-learner-isolation-is-rejected
-  ;; Failures alone cannot detect the quorum-ack regression: a Redis GET calls
-  ;; LeaseReadForKeyThrough, and when the lease is unavailable the engine falls
-  ;; back to LinearizableRead transparently — so with the voters connected the
-  ;; read SUCCEEDS and a failure-only check stays empty through exactly the
-  ;; regression it claims to catch. What changes is the latency.
+(deftest a-lease-read-that-fell-back-under-learner-isolation-is-rejected
+  ;; Neither failures nor latency can establish this. A Redis GET calls
+  ;; LeaseReadForKeyThrough and the engine falls back to LinearizableRead
+  ;; transparently, so the read SUCCEEDS — and on one host that fallback costs
+  ;; milliseconds, so any latency budget loose enough not to flag jitter sits
+  ;; far above it. elastickv_lease_read_total separates them by construction:
+  ;; its help text defines miss as "fell back to LinearizableRead".
   (let [r (check (concat healthy-prefix
                          [(promotion {} 50)]
                          (post-promotion-read 60)
-                         (partition-window 100 200)
-                         [{:type :invoke :f :read :time 120}
-                          {:type :ok :f :read :time 130
-                           :value {:lease? true :latency-ms 900.0 :value 1}}]))]
+                         (partition-window 100 200
+                                           {:hit 10 :miss 0}
+                                           {:hit 12 :miss 3})))]
     (is (false? (:valid? r)))
-    (is (= 1 (count (:slow-lease-reads r)))
-        "a lease read that fell back to a Raft round trip must fail the run")))
+    (is (= 1 (count (:lease-fast-path-losses r)))
+        "a lease read that fell back to a Raft round trip must fail the run")
+    (is (= 3 (:miss-delta (first (:lease-fast-path-losses r)))))))
 
 (deftest a-fast-lease-read-under-learner-isolation-is-fine
   (let [r (check (concat healthy-prefix
                          [(promotion {} 50)]
                          (post-promotion-read 60)
-                         (partition-window 100 200)
-                         [{:type :invoke :f :read :time 120}
-                          {:type :ok :f :read :time 130
-                           :value {:lease? true :latency-ms 3.0 :value 1}}]))]
-    (is (:valid? r) (str "slow=" (:slow-lease-reads r)))))
+                         (partition-window 100 200)))]
+    (is (:valid? r) (str "losses=" (:lease-fast-path-losses r)
+                         " unmeasured=" (:unmeasured-partition-windows r)))))
 
-(deftest a-slow-lease-read-outside-the-window-is-not-attributed-to-the-learner
+(deftest a-fallback-outside-the-window-is-not-attributed-to-the-learner
+  ;; The counters are sampled at the window's own edges, so a miss that
+  ;; happened outside it cannot appear in the delta at all.
   (let [r (check (concat healthy-prefix
                          [(promotion {} 50)]
                          (post-promotion-read 60)
@@ -339,7 +362,119 @@
                          [{:type :invoke :f :read :time 500}
                           {:type :ok :f :read :time 510
                            :value {:lease? true :latency-ms 900.0 :value 1}}]))]
-    (is (:valid? r) (str "slow=" (:slow-lease-reads r)))))
+    (is (:valid? r) (str "losses=" (:lease-fast-path-losses r)))))
+
+(deftest a-window-with-no-lease-read-served-proves-nothing
+  ;; The read coverage gate counted successful reads ANYWHERE in the run, so
+  ;; reads taken before attachment or after the heal satisfied it while the
+  ;; quorum-ack property went unexercised. An unmoved hit counter is what that
+  ;; looks like from the metrics.
+  (let [r (check (concat healthy-prefix
+                         [(promotion {} 50)]
+                         (post-promotion-read 60)
+                         (partition-window 100 200
+                                           {:hit 10 :miss 0}
+                                           {:hit 10 :miss 0})))]
+    (is (false? (:valid? r)))
+    (is (= [:no-lease-read-served]
+           (map :reason (:unmeasured-partition-windows r))))))
+
+(deftest a-window-whose-counters-could-not-be-sampled-proves-nothing
+  ;; Zero misses and no data are indistinguishable unless this is checked.
+  (let [r (check (concat healthy-prefix
+                         [(promotion {} 50)]
+                         (post-promotion-read 60)
+                         (partition-window 100 200 nil nil)))]
+    (is (false? (:valid? r)))
+    (is (= [:counters-unavailable]
+           (map :reason (:unmeasured-partition-windows r))))))
+
+(deftest a-server-that-accepts-a-premature-promotion-fails-the-run
+  ;; premature-promotions cannot fail on its own: the live path waits for
+  ;; catch-up and then records that already-qualified index as :match, so
+  ;; match >= target holds by construction even if the engine dropped the
+  ;; min_applied_index test entirely. An accepted probe is the observation.
+  (let [r (check (concat [{:type :invoke :f :write :value 1 :time 10 :process 0}
+                          {:type :ok     :f :write :value 1 :time 20 :process 0}
+                          {:type :invoke :f :read  :time 30 :process 0}
+                          {:type :ok     :f :read  :value {:lease? true :value 1}
+                           :time 40 :process 0}
+                          {:type :invoke :f :promote-learner-early :value "n5"
+                           :time 42 :process 0}
+                          {:type :ok :f :promote-learner-early :time 44 :process 0
+                           :value {:node "n5" :leader-commit-index 100
+                                   :min-applied-index 1000100}}]
+                         [(promotion {} 50)]
+                         (post-promotion-read 60)))]
+    (is (false? (:valid? r)))
+    (is (= 1 (count (:unenforced-min-applied-index r)))
+        "a promotion accepted above any reachable applied index is the defect")))
+
+(deftest a-run-that-never-probed-min-applied-index-is-not-evidence
+  ;; Without this, "no accepted premature promotions" and "never asked" look
+  ;; identical in the result map.
+  (let [r (check (concat [{:type :invoke :f :write :value 1 :time 10 :process 0}
+                          {:type :ok     :f :write :value 1 :time 20 :process 0}
+                          {:type :invoke :f :read  :time 30 :process 0}
+                          {:type :ok     :f :read  :value {:lease? true :value 1}
+                           :time 40 :process 0}]
+                         [(promotion {} 50)]
+                         (post-promotion-read 60)))]
+    (is (false? (:valid? r)))
+    (is (false? (:min-applied-index-probe-ran r)))))
+
+(deftest overlapping-writes-are-ambiguous-rather-than-lost
+  ;; Completion order alone does not identify the register's final value.
+  ;; Write 1 runs t=10..40 and write 2 runs t=20..30: both linearization
+  ;; orders are legal, so a later read of 2 is valid. Looking only for writes
+  ;; INVOKED after write 1 completed misses write 2 and reports a loss that
+  ;; never happened.
+  (let [r (check (concat [{:type :invoke :f :write :value 1 :time 10 :process 0}
+                          {:type :invoke :f :write :value 2 :time 20 :process 1}
+                          {:type :ok     :f :write :value 2 :time 30 :process 1}
+                          {:type :ok     :f :write :value 1 :time 40 :process 0}
+                          {:type :invoke :f :promote-learner-early :value "n5"
+                           :time 42 :process 2}
+                          {:type :fail   :f :promote-learner-early :time 44 :process 2}]
+                         [(promotion {} 50)]
+                         [{:type :invoke :f :read :time 60 :process 3}
+                          {:type :ok :f :read :value {:lease? true :value 2}
+                           :time 70 :process 3}]))]
+    (is (empty? (:lost-writes r))
+        "a write that overlapped the last completion makes the value ambiguous")
+    (is (:valid? r) (str r))))
+
+(deftest a-completion-is-paired-with-its-own-invocation
+  ;; Process membership is not a pairing. P invokes a read before the
+  ;; promotion, completes it after, then invokes another read after — P is in
+  ;; the set of processes that invoked after t, so the EARLIER, pre-promotion
+  ;; completion was selected as the first post-promotion read.
+  (let [r (check (concat healthy-prefix
+                         [{:type :invoke :f :write :value 7 :time 45 :process 0}
+                          {:type :ok     :f :write :value 7 :time 46 :process 0}
+                          ;; Invoked before the promotion, completes after.
+                          {:type :invoke :f :read :time 48 :process 1}
+                          (promotion {} 50)
+                          {:type :ok :f :read :value {:lease? true :value 1}
+                           :time 55 :process 1}
+                          ;; The same process reads again, properly after.
+                          {:type :invoke :f :read :time 60 :process 1}
+                          {:type :ok :f :read :value {:lease? true :value 7}
+                           :time 70 :process 1}]))]
+    (is (empty? (:lost-writes r))
+        "the stale completion must not be read as the post-promotion value")
+    (is (:valid? r) (str r))))
+
+(deftest promotion-must-actually-change-the-quorum-threshold
+  ;; Five nodes reserve one candidate, so the run starts at four voters and
+  ;; promotion takes it to five — but majority(4) and majority(5) are both 3,
+  ;; so the transition the workload is named for never happens.
+  (is (false? (lw/promotion-changes-quorum? ["n1" "n2" "n3" "n4" "n5"]))
+      "four voters to five needs three either way")
+  (is (lw/promotion-changes-quorum? ["n1" "n2" "n3" "n4"])
+      "three voters to four moves the majority from 2 to 3")
+  (is (lw/promotion-changes-quorum? lw/default-nodes)
+      "the default topology must be one where promotion changes the threshold"))
 
 (deftest the-nemesis-handles-the-operations-the-generator-emits
   ;; jepsen.nemesis/partitioner dispatches on :start and :stop. Feeding it
@@ -400,10 +535,23 @@
     (is (contains? args "--raftJoinMembers"))
     (is (contains? args "n1=n1:50051,n2=n2:50051")))
 
-  ;; The candidate itself is excluded from the members it discovers: it is
-  ;; joining, not already a member.
-  (is (= "n1=n1:50051,n2=n2:50051"
+  ;; The candidate is INCLUDED, at its own listener address. resolveJoinServers
+  ;; (main.go) rejects a members list that omits the local --raftId with
+  ;; ErrJoinMembersMissingLocalNode, so a candidate given only the voters
+  ;; receives the join flags and then exits during startup validation.
+  (is (= "n1=n1:50051,n2=n2:50051,n5=n5:50051"
          (ekdb/join-members-arg ["n1" "n2" "n5"] "n5" 50051)))
+
+  ;; The address must be the candidate's OWN listener: resolveJoinServers also
+  ;; refuses when the local entry's address does not match, so a placeholder
+  ;; that merely carries the right ID would fail the same validation.
+  (is (clojure.string/includes?
+        (ekdb/join-members-arg ["n1" "n2" "n5"] "n5" 50051)
+        "n5=n5:50051"))
+
+  ;; With no reserved candidate the list is just the nodes, unduplicated.
+  (is (= "n1=n1:50051,n2=n2:50051"
+         (ekdb/join-members-arg ["n1" "n2"] nil 50051)))
 
   ;; An ordinary voter gets neither flag.
   (let [args (set (ekdb/server-args {:node "n2" :grpc "n2:50051" :redis "n2:6379"

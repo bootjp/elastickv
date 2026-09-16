@@ -2,6 +2,7 @@
   "Jepsen DB adapter that builds, deploys, and manages elastickv nodes."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as sh]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [db :as db]
                     [util :as util]]
@@ -94,6 +95,39 @@
   (parse-raft-status
     (c/on node (c/su (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
                              raftadmin-bin addr "status")))))
+
+(def ^:private metrics-port 9090)
+
+(defn lease-read-counters
+  "Reads elastickv_lease_read_total{outcome=...} from a node's metrics
+  endpoint, as {:hit n :miss n}.
+
+  This is the only direct evidence of WHICH read path ran. A lease read that
+  loses the fast path does not fail -- kv/raft_engine.go falls back to
+  LinearizableRead -- and on a single-host cluster that fallback costs
+  milliseconds, so latency cannot separate the two either. The counter can:
+  the metric's own help text defines miss as \"fell back to LinearizableRead\".
+
+  Returns nil when the endpoint is unreachable, so a caller can tell \"no
+  samples\" apart from \"zero misses\"."
+  [node]
+  (try
+    (let [out (c/on node
+                (c/su (c/exec :curl :--connect-timeout 2 :--max-time 5 :-fsS
+                              (str "http://127.0.0.1:" metrics-port "/metrics"))))
+          grab (fn [outcome]
+                 (some->> (str/split-lines (str out))
+                          (filter #(str/starts-with?
+                                     % (str "elastickv_lease_read_total{outcome=\""
+                                            outcome "\"}")))
+                          first
+                          (re-find #"\s([0-9.eE+-]+)\s*$")
+                          second
+                          Double/parseDouble
+                          long))]
+      (when-let [hit (grab "hit")]
+        {:hit hit :miss (or (grab "miss") 0)}))
+    (catch Exception _ nil)))
 
 (defn- node-addr
   "Returns host:port for the node and port."
@@ -237,16 +271,22 @@
                 "--" (name node) (str p))))))
 
 (defn join-members-arg
-  "The --raftJoinMembers value for a learner candidate: the voters it should
-  discover, as raftID=host:port pairs.
+  "The --raftJoinMembers value for a learner candidate: raftID=host:port pairs.
 
-  Only the members that are actually part of the cluster -- the candidate
-  itself is excluded, since it is joining, not already a member."
+  The candidate is INCLUDED, at its own listener address. Excluding it looks
+  right -- it is joining, not already a member -- but `resolveJoinServers`
+  (main.go) refuses to start when the list omits the local --raftId, returning
+  ErrJoinMembersMissingLocalNode, and it also requires the entry's address to
+  equal the local listener address. So a candidate handed a members list
+  without itself receives the join flags and then exits during startup
+  validation, which is not a learner that can be attached."
   [nodes reserved grpc-port]
-  (let [reserved (when reserved (name reserved))]
-    (->> nodes
-         (remove #(= reserved (name %)))
-         (map #(str (name %) "=" (name %) ":" grpc-port))
+  (let [reserved (when reserved (name reserved))
+        members  (->> nodes
+                      (map name)
+                      (remove #(= reserved %)))]
+    (->> (if reserved (conj (vec members) reserved) (vec members))
+         (map #(str % "=" % ":" grpc-port))
          (clojure.string/join ","))))
 
 (defn voter-peers

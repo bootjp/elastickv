@@ -52,7 +52,15 @@
                     [os :as os]]
             [taoensso.carmine :as car :refer [wcar]]))
 
-(def default-nodes ["n1" "n2" "n3" "n4" "n5"])
+;; FOUR nodes, not five: three voters plus the reserved candidate.
+;;
+;; With five, the run starts at four voters and promotion takes it to five --
+;; but majority(4) and majority(5) are both 3, and followerQuorumForClusterSize
+;; is 2 for both, so the quorum-denominator transition this workload is named
+;; for never actually happens and a bug that only appears when promotion raises
+;; the threshold cannot surface. Three voters going to four moves the majority
+;; from 2 to 3 and the follower quorum from 1 to 2.
+(def default-nodes ["n1" "n2" "n3" "n4"])
 
 ;; The last node is reserved as the learner candidate: ElastickvDB's setup
 ;; otherwise runs `raftadmin add_voter` for every node after the bootstrap
@@ -68,6 +76,23 @@
   "The nodes that join as voters during setup."
   [nodes]
   (vec (butlast nodes)))
+
+(defn- raft-majority
+  "floor(N/2)+1 -- the voters a proposal needs, including the leader."
+  [n]
+  (inc (quot n 2)))
+
+(defn promotion-changes-quorum?
+  "Whether promoting the candidate actually raises the Raft majority.
+
+  This is the workload's reason to exist, and it is not true of every
+  topology: four voters going to five needs three either way. A run on such a
+  topology exercises the promotion mechanics but not the transition, so the
+  constructor warns rather than letting a green result be read as evidence
+  about quorum handling."
+  [nodes]
+  (let [voters (count (voter-nodes nodes))]
+    (> (raft-majority (inc voters)) (raft-majority voters))))
 ;; ---------------------------------------------------------------------------
 ;; Pure history analysis
 ;; ---------------------------------------------------------------------------
@@ -148,6 +173,35 @@
                         (< match catch-up-target)))))
        vec))
 
+(defn unenforced-min-applied-index
+  "Deliberately premature promotions the server ACCEPTED.
+
+  premature-promotions cannot fail on its own. The live workflow samples the
+  target, waits for the learner to reach it, and only then promotes, recording
+  that already-qualified applied index as :match -- so match >= target holds by
+  construction and the property stays empty even if the engine dropped its
+  min_applied_index test entirely.
+
+  The only way to show the enforcement exists is to ask for something it must
+  refuse. This op promotes with a min_applied_index far above the leader's
+  commit index, which no learner can have reached, and expects rejection.
+  A success here is the defect premature-promotions was meant to catch."
+  [history]
+  (->> history
+       (filter #(and (= :promote-learner-early (:f %)) (= :ok (:type %))))
+       vec))
+
+(defn unattempted-min-applied-index-probe
+  "True when the run never issued the premature-promotion probe at all.
+
+  A probe that did not run is not evidence of enforcement, and an empty
+  unenforced-min-applied-index would otherwise look identical to a passing
+  one."
+  [history]
+  (empty? (filter #(and (= :promote-learner-early (:f %))
+                        (contains? #{:ok :fail :info} (:type %)))
+                  history)))
+
 (defn promotions-without-a-sampled-target
   "Promotions whose catch-up target did not come from the leader.
 
@@ -161,38 +215,108 @@
        (remove #(= :leader-commit-index (:target-source (:value %))))
        vec))
 
-(defn- last-ok-write-before
+(defn- write-intervals
+  "Each write as [invoke-time complete-time op], for overlap tests.
+
+  A write still in flight has no completion; it is treated as running to the
+  end of the history, because a write that never completed can still have
+  taken effect."
+  [history]
+  (let [writes (->> history (filter #(= :write (:f %))) (sort-by :time))
+        end    (or (some->> history (map :time) (reduce max)) 0)]
+    (->> writes
+         (reduce (fn [{:keys [pending done]} op]
+                   (case (:type op)
+                     :invoke {:pending (assoc pending (:process op) op)
+                              :done    done}
+                     (:ok :fail :info)
+                     (if-let [inv (get pending (:process op))]
+                       {:pending (dissoc pending (:process op))
+                        :done    (conj done [(:time inv) (:time op) op])}
+                       {:pending pending :done done})
+                     {:pending pending :done done}))
+                 {:pending {} :done []})
+         ((fn [{:keys [pending done]}]
+            (into done (map (fn [[_ inv]] [(:time inv) end inv])
+                            pending)))))))
+
+(defn- concurrent-writes
+  "Writes whose execution interval overlaps [from to], excluding the write
+  that defines it.
+
+  Completion order alone does not identify a register's final value. Write 1
+  running t=10..40 and write 2 running t=20..30 both linearize either way, so
+  a later read of 2 is legal even though 1 completed last and no write was
+  INVOKED after 40. Looking only at invocations in (from, to) misses write 2
+  entirely and reports a loss that never happened.
+
+  So the ambiguity test is overlap with the selected write's own interval, not
+  just the gap between it and the read."
+  [history from to selected]
+  (->> (write-intervals history)
+       (remove (fn [[_ _ op]] (identical? op selected)))
+       (filter (fn [[start stop _]] (and (< start to) (> stop from))))
+       (mapv (fn [[_ _ op]] op))))
+
+(defn- last-ok-write-interval-before
+  "The last write acknowledged before t, as its [invoke complete op] triple.
+
+  The triple, not the op: the caller needs the write's own INVOCATION time to
+  test what overlapped it, and it needs the identical op so that write can be
+  excluded from its own overlap set. Returning a copy with the invocation time
+  attached breaks the second -- the copy is not identical to the entry in the
+  interval list, so the selected write counts as overlapping itself and every
+  history looks ambiguous."
   [history t]
-  (->> history
-       (filter #(and (= :write (:f %)) (= :ok (:type %)) (< (:time %) t)))
-       (sort-by :time)
+  (->> (write-intervals history)
+       (filter (fn [[_ stop op]] (and (= :ok (:type op)) (< stop t))))
+       (sort-by (fn [[_ stop _]] stop))
        last))
 
+(defn- read-invocation-times
+  "Each successful read paired with the time it was actually invoked.
+
+  A process set is not enough. If process P invokes a read before t, completes
+  it after t, and then invokes another read after t, P is in the set of
+  processes that invoked after t -- so the EARLIER, pre-t read is selected as
+  though it had been invoked after t. That admits exactly the stale evidence
+  the invocation filter exists to exclude.
+
+  Jepsen runs one operation at a time per process, so the invocation a
+  completion belongs to is the last invoke on that process before it."
+  [history]
+  (let [reads (->> history
+                   (filter #(= :read (:f %)))
+                   (sort-by :time))]
+    (->> reads
+         (reduce (fn [{:keys [pending done]} op]
+                   (case (:type op)
+                     :invoke {:pending (assoc pending (:process op) (:time op))
+                              :done    done}
+                     (:ok :fail :info)
+                     {:pending (dissoc pending (:process op))
+                      :done    (if (and (= :ok (:type op))
+                                        (contains? pending (:process op)))
+                                 (conj done (assoc op ::invoked-at
+                                                   (get pending (:process op))))
+                                 done)}
+                     {:pending pending :done done}))
+                 {:pending {} :done []})
+         :done)))
+
 (defn- first-ok-read-invoked-after
-  "The first successful read whose INVOCATION happened after t.
+  "The first successful read whose own INVOCATION happened after t.
 
   Invocation, not completion: with concurrent workers a read invoked before the
   promotion can linearize against the old value and return after it. Selecting
   on completion time picks up exactly that read and reports the acknowledged
-  write as lost, so the pairing has to start from the invoke event."
+  write as lost, so the pairing has to start from the invoke event -- and from
+  THIS completion's invoke event, not from any invoke the same process made."
   [history t]
-  (let [invoked-after (->> history
-                           (filter #(and (= :read (:f %)) (= :invoke (:type %))
-                                         (> (:time %) t)))
-                           (map :process)
-                           set)]
-    (->> history
-         (filter #(and (= :read (:f %)) (= :ok (:type %)) (> (:time %) t)
-                       (contains? invoked-after (:process %))))
-         (sort-by :time)
-         first)))
-
-(defn- writes-invoked-between
-  [history from to]
-  (->> history
-       (filter #(and (= :write (:f %)) (= :invoke (:type %))
-                     (> (:time %) from) (< (:time %) to)))
-       vec))
+  (->> (read-invocation-times history)
+       (filter #(> (::invoked-at %) t))
+       (sort-by :time)
+       first))
 
 (defn lost-writes-across-promotions
   "Acknowledged writes that a promotion lost, by TEMPORAL ordering.
@@ -213,16 +337,20 @@
   (->> (completed-promotions history)
        (filter #(= :ok (:type %)))
        (keep (fn [promotion]
-               (let [t     (:time promotion)
-                     write (last-ok-write-before history t)
-                     read  (first-ok-read-invoked-after history t)]
+               (let [t        (:time promotion)
+                     interval (last-ok-write-interval-before history t)
+                     [w-start _ write] interval
+                     read     (first-ok-read-invoked-after history t)]
                  ;; A read's :value is the map {:lease? b :value n}, so the
                  ;; register value has to be unwrapped before comparing it
                  ;; with the write's scalar.
                  (let [observed (get-in read [:value :value])]
                    (when (and write read
-                              (empty? (writes-invoked-between
-                                        history (:time write) (:time read)))
+                              ;; From the selected write's own INVOCATION, so a
+                              ;; write that overlapped it counts as ambiguity
+                              ;; rather than being skipped.
+                              (empty? (concurrent-writes
+                                        history w-start (:time read) write))
                               (not= (:value write) observed))
                      {:promotion      (:value promotion)
                       :acked-write    (:value write)
@@ -260,39 +388,77 @@
                   [t (or (first (filter #(> % t) stops)) Long/MAX_VALUE)])))
          vec)))
 
-;; A lease read served from the leader's lease answers in about the time of a
-;; local Pebble lookup. Losing the fast path makes it take a Raft round trip
-;; instead, which is a different order of magnitude -- so a bound well above
-;; normal service time and well below a round trip separates them without
-;; being sensitive to ordinary jitter.
-(def default-lease-read-budget-ms 250)
+(defn- partition-edge-counters
+  "The {:hit n :miss n} samples the nemesis took at each window's edges."
+  [history]
+  (let [nemesis (->> history (filter #(= :nemesis (:process %))) (sort-by :time))
+        starts  (->> nemesis
+                     (filter #(and (= :start-partition (:f %))
+                                   (= :learners-only (get-in % [:value :scope]))
+                                   (= :info (:type %))))
+                     vec)
+        stops   (->> nemesis
+                     (filter #(and (= :stop-partition (:f %)) (= :info (:type %))))
+                     vec)]
+    (->> starts
+         (keep (fn [start]
+                 (when-let [stop (->> stops
+                                      (filter #(> (:time %) (:time start)))
+                                      first)]
+                   {:start start
+                    :stop  stop
+                    :before (get-in start [:value :lease-counters])
+                    :after  (get-in stop  [:value :lease-counters])})))
+         vec)))
 
-(defn slow-lease-reads
-  "Lease reads that SUCCEEDED but took longer than the budget while only
-  learners were partitioned.
+(defn lease-fast-path-losses
+  "Windows in which a lease read FELL BACK to the linearizable path.
 
-  Failures alone cannot detect this regression. A Redis GET calls
+  Neither failures nor latency can establish this. A Redis GET calls
   LeaseReadForKeyThrough, and when the lease is unavailable kv/raft_engine.go
-  transparently falls back to LinearizableRead -- so with the voters connected
-  the read still succeeds, and a failure-only check stays empty through exactly
-  the quorum-ack regression it claims to catch. What changes is the LATENCY, so
-  that is what is measured."
-  ([history] (slow-lease-reads history default-lease-read-budget-ms))
-  ([history budget-ms]
-   (let [windows (learner-partition-windows history)]
-     (if (empty? windows)
-       []
-       (->> history
-            (filter #(and (= :read (:f %))
-                          (= :ok (:type %))
-                          (true? (:lease? (:value %)))
-                          (number? (:latency-ms (:value %)))
-                          (> (:latency-ms (:value %)) budget-ms)))
-            (filter (fn [op]
-                      (some (fn [[start stop]]
-                              (and (>= (:time op) start) (<= (:time op) stop)))
-                            windows)))
-            vec)))))
+  transparently falls back to LinearizableRead -- so a failure-only check stays
+  empty through exactly the regression it claims to catch. Latency does not
+  separate them either: LinearizableRead issues a ReadIndex immediately and,
+  with every voter connected on one host, its quorum round trip completes in a
+  few milliseconds. Any budget loose enough not to flag ordinary jitter is far
+  above the fallback's actual cost, so a run can turn every GET into a
+  successful slow-path read and still report valid.
+
+  elastickv_lease_read_total separates them by construction: the metric's own
+  help text defines miss as \"fell back to LinearizableRead\". So the property
+  is a counter delta across the window, not a time."
+  [history]
+  (->> (partition-edge-counters history)
+       (keep (fn [{:keys [before after start]}]
+               (when (and before after)
+                 (let [delta (- (:miss after) (:miss before))]
+                   (when (pos? delta)
+                     {:window-start (:time start)
+                      :miss-delta   delta})))))
+       vec))
+
+(defn unmeasured-partition-windows
+  "Windows that produced no evidence either way.
+
+  Two ways a window proves nothing, and both used to read as a pass:
+
+  - the counters could not be sampled at all (metrics endpoint unreachable),
+    so zero misses is indistinguishable from no data;
+  - the lease hit counter did not move, meaning no read was served from the
+    leader's lease while the candidate was attached and isolated. The read
+    coverage gate counted successful reads ANYWHERE in the run, so reads taken
+    before attachment or after the heal satisfied it while the quorum-ack
+    property was never exercised."
+  [history]
+  (->> (partition-edge-counters history)
+       (keep (fn [{:keys [before after start]}]
+               (cond
+                 (or (nil? before) (nil? after))
+                 {:window-start (:time start) :reason :counters-unavailable}
+
+                 (not (pos? (- (:hit after) (:hit before))))
+                 {:window-start (:time start) :reason :no-lease-read-served})))
+       vec))
 
 (defn learner-partition-read-failures
   "Lease reads that failed while only learners were partitioned.
@@ -342,23 +508,33 @@
             no-evidence  (promotions-without-post-read-evidence history)
             lost         (lost-writes-across-promotions history)
             stalls       (learner-partition-read-failures history)
-            slow         (slow-lease-reads history)
+            fallbacks    (lease-fast-path-losses history)
+            unmeasured   (unmeasured-partition-windows history)
+            unenforced   (unenforced-min-applied-index history)
+            no-probe     (unattempted-min-applied-index-probe history)
             writes       (count (filter #(and (= :write (:f %)) (= :ok (:type %))) history))
             reads        (count (filter #(and (= :read (:f %)) (= :ok (:type %))) history))]
         (when (seq premature)
           (warn "learner promoted before reaching its sampled target:" premature))
         (when (seq unmeasurable)
           (warn "promotion reported ok without catch-up evidence:" unmeasurable))
+        (when (seq unenforced)
+          (warn "server accepted a promotion below min_applied_index:" unenforced))
+        (when (seq unmeasured)
+          (warn "partition window produced no lease evidence:" unmeasured))
         {:valid?               (and (pos? (count promotions))
                                     (pos? writes)
                                     (pos? reads)
+                                    (not no-probe)
                                     (empty? premature)
                                     (empty? unmeasurable)
                                     (empty? unsampled)
                                     (empty? no-evidence)
                                     (empty? lost)
                                     (empty? stalls)
-                                    (empty? slow))
+                                    (empty? fallbacks)
+                                    (empty? unmeasured)
+                                    (empty? unenforced))
          :promotions           (count promotions)
          :ok-writes            writes
          :ok-reads             reads
@@ -368,7 +544,10 @@
          :promotions-without-post-read-evidence no-evidence
          :lost-writes          lost
          :learner-read-failures stalls
-         :slow-lease-reads     slow}))))
+         :lease-fast-path-losses fallbacks
+         :unmeasured-partition-windows unmeasured
+         :unenforced-min-applied-index unenforced
+         :min-applied-index-probe-ran (not no-probe)}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Client
@@ -477,6 +656,26 @@
                         (str candidate ":" (:grpc-port test 50051)) "0")
             (assoc op :type :ok))
 
+          ;; Asks the server for something it must refuse: promotion at a
+          ;; min_applied_index far above the leader's own commit index, which
+          ;; no learner can have reached. Rejection is the pass. This is the
+          ;; only way the enforcement can be observed -- the live promotion
+          ;; path waits for catch-up first, so it can never present the server
+          ;; with a violation to reject.
+          :promote-learner-early
+          (let [candidate      (name (:value op))
+                candidate-addr (str candidate ":" (:grpc-port test 50051))
+                commit         (leader-commit-index leader addr)
+                unreachable    (+ (or commit 0) 1000000)]
+            (raftadmin! leader addr "promote_learner" candidate
+                        "0" (str unreachable))
+            ;; Reached only when the server ACCEPTED it -- the defect.
+            (assoc op :type :ok
+                      :value {:node                candidate
+                              :addr                candidate-addr
+                              :leader-commit-index commit
+                              :min-applied-index   unreachable}))
+
           :promote-learner
           (let [candidate      (name (:value op))
                 candidate-addr (str candidate ":" (:grpc-port test 50051))
@@ -498,6 +697,9 @@
           ;; every real read exception without it, so
           ;; learner-partition-read-failures filtered them all out and the
           ;; lease regression could never invalidate a run.
+          ;; :promote-learner-early lands here on the happy path -- its
+          ;; rejection is the property holding, not a workload failure, which
+          ;; is why only an :ok from it is reported as a defect.
           (if (= :read (:f op))
             (assoc op :type :fail
                       :value {:lease? true}
@@ -529,14 +731,30 @@
         this)
 
       (invoke! [_this test op]
-        (case (:f op)
-          :start-partition (do (net/drop-all! test grudge)
-                               (assoc op :value {:scope    :learners-only
-                                                 :isolated [learner]}))
-          :stop-partition  (do (net/heal! (:net test) test)
-                               (assoc op :value {:scope :learners-only
-                                                 :healed true}))
-          (assoc op :value :unsupported)))
+        ;; The lease counters are sampled on the node the client sends its
+        ;; lease probes to, at both edges of the window. The DELTA across the
+        ;; window is the evidence: misses are reads that fell back to
+        ;; LinearizableRead, which is precisely the regression, and hits prove
+        ;; reads were actually served in the window rather than the window
+        ;; being empty.
+        (let [probe-node (first (:nodes test))]
+          (case (:f op)
+            :start-partition (let [before (ekdb/lease-read-counters probe-node)]
+                               ;; jepsen.net/drop-all! is the 2-arity wrapper in
+                               ;; jepsen.net -- it reads (:net test) itself. Only
+                               ;; jepsen.net.proto/drop-all! takes net first, and
+                               ;; heal! below differs because it is import-vars'd
+                               ;; straight from the protocol.
+                               (net/drop-all! test grudge)
+                               (assoc op :value {:scope          :learners-only
+                                                 :isolated       [learner]
+                                                 :lease-counters before}))
+            :stop-partition  (do (net/heal! (:net test) test)
+                                 (assoc op :value {:scope          :learners-only
+                                                   :healed         true
+                                                   :lease-counters (ekdb/lease-read-counters
+                                                                     probe-node)}))
+            (assoc op :value :unsupported))))
 
       (teardown! [_this test]
         (net/heal! (:net test) test)))))
@@ -552,7 +770,13 @@
   promotion phase and closed before it runs."
   []
   ;; A seq is a generator in Jepsen 0.3.x; gen/seq was removed.
-  [(gen/sleep 2)
+  ;;
+  ;; The window opens at 6s, AFTER :add-learner at ~5s. At 2s it opened before
+  ;; the candidate was attached, leaving barely a second in which the node was
+  ;; both attached and isolated -- and at rate 5 with stagger that interval
+  ;; could contain no read at all, so the quorum-ack property went unexercised
+  ;; while reads elsewhere in the run satisfied the coverage gate.
+  [(gen/sleep 6)
    {:type :info :f :start-partition}
    (gen/sleep 4)
    {:type :info :f :stop-partition}])
@@ -577,7 +801,14 @@
       ;; preserve across it.
       (gen/time-limit 5 register)
       (gen/once {:f :add-learner :value candidate})
-      (gen/time-limit 5 register)
+      ;; Spans the 6s..10s partition window, so the reads the lease counters
+      ;; measure happen with the candidate attached and isolated.
+      (gen/time-limit 6 register)
+      ;; While it is still a learner: ask for a promotion the server must
+      ;; refuse, which is the only observation that its min_applied_index test
+      ;; is doing anything.
+      (gen/once {:f :promote-learner-early :value candidate})
+      (gen/time-limit 2 register)
       (gen/once {:f :promote-learner :value candidate})
       register)))
 
