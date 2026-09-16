@@ -107,12 +107,29 @@ type RaftGroupRetirementReport struct {
 
 // RaftGroupBoundary is the old-key high-water mark for one Raft group.
 type RaftGroupBoundary struct {
+	// KeyID is the DEK this boundary describes. Checked against the key
+	// being retired for the same reason the reports are: without it, a
+	// boundary collected for a different DEK -- key 8's lower
+	// LargestProposedIndex while key 7 is being retired -- would be accepted
+	// by reports that all correctly name key 7, and the classifier would
+	// return eligible with key 7 entries still replayable. Mixing per-key
+	// metric series has to fail closed.
+	KeyID uint32
 	// LargestProposedIndex is the largest log index ever proposed under the
 	// retiring DEK in this group.
+	//
+	// There is deliberately no per-group rotation index. The rotation is
+	// proposed once, through the DEFAULT group's engine
+	// (main_encryption_admin.go), and its apply handler installs the new
+	// wrapper on every attached group in memory
+	// (raftEnvelopeRuntime.installRotatedRaftDEK). A non-default group has
+	// no rotation entry in its own index space at all, so requiring one
+	// would force the report collector to invent a number and make the
+	// verdict arbitrary. This index is the quantity that does exist per
+	// group, and it is the one the snapshot criterion actually needs:
+	// restoring from a snapshot below it replays entries proposed under the
+	// retiring DEK.
 	LargestProposedIndex uint64
-	// RotationIndex is the index of the rotation entry that installed the
-	// successor in this group.
-	RotationIndex uint64
 }
 
 // RaftRetirementReport is one node's view of a raft DEK.
@@ -298,7 +315,7 @@ func ClassifyRaftDEKRetirement(
 		if err := checkReportKeyBinding(node, r.ReportedKeyID, r.ActiveKeyID, retiringKeyID); err != nil {
 			return RetirementDecision{}, err
 		}
-		nodeBlockers, err := raftGroupBlockers(node, r.Groups, boundaries)
+		nodeBlockers, err := raftGroupBlockers(node, r.Groups, boundaries, retiringKeyID)
 		if err != nil {
 			return RetirementDecision{}, err
 		}
@@ -342,11 +359,13 @@ func checkReportKeyBinding(node string, reported, active, retiring uint32) error
 // A node that omits a group with a known boundary is an incomplete report, not
 // a passing one: the DEK is installed on every group, so an unreported group
 // is an unverified one.
-func raftGroupBlockers(
+// indexReportedGroups turns a node's per-group reports into a map, rejecting a
+// node that reported the same group twice: last-write-wins over a duplicate
+// would let a group's blocking report be overwritten by a passing one.
+func indexReportedGroups(
 	node string,
 	groups []RaftGroupRetirementReport,
-	boundaries map[uint64]RaftGroupBoundary,
-) ([]string, error) {
+) (map[uint64]RaftGroupRetirementReport, error) {
 	byGroup := make(map[uint64]RaftGroupRetirementReport, len(groups))
 	for _, g := range groups {
 		if _, dup := byGroup[g.GroupID]; dup {
@@ -355,6 +374,23 @@ func raftGroupBlockers(
 		}
 		byGroup[g.GroupID] = g
 	}
+	return byGroup, nil
+}
+
+// requireExactGroupCoverage checks BOTH directions between the reports and the
+// boundaries.
+//
+// A boundary with no report is an unverified group: the DEK is installed on
+// every group, so a group nobody reported is one nobody checked. A report with
+// no boundary is the same hole seen from the other side -- checking only the
+// first treats the boundary map as the complete group universe, so if
+// collection omits a group while every node reports it with old-key entries,
+// that group is judged by nobody and the classifier returns eligible.
+func requireExactGroupCoverage(
+	node string,
+	byGroup map[uint64]RaftGroupRetirementReport,
+	boundaries map[uint64]RaftGroupBoundary,
+) error {
 	var missing []uint64
 	for groupID := range boundaries {
 		if _, ok := byGroup[groupID]; !ok {
@@ -363,8 +399,61 @@ func raftGroupBlockers(
 	}
 	if len(missing) > 0 {
 		slices.Sort(missing)
-		return nil, errors.Wrapf(ErrIncompleteRetirementReport,
+		return errors.Wrapf(ErrIncompleteRetirementReport,
 			"node %s did not report groups %v", node, missing)
+	}
+
+	var unbounded []uint64
+	for groupID := range byGroup {
+		if _, ok := boundaries[groupID]; !ok {
+			unbounded = append(unbounded, groupID)
+		}
+	}
+	if len(unbounded) > 0 {
+		slices.Sort(unbounded)
+		return errors.Wrapf(ErrIncompleteRetirementReport,
+			"node %s reported groups %v with no boundary", node, unbounded)
+	}
+	return nil
+}
+
+// groupBlockers applies the §5.4 raft criteria to ONE group.
+func groupBlockers(
+	node string,
+	groupID uint64,
+	g RaftGroupRetirementReport,
+	boundary RaftGroupBoundary,
+) []string {
+	var blockers []string
+	// Strictly greater, per §5.4: an index EQUAL to the largest proposed one
+	// means that entry is still un-truncated and would be replayed.
+	if g.LogCompactIndex <= boundary.LargestProposedIndex {
+		blockers = append(blockers,
+			fmt.Sprintf("%s group %d: raft log start index %d has not passed proposed index %d",
+				node, groupID, g.LogCompactIndex, boundary.LargestProposedIndex))
+	}
+	if g.SnapshotIndex < boundary.LargestProposedIndex {
+		blockers = append(blockers,
+			fmt.Sprintf("%s group %d: last snapshot predates the old-key high-water mark (snapshot %d < proposed %d)",
+				node, groupID, g.SnapshotIndex, boundary.LargestProposedIndex))
+	}
+	return blockers
+}
+
+// raftGroupBlockers applies the §5.4 raft criteria to every group the node
+// hosts, against that group's own boundary.
+func raftGroupBlockers(
+	node string,
+	groups []RaftGroupRetirementReport,
+	boundaries map[uint64]RaftGroupBoundary,
+	retiringKeyID uint32,
+) ([]string, error) {
+	byGroup, err := indexReportedGroups(node, groups)
+	if err != nil {
+		return nil, err
+	}
+	if err := requireExactGroupCoverage(node, byGroup, boundaries); err != nil {
+		return nil, err
 	}
 
 	groupIDs := make([]uint64, 0, len(boundaries))
@@ -376,20 +465,12 @@ func raftGroupBlockers(
 	var blockers []string
 	for _, groupID := range groupIDs {
 		boundary := boundaries[groupID]
-		g := byGroup[groupID]
-		// Strictly greater, per §5.4: an index EQUAL to the largest
-		// proposed one means that entry is still un-truncated and would be
-		// replayed.
-		if g.LogCompactIndex <= boundary.LargestProposedIndex {
-			blockers = append(blockers,
-				fmt.Sprintf("%s group %d: raft log start index %d has not passed proposed index %d",
-					node, groupID, g.LogCompactIndex, boundary.LargestProposedIndex))
+		if boundary.KeyID != retiringKeyID {
+			return nil, errors.Wrapf(ErrIncompleteRetirementReport,
+				"group %d boundary describes key %d, not the retiring key %d",
+				groupID, boundary.KeyID, retiringKeyID)
 		}
-		if g.SnapshotIndex < boundary.RotationIndex {
-			blockers = append(blockers,
-				fmt.Sprintf("%s group %d: last snapshot predates the rotation (snapshot %d < rotation %d)",
-					node, groupID, g.SnapshotIndex, boundary.RotationIndex))
-		}
+		blockers = append(blockers, groupBlockers(node, groupID, byGroup[groupID], boundary)...)
 	}
 	return blockers, nil
 }
