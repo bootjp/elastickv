@@ -867,8 +867,9 @@ single-process 3-node demo cluster, attaches a learner via
 
 ### Milestone 3 — Hardening
 
-- Jepsen workload that exercises learner attach during partition and
-  promote after heal.
+- ~~Jepsen workload that exercises learner attach during partition and
+  promote after heal.~~ **Implemented** as
+  `jepsen/src/elastickv/learner_workload.clj`.
 - Monitoring: `suffrage` label on per-peer Prometheus labels (already
   exists in `monitoring/raft.go:355`; verify it survives the engine
   changes).
@@ -883,9 +884,19 @@ handling, v2 peers-file suffrage persistence, admin RPC/CLI surface,
 join-as-learner alarm, monitoring suffrage labels, promotion precondition
 checks against leader `Progress.Match`, and the operator runbook
 (`docs/raft_learner_operations.md`). Remaining Milestone 3 hardening is not
-claimed shipped here: the learner attach/promote-under-partition Jepsen
-workload and a first-class `Status.PerPeer` progress field are still open, and
-follower-served read routing remains a separate proposal.
+claimed shipped here: a first-class `Status.PerPeer` progress field is still
+open, and follower-served read routing remains a separate proposal. The learner
+attach/promote-under-partition Jepsen workload has landed; its checker pins
+three properties — promotion never outruns catch-up, no acknowledged write lost
+across a promotion, and a learner never counted in the voter quorum.
+
+Note on the first: catch-up is measured against the LEADER's commit index, not
+against `min-applied-index`. The engine's own test is
+`Match >= min-applied-index`, so an operator who reads the learner's current
+`Match` and passes it back satisfies it by construction — and both that broken
+call and the correct one (pick a target, wait for `Match` to reach it) end with
+`min-applied-index == Match`. That equality distinguishes nothing; only the
+leader's position does.
 
 ## 7. Risks
 
