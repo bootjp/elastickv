@@ -1535,3 +1535,45 @@ func TestLocalStoreDeleteStillRemovesANestedObject(t *testing.T) {
 	require.NoError(t, store.DeleteObject(ctx, "a/b/c.json"))
 	require.NoFileExists(t, filepath.Join(root, "a", "b", "c.json"))
 }
+
+// TestLocalStoreDeleteResolvesAgainstThePinnedRoot covers the escape in the
+// ROOT ARGUMENT, which os.Root cannot refuse because it happens before any
+// resolution the descriptor governs.
+//
+// Reopening the root per operation re-resolves a mutable pathname:
+// os.OpenRoot follows symlinks in its own argument, so a process that can
+// write the root's PARENT can rename the root away and drop a symlink in its
+// place between two deletes. The next open then anchors the descriptor outside
+// the configured directory and a descendant-relative Remove unlinks an
+// external file at the corresponding key. Pinning the descriptor on first use
+// means later operations resolve against the directory the store was
+// configured with, whatever the pathname comes to point at.
+func TestLocalStoreDeleteResolvesAgainstThePinnedRoot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := t.TempDir()
+	root := filepath.Join(base, "store")
+	require.NoError(t, os.MkdirAll(root, 0o750))
+
+	store, err := NewLocalStore(root)
+	require.NoError(t, err)
+
+	// One real delete, so the descriptor is pinned to the configured
+	// directory while it is still the configured directory.
+	require.NoError(t, store.DeleteObject(ctx, "absent.json"))
+
+	// Now the attacker swaps the root for a symlink to a directory it owns.
+	attacker := filepath.Join(base, "attacker")
+	require.NoError(t, os.MkdirAll(attacker, 0o750))
+	victim := filepath.Join(attacker, "victim.json")
+	require.NoError(t, os.WriteFile(victim, []byte("not yours"), 0o600))
+	require.NoError(t, os.Rename(root, filepath.Join(base, "store-moved")))
+	require.NoError(t, os.Symlink(attacker, root))
+
+	// The same key the attacker planted. A store that re-opened the root here
+	// would resolve into the attacker's directory and unlink the file.
+	require.NoError(t, store.DeleteObject(ctx, "victim.json"))
+	require.FileExists(t, victim,
+		"the delete must resolve against the pinned root, not the swapped pathname")
+}

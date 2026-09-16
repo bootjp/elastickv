@@ -287,6 +287,12 @@ type LocalStore struct {
 	// S3 store closes with If-Match. LocalStore is the dev/test and
 	// single-writer store; production offload targets S3.
 	deleteMu sync.Mutex
+
+	// rootMu guards the pinned root descriptor below.
+	rootMu sync.Mutex
+	// rootDir is the configured directory, opened ONCE and kept for the
+	// life of the store. See pinnedRoot.
+	rootDir *os.Root
 }
 
 const localStoreDirPerm = 0o755
@@ -468,15 +474,54 @@ func isASCIILetter(c byte) bool {
 // refuses to traverse out of it, so the check and the operation can no longer
 // disagree.
 func (s *LocalStore) removeWithinRoot(relPath string) error {
-	root, err := os.OpenRoot(s.root)
+	root, err := s.pinnedRoot()
 	if err != nil {
-		return errors.Wrapf(err, "open store root %s", s.root)
+		return err
 	}
-	defer func() { _ = root.Close() }()
+	if root == nil {
+		// The store directory does not exist, so neither does the object.
+		return nil
+	}
 	if err := root.Remove(relPath); err != nil && !os.IsNotExist(err) {
 		return errors.Wrapf(err, "remove %s within store root", relPath)
 	}
 	return nil
+}
+
+// pinnedRoot opens the configured root ONCE and keeps the descriptor for the
+// life of the store. It returns (nil, nil) when the directory does not exist
+// yet, since the first put creates it.
+//
+// Reopening per operation re-resolves a MUTABLE PATHNAME. os.OpenRoot follows
+// symlinks in its own argument, so a process that can write the root's PARENT
+// can rename the root away and leave a symlink in its place between two
+// operations; the next open then anchors the descriptor outside the configured
+// directory, and a descendant-relative Remove unlinks an external file at the
+// corresponding key. That is a different hole from a descendant symlink, which
+// os.Root already refuses to traverse -- here the escape is in the root
+// argument itself, before any resolution the descriptor governs.
+//
+// Holding the descriptor means every later operation resolves against the
+// directory this store was configured with, whatever the pathname comes to
+// point at afterwards. The descriptor lives as long as the store, which is the
+// process: that is the point of pinning, not a leak.
+func (s *LocalStore) pinnedRoot() (*os.Root, error) {
+	s.rootMu.Lock()
+	defer s.rootMu.Unlock()
+	if s.rootDir != nil {
+		return s.rootDir, nil
+	}
+	root, err := os.OpenRoot(s.root)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Not cached: the first put creates the directory, and the next
+			// call must be able to pin the real one.
+			return nil, nil
+		}
+		return nil, errors.Wrapf(err, "open store root %s", s.root)
+	}
+	s.rootDir = root
+	return root, nil
 }
 
 // relPathForKey is pathForKey's root-relative half, for the
