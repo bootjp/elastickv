@@ -315,6 +315,106 @@ func validatePublishOptions(opts PublishOptions) error {
 	}
 }
 
+// spoolFilePattern is the glob matching spool files spoolExport creates.
+// Exported via CleanStaleSpoolFiles so a caller can identify them without
+// duplicating the name.
+const spoolFilePattern = "elastickv-snapshot-offload-*.fsm"
+
+// CleanStaleSpoolFiles removes spool files left behind by a previous process.
+//
+// spoolExport removes its file with a defer, which never runs if the process
+// is killed or the host loses power mid-publish. Nothing else removed them, so
+// repeated crashes during large snapshots accumulated full payload copies
+// until the spool volume filled.
+//
+// olderThan guards against deleting a file a CONCURRENTLY RUNNING publish is
+// still writing: only files whose mtime predates the cutoff are removed. A
+// caller at startup can pass any positive age, since no publish of this
+// process has begun yet; the guard matters for a second node sharing the
+// directory.
+//
+// Returns the files removed. Individual failures are collected rather than
+// aborting, because one undeletable file must not leave the rest to
+// accumulate.
+func CleanStaleSpoolFiles(spoolDir string, olderThan time.Time) ([]string, error) {
+	spoolDir = stringsTrim(spoolDir)
+	if spoolDir == "" {
+		return nil, errors.Wrap(ErrInvalidOptions, "spool dir is required")
+	}
+	// The directory is READ, not globbed. filepath.Glob interprets the whole
+	// joined path as a pattern, so a configured spool dir containing a glob
+	// metacharacter -- /tmp/spool[12] -- would match /tmp/spool1 and
+	// /tmp/spool2 and delete files under THOSE, while the real
+	// /tmp/spool[12] was never examined. A configured path is a path, never a
+	// pattern; only the entry names are matched against the pattern.
+	spoolDir = filepath.Clean(spoolDir)
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Offload may never have run here.
+			return nil, nil
+		}
+		return nil, errors.Wrapf(err, "read spool dir %s", spoolDir)
+	}
+	var (
+		removed  []string
+		failures []error
+		examined int
+	)
+	for _, entry := range entries {
+		matched, err := filepath.Match(spoolFilePattern, entry.Name())
+		if err != nil {
+			return removed, errors.Wrapf(err, "match spool pattern %q", spoolFilePattern)
+		}
+		if !matched {
+			continue
+		}
+		examined++
+		path := filepath.Join(spoolDir, entry.Name())
+		gone, err := removeStaleSpoolFile(path, olderThan)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if gone {
+			removed = append(removed, path)
+		}
+	}
+	if len(failures) > 0 {
+		return removed, errors.Wrapf(errors.Join(failures...),
+			"clean spool dir %s: %d of %d files failed", spoolDir, len(failures), examined)
+	}
+	return removed, nil
+}
+
+// removeStaleSpoolFile removes one spool file if it is a regular file older
+// than the cutoff, reporting whether it was removed.
+//
+// A file that vanished between the glob and here is not a failure: another
+// process's cleanup, or the owning publish finishing, is the expected race.
+func removeStaleSpoolFile(path string, olderThan time.Time) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "stat spool file %s", path)
+	}
+	if !info.Mode().IsRegular() || !info.ModTime().Before(olderThan) {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return false, errors.Wrapf(err, "remove spool file %s", path)
+	}
+	return true, nil
+}
+
+// SpoolDirFor reports the spool directory a publish with these options uses,
+// so a caller can clean it without re-deriving the default.
+func SpoolDirFor(spoolDir, dataDir string) string {
+	return publishSpoolDir(PublishOptions{SpoolDir: spoolDir, DataDir: dataDir})
+}
+
 func publishSpoolDir(opts PublishOptions) string {
 	if stringsTrim(opts.SpoolDir) != "" {
 		return filepath.Clean(opts.SpoolDir)
@@ -326,7 +426,7 @@ func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotEx
 	if err := os.MkdirAll(spoolDir, localStoreDirPerm); err != nil {
 		return nil, "", 0, errors.WithStack(err)
 	}
-	tmp, err := os.CreateTemp(spoolDir, "elastickv-snapshot-offload-*.fsm")
+	tmp, err := os.CreateTemp(spoolDir, spoolFilePattern)
 	if err != nil {
 		return nil, "", 0, errors.WithStack(err)
 	}
