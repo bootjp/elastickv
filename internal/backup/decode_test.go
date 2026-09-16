@@ -411,3 +411,33 @@ func TestDecodeSnapshot_EncryptionPrefixDroppedAsInternal(t *testing.T) {
 		t.Fatalf("Counters.Unknown = %d, want 0 (!encryption| must drop to Internal, not Unknown)", res.Counters.Unknown)
 	}
 }
+
+// TestDecodeSnapshot_ChunkBlobGCKeyspacesDropAsInternal pins that the two
+// Raft-replicated chunkblob GC keyspaces are recognised.
+//
+// They are replicated, so their records appear in physical snapshots. An
+// unrouted prefix lands in Counters.Unknown, which this package defines as the
+// format-skew / corruption signal — so without a route, an ordinary snapshot
+// from a GC-enabled cluster reports false corruption proportional to how many
+// blobs are queued.
+func TestDecodeSnapshot_ChunkBlobGCKeyspacesDropAsInternal(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	b := newSnapBuilder(0)
+	b.WriteEntry([]byte(S3ChunkRefRCPrefix+"sha"), 1, []byte("rc"), false, 0, snapshotEncStateCleartx)
+	b.WriteEntry([]byte(S3ChunkBlobGCQueuePrefix+"ts|sha"), 2, []byte{}, false, 0, snapshotEncStateCleartx)
+	res, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot:  root,
+		Adapters: AllAdapters(),
+	})
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	if res.Counters.Unknown != 0 {
+		t.Fatalf("Counters.Unknown = %d, want 0: GC records must not read as corruption",
+			res.Counters.Unknown)
+	}
+	if res.Counters.Internal != 2 {
+		t.Fatalf("Counters.Internal = %d, want 2", res.Counters.Internal)
+	}
+}
