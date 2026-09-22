@@ -28,6 +28,21 @@ type ObjectRefresher interface {
 	RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error)
 }
 
+// ObjectClaim is an exclusive claim over one object key. Publishers hold a
+// payload claim until its manifest is committed; retention holds the same
+// claim while it validates and deletes that payload. The shared claim closes
+// the final same-content race that an ETag precondition cannot detect.
+type ObjectClaim interface {
+	Release(ctx context.Context) error
+}
+
+// ObjectClaimStore can acquire a cross-process claim for one object key.
+// Implementations must use storage-visible conditional operations rather than
+// a process-local mutex: publication and GC may run on different nodes.
+type ObjectClaimStore interface {
+	AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error)
+}
+
 // ObjectRef is one object seen by ListObjects.
 //
 // UpdatedAt is the object store's own last-modified time, not a value
@@ -76,6 +91,7 @@ func PreconditionFor(ref ObjectRef) DeletePrecondition {
 // make live payloads look unreferenced.
 type RetentionStore interface {
 	ObjectStore
+	ObjectClaimStore
 	ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error)
 	DeleteObject(ctx context.Context, key string) error
 
@@ -94,6 +110,7 @@ type RetentionStore interface {
 }
 
 var _ RetentionStore = (*LocalStore)(nil)
+var _ ObjectClaimStore = (*LocalStore)(nil)
 
 // ListObjects walks the local root below prefix. Directories and
 // irregular files are skipped; the returned keys are slash-separated
@@ -224,8 +241,12 @@ func (s *LocalStore) DeleteObjectIfUnmodified(ctx context.Context, key string, c
 	if err != nil {
 		return err
 	}
-	if err := s.removeWithinRoot(relPath); err != nil {
+	removed, err := s.removeWithinRoot(relPath)
+	if err != nil {
 		return errors.Wrapf(err, "delete object %s", key)
+	}
+	if !removed {
+		return nil
 	}
 	// Persist the unlink before reporting success. Without the
 	// directory sync a crash can resurrect an object GC already
@@ -248,8 +269,12 @@ func (s *LocalStore) DeleteObject(ctx context.Context, key string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.removeWithinRoot(relPath); err != nil {
+	removed, err := s.removeWithinRoot(relPath)
+	if err != nil {
 		return errors.Wrapf(err, "delete object %s", key)
+	}
+	if !removed {
+		return nil
 	}
 	// Persist the unlink before reporting success. Without the
 	// directory sync a crash can resurrect an object GC already
@@ -473,19 +498,22 @@ func isASCIILetter(c byte) bool {
 // os.Root resolves every component against the opened root descriptor and
 // refuses to traverse out of it, so the check and the operation can no longer
 // disagree.
-func (s *LocalStore) removeWithinRoot(relPath string) error {
+func (s *LocalStore) removeWithinRoot(relPath string) (bool, error) {
 	root, err := s.pinnedRoot()
 	if err != nil {
-		return err
+		return false, err
 	}
 	if root == nil {
 		// The store directory does not exist, so neither does the object.
-		return nil
+		return false, nil
 	}
-	if err := root.Remove(relPath); err != nil && !os.IsNotExist(err) {
-		return errors.Wrapf(err, "remove %s within store root", relPath)
+	if err := root.Remove(relPath); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "remove %s within store root", relPath)
 	}
-	return nil
+	return true, nil
 }
 
 // pinnedRoot opens the configured root ONCE and keeps the descriptor for the

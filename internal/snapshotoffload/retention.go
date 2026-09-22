@@ -200,7 +200,7 @@ func NewGC(opts GCOptions) (*GC, error) {
 // itself failed; a scan that completes but declines to reclaim
 // payloads returns a nil error and a GCResult with
 // PayloadPhaseSkipped set.
-func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
+func (g *GC) RunOnce(ctx context.Context) (result GCResult, retErr error) {
 	if g == nil {
 		return GCResult{}, errors.Wrap(ErrInvalidOptions, "gc is required")
 	}
@@ -211,21 +211,29 @@ func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
 		return GCResult{}, err
 	}
 
-	result := GCResult{
+	result = GCResult{
 		GroupsScanned:      len(scan.byGroup),
 		ManifestsScanned:   scan.scanned,
 		MalformedManifests: scan.malformed,
 	}
 
-	survivors, expired := g.partition(scan)
-	payloadSkipReason := g.payloadPhaseBlockedBy(scan)
-	var payloadRefs []ObjectRef
-	if payloadSkipReason == "" {
-		payloadRefs, err = g.listPayloadObjects(ctx)
-		if err != nil {
-			return result, err
-		}
+	var payloadClaims []claimedPayload
+	defer func() {
+		retErr = errors.CombineErrors(retErr, releasePayloadClaims(ctx, payloadClaims))
+	}()
+	plan, err := g.preparePayloadSweep(ctx, scan)
+	payloadClaims = plan.claims
+	if err != nil {
+		return result, err
 	}
+	scan = plan.scan
+	result.GroupsScanned = len(scan.byGroup)
+	result.ManifestsScanned = scan.scanned
+	result.MalformedManifests = scan.malformed
+	result.PayloadsClaimedConcurrently = plan.claimedConcurrently
+	result.PayloadsAwaitingSweep = plan.awaitingSweep
+	survivors, expired := g.partition(scan)
+	live := livePayloadKeys(survivors)
 
 	for _, entry := range expired {
 		deleted, err := g.compareAndDeleteManifest(ctx, entry)
@@ -239,23 +247,61 @@ func (g *GC) RunOnce(ctx context.Context) (GCResult, error) {
 		result.ManifestsDeleted = append(result.ManifestsDeleted, entry.key)
 	}
 
-	if payloadSkipReason != "" {
+	if plan.skipReason != "" {
 		result.PayloadPhaseSkipped = true
-		result.SkipReason = payloadSkipReason
+		result.SkipReason = plan.skipReason
 		g.log.Warn("snapshot offload payload reclamation skipped",
-			"reason", payloadSkipReason,
+			"reason", plan.skipReason,
 			"malformed_manifests", len(scan.malformed))
 		return result, nil
 	}
 
-	deleted, claimed, marked, err := g.reclaimPayloads(ctx, survivors, payloadRefs)
+	deleted, claimed, err := g.reclaimPayloads(ctx, live, payloadClaims, plan.refs)
 	result.PayloadsDeleted = deleted
-	result.PayloadsClaimedConcurrently = claimed
-	result.PayloadsAwaitingSweep = marked
+	result.PayloadsClaimedConcurrently += claimed
 	if err != nil {
 		return result, err
 	}
 	return result, nil
+}
+
+type payloadSweepPlan struct {
+	scan                manifestScan
+	refs                []ObjectRef
+	claims              []claimedPayload
+	claimedConcurrently int
+	awaitingSweep       int
+	skipReason          string
+}
+
+func (g *GC) preparePayloadSweep(ctx context.Context, scan manifestScan) (payloadSweepPlan, error) {
+	plan := payloadSweepPlan{scan: scan, skipReason: g.payloadPhaseBlockedBy(scan)}
+	if plan.skipReason != "" {
+		return plan, nil
+	}
+
+	survivors, _ := g.partition(scan)
+	live := livePayloadKeys(survivors)
+	refs, err := g.listPayloadObjects(ctx)
+	if err != nil {
+		return plan, err
+	}
+	plan.refs = refs
+	plan.claims, plan.claimedConcurrently, plan.awaitingSweep, err =
+		g.claimSweepablePayloads(ctx, live, refs)
+	if err != nil {
+		return plan, err
+	}
+
+	// This is the final fallible manifest scan for the pass. It must
+	// complete BEFORE phase-one deletes. Claims remain held through the
+	// scan and deletion, closing the publish-versus-sweep race.
+	plan.scan, err = g.scanManifests(ctx)
+	if err != nil {
+		return plan, err
+	}
+	plan.skipReason = g.payloadPhaseBlockedBy(plan.scan)
+	return plan, nil
 }
 
 // manifestScan is the phase-1 view of the prefix.
@@ -496,53 +542,87 @@ func (g *GC) listPayloadObjects(ctx context.Context) ([]ObjectRef, error) {
 	return refs, nil
 }
 
-// reclaimPayloads is §5 phase 2: rebuild the live object-key set from
-// every surviving manifest across every group, then delete only
-// payload objects that are both unreferenced and older than the grace
-// period.
-func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, refs []ObjectRef) ([]string, int, int, error) {
+func livePayloadKeys(survivors []scannedManifest) map[string]struct{} {
 	live := make(map[string]struct{}, len(survivors))
 	for _, entry := range survivors {
 		live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
 	}
+	return live
+}
 
-	// One revalidation pass for the whole phase, taken AFTER the
-	// payload listing so a manifest committed between the two is
-	// visible. Doing this per payload turns a stale-payload backlog
-	// into N listings and O(N×M) reads.
-	fresh, safe, err := g.revalidateLiveKeys(ctx)
-	if err != nil {
-		return nil, 0, 0, err
-	}
-	if !safe {
-		// A malformed manifest appeared since phase 1; the live set
-		// can no longer be proven complete, so reclaim nothing.
-		return nil, 0, 0, nil
-	}
-	for key := range fresh {
-		live[key] = struct{}{}
-	}
+type claimedPayload struct {
+	ref   ObjectRef
+	sha   string
+	claim ObjectClaim
+}
 
+// claimSweepablePayloads takes claims for every payload this pass may delete.
+// Claims are acquired before the final manifest scan and held through delete,
+// so a publisher cannot complete inside the scan-to-delete window.
+func (g *GC) claimSweepablePayloads(
+	ctx context.Context,
+	live map[string]struct{},
+	refs []ObjectRef,
+) ([]claimedPayload, int, int, error) {
 	graceCutoff := g.now().Add(-g.policy.PayloadGrace)
 	var (
-		deleted []string
+		claims  []claimedPayload
 		claimed int
 		marked  int
 	)
 	for _, ref := range refs {
-		key, ok, err := g.reclaimPayload(ctx, live, graceCutoff, ref)
+		sha, ok := payloadSHAFromKey(g.prefix, ref.Key)
+		if !ok {
+			g.log.Warn("snapshot offload retention skipped unrecognized payload object",
+				"object_key", ref.Key)
+			continue
+		}
+		if payloadKeyIsLive(live, ref.Key) || !beforeGraceCutoff(ref.UpdatedAt, graceCutoff) {
+			g.dropMark(ref.Key)
+			continue
+		}
+		if !g.sweepable(ref) {
+			marked++
+			continue
+		}
+		claim, err := g.store.AcquireObjectClaim(ctx, ref.Key)
 		if err != nil {
-			// A payload claimed by a concurrent publish is a normal
-			// outcome, not a failure: skip it and keep going.
+			if errors.Is(err, ErrObjectClaimed) {
+				claimed++
+				continue
+			}
+			return claims, claimed, marked, errors.Wrapf(err, "retention: claim payload %s", ref.Key)
+		}
+		claims = append(claims, claimedPayload{ref: ref, sha: sha, claim: claim})
+	}
+	return claims, claimed, marked, nil
+}
+
+// reclaimPayloads is §5 phase 2. Every entry in claims has been locked since
+// before the authoritative manifest scan used to build live.
+func (g *GC) reclaimPayloads(
+	ctx context.Context,
+	live map[string]struct{},
+	claims []claimedPayload,
+	refs []ObjectRef,
+) ([]string, int, error) {
+	graceCutoff := g.now().Add(-g.policy.PayloadGrace)
+	var (
+		deleted []string
+		claimed int
+	)
+	for _, candidate := range claims {
+		if payloadKeyIsLive(live, candidate.ref.Key) {
+			g.dropMark(candidate.ref.Key)
+			continue
+		}
+		key, ok, err := g.reclaimClaimedPayload(ctx, candidate.ref, candidate.sha, graceCutoff)
+		if err != nil {
 			if errors.Is(err, errObjectClaimed) {
 				claimed++
 				continue
 			}
-			if errors.Is(err, errPayloadMarked) {
-				marked++
-				continue
-			}
-			return deleted, claimed, marked, err
+			return deleted, claimed, err
 		}
 		if !ok {
 			continue
@@ -555,7 +635,18 @@ func (g *GC) reclaimPayloads(ctx context.Context, survivors []scannedManifest, r
 	// rule never passes through reclaimPayload again, so no dropMark
 	// call can reach it and its mark leaks for the process's lifetime.
 	g.pruneMarks(refs)
-	return deleted, claimed, marked, nil
+	return deleted, claimed, nil
+}
+
+func releasePayloadClaims(ctx context.Context, claims []claimedPayload) error {
+	var releaseErr error
+	for _, candidate := range claims {
+		releaseErr = errors.CombineErrors(releaseErr, releaseObjectClaim(ctx, candidate.claim))
+	}
+	if releaseErr != nil {
+		return errors.Wrap(releaseErr, "release payload claims")
+	}
+	return nil
 }
 
 // pruneMarks discards marks whose object was absent from the listing
@@ -576,27 +667,12 @@ func (g *GC) pruneMarks(refs []ObjectRef) {
 	}
 }
 
-func (g *GC) reclaimPayload(
+func (g *GC) reclaimClaimedPayload(
 	ctx context.Context,
-	live map[string]struct{},
-	graceCutoff time.Time,
 	ref ObjectRef,
+	sha string,
+	graceCutoff time.Time,
 ) (string, bool, error) {
-	sha, ok := payloadSHAFromKey(g.prefix, ref.Key)
-	if !ok {
-		g.log.Warn("snapshot offload retention skipped unrecognized payload object",
-			"object_key", ref.Key)
-		return "", false, nil
-	}
-	if payloadKeyIsLive(live, ref.Key) || !beforeGraceCutoff(ref.UpdatedAt, graceCutoff) {
-		// Referenced again, or freshly touched: forget any mark so a
-		// later eligibility has to serve its own full sweep delay.
-		g.dropMark(ref.Key)
-		return "", false, nil
-	}
-	if !g.sweepable(ref) {
-		return "", false, errPayloadMarked
-	}
 	info, exists, err := g.store.HeadObject(ctx, ref.Key)
 	if err != nil {
 		return "", false, errors.Wrapf(err, "retention: head payload %s", ref.Key)
@@ -670,16 +746,41 @@ func (g *GC) MarkedPayloads() []string {
 	return keys
 }
 
-// errPayloadMarked reports that a payload is waiting out its sweep
-// delay. It never escapes reclaimPayloads.
-var errPayloadMarked = errors.New("snapshot offload: payload marked, awaiting the sweep delay")
-
 // compareAndDeleteManifest deletes an expired manifest only if it
 // still matches the state the scan observed. It reports deleted=false
 // (not an error) when a concurrent publish rewrote the key, since
 // leaving a just-republished manifest in place is the correct outcome.
 func (g *GC) compareAndDeleteManifest(ctx context.Context, entry scannedManifest) (bool, error) {
-	err := g.store.DeleteObjectIfUnmodified(ctx, entry.key, PreconditionFor(entry.ref))
+	claim, err := g.store.AcquireObjectClaim(ctx, entry.key)
+	if err != nil {
+		if errors.Is(err, ErrObjectClaimed) {
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "retention: claim manifest %s", entry.key)
+	}
+	deleted, deleteErr := g.deleteClaimedManifest(ctx, entry)
+	releaseErr := releaseObjectClaim(ctx, claim)
+	if err := errors.CombineErrors(deleteErr, releaseErr); err != nil {
+		return deleted, errors.Wrap(err, "retention: delete claimed manifest")
+	}
+	return deleted, nil
+}
+
+func (g *GC) deleteClaimedManifest(ctx context.Context, entry scannedManifest) (bool, error) {
+	info, exists, err := g.store.HeadObject(ctx, entry.key)
+	if err != nil {
+		return false, errors.Wrapf(err, "retention: head manifest %s", entry.key)
+	}
+	if !exists {
+		return false, nil
+	}
+	current := refreshed(entry.ref, info)
+	if !sameObjectState(entry.ref, current) {
+		g.log.Info("snapshot offload retention skipped manifest rewritten by a concurrent publish",
+			"manifest_key", entry.key)
+		return false, nil
+	}
+	err = g.store.DeleteObjectIfUnmodified(ctx, entry.key, PreconditionFor(current))
 	switch {
 	case err == nil:
 		g.log.Info("snapshot offload retention deleted manifest",
@@ -692,6 +793,19 @@ func (g *GC) compareAndDeleteManifest(ctx context.Context, entry scannedManifest
 	default:
 		return false, errors.Wrapf(err, "retention: delete manifest %s", entry.key)
 	}
+}
+
+func sameObjectState(want, got ObjectRef) bool {
+	if want.Size != got.Size {
+		return false
+	}
+	if !want.UpdatedAt.IsZero() && !got.UpdatedAt.Equal(want.UpdatedAt) {
+		return false
+	}
+	if want.ETag != "" && got.ETag != want.ETag {
+		return false
+	}
+	return true
 }
 
 // compareAndDeletePayload deletes the payload only if it still matches
@@ -721,7 +835,7 @@ func (g *GC) compareAndDeletePayload(ctx context.Context, ref ObjectRef, sha str
 // errObjectClaimed marks the benign "a publisher took this payload
 // back" outcome so the caller can count it without treating it as a
 // failure. It never escapes reclaimPayloads.
-var errObjectClaimed = errors.New("snapshot offload: payload claimed by a concurrent publish")
+var errObjectClaimed = ErrObjectClaimed
 
 // refreshed merges the freshly-headed state into the listed ref so the
 // delete precondition describes what was actually validated, not the
@@ -744,36 +858,6 @@ func payloadKeyIsLive(live map[string]struct{}, key string) bool {
 
 func beforeGraceCutoff(updatedAt, graceCutoff time.Time) bool {
 	return !updatedAt.IsZero() && updatedAt.Before(graceCutoff)
-}
-
-// revalidateLiveKeys re-reads the manifest tree ONCE, after the payload
-// listing, and returns the set of payload keys it still references.
-//
-// The freshness matters: the live set used for the delete decision must
-// be at least as new as the payload listing, or a manifest committed
-// between the two would look absent. But it must be rebuilt once per
-// pass, not once per payload — a prefix with a large stale-payload
-// backlog would otherwise issue N listings and O(N×M) object reads and
-// never finish its first cleanup.
-//
-// A second return of false means the re-scan itself found the prefix
-// unsafe to reclaim from (a malformed manifest appeared), in which case
-// the caller must skip the phase entirely.
-func (g *GC) revalidateLiveKeys(ctx context.Context) (map[string]struct{}, bool, error) {
-	scan, err := g.scanManifests(ctx)
-	if err != nil {
-		return nil, false, err
-	}
-	if g.payloadPhaseBlockedBy(scan) != "" {
-		return nil, false, nil
-	}
-	live := make(map[string]struct{}, scan.scanned)
-	for _, manifests := range scan.byGroup {
-		for _, entry := range manifests {
-			live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
-		}
-	}
-	return live, true, nil
 }
 
 // payloadSHAFromKey recovers the content hash from a payload object

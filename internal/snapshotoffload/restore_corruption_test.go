@@ -135,11 +135,14 @@ func TestRestoreRejectsAManifestWithATamperedPayloadDescriptor(t *testing.T) {
 
 			tampered := manifest
 			tampered.Payload.SHA256 = falseSHA
-			encoded, _, err := tampered.MarshalCanonical()
+			encoded, freshSum, err := tampered.MarshalCanonical()
 			require.NoError(t, err)
 			if !tc.refreshSelfHash {
-				encoded = bytes.Replace(encoded,
-					[]byte(tampered.ManifestSHA256), []byte(manifest.ManifestSHA256), 1)
+				require.NotEqual(t, manifest.ManifestSHA256, freshSum)
+				stale := bytes.Replace(encoded,
+					[]byte(freshSum), []byte(manifest.ManifestSHA256), 1)
+				require.NotEqual(t, encoded, stale)
+				encoded = stale
 			}
 			manifestPath, err := store.pathForKey(manifest.ManifestKey)
 			require.NoError(t, err)

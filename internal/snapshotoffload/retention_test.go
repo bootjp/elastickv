@@ -333,7 +333,7 @@ func TestGCDoesNotReclaimPayloadInsideGracePeriod(t *testing.T) {
 	require.True(t, f.exists(t, keep.Payload.Key))
 }
 
-func TestPutPayloadRefreshesReusedObjectMTime(t *testing.T) {
+func TestPutPayloadReusesExistingObjectWithoutReupload(t *testing.T) {
 	t.Parallel()
 
 	f := newGCFixture(t)
@@ -360,8 +360,8 @@ func TestPutPayloadRefreshesReusedObjectMTime(t *testing.T) {
 	info, ok, err := f.store.HeadObject(ctx, key)
 	require.NoError(t, err)
 	require.True(t, ok)
-	require.True(t, info.UpdatedAt.After(oldMTime),
-		"reusing a content-addressed payload must refresh the store timestamp for GC grace")
+	require.True(t, info.UpdatedAt.Equal(oldMTime),
+		"the shared claim, not a multi-terabyte rewrite, coordinates payload reuse with GC")
 }
 
 func TestGCRevalidatesPayloadReferenceCommittedAfterInitialPayloadList(t *testing.T) {
@@ -796,6 +796,69 @@ func TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish(t *testing.T) {
 	require.True(t, f.exists(t, orphan.Payload.Key))
 }
 
+type claimAttemptDuringFinalScanStore struct {
+	RetentionStore
+	payloadKey string
+	groupLists int
+	claimErr   error
+}
+
+func (s *claimAttemptDuringFinalScanStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
+	refs, err := s.RetentionStore.ListObjects(ctx, prefix)
+	if err != nil {
+		return nil, err
+	}
+	if strings.HasSuffix(prefix, "/v1/groups") {
+		s.groupLists++
+		if s.groupLists == 4 {
+			claim, claimErr := s.AcquireObjectClaim(ctx, s.payloadKey)
+			s.claimErr = claimErr
+			if claimErr == nil {
+				_ = claim.Release(ctx)
+			}
+		}
+	}
+	return refs, nil
+}
+
+// TestGCHoldsPayloadClaimAcrossTheFinalManifestScan pins the ordering that
+// closes the same-ETag race. The fourth groups listing is the sweep pass's
+// authoritative scan; a publisher trying to claim the payload after that scan
+// has started must be excluded until GC finishes.
+func TestGCHoldsPayloadClaimAcrossTheFinalManifestScan(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	orphan := f.publishManifest(t, 1, 10, []byte("sweep-race"), year)
+	store := &claimAttemptDuringFinalScanStore{
+		RetentionStore: f.store,
+		payloadKey:     orphan.Payload.Key,
+	}
+	gc, err := NewGC(GCOptions{
+		Store:  store,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{
+			MinGenerations: 1,
+			MaxAge:         time.Hour,
+			PayloadGrace:   time.Hour,
+			MinMarkAge:     time.Hour,
+		},
+		Now: func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	f.now = f.now.Add(2 * time.Hour)
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+
+	require.ErrorIs(t, store.claimErr, ErrObjectClaimed,
+		"the payload claim must already be held when the final manifest scan completes")
+}
+
 // TestGCReclaimsAfterTwoQuietPasses is the complement: a payload that
 // nobody touches across both passes is reclaimed, so the two-pass rule
 // delays collection rather than preventing it.
@@ -878,6 +941,18 @@ func TestLocalStoreConditionalDeleteRejectsChangedObject(t *testing.T) {
 
 	// Already-absent stays a no-op so GC is retry-safe.
 	require.NoError(t, f.store.DeleteObjectIfUnmodified(ctx, key, current))
+}
+
+func TestLocalStoreDeleteIsIdempotentWhenParentNeverExisted(t *testing.T) {
+	t.Parallel()
+
+	store, err := NewLocalStore(filepath.Join(t.TempDir(), "missing-root"))
+	require.NoError(t, err)
+	ctx := context.Background()
+	const key = "never/created/object"
+
+	require.NoError(t, store.DeleteObject(ctx, key))
+	require.NoError(t, store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{Size: 1}))
 }
 
 // manifestRewritingStore rewrites an expired manifest between the scan
@@ -1205,9 +1280,9 @@ func TestLocalStoreListObjectsRejectsTraversingPrefixes(t *testing.T) {
 	}
 }
 
-// nonRefreshingStore exposes only ObjectStore, so a type assertion to
-// ObjectRefresher fails — the shape a decorator that forwards a narrow
-// interface produces.
+// nonRefreshingStore exposes only ObjectStore, so a type assertion to the
+// storage-visible claim capability fails — the shape a decorator that forwards
+// a narrow interface produces.
 type nonRefreshingStore struct {
 	put  func(context.Context, string, io.Reader, PutOptions) (ObjectInfo, error)
 	get  func(context.Context, string) (io.ReadCloser, ObjectInfo, error)
@@ -1228,50 +1303,23 @@ func (s nonRefreshingStore) HeadObject(ctx context.Context, key string) (ObjectI
 	return s.head(ctx, key)
 }
 
-// TestRefreshExistingPayloadFailsWhenTheStoreCannotRefresh is the
-// regression for a silent no-op that would defeat the whole two-pass
-// sweep.
-//
-// The sweep detects a reuse precisely BECAUSE the refresh moves the
-// object's mtime. A store that cannot refresh left the object
-// untouched, so retention would see it as quiet, reclaim it, and the
-// publisher would commit a manifest naming bytes that no longer exist.
-func TestRefreshExistingPayloadFailsWhenTheStoreCannotRefresh(t *testing.T) {
+// TestObjectClaimStoreRequiredForPublicationCoordination prevents a decorator
+// from silently dropping the capability that closes the publish/GC race.
+func TestObjectClaimStoreRequiredForPublicationCoordination(t *testing.T) {
 	t.Parallel()
 
 	f := newGCFixture(t)
-	payload := []byte("payload-that-would-be-silently-unrefreshed")
-	sha := hexSHA256Bytes(payload)
-	key, err := payloadKey(retentionPrefix, sha)
-	require.NoError(t, err)
-
-	spool := filepath.Join(t.TempDir(), "payload.fsm")
-	require.NoError(t, os.WriteFile(spool, payload, 0o600))
-	file, err := os.Open(spool)
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = file.Close() })
-
 	narrow := nonRefreshingStore{
 		put:  f.store.PutObject,
 		get:  f.store.GetObject,
 		head: f.store.HeadObject,
 	}
-	// The store really is not an ObjectRefresher.
-	_, refreshable := ObjectStore(narrow).(ObjectRefresher)
-	require.False(t, refreshable)
+	_, err := objectClaimStore(narrow)
+	require.ErrorIs(t, err, ErrInvalidOptions)
 
-	err = refreshExistingPayload(context.Background(), narrow, key, file, PutOptions{
-		Size:   int64(len(payload)),
-		SHA256: sha,
-	})
-	require.Error(t, err, "a store that cannot refresh must fail closed, not skip silently")
-	require.True(t, errors.Is(err, ErrInvalidOptions))
-
-	// The real local store refreshes, so publishing still works.
-	require.NoError(t, refreshExistingPayload(context.Background(), f.store, key, file, PutOptions{
-		Size:   int64(len(payload)),
-		SHA256: sha,
-	}))
+	claimable, err := objectClaimStore(f.store)
+	require.NoError(t, err)
+	require.NotNil(t, claimable)
 }
 
 // TestLocalStoreListObjectsRejectsNativeSeparatorTraversal covers the

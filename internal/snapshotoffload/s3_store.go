@@ -42,6 +42,7 @@ type S3ObjectClient interface {
 	AbortMultipartUpload(context.Context, *s3.AbortMultipartUploadInput, ...func(*s3.Options)) (*s3.AbortMultipartUploadOutput, error)
 	ListObjectsV2(context.Context, *s3.ListObjectsV2Input, ...func(*s3.Options)) (*s3.ListObjectsV2Output, error)
 	DeleteObject(context.Context, *s3.DeleteObjectInput, ...func(*s3.Options)) (*s3.DeleteObjectOutput, error)
+	GetBucketVersioning(context.Context, *s3.GetBucketVersioningInput, ...func(*s3.Options)) (*s3.GetBucketVersioningOutput, error)
 }
 
 type S3StoreConfig struct {
@@ -57,6 +58,12 @@ type S3StoreConfig struct {
 	ServerSideEncryption   string
 	SSEKMSKeyID            string
 	DisableChecksumHeaders bool
+	// AllowVersionedBucketWithLifecycle is an explicit operator assertion
+	// that the bucket has a noncurrent-version expiration lifecycle. The
+	// store rejects Enabled/Suspended versioning by default because keyed
+	// retention deletes otherwise create delete markers without reclaiming
+	// bytes.
+	AllowVersionedBucketWithLifecycle bool
 }
 
 type S3Store struct {
@@ -89,15 +96,42 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 			}
 		})
 	}
+	bucket := stringsTrim(cfg.Bucket)
+	if err := validateS3BucketVersioning(ctx, client, bucket, cfg.AllowVersionedBucketWithLifecycle); err != nil {
+		return nil, err
+	}
 	return &S3Store{
 		client:                 client,
-		bucket:                 stringsTrim(cfg.Bucket),
+		bucket:                 bucket,
 		serverSideEncryption:   stringsTrim(cfg.ServerSideEncryption),
 		sseKMSKeyID:            stringsTrim(cfg.SSEKMSKeyID),
 		disableChecksumHeaders: cfg.DisableChecksumHeaders,
 		multipartThreshold:     s3MaxSinglePutBytes,
 		multipartPartSize:      s3DefaultMultipartPart,
 	}, nil
+}
+
+func validateS3BucketVersioning(
+	ctx context.Context,
+	client S3ObjectClient,
+	bucket string,
+	allowWithLifecycle bool,
+) error {
+	out, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
+	if err != nil {
+		return errors.Wrap(err, "get s3 bucket versioning")
+	}
+	if out == nil {
+		return errors.Wrap(ErrIntegrity, "get s3 bucket versioning returned no response")
+	}
+	switch out.Status {
+	case types.BucketVersioningStatusEnabled, types.BucketVersioningStatusSuspended:
+		if !allowWithLifecycle {
+			return errors.Wrapf(ErrInvalidOptions,
+				"s3 bucket %s has versioning %s; configure noncurrent-version expiration and explicitly allow it", bucket, out.Status)
+		}
+	}
+	return nil
 }
 
 func loadS3AWSConfig(ctx context.Context, cfg S3StoreConfig) (aws.Config, error) {
@@ -1001,7 +1035,7 @@ func rememberListToken(seen map[string]struct{}, prefix string, token *string) e
 func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output, listPrefix string) ([]ObjectRef, error) {
 	for _, obj := range out.Contents {
 		if obj.Key == nil {
-			continue
+			return nil, errors.Wrap(ErrIntegrity, "listed object is missing its key")
 		}
 		key := *obj.Key
 		if listPrefix != "" && !strings.HasPrefix(key, listPrefix) {
@@ -1010,7 +1044,7 @@ func appendListedObjects(refs []ObjectRef, out *s3.ListObjectsV2Output, listPref
 		if normalizeObjectKey(key) != key {
 			return nil, errors.Wrapf(ErrIntegrity, "listed object key %q is not canonical", key)
 		}
-		ref := ObjectRef{Key: key}
+		ref := ObjectRef{Key: key, ETag: aws.ToString(obj.ETag)}
 		if obj.Size != nil {
 			ref.Size = *obj.Size
 		}
@@ -1112,6 +1146,9 @@ func (s *S3Store) DeleteObjectIfUnmodified(ctx context.Context, key string, cond
 			"conditional delete of %s requires an etag or a last-modified time", key)
 	}
 	if _, err := s.client.DeleteObject(ctx, input); err != nil {
+		if isS3NotFound(err) {
+			return nil
+		}
 		if isPreconditionFailed(err) {
 			return errors.Wrapf(ErrObjectModified,
 				"object %s changed since it was validated for deletion", key)

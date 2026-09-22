@@ -337,6 +337,44 @@ func TestS3StoreRejectsInvalidKMSConfig(t *testing.T) {
 	require.ErrorContains(t, err, "aliases are not supported")
 }
 
+func TestS3StoreRejectsVersionedBucketsWithoutLifecycleAssertion(t *testing.T) {
+	t.Parallel()
+
+	for _, status := range []types.BucketVersioningStatus{
+		types.BucketVersioningStatusEnabled,
+		types.BucketVersioningStatusSuspended,
+	} {
+
+		t.Run(string(status), func(t *testing.T) {
+			t.Parallel()
+			client := newFakeS3Client()
+			client.versioningStatus = status
+			_, err := NewS3Store(context.Background(), S3StoreConfig{
+				Client:               client,
+				Bucket:               "backup-bucket",
+				ServerSideEncryption: string(types.ServerSideEncryptionAes256),
+			})
+			require.ErrorIs(t, err, ErrInvalidOptions)
+			require.ErrorContains(t, err, "noncurrent-version expiration")
+		})
+	}
+}
+
+func TestS3StoreAllowsVersionedBucketWithLifecycleAssertion(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeS3Client()
+	client.versioningStatus = types.BucketVersioningStatusEnabled
+	store, err := NewS3Store(context.Background(), S3StoreConfig{
+		Client:                            client,
+		Bucket:                            "backup-bucket",
+		ServerSideEncryption:              string(types.ServerSideEncryptionAes256),
+		AllowVersionedBucketWithLifecycle: true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, store)
+}
+
 func TestS3StoreRejectsParentDirectoryKeys(t *testing.T) {
 	ctx := context.Background()
 	store := newTestS3Store(t, newFakeS3Client())
@@ -387,6 +425,8 @@ type fakeS3Client struct {
 	listModTime                 time.Time
 	listPrefixes                []string
 	deletes                     []string
+	versioningStatus            types.BucketVersioningStatus
+	versioningErr               error
 }
 
 type fakeS3Object struct {
@@ -872,6 +912,17 @@ func (c *fakeS3Client) DeleteObject(
 	return &s3.DeleteObjectOutput{}, nil
 }
 
+func (c *fakeS3Client) GetBucketVersioning(
+	_ context.Context, _ *s3.GetBucketVersioningInput, _ ...func(*s3.Options),
+) (*s3.GetBucketVersioningOutput, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.versioningErr != nil {
+		return nil, c.versioningErr
+	}
+	return &s3.GetBucketVersioningOutput{Status: c.versioningStatus}, nil
+}
+
 // fakeS3ETag derives a stable ETag from the object bytes, matching
 // S3's single-part semantics closely enough for the If-Match tests.
 func fakeS3ETag(body []byte) string {
@@ -921,6 +972,7 @@ func TestS3StoreListObjectsPagesThroughEveryPage(t *testing.T) {
 	for _, ref := range refs {
 		got = append(got, ref.Key)
 		require.Equal(t, client.listModTime, ref.UpdatedAt)
+		require.NotEmpty(t, ref.ETag)
 	}
 	sort.Strings(got)
 	require.Equal(t, want, got, "every page must be returned")
@@ -1002,6 +1054,16 @@ func TestS3StoreListObjectsRejectsNoncanonicalKeys(t *testing.T) {
 	require.Nil(t, refs, "a canonicalized alias must not be returned with another key's identity")
 }
 
+func TestAppendListedObjectsRejectsEntryWithoutKey(t *testing.T) {
+	t.Parallel()
+
+	refs, err := appendListedObjects(nil, &s3.ListObjectsV2Output{
+		Contents: []types.Object{{Key: nil}},
+	}, "cluster-a/v1/payloads/")
+	require.ErrorIs(t, err, ErrIntegrity)
+	require.Nil(t, refs)
+}
+
 func TestS3StoreDeleteObjectIsIdempotentAndValidatesKeys(t *testing.T) {
 	ctx := context.Background()
 	client := newFakeS3Client()
@@ -1059,6 +1121,9 @@ func TestS3StoreConditionalDeleteUsesIfMatchAndMapsPreconditionFailure(t *testin
 	_, gone, err := store.HeadObject(ctx, key)
 	require.NoError(t, err)
 	require.False(t, gone)
+	// A concurrent deleter already satisfying the operation is success,
+	// even when the stale condition no longer has an object to compare.
+	require.NoError(t, store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{ETag: info.ETag}))
 }
 
 // TestS3StoreConditionalDeleteRefusesAnEmptyPrecondition stops a

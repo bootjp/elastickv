@@ -31,16 +31,17 @@ const (
 )
 
 type storeFlags struct {
-	storeKind                string
-	localRoot                string
-	s3Bucket                 string
-	s3Region                 string
-	s3Endpoint               string
-	s3Profile                string
-	s3PathStyle              bool
-	s3ServerSideEncryption   string
-	s3KMSKeyID               string
-	s3DisableChecksumHeaders bool
+	storeKind                 string
+	localRoot                 string
+	s3Bucket                  string
+	s3Region                  string
+	s3Endpoint                string
+	s3Profile                 string
+	s3PathStyle               bool
+	s3ServerSideEncryption    string
+	s3KMSKeyID                string
+	s3DisableChecksumHeaders  bool
+	s3AllowVersionedLifecycle bool
 }
 
 type publishConfig struct {
@@ -194,6 +195,7 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	fs.StringVar(&cfg.s3ServerSideEncryption, "s3-sse", cfg.s3ServerSideEncryption, "Server-side encryption algorithm for uploaded objects: AES256 or aws:kms")
 	fs.StringVar(&cfg.s3KMSKeyID, "s3-kms-key-id", "", "KMS key ARN or bare key ID when --s3-sse=aws:kms; aliases are rejected")
 	fs.BoolVar(&cfg.s3DisableChecksumHeaders, "s3-disable-checksum-headers", false, "Do not send S3 checksum headers; keep metadata and restore-time verification")
+	fs.BoolVar(&cfg.s3AllowVersionedLifecycle, "s3-allow-versioned-with-lifecycle", false, "Allow an S3 versioned bucket after confirming noncurrent-version expiration is configured")
 }
 
 func validateStoreFlags(cfg storeFlags) error {
@@ -289,14 +291,15 @@ func openObjectStore(ctx context.Context, cfg storeFlags) (snapshotoffload.Objec
 		return store, nil
 	case storeS3:
 		store, err := snapshotoffload.NewS3Store(ctx, snapshotoffload.S3StoreConfig{
-			Bucket:                 cfg.s3Bucket,
-			Region:                 cfg.s3Region,
-			Endpoint:               cfg.s3Endpoint,
-			Profile:                cfg.s3Profile,
-			ForcePathStyle:         cfg.s3PathStyle,
-			ServerSideEncryption:   cfg.s3ServerSideEncryption,
-			SSEKMSKeyID:            cfg.s3KMSKeyID,
-			DisableChecksumHeaders: cfg.s3DisableChecksumHeaders,
+			Bucket:                            cfg.s3Bucket,
+			Region:                            cfg.s3Region,
+			Endpoint:                          cfg.s3Endpoint,
+			Profile:                           cfg.s3Profile,
+			ForcePathStyle:                    cfg.s3PathStyle,
+			ServerSideEncryption:              cfg.s3ServerSideEncryption,
+			SSEKMSKeyID:                       cfg.s3KMSKeyID,
+			DisableChecksumHeaders:            cfg.s3DisableChecksumHeaders,
+			AllowVersionedBucketWithLifecycle: cfg.s3AllowVersionedLifecycle,
 		})
 		if err != nil {
 			return nil, errors.Wrap(err, "open s3 object store")

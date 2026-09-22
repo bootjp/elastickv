@@ -45,7 +45,7 @@ type PublishOptions struct {
 	SkipIfNotNewerThan uint64
 }
 
-func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manifest, error) {
+func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (result *Manifest, retErr error) {
 	if err := validatePublishOptions(opts); err != nil {
 		return nil, err
 	}
@@ -56,9 +56,8 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	defer func() { _ = export.Close() }()
 
 	metadata := export.Metadata()
-	if opts.SkipIfNotNewerThan > 0 && metadata.Index <= opts.SkipIfNotNewerThan {
-		return nil, errors.Wrapf(ErrSnapshotNotNewer,
-			"persisted snapshot index %d is not newer than %d", metadata.Index, opts.SkipIfNotNewerThan)
+	if err := rejectSnapshotNotNewer(metadata.Index, opts.SkipIfNotNewerThan); err != nil {
+		return nil, err
 	}
 	payloadFile, payloadSHA, payloadBytes, err := spoolExport(ctx, export, publishSpoolDir(opts))
 	if err != nil {
@@ -75,10 +74,29 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	if err != nil {
 		return nil, err
 	}
+	claimStore, err := objectClaimStore(opts.Store)
+	if err != nil {
+		return nil, err
+	}
+	payloadClaim, err := acquireObjectClaimWaiting(ctx, claimStore, payloadObjectKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "claim snapshot payload")
+	}
+	defer func() {
+		retErr = errors.CombineErrors(retErr, releaseObjectClaim(ctx, payloadClaim))
+	}()
 	if err := putPayload(ctx, opts.Store, payloadObjectKey, payloadFile, payloadBytes, payloadSHA); err != nil {
 		return nil, err
 	}
 	return commitManifest(ctx, opts, metadata, payloadObjectKey, payloadSHA)
+}
+
+func rejectSnapshotNotNewer(index uint64, threshold uint64) error {
+	if threshold > 0 && index <= threshold {
+		return errors.Wrapf(ErrSnapshotNotNewer,
+			"persisted snapshot index %d is not newer than %d", index, threshold)
+	}
+	return nil
 }
 
 // commitManifest builds, validates and commits the manifest once the payload is
@@ -154,7 +172,19 @@ func putManifest(
 	manifest *Manifest,
 	reuseExistingCreatedAt bool,
 	verifyLeader func(context.Context) error,
-) error {
+) (retErr error) {
+	claimStore, err := objectClaimStore(store)
+	if err != nil {
+		return err
+	}
+	claim, err := acquireObjectClaimWaiting(ctx, claimStore, manifest.ManifestKey)
+	if err != nil {
+		return errors.Wrap(err, "claim snapshot manifest")
+	}
+	defer func() {
+		retErr = errors.CombineErrors(retErr, releaseObjectClaim(ctx, claim))
+	}()
+
 	data, manifestSHA, err := manifest.MarshalCanonical()
 	if err != nil {
 		return err
@@ -164,7 +194,10 @@ func putManifest(
 	if exists, err := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); err != nil {
 		return err
 	} else if exists {
-		return nil
+		if err := verifyPublishLeadership(ctx, verifyLeader, "manifest reuse"); err != nil {
+			return err
+		}
+		return refreshExistingManifest(ctx, store, manifest)
 	}
 	// §4: leadership must hold at the instant the manifest is created,
 	// not merely before the absence probe above. That probe is a remote
@@ -172,16 +205,54 @@ func putManifest(
 	// so checking before it leaves a window in which a demoted node
 	// still commits a manifest — precisely the guarantee this
 	// scheduler exists to provide.
-	if verifyLeader != nil {
-		if err := verifyLeader(ctx); err != nil {
-			return errors.Wrap(err, "snapshot offload: leadership lost before manifest commit")
-		}
+	if err := verifyPublishLeadership(ctx, verifyLeader, "manifest commit"); err != nil {
+		return err
 	}
 	if err := createManifestObject(ctx, store, manifest, data, size, objectSHA, reuseExistingCreatedAt); err != nil {
 		return err
 	}
 	manifest.ManifestSHA256 = manifestSHA
 	return verifyCommittedManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt)
+}
+
+func verifyPublishLeadership(ctx context.Context, verify func(context.Context) error, operation string) error {
+	if verify == nil {
+		return nil
+	}
+	if err := verify(ctx); err != nil {
+		return errors.Wrapf(err, "snapshot offload: leadership lost before %s", operation)
+	}
+	return nil
+}
+
+// refreshExistingManifest changes the storage-visible state of a reused
+// manifest while preserving its canonical bytes. The manifest is small, and
+// the refresh makes a retention scan taken before this publish skip the object
+// after it acquires the shared claim and revalidates the listed state.
+func refreshExistingManifest(ctx context.Context, store ObjectStore, manifest *Manifest) error {
+	refresher, ok := store.(ObjectRefresher)
+	if !ok {
+		return errors.Wrapf(ErrInvalidOptions,
+			"object store cannot refresh reused manifest %s", manifest.ManifestKey)
+	}
+	data, _, err := manifest.MarshalCanonical()
+	if err != nil {
+		return err
+	}
+	opts := PutOptions{
+		Size:        int64(len(data)),
+		SHA256:      hexSHA256Bytes(data),
+		ContentType: "application/json",
+	}
+	info, err := refresher.RefreshObject(ctx, manifest.ManifestKey, bytes.NewReader(data), opts)
+	if err != nil {
+		return errors.Wrap(err, "refresh existing snapshot manifest")
+	}
+	if info.Size != opts.Size || (info.SHA256 != "" && info.SHA256 != opts.SHA256) {
+		return errors.Wrapf(ErrIntegrity,
+			"manifest object %s remote integrity mismatch after refresh", manifest.ManifestKey)
+	}
+	return nil
 }
 
 func createManifestObject(
@@ -369,7 +440,11 @@ func putPayload(ctx context.Context, store ObjectStore, key string, file *os.Fil
 		return errors.Wrap(err, "verify existing snapshot payload")
 	}
 	if exists {
-		return refreshExistingPayload(ctx, store, key, file, opts)
+		// The caller holds the payload's storage-visible claim until the
+		// manifest commits. Rewriting a multi-terabyte content-addressed
+		// payload merely to move its mtime would defeat deduplication; the
+		// shared claim is the lightweight coordination primitive instead.
+		return nil
 	}
 	if err := seekPayloadFile(file); err != nil {
 		return err
@@ -377,31 +452,6 @@ func putPayload(ctx context.Context, store ObjectStore, key string, file *os.Fil
 	info, err := store.PutObject(ctx, key, file, opts)
 	if err != nil {
 		return errors.Wrap(err, "put snapshot payload")
-	}
-	return validatePayloadObjectInfo(key, info, opts)
-}
-
-// refreshExistingPayload restarts a reused payload's retention grace by
-// rewriting it.
-//
-// A store that cannot refresh is a hard error, not a silent skip. The
-// §5 two-pass sweep detects a reuse precisely BECAUSE the refresh moves
-// the object's mtime; if nothing moves, retention sees an untouched
-// object, sweeps it, and the publisher commits a manifest naming bytes
-// that no longer exist. Failing here costs one publish; skipping
-// quietly costs the backup.
-func refreshExistingPayload(ctx context.Context, store ObjectStore, key string, file *os.File, opts PutOptions) error {
-	refresher, ok := store.(ObjectRefresher)
-	if !ok {
-		return errors.Wrapf(ErrInvalidOptions,
-			"object store cannot refresh existing payload %s; reuse would leave it eligible for reclamation", key)
-	}
-	if err := seekPayloadFile(file); err != nil {
-		return err
-	}
-	info, err := refresher.RefreshObject(ctx, key, file, opts)
-	if err != nil {
-		return errors.Wrap(err, "refresh existing snapshot payload")
 	}
 	return validatePayloadObjectInfo(key, info, opts)
 }

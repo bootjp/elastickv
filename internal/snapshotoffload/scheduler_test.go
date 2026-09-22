@@ -473,6 +473,14 @@ type objectLosingStore struct {
 	ObjectStore
 }
 
+func (s *objectLosingStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
 func (s *objectLosingStore) PutObject(
 	ctx context.Context, key string, body io.Reader, opts PutOptions,
 ) (ObjectInfo, error) {

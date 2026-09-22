@@ -11,6 +11,7 @@ import (
 	"time"
 
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -640,6 +641,20 @@ type countingObjectStore struct {
 	getObjectCalls int
 }
 
+func (s *countingObjectStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *countingObjectStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
+}
+
 func (s *countingObjectStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
 	s.getObjectCalls++
 	return s.ObjectStore.GetObject(ctx, key)
@@ -649,6 +664,20 @@ type headMissOnceStore struct {
 	ObjectStore
 	key  string
 	miss bool
+}
+
+func (s *headMissOnceStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *headMissOnceStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
 }
 
 func (s *headMissOnceStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
@@ -670,6 +699,30 @@ type headOrderingStore struct {
 	ObjectStore
 	manifestKey string
 	calls       []string
+}
+
+func (s *headOrderingStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *headOrderingStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
+}
+
+func refreshWrappedObject(
+	ctx context.Context, store ObjectStore, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	refresher, ok := store.(ObjectRefresher)
+	if !ok {
+		return ObjectInfo{}, errors.Wrap(ErrInvalidOptions, "wrapped object store cannot refresh objects")
+	}
+	return refresher.RefreshObject(ctx, key, body, opts)
 }
 
 func (s *headOrderingStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
