@@ -89,7 +89,9 @@ manifest is the commit marker and contains:
 - source cluster identity and Raft group ID;
 - snapshot index, term, and ConfState;
 - payload object key, exact length, SHA-256, and source CRC32C;
-- binary version and snapshot feature capabilities used by the writer.
+- binary version and snapshot feature capabilities used by the writer;
+- a random publication ID that changes on every new or reused-manifest
+  publication while remaining optional for manifests written before M3.
 
 Publication order is payload first, manifest last. A retry may overwrite an
 identical payload key, but it must reject a different length or checksum. A
@@ -144,7 +146,10 @@ every initially expired manifest before the authoritative final scan,
 holds those claims through deletion, and deletes only manifests whose
 size, mtime, and ETag still match the initial scan. A manifest that was
 refreshed before GC won its claim, or whose claim is held elsewhere, is
-kept; its payload is added back to the live set before payload sweep.
+kept; its payload is added back to the live set before payload sweep. The
+fresh random publication ID changes the manifest bytes and ETag even when
+the snapshot and object-store timestamp are otherwise identical, so this
+comparison does not depend on last-modified timestamp precision.
 
 The mark state is in-memory and per-process. Losing it on restart
 delays reclamation by one pass and never advances it. Marks for objects

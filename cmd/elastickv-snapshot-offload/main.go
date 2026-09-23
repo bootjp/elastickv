@@ -187,7 +187,8 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	cfg.s3ServerSideEncryption = string(s3SSEAES256)
 	fs.StringVar(&cfg.storeKind, "store", storeLocal, "Object store backend: local or s3")
 	fs.StringVar(&cfg.localRoot, "local-root", "", "Local object store root when --store=local")
-	fs.StringVar(&cfg.s3Bucket, "s3-bucket", "", "S3 bucket when --store=s3")
+	fs.StringVar(&cfg.s3Bucket, "s3-bucket", "",
+		"S3 bucket when --store=s3; credentials require s3:GetBucketVersioning")
 	fs.StringVar(&cfg.s3Region, "s3-region", cfg.s3Region, "S3 signing region")
 	fs.StringVar(&cfg.s3Endpoint, "s3-endpoint", "", "S3-compatible endpoint URL")
 	fs.StringVar(&cfg.s3Profile, "s3-profile", "", "AWS shared config profile")

@@ -119,7 +119,7 @@ func validateS3BucketVersioning(
 ) error {
 	out, err := client.GetBucketVersioning(ctx, &s3.GetBucketVersioningInput{Bucket: aws.String(bucket)})
 	if err != nil {
-		return errors.Wrap(err, "get s3 bucket versioning")
+		return errors.Wrap(err, "get s3 bucket versioning (requires s3:GetBucketVersioning)")
 	}
 	if out == nil {
 		return errors.Wrap(ErrIntegrity, "get s3 bucket versioning returned no response")

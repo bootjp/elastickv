@@ -3,6 +3,7 @@ package snapshotoffload
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -139,6 +140,10 @@ func buildManifest(
 	payloadObjectKey string,
 	payloadSHA string,
 ) (*Manifest, error) {
+	publicationID, err := newPublicationID()
+	if err != nil {
+		return nil, err
+	}
 	manifestObjectKey, err := manifestKey(opts.Prefix, opts.GroupID, metadata.Index, metadata.Term)
 	if err != nil {
 		return nil, err
@@ -162,8 +167,17 @@ func buildManifest(
 			SourceCRC32C: metadata.CRC32C,
 		},
 		BinaryVersion: stringsTrim(opts.BinaryVersion),
+		PublicationID: publicationID,
 		ManifestKey:   manifestObjectKey,
 	}, nil
+}
+
+func newPublicationID() (string, error) {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return "", errors.Wrap(err, "generate publication id")
+	}
+	return hex.EncodeToString(token[:]), nil
 }
 
 func putManifest(
@@ -191,7 +205,7 @@ func putManifest(
 	}
 	size := int64(len(data))
 	objectSHA := hexSHA256Bytes(data)
-	if exists, err := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); err != nil {
+	if exists, err := verifyExistingManifest(ctx, store, manifest, reuseExistingCreatedAt); err != nil {
 		return err
 	} else if exists {
 		if err := verifyPublishLeadership(ctx, verifyLeader, "manifest reuse"); err != nil {
@@ -212,7 +226,7 @@ func putManifest(
 		return err
 	}
 	manifest.ManifestSHA256 = manifestSHA
-	return verifyCommittedManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt)
+	return verifyCommittedManifest(ctx, store, manifest, reuseExistingCreatedAt)
 }
 
 func verifyPublishLeadership(ctx context.Context, verify func(context.Context) error, operation string) error {
@@ -235,7 +249,7 @@ func refreshExistingManifest(ctx context.Context, store ObjectStore, manifest *M
 		return errors.Wrapf(ErrInvalidOptions,
 			"object store cannot refresh reused manifest %s", manifest.ManifestKey)
 	}
-	data, _, err := manifest.MarshalCanonical()
+	data, manifestSHA, err := manifest.MarshalCanonical()
 	if err != nil {
 		return err
 	}
@@ -252,6 +266,7 @@ func refreshExistingManifest(ctx context.Context, store ObjectStore, manifest *M
 		return errors.Wrapf(ErrIntegrity,
 			"manifest object %s remote integrity mismatch after refresh", manifest.ManifestKey)
 	}
+	manifest.ManifestSHA256 = manifestSHA
 	return nil
 }
 
@@ -270,7 +285,7 @@ func createManifestObject(
 		ContentType: "application/json",
 	})
 	if err != nil {
-		return handleManifestPutError(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt, err)
+		return handleManifestPutError(ctx, store, manifest, reuseExistingCreatedAt, err)
 	}
 	if info.Size != size || (info.SHA256 != "" && info.SHA256 != objectSHA) {
 		return errors.Wrapf(ErrIntegrity, "manifest object %s remote integrity mismatch", manifest.ManifestKey)
@@ -282,15 +297,13 @@ func handleManifestPutError(
 	ctx context.Context,
 	store ObjectStore,
 	manifest *Manifest,
-	size int64,
-	objectSHA string,
 	reuseExistingCreatedAt bool,
 	err error,
 ) error {
 	if !errors.Is(err, ErrIntegrity) {
 		return errors.Wrap(err, "put snapshot manifest")
 	}
-	if exists, verifyErr := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); verifyErr != nil {
+	if exists, verifyErr := verifyExistingManifest(ctx, store, manifest, reuseExistingCreatedAt); verifyErr != nil {
 		return errors.Wrap(verifyErr, "verify conflicting snapshot manifest")
 	} else if exists {
 		return nil
@@ -302,11 +315,9 @@ func verifyCommittedManifest(
 	ctx context.Context,
 	store ObjectStore,
 	manifest *Manifest,
-	size int64,
-	objectSHA string,
 	reuseExistingCreatedAt bool,
 ) error {
-	if exists, err := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); err != nil {
+	if exists, err := verifyExistingManifest(ctx, store, manifest, reuseExistingCreatedAt); err != nil {
 		return errors.Wrap(err, "verify committed snapshot manifest")
 	} else if !exists {
 		return errors.Wrapf(ErrIntegrity, "manifest object %s missing after put", manifest.ManifestKey)
@@ -318,31 +329,26 @@ func verifyExistingManifest(
 	ctx context.Context,
 	store ObjectStore,
 	manifest *Manifest,
-	size int64,
-	sha string,
 	reuseExistingCreatedAt bool,
 ) (bool, error) {
-	info, ok, err := store.HeadObject(ctx, manifest.ManifestKey)
+	_, ok, err := store.HeadObject(ctx, manifest.ManifestKey)
 	if err != nil {
 		return false, errors.Wrap(err, "head existing snapshot manifest")
 	}
 	if !ok {
 		return false, nil
 	}
-	if info.Size != size && !reuseExistingCreatedAt {
-		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different size", manifest.ManifestKey)
-	}
-	if info.SHA256 != "" && info.SHA256 != sha && !reuseExistingCreatedAt {
-		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different sha256", manifest.ManifestKey)
-	}
 	existing, err := LoadManifest(ctx, store, manifest.ManifestKey)
 	if err != nil {
-		return true, errors.Wrap(err, "load existing snapshot manifest")
+		return true, errors.Wrapf(ErrIntegrity,
+			"load existing snapshot manifest %s: %v", manifest.ManifestKey, err)
 	}
 	if !manifestMatchesCandidate(existing, *manifest, reuseExistingCreatedAt) {
 		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different content", manifest.ManifestKey)
 	}
+	publicationID := manifest.PublicationID
 	*manifest = existing
+	manifest.PublicationID = publicationID
 	return true, nil
 }
 
@@ -350,6 +356,7 @@ func manifestMatchesCandidate(existing Manifest, candidate Manifest, reuseExisti
 	if reuseExistingCreatedAt {
 		return sameManifestExceptCreation(existing, candidate)
 	}
+	candidate.PublicationID = existing.PublicationID
 	candidate.ManifestSHA256 = existing.ManifestSHA256
 	return reflect.DeepEqual(existing, candidate)
 }
@@ -370,6 +377,7 @@ func sameManifestExceptCreation(existing Manifest, candidate Manifest) bool {
 	candidate.CreatedAt = existing.CreatedAt
 	candidate.ManifestSHA256 = existing.ManifestSHA256
 	candidate.BinaryVersion = existing.BinaryVersion
+	candidate.PublicationID = existing.PublicationID
 	return reflect.DeepEqual(existing, candidate)
 }
 

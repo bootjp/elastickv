@@ -1,6 +1,7 @@
 package snapshotoffload
 
 import (
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"path"
@@ -12,9 +13,10 @@ import (
 )
 
 const (
-	ManifestSchemaVersion = 1
-	payloadObjectSuffix   = ".fsm"
-	manifestObjectSuffix  = ".json"
+	ManifestSchemaVersion  = 1
+	payloadObjectSuffix    = ".fsm"
+	manifestObjectSuffix   = ".json"
+	publicationIDHexLength = 32
 )
 
 var (
@@ -56,6 +58,7 @@ type Manifest struct {
 	ConfState      ManifestConfState `json:"conf_state"`
 	Payload        PayloadDescriptor `json:"payload"`
 	BinaryVersion  string            `json:"binary_version,omitempty"`
+	PublicationID  string            `json:"publication_id,omitempty"`
 	ManifestKey    string            `json:"manifest_key"`
 	ManifestSHA256 string            `json:"manifest_sha256,omitempty"`
 }
@@ -132,9 +135,19 @@ func validateManifestIdentity(manifest Manifest) error {
 		return errors.Wrap(ErrInvalidOptions, "snapshot index must be > 0")
 	case manifest.SnapshotTerm == 0:
 		return errors.Wrap(ErrInvalidOptions, "snapshot term must be > 0")
+	case manifest.PublicationID != "" && !isPublicationID(manifest.PublicationID):
+		return errors.Wrap(ErrInvalidOptions, "publication id must be 32 lowercase hex characters")
 	default:
 		return nil
 	}
+}
+
+func isPublicationID(value string) bool {
+	if len(value) != publicationIDHexLength {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil && value == strings.ToLower(value)
 }
 
 func validateManifestPayload(payload PayloadDescriptor) error {
