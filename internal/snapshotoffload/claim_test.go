@@ -83,6 +83,34 @@ func (c deadlineClaim) Release(ctx context.Context) error {
 	return ctx.Err()
 }
 
+type immediateClaim struct {
+	releases *atomic.Int32
+}
+
+func (c immediateClaim) Release(context.Context) error {
+	c.releases.Add(1)
+	return nil
+}
+
+func TestRetentionClaimCleanupDoesNotSerializeBehindSlowRelease(t *testing.T) {
+	t.Parallel()
+
+	var fastReleases atomic.Int32
+	var slowReleases atomic.Int32
+	plan := retentionPlan{payloadClaims: []claimedPayload{
+		{claim: deadlineClaim{releases: &slowReleases}},
+		{claim: immediateClaim{releases: &fastReleases}},
+		{claim: immediateClaim{releases: &fastReleases}},
+	}}
+	done := make(chan error, 1)
+	go func() {
+		done <- releaseRetentionClaimsWithin(context.Background(), plan, 200*time.Millisecond)
+	}()
+	require.Eventually(t, func() bool { return fastReleases.Load() == 2 }, 100*time.Millisecond, time.Millisecond)
+	require.Error(t, <-done)
+	require.Equal(t, int32(1), slowReleases.Load())
+}
+
 func TestRetentionClaimCleanupUsesOneDeadline(t *testing.T) {
 	t.Parallel()
 

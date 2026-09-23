@@ -2733,6 +2733,9 @@ func isReadOnlyS3Request(r *http.Request) bool {
 // isReadOnlyBucketOp returns true for bucket-level read-only operations
 // (HeadBucket, ListObjectsV2).
 func isReadOnlyBucketOp(method string, q url.Values) bool {
+	if q.Has("versioning") {
+		return false
+	}
 	switch method {
 	case http.MethodHead:
 		// HeadBucket: no query params (or only "location").

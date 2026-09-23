@@ -1677,6 +1677,50 @@ func TestLocalStoreDeleteDoesNotFollowASymlinkOutOfTheRoot(t *testing.T) {
 	require.FileExists(t, victim)
 }
 
+func TestLocalStoreRefreshDoesNotFollowASymlinkOutOfTheRoot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := t.TempDir()
+	root := filepath.Join(base, "store")
+	require.NoError(t, os.MkdirAll(root, 0o750))
+	out := filepath.Join(base, "outside")
+	require.NoError(t, os.MkdirAll(out, 0o750))
+	victim := filepath.Join(out, "manifest.json")
+	require.NoError(t, os.WriteFile(victim, []byte("original"), 0o600))
+	require.NoError(t, os.Symlink(out, filepath.Join(root, "escape")))
+
+	store, err := NewLocalStore(root)
+	require.NoError(t, err)
+	replacement := []byte("replacement")
+	_, err = store.RefreshObject(ctx, "escape/manifest.json", bytes.NewReader(replacement), PutOptions{
+		Size:        int64(len(replacement)),
+		SHA256:      hexSHA256Bytes(replacement),
+		ContentType: "application/json",
+	})
+	require.Error(t, err)
+	contents, err := os.ReadFile(victim)
+	require.NoError(t, err)
+	require.Equal(t, []byte("original"), contents)
+}
+
+func TestLocalStoreListObjectsFailsClosedOnSymlink(t *testing.T) {
+	t.Parallel()
+
+	base := t.TempDir()
+	root := filepath.Join(base, "store")
+	groups := filepath.Join(root, retentionPrefix, "v1", "groups")
+	require.NoError(t, os.MkdirAll(filepath.Dir(groups), 0o750))
+	out := filepath.Join(base, "outside")
+	require.NoError(t, os.MkdirAll(out, 0o750))
+	require.NoError(t, os.Symlink(out, groups))
+
+	store, err := NewLocalStore(root)
+	require.NoError(t, err)
+	_, err = store.ListObjects(context.Background(), path.Join(retentionPrefix, "v1", "groups"))
+	require.ErrorIs(t, err, ErrIntegrity)
+}
+
 // An ordinary nested key still deletes, so the descriptor-relative path did not
 // simply break deletion.
 func TestLocalStoreDeleteStillRemovesANestedObject(t *testing.T) {

@@ -48,7 +48,7 @@ The M1 object-store-neutral substrate now adds:
 - `cmd/elastickv-snapshot-offload publish` and `restore` for local and
   S3-backed operator workflows.
 
-The runtime scheduler remains pending. Retention/GC is implemented per §5; the remaining M3 items (restore drills, corruption tests, multi-node acceptance, operator documentation) are pending.
+The runtime scheduler remains pending. Retention/GC and corruption tests are implemented; the remaining M3 items (restore drills, multi-node acceptance, operator documentation) are pending.
 
 ## 2. Safety boundary
 
@@ -89,9 +89,7 @@ manifest is the commit marker and contains:
 - source cluster identity and Raft group ID;
 - snapshot index, term, and ConfState;
 - payload object key, exact length, SHA-256, and source CRC32C;
-- binary version and snapshot feature capabilities used by the writer;
-- a random publication ID that changes on every new or reused-manifest
-  publication while remaining optional for manifests written before M3.
+- binary version and snapshot feature capabilities used by the writer.
 
 Publication order is payload first, manifest last. A retry may overwrite an
 identical payload key, but it must reject a different length or checksum. A
@@ -147,9 +145,10 @@ holds those claims through deletion, and deletes only manifests whose
 size, mtime, and ETag still match the initial scan. A manifest that was
 refreshed before GC won its claim, or whose claim is held elsewhere, is
 kept; its payload is added back to the live set before payload sweep. The
-fresh random publication ID changes the manifest bytes and ETag even when
-the snapshot and object-store timestamp are otherwise identical, so this
-comparison does not depend on last-modified timestamp precision.
+refresh advances the existing schema-v1 `created_at` value by one nanosecond,
+which changes the manifest bytes and ETag even when the caller supplies the
+same timestamp. This avoids depending on object-store timestamp precision
+without making newly written schema-v1 manifests unreadable by older binaries.
 
 The mark state is in-memory and per-process. Losing it on restart
 delays reclamation by one pass and never advances it. Marks for objects

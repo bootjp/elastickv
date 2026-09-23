@@ -707,14 +707,40 @@ func releaseRetentionClaimsWithin(ctx context.Context, plan retentionPlan, maxWa
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), maxWait)
 	defer cancel()
 
-	var releaseErr error
+	claims := make([]ObjectClaim, 0, len(plan.manifestClaims)+len(plan.payloadClaims))
 	for _, candidate := range plan.manifestClaims {
-		releaseErr = errors.CombineErrors(releaseErr,
-			releaseObjectClaimWithContext(releaseCtx, candidate.claim))
+		claims = append(claims, candidate.claim)
 	}
 	for _, candidate := range plan.payloadClaims {
-		releaseErr = errors.CombineErrors(releaseErr,
-			releaseObjectClaimWithContext(releaseCtx, candidate.claim))
+		claims = append(claims, candidate.claim)
+	}
+	if len(claims) == 0 {
+		return nil
+	}
+
+	jobs := make(chan ObjectClaim, len(claims))
+	errs := make(chan error, len(claims))
+	for _, claim := range claims {
+		jobs <- claim
+	}
+	close(jobs)
+
+	var workers sync.WaitGroup
+	for range min(len(claims), claimReleaseConcurrency) {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for claim := range jobs {
+				errs <- releaseObjectClaimWithContext(releaseCtx, claim)
+			}
+		}()
+	}
+	workers.Wait()
+	close(errs)
+
+	var releaseErr error
+	for err := range errs {
+		releaseErr = errors.CombineErrors(releaseErr, err)
 	}
 	if releaseErr != nil {
 		return errors.Wrap(releaseErr, "release retention claims")

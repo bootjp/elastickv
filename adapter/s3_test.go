@@ -2482,6 +2482,9 @@ func TestIsReadOnlyS3Request(t *testing.T) {
 		{"HeadBucket", http.MethodHead, "/bucket", true},
 		// Allowed: ListObjectsV2.
 		{"ListObjectsV2", http.MethodGet, "/bucket?list-type=2", true},
+		// Not allowed: a versioning subresource cannot become anonymous by
+		// also carrying the ListObjectsV2 discriminator.
+		{"GetBucketVersioning_WithListType", http.MethodGet, "/bucket?versioning&list-type=2", false},
 		// Not allowed: bucket GET without list-type=2 (returns NotImplemented later, not via anonymous path).
 		{"GetBucket_NoListType", http.MethodGet, "/bucket", false},
 		// Not allowed: object GET with extra query params.

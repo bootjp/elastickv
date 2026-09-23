@@ -184,7 +184,7 @@ func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, first.ManifestKey, second.ManifestKey)
 	require.Equal(t, first.Payload.Key, second.Payload.Key)
-	require.NotEqual(t, first.PublicationID, second.PublicationID)
+	require.Equal(t, opts.CreatedAt.Add(time.Nanosecond), second.CreatedAt)
 	require.NotEqual(t, first.ManifestSHA256, second.ManifestSHA256)
 }
 
@@ -204,13 +204,13 @@ func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
 
 	first, err := PublishPersistedSnapshot(ctx, opts)
 	require.NoError(t, err)
+	firstCreatedAt := first.CreatedAt
 	time.Sleep(time.Millisecond)
 	second, err := PublishPersistedSnapshot(ctx, opts)
 	require.NoError(t, err)
 	require.Equal(t, first.ManifestKey, second.ManifestKey)
-	require.NotEqual(t, first.PublicationID, second.PublicationID)
+	require.Equal(t, firstCreatedAt.Add(time.Nanosecond), second.CreatedAt)
 	require.NotEqual(t, first.ManifestSHA256, second.ManifestSHA256)
-	require.Equal(t, first.CreatedAt, second.CreatedAt)
 }
 
 func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
@@ -247,11 +247,9 @@ func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
 
 	candidate := existing
 	candidate.CreatedAt = time.Unix(401, 0).UTC()
-	candidate.PublicationID = "0123456789abcdef0123456789abcdef"
 	racingStore := &headMissOnceStore{ObjectStore: store, key: key}
 	require.NoError(t, putManifest(ctx, racingStore, &candidate, true, nil))
-	require.Equal(t, existing.CreatedAt, candidate.CreatedAt)
-	require.Equal(t, "0123456789abcdef0123456789abcdef", candidate.PublicationID)
+	require.Equal(t, existing.CreatedAt.Add(time.Nanosecond), candidate.CreatedAt)
 	require.NotEmpty(t, candidate.ManifestSHA256)
 }
 
@@ -277,17 +275,6 @@ func TestDecodeManifestRejectsInvalidConfStateMembership(t *testing.T) {
 		_, err = DecodeManifest(raw)
 		require.ErrorIs(t, err, ErrInvalidOptions)
 	}
-}
-
-func TestDecodeManifestRejectsInvalidPublicationID(t *testing.T) {
-	t.Parallel()
-
-	manifest := testManifestForValidation(t)
-	manifest.PublicationID = "not-a-publication-id"
-	raw, _, err := manifest.MarshalCanonical()
-	require.NoError(t, err)
-	_, err = DecodeManifest(raw)
-	require.ErrorIs(t, err, ErrInvalidOptions)
 }
 
 func TestDecodeManifestAcceptsJointConsensusConfState(t *testing.T) {

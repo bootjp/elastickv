@@ -3,7 +3,6 @@ package snapshotoffload
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -140,10 +139,6 @@ func buildManifest(
 	payloadObjectKey string,
 	payloadSHA string,
 ) (*Manifest, error) {
-	publicationID, err := newPublicationID()
-	if err != nil {
-		return nil, err
-	}
 	manifestObjectKey, err := manifestKey(opts.Prefix, opts.GroupID, metadata.Index, metadata.Term)
 	if err != nil {
 		return nil, err
@@ -167,17 +162,8 @@ func buildManifest(
 			SourceCRC32C: metadata.CRC32C,
 		},
 		BinaryVersion: stringsTrim(opts.BinaryVersion),
-		PublicationID: publicationID,
 		ManifestKey:   manifestObjectKey,
 	}, nil
-}
-
-func newPublicationID() (string, error) {
-	var token [16]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return "", errors.Wrap(err, "generate publication id")
-	}
-	return hex.EncodeToString(token[:]), nil
 }
 
 func putManifest(
@@ -249,6 +235,10 @@ func refreshExistingManifest(ctx context.Context, store ObjectStore, manifest *M
 		return errors.Wrapf(ErrInvalidOptions,
 			"object store cannot refresh reused manifest %s", manifest.ManifestKey)
 	}
+	// CreatedAt is part of schema v1's canonical self-hash. Advancing the
+	// stored value produces a distinct object version without adding a field
+	// that older restore binaries would omit when recomputing that hash.
+	manifest.CreatedAt = manifest.CreatedAt.Add(time.Nanosecond)
 	data, manifestSHA, err := manifest.MarshalCanonical()
 	if err != nil {
 		return err
@@ -306,7 +296,7 @@ func handleManifestPutError(
 	if exists, verifyErr := verifyExistingManifest(ctx, store, manifest, reuseExistingCreatedAt); verifyErr != nil {
 		return errors.Wrap(verifyErr, "verify conflicting snapshot manifest")
 	} else if exists {
-		return nil
+		return refreshExistingManifest(ctx, store, manifest)
 	}
 	return errors.Wrap(err, "put snapshot manifest")
 }
@@ -346,9 +336,7 @@ func verifyExistingManifest(
 	if !manifestMatchesCandidate(existing, *manifest, reuseExistingCreatedAt) {
 		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different content", manifest.ManifestKey)
 	}
-	publicationID := manifest.PublicationID
 	*manifest = existing
-	manifest.PublicationID = publicationID
 	return true, nil
 }
 
@@ -356,7 +344,6 @@ func manifestMatchesCandidate(existing Manifest, candidate Manifest, reuseExisti
 	if reuseExistingCreatedAt {
 		return sameManifestExceptCreation(existing, candidate)
 	}
-	candidate.PublicationID = existing.PublicationID
 	candidate.ManifestSHA256 = existing.ManifestSHA256
 	return reflect.DeepEqual(existing, candidate)
 }
@@ -377,7 +364,6 @@ func sameManifestExceptCreation(existing Manifest, candidate Manifest) bool {
 	candidate.CreatedAt = existing.CreatedAt
 	candidate.ManifestSHA256 = existing.ManifestSHA256
 	candidate.BinaryVersion = existing.BinaryVersion
-	candidate.PublicationID = existing.PublicationID
 	return reflect.DeepEqual(existing, candidate)
 }
 

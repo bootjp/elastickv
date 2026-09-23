@@ -2,6 +2,7 @@ package snapshotoffload
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
@@ -162,9 +163,14 @@ func (s *LocalStore) walkEntryError(walkPath, root string, err error) error {
 
 // objectRefForWalkEntry converts one walk entry into an ObjectRef,
 // reporting ok=false for entries that are not objects (directories,
-// sockets, symlinks, and the in-progress ".put-*" temp files
-// PutObject creates).
+// sockets, and the in-progress ".put-*" temp files PutObject creates).
+// Symlinks fail the complete-listing contract closed instead of disappearing
+// from GC's live-set scan.
 func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (ObjectRef, bool, error) {
+	if entry.Type()&os.ModeSymlink != 0 {
+		return ObjectRef{}, false, errors.Wrapf(ErrIntegrity,
+			"object listing encountered symlink %s", walkPath)
+	}
 	if entry.IsDir() || !entry.Type().IsRegular() {
 		return ObjectRef{}, false, nil
 	}
@@ -321,7 +327,12 @@ type LocalStore struct {
 	rootDir *os.Root
 }
 
-const localStoreDirPerm = 0o755
+const (
+	localStoreDirPerm            = 0o755
+	localStoreFilePerm           = 0o600
+	localStoreTempTokenBytes     = 16
+	localStoreTempCreateAttempts = 10
+)
 
 func NewLocalStore(root string) (*LocalStore, error) {
 	if strings.TrimSpace(root) == "" {
@@ -353,24 +364,28 @@ func (s *LocalStore) RefreshObject(ctx context.Context, key string, body io.Read
 	if err := validatePutOptions(opts); err != nil {
 		return ObjectInfo{}, err
 	}
-	finalPath, err := s.pathForKey(key)
+	relPath, err := s.relPathForKey(key)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(finalPath), localStoreDirPerm); err != nil {
-		return ObjectInfo{}, errors.WithStack(err)
-	}
-	tmpPath, info, err := writeLocalObjectTemp(ctx, filepath.Dir(finalPath), key, body, opts)
+	root, err := s.pinnedRoot()
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	defer func() { _ = os.Remove(tmpPath) }()
+	if root == nil {
+		return ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", key)
+	}
+	tmpPath, info, err := writeLocalObjectTempWithinRoot(ctx, root, key, body, opts)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	defer func() { _ = root.Remove(tmpPath) }()
 	// Held across the replace so an in-process reclamation of this
 	// same payload cannot land between a validating stat and the
 	// unlink. See DeleteObjectIfUnmodified.
 	s.deleteMu.Lock()
 	defer s.deleteMu.Unlock()
-	return s.replaceObject(key, tmpPath, finalPath, info)
+	return replaceObjectWithinRoot(root, key, tmpPath, relPath, info)
 }
 
 func (s *LocalStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
@@ -622,6 +637,10 @@ func (s *LocalStore) hashedObjectInfoForPath(key, objectPath string) (ObjectInfo
 		return ObjectInfo{}, errors.WithStack(err)
 	}
 	defer func() { _ = file.Close() }()
+	return hashedObjectInfoFromFile(key, file)
+}
+
+func hashedObjectInfoFromFile(key string, file *os.File) (ObjectInfo, error) {
 	stat, err := file.Stat()
 	if err != nil {
 		return ObjectInfo{}, errors.WithStack(err)
@@ -660,26 +679,87 @@ func writeLocalObjectTemp(
 			_ = os.Remove(tmpPath)
 		}
 	}()
-	sum := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, sum), contextReader{ctx: ctx, reader: body})
+	info, err := writeLocalObjectContents(ctx, tmp, key, body, opts)
 	if err != nil {
-		return "", ObjectInfo{}, errors.WithStack(err)
-	}
-	gotSHA := hex.EncodeToString(sum.Sum(nil))
-	if n != opts.Size {
-		return "", ObjectInfo{}, errors.Wrapf(ErrIntegrity, "object %s wrote %d bytes, expected %d", key, n, opts.Size)
-	}
-	if gotSHA != opts.SHA256 {
-		return "", ObjectInfo{}, errors.Wrapf(ErrIntegrity, "object %s wrote sha256 %s, expected %s", key, gotSHA, opts.SHA256)
-	}
-	if err := tmp.Sync(); err != nil {
-		return "", ObjectInfo{}, errors.WithStack(err)
+		return "", ObjectInfo{}, err
 	}
 	if err := tmp.Close(); err != nil {
 		return "", ObjectInfo{}, errors.WithStack(err)
 	}
 	keep = true
-	return tmpPath, ObjectInfo{Key: normalizeObjectKey(key), Size: opts.Size, SHA256: opts.SHA256}, nil
+	return tmpPath, info, nil
+}
+
+func writeLocalObjectTempWithinRoot(
+	ctx context.Context,
+	root *os.Root,
+	key string,
+	body io.Reader,
+	opts PutOptions,
+) (string, ObjectInfo, error) {
+	tmpPath, tmp, err := createLocalTempWithinRoot(root)
+	if err != nil {
+		return "", ObjectInfo{}, err
+	}
+	keep := false
+	defer func() {
+		if !keep {
+			_ = tmp.Close()
+			_ = root.Remove(tmpPath)
+		}
+	}()
+	info, err := writeLocalObjectContents(ctx, tmp, key, body, opts)
+	if err != nil {
+		return "", ObjectInfo{}, err
+	}
+	if err := tmp.Close(); err != nil {
+		return "", ObjectInfo{}, errors.WithStack(err)
+	}
+	keep = true
+	return tmpPath, info, nil
+}
+
+func createLocalTempWithinRoot(root *os.Root) (string, *os.File, error) {
+	for range localStoreTempCreateAttempts {
+		var token [localStoreTempTokenBytes]byte
+		if _, err := rand.Read(token[:]); err != nil {
+			return "", nil, errors.Wrap(err, "generate local object temp name")
+		}
+		name := ".put-" + hex.EncodeToString(token[:])
+		file, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, localStoreFilePerm)
+		if err == nil {
+			return name, file, nil
+		}
+		if !os.IsExist(err) {
+			return "", nil, errors.Wrap(err, "create local object temp file")
+		}
+	}
+	return "", nil, errors.Wrap(ErrObjectConflict, "exhausted local object temp names")
+}
+
+func writeLocalObjectContents(
+	ctx context.Context,
+	tmp *os.File,
+	key string,
+	body io.Reader,
+	opts PutOptions,
+) (ObjectInfo, error) {
+	sum := sha256.New()
+	n, err := io.Copy(io.MultiWriter(tmp, sum), contextReader{ctx: ctx, reader: body})
+	if err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	gotSHA := hex.EncodeToString(sum.Sum(nil))
+	if n != opts.Size {
+		return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "object %s wrote %d bytes, expected %d", key, n, opts.Size)
+	}
+	if gotSHA != opts.SHA256 {
+		return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "object %s wrote sha256 %s, expected %s", key, gotSHA, opts.SHA256)
+	}
+	if err := tmp.Sync(); err != nil {
+		return ObjectInfo{}, errors.WithStack(err)
+	}
+	return ObjectInfo{Key: normalizeObjectKey(key), Size: opts.Size, SHA256: opts.SHA256}, nil
 }
 
 func (s *LocalStore) commitTempObject(key, tmpPath, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
@@ -699,14 +779,51 @@ func (s *LocalStore) commitTempObject(key, tmpPath, finalPath string, expected O
 	return s.verifyExistingObject(key, finalPath, expected)
 }
 
-func (s *LocalStore) replaceObject(key, tmpPath, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
-	if err := os.Rename(tmpPath, finalPath); err != nil {
+func replaceObjectWithinRoot(
+	root *os.Root,
+	key string,
+	tmpPath string,
+	finalPath string,
+	expected ObjectInfo,
+) (ObjectInfo, error) {
+	if err := root.Rename(tmpPath, finalPath); err != nil {
 		return ObjectInfo{}, errors.WithStack(err)
 	}
-	if err := syncDir(filepath.Dir(finalPath)); err != nil {
+	if err := syncDirWithinRoot(root, filepath.Dir(finalPath)); err != nil {
+		return ObjectInfo{}, err
+	}
+	info, err := hashedObjectInfoWithinRoot(root, key, finalPath)
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if info.Size == expected.Size && info.SHA256 == expected.SHA256 {
+		return info, nil
+	}
+	return ObjectInfo{}, errors.Wrapf(ErrIntegrity, "object %s changed during refresh", key)
+}
+
+func syncDirWithinRoot(root *os.Root, dir string) error {
+	file, err := root.Open(dir)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer func() { _ = file.Close() }()
+	if err := file.Sync(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func hashedObjectInfoWithinRoot(root *os.Root, key, objectPath string) (ObjectInfo, error) {
+	file, err := root.Open(objectPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", key)
+		}
 		return ObjectInfo{}, errors.WithStack(err)
 	}
-	return s.verifyExistingObject(key, finalPath, expected)
+	defer func() { _ = file.Close() }()
+	return hashedObjectInfoFromFile(key, file)
 }
 
 func (s *LocalStore) verifyExistingObject(key, finalPath string, expected ObjectInfo) (ObjectInfo, error) {

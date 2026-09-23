@@ -17,6 +17,7 @@ const (
 	objectClaimBytes             = 32
 	claimAcquireTimeout          = 30 * time.Second
 	claimReleaseTimeout          = 30 * time.Second
+	claimReleaseConcurrency      = 8
 	objectClaimInitialRetryDelay = 25 * time.Millisecond
 	objectClaimMaxRetryDelay     = time.Second
 	objectClaimBackoffMultiplier = 2
