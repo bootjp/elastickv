@@ -139,9 +139,12 @@ body is not rewritten merely to advance mtime, so content-addressed
 deduplication does not re-transfer multi-terabyte snapshots.
 
 Manifest reuse uses the same claim protocol. Because manifests are
-small, a matching reused manifest is refreshed while claimed; GC also
-revalidates size, mtime, and ETag after obtaining the claim before it
-deletes an expired manifest.
+small, a matching reused manifest is refreshed while claimed. GC claims
+every initially expired manifest before the authoritative final scan,
+holds those claims through deletion, and deletes only manifests whose
+size, mtime, and ETag still match the initial scan. A manifest that was
+refreshed before GC won its claim, or whose claim is held elsewhere, is
+kept; its payload is added back to the live set before payload sweep.
 
 The mark state is in-memory and per-process. Losing it on restart
 delays reclamation by one pass and never advances it. Marks for objects
@@ -150,10 +153,16 @@ reclamation cannot leak them.
 
 Claim objects are released with a conditional delete even when the
 calling context is cancelled. A process crash can leave an orphan claim;
-that fails safe by delaying publication and reclamation for only the
-hashed target key. Operators may remove an orphan claim only after
-confirming no publisher or GC owns it. Automatic lease expiry is not
-used because expiring a live claim reopens the data-loss race.
+that fails safe by delaying publication and reclamation for the hashed
+target key. Publication waits at most 30 seconds with bounded exponential
+backoff, then returns a retryable `ErrObjectClaimed` so an orphan cannot
+occupy the scheduler's upload slot indefinitely. GC never waits for a busy
+claim and retries on a later pass. All claims held by one GC pass share one
+30-second cancellation-independent cleanup deadline, so shutdown latency is
+bounded independently of the number of claimed objects. Operators may remove
+an orphan claim only after confirming no publisher or GC owns it. Automatic
+lease expiry is not used because expiring a live claim reopens the data-loss
+race.
 
 Malformed manifests fail closed: they are reported and excluded from both
 automatic manifest deletion and payload reclamation. Listing failure,

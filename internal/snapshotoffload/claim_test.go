@@ -3,7 +3,9 @@ package snapshotoffload
 import (
 	"context"
 	"path/filepath"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
 )
@@ -49,4 +51,54 @@ func TestObjectClaimsAreExclusiveAndReusable(t *testing.T) {
 			require.NoError(t, second.Release(ctx))
 		})
 	}
+}
+
+type alwaysClaimedStore struct {
+	attempts atomic.Int32
+}
+
+func (s *alwaysClaimedStore) AcquireObjectClaim(context.Context, string) (ObjectClaim, error) {
+	s.attempts.Add(1)
+	return nil, ErrObjectClaimed
+}
+
+func TestAcquireObjectClaimWaitingIsBounded(t *testing.T) {
+	t.Parallel()
+
+	store := &alwaysClaimedStore{}
+	started := time.Now()
+	_, err := acquireObjectClaimWithin(context.Background(), store, "claimed", 40*time.Millisecond)
+	require.ErrorIs(t, err, ErrObjectClaimed)
+	require.Less(t, time.Since(started), 500*time.Millisecond)
+	require.GreaterOrEqual(t, store.attempts.Load(), int32(1))
+}
+
+type deadlineClaim struct {
+	releases *atomic.Int32
+}
+
+func (c deadlineClaim) Release(ctx context.Context) error {
+	c.releases.Add(1)
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+func TestRetentionClaimCleanupUsesOneDeadline(t *testing.T) {
+	t.Parallel()
+
+	var releases atomic.Int32
+	plan := retentionPlan{
+		manifestClaims: map[string]claimedManifest{
+			"m1": {claim: deadlineClaim{releases: &releases}},
+			"m2": {claim: deadlineClaim{releases: &releases}},
+		},
+		payloadClaims: []claimedPayload{
+			{claim: deadlineClaim{releases: &releases}},
+		},
+	}
+	started := time.Now()
+	err := releaseRetentionClaimsWithin(context.Background(), plan, 40*time.Millisecond)
+	require.Error(t, err)
+	require.Less(t, time.Since(started), 500*time.Millisecond)
+	require.Equal(t, int32(3), releases.Load())
 }

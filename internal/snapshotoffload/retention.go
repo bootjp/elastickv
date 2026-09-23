@@ -217,12 +217,11 @@ func (g *GC) RunOnce(ctx context.Context) (result GCResult, retErr error) {
 		MalformedManifests: scan.malformed,
 	}
 
-	var payloadClaims []claimedPayload
+	var plan retentionPlan
 	defer func() {
-		retErr = errors.CombineErrors(retErr, releasePayloadClaims(ctx, payloadClaims))
+		retErr = errors.CombineErrors(retErr, releaseRetentionClaims(ctx, plan))
 	}()
-	plan, err := g.preparePayloadSweep(ctx, scan)
-	payloadClaims = plan.claims
+	plan, err = g.prepareRetentionPlan(ctx, scan)
 	if err != nil {
 		return result, err
 	}
@@ -230,21 +229,14 @@ func (g *GC) RunOnce(ctx context.Context) (result GCResult, retErr error) {
 	result.GroupsScanned = len(scan.byGroup)
 	result.ManifestsScanned = scan.scanned
 	result.MalformedManifests = scan.malformed
-	result.PayloadsClaimedConcurrently = plan.claimedConcurrently
+	result.PayloadsClaimedConcurrently = plan.payloadsClaimedConcurrently
 	result.PayloadsAwaitingSweep = plan.awaitingSweep
 	survivors, expired := g.partition(scan)
 	live := livePayloadKeys(survivors)
-
-	for _, entry := range expired {
-		deleted, err := g.compareAndDeleteManifest(ctx, entry)
-		if err != nil {
-			return result, err
-		}
-		if !deleted {
-			result.ManifestsClaimedConcurrently++
-			continue
-		}
-		result.ManifestsDeleted = append(result.ManifestsDeleted, entry.key)
+	result.ManifestsDeleted, result.ManifestsClaimedConcurrently, err =
+		g.deleteExpiredManifests(ctx, expired, plan.manifestClaims, live)
+	if err != nil {
+		return result, err
 	}
 
 	if plan.skipReason != "" {
@@ -256,7 +248,7 @@ func (g *GC) RunOnce(ctx context.Context) (result GCResult, retErr error) {
 		return result, nil
 	}
 
-	deleted, claimed, err := g.reclaimPayloads(ctx, live, payloadClaims, plan.refs)
+	deleted, claimed, err := g.reclaimPayloads(ctx, live, plan.payloadClaims, plan.refs)
 	result.PayloadsDeleted = deleted
 	result.PayloadsClaimedConcurrently += claimed
 	if err != nil {
@@ -265,43 +257,112 @@ func (g *GC) RunOnce(ctx context.Context) (result GCResult, retErr error) {
 	return result, nil
 }
 
-type payloadSweepPlan struct {
-	scan                manifestScan
-	refs                []ObjectRef
-	claims              []claimedPayload
-	claimedConcurrently int
-	awaitingSweep       int
-	skipReason          string
+type retentionPlan struct {
+	scan                        manifestScan
+	refs                        []ObjectRef
+	payloadClaims               []claimedPayload
+	manifestClaims              map[string]claimedManifest
+	payloadsClaimedConcurrently int
+	awaitingSweep               int
+	skipReason                  string
 }
 
-func (g *GC) preparePayloadSweep(ctx context.Context, scan manifestScan) (payloadSweepPlan, error) {
-	plan := payloadSweepPlan{scan: scan, skipReason: g.payloadPhaseBlockedBy(scan)}
-	if plan.skipReason != "" {
-		return plan, nil
+type claimedManifest struct {
+	ref   ObjectRef
+	claim ObjectClaim
+}
+
+func (g *GC) prepareRetentionPlan(ctx context.Context, scan manifestScan) (retentionPlan, error) {
+	plan := retentionPlan{
+		scan:           scan,
+		skipReason:     g.payloadPhaseBlockedBy(scan),
+		manifestClaims: make(map[string]claimedManifest),
+	}
+	if plan.skipReason == "" {
+		survivors, _ := g.partition(scan)
+		live := livePayloadKeys(survivors)
+		refs, err := g.listPayloadObjects(ctx)
+		if err != nil {
+			return plan, err
+		}
+		plan.refs = refs
+		plan.payloadClaims, plan.payloadsClaimedConcurrently, plan.awaitingSweep, err =
+			g.claimSweepablePayloads(ctx, live, refs)
+		if err != nil {
+			return plan, err
+		}
 	}
 
-	survivors, _ := g.partition(scan)
-	live := livePayloadKeys(survivors)
-	refs, err := g.listPayloadObjects(ctx)
-	if err != nil {
-		return plan, err
-	}
-	plan.refs = refs
-	plan.claims, plan.claimedConcurrently, plan.awaitingSweep, err =
-		g.claimSweepablePayloads(ctx, live, refs)
+	_, expired := g.partition(scan)
+	manifestClaims, err := g.claimExpiredManifests(ctx, expired)
+	plan.manifestClaims = manifestClaims
 	if err != nil {
 		return plan, err
 	}
 
 	// This is the final fallible manifest scan for the pass. It must
-	// complete BEFORE phase-one deletes. Claims remain held through the
-	// scan and deletion, closing the publish-versus-sweep race.
+	// complete BEFORE phase-one deletes. Payload and manifest claims remain
+	// held through the scan and deletion, closing both publish-versus-sweep
+	// races. A manifest that changed before its claim was acquired is also
+	// skipped by comparing this scan with the initial ref.
 	plan.scan, err = g.scanManifests(ctx)
 	if err != nil {
 		return plan, err
 	}
-	plan.skipReason = g.payloadPhaseBlockedBy(plan.scan)
+	if finalSkipReason := g.payloadPhaseBlockedBy(plan.scan); finalSkipReason != "" {
+		plan.skipReason = finalSkipReason
+	}
 	return plan, nil
+}
+
+func (g *GC) claimExpiredManifests(
+	ctx context.Context, expired []scannedManifest,
+) (map[string]claimedManifest, error) {
+	claims := make(map[string]claimedManifest, len(expired))
+	for _, entry := range expired {
+		claim, err := g.store.AcquireObjectClaim(ctx, entry.key)
+		if err != nil {
+			if errors.Is(err, ErrObjectClaimed) {
+				continue
+			}
+			return claims, errors.Wrapf(err, "retention: claim manifest %s", entry.key)
+		}
+		claims[entry.key] = claimedManifest{ref: entry.ref, claim: claim}
+	}
+	return claims, nil
+}
+
+func protectManifestPayload(live map[string]struct{}, entry scannedManifest) {
+	live[normalizeObjectKey(entry.manifest.Payload.Key)] = struct{}{}
+}
+
+func (g *GC) deleteExpiredManifests(
+	ctx context.Context,
+	expired []scannedManifest,
+	claims map[string]claimedManifest,
+	live map[string]struct{},
+) ([]string, int, error) {
+	var deletedKeys []string
+	claimedConcurrently := 0
+	for _, entry := range expired {
+		claimed, ok := claims[entry.key]
+		if !ok || !sameObjectState(claimed.ref, entry.ref) {
+			protectManifestPayload(live, entry)
+			claimedConcurrently++
+			continue
+		}
+		deleted, err := g.deleteClaimedManifest(ctx, entry)
+		if err != nil {
+			return deletedKeys, claimedConcurrently, err
+		}
+		if !deleted {
+			protectManifestPayload(live, entry)
+			claimedConcurrently++
+			continue
+		}
+		deletedKeys = append(deletedKeys, entry.key)
+	}
+	return deletedKeys, claimedConcurrently, nil
 }
 
 // manifestScan is the phase-1 view of the prefix.
@@ -638,13 +699,25 @@ func (g *GC) reclaimPayloads(
 	return deleted, claimed, nil
 }
 
-func releasePayloadClaims(ctx context.Context, claims []claimedPayload) error {
+func releaseRetentionClaims(ctx context.Context, plan retentionPlan) error {
+	return releaseRetentionClaimsWithin(ctx, plan, claimReleaseTimeout)
+}
+
+func releaseRetentionClaimsWithin(ctx context.Context, plan retentionPlan, maxWait time.Duration) error {
+	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), maxWait)
+	defer cancel()
+
 	var releaseErr error
-	for _, candidate := range claims {
-		releaseErr = errors.CombineErrors(releaseErr, releaseObjectClaim(ctx, candidate.claim))
+	for _, candidate := range plan.manifestClaims {
+		releaseErr = errors.CombineErrors(releaseErr,
+			releaseObjectClaimWithContext(releaseCtx, candidate.claim))
+	}
+	for _, candidate := range plan.payloadClaims {
+		releaseErr = errors.CombineErrors(releaseErr,
+			releaseObjectClaimWithContext(releaseCtx, candidate.claim))
 	}
 	if releaseErr != nil {
-		return errors.Wrap(releaseErr, "release payload claims")
+		return errors.Wrap(releaseErr, "release retention claims")
 	}
 	return nil
 }
@@ -744,26 +817,6 @@ func (g *GC) MarkedPayloads() []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-// compareAndDeleteManifest deletes an expired manifest only if it
-// still matches the state the scan observed. It reports deleted=false
-// (not an error) when a concurrent publish rewrote the key, since
-// leaving a just-republished manifest in place is the correct outcome.
-func (g *GC) compareAndDeleteManifest(ctx context.Context, entry scannedManifest) (bool, error) {
-	claim, err := g.store.AcquireObjectClaim(ctx, entry.key)
-	if err != nil {
-		if errors.Is(err, ErrObjectClaimed) {
-			return false, nil
-		}
-		return false, errors.Wrapf(err, "retention: claim manifest %s", entry.key)
-	}
-	deleted, deleteErr := g.deleteClaimedManifest(ctx, entry)
-	releaseErr := releaseObjectClaim(ctx, claim)
-	if err := errors.CombineErrors(deleteErr, releaseErr); err != nil {
-		return deleted, errors.Wrap(err, "retention: delete claimed manifest")
-	}
-	return deleted, nil
 }
 
 func (g *GC) deleteClaimedManifest(ctx context.Context, entry scannedManifest) (bool, error) {

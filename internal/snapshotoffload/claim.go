@@ -14,9 +14,12 @@ import (
 )
 
 const (
-	objectClaimBytes      = 32
-	claimReleaseTimeout   = 30 * time.Second
-	objectClaimRetryDelay = 25 * time.Millisecond
+	objectClaimBytes             = 32
+	claimAcquireTimeout          = 30 * time.Second
+	claimReleaseTimeout          = 30 * time.Second
+	objectClaimInitialRetryDelay = 25 * time.Millisecond
+	objectClaimMaxRetryDelay     = time.Second
+	objectClaimBackoffMultiplier = 2
 )
 
 type claimBackingStore interface {
@@ -108,28 +111,43 @@ func objectClaimStore(store ObjectStore) (ObjectClaimStore, error) {
 }
 
 func acquireObjectClaimWaiting(ctx context.Context, store ObjectClaimStore, key string) (ObjectClaim, error) {
+	return acquireObjectClaimWithin(ctx, store, key, claimAcquireTimeout)
+}
+
+func acquireObjectClaimWithin(
+	ctx context.Context, store ObjectClaimStore, key string, maxWait time.Duration,
+) (ObjectClaim, error) {
+	waitCtx, cancel := context.WithTimeout(ctx, maxWait)
+	defer cancel()
+	delay := objectClaimInitialRetryDelay
 	for {
-		claim, err := store.AcquireObjectClaim(ctx, key)
+		claim, err := store.AcquireObjectClaim(waitCtx, key)
 		if err == nil {
 			return claim, nil
 		}
 		if !errors.Is(err, ErrObjectClaimed) {
 			return nil, errors.Wrap(err, "acquire object claim")
 		}
-		timer := time.NewTimer(objectClaimRetryDelay)
+		timer := time.NewTimer(delay)
 		select {
-		case <-ctx.Done():
+		case <-waitCtx.Done():
 			timer.Stop()
-			return nil, errors.Wrapf(ErrObjectClaimed, "object %s", key)
+			return nil, errors.Wrapf(ErrObjectClaimed,
+				"timed out waiting for object %s claim: %v", key, waitCtx.Err())
 		case <-timer.C:
 		}
+		delay = min(delay*objectClaimBackoffMultiplier, objectClaimMaxRetryDelay)
 	}
 }
 
 func releaseObjectClaim(ctx context.Context, claim ObjectClaim) error {
 	releaseCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimReleaseTimeout)
 	defer cancel()
-	if err := claim.Release(releaseCtx); err != nil {
+	return releaseObjectClaimWithContext(releaseCtx, claim)
+}
+
+func releaseObjectClaimWithContext(ctx context.Context, claim ObjectClaim) error {
+	if err := claim.Release(ctx); err != nil {
 		return errors.Wrap(err, "release object claim")
 	}
 	return nil

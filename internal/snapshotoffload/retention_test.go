@@ -798,9 +798,11 @@ func TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish(t *testing.T) {
 
 type claimAttemptDuringFinalScanStore struct {
 	RetentionStore
-	payloadKey string
-	groupLists int
-	claimErr   error
+	payloadKey       string
+	manifestKey      string
+	groupLists       int
+	payloadClaimErr  error
+	manifestClaimErr error
 }
 
 func (s *claimAttemptDuringFinalScanStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
@@ -809,16 +811,27 @@ func (s *claimAttemptDuringFinalScanStore) ListObjects(ctx context.Context, pref
 		return nil, err
 	}
 	if strings.HasSuffix(prefix, "/v1/groups") {
-		s.groupLists++
-		if s.groupLists == 4 {
-			claim, claimErr := s.AcquireObjectClaim(ctx, s.payloadKey)
-			s.claimErr = claimErr
-			if claimErr == nil {
-				_ = claim.Release(ctx)
-			}
-		}
+		s.afterGroupList(ctx)
 	}
 	return refs, nil
+}
+
+func (s *claimAttemptDuringFinalScanStore) afterGroupList(ctx context.Context) {
+	s.groupLists++
+	switch s.groupLists {
+	case 2:
+		s.manifestClaimErr = attemptClaim(ctx, s.RetentionStore, s.manifestKey)
+	case 4:
+		s.payloadClaimErr = attemptClaim(ctx, s.RetentionStore, s.payloadKey)
+	}
+}
+
+func attemptClaim(ctx context.Context, store ObjectClaimStore, key string) error {
+	claim, err := store.AcquireObjectClaim(ctx, key)
+	if err != nil {
+		return err
+	}
+	return claim.Release(ctx)
 }
 
 // TestGCHoldsPayloadClaimAcrossTheFinalManifestScan pins the ordering that
@@ -835,6 +848,7 @@ func TestGCHoldsPayloadClaimAcrossTheFinalManifestScan(t *testing.T) {
 	store := &claimAttemptDuringFinalScanStore{
 		RetentionStore: f.store,
 		payloadKey:     orphan.Payload.Key,
+		manifestKey:    orphan.ManifestKey,
 	}
 	gc, err := NewGC(GCOptions{
 		Store:  store,
@@ -855,8 +869,10 @@ func TestGCHoldsPayloadClaimAcrossTheFinalManifestScan(t *testing.T) {
 	_, err = gc.RunOnce(context.Background())
 	require.NoError(t, err)
 
-	require.ErrorIs(t, store.claimErr, ErrObjectClaimed,
+	require.ErrorIs(t, store.payloadClaimErr, ErrObjectClaimed,
 		"the payload claim must already be held when the final manifest scan completes")
+	require.ErrorIs(t, store.manifestClaimErr, ErrObjectClaimed,
+		"the expiring manifest claim must already be held when the final manifest scan completes")
 }
 
 // TestGCReclaimsAfterTwoQuietPasses is the complement: a payload that
@@ -1011,6 +1027,104 @@ func TestGCDoesNotDeleteManifestRewrittenByAConcurrentPublish(t *testing.T) {
 	require.True(t, f.exists(t, stale.ManifestKey),
 		"a manifest rewritten by a concurrent publish must survive GC")
 	require.NotContains(t, result.ManifestsDeleted, stale.ManifestKey)
+	require.Equal(t, 1, result.ManifestsClaimedConcurrently)
+}
+
+type manifestRefreshedBeforeClaimStore struct {
+	RetentionStore
+	target  string
+	refresh func()
+	done    bool
+}
+
+func (s *manifestRefreshedBeforeClaimStore) AcquireObjectClaim(
+	ctx context.Context, key string,
+) (ObjectClaim, error) {
+	if key == s.target && !s.done {
+		s.done = true
+		s.refresh()
+	}
+	return s.RetentionStore.AcquireObjectClaim(ctx, key)
+}
+
+func TestGCKeepsManifestRefreshedBeforeItsClaim(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	stale := f.publishManifest(t, 1, 10, []byte("republished-before-claim"), year)
+	store := &manifestRefreshedBeforeClaimStore{
+		RetentionStore: f.store,
+		target:         stale.ManifestKey,
+		refresh: func() {
+			f.setMTime(t, stale.ManifestKey, f.now.Add(time.Minute))
+		},
+	}
+	gc, err := NewGC(GCOptions{
+		Store:  store,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.True(t, f.exists(t, stale.ManifestKey),
+		"a manifest refreshed between the initial scan and claim acquisition must survive")
+	require.NotContains(t, result.ManifestsDeleted, stale.ManifestKey)
+	require.Equal(t, 1, result.ManifestsClaimedConcurrently)
+}
+
+type manifestClaimBlockingStore struct {
+	RetentionStore
+	manifestKey string
+}
+
+func (s *manifestClaimBlockingStore) AcquireObjectClaim(
+	ctx context.Context, key string,
+) (ObjectClaim, error) {
+	if key == s.manifestKey {
+		return nil, ErrObjectClaimed
+	}
+	return s.RetentionStore.AcquireObjectClaim(ctx, key)
+}
+
+func TestGCKeepsPayloadWhenExpiredManifestClaimIsBusy(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	stale := f.publishManifest(t, 1, 10, []byte("still-referenced"), year)
+	store := &manifestClaimBlockingStore{
+		RetentionStore: f.store,
+		manifestKey:    stale.ManifestKey,
+	}
+	gc, err := NewGC(GCOptions{
+		Store:  store,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{
+			MinGenerations: 1,
+			MaxAge:         time.Hour,
+			PayloadGrace:   time.Hour,
+			MinMarkAge:     time.Hour,
+		},
+		Now: func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	f.now = f.now.Add(2 * time.Hour)
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+
+	require.True(t, f.exists(t, stale.ManifestKey))
+	require.True(t, f.exists(t, stale.Payload.Key),
+		"a payload remains live while its expired manifest could not be deleted")
+	require.NotContains(t, result.PayloadsDeleted, stale.Payload.Key)
 	require.Equal(t, 1, result.ManifestsClaimedConcurrently)
 }
 

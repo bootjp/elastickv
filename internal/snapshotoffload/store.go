@@ -21,9 +21,10 @@ type ObjectStore interface {
 	HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error)
 }
 
-// ObjectRefresher updates an already-verified object's store metadata while
-// preserving its content. Publish uses this when it reuses a content-addressed
-// payload, so retention's payload grace window applies to the new publish too.
+// ObjectRefresher rewrites an already-verified object while preserving its
+// canonical content. Publish uses this to make reuse of a small manifest
+// visible to retention; content-addressed payloads are coordinated by claims
+// and are not re-uploaded merely to advance metadata.
 type ObjectRefresher interface {
 	RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error)
 }

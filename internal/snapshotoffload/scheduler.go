@@ -420,6 +420,13 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "no_persisted_snapshot")
 			return
 		}
+		if errors.Is(err, ErrObjectClaimed) {
+			// A live peer or an orphaned storage-visible claim owns this
+			// target. The bounded wait has already elapsed; release the global
+			// upload slot and retry on a later scheduler tick.
+			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "object_claimed")
+			return
+		}
 		s.observer.ObserveSnapshotOffloadFailed(group.GroupID, err)
 		s.logger.WarnContext(ctx, "snapshot offload publish failed",
 			slog.Uint64("group_id", group.GroupID), slog.String("error", err.Error()))
