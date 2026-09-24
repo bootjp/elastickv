@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path"
 	"path/filepath"
@@ -114,9 +115,10 @@ type RetentionStore interface {
 var _ RetentionStore = (*LocalStore)(nil)
 var _ ObjectClaimStore = (*LocalStore)(nil)
 
-// ListObjects walks the local root below prefix. Directories and
-// irregular files are skipped; the returned keys are slash-separated
-// and relative to the store root, matching the keys PutObject accepts.
+// ListObjects walks the pinned local root below prefix. Directories and
+// irregular files are skipped, while symlinks fail the all-or-error listing
+// contract closed. Returned keys are slash-separated and relative to the
+// store root, matching the keys PutObject accepts.
 func (s *LocalStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error) {
 	if s == nil {
 		return nil, errors.Wrap(ErrInvalidOptions, "object store is required")
@@ -124,14 +126,27 @@ func (s *LocalStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRe
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	root, err := s.listRootForPrefix(prefix)
+	listRoot, err := s.listRootForPrefix(prefix)
 	if err != nil {
 		return nil, err
 	}
+	root, err := s.pinnedRoot()
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectSymlinkComponents(root, listRoot); err != nil {
+		return nil, err
+	}
+	return s.listObjectsFromRoot(ctx, root, listRoot, prefix)
+}
+
+func (s *LocalStore) listObjectsFromRoot(
+	ctx context.Context, root *os.Root, listRoot, prefix string,
+) ([]ObjectRef, error) {
 	var refs []ObjectRef
 	walk := func(walkPath string, entry os.DirEntry, err error) error {
 		if err != nil {
-			return s.walkEntryError(walkPath, root, err)
+			return s.walkEntryError(walkPath, listRoot, err)
 		}
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return errors.WithStack(ctxErr)
@@ -145,7 +160,7 @@ func (s *LocalStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRe
 		}
 		return nil
 	}
-	if err := filepath.WalkDir(root, walk); err != nil {
+	if err := iofs.WalkDir(root.FS(), listRoot, walk); err != nil {
 		return nil, errors.Wrapf(err, "list objects under %q", prefix)
 	}
 	return refs, nil
@@ -156,7 +171,7 @@ func (s *LocalStore) ListObjects(ctx context.Context, prefix string) ([]ObjectRe
 // to has no group tree yet, and GC over it must be a clean no-op.
 func (s *LocalStore) walkEntryError(walkPath, root string, err error) error {
 	if os.IsNotExist(err) && walkPath == root {
-		return filepath.SkipAll
+		return iofs.SkipAll
 	}
 	return errors.WithStack(err)
 }
@@ -181,12 +196,8 @@ func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (
 	if err != nil {
 		return ObjectRef{}, false, errors.WithStack(err)
 	}
-	rel, err := filepath.Rel(s.root, walkPath)
-	if err != nil {
-		return ObjectRef{}, false, errors.WithStack(err)
-	}
 	return ObjectRef{
-		Key:       filepath.ToSlash(rel),
+		Key:       path.Clean(filepath.ToSlash(walkPath)),
 		Size:      info.Size(),
 		UpdatedAt: info.ModTime(),
 	}, true, nil
@@ -194,28 +205,21 @@ func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (
 
 // listRootForPrefix resolves the directory a listing should walk.
 //
-// cleanObjectPrefix preserves ".." segments, so joining it blindly
-// would let a traversing prefix enumerate an ancestor or sibling tree
-// and leak those files' names, sizes and timestamps — while every
-// other local-store operation rejects the equivalent key through
-// pathForKey.
+// cleanObjectPrefix preserves ".." segments, so passing it blindly to the
+// root-relative walker would attempt to escape the store. Every other
+// local-store operation rejects the equivalent key through pathForKey.
 func (s *LocalStore) listRootForPrefix(prefix string) (string, error) {
 	cleaned := cleanObjectPrefix(prefix)
 	if cleaned == "." {
-		return s.root, nil
+		return ".", nil
 	}
-	// cleanObjectPrefix uses path (slash) semantics, but filepath.Join
-	// below interprets the platform separator — so on Windows a
-	// prefix like `..\sibling` would survive a slash-only check and
-	// then escape the root. Reject the native form too.
+	// cleanObjectPrefix uses path (slash) semantics, while os.Root interprets
+	// the platform separator too. On Windows a prefix like `..\sibling`
+	// would survive a slash-only check, so reject the native form as well.
 	if !objectPathSegmentIsSafe(cleaned) {
 		return "", errors.Wrapf(ErrInvalidOptions, "invalid object prefix %q", prefix)
 	}
-	joined := filepath.Join(s.root, filepath.FromSlash(cleaned))
-	if !objectPathWithinRoot(s.root, joined) {
-		return "", errors.Wrapf(ErrInvalidOptions, "object prefix %q resolves outside the store root", prefix)
-	}
-	return joined, nil
+	return cleaned, nil
 }
 
 // DeleteObjectIfUnmodified removes key only when it still matches
@@ -224,31 +228,26 @@ func (s *LocalStore) DeleteObjectIfUnmodified(ctx context.Context, key string, c
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
-	objectPath, err := s.pathForKey(key)
+	relPath, err := s.relPathForKey(key)
 	if err != nil {
+		return err
+	}
+	root, err := s.pinnedRoot()
+	if err != nil {
+		return err
+	}
+	if err := rejectSymlinkComponents(root, relPath); err != nil {
 		return err
 	}
 
 	s.deleteMu.Lock()
 	defer s.deleteMu.Unlock()
 
-	stat, err := os.Stat(objectPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Already gone: the caller's intent is satisfied.
-			return nil
-		}
-		return errors.Wrapf(err, "stat object %s", key)
-	}
-	if stat.Size() != cond.Size || !stat.ModTime().Equal(cond.UpdatedAt) {
-		return errors.Wrapf(ErrObjectModified,
-			"object %s changed since it was validated for deletion", key)
-	}
-	relPath, err := s.relPathForKey(key)
-	if err != nil {
+	exists, err := validateDeletePreconditionWithinRoot(root, key, relPath, cond)
+	if err != nil || !exists {
 		return err
 	}
-	removed, err := s.removeWithinRoot(relPath)
+	removed, err := removeWithinRoot(root, relPath)
 	if err != nil {
 		return errors.Wrapf(err, "delete object %s", key)
 	}
@@ -258,7 +257,25 @@ func (s *LocalStore) DeleteObjectIfUnmodified(ctx context.Context, key string, c
 	// Persist the unlink before reporting success. Without the
 	// directory sync a crash can resurrect an object GC already
 	// counted as reclaimed.
-	return syncDir(filepath.Dir(objectPath))
+	return syncDirWithinRoot(root, filepath.Dir(relPath))
+}
+
+func validateDeletePreconditionWithinRoot(
+	root *os.Root, key, relPath string, cond DeletePrecondition,
+) (bool, error) {
+	stat, err := root.Stat(relPath)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Already gone: the caller's intent is satisfied.
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "stat object %s", key)
+	}
+	if stat.Size() != cond.Size || !stat.ModTime().Equal(cond.UpdatedAt) {
+		return false, errors.Wrapf(ErrObjectModified,
+			"object %s changed since it was validated for deletion", key)
+	}
+	return true, nil
 }
 
 // DeleteObject removes one object. A already-absent object is not an
@@ -268,15 +285,18 @@ func (s *LocalStore) DeleteObject(ctx context.Context, key string) error {
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
 	}
-	objectPath, err := s.pathForKey(key)
-	if err != nil {
-		return err
-	}
 	relPath, err := s.relPathForKey(key)
 	if err != nil {
 		return err
 	}
-	removed, err := s.removeWithinRoot(relPath)
+	root, err := s.pinnedRoot()
+	if err != nil {
+		return err
+	}
+	if err := rejectSymlinkComponents(root, relPath); err != nil {
+		return err
+	}
+	removed, err := removeWithinRoot(root, relPath)
 	if err != nil {
 		return errors.Wrapf(err, "delete object %s", key)
 	}
@@ -286,7 +306,7 @@ func (s *LocalStore) DeleteObject(ctx context.Context, key string) error {
 	// Persist the unlink before reporting success. Without the
 	// directory sync a crash can resurrect an object GC already
 	// counted as reclaimed.
-	return syncDir(filepath.Dir(objectPath))
+	return syncDirWithinRoot(root, filepath.Dir(relPath))
 }
 
 type PutOptions struct {
@@ -320,10 +340,8 @@ type LocalStore struct {
 	// single-writer store; production offload targets S3.
 	deleteMu sync.Mutex
 
-	// rootMu guards the pinned root descriptor below.
-	rootMu sync.Mutex
-	// rootDir is the configured directory, opened ONCE and kept for the
-	// life of the store. See pinnedRoot.
+	// rootDir is the configured directory, opened by NewLocalStore and kept
+	// for the life of the store. See pinnedRoot.
 	rootDir *os.Root
 }
 
@@ -338,26 +356,41 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	if strings.TrimSpace(root) == "" {
 		return nil, errors.Wrap(ErrInvalidOptions, "local store root is required")
 	}
-	return &LocalStore{root: filepath.Clean(root)}, nil
+	cleaned := filepath.Clean(root)
+	if err := os.MkdirAll(cleaned, localStoreDirPerm); err != nil {
+		return nil, errors.Wrapf(err, "create local store root %s", cleaned)
+	}
+	rootDir, err := os.OpenRoot(cleaned)
+	if err != nil {
+		return nil, errors.Wrapf(err, "open local store root %s", cleaned)
+	}
+	return &LocalStore{root: cleaned, rootDir: rootDir}, nil
 }
 
 func (s *LocalStore) PutObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error) {
 	if err := validatePutOptions(opts); err != nil {
 		return ObjectInfo{}, err
 	}
-	finalPath, err := s.pathForKey(key)
+	relPath, err := s.relPathForKey(key)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	if err := os.MkdirAll(filepath.Dir(finalPath), localStoreDirPerm); err != nil {
+	root, err := s.pinnedRoot()
+	if err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := rejectSymlinkComponents(root, relPath); err != nil {
+		return ObjectInfo{}, err
+	}
+	if err := root.MkdirAll(filepath.Dir(relPath), localStoreDirPerm); err != nil {
 		return ObjectInfo{}, errors.WithStack(err)
 	}
-	tmpPath, info, err := writeLocalObjectTemp(ctx, filepath.Dir(finalPath), key, body, opts)
+	tmpPath, info, err := writeLocalObjectTempWithinRoot(ctx, root, key, body, opts)
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	defer func() { _ = os.Remove(tmpPath) }()
-	return s.commitTempObject(key, tmpPath, finalPath, info)
+	defer func() { _ = root.Remove(tmpPath) }()
+	return commitTempObjectWithinRoot(root, key, tmpPath, relPath, info)
 }
 
 func (s *LocalStore) RefreshObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error) {
@@ -372,8 +405,8 @@ func (s *LocalStore) RefreshObject(ctx context.Context, key string, body io.Read
 	if err != nil {
 		return ObjectInfo{}, err
 	}
-	if root == nil {
-		return ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", key)
+	if err := rejectSymlinkComponents(root, relPath); err != nil {
+		return ObjectInfo{}, err
 	}
 	tmpPath, info, err := writeLocalObjectTempWithinRoot(ctx, root, key, body, opts)
 	if err != nil {
@@ -392,20 +425,28 @@ func (s *LocalStore) GetObject(ctx context.Context, key string) (io.ReadCloser, 
 	if err := ctx.Err(); err != nil {
 		return nil, ObjectInfo{}, errors.WithStack(err)
 	}
-	objectPath, err := s.pathForKey(key)
+	relPath, err := s.relPathForKey(key)
 	if err != nil {
 		return nil, ObjectInfo{}, err
 	}
-	info, err := s.objectInfoForPath(key, objectPath)
+	root, err := s.pinnedRoot()
 	if err != nil {
 		return nil, ObjectInfo{}, err
 	}
-	file, err := os.Open(objectPath)
+	if err := rejectSymlinkComponents(root, relPath); err != nil {
+		return nil, ObjectInfo{}, err
+	}
+	file, err := root.Open(relPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			return nil, ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", key)
 		}
 		return nil, ObjectInfo{}, errors.WithStack(err)
+	}
+	info, err := objectInfoFromFile(key, file)
+	if err != nil {
+		_ = file.Close()
+		return nil, ObjectInfo{}, err
 	}
 	return file, info, nil
 }
@@ -414,18 +455,26 @@ func (s *LocalStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bo
 	if err := ctx.Err(); err != nil {
 		return ObjectInfo{}, false, errors.WithStack(err)
 	}
-	objectPath, err := s.pathForKey(key)
+	relPath, err := s.relPathForKey(key)
 	if err != nil {
 		return ObjectInfo{}, false, err
 	}
-	info, err := s.objectInfoForPath(key, objectPath)
+	root, err := s.pinnedRoot()
 	if err != nil {
-		if errors.Is(err, ErrObjectNotFound) {
+		return ObjectInfo{}, false, err
+	}
+	if err := rejectSymlinkComponents(root, relPath); err != nil {
+		return ObjectInfo{}, false, err
+	}
+	stat, err := root.Stat(relPath)
+	if err != nil {
+		if os.IsNotExist(err) {
 			return ObjectInfo{}, false, nil
 		}
-		return ObjectInfo{}, false, err
+		return ObjectInfo{}, false, errors.WithStack(err)
 	}
-	return info, true, nil
+	info, err := objectInfoFromStat(key, stat)
+	return info, err == nil, err
 }
 
 func (s *LocalStore) pathForKey(key string) (string, error) {
@@ -514,15 +563,7 @@ func isASCIILetter(c byte) bool {
 // os.Root resolves every component against the opened root descriptor and
 // refuses to traverse out of it, so the check and the operation can no longer
 // disagree.
-func (s *LocalStore) removeWithinRoot(relPath string) (bool, error) {
-	root, err := s.pinnedRoot()
-	if err != nil {
-		return false, err
-	}
-	if root == nil {
-		// The store directory does not exist, so neither does the object.
-		return false, nil
-	}
+func removeWithinRoot(root *os.Root, relPath string) (bool, error) {
 	if err := root.Remove(relPath); err != nil {
 		if os.IsNotExist(err) {
 			return false, nil
@@ -532,9 +573,10 @@ func (s *LocalStore) removeWithinRoot(relPath string) (bool, error) {
 	return true, nil
 }
 
-// pinnedRoot opens the configured root ONCE and keeps the descriptor for the
-// life of the store. It returns (nil, nil) when the directory does not exist
-// yet, since the first put creates it.
+// pinnedRoot returns the descriptor NewLocalStore opened for the configured
+// directory. Opening it during construction is essential: delaying the open
+// until the first operation would let a rename-and-symlink swap redirect that
+// first operation before the descriptor was pinned.
 //
 // Reopening per operation re-resolves a MUTABLE PATHNAME. os.OpenRoot follows
 // symlinks in its own argument, so a process that can write the root's PARENT
@@ -550,22 +592,10 @@ func (s *LocalStore) removeWithinRoot(relPath string) (bool, error) {
 // point at afterwards. The descriptor lives as long as the store, which is the
 // process: that is the point of pinning, not a leak.
 func (s *LocalStore) pinnedRoot() (*os.Root, error) {
-	s.rootMu.Lock()
-	defer s.rootMu.Unlock()
-	if s.rootDir != nil {
-		return s.rootDir, nil
+	if s == nil || s.rootDir == nil {
+		return nil, errors.Wrap(ErrInvalidOptions, "object store root is required")
 	}
-	root, err := os.OpenRoot(s.root)
-	if err != nil {
-		if os.IsNotExist(err) {
-			// Not cached: the first put creates the directory, and the next
-			// call must be able to pin the real one.
-			return nil, nil
-		}
-		return nil, errors.Wrapf(err, "open store root %s", s.root)
-	}
-	s.rootDir = root
-	return root, nil
+	return s.rootDir, nil
 }
 
 // relPathForKey is pathForKey's root-relative half, for the
@@ -580,6 +610,28 @@ func (s *LocalStore) relPathForKey(key string) (string, error) {
 		return "", errors.Wrapf(ErrInvalidOptions, "object key %q is not under the store root", key)
 	}
 	return rel, nil
+}
+
+func rejectSymlinkComponents(root *os.Root, relPath string) error {
+	cleaned := filepath.Clean(relPath)
+	if cleaned == "." {
+		return nil
+	}
+	current := ""
+	for _, component := range strings.Split(cleaned, string(filepath.Separator)) {
+		current = filepath.Join(current, component)
+		info, err := root.Lstat(current)
+		if err != nil {
+			if os.IsNotExist(err) {
+				return nil
+			}
+			return errors.Wrapf(err, "inspect object path component %s", current)
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
+			return errors.Wrapf(ErrIntegrity, "object path component %s is a symlink", current)
+		}
+	}
+	return nil
 }
 
 // objectPathWithinRoot reports whether joined actually resolves inside
@@ -610,14 +662,7 @@ func objectPathWithinRoot(root, joined string) bool {
 	return !strings.HasPrefix(rel, ".."+string(filepath.Separator))
 }
 
-func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, error) {
-	stat, err := os.Stat(objectPath)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", key)
-		}
-		return ObjectInfo{}, errors.WithStack(err)
-	}
+func objectInfoFromStat(key string, stat os.FileInfo) (ObjectInfo, error) {
 	if !stat.Mode().IsRegular() {
 		return ObjectInfo{}, errors.Wrapf(ErrInvalidOptions, "object %s is not a regular file", key)
 	}
@@ -628,16 +673,12 @@ func (s *LocalStore) objectInfoForPath(key, objectPath string) (ObjectInfo, erro
 	}, nil
 }
 
-func (s *LocalStore) hashedObjectInfoForPath(key, objectPath string) (ObjectInfo, error) {
-	file, err := os.Open(objectPath)
+func objectInfoFromFile(key string, file *os.File) (ObjectInfo, error) {
+	stat, err := file.Stat()
 	if err != nil {
-		if os.IsNotExist(err) {
-			return ObjectInfo{}, errors.Wrapf(ErrObjectNotFound, "object %s", key)
-		}
 		return ObjectInfo{}, errors.WithStack(err)
 	}
-	defer func() { _ = file.Close() }()
-	return hashedObjectInfoFromFile(key, file)
+	return objectInfoFromStat(key, stat)
 }
 
 func hashedObjectInfoFromFile(key string, file *os.File) (ObjectInfo, error) {
@@ -658,36 +699,6 @@ func hashedObjectInfoFromFile(key string, file *os.File) (ObjectInfo, error) {
 		UpdatedAt: stat.ModTime(),
 		SHA256:    hex.EncodeToString(sum.Sum(nil)),
 	}, nil
-}
-
-func writeLocalObjectTemp(
-	ctx context.Context,
-	dir string,
-	key string,
-	body io.Reader,
-	opts PutOptions,
-) (string, ObjectInfo, error) {
-	tmp, err := os.CreateTemp(dir, ".put-*")
-	if err != nil {
-		return "", ObjectInfo{}, errors.WithStack(err)
-	}
-	tmpPath := tmp.Name()
-	keep := false
-	defer func() {
-		if !keep {
-			_ = tmp.Close()
-			_ = os.Remove(tmpPath)
-		}
-	}()
-	info, err := writeLocalObjectContents(ctx, tmp, key, body, opts)
-	if err != nil {
-		return "", ObjectInfo{}, err
-	}
-	if err := tmp.Close(); err != nil {
-		return "", ObjectInfo{}, errors.WithStack(err)
-	}
-	keep = true
-	return tmpPath, info, nil
 }
 
 func writeLocalObjectTempWithinRoot(
@@ -762,21 +773,27 @@ func writeLocalObjectContents(
 	return ObjectInfo{Key: normalizeObjectKey(key), Size: opts.Size, SHA256: opts.SHA256}, nil
 }
 
-func (s *LocalStore) commitTempObject(key, tmpPath, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
-	if err := os.Link(tmpPath, finalPath); err != nil {
+func commitTempObjectWithinRoot(
+	root *os.Root,
+	key string,
+	tmpPath string,
+	finalPath string,
+	expected ObjectInfo,
+) (ObjectInfo, error) {
+	if err := root.Link(tmpPath, finalPath); err != nil {
 		if !os.IsExist(err) {
 			return ObjectInfo{}, errors.WithStack(err)
 		}
-		return s.verifyExistingObject(key, finalPath, expected)
+		return verifyExistingObjectWithinRoot(root, key, finalPath, expected)
 	}
 	finalDir := filepath.Dir(finalPath)
-	if err := syncDir(finalDir); err != nil {
-		if removeErr := os.Remove(finalPath); removeErr != nil && !os.IsNotExist(removeErr) {
+	if err := syncDirWithinRoot(root, finalDir); err != nil {
+		if removeErr := root.Remove(finalPath); removeErr != nil && !os.IsNotExist(removeErr) {
 			err = errors.CombineErrors(err, errors.WithStack(removeErr))
 		}
 		return ObjectInfo{}, errors.WithStack(err)
 	}
-	return s.verifyExistingObject(key, finalPath, expected)
+	return verifyExistingObjectWithinRoot(root, key, finalPath, expected)
 }
 
 func replaceObjectWithinRoot(
@@ -826,8 +843,10 @@ func hashedObjectInfoWithinRoot(root *os.Root, key, objectPath string) (ObjectIn
 	return hashedObjectInfoFromFile(key, file)
 }
 
-func (s *LocalStore) verifyExistingObject(key, finalPath string, expected ObjectInfo) (ObjectInfo, error) {
-	info, err := s.hashedObjectInfoForPath(key, finalPath)
+func verifyExistingObjectWithinRoot(
+	root *os.Root, key, finalPath string, expected ObjectInfo,
+) (ObjectInfo, error) {
+	info, err := hashedObjectInfoWithinRoot(root, key, finalPath)
 	if err != nil {
 		return ObjectInfo{}, err
 	}

@@ -268,11 +268,13 @@ type retentionPlan struct {
 }
 
 type claimedManifest struct {
-	ref   ObjectRef
-	claim ObjectClaim
+	ref            ObjectRef
+	manifestSHA256 string
+	claim          ObjectClaim
 }
 
 func (g *GC) prepareRetentionPlan(ctx context.Context, scan manifestScan) (retentionPlan, error) {
+	initialMalformed := append([]string(nil), scan.malformed...)
 	plan := retentionPlan{
 		scan:           scan,
 		skipReason:     g.payloadPhaseBlockedBy(scan),
@@ -309,6 +311,7 @@ func (g *GC) prepareRetentionPlan(ctx context.Context, scan manifestScan) (reten
 	if err != nil {
 		return plan, err
 	}
+	plan.scan.malformed = unionSortedStrings(initialMalformed, plan.scan.malformed)
 	if finalSkipReason := g.payloadPhaseBlockedBy(plan.scan); finalSkipReason != "" {
 		plan.skipReason = finalSkipReason
 	}
@@ -327,7 +330,11 @@ func (g *GC) claimExpiredManifests(
 			}
 			return claims, errors.Wrapf(err, "retention: claim manifest %s", entry.key)
 		}
-		claims[entry.key] = claimedManifest{ref: entry.ref, claim: claim}
+		claims[entry.key] = claimedManifest{
+			ref:            entry.ref,
+			manifestSHA256: entry.manifest.ManifestSHA256,
+			claim:          claim,
+		}
 	}
 	return claims, nil
 }
@@ -346,7 +353,8 @@ func (g *GC) deleteExpiredManifests(
 	claimedConcurrently := 0
 	for _, entry := range expired {
 		claimed, ok := claims[entry.key]
-		if !ok || !sameObjectState(claimed.ref, entry.ref) {
+		if !ok || !sameObjectState(claimed.ref, entry.ref) ||
+			claimed.manifestSHA256 != entry.manifest.ManifestSHA256 {
 			protectManifestPayload(live, entry)
 			claimedConcurrently++
 			continue
@@ -408,6 +416,22 @@ func malformedManifest(err error) error {
 func isMalformedManifest(err error) bool {
 	var target *malformedManifestError
 	return errors.As(err, &target)
+}
+
+func unionSortedStrings(left, right []string) []string {
+	seen := make(map[string]struct{}, len(left)+len(right))
+	for _, value := range left {
+		seen[value] = struct{}{}
+	}
+	for _, value := range right {
+		seen[value] = struct{}{}
+	}
+	result := make([]string, 0, len(seen))
+	for value := range seen {
+		result = append(result, value)
+	}
+	sort.Strings(result)
+	return result
 }
 
 func (g *GC) scanManifests(ctx context.Context) (manifestScan, error) {

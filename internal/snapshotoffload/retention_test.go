@@ -302,6 +302,55 @@ func TestGCSkipsPayloadPhaseWhenAManifestIsMalformed(t *testing.T) {
 	require.True(t, f.exists(t, live.Payload.Key))
 }
 
+type malformedRemovedBeforeFinalScanStore struct {
+	RetentionStore
+	triggerKey   string
+	malformedKey string
+	done         bool
+}
+
+func (s *malformedRemovedBeforeFinalScanStore) AcquireObjectClaim(
+	ctx context.Context, key string,
+) (ObjectClaim, error) {
+	if key == s.triggerKey && !s.done {
+		s.done = true
+		if err := s.DeleteObject(ctx, s.malformedKey); err != nil {
+			return nil, err
+		}
+	}
+	return s.RetentionStore.AcquireObjectClaim(ctx, key)
+}
+
+func TestGCPreservesMalformedManifestEvidenceFromTheInitialScan(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("live"), year)
+	stale := f.publishManifest(t, 1, 10, []byte("stale"), year)
+	badKey := f.writeMalformedManifest(t, 2, 7, 1)
+	store := &malformedRemovedBeforeFinalScanStore{
+		RetentionStore: f.store,
+		triggerKey:     stale.ManifestKey,
+		malformedKey:   badKey,
+	}
+	gc, err := NewGC(GCOptions{
+		Store:  store,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.False(t, f.exists(t, badKey), "the fixture must remove the malformed object before the final scan")
+	require.True(t, result.PayloadPhaseSkipped)
+	require.Contains(t, result.SkipReason, "malformed")
+	require.Equal(t, []string{badKey}, result.MalformedManifests,
+		"operator evidence from the initial scan must survive a later disappearance")
+}
+
 // TestGCDoesNotReclaimPayloadInsideGracePeriod covers the
 // payload-first publish window: the payload lands before its manifest
 // commits, so a freshly uploaded unreferenced payload is an in-flight
@@ -1077,6 +1126,57 @@ func TestGCKeepsManifestRefreshedBeforeItsClaim(t *testing.T) {
 	require.Equal(t, 1, result.ManifestsClaimedConcurrently)
 }
 
+func TestGCKeepsManifestWhoseContentChangedWithStableFilesystemMetadata(t *testing.T) {
+	t.Parallel()
+
+	f := newGCFixture(t)
+	year := 365 * 24 * time.Hour
+	f.publishManifest(t, 1, 30, []byte("current"), year)
+	stale := f.publishManifest(t, 1, 10, []byte("content-generation"), year)
+	before, exists, err := f.store.HeadObject(context.Background(), stale.ManifestKey)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	store := &manifestRefreshedBeforeClaimStore{
+		RetentionStore: f.store,
+		target:         stale.ManifestKey,
+		refresh: func() {
+			manifest, err := LoadManifest(context.Background(), f.store, stale.ManifestKey)
+			require.NoError(t, err)
+			manifest.SourceCluster = "cluster-b"
+			data, _, err := manifest.MarshalCanonical()
+			require.NoError(t, err)
+			_, err = f.store.RefreshObject(
+				context.Background(),
+				stale.ManifestKey,
+				bytes.NewReader(data),
+				PutOptions{Size: int64(len(data)), SHA256: hexSHA256Bytes(data)},
+			)
+			require.NoError(t, err)
+			after, exists, err := f.store.HeadObject(context.Background(), stale.ManifestKey)
+			require.NoError(t, err)
+			require.True(t, exists)
+			require.Equal(t, before.Size, after.Size,
+				"the regression requires a same-size manifest rewrite")
+			f.setMTime(t, stale.ManifestKey, before.UpdatedAt)
+		},
+	}
+	gc, err := NewGC(GCOptions{
+		Store:  store,
+		Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:    func() time.Time { return f.now },
+	})
+	require.NoError(t, err)
+
+	result, err := gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.True(t, f.exists(t, stale.ManifestKey),
+		"a changed manifest self-hash must survive even when size and mtime are unchanged")
+	require.NotContains(t, result.ManifestsDeleted, stale.ManifestKey)
+	require.Equal(t, 1, result.ManifestsClaimedConcurrently)
+}
+
 type manifestClaimBlockingStore struct {
 	RetentionStore
 	manifestKey string
@@ -1702,6 +1802,19 @@ func TestLocalStoreRefreshDoesNotFollowASymlinkOutOfTheRoot(t *testing.T) {
 	contents, err := os.ReadFile(victim)
 	require.NoError(t, err)
 	require.Equal(t, []byte("original"), contents)
+
+	_, err = store.PutObject(ctx, "escape/new.json", bytes.NewReader(replacement), PutOptions{
+		Size:        int64(len(replacement)),
+		SHA256:      hexSHA256Bytes(replacement),
+		ContentType: "application/json",
+	})
+	require.Error(t, err)
+	require.NoFileExists(t, filepath.Join(out, "new.json"))
+
+	_, _, err = store.GetObject(ctx, "escape/manifest.json")
+	require.Error(t, err)
+	_, _, err = store.HeadObject(ctx, "escape/manifest.json")
+	require.Error(t, err)
 }
 
 func TestLocalStoreListObjectsFailsClosedOnSymlink(t *testing.T) {
@@ -1782,4 +1895,72 @@ func TestLocalStoreDeleteResolvesAgainstThePinnedRoot(t *testing.T) {
 	require.NoError(t, store.DeleteObject(ctx, "victim.json"))
 	require.FileExists(t, victim,
 		"the delete must resolve against the pinned root, not the swapped pathname")
+}
+
+func TestLocalStoreAllOperationsResolveAgainstThePinnedRoot(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	base := t.TempDir()
+	root := filepath.Join(base, "store")
+	store, err := NewLocalStore(root)
+	require.NoError(t, err)
+
+	const key = "nested/object.json"
+	original := []byte("original-root")
+	_, err = store.PutObject(ctx, key, bytes.NewReader(original), PutOptions{
+		Size:   int64(len(original)),
+		SHA256: hexSHA256Bytes(original),
+	})
+	require.NoError(t, err)
+	before, exists, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, exists)
+
+	attacker := filepath.Join(base, "attacker")
+	attackerObject := filepath.Join(attacker, filepath.FromSlash(key))
+	require.NoError(t, os.MkdirAll(filepath.Dir(attackerObject), 0o750))
+	attackerBytes := []byte("attacker-root")
+	require.Equal(t, len(original), len(attackerBytes), "fixture requires the same size")
+	require.NoError(t, os.WriteFile(attackerObject, attackerBytes, 0o600))
+	require.NoError(t, os.Chtimes(attackerObject, before.UpdatedAt, before.UpdatedAt))
+
+	moved := filepath.Join(base, "store-moved")
+	require.NoError(t, os.Rename(root, moved))
+	require.NoError(t, os.Symlink(attacker, root))
+
+	body, info, err := store.GetObject(ctx, key)
+	require.NoError(t, err)
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.NoError(t, body.Close())
+	require.Equal(t, original, got)
+	require.Equal(t, before.Size, info.Size)
+
+	head, exists, err := store.HeadObject(ctx, key)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, before.Size, head.Size)
+
+	refs, err := store.ListObjects(ctx, "nested")
+	require.NoError(t, err)
+	require.Len(t, refs, 1)
+	require.Equal(t, key, refs[0].Key)
+
+	created := []byte("new-object")
+	_, err = store.PutObject(ctx, "nested/new.json", bytes.NewReader(created), PutOptions{
+		Size:   int64(len(created)),
+		SHA256: hexSHA256Bytes(created),
+	})
+	require.NoError(t, err)
+	require.FileExists(t, filepath.Join(moved, "nested", "new.json"))
+	require.NoFileExists(t, filepath.Join(attacker, "nested", "new.json"))
+
+	require.NoError(t, store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{
+		Size:      before.Size,
+		UpdatedAt: before.UpdatedAt,
+	}))
+	require.NoFileExists(t, filepath.Join(moved, filepath.FromSlash(key)))
+	require.FileExists(t, attackerObject,
+		"the replacement pathname must not participate in conditional validation or deletion")
 }

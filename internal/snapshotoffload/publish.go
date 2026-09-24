@@ -344,8 +344,19 @@ func manifestMatchesCandidate(existing Manifest, candidate Manifest, reuseExisti
 	if reuseExistingCreatedAt {
 		return sameManifestExceptCreation(existing, candidate)
 	}
+	originalCreatedAt := candidate.CreatedAt
 	candidate.ManifestSHA256 = existing.ManifestSHA256
-	return reflect.DeepEqual(existing, candidate)
+	if reflect.DeepEqual(existing, candidate) {
+		return true
+	}
+	// Refreshing a reused schema-v1 manifest advances CreatedAt by one
+	// nanosecond so the canonical bytes and self-hash form a new generation
+	// without adding a field older restore binaries cannot verify. A later
+	// retry with the caller's original explicit timestamp must still match
+	// that refreshed object. Only accept a forward-advanced stored timestamp;
+	// a candidate attempting to replace the audit timestamp with a newer value
+	// remains a conflict.
+	return existing.CreatedAt.After(originalCreatedAt) && sameManifestExceptCreation(existing, candidate)
 }
 
 // sameManifestExceptCreation compares a retry's candidate against the

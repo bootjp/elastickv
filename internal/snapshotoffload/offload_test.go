@@ -186,6 +186,13 @@ func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
 	require.Equal(t, first.Payload.Key, second.Payload.Key)
 	require.Equal(t, opts.CreatedAt.Add(time.Nanosecond), second.CreatedAt)
 	require.NotEqual(t, first.ManifestSHA256, second.ManifestSHA256)
+
+	third, err := PublishPersistedSnapshot(ctx, opts)
+	require.NoError(t, err)
+	require.Equal(t, first.ManifestKey, third.ManifestKey)
+	require.Equal(t, first.Payload.Key, third.Payload.Key)
+	require.Equal(t, opts.CreatedAt.Add(2*time.Nanosecond), third.CreatedAt)
+	require.NotEqual(t, second.ManifestSHA256, third.ManifestSHA256)
 }
 
 func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
