@@ -946,6 +946,7 @@ func isS3ConditionalConflict(err error) bool {
 }
 
 var _ RetentionStore = (*S3Store)(nil)
+var _ PublishStore = (*S3Store)(nil)
 
 // listObjectsPageLimit bounds a single ListObjectsV2 page. The AWS
 // maximum is 1000; naming it keeps the mnd linter satisfied and the
@@ -1018,6 +1019,9 @@ func (s *S3Store) listObjectsPage(
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "list s3 objects page")
+	}
+	if out == nil {
+		return nil, errors.Wrapf(ErrIntegrity, "list objects under %q returned a nil page", prefix)
 	}
 	return out, nil
 }

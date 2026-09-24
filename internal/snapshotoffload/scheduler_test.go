@@ -226,7 +226,7 @@ func TestSchedulerRunRequiresStoreAndSourceCluster(t *testing.T) {
 // newTestScheduler builds a valid scheduler and fails the test if the
 // configuration is rejected.
 func newTestScheduler(
-	t *testing.T, store ObjectStore, groups []OffloadGroup, opts ...SchedulerOption,
+	t *testing.T, store PublishStore, groups []OffloadGroup, opts ...SchedulerOption,
 ) *Scheduler {
 	t.Helper()
 	s, err := NewScheduler(store, groups, "cluster-a", "cluster-a", "test", opts...)

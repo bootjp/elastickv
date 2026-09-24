@@ -46,6 +46,14 @@ type ObjectClaimStore interface {
 	AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error)
 }
 
+// PublishStore is the capability set publication requires. Claims are part of
+// the type instead of a runtime assertion because every publish must coordinate
+// payload and manifest keys with retention.
+type PublishStore interface {
+	ObjectStore
+	ObjectClaimStore
+}
+
 // ObjectRef is one object seen by ListObjects.
 //
 // UpdatedAt is the object store's own last-modified time, not a value
@@ -82,11 +90,10 @@ func PreconditionFor(ref ObjectRef) DeletePrecondition {
 // RetentionStore is an ObjectStore that also supports the listing and
 // deletion that retention/GC needs (design §5).
 //
-// It is a separate interface rather than extra methods on ObjectStore
-// so the publish and restore paths keep working against a store that
-// can only put/get/head, while GC is a compile-time error to construct
-// over such a store. A silently-no-op GC would be far worse: retention
-// would appear configured while the bucket grew without bound.
+// It is separate from ObjectStore and PublishStore so restore can use a
+// read-only object client, publication requires claims at compile time, and GC
+// additionally requires listing and deletion. A silently-no-op GC would be far
+// worse: retention would appear configured while the bucket grew without bound.
 //
 // ListObjects is all-or-error by contract: it MUST return every object
 // under prefix or a non-nil error. §5 makes no-deletes-on-partial-scan
@@ -113,7 +120,7 @@ type RetentionStore interface {
 }
 
 var _ RetentionStore = (*LocalStore)(nil)
-var _ ObjectClaimStore = (*LocalStore)(nil)
+var _ PublishStore = (*LocalStore)(nil)
 
 // ListObjects walks the pinned local root below prefix. Directories and
 // irregular files are skipped, while symlinks fail the all-or-error listing
@@ -151,6 +158,9 @@ func (s *LocalStore) listObjectsFromRoot(
 		if ctxErr := ctx.Err(); ctxErr != nil {
 			return errors.WithStack(ctxErr)
 		}
+		if walkPath == localStoreTempDir && entry.IsDir() {
+			return iofs.SkipDir
+		}
 		ref, ok, refErr := s.objectRefForWalkEntry(walkPath, entry)
 		if refErr != nil {
 			return refErr
@@ -177,8 +187,9 @@ func (s *LocalStore) walkEntryError(walkPath, root string, err error) error {
 }
 
 // objectRefForWalkEntry converts one walk entry into an ObjectRef,
-// reporting ok=false for entries that are not objects (directories,
-// sockets, and the in-progress ".put-*" temp files PutObject creates).
+// reporting ok=false for entries that are not objects (directories and
+// sockets). In-progress writes live in the reserved localStoreTempDir subtree,
+// which listObjectsFromRoot skips before reaching this helper.
 // Symlinks fail the complete-listing contract closed instead of disappearing
 // from GC's live-set scan.
 func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (ObjectRef, bool, error) {
@@ -187,9 +198,6 @@ func (s *LocalStore) objectRefForWalkEntry(walkPath string, entry os.DirEntry) (
 			"object listing encountered symlink %s", walkPath)
 	}
 	if entry.IsDir() || !entry.Type().IsRegular() {
-		return ObjectRef{}, false, nil
-	}
-	if strings.HasPrefix(entry.Name(), ".put-") {
 		return ObjectRef{}, false, nil
 	}
 	info, err := entry.Info()
@@ -340,6 +348,9 @@ type LocalStore struct {
 	// single-writer store; production offload targets S3.
 	deleteMu sync.Mutex
 
+	// rootMu protects the pinned descriptor's ownership. Close is only valid
+	// after callers have stopped issuing operations.
+	rootMu sync.RWMutex
 	// rootDir is the configured directory, opened by NewLocalStore and kept
 	// for the life of the store. See pinnedRoot.
 	rootDir *os.Root
@@ -350,6 +361,8 @@ const (
 	localStoreFilePerm           = 0o600
 	localStoreTempTokenBytes     = 16
 	localStoreTempCreateAttempts = 10
+	localStoreTempDir            = ".snapshotoffload-tmp"
+	localStoreTempDirPerm        = 0o700
 )
 
 func NewLocalStore(root string) (*LocalStore, error) {
@@ -364,7 +377,30 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	if err != nil {
 		return nil, errors.Wrapf(err, "open local store root %s", cleaned)
 	}
+	if err := rootDir.MkdirAll(localStoreTempDir, localStoreTempDirPerm); err != nil {
+		_ = rootDir.Close()
+		return nil, errors.Wrap(err, "create local store temp directory")
+	}
 	return &LocalStore{root: cleaned, rootDir: rootDir}, nil
+}
+
+// Close releases the descriptor pinned by NewLocalStore. Callers must stop all
+// store operations before closing it. Close is idempotent.
+func (s *LocalStore) Close() error {
+	if s == nil {
+		return nil
+	}
+	s.rootMu.Lock()
+	defer s.rootMu.Unlock()
+	if s.rootDir == nil {
+		return nil
+	}
+	err := s.rootDir.Close()
+	s.rootDir = nil
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func (s *LocalStore) PutObject(ctx context.Context, key string, body io.Reader, opts PutOptions) (ObjectInfo, error) {
@@ -506,6 +542,8 @@ func objectPathSegmentIsSafe(normalized string) bool {
 	switch {
 	case normalized == "", normalized == ".", normalized == "..":
 		return false
+	case normalized == localStoreTempDir, strings.HasPrefix(normalized, localStoreTempDir+"/"):
+		return false
 	case strings.HasPrefix(normalized, "../"):
 		return false
 	case strings.ContainsRune(normalized, '\\'):
@@ -589,10 +627,15 @@ func removeWithinRoot(root *os.Root, relPath string) (bool, error) {
 //
 // Holding the descriptor means every later operation resolves against the
 // directory this store was configured with, whatever the pathname comes to
-// point at afterwards. The descriptor lives as long as the store, which is the
-// process: that is the point of pinning, not a leak.
+// point at afterwards. The descriptor lives until Close; callers must not race
+// Close with an operation that has already obtained the descriptor.
 func (s *LocalStore) pinnedRoot() (*os.Root, error) {
-	if s == nil || s.rootDir == nil {
+	if s == nil {
+		return nil, errors.Wrap(ErrInvalidOptions, "object store root is required")
+	}
+	s.rootMu.RLock()
+	defer s.rootMu.RUnlock()
+	if s.rootDir == nil {
 		return nil, errors.Wrap(ErrInvalidOptions, "object store root is required")
 	}
 	return s.rootDir, nil
@@ -736,7 +779,7 @@ func createLocalTempWithinRoot(root *os.Root) (string, *os.File, error) {
 		if _, err := rand.Read(token[:]); err != nil {
 			return "", nil, errors.Wrap(err, "generate local object temp name")
 		}
-		name := ".put-" + hex.EncodeToString(token[:])
+		name := filepath.Join(localStoreTempDir, ".put-"+hex.EncodeToString(token[:]))
 		file, err := root.OpenFile(name, os.O_RDWR|os.O_CREATE|os.O_EXCL, localStoreFilePerm)
 		if err == nil {
 			return name, file, nil

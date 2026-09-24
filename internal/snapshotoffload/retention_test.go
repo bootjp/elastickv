@@ -29,8 +29,7 @@ type gcFixture struct {
 func newGCFixture(t *testing.T) *gcFixture {
 	t.Helper()
 	root := t.TempDir()
-	store, err := NewLocalStore(root)
-	require.NoError(t, err)
+	store := newTestLocalStore(t, root)
 	return &gcFixture{
 		root:  root,
 		store: store,
@@ -777,28 +776,42 @@ func TestGCRetainsNewestEvenWhenPolicyWouldNot(t *testing.T) {
 		"an older manifest outside both bounds is still collectable")
 }
 
-// TestLocalStoreListObjectsSkipsInProgressPutTempFiles covers the
-// crash-during-publish leftover: PutObject stages content as a
-// ".put-*" temp file in the destination directory, and a process that
-// died mid-put can leave one behind. Listing it as an object would
-// hand GC a key that is not an object at all.
-func TestLocalStoreListObjectsSkipsInProgressPutTempFiles(t *testing.T) {
+// TestLocalStoreListObjectsSkipsOnlyTheReservedTempNamespace covers the
+// crash-during-publish leftover without hiding legitimate object keys whose
+// final component starts with ".put-".
+func TestLocalStoreListObjectsSkipsOnlyTheReservedTempNamespace(t *testing.T) {
 	t.Parallel()
 
 	f := newGCFixture(t)
-	m := f.publishManifest(t, 1, 10, []byte("payload"), time.Hour)
+	f.publishManifest(t, 1, 10, []byte("payload"), time.Hour)
 
-	leftover := filepath.Join(f.root, filepath.FromSlash(path.Dir(m.Payload.Key)), ".put-abandoned")
+	leftover := filepath.Join(f.root, localStoreTempDir, ".put-abandoned")
 	require.NoError(t, os.WriteFile(leftover, []byte("partial upload"), 0o600))
-
-	refs, err := f.store.ListObjects(context.Background(), retentionPrefix)
+	legitimateKey := path.Join(retentionPrefix, ".put-user-object")
+	legitimateBody := []byte("committed object")
+	_, err := f.store.PutObject(context.Background(), legitimateKey, bytes.NewReader(legitimateBody), PutOptions{
+		Size:   int64(len(legitimateBody)),
+		SHA256: hexSHA256Bytes(legitimateBody),
+	})
 	require.NoError(t, err)
 
+	refs, err := f.store.ListObjects(context.Background(), ".")
+	require.NoError(t, err)
+
+	keys := make([]string, 0, len(refs))
 	for _, ref := range refs {
-		require.NotContains(t, ref.Key, ".put-",
-			"an in-progress put temp file must not be listed as an object")
+		keys = append(keys, ref.Key)
 	}
+	require.Contains(t, keys, legitimateKey, "a committed .put-* key is an ordinary object")
+	require.NotContains(t, keys, filepath.ToSlash(filepath.Join(localStoreTempDir, ".put-abandoned")))
 	require.FileExists(t, leftover, "listing must not delete the leftover either")
+
+	_, err = f.store.ListObjects(context.Background(), localStoreTempDir)
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	_, err = f.store.PutObject(context.Background(), path.Join(localStoreTempDir, "object"), bytes.NewReader(nil), PutOptions{
+		SHA256: hexSHA256Bytes(nil),
+	})
+	require.ErrorIs(t, err, ErrInvalidOptions)
 }
 
 // TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish is the
@@ -1011,13 +1024,23 @@ func TestLocalStoreConditionalDeleteRejectsChangedObject(t *testing.T) {
 func TestLocalStoreDeleteIsIdempotentWhenParentNeverExisted(t *testing.T) {
 	t.Parallel()
 
-	store, err := NewLocalStore(filepath.Join(t.TempDir(), "missing-root"))
-	require.NoError(t, err)
+	store := newTestLocalStore(t, filepath.Join(t.TempDir(), "missing-root"))
 	ctx := context.Background()
 	const key = "never/created/object"
 
 	require.NoError(t, store.DeleteObject(ctx, key))
 	require.NoError(t, store.DeleteObjectIfUnmodified(ctx, key, DeletePrecondition{Size: 1}))
+}
+
+func TestLocalStoreCloseIsIdempotentAndStopsOperations(t *testing.T) {
+	t.Parallel()
+
+	store := newTestLocalStore(t, t.TempDir())
+	require.NoError(t, store.Close())
+	require.NoError(t, store.Close())
+
+	_, _, err := store.HeadObject(context.Background(), "object")
+	require.ErrorIs(t, err, ErrInvalidOptions)
 }
 
 // manifestRewritingStore rewrites an expired manifest between the scan
@@ -1763,10 +1786,9 @@ func TestLocalStoreDeleteDoesNotFollowASymlinkOutOfTheRoot(t *testing.T) {
 	// backslash, not rooted, and the joined path is under the root.
 	require.NoError(t, os.Symlink(outside, filepath.Join(root, "escape")))
 
-	store, err := NewLocalStore(root)
-	require.NoError(t, err)
+	store := newTestLocalStore(t, root)
 
-	err = store.DeleteObject(ctx, "escape/victim.txt")
+	err := store.DeleteObject(ctx, "escape/victim.txt")
 	require.Error(t, err, "a delete that resolves through a symlink out of the root must fail")
 	require.FileExists(t, victim,
 		"the file outside the store root must survive: os.Root refuses to traverse out of it")
@@ -1790,10 +1812,9 @@ func TestLocalStoreRefreshDoesNotFollowASymlinkOutOfTheRoot(t *testing.T) {
 	require.NoError(t, os.WriteFile(victim, []byte("original"), 0o600))
 	require.NoError(t, os.Symlink(out, filepath.Join(root, "escape")))
 
-	store, err := NewLocalStore(root)
-	require.NoError(t, err)
+	store := newTestLocalStore(t, root)
 	replacement := []byte("replacement")
-	_, err = store.RefreshObject(ctx, "escape/manifest.json", bytes.NewReader(replacement), PutOptions{
+	_, err := store.RefreshObject(ctx, "escape/manifest.json", bytes.NewReader(replacement), PutOptions{
 		Size:        int64(len(replacement)),
 		SHA256:      hexSHA256Bytes(replacement),
 		ContentType: "application/json",
@@ -1828,9 +1849,8 @@ func TestLocalStoreListObjectsFailsClosedOnSymlink(t *testing.T) {
 	require.NoError(t, os.MkdirAll(out, 0o750))
 	require.NoError(t, os.Symlink(out, groups))
 
-	store, err := NewLocalStore(root)
-	require.NoError(t, err)
-	_, err = store.ListObjects(context.Background(), path.Join(retentionPrefix, "v1", "groups"))
+	store := newTestLocalStore(t, root)
+	_, err := store.ListObjects(context.Background(), path.Join(retentionPrefix, "v1", "groups"))
 	require.ErrorIs(t, err, ErrIntegrity)
 }
 
@@ -1841,10 +1861,9 @@ func TestLocalStoreDeleteStillRemovesANestedObject(t *testing.T) {
 
 	ctx := context.Background()
 	root := t.TempDir()
-	store, err := NewLocalStore(root)
-	require.NoError(t, err)
+	store := newTestLocalStore(t, root)
 
-	_, err = store.PutObject(ctx, "a/b/c.json", bytes.NewReader([]byte("{}")), PutOptions{
+	_, err := store.PutObject(ctx, "a/b/c.json", bytes.NewReader([]byte("{}")), PutOptions{
 		Size:   2,
 		SHA256: hexSHA256Bytes([]byte("{}")),
 	})
@@ -1875,8 +1894,7 @@ func TestLocalStoreDeleteResolvesAgainstThePinnedRoot(t *testing.T) {
 	root := filepath.Join(base, "store")
 	require.NoError(t, os.MkdirAll(root, 0o750))
 
-	store, err := NewLocalStore(root)
-	require.NoError(t, err)
+	store := newTestLocalStore(t, root)
 
 	// One real delete, so the descriptor is pinned to the configured
 	// directory while it is still the configured directory.
@@ -1903,12 +1921,11 @@ func TestLocalStoreAllOperationsResolveAgainstThePinnedRoot(t *testing.T) {
 	ctx := context.Background()
 	base := t.TempDir()
 	root := filepath.Join(base, "store")
-	store, err := NewLocalStore(root)
-	require.NoError(t, err)
+	store := newTestLocalStore(t, root)
 
 	const key = "nested/object.json"
 	original := []byte("original-root")
-	_, err = store.PutObject(ctx, key, bytes.NewReader(original), PutOptions{
+	_, err := store.PutObject(ctx, key, bytes.NewReader(original), PutOptions{
 		Size:   int64(len(original)),
 		SHA256: hexSHA256Bytes(original),
 	})

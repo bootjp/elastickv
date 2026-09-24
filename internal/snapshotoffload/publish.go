@@ -17,7 +17,7 @@ import (
 )
 
 type PublishOptions struct {
-	Store         ObjectStore
+	Store         PublishStore
 	DataDir       string
 	Prefix        string
 	GroupID       uint64
@@ -74,11 +74,7 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (result 
 	if err != nil {
 		return nil, err
 	}
-	claimStore, err := objectClaimStore(opts.Store)
-	if err != nil {
-		return nil, err
-	}
-	payloadClaim, err := acquireObjectClaimWaiting(ctx, claimStore, payloadObjectKey)
+	payloadClaim, err := acquireObjectClaimWaiting(ctx, opts.Store, payloadObjectKey)
 	if err != nil {
 		return nil, errors.Wrap(err, "claim snapshot payload")
 	}
@@ -168,16 +164,12 @@ func buildManifest(
 
 func putManifest(
 	ctx context.Context,
-	store ObjectStore,
+	store PublishStore,
 	manifest *Manifest,
 	reuseExistingCreatedAt bool,
 	verifyLeader func(context.Context) error,
 ) (retErr error) {
-	claimStore, err := objectClaimStore(store)
-	if err != nil {
-		return err
-	}
-	claim, err := acquireObjectClaimWaiting(ctx, claimStore, manifest.ManifestKey)
+	claim, err := acquireObjectClaimWaiting(ctx, store, manifest.ManifestKey)
 	if err != nil {
 		return errors.Wrap(err, "claim snapshot manifest")
 	}

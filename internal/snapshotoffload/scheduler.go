@@ -21,7 +21,7 @@ import (
 // compaction behaviour, which §10 lists as a non-goal.
 type Scheduler struct {
 	groups      []OffloadGroup
-	store       ObjectStore
+	store       PublishStore
 	prefix      string
 	sourceName  string
 	binVersion  string
@@ -145,7 +145,7 @@ func WithSchedulerSpoolDir(dir string) SchedulerOption {
 // must supply both leadership callbacks: SyncOnce is exported and does
 // not re-validate, so a nil callback that survived construction would
 // be a follower publishing a manifest.
-func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluster, binaryVersion string, opts ...SchedulerOption) (*Scheduler, error) {
+func NewScheduler(store PublishStore, groups []OffloadGroup, prefix, sourceCluster, binaryVersion string, opts ...SchedulerOption) (*Scheduler, error) {
 	s := &Scheduler{
 		groups:      groups,
 		store:       store,

@@ -218,11 +218,12 @@ func validateStoreFlags(cfg storeFlags) error {
 	return nil
 }
 
-func runPublish(ctx context.Context, cfg *publishConfig, stdout io.Writer, logger *slog.Logger) error {
-	store, err := openObjectStore(ctx, cfg.store)
+func runPublish(ctx context.Context, cfg *publishConfig, stdout io.Writer, logger *slog.Logger) (retErr error) {
+	store, closeStore, err := openObjectStore(ctx, cfg.store)
 	if err != nil {
 		return err
 	}
+	defer func() { retErr = errors.CombineErrors(retErr, closeStore()) }()
 	manifest, err := snapshotoffload.PublishPersistedSnapshot(ctx, snapshotoffload.PublishOptions{
 		Store:         store,
 		DataDir:       cfg.dataDir,
@@ -252,11 +253,12 @@ func runPublish(ctx context.Context, cfg *publishConfig, stdout io.Writer, logge
 	return nil
 }
 
-func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) error {
-	store, err := openObjectStore(ctx, cfg.store)
+func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) (retErr error) {
+	store, closeStore, err := openObjectStore(ctx, cfg.store)
 	if err != nil {
 		return err
 	}
+	defer func() { retErr = errors.CombineErrors(retErr, closeStore()) }()
 	peers, err := parsePeers(cfg.peerCSV)
 	if err != nil {
 		return err
@@ -282,14 +284,16 @@ func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) er
 	return nil
 }
 
-func openObjectStore(ctx context.Context, cfg storeFlags) (snapshotoffload.ObjectStore, error) {
+func openObjectStore(
+	ctx context.Context, cfg storeFlags,
+) (snapshotoffload.PublishStore, func() error, error) {
 	switch cfg.storeKind {
 	case storeLocal:
 		store, err := snapshotoffload.NewLocalStore(cfg.localRoot)
 		if err != nil {
-			return nil, errors.Wrap(err, "open local object store")
+			return nil, nil, errors.Wrap(err, "open local object store")
 		}
-		return store, nil
+		return store, store.Close, nil
 	case storeS3:
 		store, err := snapshotoffload.NewS3Store(ctx, snapshotoffload.S3StoreConfig{
 			Bucket:                            cfg.s3Bucket,
@@ -303,11 +307,11 @@ func openObjectStore(ctx context.Context, cfg storeFlags) (snapshotoffload.Objec
 			AllowVersionedBucketWithLifecycle: cfg.s3AllowVersionedLifecycle,
 		})
 		if err != nil {
-			return nil, errors.Wrap(err, "open s3 object store")
+			return nil, nil, errors.Wrap(err, "open s3 object store")
 		}
-		return store, nil
+		return store, func() error { return nil }, nil
 	default:
-		return nil, errors.Errorf("unknown --store %q", cfg.storeKind)
+		return nil, nil, errors.Errorf("unknown --store %q", cfg.storeKind)
 	}
 }
 

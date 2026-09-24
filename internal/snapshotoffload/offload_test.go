@@ -631,6 +631,7 @@ func newTestLocalStore(t *testing.T, root string) *LocalStore {
 	t.Helper()
 	store, err := NewLocalStore(root)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return store
 }
 

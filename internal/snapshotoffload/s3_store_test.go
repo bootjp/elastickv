@@ -422,6 +422,7 @@ type fakeS3Client struct {
 	listOmitContinuationToken   bool
 	listRepeatContinuationToken bool
 	listErr                     error
+	listNilOutput               bool
 	listModTime                 time.Time
 	listPrefixes                []string
 	deletes                     []string
@@ -795,6 +796,9 @@ func (c *fakeS3Client) ListObjectsV2(
 	if c.listErr != nil {
 		return nil, c.listErr
 	}
+	if c.listNilOutput {
+		return nil, nil
+	}
 
 	bucketPrefix := aws.ToString(input.Bucket) + "/"
 	wantPrefix := aws.ToString(input.Prefix)
@@ -1040,6 +1044,18 @@ func TestS3StoreListObjectsRejectsNonAdvancingContinuationToken(t *testing.T) {
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrIntegrity))
 	require.Nil(t, refs, "a non-advancing token must fail closed")
+}
+
+func TestS3StoreListObjectsFailsClosedOnNilPage(t *testing.T) {
+	t.Parallel()
+
+	client := newFakeS3Client()
+	client.listNilOutput = true
+	store := newTestS3Store(t, client)
+
+	refs, err := store.ListObjects(context.Background(), "cluster-a/v1/payloads")
+	require.ErrorIs(t, err, ErrIntegrity)
+	require.Nil(t, refs, "a nil page must never be treated as a complete empty listing")
 }
 
 func TestS3StoreListObjectsRejectsNoncanonicalKeys(t *testing.T) {
