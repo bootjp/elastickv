@@ -308,8 +308,8 @@ func validatePublishOptions(opts PublishOptions) error {
 		return errors.Wrap(ErrInvalidOptions, "object store is required")
 	case stringsTrim(opts.DataDir) == "":
 		return errors.Wrap(ErrInvalidOptions, "data dir is required")
-	case opts.GroupID == 0 && stringsTrim(opts.SourceCluster) == "":
-		return errors.Wrap(ErrInvalidOptions, "source cluster is required for group 0 manifests")
+	case stringsTrim(opts.SourceCluster) == "":
+		return errors.Wrap(ErrInvalidOptions, "source cluster is required")
 	default:
 		return nil
 	}

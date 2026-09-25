@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -292,26 +293,30 @@ func TestDecodeManifestAcceptsJointConsensusConfState(t *testing.T) {
 	require.Equal(t, manifest.ConfState, decoded.ConfState)
 }
 
-func TestPublishRejectsGroupZeroWithoutSourceClusterBeforePayload(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	payload := []byte("EKVTHLC1payload-invalid-group-zero")
-	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 18, 11, singlePeer())
-	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+func TestPublishRejectsEveryGroupWithoutSourceClusterBeforePayload(t *testing.T) {
+	for _, groupID := range []uint64{0, 7} {
+		t.Run(fmt.Sprintf("group-%d", groupID), func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			payload := []byte("EKVTHLC1payload-invalid-source-cluster")
+			sourceDataDir := seedPhysicalSnapshot(t, root, payload, 18, 11, singlePeer())
+			store := newTestLocalStore(t, filepath.Join(root, "objects"))
 
-	_, err := PublishPersistedSnapshot(ctx, PublishOptions{
-		Store:   store,
-		DataDir: sourceDataDir,
-		Prefix:  "cluster-a",
-		GroupID: 0,
-	})
-	require.ErrorIs(t, err, ErrInvalidOptions)
+			_, err := PublishPersistedSnapshot(ctx, PublishOptions{
+				Store:   store,
+				DataDir: sourceDataDir,
+				Prefix:  "cluster-a",
+				GroupID: groupID,
+			})
+			require.ErrorIs(t, err, ErrInvalidOptions)
 
-	payloadKey, err := payloadKey("cluster-a", hexSHA256Bytes(payload))
-	require.NoError(t, err)
-	_, ok, err := store.HeadObject(ctx, payloadKey)
-	require.NoError(t, err)
-	require.False(t, ok)
+			payloadKey, err := payloadKey("cluster-a", hexSHA256Bytes(payload))
+			require.NoError(t, err)
+			_, ok, err := store.HeadObject(ctx, payloadKey)
+			require.NoError(t, err)
+			require.False(t, ok)
+		})
+	}
 }
 
 func TestPublishUsesDataDirLocalSpoolByDefault(t *testing.T) {

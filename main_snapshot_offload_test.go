@@ -4,6 +4,8 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"net/http"
+	"net/url"
 	"path/filepath"
 	"testing"
 
@@ -288,4 +290,40 @@ func TestRejectPlaintextOffloadEndpoint(t *testing.T) {
 			require.NoError(t, err, "endpoint %q", tc.endpoint)
 		})
 	}
+}
+
+func TestSnapshotOffloadRedirectPolicy(t *testing.T) {
+	t.Parallel()
+
+	origin, err := http.NewRequestWithContext(context.Background(), http.MethodPut,
+		"https://s3.example.com/object", nil)
+	require.NoError(t, err)
+
+	redirect := func(rawURL string, status int) *http.Request {
+		t.Helper()
+		u, parseErr := url.Parse(rawURL)
+		require.NoError(t, parseErr)
+		return &http.Request{
+			Method:   http.MethodPut,
+			URL:      u,
+			Header:   make(http.Header),
+			Response: &http.Response{StatusCode: status},
+		}
+	}
+
+	httpsRedirect := redirect("https://s3.example.com/next", http.StatusTemporaryRedirect)
+	require.NoError(t, checkSnapshotOffloadRedirect(httpsRedirect, []*http.Request{origin}))
+
+	plaintextRedirect := redirect("http://s3.example.com/next", http.StatusTemporaryRedirect)
+	require.ErrorIs(t, checkSnapshotOffloadRedirect(plaintextRedirect, []*http.Request{origin}),
+		snapshotoffload.ErrInvalidOptions)
+
+	unsupportedRedirect := redirect("https://s3.example.com/next", http.StatusFound)
+	require.ErrorIs(t, checkSnapshotOffloadRedirect(unsupportedRedirect, []*http.Request{origin}),
+		http.ErrUseLastResponse)
+
+	crossHost := redirect("https://other.example.com/next", http.StatusPermanentRedirect)
+	crossHost.Header.Set("X-Amz-Security-Token", "secret")
+	require.NoError(t, checkSnapshotOffloadRedirect(crossHost, []*http.Request{origin}))
+	require.Empty(t, crossHost.Header.Get("X-Amz-Security-Token"))
 }

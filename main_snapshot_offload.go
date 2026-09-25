@@ -4,15 +4,19 @@ import (
 	"context"
 	"flag"
 	"log/slog"
+	"net/http"
 	"net/url"
 	"strings"
 	"time"
 
+	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
+
+const snapshotOffloadMaxRedirects = 10
 
 // Physical snapshot object offload (design doc §4 / §7). Opt-in: the
 // whole subsystem stays dormant unless --snapshotOffloadBucket (S3) or
@@ -88,6 +92,37 @@ func rejectPlaintextOffloadEndpoint() error {
 	return nil
 }
 
+func snapshotOffloadHTTPClient() *http.Client {
+	if *snapshotOffloadAllowInsecureEndpoint {
+		return nil
+	}
+	return &http.Client{
+		Transport:     awshttp.NewBuildableClient().GetTransport(),
+		CheckRedirect: checkSnapshotOffloadRedirect,
+	}
+}
+
+func checkSnapshotOffloadRedirect(req *http.Request, via []*http.Request) error {
+	if req == nil || req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") {
+		return errors.Wrap(snapshotoffload.ErrInvalidOptions,
+			"snapshot offload redirect must preserve https")
+	}
+	if len(via) >= snapshotOffloadMaxRedirects {
+		return errors.New("snapshot offload stopped after 10 redirects")
+	}
+	if req.Response == nil {
+		return errors.New("snapshot offload redirect response is required")
+	}
+	if req.Response.StatusCode != http.StatusTemporaryRedirect &&
+		req.Response.StatusCode != http.StatusPermanentRedirect {
+		return http.ErrUseLastResponse
+	}
+	if len(via) > 0 && via[len(via)-1].URL.Host != req.URL.Host {
+		req.Header.Del("X-Amz-Security-Token")
+	}
+	return nil
+}
+
 // snapshotOffloadEnabled reports whether the operator configured a
 // destination. Checked before any other offload flag is validated so a
 // node that never opts in cannot fail startup on offload config.
@@ -127,6 +162,7 @@ func buildSnapshotOffloadStore(ctx context.Context) (snapshotoffload.ObjectStore
 		ForcePathStyle:       *snapshotOffloadForcePathStyle,
 		ServerSideEncryption: strings.TrimSpace(*snapshotOffloadSSE),
 		SSEKMSKeyID:          strings.TrimSpace(*snapshotOffloadSSEKMSKeyID),
+		HTTPClient:           snapshotOffloadHTTPClient(),
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "snapshot offload: s3 store")

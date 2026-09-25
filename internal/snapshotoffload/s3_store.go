@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -21,7 +22,7 @@ import (
 
 const (
 	s3MetadataSHA256          = "elastickv-sha256"
-	s3LoadConfigOptionCapHint = 4
+	s3LoadConfigOptionCapHint = 5
 	s3ConditionalWriteRetries = 3
 	s3MaxSinglePutBytes       = int64(5 * 1024 * 1024 * 1024)
 	s3DefaultMultipartPart    = int64(64 * 1024 * 1024)
@@ -54,6 +55,7 @@ type S3StoreConfig struct {
 	ServerSideEncryption   string
 	SSEKMSKeyID            string
 	DisableChecksumHeaders bool
+	HTTPClient             *http.Client
 }
 
 type S3Store struct {
@@ -104,6 +106,9 @@ func loadS3AWSConfig(ctx context.Context, cfg S3StoreConfig) (aws.Config, error)
 	}
 	if stringsTrim(cfg.Profile) != "" {
 		optFns = append(optFns, config.WithSharedConfigProfile(stringsTrim(cfg.Profile)))
+	}
+	if cfg.HTTPClient != nil {
+		optFns = append(optFns, config.WithHTTPClient(cfg.HTTPClient))
 	}
 	if stringsTrim(cfg.AccessKeyID) != "" || stringsTrim(cfg.SecretAccessKey) != "" || stringsTrim(cfg.SessionToken) != "" {
 		if stringsTrim(cfg.AccessKeyID) == "" || stringsTrim(cfg.SecretAccessKey) == "" {

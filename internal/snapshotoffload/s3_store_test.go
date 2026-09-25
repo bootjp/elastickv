@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -51,6 +52,18 @@ func TestPublishAndRestorePhysicalSnapshotRoundTripWithS3Store(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, manifest.Payload.SHA256, result.PayloadSHA256)
+}
+
+func TestLoadS3AWSConfigUsesConfiguredHTTPClient(t *testing.T) {
+	client := &http.Client{}
+	awsCfg, err := loadS3AWSConfig(context.Background(), S3StoreConfig{
+		Region:          "us-east-1",
+		AccessKeyID:     "test-access-key",
+		SecretAccessKey: "test-secret-key",
+		HTTPClient:      client,
+	})
+	require.NoError(t, err)
+	require.Same(t, client, awsCfg.HTTPClient)
 }
 
 func TestS3StorePutHeadGetPreservesIntegrityMetadata(t *testing.T) {
