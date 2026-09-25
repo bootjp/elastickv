@@ -252,10 +252,13 @@ key; writers to a read-locked key abort and retry instead of racing.
 
 ### A3. TLA+
 
-Status: the G0 half is done on branch `design/serializable-audit-a3`
-(commit `e11e3dd1`, not pushed); the G1 half is open.
+Status: both halves are done on local branches (not pushed):
+`design/serializable-audit-a3` (commit `e11e3dd1`, the G0 half) and
+`design/serializable-audit-a3-g1` (commit `f0ba0cbf`, the G1 half, on top
+of it). What remains is documentation and two modelling limits listed
+below.
 
-Landed on that branch, in `tla/occ/OCC.tla` and its configs:
+Landed, in `tla/occ/OCC.tla` and its configs:
 
 - `Commit(t)` is split into `Allocate(t)` (fresh timestamp, state
   `Proposed`, no version written), `Apply(t)` (versions written, watermark
@@ -263,33 +266,46 @@ Landed on that branch, in `tla/occ/OCC.tla` and its configs:
   reorderings), and `AbortProposed(t)` (the FSM rejects the entry).
   `BeginTxn` takes `startTs = watermark`, as `snapshotTS` does; reads are
   recorded in a `readSet` so "read nothing" is distinct from "not read".
-- Constant `ApplyFence`: when true, `Apply(t)` requires
-  `commitTs[t] > watermark`, otherwise `AbortProposed(t)` fires. This is the
-  A0 fence.
-- `OCC6_SnapshotStableAtWatermark`: what a read at snapshot `s` returned is
-  still what is visible at `(k, s)`. `OCC7_NoLostUpdate`: a committed writer
-  of `k` saw every version of `k` it overwrote.
-- `MCOCC.cfg` (3 transactions, fence on) passes OCC1 to OCC7 over 66,149
-  distinct states with every action, including `AbortProposed`, exercised.
-  `MCOCC_gap_applyorder.cfg` (fence off) fails `OCC6` at depth 11 with the
-  same schedule as `kv/apply_order_repro_test.go`: t1 allocates 1, t2
-  allocates 2 and applies, t3 reads `k1` at snapshot 2 and sees nothing, t1
-  applies at 1. With `OCC6` removed the same config fails `OCC7` at depth 14
-  (t3 overwrites `k1` without having seen t1's version). Wired into
-  `scripts/tla-check.sh`; `make tla-check` passes in about 22 seconds.
+- Constant `ApplyFence` (the A0 fence): `Apply(t)` requires
+  `commitTs[t] > watermark`, otherwise `AbortProposed(t)` fires.
+- Read-set validation, `ReadConflictFree(t)`: every read key has no version
+  newer than `startTs[t]`, checked by the one-phase `Apply` and by the 2PC
+  `Prepare` (once, never again at the 2PC `Apply`), exactly as
+  `checkConflictsLocked` and `handlePrepareRequest` do. Before this was
+  added the model was plain snapshot isolation: `OCC8` failed on it with two
+  one-phase transactions crossing two keys.
+- Constant `ReadLocks` (the A2 read locks): `Prepare(t)` adds `t` to a
+  shared `readLocks[k]` for each read key; a writer's `Prepare` is disabled
+  and a one-phase `Apply` is rejected while a foreign read lock sits on one
+  of its write keys; `Apply`, `Abort`, and `AbortProposed` release them;
+  readers are never blocked.
+- Invariants `OCC6_SnapshotStableAtWatermark` (what a read at snapshot `s`
+  returned is still what is visible at `(k, s)`), `OCC7_NoLostUpdate` (a
+  committed writer saw every version it overwrote), and `OCC8_NoWriteSkew`
+  (no two committed transactions each read a key the other wrote without
+  seeing the other's write; two-transaction cycles only).
+- Results, `make tla-check` in about 23 seconds: `MCOCC.cfg` (3
+  transactions, `MaxOps = 4`, all guards on) passes OCC1 to OCC8 over
+  124,064 distinct states with every guard exercised (canary invariants
+  confirmed each rejection path is reachable). `MCOCC_gap_applyorder.cfg`
+  (fence off) fails `OCC6` at depth 11 with the same schedule as
+  `kv/apply_order_repro_test.go`, and fails `OCC7` at depth 14 when `OCC6` is
+  removed. `MCOCC_gap_readlocks.cfg` (read locks off) fails `OCC8` at depth
+  12 with the G1 schedule: W prepares (lock on `k`), T allocates and applies
+  (its write key `k1` has no lock; its read key carries W's lock but no
+  version), W allocates and applies without re-checking its read key. Both
+  gap configs are wired into `scripts/tla-check.sh`.
 
-Open, for the A2 half:
+Modelling limits, recorded so nobody over-reads the result:
 
-- Model read-key validation and the read lock at `Prepare`: today the model
-  validates write keys only at `Apply`, mirroring `validateConflicts`, and
-  allocates the 2PC commit timestamp after `Prepare` (the A0 ordering), so
-  it can neither express G1 nor today's allocate-before-PREPARE.
-- `OCC8_NoWriteSkew`: for any two committed transactions `t1`, `t2` with
-  `t1` reading a key `t2` writes and `t2` reading a key `t1` writes, at least
-  one saw the other's write (no cycle of two rw anti-dependencies), with a
-  gap configuration that removes the read lock and must fail it.
-- Update `2026_05_28_implemented_tla_safety_spec.md`, which still lists
-  OCC-1 to OCC-5 and one gap config.
+- One store and one atomic `Prepare` stand for all shards; the read-only
+  shard path (`validateReadOnlyShards`) and lock-only PREPAREs are not
+  modelled separately, and `Prepare` still requires a non-empty write set.
+- The 2PC commit timestamp is allocated after `Prepare` (the A0 ordering);
+  today's allocate-before-PREPARE is not modelled. G1 does not depend on it.
+- `OCC8` checks two-transaction cycles only.
+- `2026_05_28_implemented_tla_safety_spec.md` still lists OCC-1 to OCC-5 and
+  one gap configuration; it is refreshed in the A3 PR.
 
 ### A4. Jepsen write-skew workloads
 
