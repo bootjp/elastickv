@@ -50,7 +50,7 @@ week, no deadline; the plan below is sized for that.
 | Dimension | FoundationDB | TiKV | DynamoDB | Bigtable | elastickv |
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
-| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic and serializable across keys and shards (OCC read-set validation at FSM apply); per-key linearizable |
+| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic across keys and shards (2PC with OCC validation of write and read sets at FSM apply); serializable is the target pending the audit's A0 to A2 (§6.3); per-key linearizable |
 | Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
@@ -78,7 +78,8 @@ README will present scope in two tiers instead of a non-goals section.
   OCC validation of write and read sets at apply. **Serializable is the
   target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
-  that 2PC read keys are unprotected between PREPARE and COMMIT (G1). README
+  that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
+  have failing tests on `main`. README
   makes the serializable claim only after the audit's A0 to A2 fixes land
   (§6.1). Leader reads via ReadIndex or leader lease; no follower reads.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
@@ -257,8 +258,8 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
   write-up (parallel) → showcase → feature track.
 - Spec of record is `docs/design/`; no ADRs; decisions live in design docs
   (this section is the pattern); repository artifacts are English.
-- The audit's A2 analysis found gaps G0 and G1 on `main`, and G0 is
-  reproduced by a failing test; the serializable claim is the target and is
+- The audit's A2 analysis found gaps G0 and G1 on `main`, and both are
+  reproduced by failing tests; the serializable claim is the target and is
   not made for any path until A0 to A2 land.
 
 Assumptions made while reconciling with `main` (not put to the interview):

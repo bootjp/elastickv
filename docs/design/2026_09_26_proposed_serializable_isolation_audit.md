@@ -124,7 +124,7 @@ Facts checked on `main` at `4ca7e90d`.
 | ID | Gap | Consequence if left open |
 |---|---|---|
 | G0 | **Apply order is not commit-timestamp order.** Commit timestamps are allocated before proposal with no lock to the proposal, so two writers can propose in the opposite order of their timestamps; the apply path never rejects an entry whose `commitTS` is at or below the watermark; reads take the watermark as their snapshot. Affects RAW, one-phase, and 2PC on every adapter. **Reproduced**: `TestApplyOrder_SnapshotAtWatermarkIsStableUnderProposalReordering` in `kv/apply_order_repro_test.go` (branch `design/serializable-audit-a0`) fails on `main` in 10 of 10 runs under `-race`, using a parking proposer that holds one proposal while a later-timestamped one applies; a read at the watermark returns nothing, then returns the parked write after it applies. | Writer W1 allocates `c1`, W2 allocates `c2 > c1`, W2 proposes and applies first, the watermark becomes `c2`; T reads key `k` at `s = c2` and misses W1's version; W1 applies at `c1 < s`; T's validation (`TS > s`) sees nothing. If T also writes `k`, W1's write is lost; if T read `k` and `j` from W1 across W1's apply, T saw a torn snapshot. This is the same hazard the backup floor closes for backups. |
-| G1 | 2PC read keys are unprotected between PREPARE and COMMIT on every shard: write shards validate them once at PREPARE apply, locks cover write keys only, and COMMIT does not re-validate; read-only shards are additionally validated outside the apply lock with read keys in no Raft entry | T reads `k` and writes `x` (one-phase); W reads `x` and writes `k` (2PC). W's PREPARE validates `x` before T applies; T applies (no committed version of `k` from W exists yet, and W's lock on `k` is not checked against T's read keys); W's COMMIT applies without re-validation. Both commit: write skew. On read-only shards the same window exists plus the barrier-to-check gap. |
+| G1 | 2PC read keys are unprotected between PREPARE and COMMIT on every shard: write shards validate them once at PREPARE apply, locks cover write keys only, and COMMIT does not re-validate; read-only shards are additionally validated outside the apply lock with read keys in no Raft entry | T reads `k` and writes `x` (one-phase); W reads `x` and writes `k` (2PC). W's PREPARE validates `x` before T applies; T applies (no committed version of `k` from W exists yet, and W's lock on `k` is not checked against T's read keys); W's COMMIT applies without re-validation. Both commit: write skew. On read-only shards the same window exists plus the barrier-to-check gap. **Reproduced**: `TestTwoPhaseCommit_ReadKeysUnprotectedBetweenPrepareAndCommit` in `kv/txn_read_key_window_repro_test.go` (branch `design/serializable-audit-a0`) drives exactly this interleaving on a two-group harness and fails on `main` in 3 of 3 runs under `-race`: T's one-phase entry applies after W's PREPAREs and before W's parked primary COMMIT, both dispatches return committed, and the final state is `k="w"`, `x="t"`. |
 | G2 | S3 handlers do not surface reads. Read-then-write sites (function names in `adapter/s3.go`, `s3_admin.go`, `s3_admin_objects.go`): `createBucket`, `deleteBucket`, `putBucketAcl`, `putObject`, `deleteObject`, `createMultipartUpload`, `uploadPart` (partly covered), `completeMultipartUpload`, `abortMultipartUpload`, and the admin equivalents. `If-Match` / `If-None-Match` are checked pre-Raft only (`validateS3PutPreconditions`). | Concrete anomaly: `deleteBucket` scans for emptiness at `readTS` while a concurrent `putObject` reads the bucket meta at its own `readTS`; both commit, leaving an object in a deleted bucket. Object-level races are mostly covered because the object head / manifest key is in the write set. |
 | G3 | Lua scripts record no read key for string values | A script that reads string `a` and writes string `b`, racing with one that reads `b` and writes `a`, can produce write skew. |
 | G4 | SQS fence-key coverage is asserted per call site, not audited as a table | Unknown; needs the same table as G2. |
@@ -189,7 +189,8 @@ drives the two-transaction interleaving through the coordinator and asserts
 
 ### A2. Read locks at PREPARE (G1)
 
-Analysis outcome: PREPARE-time validation is **not** sufficient. Between
+Analysis outcome, confirmed by the reproduction test: PREPARE-time
+validation is **not** sufficient. Between
 PREPARE apply and COMMIT apply nothing protects a 2PC transaction's read
 keys, on write shards or read-only shards, and re-validating at COMMIT apply
 would not close it either, because the commit point cannot be atomic across
@@ -199,10 +200,11 @@ PREPARE installs a **read lock** record for every read key on that shard
 and shared rather than exclusive), and a writer's apply-time
 `assertNoConflictingTxnLock` treats a foreign read lock like a foreign write
 lock. COMMIT, ABORT, and the `LockResolver` clear read locks exactly as they
-clear write locks. Read-only shards receive a PREPARE with an empty mutation
-list and only read locks, which replaces `validateReadOnlyShards` and the
-earlier idea of a separate `TXN_READ_VALIDATE` phase with a path that
-already exists. Cost: one Raft entry per read-only shard per multi-shard
+clear write locks. `handlePrepareRequest` is extended to accept a lock-only PREPARE (today it
+rejects an empty mutation list with `ErrInvalidRequest`) and to create read
+locks from `ReadKeys`; read-only shards then receive a PREPARE with an empty
+mutation list and only read locks, which replaces `validateReadOnlyShards`
+and the earlier idea of a separate `TXN_READ_VALIDATE` phase. Cost: one Raft entry per read-only shard per multi-shard
 transaction (already paid by write shards) and one more lock row per read
 key; writers to a read-locked key abort and retry instead of racing.
 
@@ -267,7 +269,8 @@ proves larger than expected.
 ## 5. Evidence when complete
 
 - The A0 reproduction test is red before the fence and green after; the
-  same PR carries both.
+  same PR carries both. The G1 reproduction test is red before the read
+  locks and green after; the A2 PR carries it.
 - The coverage table has no row protected by "nothing".
 - `go test -race ./kv/... ./adapter/... ./store/...` includes the new
   interleaving tests.

@@ -155,8 +155,9 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
 - **OCC (optimistic concurrency control)** — Commit-time validation of a
   transaction's write set and read set against `StartTS` (see *write
   conflict*); reads take no locks while the transaction runs. Multi-shard
-  commits do write per-key transaction locks and intents at PREPARE, held
-  until COMMIT, ABORT, or the LockResolver resolves them. The acronym is used
+  commits do write per-key transaction locks and intents for their write
+  keys only at PREPARE, held until COMMIT, ABORT, or the LockResolver
+  resolves them; read keys get no lock. The acronym is used
   throughout the code and TLA+ modules without expansion. (`kv/fsm.go`,
   `kv/lock_resolver.go`)
 - **one-phase transaction** — A single-shard transaction applied by one Raft
