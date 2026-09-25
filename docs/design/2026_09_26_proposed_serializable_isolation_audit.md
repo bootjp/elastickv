@@ -199,6 +199,32 @@ code at fix time and turns the `N` rows into fixes:
 - gRPC: none in this audit; the API gap (G8) is documented in the positioning
   doc and README.
 
+Status of the Redis half: landed on branch `design/serializable-audit-a1-redis`
+(commits `19c7cffa` "surface Lua string reads as OCC read keys" and
+`0a044364` "bump collection fences on emptying paths"; not pushed), on top
+of the reproduction tests. `stringState` records the string key and the bare
+key on first load; `EXISTS` / `TYPE` / `PTTL` go through a `probedKeyType`
+that records the string, HLL, and bare keys for a string and every type
+anchor plus the four wide fences for an absent key; `deleteListElems` and
+the hash / set / zset logical-delete helpers `Put` their type's fence, and
+`deleteLogicalKeyElems` `Put`s all four. Both reproduction tests pass (the
+first attempt now fails with a write conflict and the retry sees the
+concurrent write), two table-driven tests pin the read sets and fence
+`Put`s, `go test -race ./adapter/` is green, lint is clean. Decisions for the
+fix PR: three call sites in `redis_txn.go` and `redis_collection_ttl.go`
+now carry duplicate fence `Put`s (the FSM's `uniqueMutations` drops them;
+removing the appends restores the old entry size); every logical delete,
+including `DEL` of a string or a missing key, now writes four fences; the
+TTL-inline migrator's expired-collection delete now conflicts with a
+concurrent push and retries on its next pass; an absent-key probe adds 13
+read keys and a `GET` adds 2, so a script with roughly 770 absent probes
+hits `kv.maxReadKeys` and fails closed. Still open in Redis after this
+change: a `GET` that finds the key absent records no collection fences (a
+concurrent `HSET` creating it is undetected, which matters only in a
+two-script cycle), `SET NX` / `SET XX` / `SETNX` check existence through
+`logicalExists`, which records nothing, and probes that resolve to a
+collection type record nothing.
+
 Each fix lands with a failing test first (per `CLAUDE.md`): a unit test that
 drives the two-transaction interleaving through the coordinator and asserts
 `ErrWriteConflict`.
