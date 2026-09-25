@@ -125,9 +125,12 @@ Facts checked on `main` at `4ca7e90d`.
 |---|---|---|
 | G0 | **Apply order is not commit-timestamp order.** Commit timestamps are allocated before proposal with no lock to the proposal, so two writers can propose in the opposite order of their timestamps; the apply path never rejects an entry whose `commitTS` is at or below the watermark; reads take the watermark as their snapshot. Affects RAW, one-phase, and 2PC on every adapter. **Reproduced**: `TestApplyOrder_SnapshotAtWatermarkIsStableUnderProposalReordering` in `kv/apply_order_repro_test.go` (branch `design/serializable-audit-a0`) fails on `main` in 10 of 10 runs under `-race`, using a parking proposer that holds one proposal while a later-timestamped one applies; a read at the watermark returns nothing, then returns the parked write after it applies. | Writer W1 allocates `c1`, W2 allocates `c2 > c1`, W2 proposes and applies first, the watermark becomes `c2`; T reads key `k` at `s = c2` and misses W1's version; W1 applies at `c1 < s`; T's validation (`TS > s`) sees nothing. If T also writes `k`, W1's write is lost; if T read `k` and `j` from W1 across W1's apply, T saw a torn snapshot. This is the same hazard the backup floor closes for backups. |
 | G1 | 2PC read keys are unprotected between PREPARE and COMMIT on every shard: write shards validate them once at PREPARE apply, locks cover write keys only, and COMMIT does not re-validate; read-only shards are additionally validated outside the apply lock with read keys in no Raft entry | T reads `k` and writes `x` (one-phase); W reads `x` and writes `k` (2PC). W's PREPARE validates `x` before T applies; T applies (no committed version of `k` from W exists yet, and W's lock on `k` is not checked against T's read keys); W's COMMIT applies without re-validation. Both commit: write skew. On read-only shards the same window exists plus the barrier-to-check gap. **Reproduced**: `TestTwoPhaseCommit_ReadKeysUnprotectedBetweenPrepareAndCommit` in `kv/txn_read_key_window_repro_test.go` (branch `design/serializable-audit-a0`) drives exactly this interleaving on a two-group harness and fails on `main` in 3 of 3 runs under `-race`: T's one-phase entry applies after W's PREPAREs and before W's parked primary COMMIT, both dispatches return committed, and the final state is `k="w"`, `x="t"`. |
-| G2 | S3 handlers do not surface reads. Read-then-write sites (function names in `adapter/s3.go`, `s3_admin.go`, `s3_admin_objects.go`): `createBucket`, `deleteBucket`, `putBucketAcl`, `putObject`, `deleteObject`, `createMultipartUpload`, `uploadPart` (partly covered), `completeMultipartUpload`, `abortMultipartUpload`, and the admin equivalents. `If-Match` / `If-None-Match` are checked pre-Raft only (`validateS3PutPreconditions`). | Concrete anomaly: `deleteBucket` scans for emptiness at `readTS` while a concurrent `putObject` reads the bucket meta at its own `readTS`; both commit, leaving an object in a deleted bucket. Object-level races are mostly covered because the object head / manifest key is in the write set. |
-| G3 | Lua scripts record no read key for string values | A script that reads string `a` and writes string `b`, racing with one that reads `b` and writes `a`, can produce write skew. |
-| G4 | SQS fence-key coverage is asserted per call site, not audited as a table | Unknown; needs the same table as G2. |
+| G2 | S3 handlers rely on the write set alone (no `ReadKeys` except the upload-part meta key). Most paths are covered because the key they read is also the key they write, and object writers `Put` the bucket meta as a fence that `deleteBucket` deletes (Appendix A). The uncovered reads: `completeMultipartUpload` uses the part descriptors it loaded at its first `readTS` and never re-reads them at the commit snapshot; `uploadPart` reads the previous part at an older `readTS` than its `StartTS` and reads the bucket meta with no protection. `If-Match` / `If-None-Match` are checked pre-Raft only (`validateS3PutPreconditions`), on the head key that the write set covers. | `completeMultipartUpload` racing a re-upload of one part commits a manifest pointing at the superseded part version whose blobs the re-upload deletes asynchronously: an object with deleted chunks. `uploadPart` after a concurrent `deleteBucket` lands parts under a dead generation (leak); two uploads of the same part in the window leak blobs and double-clean the stale one. |
+| G3 | Lua scripts record read keys only for stream reads and for the keys they write (fences); reads of any other key (`GET`, `HGET`, `LRANGE`, `SMEMBERS`, `ZRANGE`, …) are not surfaced (`adapter/redis_lua_context.go`) | `v = GET a; SET b v` commits over a concurrent `SET a`; two such scripts crossing `a` and `b` produce write skew. |
+| G4 | SQS: audited (Appendix A). Every message and catalog path carries the keys it reads plus the queue meta and generation keys. Two benign `N` rows remain: the DLQ existence check at `CreateQueue` / `SetQueueAttributes` (a policy can point at a deleted DLQ; redrive re-checks) and the reaper on the old-generation keyspace. | None beyond the two benign rows; closed by documentation. |
+| G7 | Redis paths that bypass the collection fences (Appendix A): the emptying paths through `deleteLogicalKeyElems` (standalone `DEL`, `GETDEL`, `EXPIRE ≤ 0`, `LTRIM` to empty, a zset / set / HLL emptied to zero) neither read nor bump a fence; `HDEL` and update-only `HSET` do not bump the hash fence; `SETNX` and the legacy (dedup-off) `SET` / `INCR` / `HSET` creates read the key type with no fence; `MULTI` type probes for `GET` / `EXISTS` / `EXPIRE` on an absent key record no fence. | `DEL k` racing `RPUSH k v` where the push commits after `DEL`'s snapshot: `DEL` removes the base meta and the items it saw, the push's item and delta survive, the list has a hole. `SETNX k` racing `RPUSH k`: both commit, a string and a list coexist under one key. `MULTI { EXISTS k; SET a 1 }` misses a concurrent create of `k`. |
+| G8 | gRPC `TransactionalKV` has no transaction surface: there is no `Begin`, `PreWrite` / `Commit` / `Rollback` return not-implemented, and every `Put` / `Delete` is a single-key transaction with a coordinator-assigned `StartTS` and no read set (`adapter/grpc.go`, `adapter/grpc_transcoder.go`). | A gRPC client's `Get` followed by `Put` can lose an update; multi-key serializable transactions are reachable today only through Redis `MULTI`, DynamoDB `TransactWriteItems`, SQS, and the filesystem. An API gap rather than a validation bug; documented as such and out of this audit's scope. |
+| G9 | DynamoDB `finalizeLegacyTableMigration` writes `TableMeta` from an earlier snapshot under a process-local lock only; table-generation checks for item writes are compensated after commit rather than validated at apply (`adapter/dynamodb_migration.go`, `adapter/dynamodb_transact.go`). | A stale schema can overwrite a concurrent schema change during legacy migration; low likelihood, migration-only. |
 | G5 | `tla/occ/OCC.tla` models SI | The model cannot catch a regression that removes read-set validation. |
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
 
@@ -168,10 +171,9 @@ allocator to concurrent coordinators, so it is at most a complement.
 
 ### A1. Coverage table and adapter fixes
 
-Deliverable: a table in this doc (promoted to `partial` when it lands) with
-one row per read-then-write operation per adapter: keys read, keys written,
-whether the read is protected by the write set, by `ReadKeys`, or by nothing.
-Then:
+Deliverable: the coverage matrix. Its initial version, produced by code
+reading on 2026-09-26, is Appendix A; A1 re-verifies every row against the
+code at fix time and turns the `N` rows into fixes:
 
 - S3: populate `ReadKeys` with the bucket meta key on every object and
   multipart handler, the object head / manifest key on conditional puts and
@@ -181,7 +183,17 @@ Then:
   at apply.
 - Lua: extend `luaWideFenceReadKeysForPlan` so string reads record the
   string key, capped by `kv.maxReadKeys`; scripts over the cap fail closed.
-- SQS and DynamoDB: no code change expected; the table is the deliverable.
+- Redis: bump the collection fence on every emptying path
+  (`deleteLogicalKeyElems` callers, `HDEL`, update-only `HSET`) and read the
+  fence keys in `SETNX`, the legacy creates, and the `MULTI` type probes for
+  absent keys (G7).
+- S3: re-read the part descriptors at the commit snapshot in
+  `completeMultipartUpload` and surface the bucket meta and previous part in
+  `uploadPart` (G2, in addition to the bucket-meta read keys above).
+- SQS: no code change; the matrix is the deliverable (G4). DynamoDB: none
+  except the migration finaliser (G9), which gets a read key on the schema.
+- gRPC: none in this audit; the API gap (G8) is documented in the positioning
+  doc and README.
 
 Each fix lands with a failing test first (per `CLAUDE.md`): a unit test that
 drives the two-transaction interleaving through the coordinator and asserts
@@ -240,9 +252,11 @@ anti-dependencies are not accompanied by write-write edges:
   regression evidence.
 - DynamoDB: `TransactGetItems` for the reads, then `TransactWriteItems` with a
   `ConditionCheck` on each read item and a `Put` on the written item.
-- gRPC TransactionalKV: there is no Jepsen client for gRPC today. Options are
-  a Clojure gRPC client in `jepsen/` or a Go concurrency test in `kv/` that
-  drives the same interleavings; see open question 2.
+- gRPC: `TransactionalKV` cannot express a read set (G8), so no client-side
+  workload can drive write skew through it. The engine-level evidence for the
+  gRPC-facing path is the Go reproduction tests already on
+  `design/serializable-audit-a0`, extended into the `kv/` interleaving tests
+  of A0 and A2.
 - Multi-shard variant for each: keys spread across at least two Raft groups so
   G1's path is exercised (Jepsen M5 already runs multi-group locally).
 
@@ -312,11 +326,120 @@ proves larger than expected.
 1. Whether the A0 reproduction can be driven by scheduling alone or needs a
    test-only delay hook between allocation and proposal; the hook is
    acceptable if it never ships in the binary.
-2. gRPC write-skew evidence: Clojure gRPC client in `jepsen/` or a Go
-   concurrency test. The former matches "Jepsen for every adapter"; the latter
-   is a day of work instead of a week.
+2. Whether to add a read-set-bearing transaction API to gRPC
+   `TransactionalKV` (`Begin` / `Get` / `Commit`) so the surface can carry
+   serializable multi-key transactions at all (G8). Out of this audit; a
+   separate proposal if wanted.
 3. Whether `deleteBucket` should take a bucket generation read key
    (cheap, coarse) or a range fence (precise, new mechanism).
 4. Read-lock representation: a separate key prefix or a flag on the existing
    lock record; readers of a read-locked key must not wait (read locks block
    writers only).
+
+## Appendix A. Read-then-write coverage matrix (initial, 2026-09-26)
+
+Produced by code reading on `main` at `4ca7e90d`; every row is re-verified
+during A1. Protection means what stops a concurrent writer from invalidating
+the read at FSM apply: **W** the key read is also written, so the write-write
+check (`latest > StartTS`) catches it; **R** the key is in `ReadKeys`;
+**F** a fence key that every conflicting writer also writes is in `ReadKeys`
+or the write set; **N** nothing. `StartTS` is the snapshot the handler read
+at unless noted. A read key on a shard that receives no mutations is checked
+once at prewrite and not again (G1).
+
+| Adapter | Operation (handler) | Keys read | Keys written | `ReadKeys` | Protection | Notes |
+|---|---|---|---|---|---|---|
+| S3 | `createBucket` (`s3.go`), `AdminCreateBucket` (`s3_admin.go`) | bucket meta (absent), generation | bucket meta, generation | none | W | |
+| S3 | `deleteBucket`, `AdminDeleteBucket` | bucket meta | bucket meta (Del), then non-txn prefix delete | none | W | |
+| S3 | `deleteBucket` emptiness scan | object manifests (limit 1) | none | none | F via W | every manifest writer `Put`s the bucket meta as a fence (`s3_put_object.go`, `s3_multipart_complete.go`, `s3_admin_objects.go`); uploads and parts are not scanned |
+| S3 | `putBucketAcl`, `AdminPutBucketAcl` | bucket meta | bucket meta | none | W | |
+| S3 | `putObject` incl. `If-Match` / `If-None-Match` (`s3_put_object.go`, `validateS3PutPreconditions`) | bucket meta, head manifest | chunk refs, bucket meta (fence), head | none | W | `StartTS` is the prepare `readTS`, held across the body upload; `AdminPutObject` flushes chunks non-txn first |
+| S3 | `deleteObject`, `AdminDeleteObject` | bucket meta, head | head (Del; no write if absent) | none | head W; bucket meta N (benign) | |
+| S3 | `createMultipartUpload` | bucket meta | bucket meta (fence), upload meta, GC upload | none | W | |
+| S3 | `uploadPart` (`s3_upload_part.go`): upload meta | upload meta, re-read at a fresh `readTS` | part key, chunk refs | upload meta | R | conflicts with abort / complete, which delete the upload meta |
+| S3 | `uploadPart`: bucket meta | bucket meta | none | none | **N** | after a concurrent `deleteBucket` the part and chunks land under a dead generation (leak) |
+| S3 | `uploadPart`: previous part | part key at the prepare `readTS`, older than `StartTS` | part key | none | **N** (window) | a same-part upload committing in the window is unseen; its blobs are never cleaned and the stale one is cleaned twice |
+| S3 | `completeMultipartUpload` (`s3_multipart_complete.go`): meta / upload | bucket meta, generation, upload meta, head, all re-read at the second `readTS` | bucket meta, head, upload meta (Del), GC upload | none | W | |
+| S3 | `completeMultipartUpload`: parts | part descriptors at the first `readTS` | none | none | **N** | never re-read at the commit snapshot; a later `uploadPart` is allowed (upload meta unchanged) and the manifest points at superseded part versions whose blobs are deleted asynchronously |
+| S3 | `abortMultipartUpload` | bucket meta, upload meta | upload meta (Del), GC upload | none | upload meta W; bucket meta N (benign) | |
+| S3 | chunk blob push / backfill (`s3_blob_fetch.go`) | blob key latest commit | local Put | none | W (local store) | content-addressed |
+| S3 | async cleanup | prefix scans | non-txn Del | none | N | garbage only |
+| DynamoDB | `PutItem` / `UpdateItem` / `DeleteItem` with or without `ConditionExpression`, `BatchWriteItem`, admin item writes (`dynamodb_item_write.go`, `dynamodb_transact.go`) | target item; old GSI entries derived from it | target (Put / Del), stale GSI keys (Del), new GSI keys (Put) | none | W | `DeleteItem` on a missing item writes nothing |
+| DynamoDB | same, legacy migration source key (`dynamodb_item_read.go`) | legacy source when target absent | source (Del) if found | none | W if found, N if absent | the only other writer `Put`s the target, caught by W there |
+| DynamoDB | same plus `TransactWriteItems`: table schema | table meta / generation | none | none | N at apply | compensated after commit: `verifyTableGeneration` + `cleanupCommittedKeys` + retry |
+| DynamoDB | `TransactWriteItems` Put / Update / Delete on an existing item | item | as above | item key | W + R | |
+| DynamoDB | `TransactWriteItems` Delete or `ConditionCheck` on a missing item | item (absent) | none | item key | R | validated only if another element writes; an all-no-op transaction returns without dispatch |
+| DynamoDB | `ConditionCheck` on an existing item | item | same value re-put | item key | W + R | |
+| DynamoDB | `CreateTable` (`dynamodb_schema.go`) | table meta (absent), generation | both | none | W | |
+| DynamoDB | `DeleteTable` | table meta | table meta (Del); async item prefix delete | none | W | |
+| DynamoDB | legacy migration start / item (`dynamodb_migration.go`) | meta + generation; target + source | meta + generation; target (Put), source (Del) | none | W | "target exists → Del source only" reads the target unprotected (benign) |
+| DynamoDB | `finalizeLegacyTableMigration` | schema from an earlier snapshot; source-generation emptiness | table meta with a fresh `StartTS` | none | **N** | only a process-local lock; G9 |
+| Redis | `MULTI` type probe (`stagedKeyType`, `redis_txn.go`) | raw key type: string / HLL / bare, list meta + deltas, wide hash / set / zset prefixes, legacy blobs, stream meta | none | list meta, legacy blobs, stream meta, HLL, string, bare; **no fences, no wide or delta prefixes** | R partial → **N** for `GET` / `EXISTS` / `EXPIRE` on an absent key | `MULTI { EXISTS k; SET a 1 }` misses a concurrent `RPUSH` / `HSET` / `SADD` / `ZADD` creating `k`; commands that write `k` add fences |
+| Redis | `MULTI SET [NX|XX|GET]`, standalone `SET` (dedup path, default) | type; string + bare | logical delete, 4 fences, string, TTL | anchors + 4 fences | R + W + F | |
+| Redis | `MULTI INCR`, standalone `INCR` (dedup) | type, string + bare, TTL | string / TTL | anchors (+ 4 fences if absent) | R + W | |
+| Redis | `MULTI HSET` / `HMSET`, standalone (dedup) | type, hash fence, fields written | fields; fence + delta only if new fields | anchors + hash fence (+ 4 fences if absent) | R / W | update-only `HSET` does not bump the fence |
+| Redis | `MULTI RPUSH` | list meta / deltas | items, list fence, delta | list fence, boundary items | R + W + F | |
+| Redis | `MULTI LRANGE` | meta, items | none | list fence + boundary items (fence only if absent) | F | subject to the fence gaps below |
+| Redis | `MULTI DEL`, `EXPIRE ≤ 0` | list / zset / hash / legacy / stream state | every scanned key (Del) + fence Puts | 4 fences, list fence / boundaries, zset fence, anchors, stream meta | R + F | |
+| Redis | `MULTI ZINCRBY` | members | member / score, fence | zset fence + legacy zset key | R + W | |
+| Redis | `MULTI EXPIRE > 0` | type, TTL, string | string; or meta + 4 fences for collections | anchors | W | |
+| Redis | `SETNX` (`redis_expire_cmds.go` → `executeSet`); legacy `SET` / `INCR` / `HSET` with `ELASTICKV_REDIS_ONEPHASE_DEDUP=0` | type, string / fields | string / TTL or fields; `SET` over a collection deletes the keys it scanned | none | W on string / field; **N** for type-absent | no fences read or written: `SETNX` racing `RPUSH` / `HSET` / `SADD` / `ZADD` on a new key lets a string and a collection coexist |
+| Redis | `GETDEL` | type, string | logical delete | none | W (string) | |
+| Redis | standalone `EXPIRE` / `PEXPIRE` | existence, TTL, type, string / HLL | string / HLL + TTL, or meta + fences | none | W; the `≤ 0` path is N (no fence) | |
+| Redis | standalone `DEL` (`redis_strings.go`, `redis_compat_helpers.go`) | anchors; scans of list items / deltas / claims, hash / set / zset members, stream entries | every key seen (Del); **no fence** | none | **N** | an `RPUSH` committing after `DEL`'s snapshot keeps its item and delta: a list with a hole. Same gap in `LTRIM` to empty, `ZREM` / `ZREMRANGE*` that empty the zset, a set or HLL emptied to zero |
+| Redis | `LPUSH` / `RPUSH` (`redis_lists.go`) | type, TTL, meta + deltas | items, list fence, delta | absent: 4 fences; else list fence + head / tail items | R + W + F | |
+| Redis | `LPOP` / `RPOP` | type, meta, items in range | claim keys, items (Del), list fence, delta | none | W (fence / claims) | |
+| Redis | `LTRIM`, non-empty result | all items | delete + rebuild (rebuild `Put`s the fence) | none | W | |
+| Redis | `HDEL` (`redis_hash_cmds.go`) | field existence | fields (Del), delta; **no fence** | none | W | neither `HDEL` nor update-only `HSET` bumps the hash fence |
+| Redis | `HINCRBY` | type, field | field; fence + delta if new | hash create read keys | R + W | |
+| Redis | `SADD` / `SREM` (`redis_set_cmds.go`) | type, members | changed members; fence + delta if the length changes | set create read keys | R + W + F | |
+| Redis | `PFADD`, HLL-kind `SADD` | kind, HLL anchor | HLL + TTL | none | W; N if type-absent | |
+| Redis | `ZADD` / `ZINCRBY` / `ZREM` / `ZREMRANGEBYRANK` / `BZPOPMIN` (`redis_zset_cmds.go`) | type, scores / ranks | member / score keys, zset fence, delta | zset create read keys or fence | R + W + F | emptying falls into the `DEL` gap |
+| Redis | `XADD` / `XTRIM` (`redis_stream_cmds.go`) | type, stream meta, trim candidates | entry + stream meta, trimmed (Del) | none | W (stream meta); N if type-absent | |
+| Redis | `EVAL` / `EVALSHA` and Lua-backed commands (`RENAME`, `LREM`, `LSET`, `RPOPLPUSH`, `ZPOPMIN`, `ZREMRANGEBYSCORE`): keys the script writes (`redis_lua_context.go`) | any | not preserving: delete + 4 fences + rewrite; preserving (list / zset deltas): own fence | 4 fences or the own-type fence | W + R + F | |
+| Redis | Lua reads of keys the script does not write | values (`GET`, `HGET`, `LRANGE`, `SMEMBERS`, `ZRANGE`, …) | none | only stream reads are tracked | **N** | `v = GET a; SET b v` commits over a concurrent `SET a` (G3) |
+| Redis | delta compactor (`redis_delta_compactor.go`) | base meta + deltas | meta; folded deltas (Del) | none | W | |
+| SQS | `CreateQueue` (`sqs_catalog.go`) | meta, generation | both | meta, generation | R + W | |
+| SQS | `CreateQueue` / `SetQueueAttributes` DLQ existence check (`sqs_redrive.go`) | DLQ meta | none | none | N (benign) | a policy can point at a deleted DLQ; redrive re-checks |
+| SQS | `DeleteQueue` | meta, generation | meta (Del), generation + 1, tombstone | meta, generation | R + W | |
+| SQS | `SetQueueAttributes`, `TagQueue` / `UntagQueue` (`sqs_tags.go`) | meta | meta | meta | R + W | |
+| SQS | `SendMessage` / `SendMessageBatch`, standard (`sqs_messages.go`, `sqs_messages_batch.go`) | meta (generation) | data, visibility, by-age | meta, generation | F | delete, purge, and set-attributes all write meta or generation |
+| SQS | FIFO send (`sqs_fifo.go`) | meta, dedup record, sequence | data, visibility, by-age, dedup, sequence | meta, generation, dedup, sequence | R + W | a dedup hit is read-only |
+| SQS | receive rotation | visibility (range scan), data, lock | visibility (Del / Put), data, lock ops | visibility, data, meta, generation (+ lock) | R + W | |
+| SQS | receive-time expiry, `DeleteMessage`, `ChangeMessageVisibility` | visibility / data (token check), lock | data / visibility / by-age (Del), or old visibility (Del) + new visibility + data | data, visibility, meta, generation (+ owned lock) | R + W | |
+| SQS | `PurgeQueue` (`sqs_purge.go`) | meta, generation | meta, generation + 1, tombstone | meta, generation | R + W | |
+| SQS | redrive to DLQ (`sqs_redrive.go`) | source visibility / data, source + DLQ meta / generation, DLQ sequence, lock | source (Del), DLQ Puts, sequence, lock (Del) | all of those | R + W | |
+| SQS | reaper record / dedup (`sqs_reaper.go`) | by-age, data, lock / dedup expiry | Dels | same keys + meta / generation | R + W | |
+| SQS | reaper orphan by-age and tombstone | data absence; prefix emptiness | by-age / tombstone (Del) | by-age / tombstone only | N (benign) | old-generation keyspace only |
+| Filesystem | `InitializeRoot`, `Create` / `Mkdir` (`internal/filesystem/service.go`) | parent inode, entry (absent), candidate inode (absent), usage | inode, home, entry, parent inode, dir version, usage, ref, intent (Del) | all keys read | R + W | `dispatchTxn` keeps `StartTS` |
+| Filesystem | `Open` | inode, ref (absent) | ref, ref fence | inode, ref, ref fence | R + W | |
+| Filesystem | `Write`, `Truncate` / `SetAttr` | inode, home, partially overwritten chunks, usage | chunks, inode, usage | inode, home, partial chunks, usage | R + W | |
+| Filesystem | unlink file | parent, entry, inode, ref scan, chunk page | entry (Del), parent, dir version, inode / home / ref fence, chunks | includes ref fence and chunk keys | R + F | `Open` `Put`s the ref fence, which covers the ref scan |
+| Filesystem | `Rmdir`, rename over a directory | child entries (emptiness scan) | child inode / home / dir version (Del) | child inode, home, dir version | F | every creator in the child `Put`s the child inode and dir version |
+| Filesystem | `Rename` | parent, old / new entries, replaced inode | entry Del / Put, parent, dir version, GC | yes | R + W | same-parent only |
+| Filesystem | release / lease reaper, orphan finalise | ref, inode, refs, chunk emptiness | ref / inode / home / ref fence (Del) | include ref fence and inode | R + F | `Write` `Put`s the inode, which covers chunk emptiness |
+| Filesystem | move / recovery (`migration.go`, `recovery.go`) | job, intent, home, inode, chunk page | Puts | explicit lists covering every read | R + W | |
+| gRPC | `TransactionalKV` `Put` / `Delete` / `Get` (`grpc.go`, `grpc_transcoder.go`) | `Get`: snapshot at the global watermark | single-key transaction with coordinator-assigned `StartTS` | never | **N** | no `Begin`; `PreWrite` / `Commit` / `Rollback` return not-implemented; a client `Get` then `Put` can lose an update (G8) |
+
+Notes:
+
+1. Not supported at the top level and therefore not rows: `APPEND`,
+   `SETRANGE`, `GETSET`, `INCRBY`, `PERSIST`, `RENAMENX`, `HSETNX`, `SPOP`,
+   `SMOVE`, `ZPOPMAX`, `XDEL`, `LMOVE`. `MULTI` accepts only `SET`, `DEL`,
+   `GET`, `EXISTS`, `INCR`, `HSET`, `HMSET`, `RPUSH`, `LRANGE`, `ZINCRBY`,
+   `EXPIRE`, `PEXPIRE`.
+2. F protection assumes every writer of a collection bumps its fence. The
+   writers that do not: the emptying paths through `deleteLogicalKeyElems`
+   (`DEL`, `GETDEL`, `EXPIRE ≤ 0`, `LTRIM` to empty, emptied zset / set),
+   `HDEL`, and `HSET` that only updates existing fields (G7).
+   `redisTxnReadFenceKeys` only chooses the read snapshot and route; those
+   are not OCC read keys.
+3. S3 relies on W alone with `StartTS = readTS` everywhere;
+   `kv/sharded_coordinator.go` acknowledges these sites supply `StartTS`
+   without `ReadKeys`.
+4. Highest-risk `N` rows, in the order A1 takes them: S3
+   `completeMultipartUpload` parts; Redis standalone `DEL` and the other
+   fence-less emptying paths; `SETNX` and legacy type-absent creates;
+   `MULTI` `GET` / `EXISTS` type probes; Lua reads of keys the script does
+   not write; DynamoDB `finalizeLegacyTableMigration`; gRPC client
+   read-modify-write (API gap, G8).

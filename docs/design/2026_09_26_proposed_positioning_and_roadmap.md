@@ -69,7 +69,9 @@ README will present scope in two tiers instead of a non-goals section.
 - Three to five voters per Raft group, optional learners, single region.
   Membership operations: learner add / promote, fresh learner join for wiped
   nodes, fenced same-ID voter replacement.
-- Protocol surfaces: gRPC RawKV / TransactionalKV, Redis, DynamoDB
+- Protocol surfaces: gRPC RawKV / TransactionalKV (single-key operations;
+  `PreWrite` / `Commit` / `Rollback` are not implemented, so multi-key
+  transactions are reached through the protocol adapters below), Redis, DynamoDB
   (13 operations incl. `Scan`, `BatchWriteItem`, `TransactWriteItems`,
   `TransactGetItems`), S3 (path-style, SigV4 static credentials), SQS
   (opt-in, incl. HT-FIFO, DLQ redrive), FUSE filesystem
@@ -102,7 +104,7 @@ README will present scope in two tiers instead of a non-goals section.
 | Gap | Evidence (on `main` at `4ca7e90d`) | Closed by |
 |---|---|---|
 | No authentication on the DynamoDB, Redis, and gRPC data planes; no TLS on any data-plane listener | `adapter/dynamodb*.go` has no SigV4 path (only the admin and migration files mention it); `adapter/redis_server_cmds.go` rejects `HELLO AUTH` ("elastickv's Redis adapter has no AUTH layer"); the only `--*TLSCertFile` flags are the admin listener's | Security milestone (§6.2) |
-| Serializability has known holes: commit timestamps are allocated before proposal and the apply path never rejects an entry below the watermark that reads use as their snapshot (G0); 2PC read keys are validated only at PREPARE apply, with locks on write keys only and no re-check at COMMIT (G1); 2PC read-only shards are validated outside the FSM lock; the S3 adapter populates `ReadKeys` only in the upload-part path; Lua scripts record collection fence keys but no read keys for string values | `resolveDispatchCommitTS` in `kv/coordinator.go`; `alignCommitTS` in `store/`; `verifyBackupTimestampFloor` in `kv/fsm_backup.go` (the backup-only fence); `handlePrepareRequest` / `handleCommitRequest` in `kv/fsm.go`; `grep ReadKeys adapter/s3*.go`; `luaWideFenceReadKeysForPlan` in `adapter/redis_lua_context.go` | Serializable isolation audit (§6.3) |
+| Serializability has known holes: commit timestamps are allocated before proposal and the apply path never rejects an entry below the watermark that reads use as their snapshot (G0); 2PC read keys are validated only at PREPARE apply, with locks on write keys only and no re-check at COMMIT (G1); 2PC read-only shards are validated outside the FSM lock; the S3 adapter populates `ReadKeys` only in the upload-part path and never re-reads multipart part descriptors at the commit snapshot; Lua scripts do not surface reads of keys they do not write; several Redis paths (standalone `DEL` and the other emptying paths, `SETNX`, `MULTI` type probes) bypass the collection fences; gRPC `TransactionalKV` has no read-set-bearing transaction API (audit Appendix A) | `resolveDispatchCommitTS` in `kv/coordinator.go`; `alignCommitTS` in `store/`; `verifyBackupTimestampFloor` in `kv/fsm_backup.go` (the backup-only fence); `handlePrepareRequest` / `handleCommitRequest` in `kv/fsm.go`; `grep ReadKeys adapter/s3*.go`; `luaWideFenceReadKeysForPlan` in `adapter/redis_lua_context.go` | Serializable isolation audit (§6.3) |
 | `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
 | No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
 | README's "Implemented Features" omits SQS, encryption, backup, snapshot offload, and the filesystem, and its consistency bullet says only "write-after-read checks … are covered by tests" | `README.md` §Implemented Features | README refresh after §6.1 lands |
