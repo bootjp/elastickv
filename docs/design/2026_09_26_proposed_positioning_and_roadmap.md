@@ -74,13 +74,13 @@ README will present scope in two tiers instead of a non-goals section.
   `TransactGetItems`), S3 (path-style, SigV4 static credentials), SQS
   (opt-in, incl. HT-FIFO, DLQ redrive), FUSE filesystem
   (`2026_02_24_implemented_filesystem_on_elastickv.md`).
-- Consistency: per-key linearizable; multi-key transactions atomic;
-  serializable on the paths verified today, that is single-shard
-  transactions and the write shards of 2PC, whose read sets are validated at
-  apply (§5). The unverified paths (2PC read-only shards, S3 handlers, Lua
-  string reads) are closed by §6.3, and README makes the unqualified claim
-  only after those fixes land (§6.1). Leader reads via ReadIndex or leader
-  lease; no follower reads.
+- Consistency: per-key linearizable; multi-key transactions atomic, with
+  OCC validation of write and read sets at apply. **Serializable is the
+  target, not yet the claim**: the audit (§6.3) found that validation assumes
+  entries apply in commit-timestamp order, which nothing enforces (G0), and
+  that 2PC read keys are unprotected between PREPARE and COMMIT (G1). README
+  makes the serializable claim only after the audit's A0 to A2 fixes land
+  (§6.1). Leader reads via ReadIndex or leader lease; no follower reads.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
@@ -101,7 +101,7 @@ README will present scope in two tiers instead of a non-goals section.
 | Gap | Evidence (on `main` at `4ca7e90d`) | Closed by |
 |---|---|---|
 | No authentication on the DynamoDB, Redis, and gRPC data planes; no TLS on any data-plane listener | `adapter/dynamodb*.go` has no SigV4 path (only the admin and migration files mention it); `adapter/redis_server_cmds.go` rejects `HELLO AUTH` ("elastickv's Redis adapter has no AUTH layer"); the only `--*TLSCertFile` flags are the admin listener's | Security milestone (§6.2) |
-| Serializability has known holes: 2PC read-only shards are validated outside the FSM lock (`validateReadOnlyShards` in `kv/sharded_coordinator.go`), the S3 adapter populates `ReadKeys` only in the upload-part path, and Lua scripts record collection fence keys but no read keys for string values | Code comments in `kv/sharded_coordinator.go` and `store/store.go`; `grep ReadKeys adapter/s3*.go`; `luaWideFenceReadKeysForPlan` in `adapter/redis_lua_context.go` | Serializable isolation audit (§6.3) |
+| Serializability has known holes: commit timestamps are allocated before proposal and the apply path never rejects an entry below the watermark that reads use as their snapshot (G0); 2PC read keys are validated only at PREPARE apply, with locks on write keys only and no re-check at COMMIT (G1); 2PC read-only shards are validated outside the FSM lock; the S3 adapter populates `ReadKeys` only in the upload-part path; Lua scripts record collection fence keys but no read keys for string values | `resolveDispatchCommitTS` in `kv/coordinator.go`; `alignCommitTS` in `store/`; `verifyBackupTimestampFloor` in `kv/fsm_backup.go` (the backup-only fence); `handlePrepareRequest` / `handleCommitRequest` in `kv/fsm.go`; `grep ReadKeys adapter/s3*.go`; `luaWideFenceReadKeysForPlan` in `adapter/redis_lua_context.go` | Serializable isolation audit (§6.3) |
 | `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
 | No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
 | README's "Implemented Features" omits SQS, encryption, backup, snapshot offload, and the filesystem, and its consistency bullet says only "write-after-read checks … are covered by tests" | `README.md` §Implemented Features | README refresh after §6.1 lands |
@@ -124,10 +124,12 @@ behind each claim.
    `StartTS` under the store's apply lock (`checkConflictsLocked` in
    `store/mvcc_store.go`), so two transactions that read each other's writes
    cannot both commit: write skew is rejected as a write conflict. Coverage
-   today: every path that populates `ReadKeys`, that is single-shard
-   transactions and the write shards of 2PC (whose PREPARE-to-COMMIT window
-   the audit's A2 analysis confirms). Until §6.3 lands, S3 handlers, Lua
-   string reads, and 2PC read-only shards are outside the claim. Evidence
+   today: no path can be called serializable yet. The audit's A2 analysis
+   found that the check assumes apply order equals commit-timestamp order,
+   which is not enforced (G0), and that 2PC read keys are unprotected between
+   PREPARE and COMMIT (G1); S3 handlers and Lua string reads do not surface
+   their reads at all (G2, G3). The claim is made once A0 to A2 of §6.3
+   land. Evidence
    today: Elle list-append under `:strict-serializable` for Redis MULTI/EXEC
    and DynamoDB `TransactGetItems` + `TransactWriteItems`. That workload
    cannot exhibit write skew (every anti-dependency comes with a write-write
@@ -149,7 +151,7 @@ implementation, per `CLAUDE.md`.
 `2026_09_26_proposed_positioning_and_roadmap.md` (this) and
 `2026_09_26_proposed_serializable_isolation_audit.md`. README gets a short
 "Who is this for" section and the two-tier scope once both docs land; the
-consistency claims go into README only after the audit's A1 and A2 fixes are
+consistency claims go into README only after the audit's A0 to A2 fixes are
 merged.
 
 ### 6.2 Security milestone
@@ -167,12 +169,16 @@ Prerequisite for the on-premises showcase. Scope:
 
 ### 6.3 Serializable isolation audit
 
-See the audit doc. Summary: audit every read-then-write path per adapter for
-`ReadKeys` coverage (S3 and Lua first), move 2PC read-only-shard validation
-inside the FSM, add a no-write-skew property to `tla/occ`, add write-skew
-Jepsen workloads for gRPC, Redis, DynamoDB, and Lua, and rewrite the
-consistency sections of README, `architecture_overview.md`, and
-`review_todo.md`.
+See the audit doc. Summary: reproduce and close the apply-order gap with a
+permanent commit-timestamp fence at apply (A0), audit every read-then-write
+path per adapter for `ReadKeys` coverage (S3 and Lua first, A1), protect 2PC
+read keys with read locks installed at PREPARE, which also replaces the
+out-of-lock read-only-shard check (A2), model allocation and apply
+separately in `tla/occ` and add a no-write-skew property (A3), add
+write-skew Jepsen workloads for gRPC, Redis, DynamoDB, and Lua (A4), and
+rewrite the consistency sections of README, `architecture_overview.md`, and
+`review_todo.md` (A5). The A0 reproduction test is the first thing to run;
+its result decides what README may say.
 
 The two open TSO proposals (`2026_08_29_proposed_tso_batch_slot_claims.md`,
 `2026_09_02_proposed_prephase_d_resolution_evidence.md`) protect the
@@ -251,6 +257,8 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
   write-up (parallel) → showcase → feature track.
 - Spec of record is `docs/design/`; no ADRs; decisions live in design docs
   (this section is the pattern); repository artifacts are English.
+- The audit's A2 analysis found gaps G0 and G1 on `main`; the serializable
+  claim is the target and is not made for any path until A0 to A2 land.
 
 Assumptions made while reconciling with `main` (not put to the interview):
 
@@ -273,3 +281,6 @@ Assumptions made while reconciling with `main` (not put to the interview):
 4. What "multi-region" means for a future milestone: async replica, or a
    second Raft group set with cross-region routes. Not needed until the
    future track opens.
+5. Whether to run the audit's A0 reproduction test before the security
+   milestone: it is about a day of work and decides the claim, so the
+   recommendation is yes, without changing the rest of the order.
