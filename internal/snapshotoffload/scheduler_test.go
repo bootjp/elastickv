@@ -226,7 +226,7 @@ func TestSchedulerRunRequiresStoreAndSourceCluster(t *testing.T) {
 // newTestScheduler builds a valid scheduler and fails the test if the
 // configuration is rejected.
 func newTestScheduler(
-	t *testing.T, store ObjectStore, groups []OffloadGroup, opts ...SchedulerOption,
+	t *testing.T, store PublishStore, groups []OffloadGroup, opts ...SchedulerOption,
 ) *Scheduler {
 	t.Helper()
 	s, err := NewScheduler(store, groups, "cluster-a", "cluster-a", "test", opts...)
@@ -471,6 +471,20 @@ func TestSchedulerReportsRemoteObjectLossAsAFailure(t *testing.T) {
 // in for an object deleted between the head and the get.
 type objectLosingStore struct {
 	ObjectStore
+}
+
+func (s *objectLosingStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *objectLosingStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
 }
 
 func (s *objectLosingStore) PutObject(

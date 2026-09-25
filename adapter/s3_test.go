@@ -92,6 +92,116 @@ func TestS3Server_BucketAndObjectLifecycle(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+func TestS3Server_GetBucketVersioningReportsUnversioned(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a?versioning", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Contains(t, rec.Body.String(), "<VersioningConfiguration")
+	require.NotContains(t, rec.Body.String(), "<Status>")
+}
+
+func TestS3Server_DeleteObjectHonorsIfMatch(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bucket-a/object", strings.NewReader("payload"))
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	etag := rec.Header().Get("ETag")
+	require.NotEmpty(t, etag)
+
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(http.MethodDelete, "/bucket-a/object", nil)
+	req.Header.Set("If-Match", `"stale"`)
+	server.handle(rec, req)
+	require.Equal(t, http.StatusPreconditionFailed, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/object", nil))
+	require.Equal(t, http.StatusOK, rec.Code, "failed delete precondition must preserve the object")
+
+	rec = httptest.NewRecorder()
+	req = newS3TestRequest(http.MethodDelete, "/bucket-a/object", nil)
+	req.Header.Set("If-Match", etag)
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+}
+
+func TestS3Server_DeleteObjectHonorsWildcardIfMatch(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/object", strings.NewReader("payload")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodDelete, "/bucket-a/object", nil)
+	req.Header.Set("If-Match", "*")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/object", nil))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+
+	for _, ifMatch := range []string{"*", `"missing-etag"`} {
+		rec = httptest.NewRecorder()
+		req := newS3TestRequest(http.MethodDelete, "/bucket-a/object", nil)
+		req.Header.Set("If-Match", ifMatch)
+		server.handle(rec, req)
+		require.Equal(t, http.StatusPreconditionFailed, rec.Code, "If-Match %s", ifMatch)
+	}
+}
+
+func TestS3Server_PutObjectHonorsWildcardIfMatch(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/object", strings.NewReader("first")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bucket-a/object", strings.NewReader("replacement"))
+	req.Header.Set("If-Match", "*")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/object", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "replacement", rec.Body.String())
+}
+
 func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	t.Parallel()
 
@@ -2431,6 +2541,9 @@ func TestIsReadOnlyS3Request(t *testing.T) {
 		{"HeadBucket", http.MethodHead, "/bucket", true},
 		// Allowed: ListObjectsV2.
 		{"ListObjectsV2", http.MethodGet, "/bucket?list-type=2", true},
+		// Not allowed: a versioning subresource cannot become anonymous by
+		// also carrying the ListObjectsV2 discriminator.
+		{"GetBucketVersioning_WithListType", http.MethodGet, "/bucket?versioning&list-type=2", false},
 		// Not allowed: bucket GET without list-type=2 (returns NotImplemented later, not via anonymous path).
 		{"GetBucket_NoListType", http.MethodGet, "/bucket", false},
 		// Not allowed: object GET with extra query params.

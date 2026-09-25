@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1/M2 implemented; M3 pending
+Status: Partial — M0/M1/M2 implemented; M3 retention/GC implemented, remaining M3 items pending
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-07-23
@@ -48,7 +48,7 @@ The M1 object-store-neutral substrate now adds:
 - `cmd/elastickv-snapshot-offload publish` and `restore` for local and
   S3-backed operator workflows.
 
-The runtime scheduler and retention/GC remain pending.
+The runtime scheduler remains pending. Retention/GC and corruption tests are implemented; the remaining M3 items (restore drills, multi-node acceptance, operator documentation) are pending.
 
 ## 2. Safety boundary
 
@@ -121,6 +121,53 @@ window. GC runs in two phases:
 2. after a grace period, rebuild the live payload SHA set from all remaining
    manifests and delete only payload objects with no live reference.
 
+Payload reclamation is **two-pass mark-and-sweep with storage-visible
+claims**. A pass that finds a payload unreferenced and past its grace
+*marks* it; only a later pass that finds the same object unchanged, with
+the mark aged past `MinMarkAge`, may claim and delete it.
+
+Claims close the race that an ETag precondition cannot. A publisher
+conditionally creates `<prefix>/v1/claims/sha256/<shard>/<key-hash>.lock`
+before it creates or reuses a payload and holds that claim until the
+manifest commit completes. GC conditionally claims every sweepable
+payload **before** its authoritative manifest scan, holds all those
+claims through deletion, and skips a payload already claimed by a
+publisher. Therefore a publish that wins first is either still holding
+the claim or is visible in the final scan; a GC that wins first prevents
+the publisher from committing until the sweep finishes. The payload
+body is not rewritten merely to advance mtime, so content-addressed
+deduplication does not re-transfer multi-terabyte snapshots.
+
+Manifest reuse uses the same claim protocol. Because manifests are
+small, a matching reused manifest is refreshed while claimed. GC claims
+every initially expired manifest before the authoritative final scan,
+holds those claims through deletion, and deletes only manifests whose
+size, mtime, and ETag still match the initial scan. A manifest that was
+refreshed before GC won its claim, or whose claim is held elsewhere, is
+kept; its payload is added back to the live set before payload sweep. The
+refresh advances the existing schema-v1 `created_at` value by one nanosecond,
+which changes the manifest bytes and ETag even when the caller supplies the
+same timestamp. This avoids depending on object-store timestamp precision
+without making newly written schema-v1 manifests unreadable by older binaries.
+
+The mark state is in-memory and per-process. Losing it on restart
+delays reclamation by one pass and never advances it. Marks for objects
+absent from a pass's (complete) listing are pruned, so external
+reclamation cannot leak them.
+
+Claim objects are released with a conditional delete even when the
+calling context is cancelled. A process crash can leave an orphan claim;
+that fails safe by delaying publication and reclamation for the hashed
+target key. Publication waits at most 30 seconds with bounded exponential
+backoff, then returns a retryable `ErrObjectClaimed` so an orphan cannot
+occupy the scheduler's upload slot indefinitely. GC never waits for a busy
+claim and retries on a later pass. All claims held by one GC pass share one
+30-second cancellation-independent cleanup deadline, so shutdown latency is
+bounded independently of the number of claimed objects. Operators may remove
+an orphan claim only after confirming no publisher or GC owns it. Automatic
+lease expiry is not used because expiring a live claim reopens the data-loss
+race.
+
 Malformed manifests fail closed: they are reported and excluded from both
 automatic manifest deletion and payload reclamation. Listing failure,
 pagination failure, or an incomplete group scan performs no deletes. This
@@ -152,11 +199,21 @@ credentials provider, schedule, retention count/window, upload concurrency,
 and server-side encryption mode. Static secrets must use file or environment
 providers and must not appear in process arguments or manifests.
 
+**Versioned buckets.** Retention deletes by key, not by version. On a
+bucket with S3 versioning enabled a keyed delete only writes a delete
+marker, so the bytes persist as a noncurrent version that later
+listings cannot see: GC reports successful reclamation while storage
+grows without bound. `NewS3Store` therefore checks bucket versioning and
+rejects `Enabled` or `Suspended` by default. Operators that have already
+configured noncurrent-version expiration must acknowledge that policy
+explicitly with `--s3-allow-versioned-with-lifecycle`; the code cannot
+prove the lifecycle configuration itself.
+
 Storage-envelope encryption protects values but not all physical keys and
 metadata. The external bucket therefore requires private ACLs, TLS, and
 server-side encryption (SSE-S3 or SSE-KMS). Anonymous reads and writes are a
 deployment failure. Object credentials need only scoped list/get/put/delete
-permissions below the configured prefix.
+permissions below the configured prefix, plus `s3:GetBucketVersioning`.
 
 ## 8. Milestones
 
@@ -165,7 +222,7 @@ permissions below the configured prefix.
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Not yet wired into `main.go` — the runtime flags are M3. |
-| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Pending |
+| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: the §5 two-phase retention/GC (`retention.go`) with cross-process publish/GC claims and `RetentionStore` list/delete on both the local and S3 stores. Restore corruption drills are implemented (`restore_corruption_test.go`: truncated, over-length, missing and tampered-descriptor payloads, plus a positive restore-into-fresh-dir drill). Versioned buckets are rejected unless the operator explicitly confirms noncurrent-version expiration. Multi-node acceptance and the complete operator runbook remain pending. |
 
 The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to

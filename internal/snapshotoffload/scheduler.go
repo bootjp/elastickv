@@ -21,7 +21,7 @@ import (
 // compaction behaviour, which §10 lists as a non-goal.
 type Scheduler struct {
 	groups      []OffloadGroup
-	store       ObjectStore
+	store       PublishStore
 	prefix      string
 	sourceName  string
 	binVersion  string
@@ -145,7 +145,7 @@ func WithSchedulerSpoolDir(dir string) SchedulerOption {
 // must supply both leadership callbacks: SyncOnce is exported and does
 // not re-validate, so a nil callback that survived construction would
 // be a follower publishing a manifest.
-func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluster, binaryVersion string, opts ...SchedulerOption) (*Scheduler, error) {
+func NewScheduler(store PublishStore, groups []OffloadGroup, prefix, sourceCluster, binaryVersion string, opts ...SchedulerOption) (*Scheduler, error) {
 	s := &Scheduler{
 		groups:      groups,
 		store:       store,
@@ -418,6 +418,13 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 			// an object disappearing from the store mid-publish is a
 			// genuine failure and must stay one.
 			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "no_persisted_snapshot")
+			return
+		}
+		if errors.Is(err, ErrObjectClaimed) {
+			// A live peer or an orphaned storage-visible claim owns this
+			// target. The bounded wait has already elapsed; release the global
+			// upload slot and retry on a later scheduler tick.
+			s.observer.ObserveSnapshotOffloadSkipped(group.GroupID, "object_claimed")
 			return
 		}
 		s.observer.ObserveSnapshotOffloadFailed(group.GroupID, err)
