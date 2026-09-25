@@ -46,12 +46,14 @@ type ObjectClaimStore interface {
 	AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error)
 }
 
-// PublishStore is the capability set publication requires. Claims are part of
-// the type instead of a runtime assertion because every publish must coordinate
-// payload and manifest keys with retention.
+// PublishStore is the capability set publication requires. Claims and refresh
+// are part of the type instead of runtime assertions because every publish must
+// coordinate with retention and remain idempotent when a manifest already
+// exists.
 type PublishStore interface {
 	ObjectStore
 	ObjectClaimStore
+	ObjectRefresher
 }
 
 // ObjectRef is one object seen by ListObjects.
@@ -376,10 +378,6 @@ func NewLocalStore(root string) (*LocalStore, error) {
 	rootDir, err := os.OpenRoot(cleaned)
 	if err != nil {
 		return nil, errors.Wrapf(err, "open local store root %s", cleaned)
-	}
-	if err := rootDir.MkdirAll(localStoreTempDir, localStoreTempDirPerm); err != nil {
-		_ = rootDir.Close()
-		return nil, errors.Wrap(err, "create local store temp directory")
 	}
 	return &LocalStore{root: cleaned, rootDir: rootDir}, nil
 }
@@ -774,6 +772,9 @@ func writeLocalObjectTempWithinRoot(
 }
 
 func createLocalTempWithinRoot(root *os.Root) (string, *os.File, error) {
+	if err := root.MkdirAll(localStoreTempDir, localStoreTempDirPerm); err != nil {
+		return "", nil, errors.Wrap(err, "create local store temp directory")
+	}
 	for range localStoreTempCreateAttempts {
 		var token [localStoreTempTokenBytes]byte
 		if _, err := rand.Read(token[:]); err != nil {

@@ -814,6 +814,31 @@ func TestLocalStoreListObjectsSkipsOnlyTheReservedTempNamespace(t *testing.T) {
 	require.ErrorIs(t, err, ErrInvalidOptions)
 }
 
+func TestLocalStoreReadOnlyOpenDoesNotCreateTempNamespace(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	const key = "cluster-a/v1/manifests/existing.json"
+	objectPath := filepath.Join(root, filepath.FromSlash(key))
+	require.NoError(t, os.MkdirAll(filepath.Dir(objectPath), 0o755))
+	require.NoError(t, os.WriteFile(objectPath, []byte("existing"), 0o600))
+	require.NoError(t, os.Chmod(root, 0o555))
+	t.Cleanup(func() { require.NoError(t, os.Chmod(root, 0o755)) })
+
+	store, err := NewLocalStore(root)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
+	require.NoDirExists(t, filepath.Join(root, localStoreTempDir))
+
+	body, _, err := store.GetObject(context.Background(), key)
+	require.NoError(t, err)
+	got, err := io.ReadAll(body)
+	require.NoError(t, err)
+	require.NoError(t, body.Close())
+	require.Equal(t, []byte("existing"), got)
+	require.NoDirExists(t, filepath.Join(root, localStoreTempDir))
+}
+
 // TestGCDoesNotDeletePayloadRefreshedByAConcurrentPublish is the
 // regression test for the concurrent-publication race.
 //

@@ -143,6 +143,57 @@ func TestS3Server_DeleteObjectHonorsIfMatch(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+func TestS3Server_DeleteObjectHonorsWildcardIfMatch(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/object", strings.NewReader("payload")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodDelete, "/bucket-a/object", nil)
+	req.Header.Set("If-Match", "*")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusNoContent, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/object", nil))
+	require.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestS3Server_PutObjectHonorsWildcardIfMatch(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a/object", strings.NewReader("first")))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodPut, "/bucket-a/object", strings.NewReader("replacement"))
+	req.Header.Set("If-Match", "*")
+	server.handle(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	rec = httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/object", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "replacement", rec.Body.String())
+}
+
 func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	t.Parallel()
 

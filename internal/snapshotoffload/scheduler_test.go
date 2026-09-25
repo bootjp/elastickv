@@ -481,6 +481,12 @@ func (s *objectLosingStore) AcquireObjectClaim(ctx context.Context, key string) 
 	return claimStore.AcquireObjectClaim(ctx, key)
 }
 
+func (s *objectLosingStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
+}
+
 func (s *objectLosingStore) PutObject(
 	ctx context.Context, key string, body io.Reader, opts PutOptions,
 ) (ObjectInfo, error) {

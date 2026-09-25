@@ -2787,7 +2787,7 @@ func validateS3PutPreconditions(r *http.Request, previous *s3ObjectManifest) err
 		return errors.New("object already exists")
 	}
 	if ifMatch := strings.TrimSpace(r.Header.Get("If-Match")); ifMatch != "" {
-		if previous == nil || strings.Trim(ifMatch, `"`) != previous.ETag {
+		if previous == nil || (ifMatch != "*" && strings.Trim(ifMatch, `"`) != previous.ETag) {
 			return errors.New("etag precondition failed")
 		}
 	}

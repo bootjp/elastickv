@@ -221,12 +221,7 @@ func verifyPublishLeadership(ctx context.Context, verify func(context.Context) e
 // manifest while preserving its canonical bytes. The manifest is small, and
 // the refresh makes a retention scan taken before this publish skip the object
 // after it acquires the shared claim and revalidates the listed state.
-func refreshExistingManifest(ctx context.Context, store ObjectStore, manifest *Manifest) error {
-	refresher, ok := store.(ObjectRefresher)
-	if !ok {
-		return errors.Wrapf(ErrInvalidOptions,
-			"object store cannot refresh reused manifest %s", manifest.ManifestKey)
-	}
+func refreshExistingManifest(ctx context.Context, store PublishStore, manifest *Manifest) error {
 	// CreatedAt is part of schema v1's canonical self-hash. Advancing the
 	// stored value produces a distinct object version without adding a field
 	// that older restore binaries would omit when recomputing that hash.
@@ -240,7 +235,7 @@ func refreshExistingManifest(ctx context.Context, store ObjectStore, manifest *M
 		SHA256:      hexSHA256Bytes(data),
 		ContentType: "application/json",
 	}
-	info, err := refresher.RefreshObject(ctx, manifest.ManifestKey, bytes.NewReader(data), opts)
+	info, err := store.RefreshObject(ctx, manifest.ManifestKey, bytes.NewReader(data), opts)
 	if err != nil {
 		return errors.Wrap(err, "refresh existing snapshot manifest")
 	}
@@ -254,7 +249,7 @@ func refreshExistingManifest(ctx context.Context, store ObjectStore, manifest *M
 
 func createManifestObject(
 	ctx context.Context,
-	store ObjectStore,
+	store PublishStore,
 	manifest *Manifest,
 	data []byte,
 	size int64,
@@ -277,7 +272,7 @@ func createManifestObject(
 
 func handleManifestPutError(
 	ctx context.Context,
-	store ObjectStore,
+	store PublishStore,
 	manifest *Manifest,
 	reuseExistingCreatedAt bool,
 	err error,
