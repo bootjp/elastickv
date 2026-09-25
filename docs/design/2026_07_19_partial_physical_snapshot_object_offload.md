@@ -1,9 +1,9 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1/M2 implemented; M3 pending
+Status: Partial — M0/M1/M2 implemented; M3 runtime wiring and the operations runbook implemented; retention/GC, restore drills, multi-node acceptance, and the versioned-bucket decision pending
 Author: bootjp
 Date: 2026-07-19
-Updated: 2026-07-23
+Updated: 2026-09-25
 
 ## 1. Scope
 
@@ -48,7 +48,11 @@ The M1 object-store-neutral substrate now adds:
 - `cmd/elastickv-snapshot-offload publish` and `restore` for local and
   S3-backed operator workflows.
 
-The runtime scheduler and retention/GC remain pending.
+The runtime scheduler is implemented and wired into main.go, opt-in via
+`--snapshotOffloadBucket` (or `--snapshotOffloadLocalDir`). Retention/GC,
+restore drills, multi-node acceptance, and the §7 versioned-bucket decision
+remain pending on this branch; the operator runbook is at
+[`../snapshot_offload_operations.md`](../snapshot_offload_operations.md).
 
 ## 2. Safety boundary
 
@@ -164,8 +168,8 @@ permissions below the configured prefix.
 |---|---|---|
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
-| M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Not yet wired into `main.go` — the runtime flags are M3. |
-| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Pending |
+| M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Runtime wiring and flags shipped in the M3 slice below. |
+| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented. Shipped on this branch: the runtime wiring (`main_snapshot_offload.go`) that runs the scheduler in-process, its metrics (`monitoring/snapshot_offload.go`), and the operational runbook (`docs/snapshot_offload_operations.md`). **Pending: the §5 two-phase retention/GC**, which is in review separately and has NOT landed here — until it does, published manifests and payloads are never reclaimed by this system, so an operator running M3 needs an external bucket lifecycle policy. Also pending: restore corruption drills, multi-node acceptance, and the §7 versioned-bucket decision, which is why the `partial` marker stays. |
 
 The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to
