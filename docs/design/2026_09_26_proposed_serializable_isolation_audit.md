@@ -309,27 +309,60 @@ Modelling limits, recorded so nobody over-reads the result:
 
 ### A4. Jepsen write-skew workloads
 
-One workload per surface, all using Elle's rw-register model
-(`jepsen.tests.cycle.wr`) under `:strict-serializable`, which reports
-G2-item, with transactions of the shape "read `a`, write `b`" so
-anti-dependencies are not accompanied by write-write edges:
+Status: the three single-shard workloads are on local branch
+`design/serializable-audit-a4` (commit `dc880d73`, not pushed), with unit
+tests, registered in `jepsen_test.clj`. Not yet done: the multi-shard
+variant, CI wiring, and the "green after the fix" run.
 
-- Redis: `MULTI; GET a; SET b; EXEC` (reads inside the body are tracked).
-- Lua: `EVAL` script that reads `a` and writes `b`. Expected to **fail**
-  before the A1 Lua fix and pass after; the failing run is committed as the
-  regression evidence.
-- DynamoDB: `TransactGetItems` for the reads, then `TransactWriteItems` with a
-  `ConditionCheck` on each read item and a `Put` on the written item.
+All use Elle's rw-register model (`jepsen.tests.cycle.wr`) under
+`:consistency-models [:strict-serializable]` with `:wfr-keys? true`, which
+reports G2-item, with transactions of the shape "read `a`, write `b`" so
+anti-dependencies are not accompanied by write-write edges. Every run uses
+a per-run key prefix so the three workloads can share one cluster.
+
+- `elastickv.redis-wr-workload`: `MULTI; GET / SET in transaction order;
+  EXEC` (reads inside the body are tracked as OCC read keys).
+- `elastickv.redis-lua-wr-workload`: one `EVAL` per transaction that
+  performs the reads and writes in order and returns the read values.
+- `elastickv.dynamodb-wr-workload`: `TransactGetItems` for the reads, then
+  one `TransactWriteItems` with a `ConditionCheck` on every read-only key
+  (the read value) and a conditioned `Put` on every written key;
+  `TransactionCanceledException` is recorded as `:fail`.
 - gRPC: `TransactionalKV` cannot express a read set (G8), so no client-side
-  workload can drive write skew through it. The engine-level evidence for the
-  gRPC-facing path is the Go reproduction tests already on
-  `design/serializable-audit-a0`, extended into the `kv/` interleaving tests
-  of A0 and A2.
-- Multi-shard variant for each: keys spread across at least two Raft groups so
-  G1's path is exercised (Jepsen M5 already runs multi-group locally).
+  workload can drive write skew through it; the engine-level evidence for
+  that path is the Go reproduction tests on `design/serializable-audit-a0`.
 
-CI: added to `.github/workflows/jepsen-test.yml` next to the existing
-workloads with the same `--local` topology.
+First results, on a binary built from `main` at `4ca7e90d`, three local
+nodes, `--time-limit 30 --rate 50 --concurrency 10`:
+
+| Workload | Result |
+|---|---|
+| Lua | `:valid? false`, four G2-item cycles, `:not #{:repeatable-read}`. One cycle is textbook write skew: T1 `[[:r 53 1] [:r 53 1] [:w 54 2]]`, T2 `[[:r 53 1] [:w 53 2] [:r 54 nil]]`. This is G3 observed through Jepsen; the fix on `design/serializable-audit-a1-redis` is expected to turn it green. |
+| Redis `MULTI` | `:valid? true` (678 ok). The race did not trigger at this rate; not evidence of correctness. |
+| DynamoDB | `:valid? true` (1088 ok, 148 `:fail` from conditional checks). Same caveat. |
+
+Elle note, recorded so the next person does not chase it: with
+`:linearizable-keys? true` the first Redis run reported a `:cyclic-versions`
+anomaly on one key whose version edges are supported by no realtime order
+in the history; Elle 0.2.7 also drops the realtime version order for every
+key when this fires. Re-checking the same history with `:wfr-keys?` only is
+valid. The workloads therefore do not set `:linearizable-keys?`, at the
+cost that version order comes only from the initial state and from
+transactions that read then write the same key, so reads of absent keys
+are the main way write skew is detected.
+
+Remaining:
+
+- Multi-shard variant for each workload: keys spread across at least two
+  Raft groups so G1's path is exercised (Jepsen M5 already runs multi-group
+  locally).
+- CI: add the three workloads to `.github/workflows/jepsen-test.yml` next
+  to the existing ones once the A1 and A0 / A2 fixes land, so the workflow
+  stays green; until then they run locally through `scripts/run-jepsen-local.sh`.
+- Environment facts for the runner: `/tmp/lein` from `CLAUDE.md` does not
+  exist on the dev machine; `/opt/homebrew/bin/lein` with Java 21 works
+  (Java 17 fails on `java.util.SequencedCollection`); the `jepsen/redis`
+  submodule must be initialised.
 
 ### A5. Documentation
 
