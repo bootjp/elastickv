@@ -152,9 +152,13 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   commit. (`proto/internal.proto`, `kv/fsm.go`)
 - **write conflict** — `ApplyMutations` fails with `ErrWriteConflict` when any
   mutation key or read key has a commit newer than `StartTS`. (`store/store.go`)
-- **OCC (optimistic concurrency control)** — The commit-time validation
-  above: no locks during the transaction, conflicts detected at apply. The
-  acronym is used throughout the code and TLA+ modules without expansion.
+- **OCC (optimistic concurrency control)** — Commit-time validation of a
+  transaction's write set and read set against `StartTS` (see *write
+  conflict*); reads take no locks while the transaction runs. Multi-shard
+  commits do write per-key transaction locks and intents at PREPARE, held
+  until COMMIT, ABORT, or the LockResolver resolves them. The acronym is used
+  throughout the code and TLA+ modules without expansion. (`kv/fsm.go`,
+  `kv/lock_resolver.go`)
 - **one-phase transaction** — A single-shard transaction applied by one Raft
   entry, with write-write and read-write conflicts checked under the apply
   lock. (`kv/fsm.go`)
@@ -294,12 +298,14 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
 - **TLA+ safety specs** — Machine-checked models of HLC, OCC, MVCC, routes,
   and their composition under `tla/`, run by `scripts/tla-check.sh` with gap
   configurations that must fail. (`tla/README.md`)
-- **Jepsen workloads** — One per protocol surface under
-  `jepsen/src/elastickv/`, using Elle list-append, knossos registers, or
-  custom checkers. (`CLAUDE.md`, `.github/workflows/jepsen-test.yml`)
+- **Jepsen workloads** — Fault-injection workloads under
+  `jepsen/src/elastickv/` for the Redis, DynamoDB, S3, and SQS surfaces, using
+  Elle list-append, knossos registers, or custom checkers; gRPC and the
+  filesystem have none yet. (`CLAUDE.md`, `.github/workflows/jepsen-test.yml`)
 - **design doc lifecycle** — `proposed` (accepted, not implemented),
   `partial` (some milestones shipped), `implemented` (as-built record), as
   filename markers under `docs/design/`. (`docs/design/README.md`, `CLAUDE.md`)
-- **five review lenses** — The self-review passes every change records: data
-  loss, concurrency / distributed failures, performance, data consistency,
-  test coverage. (`CLAUDE.md`)
+- **five review lenses** — The five passes every code change is reviewed
+  through, one at a time, with each result recorded in the PR description:
+  data loss, concurrency / distributed failures, performance, data
+  consistency, test coverage. (`CLAUDE.md`)

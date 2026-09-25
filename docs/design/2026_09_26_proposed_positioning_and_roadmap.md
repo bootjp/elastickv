@@ -34,8 +34,9 @@ alongside it.
 
 **Proof.** The engineering record is a deliverable, not a by-product: every
 non-trivial change has a design doc, safety properties are model-checked in
-TLA+ (`tla/`), and every protocol surface has a Jepsen workload
-(`jepsen/src/elastickv/`). The same artifact therefore serves two audiences:
+TLA+ (`tla/`), and the Redis, DynamoDB, S3, and SQS surfaces each have a
+Jepsen workload (`jepsen/src/elastickv/`; gRPC and the filesystem do not yet,
+see §6.3). The same artifact therefore serves two audiences:
 adopters who want a self-hosted AWS-compatible store, and readers who want a
 documented, verified multi-raft transactional KV in Go.
 
@@ -50,10 +51,10 @@ week, no deadline; the plan below is sized for that.
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
 | Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic and serializable across keys and shards (OCC read-set validation at FSM apply); per-key linearizable |
-| Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; centralized TSO (group 0, Phase D) with batch allocation; no external service |
+| Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
-| Verification story | Deterministic simulation | Jepsen (TiDB), tests | Internal (formal methods, TLA+) | Internal | Design docs, TLA+ (HLC, OCC, MVCC, routes, composed), Jepsen per adapter (Elle list-append, knossos, custom checkers) |
+| Verification story | Deterministic simulation | Jepsen (TiDB), tests | Internal (formal methods, TLA+) | Internal | Design docs, TLA+ (HLC, OCC, MVCC, routes, composed), Jepsen for Redis / DynamoDB / S3 / SQS (Elle list-append, knossos, custom checkers) |
 | Where elastickv is weaker today | Strict serializability, simulation testing | Auto migration / merge / rebalance, PD ecosystem, published numbers | Elasticity, global tables, zero ops | Scale | See §3 (future goals) and §4 (open gaps) |
 
 Read the table as: DynamoDB is the API reference, TiKV is the architectural
@@ -73,9 +74,13 @@ README will present scope in two tiers instead of a non-goals section.
   `TransactGetItems`), S3 (path-style, SigV4 static credentials), SQS
   (opt-in, incl. HT-FIFO, DLQ redrive), FUSE filesystem
   (`2026_02_24_implemented_filesystem_on_elastickv.md`).
-- Consistency: per-key linearizable; multi-key transactions atomic and
-  serializable (§5); leader reads via ReadIndex or leader lease; no follower
-  reads.
+- Consistency: per-key linearizable; multi-key transactions atomic;
+  serializable on the paths verified today, that is single-shard
+  transactions and the write shards of 2PC, whose read sets are validated at
+  apply (§5). The unverified paths (2PC read-only shards, S3 handlers, Lua
+  string reads) are closed by §6.3, and README makes the unqualified claim
+  only after those fixes land (§6.1). Leader reads via ReadIndex or leader
+  lease; no follower reads.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
@@ -98,7 +103,7 @@ README will present scope in two tiers instead of a non-goals section.
 | No authentication on the DynamoDB, Redis, and gRPC data planes; no TLS on any data-plane listener | `adapter/dynamodb*.go` has no SigV4 path (only the admin and migration files mention it); `adapter/redis_server_cmds.go` rejects `HELLO AUTH` ("elastickv's Redis adapter has no AUTH layer"); the only `--*TLSCertFile` flags are the admin listener's | Security milestone (§6.2) |
 | Serializability has known holes: 2PC read-only shards are validated outside the FSM lock (`validateReadOnlyShards` in `kv/sharded_coordinator.go`), the S3 adapter populates `ReadKeys` only in the upload-part path, and Lua scripts record collection fence keys but no read keys for string values | Code comments in `kv/sharded_coordinator.go` and `store/store.go`; `grep ReadKeys adapter/s3*.go`; `luaWideFenceReadKeysForPlan` in `adapter/redis_lua_context.go` | Serializable isolation audit (§6.3) |
 | `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
-| No published performance numbers; four `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
+| No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
 | README's "Implemented Features" omits SQS, encryption, backup, snapshot offload, and the filesystem, and its consistency bullet says only "write-after-read checks … are covered by tests" | `README.md` §Implemented Features | README refresh after §6.1 lands |
 | Stale docs: `docs/docker_multinode_manual_run.md` listed `Scan` / `BatchWriteItem` as unsupported; `docs/review_todo.md` 4.2 described the engine as snapshot isolation | Fixed in the same change as this doc | — |
 
@@ -118,7 +123,11 @@ behind each claim.
    transaction's write set and read set against every commit newer than
    `StartTS` under the store's apply lock (`checkConflictsLocked` in
    `store/mvcc_store.go`), so two transactions that read each other's writes
-   cannot both commit: write skew is rejected as a write conflict. Evidence
+   cannot both commit: write skew is rejected as a write conflict. Coverage
+   today: every path that populates `ReadKeys`, that is single-shard
+   transactions and the write shards of 2PC (whose PREPARE-to-COMMIT window
+   the audit's A2 analysis confirms). Until §6.3 lands, S3 handlers, Lua
+   string reads, and 2PC read-only shards are outside the claim. Evidence
    today: Elle list-append under `:strict-serializable` for Redis MULTI/EXEC
    and DynamoDB `TransactGetItems` + `TransactWriteItems`. That workload
    cannot exhibit write skew (every anti-dependency comes with a write-write
@@ -139,8 +148,9 @@ implementation, per `CLAUDE.md`.
 
 `2026_09_26_proposed_positioning_and_roadmap.md` (this) and
 `2026_09_26_proposed_serializable_isolation_audit.md`. README gets a short
-"Who is this for" section, the two-tier scope, and the consistency claims once
-both land.
+"Who is this for" section and the two-tier scope once both docs land; the
+consistency claims go into README only after the audit's A1 and A2 fixes are
+merged.
 
 ### 6.2 Security milestone
 

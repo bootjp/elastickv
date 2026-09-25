@@ -40,14 +40,18 @@ Facts checked on `main` at `4ca7e90d`.
 - **Multi-shard transactions, write shards.** `prewriteTxn` in
   `kv/sharded_coordinator.go` attaches each shard's read keys to that shard's
   PREPARE entry; the `store/store.go` interface comment records this as "no
-  TOCTOU window; full SSI".
+  TOCTOU window; full SSI". That is the interface comment's claim; whether
+  PREPARE-time validation holds through the primary commit is the A2 analysis
+  (§4).
 - **Multi-shard transactions, read-only shards.** `validateReadOnlyShards`
   issues a linearizable read barrier on each shard that holds read keys but no
   mutations, then compares `LatestCommitTS` per key against `StartTS`
-  **outside** the apply lock. Its comment names the gap: a write committing
-  between the barrier and the check goes undetected, and "full SSI for
-  read-only shards … would require a dedicated 'read-validate' FSM request
-  phase". These read keys are never part of any Raft entry.
+  **outside** the apply lock. `LatestCommitTS` reads applied state, so a
+  write that has applied by the time of the check is detected; what can be
+  missed is a write that commits after the barrier and has not yet applied
+  when the check runs. The code comment names the gap and its remedy: "full
+  SSI for read-only shards … would require a dedicated 'read-validate' FSM
+  request phase". These read keys are never part of any Raft entry.
 - **Which adapters populate `ReadKeys`.**
   - DynamoDB: only `TransactWriteItems` (`adapter/dynamodb_transact.go`,
     `plan.readKeys`). `ConditionCheck` on an existing item also re-writes the
@@ -89,7 +93,7 @@ Facts checked on `main` at `4ca7e90d`.
 
 | ID | Gap | Consequence if left open |
 |---|---|---|
-| G1 | 2PC read-only shards validated outside the apply lock; read keys not in a Raft entry | A write to a read-only shard that commits between the barrier and the `LatestCommitTS` check is missed: write skew across shards. |
+| G1 | 2PC read-only shards validated outside the apply lock; read keys not in a Raft entry | A write to a read-only shard that commits after the barrier and has not yet applied when `LatestCommitTS` runs is missed: write skew across shards. |
 | G2 | S3 handlers do not surface reads. Read-then-write sites (function names in `adapter/s3.go`, `s3_admin.go`, `s3_admin_objects.go`): `createBucket`, `deleteBucket`, `putBucketAcl`, `putObject`, `deleteObject`, `createMultipartUpload`, `uploadPart` (partly covered), `completeMultipartUpload`, `abortMultipartUpload`, and the admin equivalents. `If-Match` / `If-None-Match` are checked pre-Raft only (`validateS3PutPreconditions`). | Concrete anomaly: `deleteBucket` scans for emptiness at `readTS` while a concurrent `putObject` reads the bucket meta at its own `readTS`; both commit, leaving an object in a deleted bucket. Object-level races are mostly covered because the object head / manifest key is in the write set. |
 | G3 | Lua scripts record no read key for string values | A script that reads string `a` and writes string `b`, racing with one that reads `b` and writes `a`, can produce write skew. |
 | G4 | SQS fence-key coverage is asserted per call site, not audited as a table | Unknown; needs the same table as G2. |
