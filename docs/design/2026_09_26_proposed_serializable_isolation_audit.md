@@ -131,6 +131,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G7 | Redis paths that bypass the collection fences (Appendix A): the emptying paths through `deleteLogicalKeyElems` (standalone `DEL`, `GETDEL`, `EXPIRE ≤ 0`, `LTRIM` to empty, a zset / set / HLL emptied to zero) neither read nor bump a fence; `HDEL` and update-only `HSET` do not bump the hash fence; `SETNX` and the legacy (dedup-off) `SET` / `INCR` / `HSET` creates read the key type with no fence; `MULTI` type probes for `GET` / `EXISTS` / `EXPIRE` on an absent key record no fence. | `DEL k` racing `RPUSH k v` where the push commits after `DEL`'s snapshot: `DEL` removes the base meta and the items it saw, the push's item and delta survive, the list has a hole. `SETNX k` racing `RPUSH k`: both commit, a string and a list coexist under one key. `MULTI { EXISTS k; SET a 1 }` misses a concurrent create of `k`. **Reproduced** for the `DEL` case: `TestDel_ListEmptyingDoesNotFenceConcurrentPush` in `adapter/redis_del_rpush_repro_test.go` (same branch) holds `DEL` after its item scan, lets `RPUSH v2` commit, and ends with `LLEN = 1`, `LRANGE = []`: the metadata points at the item `DEL` removed while the pushed item survives. |
 | G8 | gRPC `TransactionalKV` has no transaction surface: there is no `Begin`, `PreWrite` / `Commit` / `Rollback` return not-implemented, and every `Put` / `Delete` is a single-key transaction with a coordinator-assigned `StartTS` and no read set (`adapter/grpc.go`, `adapter/grpc_transcoder.go`). | A gRPC client's `Get` followed by `Put` can lose an update; multi-key serializable transactions are reachable today only through Redis `MULTI`, DynamoDB `TransactWriteItems`, SQS, and the filesystem. An API gap rather than a validation bug; documented as such and out of this audit's scope. |
 | G9 | DynamoDB `finalizeLegacyTableMigration` writes `TableMeta` from an earlier snapshot under a process-local lock only; table-generation checks for item writes are compensated after commit rather than validated at apply (`adapter/dynamodb_migration.go`, `adapter/dynamodb_transact.go`). | A stale schema can overwrite a concurrent schema change during legacy migration; low likelihood, migration-only. |
+| G10 | **Single-key lost update through Lua under contention** (observed, mechanism not yet pinned down). Jepsen's Lua rw-register workload reports `:lost-update` and single-key G2-item cycles on `main` and on the G3-fixed binary alike: two `EVAL`s that each `GET k` and see the same value, then `SET k`, both return ok. The write-write check at apply should reject the second one. Hypotheses under investigation on branch `design/serializable-audit-g10`: Lua commit batching merges several scripts' commits into one proposal and the merged mutation list is deduplicated by key (`uniqueMutations`) or validated against pre-batch state; the post-conflict retry re-proposes a plan built from the stale execution instead of re-running the script; or two scripts obtain equal or non-monotonic commit timestamps. | A plain read-modify-write through `EVAL` can lose a concurrent write to the same key. This is a basic single-key guarantee, independent of the multi-key claim. |
 | G5 | `tla/occ/OCC.tla` models SI | The model cannot catch a regression that removes read-set validation. |
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
 
@@ -218,8 +219,10 @@ including `DEL` of a string or a missing key, now writes four fences; the
 TTL-inline migrator's expired-collection delete now conflicts with a
 concurrent push and retries on its next pass; an absent-key probe adds 13
 read keys and a `GET` adds 2, so a script with roughly 770 absent probes
-hits `kv.maxReadKeys` and fails closed. Still open in Redis after this
-change: a `GET` that finds the key absent records no collection fences (a
+hits `kv.maxReadKeys` and fails closed. The Jepsen run on this branch shows the cross-key skew gone but a single-key
+lost update through `EVAL` remaining (G10, under investigation). Still open in
+Redis after this change: a `GET` that finds the key absent records no
+collection fences (a
 concurrent `HSET` creating it is undetected, which matters only in a
 two-script cycle), `SET NX` / `SET XX` / `SETNX` check existence through
 `logicalExists`, which records nothing, and probes that resolve to a
@@ -351,8 +354,25 @@ cost that version order comes only from the initial state and from
 transactions that read then write the same key, so reads of absent keys
 are the main way write skew is detected.
 
+Second results, on a binary built from `design/serializable-audit-a1-redis`
+(the G3 and G7 fixes), same topology and rate:
+
+| Workload | Result |
+|---|---|
+| Redis `MULTI` | `:valid? true` (707 ok, 0 fail, 0 info). |
+| Lua, two runs | `:valid? false` in both, but with **no cross-key cycle**: every G2-item is the single-key rw / rw pair under a `:lost-update` on the same key (keys 144, 43, 140 in one run; 71 in the other). The cross-key write skew that G3 targets did not appear. |
+| Lua control on `main`, two runs | one run `:valid? true`, the other `:valid? false` with two single-key lost updates and one **cross-key** cycle (keys 55 / 56, the G3 shape). |
+
+Reading: the G3 fix removes the cross-key shape (0 of 2 fixed runs versus
+2 of 3 `main` runs showing it), and exposes a distinct single-key lost
+update that exists on `main` as well (G10). A 30-second run is not enough
+to separate the binaries statistically; the fix PR should run the Lua
+workload longer or at a higher rate and report the counts.
+
 Remaining:
 
+- Pin down and fix G10, then re-run the Lua workload on the fixed binary
+  until it is green.
 - Multi-shard variant for each workload: keys spread across at least two
   Raft groups so G1's path is exercised (Jepsen M5 already runs multi-group
   locally).
