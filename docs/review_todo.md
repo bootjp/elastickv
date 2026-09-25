@@ -119,7 +119,7 @@ Items are ordered by priority within each section.
 
 ### ~~4.2 [High] Write Skew not prevented in one-phase transactions~~ DONE
 
-- **Status:** Fixed. Documented as Snapshot Isolation in `handleOnePhaseTxnRequest` and `MVCCStore.ApplyMutations` interface. Write skew is a known limitation; SSI requires read-set tracking at a higher layer.
+- **Status:** Superseded. Read-set validation now runs at FSM apply (`handleOnePhaseTxnRequest` in `kv/fsm.go`, `checkConflictsLocked` in `store/mvcc_store.go`): single-shard and 2PC write-shard transactions are validated for read-write conflicts atomically with the commit, so write skew is prevented on every path that populates `ReadKeys`. The remaining gaps (2PC read-only shards validated outside the FSM lock; the S3 adapter not populating `ReadKeys`) are tracked in `docs/design/2026_09_26_proposed_serializable_isolation_audit.md`.
 
 ### ~~4.3 [High] VerifyLeader-to-read TOCTOU allows stale reads~~ DONE (documented)
 
