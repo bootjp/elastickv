@@ -182,9 +182,10 @@ Two fixes, neither weakening an existing check:
   applied to every adapter path that pre-allocates `commitTS`.
 - **Harden the stale-reapply fast path.** "A version exists at
   `(key, commitTS)`" stops being proof that this entry was applied. The path
-  compares against a real identity (the entry's Raft index, or the
-  `(primary key, startTS)` of the transaction that wrote the version) or is
-  restricted to the crash-replay window; a live entry always runs
+  compares against a unique identity (the entry's Raft index, or a unique
+  transaction id persisted with the version; `(primary key, startTS)` is not
+  one, because `startTS` is the watermark and many transactions share it) or
+  is restricted to the crash-replay window; a live entry always runs
   `checkConflicts` and the read-set check. `dedupProbeOnePhase` is reviewed
   under the same rule.
 
