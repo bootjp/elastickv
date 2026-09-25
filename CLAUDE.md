@@ -104,3 +104,29 @@ After every code change, run **five independent review passes** — one lens at 
 Check this directory before designing anything new — there is likely a recent precedent (HLC lease, FSM compaction, S3 adapter, lease reads, Lua commit batching, TTL inline value, centralized TSO proposal, hotspot shard split, etc.). `docs/design/README.md` indexes them.
 
 **Design-doc-first workflow.** For any change that goes beyond a single-file edit — new feature, new adapter, new control-plane RPC, schema/wire-format change, or any modification touching replication / MVCC / OCC / HLC / routing — **write a `*_proposed_*.md` design doc first and land it before the implementation**. Do not start implementation until the proposal has been reviewed and accepted. The PR may carry both the doc and the implementation (in that order: doc commit first, implementation commits after) as long as the doc is reviewable on its own. Lifecycle transitions: rename `*_proposed_*.md` → `*_partial_*.md` once the first milestone ships (and update the doc to record what landed and what is still open); rename `*_partial_*.md` → `*_implemented_*.md` once the final milestone ships. Use `git mv` so the history follows the rename.
+
+**Branch and PR naming.** Work that has a design doc is done on a branch named `design/<slug>`, where `<slug>` is the design doc's slug with hyphens instead of underscores (doc `docs/design/2026_09_26_proposed_positioning_and_roadmap.md` → branch `design/positioning-and-roadmap`). The first line of the PR body is `Design: docs/design/<file>`. This is how reviewers, and the `code-review` skill's Spec axis, locate the spec.
+
+## Agent skills
+
+The `mattpocock-skills` Claude Code plugin is installed. Its engineering skills read the files under `docs/agents/`; the rules below adapt the plugin's defaults to this repo. Repository artifacts they produce (design docs, `CONTEXT.md`, `CONTRIBUTING.md`) are written in English.
+
+### Issue tracker
+
+GitHub Issues on `bootjp/elastickv` via the `gh` CLI, **for externally reported issues only**. The maintainer's own work is never filed as an issue: the spec is a design doc and its milestone list is the plan. `to-tickets` and `wayfinder` are not used. See `docs/agents/issue-tracker.md`.
+
+### Specs
+
+`docs/design/` is the spec of record. When a skill says "publish the spec to the issue tracker" (`to-spec`), write `docs/design/YYYY_MM_DD_proposed_<slug>.md` instead, on branch `design/<slug>`, and open a PR (see **Branch and PR naming** above). `implement` takes the design doc path as its spec; `code-review` finds it through the PR body's `Design:` line.
+
+### Decisions (no ADRs)
+
+Do not create `docs/adr/`. A decision tied to a feature goes in that feature's design doc under a `## Decisions` heading; a cross-cutting invariant goes in **Conventions** above. When `domain-modeling` offers to record an ADR, record it in the relevant design doc instead.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` (each label string equals its role name). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` at the repo root (glossary only). Use its vocabulary in identifiers, doc titles, and test names. See `docs/agents/domain.md`.
