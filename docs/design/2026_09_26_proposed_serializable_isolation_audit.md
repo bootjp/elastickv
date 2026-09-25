@@ -131,7 +131,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G7 | Redis paths that bypass the collection fences (Appendix A): the emptying paths through `deleteLogicalKeyElems` (standalone `DEL`, `GETDEL`, `EXPIRE ≤ 0`, `LTRIM` to empty, a zset / set / HLL emptied to zero) neither read nor bump a fence; `HDEL` and update-only `HSET` do not bump the hash fence; `SETNX` and the legacy (dedup-off) `SET` / `INCR` / `HSET` creates read the key type with no fence; `MULTI` type probes for `GET` / `EXISTS` / `EXPIRE` on an absent key record no fence. | `DEL k` racing `RPUSH k v` where the push commits after `DEL`'s snapshot: `DEL` removes the base meta and the items it saw, the push's item and delta survive, the list has a hole. `SETNX k` racing `RPUSH k`: both commit, a string and a list coexist under one key. `MULTI { EXISTS k; SET a 1 }` misses a concurrent create of `k`. **Reproduced** for the `DEL` case: `TestDel_ListEmptyingDoesNotFenceConcurrentPush` in `adapter/redis_del_rpush_repro_test.go` (same branch) holds `DEL` after its item scan, lets `RPUSH v2` commit, and ends with `LLEN = 1`, `LRANGE = []`: the metadata points at the item `DEL` removed while the pushed item survives. |
 | G8 | gRPC `TransactionalKV` has no transaction surface: there is no `Begin`, `PreWrite` / `Commit` / `Rollback` return not-implemented, and every `Put` / `Delete` is a single-key transaction with a coordinator-assigned `StartTS` and no read set (`adapter/grpc.go`, `adapter/grpc_transcoder.go`). | A gRPC client's `Get` followed by `Put` can lose an update; multi-key serializable transactions are reachable today only through Redis `MULTI`, DynamoDB `TransactWriteItems`, SQS, and the filesystem. An API gap rather than a validation bug; documented as such and out of this audit's scope. |
 | G9 | DynamoDB `finalizeLegacyTableMigration` writes `TableMeta` from an earlier snapshot under a process-local lock only; table-generation checks for item writes are compensated after commit rather than validated at apply (`adapter/dynamodb_migration.go`, `adapter/dynamodb_transact.go`). | A stale schema can overwrite a concurrent schema change during legacy migration; low likelihood, migration-only. |
-| G10 | **Single-key lost update: followers issue commit timestamps, and the stale-reapply fast path treats an equal timestamp as "already applied".** `EVAL` / `EVALSHA` are not proxied to the leader (`adapter/redis_lua.go`, `redis_command_specs.go`); a follower runs the script, allocates `commitTS` from its own HLC (`redis_lua_context.go` → `kv.NextTimestampAfterThrough` → `nextFencedWithRecovery`), stamps it into the request, and `Internal.Forward` keeps a preset `commitTS` (`adapter/internal.go`). The physical half is the Raft-applied ceiling, identical on every node, and the logical half advances only through local `Next()` and FSM `Observe`, so two followers that applied the same log hand out the same next timestamp. This violates the `CLAUDE.md` invariant that followers never issue persistence timestamps. Then `staleRaftApplyFastPathLocked` / `raftApplyAlreadyLandedLocked` in `store/lsm_store.go` (added for crash replay) declare an entry already applied when every mutation key has a version at exactly `commitTS`, and return before `checkApplyConflicts`; the second transaction becomes a silent no-op and its client gets OK. **Reproduced** deterministically: `TestLua_TwoFollowersLoseUpdateOnCommitTSCollision` and `TestLua_LostUpdate_StoreTreatsCommitTSCollisionAsReplay` in `adapter/redis_lua_lost_update_repro_test.go` (branch `design/serializable-audit-g10`), a three-node harness where scripts on two followers read the same value and both return OK while one write vanishes; 5 of 5 under `-race`. `dedupProbeOnePhase` in `kv/fsm.go` (`CommittedVersionAt(primary, PrevCommitTS)`) rests on the same timestamp-as-identity assumption. Other adapter paths that pre-allocate `commitTS` (hash / list / zset / stream commands, `MULTI` / `EXEC`, DynamoDB, S3) are not yet audited for follower execution. | A plain read-modify-write through `EVAL` on two nodes can lose one write with both clients told OK. Independent of the multi-key claim; it breaks the single-key guarantee. |
+| G10 | **Single-key lost update: non-leader nodes issue commit timestamps, and the stale-reapply fast path treats an equal timestamp as "already applied".** In legacy TSO mode (the default) `ShardedCoordinator.Dispatch` picks both `StartTS` and `CommitTS` on whichever node runs it (`nextStartTS`, `settleTxnCommitTimestamp` → `nextFencedWithRecovery` on the local HLC; raw writes through `rawLogTimestamp`), then `LeaderProxy.Commit` forwards the pre-stamped request; `Internal.Forward` keeps a nonzero `CommitTS` and its validators are no-ops outside Phase D. The leader-only issuance in `Coordinate.dispatchOnce` applies only to the non-sharded coordinator, which only the demo uses. Concretely: `EVAL` / `EVALSHA` are not proxied to the leader (`adapter/redis_lua.go`, `redis_command_specs.go`); a follower runs the script, allocates `commitTS` from its own HLC (`redis_lua_context.go` → `kv.NextTimestampAfterThrough` → `nextFencedWithRecovery`), stamps it into the request, and `Internal.Forward` keeps a preset `commitTS` (`adapter/internal.go`). The physical half is the Raft-applied ceiling, identical on every node, and the logical half advances only through local `Next()` and FSM `Observe`, so two followers that applied the same log hand out the same next timestamp. This violates the `CLAUDE.md` invariant that followers never issue persistence timestamps. Then `staleRaftApplyFastPathLocked` / `raftApplyAlreadyLandedLocked` in `store/lsm_store.go` (added for crash replay) declare an entry already applied when every mutation key has a version at exactly `commitTS`, and return before `checkApplyConflicts`; the second transaction becomes a silent no-op and its client gets OK. **Reproduced** deterministically: `TestLua_TwoFollowersLoseUpdateOnCommitTSCollision` and `TestLua_LostUpdate_StoreTreatsCommitTSCollisionAsReplay` in `adapter/redis_lua_lost_update_repro_test.go` (branch `design/serializable-audit-g10`), a three-node harness where scripts on two followers read the same value and both return OK while one write vanishes; 5 of 5 under `-race`. `dedupProbeOnePhase` in `kv/fsm.go` (`CommittedVersionAt(primary, PrevCommitTS)`) rests on the same timestamp-as-identity assumption. Blast radius (audited): besides `EVAL` / `EVALSHA`, gRPC `RawKV` `RawPut` / `RawDelete` and `TransactionalKV` `Put` / `Delete` are served on every node with no leader check and stamp locally; the FUSE filesystem service (`internal/filesystem/service.go` `dispatchTxn`, its lease reaper, and startup intent recovery) runs on any mounting node with no leader check; asynchronous cleanups (S3 manifest / part cleanup, DynamoDB deleted-table `DEL_PREFIX`) keep running after a leader change; and in multi-group deployments the default-group leader stamps `CommitTS` for groups it does not lead (2PC, cross-group Redis commands, `FLUSHALL`). Safe because the raw command reaches the leader before any timestamp is chosen: every other Redis write (`proxyToLeader` re-executes on the leader), `MULTI` / `EXEC`, DynamoDB and SQS (HTTP proxy to the default-group leader), S3 (per-route-key verified proxy), `SplitRange`, the lock resolver, and the leader-gated Redis background loops. `Internal.Forward` never `Observe`s a forwarded timestamp, so a follower's stamp can also collide with one the leader issues next. The comment in `adapter/dynamodb_item_write.go` claiming the leader allocates `commit_ts` is true only for `Coordinate`. | A plain read-modify-write through `EVAL` on two nodes can lose one write with both clients told OK. Independent of the multi-key claim; it breaks the single-key guarantee. |
 | G5 | `tla/occ/OCC.tla` models SI | The model cannot catch a regression that removes read-set validation. |
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
 
@@ -174,12 +174,21 @@ allocator to concurrent coordinators, so it is at most a complement.
 
 Two fixes, neither weakening an existing check:
 
-- **No follower-issued persistence timestamps.** Either proxy `EVAL` /
-  `EVALSHA` to the key's leader as every other write command already is, or
-  have the follower obtain its commit timestamp from the leader or the TSO.
-  Leader-side restamping is not an option because Lua list / zset delta keys
-  embed the pre-allocated `commitTS` in the key bytes. The same audit is
-  applied to every adapter path that pre-allocates `commitTS`.
+- **No non-leader-issued persistence timestamps.** `ShardedCoordinator.Dispatch`
+  on a node that does not lead the target group forwards the request
+  **unstamped** (`CommitTS = 0`, raw `Ts = 0`) and the leader allocates in
+  `resolveDispatchCommitTS`, as `Coordinate.dispatchOnce` already does for
+  the demo; `Internal.Forward` in legacy mode rejects a nonzero forwarded
+  `CommitTS` instead of keeping it, so the invariant fails closed. Handlers
+  whose keys embed the timestamp (Lua list / zset delta keys,
+  `VersionedBlobKey` in S3 upload-part) must therefore run on the leader:
+  `EVAL` / `EVALSHA` get the same `proxyToLeader` every other Redis write
+  has; gRPC `RawKV` / `TransactionalKV` gain a leader check with forwarding;
+  the filesystem service dispatches through the leader; the asynchronous
+  cleanups stop when leadership is lost; multi-group stamping for foreign
+  groups goes through each group's leader or the TSO. `CLAUDE.md`'s
+  architecture note is corrected to say this is the intended invariant, not
+  today's behaviour.
 - **Harden the stale-reapply fast path.** "A version exists at
   `(key, commitTS)`" stops being proof that this entry was applied. The path
   compares against a unique identity (the entry's Raft index, or a unique
@@ -189,8 +198,19 @@ Two fixes, neither weakening an existing check:
   `checkConflicts` and the read-set check. `dedupProbeOnePhase` is reviewed
   under the same rule.
 
-The reproduction tests on `design/serializable-audit-g10` are red before and
-must be green after; the fix PR carries them.
+A0 and A0b are one change at the store: the apply-order fence
+(`commitTS > LastCommitTS()`) also rejects a second entry carrying an
+already-applied timestamp, but only if it runs **before** the stale-reapply
+fast path, which today short-circuits first. Replay detection therefore
+moves to the Raft index (an entry at or below the applied index is a replay;
+anything else runs the fence and the conflict checks). The reproduction
+tests on `design/serializable-audit-g10` are red before and must be green
+after; the fix PR carries them, plus tests for the cases the blast-radius
+audit left open: two gRPC `RawPut`s to one key with equal `Ts`, the S3
+`maybeProxyToLeader` fallback that serves locally when the route key cannot
+be loaded, a deposed leader issuing at `physical = ceiling` next to the new
+leader, and the dedup probe (`dedupProbeOnePhase`) matching another
+transaction's version at `PrevCommitTS`.
 
 ### A1. Coverage table and adapter fixes
 
