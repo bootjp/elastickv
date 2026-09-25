@@ -76,7 +76,7 @@ README will present scope in two tiers instead of a non-goals section.
   (`2026_02_24_implemented_filesystem_on_elastickv.md`).
 - Consistency: per-key linearizable; multi-key transactions atomic, with
   OCC validation of write and read sets at apply. **Serializable is the
-  target, not yet the claim**: the audit (§6.3) found that validation assumes
+  target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
   that 2PC read keys are unprotected between PREPARE and COMMIT (G1). README
   makes the serializable claim only after the audit's A0 to A2 fixes land
@@ -125,8 +125,8 @@ behind each claim.
    `store/mvcc_store.go`), so two transactions that read each other's writes
    cannot both commit: write skew is rejected as a write conflict. Coverage
    today: no path can be called serializable yet. The audit's A2 analysis
-   found that the check assumes apply order equals commit-timestamp order,
-   which is not enforced (G0), and that 2PC read keys are unprotected between
+   found, and reproduced with a test, that the check assumes apply order
+   equals commit-timestamp order, which is not enforced (G0), and that 2PC read keys are unprotected between
    PREPARE and COMMIT (G1); S3 handlers and Lua string reads do not surface
    their reads at all (G2, G3). The claim is made once A0 to A2 of §6.3
    land. Evidence
@@ -257,8 +257,9 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
   write-up (parallel) → showcase → feature track.
 - Spec of record is `docs/design/`; no ADRs; decisions live in design docs
   (this section is the pattern); repository artifacts are English.
-- The audit's A2 analysis found gaps G0 and G1 on `main`; the serializable
-  claim is the target and is not made for any path until A0 to A2 land.
+- The audit's A2 analysis found gaps G0 and G1 on `main`, and G0 is
+  reproduced by a failing test; the serializable claim is the target and is
+  not made for any path until A0 to A2 land.
 
 Assumptions made while reconciling with `main` (not put to the interview):
 

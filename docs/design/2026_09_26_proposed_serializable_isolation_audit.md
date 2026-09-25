@@ -123,7 +123,7 @@ Facts checked on `main` at `4ca7e90d`.
 
 | ID | Gap | Consequence if left open |
 |---|---|---|
-| G0 | **Apply order is not commit-timestamp order.** Commit timestamps are allocated before proposal with no lock to the proposal, so two writers can propose in the opposite order of their timestamps; the apply path never rejects an entry whose `commitTS` is at or below the watermark; reads take the watermark as their snapshot. Affects RAW, one-phase, and 2PC on every adapter. Established by code reading (§2); not yet reproduced. | Writer W1 allocates `c1`, W2 allocates `c2 > c1`, W2 proposes and applies first, the watermark becomes `c2`; T reads key `k` at `s = c2` and misses W1's version; W1 applies at `c1 < s`; T's validation (`TS > s`) sees nothing. If T also writes `k`, W1's write is lost; if T read `k` and `j` from W1 across W1's apply, T saw a torn snapshot. This is the same hazard the backup floor closes for backups. |
+| G0 | **Apply order is not commit-timestamp order.** Commit timestamps are allocated before proposal with no lock to the proposal, so two writers can propose in the opposite order of their timestamps; the apply path never rejects an entry whose `commitTS` is at or below the watermark; reads take the watermark as their snapshot. Affects RAW, one-phase, and 2PC on every adapter. **Reproduced**: `TestApplyOrder_SnapshotAtWatermarkIsStableUnderProposalReordering` in `kv/apply_order_repro_test.go` (branch `design/serializable-audit-a0`) fails on `main` in 10 of 10 runs under `-race`, using a parking proposer that holds one proposal while a later-timestamped one applies; a read at the watermark returns nothing, then returns the parked write after it applies. | Writer W1 allocates `c1`, W2 allocates `c2 > c1`, W2 proposes and applies first, the watermark becomes `c2`; T reads key `k` at `s = c2` and misses W1's version; W1 applies at `c1 < s`; T's validation (`TS > s`) sees nothing. If T also writes `k`, W1's write is lost; if T read `k` and `j` from W1 across W1's apply, T saw a torn snapshot. This is the same hazard the backup floor closes for backups. |
 | G1 | 2PC read keys are unprotected between PREPARE and COMMIT on every shard: write shards validate them once at PREPARE apply, locks cover write keys only, and COMMIT does not re-validate; read-only shards are additionally validated outside the apply lock with read keys in no Raft entry | T reads `k` and writes `x` (one-phase); W reads `x` and writes `k` (2PC). W's PREPARE validates `x` before T applies; T applies (no committed version of `k` from W exists yet, and W's lock on `k` is not checked against T's read keys); W's COMMIT applies without re-validation. Both commit: write skew. On read-only shards the same window exists plus the barrier-to-check gap. |
 | G2 | S3 handlers do not surface reads. Read-then-write sites (function names in `adapter/s3.go`, `s3_admin.go`, `s3_admin_objects.go`): `createBucket`, `deleteBucket`, `putBucketAcl`, `putObject`, `deleteObject`, `createMultipartUpload`, `uploadPart` (partly covered), `completeMultipartUpload`, `abortMultipartUpload`, and the admin equivalents. `If-Match` / `If-None-Match` are checked pre-Raft only (`validateS3PutPreconditions`). | Concrete anomaly: `deleteBucket` scans for emptiness at `readTS` while a concurrent `putObject` reads the bucket meta at its own `readTS`; both commit, leaving an object in a deleted bucket. Object-level races are mostly covered because the object head / manifest key is in the write set. |
 | G3 | Lua scripts record no read key for string values | A script that reads string `a` and writes string `b`, racing with one that reads `b` and writes `a`, can produce write skew. |
@@ -140,9 +140,13 @@ delays one dispatch between `resolveDispatchCommitTS` and `Propose` while a
 second dispatch with a later timestamp goes through, and a reader that takes
 `StartTS` from the watermark in between; the test asserts the lost update.
 A store-level test documents the underlying semantics (applying `c1` after
-`c2 > c1` leaves a read at `c2` blind to `c1`). Both are expected to fail
-on `main` today; if the coordinator-level test cannot be made to fail, G0 is
-downgraded to "theoretical" and this milestone becomes documentation only.
+`c2 > c1` leaves a read at `c2` blind to `c1`). Status: both tests exist in
+`kv/apply_order_repro_test.go` on branch `design/serializable-audit-a0`. The
+coordinator-level test fails deterministically on `main` (no production
+hook was needed: the parking sits in a test-only `raftengine.Proposer`
+wrapper around the real single-node engine, and `commitSequential` does not
+serialise one-phase proposals); the store-level test passes. The fix PR
+carries both tests, per the convention in `CLAUDE.md`.
 
 Fix: generalise the backup timestamp floor into a permanent apply-order
 fence. At FSM apply, a RAW or one-phase entry whose `commitTS` is at or below
