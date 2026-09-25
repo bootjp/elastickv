@@ -166,6 +166,14 @@ func TestS3Server_DeleteObjectHonorsWildcardIfMatch(t *testing.T) {
 	rec = httptest.NewRecorder()
 	server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a/object", nil))
 	require.Equal(t, http.StatusNotFound, rec.Code)
+
+	for _, ifMatch := range []string{"*", `"missing-etag"`} {
+		rec = httptest.NewRecorder()
+		req := newS3TestRequest(http.MethodDelete, "/bucket-a/object", nil)
+		req.Header.Set("If-Match", ifMatch)
+		server.handle(rec, req)
+		require.Equal(t, http.StatusPreconditionFailed, rec.Code, "If-Match %s", ifMatch)
+	}
 }
 
 func TestS3Server_PutObjectHonorsWildcardIfMatch(t *testing.T) {

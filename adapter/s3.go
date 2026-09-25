@@ -1227,9 +1227,6 @@ func (s *S3Server) deleteObjectAttempt(
 	if err != nil {
 		return nil, 0, errors.WithStack(err)
 	}
-	if !found {
-		return nil, meta.Generation, nil
-	}
 	if err := validateS3PutPreconditions(r, manifest); err != nil {
 		return nil, 0, &s3ResponseError{
 			Status:  http.StatusPreconditionFailed,
@@ -1238,6 +1235,9 @@ func (s *S3Server) deleteObjectAttempt(
 			Bucket:  bucket,
 			Key:     objectKey,
 		}
+	}
+	if !found {
+		return nil, meta.Generation, nil
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
 	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
