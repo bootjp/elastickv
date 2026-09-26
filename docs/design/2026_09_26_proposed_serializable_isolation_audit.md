@@ -599,6 +599,41 @@ checks). The one-phase path is unchanged: it installs no read locks, and
 its reads and a conflicting 2PC read lock on the same group are ordered by
 that group's apply.
 
+`DEL_PREFIX` now conflicts with transaction locks, on
+`design/serializable-audit-a2-delprefix-locks` (two commits on the read-lock
+fix, not pushed): `e0c839bf` adds `kv/txn_delprefix_lock_repro_test.go`
+(T prepares with read key `k` and write key `x`; a flush over both applied,
+deleted the committed `k`, kept the intent, and T then committed
+`x`), `71334583` adds `assertNoTxnLocksUnderPrefix` to
+`handleDelPrefixWithFloorSnapshot`, after the reserved-prefix, route-fence
+and floor checks and before `DeletePrefixesAtRaftAtFenced`: one range scan
+of `txnLockKey(prefix)` for write locks (one seek when none is held), then a
+paged scan of the whole `!txn|rlock|` namespace filtered by prefix (the
+rows are length-prefixed, so a prefix cannot be seeked; pages 8 → 1024).
+The first matching row fails the apply with `TxnLockedError` ("write lock"
+or "read lock") and nothing is deleted; a key under `!txn|` never counts,
+matching what the delete skips. No coordinator change: nothing resolves or
+retries `TxnLockedError` for raw requests today, `DEL_PREFIX` is a
+per-group broadcast whose copies apply independently (re-running it would
+re-apply the landed copies), and every caller (Redis `FLUSHDB` /
+`FLUSHALL` through `retryRedisWrite`, the DynamoDB deleted-table cleanup,
+the S3 bucket-delete safety net) already retries the whole flush on that
+error. Tests: 28 table subtests (write lock, read lock, both, lock outside
+the prefix, nil prefix, `!txn|` user keys; resolved by COMMIT and by
+ABORT; in-memory and Pebble), a paging test with a read lock behind 1124
+unrelated rows, and a single-group Raft test that a dispatched flush fails
+with `ErrTxnLocked` and deletes nothing, then succeeds after COMMIT.
+`store`, `kv`, `adapter` green under `-race` (the A0b flake did not fire);
+lint clean. Limits: the read-lock scan grows with the group's in-flight
+read sets (FLUSHDB runs it five times, the S3 safety net seven), accepted
+because a prefix delete already scans everything under its prefix; locks on
+migration-staged keys are skipped as on the raw point path; and a
+rejection that crosses `Internal.Forward` loses its type as a gRPC status,
+which Redis re-parses but the DynamoDB cleanup and the S3 safety net do not
+(they give up and log), a pre-existing property of every forwarded
+`TxnLocked` or fenced conflict that the A0b `Forward` work should carry
+across the wire.
+
 Constraints the fix PR must close before merge:
 
 - **Read-lock installation versus foreign write locks (found in review):
@@ -620,10 +655,8 @@ Constraints the fix PR must close before merge:
   rollback record keys, `commitApplyStartTS`, `appendRollbackRecord`, and
   `completeCommittedTxn`), keep a same-`TxnID` retry idempotent, and turn
   the reproduction green with T1 or T2 aborted on a lock conflict.
-- **`DEL_PREFIX` ignores locks (found in review).** The implemented A2
-  leaves raw `DEL_PREFIX` outside lock validation; add range-aware conflict
-  handling against write and read locks under the prefix, with a test that
-  prepares a transaction reading a key the flush deletes.
+- **`DEL_PREFIX` ignores locks (found in review): closed** on
+  `design/serializable-audit-a2-delprefix-locks` (status above).
 - **Tombstone accumulation.** Rows are per `(key, transaction)` and MVCC
   compaction keeps a key's last tombstone, so every released read lock leaves
   a permanent tombstone that every later writer of that key scans: about
@@ -640,8 +673,8 @@ Constraints the fix PR must close before merge:
 - **Behaviour change.** A read key routing to a group the coordinator does
   not know now aborts the transaction (before, its validation was silently
   skipped).
-- Pre-existing: raw `DEL_PREFIX` bypasses lock validation (the blocker
-  above). Ordinary RAW `PUT` / `DEL` already check write locks
+- Pre-existing: raw `DEL_PREFIX` bypassed lock validation (closed above).
+  Ordinary RAW `PUT` / `DEL` already check write locks
   (`validateRawMutationForApply` → `assertNoConflictingTxnLock`) and
   deliberately skip read locks: a raw write carries no read set, so it can
   always be serialised after the transaction holding the read lock (a raw
