@@ -163,9 +163,9 @@ behind each claim.
    found, and reproduced with a test, that the check assumes apply order
    equals commit-timestamp order, which is not enforced (G0), and that 2PC read keys are unprotected between
    PREPARE and COMMIT (G1); S3 handlers and Lua string reads do not surface
-   their reads at all (G2, G3). The claim is made once A0 to A2, G11, and G13 (the append lost across a
-   route-shuffle split, not yet diagnosed) of §6.3 land; until G13 is fixed
-   the claim also excludes deployments that run the hotspot split. Evidence
+   their reads at all (G2, G3). The claim is made once A0 to A2, G11, and G13 (a 2PC PREPARE at the
+   previous commit's timestamp swallowed as a replay, closed by A0's
+   index-based replay detection) of §6.3 land. Evidence
    today: Elle list-append under `:strict-serializable` for Redis MULTI/EXEC
    and DynamoDB `TransactGetItems` + `TransactWriteItems`. That workload
    cannot exhibit write skew (every anti-dependency comes with a write-write
@@ -191,8 +191,8 @@ implementation, per `CLAUDE.md`.
 "Who is this for" section and the two-tier scope once both docs land; the
 consistency claims go into README only after the audit's A0 to A2 fixes,
 the G11 fix (the server-side outcome-unknown error and its mapping in
-every adapter), and the diagnosis and fix of G13 (an acknowledged append
-lost across a route-shuffle split) are merged; a `NOTLEADER` that a later read contradicts is
+every adapter), and G13 (a 2PC PREPARE swallowed as a replay, closed by
+A0's index-based replay detection, with its regression test) are merged; a `NOTLEADER` that a later read contradicts is
 an anomaly independent of the timestamp and read-lock fixes.
 
 ### 6.2 Security milestone
