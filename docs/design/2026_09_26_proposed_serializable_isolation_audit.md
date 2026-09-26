@@ -968,8 +968,63 @@ Constraints the fix PR must close before merge:
 - **Transaction identity (G12, found in review, reproduced): closed** on
   `design/serializable-audit-a2-txnid` (status above). Still open from it:
   the rolling-upgrade gate (A7).
-- **PREPARE order (G14, reproduced).** Three changes, on
-  `design/serializable-audit-a2-prepare-order` over the reproduction:
+- **PREPARE order (G14, reproduced): closed** on
+  `design/serializable-audit-a2-prepare-order` (four commits over the
+  reproduction, not pushed): `a9387b26` prepares in `txnPrepareOrder`
+  (primary group, then the other write groups, then the read-only groups;
+  the PREPAREs were already sequential, so no round-trip is added, and the
+  primary's `Commit` returns only after its FSM applied, so no secondary
+  lock exists before the primary lock); `c5b94ac5` makes `primaryTxnStatus`
+  and `backgroundPrimaryTxnStatus` treat "no primary lock and no record" as
+  pending (the reader gets `txn locked`, the resolver skips the row;
+  justification in the `primaryWithoutLockOrRecordIsPending` comment);
+  `9dbdb9df` adds `mutations_carry_values` to `Request` (additive, `buf
+  breaking` clean) so a `TxnID` transaction's secondary COMMITs carry the
+  group's real writes (PUT with value, DEL; the flag is needed because
+  proto3 cannot tell an empty value from a missing one; primary COMMITs and
+  legacy transactions stay keys-only); `3346ba67` makes a secondary COMMIT
+  whose lock is gone install the carried write at `commitTS` when the entry
+  carries values, has a `TxnID`, and no version of the key is newer than
+  `startTS`, treat an existing version at exactly `commitTS` as already
+  landed, and otherwise fail with the new `ErrTxnWriteLost` (logged with
+  `key`, `commit_ts`, `start_ts`, `primary_key`, `txn_id`) instead of
+  returning success with nothing written; `commitSecondaryTxns` surfaces it
+  after still committing the other secondaries and does not retry it. Two
+  things found on the way: the TransactionManager's cleanup ABORT also
+  fired after a failed secondary COMMIT and released the committed
+  transaction's secondary locks (`txnCleanupRequests` now skips COMMITs
+  that do not name their primary), and a keys-only COMMIT that finds the
+  lock present but the intent gone now fails loudly (the primary's then
+  aborts through `settleFailedPrimaryCommit`) where it silently wrote
+  nothing. Tests: the reproduction, renamed
+  `TestTwoPhaseCommit_PrimaryIsPreparedBeforeAnySecondary`, parks T's
+  second PREPARE whichever group it goes to and covers read, scan, and
+  resolver (live and expired; the four higher-group variants fail with the
+  old order restored); `SecondaryWithoutPrimaryLockOrRecordStaysPending`
+  (read, scan, expired resolver, `TxnID` and legacy, all red under the old
+  rule); the coordinator stopped after the primary PREPARE (the reader of
+  the secondary reads the old value, one resolver pass writes the rollback
+  record); the FSM install / fail-loudly / already-committed /
+  primary-lock-lost cases on both stores; and the coordinator-level
+  reinstall (`TxnID` commits both keys; legacy gets `ErrTxnWriteLost` after
+  one unretried COMMIT). `store`, `kv`, `adapter`, `distribution` green
+  under `-race`; lint clean. Cost: the Raft log carries each secondary value
+  twice (PREPARE and COMMIT) for `TxnID` transactions; keyviz double-counts
+  those bytes. Limits: a secondary lock whose primary has neither lock nor
+  record is never resolved (only an old-binary coordinator whose primary
+  PREPARE never applied can produce it), closed by the follow-up below;
+  readers on an old binary can still wrongly abort secondaries during the
+  A7 rolling upgrade, `TxnID` transactions heal through the valued COMMIT
+  and legacy ones fail loudly; `ErrTxnWriteLost` means the transaction is
+  half-committed (the same posture as
+  `ErrTxnSecondaryRouteShiftedAfterPrimaryCommit`), which is data loss to
+  report, not indeterminacy: the adapters must return an error, never OK,
+  and never retry the whole transaction on it. Follow-up on the same
+  branch: for an **expired** secondary lock whose primary has neither lock
+  nor record, the resolver sends an ABORT naming the primary, which writes
+  the rollback record so a late primary COMMIT (and, with the lock-GC
+  branch, a late primary PREPARE) is rejected. The original design of the
+  three changes follows.
   (1) `prewriteTxn` prepares the **primary group first** and sends the
   secondaries (write groups, then the lock-only read groups) only after the
   primary PREPARE has applied, so a secondary lock never exists without the
