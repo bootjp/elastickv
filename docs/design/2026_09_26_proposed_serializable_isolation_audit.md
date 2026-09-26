@@ -608,10 +608,57 @@ update that exists on `main` as well (G10). A 30-second run is not enough
 to separate the binaries statistically; the fix PR should run the Lua
 workload longer or at a higher rate and report the counts.
 
+Third results, on a binary built from `design/serializable-audit-a0-complete`
+(the full stack: G3 / G7 adapter fixes, A0 fence with replicated watermark,
+A2 read locks, A0b leader-only stamping, 2PC commit-time timestamp), same
+topology, 60 s at rate 50 / concurrency 10:
+
+| Workload | Result |
+|---|---|
+| Lua, three runs | `:valid? true` in all three (1466 / 1495 / 1512 ok, 0 fail, 0 info). No G2-item, no lost update, in about 4,470 transactions. |
+| Redis `MULTI`, two runs | `:valid? true` (1341 / 1237 ok). |
+| DynamoDB, two runs | `:valid? true` (2142 / 2237 ok; 339 / 312 `:fail` are `TransactionCanceledException` from condition checks). |
+| Existing CI set at CI settings | all `:valid? true` (see the harness findings below for three vacuous passes). |
+| Existing list-append, Redis and DynamoDB, 60 s at rate 50 on a fresh cluster | `:valid? true` (1014 and 2181 ok). |
+
+Reading: the three anomaly shapes seen on `main` (Lua cross-key G2-item,
+single-key lost update, the `MULTI` `:cyclic-versions` artifact) did not
+appear on the full-stack binary under the load that produced them. Every
+run was `--local`: no partitions, kills, or leader changes, on one host;
+the paths the fixes target under leadership changes (forwarding while
+leadership moves, the 2PC commit timestamp after PREPARE) are not yet
+exercised under faults. Node logs contained no `panic` or `fatal` lines;
+the server does not log conflicts, fences, or read locks at the default
+level, so their frequency is visible only client-side.
+
+Cost observed: Lua latency rose from roughly 39 to 72 ms mean (p50 about
+28 ms, p99 0.2 to 0.4 s) on `main` to about 380 ms mean (p50 about 162 ms,
+p99 2.7 to 2.9 s) on the full stack, while client-visible Lua write conflicts
+fell from 68 to 157 per 30 s run to 0: `EVAL` now runs on the leader through
+the proxy and conflicts are retried server-side. The benchmark milestone
+measures this properly; the Lua proxy path (a shared go-redis client with a
+3 s read timeout) is the first place to look.
+
+Harness findings, to be filed as their own follow-ups (they hold for any
+server binary):
+
+- `elastickv.sqs-htfifo-workload` tests nothing, in CI too: `setup!` stores
+  the queue URL on the record it returns, Jepsen 0.3.13 discards that
+  value, workers get clients from `open!`, so every request carries a nil
+  `QueueUrl` and the server answers `MissingParameter` (HTTP 400); the
+  checker sees 0 sends and 0 receives and reports valid.
+- The list-append workloads reuse plain integer keys across runs, so a
+  second run on the same cluster makes Elle abort (`No transaction wrote
+  11 = 2`); CI runs each workload once per cluster and is unaffected.
+- The DynamoDB per-type `binary` and `binary-set` runs cannot decode reads
+  (every read is `:info`), so those two types are write-only checks.
+
 Remaining:
 
-- Fix G10 (A0b), then re-run the Lua workload on the fixed binary until it
-  is green.
+- Run the rw-register workloads under faults (leader kill, pause,
+  partition) against the full-stack binary; `--local` disables the nemesis
+  today, so a local process-kill nemesis is needed first.
+- Fix the three harness findings above (separate PRs).
 - Multi-shard variant for each workload: keys spread across at least two
   Raft groups so G1's path is exercised (Jepsen M5 already runs multi-group
   locally).
