@@ -261,9 +261,97 @@ alternative, per-group read timestamps (each read key validated against
 the watermark its group had when it was read, carried on the wire),
 avoids the entry but gives up the single-snapshot model the TLA+ spec and
 this document rely on; it is recorded here in case the entry cost matters.
-Needed before merge: the advance entry and its apply, the `ShardStore`
-read path, a regression run of the reproduction (green with `W_B` fenced
-or seen), and a test that a single-group read proposes nothing. An alternative that avoids rejections, serialising
+Landed on `design/serializable-audit-a0-multigroup` (four commits over
+the reproduction, not pushed): `51de638c` the advance entry (a reserved
+FSM tag `0x0f` plus an 8-byte timestamp, chosen because `0x0f` is an
+invalid proto wire byte and sits outside the encryption band, applied
+through `ApplyMutationsRaftAt` with no mutations so both watermarks become
+`max(current, ts)` in the same batch as the applied index; unfenced,
+idempotent, a no-op on replay, refused for 0 and `^uint64(0)`, observed by
+the HLC so a fenced write retries above it, carried by every snapshot);
+`21a11ddc` the read path: every leader-local `ShardStore` read (eleven
+entry points: get, exists, the version probes, every scan shape) goes
+through `leaderReadAt`, whose behaviour depends on the intent carried in
+the context: a **snapshot** intent exists only on a `ReadTimestamp` minted
+inside `kv` by `BeginSnapshotReadTimestamp` (an unexported capability
+field, bound with `WithReadSnapshot` or through `WithDispatchVoucher`),
+applies only at its own timestamp, proposes an advance through the
+wrap-aware proposer when the group's replicated watermark is below it and
+waits for the local apply, is refused with `ErrReadTSAheadOfClock` when the
+physical half exceeds `max(HLC.Current, PhysicalCeiling) +
+hlcPhysicalWindowMs` (no wall clock), and skips groups without an engine,
+the TSO group, and stores without a replicated watermark; a **client**
+intent (`WithClientReadTimestamp`) never proposes and fails with
+`ErrReadTSAboveWatermark` above the watermark; a bare timestamp reads as
+before. The snapshot comes from the leaders: `BeginSnapshotReadTimestamp`
+calls the new `LeaderSnapshotCoordinator` capability, which
+`ShardedCoordinator` implements by fencing every data group's leader
+(lease or ReadIndex) and taking the maximum of their `lastCommitTS`
+(the local value is kept if higher; an all-zero answer means an empty
+store and no capability is issued; the single-group `Coordinate` adds no
+barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
+RPC carrying a `ForwardedReadMode` and the group's bearer token
+(admin-token-protected like `ForwardLeaseRead`), so a remote read still
+costs one round trip; an `Unimplemented` answer from an older leader falls
+back to the public `RawKV` call. A per-group `watermarkAdvancer` allows one
+proposal in flight, folds higher targets into the next proposal, re-checks
+under the lock, and never hands a waiter another caller's cancellation.
+`a2c51771` the public gRPC reads: no provenance field on the request
+types; a nonzero client `Ts` above the group's watermark on `RawGet` /
+`RawScanAt` / the version probes returns `FailedPrecondition`; `Ts = 0`,
+`Get`, and `Scan` begin a leader snapshot and read under it. `93b5623b`
+the adapters: the Redis, DynamoDB, SQS, and S3 transaction-begin helpers,
+the Redis `EXEC` fence path, and the delta compactor begin leader
+snapshots and read under the capability (about 60 call sites; the
+DynamoDB legacy-migration check that runs on every request stays local
+and begins a leader snapshot only when a table needs migrating). The
+reproduction is green (`W_B` is fenced and retries above `s`, or lands
+before the snapshot and is seen). Tests: the entry on both stores through
+real Raft; one proposal per lagging read entry point; zero proposals for
+the single-group, at-or-below-watermark, `^uint64(0)`, and `ts = 0`
+cases; a fresh empty store; 32 concurrent readers producing one entry;
+rising targets folding into exactly two proposals; a waiter surviving its
+owner's cancellation; the fenced delayed write; six clock-bound cases;
+forwarded reads keeping their intent in one RPC with no proposal on the
+follower and the legacy fallback; the lagging-replica regression (this
+node follows group B with a stale replica while B's leader acknowledged
+`c1`: the local snapshot misses `c1`, the leader snapshot is at or above
+it); the gRPC client-`Ts` matrix; `ForwardRead` in each mode and its
+token; each adapter's begin helper issuing the capability. `store`, `kv`,
+`adapter` green under `-race` (one pre-existing `store` flake,
+`TestPebbleStore_RestoreWaitsForMaintenanceLock`, passed on rerun); lint
+clean. Cost: single-group reads at their own watermark pay nothing; an
+idle group pays one entry per distinct snapshot; a hot multi-group
+workload at most one entry per lagging group per Raft round trip; every
+multi-group transaction begin now fences all group leaders (a local lease
+check where the lease is valid, one `ForwardLeaseRead` per group this node
+does not lead), which the benchmark milestone measures.
+
+Open after this branch:
+
+- **2PC commit timestamps versus advanced secondaries.** The commit
+  timestamp is allocated on the primary group's leader, whose HLC and
+  watermark may sit below an `s` that a secondary group was advanced to;
+  the secondary COMMIT is unfenced, so it can land at or below `s` on that
+  group if its PREPARE applied after the read. Fix: the primary allocates
+  the commit timestamp above every participant's watermark (each PREPARE
+  reply returns its group's replicated watermark; the allocation goes
+  through the HLC's after-through path). A merge blocker for A0.
+- **Non-transactional reads stay plain.** Redis `GET` / `MGET` and scans,
+  DynamoDB `GetItem` / `Query` / `Scan`, S3 `GET` / `LIST`, and the SQS
+  peek read at the local watermark without the capability. A single-key
+  read is a leader read on one group and unaffected; a multi-key read
+  that spans groups can be torn (DynamoDB documents `Scan` as such; Redis
+  `MGET` is atomic upstream and should route through a snapshot read when
+  its keys span groups). Recorded as a limit; `MGET` is the one to close.
+- **Rolling upgrade.** Older followers skip the `0x0f` entry (a fence
+  verdict divergence of the A0 class), an older node forwarding a snapshot
+  read through the public `RawGet` gets `FailedPrecondition` from an
+  upgraded leader, and a snapshot read forwarded to an older leader is
+  served without an advance: all covered by the A7 gate, whose V2 set now
+  includes the advance entry and `ForwardRead`.
+- `hlcPhysicalWindowMs` is 20 s in code; `CLAUDE.md` said 3 s and is
+  corrected. An alternative that avoids rejections, serialising
 allocation and proposal under one lock per group, does not cover timestamps
 allocated on other nodes (Internal.Forward) or handed out by the TSO batch
 allocator to concurrent coordinators, so it is at most a complement.
