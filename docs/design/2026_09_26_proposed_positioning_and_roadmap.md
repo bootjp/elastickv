@@ -216,9 +216,15 @@ Prerequisite for the on-premises showcase. Scope:
   proxy and the S3 reverse proxy (`leader_http_proxy.go`, hard-coded
   `http`) take the scheme, CA, server name, and the SigV4 credentials they
   must re-sign or pass through; `GRPCConnCache` takes the client TLS
-  config instead of the insecure dial options. Alternative if that plumbing
-  is larger than it looks: separate authenticated internal endpoints for
-  forwarding, decided in the milestone's design doc.
+  config instead of the insecure dial options; and the Raft transport,
+  which shares the gRPC listener (`startGRPCServers` registers it on the
+  same server) and dials peers through the same insecure
+  `internal.GRPCDialOptions()` (`internal/raftengine/etcd/grpc_transport.go`),
+  gets the client TLS config too, or Raft moves to its own listener, since
+  enabling TLS on the shared listener without that would stop peers from
+  exchanging messages and cost the cluster its quorum. Alternative if that
+  plumbing is larger than it looks: separate authenticated internal
+  endpoints for forwarding, decided in the milestone's design doc.
 - Deferred: gRPC mTLS or bearer tokens; node-to-node Raft authentication
   (assumed to run inside a private network or tailnet).
 

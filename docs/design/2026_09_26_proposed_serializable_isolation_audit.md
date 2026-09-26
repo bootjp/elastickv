@@ -216,10 +216,14 @@ reads. Only a **cluster-issued** snapshot may advance a watermark: the
 advance is bounded by the leader's HLC (a timestamp above what the local
 clock could have issued is refused, never persisted), and a timestamp the
 client supplied directly, as gRPC `RawGet` / `RawScanAt` / `Get` / `Scan`
-accept in their `Ts` field, never advances anything: such a read is served
-at `min(ts, watermark)` and says so, otherwise one request with a
-far-future timestamp would fence every write on the group until wall time
-caught up. The coordinator's own snapshot reads (the adapters' `snapshotTS`
+accept in their `Ts` field, never advances anything: a client timestamp
+above the group's watermark is **rejected** (`FailedPrecondition`, "read
+timestamp above the group's applied watermark"; a client that wants the
+latest state passes `Ts = 0`), not silently served at a lower snapshot,
+because the responses carry no effective read timestamp and a later write
+at or below the requested `ts` could change the answer; and otherwise one
+request with a far-future timestamp would fence every write on the group
+until wall time caught up. The coordinator's own snapshot reads (the adapters' `snapshotTS`
 / `globalSnapshotTS`, `txnStartTS`, `nextTxnReadTS`, `readTS`) are the
 trusted callers; single-group reads (`s` is that group's own watermark) never pay,
 and an idle group pays one entry per distinct `s` it is read at, in the
@@ -436,9 +440,18 @@ Still open for the fix PRs:
 - Not yet leader-issued: the 2PC ABORT timestamp (unfenced) and the
   pre-allocated paths above; making delta keys independent of the commit
   timestamp would remove the exemption.
-- One more 8-byte meta key per replicated apply batch, not benchmarked; the
-  streaming MVCC and in-memory snapshot formats do not carry the replicated
-  watermark and fall back.
+- One more 8-byte meta key per replicated apply batch, not benchmarked.
+- **The streaming MVCC and in-memory snapshot formats must carry the
+  replicated watermark (found in review).** Today they omit
+  `_meta_last_raft_commit_ts` and the restore falls back to
+  `LastCommitTS()`, which direct writes such as `CatalogStore.Save` advance
+  on their own; a replica restored from such a snapshot then fences a
+  committed entry at or below that direct-write timestamp while replicas
+  holding the true replicated watermark apply it, a divergent FSM. Every
+  Raft snapshot format carries the key, and the fallback survives only for
+  a snapshot produced before the fence existed, which the rolling-upgrade
+  gate keeps from being restored after activation. A merge blocker for
+  A0, with a restore-then-apply test on each format.
 
 ### A1. Coverage table and adapter fixes
 
