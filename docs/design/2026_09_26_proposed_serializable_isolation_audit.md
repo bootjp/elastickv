@@ -587,10 +587,64 @@ collection fences (a
 concurrent `HSET` creating it is undetected, which matters only in a
 two-script cycle), `SET NX` / `SET XX` / `SETNX` check existence through
 `logicalExists`, which records nothing, and probes that resolve to a
-collection type record nothing; Lua collection reads (`HGET`, `LRANGE`,
-`SMEMBERS`, `ZRANGE`, stream reads) record nothing; and `PFADD` / `XADD` on
-an absent key still write without the fence read (all three are A1
-blockers listed in the plan above).
+collection type record nothing.
+
+The collection half of the Lua and creator work is on
+`design/serializable-audit-a1-redis-collections` (five commits on the Redis
+branch, not pushed). `b69ce8f2` adds two reproductions through the real
+FSM: a script that reads a collection and `SET`s another key from what it
+read, racing an update of that collection (`HGET` versus an update-only
+`HSET`, `HGETALL` versus a new field, `LRANGE` versus `RPUSH`, `SMEMBERS`
+and `SISMEMBER` versus `SADD`, `ZSCORE` versus a score update; all
+committed the stale value, `XLEN` was already covered by the stream meta
+key), and two absent-key creators held after their first read while the
+other commits (`XADD` versus `HSET` and `RPUSH`, `PFADD` versus `SADD`, and
+the reverse orders; each ended with two encodings under one key, e.g.
+`[list stream]`). `c6056fc8` records collection reads as read keys, once
+per key per script: the list fence for `LLEN` / `LINDEX` / `LRANGE` /
+`LPOS`; the set fence for `SMEMBERS` / `SCARD`, plus the member key for
+`SISMEMBER`; the zset fence and the legacy zset blob key for the range and
+count reads, plus the member key for `ZSCORE`; the hash fence and the
+legacy hash blob key for `HLEN` / `HGETALL`, plus the field key for `HGET`
+/ `HEXISTS` / each `HMGET` field; the thirteen-key absent set (four fences
+and nine type anchors, shared with `EXISTS` / `TYPE` / `PTTL`) for any
+collection read that finds the key absent and for an empty
+`ZRANGEBYSCORE` fast path, which cannot tell absent from empty. The
+legacy blob keys are recorded because some legacy-blob writes skip the
+fence. `5eb20a7e` gives `PFADD` and `XADD` (dedup, legacy, and the Lua
+`XADD` create path) the `redisAbsentKeyCreateGuard` the dedup `SET`
+create uses: read the absent set and `Put` the four fences (the `Put` is
+what makes a `SADD` / `RPUSH` committing second conflict). `a7f2dafe` and
+`7b23b0fb` pin the read sets in 39 cases and the creator fences in 8.
+Results: all 15 interleavings green (the first attempt fails with a write
+conflict and the retry sees the new value, or returns `WRONGTYPE`);
+`adapter` green under `-race` (19 min); the two expected-red A0 / A2
+reproductions the branch carries still fail; lint clean. Cost: 1 read key
+per list / set read, 2 per zset / hash read, +1 per distinct element for
+point reads, 13 per absent key; a creator adds 13 read keys and 4 `Put`s;
+appends add nothing; an `HGET`-heavy script that writes now reaches
+`kv.maxReadKeys` at about 9,998 distinct fields of one hash, 3,333 present
+hashes, or 769 absent collection keys and fails closed; the empty
+`ZRANGEBYSCORE` poll (BullMQ's delayed-queue loop) costs 13 read keys.
+What range reads can and cannot detect, checked against every write
+path: lists, sets, zsets, and streams are complete (every push, pop, trim,
+membership change, score change, logical delete, type change, and stream
+write touches the type's fence or meta); **hashes are not**: `HGETALL` and
+`HLEN` cannot see an update of an existing field (`HSET`, `HMSET`,
+`HINCRBY`) or a wide-column `HDEL` that leaves the hash non-empty, because
+those write only the field key and a per-commit delta key. Decision:
+`HGETALL` and `HMGET` record every field key they return (a script reading
+a hash of more than about 10,000 fields fails closed, as for strings);
+`HLEN` depends only on the field set, so every `HDEL`, emptying or not,
+`Put`s the hash fence (deletes are rare enough to serialise per hash),
+while value-only updates stay fence-free; this is the balance between
+penalising only the scripts that read whole hashes and serialising every
+writer of a hot hash. Still open after this branch: `SETNX`, `SET NX` /
+`SET XX`, and the legacy string creates record nothing (a held `SETNX`
+against a `PFADD` / `XADD` that commits first still creates two
+encodings; the reverse order is now caught), reads that hit `WRONGTYPE`
+under `pcall` record nothing, and Lua probes that resolve to a collection
+type record nothing.
 
 Each fix lands with a failing test first (per `CLAUDE.md`): a unit test that
 drives the two-transaction interleaving through the coordinator and asserts
