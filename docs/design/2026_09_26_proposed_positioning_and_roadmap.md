@@ -34,9 +34,10 @@ alongside it.
 
 **Proof.** The engineering record is a deliverable, not a by-product: every
 non-trivial change has a design doc, safety properties are model-checked in
-TLA+ (`tla/`), and the Redis, DynamoDB, S3, and SQS surfaces each have a
-Jepsen workload (`jepsen/src/elastickv/`; gRPC and the filesystem do not yet,
-see §6.3). The same artifact therefore serves two audiences:
+TLA+ (`tla/`), and the Redis, DynamoDB, and S3 surfaces each have a Jepsen
+workload (`jepsen/src/elastickv/`; the SQS workload exists but validates
+nothing today because of a harness bug recorded in the audit's A4, and gRPC
+and the filesystem have none yet, see §6.3). The same artifact therefore serves two audiences:
 adopters who want a self-hosted AWS-compatible store, and readers who want a
 documented, verified multi-raft transactional KV in Go.
 
@@ -50,7 +51,7 @@ week, no deadline; the plan below is sized for that.
 | Dimension | FoundationDB | TiKV | DynamoDB | Bigtable | elastickv |
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
-| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic across keys and shards (2PC with OCC validation of write and read sets at FSM apply); serializable is the target pending the audit's A0 to A2 (§6.3); per-key linearizable |
+| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic across keys and shards (2PC with OCC validation of write and read sets at FSM apply); serializable is the target pending the audit's A0 to A2 (§6.3); per-key linearizable except on the G10 paths until A0b lands |
 | Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
@@ -76,7 +77,11 @@ README will present scope in two tiers instead of a non-goals section.
   `TransactGetItems`), S3 (path-style, SigV4 static credentials), SQS
   (opt-in, incl. HT-FIFO, DLQ redrive), FUSE filesystem
   (`2026_02_24_implemented_filesystem_on_elastickv.md`).
-- Consistency: per-key linearizable; multi-key transactions atomic, with
+- Consistency: per-key linearizable on the paths whose timestamps the
+  leader issues today (every Redis write except `EVAL`, DynamoDB, S3, SQS);
+  `EVAL`, gRPC `RawKV` / `TransactionalKV`, the filesystem, and the
+  asynchronous cleanups are excluded until A0b lands (G10, reproduced);
+  multi-key transactions atomic, with
   OCC validation of write and read sets at apply. **Serializable is the
   target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
@@ -105,7 +110,7 @@ README will present scope in two tiers instead of a non-goals section.
 
 | Gap | Evidence (on `main` at `4ca7e90d`) | Closed by |
 |---|---|---|
-| No authentication on the DynamoDB, Redis, and gRPC data planes; no TLS on any data-plane listener | `adapter/dynamodb*.go` has no SigV4 path (only the admin and migration files mention it); `adapter/redis_server_cmds.go` rejects `HELLO AUTH` ("elastickv's Redis adapter has no AUTH layer"); the only `--*TLSCertFile` flags are the admin listener's | Security milestone (§6.2) |
+| No authentication on the DynamoDB, Redis, and gRPC data planes; no TLS on any data-plane listener | `adapter/dynamodb*.go` has no SigV4 path (only the admin and migration files mention it); `adapter/redis_server_cmds.go` rejects `HELLO AUTH` ("elastickv's Redis adapter has no AUTH layer"); the only `--*TLSCertFile` flags are the admin listener's | DynamoDB, Redis, and TLS: security milestone (§6.2). gRPC `RawKV` / `TransactionalKV` authentication (mTLS or bearer) is deferred by §6.2 and **stays open** after it; until then the gRPC listener must sit inside a private network or tailnet |
 | Serializability has known holes: commit timestamps are allocated before proposal and the apply path never rejects an entry below the watermark that reads use as their snapshot (G0); 2PC read keys are validated only at PREPARE apply, with locks on write keys only and no re-check at COMMIT (G1); 2PC read-only shards are validated outside the FSM lock; the S3 adapter populates `ReadKeys` only in the upload-part path and never re-reads multipart part descriptors at the commit snapshot; Lua scripts do not surface reads of keys they do not write; several Redis paths (standalone `DEL` and the other emptying paths, `SETNX`, `MULTI` type probes) bypass the collection fences; gRPC `TransactionalKV` has no read-set-bearing transaction API (audit Appendix A); in the default TSO mode `ShardedCoordinator` stamps commit timestamps on whichever node runs `Dispatch` (`EVAL`, gRPC `RawKV` / `TransactionalKV`, the filesystem, async cleanups, multi-group stamping) and the store's stale-reapply fast path treats an equal `commitTS` as "already applied", so two writers on two nodes can both read the same value, both be told OK, and one write is lost (audit G10, reproduced) | `resolveDispatchCommitTS` in `kv/coordinator.go`; `alignCommitTS` in `store/`; `verifyBackupTimestampFloor` in `kv/fsm_backup.go` (the backup-only fence); `handlePrepareRequest` / `handleCommitRequest` in `kv/fsm.go`; `grep ReadKeys adapter/s3*.go`; `luaWideFenceReadKeysForPlan` in `adapter/redis_lua_context.go` | Serializable isolation audit (§6.3) |
 | `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
 | No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
@@ -118,7 +123,11 @@ What README and `docs/architecture_overview.md` will state, and the evidence
 behind each claim.
 
 1. **Per-key linearizability.** All writes go through the owning Raft group's
-   leader; reads are leader reads (ReadIndex) or leader-lease reads. Evidence:
+   leader; reads are leader reads (ReadIndex) or leader-lease reads. On
+   `main` today this holds only where the leader issues the commit
+   timestamp: the G10 paths (`EVAL`, gRPC `RawKV` / `TransactionalKV`, the
+   filesystem, asynchronous cleanups) can lose a write with both clients told
+   OK, so the unconditional claim waits for A0b. Evidence:
    `jepsen/src/elastickv/dynamodb_types_workload.clj` and `s3_workload.clj`
    (knossos linearizable register).
 2. **Multi-key transactions are atomic.** Single-shard transactions apply in
@@ -236,7 +245,7 @@ more. Can proceed in parallel with 6.2 to 6.4.
 | Active, correctness | this doc; `2026_09_26_proposed_serializable_isolation_audit.md`; `2026_08_29_proposed_tso_batch_slot_claims.md`; `2026_09_02_proposed_prephase_d_resolution_evidence.md`; the security and benchmark docs to be written |
 | Active, features | `2026_07_19_partial_physical_snapshot_object_offload.md` (M3); `2026_04_25_partial_s3_raft_blob_offload.md` (M3, M4); `2026_06_11_partial_hotspot_split_milestone2_migration.md` with parent `2026_02_18_partial_hotspot_shard_split.md` |
 | Future track (horizontal scale) | `2026_06_23_proposed_scaling_roadmap.md` (its 06/12 predecessor is already marked superseded). Referenced from README's future goals; re-evaluated when the active list is empty. |
-| Deferred | Remaining Stage 9 of `2026_04_29_partial_data_at_rest_encryption.md` (9C+: rotation budget, rewrap / retire / rewrite, `last_proposed_index_per_raft_dek`, encrypted Jepsen). 5E stays deferred as recorded there. |
+| Deferred | Remaining Stage 9 of `2026_04_29_partial_data_at_rest_encryption.md` (9C+: rotation budget, rewrap / retire / rewrite, `last_proposed_index_per_raft_dek`, encrypted Jepsen). Stage 5E (the capability fan-out helper) is shipped and wired (`buildEncryptionCapabilityFanout` in `main.go`) although that doc's header still says deferred; the header is corrected in the A5 documentation pass. |
 | Closed since the interview's inputs were gathered | `logical_backup`, `raft_learner`, `centralized_tso`, `hotspot_split_milestone3_automation`, `ttl_inline_value`, `fsm_apply_observer`, `filesystem_on_elastickv`, `deploy_via_tailscale`, `9a_encryption_compression`, `9b_kek_providers` are all `implemented` on `main`; the interview's active / deferred choices that named them are moot and are not carried into the table above. |
 
 ## 8. Decisions
@@ -248,8 +257,8 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
 - Main arena: self-hosted AWS-compatible store plus correctness evidence. First
   showcase: on-premises / edge / air-gapped deployment, delivered as an install
   guide plus a sample app.
-- Consistency claim: per-key linearizable; multi-key transactions atomic and
-  serializable. Write skew must not occur. The Jepsen strict-serializable
+- Consistency claim (targets, not yet made for every path): per-key
+  linearizable; multi-key transactions atomic and serializable. Write skew must not occur. The Jepsen strict-serializable
   checkers are evidence for the claim, and write-skew workloads are added per
   adapter.
 - README uses a two-tier scope (today / future goals); there is no non-goals

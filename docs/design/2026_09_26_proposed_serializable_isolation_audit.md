@@ -360,6 +360,8 @@ Still open for the fix PRs:
   pin's read timestamp is now aborted, not committed; `DEL_PREFIX`
   (`FLUSHALL`, S3 and DynamoDB cleanups) can return a write conflict; 2PC
   route floors are checked against `startTS + 1`.
+- `DEL_PREFIX` is fenced but still bypasses transaction locks (A2 blocker
+  above).
 - Not yet leader-issued: the 2PC ABORT timestamp (unfenced) and the
   pre-allocated paths above; making delta keys independent of the commit
   timestamp would remove the exemption.
@@ -451,7 +453,15 @@ that each read the other's write key can interleave their per-shard
 PREPAREs so that both write locks land before either read lock, and both
 commit (write skew); the reader aborts or resolves the lock, as a plain
 read does through `maybeResolveTxnLock`. COMMIT, ABORT, and the
-`LockResolver` clear read locks exactly as they clear write locks. `handlePrepareRequest` is extended to accept a lock-only PREPARE (today it
+`LockResolver` clear read locks exactly as they clear write locks.
+`DEL_PREFIX` is a range read-modify-write, not a blind write, so its apply
+must conflict with every transaction lock, write or read, under the prefix
+(the `DEL_PREFIX` is rejected as retryable, or the prepared transactions
+are resolved first); today `handleRawRequest` routes it to
+`handleDelPrefixWithFloorSnapshot` before any per-key lock validation, so a
+prepared transaction can read `k`, `FLUSHALL` can delete the committed `k`
+while missing the uncommitted intent on `x`, and the transaction then
+commits `x`: a result that serialises neither before nor after the flush. `handlePrepareRequest` is extended to accept a lock-only PREPARE (today it
 rejects an empty mutation list with `ErrInvalidRequest`) and to create read
 locks from `ReadKeys`; read-only shards then receive a PREPARE with an empty
 mutation list and only read locks, which replaces `validateReadOnlyShards`
@@ -489,6 +499,10 @@ Constraints the fix PR must close before merge:
   read lock) still commits both transactions. Add the check, a two-group
   reproduction test that drives that interleaving (expected red first), and
   split `Prepare` per shard in the TLA+ model so `OCC8` catches it.
+- **`DEL_PREFIX` ignores locks (found in review).** The implemented A2
+  leaves raw `DEL_PREFIX` outside lock validation; add range-aware conflict
+  handling against write and read locks under the prefix, with a test that
+  prepares a transaction reading a key the flush deletes.
 - **Tombstone accumulation.** Rows are per `(key, transaction)` and MVCC
   compaction keeps a key's last tombstone, so every released read lock leaves
   a permanent tombstone that every later writer of that key scans: about
