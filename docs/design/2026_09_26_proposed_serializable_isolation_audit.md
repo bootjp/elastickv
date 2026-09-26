@@ -138,6 +138,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G12 | **Transaction identity is `(primaryKey, StartTS)`, which is not unique.** Locks (`txnLock`), the commit and rollback records (`txnCommitKey`, `txnRollbackKey`), the ownership test in `handlePrepareRequest` (`lock.StartTS == startTS && PrimaryKey equal`), and the A2 read-lock rows all identify a transaction by its primary key and start timestamp. Adapter transactions supply `StartTS = readTS`, the shared read snapshot, so two concurrent 2PC transactions with the same primary key and the same snapshot alias each other: the second PREPARE passes the ownership check as a retry of the first and overwrites its intent; the first COMMIT then publishes the second's value under the first's identity, and the second's COMMIT finds no lock and reports success. A2's read-lock rows collide the same way (one transaction's COMMIT deletes the other's protection). Found in review, **reproduced** deterministically (3 of 3 under `-race`): `TestTwoPhaseCommit_SharedPrimaryAndStartTSAliasTransactions` in `kv/txn_identity_aliasing_repro_test.go` (branch `design/serializable-audit-a2-txnid-repro`, commit `255bd0ba`, on the read-lock fix). Two groups; T1 writes `p` and `s1`, T2 writes `p` and `s2`, both with `StartTS` from `ShardStore.LastCommitTS()` and primary `p`. T2's PREPARE on `p` passes `txnLockOwnedBy` and overwrites T1's intent; the first primary COMMIT publishes whatever intent is there and records its `CommitTS`; the second primary COMMIT fails with `commit_ts mismatch`, its ABORTs fail with `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` then commits the loser's secondary at the winner's recorded `CommitTS` and reports success. Final state `p="t2"`, `s1="t1"`, `s2="t2"`; both clients told committed with the same `CommitTS`; T1's write of `p` is lost. In the read variant T2's COMMIT also deletes T1's read-lock row on `s2` and T1 still commits with its read of `s2` overwritten. | A cross-shard transaction can commit a mix of two transactions' writes (atomicity), and A2's read locks do not protect a transaction that shares identity with another. |
 | G13 | **A 2PC PREPARE whose `StartTS` equals the previous commit's timestamp is skipped as a replay, and the transaction's writes are silently lost (found by A4, diagnosed).** No faults, one node, one HLC, no split: the DynamoDB multi-table list-append workload (two groups) loses 11 to 21 acknowledged appends per 30-second run with the route-shuffle nemesis on or off. Mechanism: T1's COMMIT deletes each key's lock and intent rows, leaving tombstones at exactly `c1`; T2 starts at `nextTxnReadTS` = `ShardStore.LastCommitTS()` = `c1` when nothing committed since; T2's PREPARE writes its lock and intent at version `StartTS` (`handlePrepareRequest`, `commitTS = startTS`), `staleRaftApplyFastPathLocked` → `raftApplyAlreadyLandedLocked` finds a version (the tombstone) at `c1` on every key and declares the live PREPARE a replay before `checkApplyConflicts`, so no lock is written and validation is skipped; T2's COMMIT finds no lock, treats the key as already resolved, applies nothing, and the client gets OK. A collision on the secondary group alone tears the transaction (primary lands, secondary lost); a collision on both groups loses everything. **Reproduced** deterministically (`TestTwoPhaseCommit_PrepareAtPreviousCommitTSIsSkippedAsReplay` in `kv/prepare_replay_fastpath_repro_test.go`, branch `design/serializable-audit-g13-repro`, commit `10846a6c`, on `main` plus the harness fixes; 3 of 3 red under `-race`, control green; an instrumented binary logged 26 skipped live PREPAREs in one run, every lost transaction matching a skip at its `StartTS`). Excluded: the split and migration path (two runs without route shuffle lose appends too, group-1 keys whose route never moved lose them, the reproduction has no split); the A0 cross-group snapshot (the write is never applied, nothing is in flight); cross-node stamping (one HLC). It is the G10 stale-reapply sink reached by a single node, and **the A0 completion branch's Raft-index replay detection makes the reproduction pass**. Both ABORT variants **reproduce** too (`d0ad09ae`, same file, table-driven, 4 of 4 red 3 times under `-race`, all green with the fast path disabled and all green on the A0 completion branch): a coordinator ABORT after a read-only-shard conflict leaves the same tombstones at its `abortTS`, and `tryAbortExpiredPrimary` resolving an expired lock persists an ABORT at `startTS + 1`, a timestamp nothing allocated; a transaction starting at either value loses its write the same way. The Redis, SQS, and S3 2PC paths start at the watermark too and are expected to share the defect. | The default 2PC path loses committed writes on a healthy single node with both clients told OK; the fix is A0's index-based replay detection, and the regression test travels with the A0 PR. |
 | G14 | **PREPARE order lets a reader roll back a secondary before the primary lock exists (found while implementing A2, not yet reproduced).** `prewriteTxn` prepares groups in group-id order, not primary group first. A reader that meets a secondary's lock before the primary PREPARE has applied asks `primaryTxnStatus`, finds no primary lock and no record, concludes rolled back, and aborts that secondary without writing a rollback record; the primary then prepares and commits, and the secondary COMMIT finds no lock, treats the key as already resolved, and skips it. | A cross-shard transaction commits with one of its writes silently missing while the client is told OK; pre-existing on `main`, independent of the identity fix. Fix: prepare the primary group first and only then the secondaries, and make a status probe that finds neither lock nor record while the primary's PREPARE could still be in flight return "unknown" rather than "rolled back" (or write the rollback record so the primary's later PREPARE fails). |
+| G15 | **A forwarded RPC that times out after it was sent is retried (found while implementing A6, not yet reproduced).** The leader-forward breaker in `kv/leader_proxy.go` treats `Unavailable` and `DeadlineExceeded` as retryable even when the request had already reached the leader, which may have proposed and committed it; the resend is a second proposal. | A non-idempotent write applied twice across a forward timeout with the client told OK once. Fix direction: after a forwarded write has been sent, a timeout or `Unavailable` is outcome unknown unless the request is idempotent by identity (2PC requests with a `TxnID` are; raw one-phase requests are not); the A0 fence does not detect the second apply because it carries a fresh timestamp. |
 
 ## 4. Milestones
 
@@ -1291,10 +1292,96 @@ Remaining:
 
 ### A6. Indeterminate outcomes (G11)
 
-Status: proposed; implementation starts on
-`design/serializable-audit-a6-outcome-unknown` (from `main`, independent of
-the A0 to A2 stack). Numbered after A5 because it was found by A4's pause
-nemesis after the milestone list was written.
+Status: implemented ahead of review on
+`design/serializable-audit-a6-outcome-unknown` (five commits from `main`,
+independent of the A0 to A2 stack, not pushed): `05d1091d` (the sentinel),
+`c1d40b56` (no server-side retry), `7dba0cac` (every wire protocol),
+`32e34b4b` (resolution by log position), `c74920c2` (an abandoned
+proposal's unknown outcome stays visible; the raw batch proposes under a
+30 s timeout instead of `context.Background()`, without which a batch
+pending on an isolated former leader blocked the single flusher goroutine
+and every later raw commit behind it until the partition healed). Numbered
+after A5 because it was found by A4's pause nemesis after the milestone
+list was written. What landed, and where it refines the design below:
+
+- Engine (`internal/raftengine/etcd/pending_writes.go`):
+  `trackAppendedEntries` records each pending proposal's and membership
+  change's `(index, term)` from `Ready.Entries` before anything in that
+  `Ready` applies; an entry is ours only if it carries the request id
+  **and** the term it was proposed in, because ids are per-engine counters
+  and a successor's entry can reuse one (the old id-based `resolveProposal`
+  went away). `settlePendingAt` runs on every applied entry: same term at
+  the index is success (with the FSM response or the conf-change peer);
+  a **committed and applied** entry of a different term is the definite,
+  retry-safe `errNotLeader`. A local overwrite of the index is deliberately
+  **not** enough: with five or more voters the old leader's entry `(i, t)`
+  can be overwritten on the old leader by `(i, t+1)` from a successor that
+  then dies uncommitted, and a third leader with the more up-to-date log
+  can still commit `(i, t)`, so answering `errNotLeader` at the overwrite
+  would let a client retry and apply twice; waiting for the committed
+  entry is always safe and only later. A snapshot covering the index is
+  unknown; a locally taken snapshot cannot cover an unresolved index
+  because it is taken at the applied index. Leadership loss now fails only
+  pending reads; shutdown and `fail` give pending writes the unknown class
+  with the cause kept in the chain; a context that expires after the entry
+  reached the log yields unknown, before it a plain context error, with no
+  race against resolution (stores refuse an ended context, sends happen
+  under the pending lock). Rejections before the log stay definite.
+- kv (`kv/outcome_unknown.go`): `IsOutcomeUnknown`, the wire prefix,
+  `markForwardedOutcomeUnknown`; `isLeadershipLossError` and
+  `isTransientLeaderError` check the class first so the "not leader" text
+  match cannot reclassify it; `finalDispatchErr` never swaps an unknown
+  outcome for an earlier `NOTLEADER`; the forwarding clients
+  (`LeaderProxy.forward`, `Coordinate.redirect`,
+  `leaderAdminProposer.forwardAdmin`) re-mark a `codes.Aborted` status
+  with the prefix and `forwardFailureDecision` / `runAdminForwardCycle`
+  treat it as terminal (they used to resend any non-transient error three
+  times); lease invalidation also fires on it; a TSO control entry's
+  unknown outcome becomes a definite `ErrTSONotLeader` because no
+  timestamp was handed out; `commitRaw` reports an abandoned batched item
+  as unknown.
+- Adapters: Redis `-OUTCOMEUNKNOWN <message>` checked before `NOTLEADER`
+  (a follower relays a leader's reply from `MULTI` / `EXEC` as the
+  top-level reply); gRPC `RawPut` / `RawDelete` / `Put` / `Delete`,
+  `Internal.Forward`, `ForwardAdminProposal`, and the encryption admin
+  (which used to fall through to the retryable `Unavailable`) return
+  `codes.Aborted` with `proposal outcome unknown: …` as a raw status so the
+  prefix survives; DynamoDB (JSON `__type`), S3 (XML `<Code>`), and SQS
+  (JSON, query-protocol `<Code>`, batch entries with `SenderFault=true`)
+  return HTTP 400 `RequestOutcomeUnknown` with the message "the request may
+  or may not have been applied; read the current state before retrying",
+  engine detail logged, not echoed.
+- Evidence: engine integration tests (committed by the successor →
+  success with the FSM response; a different-term entry committed at the
+  index → `errNotLeader`; pending past leadership loss → unknown only at
+  context expiry; shutdown → unknown with `errClosed` kept; follower
+  propose → definite `ErrNotLeader`) and unit tests (settle by position,
+  the config variant, a colliding foreign id ignored, snapshot → unknown,
+  the abandon cases), all red first (`main` returned "is not leader" / "is
+  closed"); kv classifier tables, forward re-mark, `finalDispatchErr`,
+  lease invalidation, the local and forwarded `LeaderProxy` paths and the
+  admin proposer each sending exactly once (before: "leader forward failed
+  after 3 retries"), TSO sanitisation, context precedence and the raw
+  batch; adapter per-surface mappings, a real `Internal.Forward` round
+  trip over gRPC sent exactly once with the prefix not stacked, and a Redis
+  end-to-end on a real three-node cluster where the followers' gRPC is cut
+  between the handler's read fences and its `Dispatch` (the client gets
+  `OUTCOMEUNKNOWN`; on the old engine an i/o timeout, because `Dispatch`
+  kept retrying `NOTLEADER`; cutting the quorum before the write is
+  correctly a `NOTLEADER`, since nothing reached the log). `internal`, `kv`,
+  `adapter` green under `-race`; lint clean. Cost: one map insert and
+  delete per proposal plus one lock per `Ready`; no extra round-trips;
+  leadership loss no longer fails fast, a write stuck on an isolated old
+  leader waits for resolution or its context (`Dispatch` 5 s, Redis 30 s,
+  raw batch 30 s).
+- Still open: the Jepsen clients recording `OUTCOMEUNKNOWN` /
+  `RequestOutcomeUnknown` / `Aborted` as `:info` (A4 branch); the forward
+  breaker's retry on `Unavailable` / `DeadlineExceeded` after an RPC was
+  sent is a separate double-apply risk (G15); the startup encryption
+  rotation now fails on an unknown outcome instead of retrying; the Redis
+  migration proxy's leader-aware backend does not refresh its leader on
+  `OUTCOMEUNKNOWN` (it never replays commands, so not a safety issue); one
+  stale mention of `resolveProposal` in `internal/raftengine/statemachine.go`.
 
 Today the etcd engine fails a proposal in three places with the same
 `errNotLeader`: `handleProposal` before `node.Propose` (nothing was
@@ -1316,8 +1403,9 @@ Design:
   by the `(index, term)` it received when its entry appeared in
   `Ready.Entries`; it resolves as success when the entry applies (the
   normal pop by id, whichever leader committed it), as a definite,
-  retry-safe `errNotLeader` only when that log position is overwritten by
-  an entry of a different term (the proposal can never commit), and as
+  retry-safe `errNotLeader` only when a **committed** entry of a different
+  term applies at that index (a local overwrite is not proof, see the
+  five-voter case in the status above), and as
   `ErrProposalOutcomeUnknown` when the request context expires, the engine
   stops, or a snapshot that covers the proposal's index is installed before
   either happens: a snapshot proves nothing about the entry (the successor
