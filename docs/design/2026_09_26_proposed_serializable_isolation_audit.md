@@ -337,13 +337,16 @@ Open after this branch:
   the commit timestamp above every participant's watermark (each PREPARE
   reply returns its group's replicated watermark; the allocation goes
   through the HLC's after-through path). A merge blocker for A0.
-- **Non-transactional reads stay plain.** Redis `GET` / `MGET` and scans,
+- **Non-transactional reads stay plain.** Redis `GET` and the scans,
   DynamoDB `GetItem` / `Query` / `Scan`, S3 `GET` / `LIST`, and the SQS
   peek read at the local watermark without the capability. A single-key
-  read is a leader read on one group and unaffected; a multi-key read
-  that spans groups can be torn (DynamoDB documents `Scan` as such; Redis
-  `MGET` is atomic upstream and should route through a snapshot read when
-  its keys span groups). Recorded as a limit; `MGET` is the one to close.
+  read is a leader read on one group and unaffected; a range read whose
+  page spans two groups can be torn. There is no multi-key point read to
+  worry about (the Redis adapter implements no `MGET` and the DynamoDB
+  adapter no `BatchGetItem`). The one to close is a DynamoDB `Query` /
+  `Scan` page under `ConsistentRead` whose range crosses a split, which
+  upstream serves from one snapshot; it should route through a snapshot
+  read. Recorded as a limit.
 - **Rolling upgrade.** Older followers skip the `0x0f` entry (a fence
   verdict divergence of the A0 class), an older node forwarding a snapshot
   read through the public `RawGet` gets `FailedPrecondition` from an
@@ -1191,8 +1194,21 @@ Constraints the fix PR must close before merge:
   Target: the check cost returns to the no-history figure after
   compaction, pinned by the benchmark. Implementation on
   `design/serializable-audit-a2-lock-gc`.
-- **Migration.** Read locks are not drained or carried across a cutover; a
-  read lock taken on the source does not protect the key on the target.
+- **Migration (found in review, reopens G1 under hotspot M2).** Read
+  locks are not drained or carried across a cutover: a transaction can
+  PREPARE and install its read lock on the source, the range can cut over
+  without it, and a writer can commit on the target before the original
+  transaction commits, a write skew that survives every read-lock check
+  because the two consult different groups. Decision: the migrator's
+  existing write-lock drain (`PendingTxnLocksInRoute` in
+  `kv/migrator_lock_drain.go`, which blocks the cutover while prepared
+  write locks remain in the range) is extended to read locks, so a cutover
+  waits until every read lock in the range is released or resolved, with
+  the same TTL-bounded wait; a read lock is never transferred (a
+  transaction that spans the cutover is aborted by its own COMMIT finding
+  the range moved, as today). Until that lands, deployments running hotspot
+  M2 migrations are excluded from the serializability claim (§6.1 of the
+  roadmap). Implementation on `design/serializable-audit-a2-migration-drain`.
 - **Cost.** A read-only shard now takes two Raft entries (PREPARE, COMMIT)
   where it took one read barrier; the earlier "one entry" estimate is wrong.
 - **Behaviour change.** A read key routing to a group the coordinator does

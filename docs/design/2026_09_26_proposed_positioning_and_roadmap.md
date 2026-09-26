@@ -51,7 +51,7 @@ week, no deadline; the plan below is sized for that.
 | Dimension | FoundationDB | TiKV | DynamoDB | Bigtable | elastickv |
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
-| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic within a shard; across shards 2PC with OCC validation of write and read sets at FSM apply, whose atomicity is not yet claimed (G12, reproduced: two transactions sharing primary key and start timestamp commit a mix) until A2's transaction id; serializable is the target pending the audit's A0 to A2, G11, and G13 (§6.3); per-key linearizable except on the G10 paths until A0b lands |
+| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic within a shard; across shards 2PC with OCC validation of write and read sets at FSM apply, whose atomicity is not yet claimed (G12 and G14, both reproduced: aliased identities commit a mix, and a secondary can be rolled back before the primary lock exists) until A2's transaction id and primary-first PREPARE land; serializable is the target pending the audit's A0 to A2, G11, and G13 (§6.3); per-key linearizable for blind writes and reads on leader-issued paths; read-modify-write operations wait for A0 (G0) and the G10 paths for A0b |
 | Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
@@ -152,8 +152,12 @@ behind each claim.
    primary key and lock resolution (`kv/lock_resolver.go`). Not yet claimed
    for multi-shard transactions: two concurrent 2PC transactions that share
    a primary key and a start timestamp are treated as one owner and can
-   commit a mix of their writes (audit gap G12); the claim waits for the
-   explicit transaction id in A2.
+   commit a mix of their writes (audit gap G12), and group-id PREPARE
+   ordering lets a reader abort a secondary before the primary lock exists,
+   after which the primary commits and the secondary COMMIT writes nothing
+   (G14); the claim waits for A2's transaction id, the primary-first PREPARE
+   order, and the secondary re-apply, all reproduced and fixed on local
+   branches.
 3. **Multi-key transactions are serializable.** The FSM validates the
    transaction's write set and read set against every commit newer than
    `StartTS` under the store's apply lock (`checkConflictsLocked` in
@@ -192,7 +196,14 @@ implementation, per `CLAUDE.md`.
 consistency claims go into README only after the audit's A0 to A2 fixes,
 the G11 fix (the server-side outcome-unknown error and its mapping in
 every adapter), and G13 (a 2PC PREPARE swallowed as a replay, closed by
-A0's index-based replay detection, with its regression test) are merged; a `NOTLEADER` that a later read contradicts is
+A0's index-based replay detection, with its regression test) are merged
+**and** A7's transaction-format gate has landed with `txn_format_v2`
+activated cluster-wide: merging alone activates nothing, because V1
+entries deliberately keep the old semantics (the timestamp replay fast
+path, no fence, no read locks, no transaction id, no watermark advance)
+until every member advertises V2, and an operator may pin a cluster to
+V1. The README caveat states that a V1-pinned or mid-upgrade cluster runs
+without these guarantees. A `NOTLEADER` that a later read contradicts is
 an anomaly independent of the timestamp and read-lock fixes.
 
 ### 6.2 Security milestone
@@ -275,7 +286,11 @@ more. Can proceed in parallel with 6.2 to 6.4.
 - A three-node install guide (systemd units, extending
   `docs/deploy_via_tailscale_runbook.md` and `docs/docker_multinode_manual_run.md`).
 - A sample application under `examples/` in Go with AWS SDK for Go v2, using
-  DynamoDB + S3 + SQS with only the endpoint overridden.
+  DynamoDB + S3 + SQS with the endpoint overridden and, for S3,
+  `s3.Options.UsePathStyle = true` (the server is path-style only; the
+  SDK's default virtual-hosted addressing would send requests to
+  `bucket.<endpoint>`, as `internal/snapshotoffload/s3_store.go` already
+  works around), with that setting explained in the sample's README.
 
 ### 6.7 Feature track (in-flight partial designs, continued after 6.2 to 6.6)
 
