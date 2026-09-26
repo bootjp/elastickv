@@ -489,6 +489,51 @@ code at fix time and turns the `N` rows into fixes:
 - gRPC: none in this audit; the API gap (G8) is documented in the positioning
   doc and README.
 
+Status of the S3 half: landed on branch `design/serializable-audit-a1-s3`
+(from `main`, not pushed): `3a975625` adds
+`adapter/s3_multipart_occ_repro_test.go`, four cases through the real FSM
+and `ShardedCoordinator` with a test-only store wrapper that parks a
+handler after a chosen `GetAt` (no production hook), all red on `main` 5 of
+5: `completeMultipartUpload` racing a same-part re-upload, parked after the
+part-descriptor read and again between its last read and its commit,
+commits a manifest whose chunk is missing and serves the object as HTTP 200
+with an empty body; `uploadPart` racing `deleteBucket` lands the part and
+chunks under the deleted generation (only when the delete's best-effort
+cleanup sweep misses; when it succeeds the upload-meta read key already
+protects `main`); two same-part uploads in the window leak one set of blobs
+and clean the other twice. `b3277347` fixes all three: the completion has
+no early read phase any more, each attempt reads bucket meta, upload meta,
+every requested part, and the head manifest at its `StartTS`, then
+allocates the commit timestamp and dispatches with every consumed part key
+in `ReadKeys` (a per-upload parts fence was rejected because every
+`uploadPart` would write it and parallel parts of one upload would conflict
+with each other; 10,000 parts fits `kv.maxReadKeys`); a conflict retries
+the attempt and either commits the new part version (same ETag) or fails
+`InvalidPart`. `uploadPart` re-reads the bucket meta in the commit phase
+(404 `NoSuchBucket` / `NoSuchUpload` when the generation changed) and reads
+the previous part at that same watermark, listing upload meta, bucket
+meta, and the part key in `ReadKeys`. `0ef1098a` pins the read sets in 15
+table cases. Undoing each part of the fix turns its reproduction red
+again; `adapter`, `kv`, `store` green under `-race`; lint clean; one
+pre-existing gosec `//nolint` removed. Cost: `uploadPart` 4 → 5 point reads
+and +2 read keys; a completion with N parts N+5 → N+3 reads on the first
+attempt and N+3 per retry (was 3), +N read keys on the entry. Two decisions
+taken after review of the result: the bucket-meta read key made
+`uploadPart` conflict with every concurrent writer in the bucket
+(`putObject`, `createMultipartUpload`, completion, ACL changes) for the
+whole body upload, which is unacceptable for multipart, so the fence moves
+to `BucketGenerationKey`, written by `deleteBucket` / `AdminDeleteBucket`
+(narrowing the conflict to bucket delete and recreate); and an OCC write
+conflict surfaced by `uploadPart` is reported as HTTP 503 `SlowDown`
+(retried with backoff by SDKs) instead of 500 `InternalError`. Both are in
+progress on the branch. Known limits: in a multi-group deployment where the
+bucket generation lives on another group, `uploadPart` becomes a 2PC
+transaction and its generation check is subject to G1 until A2 lands; a
+completion of more than about 4,998 parts during a staged-visibility
+migration exceeds `kv.maxReadKeys` (the migration aliases every key) until
+the migration ends; the Jepsen S3 workload does only PUT / GET and was not
+run.
+
 Status of the Redis half: landed on branch `design/serializable-audit-a1-redis`
 (commits `19c7cffa` "surface Lua string reads as OCC read keys" and
 `0a044364` "bump collection fences on emptying paths"; not pushed), on top
