@@ -295,6 +295,77 @@ scripts, cross-group S3 / DynamoDB / SQS / filesystem transactions); make the
 fence compare against a watermark that only replicated applies advance; fence
 `DEL_PREFIX`; review `dedupProbeOnePhase`.
 
+Status of A0, completion slice: implemented ahead of review on local branch
+`design/serializable-audit-a0-complete` (four commits on top of the A0b
+branch, not pushed). What landed:
+
+- **Replicated-only watermark.** A second persisted meta value,
+  `_meta_last_raft_commit_ts`, staged in the same Pebble batch as the write
+  and advanced only by replicated applies (`ApplyMutationsRaft*`, the Raft
+  `DeletePrefix*`, `ImportVersionsRaft`, `PromoteVersions`); direct writes
+  (`ApplyMutations`, `PutAt`, `DeleteAt`, `ExpireAt`, `DeletePrefixAt`,
+  `ImportVersions`) advance `LastCommitTS()` only. The fence compares against
+  `LastRaftCommitTS()`; a store or snapshot without the key falls back to
+  `LastCommitTS()`, capped. A two-replica test shows identical verdicts when
+  one replica took a direct write at `watermark + 1` (it fails with the old
+  fence). The only direct write on a running node is the catalog bootstrap
+  `CatalogStore.Save`; its timestamp can equal a later replicated entry's,
+  which then overwrites the seed on every replica (convergent); a local read
+  at that timestamp before the entry applies, on an empty-catalog node at
+  startup, is the one case left open and documented on
+  `EnsureCatalogSnapshot`.
+- **2PC commit timestamp after PREPARE.** `dispatchTxn` no longer allocates
+  before `prewriteTxn`; the primary COMMIT is proposed unstamped and stamped
+  by the primary group's leader (locally with `resolveTxnCommitTS`, or in
+  `Internal.Forward`'s COMMIT branch, or by `leaseRefreshingTxn` if the node
+  won leadership in between); the landed value comes back through
+  `ForwardResponse.CommitTs` or the commit record and the secondaries are
+  committed with it. The first apply of the primary COMMIT is fenced;
+  secondary and repeated primary COMMITs are not. A hazard found on the way:
+  a lost reply to an unstamped primary COMMIT makes `LeaderProxy` re-forward
+  it, the leader stamps a second timestamp, and the transaction looks
+  failed; `settleFailedPrimaryCommit` therefore aborts the primary group
+  first and, if it reports "already committed", commits the secondaries at
+  the recorded timestamp instead of rolling them back. **Exemption:**
+  transactions whose keys embed the commit timestamp before PREPARE (Redis
+  `MULTI` / `EXEC` and Lua delta keys, S3 `VersionedBlobKey`, any element
+  with a `CommitTSValueOffset` patch) still pre-allocate, marked
+  `txnCommitTSPreallocated`; their primary COMMIT is fenced too, so under
+  contention they abort with a write conflict more often, and a
+  multi-shard `MULTI` retry then meets `ErrTxnDedupRequiresSingleShard`.
+- **`DEL_PREFIX` fenced** through a new `DeletePrefixesAtRaftAtFenced`; each
+  prefix element now carries its own timestamp so a multi-prefix broadcast
+  (the S3 bucket-delete safety net) does not fence itself.
+- **Dedup probe.** `dedupProbeOnePhase` / `CommittedVersionAt` document why
+  the probe is sound once timestamps are leader-issued, monotonic, and
+  fenced; a test shows another transaction's entry at the attempt's exact
+  timestamp is fenced.
+
+Results: all reproduction tests (G0, G1, G3, G7, G10) and the A0b
+leader-stamp tests pass; `store`, `kv`, `distribution`, `internal/filesystem`,
+and `adapter` green under `-race` (one A0b test,
+`TestGRPC_FollowerWritesCarryLeaderIssuedTimestamps`, is timing-dependent
+under parallel suite load on both branches and needs its second case
+decoupled from the first); lint clean.
+
+Still open for the fix PRs:
+
+- **Rolling upgrades.** An old FSM does not fence, so a mixed-version group
+  can reach different verdicts on one entry; the fence needs a
+  cluster-wide capability gate like the encryption envelopes, or a
+  stop-the-cluster cutover.
+- Behaviour changes to review: pre-allocated 2PC commits fenced under load;
+  a pre-pin 2PC transaction whose primary COMMIT sits at or below a backup
+  pin's read timestamp is now aborted, not committed; `DEL_PREFIX`
+  (`FLUSHALL`, S3 and DynamoDB cleanups) can return a write conflict; 2PC
+  route floors are checked against `startTS + 1`.
+- Not yet leader-issued: the 2PC ABORT timestamp (unfenced) and the
+  pre-allocated paths above; making delta keys independent of the commit
+  timestamp would remove the exemption.
+- One more 8-byte meta key per replicated apply batch, not benchmarked; the
+  streaming MVCC and in-memory snapshot formats do not carry the replicated
+  watermark and fall back.
+
 ### A1. Coverage table and adapter fixes
 
 Deliverable: the coverage matrix. Its initial version, produced by code
