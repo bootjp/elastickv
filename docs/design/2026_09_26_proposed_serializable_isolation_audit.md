@@ -132,6 +132,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G8 | gRPC `TransactionalKV` has no transaction surface: there is no `Begin`, `PreWrite` / `Commit` / `Rollback` return not-implemented, and every `Put` / `Delete` is a single-key transaction with a coordinator-assigned `StartTS` and no read set (`adapter/grpc.go`, `adapter/grpc_transcoder.go`). | A gRPC client's `Get` followed by `Put` can lose an update; multi-key serializable transactions are reachable today only through Redis `MULTI`, DynamoDB `TransactWriteItems`, SQS, and the filesystem. An API gap rather than a validation bug; documented as such and out of this audit's scope. |
 | G9 | DynamoDB `finalizeLegacyTableMigration` writes `TableMeta` from an earlier snapshot under a process-local lock only; table-generation checks for item writes are compensated after commit rather than validated at apply (`adapter/dynamodb_migration.go`, `adapter/dynamodb_transact.go`). | A stale schema can overwrite a concurrent schema change during legacy migration; low likelihood, migration-only. |
 | G10 | **Single-key lost update: non-leader nodes issue commit timestamps, and the stale-reapply fast path treats an equal timestamp as "already applied".** In legacy TSO mode (the default) `ShardedCoordinator.Dispatch` picks both `StartTS` and `CommitTS` on whichever node runs it (`nextStartTS`, `settleTxnCommitTimestamp` → `nextFencedWithRecovery` on the local HLC; raw writes through `rawLogTimestamp`), then `LeaderProxy.Commit` forwards the pre-stamped request; `Internal.Forward` keeps a nonzero `CommitTS` and its validators are no-ops outside Phase D. The leader-only issuance in `Coordinate.dispatchOnce` applies only to the non-sharded coordinator, which only the demo uses. Concretely: `EVAL` / `EVALSHA` are not proxied to the leader (`adapter/redis_lua.go`, `redis_command_specs.go`); a follower runs the script, allocates `commitTS` from its own HLC (`redis_lua_context.go` → `kv.NextTimestampAfterThrough` → `nextFencedWithRecovery`), stamps it into the request, and `Internal.Forward` keeps a preset `commitTS` (`adapter/internal.go`). The physical half is the Raft-applied ceiling, identical on every node, and the logical half advances only through local `Next()` and FSM `Observe`, so two followers that applied the same log hand out the same next timestamp. This violates the `CLAUDE.md` invariant that followers never issue persistence timestamps. Then `staleRaftApplyFastPathLocked` / `raftApplyAlreadyLandedLocked` in `store/lsm_store.go` (added for crash replay) declare an entry already applied when every mutation key has a version at exactly `commitTS`, and return before `checkApplyConflicts`; the second transaction becomes a silent no-op and its client gets OK. **Reproduced** deterministically: `TestLua_TwoFollowersLoseUpdateOnCommitTSCollision` and `TestLua_LostUpdate_StoreTreatsCommitTSCollisionAsReplay` in `adapter/redis_lua_lost_update_repro_test.go` (branch `design/serializable-audit-g10`), a three-node harness where scripts on two followers read the same value and both return OK while one write vanishes; 5 of 5 under `-race`. `dedupProbeOnePhase` in `kv/fsm.go` (`CommittedVersionAt(primary, PrevCommitTS)`) rests on the same timestamp-as-identity assumption. Blast radius (audited): besides `EVAL` / `EVALSHA`, gRPC `RawKV` `RawPut` / `RawDelete` and `TransactionalKV` `Put` / `Delete` are served on every node with no leader check and stamp locally; the FUSE filesystem service (`internal/filesystem/service.go` `dispatchTxn`, its lease reaper, and startup intent recovery) runs on any mounting node with no leader check; asynchronous cleanups (S3 manifest / part cleanup, DynamoDB deleted-table `DEL_PREFIX`) keep running after a leader change; and in multi-group deployments the default-group leader stamps `CommitTS` for groups it does not lead (2PC, cross-group Redis commands, `FLUSHALL`). Safe because the raw command reaches the leader before any timestamp is chosen: every other Redis write (`proxyToLeader` re-executes on the leader), `MULTI` / `EXEC`, DynamoDB and SQS (HTTP proxy to the default-group leader), S3 (per-route-key verified proxy), `SplitRange`, the lock resolver, and the leader-gated Redis background loops. `Internal.Forward` never `Observe`s a forwarded timestamp, so a follower's stamp can also collide with one the leader issues next. The comment in `adapter/dynamodb_item_write.go` claiming the leader allocates `commit_ts` is true only for `Coordinate`. | A plain read-modify-write through `EVAL` on two nodes can lose one write with both clients told OK. Independent of the multi-key claim; it breaks the single-key guarantee. |
+| G11 | **An indeterminate outcome is reported as a definite failure.** When a leader loses leadership while a proposal is pending, `refreshStatus` in `internal/raftengine/etcd/engine.go` fails the pending proposal with `errNotLeader`; the Redis adapter maps it to `NOTLEADER` (`writeRedisError`), and the entry may still commit under the new leader. Found by the A4 pause nemesis: Jepsen recorded the writes as `:fail`, then saw their values read, and reported G1a (aborted read) in two Lua runs; reclassifying `NOTLEADER` as indeterminate makes both histories valid. | A client that treats `NOTLEADER` as "not applied" and retries can apply a non-idempotent command twice. Fix: once a proposal has been handed to Raft, leadership loss must surface as an "outcome unknown" error distinct from `NOTLEADER` (and the Jepsen clients must record it as `:info`); the Redis, DynamoDB, S3, SQS, and gRPC error mappings each need the distinction. |
 | G5 | `tla/occ/OCC.tla` models SI | The model cannot catch a regression that removes read-set validation. |
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
 
@@ -653,11 +654,39 @@ server binary):
 - The DynamoDB per-type `binary` and `binary-set` runs cannot decode reads
   (every read is `:info`), so those two types are write-only checks.
 
+Fourth results, under faults. A local process nemesis
+(`jepsen/src/elastickv/local_nemesis.clj`, branch
+`design/serializable-audit-a4-nemesis`, commit `cb267c46`, not pushed; 15
+unit tests) kills or pauses the node whose `/healthz/leader` answers 200
+every 10 s and heals it 5 s (kill) or 3 s (pause) later, restarting a killed
+node with its original flags and waiting for its ports. Same full-stack
+binary, 90 s at rate 50 / concurrency 10, fresh cluster per run:
+
+| Run | Result |
+|---|---|
+| Lua, Redis `MULTI`, DynamoDB rw-register, two runs each, leader kill | all `:valid? true`; 9 kills and 9 restarts per run, every kill hit the leader, every node came back (ports open within 143 to 291 ms); no `:ok` write vanished; no Elle anomaly. The `:fail` / `:info` counts (about 800 per Redis run) are connection refusals to the dead node and in-flight `:eof`s. |
+| Redis and DynamoDB list-append, leader kill | `:valid? true`. |
+| Lua, leader pause, prescribed run | `:valid? true`; no pause changed the leader (failover takes about 2.7 to 3 s, so a 3 s pause sits on the boundary) and the cluster stalled for the pause windows. |
+| Lua, leader pause, two additional runs | `:valid? false`, **G1a** in both, traced to G11 above (a write that committed after the leader stepped down was reported `NOTLEADER` and recorded as a definite failure); with `NOTLEADER` reclassified as indeterminate both histories are valid. |
+
+Node logs: no `panic`, `fatal`, `data race`, `inconsistent`, or `diverg`
+lines in any run. Two availability observations: failover after a leader
+stop takes about 2.7 to 3 s; and a demoted leader's Lua retries keep
+forwarding the request stamped with its old timestamp, which the A0b check
+rejects each time until the retries run out (safe, wasted work; the retry
+should re-dispatch unstamped).
+
+What the fault runs do not cover: partitions, clock skew, disk or fsync
+faults (SIGKILL keeps the page cache), more than one faulted node, a
+non-leader target, more than one Raft group (no cross-shard 2PC under
+faults), more than one host, more than two runs per configuration, pause
+for `MULTI` / list-append, and the snapshot-install path on restart.
+
 Remaining:
 
-- Run the rw-register workloads under faults (leader kill, pause,
-  partition) against the full-stack binary; `--local` disables the nemesis
-  today, so a local process-kill nemesis is needed first.
+- Fix G11 server-side and record `NOTLEADER` as indeterminate in the Jepsen
+  clients; re-run the pause configuration for every workload.
+- Multi-group cluster under faults (cross-shard 2PC); partition nemesis.
 - Fix the three harness findings above (separate PRs).
 - Multi-shard variant for each workload: keys spread across at least two
   Raft groups so G1's path is exercised (Jepsen M5 already runs multi-group

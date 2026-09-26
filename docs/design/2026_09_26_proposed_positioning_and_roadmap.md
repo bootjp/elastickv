@@ -138,7 +138,8 @@ behind each claim.
    cannot exhibit write skew (every anti-dependency comes with a write-write
    dependency on the same key), so the audit added rw-register workloads that
    can; they are red on `main` and green on the audit's fix branches under
-   the same load (audit A4), without fault injection yet.
+   the same load, including repeated leader kills (audit A4); partitions
+   and multi-group faults are not covered yet.
 4. **Caveat.** Leader-lease reads rely on bounded clock drift; under an
    arbitrary partition a deposed leader may serve a lease read until its
    lease expires (`2026_04_20_implemented_lease_read.md`). README states
