@@ -997,11 +997,21 @@ Constraints the fix PR must close before merge:
   compaction keeps a key's last tombstone, so every released read lock leaves
   a permanent tombstone that every later writer of that key scans: about
   2 µs per check with no history, 28 µs after 100 released locks, 290 µs
-  after 1000 (`kv/txn_read_lock_benchmark_test.go`). Options: let compaction
-  drop tombstone-only `!txn|rlock|` keys below `minRetainedTS` (a duplicate
-  PREPARE arriving after that could recreate a stale lock that then lasts
-  TTL plus one resolver interval), or keep one shared row per key holding
-  the set of holders. Needs a decision.
+  after 1000 (`kv/txn_read_lock_benchmark_test.go`). Decision: **the lock
+  namespaces are exempt from MVCC history.** The compactor physically
+  removes any `!txn|lock|` or `!txn|rlock|` key whose latest version is a
+  tombstone with a commit timestamp below `minRetainedTS` (no snapshot
+  read ever targets a lock row at an old timestamp; the retention floor
+  already accounts for backup pins), and a PREPARE whose identity already
+  has a commit or rollback record is a no-op, so a late duplicate PREPARE
+  cannot recreate a released lock after its tombstone is gone (the
+  records keep their history: they are the identity's memory; their own
+  growth is the pre-existing "records are never collected" limit). The
+  shared-row alternative (one row per key holding the holder set) was
+  rejected because it serialises every reader of a hot key on one row.
+  Target: the check cost returns to the no-history figure after
+  compaction, pinned by the benchmark. Implementation on
+  `design/serializable-audit-a2-lock-gc`.
 - **Migration.** Read locks are not drained or carried across a cutover; a
   read lock taken on the source does not protect the key on the target.
 - **Cost.** A read-only shard now takes two Raft entries (PREPARE, COMMIT)
