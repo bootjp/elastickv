@@ -490,17 +490,50 @@ release, foreign versus own locks, reader transparency, resolver expiry, and
 end-to-end read-only-shard transactions on two Raft groups; `store`, `kv`,
 and `adapter` are green under `-race`; lint is clean.
 
+The review finding that read-lock installation ignored foreign write locks
+is fixed on `design/serializable-audit-a2-readlock-vs-writelock` (two
+commits on top of the A0 completion branch, not pushed): `54cc0541` adds
+`kv/txn_read_lock_vs_write_lock_repro_test.go`, a two-group test that parks
+T2's lock-only PREPARE and both primary COMMITs so both write locks land
+before either read lock; before the fix both transactions committed
+(`x="t2"`, `y="t1"`). `8223f042` adds
+`assertNoForeignTxnWriteLocksOnReadKeys` to `handlePrepareRequest`, run
+after the mutations are built and before the read-lock rows are appended,
+for lock-only and write-shard PREPAREs alike; it fails with
+`TxnLockedError` ("write lock") for the first read key whose write lock
+belongs to another transaction, using the same ownership test as
+`txnLockOwnedBy`, and the write-key check was refactored into
+`assertNoConflictingTxnLockTargets` so both use the batch-get path on
+Pebble and the scan path otherwise. Checking the lock row is equivalent to
+checking the intent because PREPARE writes both in one batch and COMMIT,
+ABORT, and the resolver delete both in one batch. No new cleanup path:
+`prewriteTxn` already aborts the prepared groups of the failed transaction,
+and the reproduction asserts no lock rows remain on either group. After the
+fix T1 aborts with the lock conflict and T2 commits. Four new subtests
+(in-memory and Pebble, lock-only and write-shard PREPARE) cover rejection,
+no partial rows on rejection, own locks accepted, and success after the
+writer's ABORT; one existing test that read-locked a key under a foreign
+write lock was changed to a key the writer only read-locked. `store` and
+`kv` are green under `-race`; `adapter` is green except the pre-existing
+A0b timing flake `TestGRPC_FollowerWritesCarryLeaderIssuedTimestamps` (4 of
+15 runs fail on the base commit, 3 of 15 with the fix). Cost: one batch-get
+of the read keys' lock rows per PREPARE that carries read keys, no extra
+Raft round-trip. Limits: like the other lock checks it ignores lock TTL, so
+an orphaned write lock blocks readers' PREPAREs until the resolver settles
+it, and staged-migration lock aliases are not checked (as for the existing
+checks). The one-phase path is unchanged: it installs no read locks, and
+its reads and a conflicting 2PC read lock on the same group are ordered by
+that group's apply.
+
 Constraints the fix PR must close before merge:
 
-- **Read-lock installation versus foreign write locks (found in review).**
-  The implemented `handlePrepareRequest` installs a read lock without
-  checking for a foreign write lock on that key, so the cross-shard PREPARE
-  interleaving described in the A2 design (both write locks before either
-  read lock) still commits both transactions. Add the check and a two-group
-  reproduction test that drives that interleaving (expected red first). The
-  TLA+ half is done: `design/serializable-audit-a3-shards` splits PREPARE
-  per key and `MCOCC_gap_readlock_intent.cfg` fails `OCC8` on this
-  interleaving without the rejection (A3).
+- **Read-lock installation versus foreign write locks (found in review):
+  closed.** Reproduced and fixed on
+  `design/serializable-audit-a2-readlock-vs-writelock` (status above); the
+  TLA+ half is `design/serializable-audit-a3-shards`, whose
+  `MCOCC_gap_readlock_intent.cfg` fails `OCC8` on this interleaving without
+  the rejection (A3). Still open from it: the orphaned-write-lock wait is
+  bounded only by the resolver's TTL sweep.
 - **`DEL_PREFIX` ignores locks (found in review).** The implemented A2
   leaves raw `DEL_PREFIX` outside lock validation; add range-aware conflict
   handling against write and read locks under the prefix, with a test that
