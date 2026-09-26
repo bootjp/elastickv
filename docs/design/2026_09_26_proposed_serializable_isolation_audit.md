@@ -167,7 +167,32 @@ secondary COMMITs are not fenced because their intents are already visible
 as locks to any reader at or above `StartTS`, and readers resolve them. The
 fence makes "every version with `commitTS ≤ LastCommitTS()` is applied" a
 guaranteed invariant instead of an assumption, which is what the read
-timestamp path relies on. An alternative that avoids rejections, serialising
+timestamp path relies on.
+
+**Multi-group deployments (found in review).** The fence is per group, but
+the adapters' read snapshot is not: `globalSnapshotTS` takes
+`GlobalLastCommitTS`, and `ShardStore.LastCommitTS()` is the maximum over
+all groups. With group A's watermark at `c2` and group B's at `c0`, a write
+`c1` (`c0 < c1 < c2`) still in flight on B, and a transaction reading B at
+the global snapshot `s = c2`: the read misses `c1`, B later accepts `c1`
+(above its own watermark), and validation ignores it (`c1 ≤ s`). That is G0
+across groups, and it stays open with a per-group fence. The fix: a
+transaction's `StartTS` is the **minimum** of the replicated watermarks of
+the groups it touches (all data groups when the set is not known up front,
+as for a keys-spanning Lua script), read from each group's store; every
+group then applies only above `StartTS`, so the snapshot is stable
+everywhere, and freshness is enforced by validation (a key that changed
+between `StartTS` and the group's watermark fails the read-set check and
+the transaction retries). Single-group requests keep their group's own
+watermark. The alternative, keeping the global maximum and raising a lagging
+group's fence floor to `s` with a Raft entry before reading it (the backup
+timestamp floor already works this way, `persistBackupTimestampFloor` /
+`verifyBackupTimestampFloor`), costs a round-trip on every lag and is kept
+as the fallback if the minimum proves too stale under skewed traffic. This
+needs a two-group reproduction first: delay B's apply of `c1`, take a
+transaction snapshot at A's watermark, read B, then let `c1` land and
+commit the transaction (expected red: the transaction commits without
+seeing `c1`). An alternative that avoids rejections, serialising
 allocation and proposal under one lock per group, does not cover timestamps
 allocated on other nodes (Internal.Forward) or handed out by the TSO batch
 allocator to concurrent coordinators, so it is at most a complement.
@@ -384,22 +409,39 @@ code at fix time and turns the `N` rows into fixes:
   `If-None-Match` become read-set entries so the precondition is re-validated
   at apply.
 - Lua: extend `luaWideFenceReadKeysForPlan` so string reads record the
-  string key, capped by `kv.maxReadKeys`; scripts over the cap fail closed.
+  string key, and collection reads record what a transaction would: `HGET` /
+  `HMGET` / `HEXISTS` the field keys, `LINDEX` / `LRANGE` / `LLEN`,
+  `SMEMBERS` / `SISMEMBER` / `SCARD`, `ZSCORE` / `ZRANGE` / `ZCARD`, and the
+  stream reads the collection's fence key (a concurrent field write or
+  emptying path bumps it, per the G7 fence rules), all capped by
+  `kv.maxReadKeys`; scripts over the cap fail closed. The A1 Redis branch
+  covers string reads only, so collection reads stay a blocker (a script
+  reading a hash field and writing another key still commits against a
+  concurrent change of that field).
 - Redis: bump the collection fence on every emptying path
   (`deleteLogicalKeyElems` callers, `HDEL`, update-only `HSET`) and read the
-  fence keys in `SETNX`, the legacy creates, and the `MULTI` type probes for
-  absent keys (G7). Two of the fixes are already known to be small: in a
+  fence keys in `SETNX`, the legacy creates, the `MULTI` type probes for
+  absent keys, and the two absent-key creators the matrix marks `N` that the
+  first pass omitted, `PFADD` (HLL key) and `XADD` (stream meta): each
+  probes the type and then writes only its own encoding, so an absent-key
+  `XADD` racing `HSET` or `RPUSH`, or `PFADD` racing `SADD`, commits two
+  encodings under one logical key (G7). Two of the fixes are already known to be small: in a
   throwaway copy, adding `redisStrKey(key)` to the Lua context's read keys on
   a string read, and making `deleteListElems` `Put` the list fence, turned
   the G3 and G7 reproduction tests green (the first attempt conflicts, the
   retry sees the concurrent write).
-- S3: re-read the part descriptors at the commit snapshot in
-  `completeMultipartUpload`; in `uploadPart`, surface the bucket meta and
-  **re-read the previous part at `StartTS`** (or validate it against the
-  earlier `readTS` it was actually read at): merely listing it in
-  `ReadKeys` does not help, because a commit between the old `readTS` and
-  `StartTS` is not newer than `StartTS` and passes validation (G2, in
-  addition to the bucket-meta read keys above).
+- S3: in `completeMultipartUpload`, re-read the part descriptors at
+  `StartTS` **and list every consumed part key in `ReadKeys`** (or, if the
+  part count can exceed `kv.maxReadKeys`, a per-upload parts fence that every
+  `uploadPart` `Put`s and the completion reads): the re-read alone leaves the
+  window between it and apply, in which a same-part re-upload commits
+  without touching the upload meta. In `uploadPart`, surface the bucket meta
+  and **re-read the previous part at `StartTS`** (or validate it against the
+  earlier `readTS` it was actually read at), listing both keys in
+  `ReadKeys`: listing alone does not help when the value was read before
+  `StartTS`, because a commit between the old `readTS` and `StartTS` is not
+  newer than `StartTS` and passes validation (G2, in addition to the
+  bucket-meta read keys above).
 - SQS: no code change; the matrix is the deliverable (G4). DynamoDB: none
   except the migration finaliser (G9): `finalizeLegacyTableMigration`
   receives the schema loaded at the earlier `legacyMigrationSnapshot`,
@@ -439,7 +481,10 @@ collection fences (a
 concurrent `HSET` creating it is undetected, which matters only in a
 two-script cycle), `SET NX` / `SET XX` / `SETNX` check existence through
 `logicalExists`, which records nothing, and probes that resolve to a
-collection type record nothing.
+collection type record nothing; Lua collection reads (`HGET`, `LRANGE`,
+`SMEMBERS`, `ZRANGE`, stream reads) record nothing; and `PFADD` / `XADD` on
+an absent key still write without the fence read (all three are A1
+blockers listed in the plan above).
 
 Each fix lands with a failing test first (per `CLAUDE.md`): a unit test that
 drives the two-transaction interleaving through the coordinator and asserts
@@ -588,9 +633,15 @@ Constraints the fix PR must close before merge:
 - **Behaviour change.** A read key routing to a group the coordinator does
   not know now aborts the transaction (before, its validation was silently
   skipped).
-- Pre-existing and untouched: RAW writes and raw `DEL_PREFIX` ignore every
-  lock; a coordinator stalled past the TTL can have its primary lock treated
-  as a rollback (true for write locks too).
+- Pre-existing: raw `DEL_PREFIX` bypasses lock validation (the blocker
+  above). Ordinary RAW `PUT` / `DEL` already check write locks
+  (`validateRawMutationForApply` → `assertNoConflictingTxnLock`) and
+  deliberately skip read locks: a raw write carries no read set, so it can
+  always be serialised after the transaction holding the read lock (a raw
+  write derived from an earlier adapter read is a G7-class bug on its own,
+  fixed by making that path a transaction with `ReadKeys`). A coordinator
+  stalled past the TTL can have its primary lock treated as a rollback (true
+  for write locks too).
 
 ### A3. TLA+
 

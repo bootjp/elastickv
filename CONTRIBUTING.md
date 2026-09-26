@@ -1,6 +1,6 @@
 # Contributing to elastickv
 
-Thanks for your interest. This file is the map; the rules themselves live in `CLAUDE.md`, which is the single source of truth for coding standards.
+Thanks for your interest. This file is the map; the rules themselves live in `CLAUDE.md` (coding standards, architecture, review passes, design-doc workflow) and `AGENTS.md` (build, style, and testing requirements that reviewers enforce). Where the two overlap they say the same thing; if they ever disagree, fix the disagreement rather than picking one.
 
 ## Coding standards
 

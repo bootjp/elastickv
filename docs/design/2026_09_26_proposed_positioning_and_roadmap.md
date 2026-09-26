@@ -141,7 +141,11 @@ behind each claim.
    (knossos linearizable register).
 2. **Multi-key transactions are atomic.** Single-shard transactions apply in
    one Raft entry; multi-shard transactions use two-phase commit with a
-   primary key and lock resolution (`kv/lock_resolver.go`).
+   primary key and lock resolution (`kv/lock_resolver.go`). Not yet claimed
+   for multi-shard transactions: two concurrent 2PC transactions that share
+   a primary key and a start timestamp are treated as one owner and can
+   commit a mix of their writes (audit gap G12); the claim waits for the
+   explicit transaction id in A2.
 3. **Multi-key transactions are serializable.** The FSM validates the
    transaction's write set and read set against every commit newer than
    `StartTS` under the store's apply lock (`checkConflictsLocked` in
@@ -191,6 +195,16 @@ Prerequisite for the on-premises showcase. Scope:
   `HELLO AUTH` accepted. ACLs are out of scope.
 - TLS on every listener (gRPC, Redis, DynamoDB, S3, SQS), reusing the admin
   listener's certificate flags.
+- The internal forwarding clients get the same settings, or follower
+  forwarding breaks the moment the controls are on: the Redis leader
+  clients (`redis_proxy_leader.go`, built with only an address and pool
+  size) take the password and TLS config; the DynamoDB / SQS shared reverse
+  proxy and the S3 reverse proxy (`leader_http_proxy.go`, hard-coded
+  `http`) take the scheme, CA, server name, and the SigV4 credentials they
+  must re-sign or pass through; `GRPCConnCache` takes the client TLS
+  config instead of the insecure dial options. Alternative if that plumbing
+  is larger than it looks: separate authenticated internal endpoints for
+  forwarding, decided in the milestone's design doc.
 - Deferred: gRPC mTLS or bearer tokens; node-to-node Raft authentication
   (assumed to run inside a private network or tailnet).
 

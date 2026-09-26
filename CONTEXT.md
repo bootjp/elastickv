@@ -242,8 +242,11 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   log so snapshots and follower catch-up stay bounded.
   (`docs/design/2026_04_25_partial_s3_raft_blob_offload.md`)
 - **HT-FIFO (high-throughput FIFO)** — SQS's partitioned FIFO mode; Elastickv
-  gives each partition its own Raft group, preserving order per message
-  group. (`docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md`)
+  routes each partition independently, preserving order per message group.
+  Partitions land on distinct Raft groups only where `--sqsFifoPartitionMap`
+  assigns them so; several may share a group, and without a map every
+  partition sits on the single SQS shard.
+  (`docs/design/2026_04_26_implemented_sqs_split_queue_fifo.md`)
 - **DLQ redrive** — Dead-letter handling: a message moves to the configured
   DLQ when the next receive would exceed the redrive policy's maximum.
   (`docs/design/2026_06_16_implemented_sqs_dlq_redrive_admin_ui.md`)
