@@ -212,7 +212,16 @@ precedent). After it applies, the fence rejects any later apply at
 per group for `s`. The natural home is `ShardStore`'s read path (`GetAt`,
 `Scan`, the leader read that serves them): when `ts > group.LastRaftCommitTS()`
 the group leader proposes the advance, waits for its local apply, then
-reads; single-group reads (`s` is that group's own watermark) never pay,
+reads. Only a **cluster-issued** snapshot may advance a watermark: the
+advance is bounded by the leader's HLC (a timestamp above what the local
+clock could have issued is refused, never persisted), and a timestamp the
+client supplied directly, as gRPC `RawGet` / `RawScanAt` / `Get` / `Scan`
+accept in their `Ts` field, never advances anything: such a read is served
+at `min(ts, watermark)` and says so, otherwise one request with a
+far-future timestamp would fence every write on the group until wall time
+caught up. The coordinator's own snapshot reads (the adapters' `snapshotTS`
+/ `globalSnapshotTS`, `txnStartTS`, `nextTxnReadTS`, `readTS`) are the
+trusted callers; single-group reads (`s` is that group's own watermark) never pay,
 and an idle group pays one entry per distinct `s` it is read at, in the
 same RPC as the read when the leader is remote. The rejected alternative,
 `StartTS` = the minimum of the touched groups' watermarks, is stable
@@ -508,7 +517,11 @@ every requested part, and the head manifest at its `StartTS`, then
 allocates the commit timestamp and dispatches with every consumed part key
 in `ReadKeys` (a per-upload parts fence was rejected because every
 `uploadPart` would write it and parallel parts of one upload would conflict
-with each other; 10,000 parts fits `kv.maxReadKeys`); a conflict retries
+with each other); `kv.maxReadKeys` is raised so a 10,000-part completion
+plus its bucket-generation fence and upload meta fit (today the cap is
+exactly 10,000 and `dispatchTxn` checks the total, so the maximum-size
+upload would fail as an invalid transaction; the staged-migration alias
+doubling still halves what fits during a migration); a conflict retries
 the attempt and either commits the new part version (same ETag) or fails
 `InvalidPart`. `uploadPart` re-reads the bucket meta in the commit phase
 (404 `NoSuchBucket` / `NoSuchUpload` when the generation changed) and reads
@@ -600,14 +613,23 @@ bytes drawn once per transaction by the dispatching coordinator (no
 coordination, unique with overwhelming probability, stable across the
 retries of one transaction so an idempotent re-PREPARE still matches its
 own lock), carried in `pb.Request`, stored in the `txnLock` payload (a new
-encoding version; a lock without one is treated as foreign by everything
-except the resolver, which settles it from its primary as today), used as
+encoding version), used as
 the owner test in `handlePrepareRequest` and the read-lock checks, and as
 the suffix of the read-lock row key and of the commit / rollback record
 keys (`primaryKey` stays in the key so the resolver still finds the
-primary's status). This is a wire and key-format change: old and new
-nodes must not run mixed 2PC traffic, so it ships behind the same
-rolling-upgrade capability gate as the fence.
+primary's status). Ownership is decided per request: a request with a `TxnID` owns exactly
+the locks and records carrying that `TxnID`; a request without one (a
+legacy transaction) owns locks and records without one under the old
+`(primaryKey, StartTS)` test, permanently, not only while the gate is off,
+so a transaction prepared before activation finishes its COMMIT, ABORT,
+or retry normally and the resolver settles legacy locks from their
+primary as today; a legacy lock against a `TxnID` request, or the
+reverse, is foreign. The gate exists for FSM determinism, not ownership:
+every replica must write the same row for the same entry, so the
+coordinator starts assigning `TxnID`s only once every node runs the new
+binary, and transactions already in flight at that moment complete under
+legacy identity. This is a wire and key-format change, so it ships behind
+the same rolling-upgrade capability gate as the fence.
 `DEL_PREFIX` is a range read-modify-write, not a blind write, so its apply
 must conflict with every transaction lock, write or read, under the prefix
 (the `DEL_PREFIX` is rejected as retryable, or the prepared transactions
@@ -1111,10 +1133,14 @@ Design:
   by the `(index, term)` it received when its entry appeared in
   `Ready.Entries`; it resolves as success when the entry applies (the
   normal pop by id, whichever leader committed it), as a definite,
-  retry-safe `errNotLeader` when that log position is overwritten by an
-  entry of a different term or superseded by a snapshot (the proposal can
-  never commit), and as `ErrProposalOutcomeUnknown` only when the request
-  context expires, or the engine stops, before either happens. Pending
+  retry-safe `errNotLeader` only when that log position is overwritten by
+  an entry of a different term (the proposal can never commit), and as
+  `ErrProposalOutcomeUnknown` when the request context expires, the engine
+  stops, or a snapshot that covers the proposal's index is installed before
+  either happens: a snapshot proves nothing about the entry (the successor
+  may have committed it and compacted), so it stays unknown unless the FSM
+  can answer from durable state whether that proposal was applied, which
+  this milestone does not add. Pending
   admin / config changes follow the same rule; pending reads keep
   `errNotLeader` (nothing was applied). Pre-proposal rejections are
   unchanged. So the unknown class is the residue after a bounded wait, not
@@ -1189,8 +1215,10 @@ proves larger than expected.
 - `go test -race ./kv/... ./adapter/... ./store/...` includes the new
   interleaving tests.
 - `make tla-check` passes with `OCC6_SnapshotStableAtWatermark`,
-  `OCC7_NoLostUpdate`, and `OCC8_NoWriteSkew`, and fails the two gap
-  configurations as expected.
+  `OCC7_NoLostUpdate`, and `OCC8_NoWriteSkew`, and fails all three gap
+  configurations as expected: `MCOCC_gap_applyorder.cfg` (`OCC6`),
+  `MCOCC_gap_readlocks.cfg` (`OCC8`), and `MCOCC_gap_readlock_intent.cfg`
+  (`OCC8` on the foreign-write-lock interleaving).
 - Every A4 workload is green in CI; the Lua workload's pre-fix red run is
   linked from the PR.
 
