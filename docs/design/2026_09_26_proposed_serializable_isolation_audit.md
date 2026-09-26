@@ -255,6 +255,46 @@ be loaded, a deposed leader issuing at `physical = ceiling` next to the new
 leader, and the dedup probe (`dedupProbeOnePhase`) matching another
 transaction's version at `PrevCommitTS`.
 
+Status of A0b, first slice: implemented ahead of review on local branch
+`design/serializable-audit-a0b-leader-stamp` (five commits on top of the A2
+branch, not pushed). What landed: `EVAL` / `EVALSHA` go through the same
+leader proxy as every other Redis write (all keys led by one foreign node →
+forwarded as `EVAL` with the cached body; a foreign key with an unknown
+leader → fail closed; keys on several foreign leaders → still executed
+locally, which the 2PC follow-up covers); `ShardedCoordinator.Dispatch` on a
+node that does not lead the target group forwards single-shard one-phase,
+raw, and `DEL_PREFIX` requests **unstamped** and the leader allocates
+(`forwardSingleShardTxnUnstamped`, `rawLogTimestampForGroup`, per-group
+`DEL_PREFIX` copies), a caller-supplied `CommitTS` on a non-leader is refused
+with `ErrCommitTSNotLeaderIssued` (a `NOTLEADER`-class error), and
+`leaseRefreshingTxn.Commit` stamps an unstamped one-phase request when the
+node became leader between dispatch and commit; `Internal.Forward` rejects a
+stamped raw or one-phase request in every TSO mode
+(`ErrForwardedTimestampRejected`) while PREPARE / COMMIT / ABORT keep their
+handling; the DynamoDB dedup path dispatches unstamped when the item's group
+is led elsewhere and its false comment is rewritten. gRPC `RawKV` /
+`TransactionalKV`, the filesystem, and the asynchronous cleanups needed no
+change: none of them stamped before `Dispatch`. Results: all reproduction
+tests (G0, G1, G3, G7, G10) pass; a follower-routed `RawPut` / `Put` test
+shows leader-issued timestamps (it failed before the change); `store`, `kv`,
+and `adapter` are green under `-race` (the adapter package needs
+`-timeout 40m` on this machine because two pre-existing tests take about 8
+minutes each); lint is clean.
+
+Behaviour changes to review: a deposed leader that stamps and then fails
+`VerifyLeader` now gets its forwarded request rejected instead of accepted;
+in multi-group deployments, S3's local fallback when the route key cannot be
+loaded and a keys-spanning Lua script whose writes all land in one foreign
+group now fail closed instead of stamping locally.
+
+Remaining for A0 / A0b: allocate the 2PC commit timestamp after all
+PREPAREs succeed, from the primary group's leader or the TSO, fence the
+primary COMMIT, and stop `Internal.Forward` from keeping a coordinator-stamped
+COMMIT timestamp (cross-group Redis commands, `FLUSHALL`, spanning Lua
+scripts, cross-group S3 / DynamoDB / SQS / filesystem transactions); make the
+fence compare against a watermark that only replicated applies advance; fence
+`DEL_PREFIX`; review `dedupProbeOnePhase`.
+
 ### A1. Coverage table and adapter fixes
 
 Deliverable: the coverage matrix. Its initial version, produced by code
