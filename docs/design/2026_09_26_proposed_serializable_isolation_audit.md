@@ -137,7 +137,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
 | G12 | **Transaction identity is `(primaryKey, StartTS)`, which is not unique.** Locks (`txnLock`), the commit and rollback records (`txnCommitKey`, `txnRollbackKey`), the ownership test in `handlePrepareRequest` (`lock.StartTS == startTS && PrimaryKey equal`), and the A2 read-lock rows all identify a transaction by its primary key and start timestamp. Adapter transactions supply `StartTS = readTS`, the shared read snapshot, so two concurrent 2PC transactions with the same primary key and the same snapshot alias each other: the second PREPARE passes the ownership check as a retry of the first and overwrites its intent; the first COMMIT then publishes the second's value under the first's identity, and the second's COMMIT finds no lock and reports success. A2's read-lock rows collide the same way (one transaction's COMMIT deletes the other's protection). Found in review, **reproduced** deterministically (3 of 3 under `-race`): `TestTwoPhaseCommit_SharedPrimaryAndStartTSAliasTransactions` in `kv/txn_identity_aliasing_repro_test.go` (branch `design/serializable-audit-a2-txnid-repro`, commit `255bd0ba`, on the read-lock fix). Two groups; T1 writes `p` and `s1`, T2 writes `p` and `s2`, both with `StartTS` from `ShardStore.LastCommitTS()` and primary `p`. T2's PREPARE on `p` passes `txnLockOwnedBy` and overwrites T1's intent; the first primary COMMIT publishes whatever intent is there and records its `CommitTS`; the second primary COMMIT fails with `commit_ts mismatch`, its ABORTs fail with `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` then commits the loser's secondary at the winner's recorded `CommitTS` and reports success. Final state `p="t2"`, `s1="t1"`, `s2="t2"`; both clients told committed with the same `CommitTS`; T1's write of `p` is lost. In the read variant T2's COMMIT also deletes T1's read-lock row on `s2` and T1 still commits with its read of `s2` overwritten. | A cross-shard transaction can commit a mix of two transactions' writes (atomicity), and A2's read locks do not protect a transaction that shares identity with another. |
 | G13 | **A 2PC PREPARE whose `StartTS` equals the previous commit's timestamp is skipped as a replay, and the transaction's writes are silently lost (found by A4, diagnosed).** No faults, one node, one HLC, no split: the DynamoDB multi-table list-append workload (two groups) loses 11 to 21 acknowledged appends per 30-second run with the route-shuffle nemesis on or off. Mechanism: T1's COMMIT deletes each key's lock and intent rows, leaving tombstones at exactly `c1`; T2 starts at `nextTxnReadTS` = `ShardStore.LastCommitTS()` = `c1` when nothing committed since; T2's PREPARE writes its lock and intent at version `StartTS` (`handlePrepareRequest`, `commitTS = startTS`), `staleRaftApplyFastPathLocked` → `raftApplyAlreadyLandedLocked` finds a version (the tombstone) at `c1` on every key and declares the live PREPARE a replay before `checkApplyConflicts`, so no lock is written and validation is skipped; T2's COMMIT finds no lock, treats the key as already resolved, applies nothing, and the client gets OK. A collision on the secondary group alone tears the transaction (primary lands, secondary lost); a collision on both groups loses everything. **Reproduced** deterministically (`TestTwoPhaseCommit_PrepareAtPreviousCommitTSIsSkippedAsReplay` in `kv/prepare_replay_fastpath_repro_test.go`, branch `design/serializable-audit-g13-repro`, commit `10846a6c`, on `main` plus the harness fixes; 3 of 3 red under `-race`, control green; an instrumented binary logged 26 skipped live PREPAREs in one run, every lost transaction matching a skip at its `StartTS`). Excluded: the split and migration path (two runs without route shuffle lose appends too, group-1 keys whose route never moved lose them, the reproduction has no split); the A0 cross-group snapshot (the write is never applied, nothing is in flight); cross-node stamping (one HLC). It is the G10 stale-reapply sink reached by a single node, and **the A0 completion branch's Raft-index replay detection makes the reproduction pass**. Both ABORT variants **reproduce** too (`d0ad09ae`, same file, table-driven, 4 of 4 red 3 times under `-race`, all green with the fast path disabled and all green on the A0 completion branch): a coordinator ABORT after a read-only-shard conflict leaves the same tombstones at its `abortTS`, and `tryAbortExpiredPrimary` resolving an expired lock persists an ABORT at `startTS + 1`, a timestamp nothing allocated; a transaction starting at either value loses its write the same way. The Redis, SQS, and S3 2PC paths start at the watermark too and are expected to share the defect. | The default 2PC path loses committed writes on a healthy single node with both clients told OK; the fix is A0's index-based replay detection, and the regression test travels with the A0 PR. |
-| G14 | **PREPARE order lets a reader roll back a secondary before the primary lock exists (found while implementing A2, not yet reproduced).** `prewriteTxn` prepares groups in group-id order, not primary group first. A reader that meets a secondary's lock before the primary PREPARE has applied asks `primaryTxnStatus`, finds no primary lock and no record, concludes rolled back, and aborts that secondary without writing a rollback record; the primary then prepares and commits, and the secondary COMMIT finds no lock, treats the key as already resolved, and skips it. | A cross-shard transaction commits with one of its writes silently missing while the client is told OK; pre-existing on `main`, independent of the identity fix. Fix: prepare the primary group first and only then the secondaries, and make a status probe that finds neither lock nor record while the primary's PREPARE could still be in flight return "unknown" rather than "rolled back" (or write the rollback record so the primary's later PREPARE fails). |
+| G14 | **PREPARE order lets a reader roll back a secondary before the primary lock exists (found while implementing A2, reproduced).** `prewriteTxn` prepares groups in group-id order (`groupMutations` sorts the ids), not primary group first. A reader that meets a secondary's lock before the primary PREPARE has applied asks `primaryTxnStatus`, finds no primary lock and no record, concludes rolled back **before any TTL check**, and aborts that secondary without writing a rollback record (`handleAbortRequest` writes one only when the ABORT names the primary); the primary then prepares and commits, and the secondary COMMIT finds no lock, treats the key as already resolved (`commitTxnKeyMutations`), and `handleCommitRequest` returns nil with nothing written. **Reproduced** (`TestTwoPhaseCommit_ReaderRollsBackSecondaryBeforePrimaryPrepare` in `kv/txn_prepare_order_repro_test.go`, branch `design/serializable-audit-g14-repro`, commit `6b90173b`, on the `TxnID` branch; 3 of 3 red under `-race`, three controls green): with the route layout flipped so the primary sits on the higher group id, a plain read of the secondary key in the window (a live 30 s lock, no TTL involved) aborts it, and the `LockResolver` does the same once the secondary lock has expired; with the primary prepared first the reader gets `txn locked` and T commits both keys. The window is at least one Raft round-trip on the primary group per cross-shard transaction. The scan read path shares `primaryTxnStatus` and very likely the flaw (not exercised). | A cross-shard transaction commits with one of its writes silently missing while the client is told OK; pre-existing on `main`, independent of the identity fix. |
 | G15 | **A forwarded RPC that times out after it was sent is retried (found while implementing A6, not yet reproduced).** The leader-forward breaker in `kv/leader_proxy.go` treats `Unavailable` and `DeadlineExceeded` as retryable even when the request had already reached the leader, which may have proposed and committed it; the resend is a second proposal. | A non-idempotent write applied twice across a forward timeout with the client told OK once. Fix direction: after a forwarded write has been sent, a timeout or `Unavailable` is outcome unknown unless the request is idempotent by identity (2PC requests with a `TxnID` are; raw one-phase requests are not); the A0 fence does not detect the second apply because it carries a fresh timestamp. |
 
 ## 4. Milestones
@@ -939,8 +939,30 @@ Constraints the fix PR must close before merge:
   bounded only by the resolver's TTL sweep.
 - **Transaction identity (G12, found in review, reproduced): closed** on
   `design/serializable-audit-a2-txnid` (status above). Still open from it:
-  the rolling-upgrade gate wiring in `main.go` (shared with the fence), and
-  G14 below.
+  the rolling-upgrade gate (A7).
+- **PREPARE order (G14, reproduced).** Three changes, on
+  `design/serializable-audit-a2-prepare-order` over the reproduction:
+  (1) `prewriteTxn` prepares the **primary group first** and sends the
+  secondaries (write groups, then the lock-only read groups) only after the
+  primary PREPARE has applied, so a secondary lock never exists without the
+  primary lock or a record on the primary group; (2) `primaryTxnStatus`
+  and `backgroundPrimaryTxnStatus` conclude "rolled back" only from a
+  rollback record, or from an expired primary lock that
+  `tryAbortExpiredPrimary` then aborts (writing the record); "no lock and
+  no record" is **pending**: the reader returns `txn locked` (and retries
+  as for any live lock) and the resolver skips the row, since with
+  primary-first ordering that state is either a transient the reader
+  should wait out or an orphan whose coordinator died between the primary
+  PREPARE and the secondaries, which the primary lock's TTL then settles;
+  (3) a secondary COMMIT that finds no lock verifies the primary's commit
+  record and **re-applies the write from the COMMIT entry**, which
+  therefore carries the mutation values (today it carries keys only), and
+  fails loudly if it cannot, instead of returning success with nothing
+  written; the primary's commit record is the commit point, so any earlier
+  abort of a secondary was wrong and re-installing is correct. Tests: the
+  reproduction green (both read and resolver variants), the scan path
+  variant added, a coordinator-crash-between-PREPAREs case settled by the
+  primary TTL, and the COMMIT re-apply path.
 - **`DEL_PREFIX` ignores locks (found in review): closed** on
   `design/serializable-audit-a2-delprefix-locks` (status above).
 - **Tombstone accumulation.** Rows are per `(key, transaction)` and MVCC
@@ -1454,6 +1476,57 @@ case if it has a leadership-loss hook; a `LeaderProxy` table test that the
 class is not retried; per-adapter mapping tests; a `Forward` round-trip
 test. Merge blocker: none beyond these; the timestamp and read-lock work is
 independent.
+
+### A7. Rolling upgrade of the transaction format
+
+Status: proposed; implementation on
+`design/serializable-audit-a7-upgrade-gate` on top of the A2 `TxnID`
+branch. Every FSM-side change in A0 and A2 is a **semantic** change to
+how an entry is applied: the fence rejects an entry, `DEL_PREFIX` refuses
+under a lock, read-lock rows are written, `TxnID` rows and records use new
+keys and namespaces, the watermark-advance entry exists. A replica on the
+old binary applies the same entry with the old semantics, so a mixed
+cluster diverges as soon as one such verdict differs, whatever the
+coordinator proposes; and a lock-only PREPARE or an advance entry is not
+even decodable by the old binary. The capability gate that the earlier
+sections defer to is therefore two-sided:
+
+- **Per-entry format flag.** `pb.Request` gains `txn_format` (an enum,
+  `TXN_FORMAT_V1` = legacy, `TXN_FORMAT_V2` = this audit's semantics).
+  The FSM applies the fence, the `DEL_PREFIX` lock check, read locks,
+  `TxnID` ownership and records, and the advance entry **only for V2
+  entries**; a V1 entry is applied exactly as `main` applies it today, on
+  both binaries, so the two never disagree on a V1 entry. The
+  replay-by-index detection is local bookkeeping, not a verdict, and is
+  not gated. Snapshot formats always carry the replicated watermark once
+  the new binary writes them (a V1-only cluster simply never consults it).
+- **Cluster capability.** Every node advertises `txn_format_v2` in the
+  capability report the storage-envelope and encryption monitors already
+  read; the coordinator flips one atomic `txnFormatV2` (`WithTxnFormatV2`,
+  subsuming `WithTransactionIDs`) only when every voter and learner of
+  every group reports it, through a monitor built like
+  `startStorageEnvelopeV2CapabilityMonitor` /
+  `buildEncryptionCapabilityFanout`, and never flips it back. From then on
+  it stamps V2 on every request; transactions already in flight keep V1
+  and finish under V1 semantics (legacy ownership is permanent, A2). An
+  operator flag pins the format to V1 for a deployment that must keep an
+  old binary around, with a startup warning that the audit's guarantees
+  are off.
+- **Refusal on the old side.** A V2 entry must never reach an old binary;
+  the monitor makes that a matter of timing only. As a belt to the braces,
+  the new binary refuses to *start* a group whose peers include a node
+  without the capability while the format is pinned V2 in its data dir
+  (`raft-engine` marker, the same file that already records the backend),
+  and records the format in the marker once V2 is first proposed, so a
+  downgrade after V2 traffic fails loudly (`ErrTxnFormatDowngrade`) instead
+  of applying V2 entries with V1 semantics.
+- **Tests.** A two-binary simulation is out of reach in unit tests, so the
+  evidence is: table tests that every gated verdict is a no-op for V1
+  entries and active for V2; a coordinator test that the flag flips only on
+  full capability and stays flipped; in-flight V1 transactions finishing
+  after the flip; the marker's downgrade refusal; and a Jepsen run of the
+  rolling-update script (`rolling-update.sh`, the deploy runbook) across
+  the format change under the list-append workload.
 
 ### A5. Documentation
 
