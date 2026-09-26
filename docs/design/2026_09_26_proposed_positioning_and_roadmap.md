@@ -28,9 +28,9 @@ inside an air-gapped network, on three to five machines they operate
 themselves.
 
 **What.** One Raft-replicated, MVCC/OCC store that speaks those protocols from
-a single binary, with serializable multi-key transactions and per-key
-linearizability, and no external timestamp or placement service to run
-alongside it.
+a single binary, targeting serializable multi-key transactions and per-key
+linearizability (§4 and §5 record which of those hold on `main` today), and
+no external timestamp or placement service to run alongside it.
 
 **Proof.** The engineering record is a deliverable, not a by-product: every
 non-trivial change has a design doc, safety properties are model-checked in
@@ -55,7 +55,7 @@ week, no deadline; the plan below is sized for that.
 | Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
-| Verification story | Deterministic simulation | Jepsen (TiDB), tests | Internal (formal methods, TLA+) | Internal | Design docs, TLA+ (HLC, OCC, MVCC, routes, composed), Jepsen for Redis / DynamoDB / S3 / SQS (Elle list-append, knossos, custom checkers) |
+| Verification story | Deterministic simulation | Jepsen (TiDB), tests | Internal (formal methods, TLA+) | Internal | Design docs, TLA+ (HLC, OCC, MVCC, routes, composed), Jepsen for Redis / DynamoDB / S3 (Elle list-append, knossos, custom checkers; the SQS workload exists but validates nothing today, §1) |
 | Where elastickv is weaker today | Strict serializability, simulation testing | Auto migration / merge / rebalance, PD ecosystem, published numbers | Elasticity, global tables, zero ops | Scale | See §3 (future goals) and §4 (open gaps) |
 
 Read the table as: DynamoDB is the API reference, TiKV is the architectural

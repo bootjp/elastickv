@@ -18,9 +18,18 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   Raft group that owns it; one process can run several groups, each electing
   its leader independently. (`distribution/engine.go`,
   `docs/design/2026_06_11_implemented_leader_balance_scheduler.md`)
-- **default Raft group** — The lowest-ID group. Its reserved internal keys
-  hold the route catalog, and HLC ceiling entries replicate through it.
-  (`CLAUDE.md`, `docs/architecture_overview.md`)
+- **default Raft group** — The lowest-ID **data** group (`defaultGroupID` in
+  `shard_config.go` skips group 0). Its reserved internal keys hold the
+  route catalog. It is not the TSO group: when group 0 is configured, the
+  Phase D allocation state replicates through group 0, and the HLC ceiling
+  renewal loop proposes on every group the node leads (`renewHLCLeases`),
+  not only on the default group. (`shard_config.go`,
+  `docs/architecture_overview.md`)
+- **TSO group (group 0)** — The reserved Raft group for centralized
+  timestamp allocation; shard ranges and SQS partition maps cannot route
+  data to it. Optional: without it the legacy HLC path and the default
+  data group carry timestamp state.
+  (`docs/design/2026_04_16_implemented_centralized_tso.md`)
 - **FSM (KV FSM)** — Applies committed Raft entries to the storage layer and
   to the HLC ceiling. (`CLAUDE.md`, `kv/fsm.go`)
 - **voter** — A full member counted in the quorum. (`docs/raft_learner_operations.md`)
@@ -39,8 +48,15 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   one node does not lead every group and carry all leader-only work.
   (`docs/design/2026_06_11_implemented_leader_balance_scheduler.md`)
 - **follower forwarding** — Serving a request locally on a follower would
-  expose stale reads, so every follower request is forwarded to the leader.
-  (`adapter/dynamodb.go`)
+  expose stale reads, so a follower forwards it to the leader. Which layer
+  forwards differs by adapter: the Redis (`proxyToLeader`, except `EVAL` /
+  `EVALSHA`), DynamoDB, SQS, and S3 adapters forward the whole request
+  before any timestamp is chosen, while `EVAL` / `EVALSHA`, the gRPC
+  handlers, the filesystem, and the asynchronous cleanups run on any node
+  and forward only the eventual store dispatch, after local logic and, on
+  `main` today, timestamp selection (audit gap G10, fix A0b).
+  (`adapter/dynamodb.go`, `adapter/redis_lua.go`,
+  `kv/sharded_coordinator.go`)
 - **LeaderProxy / leader proxy circuit breaker** — The forwarding component,
   which bounds one request with a retry budget; the circuit breaker gives it
   cross-request memory so repeated work against a leader identity that just
