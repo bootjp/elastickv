@@ -87,8 +87,10 @@ README will present scope in two tiers instead of a non-goals section.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
-  restore tooling, physical snapshot offload to an S3-compatible object store
-  (M0 to M2), Pebble SST ingest snapshot transfer, admin dashboard with data
+  restore tooling, physical snapshot publish / restore tooling for an
+  S3-compatible object store (the periodic scheduler is not yet wired into
+  the server; that is the design's M3), Pebble SST ingest snapshot
+  transfer, admin dashboard with data
   browser, key visualizer with automatic same-group split, Prometheus
   metrics, rolling update over Tailscale.
 

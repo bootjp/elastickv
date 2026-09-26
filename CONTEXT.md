@@ -141,9 +141,11 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   TSO durably handed out. (`docs/design/2026_08_29_proposed_tso_batch_slot_claims.md`)
 - **StartTS** — A transaction's start timestamp; conflict validation checks
   that no read or write key was committed after it. (`proto/internal.proto`)
-- **CommitTS** — The timestamp at which a value or tombstone is committed;
-  unique, so a version at a given commit timestamp belongs to exactly one
-  transaction. (`store/store.go`)
+- **CommitTS** — The timestamp at which a value or tombstone is committed.
+  Intended invariant: unique, so a version at a given commit timestamp
+  belongs to exactly one transaction; on `main` today the default TSO mode
+  lets separate nodes issue the same value (audit gap G10), and A0b restores
+  the invariant. (`store/store.go`)
 - **PrevCommitTS** — The commit timestamp of a failed earlier attempt of the
   same transaction, used as that attempt's identity for dedup.
   (`kv/coordinator.go`)

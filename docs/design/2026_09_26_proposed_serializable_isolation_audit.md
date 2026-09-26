@@ -390,8 +390,12 @@ code at fix time and turns the `N` rows into fixes:
   the G3 and G7 reproduction tests green (the first attempt conflicts, the
   retry sees the concurrent write).
 - S3: re-read the part descriptors at the commit snapshot in
-  `completeMultipartUpload` and surface the bucket meta and previous part in
-  `uploadPart` (G2, in addition to the bucket-meta read keys above).
+  `completeMultipartUpload`; in `uploadPart`, surface the bucket meta and
+  **re-read the previous part at `StartTS`** (or validate it against the
+  earlier `readTS` it was actually read at): merely listing it in
+  `ReadKeys` does not help, because a commit between the old `readTS` and
+  `StartTS` is not newer than `StartTS` and passes validation (G2, in
+  addition to the bucket-meta read keys above).
 - SQS: no code change; the matrix is the deliverable (G4). DynamoDB: none
   except the migration finaliser (G9), which gets a read key on the schema.
 - gRPC: none in this audit; the API gap (G8) is documented in the positioning
@@ -441,8 +445,13 @@ PREPARE installs a **read lock** record for every read key on that shard
 (a marker keyed like `txnLockKey`, carrying `StartTS` and the primary key,
 and shared rather than exclusive), and a writer's apply-time
 `assertNoConflictingTxnLock` treats a foreign read lock like a foreign write
-lock. COMMIT, ABORT, and the `LockResolver` clear read locks exactly as they
-clear write locks. `handlePrepareRequest` is extended to accept a lock-only PREPARE (today it
+lock. Symmetrically, **installing a read lock fails when the key carries a
+foreign write lock** (an intent): otherwise two cross-shard transactions
+that each read the other's write key can interleave their per-shard
+PREPAREs so that both write locks land before either read lock, and both
+commit (write skew); the reader aborts or resolves the lock, as a plain
+read does through `maybeResolveTxnLock`. COMMIT, ABORT, and the
+`LockResolver` clear read locks exactly as they clear write locks. `handlePrepareRequest` is extended to accept a lock-only PREPARE (today it
 rejects an empty mutation list with `ErrInvalidRequest`) and to create read
 locks from `ReadKeys`; read-only shards then receive a PREPARE with an empty
 mutation list and only read locks, which replaces `validateReadOnlyShards`
@@ -473,6 +482,13 @@ and `adapter` are green under `-race`; lint is clean.
 
 Constraints the fix PR must close before merge:
 
+- **Read-lock installation versus foreign write locks (found in review).**
+  The implemented `handlePrepareRequest` installs a read lock without
+  checking for a foreign write lock on that key, so the cross-shard PREPARE
+  interleaving described in the A2 design (both write locks before either
+  read lock) still commits both transactions. Add the check, a two-group
+  reproduction test that drives that interleaving (expected red first), and
+  split `Prepare` per shard in the TLA+ model so `OCC8` catches it.
 - **Tombstone accumulation.** Rows are per `(key, transaction)` and MVCC
   compaction keeps a key's last tombstone, so every released read lock leaves
   a permanent tombstone that every later writer of that key scans: about
@@ -544,6 +560,10 @@ Modelling limits, recorded so nobody over-reads the result:
 - One store and one atomic `Prepare` stand for all shards; the read-only
   shard path (`validateReadOnlyShards`) and lock-only PREPAREs are not
   modelled separately, and `Prepare` still requires a non-empty write set.
+  This abstraction hides the cross-shard PREPARE interleaving found in
+  review (both write locks before either read lock): `Prepare` must be
+  split per shard, with read-lock installation rejecting a foreign write
+  lock, and a gap configuration without that rejection must fail `OCC8`.
 - The 2PC commit timestamp is allocated after `Prepare` (the A0 ordering);
   today's allocate-before-PREPARE is not modelled. G1 does not depend on it.
 - `OCC8` checks two-transaction cycles only.
@@ -723,7 +743,10 @@ proves larger than expected.
   locks and green after; the A2 PR carries it. The G3 and G7 reproduction
   tests are red before the A1 Redis fixes and green after; the A1 PR carries
   them.
-- The coverage table has no row protected by "nothing".
+- The coverage table has no unresolved in-scope row protected by
+  "nothing": every `N` that remains is marked benign (with the reason) or
+  out of scope (G8, the gRPC API gap), so completion cannot be reached by
+  relabelling.
 - `go test -race ./kv/... ./adapter/... ./store/...` includes the new
   interleaving tests.
 - `make tla-check` passes with `OCC6_SnapshotStableAtWatermark`,
