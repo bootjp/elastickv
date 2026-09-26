@@ -338,6 +338,49 @@ and the earlier idea of a separate `TXN_READ_VALIDATE` phase. Cost: one Raft ent
 transaction (already paid by write shards) and one more lock row per read
 key; writers to a read-locked key abort and retry instead of racing.
 
+Status of A2: implemented ahead of review on local branch
+`design/serializable-audit-a2-readlocks` (six commits on top of the A0 fence
+branch, not pushed). What landed: read-lock rows under a new prefix
+`!txn|rlock|` keyed `uvarint(len(key)) key startTS primaryKey` (per key and
+transaction, transaction identity `(primaryKey, startTS)` as the commit and
+rollback records already use, value = the existing `txnLock` payload);
+`handlePrepareRequest` installs one row per read key and accepts a lock-only
+PREPARE (read keys, no mutations); `assertNoForeignTxnReadLocks` makes a
+one-phase apply and a PREPARE fail with `TxnLockedError` ("read lock") when a
+write key carries another transaction's read lock, through one paged scan
+over the write keys' prefixes; COMMIT and ABORT entries carry the read keys
+and delete the rows; the `LockResolver` sweeps both lock namespaces and
+settles an expired read lock from the primary's status; `prewriteTxn`
+prepares the read-only groups with lock-only PREPAREs and the commit / abort
+fan-out includes them; `validateReadOnlyShards` and its helpers are deleted;
+migration export skips the rows; readers never consult them. Results: the G1
+reproduction passes (3 of 3 under `-race`), fifteen new tests cover install,
+release, foreign versus own locks, reader transparency, resolver expiry, and
+end-to-end read-only-shard transactions on two Raft groups; `store`, `kv`,
+and `adapter` are green under `-race`; lint is clean.
+
+Constraints the fix PR must close before merge:
+
+- **Tombstone accumulation.** Rows are per `(key, transaction)` and MVCC
+  compaction keeps a key's last tombstone, so every released read lock leaves
+  a permanent tombstone that every later writer of that key scans: about
+  2 µs per check with no history, 28 µs after 100 released locks, 290 µs
+  after 1000 (`kv/txn_read_lock_benchmark_test.go`). Options: let compaction
+  drop tombstone-only `!txn|rlock|` keys below `minRetainedTS` (a duplicate
+  PREPARE arriving after that could recreate a stale lock that then lasts
+  TTL plus one resolver interval), or keep one shared row per key holding
+  the set of holders. Needs a decision.
+- **Migration.** Read locks are not drained or carried across a cutover; a
+  read lock taken on the source does not protect the key on the target.
+- **Cost.** A read-only shard now takes two Raft entries (PREPARE, COMMIT)
+  where it took one read barrier; the earlier "one entry" estimate is wrong.
+- **Behaviour change.** A read key routing to a group the coordinator does
+  not know now aborts the transaction (before, its validation was silently
+  skipped).
+- Pre-existing and untouched: RAW writes and raw `DEL_PREFIX` ignore every
+  lock; a coordinator stalled past the TTL can have its primary lock treated
+  as a rollback (true for write locks too).
+
 ### A3. TLA+
 
 Status: both halves are done on local branches (not pushed):
