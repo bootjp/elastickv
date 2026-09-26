@@ -206,7 +206,9 @@ write-skew Jepsen workloads for Redis, DynamoDB, and Lua (A4; gRPC has no
 read-set-bearing transaction API, G8, so its evidence stays the engine-level
 Go reproductions until such an API exists), and
 rewrite the consistency sections of README, `architecture_overview.md`, and
-`review_todo.md` (A5). The A0 reproduction test is the first thing to run;
+`review_todo.md` (A5), and make an outcome the server cannot determine
+(a proposal pending at leadership loss) distinguishable from a definite
+failure on every surface (A6, G11). The A0 reproduction test is the first thing to run;
 its result decides what README may say.
 
 The two open TSO proposals (`2026_08_29_proposed_tso_batch_slot_claims.md`,

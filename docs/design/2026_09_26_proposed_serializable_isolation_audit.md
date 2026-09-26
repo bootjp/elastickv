@@ -810,8 +810,8 @@ for `MULTI` / list-append, and the snapshot-install path on restart.
 
 Remaining:
 
-- Fix G11 server-side and record `NOTLEADER` as indeterminate in the Jepsen
-  clients; re-run the pause configuration for every workload.
+- Fix G11 server-side (A6) and record the outcome-unknown class as `:info`
+  in the Jepsen clients; re-run the pause configuration for every workload.
 - Multi-group cluster under faults (cross-shard 2PC); partition nemesis.
 - Fix the three harness findings above (separate PRs).
 - Multi-shard variant for each workload: keys spread across at least two
@@ -824,6 +824,64 @@ Remaining:
   exist on the dev machine; `/opt/homebrew/bin/lein` with Java 21 works
   (Java 17 fails on `java.util.SequencedCollection`); the `jepsen/redis`
   submodule must be initialised.
+
+### A6. Indeterminate outcomes (G11)
+
+Status: proposed; implementation starts on
+`design/serializable-audit-a6-outcome-unknown` (from `main`, independent of
+the A0 to A2 stack). Numbered after A5 because it was found by A4's pause
+nemesis after the milestone list was written.
+
+Today the etcd engine fails a proposal in three places with the same
+`errNotLeader`: `handleProposal` before `node.Propose` (nothing was
+proposed: a definite failure), `ErrProposalDropped` during a leadership
+transfer (also definite), and `failPending` from `refreshStatus` when the
+node stops being leader (the entry is in the log and may commit under the
+successor: the outcome is unknown). `kv.isLeadershipLossError` treats all
+three as transient, so `LeaderProxy` and the coordinator retry, which
+double-applies a non-idempotent command when the first proposal did commit,
+and every adapter reports a definite failure (`NOTLEADER`, DynamoDB 4xx,
+gRPC `Unavailable`) that a later read can contradict. The Jepsen pause runs
+see this as G1a.
+
+Design:
+
+- **Engine.** A new sentinel `raftengine.ErrProposalOutcomeUnknown`, not
+  marked with `ErrNotLeader`. `failPending` uses it for pending proposals
+  and pending admin / config changes; pending reads keep `errNotLeader`
+  (nothing was applied). Pre-proposal rejections are unchanged. The engine
+  records, per drained proposal, the last known index and term so a later
+  milestone can resolve the outcome by watching whether that index commits
+  with that term or is overwritten; this milestone only reports it.
+- **kv.** `isLeadershipLossError` and `isTransientLeaderError` return false
+  for it, so no server-side path retries a proposal whose outcome is unknown
+  (a retry re-stamps a fresh timestamp and applies a second time when the
+  first committed; the A0 fence does not detect that). A new
+  `kv.IsOutcomeUnknown(err)` names the class for adapters. The lease
+  invalidation on leadership loss is unchanged.
+- **Forwarding.** `Internal.Forward` carries the class across the gRPC
+  boundary with a distinct status code (`codes.Aborted`) and the message
+  prefix `proposal outcome unknown`, and the client side of `Forward`
+  re-marks it with the sentinel; the phrase classifier's closed list does
+  not include it, so a forwarder never reclassifies it as transient.
+- **Adapters.** Each surface reports the class the way its upstream does
+  for an internal error whose effect is unknown, never as a retry-safe
+  failure: Redis `-OUTCOMEUNKNOWN <message>` (a distinct first token, so
+  clients and the Jepsen client classify it separately from `NOTLEADER`);
+  DynamoDB HTTP 500 `InternalServerError`; S3 HTTP 500 `InternalError`;
+  SQS HTTP 500 `InternalFailure`; gRPC `codes.Aborted` (clients must not
+  treat it as `Unavailable`).
+- **Jepsen.** The A4 clients record it as `:info` (Redis by the first
+  token, the HTTP adapters by status 500 plus the code), on the A4 branch.
+
+Tests: an engine test that proposes, forces leadership loss with the
+proposal pending, and asserts the sentinel (and that `errors.Is(err,
+ErrNotLeader)` is false), next to one that a pre-proposal rejection is
+still `ErrNotLeader`; the raftenginetest conformance suite gains the same
+case if it has a leadership-loss hook; a `LeaderProxy` table test that the
+class is not retried; per-adapter mapping tests; a `Forward` round-trip
+test. Merge blocker: none beyond these; the timestamp and read-lock work is
+independent.
 
 ### A5. Documentation
 
