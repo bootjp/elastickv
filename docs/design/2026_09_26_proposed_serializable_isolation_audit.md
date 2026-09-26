@@ -139,6 +139,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G13 | **A 2PC PREPARE whose `StartTS` equals the previous commit's timestamp is skipped as a replay, and the transaction's writes are silently lost (found by A4, diagnosed).** No faults, one node, one HLC, no split: the DynamoDB multi-table list-append workload (two groups) loses 11 to 21 acknowledged appends per 30-second run with the route-shuffle nemesis on or off. Mechanism: T1's COMMIT deletes each key's lock and intent rows, leaving tombstones at exactly `c1`; T2 starts at `nextTxnReadTS` = `ShardStore.LastCommitTS()` = `c1` when nothing committed since; T2's PREPARE writes its lock and intent at version `StartTS` (`handlePrepareRequest`, `commitTS = startTS`), `staleRaftApplyFastPathLocked` → `raftApplyAlreadyLandedLocked` finds a version (the tombstone) at `c1` on every key and declares the live PREPARE a replay before `checkApplyConflicts`, so no lock is written and validation is skipped; T2's COMMIT finds no lock, treats the key as already resolved, applies nothing, and the client gets OK. A collision on the secondary group alone tears the transaction (primary lands, secondary lost); a collision on both groups loses everything. **Reproduced** deterministically (`TestTwoPhaseCommit_PrepareAtPreviousCommitTSIsSkippedAsReplay` in `kv/prepare_replay_fastpath_repro_test.go`, branch `design/serializable-audit-g13-repro`, commit `10846a6c`, on `main` plus the harness fixes; 3 of 3 red under `-race`, control green; an instrumented binary logged 26 skipped live PREPAREs in one run, every lost transaction matching a skip at its `StartTS`). Excluded: the split and migration path (two runs without route shuffle lose appends too, group-1 keys whose route never moved lose them, the reproduction has no split); the A0 cross-group snapshot (the write is never applied, nothing is in flight); cross-node stamping (one HLC). It is the G10 stale-reapply sink reached by a single node, and **the A0 completion branch's Raft-index replay detection makes the reproduction pass**. Both ABORT variants **reproduce** too (`d0ad09ae`, same file, table-driven, 4 of 4 red 3 times under `-race`, all green with the fast path disabled and all green on the A0 completion branch): a coordinator ABORT after a read-only-shard conflict leaves the same tombstones at its `abortTS`, and `tryAbortExpiredPrimary` resolving an expired lock persists an ABORT at `startTS + 1`, a timestamp nothing allocated; a transaction starting at either value loses its write the same way. The Redis, SQS, and S3 2PC paths start at the watermark too and are expected to share the defect. | The default 2PC path loses committed writes on a healthy single node with both clients told OK; the fix is A0's index-based replay detection, and the regression test travels with the A0 PR. |
 | G14 | **PREPARE order lets a reader roll back a secondary before the primary lock exists (found while implementing A2, reproduced).** `prewriteTxn` prepares groups in group-id order (`groupMutations` sorts the ids), not primary group first. A reader that meets a secondary's lock before the primary PREPARE has applied asks `primaryTxnStatus`, finds no primary lock and no record, concludes rolled back **before any TTL check**, and aborts that secondary without writing a rollback record (`handleAbortRequest` writes one only when the ABORT names the primary); the primary then prepares and commits, and the secondary COMMIT finds no lock, treats the key as already resolved (`commitTxnKeyMutations`), and `handleCommitRequest` returns nil with nothing written. **Reproduced** (`TestTwoPhaseCommit_ReaderRollsBackSecondaryBeforePrimaryPrepare` in `kv/txn_prepare_order_repro_test.go`, branch `design/serializable-audit-g14-repro`, commit `6b90173b`, on the `TxnID` branch; 3 of 3 red under `-race`, three controls green): with the route layout flipped so the primary sits on the higher group id, a plain read of the secondary key in the window (a live 30 s lock, no TTL involved) aborts it, and the `LockResolver` does the same once the secondary lock has expired; with the primary prepared first the reader gets `txn locked` and T commits both keys. The window is at least one Raft round-trip on the primary group per cross-shard transaction. The scan read path shares `primaryTxnStatus` and very likely the flaw (not exercised). | A cross-shard transaction commits with one of its writes silently missing while the client is told OK; pre-existing on `main`, independent of the identity fix. |
 | G15 | **A forwarded RPC whose reply is lost after it reached the leader is retried (found while implementing A6, reproduced, fixed).** The leader-forward path (`LeaderProxy.forward`, `Coordinate.redirect`, the admin `forwardAdmin`) treated `Unavailable`, `DeadlineExceeded`, a dropped connection, and a reply held past the deadline as retryable even when the request had already reached the leader, which proposed and committed it; the resend was a second proposal with a fresh timestamp, which the A0 fence cannot detect. **Reproduced** (`adapter/forward_lost_response_test.go`, branch `design/serializable-audit-a6-forward-timeout`, commit `9d8cde4d`, on A6): the real `Internal` server over gRPC with a counting transaction manager and a server interceptor that applies the write and then loses the first reply in five ways, against three forward paths, 15 of 15 red ("the forwarded write was applied 2 times (err=<nil>)" for `LeaderProxy` and admin; `redirect` applied once but told the client a retryable error). **Fixed** by `8d1d77a4`: `classifyForwardedWriteError(err, sent)` keeps a never-sent failure retryable, marks a sent-then-lost reply (`Unavailable`, `DeadlineExceeded`, `Canceled`, `Internal`, a context error, a non-gRPC error) as `ErrProposalOutcomeUnknown` while keeping the gRPC code so the breaker still counts it, and passes the leader's definite answers through; "sent" comes from a per-call `grpc.Peer` probe, which grpc-go fills only after `transport.NewStream` succeeded (an empty peer means the final attempt never opened a stream); the startup gate's `Unavailable` is matched by an exact message constant (`kv.StartupGateUnavailableMessage`, now used by `main.go`'s gate interceptors) and stays retryable, so startup rotation and encryption cutover keep working. Green 15 of 15 plus 25 classification cases, a never-sent retry that succeeds once the leader listens, breaker accounting, the caller-deadline case, and the admin path; `kv`, `adapter`, `internal`, and the root package green under `-race`; lint clean. Every write is treated as non-idempotent on this branch (a lost reply on a forwarded PREPARE / COMMIT / ABORT is now unknown rather than retried inside `LeaderProxy`); `commitSecondaryWithRetry` one layer up still re-sends a secondary COMMIT on any error, relying on the per-transaction commit idempotence the `TxnID` branch formalises; the admin HTTP forward (`internal/admin/forward_client.go`, single attempt) is being given the same classification, because its handlers map a generic transport error to HTTP 503 with `Retry-After: 1` and the SPA resubmits a write whose outcome is unknown; a gRPC service-config retry policy, if ever enabled, would invalidate the probe (none is). | Closed for the data-plane forwards; the admin forward closes with its follow-up commit. A write reaching the leader is applied at most once across a lost reply; the client sees success or the outcome-unknown class. |
+| G16 | **A caught `WRONGTYPE` in a Lua script poisons the key's cached state (found while closing G7, reproduced, fixed).** Every Lua state loader (`redis_lua_context.go`) cached an empty, unloaded key state before checking the type and left it in place when the read failed with `WRONGTYPE` under `pcall` / `redis.pcall`; the next command of that type in the same script saw the key as absent, so a second `HGET` or `GET` returned nil and `HSET` / `RPUSH` / `SADD` / `ZADD` / `XADD` on a string, or `INCR` on a hash, succeeded and replaced the value at commit (`pcall(HGET)` then `HSET` turned string `"s"` into a hash). Reproduced (`TestLua_CaughtWrongTypeDoesNotPoisonKeyState`, eight cases red, `e1ff72d7`) and fixed (`fd97de18`, drop a key state whose first load failed) on `design/serializable-audit-a1-redis-setnx`. | A script that tolerates a type error can silently overwrite a value of another type on `main`; independent of concurrency. |
 
 ## 4. Milestones
 
@@ -827,7 +828,54 @@ field and standalone `HINCRBY`, which read the fence), which retry when an
 `HDEL` commits first. This is the balance between penalising only the
 scripts that read whole hashes and serialising every writer of a hot
 hash. Standalone `HGETALL` outside scripts and hash reads in `MULTI` are
-outside this change. Still open after this branch: `SETNX`, `SET NX` /
+outside this change.
+
+The string creates and the type probes are on
+`design/serializable-audit-a1-redis-setnx` (eight commits on the
+collections branch, not pushed). `590d525e` adds the reproductions
+(`adapter/redis_setnx_absent_key_repro_test.go` and new cases in the Lua
+and `MULTI` files): `SETNX` held after its existence check while `XADD` /
+`RPUSH` / `HSET` commits, the legacy `SET NX`, plain `SET`, and `INCR`
+held while `XADD` or `RPUSH` commits (seven red, "both creates committed:
+the key holds 2 encodings"); Lua `TYPE` / `EXISTS` / `PTTL` of a
+collection racing `DEL`, caught `WRONGTYPE` reads (`pcall` `GET` of a
+hash, `redis.pcall` `HGET` of a string, `pcall` `LLEN` of a set) racing
+`DEL`, and branches that skip the write (`SET NX` on a present key, `SET
+XX` / `DEL` / `PEXPIRE` / `RENAME` on an absent one), fourteen red;
+`MULTI` probes (`EXISTS` / `GET` / `EXPIRE`) of an absent key racing
+`HSET` / `ZADD` / `SADD`, three red. `SET NX` against `SET NX`, `SET XX`
+against `DEL`, and `SETNX` against `PFADD` were already rejected by the
+write-write check (both write the same key or the TTL index) and stay as
+pins. `6707a671` gives `SETNX`, `SET NX` / `XX` / `GET`, the legacy plain
+`SET`, and the legacy `INCR` the absent-key guard on create (thirteen
+read keys and four fence `Put`s) and the string, HLL, and bare-key reads
+on an existing string; `7052a141` routes `SETEX` through the same guarded
+path (it was a raw blind write with no reads and left a hash / list /
+stream / HLL next to the string; it now takes a read timestamp, the type
+probe, the TTL filter, and an OCC dispatch, and deletes the HLL or bare
+anchor it overwrites); `793d6ba4` records Lua type probes and `WRONGTYPE`
+reads on collection keys (the collection's fence, plus the legacy blob for
+hash and zset and the meta for streams); `5d356eda` makes the `MULTI`
+probes of an absent key read all four fences (nine to thirteen keys);
+`6a9ab4f3` pins the read sets (26 Lua rows, 15 string-write rows, 5
+`MULTI` rows). All 39 reproductions green; `adapter` green under `-race`;
+lint clean. Found on the way and recorded as **G16**: every Lua state
+loader cached an empty, unloaded key state before checking the type and
+left it there on `WRONGTYPE`, so after a caught error the next command of
+that type treated the key as absent (a second `HGET` or `GET` replied nil;
+`HSET` / `RPUSH` / `SADD` / `ZADD` / `XADD` on a string, or `INCR` on a
+hash, succeeded and replaced the value at commit); `e1ff72d7` reproduces
+it (eight red) and `fd97de18` drops a key state whose first load failed.
+Still open in G7 after this branch: the legacy plain `SET` over an
+existing string is still a blind write (a `DEL` plus a create of another
+type between its probe and its write leaves two encodings; dedup-off mode
+only); Lua `GET` / `GETDEL` / `INCR` on an absent key record only the
+string and bare keys (a concurrent collection create is unseen); Lua
+`PTTL` of a collection validates existence but not the TTL value (a
+positive `EXPIRE` writes the meta and TTL index, not the fence; not
+reproduced); and, not G7, an emptied wide-column hash still answers
+`EXISTS` / `TYPE` as a hash until compaction because its length deltas
+survive. Still open after this branch: `SETNX`, `SET NX` /
 `SET XX`, and the legacy string creates record nothing (a held `SETNX`
 against a `PFADD` / `XADD` that commits first still creates two
 encodings; the reverse order is now caught), reads that hit `WRONGTYPE`
