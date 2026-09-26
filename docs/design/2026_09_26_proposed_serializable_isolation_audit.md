@@ -170,6 +170,49 @@ allocation and proposal under one lock per group, does not cover timestamps
 allocated on other nodes (Internal.Forward) or handed out by the TSO batch
 allocator to concurrent coordinators, so it is at most a complement.
 
+Status of A0: implemented ahead of review on local branch
+`design/serializable-audit-a0-fence` (six commits on top of the reproduction
+branch, not pushed). What landed: replay detection by Raft index
+(`raftApplyReplayLocked`: an index below the persisted `metaAppliedIndex` is a
+pure no-op; at the persisted index the entry is a replay only if every key
+already has a version at `commitTS`, because a raw batch carries several
+requests under one index; anything above is live), the fence as
+`MVCCStore.ApplyMutationsRaftAtFenced` (Pebble and in-memory stores,
+forwarded by `ShardStore` and `LeaderRoutedStore`; runs under the apply lock
+after replay detection and before the conflict checks; rejects with
+`ErrCommitTSFenced`, which also satisfies `ErrWriteConflict`; counted as the
+`commit_ts_fence` conflict kind), requested only by `handleRawRequest` and
+`handleOnePhaseTxnRequest`. Two additions the fence forced: gRPC `RawKV`
+writes are retried with a fresh timestamp when fenced (raw timestamps are
+allocated before batching and the client has no retry), and raw batches are
+proposed in timestamp order. Results: the G0 reproduction and both G10
+reproductions pass (the parked or colliding entry is rejected and the client
+sees a serial outcome), the G1 reproduction still fails as it must, `store`
+and `adapter` are green under `-race`, `kv` fails only the G1 test, lint is
+clean. Mutations and the applied index were already written in one Pebble
+batch, so no new meta key was needed.
+
+Constraints the fix PR must close before merge:
+
+- **Replica determinism.** The fence compares against `LastCommitTS()`, which
+  non-replicated direct writes also advance (the catalog bootstrap
+  `CatalogStore.Save` writes straight to the FSM store at `LastCommitTS() + 1`).
+  A replica that took such a write mid-replay would reject an entry the
+  others accept. The fence must compare against a watermark that only
+  replicated applies advance, or those writes must go through Raft.
+- 2PC commit timestamps are still allocated before PREPARE, so the primary
+  COMMIT is not fenced; moving the allocation after the PREPAREs and fencing
+  the primary COMMIT is the remaining A0 item.
+- `DEL_PREFIX` writes versions at its `commitTS` and is not fenced.
+- The Lua path treats a forwarded write conflict as non-retryable, so a
+  fenced `EVAL` surfaces the conflict to the client instead of retrying;
+  acceptable (serial) but a behaviour change to document, and A0b's
+  leader-side execution makes it moot.
+- A possible pre-existing loss to verify: the engine's cold-start duplicate
+  skip drops the whole entry at the durable index, so a crash between two
+  requests of one raw batch could lose the second.
+- Throughput under reordering is not measured; the benchmark milestone does.
+
 ### A0b. Commit-timestamp identity (G10)
 
 Two fixes, neither weakening an existing check:
