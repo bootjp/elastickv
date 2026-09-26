@@ -136,6 +136,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G5 | `tla/occ/OCC.tla` models SI | The model cannot catch a regression that removes read-set validation. |
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
 | G12 | **Transaction identity is `(primaryKey, StartTS)`, which is not unique.** Locks (`txnLock`), the commit and rollback records (`txnCommitKey`, `txnRollbackKey`), the ownership test in `handlePrepareRequest` (`lock.StartTS == startTS && PrimaryKey equal`), and the A2 read-lock rows all identify a transaction by its primary key and start timestamp. Adapter transactions supply `StartTS = readTS`, the shared read snapshot, so two concurrent 2PC transactions with the same primary key and the same snapshot alias each other: the second PREPARE passes the ownership check as a retry of the first and overwrites its intent; the first COMMIT then publishes the second's value under the first's identity, and the second's COMMIT finds no lock and reports success. A2's read-lock rows collide the same way (one transaction's COMMIT deletes the other's protection). Found in review, **reproduced** deterministically (3 of 3 under `-race`): `TestTwoPhaseCommit_SharedPrimaryAndStartTSAliasTransactions` in `kv/txn_identity_aliasing_repro_test.go` (branch `design/serializable-audit-a2-txnid-repro`, commit `255bd0ba`, on the read-lock fix). Two groups; T1 writes `p` and `s1`, T2 writes `p` and `s2`, both with `StartTS` from `ShardStore.LastCommitTS()` and primary `p`. T2's PREPARE on `p` passes `txnLockOwnedBy` and overwrites T1's intent; the first primary COMMIT publishes whatever intent is there and records its `CommitTS`; the second primary COMMIT fails with `commit_ts mismatch`, its ABORTs fail with `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` then commits the loser's secondary at the winner's recorded `CommitTS` and reports success. Final state `p="t2"`, `s1="t1"`, `s2="t2"`; both clients told committed with the same `CommitTS`; T1's write of `p` is lost. In the read variant T2's COMMIT also deletes T1's read-lock row on `s2` and T1 still commits with its read of `s2` overwritten. | A cross-shard transaction can commit a mix of two transactions' writes (atomicity), and A2's read locks do not protect a transaction that shares identity with another. |
+| G13 | **An acknowledged append is lost across a route-shuffle split (found by A4, not yet analysed).** The DynamoDB multi-table list-append workload under the route-shuffle nemesis (M5: two groups in one process, `--local`) reports `G-single-item`, `G0`, `incompatible-order` on `main`; a later read of key 11 misses an append an earlier read had returned. Candidates, to be separated by a reproduction: the cross-group timestamp paths of G10 (the default-group leader stamps for groups it does not lead, and the stale-reapply fast path skips an equal timestamp), the cross-group snapshot of A0, or a defect in the split / migration path itself (staged visibility, promotion, `alignRaftCommitTS`). | A committed write disappears after a split with both clients told OK; whichever cause, it is a data-loss anomaly on the hotspot-split path that the roadmap lists as shipped. |
 
 ## 4. Milestones
 
@@ -988,15 +989,50 @@ server binary):
   a never-created queue now records `:fail` with
   `AWS.SimpleQueueService.NonExistentQueue`; a 30 s run is `:valid? true`
   with 66 `:ok` sends and 66 received. Not yet run under faults.
-- Found in that pass, not yet fixed: Jepsen 0.3.13 core never reads
-  `:final-generator`, so `redis_zset_safety_workload.clj`'s final
-  `(gen/once {:f :zrange-all})` and `dynamodb_multi_table_workload.clj`'s
-  nemesis final generator never run (check what each checker does without
-  that final read before trusting those two workloads' passes); and in the
-  HT-FIFO `:recv` branch a `DeleteMessage` that errors but actually
-  committed (an ambiguous timeout under faults) drops its tuple, so the
-  message is never redelivered and the checker would report a false
-  `:lost`.
+- Found in that pass and **fixed** on `fix/jepsen-final-generator` (two
+  commits on the branch above, not pushed): Jepsen 0.3.13 never reads
+  `:final-generator` (verified in the jar: only producers such as
+  `nemesis/combined.clj` and `tests/cycle/append.clj` set it, nothing in
+  `core`, `cli`, the interpreter, or the compiled `generator` classes
+  consumes it, and `store` even serialises it to disk, which is where the
+  "can't fressian-serialize some combined final gens" note came from). So
+  no elastickv workload ever ran its nemesis heal (`:stop-partition`,
+  `:resume :all`, `:start :all`): a faulted run could end mid-partition and
+  the HT-FIFO drain could run on a partitioned cluster; the zset-safety
+  final `:zrange-all` never ran, so every mutation acknowledged after the
+  last main-phase read began was unchecked and a lost tail write under
+  faults passed (main-phase reads, about 35% of ops, did exercise the other
+  properties); and the `append/test` final reads were dropped by the same
+  merge. `09344f11` adds `elastickv.cli/with-final-phases` (time-limited
+  main phase, then the nemesis package's final generator on the nemesis
+  worker, a 10 s recovery wait when a client phase follows, then the
+  workload's final client generator) and routes all seven workloads
+  through it (the HT-FIFO drain becomes the final client phase after the
+  heal); `0954de30` makes the zset-safety checker require a successful
+  `:zrange-all` that began after every mutation completed (`:valid?
+  :unknown` with a reason otherwise) and retries the final read for up to
+  30 s. Virtual-time interpreter moved to `generator_simulation.clj`; 22
+  assertions red first; full `lein test` 163 tests, 495 assertions, green.
+  A 30 s zset-safety run passes with the final read last in the history
+  and seeing two mutations the last main-phase read missed. Still off: the
+  `append/test` final reads in the list-append workloads (they need
+  `:wrap-generator max-key-tracker` around the whole generator, which
+  changes Elle's input; enabling them is the recorded follow-up, since
+  without them Elle cannot see the final state). Also found: in the HT-FIFO
+  `:recv` branch a `DeleteMessage` that errors but actually committed (an
+  ambiguous timeout under faults) drops its tuple, so the message is never
+  redelivered and the checker would report a false `:lost` (not yet
+  fixed).
+- **A real anomaly found while verifying that fix (G13 in §3).** The
+  DynamoDB multi-table list-append workload in the M5 topology (one
+  process, two groups, route-shuffle nemesis, `--local`, 30 s) fails with
+  `G-single-item`, `G0`, and `incompatible-order`: a read of key 11 misses
+  an earlier-read append, so an acknowledged append was lost across a
+  route-shuffle split. Reproduced on the pre-fix commit (`main` plus the
+  harness fixes) with the same anomaly types, in a mode where the generator
+  is unchanged (no heal, no final client phase). Stores:
+  `jepsen/store/elastickv-dynamodb-append-multi-table/20260926T235756.006+0900`
+  and `.../20260927T000015.355+0900` in that worktree.
 - The list-append workloads reuse plain integer keys across runs, so a
   second run on the same cluster makes Elle abort (`No transaction wrote
   11 = 2`); CI runs each workload once per cluster and is unaffected.
