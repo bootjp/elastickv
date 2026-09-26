@@ -681,14 +681,30 @@ membership change, score change, logical delete, type change, and stream
 write touches the type's fence or meta); **hashes are not**: `HGETALL` and
 `HLEN` cannot see an update of an existing field (`HSET`, `HMSET`,
 `HINCRBY`) or a wide-column `HDEL` that leaves the hash non-empty, because
-those write only the field key and a per-commit delta key. Decision:
-`HGETALL` and `HMGET` record every field key they return (a script reading
-a hash of more than about 10,000 fields fails closed, as for strings);
-`HLEN` depends only on the field set, so every `HDEL`, emptying or not,
-`Put`s the hash fence (deletes are rare enough to serialise per hash),
-while value-only updates stay fence-free; this is the balance between
-penalising only the scripts that read whole hashes and serialising every
-writer of a hot hash. Still open after this branch: `SETNX`, `SET NX` /
+those write only the field key and a per-commit delta key. Closed by
+`01e1bdb9`: `HGETALL` records every field key it returns (`HMGET` already
+did per field), so value updates of existing fields are seen; every
+`HDEL` that removes a field, emptying or not, on the wide-column and
+legacy-blob paths, `Put`s the hash fence, so `HLEN` (which depends only on
+the field set) and `HGETALL` see removals; value-only writers (`HSET` of an
+existing field, `HMSET`, `HINCRBY`) stay fence-free. Three more
+interleavings red then green (`HGETALL` versus update-only `HSET`,
+`HGETALL` and `HLEN` versus a non-emptying `HDEL`), three read-set pins,
+five `HDEL` fence pins; removing only the fence `Put`s turns the `HLEN`
+case and the fence pins red again. `adapter` green under `-race`; lint
+clean. Read keys on a present hash: `HGETALL` of N fields 2 + N, `HLEN` 2,
+`HGET` 2 + 1 per field, `HMGET` of M fields 2 + M. A script that
+`HGETALL`s one hash and `SET`s one new string key fits up to 9,994 fields
+and fails closed from 9,995 (hashes can hold 100,000 fields, so a large
+`HGETALL` in a writing script now fails where it used to commit without
+validation). Cost on the write side: `HDEL` now conflicts with every other
+writer of the same hash that `Put`s or reads its fence (concurrent
+`HDEL`s, `HSET` adding a field, the dedup `HSET` / `HMSET` of an existing
+field and standalone `HINCRBY`, which read the fence), which retry when an
+`HDEL` commits first. This is the balance between penalising only the
+scripts that read whole hashes and serialising every writer of a hot
+hash. Standalone `HGETALL` outside scripts and hash reads in `MULTI` are
+outside this change. Still open after this branch: `SETNX`, `SET NX` /
 `SET XX`, and the legacy string creates record nothing (a held `SETNX`
 against a `PFADD` / `XADD` that commits first still creates two
 encodings; the reverse order is now caught), reads that hit `WRONGTYPE`
