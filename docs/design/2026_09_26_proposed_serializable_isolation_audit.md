@@ -1022,12 +1022,34 @@ Constraints the fix PR must close before merge:
   half-committed (the same posture as
   `ErrTxnSecondaryRouteShiftedAfterPrimaryCommit`), which is data loss to
   report, not indeterminacy: the adapters must return an error, never OK,
-  and never retry the whole transaction on it. Follow-up on the same
-  branch: for an **expired** secondary lock whose primary has neither lock
-  nor record, the resolver sends an ABORT naming the primary, which writes
-  the rollback record so a late primary COMMIT (and, with the lock-GC
-  branch, a late primary PREPARE) is rejected. The original design of the
-  three changes follows.
+  and never retry the whole transaction on it. Closed by `3e9c61b5` on
+  the same branch: for an **expired** secondary lock whose primary has
+  neither lock nor record, `backgroundPrimaryTxnStatus` runs
+  `unpreparedPrimaryTxnStatus`, which sends an ABORT naming the identity's
+  primary (writing the rollback record on the primary group; if the primary
+  committed in between the ABORT fails `ErrTxnAlreadyCommitted`, the
+  records are re-read, and the secondary is committed; if the primary
+  PREPARE applied in between the same ABORT releases its lock) and then
+  aborts the secondary as rolled back; live secondary locks stay pending. A
+  late primary COMMIT was already rejected by `commitApplyStartTS` once the
+  rollback record exists; a late primary PREPARE is now rejected too
+  (`rejectPrepareAfterRollback`, `ErrTxnAlreadyAborted`, nothing written,
+  checked only by PREPAREs naming the primary key, including the
+  migration-staged copy of the record). Tests on both stores for `TxnID`
+  and legacy identities: one resolver pass leaves the rollback record and
+  removes the secondary lock, a late PREPARE and a late COMMIT fail, T's own
+  dispatch fails, another transaction on the same primary key prepares
+  normally; both new checks red without them. `kv` green under `-race`;
+  lint clean. Cost: one `ExistsAt` on the rollback key per primary PREPARE
+  apply (almost always a miss). Limits: a coordinator whose primary PREPARE
+  arrives more than one lock TTL after its secondary PREPARE (only the
+  old group-id order can produce that) loses its transaction with
+  `ErrTxnAlreadyAborted`; point reads and scans still get `txn locked` on
+  an expired orphan until the next resolver pass. Reconciliation with the
+  lock-GC branch, decided: a PREPARE whose identity has its **rollback**
+  record is rejected (`ErrTxnAlreadyAborted`); one whose identity has its
+  **commit** record is a no-op success (the coordinator's COMMIT is
+  idempotent). The original design of the three changes follows.
   (1) `prewriteTxn` prepares the **primary group first** and sends the
   secondaries (write groups, then the lock-only read groups) only after the
   primary PREPARE has applied, so a secondary lock never exists without the
