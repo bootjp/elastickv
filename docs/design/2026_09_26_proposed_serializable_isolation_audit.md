@@ -466,17 +466,45 @@ Still open for the fix PRs:
   pre-allocated paths above; making delta keys independent of the commit
   timestamp would remove the exemption.
 - One more 8-byte meta key per replicated apply batch, not benchmarked.
-- **The streaming MVCC and in-memory snapshot formats must carry the
-  replicated watermark (found in review).** Today they omit
-  `_meta_last_raft_commit_ts` and the restore falls back to
+- **Every snapshot format carries the replicated watermark (found in
+  review, closed).** The streaming MVCC and in-memory formats omitted
+  `_meta_last_raft_commit_ts` and the restore fell back to
   `LastCommitTS()`, which direct writes such as `CatalogStore.Save` advance
-  on their own; a replica restored from such a snapshot then fences a
+  on their own; a replica restored from such a snapshot then fenced a
   committed entry at or below that direct-write timestamp while replicas
-  holding the true replicated watermark apply it, a divergent FSM. Every
-  Raft snapshot format carries the key, and the fallback survives only for
-  a snapshot produced before the fence existed, which the rolling-upgrade
-  gate keeps from being restored after activation. A merge blocker for
-  A0, with a restore-then-apply test on each format.
+  holding the true replicated watermark applied it, a divergent FSM.
+  Fixed on `design/serializable-audit-a0-snapshot-watermark` (two commits
+  on the A0 completion branch, not pushed): `c973e232` adds the
+  reproductions (`TestSnapshotFormats_CarryReplicatedWatermark` red for
+  the streaming and in-memory formats; a variant with no Raft write before
+  the direct one red for all four formats, since a store with only direct
+  writes snapshotted nothing; and the two-replica kv test
+  `TestFSMSnapshot_RestoredReplicaFencesLikeLogReplica`, "replicas diverge
+  on one committed entry"); `7d6e6a97` fixes it. Pebble native and SST
+  ingest keep their byte format but the key is now guaranteed to exist in
+  every Pebble DB this version opens or restores (`loadLastRaftCommitTS`
+  persists it with `Sync` when missing or above `lastCommitTS`, at open and
+  after every restore swap; an empty-snapshot restore writes 0); the
+  streaming MVCC format gains layout V4 (V3 plus a trailing
+  `lastRaftCommitTS`; the reader still accepts V1 to V3); the backup
+  encoder writes the key as a raw entry and `ReadSnapshotWithHeader` skips
+  it. The fallback is one shared decision (`resolveReplicatedWatermark`):
+  a present value is used exactly (capped at `lastCommitTS`); an absent
+  one falls back to `lastCommitTS` with a warning carrying the stable
+  attribute `replicated_watermark_fallback=<open|restore_pebble_native|
+  restore_sst_ingest|restore_mvcc_stream>`, and the tests assert no such
+  warning on any restore of a snapshot this version wrote, including a
+  second hop from the restored replica. Legacy V1 to V3 and key-less
+  native / SST snapshots restore with exactly one warning; a legacy store
+  warns once at open and is silent thereafter. `store`, `kv`, `internal`,
+  `distribution`, `cmd`, the root package, and `adapter` green under
+  `-race`; lint clean. Limits: pre-fence sources still fall back (the
+  cutover requirement A7 covers); the in-memory store's V4 snapshots are
+  rejected by pre-V4 binaries (production nodes do not use the in-memory
+  store); and, separately and older, `elastickv-snapshot-decode` /
+  `ReadSnapshot` cannot decode any live Pebble `.fsm` today (it fails on
+  `_meta_last_commit_ts`, "encoded value length 8 < 9"), a tooling defect
+  left as found.
 
 ### A1. Coverage table and adapter fixes
 
