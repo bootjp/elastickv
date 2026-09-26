@@ -1496,11 +1496,23 @@ server binary):
   against the A6 binary: 151 main-phase transactions, then three final
   read transactions covering keys 0 to 17 exactly once, five keys whose
   last append was acknowledged after their last main-phase read all seen
-  only by the final read, `:valid? true`. Not yet done: the DynamoDB and
-  multi-table final reads (8-key `TransactGetItems`) were not run against
-  a server; the list-append checker does not yet refuse a run whose final
-  reads timed out (the zset checker does; same follow-up); the Redis
-  list-append keys are plain integers without a per-run namespace. Also found: in the HT-FIFO
+  only by the final read, `:valid? true`. `fix/jepsen-append-final-reads-required` (`a06fc0e9`) then makes the
+  list-append checker refuse a run whose final reads left any key unread:
+  every final-phase transaction carries `:final? true`, and
+  `AppendFinalReadsChecker` (wired once in `cli/append-test`, so all three
+  workloads get it) runs Elle, computes `max-key` from the history, counts a
+  key as read only by an `:ok` transaction whose invocation carries the
+  marker, and merges with `checker/merge-valid` (false beats `:unknown`
+  beats true), returning `:valid? :unknown` with `:reason
+  :missing-final-reads` and the unread keys otherwise; an Elle anomaly still
+  wins. 51 assertions red first; full `lein test` 190 tests, 816
+  assertions, green; a 30 s Redis run passes with `:final-reads {:max-key
+  15, :complete? true}`, and the same run with the final-read timeout
+  overridden to 50 ms returns `:unknown` with keys 8 to 22 unread and exits
+  1 through `fail-on-invalid!`. Not yet done: the DynamoDB and multi-table
+  final reads (8-key `TransactGetItems`) were not run against a server; no
+  CLI option for the final-read timeout; the Redis list-append keys are
+  plain integers without a per-run namespace. Also found: in the HT-FIFO
   `:recv` branch a `DeleteMessage` that errors but actually committed (an
   ambiguous timeout under faults) dropped its tuple, so the message was
   never redelivered and the checker would report a false `:lost`;
