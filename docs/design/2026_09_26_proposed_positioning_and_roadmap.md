@@ -51,7 +51,7 @@ week, no deadline; the plan below is sized for that.
 | Dimension | FoundationDB | TiKV | DynamoDB | Bigtable | elastickv |
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
-| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic across keys and shards (2PC with OCC validation of write and read sets at FSM apply); serializable is the target pending the audit's A0 to A2 (§6.3); per-key linearizable except on the G10 paths until A0b lands |
+| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic across keys and shards (2PC with OCC validation of write and read sets at FSM apply); serializable is the target pending the audit's A0 to A2 and G11 (§6.3); per-key linearizable except on the G10 paths until A0b lands |
 | Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
@@ -78,17 +78,22 @@ README will present scope in two tiers instead of a non-goals section.
   (opt-in, incl. HT-FIFO, DLQ redrive), FUSE filesystem
   (`2026_02_24_implemented_filesystem_on_elastickv.md`).
 - Consistency: per-key linearizable on the paths whose timestamps the
-  leader issues today (every Redis write except `EVAL`, DynamoDB, S3, SQS);
-  `EVAL`, gRPC `RawKV` / `TransactionalKV`, the filesystem, and the
-  asynchronous cleanups are excluded until A0b lands (G10, reproduced);
+  owning group's leader issues today (in a single-group deployment: every
+  Redis write except `EVAL`, DynamoDB, S3, SQS); `EVAL`, gRPC `RawKV` /
+  `TransactionalKV`, the filesystem, the asynchronous cleanups, and, in
+  multi-group deployments, every cross-group operation (2PC, cross-group
+  Redis commands, `FLUSHALL`, cross-group S3 / DynamoDB / SQS / filesystem
+  transactions, whose COMMIT timestamp the coordinating leader stamps for
+  groups it does not lead) are excluded until A0b and its remaining
+  `Internal.Forward` work land (G10, reproduced);
   multi-key transactions atomic, with
   OCC validation of write and read sets at apply. **Serializable is the
   target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
   that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
   have failing tests on `main`. README
-  makes the serializable claim only after the audit's A0 to A2 fixes land
-  (§6.1). Leader reads via ReadIndex or leader lease; no follower reads.
+  makes the serializable claim only after the audit's A0 to A2 and G11 fixes
+  land (§6.1). Leader reads via ReadIndex or leader lease; no follower reads.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
@@ -126,8 +131,12 @@ behind each claim.
    leader; reads are leader reads (ReadIndex) or leader-lease reads. On
    `main` today this holds only where the leader issues the commit
    timestamp: the G10 paths (`EVAL`, gRPC `RawKV` / `TransactionalKV`, the
-   filesystem, asynchronous cleanups) can lose a write with both clients told
-   OK, so the unconditional claim waits for A0b. Evidence:
+   filesystem, asynchronous cleanups, and every cross-group operation in a
+   multi-group deployment) can lose a write with both clients told OK, so
+   the unconditional claim waits for A0b, its `Internal.Forward` follow-up,
+   and the G11 outcome-unknown error (a `NOTLEADER` reported for a proposal
+   that later commits is a definite failure the client can observe as
+   applied). Evidence:
    `jepsen/src/elastickv/dynamodb_types_workload.clj` and `s3_workload.clj`
    (knossos linearizable register).
 2. **Multi-key transactions are atomic.** Single-shard transactions apply in
@@ -142,7 +151,7 @@ behind each claim.
    found, and reproduced with a test, that the check assumes apply order
    equals commit-timestamp order, which is not enforced (G0), and that 2PC read keys are unprotected between
    PREPARE and COMMIT (G1); S3 handlers and Lua string reads do not surface
-   their reads at all (G2, G3). The claim is made once A0 to A2 of §6.3
+   their reads at all (G2, G3). The claim is made once A0 to A2 and G11 of §6.3
    land. Evidence
    today: Elle list-append under `:strict-serializable` for Redis MULTI/EXEC
    and DynamoDB `TransactGetItems` + `TransactWriteItems`. That workload
@@ -167,8 +176,10 @@ implementation, per `CLAUDE.md`.
 `2026_09_26_proposed_positioning_and_roadmap.md` (this) and
 `2026_09_26_proposed_serializable_isolation_audit.md`. README gets a short
 "Who is this for" section and the two-tier scope once both docs land; the
-consistency claims go into README only after the audit's A0 to A2 fixes are
-merged.
+consistency claims go into README only after the audit's A0 to A2 fixes
+and the G11 fix (the server-side outcome-unknown error and its mapping in
+every adapter) are merged; a `NOTLEADER` that a later read contradicts is
+an anomaly independent of the timestamp and read-lock fixes.
 
 ### 6.2 Security milestone
 
@@ -191,7 +202,9 @@ path per adapter for `ReadKeys` coverage (S3 and Lua first, A1), protect 2PC
 read keys with read locks installed at PREPARE, which also replaces the
 out-of-lock read-only-shard check (A2), model allocation and apply
 separately in `tla/occ` and add a no-write-skew property (A3), add
-write-skew Jepsen workloads for gRPC, Redis, DynamoDB, and Lua (A4), and
+write-skew Jepsen workloads for Redis, DynamoDB, and Lua (A4; gRPC has no
+read-set-bearing transaction API, G8, so its evidence stays the engine-level
+Go reproductions until such an API exists), and
 rewrite the consistency sections of README, `architecture_overview.md`, and
 `review_todo.md` (A5). The A0 reproduction test is the first thing to run;
 its result decides what README may say.
@@ -275,7 +288,7 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
   (this section is the pattern); repository artifacts are English.
 - The audit's A2 analysis found gaps G0 and G1 on `main`, and both are
   reproduced by failing tests; the serializable claim is the target and is
-  not made for any path until A0 to A2 land.
+  not made for any path until A0 to A2 and G11 land.
 
 Assumptions made while reconciling with `main` (not put to the interview):
 
