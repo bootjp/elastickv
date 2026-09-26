@@ -881,17 +881,43 @@ server binary):
   sends and `:valid? true`; the checker commit alone `:unknown`
   `[:no-sends :no-receives]`, exit 1; both commits 80 `:ok` sends, 118
   `:ok` receives, 80 received, `:valid? true`. Not yet run under faults.
-- Found while fixing it, not yet fixed: `sqs-invoke!` reads the error code
-  from `:__type`, but this cognitect SQS client (query protocol) puts it
-  under `:cognitect.aws.error/code`, so every SQS error is `:info` with
-  `:cognitect.anomalies/incorrect`, the `:fail` classification and the
-  `QueueAlreadyExists` fallback never trigger, and the missing-queue code is
-  `AWS.SimpleQueueService.NonExistentQueue` (conservative: no false pass);
-  the drain generator is not wrapped in `gen/clients`, so the nemesis worker
-  takes `:recv` ops and logs `:jepsen.nemesis/invalid-completion` about a
-  dozen times per run (noise only); a comment in
-  `dynamodb_multi_table_workload.clj` says `setup!` runs once per test, but
-  it runs once per node.
+- Found while fixing it and **fixed** on `fix/jepsen-sqs-error-codes`
+  (three commits on the branch above, not pushed): `sqs-invoke!` read the
+  error code from `:__type`, but this cognitect SQS client (query protocol)
+  puts it under `:cognitect.aws.error/code`, so every SQS error was `:info`
+  with `:cognitect.anomalies/incorrect`, the `:fail` classification and the
+  `QueueAlreadyExists` fallback never triggered, and the missing-queue code
+  is `AWS.SimpleQueueService.NonExistentQueue` (conservative: no false
+  pass). `53116eb8` reads the query-protocol key first with a `:__type`
+  fallback and records `:fail` only for an allow-listed 4xx code
+  (`MissingParameter`, `InvalidParameterValue`, the two missing-queue codes,
+  the two already-exists codes, `ReceiptHandleIsInvalid`,
+  `InvalidIdFormat`), everything else staying `:info` (5xx, throttling,
+  transport faults, anomalies without a code), the same shape as the
+  DynamoDB workloads; the tests stub `aws/invoke` and build the error map
+  with aws-api's own `parse-http-error-response` from the XML elastickv
+  writes (24 assertions red first). `8c78b611` wraps the drain generator in
+  `gen/clients` (the nemesis worker was taking `:recv` ops and logging
+  `:jepsen.nemesis/invalid-completion`, 50 lines and 25 crashes per run
+  before, 0 after; reproduced with a small virtual-time copy of the
+  interpreter loop since 0.3.13 has no `jepsen.generator.test`).
+  `a3914bfb` corrects the `dynamodb_multi_table_workload.clj` comment:
+  `setup!` runs once per node, concurrently; that is safe because
+  `verify-multi-group-routing!` only reads and the losers of the
+  concurrent `CreateTable` race get the ignored `ResourceInUseException`.
+  Full `lein test`: 156 tests, 428 assertions, green. A live probe against
+  a never-created queue now records `:fail` with
+  `AWS.SimpleQueueService.NonExistentQueue`; a 30 s run is `:valid? true`
+  with 66 `:ok` sends and 66 received. Not yet run under faults.
+- Found in that pass, not yet fixed: Jepsen 0.3.13 core never reads
+  `:final-generator`, so `redis_zset_safety_workload.clj`'s final
+  `(gen/once {:f :zrange-all})` and `dynamodb_multi_table_workload.clj`'s
+  nemesis final generator never run (check what each checker does without
+  that final read before trusting those two workloads' passes); and in the
+  HT-FIFO `:recv` branch a `DeleteMessage` that errors but actually
+  committed (an ambiguous timeout under faults) drops its tuple, so the
+  message is never redelivered and the checker would report a false
+  `:lost`.
 - The list-append workloads reuse plain integer keys across runs, so a
   second run on the same cluster makes Elle abort (`No transaction wrote
   11 = 2`); CI runs each workload once per cluster and is unaffected.
