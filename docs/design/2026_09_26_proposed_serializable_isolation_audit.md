@@ -176,23 +176,55 @@ all groups. With group A's watermark at `c2` and group B's at `c0`, a write
 `c1` (`c0 < c1 < c2`) still in flight on B, and a transaction reading B at
 the global snapshot `s = c2`: the read misses `c1`, B later accepts `c1`
 (above its own watermark), and validation ignores it (`c1 ≤ s`). That is G0
-across groups, and it stays open with a per-group fence. The fix: a
-transaction's `StartTS` is the **minimum** of the replicated watermarks of
-the groups it touches (all data groups when the set is not known up front,
-as for a keys-spanning Lua script), read from each group's store; every
-group then applies only above `StartTS`, so the snapshot is stable
-everywhere, and freshness is enforced by validation (a key that changed
-between `StartTS` and the group's watermark fails the read-set check and
-the transaction retries). Single-group requests keep their group's own
-watermark. The alternative, keeping the global maximum and raising a lagging
-group's fence floor to `s` with a Raft entry before reading it (the backup
-timestamp floor already works this way, `persistBackupTimestampFloor` /
-`verifyBackupTimestampFloor`), costs a round-trip on every lag and is kept
-as the fallback if the minimum proves too stale under skewed traffic. This
-needs a two-group reproduction first: delay B's apply of `c1`, take a
-transaction snapshot at A's watermark, read B, then let `c1` land and
-commit the transaction (expected red: the transaction commits without
-seeing `c1`). An alternative that avoids rejections, serialising
+across groups, and it stays open with a per-group fence. **Reproduced**
+(`TestApplyOrder_GlobalSnapshotMissesLaggingGroupWrite` in
+`kv/apply_order_multigroup_repro_test.go`, branch
+`design/serializable-audit-a0-multigroup-repro`, commit `ae582d7f`, on the
+A0 completion branch; 3 of 3 red under `-race`, two control variants
+green): two groups, `W_B` at `c1` parked before its proposal, `W_A` at `c2`
+applied, T takes `s = ShardStore.LastCommitTS() = c2`, reads `b-k = "old"`,
+`W_B` lands on B (`c1` is above B's watermark), T commits `f("old")` with
+`b-k` in `ReadKeys`, both as a 2PC transaction writing on A and as a
+one-phase write on B; afterwards `b-k` at `s` is `"new"`. Validation passes
+for two reasons: the check is `latest > StartTS` and `c1 ≤ s`, and both
+stores skip `checkConflictsLocked` entirely when the group's
+`lastCommitTS ≤ StartTS` (`store/mvcc_store.go`, `store/lsm_store.go`).
+Every adapter read and transaction start uses that global maximum
+(`adapter/ts.go` `snapshotTS` / `globalSnapshotTS`; `redis_txn.go`
+`txnStartTS`; `dynamodb_locks.go` and `sqs_catalog.go` `nextTxnReadTS`;
+`s3.go` `readTS`; the gRPC reads), `ShardStore` has no `GlobalLastCommitTS`,
+and no adapter uses a per-group value as a snapshot. The unprotected window
+is from T's read to T's PREPARE or one-phase apply on B (a lock-only
+PREPARE at `StartTS` already advances B's replicated watermark to `s`
+through `alignRaftCommitTS`).
+
+The fix keeps one snapshot timestamp per transaction and makes every group
+honour it: **a read at `s` on a group whose replicated watermark is below
+`s` first raises that group's watermark to `s` with a Raft entry** (a
+watermark-advance entry carrying no mutation, applied like a lock-only
+PREPARE's `alignRaftCommitTS`; the backup timestamp floor,
+`persistBackupTimestampFloor` / `verifyBackupTimestampFloor`, is the
+precedent). After it applies, the fence rejects any later apply at
+`≤ s` on that group (a delayed `c1` retries with a fresh timestamp above
+`s`, the fence's normal path), so the read at `s` is stable and the
+"every version at or below the watermark is applied" invariant holds
+per group for `s`. The natural home is `ShardStore`'s read path (`GetAt`,
+`Scan`, the leader read that serves them): when `ts > group.LastRaftCommitTS()`
+the group leader proposes the advance, waits for its local apply, then
+reads; single-group reads (`s` is that group's own watermark) never pay,
+and an idle group pays one entry per distinct `s` it is read at, in the
+same RPC as the read when the leader is remote. The rejected alternative,
+`StartTS` = the minimum of the touched groups' watermarks, is stable
+without extra entries but livelocks against an idle group: its watermark
+never advances, every read on a busy group at that stale `s` fails
+validation, and transactions spanning the two never commit. A second
+alternative, per-group read timestamps (each read key validated against
+the watermark its group had when it was read, carried on the wire),
+avoids the entry but gives up the single-snapshot model the TLA+ spec and
+this document rely on; it is recorded here in case the entry cost matters.
+Needed before merge: the advance entry and its apply, the `ShardStore`
+read path, a regression run of the reproduction (green with `W_B` fenced
+or seen), and a test that a single-group read proposes nothing. An alternative that avoids rejections, serialising
 allocation and proposal under one lock per group, does not cover timestamps
 allocated on other nodes (Internal.Forward) or handed out by the TSO batch
 allocator to concurrent coordinators, so it is at most a complement.
@@ -387,8 +419,10 @@ Still open for the fix PRs:
   pin's read timestamp is now aborted, not committed; `DEL_PREFIX`
   (`FLUSHALL`, S3 and DynamoDB cleanups) can return a write conflict; 2PC
   route floors are checked against `startTS + 1`.
-- `DEL_PREFIX` is fenced but still bypasses transaction locks (A2 blocker
-  above).
+- Cross-group snapshots: the adapters' global-maximum snapshot is not
+  honoured by a lagging group's fence (reproduced above); the
+  watermark-advance read path is the fix, on
+  `design/serializable-audit-a0-multigroup` once it exists.
 - Not yet leader-issued: the 2PC ABORT timestamp (unfenced) and the
   pre-allocated paths above; making delta keys independent of the commit
   timestamp would remove the exemption.
