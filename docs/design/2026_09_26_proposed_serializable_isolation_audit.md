@@ -135,7 +135,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G11 | **An indeterminate outcome is reported as a definite failure.** When a leader loses leadership while a proposal is pending, `refreshStatus` in `internal/raftengine/etcd/engine.go` fails the pending proposal with `errNotLeader`; the Redis adapter maps it to `NOTLEADER` (`writeRedisError`), and the entry may still commit under the new leader. Found by the A4 pause nemesis: Jepsen recorded the writes as `:fail`, then saw their values read, and reported G1a (aborted read) in two Lua runs; reclassifying `NOTLEADER` as indeterminate makes both histories valid. | A client that treats `NOTLEADER` as "not applied" and retries can apply a non-idempotent command twice. Fix: once a proposal has been handed to Raft, leadership loss must surface as an "outcome unknown" error distinct from `NOTLEADER` (and the Jepsen clients must record it as `:info`); the Redis, DynamoDB, S3, SQS, and gRPC error mappings each need the distinction. |
 | G5 | `tla/occ/OCC.tla` models SI | The model cannot catch a regression that removes read-set validation. |
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
-| G12 | **Transaction identity is `(primaryKey, StartTS)`, which is not unique.** Locks (`txnLock`), the commit and rollback records (`txnCommitKey`, `txnRollbackKey`), the ownership test in `handlePrepareRequest` (`lock.StartTS == startTS && PrimaryKey equal`), and the A2 read-lock rows all identify a transaction by its primary key and start timestamp. Adapter transactions supply `StartTS = readTS`, the shared read snapshot, so two concurrent 2PC transactions with the same primary key and the same snapshot alias each other: the second PREPARE passes the ownership check as a retry of the first and overwrites its intent; the first COMMIT then publishes the second's value under the first's identity, and the second's COMMIT finds no lock and reports success. A2's read-lock rows collide the same way (one transaction's COMMIT deletes the other's protection). Found in review; not yet reproduced (a two-group reproduction with two transactions sharing primary key and `StartTS` is the first A2 deliverable). | A cross-shard transaction can commit a mix of two transactions' writes (atomicity), and A2's read locks do not protect a transaction that shares identity with another. |
+| G12 | **Transaction identity is `(primaryKey, StartTS)`, which is not unique.** Locks (`txnLock`), the commit and rollback records (`txnCommitKey`, `txnRollbackKey`), the ownership test in `handlePrepareRequest` (`lock.StartTS == startTS && PrimaryKey equal`), and the A2 read-lock rows all identify a transaction by its primary key and start timestamp. Adapter transactions supply `StartTS = readTS`, the shared read snapshot, so two concurrent 2PC transactions with the same primary key and the same snapshot alias each other: the second PREPARE passes the ownership check as a retry of the first and overwrites its intent; the first COMMIT then publishes the second's value under the first's identity, and the second's COMMIT finds no lock and reports success. A2's read-lock rows collide the same way (one transaction's COMMIT deletes the other's protection). Found in review, **reproduced** deterministically (3 of 3 under `-race`): `TestTwoPhaseCommit_SharedPrimaryAndStartTSAliasTransactions` in `kv/txn_identity_aliasing_repro_test.go` (branch `design/serializable-audit-a2-txnid-repro`, commit `255bd0ba`, on the read-lock fix). Two groups; T1 writes `p` and `s1`, T2 writes `p` and `s2`, both with `StartTS` from `ShardStore.LastCommitTS()` and primary `p`. T2's PREPARE on `p` passes `txnLockOwnedBy` and overwrites T1's intent; the first primary COMMIT publishes whatever intent is there and records its `CommitTS`; the second primary COMMIT fails with `commit_ts mismatch`, its ABORTs fail with `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` then commits the loser's secondary at the winner's recorded `CommitTS` and reports success. Final state `p="t2"`, `s1="t1"`, `s2="t2"`; both clients told committed with the same `CommitTS`; T1's write of `p` is lost. In the read variant T2's COMMIT also deletes T1's read-lock row on `s2` and T1 still commits with its read of `s2` overwritten. | A cross-shard transaction can commit a mix of two transactions' writes (atomicity), and A2's read locks do not protect a transaction that shares identity with another. |
 
 ## 4. Milestones
 
@@ -608,11 +608,18 @@ Constraints the fix PR must close before merge:
   `MCOCC_gap_readlock_intent.cfg` fails `OCC8` on this interleaving without
   the rejection (A3). Still open from it: the orphaned-write-lock wait is
   bounded only by the resolver's TTL sweep.
-- **Transaction identity (G12, found in review).** The implemented A2
-  keys and owns read locks by `(primaryKey, StartTS)`; add the `TxnID`
-  described in the design, with a two-group reproduction (two transactions
-  sharing primary key and `StartTS`, expected red first: a mixed commit
-  today) and tests that a same-identity retry still matches its own locks.
+- **Transaction identity (G12, found in review, reproduced).** The
+  implemented A2 keys and owns read locks by `(primaryKey, StartTS)`; add
+  the `TxnID` described in the design. The reproduction
+  (`design/serializable-audit-a2-txnid-repro`, red) shows the full chain:
+  `txnLockOwnedBy` accepts the second PREPARE as a retry, the second
+  primary COMMIT fails `commit_ts mismatch`, its ABORT fails
+  `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` commits the loser's
+  secondary under the winner's `CommitTS`. The fix must make every one of
+  those steps identity-aware (`TxnID` in the lock payload, the commit /
+  rollback record keys, `commitApplyStartTS`, `appendRollbackRecord`, and
+  `completeCommittedTxn`), keep a same-`TxnID` retry idempotent, and turn
+  the reproduction green with T1 or T2 aborted on a lock conflict.
 - **`DEL_PREFIX` ignores locks (found in review).** The implemented A2
   leaves raw `DEL_PREFIX` outside lock validation; add range-aware conflict
   handling against write and read locks under the prefix, with a test that
