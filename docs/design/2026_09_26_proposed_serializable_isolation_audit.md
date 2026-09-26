@@ -209,23 +209,46 @@ precedent). After it applies, the fence rejects any later apply at
 `≤ s` on that group (a delayed `c1` retries with a fresh timestamp above
 `s`, the fence's normal path), so the read at `s` is stable and the
 "every version at or below the watermark is applied" invariant holds
-per group for `s`. The natural home is `ShardStore`'s read path (`GetAt`,
-`Scan`, the leader read that serves them): when `ts > group.LastRaftCommitTS()`
-the group leader proposes the advance, waits for its local apply, then
-reads. Only a **cluster-issued** snapshot may advance a watermark: the
-advance is bounded by the leader's HLC (a timestamp above what the local
-clock could have issued is refused, never persisted), and a timestamp the
-client supplied directly, as gRPC `RawGet` / `RawScanAt` / `Get` / `Scan`
-accept in their `Ts` field, never advances anything: a client timestamp
-above the group's watermark is **rejected** (`FailedPrecondition`, "read
-timestamp above the group's applied watermark"; a client that wants the
-latest state passes `Ts = 0`), not silently served at a lower snapshot,
+per group for `s`. Three rules bound it (each a review finding). **Provenance.** `GetAt` and
+`ScanAt` take a bare timestamp and cannot tell a coordinator snapshot from
+a gRPC client's `Ts`, so the advance does not live in them: it lives in a
+separate snapshot-read API on `ShardStore` whose snapshot argument is a
+type only the coordinator can construct (unexported constructor), so a
+client-supplied timestamp can never reach it. A forwarded snapshot read to
+another node's group leader carries the marker on the node-to-node
+`Internal` RPC only, never on the public `RawKV` / `TransactionalKV`
+request types, whose handlers cannot set it (the public gRPC listener
+having no authentication is §6.2's problem, not this one's). Only such a
+**cluster-issued** snapshot may advance a watermark, and the advance is
+bounded by the leader's HLC (a timestamp above what the local clock could
+have issued is refused, never persisted). A client timestamp above the
+group's watermark on the gRPC reads is **rejected** (`FailedPrecondition`,
+"read timestamp above the group's applied watermark"; a client that wants
+the latest state passes `Ts = 0`), not silently served at a lower snapshot,
 because the responses carry no effective read timestamp and a later write
-at or below the requested `ts` could change the answer; and otherwise one
-request with a far-future timestamp would fence every write on the group
-until wall time caught up. The coordinator's own snapshot reads (the adapters' `snapshotTS`
-/ `globalSnapshotTS`, `txnStartTS`, `nextTxnReadTS`, `readTS`) are the
-trusted callers; single-group reads (`s` is that group's own watermark) never pay,
+at or below the requested `ts` could change the answer; without the
+rejection one request with a far-future timestamp would fence every write
+on the group until wall time caught up. **The empty-store sentinel.**
+`snapshotTS` returns `^uint64(0)` ("latest") when `LastCommitTS()` is 0;
+that value is a non-advancing read sentinel, normalised before the
+advance, so the first read against a fresh store returns empty instead of
+failing the HLC bound. **Authoritative snapshots.** The snapshot itself
+must come from the touched groups' **leaders**, not from the coordinating
+node's local replicas: a local replica of group B can lag behind B's
+leader, which has already applied and acknowledged `c1`, and a proxied
+leader read at a stale `s < c1` passes its ReadIndex barrier and still
+returns the pre-`c1` value, a stale read that began after the write
+completed. So a transaction's `s` is the maximum of the leader watermarks
+of the groups it touches, each obtained after that group's read barrier
+(the lease read already returns the leader's `lastCommitTS`;
+`GroupCommittedTimestampFloor` / `RawLatestCommitTS` are the authoritative
+per-group values the TSO floor uses), and only then are the lagging groups
+advanced to `s`. A lagging-replica regression test (coordinator on a
+follower of B, B's leader ahead) is required. The coordinator's own
+snapshot reads (the adapters' `snapshotTS` / `globalSnapshotTS`,
+`txnStartTS`, `nextTxnReadTS`, `readTS`) are the trusted callers; the
+group leader proposes the advance when `s > group.LastRaftCommitTS()`,
+waits for its local apply, then reads; single-group reads (`s` is that group's own watermark) never pay,
 and an idle group pays one entry per distinct `s` it is read at, in the
 same RPC as the read when the leader is remote. The rejected alternative,
 `StartTS` = the minimum of the touched groups' watermarks, is stable
@@ -544,16 +567,41 @@ table cases. Undoing each part of the fix turns its reproduction red
 again; `adapter`, `kv`, `store` green under `-race`; lint clean; one
 pre-existing gosec `//nolint` removed. Cost: `uploadPart` 4 → 5 point reads
 and +2 read keys; a completion with N parts N+5 → N+3 reads on the first
-attempt and N+3 per retry (was 3), +N read keys on the entry. Two decisions
-taken after review of the result: the bucket-meta read key made
-`uploadPart` conflict with every concurrent writer in the bucket
+attempt and N+3 per retry (was 3), +N read keys on the entry. Three follow-ups
+landed after review of the result. `de3eeb95`: the bucket-meta read key
+made `uploadPart` conflict with every concurrent writer in the bucket
 (`putObject`, `createMultipartUpload`, completion, ACL changes) for the
-whole body upload, which is unacceptable for multipart, so the fence moves
-to `BucketGenerationKey`, written by `deleteBucket` / `AdminDeleteBucket`
-(narrowing the conflict to bucket delete and recreate); and an OCC write
-conflict surfaced by `uploadPart` is reported as HTTP 503 `SlowDown`
-(retried with backoff by SDKs) instead of 500 `InternalError`. Both are in
-progress on the branch. Known limits: in a multi-group deployment where the
+whole body upload, unacceptable for multipart, so the fence is now
+`BucketGenerationKey`: `deleteBucket` and `AdminDeleteBucket` share one
+write set (`bucketDeleteTxnElems`) that deletes the bucket meta, still the
+emptiness fence, and re-puts the generation key at
+`max(stored, deleted generation)` (never deleted, never lowered; a legacy
+bucket without one gets it at the deleted generation so its recreate no
+longer restarts at 1), and `uploadPart`'s `ReadKeys` are the upload meta,
+the generation key, and the part key. The bucket meta is still re-read at
+the commit snapshot but no longer listed: a delete does not change the
+generation key's value, so a delete committed between the prepare read and
+`StartTS` leaves no version newer than `StartTS`, and only the re-read
+catches it (404 `NoSuchBucket`, or `NoSuchUpload` after a recreate);
+deletes and recreates after `StartTS` conflict on the key (503). A
+regression test holds a part upload while a `putObject` and another
+`createMultipartUpload` commit in the bucket (red before, 200 now), and
+the delete race covers both orders with mutation checks. `659cc2df`: an
+OCC conflict that survives the internal retries is reported as HTTP 503
+`SlowDown` by `uploadPart` (was 500) and `completeMultipartUpload` (was
+409 `OperationAborted`), the classes `retryS3Mutation` already treats as
+transient; other handlers keep 409. `7f84c4cf`: `kv.maxReadKeys` becomes
+10,000 + 240 headroom (a 10,000-part completion's read set is exactly the
+part keys, the upload meta being in its write set, so it fitted the old
+cap at the boundary; the headroom is defensive), documented with the
+migration-alias halving, and a real 10,000-part completion commits through
+Raft in a test. `adapter` and `kv` green under `-race` after each commit;
+lint clean. Point reads per request against `main`: `uploadPart` 4 → 5;
+completion with N parts N+5 → N+3 on the first attempt and 3 → N+3 per
+retry; bucket delete +1. A maximum-size completion's Raft entry grows by
+about N × 70 B plus the object key (up to about 11 MiB at 10,000 parts),
+within the gRPC limit but on etcd/raft's oversized-entry path. Known
+limits: in a multi-group deployment where the
 bucket generation lives on another group, `uploadPart` becomes a 2PC
 transaction and its generation check is subject to G1 until A2 lands; a
 completion of more than about 4,998 parts during a staged-visibility
