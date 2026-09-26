@@ -34,6 +34,12 @@ const (
 	defaultRPCDeadline     = 30 * time.Second
 )
 
+const (
+	archiveFormatDirectory = "directory"
+	archiveFormatTar       = "tar"
+	archiveFormatTarZstd   = "tar+zstd"
+)
+
 var version = "dev"
 
 func main() {
@@ -155,7 +161,7 @@ func bindDumpFlags(fs *flag.FlagSet, values *dumpFlagValues) {
 	cfg := &values.cfg
 	fs.StringVar(&cfg.address, "address", "", "Admin gRPC address")
 	fs.StringVar(&cfg.outputRoot, "output-dir", "", "New destination directory")
-	fs.StringVar(&cfg.format, "output-format", "directory", "directory, tar, or tar+zstd")
+	fs.StringVar(&cfg.format, "output-format", archiveFormatDirectory, "directory, tar, or tar+zstd")
 	fs.StringVar(&cfg.tokenFile, "admin-token-file", "", "Bearer-token file")
 	fs.StringVar(&cfg.clusterID, "cluster-id", "", "Cluster identifier for MANIFEST.json")
 	fs.StringVar(&values.adapterCSV, "adapter", "dynamodb,s3,redis,sqs", "Comma-separated adapter set")
@@ -376,7 +382,7 @@ func parseByteSize(raw string) (int64, error) {
 
 func validateOutputFormat(format string) error {
 	switch format {
-	case "directory", "tar", "tar+zstd":
+	case archiveFormatDirectory, archiveFormatTar, archiveFormatTarZstd:
 		return nil
 	default:
 		return errors.Errorf("unsupported --output-format %q", format)
@@ -385,11 +391,11 @@ func validateOutputFormat(format string) error {
 
 func writeArchive(cfg *config, stdout io.Writer) error {
 	switch cfg.format {
-	case "directory":
+	case archiveFormatDirectory:
 		return nil
-	case "tar":
+	case archiveFormatTar:
 		return errors.Wrap(backup.PackDumpTree(cfg.outputRoot, stdout, backup.ArchiveCompressionNone), "write tar backup")
-	case "tar+zstd":
+	case archiveFormatTarZstd:
 		return errors.Wrap(backup.PackDumpTree(cfg.outputRoot, stdout, backup.ArchiveCompressionZstd), "write zstd tar backup")
 	default:
 		return errors.Errorf("unsupported output format %q", cfg.format)
