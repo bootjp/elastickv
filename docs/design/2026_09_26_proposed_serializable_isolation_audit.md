@@ -1276,9 +1276,14 @@ server binary):
   changes Elle's input; enabling them is the recorded follow-up, since
   without them Elle cannot see the final state). Also found: in the HT-FIFO
   `:recv` branch a `DeleteMessage` that errors but actually committed (an
-  ambiguous timeout under faults) drops its tuple, so the message is never
-  redelivered and the checker would report a false `:lost` (not yet
-  fixed).
+  ambiguous timeout under faults) dropped its tuple, so the message was
+  never redelivered and the checker would report a false `:lost`;
+  **fixed** in `c6057c44` (under A6): a delete whose failure is classified
+  `:info` (outcome unknown, a transport fault, a 5xx) puts the tuple in the
+  receive op's `:in-doubt` list, which the checker counts as delivered for
+  the no-loss check and ignores for duplicates and ordering
+  (`:in-doubt-receives` is reported); a definitely rejected delete still
+  drops it.
 - **A real anomaly found while verifying that fix (G13 in §3).** The
   DynamoDB multi-table list-append workload in the M5 topology (one
   process, two groups, route-shuffle nemesis, `--local`, 30 s) fails with
@@ -1424,8 +1429,25 @@ list was written. What landed, and where it refines the design below:
   leadership loss no longer fails fast, a write stuck on an isolated old
   leader waits for resolution or its context (`Dispatch` 5 s, Redis 30 s,
   raw batch 30 s).
-- Still open: the Jepsen clients recording `OUTCOMEUNKNOWN` /
-  `RequestOutcomeUnknown` / `Aborted` as `:info` (A4 branch); the forward
+- The Jepsen clients record the class as `:info` with `:error
+  :outcome-unknown` and the server text under `:message`, on
+  `fix/jepsen-outcome-unknown-info` (`c6057c44`, on the harness-fix
+  branches, not pushed): a shared `client_errors.clj` (the code constant,
+  the Carmine `:prefix :outcomeunknown` check, the AWS error-code reader
+  moved from the SQS fix, an S3 XML `<Code>` parser); the Redis append
+  client catches it around `invoke!` (the submodule's `with-exceptions`
+  did not know the code and the exception used to escape), for single ops,
+  a top-level `EXEC` reply, and an element inside the `EXEC` array; the
+  zset-safety client covers all five ops and a `ZINCRBY` error reply
+  handed back as a value; the three DynamoDB clients check it first;
+  S3 reads the XML body clj-http leaves in the exception; SQS checks it
+  first in a new `error->op`. `NOTLEADER` and the allow-listed 4xx codes
+  stay `:fail`. Tests use loopback Redis and HTTP servers speaking the real
+  bytes (48 failures and 3 errors red first across seven namespaces; full
+  `lein test` 180 tests, 643 assertions, green); a 30 s Redis run against
+  the A6 binary passes without faults (no live `OUTCOMEUNKNOWN` observed:
+  the local nemesis lives on the A4 branch). Not handled because no client
+  uses them: the SQS batch form and gRPC `Aborted`. Still open: the forward
   breaker's retry on `Unavailable` / `DeadlineExceeded` after an RPC was
   sent is a separate double-apply risk (G15); the startup encryption
   rotation now fails on an unknown outcome instead of retrying; the Redis
