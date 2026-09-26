@@ -137,6 +137,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G6 | Docs: README's consistency bullet, `docs/architecture_overview.md` (no transaction section), `docs/review_todo.md` 4.4 ("or Del" is stale: the missing-item branch writes nothing) | Readers cannot tell what is guaranteed. |
 | G12 | **Transaction identity is `(primaryKey, StartTS)`, which is not unique.** Locks (`txnLock`), the commit and rollback records (`txnCommitKey`, `txnRollbackKey`), the ownership test in `handlePrepareRequest` (`lock.StartTS == startTS && PrimaryKey equal`), and the A2 read-lock rows all identify a transaction by its primary key and start timestamp. Adapter transactions supply `StartTS = readTS`, the shared read snapshot, so two concurrent 2PC transactions with the same primary key and the same snapshot alias each other: the second PREPARE passes the ownership check as a retry of the first and overwrites its intent; the first COMMIT then publishes the second's value under the first's identity, and the second's COMMIT finds no lock and reports success. A2's read-lock rows collide the same way (one transaction's COMMIT deletes the other's protection). Found in review, **reproduced** deterministically (3 of 3 under `-race`): `TestTwoPhaseCommit_SharedPrimaryAndStartTSAliasTransactions` in `kv/txn_identity_aliasing_repro_test.go` (branch `design/serializable-audit-a2-txnid-repro`, commit `255bd0ba`, on the read-lock fix). Two groups; T1 writes `p` and `s1`, T2 writes `p` and `s2`, both with `StartTS` from `ShardStore.LastCommitTS()` and primary `p`. T2's PREPARE on `p` passes `txnLockOwnedBy` and overwrites T1's intent; the first primary COMMIT publishes whatever intent is there and records its `CommitTS`; the second primary COMMIT fails with `commit_ts mismatch`, its ABORTs fail with `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` then commits the loser's secondary at the winner's recorded `CommitTS` and reports success. Final state `p="t2"`, `s1="t1"`, `s2="t2"`; both clients told committed with the same `CommitTS`; T1's write of `p` is lost. In the read variant T2's COMMIT also deletes T1's read-lock row on `s2` and T1 still commits with its read of `s2` overwritten. | A cross-shard transaction can commit a mix of two transactions' writes (atomicity), and A2's read locks do not protect a transaction that shares identity with another. |
 | G13 | **A 2PC PREPARE whose `StartTS` equals the previous commit's timestamp is skipped as a replay, and the transaction's writes are silently lost (found by A4, diagnosed).** No faults, one node, one HLC, no split: the DynamoDB multi-table list-append workload (two groups) loses 11 to 21 acknowledged appends per 30-second run with the route-shuffle nemesis on or off. Mechanism: T1's COMMIT deletes each key's lock and intent rows, leaving tombstones at exactly `c1`; T2 starts at `nextTxnReadTS` = `ShardStore.LastCommitTS()` = `c1` when nothing committed since; T2's PREPARE writes its lock and intent at version `StartTS` (`handlePrepareRequest`, `commitTS = startTS`), `staleRaftApplyFastPathLocked` → `raftApplyAlreadyLandedLocked` finds a version (the tombstone) at `c1` on every key and declares the live PREPARE a replay before `checkApplyConflicts`, so no lock is written and validation is skipped; T2's COMMIT finds no lock, treats the key as already resolved, applies nothing, and the client gets OK. A collision on the secondary group alone tears the transaction (primary lands, secondary lost); a collision on both groups loses everything. **Reproduced** deterministically (`TestTwoPhaseCommit_PrepareAtPreviousCommitTSIsSkippedAsReplay` in `kv/prepare_replay_fastpath_repro_test.go`, branch `design/serializable-audit-g13-repro`, commit `10846a6c`, on `main` plus the harness fixes; 3 of 3 red under `-race`, control green; an instrumented binary logged 26 skipped live PREPAREs in one run, every lost transaction matching a skip at its `StartTS`). Excluded: the split and migration path (two runs without route shuffle lose appends too, group-1 keys whose route never moved lose them, the reproduction has no split); the A0 cross-group snapshot (the write is never applied, nothing is in flight); cross-node stamping (one HLC). It is the G10 stale-reapply sink reached by a single node, and **the A0 completion branch's Raft-index replay detection makes the reproduction pass**. Likely variants, not yet tested: an ABORT's tombstones at `abortTS`, and `tryAbortExpiredPrimary`'s `startTS + 1`; the Redis, SQS, and S3 2PC paths start at the watermark too. | The default 2PC path loses committed writes on a healthy single node with both clients told OK; the fix is A0's index-based replay detection, and the regression test travels with the A0 PR. |
+| G14 | **PREPARE order lets a reader roll back a secondary before the primary lock exists (found while implementing A2, not yet reproduced).** `prewriteTxn` prepares groups in group-id order, not primary group first. A reader that meets a secondary's lock before the primary PREPARE has applied asks `primaryTxnStatus`, finds no primary lock and no record, concludes rolled back, and aborts that secondary without writing a rollback record; the primary then prepares and commits, and the secondary COMMIT finds no lock, treats the key as already resolved, and skips it. | A cross-shard transaction commits with one of its writes silently missing while the client is told OK; pre-existing on `main`, independent of the identity fix. Fix: prepare the primary group first and only then the secondaries, and make a status probe that finds neither lock nor record while the primary's PREPARE could still be in flight return "unknown" rather than "rolled back" (or write the rollback record so the primary's later PREPARE fails). |
 
 ## 4. Milestones
 
@@ -851,6 +852,65 @@ which Redis re-parses but the DynamoDB cleanup and the S3 safety net do not
 `TxnLocked` or fenced conflict that the A0b `Forward` work should carry
 across the wire.
 
+The transaction identity (G12) is implemented on
+`design/serializable-audit-a2-txnid` (the G12 reproduction cherry-picked
+onto the `DEL_PREFIX` branch, then three commits, not pushed). `047daa2d`
+adds `bytes txn_id = 8` to `Request` (`buf breaking` clean against the
+base; present on every 2PC PREPARE / COMMIT / ABORT and on the resolver's
+COMMIT / ABORT, which reuse the lock's own id; `abortRequestFor` copies it;
+the FSM accepts an empty id or exactly 16 bytes). `b36972e6` makes locks,
+read-lock rows, and records identity-aware: `txnLock` version 2 appends
+the id (a lock without one is still written as version 1, byte-identical
+to before); read-lock rows with an id are keyed `uvarint(len(key)) key
+txnID` and the holder is read from the row value, so a release deletes a
+row only if the value names the releasing transaction (both attempts of
+one `Dispatch` share the row, and a late ABORT of the first attempt must
+not free the second's lock); commit and rollback records with an id live
+in two new namespaces, `!txn|cmtid|` and `!txn|rbid|` (`primaryKey
+startTS txnID`), because a legacy record key is `primaryKey || startTS`
+with an unbounded primary key and no layout inside `!txn|cmt|` can be told
+apart from a legacy key with a longer primary, and `txnRouteKey` must
+recover the primary from both shapes for routing, migration filtering, and
+backup ownership; the two prefixes are wired into `isTxnInternalKey`, two
+migration families appended to the enum, the known-internal prefix list,
+and the write-conflict metric buckets, and user keys under them become
+reserved. Ownership requires id, primary key, and `StartTS` all to match
+(the composed-1 retry reuses the id under a fresh `StartTS`, so a leftover
+lock from the earlier attempt must stay foreign); a legacy request owns a
+legacy lock under the old pair test, permanently; legacy against id, or
+the reverse, is foreign; `WithTransactionIDs` (default on, an atomic read
+once per `Dispatch`) gates only whether the coordinator assigns ids, and
+plugs into the capability-monitor pattern of `main.go`
+(`startStorageEnvelopeV2CapabilityMonitor`, the encryption fan-out) with
+the migration families covered by the same gate. `9822ec6d` makes the
+first primary COMMIT require its own lock on the primary key (otherwise
+`TxnLockedError` "primary lock lost", nothing written;
+`settleFailedPrimaryCommit` then writes the transaction's own rollback
+record and aborts the other groups), for legacy transactions too;
+`completeCommittedTxn` runs only for the transaction's own record. The
+reproduction is green 3 of 3 (T2's PREPARE on the primary fails
+`TxnLocked`, its cleanup ABORT leaves T1's lock alone, T1 commits, final
+`p="t1"`, no rows left) and renamed
+`TestTwoPhaseCommit_SharedPrimaryAndStartTSStayDistinctTransactions`;
+`kv/txn_identity_test.go` covers the ownership matrix (as a function and
+through PREPARE), both codec versions and malformed input, key shapes and
+routing, idempotent re-PREPARE, a foreign record never taken as one's own,
+the primary-lock rule for id and legacy transactions, the late-ABORT
+release check, one id per `Dispatch` including the composed-1 retry, none
+with the option off or for one-phase, `settleFailedPrimaryCommit` aborting
+the secondaries on a foreign record, a legacy transaction in flight at
+activation completing while a new one with the same pair conflicts, and
+the resolver settling both shapes from their own records. `store`, `kv`,
+`adapter`, `proto`, `distribution` green under `-race` (one earlier run
+hit only the known A0b flake); lint clean. Cost: one 16-byte
+`crypto/rand` read per multi-shard `Dispatch`, +24 bytes per lock payload,
+no extra Raft round-trips; `BenchmarkAssertNoConflictingTxnLocks` 2.2 /
+29.7 / 328 µs at 0 / 100 / 1000 released locks, in line with the tombstone
+numbers above. `dedupProbeOnePhase` is unchanged. Rollback records now
+also cover the cleanup ABORT after a failed PREPARE (records were never
+collected before either). Found while implementing, recorded as G14:
+`prewriteTxn` prepares groups in group-id order rather than primary first.
+
 Constraints the fix PR must close before merge:
 
 - **Read-lock installation versus foreign write locks (found in review):
@@ -860,18 +920,10 @@ Constraints the fix PR must close before merge:
   `MCOCC_gap_readlock_intent.cfg` fails `OCC8` on this interleaving without
   the rejection (A3). Still open from it: the orphaned-write-lock wait is
   bounded only by the resolver's TTL sweep.
-- **Transaction identity (G12, found in review, reproduced).** The
-  implemented A2 keys and owns read locks by `(primaryKey, StartTS)`; add
-  the `TxnID` described in the design. The reproduction
-  (`design/serializable-audit-a2-txnid-repro`, red) shows the full chain:
-  `txnLockOwnedBy` accepts the second PREPARE as a retry, the second
-  primary COMMIT fails `commit_ts mismatch`, its ABORT fails
-  `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` commits the loser's
-  secondary under the winner's `CommitTS`. The fix must make every one of
-  those steps identity-aware (`TxnID` in the lock payload, the commit /
-  rollback record keys, `commitApplyStartTS`, `appendRollbackRecord`, and
-  `completeCommittedTxn`), keep a same-`TxnID` retry idempotent, and turn
-  the reproduction green with T1 or T2 aborted on a lock conflict.
+- **Transaction identity (G12, found in review, reproduced): closed** on
+  `design/serializable-audit-a2-txnid` (status above). Still open from it:
+  the rolling-upgrade gate wiring in `main.go` (shared with the fence), and
+  G14 below.
 - **`DEL_PREFIX` ignores locks (found in review): closed** on
   `design/serializable-audit-a2-delprefix-locks` (status above).
 - **Tombstone accumulation.** Rows are per `(key, transaction)` and MVCC
