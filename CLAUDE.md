@@ -65,8 +65,8 @@ The full diagrams live in `docs/architecture_overview.md` — read it before non
 - **Replication (`internal/raftengine/`, `kv/fsm.go`)** — Only backend is `etcd/raft` under `internal/raftengine/etcd` (the hashicorp backend was dropped in `a35245a`; the `--raftEngine` flag only accepts `etcd` and `newRaftFactory`/`parseRaftEngineType` reject anything else). Each Raft data dir contains a `raft-engine` marker so the process refuses to reopen a dir under a different backend, and refuses to start on a dir holding legacy hashicorp artifacts (`ErrLegacyHashicorpDataDir`). The one-time hashicorp→etcd migrator (`cmd/etcd-raft-migrate`) was also removed in `a35245a`; it can be retrieved from git history at the commit before `a35245a` if a never-migrated store resurfaces (see `docs/etcd_raft_migration_operations.md`). The KV FSM (`kv/fsm.go`) applies committed entries to the storage layer and to the HLC ceiling.
 - **Storage (`store/`)** — MVCC over Pebble (`mvcc_store.go`, `lsm_store.go`); OCC, TTL/expiry, snapshots (`snapshot_pebble.go`), and per-type helpers for Redis collections (`hash_helpers.go`, `list_helpers.go`, `set_helpers.go`, `zset_helpers.go`, `stream_helpers.go`).
 - **Control plane (`distribution/`)** — Durable route catalog persisted in reserved keys of the **default Raft group**. `engine.go` is the read-side cache; `watcher.go` polls the catalog and applies versioned snapshots into the engine; `catalog.go` is the storage layer. Operator RPCs (`ListRoutes`, `SplitRange` — same-group split only) are on `proto.Distribution`. **All routing decisions read from the cached `RouteEngine`, not from the catalog directly.**
-- **Timestamp Oracle (`kv/hlc.go`, `kv/hlc_wall.go`)** — All HLC timestamps are **issued exclusively by the Raft leader** via `ShardedCoordinator` / `Coordinator` — followers never call `HLC.Next()` for persistence. The 64-bit value splits into an upper 48-bit **physical** half (Unix ms) and a lower 16-bit **logical** counter, and the two halves take very different paths:
-  - **Physical (upper 48 bits) — Raft-agreed.** The leader periodically (`hlcRenewalInterval = 1s`, window `hlcPhysicalWindowMs = 3s`) proposes a ceiling entry through the default Raft group; FSM apply on every node calls `SetPhysicalCeiling`. `Next()` clamps the physical half to `max(wall_ms, ceiling_ms)`, so a newly elected leader can never issue a timestamp inside the previous leader's lease window.
+- **Timestamp Oracle (`kv/hlc.go`, `kv/hlc_wall.go`)** — The intended invariant: all HLC timestamps are **issued exclusively by the Raft leader** via `ShardedCoordinator` / `Coordinator`, and followers never call `HLC.Next()` for persistence. On `main` today only the non-sharded `Coordinator` (used by the demo) enforces it; `ShardedCoordinator.Dispatch` stamps on the dispatching node in legacy TSO mode and `Internal.Forward` keeps the stamp (audit gap G10 in `docs/design/2026_09_26_proposed_serializable_isolation_audit.md`, fix A0b). Treat the invariant as the rule for new code. The 64-bit value splits into an upper 48-bit **physical** half (Unix ms) and a lower 16-bit **logical** counter, and the two halves take very different paths:
+  - **Physical (upper 48 bits) — Raft-agreed.** The leader periodically (`hlcRenewalInterval = 1s`, window `hlcPhysicalWindowMs = 3s`) proposes a ceiling entry on every writable Raft group this node leads (`ShardedCoordinator.renewHLCLeases`; in Phase D only the configured timestamp group, `shouldRenewHLCGroup`; the non-sharded `Coordinate` has one group); FSM apply on every node calls `SetPhysicalCeiling`. `Next()` clamps the physical half to `max(wall_ms, ceiling_ms)`, so a newly elected leader can never issue a timestamp inside the previous leader's lease window.
   - **Logical (lower 16 bits) — in-memory only.** Advanced by atomic CAS on each `Next()` call; **no Raft round-trip and no consensus per timestamp**. This is what keeps issuance in the nanosecond range.
   - The coordinator and FSM **must share the same `*HLC`** instance (wired via `WithHLC` / `NewKvFSMWithHLC`) so the in-memory counter and the replicated ceiling stay coupled.
 - **Process entrypoints** — `main.go` is the multi-binary server (gRPC + Redis + DynamoDB + S3 + SQS + admin + metrics + pprof). Per-protocol bootstrapping is split into `main_s3.go` and `main_sqs.go`; SigV4 static credentials load via `main_sigv4_creds.go`. SQS exposure is opt-in via `--sqsAddress` (with `--sqsRegion` and `--sqsCredentialsFile`); leave `--sqsAddress` empty to disable. `cmd/server/demo.go` is a single-process 3-node demo. `cmd/client/`, `cmd/redis-proxy/`, `cmd/elastickv-admin/`, and `cmd/raftadmin/` are standalone tools. `multiraft_runtime.go` and `shard_config.go` wire shard groups to addresses for multi-group deployments (`--raftRedisMap`, `--raftDynamoMap`, `--raftS3Map`, `--raftSqsMap`).
@@ -104,3 +104,29 @@ After every code change, run **five independent review passes** — one lens at 
 Check this directory before designing anything new — there is likely a recent precedent (HLC lease, FSM compaction, S3 adapter, lease reads, Lua commit batching, TTL inline value, centralized TSO proposal, hotspot shard split, etc.). `docs/design/README.md` indexes them.
 
 **Design-doc-first workflow.** For any change that goes beyond a single-file edit — new feature, new adapter, new control-plane RPC, schema/wire-format change, or any modification touching replication / MVCC / OCC / HLC / routing — **write a `*_proposed_*.md` design doc first and land it before the implementation**. Do not start implementation until the proposal has been reviewed and accepted. The PR may carry both the doc and the implementation (in that order: doc commit first, implementation commits after) as long as the doc is reviewable on its own. Lifecycle transitions: rename `*_proposed_*.md` → `*_partial_*.md` once the first milestone ships (and update the doc to record what landed and what is still open); rename `*_partial_*.md` → `*_implemented_*.md` once the final milestone ships. Use `git mv` so the history follows the rename.
+
+**Branch and PR naming.** Work that has a design doc is done on a branch named `design/<slug>`, where `<slug>` is the design doc's slug with hyphens instead of underscores (doc `docs/design/2026_09_26_proposed_positioning_and_roadmap.md` → branch `design/positioning-and-roadmap`). The first line of the PR body is `Design: docs/design/<file>`. This is how reviewers, and the `code-review` skill's Spec axis, locate the spec.
+
+## Agent skills
+
+The `mattpocock-skills` Claude Code plugin is installed. Its engineering skills read the files under `docs/agents/`; the rules below adapt the plugin's defaults to this repo. Repository artifacts they produce (design docs, `CONTEXT.md`, `CONTRIBUTING.md`) are written in English.
+
+### Issue tracker
+
+GitHub Issues on `bootjp/elastickv` via the `gh` CLI, **for externally reported issues only**. The maintainer's own work is never filed as an issue: the spec is a design doc and its milestone list is the plan. `to-tickets` and `wayfinder` are not used. See `docs/agents/issue-tracker.md`.
+
+### Specs
+
+`docs/design/` is the spec of record. When a skill says "publish the spec to the issue tracker" (`to-spec`), write `docs/design/YYYY_MM_DD_proposed_<slug>.md` instead, on branch `design/<slug>`, and open a PR (see **Branch and PR naming** above). `implement` takes the design doc path as its spec; `code-review` finds it through the PR body's `Design:` line.
+
+### Decisions (no ADRs)
+
+Do not create `docs/adr/`. A decision tied to a feature goes in that feature's design doc under a `## Decisions` heading; a cross-cutting invariant goes in **Conventions** above. When `domain-modeling` offers to record an ADR, record it in the relevant design doc instead.
+
+### Triage labels
+
+Default vocabulary: `needs-triage`, `needs-info`, `ready-for-agent`, `ready-for-human`, `wontfix` (each label string equals its role name). See `docs/agents/triage-labels.md`.
+
+### Domain docs
+
+Single-context: one `CONTEXT.md` at the repo root (glossary only). Use its vocabulary in identifiers, doc titles, and test names. See `docs/agents/domain.md`.
