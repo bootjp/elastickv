@@ -89,8 +89,12 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   (writes blocked during cutover), `MigratingSource`, `MigratingTarget`.
   (`distribution/catalog.go`)
 - **route catalog** — The durable route records persisted in reserved keys of
-  the default Raft group. All mutations go through control-plane RPCs, never
-  direct key writes. (`CLAUDE.md`, `distribution/catalog.go`)
+  the default Raft group. Operator mutations go through control-plane RPCs,
+  never direct key writes; the one exception is the bootstrap of an empty
+  catalog (`EnsureCatalogSnapshot` → `CatalogStore.Save`, a direct non-Raft
+  write on the node that creates the group), which is why the apply-order
+  fence compares against a replicated-only watermark. (`CLAUDE.md`,
+  `distribution/catalog.go`, `main.go`)
 - **catalog version** — The catalog's monotonic version. It bumps on every
   mutation so watchers fan out; `SplitRange` requires the caller's expected
   version to match. (`CLAUDE.md`, `README.md`)
@@ -300,7 +304,10 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
 
 - **logical snapshot decoder / encoder** — Offline tools that turn a native
   `.fsm` snapshot into a vendor-independent per-adapter directory tree and
-  back. (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
+  back. Today the decoder cannot read a snapshot taken from a live Pebble
+  store (it rejects the store's `_meta_last_commit_ts` entry), so this path
+  works only for snapshots the encoder produced; the fix is on the
+  serializable-audit roadmap. (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
   `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`)
 - **logical backup (Phase 1)** — Live, cluster-wide point-in-time extraction
   across Raft groups through `BeginBackup` / `RenewBackup` / `EndBackup`, in

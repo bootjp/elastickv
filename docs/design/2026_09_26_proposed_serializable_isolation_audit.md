@@ -138,7 +138,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G12 | **Transaction identity is `(primaryKey, StartTS)`, which is not unique.** Locks (`txnLock`), the commit and rollback records (`txnCommitKey`, `txnRollbackKey`), the ownership test in `handlePrepareRequest` (`lock.StartTS == startTS && PrimaryKey equal`), and the A2 read-lock rows all identify a transaction by its primary key and start timestamp. Adapter transactions supply `StartTS = readTS`, the shared read snapshot, so two concurrent 2PC transactions with the same primary key and the same snapshot alias each other: the second PREPARE passes the ownership check as a retry of the first and overwrites its intent; the first COMMIT then publishes the second's value under the first's identity, and the second's COMMIT finds no lock and reports success. A2's read-lock rows collide the same way (one transaction's COMMIT deletes the other's protection). Found in review, **reproduced** deterministically (3 of 3 under `-race`): `TestTwoPhaseCommit_SharedPrimaryAndStartTSAliasTransactions` in `kv/txn_identity_aliasing_repro_test.go` (branch `design/serializable-audit-a2-txnid-repro`, commit `255bd0ba`, on the read-lock fix). Two groups; T1 writes `p` and `s1`, T2 writes `p` and `s2`, both with `StartTS` from `ShardStore.LastCommitTS()` and primary `p`. T2's PREPARE on `p` passes `txnLockOwnedBy` and overwrites T1's intent; the first primary COMMIT publishes whatever intent is there and records its `CommitTS`; the second primary COMMIT fails with `commit_ts mismatch`, its ABORTs fail with `ErrTxnAlreadyCommitted`, and `completeCommittedTxn` then commits the loser's secondary at the winner's recorded `CommitTS` and reports success. Final state `p="t2"`, `s1="t1"`, `s2="t2"`; both clients told committed with the same `CommitTS`; T1's write of `p` is lost. In the read variant T2's COMMIT also deletes T1's read-lock row on `s2` and T1 still commits with its read of `s2` overwritten. | A cross-shard transaction can commit a mix of two transactions' writes (atomicity), and A2's read locks do not protect a transaction that shares identity with another. |
 | G13 | **A 2PC PREPARE whose `StartTS` equals the previous commit's timestamp is skipped as a replay, and the transaction's writes are silently lost (found by A4, diagnosed).** No faults, one node, one HLC, no split: the DynamoDB multi-table list-append workload (two groups) loses 11 to 21 acknowledged appends per 30-second run with the route-shuffle nemesis on or off. Mechanism: T1's COMMIT deletes each key's lock and intent rows, leaving tombstones at exactly `c1`; T2 starts at `nextTxnReadTS` = `ShardStore.LastCommitTS()` = `c1` when nothing committed since; T2's PREPARE writes its lock and intent at version `StartTS` (`handlePrepareRequest`, `commitTS = startTS`), `staleRaftApplyFastPathLocked` → `raftApplyAlreadyLandedLocked` finds a version (the tombstone) at `c1` on every key and declares the live PREPARE a replay before `checkApplyConflicts`, so no lock is written and validation is skipped; T2's COMMIT finds no lock, treats the key as already resolved, applies nothing, and the client gets OK. A collision on the secondary group alone tears the transaction (primary lands, secondary lost); a collision on both groups loses everything. **Reproduced** deterministically (`TestTwoPhaseCommit_PrepareAtPreviousCommitTSIsSkippedAsReplay` in `kv/prepare_replay_fastpath_repro_test.go`, branch `design/serializable-audit-g13-repro`, commit `10846a6c`, on `main` plus the harness fixes; 3 of 3 red under `-race`, control green; an instrumented binary logged 26 skipped live PREPAREs in one run, every lost transaction matching a skip at its `StartTS`). Excluded: the split and migration path (two runs without route shuffle lose appends too, group-1 keys whose route never moved lose them, the reproduction has no split); the A0 cross-group snapshot (the write is never applied, nothing is in flight); cross-node stamping (one HLC). It is the G10 stale-reapply sink reached by a single node, and **the A0 completion branch's Raft-index replay detection makes the reproduction pass**. Both ABORT variants **reproduce** too (`d0ad09ae`, same file, table-driven, 4 of 4 red 3 times under `-race`, all green with the fast path disabled and all green on the A0 completion branch): a coordinator ABORT after a read-only-shard conflict leaves the same tombstones at its `abortTS`, and `tryAbortExpiredPrimary` resolving an expired lock persists an ABORT at `startTS + 1`, a timestamp nothing allocated; a transaction starting at either value loses its write the same way. The Redis, SQS, and S3 2PC paths start at the watermark too and are expected to share the defect. | The default 2PC path loses committed writes on a healthy single node with both clients told OK; the fix is A0's index-based replay detection, and the regression test travels with the A0 PR. |
 | G14 | **PREPARE order lets a reader roll back a secondary before the primary lock exists (found while implementing A2, reproduced).** `prewriteTxn` prepares groups in group-id order (`groupMutations` sorts the ids), not primary group first. A reader that meets a secondary's lock before the primary PREPARE has applied asks `primaryTxnStatus`, finds no primary lock and no record, concludes rolled back **before any TTL check**, and aborts that secondary without writing a rollback record (`handleAbortRequest` writes one only when the ABORT names the primary); the primary then prepares and commits, and the secondary COMMIT finds no lock, treats the key as already resolved (`commitTxnKeyMutations`), and `handleCommitRequest` returns nil with nothing written. **Reproduced** (`TestTwoPhaseCommit_ReaderRollsBackSecondaryBeforePrimaryPrepare` in `kv/txn_prepare_order_repro_test.go`, branch `design/serializable-audit-g14-repro`, commit `6b90173b`, on the `TxnID` branch; 3 of 3 red under `-race`, three controls green): with the route layout flipped so the primary sits on the higher group id, a plain read of the secondary key in the window (a live 30 s lock, no TTL involved) aborts it, and the `LockResolver` does the same once the secondary lock has expired; with the primary prepared first the reader gets `txn locked` and T commits both keys. The window is at least one Raft round-trip on the primary group per cross-shard transaction. The scan read path shares `primaryTxnStatus` and very likely the flaw (not exercised). | A cross-shard transaction commits with one of its writes silently missing while the client is told OK; pre-existing on `main`, independent of the identity fix. |
-| G15 | **A forwarded RPC whose reply is lost after it reached the leader is retried (found while implementing A6, reproduced, fixed).** The leader-forward path (`LeaderProxy.forward`, `Coordinate.redirect`, the admin `forwardAdmin`) treated `Unavailable`, `DeadlineExceeded`, a dropped connection, and a reply held past the deadline as retryable even when the request had already reached the leader, which proposed and committed it; the resend was a second proposal with a fresh timestamp, which the A0 fence cannot detect. **Reproduced** (`adapter/forward_lost_response_test.go`, branch `design/serializable-audit-a6-forward-timeout`, commit `9d8cde4d`, on A6): the real `Internal` server over gRPC with a counting transaction manager and a server interceptor that applies the write and then loses the first reply in five ways, against three forward paths, 15 of 15 red ("the forwarded write was applied 2 times (err=<nil>)" for `LeaderProxy` and admin; `redirect` applied once but told the client a retryable error). **Fixed** by `8d1d77a4`: `classifyForwardedWriteError(err, sent)` keeps a never-sent failure retryable, marks a sent-then-lost reply (`Unavailable`, `DeadlineExceeded`, `Canceled`, `Internal`, a context error, a non-gRPC error) as `ErrProposalOutcomeUnknown` while keeping the gRPC code so the breaker still counts it, and passes the leader's definite answers through; "sent" comes from a per-call `grpc.Peer` probe, which grpc-go fills only after `transport.NewStream` succeeded (an empty peer means the final attempt never opened a stream); the startup gate's `Unavailable` is matched by an exact message constant (`kv.StartupGateUnavailableMessage`, now used by `main.go`'s gate interceptors) and stays retryable, so startup rotation and encryption cutover keep working. Green 15 of 15 plus 25 classification cases, a never-sent retry that succeeds once the leader listens, breaker accounting, the caller-deadline case, and the admin path; `kv`, `adapter`, `internal`, and the root package green under `-race`; lint clean. Every write is treated as non-idempotent on this branch (a lost reply on a forwarded PREPARE / COMMIT / ABORT is now unknown rather than retried inside `LeaderProxy`); `commitSecondaryWithRetry` one layer up still re-sends a secondary COMMIT on any error, relying on the per-transaction commit idempotence the `TxnID` branch formalises; the admin HTTP forward (`internal/admin/forward_client.go`, single attempt) is not marked unknown; a gRPC service-config retry policy, if ever enabled, would invalidate the probe (none is). | Closed. A write reaching the leader is applied at most once across a lost reply; the client sees success or the outcome-unknown class. |
+| G15 | **A forwarded RPC whose reply is lost after it reached the leader is retried (found while implementing A6, reproduced, fixed).** The leader-forward path (`LeaderProxy.forward`, `Coordinate.redirect`, the admin `forwardAdmin`) treated `Unavailable`, `DeadlineExceeded`, a dropped connection, and a reply held past the deadline as retryable even when the request had already reached the leader, which proposed and committed it; the resend was a second proposal with a fresh timestamp, which the A0 fence cannot detect. **Reproduced** (`adapter/forward_lost_response_test.go`, branch `design/serializable-audit-a6-forward-timeout`, commit `9d8cde4d`, on A6): the real `Internal` server over gRPC with a counting transaction manager and a server interceptor that applies the write and then loses the first reply in five ways, against three forward paths, 15 of 15 red ("the forwarded write was applied 2 times (err=<nil>)" for `LeaderProxy` and admin; `redirect` applied once but told the client a retryable error). **Fixed** by `8d1d77a4`: `classifyForwardedWriteError(err, sent)` keeps a never-sent failure retryable, marks a sent-then-lost reply (`Unavailable`, `DeadlineExceeded`, `Canceled`, `Internal`, a context error, a non-gRPC error) as `ErrProposalOutcomeUnknown` while keeping the gRPC code so the breaker still counts it, and passes the leader's definite answers through; "sent" comes from a per-call `grpc.Peer` probe, which grpc-go fills only after `transport.NewStream` succeeded (an empty peer means the final attempt never opened a stream); the startup gate's `Unavailable` is matched by an exact message constant (`kv.StartupGateUnavailableMessage`, now used by `main.go`'s gate interceptors) and stays retryable, so startup rotation and encryption cutover keep working. Green 15 of 15 plus 25 classification cases, a never-sent retry that succeeds once the leader listens, breaker accounting, the caller-deadline case, and the admin path; `kv`, `adapter`, `internal`, and the root package green under `-race`; lint clean. Every write is treated as non-idempotent on this branch (a lost reply on a forwarded PREPARE / COMMIT / ABORT is now unknown rather than retried inside `LeaderProxy`); `commitSecondaryWithRetry` one layer up still re-sends a secondary COMMIT on any error, relying on the per-transaction commit idempotence the `TxnID` branch formalises; the admin HTTP forward (`internal/admin/forward_client.go`, single attempt) is being given the same classification, because its handlers map a generic transport error to HTTP 503 with `Retry-After: 1` and the SPA resubmits a write whose outcome is unknown; a gRPC service-config retry policy, if ever enabled, would invalidate the probe (none is). | Closed for the data-plane forwards; the admin forward closes with its follow-up commit. A write reaching the leader is applied at most once across a lost reply; the client sees success or the outcome-unknown class. |
 
 ## 4. Milestones
 
@@ -504,7 +504,10 @@ Still open for the fix PRs:
   store); and, separately and older, `elastickv-snapshot-decode` /
   `ReadSnapshot` cannot decode any live Pebble `.fsm` today (it fails on
   `_meta_last_commit_ts`, "encoded value length 8 < 9"), a tooling defect
-  left as found.
+  left as found and now a roadmap item: the decoder must skip or decode
+  every `_meta_*` entry a live store writes, with a test that decodes a
+  snapshot taken from a live Pebble store; `CONTEXT.md` says the path is
+  unavailable for live snapshots until then.
 
 ### A1. Coverage table and adapter fixes
 
@@ -1059,9 +1062,20 @@ Constraints the fix PR must close before merge:
   read ever targets a lock row at an old timestamp; the retention floor
   already accounts for backup pins), and a PREPARE whose identity already
   has a commit or rollback record is a no-op, so a late duplicate PREPARE
-  cannot recreate a released lock after its tombstone is gone (the
-  records keep their history: they are the identity's memory; their own
-  growth is the pre-existing "records are never collected" limit). The
+  cannot recreate a released lock after its tombstone is gone on the
+  **primary** group (the records keep their history: they are the
+  identity's memory; their own growth is the pre-existing "records are
+  never collected" limit). Secondary groups hold no record, so a delayed
+  duplicate secondary PREPARE arriving after its tombstone was collected
+  does recreate the lock and intent there; that is a liveness cost, not a
+  safety hole: the recreated lock is settled by the resolver from the
+  primary's record within one TTL, a commit record resolves it as already
+  landed (a version exists at exactly `commitTS`, so nothing is written,
+  even if a newer user version exists above it) and a rollback record
+  drops it, and no server path resends a PREPARE after the transaction
+  completed (a lost reply is outcome unknown since G15, a composed-1
+  retry changes the identity), so the duplicate can only be a transport
+  artefact. A test proves the settlement in both directions. The
   shared-row alternative (one row per key holding the holder set) was
   rejected because it serialises every reader of a hot key on one row.
   Target: the check cost returns to the no-history figure after
@@ -1632,10 +1646,15 @@ sections defer to is therefore two-sided:
   The FSM applies the fence, the `DEL_PREFIX` lock check, read locks,
   `TxnID` ownership and records, and the advance entry **only for V2
   entries**; a V1 entry is applied exactly as `main` applies it today, on
-  both binaries, so the two never disagree on a V1 entry. The
-  replay-by-index detection is local bookkeeping, not a verdict, and is
-  not gated. Snapshot formats always carry the replicated watermark once
-  the new binary writes them (a V1-only cluster simply never consults it).
+  both binaries, so the two never disagree on a V1 entry. That includes
+  the replay detection: for a live V1 PREPARE whose `StartTS` equals a
+  tombstone timestamp (the G13 shape) the old replica's timestamp fast path
+  skips the entry while the index-based path would apply it, so a V1 entry
+  keeps the timestamp fast path on both binaries (and keeps G13 until the
+  flip), and only V2 entries use the index-based detection and never the
+  timestamp fast path. Snapshot formats always carry the replicated
+  watermark once the new binary writes them (a V1-only cluster simply never
+  consults it).
 - **Cluster capability.** Every node advertises `txn_format_v2` in the
   capability report the storage-envelope and encryption monitors already
   read; the coordinator flips one atomic `txnFormatV2` (`WithTxnFormatV2`,
@@ -1648,14 +1667,28 @@ sections defer to is therefore two-sided:
   operator flag pins the format to V1 for a deployment that must keep an
   old binary around, with a startup warning that the audit's guarantees
   are off.
-- **Refusal on the old side.** A V2 entry must never reach an old binary;
-  the monitor makes that a matter of timing only. As a belt to the braces,
-  the new binary refuses to *start* a group whose peers include a node
-  without the capability while the format is pinned V2 in its data dir
-  (`raft-engine` marker, the same file that already records the backend),
-  and records the format in the marker once V2 is first proposed, so a
-  downgrade after V2 traffic fails loudly (`ErrTxnFormatDowngrade`) instead
-  of applying V2 entries with V1 semantics.
+- **Refusal on the old side.** A V2 entry must never be *applied* by an
+  old binary, and the monitor alone cannot guarantee that: after the
+  one-way flip, the supported fresh-learner path can add an old binary
+  with an empty data directory, which has no marker, ignores the unknown
+  `txn_format` field, and applies legacy semantics. Two guards close it.
+  First, V2 entries are **undecodable by the old binary**: they are
+  encoded under a new Raft payload tag byte (`raftEncodeTxnV2`, next to
+  `raftEncodeHLCLease` and the migration tags) that the old FSM's dispatch
+  does not know, so an old replica that receives one fails the apply and
+  halts the replica (verify that an unknown tag byte falls through to a
+  decode failure that `haltErr`s, and if it does not, make it so on the
+  new binary's V1 path so the guarantee holds one release later); a halted
+  learner is a loud failure, not a divergent one. Second, **membership
+  admission** checks capability: `AddLearner` / `AddVoter` on a V2 cluster
+  ask the joining process for its capability report before proposing the
+  conf change and refuse a node that does not advertise `txn_format_v2`.
+  The `raft-engine` marker (the same file that already records the
+  backend) records the format once V2 is first proposed, so a downgrade
+  after V2 traffic fails loudly (`ErrTxnFormatDowngrade`) instead of
+  applying V2 entries with V1 semantics, and the new binary refuses to
+  start a group whose configured peers include a node without the
+  capability while the marker says V2.
 - **Tests.** A two-binary simulation is out of reach in unit tests, so the
   evidence is: table tests that every gated verdict is a no-op for V1
   entries and active for V2; a coordinator test that the flag flips only on
