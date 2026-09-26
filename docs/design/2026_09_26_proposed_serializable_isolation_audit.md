@@ -1280,11 +1280,32 @@ server binary):
   30 s. Virtual-time interpreter moved to `generator_simulation.clj`; 22
   assertions red first; full `lein test` 163 tests, 495 assertions, green.
   A 30 s zset-safety run passes with the final read last in the history
-  and seeing two mutations the last main-phase read missed. Still off: the
-  `append/test` final reads in the list-append workloads (they need
-  `:wrap-generator max-key-tracker` around the whole generator, which
-  changes Elle's input; enabling them is the recorded follow-up, since
-  without them Elle cannot see the final state). Also found: in the HT-FIFO
+  and seeing two mutations the last main-phase read missed. The `append/test`
+  final reads in the three list-append workloads are enabled by
+  `fix/jepsen-append-final-reads` (`f7cc098c`, on the outcome-unknown
+  client change, not pushed): `with-final-phases` takes the package's
+  `:wrap-generator` and wraps the whole composed generator so
+  `max-key-tracker` sees every main-phase transaction and hands `:max-key`
+  to the final phase. The package's own `final-gen` in the 0.3.13 jar reads
+  `(range max-key)` in chunks of 8 and so never reads the highest key and
+  drops a last chunk shorter than 8 (confirmed: with max-key 7 it issued no
+  final read at all), so it is replaced by `cli/append-final-reads`, which
+  reads every key 0 to max-key, 8 per transaction, each retried one at a
+  time until `:ok` for up to 60 s, and throws if `:max-key` is missing. The
+  evidence test (Elle 0.2.7, `:strict-serializable`): a history whose last
+  append to a key is acknowledged after that key's last main-phase read is
+  `:valid? true` without a final read and `G-single-item-realtime` with a
+  final read that misses the append. 24 assertions red first (16 with the
+  package's final reads: missed keys); full `lein test` 187 tests, 729
+  assertions, green, and 50 repeated runs in one JVM. A 30 s Redis run
+  against the A6 binary: 151 main-phase transactions, then three final
+  read transactions covering keys 0 to 17 exactly once, five keys whose
+  last append was acknowledged after their last main-phase read all seen
+  only by the final read, `:valid? true`. Not yet done: the DynamoDB and
+  multi-table final reads (8-key `TransactGetItems`) were not run against
+  a server; the list-append checker does not yet refuse a run whose final
+  reads timed out (the zset checker does; same follow-up); the Redis
+  list-append keys are plain integers without a per-run namespace. Also found: in the HT-FIFO
   `:recv` branch a `DeleteMessage` that errors but actually committed (an
   ambiguous timeout under faults) dropped its tuple, so the message was
   never redelivered and the checker would report a false `:lost`;
