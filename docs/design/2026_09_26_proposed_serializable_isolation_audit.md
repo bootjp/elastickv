@@ -771,9 +771,36 @@ server binary):
 
 - `elastickv.sqs-htfifo-workload` tests nothing, in CI too: `setup!` stores
   the queue URL on the record it returns, Jepsen 0.3.13 discards that
-  value, workers get clients from `open!`, so every request carries a nil
-  `QueueUrl` and the server answers `MissingParameter` (HTTP 400); the
-  checker sees 0 sends and 0 receives and reports valid.
+  value (`with-client+nemesis-setup-teardown` runs `open!` / `setup!` /
+  `close!` once per node and drops the result), workers get clients from
+  `open!`, so every request carries a nil `QueueUrl` and the server answers
+  `MissingParameter` (HTTP 400); the checker sees 0 sends and 0 receives
+  and reports valid. **Fixed** on local branch
+  `fix/jepsen-sqs-htfifo-queue-url` (from `main`, not pushed): `7542e939`
+  makes the checker report `:valid? :unknown` with `:vacuous-reasons`
+  (`:no-sends`, `:no-receives`) when nothing was sent or received (a real
+  `:lost` still wins with `false`; `cli/fail-on-invalid!` already fails on
+  `:unknown`), and `13395f8a` keeps the queue URL in an atom created once
+  per test (the pattern `seq-counters` already uses; an `open!`-time lookup
+  was rejected because Jepsen re-opens a client after every `:info`, and a
+  promise would hang `invoke!`), with an op failing locally as
+  `:no-queue-url` if it is unset. Eighteen unit tests (57 assertions; the
+  checker and lifecycle tests were red first). On a fresh three-node
+  cluster with the CI flags (30 s, rate 5, concurrency 5): `main` 0 `:ok`
+  sends and `:valid? true`; the checker commit alone `:unknown`
+  `[:no-sends :no-receives]`, exit 1; both commits 80 `:ok` sends, 118
+  `:ok` receives, 80 received, `:valid? true`. Not yet run under faults.
+- Found while fixing it, not yet fixed: `sqs-invoke!` reads the error code
+  from `:__type`, but this cognitect SQS client (query protocol) puts it
+  under `:cognitect.aws.error/code`, so every SQS error is `:info` with
+  `:cognitect.anomalies/incorrect`, the `:fail` classification and the
+  `QueueAlreadyExists` fallback never trigger, and the missing-queue code is
+  `AWS.SimpleQueueService.NonExistentQueue` (conservative: no false pass);
+  the drain generator is not wrapped in `gen/clients`, so the nemesis worker
+  takes `:recv` ops and logs `:jepsen.nemesis/invalid-completion` about a
+  dozen times per run (noise only); a comment in
+  `dynamodb_multi_table_workload.clj` says `setup!` runs once per test, but
+  it runs once per node.
 - The list-append workloads reuse plain integer keys across runs, so a
   second run on the same cluster makes Elle abort (`No transaction wrote
   11 = 2`); CI runs each workload once per cluster and is unaffected.
