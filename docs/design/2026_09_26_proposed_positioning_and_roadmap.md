@@ -51,7 +51,7 @@ week, no deadline; the plan below is sized for that.
 | Dimension | FoundationDB | TiKV | DynamoDB | Bigtable | elastickv |
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
-| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic across keys and shards (2PC with OCC validation of write and read sets at FSM apply); serializable is the target pending the audit's A0 to A2 and G11 (§6.3); per-key linearizable except on the G10 paths until A0b lands |
+| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic within a shard; across shards 2PC with OCC validation of write and read sets at FSM apply, whose atomicity is not yet claimed (G12, reproduced: two transactions sharing primary key and start timestamp commit a mix) until A2's transaction id; serializable is the target pending the audit's A0 to A2 and G11 (§6.3); per-key linearizable except on the G10 paths until A0b lands |
 | Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
@@ -86,8 +86,9 @@ README will present scope in two tiers instead of a non-goals section.
   transactions, whose COMMIT timestamp the coordinating leader stamps for
   groups it does not lead) are excluded until A0b and its remaining
   `Internal.Forward` work land (G10, reproduced);
-  multi-key transactions atomic, with
-  OCC validation of write and read sets at apply. **Serializable is the
+  multi-key transactions atomic within a shard, and across shards once
+  A2's transaction id lands (G12, reproduced), with OCC validation of write
+  and read sets at apply. **Serializable is the
   target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
   that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
@@ -193,8 +194,12 @@ Prerequisite for the on-premises showcase. Scope:
   credentials loader (`--dynamoCredentialsFile`).
 - Redis adapter: `AUTH` with a static password (`requirepass` equivalent);
   `HELLO AUTH` accepted. ACLs are out of scope.
-- TLS on every listener (gRPC, Redis, DynamoDB, S3, SQS), reusing the admin
-  listener's certificate flags.
+- TLS on every listener (gRPC, Redis, DynamoDB, S3, SQS, and the metrics
+  and pprof listeners, whose bearer tokens otherwise travel in clear text
+  the moment `--metricsAddress` / `--pprofAddress` leave loopback, as the
+  multinode runbook's `http://10.0.0.11:9090` example shows), reusing the
+  admin listener's certificate flags; without a certificate those two
+  listeners refuse a non-loopback bind.
 - The internal forwarding clients get the same settings, or follower
   forwarding breaks the moment the controls are on: the Redis leader
   clients (`redis_proxy_leader.go`, built with only an address and pool

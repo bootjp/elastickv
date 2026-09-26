@@ -1070,12 +1070,19 @@ see this as G1a.
 Design:
 
 - **Engine.** A new sentinel `raftengine.ErrProposalOutcomeUnknown`, not
-  marked with `ErrNotLeader`. `failPending` uses it for pending proposals
-  and pending admin / config changes; pending reads keep `errNotLeader`
-  (nothing was applied). Pre-proposal rejections are unchanged. The engine
-  records, per drained proposal, the last known index and term so a later
-  milestone can resolve the outcome by watching whether that index commits
-  with that term or is overwritten; this milestone only reports it.
+  marked with `ErrNotLeader`. Leadership loss no longer fails pending
+  proposals at all: the engine **resolves** them. Each proposal is tracked
+  by the `(index, term)` it received when its entry appeared in
+  `Ready.Entries`; it resolves as success when the entry applies (the
+  normal pop by id, whichever leader committed it), as a definite,
+  retry-safe `errNotLeader` when that log position is overwritten by an
+  entry of a different term or superseded by a snapshot (the proposal can
+  never commit), and as `ErrProposalOutcomeUnknown` only when the request
+  context expires, or the engine stops, before either happens. Pending
+  admin / config changes follow the same rule; pending reads keep
+  `errNotLeader` (nothing was applied). Pre-proposal rejections are
+  unchanged. So the unknown class is the residue after a bounded wait, not
+  the first answer.
 - **kv.** `isLeadershipLossError` and `isTransientLeaderError` return false
   for it, so no server-side path retries a proposal whose outcome is unknown
   (a retry re-stamps a fresh timestamp and applies a second time when the
@@ -1087,15 +1094,24 @@ Design:
   prefix `proposal outcome unknown`, and the client side of `Forward`
   re-marks it with the sentinel; the phrase classifier's closed list does
   not include it, so a forwarder never reclassifies it as transient.
-- **Adapters.** Each surface reports the class the way its upstream does
-  for an internal error whose effect is unknown, never as a retry-safe
-  failure: Redis `-OUTCOMEUNKNOWN <message>` (a distinct first token, so
-  clients and the Jepsen client classify it separately from `NOTLEADER`);
-  DynamoDB HTTP 500 `InternalServerError`; S3 HTTP 500 `InternalError`;
-  SQS HTTP 500 `InternalFailure`; gRPC `codes.Aborted` (clients must not
-  treat it as `Unavailable`).
+- **Adapters.** The residual unknown class must never be something a
+  standard client resubmits automatically: Redis `-OUTCOMEUNKNOWN
+  <message>` (a distinct first token, so clients and the Jepsen client
+  classify it separately from `NOTLEADER`); gRPC `codes.Aborted` (not
+  `Unavailable`, which retry policies treat as safe); DynamoDB, S3, and SQS
+  HTTP **400** with the code `RequestOutcomeUnknown` (JSON `__type` for
+  DynamoDB, the XML `<Code>` for S3 and the query-protocol `<Code>` for
+  SQS), because the AWS SDKs retry every 5xx automatically and would
+  resubmit a non-idempotent `UpdateItem`, `SendMessage`, or part upload
+  that may already have committed. This deliberately departs from upstream,
+  which returns 500 and relies on client idempotency tokens; honouring
+  those tokens (`TransactWriteItems` `ClientRequestToken`, FIFO
+  `MessageDeduplicationId`, the idempotent S3 `PUT`) is the recorded
+  follow-up before any 5xx mapping could be reconsidered. The message says
+  the outcome is unknown and that the client should read before retrying.
 - **Jepsen.** The A4 clients record it as `:info` (Redis by the first
-  token, the HTTP adapters by status 500 plus the code), on the A4 branch.
+  token, the HTTP adapters by the `RequestOutcomeUnknown` code), on the A4
+  branch.
 
 Tests: an engine test that proposes, forces leadership loss with the
 proposal pending, and asserts the sentinel (and that `errors.Is(err,

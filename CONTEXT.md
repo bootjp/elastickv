@@ -74,9 +74,11 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   FSM data as a byte slice and keeps only a small token in memory storage.
   (`docs/design/2026_04_14_implemented_etcd_snapshot_disk_offload.md`)
 - **physical snapshot object offload** — Periodic per-group physical
-  snapshots stored in an external S3-compatible object store with bounded
-  retention, restorable into a fresh data directory; the object layer treats
-  the FSM payload as opaque bytes.
+  snapshots stored in an external S3-compatible object store, restorable
+  into a fresh data directory; the object layer treats the FSM payload as
+  opaque bytes. Shipped today: the publish and restore tooling. Not yet
+  available to operators: periodic scheduling (the scheduler exists as a
+  library and is not wired into `main.go`) and bounded retention / GC.
   (`docs/design/2026_07_19_partial_physical_snapshot_object_offload.md`)
 
 ## Routing and sharding
@@ -159,9 +161,14 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   that no read or write key was committed after it. (`proto/internal.proto`)
 - **CommitTS** — The timestamp at which a value or tombstone is committed.
   Intended invariant: unique, so a version at a given commit timestamp
-  belongs to exactly one transaction; on `main` today the default TSO mode
-  lets separate nodes issue the same value (audit gap G10), and A0b restores
-  the invariant. (`store/store.go`)
+  belongs to exactly one transaction. On `main` today the default TSO mode
+  lets separate nodes issue the same value (audit gap G10). After A0 and
+  A0b the invariant holds **per Raft group**: the owning leader issues the
+  value and the apply-order fence rejects a second apply at or below the
+  group's watermark; two leaders of different groups can still issue the
+  same value, which is harmless because versions live per group. It holds
+  cluster-wide only under Phase D, where group 0 is the single issuer.
+  (`store/store.go`)
 - **PrevCommitTS** — The commit timestamp of a failed earlier attempt of the
   same transaction, used as that attempt's identity for dedup.
   (`kv/coordinator.go`)
@@ -321,8 +328,11 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   and their composition under `tla/`, run by `scripts/tla-check.sh` with gap
   configurations that must fail. (`tla/README.md`)
 - **Jepsen workloads** — Fault-injection workloads under
-  `jepsen/src/elastickv/` for the Redis, DynamoDB, S3, and SQS surfaces, using
-  Elle list-append, knossos registers, or custom checkers; gRPC and the
+  `jepsen/src/elastickv/` for the Redis, DynamoDB, and S3 surfaces, using
+  Elle list-append, knossos registers, or custom checkers. The SQS
+  workload exists but validates nothing on `main` today (every request
+  carries a nil `QueueUrl`, so zero sends and receives pass as valid; the
+  fix is on a local branch recorded in the audit's A4); gRPC and the
   filesystem have none yet. (`CLAUDE.md`, `.github/workflows/jepsen-test.yml`)
 - **design doc lifecycle** — `proposed` (accepted, not implemented),
   `partial` (some milestones shipped), `implemented` (as-built record), as
