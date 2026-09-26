@@ -496,9 +496,11 @@ Constraints the fix PR must close before merge:
   The implemented `handlePrepareRequest` installs a read lock without
   checking for a foreign write lock on that key, so the cross-shard PREPARE
   interleaving described in the A2 design (both write locks before either
-  read lock) still commits both transactions. Add the check, a two-group
-  reproduction test that drives that interleaving (expected red first), and
-  split `Prepare` per shard in the TLA+ model so `OCC8` catches it.
+  read lock) still commits both transactions. Add the check and a two-group
+  reproduction test that drives that interleaving (expected red first). The
+  TLA+ half is done: `design/serializable-audit-a3-shards` splits PREPARE
+  per key and `MCOCC_gap_readlock_intent.cfg` fails `OCC8` on this
+  interleaving without the rejection (A3).
 - **`DEL_PREFIX` ignores locks (found in review).** The implemented A2
   leaves raw `DEL_PREFIX` outside lock validation; add range-aware conflict
   handling against write and read locks under the prefix, with a test that
@@ -525,11 +527,12 @@ Constraints the fix PR must close before merge:
 
 ### A3. TLA+
 
-Status: both halves are done on local branches (not pushed):
-`design/serializable-audit-a3` (commit `e11e3dd1`, the G0 half) and
-`design/serializable-audit-a3-g1` (commit `f0ba0cbf`, the G1 half, on top
-of it). What remains is documentation and two modelling limits listed
-below.
+Status: done on three stacked local branches (not pushed):
+`design/serializable-audit-a3` (commit `e11e3dd1`, the G0 half),
+`design/serializable-audit-a3-g1` (commit `f0ba0cbf`, the G1 half), and
+`design/serializable-audit-a3-shards` (commit `74c15fda`, PREPARE split per
+key so the cross-shard interleaving found in review is modelled). What
+remains is documentation and the modelling limits listed below.
 
 Landed, in `tla/occ/OCC.tla` and its configs:
 
@@ -547,37 +550,59 @@ Landed, in `tla/occ/OCC.tla` and its configs:
   `checkConflictsLocked` and `handlePrepareRequest` do. Before this was
   added the model was plain snapshot isolation: `OCC8` failed on it with two
   one-phase transactions crossing two keys.
-- Constant `ReadLocks` (the A2 read locks): `Prepare(t)` adds `t` to a
-  shared `readLocks[k]` for each read key; a writer's `Prepare` is disabled
-  and a one-phase `Apply` is rejected while a foreign read lock sits on one
-  of its write keys; `Apply`, `Abort`, and `AbortProposed` release them;
+- Constant `ReadLocks` (the A2 read locks): PREPARE adds `t` to a shared
+  `readLocks[k]` for each read key; a writer's PREPARE is disabled and a
+  one-phase `Apply` is rejected while a foreign read lock sits on one of
+  its write keys; `Apply`, `Abort`, and `AbortProposed` release them;
   readers are never blocked.
+- PREPARE is per key and per role, not one atomic step: `PrepareWrite(t,
+  k)` (no lock on `k`, no version newer than `startTs[t]`, no foreign read
+  lock) installs the write lock and `PrepareRead(t, k)` (per-key version
+  check, then the read lock when `ReadLocks` is on) stands for the
+  lock-only PREPARE of a read-only shard. The first step moves the
+  transaction to a new `Preparing` state (no further reads, writes, or
+  one-phase `Allocate`), the last to `Prepared`; `Abort` is enabled from
+  `Preparing` and releases partial locks. One key per shard is the finest
+  sharding, so every per-shard interleaving is reachable and a pass holds
+  for any key-to-shard assignment. Read validation runs when the read lock
+  is installed, as each shard's PREPARE apply does; COMMIT does not
+  re-validate.
+- Constant `ReadLockRejectsWriteLock` (the review finding): `PrepareRead`
+  is disabled while a foreign write lock sits on the key. With it off,
+  `MCOCC_gap_readlock_intent.cfg` fails `OCC8` at depth 15 on exactly the
+  review's interleaving (both write locks, then both read locks over the
+  other's intent, then both apply). With it on, a scratch check confirmed
+  the state with both write locks placed is still reachable and both
+  `PrepareRead` steps are disabled there, over all 203,379 distinct states.
 - Invariants `OCC6_SnapshotStableAtWatermark` (what a read at snapshot `s`
   returned is still what is visible at `(k, s)`), `OCC7_NoLostUpdate` (a
   committed writer saw every version it overwrote), and `OCC8_NoWriteSkew`
   (no two committed transactions each read a key the other wrote without
   seeing the other's write; two-transaction cycles only).
-- Results, `make tla-check` in about 23 seconds: `MCOCC.cfg` (3
-  transactions, `MaxOps = 4`, all guards on) passes OCC1 to OCC8 over
-  124,064 distinct states with every guard exercised (canary invariants
-  confirmed each rejection path is reachable). `MCOCC_gap_applyorder.cfg`
-  (fence off) fails `OCC6` at depth 11 with the same schedule as
-  `kv/apply_order_repro_test.go`, and fails `OCC7` at depth 14 when `OCC6` is
+- Results, `make tla-check`, all 18 runs matching the contract: `MCOCC.cfg`
+  (3 transactions, 2 keys, `MaxOps = 4`, all guards on) passes OCC1 to OCC8
+  over 203,379 distinct states at depth 23 in about 10 seconds (124,064 at
+  depth 21 before the per-key split) with every guard exercised (canary
+  invariants confirmed each rejection path is reachable).
+  `MCOCC_gap_applyorder.cfg` (fence off) fails `OCC6` at depth 11 with the
+  same schedule as `kv/apply_order_repro_test.go`, fails `OCC7` at depth 14
+  when `OCC6` is removed, and `OCC8` at depth 15 when `OCC7` is also
   removed. `MCOCC_gap_readlocks.cfg` (read locks off) fails `OCC8` at depth
-  12 with the G1 schedule: W prepares (lock on `k`), T allocates and applies
+  13 with the G1 schedule: W prepares (lock on `k`), T allocates and applies
   (its write key `k1` has no lock; its read key carries W's lock but no
-  version), W allocates and applies without re-checking its read key. Both
-  gap configs are wired into `scripts/tla-check.sh`.
+  version), W allocates and applies without re-checking its read key.
+  `MCOCC_gap_readlock_intent.cfg` fails `OCC8` at depth 15 as above. All
+  three gap configs are wired into `scripts/tla-check.sh`; the HLC, MVCC,
+  Routes, and Composed configs are unchanged.
 
 Modelling limits, recorded so nobody over-reads the result:
 
-- One store and one atomic `Prepare` stand for all shards; the read-only
-  shard path (`validateReadOnlyShards`) and lock-only PREPAREs are not
-  modelled separately, and `Prepare` still requires a non-empty write set.
-  This abstraction hides the cross-shard PREPARE interleaving found in
-  review (both write locks before either read lock): `Prepare` must be
-  split per shard, with read-lock installation rejecting a foreign write
-  lock, and a gap configuration without that rejection must fail `OCC8`.
+- One store stands for all shards; sharding shows up only as the per-key
+  PREPARE interleaving, so shard-local state (a leader change on one shard,
+  a partial PREPARE that is never resolved) is not modelled. A refused
+  PREPARE step is modelled as disabled (the transaction waits or aborts),
+  not as an error returned to the client, and `PrepareRead` still requires
+  a non-empty write set.
 - The 2PC commit timestamp is allocated after `Prepare` (the A0 ordering);
   today's allocate-before-PREPARE is not modelled. G1 does not depend on it.
 - `OCC8` checks two-transaction cycles only.
