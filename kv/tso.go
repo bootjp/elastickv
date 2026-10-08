@@ -76,6 +76,13 @@ type TSOPhaseDState interface {
 	PhaseDRequired() bool
 }
 
+// TSOPhaseDFloorSource exposes the Phase-D floor, whose physical half is the
+// instant Phase D activated. Optional: an allocator that does not implement it
+// leaves the pre-Phase-D admission window open rather than closed.
+type TSOPhaseDFloorSource interface {
+	PhaseDFloor() uint64
+}
+
 // AppliedReadTimestampVoucher records an adapter-provided applied watermark.
 // It is a process-local capability used only to distinguish audited adapter
 // snapshots from arbitrary caller-supplied StartTS values during Phase D.
@@ -392,10 +399,38 @@ func ValidateForwardedTxnStartTimestamp(
 	label string,
 ) error {
 	err := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
-	if err == nil || errors.Is(err, ErrTSOTimestampPrePhaseD) {
+	if err == nil {
 		return nil
 	}
-	return err
+	if !errors.Is(err, ErrTSOTimestampPrePhaseD) {
+		return err
+	}
+	// A pre-Phase-D start is admitted only while a transaction could still
+	// legitimately be preparing at it. This is the §4.2 bound: the attacker's
+	// leverage is creating a FRESH pre-D intent after the marker, and a
+	// transaction genuinely in flight across it can only stay preparable for
+	// its lock TTL. Past that window the commit carve-out can only ever apply
+	// to intents that really predate the marker, which is what it was written
+	// for.
+	if !prePhaseDStartWithinWindow(alloc) {
+		return errors.Wrap(ErrPrePhaseDWindowClosed, label)
+	}
+	return nil
+}
+
+// prePhaseDStartWithinWindow reports whether pre-Phase-D intent creation is
+// still open, given what the allocator can say about the floor.
+//
+// An allocator that cannot report the floor leaves the window open: this bound
+// exists to narrow a carve-out, and a missing signal must not turn it into a
+// refusal that strands legitimate legacy resolution.
+func prePhaseDStartWithinWindow(alloc TimestampAllocator) bool {
+	source, ok := alloc.(TSOPhaseDFloorSource)
+	if !ok {
+		return true
+	}
+	return PrePhaseDStartAdmissible(
+		source.PhaseDFloor(), prePhaseDNowMillis(), prePhaseDAdmissionWindow)
 }
 
 func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
