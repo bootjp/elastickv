@@ -31,6 +31,7 @@ type Registry struct {
 	coldStartObs  *ColdStartObserver
 	tso           *TSOMetrics
 	tsoObserver   *TSOObserver
+	snapOffload   *SnapshotOffloadMetrics
 	encryption    *EncryptionMetrics
 	encryptionObs *EncryptionStateObserver
 }
@@ -65,6 +66,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.coldStartObs = newColdStartObserver(r.coldStart)
 	r.tso = newTSOMetrics(registerer)
 	r.tsoObserver = newTSOObserver(r.tso)
+	r.snapOffload = newSnapshotOffloadMetrics(registerer)
 	r.encryption = newEncryptionMetrics(registerer)
 	r.encryptionObs = newEncryptionStateObserver(r.encryption)
 	return r
@@ -295,6 +297,16 @@ func (r *Registry) TSOObserver() *TSOObserver {
 		return nil
 	}
 	return r.tsoObserver
+}
+
+// SnapshotOffloadObserver returns the physical snapshot offload
+// scheduler's metrics observer. Passed to the scheduler through
+// snapshotoffload.WithSchedulerObserver.
+func (r *Registry) SnapshotOffloadObserver() *SnapshotOffloadMetrics {
+	if r == nil {
+		return nil
+	}
+	return r.snapOffload
 }
 
 // EncryptionObserver returns the data-at-rest encryption observer
