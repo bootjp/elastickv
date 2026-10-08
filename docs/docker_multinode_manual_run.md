@@ -273,25 +273,15 @@ redis-cli -h 10.0.0.12 -p 6379 GET survive
 
 ## DynamoDB Compatibility Notes
 
-Current DynamoDB-compatible API coverage includes:
+Current DynamoDB-compatible API coverage:
 
-- `CreateTable`
-- `DeleteTable`
-- `DescribeTable`
-- `ListTables`
-- `PutItem`
-- `GetItem`
-- `DeleteItem`
-- `UpdateItem`
-- `Query`
-- `TransactWriteItems`
-
-Currently unsupported commands:
-
-- `Scan`
+- `CreateTable` / `DeleteTable` / `DescribeTable` / `ListTables`
+- `PutItem` / `GetItem` / `DeleteItem` / `UpdateItem`
+- `Query` / `Scan`
 - `BatchWriteItem`
+- `TransactWriteItems` / `TransactGetItems`
 
-If you migrate existing DynamoDB data, use key-based reads (`GetItem`/`Query`) and write with `PutItem`/`TransactWriteItems` instead of `Scan`/`BatchWriteItem`.
+Unknown `X-Amz-Target` operations return an unsupported-operation error. Per-operation restrictions (for example `ConsistentRead` on a global secondary index) are rejected with a descriptive error.
 
 ## Stop and Cleanup
 
