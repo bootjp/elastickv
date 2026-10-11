@@ -248,6 +248,21 @@ func TestDecodeSnapshot_TxnPrefixDroppedAsInternal(t *testing.T) {
 	}
 }
 
+func TestDecodeSnapshot_DynamoSealDroppedAsInternal(t *testing.T) {
+	t.Parallel()
+	b := newSnapBuilder(0)
+	b.WriteEntry([]byte(DDBSealPrefix+"b3JkZXJz|1|abcd"), 1, []byte{1}, false, 0, snapshotEncStateCleartx)
+	res, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
+		OutRoot: t.TempDir(), Adapters: AllAdapters(),
+	})
+	if err != nil {
+		t.Fatalf("DecodeSnapshot: %v", err)
+	}
+	if res.Counters.Internal != 1 || res.Counters.Unknown != 0 || res.Counters.DynamoDB != 0 {
+		t.Fatalf("seal counters = %+v, want one internal record", res.Counters)
+	}
+}
+
 // TestPrefixRoutes_LongestMatchesFirst pins the descending-length
 // ordering invariant — the routing table relies on it so a key
 // matching both "!hs|meta|d|" and "!hs|meta|" lands on the delta
