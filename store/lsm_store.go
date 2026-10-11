@@ -305,6 +305,14 @@ type pebbleStore struct {
 	// preserves the pre-7a-2 posture (no direct-path gating); the
 	// production main.go wiring threads cache.Registered in.
 	storageRegistered StorageRegistered
+	// encryptionObserver receives the §9.2 envelope telemetry: one
+	// call per emitted envelope and one per decrypt-path failure. A
+	// nil observer (the default, and what an embedded/test store
+	// carries) costs a nil check on the write path and nothing else.
+	// It is metrics-only — no decision anywhere reads it back — so a
+	// dropped observation can never change stored bytes or apply
+	// determinism.
+	encryptionObserver EncryptionObserver
 }
 
 // Ensure pebbleStore implements MVCCStore and RetentionController.
