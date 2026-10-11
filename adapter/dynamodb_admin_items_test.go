@@ -674,6 +674,39 @@ func TestDynamoDB_AdminPutItem_RejectsPathKeyWithExtraAttributes(t *testing.T) {
 	require.ErrorIs(t, err, ErrAdminDynamoValidation)
 }
 
+func TestDynamoDB_AdminPutItem_RevalidatesPathKeyDuringWritePreparation(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	ctx := context.Background()
+	_, err := srv.AdminCreateTable(ctx, fullAdminPrincipal, AdminCreateTableInput{
+		TableName:    "retry-key",
+		PartitionKey: AdminAttribute{Name: "pk", Type: "S"},
+		SortKey:      &AdminAttribute{Name: "sk", Type: "S"},
+	})
+	require.NoError(t, err)
+
+	in := putItemInput{
+		TableName: "retry-key",
+		Item: map[string]attributeValue{
+			"pk": newStringAttributeValue("tenant"),
+			"sk": newStringAttributeValue("row"),
+		},
+		adminPathKey:      map[string]AdminAttributeValue{"pk": stringAttr("tenant")},
+		checkAdminPathKey: true,
+	}
+	_, err = srv.preparePutItemWrite(ctx, in, srv.nextTxnReadTS())
+	require.ErrorIs(t, err, ErrAdminDynamoValidation)
+}
+
+func TestValidateAdminPathKeyDeduplicatesPrimaryKeyNames(t *testing.T) {
+	t.Parallel()
+	schema := &dynamoTableSchema{PrimaryKey: dynamoKeySchema{HashKey: "id", RangeKey: "id"}}
+	require.NoError(t, validateAdminPathKeyCoversPrimaryKey(schema,
+		map[string]AdminAttributeValue{"id": stringAttr("same-key")}))
+}
+
 // TestDynamoDB_AdminPutItem_ReportsMissingTable pins that the schema
 // lookup the key check performs surfaces an absent table as not-found
 // rather than as a validation error.

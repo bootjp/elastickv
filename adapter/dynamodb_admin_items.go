@@ -341,8 +341,10 @@ func (d *DynamoDBServer) AdminPutItem(
 		return err
 	}
 	in := putItemInput{
-		TableName: tableName,
-		Item:      adminToInternalAttributeMap(item.Attributes),
+		TableName:         tableName,
+		Item:              adminToInternalAttributeMap(item.Attributes),
+		adminPathKey:      pathKey,
+		checkAdminPathKey: true,
 	}
 	unlock, err := d.lockItemForWrite(ctx, tableName, in.Item)
 	if err != nil {
@@ -378,9 +380,12 @@ func (d *DynamoDBServer) assertPathKeyCoversPrimaryKey(
 	if !exists {
 		return ErrAdminDynamoNotFound
 	}
+	return validateAdminPathKeyCoversPrimaryKey(schema, pathKey)
+}
 
+func validateAdminPathKeyCoversPrimaryKey(schema *dynamoTableSchema, pathKey map[string]AdminAttributeValue) error {
 	required := []string{schema.PrimaryKey.HashKey}
-	if schema.PrimaryKey.RangeKey != "" {
+	if schema.PrimaryKey.RangeKey != "" && schema.PrimaryKey.RangeKey != schema.PrimaryKey.HashKey {
 		required = append(required, schema.PrimaryKey.RangeKey)
 	}
 	for _, name := range required {
