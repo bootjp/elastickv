@@ -524,6 +524,17 @@ branch, not pushed). What landed:
   `txnCommitTSPreallocated`; their primary COMMIT is fenced too, so under
   contention they abort with a write conflict more often, and a
   multi-shard `MULTI` retry then meets `ErrTxnDedupRequiresSingleShard`.
+  Fencing the primary alone is **not** enough once a secondary group can
+  be advanced by a snapshot read (A0 multi-group): a reader advances group
+  B to `s > c` and reads there, the pre-allocated transaction prepares
+  afterwards, its primary group accepts `c` because that group's watermark
+  is below `c`, and the unfenced secondary COMMIT lands at `c ≤ s` on B,
+  invisible to the reader's validation. So, before the primary COMMIT is
+  proposed, a pre-allocated `c` must exceed every PREPARE response's
+  replicated watermark (the same participant watermarks the follow-up in
+  the multi-group section collects); otherwise the transaction aborts and
+  retries with a fresh pre-allocation. This is the pre-allocated half of
+  the "commit timestamp above every participant's watermark" blocker.
 - **`DEL_PREFIX` fenced** through a new `DeletePrefixesAtRaftAtFenced`; each
   prefix element now carries its own timestamp so a multi-prefix broadcast
   (the S3 bucket-delete safety net) does not fence itself.
@@ -1841,12 +1852,24 @@ sections defer to is therefore two-sided:
   consults it).
 - **Cluster capability.** Every node advertises `txn_format_v2` in the
   capability report the storage-envelope and encryption monitors already
-  read; the coordinator flips one atomic `txnFormatV2` (`WithTxnFormatV2`,
-  subsuming `WithTransactionIDs`) only when every voter and learner of
-  every group reports it, through a monitor built like
-  `startStorageEnvelopeV2CapabilityMonitor` /
-  `buildEncryptionCapabilityFanout`, and never flips it back. From then on
-  it stamps V2 on every request; transactions already in flight keep V1
+  read; a monitor built like `startStorageEnvelopeV2CapabilityMonitor` /
+  `buildEncryptionCapabilityFanout` watches for every voter and learner of
+  every group to report it. The flip itself is **not** a per-process
+  atomic set from that poll: a membership change admitted while this
+  process still sees V1 could race another coordinator that finished its
+  poll and flipped, which would then send a V2 entry to the newly admitted
+  old member and halt it, costing quorum. Activation is therefore a
+  **Raft-serialized epoch**: the monitor proposes a `txn_format_v2`
+  activation entry through each group (the same fatal-to-old-binaries
+  envelope, so an old member that slipped in halts here, loudly, before any
+  data entry), carrying the conf state it validated against; the FSM
+  rejects the entry if the group's current conf state differs (the
+  proposer re-validates and retries), and a membership proposal is
+  rejected while an activation entry is pending or applied unless the
+  joiner advertises the capability. The coordinator flips its atomic
+  `txnFormatV2` (`WithTxnFormatV2`, subsuming `WithTransactionIDs`) only
+  when it applies the activation entry on every group it coordinates, and
+  never flips it back. From then on it stamps V2 on every request; transactions already in flight keep V1
   and finish under V1 semantics (legacy ownership is permanent, A2). An
   operator flag pins the format to V1 for a deployment that must keep an
   old binary around, with a startup warning that the audit's guarantees

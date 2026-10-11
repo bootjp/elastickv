@@ -196,8 +196,12 @@ implementation, per `CLAUDE.md`.
 "Who is this for" section and the two-tier scope once both docs land; the
 consistency claims go into README only after the audit's A0 to A2 fixes,
 the G11 fix (the server-side outcome-unknown error and its mapping in
-every adapter), and G13 (a 2PC PREPARE swallowed as a replay, closed by
-A0's index-based replay detection, with its regression test) are merged
+every adapter), G15 (a forwarded write whose reply is lost after reaching
+the leader is reported as outcome unknown instead of being retried, on
+every data-plane forwarder and the admin forwarder, since a retried
+non-idempotent write applies twice and the fence cannot see it), and G13
+(a 2PC PREPARE swallowed as a replay, closed by A0's index-based replay
+detection, with its regression test) are merged
 **and** A7's transaction-format gate has landed with `txn_format_v2`
 activated cluster-wide: merging alone activates nothing, because V1
 entries deliberately keep the old semantics (the timestamp replay fast
