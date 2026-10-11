@@ -2,6 +2,9 @@ package s3keys_test
 
 import (
 	"context"
+	"io"
+	"log/slog"
+	"strconv"
 	"testing"
 	"time"
 
@@ -471,6 +474,58 @@ func TestOrphanScannerContinuesPastAFailingBlob(t *testing.T) {
 
 	require.Equal(t, [][32]byte{reclaimable.ContentSHA256}, local.deleted,
 		"a blob listed after the failing one must still be reclaimed")
+}
+
+func TestOrphanScannerBoundsRetainedFailures(t *testing.T) {
+	t.Parallel()
+	count := s3keys.MaxRetainedSweepFailures + 6
+	local := &fakeOrphanLocal{blobs: make([]s3keys.LocalChunkBlob, 0, count)}
+	store := &fakeOrphanStore{rcErrs: make(map[[32]byte]error, count)}
+	for n := range count {
+		blob := oldBlob(strconv.Itoa(n))
+		local.blobs = append(local.blobs, blob)
+		store.rcErrs[blob.ContentSHA256] = errors.New("replicated store unavailable")
+	}
+	scanner, err := s3keys.NewChunkBlobOrphanScanner(s3keys.ChunkBlobOrphanScannerOptions{
+		Store: store, Local: local, GracePeriod: orphanGrace,
+		NowTS:  func() uint64 { return orphanNowTS },
+		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	require.NoError(t, err)
+	err = scanner.ScanOnce(context.Background())
+	require.ErrorContains(t, err, "70 of 70 blobs failed (showing 64)")
+	require.Equal(t, count, store.rcReads)
+}
+
+type recordedOrphanObservation struct {
+	verdict s3keys.ChunkBlobOrphanVerdict
+	reason  string
+}
+
+type recordingOrphanObserver struct{ events []recordedOrphanObservation }
+
+func (o *recordingOrphanObserver) ObserveChunkBlobOrphan(verdict s3keys.ChunkBlobOrphanVerdict, reason string) {
+	o.events = append(o.events, recordedOrphanObservation{verdict: verdict, reason: reason})
+}
+
+func TestOrphanScannerReportsReclaimOnlyAfterUnlink(t *testing.T) {
+	t.Parallel()
+	blob := oldBlob("observed")
+	local := &fakeOrphanLocal{blobs: []s3keys.LocalChunkBlob{blob}}
+	clock := &orphanClock{ts: orphanNowTS}
+	observer := &recordingOrphanObserver{}
+	scanner, err := s3keys.NewChunkBlobOrphanScanner(s3keys.ChunkBlobOrphanScannerOptions{
+		Store: &fakeOrphanStore{}, Local: local,
+		GracePeriod: orphanGrace, Interval: orphanScanInterval,
+		NowTS: clock.now, Observer: observer,
+	})
+	require.NoError(t, err)
+	require.NoError(t, scanner.ScanOnce(context.Background()))
+	require.Equal(t, []recordedOrphanObservation{{s3keys.OrphanKeep, s3keys.OrphanReasonPending}}, observer.events)
+	clock.advanceMillis(orphanScanIntervalMs)
+	require.NoError(t, scanner.ScanOnce(context.Background()))
+	require.Equal(t, recordedOrphanObservation{s3keys.OrphanReclaim, s3keys.OrphanReasonNoReferenceRecord}, observer.events[1])
+	require.Len(t, local.deleted, 1)
 }
 
 // A failing unlink must not stop the pass either.

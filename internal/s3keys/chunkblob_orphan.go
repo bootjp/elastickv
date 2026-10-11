@@ -67,6 +67,8 @@ const (
 	OrphanReasonReferenced        = "referenced"
 	OrphanReasonQueueOwnsIt       = "queue_owns_it"
 	OrphanReasonRecordUnreadable  = "record_unreadable"
+	OrphanReasonPending           = "pending"
+	OrphanReasonPayloadChanged    = "payload_changed"
 )
 
 // ChunkBlobOrphanDecision is a verdict plus its reason.
@@ -311,15 +313,21 @@ func (s *ChunkBlobOrphanScanner) ScanOnce(ctx context.Context) error {
 	// lookup or an unlink starved every later orphan indefinitely and local
 	// disk grew without bound. The pass still reports failure afterwards, so
 	// the error is surfaced rather than swallowed.
-	var failures []error
+	var (
+		failures     []error
+		failureCount int
+	)
 	for _, blob := range blobs {
 		if sweepCancelled(ctx) {
 			break
 		}
 		if err := s.scanBlob(ctx, blob, boundary); err != nil {
-			s.logger.WarnContext(ctx, "chunkblob orphan scan: blob failed, continuing",
-				slog.String("err", err.Error()))
-			failures = append(failures, err)
+			failureCount++
+			if len(failures) < MaxRetainedSweepFailures {
+				s.logger.WarnContext(ctx, "chunkblob orphan scan: blob failed, continuing",
+					slog.String("err", err.Error()))
+				failures = append(failures, err)
+			}
 		}
 	}
 	// Marks for blobs that have left the listing are dropped: otherwise a
@@ -327,9 +335,9 @@ func (s *ChunkBlobOrphanScanner) ScanOnce(ctx context.Context) error {
 	// life of the process, so a long-running node accumulates one per
 	// reclaimed blob forever.
 	s.pruneMarks(blobs)
-	if len(failures) > 0 {
+	if failureCount > 0 {
 		return errors.Wrapf(errors.Join(failures...),
-			"orphan scan: %d of %d blobs failed", len(failures), len(blobs))
+			"orphan scan: %d of %d blobs failed (showing %d)", failureCount, len(blobs), len(failures))
 	}
 	return nil
 }
@@ -381,14 +389,15 @@ func (s *ChunkBlobOrphanScanner) scanBlob(
 	}
 
 	decision := ClassifyChunkBlobOrphan(blob, boundary, rcValue, rcFound, queueFound)
-	s.observer.ObserveChunkBlobOrphan(decision.Verdict, decision.Reason)
 	if decision.Verdict != OrphanReclaim {
+		s.observer.ObserveChunkBlobOrphan(OrphanKeep, decision.Reason)
 		s.dropMark(blob.ContentSHA256)
 		return nil
 	}
 	if !s.reclaimable(blob, decision.Reason) {
 		// Marked on this pass; a later pass decides. Counted as a keep so
 		// the metric does not report a reclaim that has not happened.
+		s.observer.ObserveChunkBlobOrphan(OrphanKeep, OrphanReasonPending)
 		return nil
 	}
 	unlinked, err := s.local.DeleteChunkBlobIfUnchanged(ctx, blob.ContentSHA256, blob.WrittenAtTS)
@@ -397,6 +406,7 @@ func (s *ChunkBlobOrphanScanner) scanBlob(
 	}
 	s.dropMark(blob.ContentSHA256)
 	if !unlinked {
+		s.observer.ObserveChunkBlobOrphan(OrphanKeep, OrphanReasonPayloadChanged)
 		// The payload was rewritten between the listing and the unlink, so
 		// a PUT re-anchored it. Leaving it is the whole point of the
 		// condition.
@@ -404,6 +414,7 @@ func (s *ChunkBlobOrphanScanner) scanBlob(
 			slog.String("reason", decision.Reason))
 		return nil
 	}
+	s.observer.ObserveChunkBlobOrphan(OrphanReclaim, decision.Reason)
 	s.logger.InfoContext(ctx, "chunkblob orphan reclaimed",
 		slog.String("reason", decision.Reason))
 	return nil
