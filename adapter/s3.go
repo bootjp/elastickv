@@ -1177,7 +1177,7 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		}
 		if !found {
 			cleanupManifest = nil
-			return nil
+			return validateS3AbsentObjectDelete(r, bucket, objectKey)
 		}
 		if err := s.dispatchConditionalObjectDelete(
 			r, readTimestamp, startTS, headKey, manifest, bucket, objectKey,
@@ -1196,6 +1196,14 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, cleanupManifest)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func validateS3AbsentObjectDelete(r *http.Request, bucket, objectKey string) error {
+	if _, conditional := r.Header[http.CanonicalHeaderKey("If-Match")]; conditional {
+		return newS3ResponseError(http.StatusNotFound, "NoSuchKey",
+			"object not found", bucket, objectKey)
+	}
+	return nil
 }
 
 func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
@@ -2783,12 +2791,15 @@ func (s *S3Server) dispatchConditionalObjectDelete(
 // delete will remove -- not a separately-read one that could have moved
 // in between.
 func validateS3DeletePreconditions(r *http.Request, previous *s3ObjectManifest) error {
-	if r == nil || previous == nil {
+	if r == nil {
 		return nil
 	}
 	values, present := r.Header[http.CanonicalHeaderKey("If-Match")]
 	if !present {
 		return nil
+	}
+	if previous == nil {
+		return errors.New("etag precondition failed")
 	}
 	for _, value := range values {
 		// S3 ETags contain no commas; multiple header lines and HTTP's

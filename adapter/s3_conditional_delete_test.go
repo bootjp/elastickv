@@ -160,10 +160,9 @@ func TestS3UnconditionalDeleteIsUnchanged(t *testing.T) {
 	require.False(t, s3TestObjectExists(t, server))
 }
 
-// Delete stays idempotent for an absent key, with or without the header: S3
-// delete is not an error on a missing object, and a precondition cannot be
-// evaluated against something that does not exist.
-func TestS3ConditionalDeleteOnAnAbsentKeyStaysIdempotent(t *testing.T) {
+// An unconditional delete remains idempotent, while a conditional delete
+// reports that the object whose ETag was to be checked is missing.
+func TestS3ConditionalDeleteOnAnAbsentKey(t *testing.T) {
 	t.Parallel()
 
 	server := newConditionalDeleteS3Server(t)
@@ -172,7 +171,12 @@ func TestS3ConditionalDeleteOnAnAbsentKeyStaysIdempotent(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 
 	rec = deleteS3TestObject(t, server, "never-existed", "deadbeef")
-	require.Equal(t, http.StatusNoContent, rec.Code)
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "NoSuchKey")
+
+	rec = deleteS3TestObject(t, server, "never-existed", "*")
+	require.Equal(t, http.StatusNotFound, rec.Code)
+	require.Contains(t, rec.Body.String(), "NoSuchKey")
 }
 
 // TestValidateS3DeletePreconditions covers the predicate directly, including
@@ -227,10 +231,10 @@ func TestValidateS3DeletePreconditions(t *testing.T) {
 		require.NoError(t, validateS3DeletePreconditions(req, previous))
 	})
 
-	t.Run("nil manifest passes", func(t *testing.T) {
+	t.Run("nil manifest fails with If-Match", func(t *testing.T) {
 		t.Parallel()
 		req := newS3TestRequest(http.MethodDelete, "/b/k", nil)
 		req.Header.Set("If-Match", "abc123")
-		require.NoError(t, validateS3DeletePreconditions(req, nil))
+		require.Error(t, validateS3DeletePreconditions(req, nil))
 	})
 }
