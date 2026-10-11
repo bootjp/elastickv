@@ -161,13 +161,17 @@ func (d *DynamoDBServer) migrateLegacyItem(
 	if err != nil {
 		return err
 	}
-	unlock := d.lockItemUpdate(lockKey)
+	unlock, err := d.lockItemUpdate(ctx, lockKey)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb legacy-item migration: begin read timestamp")
+		sealKey := dynamoItemSnapshotSealKey(targetSchema.TableName, targetKey)
+		readTimestamp, err := d.beginTxnWriteTimestamp(ctx, "dynamodb legacy-item migration: begin read timestamp", [][]byte{sealKey})
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -180,6 +184,7 @@ func (d *DynamoDBServer) migrateLegacyItem(
 			return nil
 		}
 		req.StartTS = readTS
+		req.ReadKeys = append(req.ReadKeys, sealKey)
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
 			return nil

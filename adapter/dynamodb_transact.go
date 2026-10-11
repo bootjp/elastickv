@@ -233,22 +233,14 @@ func (d *DynamoDBServer) executeBatchWriteRequest(
 	tableName string,
 	request batchWriteRequest,
 ) error {
-	schema, exists, err := d.loadTableSchema(ctx, tableName)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if !exists {
-		return newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
-	}
-	keyAttrs, err := batchWriteRequestKey(schema, request)
+	lockKey, err := d.batchWriteRequestLockKey(ctx, tableName, request)
 	if err != nil {
 		return err
 	}
-	lockKey, err := dynamoItemUpdateLockKey(tableName, keyAttrs)
+	unlock, err := d.lockItemUpdate(ctx, lockKey)
 	if err != nil {
-		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+		return err
 	}
-	unlock := d.lockItemUpdate(lockKey)
 	defer unlock()
 	switch countBatchWriteActions(request) {
 	case 1:
@@ -271,6 +263,29 @@ func (d *DynamoDBServer) executeBatchWriteRequest(
 	default:
 		return newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "invalid batch write request")
 	}
+}
+
+func (d *DynamoDBServer) batchWriteRequestLockKey(ctx context.Context, tableName string, request batchWriteRequest) (string, error) {
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb batch item lock schema: begin read timestamp")
+	if err != nil {
+		return "", err
+	}
+	schema, exists, err := d.loadTableSchemaAt(ctx, tableName, readTimestamp.Timestamp())
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	if !exists {
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
+	}
+	keyAttrs, err := batchWriteRequestKey(schema, request)
+	if err != nil {
+		return "", err
+	}
+	lockKey, err := dynamoItemUpdateLockKey(tableName, keyAttrs)
+	if err != nil {
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	return lockKey, nil
 }
 
 func batchWriteRequestKey(schema *dynamoTableSchema, request batchWriteRequest) (map[string]attributeValue, error) {
@@ -660,11 +675,17 @@ func countTransactWriteItemActions(item transactWriteItem) int {
 }
 
 func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in transactWriteItemsInput) error {
+	unlock, sealKeys, err := d.lockTransactWriteItems(ctx, in)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	var lastErr error
 	for range transactRetryMaxAttempts {
-		reqs, generations, cleanupKeys, err := d.buildTransactWriteItemsRequest(ctx, in)
+		reqs, generations, cleanupKeys, err := d.buildTransactWriteItemsRequest(ctx, in, sealKeys)
 		if err != nil {
 			return err
 		}
@@ -729,17 +750,11 @@ type preparedTransactWriteItemsRequest struct {
 	group         *kv.OperationGroup[kv.OP]
 }
 
-func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput) (*preparedTransactWriteItemsRequest, map[string]uint64, [][]byte, error) {
-	tableNames, err := collectTransactWriteTableNames(in)
-	if err != nil {
-		return nil, nil, nil, err
-	}
-	for _, tableName := range tableNames {
-		if err := d.ensureLegacyTableMigration(ctx, tableName); err != nil {
-			return nil, nil, nil, err
-		}
-	}
-	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb transact-write: begin read timestamp")
+func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput, sealKeys [][]byte) (*preparedTransactWriteItemsRequest, map[string]uint64, [][]byte, error) {
+	// transactWriteItemsWithRetry completes legacy migration before acquiring
+	// item locks. Re-entering table locks here would deadlock BatchWriteItem,
+	// which holds a table lock while waiting for an item lock.
+	readTimestamp, err := d.beginTxnWriteTimestamp(ctx, "dynamodb transact-write: begin read timestamp", sealKeys)
 	if err != nil {
 		return nil, nil, nil, errors.WithStack(err)
 	}
@@ -751,6 +766,7 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 		// are detected as write conflicts at commit time.
 		StartTS: readTS,
 	}
+	reqs.ReadKeys = append(reqs.ReadKeys, sealKeys...)
 	schemaCache := make(map[string]*dynamoTableSchema)
 	tableGenerations := make(map[string]uint64)
 	cleanup := make([][]byte, 0, len(in.TransactItems))
@@ -828,6 +844,18 @@ func (d *DynamoDBServer) processTransactWriteItem(
 // only hash/range key fields are used for duplicate detection, regardless of
 // whether the operation carries a full Item (Put) or a Key-only map (Update/Delete/ConditionCheck).
 func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWriteItem) (string, error) {
+	keyAttrs, err := transactWriteItemPrimaryKeyAttributes(schema, item)
+	if err != nil {
+		return "", err
+	}
+	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
+	if err != nil {
+		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
+	return keyStr, nil
+}
+
+func transactWriteItemPrimaryKeyAttributes(schema *dynamoTableSchema, item transactWriteItem) (map[string]attributeValue, error) {
 	var rawAttrs map[string]attributeValue
 	switch {
 	case item.Update != nil:
@@ -839,19 +867,15 @@ func transactWriteItemPrimaryKeyStr(schema *dynamoTableSchema, item transactWrit
 	case item.Put != nil:
 		rawAttrs = item.Put.Item
 	default:
-		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, "unsupported transact item")
 	}
 	keyAttrs, err := primaryKeyAttributes(schema.PrimaryKey, rawAttrs)
 	if err != nil {
 		// primaryKeyAttributes already returns a dynamoAPIError; return it directly
 		// to preserve its status code and error type.
-		return "", err
+		return nil, err
 	}
-	keyStr, err := canonicalPrimaryKeyStr(schema.PrimaryKey, keyAttrs)
-	if err != nil {
-		return "", newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
-	}
-	return keyStr, nil
+	return keyAttrs, nil
 }
 
 type transactWriteItemPlan struct {

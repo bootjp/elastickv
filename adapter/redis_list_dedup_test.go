@@ -347,18 +347,15 @@ func deltaLookingListMetaUserKeyAt(fakeUserKey []byte, commitTS uint64, seqInTxn
 }
 
 func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if isDynamoSnapshotSealRequest(req) {
+		return c.occAdapterCoordinator.Dispatch(ctx, req)
+	}
 	c.dispatches++
 	n := c.dispatches
 	if c.beforeDispatch != nil {
 		c.beforeDispatch(n)
 	}
-	if c.shouldRouteFence(n) {
-		return nil, kv.ErrRouteWriteFenced
-	}
-	if c.shouldComposedRouteError(n) {
-		return nil, kv.ErrComposed1Violation
-	}
-	if handled, resp, err := c.maybeProbe(ctx, req); handled {
+	if handled, resp, err := c.beforeApply(ctx, req, n); handled {
 		return resp, err
 	}
 	if err := c.preApplyError(n); err != nil {
@@ -380,6 +377,16 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 		return nil, c.maybeWireWriteConflict(req, store.ErrWriteConflict)
 	}
 	return resp, nil
+}
+
+func (c *dedupTestCoordinator) beforeApply(ctx context.Context, req *kv.OperationGroup[kv.OP], n int) (bool, *kv.CoordinateResponse, error) {
+	if c.shouldRouteFence(n) {
+		return true, nil, kv.ErrRouteWriteFenced
+	}
+	if c.shouldComposedRouteError(n) {
+		return true, nil, kv.ErrComposed1Violation
+	}
+	return c.maybeProbe(ctx, req)
 }
 
 func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.OP], err error) error {

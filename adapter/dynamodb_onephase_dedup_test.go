@@ -165,7 +165,7 @@ func TestItemWriteDedup_PhaseDVouchesReuse(t *testing.T) {
 
 	require.Equal(t, []string{"1", "2", "3"}, readListValues(t, server, schema))
 	require.Equal(t, 2, coord.dispatches)
-	require.Equal(t, uint64(2), coord.vouches.Load(), "first attempt and reused write set must each reserve a Phase-D dispatch voucher")
+	require.Equal(t, uint64(1), coord.vouches.Load(), "the applied pre-D floor needs a voucher; item writes reuse the durable seal timestamp")
 }
 
 // TestItemWriteDedup_SelfInflictedReuseConflict_ReturnsSuccess: attempt 1
@@ -219,7 +219,7 @@ func TestItemWriteDedup_GenuineConflictRecomputes(t *testing.T) {
 			"val": numberListAttr("1", "2", "99"),
 		})
 		require.NoError(t, encErr)
-		require.NoError(t, st.PutAt(ctx, itemKey, body, 100, 0))
+		require.NoError(t, st.PutAt(ctx, itemKey, body, st.LastCommitTS()+1000, 0))
 	}
 
 	plan, err := server.updateItemWithRetry(ctx, appendListInput())

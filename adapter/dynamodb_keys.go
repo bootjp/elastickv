@@ -3,7 +3,9 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"strconv"
 	"strings"
 
@@ -67,6 +69,14 @@ func dynamoTableMetaKey(tableName string) []byte {
 
 func dynamoTableGenerationKey(tableName string) []byte {
 	return []byte(dynamoTableGenerationPrefix + encodeDynamoSegment(tableName))
+}
+
+// The non-numeric generation keeps this key outside every item scan while
+// routing it with its table. Hashing the canonical item key avoids exposing
+// attribute values and gives each item an independent OCC seal.
+func dynamoItemSnapshotSealKey(tableName string, itemKey []byte) []byte {
+	digest := sha256.Sum256(itemKey)
+	return []byte(dynamoItemPrefix + encodeDynamoSegment(tableName) + "|!snapshot-seal|" + hex.EncodeToString(digest[:]))
 }
 
 func dynamoItemPrefixForTable(tableName string, generation uint64) []byte {
