@@ -20,6 +20,7 @@ func TestScopeForKey(t *testing.T) {
 	}{
 		{name: "dynamodb meta", key: []byte(DDBTableMetaPrefix + enc("orders")), want: Scope{Adapter: "dynamodb", Name: "orders"}, scoped: true},
 		{name: "dynamodb generation", key: []byte(DDBTableGenPrefix + enc("orders")), scoped: false},
+		{name: "dynamodb snapshot seal", key: []byte(DDBSealPrefix + enc("orders") + "|1|abcd"), scoped: false},
 		{name: "s3 bucket", key: s3keys.BucketMetaKey("photos"), want: Scope{Adapter: "s3", Name: "photos"}, scoped: true},
 		{name: "sqs metadata", key: []byte(SQSQueueMetaPrefix + enc("jobs")), want: Scope{Adapter: "sqs", Name: "jobs"}, scoped: true},
 		{name: "sqs sequence", key: []byte(SQSQueueSeqPrefix + enc("jobs")), scoped: false},
@@ -49,6 +50,13 @@ func TestScopeForKey(t *testing.T) {
 			require.Equal(t, tc.want, got)
 		})
 	}
+}
+
+func TestAdapterForKeyRecognizesDynamoSnapshotSeal(t *testing.T) {
+	t.Parallel()
+	adapter, ok := AdapterForKey([]byte(DDBSealPrefix + "b3JkZXJz|1|abcd"))
+	require.True(t, ok)
+	require.Equal(t, "dynamodb", adapter)
 }
 
 func TestScopeForKeyRejectsMalformedRecognizedKey(t *testing.T) {

@@ -657,6 +657,57 @@ func (s *LeaderRoutedStore) LastCommitTS() uint64 {
 	return s.local.LastCommitTS()
 }
 
+// GlobalCommittedTimestampFloor obtains the single data group's strictly
+// fenced watermark from its leader. Follower-facing DynamoDB requests can
+// reach this wrapper when HTTP leader forwarding is not configured.
+func (s *LeaderRoutedStore) GlobalCommittedTimestampFloor(ctx context.Context) (uint64, error) {
+	if s == nil || s.local == nil || s.coordinator == nil {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	if s.coordinator.IsLeader() {
+		return s.GroupCommittedTimestampFloor(ctx, 1)
+	}
+	addr := s.coordinator.RaftLeader()
+	if addr == "" {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	conn, err := s.connCache.ConnFor(addr)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	requestCtx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
+	resp, err := pb.NewRawKVClient(conn).RawLatestCommitTS(requestCtx, &pb.RawLatestCommitTSRequest{GroupId: 1})
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if !resp.GetLeaderFenced() || resp.GetGroupId() != 1 {
+		return 0, errors.WithStack(ErrTSOCommitFloorUnavailable)
+	}
+	return resp.GetTs(), nil
+}
+
+// A LeaderRoutedStore contains one data group, independent of the key count.
+func (s *LeaderRoutedStore) CommittedTimestampFloorForKeys(ctx context.Context, keys [][]byte) (uint64, error) {
+	if len(keys) == 0 {
+		return 0, errors.WithStack(ErrTSOCommitFloorUnavailable)
+	}
+	return s.GlobalCommittedTimestampFloor(ctx)
+}
+
+// GroupCommittedTimestampFloor waits for Raft ReadIndex before sampling the
+// local applied watermark. A leader lease alone does not wait for a pending
+// committed entry whose timestamp is below LastCommitTS.
+func (s *LeaderRoutedStore) GroupCommittedTimestampFloor(ctx context.Context, groupID uint64) (uint64, error) {
+	if s == nil || s.local == nil || s.coordinator == nil || groupID != 1 || !s.coordinator.IsLeader() {
+		return 0, errors.WithStack(ErrLeaderNotFound)
+	}
+	if _, err := s.coordinator.LinearizableRead(ctx); err != nil {
+		return 0, errors.WithStack(err)
+	}
+	return s.local.LastCommitTS(), nil
+}
+
 // WriteConflictCountsByPrefix delegates to the local MVCC store. The
 // leader-routed wrapper does not add cross-group conflict detection of
 // its own, so the node-local view IS the authoritative view.

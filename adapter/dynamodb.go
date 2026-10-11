@@ -70,6 +70,7 @@ const (
 	dynamoTableMetaPrefix       = kv.DynamoTableMetaPrefix
 	dynamoTableGenerationPrefix = kv.DynamoTableGenerationPrefix
 	dynamoItemPrefix            = kv.DynamoItemPrefix
+	dynamoSealPrefix            = kv.DynamoSealPrefix
 	dynamoGSIPrefix             = kv.DynamoGSIPrefix
 	dynamoScanPageLimit         = 1024
 	dynamoKeyEscapeByte         = byte(0x00)
@@ -124,7 +125,7 @@ type DynamoDBServer struct {
 	targetHandlers  map[string]func(http.ResponseWriter, *http.Request)
 	readTracker     *kv.ActiveTimestampTracker
 	requestObserver monitoring.DynamoDBRequestObserver
-	itemUpdateLocks [itemUpdateLockStripeCount]sync.Mutex
+	itemUpdateLocks [itemUpdateLockStripeCount]chan struct{}
 	tableLocks      [tableLockStripeCount]sync.Mutex
 	leaderDynamo    map[string]string
 
@@ -263,6 +264,10 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		store:            st,
 		coordinator:      kv.WithKeyVizLabel(coordinate, keyviz.LabelDynamo),
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") != "0",
+	}
+	for i := range d.itemUpdateLocks {
+		d.itemUpdateLocks[i] = make(chan struct{}, 1)
+		d.itemUpdateLocks[i] <- struct{}{}
 	}
 	d.targetHandlers = map[string]func(http.ResponseWriter, *http.Request){
 		createTableTarget:        d.createTable,
