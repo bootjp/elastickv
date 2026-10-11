@@ -33,6 +33,7 @@ type Registry struct {
 	tsoObserver   *TSOObserver
 	snapOffload   *SnapshotOffloadMetrics
 	encryption    *EncryptionMetrics
+	encryptionObs *EncryptionStateObserver
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -67,6 +68,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.tsoObserver = newTSOObserver(r.tso)
 	r.snapOffload = newSnapshotOffloadMetrics(registerer)
 	r.encryption = newEncryptionMetrics(registerer)
+	r.encryptionObs = newEncryptionStateObserver(r.encryption)
 	return r
 }
 
@@ -315,6 +317,26 @@ func (r *Registry) SnapshotOffloadObserver() *SnapshotOffloadMetrics {
 // Returns nil for a nil registry so a node running without metrics
 // wires a nil observer rather than a panicking stub.
 func (r *Registry) EncryptionObserver() EncryptionObserver {
+	if r == nil || r.encryption == nil {
+		return nil
+	}
+	return r.encryption
+}
+
+// EncryptionStateObserver returns the collector that mirrors sidecar
+// state (active DEK ids, sidecar raft_applied_index) into the §9.2
+// gauges. Start it with the process-shared encryption StateCache.
+func (r *Registry) EncryptionStateObserver() *EncryptionStateObserver {
+	if r == nil {
+		return nil
+	}
+	return r.encryptionObs
+}
+
+// KEKUnwrapObserver returns the observer that records KEK unwrap
+// latency. Pass it to monitoring.NewTimedKEKUnwrapper alongside the
+// loaded KEK source.
+func (r *Registry) KEKUnwrapObserver() KEKUnwrapObserver {
 	if r == nil || r.encryption == nil {
 		return nil
 	}
