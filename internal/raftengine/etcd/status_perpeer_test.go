@@ -97,6 +97,10 @@ func TestStatusPerPeerIsEmptyNotNilOnAPeerlessLeader(t *testing.T) {
 	require.NotNil(t, status.PerPeer,
 		"a leader with no remote replicas must report an empty map, not nil")
 	require.Empty(t, status.PerPeer)
+	require.NoError(t, leader.engine.Close())
+	require.Equal(t, raftengine.StateShutdown, leader.engine.Status().State)
+	require.Nil(t, leader.engine.Status().PerPeer,
+		"shutdown must not retain a leader's peer progress")
 }
 
 // TestStatusPerPeerIsNilOnAFollower pins the nil-versus-empty

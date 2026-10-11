@@ -3934,6 +3934,7 @@ func (e *Engine) refreshStatus() {
 	e.status = status
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
+		e.status.PerPeer = nil
 	}
 	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
 	// cluster correctly hits the leader-of-1 fast path: a learner does
@@ -3998,6 +3999,7 @@ func (e *Engine) shutdown() {
 	wasLeader := e.status.State == raftengine.StateLeader
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
+	e.status.PerPeer = nil
 	e.mu.Unlock()
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
@@ -4056,6 +4058,7 @@ func (e *Engine) fail(err error) {
 	}
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
+	e.status.PerPeer = nil
 	e.mu.Unlock()
 	// Signal the run loop so that callers which invoke fail without returning
 	// from run themselves (notably handleStep) still exit on the next select.
