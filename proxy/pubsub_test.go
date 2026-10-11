@@ -2,6 +2,7 @@ package proxy
 
 import (
 	"errors"
+	"io"
 	"net"
 	"sync"
 	"testing"
@@ -76,6 +77,14 @@ func (m *mockDetachedConn) WriteBulk(bulk []byte) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.writes = append(m.writes, "BULK:"+string(bulk))
+}
+func (m *mockDetachedConn) WriteBulkFrom(n int64, reader io.Reader) {
+	bulk, err := io.ReadAll(io.LimitReader(reader, n))
+	if err != nil {
+		m.WriteError(err.Error())
+		return
+	}
+	m.WriteBulk(bulk)
 }
 func (m *mockDetachedConn) WriteBulkString(bulk string) {
 	m.mu.Lock()
