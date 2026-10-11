@@ -352,6 +352,7 @@ func buildPrefixRoutes() []prefixRoute {
 		{[]byte(DDBTableMetaPrefix), routeDDBTableMeta},
 		{[]byte(DDBTableGenPrefix), routeDDBTableGen},
 		{[]byte(DDBItemPrefix), routeDDBItem},
+		{[]byte(DDBSealPrefix), routeInternalDrop},
 		{[]byte(DDBGSIPrefix), routeDDBGSI},
 		// S3
 		{[]byte(S3BucketMetaPrefix), routeS3BucketMeta},
