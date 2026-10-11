@@ -1271,6 +1271,7 @@ func dynamoExactCleanupRouteKey(prefix []byte) ([]byte, bool) {
 	case bytes.HasPrefix(prefix, dynamoTableMetaPrefixBytes),
 		bytes.HasPrefix(prefix, dynamoTableGenerationPrefixBytes),
 		bytes.HasPrefix(prefix, dynamoItemPrefixBytes),
+		bytes.HasPrefix(prefix, dynamoSealPrefixBytes),
 		bytes.HasPrefix(prefix, dynamoGSIPrefixBytes):
 	default:
 		return nil, false
@@ -1310,6 +1311,7 @@ var routeMappedRawPrefixes = append([][]byte{
 	[]byte(DynamoTableMetaPrefix),
 	[]byte(DynamoTableGenerationPrefix),
 	[]byte(DynamoItemPrefix),
+	[]byte(DynamoSealPrefix),
 	[]byte(DynamoGSIPrefix),
 	[]byte(store.ListMetaPrefix),
 	[]byte(store.ListItemPrefix),

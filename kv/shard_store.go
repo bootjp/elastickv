@@ -5931,6 +5931,31 @@ func (s *ShardStore) GlobalCommittedTimestampFloor(ctx context.Context) (uint64,
 	return s.parallelCommittedTimestampFloor(ctx, ids)
 }
 
+// CommittedTimestampFloorForKeys fences only the data groups that own keys.
+// DynamoDB table metadata, items, and seals share a table route, so an outage
+// in an unrelated group must not prevent a write to a healthy table.
+func (s *ShardStore) CommittedTimestampFloorForKeys(ctx context.Context, keys [][]byte) (uint64, error) {
+	if s == nil || len(keys) == 0 {
+		return 0, errors.WithStack(ErrTSOCommitFloorUnavailable)
+	}
+	seen := make(map[uint64]struct{}, len(keys))
+	ids := make([]uint64, 0, len(keys))
+	for _, key := range keys {
+		route, group, ok := s.routeAndGroupForKey(key)
+		if !ok || route.GroupID == 0 || group == nil || group.Store == nil {
+			return 0, errors.Wrapf(ErrTSOCommitFloorUnavailable, "key %q has no data group", key)
+		}
+		if _, exists := seen[route.GroupID]; !exists {
+			seen[route.GroupID] = struct{}{}
+			ids = append(ids, route.GroupID)
+		}
+	}
+	if len(ids) == 1 {
+		return s.singleGroupCommittedTimestampFloor(ctx, ids[0])
+	}
+	return s.parallelCommittedTimestampFloor(ctx, ids)
+}
+
 func (s *ShardStore) tsoCommitFloorGroupIDs() ([]uint64, error) {
 	ids := make([]uint64, 0, len(s.groups))
 	for groupID, group := range s.groups {
