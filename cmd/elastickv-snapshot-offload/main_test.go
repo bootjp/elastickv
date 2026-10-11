@@ -11,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -130,4 +131,49 @@ func seedCLISnapshot(t *testing.T, root string, payload []byte, index uint64, te
 	})
 	require.NoError(t, err)
 	return dataDir
+}
+
+// TestClassifyErrorKeepsMissingSnapshotAsADataError pins the CLI exit
+// contract across the ErrNoPersistedSnapshot split.
+//
+// Automation distinguishes "missing or invalid snapshot data" (2) from
+// "bad invocation" (1). Giving the missing-local-snapshot case its own
+// sentinel — so the scheduler could stop treating a vanished remote
+// object as a routine skip — must not silently move it to exit 1.
+func TestClassifyErrorKeepsMissingSnapshotAsADataError(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{
+			name: "data dir has no persisted snapshot",
+			err:  errors.Wrap(snapshotoffload.ErrNoPersistedSnapshot, "publish"),
+			want: exitDataErr,
+		},
+		{
+			name: "object absent from the store",
+			err:  errors.Wrap(snapshotoffload.ErrObjectNotFound, "publish"),
+			want: exitDataErr,
+		},
+		{
+			name: "integrity failure",
+			err:  errors.Wrap(snapshotoffload.ErrIntegrity, "restore"),
+			want: exitDataErr,
+		},
+		{
+			name: "invalid invocation",
+			err:  errors.Wrap(snapshotoffload.ErrInvalidOptions, "publish"),
+			want: exitUserErr,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, tc.want, classifyError(tc.err))
+		})
+	}
 }
