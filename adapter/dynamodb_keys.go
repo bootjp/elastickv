@@ -3,7 +3,9 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"strconv"
 	"strings"
 
@@ -67,6 +69,18 @@ func dynamoTableMetaKey(tableName string) []byte {
 
 func dynamoTableGenerationKey(tableName string) []byte {
 	return []byte(dynamoTableGenerationPrefix + encodeDynamoSegment(tableName))
+}
+
+// A separate internal family keeps seals out of logical backups. The two-byte
+// hash bounds retained seal rows to 65,536 per table generation while making
+// unrelated items very unlikely to contend on the same OCC key.
+func dynamoItemSnapshotSealKey(tableName string, generation uint64, itemKey []byte) []byte {
+	digest := sha256.Sum256(itemKey)
+	return append(dynamoSealPrefixForTable(tableName, generation), hex.EncodeToString(digest[:2])...)
+}
+
+func dynamoSealPrefixForTable(tableName string, generation uint64) []byte {
+	return []byte(dynamoSealPrefix + encodeDynamoSegment(tableName) + "|" + strconv.FormatUint(generation, 10) + "|")
 }
 
 func dynamoItemPrefixForTable(tableName string, generation uint64) []byte {

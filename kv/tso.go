@@ -184,6 +184,18 @@ func DispatchWithReadTimestamp(
 	return resp, errors.WithStack(err)
 }
 
+type leaderIssuedCommitTSContextKey struct{}
+
+// DispatchWithLeaderIssuedCommitTS asks the owning data-group leader to assign
+// the commit timestamp when the caller supplies none. It retains the applied
+// read-timestamp voucher required for Phase-D dispatch.
+func DispatchWithLeaderIssuedCommitTS(ctx context.Context, coord Coordinator, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	return DispatchWithReadTimestamp(context.WithValue(ctx, leaderIssuedCommitTSContextKey{}, true), coord, reqs)
+}
+
 func newAppliedReadDispatchVoucher() *appliedReadDispatchVoucher {
 	id := nextAppliedReadDispatchVoucherID.Add(1)
 	if id == 0 {

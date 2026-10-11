@@ -38,7 +38,7 @@ func (c *localAdapterCoordinator) Dispatch(ctx context.Context, req *kv.Operatio
 	if err := c.applyElems(ctx, req.Elems, commitTS); err != nil {
 		return nil, err
 	}
-	return &kv.CoordinateResponse{}, nil
+	return &kv.CoordinateResponse{CommitTS: commitTS}, nil
 }
 
 // validateDispatchShape mirrors the production coordinator's
