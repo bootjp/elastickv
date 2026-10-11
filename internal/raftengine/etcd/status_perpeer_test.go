@@ -71,7 +71,9 @@ func TestStatusPerPeerReportsLearnerProgressOnTheLeader(t *testing.T) {
 	}, 10*time.Second, 25*time.Millisecond,
 		"the learner must be observed catching up to the leader's commit index")
 
-	_, err = leader.engine.PromoteLearner(ctx, nodes[1].peer.ID, 0, target, false)
+	promoteCtx, promoteCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer promoteCancel()
+	_, err = leader.engine.PromoteLearner(promoteCtx, nodes[1].peer.ID, 0, target, false)
 	require.NoError(t, err,
 		"promotion at the observed catch-up target must satisfy the precondition")
 }

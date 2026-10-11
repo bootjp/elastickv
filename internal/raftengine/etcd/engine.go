@@ -3904,7 +3904,9 @@ func (e *Engine) peerProgress(state raftengine.State) map[uint64]raftengine.Peer
 }
 
 func (e *Engine) refreshStatus() {
-	previous := e.Status().State
+	e.mu.RLock()
+	previous := e.status.State
+	e.mu.RUnlock()
 	basic := e.rawNode.BasicStatus()
 	lastLogIndex, _ := e.storage.LastIndex()
 	snapshot, _ := e.storage.Snapshot()
