@@ -259,7 +259,7 @@ func storageRetirementBlockers(
 		}
 		// Strictly greater: a minRetainedTS EQUAL to the largest
 		// commit_ts still admits a read at exactly that version.
-		if r.MinRetainedTS <= largestCommitTS {
+		if largestCommitTS != 0 && r.MinRetainedTS <= largestCommitTS {
 			blockers = append(blockers,
 				fmt.Sprintf("%s: minRetainedTS %d has not advanced past commit_ts %d",
 					node, r.MinRetainedTS, largestCommitTS))

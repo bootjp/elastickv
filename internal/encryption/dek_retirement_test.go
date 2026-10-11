@@ -52,6 +52,11 @@ func TestStorageRetirementRejectsUnboundHighWaterMark(t *testing.T) {
 	d, err := classifyStorage(retireMembers, reports, retiringKeyID, 0)
 	require.NoError(t, err)
 	require.True(t, d.Eligible, "an observed zero high-water mark means this key was unused")
+	d, err = classifyStorage(retireMembers, []encryption.StorageRetirementReport{
+		readyStorage("n1", 0), readyStorage("n2", 0), readyStorage("n3", 0),
+	}, retiringKeyID, 0)
+	require.NoError(t, err)
+	require.True(t, d.Eligible, "an unused key has no version to retain even at the initial retention floor")
 }
 
 func TestRetirementRejectsReportsOutsideMembership(t *testing.T) {
