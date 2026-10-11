@@ -349,12 +349,16 @@ Open after this branch:
   DynamoDB `GetItem` / `Query` / `Scan`, S3 `GET` / `LIST`, and the SQS
   peek read at the local watermark without the capability. A single-key
   read is a leader read on one group and unaffected; a range read whose
-  page spans two groups can be torn. There is no multi-key point read to
-  worry about (the Redis adapter implements no `MGET` and the DynamoDB
-  adapter no `BatchGetItem`). The one to close is a DynamoDB `Query` /
-  `Scan` page under `ConsistentRead` whose range crosses a split, which
-  upstream serves from one snapshot; it should route through a snapshot
-  read. Recorded as a limit.
+  page spans two groups can be torn. Two paths to close: a DynamoDB
+  `Query` / `Scan` page under `ConsistentRead` whose range crosses a split
+  (upstream serves it from one snapshot), and **`TransactGetItems`**
+  (`adapter/dynamodb_transact.go`), which reads up to 100 point keys at one
+  `nextTxnReadTS()` snapshot and can span groups: a lagging participant
+  can later apply `c ≤ readTS`, so the supposedly atomic result is torn.
+  Both must begin a leader snapshot over the groups they route to and read
+  under the capability, with tests in the completion set. (The Redis
+  adapter implements no `MGET` and the DynamoDB adapter no
+  `BatchGetItem`, so these two are the multi-key reads that exist.)
 - **Rolling upgrade.** Older followers skip the `0x0f` entry (a fence
   verdict divergence of the A0 class), an older node forwarding a snapshot
   read through the public `RawGet` gets `FailedPrecondition` from an
@@ -1680,10 +1684,16 @@ list was written. What landed, and where it refines the design below:
   unknown; a locally taken snapshot cannot cover an unresolved index
   because it is taken at the applied index. Leadership loss now fails only
   pending reads; shutdown and `fail` give pending writes the unknown class
-  with the cause kept in the chain; a context that expires after the entry
-  reached the log yields unknown, before it a plain context error, with no
-  race against resolution (stores refuse an ended context, sends happen
-  under the pending lock). Rejections before the log stay definite.
+  with the cause kept in the chain; a context that expires after
+  `rawNode.Propose` returned success yields unknown, because `Propose`
+  appends the entry synchronously while the `(index, term)` is learned only
+  from the next `Ready.Entries`, so "not yet tracked" is not "not in the
+  log" (the implemented branch classified that gap as a plain context
+  error, which a caller could retry: a fix to carry into the branch); a
+  context that expires before `Propose` was called, or when `Propose`
+  returned an error, is a plain context error, with no race against
+  resolution (stores refuse an ended context, sends happen under the
+  pending lock). Rejections before the log stay definite.
 - kv (`kv/outcome_unknown.go`): `IsOutcomeUnknown`, the wire prefix,
   `markForwardedOutcomeUnknown`; `isLeadershipLossError` and
   `isTransientLeaderError` check the class first so the "not leader" text
@@ -1887,17 +1897,33 @@ sections defer to is therefore two-sided:
   coordinator retries the work as V2; a delayed V1 one-phase entry can no
   longer bypass the fence, and a V1 transaction that read before
   activation can no longer lock after it, which is the G1 shape a V1
-  PREPARE racing a V2 one-phase transaction would reopen), and accepts a
-  V1 COMMIT or ABORT only against an existing legacy-shape lock, so
-  already-prepared V1 transactions finish or are settled by the resolver
-  (legacy ownership is permanent, A2). The coordinator flips its atomic
-  `txnFormatV2` (`WithTxnFormatV2`, subsuming `WithTransactionIDs`) when
-  it applies the activation entry on every group it coordinates, and never
-  flips it back; the point at which the audit's guarantees hold, recorded
-  in the `raft-engine` marker as "V2 in effect" and the precondition for
-  the roadmap's README claims, is when every group reports no
-  legacy-shape lock row left (a namespace scan the monitor repeats; the
-  resolver settles expired ones). An operator flag pins the format to V1
+  PREPARE racing a V2 one-phase transaction would reopen), and does not
+  let an in-flight V1 transaction **commit** under V1 semantics either,
+  since those semantics carry the reproduced G12 and G14 failures (an
+  aliased or half-prepared V1 transaction whose COMMIT publishes the
+  primary and skips a secondary, removing the last lock row as it does so,
+  which an empty lock namespace would then mistake for a clean finish): a
+  V1 **primary** COMMIT is rejected with a retryable abort (the coordinator
+  retries the whole transaction as V2), a V1 ABORT is accepted against an
+  existing legacy lock, and a V1 **secondary** COMMIT is accepted only for
+  an identity whose legacy commit record already exists on the primary
+  group (the coordinator verifies the record before proposing, as the
+  resolver does), so a transaction that reached its commit point before
+  activation is published, and a missing lock there fails loudly with
+  `ErrTxnWriteLost` rather than skipping. The resolver settles every
+  remaining legacy lock from its primary's record. The coordinator flips
+  its atomic `txnFormatV2` (`WithTxnFormatV2`, subsuming
+  `WithTransactionIDs`) when it applies the activation entry on every group
+  it coordinates, and never flips it back; the point at which the audit's
+  guarantees hold, recorded in the `raft-engine` marker as "V2 in effect"
+  and the precondition for the roadmap's README claims, is when every
+  group reports no legacy-shape lock row left **and** every legacy commit
+  record written since activation has had its secondaries confirmed
+  (the coordinator's outstanding list drains to zero, the resolver having
+  settled the rest), a verification of outcomes, not merely of an empty
+  lock namespace. A V1 transaction that completed in a partial state
+  before activation is pre-existing damage that activation cannot detect;
+  the claims are forward-looking from "V2 in effect". An operator flag pins the format to V1
   for a deployment that must keep an old binary around, with a startup
   warning that the audit's guarantees are off.
 - **Refusal on the old side.** A V2 entry must never be *applied* by an
