@@ -24,6 +24,7 @@ const (
 	DDBTableMetaPrefix = "!ddb|meta|table|"
 	DDBTableGenPrefix  = "!ddb|meta|gen|"
 	DDBItemPrefix      = "!ddb|item|"
+	DDBSealPrefix      = "!ddb|seal|"
 	DDBGSIPrefix       = "!ddb|gsi|"
 
 	defaultDDBBundleSizeBytes = 64 << 20
