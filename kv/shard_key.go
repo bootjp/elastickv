@@ -24,6 +24,8 @@ const (
 	DynamoTableGenerationPrefix = "!ddb|meta|gen|"
 	// DynamoItemPrefix prefixes DynamoDB item storage keys.
 	DynamoItemPrefix = "!ddb|item|"
+	// DynamoSealPrefix holds bounded internal OCC snapshot seals.
+	DynamoSealPrefix = "!ddb|seal|"
 	// DynamoGSIPrefix prefixes DynamoDB GSI storage keys.
 	DynamoGSIPrefix = "!ddb|gsi|"
 )
@@ -57,6 +59,7 @@ var (
 	dynamoTableMetaPrefixBytes       = []byte(DynamoTableMetaPrefix)
 	dynamoTableGenerationPrefixBytes = []byte(DynamoTableGenerationPrefix)
 	dynamoItemPrefixBytes            = []byte(DynamoItemPrefix)
+	dynamoSealPrefixBytes            = []byte(DynamoSealPrefix)
 	dynamoGSIPrefixBytes             = []byte(DynamoGSIPrefix)
 	sqsInternalPrefixBytes           = []byte(sqsInternalPrefix)
 	sqsGlobalRouteKey                = []byte(sqsRoutePrefix + "global")
@@ -101,6 +104,7 @@ var (
 	)
 	dynamoTablePrefixWriteFamilies = [][]byte{
 		[]byte(DynamoItemPrefix),
+		[]byte(DynamoSealPrefix),
 		[]byte(DynamoGSIPrefix),
 	}
 	redisListAuxiliaryScanPrefixes = [][]byte{
@@ -433,6 +437,8 @@ func dynamoRouteKey(key []byte) []byte {
 		return dynamoRouteTableKey(key[len(dynamoTableGenerationPrefixBytes):])
 	case bytes.HasPrefix(key, dynamoItemPrefixBytes):
 		return dynamoRouteFromTablePrefixedKey(key[len(dynamoItemPrefixBytes):])
+	case bytes.HasPrefix(key, dynamoSealPrefixBytes):
+		return dynamoRouteFromTablePrefixedKey(key[len(dynamoSealPrefixBytes):])
 	case bytes.HasPrefix(key, dynamoGSIPrefixBytes):
 		return dynamoRouteFromTablePrefixedKey(key[len(dynamoGSIPrefixBytes):])
 	default:
