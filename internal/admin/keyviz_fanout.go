@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -562,9 +563,10 @@ type rowMergeAcc struct {
 	// bucket is reported by both old peers (which omit the fields) and new
 	// ones, and taking the first peer's zero would discard what the upgraded
 	// peers know.
-	subBucket      int
-	subBucketCount int
-	cells          []cellMergeAcc
+	subBucket               int
+	subBucketCount          int
+	subBucketBoundsConflict bool
+	cells                   []cellMergeAcc
 }
 
 // cellMergeAcc tracks merge state for one (bucket, column) cell.
@@ -649,12 +651,7 @@ func mergeRowInto(
 		accByBucket[row.BucketID] = acc
 		*bucketOrder = append(*bucketOrder, row.BucketID)
 	}
-	// Accept sub-range metadata from any peer that reports it, so one legacy
-	// peer in the fan-out cannot blank it for the whole row.
-	if acc.subBucketCount == 0 && row.SubBucketCount != 0 {
-		acc.subBucket = row.SubBucket
-		acc.subBucketCount = row.SubBucketCount
-	}
+	reconcileSubRangeMetadata(acc, row)
 	for j, ts := range srcColumns {
 		idx, ok := indexByColumn[ts]
 		if !ok || j >= len(row.Values) {
@@ -673,6 +670,24 @@ func mergeRowInto(
 		} else {
 			acc.cells[idx].addRead(value, group, term)
 		}
+	}
+}
+
+func reconcileSubRangeMetadata(acc *rowMergeAcc, row *KeyVizRow) {
+	// The same bucket ID can denote different bounds while peers run with
+	// different K values. Never label a merged row with one peer's range.
+	if !bytes.Equal(acc.start, row.Start) || !bytes.Equal(acc.end, row.End) ||
+		(acc.subBucketCount != 0 && row.SubBucketCount != 0 &&
+			(acc.subBucket != row.SubBucket || acc.subBucketCount != row.SubBucketCount)) {
+		acc.subBucket = 0
+		acc.subBucketCount = 0
+		acc.subBucketBoundsConflict = true
+		return
+	}
+	// Accept metadata from a modern peer when a legacy peer was first.
+	if !acc.subBucketBoundsConflict && acc.subBucketCount == 0 && row.SubBucketCount != 0 {
+		acc.subBucket = row.SubBucket
+		acc.subBucketCount = row.SubBucketCount
 	}
 }
 

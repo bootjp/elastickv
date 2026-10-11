@@ -187,6 +187,32 @@ func TestMergeKeyVizMatricesTakesSubRangeMetadataFromAnyPeer(t *testing.T) {
 		"one legacy peer must not blank the sub-range identity the upgraded peers report")
 }
 
+func TestMergeKeyVizMatricesOmitsSubRangeMetadataForDifferentBounds(t *testing.T) {
+	t.Parallel()
+
+	col := []int64{1_700_000_000_000}
+	legacyPeer := KeyVizMatrix{
+		ColumnUnixMs: col, Series: keyVizSeriesWrites,
+		Rows: []KeyVizRow{{
+			BucketID: "route:1#1", Start: []byte{0x80}, End: []byte{0xff}, Values: []uint64{4},
+		}},
+	}
+	upgradedPeer := KeyVizMatrix{
+		ColumnUnixMs: col, Series: keyVizSeriesWrites,
+		Rows: []KeyVizRow{{
+			BucketID: "route:1#1", Start: []byte{0x40}, End: []byte{0x80},
+			SubBucket: 1, SubBucketCount: 4, Values: []uint64{6},
+		}},
+	}
+
+	for _, matrices := range [][]KeyVizMatrix{{legacyPeer, upgradedPeer}, {upgradedPeer, legacyPeer}} {
+		merged := mergeKeyVizMatrices(matrices, keyVizSeriesWrites)
+		require.Len(t, merged.Rows, 1)
+		require.Zero(t, merged.Rows[0].SubBucket)
+		require.Zero(t, merged.Rows[0].SubBucketCount)
+	}
+}
+
 // A route that is not sub-divided must stay byte-identical on the wire, so an
 // older SPA sees no change.
 func TestMergeKeyVizMatricesOmitsSubRangeMetadataWhenAbsent(t *testing.T) {
