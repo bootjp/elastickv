@@ -22,8 +22,10 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   `shard_config.go` skips group 0). Its reserved internal keys hold the
   route catalog. It is not the TSO group: when group 0 is configured, the
   Phase D allocation state replicates through group 0, and the HLC ceiling
-  renewal loop proposes on every group the node leads (`renewHLCLeases`),
-  not only on the default group. (`shard_config.go`,
+  renewal loop (`renewHLCLeases`) proposes on every data group the node
+  leads in legacy mode, not only on the default group, but only on the
+  configured timestamp group once Phase D is active
+  (`shouldRenewHLCGroup`). (`shard_config.go`,
   `docs/architecture_overview.md`)
 - **TSO group (group 0)** — The reserved Raft group for centralized
   timestamp allocation; shard ranges and SQS partition maps cannot route

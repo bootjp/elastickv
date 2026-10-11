@@ -52,7 +52,7 @@ week, no deadline; the plan below is sized for that.
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
 | Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic within a shard; across shards 2PC with OCC validation of write and read sets at FSM apply, whose atomicity is not yet claimed (G12 and G14, both reproduced: aliased identities commit a mix, and a secondary can be rolled back before the primary lock exists) until A2's transaction id and primary-first PREPARE land; serializable is the target pending the audit's A0 to A2, G11, and G13 (§6.3); per-key linearizable for blind writes and reads on leader-issued paths; read-modify-write operations wait for A0 (G0) and the G10 paths for A0b |
-| Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by Raft leaders; physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
+| Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by the owning Raft leader (the post-A0b design; on `main` today the default legacy-TSO mode stamps on the dispatching node and `Internal.Forward` keeps that stamp, audit gap G10); physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
 | Verification story | Deterministic simulation | Jepsen (TiDB), tests | Internal (formal methods, TLA+) | Internal | Design docs, TLA+ (HLC, OCC, MVCC, routes, composed), Jepsen for Redis / DynamoDB / S3 (Elle list-append, knossos, custom checkers; the SQS workload exists but validates nothing today, §1) |
@@ -92,8 +92,9 @@ README will present scope in two tiers instead of a non-goals section.
   groups it does not lead) are excluded until A0b and its remaining
   `Internal.Forward` work land (G10, reproduced);
   multi-key transactions atomic within a shard, and across shards once
-  A2's transaction id lands (G12, reproduced), with OCC validation of write
-  and read sets at apply. **Serializable is the
+  A2's transaction id, the primary-first PREPARE order, and the secondary
+  re-apply land (G12 and G14, both reproduced and fixed on local
+  branches), with OCC validation of write and read sets at apply. **Serializable is the
   target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
   that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
