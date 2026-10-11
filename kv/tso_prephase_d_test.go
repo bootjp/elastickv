@@ -151,12 +151,16 @@ type stubPrePhaseDAllocator struct {
 	floor     uint64
 	prePhaseD bool
 	nowTS     uint64
+	nowErr    error
 }
 
 func (s *stubPrePhaseDAllocator) Next(context.Context) (uint64, error) { return s.nowTS, nil }
-func (s *stubPrePhaseDAllocator) PhaseDActive() bool                   { return true }
-func (s *stubPrePhaseDAllocator) PhaseDRequired() bool                 { return true }
-func (s *stubPrePhaseDAllocator) PhaseDFloor() uint64                  { return s.floor }
+func (s *stubPrePhaseDAllocator) prePhaseDAdmissionTimestamp(context.Context) (uint64, error) {
+	return s.nowTS, s.nowErr
+}
+func (s *stubPrePhaseDAllocator) PhaseDActive() bool   { return true }
+func (s *stubPrePhaseDAllocator) PhaseDRequired() bool { return true }
+func (s *stubPrePhaseDAllocator) PhaseDFloor() uint64  { return s.floor }
 
 func (s *stubPrePhaseDAllocator) ValidateDurableTimestamp(context.Context, uint64) error {
 	if s.prePhaseD {
@@ -231,6 +235,27 @@ func TestPrePhaseDFloorSurvivesProductionAllocatorWrappers(t *testing.T) {
 	within, err := prePhaseDStartWithinWindow(context.Background(), dynamic)
 	require.NoError(t, err)
 	require.True(t, within)
+}
+
+func TestPrePhaseDAdmissionBypassesStaleBatchSlot(t *testing.T) {
+	t.Parallel()
+	floor := testPhaseDFloor()
+	tso := &phaseDWindowTSO{floor: floor, nextBase: floor + 1, phaseD: true, leader: true}
+	routed, err := NewLeaderRoutedTSOAllocator(tso, &recordingTSOEngine{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, routed.Close()) }()
+	batch, err := NewBatchAllocator(routed, 8)
+	require.NoError(t, err)
+	dynamic := NewDynamicTimestampAllocator(batch)
+
+	_, err = dynamic.Next(context.Background()) // retain seven pre-window-close slots
+	require.NoError(t, err)
+	const closedMs = uint64(testPhaseDActivationMs) + maxTxnLockTTLms + 3_600_000
+	tso.nextBase = closedMs << HLCLogicalBits
+
+	within, err := prePhaseDStartWithinWindow(context.Background(), dynamic)
+	require.NoError(t, err)
+	require.False(t, within)
 }
 
 type floorlessAllocator struct{}

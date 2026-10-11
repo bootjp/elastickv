@@ -83,6 +83,12 @@ type TSOPhaseDFloorSource interface {
 	PhaseDFloor() uint64
 }
 
+// prePhaseDAdmissionTimestampIssuer bypasses reserved client-side batch slots.
+// The admission window must be measured against a new durable TSO allocation.
+type prePhaseDAdmissionTimestampIssuer interface {
+	prePhaseDAdmissionTimestamp(context.Context) (uint64, error)
+}
+
 // AppliedReadTimestampVoucher records an adapter-provided applied watermark.
 // It is a process-local capability used only to distinguish audited adapter
 // snapshots from arbitrary caller-supplied StartTS values during Phase D.
@@ -448,10 +454,13 @@ func prePhaseDStartWithinWindow(ctx context.Context, alloc TimestampAllocator) (
 	if floor == 0 {
 		return false, nil
 	}
-	// Issue a fresh timestamp through the same durable TSO group that owns
-	// the Phase-D marker. Its physical component cannot move backward when a
-	// receiver's wall clock is adjusted, so a closed window stays closed.
-	nowTS, err := alloc.Next(ctx)
+	issuer, ok := alloc.(prePhaseDAdmissionTimestampIssuer)
+	if !ok {
+		return false, errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	// Bypass cached batch slots: a lightly used node can retain one from
+	// inside the window long after the durable TSO has passed its end.
+	nowTS, err := issuer.prePhaseDAdmissionTimestamp(ctx)
 	if err != nil {
 		return false, errors.Wrap(err, "issue TSO timestamp for pre-phase-D admission")
 	}
@@ -878,6 +887,14 @@ func (b *BatchAllocator) Invalidate() {
 
 func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
 	return b.nextAfter(ctx, 0)
+}
+
+func (b *BatchAllocator) prePhaseDAdmissionTimestamp(ctx context.Context) (uint64, error) {
+	if b == nil || b.tso == nil {
+		return 0, errors.WithStack(ErrTSOAllocatorRequired)
+	}
+	timestamp, err := b.tso.NextBatch(ctx, 1)
+	return timestamp, errors.Wrap(err, "issue fresh TSO admission timestamp")
 }
 
 func (b *BatchAllocator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
