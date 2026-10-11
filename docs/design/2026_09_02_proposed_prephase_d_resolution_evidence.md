@@ -4,7 +4,7 @@ Status: Proposed
 Author: bootjp
 Date: 2026-09-02
 
-Related: [2026_08_29_proposed_tso_batch_slot_claims.md](2026_08_29_proposed_tso_batch_slot_claims.md)
+Related: [2026_08_29_partial_tso_batch_slot_claims.md](2026_08_29_partial_tso_batch_slot_claims.md)
 (the other open TSO admission question on the same PR).
 
 ## 1. The finding
