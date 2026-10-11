@@ -1,6 +1,7 @@
 package encryption_test
 
 import (
+	"math"
 	"testing"
 	"time"
 
@@ -45,7 +46,13 @@ func TestClassifyMVCCRewriteCoversEveryVersionShape(t *testing.T) {
 			name:       "version already under the active DEK",
 			version:    version(encryption.MVCCVersionRef{KeyID: activeDEK}),
 			wantVerb:   encryption.RewriteSkip,
-			wantReason: encryption.RewriteReasonAlreadyFresh,
+			wantReason: encryption.RewriteReasonDifferentDEK,
+		},
+		{
+			name:       "version under another old DEK",
+			version:    version(encryption.MVCCVersionRef{KeyID: activeDEK + 1}),
+			wantVerb:   encryption.RewriteSkip,
+			wantReason: encryption.RewriteReasonDifferentDEK,
 		},
 		{
 			name:       "tombstone carries no value bytes",
@@ -68,17 +75,17 @@ func TestClassifyMVCCRewriteCoversEveryVersionShape(t *testing.T) {
 			wantReason: encryption.RewriteReasonCleartext,
 		},
 		{
-			name:       "version below the retention floor",
+			name:       "retained anchor below the retention floor",
 			version:    encryption.MVCCVersionRef{CommitTS: retainFloor - 1, KeyID: retiringDEK},
-			wantVerb:   encryption.RewriteSkip,
-			wantReason: encryption.RewriteReasonUnretained,
+			wantVerb:   encryption.RewriteReencrypt,
+			wantReason: encryption.RewriteReasonRetiringDEK,
 		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			got := encryption.ClassifyMVCCRewrite(tc.version, retiringDEK, tc.migrate, retainFloor)
+			got := encryption.ClassifyMVCCRewrite(tc.version, retiringDEK, tc.migrate)
 			require.Equal(t, tc.wantVerb, got.Verdict)
 			require.Equal(t, tc.wantReason, got.Reason)
 		})
@@ -95,9 +102,9 @@ func TestClassifyMVCCRewriteDoesNotEncryptCleartextDuringAPlainRotation(t *testi
 
 	v := version(encryption.MVCCVersionRef{Cleartext: true})
 	require.Equal(t, encryption.RewriteSkip,
-		encryption.ClassifyMVCCRewrite(v, retiringDEK, false, retainFloor).Verdict)
+		encryption.ClassifyMVCCRewrite(v, retiringDEK, false).Verdict)
 	require.Equal(t, encryption.RewriteReencrypt,
-		encryption.ClassifyMVCCRewrite(v, retiringDEK, true, retainFloor).Verdict)
+		encryption.ClassifyMVCCRewrite(v, retiringDEK, true).Verdict)
 }
 
 // TestClassifyMVCCRewriteRewritesHistoricalVersionsNotJustTheLatest is
@@ -110,27 +117,25 @@ func TestClassifyMVCCRewriteRewritesHistoricalVersionsNotJustTheLatest(t *testin
 	for _, ts := range []uint64{retainFloor + 1, retainFloor + 10, retainFloor + 10_000} {
 		got := encryption.ClassifyMVCCRewrite(
 			encryption.MVCCVersionRef{CommitTS: ts, KeyID: retiringDEK},
-			retiringDEK, false, retainFloor)
+			retiringDEK, false)
 		require.Equal(t, encryption.RewriteReencrypt, got.Verdict,
 			"retained version at ts=%d must be rewritten", ts)
 	}
 }
 
-// TestClassifyMVCCRewriteSkipsAtTheRetentionFloorBoundary pins the
-// boundary against §5.4 item 4, which states retirement in terms of
-// minRetainedTS: a version AT the floor is not reachable, so rewriting
-// it is pure write amplification.
-func TestClassifyMVCCRewriteSkipsAtTheRetentionFloorBoundary(t *testing.T) {
+// TestClassifyMVCCRewriteKeepsTheRetentionFloorAnchor pins the
+// version an exact-floor read can still reach.
+func TestClassifyMVCCRewriteKeepsTheRetentionFloorAnchor(t *testing.T) {
 	t.Parallel()
 
 	at := encryption.ClassifyMVCCRewrite(
 		encryption.MVCCVersionRef{CommitTS: retainFloor, KeyID: retiringDEK},
-		retiringDEK, false, retainFloor)
-	require.Equal(t, encryption.RewriteSkip, at.Verdict)
+		retiringDEK, false)
+	require.Equal(t, encryption.RewriteReencrypt, at.Verdict)
 
 	above := encryption.ClassifyMVCCRewrite(
 		encryption.MVCCVersionRef{CommitTS: retainFloor + 1, KeyID: retiringDEK},
-		retiringDEK, false, retainFloor)
+		retiringDEK, false)
 	require.Equal(t, encryption.RewriteReencrypt, above.Verdict)
 }
 
@@ -152,13 +157,9 @@ func TestRewriteThrottleYieldsToHoldTheConfiguredRate(t *testing.T) {
 	require.Zero(t, th.Record(0, start.Add(2*time.Second)))
 }
 
-// TestRewriteThrottleMeasuresCumulativeRateNotPerBatch pins the
-// anti-burst property, and needs MULTIPLE batches to do it: with a
-// single batch the cumulative and per-batch rules agree, so a one-batch
-// test proves nothing. Successive batches at the same instant are what
-// separate them — which is also the realistic burst shape, a job
-// draining several batches back to back.
-func TestRewriteThrottleMeasuresCumulativeRateNotPerBatch(t *testing.T) {
+// TestRewriteThrottleCarriesDebtAcrossBackToBackBatches pins the
+// anti-burst property for successive batches at the same instant.
+func TestRewriteThrottleCarriesDebtAcrossBackToBackBatches(t *testing.T) {
 	t.Parallel()
 
 	start := time.Unix(1_700_000_000, 0)
@@ -168,16 +169,24 @@ func TestRewriteThrottleMeasuresCumulativeRateNotPerBatch(t *testing.T) {
 	// First MiB at t=0: owes 1s under either rule.
 	require.Equal(t, time.Second, th.Record(1024*1024, start))
 
-	// Second MiB, still at t=0. Cumulatively the job has now written
-	// 2 MiB and owes 2s against 0s elapsed. A per-batch rule would see
-	// only this batch's 1 MiB and owe 1s, letting the job sustain
-	// double the configured rate indefinitely.
+	// Second MiB, still at t=0, extends the virtual deadline to t=2s.
 	require.Equal(t, 2*time.Second, th.Record(1024*1024, start),
-		"the debt must accumulate across batches, not reset with each one")
+		"the debt must accumulate across batches")
 
 	// Third MiB after 2s have passed: 3 MiB owes 3s, 2s elapsed.
 	require.Equal(t, time.Second,
 		th.Record(1024*1024, start.Add(2*time.Second)))
+}
+
+func TestRewriteThrottleDoesNotBankIdleTime(t *testing.T) {
+	t.Parallel()
+	start := time.Unix(1_700_000_000, 0)
+	th := encryption.NewRewriteThrottle(1, start)
+	require.Equal(t, time.Second, th.Record(1024*1024, start))
+
+	afterIdle := start.Add(time.Minute)
+	require.Equal(t, time.Second, th.Record(1024*1024, afterIdle))
+	require.Equal(t, 2*time.Second, th.Record(1024*1024, afterIdle))
 }
 
 func TestRewriteThrottleDisabledAtNonPositiveRate(t *testing.T) {
@@ -187,7 +196,16 @@ func TestRewriteThrottleDisabledAtNonPositiveRate(t *testing.T) {
 	for _, rate := range []float64{0, -1} {
 		th := encryption.NewRewriteThrottle(rate, start)
 		require.Zero(t, th.Record(1<<30, start), "--rate=%v means run unthrottled", rate)
+		require.Equal(t, int64(1<<30), th.Written())
 	}
+}
+
+func TestRewriteThrottleClampsUnrepresentableDelay(t *testing.T) {
+	t.Parallel()
+	start := time.Unix(1_700_000_000, 0)
+	th := encryption.NewRewriteThrottle(math.SmallestNonzeroFloat64, start)
+	require.Equal(t, time.Duration(math.MaxInt64), th.Record(1, start))
+	require.Equal(t, int64(1), th.Written())
 }
 
 func TestRewriteThrottleTracksCumulativeBytes(t *testing.T) {
