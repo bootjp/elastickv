@@ -73,8 +73,8 @@ func TestEncryptionWriteWiring_PebbleOptions_WiredWhenCipherSet(t *testing.T) {
 		cipher:       cipher,
 		nonceFactory: encryption.NewDeterministicNonceFactory(0xABCD, 0),
 	}
-	if opts := w.pebbleOptions(); len(opts) != 4 {
-		t.Errorf("wired pebbleOptions = %d opts, want 4 (encryption + storage cutover + V2 capability + registration gates)", len(opts))
+	if opts := w.pebbleOptions(); len(opts) != 5 {
+		t.Errorf("wired pebbleOptions = %d opts, want 5 (encryption + storage cutover + V2 capability + registration gates + §9.2 metrics observer)", len(opts))
 	}
 }
 
@@ -206,7 +206,7 @@ func TestBuildEncryptionWriteWiring_DisabledOrUnconfigured_Cleartext(t *testing.
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			w, err := buildEncryptionWriteWiring(tc.enabled, "n1", tc.sidecarPath, tc.kek, encryption.NewKeystore(), nil)
+			w, err := buildEncryptionWriteWiring(tc.enabled, "n1", tc.sidecarPath, tc.kek, encryption.NewKeystore(), nil, nil)
 			if err != nil {
 				t.Fatalf("buildEncryptionWriteWiring: %v", err)
 			}
@@ -227,7 +227,7 @@ func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	t.Parallel()
 	path := writeActiveStorageSidecar(t, 2)
 	markRaftEnvelopeCutoverInSidecar(t, path, 55)
-	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}})
+	w, err := buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}}, nil)
 	if err != nil {
 		t.Fatalf("buildEncryptionWriteWiring: %v", err)
 	}
@@ -240,9 +240,10 @@ func TestBuildEncryptionWriteWiring_ActiveDEK_WiresCipher(t *testing.T) {
 	if w.raftEpoch != 1 {
 		t.Errorf("raft epoch = %d, want 1 (bumped from 0)", w.raftEpoch)
 	}
-	// WithEncryption plus storage cutover, V2 capability, and registration gates.
-	if opts := w.pebbleOptions(); len(opts) != 4 {
-		t.Errorf("pebbleOptions = %d, want 4", len(opts))
+	// WithEncryption plus storage cutover, V2 capability, and
+	// registration gates, plus the §9.2 metrics observer.
+	if opts := w.pebbleOptions(); len(opts) != 5 {
+		t.Errorf("pebbleOptions = %d, want 5", len(opts))
 	}
 	assertStorageEnvelopeV2Activation(t, w)
 	// Cache must reflect the on-disk active DEK + cutover gate.
@@ -275,7 +276,7 @@ func TestBuildEncryptionWriteWiring_ActiveCutoverWithoutRaftDEKRefusesBeforeStor
 		t.Fatalf("WriteSidecar: %v", err)
 	}
 
-	_, err = buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}})
+	_, err = buildEncryptionWriteWiring(true, "n1", path, wiringFakeKEK{}, encryption.NewKeystore(), []groupSpec{{id: 1}}, nil)
 	if err == nil {
 		t.Fatal("buildEncryptionWriteWiring succeeded with active raft cutover but no active raft DEK")
 	}
