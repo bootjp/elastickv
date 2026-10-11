@@ -556,6 +556,10 @@ func (a *phaseDForwardAllocator) Next(context.Context) (uint64, error) {
 	return a.floor + a.next, nil
 }
 
+func (a *phaseDForwardAllocator) FreshAdmissionTimestamp(ctx context.Context) (uint64, error) {
+	return a.Next(ctx)
+}
+
 func (a *phaseDForwardAllocator) NextAfter(_ context.Context, minTS uint64) (uint64, error) {
 	a.next++
 	ts := a.floor + a.next

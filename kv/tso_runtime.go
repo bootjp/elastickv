@@ -153,16 +153,17 @@ func (d *DynamicTimestampAllocator) Next(ctx context.Context) (uint64, error) {
 	return timestamp, errors.Wrap(err, "dynamic tso next")
 }
 
-func (d *DynamicTimestampAllocator) prePhaseDAdmissionTimestamp(ctx context.Context) (uint64, error) {
+func (d *DynamicTimestampAllocator) FreshAdmissionTimestamp(ctx context.Context) (uint64, error) {
 	allocator := d.currentTimestampAllocator()
 	if allocator == nil {
 		return 0, errors.WithStack(ErrTSOAllocatorRequired)
 	}
-	issuer, ok := allocator.(prePhaseDAdmissionTimestampIssuer)
+	issuer, ok := allocator.(TSOFreshAdmissionTimestampIssuer)
 	if !ok {
 		return 0, errors.WithStack(ErrTSOProtocolUnsupported)
 	}
-	return issuer.prePhaseDAdmissionTimestamp(ctx)
+	timestamp, err := issuer.FreshAdmissionTimestamp(ctx)
+	return timestamp, errors.Wrap(err, "dynamic tso fresh admission timestamp")
 }
 
 func (d *DynamicTimestampAllocator) NextAfter(ctx context.Context, min uint64) (uint64, error) {

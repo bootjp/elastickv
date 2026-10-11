@@ -155,7 +155,7 @@ type stubPrePhaseDAllocator struct {
 }
 
 func (s *stubPrePhaseDAllocator) Next(context.Context) (uint64, error) { return s.nowTS, nil }
-func (s *stubPrePhaseDAllocator) prePhaseDAdmissionTimestamp(context.Context) (uint64, error) {
+func (s *stubPrePhaseDAllocator) FreshAdmissionTimestamp(context.Context) (uint64, error) {
 	return s.nowTS, s.nowErr
 }
 func (s *stubPrePhaseDAllocator) PhaseDActive() bool   { return true }
