@@ -217,7 +217,7 @@ func TestRedis_StreamXReadBlockChecksWrongTypeAtDeadline(t *testing.T) {
 	// machine could consume the whole window before the SET was sent.
 	const (
 		blockWindow       = 6 * time.Second
-		waiterRegistering = time.Second
+		waiterRegistering = 2 * time.Second
 	)
 
 	resultCh := make(chan readResult, 1)
