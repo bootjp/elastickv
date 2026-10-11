@@ -1889,9 +1889,15 @@ sections defer to is therefore two-sided:
   capability attestation in its context, and at apply the engine cancels
   the conf change (etcd/raft applies an empty `ConfChange` as a no-op) when
   the group's applied activation epoch is active and the attestation is
-  missing; a leader also waits until its applied index reaches its commit
-  index before proposing any membership change, so it reasons from the
-  log it has already applied. **Activation drains V1 work before the
+  missing, and **resolves the pending admin request with a definite
+  rejection** (`ErrTxnFormatJoinerNotCapable`) rather than the success the
+  config-change apply path returns today from the committed entry's
+  context, so an operator or the rollout script never believes a member
+  was added when the configuration did not change (a test covers the
+  ordering: activation applies, then an already-queued `AddLearner` is
+  cancelled and its caller gets the rejection); a leader also waits until
+  its applied index reaches its commit index before proposing any
+  membership change, so it reasons from the log it has already applied. **Activation drains V1 work before the
   guarantees are claimed.** Once the activation entry applies on a group,
   that group's FSM rejects a V1 PREPARE and a V1 one-phase entry (the
   coordinator retries the work as V2; a delayed V1 one-phase entry can no
@@ -1944,7 +1950,18 @@ sections defer to is therefore two-sided:
   rejects with `ErrBackupWireSubtype` and `applyBackup` turns into
   `haltErr` (the same path halts on a missing timestamp tracker). The new
   binary's `applyBackup` dispatches that subtype to the transaction apply
-  path before the backup decoder sees it. A halted learner is a loud
+  path before the backup decoder sees it, and **`IsVolatileOnlyPayload`
+  becomes subtype-aware**: today it answers true for the whole
+  `raftEncodeBackup` tag (HLC leases and backup pins are the two
+  volatile-only payloads the cold-start skip gate must still deliver past
+  the snapshot index), so a V2 transaction under that tag would be
+  re-applied from the WAL tail after a restart whose durable applied index
+  is ahead of its snapshot, re-running transaction side effects with
+  `SetApplyIndex` suppressed and feeding the index-based replay detection
+  an index it never recorded; the classifier returns true only for the
+  genuine backup-pin subtypes and false for `backupSubtypeTxnV2`, it stays
+  a pure function of the bytes, and a cold-start-tail test applies a V2
+  entry past the snapshot index exactly once. A halted learner is a loud
   failure, not a divergent one; the alternative, an intermediate release
   that installs a fail-closed dispatch before V2 can activate, is recorded
   as the cleaner path for a later format bump. Second, **membership
