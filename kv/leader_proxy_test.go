@@ -140,7 +140,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 
-	svc := &fakeInternal{resp: &pb.ForwardResponse{Success: true, CommitIndex: 123}}
+	svc := &fakeInternal{resp: &pb.ForwardResponse{Success: true, CommitIndex: 123, CommitTs: 456}}
 	srv := grpc.NewServer()
 	pb.RegisterInternalServer(srv, svc)
 	go func() { _ = srv.Serve(lis) }()
@@ -180,6 +180,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 	resp, err := p.Commit(context.Background(), reqs)
 	require.NoError(t, err)
 	require.Equal(t, uint64(123), resp.CommitIndex)
+	require.Equal(t, uint64(456), resp.CommitTS)
 
 	svc.mu.Lock()
 	defer svc.mu.Unlock()
