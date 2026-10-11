@@ -1,7 +1,9 @@
+import { render, screen } from "@testing-library/react";
+import { createElement } from "react";
 import { describe, expect, it } from "vitest";
 
 import type { KeyVizRow } from "../api/client";
-import { parseBucketID, subRangeLabel } from "./KeyViz";
+import { parseBucketID, RowDetail, subRangeLabel } from "./KeyViz";
 
 describe("parseBucketID", () => {
   it("parses legacy and labeled route bucket IDs", () => {
@@ -15,6 +17,40 @@ describe("parseBucketID", () => {
     expect(parseBucketID("route:7:")).toBeNull();
     expect(parseBucketID("route:7:redis:extra")).toBeNull();
     expect(parseBucketID("route:7:redis#")).toBeNull();
+  });
+});
+
+describe("RowDetail", () => {
+  const row: KeyVizRow = {
+    bucket_id: "route:7#0",
+    start: "",
+    end: "",
+    aggregate: false,
+    route_count: 1,
+    values: [3],
+    sub_bucket_count: 4,
+  };
+
+  it("shows the bucket-zero sub-range pill, explanation, and narrowed bounds", () => {
+    render(createElement(RowDetail, { row, index: 0 }));
+
+    expect(screen.getByText("sub-range 1/4")).toHaveAttribute(
+      "title",
+      expect.stringContaining("narrowed bounds of this sub-range"),
+    );
+    expect(screen.getByText("Sub-range start")).toBeInTheDocument();
+    expect(screen.getByText("Sub-range end")).toBeInTheDocument();
+  });
+
+  it("uses whole-route bounds without a sub-range pill", () => {
+    render(createElement(RowDetail, {
+      row: { ...row, bucket_id: "route:7", sub_bucket_count: 1 },
+      index: 0,
+    }));
+
+    expect(screen.queryByText(/sub-range \d+\/\d+/)).not.toBeInTheDocument();
+    expect(screen.getByText("Start")).toBeInTheDocument();
+    expect(screen.getByText("End")).toBeInTheDocument();
   });
 });
 

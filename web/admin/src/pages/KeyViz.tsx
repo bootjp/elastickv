@@ -546,7 +546,7 @@ export function subRangeLabel(row: KeyVizRow): string | null {
   return `sub-range ${(row.sub_bucket ?? 0) + 1}/${count}`;
 }
 
-function RowDetail({ row, index }: RowDetailProps) {
+export function RowDetail({ row, index }: RowDetailProps) {
   const subRange = subRangeLabel(row);
   const total = row.values.reduce((a, b) => a + b, 0);
   return (
