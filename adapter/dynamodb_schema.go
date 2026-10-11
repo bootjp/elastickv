@@ -183,7 +183,7 @@ func (d *DynamoDBServer) createTableWithRetry(ctx context.Context, tableName str
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb create table: begin read timestamp")
+		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb create table: begin read timestamp", dynamoTableMetaKey(tableName))
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -298,7 +298,7 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb delete table: begin read timestamp")
+		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb delete table: begin read timestamp", dynamoTableMetaKey(tableName))
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -353,6 +353,7 @@ func (d *DynamoDBServer) launchDeletedTableCleanup(tableName string, generation 
 func (d *DynamoDBServer) cleanupDeletedTableGeneration(ctx context.Context, tableName string, generation uint64) error {
 	prefixes := [][]byte{
 		dynamoItemPrefixForTable(tableName, generation),
+		dynamoSealPrefixForTable(tableName, generation),
 		dynamoGSIPrefixForTable(tableName, generation),
 	}
 	// Dispatch a single DEL_PREFIX operation per prefix. The FSM on each node

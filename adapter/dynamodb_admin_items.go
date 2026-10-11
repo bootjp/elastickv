@@ -335,6 +335,11 @@ func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrinci
 		TableName: tableName,
 		Item:      adminToInternalAttributeMap(item.Attributes),
 	}
+	unlock, err := d.lockItemForWrite(ctx, tableName, in.Item)
+	if err != nil {
+		return translateDynamoAdminError(err)
+	}
+	defer unlock()
 	if _, err := d.putItemWithRetry(ctx, in); err != nil {
 		return translateDynamoAdminError(err)
 	}
@@ -372,6 +377,11 @@ func (d *DynamoDBServer) AdminDeleteItem(ctx context.Context, principal AdminPri
 		TableName: tableName,
 		Key:       adminToInternalAttributeMap(key),
 	}
+	unlock, err := d.lockItemForWrite(ctx, tableName, in.Key)
+	if err != nil {
+		return translateDynamoAdminError(err)
+	}
+	defer unlock()
 	if _, err := d.deleteItemWithRetry(ctx, in); err != nil {
 		return translateDynamoAdminError(err)
 	}
