@@ -286,9 +286,16 @@ intent (`WithClientReadTimestamp`) never proposes and fails with
 `ErrReadTSAboveWatermark` above the watermark; a bare timestamp reads as
 before. The snapshot comes from the leaders: `BeginSnapshotReadTimestamp`
 calls the new `LeaderSnapshotCoordinator` capability, which
-`ShardedCoordinator` implements by fencing every data group's leader
-(lease or ReadIndex) and taking the maximum of their `lastCommitTS`
-(the local value is kept if higher; an all-zero answer means an empty
+`ShardedCoordinator` implements by fencing the leaders of the groups the
+operation **routes to** (the owning groups of a point or range read's
+keys, the participants of a transaction) and taking the maximum of their
+`lastCommitTS`; every data group is fenced only when the key set is not
+known up front (a keys-spanning Lua script), so an unavailable or
+leaderless group fails only the operations that touch it instead of the
+whole data plane (the implemented branch fences every data group,
+including for the public gRPC `Ts = 0` reads, and must be narrowed to the
+routed participants: a merge blocker). The local value is kept if higher;
+an all-zero answer means an empty
 store and no capability is issued; the single-group `Coordinate` adds no
 barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
 RPC carrying a `ForwardedReadMode` and the group's bearer token
@@ -1864,16 +1871,35 @@ sections defer to is therefore two-sided:
   envelope, so an old member that slipped in halts here, loudly, before any
   data entry), carrying the conf state it validated against; the FSM
   rejects the entry if the group's current conf state differs (the
-  proposer re-validates and retries), and a membership proposal is
-  rejected while an activation entry is pending or applied unless the
-  joiner advertises the capability. The coordinator flips its atomic
-  `txnFormatV2` (`WithTxnFormatV2`, subsuming `WithTransactionIDs`) only
-  when it applies the activation entry on every group it coordinates, and
-  never flips it back. From then on it stamps V2 on every request; transactions already in flight keep V1
-  and finish under V1 semantics (legacy ownership is permanent, A2). An
-  operator flag pins the format to V1 for a deployment that must keep an
-  old binary around, with a startup warning that the audit's guarantees
-  are off.
+  proposer re-validates and retries). The membership exclusion is
+  **durable and enforced at apply**, not by a leader-local "pending"
+  flag, which a leader change would lose (an activation appended but not
+  yet applied, then a new leader admitting an incapable member after it):
+  every `AddLearner` / `AddVoter` conf change carries the joiner's
+  capability attestation in its context, and at apply the engine cancels
+  the conf change (etcd/raft applies an empty `ConfChange` as a no-op) when
+  the group's applied activation epoch is active and the attestation is
+  missing; a leader also waits until its applied index reaches its commit
+  index before proposing any membership change, so it reasons from the
+  log it has already applied. **Activation drains V1 work before the
+  guarantees are claimed.** Once the activation entry applies on a group,
+  that group's FSM rejects a V1 PREPARE and a V1 one-phase entry (the
+  coordinator retries the work as V2; a delayed V1 one-phase entry can no
+  longer bypass the fence, and a V1 transaction that read before
+  activation can no longer lock after it, which is the G1 shape a V1
+  PREPARE racing a V2 one-phase transaction would reopen), and accepts a
+  V1 COMMIT or ABORT only against an existing legacy-shape lock, so
+  already-prepared V1 transactions finish or are settled by the resolver
+  (legacy ownership is permanent, A2). The coordinator flips its atomic
+  `txnFormatV2` (`WithTxnFormatV2`, subsuming `WithTransactionIDs`) when
+  it applies the activation entry on every group it coordinates, and never
+  flips it back; the point at which the audit's guarantees hold, recorded
+  in the `raft-engine` marker as "V2 in effect" and the precondition for
+  the roadmap's README claims, is when every group reports no
+  legacy-shape lock row left (a namespace scan the monitor repeats; the
+  resolver settles expired ones). An operator flag pins the format to V1
+  for a deployment that must keep an old binary around, with a startup
+  warning that the audit's guarantees are off.
 - **Refusal on the old side.** A V2 entry must never be *applied* by an
   old binary, and the monitor alone cannot guarantee that: after the
   one-way flip, the supported fresh-learner path can add an old binary
