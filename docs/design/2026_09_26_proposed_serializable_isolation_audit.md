@@ -298,10 +298,17 @@ routed participants: a merge blocker). The local value is kept if higher;
 an all-zero answer means an empty
 store and no capability is issued; the single-group `Coordinate` adds no
 barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
-RPC carrying a `ForwardedReadMode` and the group's bearer token
-(admin-token-protected like `ForwardLeaseRead`), so a remote read still
-costs one round trip; an `Unimplemented` answer from an older leader falls
-back to the public `RawKV` call. A per-group `watermarkAdvancer` allows one
+RPC carrying a `ForwardedReadMode` and an authenticated peer bearer token.
+For this release the token comes from a required, non-empty
+`--adminTokenFile`: `ForwardRead` is explicitly protected by the server
+interceptor, its client always attaches the token, and V2 activation
+refuses to proceed unless every voter and learner has the credential and
+an authenticated peer-forward probe succeeds. The optional admin-token
+configuration cannot establish snapshot provenance in its default-off
+state; absent or wrong credentials fail closed. An `Unimplemented` answer
+from an older leader may fall back to public `RawKV` only while V1 is
+pinned and cannot satisfy a V2 snapshot capability. A remote authenticated
+read still costs one round trip. A per-group `watermarkAdvancer` allows one
 proposal in flight, folds higher targets into the next proposal, re-checks
 under the lock, and never hands a waiter another caller's cancellation.
 `a2c51771` the public gRPC reads: no provenance field on the request
@@ -1930,10 +1937,24 @@ sections defer to is therefore two-sided:
   guarantees hold, recorded in the `raft-engine` marker as "V2 in effect"
   and the precondition for the roadmap's README claims, is when every
   group reports no legacy-shape lock row left **and** every legacy commit
-  record written since activation has had its secondaries confirmed
-  (the coordinator's outstanding list drains to zero, the resolver having
-  settled the rest), a verification of outcomes, not merely of an empty
-  lock namespace. A V1 transaction that completed in a partial state
+  record written since activation has had its secondaries confirmed. That
+  confirmation is a durable Raft-replicated drain ledger. Before the first
+  activation entry, all nodes must run the ledger-aware code, stop admitting
+  untracked V1 work, and settle any pre-ledger V1 transaction; an outcome
+  whose participants cannot be reconstructed keeps the gate closed. Every
+  V1 transaction admitted during the transition records its stable identity,
+  primary group, and complete participant set before PREPARE, then replicates
+  its decision and each secondary confirmation. The coordinator's outstanding
+  list is only a cache rebuilt from this ledger after restart; the resolver
+  updates it as secondaries settle. A V1 transaction without a reconstructible
+  participant record cannot cross the activation boundary, and the marker
+  cannot be written while any ledger entry is incomplete or any earlier
+  legacy outcome lacks confirmation. The gate is tested by crashing the
+  coordinator after a primary decision and before secondary publication:
+  restart must reconstruct the pending participant and keep V2 out of effect
+  until confirmation is replicated. This verifies outcomes, rather than
+  inferring them from an empty lock namespace. A V1 transaction that
+  completed in a partial state
   before activation is pre-existing damage that activation cannot detect;
   the claims are forward-looking from "V2 in effect". An operator flag pins the format to V1
   for a deployment that must keep an old binary around, with a startup
