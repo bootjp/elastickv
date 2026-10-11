@@ -1262,7 +1262,7 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
    **Raft-purpose DEKs** must satisfy a different,
    WAL-driven criterion because retaining MVCC versions does
    not cover their use sites — the raft envelope ciphertext
-   lives in the etcd raft WAL and in raft snapshots, not in
+   lives in the etcd raft WAL, not in the FSM snapshots or
    Pebble values. Specifically:
    - Every node's persisted Raft log start index (the lower
      bound of un-truncated entries; advances with snapshot
@@ -1274,10 +1274,11 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
      updated on every leader Wrap. The former is exposed as
      `etcd_raft_log_compact_index` per node.
    - Every node's last committed Raft snapshot must be **at
-     or past the rotation entry's index**. A node restored
-     from an older snapshot replays the entries between that
-     snapshot and the rotation, and those were proposed under
-     the retiring DEK.
+     or past that group's largest index proposed under the retiring
+     DEK**. A node restored from an older snapshot can replay entries
+     encrypted under the retiring DEK. Non-default groups have no
+     rotation entry in their own index space, so the per-group
+     high-water mark is the boundary to check.
 
      The signal is the snapshot's own Raft index
      (`raftpb.SnapshotMetadata.Index`), which advances with

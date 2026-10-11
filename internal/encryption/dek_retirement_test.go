@@ -32,6 +32,45 @@ func readyStorage(node string, minRetained uint64) encryption.StorageRetirementR
 	}
 }
 
+func classifyStorage(members []string, reports []encryption.StorageRetirementReport, keyID uint32, largestCommitTS uint64) (encryption.RetirementDecision, error) {
+	return encryption.ClassifyStorageDEKRetirement(members, reports, keyID,
+		encryption.StorageRetirementBoundary{KeyID: keyID, LargestCommitTS: largestCommitTS, Observed: true})
+}
+
+func TestStorageRetirementRejectsUnboundHighWaterMark(t *testing.T) {
+	t.Parallel()
+	reports := []encryption.StorageRetirementReport{
+		readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
+	}
+	for _, boundary := range []encryption.StorageRetirementBoundary{
+		{KeyID: retiringKeyID + 1, LargestCommitTS: 100, Observed: true},
+		{KeyID: retiringKeyID, LargestCommitTS: 0, Observed: false},
+	} {
+		_, err := encryption.ClassifyStorageDEKRetirement(retireMembers, reports, retiringKeyID, boundary)
+		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+	}
+	d, err := classifyStorage(retireMembers, reports, retiringKeyID, 0)
+	require.NoError(t, err)
+	require.True(t, d.Eligible, "an observed zero high-water mark means this key was unused")
+}
+
+func TestRetirementRejectsReportsOutsideMembership(t *testing.T) {
+	t.Parallel()
+	storage := []encryption.StorageRetirementReport{
+		readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
+	}
+	_, err := classifyStorage([]string{"n1", "n2"}, storage, retiringKeyID, 100)
+	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+	require.ErrorContains(t, err, "nonmembers")
+
+	raft := []encryption.RaftRetirementReport{
+		readyRaft("n1", 500, 500), readyRaft("n2", 500, 500), readyRaft("n3", 1, 1),
+	}
+	_, err = encryption.ClassifyRaftDEKRetirement([]string{"n1", "n2"}, raft, retiringKeyID, boundaries(100))
+	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+	require.ErrorContains(t, err, "nonmembers")
+}
+
 func boundaries(largestProposed uint64) map[uint64]encryption.RaftGroupBoundary {
 	return map[uint64]encryption.RaftGroupBoundary{
 		retireGroup: {KeyID: retiringKeyID, LargestProposedIndex: largestProposed},
@@ -58,7 +97,7 @@ func readyRaft(node string, compact, snapshot uint64) encryption.RaftRetirementR
 func TestStorageRetirementEligibleWhenEveryCriterionHolds(t *testing.T) {
 	t.Parallel()
 
-	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	d, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
 		}, retiringKeyID, 100)
@@ -77,7 +116,7 @@ func TestStorageRetirementRefusesWhileAnyNodeStillHoldsValues(t *testing.T) {
 	behind := readyStorage("n2", 200)
 	behind.ValuesPerDEK = 7
 
-	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	d, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), behind, readyStorage("n3", 200),
 		}, retiringKeyID, 100)
@@ -95,7 +134,7 @@ func TestStorageRetirementRefusesWhileTheRewriteIsIncomplete(t *testing.T) {
 	partial := readyStorage("n3", 200)
 	partial.RewriteCursorComplete = false
 
-	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	d, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), readyStorage("n2", 200), partial,
 		}, retiringKeyID, 100)
@@ -111,7 +150,7 @@ func TestStorageRetirementRequiresMinRetainedTSStrictlyPastTheCommitTS(t *testin
 
 	const largestCommitTS = uint64(100)
 
-	equal, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	equal, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", largestCommitTS),
 			readyStorage("n2", largestCommitTS),
@@ -121,7 +160,7 @@ func TestStorageRetirementRequiresMinRetainedTSStrictlyPastTheCommitTS(t *testin
 	require.False(t, equal.Eligible,
 		"minRetainedTS equal to the commit_ts still admits a read at that version")
 
-	past, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	past, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", largestCommitTS+1),
 			readyStorage("n2", largestCommitTS+1),
@@ -216,7 +255,7 @@ func TestRetirementRefusesAPartialReport(t *testing.T) {
 
 	// n3 never reported. Treating silence as success is how a single
 	// unreachable replica ends up replaying against an unloaded DEK.
-	_, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	_, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 200), readyStorage("n2", 200),
 		}, retiringKeyID, 100)
@@ -237,7 +276,7 @@ func TestRetirementRefusesAPartialReport(t *testing.T) {
 func TestRetirementRefusesAnEmptyMembership(t *testing.T) {
 	t.Parallel()
 
-	_, err := encryption.ClassifyStorageDEKRetirement(nil, nil, retiringKeyID, 100)
+	_, err := classifyStorage(nil, nil, retiringKeyID, 100)
 	require.True(t, errors.Is(err, encryption.ErrIncompleteRetirementReport))
 
 	_, err = encryption.ClassifyRaftDEKRetirement(nil, nil, retiringKeyID, boundaries(300))
@@ -255,7 +294,7 @@ func TestRetirementBlockersNameEveryOffendingNode(t *testing.T) {
 	bad3 := readyStorage("n3", 200)
 	bad3.RewriteCursorComplete = false
 
-	d, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	d, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{bad1, readyStorage("n2", 200), bad3}, retiringKeyID, 100)
 	require.NoError(t, err)
 	require.False(t, d.Eligible)
@@ -333,7 +372,7 @@ func TestRetirementRefusesDuplicateNodeReports(t *testing.T) {
 		blocked := readyStorage("n2", 200)
 		blocked.ValuesPerDEK = 7
 
-		_, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+		_, err := classifyStorage(retireMembers,
 			[]encryption.StorageRetirementReport{
 				readyStorage("n1", 200),
 				blocked,
@@ -384,7 +423,7 @@ func TestRetirementRefusesTheStillActiveDEK(t *testing.T) {
 		// Every criterion passes; only the active key is wrong.
 		reports[1].ActiveKeyID = retiringKeyID
 
-		_, err := encryption.ClassifyStorageDEKRetirement(
+		_, err := classifyStorage(
 			retireMembers, reports, retiringKeyID, 100)
 		require.ErrorIs(t, err, encryption.ErrRetiringDEKStillActive)
 	})
@@ -411,7 +450,7 @@ func TestRetirementRefusesTheStillActiveDEK(t *testing.T) {
 		// Zero means "no key active", which cannot be treated as a successor.
 		reports[0].ActiveKeyID = 0
 
-		_, err := encryption.ClassifyStorageDEKRetirement(
+		_, err := classifyStorage(
 			retireMembers, reports, retiringKeyID, 100)
 		require.ErrorIs(t, err, encryption.ErrRetiringDEKStillActive)
 	})
@@ -428,7 +467,7 @@ func TestRetirementRefusesAReportForAnotherKey(t *testing.T) {
 	}
 	reports[1].ReportedKeyID = retiringKeyID + 99
 
-	_, err := encryption.ClassifyStorageDEKRetirement(
+	_, err := classifyStorage(
 		retireMembers, reports, retiringKeyID, 100)
 	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
 }
@@ -436,7 +475,7 @@ func TestRetirementRefusesAReportForAnotherKey(t *testing.T) {
 func TestRetirementRequiresTheRetiringKeyID(t *testing.T) {
 	t.Parallel()
 
-	_, err := encryption.ClassifyStorageDEKRetirement(retireMembers, nil, 0, 100)
+	_, err := classifyStorage(retireMembers, nil, 0, 100)
 	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
 
 	_, err = encryption.ClassifyRaftDEKRetirement(
@@ -581,7 +620,7 @@ func TestRaftRetirementRequiresPerGroupBoundaries(t *testing.T) {
 func TestRetirementErrSentinelComesFromTheClassifier(t *testing.T) {
 	t.Parallel()
 
-	storage, err := encryption.ClassifyStorageDEKRetirement(retireMembers,
+	storage, err := classifyStorage(retireMembers,
 		[]encryption.StorageRetirementReport{
 			readyStorage("n1", 1), readyStorage("n2", 1), readyStorage("n3", 1),
 		}, retiringKeyID, 100)

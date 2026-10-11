@@ -20,7 +20,7 @@ import (
 //
 // The two purposes have genuinely different criteria because their
 // ciphertext lives in different places — Pebble values for storage,
-// the etcd raft WAL and snapshots for raft — so retaining MVCC
+// the etcd raft WAL for raft — so retaining MVCC
 // versions does not cover the raft case at all.
 
 // ErrDEKStillReferenced reports that a storage DEK cannot be retired
@@ -81,6 +81,15 @@ type StorageRetirementReport struct {
 	MinRetainedTS uint64
 }
 
+// StorageRetirementBoundary is the retiring key's collected commit high-water
+// mark. Observed distinguishes a genuinely unused key from a missing metric
+// whose zero value would otherwise look safe.
+type StorageRetirementBoundary struct {
+	KeyID           uint32
+	LargestCommitTS uint64
+	Observed        bool
+}
+
 // RaftGroupRetirementReport is one node's view of ONE Raft group.
 //
 // Per group, because Raft log and snapshot indexes live in independent
@@ -100,8 +109,8 @@ type RaftGroupRetirementReport struct {
 	// largest index ever proposed under the retiring DEK in this group.
 	LogCompactIndex uint64
 	// SnapshotIndex is the Raft index of this group's last committed
-	// snapshot. See RaftRetirementReport.SnapshotIndex for why it is the
-	// snapshot's own index rather than raft_envelope_cutover_index.
+	// snapshot. It is the snapshot's own index rather than the one-shot
+	// raft_envelope_cutover_index: a restore replays later WAL entries.
 	SnapshotIndex uint64
 }
 
@@ -143,35 +152,6 @@ type RaftRetirementReport struct {
 	// Groups is this node's per-group view. Every group the node hosts must
 	// be present, because the DEK is shared across all of them.
 	Groups []RaftGroupRetirementReport
-	// LogCompactIndex is this node's persisted Raft log start index —
-	// the lower bound of un-truncated entries, exposed as
-	// etcd_raft_log_compact_index. It must be STRICTLY greater than
-	// the largest index ever proposed under the retiring DEK.
-	LogCompactIndex uint64
-	// SnapshotIndex is the Raft index of this node's last committed
-	// snapshot (raftpb.SnapshotMetadata.Index). It must be at least the
-	// rotation index: restoring from a snapshot taken BEFORE the
-	// rotation replays the entries between the snapshot and the
-	// rotation, and those were proposed under the retiring DEK.
-	//
-	// NOT the sidecar's raft_envelope_cutover_index, which §5.4's
-	// parenthetical names. That value is the one-shot Phase-2
-	// enablement index: applier.go preserves the original across every
-	// later rotation, and kv/fsm.go copies the unchanged value into
-	// each new snapshot header. It can therefore never be "past the
-	// rotation entry" for any post-cutover rotation, so a criterion
-	// built on it classifies the retiring raft DEK ineligible forever
-	// and no raft DEK could ever be retired.
-	//
-	// The cutover index also does not mean what that criterion needs.
-	// Per §4.4 the FSM snapshot stream "is ciphertext by construction"
-	// from the storage layer and "no additional wrapping is required at
-	// the snapshot layer" — a snapshot is not encrypted under any raft
-	// DEK, so "taken under the new raft DEK" can only be about which
-	// entries a restore would replay. That is exactly what the
-	// snapshot's own index expresses, and it advances with every
-	// snapshot install.
-	SnapshotIndex uint64
 }
 
 // RetirementDecision is the classifier's answer.
@@ -221,16 +201,21 @@ const (
 
 // ClassifyStorageDEKRetirement applies the §5.4 storage criteria.
 //
-// largestCommitTS is the largest commit_ts ever written under the
-// retiring DEK. members is the full cluster membership; a report is
+// boundary is the collected commit high-water mark for the retiring DEK.
+// members is the full cluster membership; a report is
 // required from each, because "cluster-wide" cannot be established
 // from a subset.
 func ClassifyStorageDEKRetirement(
-	members []string, reports []StorageRetirementReport, retiringKeyID uint32, largestCommitTS uint64,
+	members []string, reports []StorageRetirementReport, retiringKeyID uint32, boundary StorageRetirementBoundary,
 ) (RetirementDecision, error) {
 	if retiringKeyID == 0 {
 		return RetirementDecision{}, errors.Wrap(ErrIncompleteRetirementReport,
 			"retiring key id is required")
+	}
+	if !boundary.Observed || boundary.KeyID != retiringKeyID {
+		return RetirementDecision{}, errors.Wrapf(ErrIncompleteRetirementReport,
+			"storage boundary missing or describes key %d, not retiring key %d",
+			boundary.KeyID, retiringKeyID)
 	}
 	byNode := make(map[string]StorageRetirementReport, len(reports))
 	for _, r := range reports {
@@ -239,18 +224,30 @@ func ClassifyStorageDEKRetirement(
 		}
 		byNode[r.NodeID] = r
 	}
-	if err := requireFullCoverage(members, func(n string) bool {
-		_, ok := byNode[n]
-		return ok
-	}); err != nil {
+	if err := requireExactNodeCoverage(members, byNode); err != nil {
 		return RetirementDecision{}, err
 	}
 
+	blockers, err := storageRetirementBlockers(members, byNode, retiringKeyID, boundary.LargestCommitTS)
+	if err != nil {
+		return RetirementDecision{}, err
+	}
+	sort.Strings(blockers)
+	return RetirementDecision{
+		Purpose:  RetirementPurposeStorage,
+		Eligible: len(blockers) == 0,
+		Blockers: blockers,
+	}, nil
+}
+
+func storageRetirementBlockers(
+	members []string, byNode map[string]StorageRetirementReport, retiringKeyID uint32, largestCommitTS uint64,
+) ([]string, error) {
 	var blockers []string
 	for _, node := range members {
 		r := byNode[node]
 		if err := checkReportKeyBinding(node, r.ReportedKeyID, r.ActiveKeyID, retiringKeyID); err != nil {
-			return RetirementDecision{}, err
+			return nil, err
 		}
 		if !r.RewriteCursorComplete {
 			blockers = append(blockers,
@@ -268,12 +265,7 @@ func ClassifyStorageDEKRetirement(
 					node, r.MinRetainedTS, largestCommitTS))
 		}
 	}
-	sort.Strings(blockers)
-	return RetirementDecision{
-		Purpose:  RetirementPurposeStorage,
-		Eligible: len(blockers) == 0,
-		Blockers: blockers,
-	}, nil
+	return blockers, nil
 }
 
 // ClassifyRaftDEKRetirement applies the §5.4 raft criteria.
@@ -302,10 +294,7 @@ func ClassifyRaftDEKRetirement(
 		}
 		byNode[r.NodeID] = r
 	}
-	if err := requireFullCoverage(members, func(n string) bool {
-		_, ok := byNode[n]
-		return ok
-	}); err != nil {
+	if err := requireExactNodeCoverage(members, byNode); err != nil {
 		return RetirementDecision{}, err
 	}
 
@@ -490,32 +479,37 @@ func duplicateReportErr(nodeID string) error {
 		"node %s reported more than once", nodeID)
 }
 
-// requireFullCoverage rejects a report set that does not cover every
-// member, and a membership list that is empty.
-//
-// Duplicates are caught by the callers, not here. This function
-// previously compared the number of unique reporting nodes against the
-// membership size, which cannot detect a duplicate at all: if every
-// member is covered, the unique count equals the membership size
-// whether or not a node reported twice, and if a member is missing the
-// `missing` check above already fires.
-//
-// An empty membership is refused rather than treated as trivially
-// satisfied: "no members reported a problem" is not evidence when
-// nobody was asked.
-func requireFullCoverage(members []string, covered func(string) bool) error {
+// requireExactNodeCoverage compares the membership snapshot and reports in
+// both directions. A report from a node omitted by membership is not safe to
+// ignore: it may contain the only old-key blocker.
+func requireExactNodeCoverage[T any](members []string, byNode map[string]T) error {
 	if len(members) == 0 {
 		return errors.Wrap(ErrIncompleteRetirementReport, "cluster membership is empty")
 	}
+	memberSet := make(map[string]struct{}, len(members))
 	var missing []string
 	for _, node := range members {
-		if !covered(node) {
+		if _, duplicate := memberSet[node]; duplicate {
+			return errors.Wrapf(ErrIncompleteRetirementReport, "member %s listed more than once", node)
+		}
+		memberSet[node] = struct{}{}
+		if _, ok := byNode[node]; !ok {
 			missing = append(missing, node)
 		}
 	}
 	if len(missing) > 0 {
 		sort.Strings(missing)
 		return errors.Wrapf(ErrIncompleteRetirementReport, "no report from %v", missing)
+	}
+	var extra []string
+	for node := range byNode {
+		if _, ok := memberSet[node]; !ok {
+			extra = append(extra, node)
+		}
+	}
+	if len(extra) > 0 {
+		sort.Strings(extra)
+		return errors.Wrapf(ErrIncompleteRetirementReport, "reports from nonmembers %v", extra)
 	}
 	return nil
 }
