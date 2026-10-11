@@ -121,7 +121,9 @@ type Status struct {
 	// is rejected while this is true.
 	PendingConfChange bool
 	// PerPeer reports each remote replica's replication progress as
-	// the LEADER sees it, keyed by numeric node id. It is nil on a
+	// the LEADER sees it, keyed by numeric node id. Each value also
+	// carries the operator-facing server ID used by PromoteLearner.
+	// It is nil on a
 	// follower, where raft tracks no progress for anyone else — an
 	// empty map there would be indistinguishable from "the leader
 	// knows about no peers".
@@ -149,6 +151,8 @@ type Status struct {
 // PeerProgress is one remote replica's replication progress from the
 // leader's tracker.
 type PeerProgress struct {
+	// ID is the operator-facing peer identity accepted by PromoteLearner.
+	ID string
 	// Match is the highest log index known to be replicated to this
 	// peer. PromoteLearner compares it against the min_applied_index
 	// the caller supplies — which must be a catch-up TARGET, not this

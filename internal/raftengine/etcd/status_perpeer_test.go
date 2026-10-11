@@ -49,7 +49,13 @@ func TestStatusPerPeerReportsLearnerProgressOnTheLeader(t *testing.T) {
 
 	require.True(t, progress.IsLearner,
 		"progress must come from the live tracker, which knows this peer is a learner")
+	require.Equal(t, nodes[1].peer.ID, progress.ID,
+		"the status must expose the identity accepted by PromoteLearner")
 	require.GreaterOrEqual(t, progress.Next, progress.Match)
+	statusCopy := leader.engine.Status()
+	delete(statusCopy.PerPeer, learnerNodeID)
+	require.Contains(t, leader.engine.Status().PerPeer, learnerNodeID,
+		"callers must not mutate the engine's published status map")
 
 	// The CORRECT use: watch Match climb to a target and pass the
 	// TARGET. Passing the learner's own current Match would satisfy

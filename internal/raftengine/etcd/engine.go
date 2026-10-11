@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -1598,7 +1599,9 @@ func (e *Engine) Status() raftengine.Status {
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.status
+	status := e.status
+	status.PerPeer = maps.Clone(status.PerPeer)
+	return status
 }
 
 func (e *Engine) Configuration(ctx context.Context) (raftengine.Configuration, error) {
@@ -3886,7 +3889,11 @@ func (e *Engine) peerProgress(state raftengine.State) map[uint64]raftengine.Peer
 			// about remote replicas.
 			return
 		}
+		e.mu.RLock()
+		peerID := e.peers[id].ID
+		e.mu.RUnlock()
 		out[id] = raftengine.PeerProgress{
+			ID:           peerID,
 			Match:        pr.Match,
 			Next:         pr.Next,
 			IsLearner:    pr.IsLearner,
