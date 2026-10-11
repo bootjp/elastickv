@@ -14,12 +14,13 @@ import (
 )
 
 type stubLeaderCoordinator struct {
-	isLeader          bool
-	verify            error
-	linearizableErr   error
-	linearizableCalls int
-	leader            string
-	clock             *HLC
+	isLeader           bool
+	verify             error
+	linearizableErr    error
+	linearizableCalls  int
+	onLinearizableRead func()
+	leader             string
+	clock              *HLC
 }
 
 func (s *stubLeaderCoordinator) Dispatch(context.Context, *OperationGroup[OP]) (*CoordinateResponse, error) {
@@ -52,10 +53,59 @@ func (s *stubLeaderCoordinator) RaftLeaderForKey([]byte) string {
 
 func (s *stubLeaderCoordinator) LinearizableRead(context.Context) (uint64, error) {
 	s.linearizableCalls++
+	if s.onLinearizableRead != nil {
+		s.onLinearizableRead()
+	}
 	if !s.isLeader {
 		return 0, ErrLeaderNotFound
 	}
 	return 0, s.linearizableErr
+}
+
+func TestLeaderRoutedStore_GlobalCommittedTimestampFloorWaitsForApply(t *testing.T) {
+	ctx := context.Background()
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(ctx, []byte("hot"), []byte("old"), 10, 0))
+	require.NoError(t, local.PutAt(ctx, []byte("other"), []byte("x"), 20, 0))
+	var applyErr error
+	coord := &stubLeaderCoordinator{isLeader: true}
+	coord.onLinearizableRead = func() {
+		applyErr = local.PutAt(ctx, []byte("hot"), []byte("new"), 15, 0)
+	}
+	s := NewLeaderRoutedStore(local, coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ts, err := s.GlobalCommittedTimestampFloor(ctx)
+	require.NoError(t, err)
+	require.NoError(t, applyErr)
+	require.Equal(t, 1, coord.linearizableCalls)
+	require.Equal(t, uint64(20), ts)
+	value, err := local.GetAt(ctx, []byte("hot"), ts)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), value)
+}
+
+func TestLeaderRoutedStore_GlobalCommittedTimestampFloorProxiesFencedLeader(t *testing.T) {
+	fake := &fakeRawKVServer{
+		wantLatestGroupID: 1,
+		latestResp:        &pb.RawLatestCommitTSResponse{Ts: 30, GroupId: 1, LeaderFenced: true},
+	}
+	addr, stop := startRawKVServer(t, fake)
+	t.Cleanup(stop)
+	coord := &stubLeaderCoordinator{leader: addr}
+	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)
+	t.Cleanup(func() { _ = s.Close() })
+
+	ts, err := s.GlobalCommittedTimestampFloor(context.Background())
+	require.NoError(t, err)
+	require.Equal(t, uint64(30), ts)
+	require.Equal(t, 0, coord.linearizableCalls)
+
+	fake.mu.Lock()
+	fake.latestResp.LeaderFenced = false
+	fake.mu.Unlock()
+	_, err = s.GlobalCommittedTimestampFloor(context.Background())
+	require.ErrorIs(t, err, ErrTSOCommitFloorUnavailable)
 }
 
 func (s *stubLeaderCoordinator) LinearizableReadForKey(ctx context.Context, _ []byte) (uint64, error) {

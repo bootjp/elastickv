@@ -13,6 +13,8 @@ func TestDynamoDBCleanupDeletedTableGeneration_RetriesRouteFence(t *testing.T) {
 	t.Parallel()
 
 	st := store.NewMVCCStore()
+	sealKey := dynamoItemSnapshotSealKey("table-a", 7, []byte("item"))
+	require.NoError(t, st.PutAt(context.Background(), sealKey, []byte{1}, 1, 0))
 	coord := &cleanupRouteFenceCoordinator{
 		localAdapterCoordinator: newLocalAdapterCoordinator(st),
 		failuresRemaining:       1,
@@ -21,7 +23,9 @@ func TestDynamoDBCleanupDeletedTableGeneration_RetriesRouteFence(t *testing.T) {
 
 	err := server.cleanupDeletedTableGeneration(context.Background(), "table-a", 7)
 	require.NoError(t, err)
-	require.Equal(t, 3, coord.calls, "first prefix is retried once, second prefix succeeds once")
+	require.Equal(t, 4, coord.calls, "first prefix is retried once, then the item, index, and seal prefixes succeed")
+	_, err = st.GetAt(context.Background(), sealKey, st.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
 
 type cleanupRouteFenceCoordinator struct {
