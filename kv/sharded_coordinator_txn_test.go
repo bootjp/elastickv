@@ -25,6 +25,28 @@ type recordingTransactional struct {
 	onCommit  func(call int, req *pb.Request)
 }
 
+func TestShardedCoordinatorFollowerSealUsesLeaderCommitTimestamp(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+	txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 9, CommitTS: 123}}}
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: &recordingTSOEngine{state: raftengine.StateFollower}, Store: store.NewMVCCStore(), Txn: txn},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups))
+	request := &OperationGroup[OP]{
+		IsTxn: true, StartTS: 10,
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("seal"), Value: []byte{1}}},
+	}
+	resp, err := DispatchWithLeaderIssuedCommitTS(context.Background(), coord, request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(123), resp.CommitTS)
+	require.Len(t, txn.requests, 1)
+	meta, err := DecodeTxnMeta(txn.requests[0].Mutations[0].Value)
+	require.NoError(t, err)
+	require.Zero(t, meta.CommitTS, "the follower must leave the commit timestamp for the leader")
+}
+
 func (s *recordingTransactional) Commit(_ context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()

@@ -1661,6 +1661,9 @@ func (c *ShardedCoordinator) dispatchTxn(
 	if err := c.validateCallerSuppliedTxnStart(ctx, startTS, singleShard, callerSuppliedStartTS); err != nil {
 		return nil, err
 	}
+	if resp, handled, err := c.maybeDispatchLeaderStampedTxn(ctx, singleShard, startTS, commitTS, prevCommitTS, primaryKey, gids, elems, readKeys, observedRouteVersion); handled {
+		return resp, err
+	}
 
 	commitTS, err = c.settleTxnCommitTimestamp(ctx, startTS, commitTS, elems, grouped, bypassKeysByGroup)
 	if err != nil {
@@ -1679,6 +1682,43 @@ func (c *ShardedCoordinator) dispatchTxn(
 		return nil, err
 	}
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup)
+}
+
+func (c *ShardedCoordinator) maybeDispatchLeaderStampedTxn(ctx context.Context, singleShard bool, startTS, commitTS, prevCommitTS uint64, primaryKey []byte, gids []uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64) (*CoordinateResponse, bool, error) {
+	if !singleShard || commitTS != 0 || ctx.Value(leaderIssuedCommitTSContextKey{}) != true {
+		return nil, false, nil
+	}
+	group := c.groups[gids[0]]
+	if group == nil || group.Engine == nil || isLeaderEngine(group.Engine) {
+		return nil, false, nil
+	}
+	resp, err := c.dispatchSingleShardTxnLeaderStamped(ctx, startTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion, c.writeFenceBypassKeysForElems(elems))
+	return resp, true, err
+}
+
+func (c *ShardedCoordinator) dispatchSingleShardTxnLeaderStamped(ctx context.Context, startTS, prevCommitTS uint64, primaryKey []byte, gid uint64, elems []*Elem[OP], readKeys [][]byte, observedRouteVersion uint64, writeFenceBypassKeys [][]byte) (*CoordinateResponse, error) {
+	g, err := c.txnGroupForID(gid)
+	if err != nil {
+		return nil, err
+	}
+	readKeys = c.readKeysWithStagedVisibilityAliasesForGroup(gid, readKeys)
+	readKeys = c.readKeysWithStagedVisibilityMutationAliasesForGroup(gid, readKeys, elems)
+	if len(readKeys) > maxReadKeys {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
+	resp, err := g.Txn.Commit(ctx, []*pb.Request{
+		onePhaseTxnRequestWithPrevCommit(startTS, 0, prevCommitTS, primaryKey, elems, readKeys, observedRouteVersion, writeFenceBypassKeys),
+	})
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if resp == nil || resp.CommitTS <= startTS {
+		return nil, errors.WithStack(ErrTxnCommitTSRequired)
+	}
+	if c.clock != nil {
+		c.clock.Observe(resp.CommitTS)
+	}
+	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: resp.CommitTS}, nil
 }
 
 // settleTxnCommitTimestamp resolves the commit timestamp and then applies the

@@ -266,7 +266,7 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	if !resp.Success {
 		return nil, ErrInvalidRequest
 	}
-	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
+	return &TransactionResponse{CommitIndex: resp.CommitIndex, CommitTS: resp.CommitTs}, nil
 }
 
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {

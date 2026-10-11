@@ -385,19 +385,22 @@ func (d *DynamoDBServer) tryTxnWriteTimestamp(ctx context.Context, label string,
 	if err != nil {
 		return kv.ReadTimestamp{}, err
 	}
-	sealTS, err := kv.NextTimestampAfterThrough(ctx, d.coordinator, floor.Timestamp(), label+": allocate seal timestamp")
-	if err != nil {
-		return kv.ReadTimestamp{}, errors.WithStack(err)
-	}
+	var sealTS uint64
 	for _, elems := range groups {
 		request := &kv.OperationGroup[kv.OP]{IsTxn: true, StartTS: floor.Timestamp(), CommitTS: sealTS, Elems: elems}
-		resp, err := kv.DispatchWithReadTimestamp(floor.WithDispatchVoucher(ctx), d.coordinator, request)
+		var resp *kv.CoordinateResponse
+		if sealTS == 0 {
+			resp, err = kv.DispatchWithLeaderIssuedCommitTS(floor.WithDispatchVoucher(ctx), d.coordinator, request)
+		} else {
+			resp, err = kv.DispatchWithReadTimestamp(floor.WithDispatchVoucher(ctx), d.coordinator, request)
+		}
 		if err != nil {
 			return kv.ReadTimestamp{}, errors.WithStack(err)
 		}
-		if resp == nil || resp.CommitTS != sealTS {
+		if resp == nil || resp.CommitTS <= floor.Timestamp() || (sealTS != 0 && resp.CommitTS != sealTS) {
 			return kv.ReadTimestamp{}, errors.New("DynamoDB snapshot seal response has no matching commit timestamp")
 		}
+		sealTS = resp.CommitTS
 	}
 	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, d.coordinator, sealTS, label+": sealed snapshot")
 	return readTimestamp, errors.WithStack(err)

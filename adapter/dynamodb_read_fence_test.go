@@ -93,25 +93,36 @@ func (c *sealResultCoordinator) Dispatch(ctx context.Context, req *kv.OperationG
 	if !isDynamoSnapshotSealRequest(req) {
 		return c.occAdapterCoordinator.Dispatch(ctx, req)
 	}
-	c.sealCalls++
-	if c.sealTS == 0 {
-		c.sealTS = req.CommitTS
-	} else if c.sealTS != req.CommitTS {
-		return nil, errors.New("seal groups used different commit timestamps")
-	}
-	for _, elem := range req.Elems {
-		if !bytes.Equal(kv.RouteKey(elem.Key), kv.RouteKey(req.Elems[0].Key)) {
-			return nil, errors.New("seal request spans table routes")
-		}
-	}
-	if c.sealCalls == c.failAt {
-		return nil, errors.New("seal group unavailable")
+	if err := c.validateSealRequest(req); err != nil {
+		return nil, err
 	}
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
+	if resp != nil && c.sealCalls == 1 {
+		c.sealTS = resp.CommitTS
+	}
 	if resp != nil && c.omitTS {
 		resp.CommitTS = 0
 	}
 	return resp, err
+}
+
+func (c *sealResultCoordinator) validateSealRequest(req *kv.OperationGroup[kv.OP]) error {
+	c.sealCalls++
+	if c.sealCalls == 1 && req.CommitTS != 0 {
+		return errors.New("first seal did not request a leader-issued timestamp")
+	}
+	if c.sealCalls > 1 && c.sealTS != req.CommitTS {
+		return errors.New("seal groups used different commit timestamps")
+	}
+	for _, elem := range req.Elems {
+		if !bytes.Equal(kv.RouteKey(elem.Key), kv.RouteKey(req.Elems[0].Key)) {
+			return errors.New("seal request spans table routes")
+		}
+	}
+	if c.sealCalls == c.failAt {
+		return errors.New("seal group unavailable")
+	}
+	return nil
 }
 
 func TestDynamoDBSnapshotSealFailsWhenSecondTableFails(t *testing.T) {
