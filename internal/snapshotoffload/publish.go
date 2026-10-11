@@ -25,6 +25,24 @@ type PublishOptions struct {
 	BinaryVersion string
 	CreatedAt     time.Time
 	SpoolDir      string
+	// VerifyLeader, when set, is re-checked immediately before the manifest is
+	// committed. §4 requires leadership to hold at that instant, not merely when
+	// the snapshot was opened: spooling a multi-gigabyte payload takes long
+	// enough to lose an election. Failing here can leave an unreferenced
+	// content-addressed payload, which GC reclaims, but never a committed
+	// manifest naming a snapshot this node no longer had the right to publish.
+	VerifyLeader func(context.Context) error
+	// SkipIfNotNewerThan suppresses the publish when the persisted
+	// snapshot's index is not greater than this value. Zero disables
+	// the check.
+	//
+	// The comparison happens after the export is opened but BEFORE
+	// the payload is spooled, which is the whole point: a scheduler
+	// that ticks every 15 minutes over an unchanged snapshot would
+	// otherwise re-read, re-hash and re-fsync a multi-gigabyte
+	// payload every tick just to discover the object store already
+	// has it.
+	SkipIfNotNewerThan uint64
 }
 
 func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manifest, error) {
@@ -38,6 +56,10 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	defer func() { _ = export.Close() }()
 
 	metadata := export.Metadata()
+	if opts.SkipIfNotNewerThan > 0 && metadata.Index <= opts.SkipIfNotNewerThan {
+		return nil, errors.Wrapf(ErrSnapshotNotNewer,
+			"persisted snapshot index %d is not newer than %d", metadata.Index, opts.SkipIfNotNewerThan)
+	}
 	payloadFile, payloadSHA, payloadBytes, err := spoolExport(ctx, export, publishSpoolDir(opts))
 	if err != nil {
 		return nil, err
@@ -56,6 +78,19 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	if err := putPayload(ctx, opts.Store, payloadObjectKey, payloadFile, payloadBytes, payloadSHA); err != nil {
 		return nil, err
 	}
+	return commitManifest(ctx, opts, metadata, payloadObjectKey, payloadSHA)
+}
+
+// commitManifest builds, validates and commits the manifest once the payload is
+// durable. Split out of PublishPersistedSnapshot to keep that function inside
+// the cyclop budget after the leadership re-check landed.
+func commitManifest(
+	ctx context.Context,
+	opts PublishOptions,
+	metadata etcdraftengine.PersistedSnapshotExportMetadata,
+	payloadObjectKey string,
+	payloadSHA string,
+) (*Manifest, error) {
 	manifest, err := buildManifest(opts, metadata, payloadObjectKey, payloadSHA)
 	if err != nil {
 		return nil, err
@@ -63,7 +98,7 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	if err := validateManifest(*manifest); err != nil {
 		return nil, err
 	}
-	if err := putManifest(ctx, opts.Store, manifest, opts.CreatedAt.IsZero()); err != nil {
+	if err := putManifest(ctx, opts.Store, manifest, opts.CreatedAt.IsZero(), opts.VerifyLeader); err != nil {
 		return nil, err
 	}
 	return manifest, nil
@@ -75,7 +110,7 @@ func openPublishExport(dataDir string) (*etcdraftengine.PersistedSnapshotExport,
 		return nil, errors.Wrap(err, "open persisted snapshot export")
 	}
 	if !ok {
-		return nil, errors.Wrap(ErrObjectNotFound, "no persisted snapshot available")
+		return nil, errors.WithStack(ErrNoPersistedSnapshot)
 	}
 	return export, nil
 }
@@ -113,7 +148,13 @@ func buildManifest(
 	}, nil
 }
 
-func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest, reuseExistingCreatedAt bool) error {
+func putManifest(
+	ctx context.Context,
+	store ObjectStore,
+	manifest *Manifest,
+	reuseExistingCreatedAt bool,
+	verifyLeader func(context.Context) error,
+) error {
 	data, manifestSHA, err := manifest.MarshalCanonical()
 	if err != nil {
 		return err
@@ -124,6 +165,17 @@ func putManifest(ctx context.Context, store ObjectStore, manifest *Manifest, reu
 		return err
 	} else if exists {
 		return nil
+	}
+	// §4: leadership must hold at the instant the manifest is created,
+	// not merely before the absence probe above. That probe is a remote
+	// read whose latency is unbounded by anything the caller controls,
+	// so checking before it leaves a window in which a demoted node
+	// still commits a manifest — precisely the guarantee this
+	// scheduler exists to provide.
+	if verifyLeader != nil {
+		if err := verifyLeader(ctx); err != nil {
+			return errors.Wrap(err, "snapshot offload: leadership lost before manifest commit")
+		}
 	}
 	if err := createManifestObject(ctx, store, manifest, data, size, objectSHA, reuseExistingCreatedAt); err != nil {
 		return err
@@ -231,9 +283,22 @@ func manifestMatchesCandidate(existing Manifest, candidate Manifest, reuseExisti
 	return reflect.DeepEqual(existing, candidate)
 }
 
+// sameManifestExceptCreation compares a retry's candidate against the
+// committed manifest, ignoring the fields that legitimately differ
+// between two publishes of the SAME snapshot.
+//
+// BinaryVersion is one of them. It records which binary published the
+// artifact, not anything about the snapshot itself, so after an
+// upgrade a process that republishes an index it has not yet published
+// locally would otherwise conflict with the manifest the previous
+// binary committed — and keep failing every scan until Raft happens to
+// produce a new snapshot. The committed manifest keeps the original
+// publisher's version, which is the correct audit record for the
+// bytes that actually exist.
 func sameManifestExceptCreation(existing Manifest, candidate Manifest) bool {
 	candidate.CreatedAt = existing.CreatedAt
 	candidate.ManifestSHA256 = existing.ManifestSHA256
+	candidate.BinaryVersion = existing.BinaryVersion
 	return reflect.DeepEqual(existing, candidate)
 }
 
