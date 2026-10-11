@@ -23,7 +23,7 @@ import (
 // stable, so caching it cannot change a result; it only removes the
 // second call.
 //
-// The cache holds plaintext DEKs, which is why Reset exists: the
+// The cache holds plaintext DEKs, which is why Seal exists: the
 // keystore already retains every unretired DEK for the process
 // lifetime (historical versions need them), so this adds no new class
 // of exposure, but there is no reason to keep a second copy alive past

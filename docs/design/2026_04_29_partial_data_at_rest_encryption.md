@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8, 9A–9B, 9C-1, and 9C-2 shipped (5E deferred); remaining Stage 9 work open
+Status: Partial — Stages 0–8, 9A–9B, and 9C-1 through 9C-3 shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
