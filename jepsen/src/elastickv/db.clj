@@ -289,18 +289,27 @@
    (str "--proposer-node-id=" full-node-id)
    (str "--proposer-local-epoch=" local-epoch)])
 
+(defn enable-raft-envelope-args
+  "argv for the Raft envelope cutover. The same registered proposer identity
+  is required as for the storage cutover."
+  [endpoint full-node-id local-epoch]
+  [admin-bin "encryption" "enable-raft-envelope"
+   (str "--endpoint=" endpoint)
+   (str "--proposer-node-id=" full-node-id)
+   (str "--proposer-local-epoch=" local-epoch)])
+
 (defn parse-encryption-status
   "Parses `elastickv-admin encryption status` output into a map.
 
-  Returns :full-node-id and :local-epoch (needed as the proposer identity for
-  the cutover) and :storage-envelope-active (the only thing that proves the
-  cluster is storing ciphertext)."
+  Returns the unsigned :full-node-id and :local-epoch needed for cutover,
+  plus both envelope states that prove the cluster is storing ciphertext."
   [out]
   (let [field (fn [k] (second (re-find (re-pattern (str "(?m)^\\s*" k ":\\s*(\\S+)\\s*$")) out)))
-        num   (fn [k] (some-> (field k) Long/parseLong))]
+        num   (fn [k] (some-> (field k) bigint))]
     {:full-node-id            (num "full_node_id")
      :local-epoch             (num "local_epoch")
-     :storage-envelope-active (= "true" (field "storage_envelope_active"))}))
+     :storage-envelope-active (= "true" (field "storage_envelope_active"))
+     :raft-envelope-active    (pos? (or (num "raft_envelope_cutover_index") 0))}))
 
 (defn- encryption-status
   [node endpoint]
@@ -314,7 +323,7 @@
     (c/on node (c/su (c/exec encryption-setup-bin (str "--kek-file=" kek-file))))))
 
 (defn- activate-encryption!
-  "Bootstraps the DEKs and performs the §7.1 Phase-1 storage cutover, then
+  "Bootstraps the DEKs and performs both §7.1 envelope cutovers, then
   VERIFIES it applied.
 
   The verification is the point. --encryption-enabled only enables the
@@ -324,7 +333,8 @@
   against a cleartext cluster and could still report PASS -- which, as the §8.4
   gate's own rationale says, is worse than having no gate, because the run gets
   recorded as encryption evidence. So a cluster that does not report
-  storage_envelope_active here must fail setup rather than proceed."
+  storage_envelope_active or raft_envelope_cutover_index is absent here must
+  fail setup rather than proceed."
   [test node grpc-port raft-groups]
   (let [endpoint  (encryption-endpoint node grpc-port raft-groups)
         peers     (map #(encryption-endpoint % grpc-port raft-groups) (:nodes test))
@@ -333,12 +343,15 @@
     (info "bootstrapping encryption" endpoint)
     (c/on node (c/su (apply c/exec (bootstrap-args endpoint peers wrapped-s wrapped-r))))
     (let [{:keys [full-node-id local-epoch]} (encryption-status node endpoint)]
-      (when-not full-node-id
+      (when-not (and full-node-id (pos? full-node-id) (some? local-epoch))
         (throw (ex-info "encryption status did not report a full_node_id"
                         {:endpoint endpoint})))
       (info "enabling storage envelope" endpoint full-node-id local-epoch)
       (c/on node (c/su (apply c/exec (enable-storage-envelope-args
-                                       endpoint full-node-id (or local-epoch 0))))))
+                                       endpoint full-node-id local-epoch))))
+      (info "enabling Raft envelope" endpoint full-node-id local-epoch)
+      (c/on node (c/su (apply c/exec (enable-raft-envelope-args
+                                       endpoint full-node-id local-epoch)))))
     ;; Every node must report the cutover, not just the proposer: a node that
     ;; has not applied it is still writing cleartext, and the workload would be
     ;; measuring a half-encrypted cluster.
@@ -346,10 +359,12 @@
       (let [peer-endpoint (encryption-endpoint peer grpc-port raft-groups)]
         (util/await-fn
           (fn []
-            (when (:storage-envelope-active (encryption-status node peer-endpoint))
+            (when (let [state (encryption-status node peer-endpoint)]
+                    (and (:storage-envelope-active state)
+                         (:raft-envelope-active state)))
               true))
           {:timeout 60000
-           :log-message (str "waiting for storage envelope cutover on " peer)})))
+           :log-message (str "waiting for both envelope cutovers on " peer)})))
     (info "encryption active on every node")))
 
 (defrecord ElastickvDB [opts]

@@ -31,6 +31,13 @@
   (let [spec (first (filter #(= "--encryption" (second %)) cli/common-cli-opts))]
     (is (false? (:default (apply hash-map (drop 3 spec)))))))
 
+(deftest local-mode-refuses-an-encryption-claim
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                        #"--encryption requires managed Jepsen nodes"
+                        (cli/parse-common-opts
+                          {:nodes "n1" :faults "partition" :local true :encryption true}
+                          nil))))
+
 (deftest redis-workload-propagates-encryption-to-the-db
   (let [test-map (redis/elastickv-redis-test {:encryption true})]
     (is (true? (get-in test-map [:db :opts :encryption])))))
@@ -135,6 +142,12 @@
     (is (contains? args "--proposer-node-id=12345"))
     (is (contains? args "--proposer-local-epoch=7"))))
 
+(deftest enable-raft-envelope-carries-the-proposer-identity
+  (let [args (set (ekdb/enable-raft-envelope-args "n1:50051" 12345 7))]
+    (is (contains? args "enable-raft-envelope"))
+    (is (contains? args "--proposer-node-id=12345"))
+    (is (contains? args "--proposer-local-epoch=7"))))
+
 (deftest status-parsing-reads-the-fields-the-cutover-needs
   (let [out (str "capability:\n"
                  "  encryption_capable: true\n"
@@ -142,11 +155,22 @@
                  "  full_node_id:       8675309\n"
                  "  local_epoch:        3\n"
                  "sidecar:\n"
-                 "  storage_envelope_active:     true\n")
+                 "  storage_envelope_active:     true\n"
+                 "  raft_envelope_cutover_index: 42\n")
         got (ekdb/parse-encryption-status out)]
     (is (= 8675309 (:full-node-id got)))
     (is (= 3 (:local-epoch got)))
-    (is (true? (:storage-envelope-active got)))))
+    (is (true? (:storage-envelope-active got)))
+    (is (true? (:raft-envelope-active got)))))
+
+(deftest status-parsing-preserves-unsigned-node-id
+  (let [id 14577279956767878857N
+        got (ekdb/parse-encryption-status
+              (str "capability:\n  full_node_id:       " id "\n"
+                   "  local_epoch:        3\n"))]
+    (is (= id (:full-node-id got)))
+    (is (some #{(str "--proposer-node-id=" id)}
+              (ekdb/enable-raft-envelope-args "n1:50051" (:full-node-id got) 3)))))
 
 (deftest status-parsing-treats-an-inactive-envelope-as-inactive
   ;; The polling loop waits on this value, so a false must never read as true:
@@ -156,14 +180,17 @@
                  "  full_node_id:       1\n"
                  "  local_epoch:        0\n"
                  "sidecar:\n"
-                 "  storage_envelope_active:     false\n")
+                 "  storage_envelope_active:     false\n"
+                 "  raft_envelope_cutover_index: 0\n")
         got (ekdb/parse-encryption-status out)]
-    (is (false? (:storage-envelope-active got)))))
+    (is (false? (:storage-envelope-active got)))
+    (is (false? (:raft-envelope-active got)))))
 
 (deftest status-parsing-does-not-invent-an-active-envelope
   ;; A node with no sidecar omits the line entirely. Absent must not be active.
   (let [got (ekdb/parse-encryption-status "capability:\n  encryption_capable: false\n")]
     (is (false? (:storage-envelope-active got)))
+    (is (false? (:raft-envelope-active got)))
     (is (nil? (:full-node-id got)))))
 
 (deftest encryption-admin-targets-the-default-raft-group

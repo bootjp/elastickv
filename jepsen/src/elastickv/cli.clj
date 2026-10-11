@@ -101,6 +101,9 @@
                    (->> (remove str/blank?)
                         (map (comp keyword str/lower-case))
                         vec))]
+    (when (and local? (:encryption options))
+      (throw (ex-info "--encryption requires managed Jepsen nodes; --local does not set up encryption"
+                      {:local true :encryption true})))
     (assoc options
       :nodes node-list
       :faults faults
