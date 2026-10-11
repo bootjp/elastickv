@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"testing"
@@ -218,6 +219,24 @@ func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	require.Equal(t, want, routeKey(sealKey))
 	require.Equal(t, want, routeKey(gsiKey))
 	require.Equal(t, want, routeKey(txnLockKey(itemKey)))
+}
+
+func TestRoutePrefixRangeDynamoSealCleanupIsExactTable(t *testing.T) {
+	t.Parallel()
+	table := base64.RawURLEncoding.EncodeToString([]byte("foo"))
+	neighbor := base64.RawURLEncoding.EncodeToString([]byte("fooX"))
+	prefix := []byte(DynamoSealPrefix + table + "|7|")
+	start, end := RoutePrefixRange(prefix)
+	require.Equal(t, dynamoRouteTableKey([]byte(table)), start)
+	require.Equal(t, routePointRangeEnd(start), end)
+	neighborRoute := dynamoRouteTableKey([]byte(neighbor))
+	require.True(t, bytes.Compare(neighborRoute, start) >= 0)
+	require.False(t, bytes.Compare(neighborRoute, end) < 0,
+		"cleaning up foo must not touch fooX's route")
+
+	start, end = RoutePrefixRange([]byte(DynamoSealPrefix))
+	require.Equal(t, []byte(""), start)
+	require.Nil(t, end, "a whole-family cleanup must check every mapped route")
 }
 
 // TestRouteKey_CollapsesDynamoGenerationsToSameTableRoute proves that two

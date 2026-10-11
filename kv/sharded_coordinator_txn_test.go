@@ -48,6 +48,33 @@ func TestShardedCoordinatorFollowerSealUsesLeaderCommitTimestamp(t *testing.T) {
 	require.Zero(t, meta.CommitTS, "the follower must leave the commit timestamp for the leader")
 }
 
+type demotingSealEngine struct{ *recordingTSOEngine }
+
+func (*demotingSealEngine) VerifyLeader(context.Context) error {
+	return raftengine.ErrNotLeader
+}
+
+func TestShardedCoordinatorDemotingLeaderSealLeavesTimestampForForwarding(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte("a"), nil, 1)
+	txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 9, CommitTS: 123}}}
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: &demotingSealEngine{&recordingTSOEngine{state: raftengine.StateLeader}}, Store: store.NewMVCCStore(), Txn: txn},
+	}
+	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups))
+	request := &OperationGroup[OP]{
+		IsTxn: true, StartTS: 10,
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("seal"), Value: []byte{1}}},
+	}
+	resp, err := DispatchWithLeaderIssuedCommitTS(context.Background(), coord, request)
+	require.NoError(t, err)
+	require.Equal(t, uint64(123), resp.CommitTS)
+	require.Len(t, txn.requests, 1)
+	require.Zero(t, requestTxnMeta(t, txn.requests[0]).CommitTS,
+		"the unverified leader must leave the commit timestamp for forwarding")
+}
+
 type promotingSealEngine struct {
 	*recordingTSOEngine
 	stateCalls atomic.Uint32
@@ -87,6 +114,7 @@ func TestShardedCoordinatorSealStampsAfterPromotion(t *testing.T) {
 	}
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), NewShardStore(engine, groups))
 	shardEngine.stateCalls.Store(0)
+	require.Equal(t, raftengine.StateFollower, shardEngine.State(), "the request enters before promotion")
 	request := &OperationGroup[OP]{
 		IsTxn: true, StartTS: 10,
 		Elems: []*Elem[OP]{{Op: Put, Key: []byte("seal"), Value: []byte{1}}},

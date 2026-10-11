@@ -1761,10 +1761,6 @@ func (c *ShardedCoordinator) maybeDispatchLeaderStampedTxn(ctx context.Context, 
 	if !singleShard || commitTS != 0 || ctx.Value(leaderIssuedCommitTSContextKey{}) != true {
 		return nil, false, nil
 	}
-	group := c.groups[gids[0]]
-	if group == nil || group.Engine == nil || isLeaderEngine(group.Engine) {
-		return nil, false, nil
-	}
 	resp, err := c.dispatchSingleShardTxnLeaderStamped(ctx, startTS, prevCommitTS, primaryKey, gids[0], elems, readKeys, observedRouteVersion, c.writeFenceBypassKeysForElems(elems))
 	return resp, true, err
 }
