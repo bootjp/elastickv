@@ -39,16 +39,17 @@ one timestamp. That breaks the uniqueness OCC ordering assumes: the conflict
 check is `latestTS(key) > startTS`, and two commits sharing a timestamp can each
 read the other as not-newer.
 
-**Exposure (as of 2026-08-29; closed by §4a).** `adminTokenProtectedMethod`
+**Exposure (as of 2026-08-29; still open).** `adminTokenProtectedMethod`
 (`adapter/admin_grpc.go`) matched only the `/Admin/` prefix, so `Internal.Forward`
 was not behind the admin token. That was peer-port reach, not public-client
 reach, but it was unauthenticated at the gRPC layer, and the window stayed open
 for as long as the batch survived — unbounded under low write traffic.
 
-§4a closed this route: `Internal.Forward` is now inside the gate and the write
-forward carries the token. The underlying hole below is untouched — a caller who
-does hold the token can still persist at an unclaimed slot — which is why §3.2
-is still the fix.
+An attempted bearer-token gate was withdrawn after review: old followers cannot
+attach the new header during a rolling upgrade, the peer transport is plaintext,
+and the legacy coordinator has a separate forwarding path. A safe staged rollout
+and authenticated transport are prerequisites for §3.3. The slot-claim hole
+itself still needs §3.2.
 
 ## 2. Non-goals
 
@@ -110,44 +111,7 @@ that.
 §3.2 remains the fix and needs its own proposal, because the claim record is a
 wire/on-disk decision (§5 questions 2 and 3).
 
-Landed now, both decision-independent:
-
-- **§3.3 for `Internal.Forward`.** It was the only forward outside
-  `adminTokenProtectedMethod` while `ForwardAdminProposal` and
-  `ForwardLeaseRead` were inside it, which made it the cheapest route to the
-  validation path for anything with peer-port reach. Both halves shipped: the
-  server gate, and the token on the outbound write forward — protecting the
-  method without the credential would have broken forwarding rather than
-  authenticated it. An empty token still disables both ends, so an unconfigured
-  cluster is unaffected.
-
-  **Rolling upgrades.** Both halves ship in one binary, but a cluster does not
-  upgrade in one step. In a cluster that already has an admin token configured,
-  a node still running the older binary does not attach the header, so once an
-  upgraded node becomes group leader, writes entering an older follower and
-  forwarded to it are refused with `Unauthenticated` until that follower is
-  upgraded. **Upgrade every node before relying on the gate.** This is the same
-  window `ForwardLeaseRead` already shipped with -- it is gated server-side and
-  attaches the token, with no staged flag -- so this follows the established
-  rollout rather than inventing a second mechanism for the sibling RPC. A
-  cluster with no admin token configured is unaffected on both ends.
-
-  **The token is not confidential.** Every peer dial goes through
-  `internal.GRPCDialOptions`, which is `insecure.NewCredentials()` only; the
-  server has no peer-TLS option at all. So the bearer token crosses the node
-  network in cleartext -- as does the Raft traffic beside it, which an observer
-  on that network can already read and inject. The gate therefore raises the
-  bar against *reaching* the peer port, not against *observing* it, which is
-  the right reading of what §1's exposure was: unauthenticated reach to the
-  durable-timestamp validation path. Withholding the token on an insecure
-  connection would disable the gate in every existing deployment rather than
-  harden it, so confidentiality is left to peer mTLS, tracked separately.
-
-  `RelayPublish`, `ExportRangeVersions`, `ImportRangeVersions` and
-  `PromoteStagedVersions` remain outside the gate. Each needs the same
-  two-sided treatment, and their clients are built through the migration
-  factory rather than in this package, so they are tracked separately rather
-  than half-wired here.
+Landed now, independent of that decision:
 
 - **§6's invariant tests that do not depend on the option chosen.** Uniqueness
   across concurrent allocators (direct and batched) and strict monotonicity:
@@ -160,10 +124,10 @@ asserting current behaviour there would lock in the bug.
 
 ### Lifecycle
 
-This document is `_partial_`: §3.3 and the decision-independent half of §6 have
-shipped, while §3.2 — the durable per-slot claim that actually closes the hole —
-has not. It becomes `_implemented_` only when a claim record lands and the
-unclaimed-slot test in §6 can be written as a passing assertion.
+This document is `_partial_`: the decision-independent half of §6 has shipped.
+§3.3 needs a safe staged authentication rollout and authenticated peer transport;
+§3.2 needs a durable per-slot claim. It becomes `_implemented_` only when the
+claim record lands and the unclaimed-slot test in §6 passes.
 
 ## 5. Open questions
 

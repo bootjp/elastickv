@@ -756,19 +756,14 @@ func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
 // package-qualify the service name) does not silently bypass the auth gate.
 var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 
-// adminTokenProtectedMethod covers the Admin service plus three Internal RPCs:
-// ForwardAdminProposal, ForwardLeaseRead, and Forward. Each can carry work
-// protected by the admin token, so each must present the same credential.
+// adminTokenProtectedMethod covers the Admin service plus the two Internal
+// RPCs that carry admin work between nodes: a forwarded admin proposal and a
+// forwarded lease read are the same authority as a direct Admin call, so they
+// must present the same token.
 func adminTokenProtectedMethod(fullMethod string) bool {
 	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
 		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName ||
-		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName ||
-		// Internal.Forward persists at a caller-supplied timestamp, so it
-		// reaches the durable-timestamp validation path directly. It was the
-		// only forward left outside this gate while its two siblings were
-		// inside it, which made it the cheapest way to that path for anything
-		// with peer-port reach.
-		fullMethod == pb.Internal_Forward_FullMethodName
+		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName
 }
 
 // AdminTokenAuth builds a gRPC unary+stream interceptor pair enforcing
