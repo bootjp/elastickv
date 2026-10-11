@@ -60,7 +60,7 @@ func (d *DynamoDBServer) legacyMigrationSnapshot(
 	ctx context.Context,
 	tableName string,
 ) (kv.ReadTimestamp, *dynamoTableSchema, bool, error) {
-	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb legacy-table migration: begin read timestamp")
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb legacy-table migration: begin read timestamp", dynamoTableMetaKey(tableName))
 	if err != nil {
 		return kv.ReadTimestamp{}, nil, false, errors.WithStack(err)
 	}
@@ -161,13 +161,17 @@ func (d *DynamoDBServer) migrateLegacyItem(
 	if err != nil {
 		return err
 	}
-	unlock := d.lockItemUpdate(lockKey)
+	unlock, err := d.lockItemUpdate(ctx, lockKey)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb legacy-item migration: begin read timestamp")
+		sealKey := dynamoItemSnapshotSealKey(targetSchema.TableName, targetSchema.Generation, targetKey)
+		readTimestamp, err := d.beginTxnWriteTimestamp(ctx, "dynamodb legacy-item migration: begin read timestamp", [][]byte{sealKey})
 		if err != nil {
 			return errors.WithStack(err)
 		}
@@ -180,6 +184,7 @@ func (d *DynamoDBServer) migrateLegacyItem(
 			return nil
 		}
 		req.StartTS = readTS
+		req.ReadKeys = append(req.ReadKeys, sealKey)
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
 			return nil
@@ -313,7 +318,7 @@ func (d *DynamoDBServer) finalizeLegacyTableMigration(ctx context.Context, schem
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb finalize migration: begin read timestamp")
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb finalize migration: begin read timestamp", dynamoTableMetaKey(schema.TableName))
 	if err != nil {
 		return errors.WithStack(err)
 	}
