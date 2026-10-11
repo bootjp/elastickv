@@ -725,9 +725,8 @@ func TestDynamoDB_AdminPutItem_RejectsMismatchedPathValue(t *testing.T) {
 	require.False(t, exists)
 }
 
-// TestDynamoDB_AdminPutItem_ReportsMissingTable pins that the schema
-// lookup the key check performs surfaces an absent table as not-found
-// rather than as a validation error.
+// TestDynamoDB_AdminPutItem_ReportsMissingTable pins that the fenced
+// write-preparation lookup reports an absent table as not-found.
 func TestDynamoDB_AdminPutItem_ReportsMissingTable(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 1)

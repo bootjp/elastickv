@@ -343,9 +343,6 @@ func (d *DynamoDBServer) AdminPutItem(
 		adminPathKey:      pathKey,
 		checkAdminPathKey: true,
 	}
-	if err := d.assertPathKeyCoversPrimaryKey(ctx, tableName, pathKey, in.Item); err != nil {
-		return err
-	}
 	unlock, err := d.lockItemForWrite(ctx, tableName, in.Item)
 	if err != nil {
 		return translateDynamoAdminError(err)
@@ -357,28 +354,8 @@ func (d *DynamoDBServer) AdminPutItem(
 	return nil
 }
 
-// assertPathKeyCoversPrimaryKey rejects a PUT whose URL key does not
-// name every primary-key attribute the table's schema declares.
-//
-// The adapter verifies the path key's names and values against the item.
-// The HTTP layer has no schema access, so it cannot tell whether a
-// composite-key table's URL names every primary-key attribute.
-//
-// Only the adapter can make that judgement, which is why the URL key
-// is plumbed down here rather than validated above.
-func (d *DynamoDBServer) assertPathKeyCoversPrimaryKey(
-	ctx context.Context, tableName string, pathKey map[string]AdminAttributeValue, item map[string]attributeValue,
-) error {
-	schema, exists, err := d.loadTableSchema(ctx, tableName)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if !exists {
-		return ErrAdminDynamoNotFound
-	}
-	return validateAdminPathKeyCoversPrimaryKey(schema, pathKey, item)
-}
-
+// validateAdminPathKeyCoversPrimaryKey checks the URL key against the
+// schema and item loaded during write preparation at its fenced timestamp.
 func validateAdminPathKeyCoversPrimaryKey(
 	schema *dynamoTableSchema, pathKey map[string]AdminAttributeValue, item map[string]attributeValue,
 ) error {
