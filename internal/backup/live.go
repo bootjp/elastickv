@@ -77,7 +77,7 @@ func ScopeForKey(key []byte) (Scope, bool, error) {
 // to skip disabled adapters before running stricter scope parsing.
 func AdapterForKey(key []byte) (string, bool) {
 	switch {
-	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBTableGenPrefix, DDBItemPrefix, DDBGSIPrefix):
+	case hasAnyBackupPrefix(key, DDBTableMetaPrefix, DDBTableGenPrefix, DDBItemPrefix, DDBSealPrefix, DDBGSIPrefix):
 		return adapterDynamoDB, true
 	case hasAnyBackupPrefix(key,
 		S3BucketMetaPrefix, S3BucketGenPrefix, S3ObjectManifestPrefix,
