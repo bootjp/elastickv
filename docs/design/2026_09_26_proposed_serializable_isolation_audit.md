@@ -1995,17 +1995,29 @@ sections defer to is therefore two-sided:
   admission** checks capability: `AddLearner` / `AddVoter` on a V2 cluster
   ask the joining process for its capability report before proposing the
   conf change and refuse a node that does not advertise `txn_format_v2`.
-  The `raft-engine` marker (the same file that already records the
-  backend) records the format once V2 is first proposed, so a downgrade
-  after V2 traffic fails loudly (`ErrTxnFormatDowngrade`) instead of
-  applying V2 entries with V1 semantics, and the new binary refuses to
-  start a group whose configured peers include a node without the
-  capability while the marker says V2.
+  Every replica persists the V2 format in its own `raft-engine` marker
+  (the same file that already records the backend) **before** its first
+  V2 FSM apply or installation/restoration of a V2 snapshot. The marker
+  update is atomic, fsyncs the file and directory, and uses a form that
+  the shipped binary rejects at startup; the new binary reads both the
+  legacy `etcd` form and the V2 form. A marker-write failure halts apply
+  or restore before the durable applied index can advance or a read can
+  be served. This covers a follower that never proposes a V2 entry: its
+  WAL may omit an already-applied V2 envelope on restart, so the fatal
+  envelope alone cannot prevent a downgrade. A downgrade after V2
+  traffic fails loudly (`ErrTxnFormatDowngrade`) instead of applying V2
+  entries with V1 semantics, and the new binary refuses to start a group
+  whose configured peers include a node without the capability while
+  the marker says V2.
 - **Tests.** A two-binary simulation is out of reach in unit tests, so the
   evidence is: table tests that every gated verdict is a no-op for V1
   entries and active for V2; a coordinator test that the flag flips only on
   full capability and stays flipped; in-flight V1 transactions finishing
-  after the flip; the marker's downgrade refusal; and a Jepsen run of the
+  after the flip; a follower applying V2 before it ever proposes, then
+  restarting under the shipped binary and rejecting downgrade; V2
+  snapshot install/restore persisting the marker before serving; marker
+  fsync failure preventing applied-index advance; restart after the marker
+  write but before V2 apply; and a Jepsen run of the
   rolling-update script (`rolling-update.sh`, the deploy runbook) across
   the format change under the list-append workload.
 

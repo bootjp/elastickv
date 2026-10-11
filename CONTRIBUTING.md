@@ -19,7 +19,7 @@ Reviewers, human or automated, check changes against those two sections.
    even when it fits in one file. Write `docs/design/YYYY_MM_DD_proposed_<slug>.md` (see `docs/design/README.md` for the header block and lifecycle) and get it reviewed before implementing. A PR may carry the doc and the implementation, doc commit first.
 2. **Branch** `design/<slug>`; the PR body starts with `Design: docs/design/<file>`.
 3. **Review-found defects**: add a failing test that reproduces the issue first, then the fix, in the same PR.
-4. **Test evidence** in the PR description: `go test -race`, `make lint`, and the relevant Jepsen suite for replication / MVCC / OCC / Redis changes.
+4. **Test evidence** in the PR description: `make test` (all packages under `-race`), `make lint`, and the relevant Jepsen suite for replication / MVCC / OCC / Redis changes.
 
 ## Commands
 
