@@ -490,7 +490,7 @@ func validatePutItemAdminPathKey(in putItemInput, schema *dynamoTableSchema) err
 	if !in.checkAdminPathKey {
 		return nil
 	}
-	return validateAdminPathKeyCoversPrimaryKey(schema, in.adminPathKey)
+	return validateAdminPathKeyCoversPrimaryKey(schema, in.adminPathKey, in.Item)
 }
 
 func (d *DynamoDBServer) commitItemWrite(ctx context.Context, readTimestamp kv.ReadTimestamp, req *kv.OperationGroup[kv.OP]) error {

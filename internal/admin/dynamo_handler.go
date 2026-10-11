@@ -81,8 +81,8 @@ type TablesSource interface {
 	AdminGetItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) (*AdminItem, bool, error)
 	// AdminPutItem receives the URL key alongside the body so the
 	// adapter — which has schema access the HTTP layer lacks — can
-	// verify the key names every primary-key attribute the table
-	// declares.
+	// verify it names exactly the table's primary-key attributes and
+	// that their values match the body.
 	AdminPutItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue, item AdminItem) error
 	AdminDeleteItem(ctx context.Context, principal AuthPrincipal, table string, key map[string]AdminAttributeValue) error
 }

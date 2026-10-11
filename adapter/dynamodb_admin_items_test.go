@@ -704,7 +704,25 @@ func TestValidateAdminPathKeyDeduplicatesPrimaryKeyNames(t *testing.T) {
 	t.Parallel()
 	schema := &dynamoTableSchema{PrimaryKey: dynamoKeySchema{HashKey: "id", RangeKey: "id"}}
 	require.NoError(t, validateAdminPathKeyCoversPrimaryKey(schema,
-		map[string]AdminAttributeValue{"id": stringAttr("same-key")}))
+		map[string]AdminAttributeValue{"id": stringAttr("same-key")},
+		map[string]attributeValue{"id": newStringAttributeValue("same-key")}))
+}
+
+func TestDynamoDB_AdminPutItem_RejectsMismatchedPathValue(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	createTableForItemTests(t, srv, "path-value")
+
+	err := srv.AdminPutItem(context.Background(), fullAdminPrincipal, "path-value",
+		map[string]AdminAttributeValue{"id": stringAttr("other")},
+		AdminItem{Attributes: map[string]AdminAttributeValue{"id": stringAttr("target")}})
+	require.ErrorIs(t, err, ErrAdminDynamoValidation)
+	_, exists, err := srv.AdminGetItem(context.Background(), fullAdminPrincipal, "path-value",
+		map[string]AdminAttributeValue{"id": stringAttr("target")})
+	require.NoError(t, err)
+	require.False(t, exists)
 }
 
 // TestDynamoDB_AdminPutItem_ReportsMissingTable pins that the schema

@@ -337,14 +337,14 @@ func (d *DynamoDBServer) AdminPutItem(
 	if err := validateAdminAttributeMapKinds(item.Attributes); err != nil {
 		return err
 	}
-	if err := d.assertPathKeyCoversPrimaryKey(ctx, tableName, pathKey); err != nil {
-		return err
-	}
 	in := putItemInput{
 		TableName:         tableName,
 		Item:              adminToInternalAttributeMap(item.Attributes),
 		adminPathKey:      pathKey,
 		checkAdminPathKey: true,
+	}
+	if err := d.assertPathKeyCoversPrimaryKey(ctx, tableName, pathKey, in.Item); err != nil {
+		return err
 	}
 	unlock, err := d.lockItemForWrite(ctx, tableName, in.Item)
 	if err != nil {
@@ -360,18 +360,14 @@ func (d *DynamoDBServer) AdminPutItem(
 // assertPathKeyCoversPrimaryKey rejects a PUT whose URL key does not
 // name every primary-key attribute the table's schema declares.
 //
-// The HTTP layer already checks that each attribute IT received in the
-// URL is present in the body with the same value, but it has no schema
-// access — so it cannot tell that a composite-key table's URL segment
-// carried only the hash key while the body supplied the range key. The
-// write would then land on a row the URL never fully identified, which
-// is the difference between "update the item this URL names" and
-// "create some other item".
+// The adapter verifies the path key's names and values against the item.
+// The HTTP layer has no schema access, so it cannot tell whether a
+// composite-key table's URL names every primary-key attribute.
 //
 // Only the adapter can make that judgement, which is why the URL key
 // is plumbed down here rather than validated above.
 func (d *DynamoDBServer) assertPathKeyCoversPrimaryKey(
-	ctx context.Context, tableName string, pathKey map[string]AdminAttributeValue,
+	ctx context.Context, tableName string, pathKey map[string]AdminAttributeValue, item map[string]attributeValue,
 ) error {
 	schema, exists, err := d.loadTableSchema(ctx, tableName)
 	if err != nil {
@@ -380,18 +376,26 @@ func (d *DynamoDBServer) assertPathKeyCoversPrimaryKey(
 	if !exists {
 		return ErrAdminDynamoNotFound
 	}
-	return validateAdminPathKeyCoversPrimaryKey(schema, pathKey)
+	return validateAdminPathKeyCoversPrimaryKey(schema, pathKey, item)
 }
 
-func validateAdminPathKeyCoversPrimaryKey(schema *dynamoTableSchema, pathKey map[string]AdminAttributeValue) error {
+func validateAdminPathKeyCoversPrimaryKey(
+	schema *dynamoTableSchema, pathKey map[string]AdminAttributeValue, item map[string]attributeValue,
+) error {
 	required := []string{schema.PrimaryKey.HashKey}
 	if schema.PrimaryKey.RangeKey != "" && schema.PrimaryKey.RangeKey != schema.PrimaryKey.HashKey {
 		required = append(required, schema.PrimaryKey.RangeKey)
 	}
 	for _, name := range required {
-		if _, ok := pathKey[name]; !ok {
+		pathValue, ok := pathKey[name]
+		if !ok {
 			return errors.Wrapf(ErrAdminDynamoValidation,
 				"path key is missing primary key attribute %q", name)
+		}
+		bodyValue, ok := item[name]
+		if !ok || !attributeValueEqual(adminToInternalAttributeValue(pathValue), bodyValue) {
+			return errors.Wrapf(ErrAdminDynamoValidation,
+				"path key attribute %q does not match the item", name)
 		}
 	}
 	// Reject extras too: a URL key carrying an attribute the schema
