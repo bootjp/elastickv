@@ -108,6 +108,7 @@ type Transactional interface {
 
 type TransactionResponse struct {
 	CommitIndex uint64
+	CommitTS    uint64
 }
 
 func marshalRaftCommand(reqs []*pb.Request) ([]byte, error) {
