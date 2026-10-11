@@ -45,6 +45,13 @@ func NewLeaderProxyWithEngine(engine raftengine.Engine, opts ...TransactionOptio
 }
 
 func (p *LeaderProxy) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	return p.commitWithLocalStamp(ctx, reqs, nil)
+}
+
+// commitWithLocalStamp runs the shard coordinator's leader-issued timestamp
+// hook only after the proxy has selected and verified the local leader path.
+// A follower can become leader after the coordinator chose to forward a seal.
+func (p *LeaderProxy) commitWithLocalStamp(ctx context.Context, reqs []*pb.Request, stamp func(context.Context, []*pb.Request) (uint64, error)) (*TransactionResponse, error) {
 	if !isLeaderEngine(p.engine) {
 		return p.forwardWithRetry(ctx, reqs)
 	}
@@ -57,7 +64,23 @@ func (p *LeaderProxy) Commit(ctx context.Context, reqs []*pb.Request) (*Transact
 		return p.forwardWithRetry(ctx, reqs)
 	}
 	p.forwardBreaker.reset(leaderProxyIdentityFromEngine(p.engine))
-	return p.tm.Commit(ctx, reqs)
+	var commitTS uint64
+	if stamp != nil {
+		var err error
+		commitTS, err = stamp(ctx, reqs)
+		if err != nil {
+			return nil, err
+		}
+	}
+	resp, err := p.tm.Commit(ctx, reqs)
+	if err != nil || resp == nil || commitTS == 0 {
+		return resp, err
+	}
+	if resp.CommitTS != 0 && resp.CommitTS != commitTS {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
+	resp.CommitTS = commitTS
+	return resp, nil
 }
 
 func (p *LeaderProxy) Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
@@ -266,7 +289,7 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	if !resp.Success {
 		return nil, ErrInvalidRequest
 	}
-	return &TransactionResponse{CommitIndex: resp.CommitIndex}, nil
+	return &TransactionResponse{CommitIndex: resp.CommitIndex, CommitTS: resp.CommitTs}, nil
 }
 
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {
