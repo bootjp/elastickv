@@ -98,12 +98,12 @@ func (c *occAdapterCoordinator) Dispatch(ctx context.Context, req *kv.OperationG
 		return nil, err
 	}
 	if len(mutations) == 0 {
-		return &kv.CoordinateResponse{}, nil
+		return &kv.CoordinateResponse{CommitTS: commitTS}, nil
 	}
 	if err := c.store.ApplyMutations(ctx, mutations, req.ReadKeys, req.StartTS, commitTS); err != nil {
 		return nil, err
 	}
-	return &kv.CoordinateResponse{}, nil
+	return &kv.CoordinateResponse{CommitTS: commitTS}, nil
 }
 
 func (c *occAdapterCoordinator) collectMutations(_ context.Context, elems []*kv.Elem[kv.OP], _ uint64) ([]*store.KVPairMutation, error) {

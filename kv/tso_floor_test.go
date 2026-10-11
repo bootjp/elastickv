@@ -6,11 +6,37 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
+
+func TestShardStoreCommittedTimestampFloorForKeysSkipsUnrelatedUnavailableGroup(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1, State: distribution.RouteStateActive},
+			{RouteID: 2, Start: []byte("m"), End: []byte("z"), GroupID: 2, State: distribution.RouteStateActive},
+		},
+	}))
+	local := store.NewMVCCStore()
+	require.NoError(t, local.PutAt(context.Background(), []byte("apple"), []byte("v"), 42, 0))
+	shards := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Engine: &recordingTSOEngine{state: raftengine.StateLeader}, Store: local},
+		2: {Engine: &recordingTSOEngine{state: raftengine.StateFollower}, Store: store.NewMVCCStore()},
+	})
+	t.Cleanup(func() { require.NoError(t, shards.Close()) })
+
+	floor, err := shards.CommittedTimestampFloorForKeys(context.Background(), [][]byte{[]byte("apple"), []byte("apricot")})
+	require.NoError(t, err)
+	require.Equal(t, uint64(42), floor)
+	_, err = shards.CommittedTimestampFloorForKeys(context.Background(), [][]byte{[]byte("apple"), []byte("yak")})
+	require.ErrorIs(t, err, ErrTSOCommitFloorUnavailable)
+}
 
 type blockingFloorRawKVServer struct {
 	pb.UnimplementedRawKVServer
