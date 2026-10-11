@@ -58,11 +58,11 @@ func deleteS3TestObject(t *testing.T, server *S3Server, key, ifMatch string) *ht
 	return rec
 }
 
-func s3TestObjectExists(t *testing.T, server *S3Server, key string) bool {
+func s3TestObjectExists(t *testing.T, server *S3Server) bool {
 	t.Helper()
 
 	rec := httptest.NewRecorder()
-	server.handle(rec, newS3TestRequest(http.MethodHead, "/"+conditionalDeleteBucket+"/"+key, nil))
+	server.handle(rec, newS3TestRequest(http.MethodHead, "/"+conditionalDeleteBucket+"/"+conditionalDeleteKey, nil))
 	return rec.Code == http.StatusOK
 }
 
@@ -89,7 +89,7 @@ func TestS3ConditionalDeleteRefusesAStaleETag(t *testing.T) {
 	require.Equal(t, http.StatusPreconditionFailed, rec.Code,
 		"a delete conditioned on a superseded ETag must fail with 412")
 	require.Contains(t, rec.Body.String(), "PreconditionFailed")
-	require.True(t, s3TestObjectExists(t, server, conditionalDeleteKey),
+	require.True(t, s3TestObjectExists(t, server),
 		"the rewritten object must survive a refused conditional delete")
 }
 
@@ -102,7 +102,7 @@ func TestS3ConditionalDeleteAcceptsAMatchingETag(t *testing.T) {
 
 	rec := deleteS3TestObject(t, server, conditionalDeleteKey, etag)
 	require.Equal(t, http.StatusNoContent, rec.Code)
-	require.False(t, s3TestObjectExists(t, server, conditionalDeleteKey))
+	require.False(t, s3TestObjectExists(t, server))
 }
 
 // Quoted ETags are the wire form AWS uses, so both spellings must match.
@@ -116,6 +116,37 @@ func TestS3ConditionalDeleteAcceptsAQuotedETag(t *testing.T) {
 	require.Equal(t, http.StatusNoContent, rec.Code)
 }
 
+func TestS3ConditionalDeleteAcceptsWildcardAndETagList(t *testing.T) {
+	t.Parallel()
+
+	for _, ifMatch := range []string{"*", `"stale", "PLACEHOLDER"`} {
+		t.Run(ifMatch, func(t *testing.T) {
+			t.Parallel()
+			server := newConditionalDeleteS3Server(t)
+			etag := putS3TestObject(t, server, "first")
+			condition := strings.ReplaceAll(ifMatch, "PLACEHOLDER", etag)
+
+			rec := deleteS3TestObject(t, server, conditionalDeleteKey, condition)
+			require.Equal(t, http.StatusNoContent, rec.Code)
+			require.False(t, s3TestObjectExists(t, server))
+		})
+	}
+}
+
+func TestS3ConditionalDeleteRejectsBlankIfMatch(t *testing.T) {
+	t.Parallel()
+
+	server := newConditionalDeleteS3Server(t)
+	putS3TestObject(t, server, "first")
+	rec := httptest.NewRecorder()
+	req := newS3TestRequest(http.MethodDelete, "/"+conditionalDeleteBucket+"/"+conditionalDeleteKey, nil)
+	req.Header.Set("If-Match", "  ")
+	server.handle(rec, req)
+
+	require.Equal(t, http.StatusPreconditionFailed, rec.Code)
+	require.True(t, s3TestObjectExists(t, server))
+}
+
 // An unconditional delete must be unaffected: adding the header check must not
 // change the behaviour of every existing caller that does not send one.
 func TestS3UnconditionalDeleteIsUnchanged(t *testing.T) {
@@ -126,7 +157,7 @@ func TestS3UnconditionalDeleteIsUnchanged(t *testing.T) {
 
 	rec := deleteS3TestObject(t, server, conditionalDeleteKey, "")
 	require.Equal(t, http.StatusNoContent, rec.Code)
-	require.False(t, s3TestObjectExists(t, server, conditionalDeleteKey))
+	require.False(t, s3TestObjectExists(t, server))
 }
 
 // Delete stays idempotent for an absent key, with or without the header: S3
@@ -168,6 +199,21 @@ func TestValidateS3DeletePreconditions(t *testing.T) {
 		t.Parallel()
 		req := newS3TestRequest(http.MethodDelete, "/b/k", nil)
 		req.Header.Set("If-Match", "stale")
+		require.Error(t, validateS3DeletePreconditions(req, previous))
+	})
+
+	t.Run("multiple header lines match any strong etag", func(t *testing.T) {
+		t.Parallel()
+		req := newS3TestRequest(http.MethodDelete, "/b/k", nil)
+		req.Header.Add("If-Match", `"stale"`)
+		req.Header.Add("If-Match", `"abc123"`)
+		require.NoError(t, validateS3DeletePreconditions(req, previous))
+	})
+
+	t.Run("weak etag does not match", func(t *testing.T) {
+		t.Parallel()
+		req := newS3TestRequest(http.MethodDelete, "/b/k", nil)
+		req.Header.Set("If-Match", `W/"abc123"`)
 		require.Error(t, validateS3DeletePreconditions(req, previous))
 	})
 

@@ -2786,14 +2786,34 @@ func validateS3DeletePreconditions(r *http.Request, previous *s3ObjectManifest) 
 	if r == nil || previous == nil {
 		return nil
 	}
-	ifMatch := strings.TrimSpace(r.Header.Get("If-Match"))
-	if ifMatch == "" {
+	values, present := r.Header[http.CanonicalHeaderKey("If-Match")]
+	if !present {
 		return nil
 	}
-	if strings.Trim(ifMatch, `"`) != previous.ETag {
-		return errors.New("etag precondition failed")
+	for _, value := range values {
+		// S3 ETags contain no commas; multiple header lines and HTTP's
+		// comma-separated validator list have the same any-match rule.
+		for _, candidate := range strings.Split(value, ",") {
+			if s3DeleteIfMatchCandidateMatches(candidate, previous.ETag) {
+				return nil
+			}
+		}
 	}
-	return nil
+	return errors.New("etag precondition failed")
+}
+
+func s3DeleteIfMatchCandidateMatches(candidate, etag string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "*" {
+		return true
+	}
+	if strings.HasPrefix(candidate, "W/") {
+		return false // If-Match requires a strong comparison.
+	}
+	if strings.HasPrefix(candidate, `"`) && strings.HasSuffix(candidate, `"`) && len(candidate) >= 2 {
+		candidate = candidate[1 : len(candidate)-1]
+	}
+	return candidate != "" && candidate == etag
 }
 
 func cloneLeaderAddrMap(src map[string]string) map[string]string {
