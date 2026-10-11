@@ -687,6 +687,14 @@ func (s *LeaderRoutedStore) GlobalCommittedTimestampFloor(ctx context.Context) (
 	return resp.GetTs(), nil
 }
 
+// A LeaderRoutedStore contains one data group, independent of the key count.
+func (s *LeaderRoutedStore) CommittedTimestampFloorForKeys(ctx context.Context, keys [][]byte) (uint64, error) {
+	if len(keys) == 0 {
+		return 0, errors.WithStack(ErrTSOCommitFloorUnavailable)
+	}
+	return s.GlobalCommittedTimestampFloor(ctx)
+}
+
 // GroupCommittedTimestampFloor waits for Raft ReadIndex before sampling the
 // local applied watermark. A leader lease alone does not wait for a pending
 // committed entry whose timestamp is below LastCommitTS.

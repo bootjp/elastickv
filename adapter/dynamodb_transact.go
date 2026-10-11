@@ -266,7 +266,7 @@ func (d *DynamoDBServer) executeBatchWriteRequest(
 }
 
 func (d *DynamoDBServer) batchWriteRequestLockKey(ctx context.Context, tableName string, request batchWriteRequest) (string, error) {
-	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb batch item lock schema: begin read timestamp")
+	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb batch item lock schema: begin read timestamp", dynamoTableMetaKey(tableName))
 	if err != nil {
 		return "", err
 	}
@@ -675,43 +675,70 @@ func countTransactWriteItemActions(item transactWriteItem) int {
 }
 
 func (d *DynamoDBServer) transactWriteItemsWithRetry(ctx context.Context, in transactWriteItemsInput) error {
-	unlock, sealKeys, err := d.lockTransactWriteItems(ctx, in)
+	unlock, sealKeys, sealedGenerations, err := d.lockTransactWriteItems(ctx, in)
 	if err != nil {
 		return err
 	}
-	defer unlock()
+	defer func() {
+		if unlock != nil {
+			unlock()
+		}
+	}()
 
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	var lastErr error
 	for range transactRetryMaxAttempts {
-		reqs, generations, cleanupKeys, err := d.buildTransactWriteItemsRequest(ctx, in, sealKeys)
+		reqs, generations, cleanupKeys, err := d.buildTransactWriteItemsRequest(ctx, in, sealKeys, sealedGenerations)
+		if errors.Is(err, errDynamoSealGenerationChanged) {
+			unlock, sealKeys, sealedGenerations, err = d.refreshTransactWriteLocks(ctx, in, unlock, deadline, backoff)
+			if err != nil {
+				return err
+			}
+			backoff = nextTransactRetryBackoff(backoff)
+			continue
+		}
 		if err != nil {
 			return err
 		}
-		done, retryErr, fatalErr := d.runTransactWriteAttempt(ctx, reqs, generations, cleanupKeys)
-		if fatalErr != nil {
-			return fatalErr
+		done, err := d.runTransactWriteAttempt(ctx, reqs, generations, cleanupKeys, &lastErr)
+		if err != nil {
+			return err
 		}
 		if done {
 			return nil
 		}
-		if retryErr != nil {
-			lastErr = retryErr
-		}
-		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
-			if lastErr != nil {
-				combined := errors.Join(err, lastErr)
-				return errors.Wrap(combined, "transact write retry canceled")
-			}
-			return errors.WithStack(err)
+		if err := waitTransactWriteRetry(ctx, deadline, backoff, lastErr); err != nil {
+			return err
 		}
 		backoff = nextTransactRetryBackoff(backoff)
 	}
+	return transactWriteExhausted(lastErr)
+}
+
+func transactWriteExhausted(lastErr error) error {
 	if lastErr != nil {
 		return errors.Wrapf(lastErr, "transact write retry attempts exhausted after %s", transactRetryMaxDuration)
 	}
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "transact write retry attempts exhausted")
+}
+
+func (d *DynamoDBServer) refreshTransactWriteLocks(ctx context.Context, in transactWriteItemsInput, unlock func(), deadline time.Time, backoff time.Duration) (func(), [][]byte, map[string]uint64, error) {
+	unlock()
+	if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+		return nil, nil, nil, errors.WithStack(err)
+	}
+	return d.lockTransactWriteItems(ctx, in)
+}
+
+func waitTransactWriteRetry(ctx context.Context, deadline time.Time, backoff time.Duration, lastErr error) error {
+	if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+		if lastErr != nil {
+			return errors.Wrap(errors.Join(err, lastErr), "transact write retry canceled")
+		}
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 func (d *DynamoDBServer) runTransactWriteAttempt(
@@ -719,17 +746,19 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 	reqs *preparedTransactWriteItemsRequest,
 	generations map[string]uint64,
 	cleanupKeys [][]byte,
-) (bool, error, error) {
+	lastErr *error,
+) (bool, error) {
 	if len(reqs.group.Elems) == 0 {
-		return true, nil, nil
+		return true, nil
 	}
 	dispatchCtx := reqs.readTimestamp.WithDispatchVoucher(ctx)
 	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, reqs.group); err != nil {
 		wrapped := errors.WithStack(err)
 		if !isRetryableTransactWriteError(err) {
-			return false, nil, wrapped
+			return false, wrapped
 		}
-		return false, wrapped, nil
+		*lastErr = wrapped
+		return false, nil
 	}
 	retry, verifyErr := d.handleGenerationFenceResult(
 		ctx,
@@ -737,12 +766,12 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 		cleanupKeys,
 	)
 	if verifyErr != nil {
-		return false, nil, verifyErr
+		return false, verifyErr
 	}
 	if !retry {
-		return true, nil, nil
+		return true, nil
 	}
-	return false, nil, nil
+	return false, nil
 }
 
 type preparedTransactWriteItemsRequest struct {
@@ -750,7 +779,7 @@ type preparedTransactWriteItemsRequest struct {
 	group         *kv.OperationGroup[kv.OP]
 }
 
-func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput, sealKeys [][]byte) (*preparedTransactWriteItemsRequest, map[string]uint64, [][]byte, error) {
+func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in transactWriteItemsInput, sealKeys [][]byte, sealedGenerations map[string]uint64) (*preparedTransactWriteItemsRequest, map[string]uint64, [][]byte, error) {
 	// transactWriteItemsWithRetry completes legacy migration before acquiring
 	// item locks. Re-entering table locks here would deadlock BatchWriteItem,
 	// which holds a table lock while waiting for an item lock.
@@ -759,6 +788,11 @@ func (d *DynamoDBServer) buildTransactWriteItemsRequest(ctx context.Context, in 
 		return nil, nil, nil, errors.WithStack(err)
 	}
 	readTS := readTimestamp.Timestamp()
+	for name, generation := range sealedGenerations {
+		if err := d.verifySealedTableGeneration(ctx, name, generation, readTS); err != nil {
+			return nil, nil, nil, err
+		}
+	}
 	reqs := &kv.OperationGroup[kv.OP]{
 		IsTxn: true,
 		// Keep transaction start aligned with the snapshot used to evaluate

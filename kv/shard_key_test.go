@@ -209,11 +209,13 @@ func TestRouteKey_NormalizesDynamoKeysToTable(t *testing.T) {
 	metaKey := append([]byte(DynamoTableMetaPrefix), tableSegment...)
 	generationKey := append([]byte(DynamoTableGenerationPrefix), tableSegment...)
 	itemKey := append([]byte(DynamoItemPrefix+string(tableSegment)+"|7|"), []byte("pk\x00\x01")...)
+	sealKey := []byte(DynamoSealPrefix + string(tableSegment) + "|7|abcd")
 	gsiKey := append([]byte(DynamoGSIPrefix+string(tableSegment)+"|7|"+indexSegment+"|"), []byte("idx\x00\x01pk\x00\x01")...)
 
 	require.Equal(t, want, routeKey(metaKey))
 	require.Equal(t, want, routeKey(generationKey))
 	require.Equal(t, want, routeKey(itemKey))
+	require.Equal(t, want, routeKey(sealKey))
 	require.Equal(t, want, routeKey(gsiKey))
 	require.Equal(t, want, routeKey(txnLockKey(itemKey)))
 }

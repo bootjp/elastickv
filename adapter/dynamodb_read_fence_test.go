@@ -3,6 +3,7 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -59,7 +60,7 @@ func isDynamoSnapshotSealRequest(req *kv.OperationGroup[kv.OP]) bool {
 		return false
 	}
 	for _, elem := range req.Elems {
-		if elem == nil || !bytes.Contains(elem.Key, []byte("|!snapshot-seal|")) {
+		if elem == nil || !bytes.HasPrefix(elem.Key, []byte(dynamoSealPrefix)) {
 			return false
 		}
 	}
@@ -70,10 +71,97 @@ func TestDynamoDBSnapshotSealRoutesWithItem(t *testing.T) {
 	schema := dedupItemTable()
 	itemKey, err := schema.itemKeyFromAttributes(map[string]attributeValue{"pk": newStringAttributeValue(dedupTestKey)})
 	require.NoError(t, err)
-	sealKey := dynamoItemSnapshotSealKey(schema.TableName, itemKey)
+	sealKey := dynamoItemSnapshotSealKey(schema.TableName, schema.Generation, itemKey)
 	require.Equal(t, kv.RouteKey(itemKey), kv.RouteKey(sealKey))
 	require.NotContains(t, string(sealKey), string(itemKey))
 	require.False(t, bytes.HasPrefix(sealKey, dynamoItemPrefixForTable(schema.TableName, schema.Generation)))
+	require.True(t, bytes.HasPrefix(sealKey, dynamoSealPrefixForTable(schema.TableName, schema.Generation)))
+	require.Len(t, bytes.TrimPrefix(sealKey, dynamoSealPrefixForTable(schema.TableName, schema.Generation)), 4)
+	require.Equal(t, sealKey, dynamoItemSnapshotSealKey(schema.TableName, schema.Generation, itemKey))
+	require.NotEqual(t, sealKey, dynamoItemSnapshotSealKey(schema.TableName, schema.Generation+1, itemKey))
+}
+
+type sealResultCoordinator struct {
+	*occAdapterCoordinator
+	sealCalls int
+	sealTS    uint64
+	failAt    int
+	omitTS    bool
+}
+
+func (c *sealResultCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if !isDynamoSnapshotSealRequest(req) {
+		return c.occAdapterCoordinator.Dispatch(ctx, req)
+	}
+	c.sealCalls++
+	if c.sealTS == 0 {
+		c.sealTS = req.CommitTS
+	} else if c.sealTS != req.CommitTS {
+		return nil, errors.New("seal groups used different commit timestamps")
+	}
+	for _, elem := range req.Elems {
+		if !bytes.Equal(kv.RouteKey(elem.Key), kv.RouteKey(req.Elems[0].Key)) {
+			return nil, errors.New("seal request spans table routes")
+		}
+	}
+	if c.sealCalls == c.failAt {
+		return nil, errors.New("seal group unavailable")
+	}
+	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
+	if resp != nil && c.omitTS {
+		resp.CommitTS = 0
+	}
+	return resp, err
+}
+
+func TestDynamoDBSnapshotSealFailsWhenSecondTableFails(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	coord := &sealResultCoordinator{occAdapterCoordinator: newOCCAdapterCoordinator(st), failAt: 2}
+	server := NewDynamoDBServer(nil, st, coord)
+	keys := [][]byte{
+		dynamoItemSnapshotSealKey("alpha", 1, []byte("a")),
+		dynamoItemSnapshotSealKey("beta", 1, []byte("b")),
+	}
+	_, err := server.beginTxnWriteTimestamp(context.Background(), "two tables", keys)
+	require.ErrorContains(t, err, "seal group unavailable")
+	require.Equal(t, 2, coord.sealCalls)
+	require.NotZero(t, coord.sealTS)
+}
+
+func TestDynamoDBSnapshotSealRejectsMissingCommitTimestamp(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	coord := &sealResultCoordinator{occAdapterCoordinator: newOCCAdapterCoordinator(st), omitTS: true}
+	server := NewDynamoDBServer(nil, st, coord)
+	key := dynamoItemSnapshotSealKey("alpha", 1, []byte("a"))
+	_, err := server.beginTxnWriteTimestamp(context.Background(), "missing timestamp", [][]byte{key})
+	require.ErrorContains(t, err, "no matching commit timestamp")
+	require.Equal(t, 1, coord.sealCalls)
+}
+
+func TestDynamoDBSnapshotSealDetectsTableRecreation(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	writer := newDynamoFixtureWriter(t, st)
+	schema := dedupItemTable()
+	writer.writeSchema(schema)
+	server := NewDynamoDBServer(nil, st, newOCCAdapterCoordinator(st))
+	attrs := map[string]attributeValue{"pk": newStringAttributeValue(dedupTestKey)}
+	oldSeal, oldGeneration, err := server.itemSealKey(ctx, schema.TableName, attrs)
+	require.NoError(t, err)
+
+	recreated := *schema
+	recreated.Generation++
+	writer.writeSchema(&recreated)
+	sealed, err := server.beginTxnWriteTimestamp(ctx, "recreated table", [][]byte{oldSeal})
+	require.NoError(t, err)
+	require.ErrorIs(t, server.verifySealedTableGeneration(ctx, schema.TableName, oldGeneration, sealed.Timestamp()), errDynamoSealGenerationChanged)
+	newSeal, newGeneration, err := server.itemSealKey(ctx, schema.TableName, attrs)
+	require.NoError(t, err)
+	require.Equal(t, recreated.Generation, newGeneration)
+	require.NotEqual(t, oldSeal, newSeal)
 }
 
 func (c *blockedDynamoDispatchCoordinator) blockFirstDispatch(ctx context.Context, commitTS uint64) error {
@@ -312,7 +400,7 @@ func TestDynamoDBConditionCheckUsesItemLock(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
-		gotUnlock, _, lockErr := server.lockTransactWriteItems(ctx, input)
+		gotUnlock, _, _, lockErr := server.lockTransactWriteItems(ctx, input)
 		if lockErr == nil {
 			gotUnlock()
 		}

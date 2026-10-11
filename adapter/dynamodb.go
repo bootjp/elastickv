@@ -70,6 +70,7 @@ const (
 	dynamoTableMetaPrefix       = kv.DynamoTableMetaPrefix
 	dynamoTableGenerationPrefix = kv.DynamoTableGenerationPrefix
 	dynamoItemPrefix            = kv.DynamoItemPrefix
+	dynamoSealPrefix            = kv.DynamoSealPrefix
 	dynamoGSIPrefix             = kv.DynamoGSIPrefix
 	dynamoScanPageLimit         = 1024
 	dynamoKeyEscapeByte         = byte(0x00)
