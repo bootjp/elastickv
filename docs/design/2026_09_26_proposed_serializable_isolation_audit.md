@@ -356,9 +356,15 @@ Open after this branch:
   `nextTxnReadTS()` snapshot and can span groups: a lagging participant
   can later apply `c ≤ readTS`, so the supposedly atomic result is torn.
   Both must begin a leader snapshot over the groups they route to and read
-  under the capability, with tests in the completion set. (The Redis
-  adapter implements no `MGET` and the DynamoDB adapter no
-  `BatchGetItem`, so these two are the multi-key reads that exist.)
+  under the capability, with tests in the completion set. Until the router
+  exposes a stable route-subset snapshot, a `ConsistentRead` `Query` / `Scan`
+  page may conservatively cover every active data group; this adds leader
+  snapshot work for groups outside the eventual page but cannot weaken the
+  read. `TransactGetItems` validates its keys before fencing and covers the
+  distinct groups to which those keys and any result-affecting schema records
+  route. Invalid requests retain their existing 4xx ordering. The Redis
+  adapter implements no `MGET` and the DynamoDB adapter no `BatchGetItem`,
+  so these two are the multi-key reads that exist.
 - **Rolling upgrade.** Older followers skip the `0x0f` entry (a fence
   verdict divergence of the A0 class), an older node forwarding a snapshot
   read through the public `RawGet` gets `FailedPrecondition` from an
