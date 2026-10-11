@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"fmt"
+	"io"
 	"net"
 	"strings"
 	"sync"
@@ -670,11 +671,14 @@ type stubRedisConn struct {
 	lastString string
 }
 
-func (s *stubRedisConn) RemoteAddr() string             { return "127.0.0.1:9999" }
-func (s *stubRedisConn) Close() error                   { return nil }
-func (s *stubRedisConn) WriteError(msg string)          { s.lastError = msg }
-func (s *stubRedisConn) WriteString(str string)         { s.lastString = str }
-func (s *stubRedisConn) WriteBulk(bulk []byte)          {}
+func (s *stubRedisConn) RemoteAddr() string     { return "127.0.0.1:9999" }
+func (s *stubRedisConn) Close() error           { return nil }
+func (s *stubRedisConn) WriteError(msg string)  { s.lastError = msg }
+func (s *stubRedisConn) WriteString(str string) { s.lastString = str }
+func (s *stubRedisConn) WriteBulk(bulk []byte)  {}
+func (s *stubRedisConn) WriteBulkFrom(_ int64, _ io.Reader) {
+}
+
 func (s *stubRedisConn) WriteBulkString(bulk string)    {}
 func (s *stubRedisConn) WriteInt(num int)               {}
 func (s *stubRedisConn) WriteInt64(num int64)           {}

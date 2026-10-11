@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"io"
 	"math"
 	"net"
 	"strings"
@@ -54,6 +55,10 @@ func (c *helloRecordingConn) WriteString(s string) {
 func (c *helloRecordingConn) WriteBulk(bulk []byte) {
 	c.writes = append(c.writes, helloReplyElement{kind: "bulk", str: string(bulk)})
 }
+func (c *helloRecordingConn) WriteBulkFrom(n int64, reader io.Reader) {
+	c.WriteBulk(readTestBulk(n, reader))
+}
+
 func (c *helloRecordingConn) WriteBulkString(bulk string) {
 	c.writes = append(c.writes, helloReplyElement{kind: "bulk", str: bulk})
 }
