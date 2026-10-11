@@ -420,6 +420,8 @@ func adminPurgeOutcomeForError(err error) string {
 		return adminOutcomePurgeInProgress
 	case isSQSAdminQueueDoesNotExist(err):
 		return adminOutcomeNotFound
+	case errors.Is(err, ErrAdminNotLeader), isTransientLeaderRedisError(err):
+		return adminOutcomeNotLeader
 	default:
 		return adminOutcomeInternalError
 	}

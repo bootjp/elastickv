@@ -8,8 +8,17 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAdminQueueOutcomesClassifyLeaderChurn(t *testing.T) {
+	t.Parallel()
+	for _, err := range []error{ErrAdminNotLeader, ErrNotLeader, kv.ErrLeaderNotFound} {
+		require.Equal(t, adminOutcomeNotLeader, adminPurgeOutcomeForError(err))
+		require.Equal(t, adminOutcomeNotLeader, adminPeekOutcomeForError(err))
+	}
+}
 
 // captureAdminAudit points the server's audit logger at a buffer and returns a
 // reader for the admin.sqs.purge_queue records it emits.

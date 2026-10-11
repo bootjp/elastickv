@@ -276,17 +276,22 @@ func (h *SqsHandler) observePurgeRejection(name, outcome string) {
 // the counter and skips the audit leaves the §3.6 signal silent about exactly
 // the attempts an operator is looking for. Field names match the adapter's
 // record so both halves of admin.sqs.purge_queue parse identically.
-func (h *SqsHandler) recordPurgeRejection(r *http.Request, name, outcome string) {
+func (h *SqsHandler) recordPurgeRejection(r *http.Request, principal AuthPrincipal, name, outcome string) {
 	h.observePurgeRejection(name, outcome)
 
-	accessKey := ""
-	if principal, ok := PrincipalFromContext(r.Context()); ok {
-		accessKey = principal.AccessKey
-	}
 	h.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin.sqs.purge_queue",
-		slog.String("access_key", accessKey),
+		slog.String("access_key", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
 		slog.String("queue", name),
 		slog.String("outcome", outcome))
+}
+
+func (h *SqsHandler) purgeAuditPrincipal(r *http.Request) AuthPrincipal {
+	principal, _ := PrincipalFromContext(r.Context())
+	if h.roles != nil && principal.AccessKey != "" {
+		principal.Role, _ = h.roles.LookupRole(principal.AccessKey)
+	}
+	return principal
 }
 
 // observePeekRejection records a peek outcome decided in the handler.
@@ -367,9 +372,6 @@ func (h *SqsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // validator just refused. The METHOD still identifies the operation, which is
 // what the §3.6 series is keyed on.
 func (h *SqsHandler) observeRouteRejection(r *http.Request, escaped, outcome string) {
-	if h.admin == nil {
-		return
-	}
 	if !strings.Contains(escaped, "/"+sqsSubResourceMessages) {
 		// Not a messages route, so neither purge nor peek: queue CRUD has no
 		// §3.6 counter of its own.
@@ -377,9 +379,9 @@ func (h *SqsHandler) observeRouteRejection(r *http.Request, escaped, outcome str
 	}
 	switch r.Method {
 	case http.MethodDelete:
-		h.admin.ObserveAdminPurgeQueue("", outcome)
+		h.recordPurgeRejection(r, h.purgeAuditPrincipal(r), "", outcome)
 	case http.MethodGet:
-		h.admin.ObserveAdminPeekQueue("", outcome)
+		h.observePeekRejection("", outcome)
 	}
 }
 
@@ -736,11 +738,11 @@ func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name st
 		// unauthorized purge attempt appears in the counter and in the generic
 		// HTTP audit, but never in admin.sqs.purge_queue, which is the record
 		// an operator greps.
-		h.recordPurgeRejection(r, name, string(outcome))
+		h.recordPurgeRejection(r, principal, name, string(outcome))
 		return
 	}
 	if strings.TrimSpace(name) == "" {
-		h.recordPurgeRejection(r, name, adminQueueOutcomeValidation)
+		h.recordPurgeRejection(r, principal, name, adminQueueOutcomeValidation)
 		writeJSONError(w, http.StatusBadRequest, "invalid_queue_name", "queue name is required")
 		return
 	}
@@ -850,12 +852,14 @@ func (h *SqsHandler) gateWrite(
 			// the JWT claimed.
 			writeJSONError(w, http.StatusForbidden, "forbidden",
 				"this access key is not authorised to "+action)
-			return AuthPrincipal{}, gateForbid
+			principal.Role = ""
+			return principal, gateForbid
 		}
 		if !live.AllowsWrite() {
 			writeJSONError(w, http.StatusForbidden, "forbidden",
 				"this access key is not authorised to "+action)
-			return AuthPrincipal{}, gateForbid
+			principal.Role = live
+			return principal, gateForbid
 		}
 		// Forward the live role downstream so the adapter
 		// re-check sees the same role the handler gated on.
@@ -866,7 +870,7 @@ func (h *SqsHandler) gateWrite(
 	} else if !principal.Role.AllowsWrite() {
 		writeJSONError(w, http.StatusForbidden, "forbidden",
 			"this access key is not authorised to "+action)
-		return AuthPrincipal{}, gateForbid
+		return principal, gateForbid
 	}
 	return principal, gateAllowed
 }

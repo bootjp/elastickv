@@ -313,4 +313,28 @@ func TestSqsHandlerAuditsAPurgeRefusedBeforeTheAdapter(t *testing.T) {
 	require.Equal(t, adminQueueOutcomeForbidden, record["outcome"])
 	require.Equal(t, "orders", record["queue"])
 	require.Equal(t, "AKIA_RO", record["access_key"])
+	require.Equal(t, string(RoleReadOnly), record["role"],
+		"the audit role must be the live role that refused the purge")
+}
+
+func TestSqsHandlerAuditsMalformedPurgeWithoutMetrics(t *testing.T) {
+	t.Parallel()
+	var buf bytes.Buffer
+	h := NewSqsHandler(&stubQueuesSource{}).
+		WithLogger(slog.New(slog.NewJSONHandler(&buf, nil))).
+		WithRoleStore(MapRoleStore{"AKIA_RO": RoleReadOnly})
+	req := httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders//messages", nil)
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+		AuthPrincipal{AccessKey: "AKIA_RO", Role: RoleFull}))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	require.Equal(t, http.StatusBadRequest, rec.Code)
+
+	var audit map[string]any
+	require.NoError(t, json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &audit))
+	require.Equal(t, "admin.sqs.purge_queue", audit["msg"])
+	require.Equal(t, adminQueueOutcomeValidation, audit["outcome"])
+	require.Equal(t, "", audit["queue"])
+	require.Equal(t, "AKIA_RO", audit["access_key"])
+	require.Equal(t, string(RoleReadOnly), audit["role"])
 }

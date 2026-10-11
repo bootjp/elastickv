@@ -273,6 +273,8 @@ func adminPeekOutcomeForError(err error) string {
 		return adminOutcomeNotFound
 	case isSQSAdminQueueDoesNotExist(err):
 		return adminOutcomeNotFound
+	case errors.Is(err, ErrAdminNotLeader), isTransientLeaderRedisError(err):
+		return adminOutcomeNotLeader
 	default:
 		return adminOutcomeInternalError
 	}
