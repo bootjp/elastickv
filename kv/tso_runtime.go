@@ -187,6 +187,14 @@ func (d *DynamicTimestampAllocator) PhaseDRequired() bool {
 	return ok && state.PhaseDRequired()
 }
 
+func (d *DynamicTimestampAllocator) PhaseDFloor() uint64 {
+	source, ok := d.currentTimestampAllocator().(TSOPhaseDFloorSource)
+	if !ok {
+		return 0
+	}
+	return source.PhaseDFloor()
+}
+
 func (d *DynamicTimestampAllocator) Invalidate() {
 	invalidateTimestampWindow(d.currentTimestampAllocator())
 }

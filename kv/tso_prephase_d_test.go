@@ -90,14 +90,14 @@ func TestClassifyPrePhaseDCommitUsesTheRecordWhenItCanReadIt(t *testing.T) {
 		t.Parallel()
 		require.NoError(t, ClassifyPrePhaseDCommit(
 			PrimaryCommitEvidence{Readable: true, Found: true, CommitTS: claimed},
-			claimed, false, false))
+			claimed, false))
 	})
 
 	t.Run("a disagreeing record refuses even inside the window", func(t *testing.T) {
 		t.Parallel()
 		err := ClassifyPrePhaseDCommit(
 			PrimaryCommitEvidence{Readable: true, Found: true, CommitTS: claimed + 1},
-			claimed, false, true)
+			claimed, false)
 		require.ErrorIs(t, err, ErrPrePhaseDCommitUnproven)
 	})
 
@@ -105,49 +105,43 @@ func TestClassifyPrePhaseDCommitUsesTheRecordWhenItCanReadIt(t *testing.T) {
 		t.Parallel()
 		err := ClassifyPrePhaseDCommit(
 			PrimaryCommitEvidence{Readable: true, Found: false},
-			claimed, false, true)
+			claimed, false)
 		require.ErrorIs(t, err, ErrPrePhaseDCommitUnproven)
 	})
 }
 
-// TestClassifyPrePhaseDCommitFallsBackToTheWindow covers the case §4.1 alone
+// TestClassifyPrePhaseDCommitAllowsRemoteResolution covers the case §4.1 alone
 // cannot answer: the primary lives on another group, so there is no evidence to
 // draw a verdict from and refusing outright would break legitimate cross-shard
 // legacy resolution.
-func TestClassifyPrePhaseDCommitFallsBackToTheWindow(t *testing.T) {
+func TestClassifyPrePhaseDCommitAllowsRemoteResolution(t *testing.T) {
 	t.Parallel()
 
 	const claimed = uint64(4242)
 	remote := PrimaryCommitEvidence{Readable: false}
 
-	require.NoError(t, ClassifyPrePhaseDCommit(remote, claimed, false, true),
-		"inside the window a remote-primary resolution is still admitted")
-	require.ErrorIs(t,
-		ClassifyPrePhaseDCommit(remote, claimed, false, false),
-		ErrPrePhaseDWindowClosed)
+	require.NoError(t, ClassifyPrePhaseDCommit(remote, claimed, false),
+		"remote-primary legacy resolution remains open after the creation window closes")
 }
 
 // An ABORT synthesises its timestamp rather than replaying a recorded one, so
-// no record can ever support it. It is always a window decision, even when the
+// no record can ever support it. It remains admissible, even when the
 // primary is local — requiring a record there would refuse every legitimate
 // abort resolution.
-func TestClassifyPrePhaseDCommitTreatsAbortAsAWindowDecision(t *testing.T) {
+func TestClassifyPrePhaseDCommitAllowsAbortWithoutRecord(t *testing.T) {
 	t.Parallel()
 
 	const claimed = uint64(4242)
 	// Readable and with no matching record: a COMMIT would be refused here.
 	local := PrimaryCommitEvidence{Readable: true, Found: false}
 
-	require.NoError(t, ClassifyPrePhaseDCommit(local, claimed, true, true),
+	require.NoError(t, ClassifyPrePhaseDCommit(local, claimed, true),
 		"an abort's timestamp is synthesised, so the absent record proves nothing")
-	require.ErrorIs(t,
-		ClassifyPrePhaseDCommit(local, claimed, true, false),
-		ErrPrePhaseDWindowClosed)
 
 	// And the same evidence DOES refuse a commit, which is what makes the
 	// distinction meaningful rather than a blanket exemption.
 	require.ErrorIs(t,
-		ClassifyPrePhaseDCommit(local, claimed, false, true),
+		ClassifyPrePhaseDCommit(local, claimed, false),
 		ErrPrePhaseDCommitUnproven)
 }
 
@@ -156,9 +150,10 @@ func TestClassifyPrePhaseDCommitTreatsAbortAsAWindowDecision(t *testing.T) {
 type stubPrePhaseDAllocator struct {
 	floor     uint64
 	prePhaseD bool
+	nowTS     uint64
 }
 
-func (s *stubPrePhaseDAllocator) Next(context.Context) (uint64, error) { return 1, nil }
+func (s *stubPrePhaseDAllocator) Next(context.Context) (uint64, error) { return s.nowTS, nil }
 func (s *stubPrePhaseDAllocator) PhaseDActive() bool                   { return true }
 func (s *stubPrePhaseDAllocator) PhaseDRequired() bool                 { return true }
 func (s *stubPrePhaseDAllocator) PhaseDFloor() uint64                  { return s.floor }
@@ -181,20 +176,17 @@ func TestForwardedStartTimestampClosesAfterTheAdmissionWindow(t *testing.T) {
 	t.Parallel()
 
 	alloc := &stubPrePhaseDAllocator{floor: testPhaseDFloor(), prePhaseD: true}
-	restore := prePhaseDNowMillis
-	t.Cleanup(func() { prePhaseDNowMillis = restore })
 
 	// Inside the window: a transaction that began before the marker is still
 	// entitled to prepare.
-	prePhaseDNowMillis = func() int64 { return testPhaseDActivationMs }
+	alloc.nowTS = testPhaseDFloor() + 1
 	require.NoError(t, ValidateForwardedTxnStartTimestamp(
 		context.Background(), alloc, 1, "test"))
 
 	// Past it, no transaction can still legitimately be preparing at a pre-D
 	// start, so a fresh pre-D intent cannot be created.
-	prePhaseDNowMillis = func() int64 {
-		return testPhaseDActivationMs + prePhaseDAdmissionWindow.Milliseconds() + 1
-	}
+	const closedMs = uint64(testPhaseDActivationMs) + maxTxnLockTTLms + 3_600_000 + 1
+	alloc.nowTS = closedMs << HLCLogicalBits
 	err := ValidateForwardedTxnStartTimestamp(context.Background(), alloc, 1, "test")
 	require.ErrorIs(t, err, ErrPrePhaseDWindowClosed)
 }
@@ -205,24 +197,40 @@ func TestForwardedStartTimestampAfterPhaseDIsUnaffectedByTheWindow(t *testing.T)
 	t.Parallel()
 
 	alloc := &stubPrePhaseDAllocator{floor: testPhaseDFloor(), prePhaseD: false}
-	restore := prePhaseDNowMillis
-	t.Cleanup(func() { prePhaseDNowMillis = restore })
-	prePhaseDNowMillis = func() int64 {
-		return testPhaseDActivationMs + prePhaseDAdmissionWindow.Milliseconds()*10
-	}
+	const farAfterMs = uint64(testPhaseDActivationMs) + 10*(maxTxnLockTTLms+3_600_000)
+	alloc.nowTS = farAfterMs << HLCLogicalBits
 
 	require.NoError(t, ValidateForwardedTxnStartTimestamp(
 		context.Background(), alloc, 1, "test"),
 		"a timestamp group 0 actually issued is valid whenever it arrives")
 }
 
-// An allocator that cannot report the floor leaves the window OPEN. The bound
-// exists to narrow a carve-out; a missing signal must not turn it into a
-// refusal that strands legitimate legacy resolution.
-func TestForwardedStartTimestampWithoutAFloorSourceStaysOpen(t *testing.T) {
+// A Phase-D allocator with no floor fails closed for new PREPAREs.
+func TestForwardedStartTimestampWithoutAFloorSourceFailsClosed(t *testing.T) {
 	t.Parallel()
 
-	require.True(t, prePhaseDStartWithinWindow(&floorlessAllocator{}))
+	within, err := prePhaseDStartWithinWindow(context.Background(), &floorlessAllocator{})
+	require.NoError(t, err)
+	require.False(t, within)
+}
+
+func TestPrePhaseDFloorSurvivesProductionAllocatorWrappers(t *testing.T) {
+	t.Parallel()
+	floor := testPhaseDFloor()
+	local := &phaseDWindowTSO{floor: floor, nextBase: floor + 1, phaseD: true, leader: true}
+	routed, err := NewLeaderRoutedTSOAllocator(local, &recordingTSOEngine{})
+	require.NoError(t, err)
+	defer func() { require.NoError(t, routed.Close()) }()
+	batch, err := NewBatchAllocator(routed, 8)
+	require.NoError(t, err)
+	dynamic := NewDynamicTimestampAllocator(batch)
+
+	require.Equal(t, floor, routed.PhaseDFloor())
+	require.Equal(t, floor, batch.PhaseDFloor())
+	require.Equal(t, floor, dynamic.PhaseDFloor())
+	within, err := prePhaseDStartWithinWindow(context.Background(), dynamic)
+	require.NoError(t, err)
+	require.True(t, within)
 }
 
 type floorlessAllocator struct{}

@@ -35,13 +35,10 @@ import (
 //     pre-D start only inside that window shuts the fabrication route while
 //     leaving the commit carve-out open indefinitely, as correctness requires.
 //
-// The bound reads a wall clock, which CLAUDE.md restricts to diagnostics. It is
-// argued rather than assumed: this is an ADMISSION decision about whether a
-// request may create state, not an ordering decision about where that state
-// sorts. No visibility, OCC or MVCC comparison consults it, and a clock that is
-// wrong only widens or narrows who may create a pre-D intent -- it can never
-// place a write at the wrong point in the timestamp order. Skew therefore costs
-// availability for legacy resolution, never correctness.
+// The creation bound compares the marker with a newly issued timestamp from
+// the same durable TSO group. Receiver-local wall-clock rollback cannot reopen
+// a closed window. Legacy COMMIT and ABORT resolution remain admissible after
+// the creation window closes.
 
 const (
 	// prePhaseDAdmissionGrace is the slack added to the lock TTL when bounding
@@ -118,24 +115,18 @@ type PrimaryCommitEvidence struct {
 //
 // Where it is not readable -- the primary lives on another group -- there is no
 // verdict to draw from evidence, and refusing would break legitimate
-// cross-shard legacy resolution. Those fall back to the creation window, which
-// is what makes the fallback safe: past it no new pre-D intent can exist, so
-// the only resolutions left are for intents that genuinely predate the marker.
+// cross-shard legacy resolution. The creation gate prevents new pre-D intents
+// after the window closes, while resolution remains open for existing intents.
 //
 // An ABORT resolution synthesises its timestamp rather than replaying a
-// recorded one, so no record can support it; it is always a window decision.
+// recorded one, so no record can support it; it remains admissible.
 func ClassifyPrePhaseDCommit(
 	ev PrimaryCommitEvidence,
 	claimedCommitTS uint64,
 	isAbort bool,
-	withinWindow bool,
 ) error {
 	if isAbort || !ev.Readable {
-		if withinWindow {
-			return nil
-		}
-		return errors.Wrapf(ErrPrePhaseDWindowClosed,
-			"commit_ts=%d abort=%t primary_readable=%t", claimedCommitTS, isAbort, ev.Readable)
+		return nil
 	}
 	if !ev.Found {
 		return errors.Wrapf(ErrPrePhaseDCommitUnproven,
@@ -147,9 +138,3 @@ func ClassifyPrePhaseDCommit(
 	}
 	return nil
 }
-
-// prePhaseDNowMillis is the wall clock the admission window is measured
-// against. A variable so tests can drive the window deterministically; see the
-// header for why a wall-clock read is acceptable here and nowhere near an
-// ordering decision.
-var prePhaseDNowMillis = func() int64 { return time.Now().UnixMilli() }

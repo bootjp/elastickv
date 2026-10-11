@@ -98,10 +98,12 @@ expired and resolvable. So `ValidateForwardedTxnStartTimestamp` can admit a
 pre-D start only while
 
 ```
-wall_now < phaseD_activation_time + maxTxnLockTTLms + grace
+tso_issued_physical_ms < phaseD_activation_time + maxTxnLockTTLms + grace
 ```
 
-where `phaseD_activation_time` is the physical half of `PhaseDFloor()`. After
+where `phaseD_activation_time` is the physical half of `PhaseDFloor()`, and
+`tso_issued_physical_ms` comes from a fresh timestamp issued by the same
+durable TSO group. After
 the window closes, no new pre-D intent can be created, and the §3 commit
 carve-out is then only ever usable against intents that genuinely predate the
 marker — which is what it was written for. The commit carve-out stays open
@@ -109,10 +111,8 @@ indefinitely, as correctness requires.
 
 Costs and open problems:
 
-- The bound is a wall-clock comparison, which `CLAUDE.md` restricts to
-  diagnostics. It would be an *admission* bound rather than an ordering
-  decision, but it is still a clock read on a validation path and needs to be
-  argued explicitly, not assumed acceptable.
+- Each pre-D PREPARE needs a fresh TSO timestamp for the admission check.
+  The durable TSO value cannot regress with the receiver's wall clock.
 - Picking `grace` is an operational knob, and getting it wrong strands
   legitimate long-TTL transactions.
 - It does not stop an attacker who acts inside the window.
@@ -121,42 +121,39 @@ Costs and open problems:
 
 §4.2 closes the fabrication route in steady state; §4.1 closes it during the
 window for the same-group case, where the primary record is locally readable,
-and falls back to §4.2's bound when it is not.
+while §4.2 bounds new intent creation when the primary is remote.
 
 ## 4a. Decision (2026-09-15)
 
 **§4.3**, with §4.1 where the primary record is readable and §4.2's bound
-everywhere else. Answers to §5 in order:
+on PREPARE everywhere else. Answers to §5 in order:
 
 1. §4.3. §4.1 alone has no verdict when the primary is remote, and §4.2 alone
    never consults durable evidence even when it is sitting there.
-2. A leader that cannot read the primary falls back to the window rather than
-   refusing or issuing a second RPC. Refusing breaks legitimate cross-shard
-   legacy resolution, and a second RPC puts a round trip on the write path to
-   close a window that is already bounded.
+2. A leader that cannot read the primary permits legacy resolution rather
+   than refusing or issuing a second RPC. The window applies to PREPARE, so
+   no new pre-D intent can be created after it closes; existing cross-shard
+   intents can still resolve.
 3. `grace` is one hour on top of `maxTxnLockTTLms`. It absorbs clock skew
    between nodes and the spread of a rolling Phase-D activation, both of which
    can make a legitimately in-flight transaction look older than it is. Too
    small strands long-TTL transactions; too large only extends a window that is
    already bounded, so it errs long.
-4. `ABORT` is always a window decision, even when the primary is local. Its
-   timestamp is synthesised by `abortTSFrom`, so no record can support it, and
-   requiring one would refuse every legitimate abort resolution.
+4. `ABORT` remains admissible after the creation window closes. Its timestamp
+   is synthesised by `abortTSFrom`, so no record can support it, and requiring
+   one would refuse legitimate abort resolution.
 
-On the wall-clock objection raised in §4.2: the bound is an **admission**
-decision about whether a request may create state, not an ordering decision
-about where that state sorts. No visibility, OCC or MVCC comparison consults
-it, and a clock that is wrong only widens or narrows who may create a pre-D
-intent — it can never place a write at the wrong point in the timestamp order.
-Skew costs availability for legacy resolution, never correctness.
+The admission bound uses a fresh timestamp from the durable TSO group, not
+the receiver's wall clock. Its physical component is monotonic across local
+clock rollback, so the closed window cannot reopen on the receiver.
 
 ### What has shipped
 
-§4.2 is wired: `ValidateForwardedTxnStartTimestamp` admits a pre-Phase-D start
-only inside the window, which removes step 1 of the attack — the ability to
-create a fresh pre-D intent after the marker. An allocator that cannot report
-the floor leaves the window open, because a missing signal must not turn a
-narrowing into a refusal.
+§4.2 is wired for PREPARE: `ValidateForwardedTxnStartTimestamp` admits a
+pre-Phase-D start only inside the window, which removes step 1 of the attack.
+The production allocator wrappers expose `PhaseDFloor()`; a Phase-D allocator
+without a usable floor refuses new pre-D PREPAREs. COMMIT and ABORT bypass the
+creation window so they can resolve existing intents indefinitely.
 
 §4.1's decision is implemented and tested as `ClassifyPrePhaseDCommit`, but is
 **not yet wired**. It needs a signal the commit-validation path does not

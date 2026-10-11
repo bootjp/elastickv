@@ -77,8 +77,8 @@ type TSOPhaseDState interface {
 }
 
 // TSOPhaseDFloorSource exposes the Phase-D floor, whose physical half is the
-// instant Phase D activated. Optional: an allocator that does not implement it
-// leaves the pre-Phase-D admission window open rather than closed.
+// instant Phase D activated. A Phase-D allocator unable to report the floor
+// cannot safely admit a new pre-Phase-D intent.
 type TSOPhaseDFloorSource interface {
 	PhaseDFloor() uint64
 }
@@ -424,7 +424,11 @@ func ValidateForwardedTxnStartTimestamp(
 	// its lock TTL. Past that window the commit carve-out can only ever apply
 	// to intents that really predate the marker, which is what it was written
 	// for.
-	if !prePhaseDStartWithinWindow(alloc) {
+	withinWindow, windowErr := prePhaseDStartWithinWindow(ctx, alloc)
+	if windowErr != nil {
+		return errors.Wrap(windowErr, label)
+	}
+	if !withinWindow {
 		return errors.Wrap(ErrPrePhaseDWindowClosed, label)
 	}
 	return nil
@@ -433,16 +437,28 @@ func ValidateForwardedTxnStartTimestamp(
 // prePhaseDStartWithinWindow reports whether pre-Phase-D intent creation is
 // still open, given what the allocator can say about the floor.
 //
-// An allocator that cannot report the floor leaves the window open: this bound
-// exists to narrow a carve-out, and a missing signal must not turn it into a
-// refusal that strands legitimate legacy resolution.
-func prePhaseDStartWithinWindow(alloc TimestampAllocator) bool {
+// A Phase-D allocator that cannot report the floor fails closed for new
+// PREPAREs. Resolution traffic is exempt from this creation bound.
+func prePhaseDStartWithinWindow(ctx context.Context, alloc TimestampAllocator) (bool, error) {
 	source, ok := alloc.(TSOPhaseDFloorSource)
 	if !ok {
-		return true
+		return false, nil
 	}
-	return PrePhaseDStartAdmissible(
-		source.PhaseDFloor(), prePhaseDNowMillis(), prePhaseDAdmissionWindow)
+	floor := source.PhaseDFloor()
+	if floor == 0 {
+		return false, nil
+	}
+	// Issue a fresh timestamp through the same durable TSO group that owns
+	// the Phase-D marker. Its physical component cannot move backward when a
+	// receiver's wall clock is adjusted, so a closed window stays closed.
+	nowTS, err := alloc.Next(ctx)
+	if err != nil {
+		return false, errors.Wrap(err, "issue TSO timestamp for pre-phase-D admission")
+	}
+	if nowTS == 0 {
+		return false, ErrTSOTimestampInvalid
+	}
+	return PrePhaseDStartAdmissible(floor, PhaseDActivationMillis(nowTS), prePhaseDAdmissionWindow), nil
 }
 
 func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
@@ -887,6 +903,17 @@ func (b *BatchAllocator) PhaseDActive() bool {
 func (b *BatchAllocator) PhaseDRequired() bool {
 	state, ok := b.tso.(TSOPhaseDState)
 	return ok && state.PhaseDRequired()
+}
+
+func (b *BatchAllocator) PhaseDFloor() uint64 {
+	if b == nil {
+		return 0
+	}
+	source, ok := b.tso.(TSOPhaseDFloorSource)
+	if !ok {
+		return 0
+	}
+	return source.PhaseDFloor()
 }
 
 func (b *BatchAllocator) nextAfter(ctx context.Context, min uint64) (uint64, error) {
