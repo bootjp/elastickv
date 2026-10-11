@@ -1880,11 +1880,29 @@ sections defer to is therefore two-sided:
   timestamp fast path. Snapshot formats always carry the replicated
   watermark once the new binary writes them (a V1-only cluster simply never
   consults it).
-- **Cluster capability.** Every node advertises `txn_format_v2` in the
-  capability report the storage-envelope and encryption monitors already
+- **Ledger-aware transition.** The shipped binary cannot record V1
+  participants or obey a new ledger epoch. Before the first V2 activation
+  entry, the rollout stops new V1 transaction admission at every ingress,
+  waits for in-flight coordinators to finish or report an unknown outcome,
+  upgrades every voter, learner, and coordinator, and applies a
+  Raft-serialized ledger-aware epoch to every group. V1 admission reopens
+  only after that durable epoch is applied everywhere; thereafter every
+  accepted V1 transaction records its participants before PREPARE.
+  The epoch carries the validated conf state, and membership admission
+  after it checks the ledger capability at apply as the V2 epoch does.
+  Pre-epoch transactions with visible unresolved locks must settle before
+  V2 activation; an outcome whose participants cannot be reconstructed
+  requires operator reconciliation and keeps the gate closed. Historical
+  partial transactions whose locks and participant evidence are already
+  gone cannot be detected retrospectively and remain outside the
+  forward-looking claim.
+- **Cluster capability.** Every node advertises separate
+  `txn_v1_drain_ledger` and `txn_format_v2` capabilities in the report the
+  storage-envelope and encryption monitors already
   read; a monitor built like `startStorageEnvelopeV2CapabilityMonitor` /
   `buildEncryptionCapabilityFanout` watches for every voter and learner of
-  every group to report it. The flip itself is **not** a per-process
+  every group to report each capability before its corresponding epoch.
+  The flip itself is **not** a per-process
   atomic set from that poll: a membership change admitted while this
   process still sees V1 could race another coordinator that finished its
   poll and flipped, which would then send a V2 entry to the newly admitted
@@ -1938,19 +1956,24 @@ sections defer to is therefore two-sided:
   and the precondition for the roadmap's README claims, is when every
   group reports no legacy-shape lock row left **and** every legacy commit
   record written since activation has had its secondaries confirmed. That
-  confirmation is a durable Raft-replicated drain ledger. Before the first
-  activation entry, all nodes must run the ledger-aware code, stop admitting
-  untracked V1 work, and settle any pre-ledger V1 transaction; an outcome
-  whose participants cannot be reconstructed keeps the gate closed. Every
-  V1 transaction admitted during the transition records its stable identity,
-  primary group, and complete participant set before PREPARE, then replicates
-  its decision and each secondary confirmation. The coordinator's outstanding
+  confirmation is a durable Raft-replicated drain ledger. Every V1
+  transaction admitted after the ledger-aware epoch records its stable
+  identity, primary group, and complete participant set before PREPARE,
+  then replicates its decision and each secondary confirmation. The V1
+  legacy identity `(primaryKey, StartTS)` is reserved on the primary group
+  until the ledger row is terminal and fully confirmed, so an aliased V1
+  transaction cannot take over an outstanding outcome. The primary COMMIT
+  or ABORT record and the ledger decision are applied atomically in one
+  Raft entry; a separate later decision write would leave a crash gap.
+  Confirmations are per locked key because the resolver can settle one
+  key at a time. The coordinator's outstanding
   list is only a cache rebuilt from this ledger after restart; the resolver
   updates it as secondaries settle. A V1 transaction without a reconstructible
   participant record cannot cross the activation boundary, and the marker
-  cannot be written while any ledger entry is incomplete or any earlier
-  legacy outcome lacks confirmation. The gate is tested by crashing the
-  coordinator after a primary decision and before secondary publication:
+  cannot be written while any ledger entry is incomplete or any visible
+  pre-epoch legacy outcome remains unresolved. The gate is tested by
+  crashing the coordinator after a primary decision and before secondary
+  publication:
   restart must reconstruct the pending participant and keep V2 out of effect
   until confirmation is replicated. This verifies outcomes, rather than
   inferring them from an empty lock namespace. A V1 transaction that
