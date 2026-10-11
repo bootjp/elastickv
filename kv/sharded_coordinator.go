@@ -288,7 +288,7 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	}
 	start := monoclock.Now()
 	expectedGen := t.g.lease.generation()
-	resp, err := t.inner.Commit(ctx, reqs)
+	resp, leaderCommitTS, err := t.commitWithLocalStamp(ctx, reqs)
 	if err != nil {
 		// Only invalidate on errors that actually signal a leadership
 		// change. Write-conflicts, validation errors, and deadline
@@ -304,8 +304,81 @@ func (t *leaseRefreshingTxn) Commit(ctx context.Context, reqs []*pb.Request) (*T
 		}
 		return resp, errors.WithStack(err)
 	}
+	if leaderCommitTS != 0 && resp != nil {
+		if resp.CommitTS != 0 && resp.CommitTS != leaderCommitTS {
+			return nil, errors.WithStack(ErrInvalidRequest)
+		}
+		resp.CommitTS = leaderCommitTS
+	}
 	t.maybeRefresh(resp, start, expectedGen)
 	return resp, nil
+}
+
+func (t *leaseRefreshingTxn) commitWithLocalStamp(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, uint64, error) {
+	if proxy, ok := t.inner.(*LeaderProxy); ok {
+		resp, err := proxy.commitWithLocalStamp(ctx, reqs, t.stampLeaderIssuedTxnForVerifiedLocalCommit)
+		return resp, 0, err
+	}
+	commitTS, err := t.stampLeaderIssuedTxnForLocalCommit(ctx, reqs)
+	if err != nil {
+		return nil, 0, err
+	}
+	resp, err := t.inner.Commit(ctx, reqs)
+	return resp, commitTS, errors.WithStack(err)
+}
+
+// A seal can observe a follower in dispatchTxn and then reach this wrapper
+// after the shard becomes leader. Stamp its one-phase commit here so the local
+// LeaderProxy path has the same leader-issued timestamp as a forwarded commit.
+func (t *leaseRefreshingTxn) stampLeaderIssuedTxnForLocalCommit(ctx context.Context, reqs []*pb.Request) (uint64, error) {
+	if t == nil || t.g == nil || t.g.Engine == nil ||
+		ctx.Value(leaderIssuedCommitTSContextKey{}) != true ||
+		!isLeaderEngine(t.g.Engine) || !canStampRawTimestampsOnEngine(ctx, t.g.Engine) {
+		return 0, nil
+	}
+	return t.stampLeaderIssuedTxnForVerifiedLocalCommit(ctx, reqs)
+}
+
+func (t *leaseRefreshingTxn) stampLeaderIssuedTxnForVerifiedLocalCommit(ctx context.Context, reqs []*pb.Request) (uint64, error) {
+	if t == nil || t.coord == nil || ctx.Value(leaderIssuedCommitTSContextKey{}) != true {
+		return 0, nil
+	}
+	r, metaMutation := leaderIssuedOnePhaseRequest(reqs)
+	if r == nil {
+		return 0, nil
+	}
+	meta, err := DecodeTxnMeta(metaMutation.Value)
+	if err != nil {
+		return 0, errors.WithStack(err)
+	}
+	if meta.CommitTS != 0 {
+		return 0, nil
+	}
+	commitTS, err := t.coord.resolveTxnCommitTS(ctx, r.Ts, 0)
+	if err != nil {
+		return 0, err
+	}
+	if err := t.coord.ensureMutationsWriteAllowedWithBypass(r.Mutations[1:], commitTS, r.GetWriteFenceBypassKeys()); err != nil {
+		return 0, err
+	}
+	if err := StampMutationCommitTS(r.Mutations, commitTS); err != nil {
+		return 0, err
+	}
+	meta.CommitTS = commitTS
+	metaMutation.Value = EncodeTxnMeta(meta)
+	return commitTS, nil
+}
+
+func leaderIssuedOnePhaseRequest(reqs []*pb.Request) (*pb.Request, *pb.Mutation) {
+	if len(reqs) != 1 || reqs[0] == nil || !reqs[0].IsTxn ||
+		reqs[0].Phase != pb.Phase_NONE || len(reqs[0].Mutations) == 0 {
+		return nil, nil
+	}
+	metaMutation := reqs[0].Mutations[0]
+	if metaMutation == nil || !bytes.Equal(metaMutation.Key, []byte(txnMetaPrefix)) {
+		return nil, nil
+	}
+	return reqs[0], metaMutation
 }
 
 func (t *leaseRefreshingTxn) stampRawTimestampsForLocalCommit(ctx context.Context, reqs []*pb.Request) error {
