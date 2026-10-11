@@ -11,7 +11,7 @@ import (
 )
 
 // The invariants below are the decision-independent half of
-// docs/design/2026_08_29_proposed_tso_batch_slot_claims.md §6. They hold under
+// docs/design/2026_08_29_partial_tso_batch_slot_claims.md §6. They hold under
 // every option that document weighs -- forcing batchSize==1, durable per-slot
 // claims, or neither -- so they are the fixed point any of those changes has to
 // preserve, and they are written before the mechanism is chosen rather than
@@ -36,6 +36,9 @@ func newSlotClaimTSOFixture(t *testing.T) (*RaftTSOAllocator, *TSOStateMachine) 
 	}
 	alloc, err := newTestRaftTSOAllocator(&ShardGroup{Engine: engine, TSOState: fsm}, clock)
 	require.NoError(t, err)
+	require.Nil(t, fsm.Apply(marshalTSOCutover()))
+	require.Nil(t, fsm.Apply(marshalTSOPhaseD(1)))
+	require.True(t, fsm.PhaseDActive())
 	return alloc, fsm
 }
 
@@ -204,12 +207,8 @@ func TestValidateDurableTimestampRefusesBeyondTheAllocationFloor(t *testing.T) {
 	alloc, fsm := newSlotClaimTSOFixture(t)
 	ctx := context.Background()
 
-	// Phase D has to be active before the bound is even consulted:
-	// ValidateDurableTimestamp refuses an inactive state first, so on an
-	// unactivated fixture every timestamp is refused for the wrong reason and
-	// the assertion below would hold with the bound deleted.
-	require.Nil(t, fsm.Apply(marshalTSOCutover()))
-	require.Nil(t, fsm.Apply(marshalTSOPhaseD(1)))
+	// The shared fixture activates Phase D, so this test reaches the
+	// allocation-floor bound rather than the inactive-state refusal.
 	require.True(t, fsm.PhaseDActive())
 
 	// Issue one so a window is committed.

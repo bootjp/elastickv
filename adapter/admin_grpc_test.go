@@ -1149,7 +1149,7 @@ func TestCollectLiveMembersHonoursCtxCancel(t *testing.T) {
 }
 
 // TestInternalForwardIsBehindTheAdminToken closes §3.3 of
-// docs/design/2026_08_29_proposed_tso_batch_slot_claims.md for the method that
+// docs/design/2026_08_29_partial_tso_batch_slot_claims.md for the method that
 // document names.
 //
 // Internal.Forward persists at a caller-supplied timestamp, so it reaches the

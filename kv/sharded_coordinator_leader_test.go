@@ -224,7 +224,7 @@ func newWriteForwardFixture(t *testing.T, token string) (*ShardGroup, *writeForw
 }
 
 // TestForwardedWriteCarriesThePeerToken is the client half of §3.3 of
-// docs/design/2026_08_29_proposed_tso_batch_slot_claims.md.
+// docs/design/2026_08_29_partial_tso_batch_slot_claims.md.
 //
 // Putting Internal.Forward behind the admin token is only half a change:
 // without the credential on the outbound side, protecting the method would

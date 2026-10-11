@@ -756,10 +756,9 @@ func sortedGroupIDs(m map[uint64]AdminGroup) []uint64 {
 // package-qualify the service name) does not silently bypass the auth gate.
 var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 
-// adminTokenProtectedMethod covers the Admin service plus the two Internal
-// RPCs that carry admin work between nodes: a forwarded admin proposal and a
-// forwarded lease read are the same authority as a direct Admin call, so they
-// must present the same token.
+// adminTokenProtectedMethod covers the Admin service plus three Internal RPCs:
+// ForwardAdminProposal, ForwardLeaseRead, and Forward. Each can carry work
+// protected by the admin token, so each must present the same credential.
 func adminTokenProtectedMethod(fullMethod string) bool {
 	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
 		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName ||
