@@ -111,46 +111,50 @@ func TestBatchAllocatorIssuesEachTimestampAtMostOnce(t *testing.T) {
 	alloc, _ := newSlotClaimTSOFixture(t)
 
 	const (
-		allocators = 8
-		perWorker  = 64
+		allocators          = 8
+		workersPerAllocator = 4
+		perWorker           = 16
 	)
-	// One BatchAllocator per goroutine, all backed by the same TSO state. A
-	// single shared allocator serialises every reservation behind its own
-	// refill mutex, which makes the interesting failure -- two node-local
-	// allocators handed overlapping windows -- unreachable. Separate
-	// allocators are what production has: one per node, one shared service.
+	// Distinct node-local allocators share the TSO state, while several
+	// concurrent callers share each allocator's cached batch window. Both
+	// cross-node reservations and same-node offset claims must stay unique.
 	var (
 		mu    sync.Mutex
-		seen  = make(map[uint64]int, allocators*perWorker)
+		seen  = make(map[uint64]int, allocators*workersPerAllocator*perWorker)
 		total int
 		wg    sync.WaitGroup
 	)
-	failures := make([][]error, allocators)
+	failures := make([][][]error, allocators)
 	for a := range allocators {
 		batch, err := NewBatchAllocator(alloc, 16)
 		require.NoError(t, err)
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for range perWorker {
-				ts, err := batch.Next(context.Background())
-				if err != nil {
-					failures[a] = append(failures[a], err)
-					continue
+		failures[a] = make([][]error, workersPerAllocator)
+		for worker := range workersPerAllocator {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for range perWorker {
+					ts, err := batch.Next(context.Background())
+					if err != nil {
+						failures[a][worker] = append(failures[a][worker], err)
+						continue
+					}
+					mu.Lock()
+					seen[ts]++
+					total++
+					mu.Unlock()
 				}
-				mu.Lock()
-				seen[ts]++
-				total++
-				mu.Unlock()
-			}
-		}()
+			}()
+		}
 	}
 	wg.Wait()
 
 	for a := range allocators {
-		require.Empty(t, failures[a], "batched issuance must not fail under concurrency")
+		for worker := range workersPerAllocator {
+			require.Empty(t, failures[a][worker], "batched issuance must not fail under concurrency")
+		}
 	}
-	require.Equal(t, allocators*perWorker, total,
+	require.Equal(t, allocators*workersPerAllocator*perWorker, total,
 		"every request must have produced a timestamp")
 	for ts, count := range seen {
 		require.Equal(t, 1, count,
