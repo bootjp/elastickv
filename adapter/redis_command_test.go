@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"io"
 	"net"
 	"slices"
 	"strings"
@@ -50,6 +51,10 @@ func (c *commandRecorder) WriteString(str string) {
 func (c *commandRecorder) WriteBulk(b []byte) {
 	c.writes = append(c.writes, commandRecorderEntry{op: "bulk", s: string(b)})
 }
+func (c *commandRecorder) WriteBulkFrom(n int64, reader io.Reader) {
+	c.WriteBulk(readTestBulk(n, reader))
+}
+
 func (c *commandRecorder) WriteBulkString(s string) {
 	c.writes = append(c.writes, commandRecorderEntry{op: "bulk", s: s})
 }
