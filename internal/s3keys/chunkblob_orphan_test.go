@@ -348,6 +348,7 @@ func TestNewChunkBlobOrphanScannerValidatesItsCollaborators(t *testing.T) {
 		func(o *s3keys.ChunkBlobOrphanScannerOptions) { o.Store = nil },
 		func(o *s3keys.ChunkBlobOrphanScannerOptions) { o.Local = nil },
 		func(o *s3keys.ChunkBlobOrphanScannerOptions) { o.NowTS = nil },
+		func(o *s3keys.ChunkBlobOrphanScannerOptions) { o.GracePeriod = -time.Second },
 	} {
 		opts := valid
 		mutate(&opts)

@@ -207,6 +207,11 @@ func decodeSHAHex(encoded []byte, sha [chunkBlobSHA256Bytes]byte) ([chunkBlobSHA
 // rather than wrapping, so an absurd configuration sweeps nothing
 // instead of sweeping everything.
 func ChunkBlobGCGraceBoundary(nowTS uint64, grace time.Duration) uint64 {
+	if grace < 0 {
+		// Direct callers cannot turn an invalid duration into an immediate
+		// sweep. Constructors reject it before starting a GC loop.
+		return 0
+	}
 	physicalMs := nowTS >> hlcLogicalBits
 	graceMs := uint64(0)
 	if ms := grace.Milliseconds(); ms > 0 {

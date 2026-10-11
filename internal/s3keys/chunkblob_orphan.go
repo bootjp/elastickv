@@ -248,6 +248,8 @@ func NewChunkBlobOrphanScanner(opts ChunkBlobOrphanScannerOptions) (*ChunkBlobOr
 		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "orphan scanner requires a local blob store")
 	case opts.NowTS == nil:
 		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "orphan scanner requires an HLC clock")
+	case opts.GracePeriod < 0:
+		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "orphan scanner grace period cannot be negative")
 	}
 	timing := resolveGCLoopTiming(
 		opts.GracePeriod, opts.Interval,

@@ -156,12 +156,16 @@ func planOneChunkRefDelta(
 		// reachability did not change, so neither should the record.
 		return nil, nil
 	}
-	if delta.Removed > existing.Count+delta.Added {
+	available, err := addChunkRefCount(existing.Count, delta.Added, delta.ContentSHA256)
+	if err != nil {
+		return nil, err
+	}
+	if delta.Removed > available {
 		return nil, errors.Wrapf(ErrChunkRefRCUnderflow,
 			"sha=%x count=%d added=%d removed=%d",
 			delta.ContentSHA256[:4], existing.Count, delta.Added, delta.Removed)
 	}
-	next := ChunkRefRC{Count: existing.Count + delta.Added - delta.Removed}
+	next := ChunkRefRC{Count: available - delta.Removed}
 
 	mutations := make([]ChunkRefRCMutation, 0, maxMutationsPerDelta)
 	switch {

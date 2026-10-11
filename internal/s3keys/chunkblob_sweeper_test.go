@@ -394,6 +394,11 @@ func TestNewChunkBlobSweeperValidatesItsCollaborators(t *testing.T) {
 	_, err = s3keys.NewChunkBlobSweeper(noClock)
 	require.Error(t, err, "an HLC clock is required; a wall clock would be the wrong domain")
 
+	negativeGrace := valid
+	negativeGrace.GracePeriod = -time.Second
+	_, err = s3keys.NewChunkBlobSweeper(negativeGrace)
+	require.ErrorIs(t, err, s3keys.ErrInvalidChunkRefPlan)
+
 	_, err = s3keys.NewChunkBlobSweeper(valid)
 	require.NoError(t, err)
 }

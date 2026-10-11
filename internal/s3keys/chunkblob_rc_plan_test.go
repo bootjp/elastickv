@@ -283,5 +283,10 @@ func TestPlanAggregatesRepeatedSHAs(t *testing.T) {
 			{ContentSHA256: sha, Added: 1},
 		}, nil, planCommitTS)
 		require.ErrorIs(t, err, s3keys.ErrInvalidChunkRefPlan)
+		_, err = s3keys.PlanChunkRefRCMutations([]s3keys.ChunkRefDelta{
+			{ContentSHA256: sha, Added: 1},
+		}, map[[32]byte]s3keys.ChunkRefRC{sha: {Count: ^uint64(0)}}, planCommitTS)
+		require.ErrorIs(t, err, s3keys.ErrInvalidChunkRefPlan,
+			"an existing maximum count must not wrap before underflow validation")
 	})
 }

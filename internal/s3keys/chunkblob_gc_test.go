@@ -233,6 +233,8 @@ func TestChunkBlobGCGraceBoundaryClampsAtTheEpoch(t *testing.T) {
 	nowTS := uint64(1_000) << kv.HLCLogicalBits
 	require.Zero(t, s3keys.ChunkBlobGCGraceBoundary(nowTS, 999*time.Hour))
 	require.Zero(t, s3keys.ChunkBlobGCGraceBoundary(0, time.Hour))
+	require.Zero(t, s3keys.ChunkBlobGCGraceBoundary(nowTS, -time.Second),
+		"invalid negative grace must not make every queue entry eligible")
 }
 
 func TestParseChunkBlobGCQueueKeyRejectsMalformed(t *testing.T) {

@@ -196,6 +196,8 @@ func NewChunkBlobSweeper(opts ChunkBlobSweeperOptions) (*ChunkBlobSweeper, error
 		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "chunkblob sweeper requires a local blob store")
 	case opts.NowTS == nil:
 		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "chunkblob sweeper requires an HLC clock")
+	case opts.GracePeriod < 0:
+		return nil, errors.Wrap(ErrInvalidChunkRefPlan, "chunkblob sweeper grace period cannot be negative")
 	}
 	timing := resolveGCLoopTiming(
 		opts.GracePeriod, opts.Interval,
