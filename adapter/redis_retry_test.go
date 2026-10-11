@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"io"
 	"math"
 	"net"
 	"testing"
@@ -115,6 +116,10 @@ func (c *recordingConn) WriteString(str string) {
 func (c *recordingConn) WriteBulk(bulk []byte) {
 	c.bulk = append([]byte(nil), bulk...)
 }
+func (c *recordingConn) WriteBulkFrom(n int64, reader io.Reader) {
+	c.WriteBulk(readTestBulk(n, reader))
+}
+
 func (c *recordingConn) WriteBulkString(bulk string) {
 	c.bulk = []byte(bulk)
 }
@@ -943,4 +948,12 @@ func TestElasticKVZRemFastRemovesLegacyBlobZSet(t *testing.T) {
 	require.NoError(t, err)
 	require.True(t, exists)
 	require.Equal(t, []redisZSetEntry{{Member: "b", Score: 2}}, zset.Entries)
+}
+
+func readTestBulk(n int64, reader io.Reader) []byte {
+	bulk, err := io.ReadAll(io.LimitReader(reader, n))
+	if err != nil {
+		panic(err)
+	}
+	return bulk
 }
