@@ -77,11 +77,13 @@ README will present scope in two tiers instead of a non-goals section.
   `TransactGetItems`), S3 (path-style, SigV4 static credentials), SQS
   (opt-in, incl. HT-FIFO, DLQ redrive), FUSE filesystem
   (`2026_02_24_implemented_filesystem_on_elastickv.md`).
-- Consistency: per-key linearizable is the target for every path, and
-  today holds for blind writes and reads on the paths whose timestamps the
-  owning group's leader issues (in a single-group deployment: every Redis
-  write except `EVAL`, DynamoDB, S3, SQS); read-modify-write operations on
-  those same paths are excluded until A0 lands, because a delayed write
+- Consistency: per-key linearizable is the target for every path. For blind
+  writes and reads on paths whose timestamps the owning group's leader issues
+  (in a single-group deployment: every Redis write except `EVAL`, DynamoDB,
+  S3, SQS), the timestamp-order component holds today, but the per-key claim
+  also waits for A6/G11's outcome-unknown mapping: a write reported as
+  `NOTLEADER` can still commit. Read-modify-write operations on those same
+  paths are excluded until A0 lands, because a delayed write
   below the watermark can be missed and then overwritten by a
   read-modify-write that began at the watermark (G0, reproduced; two
   leader-issued timestamps that cannot be linearized); `EVAL`, gRPC `RawKV` /

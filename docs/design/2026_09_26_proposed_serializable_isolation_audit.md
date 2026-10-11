@@ -1931,8 +1931,12 @@ sections defer to is therefore two-sided:
   membership change, so it reasons from the log it has already applied. **Activation drains V1 work before the
   guarantees are claimed.** Once the activation entry applies on a group,
   that group's FSM rejects a V1 PREPARE and a V1 one-phase entry (the
-  coordinator retries the work as V2; a delayed V1 one-phase entry can no
-  longer bypass the fence, and a V1 transaction that read before
+  coordinator treats rejection as a pause and retry signal, waits until
+  the V2 activation epoch has applied on every participant group,
+  revalidates membership and capability, and then restarts the entire
+  transaction as V2; it sends no V2 entry to any participant before this
+  barrier; a delayed V1 one-phase entry can no longer bypass the fence,
+  and a V1 transaction that read before
   activation can no longer lock after it, which is the G1 shape a V1
   PREPARE racing a V2 one-phase transaction would reopen), and does not
   let an in-flight V1 transaction **commit** under V1 semantics either,
@@ -1941,7 +1945,8 @@ sections defer to is therefore two-sided:
   primary and skips a secondary, removing the last lock row as it does so,
   which an empty lock namespace would then mistake for a clean finish): a
   V1 **primary** COMMIT is rejected with a retryable abort (the coordinator
-  retries the whole transaction as V2), a V1 ABORT is accepted against an
+  retries the whole transaction as V2 only after the same participant-wide
+  activation barrier), a V1 ABORT is accepted against an
   existing legacy lock, and a V1 **secondary** COMMIT is accepted only for
   an identity whose legacy commit record already exists on the primary
   group (the coordinator verifies the record before proposing, as the
@@ -2040,7 +2045,10 @@ sections defer to is therefore two-sided:
   restarting under the shipped binary and rejecting downgrade; V2
   snapshot install/restore persisting the marker before serving; marker
   fsync failure preventing applied-index advance; restart after the marker
-  write but before V2 apply; and a Jepsen run of the
+  write but before V2 apply; staggered activation of two participant groups
+  (the coordinator waits rather than sending V2 to either group), including
+  a membership change during that wait that forces capability revalidation;
+  and a Jepsen run of the
   rolling-update script (`rolling-update.sh`, the deploy runbook) across
   the format change under the list-append workload.
 
