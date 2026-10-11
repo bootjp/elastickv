@@ -54,6 +54,12 @@ func (d *DynamoDBServer) putItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
+	unlock, err := d.lockItemForWrite(r.Context(), in.TableName, in.Item)
+	if err != nil {
+		writeDynamoErrorFromErr(w, err)
+		return
+	}
+	defer unlock()
 	plan, err := d.putItemWithRetry(r.Context(), in)
 	if err != nil {
 		writeDynamoErrorFromErr(w, err)
@@ -98,6 +104,7 @@ func (d *DynamoDBServer) putItemWithRetry(ctx context.Context, in putItemInput) 
 	return d.retryItemWriteWithGeneration(
 		ctx,
 		in.TableName,
+		in.Item,
 		"put item retry attempts exhausted",
 		func(readTS uint64) (*itemWritePlan, error) {
 			return d.preparePutItemWrite(ctx, in, readTS)
@@ -116,6 +123,7 @@ type itemWritePlan struct {
 func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	ctx context.Context,
 	tableName string,
+	attrs map[string]attributeValue,
 	exhaustedMessage string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, error) {
@@ -137,9 +145,9 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 	// ingress) falls back to the legacy path, where Coordinator.Dispatch redirects
 	// to the leader and the LEADER allocates commit_ts — never this follower's HLC.
 	if d.onePhaseTxnDedup && d.coordinator.IsLeader() {
-		return d.retryItemWriteWithGenerationDedup(ctx, tableName, exhaustedMessage, prepare)
+		return d.retryItemWriteWithGenerationDedup(ctx, tableName, attrs, exhaustedMessage, prepare)
 	}
-	return d.retryItemWriteWithGenerationLegacy(ctx, tableName, exhaustedMessage, prepare)
+	return d.retryItemWriteWithGenerationLegacy(ctx, tableName, attrs, exhaustedMessage, prepare)
 }
 
 // retryItemWriteWithGenerationLegacy is the pre-dedup retry loop: it recomputes
@@ -149,41 +157,37 @@ func (d *DynamoDBServer) retryItemWriteWithGeneration(
 func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 	ctx context.Context,
 	tableName string,
+	attrs map[string]attributeValue,
 	exhaustedMessage string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, error) {
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
-		readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb item-write legacy: begin read timestamp")
+		readTimestamp, err := d.sealedItemReadTimestamp(ctx, tableName, attrs, "dynamodb item-write legacy: begin read timestamp")
 		if err != nil {
-			return nil, errors.WithStack(err)
+			if !errors.Is(err, errDynamoSealGenerationChanged) {
+				return nil, err
+			}
+			if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
+				return nil, errors.WithStack(err)
+			}
+			backoff = nextTransactRetryBackoff(backoff)
+			continue
 		}
-		readTS := readTimestamp.Timestamp()
-		plan, err := prepare(readTS)
+		plan, err := prepare(readTimestamp.Timestamp())
 		if err != nil {
 			return nil, err
 		}
 		if plan.req == nil {
 			return plan, nil
 		}
-		plan.req.StartTS = readTS
-		if err = d.commitItemWrite(ctx, readTimestamp, plan.req); err != nil {
-			if !isRetryableTransactWriteError(err) {
-				return nil, errors.WithStack(err)
-			}
-		} else {
-			retry, verifyErr := d.handleGenerationFenceResult(
-				ctx,
-				d.verifyTableGeneration(ctx, tableName, plan.generation),
-				plan.cleanup,
-			)
-			if verifyErr != nil {
-				return nil, verifyErr
-			}
-			if !retry {
-				return plan, nil
-			}
+		retry, err := d.commitLegacyItemWritePlan(ctx, tableName, readTimestamp, plan)
+		if err != nil {
+			return nil, err
+		}
+		if !retry {
+			return plan, nil
 		}
 		if err := waitRetryWithDeadline(ctx, deadline, backoff); err != nil {
 			return nil, errors.WithStack(err)
@@ -191,6 +195,32 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationLegacy(
 		backoff = nextTransactRetryBackoff(backoff)
 	}
 	return nil, newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, exhaustedMessage)
+}
+
+func (d *DynamoDBServer) sealedItemReadTimestamp(ctx context.Context, tableName string, attrs map[string]attributeValue, label string) (kv.ReadTimestamp, error) {
+	sealKey, generation, err := d.itemSealKey(ctx, tableName, attrs)
+	if err != nil {
+		return kv.ReadTimestamp{}, err
+	}
+	readTimestamp, err := d.beginTxnWriteTimestamp(ctx, label, [][]byte{sealKey})
+	if err != nil {
+		return kv.ReadTimestamp{}, errors.WithStack(err)
+	}
+	if err := d.verifySealedTableGeneration(ctx, tableName, generation, readTimestamp.Timestamp()); err != nil {
+		return kv.ReadTimestamp{}, err
+	}
+	return readTimestamp, nil
+}
+
+func (d *DynamoDBServer) commitLegacyItemWritePlan(ctx context.Context, tableName string, readTimestamp kv.ReadTimestamp, plan *itemWritePlan) (bool, error) {
+	plan.req.StartTS = readTimestamp.Timestamp()
+	if err := d.commitItemWrite(ctx, readTimestamp, plan.req); err != nil {
+		if isRetryableTransactWriteError(err) {
+			return true, nil
+		}
+		return false, errors.WithStack(err)
+	}
+	return d.handleGenerationFenceResult(ctx, d.verifyTableGeneration(ctx, tableName, plan.generation), plan.cleanup)
 }
 
 // reusableItemWrite captures a dispatched single-item write attempt so a
@@ -231,6 +261,7 @@ type reusableItemWrite struct {
 func (d *DynamoDBServer) retryItemWriteWithGenerationDedup(
 	ctx context.Context,
 	tableName string,
+	attrs map[string]attributeValue,
 	exhaustedMessage string,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, error) {
@@ -245,12 +276,12 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationDedup(
 		if pending != nil {
 			plan, pending, err = d.itemWriteReuseAttempt(ctx, tableName, pending)
 		} else {
-			plan, pending, err = d.itemWriteFirstAttempt(ctx, tableName, prepare)
+			plan, pending, err = d.itemWriteFirstAttempt(ctx, tableName, attrs, prepare)
 		}
 		if err != nil {
 			// commitItemWrite already wraps dispatch errors; the attempt helpers
 			// return them raw, so return raw here too (no double WithStack).
-			if !isRetryableTransactWriteError(err) {
+			if !isRetryableTransactWriteError(err) && !errors.Is(err, errDynamoSealGenerationChanged) {
 				return nil, err
 			}
 		} else if plan != nil {
@@ -272,11 +303,12 @@ func (d *DynamoDBServer) retryItemWriteWithGenerationDedup(
 func (d *DynamoDBServer) itemWriteFirstAttempt(
 	ctx context.Context,
 	tableName string,
+	attrs map[string]attributeValue,
 	prepare func(readTS uint64) (*itemWritePlan, error),
 ) (*itemWritePlan, *reusableItemWrite, error) {
-	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb item-write: begin read timestamp")
+	readTimestamp, err := d.sealedItemReadTimestamp(ctx, tableName, attrs, "dynamodb item-write: begin read timestamp")
 	if err != nil {
-		return nil, nil, errors.WithStack(err)
+		return nil, nil, err
 	}
 	readTS := readTimestamp.Timestamp()
 	plan, err := prepare(readTS)
@@ -468,12 +500,11 @@ func (d *DynamoDBServer) deleteItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	lockKey, err := dynamoItemUpdateLockKey(in.TableName, in.Key)
+	unlock, err := d.lockItemForWrite(r.Context(), in.TableName, in.Key)
 	if err != nil {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	unlock := d.lockItemUpdate(lockKey)
 	defer unlock()
 	plan, err := d.deleteItemWithRetry(r.Context(), in)
 	if err != nil {
@@ -531,6 +562,7 @@ func (d *DynamoDBServer) deleteItemWithRetry(ctx context.Context, in deleteItemI
 	_, err := d.retryItemWriteWithGeneration(
 		ctx,
 		in.TableName,
+		in.Key,
 		"delete retry attempts exhausted",
 		func(readTS uint64) (*itemWritePlan, error) {
 			var err error
@@ -558,6 +590,10 @@ func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteIt
 	if !exists {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
 	}
+	itemKey, err := schema.itemKeyFromAttributes(in.Key)
+	if err != nil {
+		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
+	}
 	currentLocation, found, err := d.readLogicalItemAt(ctx, schema, in.Key, readTS)
 	if err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
@@ -581,6 +617,7 @@ func (d *DynamoDBServer) prepareDeleteItemWrite(ctx context.Context, in deleteIt
 	if err != nil {
 		return nil, err
 	}
+	req.ReadKeys = append(req.ReadKeys, dynamoItemSnapshotSealKey(in.TableName, schema.Generation, itemKey))
 	return &deleteItemPlan{
 		req:        req,
 		generation: schema.Generation,
@@ -598,12 +635,11 @@ func (d *DynamoDBServer) updateItem(w http.ResponseWriter, r *http.Request) {
 		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	lockKey, err := dynamoItemUpdateLockKey(in.TableName, in.Key)
+	unlock, err := d.lockItemForWrite(r.Context(), in.TableName, in.Key)
 	if err != nil {
-		writeDynamoError(w, http.StatusBadRequest, dynamoErrValidation, err.Error())
+		writeDynamoErrorFromErr(w, err)
 		return
 	}
-	unlock := d.lockItemUpdate(lockKey)
 	defer unlock()
 	plan, err := d.updateItemWithRetry(r.Context(), in)
 	if err != nil {
@@ -654,6 +690,7 @@ func (d *DynamoDBServer) updateItemWithRetry(ctx context.Context, in updateItemI
 	return d.retryItemWriteWithGeneration(
 		ctx,
 		in.TableName,
+		in.Key,
 		"update retry attempts exhausted",
 		func(readTS uint64) (*itemWritePlan, error) {
 			return d.prepareUpdateItemWrite(ctx, in, readTS)
@@ -772,9 +809,10 @@ func buildItemWriteRequestWithSource(
 		cleanup = append(cleanup, key)
 	}
 	return &kv.OperationGroup[kv.OP]{
-		IsTxn:   true,
-		StartTS: 0,
-		Elems:   elems,
+		IsTxn:    true,
+		StartTS:  0,
+		Elems:    elems,
+		ReadKeys: [][]byte{dynamoItemSnapshotSealKey(targetSchema.TableName, targetSchema.Generation, targetKey)},
 	}, cleanup, nil
 }
 
