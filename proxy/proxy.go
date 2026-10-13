@@ -370,7 +370,15 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) 
 	}
 
 	resp, err := p.dual.Admin(context.Background(), name, args)
-	writeResponse(conn, resp, err)
+	writeAdminResponse(conn, name, args, resp, err)
+}
+
+func writeAdminResponse(w respWriter, name string, args [][]byte, resp any, err error) {
+	if name == "COMMAND" && len(args) > 1 && strings.EqualFold(string(args[1]), "DOCS") {
+		writeCommandDocsResponse(w, resp, err)
+		return
+	}
+	writeResponse(w, resp, err)
 }
 
 func (p *ProxyServer) handleScript(conn redcon.Conn, name string, args [][]byte) {

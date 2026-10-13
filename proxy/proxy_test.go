@@ -17,6 +17,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+	"github.com/tidwall/redcon"
 )
 
 var testLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
@@ -2425,6 +2426,64 @@ func pipelineResults(ctx context.Context, cmds [][]any, execErr error) []*redis.
 
 type mockRespWriter struct {
 	writes []any
+}
+
+// Embed the unused redcon methods so handleAdmin exercises the same reply
+// writer as a client connection without opening a listener.
+type commandDocsConn struct {
+	redcon.Conn
+	writes []any
+}
+
+func (c *commandDocsConn) WriteError(msg string)      { c.writes = append(c.writes, "ERR:"+msg) }
+func (c *commandDocsConn) WriteString(msg string)     { c.writes = append(c.writes, "STR:"+msg) }
+func (c *commandDocsConn) WriteBulk(b []byte)         { c.writes = append(c.writes, "BULK:"+string(b)) }
+func (c *commandDocsConn) WriteBulkString(msg string) { c.writes = append(c.writes, "BULKSTR:"+msg) }
+func (c *commandDocsConn) WriteInt64(num int64)       { c.writes = append(c.writes, num) }
+func (c *commandDocsConn) WriteArray(count int)       { c.writes = append(c.writes, count) }
+func (c *commandDocsConn) WriteNull()                 { c.writes = append(c.writes, nil) }
+
+func TestCommandDocsPreservesFlagStatus(t *testing.T) {
+	// go-redis decodes both RESP simple and bulk strings as Go strings. A
+	// COMMAND DOCS argument's flags must still be sent to redis-cli as
+	// simple strings, or cliAddCommandDocArg aborts while starting.
+	docs := []any{
+		"set", []any{
+			"summary", "OK",
+			"doc_flags", []any{"deprecated"},
+			"arguments", []any{
+				[]any{
+					"name", "condition",
+					"flags", []any{"optional"},
+					"arguments", []any{
+						[]any{"name", "nx", "flags", []any{"multiple_token"}},
+					},
+				},
+			},
+		},
+	}
+	primary := newMockBackend("redis")
+	primary.doFunc = makeCmd(docs, nil)
+	d := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly}, newTestMetrics(), newTestSentry(), testLogger)
+	defer d.Close()
+	p := &ProxyServer{dual: d}
+	want := []any{
+		2, "BULKSTR:set", 6,
+		"BULKSTR:summary", "BULKSTR:OK",
+		"BULKSTR:doc_flags", 1, "STR:deprecated",
+		"BULKSTR:arguments", 1, 6,
+		"BULKSTR:name", "BULKSTR:condition", "BULKSTR:flags", 1, "STR:optional",
+		"BULKSTR:arguments", 1, 4,
+		"BULKSTR:name", "BULKSTR:nx", "BULKSTR:flags", 1, "STR:multiple_token",
+	}
+	for _, args := range [][][]byte{
+		{[]byte("COMMAND"), []byte("DOCS"), []byte("SET")},
+		{[]byte("COMMAND"), []byte("DOCS")},
+	} {
+		conn := &commandDocsConn{}
+		p.handleAdmin(conn, "COMMAND", args)
+		assert.Equal(t, want, conn.writes)
+	}
 }
 
 func (m *mockRespWriter) WriteError(msg string)      { m.writes = append(m.writes, "ERR:"+msg) }
