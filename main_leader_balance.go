@@ -24,6 +24,7 @@ const (
 	defaultLeaderBalanceImbalanceThreshold = 2
 	defaultLeaderBalanceMaxTargetLag       = 1024
 	defaultLeaderBalanceRPCTimeout         = 5 * time.Second
+	raftMemberSuffrageVoter                = "voter"
 )
 
 type leaderBalanceConfig struct {
@@ -328,7 +329,7 @@ func observeLeaderBalance(ctx context.Context, runtimes []*raftGroupRuntime, loc
 			localLeader: status.State == raftengine.StateLeader && status.Leader.ID == localNodeID,
 		}
 		for _, server := range cfg.Servers {
-			if server.Suffrage != "voter" {
+			if server.Suffrage != raftMemberSuffrageVoter {
 				continue
 			}
 			obs.voters[server.ID] = server

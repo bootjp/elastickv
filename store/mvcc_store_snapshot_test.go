@@ -3,6 +3,7 @@ package store
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -318,4 +319,121 @@ func snapshotBytes(t *testing.T, snap Snapshot) []byte {
 	_, err := snap.WriteTo(&buf)
 	require.NoError(t, err)
 	return buf.Bytes()
+}
+
+func TestMVCCStore_SnapshotRestorePreservesTargetReadiness(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := newTestMVCCStore(t)
+
+	stale := TargetStagedReadinessState{
+		JobID:                  8,
+		RouteStart:             []byte("old"),
+		RouteEnd:               []byte("oldz"),
+		ExpectedCutoverVersion: 1,
+		MigrationJobID:         8,
+		MinWriteTSExclusive:    80,
+		Armed:                  true,
+	}
+	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, stale))
+
+	snapState := TargetStagedReadinessState{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 12,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}
+	require.NoError(t, src.ApplyTargetStagedReadiness(ctx, snapState))
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotVersionV4, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
+
+	dst := newTestMVCCStore(t)
+	require.NoError(t, dst.ApplyTargetStagedReadiness(ctx, TargetStagedReadinessState{
+		JobID:                  77,
+		RouteStart:             []byte("dst-only"),
+		RouteEnd:               []byte("dst-z"),
+		ExpectedCutoverVersion: 2,
+		MigrationJobID:         77,
+		MinWriteTSExclusive:    700,
+		Armed:                  true,
+	}))
+
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+	states, err := dst.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []TargetStagedReadinessState{stale, snapState}, states)
+
+	states[0].RouteStart[0] = 'x'
+	states, err = dst.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), states[0].RouteStart)
+}
+
+func TestMVCCStore_SnapshotRestorePreservesMigrationImportMetadata(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	src := newTestMVCCStore(t)
+	res, err := src.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("c1"),
+		Versions:  []MVCCVersion{{Key: []byte("snapshotted"), CommitTS: 50, Value: []byte("v50")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+
+	snap, err := src.Snapshot()
+	require.NoError(t, err)
+	defer snap.Close()
+	raw := snapshotBytes(t, snap)
+	require.Equal(t, mvccSnapshotVersionV2, binary.LittleEndian.Uint32(raw[len(mvccSnapshotMagic):]))
+
+	dst := newTestMVCCStore(t)
+	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+	val, err := dst.GetAt(ctx, []byte("snapshotted"), 50)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v50"), val)
+	floor, err := dst.MigrationHLCFloor(ctx, 7)
+	require.NoError(t, err)
+	require.Equal(t, uint64(50), floor)
+	present, err := dst.MigrationImportMetadataPresent(ctx, 7)
+	require.NoError(t, err)
+	require.True(t, present)
+
+	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  1,
+		Cursor:    []byte("fresh"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.True(t, res.Duplicate)
+	require.Equal(t, []byte("c1"), res.AckedCursor)
+	_, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.ErrorIs(t, err, ErrKeyNotFound)
+
+	res, err = dst.ImportVersions(ctx, ImportVersionsOptions{
+		JobID:     7,
+		BracketID: 3,
+		BatchSeq:  2,
+		Cursor:    []byte("c2"),
+		Versions:  []MVCCVersion{{Key: []byte("fresh"), CommitTS: 60, Value: []byte("v60")}},
+	})
+	require.NoError(t, err)
+	require.False(t, res.Duplicate)
+	require.Equal(t, []byte("c2"), res.AckedCursor)
+	val, err = dst.GetAt(ctx, []byte("fresh"), 60)
+	require.NoError(t, err)
+	require.Equal(t, []byte("v60"), val)
 }

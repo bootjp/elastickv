@@ -31,6 +31,12 @@ var ErrSnapshotVersionCountTooLarge = errors.New("mvcc snapshot version count to
 var ErrValueTooLarge = errors.New("value too large")
 var ErrInvalidExportCursor = errors.New("invalid export cursor")
 
+// ErrInvalidReadinessState marks a target-staged-readiness state that fails
+// validation. Validation is a pure function of the request, so every replica
+// reaches the same verdict for the same entry: apply must return it as an
+// ordinary rejection rather than halting the group over one malformed RPC.
+var ErrInvalidReadinessState = errors.New("invalid target staged readiness state")
+
 // ErrInvalidExportBudget rejects an export asked for with no version budget.
 // Answering Done for a zero budget lets a migration driver record a non-empty
 // bracket as fully copied and move on to cutover, so the completion signal must
@@ -106,13 +112,15 @@ type ExportVersionsOptions struct {
 	EndKey               []byte
 	MinCommitTSExclusive uint64
 	MaxCommitTSInclusive uint64
-	Cursor               []byte
-	MaxVersions          int
-	MaxBytes             uint64
-	MaxScannedBytes      uint64
-	KeyFamily            uint32
-	AcceptKey            func([]byte) bool
-	AcceptVersion        func(key []byte, value []byte) bool
+	// ReadTS asks export to enforce the same retention watermark as GetAt/ScanAt.
+	ReadTS          uint64
+	Cursor          []byte
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	KeyFamily       uint32
+	AcceptKey       func([]byte) bool
+	AcceptVersion   func(key []byte, value []byte) bool
 }
 
 // ExportVersionsResult is one resumable chunk of raw MVCC versions.
@@ -180,15 +188,89 @@ type PromotionState struct {
 	LastError     string
 }
 
+// CleanupVersionsOptions physically removes exact committed versions selected
+// by the migration bracket filter. It is cursor-resumable and is used only
+// after ownership has moved or while abandoning an unpublished migration.
+type CleanupVersionsOptions struct {
+	JobID           uint64
+	AppliedIndex    uint64
+	StartKey        []byte
+	EndKey          []byte
+	Cursor          []byte
+	MaxCommitTS     uint64
+	MaxVersions     int
+	MaxBytes        uint64
+	MaxScannedBytes uint64
+	KeyFamily       uint32
+	AcceptVersion   func(key, value []byte) bool
+}
+
+// CleanupVersionsResult reports one bounded physical-delete chunk.
+type CleanupVersionsResult struct {
+	NextCursor   []byte
+	Done         bool
+	DeletedRows  uint64
+	DeletedBytes uint64
+	ScannedBytes uint64
+}
+
+// TargetStagedReadinessState is a target-local guard that makes a target voter
+// fail closed for a moving route until it has either the staged descriptor or
+// the cleared descriptor with the retained write timestamp floor.
+type TargetStagedReadinessState struct {
+	JobID                  uint64
+	RouteStart             []byte
+	RouteEnd               []byte
+	ExpectedCutoverVersion uint64
+	MigrationJobID         uint64
+	MinWriteTSExclusive    uint64
+	Armed                  bool
+	SourceWriteFence       bool
+	SourceReadFence        bool
+	RetentionPinTS         uint64
+	TrackWrites            bool
+	MinAdmittedTS          uint64
+}
+
 // MigrationPromoter is implemented by stores that can promote staged range
 // migration data into the live keyspace.
 type MigrationPromoter interface {
 	PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error)
 }
 
+// MigrationCleaner removes source or abandoned target versions and the
+// per-job migration proof records through the Raft apply path.
+type MigrationCleaner interface {
+	CleanupVersions(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error)
+	ClearMigrationState(ctx context.Context, jobID, appliedIndex uint64) error
+}
+
 // MigrationPromotionStateReader reads target-local staged promotion state.
 type MigrationPromotionStateReader interface {
 	MigrationPromotionState(ctx context.Context, jobID uint64) (PromotionState, bool, error)
+}
+
+// MigrationTargetReadinessWriter persists a target-local staged-readiness
+// guard through the target Raft group.
+type MigrationTargetReadinessWriter interface {
+	ApplyTargetStagedReadiness(ctx context.Context, state TargetStagedReadinessState) error
+}
+
+// MigrationTargetReadinessRaftWriter persists a target-local readiness guard
+// from the Raft apply loop while bundling the applied index with that update.
+type MigrationTargetReadinessRaftWriter interface {
+	ApplyTargetStagedReadinessAt(ctx context.Context, state TargetStagedReadinessState, appliedIndex uint64) error
+}
+
+// MigrationTargetReadinessReader reads retained target-local readiness guards.
+type MigrationTargetReadinessReader interface {
+	MigrationTargetReadinessStates(ctx context.Context) ([]TargetStagedReadinessState, error)
+}
+
+// MigrationImportMetadataReader reports whether target-local import proof
+// metadata remains for a migration job.
+type MigrationImportMetadataReader interface {
+	MigrationImportMetadataPresent(ctx context.Context, jobID uint64) (bool, error)
 }
 
 // OpType describes a mutation kind.
