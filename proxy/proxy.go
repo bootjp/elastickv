@@ -522,6 +522,9 @@ func writeCommandResponse(w respWriter, name string, args [][]byte, resp any, er
 }
 
 func writeCommandValue(w respWriter, name string, args [][]byte, resp any) {
+	if name == "DEBUG" && writeDebugDigestValues(w, args, resp) {
+		return
+	}
 	if value, ok := resp.(string); ok {
 		if isSimpleStringCommand(name, args) || isACLDRYRUNSuccess(name, args, value) || (isScriptReturnCommand(name) && isStatusResponse(value)) || isDefaultRoutedStatus(name, args, value) {
 			w.WriteString(value)
@@ -529,6 +532,25 @@ func writeCommandValue(w respWriter, name string, args [][]byte, resp any) {
 		}
 	}
 	writeRedisValue(w, resp)
+}
+
+func writeDebugDigestValues(w respWriter, args [][]byte, resp any) bool {
+	if !hasSubcommand(args, "DIGEST-VALUE") {
+		return false
+	}
+	values, ok := resp.([]any)
+	if !ok {
+		return false
+	}
+	w.WriteArray(len(values))
+	for _, value := range values {
+		if digest, ok := value.(string); ok {
+			w.WriteString(digest)
+		} else {
+			writeRedisValue(w, value)
+		}
+	}
+	return true
 }
 
 // Script return types cannot be recovered from go-redis's generic string
@@ -625,6 +647,28 @@ func isSimpleAdminSubcommand(name string, args [][]byte) bool {
 		return hasSubcommand(args, "PURGE")
 	case "CLUSTER":
 		return hasSubcommand(args, "ADDSLOTS", "ADDSLOTSRANGE", "DELSLOTS", "DELSLOTSRANGE", "FAILOVER", "FLUSHSLOTS", "FORGET", "MEET", "REPLICATE", "RESET", "SAVECONFIG", "SET-CONFIG-EPOCH", "SETSLOT")
+	case "DEBUG":
+		return isSimpleDebugSubcommand(args)
+	default:
+		return false
+	}
+}
+
+// DEBUG has both simple-string diagnostics and bulk-string data responses.
+// These subcommands use addReplyStatus or shared.ok in Redis 8.10.1.
+func isSimpleDebugSubcommand(args [][]byte) bool {
+	if len(args) < subcommandArgCount {
+		return false
+	}
+	switch strings.ToUpper(string(args[1])) {
+	case "OOM", "KEYSIZES-HIST-ASSERT", "ALLOCSIZE-SLOTS-ASSERT", "LOG", "LEAK", "RELOAD", "LOADAOF",
+		"DROP-CLUSTER-PACKET-FILTER", "OBJECT", "SDSLEN", "LISTPACK", "QUICKLIST", "POPULATE", "DIGEST",
+		"SLEEP", "SET-ACTIVE-EXPIRE", "SET-ALLOW-ACCESS-EXPIRED", "QUICKLIST-PACKED-THRESHOLD",
+		"SET-SKIP-CHECKSUM-VALIDATION", "ENABLE-KEYMETA-RUNTIME-REGISTRATION", "AOF-FLUSH-SLEEP",
+		"REPLICATE", "CHANGE-REPL-ID", "STRINGMATCH-TEST", "SET-DISABLE-DENY-SCRIPTS",
+		"CONFIG-REWRITE-FORCE-ALL", "PAUSE-CRON", "REPLYBUFFER", "REPLY-COPY-AVOIDANCE",
+		"REPL-PAUSE", "DICT-RESIZING", "SCRIPT", "MARK-INTERNAL-CLIENT", "ASM-FAILPOINT", "ASM-TRIM-METHOD":
+		return true
 	default:
 		return false
 	}

@@ -50,6 +50,11 @@ func TestParsedProxyRESP2StringTypes(t *testing.T) {
 		{"client-kill-legacy-status", "CLIENT", [][]byte{[]byte("CLIENT"), []byte("KILL"), []byte("127.0.0.1:1234")}, "OK", []any{"STR:OK"}},
 		{"acl-dryrun-allowed-status", "ACL", [][]byte{[]byte("ACL"), []byte("DRYRUN"), []byte("default"), []byte("PING")}, "OK", []any{"STR:OK"}},
 		{"acl-dryrun-denied-data", "ACL", [][]byte{[]byte("ACL"), []byte("DRYRUN"), []byte("restricted"), []byte("GET"), []byte("key")}, "User restricted has no permissions to run the 'get' command", []any{"BULKSTR:User restricted has no permissions to run the 'get' command"}},
+		{"debug-sleep-status", "DEBUG", [][]byte{[]byte("DEBUG"), []byte("SLEEP"), []byte("0")}, "OK", []any{"STR:OK"}},
+		{"debug-digest-status", "DEBUG", [][]byte{[]byte("DEBUG"), []byte("DIGEST")}, "0123456789abcdef", []any{"STR:0123456789abcdef"}},
+		{"debug-object-status", "DEBUG", [][]byte{[]byte("DEBUG"), []byte("OBJECT"), []byte("k")}, "Value at:0x123", []any{"STR:Value at:0x123"}},
+		{"debug-protocol-data", "DEBUG", [][]byte{[]byte("DEBUG"), []byte("PROTOCOL"), []byte("STRING")}, "Hello World", []any{"BULKSTR:Hello World"}},
+		{"debug-structsize-data", "DEBUG", [][]byte{[]byte("DEBUG"), []byte("STRUCTSIZE")}, "bits:64", []any{"BULKSTR:bits:64"}},
 		{"client-getname-data", "CLIENT", [][]byte{[]byte("CLIENT"), []byte("GETNAME")}, "OK", []any{"BULKSTR:OK"}},
 		{"function-load-data", "FUNCTION", [][]byte{[]byte("FUNCTION"), []byte("LOAD"), []byte("code")}, "OK", []any{"BULKSTR:OK"}},
 		{"slowlog-get-array", "SLOWLOG", [][]byte{[]byte("SLOWLOG"), []byte("GET")}, []any{"entry"}, []any{1, "BULKSTR:entry"}},
@@ -107,6 +112,12 @@ func TestParsedProxyTransactionPingTypes(t *testing.T) {
 	}
 	writeTxnResponse(w, queue, []any{"PONG", "PONG"}, nil)
 	require.Equal(t, []any{2, "STR:PONG", "BULKSTR:PONG"}, w.writes)
+}
+
+func TestParsedProxyDebugDigestValueTypes(t *testing.T) {
+	w := &mockRespWriter{}
+	writeCommandResponse(w, "DEBUG", [][]byte{[]byte("DEBUG"), []byte("DIGEST-VALUE"), []byte("k1"), []byte("k2")}, []any{"digest1", "digest2"}, nil)
+	require.Equal(t, []any{2, "STR:digest1", "STR:digest2"}, w.writes)
 }
 
 func TestParsedProxyPingArity(t *testing.T) {
