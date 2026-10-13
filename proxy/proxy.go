@@ -523,7 +523,7 @@ func writeCommandResponse(w respWriter, name string, args [][]byte, resp any, er
 
 func writeCommandValue(w respWriter, name string, args [][]byte, resp any) {
 	if value, ok := resp.(string); ok {
-		if isSimpleStringCommand(name, args) || (isScriptReturnCommand(name) && isStatusResponse(value)) {
+		if isSimpleStringCommand(name, args) || (isScriptReturnCommand(name) && isStatusResponse(value)) || isDefaultRoutedStatus(name, args, value) {
 			w.WriteString(value)
 			return
 		}
@@ -550,6 +550,16 @@ func isStatusResponse(s string) bool {
 	default:
 		return false
 	}
+}
+
+// Unlisted commands are forwarded as writes. Preserve the status-token
+// behavior they had before the RESP2 bulk-string fix; their reply schema is
+// unavailable to the parsed proxy after go-redis decodes the upstream frame.
+func isDefaultRoutedStatus(name string, args [][]byte, value string) bool {
+	if _, known := commandTable[name]; known || len(args) == 0 {
+		return false
+	}
+	return ClassifyCommand(name, args[1:]) == CmdWrite && isStatusResponse(value)
 }
 
 func isNullArrayResponse(name string) bool {
@@ -622,12 +632,25 @@ func setReturnsStatus(args [][]byte) bool {
 	if len(args) < setMinimumArgs {
 		return false
 	}
-	for _, arg := range args[setMinimumArgs:] {
-		if strings.EqualFold(string(arg), "GET") {
+	for i := setMinimumArgs; i < len(args); i++ {
+		option := strings.ToUpper(string(args[i]))
+		if option == "GET" {
 			return false
+		}
+		if setOptionHasValue(option) {
+			i++
 		}
 	}
 	return true
+}
+
+func setOptionHasValue(option string) bool {
+	switch option {
+	case "EX", "PX", "EXAT", "PXAT", "IFEQ", "IFNE", "IFDEQ", "IFDNE":
+		return true
+	default:
+		return false
+	}
 }
 
 func hasSubcommand(args [][]byte, names ...string) bool {
@@ -644,7 +667,7 @@ func hasSubcommand(args [][]byte, names ...string) bool {
 
 func isFixedSimpleStringCommand(name string) bool {
 	switch name {
-	case "TYPE", "SETEX", "PSETEX", "MSET", "HMSET", "LSET", "LTRIM", "RENAME", "RESTORE", "PFMERGE", "FLUSHALL", "FLUSHDB", "SWAPDB", "WATCH", "UNWATCH", "RESET":
+	case "TYPE", "SETEX", "PSETEX", "MSET", "HMSET", "LSET", "LTRIM", "RENAME", "RESTORE", "PFMERGE", "FLUSHALL", "FLUSHDB", "SWAPDB", "WATCH", "UNWATCH", "RESET", "SAVE", "BGSAVE", "BGREWRITEAOF", "REPLICAOF", "SLAVEOF", "MIGRATE", "READONLY", "READWRITE", "ASKING", "REPLCONF", "RESTORE-ASKING", "FAILOVER":
 		return true
 	default:
 		return false
