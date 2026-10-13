@@ -20,6 +20,7 @@ import (
 
 type xreadRequest struct {
 	block    time.Duration
+	hasBlock bool
 	count    int
 	keys     [][]byte
 	afterIDs []string
@@ -27,6 +28,7 @@ type xreadRequest struct {
 
 type xreadOptions struct {
 	block        time.Duration
+	hasBlock     bool
 	count        int
 	streamsIndex int
 }
@@ -1005,6 +1007,7 @@ func parseXReadOption(opts *xreadOptions, args [][]byte, i int) (int, bool, erro
 			return 0, false, err
 		}
 		opts.block = block
+		opts.hasBlock = true
 		return i + redisPairWidth, false, nil
 	case "STREAMS":
 		opts.streamsIndex = i + 1
@@ -1042,7 +1045,7 @@ func parseXReadRequest(args [][]byte) (xreadRequest, error) {
 	if err != nil {
 		return xreadRequest{}, err
 	}
-	return xreadRequest{block: opts.block, count: opts.count, keys: keys, afterIDs: afterIDs}, nil
+	return xreadRequest{block: opts.block, hasBlock: opts.hasBlock, count: opts.count, keys: keys, afterIDs: afterIDs}, nil
 }
 
 func (r *RedisServer) resolveXReadAfterIDs(ctx context.Context, req *xreadRequest) error {
@@ -1349,7 +1352,7 @@ func (r *RedisServer) writeXReadFinalOrNull(conn redcon.Conn, req xreadRequest) 
 	if r.xreadFinalTypeCheck(conn, req) {
 		return
 	}
-	conn.WriteNull()
+	conn.WriteArray(-1)
 }
 
 func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
@@ -1391,8 +1394,34 @@ func (r *RedisServer) xread(conn redcon.Conn, cmd redcon.Command) {
 		writeRedisError(conn, err)
 		return
 	}
+	if !req.hasBlock {
+		r.xreadWithoutBlock(conn, req)
+		return
+	}
 
 	r.xreadBusyPoll(conn, req, deadline)
+}
+
+func (r *RedisServer) xreadWithoutBlock(conn redcon.Conn, req xreadRequest) {
+	ctx, cancel := context.WithTimeout(r.handlerContext(), redisDispatchTimeout)
+	defer cancel()
+	var results []xreadResult
+	var err error
+	if ok := r.runWithHeavyCommandSlot(func() {
+		results, err = r.xreadOnce(ctx, req)
+	}); !ok {
+		conn.WriteError(errRedisHeavyCommandPoolFull.Error())
+		return
+	}
+	if err != nil {
+		writeRedisError(conn, err)
+		return
+	}
+	if len(results) == 0 {
+		conn.WriteArray(-1)
+		return
+	}
+	writeXReadResults(conn, results)
 }
 
 // xreadBusyPoll runs the BLOCK-window wait loop. Extracted from xread so
@@ -1416,7 +1445,7 @@ func (r *RedisServer) xreadBusyPoll(conn redcon.Conn, req xreadRequest, deadline
 		// empty iteration and the loop would otherwise wait at
 		// the configured block fallback cadence until the deadline.
 		if handlerCtx.Err() != nil {
-			conn.WriteNull()
+			conn.WriteArray(-1)
 			return
 		}
 		// BLOCK-expired before the loop body: respect the Redis contract

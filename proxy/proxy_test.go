@@ -290,13 +290,11 @@ func TestCloneArgs(t *testing.T) {
 	assert.Equal(t, byte('G'), original[0][0])
 }
 
-func TestIsStatusResponse(t *testing.T) {
-	assert.True(t, isStatusResponse("OK"))
-	assert.True(t, isStatusResponse("QUEUED"))
-	assert.True(t, isStatusResponse("PONG"))
-	assert.False(t, isStatusResponse("hello"))
-	assert.False(t, isStatusResponse(""))
-	assert.False(t, isStatusResponse("ok")) // case-sensitive
+func TestIsSimpleStringCommand(t *testing.T) {
+	assert.True(t, isSimpleStringCommand("TYPE", nil))
+	assert.True(t, isSimpleStringCommand("SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")}))
+	assert.False(t, isSimpleStringCommand("SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v"), []byte("GET")}))
+	assert.False(t, isSimpleStringCommand("GET", nil))
 }
 
 // ========== sentry.go tests ==========
@@ -2501,9 +2499,9 @@ func TestWriteRedisValue(t *testing.T) {
 		expect []any
 	}{
 		{"nil", nil, []any{nil}},
-		{"status OK", "OK", []any{"STR:OK"}},
-		{"status QUEUED", "QUEUED", []any{"STR:QUEUED"}},
-		{"status PONG", "PONG", []any{"STR:PONG"}},
+		{"bulk OK", "OK", []any{"BULKSTR:OK"}},
+		{"bulk QUEUED", "QUEUED", []any{"BULKSTR:QUEUED"}},
+		{"bulk PONG", "PONG", []any{"BULKSTR:PONG"}},
 		{"bulk string", "hello", []any{"BULKSTR:hello"}},
 		{"int64", int64(42), []any{int64(42)}},
 		{"bytes", []byte("data"), []any{"BULK:data"}},
