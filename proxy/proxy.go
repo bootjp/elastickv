@@ -320,6 +320,7 @@ const (
 	pingMessageArgCount = 2
 	helloProtoArgCount  = 2
 	subcommandArgCount  = 2
+	statusThirdArgCount = 3
 	setMinimumArgs      = 3
 )
 
@@ -573,22 +574,48 @@ func isSimpleStringCommand(name string, args [][]byte) bool {
 func isSimpleStringSubcommand(name string, args [][]byte) bool {
 	switch name {
 	case "CLIENT":
-		return hasSubcommand(args, "SETNAME", "SETINFO", "PAUSE", "UNPAUSE", "TRACKING", "CACHING", "NO-EVICT", "NO-TOUCH")
+		return isSimpleClientSubcommand(args)
 	case cmdScript:
-		return hasSubcommand(args, "FLUSH", "KILL")
+		return hasSubcommand(args, "FLUSH", "KILL", "DEBUG")
 	case "FUNCTION":
 		return hasSubcommand(args, "FLUSH", "KILL", "DELETE", "RESTORE")
 	case "XGROUP":
 		return hasSubcommand(args, "CREATE", "SETID")
+	default:
+		return isSimpleAdminSubcommand(name, args)
+	}
+}
+
+func isSimpleClientSubcommand(args [][]byte) bool {
+	if hasSubcommand(args, "SETNAME", "SETINFO", "PAUSE", "UNPAUSE", "TRACKING", "CACHING", "NO-EVICT", "NO-TOUCH") {
+		return true
+	}
+	return len(args) == statusThirdArgCount && (hasSubcommand(args, "KILL") ||
+		(hasSubcommand(args, "REPLY") && strings.EqualFold(string(args[2]), "ON")))
+}
+
+func isSimpleAdminSubcommand(name string, args [][]byte) bool {
+	switch name {
 	case "CONFIG":
 		return hasSubcommand(args, "SET", "RESETSTAT", "REWRITE")
 	case "ACL":
-		return hasSubcommand(args, "SETUSER", "SAVE", "LOAD")
+		return isSimpleACLSubcommand(args)
 	case "MODULE":
 		return hasSubcommand(args, "LOAD", "LOADEX", "UNLOAD")
+	case "SLOWLOG":
+		return hasSubcommand(args, "RESET")
+	case "MEMORY":
+		return hasSubcommand(args, "PURGE")
+	case "CLUSTER":
+		return hasSubcommand(args, "ADDSLOTS", "ADDSLOTSRANGE", "DELSLOTS", "DELSLOTSRANGE", "FAILOVER", "FLUSHSLOTS", "FORGET", "MEET", "REPLICATE", "RESET", "SAVECONFIG", "SET-CONFIG-EPOCH", "SETSLOT")
 	default:
 		return false
 	}
+}
+
+func isSimpleACLSubcommand(args [][]byte) bool {
+	return hasSubcommand(args, "SETUSER", "SAVE", "LOAD") ||
+		(len(args) == statusThirdArgCount && hasSubcommand(args, "LOG") && strings.EqualFold(string(args[2]), "RESET"))
 }
 
 func setReturnsStatus(args [][]byte) bool {

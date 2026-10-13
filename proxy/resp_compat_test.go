@@ -34,8 +34,16 @@ func TestParsedProxyRESP2StringTypes(t *testing.T) {
 		{"config-set-status", "CONFIG", [][]byte{[]byte("CONFIG"), []byte("SET"), []byte("timeout"), []byte("0")}, "OK", []any{"STR:OK"}},
 		{"acl-setuser-status", "ACL", [][]byte{[]byte("ACL"), []byte("SETUSER"), []byte("user"), []byte("OFF")}, "OK", []any{"STR:OK"}},
 		{"client-tracking-status", "CLIENT", [][]byte{[]byte("CLIENT"), []byte("TRACKING"), []byte("ON")}, "OK", []any{"STR:OK"}},
+		{"slowlog-reset-status", "SLOWLOG", [][]byte{[]byte("SLOWLOG"), []byte("RESET")}, "OK", []any{"STR:OK"}},
+		{"memory-purge-status", "MEMORY", [][]byte{[]byte("MEMORY"), []byte("PURGE")}, "OK", []any{"STR:OK"}},
+		{"acl-log-reset-status", "ACL", [][]byte{[]byte("ACL"), []byte("LOG"), []byte("RESET")}, "OK", []any{"STR:OK"}},
+		{"script-debug-status", "SCRIPT", [][]byte{[]byte("SCRIPT"), []byte("DEBUG"), []byte("NO")}, "OK", []any{"STR:OK"}},
+		{"cluster-addslots-status", "CLUSTER", [][]byte{[]byte("CLUSTER"), []byte("ADDSLOTS"), []byte("1")}, "OK", []any{"STR:OK"}},
+		{"client-kill-legacy-status", "CLIENT", [][]byte{[]byte("CLIENT"), []byte("KILL"), []byte("127.0.0.1:1234")}, "OK", []any{"STR:OK"}},
 		{"client-getname-data", "CLIENT", [][]byte{[]byte("CLIENT"), []byte("GETNAME")}, "OK", []any{"BULKSTR:OK"}},
 		{"function-load-data", "FUNCTION", [][]byte{[]byte("FUNCTION"), []byte("LOAD"), []byte("code")}, "OK", []any{"BULKSTR:OK"}},
+		{"slowlog-get-array", "SLOWLOG", [][]byte{[]byte("SLOWLOG"), []byte("GET")}, []any{"entry"}, []any{1, "BULKSTR:entry"}},
+		{"cluster-bumpepoch-data", "CLUSTER", [][]byte{[]byte("CLUSTER"), []byte("BUMPEPOCH")}, "BUMPED", []any{"BULKSTR:BUMPED"}},
 		{"bzpopmin-null-array", "BZPOPMIN", [][]byte{[]byte("BZPOPMIN"), []byte("k"), []byte("0.01")}, nil, []any{-1}},
 		{"xread-null-array", "XREAD", [][]byte{[]byte("XREAD"), []byte("STREAMS"), []byte("k"), []byte("0")}, nil, []any{-1}},
 	} {
@@ -97,5 +105,17 @@ func TestParsedProxyHello2(t *testing.T) {
 	w := &commandDocsConn{}
 	p.handleAdmin(w, "HELLO", [][]byte{[]byte("HELLO"), []byte("2")})
 	require.Equal(t, []any{4, "BULKSTR:server", "BULKSTR:redis", "BULKSTR:proto", int64(2)}, w.writes)
+	require.Len(t, primary.Calls(), 1)
+}
+
+func TestParsedProxyAdminStatusReply(t *testing.T) {
+	primary := newMockBackend("redis")
+	primary.doFunc = makeCmd("OK", nil)
+	d := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly}, newTestMetrics(), newTestSentry(), testLogger)
+	defer d.Close()
+	p := &ProxyServer{dual: d}
+	w := &commandDocsConn{}
+	p.handleAdmin(w, "SLOWLOG", [][]byte{[]byte("SLOWLOG"), []byte("RESET")})
+	require.Equal(t, []any{"STR:OK"}, w.writes)
 	require.Len(t, primary.Calls(), 1)
 }
