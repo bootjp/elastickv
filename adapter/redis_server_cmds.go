@@ -315,7 +315,7 @@ func redisCommandGroup(name string) string {
 	case 'x':
 		return "stream"
 	case 'z':
-		return "sorted_set"
+		return "sorted-set"
 	case 'p':
 		if strings.HasPrefix(name, "pf") {
 			return "hyperloglog"
@@ -329,7 +329,7 @@ func redisCommandFixedGroup(name string) (string, bool) {
 	case "get", "getdel", setKind, "setex", "setnx", "incr":
 		return "string", true
 	case "bzpopmin", "elastickv.zremfast":
-		return "sorted_set", true
+		return "sorted-set", true
 	case "client", "hello", "ping", "quit", "select":
 		return "connection", true
 	case redisCommandNameCommand, "dbsize", "info", "flushall", "flushdb", "flushlegacy":
@@ -340,7 +340,7 @@ func redisCommandFixedGroup(name string) (string, bool) {
 		return "transactions", true
 	case "publish", "pubsub", "subscribe":
 		return "pubsub", true
-	case "scan":
+	case "rename", "scan":
 		return "generic", true
 	}
 	return "", false

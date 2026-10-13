@@ -53,9 +53,41 @@ func TestRedisRESP2CommandMetadata(t *testing.T) {
 
 	docs := runCommand(t, "COMMAND", "DOCS", "GET")
 	require.Contains(t, docs.writes, commandRecorderEntry{op: "bulk", s: "group"})
+	renameDocs := runCommand(t, "COMMAND", "DOCS", "RENAME")
+	require.Contains(t, renameDocs.writes, commandRecorderEntry{op: "bulk", s: "generic"})
 
 	unknown := runCommand(t, "COMMAND", "DOCS", "NO_SUCH_COMMAND")
 	require.Equal(t, []commandRecorderEntry{{op: "array", n: 0}}, unknown.writes)
+}
+
+func TestRedisRESP2CommandGroups(t *testing.T) {
+	// Redis 8.10.1 COMMAND DOCS groups for all 82 public adapter commands,
+	// plus the two ElasticKV-only aliases.
+	groups := map[string]string{
+		"connection":   "client hello ping quit select",
+		"generic":      "del exists expire keys pexpire pttl rename scan ttl type",
+		"hash":         "hdel hexists hget hgetall hincrby hlen hmget hmset hset",
+		"hyperloglog":  "pfadd pfcount",
+		"list":         "lindex llen lpop lpos lpush lrange lrem lset ltrim rpop rpoplpush rpush",
+		"pubsub":       "publish pubsub subscribe",
+		"scripting":    "eval evalsha",
+		"server":       "command dbsize flushall flushdb flushlegacy info",
+		"set":          "sadd scard sismember smembers srem",
+		"sorted-set":   "bzpopmin elastickv.zremfast zadd zcard zcount zincrby zpopmin zrange zrangebyscore zrem zremrangebyrank zremrangebyscore zrevrange zrevrangebyscore zscore",
+		"stream":       "xadd xlen xrange xread xrevrange xtrim",
+		"string":       "get getdel incr set setex setnx",
+		"transactions": "discard exec multi",
+	}
+	want := make(map[string]string, len(redisCommandSpecs))
+	for group, names := range groups {
+		for _, name := range strings.Fields(names) {
+			want[name] = group
+		}
+	}
+	require.Len(t, want, len(redisCommandSpecs))
+	for _, spec := range redisCommandSpecs {
+		require.Equal(t, want[spec.Name], redisCommandGroup(spec.Name), spec.Name)
+	}
 }
 
 func TestRedisRESP2NullArrayReplies(t *testing.T) {

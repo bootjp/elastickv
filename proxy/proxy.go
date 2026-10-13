@@ -319,6 +319,7 @@ func (p *ProxyServer) createShadowPubSub(cmdName string, channels []string) *sha
 const (
 	pingMessageArgCount = 2
 	helloProtoArgCount  = 2
+	subcommandArgCount  = 2
 	setMinimumArgs      = 3
 )
 
@@ -563,13 +564,28 @@ func isSimpleStringCommand(name string, args [][]byte) bool {
 	if isFixedSimpleStringCommand(name) {
 		return true
 	}
-	switch name {
-	case "SET":
+	if name == "SET" {
 		return setReturnsStatus(args)
+	}
+	return isSimpleStringSubcommand(name, args)
+}
+
+func isSimpleStringSubcommand(name string, args [][]byte) bool {
+	switch name {
 	case "CLIENT":
-		return hasSubcommand(args, "SETNAME", "SETINFO")
-	case "SCRIPT", "FUNCTION":
+		return hasSubcommand(args, "SETNAME", "SETINFO", "PAUSE", "UNPAUSE", "TRACKING", "CACHING", "NO-EVICT", "NO-TOUCH")
+	case cmdScript:
 		return hasSubcommand(args, "FLUSH", "KILL")
+	case "FUNCTION":
+		return hasSubcommand(args, "FLUSH", "KILL", "DELETE", "RESTORE")
+	case "XGROUP":
+		return hasSubcommand(args, "CREATE", "SETID")
+	case "CONFIG":
+		return hasSubcommand(args, "SET", "RESETSTAT", "REWRITE")
+	case "ACL":
+		return hasSubcommand(args, "SETUSER", "SAVE", "LOAD")
+	case "MODULE":
+		return hasSubcommand(args, "LOAD", "LOADEX", "UNLOAD")
 	default:
 		return false
 	}
@@ -587,13 +603,21 @@ func setReturnsStatus(args [][]byte) bool {
 	return true
 }
 
-func hasSubcommand(args [][]byte, first, second string) bool {
-	return len(args) > 1 && (strings.EqualFold(string(args[1]), first) || strings.EqualFold(string(args[1]), second))
+func hasSubcommand(args [][]byte, names ...string) bool {
+	if len(args) < subcommandArgCount {
+		return false
+	}
+	for _, name := range names {
+		if strings.EqualFold(string(args[1]), name) {
+			return true
+		}
+	}
+	return false
 }
 
 func isFixedSimpleStringCommand(name string) bool {
 	switch name {
-	case "TYPE", "SETEX", "HMSET", "LSET", "LTRIM", "RENAME", "FLUSHALL", "FLUSHDB":
+	case "TYPE", "SETEX", "PSETEX", "MSET", "HMSET", "LSET", "LTRIM", "RENAME", "RESTORE", "PFMERGE", "FLUSHALL", "FLUSHDB", "SWAPDB", "WATCH", "UNWATCH", "RESET":
 		return true
 	default:
 		return false
