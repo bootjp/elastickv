@@ -48,6 +48,8 @@ func TestParsedProxyRESP2StringTypes(t *testing.T) {
 		{"script-debug-status", "SCRIPT", [][]byte{[]byte("SCRIPT"), []byte("DEBUG"), []byte("NO")}, "OK", []any{"STR:OK"}},
 		{"cluster-addslots-status", "CLUSTER", [][]byte{[]byte("CLUSTER"), []byte("ADDSLOTS"), []byte("1")}, "OK", []any{"STR:OK"}},
 		{"client-kill-legacy-status", "CLIENT", [][]byte{[]byte("CLIENT"), []byte("KILL"), []byte("127.0.0.1:1234")}, "OK", []any{"STR:OK"}},
+		{"acl-dryrun-allowed-status", "ACL", [][]byte{[]byte("ACL"), []byte("DRYRUN"), []byte("default"), []byte("PING")}, "OK", []any{"STR:OK"}},
+		{"acl-dryrun-denied-data", "ACL", [][]byte{[]byte("ACL"), []byte("DRYRUN"), []byte("restricted"), []byte("GET"), []byte("key")}, "User restricted has no permissions to run the 'get' command", []any{"BULKSTR:User restricted has no permissions to run the 'get' command"}},
 		{"client-getname-data", "CLIENT", [][]byte{[]byte("CLIENT"), []byte("GETNAME")}, "OK", []any{"BULKSTR:OK"}},
 		{"function-load-data", "FUNCTION", [][]byte{[]byte("FUNCTION"), []byte("LOAD"), []byte("code")}, "OK", []any{"BULKSTR:OK"}},
 		{"slowlog-get-array", "SLOWLOG", [][]byte{[]byte("SLOWLOG"), []byte("GET")}, []any{"entry"}, []any{1, "BULKSTR:entry"}},
@@ -95,6 +97,16 @@ func TestParsedProxyTransactionKeepsElementTypes(t *testing.T) {
 	}
 	writeTxnResponse(w, queue, []any{"OK", "OK"}, nil)
 	require.Equal(t, []any{2, "STR:OK", "BULKSTR:OK"}, w.writes)
+}
+
+func TestParsedProxyTransactionPingTypes(t *testing.T) {
+	w := &mockRespWriter{}
+	queue := [][][]byte{
+		{[]byte("PING")},
+		{[]byte("PING"), []byte("PONG")},
+	}
+	writeTxnResponse(w, queue, []any{"PONG", "PONG"}, nil)
+	require.Equal(t, []any{2, "STR:PONG", "BULKSTR:PONG"}, w.writes)
 }
 
 func TestParsedProxyPingArity(t *testing.T) {

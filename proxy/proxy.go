@@ -523,7 +523,7 @@ func writeCommandResponse(w respWriter, name string, args [][]byte, resp any, er
 
 func writeCommandValue(w respWriter, name string, args [][]byte, resp any) {
 	if value, ok := resp.(string); ok {
-		if isSimpleStringCommand(name, args) || (isScriptReturnCommand(name) && isStatusResponse(value)) || isDefaultRoutedStatus(name, args, value) {
+		if isSimpleStringCommand(name, args) || isACLDRYRUNSuccess(name, args, value) || (isScriptReturnCommand(name) && isStatusResponse(value)) || isDefaultRoutedStatus(name, args, value) {
 			w.WriteString(value)
 			return
 		}
@@ -562,6 +562,10 @@ func isDefaultRoutedStatus(name string, args [][]byte, value string) bool {
 	return ClassifyCommand(name, args[1:]) == CmdWrite && isStatusResponse(value)
 }
 
+func isACLDRYRUNSuccess(name string, args [][]byte, value string) bool {
+	return name == "ACL" && hasSubcommand(args, "DRYRUN") && value == "OK"
+}
+
 func isNullArrayResponse(name string) bool {
 	switch name {
 	case cmdNameBLPOP, cmdNameBRPOP, cmdNameBZPOPMIN, cmdNameBZPOPMAX, cmdNameXREAD, cmdNameXREADGROUP, "EXEC":
@@ -572,6 +576,9 @@ func isNullArrayResponse(name string) bool {
 }
 
 func isSimpleStringCommand(name string, args [][]byte) bool {
+	if name == "PING" {
+		return len(args) == 1
+	}
 	if isFixedSimpleStringCommand(name) {
 		return true
 	}
