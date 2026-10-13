@@ -525,13 +525,35 @@ func writeCommandValue(w respWriter, name string, args [][]byte, resp any) {
 	if name == "DEBUG" && writeDebugDigestValues(w, args, resp) {
 		return
 	}
+	if isScriptReturnCommand(name) {
+		writeScriptValue(w, resp)
+		return
+	}
 	if value, ok := resp.(string); ok {
-		if isSimpleStringCommand(name, args) || isACLDRYRUNSuccess(name, args, value) || (isScriptReturnCommand(name) && isStatusResponse(value)) || isDefaultRoutedStatus(name, args, value) {
+		if isSimpleStringCommand(name, args) || isACLDRYRUNSuccess(name, args, value) || isDefaultRoutedStatus(name, args, value) {
 			w.WriteString(value)
 			return
 		}
 	}
 	writeRedisValue(w, resp)
+}
+
+func writeScriptValue(w respWriter, resp any) {
+	switch value := resp.(type) {
+	case string:
+		if isStatusResponse(value) {
+			w.WriteString(value)
+		} else {
+			w.WriteBulkString(value)
+		}
+	case []any:
+		w.WriteArray(len(value))
+		for _, item := range value {
+			writeScriptValue(w, item)
+		}
+	default:
+		writeRedisValue(w, resp)
+	}
 }
 
 func writeDebugDigestValues(w respWriter, args [][]byte, resp any) bool {
@@ -553,9 +575,9 @@ func writeDebugDigestValues(w respWriter, args [][]byte, resp any) bool {
 	return true
 }
 
-// Script return types cannot be recovered from go-redis's generic string
-// value. Keep the existing status handling until the primary transport can
-// preserve the upstream RESP type directly.
+// go-redis loses the RESP type of string values, including strings nested in
+// script result arrays. Preserve the prior status-token handling until the
+// primary transport can expose the upstream RESP type directly.
 func isScriptReturnCommand(name string) bool {
 	switch name {
 	case cmdEval, cmdEvalSHA, cmdEvalRO, cmdEvalSHARO, "FCALL", "FCALL_RO":

@@ -120,6 +120,16 @@ func TestParsedProxyDebugDigestValueTypes(t *testing.T) {
 	require.Equal(t, []any{2, "STR:digest1", "STR:digest2"}, w.writes)
 }
 
+func TestParsedProxyNestedScriptStatusTypes(t *testing.T) {
+	for _, name := range []string{"EVAL", "EVALSHA", "FCALL"} {
+		t.Run(name, func(t *testing.T) {
+			w := &mockRespWriter{}
+			writeCommandResponse(w, name, [][]byte{[]byte(name)}, []any{[]any{"OK", "payload"}, "PONG", int64(1)}, nil)
+			require.Equal(t, []any{3, 2, "STR:OK", "BULKSTR:payload", "STR:PONG", int64(1)}, w.writes)
+		})
+	}
+}
+
 func TestParsedProxyPingArity(t *testing.T) {
 	p := &ProxyServer{}
 	w := &commandDocsConn{}
