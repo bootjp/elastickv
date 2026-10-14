@@ -419,14 +419,14 @@
       (finally
         (delete-tree! dir)))))
 
-(deftest persistent-read-errors-surface-as-data-loss-sentinels
+(deftest persistent-read-errors-surface-as-data-loss-sentinels-in-final-reads
   (let [dir (scratch-dir)]
     (try
       (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir]
                                                           :local true :key-count 2 :max-retries 3
                                                           :require-fuse-mount false})
             c        (client/open! (:client test-map) test-map "n1")
-            read     (fn [k] (client/invoke! c test-map {:type :invoke :f :read :value (independent/tuple k nil)}))
+            read     (fn [k] (client/invoke! c test-map {:type :invoke :f :read :value (independent/tuple k nil) :final true}))
             path     (workload/register-path dir 0)]
         (client/setup! c test-map)
         ;; Deleted register: ENOENT is retried, then reported as :missing.
@@ -437,6 +437,14 @@
             (let [r (read 0)]
               (is (= :ok (:type r)))
               (is (= (independent/tuple 0 :missing) (:value r)))
+              (is (str/includes? (:error r) "No such file or directory"))
+              (is (= 3 @calls))))
+          ;; The same exhaustion during the main phase cannot be told apart
+          ;; from the LOOKUP/OPEN race against a concurrent rename: :fail.
+          (reset! calls 0)
+          (with-redefs [workload/local-read (fn [p] (swap! calls inc) (real p))]
+            (let [r (client/invoke! c test-map {:type :invoke :f :read :value (independent/tuple 0 nil)})]
+              (is (= :fail (:type r)))
               (is (str/includes? (:error r) "No such file or directory"))
               (is (= 3 @calls)))))
         ;; Truncated register.

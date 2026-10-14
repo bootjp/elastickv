@@ -22,14 +22,17 @@
    its retries is recorded as indeterminate because an attempt may already
    have been committed. Reads additionally retry ENOENT, short and malformed
    records: FUSE splits open(2) into LOOKUP + OPEN, so a reader racing a
-   rename on another mount can briefly miss the replaced inode. A read that
-   still cannot observe its register after the retries is not a plain :fail
-   (knossos treats a failed read as never having happened, which would let a
-   lost acknowledged write pass): it completes :ok with a data-loss sentinel
-   (:missing, :truncated or :corrupt) that the register model rejects, and a
-   dedicated checker flags a final-phase read that observed nothing at all.
-   A read against a bare or dangling mount (the node was killed) fails
-   without being counted as loss.
+   rename on another mount can briefly miss the replaced inode. A main-phase
+   read that exhausts those retries is still a plain :fail, because under
+   write contention a bounded retry window cannot tell that race from loss.
+   The final reads run once every writer has stopped, so there the same
+   exhaustion is evidence: a final read that cannot observe its register is
+   not a :fail (knossos treats a failed read as never having happened, which
+   would let a lost acknowledged write pass) but completes :ok with a
+   data-loss sentinel (:missing, :truncated or :corrupt) that the register
+   model rejects, and a dedicated checker flags a final read that observed
+   nothing at all. A read against a bare or dangling mount (the node was
+   killed) fails without being counted as loss.
 
    In `--local` mode the Jepsen process talks to the mount points directly
    through java.nio (one mount directory per node). Without `--local` the
@@ -129,11 +132,12 @@
   #{:missing :truncated :corrupt})
 
 (defn data-loss-kind
-  "Classifies a read error as evidence that the register is lost: :missing
-   for ENOENT, :truncated for a record shorter than record-width and :corrupt
-   for an unparseable record. nil for everything else (EAGAIN, EIO, ENOTCONN,
-   an unavailable mount, SSH failures), which only says the read could not be
-   performed."
+  "Classifies a read error by what it says about the register: :missing for
+   ENOENT, :truncated for a record shorter than record-width and :corrupt for
+   an unparseable record. nil for everything else (EAGAIN, EIO, ENOTCONN, an
+   unavailable mount, SSH failures), which only says the read could not be
+   performed. Only a quiescent (final-phase) read may treat a non-nil kind as
+   loss; while writers run, ENOENT can be the LOOKUP/OPEN race."
   [^Throwable e]
   (let [msg (error-text e)]
     (cond
@@ -494,9 +498,12 @@
 
 (defn invoke-read!
   "Executes a read, retrying retryable and data-loss-shaped errors. Reads
-   never mutate state, so an exhausted error that merely says the read could
-   not be performed is a :fail; one that says the register is gone completes
-   :ok with its data-loss sentinel so the checker sees the loss."
+   never mutate state, so an exhausted error is a :fail, with one exception:
+   a final-phase read (:final, issued after every writer stopped) whose error
+   says the register is gone completes :ok with its data-loss sentinel so the
+   checker sees the loss. A main-phase read keeps :fail even then, because a
+   bounded retry window cannot distinguish a lost register from the
+   LOOKUP/OPEN race against a concurrent rename."
   [{:keys [local? mount-dir max-retries require-fuse-mount]} test node op k]
   (try
     (let [v (with-retries max-retries read-retryable-error?
@@ -509,7 +516,7 @@
                                            StandardCharsets/US_ASCII)))))]
       (assoc op :type :ok :value (independent/tuple k v)))
     (catch Exception e
-      (if-let [kind (data-loss-kind e)]
+      (if-let [kind (and (:final op) (data-loss-kind e))]
         (assoc op :type :ok :value (independent/tuple k kind) :error (io-error-label e))
         (fail op (io-error-label e))))))
 
