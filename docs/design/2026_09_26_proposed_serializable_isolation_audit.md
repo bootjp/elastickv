@@ -330,7 +330,11 @@ advances, and the timestamps it observes to that group's ceiling only;
 their ceilings, so a persistence timestamp never exceeds a ceiling that
 every participant's replicas agreed to; the single-group `Coordinate`
 and the TSO group keep one ceiling; `PhysicalCeiling()` for monitoring
-reports the minimum over the led groups. A transaction whose snapshot
+reports the minimum over the led groups under legacy TSO mode and
+`ceiling(0)` under Phase D, and every other reader of the former scalar
+names its group (the FSM's snapshot metadata through `hlcCeilingFromHLC`
+carries its own group's ceiling; the TSO paths read `ceiling(0)`, see
+the read path below). A transaction whose snapshot
 came from a faster group therefore waits, on its slower participants,
 for their own logs to carry the raise (the advance entry on a read, the
 PREPARE on a write, or the renewal below), never for a raise another
@@ -450,10 +454,11 @@ field, bound with `WithReadSnapshot` or through `WithDispatchVoucher`),
 applies only at its own timestamp, proposes an advance through the
 wrap-aware proposer when the group's replicated watermark is below it and
 waits for the local apply, is refused with `ErrReadTSAheadOfClock` when the
-physical half exceeds `max(HLC.Current, PhysicalCeiling) +
-hlcPhysicalWindowMs` (no wall clock; that bound sits above the local
-ceiling on purpose, which is what makes the ceiling raise at advance apply
-necessary: a group's issued timestamps sit at its own ceiling, `wall +
+physical half exceeds `max(HLC.Current, ceiling) + hlcPhysicalWindowMs`,
+the ceiling being the serving group's own under legacy TSO mode and the
+TSO group's, `ceiling(0)`, under Phase D (no wall clock; that bound sits
+above the local ceiling on purpose, which is what makes the ceiling raise
+at advance apply necessary: a group's issued timestamps sit at its own ceiling, `wall +
 hlcPhysicalWindowMs` at the last renewal, so under any positive clock skew
 a legitimate snapshot from a faster group lies above this group's ceiling,
 and refusing at the ceiling instead would fail every cross-group read from
@@ -462,23 +467,31 @@ advance entry, which is Raft-agreed exactly like a lease renewal, and the
 admission bound caps how far a snapshot can pull the ceiling ahead, by at
 most the window plus the skew; `tla/hlc` models the advance as a ceiling
 move so HLC-4 still holds; under Phase D the bound measures
-against the TSO's ceiling with no extra path (checked in review): a
+against the TSO group's ceiling, read explicitly (corrected in review:
+with the scalar ceiling the shared clock made this automatic, but the
+ceilings are per group above, `TSOStateMachine.applyLeaseCeiling`
+advances `ceiling(0)` alone, and a bound read through the minimum over
+the led groups would see the retired data group's ceiling, frozen at its
+last renewal, and refuse every TSO-issued snapshot after one window): a
 Phase-D data-group leader stops renewing its own ceiling
-(`shouldRenewHLCGroup` retires data groups once `PhaseDActive`), but the
-HLC is one per process (`main.go` creates it before the groups), Phase D
+(`shouldRenewHLCGroup` retires data groups once `PhaseDActive`), Phase D
 requires hosting the dedicated TSO group (`configureLegacyCoordinatorTSO`
 refuses `--tsoModeFile` and Phase-D mode with `ErrTSOGroupRequired`), and
-`TSOStateMachine.applyLeaseCeiling` sets the shared clock's ceiling on
-every member of that group as each lease entry applies, so an idle
-data-group leader's `PhysicalCeiling` trails group 0's renewals only by
-its apply lag and every TSO-issued snapshot, issued at or below that
-ceiling, is admitted; a node without a group-0 member is not Phase-D-aware
+`applyLeaseCeiling` advances `ceiling(0)` on every member of that group
+as each lease entry applies, so an idle data-group leader's `ceiling(0)`
+trails group 0's renewals only by its apply lag and every TSO-issued
+snapshot, issued at or below it, is admitted; the same explicit read
+serves the TSO allocator's own checks (`hlcCeilingExpired` for recovery
+and `rejectMinimumWindowBeyondCeiling`) and the fenced allocation under
+Phase D; a node without a group-0 member is not Phase-D-aware
 (`tsoCutoverState` is nil) and keeps renewing its own groups; a group-0
 member cut off from group 0's quorum for longer than the window refuses
 snapshot reads until it catches up, and it cannot allocate TSO timestamps
 for its writes in that state either, so no new unavailability. Test: a
 Phase-D data-group leader that only follows group 0 and has been idle for
-more than one window admits a busy group's snapshot), and skips groups
+more than one window, its own group's ceiling frozen at its last renewal
+below the TSO's, admits a busy group's snapshot through the per-group
+API and refuses one above `ceiling(0)` plus the window), and skips groups
 without an engine, the TSO group, and stores without a replicated
 watermark; a **client**
 intent (`WithClientReadTimestamp`) never proposes and fails with
