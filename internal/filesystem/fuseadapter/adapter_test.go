@@ -11,6 +11,8 @@ import (
 	"github.com/bootjp/elastickv/store"
 	cerrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestErrnoMapsFilesystemErrors(t *testing.T) {
@@ -30,6 +32,15 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 		{name: "unsupported", err: filesystem.ErrUnsupported, want: syscall.EOPNOTSUPP},
 		{name: "stale home", err: filesystem.ErrStaleHome, want: syscall.EAGAIN},
 		{name: "write conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: syscall.EAGAIN},
+		{
+			name: "forwarded write conflict",
+			err: cerrors.Wrap(
+				status.Error(codes.Unknown, store.NewWriteConflictError([]byte("!fs|ino|7")).Error()),
+				"leader forward failed after 3 retries",
+			),
+			want: syscall.EAGAIN,
+		},
+		{name: "forwarded other failure", err: status.Error(codes.Unknown, "key: !fs|ino|7: not leader"), want: syscall.EIO},
 		{name: "canceled", err: context.Canceled, want: syscall.EINTR},
 		{name: "deadline", err: context.DeadlineExceeded, want: syscall.ETIMEDOUT},
 		{name: "unknown", err: errors.New("boom"), want: syscall.EIO},
