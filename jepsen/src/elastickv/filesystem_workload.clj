@@ -219,18 +219,55 @@
   (with-open [raf (RandomAccessFile. ^String path "rw")]
     (write-record! raf (encode-value v))))
 
+(def ^:const temp-delete-attempts
+  "Unlink attempts for a leftover temporary file; the unlink itself can hit
+   the same directory-level write conflicts as the rename it cleans up after."
+  3)
+
+(defn- delete-quietly!
+  "Best-effort removal of a temporary file; errors are ignored because the
+   rename that preceded it may already have consumed the inode."
+  [^String path]
+  (try
+    (with-retries temp-delete-attempts
+      (fn [] (Files/deleteIfExists (nio-path path))))
+    (catch Exception _)))
+
+(defn temp-file?
+  [^String name]
+  (str/includes? name ".tmp-"))
+
+(defn local-sweep-temp-files!
+  "Removes temporary files left behind by rename writes whose cleanup also
+   failed, so a reused workload directory starts clean and does not accrue
+   inodes across runs."
+  [mount-dir]
+  (let [dir (java.io.File. ^String (workload-dir mount-dir))]
+    (when (.isDirectory dir)
+      (doseq [f (.listFiles dir)
+              :when (temp-file? (.getName f))]
+        (delete-quietly! (.getPath f))))))
+
 (defn local-rename-write!
   "Atomic replace: write the record to a temporary file, then rename it over
-   the register path."
+   the register path. Any failure between creating the temporary file and
+   renaming it (write, close or rename hitting EAGAIN/EIO) removes the
+   temporary file so retries under directory contention do not leak one
+   inode per attempt; an ambiguously successful rename has already consumed
+   it, which delete-if-exists tolerates."
   [mount-dir k v]
   (let [tmp  (temp-path mount-dir k)
         dest (register-path mount-dir k)]
-    (with-open [raf (RandomAccessFile. ^String tmp "rw")]
-      (write-record! raf (encode-value v)))
-    (Files/move (nio-path tmp) (nio-path dest)
-                (into-array StandardCopyOption
-                            [StandardCopyOption/ATOMIC_MOVE
-                             StandardCopyOption/REPLACE_EXISTING]))))
+    (try
+      (with-open [raf (RandomAccessFile. ^String tmp "rw")]
+        (write-record! raf (encode-value v)))
+      (Files/move (nio-path tmp) (nio-path dest)
+                  (into-array StandardCopyOption
+                              [StandardCopyOption/ATOMIC_MOVE
+                               StandardCopyOption/REPLACE_EXISTING]))
+      (catch Exception e
+        (delete-quietly! tmp)
+        (throw e)))))
 
 (defn local-read
   "Reads the register value."
@@ -249,9 +286,21 @@
       (with-open [raf (RandomAccessFile. ^String (register-path mount-dir k) "rw")]
         (write-record! raf (encode-value initial-value))))))
 
-(defn local-mounted?
+(defn local-fuse-mount?
+  "True when mount-dir sits on a FUSE file store. Guards --local runs against
+   a typo or a vanished mount, which would otherwise exercise the host's
+   native filesystem and still report a valid Elastickv run."
   [mount-dir]
-  (Files/isDirectory (nio-path mount-dir) (make-array LinkOption 0)))
+  (let [path (nio-path mount-dir)]
+    (and (Files/isDirectory path (make-array LinkOption 0))
+         (str/starts-with? (str (.type (Files/getFileStore path))) "fuse"))))
+
+(defn require-local-fuse-mount!
+  [mount-dir]
+  (when-not (local-fuse-mount? mount-dir)
+    (throw (ex-info (str "mount directory is not a FUSE mount: " mount-dir
+                         " (pass --allow-non-fuse-mount to override)")
+                    {:mount-dir mount-dir}))))
 
 ;; ---------------------------------------------------------------------------
 ;; Remote (SSH) backend
@@ -267,16 +316,29 @@
        " | dd of=" (sh-quote path) " bs=" record-width " conv=notrunc status=none"))
 
 (defn remote-rename-cmd
-  "Shell command performing the write-temp-then-rename replace on a node."
+  "Shell command performing the write-temp-then-rename replace on a node.
+   A failed write or mv removes the temporary file before reporting the
+   error."
   [mount-dir k v]
-  (let [tmp (temp-path mount-dir k)]
-    (str "printf '%s' " (sh-quote (String. ^bytes (encode-value v) StandardCharsets/US_ASCII))
-         " > " (sh-quote tmp)
-         " && mv -f " (sh-quote tmp) " " (sh-quote (register-path mount-dir k)))))
+  (let [tmp (sh-quote (temp-path mount-dir k))]
+    (str "{ printf '%s' " (sh-quote (String. ^bytes (encode-value v) StandardCharsets/US_ASCII))
+         " > " tmp
+         " && mv -f " tmp " " (sh-quote (register-path mount-dir k))
+         "; } || { rm -f " tmp "; exit 1; }")))
 
 (defn remote-read-cmd
+  "Shell command reading one record. It fails instead of returning a
+   truncated number when the file is shorter than a record, mirroring the
+   local backend's readFully."
   [path]
-  (str "head -c " record-width " " (sh-quote path)))
+  (let [q (sh-quote path)]
+    (str "[ \"$(stat -c %s " q ")\" -ge " record-width " ] && head -c " record-width " " q)))
+
+(defn remote-sweep-cmd
+  "Shell command removing leftover temporary files from a node's workload
+   directory."
+  [mount-dir]
+  (str "rm -f " (sh-quote (workload-dir mount-dir)) "/reg-*.tmp-* 2>/dev/null || true"))
 
 (defn remote-setup-cmd
   [mount-dir keys]
@@ -358,7 +420,7 @@
     (catch Exception e
       (fail op (io-error-label e)))))
 
-(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries node mount-dir local?]
+(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount node mount-dir local?]
   client/Client
   (open! [this test node]
     (let [dir (or (get node->mount-dir node)
@@ -370,13 +432,22 @@
 
   (setup! [this test]
     (let [keys (range key-count)]
+      (when (and local? require-fuse-mount)
+        (require-local-fuse-mount! mount-dir))
       (with-retries max-retries
         (fn []
           (if local?
             (local-setup! mount-dir keys)
             (remote-exec! test node (remote-setup-cmd mount-dir keys)))))))
 
-  (teardown! [_this _test])
+  (teardown! [_this test]
+    ;; Jepsen runs teardown! before setup! and again after the test, so the
+    ;; sweep both clears a reused directory and tidies up at the end.
+    (try
+      (if local?
+        (local-sweep-temp-files! mount-dir)
+        (remote-exec! test node (remote-sweep-cmd mount-dir)))
+      (catch Exception _)))
 
   (close! [this _test]
     (assoc this :node nil :mount-dir nil))
@@ -429,9 +500,10 @@
         threads-per-key (or (:threads-per-key opts) 2)
         write-mode      (or (:write-mode opts) :overwrite)
         max-retries     (max 1 (or (:max-retries opts) default-max-retries))
+        require-fuse    (if (contains? opts :require-fuse-mount) (boolean (:require-fuse-mount opts)) true)
         node->dir       (or (:node->mount-dir opts)
                             (node->mount-dir default-nodes nil default-mount-dir))
-        client          (->FilesystemClient node->dir write-mode key-count max-retries nil nil false)]
+        client          (->FilesystemClient node->dir write-mode key-count max-retries require-fuse nil nil false)]
     (when-not (contains? write-modes write-mode)
       (throw (ex-info "unknown write mode" {:write-mode write-mode})))
     {:client    client
@@ -534,7 +606,9 @@
     :parse-fn #(Integer/parseInt %)]
    [nil "--max-retries N" "Attempts per operation before an EAGAIN/EIO is reported."
     :default default-max-retries
-    :parse-fn #(Integer/parseInt %)]])
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--allow-non-fuse-mount" "Skip the check that every --mount-dirs entry is a FUSE mount (local runs only)."
+    :default false]])
 
 (defn- prepare-filesystem-opts
   "Transform parsed CLI options into the map expected by elastickv-filesystem-test."
@@ -548,7 +622,8 @@
       :write-mode      (:write-mode options)
       :redis-port      (:redis-port options)
       :threads-per-key (:threads-per-key options)
-      :max-retries     (:max-retries options))))
+      :max-retries     (:max-retries options)
+      :require-fuse-mount (not (:allow-non-fuse-mount options)))))
 
 (defn -main
   [& args]

@@ -244,6 +244,63 @@
       (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
               raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
 
+(defn- node-start-opts
+  [test opts]
+  (merge {:data-dir data-dir
+          :grpc-port (or (:grpc-port opts) 50051)
+          :redis-port (or (:redis-port opts) 6379)
+          :bootstrap-node (first (:nodes test))}
+         opts))
+
+(defn- wait-for-node-grpc!
+  [node opts]
+  (if-let [raft-groups (:raft-groups opts)]
+    (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
+                              (group-ids raft-groups)))
+    (wait-for-grpc! node (or (:grpc-port opts) 50051))))
+
+(defn- join-peer!
+  "Adds peer to the cluster led by bootstrap-node, retrying until it answers."
+  [bootstrap-node peer opts]
+  (let [raft-groups (:raft-groups opts)
+        grpc-port (or (:grpc-port opts) 50051)
+        group-ids (when (seq raft-groups) (group-ids raft-groups))]
+    (util/await-fn
+      (fn []
+        (try
+          (if (seq raft-groups)
+            (doseq [gid group-ids]
+              (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
+              (join-node! bootstrap-node
+                          (group-addr bootstrap-node raft-groups gid)
+                          (name peer)
+                          (group-addr peer raft-groups gid)))
+            (do
+              (wait-for-grpc! peer grpc-port)
+              (join-node! bootstrap-node
+                          (node-addr bootstrap-node grpc-port)
+                          (name peer)
+                          (node-addr peer grpc-port))))
+          true
+          (catch Throwable t
+            (warn t "retrying join for" peer)
+            nil)))
+      {:timeout 120000
+       :log-message (str "joining " peer)})))
+
+(defn- enable-peer-mount!
+  "Restarts a freshly joined peer with its FUSE mount. The server initializes
+   the filesystem root synchronously at startup and needs a Raft leader for
+   that, which an unjoined peer does not have, so peers start without the
+   mount and only get it once they are cluster members."
+  [test peer opts]
+  (when-let [mount-dir (filesystem-mount-dir (:filesystem-mount opts) peer)]
+    (stop-node! peer)
+    (start-node! test peer (node-start-opts test opts))
+    (wait-for-node-grpc! peer opts)
+    (wait-for-mount! peer mount-dir)
+    (info "filesystem mounted on joined peer" peer)))
+
 (defrecord ElastickvDB [opts]
   db/DB
   (setup! [_ test node]
@@ -253,39 +310,18 @@
       (c/su
         (c/exec :mkdir :-p data-dir)
         (c/exec :rm :-f log-file transport-metrics-file)))
-    (start-node! test node (merge {:data-dir data-dir
-                                   :grpc-port (or (:grpc-port opts) 50051)
-                                   :redis-port (or (:redis-port opts) 6379)
-                                   :bootstrap-node (first (:nodes test))}
-                                  opts))
-    (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
-    (when (= node (first (:nodes test)))
-      (let [raft-groups (:raft-groups opts)
-            grpc-port (or (:grpc-port opts) 50051)
-            group-ids (when (seq raft-groups) (group-ids raft-groups))]
+    (let [bootstrap? (= node (first (:nodes test)))
+          start-opts (node-start-opts test opts)]
+      ;; Only the bootstrap node mounts immediately; peers are restarted with
+      ;; their mount by enable-peer-mount! once they have joined.
+      (start-node! test node (if bootstrap?
+                               start-opts
+                               (assoc start-opts :filesystem-mount nil)))
+      (when bootstrap?
+        (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
         (doseq [peer (rest (:nodes test))]
-          (util/await-fn
-            (fn []
-              (try
-                (if (seq raft-groups)
-                  (doseq [gid group-ids]
-                    (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
-                    (join-node! node
-                                (group-addr node raft-groups gid)
-                                (name peer)
-                                (group-addr peer raft-groups gid)))
-                  (do
-                    (wait-for-grpc! peer grpc-port)
-                    (join-node! node
-                                (node-addr node grpc-port)
-                                (name peer)
-                                (node-addr peer grpc-port))))
-                true
-                (catch Throwable t
-                  (warn t "retrying join for" peer)
-                  nil)))
-            {:timeout 120000
-             :log-message (str "joining " peer)}))))
+          (join-peer! node peer opts)
+          (enable-peer-mount! test peer opts))))
     (info "node started" node))
 
   (teardown! [_ _test node]
@@ -312,15 +348,8 @@
 
   db/Kill
   (start! [this test node]
-    (start-node! test node (merge {:data-dir data-dir
-                                   :grpc-port (or (:grpc-port opts) 50051)
-                                   :redis-port (or (:redis-port opts) 6379)
-                                   :bootstrap-node (first (:nodes test))}
-                                  opts))
-    (if-let [raft-groups (:raft-groups opts)]
-      (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
-                                (group-ids raft-groups)))
-      (wait-for-grpc! node (or (:grpc-port opts) 50051)))
+    (start-node! test node (node-start-opts test opts))
+    (wait-for-node-grpc! node opts)
     (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
     (info "node started" node)
     this)

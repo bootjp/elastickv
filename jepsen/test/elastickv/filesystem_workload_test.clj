@@ -167,8 +167,10 @@
     (is (str/includes? write "dd of='/mnt/it'\\''s/jepsen/reg-1' bs=16 conv=notrunc"))
     (is (str/includes? write "printf '%s' '              42'")))
   (let [rename (workload/remote-rename-cmd "/mnt/fs" 1 7)]
-    (is (re-find #"> '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+' && mv -f '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+' '/mnt/fs/jepsen/reg-1'" rename)))
-  (is (= "head -c 16 '/mnt/fs/jepsen/reg-1'" (workload/remote-read-cmd "/mnt/fs/jepsen/reg-1")))
+    (is (re-find #"^\{ printf '%s' '               7' > '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+' && mv -f '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+' '/mnt/fs/jepsen/reg-1'; \} \|\| \{ rm -f '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+'; exit 1; \}$" rename))
+    (is (zero? (:exit (clojure.java.shell/sh "bash" "-n" "-c" rename)))))
+  (is (= "[ \"$(stat -c %s '/mnt/fs/jepsen/reg-1')\" -ge 16 ] && head -c 16 '/mnt/fs/jepsen/reg-1'"
+         (workload/remote-read-cmd "/mnt/fs/jepsen/reg-1")))
   (let [setup (workload/remote-setup-cmd "/mnt/fs" [0 1])]
     (is (str/starts-with? setup "mkdir -p '/mnt/fs/jepsen'"))
     (is (str/includes? setup "> '/mnt/fs/jepsen/reg-0'"))
@@ -183,7 +185,21 @@
                                        :mount-dirs [dir]
                                        :local      true
                                        :write-mode mode
-                                       :key-count  2}))
+                                       :key-count  2
+                                       :require-fuse-mount false}))
+
+(deftest local-setup-rejects-non-fuse-directories-by-default
+  (let [dir (scratch-dir)]
+    (try
+      (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir] :local true :key-count 1})
+            c        (client/open! (:client test-map) test-map "n1")]
+        (is (true? (:require-fuse-mount (:client test-map))))
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"not a FUSE mount"
+                              (client/setup! c test-map)))
+        (is (not (workload/local-fuse-mount? dir)))
+        (is (not (workload/local-fuse-mount? (str dir "/missing")))))
+      (finally
+        (delete-tree! dir)))))
 
 (deftest local-client-overwrite-round-trips
   (let [dir (scratch-dir)]
@@ -235,7 +251,7 @@
   (let [dir (scratch-dir)]
     (try
       (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir]
-                                                          :local true :key-count 1 :max-retries 2})
+                                                          :local true :key-count 1 :max-retries 2 :require-fuse-mount false})
             c        (client/open! (:client test-map) test-map "n1")]
         (client/setup! c test-map)
         (with-redefs [workload/local-overwrite! (fn [_ _] (throw (java.io.IOException. "Input/output error")))]
@@ -259,6 +275,50 @@
         (is (str/includes? (:error w) "NoSuchFileException"))
         (is (= :fail (:type r)))
         (is (str/includes? (:error r) "FileNotFoundException")))
+      (finally
+        (delete-tree! dir)))))
+
+(defn- leftover-temp-files [dir]
+  (filter #(str/includes? (.getName %) ".tmp-")
+          (.listFiles (io/file (workload/workload-dir dir)))))
+
+(deftest local-rename-write-cleans-temp-file-when-move-fails
+  (let [dir (scratch-dir)]
+    (try
+      (.mkdirs (io/file (workload/workload-dir dir)))
+      (with-redefs [workload/register-path (fn [_ _] (str dir "/jepsen/missing-dir/reg-0"))]
+        (is (thrown? java.io.IOException (workload/local-rename-write! dir 0 5))))
+      (is (empty? (leftover-temp-files dir)))
+      (finally
+        (delete-tree! dir)))))
+
+(deftest teardown-sweeps-leftover-temp-files
+  (let [dir (scratch-dir)]
+    (try
+      (let [test-map (local-test-map :rename dir)
+            c        (client/open! (:client test-map) test-map "n1")]
+        (client/setup! c test-map)
+        (spit (str (workload/workload-dir dir) "/reg-0.tmp-deadbeef") "x")
+        (spit (str (workload/workload-dir dir) "/reg-1.tmp-cafe") "y")
+        (is (= 2 (count (leftover-temp-files dir))))
+        (client/teardown! c test-map)
+        (is (empty? (leftover-temp-files dir)))
+        (is (= 2 (count (.listFiles (io/file (workload/workload-dir dir)))))))
+      (finally
+        (delete-tree! dir)))))
+
+(deftest remote-sweep-command-targets-only-temp-files
+  (let [cmd (workload/remote-sweep-cmd "/mnt/fs")]
+    (is (= "rm -f '/mnt/fs/jepsen'/reg-*.tmp-* 2>/dev/null || true" cmd))
+    (is (zero? (:exit (clojure.java.shell/sh "bash" "-n" "-c" cmd))))))
+
+(deftest local-rename-write-cleans-temp-file-when-write-fails
+  (let [dir (scratch-dir)]
+    (try
+      (.mkdirs (io/file (workload/workload-dir dir)))
+      (with-redefs [workload/encode-value (fn [_] (throw (java.io.IOException. "Resource temporarily unavailable")))]
+        (is (thrown? java.io.IOException (workload/local-rename-write! dir 0 5))))
+      (is (empty? (leftover-temp-files dir)))
       (finally
         (delete-tree! dir)))))
 
