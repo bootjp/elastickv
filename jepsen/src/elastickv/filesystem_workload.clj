@@ -93,6 +93,14 @@
 
 (def write-modes #{:overwrite :rename})
 
+(def ^:const default-threads-per-key 2)
+
+(def ^:const default-concurrency
+  "Worker threads when --concurrency is not given. independent/concurrent-generator
+   requires a multiple of threads-per-key, which the shared CLI default (5)
+   is not, so this workload carries its own default."
+  10)
+
 (def ^:const default-max-retries
   "Attempts per operation before giving up on EAGAIN/EIO."
   8)
@@ -570,25 +578,38 @@
   (map (fn [k] {:f :read :value (independent/tuple k nil) :final true})
        (range key-count)))
 
+(defn final-read-phase
+  "Final reads pinned to every node that owns a client thread. Jepsen runs
+   thread t's client against node (mod t node-count), so one gen/on-threads
+   filter per node makes every mount read every register once; a recovered
+   follower serving a stale snapshot cannot hide behind a final read that
+   happened to land on a healthy mount. A node without a thread (concurrency
+   below the node count) has no client and gets no reads."
+  [key-count node-count concurrency]
+  (apply gen/any
+         (for [i (range (min node-count concurrency))]
+           (gen/on-threads (fn [t] (and (integer? t) (= i (mod t node-count))))
+                           (final-read-ops key-count)))))
+
 (defn with-final-reads
   "Appends the recovery and final-read phases to the main generator.
    nemesis-final (the nemesis package's :final-generator) heals partitions and
    restarts killed nodes before the reads; it is nil in --local runs."
-  [main-gen nemesis-final key-count]
+  [main-gen nemesis-final key-count node-count concurrency]
   (gen/phases main-gen
               (when nemesis-final
                 (gen/phases (gen/log "Healing cluster before final reads")
                             (gen/nemesis nemesis-final)
                             (gen/sleep 10)))
-              (gen/log "Final reads")
-              (gen/clients (final-read-ops key-count))))
+              (gen/log "Final reads from every mount")
+              (final-read-phase key-count node-count concurrency)))
 
 (defn final-reads-checker
   "Per-key checker for the final-read phase. Knossos models a failed read as
-   never having happened, so a lost register whose only read after the last
-   write failed would otherwise pass: the key is invalid when its final read
-   observed a data-loss sentinel and :unknown when it could not observe the
-   register at all (or never ran)."
+   never having happened, so a lost register whose only reads after the last
+   write failed would otherwise pass: the key is invalid when any final read
+   observed a data-loss sentinel and :unknown when any mount could not observe
+   the register at all (or no final read ran)."
   []
   (reify checker/Checker
     (check [_ _test history _opts]
@@ -629,7 +650,7 @@
   [opts]
   (let [key-count       (or (:key-count opts) 10)
         max-writes      (or (:max-writes-per-key opts) 100)
-        threads-per-key (or (:threads-per-key opts) 2)
+        threads-per-key (or (:threads-per-key opts) default-threads-per-key)
         write-mode      (or (:write-mode opts) :overwrite)
         max-retries     (max 1 (or (:max-retries opts) default-max-retries))
         require-fuse    (if (contains? opts :require-fuse-mount) (boolean (:require-fuse-mount opts)) true)
@@ -664,6 +685,8 @@
                                  :raft-groups      (:raft-groups opts)
                                  :shard-ranges     (:shard-ranges opts)}))
          rate        (double (or (:rate opts) 5))
+         concurrency (or (:concurrency opts) default-concurrency)
+         threads-per-key (or (:threads-per-key opts) default-threads-per-key)
          time-limit  (or (:time-limit opts) 30)
          faults      (if local?
                        []
@@ -677,10 +700,17 @@
                        (gen/once {:type :info :f :noop}))
          key-count   (or (:key-count opts) 10)
          workload    (filesystem-register-workload (assoc opts :node->mount-dir node->dir))
+         ;; --rate is ops/sec per worker, but gen/stagger in Jepsen 0.3.x
+         ;; paces all threads together (see its docstring), so the interval
+         ;; is derived from the aggregate rate.
          main-gen    (->> (:generator workload)
                           (gen/nemesis nemesis-gen)
-                          (gen/stagger (/ rate))
+                          (gen/stagger (/ (* rate concurrency)))
                           (gen/time-limit time-limit))]
+     (when-not (and (pos? concurrency) (zero? (mod concurrency threads-per-key)))
+       (throw (ex-info (str "--concurrency (" concurrency ") must be a positive multiple of --threads-per-key ("
+                            threads-per-key "): independent/concurrent-generator assigns whole thread groups to keys")
+                       {:concurrency concurrency :threads-per-key threads-per-key})))
      (merge workload
             {:name            (or (:name opts)
                                   (str "elastickv-filesystem-register-"
@@ -705,10 +735,12 @@
              ;; :final-generator, which Jepsen 0.3.x cannot serialize for
              ;; combined nemesis generators.
              :final-generator nil
-             :concurrency     (or (:concurrency opts) 10)
+             :concurrency     concurrency
              :generator       (with-final-reads main-gen
                                                 (when nemesis-p (:final-generator nemesis-p))
-                                                key-count)}))))
+                                                key-count
+                                                (count nodes)
+                                                concurrency)}))))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI
@@ -731,7 +763,10 @@
     :default 6379
     :parse-fn #(Integer/parseInt %)]
    [nil "--threads-per-key N" "Concurrent threads per register file."
-    :default 2
+    :default default-threads-per-key
+    :parse-fn #(Integer/parseInt %)]
+   [nil "--concurrency N" "Number of worker threads (a multiple of --threads-per-key; at least the node count to final-read every mount)."
+    :default default-concurrency
     :parse-fn #(Integer/parseInt %)]
    [nil "--max-retries N" "Attempts per operation before an EAGAIN/EIO is reported."
     :default default-max-retries
@@ -754,9 +789,15 @@
       :max-retries     (:max-retries options)
       :require-fuse-mount (not (:allow-non-fuse-mount options)))))
 
+(def cli-opts
+  "Common options with this workload's own --concurrency (the shared default
+   of 5 is not a multiple of threads-per-key) plus the filesystem options."
+  (into (vec (remove #(= "--concurrency N" (second %)) cli/common-cli-opts))
+        filesystem-cli-opts))
+
 (defn -main
   [& args]
   (cli/run-workload! args
-                     (into cli/common-cli-opts filesystem-cli-opts)
+                     cli-opts
                      prepare-filesystem-opts
                      elastickv-filesystem-test))

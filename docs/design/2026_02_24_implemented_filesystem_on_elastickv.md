@@ -551,8 +551,10 @@ Phase 3:
      `--filesystemMount`, so the partition/kill nemesis applies. Reads retry
      ENOENT/short/malformed records (FUSE's LOOKUP+OPEN split lets a reader
      racing a rename on another mount miss the replaced inode) and stay
-     `:fail` on exhaustion during the main phase; a final-phase read, issued
-     once every writer has stopped, that still finds its register missing,
+     `:fail` on exhaustion during the main phase; the final phase, issued once
+     every writer has stopped, reads every register from every mount (so a
+     stale recovered follower cannot hide behind a healthy one), and a read
+     there that still finds its register missing,
      truncated or unparseable completes `:ok` with a data-loss sentinel the
      register model rejects, and a final-reads checker flags a final read
      that could not observe its register, so a lost acknowledged write

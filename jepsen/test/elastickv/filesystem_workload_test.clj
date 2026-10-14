@@ -2,6 +2,7 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer :all]
+            [clojure.tools.cli :as tools.cli]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
             [jepsen.generator :as gen]
@@ -209,6 +210,49 @@
       (is (= (range 25) (map :value writes)))
       (is (<= 1 (count reads) 25))
       (is (= (count ops) (+ (count writes) (count reads)))))))
+
+(deftest final-read-phase-reads-every-register-from-every-mount
+  ;; Thread t serves node (mod t node-count); 3 nodes x 2 threads each.
+  (let [test {:concurrency 6 :nodes ["n1" "n2" "n3"]}
+        ctx  (gen/context test)
+        ops  (loop [g (workload/final-read-phase 2 3 6), ops []]
+               (let [[op g'] (gen/op g test ctx)]
+                 (if (or (nil? op) (= :pending op))
+                   ops
+                   (recur g' (conj ops op)))))
+        by-node (group-by #(mod (:process %) 3) ops)]
+    (is (= 6 (count ops)))
+    (is (every? :final ops))
+    (is (= #{0 1 2} (set (keys by-node))))
+    (doseq [[_ node-ops] by-node]
+      (is (= [0 1] (sort (map (comp first :value) node-ops))))))
+  ;; Fewer threads than nodes: only the nodes that own a client are read.
+  (let [test {:concurrency 2 :nodes ["n1" "n2" "n3"]}
+        ctx  (gen/context test)
+        ops  (loop [g (workload/final-read-phase 2 3 2), ops []]
+               (let [[op g'] (gen/op g test ctx)]
+                 (if (or (nil? op) (= :pending op))
+                   ops
+                   (recur g' (conj ops op)))))]
+    (is (= 4 (count ops)))
+    (is (= #{0 1} (set (map #(mod (:process %) 3) ops))))))
+
+(deftest concurrency-must-be-a-multiple-of-threads-per-key
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"multiple of --threads-per-key"
+                        (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs ["/tmp/a"] :local true
+                                                             :concurrency 5})))
+  (is (thrown? clojure.lang.ExceptionInfo
+               (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs ["/tmp/a"] :local true
+                                                    :concurrency 8 :threads-per-key 3 :key-count 1})))
+  (is (= 9 (:concurrency (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs ["/tmp/a"] :local true
+                                                               :concurrency 9 :threads-per-key 3})))))
+
+(deftest cli-default-concurrency-matches-threads-per-key
+  (let [{:keys [options errors]} (tools.cli/parse-opts [] workload/cli-opts)]
+    (is (empty? errors))
+    (is (= workload/default-concurrency (:concurrency options)))
+    (is (zero? (mod (:concurrency options) (:threads-per-key options))))
+    (is (= 1 (count (filter #(= "--concurrency N" (second %)) workload/cli-opts))))))
 
 (deftest final-read-ops-cover-every-register
   (let [ops (workload/final-read-ops 3)]
