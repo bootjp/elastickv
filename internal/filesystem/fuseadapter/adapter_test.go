@@ -251,6 +251,13 @@ type openHandleRefresh struct {
 	clientID []byte
 }
 
+type renameCall struct {
+	oldParent uint64
+	oldName   []byte
+	newParent uint64
+	newName   []byte
+}
+
 type fakeCore struct {
 	resolveParent uint64
 	resolveName   []byte
@@ -261,9 +268,32 @@ type fakeCore struct {
 	stat         filesystem.Stat
 	getAttrErr   error
 
+	setAttrInode uint64
+	setAttrMask  filesystem.SetAttrMask
+	setAttrAttrs filesystem.SetAttr
+	setAttrStat  filesystem.Stat
+	setAttrErr   error
+
 	createOpts   filesystem.CreateOptions
 	createResult filesystem.CreateResult
 	createErr    error
+
+	mkdirParent uint64
+	mkdirName   []byte
+	mkdirOpts   filesystem.CreateOptions
+	mkdirResult filesystem.CreateResult
+	mkdirErr    error
+
+	unlinkParent uint64
+	unlinkName   []byte
+	unlinkErr    error
+
+	rmdirParent uint64
+	rmdirName   []byte
+	rmdirErr    error
+
+	rename    renameCall
+	renameErr error
 
 	releaseInode    uint64
 	releaseFH       uint64
@@ -283,8 +313,29 @@ type fakeCore struct {
 	blockRefreshFH  uint64
 
 	readCalled bool
+	readOffset uint64
+	readSize   uint64
 	readData   []byte
 	readErr    error
+
+	writeCalled bool
+	writeInode  uint64
+	writeFH     uint64
+	writeOffset uint64
+	writeData   []byte
+	writeN      int
+	writeErr    error
+
+	flushCalled bool
+	flushInode  uint64
+	flushFH     uint64
+	flushErr    error
+
+	fsyncCalled   bool
+	fsyncInode    uint64
+	fsyncFH       uint64
+	fsyncDatasync bool
+	fsyncErr      error
 
 	readdirInode  uint64
 	readdirCookie string
@@ -306,13 +357,16 @@ func (f *fakeCore) GetAttr(_ context.Context, inode uint64) (filesystem.Stat, er
 	return f.stat, f.getAttrErr
 }
 
-func (*fakeCore) SetAttr(
-	context.Context,
-	uint64,
-	filesystem.SetAttrMask,
-	filesystem.SetAttr,
+func (f *fakeCore) SetAttr(
+	_ context.Context,
+	inode uint64,
+	mask filesystem.SetAttrMask,
+	attrs filesystem.SetAttr,
 ) (filesystem.Stat, error) {
-	return filesystem.Stat{}, nil
+	f.setAttrInode = inode
+	f.setAttrMask = mask
+	f.setAttrAttrs = attrs
+	return f.setAttrStat, f.setAttrErr
 }
 
 func (f *fakeCore) Open(_ context.Context, inode uint64, clientID []byte) (uint64, error) {
@@ -321,21 +375,41 @@ func (f *fakeCore) Open(_ context.Context, inode uint64, clientID []byte) (uint6
 	return f.openFH, f.openErr
 }
 
-func (f *fakeCore) Read(context.Context, uint64, uint64, uint64, uint64) ([]byte, error) {
+func (f *fakeCore) Read(_ context.Context, _ uint64, _ uint64, offset uint64, size uint64) ([]byte, error) {
 	f.readCalled = true
+	f.readOffset = offset
+	f.readSize = size
 	return f.readData, f.readErr
 }
 
-func (*fakeCore) Write(context.Context, uint64, uint64, uint64, []byte) (int, error) {
-	return 0, nil
+func (f *fakeCore) Write(_ context.Context, inode uint64, fh uint64, offset uint64, data []byte) (int, error) {
+	f.writeCalled = true
+	f.writeInode = inode
+	f.writeFH = fh
+	f.writeOffset = offset
+	f.writeData = append([]byte(nil), data...)
+	if f.writeErr != nil {
+		return 0, f.writeErr
+	}
+	if f.writeN != 0 {
+		return f.writeN, nil
+	}
+	return len(data), nil
 }
 
-func (*fakeCore) Flush(context.Context, uint64, uint64) error {
-	return nil
+func (f *fakeCore) Flush(_ context.Context, inode uint64, fh uint64) error {
+	f.flushCalled = true
+	f.flushInode = inode
+	f.flushFH = fh
+	return f.flushErr
 }
 
-func (*fakeCore) Fsync(context.Context, uint64, uint64, bool) error {
-	return nil
+func (f *fakeCore) Fsync(_ context.Context, inode uint64, fh uint64, datasync bool) error {
+	f.fsyncCalled = true
+	f.fsyncInode = inode
+	f.fsyncFH = fh
+	f.fsyncDatasync = datasync
+	return f.fsyncErr
 }
 
 func (f *fakeCore) Release(_ context.Context, inode uint64, fh uint64, clientID []byte) error {
@@ -376,25 +450,38 @@ func (f *fakeCore) Create(
 	return f.createResult, f.createErr
 }
 
-func (*fakeCore) Mkdir(
-	context.Context,
-	uint64,
-	[]byte,
-	filesystem.CreateOptions,
+func (f *fakeCore) Mkdir(
+	_ context.Context,
+	parent uint64,
+	name []byte,
+	opts filesystem.CreateOptions,
 ) (filesystem.CreateResult, error) {
-	return filesystem.CreateResult{}, nil
+	f.mkdirParent = parent
+	f.mkdirName = append([]byte(nil), name...)
+	f.mkdirOpts = opts
+	return f.mkdirResult, f.mkdirErr
 }
 
-func (*fakeCore) Unlink(context.Context, uint64, []byte) error {
-	return nil
+func (f *fakeCore) Unlink(_ context.Context, parent uint64, name []byte) error {
+	f.unlinkParent = parent
+	f.unlinkName = append([]byte(nil), name...)
+	return f.unlinkErr
 }
 
-func (*fakeCore) Rmdir(context.Context, uint64, []byte) error {
-	return nil
+func (f *fakeCore) Rmdir(_ context.Context, parent uint64, name []byte) error {
+	f.rmdirParent = parent
+	f.rmdirName = append([]byte(nil), name...)
+	return f.rmdirErr
 }
 
-func (*fakeCore) Rename(context.Context, uint64, []byte, uint64, []byte) error {
-	return nil
+func (f *fakeCore) Rename(_ context.Context, oldParent uint64, oldName []byte, newParent uint64, newName []byte) error {
+	f.rename = renameCall{
+		oldParent: oldParent,
+		oldName:   append([]byte(nil), oldName...),
+		newParent: newParent,
+		newName:   append([]byte(nil), newName...),
+	}
+	return f.renameErr
 }
 
 func (f *fakeCore) Readdir(
