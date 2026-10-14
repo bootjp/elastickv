@@ -89,7 +89,7 @@ func TestServiceInitializeRootDoesNotRetryUnrelatedWireErrors(t *testing.T) {
 	require.Equal(t, 1, coord.calls)
 }
 
-func TestIsRootInitializationConflict(t *testing.T) {
+func TestIsWriteConflict(t *testing.T) {
 	conflictKey := []byte("!fs|ino|root")
 	tests := []struct {
 		name string
@@ -108,6 +108,7 @@ func TestIsRootInitializationConflict(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			require.Equal(t, tt.want, IsWriteConflict(tt.err))
 			require.Equal(t, tt.want, isRootInitializationConflict(tt.err))
 		})
 	}
