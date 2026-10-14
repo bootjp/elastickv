@@ -556,9 +556,15 @@ still issues a capability (corrected in review: issuing none left the
 read on the `^uint64(0)` "latest" sentinel, so a multi-key reader on a
 fresh store could read `a` as absent, let a single-group transaction
 write `a` and `b` atomically, and then read the new `b`, an outcome no
-serial order allows): `s` is then one fenced allocation from the
-coordinating leader's HLC (`NextFenced`, inside its lease and above
-every value the process observed), and each touched group advances to
+serial order allows): `s` is then one fenced allocation minted by the
+leader of one touched group for that group (the lowest group id among
+them; the TSO group's leader under Phase D), inside that leader's
+current-term grant, and returned in the fenced answer the capability is
+built from (corrected in review: the coordinating process may lead none
+of the touched groups, as the public gRPC, Lua, and filesystem paths
+allow, and then holds no grant for them, while an allocation under an
+unrelated group it leads would bypass the participants' ceilings), and
+each touched group advances to
 `s` on its first read, one Raft write per group once, since its
 watermark is nonzero from then on. The single-group `Coordinate` takes
 the same snapshot and the same advance (corrected in review: exempting
@@ -2614,13 +2620,26 @@ sections defer to is therefore two-sided:
   coordinator that dies between the reservation and the primary PREPARE
   leaves a reservation with neither a lock nor a decision under its
   identity, which the scan ignores and the sweep removes; one that dies
-  inside the reservation leaves a lock the resolver expires. What the
-  reservation cannot cover is a shipped-binary coordinator still
-  admitting during the rolling restart, which neither reserves nor sees
-  reservations: an identity shared with it is the G12 exposure `main`
-  has today, bounded by the restart window and closed once every
-  coordinator runs the intermediate release, which precedes the
-  admission stop. (4) **Sizing.** The coordinator sizes every per-group
+  inside the reservation leaves a lock the resolver expires. A
+  shipped-binary coordinator still admitting during the rolling restart
+  neither reserves nor sees reservations, so an identity shared with it
+  would alias with no crash for the attestation to name (found in
+  review: bounding that by the restart window is not fail-closed). The
+  intermediate release therefore admits a cross-group transaction only
+  once every node advertises the intermediate capability; until then
+  its cross-group admission fails with a retryable upgrading error
+  (single-group transactions carry no shared identity and are
+  unaffected), so during the restart only shipped coordinators admit
+  cross-group transactions, and once the last of them has drained and
+  exited, which its graceful stop guarantees before the new process
+  advertises, no shipped-era lock is left for an intermediate
+  transaction to alias. Shipped-against-shipped aliasing during the
+  restart is `main`'s own G12, not the drain's to find; the runbook
+  removes it by routing cross-group traffic away from nodes awaiting
+  restart or by pausing it at the ingress for the window. Test: a
+  cross-group transaction admitted on an upgraded node while a shipped
+  coordinator is still reported is refused with the retryable error, and
+  one admitted after the last report flips reserves and proceeds. (4) **Sizing.** The coordinator sizes every per-group
   PREPARE after augmentation against the transport limit before issuing
   any PREPARE and refuses the transaction with a client-visible size
   error (found in review: sizing one aggregate misses a per-group
