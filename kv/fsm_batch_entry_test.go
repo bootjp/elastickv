@@ -23,25 +23,36 @@ import (
 
 const (
 	g17CrashChildEnv  = "ELASTICKV_TEST_G17_CRASH_DIR"
+	g17CrashShapeEnv  = "ELASTICKV_TEST_G17_CRASH_SHAPE"
 	g17CrashExitCode  = 3
 	g17EntryIndex     = uint64(5)
 	g17FirstRequestTS = uint64(10)
 )
 
 // g17Store wraps a store so a test can observe, or abort, the moment the
-// FSM hands the second request of an entry to the store.
+// FSM hands the second request of an entry to the store, whether that
+// request is a write or a prefix delete.
 type g17Store struct {
 	store.MVCCStore
 	raftApplyCalls        int
 	beforeSecondRaftApply func()
 }
 
-func (s *g17Store) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+func (s *g17Store) noteRaftApply() {
 	s.raftApplyCalls++
 	if s.raftApplyCalls == 2 && s.beforeSecondRaftApply != nil {
 		s.beforeSecondRaftApply()
 	}
+}
+
+func (s *g17Store) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	s.noteRaftApply()
 	return s.MVCCStore.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex)
+}
+
+func (s *g17Store) DeletePrefixesAtRaftAt(ctx context.Context, deletes []store.PrefixDelete, commitTS, appliedIndex uint64) error {
+	s.noteRaftApply()
+	return s.MVCCStore.DeletePrefixesAtRaftAt(ctx, deletes, commitTS, appliedIndex)
 }
 
 func (s *g17Store) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error {
@@ -139,6 +150,33 @@ func g17TwoPutEntry(t *testing.T) []byte {
 	)
 }
 
+// g17PutThenDelPrefixEntry is a PUT followed by a DEL_PREFIX covering it and
+// then another PUT: the crash lands inside the prefix delete, and the
+// re-delivery must still apply the requests in order (the prefix delete
+// removes the staged put) while the trailing put lands.
+func g17PutThenDelPrefixEntry(t *testing.T) []byte {
+	t.Helper()
+	return g17Entry(t,
+		g17RawPut(g17FirstRequestTS, "k1", "v1"),
+		g17RawDelPrefix(g17FirstRequestTS+1, "k"),
+		g17RawPut(g17FirstRequestTS+2, "other", "v2"),
+	)
+}
+
+// g17CrashShape is one entry shape the crash test runs: the entry, the keys
+// that must be present after re-delivery, and the keys that must be absent
+// both after the crash and after re-delivery.
+type g17CrashShape struct {
+	entry   func(t *testing.T) []byte
+	present []string
+	absent  []string
+}
+
+var g17CrashShapes = map[string]g17CrashShape{
+	"two-puts":            {entry: g17TwoPutEntry, present: []string{"k1", "k2"}},
+	"put-then-del-prefix": {entry: g17PutThenDelPrefixEntry, present: []string{"other"}, absent: []string{"k1"}},
+}
+
 func g17OpenStore(t *testing.T, dir string) store.MVCCStore {
 	t.Helper()
 	st, err := store.NewPebbleStore(dir)
@@ -214,14 +252,23 @@ func TestFSMApplyBatch_EntryIsNotDurableUntilItCommits(t *testing.T) {
 // request, and the engine would have dropped the re-delivery.
 func TestFSMApplyBatch_CrashBetweenRequestsLeavesNoPartialEntry(t *testing.T) {
 	if dir := os.Getenv(g17CrashChildEnv); dir != "" {
-		g17RunCrashChild(t, dir)
+		g17RunCrashChild(t, dir, os.Getenv(g17CrashShapeEnv))
 		return
 	}
 
+	for name, shape := range g17CrashShapes {
+		t.Run(name, func(t *testing.T) {
+			g17RunCrashParent(t, name, shape)
+		})
+	}
+}
+
+func g17RunCrashParent(t *testing.T, name string, shape g17CrashShape) {
+	t.Helper()
 	dir := t.TempDir()
 	//nolint:gosec // re-executes the test binary itself with a fixed argument list
 	child := exec.CommandContext(t.Context(), os.Args[0], "-test.run=^TestFSMApplyBatch_CrashBetweenRequestsLeavesNoPartialEntry$", "-test.count=1")
-	child.Env = append(os.Environ(), g17CrashChildEnv+"="+dir)
+	child.Env = append(os.Environ(), g17CrashChildEnv+"="+dir, g17CrashShapeEnv+"="+name)
 	out, err := child.CombinedOutput()
 	var exitErr *exec.ExitError
 	require.ErrorAs(t, err, &exitErr, "the child must exit through os.Exit; output:\n%s", out)
@@ -230,17 +277,23 @@ func TestFSMApplyBatch_CrashBetweenRequestsLeavesNoPartialEntry(t *testing.T) {
 	st := g17OpenStore(t, dir)
 	_, present := g17AppliedIndex(t, st)
 	require.False(t, present, "a half-applied entry must not have persisted its applied index (G17)")
-	require.False(t, g17Exists(t, st, "k1"), "a half-applied entry must not have persisted its first request (G17)")
-	require.False(t, g17Exists(t, st, "k2"))
+	for _, key := range append(append([]string{}, shape.present...), shape.absent...) {
+		require.False(t, g17Exists(t, st, key), "a half-applied entry must not have persisted key %s (G17)", key)
+	}
 
-	// Re-delivery after the restart applies the whole entry.
-	require.Nil(t, g17FSM(t, st).Apply(g17TwoPutEntry(t)))
+	// Re-delivery after the restart applies the whole entry, in order.
+	require.Nil(t, g17FSM(t, st).Apply(shape.entry(t)))
 
 	reference := g17OpenStore(t, t.TempDir())
-	require.Nil(t, g17FSM(t, reference).Apply(g17TwoPutEntry(t)))
+	require.Nil(t, g17FSM(t, reference).Apply(shape.entry(t)))
 
-	for _, key := range []string{"k1", "k2"} {
+	for _, key := range shape.present {
 		require.True(t, g17Exists(t, st, key), "key %s after re-delivery", key)
+	}
+	for _, key := range shape.absent {
+		require.False(t, g17Exists(t, st, key), "key %s must be gone after re-delivery", key)
+	}
+	for _, key := range append(append([]string{}, shape.present...), shape.absent...) {
 		require.Equal(t, g17Exists(t, reference, key), g17Exists(t, st, key), "key %s must match the replica that never crashed", key)
 	}
 	idx, present := g17AppliedIndex(t, st)
@@ -254,12 +307,14 @@ func TestFSMApplyBatch_CrashBetweenRequestsLeavesNoPartialEntry(t *testing.T) {
 // g17RunCrashChild is the child half of the crash test. It never returns
 // normally: the store hook terminates the process the moment the second
 // request of the entry reaches the store.
-func g17RunCrashChild(t *testing.T, dir string) {
+func g17RunCrashChild(t *testing.T, dir, shapeName string) {
 	t.Helper()
+	shape, ok := g17CrashShapes[shapeName]
+	require.True(t, ok, "unknown crash shape %q", shapeName)
 	st, err := store.NewPebbleStore(dir)
 	require.NoError(t, err)
 	wrapped := &g17Store{MVCCStore: st, beforeSecondRaftApply: func() { os.Exit(g17CrashExitCode) }}
-	g17FSM(t, wrapped).Apply(g17TwoPutEntry(t))
+	g17FSM(t, wrapped).Apply(shape.entry(t))
 	t.Fatal("the child must have exited inside the second request")
 }
 
