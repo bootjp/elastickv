@@ -382,13 +382,29 @@ Open after this branch:
   `nextTxnReadTS()` snapshot and can span groups: a lagging participant
   can later apply `c ≤ readTS`, so the supposedly atomic result is torn.
   Both must begin a leader snapshot over the groups they route to and read
-  under the capability, with tests in the completion set. Until the router
-  exposes a stable route-subset snapshot, a `ConsistentRead` `Query` / `Scan`
-  page may conservatively cover every active data group; this adds leader
-  snapshot work for groups outside the eventual page but cannot weaken the
-  read. `TransactGetItems` validates its keys before fencing and covers the
-  distinct groups to which those keys and any result-affecting schema records
-  route. Invalid requests retain their existing 4xx ordering. The Redis
+  under the capability, with tests in the completion set. Until the page's
+  route subset is pinned as described next, a `ConsistentRead` `Query` /
+  `Scan` page may conservatively cover every active data group; this adds
+  leader snapshot work for groups outside the eventual page but cannot
+  weaken the read. `TransactGetItems` validates its keys before fencing and
+  covers the distinct groups to which those keys and any result-affecting
+  schema records route, and it binds that group selection and every read
+  to **one catalog version**: the groups are resolved from a single
+  `RouteEngine` snapshot (`ResolveRoutesWithVersion`), each point read
+  carries that version, and a leader whose applied catalog has a different
+  owner for the key, or an armed M2 cutover read fence for its interval,
+  rejects the read with a retryable route-moved error, on which the
+  coordinator discards the snapshot and restarts the whole request
+  (bounded retries, then a retryable 5xx). Fencing the old owning group and
+  then reading through a newer catalog that routes the key to the
+  migration target would otherwise let the target, which never received
+  the advance, apply a delayed `c ≤ readTS` after the response (found in
+  review); the per-group advance that a snapshot read proposes on an
+  unfenced group does not close it on its own, because migration imports
+  and promotions copy versions with their original, older timestamps, so
+  the pin keeps the snapshot independent of the M2 cutover protocol. A
+  `ConsistentRead` `Query` / `Scan` page is pinned the same way. Invalid
+  requests retain their existing 4xx ordering. The Redis
   adapter implements no `MGET` and the DynamoDB adapter no `BatchGetItem`,
   so these two are the multi-key reads that exist.
 - **Rolling upgrade.** Older followers skip the `0x0f` entry (a fence
@@ -648,7 +664,7 @@ Still open for the fix PRs:
   every Pebble DB this version opens or restores (`loadLastRaftCommitTS`
   persists it with `Sync` when missing or above `lastCommitTS`, at open and
   after every restore swap; an empty-snapshot restore writes 0; **to be
-  gated on the V2 marker before merge**: a V1-mode store must not carry
+  gated on the V2 marker before merge**: a store whose marker is not `txn-v2` must not carry
   the key at all, see A7); the
   streaming MVCC format gains layout V4 (V3 plus a trailing
   `lastRaftCommitTS`; the reader still accepts V1 to V3); the backup
@@ -1928,8 +1944,10 @@ sections defer to is therefore two-sided:
   streaming MVCC layout moves from V3 to V4, and the backup encoder writes
   the raw entry only when the marker is V2 (the first V2 apply seeds the
   key from `lastCommitTS`, capped, exactly as the A0 branch's fallback does
-  today); a V1-mode store, snapshot, or backup stays byte-compatible with
-  the shipped binary, and a test opens a V1-mode store and a V1-mode
+  today); a pre-epoch or V1-pinned store, snapshot, or backup stays
+  byte-compatible with the shipped binary (a ledger-era node is already
+  downgrade-incompatible through its marker and header, see the
+  ledger-aware transition), and a test opens such a store and such a
   snapshot of each format through the shipped reader logic (the
   `isPebbleMetaKey` / `findMaxCommitTS` pair as they are on `main`) and
   asserts `_meta_last_commit_ts` is unchanged. A V1 entry never consults
@@ -1939,9 +1957,26 @@ sections defer to is therefore two-sided:
   entry, the rollout stops new V1 transaction admission at every ingress,
   waits for in-flight coordinators to finish or report an unknown outcome,
   upgrades every voter, learner, and coordinator, and applies a
-  Raft-serialized ledger-aware epoch to every group. V1 admission reopens
-  only after that durable epoch is applied everywhere; thereafter every
-  accepted V1 transaction records its participants before PREPARE.
+  Raft-serialized ledger-aware epoch to every **data** group (the
+  dedicated TSO group runs `TSOStateMachine`, not `kvFSM`, and gets
+  neither epoch: its `Apply` halts on any unexpected tag, so sending the
+  envelope there would stop timestamp issuance instead of activating
+  anything; the capability monitors watch the members of the data groups,
+  and the watermark-advance read path already skips the TSO group for the
+  same reason). The ledger epoch is the first downgrade-incompatible step,
+  not a soft poll: a node advertises `txn_v1_drain_ledger` only after
+  persisting the downgrade-incompatible `txn-ledger` form of its
+  `raft-engine` marker (the marker forms are described under **Refusal on
+  the old side**), the epoch entry itself travels under the
+  fatal-to-old-binaries envelope, and a ledger-era node writes the
+  discriminating snapshot header, so a member that attested, applied the
+  epoch, and was restarted on the shipped binary is refused at startup
+  rather than admitting V1 transactions that record no participants and
+  reserve no identity (found in review: such a transaction could reach a
+  partial outcome that the later V2 gate, seeing neither a ledger row nor a
+  lock, would miss and declare V2 in effect over). V1 admission reopens
+  only after that durable epoch is applied on every data group; thereafter
+  every accepted V1 transaction records its participants before PREPARE.
   The epoch carries the validated conf state, and membership admission
   after it checks the ledger capability at apply as the V2 epoch does.
   Pre-epoch transactions with visible unresolved locks must settle before
@@ -1955,14 +1990,14 @@ sections defer to is therefore two-sided:
   storage-envelope and encryption monitors already
   read; a monitor built like `startStorageEnvelopeV2CapabilityMonitor` /
   `buildEncryptionCapabilityFanout` watches for every voter and learner of
-  every group to report each capability before its corresponding epoch.
+  every data group to report each capability before its corresponding epoch.
   The flip itself is **not** a per-process
   atomic set from that poll: a membership change admitted while this
   process still sees V1 could race another coordinator that finished its
   poll and flipped, which would then send a V2 entry to the newly admitted
   old member and halt it, costing quorum. Activation is therefore a
   **Raft-serialized epoch**: the monitor proposes a `txn_format_v2`
-  activation entry through each group (the same fatal-to-old-binaries
+  activation entry through each data group (the same fatal-to-old-binaries
   envelope, so an old member that slipped in halts here, loudly, before any
   data entry), carrying the conf state it validated against; the FSM
   rejects the entry if the group's current conf state differs (the
@@ -2077,42 +2112,45 @@ sections defer to is therefore two-sided:
   admission** checks capability: `AddLearner` / `AddVoter` on a V2 cluster
   ask the joining process for its capability report before proposing the
   conf change and refuse a node that does not advertise `txn_format_v2`.
-  A process advertises `txn_format_v2` only after it has persisted a
-  downgrade-incompatible `v2-capable` form of its own `raft-engine` marker
-  (the same file that already records the backend), so a capability report
-  that can satisfy activation is backed by durable state rather than by a
-  process poll: a voter that advertised and is then restarted on the
-  shipped binary before the activation entry applies is refused at startup
-  (`ErrTxnFormatDowngrade`) instead of starting, matching the still-V1
-  polled state, and halting on the activation envelope. The V1 pin
-  suppresses the advertisement and the marker write, so a pinned cluster
-  stays downgradable. (Downgrading two of three voters after they
-  advertised still costs the group its quorum until they are upgraded
-  again; the marker turns that into a startup refusal with a named error
-  rather than a halt mid-apply, and the rollout runbook says so.) Every
-  replica then moves the marker to the `v2` form **before** its first V2
-  FSM apply or installation / restoration of a V2 snapshot, and the
-  receiver must be able to tell a V2 snapshot apart **before** restoring
-  it: Raft snapshot metadata carries only index, term, and the conf state,
-  and an activation row inside the FSM payload is discoverable only after
-  installation, so a fresh replica could otherwise restore V2 state
+  The `raft-engine` marker (the same file that already records the
+  backend) has three forms: the legacy `etcd` form, the `txn-ledger` form,
+  and the `txn-v2` form; the shipped binary rejects the last two at
+  startup (`ErrTxnFormatDowngrade`), the new binary reads all three. A
+  process advertises `txn_v1_drain_ledger` or `txn_format_v2` only after
+  it has persisted the downgrade-incompatible `txn-ledger` form, so a
+  capability report that can satisfy either epoch is backed by durable
+  state rather than by a process poll: a voter that advertised and is then
+  restarted on the shipped binary before an epoch entry applies is refused
+  at startup instead of starting, matching the still-V1 polled state, and
+  halting on the epoch envelope, or, worse for the ledger epoch, admitting
+  V1 transactions the ledger never sees. The V1 pin suppresses both
+  advertisements and the marker write, so a pinned cluster stays
+  downgradable. (Downgrading two of three voters after they advertised
+  still costs the group its quorum until they are upgraded again; the
+  marker turns that into a startup refusal with a named error rather than
+  a halt mid-apply, and the rollout runbook says so.) Every replica then
+  moves the marker to the `txn-v2` form **before** its first V2 FSM apply
+  or installation / restoration of a V2 snapshot, and the receiver must be
+  able to tell a ledger-era or V2 snapshot apart **before** restoring it:
+  Raft snapshot metadata carries only index, term, and the conf state, and
+  an epoch row inside the FSM payload is discoverable only after
+  installation, so a fresh replica could otherwise restore such state
   without writing the marker and then be restarted under the shipped
-  binary with no fatal envelope in its WAL. V2 snapshots are therefore
-  written under a new authenticated FSM snapshot header magic
-  (`EKVTHLC3`, whose payload carries the transaction format next to the
-  ceiling and the cutover index), which the new binary reads and fences on
-  before mutating the FSM and which the shipped `ReadSnapshotHeader`
-  rejects fail-closed with `ErrSnapshotHeaderUnknownMagic` (a trailing V2
-  extension would not do: the shipped reader skips unknown trailing
-  bytes); the external restore formats (the streaming MVCC V4 layout, the
-  backup encoder's archive, the SST ingest and physical snapshot
-  manifests) carry the same format field, and
-  `elastickv-snapshot-prepare-restore` and the physical restore path fence
-  on it the same way. A V1-mode node keeps writing the `EKVTHLC2` header,
-  so V1-only clusters stay restorable by the shipped binary. The marker
-  update is atomic, fsyncs the file and directory, and uses a form that
-  the shipped binary rejects at startup; the new binary reads the legacy
-  `etcd` form, the `v2-capable` form, and the `v2` form. A marker-write failure halts apply
+  binary with no fatal envelope in its WAL. Ledger-era and V2 snapshots
+  are therefore written under a new authenticated FSM snapshot header
+  magic (`EKVTHLC3`, whose payload carries the transaction format,
+  `ledger` or `v2`, next to the ceiling and the cutover index), which the
+  new binary reads and fences on before mutating the FSM (the marker moves
+  to at least the snapshot's form first) and which the shipped
+  `ReadSnapshotHeader` rejects fail-closed with
+  `ErrSnapshotHeaderUnknownMagic` (a trailing V2 extension would not do:
+  the shipped reader skips unknown trailing bytes); the external restore
+  formats (the streaming MVCC V4 layout, the backup encoder's archive, the
+  SST ingest and physical snapshot manifests) carry the same format field,
+  and `elastickv-snapshot-prepare-restore` and the physical restore path
+  fence on it the same way. A pre-epoch or V1-pinned node keeps writing
+  the `EKVTHLC2` header, so such clusters stay restorable by the shipped
+  binary. The marker update is atomic and fsyncs the file and directory. A marker-write failure halts apply
   or restore before the durable applied index can advance or a read can
   be served. This covers a follower that never proposes a V2 entry: its
   WAL may omit an already-applied V2 envelope on restart, so the fatal
@@ -2130,8 +2168,10 @@ sections defer to is therefore two-sided:
   snapshot install/restore persisting the marker before serving, and
   before any FSM mutation when the snapshot arrives at a fresh replica;
   the shipped `ReadSnapshotHeader` rejecting an `EKVTHLC3` header; a
-  capability report refused until the `v2-capable` marker is durable, and
-  the shipped startup check rejecting a data directory that holds it;
+  capability report (either capability) refused until the `txn-ledger`
+  marker is durable, and the shipped startup check rejecting a data
+  directory that holds it; the ledger epoch entry halting the shipped
+  binary; neither epoch proposed through the dedicated TSO group;
   marker fsync failure preventing applied-index advance; restart after the marker
   write but before V2 apply; staggered activation of two participant groups
   (the coordinator waits rather than sending V2 to either group), including
