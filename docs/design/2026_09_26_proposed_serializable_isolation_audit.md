@@ -302,7 +302,34 @@ long as the skew lasts (found in review); `kvFSM` therefore raises the
 ceiling to the physical half of every timestamp it is about to observe,
 on apply and at open, which is deterministic across members because it
 is a function of the applied log and the restored snapshot, so a new
-leader floors at the same value. The raise and the observation are one
+leader floors at the same value. For that to hold, the ceiling is **one
+per Raft group** (found in review: the HLC is one per process and
+`SetPhysicalCeiling` kept a single value for every group the process
+hosts, so a raise carried by group B's log, its own lease or a value it
+observed, lifted the fence for group A on the same process while A's
+replicas had agreed to nothing above A's own lease; A's leader then
+issued above A's replicated ceiling, and once A's leadership moved to a
+process that never applied B's entries, the new leader floored at A's
+lower ceiling and could re-issue a value the old leader had handed to a
+transaction still in flight, the identity collision G10 describes;
+`main` has the same shape in a narrower window, since the groups a
+process leads renew out of phase by up to one tick). `HLC` keeps a
+ceiling per group id: each group's FSM applies its lease entries, its
+advances, and the timestamps it observes to that group's ceiling only;
+`NextFenced` takes the participant groups and fences at the lowest of
+their ceilings, so a persistence timestamp never exceeds a ceiling that
+every participant's replicas agreed to; the single-group `Coordinate`
+and the TSO group keep one ceiling; `PhysicalCeiling()` for monitoring
+reports the minimum over the led groups. A transaction whose snapshot
+came from a faster group therefore waits, on its slower participants,
+for their own logs to carry the raise (the advance entry on a read, the
+PREPARE on a write, or the renewal below), never for a raise another
+group carried. Tests: a process leading A and B where B observes a value
+far ahead refuses an allocation for A alone until A's own renewal lands
+and never issues for A above A's replicated ceiling; after A's
+leadership moves to a process that never applied B's entries, the values
+the old leader issued for A and the values the new leader issues are
+disjoint. The raise and the observation are one
 HLC operation, `ObserveApplied(ts)`, not `SetPhysicalCeiling` followed by
 `Observe` (found in review): `nextLocked` loads `last` and then the
 ceiling, so an allocator running between the two stores would see the
@@ -331,10 +358,13 @@ window and fail every write with `ErrCeilingExpired` until its wall
 caught up, for up to the clock skew between the two groups, which the
 admission bound below caps at about one window. Decision: the renewal
 target on every group a node renews, in `renewHLCLease` and in the
-single-group `Coordinator`, becomes
-`max(wall + hlcPhysicalWindowMs, PhysicalCeiling() + 1)`, so each tick
-opens one fresh window above a raised ceiling, exactly the budget an
-unskewed group has; the ceiling then drifts by one millisecond per tick
+single-group `Coordinator`, becomes, for each led group `G`,
+`max(wall + hlcPhysicalWindowMs, ceiling(G) + 1, physical(last) + 1)`,
+so each tick opens one fresh window above a raised ceiling, exactly the
+budget an unskewed group has, and every led group agrees within one tick
+to everything the process has observed (the per-group ceiling above
+makes that agreement the condition for issuing on `G` at all); the
+ceiling then drifts by one millisecond per tick
 per group while it sits ahead of the wall (coupled groups pass each
 tick's raise to each other through observation, so the drift is one
 millisecond per tick per coupled group against a wall that moves a
@@ -348,10 +378,10 @@ logical `0xffff` of the ceiling's millisecond, which 65,536 allocations
 in one leased millisecond or an observed maximum-logical snapshot produce
 legitimately, would fail writes until the next tick; it is entered on
 every `ErrCeilingExpired` instead (its callers already are the fenced
-allocation paths), proposes the same
-`max(wall + hlcPhysicalWindowMs, PhysicalCeiling() + 1)` target, and
-reports success once the fenced path can issue again (the ceiling is
-above `last`'s millisecond, or `last` has logical room at it), so the
+allocation paths), proposes the same per-group target on every led
+group whose ceiling is below the needed value, and reports success once
+the fenced path can issue again (the lowest participant ceiling is above
+`last`'s millisecond, or `last` has logical room at it), so the
 exhausted case costs one Raft round trip, serialized by `hlcRecoveryMu`
 as the expired-wall case is today. Tests: a receiver advanced ahead of its
 wall by more than one tick and given no further advance allocates past
@@ -2338,8 +2368,19 @@ sections defer to is therefore two-sided:
   of that family look up exact keys only (`primaryTxnStatus`, the dedup
   probe); the `!txn|meta|` family was rejected because it is the
   un-persisted PREPARE header and a suffixed key routes off the primary at
-  a split boundary. The value names every participant group and key.
-  Compatibility tests run the shipped binary's FSM against a PREPARE
+  a split boundary. The value names every participant group and key, and
+  it is bounded before admission (found in review: each per-group PREPARE
+  can sit under the 64 MiB transport limit while the aggregate of every
+  participant key does not, and such a transaction would have worked
+  before the intermediate release and then failed to replicate its
+  primary PREPARE): the coordinator sizes the record before any PREPARE
+  and refuses a V1 cross-group transaction whose record exceeds 4 MiB
+  with a client-visible size error, in the intermediate release only; the
+  adapters' transaction shapes sit far below it (DynamoDB caps a
+  transaction at 100 items, Redis `MULTI` and Lua carry their keys), and
+  a test drives a transaction whose per-group payloads fit while the
+  aggregate record does not. Compatibility tests run the shipped
+  binary's FSM against a PREPARE
   carrying the record: it is applied as an ordinary mutation, hidden from
   `RawGet` / `RawScan`, and routed with the primary key. The coordinator
   deletes the record only once every named secondary key is
@@ -2349,12 +2390,29 @@ sections defer to is therefore two-sided:
   timestamp replay and on G14 its lock was removed before the primary
   committed, and in both the legacy COMMIT finds no lock, writes nothing,
   and returns success). Confirmation is a leader-fenced probe on the
-  secondary group that a committed version of the key exists at exactly
-  the decision timestamp (`CommittedVersionAt`, carried by the
-  `RawLatestCommitTS` key batch in a new exact-timestamp mode next to its
-  at-or-before mode) or, for an aborted transaction, the primary's
-  rollback record; the `txn-v2` marker cannot be written while any record
-  remains. The epoch proposer derives the outstanding set by scanning
+  secondary group for a per-key receipt, not for the key's version
+  (corrected in review: the exact version alone is not compaction-safe;
+  a coordinator that crashes after the secondary COMMIT lands and before
+  confirmation leaves the version to be superseded by a later write and
+  removed by retention compaction, which keeps only the newest version at
+  or below the retained timestamp, and the probe would then classify a
+  published secondary as a G13 or G14 loss and block the gate for good).
+  The receipt is the route-local, prefix-reserved success marker the
+  migration planner already defines (`TxnSuccessMarkerKey`, keyed by the
+  locked key, `StartTS`, the decision timestamp, and the primary key, and
+  routed with the locked key): the intermediate release's coordinator
+  adds it to each secondary PREPARE's write set next to the key it
+  attests, so every binary applies it as an ordinary mutation and it
+  lands exactly when the key's version lands and never otherwise (a
+  skipped PREPARE or a removed lock leaves both unwritten), and a row
+  that is written once has a single version, which compaction never
+  removes. For a transaction the shipped binary prepared before the
+  upgrade the exact-timestamp version probe (`CommittedVersionAt`, carried
+  by the `RawLatestCommitTS` key batch in a new exact-timestamp mode next
+  to its at-or-before mode) is the fallback, and for an aborted
+  transaction the primary's rollback record is the proof; the receipts
+  are deleted with the record, and the `txn-v2` marker cannot be written
+  while any record remains. The epoch proposer derives the outstanding set by scanning
   every data group for these records, and for pre-epoch locks, instead of
   polling coordinators, so no coordinator incarnation needs tracking: a
   lost coordinator leaves its records in place, the `LockResolver`
