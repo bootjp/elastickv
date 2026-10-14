@@ -900,7 +900,21 @@ branch, not pushed). What landed:
   replicated watermark (the same participant watermarks the follow-up in
   the multi-group section collects); otherwise the transaction aborts and
   retries with a fresh pre-allocation. This is the pre-allocated half of
-  the "commit timestamp above every participant's watermark" blocker.
+  the "commit timestamp above every participant's watermark" blocker. The
+  non-offloaded `UploadPart` cannot stay pre-allocated under it (found in
+  review): `allocateS3UploadPartVersion` chooses `c` before
+  `uploadS3Chunks`, whose chunk batches are unstamped dispatches on the
+  same object group and raise its replicated watermark above `c`, so the
+  descriptor PREPARE's watermark exceeds `c` on every non-empty part, the
+  request body is already consumed, the retry is impossible, and the
+  failure path deletes the chunks. It therefore adopts the offloaded
+  path's shape: the first allocation becomes the chunk namespace only
+  (the version in `VersionedBlobKey` and the descriptor's `PartVersion`),
+  and the descriptor's commit timestamp is allocated after the chunks are
+  durable, as `finalizeS3UploadPartCommitTS` already does for offloaded
+  parts, so the descriptor transaction is not pre-allocated at all and
+  takes the ordinary post-PREPARE allocation. A test drives a non-empty
+  non-offloaded part through the fenced rule.
 - **`DEL_PREFIX` fenced** through a new `DeletePrefixesAtRaftAtFenced`; each
   prefix element now carries its own timestamp so a multi-prefix broadcast
   (the S3 bucket-delete safety net) does not fence itself.
@@ -1543,7 +1557,10 @@ Constraints the fix PR must close before merge:
   whose lock is gone install the carried write at `commitTS` when the entry
   carries values, has a `TxnID`, and no version of the key is newer than
   `startTS`, treat an existing version at exactly `commitTS` as already
-  landed, and otherwise fail with the new `ErrTxnWriteLost` (logged with
+  landed, treat a version newer than `commitTS` as landed and since
+  overwritten (released without writing; corrected in review, see the
+  lock-GC decision below), and otherwise fail with the new
+  `ErrTxnWriteLost` (logged with
   `key`, `commit_ts`, `start_ts`, `primary_key`, `txn_id`) instead of
   returning success with nothing written; `commitSecondaryTxns` surfaces it
   after still committing the other secondaries and does not retry it. Two
@@ -1646,9 +1663,23 @@ Constraints the fix PR must close before merge:
   does recreate the lock and intent there; that is a liveness cost, not a
   safety hole: the recreated lock is settled by the resolver from the
   primary's record within one TTL, a commit record resolves it as already
-  landed (a version exists at exactly `commitTS`, so nothing is written,
-  even if a newer user version exists above it) and a rollback record
-  drops it, and no server path resends a PREPARE after the transaction
+  landed and a rollback record drops it. Landed is decided without the
+  exact version (corrected in review: retention compaction removes the
+  version at exactly `commitTS` once a newer version supersedes it, at
+  the same floor at which the tombstone is collected, so a recreated
+  lock on an overwritten key found no exact version, the valued COMMIT
+  saw a version newer than `StartTS`, and `ErrTxnWriteLost` left the key
+  locked for good): a version at exactly `commitTS`, or any version newer
+  than `commitTS`, means the write landed, because under V2 the lock is
+  released only by the transaction's own COMMIT or ABORT, so a newer
+  version can exist only after the COMMIT that the record proves; the
+  lock and the recreated intent are then dropped without writing. No
+  version above `StartTS` installs the write from the recreated intent
+  (or the entry's carried values), and a version in `(StartTS,
+  commitTS)` is the loud `ErrTxnWriteLost`, impossible under V2. Test:
+  commit, overwrite, compact past both the version and the tombstone,
+  then the delayed PREPARE, settled by the resolver without a write and
+  without a lock left behind; and no server path resends a PREPARE after the transaction
   completed (a lost reply is outcome unknown since G15, a composed-1
   retry changes the identity), so the duplicate can only be a transport
   artefact. A test proves the settlement in both directions. The
