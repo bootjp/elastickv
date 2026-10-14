@@ -270,7 +270,9 @@ func TestRawFileSystemWriteMapsErrorsAndOverflow(t *testing.T) {
 	require.Equal(t, fuse.Status(syscall.EOVERFLOW), status)
 
 	if math.MaxInt > math.MaxUint32 {
-		core.writeN = int(math.MaxUint32) + 1
+		// math.MaxInt fits int on every platform, so the file still builds on
+		// 32-bit targets where the guard above is false.
+		core.writeN = math.MaxInt
 		n, status = raw.Write(nil, &fuse.WriteIn{InHeader: fuse.InHeader{NodeId: 7}, Fh: 9}, []byte("data"))
 		require.Zero(t, n)
 		require.Equal(t, fuse.Status(syscall.EOVERFLOW), status)

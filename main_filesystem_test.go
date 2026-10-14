@@ -6,6 +6,7 @@ import (
 	"math"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -178,21 +179,39 @@ func TestMountFilesystemServiceFailsOnMissingMountPoint(t *testing.T) {
 	require.Nil(t, serveDone)
 }
 
+// skipOrFailWithoutFuse skips when the FUSE prerequisites are missing unless
+// ELASTICKV_REQUIRE_FUSE is set, in which case missing coverage is a failure.
+func skipOrFailWithoutFuse(t *testing.T, format string, args ...any) {
+	t.Helper()
+	if os.Getenv("ELASTICKV_REQUIRE_FUSE") != "" {
+		t.Fatalf(format, args...)
+	}
+	t.Skipf(format, args...)
+}
+
 func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
-		t.Skipf("no /dev/fuse: %v", err)
+		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
 	}
 	svc := newFilesystemTestService(t)
 	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-a"}
 
 	server, serveDone, err := mountFilesystemService(svc, config)
 	if err != nil {
-		if os.Getenv("ELASTICKV_REQUIRE_FUSE") != "" {
-			t.Fatalf("mount failed: %v", err)
-		}
-		t.Skipf("FUSE mount unavailable: %v", err)
+		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
 	}
 	require.NotNil(t, server)
+	unmount := sync.OnceValue(server.Unmount)
+	t.Cleanup(func() {
+		if err := unmount(); err != nil {
+			t.Errorf("unmount: %v", err)
+		}
+		select {
+		case <-serveDone:
+		case <-time.After(10 * time.Second):
+			t.Error("serve loop did not stop after unmount")
+		}
+	})
 
 	path := filepath.Join(config.mountPoint, "probe")
 	require.NoError(t, os.WriteFile(path, []byte("probe"), 0o600))
@@ -200,7 +219,7 @@ func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("probe"), got)
 
-	require.NoError(t, server.Unmount())
+	require.NoError(t, unmount())
 	select {
 	case <-serveDone:
 	case <-time.After(10 * time.Second):
@@ -225,6 +244,9 @@ func TestInstallFilesystemServerLifecycleUnmountsOnContextCancel(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 
+	// Both ctx.Done() and serveDone are ready once the serve loop exits
+	// after cancellation; the lifecycle must report a clean shutdown
+	// whichever branch the select picks.
 	cancel()
 	close(serveDone)
 	select {
@@ -233,6 +255,22 @@ func TestInstallFilesystemServerLifecycleUnmountsOnContextCancel(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("lifecycle did not stop after cancellation")
 	}
+	cleanup.Run()
+}
+
+func TestInstallFilesystemServerLifecycleTreatsServeExitAfterCancelAsClean(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, egCtx := errgroup.WithContext(ctx)
+	cleanup := &internalutil.CleanupStack{}
+	serveDone := make(chan struct{})
+
+	// Cancel and close before the lifecycle goroutine can run, so its select
+	// sees both cases ready from the start.
+	cancel()
+	close(serveDone)
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, &fuseadapter.Server{}, serveDone, "/mnt/fs")
+
+	require.NoError(t, eg.Wait())
 	cleanup.Run()
 }
 

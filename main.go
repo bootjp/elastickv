@@ -973,7 +973,14 @@ func installFilesystemServerLifecycle(
 			<-serveDone
 			return nil
 		case <-serveDone:
-			return errors.New("filesystem FUSE server stopped unexpectedly")
+			select {
+			case <-ctx.Done():
+				// Shutdown already began; the serve loop exiting after the
+				// unmount is the expected path, not a failure.
+				return nil
+			default:
+				return errors.New("filesystem FUSE server stopped unexpectedly")
+			}
 		}
 	})
 }
