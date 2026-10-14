@@ -113,19 +113,42 @@
     (map? filesystem-mount) (get filesystem-mount node)
     :else                   filesystem-mount))
 
+(defn- sh-quote
+  "Single-quotes s for use inside a bash -c script."
+  [s]
+  (str "'" (clojure.string/replace (str s) "'" "'\\''") "'"))
+
 (defn- unmount-filesystem-cmd
   "Shell snippet that lazily detaches a (possibly dangling) FUSE mount. A
    node killed with SIGKILL leaves its mount point in a 'transport endpoint
-   is not connected' state, which would make the next --filesystemMount fail."
+   is not connected' state, which would make the next --filesystemMount fail.
+   The path is quoted because the snippet runs as root through bash -c."
   [mount-dir]
-  (str "if mountpoint -q " mount-dir " 2>/dev/null || grep -qs ' " mount-dir " ' /proc/mounts; then "
-       "fusermount3 -uz " mount-dir " 2>/dev/null || fusermount -uz " mount-dir " 2>/dev/null || umount -l " mount-dir " || true; fi"))
+  (let [q (sh-quote mount-dir)]
+    (str "if mountpoint -q " q " 2>/dev/null || grep -qs \" \"" q "\" \" /proc/mounts; then "
+         "fusermount3 -uz " q " 2>/dev/null || fusermount -uz " q " 2>/dev/null || umount -l " q " || true; fi")))
+
+(defn- wait-for-mount-cmd
+  "Shell snippet that waits up to ~60s for mount-dir to become a mountpoint.
+   The server mounts the filesystem after its public listeners are up, so a
+   gRPC readiness check alone would let clients hit the bare directory."
+  [mount-dir]
+  (let [q (sh-quote mount-dir)]
+    (str "for i in $(seq 1 60); do if mountpoint -q " q "; then exit 0; fi; sleep 1; done; "
+         "echo \"Timed out waiting for FUSE mount at \"" q "; exit 1")))
 
 (defn- prepare-filesystem-mount!
   "Ensures mount-dir exists and holds no stale mount before the server starts."
   [mount-dir]
   (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))
   (c/exec :mkdir :-p mount-dir))
+
+(defn- wait-for-mount!
+  "Blocks until node has mounted the filesystem at mount-dir (no-op when nil)."
+  [node mount-dir]
+  (when mount-dir
+    (c/on node
+      (c/exec :bash "-c" (wait-for-mount-cmd mount-dir)))))
 
 (defn- cleanup-filesystem-mount!
   "Detaches the node's mount after the server stopped."
@@ -235,6 +258,7 @@
                                    :redis-port (or (:redis-port opts) 6379)
                                    :bootstrap-node (first (:nodes test))}
                                   opts))
+    (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
     (when (= node (first (:nodes test)))
       (let [raft-groups (:raft-groups opts)
             grpc-port (or (:grpc-port opts) 50051)
@@ -297,6 +321,7 @@
       (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
                                 (group-ids raft-groups)))
       (wait-for-grpc! node (or (:grpc-port opts) 50051)))
+    (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
     (info "node started" node)
     this)
   (kill! [this _test node]

@@ -135,6 +135,18 @@
   (is (thrown? clojure.lang.ExceptionInfo
                (workload/elastickv-filesystem-test {:write-mode :truncate}))))
 
+(deftest final-read-ops-cover-every-register
+  (let [ops (workload/final-read-ops 3)]
+    (is (= 3 (count ops)))
+    (is (every? #(= :read (:f %)) ops))
+    (is (= [0 1 2] (map (comp first :value) ops)))
+    (is (every? #(nil? (second (:value %))) ops))))
+
+(deftest test-spec-generator-ends-with-final-reads
+  (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs ["/tmp/a"] :local true :key-count 2})]
+    (is (nil? (:final-generator test-map)))
+    (is (some? (:generator test-map)))))
+
 (deftest register-checker-races-knossos-analyzers
   (let [linear-checker (get-in (workload/filesystem-register-checker)
                                [:checkers :linear])]

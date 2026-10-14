@@ -391,6 +391,27 @@
 ;; Workload & Test builders
 ;; ---------------------------------------------------------------------------
 
+(defn final-read-ops
+  "One read per register, run after the main phase (and after the nemesis
+   has healed the cluster) so a lost final write is observed even when no
+   workload read happened to target that key afterwards."
+  [key-count]
+  (map (fn [k] {:f :read :value (independent/tuple k nil)})
+       (range key-count)))
+
+(defn with-final-reads
+  "Appends the recovery and final-read phases to the main generator.
+   nemesis-final (the nemesis package's :final-generator) heals partitions and
+   restarts killed nodes before the reads; it is nil in --local runs."
+  [main-gen nemesis-final key-count]
+  (gen/phases main-gen
+              (when nemesis-final
+                (gen/phases (gen/log "Healing cluster before final reads")
+                            (gen/nemesis nemesis-final)
+                            (gen/sleep 10)))
+              (gen/log "Final reads")
+              (gen/clients (final-read-ops key-count))))
+
 (defn filesystem-register-checker
   "Per-key register checker. Knossos races its linear and WGL analyzers."
   []
@@ -453,7 +474,12 @@
          nemesis-gen (if nemesis-p
                        (:generator nemesis-p)
                        (gen/once {:type :info :f :noop}))
-         workload    (filesystem-register-workload (assoc opts :node->mount-dir node->dir))]
+         key-count   (or (:key-count opts) 10)
+         workload    (filesystem-register-workload (assoc opts :node->mount-dir node->dir))
+         main-gen    (->> (:generator workload)
+                          (gen/nemesis nemesis-gen)
+                          (gen/stagger (/ rate))
+                          (gen/time-limit time-limit))]
      (merge workload
             {:name            (or (:name opts)
                                   (str "elastickv-filesystem-register-"
@@ -474,12 +500,14 @@
              :nemesis         (if nemesis-p
                                 (:nemesis nemesis-p)
                                 nemesis/noop)
+             ;; Final reads live inside :generator (gen/phases) rather than
+             ;; :final-generator, which Jepsen 0.3.x cannot serialize for
+             ;; combined nemesis generators.
              :final-generator nil
              :concurrency     (or (:concurrency opts) 10)
-             :generator       (->> (:generator workload)
-                                   (gen/nemesis nemesis-gen)
-                                   (gen/stagger (/ rate))
-                                   (gen/time-limit time-limit))}))))
+             :generator       (with-final-reads main-gen
+                                                (when nemesis-p (:final-generator nemesis-p))
+                                                key-count)}))))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI
