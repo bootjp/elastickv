@@ -302,7 +302,25 @@ long as the skew lasts (found in review); `kvFSM` therefore raises the
 ceiling to the physical half of every timestamp it is about to observe,
 on apply and at open, which is deterministic across members because it
 is a function of the applied log and the restored snapshot, so a new
-leader floors at the same value. Two consequences follow. One, the lease
+leader floors at the same value. The raise and the observation are one
+HLC operation, `ObserveApplied(ts)`, not `SetPhysicalCeiling` followed by
+`Observe` (found in review): `nextLocked` loads `last` and then the
+ceiling, so an allocator running between the two stores would see the
+raised ceiling with the old `last` and issue `(physical(ts), 0)`, the
+very value a secondary COMMIT at logical zero carries, and during the
+ledger-era V1 interval a same-key write at that timestamp is taken for
+the already-landed version by the timestamp replay shortcut and
+acknowledged without applying. `ObserveApplied` publishes `last` first
+and the ceiling second, and `nextLocked` loads the ceiling before `last`,
+so a fenced allocation that sees the raised ceiling also sees `last ≥
+ts` and issues above it; an allocation that sees the new `last` with the
+old ceiling computes a physical half above the ceiling and re-reads the
+ceiling once and retries before returning `ErrCeilingExpired`, which
+closes the nanosecond window between the two stores without a lock on
+the issuance path. Test: a spinning fenced allocator against repeated
+`ObserveApplied` calls at logical `0` and at logical `0xffff`, under
+`-race`, never returns a value equal to or below an observed one. Two
+consequences follow. One, the lease
 renewal target must clear a raised ceiling (found in review): one ceiling
 value holds 65,536 timestamps and a group's budget is one fresh window
 per renewal tick (`hlcRenewalInterval`, 1 s), whatever
@@ -400,8 +418,22 @@ known up front (a keys-spanning Lua script), so an unavailable or
 leaderless group fails only the operations that touch it instead of the
 whole data plane (the implemented branch fences every data group,
 including for the public gRPC `Ts = 0` reads, and must be narrowed to the
-routed participants: a merge blocker). The local value is kept if higher;
-an all-zero answer means an empty
+routed participants: a merge blocker). No value from outside the touched
+groups seeds `s` (found in review): the adapters' local seeds today are
+process-wide, `ShardStore.LastCommitTS` behind `snapshotTS`,
+`GlobalLastCommitTS` behind `nextTxnReadTS`, and
+`GlobalCommittedTimestampFloor` for a keyless begin, and keeping such a
+value when it is higher would turn every point read on an idle group into
+an advance proposal whenever any other group moves, which is exactly the
+Raft write the routed-participant narrowing exists to avoid. `s` is the
+maximum over the touched groups of the fenced leader answer and that
+group's own replica watermark (`CommittedTimestampFloorForKeys` over the
+same key set, a floor against a regressed answer), the keyless helpers
+pass their keys or take the snapshot without a seed, and a keys-spanning
+operation fences every data group anyway, where the global floor is the
+same value. Test: with group B busy and group A idle, point reads and
+single-table transactions on A propose zero advances while B's watermark
+moves. An all-zero answer means an empty
 store and no capability is issued; the single-group `Coordinate` adds no
 barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
 RPC carrying a `ForwardedReadMode` and an authenticated **peer-only**
@@ -1219,9 +1251,12 @@ matching what the delete skips. No coordinator change: nothing resolves or
 retries `TxnLockedError` for raw requests today, `DEL_PREFIX` is a
 per-group broadcast whose copies apply independently (re-running it would
 re-apply the landed copies), and every caller (Redis `FLUSHDB` /
-`FLUSHALL` through `retryRedisWrite`, the DynamoDB deleted-table cleanup,
-the S3 bucket-delete safety net) already retries the whole flush on that
-error. Tests: 28 table subtests (write lock, read lock, both, lock outside
+`FLUSHALL` through `retryRedisWrite`, the DynamoDB deleted-table cleanup
+through `isRetryableTransactWriteError`, the S3 bucket-delete safety net
+through `retryS3Mutation`) retries the whole flush on that error when it
+reaches them typed, which today it does only when the rejecting group is
+led locally (found in review; corrected under Limits below: the forwarded
+form lands with this branch, not with A0b). Tests: 28 table subtests (write lock, read lock, both, lock outside
 the prefix, nil prefix, `!txn|` user keys; resolved by COMMIT and by
 ABORT; in-memory and Pebble), a paging test with a read lock behind 1124
 unrelated rows, and a single-group Raft test that a dispatched flush fails
@@ -1232,10 +1267,26 @@ read sets (FLUSHDB runs it five times, the S3 safety net seven), accepted
 because a prefix delete already scans everything under its prefix; locks on
 migration-staged keys are skipped as on the raw point path; and a
 rejection that crosses `Internal.Forward` loses its type as a gRPC status,
-which Redis re-parses but the DynamoDB cleanup and the S3 safety net do not
-(they give up and log), a pre-existing property of every forwarded
-`TxnLocked` or fenced conflict that the A0b `Forward` work should carry
-across the wire.
+which Redis re-parses (`redis_retry.go`) but the DynamoDB cleanup and the
+S3 safety net do not: `dispatchDeletedTableCleanupPrefix` returns the
+untyped error and `launchDeletedTableCleanup` logs it, with no sweeper
+behind it, and `runBucketDeleteSafetyNet` logs "orphan sweep incomplete"
+and returns nil. Before this branch a remote group never rejected a
+`DEL_PREFIX`, so the gap was latent; with the lock check, a transient
+read lock on a remote group would abandon the deletion of a removed
+table or bucket for good and leak everything under the prefix (found in
+review). So the typed class crosses the wire in this branch: `Forward`
+attaches a `ForwardError` status detail (`kind`: txn locked, write
+conflict, route fenced; the key and the detail string), `LeaderProxy`
+rebuilds the typed error from it, the Redis string re-parse stays as the
+fallback for a leader that predates the detail, and the two cleanups
+retry on the rebuilt class exactly as they do locally. Tests: a
+forwarded `DEL_PREFIX` blocked by a read lock on a remote group comes
+back typed, the DynamoDB cleanup and the S3 safety net retry it, and
+after COMMIT nothing remains under the prefix; a forwarded write conflict
+and a forwarded route fence come back typed too. The one-shot cleanup
+goroutine itself (a crash between the table delete and the sweep leaks
+the same way) is pre-existing and out of scope here.
 
 The transaction identity (G12) is implemented on
 `design/serializable-audit-a2-txnid` (the G12 reproduction cherry-picked
@@ -1491,11 +1542,35 @@ Constraints the fix PR must close before merge:
   groups from a fresh `RouteEngine` snapshot, re-reads at a fresh leader
   snapshot, recomputes its mutations, re-dispatches) within bounded
   retries, the same contract the M4 loop already imposes on adapters.
-  Tests: a cutover between the read and the PREPARE of a read-write
-  transaction is rejected, surfaced to the adapter, and re-executed from
-  the read, with a write that landed between the two snapshots visible
-  to the second attempt; a resolver-routed transaction is documented as
-  outside the claim. Until both the drain and the pin land,
+  The streaming S3 writes are the exception that needs its own rule
+  (found in review): `putObject` and `uploadPart` stream the request
+  body into chunk rows (`BlobKey` / `ChunkRefKey` under the bucket
+  generation, the object, and a per-request upload id) through raw
+  dispatches before the manifest or part transaction is dispatched, and
+  by the time a cutover rejects that PREPARE the body is gone, so a
+  re-execution cannot rebuild the chunks, and spooling the body is ruled
+  out (unbounded memory or disk per in-flight upload). Their retry is
+  metadata-only: every object-scoped key family (manifest, blob, chunk
+  ref, upload part) maps to one route key per object
+  (`s3keys.ExtractRouteKey`), so the drain carries an object's chunk rows
+  to the new owner with its manifest; the handler re-resolves the route,
+  re-reads the bucket meta and the previous manifest or the upload meta
+  at a fresh leader snapshot, fails the request and deletes the chunks if
+  the bucket generation changed (the rows then belong to a dead
+  generation), and otherwise re-dispatches the same transaction, the same
+  chunk-ref elements included, with a fresh commit timestamp; the chunk
+  rows are never written twice. Today a rejected manifest PREPARE deletes
+  the chunks and fails the request (`cleanupS3PutObjectChunks`), which is
+  safe but turns a cutover into a failed upload. Tests: a cutover between
+  the read and the PREPARE of a read-write transaction is rejected,
+  surfaced to the adapter, and re-executed from the read, with a write
+  that landed between the two snapshots visible to the second attempt; a
+  cutover of an object's route between the chunk upload and the manifest
+  PREPARE of a `PutObject`, and between a part's chunk upload and its
+  part PREPARE, completes on the new owner with every chunk readable and
+  the body read once; a bucket generation change in that window fails
+  the request and leaves no chunk rows; a resolver-routed transaction is
+  documented as outside the claim. Until both the drain and the pin land,
   deployments running hotspot M2 migrations are excluded from the
   serializability claim (§6.1 of the roadmap). Implementation on
   `design/serializable-audit-a2-migration-drain`.
