@@ -579,15 +579,16 @@
        (range key-count)))
 
 (defn final-read-phase
-  "Final reads pinned to every node that owns a client thread. Jepsen runs
-   thread t's client against node (mod t node-count), so one gen/on-threads
-   filter per node makes every mount read every register once; a recovered
-   follower serving a stale snapshot cannot hide behind a final read that
-   happened to land on a healthy mount. A node without a thread (concurrency
-   below the node count) has no client and gets no reads."
-  [key-count node-count concurrency]
+  "Final reads pinned to every node. Jepsen runs thread t's client against
+   node (mod t node-count), so one gen/on-threads filter per node makes every
+   mount read every register once; a recovered follower serving a stale
+   snapshot cannot hide behind a final read that happened to land on a
+   healthy mount. elastickv-filesystem-test rejects a concurrency below the
+   node count, so every node owns at least one thread and no filter can be
+   left without a worker (which would stall the phase)."
+  [key-count node-count]
   (apply gen/any
-         (for [i (range (min node-count concurrency))]
+         (for [i (range node-count)]
            (gen/on-threads (fn [t] (and (integer? t) (= i (mod t node-count))))
                            (final-read-ops key-count)))))
 
@@ -595,14 +596,14 @@
   "Appends the recovery and final-read phases to the main generator.
    nemesis-final (the nemesis package's :final-generator) heals partitions and
    restarts killed nodes before the reads; it is nil in --local runs."
-  [main-gen nemesis-final key-count node-count concurrency]
+  [main-gen nemesis-final key-count node-count]
   (gen/phases main-gen
               (when nemesis-final
                 (gen/phases (gen/log "Healing cluster before final reads")
                             (gen/nemesis nemesis-final)
                             (gen/sleep 10)))
               (gen/log "Final reads from every mount")
-              (final-read-phase key-count node-count concurrency)))
+              (final-read-phase key-count node-count)))
 
 (defn final-reads-checker
   "Per-key checker for the final-read phase. Knossos models a failed read as
@@ -711,6 +712,12 @@
        (throw (ex-info (str "--concurrency (" concurrency ") must be a positive multiple of --threads-per-key ("
                             threads-per-key "): independent/concurrent-generator assigns whole thread groups to keys")
                        {:concurrency concurrency :threads-per-key threads-per-key})))
+     ;; Thread t drives node (mod t node-count): a node without a thread has
+     ;; no client, so its mount would be neither exercised nor final-read.
+     (when (< concurrency (count nodes))
+       (throw (ex-info (str "--concurrency (" concurrency ") must be at least the node count ("
+                            (count nodes) ") so every mount owns a worker and is read in the final phase")
+                       {:concurrency concurrency :nodes nodes})))
      (merge workload
             {:name            (or (:name opts)
                                   (str "elastickv-filesystem-register-"
@@ -739,8 +746,7 @@
              :generator       (with-final-reads main-gen
                                                 (when nemesis-p (:final-generator nemesis-p))
                                                 key-count
-                                                (count nodes)
-                                                concurrency)}))))
+                                                (count nodes))}))))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI

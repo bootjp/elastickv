@@ -215,7 +215,7 @@
   ;; Thread t serves node (mod t node-count); 3 nodes x 2 threads each.
   (let [test {:concurrency 6 :nodes ["n1" "n2" "n3"]}
         ctx  (gen/context test)
-        ops  (loop [g (workload/final-read-phase 2 3 6), ops []]
+        ops  (loop [g (workload/final-read-phase 2 3), ops []]
                (let [[op g'] (gen/op g test ctx)]
                  (if (or (nil? op) (= :pending op))
                    ops
@@ -225,17 +225,16 @@
     (is (every? :final ops))
     (is (= #{0 1 2} (set (keys by-node))))
     (doseq [[_ node-ops] by-node]
-      (is (= [0 1] (sort (map (comp first :value) node-ops))))))
-  ;; Fewer threads than nodes: only the nodes that own a client are read.
-  (let [test {:concurrency 2 :nodes ["n1" "n2" "n3"]}
-        ctx  (gen/context test)
-        ops  (loop [g (workload/final-read-phase 2 3 2), ops []]
-               (let [[op g'] (gen/op g test ctx)]
-                 (if (or (nil? op) (= :pending op))
-                   ops
-                   (recur g' (conj ops op)))))]
-    (is (= 4 (count ops)))
-    (is (= #{0 1} (set (map #(mod (:process %) 3) ops))))))
+      (is (= [0 1] (sort (map (comp first :value) node-ops)))))))
+
+(deftest concurrency-must-cover-every-node
+  ;; 2 workers is a multiple of threads-per-key but leaves n3 without a
+  ;; client, so its mount would never be exercised or final-read.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo #"at least the node count"
+                        (workload/elastickv-filesystem-test {:nodes ["n1" "n2" "n3"] :mount-dir "/mnt/fs" :local true
+                                                             :concurrency 2})))
+  (is (= 6 (:concurrency (workload/elastickv-filesystem-test {:nodes ["n1" "n2" "n3"] :mount-dir "/mnt/fs" :local true
+                                                               :concurrency 6})))))
 
 (deftest concurrency-must-be-a-multiple-of-threads-per-key
   (is (thrown-with-msg? clojure.lang.ExceptionInfo #"multiple of --threads-per-key"
