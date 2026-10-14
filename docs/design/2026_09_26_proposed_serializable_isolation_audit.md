@@ -2626,14 +2626,28 @@ sections defer to is therefore two-sided:
   would alias with no crash for the attestation to name (found in
   review: bounding that by the restart window is not fail-closed). The
   intermediate release therefore admits a cross-group transaction only
-  once every node advertises the intermediate capability; until then
+  once a **reservation epoch** has applied on every participant group:
+  once every node advertises the intermediate capability, the
+  capability monitor proposes the epoch through each data group exactly
+  as the V2 activation below is proposed (the same fatal-to-old-binaries
+  envelope, the validated conf state the FSM checks at apply, the
+  apply-enforced membership exclusion for a joiner without the
+  capability attestation), and a node that applied it persists the
+  `txn-reserve` form of its `raft-engine` marker, which the shipped
+  binary refuses at startup, so the epoch is the intermediate release's
+  first downgrade-incompatible step (corrected in review: a capability
+  poll alone races a member restarted on the shipped binary and an
+  incapable joiner, both of which could admit an unreserved transaction
+  after one coordinator had seen every node capable, exactly the race
+  the V2 transition records below). A coordinator observes the epoch
+  once per group and caches it, since it is never revoked; until then
   its cross-group admission fails with a retryable upgrading error
   (single-group transactions carry no shared identity and are
-  unaffected), so during the restart only shipped coordinators admit
-  cross-group transactions, and once the last of them has drained and
-  exited, which its graceful stop guarantees before the new process
-  advertises, no shipped-era lock is left for an intermediate
-  transaction to alias. Shipped-against-shipped aliasing during the
+  unaffected), so before the epoch only shipped coordinators admit
+  cross-group transactions, and the epoch is proposed only after the
+  last of them has drained and exited, which its graceful stop
+  guarantees before the new process advertises, so no shipped-era lock
+  is left for an intermediate transaction to alias. Shipped-against-shipped aliasing during the
   restart is `main`'s own G12, not the drain's to find; the runbook
   removes it by routing cross-group traffic away from nodes awaiting
   restart or by pausing it at the ingress for the window. Test: a
@@ -2645,7 +2659,20 @@ sections defer to is therefore two-sided:
   error (found in review: sizing one aggregate misses a per-group
   request that no longer fits once augmented); the adapters' transaction
   shapes sit far below it (DynamoDB caps a transaction at 100 items,
-  Redis `MULTI` and Lua carry their keys). With the three closures, every
+  Redis `MULTI` and Lua carry their keys). (5) **No cleanup ABORT after
+  the primary commits** (found in review): on `main`,
+  `TransactionManager.commitSequential` treats a failed secondary COMMIT
+  as needing cleanup, so a cancellation or a proposal error after the
+  primary COMMIT is durable fires a detached ABORT that removes that
+  secondary's lock and intent, and `commitSecondaryTxns` still reports
+  success, leaving a missing write with no lock for the scan to find;
+  the A2 status's `txnCleanupRequests` exclusion (no cleanup for a COMMIT
+  that does not name its primary) is coordinator-only and therefore
+  ships in the intermediate release too, a failed or cancelled secondary
+  COMMIT after a durable primary COMMIT is reported as outcome unknown
+  and left to the resolver, never cleaned up, and the test runs primary
+  commit, cancelled secondary commit, activation drain, and asserts the
+  lock is found and the write published. With the closures, every
   write of a transaction the intermediate release admitted either holds
   a lock the epoch scan settles from the primary's recorded decision or
   has already become the version or the rollback that decision produced,
