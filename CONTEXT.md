@@ -148,9 +148,15 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   half (Unix milliseconds) whose upper bound is agreed through Raft, and a
   16-bit logical counter advanced in memory. (`kv/hlc.go`)
 - **physical ceiling** — The Raft-agreed upper bound on the physical half.
-  The leader periodically commits a ceiling entry; every node applies it, so
-  a new leader never issues timestamps inside the previous leader's window.
-  (`kv/hlc.go`)
+  The leader periodically commits a ceiling entry and every node applies
+  it, which bounds how far ahead of the wall clock any leader issues. On
+  `main` it does not by itself separate leader windows: a newly elected
+  leader applies the same ceiling from the log, its in-memory logical
+  counter starts from what it observed, and it can reissue a value the old
+  leader handed out but had not yet written into the log (audit gap G10).
+  The audit's A0 adds a current-term grant: a leader issues for a group
+  only inside a lease entry it proposed itself, so successive leaders'
+  windows are disjoint once that lands. (`kv/hlc.go`)
 - **logical counter** — The in-memory low half, incremented per `Next()`
   within a millisecond, reset when wall time advances. No Raft round trip.
   (`kv/hlc.go`)
