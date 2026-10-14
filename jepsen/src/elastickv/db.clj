@@ -118,15 +118,37 @@
   [s]
   (str "'" (clojure.string/replace (str s) "'" "'\\''") "'"))
 
+(defn- proc-mounts-escape
+  "Encodes a path the way /proc/mounts prints mount points: backslash, space,
+   tab and newline become octal escapes."
+  [path]
+  (-> (str path)
+      (clojure.string/replace "\\" "\\134")
+      (clojure.string/replace " " "\\040")
+      (clojure.string/replace "\t" "\\011")
+      (clojure.string/replace "\n" "\\012")))
+
 (defn- unmount-filesystem-cmd
   "Shell snippet that lazily detaches a (possibly dangling) FUSE mount. A
    node killed with SIGKILL leaves its mount point in a 'transport endpoint
    is not connected' state, which would make the next --filesystemMount fail.
-   The path is quoted because the snippet runs as root through bash -c."
-  [mount-dir]
-  (let [q (sh-quote mount-dir)]
-    (str "if mountpoint -q " q " 2>/dev/null || grep -qs \" \"" q "\" \" /proc/mounts; then "
-         "fusermount3 -uz " q " 2>/dev/null || fusermount -uz " q " 2>/dev/null || umount -l " q " || true; fi")))
+   The filesystem type comes from the mounts table (mountpoint(1) cannot stat
+   a dangling mount) and only a FUSE mount is touched: the snippet runs as
+   root, so a mis-typed --filesystem-mount naming an unrelated volume must
+   warn rather than reach the generic umount fallback. The path is quoted
+   because the snippet runs through bash -c."
+  ([mount-dir]
+   (unmount-filesystem-cmd mount-dir "/proc/mounts"))
+  ([mount-dir mounts-file]
+   (let [q   (sh-quote mount-dir)
+         esc (sh-quote (proc-mounts-escape mount-dir))
+         mf  (sh-quote mounts-file)]
+     (str "fstype=$(while read -r _ mp fs _; do [ \"$mp\" = " esc " ] && printf '%s\\n' \"$fs\"; done < " mf " | tail -n 1); "
+          "case \"$fstype\" in "
+          "'') ;; "
+          "fuse|fuse.*|fuseblk) fusermount3 -uz " q " 2>/dev/null || fusermount -uz " q " 2>/dev/null || umount -l " q " || true ;; "
+          "*) echo \"refusing to unmount non-FUSE filesystem ($fstype) at \"" q " >&2 ;; "
+          "esac"))))
 
 (defn- wait-for-mount-cmd
   "Shell snippet that waits up to ~60s for mount-dir to become a mountpoint.

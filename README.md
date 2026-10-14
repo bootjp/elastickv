@@ -438,7 +438,10 @@ cd jepsen && ~/lein run -m elastickv.filesystem-workload --local \
 ```
 
 `--write-mode overwrite` replaces each register with one in-place `pwrite`;
-`--write-mode rename` writes a temp file and renames it over the key.
+`--write-mode rename` writes a temp file and renames it over the key. A read
+that still finds its register missing, truncated or unparseable after the
+retries is recorded as an observed data-loss value rather than a failed
+operation, so the checker reports the lost write instead of ignoring the read.
 
 ### Setup pre-commit hooks
 ```bash

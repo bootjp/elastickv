@@ -548,7 +548,12 @@ Phase 3:
      key (namespace transaction, remove-while-open). `--local` drives the
      mounts through java.nio; without it the client runs `dd`/`head`/`mv` on
      each node over SSH and the DB adapter starts nodes with
-     `--filesystemMount`, so the partition/kill nemesis applies. The CI
+     `--filesystemMount`, so the partition/kill nemesis applies. A read that
+     still finds its register missing, truncated or unparseable after the
+     retries completes `:ok` with a data-loss sentinel the register model
+     rejects, and a final-reads checker flags a final-phase read that could
+     not observe its register, so a lost acknowledged write cannot hide
+     behind a failed read (knossos treats `:fail` as a no-op). The CI
      `jepsen-test` workflow runs both modes against the 3-node cluster.
    - concurrent append + read under node failure (open)
    - migration during read/write load (open)

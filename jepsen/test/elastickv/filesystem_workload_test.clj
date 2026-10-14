@@ -2,7 +2,9 @@
   (:require [clojure.java.io :as io]
             [clojure.string :as str]
             [clojure.test :refer :all]
+            [jepsen.checker :as checker]
             [jepsen.client :as client]
+            [jepsen.history :as history]
             [jepsen.independent :as independent]
             [elastickv.filesystem-workload :as workload])
   (:import (java.nio.file Files)
@@ -85,6 +87,56 @@
   (is (not (workload/retryable-error? (java.io.IOException. "No space left on device"))))
   (is (not (workload/retryable-error? (java.nio.file.NoSuchFileException. "reg-1")))))
 
+(defn- nonzero-exit
+  "Mimics the exception jepsen.control throws for a non-zero remote exit: the
+   message quotes the command line, the data carries the streams."
+  [cmd err]
+  (ex-info (str "Command exited with non-zero status 1 on node n1:\n" cmd "\n\nSTDERR:\n" err)
+           {:type :jepsen.control/nonzero-exit :cmd cmd :exit 1 :out "" :err err}))
+
+(deftest error-text-ignores-the-remote-command-line
+  (let [cmd (workload/remote-read-cmd "/mnt/fs" "/mnt/fs/jepsen/reg-1")]
+    (is (= "head: error reading 'reg-1': Input/output error\n"
+           (workload/error-text (nonzero-exit cmd "head: error reading 'reg-1': Input/output error"))))
+    (is (= "boom" (workload/error-text (java.io.IOException. "boom"))))
+    (is (= "" (workload/error-text (java.io.IOException.))))))
+
+(deftest data-loss-kind-classifies-lost-registers-only
+  (let [cmd (workload/remote-read-cmd "/mnt/fs" "/mnt/fs/jepsen/reg-1")]
+    (is (= :missing (workload/data-loss-kind (java.nio.file.NoSuchFileException. "reg-1"))))
+    (is (= :missing (workload/data-loss-kind (java.io.FileNotFoundException. "/mnt/fs/jepsen/reg-1 (No such file or directory)"))))
+    (is (= :missing (workload/data-loss-kind (java.io.IOException. "No such file or directory"))))
+    (is (= :missing (workload/data-loss-kind (nonzero-exit cmd "stat: cannot statx '/mnt/fs/jepsen/reg-1': No such file or directory"))))
+    (is (= :truncated (workload/data-loss-kind (java.io.EOFException.))))
+    (is (= :truncated (workload/data-loss-kind (nonzero-exit cmd "short record"))))
+    (is (= :corrupt (workload/data-loss-kind (NumberFormatException. "For input string: \"garbage\""))))
+    ;; The read could not be performed, but nothing says the register is gone.
+    (is (nil? (workload/data-loss-kind (java.io.FileNotFoundException. "reg-1 (Resource temporarily unavailable)"))))
+    (is (nil? (workload/data-loss-kind (java.io.FileNotFoundException. "reg-1 (Transport endpoint is not connected)"))))
+    (is (nil? (workload/data-loss-kind (java.io.IOException. "Input/output error"))))
+    (is (nil? (workload/data-loss-kind (ex-info "mount unavailable: /mnt/fs" {}))))
+    (is (nil? (workload/data-loss-kind (nonzero-exit cmd "mount unavailable: /mnt/fs"))))
+    ;; The command line quotes the markers; only the streams count.
+    (is (nil? (workload/data-loss-kind (nonzero-exit cmd "ssh_exchange_identification: Connection closed"))))
+    (is (nil? (workload/data-loss-kind (RuntimeException. "ssh failed"))))))
+
+(deftest reads-retry-data-loss-shaped-errors
+  (is (workload/read-retryable-error? (java.io.IOException. "Input/output error")))
+  (is (workload/read-retryable-error? (java.nio.file.NoSuchFileException. "reg-1")))
+  (is (workload/read-retryable-error? (java.io.EOFException.)))
+  (is (workload/read-retryable-error? (NumberFormatException. "x")))
+  (is (not (workload/read-retryable-error? (ex-info "mount unavailable: /mnt/fs" {}))))
+  (is (not (workload/read-retryable-error? (java.io.FileNotFoundException. "reg-1 (Transport endpoint is not connected)")))))
+
+(deftest with-retries-accepts-a-custom-predicate
+  (let [calls (atom 0)]
+    (is (thrown? java.nio.file.NoSuchFileException
+                 (workload/with-retries 3 workload/read-retryable-error?
+                   (fn []
+                     (swap! calls inc)
+                     (throw (java.nio.file.NoSuchFileException. "reg-1"))))))
+    (is (= 3 @calls))))
+
 (deftest with-retries-retries-only-retryable-errors
   (let [calls (atom 0)]
     (is (= :done (workload/with-retries 3 (fn []
@@ -139,8 +191,54 @@
   (let [ops (workload/final-read-ops 3)]
     (is (= 3 (count ops)))
     (is (every? #(= :read (:f %)) ops))
+    (is (every? :final ops))
     (is (= [0 1 2] (map (comp first :value) ops)))
     (is (every? #(nil? (second (:value %))) ops))))
+
+(defn- check-final-reads [history]
+  (checker/check (workload/final-reads-checker) {} (history/history history) {}))
+
+(deftest final-reads-checker-rejects-lost-registers
+  (let [res (check-final-reads [{:process 0 :type :invoke :f :write :value 1}
+                                {:process 0 :type :ok :f :write :value 1}
+                                {:process 1 :type :invoke :f :read :value nil :final true}
+                                {:process 1 :type :ok :f :read :value :missing :final true :error "NoSuchFileException: reg-0"}])]
+    (is (false? (:valid? res)))
+    (is (= 1 (count (:lost res))))
+    (is (= :missing (:value (first (:lost res)))))))
+
+(deftest final-reads-checker-reports-unobserved-final-reads
+  (let [res (check-final-reads [{:process 0 :type :invoke :f :read :value nil :final true}
+                                {:process 0 :type :fail :f :read :value nil :final true :error "IOException: Input/output error"}])]
+    (is (= :unknown (:valid? res)))
+    (is (= 1 (count (:unobserved res)))))
+  (let [res (check-final-reads [{:process 0 :type :invoke :f :write :value 1}
+                                {:process 0 :type :ok :f :write :value 1}])]
+    (is (= :unknown (:valid? res)))))
+
+(deftest final-reads-checker-accepts-observed-registers
+  (let [res (check-final-reads [{:process 0 :type :invoke :f :read :value nil}
+                                {:process 0 :type :fail :f :read :value nil :error "transient"}
+                                {:process 1 :type :invoke :f :read :value nil :final true}
+                                {:process 1 :type :ok :f :read :value 7 :final true}])]
+    (is (true? (:valid? res)))))
+
+(deftest register-model-rejects-data-loss-sentinels
+  ;; A sentinel read is a linearizability violation, so the lost write is
+  ;; reported by knossos as well as by the final-reads checker.
+  (let [check (fn [history]
+                (:valid? (checker/check (workload/filesystem-register-checker)
+                                        {:name "fs-test" :start-time 0}
+                                        (history/history history)
+                                        {})))]
+    (is (true? (check [{:process 0 :type :invoke :f :write :value 3}
+                       {:process 0 :type :ok :f :write :value 3}
+                       {:process 1 :type :invoke :f :read :value nil :final true}
+                       {:process 1 :type :ok :f :read :value 3 :final true}])))
+    (is (false? (check [{:process 0 :type :invoke :f :write :value 3}
+                        {:process 0 :type :ok :f :write :value 3}
+                        {:process 1 :type :invoke :f :read :value nil :final true}
+                        {:process 1 :type :ok :f :read :value :truncated :final true}])))))
 
 (deftest test-spec-generator-ends-with-final-reads
   (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs ["/tmp/a"] :local true :key-count 2})]
@@ -169,8 +267,12 @@
   (let [rename (workload/remote-rename-cmd "/mnt/fs" 1 7)]
     (is (re-find #"^\{ printf '%s' '               7' > '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+' && mv -f '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+' '/mnt/fs/jepsen/reg-1'; \} \|\| \{ rm -f '/mnt/fs/jepsen/reg-1\.tmp-[0-9a-f]+'; exit 1; \}$" rename))
     (is (zero? (:exit (clojure.java.shell/sh "bash" "-n" "-c" rename)))))
-  (is (= "[ \"$(stat -c %s '/mnt/fs/jepsen/reg-1')\" -ge 16 ] && head -c 16 '/mnt/fs/jepsen/reg-1'"
-         (workload/remote-read-cmd "/mnt/fs/jepsen/reg-1")))
+  (let [read (workload/remote-read-cmd "/mnt/fs" "/mnt/fs/jepsen/reg-1")]
+    (is (zero? (:exit (clojure.java.shell/sh "bash" "-n" "-c" read))))
+    (is (str/starts-with? read "{ mountpoint -q '/mnt/fs' && [ -d '/mnt/fs/jepsen' ]; } || { echo 'mount unavailable: /mnt/fs' >&2; exit 1; }; "))
+    (is (str/includes? read "s=$(stat -c %s '/mnt/fs/jepsen/reg-1') || exit 1; "))
+    (is (str/includes? read "[ \"$s\" -ge 16 ] || { echo 'short record' >&2; exit 1; }; "))
+    (is (str/ends-with? read "exec head -c 16 '/mnt/fs/jepsen/reg-1'")))
   (let [setup (workload/remote-setup-cmd "/mnt/fs" [0 1])]
     (is (str/starts-with? setup "mkdir -p '/mnt/fs/jepsen'"))
     (is (str/includes? setup "> '/mnt/fs/jepsen/reg-0'"))
@@ -311,7 +413,71 @@
         (is (= :fail (:type w)))
         (is (str/includes? (:error w) "NoSuchFileException"))
         (is (= :fail (:type r)))
-        (is (str/includes? (:error r) "FileNotFoundException")))
+        ;; No workload directory yet: the ENOENT is an unavailable mount, not
+        ;; a lost register.
+        (is (str/includes? (:error r) "mount unavailable")))
+      (finally
+        (delete-tree! dir)))))
+
+(deftest persistent-read-errors-surface-as-data-loss-sentinels
+  (let [dir (scratch-dir)]
+    (try
+      (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir]
+                                                          :local true :key-count 2 :max-retries 3
+                                                          :require-fuse-mount false})
+            c        (client/open! (:client test-map) test-map "n1")
+            read     (fn [k] (client/invoke! c test-map {:type :invoke :f :read :value (independent/tuple k nil)}))
+            path     (workload/register-path dir 0)]
+        (client/setup! c test-map)
+        ;; Deleted register: ENOENT is retried, then reported as :missing.
+        (let [calls (atom 0)
+              real  workload/local-read]
+          (io/delete-file path)
+          (with-redefs [workload/local-read (fn [p] (swap! calls inc) (real p))]
+            (let [r (read 0)]
+              (is (= :ok (:type r)))
+              (is (= (independent/tuple 0 :missing) (:value r)))
+              (is (str/includes? (:error r) "No such file or directory"))
+              (is (= 3 @calls)))))
+        ;; Truncated register.
+        (spit path "7")
+        (let [r (read 0)]
+          (is (= :ok (:type r)))
+          (is (= (independent/tuple 0 :truncated) (:value r))))
+        ;; Garbage record.
+        (spit path "not-a-number!!!!")
+        (let [r (read 0)]
+          (is (= :ok (:type r)))
+          (is (= (independent/tuple 0 :corrupt) (:value r))))
+        ;; A transient ENOENT that heals within the retries reads normally.
+        (let [calls (atom 0)
+              real  workload/local-read]
+          (with-redefs [workload/local-read (fn [p]
+                                              (if (= 1 (swap! calls inc))
+                                                (throw (java.nio.file.NoSuchFileException. p))
+                                                (real p)))]
+            (let [r (read 1)]
+              (is (= (independent/tuple 1 workload/initial-value) (:value r)))
+              (is (= 2 @calls)))))
+        ;; A read that could not be performed stays a :fail.
+        (with-redefs [workload/local-read (fn [_] (throw (java.io.FileNotFoundException. (str path " (Transport endpoint is not connected)"))))]
+          (is (= :fail (:type (read 0)))))
+        ;; Without the workload directory (bare directory after an unmount)
+        ;; the ENOENT says nothing about the register.
+        (delete-tree! (workload/workload-dir dir))
+        (let [r (read 0)]
+          (is (= :fail (:type r)))
+          (is (str/includes? (:error r) "mount unavailable"))))
+      (finally
+        (delete-tree! dir)))))
+
+(deftest local-mount-availability-requires-workload-dir
+  (let [dir (scratch-dir)]
+    (try
+      (is (not (workload/local-mount-available? dir false)))
+      (.mkdirs (io/file (workload/workload-dir dir)))
+      (is (workload/local-mount-available? dir false))
+      (is (not (workload/local-mount-available? dir true)))
       (finally
         (delete-tree! dir)))))
 

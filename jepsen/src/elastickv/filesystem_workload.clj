@@ -20,7 +20,16 @@
    follower mount that lost its forwarded proposal may report EIO. Both are
    retried a bounded number of times (`--max-retries`); a write that exhausts
    its retries is recorded as indeterminate because an attempt may already
-   have been committed, while a read that exhausts them simply fails.
+   have been committed. Reads additionally retry ENOENT, short and malformed
+   records: FUSE splits open(2) into LOOKUP + OPEN, so a reader racing a
+   rename on another mount can briefly miss the replaced inode. A read that
+   still cannot observe its register after the retries is not a plain :fail
+   (knossos treats a failed read as never having happened, which would let a
+   lost acknowledged write pass): it completes :ok with a data-loss sentinel
+   (:missing, :truncated or :corrupt) that the register model rejects, and a
+   dedicated checker flags a final-phase read that observed nothing at all.
+   A read against a bare or dangling mount (the node was killed) fails
+   without being counted as loss.
 
    In `--local` mode the Jepsen process talks to the mount points directly
    through java.nio (one mount directory per node). Without `--local` the
@@ -94,26 +103,73 @@
   ["Resource temporarily unavailable"
    "Input/output error"])
 
+(defn error-text
+  "Text an error is classified by. A jepsen.control non-zero exit carries the
+   command line in its message (which may quote the very markers we look
+   for), so for those only stderr and stdout are inspected."
+  [^Throwable e]
+  (let [data (ex-data e)]
+    (if (contains? data :exit)
+      (str (:err data) "\n" (:out data))
+      (or (.getMessage e) ""))))
+
 (defn retryable-error?
   [^Throwable e]
-  (let [msg (or (.getMessage e) "")]
+  (let [msg (error-text e)]
     (boolean (some #(str/includes? msg %) retryable-messages))))
 
+(def ^:const short-record-message "short record")
+
+(def ^:const mount-unavailable-message "mount unavailable")
+
+(def data-loss-kinds
+  "Sentinel register values a read completes with when the register itself is
+   gone or damaged. None of them equals a written long, so the register model
+   rejects the read instead of ignoring it."
+  #{:missing :truncated :corrupt})
+
+(defn data-loss-kind
+  "Classifies a read error as evidence that the register is lost: :missing
+   for ENOENT, :truncated for a record shorter than record-width and :corrupt
+   for an unparseable record. nil for everything else (EAGAIN, EIO, ENOTCONN,
+   an unavailable mount, SSH failures), which only says the read could not be
+   performed."
+  [^Throwable e]
+  (let [msg (error-text e)]
+    (cond
+      (str/includes? msg mount-unavailable-message)      nil
+      (instance? NumberFormatException e)                :corrupt
+      (instance? EOFException e)                         :truncated
+      (str/includes? msg short-record-message)           :truncated
+      (instance? NoSuchFileException e)                  :missing
+      (str/includes? msg "No such file or directory")    :missing
+      :else                                              nil)))
+
+(defn read-retryable-error?
+  "Reads retry the backend's retryable errnos and every data-loss-shaped
+   error, so only a persistent loss is reported as one."
+  [^Throwable e]
+  (or (retryable-error? e)
+      (some? (data-loss-kind e))))
+
 (defn with-retries
-  "Calls (f) up to max-retries times while it throws a retryable error,
-   sleeping retry-backoff-ms between attempts. Rethrows the last error."
-  [max-retries f]
-  (loop [attempt 1]
-    (let [result (try
-                   {:value (f)}
-                   (catch Exception e
-                     (if (and (< attempt max-retries) (retryable-error? e))
-                       {:retry e}
-                       (throw e))))]
-      (if (contains? result :retry)
-        (do (Thread/sleep (long retry-backoff-ms))
-            (recur (inc attempt)))
-        (:value result)))))
+  "Calls (f) up to max-retries times while it throws an error accepted by
+   retry? (retryable-error? by default), sleeping retry-backoff-ms between
+   attempts. Rethrows the last error."
+  ([max-retries f]
+   (with-retries max-retries retryable-error? f))
+  ([max-retries retry? f]
+   (loop [attempt 1]
+     (let [result (try
+                    {:value (f)}
+                    (catch Exception e
+                      (if (and (< attempt max-retries) (retry? e))
+                        {:retry e}
+                        (throw e))))]
+       (if (contains? result :retry)
+         (do (Thread/sleep (long retry-backoff-ms))
+             (recur (inc attempt)))
+         (:value result))))))
 
 ;; ---------------------------------------------------------------------------
 ;; Record encoding
@@ -302,6 +358,21 @@
                          " (pass --allow-non-fuse-mount to override)")
                     {:mount-dir mount-dir}))))
 
+(defn local-mount-available?
+  "True when reads may interpret an ENOENT as a lost register: the workload
+   directory is reachable (a bare directory left by an unmount, or a dangling
+   mount, has none) and, unless the FUSE check is disabled, the mount is
+   still a FUSE file store."
+  [mount-dir require-fuse-mount]
+  (and (or (not require-fuse-mount) (local-fuse-mount? mount-dir))
+       (Files/isDirectory (nio-path (workload-dir mount-dir)) (make-array LinkOption 0))))
+
+(defn require-local-mount!
+  [mount-dir require-fuse-mount]
+  (when-not (local-mount-available? mount-dir require-fuse-mount)
+    (throw (ex-info (str mount-unavailable-message ": " mount-dir)
+                    {:mount-dir mount-dir}))))
+
 ;; ---------------------------------------------------------------------------
 ;; Remote (SSH) backend
 ;; ---------------------------------------------------------------------------
@@ -327,12 +398,20 @@
          "; } || { rm -f " tmp "; exit 1; }")))
 
 (defn remote-read-cmd
-  "Shell command reading one record. It fails instead of returning a
-   truncated number when the file is shorter than a record, mirroring the
-   local backend's readFully."
-  [path]
-  (let [q (sh-quote path)]
-    (str "[ \"$(stat -c %s " q ")\" -ge " record-width " ] && head -c " record-width " " q)))
+  "Shell command reading one record. It refuses to run against an
+   unavailable mount (a killed node leaves a bare or dangling directory, whose
+   ENOENT must not pass for a lost register) and fails with a short-record
+   message instead of returning a truncated number, mirroring the local
+   backend's readFully. stat reports ENOENT on stderr."
+  [mount-dir path]
+  (let [m (sh-quote mount-dir)
+        w (sh-quote (workload-dir mount-dir))
+        q (sh-quote path)]
+    (str "{ mountpoint -q " m " && [ -d " w " ]; } || { echo "
+         (sh-quote (str mount-unavailable-message ": " mount-dir)) " >&2; exit 1; }; "
+         "s=$(stat -c %s " q ") || exit 1; "
+         "[ \"$s\" -ge " record-width " ] || { echo " (sh-quote short-record-message) " >&2; exit 1; }; "
+         "exec head -c " record-width " " q)))
 
 (defn remote-sweep-cmd
   "Shell command removing leftover temporary files from a node's workload
@@ -414,20 +493,25 @@
           (indeterminate op (io-error-label e)))))))
 
 (defn invoke-read!
-  "Executes a read, retrying retryable errors. Reads never mutate state, so
-   every exhausted error is a :fail."
-  [{:keys [local? mount-dir max-retries]} test node op k]
+  "Executes a read, retrying retryable and data-loss-shaped errors. Reads
+   never mutate state, so an exhausted error that merely says the read could
+   not be performed is a :fail; one that says the register is gone completes
+   :ok with its data-loss sentinel so the checker sees the loss."
+  [{:keys [local? mount-dir max-retries require-fuse-mount]} test node op k]
   (try
-    (let [v (with-retries max-retries
+    (let [v (with-retries max-retries read-retryable-error?
               (fn []
                 (if local?
-                  (local-read (register-path mount-dir k))
+                  (do (require-local-mount! mount-dir require-fuse-mount)
+                      (local-read (register-path mount-dir k)))
                   (decode-value (.getBytes ^String (remote-exec! test node
-                                                                   (remote-read-cmd (register-path mount-dir k)))
+                                                                   (remote-read-cmd mount-dir (register-path mount-dir k)))
                                            StandardCharsets/US_ASCII)))))]
       (assoc op :type :ok :value (independent/tuple k v)))
     (catch Exception e
-      (fail op (io-error-label e)))))
+      (if-let [kind (data-loss-kind e)]
+        (assoc op :type :ok :value (independent/tuple k kind) :error (io-error-label e))
+        (fail op (io-error-label e))))))
 
 (defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount node mount-dir local?]
   client/Client
@@ -476,7 +560,7 @@
    has healed the cluster) so a lost final write is observed even when no
    workload read happened to target that key afterwards."
   [key-count]
-  (map (fn [k] {:f :read :value (independent/tuple k nil)})
+  (map (fn [k] {:f :read :value (independent/tuple k nil) :final true})
        (range key-count)))
 
 (defn with-final-reads
@@ -492,12 +576,34 @@
               (gen/log "Final reads")
               (gen/clients (final-read-ops key-count))))
 
+(defn final-reads-checker
+  "Per-key checker for the final-read phase. Knossos models a failed read as
+   never having happened, so a lost register whose only read after the last
+   write failed would otherwise pass: the key is invalid when its final read
+   observed a data-loss sentinel and :unknown when it could not observe the
+   register at all (or never ran)."
+  []
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [finals     (->> history
+                            (filter #(and (:final %) (not= :invoke (:type %))))
+                            (map #(into {} %)))
+            lost       (filter #(and (= :ok (:type %)) (contains? data-loss-kinds (:value %))) finals)
+            unobserved (remove #(= :ok (:type %)) finals)]
+        (cond
+          (seq lost)       {:valid? false :lost (vec lost)}
+          (seq unobserved) {:valid? :unknown :unobserved (vec unobserved)}
+          (empty? finals)  {:valid? :unknown :error "no final read in history"}
+          :else            {:valid? true})))))
+
 (defn filesystem-register-checker
-  "Per-key register checker. Knossos races its linear and WGL analyzers."
+  "Per-key register checker. Knossos races its linear and WGL analyzers; the
+   final-reads checker refuses to let a failed last read hide data loss."
   []
   (checker/compose
-    {:linear   (checker/linearizable {:model (model/register initial-value)})
-     :timeline (timeline/html)}))
+    {:linear      (checker/linearizable {:model (model/register initial-value)})
+     :final-reads (final-reads-checker)
+     :timeline    (timeline/html)}))
 
 (defn filesystem-register-workload
   "Builds the linearizable-register workload. Each independent key is one
