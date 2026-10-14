@@ -2216,7 +2216,14 @@ sections defer to is therefore two-sided:
   The `raft-engine` marker (the same file that already records the
   backend) has three forms: the legacy `etcd` form, the `txn-ledger` form,
   and the `txn-v2` form; the shipped binary rejects the last two at
-  startup (`ErrTxnFormatDowngrade`), the new binary reads all three. A
+  startup with the error it already has, `ErrUnsupportedRaftEngine`
+  wrapped as "invalid raft engine marker" (`readRaftEngineMarker` →
+  `parseRaftEngineType` in `multiraft_runtime.go`; the shipped binary has
+  no `ErrTxnFormatDowngrade` sentinel, so the rollout runbook and the
+  compatibility test match on that message, found in review), and the new
+  binary reads all three and raises `ErrTxnFormatDowngrade` itself when a
+  process pinned to V1 by the operator flag is started on a `txn-ledger`
+  or `txn-v2` directory. A
   process advertises `txn_v1_drain_ledger` or `txn_format_v2` only after
   it has persisted the downgrade-incompatible `txn-ledger` form, so a
   capability report that can satisfy either epoch is backed by durable
@@ -2272,7 +2279,8 @@ sections defer to is therefore two-sided:
   be served. This covers a follower that never proposes a V2 entry: its
   WAL may omit an already-applied V2 envelope on restart, so the fatal
   envelope alone cannot prevent a downgrade. A downgrade after V2
-  traffic fails loudly (`ErrTxnFormatDowngrade`) instead of applying V2
+  traffic fails loudly (`ErrUnsupportedRaftEngine` on the shipped binary,
+  `ErrTxnFormatDowngrade` on a V1-pinned new binary) instead of applying V2
   entries with V1 semantics, and the new binary refuses to start a group
   whose configured peers include a node without the capability while
   the marker says V2.
