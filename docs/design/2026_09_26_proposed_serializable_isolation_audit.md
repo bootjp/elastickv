@@ -560,10 +560,19 @@ serial order allows): `s` is then one fenced allocation from the
 coordinating leader's HLC (`NextFenced`, inside its lease and above
 every value the process observed), and each touched group advances to
 `s` on its first read, one Raft write per group once, since its
-watermark is nonzero from then on. Test: on a fresh store a reader of
-`a` then `b`, interleaved with a single-group transaction writing both,
-sees neither or both in every interleaving. The single-group
-`Coordinate` adds no barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
+watermark is nonzero from then on. The single-group `Coordinate` takes
+the same snapshot and the same advance (corrected in review: exempting
+it kept the apply-order hole open on a fresh store, where a writer that
+allocated `c` and stalled before proposing would land after a snapshot
+minted at `s > c` had read a key as absent, the zero watermark fencing
+nothing, and a later read at `s` would see the write); its one group
+advances to `s` once when `s` was minted above its watermark, and
+otherwise `s` is the watermark itself and no advance is proposed. Test:
+on a fresh store a reader of `a` then `b`, interleaved with a
+single-group transaction writing both, sees neither or both in every
+interleaving, through `ShardedCoordinator` and through `Coordinate`,
+including the writer that allocated its timestamp before the snapshot
+was minted and proposed after the first read). Forwarded reads use a new node-to-node `Internal.ForwardRead`
 RPC carrying a `ForwardedReadMode` and an authenticated **peer-only**
 bearer token. The token is a node-only secret from a required, non-empty
 `--internalTokenFile` (or the node-to-node mTLS the security milestone
