@@ -183,18 +183,18 @@ func (p *ProxyServer) handleQueuedCommand(conn redcon.Conn, state *proxyConnStat
 
 func (p *ProxyServer) handleWrite(conn redcon.Conn, cmd string, args [][]byte) {
 	resp, err := p.dual.Write(context.Background(), cmd, args)
-	writeResponse(conn, resp, err)
+	writeCommandResponse(conn, cmd, args, resp, err)
 }
 
 func (p *ProxyServer) handleRead(conn redcon.Conn, cmd string, args [][]byte) {
 	resp, err := p.dual.Read(context.Background(), cmd, args)
-	writeResponse(conn, resp, err)
+	writeCommandResponse(conn, cmd, args, resp, err)
 }
 
 func (p *ProxyServer) handleBlocking(conn redcon.Conn, cmd string, args [][]byte) {
 	// Use shutdownCtx so blocking commands are interrupted on graceful shutdown.
 	resp, err := p.dual.Blocking(p.shutdownCtx, cmd, args)
-	writeResponse(conn, resp, err)
+	writeCommandResponse(conn, cmd, args, resp, err)
 }
 
 func (p *ProxyServer) handlePubSub(conn redcon.Conn, name string, args [][]byte) {
@@ -316,15 +316,18 @@ func (p *ProxyServer) createShadowPubSub(cmdName string, channels []string) *sha
 	return shadow
 }
 
-func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) {
+const (
+	pingMessageArgCount = 2
+	helloProtoArgCount  = 2
+	subcommandArgCount  = 2
+	statusThirdArgCount = 3
+	setMinimumArgs      = 3
+)
 
+func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) {
 	// Handle PING locally for speed.
 	if name == cmdPing {
-		if len(args) > 1 {
-			conn.WriteBulk(args[1])
-		} else {
-			conn.WriteString("PONG")
-		}
+		writePingResponse(conn, args)
 		return
 	}
 
@@ -338,20 +341,7 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) 
 	// SELECT: accept only the configured DB; reject others since the proxy
 	// uses a shared connection pool and cannot maintain per-client DB state.
 	if name == cmdNameSELECT {
-		// Redis arity: SELECT <db>. Require exactly one DB argument.
-		if len(args) != selectArgCount {
-			conn.WriteError("ERR wrong number of arguments for 'select' command")
-			return
-		}
-
-		requestedDB := string(args[1])
-		configuredDB := fmt.Sprintf("%d", p.cfg.PrimaryDB)
-
-		if requestedDB != configuredDB {
-			conn.WriteError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", requestedDB, p.cfg.PrimaryDB))
-			return
-		}
-		conn.WriteString("OK")
+		p.writeSelectResponse(conn, args)
 		return
 	}
 
@@ -362,10 +352,11 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) 
 		return
 	}
 
-	// HELLO: reject to prevent RESP3 protocol upgrade, which the proxy
-	// (redcon, RESP2 only) cannot support.
+	// HELLO 2 is safe to forward: both the client and pooled upstream
+	// connections stay on RESP2. Options change per-connection state and
+	// cannot be forwarded through the shared upstream pool.
 	if name == "HELLO" {
-		conn.WriteError("ERR proxy does not support HELLO (RESP2 only)")
+		p.writeHelloResponse(conn, args)
 		return
 	}
 
@@ -373,17 +364,63 @@ func (p *ProxyServer) handleAdmin(conn redcon.Conn, name string, args [][]byte) 
 	writeAdminResponse(conn, name, args, resp, err)
 }
 
-func writeAdminResponse(w respWriter, name string, args [][]byte, resp any, err error) {
-	if name == "COMMAND" && len(args) > 1 && strings.EqualFold(string(args[1]), "DOCS") {
-		writeCommandDocsResponse(w, resp, err)
+func writePingResponse(conn redcon.Conn, args [][]byte) {
+	switch len(args) {
+	case 1:
+		conn.WriteString("PONG")
+	case pingMessageArgCount:
+		conn.WriteBulk(args[1])
+	default:
+		conn.WriteError("ERR wrong number of arguments for 'ping' command")
+	}
+}
+
+func (p *ProxyServer) writeSelectResponse(conn redcon.Conn, args [][]byte) {
+	if len(args) != selectArgCount {
+		conn.WriteError("ERR wrong number of arguments for 'select' command")
 		return
 	}
-	writeResponse(w, resp, err)
+	requestedDB := string(args[1])
+	if requestedDB != fmt.Sprintf("%d", p.cfg.PrimaryDB) {
+		conn.WriteError(fmt.Sprintf("ERR proxy does not support SELECT %s (configured DB: %d)", requestedDB, p.cfg.PrimaryDB))
+		return
+	}
+	conn.WriteString("OK")
+}
+
+func (p *ProxyServer) writeHelloResponse(conn redcon.Conn, args [][]byte) {
+	if len(args) > helloProtoArgCount || (len(args) == helloProtoArgCount && string(args[1]) != "2") {
+		conn.WriteError("ERR proxy supports HELLO 2 without options only")
+		return
+	}
+	resp, err := p.dual.Admin(context.Background(), "HELLO", args)
+	writeCommandResponse(conn, "HELLO", args, resp, err)
+}
+
+func writeAdminResponse(w respWriter, name string, args [][]byte, resp any, err error) {
+	if name == "COMMAND" {
+		if len(args) == 1 {
+			writeCommandInfoResponse(w, resp, err)
+			return
+		}
+		switch strings.ToUpper(string(args[1])) {
+		case "DOCS":
+			writeCommandDocsResponse(w, resp, err)
+			return
+		case "INFO":
+			writeCommandInfoResponse(w, resp, err)
+			return
+		case "GETKEYSANDFLAGS":
+			writeCommandGetKeysAndFlagsResponse(w, resp, err)
+			return
+		}
+	}
+	writeCommandResponse(w, name, args, resp, err)
 }
 
 func (p *ProxyServer) handleScript(conn redcon.Conn, name string, args [][]byte) {
 	resp, err := p.dual.Script(context.Background(), name, args)
-	writeResponse(conn, resp, err)
+	writeCommandResponse(conn, name, args, resp, err)
 }
 
 // Transaction handling
@@ -437,7 +474,7 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 		// Write the EXEC result (last command in the pipeline).
 		lastResult := results[len(results)-1]
 		resp, rErr := lastResult.Result()
-		writeResponse(conn, resp, rErr)
+		writeTxnResponse(conn, queue, resp, rErr)
 	default:
 		conn.WriteError("ERR empty transaction response")
 	}
@@ -470,6 +507,266 @@ func writeResponse(w respWriter, resp any, err error) {
 	writeRedisValue(w, resp)
 }
 
+// writeCommandResponse restores top-level RESP2 types that go-redis's generic
+// Cmd decoder represents as plain Go strings or redis.Nil.
+func writeCommandResponse(w respWriter, name string, args [][]byte, resp any, err error) {
+	if errors.Is(err, redis.Nil) && isNullArrayResponse(name) {
+		w.WriteArray(-1)
+		return
+	}
+	if err != nil {
+		writeResponse(w, nil, err)
+		return
+	}
+	writeCommandValue(w, name, args, resp)
+}
+
+func writeCommandValue(w respWriter, name string, args [][]byte, resp any) {
+	if name == "DEBUG" && writeDebugDigestValues(w, args, resp) {
+		return
+	}
+	if isScriptReturnCommand(name) {
+		writeScriptValue(w, resp)
+		return
+	}
+	if value, ok := resp.(string); ok {
+		if isSimpleStringCommand(name, args) || isACLDRYRUNSuccess(name, args, value) || isDefaultRoutedStatus(name, args, value) {
+			w.WriteString(value)
+			return
+		}
+	}
+	writeRedisValue(w, resp)
+}
+
+func writeScriptValue(w respWriter, resp any) {
+	switch value := resp.(type) {
+	case string:
+		if isStatusResponse(value) {
+			w.WriteString(value)
+		} else {
+			w.WriteBulkString(value)
+		}
+	case []any:
+		w.WriteArray(len(value))
+		for _, item := range value {
+			writeScriptValue(w, item)
+		}
+	default:
+		writeRedisValue(w, resp)
+	}
+}
+
+func writeDebugDigestValues(w respWriter, args [][]byte, resp any) bool {
+	if !hasSubcommand(args, "DIGEST-VALUE") {
+		return false
+	}
+	values, ok := resp.([]any)
+	if !ok {
+		return false
+	}
+	w.WriteArray(len(values))
+	for _, value := range values {
+		if digest, ok := value.(string); ok {
+			w.WriteString(digest)
+		} else {
+			writeRedisValue(w, value)
+		}
+	}
+	return true
+}
+
+// go-redis loses the RESP type of string values, including strings nested in
+// script result arrays. Preserve the prior status-token handling until the
+// primary transport can expose the upstream RESP type directly.
+func isScriptReturnCommand(name string) bool {
+	switch name {
+	case cmdEval, cmdEvalSHA, cmdEvalRO, cmdEvalSHARO, "FCALL", "FCALL_RO":
+		return true
+	default:
+		return false
+	}
+}
+
+func isStatusResponse(s string) bool {
+	switch s {
+	case "OK", "QUEUED", "PONG":
+		return true
+	default:
+		return false
+	}
+}
+
+// Unlisted commands are forwarded as writes. Preserve the status-token
+// behavior they had before the RESP2 bulk-string fix; their reply schema is
+// unavailable to the parsed proxy after go-redis decodes the upstream frame.
+func isDefaultRoutedStatus(name string, args [][]byte, value string) bool {
+	if _, known := commandTable[name]; known || len(args) == 0 {
+		return false
+	}
+	return ClassifyCommand(name, args[1:]) == CmdWrite && isStatusResponse(value)
+}
+
+func isACLDRYRUNSuccess(name string, args [][]byte, value string) bool {
+	return name == "ACL" && hasSubcommand(args, "DRYRUN") && value == "OK"
+}
+
+func isNullArrayResponse(name string) bool {
+	switch name {
+	case cmdNameBLPOP, cmdNameBRPOP, cmdNameBZPOPMIN, cmdNameBZPOPMAX, cmdNameXREAD, cmdNameXREADGROUP, "EXEC":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSimpleStringCommand(name string, args [][]byte) bool {
+	if name == "PING" {
+		return len(args) == 1
+	}
+	if isFixedSimpleStringCommand(name) {
+		return true
+	}
+	if name == "SET" {
+		return setReturnsStatus(args)
+	}
+	return isSimpleStringSubcommand(name, args)
+}
+
+func isSimpleStringSubcommand(name string, args [][]byte) bool {
+	switch name {
+	case "CLIENT":
+		return isSimpleClientSubcommand(args)
+	case cmdScript:
+		return hasSubcommand(args, "FLUSH", "KILL", "DEBUG")
+	case "FUNCTION":
+		return hasSubcommand(args, "FLUSH", "KILL", "DELETE", "RESTORE")
+	case "XGROUP":
+		return hasSubcommand(args, "CREATE", "SETID")
+	default:
+		return isSimpleAdminSubcommand(name, args)
+	}
+}
+
+func isSimpleClientSubcommand(args [][]byte) bool {
+	if hasSubcommand(args, "SETNAME", "SETINFO", "PAUSE", "UNPAUSE", "TRACKING", "CACHING", "NO-EVICT", "NO-TOUCH") {
+		return true
+	}
+	return len(args) == statusThirdArgCount && (hasSubcommand(args, "KILL") ||
+		(hasSubcommand(args, "REPLY") && strings.EqualFold(string(args[2]), "ON")))
+}
+
+func isSimpleAdminSubcommand(name string, args [][]byte) bool {
+	switch name {
+	case "CONFIG":
+		return hasSubcommand(args, "SET", "RESETSTAT", "REWRITE")
+	case "ACL":
+		return isSimpleACLSubcommand(args)
+	case "MODULE":
+		return hasSubcommand(args, "LOAD", "LOADEX", "UNLOAD")
+	case "SLOWLOG":
+		return hasSubcommand(args, "RESET")
+	case "MEMORY":
+		return hasSubcommand(args, "PURGE")
+	case "CLUSTER":
+		return hasSubcommand(args, "ADDSLOTS", "ADDSLOTSRANGE", "DELSLOTS", "DELSLOTSRANGE", "FAILOVER", "FLUSHSLOTS", "FORGET", "MEET", "REPLICATE", "RESET", "SAVECONFIG", "SET-CONFIG-EPOCH", "SETSLOT")
+	case "DEBUG":
+		return isSimpleDebugSubcommand(args)
+	default:
+		return false
+	}
+}
+
+// DEBUG has both simple-string diagnostics and bulk-string data responses.
+// These subcommands use addReplyStatus or shared.ok in Redis 8.10.1.
+func isSimpleDebugSubcommand(args [][]byte) bool {
+	if len(args) < subcommandArgCount {
+		return false
+	}
+	switch strings.ToUpper(string(args[1])) {
+	case "OOM", "KEYSIZES-HIST-ASSERT", "ALLOCSIZE-SLOTS-ASSERT", "LOG", "LEAK", "RELOAD", "LOADAOF",
+		"DROP-CLUSTER-PACKET-FILTER", "OBJECT", "SDSLEN", "LISTPACK", "QUICKLIST", "POPULATE", "DIGEST",
+		"SLEEP", "SET-ACTIVE-EXPIRE", "SET-ALLOW-ACCESS-EXPIRED", "QUICKLIST-PACKED-THRESHOLD",
+		"SET-SKIP-CHECKSUM-VALIDATION", "ENABLE-KEYMETA-RUNTIME-REGISTRATION", "AOF-FLUSH-SLEEP",
+		"REPLICATE", "CHANGE-REPL-ID", "STRINGMATCH-TEST", "SET-DISABLE-DENY-SCRIPTS",
+		"CONFIG-REWRITE-FORCE-ALL", "PAUSE-CRON", "REPLYBUFFER", "REPLY-COPY-AVOIDANCE",
+		"REPL-PAUSE", "DICT-RESIZING", "SCRIPT", "MARK-INTERNAL-CLIENT", "ASM-FAILPOINT", "ASM-TRIM-METHOD":
+		return true
+	default:
+		return false
+	}
+}
+
+func isSimpleACLSubcommand(args [][]byte) bool {
+	return hasSubcommand(args, "SETUSER", "SAVE", "LOAD") ||
+		(len(args) == statusThirdArgCount && hasSubcommand(args, "LOG") && strings.EqualFold(string(args[2]), "RESET"))
+}
+
+func setReturnsStatus(args [][]byte) bool {
+	if len(args) < setMinimumArgs {
+		return false
+	}
+	for i := setMinimumArgs; i < len(args); i++ {
+		option := strings.ToUpper(string(args[i]))
+		if option == "GET" {
+			return false
+		}
+		if setOptionHasValue(option) {
+			i++
+		}
+	}
+	return true
+}
+
+func setOptionHasValue(option string) bool {
+	switch option {
+	case "EX", "PX", "EXAT", "PXAT", "IFEQ", "IFNE", "IFDEQ", "IFDNE":
+		return true
+	default:
+		return false
+	}
+}
+
+func hasSubcommand(args [][]byte, names ...string) bool {
+	if len(args) < subcommandArgCount {
+		return false
+	}
+	for _, name := range names {
+		if strings.EqualFold(string(args[1]), name) {
+			return true
+		}
+	}
+	return false
+}
+
+func isFixedSimpleStringCommand(name string) bool {
+	switch name {
+	case "TYPE", "SETEX", "PSETEX", "MSET", "HMSET", "LSET", "LTRIM", "RENAME", "RESTORE", "PFMERGE", "FLUSHALL", "FLUSHDB", "SWAPDB", "WATCH", "UNWATCH", "RESET", "SAVE", "BGSAVE", "BGREWRITEAOF", "REPLICAOF", "SLAVEOF", "MIGRATE", "READONLY", "READWRITE", "ASKING", "REPLCONF", "RESTORE-ASKING", "FAILOVER":
+		return true
+	default:
+		return false
+	}
+}
+
+func writeTxnResponse(w respWriter, queue [][][]byte, resp any, err error) {
+	if err != nil {
+		writeCommandResponse(w, "EXEC", nil, nil, err)
+		return
+	}
+	values, ok := resp.([]any)
+	if !ok || len(values) != len(queue) {
+		writeRedisValue(w, resp)
+		return
+	}
+	w.WriteArray(len(values))
+	for i, value := range values {
+		if len(queue[i]) == 0 {
+			writeRedisValue(w, value)
+			continue
+		}
+		writeCommandValue(w, strings.ToUpper(string(queue[i][0])), queue[i], value)
+	}
+}
+
 // writeRedisError writes an upstream error to the client.
 // go-redis redis.Error values already carry the Redis prefix (e.g. "ERR ...", "WRONGTYPE ...").
 // Other errors (timeouts, dial failures) are normalized to "ERR ..." to produce valid RESP.
@@ -490,11 +787,7 @@ func writeRedisValue(w respWriter, val any) {
 	}
 	switch v := val.(type) {
 	case string:
-		if isStatusResponse(v) {
-			w.WriteString(v)
-		} else {
-			w.WriteBulkString(v)
-		}
+		w.WriteBulkString(v)
 	case int64:
 		w.WriteInt64(v)
 	case []any:
@@ -508,17 +801,6 @@ func writeRedisValue(w respWriter, val any) {
 		w.WriteError(v.Error())
 	default:
 		w.WriteBulkString(fmt.Sprintf("%v", v))
-	}
-}
-
-// isStatusResponse detects known Redis status reply strings that should be
-// sent as simple strings (+OK) rather than bulk strings ($2\r\nOK).
-func isStatusResponse(s string) bool {
-	switch s {
-	case "OK", "QUEUED", "PONG":
-		return true
-	default:
-		return false
 	}
 }
 

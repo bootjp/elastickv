@@ -129,11 +129,11 @@ func TestCommandNoArgs_ReturnsAllEntries(t *testing.T) {
 func TestCommandInfo_Get(t *testing.T) {
 	t.Parallel()
 	conn := runCommand(t, "COMMAND", "INFO", "GET")
-	// outer array of 1 + 6-element inner.
+	// outer array of 1 + 10-element inner.
 	require.Equal(t, "array", conn.writes[0].op)
 	require.Equal(t, 1, conn.writes[0].n)
 	require.Equal(t, "array", conn.writes[1].op)
-	require.Equal(t, 6, conn.writes[1].n)
+	require.Equal(t, 10, conn.writes[1].n)
 	require.Equal(t, "bulk", conn.writes[2].op)
 	require.Equal(t, "get", conn.writes[2].s)
 	require.Equal(t, "int", conn.writes[3].op)
@@ -158,7 +158,7 @@ func TestCommandInfo_Set(t *testing.T) {
 	require.Equal(t, "array", conn.writes[0].op)
 	require.Equal(t, 1, conn.writes[0].n)
 	require.Equal(t, "array", conn.writes[1].op)
-	require.Equal(t, 6, conn.writes[1].n)
+	require.Equal(t, 10, conn.writes[1].n)
 	require.Equal(t, "set", conn.writes[2].s)
 	require.Equal(t, int64(-3), conn.writes[3].i)
 	require.Equal(t, "array", conn.writes[4].op)
@@ -189,17 +189,18 @@ func TestCommandInfo_MixedKnownUnknown(t *testing.T) {
 	require.Equal(t, 3, conn.writes[0].n)
 	// first entry: 6-element GET array header.
 	require.Equal(t, "array", conn.writes[1].op)
-	require.Equal(t, 6, conn.writes[1].n)
+	require.Equal(t, 10, conn.writes[1].n)
 	// Walk past GET: outer-array-header(1) + inner-array-header(1) + name(1)
-	// + arity(1) + flags-header(1) + flagN flag strings + 3 ints.
+	// + arity(1) + flags-header(1) + flagN flag strings + 3 ints
+	// + categories, tips, key-specs and subcommands arrays.
 	flagN := conn.writes[4].n
-	cursor := 5 + flagN + 3
+	cursor := 5 + flagN + 3 + 4
 	// cursor now at NOSUCH → must be nil.
 	require.Equal(t, "null", conn.writes[cursor].op)
 	cursor++
 	// SET entry: 6-element header then its fields.
 	require.Equal(t, "array", conn.writes[cursor].op)
-	require.Equal(t, 6, conn.writes[cursor].n)
+	require.Equal(t, 10, conn.writes[cursor].n)
 	require.Equal(t, "set", conn.writes[cursor+1].s)
 }
 
@@ -317,18 +318,20 @@ func TestCommandDocs_Get(t *testing.T) {
 	t.Parallel()
 	conn := runCommand(t, "COMMAND", "DOCS", "GET")
 	// RESP2 flat-map shape: outer array of 2 (name + doc-map pair),
-	// then a name bulk string, then a 4-element map-shaped doc-map.
+	// then a name bulk string, then a 6-element map-shaped doc-map.
 	require.Equal(t, "array", conn.writes[0].op)
 	require.Equal(t, 2, conn.writes[0].n, "outer array must be (name, docs) pair")
 	require.Equal(t, "bulk", conn.writes[1].op)
 	require.Equal(t, "get", conn.writes[1].s)
 	require.Equal(t, "array", conn.writes[2].op)
-	require.Equal(t, 4, conn.writes[2].n)
+	require.Equal(t, 6, conn.writes[2].n)
 	require.Equal(t, "summary", conn.writes[3].s)
 	require.Equal(t, "", conn.writes[4].s)
-	require.Equal(t, "arguments", conn.writes[5].s)
-	require.Equal(t, "array", conn.writes[6].op)
-	require.Equal(t, 0, conn.writes[6].n)
+	require.Equal(t, "group", conn.writes[5].s)
+	require.Equal(t, "string", conn.writes[6].s)
+	require.Equal(t, "arguments", conn.writes[7].s)
+	require.Equal(t, "array", conn.writes[8].op)
+	require.Equal(t, 0, conn.writes[8].n)
 }
 
 // TestCommandDocs_BareReturnsAllDocs pins that bare COMMAND DOCS
@@ -345,28 +348,19 @@ func TestCommandDocs_BareReturnsAllDocs(t *testing.T) {
 	wantOuterLen := len(routedRedisCommandMetas()) * 2
 	require.Equal(t, wantOuterLen, conn.writes[0].n,
 		"bare COMMAND DOCS must emit (name, docs) for every routed command")
-	// First pair: name bulk, then 4-element doc map.
+	// First pair: name bulk, then 6-element doc map.
 	require.Equal(t, "bulk", conn.writes[1].op)
 	require.NotEmpty(t, conn.writes[1].s)
 	require.Equal(t, "array", conn.writes[2].op)
-	require.Equal(t, 4, conn.writes[2].n)
+	require.Equal(t, 6, conn.writes[2].n)
 	require.Equal(t, "summary", conn.writes[3].s)
 }
 
-// TestCommandDocs_UnknownReturnsNamedNil pins the Redis "unknown
-// command" shape for DOCS: the requested name key is still written
-// (preserving the flat-map layout) but its value is nil. A client
-// decoding the response as a map then sees `"FOO" -> nil`, which is
-// the canonical "we acknowledged your question, we just have no
-// entry" reply.
-func TestCommandDocs_UnknownReturnsNamedNil(t *testing.T) {
+// Redis omits unknown names from COMMAND DOCS's flat map.
+func TestCommandDocs_UnknownIsOmitted(t *testing.T) {
 	t.Parallel()
 	conn := runCommand(t, "COMMAND", "DOCS", "NOSUCH")
-	require.Equal(t, "array", conn.writes[0].op)
-	require.Equal(t, 2, conn.writes[0].n)
-	require.Equal(t, "bulk", conn.writes[1].op)
-	require.Equal(t, "NOSUCH", conn.writes[1].s)
-	require.Equal(t, "null", conn.writes[2].op)
+	require.Equal(t, []commandRecorderEntry{{op: "array", n: 0}}, conn.writes)
 }
 
 func TestCommand_UnknownSubcommand(t *testing.T) {

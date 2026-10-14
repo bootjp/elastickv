@@ -1568,7 +1568,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 	lastFullCheck := time.Now()
 	for {
 		if handlerCtx.Err() != nil {
-			conn.WriteNull()
+			conn.WriteArray(-1)
 			return
 		}
 		var done bool
@@ -1585,7 +1585,7 @@ func (r *RedisServer) bzpopminWaitLoop(conn redcon.Conn, keys [][]byte, deadline
 			lastFullCheck = time.Now()
 		}
 		if !time.Now().Before(deadline) {
-			conn.WriteNull()
+			conn.WriteArray(-1)
 			return
 		}
 		signaled := waitForBlockedCommandUpdate(handlerCtx, w, deadline, r.blockWaitFallback)

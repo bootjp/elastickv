@@ -194,22 +194,25 @@ func (r *RedisServer) command(conn redcon.Conn, cmd redcon.Command) {
 	}
 }
 
-// writeCommandInfoEntry emits the 6-element per-command info array for a
-// single command. Redis 7 extends this to 10 elements; we deliberately
-// stop at 6 because every client we care about parses the first 6 fields
-// and ignores trailing elements.
+// writeCommandInfoEntry emits the Redis 7+ per-command info array.
 func writeCommandInfoEntry(conn redcon.Conn, meta redisCommandMeta) {
-	const infoArity = 6
+	const infoArity = 10
 	conn.WriteArray(infoArity)
 	conn.WriteBulkString(meta.Name)
 	conn.WriteInt(meta.Arity)
 	conn.WriteArray(len(meta.Flags))
 	for _, f := range meta.Flags {
-		conn.WriteBulkString(f)
+		conn.WriteString(f)
 	}
 	conn.WriteInt(meta.FirstKey)
 	conn.WriteInt(meta.LastKey)
 	conn.WriteInt(meta.Step)
+	// Categories, tips, key specs and subcommands have independent array slots.
+	// The legacy key positions above remain available to clients.
+	conn.WriteArray(0)
+	conn.WriteArray(0)
+	conn.WriteArray(0)
+	conn.WriteArray(0)
 }
 
 func (r *RedisServer) writeCommandInfoAll(conn redcon.Conn) {
@@ -248,22 +251,17 @@ func (r *RedisServer) writeCommandInfo(conn redcon.Conn, requested [][]byte) {
 }
 
 // writeCommandDocs emits the RESP2 flat-map form of COMMAND DOCS:
-// alternating command-name keys and 4-element doc-maps with "summary"
-// and "arguments" fields. Two compliance-critical behaviours:
+// alternating command-name keys and doc maps. Two compliance-critical behaviours:
 //
 //  1. Bare `COMMAND DOCS` (no names) returns docs for ALL routed
 //     commands, identical to how `COMMAND INFO` and bare `COMMAND`
 //     behave. Clients/tools like redis-cli --docs rely on this.
-//  2. Every requested entry writes BOTH the command-name key AND the
-//     doc map value. Clients decode the top-level array as a map of
-//     name -> docs, so skipping the name key makes the reply
-//     unparseable. Unknown commands emit the requested name followed
-//     by nil (Redis semantics).
+//  2. Known entries write BOTH the command-name key AND the doc map value.
+//     Unknown names are omitted, matching Redis's flat-map response.
 //
 // We do not maintain per-command docs, so summary is "" and arguments
 // is empty. The wire-shape is what clients care about at connect time.
 func (r *RedisServer) writeCommandDocs(conn redcon.Conn, requested [][]byte) {
-	const docEntryLen = 4
 	// Bare DOCS (no command names): iterate the routed set so the
 	// reply mirrors `COMMAND` / `COMMAND INFO` / `COMMAND LIST`.
 	if len(requested) == 0 {
@@ -271,35 +269,81 @@ func (r *RedisServer) writeCommandDocs(conn redcon.Conn, requested [][]byte) {
 		// Two wire slots per command (name + doc map).
 		conn.WriteArray(len(metas) * 2) //nolint:mnd // 2 = (name, docs) pair
 		for _, meta := range metas {
-			conn.WriteBulkString(meta.Name)
-			conn.WriteArray(docEntryLen)
-			conn.WriteBulkString("summary")
-			conn.WriteBulkString("")
-			conn.WriteBulkString("arguments")
-			conn.WriteArray(0)
+			writeCommandDocEntry(conn, meta)
 		}
 		return
 	}
-	// Explicit names: preserve the caller-supplied order so a client
-	// that expects its own request ordering back (e.g. for building a
-	// lookup table) is not surprised. Each pair is (name, docs) or
-	// (name, nil) for unknowns.
-	conn.WriteArray(len(requested) * 2) //nolint:mnd // 2 = (name, docs) pair
+	known := make([]redisCommandMeta, 0, len(requested))
 	for _, raw := range requested {
-		name := string(raw)
-		meta, ok := redisCommandTable[strings.ToUpper(name)]
-		if !ok {
-			conn.WriteBulkString(name)
-			conn.WriteNull()
-			continue
+		if meta, ok := redisCommandTable[strings.ToUpper(string(raw))]; ok {
+			known = append(known, meta)
 		}
-		conn.WriteBulkString(meta.Name)
-		conn.WriteArray(docEntryLen)
-		conn.WriteBulkString("summary")
-		conn.WriteBulkString("")
-		conn.WriteBulkString("arguments")
-		conn.WriteArray(0)
 	}
+	conn.WriteArray(len(known) * 2) //nolint:mnd // 2 = (name, docs) pair
+	for _, meta := range known {
+		writeCommandDocEntry(conn, meta)
+	}
+}
+
+func writeCommandDocEntry(conn redcon.Conn, meta redisCommandMeta) {
+	const docEntryLen = 6
+	conn.WriteBulkString(meta.Name)
+	conn.WriteArray(docEntryLen)
+	conn.WriteBulkString("summary")
+	conn.WriteBulkString("")
+	conn.WriteBulkString("group")
+	conn.WriteBulkString(redisCommandGroup(meta.Name))
+	conn.WriteBulkString("arguments")
+	conn.WriteArray(0)
+}
+
+const (
+	redisCommandNameCommand = "command"
+)
+
+func redisCommandGroup(name string) string {
+	if group, ok := redisCommandFixedGroup(name); ok {
+		return group
+	}
+	switch name[0] {
+	case 'h':
+		return "hash"
+	case 'l', 'r':
+		return "list"
+	case 's':
+		return setKind
+	case 'x':
+		return "stream"
+	case 'z':
+		return "sorted-set"
+	case 'p':
+		if strings.HasPrefix(name, "pf") {
+			return "hyperloglog"
+		}
+	}
+	return "generic"
+}
+
+func redisCommandFixedGroup(name string) (string, bool) {
+	switch name {
+	case "get", "getdel", setKind, "setex", "setnx", "incr":
+		return "string", true
+	case "bzpopmin", "elastickv.zremfast":
+		return "sorted-set", true
+	case "client", "hello", "ping", "quit", "select":
+		return "connection", true
+	case redisCommandNameCommand, "dbsize", "info", "flushall", "flushdb", "flushlegacy":
+		return "server", true
+	case "eval", "evalsha":
+		return "scripting", true
+	case "multi", "exec", "discard":
+		return "transactions", true
+	case "publish", "pubsub", "subscribe":
+		return "pubsub", true
+	case "rename", "scan":
+		return "generic", true
+	}
+	return "", false
 }
 
 // writeCommandGetKeys dispatches COMMAND GETKEYS for a given subcommand
@@ -480,8 +524,13 @@ func (r *RedisServer) hello(conn redcon.Conn, cmd redcon.Command) {
 }
 
 func (r *RedisServer) selectDB(conn redcon.Conn, cmd redcon.Command) {
-	if _, err := strconv.Atoi(string(cmd.Args[1])); err != nil {
+	db, err := strconv.Atoi(string(cmd.Args[1]))
+	if err != nil {
 		conn.WriteError("ERR invalid DB index")
+		return
+	}
+	if db != 0 {
+		conn.WriteError("ERR DB index is out of range")
 		return
 	}
 	conn.WriteString("OK")
