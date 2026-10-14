@@ -1341,9 +1341,36 @@ Constraints the fix PR must close before merge:
   waits until every read lock in the range is released or resolved, with
   the same TTL-bounded wait; a read lock is never transferred (a
   transaction that spans the cutover is aborted by its own COMMIT finding
-  the range moved, as today). Until that lands, deployments running hotspot
-  M2 migrations are excluded from the serializability claim (§6.1 of the
-  roadmap). Implementation on `design/serializable-audit-a2-migration-drain`.
+  the range moved, as today). **The drain covers only transactions that
+  have already PREPAREd (found in review).** A cutover can land after an
+  adapter fenced or read the old owner and before its PREPARE, when no
+  lock exists to drain; `maybeAutoPinObservedRouteVersion`
+  (`kv/sharded_coordinator.go`) deliberately leaves requests that carry
+  `ReadKeys` or a caller-supplied `StartTS` unpinned, and the DynamoDB,
+  S3, SQS, and filesystem paths that do not set `ObservedRouteVersion`
+  themselves flow with version 0, so the Composed-1 gate short-circuits
+  and the transaction can PREPARE on the new owner while carrying an
+  old-owner snapshot; a target-side version imported at `commitTS ≤
+  StartTS` is invisible to the `latest > StartTS` predicate, so OCC cannot
+  catch it either. Decision: the catalog pin the A0 snapshot read path
+  uses for `TransactGetItems` applies to every read-write operation. The
+  adapter resolves its groups from one `RouteEngine` snapshot and carries
+  that version on its reads, its PREPAREs, and its COMMIT: every
+  transactional path sets `ObservedRouteVersion` from the snapshot it read
+  at, the auto-pin exemptions for `ReadKeys` and a caller-supplied
+  `StartTS` go away (a pinned read set is exactly what the gate must
+  protect), and the resolver-routed exemption stays until the M5
+  resolver-aware gate, which keeps resolver-routed keys outside the claim.
+  The FSM rejects a PREPARE or one-phase entry whose pinned version
+  predates a cutover that moved any of its keys **or read keys** (the
+  existing Composed-1 fence, extended to read keys), and the coordinator
+  restarts the whole operation on a fresh snapshot (bounded retries).
+  Tests: a cutover between the read and the PREPARE of a read-write
+  transaction is rejected and restarted; a resolver-routed transaction is
+  documented as outside the claim. Until both the drain and the pin land,
+  deployments running hotspot M2 migrations are excluded from the
+  serializability claim (§6.1 of the roadmap). Implementation on
+  `design/serializable-audit-a2-migration-drain`.
 - **Cost.** A read-only shard now takes two Raft entries (PREPARE, COMMIT)
   where it took one read barrier; the earlier "one entry" estimate is wrong.
 - **Behaviour change.** A read key routing to a group the coordinator does
@@ -2037,15 +2064,22 @@ sections defer to is therefore two-sided:
   its applied index reaches its commit index before proposing any
   membership change, so it reasons from the log it has already applied. **Activation drains V1 work before the
   guarantees are claimed.** Once the activation entry applies on a group,
-  that group's FSM rejects a V1 PREPARE and a V1 one-phase entry (the
-  coordinator treats rejection as a pause and retry signal, waits until
-  the V2 activation epoch has applied on every participant group,
-  revalidates membership and capability, and then restarts the entire
-  transaction as V2; it sends no V2 entry to any participant before this
-  barrier; a delayed V1 one-phase entry can no longer bypass the fence,
-  and a V1 transaction that read before
-  activation can no longer lock after it, which is the G1 shape a V1
-  PREPARE racing a V2 one-phase transaction would reopen), and does not
+  that group's FSM rejects every V1 **mutating** entry: a V1 PREPARE, a V1
+  one-phase entry, and (found in review) a V1 raw `PUT` / `DEL` or
+  `DEL_PREFIX` entry, which are separate non-transactional apply paths
+  whose V1 semantics carry no apply-order fence, no foreign-read-lock
+  check, and no `DEL_PREFIX` lock check, so a V1 raw entry proposed before
+  activation and applied after it could write a key under a V2
+  transaction's read lock and recreate the raw-write cycle recorded under
+  A2 (the coordinator treats every such rejection as a pause and retry
+  signal, waits until the V2 activation epoch has applied on every
+  participant group, revalidates membership and capability, and then
+  restarts the entire transaction, or re-proposes the raw write, as V2; it
+  sends no V2 entry to any participant before this barrier; a delayed V1
+  one-phase or raw entry can no longer bypass the fence, and a V1
+  transaction that read before activation can no longer lock after it,
+  which is the G1 shape a V1 PREPARE racing a V2 one-phase transaction
+  would reopen), and does not
   let an in-flight V1 transaction **commit** under V1 semantics either,
   since those semantics carry the reproduced G12 and G14 failures (an
   aliased or half-prepared V1 transaction whose COMMIT publishes the
@@ -2070,8 +2104,19 @@ sections defer to is therefore two-sided:
   record written since activation has had its secondaries confirmed. That
   confirmation is a durable Raft-replicated drain ledger. Every V1
   transaction admitted after the ledger-aware epoch records its stable
-  identity, primary group, and complete participant set before PREPARE,
-  then replicates its decision and each secondary confirmation. The V1
+  identity, primary group, and complete participant set **in the primary
+  group's PREPARE entry, atomically with the primary lock** (found in
+  review: a row committed before PREPARE would be orphaned by a
+  coordinator crash right after it, with no lock, commit record, or
+  rollback to make it terminal, and the gate below would then block the
+  upgrade for good). The row therefore exists exactly when the primary
+  lock does: a crash before the primary PREPARE leaves nothing, and a
+  crash after it leaves a lock the resolver already settles (TTL expiry,
+  rollback), whose settlement makes the row terminal in the same entry; a
+  secondary PREPARE carries the primary identity and is fenced by the
+  existing primary-lock check once the primary has rolled back. The
+  transaction then replicates its decision and each secondary
+  confirmation. The V1
   legacy identity `(primaryKey, StartTS)` is reserved on the primary group
   until the ledger row is terminal and fully confirmed, so an aliased V1
   transaction cannot take over an outstanding outcome. The primary COMMIT
@@ -2087,7 +2132,10 @@ sections defer to is therefore two-sided:
   crashing the coordinator after a primary decision and before secondary
   publication:
   restart must reconstruct the pending participant and keep V2 out of effect
-  until confirmation is replicated. This verifies outcomes, rather than
+  until confirmation is replicated; and by crashing it between the primary
+  PREPARE and the secondary PREPAREs: the orphaned primary lock expires,
+  the resolver rolls it back, the row becomes terminal with the rollback,
+  and a delayed secondary PREPARE is fenced. This verifies outcomes, rather than
   inferring them from an empty lock namespace. A V1 transaction that
   completed in a partial state
   before activation is pre-existing damage that activation cannot detect;
