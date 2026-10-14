@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 
+	"github.com/bootjp/elastickv/store"
 	cockroachdberr "github.com/cockroachdb/errors"
 )
 
@@ -259,6 +260,14 @@ func readOneEntry(
 	value, err := readEntryValue(r, valBuf)
 	if err != nil {
 		return false, err
+	}
+	// A snapshot taken from a live Pebble store carries the store's
+	// reserved metadata keys (`_meta_last_commit_ts` and its siblings)
+	// next to the MVCC versions. They have neither the inverted-timestamp
+	// key suffix nor the value header, so decoding one fails the whole
+	// read; they carry no user data, so the reader skips them.
+	if store.IsPebbleOperationalKey(key) {
+		return false, nil
 	}
 	entry, err := decodeSnapshotEntry(key, value)
 	if err != nil {
