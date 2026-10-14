@@ -612,6 +612,16 @@
      :final-reads (final-reads-checker)
      :timeline    (timeline/html)}))
 
+(defn register-key-generator
+  "Per-key op stream: exactly max-writes writes (values 0..max-writes-1)
+   mixed with at most as many reads, so --max-writes-per-key really bounds
+   the writes a key receives and the key exhausts (handing its threads to the
+   next key) once they are done. A limit over the mixed stream would instead
+   cap reads and writes together and leave the write count to chance."
+  [max-writes]
+  (gen/mix [(map (fn [v] {:f :write :value v}) (range max-writes))
+            (gen/limit max-writes (gen/repeat {:f :read}))]))
+
 (defn filesystem-register-workload
   "Builds the linearizable-register workload. Each independent key is one
    file under <mount>/jepsen; threads-per-key concurrent workers hammer each
@@ -632,10 +642,7 @@
      :generator (independent/concurrent-generator
                   threads-per-key
                   (range key-count)
-                  (fn [_k]
-                    (->> (gen/mix [(map (fn [v] {:f :write :value v}) (range))
-                                  (gen/repeat {:f :read})])
-                         (gen/limit max-writes))))
+                  (fn [_k] (register-key-generator max-writes)))
      :checker   (independent/checker
                   (filesystem-register-checker))}))
 

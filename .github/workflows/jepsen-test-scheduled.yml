@@ -73,15 +73,20 @@ jobs:
           key: ${{ runner.os }}-maven-${{ hashFiles('jepsen/project.clj') }}
           restore-keys: |
             ${{ runner.os }}-maven-
-      - name: Pre-fetch Go modules and build binary
-        # The binary serves the filesystem stress phase below: the demo
-        # cluster (cmd/server/demo.go) has no --filesystemMount, so the FUSE
-        # workload runs against three real server processes instead.
+      - name: Pre-fetch Go modules and build binaries
+        # The demo cluster is built rather than started through `go run`:
+        # `go run` execs the compiled program as a child and does not forward
+        # SIGTERM to it, so killing the recorded `go run` PID would leave the
+        # demo listening and block the filesystem cluster below. The server
+        # binary serves that filesystem stress phase: the demo cluster
+        # (cmd/server/demo.go) has no --filesystemMount, so the FUSE workload
+        # runs against three real server processes instead.
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
           GOPATH=$(go env GOPATH)
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
+          go build -o /tmp/elastickv-demo ./cmd/server
           go build -o /tmp/elastickv-bin .
       # Warm the Maven cache up front so unit tests / workloads start
       # against a populated ~/.m2. `lein deps` is wrapped with a retry
@@ -111,9 +116,7 @@ jobs:
       - name: Launch demo cluster
         run: |
           set -euo pipefail
-          mkdir -p "$GOCACHE" /tmp/go-tmp
-          export GOTMPDIR=/tmp/go-tmp
-          nohup go run cmd/server/demo.go > /tmp/elastickv-demo.log 2>&1 &
+          nohup /tmp/elastickv-demo > /tmp/elastickv-demo.log 2>&1 &
           echo $! > /tmp/elastickv-demo.pid
 
           echo "Waiting for redis (63791-63793), dynamo (63801-63803), and s3 (63901-63903) listeners..."
@@ -241,6 +244,9 @@ jobs:
         # single-process demo cluster does not offer, so it runs against a
         # real-binary cluster on the same ports once the demo is down. The
         # demo keeps its Raft state in memory; nothing is lost by stopping it.
+        # The PID is the demo binary itself (not a `go run` wrapper), so the
+        # listeners close with it; the loop below confirms that before the
+        # ports are reused.
         run: |
           if [ -f /tmp/elastickv-demo.pid ]; then
             pid=$(cat /tmp/elastickv-demo.pid)

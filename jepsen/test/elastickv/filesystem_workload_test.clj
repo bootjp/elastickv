@@ -4,6 +4,7 @@
             [clojure.test :refer :all]
             [jepsen.checker :as checker]
             [jepsen.client :as client]
+            [jepsen.generator :as gen]
             [jepsen.history :as history]
             [jepsen.independent :as independent]
             [elastickv.filesystem-workload :as workload])
@@ -186,6 +187,28 @@
 (deftest unknown-write-mode-is-rejected
   (is (thrown? clojure.lang.ExceptionInfo
                (workload/elastickv-filesystem-test {:write-mode :truncate}))))
+
+(defn- drain-generator
+  "Pulls every op out of a pure (seq/limit/repeat/mix) generator with a
+   fixed context; nothing here blocks on completions."
+  [g]
+  (let [test {:concurrency 2}
+        ctx  (gen/context test)]
+    (loop [g g, ops []]
+      (let [[op g'] (gen/op g test ctx)]
+        (if (or (nil? op) (= :pending op))
+          ops
+          (recur g' (conj ops op)))))))
+
+(deftest key-generator-issues-exactly-max-writes-writes
+  (dotimes [_ 5]
+    (let [ops    (drain-generator (workload/register-key-generator 25))
+          writes (filter #(= :write (:f %)) ops)
+          reads  (filter #(= :read (:f %)) ops)]
+      (is (= 25 (count writes)))
+      (is (= (range 25) (map :value writes)))
+      (is (<= 1 (count reads) 25))
+      (is (= (count ops) (+ (count writes) (count reads)))))))
 
 (deftest final-read-ops-cover-every-register
   (let [ops (workload/final-read-ops 3)]
