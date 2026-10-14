@@ -167,8 +167,14 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   allocator over the leader's HLC plus a batch allocator that hands out
   slots from committed windows. (`docs/design/2026_04_16_implemented_centralized_tso.md`)
 - **Phase D** — The TSO mode in which the group-0 leader is the only issuer
-  of persistence timestamps and writes may persist only at timestamps the
-  TSO durably handed out. (`docs/design/2026_08_29_proposed_tso_batch_slot_claims.md`)
+  of persistence timestamps. Target, not current, behaviour: writes may
+  persist only at timestamps the TSO durably handed out. Today
+  `RaftTSOAllocator.ValidateDurableTimestamp` accepts any timestamp
+  between `PhaseDFloor` and `AllocationFloor`, and a batch window is
+  committed before its slots are handed to callers, so an unissued slot
+  can still be persisted; the batch-slot-claims proposal closes that and
+  is still open. (`kv/tso_raft.go`,
+  `docs/design/2026_08_29_proposed_tso_batch_slot_claims.md`)
 - **StartTS** — A transaction's start timestamp; conflict validation checks
   that no read or write key was committed after it. (`proto/internal.proto`)
 - **CommitTS** — The timestamp at which a value or tombstone is committed.
@@ -186,8 +192,10 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   can equal a commit timestamp another leader issued, the `latest >
   StartTS` conflict check does not see the equality, and the audit keeps
   cross-issuer uniqueness (an issuer lane in the logical half, or Phase
-  D's single issuer) as a blocker for the README claim. It holds
-  cluster-wide only under Phase D, where group 0 is the single issuer.
+  D's single issuer) as a blocker for the README claim. It would hold
+  cluster-wide under Phase D, where group 0 is the single issuer, once the
+  batch-slot-claims proposal makes a persisted timestamp one the TSO
+  actually handed out (see *Phase D*).
   (`store/store.go`)
 - **PrevCommitTS** — The commit timestamp of a failed earlier attempt of the
   same transaction, used as that attempt's identity for dedup.

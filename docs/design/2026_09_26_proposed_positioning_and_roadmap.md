@@ -107,8 +107,10 @@ README will present scope in two tiers instead of a non-goals section.
   entries apply in commit-timestamp order, which nothing enforces (G0), and
   that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
   have failing tests on `main`. README
-  makes the serializable claim only after the audit's A0 to A2, G11, and
-  G13 fixes land (§6.1). Leader reads via ReadIndex or leader lease; no follower reads.
+  makes the serializable claim only after the full §6.1 gate: the audit's
+  A0 to A2, G11, G15, and G13 fixes merged **and** A7's transaction-format
+  gate landed with `txn_format_v2` activated cluster-wide (merging alone
+  activates nothing). Leader reads via ReadIndex or leader lease; no follower reads.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
@@ -184,9 +186,10 @@ behind each claim.
    found, and reproduced with a test, that the check assumes apply order
    equals commit-timestamp order, which is not enforced (G0), and that 2PC read keys are unprotected between
    PREPARE and COMMIT (G1); S3 handlers and Lua string reads do not surface
-   their reads at all (G2, G3). The claim is made once A0 to A2, G11, and G13 (a 2PC PREPARE at the
+   their reads at all (G2, G3). The claim is made once A0 to A2, G11, G15, and G13 (a 2PC PREPARE at the
    previous commit's timestamp swallowed as a replay, closed by A0's
-   index-based replay detection) of §6.3 land. Evidence
+   index-based replay detection) of §6.3 are merged and A7's
+   `txn_format_v2` is activated cluster-wide, the full §6.1 gate. Evidence
    today: Elle list-append under `:strict-serializable` for Redis MULTI/EXEC
    and DynamoDB `TransactGetItems` + `TransactWriteItems`. That workload
    cannot exhibit write skew (every anti-dependency comes with a write-write
@@ -385,7 +388,8 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
   (this section is the pattern); repository artifacts are English.
 - The audit's A2 analysis found gaps G0 and G1 on `main`, and both are
   reproduced by failing tests; the serializable claim is the target and is
-  not made for any path until A0 to A2, G11, and G13 land.
+  not made for any path until the full §6.1 gate holds: A0 to A2, G11,
+  G15, and G13 merged and A7's `txn_format_v2` activated cluster-wide.
 - Cross-shard atomicity is gated on G12, G13, and G14 together: A2's
   transaction id and PREPARE order plus A0's index-based replay detection.
 - The README consistency claims exclude Phase-D clusters until both TSO
