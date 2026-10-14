@@ -300,9 +300,19 @@ entries, so a primary on a faster clock poisons the secondary's `last`
 with every COMMIT it stamps and starves the secondary's own writes for as
 long as the skew lasts (found in review); `kvFSM` therefore raises the
 ceiling to the physical half of every timestamp it is about to observe,
-on apply and at open, which is deterministic across members because it
-is a function of the applied log and the restored snapshot, so a new
-leader floors at the same value. For that to hold, the ceiling is **one
+on apply, and at open from the replicated watermark alone
+(`LastRaftCommitTS`, which a store carries once its marker is
+`txn-ledger` or later; a store without it raises nothing at open and
+its first renewal establishes the fence), never from `LastCommitTS()`
+(found in review: `observeStoreLastCommitTS` observes `LastCommitTS()`,
+which the replica-local `CatalogStore.Save` direct write advances at
+`LastCommitTS() + 1` on the one member that took it, so that member
+opened with a ceiling and a `last` its peers did not have, and the
+applied log said nothing about the difference); the raise is then
+deterministic across members, a function of the applied log and the
+restored snapshot, so a new leader floors at the same value (`last` at
+open may still take the capped `LastCommitTS()`, since a higher floor
+only skips values). For that to hold, the ceiling is **one
 per Raft group** (found in review: the HLC is one per process and
 `SetPhysicalCeiling` kept a single value for every group the process
 hosts, so a raise carried by group B's log, its own lease or a value it
@@ -329,7 +339,41 @@ far ahead refuses an allocation for A alone until A's own renewal lands
 and never issues for A above A's replicated ceiling; after A's
 leadership moves to a process that never applied B's entries, the values
 the old leader issued for A and the values the new leader issues are
-disjoint. The raise and the observation are one
+disjoint; a member that took a `CatalogStore.Save` direct write above
+the replicated watermark opens with the same ceiling as its peers. The
+disjointness needs one more rule, because a floor is not a grant (found
+in review): a leader whose ceiling for `G` was reached by observation,
+or by re-applying the previous leader's lease, shares that ceiling's
+millisecond with the previous leader, whose allocations at it reach the
+new one only inside a later entry (a `StartTS` issued before the
+election rides a PREPARE proposed after it), so the new leader would
+hand out values the old one already had, the G10 collision across a
+leader change (`main` has it: `NextFenced` fences on the wall alone and
+the ceiling a new leader applies from the log is the old leader's).
+`HLC` therefore keeps per group the ceiling of the last lease entry
+this process proposed in its current term, once applied (`grant(G)`,
+cleared on leadership loss), and a fenced allocation for `G` requires
+`grant(G)` to be at or above `ceiling(G)`: a newly elected leader's
+first fenced allocation enters the on-demand recovery below, whose
+target clears every floor, and a raise that a later observation carries
+above the grant blocks `G` until the next tick or that recovery, one
+Raft round trip either way; so a leader only ever issues inside a
+window no earlier leader could issue in. Tests: a newly elected leader
+whose ceiling came from the previous leader's lease refuses its first
+fenced allocation until its own lease entry applies, and the two
+leaders' values are disjoint even when the old leader kept issuing
+after losing leadership. Open, found in the same review and not
+decided here: a raise to the observed value lets the leaders of two
+coupled groups issue in one millisecond from independent logical
+counters, so a `(physical, logical)` pair is not unique across issuers,
+which the dedup probe and the pre-epoch timestamp fast path assume, and
+which the OCC boundary assumes too (a snapshot one leader issued equal
+to a commit timestamp another leader issued, with the read served
+before that commit applied, is a lost update the snapshot check cannot
+see); the candidates are an issuer lane in the logical half (a few high
+bits per issuing process, the counter below them) and Phase D's single
+issuer, and the A0 PR must settle it before the README claim. The
+raise and the observation are one
 HLC operation, `ObserveApplied(ts)`, not `SetPhysicalCeiling` followed by
 `Observe` (found in review): `nextLocked` loads `last` and then the
 ceiling, so an allocator running between the two stores would see the
@@ -394,8 +438,9 @@ within one tick of each other and of the faster group's
 `wall + hlcPhysicalWindowMs`, which pins the absence of the staircase; a
 2PC secondary whose process hosts no primary-group member keeps issuing
 its own writes while a primary on a faster clock commits through it
-repeatedly; a restart from a snapshot whose `lastCommitTS` physical half
-exceeds its ceiling issues immediately);
+repeatedly; a restart from a snapshot whose replicated watermark's
+physical half exceeds its ceiling issues after the one recovery that
+grants it);
 `21a11ddc` the read path: every leader-local `ShardStore` read (eleven
 entry points: get, exists, the version probes, every scan shape) goes
 through `leaderReadAt`, whose behaviour depends on the intent carried in
@@ -1221,7 +1266,9 @@ key; writers to a read-locked key abort and retry instead of racing.
 Status of A2: implemented ahead of review on local branch
 `design/serializable-audit-a2-readlocks` (six commits on top of the A0 fence
 branch, not pushed). What landed: read-lock rows under a new prefix
-`!txn|rlock|` keyed `uvarint(len(key)) key startTS primaryKey` (per key and
+`!txn|rlock|` (moved in review under `!txn|ok|` tag `0x04`, see the
+identity status below; the layout after the tag is unchanged) keyed
+`uvarint(len(key)) key startTS primaryKey` (per key and
 transaction, transaction identity `(primaryKey, startTS)` as the commit and
 rollback records already use, value = the existing `txnLock` payload);
 `handlePrepareRequest` installs one row per read key and accepts a lock-only
@@ -1283,7 +1330,7 @@ deleted the committed `k`, kept the intent, and T then committed
 `handleDelPrefixWithFloorSnapshot`, after the reserved-prefix, route-fence
 and floor checks and before `DeletePrefixesAtRaftAtFenced`: one range scan
 of `txnLockKey(prefix)` for write locks (one seek when none is held), then a
-paged scan of the whole `!txn|rlock|` namespace filtered by prefix (the
+paged scan of the whole read-lock namespace filtered by prefix (the
 rows are length-prefixed, so a prefix cannot be seeked; pages 8 → 1024).
 The first matching row fails the apply with `TxnLockedError` ("write lock"
 or "read lock") and nothing is deleted; a key under `!txn|` never counts,
@@ -1341,16 +1388,33 @@ to before); read-lock rows with an id are keyed `uvarint(len(key)) key
 txnID` and the holder is read from the row value, so a release deletes a
 row only if the value names the releasing transaction (both attempts of
 one `Dispatch` share the row, and a late ABORT of the first attempt must
-not free the second's lock); commit and rollback records with an id live
-in two new namespaces, `!txn|cmtid|` and `!txn|rbid|` (`primaryKey
-startTS txnID`), because a legacy record key is `primaryKey || startTS`
-with an unbounded primary key and no layout inside `!txn|cmt|` can be told
-apart from a legacy key with a longer primary, and `txnRouteKey` must
-recover the primary from both shapes for routing, migration filtering, and
-backup ownership; the two prefixes are wired into `isTxnInternalKey`, two
-migration families appended to the enum, the known-internal prefix list,
-and the write-conflict metric buckets, and user keys under them become
-reserved. Ownership requires id, primary key, and `StartTS` all to match
+not free the second's lock); commit and rollback records with an id, and
+the A2 read-lock rows, live under the success-marker family `!txn|ok|`,
+which the shipped binary already reserves by prefix, hides from reads,
+refuses for raw writes, and parses by a leading tag byte
+(`txnSuccessMarkerVersion`, `0x01`; `txnSuccessLockedKey` rejects every
+other tag): tag `0x02` is the commit record and `0x03` the rollback
+record (`primaryKey startTS txnID` after the tag), and tag `0x04` the
+read-lock row (the layout A2 gave `!txn|rlock|`, after the tag). They
+cannot live in `!txn|cmt|` or `!txn|rb|`, because a legacy record key
+is `primaryKey || startTS` with an unbounded primary and no layout
+inside those families can be told apart from a legacy key with a longer
+primary; and they cannot take prefixes of their own (corrected in
+review: `!txn|cmtid|`, `!txn|rbid|`, and `!txn|rlock|` are ordinary
+user keyspace to the shipped binary, which reserves exactly the lock,
+intent, commit, rollback, success, and meta families and the backup
+floor key, so reserving them later would hide a user's rows under them,
+an exact collision would overwrite one, and a collision scan with a
+migration gate would have to precede the reservation). `txnRouteKey`
+dispatches on the tag to recover the primary (tags `0x02`, `0x03`) or
+the locked key (`0x04`) for routing, migration filtering, and backup
+ownership; every tagged layout is written only after the identity
+capability is on, which the capability monitor grants once every member
+advertises it, so no shipped binary ever routes or migrates one; the
+tags are wired into the migration families appended to the enum and
+the write-conflict metric buckets, and a test pins that
+`isTxnInternalKey` reserves no new prefix. Ownership requires id,
+primary key, and `StartTS` all to match
 (the composed-1 retry reuses the id under a fresh `StartTS`, so a leftover
 lock from the earlier attempt must stay foreign); a legacy request owns a
 legacy lock under the old pair test, permanently; legacy against id, or
@@ -1507,7 +1571,7 @@ Constraints the fix PR must close before merge:
   2 µs per check with no history, 28 µs after 100 released locks, 290 µs
   after 1000 (`kv/txn_read_lock_benchmark_test.go`). Decision: **the lock
   namespaces are exempt from MVCC history.** The compactor physically
-  removes any `!txn|lock|` or `!txn|rlock|` key whose latest version is a
+  removes any `!txn|lock|` or read-lock key whose latest version is a
   tombstone with a commit timestamp below `minRetainedTS` (no snapshot
   read ever targets a lock row at an old timestamp; the retention floor
   already accounts for backup pins), and a PREPARE whose identity already
@@ -2343,114 +2407,138 @@ sections defer to is therefore two-sided:
   coordinator then crashed, the primary lock is gone and the only complete
   participant list went with the coordinator; the later lock and ledger
   scan cannot name the missing secondary and would publish `txn-v2` over
-  a torn transaction. The upgraded coordinator therefore records each V1
-  transaction's participant set in **replicated** state before the primary
-  decision can commit, not in a coordinator-local list (corrected in
-  review: a coordinator-local list cannot fail closed, because a
-  replacement coordinator on a fresh data directory has neither the list
-  nor any evidence that one was lost, reports nothing outstanding, and the
-  epoch would activate over exactly the torn transaction). The record is a
-  reserved-key mutation added to the primary PREPARE's write set after the
-  meta mutation (`extractTxnMeta` consumes only `muts[0]`), so every
-  binary applies it as an ordinary mutation, it commits exactly when the
-  primary decision commits, and it is visible afterwards on every replica
-  of the primary group. Its key lives in a family the shipped binary
-  already reserves by prefix (corrected in review: a new
-  `!txn|participants|` prefix is ordinary user keyspace to the shipped
-  binary, which `TestIsTxnInternalKeyReservesOnlyKnownFamilies` pins, so
-  reserving it later could hide user rows and a colliding record could
-  overwrite one): the commit-record family, `!txn|cmt|` + primary key + the
-  8-byte `StartTS` suffix with its top bit set, a value no real timestamp
-  carries (the physical half is 48 bits of Unix milliseconds), so it never
-  collides with `txnCommitKey(primary, StartTS)`, `txnRouteKey` strips the
-  suffix and routes it with the primary key exactly, the shipped binary
-  hides it from reads and refuses raw writes to it, and the shipped readers
-  of that family look up exact keys only (`primaryTxnStatus`, the dedup
-  probe); the `!txn|meta|` family was rejected because it is the
-  un-persisted PREPARE header and a suffixed key routes off the primary at
-  a split boundary. The value names every participant group and key, and
-  it is bounded before admission (found in review: each per-group PREPARE
-  can sit under the 64 MiB transport limit while the aggregate of every
-  participant key does not, and such a transaction would have worked
-  before the intermediate release and then failed to replicate its
-  primary PREPARE): the coordinator sizes the record before any PREPARE
-  and refuses a V1 cross-group transaction whose record exceeds 4 MiB
-  with a client-visible size error, in the intermediate release only; the
-  adapters' transaction shapes sit far below it (DynamoDB caps a
-  transaction at 100 items, Redis `MULTI` and Lua carry their keys), and
-  a test drives a transaction whose per-group payloads fit while the
-  aggregate record does not. Compatibility tests run the shipped
-  binary's FSM against a PREPARE
-  carrying the record: it is applied as an ordinary mutation, hidden from
-  `RawGet` / `RawScan`, and routed with the primary key. The coordinator
-  deletes the record only once every named secondary key is
-  **confirmed**, not when the secondary COMMIT is acknowledged (corrected
-  in review: a V1 secondary COMMIT acknowledgement proves nothing, because
-  on the reproduced G13 path the secondary PREPARE was skipped as a
-  timestamp replay and on G14 its lock was removed before the primary
-  committed, and in both the legacy COMMIT finds no lock, writes nothing,
-  and returns success). Confirmation is a leader-fenced probe on the
-  secondary group for a per-key receipt, not for the key's version
-  (corrected in review: the exact version alone is not compaction-safe;
-  a coordinator that crashes after the secondary COMMIT lands and before
-  confirmation leaves the version to be superseded by a later write and
-  removed by retention compaction, which keeps only the newest version at
-  or below the retained timestamp, and the probe would then classify a
-  published secondary as a G13 or G14 loss and block the gate for good).
-  The receipt is the route-local, prefix-reserved success marker the
-  migration planner already defines (`TxnSuccessMarkerKey`, keyed by the
-  locked key, `StartTS`, the decision timestamp, and the primary key, and
-  routed with the locked key): the intermediate release's coordinator
-  adds it to each secondary PREPARE's write set next to the key it
-  attests, so every binary applies it as an ordinary mutation and it
-  lands exactly when the key's version lands and never otherwise (a
-  skipped PREPARE or a removed lock leaves both unwritten), and a row
-  that is written once has a single version, which compaction never
-  removes. For a transaction the shipped binary prepared before the
-  upgrade the exact-timestamp version probe (`CommittedVersionAt`, carried
-  by the `RawLatestCommitTS` key batch in a new exact-timestamp mode next
-  to its at-or-before mode) is the fallback, and for an aborted
-  transaction the primary's rollback record is the proof; the receipts
-  are deleted with the record, and the `txn-v2` marker cannot be written
-  while any record remains. The epoch proposer derives the outstanding set by scanning
-  every data group for these records, and for pre-epoch locks, instead of
-  polling coordinators, so no coordinator incarnation needs tracking: a
-  lost coordinator leaves its records in place, the `LockResolver`
-  completes a named secondary whose intent exists from the primary's
-  commit record, and a record whose named key has neither a version nor
-  an intent (the G13 and G14 shapes) or whose primary group cannot be read
-  keeps the gate closed and names the transaction for operator
-  reconciliation, which the runbook says. Tests: a coordinator that loses
-  its data directory after the primary commit and before the secondary
-  COMMIT is replaced by an empty one, the proposer still sees the record
-  and withholds the epoch, the resolver publishes the secondary, the record
-  is deleted once the probe confirms the version, and the epoch applies;
-  the same with the coordinator merely restarted; the G13 and G14
-  reproductions run under the record-writing coordinator, the acknowledged
-  no-op COMMIT leaves the record in place, and the proposer refuses the
-  epoch naming the transaction. Transactions admitted by a shipped-binary
-  coordinator have no record, so the rollout is two steps (corrected in
+  a torn transaction. The upgraded coordinator therefore admits no
+  transaction that the later scan cannot settle, by closing on its own
+  side the three ways a V1 write goes missing without leaving a lock
+  (rewritten in review: the earlier revision recorded each transaction's
+  participant set in a reserved-key mutation of the primary PREPARE and
+  confirmed every named secondary through a per-key receipt carried in
+  the secondary PREPARE, and review found each piece defeatable under V1
+  apply semantics: the receipt was a lock of its own, and the shipped
+  `handleCommitRequest` and `LockResolver.resolveExpiredLock` settle one
+  lock at a time, so on the G14 schedule the user key's lock was removed
+  while the receipt's survived, the receipt landed alone, and the probe
+  deleted the record over a torn secondary; a receipt per secondary key
+  repeated the primary key once per key, so a transaction whose
+  per-group PREPAREs fit could stop fitting once augmented while the
+  bound on the aggregate record held; a receipt-bearing PREPARE could
+  not take the G13 skip at all, so the G13 completion test expected an
+  outcome that coordinator cannot produce; and two transactions sharing
+  `(primaryKey, StartTS)` overwrote one record). The intermediate
+  release changes only the coordinator, so every entry it proposes is a
+  V1 entry the shipped binary applies exactly as today. (1) **Primary
+  first.** It prepares in `txnPrepareOrder` (the A2 prepare-order
+  branch, coordinator-only: the primary group's PREPARE has applied
+  before any secondary PREPARE is sent, and the PREPAREs were sequential
+  already). The shipped `primaryTxnStatus` then reaches "no primary lock
+  and no record" only after a decision record exists: the shipped COMMIT
+  writes the commit record in the batch that deletes the primary lock
+  (`buildCommitStoreMutations`), an ABORT naming the primary writes the
+  rollback record (`appendRollbackRecord`), `tryAbortExpiredPrimary`
+  writes it before a resolver rolls a secondary back, and the status read
+  reaches the primary group's leader (`getGroupAt` serves it through
+  `leaderGetAt` or forwards it), so no reader or resolver removes a
+  secondary lock except on the primary's recorded decision, which the
+  shipped COMMIT honours (`ErrTxnAlreadyAborted` on a rollback record,
+  the recorded timestamp otherwise). (2) **One fresh key per per-group
+  PREPARE**, the attempt marker: `!txn|cmt|` + the group's lowest write
+  key + `StartTS` with bit 62 set, value the attempt id (16 random
+  bytes; no real timestamp sets bit 62 or bit 63, the physical half
+  being 48 bits of Unix milliseconds). The shipped timestamp fast path
+  (`raftApplyAlreadyLandedWith`) skips a PREPARE only when every store
+  mutation has a version at `StartTS`, and the marker's lock and intent
+  rows have one only if this PREPARE itself applied, so the G13 skip
+  cannot take a marker-bearing PREPARE on either binary while a genuine
+  re-proposal is still skipped; the marker routes with the group's key
+  under the shipped `txnRouteKey` (eight bytes stripped), is hidden and
+  refused for raw writes as the commit-record family is, nothing reads
+  it, it is committed or rolled back with the group's keys, and the
+  post-activation sweep removes it. Its lock and intent rows route, once
+  `routeKey` strips their one wrapper, by the marker's own bytes, so a
+  range move inside the PREPARE-to-COMMIT window can leave them behind
+  (true of every `!txn|cmt|`-keyed mutation, the earlier revision's
+  record included); harmless here, since nothing depends on the marker
+  once its PREPARE applied and an orphaned row is settled by the
+  resolver like any lock. (3) **Identity reservation.** Before the
+  primary PREPARE the coordinator runs a one-key V1 2PC on `!txn|cmt|` +
+  primary key + `StartTS` with bit 63 set (the earlier revision's record
+  key, now the reservation; the shipped readers of the family look up
+  exact keys only), as a transaction of its own with identity (that key,
+  `StartTS`) and the attempt id as value. The shipped `validateConflicts`
+  rejects a PREPARE whose key has a committed version above `StartTS`,
+  and the shipped COMMIT rejects a second commit of one identity at
+  another timestamp (the `commit_ts mismatch` of G12), so of two
+  coordinators that admitted `(primaryKey, StartTS)` exactly one
+  reservation commits and the other fails before its primary PREPARE and
+  retries under a fresh snapshot: no two transactions of the
+  intermediate release share an identity, which is what G12 needs. A
+  raw or one-phase write cannot serve, since both refuse
+  transaction-internal keys (`validateRawMutationForApply`,
+  `buildOnePhaseStoreMutations`). Cost: two Raft round trips on the
+  primary group per cross-group transaction, in the intermediate release
+  only; the ledger era reserves through the ledger row instead. A
+  coordinator that dies between the reservation and the primary PREPARE
+  leaves a reservation with neither a lock nor a decision under its
+  identity, which the scan ignores and the sweep removes; one that dies
+  inside the reservation leaves a lock the resolver expires. What the
+  reservation cannot cover is a shipped-binary coordinator still
+  admitting during the rolling restart, which neither reserves nor sees
+  reservations: an identity shared with it is the G12 exposure `main`
+  has today, bounded by the restart window and closed once every
+  coordinator runs the intermediate release, which precedes the
+  admission stop. (4) **Sizing.** The coordinator sizes every per-group
+  PREPARE after augmentation against the transport limit before issuing
+  any PREPARE and refuses the transaction with a client-visible size
+  error (found in review: sizing one aggregate misses a per-group
+  request that no longer fits once augmented); the adapters' transaction
+  shapes sit far below it (DynamoDB caps a transaction at 100 items,
+  Redis `MULTI` and Lua carry their keys). With the three closures, every
+  write of a transaction the intermediate release admitted either holds
+  a lock the epoch scan settles from the primary's recorded decision or
+  has already become the version or the rollback that decision produced,
+  so the epoch proposer scans every data group for pre-epoch locks, as
+  before, settles them through the `LockResolver`, ignores reservations
+  and markers with no lock and no decision under their identity, and
+  needs no participant list, no confirmation probe, and no
+  exact-timestamp version probe (the `CommittedVersionAt` exact mode of
+  the earlier revision is withdrawn). Tests: the G13 and G14
+  reproductions run under the intermediate coordinator against the
+  shipped FSM and **pass** (every write lands, the reader gets `txn
+  locked`); the G12 aliasing reproduction under it ends with the second
+  transaction's reservation rejected and retried under a fresh snapshot
+  and no mixed outcome; a coordinator that loses its data directory
+  after the primary commit and before the secondary COMMIT is replaced
+  by an empty one, the scan finds the secondary lock, the resolver
+  publishes it from the commit record, and the epoch applies; the same
+  with the coordinator merely restarted; a coordinator crashed between
+  the reservation and the primary PREPARE leaves nothing the epoch waits
+  for; the resolver settles a marker's lock and the user key's lock in
+  either order to the same outcome; and a per-group PREPARE that fits
+  only before augmentation is refused before any PREPARE is sent.
+  Transactions admitted by a shipped-binary coordinator carry neither
+  marker nor reservation, so the rollout is two steps (corrected in
   review: calling such a transaction pre-existing damage did not make the
   drain fail closed). First, an intermediate release that keeps V1
-  semantics and only writes records is rolled onto every node by graceful
-  restart, which the shipped binary's gRPC and HTTP listeners already
-  honour (`GracefulStop` and `http.Server.Shutdown` drain in-flight
-  requests, and a `Dispatch` runs inside its request), and that release
-  makes the Redis listener's stop drain the same way (checked in review: a
-  Lua or `MULTI` transaction cut mid-2PC is exactly the case the record
-  exists for); admission stops only once every member and coordinator
-  advertises the record capability, so every transaction in flight at the
-  stop has a record. What that cannot cover is a shipped-binary coordinator
-  that died ungracefully (a crash, a kill past the drain, a lost data
-  directory) before its upgrade: nothing on the server can name its
-  transactions. The activation command therefore refuses to propose the
-  epoch unless the operator passes an explicit attestation that every such
-  incident has been reconciled; the attestation and the incident list
-  travel in the epoch entry, and the runbook lists how to find the
-  incidents (restart reasons, the lock namespace, application-level
-  checks). The disk-loss test is also run with the transaction begun on
-  the shipped binary before the upgrade, and asserts the refusal without
-  the attestation and the activation with it. The
+  semantics and adds only the coordinator-side closures above is rolled
+  onto every node by graceful restart, which the shipped binary's gRPC
+  and HTTP listeners already honour (`GracefulStop` and
+  `http.Server.Shutdown` drain in-flight requests, and a `Dispatch` runs
+  inside its request), and that release makes the Redis listener's stop
+  drain the same way (checked in review: a Lua or `MULTI` transaction
+  cut mid-2PC is exactly the case the closures exist for); admission
+  stops only once every member and coordinator advertises the
+  intermediate capability, so every transaction in flight at the stop
+  was admitted with them. What that cannot cover is a shipped-binary
+  coordinator that died ungracefully (a crash, a kill past the drain, a
+  lost data directory) before its upgrade: nothing on the server can
+  name its transactions. The activation command therefore refuses to
+  propose the epoch unless the operator passes an explicit attestation
+  that every such incident has been reconciled; the attestation and the
+  incident list travel in the epoch entry, and the runbook lists how to
+  find the incidents (restart reasons, the lock namespace,
+  application-level checks). The disk-loss test is also run with the
+  transaction begun on the shipped binary before the upgrade, and asserts
+  the refusal without the attestation and the activation with it. The
   ledger epoch is the first downgrade-incompatible step,
   not a soft poll: a node advertises `txn_v1_drain_ledger` only after
   persisting the downgrade-incompatible `txn-ledger` form of its
