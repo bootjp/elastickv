@@ -507,7 +507,27 @@ known up front (a keys-spanning Lua script), so an unavailable or
 leaderless group fails only the operations that touch it instead of the
 whole data plane (the implemented branch fences every data group,
 including for the public gRPC `Ts = 0` reads, and must be narrowed to the
-routed participants: a merge blocker). No value from outside the touched
+routed participants: a merge blocker). A group the operation discovers
+only after `s` was minted is not a gap in the rule (found in review): an
+S3 object handler learns the bucket generation from the bucket-meta read
+and only then builds `s3keys.RouteKey`, and `BucketMetaKey` and the
+object key can route to different groups, so the object group is not a
+participant at Begin; the participants at Begin only seed `s`, and every
+read at `s` on any group goes through the read path above, which
+advances that group's replicated watermark to `s` when it is below and
+waits for the apply, after which the fence rejects every entry at or
+below `s` on it, while a group already above `s` serves the read at `s`
+as an ordinary MVCC read below its watermark. A delayed object write at
+`c ≤ s` therefore either applied before the advance, and the manifest
+read at `s` sees it, or is fenced after it and retried above `s`, never
+the G0 schedule, with no restart of the snapshot and no fencing of every
+S3 group; the generation the handler uses is the one its bucket-meta
+read at `s` returned, and the `proxyRouteKey` read stays what it is,
+proxy routing outside the snapshot. Test: the bucket-meta group ahead
+supplies `s`, the object group behind, an object write at `c ≤ s`
+proposed on it around the manifest read at `s` either lands before the
+advance and is read, or is fenced after it, and the read never misses a
+write that was acknowledged. No value from outside the touched
 groups seeds `s` (found in review): the adapters' local seeds today are
 process-wide, `ShardStore.LastCommitTS` behind `snapshotTS`,
 `GlobalLastCommitTS` behind `nextTxnReadTS`, and
@@ -705,11 +725,21 @@ Constraints the fix PR must close before merge:
   applied on that replica while every other replica applied all of it: a
   permanent divergence that A0's per-request index replay detection cannot
   repair, because the engine discards the entry before the FSM sees it. The
-  fix applies every request of one entry in one Pebble batch with one
-  applied-index write, so the entry lands whole or not at all, and a crash
-  test that kills the process between two requests of one batched entry,
-  restarts, and asserts the replica converges with one that never crashed
-  travels with it. The loss is pre-existing on `main` (the cold-start skip
+  fix applies every request of one entry in one **indexed** Pebble batch
+  with one applied-index write, so the entry lands whole or not at all,
+  and keeps the sequential semantics of the per-request path (found in
+  review: a plain batch whose later requests read only the DB would let a
+  `DEL_PREFIX prefix(k)` after a `PUT k` in the same entry miss the staged
+  put and leave `k` visible while both requests report success): the
+  replay probe, the OCC conflict checks, and the prefix-delete scan of a
+  later request read through the batch, so they observe the earlier
+  requests' staged writes exactly as they observed the per-request
+  commits (#1269 implements it this way). A crash test that kills the
+  process between two requests of one batched entry, restarts, and
+  asserts the replica converges with one that never crashed travels with
+  it, run on a two-put entry and on a `PUT k` followed by `DEL_PREFIX
+  prefix(k)` entry, whose re-delivery must leave `k` deleted. The loss is
+  pre-existing on `main` (the cold-start skip
   predates this audit) and is listed in §3.
 - Throughput under reordering is not measured; the benchmark milestone does.
 

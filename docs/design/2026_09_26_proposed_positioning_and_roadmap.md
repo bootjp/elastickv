@@ -176,7 +176,10 @@ behind each claim.
    after which the primary commits and the secondary COMMIT writes nothing
    (G14); the claim waits for A2's transaction id, the primary-first PREPARE
    order, and the secondary re-apply, and for A0's index-based replay
-   detection, all reproduced and fixed on local branches.
+   detection, all reproduced and fixed on local branches, and, as every
+   consistency claim does, for A7's `txn_format_v2` activated
+   cluster-wide (§6.1): until then V1 entries keep the legacy identity
+   and replay semantics, and merging the fixes excludes nothing.
 3. **Multi-key transactions are serializable.** The FSM validates the
    transaction's write set and read set against every commit newer than
    `StartTS` under the store's apply lock (`checkConflictsLocked` in
@@ -391,7 +394,9 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
   not made for any path until the full §6.1 gate holds: A0 to A2, G11,
   G15, and G13 merged and A7's `txn_format_v2` activated cluster-wide.
 - Cross-shard atomicity is gated on G12, G13, and G14 together: A2's
-  transaction id and PREPARE order plus A0's index-based replay detection.
+  transaction id and PREPARE order plus A0's index-based replay detection,
+  merged and in effect through A7's `txn_format_v2` activated
+  cluster-wide, as for every consistency claim.
 - The README consistency claims exclude Phase-D clusters until both TSO
   admission proposals land; legacy-mode clusters do not wait on them.
 - The README consistency claims exclude resolver-routed keys (SQS FIFO
