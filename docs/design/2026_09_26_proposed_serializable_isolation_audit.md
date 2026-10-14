@@ -317,14 +317,23 @@ routed participants: a merge blocker). The local value is kept if higher;
 an all-zero answer means an empty
 store and no capability is issued; the single-group `Coordinate` adds no
 barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
-RPC carrying a `ForwardedReadMode` and an authenticated peer bearer token.
-For this release the token comes from a required, non-empty
-`--adminTokenFile`: `ForwardRead` is explicitly protected by the server
-interceptor, its client always attaches the token, and V2 activation
+RPC carrying a `ForwardedReadMode` and an authenticated **peer-only**
+bearer token. The token is a node-only secret from a required, non-empty
+`--internalTokenFile` (or the node-to-node mTLS the security milestone
+introduces, once it exists), never the `--adminTokenFile` value: that
+file is the read-only Admin bearer token handed to operator clients, and
+a holder of it who can reach a group listener could otherwise call
+`ForwardRead` in snapshot mode with a chosen timestamp and, since each
+accepted advance extends the ceiling the next admission bound is measured
+against, staircase the replicated watermark arbitrarily far ahead and
+stall timestamp allocation (found in review; the implemented branch
+sourced the token from `--adminTokenFile` and must change). `ForwardRead`
+is explicitly protected by the server interceptor, which accepts only the
+internal token, its client always attaches that token, and V2 activation
 refuses to proceed unless every voter and learner has the credential and
-an authenticated peer-forward probe succeeds. The optional admin-token
-configuration cannot establish snapshot provenance in its default-off
-state; absent or wrong credentials fail closed. An `Unimplemented` answer
+an authenticated peer-forward probe succeeds. Absent or wrong credentials
+fail closed, and a request carrying the admin token is rejected like one
+carrying none (a test pins that). An `Unimplemented` answer
 from an older leader may fall back to public `RawKV` only while V1 is
 pinned and cannot satisfy a V2 snapshot capability. A remote authenticated
 read still costs one round trip. A per-group `watermarkAdvancer` allows one
@@ -333,7 +342,16 @@ under the lock, and never hands a waiter another caller's cancellation.
 `a2c51771` the public gRPC reads: no provenance field on the request
 types; a nonzero client `Ts` above the group's watermark on `RawGet` /
 `RawScanAt` / the version probes returns `FailedPrecondition`; `Ts = 0`,
-`Get`, and `Scan` begin a leader snapshot and read under it. `93b5623b`
+`Get`, and `Scan` begin a leader snapshot and read under it, and they
+carry the same catalog pin as `TransactGetItems` (found in review): the
+groups to fence and the point or range read are resolved from one
+`RouteEngine` snapshot, the read carries that version, a leader whose
+applied catalog moved the key or range, or whose M2 cutover read fence is
+armed for it, rejects it with the retryable route-moved error, and the
+server restarts the read on a fresh snapshot (bounded retries), so a read
+cannot fence the old owner and then resolve through the new one, where a
+migration can still install versions at their original `commitTS ≤
+snapshotTS` after the response. `93b5623b`
 the adapters: the Redis, DynamoDB, SQS, and S3 transaction-begin helpers,
 the Redis `EXEC` fence path, and the delta compactor begin leader
 snapshots and read under the capability (about 60 call sites; the
@@ -1507,7 +1525,24 @@ a per-run key prefix so the three workloads can share one cluster.
 - `elastickv.dynamodb-wr-workload`: `TransactGetItems` for the reads, then
   one `TransactWriteItems` with a `ConditionCheck` on every read-only key
   (the read value) and a conditioned `Put` on every written key;
-  `TransactionCanceledException` is recorded as `:fail`.
+  `TransactionCanceledException` is recorded as `:fail`. **Not yet the
+  claimed shape (found in review):** on `main` the adapter turns a
+  `ConditionCheck` on an existing item into a `Put` of the item's current
+  value (`buildConditionCheckLockRequest` in `adapter/dynamodb_transact.go`,
+  a pre-A2 way of protecting the read with a write lock), so every
+  read-only key of an existing item is also in the write set, two crossing
+  transactions collide as ordinary write-write conflicts, and the
+  PREPARE-to-COMMIT read-lock window is never exercised; the green result
+  below is explained by that, not by correctness. A2 changes the adapter so
+  that a `ConditionCheck` on an existing item is a read key under a read
+  lock and writes nothing (which also stops a condition check from
+  rewriting the item at a new commit timestamp), with a unit test on the
+  plan builder asserting that no mutation is emitted, and the workload's
+  harness asserts before a run counts as evidence that its read-only keys
+  stay outside the write set (the plan-builder test plus an adapter-level
+  check that the item's version is unchanged after a `ConditionCheck`-only
+  transaction). Until then the DynamoDB workload is not DynamoDB
+  serializability evidence either way.
 - gRPC: `TransactionalKV` cannot express a read set (G8), so no client-side
   workload can drive write skew through it; the engine-level evidence for
   that path is the Go reproduction tests on `design/serializable-audit-a0`.
@@ -1519,7 +1554,7 @@ nodes, `--time-limit 30 --rate 50 --concurrency 10`:
 |---|---|
 | Lua | `:valid? false`, four G2-item cycles, `:not #{:repeatable-read}`. One cycle is textbook write skew: T1 `[[:r 53 1] [:r 53 1] [:w 54 2]]`, T2 `[[:r 53 1] [:w 53 2] [:r 54 nil]]`. This is G3 observed through Jepsen; the fix on `design/serializable-audit-a1-redis` is expected to turn it green. |
 | Redis `MULTI` | `:valid? true` (678 ok). The race did not trigger at this rate; not evidence of correctness. |
-| DynamoDB | `:valid? true` (1088 ok, 148 `:fail` from conditional checks). Same caveat. |
+| DynamoDB | `:valid? true` (1088 ok, 148 `:fail` from conditional checks). Not evidence: the `ConditionCheck` keys were in the write set (see the workload's note above), so the crossings were rejected as write-write conflicts and the read-lock window was never reached. |
 
 Elle note, recorded so the next person does not chase it: with
 `:linearizable-keys? true` the first Redis run reported a `:cyclic-versions`
@@ -2304,10 +2339,12 @@ proves larger than expected.
   capability and activation wiring, so a package subset is not completion
   evidence.
 - `make tla-check` passes with `OCC6_SnapshotStableAtWatermark`,
-  `OCC7_NoLostUpdate`, and `OCC8_NoWriteSkew`, and fails all three gap
+  `OCC7_NoLostUpdate`, and `OCC8_NoWriteSkew`, and fails all four gap
   configurations as expected: `MCOCC_gap_applyorder.cfg` (`OCC6`),
-  `MCOCC_gap_readlocks.cfg` (`OCC8`), and `MCOCC_gap_readlock_intent.cfg`
-  (`OCC8` on the foreign-write-lock interleaving).
+  `MCOCC_gap_readlocks.cfg` (`OCC8`), `MCOCC_gap_readlock_intent.cfg`
+  (`OCC8` on the foreign-write-lock interleaving), and
+  `MCOCC_gap_rawwrite_readlock.cfg` (`OCC8` on a raw write ignoring a
+  transaction's read lock, the A2 cycle).
 - Every A4 workload is green in CI; the Lua workload's pre-fix red run is
   linked from the PR.
 
