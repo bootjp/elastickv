@@ -664,8 +664,8 @@ Still open for the fix PRs:
   every Pebble DB this version opens or restores (`loadLastRaftCommitTS`
   persists it with `Sync` when missing or above `lastCommitTS`, at open and
   after every restore swap; an empty-snapshot restore writes 0; **to be
-  gated on the V2 marker before merge**: a store whose marker is not `txn-v2` must not carry
-  the key at all, see A7); the
+  gated on the V2 marker before merge**: a store whose marker is still `etcd` (pre-epoch or V1-pinned) must
+  not carry the key at all, see A7); the
   streaming MVCC format gains layout V4 (V3 plus a trailing
   `lastRaftCommitTS`; the reader still accepts V1 to V3); the backup
   encoder writes the key as a raw entry and `ReadSnapshotWithHeader` skips
@@ -1351,13 +1351,30 @@ Constraints the fix PR must close before merge:
   skipped).
 - Pre-existing: raw `DEL_PREFIX` bypassed lock validation (closed above).
   Ordinary RAW `PUT` / `DEL` already check write locks
-  (`validateRawMutationForApply` → `assertNoConflictingTxnLock`) and
-  deliberately skip read locks: a raw write carries no read set, so it can
-  always be serialised after the transaction holding the read lock (a raw
-  write derived from an earlier adapter read is a G7-class bug on its own,
-  fixed by making that path a transaction with `ReadKeys`). A coordinator
-  stalled past the TTL can have its primary lock treated as a rollback (true
-  for write locks too).
+  (`validateRawMutationForApply` → `assertNoConflictingTxnLock`); **they
+  must check foreign read locks too (found in review)**. The earlier
+  reasoning, that a raw write carries no read set and can therefore always
+  be serialised after the transaction holding the read lock, is wrong once
+  snapshot readers exist: T reads `k` and PREPAREs a write to `x` (read
+  lock on `k`, write lock on `x`); a raw `PUT k` applies while T's read
+  lock is held; a read-only transaction R then observes the new `k` and
+  the old `x` before T commits. The order constraints are T before the PUT
+  (T read the old `k`), the PUT before R (R saw it), and R before T (R
+  missed `x`), so no serial history exists although every operation
+  succeeded, and T's COMMIT does not re-validate its read set because the
+  read lock was meant to protect it. A raw `PUT` / `DEL` on a key under a
+  foreign read lock is therefore rejected with `TxnLockedError` exactly as
+  one under a foreign write lock is; the coordinator already retries
+  `TxnLockedError` for raw requests, so the client-visible effect is a
+  retry, not an error. The A2 test set gains this interleaving as a Go
+  reproduction (T PREPARE, raw PUT, R read, T COMMIT: red with the skip,
+  green with the check), and A3 adds it as an OCC.tla gap configuration
+  (`MCOCC_gap_rawwrite_readlock.cfg`, expected to fail `OCC8`), so write
+  skew through a raw write is covered by the model as well. A raw write
+  derived from an earlier adapter read is still a G7-class bug on its own,
+  fixed by making that path a transaction with `ReadKeys`. A coordinator
+  stalled past the TTL can have its primary lock treated as a rollback
+  (true for write locks too).
 
 ### A3. TLA+
 
@@ -1933,7 +1950,8 @@ sections defer to is therefore two-sided:
   flip), and only V2 entries use the index-based detection and never the
   timestamp fast path. The replicated watermark key
   `_meta_last_raft_commit_ts` and the snapshot layouts that carry it exist
-  **only once the marker says V2**; in V1 mode the new binary writes
+  **only once the marker is `txn-ledger` or later** (a downgrade-incompatible
+  directory); on a pre-epoch or V1-pinned node the new binary writes
   neither (found in review: the shipped `isPebbleMetaKey` does not know the
   key, so the shipped binary's `findMaxCommitTS` decodes its last eight
   bytes as an inverted MVCC timestamp and, at every open, raises
@@ -1942,9 +1960,9 @@ sections defer to is therefore two-sided:
   installed a snapshot the new binary wrote, would therefore break OCC and
   snapshot reads). Concretely: `loadLastRaftCommitTS` seeds the key, the
   streaming MVCC layout moves from V3 to V4, and the backup encoder writes
-  the raw entry only when the marker is V2 (the first V2 apply seeds the
-  key from `lastCommitTS`, capped, exactly as the A0 branch's fallback does
-  today); a pre-epoch or V1-pinned store, snapshot, or backup stays
+  the raw entry only when the marker is `txn-ledger` or later (the first
+  apply after the marker moves seeds the key from `lastCommitTS`, capped,
+  exactly as the A0 branch's fallback does today); a pre-epoch or V1-pinned store, snapshot, or backup stays
   byte-compatible with the shipped binary (a ledger-era node is already
   downgrade-incompatible through its marker and header, see the
   ledger-aware transition), and a test opens such a store and such a
@@ -2128,10 +2146,26 @@ sections defer to is therefore two-sided:
   downgradable. (Downgrading two of three voters after they advertised
   still costs the group its quorum until they are upgraded again; the
   marker turns that into a startup refusal with a named error rather than
-  a halt mid-apply, and the rollout runbook says so.) Every replica then
-  moves the marker to the `txn-v2` form **before** its first V2 FSM apply
-  or installation / restoration of a V2 snapshot, and the receiver must be
-  able to tell a ledger-era or V2 snapshot apart **before** restoring it:
+  a halt mid-apply, and the rollout runbook says so.) The `txn-ledger`
+  form is also the downgrade fence for V2 entries and V2 snapshots: a
+  replica applies its first V2 entry, or installs / restores a ledger-era
+  or V2 snapshot, only while its marker is at least `txn-ledger` (a fresh
+  replica writes that form before the restore mutates the FSM), and the
+  `txn-v2` form means something else, **V2 in effect**: it is written by
+  the drain's completion step once the activation epoch has applied on
+  every data group and every ledger row is terminal and confirmed, and it
+  is the publication gate the roadmap's README claims wait on. The two
+  states are distinct on purpose (found in review): writing `txn-v2`
+  before the activation entry applies would make a crash at that point,
+  or an activation rejected for a conf-state mismatch, indistinguishable
+  from a drained V2 group, while delaying the fence to the drain would
+  leave V2 entries applied on a downgradable directory. A crash between
+  activation apply and the `txn-v2` write restarts as fenced, active, and
+  not in effect: the marker says `txn-ledger`, the applied activation row
+  says active, the ledger says what remains, and the drain resumes from
+  it; a rejected activation leaves the marker at `txn-ledger`. The
+  receiver must be able to tell a ledger-era or V2 snapshot apart
+  **before** restoring it:
   Raft snapshot metadata carries only index, term, and the conf state, and
   an epoch row inside the FSM payload is discoverable only after
   installation, so a fresh replica could otherwise restore such state
@@ -2141,7 +2175,7 @@ sections defer to is therefore two-sided:
   magic (`EKVTHLC3`, whose payload carries the transaction format,
   `ledger` or `v2`, next to the ceiling and the cutover index), which the
   new binary reads and fences on before mutating the FSM (the marker moves
-  to at least the snapshot's form first) and which the shipped
+  to `txn-ledger` first when it is still `etcd`) and which the shipped
   `ReadSnapshotHeader` rejects fail-closed with
   `ErrSnapshotHeaderUnknownMagic` (a trailing V2 extension would not do:
   the shipped reader skips unknown trailing bytes); the external restore
@@ -2165,8 +2199,12 @@ sections defer to is therefore two-sided:
   full capability and stays flipped; in-flight V1 transactions finishing
   after the flip; a follower applying V2 before it ever proposes, then
   restarting under the shipped binary and rejecting downgrade; V2
-  snapshot install/restore persisting the marker before serving, and
-  before any FSM mutation when the snapshot arrives at a fresh replica;
+  snapshot install/restore persisting the `txn-ledger` marker before
+  serving, and before any FSM mutation when the snapshot arrives at a
+  fresh replica; a crash between activation apply and the `txn-v2` write
+  restarting as fenced and active but not in effect, resuming the drain,
+  and publishing only when the drain completes; an activation rejected
+  for a conf-state mismatch leaving the marker at `txn-ledger`;
   the shipped `ReadSnapshotHeader` rejecting an `EKVTHLC3` header; a
   capability report (either capability) refused until the `txn-ledger`
   marker is durable, and the shipped startup check rejecting a data
