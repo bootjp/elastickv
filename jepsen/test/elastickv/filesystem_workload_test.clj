@@ -264,6 +264,43 @@
       (finally
         (delete-tree! dir)))))
 
+(deftest write-classification-uses-every-attempt
+  (let [dir (scratch-dir)]
+    (try
+      (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir]
+                                                          :local true :key-count 1 :max-retries 3
+                                                          :require-fuse-mount false})
+            c        (client/open! (:client test-map) test-map "n1")
+            write    (fn [] (client/invoke! c test-map {:type :invoke :f :write :value (independent/tuple 0 1)}))
+            eagain   (fn [] (java.io.FileNotFoundException. "reg-0 (Resource temporarily unavailable)"))]
+        (client/setup! c test-map)
+        ;; Every attempt fails at open: nothing reached the backend -> :fail.
+        (with-redefs [workload/local-overwrite! (fn [_ _] (throw (eagain)))]
+          (is (= :fail (:type (write)))))
+        ;; First attempt fails after open (write/close EIO), later attempts
+        ;; fail at open: the first one may have committed -> :info.
+        (let [calls (atom 0)]
+          (with-redefs [workload/local-overwrite! (fn [_ _]
+                                                    (if (= 1 (swap! calls inc))
+                                                      (throw (java.io.IOException. "Input/output error"))
+                                                      (throw (eagain))))]
+            (let [w (write)]
+              (is (= :info (:type w)))
+              (is (= 3 @calls))
+              (is (str/includes? (:error w) "Resource temporarily unavailable")))))
+        ;; A genuinely missing file is still a definite failure.
+        (with-redefs [workload/local-overwrite! (fn [_ _] (throw (java.nio.file.NoSuchFileException. "reg-0")))]
+          (is (= :fail (:type (write))))))
+      (finally
+        (delete-tree! dir)))))
+
+(deftest pre-mutation-errors-are-open-failures-only
+  (is (workload/pre-mutation-error? (java.nio.file.NoSuchFileException. "x")))
+  (is (workload/pre-mutation-error? (java.io.FileNotFoundException. "x (Resource temporarily unavailable)")))
+  (is (workload/pre-mutation-error? (java.nio.file.FileAlreadyExistsException. "x")))
+  (is (not (workload/pre-mutation-error? (java.io.IOException. "Input/output error"))))
+  (is (not (workload/pre-mutation-error? (RuntimeException. "ssh failed")))))
+
 (deftest local-client-maps-missing-file-errors
   (let [dir (scratch-dir)]
     (try
@@ -286,9 +323,14 @@
   (let [dir (scratch-dir)]
     (try
       (.mkdirs (io/file (workload/workload-dir dir)))
-      (with-redefs [workload/register-path (fn [_ _] (str dir "/jepsen/missing-dir/reg-0"))]
-        (is (thrown? java.io.IOException (workload/local-rename-write! dir 0 5))))
+      ;; A non-empty directory at the destination makes the atomic replace
+      ;; fail after the temp file has been written, so the move path runs.
+      (let [dest (io/file (workload/register-path dir 0))]
+        (.mkdirs dest)
+        (spit (io/file dest "child") "x"))
+      (is (thrown? java.io.IOException (workload/local-rename-write! dir 0 5)))
       (is (empty? (leftover-temp-files dir)))
+      (is (.isDirectory (io/file (workload/register-path dir 0))))
       (finally
         (delete-tree! dir)))))
 

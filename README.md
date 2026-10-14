@@ -426,7 +426,10 @@ history.
 
 
 The filesystem workload drives the FUSE mounts directly. Start a cluster with
-`--filesystemMount` on every node (as `scripts/run-jepsen-local.sh` does), then:
+`--filesystemMount` on every node (as `scripts/run-jepsen-local.sh` does), then
+run it in `--local` mode, which checks linearizability without injecting any
+faults (the partition/kill nemesis only applies to SSH-managed runs without
+`--local`):
 
 ```bash
 cd jepsen && ~/lein run -m elastickv.filesystem-workload --local \

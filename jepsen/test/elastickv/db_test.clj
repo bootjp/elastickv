@@ -23,9 +23,14 @@
     (is (str/includes? cmd "mountpoint -q '/mnt/elastickv test'\\''s dir'"))
     (is (str/includes? cmd "exit 1"))))
 
+(defn- mountpoint-available? []
+  (zero? (:exit (sh/sh "bash" "-c" "command -v mountpoint >/dev/null"))))
+
 (deftest wait-for-mount-command-succeeds-on-a-real-mountpoint
-  (let [cmd (#'db/wait-for-mount-cmd "/")]
-    (is (zero? (:exit (sh/sh "bash" "-c" cmd))))))
+  (if (mountpoint-available?)
+    (let [cmd (#'db/wait-for-mount-cmd "/")]
+      (is (zero? (:exit (sh/sh "bash" "-c" cmd)))))
+    (println "skipping wait-for-mount-command-succeeds-on-a-real-mountpoint: mountpoint not available")))
 
 (deftest filesystem-mount-dir-resolution
   (is (nil? (#'db/filesystem-mount-dir nil "n1")))

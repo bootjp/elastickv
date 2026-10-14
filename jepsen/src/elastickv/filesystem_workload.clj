@@ -373,36 +373,45 @@
 (defn- io-error-label [^Throwable e]
   (str (.. e getClass getSimpleName) ": " (.getMessage e)))
 
+(defn pre-mutation-error?
+  "True when an attempt failed before any byte could reach the register: the
+   register (or temp) file could not be opened or does not exist. Everything
+   else (a write, close, rename or SSH error) may have left the write applied."
+  [^Throwable e]
+  (or (instance? NoSuchFileException e)
+      (instance? FileNotFoundException e)
+      (instance? FileAlreadyExistsException e)))
+
 (defn invoke-write!
-  "Executes a write, retrying retryable errors. A missing register file maps
-   to :fail because no attempt could have reached the backend; any other
-   exhausted error is indeterminate because an attempt may already have been
-   committed."
+  "Executes a write, retrying retryable errors. The outcome is classified
+   over every attempt, not just the last exception: an op is :fail only when
+   all attempts failed before touching the backend, because a single earlier
+   write/close/rename error may already have been committed and a later
+   EAGAIN at open (which RandomAccessFile reports as FileNotFoundException)
+   must not downgrade it to a definite failure."
   [{:keys [local? mount-dir write-mode max-retries]} test node op k v]
-  (try
-    (with-retries max-retries
-      (fn []
-        (if local?
-          (case write-mode
-            :overwrite (local-overwrite! (register-path mount-dir k) v)
-            :rename    (local-rename-write! mount-dir k v))
-          (remote-exec! test node
-                        (case write-mode
-                          :overwrite (remote-overwrite-cmd (register-path mount-dir k) v)
-                          :rename    (remote-rename-cmd mount-dir k v))))))
-    (assoc op :type :ok)
-    (catch NoSuchFileException e
-      (fail op (io-error-label e)))
-    (catch FileNotFoundException e
-      (fail op (io-error-label e)))
-    (catch FileAlreadyExistsException e
-      (fail op (io-error-label e)))
-    (catch AtomicMoveNotSupportedException e
-      (indeterminate op (io-error-label e)))
-    (catch IOException e
-      (indeterminate op (io-error-label e)))
-    (catch Exception e
-      (indeterminate op (io-error-label e)))))
+  (let [maybe-applied? (volatile! false)
+        attempt! (fn []
+                   (try
+                     (if local?
+                       (case write-mode
+                         :overwrite (local-overwrite! (register-path mount-dir k) v)
+                         :rename    (local-rename-write! mount-dir k v))
+                       (remote-exec! test node
+                                     (case write-mode
+                                       :overwrite (remote-overwrite-cmd (register-path mount-dir k) v)
+                                       :rename    (remote-rename-cmd mount-dir k v))))
+                     (catch Exception e
+                       (when-not (pre-mutation-error? e)
+                         (vreset! maybe-applied? true))
+                       (throw e))))]
+    (try
+      (with-retries max-retries attempt!)
+      (assoc op :type :ok)
+      (catch Exception e
+        (if (and (not @maybe-applied?) (pre-mutation-error? e))
+          (fail op (io-error-label e))
+          (indeterminate op (io-error-label e)))))))
 
 (defn invoke-read!
   "Executes a read, retrying retryable errors. Reads never mutate state, so
