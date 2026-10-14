@@ -2320,27 +2320,79 @@ sections defer to is therefore two-sided:
   replacement coordinator on a fresh data directory has neither the list
   nor any evidence that one was lost, reports nothing outstanding, and the
   epoch would activate over exactly the torn transaction). The record is a
-  reserved-key mutation (`!txn|participants|` plus the primary key and
-  `StartTS`, naming every participant group and key) added to the primary
-  PREPARE's write set, so every binary applies it as an ordinary mutation,
-  it commits exactly when the primary decision commits, and it is visible
-  afterwards on every replica of the primary group; the coordinator
-  deletes it once every secondary has acknowledged its COMMIT or ABORT.
-  The epoch proposer derives the outstanding set by scanning every data
-  group for these records, and for pre-epoch locks, instead of polling
-  coordinators, so no coordinator incarnation needs tracking: a lost
-  coordinator leaves its records in place, the `LockResolver` completes
-  each named secondary from the primary's commit record (the record is
-  what makes the secondary nameable), and only a record whose primary
-  group cannot be read keeps the gate closed for operator reconciliation,
-  which the runbook says. Tests: a coordinator that loses its data
-  directory after the primary commit and before the secondary COMMIT is
-  replaced by an empty one, the proposer still sees the record and
-  withholds the epoch, the resolver publishes the secondary, the record is
-  deleted, and the epoch applies; the same with the coordinator merely
-  restarted. A transaction admitted before
-  the coordinator was upgraded, and therefore never on any list, is the
-  residual pre-existing damage already noted at the end of this bullet. The
+  reserved-key mutation added to the primary PREPARE's write set after the
+  meta mutation (`extractTxnMeta` consumes only `muts[0]`), so every
+  binary applies it as an ordinary mutation, it commits exactly when the
+  primary decision commits, and it is visible afterwards on every replica
+  of the primary group. Its key lives in a family the shipped binary
+  already reserves by prefix (corrected in review: a new
+  `!txn|participants|` prefix is ordinary user keyspace to the shipped
+  binary, which `TestIsTxnInternalKeyReservesOnlyKnownFamilies` pins, so
+  reserving it later could hide user rows and a colliding record could
+  overwrite one): the commit-record family, `!txn|cmt|` + primary key + the
+  8-byte `StartTS` suffix with its top bit set, a value no real timestamp
+  carries (the physical half is 48 bits of Unix milliseconds), so it never
+  collides with `txnCommitKey(primary, StartTS)`, `txnRouteKey` strips the
+  suffix and routes it with the primary key exactly, the shipped binary
+  hides it from reads and refuses raw writes to it, and the shipped readers
+  of that family look up exact keys only (`primaryTxnStatus`, the dedup
+  probe); the `!txn|meta|` family was rejected because it is the
+  un-persisted PREPARE header and a suffixed key routes off the primary at
+  a split boundary. The value names every participant group and key.
+  Compatibility tests run the shipped binary's FSM against a PREPARE
+  carrying the record: it is applied as an ordinary mutation, hidden from
+  `RawGet` / `RawScan`, and routed with the primary key. The coordinator
+  deletes the record only once every named secondary key is
+  **confirmed**, not when the secondary COMMIT is acknowledged (corrected
+  in review: a V1 secondary COMMIT acknowledgement proves nothing, because
+  on the reproduced G13 path the secondary PREPARE was skipped as a
+  timestamp replay and on G14 its lock was removed before the primary
+  committed, and in both the legacy COMMIT finds no lock, writes nothing,
+  and returns success). Confirmation is a leader-fenced probe on the
+  secondary group that a committed version of the key exists at exactly
+  the decision timestamp (`CommittedVersionAt`, carried by the
+  `RawLatestCommitTS` key batch in a new exact-timestamp mode next to its
+  at-or-before mode) or, for an aborted transaction, the primary's
+  rollback record; the `txn-v2` marker cannot be written while any record
+  remains. The epoch proposer derives the outstanding set by scanning
+  every data group for these records, and for pre-epoch locks, instead of
+  polling coordinators, so no coordinator incarnation needs tracking: a
+  lost coordinator leaves its records in place, the `LockResolver`
+  completes a named secondary whose intent exists from the primary's
+  commit record, and a record whose named key has neither a version nor
+  an intent (the G13 and G14 shapes) or whose primary group cannot be read
+  keeps the gate closed and names the transaction for operator
+  reconciliation, which the runbook says. Tests: a coordinator that loses
+  its data directory after the primary commit and before the secondary
+  COMMIT is replaced by an empty one, the proposer still sees the record
+  and withholds the epoch, the resolver publishes the secondary, the record
+  is deleted once the probe confirms the version, and the epoch applies;
+  the same with the coordinator merely restarted; the G13 and G14
+  reproductions run under the record-writing coordinator, the acknowledged
+  no-op COMMIT leaves the record in place, and the proposer refuses the
+  epoch naming the transaction. Transactions admitted by a shipped-binary
+  coordinator have no record, so the rollout is two steps (corrected in
+  review: calling such a transaction pre-existing damage did not make the
+  drain fail closed). First, an intermediate release that keeps V1
+  semantics and only writes records is rolled onto every node by graceful
+  restart, which the shipped binary's gRPC and HTTP listeners already
+  honour (`GracefulStop` and `http.Server.Shutdown` drain in-flight
+  requests, and a `Dispatch` runs inside its request), and that release
+  makes the Redis listener's stop drain the same way (checked in review: a
+  Lua or `MULTI` transaction cut mid-2PC is exactly the case the record
+  exists for); admission stops only once every member and coordinator
+  advertises the record capability, so every transaction in flight at the
+  stop has a record. What that cannot cover is a shipped-binary coordinator
+  that died ungracefully (a crash, a kill past the drain, a lost data
+  directory) before its upgrade: nothing on the server can name its
+  transactions. The activation command therefore refuses to propose the
+  epoch unless the operator passes an explicit attestation that every such
+  incident has been reconciled; the attestation and the incident list
+  travel in the epoch entry, and the runbook lists how to find the
+  incidents (restart reasons, the lock namespace, application-level
+  checks). The disk-loss test is also run with the transaction begun on
+  the shipped binary before the upgrade, and asserts the refusal without
+  the attestation and the activation with it. The
   ledger epoch is the first downgrade-incompatible step,
   not a soft poll: a node advertises `txn_v1_drain_ledger` only after
   persisting the downgrade-incompatible `txn-ledger` form of its
