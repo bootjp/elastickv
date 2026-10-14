@@ -2748,7 +2748,17 @@ sections defer to is therefore two-sided:
   crash after it leaves a lock the resolver already settles (TTL expiry,
   rollback), whose settlement makes the row terminal in the same entry; a
   secondary PREPARE carries the primary identity and is fenced by the
-  existing primary-lock check once the primary has rolled back. The
+  existing primary-lock check once the primary has rolled back. Because
+  the row rides in the primary PREPARE, the coordinator sizes that
+  PREPARE with the row against `maxMarshaledCommandSize` before admission
+  and refuses the transaction with the client-visible size error when it
+  does not fit (found in review: every per-group request can fit while
+  the aggregate participant set pushes the primary command past the
+  64 MiB bound, and such a transaction would otherwise be admitted and
+  then fail to replicate for the whole ledger era); the row names each
+  participant by group id and key, the adapters' transaction shapes sit
+  far below the bound, and a test drives a transaction spread over many
+  groups whose per-group requests fit while the row does not. The
   transaction then replicates its decision and each secondary
   confirmation. The V1
   legacy identity `(primaryKey, StartTS)` is reserved on the primary group
