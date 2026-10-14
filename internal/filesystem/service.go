@@ -336,7 +336,7 @@ func (s *Service) InitializeRoot(ctx context.Context, mode uint32, uid uint32, g
 	var lastErr error
 	for range rootInitializationRetryLimit {
 		err := s.initializeRootOnce(ctx, mode, uid, gid)
-		if !errors.Is(err, store.ErrWriteConflict) {
+		if !isRootInitializationConflict(err) {
 			return err
 		}
 		lastErr = err
