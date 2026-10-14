@@ -2647,7 +2647,21 @@ sections defer to is therefore two-sided:
   cross-group transactions, and the epoch is proposed only after the
   last of them has drained and exited, which its graceful stop
   guarantees before the new process advertises, so no shipped-era lock
-  is left for an intermediate transaction to alias. Shipped-against-shipped aliasing during the
+  is left for an intermediate transaction to alias. Two more guards
+  (found in review): a node persists the `txn-reserve` marker form
+  before it advertises the intermediate capability, as the ledger era
+  does with `txn-ledger`, so a coordinator that advertised and was then
+  restarted on the shipped binary is refused at startup rather than
+  admitting unreserved transactions against groups whose epoch already
+  applied; and once the epoch applies on a group, that group's FSM
+  rejects a PREPARE that carries no attempt marker
+  (`ErrTxnReservationRequired`, a definite error the coordinator reports
+  as the upgrading retry), deterministic because every member of the
+  group is the intermediate binary by then, so a coordinator the barrier
+  missed still cannot land an unreserved cross-group PREPARE there.
+  Tests: a node restarted on the shipped binary after advertising is
+  refused; an unreserved PREPARE proposed to a group after its epoch is
+  rejected while a marker-bearing one applies. Shipped-against-shipped aliasing during the
   restart is `main`'s own G12, not the drain's to find; the runbook
   removes it by routing cross-group traffic away from nodes awaiting
   restart or by pausing it at the ingress for the window. Test: a
@@ -2794,7 +2808,20 @@ sections defer to is therefore two-sided:
   A2 (the coordinator treats every such rejection as a pause and retry
   signal, waits until the V2 activation epoch has applied on every
   participant group, revalidates membership and capability, and then
-  restarts the entire transaction, or re-proposes the raw write, as V2; it
+  re-proposes a raw write as V2 itself, while a read-bearing transaction
+  is returned to the adapter as a retry sentinel (`ErrTxnFormatRetry`)
+  rather than restarted by the coordinator (corrected in review: the
+  coordinator holds the computed mutations and the read-key names, not
+  the observations that produced them, so re-running them under a fresh
+  V2 `StartTS` would let a write committed between the original read and
+  the retry fall below the new snapshot and pass validation, and keeping
+  the old `StartTS` keeps the unfenced V1 read's G0 exposure); the
+  adapter repeats its reads under a V2 snapshot and recomputes the
+  mutations, exactly as the composed-1 retry stays in the adapter under
+  A2, with the same metadata-only retry and precondition re-validation
+  for a streaming S3 request whose body is consumed, and a test drives a
+  read-bearing DynamoDB transaction, a Redis `MULTI`, and a streaming S3
+  put through activation and asserts each re-read before retrying; it
   sends no V2 entry to any participant before this barrier; a delayed V1
   one-phase or raw entry can no longer bypass the fence, and a V1
   transaction that read before activation can no longer lock after it,
@@ -2914,16 +2941,21 @@ sections defer to is therefore two-sided:
   ask the joining process for its capability report before proposing the
   conf change and refuse a node that does not advertise `txn_format_v2`.
   The `raft-engine` marker (the same file that already records the
-  backend) has three forms: the legacy `etcd` form, the `txn-ledger` form,
-  and the `txn-v2` form; the shipped binary rejects the last two at
+  backend) has four forms: the legacy `etcd` form, the `txn-reserve`
+  form the intermediate release writes before advertising its capability
+  (added in review: the reservation epoch introduced the form without
+  listing it here, and a node restarted after the epoch would have
+  rejected its own directory), the `txn-ledger` form, and the `txn-v2`
+  form, moving only forward in that order; the shipped binary rejects
+  the last three at
   startup with the error it already has, `ErrUnsupportedRaftEngine`
   wrapped as "invalid raft engine marker" (`readRaftEngineMarker` →
   `parseRaftEngineType` in `multiraft_runtime.go`; the shipped binary has
   no `ErrTxnFormatDowngrade` sentinel, so the rollout runbook and the
   compatibility test match on that message, found in review), and the new
-  binary reads all three and raises `ErrTxnFormatDowngrade` itself when a
-  process pinned to V1 by the operator flag is started on a `txn-ledger`
-  or `txn-v2` directory. A
+  binary reads all four and raises `ErrTxnFormatDowngrade` itself when a
+  process pinned to V1 by the operator flag is started on a
+  `txn-reserve`, `txn-ledger`, or `txn-v2` directory. A
   process advertises `txn_v1_drain_ledger` or `txn_format_v2` only after
   it has persisted the downgrade-incompatible `txn-ledger` form, so a
   capability report that can satisfy either epoch is backed by durable
@@ -2960,21 +2992,27 @@ sections defer to is therefore two-sided:
   an epoch row inside the FSM payload is discoverable only after
   installation, so a fresh replica could otherwise restore such state
   without writing the marker and then be restarted under the shipped
-  binary with no fatal envelope in its WAL. Ledger-era and V2 snapshots
-  are therefore written under a new authenticated FSM snapshot header
-  magic (`EKVTHLC3`, whose payload carries the transaction format,
-  `ledger` or `v2`, next to the ceiling and the cutover index), which the
-  new binary reads and fences on before mutating the FSM (the marker moves
-  to `txn-ledger` first when it is still `etcd`) and which the shipped
+  binary with no fatal envelope in its WAL. Reservation-era, ledger-era,
+  and V2 snapshots are therefore written under a new authenticated FSM
+  snapshot header magic (`EKVTHLC3`, whose payload carries the
+  transaction format, `reserve`, `ledger`, or `v2`, next to the ceiling
+  and the cutover index; `reserve` added in review, since a
+  reservation-era snapshot in the old format could be installed by a
+  fresh learner or a restore under the shipped binary once the epoch
+  entry was compacted, which would then admit unreserved transactions),
+  which the new binary reads and fences on before mutating the FSM (the
+  marker moves to the format's form first, `txn-reserve` for a
+  reservation-era snapshot and `txn-ledger` for a ledger one, whenever
+  the directory's marker is behind it) and which the shipped
   `ReadSnapshotHeader` rejects fail-closed with
   `ErrSnapshotHeaderUnknownMagic` (a trailing V2 extension would not do:
   the shipped reader skips unknown trailing bytes); the external restore
   formats (the streaming MVCC V4 layout, the backup encoder's archive, the
   SST ingest and physical snapshot manifests) carry the same format field,
   and `elastickv-snapshot-prepare-restore` and the physical restore path
-  fence on it the same way. A pre-epoch or V1-pinned node keeps writing
-  the `EKVTHLC2` header, so such clusters stay restorable by the shipped
-  binary. The marker update is atomic and fsyncs the file and directory. A marker-write failure halts apply
+  fence on it the same way. A node before the reservation epoch, or a
+  V1-pinned one, keeps writing the `EKVTHLC2` header, so such clusters
+  stay restorable by the shipped binary. The marker update is atomic and fsyncs the file and directory. A marker-write failure halts apply
   or restore before the durable applied index can advance or a read can
   be served. This covers a follower that never proposes a V2 entry: its
   WAL may omit an already-applied V2 envelope on restart, so the fatal
