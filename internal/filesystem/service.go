@@ -92,6 +92,16 @@ type allGroupsLeaseReader interface {
 	LeaseReadAllGroups(context.Context) error
 }
 
+// allGroupsLeaseTimestampReader is the richer all-group fence that also
+// returns the greatest commit timestamp applied by any fenced group leader.
+// A follower's local LastCommitTS can lag behind that watermark, and its
+// reads are proxied to the leader at the chosen snapshot, so the snapshot
+// must be at least as fresh as the fence or the follower misses writes the
+// fence already made visible (including its own forwarded writes).
+type allGroupsLeaseTimestampReader interface {
+	LeaseReadAllGroupsTimestamp(context.Context) (uint64, error)
+}
+
 type InodeMeta struct {
 	Inode      uint64   `json:"inode"`
 	Parent     uint64   `json:"parent"`
@@ -2575,32 +2585,46 @@ func (s *Service) openHandleExpiresNsec(now time.Time) int64 {
 	return now.Add(s.openLeaseTTL).UnixNano()
 }
 
+// readTS returns the snapshot timestamp for a read: the local applied
+// watermark, raised to the fence's leader-side commit timestamp when the
+// fence reports one. Lease and linearizable fences return Raft indexes, not
+// commit timestamps, so only the all-groups timestamp fence can raise it.
 func (s *Service) readTS(ctx context.Context) (uint64, error) {
-	if err := s.fenceReadSnapshot(ctx); err != nil {
+	fenceTS, err := s.fenceReadSnapshot(ctx)
+	if err != nil {
 		return 0, err
 	}
-	return s.store.LastCommitTS(), nil
+	return max(s.store.LastCommitTS(), fenceTS), nil
 }
 
-func (s *Service) fenceReadSnapshot(ctx context.Context) error {
+// fenceReadSnapshot establishes the read freshness bound and returns the
+// leader-side commit timestamp when the fence exposes one, else zero.
+func (s *Service) fenceReadSnapshot(ctx context.Context) (uint64, error) {
+	if reader, ok := s.dispatch.(allGroupsLeaseTimestampReader); ok {
+		ts, err := reader.LeaseReadAllGroupsTimestamp(ctx)
+		if err != nil {
+			return 0, errors.Wrap(err, "filesystem all-groups lease read")
+		}
+		return ts, nil
+	}
 	if reader, ok := s.dispatch.(allGroupsLeaseReader); ok {
 		if err := reader.LeaseReadAllGroups(ctx); err != nil {
-			return errors.Wrap(err, "filesystem all-groups lease read")
+			return 0, errors.Wrap(err, "filesystem all-groups lease read")
 		}
-		return nil
+		return 0, nil
 	}
 	if reader, ok := s.dispatch.(leaseReader); ok {
 		if _, err := reader.LeaseRead(ctx); err != nil {
-			return errors.Wrap(err, "filesystem lease read")
+			return 0, errors.Wrap(err, "filesystem lease read")
 		}
-		return nil
+		return 0, nil
 	}
 	if reader, ok := s.dispatch.(linearizableReader); ok {
 		if _, err := reader.LinearizableRead(ctx); err != nil {
-			return errors.Wrap(err, "filesystem linearizable read")
+			return 0, errors.Wrap(err, "filesystem linearizable read")
 		}
 	}
-	return nil
+	return 0, nil
 }
 
 // dispatchTxn binds a Phase-D read voucher to the transaction's caller-supplied
