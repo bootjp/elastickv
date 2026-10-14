@@ -425,6 +425,18 @@ history.
 
 
 
+The filesystem workload drives the FUSE mounts directly. Start a cluster with
+`--filesystemMount` on every node (as `scripts/run-jepsen-local.sh` does), then:
+
+```bash
+cd jepsen && ~/lein run -m elastickv.filesystem-workload --local \
+  --time-limit 20 --rate 5 --concurrency 6 --write-mode rename \
+  --mount-dirs /tmp/elastickv-test-run/fs-n1,/tmp/elastickv-test-run/fs-n2,/tmp/elastickv-test-run/fs-n3
+```
+
+`--write-mode overwrite` replaces each register with one in-place `pwrite`;
+`--write-mode rename` writes a temp file and renames it over the key.
+
 ### Setup pre-commit hooks
 ```bash
 git config --local core.hooksPath .githooks

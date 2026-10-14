@@ -540,8 +540,18 @@ Phase 3:
    - committed Truncate/SetAttr shrink cleanup survives caller cancellation
    - TTL lease expiry and orphan GC correctness
 3. Jepsen-like:
-   - concurrent append + read under node failure
-   - migration during read/write load
+   - linearizable register over the FUSE mounts
+     (`jepsen/src/elastickv/filesystem_workload.clj`): every node mounts the
+     shared filesystem and each key is one fixed-width file. `--write-mode
+     overwrite` replaces the record with a single in-place pwrite (one chunk
+     RMW); `--write-mode rename` writes a temp file and renames it over the
+     key (namespace transaction, remove-while-open). `--local` drives the
+     mounts through java.nio; without it the client runs `dd`/`head`/`mv` on
+     each node over SSH and the DB adapter starts nodes with
+     `--filesystemMount`, so the partition/kill nemesis applies. The CI
+     `jepsen-test` workflow runs both modes against the 3-node cluster.
+   - concurrent append + read under node failure (open)
+   - migration during read/write load (open)
 4. FUSE compatibility:
    - go-fuse raw protocol tests for stable attributes, handles, and resumable
      `readdir` offsets
