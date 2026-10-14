@@ -272,48 +272,82 @@ through `ApplyMutationsRaftAt` with no mutations so both watermarks become
 idempotent, a no-op on replay, refused for 0 and `^uint64(0)`, observed by
 the HLC so a fenced write retries above it, carried by every snapshot;
 **open, a merge blocker for this branch:** the apply must raise the
-replicated physical ceiling to at least the advance's physical half **plus
-one millisecond of rollover headroom** (found in review: a snapshot whose
-logical half is `0xffff`, which 65,536 allocations in one leased
-millisecond produce legitimately, would otherwise leave `last` exhausted,
-and the next `NextFenced` wraps to the following millisecond and is
-rejected above the ceiling until a renewal overtakes it; a maximum-logical
-snapshot test covers the boundary) **before** the HLC observes it, because
-`NextFenced` floors the physical
-half at the ceiling and rejects any value above it, so a value observed
-above the ceiling makes every subsequent persistence allocation on the
-group fail with `ErrCeilingExpired` until a lease renewal overtakes it,
-which frequent cross-group reads from a group whose clock runs ahead would
-keep from ever happening; see the read path below); **open, a merge
-blocker for this branch:** the lease renewal target must clear an
-advanced ceiling (found in review: that headroom is exactly one logical
-window. Every fenced allocation sits at the ceiling's physical
+replicated physical ceiling to the advance's physical half **before** the
+HLC observes it, because `NextFenced` floors the physical half at the
+ceiling and rejects any value above it, so a value observed above the
+ceiling makes every subsequent persistence allocation on the group fail
+with `ErrCeilingExpired` until a lease renewal overtakes it, which
+frequent cross-group reads from a group whose clock runs ahead would keep
+from ever happening (found in review; see the read path below). The raise
+is to the observed physical half exactly, not one millisecond above it
+(an earlier revision added a millisecond of rollover headroom; withdrawn
+in review): every fenced allocation sits at the ceiling's physical
 millisecond, because `fencedNowMillis` floors the wall at the ceiling and
-the fence rejects a wall at or past it, so one ceiling value holds 65,536
-timestamps and a group's budget is one fresh window per renewal tick
-(`hlcRenewalInterval`, 1 s), whatever `hlcPhysicalWindowMs` (20 s) is;
-`SetPhysicalCeiling` keeps the maximum, so a renewal at `wall +
-hlcPhysicalWindowMs` below a ceiling the advance pushed ahead is ignored,
-and `RecoverHLCLease` acts only once the wall reaches the ceiling. A busy
-receiver with no further advance therefore exhausts that one window and
-fails every write with `ErrCeilingExpired` until its wall catches up, for
-up to the clock skew between the two groups, which the admission bound
-below caps at about one window. Decision: the renewal target on every
-group a node renews, in `renewHLCLease` and in the single-group
-`Coordinator`, becomes
+the fence rejects a wall at or past it, so a receiver whose ceiling is
+raised one millisecond above the sender's value issues above the sender,
+the next snapshot taken across both groups carries the receiver's value
+back, and alternating cross-group traffic staircases both ceilings by a
+millisecond per operation with no bound (the staircase the peer-only
+`ForwardRead` token guards against, reached by ordinary traffic); raised
+to the value itself, the receiver shares the sender's millisecond and the
+ceilings move only with renewals. The rule is not specific to the advance
+entry: the same observation happens for every replicated entry that
+carries a leader-issued timestamp (PREPARE, COMMIT, one-phase, raw,
+`DEL_PREFIX`), through `observeAppliedCommitTS` after each apply and
+`observeStoreLastCommitTS` at open, and a 2PC secondary whose process
+hosts no member of the primary group never sees the primary group's lease
+entries, so a primary on a faster clock poisons the secondary's `last`
+with every COMMIT it stamps and starves the secondary's own writes for as
+long as the skew lasts (found in review); `kvFSM` therefore raises the
+ceiling to the physical half of every timestamp it is about to observe,
+on apply and at open, which is deterministic across members because it
+is a function of the applied log and the restored snapshot, so a new
+leader floors at the same value. Two consequences follow. One, the lease
+renewal target must clear a raised ceiling (found in review): one ceiling
+value holds 65,536 timestamps and a group's budget is one fresh window
+per renewal tick (`hlcRenewalInterval`, 1 s), whatever
+`hlcPhysicalWindowMs` (20 s) is; `SetPhysicalCeiling` keeps the maximum,
+so a renewal at `wall + hlcPhysicalWindowMs` below a raised ceiling is
+ignored, and a busy receiver with no further raise would exhaust its one
+window and fail every write with `ErrCeilingExpired` until its wall
+caught up, for up to the clock skew between the two groups, which the
+admission bound below caps at about one window. Decision: the renewal
+target on every group a node renews, in `renewHLCLease` and in the
+single-group `Coordinator`, becomes
 `max(wall + hlcPhysicalWindowMs, PhysicalCeiling() + 1)`, so each tick
-opens one fresh window above an advanced ceiling, exactly the budget an
+opens one fresh window above a raised ceiling, exactly the budget an
 unskewed group has; the ceiling then drifts by one millisecond per tick
-while it sits ahead of the wall and returns to
-`wall + hlcPhysicalWindowMs` the moment the wall overtakes; on-demand recovery
-is unchanged, since it runs only once the wall has reached the ceiling,
-where the two targets coincide; and a renewal is a ceiling move, which
-`tla/hlc` already models as `ApplyCeiling`. Tests: a receiver advanced
-ahead of its wall by more than one tick and given no further advance
-allocates past 65,536 fenced timestamps across two ticks; its target
-falls back to `wall + hlcPhysicalWindowMs` once the wall passes the
-advanced value; the maximum-logical case above still holds with the new
-target);
+per group while it sits ahead of the wall (coupled groups pass each
+tick's raise to each other through observation, so the drift is one
+millisecond per tick per coupled group against a wall that moves a
+thousand, and the coupled ceilings track the fastest group's
+`wall + hlcPhysicalWindowMs`) and returns to its own
+`wall + hlcPhysicalWindowMs` as soon as the wall overtakes; a renewal is
+a ceiling move, which `tla/hlc` already models as `ApplyCeiling`. Two,
+on-demand recovery covers the exhausted window: `RecoverHLCLease` today
+proposes only once the wall has passed the ceiling, so a `last` at
+logical `0xffff` of the ceiling's millisecond, which 65,536 allocations
+in one leased millisecond or an observed maximum-logical snapshot produce
+legitimately, would fail writes until the next tick; it is entered on
+every `ErrCeilingExpired` instead (its callers already are the fenced
+allocation paths), proposes the same
+`max(wall + hlcPhysicalWindowMs, PhysicalCeiling() + 1)` target, and
+reports success once the fenced path can issue again (the ceiling is
+above `last`'s millisecond, or `last` has logical room at it), so the
+exhausted case costs one Raft round trip, serialized by `hlcRecoveryMu`
+as the expired-wall case is today. Tests: a receiver advanced ahead of its
+wall by more than one tick and given no further advance allocates past
+65,536 fenced timestamps across two ticks; its target falls back to
+`wall + hlcPhysicalWindowMs` once the wall passes the raised value; a
+maximum-logical snapshot issues again after one on-demand renewal; two
+groups on skewed clocks exchanging cross-group snapshot reads and 2PC
+commits in both directions over many operations keep their ceilings
+within one tick of each other and of the faster group's
+`wall + hlcPhysicalWindowMs`, which pins the absence of the staircase; a
+2PC secondary whose process hosts no primary-group member keeps issuing
+its own writes while a primary on a faster clock commits through it
+repeatedly; a restart from a snapshot whose `lastCommitTS` physical half
+exceeds its ceiling issues immediately);
 `21a11ddc` the read path: every leader-local `ShardStore` read (eleven
 entry points: get, exists, the version probes, every scan shape) goes
 through `leaderReadAt`, whose behaviour depends on the intent carried in
@@ -465,7 +499,8 @@ Open after this branch:
   carries that version, and a leader whose applied catalog has a different
   owner for the key, or an armed M2 cutover read fence for its interval,
   rejects the read with a retryable route-moved error, on which the
-  coordinator discards the snapshot and restarts the whole request
+  adapter's `TransactGetItems` handler discards the snapshot and restarts
+  the whole request from the group resolution, re-reading every key
   (bounded retries, then a retryable 5xx). Fencing the old owning group and
   then reading through a newer catalog that routes the key to the
   migration target would otherwise let the target, which never received
@@ -659,7 +694,12 @@ branch, not pushed). What landed:
   won leadership in between); the landed value comes back through
   `ForwardResponse.CommitTs` or the commit record and the secondaries are
   committed with it. The first apply of the primary COMMIT is fenced;
-  secondary and repeated primary COMMITs are not. A hazard found on the way:
+  secondary and repeated primary COMMITs are not (a secondary's HLC
+  observes the primary's stamped value on apply; a secondary whose process
+  hosts no primary-group member and runs on a slower clock would be
+  starved by it, found in review, which the ceiling raise before
+  observation in the A0 advance notes closes for every replicated apply,
+  not only the advance entry). A hazard found on the way:
   a lost reply to an unstamped primary COMMIT makes `LeaderProxy` re-forward
   it, the leader stamps a second timestamp, and the transaction looks
   failed; `settleFailedPrimaryCommit` therefore aborts the primary group
@@ -1437,11 +1477,25 @@ Constraints the fix PR must close before merge:
   not own).
   The FSM rejects a PREPARE or one-phase entry whose pinned version
   predates a cutover that moved any of its keys **or read keys** (the
-  existing Composed-1 fence, extended to read keys), and the coordinator
-  restarts the whole operation on a fresh snapshot (bounded retries).
+  existing Composed-1 fence, extended to read keys), and the operation
+  restarts on a fresh snapshot where the reads can be repeated (corrected
+  in review: `Dispatch` receives only the computed `StartTS`, `ReadKeys`,
+  and `Elems` and has no way to repeat the adapter's reads, so a
+  coordinator-level restart would commit the old mutations against a
+  newer snapshot and miss every write between the two). The existing
+  `dispatchTxnWithComposed1Retry` split therefore stands: a
+  coordinator-allocated, read-free transaction retries inside the
+  coordinator; a read-bearing one (non-empty `ReadKeys`, or a
+  caller-supplied `StartTS`) surfaces the retryable route-moved sentinel
+  to the adapter, which re-executes the whole operation (resolves its
+  groups from a fresh `RouteEngine` snapshot, re-reads at a fresh leader
+  snapshot, recomputes its mutations, re-dispatches) within bounded
+  retries, the same contract the M4 loop already imposes on adapters.
   Tests: a cutover between the read and the PREPARE of a read-write
-  transaction is rejected and restarted; a resolver-routed transaction is
-  documented as outside the claim. Until both the drain and the pin land,
+  transaction is rejected, surfaced to the adapter, and re-executed from
+  the read, with a write that landed between the two snapshots visible
+  to the second attempt; a resolver-routed transaction is documented as
+  outside the claim. Until both the drain and the pin land,
   deployments running hotspot M2 migrations are excluded from the
   serializability claim (§6.1 of the roadmap). Implementation on
   `design/serializable-audit-a2-migration-drain`.
