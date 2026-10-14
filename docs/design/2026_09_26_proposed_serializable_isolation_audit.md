@@ -2313,14 +2313,32 @@ sections defer to is therefore two-sided:
   coordinator then crashed, the primary lock is gone and the only complete
   participant list went with the coordinator; the later lock and ledger
   scan cannot name the missing secondary and would publish `txn-v2` over
-  a torn transaction. The upgraded coordinator therefore persists each V1
-  transaction's participant set in a coordinator-local durable outstanding
-  list before its first PREPARE (fsynced, in its data directory), finishes
-  or aborts every entry of that list on restart, and reports the list to
-  the epoch proposer, which applies the epoch only when every coordinator
-  reports it empty; a coordinator whose local list cannot be recovered (a
-  lost data directory) keeps the gate closed until an operator reconciles
-  its transactions, and the runbook says so. A transaction admitted before
+  a torn transaction. The upgraded coordinator therefore records each V1
+  transaction's participant set in **replicated** state before the primary
+  decision can commit, not in a coordinator-local list (corrected in
+  review: a coordinator-local list cannot fail closed, because a
+  replacement coordinator on a fresh data directory has neither the list
+  nor any evidence that one was lost, reports nothing outstanding, and the
+  epoch would activate over exactly the torn transaction). The record is a
+  reserved-key mutation (`!txn|participants|` plus the primary key and
+  `StartTS`, naming every participant group and key) added to the primary
+  PREPARE's write set, so every binary applies it as an ordinary mutation,
+  it commits exactly when the primary decision commits, and it is visible
+  afterwards on every replica of the primary group; the coordinator
+  deletes it once every secondary has acknowledged its COMMIT or ABORT.
+  The epoch proposer derives the outstanding set by scanning every data
+  group for these records, and for pre-epoch locks, instead of polling
+  coordinators, so no coordinator incarnation needs tracking: a lost
+  coordinator leaves its records in place, the `LockResolver` completes
+  each named secondary from the primary's commit record (the record is
+  what makes the secondary nameable), and only a record whose primary
+  group cannot be read keeps the gate closed for operator reconciliation,
+  which the runbook says. Tests: a coordinator that loses its data
+  directory after the primary commit and before the secondary COMMIT is
+  replaced by an empty one, the proposer still sees the record and
+  withholds the epoch, the resolver publishes the secondary, the record is
+  deleted, and the epoch applies; the same with the coordinator merely
+  restarted. A transaction admitted before
   the coordinator was upgraded, and therefore never on any list, is the
   residual pre-existing damage already noted at the end of this bullet. The
   ledger epoch is the first downgrade-incompatible step,
