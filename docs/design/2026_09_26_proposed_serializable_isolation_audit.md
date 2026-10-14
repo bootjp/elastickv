@@ -2442,23 +2442,37 @@ sections defer to is therefore two-sided:
   shipped COMMIT honours (`ErrTxnAlreadyAborted` on a rollback record,
   the recorded timestamp otherwise). (2) **One fresh key per per-group
   PREPARE**, the attempt marker: `!txn|cmt|` + the group's lowest write
-  key + `StartTS` with bit 62 set, value the attempt id (16 random
-  bytes; no real timestamp sets bit 62 or bit 63, the physical half
-  being 48 bits of Unix milliseconds). The shipped timestamp fast path
+  key + the attempt id (16 random bytes) + `StartTS` with bit 62 set,
+  with an empty value (no real timestamp sets bit 62 or bit 63, the
+  physical half being 48 bits of Unix milliseconds). The attempt id is
+  part of the key (corrected in review: keyed by the group's key and
+  `StartTS` alone, two transactions with different primaries, the same
+  `StartTS`, and the same lowest write key on one group, which the
+  reservations let through, shared the marker; once the first had
+  completed, every row of the second's delayed PREPARE on that group had
+  a version at `StartTS`, so it was skipped as the first one's replay and
+  its write was lost, the G13 shape again, and a value cannot help an
+  existence probe). The shipped timestamp fast path
   (`raftApplyAlreadyLandedWith`) skips a PREPARE only when every store
   mutation has a version at `StartTS`, and the marker's lock and intent
   rows have one only if this PREPARE itself applied, so the G13 skip
   cannot take a marker-bearing PREPARE on either binary while a genuine
-  re-proposal is still skipped; the marker routes with the group's key
-  under the shipped `txnRouteKey` (eight bytes stripped), is hidden and
+  re-proposal is still skipped, and the delayed PREPARE above now fails
+  `validateConflicts` on the key the first transaction committed. The
+  coordinator appends the marker to the group's PREPARE itself, so where
+  the router would place the key does not matter (the FSM's
+  route-ownership check skips transaction-internal keys); the shipped
+  `txnRouteKey` strips eight bytes and routes the marker by the group's
+  key followed by the attempt id, which sits in the group's range unless
+  a split boundary falls inside that suffix, and either way nothing
+  depends on the marker once its PREPARE applied: it is hidden and
   refused for raw writes as the commit-record family is, nothing reads
   it, it is committed or rolled back with the group's keys, and the
   post-activation sweep removes it. Its lock and intent rows route, once
   `routeKey` strips their one wrapper, by the marker's own bytes, so a
   range move inside the PREPARE-to-COMMIT window can leave them behind
   (true of every `!txn|cmt|`-keyed mutation, the earlier revision's
-  record included); harmless here, since nothing depends on the marker
-  once its PREPARE applied and an orphaned row is settled by the
+  record included); harmless, since an orphaned row is settled by the
   resolver like any lock. (3) **Identity reservation.** Before the
   primary PREPARE the coordinator runs a one-key V1 2PC on `!txn|cmt|` +
   primary key + `StartTS` with bit 63 set (the earlier revision's record
@@ -2473,19 +2487,31 @@ sections defer to is therefore two-sided:
   whose key has a committed version above `StartTS`, and the shipped
   COMMIT rejects a second commit of one identity at another timestamp
   (`commit_ts mismatch`, `ErrTxnInvalidMeta`) and a commit after a
-  rollback record (`ErrTxnAlreadyAborted`), so exactly one reservation
-  COMMIT succeeds. The coordinator admits the transaction only when its
-  own reservation COMMIT returned success; an ambiguous outcome is
-  retried with the same timestamp until it is definite (a record at its
-  own timestamp is success, a record at another timestamp or a rollback
-  record is loss), and a loss retries the whole transaction under a
-  fresh snapshot before any PREPARE. The reservation path never enters
-  the generic completion by which the V1 coordinator finishes a
-  transaction whose primary COMMIT failed but whose identity turns out
-  committed (the G12 behaviour, where the loser's secondaries are
-  committed at the winner's timestamp and success is reported), and it
-  never aborts a reservation. The committed value is diagnostic only and
-  may name the losing attempt when the PREPAREs overlapped. No two
+  rollback record (`ErrTxnAlreadyAborted`), so at most one reservation
+  COMMIT lands and the key then holds exactly one committed version,
+  carrying the attempt id of whichever PREPARE wrote the intent last.
+  That committed value is the arbiter, not the COMMIT's own outcome
+  (found in review: the outcome is not unique, because a second COMMIT
+  stamped with the same timestamp, which `main`'s any-node stamping and
+  a leadership change between the first COMMIT's Raft commit and its
+  apply both produce, is accepted as an idempotent replay of the first,
+  so both coordinators would see success). The coordinator drives its
+  COMMIT to a definite outcome (an ambiguous proposal is retried with
+  the same timestamp until a commit record or a rollback record
+  exists), then performs a leader-fenced read of the reservation key on
+  the primary group and admits the transaction only if the committed
+  value names its own attempt; a foreign value, or no committed version
+  (a rollback record), retries the whole transaction under a fresh
+  snapshot before any PREPARE. The value is final once a version
+  exists, because a later PREPARE on the key fails `validateConflicts`
+  and nothing else writes it, and it names exactly one attempt, so
+  exactly one coordinator is admitted however the PREPAREs and COMMITs
+  interleave, with no dependence on timestamp uniqueness. The
+  reservation path never enters the generic completion by which the V1
+  coordinator finishes a transaction whose primary COMMIT failed but
+  whose identity turns out committed (the G12 behaviour, where the
+  loser's secondaries are committed at the winner's timestamp and
+  success is reported), and it never aborts a reservation. No two
   transactions of the intermediate release therefore share an identity,
   which is what G12 needs. A raw or one-phase write cannot serve, since
   both refuse transaction-internal keys (`validateRawMutationForApply`,
@@ -2520,18 +2546,25 @@ sections defer to is therefore two-sided:
   reproductions run under the intermediate coordinator against the
   shipped FSM and **pass** (every write lands, the reader gets `txn
   locked`); the G12 aliasing reproduction under it, run once with the
-  two reservation PREPAREs overlapped before either COMMIT and once with
-  the second PREPARE after the first COMMIT, ends with exactly one
-  coordinator admitted, the other retried under a fresh snapshot, and
-  no mixed outcome; a coordinator that loses its data directory
+  two reservation PREPAREs overlapped before either COMMIT, once with
+  the second PREPARE after the first COMMIT, and once with the second
+  COMMIT stamped at the first one's timestamp across a leadership change
+  between the first COMMIT's Raft commit and its apply, ends with
+  exactly one coordinator admitted, the other retried under a fresh
+  snapshot, and no mixed outcome; a coordinator that loses its data
+  directory
   after the primary commit and before the secondary COMMIT is replaced
   by an empty one, the scan finds the secondary lock, the resolver
   publishes it from the commit record, and the epoch applies; the same
   with the coordinator merely restarted; a coordinator crashed between
   the reservation and the primary PREPARE leaves nothing the epoch waits
   for; the resolver settles a marker's lock and the user key's lock in
-  either order to the same outcome; and a per-group PREPARE that fits
-  only before augmentation is refused before any PREPARE is sent.
+  either order to the same outcome; a per-group PREPARE that fits only
+  before augmentation is refused before any PREPARE is sent; and two
+  transactions with different primaries, the same `StartTS`, and the
+  same lowest write key on a secondary group, the second's PREPARE there
+  delayed past the first's COMMIT, see that PREPARE fail with a write
+  conflict instead of being skipped.
   Transactions admitted by a shipped-binary coordinator carry neither
   marker nor reservation, so the rollout is two steps (corrected in
   review: calling such a transaction pre-existing damage did not make the
