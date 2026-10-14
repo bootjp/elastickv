@@ -73,6 +73,31 @@ func (s *g17FailingEntryStore) ApplyRaftEntry(ctx context.Context, appliedIndex 
 	})
 }
 
+// g17OperationalFailureStore fails the second request of an entry with an
+// error that is not a verdict, the shape of a Pebble read failure during a
+// request's staging, while the first request has already staged.
+type g17OperationalFailureStore struct {
+	store.MVCCStore
+	calls int
+	err   error
+}
+
+func (s *g17OperationalFailureStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	s.calls++
+	if s.calls == 2 {
+		return s.err
+	}
+	return s.MVCCStore.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex)
+}
+
+func (s *g17OperationalFailureStore) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error {
+	applier, ok := s.MVCCStore.(store.RaftEntryApplier)
+	if !ok {
+		return fn(ctx)
+	}
+	return applier.ApplyRaftEntry(ctx, appliedIndex, fn)
+}
+
 type g17AppliedIndexReader interface {
 	LastAppliedIndex() (uint64, bool, error)
 }
@@ -319,6 +344,64 @@ func TestFSMApplyBatch_EntryFailureHaltsApply(t *testing.T) {
 	require.False(t, g17Exists(t, st, "k2"))
 	_, present := g17AppliedIndex(t, st)
 	require.False(t, present, "nothing of a failed entry may be durable")
+}
+
+// TestFSMApplyBatch_OperationalRequestFailureHaltsApply pins that a request
+// that fails operationally while the entry is being staged (a Pebble read
+// failure, not a verdict) discards the whole entry and halts the engine.
+// Reported as a per-request result, the other requests and the applied
+// index would commit and this replica would diverge from the replicas
+// where the request succeeded (found in review).
+func TestFSMApplyBatch_OperationalRequestFailureHaltsApply(t *testing.T) {
+	st := g17OpenStore(t, t.TempDir())
+	errRead := errors.New("pebble: read failed")
+	fsm := g17FSM(t, &g17OperationalFailureStore{MVCCStore: st, err: errRead})
+
+	resp := fsm.Apply(g17TwoPutEntry(t))
+
+	halter, ok := resp.(interface{ HaltApply() error })
+	require.True(t, ok, "an operational request failure must halt the engine, got %T", resp)
+	require.True(t, errors.Is(halter.HaltApply(), ErrRaftEntryApply), "err = %v", halter.HaltApply())
+	require.True(t, errors.Is(halter.HaltApply(), errRead), "err = %v", halter.HaltApply())
+	require.False(t, g17Exists(t, st, "k1"), "the first request must not land when the second failed operationally")
+	require.False(t, g17Exists(t, st, "k2"))
+	_, present := g17AppliedIndex(t, st)
+	require.False(t, present)
+}
+
+// TestFSMApplyBatch_VerdictsStayPerRequest pins the other side of the same
+// rule: a verdict (a write conflict, an unknown op, an invalid request) is
+// reported per request, the other requests land, and the entry commits.
+func TestFSMApplyBatch_VerdictsStayPerRequest(t *testing.T) {
+	st := g17OpenStore(t, t.TempDir())
+	fsm := g17FSM(t, st)
+
+	unknownOp := g17RawPut(12, "unknown", "v")
+	unknownOp.Mutations[0].Op = pb.Op(99)
+	resp := fsm.Apply(g17Entry(t,
+		g17RawPut(10, "k", "first"),
+		g17RawPut(9, "k", "stale"),
+		unknownOp,
+		g17RawPut(13, "", "bad"),
+		g17RawPut(14, "last", "v"),
+	))
+
+	applyResp, ok := resp.(*fsmApplyResponse)
+	require.True(t, ok, "verdicts must not halt the engine, got %T", resp)
+	require.Len(t, applyResp.results, 5)
+	require.NoError(t, applyResp.results[0])
+	require.True(t, errors.Is(applyResp.results[1], store.ErrWriteConflict), "err = %v", applyResp.results[1])
+	require.True(t, errors.Is(applyResp.results[2], ErrUnknownRequestType), "err = %v", applyResp.results[2])
+	require.True(t, errors.Is(applyResp.results[3], ErrInvalidRequest), "err = %v", applyResp.results[3])
+	require.NoError(t, applyResp.results[4])
+
+	got, err := st.GetAt(context.Background(), []byte("k"), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("first"), got)
+	require.True(t, g17Exists(t, st, "last"))
+	idx, present := g17AppliedIndex(t, st)
+	require.True(t, present)
+	require.Equal(t, g17EntryIndex, idx)
 }
 
 // TestFSMApplyBatch_ObserversSeeOnlyCommittedWrites pins that apply observers

@@ -415,7 +415,7 @@ func (f *kvFSM) applyBatchedRequests(ctx context.Context, reqs []*pb.Request, re
 	f.beginDeferredApplyNotices()
 	err := applier.ApplyRaftEntry(ctx, f.pendingApplyIdx, func(ctx context.Context) error {
 		hasError = f.applyRequestsOneByOne(ctx, reqs, results)
-		return nil
+		return firstOperationalRequestFailure(results)
 	})
 	if err != nil {
 		f.discardDeferredApplyNotices()
@@ -423,6 +423,38 @@ func (f *kvFSM) applyBatchedRequests(ctx context.Context, reqs []*pb.Request, re
 	}
 	f.flushDeferredApplyNotices()
 	return nil, hasError
+}
+
+// firstOperationalRequestFailure returns the first per-request error that is
+// not a verdict. A verdict (an invalid request, a fenced route, a lock or
+// write conflict, an unknown op) is a function of the entry and the
+// replicated state, so every replica reaches it identically and it stays a
+// per-request result. Anything else (a Pebble read failure under a lock
+// check, an encryption failure, a corrupt lock row) is replica-local:
+// returned from the entry callback it discards the whole entry and halts
+// the engine, because committing the other requests and the applied
+// index would let this replica diverge from those where the request
+// succeeded (found in review).
+func firstOperationalRequestFailure(results []error) error {
+	for i, err := range results {
+		if err != nil && !isRawApplyVerdict(err) {
+			return errors.Wrapf(err, "request %d failed operationally", i)
+		}
+	}
+	return nil
+}
+
+// isRawApplyVerdict reports whether err is a deterministic verdict of the
+// raw apply path, on the FSM side or the store side.
+func isRawApplyVerdict(err error) bool {
+	return errors.Is(err, ErrInvalidRequest) ||
+		errors.Is(err, ErrUnknownRequestType) ||
+		errors.Is(err, ErrBackupTimestampFenced) ||
+		errors.Is(err, ErrRouteWriteFenced) ||
+		errors.Is(err, ErrRouteWriteTimestampTooLow) ||
+		errors.Is(err, ErrComposed1VersionGCd) ||
+		errors.Is(err, ErrTxnLocked) ||
+		store.IsApplyVerdict(err)
 }
 
 func (f *kvFSM) applyRequestsOneByOne(ctx context.Context, reqs []*pb.Request, results []error) bool {

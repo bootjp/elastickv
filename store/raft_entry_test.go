@@ -337,6 +337,25 @@ func TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock(t *testing.T) {
 	require.Equal(t, uint64(4), idx)
 }
 
+func TestIsApplyVerdict(t *testing.T) {
+	for _, err := range []error{
+		NewWriteConflictError([]byte("k")),
+		errors.Wrap(ErrUnknownOp, "wrapped"),
+		errors.Wrapf(ErrValueTooLarge, "value length %d", 1),
+		errors.WithStack(errMVCCMetadataKeyCollision),
+	} {
+		require.True(t, IsApplyVerdict(err), "verdict %v", err)
+	}
+	for _, err := range []error{
+		errors.New("pebble: read failed"),
+		errors.WithStack(ErrRaftEntryStoreSwapped),
+		errors.WithStack(ErrWriterNotRegistered),
+		nil,
+	} {
+		require.False(t, IsApplyVerdict(err), "operational %v", err)
+	}
+}
+
 func TestApplyRaftEntry_InMemoryStoreRunsTheCallback(t *testing.T) {
 	ctx := context.Background()
 	st := NewMVCCStore()

@@ -25,11 +25,29 @@ import (
 // The batch is committed once, with one applied-index write, after fn
 // returns nil. A non-nil error from fn, or a failure while staging, discards
 // the whole batch: nothing of the entry becomes durable. Per-request
-// validation failures (a write conflict, an invalid mutation) are returned
-// to the caller of the staging call and leave the batch untouched, so the
-// per-request result semantics of a batched entry are unchanged.
+// verdicts (a write conflict, an invalid mutation; see IsApplyVerdict) are
+// returned to the caller of the staging call and leave the batch untouched,
+// so the per-request result semantics of a batched entry are unchanged. An
+// operational failure while staging (a Pebble read or iterator error, an
+// encryption failure) is replica-local, so it fails the whole scope rather
+// than one request: committing the rest of the entry would diverge from
+// the replicas where the request succeeded (found in review).
 type RaftEntryApplier interface {
 	ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error
+}
+
+// IsApplyVerdict reports whether err is a deterministic verdict of the
+// apply path, a function of the entry and the replicated state that every
+// replica reaches identically: a write conflict, an unknown op, an
+// oversized value, or a key that collides with the store's metadata
+// namespace. Every other error from a staging call is operational and
+// replica-local. kvFSM uses it to keep verdicts per request and to halt
+// on anything else.
+func IsApplyVerdict(err error) bool {
+	return errors.Is(err, ErrWriteConflict) ||
+		errors.Is(err, ErrUnknownOp) ||
+		errors.Is(err, ErrValueTooLarge) ||
+		errors.Is(err, errMVCCMetadataKeyCollision)
 }
 
 // ErrRaftEntryStoreSwapped is returned when the Pebble DB was replaced (a
@@ -219,7 +237,7 @@ func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raft
 	if appliedIndex > 0 {
 		landed, err := s.raftApplyAlreadyLandedWith(scope.batch, mutations, commitTS)
 		if err != nil {
-			return err
+			return scope.fail(err)
 		}
 		if landed {
 			scope.observe(commitTS, true)
@@ -227,17 +245,26 @@ func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raft
 		}
 	}
 	if err := s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, false); err != nil {
-		return err
+		return scope.failUnlessVerdict(err)
 	}
 	encoded, err := s.encodeMutationsForBatch(mutations, commitTS, false)
 	if err != nil {
-		return err
+		return scope.failUnlessVerdict(err)
 	}
 	if err := stageEncodedMutations(scope.batch, encoded); err != nil {
 		return scope.fail(err)
 	}
 	scope.observe(commitTS, true)
 	return nil
+}
+
+// failUnlessVerdict returns a per-request verdict untouched and fails the
+// scope for any other error, which is operational.
+func (sc *raftEntryScope) failUnlessVerdict(err error) error {
+	if IsApplyVerdict(err) {
+		return err
+	}
+	return sc.fail(err)
 }
 
 // stagePrefixDeletesInRaftEntry is DeletePrefixesAtRaftAt inside a Raft
@@ -263,7 +290,7 @@ func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, delet
 
 	iter, err := newDeletePrefixesIteratorWith(scope.batch, deletes)
 	if err != nil {
-		return errors.WithStack(err)
+		return scope.fail(errors.WithStack(err))
 	}
 	defer iter.Close()
 
