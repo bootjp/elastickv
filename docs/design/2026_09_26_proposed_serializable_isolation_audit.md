@@ -413,7 +413,8 @@ calls the new `LeaderSnapshotCoordinator` capability, which
 `ShardedCoordinator` implements by fencing the leaders of the groups the
 operation **routes to** (the owning groups of a point or range read's
 keys, the participants of a transaction) and taking the maximum of their
-`lastCommitTS`; every data group is fenced only when the key set is not
+replicated watermarks (`LastRaftCommitTS`, never `LastCommitTS`; see the
+seed rule below); every data group is fenced only when the key set is not
 known up front (a keys-spanning Lua script), so an unavailable or
 leaderless group fails only the operations that touch it instead of the
 whole data plane (the implemented branch fences every data group,
@@ -427,13 +428,22 @@ value when it is higher would turn every point read on an idle group into
 an advance proposal whenever any other group moves, which is exactly the
 Raft write the routed-participant narrowing exists to avoid. `s` is the
 maximum over the touched groups of the fenced leader answer and that
-group's own replica watermark (`CommittedTimestampFloorForKeys` over the
-same key set, a floor against a regressed answer), the keyless helpers
+group's own replica watermark, both the **replicated-only** watermark
+(found in review: `CommittedTimestampFloorForKeys` and the
+`RawLatestCommitTS` RPC behind it sample `Store.LastCommitTS`, which a
+direct write advances, so a catalog bootstrap `CatalogStore.Save` at `d`
+on a replica whose replicated watermark is `r < d` would advertise
+`s = d`, and a later entry stamped at `d` still passes the `commitTS > r`
+fence and changes the snapshot after the read returned; the floor helpers
+and the RPC therefore return `LastRaftCommitTS`, and the floor is a guard
+against a regressed answer over the same key set, not a second source),
+the keyless helpers
 pass their keys or take the snapshot without a seed, and a keys-spanning
 operation fences every data group anyway, where the global floor is the
-same value. Test: with group B busy and group A idle, point reads and
+same value. Tests: with group B busy and group A idle, point reads and
 single-table transactions on A propose zero advances while B's watermark
-moves. An all-zero answer means an empty
+moves; a direct write above the replicated watermark raises neither the
+answer nor the floor. An all-zero answer means an empty
 store and no capability is issued; the single-group `Coordinate` adds no
 barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
 RPC carrying a `ForwardedReadMode` and an authenticated **peer-only**
@@ -1557,9 +1567,17 @@ Constraints the fix PR must close before merge:
   re-reads the bucket meta and the previous manifest or the upload meta
   at a fresh leader snapshot, fails the request and deletes the chunks if
   the bucket generation changed (the rows then belong to a dead
-  generation), and otherwise re-dispatches the same transaction, the same
-  chunk-ref elements included, with a fresh commit timestamp; the chunk
-  rows are never written twice. Today a rejected manifest PREPARE deletes
+  generation), re-runs the request's preconditions against the fresh
+  manifest (`validateS3PutPreconditions`: `If-Match` / `If-None-Match`;
+  found in review: an `If-None-Match: *` upload that saw no object, lost
+  its PREPARE to a cutover, and raced a successful create would otherwise
+  overwrite it, since the fresh `StartTS` no longer conflicts with that
+  create), failing with `PreconditionFailed` and deleting the chunks when
+  they no longer hold, takes the fresh manifest as the previous version
+  the post-commit blob cleanup (`cleanupManifestBlobsAsync`) acts on, and
+  otherwise re-dispatches the same transaction, the same chunk-ref
+  elements included, with a fresh commit timestamp; the chunk rows are
+  never written twice. Today a rejected manifest PREPARE deletes
   the chunks and fails the request (`cleanupS3PutObjectChunks`), which is
   safe but turns a cutover into a failed upload. Tests: a cutover between
   the read and the PREPARE of a read-write transaction is rejected,
@@ -1569,8 +1587,12 @@ Constraints the fix PR must close before merge:
   PREPARE of a `PutObject`, and between a part's chunk upload and its
   part PREPARE, completes on the new owner with every chunk readable and
   the body read once; a bucket generation change in that window fails
-  the request and leaves no chunk rows; a resolver-routed transaction is
-  documented as outside the claim. Until both the drain and the pin land,
+  the request and leaves no chunk rows; an `If-None-Match: *` `PutObject`
+  that loses its first PREPARE to a cutover while another create lands
+  fails with `PreconditionFailed` and leaves no chunk rows, and an
+  overwrite retried after a cutover cleans up the manifest that was
+  current at the retry; a resolver-routed transaction is documented as
+  outside the claim. Until both the drain and the pin land,
   deployments running hotspot M2 migrations are excluded from the
   serializability claim (§6.1 of the roadmap). Implementation on
   `design/serializable-audit-a2-migration-drain`.
@@ -1722,7 +1744,20 @@ a per-run key prefix so the three workloads can share one cluster.
   that a `ConditionCheck` on an existing item is a read key under a read
   lock and writes nothing (which also stops a condition check from
   rewriting the item at a new commit timestamp), with a unit test on the
-  plan builder asserting that no mutation is emitted, and the workload's
+  plan builder asserting that no mutation is emitted. A request whose
+  every action is a `ConditionCheck` then carries read keys and no
+  mutation and dispatches nothing (found in review): `dispatchTxn` takes
+  its primary key from the write set and rejects an empty one with
+  `ErrTxnPrimaryKeyRequired`, and `runTransactWriteAttempt` already
+  answers a request with no elements without calling it, which is how a
+  `ConditionCheck` on a missing item works today; with no write there is
+  no commit point to protect, the conditions are evaluated at the A0
+  leader snapshot, a serializable read-only transaction at `s`, and a
+  violated condition cancels as today. Endpoint tests: an
+  all-`ConditionCheck` request on existing items succeeds and leaves
+  every item's version unchanged, one with a violated condition returns
+  `TransactionCanceledException`, and a mixed request keeps its
+  `ConditionCheck` keys out of the write set. The workload's
   harness asserts before a run counts as evidence that its read-only keys
   stay outside the write set (the plan-builder test plus an adapter-level
   check that the item's version is unchanged after a `ConditionCheck`-only
