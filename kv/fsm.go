@@ -102,6 +102,11 @@ type kvFSM struct {
 	// applyObservers are called after successful logical mutations.
 	// They are never mutated after NewKvFSMWithHLC returns.
 	applyObservers []ApplyObserver
+	// deferApplyNotices holds observer notifications back while a batched
+	// Raft entry is staged (applyBatchedRequests); they are delivered once
+	// the entry commits and dropped if it does not.
+	deferApplyNotices    bool
+	deferredApplyNotices []func()
 	// backupTimestampFloor is the highest replicated BackupPin read timestamp.
 	// New raw, one-phase, and PREPARE entries at or below this floor were
 	// timestamped before the backup cut and reached apply too late.
@@ -368,19 +373,72 @@ func (f *kvFSM) Apply(data []byte) any {
 	}
 
 	resp := &fsmApplyResponse{results: make([]error, len(reqs))}
-	hasError := false
-	for i, req := range reqs {
-		err := f.applyRequestErr(ctx, req)
-		if err == nil {
-			continue
-		}
-		resp.results[i] = err
-		hasError = true
-	}
-	if hasError {
+	if f.applyBatchedRequests(ctx, reqs, resp.results) {
 		return resp
 	}
 	return nil
+}
+
+// applyBatchedRequests applies the requests of one batched Raft entry and
+// reports whether any of them failed. On a store that implements
+// store.RaftEntryApplier, and when every request is a raw write (the only
+// shape the raw batcher produces), the entry is staged into one store batch
+// and committed once with one applied-index write, so a crash between two
+// requests cannot leave a replica whose durable applied index names an
+// entry it only half applied; on restart the engine's cold-start duplicate
+// skip would drop such an entry without calling the FSM, and the tail would
+// never apply on that replica (serializable isolation audit, G17).
+// Per-request validation errors stay per request, as before. An error from
+// the entry commit is reported on every request that had reported success,
+// because none of them landed, and apply observers are notified only after
+// the entry commits.
+func (f *kvFSM) applyBatchedRequests(ctx context.Context, reqs []*pb.Request, results []error) bool {
+	applier, ok := f.store.(store.RaftEntryApplier)
+	if !ok || !allRawRequests(reqs) {
+		return f.applyRequestsOneByOne(ctx, reqs, results)
+	}
+	f.beginDeferredApplyNotices()
+	hasError := false
+	err := applier.ApplyRaftEntry(ctx, f.pendingApplyIdx, func(ctx context.Context) error {
+		hasError = f.applyRequestsOneByOne(ctx, reqs, results)
+		return nil
+	})
+	if err != nil {
+		f.discardDeferredApplyNotices()
+		for i := range results {
+			if results[i] == nil {
+				results[i] = errors.WithStack(err)
+			}
+		}
+		return true
+	}
+	f.flushDeferredApplyNotices()
+	return hasError
+}
+
+func (f *kvFSM) applyRequestsOneByOne(ctx context.Context, reqs []*pb.Request, results []error) bool {
+	hasError := false
+	for i, req := range reqs {
+		if err := f.applyRequestErr(ctx, req); err != nil {
+			results[i] = err
+			hasError = true
+		}
+	}
+	return hasError
+}
+
+// allRawRequests reports whether every request of a batched entry is a raw
+// (non-transactional) write. Transactional requests read lock and intent
+// rows through the store's public read API, which does not observe a Raft
+// entry scope's staged writes, so an entry carrying one keeps the
+// per-request path; the raw batcher never produces such an entry.
+func allRawRequests(reqs []*pb.Request) bool {
+	for _, r := range reqs {
+		if r == nil || r.GetIsTxn() {
+			return false
+		}
+	}
+	return true
 }
 
 // applyReservedOpcode handles the FSM-internal opcode bands that are
