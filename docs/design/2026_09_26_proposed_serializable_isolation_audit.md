@@ -551,9 +551,19 @@ operation fences every data group anyway, where the global floor is the
 same value. Tests: with group B busy and group A idle, point reads and
 single-table transactions on A propose zero advances while B's watermark
 moves; a direct write above the replicated watermark raises neither the
-answer nor the floor. An all-zero answer means an empty
-store and no capability is issued; the single-group `Coordinate` adds no
-barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
+answer nor the floor. An all-zero answer (every touched group fresh)
+still issues a capability (corrected in review: issuing none left the
+read on the `^uint64(0)` "latest" sentinel, so a multi-key reader on a
+fresh store could read `a` as absent, let a single-group transaction
+write `a` and `b` atomically, and then read the new `b`, an outcome no
+serial order allows): `s` is then one fenced allocation from the
+coordinating leader's HLC (`NextFenced`, inside its lease and above
+every value the process observed), and each touched group advances to
+`s` on its first read, one Raft write per group once, since its
+watermark is nonzero from then on. Test: on a fresh store a reader of
+`a` then `b`, interleaved with a single-group transaction writing both,
+sees neither or both in every interleaving. The single-group
+`Coordinate` adds no barrier). Forwarded reads use a new node-to-node `Internal.ForwardRead`
 RPC carrying a `ForwardedReadMode` and an authenticated **peer-only**
 bearer token. The token is a node-only secret from a required, non-empty
 `--internalTokenFile` (or the node-to-node mTLS the security milestone
