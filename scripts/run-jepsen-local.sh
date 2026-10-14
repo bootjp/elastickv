@@ -65,6 +65,8 @@ if ! $NO_CLUSTER; then
       --dynamoAddress "127.0.0.1:6380${node}" \
       --s3Address    "127.0.0.1:6390${node}" \
       --filesystemMount "${DATA_DIR}/fs-n${node}" \
+      --filesystemRootUID "$(id -u)" \
+      --filesystemRootGID "$(id -g)" \
       --metricsAddress "" \
       --pprofAddress "" \
       --raftId       "n${node}" \

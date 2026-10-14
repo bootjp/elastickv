@@ -84,7 +84,10 @@ jobs:
           : > /tmp/elastickv-demo.pid
           for node in 1 2 3; do
             # Every node mounts the shared filesystem so the filesystem
-            # workload can drive leader and follower mounts alike.
+            # workload can drive leader and follower mounts alike. The root
+            # directory is owned by the runner user: the mount enforces
+            # default_permissions, so a root-owned root would reject the
+            # workload's mkdir.
             mkdir -p "/tmp/elastickv-ci/fs-n${node}"
             nohup /tmp/elastickv-bin \
               --address "127.0.0.1:5005${node}" \
@@ -93,6 +96,8 @@ jobs:
               --s3Address "127.0.0.1:6390${node}" \
               --sqsAddress "127.0.0.1:6350${node}" \
               --filesystemMount "/tmp/elastickv-ci/fs-n${node}" \
+              --filesystemRootUID "$(id -u)" \
+              --filesystemRootGID "$(id -g)" \
               --metricsAddress "" \
               --pprofAddress "" \
               --raftId "n${node}" \

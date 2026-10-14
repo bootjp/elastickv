@@ -288,10 +288,13 @@
                      " > " (sh-quote (register-path mount-dir k)))))))
 
 (defn- remote-exec!
-  "Runs a shell command on node over the test's SSH session."
+  "Runs a shell command on node over the test's SSH session. elastickv.db
+   starts the server as root, so the FUSE mount belongs to root and is only
+   reachable through su."
   [test node cmd]
   (control/with-node test node
-    (control/exec :sh :-c cmd)))
+    (control/su
+      (control/exec :sh :-c cmd))))
 
 ;; ---------------------------------------------------------------------------
 ;; Jepsen client
