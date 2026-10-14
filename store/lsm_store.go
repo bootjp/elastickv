@@ -225,15 +225,21 @@ var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 // Lock ordering (must always be acquired in this order to avoid deadlocks):
 //
 //  1. maintenanceMu – serialises Compact/Restore/Close.
-//  2. dbMu          – guards the s.db pointer; held as a write-lock while the
-//     DB is being swapped (Restore/Close), and as a read-lock by every
-//     operation that accesses s.db.
-//  3. applyMu       – serialises raft-apply conflict-check → batch-commit so
-//     concurrent ApplyMutationsRaft/At cannot both pass checkConflicts and
-//     then both commit. Also held by deletePrefixAtWithOpts and by
-//     SetDurableAppliedIndex's read-modify-write monotonic guard
-//     (PR #915 round-3) so the snapshot-persist checkpoint cannot rewind
-//     metaAppliedIndex below a concurrent per-Apply value.
+//  2. applyMu       – serialises every applier from its conflict check to
+//     its batch commit so two appliers cannot both pass checkConflicts and
+//     then both commit: applyMutationsWithOpts, deletePrefixesAtWithOpts,
+//     importVersionsWithOpts, PromoteVersions, SetDurableAppliedIndex's
+//     read-modify-write monotonic guard (PR #915 round-3, so the
+//     snapshot-persist checkpoint cannot rewind metaAppliedIndex below a
+//     concurrent per-Apply value), the SST checkpoint, and ApplyRaftEntry,
+//     which holds it across a whole batched Raft entry. It is taken BEFORE
+//     dbMu so an applier that holds it across several dbMu sections never
+//     waits for dbMu behind a writer that is itself waiting for applyMu
+//     (the inverted order deadlocked ApplyRaftEntry against
+//     newSSTIngestSnapshot; found in review).
+//  3. dbMu          – guards the s.db pointer; held as a write-lock while the
+//     DB is being swapped (Restore/Close) or checkpointed, and as a
+//     read-lock by every operation that accesses s.db.
 //  4. mtx           – guards the in-memory metadata fields
 //     (lastCommitTS, minRetainedTS, pendingMinRetainedTS).
 type pebbleStore struct {
@@ -890,14 +896,14 @@ func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
 // deletePrefixAtWithOpts (both hold it across their batch commit),
 // and the read-modify-write keeps the meta key strictly monotonic.
 //
-// Lock order: dbMu.RLock before applyMu.Lock matches the existing
-// discipline in applyMutationsWithOpts (lsm_store.go around :1438 /
-// :1444). No deadlock.
+// Lock order: applyMu.Lock before dbMu.RLock matches the discipline in
+// applyMutationsWithOpts (see the lock ordering on pebbleStore). No
+// deadlock.
 func (s *pebbleStore) SetDurableAppliedIndex(idx uint64) error {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	existing, present, err := s.readAppliedIndexLocked()
 	if err != nil {
@@ -2542,13 +2548,14 @@ func (s *pebbleStore) checkApplyConflictsWith(ctx context.Context, r pebble.Read
 }
 
 func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64, advanceLastCommitTS bool) error {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-
 	// Serialize conflict check → batch commit so concurrent ApplyMutations
-	// cannot both pass checkConflicts and then both commit.
+	// cannot both pass checkConflicts and then both commit. applyMu comes
+	// before dbMu (see the lock ordering on pebbleStore).
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	fastPathDone, err := s.staleRaftApplyFastPathLocked(mutations, commitTS, appliedIndex, writeOpts)
 	if err != nil {
@@ -2664,11 +2671,11 @@ func (s *pebbleStore) deletePrefixesAtWithOpts(_ context.Context, deletes []Pref
 		return nil
 	}
 
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	iter, err := s.newDeletePrefixesIterator(deletes)
 	if err != nil {

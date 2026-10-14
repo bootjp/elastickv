@@ -373,47 +373,56 @@ func (f *kvFSM) Apply(data []byte) any {
 	}
 
 	resp := &fsmApplyResponse{results: make([]error, len(reqs))}
-	if f.applyBatchedRequests(ctx, reqs, resp.results) {
+	halt, hasError := f.applyBatchedRequests(ctx, reqs, resp.results)
+	if halt != nil {
+		return halt
+	}
+	if hasError {
 		return resp
 	}
 	return nil
 }
 
-// applyBatchedRequests applies the requests of one batched Raft entry and
-// reports whether any of them failed. On a store that implements
-// store.RaftEntryApplier, and when every request is a raw write (the only
-// shape the raw batcher produces), the entry is staged into one store batch
-// and committed once with one applied-index write, so a crash between two
-// requests cannot leave a replica whose durable applied index names an
-// entry it only half applied; on restart the engine's cold-start duplicate
-// skip would drop such an entry without calling the FSM, and the tail would
-// never apply on that replica (serializable isolation audit, G17).
-// Per-request validation errors stay per request, as before. An error from
-// the entry commit is reported on every request that had reported success,
-// because none of them landed, and apply observers are notified only after
-// the entry commits.
-func (f *kvFSM) applyBatchedRequests(ctx context.Context, reqs []*pb.Request, results []error) bool {
+// ErrRaftEntryApply marks the halt the FSM returns when a batched Raft
+// entry could not be applied as a unit: the store failed to stage or
+// commit the entry's batch, so none of its writes landed on this replica.
+// The engine must not advance past such an entry, because a later entry
+// would persist a newer applied index and the cold-start duplicate skip
+// would then drop this one for good (found in review).
+var ErrRaftEntryApply = errors.New("kv/fsm: raft entry apply failed")
+
+// applyBatchedRequests applies the requests of one batched Raft entry. On
+// a store that implements store.RaftEntryApplier, and when every request
+// is a raw write (the only shape the raw batcher produces), the entry is
+// staged into one store batch and committed once with one applied-index
+// write, so a crash between two requests cannot leave a replica whose
+// durable applied index names an entry it only half applied; on restart
+// the engine's cold-start duplicate skip would drop such an entry without
+// calling the FSM, and the tail would never apply on that replica
+// (serializable isolation audit, G17). Per-request validation errors stay
+// per request, as before, and are reported through results; hasError says
+// whether any request failed that way. A failure of the entry itself (the
+// store could not stage or commit the batch) is operational, not a
+// per-request verdict: nothing landed, so it returns a HaltApply response
+// that stops the engine before it advances its applied index, rather than
+// a per-request response the engine would treat as applied. Apply
+// observers are notified only after the entry commits.
+func (f *kvFSM) applyBatchedRequests(ctx context.Context, reqs []*pb.Request, results []error) (halt any, hasError bool) {
 	applier, ok := f.store.(store.RaftEntryApplier)
 	if !ok || !allRawRequests(reqs) {
-		return f.applyRequestsOneByOne(ctx, reqs, results)
+		return nil, f.applyRequestsOneByOne(ctx, reqs, results)
 	}
 	f.beginDeferredApplyNotices()
-	hasError := false
 	err := applier.ApplyRaftEntry(ctx, f.pendingApplyIdx, func(ctx context.Context) error {
 		hasError = f.applyRequestsOneByOne(ctx, reqs, results)
 		return nil
 	})
 	if err != nil {
 		f.discardDeferredApplyNotices()
-		for i := range results {
-			if results[i] == nil {
-				results[i] = errors.WithStack(err)
-			}
-		}
-		return true
+		return haltErr(errors.Wrap(errors.Mark(err, ErrRaftEntryApply), "kv/fsm: apply batched raft entry")), true
 	}
 	f.flushDeferredApplyNotices()
-	return hasError
+	return nil, hasError
 }
 
 func (f *kvFSM) applyRequestsOneByOne(ctx context.Context, reqs []*pb.Request, results []error) bool {

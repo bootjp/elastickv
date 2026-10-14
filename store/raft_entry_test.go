@@ -227,13 +227,70 @@ func TestApplyRaftEntry_NestedScopeReusesTheOuterEntry(t *testing.T) {
 	require.True(t, raftEntryExists(t, st, "k1"))
 }
 
+// TestApplyRaftEntry_DirectWriteWaitsForTheEntry pins that the entry is one
+// critical section against every other applier: a direct write that starts
+// between two requests of the entry must not commit before the entry does,
+// so its conflict check sees the entry's writes. With applyMu taken per
+// staging call instead of across the entry, the direct write passed its
+// check against the unchanged DB, committed x@20, and the entry then
+// committed x@10 underneath it, so both reported success although either
+// serial order requires one of them to see a write conflict (found in
+// review).
+func TestApplyRaftEntry_DirectWriteWaitsForTheEntry(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	applier := raftEntryApplier(t, st)
+
+	const wait = 10 * time.Second
+	directDone := make(chan error, 1)
+	entryDone := make(chan error, 1)
+	go func() {
+		entryDone <- applier.ApplyRaftEntry(ctx, 4, func(ctx context.Context) error {
+			if err := st.ApplyMutationsRaftAt(ctx, raftEntryPut("x", "entry"), nil, 10, 10, 4); err != nil {
+				return err
+			}
+			// A direct write of x at 20, read at 5, arrives between the two
+			// requests. It must wait for the entry and then conflict with x@10.
+			go func() {
+				directDone <- st.ApplyMutations(ctx, raftEntryPut("x", "direct"), nil, 5, 20)
+			}()
+			time.Sleep(100 * time.Millisecond)
+			select {
+			case err := <-directDone:
+				directDone <- err
+				return errors.New("the direct write committed in the middle of the entry")
+			default:
+			}
+			return st.ApplyMutationsRaftAt(ctx, raftEntryPut("y", "entry"), nil, 11, 11, 4)
+		})
+	}()
+
+	select {
+	case err := <-entryDone:
+		require.NoError(t, err)
+	case <-time.After(wait):
+		t.Fatal("ApplyRaftEntry did not complete")
+	}
+	select {
+	case err := <-directDone:
+		require.ErrorIs(t, err, ErrWriteConflict, "the direct write must see the entry's x@10 above its start timestamp")
+	case <-time.After(wait):
+		t.Fatal("the direct write never completed")
+	}
+	got, err := st.GetAt(ctx, []byte("x"), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("entry"), got)
+	require.True(t, raftEntryExists(t, st, "y"))
+}
+
 // TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock pins the lock
-// order of the entry scope against newSSTIngestSnapshot, which takes dbMu
-// exclusively and then applyMu. An entry that held applyMu across its
-// callback and re-acquired dbMu for each staging call inverted that order:
-// a snapshot taken between two requests held dbMu waiting for applyMu
-// while the second request waited for dbMu, and Raft apply stopped for
-// good (found in review).
+// order of the entry scope against newSSTIngestSnapshot. An entry holds
+// applyMu across its callback and takes dbMu for each staging call; the
+// checkpoint takes applyMu before dbMu as well (the lock ordering on
+// pebbleStore), so a snapshot taken between two requests waits for the
+// entry to commit. The first revision had the checkpoint take dbMu first
+// and wait for applyMu while the second request waited for dbMu, and Raft
+// apply stopped for good (found in review).
 func TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock(t *testing.T) {
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)

@@ -115,25 +115,28 @@ func (sc *raftEntryScope) checkIndex(appliedIndex uint64) error {
 	return nil
 }
 
-// ApplyRaftEntry implements RaftEntryApplier. No store lock is held across
-// the callback: each staging call and the commit take dbMu.RLock and then
-// applyMu, the order every other applier and newSSTIngestSnapshot use
-// (dbMu before applyMu), and release both before returning. Holding
-// applyMu across the callback and re-acquiring dbMu per staging call
-// inverted that order and deadlocked against a snapshot taken between two
-// requests, which holds dbMu exclusively while it waits for applyMu
-// (found in review; TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock).
-//
-// A request's validation and the entry's commit are therefore two applyMu
-// sections. That matches the per-request path in practice: on a running
-// node every applier other than the Raft apply goroutine itself is the
-// startup catalog bootstrap, so nothing can commit between a staged
-// request and the entry's commit, and the indexed batch reads the DB's
-// current state, so a staging call sees whatever did land before it.
+// ApplyRaftEntry implements RaftEntryApplier. It holds applyMu from before
+// the batch is created until the batch has committed, so every other
+// applier (a direct write, a prefix delete, a migration import or promote,
+// the SST checkpoint) waits for the whole entry: a request's conflict check
+// and the entry's commit are one critical section, exactly as a request's
+// check and commit are on the per-request path, and nothing can commit
+// between a staged request and the entry's commit (found in review: with
+// applyMu taken per staging call, a direct write could pass its conflict
+// check against the DB after a request had staged a lower version of the
+// same key and both would succeed). applyMu is ordered before dbMu (see
+// the lock ordering on pebbleStore), so holding it across the callback
+// while each staging call and the commit take dbMu.RLock is the canonical
+// order; the callback's own reads take dbMu.RLock too and nest under no
+// held read lock. The nested staging calls detect the scope through ctx
+// and take neither lock again.
 func (s *pebbleStore) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error {
 	if s.raftEntryScopeFrom(ctx) != nil {
 		return fn(ctx)
 	}
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+
 	scope := s.newRaftEntryScope(appliedIndex)
 	defer func() { _ = scope.batch.Close() }()
 
@@ -158,10 +161,9 @@ func (s *pebbleStore) newRaftEntryScope(appliedIndex uint64) *raftEntryScope {
 }
 
 // commitRaftEntryScope writes the entry's lastCommitTS and applied index
-// into the staged batch and commits it once, under dbMu.RLock then
-// applyMu like every other commit. The in-memory lastCommitTS advances
-// only after the commit, as it does on the per-request path, so no reader
-// sees a watermark above durable state.
+// into the staged batch and commits it once. The caller holds applyMu.
+// The in-memory lastCommitTS advances only after the commit, as it does on
+// the per-request path, so no reader sees a watermark above durable state.
 func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if !scope.touched {
 		return nil
@@ -171,8 +173,6 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if s.db != scope.db {
 		return errors.WithStack(ErrRaftEntryStoreSwapped)
 	}
-	s.applyMu.Lock()
-	defer s.applyMu.Unlock()
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -215,8 +215,6 @@ func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raft
 	if s.db != scope.db {
 		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
 	}
-	s.applyMu.Lock()
-	defer s.applyMu.Unlock()
 
 	if appliedIndex > 0 {
 		landed, err := s.raftApplyAlreadyLandedWith(scope.batch, mutations, commitTS)
@@ -262,8 +260,6 @@ func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, delet
 	if s.db != scope.db {
 		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
 	}
-	s.applyMu.Lock()
-	defer s.applyMu.Unlock()
 
 	iter, err := newDeletePrefixesIteratorWith(scope.batch, deletes)
 	if err != nil {

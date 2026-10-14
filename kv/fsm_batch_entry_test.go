@@ -8,6 +8,7 @@ import (
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,6 +50,27 @@ func (s *g17Store) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn f
 		return fn(ctx)
 	}
 	return applier.ApplyRaftEntry(ctx, appliedIndex, fn)
+}
+
+// g17FailingEntryStore runs the entry through the real applier and then
+// fails it after every request has staged, the shape of a Pebble commit
+// failure: the applier discards the batch and nothing of the entry lands.
+type g17FailingEntryStore struct {
+	store.MVCCStore
+	err error
+}
+
+func (s *g17FailingEntryStore) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error {
+	applier, ok := s.MVCCStore.(store.RaftEntryApplier)
+	if !ok {
+		return s.err
+	}
+	return applier.ApplyRaftEntry(ctx, appliedIndex, func(ctx context.Context) error {
+		if err := fn(ctx); err != nil {
+			return err
+		}
+		return s.err
+	})
 }
 
 type g17AppliedIndexReader interface {
@@ -273,6 +295,30 @@ type g17Observer struct {
 func (o *g17Observer) OnApply(_ pb.Op, key []byte) {
 	o.seen = append(o.seen, string(key))
 	o.ready = append(o.ready, g17Exists(o.t, o.st, string(key)))
+}
+
+// TestFSMApplyBatch_EntryFailureHaltsApply pins that an entry the store
+// could not apply as a unit halts the engine instead of being reported as
+// a per-request result. A per-request response is treated as applied, the
+// engine advances its applied index, and a later entry's commit then
+// persists a newer index, so this entry, none of whose writes landed, would
+// be skipped on this replica for good by the cold-start duplicate skip
+// (found in review).
+func TestFSMApplyBatch_EntryFailureHaltsApply(t *testing.T) {
+	st := g17OpenStore(t, t.TempDir())
+	errCommit := errors.New("pebble: batch commit failed")
+	fsm := g17FSM(t, &g17FailingEntryStore{MVCCStore: st, err: errCommit})
+
+	resp := fsm.Apply(g17TwoPutEntry(t))
+
+	halter, ok := resp.(interface{ HaltApply() error })
+	require.True(t, ok, "an entry that could not be applied as a unit must halt the engine, got %T", resp)
+	require.True(t, errors.Is(halter.HaltApply(), ErrRaftEntryApply), "err = %v", halter.HaltApply())
+	require.True(t, errors.Is(halter.HaltApply(), errCommit), "err = %v", halter.HaltApply())
+	require.False(t, g17Exists(t, st, "k1"))
+	require.False(t, g17Exists(t, st, "k2"))
+	_, present := g17AppliedIndex(t, st)
+	require.False(t, present, "nothing of a failed entry may be durable")
 }
 
 // TestFSMApplyBatch_ObserversSeeOnlyCommittedWrites pins that apply observers
