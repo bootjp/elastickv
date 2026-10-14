@@ -546,6 +546,12 @@ Phase 3:
    - go-fuse raw protocol tests for stable attributes, handles, and resumable
      `readdir` offsets
    - kernel mount smoke test in a FUSE-capable deployment environment
+     (`internal/filesystem/fuseadapter/mount_e2e_test.go` mounts an in-memory
+     `filesystem.Service` through go-fuse and drives it with `os` calls:
+     create/read/overwrite-truncate/pwrite/truncate-extend/chmod/rename/
+     unlink, mkdir/readdir/rmdir, >256-entry `readdir` paging,
+     unlink-while-open, unsupported-op errno, and `statfs`; it skips when
+     `/dev/fuse` is unusable unless `ELASTICKV_REQUIRE_FUSE` is set)
    - errno conformance checks for unsupported operations
 
 ## 14. Open Questions
