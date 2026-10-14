@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -224,6 +225,59 @@ func TestApplyRaftEntry_NestedScopeReusesTheOuterEntry(t *testing.T) {
 	}))
 	require.False(t, midK1, "a nested scope must not commit on its own")
 	require.True(t, raftEntryExists(t, st, "k1"))
+}
+
+// TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock pins the lock
+// order of the entry scope against newSSTIngestSnapshot, which takes dbMu
+// exclusively and then applyMu. An entry that held applyMu across its
+// callback and re-acquired dbMu for each staging call inverted that order:
+// a snapshot taken between two requests held dbMu waiting for applyMu
+// while the second request waited for dbMu, and Raft apply stopped for
+// good (found in review).
+func TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	ps := pebbleStoreApplied(t, st)
+	applier := raftEntryApplier(t, st)
+
+	const wait = 10 * time.Second
+	snapshotDone := make(chan error, 1)
+	entryDone := make(chan error, 1)
+	go func() {
+		entryDone <- applier.ApplyRaftEntry(ctx, 4, func(ctx context.Context) error {
+			if err := st.ApplyMutationsRaftAt(ctx, raftEntryPut("k1", "v1"), nil, 10, 10, 4); err != nil {
+				return err
+			}
+			go func() {
+				snap, err := ps.newSSTIngestSnapshot()
+				if err == nil {
+					err = snap.Close()
+				}
+				snapshotDone <- err
+			}()
+			// Give the snapshot time to reach its lock acquisition before the
+			// second request stages; the result must not depend on it either way.
+			time.Sleep(100 * time.Millisecond)
+			return st.ApplyMutationsRaftAt(ctx, raftEntryPut("k2", "v2"), nil, 11, 11, 4)
+		})
+	}()
+
+	select {
+	case err := <-entryDone:
+		require.NoError(t, err)
+	case <-time.After(wait):
+		t.Fatal("ApplyRaftEntry deadlocked against a snapshot taken between two requests of the entry")
+	}
+	select {
+	case err := <-snapshotDone:
+		require.NoError(t, err)
+	case <-time.After(wait):
+		t.Fatal("the snapshot never completed")
+	}
+	require.True(t, raftEntryExists(t, st, "k1"))
+	require.True(t, raftEntryExists(t, st, "k2"))
+	idx, _ := raftEntryAppliedIndex(t, st)
+	require.Equal(t, uint64(4), idx)
 }
 
 func TestApplyRaftEntry_InMemoryStoreRunsTheCallback(t *testing.T) {

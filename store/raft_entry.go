@@ -115,20 +115,25 @@ func (sc *raftEntryScope) checkIndex(appliedIndex uint64) error {
 	return nil
 }
 
-// ApplyRaftEntry implements RaftEntryApplier. It holds applyMu for the
-// whole callback, which is what the per-request path holds for each
-// request, so direct writers still serialize against the entry; the
-// nested staging calls detect the scope through ctx and do not take
-// applyMu again. dbMu is taken only around the batch creation, the
-// staging calls, and the commit, never across the callback, so reads the
-// FSM performs between requests nest no read lock.
+// ApplyRaftEntry implements RaftEntryApplier. No store lock is held across
+// the callback: each staging call and the commit take dbMu.RLock and then
+// applyMu, the order every other applier and newSSTIngestSnapshot use
+// (dbMu before applyMu), and release both before returning. Holding
+// applyMu across the callback and re-acquiring dbMu per staging call
+// inverted that order and deadlocked against a snapshot taken between two
+// requests, which holds dbMu exclusively while it waits for applyMu
+// (found in review; TestApplyRaftEntry_SnapshotBetweenRequestsDoesNotDeadlock).
+//
+// A request's validation and the entry's commit are therefore two applyMu
+// sections. That matches the per-request path in practice: on a running
+// node every applier other than the Raft apply goroutine itself is the
+// startup catalog bootstrap, so nothing can commit between a staged
+// request and the entry's commit, and the indexed batch reads the DB's
+// current state, so a staging call sees whatever did land before it.
 func (s *pebbleStore) ApplyRaftEntry(ctx context.Context, appliedIndex uint64, fn func(ctx context.Context) error) error {
 	if s.raftEntryScopeFrom(ctx) != nil {
 		return fn(ctx)
 	}
-	s.applyMu.Lock()
-	defer s.applyMu.Unlock()
-
 	scope := s.newRaftEntryScope(appliedIndex)
 	defer func() { _ = scope.batch.Close() }()
 
@@ -153,9 +158,10 @@ func (s *pebbleStore) newRaftEntryScope(appliedIndex uint64) *raftEntryScope {
 }
 
 // commitRaftEntryScope writes the entry's lastCommitTS and applied index
-// into the staged batch and commits it once. The in-memory lastCommitTS
-// advances only after the commit, as it does on the per-request path, so
-// no reader sees a watermark above durable state.
+// into the staged batch and commits it once, under dbMu.RLock then
+// applyMu like every other commit. The in-memory lastCommitTS advances
+// only after the commit, as it does on the per-request path, so no reader
+// sees a watermark above durable state.
 func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if !scope.touched {
 		return nil
@@ -165,6 +171,8 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	if s.db != scope.db {
 		return errors.WithStack(ErrRaftEntryStoreSwapped)
 	}
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
@@ -207,6 +215,8 @@ func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raft
 	if s.db != scope.db {
 		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
 	}
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 
 	if appliedIndex > 0 {
 		landed, err := s.raftApplyAlreadyLandedWith(scope.batch, mutations, commitTS)
@@ -252,6 +262,8 @@ func (s *pebbleStore) stagePrefixDeletesInRaftEntry(scope *raftEntryScope, delet
 	if s.db != scope.db {
 		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
 	}
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
 
 	iter, err := newDeletePrefixesIteratorWith(scope.batch, deletes)
 	if err != nil {
