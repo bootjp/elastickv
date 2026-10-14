@@ -99,7 +99,10 @@ README will present scope in two tiers instead of a non-goals section.
   PREPARE swallowed as a replay on the secondary group alone leaves the
   primary committed and the secondary write missing) land, all three
   reproduced and fixed on local branches, with OCC validation of write and
-  read sets at apply. **Serializable is the
+  read sets at apply; resolver-routed keys (SQS FIFO queues placed with
+  `--sqsFifoPartitionMap`) stay outside both the serializable and the
+  cross-shard claim until the resolver-aware route gate lands (§6.1).
+  **Serializable is the
   target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
   that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
@@ -232,7 +235,16 @@ write can persist at a timestamp the audit's fence and conflict predicate
 assume was uniquely and durably issued. The README caveat names that
 exclusion next to the V1 one; in legacy TSO mode those validators are not
 in the write path (leader-issued identity there is A0b's job), so the
-claim for legacy-mode clusters does not wait on them. The README backup
+claim for legacy-mode clusters does not wait on them. The claims also
+exclude resolver-routed keys, today the SQS FIFO queues an operator
+places with `--sqsFifoPartitionMap` (HT-FIFO, `PartitionResolver`):
+`ShardRouter` resolves them through the resolver rather than the catalog,
+so the catalog-version pin A2 extends to every read-write transaction
+cannot fence a routing change for them between the read and the PREPARE,
+and A2 keeps their exemption until the resolver-aware form of the
+Composed-1 gate (the Composed-1 design's M5 "error on unpinned" step,
+extended to resolver-routed keys, in its own design doc) lands. The README
+caveat names this third exclusion with the other two. The README backup
 section describes `elastickv-snapshot-decode` as encoder-only until the
 A0 PR's decoder fix lands (§4). A `NOTLEADER` that a later read
 contradicts is an anomaly independent of the timestamp and read-lock
@@ -378,6 +390,10 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
   transaction id and PREPARE order plus A0's index-based replay detection.
 - The README consistency claims exclude Phase-D clusters until both TSO
   admission proposals land; legacy-mode clusters do not wait on them.
+- The README consistency claims exclude resolver-routed keys (SQS FIFO
+  queues placed with `--sqsFifoPartitionMap`) until the resolver-aware
+  Composed-1 gate lands: A2's catalog-version pin cannot fence a route
+  the catalog does not own.
 
 Assumptions made while reconciling with `main` (not put to the interview):
 

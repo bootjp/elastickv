@@ -284,7 +284,36 @@ half at the ceiling and rejects any value above it, so a value observed
 above the ceiling makes every subsequent persistence allocation on the
 group fail with `ErrCeilingExpired` until a lease renewal overtakes it,
 which frequent cross-group reads from a group whose clock runs ahead would
-keep from ever happening; see the read path below);
+keep from ever happening; see the read path below); **open, a merge
+blocker for this branch:** the lease renewal target must clear an
+advanced ceiling (found in review: that headroom is exactly one logical
+window. Every fenced allocation sits at the ceiling's physical
+millisecond, because `fencedNowMillis` floors the wall at the ceiling and
+the fence rejects a wall at or past it, so one ceiling value holds 65,536
+timestamps and a group's budget is one fresh window per renewal tick
+(`hlcRenewalInterval`, 1 s), whatever `hlcPhysicalWindowMs` (20 s) is;
+`SetPhysicalCeiling` keeps the maximum, so a renewal at `wall +
+hlcPhysicalWindowMs` below a ceiling the advance pushed ahead is ignored,
+and `RecoverHLCLease` acts only once the wall reaches the ceiling. A busy
+receiver with no further advance therefore exhausts that one window and
+fails every write with `ErrCeilingExpired` until its wall catches up, for
+up to the clock skew between the two groups, which the admission bound
+below caps at about one window. Decision: the renewal target on every
+group a node renews, in `renewHLCLease` and in the single-group
+`Coordinator`, becomes
+`max(wall + hlcPhysicalWindowMs, PhysicalCeiling() + 1)`, so each tick
+opens one fresh window above an advanced ceiling, exactly the budget an
+unskewed group has; the ceiling then drifts by one millisecond per tick
+while it sits ahead of the wall and returns to
+`wall + hlcPhysicalWindowMs` the moment the wall overtakes; on-demand recovery
+is unchanged, since it runs only once the wall has reached the ceiling,
+where the two targets coincide; and a renewal is a ceiling move, which
+`tla/hlc` already models as `ApplyCeiling`. Tests: a receiver advanced
+ahead of its wall by more than one tick and given no further advance
+allocates past 65,536 fenced timestamps across two ticks; its target
+falls back to `wall + hlcPhysicalWindowMs` once the wall passes the
+advanced value; the maximum-logical case above still holds with the new
+target);
 `21a11ddc` the read path: every leader-local `ShardStore` read (eleven
 entry points: get, exists, the version probes, every scan shape) goes
 through `leaderReadAt`, whose behaviour depends on the intent carried in
@@ -305,8 +334,26 @@ that group; the apply therefore extends the ceiling through the replicated
 advance entry, which is Raft-agreed exactly like a lease renewal, and the
 admission bound caps how far a snapshot can pull the ceiling ahead, by at
 most the window plus the skew; `tla/hlc` models the advance as a ceiling
-move so HLC-4 still holds), and skips groups without an engine,
-the TSO group, and stores without a replicated watermark; a **client**
+move so HLC-4 still holds; under Phase D the bound measures
+against the TSO's ceiling with no extra path (checked in review): a
+Phase-D data-group leader stops renewing its own ceiling
+(`shouldRenewHLCGroup` retires data groups once `PhaseDActive`), but the
+HLC is one per process (`main.go` creates it before the groups), Phase D
+requires hosting the dedicated TSO group (`configureLegacyCoordinatorTSO`
+refuses `--tsoModeFile` and Phase-D mode with `ErrTSOGroupRequired`), and
+`TSOStateMachine.applyLeaseCeiling` sets the shared clock's ceiling on
+every member of that group as each lease entry applies, so an idle
+data-group leader's `PhysicalCeiling` trails group 0's renewals only by
+its apply lag and every TSO-issued snapshot, issued at or below that
+ceiling, is admitted; a node without a group-0 member is not Phase-D-aware
+(`tsoCutoverState` is nil) and keeps renewing its own groups; a group-0
+member cut off from group 0's quorum for longer than the window refuses
+snapshot reads until it catches up, and it cannot allocate TSO timestamps
+for its writes in that state either, so no new unavailability. Test: a
+Phase-D data-group leader that only follows group 0 and has been idle for
+more than one window admits a busy group's snapshot), and skips groups
+without an engine, the TSO group, and stores without a replicated
+watermark; a **client**
 intent (`WithClientReadTimestamp`) never proposes and fails with
 `ErrReadTSAboveWatermark` above the watermark; a bare timestamp reads as
 before. The snapshot comes from the leaders: `BeginSnapshotReadTimestamp`
@@ -1384,7 +1431,10 @@ Constraints the fix PR must close before merge:
   at, the auto-pin exemptions for `ReadKeys` and a caller-supplied
   `StartTS` go away (a pinned read set is exactly what the gate must
   protect), and the resolver-routed exemption stays until the M5
-  resolver-aware gate, which keeps resolver-routed keys outside the claim.
+  resolver-aware gate, which keeps resolver-routed keys outside the claim
+  (the roadmap's publication gate, §6.1, names that exclusion next to the
+  V1 and Phase-D ones, since the pin cannot fence a route the catalog does
+  not own).
   The FSM rejects a PREPARE or one-phase entry whose pinned version
   predates a cutover that moved any of its keys **or read keys** (the
   existing Composed-1 fence, extended to read keys), and the coordinator
@@ -2387,7 +2437,9 @@ shipped and wired) is corrected on `docs/encryption-5e-header`
 (`0168e290`, from `main`, not pushed), the first A5 item to land.
 
 - README: replace the "Basic Consistency Behaviors" bullet with the three
-  claims from the positioning doc §5 and the lease caveat.
+  claims from the positioning doc §5, the lease caveat, and the three
+  exclusions the roadmap's §6.1 gate names (V1-pinned or mid-upgrade
+  clusters, Phase-D clusters, resolver-routed keys).
 - `docs/architecture_overview.md`: add a transactions section (one-phase, 2PC,
   read-validate, conflict predicate).
 - `docs/review_todo.md`: 4.2 already points here; fix 4.4's stale "or Del".
