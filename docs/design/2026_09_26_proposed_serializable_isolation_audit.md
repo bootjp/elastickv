@@ -140,6 +140,7 @@ Facts checked on `main` at `4ca7e90d`.
 | G14 | **PREPARE order lets a reader roll back a secondary before the primary lock exists (found while implementing A2, reproduced).** `prewriteTxn` prepares groups in group-id order (`groupMutations` sorts the ids), not primary group first. A reader that meets a secondary's lock before the primary PREPARE has applied asks `primaryTxnStatus`, finds no primary lock and no record, concludes rolled back **before any TTL check**, and aborts that secondary without writing a rollback record (`handleAbortRequest` writes one only when the ABORT names the primary); the primary then prepares and commits, and the secondary COMMIT finds no lock, treats the key as already resolved (`commitTxnKeyMutations`), and `handleCommitRequest` returns nil with nothing written. **Reproduced** (`TestTwoPhaseCommit_ReaderRollsBackSecondaryBeforePrimaryPrepare` in `kv/txn_prepare_order_repro_test.go`, branch `design/serializable-audit-g14-repro`, commit `6b90173b`, on the `TxnID` branch; 3 of 3 red under `-race`, three controls green): with the route layout flipped so the primary sits on the higher group id, a plain read of the secondary key in the window (a live 30 s lock, no TTL involved) aborts it, and the `LockResolver` does the same once the secondary lock has expired; with the primary prepared first the reader gets `txn locked` and T commits both keys. The window is at least one Raft round-trip on the primary group per cross-shard transaction. The scan read path shares `primaryTxnStatus` and very likely the flaw (not exercised). | A cross-shard transaction commits with one of its writes silently missing while the client is told OK; pre-existing on `main`, independent of the identity fix. |
 | G15 | **A forwarded RPC whose reply is lost after it reached the leader is retried (found while implementing A6, reproduced, fixed).** The leader-forward path (`LeaderProxy.forward`, `Coordinate.redirect`, the admin `forwardAdmin`) treated `Unavailable`, `DeadlineExceeded`, a dropped connection, and a reply held past the deadline as retryable even when the request had already reached the leader, which proposed and committed it; the resend was a second proposal with a fresh timestamp, which the A0 fence cannot detect. **Reproduced** (`adapter/forward_lost_response_test.go`, branch `design/serializable-audit-a6-forward-timeout`, commit `9d8cde4d`, on A6): the real `Internal` server over gRPC with a counting transaction manager and a server interceptor that applies the write and then loses the first reply in five ways, against three forward paths, 15 of 15 red ("the forwarded write was applied 2 times (err=<nil>)" for `LeaderProxy` and admin; `redirect` applied once but told the client a retryable error). **Fixed** by `8d1d77a4`: `classifyForwardedWriteError(err, sent)` keeps a never-sent failure retryable, marks a sent-then-lost reply (`Unavailable`, `DeadlineExceeded`, `Canceled`, `Internal`, a context error, a non-gRPC error) as `ErrProposalOutcomeUnknown` while keeping the gRPC code so the breaker still counts it, and passes the leader's definite answers through; "sent" comes from a per-call `grpc.Peer` probe, which grpc-go fills only after `transport.NewStream` succeeded (an empty peer means the final attempt never opened a stream); the startup gate's `Unavailable` is matched by an exact message constant (`kv.StartupGateUnavailableMessage`, now used by `main.go`'s gate interceptors) and stays retryable, so startup rotation and encryption cutover keep working. Green 15 of 15 plus 25 classification cases, a never-sent retry that succeeds once the leader listens, breaker accounting, the caller-deadline case, and the admin path; `kv`, `adapter`, `internal`, and the root package green under `-race`; lint clean. Every write is treated as non-idempotent on this branch (a lost reply on a forwarded PREPARE / COMMIT / ABORT is now unknown rather than retried inside `LeaderProxy`); `commitSecondaryWithRetry` one layer up still re-sends a secondary COMMIT on any error, relying on the per-transaction commit idempotence the `TxnID` branch formalises; the admin HTTP forward got the same classification in `5815c790` (the probe and the lost-reply rule moved into a leaf package `internal/forwardoutcome` that both `kv` and `internal/admin` use; the forward client marks a sent-then-lost reply; the Dynamo, S3, and SQS admin handlers and the leader-side forward responses answer HTTP 400 `RequestOutcomeUnknown` with no `Retry-After` where they answered 503 `leader_unavailable` "retry shortly", and `main_admin.go`'s leader-churn suffix match no longer catches the class; the admin SPA never retries and shows the message; an end-to-end test through the real `AdminForward` gRPC path applies the create once and returns the 400; the startup gate still gets its retryable 503); a gRPC service-config retry policy, if ever enabled, would invalidate the probe (none is). | Closed for the data-plane and admin forwards. A write reaching the leader is applied at most once across a lost reply; the client sees success or the outcome-unknown class. |
 | G16 | **A caught `WRONGTYPE` in a Lua script poisons the key's cached state (found while closing G7, reproduced, fixed).** Every Lua state loader (`redis_lua_context.go`) cached an empty, unloaded key state before checking the type and left it in place when the read failed with `WRONGTYPE` under `pcall` / `redis.pcall`; the next command of that type in the same script saw the key as absent, so a second `HGET` or `GET` returned nil and `HSET` / `RPUSH` / `SADD` / `ZADD` / `XADD` on a string, or `INCR` on a hash, succeeded and replaced the value at commit (`pcall(HGET)` then `HSET` turned string `"s"` into a hash). Reproduced (`TestLua_CaughtWrongTypeDoesNotPoisonKeyState`, eight cases red, `e1ff72d7`) and fixed (`fd97de18`, drop a key state whose first load failed) on `design/serializable-audit-a1-redis-setnx`. | A script that tolerates a type error can silently overwrite a value of another type on `main`; independent of concurrency. |
+| G17 | **A crash between two requests of one batched Raft entry loses the tail on the restarted replica (found in the A0 review, confirmed from the code, not yet reproduced).** `kvFSM.Apply` applies a `raftEncodeBatch` entry request by request (`kv/fsm.go`); each request's `ApplyMutationsRaftAt` persists the entry index in its own Pebble batch (`store/lsm_store.go`), so the durable applied index names the whole entry after the first request; the engine's cold start seeds the applied index from that durable value and drops a non-volatile entry at or below it without calling the FSM (`rawNodeAppliedForOpen`, `applyNormalCommitted` in `internal/raftengine/etcd/engine.go`). The batched entry is the raw multi-key write (`kv/transaction.go` encodes it; `kv/coordinator.go` and `kv/leader_proxy.go` build it). | The restarted replica permanently misses part of a committed entry that its peers applied in full, and a later leader change can serve either state. Closed under A0 by applying one entry in one Pebble batch with one applied-index write, with a crash test; a merge blocker for the A0 PR. |
 
 ## 4. Milestones
 
@@ -269,7 +270,15 @@ invalid proto wire byte and sits outside the encryption band, applied
 through `ApplyMutationsRaftAt` with no mutations so both watermarks become
 `max(current, ts)` in the same batch as the applied index; unfenced,
 idempotent, a no-op on replay, refused for 0 and `^uint64(0)`, observed by
-the HLC so a fenced write retries above it, carried by every snapshot);
+the HLC so a fenced write retries above it, carried by every snapshot;
+**open, a merge blocker for this branch:** the apply must raise the
+replicated physical ceiling to at least the advance's physical half
+**before** the HLC observes it, because `NextFenced` floors the physical
+half at the ceiling and rejects any value above it, so a value observed
+above the ceiling makes every subsequent persistence allocation on the
+group fail with `ErrCeilingExpired` until a lease renewal overtakes it,
+which frequent cross-group reads from a group whose clock runs ahead would
+keep from ever happening; see the read path below);
 `21a11ddc` the read path: every leader-local `ShardStore` read (eleven
 entry points: get, exists, the version probes, every scan shape) goes
 through `leaderReadAt`, whose behaviour depends on the intent carried in
@@ -280,7 +289,17 @@ applies only at its own timestamp, proposes an advance through the
 wrap-aware proposer when the group's replicated watermark is below it and
 waits for the local apply, is refused with `ErrReadTSAheadOfClock` when the
 physical half exceeds `max(HLC.Current, PhysicalCeiling) +
-hlcPhysicalWindowMs` (no wall clock), and skips groups without an engine,
+hlcPhysicalWindowMs` (no wall clock; that bound sits above the local
+ceiling on purpose, which is what makes the ceiling raise at advance apply
+necessary: a group's issued timestamps sit at its own ceiling, `wall +
+hlcPhysicalWindowMs` at the last renewal, so under any positive clock skew
+a legitimate snapshot from a faster group lies above this group's ceiling,
+and refusing at the ceiling instead would fail every cross-group read from
+that group; the apply therefore extends the ceiling through the replicated
+advance entry, which is Raft-agreed exactly like a lease renewal, and the
+admission bound caps how far a snapshot can pull the ceiling ahead, by at
+most the window plus the skew; `tla/hlc` models the advance as a ceiling
+move so HLC-4 still holds), and skips groups without an engine,
 the TSO group, and stores without a replicated watermark; a **client**
 intent (`WithClientReadTimestamp`) never proposes and fails with
 `ErrReadTSAboveWatermark` above the watermark; a bare timestamp reads as
@@ -422,9 +441,24 @@ Constraints the fix PR must close before merge:
   fenced `EVAL` surfaces the conflict to the client instead of retrying;
   acceptable (serial) but a behaviour change to document, and A0b's
   leader-side execution makes it moot.
-- A possible pre-existing loss to verify: the engine's cold-start duplicate
-  skip drops the whole entry at the durable index, so a crash between two
-  requests of one raw batch could lose the second.
+- **Batched entries are not applied atomically (G17, a merge blocker for
+  A0).** `kvFSM.Apply` applies the requests of one `raftEncodeBatch` entry
+  one at a time, and each request's `ApplyMutationsRaftAt` persists the
+  entry index in its own Pebble batch, so after the first request the
+  durable applied index already names the whole entry. A crash before a
+  later request leaves that replica with the entry's head applied and its
+  tail not; on restart the engine seeds `e.applied` from the durable index
+  (`rawNodeAppliedForOpen`) and `applyNormalCommitted` drops the entry as a
+  non-volatile duplicate without calling the FSM, so the tail is never
+  applied on that replica while every other replica applied all of it: a
+  permanent divergence that A0's per-request index replay detection cannot
+  repair, because the engine discards the entry before the FSM sees it. The
+  fix applies every request of one entry in one Pebble batch with one
+  applied-index write, so the entry lands whole or not at all, and a crash
+  test that kills the process between two requests of one batched entry,
+  restarts, and asserts the replica converges with one that never crashed
+  travels with it. The loss is pre-existing on `main` (the cold-start skip
+  predates this audit) and is listed in §3.
 - Throughput under reordering is not measured; the benchmark milestone does.
 
 ### A0b. Commit-timestamp identity (G10)
@@ -508,7 +542,9 @@ primary COMMIT, and stop `Internal.Forward` from keeping a coordinator-stamped
 COMMIT timestamp (cross-group Redis commands, `FLUSHALL`, spanning Lua
 scripts, cross-group S3 / DynamoDB / SQS / filesystem transactions); make the
 fence compare against a watermark that only replicated applies advance; fence
-`DEL_PREFIX`; review `dedupProbeOnePhase`.
+`DEL_PREFIX`; review `dedupProbeOnePhase`; apply every request of a batched
+entry in one Pebble batch (G17); raise the physical ceiling at advance apply
+before the HLC observes the advance (the multi-group branch's open item).
 
 Status of A0, completion slice: implemented ahead of review on local branch
 `design/serializable-audit-a0-complete` (four commits on top of the A0b
@@ -611,7 +647,9 @@ Still open for the fix PRs:
   ingest keep their byte format but the key is now guaranteed to exist in
   every Pebble DB this version opens or restores (`loadLastRaftCommitTS`
   persists it with `Sync` when missing or above `lastCommitTS`, at open and
-  after every restore swap; an empty-snapshot restore writes 0); the
+  after every restore swap; an empty-snapshot restore writes 0; **to be
+  gated on the V2 marker before merge**: a V1-mode store must not carry
+  the key at all, see A7); the
   streaming MVCC format gains layout V4 (V3 plus a trailing
   `lastRaftCommitTS`; the reader still accepts V1 to V3); the backup
   encoder writes the key as a raw entry and `ReadSnapshotWithHeader` skips
@@ -1877,9 +1915,25 @@ sections defer to is therefore two-sided:
   skips the entry while the index-based path would apply it, so a V1 entry
   keeps the timestamp fast path on both binaries (and keeps G13 until the
   flip), and only V2 entries use the index-based detection and never the
-  timestamp fast path. Snapshot formats always carry the replicated
-  watermark once the new binary writes them (a V1-only cluster simply never
-  consults it).
+  timestamp fast path. The replicated watermark key
+  `_meta_last_raft_commit_ts` and the snapshot layouts that carry it exist
+  **only once the marker says V2**; in V1 mode the new binary writes
+  neither (found in review: the shipped `isPebbleMetaKey` does not know the
+  key, so the shipped binary's `findMaxCommitTS` decodes its last eight
+  bytes as an inverted MVCC timestamp and, at every open, raises
+  `_meta_last_commit_ts` to that bogus value with `Sync`, and whole-keyspace
+  scans surface it as a user key; a V1-only cluster that downgraded, or
+  installed a snapshot the new binary wrote, would therefore break OCC and
+  snapshot reads). Concretely: `loadLastRaftCommitTS` seeds the key, the
+  streaming MVCC layout moves from V3 to V4, and the backup encoder writes
+  the raw entry only when the marker is V2 (the first V2 apply seeds the
+  key from `lastCommitTS`, capped, exactly as the A0 branch's fallback does
+  today); a V1-mode store, snapshot, or backup stays byte-compatible with
+  the shipped binary, and a test opens a V1-mode store and a V1-mode
+  snapshot of each format through the shipped reader logic (the
+  `isPebbleMetaKey` / `findMaxCommitTS` pair as they are on `main`) and
+  asserts `_meta_last_commit_ts` is unchanged. A V1 entry never consults
+  the watermark, so V1 mode loses nothing by not carrying it.
 - **Ledger-aware transition.** The shipped binary cannot record V1
   participants or obey a new ledger epoch. Before the first V2 activation
   entry, the rollout stops new V1 transaction admission at every ingress,
@@ -2023,12 +2077,42 @@ sections defer to is therefore two-sided:
   admission** checks capability: `AddLearner` / `AddVoter` on a V2 cluster
   ask the joining process for its capability report before proposing the
   conf change and refuse a node that does not advertise `txn_format_v2`.
-  Every replica persists the V2 format in its own `raft-engine` marker
-  (the same file that already records the backend) **before** its first
-  V2 FSM apply or installation/restoration of a V2 snapshot. The marker
+  A process advertises `txn_format_v2` only after it has persisted a
+  downgrade-incompatible `v2-capable` form of its own `raft-engine` marker
+  (the same file that already records the backend), so a capability report
+  that can satisfy activation is backed by durable state rather than by a
+  process poll: a voter that advertised and is then restarted on the
+  shipped binary before the activation entry applies is refused at startup
+  (`ErrTxnFormatDowngrade`) instead of starting, matching the still-V1
+  polled state, and halting on the activation envelope. The V1 pin
+  suppresses the advertisement and the marker write, so a pinned cluster
+  stays downgradable. (Downgrading two of three voters after they
+  advertised still costs the group its quorum until they are upgraded
+  again; the marker turns that into a startup refusal with a named error
+  rather than a halt mid-apply, and the rollout runbook says so.) Every
+  replica then moves the marker to the `v2` form **before** its first V2
+  FSM apply or installation / restoration of a V2 snapshot, and the
+  receiver must be able to tell a V2 snapshot apart **before** restoring
+  it: Raft snapshot metadata carries only index, term, and the conf state,
+  and an activation row inside the FSM payload is discoverable only after
+  installation, so a fresh replica could otherwise restore V2 state
+  without writing the marker and then be restarted under the shipped
+  binary with no fatal envelope in its WAL. V2 snapshots are therefore
+  written under a new authenticated FSM snapshot header magic
+  (`EKVTHLC3`, whose payload carries the transaction format next to the
+  ceiling and the cutover index), which the new binary reads and fences on
+  before mutating the FSM and which the shipped `ReadSnapshotHeader`
+  rejects fail-closed with `ErrSnapshotHeaderUnknownMagic` (a trailing V2
+  extension would not do: the shipped reader skips unknown trailing
+  bytes); the external restore formats (the streaming MVCC V4 layout, the
+  backup encoder's archive, the SST ingest and physical snapshot
+  manifests) carry the same format field, and
+  `elastickv-snapshot-prepare-restore` and the physical restore path fence
+  on it the same way. A V1-mode node keeps writing the `EKVTHLC2` header,
+  so V1-only clusters stay restorable by the shipped binary. The marker
   update is atomic, fsyncs the file and directory, and uses a form that
-  the shipped binary rejects at startup; the new binary reads both the
-  legacy `etcd` form and the V2 form. A marker-write failure halts apply
+  the shipped binary rejects at startup; the new binary reads the legacy
+  `etcd` form, the `v2-capable` form, and the `v2` form. A marker-write failure halts apply
   or restore before the durable applied index can advance or a read can
   be served. This covers a follower that never proposes a V2 entry: its
   WAL may omit an already-applied V2 envelope on restart, so the fatal
@@ -2043,8 +2127,12 @@ sections defer to is therefore two-sided:
   full capability and stays flipped; in-flight V1 transactions finishing
   after the flip; a follower applying V2 before it ever proposes, then
   restarting under the shipped binary and rejecting downgrade; V2
-  snapshot install/restore persisting the marker before serving; marker
-  fsync failure preventing applied-index advance; restart after the marker
+  snapshot install/restore persisting the marker before serving, and
+  before any FSM mutation when the snapshot arrives at a fresh replica;
+  the shipped `ReadSnapshotHeader` rejecting an `EKVTHLC3` header; a
+  capability report refused until the `v2-capable` marker is durable, and
+  the shipped startup check rejecting a data directory that holds it;
+  marker fsync failure preventing applied-index advance; restart after the marker
   write but before V2 apply; staggered activation of two participant groups
   (the coordinator waits rather than sending V2 to either group), including
   a membership change during that wait that forces capability revalidation;
@@ -2084,8 +2172,11 @@ proves larger than expected.
   "nothing": every `N` that remains is marked benign (with the reason) or
   out of scope (G8, the gRPC API gap), so completion cannot be reached by
   relabelling.
-- `go test -race ./kv/... ./adapter/... ./store/...` includes the new
-  interleaving tests.
+- `go test -race ./...` (`make test`, the repository-wide suite
+  `CONTRIBUTING.md` requires) is green and includes the new interleaving
+  tests; A6 and A7 change `internal/raftengine/etcd` and the root package's
+  capability and activation wiring, so a package subset is not completion
+  evidence.
 - `make tla-check` passes with `OCC6_SnapshotStableAtWatermark`,
   `OCC7_NoLostUpdate`, and `OCC8_NoWriteSkew`, and fails all three gap
   configurations as expected: `MCOCC_gap_applyorder.cfg` (`OCC6`),

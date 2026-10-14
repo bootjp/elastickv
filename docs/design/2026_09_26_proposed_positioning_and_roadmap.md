@@ -51,7 +51,7 @@ week, no deadline; the plan below is sized for that.
 | Dimension | FoundationDB | TiKV | DynamoDB | Bigtable | elastickv |
 |---|---|---|---|---|---|
 | API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
-| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic within a shard; across shards 2PC with OCC validation of write and read sets at FSM apply, whose atomicity is not yet claimed (G12 and G14, both reproduced: aliased identities commit a mix, and a secondary can be rolled back before the primary lock exists) until A2's transaction id and primary-first PREPARE land; serializable is the target pending the audit's A0 to A2, G11, and G13 (§6.3); per-key linearizable for blind writes and reads on leader-issued paths; read-modify-write operations wait for A0 (G0) and the G10 paths for A0b |
+| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic within a shard; across shards 2PC with OCC validation of write and read sets at FSM apply, whose atomicity is not yet claimed (G12, G13, and G14, all reproduced: aliased identities commit a mix, a PREPARE at the previous commit's timestamp is swallowed as a replay on the secondary group alone so the primary lands while the secondary write is lost, and a secondary can be rolled back before the primary lock exists) until A2's transaction id and primary-first PREPARE and A0's index-based replay detection land; serializable is the target pending the audit's A0 to A2, G11, and G13 (§6.3); per-key linearizable for blind writes and reads on leader-issued paths; read-modify-write operations wait for A0 (G0) and the G10 paths for A0b |
 | Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by the owning Raft leader (the post-A0b design; on `main` today the default legacy-TSO mode stamps on the dispatching node and `Internal.Forward` keeps that stamp, audit gap G10); physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
 | Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
 | Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
@@ -95,8 +95,11 @@ README will present scope in two tiers instead of a non-goals section.
   `Internal.Forward` work land (G10, reproduced);
   multi-key transactions atomic within a shard, and across shards once
   A2's transaction id, the primary-first PREPARE order, and the secondary
-  re-apply land (G12 and G14, both reproduced and fixed on local
-  branches), with OCC validation of write and read sets at apply. **Serializable is the
+  re-apply (G12 and G14) and A0's index-based replay detection (G13: a
+  PREPARE swallowed as a replay on the secondary group alone leaves the
+  primary committed and the secondary write missing) land, all three
+  reproduced and fixed on local branches, with OCC validation of write and
+  read sets at apply. **Serializable is the
   target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
   entries apply in commit-timestamp order, which nothing enforces (G0), and
   that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
@@ -106,7 +109,11 @@ README will present scope in two tiers instead of a non-goals section.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
-  restore tooling, physical snapshot publish / restore tooling for an
+  restore tooling (the decoder reads only snapshots the encoder produced:
+  it rejects a snapshot taken from a live Pebble store on the store's
+  `_meta_last_commit_ts` entry, a tooling defect listed in §4 and fixed
+  with the audit's A0, so there is no offline decode path for a live
+  snapshot today), physical snapshot publish / restore tooling for an
   S3-compatible object store (the periodic scheduler is not yet wired into
   the server; that is the design's M3), Pebble SST ingest snapshot
   transfer, admin dashboard with data
@@ -129,6 +136,7 @@ README will present scope in two tiers instead of a non-goals section.
 | `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
 | No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
 | README's "Implemented Features" omits SQS, encryption, backup, snapshot offload, and the filesystem, and its consistency bullet says only "write-after-read checks … are covered by tests" | `README.md` §Implemented Features | README refresh after §6.1 lands |
+| `elastickv-snapshot-decode` cannot read a snapshot taken from a live Pebble store: `ReadSnapshot` fails on the store's `_meta_last_commit_ts` entry ("encoded value length 8 < 9"), so the offline decode / restore path works only on encoder-produced snapshots, although §3 lists the tooling | Audit A0 status; `CONTEXT.md` "Backup and snapshots" | Serializable isolation audit (§6.3): the A0 PR makes the decoder skip or decode every `_meta_*` entry a live store writes, with a test that decodes a live-store snapshot; until it lands README describes the decoder as encoder-only, and the publication checklist in §6.1 carries the item |
 | Stale docs: `docs/docker_multinode_manual_run.md` listed `Scan` / `BatchWriteItem` as unsupported; `docs/review_todo.md` 4.2 described the engine as snapshot isolation | Fixed in the same change as this doc | — |
 
 ## 5. Consistency claims
@@ -155,12 +163,15 @@ behind each claim.
    primary key and lock resolution (`kv/lock_resolver.go`). Not yet claimed
    for multi-shard transactions: two concurrent 2PC transactions that share
    a primary key and a start timestamp are treated as one owner and can
-   commit a mix of their writes (audit gap G12), and group-id PREPARE
+   commit a mix of their writes (audit gap G12); a PREPARE whose `StartTS`
+   equals the previous commit's timestamp is skipped as a replay, and when
+   that happens on the secondary group alone the primary commits while the
+   secondary write is silently omitted (G13); and group-id PREPARE
    ordering lets a reader abort a secondary before the primary lock exists,
    after which the primary commits and the secondary COMMIT writes nothing
    (G14); the claim waits for A2's transaction id, the primary-first PREPARE
-   order, and the secondary re-apply, all reproduced and fixed on local
-   branches.
+   order, and the secondary re-apply, and for A0's index-based replay
+   detection, all reproduced and fixed on local branches.
 3. **Multi-key transactions are serializable.** The FSM validates the
    transaction's write set and read set against every commit newer than
    `StartTS` under the store's apply lock (`checkConflictsLocked` in
@@ -210,8 +221,22 @@ entries deliberately keep the old semantics (the timestamp replay fast
 path, no fence, no read locks, no transaction id, no watermark advance)
 until every member advertises V2, and an operator may pin a cluster to
 V1. The README caveat states that a V1-pinned or mid-upgrade cluster runs
-without these guarantees. A `NOTLEADER` that a later read contradicts is
-an anomaly independent of the timestamp and read-lock fixes.
+without these guarantees. The claims also exclude Phase-D clusters
+(`--tsoPhaseDEnabled`) until both TSO admission proposals
+(`2026_08_29_proposed_tso_batch_slot_claims.md`,
+`2026_09_02_proposed_prephase_d_resolution_evidence.md`) have landed:
+under Phase D the batch-window validator accepts any timestamp inside a
+committed window whether or not it was issued, and the pre-Phase-D
+resolution carve-out accepts a caller-asserted legacy timestamp, so a
+write can persist at a timestamp the audit's fence and conflict predicate
+assume was uniquely and durably issued. The README caveat names that
+exclusion next to the V1 one; in legacy TSO mode those validators are not
+in the write path (leader-issued identity there is A0b's job), so the
+claim for legacy-mode clusters does not wait on them. The README backup
+section describes `elastickv-snapshot-decode` as encoder-only until the
+A0 PR's decoder fix lands (§4). A `NOTLEADER` that a later read
+contradicts is an anomaly independent of the timestamp and read-lock
+fixes.
 
 ### 6.2 Security milestone
 
@@ -266,8 +291,10 @@ its result decides what README may say.
 The two open TSO proposals (`2026_08_29_proposed_tso_batch_slot_claims.md`,
 `2026_09_02_proposed_prephase_d_resolution_evidence.md`) protect the
 timestamp-uniqueness assumption the OCC check relies on. They belong to the
-same correctness track and are listed as active in §7; their order relative
-to the audit is an open question (§9).
+same correctness track and are listed as active in §7. Their order relative
+to the audit's fixes is open (§9), but they gate the README claims for
+Phase-D clusters (§6.1): until both land, README states the claims for
+legacy-mode clusters only.
 
 ### 6.4 Benchmark harness and published numbers
 
@@ -347,6 +374,10 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
 - The audit's A2 analysis found gaps G0 and G1 on `main`, and both are
   reproduced by failing tests; the serializable claim is the target and is
   not made for any path until A0 to A2, G11, and G13 land.
+- Cross-shard atomicity is gated on G12, G13, and G14 together: A2's
+  transaction id and PREPARE order plus A0's index-based replay detection.
+- The README consistency claims exclude Phase-D clusters until both TSO
+  admission proposals land; legacy-mode clusters do not wait on them.
 
 Assumptions made while reconciling with `main` (not put to the interview):
 
@@ -363,7 +394,9 @@ Assumptions made while reconciling with `main` (not put to the interview):
 1. Benchmark hosts: which three machines, and their CPU / memory / disk / NIC.
    Fixed in the benchmark harness design doc.
 2. Order of the two TSO admission proposals relative to the serializable
-   audit (before, after, or interleaved).
+   audit's fixes (before, after, or interleaved). Settled only as far as
+   the claims go: both must land before README covers Phase-D clusters
+   (§6.1); whether they land before or after A0 to A2 is still open.
 3. Sample app scope: which DynamoDB / S3 / SQS operations it exercises, and
    whether Redis and the FUSE filesystem are included.
 4. What "multi-region" means for a future milestone: async replica, or a
