@@ -557,7 +557,10 @@ Phase 3:
      register model rejects, and a final-reads checker flags a final read
      that could not observe its register, so a lost acknowledged write
      cannot hide behind a failed read (knossos treats `:fail` as a no-op). The CI
-     `jepsen-test` workflow runs both modes against the 3-node cluster.
+     `jepsen-test` workflow runs both modes against the 3-node cluster on
+     every push, and the 6-hourly `jepsen-test-scheduled` stress run repeats
+     them at the stress settings against a real-binary cluster (the
+     single-process demo cluster has no mount flags).
    - concurrent append + read under node failure (open)
    - migration during read/write load (open)
 4. FUSE compatibility:
