@@ -272,8 +272,14 @@ through `ApplyMutationsRaftAt` with no mutations so both watermarks become
 idempotent, a no-op on replay, refused for 0 and `^uint64(0)`, observed by
 the HLC so a fenced write retries above it, carried by every snapshot;
 **open, a merge blocker for this branch:** the apply must raise the
-replicated physical ceiling to at least the advance's physical half
-**before** the HLC observes it, because `NextFenced` floors the physical
+replicated physical ceiling to at least the advance's physical half **plus
+one millisecond of rollover headroom** (found in review: a snapshot whose
+logical half is `0xffff`, which 65,536 allocations in one leased
+millisecond produce legitimately, would otherwise leave `last` exhausted,
+and the next `NextFenced` wraps to the following millisecond and is
+rejected above the ceiling until a renewal overtakes it; a maximum-logical
+snapshot test covers the boundary) **before** the HLC observes it, because
+`NextFenced` floors the physical
 half at the ceiling and rejects any value above it, so a value observed
 above the ceiling makes every subsequent persistence allocation on the
 group fail with `ErrCeilingExpired` until a lease renewal overtakes it,
@@ -2016,9 +2022,19 @@ sections defer to is therefore two-sided:
   StartTS)` and the same primary mutation but a different participant set
   be classified as the first one's replay, after which its secondary
   PREPARE lands on a group the durable row never named and the drain
-  confirms the wrong participants); a ledger-era PREPARE whose row already
-  exists with a different participant set is rejected as an aliased
-  identity (the G12 class), with a test for that pair. V2 entries use the
+  confirms the wrong participants). Every ledger-era V1 request also
+  carries an `attempt_id` the coordinator generates once per transaction
+  attempt (all binaries are new after the epoch, so the field needs no
+  compatibility path), the ledger row records it next to the participant
+  set, and a PREPARE whose row already exists with a different participant
+  set **or a different `attempt_id`** is rejected as an aliased identity
+  (the G12 class); only a PREPARE carrying the row's own `attempt_id` is a
+  replay (found in review: with the same identity, participants, and
+  primary mutation, a second transaction's delayed PREPARE would otherwise
+  be indistinguishable from a replay and the first one's commit record
+  would make its PREPARE and COMMIT succeed without applying its writes).
+  Tests cover the different-participants pair and the same-participants,
+  different-`attempt_id` pair. V2 entries use the
   index-based detection and never the timestamp fast path. The replicated
   watermark key
   `_meta_last_raft_commit_ts` and the snapshot layouts that carry it exist
@@ -2033,12 +2049,21 @@ sections defer to is therefore two-sided:
   snapshot reads). Concretely: `loadLastRaftCommitTS` seeds the key, the
   streaming MVCC layout moves from V3 to V4, and the backup encoder writes
   the raw entry only when the marker is `txn-ledger` or later. The key's
-  initial value is **Raft-agreed, not local** (found in review): the
-  ledger epoch entry carries a `seed_watermark` the proposer takes from its
-  own replicated watermark, or, when it has none yet, from the highest
-  commit timestamp of the Raft entries it has applied, and every replica
-  seeds `_meta_last_raft_commit_ts` from that field when it applies the
-  epoch, so the fence starts from one value everywhere; seeding each
+  initial value is **Raft-agreed, not local** (found in review): the seed
+  is the ledger epoch entry's own leader-issued commit timestamp, carried
+  in the entry, and every replica sets `_meta_last_raft_commit_ts` to it in
+  the same Pebble batch as the epoch's apply, so the value is persisted,
+  travels in every later snapshot, and a restarted replica, or one whose
+  log was compacted, recovers it from its store or its snapshot rather than
+  from anything it would have to reconstruct (a pre-epoch store has no
+  replicated watermark key, its `_meta_last_commit_ts` mixes Raft applies
+  with direct writes, and its applied index records no timestamps, so
+  "the highest commit timestamp of the entries it applied" is not
+  recoverable there, found in review). The seed is safe: the admission stop
+  drains every V1 transaction before the epoch, V1 entries never consult
+  the watermark, and every V2 entry's timestamp is leader-issued after the
+  activation epoch and therefore above the ledger epoch's timestamp, which
+  every replica's HLC observed when it applied the entry. Seeding each
   replica from its own `lastCommitTS` would not do, because that value
   includes direct writes such as `CatalogStore.Save` that differ between
   replicas, and a replica with a direct write at `r + 1` would fence the
@@ -2194,8 +2219,13 @@ sections defer to is therefore two-sided:
   transaction then replicates its decision and each secondary
   confirmation. The V1
   legacy identity `(primaryKey, StartTS)` is reserved on the primary group
-  until the ledger row is terminal and fully confirmed, so an aliased V1
-  transaction cannot take over an outstanding outcome. The primary COMMIT
+  **until V2 activation**, not merely until the row is terminal and
+  confirmed: a terminal row is kept, never released (found in review: a
+  released identity would let a second transaction's delayed PREPARE with
+  the same identity and participants ride the first one's commit record
+  as a replay), so an aliased V1 transaction can neither take over an
+  outstanding outcome nor reuse a settled one; the rows are small and the
+  ledger era is bounded by activation, which removes them. The primary COMMIT
   or ABORT record and the ledger decision are applied atomically in one
   Raft entry; a separate later decision write would leave a crash gap.
   Confirmations are per locked key because the resolver can settle one
