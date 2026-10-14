@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Run the DynamoDB Jepsen workload locally against a 3-node elastickv cluster.
+# Run the DynamoDB and filesystem Jepsen workloads locally against a 3-node
+# elastickv cluster. Every node mounts the shared FUSE filesystem under
+# $DATA_DIR/fs-n{1,2,3}; fusermount3 (package fuse3) must be installed.
 # Usage:
 #   ./scripts/run-jepsen-local.sh               # build + start cluster + test
 #   ./scripts/run-jepsen-local.sh --no-rebuild   # skip go build (reuse binary)
@@ -34,6 +36,9 @@ stop_cluster() {
     done < "$PID_FILE"
     rm -f "$PID_FILE"
   fi
+  for n in 1 2 3; do
+    fusermount3 -uz "${DATA_DIR}/fs-n${n}" 2>/dev/null || true
+  done
 }
 
 # ---- build ----
@@ -53,11 +58,13 @@ if ! $NO_CLUSTER; then
 
   echo "[cluster] starting 3-node cluster..."
   for node in 1 2 3; do
+    mkdir -p "${DATA_DIR}/fs-n${node}"
     nohup "$BINARY" \
       --address      "127.0.0.1:5005${node}" \
       --redisAddress "127.0.0.1:6379${node}" \
       --dynamoAddress "127.0.0.1:6380${node}" \
       --s3Address    "127.0.0.1:6390${node}" \
+      --filesystemMount "${DATA_DIR}/fs-n${node}" \
       --metricsAddress "" \
       --pprofAddress "" \
       --raftId       "n${node}" \
@@ -70,11 +77,13 @@ if ! $NO_CLUSTER; then
     echo $! >> "$PID_FILE"
   done
 
-  echo "[cluster] waiting for all ports (redis 63791-3, dynamo 63801-3, s3 63901-3)..."
+  echo "[cluster] waiting for all ports (redis 63791-3, dynamo 63801-3, s3 63901-3) and FUSE mounts..."
   for i in $(seq 1 90); do
     if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
       && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
-      && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903; then
+      && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903 \
+      && mountpoint -q "${DATA_DIR}/fs-n1" && mountpoint -q "${DATA_DIR}/fs-n2" \
+      && mountpoint -q "${DATA_DIR}/fs-n3"; then
       echo "[cluster] up after ${i}s"
       break
     fi
@@ -138,6 +147,36 @@ echo
 echo "[jepsen] per-type summary:"
 for t in "${TYPES[@]}"; do
   printf '  %-12s %s\n' "$t" "${TYPE_RESULT[$t]}"
+done
+
+# Filesystem register workload over the FUSE mounts, in both write modes.
+FS_MODES=(overwrite rename)
+declare -A FS_RESULT
+for mode in "${FS_MODES[@]}"; do
+  echo "[jepsen] running filesystem workload: write-mode=${mode}..."
+  set +e
+  lein run -m elastickv.filesystem-workload \
+    --local \
+    --time-limit 20 \
+    --rate 5 \
+    --concurrency 6 \
+    --write-mode "$mode" \
+    --mount-dirs "${DATA_DIR}/fs-n1,${DATA_DIR}/fs-n2,${DATA_DIR}/fs-n3"
+  FS_EXIT=$?
+  set -e
+  if [ $FS_EXIT -ne 0 ]; then
+    echo "[jepsen] filesystem write-mode=${mode} FAILED (exit $FS_EXIT)"
+    EXIT_CODE=$FS_EXIT
+    FS_RESULT[$mode]="fail(${FS_EXIT})"
+  else
+    FS_RESULT[$mode]="pass"
+  fi
+done
+
+echo
+echo "[jepsen] filesystem summary:"
+for mode in "${FS_MODES[@]}"; do
+  printf '  %-10s %s\n' "$mode" "${FS_RESULT[$mode]}"
 done
 
 if [ $EXIT_CODE -eq 0 ]; then

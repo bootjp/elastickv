@@ -49,7 +49,7 @@
   "Install minimal packages on a node."
   [node]
   (c/on node
-    (debian/install [:curl :netcat-openbsd :rsync :iptables :chrony :libfaketime])))
+    (debian/install [:curl :netcat-openbsd :rsync :iptables :chrony :libfaketime :fuse3])))
 
 (defn- upload-binaries!
   "Copy built binaries to the given node."
@@ -103,8 +103,40 @@
 (defn- build-raft-dynamo-map [nodes grpc-port dynamo-port raft-groups]
   (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
+(defn- filesystem-mount-dir
+  "Resolves the FUSE mount directory for node from the :filesystem-mount
+   option, which is either a single path applied to every node or a map of
+   node -> path. nil disables the filesystem frontend."
+  [filesystem-mount node]
+  (cond
+    (nil? filesystem-mount) nil
+    (map? filesystem-mount) (get filesystem-mount node)
+    :else                   filesystem-mount))
+
+(defn- unmount-filesystem-cmd
+  "Shell snippet that lazily detaches a (possibly dangling) FUSE mount. A
+   node killed with SIGKILL leaves its mount point in a 'transport endpoint
+   is not connected' state, which would make the next --filesystemMount fail."
+  [mount-dir]
+  (str "if mountpoint -q " mount-dir " 2>/dev/null || grep -qs ' " mount-dir " ' /proc/mounts; then "
+       "fusermount3 -uz " mount-dir " 2>/dev/null || fusermount -uz " mount-dir " 2>/dev/null || umount -l " mount-dir " || true; fi"))
+
+(defn- prepare-filesystem-mount!
+  "Ensures mount-dir exists and holds no stale mount before the server starts."
+  [mount-dir]
+  (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))
+  (c/exec :mkdir :-p mount-dir))
+
+(defn- cleanup-filesystem-mount!
+  "Detaches the node's mount after the server stopped."
+  [node mount-dir]
+  (when mount-dir
+    (c/on node
+      (c/su
+        (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
+
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env filesystem-mount]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -122,6 +154,7 @@
         raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
         raft-dynamo-map (when dynamo
                           (build-raft-dynamo-map (:nodes test) grpc-port dynamo-port raft-groups))
+        mount-dir (filesystem-mount-dir filesystem-mount node)
         bootstrap? (= node bootstrap-node)
         args (cond-> ["--address" grpc
                       "--redisAddress" redis
@@ -134,6 +167,7 @@
                s3 (conj "--s3Address" s3)
                sqs (conj "--sqsAddress" sqs)
                (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
+               mount-dir (conj "--filesystemMount" mount-dir)
                (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
                (seq shard-ranges) (conj "--shardRanges" shard-ranges)
                bootstrap? (conj "--raftBootstrap"))
@@ -145,6 +179,8 @@
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
+        (when mount-dir
+          (prepare-filesystem-mount! mount-dir))
         (apply cu/start-daemon! daemon-opts server-bin args)))))
 
 (defn- stop-node!
@@ -237,6 +273,10 @@
       (stop-node! node)
       (catch Throwable t
         (warn t "teardown stop failed")))
+    (try
+      (cleanup-filesystem-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
+      (catch Throwable t
+        (warn t "teardown unmount failed")))
     (c/on node
       (c/su
         (c/exec :rm :-rf data-dir))))
@@ -265,6 +305,10 @@
       (catch Throwable t
         (warn t "transport metrics snapshot before kill failed")))
     (stop-node! node)
+    (try
+      (cleanup-filesystem-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
+      (catch Throwable t
+        (warn t "unmount after kill failed")))
     this)
 
   db/Pause
@@ -284,6 +328,7 @@
 (defn db
   "Constructs an ElastickvDB with optional opts.
    opts: {:grpc-port 50051 :redis-port 6379
+          :filesystem-mount \"/mnt/elastickv\" ; or {node -> dir}; nil disables FUSE
           :raft-groups {1 50051 2 50052}
           :shard-ranges \":m=1,m:=2\"
           :server-env {\"ELASTICKV_RAFT_SEND_STREAM\" \"true\"}}"
