@@ -2007,10 +2007,20 @@ sections defer to is therefore two-sided:
   both binaries, so the two never disagree on a V1 entry. That includes
   the replay detection: for a live V1 PREPARE whose `StartTS` equals a
   tombstone timestamp (the G13 shape) the old replica's timestamp fast path
-  skips the entry while the index-based path would apply it, so a V1 entry
-  keeps the timestamp fast path on both binaries (and keeps G13 until the
-  flip), and only V2 entries use the index-based detection and never the
-  timestamp fast path. The replicated watermark key
+  skips the entry while the index-based path would apply it, so a
+  **pre-epoch** V1 entry keeps the timestamp fast path on both binaries
+  (and keeps G13 until the flip). Once the ledger epoch has applied, every
+  replica runs the new binary, and a ledger-era V1 PREPARE uses the
+  index-based detection like a V2 entry (found in review: the timestamp
+  shortcut would let a second transaction with the same `(primaryKey,
+  StartTS)` and the same primary mutation but a different participant set
+  be classified as the first one's replay, after which its secondary
+  PREPARE lands on a group the durable row never named and the drain
+  confirms the wrong participants); a ledger-era PREPARE whose row already
+  exists with a different participant set is rejected as an aliased
+  identity (the G12 class), with a test for that pair. V2 entries use the
+  index-based detection and never the timestamp fast path. The replicated
+  watermark key
   `_meta_last_raft_commit_ts` and the snapshot layouts that carry it exist
   **only once the marker is `txn-ledger` or later** (a downgrade-incompatible
   directory); on a pre-epoch or V1-pinned node the new binary writes
@@ -2022,9 +2032,23 @@ sections defer to is therefore two-sided:
   installed a snapshot the new binary wrote, would therefore break OCC and
   snapshot reads). Concretely: `loadLastRaftCommitTS` seeds the key, the
   streaming MVCC layout moves from V3 to V4, and the backup encoder writes
-  the raw entry only when the marker is `txn-ledger` or later (the first
-  apply after the marker moves seeds the key from `lastCommitTS`, capped,
-  exactly as the A0 branch's fallback does today); a pre-epoch or V1-pinned store, snapshot, or backup stays
+  the raw entry only when the marker is `txn-ledger` or later. The key's
+  initial value is **Raft-agreed, not local** (found in review): the
+  ledger epoch entry carries a `seed_watermark` the proposer takes from its
+  own replicated watermark, or, when it has none yet, from the highest
+  commit timestamp of the Raft entries it has applied, and every replica
+  seeds `_meta_last_raft_commit_ts` from that field when it applies the
+  epoch, so the fence starts from one value everywhere; seeding each
+  replica from its own `lastCommitTS` would not do, because that value
+  includes direct writes such as `CatalogStore.Save` that differ between
+  replicas, and a replica with a direct write at `r + 1` would fence the
+  first entry at `r + 1` while its peers, seeded at `r`, applied it. A
+  replica whose `lastCommitTS` is above the seed keeps `_meta_last_commit_ts`
+  as it is (the fence reads only the replicated watermark); the epoch
+  entry's own commit timestamp then advances the watermark identically on
+  every replica, and a test applies the epoch on two replicas, one holding
+  a direct write above the seed, and asserts the same verdict on the next
+  entry. A pre-epoch or V1-pinned store, snapshot, or backup stays
   byte-compatible with the shipped binary (a ledger-era node is already
   downgrade-incompatible through its marker and header, see the
   ledger-aware transition), and a test opens such a store and such a
@@ -2035,15 +2059,32 @@ sections defer to is therefore two-sided:
 - **Ledger-aware transition.** The shipped binary cannot record V1
   participants or obey a new ledger epoch. Before the first V2 activation
   entry, the rollout stops new V1 transaction admission at every ingress,
-  waits for in-flight coordinators to finish or report an unknown outcome,
-  upgrades every voter, learner, and coordinator, and applies a
+  waits for every in-flight coordinator to reach a **definitive** outcome
+  for each of its transactions, upgrades every voter, learner, and
+  coordinator, and applies a
   Raft-serialized ledger-aware epoch to every **data** group (the
   dedicated TSO group runs `TSOStateMachine`, not `kvFSM`, and gets
   neither epoch: its `Apply` halts on any unexpected tag, so sending the
   envelope there would stop timestamp issuance instead of activating
   anything; the capability monitors watch the members of the data groups,
   and the watermark-advance read path already skips the TSO group for the
-  same reason). The ledger epoch is the first downgrade-incompatible step,
+  same reason). "Definitive" excludes an unknown outcome (found in
+  review): a pre-epoch V1 transaction has no ledger row, so if its primary
+  decision committed, its secondary was not published, and the
+  coordinator then crashed, the primary lock is gone and the only complete
+  participant list went with the coordinator; the later lock and ledger
+  scan cannot name the missing secondary and would publish `txn-v2` over
+  a torn transaction. The upgraded coordinator therefore persists each V1
+  transaction's participant set in a coordinator-local durable outstanding
+  list before its first PREPARE (fsynced, in its data directory), finishes
+  or aborts every entry of that list on restart, and reports the list to
+  the epoch proposer, which applies the epoch only when every coordinator
+  reports it empty; a coordinator whose local list cannot be recovered (a
+  lost data directory) keeps the gate closed until an operator reconciles
+  its transactions, and the runbook says so. A transaction admitted before
+  the coordinator was upgraded, and therefore never on any list, is the
+  residual pre-existing damage already noted at the end of this bullet. The
+  ledger epoch is the first downgrade-incompatible step,
   not a soft poll: a node advertises `txn_v1_drain_ledger` only after
   persisting the downgrade-incompatible `txn-ledger` form of its
   `raft-engine` marker (the marker forms are described under **Refusal on
