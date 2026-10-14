@@ -2464,16 +2464,31 @@ sections defer to is therefore two-sided:
   primary key + `StartTS` with bit 63 set (the earlier revision's record
   key, now the reservation; the shipped readers of the family look up
   exact keys only), as a transaction of its own with identity (that key,
-  `StartTS`) and the attempt id as value. The shipped `validateConflicts`
-  rejects a PREPARE whose key has a committed version above `StartTS`,
-  and the shipped COMMIT rejects a second commit of one identity at
-  another timestamp (the `commit_ts mismatch` of G12), so of two
-  coordinators that admitted `(primaryKey, StartTS)` exactly one
-  reservation commits and the other fails before its primary PREPARE and
-  retries under a fresh snapshot: no two transactions of the
-  intermediate release share an identity, which is what G12 needs. A
-  raw or one-phase write cannot serve, since both refuse
-  transaction-internal keys (`validateRawMutationForApply`,
+  `StartTS`) and the attempt id as value. The reservation transactions
+  of two coordinators that admitted `(primaryKey, StartTS)` share the
+  legacy identity (reservation key, `StartTS`) themselves, so the second
+  PREPARE passes the ownership test as the first one's retry and
+  overwrites the intent; the arbiter is the COMMIT, not the PREPARE
+  (found in review). The shipped `validateConflicts` rejects a PREPARE
+  whose key has a committed version above `StartTS`, and the shipped
+  COMMIT rejects a second commit of one identity at another timestamp
+  (`commit_ts mismatch`, `ErrTxnInvalidMeta`) and a commit after a
+  rollback record (`ErrTxnAlreadyAborted`), so exactly one reservation
+  COMMIT succeeds. The coordinator admits the transaction only when its
+  own reservation COMMIT returned success; an ambiguous outcome is
+  retried with the same timestamp until it is definite (a record at its
+  own timestamp is success, a record at another timestamp or a rollback
+  record is loss), and a loss retries the whole transaction under a
+  fresh snapshot before any PREPARE. The reservation path never enters
+  the generic completion by which the V1 coordinator finishes a
+  transaction whose primary COMMIT failed but whose identity turns out
+  committed (the G12 behaviour, where the loser's secondaries are
+  committed at the winner's timestamp and success is reported), and it
+  never aborts a reservation. The committed value is diagnostic only and
+  may name the losing attempt when the PREPAREs overlapped. No two
+  transactions of the intermediate release therefore share an identity,
+  which is what G12 needs. A raw or one-phase write cannot serve, since
+  both refuse transaction-internal keys (`validateRawMutationForApply`,
   `buildOnePhaseStoreMutations`). Cost: two Raft round trips on the
   primary group per cross-group transaction, in the intermediate release
   only; the ledger era reserves through the ledger row instead. A
@@ -2504,9 +2519,11 @@ sections defer to is therefore two-sided:
   the earlier revision is withdrawn). Tests: the G13 and G14
   reproductions run under the intermediate coordinator against the
   shipped FSM and **pass** (every write lands, the reader gets `txn
-  locked`); the G12 aliasing reproduction under it ends with the second
-  transaction's reservation rejected and retried under a fresh snapshot
-  and no mixed outcome; a coordinator that loses its data directory
+  locked`); the G12 aliasing reproduction under it, run once with the
+  two reservation PREPAREs overlapped before either COMMIT and once with
+  the second PREPARE after the first COMMIT, ends with exactly one
+  coordinator admitted, the other retried under a fresh snapshot, and
+  no mixed outcome; a coordinator that loses its data directory
   after the primary commit and before the secondary COMMIT is replaced
   by an empty one, the scan finds the secondary lock, the resolver
   publishes it from the commit record, and the epoch applies; the same

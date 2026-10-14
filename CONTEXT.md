@@ -173,10 +173,14 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   issues the value, the apply-order fence rejects a second apply at or
   below the group's watermark, and a 2PC secondary COMMIT (which A0 leaves
   unfenced) can only touch keys its PREPARE locked, so no other transaction
-  can apply the same key at that timestamp. Two transactions with disjoint
-  keys can still share a timestamp within a group through such a secondary
-  COMMIT, and two leaders of different groups can issue the same value;
-  both are harmless because versions are identified per key. It holds
+  can apply the same key at that timestamp. Two transactions can still
+  share a timestamp, within a group when a secondary COMMIT carries a
+  value another group's leader issued, and across groups when two leaders
+  issue the same value; neither is settled: a snapshot one leader issued
+  can equal a commit timestamp another leader issued, the `latest >
+  StartTS` conflict check does not see the equality, and the audit keeps
+  cross-issuer uniqueness (an issuer lane in the logical half, or Phase
+  D's single issuer) as a blocker for the README claim. It holds
   cluster-wide only under Phase D, where group 0 is the single issuer.
   (`store/store.go`)
 - **PrevCommitTS** — The commit timestamp of a failed earlier attempt of the
