@@ -194,7 +194,7 @@ func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
 	}
 	svc := newFilesystemTestService(t)
-	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-a"}
+	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-a", mountOptions: testFUSEMountOptions()}
 
 	server, serveDone, err := mountFilesystemService(svc, config)
 	if err != nil {

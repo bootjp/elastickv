@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
@@ -37,6 +39,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -299,6 +302,17 @@ var memoryPressureExit atomic.Bool
 // so log scraping can tell them apart.
 const exitCodeMemoryPressure = 2
 
+// shutdownSignals are the signals that start a graceful stop. Without a
+// handler Go's default disposition ends the process immediately, which
+// skips the CleanupStack: the WAL is not synced and a FUSE mount stays
+// attached to a dead server (`Transport endpoint is not connected`).
+var shutdownSignals = []os.Signal{syscall.SIGTERM, syscall.SIGINT}
+
+// signalShutdown is set by the signal handler once a shutdown signal has
+// cancelled the root context, so main can tell a requested stop from a
+// failure when the errgroup surfaces context.Canceled while unwinding.
+var signalShutdown atomic.Bool
+
 // memoryShutdownThresholdEnvVar configures the heap-inuse ceiling at
 // which memwatch triggers a graceful shutdown. Empty or "0" disables the
 // watchdog (the default; existing operators see no behaviour change).
@@ -333,9 +347,21 @@ func main() {
 		}
 		os.Exit(exitCodeMemoryPressure)
 	}
-	if err != nil {
+	if err := ignoreCanceledAfterSignal(err); err != nil {
 		log.Fatalf("%v", err)
 	}
+}
+
+// ignoreCanceledAfterSignal maps the context.Canceled an errgroup member may
+// surface while unwinding after SIGTERM/SIGINT to a clean exit. The
+// cancellation is the shutdown the operator asked for, not a failure; any
+// other error (or a cancellation nobody requested) is reported unchanged.
+func ignoreCanceledAfterSignal(err error) error {
+	if err == nil || !signalShutdown.Load() || !errors.Is(err, context.Canceled) {
+		return err
+	}
+	slog.Info("graceful shutdown after signal completed")
+	return nil
 }
 
 // memwatchConfigFromEnv resolves the memwatch Config from environment
@@ -538,6 +564,9 @@ func run() error {
 	cleanup.Add(readTracker.Close)
 
 	ctx, cancel := context.WithCancel(context.Background())
+	// Registered before the store/runtime closers so the handler is still
+	// swallowing repeat signals while CleanupStack syncs and closes them.
+	cleanup.Add(installShutdownSignalHandler(cancel))
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
@@ -857,6 +886,9 @@ type filesystemStartConfig struct {
 	rootMode   uint32
 	rootUID    uint32
 	rootGID    uint32
+	// mountOptions overrides go-fuse's mount options. Production leaves it
+	// nil (fusermount3 path); tests set DirectMount where no helper exists.
+	mountOptions *fuse.MountOptions
 }
 
 func filesystemStartConfigFromFlags() (filesystemStartConfig, error) {
@@ -932,7 +964,7 @@ func mountFilesystemService(
 	config filesystemStartConfig,
 ) (*fuseadapter.Server, <-chan struct{}, error) {
 	frontend := fuseadapter.New(service, []byte(config.clientID))
-	server, err := fuseadapter.Mount(config.mountPoint, frontend, nil)
+	server, err := fuseadapter.Mount(config.mountPoint, frontend, config.mountOptions)
 	if err != nil {
 		frontend.Close()
 		return nil, nil, errors.Wrap(err, "mount filesystem frontend")
@@ -3289,6 +3321,45 @@ func loadS3BlobPeerTokenFile(path string) (string, error) {
 		return "", errors.Wrap(err, "load S3 blob peer token")
 	}
 	return tok, nil
+}
+
+// installShutdownSignalHandler routes SIGTERM/SIGINT (or the given signals)
+// into cancel so the process unwinds through the same path the memory
+// watchdog uses: the errgroup drains, the FUSE mount is unmounted, and the
+// CleanupStack syncs the WAL. The first signal cancels; later ones are
+// logged and otherwise ignored so a second SIGTERM from a supervisor cannot
+// cut the shutdown short (SIGKILL still can, which no handler prevents).
+// The returned function releases the registration and must be called once
+// the cleanup that needs protection has run.
+func installShutdownSignalHandler(cancel context.CancelFunc, signals ...os.Signal) func() {
+	if len(signals) == 0 {
+		signals = shutdownSignals
+	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, signals...)
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case sig := <-sigCh:
+				if signalShutdown.CompareAndSwap(false, true) {
+					slog.Info("shutdown signal received, stopping", "signal", sig.String())
+					cancel()
+					continue
+				}
+				slog.Warn("shutdown already in progress, ignoring repeated signal", "signal", sig.String())
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+	return sync.OnceFunc(func() {
+		signal.Stop(sigCh)
+		close(stopCh)
+		<-done
+	})
 }
 
 // startMemoryWatchdog optionally starts the memwatch goroutine. The

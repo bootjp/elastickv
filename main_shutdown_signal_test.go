@@ -1,0 +1,150 @@
+package main
+
+import (
+	"context"
+	"os"
+	"path/filepath"
+	"syscall"
+	"testing"
+	"time"
+
+	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/cockroachdb/errors"
+	"github.com/hanwen/go-fuse/v2/fuse"
+	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
+)
+
+const shutdownTestTimeout = 15 * time.Second
+
+// resetSignalShutdown clears the process-wide sentinel so tests that raise a
+// signal start from the same state main does.
+func resetSignalShutdown(t *testing.T) {
+	t.Helper()
+	signalShutdown.Store(false)
+	t.Cleanup(func() { signalShutdown.Store(false) })
+}
+
+// testFUSEMountOptions mounts directly when the test runs as root, which
+// lets the kernel-mount tests run in containers without fusermount3.
+func testFUSEMountOptions() *fuse.MountOptions {
+	return &fuse.MountOptions{DirectMount: os.Geteuid() == 0}
+}
+
+func TestInstallShutdownSignalHandlerCancelsOnSignal(t *testing.T) {
+	resetSignalShutdown(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := installShutdownSignalHandler(cancel, syscall.SIGTERM)
+	t.Cleanup(stop)
+
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+	select {
+	case <-ctx.Done():
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("SIGTERM did not cancel the root context")
+	}
+	require.True(t, signalShutdown.Load())
+
+	// A repeat signal while the shutdown is in flight must stay with the
+	// handler: if the registration had been released, the default
+	// disposition would kill this test binary.
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+	time.Sleep(50 * time.Millisecond)
+	stop()
+	stop() // idempotent
+}
+
+func TestInstallShutdownSignalHandlerStopReleasesWithoutSignal(t *testing.T) {
+	resetSignalShutdown(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	stop := installShutdownSignalHandler(cancel, syscall.SIGUSR2)
+
+	stop()
+	require.NoError(t, ctx.Err())
+	require.False(t, signalShutdown.Load())
+}
+
+func TestIgnoreCanceledAfterSignal(t *testing.T) {
+	resetSignalShutdown(t)
+	wrappedCancel := errors.Wrap(context.Canceled, "failed to serve")
+	other := errors.New("listener exploded")
+	tests := []struct {
+		name     string
+		signaled bool
+		err      error
+		wantNil  bool
+	}{
+		{name: "nil error", signaled: true, err: nil, wantNil: true},
+		{name: "canceled after signal", signaled: true, err: context.Canceled, wantNil: true},
+		{name: "wrapped canceled after signal", signaled: true, err: wrappedCancel, wantNil: true},
+		{name: "other error after signal", signaled: true, err: other, wantNil: false},
+		{name: "canceled without signal", signaled: false, err: context.Canceled, wantNil: false},
+		{name: "other error without signal", signaled: false, err: other, wantNil: false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			signalShutdown.Store(tt.signaled)
+			got := ignoreCanceledAfterSignal(tt.err)
+			if tt.wantNil {
+				require.NoError(t, got)
+				return
+			}
+			require.ErrorIs(t, got, tt.err)
+		})
+	}
+}
+
+// TestShutdownSignalUnmountsFilesystem drives the production wiring end to
+// end: the signal handler cancels the root context, the errgroup-derived
+// context fires, and the filesystem lifecycle unmounts the kernel mount.
+func TestShutdownSignalUnmountsFilesystem(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
+	}
+	resetSignalShutdown(t)
+	svc := newFilesystemTestService(t)
+	config := filesystemStartConfig{
+		mountPoint:   t.TempDir(),
+		clientID:     "mount-signal",
+		mountOptions: testFUSEMountOptions(),
+	}
+	server, serveDone, err := mountFilesystemService(svc, config)
+	if err != nil {
+		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanup := &internalutil.CleanupStack{}
+	t.Cleanup(cleanup.Run)
+	cleanup.Add(installShutdownSignalHandler(cancel, syscall.SIGTERM))
+	cleanup.Add(cancel)
+	eg, egCtx := errgroup.WithContext(ctx)
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, config.mountPoint)
+
+	probe := filepath.Join(config.mountPoint, "probe")
+	require.NoError(t, os.WriteFile(probe, []byte("probe"), 0o600))
+
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- eg.Wait() }()
+	select {
+	case err := <-waitDone:
+		require.NoError(t, err)
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("filesystem lifecycle did not stop after SIGTERM")
+	}
+	require.True(t, signalShutdown.Load())
+	select {
+	case <-serveDone:
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("FUSE serve loop did not stop after SIGTERM")
+	}
+
+	// The mount is gone: the path is the bare temp directory again, so the
+	// probe written through the mount is no longer visible and stat works.
+	require.NoError(t, ignoreCanceledAfterSignal(egCtx.Err()))
+	entries, err := os.ReadDir(config.mountPoint)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}

@@ -495,12 +495,22 @@ type Server struct {
 
 // Mount attaches adapter to mountPoint using go-fuse. The returned server is
 // ready for Serve; callers should call Unmount during shutdown.
+//
+// A dangling FUSE mount left at mountPoint by a server that died without
+// unmounting (SIGKILL, a crash) is detached first, because fusermount3
+// refuses to mount over a mount point whose transport is not connected. Only
+// a mount the mounts table reports as FUSE and whose stat fails with ENOTCONN
+// is touched; a live FUSE mount or any other filesystem at the path is left
+// alone.
 func Mount(mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Server, error) {
 	if adapter == nil || adapter.core == nil {
 		return nil, errors.New("filesystem FUSE adapter is required")
 	}
 	if strings.TrimSpace(mountPoint) == "" {
 		return nil, errors.New("filesystem FUSE mount point is required")
+	}
+	if _, err := detachStaleMount(context.Background(), mountPoint, slog.Default()); err != nil {
+		return nil, errors.Wrap(err, "detach stale filesystem FUSE mount")
 	}
 	opts := defaultMountOptions(options)
 	if recoverer, ok := adapter.core.(intentRecoverer); ok {
