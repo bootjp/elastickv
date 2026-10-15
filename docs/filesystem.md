@@ -381,14 +381,12 @@ The gauges derived from scanning the store (`open_handle_lease_active`,
 `orphan_inode_gc_pending`, `files_by_group`, `file_multi_shard_current`,
 `file_move_inflight`) are refreshed every `--filesystemPlacementScanInterval`
 and describe the whole cluster, and every mounted node exports the same
-value. Aggregate them across nodes with `max`, not `sum`: the Grafana
-dashboard `monitoring/grafana/dashboards/elastickv-filesystem.json` sums
-them, so with three mounted nodes its placement panels show three times the
-real count until that is changed (the chunk I/O counters and the `_total`
-counters are per node and sum correctly). The alert rules in
-`monitoring/prometheus/rules/filesystem.yml` (pinned hotspot, multi-shard
-file, stuck move, pending orphan GC, home epoch conflicts) compare against
-zero, so the summing does not change their outcome.
+value. Aggregate them across nodes with `max`, not `sum`; summing shows N
+times the real count with N mounted nodes. The Grafana dashboard
+`monitoring/grafana/dashboards/elastickv-filesystem.json` and the alert
+rules in `monitoring/prometheus/rules/filesystem.yml` (pinned hotspot,
+multi-shard file, stuck move, pending orphan GC, home epoch conflicts) do so;
+the chunk I/O counters and the `_total` counters are per node and are summed.
 
 ## Backup and restore
 
