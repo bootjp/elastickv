@@ -407,11 +407,14 @@ filesystem backup adapter exists, there are two options:
 - Keep a cold copy of every node's Raft data directory, taken with the
   servers stopped. With data-at-rest encryption enabled the copy must also
   include the key sidecar (`--encryptionSidecarPath`, which may live outside
-  the data directory) and the KEK source (`--kekFile`, `--kekUri`, or the
-  `ELASTICKV_KEK_BASE64` environment value, which the server removes from
-  its environment at startup and stores nowhere); restoring data without its
-  sidecar leaves the values unrecoverable, and the KEK is never part of any
-  backup. See the
+  the data directory); restoring data without its sidecar leaves the values
+  unrecoverable.
+- Keep the KEK itself out of the copy. Whichever source the cluster uses
+  (`--kekFile`, `--kekUri`, or `ELASTICKV_KEK_BASE64`) has to be managed
+  separately and be available again at restore time; the server removes
+  `ELASTICKV_KEK_BASE64` from its environment at startup and stores it
+  nowhere, so a restore of encrypted data needs that value from wherever it
+  is kept. See the
   [encryption design](design/2026_04_29_partial_data_at_rest_encryption.md).
 
 ## Troubleshooting
