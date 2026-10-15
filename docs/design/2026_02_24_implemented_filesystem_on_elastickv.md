@@ -540,8 +540,31 @@ Phase 3:
    - committed Truncate/SetAttr shrink cleanup survives caller cancellation
    - TTL lease expiry and orphan GC correctness
 3. Jepsen-like:
-   - concurrent append + read under node failure
-   - migration during read/write load
+   - linearizable register over the FUSE mounts
+     (`jepsen/src/elastickv/filesystem_workload.clj`): every node mounts the
+     shared filesystem and each key is one fixed-width file. `--write-mode
+     overwrite` replaces the record with a single in-place pwrite (one chunk
+     RMW); `--write-mode rename` writes a temp file and renames it over the
+     key (namespace transaction, remove-while-open). `--local` drives the
+     mounts through java.nio; without it the client runs `dd`/`head`/`mv` on
+     each node over SSH and the DB adapter starts nodes with
+     `--filesystemMount`, so the partition/kill nemesis applies. Reads retry
+     ENOENT/short/malformed records (FUSE's LOOKUP+OPEN split lets a reader
+     racing a rename on another mount miss the replaced inode) and stay
+     `:fail` on exhaustion during the main phase; the final phase, issued once
+     every writer has stopped, reads every register from every mount (so a
+     stale recovered follower cannot hide behind a healthy one), and a read
+     there that still finds its register missing,
+     truncated or unparseable completes `:ok` with a data-loss sentinel the
+     register model rejects, and a final-reads checker flags a final read
+     that could not observe its register, so a lost acknowledged write
+     cannot hide behind a failed read (knossos treats `:fail` as a no-op). The CI
+     `jepsen-test` workflow runs both modes against the 3-node cluster on
+     every push, and the 6-hourly `jepsen-test-scheduled` stress run repeats
+     them at the stress settings against a real-binary cluster (the
+     single-process demo cluster has no mount flags).
+   - concurrent append + read under node failure (open)
+   - migration during read/write load (open)
 4. FUSE compatibility:
    - go-fuse raw protocol tests for stable attributes, handles, and resumable
      `readdir` offsets

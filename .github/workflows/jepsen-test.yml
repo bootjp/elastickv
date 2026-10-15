@@ -24,8 +24,10 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-      - name: Install netcat and graphviz
-        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz
+      - name: Install netcat, graphviz and fuse3
+        # fuse3 provides fusermount3 for the --filesystemMount nodes used by
+        # the filesystem Jepsen workload.
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3
       - name: Install Leiningen
         run: |
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
@@ -81,12 +83,21 @@ jobs:
 
           : > /tmp/elastickv-demo.pid
           for node in 1 2 3; do
+            # Every node mounts the shared filesystem so the filesystem
+            # workload can drive leader and follower mounts alike. The root
+            # directory is owned by the runner user: the mount enforces
+            # default_permissions, so a root-owned root would reject the
+            # workload's mkdir.
+            mkdir -p "/tmp/elastickv-ci/fs-n${node}"
             nohup /tmp/elastickv-bin \
               --address "127.0.0.1:5005${node}" \
               --redisAddress "127.0.0.1:6379${node}" \
               --dynamoAddress "127.0.0.1:6380${node}" \
               --s3Address "127.0.0.1:6390${node}" \
               --sqsAddress "127.0.0.1:6350${node}" \
+              --filesystemMount "/tmp/elastickv-ci/fs-n${node}" \
+              --filesystemRootUID "$(id -u)" \
+              --filesystemRootGID "$(id -g)" \
               --metricsAddress "" \
               --pprofAddress "" \
               --raftId "n${node}" \
@@ -100,12 +111,14 @@ jobs:
             echo $! >> /tmp/elastickv-demo.pid
           done
 
-          echo "Waiting for redis (63791-63793), dynamo (63801-63803), s3 (63901-63903), and sqs (63501-63503) listeners..."
+          echo "Waiting for redis (63791-63793), dynamo (63801-63803), s3 (63901-63903), sqs (63501-63503) listeners and FUSE mounts..."
           for i in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
               && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
               && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903 \
-              && nc -z 127.0.0.1 63501 && nc -z 127.0.0.1 63502 && nc -z 127.0.0.1 63503; then
+              && nc -z 127.0.0.1 63501 && nc -z 127.0.0.1 63502 && nc -z 127.0.0.1 63503 \
+              && mountpoint -q /tmp/elastickv-ci/fs-n1 && mountpoint -q /tmp/elastickv-ci/fs-n2 \
+              && mountpoint -q /tmp/elastickv-ci/fs-n3; then
               echo "Cluster is up"
               exit 0
             fi
@@ -199,6 +212,52 @@ jobs:
             --partition-count 4 --group-count 6 \
             --drain-time 15 \
             --sqs-ports 63501,63502,63503 --host 127.0.0.1
+      - name: Run filesystem Jepsen workloads against elastickv
+        working-directory: jepsen
+        # Linearizable register over the FUSE mounts: every node mounts the
+        # same filesystem, and each key is one file. `overwrite` writes the
+        # record in place (one chunk RMW); `rename` replaces it through a
+        # temp file + rename (namespace txn and remove-while-open). Both run
+        # even if one fails so the log shows which mode broke.
+        # See jepsen/src/elastickv/filesystem_workload.clj.
+        timeout-minutes: 6
+        run: |
+          declare -A RESULT
+          FAILED=()
+          for mode in overwrite rename; do
+            echo "::group::write-mode=${mode}"
+            set +e
+            timeout 150 ~/lein run -m elastickv.filesystem-workload --local \
+              --time-limit 5 --rate 5 --concurrency 6 \
+              --write-mode "${mode}" \
+              --mount-dirs /tmp/elastickv-ci/fs-n1,/tmp/elastickv-ci/fs-n2,/tmp/elastickv-ci/fs-n3
+            rc=$?
+            set -e
+            if [ "$rc" -eq 0 ]; then
+              RESULT[$mode]="pass"
+            else
+              RESULT[$mode]="fail(${rc})"
+              FAILED+=("$mode")
+            fi
+            echo "::endgroup::"
+          done
+          echo
+          echo "=== filesystem jepsen summary ==="
+          for mode in overwrite rename; do
+            printf '  %-10s %s\n' "$mode" "${RESULT[$mode]}"
+          done
+          if [ ${#FAILED[@]} -ne 0 ]; then
+            echo "FAILED modes: ${FAILED[*]}"
+            exit 1
+          fi
+      - name: Upload Jepsen store on filesystem failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: jepsen-store-filesystem
+          path: jepsen/store/elastickv-filesystem-register-*
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Dump demo cluster logs on failure
         if: failure()
         # Same rationale as jepsen-test-scheduled.yml: inline summary
@@ -235,3 +294,6 @@ jobs:
               wait "$pid" 2>/dev/null || true
             done < /tmp/elastickv-demo.pid
           fi
+          for node in 1 2 3; do
+            fusermount3 -uz "/tmp/elastickv-ci/fs-n${node}" 2>/dev/null || true
+          done

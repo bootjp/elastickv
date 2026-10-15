@@ -49,7 +49,7 @@
   "Install minimal packages on a node."
   [node]
   (c/on node
-    (debian/install [:curl :netcat-openbsd :rsync :iptables :chrony :libfaketime])))
+    (debian/install [:curl :netcat-openbsd :rsync :iptables :chrony :libfaketime :fuse3])))
 
 (defn- upload-binaries!
   "Copy built binaries to the given node."
@@ -103,8 +103,85 @@
 (defn- build-raft-dynamo-map [nodes grpc-port dynamo-port raft-groups]
   (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
+(defn- filesystem-mount-dir
+  "Resolves the FUSE mount directory for node from the :filesystem-mount
+   option, which is either a single path applied to every node or a map of
+   node -> path. nil disables the filesystem frontend."
+  [filesystem-mount node]
+  (cond
+    (nil? filesystem-mount) nil
+    (map? filesystem-mount) (get filesystem-mount node)
+    :else                   filesystem-mount))
+
+(defn- sh-quote
+  "Single-quotes s for use inside a bash -c script."
+  [s]
+  (str "'" (clojure.string/replace (str s) "'" "'\\''") "'"))
+
+(defn- proc-mounts-escape
+  "Encodes a path the way /proc/mounts prints mount points: backslash, space,
+   tab and newline become octal escapes."
+  [path]
+  (-> (str path)
+      (clojure.string/replace "\\" "\\134")
+      (clojure.string/replace " " "\\040")
+      (clojure.string/replace "\t" "\\011")
+      (clojure.string/replace "\n" "\\012")))
+
+(defn- unmount-filesystem-cmd
+  "Shell snippet that lazily detaches a (possibly dangling) FUSE mount. A
+   node killed with SIGKILL leaves its mount point in a 'transport endpoint
+   is not connected' state, which would make the next --filesystemMount fail.
+   The filesystem type comes from the mounts table (mountpoint(1) cannot stat
+   a dangling mount) and only a FUSE mount is touched: the snippet runs as
+   root, so a mis-typed --filesystem-mount naming an unrelated volume must
+   warn rather than reach the generic umount fallback. The path is quoted
+   because the snippet runs through bash -c."
+  ([mount-dir]
+   (unmount-filesystem-cmd mount-dir "/proc/mounts"))
+  ([mount-dir mounts-file]
+   (let [q   (sh-quote mount-dir)
+         esc (sh-quote (proc-mounts-escape mount-dir))
+         mf  (sh-quote mounts-file)]
+     (str "fstype=$(while read -r _ mp fs _; do [ \"$mp\" = " esc " ] && printf '%s\\n' \"$fs\"; done < " mf " | tail -n 1); "
+          "case \"$fstype\" in "
+          "'') ;; "
+          "fuse|fuse.*|fuseblk) fusermount3 -uz " q " 2>/dev/null || fusermount -uz " q " 2>/dev/null || umount -l " q " || true ;; "
+          "*) echo \"refusing to unmount non-FUSE filesystem ($fstype) at \"" q " >&2 ;; "
+          "esac"))))
+
+(defn- wait-for-mount-cmd
+  "Shell snippet that waits up to ~60s for mount-dir to become a mountpoint.
+   The server mounts the filesystem after its public listeners are up, so a
+   gRPC readiness check alone would let clients hit the bare directory."
+  [mount-dir]
+  (let [q (sh-quote mount-dir)]
+    (str "for i in $(seq 1 60); do if mountpoint -q " q "; then exit 0; fi; sleep 1; done; "
+         "echo \"Timed out waiting for FUSE mount at \"" q "; exit 1")))
+
+(defn- prepare-filesystem-mount!
+  "Ensures mount-dir exists and holds no stale mount before the server starts."
+  [mount-dir]
+  (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))
+  (c/exec :mkdir :-p mount-dir))
+
+(defn- wait-for-mount!
+  "Blocks until node has mounted the filesystem at mount-dir (no-op when nil)."
+  [node mount-dir]
+  (when mount-dir
+    (c/on node
+      (c/exec :bash "-c" (wait-for-mount-cmd mount-dir)))))
+
+(defn- cleanup-filesystem-mount!
+  "Detaches the node's mount after the server stopped."
+  [node mount-dir]
+  (when mount-dir
+    (c/on node
+      (c/su
+        (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
+
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env filesystem-mount]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -122,6 +199,7 @@
         raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
         raft-dynamo-map (when dynamo
                           (build-raft-dynamo-map (:nodes test) grpc-port dynamo-port raft-groups))
+        mount-dir (filesystem-mount-dir filesystem-mount node)
         bootstrap? (= node bootstrap-node)
         args (cond-> ["--address" grpc
                       "--redisAddress" redis
@@ -134,6 +212,7 @@
                s3 (conj "--s3Address" s3)
                sqs (conj "--sqsAddress" sqs)
                (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
+               mount-dir (conj "--filesystemMount" mount-dir)
                (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
                (seq shard-ranges) (conj "--shardRanges" shard-ranges)
                bootstrap? (conj "--raftBootstrap"))
@@ -145,6 +224,8 @@
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
+        (when mount-dir
+          (prepare-filesystem-mount! mount-dir))
         (apply cu/start-daemon! daemon-opts server-bin args)))))
 
 (defn- stop-node!
@@ -185,6 +266,63 @@
       (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
               raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
 
+(defn- node-start-opts
+  [test opts]
+  (merge {:data-dir data-dir
+          :grpc-port (or (:grpc-port opts) 50051)
+          :redis-port (or (:redis-port opts) 6379)
+          :bootstrap-node (first (:nodes test))}
+         opts))
+
+(defn- wait-for-node-grpc!
+  [node opts]
+  (if-let [raft-groups (:raft-groups opts)]
+    (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
+                              (group-ids raft-groups)))
+    (wait-for-grpc! node (or (:grpc-port opts) 50051))))
+
+(defn- join-peer!
+  "Adds peer to the cluster led by bootstrap-node, retrying until it answers."
+  [bootstrap-node peer opts]
+  (let [raft-groups (:raft-groups opts)
+        grpc-port (or (:grpc-port opts) 50051)
+        group-ids (when (seq raft-groups) (group-ids raft-groups))]
+    (util/await-fn
+      (fn []
+        (try
+          (if (seq raft-groups)
+            (doseq [gid group-ids]
+              (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
+              (join-node! bootstrap-node
+                          (group-addr bootstrap-node raft-groups gid)
+                          (name peer)
+                          (group-addr peer raft-groups gid)))
+            (do
+              (wait-for-grpc! peer grpc-port)
+              (join-node! bootstrap-node
+                          (node-addr bootstrap-node grpc-port)
+                          (name peer)
+                          (node-addr peer grpc-port))))
+          true
+          (catch Throwable t
+            (warn t "retrying join for" peer)
+            nil)))
+      {:timeout 120000
+       :log-message (str "joining " peer)})))
+
+(defn- enable-peer-mount!
+  "Restarts a freshly joined peer with its FUSE mount. The server initializes
+   the filesystem root synchronously at startup and needs a Raft leader for
+   that, which an unjoined peer does not have, so peers start without the
+   mount and only get it once they are cluster members."
+  [test peer opts]
+  (when-let [mount-dir (filesystem-mount-dir (:filesystem-mount opts) peer)]
+    (stop-node! peer)
+    (start-node! test peer (node-start-opts test opts))
+    (wait-for-node-grpc! peer opts)
+    (wait-for-mount! peer mount-dir)
+    (info "filesystem mounted on joined peer" peer)))
+
 (defrecord ElastickvDB [opts]
   db/DB
   (setup! [_ test node]
@@ -194,38 +332,18 @@
       (c/su
         (c/exec :mkdir :-p data-dir)
         (c/exec :rm :-f log-file transport-metrics-file)))
-    (start-node! test node (merge {:data-dir data-dir
-                                   :grpc-port (or (:grpc-port opts) 50051)
-                                   :redis-port (or (:redis-port opts) 6379)
-                                   :bootstrap-node (first (:nodes test))}
-                                  opts))
-    (when (= node (first (:nodes test)))
-      (let [raft-groups (:raft-groups opts)
-            grpc-port (or (:grpc-port opts) 50051)
-            group-ids (when (seq raft-groups) (group-ids raft-groups))]
+    (let [bootstrap? (= node (first (:nodes test)))
+          start-opts (node-start-opts test opts)]
+      ;; Only the bootstrap node mounts immediately; peers are restarted with
+      ;; their mount by enable-peer-mount! once they have joined.
+      (start-node! test node (if bootstrap?
+                               start-opts
+                               (assoc start-opts :filesystem-mount nil)))
+      (when bootstrap?
+        (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
         (doseq [peer (rest (:nodes test))]
-          (util/await-fn
-            (fn []
-              (try
-                (if (seq raft-groups)
-                  (doseq [gid group-ids]
-                    (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
-                    (join-node! node
-                                (group-addr node raft-groups gid)
-                                (name peer)
-                                (group-addr peer raft-groups gid)))
-                  (do
-                    (wait-for-grpc! peer grpc-port)
-                    (join-node! node
-                                (node-addr node grpc-port)
-                                (name peer)
-                                (node-addr peer grpc-port))))
-                true
-                (catch Throwable t
-                  (warn t "retrying join for" peer)
-                  nil)))
-            {:timeout 120000
-             :log-message (str "joining " peer)}))))
+          (join-peer! node peer opts)
+          (enable-peer-mount! test peer opts))))
     (info "node started" node))
 
   (teardown! [_ _test node]
@@ -237,6 +355,10 @@
       (stop-node! node)
       (catch Throwable t
         (warn t "teardown stop failed")))
+    (try
+      (cleanup-filesystem-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
+      (catch Throwable t
+        (warn t "teardown unmount failed")))
     (c/on node
       (c/su
         (c/exec :rm :-rf data-dir))))
@@ -248,15 +370,9 @@
 
   db/Kill
   (start! [this test node]
-    (start-node! test node (merge {:data-dir data-dir
-                                   :grpc-port (or (:grpc-port opts) 50051)
-                                   :redis-port (or (:redis-port opts) 6379)
-                                   :bootstrap-node (first (:nodes test))}
-                                  opts))
-    (if-let [raft-groups (:raft-groups opts)]
-      (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
-                                (group-ids raft-groups)))
-      (wait-for-grpc! node (or (:grpc-port opts) 50051)))
+    (start-node! test node (node-start-opts test opts))
+    (wait-for-node-grpc! node opts)
+    (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
     (info "node started" node)
     this)
   (kill! [this _test node]
@@ -265,6 +381,10 @@
       (catch Throwable t
         (warn t "transport metrics snapshot before kill failed")))
     (stop-node! node)
+    (try
+      (cleanup-filesystem-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
+      (catch Throwable t
+        (warn t "unmount after kill failed")))
     this)
 
   db/Pause
@@ -284,6 +404,7 @@
 (defn db
   "Constructs an ElastickvDB with optional opts.
    opts: {:grpc-port 50051 :redis-port 6379
+          :filesystem-mount \"/mnt/elastickv\" ; or {node -> dir}; nil disables FUSE
           :raft-groups {1 50051 2 50052}
           :shard-ranges \":m=1,m:=2\"
           :server-env {\"ELASTICKV_RAFT_SEND_STREAM\" \"true\"}}"
