@@ -16,7 +16,7 @@
 
 Out-of-scope follow-ups (tracked separately, not gating this rename):
 - Throttle integration (`bucketActionAdminPeek` + dedicated per-queue admin-peek bucket per §3.1)
-- Audit logging + Prometheus counters per §3.6
+- ~~Audit logging + Prometheus counters per §3.6~~ — **implemented**
 - `principalForReadSensitive` live `RoleStore` re-check (Goal 8, blocked on wider RoleStore plumbing)
 - Page-size selector (20 / 50 / 100) + response-size warning
 
@@ -491,20 +491,25 @@ mirroring the existing `deleteQueue` / `describeQueue` shape. `peekQueue` is `si
 
 ### 3.6 Audit and observability
 
-_Not yet implemented in the initial rollout — see "Out-of-scope follow-ups" at the top. Mitigation in absence: the admin handler still emits the standard request-log line with `route` / `subject` / `status_code` for both purge and peek calls, so an operator can correlate "who did what when" against the application logs at audit-review time. The structured `admin.sqs.purge_queue` audit line and the two Prometheus counters land alongside the SPA wiring so the metrics have a real consumer._
+_**Implemented.** The `admin.sqs.purge_queue` audit line and both Prometheus counters are live. Two deviations from the text below, both forced by the code as it stands:_
+
+_1. The audit line logs `access_key`, not `subject`: `AdminPrincipal` carries `AccessKey` and `Role` and has no `Subject` field. The access key ID is the identity the admin surface authenticates and is an identifier rather than a secret — the signing key never appears in the log._
+
+_2. The two outcome sets are deliberately asymmetric. `purge_in_progress` exists only on the purge counter and `throttled` only on peek, because purge signals contention via the generation gate and peek via the throttle. Accepting both on either counter would let the two paths drift into describing one condition two ways. The peek `throttled` outcome is defined but not yet emitted — admin-peek throttle integration remains a separate open follow-up._
 
 New structured log line at `slog.Info` level (matches `AdminDeleteQueue`):
 
 ```
 admin.sqs.purge_queue
-  subject=<principal.Subject>
+  access_key=<principal.AccessKey>
   role=<principal.Role>
   queue=<name>
-  generation_before=<n>
-  generation_after=<n+1>
+  outcome=<ok|failure_reason>
+  generation_before=<n>  // success only
+  generation_after=<n+1>  // success only
 ```
 
-The audit line stays **lean** — `subject`, `role`, `queue`, and the two generations are everything an operator needs to reconstruct who-purged-what-when. Gemini's r1 review flagged that an earlier draft logged `is_dlq` / `dlq_sources` too; computing those would force every purge to pay the catalog reverse-scan cost (§3.3), turning an O(1) generation bump into O(N). The DLQ relationship is observable separately via `AdminDescribeQueue` at audit-review time, so dragging it into the write path is not worth the cost. If incident-triage workflows turn out to need the DLQ context inline, a future PR can add a `--with-dlq-context` opt-in flag.
+The audit line stays **lean** — `access_key`, `role`, `queue`, and `outcome` identify every attempt; successful purges also include the two committed generations. An earlier review flagged that a draft logged `is_dlq` / `dlq_sources` too; computing those would force every purge to pay the catalog reverse-scan cost (§3.3), turning an O(1) generation bump into O(N). The DLQ relationship is observable separately via `AdminDescribeQueue` at audit-review time, so dragging it into the write path is not worth the cost. If incident-triage workflows turn out to need the DLQ context inline, a future PR can add a `--with-dlq-context` opt-in flag.
 
 **Sourcing the generation values.** `purgeQueueWithRetry` is modified to return `(oldGen, newGen uint64, err error)` so the audit log records the values from the **committed OCC round**, not a pre/post `loadQueueMetaAt` read that could race a concurrent purge in the 60-second window. `tryPurgeQueueOnce` already has both values inside the OCC transaction (`lastGen` and `lastGen + 1`); plumbing them out is one extra `return`. Claude r2 caught this — fetching the generations via extra Pebble reads would race the meta-stored rate-limit fields and could log values that never appeared as a single consistent state. The change is contained to `adapter/sqs_purge.go`; the only other caller (the SigV4 `purgeQueue` handler) discards the new return values via `_, _, err := ...`.
 

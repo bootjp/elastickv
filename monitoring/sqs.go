@@ -149,6 +149,13 @@ type SQSMetrics struct {
 	queueDepth        *prometheus.GaugeVec
 	throttledRequests *prometheus.CounterVec
 	throttleTokens    *prometheus.GaugeVec
+	adminPurgeQueue   *prometheus.CounterVec
+	adminPeekQueue    *prometheus.CounterVec
+	// trackedAdminCounterQueues bounds the queue label on the two
+	// admin counters with the same budget the data-path counters use.
+	// Queue names are operator-supplied, so an unbounded label here
+	// would let queue churn grow the series set without limit.
+	trackedAdminCounterQueues map[string]struct{}
 
 	mu                           sync.Mutex
 	trackedCounterQueues         map[string]struct{}
@@ -215,6 +222,7 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 			[]string{"queue", "action"},
 		),
 		trackedCounterQueues:         map[string]struct{}{},
+		trackedAdminCounterQueues:    map[string]struct{}{},
 		trackedThrottleCounterQueues: map[string]struct{}{},
 		trackedDepthQueues:           map[string]struct{}{},
 		trackedThrottleGaugeQueues:   map[string]map[string]struct{}{},
@@ -223,11 +231,111 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 		overflowDepthQueues:          map[string]struct{}{},
 		overflowThrottleGaugeQueues:  map[string]map[string]struct{}{},
 	}
+	m.adminPurgeQueue = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "elastickv_sqs_admin_purge_queue_total",
+			Help: "Total admin PurgeQueue calls by queue and outcome.",
+		},
+		[]string{"queue", "outcome"},
+	)
+	m.adminPeekQueue = prometheus.NewCounterVec(
+		prometheus.CounterOpts{
+			Name: "elastickv_sqs_admin_peek_queue_total",
+			Help: "Total admin PeekQueue calls by queue and outcome.",
+		},
+		[]string{"queue", "outcome"},
+	)
 	registerer.MustRegister(m.partitionMessages)
 	registerer.MustRegister(m.queueDepth)
 	registerer.MustRegister(m.throttledRequests)
 	registerer.MustRegister(m.throttleTokens)
+	registerer.MustRegister(m.adminPurgeQueue)
+	registerer.MustRegister(m.adminPeekQueue)
 	return m
+}
+
+// Outcomes for the two admin SQS counters. Closed sets: the label is
+// derived from a sentinel comparison, never from an error string, so
+// one recurring failure cannot mint new series.
+const (
+	SQSAdminOutcomeOK              = "ok"
+	SQSAdminOutcomeForbidden       = "forbidden"
+	SQSAdminOutcomeNotLeader       = "not_leader"
+	SQSAdminOutcomeNotFound        = "not_found"
+	SQSAdminOutcomeValidation      = "validation"
+	SQSAdminOutcomePurgeInProgress = "purge_in_progress"
+	SQSAdminOutcomeThrottled       = "throttled"
+	SQSAdminOutcomeInternalError   = "internal_error"
+)
+
+// ObserveAdminPurgeQueue counts one AdminPurgeQueue call.
+func (m *SQSMetrics) ObserveAdminPurgeQueue(queue, outcome string) {
+	if m == nil {
+		return
+	}
+	m.adminPurgeQueue.WithLabelValues(
+		m.admitForAdminCounterBudget(queue),
+		normalizeSQSAdminPurgeOutcome(outcome),
+	).Inc()
+}
+
+// ObserveAdminPeekQueue counts one AdminPeekQueue call.
+func (m *SQSMetrics) ObserveAdminPeekQueue(queue, outcome string) {
+	if m == nil {
+		return
+	}
+	m.adminPeekQueue.WithLabelValues(
+		m.admitForAdminCounterBudget(queue),
+		normalizeSQSAdminPeekOutcome(outcome),
+	).Inc()
+}
+
+func (m *SQSMetrics) admitForAdminCounterBudget(queue string) string {
+	if queue == "" {
+		// An empty name reaches here only on a validation rejection,
+		// where there is no queue to attribute the call to.
+		return sqsQueueOverflow
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return admitCounterQueueLocked(queue, m.trackedAdminCounterQueues)
+}
+
+// normalizeSQSAdminPurgeOutcome keeps the purge label inside §3.6's
+// closed set. `throttled` is deliberately absent: purge signals
+// contention as purge_in_progress, and accepting both would let the
+// two paths drift into reporting the same condition differently.
+func normalizeSQSAdminPurgeOutcome(outcome string) string {
+	switch outcome {
+	case SQSAdminOutcomeOK,
+		SQSAdminOutcomeForbidden,
+		SQSAdminOutcomeNotLeader,
+		SQSAdminOutcomeNotFound,
+		SQSAdminOutcomeValidation,
+		SQSAdminOutcomePurgeInProgress,
+		SQSAdminOutcomeInternalError:
+		return outcome
+	default:
+		return SQSAdminOutcomeInternalError
+	}
+}
+
+// normalizeSQSAdminPeekOutcome keeps the peek label inside §3.6's
+// closed set. `purge_in_progress` is absent for the mirror-image
+// reason: peek is throttled, not generation-gated.
+func normalizeSQSAdminPeekOutcome(outcome string) string {
+	switch outcome {
+	case SQSAdminOutcomeOK,
+		SQSAdminOutcomeForbidden,
+		SQSAdminOutcomeNotLeader,
+		SQSAdminOutcomeNotFound,
+		SQSAdminOutcomeValidation,
+		SQSAdminOutcomeThrottled,
+		SQSAdminOutcomeInternalError:
+		return outcome
+	default:
+		return SQSAdminOutcomeInternalError
+	}
 }
 
 // ObservePartitionMessage implements SQSPartitionObserver. The
