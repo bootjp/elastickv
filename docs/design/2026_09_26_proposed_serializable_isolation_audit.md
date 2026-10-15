@@ -1012,12 +1012,13 @@ Still open for the fix PRs:
   cutover requirement A7 covers); the in-memory store's V4 snapshots are
   rejected by pre-V4 binaries (production nodes do not use the in-memory
   store); and, separately and older, `elastickv-snapshot-decode` /
-  `ReadSnapshot` cannot decode any live Pebble `.fsm` today (it fails on
+  `ReadSnapshot` could not decode any live Pebble `.fsm` (it failed on
   `_meta_last_commit_ts`, "encoded value length 8 < 9"), a tooling defect
-  left as found and now a roadmap item: the decoder must skip or decode
-  every `_meta_*` entry a live store writes, with a test that decodes a
-  snapshot taken from a live Pebble store; `CONTEXT.md` says the path is
-  unavailable for live snapshots until then.
+  left as found by this branch and since closed on `main` by #1267
+  (merged 2026-10-15 as `95889d1f`), which skips every reserved metadata
+  key a live store writes through a mirror of the store's classifier
+  pinned by cross-check tests and decodes a live-store snapshot in its
+  reader and CLI tests; `CONTEXT.md` says so.
 
 ### A1. Coverage table and adapter fixes
 

@@ -324,10 +324,11 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
 
 - **logical snapshot decoder / encoder** — Offline tools that turn a native
   `.fsm` snapshot into a vendor-independent per-adapter directory tree and
-  back. Today the decoder cannot read a snapshot taken from a live Pebble
-  store (it rejects the store's `_meta_last_commit_ts` entry), so this path
-  works only for snapshots the encoder produced; the fix is on the
-  serializable-audit roadmap. (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
+  back. The decoder skips the store's reserved metadata keys
+  (`_meta_last_commit_ts` and its siblings) through a mirror of the store's
+  classifier pinned by cross-check tests, so it reads snapshots taken from
+  a live Pebble store as well as encoder-produced ones (fixed in #1267,
+  merged 2026-10-15 as `95889d1f`). (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
   `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`)
 - **logical backup (Phase 1)** — Live, cluster-wide point-in-time extraction
   across Raft groups through `BeginBackup` / `RenewBackup` / `EndBackup`, in

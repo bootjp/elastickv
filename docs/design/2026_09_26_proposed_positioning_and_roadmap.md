@@ -115,11 +115,10 @@ README will present scope in two tiers instead of a non-goals section.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
-  restore tooling (the decoder reads only snapshots the encoder produced:
-  it rejects a snapshot taken from a live Pebble store on the store's
-  `_meta_last_commit_ts` entry, a tooling defect listed in §4 and fixed
-  with the audit's A0, so there is no offline decode path for a live
-  snapshot today), physical snapshot publish / restore tooling for an
+  restore tooling (the decoder reads snapshots taken from a live Pebble
+  store as well as encoder-produced ones since #1267, merged as
+  `95889d1f`; the live-store defect listed in §4 is closed), physical
+  snapshot publish / restore tooling for an
   S3-compatible object store (the periodic scheduler is not yet wired into
   the server; that is the design's M3), Pebble SST ingest snapshot
   transfer, admin dashboard with data
@@ -142,7 +141,7 @@ README will present scope in two tiers instead of a non-goals section.
 | `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
 | No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
 | README's "Implemented Features" omits SQS, encryption, backup, snapshot offload, and the filesystem, and its consistency bullet says only "write-after-read checks … are covered by tests" | `README.md` §Implemented Features | README refresh after §6.1 lands |
-| `elastickv-snapshot-decode` cannot read a snapshot taken from a live Pebble store: `ReadSnapshot` fails on the store's `_meta_last_commit_ts` entry ("encoded value length 8 < 9"), so the offline decode / restore path works only on encoder-produced snapshots, although §3 lists the tooling | Audit A0 status; `CONTEXT.md` "Backup and snapshots" | Serializable isolation audit (§6.3): the A0 PR makes the decoder skip or decode every `_meta_*` entry a live store writes, with a test that decodes a live-store snapshot; until it lands README describes the decoder as encoder-only, and the publication checklist in §6.1 carries the item |
+| `elastickv-snapshot-decode` could not read a snapshot taken from a live Pebble store: `ReadSnapshot` failed on the store's `_meta_last_commit_ts` entry ("encoded value length 8 < 9"), so the offline decode / restore path worked only on encoder-produced snapshots | Fixed on `main` by #1267 (merged 2026-10-15 as `95889d1f`): the reader skips the store's reserved metadata keys through a mirror of the store's classifier pinned by cross-check tests, with tests that decode a live-store snapshot at the reader and CLI levels; `CONTEXT.md` "Backup and snapshots" updated | — |
 | Stale docs: `docs/docker_multinode_manual_run.md` listed `Scan` / `BatchWriteItem` as unsupported; `docs/review_todo.md` 4.2 described the engine as snapshot isolation | Fixed in the same change as this doc | — |
 
 ## 5. Consistency claims
@@ -261,8 +260,8 @@ and A2 keeps their exemption until the resolver-aware form of the
 Composed-1 gate (the Composed-1 design's M5 "error on unpinned" step,
 extended to resolver-routed keys, in its own design doc) lands. The README
 caveat names this third exclusion with the other two. The README backup
-section describes `elastickv-snapshot-decode` as encoder-only until the
-A0 PR's decoder fix lands (§4). A `NOTLEADER` that a later read
+section can describe `elastickv-snapshot-decode` as reading live-store
+snapshots too, since #1267 landed (§4). A `NOTLEADER` that a later read
 contradicts is an anomaly independent of the timestamp and read-lock
 fixes.
 
