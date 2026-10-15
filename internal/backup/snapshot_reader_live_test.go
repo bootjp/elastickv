@@ -142,9 +142,16 @@ func TestIsPebbleOperationalKey_MatchesStore(t *testing.T) {
 		{name: "writer registry row", key: registry, want: true},
 		{name: "bare registry prefix", key: bytes.Clone(encryption.WriterRegistryPrefix), want: false},
 		{name: "registry row one byte short", key: registry[:len(registry)-1], want: false},
+		{name: "registry row with the wrong separator", key: registryWithSeparator(registry, 'x'), want: false},
 		{name: "mvcc-encoded user key with a reserved name", key: append([]byte("_meta_last_commit_ts"), make([]byte, snapshotTSSize)...), want: false},
 		{name: "user key", key: []byte(RedisStringPrefix + "greeting"), want: false},
 		{name: "empty", key: nil, want: false},
+	}
+	if !bytes.Equal(pebbleWriterRegistryPrefix, encryption.WriterRegistryPrefix) {
+		t.Fatalf("registry prefix mirror %q differs from encryption.WriterRegistryPrefix %q", pebbleWriterRegistryPrefix, encryption.WriterRegistryPrefix)
+	}
+	if len(registry) != len(pebbleWriterRegistryPrefix)+pebbleWriterRegistrySuffixSize {
+		t.Fatalf("registry row is %d bytes, mirror expects %d", len(registry), len(pebbleWriterRegistryPrefix)+pebbleWriterRegistrySuffixSize)
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -183,6 +190,14 @@ func TestIsPebbleOperationalKey_AgreesWithStoreOnLiveStream(t *testing.T) {
 	if operational == len(keys) {
 		t.Fatalf("every one of %d raw keys classified as metadata; the user version is missing", len(keys))
 	}
+}
+
+// registryWithSeparator returns a copy of a writer-registry row with the
+// byte at the separator position replaced.
+func registryWithSeparator(registry []byte, sep byte) []byte {
+	out := bytes.Clone(registry)
+	out[len(pebbleWriterRegistryPrefix)+pebbleWriterRegistryDEKIDSize] = sep
+	return out
 }
 
 // rawSnapshotKeys splits a native snapshot stream into its raw encoded

@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/bootjp/elastickv/internal/encryption"
 	cockroachdberr "github.com/cockroachdb/errors"
 )
 
@@ -257,19 +256,39 @@ var pebbleOperationalKeys = [][]byte{
 	[]byte("_migpromote"),
 }
 
+// Writer-registry rows: mirror internal/encryption.WriterRegistryPrefix,
+// registryKeySuffixSize (4-byte dek_id, the '|' separator, 2-byte node
+// id) and registryKeySep, the shape test encryption.IsRegistryKey applies
+// and the live store relies on to recognise a registry row. Duplicated
+// here, like envelopeMaxB, so this package does not import the encryption
+// package either; the cross-check tests compare the prefix and the
+// verdicts against the encryption package.
+var pebbleWriterRegistryPrefix = []byte("!encryption|writers|")
+
+const (
+	pebbleWriterRegistryDEKIDSize  = 4
+	pebbleWriterRegistryNodeIDSize = 2
+	pebbleWriterRegistrySuffixSize = pebbleWriterRegistryDEKIDSize + 1 + pebbleWriterRegistryNodeIDSize
+	pebbleWriterRegistrySep        = '|'
+)
+
+func isPebbleWriterRegistryKey(rawKey []byte) bool {
+	return len(rawKey) == len(pebbleWriterRegistryPrefix)+pebbleWriterRegistrySuffixSize &&
+		bytes.HasPrefix(rawKey, pebbleWriterRegistryPrefix) &&
+		rawKey[len(pebbleWriterRegistryPrefix)+pebbleWriterRegistryDEKIDSize] == pebbleWriterRegistrySep
+}
+
 // isPebbleOperationalKey mirrors store.isPebbleMetaKey: the reserved keys
-// above plus the encryption writer-registry rows, which the live store
-// recognises by the same shape test encryption.IsRegistryKey applies
-// (prefix, fixed length, separator). Such keys carry no user data and
-// follow neither the inverted-timestamp key layout nor the value-header
-// layout, so the reader skips them.
+// above plus the encryption writer-registry rows. Such keys carry no user
+// data and follow neither the inverted-timestamp key layout nor the
+// value-header layout, so the reader skips them.
 func isPebbleOperationalKey(rawKey []byte) bool {
 	for _, reserved := range pebbleOperationalKeys {
 		if bytes.Equal(rawKey, reserved) {
 			return true
 		}
 	}
-	return encryption.IsRegistryKey(rawKey)
+	return isPebbleWriterRegistryKey(rawKey)
 }
 
 // readOneEntry handles one (key, value) tuple plus the callback
