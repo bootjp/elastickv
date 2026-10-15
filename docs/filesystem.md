@@ -17,9 +17,12 @@ data on it that you cannot recreate.
 - Offset reads and writes, sparse files, truncate (shrink and extend), `chmod`,
   `chown`, `utimes`, same-directory `rename`, `mkdir`/`rmdir`, `unlink` while a
   file is still open, resumable `readdir`, and `statfs`.
-- Every metadata change and every write is one Raft-committed transaction.
-  When a system call returns, the change is durable on a quorum and visible
-  to every other mount.
+- Every metadata change and every FUSE write request is one Raft-committed
+  transaction. When a system call returns, the change is durable on a quorum,
+  and any other mount that opens the file afterwards reads it (see
+  [Durability and caching](#semantics-worth-knowing) for the two caveats:
+  the kernel splits a large `write(2)` into several requests, and a
+  descriptor that is already open may still serve cached pages).
 
 Not supported (the kernel receives an explicit error, never a silent no-op):
 
@@ -28,7 +31,7 @@ Not supported (the kernel receives an explicit error, never a silent no-op):
 | `rename` across directories | `EXDEV` (GNU `mv` then falls back to copy + delete, which is not atomic) |
 | Hard links (`link`) | `EOPNOTSUPP` |
 | Symbolic links (`symlink`, `readlink`) | `EOPNOTSUPP` |
-| POSIX file locks (`flock`, `fcntl` locks) | `EOPNOTSUPP` |
+| POSIX advisory locks (`flock`, `fcntl` locks) | **Succeed, but only within one mount.** The kernel handles locks locally and never forwards them to the server, so two processes on different nodes can both hold "exclusive" locks on the same file. Do not rely on locks for cross-node coordination. |
 | Extended attributes | disabled at mount time |
 | Special files other than regular files and directories | `EOPNOTSUPP` |
 
@@ -44,9 +47,11 @@ advertises a 255-byte name limit.
   server mounts through this helper; it does not perform a direct `mount(2)`,
   so even a root process cannot mount without it.
 - An existing, empty directory to use as the mount point.
-- The server process must be able to reach a Raft leader for the default
-  group, because the filesystem root is created through a Raft transaction at
-  startup (see [Startup sequence](#startup-sequence)).
+- Every configured Raft group must have a reachable leader when the server
+  starts: root initialization first takes a fenced read across all groups,
+  then creates the root through a transaction on the default group (see
+  [Startup sequence](#startup-sequence)). On a multi-group cluster a group
+  without quorum fails the mount even though the root lives elsewhere.
 
 The official container image (`ghcr.io/bootjp/elastickv`) is built on
 `distroless/static` and does not ship `fusermount3`. To mount from a
@@ -104,8 +109,13 @@ df -h /tmp/elastickv-mount
 `--filesystemRootUID` / `--filesystemRootGID` matter even on a single node:
 the mount enforces `default_permissions`, so a root directory owned by UID 0
 (the default) rejects `mkdir` and file creation from any other user. Set them
-to the user that will write to the mount, or `chown` the root as `root`
-afterwards.
+to the user that will write to the mount **before the first start**; they are
+ignored once the root exists. If the root was already created with the wrong
+owner, there is no shortcut from another account: the mount has no
+`allow_other`, so only the user running the server can reach it, and that
+user cannot `chown` a root-owned directory. Either start the cluster over
+with the right flags, or restart the server as root once, `chown` the mount
+point from a root shell, and then go back to the normal user.
 
 ### Multi-node cluster
 
@@ -198,9 +208,26 @@ released by the lease reaper.
 
 **Durability and caching.** The mount sets zero attribute and entry cache
 timeouts, so every `stat`, `lookup`, and `readdir` goes to the backend and
-reflects the latest committed state. `write` is applied as one transaction
-over the touched chunks and is durable when it returns. `flush` is a no-op and
-`fsync` only re-reads the inode; there is no write-back buffer to flush.
+reflects the latest committed state. Each FUSE write request is applied as one
+transaction over the chunks it touches and is durable when the request
+returns; `flush` is a no-op and `fsync` only re-reads the inode, because there
+is no write-back buffer on the server side. Two caveats:
+
+- *A large `write(2)` is not atomic.* The kernel splits a write into FUSE
+  requests of at most 128 KiB (the go-fuse default; the mount does not raise
+  it), and each request commits on its own. A 1 MiB write can therefore
+  commit its first requests and then fail or conflict on a later one, leaving
+  a partially applied write and a short count. Treat atomicity as per 128 KiB
+  request, and write temp-file-plus-`rename` when a whole file must appear at
+  once.
+- *Data reads can be served from the kernel page cache.* The mount uses
+  cached I/O without `direct_io`, and nothing invalidates a node's page cache
+  when another node writes. The kernel drops cached pages when a file is
+  opened, so a fresh `open` always reads the latest data, but a process that
+  keeps a descriptor open and has already read a region may keep seeing the
+  old bytes after another mount overwrote them. Readers that must observe
+  remote writes through a long-lived descriptor should reopen the file or
+  open it with `O_DIRECT`.
 
 **Concurrency.** The backend uses optimistic concurrency. Two callers that
 modify the same file or the same directory at the same moment can race; the
@@ -224,9 +251,13 @@ handle). If a mount dies without releasing its handles, the leases expire and
 the lease reaper on any mounted node reclaims the space.
 
 **Directory listing.** `readdir` captures a snapshot of the directory when
-the listing starts and pages through that snapshot. Entries created or
-removed after the first page was read appear in the next listing, not in the
-current one.
+the listing starts and pages through that snapshot, so entries created or
+removed after the first page normally appear in the next listing, not in the
+current one. The snapshot is held only as long as MVCC retention keeps its
+timestamp: a listing paused for longer than the retention window (the
+compactor is on by default) resumes from a newer snapshot at the name it
+reached, and the remaining pages can then include later creations or skip
+later removals.
 
 **Permissions.** `default_permissions` is always set, so the kernel enforces
 mode bits against the caller's UID/GID. `allow_other` is not set, and there is
@@ -305,15 +336,17 @@ need a crash-consistent view at a single point in time.
 | `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry the operation. |
 | `Input/output error` (`EIO`) | A backend error that is not a write conflict, for example a lost connection to the leader. Check the server log; retry once the cluster is healthy. |
 | `ENOENT` opening a file that exists | The file was replaced by `rename` from another mount between lookup and open. Retry. |
-| `Operation not supported` | Hard link, symlink, lock, or cross-directory rename. See the table at the top. |
+| `Operation not supported` | Hard link, symlink, special file, or cross-directory rename. See the table at the top. |
 | `mountpoint -q` fails while the server is up | The listeners start before the mount; wait for `filesystem FUSE mounted` in the log. If it never appears, the mount failed and the server exits. |
 | `df` shows an absurdly large size | `--filesystemCapacity` / `--filesystemMaxFiles` are unset, so `statfs` reports the maximum. Both affect reporting only. |
 
 ## Verifying a build
 
-- `go test -race ./internal/filesystem/...` exercises the service and the FUSE
-  adapter against an in-memory store. The kernel-mount end-to-end tests in
-  `internal/filesystem/fuseadapter` and the `main` package mount a real FUSE
+- `go test -race ./internal/filesystem/... .` exercises the service and the
+  FUSE adapter against an in-memory store and, through the `main` package,
+  the production mount and shutdown wiring (`go test -race -run Filesystem .`
+  runs only the latter). The kernel-mount end-to-end tests in
+  `internal/filesystem/fuseadapter` and in `main` mount a real FUSE
   filesystem; they skip when `/dev/fuse` or `fusermount3` is unavailable, and
   `ELASTICKV_REQUIRE_FUSE=1` turns that skip into a failure.
 - The Jepsen linearizable-register workload drives real mounts on every node
