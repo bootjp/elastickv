@@ -537,6 +537,19 @@ func run() error {
 	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(*backupMaxActivePins))
 	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.s3BlobBackfillConfig)
 
+	cleanup := internalutil.CleanupStack{}
+	defer cleanup.Run()
+	// The root context and the SIGTERM/SIGINT handler are installed before
+	// the Raft/Pebble runtimes are opened, so a stop requested during a slow
+	// open or snapshot restore is recorded (ctx is cancelled) instead of
+	// killing the process mid-open through the default disposition; startup
+	// then unwinds through the normal cancelled-context path once the
+	// runtimes exist. The handler is registered before the store/runtime
+	// closers so it is still swallowing repeat signals while CleanupStack
+	// syncs and closes them.
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanup.Add(installShutdownSignalHandler(cancel))
+
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
 	// factory + the process-shared StateCache) before opening any
@@ -585,14 +598,7 @@ func run() error {
 	// shards share the same env and therefore the same label).
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
-	cleanup := internalutil.CleanupStack{}
-	defer cleanup.Run()
 	cleanup.Add(readTracker.Close)
-
-	ctx, cancel := context.WithCancel(context.Background())
-	// Registered before the store/runtime closers so the handler is still
-	// swallowing repeat signals while CleanupStack syncs and closes them.
-	cleanup.Add(installShutdownSignalHandler(cancel))
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
@@ -1098,21 +1104,25 @@ func stopFilesystemServer(
 	mountPoint string,
 ) {
 	defer unmounter.handled.Store(true)
-	// ctx is already cancelled; the shutdown gets its own bound.
+	// ctx is already cancelled; the whole shutdown shares one budget.
 	stopCtx, cancel := context.WithTimeout(context.Background(), filesystemServeStopTimeout)
 	defer cancel()
+	// The plain unmount may use most of the budget, but a slice is kept so
+	// the lazy detach still runs inside it when the unmount hangs.
+	unmountWait := time.NewTimer(filesystemServeStopTimeout - filesystemServeStopTimeout/filesystemLazyDetachShare)
+	defer unmountWait.Stop()
 	select {
 	case <-unmounter.begin():
 		if err := unmounter.result(); err != nil {
 			slog.WarnContext(ctx, "filesystem FUSE unmount failed, detaching lazily", "mount_point", mountPoint, "err", err)
-			lazyDetachFilesystem(ctx, server, mountPoint)
+			lazyDetachFilesystem(ctx, stopCtx, server, mountPoint)
 		}
-	case <-stopCtx.Done():
+	case <-unmountWait.C:
 		slog.ErrorContext(ctx, "filesystem FUSE unmount did not return in time (a request may be stuck in the backend), detaching lazily and continuing shutdown",
 			"mount_point", mountPoint,
 			"timeout", filesystemServeStopTimeout,
 		)
-		lazyDetachFilesystem(ctx, server, mountPoint)
+		lazyDetachFilesystem(ctx, stopCtx, server, mountPoint)
 		return
 	}
 	select {
@@ -1160,13 +1170,16 @@ func (u *filesystemUnmounter) begin() <-chan struct{} {
 // result is the unmount's error; valid once the channel from begin is closed.
 func (u *filesystemUnmounter) result() error { return u.err }
 
-// lazyDetachFilesystem runs the lazy detach fallback with its own bound; the
-// shutdown budget may already be spent when it is called.
-func lazyDetachFilesystem(ctx context.Context, server filesystemMountServer, mountPoint string) {
-	detachCtx, cancel := context.WithTimeout(context.Background(), filesystemServeStopTimeout)
-	defer cancel()
-	if err := server.UnmountLazy(detachCtx); err != nil {
-		slog.WarnContext(ctx, "filesystem FUSE lazy detach failed", "mount_point", mountPoint, "err", err)
+// filesystemLazyDetachShare is the fraction (1/n) of filesystemServeStopTimeout
+// held back from the plain-unmount wait so the lazy detach fallback still
+// runs inside the one advertised budget when the unmount hangs.
+const filesystemLazyDetachShare = 5
+
+// lazyDetachFilesystem runs the lazy detach fallback within the shutdown's
+// remaining budget (stopCtx); logCtx only correlates the log line.
+func lazyDetachFilesystem(logCtx, stopCtx context.Context, server filesystemMountServer, mountPoint string) {
+	if err := server.UnmountLazy(stopCtx); err != nil {
+		slog.WarnContext(logCtx, "filesystem FUSE lazy detach failed", "mount_point", mountPoint, "err", err)
 	}
 }
 

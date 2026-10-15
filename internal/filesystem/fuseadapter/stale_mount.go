@@ -336,6 +336,25 @@ func unescapeMountTableField(field string) string {
 	return out.String()
 }
 
+// mountHelperFallbackDir mirrors go-fuse's helper lookup: when PATH does not
+// hold fusermount3/fusermount, /bin is tried, so a service started with a
+// restricted PATH detaches with the same helper go-fuse mounted with. A
+// variable so tests can point it at a directory they control.
+var mountHelperFallbackDir = "/bin"
+
+// lookupMountHelper finds a fusermount helper the way go-fuse does: PATH
+// first, then mountHelperFallbackDir.
+func lookupMountHelper(name string) (string, error) {
+	if path, err := exec.LookPath(name); err == nil {
+		return path, nil
+	}
+	path, err := exec.LookPath(filepath.Join(mountHelperFallbackDir, name))
+	if err != nil {
+		return "", errors.Wrapf(err, "locate mount helper %s", name)
+	}
+	return path, nil
+}
+
 // detachFUSEMount lazily detaches the FUSE mount at mountPoint through the
 // same helpers go-fuse's own unmount uses: the suid fusermount3 (or legacy
 // fusermount) binary with `-u -z`, which works for unprivileged users, and
@@ -347,7 +366,7 @@ func unescapeMountTableField(field string) string {
 func detachFUSEMount(ctx context.Context, mountPoint string) (string, error) {
 	var helperErr error
 	for _, helper := range []string{"fusermount3", "fusermount"} {
-		bin, err := exec.LookPath(helper)
+		bin, err := lookupMountHelper(helper)
 		if err != nil {
 			continue
 		}

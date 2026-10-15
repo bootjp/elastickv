@@ -394,6 +394,39 @@ func TestStaleFUSEMountProbeTimesOutOnWedgedServer(t *testing.T) {
 	require.Zero(t, detached)
 }
 
+// writeFakeMountHelper drops an executable stand-in for a fusermount binary
+// into dir and returns its path.
+func writeFakeMountHelper(t *testing.T, dir, name string) string {
+	t.Helper()
+	path := filepath.Join(dir, name)
+	require.NoError(t, os.WriteFile(path, []byte("#!/bin/sh\nexit 0\n"), 0o700)) //nolint:gosec // the helper stand-in must be executable.
+	return path
+}
+
+func TestLookupMountHelperFallsBackLikeGoFuse(t *testing.T) {
+	t.Setenv("PATH", t.TempDir()) // empty PATH: nothing found there
+	fallback := t.TempDir()
+	oldFallback := mountHelperFallbackDir
+	mountHelperFallbackDir = fallback
+	t.Cleanup(func() { mountHelperFallbackDir = oldFallback })
+
+	_, err := lookupMountHelper("fusermount3")
+	require.Error(t, err, "nothing on PATH or in the fallback dir")
+
+	want := writeFakeMountHelper(t, fallback, "fusermount3")
+	got, err := lookupMountHelper("fusermount3")
+	require.NoError(t, err)
+	require.Equal(t, want, got)
+
+	// PATH still wins when it has the helper.
+	onPath := t.TempDir()
+	t.Setenv("PATH", onPath)
+	wantOnPath := writeFakeMountHelper(t, onPath, "fusermount3")
+	got, err = lookupMountHelper("fusermount3")
+	require.NoError(t, err)
+	require.Equal(t, wantOnPath, got)
+}
+
 func TestDetachFUSEMountReportsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

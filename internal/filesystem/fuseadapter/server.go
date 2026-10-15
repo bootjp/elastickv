@@ -536,11 +536,43 @@ func MountContext(ctx context.Context, mountPoint string, adapter *Adapter, opti
 			return nil, errors.Wrap(recoveryErr, "recover filesystem intents before FUSE mount")
 		}
 	}
-	inner, err := fuse.NewServer(NewRawFileSystem(adapter), mountPoint, opts)
+	inner, err := newServerContext(ctx, NewRawFileSystem(adapter), mountPoint, opts)
 	if err != nil {
-		return nil, errors.Wrap(err, "mount filesystem FUSE server")
+		return nil, err
 	}
 	return &Server{inner: inner, adapter: adapter, mountPoint: mountPoint}, nil
+}
+
+type newServerResult struct {
+	server *fuse.Server
+	err    error
+}
+
+// newServerContext runs fuse.NewServer in its own goroutine so a cancelled
+// ctx can unwind startup: go-fuse waits for the fusermount helper with no
+// context of its own, and a hung helper would otherwise block the mount, the
+// errgroup drain and the WAL sync behind it forever. A mount that completes
+// after the caller gave up is unmounted again so no kernel mount leaks.
+func newServerContext(ctx context.Context, fs fuse.RawFileSystem, mountPoint string, opts *fuse.MountOptions) (*fuse.Server, error) {
+	results := make(chan newServerResult, 1)
+	go func() {
+		server, err := fuse.NewServer(fs, mountPoint, opts)
+		results <- newServerResult{server: server, err: err}
+	}()
+	select {
+	case res := <-results:
+		if res.err != nil {
+			return nil, errors.Wrap(res.err, "mount filesystem FUSE server")
+		}
+		return res.server, nil
+	case <-ctx.Done():
+		go func() {
+			if res := <-results; res.server != nil {
+				_ = res.server.Unmount()
+			}
+		}()
+		return nil, errors.Wrap(ctx.Err(), "filesystem FUSE mount cancelled while waiting for the mount helper")
+	}
 }
 
 func recoverIntentsBeforeMount(ctx context.Context, recoverer intentRecoverer) error {
