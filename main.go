@@ -356,12 +356,38 @@ func main() {
 // surface while unwinding after SIGTERM/SIGINT to a clean exit. The
 // cancellation is the shutdown the operator asked for, not a failure; any
 // other error (or a cancellation nobody requested) is reported unchanged.
+// A joined error (waitErrgroupAfterStartupFailure combines the startup error
+// with the drain error) is only clean when every branch is a cancellation.
 func ignoreCanceledAfterSignal(err error) error {
-	if err == nil || !signalShutdown.Load() || !errors.Is(err, context.Canceled) {
+	if err == nil || !signalShutdown.Load() || !onlyContextCanceled(err) {
 		return err
 	}
 	slog.Info("graceful shutdown after signal completed")
 	return nil
+}
+
+// onlyContextCanceled reports whether err carries nothing but
+// context.Canceled: a plain or wrapped cancellation, or a joined error whose
+// every branch is one. errors.Is alone would accept a join that also holds a
+// real failure, hiding it behind exit status 0.
+func onlyContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		branches := joined.Unwrap()
+		if len(branches) == 0 {
+			return false
+		}
+		for _, branch := range branches {
+			if !onlyContextCanceled(branch) {
+				return false
+			}
+		}
+		return true
+	}
+	return errors.Is(err, context.Canceled)
 }
 
 // memwatchConfigFromEnv resolves the memwatch Config from environment
@@ -637,7 +663,11 @@ func run() error {
 		tsoWiring:       tsoWiring,
 	})
 	if err != nil {
-		return err
+		// Members already run on eg (TSO reloader, raft lifecycle
+		// watchers, the registration gate); drain them before the deferred
+		// CleanupStack closes the stores they still use. A SIGTERM during
+		// the registration retry surfaces here as context.Canceled.
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	defaultRuntime := distStartup.defaultRuntime
 	distServer := distStartup.distServer

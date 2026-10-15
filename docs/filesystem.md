@@ -151,16 +151,18 @@ When `--filesystemMount` is set, the server:
    transaction on the default group. Concurrent root creation from several
    nodes is resolved by write-conflict retries; the losers find the root the
    first node created.
-3. Replays filesystem recovery state: safely aborted create/delete intents are
-   cleared and unfinished file moves are resumed, in bounded batches, until
-   nothing is left.
-4. Checks the mount point for a FUSE mount left behind by a previous server
+3. Checks the mount point for a FUSE mount left behind by a previous server
    that died without unmounting (the mounts table lists a `fuse` /
    `fuse.*` entry for the path and `stat` fails with `ENOTCONN`). Such a
    dead mount is detached with `fusermount3 -u -z` (or `fusermount`, or a
    lazy `umount` when neither helper exists) and logged as `detached stale
    filesystem FUSE mount left by a previous process`. A live FUSE mount or
-   any non-FUSE filesystem at the path is never touched.
+   any non-FUSE filesystem at the path is never touched. When
+   `/proc/self/mounts` cannot be read (no `/proc` in a minimal container),
+   the check is skipped with a warning and the mount proceeds as before.
+4. Replays filesystem recovery state: safely aborted create/delete intents are
+   cleared and unfinished file moves are resumed, in bounded batches, until
+   nothing is left.
 5. Mounts the directory with `fusermount3`, waits for the kernel to confirm
    the mount, and logs `filesystem FUSE mounted` with the mount point and
    client ID.

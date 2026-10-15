@@ -43,6 +43,9 @@ const (
 	// the topmost stale mount at the path; several only stack up when a
 	// server was restarted over a dangling mount more than once.
 	maxStaleMountDetaches = 8
+	// maxMountPointSymlinkHops bounds symlink resolution of the mount point
+	// itself, matching the kernel's MAXSYMLINKS.
+	maxMountPointSymlinkHops = 40
 )
 
 // mountTableEntry is one row of /proc/self/mounts.
@@ -50,6 +53,21 @@ type mountTableEntry struct {
 	mountPoint string
 	fsType     string
 }
+
+// mountTableUnavailableError reports that the mounts table could not be
+// read at all (no /proc in a minimal container or chroot). It is not a
+// stale-mount verdict: the caller skips the check and lets the real mount
+// report any conflict, so /proc does not become a new hard prerequisite.
+type mountTableUnavailableError struct {
+	path string
+	err  error
+}
+
+func (e *mountTableUnavailableError) Error() string {
+	return "open mount table " + e.path + ": " + e.err.Error()
+}
+
+func (e *mountTableUnavailableError) Unwrap() error { return e.err }
 
 // staleMountInspector locates dangling FUSE mounts at a path. The fields are
 // swapped in tests so the decision logic can be exercised without a kernel
@@ -88,13 +106,27 @@ func (i *staleMountInspector) detachAll(
 		logger = slog.Default()
 	}
 	detached := 0
-	for detached < maxStaleMountDetaches {
+	for {
 		entry, stale, err := i.staleFUSEMount(mountPoint)
+		var unavailable *mountTableUnavailableError
+		if errors.As(err, &unavailable) {
+			logger.Warn("mount table unavailable, skipping stale FUSE mount check",
+				"mount_point", mountPoint,
+				"err", err,
+			)
+			return detached, nil
+		}
 		if err != nil {
 			return detached, err
 		}
 		if !stale {
 			return detached, nil
+		}
+		if detached >= maxStaleMountDetaches {
+			// Re-inspected after the last allowed detach, so exactly
+			// maxStaleMountDetaches stacked mounts succeed; only a mount
+			// that is still there is an error.
+			return detached, errors.Errorf("more than %d stale FUSE mounts at %s", maxStaleMountDetaches, mountPoint)
 		}
 		method, err := detach(ctx, entry.mountPoint)
 		if err != nil {
@@ -107,7 +139,6 @@ func (i *staleMountInspector) detachAll(
 			"method", method,
 		)
 	}
-	return detached, errors.Errorf("more than %d stale FUSE mounts at %s", maxStaleMountDetaches, mountPoint)
 }
 
 // staleFUSEMount reports whether the topmost mount at mountPoint is a FUSE
@@ -147,21 +178,46 @@ func (i *staleMountInspector) staleFUSEMount(mountPoint string) (mountTableEntry
 }
 
 // mountPointCandidates returns the spellings of mountPoint that may appear
-// in the mounts table: the cleaned absolute path and, when the parent
-// directory resolves differently through symlinks, the resolved one. The
-// mount point itself is never resolved because stat on a dangling mount
+// in the mounts table: the cleaned absolute path, the path with a symlinked
+// final component followed (the kernel mounts on the target and records the
+// target), and each of those with a symlinked parent directory resolved. The
+// mounted directory itself is never stat'ed because stat on a dangling mount
 // fails.
 func mountPointCandidates(mountPoint string) (map[string]bool, error) {
 	abs, err := filepath.Abs(mountPoint)
 	if err != nil {
 		return nil, errors.Wrapf(err, "resolve FUSE mount point %q", mountPoint)
 	}
-	candidates := map[string]bool{abs: true}
-	parent, err := filepath.EvalSymlinks(filepath.Dir(abs))
-	if err == nil {
-		candidates[filepath.Join(parent, filepath.Base(abs))] = true
+	candidates := map[string]bool{}
+	for _, path := range []string{abs, resolveMountPointSymlinks(abs)} {
+		candidates[path] = true
+		if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
+			candidates[filepath.Join(parent, filepath.Base(path))] = true
+		}
 	}
 	return candidates, nil
+}
+
+// resolveMountPointSymlinks follows a symlink used as the mount point itself
+// using only Lstat and Readlink, which never traverse into the (possibly
+// dead) mounted target. It returns path unchanged when it is not a symlink
+// or cannot be read.
+func resolveMountPointSymlinks(path string) string {
+	for hop := 0; hop < maxMountPointSymlinkHops; hop++ {
+		info, err := os.Lstat(path)
+		if err != nil || info.Mode()&os.ModeSymlink == 0 {
+			return path
+		}
+		target, err := os.Readlink(path)
+		if err != nil {
+			return path
+		}
+		if !filepath.IsAbs(target) {
+			target = filepath.Join(filepath.Dir(path), target)
+		}
+		path = filepath.Clean(target)
+	}
+	return path
 }
 
 func isFUSEType(fsType string) bool {
@@ -171,7 +227,7 @@ func isFUSEType(fsType string) bool {
 func readMountTable(path string) ([]mountTableEntry, error) {
 	file, err := os.Open(path)
 	if err != nil {
-		return nil, errors.Wrapf(err, "open mount table %s", path)
+		return nil, errors.WithStack(&mountTableUnavailableError{path: path, err: err})
 	}
 	defer file.Close()
 	var entries []mountTableEntry

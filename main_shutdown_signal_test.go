@@ -69,6 +69,16 @@ func TestIgnoreCanceledAfterSignal(t *testing.T) {
 	resetSignalShutdown(t)
 	wrappedCancel := errors.Wrap(context.Canceled, "failed to serve")
 	other := errors.New("listener exploded")
+	// What waitErrgroupAfterStartupFailure produces when a signal cancels
+	// startup: the startup error joined with the drain error.
+	joinedOnlyCanceled := errors.Wrap(errors.Join(
+		errors.Wrap(context.Canceled, "wait for raft join"),
+		errors.Wrap(context.Canceled, "shutdown failed after startup error"),
+	), "startup failed")
+	joinedWithFailure := errors.Wrap(errors.Join(
+		errors.Wrap(context.Canceled, "wait for raft join"),
+		errors.Wrap(other, "shutdown failed after startup error"),
+	), "startup failed")
 	tests := []struct {
 		name     string
 		signaled bool
@@ -78,6 +88,8 @@ func TestIgnoreCanceledAfterSignal(t *testing.T) {
 		{name: "nil error", signaled: true, err: nil, wantNil: true},
 		{name: "canceled after signal", signaled: true, err: context.Canceled, wantNil: true},
 		{name: "wrapped canceled after signal", signaled: true, err: wrappedCancel, wantNil: true},
+		{name: "joined cancellations after signal", signaled: true, err: joinedOnlyCanceled, wantNil: true},
+		{name: "joined cancellation and failure after signal", signaled: true, err: joinedWithFailure, wantNil: false},
 		{name: "other error after signal", signaled: true, err: other, wantNil: false},
 		{name: "canceled without signal", signaled: false, err: context.Canceled, wantNil: false},
 		{name: "other error without signal", signaled: false, err: other, wantNil: false},
@@ -93,6 +105,11 @@ func TestIgnoreCanceledAfterSignal(t *testing.T) {
 			require.ErrorIs(t, got, tt.err)
 		})
 	}
+	// errors.Is alone would have accepted the mixed join; pin the reason the
+	// helper exists.
+	require.True(t, errors.Is(joinedWithFailure, context.Canceled))
+	require.False(t, onlyContextCanceled(joinedWithFailure))
+	require.True(t, onlyContextCanceled(joinedOnlyCanceled))
 }
 
 // TestShutdownSignalUnmountsFilesystem drives the production wiring end to

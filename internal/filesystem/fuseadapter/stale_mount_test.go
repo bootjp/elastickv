@@ -149,13 +149,65 @@ func TestStaleFUSEMountMatchesSymlinkedParent(t *testing.T) {
 	require.Equal(t, filepath.Join(resolvedBase, "mnt"), entry.mountPoint)
 }
 
+func TestStaleFUSEMountMatchesSymlinkedMountPoint(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real-mount")
+	require.NoError(t, os.Mkdir(real, 0o755))
+	link := filepath.Join(base, "mount-link")
+	require.NoError(t, os.Symlink("real-mount", link))
+	resolvedReal, err := filepath.EvalSymlinks(real)
+	require.NoError(t, err)
+
+	// The kernel mounts on the symlink's target and records the target.
+	table := writeMountTable(t, mountTableLine("elastickv", resolvedReal, "fuse.elastickv"))
+	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
+	entry, stale, err := inspector.staleFUSEMount(link)
+	require.NoError(t, err)
+	require.True(t, stale)
+	require.Equal(t, resolvedReal, entry.mountPoint)
+}
+
+func TestResolveMountPointSymlinksStopsAtNonSymlink(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	require.NoError(t, os.Mkdir(real, 0o755))
+	first := filepath.Join(base, "first")
+	second := filepath.Join(base, "second")
+	require.NoError(t, os.Symlink(real, second))
+	require.NoError(t, os.Symlink("second", first))
+
+	require.Equal(t, real, resolveMountPointSymlinks(first))
+	require.Equal(t, real, resolveMountPointSymlinks(real))
+	missing := filepath.Join(base, "missing")
+	require.Equal(t, missing, resolveMountPointSymlinks(missing))
+}
+
 func TestStaleFUSEMountReportsUnreadableTable(t *testing.T) {
 	inspector := &staleMountInspector{
 		mountTable: filepath.Join(t.TempDir(), "missing"),
 		stat:       statReturning(syscall.ENOTCONN),
 	}
 	_, _, err := inspector.staleFUSEMount(t.TempDir())
+	var unavailable *mountTableUnavailableError
+	require.ErrorAs(t, err, &unavailable)
 	require.ErrorContains(t, err, "open mount table")
+}
+
+func TestDetachAllSkipsCheckWithoutMountTable(t *testing.T) {
+	// A chroot or minimal container may have /dev/fuse but no /proc; the
+	// stale check must not turn that into a new mount prerequisite.
+	inspector := &staleMountInspector{
+		mountTable: filepath.Join(t.TempDir(), "missing"),
+		stat:       statReturning(syscall.ENOTCONN),
+	}
+	detach := func(context.Context, string) (string, error) {
+		t.Fatal("detach must not run without a mount table")
+		return "", nil
+	}
+
+	detached, err := inspector.detachAll(context.Background(), t.TempDir(), slog.Default(), detach)
+	require.NoError(t, err)
+	require.Zero(t, detached)
 }
 
 func TestDetachAllDetachesUntilClean(t *testing.T) {
@@ -208,6 +260,33 @@ func TestDetachAllWrapsDetachFailure(t *testing.T) {
 	require.ErrorIs(t, err, boom)
 	require.ErrorContains(t, err, "detach stale FUSE mount at "+mountPoint)
 	require.Zero(t, detached)
+}
+
+func TestDetachAllClearsExactlyTheMaximum(t *testing.T) {
+	mountPoint := t.TempDir()
+	stale := mountTableLine("elastickv", mountPoint, "fuse.elastickv")
+	// tables[k] holds maxStaleMountDetaches-k stacked dead mounts; the last
+	// one is clean. Exactly the maximum must succeed, not report "more than".
+	tables := make([]string, 0, maxStaleMountDetaches+1)
+	for remaining := maxStaleMountDetaches; remaining >= 0; remaining-- {
+		lines := make([]string, remaining)
+		for index := range lines {
+			lines[index] = stale
+		}
+		tables = append(tables, writeMountTable(t, lines...))
+	}
+	inspector := &staleMountInspector{mountTable: tables[0], stat: statReturning(syscall.ENOTCONN)}
+	calls := 0
+	detach := func(context.Context, string) (string, error) {
+		calls++
+		inspector.mountTable = tables[calls]
+		return "fake", nil
+	}
+
+	detached, err := inspector.detachAll(context.Background(), mountPoint, slog.Default(), detach)
+	require.NoError(t, err)
+	require.Equal(t, maxStaleMountDetaches, detached)
+	require.Equal(t, maxStaleMountDetaches, calls)
 }
 
 func TestDetachAllBoundsTheLoop(t *testing.T) {
