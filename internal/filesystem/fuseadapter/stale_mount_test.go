@@ -8,6 +8,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -117,7 +118,7 @@ func TestStaleFUSEMountDetection(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			inspector := &staleMountInspector{mountTable: writeMountTable(t, tt.table...), stat: tt.stat}
-			entry, stale, err := inspector.staleFUSEMount(mountPoint)
+			entry, stale, err := inspector.staleFUSEMount(context.Background(), mountPoint)
 			require.NoError(t, err)
 			require.Equal(t, tt.wantStale, stale)
 			if tt.wantStale {
@@ -143,7 +144,7 @@ func TestStaleFUSEMountMatchesSymlinkedParent(t *testing.T) {
 
 	table := writeMountTable(t, mountTableLine("elastickv", filepath.Join(resolvedBase, "mnt"), "fuse.elastickv"))
 	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
-	entry, stale, err := inspector.staleFUSEMount(filepath.Join(link, "mnt"))
+	entry, stale, err := inspector.staleFUSEMount(context.Background(), filepath.Join(link, "mnt"))
 	require.NoError(t, err)
 	require.True(t, stale)
 	require.Equal(t, filepath.Join(resolvedBase, "mnt"), entry.mountPoint)
@@ -161,7 +162,7 @@ func TestStaleFUSEMountMatchesSymlinkedMountPoint(t *testing.T) {
 	// The kernel mounts on the symlink's target and records the target.
 	table := writeMountTable(t, mountTableLine("elastickv", resolvedReal, "fuse.elastickv"))
 	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
-	entry, stale, err := inspector.staleFUSEMount(link)
+	entry, stale, err := inspector.staleFUSEMount(context.Background(), link)
 	require.NoError(t, err)
 	require.True(t, stale)
 	require.Equal(t, resolvedReal, entry.mountPoint)
@@ -186,7 +187,7 @@ func TestStaleFUSEMountMatchesRelativeSymlinkUnderSymlinkedParent(t *testing.T) 
 
 	table := writeMountTable(t, mountTableLine("elastickv", target, "fuse.elastickv"))
 	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
-	entry, stale, err := inspector.staleFUSEMount(typed)
+	entry, stale, err := inspector.staleFUSEMount(context.Background(), typed)
 	require.NoError(t, err)
 	require.True(t, stale)
 	require.Equal(t, target, entry.mountPoint)
@@ -212,7 +213,7 @@ func TestStaleFUSEMountReportsUnreadableTable(t *testing.T) {
 		mountTable: filepath.Join(t.TempDir(), "missing"),
 		stat:       statReturning(syscall.ENOTCONN),
 	}
-	_, _, err := inspector.staleFUSEMount(t.TempDir())
+	_, _, err := inspector.staleFUSEMount(context.Background(), t.TempDir())
 	var unavailable *mountTableUnavailableError
 	require.ErrorAs(t, err, &unavailable)
 	require.ErrorContains(t, err, "open mount table")
@@ -338,6 +339,61 @@ func TestDetachAllBoundsTheLoop(t *testing.T) {
 // onlyContextCanceled in main relies on that to exit 0 after a signal. The
 // path is a plain directory, so nothing is unmounted whether or not a
 // fusermount helper exists on this machine.
+// blockingStat imitates stat on a FUSE mount whose server is alive but
+// wedged: the syscall never returns until release is closed.
+func blockingStat(release <-chan struct{}) func(string) error {
+	return func(string) error {
+		<-release
+		return nil
+	}
+}
+
+func TestStaleFUSEMountProbeStopsOnCancellation(t *testing.T) {
+	mountPoint := t.TempDir()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	inspector := &staleMountInspector{
+		mountTable:   writeMountTable(t, mountTableLine("elastickv", mountPoint, "fuse.elastickv")),
+		stat:         blockingStat(release),
+		probeTimeout: time.Minute,
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	_, stale, err := inspector.staleFUSEMount(ctx, mountPoint)
+	require.ErrorIs(t, err, context.Canceled)
+	var probeErr *mountProbeError
+	require.ErrorAs(t, err, &probeErr)
+	require.False(t, stale)
+}
+
+func TestStaleFUSEMountProbeTimesOutOnWedgedServer(t *testing.T) {
+	mountPoint := t.TempDir()
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	inspector := &staleMountInspector{
+		mountTable:   writeMountTable(t, mountTableLine("elastickv", mountPoint, "fuse.elastickv")),
+		stat:         blockingStat(release),
+		probeTimeout: 20 * time.Millisecond,
+	}
+
+	_, stale, err := inspector.staleFUSEMount(context.Background(), mountPoint)
+	require.ErrorContains(t, err, "unresponsive FUSE server")
+	var probeErr *mountProbeError
+	require.ErrorAs(t, err, &probeErr)
+	require.False(t, stale)
+
+	// The verdict error must stop the detach loop rather than be read as
+	// "not stale and proceed".
+	detach := func(context.Context, string) (string, error) {
+		t.Fatal("detach must not run when the probe reached no verdict")
+		return "", nil
+	}
+	detached, err := inspector.detachAll(context.Background(), mountPoint, slog.Default(), detach)
+	require.ErrorAs(t, err, &probeErr)
+	require.Zero(t, detached)
+}
+
 func TestDetachFUSEMountReportsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()

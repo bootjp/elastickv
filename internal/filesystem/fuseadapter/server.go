@@ -489,8 +489,9 @@ func saturatingAdd(left uint64, right uint64) uint64 {
 
 // Server owns an active kernel mount and its adapter session.
 type Server struct {
-	inner   *fuse.Server
-	adapter *Adapter
+	inner      *fuse.Server
+	adapter    *Adapter
+	mountPoint string
 }
 
 // Mount attaches adapter to mountPoint using go-fuse. The returned server is
@@ -539,7 +540,7 @@ func MountContext(ctx context.Context, mountPoint string, adapter *Adapter, opti
 	if err != nil {
 		return nil, errors.Wrap(err, "mount filesystem FUSE server")
 	}
-	return &Server{inner: inner, adapter: adapter}, nil
+	return &Server{inner: inner, adapter: adapter, mountPoint: mountPoint}, nil
 }
 
 func recoverIntentsBeforeMount(ctx context.Context, recoverer intentRecoverer) error {
@@ -613,4 +614,19 @@ func (s *Server) Unmount() error {
 		return nil
 	}
 	return errors.WithStack(s.inner.Unmount())
+}
+
+// UnmountLazy detaches the mount from the namespace even while clients still
+// hold files on it open (`fusermount -u -z`, or a lazy unmount(2)): new
+// lookups see the plain directory at once, open handles keep working until
+// they are closed, and the kernel releases the FUSE connection, ending
+// Serve, once the last one is gone. It is the fallback for an Unmount that
+// failed with EBUSY during shutdown. A nil or never-mounted Server is a
+// no-op.
+func (s *Server) UnmountLazy(ctx context.Context) error {
+	if s == nil || s.inner == nil || s.mountPoint == "" {
+		return nil
+	}
+	_, err := detachFUSEMount(ctx, s.mountPoint)
+	return err
 }

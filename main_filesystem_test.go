@@ -275,6 +275,88 @@ func TestInstallFilesystemServerLifecycleUnmountsOnContextCancel(t *testing.T) {
 	cleanup.Run()
 }
 
+// fakeFilesystemMountServer stands in for *fuseadapter.Server so the unmount
+// failure paths of the lifecycle can be driven without a kernel mount.
+type fakeFilesystemMountServer struct {
+	unmountErr error
+	lazyErr    error
+	onLazy     func()
+	lazyCalls  int
+}
+
+func (f *fakeFilesystemMountServer) Unmount() error { return f.unmountErr }
+
+func (f *fakeFilesystemMountServer) UnmountLazy(context.Context) error {
+	f.lazyCalls++
+	if f.onLazy != nil {
+		f.onLazy()
+	}
+	return f.lazyErr
+}
+
+func shortenFilesystemServeStopTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := filesystemServeStopTimeout
+	filesystemServeStopTimeout = d
+	t.Cleanup(func() { filesystemServeStopTimeout = old })
+}
+
+// A plain unmount that fails (EBUSY: a client holds a file open) must fall
+// back to a lazy detach; the serve loop then ends when the kernel releases
+// the connection, here simulated by the fake closing serveDone.
+func TestInstallFilesystemServerLifecycleDetachesLazilyWhenUnmountFails(t *testing.T) {
+	shortenFilesystemServeStopTimeout(t, 5*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, egCtx := errgroup.WithContext(ctx)
+	cleanup := &internalutil.CleanupStack{}
+	serveDone := make(chan struct{})
+	server := &fakeFilesystemMountServer{unmountErr: errors.New("umount: device or resource busy")}
+	server.onLazy = func() { close(serveDone) }
+
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	cancel()
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- eg.Wait() }()
+	select {
+	case err := <-waitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("lifecycle did not stop after the lazy detach released the serve loop")
+	}
+	require.Equal(t, 1, server.lazyCalls)
+	cleanup.Run()
+}
+
+// When even the lazy detach cannot end the serve loop (handles stay open),
+// the shutdown must proceed after the bounded wait instead of hanging until
+// SIGKILL.
+func TestInstallFilesystemServerLifecycleBoundsWaitWhenServeLoopStalls(t *testing.T) {
+	shortenFilesystemServeStopTimeout(t, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, egCtx := errgroup.WithContext(ctx)
+	cleanup := &internalutil.CleanupStack{}
+	serveDone := make(chan struct{}) // never closed
+	server := &fakeFilesystemMountServer{
+		unmountErr: errors.New("umount: device or resource busy"),
+		lazyErr:    errors.New("fusermount: not permitted"),
+	}
+
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	cancel()
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- eg.Wait() }()
+	select {
+	case err := <-waitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("lifecycle hung on a serve loop that never stops")
+	}
+	require.Equal(t, 1, server.lazyCalls)
+	cleanup.Run()
+}
+
 func TestInstallFilesystemServerLifecycleTreatsServeExitAfterCancelAsClean(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)

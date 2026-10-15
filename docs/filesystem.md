@@ -187,7 +187,12 @@ listeners drain, and the WAL is synced before the process exits with status
 0. Repeated `SIGTERM`/`SIGINT` while that shutdown is running are logged and
 ignored so a supervisor's second stop attempt cannot cut the cleanup short.
 This is the same path the server takes when a component fails or the memory
-watchdog trips (which still exits with status 2).
+watchdog trips (which still exits with status 2). If the unmount fails because
+a client still holds files on the mount open (`EBUSY`), the server detaches
+the mount lazily instead: new lookups see the plain directory at once, the
+open handles keep working until they are closed, and the server waits at most
+10 seconds for the kernel to release the connection before finishing its
+shutdown, so a stop never hangs on a busy mount.
 
 `SIGKILL`, an OOM kill, or a crash cannot run that cleanup, and the kernel
 keeps the now-dead mount attached. Until it is detached, every access to the
@@ -324,6 +329,7 @@ need a crash-consistent view at a single point in time.
 | `mkdir: cannot create directory: Permission denied` right after the first mount | The root directory is owned by UID 0 with mode `0755`. Start with `--filesystemRootUID` / `--filesystemRootGID` set to the writing user (only effective before the root exists) or `chown` the mount point as root. |
 | `Transport endpoint is not connected` on the mount point | The server process died without unmounting (`SIGKILL`, OOM kill, or a crash; `SIGTERM`/`SIGINT` unmount cleanly). Restart the server: it detaches the dead mount before mounting. To free the directory without a restart, run `fusermount3 -uz <mount-point>` (or `umount -l`). |
 | Restart exits with `detach stale filesystem FUSE mount: ...` | The server found a dead FUSE mount at the path but could not detach it: neither `fusermount3` nor `fusermount` is on `PATH` and the process lacks `CAP_SYS_ADMIN` for a direct lazy unmount, or the helper failed (its output is in the error). Detach it as root with `fusermount3 -uz` / `umount -l`, then restart; see [Stopping and restarting](#stopping-and-restarting). |
+| Restart exits with `detach stale filesystem FUSE mount: ... stat FUSE mount at ...: no answer within 10s` | A FUSE server is still attached to the mount point but not answering (a hung previous process). Find and stop that process (`fuser -m <mount-point>` or `ps`), then restart. |
 | Restart exits with `fusermount3: failed to access mountpoint ...: Transport endpoint is not connected` | The dead mount at the path is not one the server will touch: the mounts table does not list it as `fuse` / `fuse.*` (for example a `fuseblk` or non-FUSE filesystem stacked over the mount point). Inspect `/proc/self/mounts` and detach it by hand. |
 | `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry the operation. |
 | `Input/output error` (`EIO`) | A backend error that is not a write conflict, for example a lost connection to the leader. Check the server log; retry once the cluster is healthy. |

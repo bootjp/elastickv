@@ -1017,11 +1017,26 @@ func mountFilesystemService(
 	return server, serveDone, nil
 }
 
+// filesystemMountServer is the part of *fuseadapter.Server the shutdown
+// lifecycle drives; tests substitute a fake to exercise the failure paths.
+type filesystemMountServer interface {
+	Unmount() error
+	UnmountLazy(context.Context) error
+}
+
+// filesystemServeStopTimeout bounds how long a signal shutdown waits for the
+// FUSE serve loop after the unmount. After a plain unmount failed (EBUSY: a
+// client still holds files open) the mount is detached lazily and the loop
+// only ends once those handles close, which may never happen; the shutdown
+// proceeds after this wait so a SIGTERM cannot hang the process until
+// SIGKILL. A variable so tests can shorten it.
+var filesystemServeStopTimeout = 10 * time.Second
+
 func installFilesystemServerLifecycle(
 	ctx context.Context,
 	eg *errgroup.Group,
 	cleanup *internalutil.CleanupStack,
-	server *fuseadapter.Server,
+	server filesystemMountServer,
 	serveDone <-chan struct{},
 	mountPoint string,
 ) {
@@ -1034,10 +1049,7 @@ func installFilesystemServerLifecycle(
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			if err := unmount(); err != nil {
-				slog.WarnContext(ctx, "filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
-			}
-			<-serveDone
+			stopFilesystemServer(ctx, unmount, server, serveDone, mountPoint)
 			return nil
 		case <-serveDone:
 			select {
@@ -1050,6 +1062,41 @@ func installFilesystemServerLifecycle(
 			}
 		}
 	})
+}
+
+// stopFilesystemServer unmounts during a shutdown. A plain unmount fails
+// with EBUSY while a client holds files on the mount open; the mount is then
+// detached lazily (open handles keep working until closed) and the wait for
+// the serve loop is bounded, so the rest of the shutdown (WAL sync, store
+// close) still runs and the process exits. Exiting closes the /dev/fuse
+// descriptor, which makes the kernel drop whatever the lazy detach left
+// behind.
+func stopFilesystemServer(
+	ctx context.Context,
+	unmount func() error,
+	server filesystemMountServer,
+	serveDone <-chan struct{},
+	mountPoint string,
+) {
+	if err := unmount(); err != nil {
+		slog.WarnContext(ctx, "filesystem FUSE unmount failed, detaching lazily", "mount_point", mountPoint, "err", err)
+		// ctx is already cancelled; the detach helper gets its own bound.
+		detachCtx, cancel := context.WithTimeout(context.Background(), filesystemServeStopTimeout)
+		defer cancel()
+		if err := server.UnmountLazy(detachCtx); err != nil {
+			slog.WarnContext(ctx, "filesystem FUSE lazy detach failed", "mount_point", mountPoint, "err", err)
+		}
+	}
+	timer := time.NewTimer(filesystemServeStopTimeout)
+	defer timer.Stop()
+	select {
+	case <-serveDone:
+	case <-timer.C:
+		slog.ErrorContext(ctx, "filesystem FUSE serve loop did not stop in time, continuing shutdown",
+			"mount_point", mountPoint,
+			"timeout", filesystemServeStopTimeout,
+		)
+	}
 }
 
 func startFilesystemPlacementCollector(

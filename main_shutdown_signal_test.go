@@ -112,6 +112,63 @@ func TestIgnoreCanceledAfterSignal(t *testing.T) {
 	require.True(t, onlyContextCanceled(joinedOnlyCanceled))
 }
 
+// TestShutdownSignalWithOpenFileDetachesLazily: SIGTERM while a client still
+// holds a file open on the mount. The plain unmount fails with EBUSY, so the
+// lifecycle must detach lazily and finish the shutdown within the bounded
+// wait instead of hanging until SIGKILL; once the handle closes the kernel
+// releases the connection and the serve loop ends, leaving a bare directory.
+func TestShutdownSignalWithOpenFileDetachesLazily(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFailWithoutFuse(t, "no /dev/fuse: %v", err)
+	}
+	resetSignalShutdown(t)
+	shortenFilesystemServeStopTimeout(t, 2*time.Second)
+	svc := newFilesystemTestService(t)
+	config := filesystemStartConfig{
+		mountPoint:   t.TempDir(),
+		clientID:     "mount-busy",
+		mountOptions: testFUSEMountOptions(),
+	}
+	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
+	if err != nil {
+		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanup := &internalutil.CleanupStack{}
+	t.Cleanup(cleanup.Run)
+	cleanup.Add(installShutdownSignalHandler(cancel, syscall.SIGTERM))
+	cleanup.Add(cancel)
+	eg, egCtx := errgroup.WithContext(ctx)
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, config.mountPoint)
+
+	held, err := os.OpenFile(filepath.Join(config.mountPoint, "held"), os.O_CREATE|os.O_RDWR, 0o600)
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = held.Close() })
+	_, err = held.Write([]byte("held"))
+	require.NoError(t, err)
+
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- eg.Wait() }()
+	select {
+	case err := <-waitDone:
+		require.NoError(t, err)
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("shutdown hung on a busy FUSE mount")
+	}
+
+	require.NoError(t, held.Close())
+	select {
+	case <-serveDone:
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("FUSE serve loop did not stop after the last handle closed")
+	}
+	entries, err := os.ReadDir(config.mountPoint)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+}
+
 // TestShutdownSignalUnmountsFilesystem drives the production wiring end to
 // end: the signal handler cancels the root context, the errgroup-derived
 // context fires, and the filesystem lifecycle unmounts the kernel mount.

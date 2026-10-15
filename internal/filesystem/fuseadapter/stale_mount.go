@@ -46,7 +46,27 @@ const (
 	// maxMountPointSymlinkHops bounds symlink resolution of the mount point
 	// itself, matching the kernel's MAXSYMLINKS.
 	maxMountPointSymlinkHops = 40
+	// staleProbeTimeout bounds the liveness stat on a FUSE mount. A dead
+	// mount answers ENOTCONN at once and a healthy server answers quickly;
+	// only a server that is alive but wedged makes stat block, and that mount
+	// is not ours to detach, so startup fails with a clear error instead of
+	// hanging in fusermount's own stat afterwards.
+	staleProbeTimeout = 10 * time.Second
 )
+
+// mountProbeError reports that the liveness stat on a FUSE mount could not
+// reach a verdict: the probe was cancelled (shutdown requested) or timed out
+// (a live but unresponsive FUSE server still holds the mount point).
+type mountProbeError struct {
+	path string
+	err  error
+}
+
+func (e *mountProbeError) Error() string {
+	return "stat FUSE mount at " + e.path + ": " + e.err.Error()
+}
+
+func (e *mountProbeError) Unwrap() error { return e.err }
 
 // mountTableEntry is one row of /proc/self/mounts.
 type mountTableEntry struct {
@@ -73,12 +93,13 @@ func (e *mountTableUnavailableError) Unwrap() error { return e.err }
 // swapped in tests so the decision logic can be exercised without a kernel
 // mount; production code uses defaultStaleMountInspector.
 type staleMountInspector struct {
-	mountTable string
-	stat       func(string) error
+	mountTable   string
+	stat         func(string) error
+	probeTimeout time.Duration
 }
 
 func defaultStaleMountInspector() *staleMountInspector {
-	return &staleMountInspector{mountTable: mountTablePath, stat: statMountPoint}
+	return &staleMountInspector{mountTable: mountTablePath, stat: statMountPoint, probeTimeout: staleProbeTimeout}
 }
 
 func statMountPoint(path string) error {
@@ -107,7 +128,7 @@ func (i *staleMountInspector) detachAll(
 	}
 	detached := 0
 	for {
-		entry, stale, err := i.staleFUSEMount(mountPoint)
+		entry, stale, err := i.staleFUSEMount(ctx, mountPoint)
 		var unavailable *mountTableUnavailableError
 		if errors.As(err, &unavailable) {
 			logger.Warn("mount table unavailable, skipping stale FUSE mount check",
@@ -143,8 +164,10 @@ func (i *staleMountInspector) detachAll(
 
 // staleFUSEMount reports whether the topmost mount at mountPoint is a FUSE
 // mount whose server is gone. The topmost entry decides: a non-FUSE
-// filesystem mounted over a dead FUSE mount is not touched either.
-func (i *staleMountInspector) staleFUSEMount(mountPoint string) (mountTableEntry, bool, error) {
+// filesystem mounted over a dead FUSE mount is not touched either. The
+// liveness stat is bounded by ctx and probeTimeout; when it cannot reach a
+// verdict the error is a *mountProbeError.
+func (i *staleMountInspector) staleFUSEMount(ctx context.Context, mountPoint string) (mountTableEntry, bool, error) {
 	candidates, err := mountPointCandidates(mountPoint)
 	if err != nil {
 		return mountTableEntry{}, false, err
@@ -164,7 +187,11 @@ func (i *staleMountInspector) staleFUSEMount(mountPoint string) (mountTableEntry
 	if !found || !isFUSEType(top.fsType) {
 		return mountTableEntry{}, false, nil
 	}
-	statErr := i.stat(top.mountPoint)
+	statErr := i.probe(ctx, top.mountPoint)
+	var probeErr *mountProbeError
+	if errors.As(statErr, &probeErr) {
+		return mountTableEntry{}, false, statErr
+	}
 	if statErr == nil {
 		return mountTableEntry{}, false, nil
 	}
@@ -175,6 +202,34 @@ func (i *staleMountInspector) staleFUSEMount(mountPoint string) (mountTableEntry
 		return mountTableEntry{}, false, nil
 	}
 	return top, true, nil
+}
+
+// probe runs the liveness stat on a mount point the table reports as FUSE.
+// Nothing can interrupt a stat blocked on a wedged FUSE server, so the call
+// runs in its own goroutine and only the wait is bounded, by ctx and by
+// probeTimeout; on cancellation or timeout the goroutine is left to finish
+// whenever the kernel lets it and a *mountProbeError is returned instead of
+// a verdict.
+func (i *staleMountInspector) probe(ctx context.Context, path string) error {
+	timeout := i.probeTimeout
+	if timeout <= 0 {
+		timeout = staleProbeTimeout
+	}
+	result := make(chan error, 1)
+	go func() { result <- i.stat(path) }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-result:
+		return err
+	case <-ctx.Done():
+		return errors.WithStack(&mountProbeError{path: path, err: ctx.Err()})
+	case <-timer.C:
+		return errors.WithStack(&mountProbeError{
+			path: path,
+			err:  errors.Newf("no answer within %s, a live but unresponsive FUSE server may still hold the mount point", timeout),
+		})
+	}
 }
 
 // mountPointCandidates returns the spellings of mountPoint that may appear
