@@ -390,10 +390,53 @@ func TestInstallFilesystemServerLifecycleBoundsHungUnmount(t *testing.T) {
 		t.Fatal("lifecycle hung on an Unmount that never returns")
 	}
 	require.Equal(t, 1, server.lazyCalls)
-	// cleanup.Run calls the once-wrapped unmount, which waits for the first,
-	// still-blocked call; release it first.
+	// The CleanupStack entry must not re-wait on the unmount that is still
+	// stuck: the lifecycle already gave up on it, and the WAL sync and store
+	// close that follow in the real CleanupStack must still run.
+	cleanupDone := make(chan struct{})
+	go func() {
+		cleanup.Run()
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup blocked on the hung unmount")
+	}
 	release()
-	cleanup.Run()
+}
+
+// The CleanupStack entry is the fallback when the lifecycle goroutine never
+// ran the shutdown (ctx not cancelled); a hung unmount must not block it past
+// the budget either.
+func TestInstallFilesystemServerLifecycleCleanupBoundsHungUnmount(t *testing.T) {
+	shortenFilesystemServeStopTimeout(t, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, egCtx := errgroup.WithContext(ctx)
+	cleanup := &internalutil.CleanupStack{}
+	serveDone := make(chan struct{})
+	block := make(chan struct{})
+	release := sync.OnceFunc(func() { close(block) })
+	t.Cleanup(release)
+	server := &fakeFilesystemMountServer{unmountBlock: block}
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+
+	cleanupDone := make(chan struct{})
+	go func() {
+		cleanup.Run()
+		close(cleanupDone)
+	}()
+	select {
+	case <-cleanupDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("cleanup blocked on the hung unmount")
+	}
+
+	// Teardown: let the lifecycle goroutine finish.
+	release()
+	close(serveDone)
+	cancel()
+	require.NoError(t, eg.Wait())
 }
 
 func TestInstallFilesystemServerLifecycleTreatsServeExitAfterCancelAsClean(t *testing.T) {

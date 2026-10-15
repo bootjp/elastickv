@@ -1040,16 +1040,32 @@ func installFilesystemServerLifecycle(
 	serveDone <-chan struct{},
 	mountPoint string,
 ) {
-	unmount := sync.OnceValue(server.Unmount)
+	unmounter := newFilesystemUnmounter(server.Unmount)
 	cleanup.Add(func() {
-		if err := unmount(); err != nil {
-			slog.Warn("filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+		// Normally the lifecycle goroutine has already run the shutdown by
+		// the time CleanupStack runs (eg.Wait precedes it); then there is
+		// nothing left to do, and re-waiting on an unmount that is stuck in
+		// a backend request would hang the WAL sync and store close that
+		// follow. Only an unmount nobody started yet is run here, bounded.
+		if unmounter.handled.Load() {
+			return
+		}
+		select {
+		case <-unmounter.begin():
+			if err := unmounter.result(); err != nil {
+				slog.Warn("filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+			}
+		case <-time.After(filesystemServeStopTimeout):
+			slog.Error("filesystem FUSE unmount did not return in time during cleanup, continuing",
+				"mount_point", mountPoint,
+				"timeout", filesystemServeStopTimeout,
+			)
 		}
 	})
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			stopFilesystemServer(ctx, unmount, server, serveDone, mountPoint)
+			stopFilesystemServer(ctx, unmounter, server, serveDone, mountPoint)
 			return nil
 		case <-serveDone:
 			select {
@@ -1076,19 +1092,18 @@ func installFilesystemServerLifecycle(
 // makes the kernel drop whatever the lazy detach left behind.
 func stopFilesystemServer(
 	ctx context.Context,
-	unmount func() error,
+	unmounter *filesystemUnmounter,
 	server filesystemMountServer,
 	serveDone <-chan struct{},
 	mountPoint string,
 ) {
+	defer unmounter.handled.Store(true)
 	// ctx is already cancelled; the shutdown gets its own bound.
 	stopCtx, cancel := context.WithTimeout(context.Background(), filesystemServeStopTimeout)
 	defer cancel()
-	unmountDone := make(chan error, 1)
-	go func() { unmountDone <- unmount() }()
 	select {
-	case err := <-unmountDone:
-		if err != nil {
+	case <-unmounter.begin():
+		if err := unmounter.result(); err != nil {
 			slog.WarnContext(ctx, "filesystem FUSE unmount failed, detaching lazily", "mount_point", mountPoint, "err", err)
 			lazyDetachFilesystem(ctx, server, mountPoint)
 		}
@@ -1109,6 +1124,41 @@ func stopFilesystemServer(
 		)
 	}
 }
+
+// filesystemUnmounter runs Server.Unmount at most once, in the background,
+// and lets any number of waiters observe its completion without a later
+// caller ever blocking on an earlier call that is stuck (go-fuse's Unmount
+// waits for an event loop that may be held by a hung backend request;
+// sync.OnceValue would make the second caller wait for the first).
+type filesystemUnmounter struct {
+	run     func() error
+	started atomic.Bool
+	done    chan struct{}
+	err     error
+	// handled is set once the lifecycle's shutdown has run to completion
+	// (unmounted, or gave up after its budget), so the CleanupStack entry
+	// knows there is nothing left to wait for.
+	handled atomic.Bool
+}
+
+func newFilesystemUnmounter(run func() error) *filesystemUnmounter {
+	return &filesystemUnmounter{run: run, done: make(chan struct{})}
+}
+
+// begin starts the unmount the first time it is called and returns a channel
+// that is closed when it finishes; later calls return the same channel.
+func (u *filesystemUnmounter) begin() <-chan struct{} {
+	if u.started.CompareAndSwap(false, true) {
+		go func() {
+			defer close(u.done)
+			u.err = u.run()
+		}()
+	}
+	return u.done
+}
+
+// result is the unmount's error; valid once the channel from begin is closed.
+func (u *filesystemUnmounter) result() error { return u.err }
 
 // lazyDetachFilesystem runs the lazy detach fallback with its own bound; the
 // shutdown budget may already be spent when it is called.
