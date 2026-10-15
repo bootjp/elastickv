@@ -1,3 +1,9 @@
+//go:build linux
+
+// The kernel-mount tests drive a real /dev/fuse mount and read Linux statfs
+// fields, so they only build on Linux; elsewhere the package's portable
+// tests still run.
+
 package fuseadapter_test
 
 import (

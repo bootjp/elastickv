@@ -332,6 +332,21 @@ func TestDetachAllBoundsTheLoop(t *testing.T) {
 	require.Equal(t, maxStaleMountDetaches, calls)
 }
 
+// TestDetachFUSEMountReportsCancellation pins that a shutdown requested while
+// a detach is in flight surfaces as context.Canceled rather than as the
+// EPERM the privileged fallback would return for an unprivileged server:
+// onlyContextCanceled in main relies on that to exit 0 after a signal. The
+// path is a plain directory, so nothing is unmounted whether or not a
+// fusermount helper exists on this machine.
+func TestDetachFUSEMountReportsCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	method, err := detachFUSEMount(ctx, t.TempDir())
+	require.ErrorIs(t, err, context.Canceled)
+	require.Empty(t, method)
+}
+
 func TestUnescapeMountTableField(t *testing.T) {
 	tests := []struct {
 		in, want string

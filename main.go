@@ -2272,14 +2272,26 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return err
 	}
 	runner.startAdminHTTP()
-	return startFilesystemIfEnabled(
+	return startFilesystemAfterServing(in)
+}
+
+// startFilesystemAfterServing mounts the optional FUSE filesystem once the
+// public services are up. On failure the public services are already serving
+// on eg, so they are drained before the deferred CleanupStack closes the
+// stores they use; a shutdown signal during the FUSE pre-mount work surfaces
+// here as context.Canceled and must not skip that drain either.
+func startFilesystemAfterServing(in serversInput) error {
+	if err := startFilesystemIfEnabled(
 		in.ctx,
 		in.eg,
 		in.cleanup,
 		in.shardStore,
 		in.coordinate,
 		in.metricsRegistry.FileSystemObserver(),
-	)
+	); err != nil {
+		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
+	}
+	return nil
 }
 
 func startupRoleStoreFromFlags(enabled bool) admin.RoleStore {

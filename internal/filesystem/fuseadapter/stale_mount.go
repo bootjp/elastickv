@@ -286,7 +286,10 @@ func unescapeMountTableField(field string) string {
 // same helpers go-fuse's own unmount uses: the suid fusermount3 (or legacy
 // fusermount) binary with `-u -z`, which works for unprivileged users, and
 // otherwise a direct lazy unmount(2), the equivalent of `umount -l`, which
-// needs CAP_SYS_ADMIN. It returns a description of the mechanism used.
+// needs CAP_SYS_ADMIN (lazyUnmount, Linux only). It returns a description of
+// the mechanism used. A cancelled ctx is reported as the cancellation, not
+// as the EPERM the privileged fallback would produce for an unprivileged
+// server, so a shutdown requested mid-detach still exits cleanly.
 func detachFUSEMount(ctx context.Context, mountPoint string) (string, error) {
 	var helperErr error
 	for _, helper := range []string{"fusermount3", "fusermount"} {
@@ -304,11 +307,17 @@ func detachFUSEMount(ctx context.Context, mountPoint string) (string, error) {
 		}
 		helperErr = errors.Wrapf(err, "%s -u -z %s: %s", helper, mountPoint, strings.TrimSpace(string(output)))
 	}
-	if err := syscall.Unmount(mountPoint, syscall.MNT_DETACH); err != nil {
+	if err := ctx.Err(); err != nil {
 		if helperErr != nil {
-			return "", errors.Wrapf(err, "umount(MNT_DETACH) %s after %s", mountPoint, helperErr.Error())
+			return "", errors.Wrapf(err, "detach cancelled after %s", helperErr.Error())
 		}
-		return "", errors.Wrapf(err, "umount(MNT_DETACH) %s", mountPoint)
+		return "", errors.Wrap(err, "detach cancelled")
 	}
-	return "umount(MNT_DETACH)", nil
+	if err := lazyUnmount(mountPoint); err != nil {
+		if helperErr != nil {
+			return "", errors.Wrapf(err, "%s %s after %s", lazyUnmountMethod, mountPoint, helperErr.Error())
+		}
+		return "", errors.Wrapf(err, "%s %s", lazyUnmountMethod, mountPoint)
+	}
+	return lazyUnmountMethod, nil
 }

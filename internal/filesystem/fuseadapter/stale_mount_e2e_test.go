@@ -1,3 +1,5 @@
+//go:build linux
+
 package fuseadapter_test
 
 import (
