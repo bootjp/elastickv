@@ -301,8 +301,8 @@ with every COMMIT it stamps and starves the secondary's own writes for as
 long as the skew lasts (found in review); `kvFSM` therefore raises the
 ceiling to the physical half of every timestamp it is about to observe,
 on apply, and at open from the replicated watermark alone
-(`LastRaftCommitTS`, which a store carries once its marker is
-`txn-ledger` or later; a store without it raises nothing at open and
+(`LastRaftCommitTS`, which a store carries once the ledger epoch has
+applied on it; a store without it raises nothing at open and
 its first renewal establishes the fence), never from `LastCommitTS()`
 (found in review: `observeStoreLastCommitTS` observes `LastCommitTS()`,
 which the replica-local `CatalogStore.Save` direct write advances at
@@ -326,9 +326,19 @@ transaction still in flight, the identity collision G10 describes;
 process leads renew out of phase by up to one tick). `HLC` keeps a
 ceiling per group id: each group's FSM applies its lease entries, its
 advances, and the timestamps it observes to that group's ceiling only;
-`NextFenced` takes the participant groups and fences at the lowest of
-their ceilings, so a persistence timestamp never exceeds a ceiling that
-every participant's replicas agreed to; the single-group `Coordinate`
+`NextFenced(G)` takes the issuing group and fences at that group's
+ceiling, inside that group's grant (below), so a persistence timestamp
+never exceeds a ceiling the issuer's replicas agreed to (corrected in
+review: an earlier revision fenced at the lowest ceiling over every
+participant group and so required every participant's grant, which the
+2PC issuer, the primary group's leader, holds only for the groups it
+leads, so a cross-group COMMIT from a leader of the primary alone would
+have been refused; the secondaries need no grant from the issuer: a
+secondary COMMIT at `c` is bound by A0b's apply-order fence, `c` above
+the secondary's replicated watermark, and the secondary's FSM raises its
+own ceiling to `physical(c)` as it applies the COMMIT, which is what
+keeps that group's next leader from re-issuing below `c`); the
+single-group `Coordinate`
 and the TSO group keep one ceiling; `PhysicalCeiling()` for monitoring
 reports the minimum over the led groups under legacy TSO mode and
 `ceiling(0)` under Phase D, and every other reader of the former scalar
@@ -428,7 +438,7 @@ legitimately, would fail writes until the next tick; it is entered on
 every `ErrCeilingExpired` instead (its callers already are the fenced
 allocation paths), proposes the same per-group target on every led
 group whose ceiling is below the needed value, and reports success once
-the fenced path can issue again (the lowest participant ceiling is above
+the fenced path can issue again (the issuing group's ceiling is above
 `last`'s millisecond, or `last` has logical room at it), so the
 exhausted case costs one Raft round trip, serialized by `hlcRecoveryMu`
 as the expired-wall case is today. Tests: a receiver advanced ahead of its
@@ -454,8 +464,13 @@ field, bound with `WithReadSnapshot` or through `WithDispatchVoucher`),
 applies only at its own timestamp, proposes an advance through the
 wrap-aware proposer when the group's replicated watermark is below it and
 waits for the local apply, is refused with `ErrReadTSAheadOfClock` when the
-physical half exceeds `max(HLC.Current, ceiling) + hlcPhysicalWindowMs`,
-the ceiling being the serving group's own under legacy TSO mode and the
+physical half exceeds `max(physical(HLC.Current), ceiling) +
+hlcPhysicalWindowMs`, with `physical(x) = x >> HLCLogicalBits`
+(corrected in review: the earlier text compared the packed 64-bit
+`HLC.Current` against a ceiling in milliseconds, a bound 65,536 times
+too wide that every snapshot passed; the test pins the boundary with a
+nonzero logical counter in `HLC.Current`), the ceiling being the
+serving group's own under legacy TSO mode and the
 TSO group's, `ceiling(0)`, under Phase D (no wall clock; that bound sits
 above the local ceiling on purpose, which is what makes the ceiling raise
 at advance apply necessary: a group's issued timestamps sit at its own ceiling, `wall +
@@ -563,7 +578,8 @@ current-term grant, and returned in the fenced answer the capability is
 built from (corrected in review: the coordinating process may lead none
 of the touched groups, as the public gRPC, Lua, and filesystem paths
 allow, and then holds no grant for them, while an allocation under an
-unrelated group it leads would bypass the participants' ceilings), and
+unrelated group it leads would be fenced at none of the touched groups'
+ceilings), and
 each touched group advances to
 `s` on its first read, one Raft write per group once, since its
 watermark is nonzero from then on. The single-group `Coordinate` takes
@@ -974,8 +990,11 @@ Still open for the fix PRs:
   every Pebble DB this version opens or restores (`loadLastRaftCommitTS`
   persists it with `Sync` when missing or above `lastCommitTS`, at open and
   after every restore swap; an empty-snapshot restore writes 0; **to be
-  gated on the V2 marker before merge**: a store whose marker is still `etcd` (pre-epoch or V1-pinned) must
-  not carry the key at all, see A7); the
+  gated on the applied ledger epoch row before merge**: a store on which
+  the ledger epoch has not applied (pre-epoch, V1-pinned, or marker
+  already `txn-ledger` with the epoch row not yet applied) must not
+  carry the key at all, and the open-time seeding above goes away, the
+  epoch's apply batch being the key's only creator, see A7); the
   streaming MVCC format gains layout V4 (V3 plus a trailing
   `lastRaftCommitTS`; the reader still accepts V1 to V3); the backup
   encoder writes the key as a raw entry and `ReadSnapshotWithHeader` skips
@@ -2445,17 +2464,27 @@ sections defer to is therefore two-sided:
   index-based detection and never the timestamp fast path. The replicated
   watermark key
   `_meta_last_raft_commit_ts` and the snapshot layouts that carry it exist
-  **only once the marker is `txn-ledger` or later** (a downgrade-incompatible
-  directory); on a pre-epoch or V1-pinned node the new binary writes
+  **only once the ledger epoch's row has applied** on that replica (the
+  marker is a downgrade fence only, written before the node advertises
+  and therefore before the epoch applies, so it cannot gate the key;
+  corrected in review: gated on the marker, a node that had advertised
+  and not yet applied the epoch would have created the key at open from
+  its local `lastCommitTS`, the very seed the next sentences rule out,
+  and carried it into snapshots that pre-epoch replicas then restored);
+  on a pre-epoch or V1-pinned node the new binary writes
   neither (found in review: the shipped `isPebbleMetaKey` does not know the
   key, so the shipped binary's `findMaxCommitTS` decodes its last eight
   bytes as an inverted MVCC timestamp and, at every open, raises
   `_meta_last_commit_ts` to that bogus value with `Sync`, and whole-keyspace
   scans surface it as a user key; a V1-only cluster that downgraded, or
   installed a snapshot the new binary wrote, would therefore break OCC and
-  snapshot reads). Concretely: `loadLastRaftCommitTS` seeds the key, the
-  streaming MVCC layout moves from V3 to V4, and the backup encoder writes
-  the raw entry only when the marker is `txn-ledger` or later. The key's
+  snapshot reads). Concretely: the epoch's apply batch creates the key,
+  `loadLastRaftCommitTS` only reads it back and never creates it (a
+  missing key means pre-epoch, not "seed me"), the streaming MVCC layout
+  moves from V3 to V4 and the backup encoder writes the raw entry only
+  when the applied epoch row is present (the snapshot header's format
+  field, `reserve`, `ledger`, `v2`, follows the applied epoch rows too,
+  never the marker). The key's
   initial value is **Raft-agreed, not local** (found in review): the seed
   is the ledger epoch entry's own leader-issued commit timestamp, carried
   in the entry, and every replica sets `_meta_last_raft_commit_ts` to it in
