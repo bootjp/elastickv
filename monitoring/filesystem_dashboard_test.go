@@ -23,6 +23,12 @@ var clusterWideFilesystemGauges = []string{
 	"elastickv_fs_file_move_inflight",
 }
 
+// nodeLocalFilesystemGauges describe only the exporting node, so they are
+// summed across nodes; a max would hide every node but one.
+var nodeLocalFilesystemGauges = []string{
+	"elastickv_fs_file_move_active_local",
+}
+
 func filesystemDashboardExprs(t *testing.T) []string {
 	t.Helper()
 	raw, err := os.ReadFile(filepath.Join("grafana", "dashboards", "elastickv-filesystem.json"))
@@ -95,6 +101,22 @@ func TestFilesystemClusterWideGaugesAreNotSummedAcrossNodes(t *testing.T) {
 				seen = true
 				require.Falsef(t, summed.MatchString(expr), "%s sums cluster-wide gauge %s across nodes: %s", name, metric, expr)
 				require.Truef(t, maxed.MatchString(expr), "%s must aggregate cluster-wide gauge %s with max: %s", name, metric, expr)
+			}
+			if name == "dashboard" {
+				require.Truef(t, seen, "dashboard has no panel for %s", metric)
+			}
+		}
+		for _, metric := range nodeLocalFilesystemGauges {
+			summed := aggregationOver("sum", metric)
+			maxed := aggregationOver("max", metric)
+			seen := false
+			for _, expr := range exprs {
+				if !strings.Contains(expr, metric) {
+					continue
+				}
+				seen = true
+				require.Falsef(t, maxed.MatchString(expr), "%s takes max of node-local gauge %s: %s", name, metric, expr)
+				require.Truef(t, summed.MatchString(expr), "%s must aggregate node-local gauge %s with sum: %s", name, metric, expr)
 			}
 			if name == "dashboard" {
 				require.Truef(t, seen, "dashboard has no panel for %s", metric)

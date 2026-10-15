@@ -14,7 +14,10 @@
       "gridPos": {"h": 8, "w": 6, "x": 0, "y": 0},
       "id": 1,
       "options": {"colorMode": "value", "graphMode": "area", "justifyMode": "auto", "orientation": "auto", "reduceOptions": {"calcs": ["lastNotNull"], "fields": "", "values": false}, "textMode": "auto", "wideLayout": true},
-      "targets": [{"editorMode": "code", "expr": "max(elastickv_fs_file_move_inflight)", "legendFormat": "moves", "range": true, "refId": "A"}],
+      "targets": [
+        {"editorMode": "code", "expr": "max(elastickv_fs_file_move_inflight)", "legendFormat": "durable", "range": true, "refId": "A"},
+        {"editorMode": "code", "expr": "sum(elastickv_fs_file_move_active_local)", "legendFormat": "running on nodes", "range": true, "refId": "B"}
+      ],
       "title": "Moves In Flight",
       "type": "stat"
     },

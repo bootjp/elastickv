@@ -19,7 +19,7 @@ groups:
           description: Placement reconciliation found an active file outside the single-home invariant. Pause rebalancing and inspect unfinished move jobs.
 
       - alert: ElastickvFilesystemMoveStuck
-        expr: min_over_time(max(elastickv_fs_file_move_inflight)[30m:]) > 0
+        expr: min_over_time(max(elastickv_fs_file_move_inflight)[30m:]) > 0 or min_over_time(sum(elastickv_fs_file_move_active_local)[30m:]) > 0
         labels:
           severity: warning
         annotations:

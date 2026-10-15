@@ -33,6 +33,7 @@ type FileSystemMetrics struct {
 	fileMultiShardTotal    prometheus.Counter
 	fileMultiShardCurrent  prometheus.Gauge
 	fileMoveInflight       prometheus.Gauge
+	fileMoveActiveLocal    prometheus.Gauge
 	chunkReadOpsTotal      prometheus.Counter
 	chunkWriteOpsTotal     prometheus.Counter
 	chunkReadLatencyMS     prometheus.Histogram
@@ -45,7 +46,6 @@ type FileSystemMetrics struct {
 	activeMoveJobs         map[string]struct{}
 	lastFilesByGroup       map[string]struct{}
 	lastMultiShardInodes   map[uint64]struct{}
-	lastMoveInflight       uint64
 }
 
 func newFileSystemMetrics(registerer prometheus.Registerer) *FileSystemMetrics {
@@ -67,7 +67,11 @@ func newFileSystemMetrics(registerer prometheus.Registerer) *FileSystemMetrics {
 		}),
 		fileMoveInflight: prometheus.NewGauge(prometheus.GaugeOpts{
 			Name: "elastickv_fs_file_move_inflight",
-			Help: "Current durable whole-file migration jobs that have not completed.",
+			Help: "Current durable whole-file migration jobs that have not completed, from the last placement scan (cluster-wide; aggregate with max).",
+		}),
+		fileMoveActiveLocal: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "elastickv_fs_file_move_active_local",
+			Help: "Whole-file migration jobs this node is currently executing (per node; aggregate with sum).",
 		}),
 		chunkReadOpsTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "elastickv_fs_chunk_read_ops_total",
@@ -116,6 +120,7 @@ func newFileSystemMetrics(registerer prometheus.Registerer) *FileSystemMetrics {
 		m.fileMultiShardTotal,
 		m.fileMultiShardCurrent,
 		m.fileMoveInflight,
+		m.fileMoveActiveLocal,
 		m.chunkReadOpsTotal,
 		m.chunkWriteOpsTotal,
 		m.chunkReadLatencyMS,
@@ -169,7 +174,7 @@ func (m *FileSystemMetrics) ObserveMoveJob(jobID []byte, active bool) {
 	} else {
 		delete(m.activeMoveJobs, key)
 	}
-	m.updateMoveInflightLocked()
+	m.fileMoveActiveLocal.Set(float64(len(m.activeMoveJobs)))
 }
 
 func (m *FileSystemMetrics) ObservePlacementStats(stats filesystem.PlacementStats) {
@@ -178,8 +183,7 @@ func (m *FileSystemMetrics) ObservePlacementStats(stats filesystem.PlacementStat
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	m.lastMoveInflight = stats.MoveInflight
-	m.updateMoveInflightLocked()
+	m.fileMoveInflight.Set(float64(stats.MoveInflight))
 	m.openHandleLeaseActive.Set(float64(stats.OpenHandleLeases))
 	m.orphanInodeGCPending.Set(float64(stats.OrphanedInodes))
 	m.fileMultiShardCurrent.Set(float64(stats.MultiShardFiles))
@@ -204,14 +208,6 @@ func (m *FileSystemMetrics) ObservePlacementStats(stats filesystem.PlacementStat
 		}
 	}
 	m.lastFilesByGroup = nextGroups
-}
-
-func (m *FileSystemMetrics) updateMoveInflightLocked() {
-	inflight := m.lastMoveInflight
-	if active := uint64(len(m.activeMoveJobs)); active > inflight {
-		inflight = active
-	}
-	m.fileMoveInflight.Set(float64(inflight))
 }
 
 func (m *FileSystemMetrics) ObserveFilePinnedHotspot(reason string) {
