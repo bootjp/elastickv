@@ -761,6 +761,18 @@ func isPebbleOperationalKey(rawKey []byte) bool {
 	return isPebbleMetaKey(rawKey)
 }
 
+// IsPebbleOperationalKey reports whether rawKey, as it appears in a native
+// Pebble snapshot stream, is one of the store's reserved metadata keys
+// (`_meta_last_commit_ts`, the retention and applied-index markers, the
+// migration records, the encryption writer registry) rather than an MVCC
+// version. It is the live side of the classifier that
+// internal/backup/snapshot_reader.go mirrors for the offline decoder,
+// which must not link this package; the mirror's tests call it to pin the
+// two sides against each other.
+func IsPebbleOperationalKey(rawKey []byte) bool {
+	return isPebbleOperationalKey(rawKey)
+}
+
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 	metaTS, err := readPebbleUint64(s.db, metaLastCommitTSBytes)
 	if err != nil {
