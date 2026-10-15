@@ -2687,10 +2687,33 @@ sections defer to is therefore two-sided:
   (`ErrTxnReservationRequired`, a definite error the coordinator reports
   as the upgrading retry), deterministic because every member of the
   group is the intermediate binary by then, so a coordinator the barrier
-  missed still cannot land an unreserved cross-group PREPARE there.
+  missed still cannot land an unreserved cross-group PREPARE there. The
+  guard recognises the reservation by shape (corrected in review: the
+  reservation is itself a one-key V1 2PC that carries no marker and
+  runs only after the epoch, so a guard on the marker alone would have
+  rejected every reservation and with it every cross-group transaction
+  of the intermediate release): a PREPARE whose only mutation is a
+  bit-63 reservation key under `!txn|cmt|` and whose primary key is
+  that same key is admitted without a marker, and any other marker-less
+  PREPARE, a reservation key next to a user key included, is rejected.
+  The ledger epoch supersedes the guard: once it has applied on a
+  group, that group's FSM admits a V1 PREPARE only in the ledger-era
+  form (the request-level `attempt_id` on every PREPARE, the ledger row
+  on a primary one) and rejects the marker-bearing and the
+  reservation-shaped forms of the intermediate release with the same
+  definite error; that strands nothing, since the ledger epoch waits
+  for every node to advertise `txn_v1_drain_ledger`, which an
+  intermediate binary never does, so the last intermediate coordinator
+  has drained and exited before it, and a reservation leaves no lock
+  and no decision under its identity for a later PREPARE to depend on.
   Tests: a node restarted on the shipped binary after advertising is
-  refused; an unreserved PREPARE proposed to a group after its epoch is
-  rejected while a marker-bearing one applies. Shipped-against-shipped aliasing during the
+  refused; on a group whose epoch has applied, a reservation PREPARE
+  and COMMIT followed by marker-bearing primary and secondary PREPAREs
+  apply end to end, an unreserved marker-less PREPARE is rejected, and
+  a marker-less PREPARE carrying a reservation key next to a user key
+  is rejected; after the ledger epoch a reservation-shaped PREPARE and
+  a marker-bearing one are rejected while a ledger-era PREPARE
+  applies. Shipped-against-shipped aliasing during the
   restart is `main`'s own G12, not the drain's to find; the runbook
   removes it by routing cross-group traffic away from nodes awaiting
   restart or by pausing it at the ingress for the window. Test: a

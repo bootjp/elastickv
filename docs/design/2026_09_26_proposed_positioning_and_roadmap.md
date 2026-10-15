@@ -109,8 +109,9 @@ README will present scope in two tiers instead of a non-goals section.
   have failing tests on `main`. README
   makes the serializable claim only after the full §6.1 gate: the audit's
   A0 to A2, G11, G15, and G13 fixes merged **and** A7's transaction-format
-  gate landed with `txn_format_v2` activated cluster-wide (merging alone
-  activates nothing). Leader reads via ReadIndex or leader lease; no follower reads.
+  gate landed with V2 in effect cluster-wide, the `txn-v2` marker the
+  drain's completion step writes (merging alone activates nothing, and
+  activation alone is not the gate). Leader reads via ReadIndex or leader lease; no follower reads.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
@@ -177,8 +178,8 @@ behind each claim.
    (G14); the claim waits for A2's transaction id, the primary-first PREPARE
    order, and the secondary re-apply, and for A0's index-based replay
    detection, all reproduced and fixed on local branches, and, as every
-   consistency claim does, for A7's `txn_format_v2` activated
-   cluster-wide (§6.1): until then V1 entries keep the legacy identity
+   consistency claim does, for A7's V2 format in effect cluster-wide
+   (§6.1): until then V1 entries keep the legacy identity
    and replay semantics, and merging the fixes excludes nothing.
 3. **Multi-key transactions are serializable.** The FSM validates the
    transaction's write set and read set against every commit newer than
@@ -191,8 +192,8 @@ behind each claim.
    PREPARE and COMMIT (G1); S3 handlers and Lua string reads do not surface
    their reads at all (G2, G3). The claim is made once A0 to A2, G11, G15, and G13 (a 2PC PREPARE at the
    previous commit's timestamp swallowed as a replay, closed by A0's
-   index-based replay detection) of §6.3 are merged and A7's
-   `txn_format_v2` is activated cluster-wide, the full §6.1 gate. Evidence
+   index-based replay detection) of §6.3 are merged and A7's V2 format
+   is in effect cluster-wide, the full §6.1 gate. Evidence
    today: Elle list-append under `:strict-serializable` for Redis MULTI/EXEC
    and DynamoDB `TransactGetItems` + `TransactWriteItems`. That workload
    cannot exhibit write skew (every anti-dependency comes with a write-write
@@ -224,12 +225,21 @@ every data-plane forwarder and the admin forwarder, since a retried
 non-idempotent write applies twice and the fence cannot see it), and G13
 (a 2PC PREPARE swallowed as a replay, closed by A0's index-based replay
 detection, with its regression test) are merged
-**and** A7's transaction-format gate has landed with `txn_format_v2`
-activated cluster-wide: merging alone activates nothing, because V1
+**and** A7's transaction-format gate has landed with **V2 in effect**
+cluster-wide, the `txn-v2` form of the `raft-engine` marker that the
+drain's completion step writes once the `txn_format_v2` activation epoch
+has applied on every data group, no legacy-shape lock row is left, and
+every legacy commit record written since activation has had its
+secondaries confirmed (corrected in review: activation alone is not the
+gate, because V2 transactions run next to the drain of the legacy
+outcomes and the audit's guarantees are forward-looking from the drain's
+completion, not from the activation entry). Merging alone activates
+nothing, because V1
 entries deliberately keep the old semantics (the timestamp replay fast
 path, no fence, no read locks, no transaction id, no watermark advance)
 until every member advertises V2, and an operator may pin a cluster to
-V1. The README caveat states that a V1-pinned or mid-upgrade cluster runs
+V1. The README caveat states that a V1-pinned or mid-upgrade cluster,
+one activated but still draining included, runs
 without these guarantees. The claims also exclude Phase-D clusters
 (`--tsoPhaseDEnabled`) until both TSO admission proposals
 (`2026_08_29_proposed_tso_batch_slot_claims.md`,
@@ -392,11 +402,12 @@ Recorded from the 2026-09-26 design interview, then reconciled with `main`.
 - The audit's A2 analysis found gaps G0 and G1 on `main`, and both are
   reproduced by failing tests; the serializable claim is the target and is
   not made for any path until the full §6.1 gate holds: A0 to A2, G11,
-  G15, and G13 merged and A7's `txn_format_v2` activated cluster-wide.
+  G15, and G13 merged and A7's V2 format in effect cluster-wide (the
+  `txn-v2` marker, not the activation entry).
 - Cross-shard atomicity is gated on G12, G13, and G14 together: A2's
   transaction id and PREPARE order plus A0's index-based replay detection,
-  merged and in effect through A7's `txn_format_v2` activated
-  cluster-wide, as for every consistency claim.
+  merged and in effect through A7's `txn-v2` marker cluster-wide, as for
+  every consistency claim.
 - The README consistency claims exclude Phase-D clusters until both TSO
   admission proposals land; legacy-mode clusters do not wait on them.
 - The README consistency claims exclude resolver-routed keys (SQS FIFO
