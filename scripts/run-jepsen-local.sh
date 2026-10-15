@@ -8,12 +8,17 @@
 #   ./scripts/run-jepsen-local.sh               # build + start cluster + test
 #   ./scripts/run-jepsen-local.sh --no-rebuild   # skip go build (reuse binary)
 #   ./scripts/run-jepsen-local.sh --no-cluster   # skip cluster start (reuse running one)
+#   ./scripts/run-jepsen-local.sh --encrypted    # same, against a data-at-rest
+#                                                # encrypted cluster (file KEK,
+#                                                # storage + raft envelopes on)
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BINARY=/tmp/elastickv4-binary
+ADMIN_BINARY=/tmp/elastickv4-admin-binary
 DATA_DIR=/tmp/elastickv-test-run
 PID_FILE=/tmp/elastickv-test-run.pid
+KEK_FILE="${DATA_DIR}/kek.bin"
 
 BOOTSTRAP_MEMBERS="n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053"
 RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
@@ -22,10 +27,12 @@ RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802
 
 NO_REBUILD=false
 NO_CLUSTER=false
+ENCRYPTED=false
 for arg in "$@"; do
   case "$arg" in
     --no-rebuild) NO_REBUILD=true ;;
     --no-cluster) NO_CLUSTER=true ;;
+    --encrypted) ENCRYPTED=true ;;
   esac
 done
 
@@ -79,6 +86,10 @@ if ! $NO_REBUILD; then
   cd "$REPO_ROOT"
   go build -o "$BINARY" .
   echo "[build] done -> $BINARY"
+  if $ENCRYPTED; then
+    go build -o "$ADMIN_BINARY" ./cmd/elastickv-admin
+    echo "[build] done -> $ADMIN_BINARY"
+  fi
 fi
 
 # ---- start cluster ----
@@ -89,8 +100,23 @@ if ! $NO_CLUSTER; then
   mkdir -p "$DATA_DIR"
   : > "$PID_FILE"
 
-  echo "[cluster] starting 3-node cluster..."
+  # Encrypted mode: one random 32-byte file KEK shared by every node
+  # (owner-only mode, as kek.NewFileWrapper requires). The nodes start
+  # encryption-capable but still cleartext; the §7.1 cutover below flips
+  # the storage and raft envelopes on once the cluster is up.
+  if $ENCRYPTED; then
+    head -c 32 /dev/urandom > "$KEK_FILE"
+    chmod 600 "$KEK_FILE"
+  fi
+
+  echo "[cluster] starting 3-node cluster (encrypted=${ENCRYPTED})..."
   for node in 1 2 3; do
+    ENC_ARGS=()
+    if $ENCRYPTED; then
+      mkdir -p "${DATA_DIR}/n${node}"
+      ENC_ARGS=(--encryption-enabled --kekFile "$KEK_FILE" \
+                --encryptionSidecarPath "${DATA_DIR}/n${node}/keys.json")
+    fi
     FS_ARGS=()
     if $FUSE_ENABLED; then
       mkdir -p "${DATA_DIR}/fs-n${node}"
@@ -104,6 +130,7 @@ if ! $NO_CLUSTER; then
       --dynamoAddress "127.0.0.1:6380${node}" \
       --s3Address    "127.0.0.1:6390${node}" \
       "${FS_ARGS[@]}" \
+      "${ENC_ARGS[@]}" \
       --metricsAddress "" \
       --pprofAddress "" \
       --raftId       "n${node}" \
@@ -140,6 +167,12 @@ if ! $NO_CLUSTER; then
       exit 1
     fi
   done
+
+  if $ENCRYPTED; then
+    echo "[cluster] enabling data-at-rest encryption (bootstrap + storage/raft envelope cutover)..."
+    "$REPO_ROOT/scripts/jepsen-enable-encryption.sh" "$ADMIN_BINARY" "$KEK_FILE" \
+      127.0.0.1:50051 127.0.0.1:50052 127.0.0.1:50053
+  fi
 fi
 
 # ---- run Jepsen DynamoDB workloads ----
