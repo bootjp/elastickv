@@ -72,7 +72,7 @@ flags:
 | Flag | Default | Meaning |
 |---|---|---|
 | `--filesystemMount` | empty (disabled) | Directory to mount the filesystem on. |
-| `--filesystemClientID` | value of `--raftId` | Identity recorded in open-handle leases. Must be unique per mount in the cluster. |
+| `--filesystemClientID` | value of `--raftId` | Identity recorded in open-handle lease keys and in the mount log line, for attribution. Does not have to be unique: lease keys also carry a per-open handle ID. |
 | `--filesystemRootUID` | `0` | Owner UID of the root directory. Applied only when the root is first created. |
 | `--filesystemRootGID` | `0` | Owner GID of the root directory. Applied only when the root is first created. |
 | `--filesystemRootMode` | `0755` | Permission bits of the root directory. Applied only when the root is first created. |
@@ -143,8 +143,12 @@ Rules that apply across nodes:
   enforced by the kernel on every mount (`default_permissions`), so the
   cluster needs one numeric UID/GID that the processes using the mount share
   on every node. If the first node to start wins with the wrong values, the
-  mounts on the other nodes are read-only for their users until an
-  administrator fixes it with `chown`/`chmod` on the root from any mount.
+  mounts on the other nodes are read-only for their users until the root is
+  repaired. Only root can `chown` it, and root cannot reach a mount made by
+  another user (no `allow_other`), so the repair is the one described under
+  [Single node](#single-node): restart one server as root, `chown`/`chmod`
+  the mount point from a root shell, then return that server to its normal
+  user.
 - Leave `--filesystemClientID` at its default (the Raft ID). It is recorded
   in open-handle lease keys and in the `filesystem FUSE mounted` log line,
   so a distinct value per mount makes leases and logs attributable to a node.
@@ -152,9 +156,12 @@ Rules that apply across nodes:
   the same client ID do not interfere with each other's handles; the ID is
   for operators, not for correctness.
 - A follower mount forwards writes to the leader and fences its reads on the
-  leader's commit position before serving them, so a read on any node
-  observes every write that completed on any other node before the read
-  started.
+  leader's commit position before serving them, so a read that reaches the
+  backend on any node observes every write that completed on any other node
+  before the read started. That covers lookups, attributes, directory
+  listings, and data read through a freshly opened descriptor; a descriptor
+  that was already open may still be served from that node's page cache (see
+  [Durability and caching](#semantics-worth-knowing)).
 - When bootstrapping a brand-new cluster with per-node joins, start the
   bootstrap node with the mount first and add the mount to the other nodes
   once they have joined. Root initialization needs a leader; a node that
@@ -283,8 +290,13 @@ for a path that exists again a moment later. Retry the `open`.
 removes the name immediately; the data stays readable through the open handle
 and is garbage-collected after the last handle is released. Each open handle
 holds a lease (5 minutes, refreshed on every read and write through that
-handle). If a mount dies without releasing its handles, the leases expire and
-the lease reaper reclaims the space. The reaper runs only on mounted nodes
+handle and by a keepalive that each mount runs for its open handles once a
+minute). The guarantee therefore lasts only while the mount can refresh the
+lease: if the mount cannot reach the leader for longer than the lease TTL,
+the reaper on another node treats the handle as dead, and reads through the
+still-open descriptor fail once the data has been garbage-collected. If a
+mount dies without releasing its handles, the leases expire and the lease
+reaper reclaims the space. The reaper runs only on mounted nodes
 whose `--filesystemLeaseReapInterval` is positive (the default is 30s);
 if every mount disables it, space held by dead handles is never returned.
 
@@ -338,7 +350,7 @@ Filesystem metrics are served on the usual `--metricsAddress` endpoint when
 |---|---|
 | `elastickv_fs_chunk_read_ops_total`, `elastickv_fs_chunk_write_ops_total` | Chunk I/O counters. |
 | `elastickv_fs_chunk_read_latency_ms`, `elastickv_fs_chunk_write_latency_ms` | Chunk I/O latency histograms. |
-| `elastickv_fs_open_handle_lease_active` | Live open-handle leases. |
+| `elastickv_fs_open_handle_lease_active` | Stored open-handle lease records, including expired ones the reaper has not reclaimed yet. |
 | `elastickv_fs_orphan_inode_gc_pending` | Unlinked inodes whose chunks are still waiting for garbage collection. |
 | `elastickv_fs_files_by_group{group_id}` | Files homed on each Raft group. |
 | `elastickv_fs_file_multi_shard_current`, `elastickv_fs_file_multi_shard_detected_total` | Files whose chunks were found on more than one group. Should stay at zero. |
@@ -347,12 +359,18 @@ Filesystem metrics are served on the usual `--metricsAddress` endpoint when
 | `elastickv_fs_file_pinned_hotspot_total` | Split candidates skipped to keep a file on one group. |
 | `elastickv_fs_inode_id_collision_retry_total` | Inode ID allocation retries. |
 
-The gauges derived from scanning the store are refreshed every
-`--filesystemPlacementScanInterval`. The Grafana dashboard
-`monitoring/grafana/dashboards/elastickv-filesystem.json` and the alert rules
-in `monitoring/prometheus/rules/filesystem.yml` (pinned hotspot, multi-shard
-file, stuck move, pending orphan GC, home epoch conflicts) cover these
-metrics.
+The gauges derived from scanning the store (`open_handle_lease_active`,
+`orphan_inode_gc_pending`, `files_by_group`, `file_multi_shard_current`,
+`file_move_inflight`) are refreshed every `--filesystemPlacementScanInterval`
+and describe the whole cluster, and every mounted node exports the same
+value. Aggregate them across nodes with `max`, not `sum`: the Grafana
+dashboard `monitoring/grafana/dashboards/elastickv-filesystem.json` sums
+them, so with three mounted nodes its placement panels show three times the
+real count until that is changed (the chunk I/O counters and the `_total`
+counters are per node and sum correctly). The alert rules in
+`monitoring/prometheus/rules/filesystem.yml` (pinned hotspot, multi-shard
+file, stuck move, pending orphan GC, home epoch conflicts) compare against
+zero, so the summing does not change their outcome.
 
 ## Backup and restore
 
@@ -373,9 +391,11 @@ filesystem backup adapter exists, there are two options:
 - Keep a cold copy of every node's Raft data directory, taken with the
   servers stopped. With data-at-rest encryption enabled the copy must also
   include the key sidecar (`--encryptionSidecarPath`, which may live outside
-  the data directory) and the KEK source configuration (`--kekFile` /
-  `--kekUri`); restoring data without its sidecar leaves the values
-  unrecoverable, and the KEK is never part of any backup. See the
+  the data directory) and the KEK source (`--kekFile`, `--kekUri`, or the
+  `ELASTICKV_KEK_BASE64` environment value, which the server removes from
+  its environment at startup and stores nowhere); restoring data without its
+  sidecar leaves the values unrecoverable, and the KEK is never part of any
+  backup. See the
   [encryption design](design/2026_04_29_partial_data_at_rest_encryption.md).
 
 ## Troubleshooting
@@ -387,7 +407,7 @@ filesystem backup adapter exists, there are two options:
 | `mkdir: cannot create directory: Permission denied` right after the first mount | The root directory is owned by UID 0 with mode `0755`. Start with `--filesystemRootUID` / `--filesystemRootGID` set to the writing user (only effective before the root exists) or `chown` the mount point as root. |
 | `Transport endpoint is not connected` on the mount point | The server process stopped (any signal ends it without unmounting). Run `fusermount3 -uz <mount-point>` (or `umount -l`), then restart the server. |
 | Restart exits with `fusermount3: failed to access mountpoint ...: Transport endpoint is not connected` | The previous mount is still attached. Detach it with `fusermount3 -uz` first; see [Stopping and restarting](#stopping-and-restarting). |
-| `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry the operation. |
+| `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry `open`, `write`, `rename`, and `unlink`; never retry `close`, and do not retry an `O_APPEND` write that other mounts may also be appending to. See [Concurrency](#semantics-worth-knowing). |
 | `Input/output error` (`EIO`) | A backend error that is not a write conflict, for example a lost connection to the leader. Check the server log; retry once the cluster is healthy. |
 | `ENOENT` opening a file that exists | The file was replaced by `rename` from another mount between lookup and open. Retry. |
 | `Operation not supported` | Hard link, symlink, special file, or cross-directory rename. See the table at the top. |
