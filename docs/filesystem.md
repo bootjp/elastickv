@@ -55,6 +55,12 @@ advertises a 255-byte name limit.
   groups that own the root's inode, home, directory-version and usage keys
   (see [Startup sequence](#startup-sequence)). On a multi-group cluster a
   group without quorum fails the mount even if it owns none of those keys.
+- Synchronized wall clocks across the nodes (NTP or equivalent). Open-handle
+  lease expiry is stamped with the local clock of the mount that refreshes
+  the lease and checked against the local clock of the node whose reaper
+  runs; a reaper whose clock runs ahead by close to the lease TTL (5 minutes)
+  can reclaim a handle that is still in use (see
+  [Remove while open](#semantics-worth-knowing)).
 
 The official container image (`ghcr.io/bootjp/elastickv`) is built on
 `distroless/static` and does not ship `fusermount3`. To mount from a
@@ -239,11 +245,15 @@ coherency is outside what the filesystem guarantees.
 ## Semantics worth knowing
 
 **Durability and caching.** The mount sets zero attribute and entry cache
-timeouts, so every `stat`, `lookup`, and `readdir` goes to the backend and
-reflects the latest committed state. Each FUSE write request is applied as one
-transaction over the chunks it touches and is durable when the request
-returns; `flush` is a no-op and `fsync` only re-reads the inode, because there
-is no write-back buffer on the server side. Two caveats:
+timeouts, so every `stat` and `lookup` goes to the backend and reflects the
+latest committed state, and so does a `readdir` that starts a new listing (a
+listing already in progress keeps paging through its original snapshot; see
+[Directory listing](#semantics-worth-knowing)). Each FUSE write request is
+applied as one transaction over the chunks it touches and is durable when
+the request returns. `flush` writes no data and `fsync` only re-reads the
+inode, because there is no write-back buffer on the server side; both still
+refresh the handle's lease in the backend, so they can fail with `EAGAIN`
+(see [Concurrency](#semantics-worth-knowing)). Two caveats:
 
 - *A large `write(2)` is not atomic.* The kernel splits a write into FUSE
   requests of at most 128 KiB (the go-fuse default; the mount does not raise
@@ -263,11 +273,17 @@ is no write-back buffer on the server side. Two caveats:
 
 **Concurrency.** The backend uses optimistic concurrency. Two callers that
 modify the same file or the same directory at the same moment can race; the
-loser's system call fails with `EAGAIN` (`Resource temporarily unavailable`)
-at `open`, `write`, `close`, `rename`, or `unlink`. Retry `open`, `write`,
-`rename`, and `unlink`: rewriting the same bytes at the same offset is
-idempotent, and a retried `rename` or `unlink` whose first attempt did apply
-reports `ENOENT`, which tells you it is already done. The exception is
+loser's system call fails with `EAGAIN` (`Resource temporarily unavailable`).
+Any call that commits a transaction can lose such a race: `open`, `create`,
+`write`, `truncate`, `chmod`/`chown`/`utimes`, `mkdir`, `rmdir`, `rename`,
+`unlink`, `close`, and also `read`, `fsync`, and `flush`, which refresh the
+handle's lease and can collide with the mount's own once-a-minute keepalive
+on the same lease key. Retry everything except the two cases below: reads,
+lease refreshes, and rewriting the same bytes at the same offset are
+idempotent; a retried `mkdir` or `create` whose first attempt did apply
+reports `EEXIST` (`O_CREAT` without `O_EXCL` simply opens the file), and a
+retried `rmdir`, `rename`, or `unlink` reports `ENOENT`, which tells you it
+is already done. The exception is
 `O_APPEND` across mounts: the kernel picks the append offset from the size it
 last saw and the server writes at that offset, so appends from different
 nodes are not atomic with respect to each other, and retrying one after
@@ -407,7 +423,7 @@ filesystem backup adapter exists, there are two options:
 | `mkdir: cannot create directory: Permission denied` right after the first mount | The root directory is owned by UID 0 with mode `0755`. Start with `--filesystemRootUID` / `--filesystemRootGID` set to the writing user (only effective before the root exists) or `chown` the mount point as root. |
 | `Transport endpoint is not connected` on the mount point | The server process stopped (any signal ends it without unmounting). Run `fusermount3 -uz <mount-point>` (or `umount -l`), then restart the server. |
 | Restart exits with `fusermount3: failed to access mountpoint ...: Transport endpoint is not connected` | The previous mount is still attached. Detach it with `fusermount3 -uz` first; see [Stopping and restarting](#stopping-and-restarting). |
-| `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry `open`, `write`, `rename`, and `unlink`; never retry `close`, and do not retry an `O_APPEND` write that other mounts may also be appending to. See [Concurrency](#semantics-worth-knowing). |
+| `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry the call, with two exceptions: never retry `close`, and do not retry an `O_APPEND` write that other mounts may also be appending to. See [Concurrency](#semantics-worth-knowing) for what a retry reports when the first attempt did apply. |
 | `Input/output error` (`EIO`) | A backend error that is not a write conflict, for example a lost connection to the leader. Check the server log; retry once the cluster is healthy. |
 | `ENOENT` opening a file that exists | The file was replaced by `rename` from another mount between lookup and open. Retry. |
 | `Operation not supported` | Hard link, symlink, special file, or cross-directory rename. See the table at the top. |
