@@ -42,6 +42,7 @@ The local Jepsen runner (builds, starts a 3-node cluster on `5005{1,2,3}` / `637
 ```bash
 ./scripts/run-jepsen-local.sh                     # full cycle
 ./scripts/run-jepsen-local.sh --no-rebuild --no-cluster  # reuse running cluster
+./scripts/run-jepsen-local.sh --encrypted         # same workloads against an encrypted cluster (file KEK + storage/raft envelope cutover)
 ```
 
 Direct Jepsen invocation requires isolating Leiningen state from `$HOME`:

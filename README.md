@@ -437,6 +437,17 @@ cd jepsen && ~/lein run -m elastickv.filesystem-workload --local \
   --mount-dirs /tmp/elastickv-test-run/fs-n1,/tmp/elastickv-test-run/fs-n2,/tmp/elastickv-test-run/fs-n3
 ```
 
+To run the same workloads against a data-at-rest encrypted cluster, pass
+`--encrypted` to the local runner. It generates a random file KEK under the
+run's data directory, starts every node with `--encryption-enabled --kekFile
+--encryptionSidecarPath`, and drives the bootstrap → `enable-storage-envelope`
+→ `enable-raft-envelope` cutover through `scripts/jepsen-enable-encryption.sh`
+before the first workload starts (the per-push CI job runs both legs):
+
+```bash
+./scripts/run-jepsen-local.sh --encrypted
+```
+
 `--write-mode overwrite` replaces each register with one in-place `pwrite`;
 `--write-mode rename` writes a temp file and renames it over the key. After the
 main phase every mount reads every register once more with the writers stopped

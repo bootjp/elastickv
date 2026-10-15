@@ -10,7 +10,18 @@ permissions:
   contents: read
 jobs:
   test:
+    # Every workload runs twice: once against the cleartext cluster and
+    # once against a data-at-rest encrypted one (file KEK, storage + raft
+    # envelopes enabled before the first workload). Encryption is
+    # consistency-transparent, so the encrypted leg is the acceptance
+    # gate from docs/design/2026_04_29_partial_data_at_rest_encryption.md
+    # §8.4 rather than a new workload.
+    name: test (encryption=${{ matrix.encryption }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        encryption: ['off', 'on']
     env:
       GOCACHE: /tmp/go-build
     steps:
@@ -52,6 +63,7 @@ jobs:
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
           go build -o /tmp/elastickv-bin .
+          go build -o /tmp/elastickv-admin-bin ./cmd/elastickv-admin
       - name: Warm Leiningen Maven cache
         working-directory: jepsen
         run: |
@@ -81,8 +93,23 @@ jobs:
           RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802,127.0.0.1:50053=127.0.0.1:63803"
           RAFT_SQS_MAP="127.0.0.1:50051=127.0.0.1:63501,127.0.0.1:50052=127.0.0.1:63502,127.0.0.1:50053=127.0.0.1:63503"
 
+          # Encrypted leg: one random owner-only file KEK shared by the
+          # three nodes; the cutover runs in the next step once the
+          # cluster is up. Node data dirs must exist before start-up so
+          # the sidecar path's directory is writable.
+          ENC_ARGS=()
+          if [ "${{ matrix.encryption }}" = "on" ]; then
+            head -c 32 /dev/urandom > /tmp/elastickv-ci/kek.bin
+            chmod 600 /tmp/elastickv-ci/kek.bin
+          fi
+
           : > /tmp/elastickv-demo.pid
           for node in 1 2 3; do
+            if [ "${{ matrix.encryption }}" = "on" ]; then
+              mkdir -p "/tmp/elastickv-ci/n${node}"
+              ENC_ARGS=(--encryption-enabled --kekFile /tmp/elastickv-ci/kek.bin \
+                        --encryptionSidecarPath "/tmp/elastickv-ci/n${node}/keys.json")
+            fi
             # Every node mounts the shared filesystem so the filesystem
             # workload can drive leader and follower mounts alike. The root
             # directory is owned by the runner user: the mount enforces
@@ -107,6 +134,7 @@ jobs:
               --raftS3Map "$RAFT_S3_MAP" \
               --raftDynamoMap "$RAFT_DYNAMO_MAP" \
               --raftSqsMap "$RAFT_SQS_MAP" \
+              "${ENC_ARGS[@]}" \
               > "/tmp/elastickv-demo-n${node}.log" 2>&1 &
             echo $! >> /tmp/elastickv-demo.pid
           done
@@ -130,6 +158,16 @@ jobs:
           tail -n 200 /tmp/elastickv-demo-n2.log || true
           tail -n 200 /tmp/elastickv-demo-n3.log || true
           exit 1
+      - name: Enable data-at-rest encryption on the cluster
+        if: matrix.encryption == 'on'
+        # Bootstrap the DEK pair, then flip the storage and raft envelope
+        # cluster flags (§7.1 Phase 1 + Phase 2) and wait until every
+        # member reports them active, so every workload below runs
+        # against encrypted storage and encrypted Raft entries.
+        timeout-minutes: 3
+        run: |
+          scripts/jepsen-enable-encryption.sh /tmp/elastickv-admin-bin /tmp/elastickv-ci/kek.bin \
+            127.0.0.1:50051 127.0.0.1:50052 127.0.0.1:50053
       - name: Run Redis Jepsen workload against elastickv
         working-directory: jepsen
         timeout-minutes: 3
@@ -184,7 +222,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: jepsen-store-types
+          name: jepsen-store-types-encryption-${{ matrix.encryption }}
           path: jepsen/store
           retention-days: 7
       - name: Run S3 Jepsen workload against elastickv
@@ -254,7 +292,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: jepsen-store-filesystem
+          name: jepsen-store-filesystem-encryption-${{ matrix.encryption }}
           path: jepsen/store/elastickv-filesystem-register-*
           retention-days: 7
           if-no-files-found: ignore
@@ -278,7 +316,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v7
         with:
-          name: elastickv-demo-logs
+          name: elastickv-demo-logs-encryption-${{ matrix.encryption }}
           path: |
             /tmp/elastickv-demo-n1.log
             /tmp/elastickv-demo-n2.log
