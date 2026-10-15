@@ -198,7 +198,7 @@ mount or on a request stuck in the backend.
 `SIGKILL`, an OOM kill, or a crash cannot run that cleanup, and the kernel
 keeps the now-dead mount attached. Until it is detached, every access to the
 mount point fails with `Transport endpoint is not connected`. A restarted
-server detaches such a dead mount itself before mounting (see step 4 of the
+server detaches such a dead mount itself before mounting (see step 3 of the
 [startup sequence](#startup-sequence)) and logs `detached stale filesystem
 FUSE mount left by a previous process`, so an ordinary restart needs no
 manual step:
