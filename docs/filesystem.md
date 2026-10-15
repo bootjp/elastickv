@@ -193,7 +193,10 @@ the mount lazily instead: new lookups see the plain directory at once, the
 open handles keep working until they are closed, and the server waits at most
 10 seconds in total for the unmount and for the kernel to release the
 connection before finishing its shutdown, so a stop never hangs on a busy
-mount or on a request stuck in the backend.
+mount or on a request stuck in the backend. The gRPC listeners likewise drain
+in-flight calls for at most 10 seconds before the remaining long-lived
+streams (catalog watches, Raft transport streams) are closed, so a stop
+never waits on a peer that stays connected.
 
 `SIGKILL`, an OOM kill, or a crash cannot run that cleanup, and the kernel
 keeps the now-dead mount attached. Until it is detached, every access to the

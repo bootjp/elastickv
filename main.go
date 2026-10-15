@@ -1122,8 +1122,10 @@ func stopFilesystemServer(
 			"mount_point", mountPoint,
 			"timeout", filesystemServeStopTimeout,
 		)
+		// Fall through: the reserved remainder of the budget still waits for
+		// the serve loop, so a request that finishes in time is not cut off
+		// by the store close that follows.
 		lazyDetachFilesystem(ctx, stopCtx, server, mountPoint)
-		return
 	}
 	select {
 	case <-serveDone:
@@ -3501,6 +3503,36 @@ func loadS3BlobPeerTokenFile(path string) (string, error) {
 	return tok, nil
 }
 
+// grpcGracefulStopTimeout bounds how long a gRPC server's GracefulStop may
+// wait for in-flight RPCs during shutdown. Long-lived streams (catalog
+// watches, the Raft transport's SendStream) only end when their client goes
+// away, so without a bound a SIGTERM would wait on them for as long as a
+// peer stays connected while repeat signals are swallowed. After the bound,
+// Stop closes the remaining streams. A variable so tests can shorten it.
+var grpcGracefulStopTimeout = 10 * time.Second
+
+// stopGRPCServerBounded drains srv for at most grpcGracefulStopTimeout and
+// then forces Stop, which also makes the pending GracefulStop return.
+func stopGRPCServerBounded(ctx context.Context, srv *grpc.Server, name string) {
+	done := make(chan struct{})
+	go func() {
+		srv.GracefulStop()
+		close(done)
+	}()
+	timer := time.NewTimer(grpcGracefulStopTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		slog.WarnContext(ctx, "gRPC graceful stop did not finish in time, closing remaining streams",
+			"server", name,
+			"timeout", grpcGracefulStopTimeout,
+		)
+		srv.Stop()
+		<-done
+	}
+}
+
 // installShutdownSignalHandler routes SIGTERM/SIGINT (or the given signals)
 // into cancel so the process unwinds through the same path the memory
 // watchdog uses: the errgroup drains, the FUSE mount is unmounted, and the
@@ -3866,7 +3898,7 @@ func startRaftServers(
 			go func() {
 				select {
 				case <-ctx.Done():
-					srv.GracefulStop()
+					stopGRPCServerBounded(ctx, srv, rt.spec.address)
 					_ = lis.Close()
 					closeService()
 				case <-stop:

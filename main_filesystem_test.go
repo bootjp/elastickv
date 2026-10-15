@@ -406,6 +406,51 @@ func TestInstallFilesystemServerLifecycleBoundsHungUnmount(t *testing.T) {
 	release()
 }
 
+// After a hung unmount the lazy detach must still be followed by the wait
+// for the serve loop inside the remaining budget: a backend request that
+// finishes in that window ends the loop and the shutdown proceeds at once,
+// before the stores are closed underneath it.
+func TestInstallFilesystemServerLifecycleWaitsForServeLoopAfterHungUnmount(t *testing.T) {
+	shortenFilesystemServeStopTimeout(t, 500*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, egCtx := errgroup.WithContext(ctx)
+	cleanup := &internalutil.CleanupStack{}
+	serveDone := make(chan struct{})
+	block := make(chan struct{})
+	release := sync.OnceFunc(func() { close(block) })
+	t.Cleanup(release)
+	server := &fakeFilesystemMountServer{unmountBlock: block}
+	// The lazy detach lets the loop finish shortly afterwards, inside the
+	// reserved slice of the budget.
+	server.onLazy = func() {
+		go func() {
+			time.Sleep(20 * time.Millisecond)
+			close(serveDone)
+		}()
+	}
+
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	start := time.Now()
+	cancel()
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- eg.Wait() }()
+	select {
+	case err := <-waitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("lifecycle did not stop")
+	}
+	elapsed := time.Since(start)
+	require.Equal(t, 1, server.lazyCalls)
+	// Past the 4/5 unmount wait, but well before the full budget: the loop
+	// ending was observed rather than timed out.
+	require.GreaterOrEqual(t, elapsed, 400*time.Millisecond)
+	require.Less(t, elapsed, 480*time.Millisecond, "serveDone closing must end the wait before the budget expires")
+	release()
+	cleanup.Run()
+}
+
 // The CleanupStack entry is the fallback when the lifecycle goroutine never
 // ran the shutdown (ctx not cancelled); a hung unmount must not block it past
 // the budget either.
