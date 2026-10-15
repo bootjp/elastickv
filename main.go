@@ -978,7 +978,7 @@ func startFilesystemIfEnabled(
 	); err != nil {
 		return errors.Wrap(err, "initialize filesystem root")
 	}
-	server, serveDone, err := mountFilesystemService(service, config)
+	server, serveDone, err := mountFilesystemService(ctx, service, config)
 	if err != nil {
 		return err
 	}
@@ -989,12 +989,17 @@ func startFilesystemIfEnabled(
 	return nil
 }
 
+// mountFilesystemService mounts service at the configured mount point. ctx
+// bounds only the pre-mount work (stale-mount detach, intent recovery) so a
+// shutdown signal during startup is not held up by it; the mount itself is
+// ended by the lifecycle installed afterwards.
 func mountFilesystemService(
+	ctx context.Context,
 	service *filesystem.Service,
 	config filesystemStartConfig,
 ) (*fuseadapter.Server, <-chan struct{}, error) {
 	frontend := fuseadapter.New(service, []byte(config.clientID))
-	server, err := fuseadapter.Mount(config.mountPoint, frontend, config.mountOptions)
+	server, err := fuseadapter.MountContext(ctx, config.mountPoint, frontend, config.mountOptions)
 	if err != nil {
 		frontend.Close()
 		return nil, nil, errors.Wrap(err, "mount filesystem frontend")

@@ -167,6 +167,31 @@ func TestStaleFUSEMountMatchesSymlinkedMountPoint(t *testing.T) {
 	require.Equal(t, resolvedReal, entry.mountPoint)
 }
 
+// TestStaleFUSEMountMatchesRelativeSymlinkUnderSymlinkedParent covers
+// /base/link/mp with link -> /base/real/deep and mp -> ../target: the kernel
+// resolves the parent first and mounts on /base/real/target, so a relative
+// link target must be joined to the canonical parent, not the typed one.
+func TestStaleFUSEMountMatchesRelativeSymlinkUnderSymlinkedParent(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	require.NoError(t, err)
+	deep := filepath.Join(base, "real", "deep")
+	target := filepath.Join(base, "real", "target")
+	require.NoError(t, os.MkdirAll(deep, 0o755))
+	require.NoError(t, os.MkdirAll(target, 0o755))
+	require.NoError(t, os.Symlink(deep, filepath.Join(base, "link")))
+	require.NoError(t, os.Symlink("../target", filepath.Join(deep, "mp")))
+	typed := filepath.Join(base, "link", "mp")
+
+	require.Equal(t, target, resolveMountPointSymlinks(typed))
+
+	table := writeMountTable(t, mountTableLine("elastickv", target, "fuse.elastickv"))
+	inspector := &staleMountInspector{mountTable: table, stat: statReturning(syscall.ENOTCONN)}
+	entry, stale, err := inspector.staleFUSEMount(typed)
+	require.NoError(t, err)
+	require.True(t, stale)
+	require.Equal(t, target, entry.mountPoint)
+}
+
 func TestResolveMountPointSymlinksStopsAtNonSymlink(t *testing.T) {
 	base := t.TempDir()
 	real := filepath.Join(base, "real")

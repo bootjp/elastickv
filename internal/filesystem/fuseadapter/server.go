@@ -494,7 +494,9 @@ type Server struct {
 }
 
 // Mount attaches adapter to mountPoint using go-fuse. The returned server is
-// ready for Serve; callers should call Unmount during shutdown.
+// ready for Serve; callers should call Unmount during shutdown. It is
+// MountContext with a background context; servers that can be told to stop
+// during startup should use MountContext.
 //
 // A dangling FUSE mount left at mountPoint by a server that died without
 // unmounting (SIGKILL, a crash) is detached first, because fusermount3
@@ -503,18 +505,30 @@ type Server struct {
 // is touched; a live FUSE mount or any other filesystem at the path is left
 // alone.
 func Mount(mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Server, error) {
+	return MountContext(context.Background(), mountPoint, adapter, options)
+}
+
+// MountContext is Mount whose pre-mount work (the stale-mount detach and the
+// intent recovery) stops when ctx is cancelled, so a shutdown requested
+// during startup does not wait on a hung fusermount helper, an unavailable
+// leader, or a long recovery backlog. The kernel mount itself and the
+// returned Server are not bound to ctx; Unmount still ends them.
+func MountContext(ctx context.Context, mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Server, error) {
 	if adapter == nil || adapter.core == nil {
 		return nil, errors.New("filesystem FUSE adapter is required")
 	}
 	if strings.TrimSpace(mountPoint) == "" {
 		return nil, errors.New("filesystem FUSE mount point is required")
 	}
-	if _, err := detachStaleMount(context.Background(), mountPoint, slog.Default()); err != nil {
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Wrap(err, "filesystem FUSE mount aborted before start")
+	}
+	if _, err := detachStaleMount(ctx, mountPoint, slog.Default()); err != nil {
 		return nil, errors.Wrap(err, "detach stale filesystem FUSE mount")
 	}
 	opts := defaultMountOptions(options)
 	if recoverer, ok := adapter.core.(intentRecoverer); ok {
-		recoveryCtx, cancel := context.WithTimeout(context.Background(), startupRecoveryTimeout)
+		recoveryCtx, cancel := context.WithTimeout(ctx, startupRecoveryTimeout)
 		recoveryErr := recoverIntentsBeforeMount(recoveryCtx, recoverer)
 		cancel()
 		if recoveryErr != nil {

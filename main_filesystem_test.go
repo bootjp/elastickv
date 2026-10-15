@@ -173,7 +173,24 @@ func TestMountFilesystemServiceFailsOnMissingMountPoint(t *testing.T) {
 		clientID:   "mount-a",
 	}
 
-	server, serveDone, err := mountFilesystemService(svc, config)
+	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
+	require.ErrorContains(t, err, "mount filesystem frontend")
+	require.Nil(t, server)
+	require.Nil(t, serveDone)
+}
+
+// TestMountFilesystemServiceAbortsOnCancelledContext pins that a shutdown
+// requested while the filesystem is still starting stops the pre-mount work
+// instead of letting it run to completion (or to the five-minute recovery
+// timeout) while the signal handler swallows repeat signals.
+func TestMountFilesystemServiceAbortsOnCancelledContext(t *testing.T) {
+	svc := newFilesystemTestService(t)
+	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-cancel"}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	server, serveDone, err := mountFilesystemService(ctx, svc, config)
+	require.ErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, "mount filesystem frontend")
 	require.Nil(t, server)
 	require.Nil(t, serveDone)
@@ -196,7 +213,7 @@ func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 	svc := newFilesystemTestService(t)
 	config := filesystemStartConfig{mountPoint: t.TempDir(), clientID: "mount-a", mountOptions: testFUSEMountOptions()}
 
-	server, serveDone, err := mountFilesystemService(svc, config)
+	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
 	if err != nil {
 		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
 	}

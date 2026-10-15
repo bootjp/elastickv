@@ -126,7 +126,7 @@ func TestShutdownSignalUnmountsFilesystem(t *testing.T) {
 		clientID:     "mount-signal",
 		mountOptions: testFUSEMountOptions(),
 	}
-	server, serveDone, err := mountFilesystemService(svc, config)
+	server, serveDone, err := mountFilesystemService(context.Background(), svc, config)
 	if err != nil {
 		skipOrFailWithoutFuse(t, "FUSE mount unavailable: %v", err)
 	}

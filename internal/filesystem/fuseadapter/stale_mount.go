@@ -191,17 +191,17 @@ func mountPointCandidates(mountPoint string) (map[string]bool, error) {
 	candidates := map[string]bool{}
 	for _, path := range []string{abs, resolveMountPointSymlinks(abs)} {
 		candidates[path] = true
-		if parent, err := filepath.EvalSymlinks(filepath.Dir(path)); err == nil {
-			candidates[filepath.Join(parent, filepath.Base(path))] = true
-		}
+		candidates[filepath.Join(canonicalParent(path), filepath.Base(path))] = true
 	}
 	return candidates, nil
 }
 
 // resolveMountPointSymlinks follows a symlink used as the mount point itself
 // using only Lstat and Readlink, which never traverse into the (possibly
-// dead) mounted target. It returns path unchanged when it is not a symlink
-// or cannot be read.
+// dead) mounted target. A relative link target is interpreted from the
+// canonical parent directory, as the kernel's pathname resolution does, so
+// a link under a symlinked parent lands where the kernel mounted. It returns
+// path unchanged when it is not a symlink or cannot be read.
 func resolveMountPointSymlinks(path string) string {
 	for hop := 0; hop < maxMountPointSymlinkHops; hop++ {
 		info, err := os.Lstat(path)
@@ -213,11 +213,22 @@ func resolveMountPointSymlinks(path string) string {
 			return path
 		}
 		if !filepath.IsAbs(target) {
-			target = filepath.Join(filepath.Dir(path), target)
+			target = filepath.Join(canonicalParent(path), target)
 		}
 		path = filepath.Clean(target)
 	}
 	return path
+}
+
+// canonicalParent resolves symlinks in the directory holding path without
+// ever stat'ing path itself (which may be a dead mount). It falls back to the
+// lexical parent when resolution fails.
+func canonicalParent(path string) string {
+	parent := filepath.Dir(path)
+	if resolved, err := filepath.EvalSymlinks(parent); err == nil {
+		return resolved
+	}
+	return parent
 }
 
 func isFUSEType(fsType string) bool {
