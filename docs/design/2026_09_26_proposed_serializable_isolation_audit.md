@@ -2885,8 +2885,21 @@ sections defer to is therefore two-sided:
   primary and skips a secondary, removing the last lock row as it does so,
   which an empty lock namespace would then mistake for a clean finish): a
   V1 **primary** COMMIT is rejected with a retryable abort (the coordinator
-  retries the whole transaction as V2 only after the same participant-wide
-  activation barrier), a V1 ABORT is accepted against an
+  aborts the transaction's V1 locks and, for a read-bearing transaction,
+  returns it to the adapter as the same `ErrTxnFormatRetry` a PREPARE
+  rejected by activation produces, so the adapter repeats its reads under
+  a V2 snapshot and recomputes the mutations; corrected in review: at
+  commit time the coordinator holds only the computed mutations and the
+  read-key names, so a V2 retry under a fresh `StartTS` would let a
+  write committed after the original read fall below the new snapshot
+  and pass validation, and a retry under the old `StartTS` would keep
+  the unfenced V1 read's G0 exposure; only a transaction with raw writes
+  and no reads is re-proposed by the coordinator itself as V2, after the
+  same participant-wide activation barrier. Test: a read-bearing V1
+  transaction whose PREPAREs applied before activation and whose primary
+  COMMIT arrives after it sees its locks aborted and its adapter re-read
+  and recompute, and a write committed between the original read and
+  the retry is observed by the retry), a V1 ABORT is accepted against an
   existing legacy lock, and a V1 **secondary** COMMIT is accepted only for
   an identity whose legacy commit record already exists on the primary
   group (the coordinator verifies the record before proposing, as the
@@ -2995,7 +3008,10 @@ sections defer to is therefore two-sided:
   until confirmation is replicated; and by crashing it between the primary
   PREPARE and the secondary PREPAREs: the orphaned primary lock expires,
   the resolver rolls it back, the row becomes terminal with the rollback,
-  and a delayed secondary PREPARE is fenced. This verifies outcomes, rather than
+  a delayed secondary PREPARE then lands as an orphan (the secondary
+  FSM cannot see the primary group's rollback record), the completion
+  scan withholds `txn-v2` while that lock exists, and the resolver aborts
+  it from the primary's rollback record. This verifies outcomes, rather than
   inferring them from an empty lock namespace. A V1 transaction that
   completed in a partial state
   before activation is pre-existing damage that activation cannot detect;
