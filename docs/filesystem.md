@@ -49,9 +49,10 @@ advertises a 255-byte name limit.
 - An existing, empty directory to use as the mount point.
 - Every configured Raft group must have a reachable leader when the server
   starts: root initialization first takes a fenced read across all groups,
-  then creates the root through a transaction on the default group (see
-  [Startup sequence](#startup-sequence)). On a multi-group cluster a group
-  without quorum fails the mount even though the root lives elsewhere.
+  then creates the root through a transaction routed by the catalog to the
+  groups that own the root's inode, home, directory-version and usage keys
+  (see [Startup sequence](#startup-sequence)). On a multi-group cluster a
+  group without quorum fails the mount even if it owns none of those keys.
 
 The official container image (`ghcr.io/bootjp/elastickv`) is built on
 `distroless/static` and does not ship `fusermount3`. To mount from a
@@ -137,9 +138,12 @@ Rules that apply across nodes:
 - Pass identical `--filesystemRoot*` values everywhere. Only the node that
   creates the root applies them; the others find the root already present and
   ignore their own values, so a mismatch is harmless but confusing.
-- Leave `--filesystemClientID` at its default (the Raft ID) unless two mounts
-  would otherwise share an ID. Open-handle leases are keyed by it; two mounts
-  with the same ID would release each other's handles.
+- Leave `--filesystemClientID` at its default (the Raft ID). It is recorded
+  in open-handle lease keys and in the `filesystem FUSE mounted` log line,
+  so a distinct value per mount makes leases and logs attributable to a node.
+  Lease keys also carry a per-open random handle ID, so even two mounts with
+  the same client ID do not interfere with each other's handles; the ID is
+  for operators, not for correctness.
 - A follower mount forwards writes to the leader and fences its reads on the
   leader's commit position before serving them, so a read on any node
   observes every write that completed on any other node before the read
@@ -157,10 +161,12 @@ When `--filesystemMount` is set, the server:
 
 1. Starts its network listeners (gRPC, Redis, and the other enabled
    protocols).
-2. Creates the root directory if it does not exist yet, through a Raft
-   transaction on the default group. Concurrent root creation from several
-   nodes is resolved by write-conflict retries; the losers find the root the
-   first node created.
+2. Creates the root directory if it does not exist yet, through a sharded
+   transaction whose keys (`!fs|ino|`, `!fs|home|`, `!fs|dirv|`, `!fs|usage`)
+   are routed by the catalog; on a single-group cluster that is the default
+   group, on a multi-group cluster it can span several groups. Concurrent
+   root creation from several nodes is resolved by write-conflict retries;
+   the losers find the root the first node created.
 3. Replays filesystem recovery state: safely aborted create/delete intents are
    cleared and unfinished file moves are resumed, in bounded batches, until
    nothing is left.
@@ -240,7 +246,13 @@ loser's system call fails with `EAGAIN` (`Resource temporarily unavailable`)
 at `open`, `write`, `close`, `rename`, or `unlink`. Retry `open`, `write`,
 `rename`, and `unlink`: rewriting the same bytes at the same offset is
 idempotent, and a retried `rename` or `unlink` whose first attempt did apply
-reports `ENOENT`, which tells you it is already done. Never retry `close`:
+reports `ENOENT`, which tells you it is already done. The exception is
+`O_APPEND` across mounts: the kernel picks the append offset from the size it
+last saw and the server writes at that offset, so appends from different
+nodes are not atomic with respect to each other, and retrying one after
+`EAGAIN` can land on an offset another node has since written. Give each
+appending file a single writer, or append through one mount. Never retry
+`close`:
 the kernel has already released the descriptor when it reports the error (the
 `EAGAIN` comes from the lease refresh in the final flush), and a second
 `close` could hit a descriptor another thread has since reused. Treat a
@@ -335,9 +347,20 @@ and the dump-to-snapshot conversion in the
 DynamoDB, S3, Redis, and SQS key families; `!fs|` keys are skipped by the
 scope classifier, so a dump taken from a cluster with a filesystem and
 restored through those runbooks comes back without the file tree. Until a
-filesystem backup adapter exists, back the data up from the mount with
-ordinary file tools (`rsync`, `tar`) while the cluster is healthy, or keep a
-cold copy of the Raft data directories taken with the servers stopped.
+filesystem backup adapter exists, there are two options:
+
+- Copy the tree through the mount with ordinary file tools (`rsync`, `tar`).
+  Those tools read each file on its own, not from one filesystem-wide
+  snapshot, so quiesce the writers first (and have `mmap` users
+  `msync` their mappings); a copy taken under live writes can mix versions of
+  different files or catch a file between two FUSE write requests.
+- Keep a cold copy of every node's Raft data directory, taken with the
+  servers stopped. With data-at-rest encryption enabled the copy must also
+  include the key sidecar (`--encryptionSidecarPath`, which may live outside
+  the data directory) and the KEK source configuration (`--kekFile` /
+  `--kekUri`); restoring data without its sidecar leaves the values
+  unrecoverable, and the KEK is never part of any backup. See the
+  [encryption design](design/2026_04_29_partial_data_at_rest_encryption.md).
 
 ## Troubleshooting
 
