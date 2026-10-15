@@ -372,7 +372,8 @@ Filesystem metrics are served on the usual `--metricsAddress` endpoint when
 | `elastickv_fs_orphan_inode_gc_pending` | Unlinked inodes whose chunks are still waiting for garbage collection. |
 | `elastickv_fs_files_by_group{group_id}` | Files homed on each Raft group. |
 | `elastickv_fs_file_multi_shard_current`, `elastickv_fs_file_multi_shard_detected_total` | Files whose chunks were found on more than one group. Should stay at zero. |
-| `elastickv_fs_file_move_inflight` | File moves in progress. |
+| `elastickv_fs_file_move_inflight` | Durable file moves not yet completed, from the last placement scan. |
+| `elastickv_fs_file_move_active_local` | File moves this node is currently executing. Per node; sum it across nodes. |
 | `elastickv_fs_home_epoch_conflict_total` | Writes rejected because the file's home was being moved. |
 | `elastickv_fs_file_pinned_hotspot_total` | Split candidates skipped to keep a file on one group. |
 | `elastickv_fs_inode_id_collision_retry_total` | Inode ID allocation retries. |
@@ -381,14 +382,13 @@ The gauges derived from scanning the store (`open_handle_lease_active`,
 `orphan_inode_gc_pending`, `files_by_group`, `file_multi_shard_current`,
 `file_move_inflight`) are refreshed every `--filesystemPlacementScanInterval`
 and describe the whole cluster, and every mounted node exports the same
-value. Aggregate them across nodes with `max`, not `sum`: the Grafana
-dashboard `monitoring/grafana/dashboards/elastickv-filesystem.json` sums
-them, so with three mounted nodes its placement panels show three times the
-real count until that is changed (the chunk I/O counters and the `_total`
-counters are per node and sum correctly). The alert rules in
-`monitoring/prometheus/rules/filesystem.yml` (pinned hotspot, multi-shard
-file, stuck move, pending orphan GC, home epoch conflicts) compare against
-zero, so the summing does not change their outcome.
+value. Aggregate them across nodes with `max`, not `sum`; summing shows N
+times the real count with N mounted nodes. The Grafana dashboard
+`monitoring/grafana/dashboards/elastickv-filesystem.json` and the alert
+rules in `monitoring/prometheus/rules/filesystem.yml` (pinned hotspot,
+multi-shard file, stuck move, pending orphan GC, home epoch conflicts) do so;
+the chunk I/O counters, the `_total` counters and `file_move_active_local`
+are per node and are summed.
 
 ## Backup and restore
 
