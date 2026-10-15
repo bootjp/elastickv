@@ -200,9 +200,14 @@ fusermount3 -uz /mnt/elastickv     # detach the stale mount (umount -l also work
 
 Put the `fusermount3 -uz` step in the service's `ExecStopPost` (systemd) or
 the equivalent hook of your supervisor so an automatic restart does not loop
-on the stale mount. Detaching the mount never loses data: everything is
-already committed in the store, and open handles on the dead mount are
-released by the lease reaper.
+on the stale mount. Detaching the mount loses nothing that a completed
+system call wrote: every `write(2)` that returned is committed in the store,
+and open handles on the dead mount are released by the lease reaper. The one
+exception is `mmap`: stores into a shared mapping sit in the kernel page
+cache until writeback turns them into FUSE write requests, and once the
+server is gone there is no daemon left to commit them. Writers that use
+`mmap` must `msync(MS_SYNC)` (or `fsync`) before the server stops; `mmap`
+coherency is outside what the filesystem guarantees.
 
 ## Semantics worth knowing
 
@@ -232,10 +237,15 @@ is no write-back buffer on the server side. Two caveats:
 **Concurrency.** The backend uses optimistic concurrency. Two callers that
 modify the same file or the same directory at the same moment can race; the
 loser's system call fails with `EAGAIN` (`Resource temporarily unavailable`)
-at `open`, `write`, `close`, `rename`, or `unlink`. Retry the call: rewriting
-the same bytes at the same offset is idempotent, and a retried `rename` or
-`unlink` whose first attempt did apply reports `ENOENT`, which tells you it is
-already done. Applications that expect POSIX serialization under contention
+at `open`, `write`, `close`, `rename`, or `unlink`. Retry `open`, `write`,
+`rename`, and `unlink`: rewriting the same bytes at the same offset is
+idempotent, and a retried `rename` or `unlink` whose first attempt did apply
+reports `ENOENT`, which tells you it is already done. Never retry `close`:
+the kernel has already released the descriptor when it reports the error (the
+`EAGAIN` comes from the lease refresh in the final flush), and a second
+`close` could hit a descriptor another thread has since reused. Treat a
+failed `close` as a signal to redo the higher-level operation through a fresh
+descriptor. Applications that expect POSIX serialization under contention
 must retry on `EAGAIN`.
 
 **Open / replace race across mounts.** FUSE splits `open(2)` into a lookup and
@@ -318,11 +328,16 @@ metrics.
 
 ## Backup and restore
 
-The filesystem has no storage of its own. Its keys are part of the regular
-store, so the [live backup runbook](operations/backup_restore.md) and the
-[snapshot restore runbook](operations/snapshot_restore.md) include the file
-tree. Unmount or quiesce writers before taking a snapshot-based backup if you
-need a crash-consistent view at a single point in time.
+**The logical backup pipeline does not cover the filesystem.** The live
+backup described in the [live backup runbook](operations/backup_restore.md)
+and the dump-to-snapshot conversion in the
+[snapshot restore runbook](operations/snapshot_restore.md) recognize only the
+DynamoDB, S3, Redis, and SQS key families; `!fs|` keys are skipped by the
+scope classifier, so a dump taken from a cluster with a filesystem and
+restored through those runbooks comes back without the file tree. Until a
+filesystem backup adapter exists, back the data up from the mount with
+ordinary file tools (`rsync`, `tar`) while the cluster is healthy, or keep a
+cold copy of the Raft data directories taken with the servers stopped.
 
 ## Troubleshooting
 
