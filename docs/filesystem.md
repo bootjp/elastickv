@@ -104,8 +104,10 @@ go run . \
   --filesystemRootGID "$(id -g)"
 ```
 
-Wait for the log line `filesystem FUSE mounted` (or `mountpoint -q
-/tmp/elastickv-mount`), then use ordinary commands from another shell:
+Wait for the log line `filesystem FUSE mounted` (or until
+`ls /tmp/elastickv-mount` succeeds; `mountpoint -q` alone is not enough,
+see [Startup sequence](#startup-sequence)), then use ordinary commands from
+another shell:
 
 ```bash
 mkdir /tmp/elastickv-mount/docs
@@ -423,7 +425,7 @@ filesystem backup adapter exists, there are two options:
 |---|---|
 | Server exits with `mount filesystem frontend: ...` naming `fusermount3` or `fusermount` as not found in `$PATH` | `fuse3` is not installed or not on `PATH`. Install it, or run the server outside the distroless image. |
 | Server exits with `initialize filesystem root: ... leader not found` | The node could not reach a Raft leader at startup. Start or repair the cluster first; for per-node joins, mount on the bootstrap node first and on peers after they joined. |
-| `mkdir: cannot create directory: Permission denied` right after the first mount | The root directory is owned by UID 0 with mode `0755`. Start with `--filesystemRootUID` / `--filesystemRootGID` set to the writing user (only effective before the root exists) or `chown` the mount point as root. |
+| `mkdir: cannot create directory: Permission denied` right after the first mount | The root directory is owned by UID 0 with mode `0755`. Start with `--filesystemRootUID` / `--filesystemRootGID` set to the writing user (only effective before the root exists). If the root already exists, repair it as described under [Single node](#single-node): restart one server as root and `chown` the mount point from a root shell; a root shell cannot reach a mount made by another user, and that user cannot `chown` a root-owned directory. |
 | `Transport endpoint is not connected` on the mount point | The server process stopped (any signal ends it without unmounting). Run `fusermount3 -uz <mount-point>` (or `umount -l`), then restart the server. |
 | Restart exits with `fusermount3: failed to access mountpoint ...: Transport endpoint is not connected` | The previous mount is still attached. Detach it with `fusermount3 -uz` first; see [Stopping and restarting](#stopping-and-restarting). |
 | `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry the call, with two exceptions: never retry `close`, and do not retry an `O_APPEND` write that other mounts may also be appending to. See [Concurrency](#semantics-worth-knowing) for what a retry reports when the first attempt did apply. |
