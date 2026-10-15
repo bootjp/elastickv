@@ -566,12 +566,32 @@ func newServerContext(ctx context.Context, fs fuse.RawFileSystem, mountPoint str
 		}
 		return res.server, nil
 	case <-ctx.Done():
-		go func() {
-			if res := <-results; res.server != nil {
-				_ = res.server.Unmount()
-			}
-		}()
+		go releaseAbandonedMount(results, mountPoint)
 		return nil, errors.Wrap(ctx.Err(), "filesystem FUSE mount cancelled while waiting for the mount helper")
+	}
+}
+
+// releaseAbandonedMount tears down a mount that completed after MountContext
+// had already given up on it. go-fuse's NewServer registers the event loop
+// with its wait group and Unmount waits for that group, but only Serve runs
+// the loop that releases it, so Serve must be running for Unmount to return;
+// the loop exits by itself once the kernel unmount closes the connection. A
+// failed unmount falls back to the lazy detach so no kernel mount is left
+// behind.
+func releaseAbandonedMount(results <-chan newServerResult, mountPoint string) {
+	res := <-results
+	if res.server == nil {
+		return
+	}
+	go res.server.Serve()
+	if err := res.server.Unmount(); err == nil {
+		return
+	}
+	slog.Warn("filesystem FUSE unmount of an abandoned mount failed, detaching lazily", "mount_point", mountPoint)
+	ctx, cancel := context.WithTimeout(context.Background(), detachCommandTimeout)
+	defer cancel()
+	if _, err := detachFUSEMount(ctx, mountPoint); err != nil {
+		slog.Warn("filesystem FUSE lazy detach of an abandoned mount failed", "mount_point", mountPoint, "err", err)
 	}
 }
 
