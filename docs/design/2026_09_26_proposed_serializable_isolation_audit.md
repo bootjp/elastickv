@@ -2937,9 +2937,29 @@ sections defer to is therefore two-sided:
   upgrade for good). The row therefore exists exactly when the primary
   lock does: a crash before the primary PREPARE leaves nothing, and a
   crash after it leaves a lock the resolver already settles (TTL expiry,
-  rollback), whose settlement makes the row terminal in the same entry; a
-  secondary PREPARE carries the primary identity and is fenced by the
-  existing primary-lock check once the primary has rolled back. Because
+  rollback), whose settlement makes the row terminal in the same entry. A
+  secondary PREPARE delayed past that rollback is **not** fenced at apply
+  (corrected in review: `rejectPrepareAfterRollback` runs only for a
+  PREPARE naming the primary key, and the rollback record lives on the
+  primary group alone, so a secondary group's FSM cannot see it): it
+  creates a lock and intent under an identity whose row is already
+  terminal, an orphan the drain treats like any other legacy lock. It
+  can never commit, because the primary's rollback record makes every
+  COMMIT under the identity fail (`commitApplyStartTS`,
+  `ErrTxnAlreadyAborted`) and the identity stays reserved until
+  activation; the resolver, or any reader that meets the lock, settles it
+  from that record with an ABORT; and the row's per-key confirmation is
+  not the gate's last word for it, since the completion step reads the
+  lock namespace itself ("no legacy-shape lock row left") after the
+  activation epoch has applied on every data group, and after activation
+  the FSM rejects a delayed V1 PREPARE outright, so a delayed secondary
+  PREPARE either lands before activation, where that scan finds its lock
+  and the resolver aborts it before the marker is written, or is
+  rejected. Test: a ledger-era secondary PREPARE delayed past the
+  primary's TTL rollback and the row's terminal confirmation lands, the
+  resolver aborts it from the rollback record, the completion step's scan
+  finds the lock and withholds the marker until it is gone, and the same
+  PREPARE arriving after activation is rejected. Because
   the row rides in the primary PREPARE, the coordinator sizes that
   PREPARE with the row against `maxMarshaledCommandSize` before admission
   and refuses the transaction with the client-visible size error when it
