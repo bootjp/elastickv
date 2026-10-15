@@ -326,9 +326,11 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   `.fsm` snapshot into a vendor-independent per-adapter directory tree and
   back. The decoder skips the store's reserved metadata keys
   (`_meta_last_commit_ts` and its siblings) through a mirror of the store's
-  classifier pinned by cross-check tests, so it reads snapshots taken from
-  a live Pebble store as well as encoder-produced ones (fixed in #1267,
-  merged 2026-10-15 as `95889d1f`). (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
+  classifier pinned by cross-check tests, so it reads cleartext snapshots
+  taken from a live Pebble store as well as encoder-produced ones (fixed in
+  #1267, merged 2026-10-15 as `95889d1f`); a live snapshot from a store
+  with at-rest encryption enabled still fails on its first encrypted entry
+  (`ErrSnapshotEncryptedEntry`), an open limitation. (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
   `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`)
 - **logical backup (Phase 1)** — Live, cluster-wide point-in-time extraction
   across Raft groups through `BeginBackup` / `RenewBackup` / `EndBackup`, in
