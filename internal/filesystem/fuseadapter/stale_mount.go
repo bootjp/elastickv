@@ -39,6 +39,13 @@ const (
 	// mount does not need the server, so detaching it never blocks on I/O,
 	// but a hung suid helper must not stall startup forever.
 	detachCommandTimeout = 10 * time.Second
+	// detachHelperBudgetShare is the fraction (1/n) of the caller's remaining
+	// deadline one helper invocation may use, so a hung helper cannot spend
+	// the whole budget and starve the privileged unmount(2) fallback.
+	detachHelperBudgetShare = 2
+	// detachHelperWaitDelay bounds how long a killed helper's output pipes
+	// are waited for (exec.Cmd.WaitDelay).
+	detachHelperWaitDelay = 500 * time.Millisecond
 	// maxStaleMountDetaches bounds the detach loop. Each iteration removes
 	// the topmost stale mount at the path; several only stack up when a
 	// server was restarted over a dangling mount more than once.
@@ -355,6 +362,20 @@ func lookupMountHelper(name string) (string, error) {
 	return path, nil
 }
 
+// detachHelperTimeout bounds one helper invocation: detachCommandTimeout,
+// or a share of whatever is left of the caller's deadline, so that when the
+// helper hangs the privileged unmount(2) fallback still runs inside the
+// caller's budget instead of being skipped behind an expired context.
+func detachHelperTimeout(ctx context.Context) time.Duration {
+	timeout := detachCommandTimeout
+	if deadline, ok := ctx.Deadline(); ok {
+		if share := time.Until(deadline) / detachHelperBudgetShare; share < timeout {
+			timeout = share
+		}
+	}
+	return timeout
+}
+
 // detachFUSEMount lazily detaches the FUSE mount at mountPoint through the
 // same helpers go-fuse's own unmount uses: the suid fusermount3 (or legacy
 // fusermount) binary with `-u -z`, which works for unprivileged users, and
@@ -370,9 +391,13 @@ func detachFUSEMount(ctx context.Context, mountPoint string) (string, error) {
 		if err != nil {
 			continue
 		}
-		cmdCtx, cancel := context.WithTimeout(ctx, detachCommandTimeout)
+		cmdCtx, cancel := context.WithTimeout(ctx, detachHelperTimeout(ctx))
 		//nolint:gosec // bin comes from LookPath over two fixed helper names and mountPoint is the operator's configured path.
 		cmd := exec.CommandContext(cmdCtx, bin, "-u", "-z", mountPoint)
+		// After the context kills the helper, do not wait on its output
+		// pipes for longer than this: a child the helper left behind could
+		// otherwise hold them open past the budget.
+		cmd.WaitDelay = detachHelperWaitDelay
 		output, err := cmd.CombinedOutput()
 		cancel()
 		if err == nil {

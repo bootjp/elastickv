@@ -26,7 +26,7 @@ func TestMountContextAbortsWhileMountHelperHangs(t *testing.T) {
 	// a descriptor; it exits on its own so no process outlives the test by
 	// much.
 	helper := filepath.Join(helperDir, "fusermount3")
-	require.NoError(t, os.WriteFile(helper, []byte("#!/bin/sh\nsleep 3\nexit 1\n"), 0o700)) //nolint:gosec // the helper stand-in must be executable.
+	require.NoError(t, os.WriteFile(helper, []byte("#!/bin/sh\nexec /bin/sleep 3\n"), 0o700)) //nolint:gosec // the helper stand-in must be executable.
 	t.Setenv("PATH", helperDir)
 
 	svc, err := fstest.NewMemoryService()
@@ -42,5 +42,7 @@ func TestMountContextAbortsWhileMountHelperHangs(t *testing.T) {
 	require.ErrorIs(t, err, context.DeadlineExceeded)
 	require.ErrorContains(t, err, "waiting for the mount helper")
 	require.Nil(t, server)
-	require.Less(t, time.Since(start), 2*time.Second, "MountContext must return on cancellation, not when the helper exits")
+	elapsed := time.Since(start)
+	require.GreaterOrEqual(t, elapsed, 150*time.Millisecond, "the helper must really have been waited on until the deadline")
+	require.Less(t, elapsed, 2*time.Second, "MountContext must return on cancellation, not when the helper exits")
 }

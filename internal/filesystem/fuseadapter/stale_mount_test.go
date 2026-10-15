@@ -427,6 +427,46 @@ func TestLookupMountHelperFallsBackLikeGoFuse(t *testing.T) {
 	require.Equal(t, wantOnPath, got)
 }
 
+// TestDetachFUSEMountReachesKernelFallbackWhenHelperHangs puts a fusermount3
+// stand-in that never finishes on PATH and gives the detach a short deadline.
+// The helper must be cut off before the deadline so the privileged
+// unmount(2) fallback is still attempted (here on a plain directory, so it
+// fails with its own error rather than the deadline's).
+func TestDetachFUSEMountReachesKernelFallbackWhenHelperHangs(t *testing.T) {
+	helperDir := t.TempDir()
+	helper := filepath.Join(helperDir, "fusermount3")
+	require.NoError(t, os.WriteFile(helper, []byte("#!/bin/sh\nexec /bin/sleep 5\n"), 0o700)) //nolint:gosec // the helper stand-in must be executable.
+	t.Setenv("PATH", helperDir)
+	ctx, cancel := context.WithTimeout(context.Background(), 400*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	method, err := detachFUSEMount(ctx, t.TempDir())
+	t.Logf("detach error: %v", err)
+	require.Error(t, err)
+	require.Empty(t, method)
+	require.NotErrorIs(t, err, context.DeadlineExceeded, "the deadline must not pre-empt the kernel fallback")
+	require.ErrorContains(t, err, lazyUnmountMethod)
+	elapsed := time.Since(start)
+	require.GreaterOrEqual(t, elapsed, 150*time.Millisecond, "the helper must have been given its share of the deadline")
+	require.Less(t, elapsed, 2*time.Second)
+}
+
+func TestDetachHelperTimeoutSharesRemainingDeadline(t *testing.T) {
+	require.Equal(t, detachCommandTimeout, detachHelperTimeout(context.Background()))
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	timeout := detachHelperTimeout(ctx)
+	require.Greater(t, timeout, time.Duration(0))
+	require.LessOrEqual(t, timeout, time.Second/detachHelperBudgetShare)
+
+	expired, cancelExpired := context.WithTimeout(context.Background(), time.Nanosecond)
+	defer cancelExpired()
+	time.Sleep(time.Millisecond)
+	require.LessOrEqual(t, detachHelperTimeout(expired), time.Duration(0))
+}
+
 func TestDetachFUSEMountReportsCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
