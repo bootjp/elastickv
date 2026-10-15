@@ -2870,7 +2870,33 @@ sections defer to is therefore two-sided:
   resolver does), so a transaction that reached its commit point before
   activation is published, and a missing lock there fails loudly with
   `ErrTxnWriteLost` rather than skipping. The resolver settles every
-  remaining legacy lock from its primary's record. The coordinator flips
+  remaining legacy lock from its primary's record, and V2 transactions
+  run next to those settlements without waiting for the drain (checked
+  in review: a legacy transaction with a durable primary record at `c`
+  and a secondary lock not yet settled cannot give a V2 transaction a
+  stale observation, because the lock row, written at the legacy
+  `StartTS` below `c`, is visible to every V2 snapshot read at `s ≥ c`,
+  and the read settles it before returning: the point read resolves the
+  lock from the primary's record and lands the secondary COMMIT at `c`
+  before reading the key (`leaderGetAt` → `maybeResolveTxnLock`, which
+  A0's `leaderReadAt` keeps), the scan paths plan the resolutions,
+  apply them, and re-read every locked key (`resolveScanLocks` →
+  `materializeScanLockResults`), a pending primary fails the read with
+  `txn locked`, and a non-leader proxies to the leader; so an
+  observation at `s ≥ c` includes `c`, an observation at `s` between
+  the legacy `StartTS` and `c` excludes `c` and its PREPARE finds
+  `latest = c > s`, and a read below the legacy `StartTS`, which sees no
+  lock, is followed by a PREPARE that meets the legacy lock, foreign
+  under A2, or finds `latest = c > s`: a conflict every way. Pausing V2
+  admission until the drain completes would stall every write for the
+  drain's duration, bounded below by the lock TTL, for no further
+  safety. Test: a legacy transaction whose primary COMMIT at `c` is
+  durable and whose secondary lock is unsettled, then activation; a V2
+  transaction reads the secondary key at `s ≥ c`, observes the version
+  at `c` with the secondary COMMIT landed through the read, and its
+  PREPARE on that key succeeds; a V2 transaction that read at `s` below
+  `c` has its PREPARE refused; and the scan form of both). The
+  coordinator flips
   its atomic `txnFormatV2` (`WithTxnFormatV2`, subsuming
   `WithTransactionIDs`) when it applies the activation entry on every group
   it coordinates, and never flips it back; the point at which the audit's
