@@ -759,9 +759,10 @@ func isPebbleOperationalKey(rawKey []byte) bool {
 // Pebble snapshot stream, is one of the store's reserved metadata keys
 // (`_meta_last_commit_ts`, the retention and applied-index markers, the
 // migration records, the encryption writer registry) rather than an MVCC
-// version. Offline readers of a live store's snapshot skip such keys: they
-// carry no user data and do not follow the `<key><inverted ts>` /
-// `<value header><body>` layout.
+// version. It is the live side of the classifier that
+// internal/backup/snapshot_reader.go mirrors for the offline decoder,
+// which must not link this package; the mirror's tests call it to pin the
+// two sides against each other.
 func IsPebbleOperationalKey(rawKey []byte) bool {
 	return isPebbleOperationalKey(rawKey)
 }

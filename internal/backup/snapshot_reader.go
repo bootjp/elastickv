@@ -6,7 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 
-	"github.com/bootjp/elastickv/store"
+	"github.com/bootjp/elastickv/internal/encryption"
 	cockroachdberr "github.com/cockroachdb/errors"
 )
 
@@ -237,6 +237,41 @@ func ReadSnapshotWithHeader(r io.Reader, fn func(SnapshotHeader, SnapshotEntry) 
 	}
 }
 
+// pebbleOperationalKeys are the live store's reserved metadata keys as
+// they appear, verbatim, in a native snapshot stream: mirrors
+// store/lsm_store.go (metaLastCommitTS, metaMinRetainedTS,
+// metaPendingMinRetainedTS, metaAppliedIndex) and
+// store/migration_versions.go (migrationAckMetaKey,
+// migrationHLCFloorMetaKey, migrationPromoteMetaKey). Duplicated here,
+// like the format constants above, so this package links no live-store
+// machinery; TestIsPebbleOperationalKey_MatchesStore and
+// TestIsPebbleOperationalKey_AgreesWithStoreOnLiveStream pin the mirror
+// against store.IsPebbleOperationalKey.
+var pebbleOperationalKeys = [][]byte{
+	[]byte("_meta_last_commit_ts"),
+	[]byte("_meta_min_retained_ts"),
+	[]byte("_meta_pending_min_retained_ts"),
+	[]byte("_meta_applied_index"),
+	[]byte("_migack"),
+	[]byte("_mighlc"),
+	[]byte("_migpromote"),
+}
+
+// isPebbleOperationalKey mirrors store.isPebbleMetaKey: the reserved keys
+// above plus the encryption writer-registry rows, which the live store
+// recognises by the same shape test encryption.IsRegistryKey applies
+// (prefix, fixed length, separator). Such keys carry no user data and
+// follow neither the inverted-timestamp key layout nor the value-header
+// layout, so the reader skips them.
+func isPebbleOperationalKey(rawKey []byte) bool {
+	for _, reserved := range pebbleOperationalKeys {
+		if bytes.Equal(rawKey, reserved) {
+			return true
+		}
+	}
+	return encryption.IsRegistryKey(rawKey)
+}
+
 // readOneEntry handles one (key, value) tuple plus the callback
 // dispatch. Extracted from ReadSnapshot so the parent stays under
 // the cyclop budget — the same shape every backup encoder uses
@@ -266,7 +301,7 @@ func readOneEntry(
 	// next to the MVCC versions. They have neither the inverted-timestamp
 	// key suffix nor the value header, so decoding one fails the whole
 	// read; they carry no user data, so the reader skips them.
-	if store.IsPebbleOperationalKey(key) {
+	if isPebbleOperationalKey(key) {
 		return false, nil
 	}
 	entry, err := decodeSnapshotEntry(key, value)
