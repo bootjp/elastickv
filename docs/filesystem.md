@@ -191,8 +191,9 @@ watchdog trips (which still exits with status 2). If the unmount fails because
 a client still holds files on the mount open (`EBUSY`), the server detaches
 the mount lazily instead: new lookups see the plain directory at once, the
 open handles keep working until they are closed, and the server waits at most
-10 seconds for the kernel to release the connection before finishing its
-shutdown, so a stop never hangs on a busy mount.
+10 seconds in total for the unmount and for the kernel to release the
+connection before finishing its shutdown, so a stop never hangs on a busy
+mount or on a request stuck in the backend.
 
 `SIGKILL`, an OOM kill, or a crash cannot run that cleanup, and the kernel
 keeps the now-dead mount attached. Until it is detached, every access to the

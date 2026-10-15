@@ -252,17 +252,16 @@ func mountPointCandidates(mountPoint string) (map[string]bool, error) {
 }
 
 // resolveMountPointSymlinks follows a symlink used as the mount point itself
-// using only Lstat and Readlink, which never traverse into the (possibly
-// dead) mounted target. A relative link target is interpreted from the
-// canonical parent directory, as the kernel's pathname resolution does, so
-// a link under a symlinked parent lands where the kernel mounted. It returns
-// path unchanged when it is not a symlink or cannot be read.
+// using only Readlink. Readlink on a non-symlink fails with EINVAL from the
+// dentry type alone, so unlike Lstat it never sends a getattr through a
+// FUSE mount covering the path: a dead mount cannot fail it and a live but
+// wedged server cannot block it (that case is left to the bounded probe).
+// A relative link target is interpreted from the canonical parent
+// directory, as the kernel's pathname resolution does, so a link under a
+// symlinked parent lands where the kernel mounted. It returns path unchanged
+// when it is not a symlink or cannot be read.
 func resolveMountPointSymlinks(path string) string {
 	for hop := 0; hop < maxMountPointSymlinkHops; hop++ {
-		info, err := os.Lstat(path)
-		if err != nil || info.Mode()&os.ModeSymlink == 0 {
-			return path
-		}
 		target, err := os.Readlink(path)
 		if err != nil {
 			return path

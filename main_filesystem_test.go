@@ -279,12 +279,20 @@ func TestInstallFilesystemServerLifecycleUnmountsOnContextCancel(t *testing.T) {
 // failure paths of the lifecycle can be driven without a kernel mount.
 type fakeFilesystemMountServer struct {
 	unmountErr error
-	lazyErr    error
-	onLazy     func()
-	lazyCalls  int
+	// unmountBlock, when set, makes Unmount block until it is closed, like
+	// go-fuse waiting for an event loop stuck in a backend request.
+	unmountBlock <-chan struct{}
+	lazyErr      error
+	onLazy       func()
+	lazyCalls    int
 }
 
-func (f *fakeFilesystemMountServer) Unmount() error { return f.unmountErr }
+func (f *fakeFilesystemMountServer) Unmount() error {
+	if f.unmountBlock != nil {
+		<-f.unmountBlock
+	}
+	return f.unmountErr
+}
 
 func (f *fakeFilesystemMountServer) UnmountLazy(context.Context) error {
 	f.lazyCalls++
@@ -354,6 +362,37 @@ func TestInstallFilesystemServerLifecycleBoundsWaitWhenServeLoopStalls(t *testin
 		t.Fatal("lifecycle hung on a serve loop that never stops")
 	}
 	require.Equal(t, 1, server.lazyCalls)
+	cleanup.Run()
+}
+
+// go-fuse's Unmount waits for its event loops; one stuck in a backend
+// request never returns. The shutdown must not wait on it past the budget.
+func TestInstallFilesystemServerLifecycleBoundsHungUnmount(t *testing.T) {
+	shortenFilesystemServeStopTimeout(t, 50*time.Millisecond)
+	ctx, cancel := context.WithCancel(context.Background())
+	eg, egCtx := errgroup.WithContext(ctx)
+	cleanup := &internalutil.CleanupStack{}
+	serveDone := make(chan struct{}) // never closed
+	block := make(chan struct{})
+	release := sync.OnceFunc(func() { close(block) })
+	t.Cleanup(release)
+	server := &fakeFilesystemMountServer{unmountBlock: block}
+
+	installFilesystemServerLifecycle(egCtx, eg, cleanup, server, serveDone, "/mnt/fs")
+	cancel()
+
+	waitDone := make(chan error, 1)
+	go func() { waitDone <- eg.Wait() }()
+	select {
+	case err := <-waitDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("lifecycle hung on an Unmount that never returns")
+	}
+	require.Equal(t, 1, server.lazyCalls)
+	// cleanup.Run calls the once-wrapped unmount, which waits for the first,
+	// still-blocked call; release it first.
+	release()
 	cleanup.Run()
 }
 
