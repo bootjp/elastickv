@@ -15,8 +15,9 @@ data on it that you cannot recreate.
   as the other protocols. Every node of the cluster can mount the filesystem;
   all mounts show the same tree.
 - Offset reads and writes, sparse files, truncate (shrink and extend), `chmod`,
-  `chown`, `utimes`, same-directory `rename`, `mkdir`/`rmdir`, `unlink` while a
-  file is still open, resumable `readdir`, and `statfs`.
+  `chown`, `utimes`, plain same-directory `rename` (no `renameat2` flags),
+  `mkdir`/`rmdir`, `unlink` while a file is still open, resumable `readdir`,
+  and `statfs`.
 - Every metadata change and every FUSE write request is one Raft-committed
   transaction. When a system call returns, the change is durable on a quorum,
   and any other mount that opens the file afterwards reads it (see
@@ -29,6 +30,7 @@ Not supported (the kernel receives an explicit error, never a silent no-op):
 | Operation | Result |
 |---|---|
 | `rename` across directories | `EXDEV` (GNU `mv` then falls back to copy + delete, which is not atomic) |
+| `renameat2` with flags (`RENAME_NOREPLACE`, `RENAME_EXCHANGE`, `RENAME_WHITEOUT`) | `EOPNOTSUPP` (only a flag-less `rename` is served) |
 | Hard links (`link`) | `EOPNOTSUPP` |
 | Symbolic links (`symlink`, `readlink`) | `EOPNOTSUPP` |
 | POSIX advisory locks (`flock`, `fcntl` locks) | **Succeed, but only within one mount.** The kernel handles locks locally and never forwards them to the server, so two processes on different nodes can both hold "exclusive" locks on the same file. Do not rely on locks for cross-node coordination. |
@@ -137,7 +139,12 @@ Rules that apply across nodes:
 
 - Pass identical `--filesystemRoot*` values everywhere. Only the node that
   creates the root applies them; the others find the root already present and
-  ignore their own values, so a mismatch is harmless but confusing.
+  ignore their own values. The root owner and mode are stored once and are
+  enforced by the kernel on every mount (`default_permissions`), so the
+  cluster needs one numeric UID/GID that the processes using the mount share
+  on every node. If the first node to start wins with the wrong values, the
+  mounts on the other nodes are read-only for their users until an
+  administrator fixes it with `chown`/`chmod` on the root from any mount.
 - Leave `--filesystemClientID` at its default (the Raft ID). It is recorded
   in open-handle lease keys and in the `filesystem FUSE mounted` log line,
   so a distinct value per mount makes leases and logs attributable to a node.
@@ -168,8 +175,10 @@ When `--filesystemMount` is set, the server:
    root creation from several nodes is resolved by write-conflict retries;
    the losers find the root the first node created.
 3. Replays filesystem recovery state: safely aborted create/delete intents are
-   cleared and unfinished file moves are resumed, in bounded batches, until
-   nothing is left.
+   cleared and unfinished file moves are resumed, in batches of 256, until
+   nothing is left. The whole replay must finish within 5 minutes; if it does
+   not, the mount fails and the server exits. Recovery is resumable, so
+   restarting the server continues where the previous attempt stopped.
 4. Mounts the directory with `fusermount3`, waits for the kernel to confirm
    the mount, and logs `filesystem FUSE mounted` with the mount point and
    client ID.
@@ -177,10 +186,15 @@ When `--filesystemMount` is set, the server:
 
 Because the listeners come up before the mount, a readiness check on the gRPC
 or Redis port is not enough for clients that use the mount. Check the
-mount point itself:
+mount point itself, and issue an I/O request against it rather than only
+consulting the mount table, so that a mount left behind by a previous server
+process (see [Stopping and restarting](#stopping-and-restarting)) does not
+pass the check:
 
 ```bash
-until mountpoint -q /mnt/elastickv; do sleep 1; done
+until mountpoint -q /mnt/elastickv && ls /mnt/elastickv >/dev/null 2>&1; do
+  sleep 1
+done
 ```
 
 A mount failure is fatal: the server exits rather than running without the
@@ -270,7 +284,9 @@ removes the name immediately; the data stays readable through the open handle
 and is garbage-collected after the last handle is released. Each open handle
 holds a lease (5 minutes, refreshed on every read and write through that
 handle). If a mount dies without releasing its handles, the leases expire and
-the lease reaper on any mounted node reclaims the space.
+the lease reaper reclaims the space. The reaper runs only on mounted nodes
+whose `--filesystemLeaseReapInterval` is positive (the default is 30s);
+if every mount disables it, space held by dead handles is never returned.
 
 **Directory listing.** `readdir` captures a snapshot of the directory when
 the listing starts and pages through that snapshot, so entries created or
