@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -612,6 +613,79 @@ func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
 	meta, err := store.UnmarshalHashMeta(raw)
 	require.NoError(t, err)
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
+// newSplitRedisShardStore returns a ShardStore whose catalog sends user keys
+// below "m" to group 1 and the rest to group 2, the way a multi-shard
+// deployment splits the Redis keyspace.
+func newSplitRedisShardStore() *kv.ShardStore {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	return kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	})
+}
+
+// A node scans each data group it leads for legacy TTL anchors. The bare anchor
+// prefixes ("!redis|str|", "!hs|meta|", ...) resolve to the first route only, so
+// a route-checked group scan refused every other group: anchors outside the
+// first route were never migrated and every tick failed. Run the migrator over a
+// real split ShardStore and require the anchors of both groups to migrate.
+func TestDeltaCompactor_TTLInlineMigratesEveryLocalLeaderShard(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newSplitRedisShardStore()
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1, 2},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	expireAt := time.Now().Add(time.Hour)
+	// One key on each side of the split per anchor type.
+	stringKeys := [][]byte{[]byte("apple"), []byte("zebra")}
+	hashKeys := [][]byte{[]byte("aardvark"), []byte("yak")}
+	legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta, 1)
+	ts := uint64(0)
+	seed := func(key, value []byte) {
+		ts++
+		require.NoError(t, st.PutAt(ctx, key, value, ts, 0))
+	}
+	for _, key := range stringKeys {
+		seed(redisStrKey(key), []byte("legacy-value"))
+		seed(redisTTLKey(key), encodeRedisTTL(expireAt))
+	}
+	for _, key := range hashKeys {
+		seed(store.HashMetaKey(key), legacyMeta)
+		seed(redisTTLKey(key), encodeRedisTTL(expireAt))
+	}
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	for _, key := range stringKeys {
+		raw, err := st.GetAt(ctx, redisStrKey(key), readTS)
+		require.NoError(t, err)
+		require.Truef(t, isNewRedisStrFormat(raw), "string %q was not migrated", key)
+		value, ttl, err := decodeRedisStr(raw)
+		require.NoError(t, err)
+		require.Equal(t, []byte("legacy-value"), value)
+		require.NotNil(t, ttl)
+		require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(*ttl))
+	}
+	for _, key := range hashKeys {
+		raw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
+		require.NoError(t, err)
+		meta, err := store.UnmarshalHashMeta(raw)
+		require.NoError(t, err)
+		require.Equalf(t, redisExpireAtMillis(expireAt), meta.ExpireAt, "hash %q was not migrated", key)
+	}
 }
 
 // capabilityHidingCompactionCoordinator forwards only the kv.Coordinator
