@@ -10,7 +10,7 @@ import (
 func TestRouteDescriptorFromProtoPreservesMigrationFields(t *testing.T) {
 	t.Parallel()
 
-	route, err := routeDescriptorFromProto(&pb.RouteDescriptor{
+	route, err := RouteDescriptorFromProto(&pb.RouteDescriptor{
 		RouteId:                7,
 		Start:                  []byte("a"),
 		End:                    []byte("z"),

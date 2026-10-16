@@ -49,17 +49,6 @@ func encodeStreamMetaValue(length int64, lastMs, lastSeq uint64) []byte {
 	return v
 }
 
-func encodeStreamMetaValueWithTrimCursor(length int64, lastMs, lastSeq, expireAtMs, trimmedMs, trimmedSeq uint64) []byte {
-	v := make([]byte, store.StreamMetaTrimBinarySize)
-	binary.BigEndian.PutUint64(v[0:8], uint64(length)) //nolint:gosec
-	binary.BigEndian.PutUint64(v[8:16], lastMs)
-	binary.BigEndian.PutUint64(v[16:24], lastSeq)
-	binary.BigEndian.PutUint64(v[24:32], expireAtMs)
-	binary.BigEndian.PutUint64(v[32:40], trimmedMs)
-	binary.BigEndian.PutUint64(v[40:48], trimmedSeq)
-	return v
-}
-
 // encodeStreamEntryValue produces the magic-prefixed protobuf wire
 // format the live store writes for !stream|entry| values.
 func encodeStreamEntryValue(t *testing.T, id string, fields []string) []byte {
@@ -528,15 +517,37 @@ func TestRedisDB_StreamRejectsMalformedMetaValueLength(t *testing.T) {
 	}
 }
 
-func TestRedisDB_StreamAcceptsTrimCursorMetaValue(t *testing.T) {
+// TestRedisStreamSizesMirrorLiveStore pins the stream size constants
+// backup re-declares (it must not import store) to the live ones.
+func TestRedisStreamSizesMirrorLiveStore(t *testing.T) {
+	t.Parallel()
+	if redisStreamMetaTrimSize != store.StreamMetaTrimBinarySize {
+		t.Fatalf("redisStreamMetaTrimSize = %d, store.StreamMetaTrimBinarySize = %d",
+			redisStreamMetaTrimSize, store.StreamMetaTrimBinarySize)
+	}
+	if redisStreamIDBytes != store.StreamIDBytes {
+		t.Fatalf("redisStreamIDBytes = %d, store.StreamIDBytes = %d", redisStreamIDBytes, store.StreamIDBytes)
+	}
+}
+
+// TestRedisDB_StreamMetaMirrorsLiveStore cross-checks the stream-meta
+// mirror against the live store: the meta and entry keys and the
+// current meta value come from store's own encoders, and the decoded
+// length, last ID and TTL must match what was written.
+func TestRedisDB_StreamMetaMirrorsLiveStore(t *testing.T) {
 	t.Parallel()
 	db, root := newRedisDB(t)
-	meta := encodeStreamMetaValueWithTrimCursor(1, 200, 3, 123456, 100, 1)
-	if err := db.HandleStreamMeta(streamMetaKey("s"), meta); err != nil {
+	meta, err := store.MarshalStreamMeta(store.StreamMeta{
+		Length: 1, LastMs: 200, LastSeq: 3, ExpireAt: 123456, TrimmedMs: 100, TrimmedSeq: 1,
+	})
+	if err != nil {
+		t.Fatalf("MarshalStreamMeta: %v", err)
+	}
+	if err := db.HandleStreamMeta(store.StreamMetaKey([]byte("s")), meta); err != nil {
 		t.Fatalf("HandleStreamMeta: %v", err)
 	}
 	val := encodeStreamEntryValue(t, "200-3", []string{"k", "v"})
-	if err := db.HandleStreamEntry(streamEntryKey("s", 200, 3), val); err != nil {
+	if err := db.HandleStreamEntry(store.StreamEntryKey([]byte("s"), 200, 3), val); err != nil {
 		t.Fatalf("HandleStreamEntry: %v", err)
 	}
 	if err := db.Finalize(); err != nil {

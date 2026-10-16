@@ -78,7 +78,8 @@ func (s *S3Server) storeS3UploadPart(ctx context.Context, request *http.Request,
 		return s3ChunkUploadResult{}, nil, nil, err
 	}
 	upload, bodyErr, err := s.uploadS3Chunks(ctx, s3ChunkUploadConfig{
-		request:           request,
+		body:              request.Body,
+		contentLength:     request.ContentLength,
 		streamBody:        streamBody,
 		admissionProtocol: admissionProtocol,
 		tooLargeMessage:   "part exceeds maximum allowed size",

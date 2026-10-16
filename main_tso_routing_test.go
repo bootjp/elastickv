@@ -75,7 +75,7 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	wiring, err := configureCoordinatorTSO(coord, groups, mainTSOFloorProvider{floor: 42})
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
-	decorated := kv.WithKeyVizLabel(startupGatedCoordinator{inner: coord}, keyviz.LabelRedis)
+	decorated := kv.WithKeyVizLabel(newStartupGatedCoordinator(coord, nil), keyviz.LabelRedis)
 
 	readTS, err := kv.BeginReadTimestampThrough(context.Background(), decorated, 42, "test decorated phase D")
 	require.NoError(t, err)
@@ -177,7 +177,7 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	t.Parallel()
 	allocator := &mainTimestampAllocator{next: 123}
 	coord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
-	gated := startupGatedCoordinator{inner: coord, gate: &startupPublicKVGate{}}
+	gated := newStartupGatedCoordinator(coord, &startupPublicKVGate{})
 
 	got, ok := kv.TimestampAllocatorThrough(gated)
 	require.True(t, ok)
@@ -192,7 +192,7 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 
 	runtimeAllocator := kv.NewDynamicTimestampAllocator(nil)
 	runtimeCoord := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(runtimeAllocator)
-	runtimeGated := startupGatedCoordinator{inner: runtimeCoord, gate: &startupPublicKVGate{}}
+	runtimeGated := newStartupGatedCoordinator(runtimeCoord, &startupPublicKVGate{})
 	got, ok = kv.TimestampAllocatorThrough(runtimeGated)
 	require.True(t, ok)
 	require.IsType(t, startupGatedCoordinator{}, got)
@@ -201,7 +201,7 @@ func TestInternalTimestampOptionsPreservesTSOThroughStartupGate(t *testing.T) {
 	require.Same(t, runtimeAllocator, configured)
 	require.Len(t, internalTimestampOptions(runtimeGated), 3)
 
-	legacy := startupGatedCoordinator{inner: newMainTSOCoordinator(kv.NewHLC(), nil)}
+	legacy := newStartupGatedCoordinator(newMainTSOCoordinator(kv.NewHLC(), nil), nil)
 	// No TSO allocator underneath: only the write gate and the forwarded-write
 	// observer, which the gate wrapper satisfies unconditionally.
 	require.Len(t, internalTimestampOptions(legacy), 2)
@@ -212,7 +212,7 @@ func TestInternalTimestampOptionsPreservesForwardObserverThroughStartupGate(t *t
 	allocator := &mainTimestampAllocator{next: 123}
 	inner := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
 	observing := &mainForwardObservingCoordinator{ShardedCoordinator: inner}
-	gated := startupGatedCoordinator{inner: observing}
+	gated := newStartupGatedCoordinator(observing, nil)
 	opts := internalTimestampOptions(gated)
 	require.Len(t, opts, 3)
 
@@ -248,7 +248,7 @@ func TestInternalForwardUsesRuntimeAllocatorAfterModeReload(t *testing.T) {
 	t.Cleanup(func() { require.NoError(t, wiring.Close()) })
 	require.Equal(t, kv.TSOModeLegacy, wiring.runtimeController.CurrentMode())
 
-	gated := startupGatedCoordinator{inner: coord, gate: &startupPublicKVGate{}}
+	gated := newStartupGatedCoordinator(coord, &startupPublicKVGate{})
 	opts := internalTimestampOptions(gated)
 	require.Len(t, opts, 3)
 
@@ -574,7 +574,7 @@ func TestInternalTimestampOptionsPreservesPhaseDValidatorThroughStartupGate(t *t
 
 	allocator := &phaseDMainAllocator{floor: 100}
 	inner := newMainTSOCoordinator(kv.NewHLC(), nil).WithTSOAllocator(allocator)
-	gated := startupGatedCoordinator{inner: inner, gate: &startupPublicKVGate{}}
+	gated := newStartupGatedCoordinator(inner, &startupPublicKVGate{})
 
 	installed, ok := kv.ConfiguredTimestampAllocatorThrough(gated)
 	require.True(t, ok)
