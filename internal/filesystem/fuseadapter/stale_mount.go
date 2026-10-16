@@ -478,6 +478,40 @@ func unescapeMountTableField(field string) string {
 // variable so tests can point it at a directory they control.
 var mountHelperFallbackDir = "/bin"
 
+// lookupMountHelperFn locates a helper; a variable so tests can stand in a
+// lookup that blocks, as exec.LookPath does when a PATH directory sits on an
+// unresponsive filesystem.
+var lookupMountHelperFn = lookupMountHelper
+
+// lookupMountHelperContext runs the helper lookup under the same share of
+// ctx's deadline a helper invocation gets. exec.LookPath stats each PATH
+// directory and nothing can interrupt a stat blocked on a wedged FUSE or
+// network filesystem, so the lookup runs in its own goroutine and only the
+// wait is bounded; a lookup that does not answer in time counts as the
+// helper not being found, which keeps the kernel fallback reachable.
+func lookupMountHelperContext(ctx context.Context, name string) (string, error) {
+	type lookupResult struct {
+		path string
+		err  error
+	}
+	results := make(chan lookupResult, 1)
+	lookup := lookupMountHelperFn
+	go func() {
+		path, err := lookup(name)
+		results <- lookupResult{path: path, err: err}
+	}()
+	timer := time.NewTimer(detachHelperTimeout(ctx))
+	defer timer.Stop()
+	select {
+	case res := <-results:
+		return res.path, res.err
+	case <-ctx.Done():
+		return "", errors.Wrapf(ctx.Err(), "locate mount helper %s", name)
+	case <-timer.C:
+		return "", errors.Errorf("locate mount helper %s: no answer within its share of the detach budget", name)
+	}
+}
+
 // lookupMountHelper finds a fusermount helper the way go-fuse does: PATH
 // first, then mountHelperFallbackDir.
 func lookupMountHelper(name string) (string, error) {
@@ -547,7 +581,8 @@ func detachFUSEMount(ctx context.Context, mountPoint, fsType string) (string, er
 var detachMountHelpers = []string{"fusermount3", "fusermount"}
 
 // detachWithHelpers runs `fusermount3 -u -z`, then `fusermount -u -z`, each
-// under its share of the deadline. It returns the mechanism on success;
+// under its share of the deadline, as is the lookup of each helper. It
+// returns the mechanism on success;
 // otherwise the last helper's failure, or nil when no helper was found.
 // Before a helper runs after a failed one, the mounts table is checked
 // again: the failed helper may still have detached our mount (it reports
@@ -558,7 +593,7 @@ var detachMountHelpers = []string{"fusermount3", "fusermount"}
 func detachWithHelpers(ctx context.Context, mountPoint, fsType string) (string, error) {
 	var helperErr error
 	for _, helper := range detachMountHelpers {
-		bin, err := lookupMountHelper(helper)
+		bin, err := lookupMountHelperContext(ctx, helper)
 		if err != nil {
 			continue
 		}
