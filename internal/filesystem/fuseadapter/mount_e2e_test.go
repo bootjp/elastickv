@@ -32,11 +32,19 @@ func mountMemoryFilesystem(t *testing.T) string {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
+	return mountMemoryService(t, newMemoryServiceForMount(t), "e2e-mount")
+}
+
+func newMemoryServiceForMount(t *testing.T) *filesystem.Service {
+	t.Helper()
 	svc, err := fstest.NewMemoryService(filesystem.WithChunkSize(e2eChunkSize))
 	require.NoError(t, err)
-	uid, gid := uint32(os.Getuid()), uint32(os.Getgid()) //nolint:gosec // test process ids fit uint32.
-	require.NoError(t, svc.InitializeRoot(t.Context(), e2eRootMode, uid, gid))
-	return mountMemoryService(t, svc, "e2e-mount")
+	info, err := os.Stat(t.TempDir())
+	require.NoError(t, err)
+	owner, ok := info.Sys().(*syscall.Stat_t)
+	require.True(t, ok)
+	require.NoError(t, svc.InitializeRoot(t.Context(), e2eRootMode, owner.Uid, owner.Gid))
+	return svc
 }
 
 func mountMemoryService(t *testing.T, svc *filesystem.Service, clientID string) string {
@@ -73,10 +81,7 @@ func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
-	svc, err := fstest.NewMemoryService(filesystem.WithChunkSize(e2eChunkSize))
-	require.NoError(t, err)
-	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
-	require.NoError(t, svc.InitializeRoot(t.Context(), e2eRootMode, uid, gid))
+	svc := newMemoryServiceForMount(t)
 
 	mountA := mountMemoryService(t, svc, "e2e-mount-a")
 	mountB := mountMemoryService(t, svc, "e2e-mount-b")
