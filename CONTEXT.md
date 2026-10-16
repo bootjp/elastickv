@@ -330,8 +330,10 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   decodable offline, and a dump is not a complete restore source: it can
   omit committed data (a write whose secondary lock was still unresolved,
   a value staged by an in-flight range migration, and keyspaces outside
-  those four adapters, such as gRPC RawKV and filesystem keys), and dumps
-  of several groups do not share a point in time.
+  those four adapters, such as gRPC RawKV and filesystem keys), it ignores
+  storage-level expiry, it reflects the snapshot's applied index rather
+  than the Raft log after it, and dumps of several groups do not share a
+  point in time.
   (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
   `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`,
   `docs/design/2026_09_26_proposed_positioning_and_roadmap.md` §4)
