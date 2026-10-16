@@ -30,7 +30,7 @@ func TestAdapterCoordinatorChainForwardsLocalLeaderGroups(t *testing.T) {
 	t.Parallel()
 
 	inner := localLeaderGroupsCoordinator{groups: []uint64{1, 3}}
-	chain := kv.WithKeyVizLabel(startupGatedCoordinator{inner: inner, gate: &startupPublicKVGate{}}, keyviz.LabelRedis)
+	chain := kv.WithKeyVizLabel(newStartupGatedCoordinator(inner, &startupPublicKVGate{}), keyviz.LabelRedis)
 
 	groups, ok := chain.(interface{ LocalLeaderGroupIDs() []uint64 })
 	require.True(t, ok, "the adapter coordinator chain must expose LocalLeaderGroupIDs")

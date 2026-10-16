@@ -2103,10 +2103,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		in.distServer.SetReadGate(publicKVGate.blocked)
 	}
 	installHLCLeaseRenewalBlocker(in.coordinate, waitRotateOnStartup.BlockMutators)
-	adapterCoordinate := startupGatedCoordinator{
-		inner: in.coordinate,
-		gate:  publicKVGate,
-	}
+	adapterCoordinate := newStartupGatedCoordinator(in.coordinate, publicKVGate)
 	runner := runtimeServerRunner{
 		ctx:                in.ctx,
 		lc:                 in.lc,
@@ -2708,9 +2705,19 @@ func (a adminGRPCInterceptors) empty() bool {
 	return len(a.unary) == 0 && len(a.stream) == 0
 }
 
+// startupGatedCoordinator is the coordinator main hands the adapters. While
+// the startup gate is closed (encryption rotate-on-startup) it refuses
+// dispatches and timestamp allocation; everything else, including every
+// optional capability the adapters type-assert, is forwarded by the embedded
+// kv.CoordinatorForwarder.
 type startupGatedCoordinator struct {
-	inner kv.Coordinator
-	gate  *startupPublicKVGate
+	kv.CoordinatorForwarder
+
+	gate *startupPublicKVGate
+}
+
+func newStartupGatedCoordinator(inner kv.Coordinator, gate *startupPublicKVGate) startupGatedCoordinator {
+	return startupGatedCoordinator{CoordinatorForwarder: kv.CoordinatorForwarder{Inner: inner}, gate: gate}
 }
 
 var _ kv.Coordinator = (*startupGatedCoordinator)(nil)
@@ -2728,243 +2735,45 @@ var _ kv.AppliedReadTimestampVoucherRevoker = (*startupGatedCoordinator)(nil)
 var _ kv.AppliedReadTimestampVoucherSupport = (*startupGatedCoordinator)(nil)
 var _ kv.MutationWriteGate = (*startupGatedCoordinator)(nil)
 
+func (c startupGatedCoordinator) closed() bool {
+	return c.gate != nil && c.gate.blocked()
+}
+
+// errStartupGateClosed carries codes.Unavailable. The stack wrapper keeps it
+// reachable: grpc's status.FromError and the HTTP adapters' error mappers
+// unwrap to the status, so callers still see Unavailable / 503.
+func errStartupGateClosed() error {
+	return errors.WithStack(status.Error(codes.Unavailable, "startup rotation has not completed"))
+}
+
 func (c startupGatedCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	if c.gate != nil && c.gate.blocked() {
-		return nil, status.Error(codes.Unavailable, "startup rotation has not completed") //nolint:wrapcheck // Preserve the gRPC status for adapters.
+	if c.closed() {
+		return nil, errStartupGateClosed()
 	}
-	return c.inner.Dispatch(ctx, reqs) //nolint:wrapcheck // Pass through coordinator errors unchanged.
+	resp, err := c.CoordinatorForwarder.Dispatch(ctx, reqs)
+	return resp, errors.WithStack(err)
 }
 
-func (c startupGatedCoordinator) IsLeader() bool {
-	return c.inner.IsLeader()
-}
-
-func (c startupGatedCoordinator) VerifyLeader(ctx context.Context) error {
-	return c.inner.VerifyLeader(ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-func (c startupGatedCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
-	return c.inner.LinearizableRead(ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-func (c startupGatedCoordinator) RaftLeader() string {
-	return c.inner.RaftLeader()
-}
-
-func (c startupGatedCoordinator) IsLeaderForKey(key []byte) bool {
-	return c.inner.IsLeaderForKey(key)
-}
-
-func (c startupGatedCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
-	return c.inner.VerifyLeaderForKey(ctx, key) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-func (c startupGatedCoordinator) RaftLeaderForKey(key []byte) string {
-	return c.inner.RaftLeaderForKey(key)
-}
-
-func (c startupGatedCoordinator) Clock() *kv.HLC {
-	return c.inner.Clock()
-}
-
+// TimestampAllocator returns the gate itself, so timestamps allocated through
+// kv.TimestampAllocatorThrough are refused while the gate is closed too.
 func (c startupGatedCoordinator) TimestampAllocator() kv.TimestampAllocator {
 	return c
 }
 
-func (c startupGatedCoordinator) ConfiguredTimestampAllocator() kv.TimestampAllocator {
-	alloc, _ := kv.ConfiguredTimestampAllocatorThrough(c.inner)
-	return alloc
-}
-
-func (c startupGatedCoordinator) innerTimestampAllocator() (kv.TimestampAllocator, bool) {
-	if c.inner == nil {
-		return nil, false
-	}
-	return kv.TimestampAllocatorThrough(c.inner)
-}
-
-func (c startupGatedCoordinator) PhaseDActive() bool {
-	alloc, ok := c.innerTimestampAllocator()
-	if !ok {
-		return false
-	}
-	phaseD, ok := alloc.(kv.TSOPhaseDState)
-	return ok && phaseD.PhaseDActive()
-}
-
-func (c startupGatedCoordinator) PhaseDRequired() bool {
-	alloc, ok := c.innerTimestampAllocator()
-	if !ok {
-		return false
-	}
-	phaseD, ok := alloc.(kv.TSOPhaseDState)
-	return ok && phaseD.PhaseDRequired()
-}
-
-func (c startupGatedCoordinator) ValidateDurableTimestamp(ctx context.Context, timestamp uint64) error {
-	alloc, ok := c.innerTimestampAllocator()
-	if !ok {
-		return errors.WithStack(kv.ErrTSOProtocolUnsupported)
-	}
-	validator, ok := alloc.(kv.DurableTimestampValidator)
-	if !ok {
-		return errors.WithStack(kv.ErrTSOProtocolUnsupported)
-	}
-	return errors.WithStack(validator.ValidateDurableTimestamp(ctx, timestamp))
-}
-
 func (c startupGatedCoordinator) Next(ctx context.Context) (uint64, error) {
-	if c.gate != nil && c.gate.blocked() {
-		return 0, status.Error(codes.Unavailable, "startup rotation has not completed") //nolint:wrapcheck // Preserve the gRPC status for adapters.
+	if c.closed() {
+		return 0, errStartupGateClosed()
 	}
-	if alloc, ok := c.inner.(kv.TimestampAllocator); ok {
-		ts, err := alloc.Next(ctx)
-		return ts, errors.WithStack(err)
-	}
-	ts, err := kv.NextTimestampThrough(ctx, c.inner, "startup-gated timestamp")
+	ts, err := c.CoordinatorForwarder.Next(ctx)
 	return ts, errors.WithStack(err)
 }
 
 func (c startupGatedCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
-	if c.gate != nil && c.gate.blocked() {
-		return 0, status.Error(codes.Unavailable, "startup rotation has not completed") //nolint:wrapcheck // Preserve the gRPC status for adapters.
+	if c.closed() {
+		return 0, errStartupGateClosed()
 	}
-	if alloc, ok := c.inner.(kv.TimestampAfterAllocator); ok {
-		ts, err := alloc.NextAfter(ctx, min)
-		return ts, errors.WithStack(err)
-	}
-	ts, err := kv.NextTimestampAfterThrough(ctx, c.inner, min, "startup-gated timestamp after observed ts")
+	ts, err := c.CoordinatorForwarder.NextAfter(ctx, min)
 	return ts, errors.WithStack(err)
-}
-
-func (c startupGatedCoordinator) RecoverHLCLease(ctx context.Context) error {
-	type hlcLeaseRecoverer interface {
-		RecoverHLCLease(context.Context) error
-	}
-	if recoverer, ok := c.inner.(hlcLeaseRecoverer); ok {
-		return errors.WithStack(recoverer.RecoverHLCLease(ctx))
-	}
-	return errors.New("startup-gated coordinator: hlc lease recovery unavailable")
-}
-
-func (c startupGatedCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref kv.AppliedReadTimestampVoucherRef) error {
-	voucher, ok := c.inner.(kv.AppliedReadTimestampVoucher)
-	if !ok {
-		return errors.WithStack(kv.ErrTSOProtocolUnsupported)
-	}
-	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
-}
-
-func (c startupGatedCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref kv.AppliedReadTimestampVoucherRef) {
-	if revoker, ok := c.inner.(kv.AppliedReadTimestampVoucherRevoker); ok {
-		revoker.RevokeAppliedReadTimestamp(timestamp, ref)
-	}
-}
-
-func (c startupGatedCoordinator) SupportsAppliedReadTimestampVoucher() bool {
-	if support, ok := c.inner.(kv.AppliedReadTimestampVoucherSupport); ok {
-		return support.SupportsAppliedReadTimestampVoucher()
-	}
-	_, ok := c.inner.(kv.AppliedReadTimestampVoucher)
-	return ok
-}
-
-func (c startupGatedCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
-	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-func (c startupGatedCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	return kv.LeaseReadForKeyThrough(c.inner, ctx, key) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-func (c startupGatedCoordinator) LeaseReadAllGroups(ctx context.Context) error {
-	return kv.LeaseReadAllGroupsThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-func (c startupGatedCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
-	return kv.LeaseReadAllGroupsTimestampThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-// IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
-// group-keyed read-fence path. Without them this wrapper silently fails the
-// kv.GroupLeaderRoutableCoordinator assertion in the Redis fence and every
-// target falls back to key resolution, which is exactly the collapse
-// kv.ReadFenceTarget exists to prevent -- and it would not show up in tests that
-// use an unwrapped coordinator.
-func (c startupGatedCoordinator) IsLeaderForGroup(groupID uint64) bool {
-	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
-	if !ok {
-		return false
-	}
-	return router.IsLeaderForGroup(groupID)
-}
-
-func (c startupGatedCoordinator) RaftLeaderForGroup(groupID uint64) string {
-	router, ok := c.inner.(kv.GroupLeaderRoutableCoordinator)
-	if !ok {
-		return ""
-	}
-	return router.RaftLeaderForGroup(groupID)
-}
-
-func (c startupGatedCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
-	if lr, ok := c.inner.(interface {
-		LeaseReadForGroup(context.Context, uint64) (uint64, error)
-	}); ok {
-		return lr.LeaseReadForGroup(ctx, groupID) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-	}
-	// No group-keyed lease read underneath (single-group Coordinate). Fall back
-	// to the plain lease read rather than a key-resolved one: there is no key to
-	// resolve here, and the single group is the one being fenced anyway.
-	return kv.LeaseReadThrough(c.inner, ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
-}
-
-// Internal.Forward re-applies the route write floor and records forwarded-write
-// samples on the leader. Both reach the handler through an optional-interface
-// probe in internalTimestampOptions, and the value probed there is this wrapper
-// -- not the ShardedCoordinator it holds. Without these two forwards the probe
-// fails, follower-forwarded raw and transactional commits skip the
-// MinWriteTSExclusive check entirely, and forwarded-write sampling goes dark.
-func (c startupGatedCoordinator) EnsureMutationsWriteAllowed(muts []*pb.Mutation, commitTS uint64) error {
-	gate, ok := c.inner.(kv.MutationWriteGate)
-	if !ok {
-		// Single-group Coordinate owns no route table, so it has no write
-		// floors to enforce. Allowing the write matches the behaviour of
-		// leaving the gate unset.
-		return nil
-	}
-	return gate.EnsureMutationsWriteAllowed(muts, commitTS) //nolint:wrapcheck // Pass through the coordinator's gate error unchanged.
-}
-
-func (c startupGatedCoordinator) ObserveForwardedRequests(reqs []*pb.Request) {
-	observer, ok := c.inner.(interface{ ObserveForwardedRequests([]*pb.Request) })
-	if !ok {
-		return
-	}
-	observer.ObserveForwardedRequests(reqs)
-}
-
-func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
-	if router, ok := c.inner.(kv.GroupRoutableCoordinator); ok {
-		return router.EngineGroupIDForKey(key)
-	}
-	return 0
-}
-
-func (c startupGatedCoordinator) RaftMembers(ctx context.Context) ([]kv.RaftMember, error) {
-	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
-	if !ok {
-		return nil, errors.WithStack(kv.ErrLeaderNotFound)
-	}
-	return provider.RaftMembers(ctx) //nolint:wrapcheck // Preserve membership lookup errors.
-}
-
-func (c startupGatedCoordinator) RaftMembersForKey(ctx context.Context, key []byte) ([]kv.RaftMember, error) {
-	provider, ok := c.inner.(kv.RaftMembershipCoordinator)
-	if !ok {
-		return nil, errors.WithStack(kv.ErrLeaderNotFound)
-	}
-	return provider.RaftMembersForKey(ctx, key) //nolint:wrapcheck // Preserve membership lookup errors.
 }
 
 type startupPublicKVGate struct {
