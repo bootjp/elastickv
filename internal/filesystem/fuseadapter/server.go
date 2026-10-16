@@ -832,17 +832,25 @@ func (s *Server) Unmount() error {
 
 // UnmountLazy detaches the mount from the namespace even while clients still
 // hold files on it open (`fusermount -u -z`, or a lazy unmount(2)): new
-// lookups see the plain directory at once, open handles keep working until
-// they are closed, and the kernel releases the FUSE connection, ending
-// Serve, once the last one is gone. It is the fallback for an Unmount that
-// failed with EBUSY or did not return during shutdown. It acts only on a
-// mount of this server's own type still present at the mount point: when
-// the kernel mount is already gone (Unmount removed it and is merely waiting
-// for its event loop), or a filesystem of any other type is exposed there,
-// nothing is touched and nil is returned. A nil or never-mounted Server is a
-// no-op.
+// lookups see the plain directory at once, and the kernel releases the FUSE
+// connection, ending Serve, once the last open handle is closed. It is the
+// fallback for an Unmount that failed with EBUSY or did not return during
+// shutdown, so it first stops serving: every request in flight, and every
+// one that arrives later, has its context cancelled. A handler blocked in
+// the backend (the reason the Unmount hung) therefore returns before the
+// stores behind it are closed, and requests through a handle that is still
+// open get an error from then on. The detach itself acts only on a mount of
+// this server's own type still present at the mount point: when the kernel
+// mount is already gone (Unmount removed it and is merely waiting for its
+// event loop), or a filesystem of any other type is exposed there, nothing
+// is touched and nil is returned. A nil or never-mounted Server is a no-op
+// apart from the cancellation.
 func (s *Server) UnmountLazy(ctx context.Context) error {
-	if s == nil || s.inner == nil || s.mountPoint == "" {
+	if s == nil {
+		return nil
+	}
+	s.fs.cancelInFlight()
+	if s.inner == nil || s.mountPoint == "" {
 		return nil
 	}
 	_, err := detachFUSEMount(ctx, s.mountPoint, s.fsType)

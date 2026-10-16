@@ -238,11 +238,13 @@ a supervisor's second stop attempt cannot cut the cleanup short.
 This is the same path the server takes when a component fails or the memory
 watchdog trips (which still exits with status 2). If the unmount fails because
 a client still holds files on the mount open (`EBUSY`), the server detaches
-the mount lazily instead: new lookups see the plain directory at once, the
-open handles keep working until they are closed, and the server waits at most
-10 seconds in total for the unmount and for the kernel to release the
-connection before finishing its shutdown, so a stop never hangs on a busy
-mount or on a request stuck in the backend. That lazy detach, like the
+the mount lazily instead: new lookups see the plain directory at once, and
+the server stops serving, so a request still in flight, or one made through
+a handle that is still open, returns an error instead of running against
+stores that are about to close. The server waits at most 10 seconds in total
+for the unmount and for the kernel to release the connection before
+finishing its shutdown, so a stop never hangs on a busy mount or on a
+request stuck in the backend. That lazy detach, like the
 startup check, only ever acts on a mount the mounts table lists with the
 server's own type (`fuse.elastickv`): if the kernel mount is already gone by
 then, whatever filesystem the mount point sits on, another FUSE filesystem
