@@ -15,6 +15,12 @@ Date: 2026-04-29
 > `docs/operations/snapshot_restore.md`. This doc
 > remains the format owner; the encoder doc owns the reverse-direction
 > wire-format reconstruction.
+>
+> **Addendum (2026-10-16):** the decoder as first shipped read only the
+> raw store stream, so a file a running node persists did not decode,
+> and a store stream with MVCC history produced a wrong dump. §"Reading
+> files a running node persists" records the gaps and the fix, and
+> corrects the framing description in §"Background".
 
 ## Background
 
@@ -726,6 +732,65 @@ bespoke parser, the format has failed its goal.
 |------|---|
 | `FuzzFilenameEncoding` | Encoder/decoder never panics and is bijective on arbitrary byte input |
 | `BenchmarkSnapshotDecodeThroughput` | Establishes baseline throughput per adapter so Phase 1 has a regression target |
+
+## Reading files a running node persists (addendum, 2026-10-16)
+
+Found in review of the positioning roadmap (#1275), after #1267 taught
+the reader to skip the store's reserved metadata keys: the decoder still
+could not read the `fsm-snap/<index>.fsm` a node writes, and on a raw
+store stream with history it produced a wrong dump. Each gap and the
+decoder's answer:
+
+- **Framing.** A persisted file is not the raw store stream §"Background"
+  describes. `kvFSMSnapshot.WriteTo` (`kv/snapshot.go`) writes an FSM
+  snapshot header in front of the store payload (`EKVTHLC1`: magic and
+  ceiling ms; `EKVTHLC2`: magic, a BE uint16 length, ceiling ms, cutover
+  index, and optional extension bytes), and `writeFSMSnapshotPayload`
+  (`internal/raftengine/etcd`) appends a 4-byte BE CRC32C (Castagnoli)
+  footer over everything before it. `backup.ReadSnapshotFile` accepts
+  that file, a raw store payload (encoder output), and a raw payload
+  followed by the footer (what a header-less node persisted). With a
+  header the footer is required and verified; without one it is
+  recognised when the last four bytes equal the CRC32C of the rest. The
+  verified value goes into MANIFEST `source.fsm_crc32c`, a field this doc
+  defined and the CLI never filled.
+- **MVCC history.** The store streams every physical version of a key
+  (`userKey || BE(^commitTS)` in bytewise order, so newest first), not
+  the one version per key an encoder-produced snapshot holds. Routing
+  each version wrote older values over newer ones and resurrected a
+  deleted key from the version under its tombstone. The decoder now
+  keeps each key's newest version and drops the key when that version is
+  a tombstone. Versions of one key need not be adjacent, since a key that
+  extends another can sort between them, so the filter tracks the keys
+  that are prefixes of the current encoded key, and it fails closed on
+  out-of-order input. `DecodeCounters.Superseded` counts the hidden
+  versions.
+- **SST ingest format.** With `ELASTICKV_PEBBLE_SST_INGEST_SNAPSHOT` on,
+  the store payload is the `EKVSSTI1` bundle: a manifest with its
+  SHA-256, then the SST files. The decoder verifies the manifest and each
+  file's digest, checks that the files' key ranges are ordered and
+  disjoint, and reads each SST with Pebble's sstable reader, yielding the
+  same entries as the legacy stream. This is the one place the package
+  links a storage library, because the files are in Pebble's format.
+- **Key budget.** The reader capped keys at the 1 MiB logical size, while
+  the store streams stored keys up to `MaxSnapshotStoredKeySize`, 1 MiB
+  plus a 32-byte internal envelope such as migration staging. The reader
+  now accepts the stored budget; the encoder keeps the logical cap for
+  the user keys it writes.
+- **File names.** The engine names a file `%016x.fsm`, in hex, and
+  `SnapshotIndexFromPath` parsed the stem as decimal, so
+  `0000000000000040.fsm` read back as index 40 instead of 64. A 16-digit
+  hex stem now parses as hex; any other stem keeps the decimal parse.
+
+Still out of scope: encrypted entries (`ErrSnapshotEncryptedEntry`; the
+decoder links no keyring). Expiry handling is unchanged.
+
+Tests: the CLI decodes a `.fsm` persisted through the engine's writer
+(`PreparePhysicalSnapshotRestore`) and records its footer in the
+manifest; a live store with an overwrite and a delete dumps the newest
+value and no deleted key, through the legacy stream and through the SST
+bundle; an interleaving case and a rapid property test pin the filter;
+framing, header, footer, and SST corruption cases fail with typed errors.
 
 ## References
 
