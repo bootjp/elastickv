@@ -15,9 +15,9 @@ import (
 )
 
 // groupScanRecordingStore stands in for the *kv.ShardStore the Redis delta
-// compactor holds in production. Exposing ScanGroupAt is what lets the
+// compactor holds in production. Exposing ScanGroupOwnedAt is what lets the
 // TTL-inline migrator plan one scan per locally led group instead of a
-// full-keyspace scan.
+// whole-prefix scan.
 type groupScanRecordingStore struct {
 	store.MVCCStore
 
@@ -33,7 +33,7 @@ func (s *groupScanRecordingStore) ScanAt(ctx context.Context, start []byte, end 
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
 }
 
-func (s *groupScanRecordingStore) ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *groupScanRecordingStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	s.mu.Lock()
 	if s.groupScans == nil {
 		s.groupScans = make(map[uint64][]string)
@@ -105,5 +105,5 @@ func TestRedisTTLInlineMigrationScansLocalLeaderGroupsThroughStartupGate(t *test
 		seen[start] = struct{}{}
 	}
 	require.NotContains(t, fullScans, store.HashMetaPrefix,
-		"the migrator must not fall back to a full-keyspace scan when the groups are known")
+		"the migrator must not fall back to a whole-prefix scan when the groups are known")
 }

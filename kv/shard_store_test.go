@@ -1512,6 +1512,91 @@ func TestShardStoreScanGroupAt_DeduplicatesRouteMappedSameGroupSplits(t *testing
 	require.Equal(t, []*store.KVPair{{Key: key, Value: []byte("msg-2")}}, kvs)
 }
 
+func newSplitRedisShardStoreForGroupScan() (*ShardStore, map[uint64]*ShardGroup) {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	}
+	return NewShardStore(engine, groups), groups
+}
+
+// The Redis TTL-inline migrator walks each anchor prefix one locally led group at
+// a time. A bare prefix resolves to the first route only, so ScanGroupAt refuses
+// every other group; ScanGroupOwnedAt must return each group's share, both for
+// anchors keyed directly by the user key and for length-prefixed ones.
+func TestShardStoreScanGroupOwnedAt_ReturnsEachGroupsShareOfAPrefix(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		prefix []byte
+		key    func(userKey string) []byte
+	}{
+		{
+			name:   "string anchors",
+			prefix: []byte("!redis|str|"),
+			key:    func(userKey string) []byte { return []byte("!redis|str|" + userKey) },
+		},
+		{
+			name:   "hash meta anchors",
+			prefix: []byte(store.HashMetaPrefix),
+			key:    func(userKey string) []byte { return store.HashMetaKey([]byte(userKey)) },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st, groups := newSplitRedisShardStoreForGroupScan()
+			owned := map[uint64][]byte{1: tc.key("apple"), 2: tc.key("zebra")}
+			for gid, key := range owned {
+				require.NoError(t, groups[gid].Store.PutAt(ctx, key, []byte("v"), 5, 0))
+			}
+			end := prefixScanEnd(tc.prefix)
+
+			_, err := st.ScanGroupAt(ctx, 2, tc.prefix, end, 10, 10)
+			require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
+			for gid, key := range owned {
+				kvs, err := st.ScanGroupOwnedAt(ctx, gid, tc.prefix, end, 10, 10)
+				require.NoError(t, err)
+				require.Equalf(t, []*store.KVPair{{Key: key, Value: []byte("v")}}, kvs, "group %d", gid)
+			}
+		})
+	}
+}
+
+// A group's store can still hold keys of a range that has moved to another
+// group. ScanGroupOwnedAt must skip them, and must keep paging past them instead
+// of reporting a short page as the end of the range: hash meta keys are length
+// prefixed, so a stale two-byte key sorts before an owned three-byte one.
+func TestShardStoreScanGroupOwnedAt_SkipsKeysOfRangesTheGroupNoLongerOwns(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st, groups := newSplitRedisShardStoreForGroupScan()
+	stale := store.HashMetaKey([]byte("zz"))
+	owned := store.HashMetaKey([]byte("abc"))
+	require.Negative(t, bytes.Compare(stale, owned), "the stale key must sort first")
+	require.NoError(t, groups[1].Store.PutAt(ctx, stale, []byte("stale"), 5, 0))
+	require.NoError(t, groups[1].Store.PutAt(ctx, owned, []byte("owned"), 5, 0))
+	require.NoError(t, groups[2].Store.PutAt(ctx, stale, []byte("current"), 6, 0))
+	prefix := []byte(store.HashMetaPrefix)
+	end := prefixScanEnd(prefix)
+
+	kvs, err := st.ScanGroupOwnedAt(ctx, 1, prefix, end, 1, 10)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: owned, Value: []byte("owned")}}, kvs,
+		"a page of skipped keys is not the end of the range")
+
+	kvs, err = st.ScanGroupOwnedAt(ctx, 2, prefix, end, 10, 10)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: stale, Value: []byte("current")}}, kvs)
+}
+
 func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
 	t.Parallel()
 

@@ -222,7 +222,7 @@ func (c keyVizLabeledCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 // LocalLeaderGroupIDs forwards which data groups the inner coordinator leads.
 // An inner coordinator without the capability stays unknown instead of
 // answering "no groups": the TTL-inline migrator then falls back to a
-// full-keyspace scan rather than planning nothing.
+// whole-prefix scan rather than planning nothing.
 func (c keyVizLabeledCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) {
 	return LocalLeaderGroupIDsThrough(c.inner)
 }

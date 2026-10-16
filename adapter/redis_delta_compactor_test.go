@@ -576,7 +576,7 @@ func (s *recordingTTLInlineGroupScanStore) ScanAt(ctx context.Context, start []b
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
 }
 
-func (s *recordingTTLInlineGroupScanStore) ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *recordingTTLInlineGroupScanStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
 	s.groupScans = append(s.groupScans, groupID)
 	s.groupStarts = append(s.groupStarts, string(start))
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
@@ -607,7 +607,7 @@ func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
 	require.Contains(t, st.groupScans, uint64(2))
 	require.Contains(t, st.groupStarts, store.HashMetaPrefix)
 	require.NotContains(t, st.fullStarts, store.HashMetaPrefix,
-		"sharded ttl migration should scan candidate metadata with ScanGroupAt")
+		"sharded ttl migration should scan candidate metadata with ScanGroupOwnedAt")
 	raw, err := st.GetAt(ctx, store.HashMetaKey(key), st.LastCommitTS())
 	require.NoError(t, err)
 	meta, err := store.UnmarshalHashMeta(raw)
@@ -697,7 +697,7 @@ type capabilityHidingCompactionCoordinator struct {
 // The coordinator the compactor holds is wrapped in WithKeyVizLabel, which
 // always exposes LocalLeaderGroupIDs. When a decorator underneath hides the
 // capability the answer must stay unknown and the migrator must fall back to a
-// full-keyspace scan; answering "no groups" there planned nothing and silently
+// whole-prefix scan; answering "no groups" there planned nothing and silently
 // stopped the migration in production. A known empty list is different: this
 // node leads no group, so there is nothing for it to migrate.
 func TestDeltaCompactor_TTLInlineScanPlanWhenLocalLeaderGroupsUnknownOrEmpty(t *testing.T) {

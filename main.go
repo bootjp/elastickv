@@ -2971,7 +2971,7 @@ func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 // LocalLeaderGroupIDs forwards the data groups this node leads. The Redis delta
 // compactor reaches it through WithKeyVizLabel to scope the TTL-inline migration
 // to locally led groups; without this forward every node falls back to
-// full-keyspace migration scans.
+// whole-prefix migration scans.
 func (c startupGatedCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) {
 	return kv.LocalLeaderGroupIDsThrough(c.inner)
 }

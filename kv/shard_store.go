@@ -904,6 +904,57 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 	return s.scanExplicitGroupAtWithReadFence(ctx, groupID, start, end, limit, ts, false, 0, nil, nil)
 }
 
+// ScanGroupOwnedAt scans [start, end) on groupID's own store and returns, in key
+// order, up to limit keys whose route groupID currently owns. ScanGroupAt first
+// resolves the requested range through the route catalog, and a bare internal
+// prefix such as "!redis|str|" resolves to the first route only, so it refuses
+// every other group. Maintenance that walks a whole prefix one group at a time
+// uses this instead. The group's store can still hold keys of ranges it no
+// longer owns; those are skipped rather than returned. Fewer than limit results
+// means the range is exhausted. It is meant for the group's own leader: on any
+// other node the read is forwarded, and the leader serves it as ScanGroupAt,
+// which may refuse such a range.
+func (s *ShardStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil
+	}
+	route := distribution.Route{GroupID: groupID}
+	out := make([]*store.KVPair, 0, limit)
+	cursor := start
+	for {
+		if err := ctx.Err(); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		page, err := s.scanRouteAtDirectionWithReadFence(ctx, route, cursor, end, limit, ts, false, true, 0, nil, nil)
+		if err != nil {
+			return nil, err
+		}
+		out = s.appendGroupOwnedKVs(out, page, groupID, limit)
+		if len(out) >= limit || len(page) < limit {
+			return out, nil
+		}
+		cursor = nextScanCursor(lastKVKey(page))
+		if end != nil && bytes.Compare(cursor, end) >= 0 {
+			return out, nil
+		}
+	}
+}
+
+func (s *ShardStore) appendGroupOwnedKVs(out []*store.KVPair, kvs []*store.KVPair, groupID uint64, limit int) []*store.KVPair {
+	for _, kvp := range kvs {
+		if len(out) >= limit {
+			break
+		}
+		if kvp == nil {
+			continue
+		}
+		if route, _, ok := s.routeAndGroupForKey(kvp.Key); ok && route.GroupID == groupID {
+			out = append(out, kvp)
+		}
+	}
+	return out
+}
+
 func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64, reverse bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil

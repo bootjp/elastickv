@@ -23,8 +23,11 @@ type ttlInlineMigrationHandler struct {
 	buildElems     func(context.Context, *store.KVPair, uint64) ([]*kv.Elem[kv.OP], error)
 }
 
+// ttlInlineGroupScanner is *kv.ShardStore in the server. It uses
+// ScanGroupOwnedAt because ScanGroupAt resolves a bare anchor prefix to the
+// first route only and refuses every other group.
 type ttlInlineGroupScanner interface {
-	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+	ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
 }
 
 type ttlInlineMigrationScanPlan struct {
@@ -241,8 +244,8 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 // ttlInlineMigrationScanPlans scans only the groups this node leads when the
 // store can scan one group and the coordinator knows which groups those are. A
 // known empty list means this node leads no group and plans nothing. When the
-// groups are unknown the migrator falls back to one full-keyspace scan,
-// filtered per key by IsLeaderForKey, rather than migrating nothing.
+// groups are unknown the migrator falls back to one ScanAt over the whole
+// prefix, filtered per key by IsLeaderForKey, rather than migrating nothing.
 func (c *DeltaCompactor) ttlInlineMigrationScanPlans(h ttlInlineMigrationHandler) []ttlInlineMigrationScanPlan {
 	scanner, hasGroupScanner := c.st.(ttlInlineGroupScanner)
 	if hasGroupScanner {
@@ -265,10 +268,10 @@ func (c *DeltaCompactor) ttlInlineMigrationScanPlans(h ttlInlineMigrationHandler
 // warnTTLInlineLocalLeaderGroupsUnknown logs once when the store can scan one
 // group but the coordinator cannot name the groups this node leads. In the
 // server that means a coordinator decorator dropped LocalLeaderGroupIDs, and
-// every node is back to full-keyspace migration scans.
+// every node is back to whole-prefix migration scans.
 func (c *DeltaCompactor) warnTTLInlineLocalLeaderGroupsUnknown() {
 	c.ttlInlineGroupsUnknownOnce.Do(func() {
-		c.logger.Warn("ttl inline migrator: coordinator does not report local leader groups; falling back to full-keyspace scans")
+		c.logger.Warn("ttl inline migrator: coordinator does not report local leader groups; falling back to whole-prefix scans")
 	})
 }
 
@@ -295,7 +298,7 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 		err error
 	)
 	if plan.scanner != nil {
-		kvs, err = plan.scanner.ScanGroupAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
+		kvs, err = plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
 	} else {
 		kvs, err = c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
 	}
