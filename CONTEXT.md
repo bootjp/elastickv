@@ -324,9 +324,8 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
 
 - **logical snapshot decoder / encoder** — Offline tools that turn a native
   `.fsm` snapshot into a vendor-independent per-adapter directory tree and
-  back. The decoder reads cleartext snapshots taken from a live Pebble
-  store as well as encoder-produced ones; an encrypted live snapshot is
-  not decodable offline.
+  back. Today the decoder reads only snapshots the encoder produced; a
+  snapshot taken from a live store is not yet decodable offline.
   (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
   `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`,
   `docs/design/2026_09_26_proposed_positioning_and_roadmap.md` §4)
