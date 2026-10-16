@@ -115,11 +115,11 @@ README will present scope in two tiers instead of a non-goals section.
 - Durability and operations: at-rest encryption (storage and Raft envelopes,
   compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
   live point-in-time logical backup plus offline snapshot encode / decode /
-  restore tooling (the decoder reads only snapshots the encoder produced:
-  #1267, merged as `95889d1f`, removed its first failure on a live
-  store's reserved metadata keys, but a snapshot taken from a live store
-  is still not decodable offline, for the reasons the §4 row lists), physical
-  snapshot publish / restore tooling for an
+  restore tooling (since #1267 and #1276 the decoder reads the
+  `fsm-snap/<index>.fsm` file a node persists, in either store snapshot
+  format, as well as encoder output; a snapshot holding encrypted entries
+  is not decodable offline, §4), physical snapshot publish / restore
+  tooling for an
   S3-compatible object store (the periodic scheduler is not yet wired into
   the server; that is the design's M3), Pebble SST ingest snapshot
   transfer, admin dashboard with data
@@ -142,7 +142,7 @@ README will present scope in two tiers instead of a non-goals section.
 | `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
 | No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
 | README's "Implemented Features" omits SQS, encryption, backup, snapshot offload, and the filesystem, and its consistency bullet says only "write-after-read checks … are covered by tests" | `README.md` §Implemented Features | README refresh after §6.1 lands |
-| `elastickv-snapshot-decode` cannot decode a snapshot taken from a live Pebble store, so the offline decode / restore path works only on encoder-produced snapshots, although §3 lists the tooling | #1267 (merged 2026-10-15 as `95889d1f`) removed the first failure: `ReadSnapshot` no longer rejects the store's reserved metadata keys (it failed on `_meta_last_commit_ts`, "encoded value length 8 < 9"). Its tests feed the raw store stream (`store.Snapshot().WriteTo`), not an on-disk `fsm-snap/<index>.fsm`, and five gaps remain (found in review on #1275): the on-disk file starts with the FSM snapshot header (`EKVTHLC1` / `EKVTHLC2`, `kvFSMSnapshot.WriteTo`) and ends with the engine's CRC32C footer (`writeFSMSnapshotPayload`), while the reader expects `EKVPBBL1` at the first byte; the store streams every MVCC version (`writePebbleSnapshotEntries`) and the decoder routes each one and drops tombstones without hiding older versions (`dispatcher.handleEntry`), so a dump carries stale values and resurrects deleted keys; with `ELASTICKV_PEBBLE_SST_INGEST_SNAPSHOT` enabled the store emits `EKVSSTI1`, which the reader rejects with `ErrSnapshotBadMagic`; the reader caps keys at 1 MiB plus the timestamp while the store allows `MaxSnapshotStoredKeySize`, 32 bytes more; and an encrypted entry is rejected (`ErrSnapshotEncryptedEntry`, pinned by `TestReadSnapshot_RejectsEncryptedEntry`) | A decoder follow-up: strip and verify the FSM header and the CRC32C footer, keep only the newest visible version of each key, accept the SST-ingest format and the stored-key budget, with tests on a file written through the engine's snapshot path. Offline decoding of encrypted live snapshots: open, not scheduled. Until the follow-up lands README describes the decoder as encoder-only, and the publication checklist in §6.1 carries the item |
+| `elastickv-snapshot-decode` could not decode a snapshot taken from a live Pebble store, so the offline decode / restore path worked only on encoder-produced snapshots, although §3 lists the tooling; it still rejects encrypted entries | #1267 (merged 2026-10-15 as `95889d1f`) removed the first failure: `ReadSnapshot` no longer rejects the store's reserved metadata keys (it failed on `_meta_last_commit_ts`, "encoded value length 8 < 9"). #1276 (merged 2026-10-16 as `184351ae`) closed the gaps found in review on #1275: `ReadSnapshotFile` strips the FSM snapshot header (`EKVTHLC1` / `EKVTHLC2`, `kvFSMSnapshot.WriteTo`) of an on-disk `fsm-snap/<index>.fsm` and verifies the engine's CRC32C footer (`writeFSMSnapshotPayload`); `DecodeSnapshot` keeps only the newest version of each key, so a dump no longer carries stale values or resurrects deleted keys; the reader accepts the SST-ingest format (`EKVSSTI1`) and the store's `MaxSnapshotStoredKeySize`; `SnapshotIndexFromPath` parses the engine's hex `%016x.fsm` names; and `TestRun_DecodesOnDiskFSMFile` decodes a file written through the engine's snapshot path. Still rejected: encrypted entries (`ErrSnapshotEncryptedEntry`, pinned by `TestReadSnapshot_RejectsEncryptedEntry`). Not applied: a committed transaction whose secondary locks were still unresolved when the snapshot was taken, since the decoder drops the `!txn` intent and lock records | Offline decoding of encrypted snapshots and of unresolved secondary locks: open, not scheduled. README may describe the decoder as reading persisted `.fsm` files from cleartext stores (§6.1) |
 | Stale docs: `docs/docker_multinode_manual_run.md` listed `Scan` / `BatchWriteItem` as unsupported; `docs/review_todo.md` 4.2 described the engine as snapshot isolation | Fixed in the same change as this doc | — |
 
 ## 5. Consistency claims
@@ -261,11 +261,11 @@ and A2 keeps their exemption until the resolver-aware form of the
 Composed-1 gate (the Composed-1 design's M5 "error on unpinned" step,
 extended to resolver-routed keys, in its own design doc) lands. The README
 caveat names this third exclusion with the other two. The README backup
-section describes `elastickv-snapshot-decode` as encoder-only until the
-decoder follow-up in §4 lands (#1267 removed only the first of its
-failures on a live store). A `NOTLEADER` that a later read
-contradicts is an anomaly independent of the timestamp and read-lock
-fixes.
+section may describe `elastickv-snapshot-decode` as reading the `.fsm`
+files a node persists (#1267, #1276) and names the limits the §4 row
+keeps open: a snapshot holding encrypted entries is not decodable
+offline. A `NOTLEADER` that a later read contradicts is an anomaly
+independent of the timestamp and read-lock fixes.
 
 ### 6.2 Security milestone
 
