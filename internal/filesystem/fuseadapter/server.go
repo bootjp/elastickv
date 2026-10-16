@@ -22,6 +22,7 @@ const (
 	fuseBlockUnit          = 512
 	rootDirHandle          = 1
 	permissionModeMask     = 0o7777
+	createRetryLimit       = 4
 	startupRecoveryTimeout = 5 * time.Minute
 	startupRecoveryBatch   = 256
 	filesystemName         = "elastickv"
@@ -192,16 +193,60 @@ func (r *RawFileSystem) Access(cancel <-chan struct{}, input *fuse.AccessIn) fus
 func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 	ctx, done := requestContext(cancel)
 	defer done()
-	result, errno := r.adapter.Create(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
+	nameBytes := []byte(name)
+	opts := filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
 		UID:  input.Uid,
 		GID:  input.Gid,
-	})
+	}
+	for attempt := range createRetryLimit {
+		result, errno := r.adapter.Create(ctx, input.NodeId, nameBytes, opts)
+		if errno == syscall.EAGAIN && attempt+1 < createRetryLimit {
+			continue
+		}
+		if errno == syscall.EEXIST && input.Flags&syscall.O_EXCL == 0 {
+			stat, lookupErrno := r.adapter.Lookup(ctx, input.NodeId, nameBytes)
+			if lookupErrno == syscall.ENOENT && attempt+1 < createRetryLimit {
+				continue
+			}
+			if lookupErrno != 0 {
+				return fuse.Status(lookupErrno)
+			}
+			return r.openExistingForCreate(ctx, input.Flags, stat, out)
+		}
+		if errno != 0 {
+			return fuse.Status(errno)
+		}
+		r.fillEntry(&out.EntryOut, result.Stat)
+		out.Fh = result.FH
+		return fuse.OK
+	}
+	return fuse.Status(syscall.ENOENT)
+}
+
+func (r *RawFileSystem) openExistingForCreate(
+	ctx context.Context,
+	flags uint32,
+	stat filesystem.Stat,
+	out *fuse.CreateOut,
+) fuse.Status {
+	if stat.Type == filesystem.TypeDirectory {
+		return fuse.Status(syscall.EISDIR)
+	}
+	fh, errno := r.adapter.Open(ctx, stat.Inode)
 	if errno != 0 {
 		return fuse.Status(errno)
 	}
-	r.fillEntry(&out.EntryOut, result.Stat)
-	out.Fh = result.FH
+	if flags&syscall.O_TRUNC != 0 {
+		truncated, setattrErrno := r.adapter.SetAttr(ctx, stat.Inode, filesystem.SetAttrMask{Size: true}, filesystem.SetAttr{Size: 0})
+		if setattrErrno != 0 {
+			_ = r.adapter.Release(ctx, stat.Inode, fh)
+			return fuse.Status(setattrErrno)
+		}
+		stat = truncated
+	}
+	r.fillEntry(&out.EntryOut, stat)
+	out.Fh = fh
 	return fuse.OK
 }
 

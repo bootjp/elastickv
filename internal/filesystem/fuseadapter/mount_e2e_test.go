@@ -1,3 +1,5 @@
+//go:build linux
+
 package fuseadapter_test
 
 import (
@@ -34,9 +36,13 @@ func mountMemoryFilesystem(t *testing.T) string {
 	require.NoError(t, err)
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid()) //nolint:gosec // test process ids fit uint32.
 	require.NoError(t, svc.InitializeRoot(t.Context(), e2eRootMode, uid, gid))
+	return mountMemoryService(t, svc, "e2e-mount")
+}
 
+func mountMemoryService(t *testing.T, svc *filesystem.Service, clientID string) string {
+	t.Helper()
 	mountPoint := t.TempDir()
-	adapter := fuseadapter.New(svc, []byte("e2e-mount"))
+	adapter := fuseadapter.New(svc, []byte(clientID))
 	server, err := fuseadapter.Mount(mountPoint, adapter, &fuse.MountOptions{DirectMount: os.Geteuid() == 0})
 	if err != nil {
 		adapter.Close()
@@ -61,6 +67,54 @@ func mountMemoryFilesystem(t *testing.T) string {
 		}
 	})
 	return mountPoint
+}
+
+func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc, err := fstest.NewMemoryService(filesystem.WithChunkSize(e2eChunkSize))
+	require.NoError(t, err)
+	uid, gid := uint32(os.Getuid()), uint32(os.Getgid())
+	require.NoError(t, svc.InitializeRoot(t.Context(), e2eRootMode, uid, gid))
+
+	mountA := mountMemoryService(t, svc, "e2e-mount-a")
+	mountB := mountMemoryService(t, svc, "e2e-mount-b")
+	for i := range 32 {
+		name := "shared-" + strconv.Itoa(i)
+		pathA := filepath.Join(mountA, name)
+		pathB := filepath.Join(mountB, name)
+		_, err := os.Stat(pathA)
+		require.ErrorIs(t, err, os.ErrNotExist)
+		_, err = os.Stat(pathB)
+		require.ErrorIs(t, err, os.ErrNotExist)
+
+		start := make(chan struct{})
+		type openResult struct {
+			file *os.File
+			err  error
+		}
+		results := make(chan openResult, 2)
+		for _, path := range []string{pathA, pathB} {
+			go func() {
+				<-start
+				file, openErr := os.OpenFile(path, os.O_RDWR|os.O_CREATE, 0o644)
+				results <- openResult{file: file, err: openErr}
+			}()
+		}
+		close(start)
+		first, second := <-results, <-results
+		if first.file != nil {
+			require.NoError(t, first.file.Close())
+		}
+		if second.file != nil {
+			require.NoError(t, second.file.Close())
+		}
+		require.NoError(t, first.err)
+		require.NoError(t, second.err)
+		require.FileExists(t, pathA)
+		require.FileExists(t, pathB)
+	}
 }
 
 func skipOrFail(t *testing.T, format string, args ...any) {
