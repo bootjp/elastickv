@@ -480,10 +480,12 @@ func TestInstallFilesystemServerLifecycleCleanupBoundsHungUnmount(t *testing.T) 
 		t.Fatal("cleanup blocked on the hung unmount")
 	}
 
-	// Teardown: let the lifecycle goroutine finish.
+	// Teardown: let the lifecycle goroutine finish. Cancel before the serve
+	// loop ends, as a real shutdown does; the other order is the "stopped
+	// unexpectedly" case the lifecycle reports as an error.
 	release()
-	close(serveDone)
 	cancel()
+	close(serveDone)
 	require.NoError(t, eg.Wait())
 }
 
