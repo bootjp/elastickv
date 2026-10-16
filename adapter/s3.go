@@ -120,6 +120,10 @@ type S3Server struct {
 	blobMinReplicas      int
 	blobPushBlocked      func() bool
 	blobBackfiller       *S3BlobBackfiller
+	// adminBlobUsers counts the admin object operations that may use
+	// blobCluster from outside the HTTP listener (see enterAdminBlobUse),
+	// so Stop can wait for them before closing the cluster.
+	adminBlobUsers *inflightGate
 }
 
 type s3BucketMeta struct {
@@ -362,6 +366,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		cleanupSem:         make(chan struct{}, s3ManifestCleanupWorkers),
 		putAdmission:       newS3PutAdmissionFromEnv(),
 		blobOffloadEnabled: S3BlobOffloadEnabledFromEnv(),
+		adminBlobUsers:     newInflightGate(),
 	}
 	if localStores, ok := st.(S3BlobLocalStoreResolver); ok {
 		s.blobLocalStores = localStores
@@ -406,15 +411,33 @@ func (s *S3Server) Run() error {
 	return nil
 }
 
+// Stop ends the background backfill, drains the HTTP listener (bounded,
+// see shutdownHTTPServer), waits for the admin object operations still
+// using the blob peer cluster (bounded the same way, see
+// enterAdminBlobUse), and only then closes the cluster: an in-flight upload
+// or read that replicates or fetches chunk blobs through it keeps its peers
+// for the whole graceful window instead of failing at once with a closed
+// cluster. The admin operations are counted separately because they reach
+// this server through the admin listener or the gRPC admin forwarder,
+// which drain on their own; an idle S3 listener finishes its drain at once.
 func (s *S3Server) Stop() {
-	if s != nil && s.blobBackfiller != nil {
+	if s == nil {
+		return
+	}
+	if s.blobBackfiller != nil {
 		s.blobBackfiller.Stop()
 	}
-	if s != nil && s.blobCluster != nil {
-		_ = s.blobCluster.Close()
+	if s.httpServer != nil {
+		shutdownHTTPServer(s.httpServer, "s3")
 	}
-	if s != nil && s.httpServer != nil {
-		_ = s.httpServer.Shutdown(context.Background())
+	if !s.adminBlobUsers.drain(httpShutdownTimeout) {
+		slog.Warn("s3 server: admin object operations still running after the shutdown bound, closing the blob cluster",
+			slog.Int64("in_flight", s.adminBlobUsers.remaining()),
+			slog.Duration("timeout", httpShutdownTimeout),
+		)
+	}
+	if s.blobCluster != nil {
+		_ = s.blobCluster.Close()
 	}
 }
 
