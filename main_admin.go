@@ -17,6 +17,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -33,7 +34,6 @@ const (
 	adminReadHeaderTimeout = 5 * time.Second
 	adminWriteTimeout      = 10 * time.Second
 	adminIdleTimeout       = 30 * time.Second
-	adminShutdownTimeout   = 5 * time.Second
 )
 
 // adminBuildVersion is surfaced by both GET /admin/api/v1/cluster and the
@@ -618,7 +618,10 @@ func translateAdminObjectsError(err error) error {
 		return nil
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrObjectsForbidden
-	case errors.Is(err, adapter.ErrAdminNotLeader):
+	case errors.Is(err, adapter.ErrAdminNotLeader),
+		// A node that is stopping cannot serve the object either; the
+		// not-leader response's Retry-After sends the client elsewhere.
+		errors.Is(err, adapter.ErrAdminS3Stopping):
 		return admin.ErrObjectsNotLeader
 	case errors.Is(err, adapter.ErrAdminBucketNotFound):
 		return admin.ErrObjectsBucketNotFound
@@ -1191,6 +1194,11 @@ func newAdminHTTPServer(server *admin.Server) *http.Server {
 	}
 }
 
+// adminShutdownTimeout bounds how long the admin listener waits for
+// in-flight requests on shutdown before the remaining connections are
+// closed (monitoring.ShutdownHTTPServer). A variable so tests can shorten it.
+var adminShutdownTimeout = 5 * time.Second
+
 func registerAdminLifecycle(
 	ctx context.Context,
 	eg *errgroup.Group,
@@ -1204,13 +1212,7 @@ func registerAdminLifecycle(
 	eg.Go(func() error {
 		<-ctx.Done()
 		slog.Info("shutting down admin listener", "address", addr, "reason", ctx.Err())
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), adminShutdownTimeout)
-		defer cancel()
-		err := httpSrv.Shutdown(shutdownCtx)
-		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return errors.WithStack(err)
+		return monitoring.ShutdownHTTPServer(ctx, httpSrv, "admin", adminShutdownTimeout)
 	})
 	eg.Go(func() error {
 		slog.Info("starting admin listener", "address", addr, "tls", tlsEnabled, "version", version)
