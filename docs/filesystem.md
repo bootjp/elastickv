@@ -189,22 +189,32 @@ When `--filesystemMount` is set, the server:
    group, on a multi-group cluster it can span several groups. Concurrent
    root creation from several nodes is resolved by write-conflict retries;
    the losers find the root the first node created.
-3. Replays filesystem recovery state: safely aborted create/delete intents are
+3. Checks the mount point for a FUSE mount left behind by a previous server
+   that died without unmounting (the mounts table lists a `fuse.elastickv`
+   entry, the type the server mounts with, for the path and `stat` fails
+   with `ENOTCONN`). Such a dead mount is detached with `fusermount3 -u -z`
+   (or `fusermount`, or a lazy `umount` when neither helper exists) and
+   logged as `detached stale filesystem FUSE mount left by a previous
+   process`. A live mount, or a filesystem of any other type at the path,
+   FUSE or not, is never touched. When `/proc/self/mounts` cannot be read
+   (no `/proc` in a minimal container), the check is skipped with a warning
+   and the mount proceeds as before.
+4. Replays filesystem recovery state: safely aborted create/delete intents are
    cleared and unfinished file moves are resumed, in batches of 256, until
    nothing is left. The whole replay must finish within 5 minutes; if it does
    not, the mount fails and the server exits. Recovery is resumable, so
    restarting the server continues where the previous attempt stopped.
-4. Mounts the directory with `fusermount3`, waits for the kernel to confirm
+5. Mounts the directory with `fusermount3`, waits for the kernel to confirm
    the mount, and logs `filesystem FUSE mounted` with the mount point and
    client ID.
-5. Starts the placement-metrics collector and the lease reaper.
+6. Starts the placement-metrics collector and the lease reaper.
 
 Because the listeners come up before the mount, a readiness check on the gRPC
 or Redis port is not enough for clients that use the mount. Check the
 mount point itself, and issue an I/O request against it rather than only
-consulting the mount table, so that a mount left behind by a previous server
-process (see [Stopping and restarting](#stopping-and-restarting)) does not
-pass the check:
+consulting the mount table: a mount left behind by a previous server process
+(see [Stopping and restarting](#stopping-and-restarting)) stays in the mount
+table until step 3 detaches it, and the listeners are already up by then:
 
 ```bash
 until mountpoint -q /mnt/elastickv && ls /mnt/elastickv >/dev/null 2>&1; do
@@ -217,25 +227,61 @@ filesystem it was asked to expose.
 
 ## Stopping and restarting
 
-The server has no signal handler: `SIGTERM`, `SIGINT`, and `SIGKILL` all end
-the process immediately, and the kernel keeps the now-dead mount attached.
-Until it is detached, every access to the mount point fails with
-`Transport endpoint is not connected`, and a restarted server exits with
-`fusermount3: failed to access mountpoint ...: Transport endpoint is not
-connected`. The orderly unmount built into the server only runs when the
-server shuts itself down (a failed component or the memory watchdog).
+`SIGTERM` and `SIGINT` stop the server gracefully: the first signal is logged
+as `shutdown signal received, stopping`, the FUSE mount is unmounted, the
+listeners drain, and the WAL is synced before the process exits with status
+0. That status is for a clean shutdown, one whose only errors are the
+cancellation itself; a component that fails while stopping still makes the
+process exit with an error after the same cleanup. Repeated
+`SIGTERM`/`SIGINT` while that shutdown is running are logged and ignored so
+a supervisor's second stop attempt cannot cut the cleanup short.
+This is the same path the server takes when a component fails or the memory
+watchdog trips (which still exits with status 2). If the unmount fails because
+a client still holds files on the mount open (`EBUSY`), the server detaches
+the mount lazily instead: new lookups see the plain directory at once, the
+open handles keep working until they are closed, and the server waits at most
+10 seconds in total for the unmount and for the kernel to release the
+connection before finishing its shutdown, so a stop never hangs on a busy
+mount or on a request stuck in the backend. That lazy detach, like the
+startup check, only ever acts on a mount the mounts table lists with the
+server's own type (`fuse.elastickv`): if the kernel mount is already gone by
+then, whatever filesystem the mount point sits on, another FUSE filesystem
+included, is left alone. The gRPC listeners likewise drain
+in-flight calls for at most 10 seconds before the remaining long-lived
+streams (catalog watches, Raft transport streams) are closed, so a stop
+never waits on a peer that stays connected. The DynamoDB, S3, and SQS HTTP
+listeners follow the same rule: in-flight requests get at most 10 seconds to
+finish, then the remaining connections are closed, so a client that stalls
+mid-request (for example an S3 upload that never sends its body) cannot hold
+the shutdown open either. The Redis listener closes its connections at once
+and then waits at most 10 seconds for the commands that were already
+executing (for example a write waiting on Raft) before the stores behind them
+are closed.
 
-Stop and restart a mounted node like this:
+`SIGKILL`, an OOM kill, or a crash cannot run that cleanup, and the kernel
+keeps the now-dead mount attached. Until it is detached, every access to the
+mount point fails with `Transport endpoint is not connected`. A restarted
+server detaches such a dead mount itself before mounting (see step 3 of the
+[startup sequence](#startup-sequence)) and logs `detached stale filesystem
+FUSE mount left by a previous process`, so an ordinary restart needs no
+manual step:
 
 ```bash
-kill "$(pidof elastickv)"          # or your supervisor's stop action
-fusermount3 -uz /mnt/elastickv     # detach the stale mount (umount -l also works)
+kill "$(pidof elastickv)"          # SIGTERM: unmounts, syncs, exits 0
 # start the server again with the same flags
 ```
 
-Put the `fusermount3 -uz` step in the service's `ExecStopPost` (systemd) or
-the equivalent hook of your supervisor so an automatic restart does not loop
-on the stale mount. Detaching the mount loses nothing that a completed
+To free the mount point without restarting the server (for example before
+reusing the directory for something else), detach it by hand:
+
+```bash
+fusermount3 -uz /mnt/elastickv     # umount -l also works
+```
+
+The same command in a supervisor's post-stop hook (`ExecStopPost` under
+systemd) is still a reasonable belt-and-braces measure for hosts where the
+server runs as a user that cannot detach the mount, but it is no longer
+required for restarts. Detaching the mount loses nothing that a completed
 system call wrote: every `write(2)` that returned is committed in the store,
 and open handles on the dead mount are released by the lease reaper. The one
 exception is `mmap`: stores into a shared mapping sit in the kernel page
@@ -426,8 +472,11 @@ filesystem backup adapter exists, there are two options:
 | Server exits with `mount filesystem frontend: ...` naming `fusermount3` or `fusermount` as not found in `$PATH` | `fuse3` is not installed or not on `PATH`. Install it, or run the server outside the distroless image. |
 | Server exits with `initialize filesystem root: ... leader not found` | The node could not reach a Raft leader at startup. Start or repair the cluster first; for per-node joins, mount on the bootstrap node first and on peers after they joined. |
 | `mkdir: cannot create directory: Permission denied` right after the first mount | The root directory is owned by UID 0 with mode `0755`. Start with `--filesystemRootUID` / `--filesystemRootGID` set to the writing user (only effective before the root exists). If the root already exists, repair it as described under [Single node](#single-node): restart one server as root and `chown` the mount point from a root shell; a root shell cannot reach a mount made by another user, and that user cannot `chown` a root-owned directory. |
-| `Transport endpoint is not connected` on the mount point | The server process stopped (any signal ends it without unmounting). Run `fusermount3 -uz <mount-point>` (or `umount -l`), then restart the server. |
-| Restart exits with `fusermount3: failed to access mountpoint ...: Transport endpoint is not connected` | The previous mount is still attached. Detach it with `fusermount3 -uz` first; see [Stopping and restarting](#stopping-and-restarting). |
+| `Transport endpoint is not connected` on the mount point | The server process died without unmounting (`SIGKILL`, OOM kill, or a crash; `SIGTERM`/`SIGINT` unmount cleanly). Restart the server: it detaches the dead mount before mounting. To free the directory without a restart, run `fusermount3 -uz <mount-point>` (or `umount -l`). |
+| Restart exits with `detach stale filesystem FUSE mount: ...` | The server found a dead FUSE mount at the path but could not detach it: neither `fusermount3` nor `fusermount` is on `PATH` and the process lacks `CAP_SYS_ADMIN` for a direct lazy unmount, or the helper failed (its output is in the error). Detach it as root with `fusermount3 -uz` / `umount -l`, then restart; see [Stopping and restarting](#stopping-and-restarting). |
+| Restart exits with `detach stale filesystem FUSE mount: ... stat FUSE mount at ...: no answer within 10s` | A FUSE server is still attached to the mount point but not answering (a hung previous process). Find and stop that process (`fuser -m <mount-point>` or `ps`), then restart. |
+| Restart exits with `detach stale filesystem FUSE mount: ... resolve FUSE mount point ...: no answer within 10s` | A parent directory of the mount point sits on a filesystem that is not answering (a wedged FUSE or network mount above the mount point), so the server could not even resolve the path. Repair or detach that outer filesystem, or move the mount point off it, then restart. |
+| Restart exits with `fusermount3: failed to access mountpoint ...: Transport endpoint is not connected` | The dead mount at the path is not one the server will touch: the mounts table does not list it as `fuse.elastickv` (for example a `fuseblk`, a non-FUSE filesystem, or another FUSE filesystem such as `fuse.sshfs` stacked over the mount point). Inspect `/proc/self/mounts` and detach it by hand. |
 | `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry the call, with two exceptions: never retry `close`, and do not retry an `O_APPEND` write that other mounts may also be appending to. See [Concurrency](#semantics-worth-knowing) for what a retry reports when the first attempt did apply. |
 | `Input/output error` (`EIO`) | A backend error that is not a write conflict, for example a lost connection to the leader. Check the server log; retry once the cluster is healthy. |
 | `ENOENT` opening a file that exists | The file was replaced by `rename` from another mount between lookup and open. Retry. |
@@ -443,7 +492,13 @@ filesystem backup adapter exists, there are two options:
   runs only the latter). The kernel-mount end-to-end tests in
   `internal/filesystem/fuseadapter` and in `main` mount a real FUSE
   filesystem; they skip when `/dev/fuse` or `fusermount3` is unavailable, and
-  `ELASTICKV_REQUIRE_FUSE=1` turns that skip into a failure.
+  `ELASTICKV_REQUIRE_FUSE=1` turns that skip into a failure. Among them,
+  `TestShutdownSignalUnmountsFilesystem` (package `main`) sends the test
+  process a real `SIGTERM` and checks that the mount is gone afterwards, and
+  `TestMountDetachesStaleMountLeftByKilledServer` (`fuseadapter`) kills a
+  helper process that holds a mount, then mounts over the dangling mount it
+  left behind. When the tests run as root they mount directly through
+  `mount(2)` and do not need `fusermount3`.
 - The Jepsen linearizable-register workload drives real mounts on every node
   of a cluster (`jepsen/src/elastickv/filesystem_workload.clj`). See
   "Running Jepsen tests" in the README; `scripts/run-jepsen-local.sh` runs it
