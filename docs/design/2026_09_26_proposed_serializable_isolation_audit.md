@@ -1017,15 +1017,13 @@ Still open for the fix PRs:
   left as found by this branch. #1267 (merged 2026-10-15 as `95889d1f`)
   removed that first failure, by skipping every reserved metadata key a
   live store writes through a mirror of the store's classifier pinned by
-  cross-check tests, but the defect stays open (found in review on
-  #1275): its tests feed the raw store stream, while an on-disk `.fsm`
-  carries the FSM snapshot header in front and the engine's CRC32C
-  footer behind it; the decoder routes every MVCC version and drops
-  tombstones without hiding older versions, so a dump carries stale
-  values and resurrects deleted keys; and the SST-ingest snapshot format,
-  the store's stored-key budget, and encrypted entries are rejected. The
-  roadmap's §4 row lists the follow-up; `CONTEXT.md` describes the
-  decoder as encoder-only until it lands.
+  cross-check tests, and #1276 (merged 2026-10-16 as `184351ae`) closed
+  the rest, found in review on #1275: the decoder now reads an on-disk
+  `.fsm` (the FSM snapshot header in front, the engine's CRC32C footer
+  behind), keeps only the newest version of each key, and accepts the
+  SST-ingest snapshot format and the store's stored-key budget, with a
+  test on a file written through the engine's snapshot path. Encrypted
+  entries are still rejected; the roadmap's §4 row records that limit.
 
 ### A1. Coverage table and adapter fixes
 
