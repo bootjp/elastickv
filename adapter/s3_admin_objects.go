@@ -74,6 +74,7 @@ var ErrAdminInvalidContinuationToken = errors.New("s3 admin: invalid continuatio
 //   - ErrAdminNotLeader          — follower
 //   - ErrAdminBucketNotFound     — bucket absent
 //   - ErrAdminInvalidObjectKey   — empty key
+//   - ErrAdminS3Stopping         — Stop has begun
 func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincipal, bucket, key string) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
@@ -87,6 +88,13 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 	if err := validateS3BucketName(bucket); err != nil {
 		return errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
 	}
+	// Counted like the other admin object operations so Stop waits for
+	// the delete before it closes the cleanup gate: the blob cleanup the
+	// delete schedules once it has committed must not be refused.
+	if err := s.enterAdminBlobUse(); err != nil {
+		return err
+	}
+	defer s.exitAdminBlobUse()
 
 	var cleanupManifest *s3ObjectManifest
 	var generation uint64
