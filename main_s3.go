@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
@@ -203,5 +204,6 @@ func loadS3StaticCredentialsForAddress(s3Address, credentialsFile string) (map[s
 }
 
 func loadS3StaticCredentials(path string) (map[string]string, error) {
-	return loadSigV4StaticCredentialsFile(path, "s3")
+	creds, err := serverwiring.LoadSigV4StaticCredentials(path, "s3")
+	return creds, errors.WithStack(err)
 }

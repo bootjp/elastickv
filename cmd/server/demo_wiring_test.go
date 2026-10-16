@@ -7,9 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
-	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
 
@@ -48,38 +46,6 @@ func TestDemoKeyVizSamplerHonoursLabelsFlag(t *testing.T) {
 		}
 	}
 	require.True(t, labels[keyviz.LabelRedis], "labelled sampler must keep a redis row; got %v", labels)
-}
-
-// SplitRange copies the parent's migration fields onto both children. The
-// autosplit splitter's route conversion must keep them, as the catalog
-// watcher's converter does.
-func TestDemoAutoSplitRouteFromProtoKeepsRouteFields(t *testing.T) {
-	t.Parallel()
-
-	got := demoAutoSplitRouteFromProto(&pb.RouteDescriptor{
-		RouteId:                7,
-		Start:                  []byte("a"),
-		End:                    []byte("m"),
-		RaftGroupId:            3,
-		State:                  pb.RouteState_ROUTE_STATE_ACTIVE,
-		ParentRouteId:          2,
-		SplitAtHlc:             100,
-		StagedVisibilityActive: true,
-		MigrationJobId:         9,
-		MinWriteTsExclusive:    1234,
-	})
-	require.Equal(t, distribution.RouteDescriptor{
-		RouteID:                7,
-		Start:                  []byte("a"),
-		End:                    []byte("m"),
-		GroupID:                3,
-		State:                  distribution.RouteStateActive,
-		ParentRouteID:          2,
-		SplitAtHLC:             100,
-		StagedVisibilityActive: true,
-		MigrationJobID:         9,
-		MinWriteTSExclusive:    1234,
-	}, got)
 }
 
 func setDemoFlagForTest(t *testing.T, name, value string) {

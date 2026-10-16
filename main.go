@@ -31,6 +31,7 @@ import (
 	internalraftadmin "github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
@@ -248,29 +249,14 @@ var (
 	kekFile = flag.String("kekFile", "", "§5.1 KEK file path (32 raw bytes, owner-only mode). When set, the file-backed kek.Wrapper is constructed at startup and threaded into the §6.3 EncryptionApplier so ApplyBootstrap and ApplyRotation can KEK-unwrap.")
 	kekURI  = flag.String("kekUri", "", "§5.1 remote KEK URI: aws-kms://<key-arn>, gcp-kms://<crypto-key-resource>, or vault-transit://<mount>/<key>. Mutually exclusive with --kekFile and ELASTICKV_KEK_BASE64.")
 
-	// Key visualizer sampler flags. The sampler runs entirely in-memory
-	// on each node, feeds AdminServer.GetKeyVizMatrix, and is disabled
-	// by default — opt in with --keyvizEnabled. The other flags are
-	// no-ops when the sampler is disabled.
-	keyvizEnabled                = flag.Bool("keyvizEnabled", false, "Enable the in-memory key visualizer sampler that feeds AdminServer.GetKeyVizMatrix")
-	keyvizStep                   = flag.Duration("keyvizStep", keyviz.DefaultStep, "Flush interval / matrix-column resolution for the keyviz sampler")
-	keyvizMaxTrackedRoutes       = flag.Int("keyvizMaxTrackedRoutes", keyviz.DefaultMaxTrackedRoutes, "Maximum routes tracked individually before excess routes coarsen into virtual buckets")
-	keyvizMaxMemberRoutesPerSlot = flag.Int("keyvizMaxMemberRoutesPerSlot", keyviz.DefaultMaxMemberRoutesPerSlot, "Maximum members listed on a virtual bucket; excess routes still drive the bucket counters")
-	keyvizHistoryColumns         = flag.Int("keyvizHistoryColumns", keyviz.DefaultHistoryColumns, "Maximum matrix columns retained in the keyviz ring buffer (each column = one Step)")
-	keyvizKeyBucketsPerRoute     = flag.Int("keyvizKeyBucketsPerRoute", keyviz.DefaultKeyBucketsPerRoute, "Order-preserving sub-range buckets per individual route for the hot-key heatmap; 1 disables sub-bucketing (route-granular, today's behaviour). Capped at 256; memory is ~K*32 bytes/route, so K_max ~= memBudget/(32*keyvizMaxTrackedRoutes)")
-	keyvizLabelsEnabled          = flag.Bool("keyvizLabelsEnabled", false, "Enable per-adapter KeyViz row labels. Default false keeps legacy route-only rows during rolling upgrades")
+	// Key visualizer sampler and auto-split flags. Both groups are shared
+	// with the cmd/server demo through internal/serverwiring. The sampler
+	// runs entirely in-memory on each node, feeds
+	// AdminServer.GetKeyVizMatrix, and is disabled unless --keyvizEnabled
+	// or --autoSplit is set.
+	keyVizFlags    = serverwiring.RegisterKeyVizFlags(flag.CommandLine)
+	autoSplitFlags = serverwiring.RegisterAutoSplitFlags(flag.CommandLine)
 
-	// Hot-key drill-down (Phase 2-A++; design 2026_05_28_implemented_keyviz_hot_key_topk).
-	// Off by default — the disabled-case adds one early-return branch
-	// to Observe and retains zero real key bytes. When enabled, the
-	// sampler retains actual hot key bytes in memory and exposes them
-	// via the admin /keyviz/hotkeys drill-down (gated behind admin
-	// auth + audit).
-	keyvizHotKeysEnabled    = flag.Bool("keyvizHotKeysEnabled", false, "Enable per-route Top-K hot-key drill-down (retains actual key bytes; admin auth + keyviz flag both required)")
-	keyvizHotKeysPerRoute   = flag.Int("keyvizHotKeysPerRoute", keyviz.DefaultHotKeysPerRoute, "Space-Saving sketch capacity m per route (default 64, cap 256). Larger m tightens the error bound N_total/m at the cost of memory")
-	keyvizHotKeysSampleRate = flag.Int("keyvizHotKeysSampleRate", keyviz.DefaultHotKeysSampleRate, "Hot-keys hot-path sample rate R: 1-in-R observes are enqueued (default 16, cap 1024). Higher R reduces hot-path cost; raises Chernoff miss probability over the sampled stream")
-	keyvizHotKeysQueueSize  = flag.Int("keyvizHotKeysQueueSize", keyviz.DefaultHotKeysQueueSize, "Bounded channel size between Observe and the hot-keys aggregator. Default 8192, cap 65536. Drops past this are counted (dropped_samples -> degraded)")
-	keyvizHotKeysMaxKeyLen  = flag.Int("keyvizHotKeysMaxKeyLen", keyviz.DefaultHotKeysMaxKeyLen, "Maximum key length sampled into the hot-keys sketch (default 1024 B, cap 4096). Longer keys bump skipped_long_keys -> degraded, never truncated")
 	// Phase 2-C cluster fan-out: comma-separated list of admin
 	// HTTP endpoints (host:port or scheme://host:port). When set,
 	// the admin keyviz handler aggregates the local matrix with
@@ -319,7 +305,7 @@ const bytesPerMiB = 1024 * 1024
 
 func main() {
 	flag.Parse()
-	recordExplicitRuntimeFlags(flag.CommandLine)
+	keyVizFlags.RecordExplicit(flag.CommandLine)
 
 	err := run()
 	if memoryPressureExit.Load() {
@@ -547,13 +533,13 @@ func run() error {
 	})
 	cleanup.Add(cancel)
 	startLockResolverIfEnabled(shardStore, shardGroups, &cleanup)
-	sampler := buildKeyVizSampler()
+	sampler := serverwiring.BuildSampler(keyVizFlags, autoSplitFlags)
 	sqsPartitionResolver := buildSQSPartitionResolver(cfg.sqsFifoPartitionMap)
 	shardStore.WithPartitionResolver(sqsPartitionResolver)
 	coordinate := kv.NewShardedCoordinator(cfg.engine, shardGroups, cfg.defaultGroup, clock, shardStore).
 		WithLeaseReadObserver(metricsRegistry.LeaseReadObserver()).
 		WithSampler(keyVizSamplerForCoordinator(sampler)).
-		WithKeyVizLabelsEnabled(*keyvizLabelsEnabled).
+		WithKeyVizLabelsEnabled(*keyVizFlags.LabelsEnabled).
 		WithAllShardGroups(dataGroupIDs(cfg.groups)...).
 		WithPartitionResolver(sqsPartitionResolver)
 	tsoWiring, err := configureCoordinatorTSOWithObserver(
@@ -771,14 +757,14 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	// with durable non-zero RouteIDs; seeding earlier would register
 	// the placeholder zero IDs from buildEngine and Observe would miss
 	// every dispatched mutation.
-	seedKeyVizRoutes(in.sampler, in.cfg.engine)
+	serverwiring.SeedRoutes(in.sampler, in.cfg.engine)
 
 	catalogWatchConns := &kv.GRPCConnCache{}
 	in.cleanup.Add(func() { _ = catalogWatchConns.Close() })
 	in.eg.Go(func() error {
 		return runDistributionCatalogStream(in.ctx, catalogRuntime, catalogWatchConns, in.cfg.engine)
 	})
-	startKeyVizFlusher(in.ctx, in.eg, in.sampler)
+	serverwiring.StartFlusher(in.ctx, in.eg, in.sampler)
 	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
 	startMemoryWatchdog(in.ctx, in.eg, in.cancel)
 	distServer := adapter.NewDistributionServer(
@@ -3591,31 +3577,12 @@ func runDynamoDBServer(ctx context.Context, eg *errgroup.Group, dynamoServer *ad
 }
 
 func startPprofServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, pprofAddr string, pprofToken string) error {
-	pprofServer, pprofL, bindAddr, err := preparePprofServer(ctx, lc, pprofAddr, pprofToken)
+	pprofServer, pprofL, bindAddr, err := serverwiring.PreparePprofServer(ctx, lc, pprofAddr, pprofToken)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	runPreparedPprofServer(ctx, eg, pprofServer, pprofL, bindAddr)
 	return nil
-}
-
-func preparePprofServer(ctx context.Context, lc *net.ListenConfig, pprofAddr string, pprofToken string) (*http.Server, net.Listener, string, error) {
-	pprofAddr = strings.TrimSpace(pprofAddr)
-	if pprofAddr == "" {
-		return nil, nil, "", nil
-	}
-	if _, _, err := net.SplitHostPort(pprofAddr); err != nil {
-		return nil, nil, "", errors.Wrapf(err, "invalid pprofAddress %q; expected host:port", pprofAddr)
-	}
-	if monitoring.AddressRequiresToken(pprofAddr) && strings.TrimSpace(pprofToken) == "" {
-		return nil, nil, "", errors.New("pprofToken is required when pprofAddress is not loopback")
-	}
-	pprofL, err := lc.Listen(ctx, "tcp", pprofAddr)
-	if err != nil {
-		return nil, nil, "", errors.Wrapf(err, "failed to listen on %s", pprofAddr)
-	}
-	pprofServer := monitoring.NewPprofServer(pprofToken)
-	return pprofServer, pprofL, pprofAddr, nil
 }
 
 func runPreparedPprofServer(ctx context.Context, eg *errgroup.Group, pprofServer *http.Server, pprofL net.Listener, pprofAddr string) {
@@ -3627,31 +3594,12 @@ func runPreparedPprofServer(ctx context.Context, eg *errgroup.Group, pprofServer
 }
 
 func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, metricsToken string, handler http.Handler) error {
-	metricsServer, metricsL, bindAddr, err := prepareMetricsServer(ctx, lc, metricsAddr, metricsToken, handler)
+	metricsServer, metricsL, bindAddr, err := serverwiring.PrepareMetricsServer(ctx, lc, metricsAddr, metricsToken, handler)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	runPreparedMetricsServer(ctx, eg, metricsServer, metricsL, bindAddr)
 	return nil
-}
-
-func prepareMetricsServer(ctx context.Context, lc *net.ListenConfig, metricsAddr string, metricsToken string, handler http.Handler) (*http.Server, net.Listener, string, error) {
-	metricsAddr = strings.TrimSpace(metricsAddr)
-	if metricsAddr == "" || handler == nil {
-		return nil, nil, "", nil
-	}
-	if _, _, err := net.SplitHostPort(metricsAddr); err != nil {
-		return nil, nil, "", errors.Wrapf(err, "invalid metricsAddress %q; expected host:port", metricsAddr)
-	}
-	if monitoring.AddressRequiresToken(metricsAddr) && strings.TrimSpace(metricsToken) == "" {
-		return nil, nil, "", errors.New("metricsToken is required when metricsAddress is not loopback")
-	}
-	metricsL, err := lc.Listen(ctx, "tcp", metricsAddr)
-	if err != nil {
-		return nil, nil, "", errors.Wrapf(err, "failed to listen on %s", metricsAddr)
-	}
-	metricsServer := monitoring.NewMetricsServer(handler, metricsToken)
-	return metricsServer, metricsL, metricsAddr, nil
 }
 
 func runPreparedMetricsServer(ctx context.Context, eg *errgroup.Group, metricsServer *http.Server, metricsL net.Listener, metricsAddr string) {
@@ -4132,19 +4080,19 @@ func (r *runtimeServerRunner) preparePublicServices() error {
 	r.sqsServer = sqsServer
 	r.sqsListener = sqsListener
 
-	metricsServer, metricsListener, metricsAddr, err := prepareMetricsServer(
+	metricsServer, metricsListener, metricsAddr, err := serverwiring.PrepareMetricsServer(
 		r.ctx, r.lc, r.metricsAddress, r.metricsToken, r.metricsRegistry.Handler(),
 	)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	r.metricsServer = metricsServer
 	r.metricsListener = metricsListener
 	r.metricsBindAddr = metricsAddr
 
-	pprofServer, pprofListener, pprofAddr, err := preparePprofServer(r.ctx, r.lc, r.pprofAddress, r.pprofToken)
+	pprofServer, pprofListener, pprofAddr, err := serverwiring.PreparePprofServer(r.ctx, r.lc, r.pprofAddress, r.pprofToken)
 	if err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	r.pprofServer = pprofServer
 	r.pprofListener = pprofListener
@@ -4230,36 +4178,6 @@ func (r *runtimeServerRunner) startAdminHTTP() {
 	r.adminHTTP.start(r.ctx, r.eg)
 }
 
-// buildKeyVizSampler constructs the in-memory keyviz sampler from
-// flag-supplied options, or returns nil when neither --keyvizEnabled nor
-// --autoSplit is set. The coordinator's WithSampler and AdminServer's
-// RegisterSampler both treat a nil receiver as "keyviz disabled," so
-// this is the single decision point.
-func buildKeyVizSampler() *keyviz.MemSampler {
-	if !*keyvizEnabled && !*autoSplit {
-		return nil
-	}
-	keyBucketsPerRoute := effectiveKeyVizBucketsPerRoute(
-		*autoSplit,
-		keyvizKeyBucketsPerRouteExplicit,
-		*keyvizKeyBucketsPerRoute,
-		*autoSplitDefaultBuckets,
-	)
-	return keyviz.NewMemSampler(keyviz.MemSamplerOptions{
-		Step:                   *keyvizStep,
-		HistoryColumns:         *keyvizHistoryColumns,
-		MaxTrackedRoutes:       *keyvizMaxTrackedRoutes,
-		MaxMemberRoutesPerSlot: *keyvizMaxMemberRoutesPerSlot,
-		KeyBucketsPerRoute:     keyBucketsPerRoute,
-		KeyVizLabelsEnabled:    *keyvizLabelsEnabled,
-		HotKeysEnabled:         *keyvizHotKeysEnabled,
-		HotKeysPerRoute:        *keyvizHotKeysPerRoute,
-		HotKeysSampleRate:      *keyvizHotKeysSampleRate,
-		HotKeysQueueSize:       *keyvizHotKeysQueueSize,
-		HotKeysMaxKeyLen:       *keyvizHotKeysMaxKeyLen,
-	})
-}
-
 // keyVizSamplerForCoordinator wraps a *MemSampler in the
 // keyviz.Sampler interface understood by ShardedCoordinator. A nil
 // sampler returns a typed-nil interface value, so the coordinator's
@@ -4270,43 +4188,6 @@ func keyVizSamplerForCoordinator(s *keyviz.MemSampler) keyviz.Sampler {
 		return nil
 	}
 	return s
-}
-
-// seedKeyVizRoutes copies the engine's current route catalogue into the sampler
-// so the first matrix snapshots have non-empty metadata. The auto-split
-// scheduler keeps membership reconciled after catalog changes.
-func seedKeyVizRoutes(s *keyviz.MemSampler, engine *distribution.Engine) {
-	if s == nil || engine == nil {
-		return
-	}
-	for _, r := range engine.Stats() {
-		s.RegisterRoute(r.RouteID, r.Start, r.End, r.GroupID)
-	}
-}
-
-// startKeyVizFlusher launches RunFlusher in the supplied errgroup
-// and harvests the in-progress step with a final Flush after the
-// goroutine returns, so a graceful shutdown does not lose the most
-// recent partial column. Skip the goroutine entirely when the
-// sampler is disabled — RunFlusher would just park on ctx.Done with
-// no work to do, which is a free goroutine but adds no signal.
-func startKeyVizFlusher(ctx context.Context, eg *errgroup.Group, s *keyviz.MemSampler) {
-	if s == nil {
-		return
-	}
-	eg.Go(func() error {
-		keyviz.RunFlusher(ctx, s, s.Step())
-		s.Flush()
-		return nil
-	})
-	// Hot-key drill-down aggregator: a separate goroutine on the same
-	// keyvizStep cadence. RunHotKeysAggregator is a no-op block when
-	// HotKeysEnabled is false, so calling it unconditionally is safe
-	// and keeps the startup wiring uniform regardless of the flag.
-	eg.Go(func() error {
-		keyviz.RunHotKeysAggregator(ctx, s)
-		return nil
-	})
 }
 
 // startKeyVizLeaderTermPublisher polls each Raft group's current term
