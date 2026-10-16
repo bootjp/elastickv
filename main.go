@@ -2718,6 +2718,7 @@ var _ kv.LeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseReadableCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.AllGroupsLeaseTimestampCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.GroupRoutableCoordinator = (*startupGatedCoordinator)(nil)
+var _ kv.LocalLeaderGroupsCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.RaftMembershipCoordinator = (*startupGatedCoordinator)(nil)
 var _ kv.TimestampAllocatorProvider = (*startupGatedCoordinator)(nil)
 var _ kv.ConfiguredTimestampAllocatorProvider = (*startupGatedCoordinator)(nil)
@@ -2949,6 +2950,14 @@ func (c startupGatedCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 		return router.EngineGroupIDForKey(key)
 	}
 	return 0
+}
+
+// LocalLeaderGroupIDs forwards the data groups this node leads. The Redis delta
+// compactor reaches it through WithKeyVizLabel to scope the TTL-inline migration
+// to locally led groups; without this forward every node falls back to
+// full-keyspace migration scans.
+func (c startupGatedCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) {
+	return kv.LocalLeaderGroupIDsThrough(c.inner)
 }
 
 func (c startupGatedCoordinator) RaftMembers(ctx context.Context) ([]kv.RaftMember, error) {

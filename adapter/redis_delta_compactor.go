@@ -75,6 +75,8 @@ type DeltaCompactor struct {
 	stateMu       sync.Mutex
 	backoffUntil  time.Time
 	handlerCursor int
+
+	ttlInlineGroupsUnknownOnce sync.Once
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.

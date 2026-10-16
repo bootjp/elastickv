@@ -27,10 +27,6 @@ type ttlInlineGroupScanner interface {
 	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
 }
 
-type ttlInlineLocalLeaderGroups interface {
-	LocalLeaderGroupIDs() []uint64
-}
-
 type ttlInlineMigrationScanPlan struct {
 	cursorName string
 	groupID    uint64
@@ -242,22 +238,38 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	return nil
 }
 
+// ttlInlineMigrationScanPlans scans only the groups this node leads when the
+// store can scan one group and the coordinator knows which groups those are. A
+// known empty list means this node leads no group and plans nothing. When the
+// groups are unknown the migrator falls back to one full-keyspace scan,
+// filtered per key by IsLeaderForKey, rather than migrating nothing.
 func (c *DeltaCompactor) ttlInlineMigrationScanPlans(h ttlInlineMigrationHandler) []ttlInlineMigrationScanPlan {
 	scanner, hasGroupScanner := c.st.(ttlInlineGroupScanner)
-	groups, hasLocalGroups := c.coord.(ttlInlineLocalLeaderGroups)
-	if hasGroupScanner && hasLocalGroups {
-		groupIDs := groups.LocalLeaderGroupIDs()
-		plans := make([]ttlInlineMigrationScanPlan, 0, len(groupIDs))
-		for _, groupID := range groupIDs {
-			plans = append(plans, ttlInlineMigrationScanPlan{
-				cursorName: ttlInlineMigrationGroupCursorName(h.typeName, groupID),
-				groupID:    groupID,
-				scanner:    scanner,
-			})
+	if hasGroupScanner {
+		if groupIDs, known := kv.LocalLeaderGroupIDsThrough(c.coord); known {
+			plans := make([]ttlInlineMigrationScanPlan, 0, len(groupIDs))
+			for _, groupID := range groupIDs {
+				plans = append(plans, ttlInlineMigrationScanPlan{
+					cursorName: ttlInlineMigrationGroupCursorName(h.typeName, groupID),
+					groupID:    groupID,
+					scanner:    scanner,
+				})
+			}
+			return plans
 		}
-		return plans
+		c.warnTTLInlineLocalLeaderGroupsUnknown()
 	}
 	return []ttlInlineMigrationScanPlan{{cursorName: h.typeName}}
+}
+
+// warnTTLInlineLocalLeaderGroupsUnknown logs once when the store can scan one
+// group but the coordinator cannot name the groups this node leads. In the
+// server that means a coordinator decorator dropped LocalLeaderGroupIDs, and
+// every node is back to full-keyspace migration scans.
+func (c *DeltaCompactor) warnTTLInlineLocalLeaderGroupsUnknown() {
+	c.ttlInlineGroupsUnknownOnce.Do(func() {
+		c.logger.Warn("ttl inline migrator: coordinator does not report local leader groups; falling back to full-keyspace scans")
+	})
 }
 
 func ttlInlineMigrationGroupCursorName(typeName string, groupID uint64) string {

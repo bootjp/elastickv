@@ -71,15 +71,17 @@ func TestRedisTTLInlineMigrationScansLocalLeaderGroupsThroughStartupGate(t *test
 		3: {Engine: follower},
 	}, 1, kv.NewHLC(), nil)
 	localLeaders := []uint64{1, 2}
-	require.Equal(t, localLeaders, coord.LocalLeaderGroupIDs())
+	ids, known := coord.LocalLeaderGroupIDs()
+	require.True(t, known)
+	require.Equal(t, localLeaders, ids)
 
 	gate := &startupPublicKVGate{}
 	gate.markReady()
 	gated := startupGatedCoordinator{inner: coord, gate: gate}
 
-	labeled, ok := kv.WithKeyVizLabel(gated, keyviz.LabelRedis).(interface{ LocalLeaderGroupIDs() []uint64 })
-	require.True(t, ok, "the Redis compactor's coordinator must expose LocalLeaderGroupIDs")
-	require.Equal(t, localLeaders, labeled.LocalLeaderGroupIDs(),
+	ids, known = kv.LocalLeaderGroupIDsThrough(kv.WithKeyVizLabel(gated, keyviz.LabelRedis))
+	require.True(t, known, "the Redis compactor's coordinator must know its local leader groups")
+	require.Equal(t, localLeaders, ids,
 		"the local leader groups must survive the startup gate and the keyviz label")
 
 	st := &groupScanRecordingStore{MVCCStore: store.NewMVCCStore()}

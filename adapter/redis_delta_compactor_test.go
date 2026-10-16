@@ -559,8 +559,8 @@ type localLeaderGroupCompactionCoordinator struct {
 	groupIDs []uint64
 }
 
-func (c *localLeaderGroupCompactionCoordinator) LocalLeaderGroupIDs() []uint64 {
-	return append([]uint64(nil), c.groupIDs...)
+func (c *localLeaderGroupCompactionCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) {
+	return append([]uint64(nil), c.groupIDs...), true
 }
 
 type recordingTTLInlineGroupScanStore struct {
@@ -612,6 +612,85 @@ func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
 	meta, err := store.UnmarshalHashMeta(raw)
 	require.NoError(t, err)
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
+// capabilityHidingCompactionCoordinator forwards only the kv.Coordinator
+// methods, the way a decorator that forgets an optional forward does.
+type capabilityHidingCompactionCoordinator struct {
+	kv.Coordinator
+}
+
+// The coordinator the compactor holds is wrapped in WithKeyVizLabel, which
+// always exposes LocalLeaderGroupIDs. When a decorator underneath hides the
+// capability the answer must stay unknown and the migrator must fall back to a
+// full-keyspace scan; answering "no groups" there planned nothing and silently
+// stopped the migration in production. A known empty list is different: this
+// node leads no group, so there is nothing for it to migrate.
+func TestDeltaCompactor_TTLInlineScanPlanWhenLocalLeaderGroupsUnknownOrEmpty(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		wrap         func(kv.Coordinator) kv.Coordinator
+		groupIDs     []uint64
+		wantFullScan bool
+		wantMigrated bool
+	}{
+		{
+			name: "unknown behind a decorator",
+			wrap: func(c kv.Coordinator) kv.Coordinator {
+				return capabilityHidingCompactionCoordinator{Coordinator: c}
+			},
+			groupIDs:     []uint64{2},
+			wantFullScan: true,
+			wantMigrated: true,
+		},
+		{
+			name:     "known with no local leader group",
+			wrap:     func(c kv.Coordinator) kv.Coordinator { return c },
+			groupIDs: []uint64{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := &recordingTTLInlineGroupScanStore{MVCCStore: store.NewMVCCStore()}
+			inner := &localLeaderGroupCompactionCoordinator{
+				shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+					localAdapterCoordinator: newLocalAdapterCoordinator(st),
+				},
+				groupIDs: tc.groupIDs,
+			}
+			c := NewDeltaCompactor(st, tc.wrap(inner), WithDeltaCompactorMaxDeltaCount(2))
+
+			key := []byte("ttl:migrate:group-plan")
+			expireAt := time.Now().Add(time.Hour)
+			legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+			binary.BigEndian.PutUint64(legacyMeta, 1)
+			require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), legacyMeta, 1, 0))
+			require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+			require.NoError(t, c.SyncOnce(ctx))
+
+			require.Empty(t, st.groupScans)
+			if tc.wantFullScan {
+				require.Contains(t, st.fullStarts, store.HashMetaPrefix)
+			} else {
+				require.NotContains(t, st.fullStarts, store.HashMetaPrefix)
+			}
+			raw, err := st.GetAt(ctx, store.HashMetaKey(key), st.LastCommitTS())
+			require.NoError(t, err)
+			meta, err := store.UnmarshalHashMeta(raw)
+			require.NoError(t, err)
+			wantExpireAt := uint64(0)
+			if tc.wantMigrated {
+				wantExpireAt = redisExpireAtMillis(expireAt)
+			}
+			require.Equal(t, wantExpireAt, meta.ExpireAt)
+		})
+	}
 }
 
 func TestDeltaCompactor_TTLInlineMigratesEmptyCollectionKeys(t *testing.T) {
