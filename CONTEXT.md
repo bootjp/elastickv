@@ -326,7 +326,8 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
   `.fsm` snapshot into a vendor-independent per-adapter directory tree and
   back. The decoder reads the `fsm-snap/<index>.fsm` file a node persists
   as well as encoder output; a snapshot holding encrypted entries is not
-  decodable offline.
+  decodable offline, and a dump omits the write of a committed cross-shard
+  transaction whose secondary lock was still unresolved at snapshot time.
   (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
   `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`,
   `docs/design/2026_09_26_proposed_positioning_and_roadmap.md` §4)

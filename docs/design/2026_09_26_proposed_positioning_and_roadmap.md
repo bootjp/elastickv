@@ -118,8 +118,9 @@ README will present scope in two tiers instead of a non-goals section.
   restore tooling (since #1267 and #1276 the decoder reads the
   `fsm-snap/<index>.fsm` file a node persists, in either store snapshot
   format, as well as encoder output; a snapshot holding encrypted entries
-  is not decodable offline, §4), physical snapshot publish / restore
-  tooling for an
+  is not decodable offline, and a dump omits the write of a committed
+  cross-shard transaction whose secondary lock was still unresolved at
+  snapshot time, §4), physical snapshot publish / restore tooling for an
   S3-compatible object store (the periodic scheduler is not yet wired into
   the server; that is the design's M3), Pebble SST ingest snapshot
   transfer, admin dashboard with data
@@ -262,10 +263,13 @@ Composed-1 gate (the Composed-1 design's M5 "error on unpinned" step,
 extended to resolver-routed keys, in its own design doc) lands. The README
 caveat names this third exclusion with the other two. The README backup
 section may describe `elastickv-snapshot-decode` as reading the `.fsm`
-files a node persists (#1267, #1276) and names the limits the §4 row
+files a node persists (#1267, #1276) and names both limits the §4 row
 keeps open: a snapshot holding encrypted entries is not decodable
-offline. A `NOTLEADER` that a later read contradicts is an anomaly
-independent of the timestamp and read-lock fixes.
+offline, and a dump omits the write of a committed cross-shard
+transaction whose secondary lock was still unresolved when the snapshot
+was taken, so such a dump is not a complete restore source. A
+`NOTLEADER` that a later read contradicts is an anomaly independent of
+the timestamp and read-lock fixes.
 
 ### 6.2 Security milestone
 
