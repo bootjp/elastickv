@@ -195,3 +195,9 @@ func (s *S3Server) observeS3BlobOffloadDecision(ctx context.Context) s3BlobOfflo
 	}
 	return decision
 }
+
+// s3BlobOffloadSelected records the offload decision for one upload and
+// reports whether its chunks go to replicated chunkblobs.
+func (s *S3Server) s3BlobOffloadSelected(ctx context.Context) bool {
+	return s.observeS3BlobOffloadDecision(ctx).mode == s3BlobOffloadModeOffload
+}

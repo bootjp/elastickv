@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/bootjp/elastickv/adapter"
+	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
@@ -99,7 +100,7 @@ func openSQSListener(ctx context.Context, lc *net.ListenConfig, sqsAddr string) 
 	return l, nil
 }
 
-// loadSQSStaticCredentials wraps loadSigV4StaticCredentialsFile with
+// loadSQSStaticCredentials wraps serverwiring.LoadSigV4StaticCredentials with
 // the listenless-mode short-circuit: when sqsAddr is empty there is
 // no public HTTP listener and the admin /admin/api/v1/sqs/* endpoints
 // bypass SigV4, so the credentials file is not needed at all.
@@ -110,7 +111,8 @@ func loadSQSStaticCredentials(credentialsFile, sqsAddr string) (map[string]strin
 	if sqsAddr == "" {
 		return nil, nil
 	}
-	return loadSigV4StaticCredentialsFile(credentialsFile, "sqs")
+	creds, err := serverwiring.LoadSigV4StaticCredentials(credentialsFile, "sqs")
+	return creds, errors.WithStack(err)
 }
 
 // closeSQSListenerOnError closes the listener after another startup

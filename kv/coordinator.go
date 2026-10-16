@@ -749,7 +749,7 @@ func prepareDispatchRetry(ctx context.Context, reqs *OperationGroup[OP], leaderA
 // monotonicity across the leader transition.
 func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	if !c.IsLeader() {
-		c.observeElems(reqs.Elems)
+		c.observeElems(reqs.Elems, reqs.KeyVizLabel)
 		return c.redirect(ctx, reqs)
 	}
 
@@ -784,9 +784,9 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
-		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.ObservedRouteVersion)
+		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.ObservedRouteVersion, reqs.KeyVizLabel)
 	} else {
-		resp, err = c.dispatchRaw(ctx, reqs.Elems)
+		resp, err = c.dispatchRaw(ctx, reqs.Elems, reqs.KeyVizLabel)
 	}
 	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
 	return resp, err
@@ -1109,7 +1109,7 @@ func (c *Coordinate) LinearizableRead(ctx context.Context) (uint64, error) {
 }
 
 func (c *Coordinate) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	c.observeRead(key)
+	c.observeRead(ctx, key)
 	return c.LinearizableRead(ctx)
 }
 
@@ -1215,7 +1215,7 @@ func engineLeaseAckValid(state raftengine.State, ack, now monoclock.Instant, lea
 }
 
 func (c *Coordinate) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	c.observeRead(key)
+	c.observeRead(ctx, key)
 	return c.LeaseRead(ctx)
 }
 
@@ -1302,7 +1302,7 @@ func (c *Coordinate) resolveDispatchCommitTS(ctx context.Context, commitTS, star
 	return retry, nil
 }
 
-func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64, prevCommitTS uint64, observedRouteVersion uint64) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64, prevCommitTS uint64, observedRouteVersion uint64, label keyviz.Label) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
@@ -1322,7 +1322,7 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	if err := ValidateElemCommitTSPatches(reqs, commitTS); err != nil {
 		return nil, err
 	}
-	c.observeElems(reqs)
+	c.observeElems(reqs, label)
 
 	// ReadKeys are included in the Raft log entry so the FSM validates
 	// read-write conflicts atomically under applyMu, eliminating the TOCTOU
@@ -1345,11 +1345,11 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	}, nil
 }
 
-func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP], label keyviz.Label) (*CoordinateResponse, error) {
 	muts := make([]*pb.Mutation, 0, len(req))
 	for _, elem := range req {
 		mut := elemToMutation(elem)
-		c.observeMutation(mut)
+		c.observeMutation(mut, label)
 		muts = append(muts, mut)
 	}
 
@@ -1374,12 +1374,16 @@ func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP]) (*Coordin
 	}, nil
 }
 
-func (c *Coordinate) observeElems(elems []*Elem[OP]) {
+// observeElems records write evidence for a dispatch under the adapter label
+// WithKeyVizLabel stamped on it. The sampler keeps the label only when its
+// KeyVizLabelsEnabled option is set and folds it into the legacy row
+// otherwise.
+func (c *Coordinate) observeElems(elems []*Elem[OP], label keyviz.Label) {
 	if c == nil {
 		return
 	}
 	for _, elem := range elems {
-		c.observeMutation(elemToMutation(elem))
+		c.observeMutation(elemToMutation(elem), label)
 	}
 }
 
@@ -1400,12 +1404,14 @@ func (c *Coordinate) ObserveForwardedRequests(reqs []*pb.Request) {
 			if mut == nil || isTxnMetaKey(mut.Key) {
 				continue
 			}
-			c.observeMutation(mut)
+			// The follower that took the request knew its adapter; the
+			// forwarded wire request does not carry it.
+			c.observeMutation(mut, keyviz.LabelLegacy)
 		}
 	}
 }
 
-func (c *Coordinate) observeMutation(mut *pb.Mutation) {
+func (c *Coordinate) observeMutation(mut *pb.Mutation, label keyviz.Label) {
 	cfg := c.samplerSnapshot()
 	if cfg == nil || mut == nil {
 		return
@@ -1414,10 +1420,12 @@ func (c *Coordinate) observeMutation(mut *pb.Mutation) {
 	if !ok {
 		return
 	}
-	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpWrite, len(mut.Value), keyviz.LabelLegacy)
+	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpWrite, len(mut.Value), label)
 }
 
-func (c *Coordinate) observeRead(key []byte) {
+// observeRead records read evidence under the adapter label WithKeyVizLabel
+// put on ctx, or the legacy label when there is none.
+func (c *Coordinate) observeRead(ctx context.Context, key []byte) {
 	cfg := c.samplerSnapshot()
 	if cfg == nil {
 		return
@@ -1426,7 +1434,7 @@ func (c *Coordinate) observeRead(key []byte) {
 	if !ok {
 		return
 	}
-	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpRead, 0, keyviz.LabelLegacy)
+	cfg.sampler.Observe(routeID, sampleKey, keyviz.OpRead, 0, keyVizLabelFromContext(ctx))
 }
 
 func (c *Coordinate) samplerSnapshot() *samplerConfig {

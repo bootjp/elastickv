@@ -81,7 +81,7 @@ func TestRedisTTLInlineMigrationScansLocalLeaderGroupsThroughStartupGate(t *test
 
 	gate := &startupPublicKVGate{}
 	gate.markReady()
-	gated := startupGatedCoordinator{inner: coord, gate: gate}
+	gated := newStartupGatedCoordinator(coord, gate)
 
 	ids, known = kv.LocalLeaderGroupIDsThrough(kv.WithKeyVizLabel(gated, keyviz.LabelRedis))
 	require.True(t, known, "the Redis compactor's coordinator must know its local leader groups")

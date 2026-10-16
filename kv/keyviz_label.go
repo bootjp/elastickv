@@ -4,7 +4,6 @@ import (
 	"context"
 
 	"github.com/bootjp/elastickv/keyviz"
-	"github.com/cockroachdb/errors"
 )
 
 type keyVizLabelContextKey struct{}
@@ -28,16 +27,18 @@ func keyVizLabelFromContext(ctx context.Context) keyviz.Label {
 }
 
 // WithKeyVizLabel returns a Coordinator wrapper that stamps all dispatches and
-// key-routed lease reads with the supplied adapter label.
+// key-routed lease reads with the supplied adapter label. Every other call and
+// capability is forwarded unchanged by the embedded CoordinatorForwarder.
 func WithKeyVizLabel(c Coordinator, label keyviz.Label) Coordinator {
 	if c == nil || label == keyviz.LabelLegacy {
 		return c
 	}
-	return keyVizLabeledCoordinator{inner: c, label: label}
+	return keyVizLabeledCoordinator{CoordinatorForwarder: CoordinatorForwarder{Inner: c}, label: label}
 }
 
 type keyVizLabeledCoordinator struct {
-	inner Coordinator
+	CoordinatorForwarder
+
 	label keyviz.Label
 }
 
@@ -47,182 +48,31 @@ func (c keyVizLabeledCoordinator) Dispatch(ctx context.Context, reqs *OperationG
 		copied.KeyVizLabel = c.label
 		reqs = &copied
 	}
-	resp, err := c.inner.Dispatch(ctx, reqs)
-	return resp, errors.WithStack(err)
-}
-
-func (c keyVizLabeledCoordinator) IsLeader() bool { return c.inner.IsLeader() }
-
-func (c keyVizLabeledCoordinator) VerifyLeader(ctx context.Context) error {
-	return errors.WithStack(c.inner.VerifyLeader(ctx))
-}
-
-func (c keyVizLabeledCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
-	idx, err := c.inner.LinearizableRead(ctx)
-	return idx, errors.WithStack(err)
+	return c.CoordinatorForwarder.Dispatch(ctx, reqs)
 }
 
 func (c keyVizLabeledCoordinator) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	ctx = contextWithKeyVizLabel(ctx, c.label)
-	if lr, ok := c.inner.(interface {
-		LinearizableReadForKey(context.Context, []byte) (uint64, error)
-	}); ok {
-		idx, err := lr.LinearizableReadForKey(ctx, key)
-		return idx, errors.WithStack(err)
-	}
-	idx, err := c.inner.LinearizableRead(ctx)
-	return idx, errors.WithStack(err)
-}
-
-func (c keyVizLabeledCoordinator) RaftLeader() string { return c.inner.RaftLeader() }
-
-func (c keyVizLabeledCoordinator) IsLeaderForKey(key []byte) bool {
-	return c.inner.IsLeaderForKey(key)
-}
-
-func (c keyVizLabeledCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
-	return errors.WithStack(c.inner.VerifyLeaderForKey(ctx, key))
-}
-
-func (c keyVizLabeledCoordinator) RaftLeaderForKey(key []byte) string {
-	return c.inner.RaftLeaderForKey(key)
-}
-
-func (c keyVizLabeledCoordinator) Clock() *HLC { return c.inner.Clock() }
-
-func (c keyVizLabeledCoordinator) TimestampAllocator() TimestampAllocator {
-	alloc, _ := TimestampAllocatorThrough(c.inner)
-	return alloc
-}
-
-func (c keyVizLabeledCoordinator) ConfiguredTimestampAllocator() TimestampAllocator {
-	alloc, _ := ConfiguredTimestampAllocatorThrough(c.inner)
-	return alloc
+	return c.CoordinatorForwarder.LinearizableReadForKey(contextWithKeyVizLabel(ctx, c.label), key)
 }
 
 func (c keyVizLabeledCoordinator) Next(ctx context.Context) (uint64, error) {
-	ctx = contextWithKeyVizLabel(ctx, c.label)
-	if alloc, ok := c.inner.(TimestampAllocator); ok {
-		ts, err := alloc.Next(ctx)
-		return ts, errors.WithStack(err)
-	}
-	return NextTimestampThrough(ctx, c.inner, "allocate keyviz-labeled timestamp")
+	return c.CoordinatorForwarder.Next(contextWithKeyVizLabel(ctx, c.label))
 }
 
 func (c keyVizLabeledCoordinator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
-	ctx = contextWithKeyVizLabel(ctx, c.label)
-	if after, ok := c.inner.(TimestampAfterAllocator); ok {
-		ts, err := after.NextAfter(ctx, min)
-		return ts, errors.WithStack(err)
-	}
-	return NextTimestampAfterThrough(ctx, c.inner, min, "allocate keyviz-labeled timestamp after observed ts")
+	return c.CoordinatorForwarder.NextAfter(contextWithKeyVizLabel(ctx, c.label), min)
 }
 
 func (c keyVizLabeledCoordinator) RecoverHLCLease(ctx context.Context) error {
-	ctx = contextWithKeyVizLabel(ctx, c.label)
-	if recoverer, ok := c.inner.(hlcLeaseRecoverer); ok {
-		return errors.WithStack(recoverer.RecoverHLCLease(ctx))
-	}
-	return errors.WithStack(errHLCLeaseRecoveryUnavailable)
-}
-
-func (c keyVizLabeledCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
-	voucher, ok := c.inner.(AppliedReadTimestampVoucher)
-	if !ok {
-		return errors.WithStack(ErrTSOProtocolUnsupported)
-	}
-	return errors.WithStack(voucher.VouchAppliedReadTimestamp(timestamp, ref))
-}
-
-func (c keyVizLabeledCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
-	if revoker, ok := c.inner.(AppliedReadTimestampVoucherRevoker); ok {
-		revoker.RevokeAppliedReadTimestamp(timestamp, ref)
-	}
-}
-
-func (c keyVizLabeledCoordinator) SupportsAppliedReadTimestampVoucher() bool {
-	if support, ok := c.inner.(AppliedReadTimestampVoucherSupport); ok {
-		return support.SupportsAppliedReadTimestampVoucher()
-	}
-	_, ok := c.inner.(AppliedReadTimestampVoucher)
-	return ok
-}
-
-func (c keyVizLabeledCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
-	if lr, ok := c.inner.(LeaseReadableCoordinator); ok {
-		idx, err := lr.LeaseRead(ctx)
-		return idx, errors.WithStack(err)
-	}
-	idx, err := c.inner.LinearizableRead(ctx)
-	return idx, errors.WithStack(err)
+	return c.CoordinatorForwarder.RecoverHLCLease(contextWithKeyVizLabel(ctx, c.label))
 }
 
 func (c keyVizLabeledCoordinator) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
-	ctx = contextWithKeyVizLabel(ctx, c.label)
-	if lr, ok := c.inner.(LeaseReadableCoordinator); ok {
-		idx, err := lr.LeaseReadForKey(ctx, key)
-		return idx, errors.WithStack(err)
-	}
-	idx, err := c.inner.LinearizableRead(ctx)
-	return idx, errors.WithStack(err)
+	return c.CoordinatorForwarder.LeaseReadForKey(contextWithKeyVizLabel(ctx, c.label), key)
 }
 
-func (c keyVizLabeledCoordinator) LeaseReadAllGroups(ctx context.Context) error {
-	if ag, ok := c.inner.(AllGroupsLeaseReadableCoordinator); ok {
-		return errors.WithStack(ag.LeaseReadAllGroups(ctx))
-	}
-	_, err := LeaseReadThrough(c.inner, ctx)
-	return errors.WithStack(err)
-}
-
-func (c keyVizLabeledCoordinator) LeaseReadAllGroupsTimestamp(ctx context.Context) (uint64, error) {
-	return LeaseReadAllGroupsTimestampThrough(c.inner, ctx)
-}
-
-// IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup forward the
-// group-keyed read-fence path. The Redis adapter wraps its coordinator with
-// WithKeyVizLabel, so this is the outermost type the fence type-asserts against;
-// omitting these makes every fence target fall back to key resolution and
-// silently re-introduces the legacy wide-column group collapse.
-func (c keyVizLabeledCoordinator) IsLeaderForGroup(groupID uint64) bool {
-	gr, ok := c.inner.(GroupLeaderRoutableCoordinator)
-	if !ok {
-		return false
-	}
-	return gr.IsLeaderForGroup(groupID)
-}
-
-func (c keyVizLabeledCoordinator) RaftLeaderForGroup(groupID uint64) string {
-	gr, ok := c.inner.(GroupLeaderRoutableCoordinator)
-	if !ok {
-		return ""
-	}
-	return gr.RaftLeaderForGroup(groupID)
-}
-
+// LeaseReadForGroup is part of the group-keyed read-fence path; the Redis
+// adapter's fence type-asserts this wrapper, the outermost one it holds.
 func (c keyVizLabeledCoordinator) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
-	ctx = contextWithKeyVizLabel(ctx, c.label)
-	if lr, ok := c.inner.(interface {
-		LeaseReadForGroup(context.Context, uint64) (uint64, error)
-	}); ok {
-		idx, err := lr.LeaseReadForGroup(ctx, groupID)
-		return idx, errors.WithStack(err)
-	}
-	idx, err := c.inner.LinearizableRead(ctx)
-	return idx, errors.WithStack(err)
-}
-
-func (c keyVizLabeledCoordinator) EngineGroupIDForKey(key []byte) uint64 {
-	if gr, ok := c.inner.(GroupRoutableCoordinator); ok {
-		return gr.EngineGroupIDForKey(key)
-	}
-	return 0
-}
-
-// LocalLeaderGroupIDs forwards which data groups the inner coordinator leads.
-// An inner coordinator without the capability stays unknown instead of
-// answering "no groups": the TTL-inline migrator then falls back to a
-// whole-prefix scan rather than planning nothing.
-func (c keyVizLabeledCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) {
-	return LocalLeaderGroupIDsThrough(c.inner)
+	return c.CoordinatorForwarder.LeaseReadForGroup(contextWithKeyVizLabel(ctx, c.label), groupID)
 }

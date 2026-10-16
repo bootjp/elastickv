@@ -324,11 +324,19 @@ only; decisions live in `docs/design/`, invariants in `CLAUDE.md`.
 
 - **logical snapshot decoder / encoder** — Offline tools that turn a native
   `.fsm` snapshot into a vendor-independent per-adapter directory tree and
-  back. Today the decoder cannot read a snapshot taken from a live Pebble
-  store (it rejects the store's `_meta_last_commit_ts` entry), so this path
-  works only for snapshots the encoder produced; the fix is on the
-  serializable-audit roadmap. (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
-  `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`)
+  back. The decoder reads the `fsm-snap/<index>.fsm` file a node persists
+  as well as encoder output, and dumps that one Raft group's DynamoDB, S3,
+  Redis, and SQS keyspaces. A snapshot holding encrypted entries is not
+  decodable offline, and a dump is not a complete restore source: it can
+  omit committed data (a write whose secondary lock was still unresolved,
+  a value staged by an in-flight range migration, and keyspaces outside
+  those four adapters, such as gRPC RawKV and filesystem keys), it ignores
+  storage-level expiry, it reflects the snapshot's applied index rather
+  than the Raft log after it, and dumps of several groups do not share a
+  point in time.
+  (`docs/design/2026_04_29_implemented_snapshot_logical_decoder.md`,
+  `docs/design/2026_05_25_implemented_snapshot_logical_encoder.md`,
+  `docs/design/2026_09_26_proposed_positioning_and_roadmap.md` §4)
 - **logical backup (Phase 1)** — Live, cluster-wide point-in-time extraction
   across Raft groups through `BeginBackup` / `RenewBackup` / `EndBackup`, in
   the same on-disk format as the offline tools.

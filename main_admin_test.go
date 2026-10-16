@@ -30,6 +30,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	crdberrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
@@ -693,6 +694,39 @@ func TestTranslateAdminTablesError_UnrelatedErrorPassesThrough(t *testing.T) {
 	// ErrTablesNotLeader.
 	require.NotErrorIs(t, out, admin.ErrTablesNotLeader)
 	require.Equal(t, in, out)
+}
+
+// TestTranslateAdminObjectsError pins the object-tier sentinel mapping. An
+// admin upload refused by the S3 PUT admission limiter comes back from the
+// adapter marked ErrAdminUploadThrottled and must become the retryable 503
+// sentinel rather than a 500.
+func TestTranslateAdminObjectsError(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		in   error
+		want error
+	}{
+		{
+			name: "upload throttled",
+			in: crdberrors.WithStack(crdberrors.Mark(
+				errors.New("s3 put admission budget exhausted"), adapter.ErrAdminUploadThrottled)),
+			want: admin.ErrObjectsUploadThrottled,
+		},
+		{name: "upload too large", in: adapter.ErrAdminUploadTooLarge, want: admin.ErrObjectsUploadTooLarge},
+		{name: "bucket not found", in: adapter.ErrAdminBucketNotFound, want: admin.ErrObjectsBucketNotFound},
+		{
+			name: "invalid continuation token",
+			in:   crdberrors.Wrap(adapter.ErrAdminInvalidContinuationToken, "continuation token does not match request"),
+			want: admin.ErrObjectsValidation,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.ErrorIs(t, translateAdminObjectsError(tc.in), tc.want)
+		})
+	}
 }
 
 // TestTranslateAdminItemsError_LeaderChurn is the items-tier

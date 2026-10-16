@@ -16,7 +16,10 @@ import (
 )
 
 type s3ChunkUploadConfig struct {
-	request            *http.Request
+	// body is the (already size-bounded) payload; contentLength is its
+	// length, or -1 when unknown.
+	body               io.Reader
+	contentLength      int64
 	streamBody         *s3StreamingBody
 	admissionProtocol  string
 	tooLargeMessage    string
@@ -106,8 +109,7 @@ func (u *s3ChunkUploader) uploadNextChunk() (bool, *s3PutBodyError, error) {
 	if err := u.flushBeforeRead(); err != nil {
 		return false, nil, err
 	}
-	request := u.cfg.request
-	readBuf, finalRead := nextS3PutReadBuffer(u.buf, u.cfg.admissionProtocol, request.ContentLength, u.result.SizeBytes)
+	readBuf, finalRead := nextS3PutReadBuffer(u.buf, u.cfg.admissionProtocol, u.cfg.contentLength, u.result.SizeBytes)
 	if len(readBuf) == 0 {
 		return true, nil, nil
 	}
@@ -115,8 +117,8 @@ func (u *s3ChunkUploader) uploadNextChunk() (bool, *s3PutBodyError, error) {
 	if err != nil {
 		return false, nil, errors.WithStack(err)
 	}
-	allowFinalPartial := s3PutReadAllowsFinalPartial(u.cfg.admissionProtocol, request.ContentLength)
-	n, readErr := readS3PutChunk(request.Body, readBuf, allowFinalPartial, finalRead)
+	allowFinalPartial := s3PutReadAllowsFinalPartial(u.cfg.admissionProtocol, u.cfg.contentLength)
+	n, readErr := readS3PutChunk(u.cfg.body, readBuf, allowFinalPartial, finalRead)
 	if readErr != nil && !errors.Is(readErr, io.EOF) {
 		release()
 		return u.classifyReadError(readErr)

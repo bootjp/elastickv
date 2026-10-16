@@ -14,87 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// coordinatorSurface names the value a capability's consumers type-assert
-// against in the server. main.go wraps the ShardedCoordinator in
-// startupGatedCoordinator and hands that to the adapters, and every adapter
-// wraps it again in WithKeyVizLabel.
-type coordinatorSurface int
-
-const (
-	// adapterSurface capabilities are probed by adapters on
-	// WithKeyVizLabel(startupGatedCoordinator), so both wrappers must forward
-	// them.
-	adapterSurface coordinatorSurface = iota + 1
-	// gateSurface capabilities are probed by main on the startupGatedCoordinator
-	// itself; no adapter probes them. If one starts to, move the capability to
-	// adapterSurface and forward it on WithKeyVizLabel with a fallback that
-	// matches what the consumer does when the capability is absent.
-	gateSurface
-	// rawOnly methods are called by main on the ShardedCoordinator it built,
-	// never through a wrapper.
-	rawOnly
-)
-
-// shardedCoordinatorSurfaces classifies every exported ShardedCoordinator
-// method except the With* builders. Adding a method to ShardedCoordinator fails
-// TestStartupWrappersForwardShardedCoordinatorCapabilities until it is listed
-// here.
-var shardedCoordinatorSurfaces = map[string]coordinatorSurface{
-	// kv.Coordinator.
-	"Dispatch":           adapterSurface,
-	"IsLeader":           adapterSurface,
-	"VerifyLeader":       adapterSurface,
-	"LinearizableRead":   adapterSurface,
-	"RaftLeader":         adapterSurface,
-	"IsLeaderForKey":     adapterSurface,
-	"VerifyLeaderForKey": adapterSurface,
-	"RaftLeaderForKey":   adapterSurface,
-	"Clock":              adapterSurface,
-	// Key-routed read fence (kv.LeaderRoutedStore), exposed by WithKeyVizLabel.
-	"LinearizableReadForKey": adapterSurface,
-	// Lease reads.
-	"LeaseRead":                   adapterSurface,
-	"LeaseReadForKey":             adapterSurface,
-	"LeaseReadAllGroups":          adapterSurface,
-	"LeaseReadAllGroupsTimestamp": adapterSurface,
-	// Group-keyed Redis read fence and per-group lease dedup.
-	"IsLeaderForGroup":    adapterSurface,
-	"RaftLeaderForGroup":  adapterSurface,
-	"LeaseReadForGroup":   adapterSurface,
-	"EngineGroupIDForKey": adapterSurface,
-	// Scope of the Redis TTL-inline migration.
-	"LocalLeaderGroupIDs": adapterSurface,
-	// Timestamp allocation and applied-read vouchers.
-	"Next":                                adapterSurface,
-	"NextAfter":                           adapterSurface,
-	"TimestampAllocator":                  adapterSurface,
-	"RecoverHLCLease":                     adapterSurface,
-	"VouchAppliedReadTimestamp":           adapterSurface,
-	"RevokeAppliedReadTimestamp":          adapterSurface,
-	"SupportsAppliedReadTimestampVoucher": adapterSurface,
-
-	// internalServerOptions installs the route-floor gate and the
-	// forwarded-write observer from the startup gate for Internal.Forward.
-	"EnsureMutationsWriteAllowed": gateSurface,
-	"ObserveForwardedRequests":    gateSurface,
-	// newS3BlobCluster discovers peers through the startup gate.
-	"RaftMembers":       gateSurface,
-	"RaftMembersForKey": gateSurface,
-
-	// Lifecycle and HLC lease renewal, driven by main on in.coordinate.
-	"Close":                     rawOnly,
-	"RunHLCLeaseRenewal":        rawOnly,
-	"SetHLCLeaseRenewalBlocker": rawOnly,
-	"ProposeHLCLease":           rawOnly,
-	// Installed on the read tracker from the typed coordinator.
-	"ObserveTimestampFloor": rawOnly,
-	// Autosplit is configured with the typed *kv.ShardedCoordinator.
-	"GroupLeadership":  rawOnly,
-	"LeadershipForKey": rawOnly,
-	// The legacy TSO bridge wraps the typed coordinator (configureLegacyCoordinatorTSO).
-	"IsTimestampLeader": rawOnly,
-}
-
 var errSpyForwarded = errors.New("forwarded from the wrapped coordinator")
 
 const (
@@ -287,21 +206,21 @@ type startupWrapperSurface struct {
 func startupGateOver(inner kv.Coordinator) kv.Coordinator {
 	gate := &startupPublicKVGate{}
 	gate.markReady()
-	return startupGatedCoordinator{inner: inner, gate: gate}
+	return newStartupGatedCoordinator(inner, gate)
 }
 
-var (
-	startupGateSurface = startupWrapperSurface{
-		name: "startupGatedCoordinator",
-		wrap: startupGateOver,
-	}
-	adapterCoordinatorSurface = startupWrapperSurface{
+// startupWrapperSurfaces are the values capability consumers type-assert in
+// the server: main probes the startup gate itself, and every adapter probes
+// WithKeyVizLabel(startupGatedCoordinator).
+var startupWrapperSurfaces = []startupWrapperSurface{
+	{name: "startupGatedCoordinator", wrap: startupGateOver},
+	{
 		name: "WithKeyVizLabel(startupGatedCoordinator)",
 		wrap: func(inner kv.Coordinator) kv.Coordinator {
 			return kv.WithKeyVizLabel(startupGateOver(inner), keyviz.LabelRedis)
 		},
-	}
-)
+	},
+}
 
 // capabilityChecks replaces the default "call it, expect the same-named method
 // on the wrapped coordinator" check for capabilities a wrapper serves
@@ -322,26 +241,25 @@ var capabilityChecks = map[string]func(*testing.T, kv.Coordinator, *shardedCapab
 	},
 }
 
-// main.go hands the adapters startupGatedCoordinator{ShardedCoordinator}, and
-// each adapter wraps it in WithKeyVizLabel. Capabilities are optional
-// interfaces found by type assertion, so a wrapper that does not forward one
-// fails silently: the probe misses and the consumer quietly takes a fallback,
-// or the outer wrapper answers on the inner's behalf. That has already cost the
-// Redis read fence its group routing, Internal.Forward its route-floor gate,
-// and the Redis TTL-inline migration all of its work, each time with green unit
-// tests that used an unwrapped coordinator. This test requires every
-// ShardedCoordinator capability to be classified by the surface its consumers
-// probe, and every forwarded one to reach the wrapped coordinator and return
-// its result through that surface. The wrappers' own timestamp-allocator
-// surfaces (PhaseD*, ValidateDurableTimestamp, ConfiguredTimestampAllocator)
-// are not ShardedCoordinator methods; the TSO routing tests cover them.
+// TestStartupWrappersForwardShardedCoordinatorCapabilities calls every
+// ShardedCoordinator method not listed in shardedMethodsNotForwarded through
+// both wrappers, against a spy, and requires the call to reach the spy and
+// return its result. TestAdapterCoordinatorWrappersForwardShardedCapabilities
+// checks only that the methods exist. A method can exist and still not
+// forward, when the wrapper probes its inner coordinator through an interface
+// that no longer matches and answers with its own fallback. That is how
+// LocalLeaderGroupIDs stopped the Redis TTL-inline migration while unit tests
+// on an unwrapped coordinator stayed green. The wrappers' own
+// timestamp-allocator surfaces (PhaseD*, ValidateDurableTimestamp,
+// ConfiguredTimestampAllocator) are not ShardedCoordinator methods; the TSO
+// routing tests cover them.
 func TestStartupWrappersForwardShardedCoordinatorCapabilities(t *testing.T) {
 	t.Parallel()
 
 	shardedType := reflect.TypeOf((*kv.ShardedCoordinator)(nil))
-	for name := range shardedCoordinatorSurfaces {
+	for name := range shardedMethodsNotForwarded {
 		_, ok := shardedType.MethodByName(name)
-		require.Truef(t, ok, "ShardedCoordinator.%s no longer exists; drop it from shardedCoordinatorSurfaces", name)
+		require.Truef(t, ok, "ShardedCoordinator.%s no longer exists; drop it from shardedMethodsNotForwarded", name)
 	}
 	sharded := reflect.ValueOf((*kv.ShardedCoordinator)(nil))
 	spyMethods := reflect.ValueOf(newShardedCapabilitySpy())
@@ -351,22 +269,15 @@ func TestStartupWrappersForwardShardedCoordinatorCapabilities(t *testing.T) {
 		if isShardedCoordinatorBuilder(name, sig, shardedType) {
 			continue
 		}
-		surface, ok := shardedCoordinatorSurfaces[name]
-		require.Truef(t, ok, "ShardedCoordinator.%s is not classified in shardedCoordinatorSurfaces: "+
-			"forward it on the wrappers whose consumers probe it, or record why main keeps it on the raw coordinator", name)
-		if surface == rawOnly {
+		if _, notForwarded := shardedMethodsNotForwarded[name]; notForwarded {
 			continue
 		}
 		spyMethod := spyMethods.MethodByName(name)
 		require.Truef(t, spyMethod.IsValid() && spyMethod.Type() == sig,
 			"shardedCapabilitySpy.%s must mirror ShardedCoordinator.%s %s", name, name, sig)
-		surfaces := []startupWrapperSurface{startupGateSurface}
-		if surface == adapterSurface {
-			surfaces = append(surfaces, adapterCoordinatorSurface)
-		}
 		t.Run(name, func(t *testing.T) {
 			t.Parallel()
-			for _, s := range surfaces {
+			for _, s := range startupWrapperSurfaces {
 				t.Run(s.name, func(t *testing.T) {
 					t.Parallel()
 					requireForwardsCapability(t, s, name, sig)
@@ -421,31 +332,4 @@ func capabilityCallArgs(sig reflect.Type) []reflect.Value {
 		}
 	}
 	return args
-}
-
-// plainLinearizableReadCoordinator has a LinearizableRead but no key-routed
-// fence. The embedded interface is nil on purpose: only LinearizableRead is
-// exercised here.
-type plainLinearizableReadCoordinator struct {
-	kv.Coordinator
-
-	reads int
-}
-
-func (c *plainLinearizableReadCoordinator) LinearizableRead(context.Context) (uint64, error) {
-	c.reads++
-	return spyIndex, nil
-}
-
-// An inner coordinator without a key-routed fence owns a single group, so the
-// startup gate serves LinearizableReadForKey from its plain LinearizableRead,
-// the same fallback WithKeyVizLabel uses.
-func TestStartupGatedCoordinatorLinearizableReadForKeyFallsBackToLinearizableRead(t *testing.T) {
-	t.Parallel()
-
-	inner := &plainLinearizableReadCoordinator{}
-	idx, err := startupGatedCoordinator{inner: inner}.LinearizableReadForKey(context.Background(), []byte("k"))
-	require.NoError(t, err)
-	require.Equal(t, spyIndex, idx)
-	require.Equal(t, 1, inner.reads)
 }
