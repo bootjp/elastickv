@@ -490,9 +490,10 @@ func (s *SQSServer) Stop() {
 		// http.Server.Shutdown returns immediately when Serve was
 		// never called (listenless mode — no public listener was
 		// constructed), so this is a no-op for admin-only
-		// deployments. The branch is still gated on httpServer
-		// being non-nil because Shutdown panics on a nil receiver.
-		_ = s.httpServer.Shutdown(context.Background())
+		// deployments. With a listener, shutdownHTTPServer drains
+		// in-flight requests for at most httpShutdownTimeout and then
+		// closes whatever is still connected.
+		shutdownHTTPServer(s.httpServer, "sqs")
 	}
 }
 
