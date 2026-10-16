@@ -625,6 +625,58 @@ func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
 }
 
+// budgetedTTLInlineScanStore ends the tick during its first group scan, the
+// way a tick whose first scan uses up the per-tick budget ends, and records
+// which group and prefix each tick reached.
+type budgetedTTLInlineScanStore struct {
+	store.MVCCStore
+
+	endTick context.CancelFunc
+	scanned map[string]int
+}
+
+func (s *budgetedTTLInlineScanStore) ScanGroupOwnedAt(_ context.Context, groupID uint64, start []byte, _ []byte, _ int, _ uint64) ([]*store.KVPair, []byte, error) {
+	s.scanned[string(start)+"#"+strconv.FormatUint(groupID, 10)]++
+	s.endTick()
+	return nil, nil, nil
+}
+
+// Every TTL-inline scan plan shares one per-tick budget. When the budget runs
+// out partway through the plans, the next tick must start where this one
+// stopped; starting every tick from the first handler's first group starved
+// the later handlers and groups for as long as the earlier ones used the whole
+// budget.
+func TestDeltaCompactor_TTLInlineRotatesPlansAcrossTicksThatRunOutOfBudget(t *testing.T) {
+	t.Parallel()
+
+	st := &budgetedTTLInlineScanStore{MVCCStore: store.NewMVCCStore(), scanned: map[string]int{}}
+	groupIDs := []uint64{1, 2, 3}
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: groupIDs,
+	}
+	c := NewDeltaCompactor(st, coord)
+	handlers := c.ttlInlineMigrationHandlers()
+	plans := len(handlers) * len(groupIDs)
+
+	for range plans {
+		ctx, cancel := context.WithCancel(context.Background())
+		st.endTick = cancel
+		require.ErrorIs(t, c.migrateTTLInlineOnce(ctx, 10), context.Canceled)
+		cancel()
+	}
+
+	want := make(map[string]int, plans)
+	for _, h := range handlers {
+		for _, groupID := range groupIDs {
+			want[string(h.prefix)+"#"+strconv.FormatUint(groupID, 10)] = 1
+		}
+	}
+	require.Equal(t, want, st.scanned, "each tick must reach the plan after the one the previous tick reached")
+}
+
 // newSplitRedisShardStore returns a ShardStore whose catalog sends user keys
 // below "m" to group 1 and the rest to group 2, the way a multi-shard
 // deployment splits the Redis keyspace.
