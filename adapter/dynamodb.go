@@ -310,7 +310,7 @@ func (d *DynamoDBServer) Run() error {
 
 func (d *DynamoDBServer) Stop() {
 	if d.httpServer != nil {
-		_ = d.httpServer.Shutdown(context.Background())
+		shutdownHTTPServer(d.httpServer, "dynamodb")
 	}
 }
 
