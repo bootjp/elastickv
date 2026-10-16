@@ -10,6 +10,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	"github.com/bootjp/elastickv/keyviz"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -129,6 +130,38 @@ func TestValidateAutoSplitDetectorConfigRejectsNonFiniteFloats(t *testing.T) {
 			require.Error(t, validateAutoSplitDetectorConfig(cfg))
 		})
 	}
+}
+
+// SplitRange copies the parent's migration fields onto both children. The
+// autosplit splitter's route conversion must keep them, as the catalog
+// watcher's converter does.
+func TestAutoSplitRouteFromProtoKeepsRouteFields(t *testing.T) {
+	t.Parallel()
+
+	got := autoSplitRouteFromProto(&pb.RouteDescriptor{
+		RouteId:                7,
+		Start:                  []byte("a"),
+		End:                    []byte("m"),
+		RaftGroupId:            3,
+		State:                  pb.RouteState_ROUTE_STATE_ACTIVE,
+		ParentRouteId:          2,
+		SplitAtHlc:             100,
+		StagedVisibilityActive: true,
+		MigrationJobId:         9,
+		MinWriteTsExclusive:    1234,
+	})
+	require.Equal(t, distribution.RouteDescriptor{
+		RouteID:                7,
+		Start:                  []byte("a"),
+		End:                    []byte("m"),
+		GroupID:                3,
+		State:                  distribution.RouteStateActive,
+		ParentRouteID:          2,
+		SplitAtHLC:             100,
+		StagedVisibilityActive: true,
+		MigrationJobID:         9,
+		MinWriteTSExclusive:    1234,
+	}, got)
 }
 
 type fakeAutoSplitLeader struct {
