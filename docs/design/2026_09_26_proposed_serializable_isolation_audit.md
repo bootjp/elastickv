@@ -1015,10 +1015,13 @@ Still open for the fix PRs:
   `ReadSnapshot` could not decode any live Pebble `.fsm` (it failed on
   `_meta_last_commit_ts`, "encoded value length 8 < 9"), a tooling defect
   left as found by this branch and since closed on `main` by #1267
-  (merged 2026-10-15 as `95889d1f`), which skips every reserved metadata
-  key a live store writes through a mirror of the store's classifier
-  pinned by cross-check tests and decodes a live-store snapshot in its
-  reader and CLI tests; `CONTEXT.md` says so.
+  (merged 2026-10-15 as `95889d1f`) for cleartext stores: it skips every
+  reserved metadata key a live store writes through a mirror of the
+  store's classifier pinned by cross-check tests and decodes a live-store
+  snapshot in its reader and CLI tests, while an encrypted entry is still
+  rejected (`ErrSnapshotEncryptedEntry`), so a live snapshot from a store
+  with at-rest encryption enabled remains undecodable offline, an open
+  limitation the roadmap's §4 lists; `CONTEXT.md` says both.
 
 ### A1. Coverage table and adapter fixes
 
