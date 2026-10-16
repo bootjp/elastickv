@@ -3,6 +3,7 @@ package adapter
 import (
 	"context"
 	"io"
+	"log/slog"
 	"net"
 	"net/http"
 	"strconv"
@@ -214,6 +215,9 @@ type SQSServer struct {
 	// nil on non-monitored fixtures; observeThrottleDecision is
 	// nil-safe so the request path pays one branch when unwired.
 	throttleObserver SQSThrottleObserver
+	// workers tracks the goroutines Run starts (retention reaper,
+	// throttle bucket sweep) so Stop can join them before returning.
+	workers sqsWorkers
 }
 
 // SQSPartitionObserver is the metrics-package interface
@@ -462,8 +466,9 @@ func (s *SQSServer) Run() error {
 	s.startReaper(s.reaperCtx)
 	// Throttle bucket idle-evict runs on a background ticker so the
 	// request hot path never pays the O(N) sweep cost. Cleaned up by
-	// the same reaperCtx cancellation that stops the message reaper.
-	go s.throttle.runSweepLoop(s.reaperCtx)
+	// the same reaperCtx cancellation that stops the message reaper,
+	// and joined by Stop like the reaper.
+	s.workers.start(func() { s.throttle.runSweepLoop(s.reaperCtx) })
 	if s.listen == nil {
 		// Listenless mode: the SQS adapter was constructed without a
 		// public HTTP listener (--sqsAddress empty). Admin endpoints
@@ -490,9 +495,19 @@ func (s *SQSServer) Stop() {
 		// http.Server.Shutdown returns immediately when Serve was
 		// never called (listenless mode — no public listener was
 		// constructed), so this is a no-op for admin-only
-		// deployments. The branch is still gated on httpServer
-		// being non-nil because Shutdown panics on a nil receiver.
-		_ = s.httpServer.Shutdown(context.Background())
+		// deployments. With a listener, shutdownHTTPServer drains
+		// in-flight requests for at most httpShutdownTimeout and then
+		// closes whatever is still connected.
+		shutdownHTTPServer(s.httpServer, "sqs")
+	}
+	// The reaper and the bucket sweep observe the cancelled reaperCtx,
+	// but a reaper pass can still be inside a store scan or a Raft
+	// dispatch; give it its bounded window before the caller closes the
+	// stores. In listenless mode nothing above waited at all.
+	if !s.workers.stop(sqsWorkerStopTimeout) {
+		slog.Warn("sqs server: background workers still running after the shutdown bound, continuing",
+			slog.Duration("timeout", sqsWorkerStopTimeout),
+		)
 	}
 }
 

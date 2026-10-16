@@ -120,6 +120,18 @@ type S3Server struct {
 	blobMinReplicas      int
 	blobPushBlocked      func() bool
 	blobBackfiller       *S3BlobBackfiller
+	// adminBlobUsers counts the admin object operations that may use
+	// blobCluster from outside the HTTP listener (see enterAdminBlobUse),
+	// so Stop can wait for them before closing the cluster.
+	adminBlobUsers *inflightGate
+	// cleanupWorkers counts the background cleanups (see startCleanup) so
+	// Stop can join them, bounded, before the blob cluster and the stores
+	// close underneath them.
+	cleanupWorkers *inflightGate
+	// cleanupCtx is the parent of every background cleanup's context;
+	// cancelCleanups ends it once Stop has waited its bound.
+	cleanupCtx     context.Context
+	cancelCleanups context.CancelFunc
 }
 
 type s3BucketMeta struct {
@@ -362,7 +374,10 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		cleanupSem:         make(chan struct{}, s3ManifestCleanupWorkers),
 		putAdmission:       newS3PutAdmissionFromEnv(),
 		blobOffloadEnabled: S3BlobOffloadEnabledFromEnv(),
+		adminBlobUsers:     newInflightGate(),
+		cleanupWorkers:     newInflightGate(),
 	}
+	s.cleanupCtx, s.cancelCleanups = context.WithCancel(context.Background())
 	if localStores, ok := st.(S3BlobLocalStoreResolver); ok {
 		s.blobLocalStores = localStores
 	}
@@ -406,15 +421,38 @@ func (s *S3Server) Run() error {
 	return nil
 }
 
+// Stop ends the background backfill, drains the HTTP listener (bounded,
+// see shutdownHTTPServer), then waits, under one more bound, for the admin
+// object operations still using the blob peer cluster (see
+// enterAdminBlobUse) and for the background cleanups those requests
+// started (see startCleanup). Only then does it close the cluster: an
+// in-flight upload or read that replicates or fetches chunk blobs through
+// it keeps its peers for the whole graceful window instead of failing at
+// once with a closed cluster, and a cleanup finishes its deletes before
+// the stores are closed after Stop. The admin operations are counted
+// separately because they reach this server through the admin listener or
+// the gRPC admin forwarder, which drain on their own; an idle S3 listener
+// finishes its drain at once.
 func (s *S3Server) Stop() {
-	if s != nil && s.blobBackfiller != nil {
+	if s == nil {
+		return
+	}
+	if s.blobBackfiller != nil {
 		s.blobBackfiller.Stop()
 	}
-	if s != nil && s.blobCluster != nil {
-		_ = s.blobCluster.Close()
+	if s.httpServer != nil {
+		shutdownHTTPServer(s.httpServer, "s3")
 	}
-	if s != nil && s.httpServer != nil {
-		_ = s.httpServer.Shutdown(context.Background())
+	deadline := time.Now().Add(httpShutdownTimeout)
+	if !s.adminBlobUsers.drain(time.Until(deadline)) {
+		slog.Warn("s3 server: admin object operations still running after the shutdown bound, closing the blob cluster",
+			slog.Int64("in_flight", s.adminBlobUsers.remaining()),
+			slog.Duration("timeout", httpShutdownTimeout),
+		)
+	}
+	s.drainCleanups(time.Until(deadline))
+	if s.blobCluster != nil {
+		_ = s.blobCluster.Close()
 	}
 }
 
@@ -1481,18 +1519,9 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 }
 
 func (s *S3Server) cleanupUploadPartsAsync(bucket string, generation uint64, objectKey string, uploadID string) {
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		s.cleanupUploadParts(ctx, bucket, generation, objectKey, uploadID)
-	}()
+	})
 }
 
 func (s *S3Server) cleanupUploadParts(ctx context.Context, bucket string, generation uint64, objectKey string, uploadID string) {
@@ -1515,16 +1544,7 @@ func (s *S3Server) cleanupPartBlobsAsync(
 	chunkRefVersion uint64,
 	offloaded bool,
 ) {
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
 		flush := func() {
 			if len(pending) == 0 {
@@ -1555,20 +1575,11 @@ func (s *S3Server) cleanupPartBlobsAsync(
 			}
 		}
 		flush()
-	}()
+	})
 }
 
 func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, objectKey string, uploadID string) {
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		// Delete part descriptors.
 		s.cleanupUploadParts(ctx, bucket, generation, objectKey, uploadID)
 		// Delete legacy blob chunks and offloaded chunk references. Content-
@@ -1577,7 +1588,7 @@ func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, obje
 		s.deleteByPrefix(ctx, blobPrefix, bucket, generation, objectKey, uploadID)
 		chunkRefPrefix := s3keys.ChunkRefPrefixForUpload(bucket, generation, objectKey, uploadID)
 		s.deleteByPrefix(ctx, chunkRefPrefix, bucket, generation, objectKey, uploadID)
-	}()
+	})
 }
 
 func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket string, generation uint64, objectKey string, uploadID string) {
@@ -1834,18 +1845,9 @@ func (s *S3Server) cleanupManifestBlobsAsync(bucket string, generation uint64, o
 	if manifest == nil {
 		return
 	}
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		s.cleanupManifestBlobs(ctx, bucket, generation, objectKey, manifest)
-	}()
+	})
 }
 
 func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest) {
