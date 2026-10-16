@@ -14,7 +14,7 @@ import (
 
 // The backup_crosscheck_*_test.go files pin the adapter encoders that
 // internal/backup re-implements (M4 of
-// docs/design/2026_10_16_proposed_production_commonization.md and the
+// docs/design/2026_10_16_implemented_production_commonization.md and the
 // "duplicated ... covered by a cross-check test" promise of
 // docs/design/2026_05_25_implemented_snapshot_logical_encoder.md).
 // internal/backup may not import this package, so it carries its own copies
