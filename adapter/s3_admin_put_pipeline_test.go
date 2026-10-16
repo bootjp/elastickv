@@ -31,6 +31,7 @@ func TestS3Server_AdminPutObject_HonoursPutAdmission(t *testing.T) {
 	err = server.AdminPutObject(context.Background(), fullAdminBucketsPrincipal(), "admitted", "object",
 		strings.NewReader("payload"), "text/plain")
 	require.True(t, errors.Is(err, errS3PutAdmissionExhausted), "want admission exhaustion; got %v", err)
+	require.True(t, errors.Is(err, ErrAdminUploadThrottled), "the admin bridge keys its 503 off ErrAdminUploadThrottled; got %v", err)
 
 	_, _, err = server.AdminGetObject(context.Background(), fullAdminBucketsPrincipal(), "admitted", "object")
 	require.True(t, errors.Is(err, ErrAdminObjectNotFound), "a refused upload must not commit; got %v", err)

@@ -106,6 +106,12 @@ var ErrObjectsValidation = errors.New("admin s3 objects: invalid request")
 // adapter's ErrAdminUploadTooLarge to this.
 var ErrObjectsUploadTooLarge = errors.New("admin s3 objects: upload exceeds cap")
 
+// ErrObjectsUploadThrottled — the node's S3 PUT admission budget,
+// shared with SigV4 uploads, is exhausted. 503 + Retry-After: 1; the
+// same upload can be retried. The bridge translates the adapter's
+// ErrAdminUploadThrottled to this.
+var ErrObjectsUploadThrottled = errors.New("admin s3 objects: upload throttled")
+
 // ---------- handler entry points (called from S3Handler.ServeHTTP) ----------
 
 // handleObjectsCollection serves GET /buckets/{name}/objects.
@@ -452,6 +458,10 @@ func (h *S3Handler) writeObjectsError(w http.ResponseWriter, r *http.Request, op
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, ErrObjectsUploadTooLarge):
 		WriteMaxBytesError(w)
+	case errors.Is(err, ErrObjectsUploadThrottled):
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusServiceUnavailable, "upload_throttled",
+			"this node's upload budget is exhausted; retry shortly")
 	default:
 		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" object failed",
 			slog.String("bucket", bucket),

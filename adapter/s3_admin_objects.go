@@ -2,9 +2,8 @@ package adapter
 
 import (
 	"context"
-	"crypto/md5" //nolint:gosec // S3 ETag compatibility requires MD5.
-	"encoding/hex"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
@@ -25,6 +24,11 @@ const adminS3UploadMaxBytes int64 = 100 * 1024 * 1024
 // larger than adminS3UploadMaxBytes. The HTTP bridge maps this
 // to 413 Payload Too Large.
 var ErrAdminUploadTooLarge = errors.New("s3 admin: object exceeds upload cap")
+
+// ErrAdminUploadThrottled signals AdminPutObject was refused by the S3 PUT
+// admission limiter, the memory budget admin and SigV4 uploads share. The
+// HTTP bridge maps it to a retryable 503.
+var ErrAdminUploadThrottled = errors.New("s3 admin: upload throttled by PUT admission")
 
 // defaultS3ContentType is the MIME type stored on / surfaced by
 // admin RPCs when the caller (or the manifest) does not name one
@@ -157,7 +161,9 @@ func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string)
 // AdminPutObject creates-or-replaces one object via a streaming
 // upload. Write role required. Caps body size at adminS3UploadMaxBytes
 // (100 MiB) per design §3.3.3; larger objects must use the public
-// SigV4 endpoint with the SDK's multipart path.
+// SigV4 endpoint with the SDK's multipart path. The upload runs the
+// same pipeline as SigV4 PutObject, so it is subject to PUT admission
+// control and uses blob offload when that is enabled.
 //
 // contentType is stored verbatim on the manifest (defaults to
 // application/octet-stream when empty). body is consumed exactly
@@ -171,6 +177,7 @@ func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string)
 //   - ErrAdminInvalidObjectKey   — empty key
 //   - ErrAdminInvalidBucketName  — malformed bucket name
 //   - ErrAdminUploadTooLarge     — body exceeds adminS3UploadMaxBytes
+//   - ErrAdminUploadThrottled    — PUT admission budget exhausted
 func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal, bucket, key string, body io.Reader, contentType string) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
@@ -187,180 +194,66 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 	if body == nil {
 		body = strings.NewReader("")
 	}
+	return s.adminPutObject(ctx, &s3PutObjectInput{
+		// MaxBytesReader with no ResponseWriter only bounds the read; the
+		// overflow surfaces as *http.MaxBytesError, which the upload maps to
+		// a 413 body error.
+		body:            http.MaxBytesReader(nil, io.NopCloser(body), adminS3UploadMaxBytes),
+		contentLength:   -1,
+		streamBody:      &s3StreamingBody{},
+		tooLargeMessage: ErrAdminUploadTooLarge.Error(),
+		contentType:     s3ContentTypeOrDefault(strings.TrimSpace(contentType)),
+	}, bucket, key)
+}
 
-	previous, generation, err := s.adminPutObjectStream(ctx, bucket, key, body, contentType)
+// adminPutObject runs one admin upload through the PutObject stages SigV4
+// uses (prepare, admission pre-check, chunk upload with blob offload when
+// enabled, manifest commit, cleanup on failure) and maps their failures onto
+// the admin sentinels. It makes a single attempt: the chunk fan-out has no
+// idempotency token, so a retry would leak the first attempt's chunks.
+func (s *S3Server) adminPutObject(ctx context.Context, in *s3PutObjectInput, bucket, key string) error {
+	state, err := s.prepareS3PutObject(ctx, in, bucket, key)
 	if err != nil {
-		return err //nolint:wrapcheck // sentinels propagate as-is; wrapped values already carry context.
+		var respErr *s3ResponseError
+		if errors.As(err, &respErr) && respErr.Code == "NoSuchBucket" {
+			return ErrAdminBucketNotFound
+		}
+		return errors.WithStack(err)
 	}
-	if previous != nil {
-		s.cleanupManifestBlobsAsync(bucket, generation, key, previous)
+	defer state.readPin.Release()
+
+	// The body length is unknown, so the pre-check reserves one chunk, as it
+	// does for streaming SigV4 uploads.
+	if err := s.checkS3PutHeadroom(s3ChunkSize, s3PutAdmissionProtocolFixed); err != nil {
+		return errors.WithStack(errors.Mark(err, ErrAdminUploadThrottled))
+	}
+	upload, bodyErr, err := s.uploadS3ObjectData(ctx, in, state, bucket, key, s.s3BlobOffloadSelected(ctx))
+	if err != nil || bodyErr != nil {
+		s.cleanupS3PutObjectChunks(ctx, state, upload, bucket, key)
+		return adminPutUploadError(bodyErr, err)
+	}
+	if _, err := s.commitS3PutObject(ctx, in, state, upload, bucket); err != nil {
+		s.cleanupS3PutObjectChunks(ctx, state, upload, bucket, key)
+		return errors.WithStack(err)
+	}
+	if state.previous != nil {
+		s.cleanupManifestBlobsAsync(bucket, state.meta.Generation, key, state.previous)
 	}
 	return nil
 }
 
-// adminPutObjectStream performs the chunked upload + manifest
-// commit in a single attempt (no retry — the chunk fan-out has
-// no idempotency token, and a partial-then-retry would leak
-// blobs that adminCleanupManifestBlobs on the leaked uploadID
-// would never reach).
-//
-// Returns (previousManifest, generation, err); previousManifest
-// is non-nil when the put REPLACED an existing object and the
-// caller should asynchronously clean up its blob chunks.
-//
-// Mirrors the SigV4 putObject precedent at s3.go (which carries
-// the same `//nolint:cyclop,gocognit,gocyclo,nestif` because the
-// chunk pipeline is a sequential N-stage flow with per-stage
-// cleanup-on-error that needs the local manifest view at every
-// stage; splitting further would obscure the lifecycle).
-//
-//nolint:cyclop,gocognit,nestif // see comment above
-func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string, body io.Reader, contentType string) (*s3ObjectManifest, uint64, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin put object: begin read timestamp")
-	if err != nil {
-		return nil, 0, errors.Wrap(err, "s3 admin: allocate startTS for adminPutObjectStream")
+// adminPutUploadError maps a failed chunk upload onto the admin sentinels.
+func adminPutUploadError(bodyErr *s3PutBodyError, err error) error {
+	switch {
+	case bodyErr != nil && bodyErr.Status == http.StatusRequestEntityTooLarge:
+		return ErrAdminUploadTooLarge
+	case bodyErr != nil:
+		return errors.Errorf("s3 admin: read upload body: %s", bodyErr.Message)
+	case errors.Is(err, errS3PutAdmissionExhausted):
+		return errors.WithStack(errors.Mark(err, ErrAdminUploadThrottled))
+	default:
+		return errors.WithStack(err)
 	}
-	readTS = readTimestamp.Timestamp()
-	startTS := readTS
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
-	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
-	if err != nil {
-		return nil, 0, errors.WithStack(err)
-	}
-	if !exists || meta == nil {
-		return nil, 0, ErrAdminBucketNotFound
-	}
-
-	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, key)
-	previous, _, err := s.loadObjectManifestAt(ctx, headKey, readTS)
-	if err != nil {
-		return nil, 0, errors.WithStack(err)
-	}
-
-	uploadID := newS3UploadID(s.clock())
-	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
-	part := s3ObjectPart{PartNo: 1}
-	sizeBytes := int64(0)
-	chunkNo := uint64(0)
-	buf := make([]byte, s3ChunkSize)
-	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
-	pendingChunkSizes := make([]uint64, 0, s3ChunkBatchOps)
-
-	uploadedManifest := func() *s3ObjectManifest {
-		if len(part.ChunkSizes) == 0 {
-			return &s3ObjectManifest{UploadID: uploadID}
-		}
-		clonedPart := part
-		clonedPart.ChunkSizes = append([]uint64(nil), part.ChunkSizes...)
-		clonedPart.ChunkCount = uint64(len(clonedPart.ChunkSizes))
-		return &s3ObjectManifest{UploadID: uploadID, Parts: []s3ObjectPart{clonedPart}}
-	}
-	flushBatch := func() error {
-		if len(pendingBatch) == 0 {
-			return nil
-		}
-		if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pendingBatch}); err != nil {
-			return errors.WithStack(err)
-		}
-		part.ChunkSizes = append(part.ChunkSizes, pendingChunkSizes...)
-		part.ChunkCount = uint64(len(part.ChunkSizes))
-		pendingBatch = pendingBatch[:0]
-		pendingChunkSizes = pendingChunkSizes[:0]
-		return nil
-	}
-
-	for {
-		n, readErr := body.Read(buf)
-		if n > 0 {
-			if sizeBytes+int64(n) > adminS3UploadMaxBytes {
-				s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-				return nil, 0, ErrAdminUploadTooLarge
-			}
-			chunk := append([]byte(nil), buf[:n]...)
-			if _, err := hasher.Write(chunk); err != nil {
-				s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-				return nil, 0, errors.WithStack(err)
-			}
-			chunkKey := s3keys.BlobKey(bucket, meta.Generation, key, uploadID, part.PartNo, chunkNo)
-			pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
-			chunkSize, err := uint64FromInt(n)
-			if err != nil {
-				s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-				return nil, 0, errors.WithStack(err)
-			}
-			pendingChunkSizes = append(pendingChunkSizes, chunkSize)
-			if len(pendingBatch) >= s3ChunkBatchOps {
-				if err := flushBatch(); err != nil {
-					s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-					return nil, 0, err
-				}
-			}
-			sizeBytes += int64(n)
-			chunkNo++
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-			return nil, 0, errors.WithStack(readErr)
-		}
-	}
-	if err := flushBatch(); err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, err
-	}
-
-	etag := hex.EncodeToString(hasher.Sum(nil))
-	part.ETag = etag
-	part.SizeBytes = sizeBytes
-	part.ChunkCount = uint64(len(part.ChunkSizes))
-	commitTS, err := s.nextTxnCommitTS(ctx, startTS)
-	if err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	ct := strings.TrimSpace(contentType)
-	if ct == "" {
-		ct = defaultS3ContentType
-	}
-	manifest := &s3ObjectManifest{
-		UploadID:        uploadID,
-		ETag:            etag,
-		SizeBytes:       sizeBytes,
-		LastModifiedHLC: commitTS,
-		ContentType:     ct,
-	}
-	if sizeBytes > 0 {
-		manifest.Parts = []s3ObjectPart{part}
-	}
-	bodyEnc, err := encodeS3ObjectManifest(manifest)
-	if err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	bucketFence, err := encodeS3BucketMeta(meta)
-	if err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  startTS,
-		CommitTS: commitTS,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
-			{Op: kv.Put, Key: headKey, Value: bodyEnc},
-		},
-	}); err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	return previous, meta.Generation, nil
 }
 
 // AdminObject is the admin-facing metadata projection. Mirrors the

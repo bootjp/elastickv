@@ -907,32 +907,30 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 }
 
 func (s *S3Server) putObject(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
-	state, err := s.prepareS3PutObject(r.Context(), r, bucket, objectKey)
+	in := s3PutObjectInputFromHeaders(r.Header)
+	state, err := s.prepareS3PutObject(r.Context(), in, bucket, objectKey)
 	if err != nil {
 		writeS3ResponseOrInternalError(w, err)
 		return
 	}
 	defer state.readPin.Release()
 
-	expectedPayloadSHA := normalizeS3PayloadHash(r.Header.Get("X-Amz-Content-Sha256"))
-	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, expectedPayloadSHA, "object exceeds maximum allowed size")
+	streamBody, bodyErr := prepareStreamingPutBody(w, r, s3MaxObjectSizeBytes, in.payloadSHA, in.tooLargeMessage)
 	if bodyErr != nil {
 		writeS3Error(w, bodyErr.Status, bodyErr.Code, bodyErr.Message, bucket, objectKey)
 		return
 	}
-	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, "object exceeds maximum allowed size") {
+	in.body, in.contentLength, in.streamBody = r.Body, r.ContentLength, streamBody
+	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxObjectSizeBytes, in.tooLargeMessage) {
 		return
 	}
-	offload := s.observeS3BlobOffloadDecision(r.Context()).mode == s3BlobOffloadModeOffload
-	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(
-		r.Context(), r, streamBody, state, bucket, objectKey, expectedPayloadSHA, offload,
-	)
+	upload, uploadBodyErr, uploadErr := s.uploadS3ObjectData(r.Context(), in, state, bucket, objectKey, s.s3BlobOffloadSelected(r.Context()))
 	if uploadErr != nil || uploadBodyErr != nil {
 		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
 		s.writeS3ChunkUploadError(w, uploadBodyErr, uploadErr, bucket, objectKey)
 		return
 	}
-	mutationAttempted, err := s.commitS3PutObject(r.Context(), r, state, upload, bucket)
+	mutationAttempted, err := s.commitS3PutObject(r.Context(), in, state, upload, bucket)
 	if err != nil {
 		s.cleanupS3PutObjectChunks(r.Context(), state, upload, bucket, objectKey)
 		writeS3PutObjectCommitError(w, err, mutationAttempted, bucket, objectKey)
@@ -1238,7 +1236,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 		Generation:  meta.Generation,
 		UploadID:    uploadID,
 		CreatedHLC:  commitTS,
-		ContentType: headerOrDefault(r.Header.Get("Content-Type"), "application/octet-stream"),
+		ContentType: s3ContentTypeOrDefault(r.Header.Get("Content-Type")),
 		Metadata:    collectS3UserMetadata(r.Header),
 	}
 	body, err := json.Marshal(uploadMeta)
@@ -1291,7 +1289,7 @@ func (s *S3Server) uploadPart(w http.ResponseWriter, r *http.Request, bucket str
 	if !s.admitS3PutRequest(w, r, bucket, objectKey, s3MaxPartSizeBytes, "part exceeds maximum allowed size") {
 		return
 	}
-	offload := s.observeS3BlobOffloadDecision(r.Context()).mode == s3BlobOffloadModeOffload
+	offload := s.s3BlobOffloadSelected(r.Context())
 	upload, previous, uploadBodyErr, uploadErr := s.storeS3UploadPart(
 		r.Context(), r, streamBody, state, bucket, objectKey, uploadID, admissionProtocol, offload,
 	)
@@ -1646,7 +1644,8 @@ func parseS3PartNumberMarker(raw string) int {
 	return v
 }
 
-//nolint:cyclop,gocognit,gocyclo,nestif // ListObjectsV2 combines token validation, shard-stable snapshotting, and delimiter pagination rules.
+// listObjectsV2 serves ListObjectsV2. The scan, token handling and delimiter
+// collapsing live in scanS3ObjectListing, shared with AdminListObjects.
 func (s *S3Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
 	query := r.URL.Query()
 	req := s3ObjectListingRequest{
@@ -2307,7 +2306,7 @@ func writeS3ObjectHeaders(h http.Header, manifest *s3ObjectManifest) {
 	h.Set("ETag", quoteS3ETag(manifest.ETag))
 	h.Set("Content-Length", strconv.FormatInt(manifest.SizeBytes, 10))
 	h.Set("Last-Modified", formatS3HTTPTime(manifest.LastModifiedHLC))
-	h.Set("Content-Type", headerOrDefault(manifest.ContentType, "application/octet-stream"))
+	h.Set("Content-Type", s3ContentTypeOrDefault(manifest.ContentType))
 	if manifest.ContentEncoding != "" {
 		h.Set("Content-Encoding", manifest.ContentEncoding)
 	}
@@ -2647,14 +2646,14 @@ func uint64FromInt(v int) (uint64, error) {
 	return uint64(v), nil
 }
 
-func validateS3PutPreconditions(r *http.Request, previous *s3ObjectManifest) error {
-	if r == nil {
-		return nil
-	}
-	if ifNoneMatch := strings.TrimSpace(r.Header.Get("If-None-Match")); ifNoneMatch == "*" && previous != nil {
+// validateS3PutPreconditions checks the If-Match / If-None-Match values of a
+// conditional PutObject against the object's current manifest. Empty values
+// impose no condition.
+func validateS3PutPreconditions(ifMatch, ifNoneMatch string, previous *s3ObjectManifest) error {
+	if ifNoneMatch == "*" && previous != nil {
 		return errors.New("object already exists")
 	}
-	if ifMatch := strings.TrimSpace(r.Header.Get("If-Match")); ifMatch != "" {
+	if ifMatch != "" {
 		if previous == nil || strings.Trim(ifMatch, `"`) != previous.ETag {
 			return errors.New("etag precondition failed")
 		}
@@ -2673,9 +2672,11 @@ func cloneLeaderAddrMap(src map[string]string) map[string]string {
 	return out
 }
 
-func headerOrDefault(value string, fallback string) string {
+// s3ContentTypeOrDefault returns value, or the S3 default content type when
+// value is blank.
+func s3ContentTypeOrDefault(value string) string {
 	if strings.TrimSpace(value) == "" {
-		return fallback
+		return defaultS3ContentType
 	}
 	return value
 }
