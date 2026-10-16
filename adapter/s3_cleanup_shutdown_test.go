@@ -14,14 +14,19 @@ import (
 
 // cleanupBlockingCoordinator holds every Dispatch until release is closed
 // or the request's context ends, the way a cleanup batch waits on Raft.
+// unwind delays the return after a cancellation, the way a proposal takes a
+// moment to give up; ignoreCancel keeps waiting for release regardless.
 type cleanupBlockingCoordinator struct {
 	*localAdapterCoordinator
-	dispatches atomic.Int64
-	entered    chan struct{}
-	enterOnce  sync.Once
-	release    chan struct{}
-	cancelled  chan struct{}
-	cancelOnce sync.Once
+	unwind       time.Duration
+	ignoreCancel bool
+	returned     atomic.Bool
+	dispatches   atomic.Int64
+	entered      chan struct{}
+	enterOnce    sync.Once
+	release      chan struct{}
+	cancelled    chan struct{}
+	cancelOnce   sync.Once
 }
 
 func newCleanupBlockingCoordinator(st store.MVCCStore) *cleanupBlockingCoordinator {
@@ -35,11 +40,17 @@ func newCleanupBlockingCoordinator(st store.MVCCStore) *cleanupBlockingCoordinat
 
 func (c *cleanupBlockingCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	c.dispatches.Add(1)
+	defer c.returned.Store(true)
 	c.enterOnce.Do(func() { close(c.entered) })
+	done := ctx.Done()
+	if c.ignoreCancel {
+		done = nil
+	}
 	select {
 	case <-c.release:
-	case <-ctx.Done():
+	case <-done:
 		c.cancelOnce.Do(func() { close(c.cancelled) })
+		time.Sleep(c.unwind)
 		return nil, ctx.Err() //nolint:wrapcheck // test double reports the cancellation as is.
 	}
 	return c.localAdapterCoordinator.Dispatch(ctx, req)
@@ -117,4 +128,55 @@ func TestS3ServerStopRefusesLateCleanup(t *testing.T) {
 	})
 	time.Sleep(100 * time.Millisecond)
 	require.Zero(t, coord.dispatches.Load(), "a cleanup must not start after Stop")
+}
+
+// A cleanup cancelled at the bound still has to unwind out of its dispatch.
+// Stop must wait for that, briefly, before the blob cluster and the stores
+// close underneath it.
+func TestS3ServerStopJoinsCleanupAfterCancellingIt(t *testing.T) {
+	shortenHTTPShutdownTimeout(t, 100*time.Millisecond)
+	st := store.NewMVCCStore()
+	coord := newCleanupBlockingCoordinator(st)
+	coord.unwind = 300 * time.Millisecond
+	t.Cleanup(func() { close(coord.release) })
+	s := NewS3Server(nil, "", st, coord, nil)
+	cluster := &closeRecordingBlobCluster{fakeS3BlobCluster: newFakeS3BlobCluster()}
+	s.blobCluster = cluster
+	startBlockedManifestCleanup(t, s, coord)
+
+	s.Stop()
+	require.True(t, coord.returned.Load(), "Stop returned while the cancelled cleanup was still in Dispatch")
+	require.Zero(t, s.cleanupWorkers.remaining(), "Stop returned before the cancelled cleanup exited")
+	require.True(t, cluster.closed.Load())
+}
+
+// A cleanup that does not observe its cancellation holds Stop for the
+// bound and the join only.
+func TestS3ServerStopBoundsJoinOfCleanupIgnoringCancellation(t *testing.T) {
+	shortenHTTPShutdownTimeout(t, 100*time.Millisecond)
+	shortenS3CleanupJoinTimeout(t, 200*time.Millisecond)
+	st := store.NewMVCCStore()
+	coord := newCleanupBlockingCoordinator(st)
+	coord.ignoreCancel = true
+	t.Cleanup(func() { close(coord.release) })
+	s := NewS3Server(nil, "", st, coord, nil)
+	startBlockedManifestCleanup(t, s, coord)
+
+	start := time.Now()
+	s.Stop()
+	elapsed := time.Since(start)
+	require.GreaterOrEqual(t, elapsed, 250*time.Millisecond, "the cancelled cleanup must be given its join")
+	require.Less(t, elapsed, 3*time.Second, "Stop must not wait on a stuck cleanup past the join")
+
+	// A second Stop does not spend the bound or the join again.
+	start = time.Now()
+	s.Stop()
+	require.Less(t, time.Since(start), 100*time.Millisecond)
+}
+
+func shortenS3CleanupJoinTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := s3CleanupJoinTimeout
+	s3CleanupJoinTimeout = d
+	t.Cleanup(func() { s3CleanupJoinTimeout = old })
 }

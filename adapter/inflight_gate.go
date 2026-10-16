@@ -10,12 +10,14 @@ import (
 // bounded, for them to finish, and refuses new ones once the drain began.
 // A few atomic operations per operation keep it off the hot path's locks.
 // The Redis listener counts its commands with it; the S3 server counts the
-// admin object operations that use its blob peer cluster. All methods are
+// admin object operations that use its blob peer cluster, and its
+// background cleanups. All methods are
 // safe on a nil gate, which admits everything and has nothing to drain.
 type inflightGate struct {
 	n        atomic.Int64
 	draining atomic.Bool
 	drained  atomic.Bool
+	joined   atomic.Bool
 	idle     chan struct{}
 	idleOnce sync.Once
 }
@@ -89,4 +91,26 @@ func (i *inflightGate) drain(timeout time.Duration) bool {
 	}
 	i.drained.Store(true)
 	return finished
+}
+
+// join waits up to timeout, after a drain that gave up, for the operations
+// still running to finish, and reports whether they did. It is meant for a
+// caller that has meanwhile told them to stop (by cancelling their context)
+// and must not release their resources while they unwind. Like drain, only
+// the first call waits.
+func (i *inflightGate) join(timeout time.Duration) bool {
+	if i == nil || i.n.Load() == 0 {
+		return true
+	}
+	if !i.draining.Load() || !i.joined.CompareAndSwap(false, true) {
+		return i.n.Load() == 0
+	}
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-i.idle:
+		return true
+	case <-timer.C:
+		return i.n.Load() == 0
+	}
 }

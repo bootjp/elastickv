@@ -66,18 +66,32 @@ func (s *S3Server) startCleanup(run func(ctx context.Context)) {
 	}()
 }
 
+// s3CleanupJoinTimeout bounds how long Stop waits, after cancelling the
+// background cleanups that outlived the shutdown bound, for them to unwind
+// out of their dispatch or scan. A variable so tests can shorten it.
+var s3CleanupJoinTimeout = 2 * time.Second
+
 // drainCleanups waits up to timeout for the background cleanups still
-// running, then cancels the context of any that remain so they stop
-// dispatching against stores that are about to close. New cleanups are
+// running, then cancels the context of any that remain and waits, under
+// s3CleanupJoinTimeout, for them to return, so none is still dispatching
+// or scanning when the blob cluster and the stores close. New cleanups are
 // refused from the moment the wait begins.
 func (s *S3Server) drainCleanups(timeout time.Duration) {
-	if !s.cleanupWorkers.drain(timeout) {
-		slog.Warn("s3 server: background cleanups still running after the shutdown bound, cancelling them",
-			slog.Int64("in_flight", s.cleanupWorkers.remaining()),
-			slog.Duration("timeout", timeout),
-		)
-	}
+	finished := s.cleanupWorkers.drain(timeout)
 	if s.cancelCleanups != nil {
 		s.cancelCleanups()
+	}
+	if finished {
+		return
+	}
+	slog.Warn("s3 server: background cleanups still running after the shutdown bound, cancelling them",
+		slog.Int64("in_flight", s.cleanupWorkers.remaining()),
+		slog.Duration("timeout", timeout),
+	)
+	if !s.cleanupWorkers.join(s3CleanupJoinTimeout) {
+		slog.Warn("s3 server: cancelled background cleanups did not return, closing the blob cluster",
+			slog.Int64("in_flight", s.cleanupWorkers.remaining()),
+			slog.Duration("timeout", s3CleanupJoinTimeout),
+		)
 	}
 }
