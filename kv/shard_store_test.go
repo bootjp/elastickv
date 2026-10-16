@@ -1767,28 +1767,95 @@ func TestShardStoreScanGroupOwnedAt_ServesLegacyRouteRowsTheOwnerDoesNotHold(t *
 }
 
 // Whether the logical owner holds the key can be answered here only by that
-// group's leader. When another node leads it, the legacy row is left to that
-// node: only it may rewrite the key, and guessing "nothing there" could act on
-// a copy the owner has superseded.
+// group's leader. When another node leads it, or no leader is known, the
+// legacy row is left to that group's leader: only it may rewrite the key, and
+// guessing "nothing there" could act on a copy the owner has superseded. The
+// rest of the page must still be served.
 func TestShardStoreScanGroupOwnedAt_SkipsLegacyRouteRowsOfAnOwnerLedElsewhere(t *testing.T) {
+	t.Parallel()
+
+	families := []struct {
+		name   string
+		prefix []byte
+		key    func(userKey string) []byte
+	}{
+		{name: "hash", prefix: []byte(store.HashMetaPrefix), key: func(u string) []byte { return store.HashMetaKey([]byte(u)) }},
+		{name: "stream", prefix: []byte(store.StreamMetaPrefix), key: func(u string) []byte { return store.StreamMetaKey([]byte(u)) }},
+	}
+	for _, family := range families {
+		t.Run(family.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			engine := distribution.NewEngine()
+			engine.UpdateRoute([]byte(""), []byte("m"), 1)
+			engine.UpdateRoute([]byte("m"), nil, 2)
+			groups := map[uint64]*ShardGroup{
+				1: {Store: store.NewMVCCStore()},
+				2: {Store: store.NewMVCCStore(), Engine: &followerProxyEngine{}},
+			}
+			st := NewShardStore(engine, groups)
+			owned := family.key("apple")
+			legacy := family.key("zebra")
+			require.NoError(t, groups[1].Store.PutAt(ctx, owned, []byte("owned"), 5, 0))
+			require.NoError(t, groups[1].Store.PutAt(ctx, legacy, []byte("legacy"), 5, 0))
+
+			kvs, _, err := st.ScanGroupOwnedAt(ctx, 1, family.prefix, prefixScanEnd(family.prefix), 10, 10)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{{Key: owned, Value: []byte("owned")}}, kvs)
+		})
+	}
+}
+
+// pointReadCountingMVCCStore counts point reads, which a ShardStore scan uses
+// to re-read wide-column rows through the point-read path.
+type pointReadCountingMVCCStore struct {
+	store.MVCCStore
+
+	mu    sync.Mutex
+	reads int
+}
+
+func (s *pointReadCountingMVCCStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	s.mu.Lock()
+	s.reads++
+	s.mu.Unlock()
+	return s.MVCCStore.GetAt(ctx, key, ts)
+}
+
+func (s *pointReadCountingMVCCStore) pointReads() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reads
+}
+
+// Every row ScanGroupOwnedAt serves already carries the value a point read
+// would return, so the page must not re-read its wide-column rows one point
+// read at a time.
+func TestShardStoreScanGroupOwnedAt_DoesNotReReadServedRows(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), []byte("m"), 1)
 	engine.UpdateRoute([]byte("m"), nil, 2)
-	groups := map[uint64]*ShardGroup{
-		1: {Store: store.NewMVCCStore()},
-		2: {Store: store.NewMVCCStore(), Engine: &followerProxyEngine{}},
+	counting := &pointReadCountingMVCCStore{MVCCStore: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: counting},
+		2: {Store: store.NewMVCCStore()},
+	})
+	want := make([]*store.KVPair, 0, 3)
+	for _, userKey := range []string{"apple", "banana", "cherry"} {
+		key := store.HashMetaKey([]byte(userKey))
+		require.NoError(t, counting.PutAt(ctx, key, []byte(userKey), 5, 0))
+		want = append(want, &store.KVPair{Key: key, Value: []byte(userKey)})
 	}
-	st := NewShardStore(engine, groups)
-	key := store.StreamMetaKey([]byte("zebra"))
-	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 5, 0))
-	prefix := []byte(store.StreamMetaPrefix)
+	prefix := []byte(store.HashMetaPrefix)
 
 	kvs, _, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
 	require.NoError(t, err)
-	require.Empty(t, kvs)
+	require.Equal(t, want, kvs)
+	require.Zero(t, counting.pointReads())
 }
 
 func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
