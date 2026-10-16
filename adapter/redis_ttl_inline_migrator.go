@@ -25,9 +25,11 @@ type ttlInlineMigrationHandler struct {
 
 // ttlInlineGroupScanner is *kv.ShardStore in the server. It uses
 // ScanGroupOwnedAt because ScanGroupAt resolves a bare anchor prefix to the
-// first route only and refuses every other group.
+// first route only and refuses every other group. ScanGroupOwnedAt reads one
+// page per call and returns where it stopped, so the cursor advances even when
+// the page held no row the group serves.
 type ttlInlineGroupScanner interface {
-	ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
+	ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error)
 }
 
 type ttlInlineMigrationScanPlan struct {
@@ -197,7 +199,7 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
 ) error {
-	kvs, truncated, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
+	kvs, cursorKey, truncated, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
 	if err != nil {
 		return err
 	}
@@ -237,7 +239,7 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	if err := flushBatch(); err != nil {
 		return err
 	}
-	c.advanceCursor(plan.cursorName, lastKVKey(kvs), truncated)
+	c.advanceCursor(plan.cursorName, cursorKey, truncated)
 	return nil
 }
 
@@ -279,12 +281,14 @@ func ttlInlineMigrationGroupCursorName(typeName string, groupID uint64) string {
 	return typeName + ":group:" + strconv.FormatUint(groupID, 10)
 }
 
+// scanTTLInlineMigrationRaw returns the scanned rows, the key the plan's cursor
+// moves to, and whether the scan stopped before the end of the prefix.
 func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	ctx context.Context,
 	h ttlInlineMigrationHandler,
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
-) ([]*store.KVPair, bool, error) {
+) ([]*store.KVPair, []byte, bool, error) {
 	c.cursorMu.Lock()
 	start := h.prefix
 	if cur := c.cursors[plan.cursorName]; len(cur) > 0 {
@@ -293,19 +297,18 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	c.cursorMu.Unlock()
 
 	end := store.PrefixScanEnd(h.prefix)
-	var (
-		kvs []*store.KVPair
-		err error
-	)
 	if plan.scanner != nil {
-		kvs, err = plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
-	} else {
-		kvs, err = c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
+		kvs, resume, err := plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
+		if err != nil {
+			return nil, nil, false, errors.WithStack(err)
+		}
+		return kvs, resume, resume != nil, nil
 	}
+	kvs, err := c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
 	if err != nil {
-		return nil, false, errors.WithStack(err)
+		return nil, nil, false, errors.WithStack(err)
 	}
-	return kvs, len(kvs) == ttlInlineMigrationTickScanLimit, nil
+	return kvs, lastKVKey(kvs), len(kvs) == ttlInlineMigrationTickScanLimit, nil
 }
 
 func (c *DeltaCompactor) migrateStringTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {

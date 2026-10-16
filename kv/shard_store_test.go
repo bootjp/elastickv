@@ -1562,7 +1562,7 @@ func TestShardStoreScanGroupOwnedAt_ReturnsEachGroupsShareOfAPrefix(t *testing.T
 			_, err := st.ScanGroupAt(ctx, 2, tc.prefix, end, 10, 10)
 			require.ErrorIs(t, err, ErrExplicitGroupRouteOwnerMismatch)
 			for gid, key := range owned {
-				kvs, err := st.ScanGroupOwnedAt(ctx, gid, tc.prefix, end, 10, 10)
+				kvs, _, err := st.ScanGroupOwnedAt(ctx, gid, tc.prefix, end, 10, 10)
 				require.NoError(t, err)
 				require.Equalf(t, []*store.KVPair{{Key: key, Value: []byte("v")}}, kvs, "group %d", gid)
 			}
@@ -1571,30 +1571,30 @@ func TestShardStoreScanGroupOwnedAt_ReturnsEachGroupsShareOfAPrefix(t *testing.T
 }
 
 // A group's store can still hold keys of a range that has moved to another
-// group. ScanGroupOwnedAt must skip them, and must keep paging past them instead
-// of reporting a short page as the end of the range: hash meta keys are length
-// prefixed, so a stale two-byte key sorts before an owned three-byte one.
+// group. ScanGroupOwnedAt must skip them: acting on such a copy could rewrite
+// the key from a stale value. String keys have no legacy route, so a copy in
+// the wrong group is just stale.
 func TestShardStoreScanGroupOwnedAt_SkipsKeysOfRangesTheGroupNoLongerOwns(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
 	st, groups := newSplitRedisShardStoreForGroupScan()
-	stale := store.HashMetaKey([]byte("zz"))
-	owned := store.HashMetaKey([]byte("abc"))
-	require.Negative(t, bytes.Compare(stale, owned), "the stale key must sort first")
+	stale := []byte("!redis|str|zebra")
+	owned := []byte("!redis|str|apple")
 	require.NoError(t, groups[1].Store.PutAt(ctx, stale, []byte("stale"), 5, 0))
 	require.NoError(t, groups[1].Store.PutAt(ctx, owned, []byte("owned"), 5, 0))
 	require.NoError(t, groups[2].Store.PutAt(ctx, stale, []byte("current"), 6, 0))
-	prefix := []byte(store.HashMetaPrefix)
+	prefix := []byte("!redis|str|")
 	end := prefixScanEnd(prefix)
 
-	kvs, err := st.ScanGroupOwnedAt(ctx, 1, prefix, end, 1, 10)
+	kvs, resume, err := st.ScanGroupOwnedAt(ctx, 1, prefix, end, 10, 10)
 	require.NoError(t, err)
-	require.Equal(t, []*store.KVPair{{Key: owned, Value: []byte("owned")}}, kvs,
-		"a page of skipped keys is not the end of the range")
+	require.Nil(t, resume)
+	require.Equal(t, []*store.KVPair{{Key: owned, Value: []byte("owned")}}, kvs)
 
-	kvs, err = st.ScanGroupOwnedAt(ctx, 2, prefix, end, 10, 10)
+	kvs, resume, err = st.ScanGroupOwnedAt(ctx, 2, prefix, end, 10, 10)
 	require.NoError(t, err)
+	require.Nil(t, resume)
 	require.Equal(t, []*store.KVPair{{Key: stale, Value: []byte("current")}}, kvs)
 }
 
@@ -1648,7 +1648,7 @@ func TestShardStoreScanGroupOwnedAt_DefersKeysOfStagedRoutes(t *testing.T) {
 	require.NoError(t, group.Store.PutAt(ctx, live, []byte("v"), 5, 0))
 	prefix := []byte("!redis|str|")
 
-	kvs, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
+	kvs, _, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
 	require.NoError(t, err)
 	require.Equal(t, []*store.KVPair{{Key: live, Value: []byte("v")}}, kvs)
 }
@@ -1679,9 +1679,23 @@ func TestShardStoreScanGroupOwnedAt_ReadsOnePhysicalPagePerCall(t *testing.T) {
 	prefix := []byte("!redis|str|")
 	const limit = 2
 
-	_, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), limit, 10)
-	require.NoError(t, err)
-	require.LessOrEqual(t, counting.rowsRead(), limit)
+	end := prefixScanEnd(prefix)
+
+	var served []*store.KVPair
+	start := prefix
+	for calls := 1; ; calls++ {
+		before := counting.rowsRead()
+		kvs, resume, err := st.ScanGroupOwnedAt(ctx, 1, start, end, limit, 10)
+		require.NoError(t, err)
+		require.LessOrEqualf(t, counting.rowsRead()-before, limit, "call %d read more than one page", calls)
+		served = append(served, kvs...)
+		if resume == nil {
+			break
+		}
+		require.Lessf(t, calls, 10, "the scan must make progress")
+		start = nextScanCursor(resume)
+	}
+	require.Equal(t, []*store.KVPair{{Key: owned, Value: []byte("owned")}}, served)
 }
 
 // Hash, set and zset rows written before wide-column routing still live at the
@@ -1715,7 +1729,7 @@ func TestShardStoreScanGroupOwnedAt_ServesWideColumnRowsAtTheirLegacyRoute(t *te
 			}
 			prefix := []byte(store.HashMetaPrefix)
 
-			kvs, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
+			kvs, _, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
 			require.NoError(t, err)
 			require.Equal(t, []*store.KVPair{{Key: key, Value: tc.want}}, kvs)
 		})

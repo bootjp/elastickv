@@ -33,14 +33,18 @@ func (s *groupScanRecordingStore) ScanAt(ctx context.Context, start []byte, end 
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
 }
 
-func (s *groupScanRecordingStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *groupScanRecordingStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
 	s.mu.Lock()
 	if s.groupScans == nil {
 		s.groupScans = make(map[uint64][]string)
 	}
 	s.groupScans[groupID] = append(s.groupScans[groupID], string(start))
 	s.mu.Unlock()
-	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	kvs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	if err != nil || len(kvs) < limit {
+		return kvs, nil, err
+	}
+	return kvs, kvs[len(kvs)-1].Key, nil
 }
 
 func (s *groupScanRecordingStore) recorded() (map[uint64][]string, []string) {

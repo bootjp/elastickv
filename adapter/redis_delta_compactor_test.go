@@ -576,10 +576,20 @@ func (s *recordingTTLInlineGroupScanStore) ScanAt(ctx context.Context, start []b
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
 }
 
-func (s *recordingTTLInlineGroupScanStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *recordingTTLInlineGroupScanStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
 	s.groupScans = append(s.groupScans, groupID)
 	s.groupStarts = append(s.groupStarts, string(start))
-	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	return scanPageWithResume(ctx, s.MVCCStore, start, end, limit, ts)
+}
+
+// scanPageWithResume reads one page the way ShardStore.ScanGroupOwnedAt does
+// and reports its last key when the page was full.
+func scanPageWithResume(ctx context.Context, st store.MVCCStore, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
+	kvs, err := st.ScanAt(ctx, start, end, limit, ts)
+	if err != nil || len(kvs) < limit {
+		return kvs, nil, err
+	}
+	return kvs, kvs[len(kvs)-1].Key, nil
 }
 
 func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
