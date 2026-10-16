@@ -1014,14 +1014,18 @@ Still open for the fix PRs:
   store); and, separately and older, `elastickv-snapshot-decode` /
   `ReadSnapshot` could not decode any live Pebble `.fsm` (it failed on
   `_meta_last_commit_ts`, "encoded value length 8 < 9"), a tooling defect
-  left as found by this branch and since closed on `main` by #1267
-  (merged 2026-10-15 as `95889d1f`) for cleartext stores: it skips every
-  reserved metadata key a live store writes through a mirror of the
-  store's classifier pinned by cross-check tests and decodes a live-store
-  snapshot in its reader and CLI tests, while an encrypted entry is still
-  rejected (`ErrSnapshotEncryptedEntry`), so a live snapshot from a store
-  with at-rest encryption enabled remains undecodable offline, an open
-  limitation the roadmap's §4 lists; `CONTEXT.md` says both.
+  left as found by this branch. #1267 (merged 2026-10-15 as `95889d1f`)
+  removed that first failure, by skipping every reserved metadata key a
+  live store writes through a mirror of the store's classifier pinned by
+  cross-check tests, but the defect stays open (found in review on
+  #1275): its tests feed the raw store stream, while an on-disk `.fsm`
+  carries the FSM snapshot header in front and the engine's CRC32C
+  footer behind it; the decoder routes every MVCC version and drops
+  tombstones without hiding older versions, so a dump carries stale
+  values and resurrects deleted keys; and the SST-ingest snapshot format,
+  the store's stored-key budget, and encrypted entries are rejected. The
+  roadmap's §4 row lists the follow-up; `CONTEXT.md` describes the
+  decoder as encoder-only until it lands.
 
 ### A1. Coverage table and adapter fixes
 
