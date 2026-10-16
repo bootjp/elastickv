@@ -1,6 +1,6 @@
 # Production code commonization: coordinator wrappers, admin authorization, S3 paths, backup mirrors, server wiring
 
-Status: Proposed
+Status: Implemented (all milestones, PR #1277)
 Author: bootjp
 Date: 2026-10-16
 
@@ -158,6 +158,38 @@ Milestones are independent and land as separate commit series in the PR that car
 - records the five self-review lenses in the PR description.
 
 M1 touches the Redis adapter's coordinator path, so the Redis Jepsen workload is the integration check. The CI Jepsen job covers it.
+
+## As built
+
+All five milestones shipped in PR #1277. Each defect fix landed as a failing-test commit followed by the fix. Differences from the plan above, and additions found during implementation:
+
+**M1.**
+- The forwarder also answers `IsLeaderForGroup` / `RaftLeaderForGroup` from the wrapped coordinator's own `IsLeader` / `RaftLeader` when that coordinator has no group-keyed leadership (a single-group `Coordinate`), the same reasoning as the `LeaseReadForGroup` fallback (CodeRabbit on PR #1277).
+- The startup gate's errors now carry a stack; gRPC codes are unchanged (`status.FromError` unwraps).
+- The keyviz label wrapper's `LeaseReadForGroup` falls back to a lease read instead of a linearizable read when the inner coordinator has no group-keyed lease read, matching the gate.
+
+**M2.**
+- The SQS endpoints affected are delete queue, set queue attributes, purge and peek. There is no admin redrive endpoint.
+
+**M3.**
+- AdminListObjects also returned a bare decode error for a continuation token that is not base64 JSON, which the admin handler answered with 500. The shared scan classifies it, so admin now answers 400 like SigV4.
+- An exhausted PUT admission limiter surfaces as `ErrAdminUploadThrottled`; the admin API answers 503 with `Retry-After: 1`.
+- Admin uploads fill chunks to the chunk size before writing them, as SigV4 uploads do, instead of writing one chunk per `Read` call.
+
+**M4.**
+- The cross-checks round-trip the records the live write paths stage through the backup decoder (`NewLiveDecoder`) and encoder (`EncodeSnapshot`, `DecodeLiveEntries`) and require byte-identical keys and values. That covers both the decoder's and the encoder's mirrors.
+- Where a restore differs from live state by design, the live side is built in the documented restored state, and each test says so:
+  - generation 1;
+  - SQS messages never received and fully visible;
+  - the FIFO dedup send timestamp sharing the record's millisecond;
+  - no-TTL HLLs restoring as the legacy raw payload.
+- Mutation checks on both the backup copy and the live counterpart fail every family's test.
+- `elastickv-backup`, `elastickv-snapshot-decode`, `elastickv-snapshot-encode` and `elastickv-snapshot-archive` no longer link `store`, Pebble or `internal/encryption`. `elastickv-snapshot-prepare-restore` still does, through `internal/raftengine/etcd`, which the restore path needs.
+
+**M5.**
+- The autosplit splitter converts SplitRange children with `distribution.RouteDescriptorFromProto`, which rejects a nil child, an unspecified state or invalid bounds. Such a response now fails the split call instead of becoming a write-fenced placeholder.
+- The single-group `Coordinate` used to hand the sampler `LabelLegacy` for every observation, so the demo's new `--keyvizLabelsEnabled` produced no per-adapter rows. It now passes the adapter label stamped by `WithKeyVizLabel` and leaves the decision to the sampler's `KeyVizLabelsEnabled` option (CodeRabbit on PR #1277).
+- The demo's KeyViz flags use the server binary's help text.
 
 ## Decisions
 
