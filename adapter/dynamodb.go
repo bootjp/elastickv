@@ -138,6 +138,11 @@ type DynamoDBServer struct {
 	// Set ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0 or pass
 	// WithDynamoOnePhaseTxnDedup(false) for an operator rollback.
 	onePhaseTxnDedup bool
+
+	// tableCleanups runs the cleanup of a deleted table's old generation
+	// (see launchDeletedTableCleanup) so Stop can join it, bounded, before
+	// the stores close underneath it.
+	tableCleanups *backgroundWorkers
 }
 
 // WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
@@ -264,6 +269,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		store:            st,
 		coordinator:      kv.WithKeyVizLabel(coordinate, keyviz.LabelDynamo),
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") != "0",
+		tableCleanups:    newBackgroundWorkers(),
 	}
 	for i := range d.itemUpdateLocks {
 		d.itemUpdateLocks[i] = make(chan struct{}, 1)
@@ -308,11 +314,21 @@ func (d *DynamoDBServer) Run() error {
 	return nil
 }
 
+// Stop drains the HTTP listener (bounded, see shutdownHTTPServer), then
+// waits, under one more bound, for the deleted-table cleanups those
+// requests started, cancelling and briefly joining any still running, so
+// none is dispatching when the stores close after Stop.
 func (d *DynamoDBServer) Stop() {
 	if d.httpServer != nil {
 		shutdownHTTPServer(d.httpServer, "dynamodb")
 	}
+	d.tableCleanups.stop("dynamodb server", httpShutdownTimeout, dynamoTableCleanupJoinTimeout)
 }
+
+// dynamoTableCleanupJoinTimeout bounds how long Stop waits, after
+// cancelling the table cleanups that outlived the shutdown bound, for them
+// to return. A variable so tests can shorten it.
+var dynamoTableCleanupJoinTimeout = 2 * time.Second
 
 // proxyToLeader forwards the HTTP request to the current DynamoDB leader when
 // this node is not the Raft leader.  Returns true if the request was handled

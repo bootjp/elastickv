@@ -337,9 +337,7 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 }
 
 func (d *DynamoDBServer) launchDeletedTableCleanup(tableName string, generation uint64) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), tableCleanupAsyncTimeout)
-		defer cancel()
+	started := d.tableCleanups.start(tableCleanupAsyncTimeout, func(ctx context.Context) {
 		if err := d.cleanupDeletedTableGeneration(ctx, tableName, generation); err != nil {
 			slog.Error("dynamodb delete table cleanup failed",
 				"table", tableName,
@@ -347,7 +345,13 @@ func (d *DynamoDBServer) launchDeletedTableCleanup(tableName string, generation 
 				"error", err,
 			)
 		}
-	}()
+	})
+	if !started {
+		slog.Warn("dynamodb delete table cleanup skipped, the server is stopping",
+			"table", tableName,
+			"generation", generation,
+		)
+	}
 }
 
 func (d *DynamoDBServer) cleanupDeletedTableGeneration(ctx context.Context, tableName string, generation uint64) error {
