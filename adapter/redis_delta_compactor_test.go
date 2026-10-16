@@ -688,6 +688,95 @@ func TestDeltaCompactor_TTLInlineMigratesEveryLocalLeaderShard(t *testing.T) {
 	}
 }
 
+// A group can still hold a full page of copies of ranges it no longer owns. A
+// tick must read one page per plan and move the cursor past it, so the group's
+// own anchors behind such a page are reached on the next tick; reading on until
+// a page of owned rows turned a large stale backlog into a call that never
+// finished within the tick budget and never advanced.
+func TestDeltaCompactor_TTLInlineAdvancesPastAFullPageOfStaleRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 2)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+	group1 := store.NewMVCCStore()
+	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: group1},
+		2: {Store: store.NewMVCCStore()},
+	})
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	// A full page of stale copies of group 2's keys sorts before group 1's key.
+	for i := range ttlInlineMigrationTickScanLimit {
+		key := []byte("a" + strconv.Itoa(1000+i))
+		require.NoError(t, group1.PutAt(ctx, redisStrKey(key), []byte("stale"), 1, 0))
+	}
+	owned := []byte("zebra")
+	expireAt := time.Now().Add(time.Hour)
+	require.NoError(t, st.PutAt(ctx, redisStrKey(owned), []byte("legacy-value"), 2, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(owned), encodeRedisTTL(expireAt), 3, 0))
+	migrated := func() bool {
+		raw, err := st.GetAt(ctx, redisStrKey(owned), st.LastCommitTS())
+		require.NoError(t, err)
+		return isNewRedisStrFormat(raw)
+	}
+
+	require.NoError(t, c.SyncOnce(ctx))
+	require.False(t, migrated(), "a tick reads one page per plan")
+	require.NoError(t, c.SyncOnce(ctx))
+	require.True(t, migrated(), "the next tick resumes after the stale page")
+}
+
+// Hash, set and zset metadata written before wide-column routing can still sit
+// at the route of its raw key while its user key belongs to another group, and
+// reads fall back to that row. The group holding it must hand it to the
+// migrator, which rewrites it into the user key's group when this node leads
+// that group.
+func TestDeltaCompactor_TTLInlineMigratesWideColumnRowsAtTheirLegacyRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	group1 := store.NewMVCCStore()
+	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: group1},
+		2: {Store: store.NewMVCCStore()},
+	})
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1, 2},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	key := []byte("zebra")
+	expireAt := time.Now().Add(time.Hour)
+	legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta, 1)
+	// The raw meta key starts with "!", so its legacy route is group 1.
+	require.NoError(t, group1.PutAt(ctx, store.HashMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	raw, err := st.GetAt(ctx, store.HashMetaKey(key), st.LastCommitTS())
+	require.NoError(t, err)
+	meta, err := store.UnmarshalHashMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
 // capabilityHidingCompactionCoordinator forwards only the kv.Coordinator
 // methods, the way a decorator that forgets an optional forward does.
 type capabilityHidingCompactionCoordinator struct {

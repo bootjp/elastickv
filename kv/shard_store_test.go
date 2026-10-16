@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"strconv"
 	"sync"
 	"testing"
 	"time"
@@ -1595,6 +1596,130 @@ func TestShardStoreScanGroupOwnedAt_SkipsKeysOfRangesTheGroupNoLongerOwns(t *tes
 	kvs, err = st.ScanGroupOwnedAt(ctx, 2, prefix, end, 10, 10)
 	require.NoError(t, err)
 	require.Equal(t, []*store.KVPair{{Key: stale, Value: []byte("current")}}, kvs)
+}
+
+// rowCountingMVCCStore counts the rows ScanAt hands back, which is the physical
+// work a ShardStore scan does on a group without a Raft engine.
+type rowCountingMVCCStore struct {
+	store.MVCCStore
+
+	mu   sync.Mutex
+	rows int
+}
+
+func (s *rowCountingMVCCStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	kvs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	s.mu.Lock()
+	s.rows += len(kvs)
+	s.mu.Unlock()
+	return kvs, err
+}
+
+func (s *rowCountingMVCCStore) rowsRead() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rows
+}
+
+// A route under staged visibility serves reads from its staged copy first, and
+// a group-local scan with a bare group route reads live rows only. Acting on an
+// older live copy while a newer staged copy is being imported would rewrite the
+// key from stale data, so those keys must be left alone until promotion.
+func TestShardStoreScanGroupOwnedAt_DefersKeysOfStagedRoutes(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
+		Version: 1,
+		Routes: []distribution.RouteDescriptor{
+			{
+				RouteID: 1, Start: []byte(""), End: []byte("m"), GroupID: 1,
+				State: distribution.RouteStateActive, StagedVisibilityActive: true, MigrationJobID: 9,
+			},
+			{RouteID: 2, Start: []byte("m"), End: nil, GroupID: 1, State: distribution.RouteStateActive},
+		},
+	}))
+	group := &ShardGroup{Store: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{1: group})
+	staged := []byte("!redis|str|apple")
+	live := []byte("!redis|str|zebra")
+	require.NoError(t, group.Store.PutAt(ctx, staged, []byte("v"), 5, 0))
+	require.NoError(t, group.Store.PutAt(ctx, live, []byte("v"), 5, 0))
+	prefix := []byte("!redis|str|")
+
+	kvs, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
+	require.NoError(t, err)
+	require.Equal(t, []*store.KVPair{{Key: live, Value: []byte("v")}}, kvs)
+}
+
+// Maintenance scans run under a per-tick budget. A group can hold many rows of
+// ranges it no longer owns, so one call must read a single physical page no
+// matter how few of its rows are kept; reading on until limit kept rows turned
+// a large stale backlog into a call that never finished within the budget.
+func TestShardStoreScanGroupOwnedAt_ReadsOnePhysicalPagePerCall(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 2)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+	counting := &rowCountingMVCCStore{MVCCStore: store.NewMVCCStore()}
+	st := NewShardStore(engine, map[uint64]*ShardGroup{
+		1: {Store: counting},
+		2: {Store: store.NewMVCCStore()},
+	})
+	// Stale copies of group 2's keys sort before group 1's only key.
+	for i := range 6 {
+		key := []byte("!redis|str|a" + strconv.Itoa(i))
+		require.NoError(t, counting.PutAt(ctx, key, []byte("stale"), 5, 0))
+	}
+	owned := []byte("!redis|str|zebra")
+	require.NoError(t, counting.PutAt(ctx, owned, []byte("owned"), 5, 0))
+	prefix := []byte("!redis|str|")
+	const limit = 2
+
+	_, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), limit, 10)
+	require.NoError(t, err)
+	require.LessOrEqual(t, counting.rowsRead(), limit)
+}
+
+// Hash, set and zset rows written before wide-column routing still live at the
+// route of their raw key, and reads fall back to that route when the logical
+// owner has nothing. The group holding such a row serves it, so its scan must
+// return it with the value a point read would see, not drop it because the
+// logical owner is another group.
+func TestShardStoreScanGroupOwnedAt_ServesWideColumnRowsAtTheirLegacyRoute(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name          string
+		ownerHasNewer bool
+		want          []byte
+	}{
+		{name: "legacy row only", want: []byte("legacy")},
+		{name: "logical owner has a newer row", ownerHasNewer: true, want: []byte("current")},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st, groups := newSplitRedisShardStoreForGroupScan()
+			// The raw key starts with "!", so its legacy route is group 1;
+			// the user key "zebra" belongs to group 2.
+			key := store.HashMetaKey([]byte("zebra"))
+			require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 5, 0))
+			if tc.ownerHasNewer {
+				require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("current"), 6, 0))
+			}
+			prefix := []byte(store.HashMetaPrefix)
+
+			kvs, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
+			require.NoError(t, err)
+			require.Equal(t, []*store.KVPair{{Key: key, Value: tc.want}}, kvs)
+		})
+	}
 }
 
 func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {
