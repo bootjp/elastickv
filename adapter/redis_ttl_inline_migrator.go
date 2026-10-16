@@ -38,17 +38,43 @@ type ttlInlineMigrationScanPlan struct {
 	scanner    ttlInlineGroupScanner
 }
 
+// ttlInlineMigrationTickPlan is one handler's scan plan within a tick.
+type ttlInlineMigrationTickPlan struct {
+	handler ttlInlineMigrationHandler
+	plan    ttlInlineMigrationScanPlan
+}
+
+// migrateTTLInlineOnce runs every handler's scan plans under the tick's
+// budget. The plans share that budget, so each tick starts at the plan after
+// the last one the previous tick ran, as compactBackgroundHandlers rotates its
+// handlers; starting from the first plan every tick starved the later handlers
+// and groups whenever the earlier plans used up the budget.
 func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64) error {
+	plans := c.ttlInlineMigrationTickPlans()
+	start := c.rotationStart(&c.ttlInlinePlanCursor, len(plans))
 	var combined error
-	for _, h := range c.ttlInlineMigrationHandlers() {
+	for offset := range plans {
 		if ctx.Err() != nil {
 			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
 		}
-		if err := c.migrateTTLInlineHandler(ctx, h, readTS); err != nil {
+		idx := (start + offset) % len(plans)
+		err := c.migrateTTLInlineScanPlan(ctx, plans[idx].handler, plans[idx].plan, readTS)
+		c.advanceRotation(&c.ttlInlinePlanCursor, idx, len(plans))
+		if err != nil {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}
 	return errors.WithStack(combined)
+}
+
+func (c *DeltaCompactor) ttlInlineMigrationTickPlans() []ttlInlineMigrationTickPlan {
+	var plans []ttlInlineMigrationTickPlan
+	for _, h := range c.ttlInlineMigrationHandlers() {
+		for _, plan := range c.ttlInlineMigrationScanPlans(h) {
+			plans = append(plans, ttlInlineMigrationTickPlan{handler: h, plan: plan})
+		}
+	}
+	return plans
 }
 
 func (c *DeltaCompactor) ttlInlineMigrationHandlers() []ttlInlineMigrationHandler {
@@ -178,19 +204,6 @@ func (c *DeltaCompactor) simpleTTLInlineMigrationHandler(
 			return appendTTLIndexSyncElem(ctx, c.st, elems, userKey, ttlMs, readTS)
 		},
 	}
-}
-
-func (c *DeltaCompactor) migrateTTLInlineHandler(ctx context.Context, h ttlInlineMigrationHandler, readTS uint64) error {
-	var combined error
-	for _, plan := range c.ttlInlineMigrationScanPlans(h) {
-		if ctx.Err() != nil {
-			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
-		}
-		if err := c.migrateTTLInlineScanPlan(ctx, h, plan, readTS); err != nil {
-			combined = errors.CombineErrors(combined, err)
-		}
-	}
-	return errors.WithStack(combined)
 }
 
 func (c *DeltaCompactor) migrateTTLInlineScanPlan(

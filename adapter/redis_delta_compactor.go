@@ -72,9 +72,13 @@ type DeltaCompactor struct {
 	// quickly without waiting for the next scheduled pass.
 	urgentCh chan urgentCompactionRequest
 
-	stateMu       sync.Mutex
-	backoffUntil  time.Time
-	handlerCursor int
+	stateMu      sync.Mutex
+	backoffUntil time.Time
+	// handlerCursor and ttlInlinePlanCursor are where the next tick's
+	// background handlers and TTL-inline scan plans start, so a tick that runs
+	// out of budget hands the rest of the rotation to the next one.
+	handlerCursor       int
+	ttlInlinePlanCursor int
 
 	ttlInlineGroupsUnknownOnce sync.Once
 }
@@ -342,7 +346,7 @@ func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS u
 		return nil
 	}
 	handlers := c.allHandlers()
-	start := c.backgroundHandlerStart(len(handlers))
+	start := c.rotationStart(&c.handlerCursor, len(handlers))
 	var combined error
 	for offset := range handlers {
 		if ctx.Err() != nil {
@@ -351,7 +355,7 @@ func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS u
 		idx := (start + offset) % len(handlers)
 		h := handlers[idx]
 		err := c.compactHandlerSafely(ctx, h, readTS)
-		c.advanceBackgroundHandlerCursor(idx, len(handlers))
+		c.advanceRotation(&c.handlerCursor, idx, len(handlers))
 		if err != nil && !errors.Is(err, context.Canceled) {
 			combined = errors.CombineErrors(combined, err)
 		}
@@ -359,25 +363,28 @@ func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS u
 	return errors.WithStack(combined)
 }
 
-func (c *DeltaCompactor) backgroundHandlerStart(total int) int {
+// rotationStart returns where a rotation over total items starts this tick.
+// cursor is one of the compactor's rotation cursors, guarded by stateMu.
+func (c *DeltaCompactor) rotationStart(cursor *int, total int) int {
 	if total <= 0 {
 		return 0
 	}
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	if c.handlerCursor < 0 || c.handlerCursor >= total {
-		c.handlerCursor = 0
+	if *cursor < 0 || *cursor >= total {
+		*cursor = 0
 	}
-	return c.handlerCursor
+	return *cursor
 }
 
-func (c *DeltaCompactor) advanceBackgroundHandlerCursor(current, total int) {
+// advanceRotation moves cursor past current, the item a tick just ran.
+func (c *DeltaCompactor) advanceRotation(cursor *int, current, total int) {
 	if total <= 0 {
 		return
 	}
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	c.handlerCursor = (current + 1) % total
+	*cursor = (current + 1) % total
 }
 
 func (c *DeltaCompactor) compactHandlerSafely(ctx context.Context, h collectionDeltaHandler, readTS uint64) (err error) {
