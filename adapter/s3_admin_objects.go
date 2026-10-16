@@ -10,7 +10,6 @@ import (
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
-	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
@@ -620,30 +619,19 @@ func clampAdminListMaxKeys(n int) int {
 }
 
 // AdminListObjects returns a bounded page of objects under a
-// prefix. Read role required. Delimiter collapses pseudo-folders
-// into CommonPrefixes the same way SigV4 ListObjectsV2 does.
+// prefix. Read role required. It runs the same scan as SigV4
+// ListObjectsV2 (scanS3ObjectListing), so delimiter collapsing and
+// continuation tokens behave identically on both paths.
 //
 // Sentinels:
 //   - ErrAdminForbidden                — principal lacks read role
 //   - ErrAdminNotLeader                — follower
 //   - ErrAdminBucketNotFound           — bucket absent
 //   - ErrAdminInvalidBucketName        — malformed bucket name argument
-//   - ErrAdminInvalidContinuationToken — token references a different
-//     bucket / generation / prefix / delimiter than the current
-//     request, OR the token's readTS has been MVCC-GC'd past
-//     (store.ErrReadTSCompacted on the underlying scan)
-//
-// A structurally invalid / non-base64-decodable continuation token
-// surfaces as a wrapped json/decode error from decodeS3ContinuationToken,
-// not as a sentinel — the bridge maps that to a generic 400 with the
-// decode-error text preserved.
-//
-// Mirrors the SigV4 listObjectsV2 precedent at s3.go (same scan-
-// and-collapse pipeline with one error-return per stage; carries
-// the same nolint set). Splitting further would obscure the
-// pagination cursor lifecycle.
-//
-//nolint:cyclop,gocognit,gocyclo,nestif // see comment above
+//   - ErrAdminInvalidContinuationToken — token is not base64 JSON,
+//     references a different bucket / generation / prefix / delimiter
+//     than the current request, or its readTS has been MVCC-GC'd past
+//     (store.ErrReadTSCompacted on the metadata load or the scan)
 func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipal, bucket string, opts AdminListObjectsOptions) (AdminObjectListing, error) {
 	if !principal.Role.canRead() {
 		return AdminObjectListing{}, ErrAdminForbidden
@@ -655,141 +643,51 @@ func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipa
 		return AdminObjectListing{}, errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
 	}
 
-	token, err := decodeS3ContinuationToken(opts.ContinuationToken)
+	page, err := s.scanS3ObjectListing(ctx, s3ObjectListingRequest{
+		Bucket:            bucket,
+		Prefix:            opts.Prefix,
+		Delimiter:         opts.Delimiter,
+		ContinuationToken: opts.ContinuationToken,
+		MaxKeys:           clampAdminListMaxKeys(opts.MaxKeys),
+	})
 	if err != nil {
-		return AdminObjectListing{}, errors.Wrap(err, "decode continuation token")
+		return AdminObjectListing{}, adminListingError(err)
 	}
 
-	readTS := s.readTS()
-	if token != nil && token.ReadTS != 0 {
-		readTS = token.ReadTS
+	out := AdminObjectListing{
+		Objects:               make([]AdminObject, 0, len(page.Objects)),
+		CommonPrefixes:        page.CommonPrefixes,
+		NextContinuationToken: page.NextContinuationToken,
 	}
-
-	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
-	if err != nil {
-		// Same compaction-error translation as the ScanAt path
-		// below: when the caller passed a continuation token whose
-		// readTS has been MVCC-GC'd past, loadBucketMetaAt's GetAt
-		// also surfaces ErrReadTSCompacted — callers need to see
-		// the dedicated sentinel rather than a generic 500 (Codex
-		// r2 P2 on PR #811).
-		if token != nil && errors.Is(err, store.ErrReadTSCompacted) {
-			return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidContinuationToken,
-				"continuation token readTS has been compacted")
+	for _, obj := range page.Objects {
+		ct := obj.Manifest.ContentType
+		if ct == "" {
+			ct = defaultS3ContentType
 		}
-		return AdminObjectListing{}, errors.WithStack(err)
-	}
-	if !exists || meta == nil {
-		return AdminObjectListing{}, ErrAdminBucketNotFound
-	}
-
-	if token != nil && (token.Bucket != bucket || token.Generation != meta.Generation ||
-		token.Prefix != opts.Prefix || token.Delimiter != opts.Delimiter) {
-		return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidContinuationToken,
-			"continuation token does not match request")
-	}
-
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
-	start := s3keys.ObjectManifestScanStart(bucket, meta.Generation, opts.Prefix)
-	if token != nil {
-		start = nextScanCursor(s3keys.ObjectManifestKey(bucket, token.Generation, token.LastKey))
-	}
-	end := prefixScanEnd(s3keys.ObjectManifestScanStart(bucket, meta.Generation, opts.Prefix))
-	maxKeys := clampAdminListMaxKeys(opts.MaxKeys)
-
-	out := AdminObjectListing{Objects: []AdminObject{}}
-	commonPrefixSeen := map[string]struct{}{}
-	if token != nil && token.LastCommonPrefix != "" {
-		commonPrefixSeen[token.LastCommonPrefix] = struct{}{}
-	}
-	cursor := start
-	truncated := false
-	emitted := 0
-	var lastKey, lastCommonPrefix string
-
-	for emitted < maxKeys {
-		pageLimit := s3ListPageSize
-		if remaining := maxKeys - emitted; remaining < pageLimit {
-			pageLimit = remaining
-		}
-		page, err := s.store.ScanAt(ctx, cursor, end, pageLimit, readTS)
-		if err != nil {
-			// Matches the SigV4 listObjectsV2 precedent at
-			// s3.go:2105 — a continuation token whose readTS has
-			// been MVCC-GC'd past surfaces as ErrReadTSCompacted
-			// from the underlying scan; the admin caller needs the
-			// dedicated sentinel so the bridge can render 400 with
-			// a useful message instead of an opaque 500.
-			if token != nil && errors.Is(err, store.ErrReadTSCompacted) {
-				return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidContinuationToken,
-					"continuation token readTS has been compacted")
-			}
-			return AdminObjectListing{}, errors.WithStack(err)
-		}
-		if len(page) == 0 {
-			break
-		}
-		for _, kvp := range page {
-			_, generation, objectKey, ok := s3keys.ParseObjectManifestKey(kvp.Key)
-			if !ok || generation != meta.Generation || !strings.HasPrefix(objectKey, opts.Prefix) {
-				continue
-			}
-			if opts.Delimiter != "" {
-				suffix := strings.TrimPrefix(objectKey, opts.Prefix)
-				if idx := strings.Index(suffix, opts.Delimiter); idx >= 0 {
-					commonPrefix := opts.Prefix + suffix[:idx+len(opts.Delimiter)]
-					if _, exists := commonPrefixSeen[commonPrefix]; !exists {
-						commonPrefixSeen[commonPrefix] = struct{}{}
-						out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix)
-						emitted++
-						lastKey = objectKey
-						lastCommonPrefix = commonPrefix
-					}
-					if emitted >= maxKeys {
-						truncated = true
-						break
-					}
-					continue
-				}
-			}
-			manifest, err := decodeS3ObjectManifest(kvp.Value)
-			if err != nil {
-				return AdminObjectListing{}, errors.WithStack(err)
-			}
-			ct := manifest.ContentType
-			if ct == "" {
-				ct = defaultS3ContentType
-			}
-			out.Objects = append(out.Objects, AdminObject{
-				Key:          objectKey,
-				Size:         manifest.SizeBytes,
-				ContentType:  ct,
-				ETag:         manifest.ETag,
-				LastModified: hlcToTime(manifest.LastModifiedHLC),
-				StorageClass: "STANDARD",
-			})
-			emitted++
-			lastKey = objectKey
-			lastCommonPrefix = ""
-			if emitted >= maxKeys {
-				truncated = true
-				break
-			}
-		}
-		if truncated {
-			break
-		}
-		cursor = nextScanCursor(page[len(page)-1].Key)
-		if len(page) < pageLimit {
-			break
-		}
-	}
-
-	if truncated {
-		out.NextContinuationToken = encodeS3ContinuationToken(bucket, meta.Generation,
-			opts.Prefix, opts.Delimiter, lastKey, lastCommonPrefix, readTS)
+		out.Objects = append(out.Objects, AdminObject{
+			Key:          obj.Key,
+			Size:         obj.Manifest.SizeBytes,
+			ContentType:  ct,
+			ETag:         obj.Manifest.ETag,
+			LastModified: hlcToTime(obj.Manifest.LastModifiedHLC),
+			StorageClass: "STANDARD",
+		})
 	}
 	return out, nil
+}
+
+// adminListingError maps scanS3ObjectListing failures onto the admin
+// sentinels. Token failures keep their reason in the message, which the
+// admin bridge surfaces in the 400 body.
+func adminListingError(err error) error {
+	switch {
+	case errors.Is(err, errS3ListingMalformedToken),
+		errors.Is(err, errS3ListingTokenMismatch),
+		errors.Is(err, errS3ListingTokenExpired):
+		return errors.Wrap(ErrAdminInvalidContinuationToken, err.Error())
+	case errors.Is(err, errS3ListingNoSuchBucket):
+		return ErrAdminBucketNotFound
+	default:
+		return errors.WithStack(err)
+	}
 }

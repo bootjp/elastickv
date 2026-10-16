@@ -1649,140 +1649,60 @@ func parseS3PartNumberMarker(raw string) int {
 //nolint:cyclop,gocognit,gocyclo,nestif // ListObjectsV2 combines token validation, shard-stable snapshotting, and delimiter pagination rules.
 func (s *S3Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket string) {
 	query := r.URL.Query()
-	prefix := query.Get("prefix")
-	delimiter := query.Get("delimiter")
-	maxKeys := parseS3MaxKeys(query.Get("max-keys"))
-
-	// Parse the continuation token first so we can select the final readTS before loading metadata.
-	// This ensures meta is always loaded at the same snapshot used for the scan.
-	token, err := decodeS3ContinuationToken(query.Get("continuation-token"))
+	req := s3ObjectListingRequest{
+		Bucket:            bucket,
+		Prefix:            query.Get("prefix"),
+		Delimiter:         query.Get("delimiter"),
+		ContinuationToken: query.Get("continuation-token"),
+		StartAfter:        query.Get("start-after"),
+		MaxKeys:           parseS3MaxKeys(query.Get("max-keys")),
+	}
+	page, err := s.scanS3ObjectListing(r.Context(), req)
 	if err != nil {
-		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "invalid continuation token", bucket, "")
+		writeS3ListingError(w, bucket, err)
 		return
 	}
-
-	readTS := s.readTS()
-	if token != nil && token.ReadTS != 0 {
-		readTS = token.ReadTS
-	}
-
-	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
-	if err != nil {
-		writeS3InternalError(w, err)
-		return
-	}
-	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
-		return
-	}
-
-	if token != nil {
-		if token.Bucket != bucket || token.Generation != meta.Generation || token.Prefix != prefix || token.Delimiter != delimiter {
-			writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "continuation token does not match request", bucket, "")
-			return
-		}
-	}
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
-	start := s3keys.ObjectManifestScanStart(bucket, meta.Generation, prefix)
-	if token != nil {
-		start = nextScanCursor(s3keys.ObjectManifestKey(bucket, token.Generation, token.LastKey))
-	}
-	if token == nil {
-		startAfter := query.Get("start-after")
-		if startAfter != "" {
-			start = nextScanCursor(s3keys.ObjectManifestKey(bucket, meta.Generation, startAfter))
-		}
-	}
-	end := prefixScanEnd(s3keys.ObjectManifestScanStart(bucket, meta.Generation, prefix))
 
 	result := s3ListBucketResult{
-		XMLNS:             s3XMLNamespace,
-		Name:              bucket,
-		Prefix:            prefix,
-		Delimiter:         delimiter,
-		MaxKeys:           maxKeys,
-		ContinuationToken: query.Get("continuation-token"),
+		XMLNS:                 s3XMLNamespace,
+		Name:                  bucket,
+		Prefix:                req.Prefix,
+		Delimiter:             req.Delimiter,
+		MaxKeys:               req.MaxKeys,
+		KeyCount:              len(page.Objects) + len(page.CommonPrefixes),
+		ContinuationToken:     req.ContinuationToken,
+		NextContinuationToken: page.NextContinuationToken,
+		IsTruncated:           page.Truncated,
 	}
-	commonPrefixSeen := map[string]struct{}{}
-	if token != nil && token.LastCommonPrefix != "" {
-		commonPrefixSeen[token.LastCommonPrefix] = struct{}{}
+	for _, obj := range page.Objects {
+		result.Contents = append(result.Contents, s3ListObjectContent{
+			Key:          obj.Key,
+			LastModified: formatS3ISOTime(obj.Manifest.LastModifiedHLC),
+			ETag:         quoteS3ETag(obj.Manifest.ETag),
+			Size:         obj.Manifest.SizeBytes,
+			StorageClass: "STANDARD",
+		})
 	}
-	cursor := start
-	truncated := false
-	nextToken := ""
-
-	for result.KeyCount < maxKeys {
-		pageLimit := s3ListPageSize
-		if remaining := maxKeys - result.KeyCount; remaining < pageLimit {
-			pageLimit = remaining
-		}
-		page, err := s.store.ScanAt(r.Context(), cursor, end, pageLimit, readTS)
-		if err != nil {
-			if token != nil && errors.Is(err, store.ErrReadTSCompacted) {
-				writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "continuation token has expired", bucket, "")
-				return
-			}
-			writeS3InternalError(w, err)
-			return
-		}
-		if len(page) == 0 {
-			break
-		}
-		for _, kvp := range page {
-			_, generation, objectKey, ok := s3keys.ParseObjectManifestKey(kvp.Key)
-			if !ok || generation != meta.Generation || !strings.HasPrefix(objectKey, prefix) {
-				continue
-			}
-			if delimiter != "" {
-				suffix := strings.TrimPrefix(objectKey, prefix)
-				if idx := strings.Index(suffix, delimiter); idx >= 0 {
-					commonPrefix := prefix + suffix[:idx+len(delimiter)]
-					if _, exists := commonPrefixSeen[commonPrefix]; !exists {
-						commonPrefixSeen[commonPrefix] = struct{}{}
-						result.CommonPrefixes = append(result.CommonPrefixes, s3CommonPrefix{Prefix: commonPrefix})
-						result.KeyCount++
-					}
-					if result.KeyCount >= maxKeys {
-						truncated = true
-						nextToken = encodeS3ContinuationToken(bucket, meta.Generation, prefix, delimiter, objectKey, commonPrefix, readTS)
-						break
-					}
-					continue
-				}
-			}
-			manifest, err := decodeS3ObjectManifest(kvp.Value)
-			if err != nil {
-				writeS3InternalError(w, err)
-				return
-			}
-			result.Contents = append(result.Contents, s3ListObjectContent{
-				Key:          objectKey,
-				LastModified: formatS3ISOTime(manifest.LastModifiedHLC),
-				ETag:         quoteS3ETag(manifest.ETag),
-				Size:         manifest.SizeBytes,
-				StorageClass: "STANDARD",
-			})
-			result.KeyCount++
-			if result.KeyCount >= maxKeys {
-				truncated = true
-				nextToken = encodeS3ContinuationToken(bucket, meta.Generation, prefix, delimiter, objectKey, "", readTS)
-				break
-			}
-		}
-		if truncated {
-			break
-		}
-		cursor = nextScanCursor(page[len(page)-1].Key)
-		if len(page) < pageLimit {
-			break
-		}
+	for _, prefix := range page.CommonPrefixes {
+		result.CommonPrefixes = append(result.CommonPrefixes, s3CommonPrefix{Prefix: prefix})
 	}
-
-	result.IsTruncated = truncated
-	result.NextContinuationToken = nextToken
 	writeS3XML(w, http.StatusOK, result)
+}
+
+// writeS3ListingError maps scanS3ObjectListing failures onto S3 errors.
+func writeS3ListingError(w http.ResponseWriter, bucket string, err error) {
+	switch {
+	case errors.Is(err, errS3ListingMalformedToken):
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "invalid continuation token", bucket, "")
+	case errors.Is(err, errS3ListingTokenMismatch):
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "continuation token does not match request", bucket, "")
+	case errors.Is(err, errS3ListingTokenExpired):
+		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "continuation token has expired", bucket, "")
+	case errors.Is(err, errS3ListingNoSuchBucket):
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+	default:
+		writeS3InternalError(w, err)
+	}
 }
 
 func (s *S3Server) loadBucketMetaAt(ctx context.Context, bucket string, readTS uint64) (*s3BucketMeta, bool, error) {

@@ -69,3 +69,20 @@ func TestS3Server_AdminListObjects_MalformedContinuationTokenIsInvalid(t *testin
 			"token %q: want ErrAdminInvalidContinuationToken; got %v", raw, err)
 	}
 }
+
+func TestS3Server_ListObjectsV2_MalformedContinuationTokenIsInvalidArgument(t *testing.T) {
+	t.Parallel()
+
+	st := store.NewMVCCStore()
+	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
+	rec := httptest.NewRecorder()
+	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-a", nil))
+	require.Equal(t, http.StatusOK, rec.Code)
+
+	for _, raw := range []string{"%25%25not-base64", "bm90LWpzb24"} {
+		rec = httptest.NewRecorder()
+		server.handle(rec, newS3TestRequest(http.MethodGet, "/bucket-a?list-type=2&continuation-token="+raw, nil))
+		require.Equal(t, http.StatusBadRequest, rec.Code, "token %q: body=%s", raw, rec.Body.String())
+		require.Contains(t, rec.Body.String(), "invalid continuation token")
+	}
+}
