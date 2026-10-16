@@ -411,7 +411,10 @@ func TestInstallFilesystemServerLifecycleBoundsHungUnmount(t *testing.T) {
 // finishes in that window ends the loop and the shutdown proceeds at once,
 // before the stores are closed underneath it.
 func TestInstallFilesystemServerLifecycleWaitsForServeLoopAfterHungUnmount(t *testing.T) {
-	shortenFilesystemServeStopTimeout(t, 500*time.Millisecond)
+	// A budget large enough that scheduling jitter under -race or a loaded
+	// CI runner cannot push the observed end of the serve loop past the
+	// upper bound below.
+	shortenFilesystemServeStopTimeout(t, 2*time.Second)
 	ctx, cancel := context.WithCancel(context.Background())
 	eg, egCtx := errgroup.WithContext(ctx)
 	cleanup := &internalutil.CleanupStack{}
@@ -443,10 +446,10 @@ func TestInstallFilesystemServerLifecycleWaitsForServeLoopAfterHungUnmount(t *te
 	}
 	elapsed := time.Since(start)
 	require.Equal(t, 1, server.lazyCalls)
-	// Past the 4/5 unmount wait, but well before the full budget: the loop
-	// ending was observed rather than timed out.
-	require.GreaterOrEqual(t, elapsed, 400*time.Millisecond)
-	require.Less(t, elapsed, 480*time.Millisecond, "serveDone closing must end the wait before the budget expires")
+	// Past the 4/5 unmount wait (1.6 s), but well before the full budget:
+	// the loop ending was observed rather than timed out.
+	require.GreaterOrEqual(t, elapsed, 1600*time.Millisecond)
+	require.Less(t, elapsed, 1900*time.Millisecond, "serveDone closing must end the wait before the budget expires")
 	release()
 	cleanup.Run()
 }
