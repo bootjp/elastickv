@@ -492,6 +492,10 @@ type Server struct {
 	inner      *fuse.Server
 	adapter    *Adapter
 	mountPoint string
+	// fsType is the mounts-table type of this mount (`fuse.<Name>`, the
+	// subtype go-fuse mounts with); the lazy detach refuses to act on
+	// anything else at the mount point.
+	fsType string
 }
 
 // Mount attaches adapter to mountPoint using go-fuse. The returned server is
@@ -502,9 +506,9 @@ type Server struct {
 // A dangling FUSE mount left at mountPoint by a server that died without
 // unmounting (SIGKILL, a crash) is detached first, because fusermount3
 // refuses to mount over a mount point whose transport is not connected. Only
-// a mount the mounts table reports as FUSE and whose stat fails with ENOTCONN
-// is touched; a live FUSE mount or any other filesystem at the path is left
-// alone.
+// a mount the mounts table reports with this server's own type
+// (`fuse.<Name>`) and whose stat fails with ENOTCONN is touched; a live
+// mount or a filesystem of any other type at the path is left alone.
 func Mount(mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Server, error) {
 	return MountContext(context.Background(), mountPoint, adapter, options)
 }
@@ -524,10 +528,10 @@ func MountContext(ctx context.Context, mountPoint string, adapter *Adapter, opti
 	if err := ctx.Err(); err != nil {
 		return nil, errors.Wrap(err, "filesystem FUSE mount aborted before start")
 	}
-	if _, err := detachStaleMount(ctx, mountPoint, slog.Default()); err != nil {
+	opts := defaultMountOptions(options)
+	if _, err := detachStaleMount(ctx, mountPoint, opts.Name, slog.Default()); err != nil {
 		return nil, errors.Wrap(err, "detach stale filesystem FUSE mount")
 	}
-	opts := defaultMountOptions(options)
 	if recoverer, ok := adapter.core.(intentRecoverer); ok {
 		recoveryCtx, cancel := context.WithTimeout(ctx, startupRecoveryTimeout)
 		recoveryErr := recoverIntentsBeforeMount(recoveryCtx, recoverer)
@@ -540,7 +544,7 @@ func MountContext(ctx context.Context, mountPoint string, adapter *Adapter, opti
 	if err != nil {
 		return nil, err
 	}
-	return &Server{inner: inner, adapter: adapter, mountPoint: mountPoint}, nil
+	return &Server{inner: inner, adapter: adapter, mountPoint: mountPoint, fsType: fuseTypeFor(opts.Name)}, nil
 }
 
 type newServerResult struct {
@@ -566,31 +570,56 @@ func newServerContext(ctx context.Context, fs fuse.RawFileSystem, mountPoint str
 		}
 		return res.server, nil
 	case <-ctx.Done():
-		go releaseAbandonedMount(results, mountPoint)
+		go releaseAbandonedMount(results, mountPoint, fuseTypeFor(opts.Name))
 		return nil, errors.Wrap(ctx.Err(), "filesystem FUSE mount cancelled while waiting for the mount helper")
 	}
 }
+
+// abandonedUnmountTimeout bounds the plain unmount of a mount that completed
+// after its caller gave up: go-fuse runs the unmount helper without a bound
+// and then waits for its event loops, either of which can hang. A variable
+// so tests can shorten it.
+var abandonedUnmountTimeout = detachCommandTimeout
 
 // releaseAbandonedMount tears down a mount that completed after MountContext
 // had already given up on it. go-fuse's NewServer registers the event loop
 // with its wait group and Unmount waits for that group, but only Serve runs
 // the loop that releases it, so Serve must be running for Unmount to return;
-// the loop exits by itself once the kernel unmount closes the connection. A
-// failed unmount falls back to the lazy detach so no kernel mount is left
-// behind.
-func releaseAbandonedMount(results <-chan newServerResult, mountPoint string) {
+// the loop exits by itself once the kernel unmount closes the connection.
+func releaseAbandonedMount(results <-chan newServerResult, mountPoint, fsType string) {
 	res := <-results
 	if res.server == nil {
 		return
 	}
 	go res.server.Serve()
-	if err := res.server.Unmount(); err == nil {
-		return
+	releaseAbandoned(res.server.Unmount, mountPoint, fsType)
+}
+
+// releaseAbandoned runs unmount under abandonedUnmountTimeout. When it fails
+// or does not return in time, the mount is detached lazily instead so no
+// kernel mount is left behind; the lazy detach itself refuses a path that
+// no longer holds a mount of fsType, so an unmount that did succeed late is
+// not followed by a detach of whatever sits underneath.
+func releaseAbandoned(unmount func() error, mountPoint, fsType string) {
+	done := make(chan error, 1)
+	go func() { done <- unmount() }()
+	timer := time.NewTimer(abandonedUnmountTimeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err == nil {
+			return
+		}
+		slog.Warn("filesystem FUSE unmount of an abandoned mount failed, detaching lazily", "mount_point", mountPoint, "err", err)
+	case <-timer.C:
+		slog.Warn("filesystem FUSE unmount of an abandoned mount did not return in time, detaching lazily",
+			"mount_point", mountPoint,
+			"timeout", abandonedUnmountTimeout,
+		)
 	}
-	slog.Warn("filesystem FUSE unmount of an abandoned mount failed, detaching lazily", "mount_point", mountPoint)
 	ctx, cancel := context.WithTimeout(context.Background(), detachCommandTimeout)
 	defer cancel()
-	if _, err := detachFUSEMount(ctx, mountPoint); err != nil {
+	if _, err := detachFUSEMount(ctx, mountPoint, fsType); err != nil && !errors.Is(err, errNoFUSEMount) {
 		slog.Warn("filesystem FUSE lazy detach of an abandoned mount failed", "mount_point", mountPoint, "err", err)
 	}
 }
@@ -673,12 +702,20 @@ func (s *Server) Unmount() error {
 // lookups see the plain directory at once, open handles keep working until
 // they are closed, and the kernel releases the FUSE connection, ending
 // Serve, once the last one is gone. It is the fallback for an Unmount that
-// failed with EBUSY during shutdown. A nil or never-mounted Server is a
+// failed with EBUSY or did not return during shutdown. It acts only on a
+// mount of this server's own type still present at the mount point: when
+// the kernel mount is already gone (Unmount removed it and is merely waiting
+// for its event loop), or a filesystem of any other type is exposed there,
+// nothing is touched and nil is returned. A nil or never-mounted Server is a
 // no-op.
 func (s *Server) UnmountLazy(ctx context.Context) error {
 	if s == nil || s.inner == nil || s.mountPoint == "" {
 		return nil
 	}
-	_, err := detachFUSEMount(ctx, s.mountPoint)
+	_, err := detachFUSEMount(ctx, s.mountPoint, s.fsType)
+	if errors.Is(err, errNoFUSEMount) {
+		slog.InfoContext(ctx, "filesystem FUSE mount is already gone, nothing to detach", "mount_point", s.mountPoint)
+		return nil
+	}
 	return err
 }

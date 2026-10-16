@@ -30,21 +30,24 @@ const (
 	mountTableOctalBase = 8
 	// mountTableOctalBits is the bit size of the byte a `\ooo` escape encodes.
 	mountTableOctalBits = 8
-	// fuseTypePrefix is the type go-fuse mounts report in the mounts table
-	// (`fuse.<FsName>`). A bare `fuse` type is the libfuse default.
+	// fuseTypePrefix starts the type go-fuse mounts report in the mounts
+	// table (`fuse.<Name>`); fuseTypeFor builds the full type. Only a
+	// mount of this server's own type is ever detached: a bare `fuse` or a
+	// foreign `fuse.<other>` mount at the path belongs to someone else.
 	fuseTypePrefix = "fuse."
-	// fuseType is the mounts-table type of a FUSE mount without an FsName.
-	fuseType = "fuse"
 	// detachCommandTimeout bounds one fusermount invocation. A dangling
 	// mount does not need the server, so detaching it never blocks on I/O,
 	// but a hung suid helper must not stall startup forever.
 	detachCommandTimeout = 10 * time.Second
 	// detachHelperBudgetShare is the fraction (1/n) of the caller's remaining
-	// deadline one helper invocation may use, so a hung helper cannot spend
-	// the whole budget and starve the privileged unmount(2) fallback.
+	// deadline one helper invocation may use in total, including the
+	// WaitDelay below, so a hung helper cannot spend the whole budget and
+	// starve the privileged unmount(2) fallback.
 	detachHelperBudgetShare = 2
 	// detachHelperWaitDelay bounds how long a killed helper's output pipes
-	// are waited for (exec.Cmd.WaitDelay).
+	// are waited for (exec.Cmd.WaitDelay). It is reserved out of the
+	// helper's share: os/exec waits for the pipes after the context has
+	// killed the helper, on top of the context timeout.
 	detachHelperWaitDelay = 500 * time.Millisecond
 	// maxStaleMountDetaches bounds the detach loop. Each iteration removes
 	// the topmost stale mount at the path; several only stack up when a
@@ -61,16 +64,35 @@ const (
 	staleProbeTimeout = 10 * time.Second
 )
 
-// mountProbeError reports that the liveness stat on a FUSE mount could not
-// reach a verdict: the probe was cancelled (shutdown requested) or timed out
-// (a live but unresponsive FUSE server still holds the mount point).
+// mountPointResolveTimeout bounds the symlink resolution of the mount
+// point's parent directories, which stats each path component and can
+// block when a parent sits on an unresponsive FUSE or network filesystem.
+// A variable so tests can shorten it.
+var mountPointResolveTimeout = staleProbeTimeout
+
+// mountProbeError reports that an inspection of the mount point could not
+// reach a verdict: the liveness stat on a FUSE mount, or the resolution of
+// the mount point's parent directories, was cancelled (shutdown requested)
+// or timed out (a live but unresponsive FUSE server still holds the mount
+// point, or a parent directory sits on an unresponsive filesystem). op names
+// the step that gave up.
 type mountProbeError struct {
+	op   string
 	path string
 	err  error
 }
 
+const (
+	probeOpStat    = "stat FUSE mount at"
+	probeOpResolve = "resolve FUSE mount point"
+)
+
 func (e *mountProbeError) Error() string {
-	return "stat FUSE mount at " + e.path + ": " + e.err.Error()
+	op := e.op
+	if op == "" {
+		op = probeOpStat
+	}
+	return op + " " + e.path + ": " + e.err.Error()
 }
 
 func (e *mountProbeError) Unwrap() error { return e.err }
@@ -103,10 +125,27 @@ type staleMountInspector struct {
 	mountTable   string
 	stat         func(string) error
 	probeTimeout time.Duration
+	// fsType is the mounts-table type of the mounts this server makes;
+	// only a dead mount of that type is detached. Empty means the default
+	// mount name's type.
+	fsType string
 }
 
-func defaultStaleMountInspector() *staleMountInspector {
-	return &staleMountInspector{mountTable: mountTablePath, stat: statMountPoint, probeTimeout: staleProbeTimeout}
+func defaultStaleMountInspector(mountName string) *staleMountInspector {
+	return &staleMountInspector{
+		mountTable:   mountTablePath,
+		stat:         statMountPoint,
+		probeTimeout: staleProbeTimeout,
+		fsType:       fuseTypeFor(mountName),
+	}
+}
+
+// expectedType is the mounts-table type a mount must have to be ours.
+func (i *staleMountInspector) expectedType() string {
+	if i.fsType == "" {
+		return fuseTypeFor(filesystemName)
+	}
+	return i.fsType
 }
 
 func statMountPoint(path string) error {
@@ -116,12 +155,17 @@ func statMountPoint(path string) error {
 
 // detachStaleMount removes a dangling FUSE mount left at mountPoint by a
 // server that died without unmounting (SIGKILL, a crash, or a stop before
-// the process installed signal handling). It reports how many mounts were
-// detached. A path that holds no mount, a live FUSE mount (its server still
-// answers stat), or any non-FUSE filesystem is left untouched: the mount
-// table decides the type, never the error from stat alone.
-func detachStaleMount(ctx context.Context, mountPoint string, logger *slog.Logger) (int, error) {
-	return defaultStaleMountInspector().detachAll(ctx, mountPoint, logger, detachFUSEMount)
+// the process installed signal handling). mountName is the Name (subtype)
+// this server mounts with, so only a mount of the same `fuse.<Name>` type
+// is a candidate. It reports how many mounts were detached. A path that holds
+// no mount, a live mount (its server still answers stat), or a filesystem
+// of any other type, FUSE or not, is left untouched: the mount table
+// decides the type, never the error from stat alone.
+func detachStaleMount(ctx context.Context, mountPoint, mountName string, logger *slog.Logger) (int, error) {
+	inspector := defaultStaleMountInspector(mountName)
+	return inspector.detachAll(ctx, mountPoint, logger, func(ctx context.Context, path string) (string, error) {
+		return detachFUSEMount(ctx, path, inspector.fsType)
+	})
 }
 
 func (i *staleMountInspector) detachAll(
@@ -157,6 +201,12 @@ func (i *staleMountInspector) detachAll(
 			return detached, errors.Errorf("more than %d stale FUSE mounts at %s", maxStaleMountDetaches, mountPoint)
 		}
 		method, err := detach(ctx, entry.mountPoint)
+		if errors.Is(err, errNoFUSEMount) {
+			// The mount went away between the inspection and the detach
+			// (another process, or the kernel finishing an unmount);
+			// inspect again rather than count or report it.
+			continue
+		}
 		if err != nil {
 			return detached, errors.Wrapf(err, "detach stale FUSE mount at %s", entry.mountPoint)
 		}
@@ -169,29 +219,65 @@ func (i *staleMountInspector) detachAll(
 	}
 }
 
-// staleFUSEMount reports whether the topmost mount at mountPoint is a FUSE
-// mount whose server is gone. The topmost entry decides: a non-FUSE
-// filesystem mounted over a dead FUSE mount is not touched either. The
-// liveness stat is bounded by ctx and probeTimeout; when it cannot reach a
-// verdict the error is a *mountProbeError.
-func (i *staleMountInspector) staleFUSEMount(ctx context.Context, mountPoint string) (mountTableEntry, bool, error) {
-	candidates, err := mountPointCandidates(mountPoint)
+// topmostMount returns the last mounts-table entry for mountPoint (the one
+// the kernel currently exposes there), read from tablePath. found is false
+// when nothing is mounted at the path. Resolving the mount point's
+// spellings is bounded by ctx and mountPointResolveTimeout; when it cannot
+// finish the error is a *mountProbeError.
+func topmostMount(ctx context.Context, tablePath, mountPoint string) (top mountTableEntry, found bool, err error) {
+	candidates, err := resolveMountPointCandidates(ctx, mountPoint)
 	if err != nil {
 		return mountTableEntry{}, false, err
 	}
-	entries, err := readMountTable(i.mountTable)
+	entries, err := readMountTable(tablePath)
 	if err != nil {
 		return mountTableEntry{}, false, err
 	}
-	var top mountTableEntry
-	found := false
 	for _, entry := range entries {
 		if candidates[entry.mountPoint] {
 			top = entry
 			found = true
 		}
 	}
-	if !found || !isFUSEType(top.fsType) {
+	return top, found, nil
+}
+
+// errNoFUSEMount reports that the path currently holds no FUSE mount of this
+// server's type: either nothing is mounted there or the topmost filesystem
+// is of another type, FUSE or not. A detach stops at that point so it can
+// never remove a foreign filesystem.
+var errNoFUSEMount = errors.New("no FUSE mount of this server's type at the path")
+
+// detachMountTable is the mounts table detachFUSEMount checks before it
+// touches anything. A variable so tests can point it at a table they wrote.
+var detachMountTable = mountTablePath
+
+// requireFUSEMount fails unless the topmost mount at mountPoint is a FUSE
+// mount of type fsType: errNoFUSEMount when the path holds nothing or a
+// filesystem of any other type, a wrapped *mountTableUnavailableError when
+// that cannot be verified.
+func requireFUSEMount(ctx context.Context, mountPoint, fsType string) error {
+	top, found, err := topmostMount(ctx, detachMountTable, mountPoint)
+	if err != nil {
+		return errors.Wrapf(err, "verify FUSE mount at %s", mountPoint)
+	}
+	if !found || top.fsType != fsType {
+		return errors.Wrapf(errNoFUSEMount, "%s", mountPoint)
+	}
+	return nil
+}
+
+// staleFUSEMount reports whether the topmost mount at mountPoint is a FUSE
+// mount of this server's type whose server is gone. The topmost entry
+// decides: any other filesystem mounted over a dead mount is not touched
+// either. The liveness stat is bounded by ctx and probeTimeout; when it
+// cannot reach a verdict the error is a *mountProbeError.
+func (i *staleMountInspector) staleFUSEMount(ctx context.Context, mountPoint string) (mountTableEntry, bool, error) {
+	top, found, err := topmostMount(ctx, i.mountTable, mountPoint)
+	if err != nil {
+		return mountTableEntry{}, false, err
+	}
+	if !found || top.fsType != i.expectedType() {
 		return mountTableEntry{}, false, nil
 	}
 	statErr := i.probe(ctx, top.mountPoint)
@@ -230,11 +316,51 @@ func (i *staleMountInspector) probe(ctx context.Context, path string) error {
 	case err := <-result:
 		return err
 	case <-ctx.Done():
-		return errors.WithStack(&mountProbeError{path: path, err: ctx.Err()})
+		return errors.WithStack(&mountProbeError{op: probeOpStat, path: path, err: ctx.Err()})
 	case <-timer.C:
 		return errors.WithStack(&mountProbeError{
+			op:   probeOpStat,
 			path: path,
 			err:  errors.Newf("no answer within %s, a live but unresponsive FUSE server may still hold the mount point", timeout),
+		})
+	}
+}
+
+// mountPointCandidatesFn resolves a mount point's spellings; a variable so
+// tests can stand in a resolution that blocks, as it does when a parent
+// directory sits on an unresponsive filesystem.
+var mountPointCandidatesFn = mountPointCandidates
+
+// resolveMountPointCandidates runs mountPointCandidates with a bound. The
+// parent canonicalization stats each path component, and nothing can
+// interrupt a stat blocked on a wedged FUSE or network filesystem, so the
+// call runs in its own goroutine and only the wait is bounded, by ctx and
+// by mountPointResolveTimeout; on cancellation or timeout the goroutine is
+// left to finish whenever the kernel lets it and a *mountProbeError is
+// returned instead of a verdict.
+func resolveMountPointCandidates(ctx context.Context, mountPoint string) (map[string]bool, error) {
+	type resolution struct {
+		candidates map[string]bool
+		err        error
+	}
+	results := make(chan resolution, 1)
+	resolve := mountPointCandidatesFn
+	go func() {
+		candidates, err := resolve(mountPoint)
+		results <- resolution{candidates: candidates, err: err}
+	}()
+	timer := time.NewTimer(mountPointResolveTimeout)
+	defer timer.Stop()
+	select {
+	case res := <-results:
+		return res.candidates, res.err
+	case <-ctx.Done():
+		return nil, errors.WithStack(&mountProbeError{op: probeOpResolve, path: mountPoint, err: ctx.Err()})
+	case <-timer.C:
+		return nil, errors.WithStack(&mountProbeError{
+			op:   probeOpResolve,
+			path: mountPoint,
+			err:  errors.Newf("no answer within %s, a parent directory may sit on an unresponsive filesystem", mountPointResolveTimeout),
 		})
 	}
 }
@@ -292,8 +418,11 @@ func canonicalParent(path string) string {
 	return parent
 }
 
-func isFUSEType(fsType string) bool {
-	return fsType == fuseType || strings.HasPrefix(fsType, fuseTypePrefix)
+// fuseTypeFor returns the mounts-table type go-fuse records for a mount
+// made with MountOptions.Name: go-fuse passes Name as the subtype
+// (`fuse.<Name>`), while FsName only fills the source column.
+func fuseTypeFor(mountName string) string {
+	return fuseTypePrefix + mountName
 }
 
 func readMountTable(path string) ([]mountTableEntry, error) {
@@ -362,10 +491,16 @@ func lookupMountHelper(name string) (string, error) {
 	return path, nil
 }
 
-// detachHelperTimeout bounds one helper invocation: detachCommandTimeout,
-// or a share of whatever is left of the caller's deadline, so that when the
-// helper hangs the privileged unmount(2) fallback still runs inside the
-// caller's budget instead of being skipped behind an expired context.
+// detachHelperTimeout bounds one helper invocation's context:
+// detachCommandTimeout, or a share of whatever is left of the caller's
+// deadline, so that when the helper hangs the privileged unmount(2)
+// fallback still runs inside the caller's budget instead of being skipped
+// behind an expired context. The share covers the whole invocation: the
+// pipe wait that os/exec adds after killing the helper (WaitDelay) is
+// taken out of it, so a helper that leaves a child holding its output
+// pipes still returns within the share. A share no larger than that wait
+// yields a zero or negative timeout, which makes exec skip the helper
+// without starting it.
 func detachHelperTimeout(ctx context.Context) time.Duration {
 	timeout := detachCommandTimeout
 	if deadline, ok := ctx.Deadline(); ok {
@@ -373,18 +508,42 @@ func detachHelperTimeout(ctx context.Context) time.Duration {
 			timeout = share
 		}
 	}
-	return timeout
+	return timeout - detachHelperWaitDelay
 }
 
-// detachFUSEMount lazily detaches the FUSE mount at mountPoint through the
-// same helpers go-fuse's own unmount uses: the suid fusermount3 (or legacy
+// detachFUSEMount lazily detaches the FUSE mount of type fsType at
+// mountPoint through the same helpers go-fuse's own unmount uses: the suid fusermount3 (or legacy
 // fusermount) binary with `-u -z`, which works for unprivileged users, and
 // otherwise a direct lazy unmount(2), the equivalent of `umount -l`, which
 // needs CAP_SYS_ADMIN (lazyUnmount, Linux only). It returns a description of
 // the mechanism used. A cancelled ctx is reported as the cancellation, not
 // as the EPERM the privileged fallback would produce for an unprivileged
 // server, so a shutdown requested mid-detach still exits cleanly.
-func detachFUSEMount(ctx context.Context, mountPoint string) (string, error) {
+//
+// It only ever acts on a mount of this server's own type. The mounts table
+// is checked before the helpers run and again right before the kernel
+// fallback: the helpers refuse a non-FUSE mount on their own but accept any
+// FUSE filesystem, unmount(2) accepts anything, and the path may no longer
+// hold our mount by then (go-fuse's own Unmount can have removed it while
+// still blocked on its event loop; another process may have detached it).
+// Such a path yields errNoFUSEMount and nothing is touched, so a filesystem
+// mounted underneath the mount point, another FUSE filesystem included, is
+// never detached.
+func detachFUSEMount(ctx context.Context, mountPoint, fsType string) (string, error) {
+	if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
+		return "", err
+	}
+	method, helperErr := detachWithHelpers(ctx, mountPoint)
+	if method != "" {
+		return method, nil
+	}
+	return detachWithKernel(ctx, mountPoint, fsType, helperErr)
+}
+
+// detachWithHelpers runs `fusermount3 -u -z`, then `fusermount -u -z`, each
+// under its share of the deadline. It returns the mechanism on success;
+// otherwise the last helper's failure, or nil when no helper was found.
+func detachWithHelpers(ctx context.Context, mountPoint string) (string, error) {
 	var helperErr error
 	for _, helper := range []string{"fusermount3", "fusermount"} {
 		bin, err := lookupMountHelper(helper)
@@ -405,17 +564,34 @@ func detachFUSEMount(ctx context.Context, mountPoint string) (string, error) {
 		}
 		helperErr = errors.Wrapf(err, "%s -u -z %s: %s", helper, mountPoint, strings.TrimSpace(string(output)))
 	}
+	return "", helperErr
+}
+
+// detachWithKernel is the privileged fallback after the helpers: it stops
+// on a cancelled context, re-verifies that the path still holds a FUSE
+// mount of type fsType, and only then calls unmount(2) with MNT_DETACH.
+// helperErr, when set, is kept in the error chain so the log shows why the
+// helpers did not do the job.
+func detachWithKernel(ctx context.Context, mountPoint, fsType string, helperErr error) (string, error) {
 	if err := ctx.Err(); err != nil {
-		if helperErr != nil {
-			return "", errors.Wrapf(err, "detach cancelled after %s", helperErr.Error())
-		}
-		return "", errors.Wrap(err, "detach cancelled")
+		return "", afterHelper(errors.Wrap(err, "detach cancelled"), helperErr)
+	}
+	// Re-check right before the privileged fallback: a helper may have
+	// taken long enough for the mount to disappear, and unmount(2) would
+	// otherwise detach whatever filesystem is now exposed at the path.
+	if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
+		return "", afterHelper(err, helperErr)
 	}
 	if err := lazyUnmount(mountPoint); err != nil {
-		if helperErr != nil {
-			return "", errors.Wrapf(err, "%s %s after %s", lazyUnmountMethod, mountPoint, helperErr.Error())
-		}
-		return "", errors.Wrapf(err, "%s %s", lazyUnmountMethod, mountPoint)
+		return "", afterHelper(errors.Wrapf(err, "%s %s", lazyUnmountMethod, mountPoint), helperErr)
 	}
 	return lazyUnmountMethod, nil
+}
+
+// afterHelper records the helpers' failure alongside err.
+func afterHelper(err, helperErr error) error {
+	if helperErr == nil {
+		return err
+	}
+	return errors.Wrapf(err, "after %s", helperErr.Error())
 }

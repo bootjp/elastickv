@@ -49,6 +49,7 @@ func mountMemoryFilesystemAt(t *testing.T, mountPoint string) {
 // e2eMount is a kernel mount owned by a test. unmount is idempotent so a
 // test may unmount early and let the cleanup run harmlessly afterwards.
 type e2eMount struct {
+	server    *fuseadapter.Server
 	serveDone <-chan struct{}
 	unmount   func() error
 }
@@ -79,7 +80,7 @@ func mountMemoryFilesystemServer(t *testing.T, mountPoint string) *e2eMount {
 		<-serveDone
 		skipOrFail(t, "FUSE mount did not come up: %v", err)
 	}
-	mount := &e2eMount{serveDone: serveDone, unmount: sync.OnceValue(server.Unmount)}
+	mount := &e2eMount{server: server, serveDone: serveDone, unmount: sync.OnceValue(server.Unmount)}
 	t.Cleanup(func() {
 		require.NoError(t, mount.unmount())
 		select {

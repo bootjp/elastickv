@@ -5,6 +5,7 @@ package fuseadapter_test
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"os/exec"
@@ -153,6 +154,13 @@ func TestKernelMountUnmountLeavesPlainDirectory(t *testing.T) {
 	}
 
 	entries, err := os.ReadDir(mountPoint)
+	require.NoError(t, err)
+	require.Empty(t, entries)
+
+	// The shutdown fallback after the kernel mount is already gone must be
+	// a no-op: nothing to detach, no error, the plain directory untouched.
+	require.NoError(t, mount.server.UnmountLazy(context.Background()))
+	entries, err = os.ReadDir(mountPoint)
 	require.NoError(t, err)
 	require.Empty(t, entries)
 
