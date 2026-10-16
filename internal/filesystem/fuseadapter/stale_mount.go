@@ -533,38 +533,65 @@ func detachFUSEMount(ctx context.Context, mountPoint, fsType string) (string, er
 	if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
 		return "", err
 	}
-	method, helperErr := detachWithHelpers(ctx, mountPoint)
+	method, helperErr := detachWithHelpers(ctx, mountPoint, fsType)
 	if method != "" {
 		return method, nil
+	}
+	if errors.Is(helperErr, errNoFUSEMount) {
+		return "", helperErr
 	}
 	return detachWithKernel(ctx, mountPoint, fsType, helperErr)
 }
 
+// detachMountHelpers are the helpers go-fuse's own unmount uses, in order.
+var detachMountHelpers = []string{"fusermount3", "fusermount"}
+
 // detachWithHelpers runs `fusermount3 -u -z`, then `fusermount -u -z`, each
 // under its share of the deadline. It returns the mechanism on success;
 // otherwise the last helper's failure, or nil when no helper was found.
-func detachWithHelpers(ctx context.Context, mountPoint string) (string, error) {
+// Before a helper runs after a failed one, the mounts table is checked
+// again: the failed helper may still have detached our mount (it reports
+// an error when, for example, a descendant keeps its output pipe open past
+// WaitDelay), and the next helper accepts any FUSE filesystem, so it must
+// not run against one that is now exposed. Such a path yields
+// errNoFUSEMount with the earlier failure kept in the chain.
+func detachWithHelpers(ctx context.Context, mountPoint, fsType string) (string, error) {
 	var helperErr error
-	for _, helper := range []string{"fusermount3", "fusermount"} {
+	for _, helper := range detachMountHelpers {
 		bin, err := lookupMountHelper(helper)
 		if err != nil {
 			continue
 		}
-		cmdCtx, cancel := context.WithTimeout(ctx, detachHelperTimeout(ctx))
-		//nolint:gosec // bin comes from LookPath over two fixed helper names and mountPoint is the operator's configured path.
-		cmd := exec.CommandContext(cmdCtx, bin, "-u", "-z", mountPoint)
-		// After the context kills the helper, do not wait on its output
-		// pipes for longer than this: a child the helper left behind could
-		// otherwise hold them open past the budget.
-		cmd.WaitDelay = detachHelperWaitDelay
-		output, err := cmd.CombinedOutput()
-		cancel()
-		if err == nil {
-			return helper + " -u -z", nil
+		if helperErr != nil {
+			if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
+				return "", afterHelper(err, helperErr)
+			}
 		}
-		helperErr = errors.Wrapf(err, "%s -u -z %s: %s", helper, mountPoint, strings.TrimSpace(string(output)))
+		if err := runDetachHelper(ctx, bin, mountPoint); err != nil {
+			helperErr = errors.Wrapf(err, "%s -u -z %s", helper, mountPoint)
+			continue
+		}
+		return helper + " -u -z", nil
 	}
 	return "", helperErr
+}
+
+// runDetachHelper runs one helper binary with `-u -z mountPoint` under its
+// share of ctx's deadline, reporting its output alongside a failure.
+func runDetachHelper(ctx context.Context, bin, mountPoint string) error {
+	cmdCtx, cancel := context.WithTimeout(ctx, detachHelperTimeout(ctx))
+	defer cancel()
+	//nolint:gosec // bin comes from LookPath over two fixed helper names and mountPoint is the operator's configured path.
+	cmd := exec.CommandContext(cmdCtx, bin, "-u", "-z", mountPoint)
+	// After the context kills the helper, do not wait on its output pipes
+	// for longer than this: a child the helper left behind could otherwise
+	// hold them open past the budget.
+	cmd.WaitDelay = detachHelperWaitDelay
+	output, err := cmd.CombinedOutput()
+	if err != nil {
+		return errors.Wrap(err, strings.TrimSpace(string(output)))
+	}
+	return nil
 }
 
 // detachWithKernel is the privileged fallback after the helpers: it stops
