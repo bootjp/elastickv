@@ -914,15 +914,16 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 // a time uses this instead, at a cost of one page per call however few of its
 // rows are kept.
 //
-// A group serves the keys whose route it owns, plus Redis hash, set and zset
-// rows still stored at the route of their raw key, which reads fall back to; the
-// page has already re-read those through the point-read path, so they carry the
-// value a reader sees. Rows of ranges the group no longer owns are skipped. Keys
-// of a route under staged visibility are skipped too: the page reads live rows
-// only, and an older live copy must not be acted on while a newer staged copy
-// waits for promotion. It is meant for the group's own leader: on any other node
-// the read is forwarded, and the leader serves it as ScanGroupAt, which may
-// refuse such a range.
+// A group serves the keys whose route it owns, plus Redis hash, set, zset and
+// stream rows still stored at the route of their raw key while the logical owner
+// holds no version of the key: point reads fall back to such a row exactly then,
+// so it is the value a reader sees. Only the owner's leader can tell, so on any
+// other node those rows are left out. Rows of ranges the group no longer owns
+// are skipped. Keys of a route under staged visibility are skipped too: the page
+// reads live rows only, and an older live copy must not be acted on while a
+// newer staged copy waits for promotion. It is meant for the group's own leader:
+// on any other node the read is forwarded, and the leader serves it as
+// ScanGroupAt, which may refuse such a range.
 func (s *ShardStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil, nil
@@ -939,33 +940,71 @@ func (s *ShardStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start
 	if page.full {
 		resume = page.advanceKey
 	}
-	canonicalized := redisWideColumnCanonicalizableScan(start)
-	out := make([]*store.KVPair, 0, len(page.kvs))
-	for _, kvp := range page.kvs {
-		if kvp != nil && s.groupServesKey(groupID, kvp.Key, canonicalized) {
-			out = append(out, kvp)
-		}
+	out, err := s.rowsGroupServesAt(ctx, groupID, page.kvs, ts)
+	if err != nil {
+		return nil, nil, err
 	}
 	return out, resume, nil
 }
 
-// groupServesKey reports whether groupID serves key: it owns the key's route,
-// or key is a wide-column row stored at its legacy raw-key route in groupID
-// and the scan re-read it through the point-read path.
-func (s *ShardStore) groupServesKey(groupID uint64, key []byte, canonicalized bool) bool {
+func (s *ShardStore) rowsGroupServesAt(ctx context.Context, groupID uint64, kvs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		serves, err := s.groupServesKeyAt(ctx, groupID, kvp.Key, ts)
+		if err != nil {
+			return nil, err
+		}
+		if serves {
+			out = append(out, kvp)
+		}
+	}
+	return out, nil
+}
+
+// groupServesKeyAt reports whether groupID serves key at ts: it owns the key's
+// route, or key is stored at its legacy raw-key route in groupID and the
+// logical owner holds no version of key at ts. Then the group's own row is the
+// value a point read returns.
+func (s *ShardStore) groupServesKeyAt(ctx context.Context, groupID uint64, key []byte, ts uint64) (bool, error) {
 	route, _, ok := s.routeAndGroupForKey(key)
 	if !ok || routeHasStagedVisibility(route) {
-		return false
+		return false, nil
 	}
 	if route.GroupID == groupID {
-		return true
+		return true, nil
 	}
-	legacyKey := redisWideColumnLegacyPointRouteKey(key)
-	if !canonicalized || legacyKey == nil {
+	if !s.legacyRouteInGroup(groupID, key) {
+		return false, nil
+	}
+	return s.ownerHoldsNoVersionAt(ctx, route, key, ts)
+}
+
+// legacyRouteInGroup reports whether key's raw-key route, which point reads
+// fall back to, belongs to groupID and is not under staged visibility.
+func (s *ShardStore) legacyRouteInGroup(groupID uint64, key []byte) bool {
+	legacyKey := legacyPointRouteKey(key)
+	if legacyKey == nil {
 		return false
 	}
 	legacy, ok := s.engine.GetRoute(legacyKey)
 	return ok && legacy.GroupID == groupID && !routeHasStagedVisibility(legacy)
+}
+
+// ownerHoldsNoVersionAt reports whether owner, the route of key's logical
+// owner, holds no version of key at ts. Only the owner's leader on this node
+// can answer; anywhere else it reports false.
+func (s *ShardStore) ownerHoldsNoVersionAt(ctx context.Context, owner distribution.Route, key []byte, ts uint64) (bool, error) {
+	if g, ok := s.groupForID(owner.GroupID); !ok || g == nil || g.Store == nil {
+		return false, nil
+	}
+	exists, answered, err := s.routeHasVersionAtOrBefore(ctx, owner, key, ts)
+	if err != nil {
+		return false, err
+	}
+	return answered && !exists, nil
 }
 
 func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64, reverse bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
