@@ -199,17 +199,21 @@ func (f CoordinatorForwarder) LeaseReadAllGroupsTimestamp(ctx context.Context) (
 // group-keyed read-fence path. Without them every fence target falls back to
 // key resolution, which re-introduces the legacy wide-column group collapse
 // kv.ReadFenceTarget exists to prevent.
+//
+// A single-group coordinator has no group-keyed leadership; its one group is
+// the group being asked about, so its own leadership answers.
 func (f CoordinatorForwarder) IsLeaderForGroup(groupID uint64) bool {
-	router, ok := f.Inner.(GroupLeaderRoutableCoordinator)
-	return ok && router.IsLeaderForGroup(groupID)
+	if router, ok := f.Inner.(GroupLeaderRoutableCoordinator); ok {
+		return router.IsLeaderForGroup(groupID)
+	}
+	return f.Inner.IsLeader()
 }
 
 func (f CoordinatorForwarder) RaftLeaderForGroup(groupID uint64) string {
-	router, ok := f.Inner.(GroupLeaderRoutableCoordinator)
-	if !ok {
-		return ""
+	if router, ok := f.Inner.(GroupLeaderRoutableCoordinator); ok {
+		return router.RaftLeaderForGroup(groupID)
 	}
-	return router.RaftLeaderForGroup(groupID)
+	return f.Inner.RaftLeader()
 }
 
 func (f CoordinatorForwarder) LeaseReadForGroup(ctx context.Context, groupID uint64) (uint64, error) {
