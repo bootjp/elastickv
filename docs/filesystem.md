@@ -258,6 +258,12 @@ and then waits at most 10 seconds for the commands that were already
 executing (for example a write waiting on Raft) before the stores behind them
 are closed.
 
+A stop requested while the server is still opening its Raft/Pebble stores at
+startup (for example during a long snapshot restore) takes effect once the
+open finishes; repeated signals are ignored then too. If the open never
+returns, for instance because the data filesystem has stopped answering, only
+`SIGKILL` ends the process.
+
 `SIGKILL`, an OOM kill, or a crash cannot run that cleanup, and the kernel
 keeps the now-dead mount attached. Until it is detached, every access to the
 mount point fails with `Transport endpoint is not connected`. A restarted
