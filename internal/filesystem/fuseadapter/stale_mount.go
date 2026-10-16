@@ -584,12 +584,14 @@ var detachMountHelpers = []string{"fusermount3", "fusermount"}
 // under its share of the deadline, as is the lookup of each helper. It
 // returns the mechanism on success;
 // otherwise the last helper's failure, or nil when no helper was found.
-// Before a helper runs after a failed one, the mounts table is checked
-// again: the failed helper may still have detached our mount (it reports
-// an error when, for example, a descendant keeps its output pipe open past
-// WaitDelay), and the next helper accepts any FUSE filesystem, so it must
-// not run against one that is now exposed. Such a path yields
-// errNoFUSEMount with the earlier failure kept in the chain.
+// Right before each helper runs, after its lookup, the mounts table is
+// checked again: the mount may have gone away while the lookup ran (the
+// plain unmount finishing late) or a failed helper may still have detached
+// it (it reports an error when, for example, a descendant keeps its output
+// pipe open past WaitDelay), and a helper acts on whatever FUSE filesystem
+// the mount point names, so it must not run against one that is now
+// exposed. Such a path yields errNoFUSEMount with any earlier helper
+// failure kept in the chain.
 func detachWithHelpers(ctx context.Context, mountPoint, fsType string) (string, error) {
 	var helperErr error
 	for _, helper := range detachMountHelpers {
@@ -597,10 +599,8 @@ func detachWithHelpers(ctx context.Context, mountPoint, fsType string) (string, 
 		if err != nil {
 			continue
 		}
-		if helperErr != nil {
-			if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
-				return "", afterHelper(err, helperErr)
-			}
+		if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
+			return "", afterHelper(err, helperErr)
 		}
 		if err := runDetachHelper(ctx, bin, mountPoint); err != nil {
 			helperErr = errors.Wrapf(err, "%s -u -z %s", helper, mountPoint)
