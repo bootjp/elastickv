@@ -33,7 +33,7 @@ const (
 func TestRun_DecodesSimpleRedisStringSnapshot(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	in := filepath.Join(dir, "0000000000000064.fsm")
+	in := filepath.Join(dir, "0000000000000040.fsm")
 	out := filepath.Join(dir, "out")
 	mustWriteFSM(t, in, redisStringSnapshot(t, "greeting", "hello"))
 
@@ -68,7 +68,7 @@ func TestRun_DecodesSimpleRedisStringSnapshot(t *testing.T) {
 func TestRun_DecodesLivePebbleSnapshot(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	in := filepath.Join(dir, "0000000000000064.fsm")
+	in := filepath.Join(dir, "0000000000000040.fsm")
 	out := filepath.Join(dir, "out")
 	mustWriteFSM(t, in, liveRedisStringSnapshot(t, "greeting", "hello"))
 
