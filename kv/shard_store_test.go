@@ -1698,42 +1698,97 @@ func TestShardStoreScanGroupOwnedAt_ReadsOnePhysicalPagePerCall(t *testing.T) {
 	require.Equal(t, []*store.KVPair{{Key: owned, Value: []byte("owned")}}, served)
 }
 
-// Hash, set and zset rows written before wide-column routing still live at the
-// route of their raw key, and reads fall back to that route when the logical
-// owner has nothing. The group holding such a row serves it, so its scan must
-// return it with the value a point read would see, not drop it because the
-// logical owner is another group.
-func TestShardStoreScanGroupOwnedAt_ServesWideColumnRowsAtTheirLegacyRoute(t *testing.T) {
+// Hash, set, zset and stream rows written before their families were routed by
+// user key still live at the route of their raw key, and point reads fall back
+// to that route only when the logical owner holds no version of the key. The
+// group holding such a row must serve it exactly then: when the logical owner
+// has its own row, or a tombstone, that is what a reader sees, and the legacy
+// copy must not be acted on as well.
+func TestShardStoreScanGroupOwnedAt_ServesLegacyRouteRowsTheOwnerDoesNotHold(t *testing.T) {
 	t.Parallel()
 
-	cases := []struct {
-		name          string
-		ownerHasNewer bool
-		want          []byte
+	families := []struct {
+		name   string
+		prefix []byte
+		key    []byte
 	}{
-		{name: "legacy row only", want: []byte("legacy")},
-		{name: "logical owner has a newer row", ownerHasNewer: true, want: []byte("current")},
+		// The raw keys start with "!", so their legacy route is group 1; the
+		// user key "zebra" belongs to group 2.
+		{name: "hash", prefix: []byte(store.HashMetaPrefix), key: store.HashMetaKey([]byte("zebra"))},
+		{name: "stream", prefix: []byte(store.StreamMetaPrefix), key: store.StreamMetaKey([]byte("zebra"))},
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-
-			ctx := context.Background()
-			st, groups := newSplitRedisShardStoreForGroupScan()
-			// The raw key starts with "!", so its legacy route is group 1;
-			// the user key "zebra" belongs to group 2.
-			key := store.HashMetaKey([]byte("zebra"))
-			require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 5, 0))
-			if tc.ownerHasNewer {
-				require.NoError(t, groups[2].Store.PutAt(ctx, key, []byte("current"), 6, 0))
-			}
-			prefix := []byte(store.HashMetaPrefix)
-
-			kvs, _, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
-			require.NoError(t, err)
-			require.Equal(t, []*store.KVPair{{Key: key, Value: tc.want}}, kvs)
-		})
+	owners := []struct {
+		name      string
+		write     func(ctx context.Context, st store.MVCCStore, key []byte) error
+		wantGroup uint64
+		want      []byte
+	}{
+		{name: "owner holds nothing", wantGroup: 1, want: []byte("legacy")},
+		{
+			name: "owner holds a newer row",
+			write: func(ctx context.Context, st store.MVCCStore, key []byte) error {
+				return st.PutAt(ctx, key, []byte("current"), 6, 0)
+			},
+			wantGroup: 2,
+			want:      []byte("current"),
+		},
+		{
+			name: "owner deleted the key",
+			write: func(ctx context.Context, st store.MVCCStore, key []byte) error {
+				return st.DeleteAt(ctx, key, 6)
+			},
+		},
 	}
+	for _, family := range families {
+		for _, owner := range owners {
+			t.Run(family.name+"/"+owner.name, func(t *testing.T) {
+				t.Parallel()
+
+				ctx := context.Background()
+				st, groups := newSplitRedisShardStoreForGroupScan()
+				require.NoError(t, groups[1].Store.PutAt(ctx, family.key, []byte("legacy"), 5, 0))
+				if owner.write != nil {
+					require.NoError(t, owner.write(ctx, groups[2].Store, family.key))
+				}
+				end := prefixScanEnd(family.prefix)
+
+				for _, gid := range []uint64{1, 2} {
+					kvs, _, err := st.ScanGroupOwnedAt(ctx, gid, family.prefix, end, 10, 10)
+					require.NoError(t, err)
+					want := []*store.KVPair{}
+					if gid == owner.wantGroup {
+						want = []*store.KVPair{{Key: family.key, Value: owner.want}}
+					}
+					require.Equalf(t, want, kvs, "group %d", gid)
+				}
+			})
+		}
+	}
+}
+
+// Whether the logical owner holds the key can be answered here only by that
+// group's leader. When another node leads it, the legacy row is left to that
+// node: only it may rewrite the key, and guessing "nothing there" could act on
+// a copy the owner has superseded.
+func TestShardStoreScanGroupOwnedAt_SkipsLegacyRouteRowsOfAnOwnerLedElsewhere(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	groups := map[uint64]*ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore(), Engine: &followerProxyEngine{}},
+	}
+	st := NewShardStore(engine, groups)
+	key := store.StreamMetaKey([]byte("zebra"))
+	require.NoError(t, groups[1].Store.PutAt(ctx, key, []byte("legacy"), 5, 0))
+	prefix := []byte(store.StreamMetaPrefix)
+
+	kvs, _, err := st.ScanGroupOwnedAt(ctx, 1, prefix, prefixScanEnd(prefix), 10, 10)
+	require.NoError(t, err)
+	require.Empty(t, kvs)
 }
 
 func TestShardStoreGetGroupAt_UsesExplicitGroup(t *testing.T) {

@@ -787,6 +787,55 @@ func TestDeltaCompactor_TTLInlineMigratesWideColumnRowsAtTheirLegacyRoute(t *tes
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
 }
 
+// Stream metadata written before streams were routed by user key can sit at
+// the route of its raw key while the user key belongs to another group, and
+// point reads fall back to it while that group holds nothing. The migrator must
+// rewrite it into the user key's group with its TTL inline, as it does for
+// hash, set and zset metadata.
+func TestDeltaCompactor_TTLInlineMigratesStreamMetaAtItsLegacyRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	group1 := store.NewMVCCStore()
+	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: group1},
+		2: {Store: store.NewMVCCStore()},
+	})
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1, 2},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	key := []byte("zebra")
+	expireAt := time.Now().Add(time.Hour)
+	legacyMeta := make([]byte, redisWideMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta[0:8], 3)
+	binary.BigEndian.PutUint64(legacyMeta[8:16], 100)
+	binary.BigEndian.PutUint64(legacyMeta[16:24], 7)
+	// The raw meta key starts with "!", so its legacy route is group 1.
+	require.NoError(t, group1.PutAt(ctx, store.StreamMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	raw, err := st.GetAt(ctx, store.StreamMetaKey(key), st.LastCommitTS())
+	require.NoError(t, err)
+	meta, err := store.UnmarshalStreamMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, store.StreamMeta{
+		Length:   3,
+		LastMs:   100,
+		LastSeq:  7,
+		ExpireAt: redisExpireAtMillis(expireAt),
+	}, meta)
+}
+
 // capabilityHidingCompactionCoordinator forwards only the kv.Coordinator
 // methods, the way a decorator that forgets an optional forward does.
 type capabilityHidingCompactionCoordinator struct {
