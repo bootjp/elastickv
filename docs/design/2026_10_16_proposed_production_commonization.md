@@ -65,7 +65,7 @@ The 2026-10-16 code audit (see `2026_10_16_proposed_test_suite_cleanup.md` for t
 **Decision.** The JWT freezes the role at login, and the live role can only narrow it. That is the documented policy (PR #669 review), it is the least-privilege option, and two of the three handler families already follow it. As a result, a key promoted from `read_only` to `full` must log in again before SQS writes succeed, as it already must for DynamoDB and S3.
 
 **Behaviour change (SQS only).**
-- JWT `read_only` with live `full` → 403 on delete, purge and redrive (previously allowed).
+- JWT `read_only` with live `full` → 403 on delete queue, set queue attributes and purge (previously allowed).
 - JWT without read with live read → 403 on peek (previously allowed).
 - Missing principal → 401 (previously 500).
 
