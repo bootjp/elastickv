@@ -2748,6 +2748,22 @@ func (c startupGatedCoordinator) LinearizableRead(ctx context.Context) (uint64, 
 	return c.inner.LinearizableRead(ctx) //nolint:wrapcheck // Pass through coordinator errors unchanged.
 }
 
+// LinearizableReadForKey forwards the key-routed read fence. WithKeyVizLabel
+// exposes it to the adapters and serves it from the plain LinearizableRead when
+// its inner coordinator lacks it, so without this forward a key owned by a
+// non-default group would be fenced against the default group. An inner
+// coordinator with no key-routed fence has only the one group to fence.
+func (c startupGatedCoordinator) LinearizableReadForKey(ctx context.Context, key []byte) (uint64, error) {
+	if lr, ok := c.inner.(interface {
+		LinearizableReadForKey(context.Context, []byte) (uint64, error)
+	}); ok {
+		idx, err := lr.LinearizableReadForKey(ctx, key)
+		return idx, errors.WithStack(err)
+	}
+	idx, err := c.inner.LinearizableRead(ctx)
+	return idx, errors.WithStack(err)
+}
+
 func (c startupGatedCoordinator) RaftLeader() string {
 	return c.inner.RaftLeader()
 }

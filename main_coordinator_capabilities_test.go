@@ -422,3 +422,30 @@ func capabilityCallArgs(sig reflect.Type) []reflect.Value {
 	}
 	return args
 }
+
+// plainLinearizableReadCoordinator has a LinearizableRead but no key-routed
+// fence. The embedded interface is nil on purpose: only LinearizableRead is
+// exercised here.
+type plainLinearizableReadCoordinator struct {
+	kv.Coordinator
+
+	reads int
+}
+
+func (c *plainLinearizableReadCoordinator) LinearizableRead(context.Context) (uint64, error) {
+	c.reads++
+	return spyIndex, nil
+}
+
+// An inner coordinator without a key-routed fence owns a single group, so the
+// startup gate serves LinearizableReadForKey from its plain LinearizableRead,
+// the same fallback WithKeyVizLabel uses.
+func TestStartupGatedCoordinatorLinearizableReadForKeyFallsBackToLinearizableRead(t *testing.T) {
+	t.Parallel()
+
+	inner := &plainLinearizableReadCoordinator{}
+	idx, err := startupGatedCoordinator{inner: inner}.LinearizableReadForKey(context.Background(), []byte("k"))
+	require.NoError(t, err)
+	require.Equal(t, spyIndex, idx)
+	require.Equal(t, 1, inner.reads)
+}
