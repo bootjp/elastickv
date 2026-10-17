@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -58,6 +59,12 @@ type restoreConfig struct {
 	manifestKey string
 	dataDir     string
 	peerCSV     string
+	// expectGroupRaw is the flag text; empty means the operator did not
+	// supply one, which is an error. Parsed into expectGroupID because
+	// group 0 is a real group and cannot double as "unset".
+	expectGroupRaw string
+	expectGroupID  uint64
+	expectCluster  string
 }
 
 func main() {
@@ -122,7 +129,7 @@ func parsePublishFlags(argv []string) (*publishConfig, error) {
 	fs.StringVar(&cfg.dataDir, "data-dir", "", "Source raft data directory containing a persisted snapshot (required)")
 	fs.StringVar(&cfg.prefix, "prefix", "", "Object key prefix for published snapshot objects")
 	fs.Uint64Var(&cfg.groupID, "group-id", 0, "Raft group ID recorded in the manifest")
-	fs.StringVar(&cfg.sourceCluster, "source-cluster", "", "Source cluster identifier (required for group 0 manifests)")
+	fs.StringVar(&cfg.sourceCluster, "source-cluster", "", "Source cluster identifier (required; restore matches it against the manifest)")
 	fs.StringVar(&cfg.binaryVersion, "binary-version", "", "Binary version recorded in the manifest")
 	fs.StringVar(&cfg.spoolDir, "spool-dir", "", "Temporary spool directory for the payload stream")
 	if err := fs.Parse(argv); err != nil {
@@ -134,8 +141,14 @@ func parsePublishFlags(argv []string) (*publishConfig, error) {
 	if strings.TrimSpace(cfg.dataDir) == "" {
 		return nil, errors.New("--data-dir is required")
 	}
-	if cfg.groupID == 0 && strings.TrimSpace(cfg.sourceCluster) == "" {
-		return nil, errors.New("--source-cluster is required when --group-id is 0")
+	// Required for EVERY group, not just group 0. restore rejects an empty
+	// --expect-source-cluster outright and then compares it against the
+	// manifest's own value, so a manifest published without one can never
+	// match: a nonzero-group backup taken with this CLI would be
+	// unrestorable by it. Relaxing the restore side instead would give back
+	// the wrong-cluster restore that check exists to prevent.
+	if strings.TrimSpace(cfg.sourceCluster) == "" {
+		return nil, errors.New("--source-cluster is required")
 	}
 	if err := validateStoreFlags(cfg.store); err != nil {
 		return nil, err
@@ -151,6 +164,14 @@ func parseRestoreFlags(argv []string) (*restoreConfig, error) {
 	fs.StringVar(&cfg.manifestKey, "manifest-key", "", "Object key of the snapshot manifest to restore (required)")
 	fs.StringVar(&cfg.dataDir, "data-dir", "", "Fresh target raft data directory to create (required; must not already exist)")
 	fs.StringVar(&cfg.peerCSV, "peers", "", "Comma-separated raft peers id=addr,id=addr (required)")
+	fs.StringVar(&cfg.expectCluster, "expect-source-cluster", "",
+		"Source cluster this data dir is for (required). The restore is refused if the "+
+			"manifest was published by a different cluster -- which the group check alone "+
+			"cannot catch when one bucket holds backups from several clusters.")
+	fs.StringVar(&cfg.expectGroupRaw, "expect-group", "",
+		"Raft group id this data dir is for (required). The restore is refused if the manifest "+
+			"belongs to a different group, which is otherwise undetectable: nothing downstream "+
+			"records the group, so the wrong group's FSM would start under this group's identity.")
 	if err := fs.Parse(argv); err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -166,6 +187,17 @@ func parseRestoreFlags(argv []string) (*restoreConfig, error) {
 	if strings.TrimSpace(cfg.peerCSV) == "" {
 		return nil, errors.New("--peers is required")
 	}
+	if strings.TrimSpace(cfg.expectGroupRaw) == "" {
+		return nil, errors.New("--expect-group is required")
+	}
+	if strings.TrimSpace(cfg.expectCluster) == "" {
+		return nil, errors.New("--expect-source-cluster is required")
+	}
+	groupID, err := strconv.ParseUint(strings.TrimSpace(cfg.expectGroupRaw), 10, 64)
+	if err != nil {
+		return nil, errors.Wrapf(err, "parse --expect-group %q", cfg.expectGroupRaw)
+	}
+	cfg.expectGroupID = groupID
 	if err := validateStoreFlags(cfg.store); err != nil {
 		return nil, err
 	}
@@ -259,10 +291,12 @@ func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) er
 		return err
 	}
 	result, err := snapshotoffload.RestorePhysicalSnapshot(ctx, snapshotoffload.RestoreOptions{
-		Store:       store,
-		ManifestKey: cfg.manifestKey,
-		DataDir:     cfg.dataDir,
-		Peers:       peers,
+		Store:               store,
+		ManifestKey:         cfg.manifestKey,
+		DataDir:             cfg.dataDir,
+		Peers:               peers,
+		ExpectGroupID:       &cfg.expectGroupID,
+		ExpectSourceCluster: cfg.expectCluster,
 	})
 	if err != nil {
 		return errors.Wrap(err, "restore physical snapshot")
