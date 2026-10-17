@@ -628,11 +628,19 @@ func newServerContext(ctx context.Context, fs fuse.RawFileSystem, mountPoint str
 	}
 }
 
-// abandonedUnmountTimeout bounds the plain unmount of a mount that completed
-// after its caller gave up: go-fuse runs the unmount helper without a bound
-// and then waits for its event loops, either of which can hang. A variable
-// so tests can shorten it.
-var abandonedUnmountTimeout = detachCommandTimeout
+// abandonedUnmountTimeout and abandonedDetachTimeout split the one window a
+// mount whose caller gave up on it is released in. The plain unmount (go-fuse
+// runs the unmount helper without a bound and then waits for its event
+// loops, either of which can hang), together with the wait for a cancelled
+// readiness check before it, must finish within abandonedUnmountTimeout of
+// the start of the release; the lazy detach that may follow must finish
+// within abandonedDetachTimeout after that deadline. A release therefore
+// never takes longer than their sum, a stop requested during startup
+// included. Variables so tests can shorten them.
+var (
+	abandonedUnmountTimeout = 7 * time.Second
+	abandonedDetachTimeout  = 3 * time.Second
+)
 
 // releaseAbandonedMount tears down a mount that completed after MountContext
 // had already given up on it. go-fuse's NewServer registers the event loop
@@ -648,15 +656,22 @@ func releaseAbandonedMount(results <-chan newServerResult, mountPoint, fsType st
 	releaseAbandoned(res.server.Unmount, mountPoint, fsType)
 }
 
-// releaseAbandoned runs unmount under abandonedUnmountTimeout. When it fails
-// or does not return in time, the mount is detached lazily instead so no
-// kernel mount is left behind; the lazy detach itself refuses a path that
-// no longer holds a mount of fsType, so an unmount that did succeed late is
-// not followed by a detach of whatever sits underneath.
+// releaseAbandoned releases a mount in a release window that starts now
+// (see releaseAbandonedBy).
 func releaseAbandoned(unmount func() error, mountPoint, fsType string) {
+	releaseAbandonedBy(time.Now().Add(abandonedUnmountTimeout), unmount, mountPoint, fsType)
+}
+
+// releaseAbandonedBy runs unmount until unmountBy. When it fails or does
+// not return in time, the mount is detached lazily instead, by
+// abandonedDetachTimeout after unmountBy, so no kernel mount is left
+// behind; the lazy detach itself refuses a path that no longer holds a
+// mount of fsType, so an unmount that did succeed late is not followed by a
+// detach of whatever sits underneath.
+func releaseAbandonedBy(unmountBy time.Time, unmount func() error, mountPoint, fsType string) {
 	done := make(chan error, 1)
 	go func() { done <- unmount() }()
-	timer := time.NewTimer(abandonedUnmountTimeout)
+	timer := time.NewTimer(time.Until(unmountBy))
 	defer timer.Stop()
 	select {
 	case err := <-done:
@@ -670,7 +685,7 @@ func releaseAbandoned(unmount func() error, mountPoint, fsType string) {
 			"timeout", abandonedUnmountTimeout,
 		)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), detachCommandTimeout)
+	ctx, cancel := context.WithDeadline(context.Background(), unmountBy.Add(abandonedDetachTimeout))
 	defer cancel()
 	if _, err := detachFUSEMount(ctx, mountPoint, fsType); err != nil && !errors.Is(err, errNoFUSEMount) {
 		slog.Warn("filesystem FUSE lazy detach of an abandoned mount failed", "mount_point", mountPoint, "err", err)
@@ -770,28 +785,37 @@ func (s *Server) WaitMount() error {
 // every request in flight: the kernel caller of a request already handed to
 // this server waits for the answer uninterruptibly (here go-fuse's readiness
 // check in this very process), so the handler must return before anything
-// else can. Once the readiness check has returned (ready), it unmounts under
-// the abandoned-mount bound, falling back to the guarded lazy detach. When
-// the check does not return within that bound, a backend request is ignoring
-// its context, and go-fuse's Unmount (which must not run alongside the
-// check, and would wait on the stuck request) is skipped for the lazy detach
-// alone. The Server is then marked released.
+// else can. It then waits for the readiness check (ready) and unmounts,
+// falling back to the guarded lazy detach, inside one release window (see
+// releaseAfterReadiness). The Server is then marked released.
 func (s *Server) release(ready <-chan error) {
 	s.releaseOnce.Do(func() {
 		s.fs.cancelInFlight()
-		unmount := s.inner.Unmount
-		timer := time.NewTimer(abandonedUnmountTimeout)
-		select {
-		case <-ready:
-		case <-timer.C:
-			unmount = func() error { return errReadinessStuck }
-		}
-		timer.Stop()
-		releaseAbandoned(unmount, s.mountPoint, s.fsType)
+		releaseAfterReadiness(ready, s.inner.Unmount, s.mountPoint, s.fsType)
 		if s.released != nil {
 			close(s.released)
 		}
 	})
+}
+
+// releaseAfterReadiness waits for the cancelled readiness check (ready) and
+// then releases the mount with releaseAbandonedBy, all inside one release
+// window: the readiness wait and the plain unmount share its unmount
+// deadline, so a check that returns late leaves the unmount only what is
+// left of it, and the lazy detach runs by its end. A check still running at
+// the unmount deadline means a backend request is ignoring its context, and
+// go-fuse's Unmount (which must not run alongside the check, and would wait
+// on the stuck request) is skipped for the lazy detach alone.
+func releaseAfterReadiness(ready <-chan error, unmount func() error, mountPoint, fsType string) {
+	unmountBy := time.Now().Add(abandonedUnmountTimeout)
+	timer := time.NewTimer(abandonedUnmountTimeout)
+	select {
+	case <-ready:
+	case <-timer.C:
+		unmount = func() error { return errReadinessStuck }
+	}
+	timer.Stop()
+	releaseAbandonedBy(unmountBy, unmount, mountPoint, fsType)
 }
 
 // errReadinessStuck reports that go-fuse's readiness check did not return
