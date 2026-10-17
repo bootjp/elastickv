@@ -56,7 +56,14 @@ P's leader also scans the hash, set, zset and stream meta prefixes in every grou
 
 ### B. Legacy group's leader checks the owner and forwards the rewrite
 
-L's leader already scans L. For a legacy-route row whose owner P is led elsewhere:
+L's leader already scans L, but `ScanGroupOwnedAt` filters out a legacy-route row whose owner is led elsewhere before the migrator sees it. **The scan must report the rows it skips.** Beside the served rows, the page returns each skipped legacy-route row with its owner group and the reason it was skipped:
+- the owner is led elsewhere;
+- the owner, led locally, holds a version;
+- a route is under staged visibility.
+
+These rows are candidates and inputs to M1's counts, not rows to rewrite as served. They come from the same stored page, so reporting them costs no extra read.
+
+For a legacy-route row whose owner P is led elsewhere:
 1. Ask P's leader whether P holds a version of the key at `readTS`. The authoritative probe exists: `routeHasVersionAtOrBeforeRemote` sends `RawLatestCommitTS` with `VersionVisibleAtTs`, served by `VersionExistsAtOrBeforeGroupWithReadFence`.
 2. If P holds none, dispatch the rewrite for P's key with `StartTS = readTS`. P's leader validates it with OCC. A write to the key after `readTS` conflicts and the next pass retries.
 
@@ -66,6 +73,8 @@ The commit timestamp must not come from L's leader:
 - **Neither in place:** stamping on L's leader is exactly G10. Option B must stay disabled, and the row stays as today.
 
 **Batches are partitioned by owner group.** The migrator batches up to 32 keys per OCC transaction, and one scan page can hold rows owned by several remote groups. Under A0b no single leader can stamp a batch that writes several groups without one of them receiving a foreign-group timestamp. M2 therefore groups rewrites by owner group and chunks each group's rows into transactions of at most 32 keys, each forwarded to that group's leader. A page with many rows of one owner produces several transactions for it. A batch spanning groups is allowed only under Phase D, where group 0 stamps everything.
+
+**Batches are bound to the catalog version they were grouped under.** A split or move between grouping and commit can leave one batch's keys owned by both P and a new group Q. Each batch records the catalog version used to resolve its owners. Before dispatch, the migrator re-resolves the owners. If the catalog has moved past that version, it repartitions the rows under the new catalog and re-probes the owners that changed. The forward carries the version, and P's leader refuses it if any key no longer routes to P. A refused batch leaves its rows unsettled, so the next tick redoes them under the current catalog.
 
 **A relocation always writes.** The rewrite goes through the handler's `buildElems`, which uses `putIfChanged`. A legacy-route row already in inline format, written after TTL-inline encoding shipped but before user-key routing, produces no mutation, because L's value equals the desired value. The row would then count as settled with nothing copied into P, and reappear on every pass. When the presence probe says P holds no version, M2 forces the metadata `Put` into P, plus the TTL-index sync. Value equality is a valid no-op only once P holds the row. The same-node path of bootjp/elastickv#1278 has the same no-op for already-inline legacy rows, and M2 applies the forced `Put` there too, so M3 can evacuate those rows as well.
 
@@ -96,10 +105,10 @@ A cheap local count, on each group's leader, of legacy-route rows by owner group
 
 | Milestone | Change | Gated on |
 |---|---|---|
-| M1 | **Measure.** Per-group-leader counts of legacy-route rows the scan sees, split into: served (owner led locally, holds nothing), owner led locally and holds a version, owner led elsewhere. Without a remote probe, M1 cannot tell whether a remote owner holds the key; M2 adds that split. Counts accumulate per pass and are published atomically with that pass's completion epoch when the plan's cursor wraps. A leadership change discards the in-progress pass and invalidates the published snapshot, since a new leader starts a new pass. Expose the published snapshots as metrics and in an admin RPC. | bootjp/elastickv#1278 |
-| M2 | **Option B.** L's leader resolves owner-led-elsewhere rows with batched, concurrent presence probes per owner group. It forwards each owner group's rewrites in transactions of at most 32 keys: unstamped under A0b, TSO-stamped under Phase D. A relocation forces the `Put` when the owner holds nothing. The plan cursor advances only over the contiguous prefix of settled rows. It extends M1's counts with "owner led elsewhere and holds a version". Disabled, with the row skipped as today, when neither A0b nor Phase D holds. | M1; A0b or Phase D; `RawVersionsVisibleAt` |
+| M1 | **Measure.** Per-group-leader counts of the legacy-route rows the scan serves or reports as skipped (§3 B), split into: served (owner led locally, holds nothing), owner led locally and holds a version, owner led elsewhere, deferred by staged visibility. Without a remote probe, M1 cannot tell whether a remote owner holds the key; M2 adds that split. Counts accumulate per pass of each plan (one plan per family: hash, set, zset, stream). When that plan's cursor wraps, they are published atomically with the pass's completion epoch and the catalog version the pass ran under. A pass that sees the catalog version change restarts. A leadership change discards the in-progress pass and invalidates the group's published snapshots, since a new leader starts new passes. Expose the published snapshots, keyed by group and plan, as metrics and in an admin RPC. | bootjp/elastickv#1278 |
+| M2 | **Option B.** L's leader takes the owner-led-elsewhere rows its scan reports as skipped and resolves them with batched, concurrent presence probes per owner group. It forwards each owner group's rewrites in transactions of at most 32 keys: unstamped under A0b, TSO-stamped under Phase D. Each transaction is bound to the catalog version its owners were resolved under, and is repartitioned or refused once the catalog moves. A relocation forces the `Put` when the owner holds nothing. The plan cursor advances only over the contiguous prefix of settled rows. It extends M1's counts with "owner led elsewhere and holds a version". Disabled, with the row skipped as today, when neither A0b nor Phase D holds. | M1; A0b or Phase D; `RawVersionsVisibleAt` |
 | M3 | **Option C.** By L's leader, in a later pass: enumerate L's raw page and delete L's metadata copy with an explicit-group delete, when the current owner is a group other than L and holds a version, at the delete's route version. Ships together with M2, which otherwise re-probes every rewritten row on every pass. | M2; an explicit-group delete path |
-| M4 | **Phase 3 gate.** Document that the legacy fallback may be disabled only when, for every group, the latest published M1 snapshot has a valid completion epoch from after the rollout and reports zero legacy-route rows with the owner led elsewhere and zero served-but-unmigrated rows. Counts and epoch come from the same pass, so in-progress zeroes after a reset can never satisfy the gate. | M1 to M3 |
+| M4 | **Legacy-route gate for Phase 3.** For every group and every plan, the latest published M1 snapshot must meet all of these:<br>• it is valid and has a completion epoch from after the rollout;<br>• it reports zero legacy-route rows with the owner led elsewhere, zero served-but-unmigrated rows and zero rows deferred by staged visibility;<br>• it carries the same catalog version as every other gated snapshot, and that version is still current.<br>Counts, epoch and catalog version come from the same pass, so in-progress zeroes after a reset never satisfy the gate. A row moved between groups by a catalog change cannot hide between two passes either. This is **one additional** Phase 3 condition, not the whole gate. The TTL-inline design's other prerequisites still apply: every node has migrated, and legacy bare string keys, which no prefix scan covers, have been ruled out or rewritten. | M1 to M3 |
 
 Option A is rejected. It restores the cost profile a36dac7f removed and never converges, because the copies it reads are never removed.
 
@@ -115,7 +124,9 @@ Option A is rejected. It restores the cost profile a36dac7f removed and never co
 - **OCC:** the rewrite's `StartTS` is the page's `readTS`. A user write to the key at P after `readTS` makes the rewrite conflict, and the row is reconsidered on a later pass.
 - **Presence-check races:** if P gains a version between the probe and the commit, the rewrite conflicts with it, because it writes the same key. If P's leadership moves, the probe is answered only by a current leader (it reports "cannot answer" otherwise), and the forward is re-routed or fails.
 - **Timestamps:** never issued by L's leader for P's key. Under Phase D they come from group 0; under A0b P's leader allocates. Without either, M2 stays off.
-- **Staged visibility:** rows whose route, at L or P, is under staged visibility stay deferred, as in bootjp/elastickv#1278.
+- **Staged visibility:** rows whose route, at L or P, is under staged visibility stay deferred, as in bootjp/elastickv#1278. M1 counts them, so the M4 gate does not pass while any remain.
+- **Catalog changes during M2:** a batch whose owners were resolved under an older catalog version is repartitioned before dispatch, or refused by P's leader. Under A0b, no forward therefore writes a group other than the leader's own.
+- **Catalog changes during the gate:** each M1 snapshot carries its pass's catalog version, and M4 requires one current version across all of them. A row moved into a group after that group's pass completed fails the gate until every pass has run again under the new version.
 - **M3 safety:** delete L's copy only when, at the delete's own read timestamp and route version:
   - the key's current owner is a group other than L;
   - that owner holds a version of the key;
@@ -126,7 +137,14 @@ Option A is rejected. It restores the cost profile a36dac7f removed and never co
 ## 7. Test plan
 
 - `kv`: a real split `ShardStore`, with P behind a `followerProxyEngine` whose leader is a fake RawKV server. Cover the probe answering "none", "has a version" and "cannot answer". Cover unstamped forwarding under A0b and TSO stamping under Phase D. M2 must stay off when neither holds.
-- `adapter`: compactor tests where L and P have different leaders. The legacy row is migrated into P exactly once; a concurrent user write at P wins. One page holding rows of two remote owner groups produces one transaction per owner group. With interleaved owners (`P1, P2, P1`), a tick whose budget runs out after P1's batch commits but before P2's resumes behind the settled prefix and never skips the P2 row. A group with more than 32 rows on the page commits in several transactions. An already-inline legacy row whose owner holds nothing is copied into P, on both the cross-leader and the same-node path. M1: a reset pass never publishes zeroes before its completion, and a leadership change invalidates the snapshot.
+- `adapter`: compactor tests where L and P have different leaders. The legacy row is migrated into P exactly once; a concurrent user write at P wins. One page holding rows of two remote owner groups produces one transaction per owner group. With interleaved owners (`P1, P2, P1`), a tick whose budget runs out after P1's batch commits but before P2's resumes behind the settled prefix and never skips the P2 row. A group with more than 32 rows on the page commits in several transactions. An already-inline legacy row whose owner holds nothing is copied into P, on both the cross-leader and the same-node path. A split of P between grouping and dispatch repartitions the batch, and P's leader refuses a forward carrying a key it no longer owns.
+- `kv`: the group scan reports every skipped legacy-route row with its owner group and reason (owner led elsewhere, owner holds a version, staged) and does not serve it.
+- M1:
+  - a reset pass never publishes zeroes before its completion;
+  - a leadership change invalidates the snapshots;
+  - each plan publishes its own snapshot;
+  - a catalog change during a pass restarts it.
+- M4: the gate fails when one plan of a group still has rows while the others report zero. It also fails when snapshots carry different catalog versions, or a version that is no longer current. It does not replace the bare-string prerequisite.
 - M3:
   - an explicit-group delete removes L's copy only, never P's;
   - it refuses after the route moves, and when the current owner has become L;
