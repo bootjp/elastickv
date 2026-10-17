@@ -597,6 +597,7 @@ func run() error {
 	// in NewPebbleStore; read it off the first constructed store (all
 	// shards share the same env and therefore the same label).
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
+
 	cleanup.Add(readTracker.Close)
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
