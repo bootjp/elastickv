@@ -353,9 +353,10 @@ Each pass also has a monitoring outcome:
 Two metrics per node carry it, labelled `type`, `group` and `outcome`:
 - `elastickv_redis_ttl_inline_migration_passes_total`;
 - `elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds`,
-  the time the latest pass this node completed with that outcome began. It
-  records the start, not the end, because a pass spanning several ticks read
-  its first pages at its start.
+  the time the latest pass this node completed with that outcome began. A pass
+  begins when the tick that reads its first page starts, before that tick
+  acquires the read timestamp the page is read at. The gauge records the start,
+  not the end, because a pass spanning several ticks read its first pages then.
 
 **Condition to check before disabling the fallback.**
 

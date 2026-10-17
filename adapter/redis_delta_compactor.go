@@ -334,6 +334,9 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	}
 	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	// snapshotAt precedes the read timestamp, so a TTL-inline pass that reads
+	// at readTS never reports a start later than its snapshot.
+	snapshotAt := time.Now()
 	readTimestamp, err := kv.BeginReadTimestampThrough(tickCtx, c.coord, snapshotTS(c.coord.Clock(), c.st),
 		"redis delta compactor: begin read timestamp")
 	if err != nil {
@@ -344,7 +347,7 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 
 	combined := c.compactBackgroundHandlers(tickCtx, readTS)
 	if tickCtx.Err() == nil {
-		if err := c.migrateTTLInlineOnce(tickCtx, readTS); err != nil && !errors.Is(err, context.Canceled) {
+		if err := c.migrateTTLInlineOnce(tickCtx, readTS, snapshotAt); err != nil && !errors.Is(err, context.Canceled) {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}

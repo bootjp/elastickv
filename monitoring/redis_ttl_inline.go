@@ -26,8 +26,8 @@ const (
 // migrator completes. A pass covers one anchor type (typeName, such as
 // "ttl-inline-string") in one data group; group 0 is the whole-prefix scan the
 // migrator falls back to when the coordinator does not report its groups.
-// outcome is one of the RedisTTLInlinePass constants; startedAt is when the
-// pass's first page was scanned.
+// outcome is one of the RedisTTLInlinePass constants; startedAt is no later
+// than the read timestamp of the pass's first page was acquired.
 type RedisTTLInlineMigrationObserver interface {
 	ObserveRedisTTLInlineMigrationPass(typeName string, groupID uint64, outcome string, startedAt time.Time)
 }

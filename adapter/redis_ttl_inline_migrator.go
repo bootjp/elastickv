@@ -49,7 +49,10 @@ type ttlInlineMigrationTickPlan struct {
 // the last one the previous tick ran, as compactBackgroundHandlers rotates its
 // handlers; starting from the first plan every tick starved the later handlers
 // and groups whenever the earlier plans used up the budget.
-func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64) error {
+//
+// snapshotAt is a wall-clock time no later than the acquisition of readTS. A
+// pass that opens this tick reports it as its start.
+func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64, snapshotAt time.Time) error {
 	plans := c.ttlInlineMigrationTickPlans()
 	c.pruneTTLInlineMigrationPlanStates(plans)
 	start := c.rotationStart(&c.ttlInlinePlanCursor, len(plans))
@@ -59,7 +62,7 @@ func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64
 			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
 		}
 		idx := (start + offset) % len(plans)
-		err := c.migrateTTLInlineScanPlan(ctx, plans[idx].handler, plans[idx].plan, readTS)
+		err := c.migrateTTLInlineScanPlan(ctx, plans[idx].handler, plans[idx].plan, readTS, snapshotAt)
 		c.advanceRotation(&c.ttlInlinePlanCursor, idx, len(plans))
 		if err != nil {
 			combined = errors.CombineErrors(combined, err)
@@ -212,8 +215,9 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	h ttlInlineMigrationHandler,
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
+	snapshotAt time.Time,
 ) error {
-	page, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
+	page, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS, snapshotAt)
 	if err != nil {
 		return err
 	}
@@ -343,8 +347,9 @@ type ttlInlineMigrationPage struct {
 	// startCursor is the plan's cursor when the scan began. A page whose plan
 	// cursor has moved since was also finished by another tick.
 	startCursor []byte
-	// scannedAt is when the scan began; a pass opened by this page starts then.
-	scannedAt time.Time
+	// snapshotAt is no later than the acquisition of the read timestamp the
+	// page was scanned at; a pass opened by this page starts then.
+	snapshotAt time.Time
 }
 
 func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
@@ -352,8 +357,8 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	h ttlInlineMigrationHandler,
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
+	snapshotAt time.Time,
 ) (ttlInlineMigrationPage, error) {
-	scannedAt := time.Now()
 	c.cursorMu.Lock()
 	start := h.prefix
 	cur := bytes.Clone(c.cursors[plan.cursorName])
@@ -362,7 +367,7 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	}
 	c.cursorMu.Unlock()
 
-	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, startCursor: cur, scannedAt: scannedAt}
+	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, startCursor: cur, snapshotAt: snapshotAt}
 	end := store.PrefixScanEnd(h.prefix)
 	if plan.scanner != nil {
 		kvs, resume, err := plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)

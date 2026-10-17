@@ -669,7 +669,7 @@ func TestDeltaCompactor_TTLInlineRotatesPlansAcrossTicksThatRunOutOfBudget(t *te
 	for range plans {
 		ctx, cancel := context.WithCancel(context.Background())
 		st.endTick = cancel
-		require.ErrorIs(t, c.migrateTTLInlineOnce(ctx, 10), context.Canceled)
+		require.ErrorIs(t, c.migrateTTLInlineOnce(ctx, 10, time.Now()), context.Canceled)
 		cancel()
 	}
 
@@ -2666,8 +2666,8 @@ func TestDeltaCompactor_TTLInlinePassIgnoresAPageAnotherTickFinished(t *testing.
 	require.True(t, passes[0].Clean)
 }
 
-// A pass's duration includes its first page: the pass starts when that page's
-// scan starts, not when the page has been migrated.
+// A pass's duration includes its first page: the pass starts before that
+// page's scan, not when the page has been migrated.
 func TestDeltaCompactor_TTLInlinePassDurationIncludesFirstPage(t *testing.T) {
 	t.Parallel()
 
@@ -2718,4 +2718,50 @@ func (b *lockedLogBuffer) ttlInlinePassDurations(t *testing.T, typeName string) 
 		}
 	}
 	return out
+}
+
+// snapshotTimingCoordinator records when the compactor first asks for its
+// clock, which is when SyncOnce acquires the tick's read timestamp, and then
+// delays, as a slow read-timestamp acquisition would.
+type snapshotTimingCoordinator struct {
+	*ttlInlinePassTestCoordinator
+
+	once       sync.Once
+	snapshotAt time.Time
+}
+
+func (c *snapshotTimingCoordinator) Clock() *kv.HLC {
+	c.once.Do(func() {
+		c.snapshotAt = time.Now()
+		time.Sleep(10 * time.Millisecond)
+	})
+	return c.ttlInlinePassTestCoordinator.Clock()
+}
+
+// A pass reads its pages at the tick's read timestamp, so it starts no later
+// than that timestamp is acquired. Stamping it when the scan began let a route
+// change between the two give a pass that read a snapshot from before the
+// change a start after it.
+func TestDeltaCompactor_TTLInlinePassStartsNoLaterThanItsReadTimestamp(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingTTLInlineGroupScanStore{MVCCStore: store.NewMVCCStore()}
+	seedTTLInlinePassStrings(t, st, 3, false)
+	coord := &snapshotTimingCoordinator{ttlInlinePassTestCoordinator: &ttlInlinePassTestCoordinator{
+		localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		groupIDs:                []uint64{1},
+		leadsKeys:               true,
+	}}
+	observer := &recordingTTLInlinePassObserver{}
+	c := NewDeltaCompactor(st, coord,
+		WithDeltaCompactorTimeout(time.Minute),
+		WithDeltaCompactorTTLInlineMigrationObserver(observer),
+	)
+
+	require.NoError(t, c.SyncOnce(context.Background()))
+
+	passes := observer.recordedForType("ttl-inline-string")
+	require.Len(t, passes, 1)
+	require.False(t, coord.snapshotAt.IsZero(), "SyncOnce must read the coordinator's clock")
+	require.LessOrEqual(t, passes[0].startedAt, coord.snapshotAt)
 }

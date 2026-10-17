@@ -80,8 +80,8 @@ type ttlInlineMigrationPlanState struct {
 // openTTLInlineMigrationPassLocked returns the open pass of the plan named
 // name, starting one if needed. A page that starts at the beginning of the
 // prefix always opens a new pass unless the open pass has not completed a page
-// yet. A pass the page opens starts when the page's scan began. Callers hold
-// cursorMu.
+// yet. A pass the page opens starts at the page's snapshot time, no later than
+// its read timestamp was acquired. Callers hold cursorMu.
 func (c *DeltaCompactor) openTTLInlineMigrationPassLocked(name string, page ttlInlineMigrationPage) *ttlInlineMigrationPass {
 	state := c.ttlInlinePlans[name]
 	if state == nil {
@@ -89,7 +89,7 @@ func (c *DeltaCompactor) openTTLInlineMigrationPassLocked(name string, page ttlI
 		c.ttlInlinePlans[name] = state
 	}
 	if state.pass == nil || (page.fromStart && state.pass.pages > 0) {
-		state.pass = &ttlInlineMigrationPass{full: page.fromStart, startedAt: page.scannedAt}
+		state.pass = &ttlInlineMigrationPass{full: page.fromStart, startedAt: page.snapshotAt}
 	}
 	return state.pass
 }
