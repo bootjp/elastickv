@@ -333,7 +333,7 @@ completed pass, `ttl inline migrator: pass complete`, with these keys:
 |---|---|
 | `type` | Anchor type. |
 | `group_id` | Data group. `0` is the whole-prefix fallback scan, used only when the coordinator does not report its local leader groups. |
-| `full_pass` | The pass started at the top of the prefix in this leadership term. A plan that loses its group mid-pass drops its counters. If the group comes back, the resumed pass is not full. |
+| `full_pass` | The pass started at the top of the prefix, and every tick since planned its group on this node. A plan whose group is missing from a tick's plans drops its counters; if the group comes back, the resumed pass is not full. Leadership lost and regained between two ticks is not noticed (see "What a clean pass does not prove"). |
 | `pages` | Pages the pass read. |
 | `keys_scanned` | Anchors the pass read. |
 | `keys_migrated` | Anchors rewritten by committed batches. A page retried after a failed batch still counts the keys its earlier batches rewrote. |
@@ -345,36 +345,63 @@ completed pass, `ttl inline migrator: pass complete`, with these keys:
 A pass that is not clean, and the first clean pass after one that was not, are
 logged at info. Repeated clean passes are logged at debug.
 
-The same outcome is exported per node with labels `type` and `group`:
-- `elastickv_redis_ttl_inline_migration_passes_total{outcome="clean"|"not_clean"}`;
-- `elastickv_redis_ttl_inline_migration_last_clean_pass_timestamp_seconds`.
+Each pass also has a monitoring outcome:
+- `clean`: as in the log.
+- `partial`: rewrote, skipped and failed nothing, but was not full.
+- `not_clean`: rewrote, skipped or failed at least one anchor.
+
+Two metrics per node carry it, labelled `type`, `group` and `outcome`:
+- `elastickv_redis_ttl_inline_migration_passes_total`;
+- `elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds`, the time
+  this node last completed a pass with that outcome.
 
 **Condition to check before disabling the fallback.**
 
-1. The Redis delta compactor (`ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED`) is
+Let T0 be the latest of:
+- the time the last node was upgraded to a build that reports passes (it also
+  migrates every locally led group, bootjp/elastickv#1278);
+- the last route catalog change that moved a range between groups, since a
+  pass covers only the rows its group served at its read timestamps;
+- the last restart of any node, since the metrics are process-local and a
+  restart drops that node's history.
+
+Then all of the following must hold:
+1. No live build writes the legacy format. Every node runs a build that writes
+   inline TTLs (Phase 1 or later).
+2. The Redis delta compactor (`ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED`) is
    enabled on every node. A group whose leader runs no compactor gets no pass.
-2. Every anchor type in every data group has completed a clean pass.
-   Leadership moves, so check across nodes:
-   `max by (type, group) (elastickv_redis_ttl_inline_migration_last_clean_pass_timestamp_seconds)`
-   must have a series for all eight types and every group. The gauge exists
-   only in builds that also migrate every locally led group
-   (bootjp/elastickv#1278), so an older build cannot produce it. It is
-   process-local and gone after a restart: a missing series means no clean
-   pass is known, not that one failed.
-3. No route catalog change has moved a range between groups since those
-   passes. A pass covers only the rows its group served at its read
-   timestamps. After such a change, repeat step 2.
+3. For all eight types and every data group, the latest clean pass across all
+   nodes is later than T0:
+   `max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds{outcome="clean"})`
+   has a series for every type and group, each later than T0.
+4. For each type and group, that clean pass is later than every `not_clean`
+   pass on any node. Leadership moves, so a clean sample from a former leader
+   does not outrank a later `not_clean` pass on the current one. This query
+   must return nothing:
+
+   ```
+   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds{outcome="not_clean"})
+     >= on (type, group)
+   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds{outcome="clean"})
+   ```
+
+`partial` passes do not affect the gate.
 
 **What a clean pass does not prove.**
-- Live writers only produce the inline format. A clean pass therefore shows
-  that the anchors its group's scan serves were all inline when read.
+- Live writers only produce the inline format (condition 1). A clean pass
+  therefore shows that the anchors its group's scan serves were all inline
+  when read.
+- Leadership lost and regained between two ticks leaves the pass open and
+  full. The anchors behind the cursor were read inline earlier in the pass, and
+  without a legacy writer (condition 1) the interim leader could not have made
+  them legacy again.
 - The scan skips some legacy-route hash, set, zset and stream rows without
   counting them: those whose user key belongs to a group another node leads.
   They are not migrated, and they do not keep a pass from being clean. The gate
   for them is milestone M4 of the cross-leader design (bootjp/elastickv#1280),
   which Phase 3 must also pass.
 - The scan also defers, without counting, rows whose route is under staged
-  visibility. Step 3 excludes them: staging only happens while a route moves.
+  visibility. T0 excludes them: staging only happens while a route moves.
 - Legacy bare string keys are outside the anchor prefixes, as noted above.
 
 ### Phase 4 — Remove TTL buffer

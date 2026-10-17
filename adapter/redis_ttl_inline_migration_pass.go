@@ -5,6 +5,8 @@ import (
 	"context"
 	"log/slog"
 	"time"
+
+	"github.com/bootjp/elastickv/monitoring"
 )
 
 // ttlInlineMigrationTally counts what the TTL-inline migrator did with the
@@ -33,9 +35,9 @@ func (t *ttlInlineMigrationTally) add(o ttlInlineMigrationTally) {
 // from the start of the prefix through the page that reaches its end.
 type ttlInlineMigrationPass struct {
 	ttlInlineMigrationTally
-	// full reports that the pass started at the beginning of the prefix in
-	// this leadership term. A pass that resumes a cursor left by an earlier
-	// term is not full: this term never read the anchors before the cursor.
+	// full reports that the pass started at the beginning of the prefix and
+	// its group stayed in every tick's plans since. A pass that resumes a
+	// cursor left before its group dropped out of the plans is not full.
 	full      bool
 	pages     int
 	startedAt time.Time
@@ -45,7 +47,25 @@ type ttlInlineMigrationPass struct {
 // already in the inline format: it read the whole prefix, rewrote nothing, and
 // left nothing unchecked.
 func (p ttlInlineMigrationPass) clean() bool {
-	return p.full && p.keysMigrated == 0 && p.keysSkipped == 0 && p.keysFailed == 0
+	return p.full && p.foundNothing()
+}
+
+// foundNothing reports that the pass rewrote, skipped and failed no anchor.
+func (p ttlInlineMigrationPass) foundNothing() bool {
+	return p.keysMigrated == 0 && p.keysSkipped == 0 && p.keysFailed == 0
+}
+
+// outcome is the pass's monitoring outcome: clean, partial (found nothing but
+// did not read the whole prefix), or not_clean.
+func (p ttlInlineMigrationPass) outcome() string {
+	switch {
+	case p.clean():
+		return monitoring.RedisTTLInlinePassClean
+	case p.foundNothing():
+		return monitoring.RedisTTLInlinePassPartial
+	default:
+		return monitoring.RedisTTLInlinePassNotClean
+	}
 }
 
 // ttlInlineMigrationPlanState is a scan plan's pass bookkeeping.
@@ -165,6 +185,6 @@ func (c *DeltaCompactor) reportTTLInlineMigrationPass(
 		"duration", time.Since(pass.startedAt),
 	)
 	if c.ttlInlineObserver != nil {
-		c.ttlInlineObserver.ObserveRedisTTLInlineMigrationPass(h.typeName, plan.groupID, clean)
+		c.ttlInlineObserver.ObserveRedisTTLInlineMigrationPass(h.typeName, plan.groupID, pass.outcome())
 	}
 }

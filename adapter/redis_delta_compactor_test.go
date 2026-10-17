@@ -15,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -2332,7 +2333,7 @@ func (c *ttlInlinePassTestCoordinator) Dispatch(ctx context.Context, req *kv.Ope
 type ttlInlinePassObservation struct {
 	typeName string
 	groupID  uint64
-	clean    bool
+	outcome  string
 }
 
 type recordingTTLInlinePassObserver struct {
@@ -2340,10 +2341,10 @@ type recordingTTLInlinePassObserver struct {
 	passes []ttlInlinePassObservation
 }
 
-func (o *recordingTTLInlinePassObserver) ObserveRedisTTLInlineMigrationPass(typeName string, groupID uint64, clean bool) {
+func (o *recordingTTLInlinePassObserver) ObserveRedisTTLInlineMigrationPass(typeName string, groupID uint64, outcome string) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.passes = append(o.passes, ttlInlinePassObservation{typeName: typeName, groupID: groupID, clean: clean})
+	o.passes = append(o.passes, ttlInlinePassObservation{typeName: typeName, groupID: groupID, outcome: outcome})
 }
 
 func (o *recordingTTLInlinePassObserver) forType(typeName string) []ttlInlinePassObservation {
@@ -2403,6 +2404,20 @@ func (b *lockedLogBuffer) ttlInlinePasses(t *testing.T, typeName string) []ttlIn
 		}
 	}
 	return out
+}
+
+// wantTTLInlinePassOutcome is the monitoring outcome a pass should report: a
+// pass that is not clean but found nothing to rewrite, skip or fail did not
+// read its whole prefix, so it is partial.
+func wantTTLInlinePassOutcome(clean, foundNothing bool) string {
+	switch {
+	case clean:
+		return monitoring.RedisTTLInlinePassClean
+	case foundNothing:
+		return monitoring.RedisTTLInlinePassPartial
+	default:
+		return monitoring.RedisTTLInlinePassNotClean
+	}
 }
 
 func seedTTLInlinePassStrings(t *testing.T, st store.MVCCStore, n uint64, legacy bool) {
@@ -2563,7 +2578,8 @@ func TestDeltaCompactor_TTLInlineReportsCompletedPasses(t *testing.T) {
 
 			wantObserved := make([]ttlInlinePassObservation, 0, len(tc.want))
 			for _, p := range tc.want {
-				wantObserved = append(wantObserved, ttlInlinePassObservation{typeName: typeName, groupID: 1, clean: p.clean})
+				outcome := wantTTLInlinePassOutcome(p.clean, p.keysMigrated+p.keysSkipped+p.keysFailed == 0)
+				wantObserved = append(wantObserved, ttlInlinePassObservation{typeName: typeName, groupID: 1, outcome: outcome})
 			}
 			require.Equal(t, wantObserved, observer.forType(typeName))
 		})
