@@ -76,6 +76,19 @@ type TSOPhaseDState interface {
 	PhaseDRequired() bool
 }
 
+// TSOPhaseDFloorSource exposes the Phase-D floor, whose physical half is the
+// instant Phase D activated. A Phase-D allocator unable to report the floor
+// cannot safely admit a new pre-Phase-D intent.
+type TSOPhaseDFloorSource interface {
+	PhaseDFloor() uint64
+}
+
+// TSOFreshAdmissionTimestampIssuer bypasses reserved client-side batch slots.
+// The admission window must be measured against a new durable TSO allocation.
+type TSOFreshAdmissionTimestampIssuer interface {
+	FreshAdmissionTimestamp(context.Context) (uint64, error)
+}
+
 // AppliedReadTimestampVoucher records an adapter-provided applied watermark.
 // It is a process-local capability used only to distinguish audited adapter
 // snapshots from arbitrary caller-supplied StartTS values during Phase D.
@@ -404,10 +417,57 @@ func ValidateForwardedTxnStartTimestamp(
 	label string,
 ) error {
 	err := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
-	if err == nil || errors.Is(err, ErrTSOTimestampPrePhaseD) {
+	if err == nil {
 		return nil
 	}
-	return err
+	if !errors.Is(err, ErrTSOTimestampPrePhaseD) {
+		return err
+	}
+	// A pre-Phase-D start is admitted only while a transaction could still
+	// legitimately be preparing at it. This is the §4.2 bound: the attacker's
+	// leverage is creating a FRESH pre-D intent after the marker, and a
+	// transaction genuinely in flight across it can only stay preparable for
+	// its lock TTL. Past that window the commit carve-out can only ever apply
+	// to intents that really predate the marker, which is what it was written
+	// for.
+	withinWindow, windowErr := prePhaseDStartWithinWindow(ctx, alloc)
+	if windowErr != nil {
+		return errors.Wrap(windowErr, label)
+	}
+	if !withinWindow {
+		return errors.Wrap(ErrPrePhaseDWindowClosed, label)
+	}
+	return nil
+}
+
+// prePhaseDStartWithinWindow reports whether pre-Phase-D intent creation is
+// still open, given what the allocator can say about the floor.
+//
+// A Phase-D allocator that cannot report the floor fails closed for new
+// PREPAREs. Resolution traffic is exempt from this creation bound.
+func prePhaseDStartWithinWindow(ctx context.Context, alloc TimestampAllocator) (bool, error) {
+	source, ok := alloc.(TSOPhaseDFloorSource)
+	if !ok {
+		return false, nil
+	}
+	floor := source.PhaseDFloor()
+	if floor == 0 {
+		return false, nil
+	}
+	issuer, ok := alloc.(TSOFreshAdmissionTimestampIssuer)
+	if !ok {
+		return false, errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	// Bypass cached batch slots: a lightly used node can retain one from
+	// inside the window long after the durable TSO has passed its end.
+	nowTS, err := issuer.FreshAdmissionTimestamp(ctx)
+	if err != nil {
+		return false, errors.Wrap(err, "issue TSO timestamp for pre-phase-D admission")
+	}
+	if nowTS == 0 {
+		return false, ErrTSOTimestampInvalid
+	}
+	return PrePhaseDStartAdmissible(floor, PhaseDActivationMillis(nowTS), prePhaseDAdmissionWindow), nil
 }
 
 func ConfiguredTimestampAllocatorThrough(coord Coordinator) (TimestampAllocator, bool) {
@@ -829,6 +889,14 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
 	return b.nextAfter(ctx, 0)
 }
 
+func (b *BatchAllocator) FreshAdmissionTimestamp(ctx context.Context) (uint64, error) {
+	if b == nil || b.tso == nil {
+		return 0, errors.WithStack(ErrTSOAllocatorRequired)
+	}
+	timestamp, err := b.tso.NextBatch(ctx, 1)
+	return timestamp, errors.Wrap(err, "issue fresh TSO admission timestamp")
+}
+
 func (b *BatchAllocator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
 	if min == ^uint64(0) {
 		return 0, errors.WithStack(ErrTxnCommitTSRequired)
@@ -852,6 +920,17 @@ func (b *BatchAllocator) PhaseDActive() bool {
 func (b *BatchAllocator) PhaseDRequired() bool {
 	state, ok := b.tso.(TSOPhaseDState)
 	return ok && state.PhaseDRequired()
+}
+
+func (b *BatchAllocator) PhaseDFloor() uint64 {
+	if b == nil {
+		return 0
+	}
+	source, ok := b.tso.(TSOPhaseDFloorSource)
+	if !ok {
+		return 0
+	}
+	return source.PhaseDFloor()
 }
 
 func (b *BatchAllocator) nextAfter(ctx context.Context, min uint64) (uint64, error) {
