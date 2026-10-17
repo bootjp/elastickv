@@ -184,7 +184,11 @@ All five milestones shipped in PR #1277. Each defect fix landed as a failing-tes
   - the FIFO dedup send timestamp sharing the record's millisecond;
   - no-TTL HLLs restoring as the legacy raw payload.
 - Mutation checks on both the backup copy and the live counterpart fail every family's test.
-- `elastickv-backup`, `elastickv-snapshot-decode`, `elastickv-snapshot-encode` and `elastickv-snapshot-archive` no longer link `store`, Pebble or `internal/encryption`. `elastickv-snapshot-prepare-restore` still does, through `internal/raftengine/etcd`, which the restore path needs.
+- `elastickv-backup`, `elastickv-snapshot-decode`, `elastickv-snapshot-encode` and `elastickv-snapshot-archive` no longer link `store`, the Pebble engine or `internal/encryption`. `elastickv-snapshot-prepare-restore` still does, through `internal/raftengine/etcd`, which the restore path needs.
+- #1276 merged while PR #1277 was open. It made the decoder read SST ingest bundles with `github.com/cockroachdb/pebble/v2/sstable` (`internal/backup/snapshot_sst.go`), as the decoder design records. With both on `main`, the boundary test failed on that import.
+  - The test now exempts exactly that package (`backupAllowedDeps`), and fails if the exemption goes unused.
+  - The Pebble engine (`github.com/cockroachdb/pebble/v2`) imports `sstable`, so it cannot come in through it. Importing the engine or any other Pebble package still fails the test.
+  - The four CLIs above therefore link the sstable reader and the Pebble packages it depends on, about 5 MiB per linux/amd64 binary. Only `elastickv-snapshot-decode` and the self-test of `elastickv-snapshot-encode` reach it; `elastickv-backup` and `elastickv-snapshot-archive` carry it unused.
 
 **M5.**
 - The autosplit splitter converts SplitRange children with `distribution.RouteDescriptorFromProto`, which rejects a nil child, an unspecified state or invalid bounds. Such a response now fails the split call instead of becoming a write-fenced placeholder.
@@ -196,5 +200,5 @@ All five milestones shipped in PR #1277. Each defect fix landed as a failing-tes
 - Coordinator wrappers share one forwarding base, and a capability-parity test is the guard against future drift (M1).
 - Admin writes and sensitive reads require both the JWT role and the live role (M2).
 - Admin S3 uploads go through the same PUT pipeline as SigV4 uploads, including admission control and blob offload; admin keeps its own size cap (M3).
-- `internal/backup`'s import boundary is enforced by a test, and every backup mirror of an adapter encoder has an adapter-side byte-for-byte cross-check (M4).
+- `internal/backup`'s import boundary is enforced by a test, and every backup mirror of an adapter encoder has an adapter-side byte-for-byte cross-check (M4). The boundary keeps the Pebble engine out but allows exactly Pebble's `sstable` reader, because SST ingest bundles are Pebble sstable files (#1276).
 - Shared server wiring lives in `internal/serverwiring`; the demo stays a separate binary (M5).
