@@ -597,7 +597,6 @@ func run() error {
 	// in NewPebbleStore; read it off the first constructed store (all
 	// shards share the same env and therefore the same label).
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
-
 	cleanup.Add(readTracker.Close)
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
@@ -1091,9 +1090,10 @@ func installFilesystemServerLifecycle(
 // because go-fuse's Unmount waits for its event loops after the kernel
 // unmount, and a loop stuck in a backend request (leader unavailable) never
 // returns; a plain unmount also fails with EBUSY while a client holds files
-// on the mount open. In either case the mount is detached lazily (open
-// handles keep working until closed) and the wait for the serve loop is
-// bounded, so the rest of the shutdown (WAL sync, store close) still runs
+// on the mount open. In either case the mount is detached lazily, which
+// also cancels the requests still in flight so a handler blocked in the
+// backend returns before the stores close, and the wait for the serve loop
+// is bounded, so the rest of the shutdown (WAL sync, store close) still runs
 // and the process exits. Exiting closes the /dev/fuse descriptor, which
 // makes the kernel drop whatever the lazy detach left behind.
 func stopFilesystemServer(
@@ -3555,8 +3555,11 @@ func installShutdownSignalHandler(cancel context.CancelFunc, signals ...os.Signa
 			select {
 			case sig := <-sigCh:
 				if signalShutdown.CompareAndSwap(false, true) {
-					slog.Info("shutdown signal received, stopping", "signal", sig.String())
+					// Cancel before logging: a log write that blocks (a
+					// backpressured stderr, a synchronous shipper) must not
+					// hold the shutdown back, and later signals are ignored.
 					cancel()
+					slog.Info("shutdown signal received, stopping", "signal", sig.String())
 					continue
 				}
 				slog.Warn("shutdown already in progress, ignoring repeated signal", "signal", sig.String())
