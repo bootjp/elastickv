@@ -15,8 +15,8 @@ type groupScanningStore struct {
 	store.MVCCStore
 }
 
-func (groupScanningStore) ScanGroupAt(context.Context, uint64, []byte, []byte, int, uint64) ([]*store.KVPair, error) {
-	return nil, nil
+func (groupScanningStore) ScanGroupOwnedAt(context.Context, uint64, []byte, []byte, int, uint64) ([]*store.KVPair, []byte, error) {
+	return nil, nil, nil
 }
 
 type ttlPlanLeaderGroupsCoordinator struct {
@@ -25,7 +25,7 @@ type ttlPlanLeaderGroupsCoordinator struct {
 	groups []uint64
 }
 
-func (c ttlPlanLeaderGroupsCoordinator) LocalLeaderGroupIDs() []uint64 { return c.groups }
+func (c ttlPlanLeaderGroupsCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) { return c.groups, true }
 
 // In production the compactor holds WithKeyVizLabel(startupGatedCoordinator{
 // sharded}); kv.CoordinatorForwarder stands in for the startup gate, which

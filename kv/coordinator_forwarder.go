@@ -28,6 +28,7 @@ var (
 	_ AllGroupsLeaseTimestampCoordinator   = CoordinatorForwarder{}
 	_ GroupRoutableCoordinator             = CoordinatorForwarder{}
 	_ GroupLeaderRoutableCoordinator       = CoordinatorForwarder{}
+	_ LocalLeaderGroupsCoordinator         = CoordinatorForwarder{}
 	_ RaftMembershipCoordinator            = CoordinatorForwarder{}
 	_ TimestampAllocatorProvider           = CoordinatorForwarder{}
 	_ ConfiguredTimestampAllocatorProvider = CoordinatorForwarder{}
@@ -256,11 +257,10 @@ func (f CoordinatorForwarder) EngineGroupIDForKey(key []byte) uint64 {
 
 // LocalLeaderGroupIDs lists the data groups this process leads. The Redis
 // delta compactor's TTL-inline migration plans one scan per group from it.
-func (f CoordinatorForwarder) LocalLeaderGroupIDs() []uint64 {
-	if groups, ok := f.Inner.(interface{ LocalLeaderGroupIDs() []uint64 }); ok {
-		return groups.LocalLeaderGroupIDs()
-	}
-	return nil
+// An Inner without the capability stays unknown rather than leading no group,
+// so the migration falls back to whole-prefix scans instead of planning none.
+func (f CoordinatorForwarder) LocalLeaderGroupIDs() ([]uint64, bool) {
+	return LocalLeaderGroupIDsThrough(f.Inner)
 }
 
 func (f CoordinatorForwarder) RaftMembers(ctx context.Context) ([]RaftMember, error) {

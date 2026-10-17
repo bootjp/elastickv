@@ -23,12 +23,13 @@ type ttlInlineMigrationHandler struct {
 	buildElems     func(context.Context, *store.KVPair, uint64) ([]*kv.Elem[kv.OP], error)
 }
 
+// ttlInlineGroupScanner is *kv.ShardStore in the server. It uses
+// ScanGroupOwnedAt because ScanGroupAt resolves a bare anchor prefix to the
+// first route only and refuses every other group. ScanGroupOwnedAt reads one
+// page per call and returns where it stopped, so the cursor advances even when
+// the page held no row the group serves.
 type ttlInlineGroupScanner interface {
-	ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error)
-}
-
-type ttlInlineLocalLeaderGroups interface {
-	LocalLeaderGroupIDs() []uint64
+	ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error)
 }
 
 type ttlInlineMigrationScanPlan struct {
@@ -37,17 +38,43 @@ type ttlInlineMigrationScanPlan struct {
 	scanner    ttlInlineGroupScanner
 }
 
+// ttlInlineMigrationTickPlan is one handler's scan plan within a tick.
+type ttlInlineMigrationTickPlan struct {
+	handler ttlInlineMigrationHandler
+	plan    ttlInlineMigrationScanPlan
+}
+
+// migrateTTLInlineOnce runs every handler's scan plans under the tick's
+// budget. The plans share that budget, so each tick starts at the plan after
+// the last one the previous tick ran, as compactBackgroundHandlers rotates its
+// handlers; starting from the first plan every tick starved the later handlers
+// and groups whenever the earlier plans used up the budget.
 func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64) error {
+	plans := c.ttlInlineMigrationTickPlans()
+	start := c.rotationStart(&c.ttlInlinePlanCursor, len(plans))
 	var combined error
-	for _, h := range c.ttlInlineMigrationHandlers() {
+	for offset := range plans {
 		if ctx.Err() != nil {
 			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
 		}
-		if err := c.migrateTTLInlineHandler(ctx, h, readTS); err != nil {
+		idx := (start + offset) % len(plans)
+		err := c.migrateTTLInlineScanPlan(ctx, plans[idx].handler, plans[idx].plan, readTS)
+		c.advanceRotation(&c.ttlInlinePlanCursor, idx, len(plans))
+		if err != nil {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}
 	return errors.WithStack(combined)
+}
+
+func (c *DeltaCompactor) ttlInlineMigrationTickPlans() []ttlInlineMigrationTickPlan {
+	var plans []ttlInlineMigrationTickPlan
+	for _, h := range c.ttlInlineMigrationHandlers() {
+		for _, plan := range c.ttlInlineMigrationScanPlans(h) {
+			plans = append(plans, ttlInlineMigrationTickPlan{handler: h, plan: plan})
+		}
+	}
+	return plans
 }
 
 func (c *DeltaCompactor) ttlInlineMigrationHandlers() []ttlInlineMigrationHandler {
@@ -179,26 +206,13 @@ func (c *DeltaCompactor) simpleTTLInlineMigrationHandler(
 	}
 }
 
-func (c *DeltaCompactor) migrateTTLInlineHandler(ctx context.Context, h ttlInlineMigrationHandler, readTS uint64) error {
-	var combined error
-	for _, plan := range c.ttlInlineMigrationScanPlans(h) {
-		if ctx.Err() != nil {
-			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
-		}
-		if err := c.migrateTTLInlineScanPlan(ctx, h, plan, readTS); err != nil {
-			combined = errors.CombineErrors(combined, err)
-		}
-	}
-	return errors.WithStack(combined)
-}
-
 func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	ctx context.Context,
 	h ttlInlineMigrationHandler,
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
 ) error {
-	kvs, truncated, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
+	kvs, cursorKey, truncated, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
 	if err != nil {
 		return err
 	}
@@ -238,38 +252,56 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	if err := flushBatch(); err != nil {
 		return err
 	}
-	c.advanceCursor(plan.cursorName, lastKVKey(kvs), truncated)
+	c.advanceCursor(plan.cursorName, cursorKey, truncated)
 	return nil
 }
 
+// ttlInlineMigrationScanPlans scans only the groups this node leads when the
+// store can scan one group and the coordinator knows which groups those are. A
+// known empty list means this node leads no group and plans nothing. When the
+// groups are unknown the migrator falls back to one ScanAt over the whole
+// prefix, filtered per key by IsLeaderForKey, rather than migrating nothing.
 func (c *DeltaCompactor) ttlInlineMigrationScanPlans(h ttlInlineMigrationHandler) []ttlInlineMigrationScanPlan {
 	scanner, hasGroupScanner := c.st.(ttlInlineGroupScanner)
-	groups, hasLocalGroups := c.coord.(ttlInlineLocalLeaderGroups)
-	if hasGroupScanner && hasLocalGroups {
-		groupIDs := groups.LocalLeaderGroupIDs()
-		plans := make([]ttlInlineMigrationScanPlan, 0, len(groupIDs))
-		for _, groupID := range groupIDs {
-			plans = append(plans, ttlInlineMigrationScanPlan{
-				cursorName: ttlInlineMigrationGroupCursorName(h.typeName, groupID),
-				groupID:    groupID,
-				scanner:    scanner,
-			})
+	if hasGroupScanner {
+		if groupIDs, known := kv.LocalLeaderGroupIDsThrough(c.coord); known {
+			plans := make([]ttlInlineMigrationScanPlan, 0, len(groupIDs))
+			for _, groupID := range groupIDs {
+				plans = append(plans, ttlInlineMigrationScanPlan{
+					cursorName: ttlInlineMigrationGroupCursorName(h.typeName, groupID),
+					groupID:    groupID,
+					scanner:    scanner,
+				})
+			}
+			return plans
 		}
-		return plans
+		c.warnTTLInlineLocalLeaderGroupsUnknown()
 	}
 	return []ttlInlineMigrationScanPlan{{cursorName: h.typeName}}
+}
+
+// warnTTLInlineLocalLeaderGroupsUnknown logs once when the store can scan one
+// group but the coordinator cannot name the groups this node leads. In the
+// server that means a coordinator decorator dropped LocalLeaderGroupIDs, and
+// every node is back to whole-prefix migration scans.
+func (c *DeltaCompactor) warnTTLInlineLocalLeaderGroupsUnknown() {
+	c.ttlInlineGroupsUnknownOnce.Do(func() {
+		c.logger.Warn("ttl inline migrator: coordinator does not report local leader groups; falling back to whole-prefix scans")
+	})
 }
 
 func ttlInlineMigrationGroupCursorName(typeName string, groupID uint64) string {
 	return typeName + ":group:" + strconv.FormatUint(groupID, 10)
 }
 
+// scanTTLInlineMigrationRaw returns the scanned rows, the key the plan's cursor
+// moves to, and whether the scan stopped before the end of the prefix.
 func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	ctx context.Context,
 	h ttlInlineMigrationHandler,
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
-) ([]*store.KVPair, bool, error) {
+) ([]*store.KVPair, []byte, bool, error) {
 	c.cursorMu.Lock()
 	start := h.prefix
 	if cur := c.cursors[plan.cursorName]; len(cur) > 0 {
@@ -278,19 +310,18 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	c.cursorMu.Unlock()
 
 	end := store.PrefixScanEnd(h.prefix)
-	var (
-		kvs []*store.KVPair
-		err error
-	)
 	if plan.scanner != nil {
-		kvs, err = plan.scanner.ScanGroupAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
-	} else {
-		kvs, err = c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
+		kvs, resume, err := plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
+		if err != nil {
+			return nil, nil, false, errors.WithStack(err)
+		}
+		return kvs, resume, resume != nil, nil
 	}
+	kvs, err := c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
 	if err != nil {
-		return nil, false, errors.WithStack(err)
+		return nil, nil, false, errors.WithStack(err)
 	}
-	return kvs, len(kvs) == ttlInlineMigrationTickScanLimit, nil
+	return kvs, lastKVKey(kvs), len(kvs) == ttlInlineMigrationTickScanLimit, nil
 }
 
 func (c *DeltaCompactor) migrateStringTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {

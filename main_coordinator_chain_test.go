@@ -19,7 +19,7 @@ type localLeaderGroupsCoordinator struct {
 	groups []uint64
 }
 
-func (c localLeaderGroupsCoordinator) LocalLeaderGroupIDs() []uint64 { return c.groups }
+func (c localLeaderGroupsCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) { return c.groups, true }
 
 // Every adapter receives WithKeyVizLabel(startupGatedCoordinator{sharded}). The
 // Redis delta compactor's TTL-inline migration plans one scan per group this
@@ -32,9 +32,9 @@ func TestAdapterCoordinatorChainForwardsLocalLeaderGroups(t *testing.T) {
 	inner := localLeaderGroupsCoordinator{groups: []uint64{1, 3}}
 	chain := kv.WithKeyVizLabel(newStartupGatedCoordinator(inner, &startupPublicKVGate{}), keyviz.LabelRedis)
 
-	groups, ok := chain.(interface{ LocalLeaderGroupIDs() []uint64 })
-	require.True(t, ok, "the adapter coordinator chain must expose LocalLeaderGroupIDs")
-	require.Equal(t, []uint64{1, 3}, groups.LocalLeaderGroupIDs())
+	groups, known := kv.LocalLeaderGroupIDsThrough(chain)
+	require.True(t, known, "the adapter coordinator chain must report LocalLeaderGroupIDs")
+	require.Equal(t, []uint64{1, 3}, groups)
 }
 
 // shardedMethodsNotForwarded lists the *kv.ShardedCoordinator methods the
