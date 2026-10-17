@@ -53,6 +53,11 @@ type ttlInlineMigrationTickPlan struct {
 // snapshotAt is a wall-clock time no later than the acquisition of readTS. A
 // pass that opens this tick reports it as its start.
 func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64, snapshotAt time.Time) error {
+	if !c.ttlInlineMu.TryLock() {
+		c.logger.DebugContext(ctx, "ttl inline migrator: another tick is migrating; skipping")
+		return nil
+	}
+	defer c.ttlInlineMu.Unlock()
 	plans := c.ttlInlineMigrationTickPlans()
 	c.pruneTTLInlineMigrationPlanStates(plans)
 	start := c.rotationStart(&c.ttlInlinePlanCursor, len(plans))
@@ -344,9 +349,6 @@ type ttlInlineMigrationPage struct {
 	// fromStart reports that the page starts at the beginning of the prefix,
 	// so it is the first page of a pass.
 	fromStart bool
-	// startCursor is the plan's cursor when the scan began. A page whose plan
-	// cursor has moved since was also finished by another tick.
-	startCursor []byte
 	// snapshotAt is no later than the acquisition of the read timestamp the
 	// page was scanned at; a pass opened by this page starts then.
 	snapshotAt time.Time
@@ -361,13 +363,13 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 ) (ttlInlineMigrationPage, error) {
 	c.cursorMu.Lock()
 	start := h.prefix
-	cur := bytes.Clone(c.cursors[plan.cursorName])
+	cur := c.cursors[plan.cursorName]
 	if len(cur) > 0 {
 		start = append(bytes.Clone(cur), cursorNextByte)
 	}
 	c.cursorMu.Unlock()
 
-	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, startCursor: cur, snapshotAt: snapshotAt}
+	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, snapshotAt: snapshotAt}
 	end := store.PrefixScanEnd(h.prefix)
 	if plan.scanner != nil {
 		kvs, resume, err := plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)

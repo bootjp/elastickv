@@ -88,6 +88,11 @@ type DeltaCompactor struct {
 	ttlInlinePlanCursor int
 
 	ttlInlineGroupsUnknownOnce sync.Once
+
+	// ttlInlineMu lets one tick at a time run the TTL-inline migration, so a
+	// plan's pages are scanned, tallied and reported in order. A tick that
+	// finds it held skips the migration.
+	ttlInlineMu sync.Mutex
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.

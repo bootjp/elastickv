@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"time"
@@ -109,8 +108,7 @@ func (c *DeltaCompactor) noteTTLInlineMigrationPageFailed(name string, page ttlI
 // finishTTLInlineMigrationPage adds a migrated page to its plan's pass and
 // moves the plan's cursor past it. When the page reached the end of the prefix
 // it closes the pass and returns it with done set, and whether the plan's
-// previous pass was clean. A page is dropped when the plan's cursor moved after
-// its scan began: another tick that read the same cursor already finished it.
+// previous pass was clean.
 func (c *DeltaCompactor) finishTTLInlineMigrationPage(
 	name string,
 	page ttlInlineMigrationPage,
@@ -118,9 +116,6 @@ func (c *DeltaCompactor) finishTTLInlineMigrationPage(
 ) (pass ttlInlineMigrationPass, prevClean bool, done bool) {
 	c.cursorMu.Lock()
 	defer c.cursorMu.Unlock()
-	if !bytes.Equal(c.cursors[name], page.startCursor) {
-		return ttlInlineMigrationPass{}, false, false
-	}
 	open := c.openTTLInlineMigrationPassLocked(name, page)
 	open.add(tally)
 	open.pages++

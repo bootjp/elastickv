@@ -2632,38 +2632,54 @@ func newHookedTTLInlinePassCompactor(t *testing.T, st *hookedTTLInlineScanStore)
 	return c, logs
 }
 
-// Two ticks that run at once read the same cursor and migrate the same page.
-// Only the first to finish may add that page to the pass; the other's page is
-// stale. Counting both inflated the pass's tallies, and on the last page opened
-// a second, spurious pass.
-func TestDeltaCompactor_TTLInlinePassIgnoresAPageAnotherTickFinished(t *testing.T) {
+// TTL-inline migration ticks never overlap. A tick that starts while another
+// is migrating skips migration, so a page is scanned, tallied and reported by
+// one tick only. Overlapping ticks double-counted a middle page; on a one-page
+// plan, where the cursor resets to empty, the second tick even reported the
+// same page as a second pass.
+func TestDeltaCompactor_TTLInlineTicksDoNotOverlap(t *testing.T) {
 	t.Parallel()
 
-	ctx := context.Background()
-	const keys = 2*ttlInlineMigrationTickScanLimit + 88
-	st := &hookedTTLInlineScanStore{MVCCStore: store.NewMVCCStore(), prefix: []byte(redisStrPrefix)}
-	seedTTLInlinePassStrings(t, st, keys, false)
-	c, logs := newHookedTTLInlinePassCompactor(t, st)
-
-	// The scan of the second string page runs a whole tick in between, as a
-	// concurrent SyncOnce would: both ticks read the cursor before page two.
-	scans, nested := 0, false
-	st.onScan = func() {
-		scans++
-		if scans == 2 && !nested {
-			nested = true
-			require.NoError(t, c.SyncOnce(ctx))
-		}
+	tests := []struct {
+		name  string
+		keys  uint64
+		ticks int
+		pages int
+	}{
+		{name: "one-page plan", keys: 3, ticks: 1, pages: 1},
+		{name: "middle page", keys: 2*ttlInlineMigrationTickScanLimit + 88, ticks: 3, pages: 3},
 	}
-	for range 3 {
-		require.NoError(t, c.SyncOnce(ctx))
-	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	passes := logs.ttlInlinePasses(t, "ttl-inline-string")
-	require.Len(t, passes, 1)
-	require.Equal(t, 3, passes[0].Pages)
-	require.Equal(t, keys, passes[0].KeysScanned)
-	require.True(t, passes[0].Clean)
+			ctx := context.Background()
+			st := &hookedTTLInlineScanStore{MVCCStore: store.NewMVCCStore(), prefix: []byte(redisStrPrefix)}
+			seedTTLInlinePassStrings(t, st, tc.keys, false)
+			c, logs := newHookedTTLInlinePassCompactor(t, st)
+
+			// The scan of the last page runs a whole tick in between, as a
+			// concurrent SyncOnce would.
+			scans, nested := 0, false
+			st.onScan = func() {
+				scans++
+				if scans == tc.pages && !nested {
+					nested = true
+					require.NoError(t, c.SyncOnce(ctx))
+				}
+			}
+			for range tc.ticks {
+				require.NoError(t, c.SyncOnce(ctx))
+			}
+
+			require.Equal(t, tc.pages, scans, "the overlapping tick must not scan")
+			passes := logs.ttlInlinePasses(t, "ttl-inline-string")
+			require.Len(t, passes, 1)
+			require.Equal(t, tc.pages, passes[0].Pages)
+			require.EqualValues(t, tc.keys, passes[0].KeysScanned)
+			require.True(t, passes[0].Clean)
+		})
+	}
 }
 
 // A pass's duration includes its first page: the pass starts before that
