@@ -111,6 +111,7 @@ The 2026-10-16 code audit (see `2026_10_16_proposed_test_suite_cleanup.md` for t
 
 **Design.**
 - `internal/backup` must not depend on `store`, `adapter`, `kv`, `distribution`, `internal/encryption` or Pebble. `proto` and the leaf key packages (`internal/s3keys`) remain allowed.
+  - Exception: Pebble's file-format reader `github.com/cockroachdb/pebble/v2/sstable`. `snapshot_sst.go` (PR #1276, merged independently of this change) reads the SST files of an `EKVSSTI1` snapshot ingest bundle with it; the snapshot decoder design names it as the one storage library the package links. The boundary test allows that exact package path; the Pebble DB and every other Pebble package stay forbidden.
   - A test in `internal/backup` walks the package's first-party import closure with `go/build` and fails on any forbidden package.
   - `redis_stream.go` gets a local copy of `store.StreamMetaTrimBinarySize`, pinned against `store` by a cross-check in `internal/backup`'s own tests (the existing `snapshot_reader_live_test.go` pattern).
 - Adapter-side cross-check tests (package `adapter`, which already imports `internal/backup`) build the same logical object with the live adapter builders and with the backup encoder. They decode the backup output with `backup.DecodeLiveEntries` and assert byte-identical keys and values for:
@@ -184,7 +185,7 @@ All five milestones shipped in PR #1277. Each defect fix landed as a failing-tes
   - the FIFO dedup send timestamp sharing the record's millisecond;
   - no-TTL HLLs restoring as the legacy raw payload.
 - Mutation checks on both the backup copy and the live counterpart fail every family's test.
-- `elastickv-backup`, `elastickv-snapshot-decode`, `elastickv-snapshot-encode` and `elastickv-snapshot-archive` no longer link `store`, Pebble or `internal/encryption`. `elastickv-snapshot-prepare-restore` still does, through `internal/raftengine/etcd`, which the restore path needs.
+- `elastickv-backup`, `elastickv-snapshot-decode`, `elastickv-snapshot-encode` and `elastickv-snapshot-archive` no longer link `store`, the Pebble DB or `internal/encryption` (they link Pebble's `sstable` reader for SST ingest bundles). `elastickv-snapshot-prepare-restore` still does, through `internal/raftengine/etcd`, which the restore path needs.
 
 **M5.**
 - The autosplit splitter converts SplitRange children with `distribution.RouteDescriptorFromProto`, which rejects a nil child, an unspecified state or invalid bounds. Such a response now fails the split call instead of becoming a write-fenced placeholder.
@@ -196,5 +197,5 @@ All five milestones shipped in PR #1277. Each defect fix landed as a failing-tes
 - Coordinator wrappers share one forwarding base, and a capability-parity test is the guard against future drift (M1).
 - Admin writes and sensitive reads require both the JWT role and the live role (M2).
 - Admin S3 uploads go through the same PUT pipeline as SigV4 uploads, including admission control and blob offload; admin keeps its own size cap (M3).
-- `internal/backup`'s import boundary is enforced by a test, and every backup mirror of an adapter encoder has an adapter-side byte-for-byte cross-check (M4).
+- `internal/backup`'s import boundary is enforced by a test, which allows only Pebble's `sstable` reader for SST ingest bundles, and every backup mirror of an adapter encoder has an adapter-side byte-for-byte cross-check (M4).
 - Shared server wiring lives in `internal/serverwiring`; the demo stays a separate binary (M5).

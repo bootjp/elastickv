@@ -4,6 +4,7 @@ import (
 	"go/build"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -22,6 +23,15 @@ var backupForbiddenDeps = []string{
 	elastickvModule + "/distribution",
 	elastickvModule + "/internal/encryption",
 	"github.com/cockroachdb/pebble",
+}
+
+// backupAllowedDeps are exact package paths exempt from
+// backupForbiddenDeps. Snapshot SST ingest bundles (EKVSSTI1) carry
+// Pebble sstable files, so snapshot_sst.go reads them with Pebble's
+// file-format reader; the live Pebble DB stays forbidden
+// (docs/design/2026_04_29_implemented_snapshot_logical_decoder.md).
+var backupAllowedDeps = []string{
+	"github.com/cockroachdb/pebble/v2/sstable",
 }
 
 // TestBackupLinksNoLiveClusterCode walks the non-test import closure of
@@ -59,6 +69,9 @@ func TestBackupLinksNoLiveClusterCode(t *testing.T) {
 }
 
 func forbiddenBackupDep(pkgPath string) string {
+	if slices.Contains(backupAllowedDeps, pkgPath) {
+		return ""
+	}
 	for _, forbidden := range backupForbiddenDeps {
 		if pkgPath == forbidden || strings.HasPrefix(pkgPath, forbidden+"/") {
 			return forbidden
