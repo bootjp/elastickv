@@ -63,8 +63,12 @@ const (
 
 	// MaxSnapshotEncodedKeySize / MaxSnapshotEncodedValueSize bound the
 	// per-entry allocations made by readExact / readExactGrow. Mirrors
-	// the live store's `maxPebbleEncodedKeySize` (1 MiB user-key cap +
-	// 8-byte TS suffix; store/mvcc_store.go:29 + store/lsm_store.go:51)
+	// the live store's `maxPebbleEncodedKeySize` (the physical stored-key
+	// budget, a 1 MiB logical key plus 32 bytes of internal envelope such
+	// as migration staging, plus the 8-byte TS suffix;
+	// store/mvcc_store.go `maxSnapshotStoredKeySize` +
+	// store/lsm_store.go `maxPebbleEncodedKeySize`; pinned by
+	// TestMaxSnapshotEncodedKeySize_MatchesStore)
 	// and `maxSnapshotValueSize + valueHeaderSize +
 	// encryption.EnvelopeOverhead` (256 MiB cleartext + 9-byte header +
 	// 34-byte envelope; store/mvcc_store.go:37 +
@@ -83,13 +87,20 @@ const (
 	// maxSnapshotUserKeySize mirrors store/mvcc_store.go:29
 	// `maxSnapshotKeySize` = 1 MiB.
 	maxSnapshotUserKeySize = 1 << maxSnapshotUserKeyShift
+	// maxSnapshotInternalKeyEnvelope / maxSnapshotStoredKeySize mirror
+	// store/mvcc_store.go `maxSnapshotInternalKeyEnvelope` (32 bytes of
+	// headroom for internal stored-key envelopes) and
+	// `maxSnapshotStoredKeySize`: a live store may stream a stored key
+	// that long, so the offline reader accepts it too.
+	maxSnapshotInternalKeyEnvelope = 32
+	maxSnapshotStoredKeySize       = maxSnapshotUserKeySize + maxSnapshotInternalKeyEnvelope
 	// maxSnapshotUserValueSize mirrors store/mvcc_store.go:37
 	// `maxSnapshotValueSize` = 256 MiB.
 	maxSnapshotUserValueSize    = maxSnapshotValueMiB << maxSnapshotValueShift
 	maxSnapshotUserKeyShift     = 20 // 1 << 20 == 1 MiB
 	maxSnapshotValueShift       = 20 // <Mib> << 20 == byte count
 	maxSnapshotValueMiB         = 256
-	MaxSnapshotEncodedKeySize   = maxSnapshotUserKeySize + snapshotTSSize
+	MaxSnapshotEncodedKeySize   = maxSnapshotStoredKeySize + snapshotTSSize
 	MaxSnapshotEncodedValueSize = maxSnapshotUserValueSize + snapshotValueHeaderSize + envelopeMaxB
 
 	// envelopeMaxB mirrors internal/encryption.EnvelopeOverhead (12-
@@ -215,8 +226,18 @@ func ReadSnapshot(r io.Reader, fn func(SnapshotHeader, SnapshotEntry) error) err
 // DecodeSnapshot needs this so MANIFEST.json's `last_commit_ts`
 // field is populated for an empty-snapshot dump — the per-entry
 // callback's header argument cannot fire on a header-only file.
+//
+// It reads the raw store stream only. A file persisted by a node
+// (`fsm-snap/<index>.fsm`) or an SST ingest bundle goes through
+// ReadSnapshotFile, which strips the framing and dispatches on the
+// store format.
 func ReadSnapshotWithHeader(r io.Reader, fn func(SnapshotHeader, SnapshotEntry) error) (SnapshotHeader, error) {
-	br := bufio.NewReader(r)
+	return readPebbleStream(bufio.NewReader(r), fn)
+}
+
+// readPebbleStream reads one EKVPBBL1 stream from br: the header, then
+// every entry up to the clean EOF that terminates it.
+func readPebbleStream(br *bufio.Reader, fn func(SnapshotHeader, SnapshotEntry) error) (SnapshotHeader, error) {
 	header, err := readSnapshotHeader(br)
 	if err != nil {
 		return SnapshotHeader{}, err
@@ -315,22 +336,27 @@ func readOneEntry(
 	if err != nil {
 		return false, err
 	}
-	// A snapshot taken from a live Pebble store carries the store's
-	// reserved metadata keys (`_meta_last_commit_ts` and its siblings)
-	// next to the MVCC versions. They have neither the inverted-timestamp
-	// key suffix nor the value header, so decoding one fails the whole
-	// read; they carry no user data, so the reader skips them.
+	return false, emitRawEntry(key, value, header, fn)
+}
+
+// emitRawEntry decodes one raw (key, value) pair as the live store wrote
+// it and hands it to fn. Shared by the EKVPBBL1 stream and the SST ingest
+// bundle, which carry the same physical keys and values.
+//
+// A snapshot taken from a live Pebble store carries the store's reserved
+// metadata keys (`_meta_last_commit_ts` and its siblings) next to the
+// MVCC versions. They have neither the inverted-timestamp key suffix nor
+// the value header, so decoding one fails the whole read; they carry no
+// user data, so the reader skips them.
+func emitRawEntry(key, value []byte, header SnapshotHeader, fn func(SnapshotHeader, SnapshotEntry) error) error {
 	if isPebbleOperationalKey(key) {
-		return false, nil
+		return nil
 	}
 	entry, err := decodeSnapshotEntry(key, value)
 	if err != nil {
-		return false, err
+		return err
 	}
-	if err := fn(header, entry); err != nil {
-		return false, err
-	}
-	return false, nil
+	return fn(header, entry)
 }
 
 // readEntryKey reads the per-entry length-prefix-then-bytes for the

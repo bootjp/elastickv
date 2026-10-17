@@ -21,4 +21,11 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
+      - name: Install fuse3
+        # fusermount3 lets the FUSE end-to-end tests mount without root
+        # (internal/filesystem/fuseadapter, TestMountFilesystemServiceServesKernelMount).
+        run: sudo apt-get update && sudo apt-get install -y fuse3
       - run: go test -race ./...
+        env:
+          # Fail, rather than skip, the kernel-mount tests when FUSE is unusable.
+          ELASTICKV_REQUIRE_FUSE: "1"

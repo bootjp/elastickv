@@ -609,38 +609,14 @@ func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name st
 }
 
 // principalForReadSensitive gates peek (and any future read endpoint
-// that surfaces stored payload content). Mirrors principalForWrite's
-// live-role re-check pattern but accepts the lower RoleReadOnly
-// tier. List / Describe themselves stay on the looser session-auth
-// gate because their output is queue metadata already shown on the
-// SPA's queue list page; peek diverges because the payload is the
-// stored message bodies themselves (Codex r9 P1 on the design doc
-// flagged the security-class distinction).
+// that surfaces stored payload content) with the RoleReadOnly tier.
+// List / Describe stay on the looser session-auth gate because their
+// output is queue metadata already shown on the SPA's queue list page;
+// peek returns the stored message bodies themselves (Codex r9 P1 on
+// the design doc flagged the security-class distinction). The policy
+// lives in authorizePrincipal.
 func (h *SqsHandler) principalForReadSensitive(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
-	principal, ok := PrincipalFromContext(r.Context())
-	if !ok {
-		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
-		return AuthPrincipal{}, false
-	}
-	if h.roles != nil {
-		live, exists := h.roles.LookupRole(principal.AccessKey)
-		if !exists {
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to read queue contents")
-			return AuthPrincipal{}, false
-		}
-		if !live.AllowsRead() {
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to read queue contents")
-			return AuthPrincipal{}, false
-		}
-		principal.Role = live
-	} else if !principal.Role.AllowsRead() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to read queue contents")
-		return AuthPrincipal{}, false
-	}
-	return principal, true
+	return authorizePrincipal(w, r, h.roles, accessRead, "this access key is not authorised to read queue contents")
 }
 
 // principalForWriteOnPurge wraps principalForWrite with the verb the
@@ -653,64 +629,12 @@ func (h *SqsHandler) principalForWriteOnPurge(w http.ResponseWriter, r *http.Req
 	return h.principalForWrite(w, r, "purge messages")
 }
 
-// principalForWrite resolves the live role from the RoleStore (when
-// configured), gates the request, and returns the principal with the
-// **live** role overridden in place — so the role that flows downstream
-// to the adapter is the one the operator currently has, not whatever
-// the JWT happens to remember. Mirrors DynamoHandler.principalForWrite.
-// Without the role override, a JWT-read_only / store-full promoted key
-// passes the handler-side check but the adapter rejects with
-// ErrAdminForbidden, forcing the user to log out and back in for a
-// delete to work.
-//
-// The action verb (e.g. "delete queues", "purge messages") is woven
-// into the 403 rejection body so an operator sees the right
-// operation name. Without this, a read-only principal clicking
-// Purge would be told they "lack the role to delete queues" — a
-// confusing message about the wrong operation (Claude r1 caught
-// this on PR #797).
-//
-// Failure paths write the response and return ok=false; callers
-// short-circuit on the bool. Logged-out / wrong-role callers never
-// reach the source layer, so the leader's identity is not leaked
-// by indirection (forbidden response is the same shape regardless
-// of leadership state).
+// principalForWrite gates the state-changing queue endpoints. The
+// action verb (e.g. "delete queues", "purge messages") is woven into
+// the 403 body so an operator sees the operation they attempted
+// (Claude r1 on PR #797). The policy lives in authorizePrincipal.
 func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request, action string) (AuthPrincipal, bool) {
-	principal, ok := PrincipalFromContext(r.Context())
-	if !ok {
-		// SessionAuth runs before this handler, so a missing
-		// principal is a wiring bug. 500 rather than 401 since
-		// 401 would be misleading — the request was authenticated.
-		writeJSONError(w, http.StatusInternalServerError, "internal", "missing session principal")
-		return AuthPrincipal{}, false
-	}
-	if h.roles != nil {
-		live, exists := h.roles.LookupRole(principal.AccessKey)
-		if !exists {
-			// Key has been removed from the role config since
-			// login. Treat it as no-access regardless of what
-			// the JWT claimed.
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to "+action)
-			return AuthPrincipal{}, false
-		}
-		if !live.AllowsWrite() {
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to "+action)
-			return AuthPrincipal{}, false
-		}
-		// Forward the live role downstream so the adapter
-		// re-check sees the same role the handler gated on.
-		// Without this, a key promoted from read_only → full
-		// after login still hits the adapter with the JWT's
-		// stale read_only and gets a confusing 403.
-		principal.Role = live
-	} else if !principal.Role.AllowsWrite() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to "+action)
-		return AuthPrincipal{}, false
-	}
-	return principal, true
+	return authorizePrincipal(w, r, h.roles, accessWrite, "this access key is not authorised to "+action)
 }
 
 // writeQueuesError translates a QueuesSource error onto an HTTP

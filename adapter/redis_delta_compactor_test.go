@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -559,8 +560,8 @@ type localLeaderGroupCompactionCoordinator struct {
 	groupIDs []uint64
 }
 
-func (c *localLeaderGroupCompactionCoordinator) LocalLeaderGroupIDs() []uint64 {
-	return append([]uint64(nil), c.groupIDs...)
+func (c *localLeaderGroupCompactionCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) {
+	return append([]uint64(nil), c.groupIDs...), true
 }
 
 type recordingTTLInlineGroupScanStore struct {
@@ -575,10 +576,20 @@ func (s *recordingTTLInlineGroupScanStore) ScanAt(ctx context.Context, start []b
 	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
 }
 
-func (s *recordingTTLInlineGroupScanStore) ScanGroupAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+func (s *recordingTTLInlineGroupScanStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
 	s.groupScans = append(s.groupScans, groupID)
 	s.groupStarts = append(s.groupStarts, string(start))
-	return s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	return scanPageWithResume(ctx, s.MVCCStore, start, end, limit, ts)
+}
+
+// scanPageWithResume reads one page the way ShardStore.ScanGroupOwnedAt does
+// and reports its last key when the page was full.
+func scanPageWithResume(ctx context.Context, st store.MVCCStore, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
+	kvs, err := st.ScanAt(ctx, start, end, limit, ts)
+	if err != nil || len(kvs) < limit {
+		return kvs, nil, err
+	}
+	return kvs, kvs[len(kvs)-1].Key, nil
 }
 
 func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
@@ -606,12 +617,354 @@ func TestDeltaCompactor_TTLInlineUsesLocalLeaderGroupScan(t *testing.T) {
 	require.Contains(t, st.groupScans, uint64(2))
 	require.Contains(t, st.groupStarts, store.HashMetaPrefix)
 	require.NotContains(t, st.fullStarts, store.HashMetaPrefix,
-		"sharded ttl migration should scan candidate metadata with ScanGroupAt")
+		"sharded ttl migration should scan candidate metadata with ScanGroupOwnedAt")
 	raw, err := st.GetAt(ctx, store.HashMetaKey(key), st.LastCommitTS())
 	require.NoError(t, err)
 	meta, err := store.UnmarshalHashMeta(raw)
 	require.NoError(t, err)
 	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
+// budgetedTTLInlineScanStore ends the tick during its first group scan, the
+// way a tick whose first scan uses up the per-tick budget ends, and records
+// which group and prefix each tick reached.
+type budgetedTTLInlineScanStore struct {
+	store.MVCCStore
+
+	endTick context.CancelFunc
+	scanned map[string]int
+}
+
+func (s *budgetedTTLInlineScanStore) ScanGroupOwnedAt(_ context.Context, groupID uint64, start []byte, _ []byte, _ int, _ uint64) ([]*store.KVPair, []byte, error) {
+	s.scanned[string(start)+"#"+strconv.FormatUint(groupID, 10)]++
+	s.endTick()
+	return nil, nil, nil
+}
+
+// Every TTL-inline scan plan shares one per-tick budget. When the budget runs
+// out partway through the plans, the next tick must start where this one
+// stopped; starting every tick from the first handler's first group starved
+// the later handlers and groups for as long as the earlier ones used the whole
+// budget.
+func TestDeltaCompactor_TTLInlineRotatesPlansAcrossTicksThatRunOutOfBudget(t *testing.T) {
+	t.Parallel()
+
+	st := &budgetedTTLInlineScanStore{MVCCStore: store.NewMVCCStore(), scanned: map[string]int{}}
+	groupIDs := []uint64{1, 2, 3}
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: groupIDs,
+	}
+	c := NewDeltaCompactor(st, coord)
+	handlers := c.ttlInlineMigrationHandlers()
+	plans := len(handlers) * len(groupIDs)
+
+	for range plans {
+		ctx, cancel := context.WithCancel(context.Background())
+		st.endTick = cancel
+		require.ErrorIs(t, c.migrateTTLInlineOnce(ctx, 10), context.Canceled)
+		cancel()
+	}
+
+	want := make(map[string]int, plans)
+	for _, h := range handlers {
+		for _, groupID := range groupIDs {
+			want[string(h.prefix)+"#"+strconv.FormatUint(groupID, 10)] = 1
+		}
+	}
+	require.Equal(t, want, st.scanned, "each tick must reach the plan after the one the previous tick reached")
+}
+
+// newSplitRedisShardStore returns a ShardStore whose catalog sends user keys
+// below "m" to group 1 and the rest to group 2, the way a multi-shard
+// deployment splits the Redis keyspace.
+func newSplitRedisShardStore() *kv.ShardStore {
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	return kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: store.NewMVCCStore()},
+		2: {Store: store.NewMVCCStore()},
+	})
+}
+
+// A node scans each data group it leads for legacy TTL anchors. The bare anchor
+// prefixes ("!redis|str|", "!hs|meta|", ...) resolve to the first route only, so
+// a route-checked group scan refused every other group: anchors outside the
+// first route were never migrated and every tick failed. Run the migrator over a
+// real split ShardStore and require the anchors of both groups to migrate.
+func TestDeltaCompactor_TTLInlineMigratesEveryLocalLeaderShard(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := newSplitRedisShardStore()
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1, 2},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	expireAt := time.Now().Add(time.Hour)
+	// One key on each side of the split per anchor type.
+	stringKeys := [][]byte{[]byte("apple"), []byte("zebra")}
+	hashKeys := [][]byte{[]byte("aardvark"), []byte("yak")}
+	legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta, 1)
+	ts := uint64(0)
+	seed := func(key, value []byte) {
+		ts++
+		require.NoError(t, st.PutAt(ctx, key, value, ts, 0))
+	}
+	for _, key := range stringKeys {
+		seed(redisStrKey(key), []byte("legacy-value"))
+		seed(redisTTLKey(key), encodeRedisTTL(expireAt))
+	}
+	for _, key := range hashKeys {
+		seed(store.HashMetaKey(key), legacyMeta)
+		seed(redisTTLKey(key), encodeRedisTTL(expireAt))
+	}
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	readTS := st.LastCommitTS()
+	for _, key := range stringKeys {
+		raw, err := st.GetAt(ctx, redisStrKey(key), readTS)
+		require.NoError(t, err)
+		require.Truef(t, isNewRedisStrFormat(raw), "string %q was not migrated", key)
+		value, ttl, err := decodeRedisStr(raw)
+		require.NoError(t, err)
+		require.Equal(t, []byte("legacy-value"), value)
+		require.NotNil(t, ttl)
+		require.Equal(t, redisExpireAtMillis(expireAt), redisExpireAtMillis(*ttl))
+	}
+	for _, key := range hashKeys {
+		raw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
+		require.NoError(t, err)
+		meta, err := store.UnmarshalHashMeta(raw)
+		require.NoError(t, err)
+		require.Equalf(t, redisExpireAtMillis(expireAt), meta.ExpireAt, "hash %q was not migrated", key)
+	}
+}
+
+// A group can still hold a full page of copies of ranges it no longer owns. A
+// tick must read one page per plan and move the cursor past it, so the group's
+// own anchors behind such a page are reached on the next tick; reading on until
+// a page of owned rows turned a large stale backlog into a call that never
+// finished within the tick budget and never advanced.
+func TestDeltaCompactor_TTLInlineAdvancesPastAFullPageOfStaleRows(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 2)
+	engine.UpdateRoute([]byte("m"), nil, 1)
+	group1 := store.NewMVCCStore()
+	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: group1},
+		2: {Store: store.NewMVCCStore()},
+	})
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	// A full page of stale copies of group 2's keys sorts before group 1's key.
+	for i := range ttlInlineMigrationTickScanLimit {
+		key := []byte("a" + strconv.Itoa(1000+i))
+		require.NoError(t, group1.PutAt(ctx, redisStrKey(key), []byte("stale"), 1, 0))
+	}
+	owned := []byte("zebra")
+	expireAt := time.Now().Add(time.Hour)
+	require.NoError(t, st.PutAt(ctx, redisStrKey(owned), []byte("legacy-value"), 2, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(owned), encodeRedisTTL(expireAt), 3, 0))
+	migrated := func() bool {
+		raw, err := st.GetAt(ctx, redisStrKey(owned), st.LastCommitTS())
+		require.NoError(t, err)
+		return isNewRedisStrFormat(raw)
+	}
+
+	require.NoError(t, c.SyncOnce(ctx))
+	require.False(t, migrated(), "a tick reads one page per plan")
+	require.NoError(t, c.SyncOnce(ctx))
+	require.True(t, migrated(), "the next tick resumes after the stale page")
+}
+
+// Hash, set and zset metadata written before wide-column routing can still sit
+// at the route of its raw key while its user key belongs to another group, and
+// reads fall back to that row. The group holding it must hand it to the
+// migrator, which rewrites it into the user key's group when this node leads
+// that group.
+func TestDeltaCompactor_TTLInlineMigratesWideColumnRowsAtTheirLegacyRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	group1 := store.NewMVCCStore()
+	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: group1},
+		2: {Store: store.NewMVCCStore()},
+	})
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1, 2},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	key := []byte("zebra")
+	expireAt := time.Now().Add(time.Hour)
+	legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta, 1)
+	// The raw meta key starts with "!", so its legacy route is group 1.
+	require.NoError(t, group1.PutAt(ctx, store.HashMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	raw, err := st.GetAt(ctx, store.HashMetaKey(key), st.LastCommitTS())
+	require.NoError(t, err)
+	meta, err := store.UnmarshalHashMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, int64(1), meta.Len)
+	require.Equal(t, redisExpireAtMillis(expireAt), meta.ExpireAt)
+}
+
+// Stream metadata written before streams were routed by user key can sit at
+// the route of its raw key while the user key belongs to another group, and
+// point reads fall back to it while that group holds nothing. The migrator must
+// rewrite it into the user key's group with its TTL inline, as it does for
+// hash, set and zset metadata.
+func TestDeltaCompactor_TTLInlineMigratesStreamMetaAtItsLegacyRoute(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	engine := distribution.NewEngine()
+	engine.UpdateRoute([]byte(""), []byte("m"), 1)
+	engine.UpdateRoute([]byte("m"), nil, 2)
+	group1 := store.NewMVCCStore()
+	st := kv.NewShardStore(engine, map[uint64]*kv.ShardGroup{
+		1: {Store: group1},
+		2: {Store: store.NewMVCCStore()},
+	})
+	coord := &localLeaderGroupCompactionCoordinator{
+		shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+			localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		},
+		groupIDs: []uint64{1, 2},
+	}
+	c := NewDeltaCompactor(st, coord, WithDeltaCompactorMaxDeltaCount(2))
+
+	key := []byte("zebra")
+	expireAt := time.Now().Add(time.Hour)
+	legacyMeta := make([]byte, redisWideMetaLegacySizeBytes)
+	binary.BigEndian.PutUint64(legacyMeta[0:8], 3)
+	binary.BigEndian.PutUint64(legacyMeta[8:16], 100)
+	binary.BigEndian.PutUint64(legacyMeta[16:24], 7)
+	// The raw meta key starts with "!", so its legacy route is group 1.
+	require.NoError(t, group1.PutAt(ctx, store.StreamMetaKey(key), legacyMeta, 1, 0))
+	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+	require.NoError(t, c.SyncOnce(ctx))
+
+	raw, err := st.GetAt(ctx, store.StreamMetaKey(key), st.LastCommitTS())
+	require.NoError(t, err)
+	meta, err := store.UnmarshalStreamMeta(raw)
+	require.NoError(t, err)
+	require.Equal(t, store.StreamMeta{
+		Length:   3,
+		LastMs:   100,
+		LastSeq:  7,
+		ExpireAt: redisExpireAtMillis(expireAt),
+	}, meta)
+}
+
+// capabilityHidingCompactionCoordinator forwards only the kv.Coordinator
+// methods, the way a decorator that forgets an optional forward does.
+type capabilityHidingCompactionCoordinator struct {
+	kv.Coordinator
+}
+
+// The coordinator the compactor holds is wrapped in WithKeyVizLabel, which
+// always exposes LocalLeaderGroupIDs. When a decorator underneath hides the
+// capability the answer must stay unknown and the migrator must fall back to a
+// whole-prefix scan; answering "no groups" there planned nothing and silently
+// stopped the migration in production. A known empty list is different: this
+// node leads no group, so there is nothing for it to migrate.
+func TestDeltaCompactor_TTLInlineScanPlanWhenLocalLeaderGroupsUnknownOrEmpty(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name         string
+		wrap         func(kv.Coordinator) kv.Coordinator
+		groupIDs     []uint64
+		wantFullScan bool
+		wantMigrated bool
+	}{
+		{
+			name: "unknown behind a decorator",
+			wrap: func(c kv.Coordinator) kv.Coordinator {
+				return capabilityHidingCompactionCoordinator{Coordinator: c}
+			},
+			groupIDs:     []uint64{2},
+			wantFullScan: true,
+			wantMigrated: true,
+		},
+		{
+			name:     "known with no local leader group",
+			wrap:     func(c kv.Coordinator) kv.Coordinator { return c },
+			groupIDs: []uint64{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := &recordingTTLInlineGroupScanStore{MVCCStore: store.NewMVCCStore()}
+			inner := &localLeaderGroupCompactionCoordinator{
+				shardOnlyLeaderCompactionCoordinator: &shardOnlyLeaderCompactionCoordinator{
+					localAdapterCoordinator: newLocalAdapterCoordinator(st),
+				},
+				groupIDs: tc.groupIDs,
+			}
+			c := NewDeltaCompactor(st, tc.wrap(inner), WithDeltaCompactorMaxDeltaCount(2))
+
+			key := []byte("ttl:migrate:group-plan")
+			expireAt := time.Now().Add(time.Hour)
+			legacyMeta := make([]byte, redisSimpleMetaLegacySizeBytes)
+			binary.BigEndian.PutUint64(legacyMeta, 1)
+			require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), legacyMeta, 1, 0))
+			require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 2, 0))
+
+			require.NoError(t, c.SyncOnce(ctx))
+
+			require.Empty(t, st.groupScans)
+			if tc.wantFullScan {
+				require.Contains(t, st.fullStarts, store.HashMetaPrefix)
+			} else {
+				require.NotContains(t, st.fullStarts, store.HashMetaPrefix)
+			}
+			raw, err := st.GetAt(ctx, store.HashMetaKey(key), st.LastCommitTS())
+			require.NoError(t, err)
+			meta, err := store.UnmarshalHashMeta(raw)
+			require.NoError(t, err)
+			wantExpireAt := uint64(0)
+			if tc.wantMigrated {
+				wantExpireAt = redisExpireAtMillis(expireAt)
+			}
+			require.Equal(t, wantExpireAt, meta.ExpireAt)
+		})
+	}
 }
 
 func TestDeltaCompactor_TTLInlineMigratesEmptyCollectionKeys(t *testing.T) {

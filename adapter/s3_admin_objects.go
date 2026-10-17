@@ -2,15 +2,13 @@ package adapter
 
 import (
 	"context"
-	"crypto/md5" //nolint:gosec // S3 ETag compatibility requires MD5.
-	"encoding/hex"
 	"io"
+	"net/http"
 	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
-	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
@@ -26,6 +24,11 @@ const adminS3UploadMaxBytes int64 = 100 * 1024 * 1024
 // larger than adminS3UploadMaxBytes. The HTTP bridge maps this
 // to 413 Payload Too Large.
 var ErrAdminUploadTooLarge = errors.New("s3 admin: object exceeds upload cap")
+
+// ErrAdminUploadThrottled signals AdminPutObject was refused by the S3 PUT
+// admission limiter, the memory budget admin and SigV4 uploads share. The
+// HTTP bridge maps it to a retryable 503.
+var ErrAdminUploadThrottled = errors.New("s3 admin: upload throttled by PUT admission")
 
 // defaultS3ContentType is the MIME type stored on / surfaced by
 // admin RPCs when the caller (or the manifest) does not name one
@@ -166,7 +169,9 @@ func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string)
 // AdminPutObject creates-or-replaces one object via a streaming
 // upload. Write role required. Caps body size at adminS3UploadMaxBytes
 // (100 MiB) per design §3.3.3; larger objects must use the public
-// SigV4 endpoint with the SDK's multipart path.
+// SigV4 endpoint with the SDK's multipart path. The upload runs the
+// same pipeline as SigV4 PutObject, so it is subject to PUT admission
+// control and uses blob offload when that is enabled.
 //
 // contentType is stored verbatim on the manifest (defaults to
 // application/octet-stream when empty). body is consumed exactly
@@ -180,6 +185,7 @@ func (s *S3Server) adminDeleteObjectTxn(ctx context.Context, bucket, key string)
 //   - ErrAdminInvalidObjectKey   — empty key
 //   - ErrAdminInvalidBucketName  — malformed bucket name
 //   - ErrAdminUploadTooLarge     — body exceeds adminS3UploadMaxBytes
+//   - ErrAdminUploadThrottled    — PUT admission budget exhausted
 func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal, bucket, key string, body io.Reader, contentType string) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
@@ -200,180 +206,66 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 	if body == nil {
 		body = strings.NewReader("")
 	}
+	return s.adminPutObject(ctx, &s3PutObjectInput{
+		// MaxBytesReader with no ResponseWriter only bounds the read; the
+		// overflow surfaces as *http.MaxBytesError, which the upload maps to
+		// a 413 body error.
+		body:            http.MaxBytesReader(nil, io.NopCloser(body), adminS3UploadMaxBytes),
+		contentLength:   -1,
+		streamBody:      &s3StreamingBody{},
+		tooLargeMessage: ErrAdminUploadTooLarge.Error(),
+		contentType:     s3ContentTypeOrDefault(strings.TrimSpace(contentType)),
+	}, bucket, key)
+}
 
-	previous, generation, err := s.adminPutObjectStream(ctx, bucket, key, body, contentType)
+// adminPutObject runs one admin upload through the PutObject stages SigV4
+// uses (prepare, admission pre-check, chunk upload with blob offload when
+// enabled, manifest commit, cleanup on failure) and maps their failures onto
+// the admin sentinels. It makes a single attempt: the chunk fan-out has no
+// idempotency token, so a retry would leak the first attempt's chunks.
+func (s *S3Server) adminPutObject(ctx context.Context, in *s3PutObjectInput, bucket, key string) error {
+	state, err := s.prepareS3PutObject(ctx, in, bucket, key)
 	if err != nil {
-		return err //nolint:wrapcheck // sentinels propagate as-is; wrapped values already carry context.
+		var respErr *s3ResponseError
+		if errors.As(err, &respErr) && respErr.Code == "NoSuchBucket" {
+			return ErrAdminBucketNotFound
+		}
+		return errors.WithStack(err)
 	}
-	if previous != nil {
-		s.cleanupManifestBlobsAsync(bucket, generation, key, previous)
+	defer state.readPin.Release()
+
+	// The body length is unknown, so the pre-check reserves one chunk, as it
+	// does for streaming SigV4 uploads.
+	if err := s.checkS3PutHeadroom(s3ChunkSize, s3PutAdmissionProtocolFixed); err != nil {
+		return errors.WithStack(errors.Mark(err, ErrAdminUploadThrottled))
+	}
+	upload, bodyErr, err := s.uploadS3ObjectData(ctx, in, state, bucket, key, s.s3BlobOffloadSelected(ctx))
+	if err != nil || bodyErr != nil {
+		s.cleanupS3PutObjectChunks(ctx, state, upload, bucket, key)
+		return adminPutUploadError(bodyErr, err)
+	}
+	if _, err := s.commitS3PutObject(ctx, in, state, upload, bucket); err != nil {
+		s.cleanupS3PutObjectChunks(ctx, state, upload, bucket, key)
+		return errors.WithStack(err)
+	}
+	if state.previous != nil {
+		s.cleanupManifestBlobsAsync(bucket, state.meta.Generation, key, state.previous)
 	}
 	return nil
 }
 
-// adminPutObjectStream performs the chunked upload + manifest
-// commit in a single attempt (no retry — the chunk fan-out has
-// no idempotency token, and a partial-then-retry would leak
-// blobs that adminCleanupManifestBlobs on the leaked uploadID
-// would never reach).
-//
-// Returns (previousManifest, generation, err); previousManifest
-// is non-nil when the put REPLACED an existing object and the
-// caller should asynchronously clean up its blob chunks.
-//
-// Mirrors the SigV4 putObject precedent at s3.go (which carries
-// the same `//nolint:cyclop,gocognit,gocyclo,nestif` because the
-// chunk pipeline is a sequential N-stage flow with per-stage
-// cleanup-on-error that needs the local manifest view at every
-// stage; splitting further would obscure the lifecycle).
-//
-//nolint:cyclop,gocognit,nestif // see comment above
-func (s *S3Server) adminPutObjectStream(ctx context.Context, bucket, key string, body io.Reader, contentType string) (*s3ObjectManifest, uint64, error) {
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 admin put object: begin read timestamp")
-	if err != nil {
-		return nil, 0, errors.Wrap(err, "s3 admin: allocate startTS for adminPutObjectStream")
+// adminPutUploadError maps a failed chunk upload onto the admin sentinels.
+func adminPutUploadError(bodyErr *s3PutBodyError, err error) error {
+	switch {
+	case bodyErr != nil && bodyErr.Status == http.StatusRequestEntityTooLarge:
+		return ErrAdminUploadTooLarge
+	case bodyErr != nil:
+		return errors.Errorf("s3 admin: read upload body: %s", bodyErr.Message)
+	case errors.Is(err, errS3PutAdmissionExhausted):
+		return errors.WithStack(errors.Mark(err, ErrAdminUploadThrottled))
+	default:
+		return errors.WithStack(err)
 	}
-	readTS = readTimestamp.Timestamp()
-	startTS := readTS
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
-	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
-	if err != nil {
-		return nil, 0, errors.WithStack(err)
-	}
-	if !exists || meta == nil {
-		return nil, 0, ErrAdminBucketNotFound
-	}
-
-	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, key)
-	previous, _, err := s.loadObjectManifestAt(ctx, headKey, readTS)
-	if err != nil {
-		return nil, 0, errors.WithStack(err)
-	}
-
-	uploadID := newS3UploadID(s.clock())
-	hasher := md5.New() //nolint:gosec // S3 ETag compatibility requires MD5.
-	part := s3ObjectPart{PartNo: 1}
-	sizeBytes := int64(0)
-	chunkNo := uint64(0)
-	buf := make([]byte, s3ChunkSize)
-	pendingBatch := make([]*kv.Elem[kv.OP], 0, s3ChunkBatchOps)
-	pendingChunkSizes := make([]uint64, 0, s3ChunkBatchOps)
-
-	uploadedManifest := func() *s3ObjectManifest {
-		if len(part.ChunkSizes) == 0 {
-			return &s3ObjectManifest{UploadID: uploadID}
-		}
-		clonedPart := part
-		clonedPart.ChunkSizes = append([]uint64(nil), part.ChunkSizes...)
-		clonedPart.ChunkCount = uint64(len(clonedPart.ChunkSizes))
-		return &s3ObjectManifest{UploadID: uploadID, Parts: []s3ObjectPart{clonedPart}}
-	}
-	flushBatch := func() error {
-		if len(pendingBatch) == 0 {
-			return nil
-		}
-		if _, err := s.coordinator.Dispatch(ctx, &kv.OperationGroup[kv.OP]{Elems: pendingBatch}); err != nil {
-			return errors.WithStack(err)
-		}
-		part.ChunkSizes = append(part.ChunkSizes, pendingChunkSizes...)
-		part.ChunkCount = uint64(len(part.ChunkSizes))
-		pendingBatch = pendingBatch[:0]
-		pendingChunkSizes = pendingChunkSizes[:0]
-		return nil
-	}
-
-	for {
-		n, readErr := body.Read(buf)
-		if n > 0 {
-			if sizeBytes+int64(n) > adminS3UploadMaxBytes {
-				s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-				return nil, 0, ErrAdminUploadTooLarge
-			}
-			chunk := append([]byte(nil), buf[:n]...)
-			if _, err := hasher.Write(chunk); err != nil {
-				s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-				return nil, 0, errors.WithStack(err)
-			}
-			chunkKey := s3keys.BlobKey(bucket, meta.Generation, key, uploadID, part.PartNo, chunkNo)
-			pendingBatch = append(pendingBatch, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: chunk})
-			chunkSize, err := uint64FromInt(n)
-			if err != nil {
-				s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-				return nil, 0, errors.WithStack(err)
-			}
-			pendingChunkSizes = append(pendingChunkSizes, chunkSize)
-			if len(pendingBatch) >= s3ChunkBatchOps {
-				if err := flushBatch(); err != nil {
-					s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-					return nil, 0, err
-				}
-			}
-			sizeBytes += int64(n)
-			chunkNo++
-		}
-		if errors.Is(readErr, io.EOF) {
-			break
-		}
-		if readErr != nil {
-			s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-			return nil, 0, errors.WithStack(readErr)
-		}
-	}
-	if err := flushBatch(); err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, err
-	}
-
-	etag := hex.EncodeToString(hasher.Sum(nil))
-	part.ETag = etag
-	part.SizeBytes = sizeBytes
-	part.ChunkCount = uint64(len(part.ChunkSizes))
-	commitTS, err := s.nextTxnCommitTS(ctx, startTS)
-	if err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	ct := strings.TrimSpace(contentType)
-	if ct == "" {
-		ct = defaultS3ContentType
-	}
-	manifest := &s3ObjectManifest{
-		UploadID:        uploadID,
-		ETag:            etag,
-		SizeBytes:       sizeBytes,
-		LastModifiedHLC: commitTS,
-		ContentType:     ct,
-	}
-	if sizeBytes > 0 {
-		manifest.Parts = []s3ObjectPart{part}
-	}
-	bodyEnc, err := encodeS3ObjectManifest(manifest)
-	if err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	bucketFence, err := encodeS3BucketMeta(meta)
-	if err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-		IsTxn:    true,
-		StartTS:  startTS,
-		CommitTS: commitTS,
-		Elems: []*kv.Elem[kv.OP]{
-			{Op: kv.Put, Key: s3keys.BucketMetaKey(bucket), Value: bucketFence},
-			{Op: kv.Put, Key: headKey, Value: bodyEnc},
-		},
-	}); err != nil {
-		s.cleanupManifestBlobs(ctx, bucket, meta.Generation, key, uploadedManifest())
-		return nil, 0, errors.WithStack(err)
-	}
-	return previous, meta.Generation, nil
 }
 
 // AdminObject is the admin-facing metadata projection. Mirrors the
@@ -649,30 +541,19 @@ func clampAdminListMaxKeys(n int) int {
 }
 
 // AdminListObjects returns a bounded page of objects under a
-// prefix. Read role required. Delimiter collapses pseudo-folders
-// into CommonPrefixes the same way SigV4 ListObjectsV2 does.
+// prefix. Read role required. It runs the same scan as SigV4
+// ListObjectsV2 (scanS3ObjectListing), so delimiter collapsing and
+// continuation tokens behave identically on both paths.
 //
 // Sentinels:
 //   - ErrAdminForbidden                — principal lacks read role
 //   - ErrAdminNotLeader                — follower
 //   - ErrAdminBucketNotFound           — bucket absent
 //   - ErrAdminInvalidBucketName        — malformed bucket name argument
-//   - ErrAdminInvalidContinuationToken — token references a different
-//     bucket / generation / prefix / delimiter than the current
-//     request, OR the token's readTS has been MVCC-GC'd past
-//     (store.ErrReadTSCompacted on the underlying scan)
-//
-// A structurally invalid / non-base64-decodable continuation token
-// surfaces as a wrapped json/decode error from decodeS3ContinuationToken,
-// not as a sentinel — the bridge maps that to a generic 400 with the
-// decode-error text preserved.
-//
-// Mirrors the SigV4 listObjectsV2 precedent at s3.go (same scan-
-// and-collapse pipeline with one error-return per stage; carries
-// the same nolint set). Splitting further would obscure the
-// pagination cursor lifecycle.
-//
-//nolint:cyclop,gocognit,gocyclo,nestif // see comment above
+//   - ErrAdminInvalidContinuationToken — token is not base64 JSON,
+//     references a different bucket / generation / prefix / delimiter
+//     than the current request, or its readTS has been MVCC-GC'd past
+//     (store.ErrReadTSCompacted on the metadata load or the scan)
 func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipal, bucket string, opts AdminListObjectsOptions) (AdminObjectListing, error) {
 	if !principal.Role.canRead() {
 		return AdminObjectListing{}, ErrAdminForbidden
@@ -684,141 +565,51 @@ func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipa
 		return AdminObjectListing{}, errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
 	}
 
-	token, err := decodeS3ContinuationToken(opts.ContinuationToken)
+	page, err := s.scanS3ObjectListing(ctx, s3ObjectListingRequest{
+		Bucket:            bucket,
+		Prefix:            opts.Prefix,
+		Delimiter:         opts.Delimiter,
+		ContinuationToken: opts.ContinuationToken,
+		MaxKeys:           clampAdminListMaxKeys(opts.MaxKeys),
+	})
 	if err != nil {
-		return AdminObjectListing{}, errors.Wrap(err, "decode continuation token")
+		return AdminObjectListing{}, adminListingError(err)
 	}
 
-	readTS := s.readTS()
-	if token != nil && token.ReadTS != 0 {
-		readTS = token.ReadTS
+	out := AdminObjectListing{
+		Objects:               make([]AdminObject, 0, len(page.Objects)),
+		CommonPrefixes:        page.CommonPrefixes,
+		NextContinuationToken: page.NextContinuationToken,
 	}
-
-	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
-	if err != nil {
-		// Same compaction-error translation as the ScanAt path
-		// below: when the caller passed a continuation token whose
-		// readTS has been MVCC-GC'd past, loadBucketMetaAt's GetAt
-		// also surfaces ErrReadTSCompacted — callers need to see
-		// the dedicated sentinel rather than a generic 500 (Codex
-		// r2 P2 on PR #811).
-		if token != nil && errors.Is(err, store.ErrReadTSCompacted) {
-			return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidContinuationToken,
-				"continuation token readTS has been compacted")
+	for _, obj := range page.Objects {
+		ct := obj.Manifest.ContentType
+		if ct == "" {
+			ct = defaultS3ContentType
 		}
-		return AdminObjectListing{}, errors.WithStack(err)
-	}
-	if !exists || meta == nil {
-		return AdminObjectListing{}, ErrAdminBucketNotFound
-	}
-
-	if token != nil && (token.Bucket != bucket || token.Generation != meta.Generation ||
-		token.Prefix != opts.Prefix || token.Delimiter != opts.Delimiter) {
-		return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidContinuationToken,
-			"continuation token does not match request")
-	}
-
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
-	start := s3keys.ObjectManifestScanStart(bucket, meta.Generation, opts.Prefix)
-	if token != nil {
-		start = nextScanCursor(s3keys.ObjectManifestKey(bucket, token.Generation, token.LastKey))
-	}
-	end := prefixScanEnd(s3keys.ObjectManifestScanStart(bucket, meta.Generation, opts.Prefix))
-	maxKeys := clampAdminListMaxKeys(opts.MaxKeys)
-
-	out := AdminObjectListing{Objects: []AdminObject{}}
-	commonPrefixSeen := map[string]struct{}{}
-	if token != nil && token.LastCommonPrefix != "" {
-		commonPrefixSeen[token.LastCommonPrefix] = struct{}{}
-	}
-	cursor := start
-	truncated := false
-	emitted := 0
-	var lastKey, lastCommonPrefix string
-
-	for emitted < maxKeys {
-		pageLimit := s3ListPageSize
-		if remaining := maxKeys - emitted; remaining < pageLimit {
-			pageLimit = remaining
-		}
-		page, err := s.store.ScanAt(ctx, cursor, end, pageLimit, readTS)
-		if err != nil {
-			// Matches the SigV4 listObjectsV2 precedent at
-			// s3.go:2105 — a continuation token whose readTS has
-			// been MVCC-GC'd past surfaces as ErrReadTSCompacted
-			// from the underlying scan; the admin caller needs the
-			// dedicated sentinel so the bridge can render 400 with
-			// a useful message instead of an opaque 500.
-			if token != nil && errors.Is(err, store.ErrReadTSCompacted) {
-				return AdminObjectListing{}, errors.Wrap(ErrAdminInvalidContinuationToken,
-					"continuation token readTS has been compacted")
-			}
-			return AdminObjectListing{}, errors.WithStack(err)
-		}
-		if len(page) == 0 {
-			break
-		}
-		for _, kvp := range page {
-			_, generation, objectKey, ok := s3keys.ParseObjectManifestKey(kvp.Key)
-			if !ok || generation != meta.Generation || !strings.HasPrefix(objectKey, opts.Prefix) {
-				continue
-			}
-			if opts.Delimiter != "" {
-				suffix := strings.TrimPrefix(objectKey, opts.Prefix)
-				if idx := strings.Index(suffix, opts.Delimiter); idx >= 0 {
-					commonPrefix := opts.Prefix + suffix[:idx+len(opts.Delimiter)]
-					if _, exists := commonPrefixSeen[commonPrefix]; !exists {
-						commonPrefixSeen[commonPrefix] = struct{}{}
-						out.CommonPrefixes = append(out.CommonPrefixes, commonPrefix)
-						emitted++
-						lastKey = objectKey
-						lastCommonPrefix = commonPrefix
-					}
-					if emitted >= maxKeys {
-						truncated = true
-						break
-					}
-					continue
-				}
-			}
-			manifest, err := decodeS3ObjectManifest(kvp.Value)
-			if err != nil {
-				return AdminObjectListing{}, errors.WithStack(err)
-			}
-			ct := manifest.ContentType
-			if ct == "" {
-				ct = defaultS3ContentType
-			}
-			out.Objects = append(out.Objects, AdminObject{
-				Key:          objectKey,
-				Size:         manifest.SizeBytes,
-				ContentType:  ct,
-				ETag:         manifest.ETag,
-				LastModified: hlcToTime(manifest.LastModifiedHLC),
-				StorageClass: "STANDARD",
-			})
-			emitted++
-			lastKey = objectKey
-			lastCommonPrefix = ""
-			if emitted >= maxKeys {
-				truncated = true
-				break
-			}
-		}
-		if truncated {
-			break
-		}
-		cursor = nextScanCursor(page[len(page)-1].Key)
-		if len(page) < pageLimit {
-			break
-		}
-	}
-
-	if truncated {
-		out.NextContinuationToken = encodeS3ContinuationToken(bucket, meta.Generation,
-			opts.Prefix, opts.Delimiter, lastKey, lastCommonPrefix, readTS)
+		out.Objects = append(out.Objects, AdminObject{
+			Key:          obj.Key,
+			Size:         obj.Manifest.SizeBytes,
+			ContentType:  ct,
+			ETag:         obj.Manifest.ETag,
+			LastModified: hlcToTime(obj.Manifest.LastModifiedHLC),
+			StorageClass: "STANDARD",
+		})
 	}
 	return out, nil
+}
+
+// adminListingError maps scanS3ObjectListing failures onto the admin
+// sentinels. Token failures keep their reason in the message, which the
+// admin bridge surfaces in the 400 body.
+func adminListingError(err error) error {
+	switch {
+	case errors.Is(err, errS3ListingMalformedToken),
+		errors.Is(err, errS3ListingTokenMismatch),
+		errors.Is(err, errS3ListingTokenExpired):
+		return errors.Wrap(ErrAdminInvalidContinuationToken, err.Error())
+	case errors.Is(err, errS3ListingNoSuchBucket):
+		return ErrAdminBucketNotFound
+	default:
+		return errors.WithStack(err)
+	}
 }
