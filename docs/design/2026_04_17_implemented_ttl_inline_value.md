@@ -315,6 +315,68 @@ from `ttlAt()` after the anchor-specific probes miss. The default remains
 fallback-enabled so rolling upgrades and not-yet-migrated stores preserve
 behavior.
 
+"All nodes have migrated" is decided from the migrator's pass reports, not
+from elapsed time.
+
+**What a pass is.** The migrator scans one plan per anchor type and per data
+group the node leads. There are eight anchor types: `ttl-inline-string`,
+`-hll`, `-indexed-collection`, `-list`, `-hash`, `-set`, `-zset` and
+`-stream`. A plan reads at most 512 rows a tick, so a pass over a large prefix
+spans several ticks. A pass runs from the first page of the prefix to the first
+page that reaches its end. It closes on that page, and the next pass starts
+again at the top with fresh counters.
+
+**What each pass reports.** The leader running the plan logs one line per
+completed pass, `ttl inline migrator: pass complete`, with these keys:
+
+| Key | Meaning |
+|---|---|
+| `type` | Anchor type. |
+| `group_id` | Data group. `0` is the whole-prefix fallback scan, used only when the coordinator does not report its local leader groups. |
+| `full_pass` | The pass started at the top of the prefix in this leadership term. A plan that loses its group mid-pass drops its counters. If the group comes back, the resumed pass is not full. |
+| `pages` | Pages the pass read. |
+| `keys_scanned` | Anchors the pass read. |
+| `keys_migrated` | Anchors rewritten by committed batches. A page retried after a failed batch still counts the keys its earlier batches rewrote. |
+| `keys_skipped` | Anchors left alone because this node did not lead their user key's route. |
+| `keys_failed` | Anchors whose rewrite could not be built. |
+| `clean` | `full_pass` is true and the other three counts are all zero. |
+| `duration` | How long the pass took. |
+
+A pass that is not clean, and the first clean pass after one that was not, are
+logged at info. Repeated clean passes are logged at debug.
+
+The same outcome is exported per node with labels `type` and `group`:
+- `elastickv_redis_ttl_inline_migration_passes_total{outcome="clean"|"not_clean"}`;
+- `elastickv_redis_ttl_inline_migration_last_clean_pass_timestamp_seconds`.
+
+**Condition to check before disabling the fallback.**
+
+1. The Redis delta compactor (`ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED`) is
+   enabled on every node. A group whose leader runs no compactor gets no pass.
+2. Every anchor type in every data group has completed a clean pass.
+   Leadership moves, so check across nodes:
+   `max by (type, group) (elastickv_redis_ttl_inline_migration_last_clean_pass_timestamp_seconds)`
+   must have a series for all eight types and every group. The gauge exists
+   only in builds that also migrate every locally led group
+   (bootjp/elastickv#1278), so an older build cannot produce it. It is
+   process-local and gone after a restart: a missing series means no clean
+   pass is known, not that one failed.
+3. No route catalog change has moved a range between groups since those
+   passes. A pass covers only the rows its group served at its read
+   timestamps. After such a change, repeat step 2.
+
+**What a clean pass does not prove.**
+- Live writers only produce the inline format. A clean pass therefore shows
+  that the anchors its group's scan serves were all inline when read.
+- The scan skips some legacy-route hash, set, zset and stream rows without
+  counting them: those whose user key belongs to a group another node leads.
+  They are not migrated, and they do not keep a pass from being clean. The gate
+  for them is milestone M4 of the cross-leader design (bootjp/elastickv#1280),
+  which Phase 3 must also pass.
+- The scan also defers, without counting, rows whose route is under staged
+  visibility. Step 3 excludes them: staging only happens while a route moves.
+- Legacy bare string keys are outside the anchor prefixes, as noted above.
+
 ### Phase 4 — Remove TTL buffer
 
 The `TTLBuffer`, `runTTLFlusher`, and `flushTTLBuffer` have been removed. TTL
@@ -394,5 +456,5 @@ adapter/
 | 0 | Add dual-read fallback; new writes use new encoding | Low — reads always fall back |
 | 1 | Add inline TTL to list/hash/set/zset/stream metadata and HLL payloads | Medium — delta compaction must preserve TTL |
 | 2 | Background migration of existing keys | Medium — shipped as bounded compactor pass |
-| 3 | Remove legacy `!redis\|ttl\|` read path | Medium — safe only after prefix-scanned anchors and legacy bare strings are cleared |
+| 3 | Remove legacy `!redis\|ttl\|` read path | Medium — safe only after a clean migration pass for every anchor type and group (§5, Phase 3), the cross-leader legacy-route gate, and legacy bare strings are cleared |
 | 4 | Remove TTL buffer | Low — shipped |
