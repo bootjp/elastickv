@@ -2336,21 +2336,37 @@ type ttlInlinePassObservation struct {
 	outcome  string
 }
 
-type recordingTTLInlinePassObserver struct {
-	mu     sync.Mutex
-	passes []ttlInlinePassObservation
+type recordedTTLInlinePass struct {
+	ttlInlinePassObservation
+	startedAt time.Time
 }
 
-func (o *recordingTTLInlinePassObserver) ObserveRedisTTLInlineMigrationPass(typeName string, groupID uint64, outcome string) {
+type recordingTTLInlinePassObserver struct {
+	mu     sync.Mutex
+	passes []recordedTTLInlinePass
+}
+
+func (o *recordingTTLInlinePassObserver) ObserveRedisTTLInlineMigrationPass(typeName string, groupID uint64, outcome string, startedAt time.Time) {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	o.passes = append(o.passes, ttlInlinePassObservation{typeName: typeName, groupID: groupID, outcome: outcome})
+	o.passes = append(o.passes, recordedTTLInlinePass{
+		ttlInlinePassObservation: ttlInlinePassObservation{typeName: typeName, groupID: groupID, outcome: outcome},
+		startedAt:                startedAt,
+	})
 }
 
 func (o *recordingTTLInlinePassObserver) forType(typeName string) []ttlInlinePassObservation {
+	var out []ttlInlinePassObservation
+	for _, p := range o.recordedForType(typeName) {
+		out = append(out, p.ttlInlinePassObservation)
+	}
+	return out
+}
+
+func (o *recordingTTLInlinePassObserver) recordedForType(typeName string) []recordedTTLInlinePass {
 	o.mu.Lock()
 	defer o.mu.Unlock()
-	var out []ttlInlinePassObservation
+	var out []recordedTTLInlinePass
 	for _, p := range o.passes {
 		if p.typeName == typeName {
 			out = append(out, p)
@@ -2663,12 +2679,23 @@ func TestDeltaCompactor_TTLInlinePassDurationIncludesFirstPage(t *testing.T) {
 	}
 	seedTTLInlinePassStrings(t, st, 3, false)
 	c, logs := newHookedTTLInlinePassCompactor(t, st)
+	observer := &recordingTTLInlinePassObserver{}
+	c.ttlInlineObserver = observer
 
+	before := time.Now()
 	require.NoError(t, c.SyncOnce(context.Background()))
+	after := time.Now()
 
 	durations := logs.ttlInlinePassDurations(t, "ttl-inline-string")
 	require.Len(t, durations, 1)
 	require.GreaterOrEqual(t, durations[0], scanDelay)
+
+	// The observer gets the pass's start, which precedes its first page's
+	// scan: a gate can then require a pass that started after an event.
+	passes := observer.recordedForType("ttl-inline-string")
+	require.Len(t, passes, 1)
+	require.False(t, passes[0].startedAt.Before(before))
+	require.LessOrEqual(t, passes[0].startedAt, after.Add(-scanDelay))
 }
 
 func (b *lockedLogBuffer) ttlInlinePassDurations(t *testing.T, typeName string) []time.Duration {

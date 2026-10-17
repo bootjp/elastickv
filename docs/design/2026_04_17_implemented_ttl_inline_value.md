@@ -352,8 +352,10 @@ Each pass also has a monitoring outcome:
 
 Two metrics per node carry it, labelled `type`, `group` and `outcome`:
 - `elastickv_redis_ttl_inline_migration_passes_total`;
-- `elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds`, the time
-  this node last completed a pass with that outcome.
+- `elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds`,
+  the time the latest pass this node completed with that outcome began. It
+  records the start, not the end, because a pass spanning several ticks read
+  its first pages at its start.
 
 **Condition to check before disabling the fallback.**
 
@@ -371,18 +373,20 @@ Then all of the following must hold:
 2. The Redis delta compactor (`ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED`) is
    enabled on every node. A group whose leader runs no compactor gets no pass.
 3. For all eight types and every data group, the latest clean pass across all
-   nodes is later than T0:
-   `max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds{outcome="clean"})`
-   has a series for every type and group, each later than T0.
-4. For each type and group, that clean pass is later than every `not_clean`
+   nodes started after T0:
+   `max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds{outcome="clean"})`
+   has a series for every type and group, each later than T0. A pass that only
+   ended after T0 does not count: it read its first pages before T0, so a
+   route change at T0 could have put a legacy anchor behind its cursor.
+4. For each type and group, that clean pass started after every `not_clean`
    pass on any node. Leadership moves, so a clean sample from a former leader
    does not outrank a later `not_clean` pass on the current one. This query
    must return nothing:
 
    ```
-   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds{outcome="not_clean"})
+   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds{outcome="not_clean"})
      >= on (type, group)
-   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_timestamp_seconds{outcome="clean"})
+   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds{outcome="clean"})
    ```
 
 `partial` passes do not affect the gate.

@@ -185,6 +185,6 @@ func (c *DeltaCompactor) reportTTLInlineMigrationPass(
 		"duration", time.Since(pass.startedAt),
 	)
 	if c.ttlInlineObserver != nil {
-		c.ttlInlineObserver.ObserveRedisTTLInlineMigrationPass(h.typeName, plan.groupID, pass.outcome())
+		c.ttlInlineObserver.ObserveRedisTTLInlineMigrationPass(h.typeName, plan.groupID, pass.outcome(), pass.startedAt)
 	}
 }
