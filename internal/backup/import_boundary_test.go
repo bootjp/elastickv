@@ -4,6 +4,7 @@ import (
 	"go/build"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -24,9 +25,12 @@ var backupForbiddenDeps = []string{
 	"github.com/cockroachdb/pebble",
 }
 
-// backupAllowedDeps are exceptions inside a forbidden prefix. Snapshot SST
-// ingest bundles (snapshot_sst.go) are files in pebble's sstable format, and
-// reading them takes pebble's sstable reader, not a live store.
+// backupAllowedDeps are exact package paths exempt from
+// backupForbiddenDeps. Snapshot SST ingest bundles are Pebble sstable
+// files, so the decoder reads them with Pebble's sstable reader
+// (snapshot_sst.go, docs/design/2026_04_29_implemented_snapshot_logical_decoder.md).
+// That package cannot reach the Pebble engine, which imports it, and
+// importing the engine or any other Pebble package still fails the test.
 var backupAllowedDeps = []string{
 	"github.com/cockroachdb/pebble/v2/sstable",
 }
@@ -63,13 +67,42 @@ func TestBackupLinksNoLiveClusterCode(t *testing.T) {
 			}
 		}
 	}
+	for _, allowed := range backupAllowedDeps {
+		if _, seen := via[allowed]; !seen {
+			t.Errorf("internal/backup no longer links %s; remove it from backupAllowedDeps", allowed)
+		}
+	}
+}
+
+// TestForbiddenBackupDep pins the boundary's matching rules: a forbidden
+// entry covers its subpackages, and an allowed entry exempts only its
+// exact path.
+func TestForbiddenBackupDep(t *testing.T) {
+	t.Parallel()
+
+	const pebble = "github.com/cockroachdb/pebble"
+	cases := []struct {
+		pkgPath string
+		want    string
+	}{
+		{pkgPath: pebble + "/v2/sstable", want: ""},
+		{pkgPath: pebble + "/v2", want: pebble},
+		{pkgPath: pebble + "/v2/sstable/block", want: pebble},
+		{pkgPath: pebble + "/sstable", want: pebble},
+		{pkgPath: elastickvModule + "/store", want: elastickvModule + "/store"},
+		{pkgPath: elastickvModule + "/internal/encryption/kek", want: elastickvModule + "/internal/encryption"},
+		{pkgPath: elastickvModule + "/internal/s3keys", want: ""},
+	}
+	for _, tc := range cases {
+		if got := forbiddenBackupDep(tc.pkgPath); got != tc.want {
+			t.Errorf("forbiddenBackupDep(%q) = %q, want %q", tc.pkgPath, got, tc.want)
+		}
+	}
 }
 
 func forbiddenBackupDep(pkgPath string) string {
-	for _, allowed := range backupAllowedDeps {
-		if pkgPath == allowed {
-			return ""
-		}
+	if slices.Contains(backupAllowedDeps, pkgPath) {
+		return ""
 	}
 	for _, forbidden := range backupForbiddenDeps {
 		if pkgPath == forbidden || strings.HasPrefix(pkgPath, forbidden+"/") {
