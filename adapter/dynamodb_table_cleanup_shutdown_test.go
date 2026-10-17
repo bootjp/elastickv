@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -17,7 +18,7 @@ func TestDynamoDBServerStopWaitsForTableCleanup(t *testing.T) {
 	st := store.NewMVCCStore()
 	coord := newCleanupBlockingCoordinator(st)
 	d := NewDynamoDBServer(nil, st, coord)
-	d.launchDeletedTableCleanup("orders", 1)
+	launchReservedTableCleanup(t, d, "orders", 1)
 	waitDispatchEntered(t, coord)
 
 	stopDone := make(chan struct{})
@@ -47,18 +48,23 @@ func TestDynamoDBServerStopCancelsAndJoinsTableCleanup(t *testing.T) {
 	coord.unwind = 300 * time.Millisecond
 	t.Cleanup(func() { close(coord.release) })
 	d := NewDynamoDBServer(nil, st, coord)
-	d.launchDeletedTableCleanup("orders", 1)
+	launchReservedTableCleanup(t, d, "orders", 1)
 	waitDispatchEntered(t, coord)
 
 	d.Stop()
 	require.True(t, coord.returned.Load(), "Stop returned while the cancelled cleanup was still in Dispatch")
 	require.Zero(t, d.tableCleanups.gate.remaining())
 
-	// A cleanup requested once Stop has begun is not started.
-	before := coord.dispatches.Load()
-	d.launchDeletedTableCleanup("orders", 2)
-	time.Sleep(100 * time.Millisecond)
-	require.Equal(t, before, coord.dispatches.Load(), "a cleanup must not start after Stop")
+	// No cleanup slot can be reserved once Stop has begun.
+	_, ok := d.tableCleanups.reserve()
+	require.False(t, ok, "a cleanup slot must not be reserved after Stop")
+}
+
+func launchReservedTableCleanup(t *testing.T, d *DynamoDBServer, tableName string, generation uint64) {
+	t.Helper()
+	cleanup, ok := d.tableCleanups.reserve()
+	require.True(t, ok)
+	d.launchDeletedTableCleanup(cleanup, tableName, generation)
 }
 
 func waitDispatchEntered(t *testing.T, coord *cleanupBlockingCoordinator) {
@@ -67,5 +73,70 @@ func waitDispatchEntered(t *testing.T, coord *cleanupBlockingCoordinator) {
 	case <-coord.entered:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the cleanup never dispatched")
+	}
+}
+
+// TestDynamoDBAdminDeleteTableRefusedOnceStopBegan pins that a table delete
+// arriving through the admin surface (which Stop's listener drain does not
+// cover) after Stop began is refused before it commits: committing it
+// would leave the deleted generation's items and index entries behind,
+// since its cleanup can no longer start.
+func TestDynamoDBAdminDeleteTableRefusedOnceStopBegan(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	srv := nodes[0].dynamoServer
+	ctx := context.Background()
+	_, err := srv.AdminCreateTable(ctx, fullAdminPrincipal, AdminCreateTableInput{
+		TableName:    "orders",
+		PartitionKey: AdminAttribute{Name: "id", Type: "S"},
+	})
+	require.NoError(t, err)
+
+	srv.Stop()
+	err = srv.AdminDeleteTable(ctx, fullAdminPrincipal, "orders")
+	require.ErrorIs(t, err, ErrDynamoServerStopping)
+	_, exists, err := srv.AdminDescribeTable(ctx, "orders")
+	require.NoError(t, err)
+	require.True(t, exists, "a delete refused for the shutdown must not commit")
+}
+
+// A slot reserved before stop holds it until the job started through it
+// returns, or until it is released unused; a reservation is refused once
+// stop has begun.
+func TestBackgroundWorkersReservationHoldsStop(t *testing.T) {
+	w := newBackgroundWorkers()
+	started, ok := w.reserve()
+	require.True(t, ok)
+	unused, ok := w.reserve()
+	require.True(t, ok)
+
+	stopDone := make(chan struct{})
+	go func() {
+		w.stop("test", 5*time.Second, time.Second)
+		close(stopDone)
+	}()
+	require.Eventually(t, func() bool {
+		r, ok := w.reserve()
+		if ok {
+			r.release()
+		}
+		return !ok
+	}, 5*time.Second, time.Millisecond, "a reservation must be refused once stop began")
+
+	finish := make(chan struct{})
+	started.start(time.Minute, func(context.Context) { <-finish })
+	unused.release()
+	unused.release()
+	select {
+	case <-stopDone:
+		t.Fatal("stop returned while a reserved job was still running")
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(finish)
+	select {
+	case <-stopDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("stop did not return once the reserved job finished")
 	}
 }

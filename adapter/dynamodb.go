@@ -141,7 +141,9 @@ type DynamoDBServer struct {
 
 	// tableCleanups runs the cleanup of a deleted table's old generation
 	// (see launchDeletedTableCleanup) so Stop can join it, bounded, before
-	// the stores close underneath it.
+	// the stores close underneath it. Its slot is reserved before the change
+	// that orphans the generation commits, whichever surface (public
+	// listener, admin HTTP or gRPC forwarder) the change came through.
 	tableCleanups *backgroundWorkers
 }
 
@@ -315,15 +317,25 @@ func (d *DynamoDBServer) Run() error {
 }
 
 // Stop drains the HTTP listener (bounded, see shutdownHTTPServer), then
-// waits, under one more bound, for the deleted-table cleanups those
-// requests started, cancelling and briefly joining any still running, so
-// none is dispatching when the stores close after Stop.
+// waits, under one more bound, for the deleted-table cleanups already
+// started or reserved by a delete still committing, cancelling and briefly
+// joining any still running, so none is dispatching when the stores close
+// after Stop. From then on a change that would need a cleanup is refused
+// with ErrDynamoServerStopping.
 func (d *DynamoDBServer) Stop() {
 	if d.httpServer != nil {
 		shutdownHTTPServer(d.httpServer, "dynamodb")
 	}
 	d.tableCleanups.stop("dynamodb server", httpShutdownTimeout, dynamoTableCleanupJoinTimeout)
 }
+
+// ErrDynamoServerStopping is returned by a table delete, or a legacy-table
+// migration step, that would orphan a table generation once Stop has begun:
+// the generation's cleanup can no longer start, so the change is refused
+// before it commits, and the table is left as it was. The public listener
+// answers it with 503 ServiceUnavailable, which clients retry; the admin
+// surface reports it as a failed request.
+var ErrDynamoServerStopping = newDynamoAPIError(http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "server is stopping")
 
 // dynamoTableCleanupJoinTimeout bounds how long Stop waits, after
 // cancelling the table cleanups that outlived the shutdown bound, for them

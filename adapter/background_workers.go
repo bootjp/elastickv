@@ -24,32 +24,62 @@ func newBackgroundWorkers() *backgroundWorkers {
 	return &backgroundWorkers{gate: newInflightGate(), ctx: ctx, cancel: cancel}
 }
 
+// backgroundReservation is a job slot claimed before the commit that makes
+// the job necessary, so the job can still start after that commit even when
+// stop began in between: stop waits for the slot as for a running job. The
+// holder either starts the job through it or releases it.
+type backgroundReservation struct {
+	w    *backgroundWorkers
+	used bool
+}
+
+// reserve claims a job slot, or reports false once stop has begun, in which
+// case the caller must not commit the change the job would follow up on.
+func (w *backgroundWorkers) reserve() (*backgroundReservation, bool) {
+	if w != nil && !w.gate.enter() {
+		return nil, false
+	}
+	return &backgroundReservation{w: w}, true
+}
+
 // start runs run on its own goroutine under a context bounded by timeout,
-// and reports whether it did. Once stop has begun it runs nothing and
-// returns false.
-func (w *backgroundWorkers) start(timeout time.Duration, run func(ctx context.Context)) bool {
+// handing it the reserved slot. A reservation starts at most one job.
+func (r *backgroundReservation) start(timeout time.Duration, run func(ctx context.Context)) {
+	if r.used {
+		return
+	}
+	r.used = true
 	parent := context.Background()
-	if w != nil {
-		if !w.gate.enter() {
-			return false
-		}
-		parent = w.ctx
+	if r.w != nil {
+		parent = r.w.ctx
 	}
 	go func() {
-		if w != nil {
-			defer w.gate.exit()
+		if r.w != nil {
+			defer r.w.gate.exit()
 		}
 		ctx, cancel := context.WithTimeout(parent, timeout)
 		defer cancel()
 		run(ctx)
 	}()
-	return true
 }
 
-// stop refuses new jobs, waits up to timeout for the running ones, then
-// cancels the context of any that remain and waits up to joinTimeout for
-// them to return, so none is still dispatching when the stores close. Only
-// the first call waits; name labels the warnings it logs.
+// release gives back a slot no job was started through; it is a no-op once
+// start ran or after an earlier release.
+func (r *backgroundReservation) release() {
+	if r.used {
+		return
+	}
+	r.used = true
+	if r.w != nil {
+		r.w.gate.exit()
+	}
+}
+
+// stop refuses new reservations, waits up to timeout for the reserved slots
+// and the running jobs, then cancels the context of any jobs that remain and
+// waits up to joinTimeout for them to return, so none is still dispatching
+// when the stores close. Only the first call waits; name labels the
+// warnings it logs.
 func (w *backgroundWorkers) stop(name string, timeout, joinTimeout time.Duration) {
 	if w == nil {
 		return
