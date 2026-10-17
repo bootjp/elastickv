@@ -373,19 +373,25 @@ Then all of the following must hold:
    inline TTLs (Phase 1 or later).
 2. The Redis delta compactor (`ELASTICKV_REDIS_DELTA_COMPACTOR_ENABLED`) is
    enabled on every node. A group whose leader runs no compactor gets no pass.
+Pass starts come from each node's wall clock, and T0 from whichever clock
+recorded the event. Let S be the largest wall-clock offset between any two
+nodes (or between a node and the clock T0 was read from) that the deployment
+guarantees, for example its NTP bound. Every comparison below keeps a margin
+of S, so skew cannot order a pass on the wrong side of an event.
+
 3. For all eight types and every data group, the latest clean pass across all
-   nodes started after T0:
+   nodes started more than S after T0:
    `max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds{outcome="clean"})`
-   has a series for every type and group, each later than T0. A pass that only
-   ended after T0 does not count: it read its first pages before T0, so a
+   has a series for every type and group, each later than T0 + S. A pass that
+   only ended after T0 does not count: it read its first pages before T0, so a
    route change at T0 could have put a legacy anchor behind its cursor.
-4. For each type and group, that clean pass started after every `not_clean`
-   pass on any node. Leadership moves, so a clean sample from a former leader
-   does not outrank a later `not_clean` pass on the current one. This query
-   must return nothing:
+4. For each type and group, that clean pass started more than S after every
+   `not_clean` pass on any node. Leadership moves, so a clean sample from a
+   former leader does not outrank a later `not_clean` pass on the current one.
+   With S in seconds, this query must return nothing:
 
    ```
-   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds{outcome="not_clean"})
+   max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds{outcome="not_clean"}) + S
      >= on (type, group)
    max by (type, group) (elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds{outcome="clean"})
    ```
