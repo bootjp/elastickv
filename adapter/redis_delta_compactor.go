@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -65,6 +66,12 @@ type DeltaCompactor struct {
 	// called from a test while Run is active).
 	cursorMu sync.Mutex
 	cursors  map[string][]byte
+	// ttlInlinePlans tracks each TTL-inline scan plan's pass, keyed like
+	// cursors by the plan's cursor name. Guarded by cursorMu so a pass moves
+	// together with its plan's cursor.
+	ttlInlinePlans map[string]*ttlInlineMigrationPlanState
+	// ttlInlineObserver, when set, receives every completed TTL-inline pass.
+	ttlInlineObserver monitoring.RedisTTLInlineMigrationObserver
 
 	// urgentCh receives requests to immediately compact a single key whose
 	// delta count has exceeded MaxDeltaScanLimit, making reads fail. The Run
@@ -134,6 +141,14 @@ func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 	}
 }
 
+// WithDeltaCompactorTTLInlineMigrationObserver reports every pass the
+// TTL-inline migration completes over an anchor type and data group.
+func WithDeltaCompactorTTLInlineMigrationObserver(o monitoring.RedisTTLInlineMigrationObserver) DeltaCompactorOption {
+	return func(c *DeltaCompactor) {
+		c.ttlInlineObserver = o
+	}
+}
+
 // NewDeltaCompactor creates a DeltaCompactor that operates on st using coord.
 func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCompactorOption) *DeltaCompactor {
 	c := &DeltaCompactor{
@@ -145,6 +160,7 @@ func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCo
 		timeout:        defaultDeltaCompactorTimeout,
 		timeoutBackoff: defaultDeltaCompactorTimeoutBackoff,
 		cursors:        make(map[string][]byte),
+		ttlInlinePlans: make(map[string]*ttlInlineMigrationPlanState),
 		urgentCh:       make(chan urgentCompactionRequest, urgentCompactionChanSize),
 	}
 	for _, opt := range opts {
@@ -490,11 +506,19 @@ func (c *DeltaCompactor) scanDeltaRaw(ctx context.Context, h collectionDeltaHand
 func (c *DeltaCompactor) advanceCursor(typeName string, lastScannedKey []byte, truncated bool) {
 	c.cursorMu.Lock()
 	defer c.cursorMu.Unlock()
+	c.advanceCursorLocked(typeName, lastScannedKey, truncated)
+}
+
+// advanceCursorLocked is advanceCursor for callers holding cursorMu. It
+// reports whether the cursor was reset, i.e. the scan reached the end of the
+// prefix and the next one starts from the beginning.
+func (c *DeltaCompactor) advanceCursorLocked(typeName string, lastScannedKey []byte, truncated bool) (reset bool) {
 	if truncated && len(lastScannedKey) > 0 {
 		c.cursors[typeName] = bytes.Clone(lastScannedKey)
-	} else {
-		delete(c.cursors, typeName)
+		return false
 	}
+	delete(c.cursors, typeName)
+	return true
 }
 
 // compactHandler scans the delta prefix for h, groups entries by userKey,

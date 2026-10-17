@@ -408,9 +408,13 @@ func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtime
 	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
-func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator) *adapter.DeltaCompactor {
+func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry) *adapter.DeltaCompactor {
 	if enabledEnv(redisDeltaCompactorEnabledEnvVar) {
-		return adapter.NewDeltaCompactor(shardStore, coordinate)
+		var opts []adapter.DeltaCompactorOption
+		if obs := metricsRegistry.RedisTTLInlineMigrationObserver(); obs != nil {
+			opts = append(opts, adapter.WithDeltaCompactorTTLInlineMigrationObserver(obs))
+		}
+		return adapter.NewDeltaCompactor(shardStore, coordinate, opts...)
 	}
 	slog.Info("redis delta compactor disabled", "env", redisDeltaCompactorEnabledEnvVar)
 	return nil
@@ -3482,7 +3486,7 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate)
+	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate, metricsRegistry)
 	redisOpts := []adapter.RedisServerOption{
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),

@@ -51,6 +51,7 @@ type ttlInlineMigrationTickPlan struct {
 // and groups whenever the earlier plans used up the budget.
 func (c *DeltaCompactor) migrateTTLInlineOnce(ctx context.Context, readTS uint64) error {
 	plans := c.ttlInlineMigrationTickPlans()
+	c.pruneTTLInlineMigrationPlanStates(plans)
 	start := c.rotationStart(&c.ttlInlinePlanCursor, len(plans))
 	var combined error
 	for offset := range plans {
@@ -212,48 +213,83 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
 ) error {
-	kvs, cursorKey, truncated, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
+	page, err := c.scanTTLInlineMigrationRaw(ctx, h, plan, readTS)
 	if err != nil {
 		return err
 	}
+	tally, err := c.migrateTTLInlinePage(ctx, h, page.kvs, readTS)
+	if err != nil {
+		// The next tick reads this page again, so only the keys its earlier
+		// batches already rewrote count toward the pass.
+		c.noteTTLInlineMigrationPageFailed(plan.cursorName, page, tally.keysMigrated)
+		return err
+	}
+	if pass, prevClean, done := c.finishTTLInlineMigrationPage(plan.cursorName, page, tally); done {
+		c.reportTTLInlineMigrationPass(ctx, h, plan, pass, prevClean)
+	}
+	return nil
+}
+
+// migrateTTLInlinePage rewrites the page's legacy anchors in batches of at most
+// ttlInlineMigrationBatchKeyLimit keys and tallies what it did with each
+// anchor. On a dispatch error the tally's keysMigrated still counts the keys
+// of the batches dispatched before it.
+func (c *DeltaCompactor) migrateTTLInlinePage(
+	ctx context.Context,
+	h ttlInlineMigrationHandler,
+	kvs []*store.KVPair,
+	readTS uint64,
+) (ttlInlineMigrationTally, error) {
 	var (
+		tally      ttlInlineMigrationTally
 		elems      []*kv.Elem[kv.OP]
 		batchKeys  int
+		rewrites   int
 		flushBatch = func() error {
 			if err := c.dispatchCompaction(ctx, readTS, elems); err != nil {
 				c.logger.WarnContext(ctx, "ttl inline migrator: batch dispatch failed",
 					"type", h.typeName, "error", err)
 				return err
 			}
+			tally.keysMigrated += rewrites
 			elems = nil
 			batchKeys = 0
+			rewrites = 0
 			return nil
 		}
 	)
 	for _, pair := range kvs {
 		userKey := h.extractUserKey(pair.Key)
-		if userKey == nil || !c.coord.IsLeaderForKey(redisUserRouteKey(userKey)) {
+		if userKey == nil {
+			continue
+		}
+		tally.keysScanned++
+		if !c.coord.IsLeaderForKey(redisUserRouteKey(userKey)) {
+			tally.keysSkipped++
 			continue
 		}
 		built, buildErr := h.buildElems(ctx, pair, readTS)
 		if buildErr != nil {
+			tally.keysFailed++
 			c.logger.WarnContext(ctx, "ttl inline migrator: failed to build elems",
 				"type", h.typeName, "key", string(userKey), "error", buildErr)
 			continue
+		}
+		if len(built) > 0 {
+			rewrites++
 		}
 		elems = append(elems, built...)
 		batchKeys++
 		if batchKeys >= ttlInlineMigrationBatchKeyLimit {
 			if err := flushBatch(); err != nil {
-				return err
+				return tally, err
 			}
 		}
 	}
-	if err := flushBatch(); err != nil {
-		return err
-	}
-	c.advanceCursor(plan.cursorName, cursorKey, truncated)
-	return nil
+	// flushBatch adds the last batch's keys to tally, so call it before
+	// returning tally.
+	err := flushBatch()
+	return tally, err
 }
 
 // ttlInlineMigrationScanPlans scans only the groups this node leads when the
@@ -294,34 +330,54 @@ func ttlInlineMigrationGroupCursorName(typeName string, groupID uint64) string {
 	return typeName + ":group:" + strconv.FormatUint(groupID, 10)
 }
 
-// scanTTLInlineMigrationRaw returns the scanned rows, the key the plan's cursor
-// moves to, and whether the scan stopped before the end of the prefix.
+// ttlInlineMigrationPage is one page a scan plan read in a tick.
+type ttlInlineMigrationPage struct {
+	kvs []*store.KVPair
+	// cursorKey is the key the plan's cursor moves to.
+	cursorKey []byte
+	// truncated reports that the scan stopped before the end of the prefix.
+	truncated bool
+	// fromStart reports that the page starts at the beginning of the prefix,
+	// so it is the first page of a pass.
+	fromStart bool
+	// startCursor is the plan's cursor when the scan began. A page whose plan
+	// cursor has moved since was also finished by another tick.
+	startCursor []byte
+	// scannedAt is when the scan began; a pass opened by this page starts then.
+	scannedAt time.Time
+}
+
 func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	ctx context.Context,
 	h ttlInlineMigrationHandler,
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
-) ([]*store.KVPair, []byte, bool, error) {
+) (ttlInlineMigrationPage, error) {
+	scannedAt := time.Now()
 	c.cursorMu.Lock()
 	start := h.prefix
-	if cur := c.cursors[plan.cursorName]; len(cur) > 0 {
+	cur := bytes.Clone(c.cursors[plan.cursorName])
+	if len(cur) > 0 {
 		start = append(bytes.Clone(cur), cursorNextByte)
 	}
 	c.cursorMu.Unlock()
 
+	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, startCursor: cur, scannedAt: scannedAt}
 	end := store.PrefixScanEnd(h.prefix)
 	if plan.scanner != nil {
 		kvs, resume, err := plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
 		if err != nil {
-			return nil, nil, false, errors.WithStack(err)
+			return ttlInlineMigrationPage{}, errors.WithStack(err)
 		}
-		return kvs, resume, resume != nil, nil
+		page.kvs, page.cursorKey, page.truncated = kvs, resume, resume != nil
+		return page, nil
 	}
 	kvs, err := c.st.ScanAt(ctx, start, end, ttlInlineMigrationTickScanLimit, readTS)
 	if err != nil {
-		return nil, nil, false, errors.WithStack(err)
+		return ttlInlineMigrationPage{}, errors.WithStack(err)
 	}
-	return kvs, lastKVKey(kvs), len(kvs) == ttlInlineMigrationTickScanLimit, nil
+	page.kvs, page.cursorKey, page.truncated = kvs, lastKVKey(kvs), len(kvs) == ttlInlineMigrationTickScanLimit
+	return page, nil
 }
 
 func (c *DeltaCompactor) migrateStringTTLInlineElems(ctx context.Context, pair *store.KVPair, readTS uint64) ([]*kv.Elem[kv.OP], error) {
