@@ -608,8 +608,23 @@ func TestShadowTimestampAllocatorBypassesLegacyAfterObservedCutover(t *testing.T
 }
 
 func TestShadowAndCutoverAllocatorsSerializeMigrationOnGroupZero(t *testing.T) {
+	// Both clocks must take their ceiling from ONE wall-clock sample.
+	//
+	// HLC.fencedNowMillis jumps the physical half straight to the ceiling
+	// whenever the ceiling is in the future, so every timestamp this legacy
+	// clock issues sits exactly at legacyClock's ceiling. The shadow path
+	// hands that timestamp to the group-0 allocator as a minimum, and
+	// rejectMinimumWindowBeyondCeiling correctly refuses a minimum above
+	// tsoClock's committed ceiling. Two separate time.Now() calls can
+	// straddle a millisecond boundary, which puts legacyClock's ceiling 1 ms
+	// above tsoClock's and fails the shadow validation -- a fixture artifact,
+	// not a real condition: production wires one *HLC (coordinate.Clock())
+	// into both the dedicated allocator and the legacy path, so the two
+	// ceilings there are the same value by construction.
+	ceilingMs := time.Now().Add(testTSOFutureCeiling).UnixMilli()
+
 	tsoClock := NewHLC()
-	tsoClock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	tsoClock.SetPhysicalCeiling(ceilingMs)
 	fsm := NewTSOStateMachine(tsoClock)
 	engine := &recordingTSOEngine{
 		state:  raftengine.StateLeader,
@@ -621,7 +636,7 @@ func TestShadowAndCutoverAllocatorsSerializeMigrationOnGroupZero(t *testing.T) {
 	require.NoError(t, err)
 
 	legacyClock := NewHLC()
-	legacyClock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	legacyClock.SetPhysicalCeiling(ceilingMs)
 	shadowRoute, err := NewLeaderRoutedTSOAllocator(local, engine, WithTSORoutedClock(legacyClock))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, shadowRoute.Close()) })
