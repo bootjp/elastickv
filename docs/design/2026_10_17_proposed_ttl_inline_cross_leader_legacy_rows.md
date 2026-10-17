@@ -67,6 +67,8 @@ The commit timestamp must not come from L's leader:
 
 **Batches are partitioned by owner group.** The migrator batches up to 32 keys per OCC transaction, and one scan page can hold rows owned by several remote groups. Under A0b no single leader can stamp a batch that writes several groups without one of them receiving a foreign-group timestamp. M2 therefore groups rewrites by owner group and chunks each group's rows into transactions of at most 32 keys, each forwarded to that group's leader. A page with many rows of one owner produces several transactions for it. A batch spanning groups is allowed only under Phase D, where group 0 stamps everything.
 
+**A relocation always writes.** The rewrite goes through the handler's `buildElems`, which uses `putIfChanged`. A legacy-route row already in inline format, written after TTL-inline encoding shipped but before user-key routing, produces no mutation, because L's value equals the desired value. The row would then count as settled with nothing copied into P, and reappear on every pass. When the presence probe says P holds no version, M2 forces the metadata `Put` into P, plus the TTL-index sync. Value equality is a valid no-op only once P holds the row. The same-node path of bootjp/elastickv#1278 has the same no-op for already-inline legacy rows, and M2 applies the forced `Put` there too, so M3 can evacuate those rows as well.
+
 **Progress is checkpointed within the page.** Today a plan's cursor advances only after the whole page has been processed, and every plan shares one 5s tick. A page of remote-owner rows, each needing a probe and a forward, could exhaust the tick before the page ends. The next tick would then restart on the same page and repeat the same probes, starving every row behind them. M2 must:
 - probe in batches per owner group, one RPC carrying many keys (`RawVersionsVisibleAt`), with the owner groups' batches issued concurrently;
 - checkpoint only a contiguous prefix of the page. Owner groups interleave in scan order (`P1, P2, P1, …`) and their batches finish in any order, so the cursor may advance only to the last row of the longest prefix in which every row is settled. A row is settled when its transaction committed, or when it needed no work: owned, skipped, or the owner already holds a version. A tick that runs out of budget resumes behind that prefix and redoes at most the unsettled rows after it; redoing a committed rewrite is a no-op (`putIfChanged`).
@@ -82,6 +84,8 @@ Once P holds a version of the **metadata** key, L's copy of that row is shadowed
 
 This does **not** let the dual-route fallback be retired. A collection created before user-key routing may also have field, member, score or entry rows that live only in L. Evacuating its metadata row moves none of them, and a point read such as `HGET` still needs the legacy route to find them. Retiring the fallback needs a separate migration of every row family, with its own gate. That is out of scope here (§2).
 
+**Enumerating the candidates.** The rows M3 deletes are exactly the ones the migrator's scan does not serve: `ScanGroupOwnedAt` skips a legacy-route row once its owner holds any version, a tombstone included. Scans that canonicalize wide-column rows drop it as well, because the owner's tombstone stops the point-read fallback. M3 therefore reads L's raw stored page, `scanRouteAtForwardStoredPage` without the point-read pass, and keeps legacy-route rows whose owner, a group other than L, holds a version at the read timestamp. Rows shadowed by a tombstone at P are candidates like any other.
+
 The delete is a write into **L** at the raw key, issued by L's leader, so it is compliant in every TSO mode. However, the normal dispatch path routes the raw key to P by its user key, and **a plain `Del` would delete P's copy**. Option C needs an explicit-group delete: "delete this raw key in group L, if L's route still covers it". `ShardStore` has explicit-group reads (`GetGroupAt`, `ScanGroupAt`) but no explicit-group write.
 
 ### D. Measure first
@@ -92,16 +96,16 @@ A cheap local count, on each group's leader, of legacy-route rows by owner group
 
 | Milestone | Change | Gated on |
 |---|---|---|
-| M1 | **Measure.** Per-group-leader counts of legacy-route rows the scan sees, split into: served (owner led locally), owner led elsewhere, owner holds a newer version. Counts accumulate per pass and are published atomically with that pass's completion epoch when the plan's cursor wraps. A leadership change discards the in-progress pass and invalidates the published snapshot, since a new leader starts a new pass. Expose the published snapshots as metrics and in an admin RPC. | bootjp/elastickv#1278 |
-| M2 | **Option B.** L's leader resolves owner-led-elsewhere rows with batched, concurrent presence probes per owner group. It forwards one rewrite transaction per owner group: unstamped under A0b, TSO-stamped under Phase D. The plan cursor advances after each completed batch. Disabled, with the row skipped as today, when neither A0b nor Phase D holds. | M1; A0b or Phase D; `RawVersionsVisibleAt` |
-| M3 | **Option C.** Explicit-group delete of L's metadata copy once P holds a version, in a later pass, by L's leader. Ships together with M2, which otherwise re-probes every rewritten row on every pass. | M2; an explicit-group delete path |
+| M1 | **Measure.** Per-group-leader counts of legacy-route rows the scan sees, split into: served (owner led locally, holds nothing), owner led locally and holds a version, owner led elsewhere. Without a remote probe, M1 cannot tell whether a remote owner holds the key; M2 adds that split. Counts accumulate per pass and are published atomically with that pass's completion epoch when the plan's cursor wraps. A leadership change discards the in-progress pass and invalidates the published snapshot, since a new leader starts a new pass. Expose the published snapshots as metrics and in an admin RPC. | bootjp/elastickv#1278 |
+| M2 | **Option B.** L's leader resolves owner-led-elsewhere rows with batched, concurrent presence probes per owner group. It forwards each owner group's rewrites in transactions of at most 32 keys: unstamped under A0b, TSO-stamped under Phase D. A relocation forces the `Put` when the owner holds nothing. The plan cursor advances only over the contiguous prefix of settled rows. It extends M1's counts with "owner led elsewhere and holds a version". Disabled, with the row skipped as today, when neither A0b nor Phase D holds. | M1; A0b or Phase D; `RawVersionsVisibleAt` |
+| M3 | **Option C.** By L's leader, in a later pass: enumerate L's raw page and delete L's metadata copy with an explicit-group delete, when the current owner is a group other than L and holds a version, at the delete's route version. Ships together with M2, which otherwise re-probes every rewritten row on every pass. | M2; an explicit-group delete path |
 | M4 | **Phase 3 gate.** Document that the legacy fallback may be disabled only when, for every group, the latest published M1 snapshot has a valid completion epoch from after the rollout and reports zero legacy-route rows with the owner led elsewhere and zero served-but-unmigrated rows. Counts and epoch come from the same pass, so in-progress zeroes after a reset can never satisfy the gate. | M1 to M3 |
 
 Option A is rejected. It restores the cost profile a36dac7f removed and never converges, because the copies it reads are never removed.
 
 ## 5. Cost
 
-- **M1:** no extra reads. The counters classify rows the page already reads; a classification is one in-memory route lookup.
+- **M1:** no remote reads. The counters classify rows the page already reads, by an in-memory route lookup plus, for a locally led owner, the local version probe bootjp/elastickv#1278 already performs. Whether a remote owner holds the key is left to M2, which issues the probe anyway.
 - **M2:** per page (≤ 512 rows per plan per tick), one batched presence RPC per remote owner group, plus one forwarded transaction per 32 of that group's rows, issued concurrently across owner groups. Batching is a convergence requirement, not an optimisation: sequential per-row RPCs could exhaust the tick on one page every time.
 - **M2 before M3 evacuates:** every pass re-probes each rewritten row still present in L. That is one batched RPC per owner group per page, recurring for the backlog's size until M3 removes the copies. With M2 and M3 shipped together, a row is re-probed at most until the pass after its rewrite. If M3 is disabled or failing, M1's "owner holds a newer version" counter shows the recurring set.
 - **M3:** one explicit-group delete per evacuated metadata row, once. After evacuation, L's legacy metadata range is empty and the TTL-inline plans read nothing there. Collection field, member, score and entry rows stay in L (§3 C).
@@ -112,13 +116,21 @@ Option A is rejected. It restores the cost profile a36dac7f removed and never co
 - **Presence-check races:** if P gains a version between the probe and the commit, the rewrite conflicts with it, because it writes the same key. If P's leadership moves, the probe is answered only by a current leader (it reports "cannot answer" otherwise), and the forward is re-routed or fails.
 - **Timestamps:** never issued by L's leader for P's key. Under Phase D they come from group 0; under A0b P's leader allocates. Without either, M2 stays off.
 - **Staged visibility:** rows whose route, at L or P, is under staged visibility stay deferred, as in bootjp/elastickv#1278.
-- **M3 safety:** delete L's copy only when P holds a version at the delete's own read timestamp. The explicit-group delete must refuse if L's route no longer covers the raw key, which can happen after a catalog change.
+- **M3 safety:** delete L's copy only when, at the delete's own read timestamp and route version:
+  - the key's current owner is a group other than L;
+  - that owner holds a version of the key;
+  - L's route still covers the raw key.
+
+  The explicit-group delete carries that route version and refuses if the catalog has moved past it. A catalog change can make L the owner, and then P's "version" would be the very row being deleted. A delete decided against an older catalog could remove the collection's only current metadata copy.
 
 ## 7. Test plan
 
 - `kv`: a real split `ShardStore`, with P behind a `followerProxyEngine` whose leader is a fake RawKV server. Cover the probe answering "none", "has a version" and "cannot answer". Cover unstamped forwarding under A0b and TSO stamping under Phase D. M2 must stay off when neither holds.
-- `adapter`: compactor tests where L and P have different leaders. The legacy row is migrated into P exactly once; a concurrent user write at P wins. One page holding rows of two remote owner groups produces one transaction per owner group. With interleaved owners (`P1, P2, P1`), a tick whose budget runs out after P1's batch commits but before P2's resumes behind the settled prefix and never skips the P2 row. A group with more than 32 rows on the page commits in several transactions. M1: a reset pass never publishes zeroes before its completion, and a leadership change invalidates the snapshot.
-- M3: an explicit-group delete removes L's copy only, never P's, and refuses after the route moves.
+- `adapter`: compactor tests where L and P have different leaders. The legacy row is migrated into P exactly once; a concurrent user write at P wins. One page holding rows of two remote owner groups produces one transaction per owner group. With interleaved owners (`P1, P2, P1`), a tick whose budget runs out after P1's batch commits but before P2's resumes behind the settled prefix and never skips the P2 row. A group with more than 32 rows on the page commits in several transactions. An already-inline legacy row whose owner holds nothing is copied into P, on both the cross-leader and the same-node path. M1: a reset pass never publishes zeroes before its completion, and a leadership change invalidates the snapshot.
+- M3:
+  - an explicit-group delete removes L's copy only, never P's;
+  - it refuses after the route moves, and when the current owner has become L;
+  - rows shadowed by a tombstone at P are found by the raw enumeration and evacuated.
 - Jepsen: the Redis workloads with a seeded legacy-route backlog and leader shuffles, checking linearizable reads of the affected keys during migration and evacuation.
 
 ## Decisions
