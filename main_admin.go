@@ -618,10 +618,7 @@ func translateAdminObjectsError(err error) error {
 		return nil
 	case errors.Is(err, adapter.ErrAdminForbidden):
 		return admin.ErrObjectsForbidden
-	case errors.Is(err, adapter.ErrAdminNotLeader),
-		// A node that is stopping cannot serve the object either; the
-		// not-leader response's Retry-After sends the client elsewhere.
-		errors.Is(err, adapter.ErrAdminS3Stopping):
+	case errors.Is(err, adapter.ErrAdminNotLeader):
 		return admin.ErrObjectsNotLeader
 	case errors.Is(err, adapter.ErrAdminBucketNotFound):
 		return admin.ErrObjectsBucketNotFound

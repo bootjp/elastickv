@@ -187,6 +187,10 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 	if !s.isVerifiedS3Leader(ctx) {
 		return ErrAdminNotLeader
 	}
+	if err := s.enterAdminBlobUse(); err != nil {
+		return err
+	}
+	defer s.exitAdminBlobUse()
 	if key == "" {
 		return ErrAdminInvalidObjectKey
 	}
@@ -196,10 +200,6 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 	if body == nil {
 		body = strings.NewReader("")
 	}
-	if err := s.enterAdminBlobUse(); err != nil {
-		return err
-	}
-	defer s.exitAdminBlobUse()
 
 	previous, generation, err := s.adminPutObjectStream(ctx, bucket, key, body, contentType)
 	if err != nil {

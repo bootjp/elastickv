@@ -11,10 +11,10 @@ import (
 // ErrAdminS3Stopping is returned by the admin object operations
 // (AdminPutObject, AdminGetObject, AdminDeleteObject) once Stop has begun:
 // the blob peer cluster and the cleanup gate are about to close, so the
-// operation is refused rather than started against them. The admin handler
-// maps it to the not-leader response so the client retries against another
-// node.
-var ErrAdminS3Stopping = errors.New("s3 admin: server is stopping")
+// operation is refused rather than started against them. It is marked as
+// ErrAdminNotLeader, so the admin bridge answers it with the not-leader
+// response and the client retries against another node.
+var ErrAdminS3Stopping = errors.Mark(errors.New("s3 admin: server is stopping"), ErrAdminNotLeader)
 
 // enterAdminBlobUse registers an admin object operation that may replicate
 // or fetch chunk blobs through the blob peer cluster, or schedule a
@@ -27,7 +27,7 @@ func (s *S3Server) enterAdminBlobUse() error {
 	if s == nil || s.adminBlobUsers.enter() {
 		return nil
 	}
-	return ErrAdminS3Stopping
+	return errors.WithStack(ErrAdminS3Stopping)
 }
 
 func (s *S3Server) exitAdminBlobUse() {
