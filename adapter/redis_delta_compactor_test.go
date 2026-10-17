@@ -2569,3 +2569,110 @@ func TestDeltaCompactor_TTLInlineReportsCompletedPasses(t *testing.T) {
 		})
 	}
 }
+
+// hookedTTLInlineScanStore runs onScan before each group scan of prefix.
+type hookedTTLInlineScanStore struct {
+	store.MVCCStore
+
+	prefix []byte
+	onScan func()
+}
+
+func (s *hookedTTLInlineScanStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
+	if bytes.HasPrefix(start, s.prefix) && s.onScan != nil {
+		s.onScan()
+	}
+	return scanPageWithResume(ctx, s.MVCCStore, start, end, limit, ts)
+}
+
+func newHookedTTLInlinePassCompactor(t *testing.T, st *hookedTTLInlineScanStore) (*DeltaCompactor, *lockedLogBuffer) {
+	t.Helper()
+	coord := &ttlInlinePassTestCoordinator{
+		localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		groupIDs:                []uint64{1},
+		leadsKeys:               true,
+	}
+	logs := &lockedLogBuffer{}
+	c := NewDeltaCompactor(st, coord,
+		WithDeltaCompactorTimeout(time.Minute),
+		WithDeltaCompactorLogger(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+	return c, logs
+}
+
+// Two ticks that run at once read the same cursor and migrate the same page.
+// Only the first to finish may add that page to the pass; the other's page is
+// stale. Counting both inflated the pass's tallies, and on the last page opened
+// a second, spurious pass.
+func TestDeltaCompactor_TTLInlinePassIgnoresAPageAnotherTickFinished(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	const keys = 2*ttlInlineMigrationTickScanLimit + 88
+	st := &hookedTTLInlineScanStore{MVCCStore: store.NewMVCCStore(), prefix: []byte(redisStrPrefix)}
+	seedTTLInlinePassStrings(t, st, keys, false)
+	c, logs := newHookedTTLInlinePassCompactor(t, st)
+
+	// The scan of the second string page runs a whole tick in between, as a
+	// concurrent SyncOnce would: both ticks read the cursor before page two.
+	scans, nested := 0, false
+	st.onScan = func() {
+		scans++
+		if scans == 2 && !nested {
+			nested = true
+			require.NoError(t, c.SyncOnce(ctx))
+		}
+	}
+	for range 3 {
+		require.NoError(t, c.SyncOnce(ctx))
+	}
+
+	passes := logs.ttlInlinePasses(t, "ttl-inline-string")
+	require.Len(t, passes, 1)
+	require.Equal(t, 3, passes[0].Pages)
+	require.Equal(t, keys, passes[0].KeysScanned)
+	require.True(t, passes[0].Clean)
+}
+
+// A pass's duration includes its first page: the pass starts when that page's
+// scan starts, not when the page has been migrated.
+func TestDeltaCompactor_TTLInlinePassDurationIncludesFirstPage(t *testing.T) {
+	t.Parallel()
+
+	const scanDelay = 50 * time.Millisecond
+	st := &hookedTTLInlineScanStore{
+		MVCCStore: store.NewMVCCStore(),
+		prefix:    []byte(redisStrPrefix),
+		onScan:    func() { time.Sleep(scanDelay) },
+	}
+	seedTTLInlinePassStrings(t, st, 3, false)
+	c, logs := newHookedTTLInlinePassCompactor(t, st)
+
+	require.NoError(t, c.SyncOnce(context.Background()))
+
+	durations := logs.ttlInlinePassDurations(t, "ttl-inline-string")
+	require.Len(t, durations, 1)
+	require.GreaterOrEqual(t, durations[0], scanDelay)
+}
+
+func (b *lockedLogBuffer) ttlInlinePassDurations(t *testing.T, typeName string) []time.Duration {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []time.Duration
+	for _, line := range bytes.Split(b.buf.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Msg      string        `json:"msg"`
+			Type     string        `json:"type"`
+			Duration time.Duration `json:"duration"`
+		}
+		require.NoError(t, json.Unmarshal(line, &rec))
+		if rec.Msg == "ttl inline migrator: pass complete" && rec.Type == typeName {
+			out = append(out, rec.Duration)
+		}
+	}
+	return out
+}

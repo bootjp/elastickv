@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"time"
@@ -57,17 +58,18 @@ type ttlInlineMigrationPlanState struct {
 }
 
 // openTTLInlineMigrationPassLocked returns the open pass of the plan named
-// name, starting one if needed. fromStart reports that the page being recorded
-// starts at the beginning of the prefix; such a page always opens a new pass
-// unless the open pass has not completed a page yet. Callers hold cursorMu.
-func (c *DeltaCompactor) openTTLInlineMigrationPassLocked(name string, fromStart bool) *ttlInlineMigrationPass {
+// name, starting one if needed. A page that starts at the beginning of the
+// prefix always opens a new pass unless the open pass has not completed a page
+// yet. A pass the page opens starts when the page's scan began. Callers hold
+// cursorMu.
+func (c *DeltaCompactor) openTTLInlineMigrationPassLocked(name string, page ttlInlineMigrationPage) *ttlInlineMigrationPass {
 	state := c.ttlInlinePlans[name]
 	if state == nil {
 		state = &ttlInlineMigrationPlanState{}
 		c.ttlInlinePlans[name] = state
 	}
-	if state.pass == nil || (fromStart && state.pass.pages > 0) {
-		state.pass = &ttlInlineMigrationPass{full: fromStart, startedAt: time.Now()}
+	if state.pass == nil || (page.fromStart && state.pass.pages > 0) {
+		state.pass = &ttlInlineMigrationPass{full: page.fromStart, startedAt: page.scannedAt}
 	}
 	return state.pass
 }
@@ -75,19 +77,20 @@ func (c *DeltaCompactor) openTTLInlineMigrationPassLocked(name string, fromStart
 // noteTTLInlineMigrationPageFailed adds the keys a failed page already
 // rewrote to its plan's pass. The page itself does not count: its cursor stays,
 // and the next tick reads it again.
-func (c *DeltaCompactor) noteTTLInlineMigrationPageFailed(name string, fromStart bool, migrated int) {
+func (c *DeltaCompactor) noteTTLInlineMigrationPageFailed(name string, page ttlInlineMigrationPage, migrated int) {
 	if migrated == 0 {
 		return
 	}
 	c.cursorMu.Lock()
 	defer c.cursorMu.Unlock()
-	c.openTTLInlineMigrationPassLocked(name, fromStart).keysMigrated += migrated
+	c.openTTLInlineMigrationPassLocked(name, page).keysMigrated += migrated
 }
 
 // finishTTLInlineMigrationPage adds a migrated page to its plan's pass and
 // moves the plan's cursor past it. When the page reached the end of the prefix
 // it closes the pass and returns it with done set, and whether the plan's
-// previous pass was clean.
+// previous pass was clean. A page is dropped when the plan's cursor moved after
+// its scan began: another tick that read the same cursor already finished it.
 func (c *DeltaCompactor) finishTTLInlineMigrationPage(
 	name string,
 	page ttlInlineMigrationPage,
@@ -95,7 +98,10 @@ func (c *DeltaCompactor) finishTTLInlineMigrationPage(
 ) (pass ttlInlineMigrationPass, prevClean bool, done bool) {
 	c.cursorMu.Lock()
 	defer c.cursorMu.Unlock()
-	open := c.openTTLInlineMigrationPassLocked(name, page.fromStart)
+	if !bytes.Equal(c.cursors[name], page.startCursor) {
+		return ttlInlineMigrationPass{}, false, false
+	}
+	open := c.openTTLInlineMigrationPassLocked(name, page)
 	open.add(tally)
 	open.pages++
 	if !c.advanceCursorLocked(name, page.cursorKey, page.truncated) {

@@ -221,7 +221,7 @@ func (c *DeltaCompactor) migrateTTLInlineScanPlan(
 	if err != nil {
 		// The next tick reads this page again, so only the keys its earlier
 		// batches already rewrote count toward the pass.
-		c.noteTTLInlineMigrationPageFailed(plan.cursorName, page.fromStart, tally.keysMigrated)
+		c.noteTTLInlineMigrationPageFailed(plan.cursorName, page, tally.keysMigrated)
 		return err
 	}
 	if pass, prevClean, done := c.finishTTLInlineMigrationPage(plan.cursorName, page, tally); done {
@@ -340,6 +340,11 @@ type ttlInlineMigrationPage struct {
 	// fromStart reports that the page starts at the beginning of the prefix,
 	// so it is the first page of a pass.
 	fromStart bool
+	// startCursor is the plan's cursor when the scan began. A page whose plan
+	// cursor has moved since was also finished by another tick.
+	startCursor []byte
+	// scannedAt is when the scan began; a pass opened by this page starts then.
+	scannedAt time.Time
 }
 
 func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
@@ -348,15 +353,16 @@ func (c *DeltaCompactor) scanTTLInlineMigrationRaw(
 	plan ttlInlineMigrationScanPlan,
 	readTS uint64,
 ) (ttlInlineMigrationPage, error) {
+	scannedAt := time.Now()
 	c.cursorMu.Lock()
 	start := h.prefix
-	cur := c.cursors[plan.cursorName]
+	cur := bytes.Clone(c.cursors[plan.cursorName])
 	if len(cur) > 0 {
 		start = append(bytes.Clone(cur), cursorNextByte)
 	}
 	c.cursorMu.Unlock()
 
-	page := ttlInlineMigrationPage{fromStart: len(cur) == 0}
+	page := ttlInlineMigrationPage{fromStart: len(cur) == 0, startCursor: cur, scannedAt: scannedAt}
 	end := store.PrefixScanEnd(h.prefix)
 	if plan.scanner != nil {
 		kvs, resume, err := plan.scanner.ScanGroupOwnedAt(ctx, plan.groupID, start, end, ttlInlineMigrationTickScanLimit, readTS)
