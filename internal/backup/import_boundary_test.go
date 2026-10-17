@@ -24,6 +24,13 @@ var backupForbiddenDeps = []string{
 	"github.com/cockroachdb/pebble",
 }
 
+// backupAllowedDeps are exceptions inside a forbidden prefix. Snapshot SST
+// ingest bundles (snapshot_sst.go) are files in pebble's sstable format, and
+// reading them takes pebble's sstable reader, not a live store.
+var backupAllowedDeps = []string{
+	"github.com/cockroachdb/pebble/v2/sstable",
+}
+
 // TestBackupLinksNoLiveClusterCode walks the non-test import closure of
 // internal/backup through first-party packages and fails on any
 // forbidden package, naming the import chain that reaches it.
@@ -59,6 +66,11 @@ func TestBackupLinksNoLiveClusterCode(t *testing.T) {
 }
 
 func forbiddenBackupDep(pkgPath string) string {
+	for _, allowed := range backupAllowedDeps {
+		if pkgPath == allowed {
+			return ""
+		}
+	}
 	for _, forbidden := range backupForbiddenDeps {
 		if pkgPath == forbidden || strings.HasPrefix(pkgPath, forbidden+"/") {
 			return forbidden
