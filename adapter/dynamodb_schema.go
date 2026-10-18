@@ -300,7 +300,7 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 	// delete without it would leave the generation's items behind.
 	cleanup, ok := d.tableCleanups.reserve()
 	if !ok {
-		return ErrDynamoServerStopping
+		return errors.WithStack(ErrDynamoServerStopping)
 	}
 	defer cleanup.release()
 	backoff := transactRetryInitialBackoff
