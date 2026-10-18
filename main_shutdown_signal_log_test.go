@@ -53,3 +53,37 @@ func TestInstallShutdownSignalHandlerCancelsBeforeLogging(t *testing.T) {
 		t.Fatal("a blocked log write held back the shutdown")
 	}
 }
+
+// The cleanup that stops the handler must not wait forever on a goroutine
+// stuck in that log write: it runs at the end of the shutdown, after the
+// WAL sync, and a hang there would keep the process from exiting.
+func TestInstallShutdownSignalHandlerStopDoesNotWaitOnBlockedLog(t *testing.T) {
+	resetSignalShutdown(t)
+	handler := &blockingLogHandler{release: make(chan struct{})}
+	release := sync.OnceFunc(func() { close(handler.release) })
+	old := slog.Default()
+	slog.SetDefault(slog.New(handler))
+	ctx, cancel := context.WithCancel(context.Background())
+	stop := installShutdownSignalHandler(cancel, syscall.SIGUSR2)
+	t.Cleanup(func() {
+		release()
+		slog.SetDefault(old)
+	})
+
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
+	select {
+	case <-ctx.Done():
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("the signal did not cancel the shutdown")
+	}
+	stopped := make(chan struct{})
+	go func() {
+		stop()
+		close(stopped)
+	}()
+	select {
+	case <-stopped:
+	case <-time.After(shutdownTestTimeout):
+		t.Fatal("stopping the handler waited on the goroutine stuck in the log write")
+	}
+}

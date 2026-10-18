@@ -294,6 +294,10 @@ const exitCodeMemoryPressure = 2
 // attached to a dead server (`Transport endpoint is not connected`).
 var shutdownSignals = []os.Signal{syscall.SIGTERM, syscall.SIGINT}
 
+// shutdownSignalHandlerJoinTimeout bounds how long stopping the signal
+// handler waits for its goroutine, which a blocked log write can hold.
+const shutdownSignalHandlerJoinTimeout = time.Second
+
 // signalShutdown is set by the signal handler once a shutdown signal has
 // cancelled the root context, so main can tell a requested stop from a
 // failure when the errgroup surfaces context.Canceled while unwinding.
@@ -3368,7 +3372,15 @@ func installShutdownSignalHandler(cancel context.CancelFunc, signals ...os.Signa
 	return sync.OnceFunc(func() {
 		signal.Stop(sigCh)
 		close(stopCh)
-		<-done
+		// Wait for the goroutine, but bounded: it may be stuck in a log
+		// write that never completes, and this runs at the very end of the
+		// shutdown, which must not hang on it.
+		timer := time.NewTimer(shutdownSignalHandlerJoinTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+		}
 	})
 }
 
