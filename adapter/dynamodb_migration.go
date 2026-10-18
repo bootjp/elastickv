@@ -322,7 +322,7 @@ func (d *DynamoDBServer) finalizeLegacyTableMigration(ctx context.Context, schem
 	// before the schema switch can commit.
 	cleanup, ok := d.tableCleanups.reserve()
 	if !ok {
-		return ErrDynamoServerStopping
+		return errors.WithStack(ErrDynamoServerStopping)
 	}
 	defer cleanup.release()
 	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb finalize migration: begin read timestamp", dynamoTableMetaKey(schema.TableName))

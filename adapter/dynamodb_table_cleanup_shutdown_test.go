@@ -2,10 +2,13 @@ package adapter
 
 import (
 	"context"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -139,4 +142,13 @@ func TestBackgroundWorkersReservationHoldsStop(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("stop did not return once the reserved job finished")
 	}
+}
+
+// The public listener answers the stopping refusal with a retryable 503
+// ServiceUnavailable, not with the 500 an unknown error gets.
+func TestDynamoDBStoppingErrorIsServiceUnavailable(t *testing.T) {
+	rec := httptest.NewRecorder()
+	writeDynamoErrorFromErr(rec, errors.WithStack(ErrDynamoServerStopping))
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+	require.Equal(t, dynamoErrServiceUnavailable, rec.Header().Get("x-amzn-ErrorType"))
 }

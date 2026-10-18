@@ -333,9 +333,13 @@ func (d *DynamoDBServer) Stop() {
 // migration step, that would orphan a table generation once Stop has begun:
 // the generation's cleanup can no longer start, so the change is refused
 // before it commits, and the table is left as it was. The public listener
-// answers it with 503 ServiceUnavailable, which clients retry; the admin
-// surface reports it as a failed request.
-var ErrDynamoServerStopping = newDynamoAPIError(http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "server is stopping")
+// answers it with 503 ServiceUnavailable, which clients retry. It is also
+// marked as ErrAdminNotLeader, so the admin bridge answers it with the
+// not-leader response and the admin client retries against another node.
+var ErrDynamoServerStopping = errors.Mark(
+	newDynamoAPIError(http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "server is stopping"),
+	ErrAdminNotLeader,
+)
 
 // dynamoTableCleanupJoinTimeout bounds how long Stop waits, after
 // cancelling the table cleanups that outlived the shutdown bound, for them
