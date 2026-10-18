@@ -81,3 +81,36 @@ func TestSQSServerListenlessRunReturnsAfterStop(t *testing.T) {
 		t.Fatal("Run did not return after Stop")
 	}
 }
+
+// Stop runs from two places at once (the context waiter and the deferred
+// call after Run returns). A Stop that starts while the first is still
+// joining the workers must wait for them as well: returning at once lets
+// its caller close the stores under a worker that is still running.
+func TestSQSServerConcurrentStopsShareTheWorkerJoin(t *testing.T) {
+	shortenSQSWorkerStopTimeout(t, 5*time.Second)
+	s := NewSQSServer(nil, nil, nil)
+	release := make(chan struct{})
+	finished := make(chan struct{})
+	require.True(t, s.workers.start(func() {
+		<-release
+		close(finished)
+	}))
+	firstStop := make(chan struct{})
+	go func() {
+		s.Stop()
+		close(firstStop)
+	}()
+	time.Sleep(100 * time.Millisecond)
+	go func() {
+		time.Sleep(200 * time.Millisecond)
+		close(release)
+	}()
+
+	s.Stop()
+	select {
+	case <-finished:
+	default:
+		t.Fatal("a concurrent Stop returned before the worker finished")
+	}
+	<-firstStop
+}

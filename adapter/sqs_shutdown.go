@@ -2,7 +2,6 @@ package adapter
 
 import (
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -22,7 +21,13 @@ type sqsWorkers struct {
 	mu       sync.Mutex
 	stopping bool
 	wg       sync.WaitGroup
-	joined   atomic.Bool
+
+	// stopOnce fixes, on the first stop, the deadline every later or
+	// concurrent stop waits until, and starts the one goroutine that waits
+	// for the workers (done closes once they all returned).
+	stopOnce  sync.Once
+	stopUntil time.Time
+	done      chan struct{}
 }
 
 // start runs fn in a tracked goroutine and reports whether it did; it
@@ -37,31 +42,38 @@ func (w *sqsWorkers) start(fn func()) bool {
 	return true
 }
 
-// stop refuses new workers and waits up to timeout for the running ones,
-// reporting whether they all returned. Only the first call waits: Stop
-// runs twice on the normal path (from the context waiter and deferred
-// after Run returns), and the second call must not spend the bound again.
+// stop refuses new workers and waits, until timeout after the first stop,
+// for the running ones, reporting whether they all returned. Stop runs
+// twice on the normal path, from the context waiter and deferred after
+// Run returns, possibly at the same time: a call made while an earlier one
+// is still waiting waits until the same deadline (whichever returns first
+// lets its caller close the stores, so neither may return early), and one
+// made after it reports at once without spending the bound again.
 func (w *sqsWorkers) stop(timeout time.Duration) bool {
-	w.mu.Lock()
-	w.stopping = true
-	w.mu.Unlock()
-	done := make(chan struct{})
-	go func() {
-		w.wg.Wait()
-		close(done)
-	}()
-	if w.joined.Swap(true) {
+	w.stopOnce.Do(func() {
+		w.mu.Lock()
+		w.stopping = true
+		w.mu.Unlock()
+		w.stopUntil = time.Now().Add(timeout)
+		w.done = make(chan struct{})
+		go func() {
+			w.wg.Wait()
+			close(w.done)
+		}()
+	})
+	wait := time.Until(w.stopUntil)
+	if wait <= 0 {
 		select {
-		case <-done:
+		case <-w.done:
 			return true
 		default:
 			return false
 		}
 	}
-	timer := time.NewTimer(timeout)
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
-	case <-done:
+	case <-w.done:
 		return true
 	case <-timer.C:
 		return false

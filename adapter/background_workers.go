@@ -78,7 +78,8 @@ func (r *backgroundReservation) release() {
 // stop refuses new reservations, waits up to timeout for the reserved slots
 // and the running jobs, then cancels the context of any jobs that remain and
 // waits up to joinTimeout for them to return, so none is still dispatching
-// when the stores close. Only the first call waits; name labels the
+// when the stores close. A call made while an earlier one is still waiting
+// waits until the same deadlines (see inflightGate); name labels the
 // warnings it logs.
 func (w *backgroundWorkers) stop(name string, timeout, joinTimeout time.Duration) {
 	if w == nil {
