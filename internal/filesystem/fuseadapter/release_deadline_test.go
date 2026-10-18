@@ -63,3 +63,24 @@ func TestReleaseAfterReadinessBoundsTheLazyDetach(t *testing.T) {
 	require.Less(t, time.Since(start), 3*time.Second, "the lazy detach ran past the release window")
 	require.Empty(t, unmounted, "the unmount must be skipped while the readiness check is stuck")
 }
+
+// TestReleaseAbandonedSkipsUnmountPastItsDeadline: when no time is left for
+// the plain unmount (a readiness check that returned right at the
+// deadline), go-fuse's unbounded Unmount is not started at all, so it
+// cannot run on alongside the lazy detach and act, by path, on whatever
+// the detach exposed; the lazy detach still runs.
+func TestReleaseAbandonedSkipsUnmountPastItsDeadline(t *testing.T) {
+	shortenAbandonedRelease(t, time.Second, 2*time.Second)
+	mountPoint := t.TempDir()
+	useFakeDetachMountTable(t, fuseTableLine(mountPoint))
+	marker := writeRecordingMountHelper(t)
+	unmounted := make(chan struct{}, 1)
+
+	releaseAbandonedBy(time.Now().Add(-time.Millisecond), func() error {
+		unmounted <- struct{}{}
+		return nil
+	}, mountPoint, fuseTypeFor(filesystemName))
+	require.FileExists(t, marker, "the lazy detach must still run")
+	time.Sleep(50 * time.Millisecond)
+	require.Empty(t, unmounted, "the plain unmount must not start once its deadline has passed")
+}

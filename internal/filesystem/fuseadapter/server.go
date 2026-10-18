@@ -610,7 +610,7 @@ type newServerResult struct {
 // context of its own, and a hung helper would otherwise block the mount, the
 // errgroup drain and the WAL sync behind it forever. A mount that completes
 // after the caller gave up is unmounted again so no kernel mount leaks.
-func newServerContext(ctx context.Context, fs fuse.RawFileSystem, mountPoint string, opts *fuse.MountOptions) (*fuse.Server, error) {
+func newServerContext(ctx context.Context, fs *RawFileSystem, mountPoint string, opts *fuse.MountOptions) (*fuse.Server, error) {
 	results := make(chan newServerResult, 1)
 	go func() {
 		server, err := fuse.NewServer(fs, mountPoint, opts)
@@ -623,7 +623,7 @@ func newServerContext(ctx context.Context, fs fuse.RawFileSystem, mountPoint str
 		}
 		return res.server, nil
 	case <-ctx.Done():
-		go releaseAbandonedMount(results, mountPoint, fuseTypeFor(opts.Name))
+		go releaseAbandonedMount(results, fs, mountPoint, fuseTypeFor(opts.Name))
 		return nil, errors.Wrap(ctx.Err(), "filesystem FUSE mount cancelled while waiting for the mount helper")
 	}
 }
@@ -643,15 +643,20 @@ var (
 )
 
 // releaseAbandonedMount tears down a mount that completed after MountContext
-// had already given up on it. go-fuse's NewServer registers the event loop
-// with its wait group and Unmount waits for that group, but only Serve runs
-// the loop that releases it, so Serve must be running for Unmount to return;
-// the loop exits by itself once the kernel unmount closes the connection.
-func releaseAbandonedMount(results <-chan newServerResult, mountPoint, fsType string) {
+// had already given up on it. It first cancels every request the late mount
+// serves, now and later (fs is its request bridge), so a client request that
+// reached the backend before the release returns instead of running on
+// while the caller's unwinding closes the stores. go-fuse's NewServer
+// registers the event loop with its wait group and Unmount waits for that
+// group, but only Serve runs the loop that releases it, so Serve must be
+// running for Unmount to return; the loop exits by itself once the kernel
+// unmount closes the connection.
+func releaseAbandonedMount(results <-chan newServerResult, fs *RawFileSystem, mountPoint, fsType string) {
 	res := <-results
 	if res.server == nil {
 		return
 	}
+	fs.cancelInFlight()
 	go res.server.Serve()
 	releaseAbandoned(res.server.Unmount, mountPoint, fsType)
 }
@@ -667,16 +672,38 @@ func releaseAbandoned(unmount func() error, mountPoint, fsType string) {
 // abandonedDetachTimeout after unmountBy, so no kernel mount is left
 // behind; the lazy detach itself refuses a path that no longer holds a
 // mount of fsType, so an unmount that did succeed late is not followed by a
-// detach of whatever sits underneath.
+// detach of whatever sits underneath. When unmountBy has already passed,
+// unmount is not started at all: go-fuse's unmount runs without a bound,
+// and one left running beside the lazy detach could act, by path, on a
+// mount the detach exposed.
 func releaseAbandonedBy(unmountBy time.Time, unmount func() error, mountPoint, fsType string) {
+	if wait := time.Until(unmountBy); wait <= 0 {
+		slog.Warn("filesystem FUSE unmount of an abandoned mount has no time left, detaching lazily",
+			"mount_point", mountPoint,
+			"timeout", abandonedUnmountTimeout,
+		)
+	} else if !unmountWithin(wait, unmount, mountPoint) {
+		return
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), unmountBy.Add(abandonedDetachTimeout))
+	defer cancel()
+	if _, err := detachFUSEMount(ctx, mountPoint, fsType); err != nil && !errors.Is(err, errNoFUSEMount) {
+		slog.Warn("filesystem FUSE lazy detach of an abandoned mount failed", "mount_point", mountPoint, "err", err)
+	}
+}
+
+// unmountWithin runs unmount for up to wait and reports whether the mount
+// still needs the lazy detach: true when unmount failed or did not return
+// in time, false when it unmounted cleanly.
+func unmountWithin(wait time.Duration, unmount func() error, mountPoint string) bool {
 	done := make(chan error, 1)
 	go func() { done <- unmount() }()
-	timer := time.NewTimer(time.Until(unmountBy))
+	timer := time.NewTimer(wait)
 	defer timer.Stop()
 	select {
 	case err := <-done:
 		if err == nil {
-			return
+			return false
 		}
 		slog.Warn("filesystem FUSE unmount of an abandoned mount failed, detaching lazily", "mount_point", mountPoint, "err", err)
 	case <-timer.C:
@@ -685,11 +712,7 @@ func releaseAbandonedBy(unmountBy time.Time, unmount func() error, mountPoint, f
 			"timeout", abandonedUnmountTimeout,
 		)
 	}
-	ctx, cancel := context.WithDeadline(context.Background(), unmountBy.Add(abandonedDetachTimeout))
-	defer cancel()
-	if _, err := detachFUSEMount(ctx, mountPoint, fsType); err != nil && !errors.Is(err, errNoFUSEMount) {
-		slog.Warn("filesystem FUSE lazy detach of an abandoned mount failed", "mount_point", mountPoint, "err", err)
-	}
+	return true
 }
 
 func recoverIntentsBeforeMount(ctx context.Context, recoverer intentRecoverer) error {

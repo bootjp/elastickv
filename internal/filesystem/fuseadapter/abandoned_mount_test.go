@@ -16,7 +16,8 @@ import (
 // releaseAbandonedMount the way newServerContext does after a cancellation.
 // go-fuse's Unmount waits for an event loop that only Serve runs, so a
 // release that skipped Serve would never return; the mount point must also
-// be a plain directory again afterwards.
+// be a plain directory again afterwards, and a request in flight on the
+// late mount must have been cancelled.
 func TestReleaseAbandonedMountReturns(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		if os.Getenv("ELASTICKV_REQUIRE_FUSE") != "" {
@@ -30,7 +31,8 @@ func TestReleaseAbandonedMountReturns(t *testing.T) {
 	t.Cleanup(adapter.Close)
 	mountPoint := t.TempDir()
 	opts := defaultMountOptions(&fuse.MountOptions{DirectMount: os.Geteuid() == 0})
-	server, err := fuse.NewServer(NewRawFileSystem(adapter), mountPoint, opts)
+	fs := NewRawFileSystem(adapter)
+	server, err := fuse.NewServer(fs, mountPoint, opts)
 	if err != nil {
 		if os.Getenv("ELASTICKV_REQUIRE_FUSE") != "" {
 			t.Fatalf("FUSE mount unavailable: %v", err)
@@ -39,10 +41,13 @@ func TestReleaseAbandonedMountReturns(t *testing.T) {
 	}
 	results := make(chan newServerResult, 1)
 	results <- newServerResult{server: server}
+	// A request a client sent to the late mount before it is released.
+	inFlight, done := fs.requestContext(nil)
+	defer done()
 
 	released := make(chan struct{})
 	go func() {
-		releaseAbandonedMount(results, mountPoint, fuseTypeFor(opts.Name))
+		releaseAbandonedMount(results, fs, mountPoint, fuseTypeFor(opts.Name))
 		close(released)
 	}()
 	select {
@@ -50,6 +55,9 @@ func TestReleaseAbandonedMountReturns(t *testing.T) {
 	case <-time.After(15 * time.Second):
 		t.Fatal("releaseAbandonedMount did not return; Unmount is waiting for a serve loop that never ran")
 	}
+	// The release cancels the requests in flight, so a handler blocked in
+	// the backend returns before the stores behind it are closed.
+	require.Error(t, inFlight.Err(), "the release must cancel the requests in flight on the late mount")
 
 	entries, err := readMountTable(mountTablePath)
 	require.NoError(t, err)
