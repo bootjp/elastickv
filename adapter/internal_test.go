@@ -556,6 +556,10 @@ func (a *phaseDForwardAllocator) Next(context.Context) (uint64, error) {
 	return a.floor + a.next, nil
 }
 
+func (a *phaseDForwardAllocator) FreshAdmissionTimestamp(ctx context.Context) (uint64, error) {
+	return a.Next(ctx)
+}
+
 func (a *phaseDForwardAllocator) NextAfter(_ context.Context, minTS uint64) (uint64, error) {
 	a.next++
 	ts := a.floor + a.next
@@ -578,6 +582,29 @@ func (a *phaseDForwardAllocator) ValidateDurableTimestamp(_ context.Context, tim
 
 func (a *phaseDForwardAllocator) PhaseDActive() bool   { return true }
 func (a *phaseDForwardAllocator) PhaseDRequired() bool { return true }
+func (a *phaseDForwardAllocator) PhaseDFloor() uint64  { return a.floor }
+
+func TestForwardedTxnCreationWindowDoesNotBlockResolution(t *testing.T) {
+	t.Parallel()
+	const activationMs = uint64(1_700_000_000_000)
+	const closedWindowMs = uint64(26 * 60 * 60 * 1000)
+	floor := activationMs << kv.HLCLogicalBits
+	alloc := &phaseDForwardAllocator{floor: floor, next: closedWindowMs << kv.HLCLogicalBits}
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+	startTS := floor - 1
+
+	prepare := []*pb.Request{{IsTxn: true, Phase: pb.Phase_PREPARE}}
+	require.ErrorIs(t, i.validateForwardedTxnStartForPhase(context.Background(), prepare, startTS),
+		kv.ErrPrePhaseDWindowClosed)
+	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
+		resolution := []*pb.Request{{IsTxn: true, Phase: phase}}
+		require.NoError(t, i.validateForwardedTxnStartForPhase(context.Background(), resolution, startTS),
+			"old intents must remain resolvable after the creation window closes")
+	}
+	mixed := []*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}, {IsTxn: true, Phase: pb.Phase_PREPARE}}
+	require.ErrorIs(t, i.validateForwardedTxnStartForPhase(context.Background(), mixed, startTS),
+		kv.ErrPrePhaseDWindowClosed)
+}
 
 func TestStampRawTimestamps_ValidatesForwardedTimestampUnderPhaseD(t *testing.T) {
 	t.Parallel()
