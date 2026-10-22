@@ -478,28 +478,30 @@ func TestConcurrentRegisterAndObserveRace(t *testing.T) {
 	t.Parallel()
 	s, _ := newTestSampler(t, MemSamplerOptions{Step: time.Second, HistoryColumns: 8})
 	const routes = 64
+	const observers = 4
+	const rounds = 64
 	var observed atomic.Uint64
 
-	stop := make(chan struct{})
+	start := make(chan struct{})
+	var ready sync.WaitGroup
+	ready.Add(1 + observers)
 	var wg sync.WaitGroup
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		ready.Done()
+		<-start
 		for i := uint64(1); i <= routes; i++ {
 			s.RegisterRoute(i, []byte{byte('a' + i%26)}, []byte{byte('a' + (i+1)%26)}, 0)
-			time.Sleep(time.Microsecond)
 		}
 	}()
-	wg.Add(4)
-	for w := 0; w < 4; w++ {
+	wg.Add(observers)
+	for w := 0; w < observers; w++ {
 		go func() {
 			defer wg.Done()
-			for {
-				select {
-				case <-stop:
-					return
-				default:
-				}
+			ready.Done()
+			<-start
+			for range rounds {
 				for i := uint64(1); i <= routes; i++ {
 					s.Observe(i, make([]byte, 0), OpRead, 0, LabelLegacy)
 					observed.Add(1)
@@ -508,12 +510,12 @@ func TestConcurrentRegisterAndObserveRace(t *testing.T) {
 		}()
 	}
 
-	time.Sleep(20 * time.Millisecond)
-	close(stop)
+	ready.Wait()
+	close(start)
 	wg.Wait()
 
-	if observed.Load() == 0 {
-		t.Fatal("observers ran zero iterations — schedule starvation?")
+	if got, want := observed.Load(), uint64(observers*rounds*routes); got != want {
+		t.Fatalf("observer iterations = %d, want %d", got, want)
 	}
 }
 

@@ -32,7 +32,9 @@ func NewPprofServer(bearerToken string) *http.Server {
 }
 
 // PprofShutdownTask returns an errgroup task that stops the pprof server on
-// context cancellation.
+// context cancellation: a graceful drain bounded by metricsShutdownTimeout,
+// then a forced close, so a long profile request (`/debug/pprof/profile?
+// seconds=30`) cannot hold the shutdown open or turn it into a failure.
 func PprofShutdownTask(ctx context.Context, server *http.Server, address string) func() error {
 	return func() error {
 		if server == nil {
@@ -40,13 +42,7 @@ func PprofShutdownTask(ctx context.Context, server *http.Server, address string)
 		}
 		<-ctx.Done()
 		slog.Info("Shutting down pprof server", "address", address, "reason", ctx.Err())
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metricsShutdownTimeout)
-		defer cancel()
-		err := server.Shutdown(shutdownCtx)
-		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return errors.WithStack(err)
+		return ShutdownHTTPServer(ctx, server, "pprof", metricsShutdownTimeout)
 	}
 }
 

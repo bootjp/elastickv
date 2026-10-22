@@ -867,8 +867,9 @@ single-process 3-node demo cluster, attaches a learner via
 
 ### Milestone 3 — Hardening
 
-- Jepsen workload that exercises learner attach during partition and
-  promote after heal.
+- ~~Jepsen workload that exercises learner attach during partition and
+  promote after heal.~~ **Implemented** as
+  `jepsen/src/elastickv/learner_workload.clj`.
 - Monitoring: `suffrage` label on per-peer Prometheus labels (already
   exists in `monitoring/raft.go:355`; verify it survives the engine
   changes).
@@ -890,10 +891,29 @@ The shipped learner primitive includes the engine API, etcd backend learner
 handling, v2 peers-file suffrage persistence, admin RPC/CLI surface,
 join-as-learner alarm, monitoring suffrage labels, promotion precondition
 checks against leader `Progress.Match`, and the operator runbook
-(`docs/raft_learner_operations.md`). Remaining Milestone 3 hardening is not
-claimed shipped here: the learner attach/promote-under-partition Jepsen
-workload is still open, and follower-served read routing remains a separate
-proposal. The `Status.PerPeer` progress field has since landed (see §6).
+(`docs/raft_learner_operations.md`). The `Status.PerPeer` progress field has
+also landed (see §6); exposing it over the RaftAdmin RPC is a follow-up, and
+follower-served read routing remains a separate proposal. The learner
+attach/promote-under-partition Jepsen workload has landed; its checker pins
+three properties — promotion never outruns catch-up, no acknowledged write lost
+across a promotion, and a learner never counted in the voter quorum.
+
+Note on the first: catch-up is measured against the LEADER's commit index, not
+against `min-applied-index`. The engine's own test is
+`Match >= min-applied-index`, so an operator who reads the learner's current
+`Match` and passes it back satisfies it by construction — and both that broken
+call and the correct one (pick a target, wait for `Match` to reach it) end with
+`min-applied-index == Match`. That equality distinguishes nothing; only the
+leader's position does.
+
+The managed workload also accepts `--encryption`. Setup starts the reserved
+candidate with the same KEK and encryption capability flags as the voters,
+but excludes it from initial voter joins, bootstrap writer discovery, and
+initial envelope-cutover checks. The `AddLearner` membership interceptor
+registers its writer identity for both active DEKs before attachment. The
+workload then waits for both cutovers on the candidate before reporting
+attachment successful. Catch-up and promotion still use the leader's commit
+target; encryption does not change the learner reservation or quorum rules.
 
 ## 7. Risks
 
