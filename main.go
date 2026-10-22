@@ -568,6 +568,7 @@ func run() error {
 		sqsAdvertisesHTFIFO(), slog.Default())
 	cleanup.Add(leadershipRefusalDeregister)
 	eg, runCtx := errgroup.WithContext(ctx)
+	cleanup.Add(startSignalShutdown(runCtx, eg, cancel, runtimes))
 	startTSOModeReloader(runCtx, eg, tsoWiring)
 	startRaftEngineLifecycleWatchers(runCtx, eg, runtimes)
 	// setupDistributionCatalog + the Stage 7a process-start registration
@@ -3091,9 +3092,10 @@ func loadS3BlobPeerTokenFile(path string) (string, error) {
 // watcher is off by default; it is enabled only when the operator sets
 // ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB. On threshold crossing the
 // callback flips the memoryPressureExit sentinel and cancels the root
-// context, routing through the exact same shutdown path SIGTERM would
-// use (errgroup unwinds, CleanupStack runs, WAL is synced). We do NOT
-// send a signal, call os.Exit, or touch the raft engine directly here.
+// context so errgroup unwinds, CleanupStack runs, and the WAL is synced.
+// It skips the signal handler's leadership handoff to relieve pressure
+// immediately. We do NOT send a signal, call os.Exit, or touch the raft
+// engine directly here.
 func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context.CancelFunc) {
 	cfg, enabled := memwatchConfigFromEnv()
 	if !enabled {
@@ -3413,7 +3415,7 @@ func startRaftServers(
 			go func() {
 				select {
 				case <-ctx.Done():
-					srv.GracefulStop()
+					stopGRPCServer(srv, shutdownGRPCGracePeriod)
 					_ = lis.Close()
 					closeService()
 				case <-stop:

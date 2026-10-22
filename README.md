@@ -26,6 +26,20 @@ Elastickv is an experimental distributed key-value store backed by Raft. It expo
 ## Development Status
 Elastickv remains experimental. Protocol and POSIX compatibility are limited to the operations documented below. Contributions and feedback are welcome.
 
+## Graceful shutdown
+
+The production server (`go run .`) handles SIGTERM and SIGINT by transferring
+leadership of every locally led Raft group before stopping its servers and
+closing storage. Transfers run in parallel with a shared five-second deadline;
+the Raft transport stays available until they finish. Only active voting
+replicas can receive leadership; learners are excluded.
+
+If a group has no eligible successor or a transfer times out, the server logs a
+warning and continues shutdown. Followers shut down without initiating a
+transfer. gRPC requests have another five seconds to drain before remaining
+streams are closed. Set the supervisor's termination grace period longer than
+ten seconds to leave time for storage cleanup.
+
 ## Architecture
 
 Architecture diagrams are available in:
