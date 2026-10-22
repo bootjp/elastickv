@@ -210,11 +210,11 @@ func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsO
 		return PromoteVersionsResult{Done: true}, nil
 	}
 
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	state, cursor, err := s.pebblePromotionStateAndCursor(opts)
 	if err != nil {

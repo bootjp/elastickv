@@ -107,7 +107,10 @@ type DecodeOptions struct {
 // The breakdown is:
 //
 //	Total      - every snapshot entry that reached the dispatcher
-//	Tombstone  - entries whose value-header flagged a delete; skipped
+//	Superseded - older MVCC versions hidden by a newer version of the
+//	             same key; a live store's snapshot streams every
+//	             version, an encoder-produced one has none
+//	Tombstone  - keys whose newest version is a delete; skipped
 //	             before adapter dispatch
 //	DynamoDB   - entries routed to a DDBEncoder method
 //	S3         - entries routed to an S3Encoder method
@@ -121,34 +124,40 @@ type DecodeOptions struct {
 //	             so a malformed or version-skewed snapshot does not
 //	             silently round-trip into an empty dump
 //
-// Total = Tombstone + DynamoDB + S3 + Redis + SQS + Internal + Unknown.
+// Total = Superseded + Tombstone + DynamoDB + S3 + Redis + SQS +
+// Internal + Unknown.
 type DecodeCounters struct {
-	Total     uint64
-	Tombstone uint64
-	DynamoDB  uint64
-	S3        uint64
-	Redis     uint64
-	SQS       uint64
-	Internal  uint64
-	Unknown   uint64
+	Total      uint64
+	Superseded uint64
+	Tombstone  uint64
+	DynamoDB   uint64
+	S3         uint64
+	Redis      uint64
+	SQS        uint64
+	Internal   uint64
+	Unknown    uint64
 }
 
 // DecodeResult is returned by DecodeSnapshot after a successful
 // run. Header carries the snapshot's `last_commit_ts` for the
-// caller's MANIFEST.json.
+// caller's MANIFEST.json; Framing records how the input was framed,
+// including the CRC32C footer the reader verified, if any.
 type DecodeResult struct {
 	Header   SnapshotHeader
 	Counters DecodeCounters
+	Framing  SnapshotFraming
 }
 
 // ErrDecodeOptionsInvalid is returned when DecodeSnapshot is called
 // with an under-populated DecodeOptions (missing OutRoot, etc.).
 var ErrDecodeOptionsInvalid = errors.New("backup: DecodeOptions invalid")
 
-// DecodeSnapshot reads a `.fsm`-format stream from r, dispatches
-// every non-tombstone entry to the appropriate adapter encoder
-// rooted under opts.OutRoot, and runs Finalize on each enabled
-// adapter at end of stream.
+// DecodeSnapshot reads a snapshot from r in any form ReadSnapshotFile
+// accepts (a `fsm-snap/<index>.fsm` file a node persisted, an encoder-
+// produced stream, or an SST ingest bundle), keeps the newest version of
+// each key, dispatches every key whose newest version is not a delete to
+// the appropriate adapter encoder rooted under opts.OutRoot, and runs
+// Finalize on each enabled adapter at end of stream.
 //
 // Caller closes r. DecodeSnapshot does NOT write MANIFEST.json or
 // CHECKSUMS — both are emitted by the cmd/ wrapper from the returned
@@ -158,7 +167,17 @@ func DecodeSnapshot(r io.Reader, opts DecodeOptions) (DecodeResult, error) {
 	if err != nil {
 		return DecodeResult{}, err
 	}
-	hdr, err := ReadSnapshotWithHeader(r, func(_ SnapshotHeader, e SnapshotEntry) error {
+	var versions latestVersionFilter
+	hdr, framing, err := ReadSnapshotFile(r, func(_ SnapshotHeader, e SnapshotEntry) error {
+		newest, err := versions.keep(e)
+		if err != nil {
+			return err
+		}
+		if !newest {
+			d.counters.Total++
+			d.counters.Superseded++
+			return nil
+		}
 		return d.handleEntry(e)
 	})
 	// finalize() runs unconditionally so encoders (notably the S3
@@ -174,7 +193,7 @@ func DecodeSnapshot(r io.Reader, opts DecodeOptions) (DecodeResult, error) {
 	if err != nil {
 		return DecodeResult{}, err
 	}
-	return DecodeResult{Header: hdr, Counters: d.counters}, nil
+	return DecodeResult{Header: hdr, Counters: d.counters, Framing: framing}, nil
 }
 
 // dispatcher is the in-memory state carried across the ReadSnapshot
@@ -271,10 +290,10 @@ func newS3DecodeEncoder(opts DecodeOptions) (*S3Encoder, error) {
 		WithWarnSink(opts.WarnSink), nil
 }
 
-// handleEntry is the per-entry hook ReadSnapshot calls. Tombstones
-// are counted and dropped before any prefix matching runs — Phase 0a
-// dumps reflect the *current* user-visible state, not the
-// crash-consistent MVCC tombstone fan.
+// handleEntry is the per-key hook DecodeSnapshot calls with each key's
+// newest version. Tombstones are counted and dropped before any prefix
+// matching runs — Phase 0a dumps reflect the *current* user-visible
+// state, not the crash-consistent MVCC tombstone fan.
 func (d *dispatcher) handleEntry(e SnapshotEntry) error {
 	d.counters.Total++
 	if e.Tombstone {

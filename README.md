@@ -38,6 +38,7 @@ Deployment/runbook documents:
 - `docs/etcd_raft_migration_operations.md` (offline HashiCorp-to-etcd cutover runbook and verification checklist)
 - `docs/redis-proxy-deployment.md` (Redis-protocol reverse proxy for zero-downtime Redis-to-Elastickv migration)
 - `docs/operations/backup_restore.md` and `docs/operations/snapshot_restore.md` (backup and restore procedures)
+- `docs/filesystem.md` (enabling, mounting, and operating the FUSE filesystem)
 - `docs/centralized_tso_operations.md` and `docs/raft_learner_operations.md` (timestamp oracle and cluster membership operations)
 
 Design documents:
@@ -219,9 +220,9 @@ printf 'hello\n' > /tmp/elastickv-mount/docs/hello.txt
 cat /tmp/elastickv-mount/docs/hello.txt
 ```
 
-The root owner and mode flags apply when the filesystem root is first created; the defaults are UID/GID `0` and mode `0755`. `--filesystemClientID` defaults to `--raftId` and identifies open-handle leases. `--filesystemCapacity` and `--filesystemMaxFiles` set values reported by `statfs`; they do not enforce write quotas. The server unmounts the filesystem during shutdown.
+The root owner and mode flags apply when the filesystem root is first created; the defaults are UID/GID `0` and mode `0755`, and the mount enforces `default_permissions`, so set them to the user that will write to the mount. `--filesystemClientID` defaults to `--raftId` and identifies open-handle leases. `--filesystemCapacity` and `--filesystemMaxFiles` set values reported by `statfs`; they do not enforce write quotas. The server mounts through `fusermount3` (package `fuse3`) after its network listeners are up. Stopping the process with a signal leaves the mount attached in a `Transport endpoint is not connected` state; run `fusermount3 -uz <mount-point>` before restarting.
 
-This FUSE implementation supports regular files and directories, but not cross-directory rename, hard links, symbolic links, extended attributes, or full POSIX locking. See the [filesystem design](docs/design/2026_02_24_implemented_filesystem_on_elastickv.md) for the supported operations and placement model.
+This FUSE implementation supports regular files and directories, but not cross-directory rename, hard links, symbolic links, extended attributes, or full POSIX locking. Concurrent modifications from different mounts are resolved optimistically: the loser gets `EAGAIN`. Most operations can simply be retried, but `close` must not be, and an `O_APPEND` write that other mounts may also be appending to must not be either; the guide's Concurrency section has the per-operation rules. See the [FUSE filesystem guide](docs/filesystem.md) for prerequisites, multi-node setup, semantics, monitoring, and troubleshooting, and the [filesystem design](docs/design/2026_02_24_implemented_filesystem_on_elastickv.md) for the supported operations and placement model.
 
 ### Working with Redis
 To start the Redis client:
@@ -424,6 +425,38 @@ injects random network partitions. Jepsen's linearizability checker verifies the
 history.
 
 
+
+The filesystem workload drives the FUSE mounts directly. Start a cluster with
+`--filesystemMount` on every node (as `scripts/run-jepsen-local.sh` does), then
+run it in `--local` mode, which checks linearizability without injecting any
+faults (the partition/kill nemesis only applies to SSH-managed runs without
+`--local`):
+
+```bash
+cd jepsen && ~/lein run -m elastickv.filesystem-workload --local \
+  --time-limit 20 --rate 5 --concurrency 6 --write-mode rename \
+  --mount-dirs /tmp/elastickv-test-run/fs-n1,/tmp/elastickv-test-run/fs-n2,/tmp/elastickv-test-run/fs-n3
+```
+
+To run the same workloads against a data-at-rest encrypted cluster, pass
+`--encrypted` to the local runner. It generates a random file KEK under the
+run's data directory, starts every node with `--encryption-enabled --kekFile
+--encryptionSidecarPath`, and drives the bootstrap → `enable-storage-envelope`
+→ `enable-raft-envelope` cutover through `scripts/jepsen-enable-encryption.sh`
+before the first workload starts (the per-push CI job runs both legs):
+
+```bash
+./scripts/run-jepsen-local.sh --encrypted
+```
+
+`--write-mode overwrite` replaces each register with one in-place `pwrite`;
+`--write-mode rename` writes a temp file and renames it over the key. After the
+main phase every mount reads every register once more with the writers stopped
+(`--concurrency` must be a multiple of `--threads-per-key` and at least the
+node count); a final read that still finds its register missing, truncated or
+unparseable is recorded
+as an observed data-loss value rather than a failed operation, so the checker
+reports the lost write instead of ignoring the read.
 
 ### Setup pre-commit hooks
 ```bash

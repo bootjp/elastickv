@@ -14,7 +14,11 @@ func TestSnapshotIndexFromPath(t *testing.T) {
 		wantIdx uint64
 		wantErr bool
 	}{
-		{"live-writer zero-padded", "/data/fsm-snap/0000000000000064.fsm", 64, false},
+		// The Raft engine names every file %016x (fsmSnapPath in
+		// internal/raftengine/etcd), so a 16-character stem is hex.
+		{"live-writer name", "/data/fsm-snap/0000000000000040.fsm", 64, false},
+		{"live-writer name with hex letters", "000000000001e240.fsm", 123456, false},
+		{"live-writer name is not decimal", "0000000000000064.fsm", 100, false},
 		{"unpadded hand-rolled", "42.fsm", 42, false},
 		{"max uint64", "18446744073709551615.fsm", 18446744073709551615, false},
 		{"missing .fsm suffix", "snapshot.bin", 0, true},
