@@ -63,13 +63,29 @@ func shutdownOnSignal(ctx context.Context, cancel context.CancelFunc, runtimes [
 }
 
 func transferLeadershipOnShutdown(ctx context.Context, runtimes []*raftGroupRuntime) {
+	ticker := time.NewTicker(shutdownTransferRetryDelay)
+	defer ticker.Stop()
+	for ctx.Err() == nil && transferShutdownLeaderRound(ctx, runtimes) {
+		// Revisit followers after each round: they may have acquired a new
+		// leadership while another group's handoff was still running.
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+	}
+}
+
+func transferShutdownLeaderRound(ctx context.Context, runtimes []*raftGroupRuntime) bool {
 	var transfers sync.WaitGroup
+	foundLeader := false
 	for _, rt := range runtimes {
 		engine := rt.snapshotEngine()
 		admin, ok := engine.(shutdownLeadershipController)
 		if !ok || admin.State() != raftengine.StateLeader {
 			continue
 		}
+		foundLeader = true
 		transfers.Go(func() {
 			slog.Info("transferring leadership before shutdown", "group", rt.spec.id)
 			if err := transferGroupLeadershipOnShutdown(ctx, admin); err != nil {
@@ -82,6 +98,7 @@ func transferLeadershipOnShutdown(ctx context.Context, runtimes []*raftGroupRunt
 	// All groups share one deadline, so an unavailable group does not delay
 	// healthy groups or multiply the shutdown budget by the shard count.
 	transfers.Wait()
+	return foundLeader
 }
 
 func transferGroupLeadershipOnShutdown(ctx context.Context, admin shutdownLeadershipController) error {

@@ -22,12 +22,17 @@ import (
 
 type shutdownEngineStub struct {
 	raftengine.Engine
-	state    raftengine.State
+	leader   atomic.Bool
 	servers  []raftengine.Server
 	transfer func(context.Context, []raftengine.TransferTarget, uint64) error
 }
 
-func (e *shutdownEngineStub) State() raftengine.State { return e.state }
+func (e *shutdownEngineStub) State() raftengine.State {
+	if e.leader.Load() {
+		return raftengine.StateLeader
+	}
+	return raftengine.StateFollower
+}
 func (e *shutdownEngineStub) Leader() raftengine.LeaderInfo {
 	return raftengine.LeaderInfo{ID: "local"}
 }
@@ -35,12 +40,15 @@ func (e *shutdownEngineStub) Configuration(context.Context) (raftengine.Configur
 	return raftengine.Configuration{Servers: e.servers}, nil
 }
 func (e *shutdownEngineStub) TransferLeadershipToServerIfEligible(ctx context.Context, candidates []raftengine.TransferTarget, maxLag uint64) error {
-	return e.transfer(ctx, candidates, maxLag)
+	err := e.transfer(ctx, candidates, maxLag)
+	if err == nil || errors.Is(err, raftengine.ErrNotLeader) {
+		e.leader.Store(false)
+	}
+	return err
 }
 
 func shutdownTestEngine(transfer func(context.Context, []raftengine.TransferTarget, uint64) error) *shutdownEngineStub {
-	return &shutdownEngineStub{
-		state: raftengine.StateLeader,
+	engine := &shutdownEngineStub{
 		servers: []raftengine.Server{
 			{ID: "local", Address: "local:1", Suffrage: "voter"},
 			{ID: "learner", Address: "learner:1", Suffrage: "learner"},
@@ -48,6 +56,8 @@ func shutdownTestEngine(transfer func(context.Context, []raftengine.TransferTarg
 		},
 		transfer: transfer,
 	}
+	engine.leader.Store(true)
+	return engine
 }
 
 func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
@@ -67,7 +77,7 @@ func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
 		t.Error("a follower must not initiate transfer")
 		return nil
 	})
-	follower.state = raftengine.StateFollower
+	follower.leader.Store(false)
 	runtimes := []*raftGroupRuntime{
 		nil,
 		{},
@@ -80,6 +90,34 @@ func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
 	shutdownOnSignal(ctx, cancel, runtimes, signals, time.Second)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.Equal(t, int32(2), calls.Load())
+}
+
+func TestShutdownSignalTransfersLeadershipAcquiredDuringHandoff(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var followerTransfers atomic.Int32
+	follower := shutdownTestEngine(func(context.Context, []raftengine.TransferTarget, uint64) error {
+		require.NoError(t, ctx.Err(), "newly acquired leadership must transfer before server cancellation")
+		followerTransfers.Add(1)
+		return nil
+	})
+	follower.leader.Store(false)
+	leader := shutdownTestEngine(func(context.Context, []raftengine.TransferTarget, uint64) error {
+		// The first runtime was already observed as a follower when this
+		// group's transfer causes it to acquire leadership.
+		follower.leader.Store(true)
+		return nil
+	})
+	signals := make(chan os.Signal, 1)
+	signals <- syscall.SIGTERM
+	shutdownOnSignal(ctx, cancel, []*raftGroupRuntime{
+		{spec: groupSpec{id: 1}, engine: follower},
+		{spec: groupSpec{id: 2}, engine: leader},
+	}, signals, time.Second)
+	require.Equal(t, int32(1), followerTransfers.Load())
+	require.Equal(t, raftengine.StateFollower, follower.State())
+	require.ErrorIs(t, ctx.Err(), context.Canceled)
 }
 
 func TestShutdownSignalSharesDeadlineAcrossGroups(t *testing.T) {
