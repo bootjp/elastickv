@@ -12,10 +12,20 @@ import (
 
 const maxEncryptionSnapshotGapAttempts = 3
 
-func verifySidecarGapWithSnapshot(engine encryptionGapEngine, sc *encryption.Sidecar) error {
+func verifySidecarGapWithSnapshot(engine encryptionGapEngine, sidecarPath string, sc *encryption.Sidecar) error {
 	var previousStart uint64
 	var scanErr error
-	for range maxEncryptionSnapshotGapAttempts {
+	for attempt := range maxEncryptionSnapshotGapAttempts {
+		if attempt > 0 {
+			fresh, err := encryption.ReadSidecar(sidecarPath)
+			if err != nil {
+				return errors.Wrap(err, "encryption startup guard: reload sidecar after compaction")
+			}
+			if fresh.RaftAppliedIndex < sc.RaftAppliedIndex {
+				return errors.Wrap(encryption.ErrSidecarBehindRaftLog, "sidecar index regressed during gap verification")
+			}
+			sc = fresh
+		}
 		start, err := sidecarGapStartFromSnapshot(engine, sc)
 		if err != nil {
 			return err

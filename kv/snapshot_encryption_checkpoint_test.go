@@ -3,6 +3,8 @@ package kv
 import (
 	"bufio"
 	"bytes"
+	"encoding/binary"
+	"io"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -76,6 +78,23 @@ func TestEncryptionSnapshotCheckpointRejectsTruncationWithoutMutation(t *testing
 	before := fsm.encryptionCheckpoint
 	require.Error(t, fsm.RestoreSnapshotHeader(bytes.NewReader(payload.Bytes()[:snapshotCheckpointHeaderLen-1])))
 	require.Equal(t, before, fsm.encryptionCheckpoint)
+}
+
+func TestEncryptionCheckpointAllowsTrailingV2Extensions(t *testing.T) {
+	cp := encryption.SnapshotCheckpoint{Index: 6, State: [32]byte{1, 2, 3}}
+	header := &kvFSMSnapshot{useV2: true, checkpoint: cp}
+	encoded, size := header.encodeHeader()
+	const extension = "FUTURE01"
+	payload := append(bytes.Clone(encoded[:size]), extension...)
+	binary.BigEndian.PutUint16(payload[8:10], uint16(hlcSnapshotV2MinPayload+encryptionCheckpointBytes+len(extension)))
+	body := []byte("unchanged physical snapshot body")
+	reader := bufio.NewReader(bytes.NewReader(append(payload, body...)))
+	_, _, got, err := ReadSnapshotHeaderWithCheckpoint(reader)
+	require.NoError(t, err)
+	require.Equal(t, cp, got)
+	remaining, err := io.ReadAll(reader)
+	require.NoError(t, err)
+	require.Equal(t, body, remaining)
 }
 
 type durableCheckpointFixture struct {

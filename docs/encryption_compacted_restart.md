@@ -55,6 +55,10 @@ must advance, and at most three scans are attempted. Absent or inconsistent
 proof, CRC/authentication errors, a nonadvancing snapshot, or continuous
 compaction past that bound still refuse startup. No compacted history is
 treated as harmless merely because a scan was overtaken.
+Each retry rereads the sidecar because the running Raft apply loop may have
+completed a legitimate rotation in the meantime. A regressing sidecar index
+or read failure refuses startup; refreshed metadata does not authorize an
+epoch reset or bypass the snapshot witness comparison.
 
 The membership/collision, pre-bump epoch rollback, post-replay epoch rollback,
 writer-registration, and physical snapshot recovery paths remain enabled.
@@ -70,6 +74,9 @@ Mixed-version native physical snapshot transfer to an older follower is not
 supported by this change: upgrade the receiving follower before allowing it
 to install a snapshot produced by this version. Do not delete the checkpoint
 record or bypass snapshot, sidecar, or epoch checks to enable a downgrade.
+The complete checkpoint may be followed by future v2 header extensions;
+readers consume those extra header bytes without treating them as body data.
+An incomplete known checkpoint still fails parsing.
 
 An old snapshot without a witness does **not** authorize skipping compacted
 history. Such a node can still refuse startup and needs an independently
@@ -111,6 +118,6 @@ The no-gap fast path keeps the original sidecar index rather than advancing
 it. Its sole production caller still invokes the pure gap guard afterward;
 the engine's full-restore and header-only-skip CRC checks are unchanged.
 The snapshot-gap retry helper has one production caller, the startup guard.
-Each retry recomputes the gap from the unchanged sidecar and a freshly verified
+Each retry recomputes the gap from a freshly read sidecar and a freshly verified
 installed snapshot; only the typed suffix-compaction error is retried. The
 pure guard and all its other callers retain their original semantics.

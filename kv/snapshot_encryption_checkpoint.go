@@ -21,7 +21,7 @@ func decodeSnapshotCheckpoint(payload []byte) (encryption.SnapshotCheckpoint, er
 		!bytes.Equal(payload[hlcSnapshotV2MinPayload:hlcSnapshotV2MinPayload+len(encryptionCheckpointMagic)], encryptionCheckpointMagic) {
 		return checkpoint, nil
 	}
-	if len(payload) != hlcSnapshotV2MinPayload+encryptionCheckpointBytes {
+	if len(payload) < hlcSnapshotV2MinPayload+encryptionCheckpointBytes {
 		return checkpoint, errors.New("snapshot encryption checkpoint: invalid length")
 	}
 	checkpoint.Index = binary.BigEndian.Uint64(payload[24:32])
