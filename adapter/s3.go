@@ -241,6 +241,11 @@ type s3BucketEntry struct {
 	CreationDate string `xml:"CreationDate"`
 }
 
+type s3VersioningConfiguration struct {
+	XMLName xml.Name `xml:"VersioningConfiguration"`
+	XMLNS   string   `xml:"xmlns,attr,omitempty"`
+}
+
 type s3AccessControlPolicy struct {
 	XMLName           xml.Name            `xml:"AccessControlPolicy"`
 	XMLNS             string              `xml:"xmlns,attr,omitempty"`
@@ -550,6 +555,14 @@ func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 //nolint:cyclop // handleBucket routes to sub-handlers based on method+query; branching is by design.
 func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	query := r.URL.Query()
+	if query.Has("versioning") {
+		if r.Method == http.MethodGet {
+			s.getBucketVersioning(w, r, bucket)
+		} else {
+			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method", bucket, "")
+		}
+		return
+	}
 	if query.Has("acl") {
 		switch r.Method {
 		case http.MethodGet:
@@ -745,6 +758,25 @@ func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *S3Server) getBucketVersioning(w http.ResponseWriter, r *http.Request, bucket string) {
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	_, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		return
+	}
+	// The bundled endpoint does not implement object versions. An empty
+	// VersioningConfiguration is the S3 response for an unversioned bucket.
+	writeS3XML(w, http.StatusOK, s3VersioningConfiguration{XMLNS: s3XMLNamespace})
 }
 
 func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -1187,46 +1219,12 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 	var cleanupManifest *s3ObjectManifest
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
+		manifest, objectGeneration, err := s.deleteObjectAttempt(r, bucket, objectKey)
 		if err != nil {
-			return errors.Wrap(err, "s3: allocate startTS for mutation")
-		}
-		readTS = readTimestamp.Timestamp()
-		startTS := readTS
-		readPin := s.pinReadTS(readTS)
-		defer readPin.Release()
-
-		meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !exists || meta == nil {
-			return &s3ResponseError{
-				Status:  http.StatusNotFound,
-				Code:    "NoSuchBucket",
-				Message: "bucket not found",
-				Bucket:  bucket,
-				Key:     objectKey,
-			}
-		}
-
-		headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
-		manifest, found, err := s.loadObjectManifestAt(r.Context(), headKey, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !found {
-			cleanupManifest = nil
-			return validateS3AbsentObjectDelete(r, bucket, objectKey)
-		}
-		if err := s.dispatchConditionalObjectDelete(
-			r, readTimestamp, startTS, headKey, manifest, bucket, objectKey,
-		); err != nil {
 			return err
 		}
 		cleanupManifest = manifest
-		generation = meta.Generation
+		generation = objectGeneration
 		return nil
 	})
 	if err != nil {
@@ -1237,6 +1235,46 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, cleanupManifest)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *S3Server) deleteObjectAttempt(
+	r *http.Request, bucket string, objectKey string,
+) (*s3ObjectManifest, uint64, error) {
+	readTS := s.readTS()
+	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "s3: allocate startTS for mutation")
+	}
+	readTS = readTimestamp.Timestamp()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	if !exists || meta == nil {
+		return nil, 0, &s3ResponseError{
+			Status:  http.StatusNotFound,
+			Code:    "NoSuchBucket",
+			Message: "bucket not found",
+			Bucket:  bucket,
+			Key:     objectKey,
+		}
+	}
+
+	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
+	manifest, found, err := s.loadObjectManifestAt(r.Context(), headKey, readTS)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	if !found {
+		return nil, meta.Generation, validateS3AbsentObjectDelete(r, bucket, objectKey)
+	}
+	if err := s.dispatchConditionalObjectDelete(r, readTimestamp, readTS, headKey, manifest, bucket, objectKey); err != nil {
+		return nil, 0, err
+	}
+	return manifest, meta.Generation, nil
 }
 
 func validateS3AbsentObjectDelete(r *http.Request, bucket, objectKey string) error {
@@ -2612,6 +2650,9 @@ func isReadOnlyS3Request(r *http.Request) bool {
 // isReadOnlyBucketOp returns true for bucket-level read-only operations
 // (HeadBucket, ListObjectsV2).
 func isReadOnlyBucketOp(method string, q url.Values) bool {
+	if q.Has("versioning") {
+		return false
+	}
 	switch method {
 	case http.MethodHead:
 		// HeadBucket: no query params (or only "location").
@@ -2663,7 +2704,7 @@ func validateS3PutPreconditions(ifMatch, ifNoneMatch string, previous *s3ObjectM
 		return errors.New("object already exists")
 	}
 	if ifMatch != "" {
-		if previous == nil || strings.Trim(ifMatch, `"`) != previous.ETag {
+		if previous == nil || (ifMatch != "*" && strings.Trim(ifMatch, `"`) != previous.ETag) {
 			return errors.New("etag precondition failed")
 		}
 	}

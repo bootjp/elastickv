@@ -22,6 +22,14 @@ var (
 	ErrIntegrity      = errors.New("snapshot offload: integrity check failed")
 	ErrObjectConflict = errors.New("snapshot offload: object conflict")
 	ErrObjectNotFound = errors.New("snapshot offload: object not found")
+	ErrObjectClaimed  = errors.New("snapshot offload: object claimed by another operation")
+
+	// ErrObjectModified is returned by DeleteObjectIfUnmodified when
+	// the object changed after the caller validated it. For retention
+	// this is not a failure: it means a concurrent publish changed the
+	// target object, so the correct response is to leave it alone. The
+	// target may be either a payload or a manifest.
+	ErrObjectModified = errors.New("snapshot offload: object modified since validation")
 
 	// ErrNoPersistedSnapshot reports that the LOCAL data dir has no
 	// persisted snapshot yet. It is deliberately distinct from
@@ -118,6 +126,8 @@ func validateManifestIdentity(manifest Manifest) error {
 		return errors.Wrapf(ErrInvalidOptions, "unsupported manifest schema version %d", manifest.SchemaVersion)
 	case manifest.GroupID == 0 && strings.TrimSpace(manifest.SourceCluster) == "":
 		return errors.Wrap(ErrInvalidOptions, "source cluster is required for group 0 manifests")
+	case manifest.CreatedAt.IsZero():
+		return errors.Wrap(ErrInvalidOptions, "manifest creation time is required")
 	case manifest.SnapshotIndex == 0:
 		return errors.Wrap(ErrInvalidOptions, "snapshot index must be > 0")
 	case manifest.SnapshotTerm == 0:

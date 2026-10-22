@@ -97,7 +97,7 @@ func (d *DynamoDBServer) startLegacyTableKeyMigration(
 	}
 	req.StartTS = readTS
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err != nil {
+	if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -186,7 +186,7 @@ func (d *DynamoDBServer) migrateLegacyItem(
 		req.StartTS = readTS
 		req.ReadKeys = append(req.ReadKeys, sealKey)
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
+		if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err == nil {
 			return nil
 		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
@@ -338,7 +338,7 @@ func (d *DynamoDBServer) finalizeLegacyTableMigration(ctx context.Context, schem
 		},
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err != nil {
+	if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err != nil {
 		return errors.WithStack(err)
 	}
 	d.launchDeletedTableCleanup(cleanup, schema.TableName, oldGeneration)
