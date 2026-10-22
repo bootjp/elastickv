@@ -122,6 +122,7 @@ type DynamoDBServer struct {
 	store           store.MVCCStore
 	coordinator     kv.Coordinator
 	httpServer      *http.Server
+	httpConns       *httpConnTracker
 	targetHandlers  map[string]func(http.ResponseWriter, *http.Request)
 	readTracker     *kv.ActiveTimestampTracker
 	requestObserver monitoring.DynamoDBRequestObserver
@@ -295,6 +296,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.handle)
 	d.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	d.httpConns = trackHTTPConns(d.httpServer)
 	for _, opt := range opts {
 		if opt != nil {
 			opt(d)
@@ -324,7 +326,7 @@ func (d *DynamoDBServer) Run() error {
 // with ErrDynamoServerStopping.
 func (d *DynamoDBServer) Stop() {
 	if d.httpServer != nil {
-		shutdownHTTPServer(d.httpServer, "dynamodb")
+		shutdownHTTPServer(d.httpServer, d.httpConns, "dynamodb")
 	}
 	d.tableCleanups.stop("dynamodb server", httpShutdownTimeout, dynamoTableCleanupJoinTimeout)
 }

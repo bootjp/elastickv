@@ -349,3 +349,109 @@ func TestS3ServerStopGivesUpOnUnclosedAdminReadAfterBound(t *testing.T) {
 	require.Less(t, elapsed, 3*time.Second, "Stop must not wait on a body nobody closes")
 	require.True(t, cluster.closed.Load())
 }
+
+func shortenHTTPHandlerJoinTimeout(t *testing.T, d time.Duration) {
+	t.Helper()
+	old := httpHandlerJoinTimeout
+	httpHandlerJoinTimeout = d
+	t.Cleanup(func() { httpHandlerJoinTimeout = old })
+}
+
+// slowUnwindingHandler stands for a handler still inside a store call when
+// the server forces its connection closed: it notices the cancellation but
+// takes unwind longer to return, or never returns while release
+// stays open.
+func slowUnwindingHandler(started chan<- struct{}, unwind time.Duration, release <-chan struct{}, finished *atomic.Bool) http.Handler {
+	return http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
+		select {
+		case started <- struct{}{}:
+		default:
+		}
+		<-r.Context().Done()
+		time.Sleep(unwind)
+		<-release
+		finished.Store(true)
+	})
+}
+
+// startStalledRequest sends one request the handler will not finish and
+// waits until the handler runs.
+func startStalledRequest(t *testing.T, lis net.Listener, started <-chan struct{}) {
+	t.Helper()
+	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", lis.Addr().String())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
+	require.NoError(t, err)
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handler did not start")
+	}
+}
+
+// TestHTTPAdapterStopJoinsHandlerAfterForcedClose pins that Stop does not
+// return while a handler is still running on a connection the bound forced
+// closed: http.Server.Close does not wait for handlers, so the caller would
+// otherwise close the stores under a handler still unwinding out of a store
+// call.
+func TestHTTPAdapterStopJoinsHandlerAfterForcedClose(t *testing.T) {
+	shortenHTTPShutdownTimeout(t, 100*time.Millisecond)
+	shortenHTTPHandlerJoinTimeout(t, 5*time.Second)
+	for _, tc := range httpAdaptersUnderTest() {
+		t.Run(tc.name, func(t *testing.T) {
+			lis := listenLoopback(t)
+			srv, run, stop := tc.build(t, lis)
+			started := make(chan struct{}, 1)
+			release := make(chan struct{})
+			close(release)
+			var finished atomic.Bool
+			srv.Handler = slowUnwindingHandler(started, 300*time.Millisecond, release, &finished)
+			runDone := make(chan error, 1)
+			go func() { runDone <- run() }()
+			startStalledRequest(t, lis, started)
+
+			stop()
+			require.True(t, finished.Load(), "Stop returned while the handler on the closed connection was still running")
+			select {
+			case err := <-runDone:
+				require.NoError(t, err)
+			case <-time.After(5 * time.Second):
+				t.Fatal("Run did not return after Stop")
+			}
+		})
+	}
+}
+
+// A handler that never returns holds Stop for the join bound only.
+func TestHTTPAdapterStopBoundsJoinOfHandlerIgnoringClose(t *testing.T) {
+	shortenHTTPShutdownTimeout(t, 100*time.Millisecond)
+	shortenHTTPHandlerJoinTimeout(t, 400*time.Millisecond)
+	lis := listenLoopback(t)
+	srv, run, stop := httpAdaptersUnderTest()[0].build(t, lis)
+	started := make(chan struct{}, 1)
+	release := make(chan struct{})
+	t.Cleanup(func() { close(release) })
+	var finished atomic.Bool
+	srv.Handler = slowUnwindingHandler(started, 0, release, &finished)
+	runDone := make(chan error, 1)
+	go func() { runDone <- run() }()
+	startStalledRequest(t, lis, started)
+
+	start := time.Now()
+	stop()
+	elapsed := time.Since(start)
+	require.GreaterOrEqual(t, elapsed, 400*time.Millisecond, "the handler must be given the join bound")
+	require.Less(t, elapsed, 3*time.Second, "Stop must not wait on a handler that never returns")
+	require.False(t, finished.Load())
+
+	start = time.Now()
+	stop()
+	require.Less(t, time.Since(start), 50*time.Millisecond, "second Stop must not wait the join bound again")
+	select {
+	case err := <-runDone:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("Run did not return after Stop")
+	}
+}

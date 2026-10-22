@@ -153,6 +153,7 @@ type SQSServer struct {
 	store          store.MVCCStore
 	coordinator    kv.Coordinator
 	httpServer     *http.Server
+	httpConns      *httpConnTracker
 	targetHandlers map[string]func(http.ResponseWriter, *http.Request)
 	leaderSQS      map[string]string
 	region         string
@@ -454,6 +455,7 @@ func NewSQSServer(listen net.Listener, st store.MVCCStore, coordinate kv.Coordin
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
 	s.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	s.httpConns = trackHTTPConns(s.httpServer)
 	for _, opt := range opts {
 		if opt != nil {
 			opt(s)
@@ -498,7 +500,7 @@ func (s *SQSServer) Stop() {
 		// deployments. With a listener, shutdownHTTPServer drains
 		// in-flight requests for at most httpShutdownTimeout and then
 		// closes whatever is still connected.
-		shutdownHTTPServer(s.httpServer, "sqs")
+		shutdownHTTPServer(s.httpServer, s.httpConns, "sqs")
 	}
 	// The reaper and the bucket sweep observe the cancelled reaperCtx,
 	// but a reaper pass can still be inside a store scan or a Raft

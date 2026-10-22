@@ -108,6 +108,7 @@ type S3Server struct {
 	staticCreds          map[string]string
 	readTracker          *kv.ActiveTimestampTracker
 	httpServer           *http.Server
+	httpConns            *httpConnTracker
 	cleanupSem           chan struct{}
 	putAdmission         *s3PutAdmission
 	putAdmissionObserver S3PutAdmissionObserver
@@ -399,6 +400,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
 	s.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	s.httpConns = trackHTTPConns(s.httpServer)
 	return s
 }
 
@@ -441,7 +443,7 @@ func (s *S3Server) Stop() {
 		s.blobBackfiller.Stop()
 	}
 	if s.httpServer != nil {
-		shutdownHTTPServer(s.httpServer, "s3")
+		shutdownHTTPServer(s.httpServer, s.httpConns, "s3")
 	}
 	deadline := time.Now().Add(httpShutdownTimeout)
 	if !s.adminBlobUsers.drain(time.Until(deadline)) {
