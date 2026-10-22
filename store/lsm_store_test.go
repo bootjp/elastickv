@@ -76,59 +76,6 @@ func (c *cancelAfterErrCallsContext) Err() error {
 	return nil
 }
 
-func TestPebbleStore_Basic(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-	key := []byte("key1")
-
-	// Put at TS 10
-	err = s.PutAt(ctx, key, []byte("val10"), 10, 0)
-	require.NoError(t, err)
-
-	// Get at TS 10
-	val, err := s.GetAt(ctx, key, 10)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("val10"), val)
-
-	// Get at TS 5 (should be not found)
-	_, err = s.GetAt(ctx, key, 5)
-	assert.Equal(t, ErrKeyNotFound, err)
-
-	// Put at TS 20
-	err = s.PutAt(ctx, key, []byte("val20"), 20, 0)
-	require.NoError(t, err)
-
-	// Get at TS 20 -> val20
-	val, err = s.GetAt(ctx, key, 20)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("val20"), val)
-
-	// Get at TS 15 -> val10 (latest <= 15)
-	val, err = s.GetAt(ctx, key, 15)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("val10"), val)
-
-	// Delete at TS 30
-	err = s.DeleteAt(ctx, key, 30)
-	require.NoError(t, err)
-
-	// Get at TS 35 -> NotFound (Tombstone)
-	_, err = s.GetAt(ctx, key, 35)
-	assert.Equal(t, ErrKeyNotFound, err)
-
-	// Get at TS 25 -> val20
-	val, err = s.GetAt(ctx, key, 25)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("val20"), val)
-}
-
 func TestPebbleStore_LastCommitTSPersistedAcrossRestart(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-last-ts-test")
 	require.NoError(t, err)
@@ -371,79 +318,6 @@ func TestPebbleStore_MinRetainedTSPersistedAcrossRestart(t *testing.T) {
 	require.ErrorIs(t, err, ErrReadTSCompacted)
 }
 
-func TestPebbleStore_ReadTSCompacted(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-read-ts-compacted-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-	require.NoError(t, s.PutAt(ctx, []byte("k"), []byte("v10"), 10, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k"), []byte("v20"), 20, 0))
-
-	requirePebbleRetentionController(t, s).SetMinRetainedTS(15)
-
-	_, err = s.GetAt(ctx, []byte("k"), 10)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
-
-	_, err = s.ScanAt(ctx, []byte(""), nil, 10, 10)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
-
-	_, err = s.ReverseScanAt(ctx, []byte(""), nil, 10, 10)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
-
-	val, err := s.GetAt(ctx, []byte("k"), 20)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v20"), val)
-}
-
-func TestPebbleStore_Scan(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-scan-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	// k2: v10@10
-	// k1: v10@11 (aligned), v20@20
-	// k3: v30@30
-	require.NoError(t, s.PutAt(ctx, []byte("k2"), []byte("v10"), 10, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v10"), 10, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v20"), 20, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k3"), []byte("v30"), 30, 0))
-
-	// Scan at TS 25
-	// Expect: k1=v20, k2=v10 (k3 is at 30, so invisible)
-	pairs, err := s.ScanAt(ctx, []byte("k"), nil, 10, 25)
-	require.NoError(t, err)
-	assert.Len(t, pairs, 2)
-	assert.Equal(t, []byte("k1"), pairs[0].Key)
-	assert.Equal(t, []byte("v20"), pairs[0].Value)
-	assert.Equal(t, []byte("k2"), pairs[1].Key)
-	assert.Equal(t, []byte("v10"), pairs[1].Value)
-
-	// Scan at TS 15
-	// Expect: k1=v10, k2=v10
-	pairs, err = s.ScanAt(ctx, []byte("k"), nil, 10, 15)
-	require.NoError(t, err)
-	assert.Len(t, pairs, 2)
-	assert.Equal(t, []byte("k1"), pairs[0].Key)
-	assert.Equal(t, []byte("v10"), pairs[0].Value)
-
-	// Scan at TS 5
-	// Expect: empty
-	pairs, err = s.ScanAt(ctx, []byte("k"), nil, 10, 5)
-	require.NoError(t, err)
-	assert.Len(t, pairs, 0)
-}
-
 func TestPebbleStore_Scan_TombstoneMasksOlderVersions(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-scan-tombstone-test")
 	require.NoError(t, err)
@@ -503,39 +377,6 @@ func TestPebbleStore_Scan_IgnoresInternalMetaKey(t *testing.T) {
 	require.Len(t, pairs, 2)
 	assert.Equal(t, []byte("k1"), pairs[0].Key)
 	assert.Equal(t, []byte("k2"), pairs[1].Key)
-}
-
-func TestPebbleStore_Compact(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-compact-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-	key := []byte("key1")
-	require.NoError(t, s.PutAt(ctx, key, []byte("v10"), 10, 0))
-	require.NoError(t, s.PutAt(ctx, key, []byte("v20"), 20, 0))
-	require.NoError(t, s.PutAt(ctx, key, []byte("v30"), 30, 0))
-	require.NoError(t, s.PutAt(ctx, key, []byte("v40"), 40, 0))
-	require.Equal(t, 4, countPebbleVersions(t, s))
-
-	require.NoError(t, s.Compact(ctx, 25))
-	require.Equal(t, uint64(25), requirePebbleRetentionController(t, s).MinRetainedTS())
-	require.Equal(t, 3, countPebbleVersions(t, s))
-
-	_, err = s.GetAt(ctx, key, 15)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
-
-	val, err := s.GetAt(ctx, key, 25)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v20"), val)
-
-	val, err = s.GetAt(ctx, key, 35)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v30"), val)
 }
 
 func TestPebbleStore_CompactCanceledDoesNotAdvanceMinRetainedTS(t *testing.T) {
@@ -729,87 +570,6 @@ func TestPebbleStore_RestoreWaitsForMaintenanceLock(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("timed out waiting for restore")
 	}
-}
-
-func TestPebbleStore_SnapshotRestore(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-snap-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, s.Close()) }()
-
-	ctx := context.Background()
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 100, 0))
-
-	// Snapshot
-	buf, err := s.Snapshot()
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, buf.Close()) }()
-
-	var raw bytes.Buffer
-	_, err = buf.WriteTo(&raw)
-	require.NoError(t, err)
-
-	// Restore to new dir
-	dir2, err := os.MkdirTemp("", "pebble-restore-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir2)
-
-	s2, err := NewPebbleStore(dir2)
-	require.NoError(t, err)
-	defer s2.Close()
-
-	err = s2.Restore(bytes.NewReader(raw.Bytes()))
-	require.NoError(t, err)
-
-	val, err := s2.GetAt(ctx, []byte("k1"), 100)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("v1"), val)
-
-	assert.Equal(t, uint64(100), s2.LastCommitTS()) // aligned 100 -> 100 (if started from 0)
-}
-
-func TestPebbleStore_SnapshotRestorePreservesMinRetainedTS(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-retained-snap-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-
-	ctx := context.Background()
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v10"), 10, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v20"), 20, 0))
-	require.NoError(t, s.Compact(ctx, 20))
-
-	snap, err := s.Snapshot()
-	require.NoError(t, err)
-
-	var raw bytes.Buffer
-	_, err = snap.WriteTo(&raw)
-	require.NoError(t, err)
-	require.NoError(t, snap.Close())
-	require.NoError(t, s.Close())
-
-	dir2, err := os.MkdirTemp("", "pebble-retained-restore-test")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir2)
-
-	s2, err := NewPebbleStore(dir2)
-	require.NoError(t, err)
-	defer s2.Close()
-
-	require.NoError(t, s2.Restore(bytes.NewReader(raw.Bytes())))
-	require.Equal(t, uint64(20), requirePebbleRetentionController(t, s2).MinRetainedTS())
-
-	_, err = s2.GetAt(ctx, []byte("k1"), 10)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
-
-	val, err := s2.GetAt(ctx, []byte("k1"), 20)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v20"), val)
 }
 
 func TestSnapshotBatchShouldFlushOnByteLimit(t *testing.T) {
@@ -1030,7 +790,7 @@ func TestPebbleStore_Restore_TruncatedHeader(t *testing.T) {
 }
 
 // TestPebbleStore_Restore_PebbleMagicMismatch verifies that a stream
-// dispatched as native Pebble but containing a wrong magic header is rejected.
+// with an unknown magic header is rejected by the public restore dispatcher.
 func TestPebbleStore_Restore_PebbleMagicMismatch(t *testing.T) {
 	dir, err := os.MkdirTemp("", "pebble-restore-magic-*")
 	require.NoError(t, err)
@@ -1040,14 +800,10 @@ func TestPebbleStore_Restore_PebbleMagicMismatch(t *testing.T) {
 	require.NoError(t, err)
 	defer s.Close()
 
-	// Call restorePebbleNative directly with a bad magic value to test the
-	// explicit in-function magic check.
 	badMagic := [8]byte{'B', 'A', 'D', 'M', 'A', 'G', 'I', 'C'}
-	ps, ok := s.(*pebbleStore)
-	require.True(t, ok, "expected *pebbleStore")
-	err = ps.restorePebbleNative(bytes.NewReader(badMagic[:]))
+	err = s.Restore(bytes.NewReader(badMagic[:]))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "invalid pebble snapshot magic header")
+	assert.Contains(t, err.Error(), "unrecognized snapshot format")
 }
 
 // TestPebbleStore_Restore_NativePebbleAtomic verifies that when a native
@@ -1090,86 +846,42 @@ func TestPebbleStore_Restore_NativePebbleAtomic(t *testing.T) {
 	assert.Equal(t, []byte("value"), val)
 }
 
-// TestPebbleStore_PutAt_ValueTooLarge verifies that PutAt rejects values
-// exceeding maxSnapshotValueSize to ensure write and restore are consistent.
-func TestPebbleStore_PutAt_ValueTooLarge(t *testing.T) {
-	orig := maxSnapshotValueSize
-	maxSnapshotValueSize = 100
-	t.Cleanup(func() { maxSnapshotValueSize = orig })
-
-	dir, err := os.MkdirTemp("", "pebble-value-limit-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, s.Close()) }()
-
-	ctx := context.Background()
-	oversized := make([]byte, maxSnapshotValueSize+1)
-	err = s.PutAt(ctx, []byte("k"), oversized, 1, 0)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrValueTooLarge)
-}
-
-// TestPebbleStore_ApplyMutations_ValueTooLarge verifies that ApplyMutations
-// rejects Put mutations with values exceeding maxSnapshotValueSize.
-func TestPebbleStore_ApplyMutations_ValueTooLarge(t *testing.T) {
-	orig := maxSnapshotValueSize
-	maxSnapshotValueSize = 100
-	t.Cleanup(func() { maxSnapshotValueSize = orig })
-
-	dir, err := os.MkdirTemp("", "pebble-apply-value-limit-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, s.Close()) }()
-
-	ctx := context.Background()
-	oversized := make([]byte, maxSnapshotValueSize+1)
-	err = s.ApplyMutations(ctx, []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k"), Value: oversized},
-	}, nil, 0, 1)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrValueTooLarge)
-}
-
-// TestMVCCStore_PutAt_ValueTooLarge verifies that the in-memory mvccStore
-// also rejects oversized values.
+// TestMVCCStore_PutAt_ValueTooLarge verifies that both stores reject
+// oversized values.
 func TestMVCCStore_PutAt_ValueTooLarge(t *testing.T) {
-	orig := maxSnapshotValueSize
-	maxSnapshotValueSize = 100
-	t.Cleanup(func() { maxSnapshotValueSize = orig })
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		orig := maxSnapshotValueSize
+		maxSnapshotValueSize = 100
+		t.Cleanup(func() { maxSnapshotValueSize = orig })
 
-	s := NewMVCCStore()
-	defer s.Close()
+		s := newStore(t)
 
-	ctx := context.Background()
-	oversized := make([]byte, maxSnapshotValueSize+1)
-	err := s.PutAt(ctx, []byte("k"), oversized, 1, 0)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrValueTooLarge)
+		ctx := context.Background()
+		oversized := make([]byte, maxSnapshotValueSize+1)
+		err := s.PutAt(ctx, []byte("k"), oversized, 1, 0)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrValueTooLarge)
+	})
 }
 
-// TestMVCCStore_ApplyMutations_ValueTooLarge verifies that the in-memory
-// mvccStore rejects oversized Put mutations.
+// TestMVCCStore_ApplyMutations_ValueTooLarge verifies that both stores
+// reject oversized Put mutations.
 func TestMVCCStore_ApplyMutations_ValueTooLarge(t *testing.T) {
-	orig := maxSnapshotValueSize
-	maxSnapshotValueSize = 100
-	t.Cleanup(func() { maxSnapshotValueSize = orig })
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		orig := maxSnapshotValueSize
+		maxSnapshotValueSize = 100
+		t.Cleanup(func() { maxSnapshotValueSize = orig })
 
-	s := NewMVCCStore()
-	defer s.Close()
+		s := newStore(t)
 
-	ctx := context.Background()
-	oversized := make([]byte, maxSnapshotValueSize+1)
-	err := s.ApplyMutations(ctx, []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k"), Value: oversized},
-	}, nil, 0, 1)
-	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrValueTooLarge)
+		ctx := context.Background()
+		oversized := make([]byte, maxSnapshotValueSize+1)
+		err := s.ApplyMutations(ctx, []*KVPairMutation{
+			{Op: OpTypePut, Key: []byte("k"), Value: oversized},
+		}, nil, 0, 1)
+		require.Error(t, err)
+		assert.ErrorIs(t, err, ErrValueTooLarge)
+	})
 }
 
 // TestPebbleStore_SnapshotRestore_MaxSizeKey verifies that a key of exactly
@@ -1199,42 +911,6 @@ func TestPebbleStore_SnapshotRestore_MaxSizeKey(t *testing.T) {
 	require.NoError(t, err)
 
 	dir2, err := os.MkdirTemp("", "pebble-maxkey-restore-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir2)
-
-	s2, err := NewPebbleStore(dir2)
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, s2.Close()) }()
-
-	require.NoError(t, s2.Restore(bytes.NewReader(buf.Bytes())))
-
-	got, err := s2.GetAt(ctx, bigKey, 1)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("val"), got)
-}
-
-func TestPebbleStore_SnapshotRestore_MaxStoredKey(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-maxstoredkey-snap-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, s.Close()) }()
-
-	ctx := context.Background()
-	bigKey := bytes.Repeat([]byte("k"), maxSnapshotStoredKeySize)
-	require.NoError(t, s.PutAt(ctx, bigKey, []byte("val"), 1, 0))
-
-	snap, err := s.Snapshot()
-	require.NoError(t, err)
-	defer func() { assert.NoError(t, snap.Close()) }()
-
-	var buf bytes.Buffer
-	_, err = snap.WriteTo(&buf)
-	require.NoError(t, err)
-
-	dir2, err := os.MkdirTemp("", "pebble-maxstoredkey-restore-*")
 	require.NoError(t, err)
 	defer os.RemoveAll(dir2)
 

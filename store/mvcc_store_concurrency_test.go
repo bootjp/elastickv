@@ -13,90 +13,94 @@ import (
 )
 
 func TestMVCCStore_ScanConcurrentWithWrites(t *testing.T) {
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, 2)
-	wg.Add(2)
+		var wg sync.WaitGroup
+		errCh := make(chan error, 2)
+		wg.Add(2)
 
-	go func() {
-		defer wg.Done()
-		commitTS := uint64(1)
-		for i := 1; i <= 1000; i++ {
-			key := []byte("k" + strconv.Itoa(i%50))
-			if err := st.PutAt(ctx, key, []byte("v"), commitTS, 0); err != nil {
-				errCh <- err
-				return
+		go func() {
+			defer wg.Done()
+			commitTS := uint64(1)
+			for i := 1; i <= 1000; i++ {
+				key := []byte("k" + strconv.Itoa(i%50))
+				if err := st.PutAt(ctx, key, []byte("v"), commitTS, 0); err != nil {
+					errCh <- err
+					return
+				}
+				commitTS++
 			}
-			commitTS++
-		}
-	}()
+		}()
 
-	go func() {
-		defer wg.Done()
-		for range 1000 {
-			if _, err := st.Scan(ctx, nil, nil, 100); err != nil {
-				errCh <- err
-				return
+		go func() {
+			defer wg.Done()
+			for range 1000 {
+				// Match the legacy memory Scan wrapper through the shared API.
+				if _, err := st.ScanAt(ctx, nil, nil, 100, st.LastCommitTS()); err != nil {
+					errCh <- err
+					return
+				}
 			}
-		}
-	}()
+		}()
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		require.NoError(t, err)
-	}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+	})
 }
 
 // TestMVCCConcurrentPutAtDifferentKeys verifies that multiple goroutines
 // writing to distinct keys concurrently produce no data corruption.
 func TestMVCCConcurrentPutAtDifferentKeys(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+		const numGoroutines = 10
+		const writesPerGoroutine = 200
 
-	const numGoroutines = 10
-	const writesPerGoroutine = 200
+		var wg sync.WaitGroup
+		errCh := make(chan error, numGoroutines*writesPerGoroutine)
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, numGoroutines*writesPerGoroutine)
-
-	for g := uint64(0); g < numGoroutines; g++ {
-		wg.Add(1)
-		go func(goroutineID uint64) {
-			defer wg.Done()
-			for i := uint64(0); i < writesPerGoroutine; i++ {
-				key := []byte(fmt.Sprintf("g%d-key%d", goroutineID, i))
-				value := []byte(fmt.Sprintf("val-%d-%d", goroutineID, i))
-				ts := goroutineID*writesPerGoroutine + i + 1
-				if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
-					errCh <- err
-					return
+		for g := uint64(0); g < numGoroutines; g++ {
+			wg.Add(1)
+			go func(goroutineID uint64) {
+				defer wg.Done()
+				for i := uint64(0); i < writesPerGoroutine; i++ {
+					key := []byte(fmt.Sprintf("g%d-key%d", goroutineID, i))
+					value := []byte(fmt.Sprintf("val-%d-%d", goroutineID, i))
+					ts := goroutineID*writesPerGoroutine + i + 1
+					if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
+						errCh <- err
+						return
+					}
 				}
-			}
-		}(g)
-	}
-
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		require.NoError(t, err)
-	}
-
-	// Verify every key was written correctly.
-	readTS := uint64(numGoroutines*writesPerGoroutine + 1)
-	for g := 0; g < numGoroutines; g++ {
-		for i := 0; i < writesPerGoroutine; i++ {
-			key := []byte(fmt.Sprintf("g%d-key%d", g, i))
-			expected := []byte(fmt.Sprintf("val-%d-%d", g, i))
-			val, err := st.GetAt(ctx, key, readTS)
-			require.NoError(t, err, "key=%s", string(key))
-			require.Equal(t, expected, val, "key=%s", string(key))
+			}(g)
 		}
-	}
+
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+
+		// Verify every key was written correctly.
+		readTS := uint64(numGoroutines*writesPerGoroutine + 1)
+		for g := 0; g < numGoroutines; g++ {
+			for i := 0; i < writesPerGoroutine; i++ {
+				key := []byte(fmt.Sprintf("g%d-key%d", g, i))
+				expected := []byte(fmt.Sprintf("val-%d-%d", g, i))
+				val, err := st.GetAt(ctx, key, readTS)
+				require.NoError(t, err, "key=%s", string(key))
+				require.Equal(t, expected, val, "key=%s", string(key))
+			}
+		}
+	})
 }
 
 // TestMVCCConcurrentPutAtSameKey verifies that multiple goroutines writing
@@ -104,55 +108,56 @@ func TestMVCCConcurrentPutAtDifferentKeys(t *testing.T) {
 // (latest timestamp wins on read).
 func TestMVCCConcurrentPutAtSameKey(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+		const numGoroutines = 20
+		const writesPerGoroutine = 100
+		key := []byte("shared-key")
 
-	const numGoroutines = 20
-	const writesPerGoroutine = 100
-	key := []byte("shared-key")
+		var wg sync.WaitGroup
+		errCh := make(chan error, numGoroutines*writesPerGoroutine)
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, numGoroutines*writesPerGoroutine)
-
-	for g := uint64(0); g < numGoroutines; g++ {
-		wg.Add(1)
-		go func(goroutineID uint64) {
-			defer wg.Done()
-			for i := uint64(0); i < writesPerGoroutine; i++ {
-				// Each goroutine uses a unique timestamp range so no two
-				// goroutines share a timestamp.
-				ts := goroutineID*writesPerGoroutine + i + 1
-				value := []byte(fmt.Sprintf("v-ts%d", ts))
-				if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
-					errCh <- err
-					return
+		for g := uint64(0); g < numGoroutines; g++ {
+			wg.Add(1)
+			go func(goroutineID uint64) {
+				defer wg.Done()
+				for i := uint64(0); i < writesPerGoroutine; i++ {
+					// Each goroutine uses a unique timestamp range so no two
+					// goroutines share a timestamp.
+					ts := goroutineID*writesPerGoroutine + i + 1
+					value := []byte(fmt.Sprintf("v-ts%d", ts))
+					if err := st.PutAt(ctx, key, value, ts, 0); err != nil {
+						errCh <- err
+						return
+					}
 				}
-			}
-		}(g)
-	}
+			}(g)
+		}
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+
+		// The highest timestamp written is numGoroutines*writesPerGoroutine.
+		maxTS := uint64(numGoroutines * writesPerGoroutine)
+
+		// Reading at maxTS should return the value written at maxTS.
+		val, err := st.GetAt(ctx, key, maxTS)
 		require.NoError(t, err)
-	}
+		require.Equal(t, []byte(fmt.Sprintf("v-ts%d", maxTS)), val)
 
-	// The highest timestamp written is numGoroutines*writesPerGoroutine.
-	maxTS := uint64(numGoroutines * writesPerGoroutine)
-
-	// Reading at maxTS should return the value written at maxTS.
-	val, err := st.GetAt(ctx, key, maxTS)
-	require.NoError(t, err)
-	require.Equal(t, []byte(fmt.Sprintf("v-ts%d", maxTS)), val)
-
-	// Spot-check that reading at intermediate timestamps returns the
-	// correct version (snapshot consistency).
-	for _, checkTS := range []uint64{1, 50, 100, maxTS / 2, maxTS} {
-		val, err := st.GetAt(ctx, key, checkTS)
-		require.NoError(t, err)
-		require.Equal(t, []byte(fmt.Sprintf("v-ts%d", checkTS)), val)
-	}
+		// Spot-check that reading at intermediate timestamps returns the
+		// correct version (snapshot consistency).
+		for _, checkTS := range []uint64{1, 50, 100, maxTS / 2, maxTS} {
+			val, err := st.GetAt(ctx, key, checkTS)
+			require.NoError(t, err)
+			require.Equal(t, []byte(fmt.Sprintf("v-ts%d", checkTS)), val)
+		}
+	})
 }
 
 func concurrentGetAtWriter(ctx context.Context, st MVCCStore, numKeys, writesPerWriter int, tsCounter *atomic.Uint64, errCh chan<- error) {
@@ -193,51 +198,52 @@ func concurrentGetAtReader(ctx context.Context, st MVCCStore, numKeys, writesPer
 // the value committed at or before T, never a partially-written state.
 func TestMVCCConcurrentGetAtAndPutAt(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+		const numKeys = 50
+		const numWriters = 5
+		const numReaders = 5
+		const writesPerWriter = 200
 
-	const numKeys = 50
-	const numWriters = 5
-	const numReaders = 5
-	const writesPerWriter = 200
+		// Seed one version per key so reads never hit ErrKeyNotFound.
+		for i := 0; i < numKeys; i++ {
+			key := []byte(fmt.Sprintf("rw-key%d", i))
+			require.NoError(t, st.PutAt(ctx, key, []byte("init"), 1, 0))
+		}
 
-	// Seed one version per key so reads never hit ErrKeyNotFound.
-	for i := 0; i < numKeys; i++ {
-		key := []byte(fmt.Sprintf("rw-key%d", i))
-		require.NoError(t, st.PutAt(ctx, key, []byte("init"), 1, 0))
-	}
+		// Writers advance timestamps starting from 2.
+		var tsCounter atomic.Uint64
+		tsCounter.Store(1)
 
-	// Writers advance timestamps starting from 2.
-	var tsCounter atomic.Uint64
-	tsCounter.Store(1)
+		var wg sync.WaitGroup
+		errCh := make(chan error, (numWriters+numReaders)*writesPerWriter)
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, (numWriters+numReaders)*writesPerWriter)
+		// Spawn writers.
+		for w := 0; w < numWriters; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				concurrentGetAtWriter(ctx, st, numKeys, writesPerWriter, &tsCounter, errCh)
+			}()
+		}
 
-	// Spawn writers.
-	for w := 0; w < numWriters; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			concurrentGetAtWriter(ctx, st, numKeys, writesPerWriter, &tsCounter, errCh)
-		}()
-	}
+		// Spawn readers that read at the current lastCommitTS.
+		for r := 0; r < numReaders; r++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				concurrentGetAtReader(ctx, st, numKeys, writesPerWriter, errCh)
+			}()
+		}
 
-	// Spawn readers that read at the current lastCommitTS.
-	for r := 0; r < numReaders; r++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			concurrentGetAtReader(ctx, st, numKeys, writesPerWriter, errCh)
-		}()
-	}
-
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		require.NoError(t, err)
-	}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+	})
 }
 
 // TestMVCCConcurrentApplyMutations verifies that ApplyMutations detects
@@ -245,73 +251,74 @@ func TestMVCCConcurrentGetAtAndPutAt(t *testing.T) {
 // goroutines.
 func TestMVCCConcurrentApplyMutations(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+		const numGoroutines = 20
+		const rounds = 50
+		key := []byte("contended-key")
 
-	const numGoroutines = 20
-	const rounds = 50
-	key := []byte("contended-key")
+		// Seed key at ts=1 so latestVersionLocked always finds something.
+		require.NoError(t, st.PutAt(ctx, key, []byte("seed"), 1, 0))
 
-	// Seed key at ts=1 so latestVersionLocked always finds something.
-	require.NoError(t, st.PutAt(ctx, key, []byte("seed"), 1, 0))
+		var wg sync.WaitGroup
+		var successCount atomic.Int64
+		var conflictCount atomic.Int64
+		errCh := make(chan error, numGoroutines*rounds)
 
-	var wg sync.WaitGroup
-	var successCount atomic.Int64
-	var conflictCount atomic.Int64
-	errCh := make(chan error, numGoroutines*rounds)
-
-	for g := 0; g < numGoroutines; g++ {
-		wg.Add(1)
-		go func(goroutineID int) {
-			defer wg.Done()
-			for i := 0; i < rounds; i++ {
-				// Every goroutine reads lastCommitTS as its startTS, then
-				// tries to commit at startTS+1. Under contention most
-				// should fail with ErrWriteConflict.
-				startTS := st.LastCommitTS()
-				commitTS := startTS + 1
-				mutations := []*KVPairMutation{
-					{
-						Op:    OpTypePut,
-						Key:   key,
-						Value: []byte(fmt.Sprintf("g%d-r%d", goroutineID, i)),
-					},
+		for g := 0; g < numGoroutines; g++ {
+			wg.Add(1)
+			go func(goroutineID int) {
+				defer wg.Done()
+				for i := 0; i < rounds; i++ {
+					// Every goroutine reads lastCommitTS as its startTS, then
+					// tries to commit at startTS+1. Under contention most
+					// should fail with ErrWriteConflict.
+					startTS := st.LastCommitTS()
+					commitTS := startTS + 1
+					mutations := []*KVPairMutation{
+						{
+							Op:    OpTypePut,
+							Key:   key,
+							Value: []byte(fmt.Sprintf("g%d-r%d", goroutineID, i)),
+						},
+					}
+					err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
+					if err == nil {
+						successCount.Add(1)
+						continue
+					}
+					if errors.Is(err, ErrWriteConflict) {
+						conflictCount.Add(1)
+						continue
+					}
+					// Unexpected error.
+					errCh <- fmt.Errorf("goroutine %d round %d: %w", goroutineID, i, err)
+					return
 				}
-				err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
-				if err == nil {
-					successCount.Add(1)
-					continue
-				}
-				if errors.Is(err, ErrWriteConflict) {
-					conflictCount.Add(1)
-					continue
-				}
-				// Unexpected error.
-				errCh <- fmt.Errorf("goroutine %d round %d: %w", goroutineID, i, err)
-				return
-			}
-		}(g)
-	}
+			}(g)
+		}
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+
+		// At least some must have succeeded. Conflicts may or may not occur
+		// depending on the store implementation's serialization strategy;
+		// mvccStore serializes fully so conflicts are unlikely.
+		require.Greater(t, successCount.Load(), int64(0), "expected at least one successful commit")
+		require.Equal(t, int64(numGoroutines*rounds), successCount.Load()+conflictCount.Load(),
+			"every round should either succeed or conflict")
+
+		// The stored value must be from one of the successful commits (not corrupted).
+		finalTS := st.LastCommitTS()
+		val, err := st.GetAt(ctx, key, finalTS)
 		require.NoError(t, err)
-	}
-
-	// At least some must have succeeded. Conflicts may or may not occur
-	// depending on the store implementation's serialization strategy;
-	// mvccStore serializes fully so conflicts are unlikely.
-	require.Greater(t, successCount.Load(), int64(0), "expected at least one successful commit")
-	require.Equal(t, int64(numGoroutines*rounds), successCount.Load()+conflictCount.Load(),
-		"every round should either succeed or conflict")
-
-	// The stored value must be from one of the successful commits (not corrupted).
-	finalTS := st.LastCommitTS()
-	val, err := st.GetAt(ctx, key, finalTS)
-	require.NoError(t, err)
-	require.NotEmpty(t, val)
+		require.NotEmpty(t, val)
+	})
 }
 
 // TestMVCCConcurrentApplyMutationsMultiKey verifies that ApplyMutations with
@@ -319,71 +326,72 @@ func TestMVCCConcurrentApplyMutations(t *testing.T) {
 // the mutations in the batch are applied.
 func TestMVCCConcurrentApplyMutationsMultiKey(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+		keyA := []byte("multi-a")
+		keyB := []byte("multi-b")
 
-	keyA := []byte("multi-a")
-	keyB := []byte("multi-b")
+		// Seed both keys at ts=1.
+		require.NoError(t, st.PutAt(ctx, keyA, []byte("seedA"), 1, 0))
+		require.NoError(t, st.PutAt(ctx, keyB, []byte("seedB"), 1, 0))
 
-	// Seed both keys at ts=1.
-	require.NoError(t, st.PutAt(ctx, keyA, []byte("seedA"), 1, 0))
-	require.NoError(t, st.PutAt(ctx, keyB, []byte("seedB"), 1, 0))
+		const numGoroutines = 15
+		const rounds = 40
 
-	const numGoroutines = 15
-	const rounds = 40
+		var wg sync.WaitGroup
+		var successCount atomic.Int64
+		var conflictCount atomic.Int64
+		errCh := make(chan error, numGoroutines*rounds)
 
-	var wg sync.WaitGroup
-	var successCount atomic.Int64
-	var conflictCount atomic.Int64
-	errCh := make(chan error, numGoroutines*rounds)
-
-	for g := 0; g < numGoroutines; g++ {
-		wg.Add(1)
-		go func(goroutineID int) {
-			defer wg.Done()
-			for i := 0; i < rounds; i++ {
-				startTS := st.LastCommitTS()
-				commitTS := startTS + 1
-				mutations := []*KVPairMutation{
-					{Op: OpTypePut, Key: keyA, Value: []byte(fmt.Sprintf("a-g%d-r%d", goroutineID, i))},
-					{Op: OpTypePut, Key: keyB, Value: []byte(fmt.Sprintf("b-g%d-r%d", goroutineID, i))},
+		for g := 0; g < numGoroutines; g++ {
+			wg.Add(1)
+			go func(goroutineID int) {
+				defer wg.Done()
+				for i := 0; i < rounds; i++ {
+					startTS := st.LastCommitTS()
+					commitTS := startTS + 1
+					mutations := []*KVPairMutation{
+						{Op: OpTypePut, Key: keyA, Value: []byte(fmt.Sprintf("a-g%d-r%d", goroutineID, i))},
+						{Op: OpTypePut, Key: keyB, Value: []byte(fmt.Sprintf("b-g%d-r%d", goroutineID, i))},
+					}
+					err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
+					if err == nil {
+						successCount.Add(1)
+						continue
+					}
+					if errors.Is(err, ErrWriteConflict) {
+						conflictCount.Add(1)
+						continue
+					}
+					errCh <- fmt.Errorf("goroutine %d round %d: %w", goroutineID, i, err)
+					return
 				}
-				err := st.ApplyMutations(ctx, mutations, nil, startTS, commitTS)
-				if err == nil {
-					successCount.Add(1)
-					continue
-				}
-				if errors.Is(err, ErrWriteConflict) {
-					conflictCount.Add(1)
-					continue
-				}
-				errCh <- fmt.Errorf("goroutine %d round %d: %w", goroutineID, i, err)
-				return
-			}
-		}(g)
-	}
+			}(g)
+		}
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		require.NoError(t, err)
-	}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
 
-	require.Greater(t, successCount.Load(), int64(0))
-	require.Equal(t, int64(numGoroutines*rounds), successCount.Load()+conflictCount.Load(),
-		"every round should either succeed or conflict")
+		require.Greater(t, successCount.Load(), int64(0))
+		require.Equal(t, int64(numGoroutines*rounds), successCount.Load()+conflictCount.Load(),
+			"every round should either succeed or conflict")
 
-	// Both keys must have the same number of committed versions (atomicity).
-	// The latest commit timestamp of both keys should be identical because
-	// every successful ApplyMutations writes both keys at the same commitTS.
-	tsA, okA, errA := st.LatestCommitTS(ctx, keyA)
-	tsB, okB, errB := st.LatestCommitTS(ctx, keyB)
-	require.NoError(t, errA)
-	require.NoError(t, errB)
-	require.True(t, okA)
-	require.True(t, okB)
-	require.Equal(t, tsA, tsB, "both keys must share the latest commit timestamp")
+		// Both keys must have the same number of committed versions (atomicity).
+		// The latest commit timestamp of both keys should be identical because
+		// every successful ApplyMutations writes both keys at the same commitTS.
+		tsA, okA, errA := st.LatestCommitTS(ctx, keyA)
+		tsB, okB, errB := st.LatestCommitTS(ctx, keyB)
+		require.NoError(t, errA)
+		require.NoError(t, errB)
+		require.True(t, okA)
+		require.True(t, okB)
+		require.Equal(t, tsA, tsB, "both keys must share the latest commit timestamp")
+	})
 }
 
 // TestMVCCConcurrentScanAtAndPutAt verifies that ScanAt returns consistent
@@ -439,56 +447,57 @@ func scanAtScanner(ctx context.Context, st MVCCStore, numKeys, writesPerWriter i
 
 func TestMVCCConcurrentScanAtAndPutAt(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+		const numKeys = 30
+		const numWriters = 4
+		const numScanners = 4
+		const writesPerWriter = 200
 
-	const numKeys = 30
-	const numWriters = 4
-	const numScanners = 4
-	const writesPerWriter = 200
+		// Seed keys at ts=1 with known prefix so scans find them.
+		for i := 0; i < numKeys; i++ {
+			key := []byte(fmt.Sprintf("scan-key%03d", i))
+			require.NoError(t, st.PutAt(ctx, key, []byte("init"), 1, 0))
+		}
 
-	// Seed keys at ts=1 with known prefix so scans find them.
-	for i := 0; i < numKeys; i++ {
-		key := []byte(fmt.Sprintf("scan-key%03d", i))
-		require.NoError(t, st.PutAt(ctx, key, []byte("init"), 1, 0))
-	}
+		var tsCounter atomic.Uint64
+		tsCounter.Store(1)
 
-	var tsCounter atomic.Uint64
-	tsCounter.Store(1)
+		var wg sync.WaitGroup
+		errCh := make(chan error, (numWriters+numScanners)*writesPerWriter)
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, (numWriters+numScanners)*writesPerWriter)
+		// Writers.
+		for w := 0; w < numWriters; w++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				scanAtWriter(ctx, st, numKeys, writesPerWriter, &tsCounter, errCh)
+			}()
+		}
 
-	// Writers.
-	for w := 0; w < numWriters; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			scanAtWriter(ctx, st, numKeys, writesPerWriter, &tsCounter, errCh)
-		}()
-	}
+		// Scanners read consistent snapshots.
+		for s := 0; s < numScanners; s++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				scanAtScanner(ctx, st, numKeys, writesPerWriter, errCh)
+			}()
+		}
 
-	// Scanners read consistent snapshots.
-	for s := 0; s < numScanners; s++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			scanAtScanner(ctx, st, numKeys, writesPerWriter, errCh)
-		}()
-	}
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
+		// Final scan should see all keys.
+		finalTS := st.LastCommitTS()
+		pairs, err := st.ScanAt(ctx, []byte("scan-key"), []byte("scan-key999"), numKeys+10, finalTS)
 		require.NoError(t, err)
-	}
-
-	// Final scan should see all keys.
-	finalTS := st.LastCommitTS()
-	pairs, err := st.ScanAt(ctx, []byte("scan-key"), []byte("scan-key999"), numKeys+10, finalTS)
-	require.NoError(t, err)
-	require.Equal(t, numKeys, len(pairs), "all seeded keys should be visible at final timestamp")
+		require.Equal(t, numKeys, len(pairs), "all seeded keys should be visible at final timestamp")
+	})
 }
 
 func snapshotConsistencyWriter(ctx context.Context, st MVCCStore, numKeys, totalWrites int, tsCounter *atomic.Uint64, errCh chan<- error) {
@@ -530,47 +539,48 @@ func snapshotConsistencyScanner(ctx context.Context, st MVCCStore, numKeys, tota
 // torn write.
 func TestMVCCConcurrentScanAtSnapshotConsistency(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+		const numKeys = 20
+		const totalWrites = 500
 
-	const numKeys = 20
-	const totalWrites = 500
+		// Seed keys.
+		for i := 0; i < numKeys; i++ {
+			key := []byte("ss-" + strconv.Itoa(i))
+			require.NoError(t, st.PutAt(ctx, key, []byte("ss-init-"+strconv.Itoa(i)), 1, 0))
+		}
 
-	// Seed keys.
-	for i := 0; i < numKeys; i++ {
-		key := []byte("ss-" + strconv.Itoa(i))
-		require.NoError(t, st.PutAt(ctx, key, []byte("ss-init-"+strconv.Itoa(i)), 1, 0))
-	}
+		var tsCounter atomic.Uint64
+		tsCounter.Store(1)
 
-	var tsCounter atomic.Uint64
-	tsCounter.Store(1)
+		var wg sync.WaitGroup
+		errCh := make(chan error, totalWrites*2)
 
-	var wg sync.WaitGroup
-	errCh := make(chan error, totalWrites*2)
-
-	// Single writer with deterministic key->value mapping: value = "ss-<key>-ts<ts>".
-	wg.Add(1)
-	go func() {
-		defer wg.Done()
-		snapshotConsistencyWriter(ctx, st, numKeys, totalWrites, &tsCounter, errCh)
-	}()
-
-	// Multiple scanners check that returned results are non-empty and
-	// that the scan does not panic or return garbled data.
-	for s := 0; s < 4; s++ {
+		// Single writer with deterministic key->value mapping: value = "ss-<key>-ts<ts>".
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			snapshotConsistencyScanner(ctx, st, numKeys, totalWrites, errCh)
+			snapshotConsistencyWriter(ctx, st, numKeys, totalWrites, &tsCounter, errCh)
 		}()
-	}
 
-	wg.Wait()
-	close(errCh)
-	for err := range errCh {
-		require.NoError(t, err)
-	}
+		// Multiple scanners check that returned results are non-empty and
+		// that the scan does not panic or return garbled data.
+		for s := 0; s < 4; s++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				snapshotConsistencyScanner(ctx, st, numKeys, totalWrites, errCh)
+			}()
+		}
+
+		wg.Wait()
+		close(errCh)
+		for err := range errCh {
+			require.NoError(t, err)
+		}
+	})
 }
 
 // ---------------------------------------------------------------------------
@@ -578,58 +588,77 @@ func TestMVCCConcurrentScanAtSnapshotConsistency(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestMVCCStore_ApplyMutations_ReadConflict(t *testing.T) {
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	// Commit k1 at TS=20.
-	require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+		// Commit k1 at TS=20.
+		require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
 
-	// Write k2 but read k1. k1 committed at 20 > startTS=10 → conflict.
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 30)
-	require.Error(t, err)
-	require.True(t, errors.Is(err, ErrWriteConflict))
+		// Write k2 but read k1. k1 committed at 20 > startTS=10 → conflict.
+		mutations := []*KVPairMutation{
+			{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+		}
+		err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 30)
+		require.Error(t, err)
+		require.True(t, errors.Is(err, ErrWriteConflict))
+		key, ok := WriteConflictKey(err)
+		require.True(t, ok)
+		require.Equal(t, []byte("k1"), key)
+		_, err = st.GetAt(ctx, []byte("k2"), 30)
+		require.ErrorIs(t, err, ErrKeyNotFound)
+	})
 }
 
 func TestMVCCStore_ApplyMutations_ReadConflict_NoConflictWhenUnchanged(t *testing.T) {
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	// Commit k1 at TS=5.
-	require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
+		// Commit k1 at TS=5.
+		require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
 
-	// startTS=10 >= k1's commit(5) → no conflict.
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 20)
-	require.NoError(t, err)
+		// startTS=10 >= k1's commit(5) → no conflict.
+		mutations := []*KVPairMutation{
+			{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+		}
+		err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 20)
+		require.NoError(t, err)
+		value, err := st.GetAt(ctx, []byte("k2"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v2"), value)
+	})
 }
 
 func TestMVCCStore_ApplyMutations_ReadConflict_NonexistentKey(t *testing.T) {
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	// Reading a nonexistent key should not conflict.
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
-	}
-	err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("ghost")}, 10, 20)
-	require.NoError(t, err)
+		// Reading a nonexistent key should not conflict.
+		mutations := []*KVPairMutation{
+			{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
+		}
+		err := st.ApplyMutations(ctx, mutations, [][]byte{[]byte("ghost")}, 10, 20)
+		require.NoError(t, err)
+		value, err := st.GetAt(ctx, []byte("k1"), 20)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v1"), value)
+	})
 }
 
 func TestMVCCStore_ApplyMutations_ReadConflict_NilReadKeys(t *testing.T) {
-	ctx := context.Background()
-	st := newTestMVCCStore(t)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
 
-	// nil readKeys → only write-write check; k2 write has no conflict.
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	err := st.ApplyMutations(ctx, mutations, nil, 10, 30)
-	require.NoError(t, err)
+		// nil readKeys → only write-write check; k2 write has no conflict.
+		mutations := []*KVPairMutation{
+			{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
+		}
+		err := st.ApplyMutations(ctx, mutations, nil, 10, 30)
+		require.NoError(t, err)
+	})
 }

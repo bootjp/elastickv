@@ -3297,8 +3297,7 @@ func flushSnapshotBatchIfNeeded(db *pebble.DB, batch **pebble.Batch, kLen, vLen 
 }
 
 // restoreBatchLoopInto reads raw Pebble key-value entries from r and writes
-// them into db using batched commits. It is used for both the direct and the
-// temp-dir atomic native Pebble restore paths.
+// them into db using batched commits for the temp-dir atomic native restore.
 func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 	batch := db.NewBatch()
 	var keyBuf []byte // reused across entries to reduce per-entry allocations
@@ -3402,48 +3401,6 @@ func (s *pebbleStore) reopenFreshDB() error {
 	}
 	s.db = db
 	s.cache = cache
-	return nil
-}
-
-// restorePebbleNative restores from the current Pebble snapshot format
-// (magic "EKVPBBL1" + lastCommitTS + raw key-value entries) into s.db directly.
-//
-// Format history / compatibility:
-//   - The pebbleSnapshotMagic header ("EKVPBBL1") was introduced along with
-//     this snapshot format. Older Pebble snapshots that pre-date this header
-//     (i.e. those that started directly with lastCommitTS) are not handled
-//     here. A stream dispatched to this function MUST start with the magic;
-//     otherwise "invalid pebble snapshot magic header" is returned.
-func (s *pebbleStore) restorePebbleNative(r io.Reader) error {
-	var magic [8]byte
-	if _, err := io.ReadFull(r, magic[:]); err != nil {
-		return errors.WithStack(err)
-	}
-	if !bytes.Equal(magic[:], pebbleSnapshotMagic[:]) {
-		return errors.New("invalid pebble snapshot magic header")
-	}
-
-	var ts uint64
-	if err := binary.Read(r, binary.LittleEndian, &ts); err != nil {
-		return errors.WithStack(err)
-	}
-	if err := s.saveLastCommitTS(ts); err != nil {
-		return err
-	}
-	if err := restoreBatchLoopInto(r, s.db); err != nil {
-		return err
-	}
-	minRetainedTS, err := s.findMinRetainedTS()
-	if err != nil {
-		return err
-	}
-	pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
-	if err != nil {
-		return err
-	}
-	s.lastCommitTS = ts
-	s.minRetainedTS = minRetainedTS
-	s.pendingMinRetainedTS = pendingMinRetainedTS
 	return nil
 }
 
