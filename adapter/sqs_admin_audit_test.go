@@ -20,6 +20,49 @@ func TestAdminQueueOutcomesClassifyLeaderChurn(t *testing.T) {
 	}
 }
 
+type adminQueueOutcomeRecorder struct {
+	purge string
+	peek  string
+}
+
+func (o *adminQueueOutcomeRecorder) ObserveAdminPurgeQueue(_ string, outcome string) {
+	o.purge = outcome
+}
+
+func (o *adminQueueOutcomeRecorder) ObserveAdminPeekQueue(_ string, outcome string) {
+	o.peek = outcome
+}
+
+// Regression for PR #1228: malformed queue names are validation failures,
+// not missing queues, in both the return value and the observed outcome.
+func TestAdminQueueInvalidNamesRecordValidation(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	server := sqsLeaderNode(t, nodes).sqsServer
+	records := captureAdminAudit(t, server)
+
+	for _, name := range []string{"orders.bad", "orders/bad", " orders", "orders ", strings.Repeat("a", 81)} {
+		t.Run(name, func(t *testing.T) {
+			observer := &adminQueueOutcomeRecorder{}
+			server.adminObserver = observer
+			t.Run("purge", func(t *testing.T) {
+				_, err := server.AdminPurgeQueue(t.Context(), fullAdminPrincipal, name)
+				require.ErrorIs(t, err, ErrAdminSQSValidation)
+				require.Equal(t, adminOutcomeValidation, observer.purge)
+				got := records()
+				require.NotEmpty(t, got)
+				require.Equal(t, adminOutcomeValidation, got[len(got)-1]["outcome"])
+			})
+			t.Run("peek", func(t *testing.T) {
+				_, _, err := server.AdminPeekQueue(t.Context(), fullAdminPrincipal, name, AdminPeekMessageOptions{})
+				require.ErrorIs(t, err, ErrAdminSQSValidation)
+				require.Equal(t, adminOutcomeValidation, observer.peek)
+			})
+		})
+	}
+}
+
 // captureAdminAudit points the server's audit logger at a buffer and returns a
 // reader for the admin.sqs.purge_queue records it emits.
 func captureAdminAudit(t *testing.T, server *SQSServer) func() []map[string]any {

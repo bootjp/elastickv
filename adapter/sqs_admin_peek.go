@@ -222,7 +222,7 @@ func (s *SQSServer) AdminPeekQueue(
 		s.observeAdminPeek(name, adminOutcomeNotLeader)
 		return nil, "", ErrAdminNotLeader
 	}
-	if strings.TrimSpace(name) == "" {
+	if strings.TrimSpace(name) != name || validateQueueName(name) != nil {
 		s.observeAdminPeek(name, adminOutcomeValidation)
 		return nil, "", ErrAdminSQSValidation
 	}

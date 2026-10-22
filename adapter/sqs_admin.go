@@ -314,7 +314,7 @@ func (e *PurgeInProgressError) Is(target error) bool {
 //   - ErrAdminSQSNotFound        — queue absent
 //   - *PurgeInProgressError      — last purge < 60 s ago; errors.Is matches
 //     ErrAdminSQSPurgeInProgress, RetryAfter carries the duration.
-//   - ErrAdminSQSValidation      — empty / whitespace name
+//   - ErrAdminSQSValidation      — malformed queue name
 func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipal, name string) (AdminPurgeResult, error) {
 	if !principal.Role.canWrite() {
 		s.recordAdminPurge(ctx, principal, name, adminOutcomeForbidden)
@@ -324,7 +324,7 @@ func (s *SQSServer) AdminPurgeQueue(ctx context.Context, principal AdminPrincipa
 		s.recordAdminPurge(ctx, principal, name, adminOutcomeNotLeader)
 		return AdminPurgeResult{}, ErrAdminNotLeader
 	}
-	if strings.TrimSpace(name) == "" {
+	if strings.TrimSpace(name) != name || validateQueueName(name) != nil {
 		s.recordAdminPurge(ctx, principal, name, adminOutcomeValidation)
 		return AdminPurgeResult{}, ErrAdminSQSValidation
 	}

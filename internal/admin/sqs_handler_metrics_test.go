@@ -139,7 +139,7 @@ func TestSqsHandlerWithoutAnObserverStillServes(t *testing.T) {
 		WithRoleStore(MapRoleStore{"AKIA_RO": RoleReadOnly}).
 		WithAdminQueueObserver(adminQueueObserverFrom(src))
 
-	req := httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
 	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
 		AuthPrincipal{AccessKey: "AKIA_RO", Role: RoleFull}))
 	rec := httptest.NewRecorder()
@@ -200,7 +200,7 @@ func TestSqsHandlerCountsRouteParsingRejections(t *testing.T) {
 				WithRoleStore(MapRoleStore{"AKIA_FULL": RoleFull}).
 				WithAdminQueueObserver(adminQueueObserverFrom(src))
 
-			req := httptest.NewRequest(tc.method, tc.path, nil)
+			req := httptest.NewRequestWithContext(t.Context(), tc.method, tc.path, nil)
 			req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
 				AuthPrincipal{AccessKey: "AKIA_FULL", Role: RoleFull}))
 			rec := httptest.NewRecorder()
@@ -255,7 +255,7 @@ func TestSqsHandlerClassifiesAMissingPrincipalAsInternal(t *testing.T) {
 
 			// No principal in the context: SessionAuth did not run, which is a
 			// mount/middleware regression rather than a denied request.
-			req := httptest.NewRequest(tc.method, pathPrefixSqsQueues+"orders/messages", nil)
+			req := httptest.NewRequestWithContext(t.Context(), tc.method, pathPrefixSqsQueues+"orders/messages", nil)
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 
@@ -290,7 +290,7 @@ func TestSqsHandlerAuditsAPurgeRefusedBeforeTheAdapter(t *testing.T) {
 		WithRoleStore(MapRoleStore{"AKIA_RO": RoleReadOnly}).
 		WithAdminQueueObserver(adminQueueObserverFrom(src))
 
-	req := httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
 	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
 		AuthPrincipal{AccessKey: "AKIA_RO", Role: RoleFull}))
 	rec := httptest.NewRecorder()
@@ -323,7 +323,7 @@ func TestSqsHandlerAuditsMalformedPurgeWithoutMetrics(t *testing.T) {
 	h := NewSqsHandler(&stubQueuesSource{}).
 		WithLogger(slog.New(slog.NewJSONHandler(&buf, nil))).
 		WithRoleStore(MapRoleStore{"AKIA_RO": RoleReadOnly})
-	req := httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders//messages", nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodDelete, pathPrefixSqsQueues+"orders//messages", nil)
 	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
 		AuthPrincipal{AccessKey: "AKIA_RO", Role: RoleFull}))
 	rec := httptest.NewRecorder()
