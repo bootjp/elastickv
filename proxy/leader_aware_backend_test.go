@@ -646,7 +646,20 @@ func TestLeaderAwareRedisBackend_InitialCommandWaitsForLeaderDiscovery(t *testin
 					return ErrNoLeaderBackend
 				}
 				defer ps.Close()
-				return ps.Subscribe(ctx, "events")
+				if err := ps.Subscribe(ctx, "events"); err != nil {
+					return err
+				}
+				// Subscribe only flushes the request; the acknowledgment
+				// proves the discovered leader has actually processed it.
+				reply, err := ps.Receive(ctx)
+				if err != nil {
+					return err
+				}
+				ack, ok := reply.(*redis.Subscription)
+				if !ok || ack.Kind != "subscribe" || ack.Channel != "events" {
+					return fmt.Errorf("unexpected subscription acknowledgment: %v", reply)
+				}
+				return nil
 			},
 		},
 	}
