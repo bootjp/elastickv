@@ -62,25 +62,88 @@ func TestRunFlusherAttachesAlignedHotKeysWindow(t *testing.T) {
 		RunFlusher(ctx, s, s.Step())
 		done <- struct{}{}
 	}()
+	t.Cleanup(func() {
+		cancel()
+		for range 2 {
+			select {
+			case <-done:
+			case <-time.After(time.Second):
+				t.Fatal("hot-key workers did not return after cancel")
+			}
+		}
+	})
 	for i := 0; i < 8; i++ {
 		s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
 	}
 
 	require.Eventually(t, func() bool {
-		for _, col := range s.Snapshot(time.Time{}, time.Time{}) {
-			if len(col.HotKeys) == 0 {
+		// Keep producing while polling: the 16-column history retains only
+		// 80ms, so a scheduler pause can evict every initial observation.
+		s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
+		return alignedHotKeysWindowObserved(s.Snapshot(time.Time{}, time.Time{}))
+	}, time.Second, 5*time.Millisecond)
+}
+
+func alignedHotKeysWindowObserved(columns []MatrixColumn) bool {
+	observed := false
+	for _, col := range columns {
+		for _, snapshot := range col.HotKeys {
+			if len(snapshot.Entries) == 0 {
 				continue
 			}
-			snapshot := col.HotKeys[0]
-			return snapshot.WindowStart.Equal(col.WindowStart) &&
-				snapshot.WindowEnd.Equal(col.At) &&
-				len(snapshot.Entries) > 0
+			if !snapshot.WindowStart.Equal(col.WindowStart) || !snapshot.WindowEnd.Equal(col.At) {
+				return false
+			}
+			observed = true
 		}
-		return false
-	}, time.Second, 5*time.Millisecond)
-	cancel()
-	<-done
-	<-done
+	}
+	return observed
+}
+
+func TestAlignedHotKeysWindowObservedSkipsEmptyWindows(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	end := start.Add(5 * time.Millisecond)
+	columns := []MatrixColumn{
+		{WindowStart: start, At: end, HotKeys: []KeyvizHotKeysSnapshot{{WindowStart: start, WindowEnd: end}}},
+		{WindowStart: end, At: end.Add(5 * time.Millisecond), HotKeys: []KeyvizHotKeysSnapshot{{
+			WindowStart: end, WindowEnd: end.Add(5 * time.Millisecond), Entries: []KeyvizHotKeyEntry{{Key: []byte("hot")}},
+		}}},
+	}
+	require.True(t, alignedHotKeysWindowObserved(columns))
+	columns[1].HotKeys[0].WindowStart = start
+	require.False(t, alignedHotKeysWindowObserved(columns), "a populated misaligned window must still fail")
+	require.False(t, alignedHotKeysWindowObserved(columns[:1]), "empty windows cannot satisfy the assertion")
+}
+
+func TestFlusherAlignmentProbeAfterHistoryEviction(t *testing.T) {
+	start := time.Unix(1_700_000_000, 0)
+	step := 5 * time.Millisecond
+	s := NewMemSampler(MemSamplerOptions{
+		Step: step, HistoryColumns: 2, HotKeysEnabled: true,
+		HotKeysPerRoute: 8, HotKeysSampleRate: 1, HotKeysQueueSize: 32,
+		HotKeysMaxKeyLen: 64, Now: func() time.Time { return start },
+	})
+	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 1))
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		RunHotKeysAggregator(ctx, s)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+	s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
+	require.True(t, s.flushWindow(ctx, start.Add(step)))
+	require.True(t, alignedHotKeysWindowObserved(s.Snapshot(time.Time{}, time.Time{})))
+	for i := 2; i <= 3; i++ {
+		require.True(t, s.flushWindow(ctx, start.Add(time.Duration(i)*step)))
+	}
+	require.False(t, alignedHotKeysWindowObserved(s.Snapshot(time.Time{}, time.Time{})), "the initial sample has been evicted")
+	s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
+	require.True(t, s.flushWindow(ctx, start.Add(4*step)))
+	require.True(t, alignedHotKeysWindowObserved(s.Snapshot(time.Time{}, time.Time{})), "an earlier empty window must not hide the new sample")
 }
 
 func TestFlushWindowKeepsHotKeyAndCounterInSameColumn(t *testing.T) {
