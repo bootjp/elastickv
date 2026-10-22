@@ -102,7 +102,7 @@ The audit above describes main at `429f5ee7`; the following additions address it
 
 These tests exposed two runtime gaps, rather than a missing seal implementation:
 
-1. Forwarded write conflicts arrive as gRPC statuses without the local sentinel chain. [`normalizeDynamoWriteDispatchError`](../../adapter/dynamodb_write_error.go) recognizes only the known key-conflict envelope and restores the sentinel at DynamoDB's item/transaction dispatch boundaries. Existing dedup and recompute behavior remains in place. The shared retry predicates, including their SQS callers, are unchanged.
+1. Forwarded write conflicts and transaction locks arrive as gRPC statuses without the local sentinel chain. [`normalizeDynamoWriteDispatchError`](../../adapter/dynamodb_write_error.go) recognizes only known `Unknown`/`Aborted` key-conflict/key-lock envelopes and restores the sentinel at DynamoDB's item/transaction dispatch boundaries. Existing dedup and recompute behavior remains in place. `TestDynamoDBRetriesForwardedTxnLock` covers item and transaction retries. The shared retry predicates, including their SQS callers, are unchanged.
 2. [`buildLeaderDynamo`](../../main.go) previously synthesized a self-only HTTP map even when the flag was omitted. A follower could not resolve a remote leader in that map. An omitted DynamoDB map now selects the existing coordinator gRPC path; explicit maps retain the previous local-entry completion. [`main_dynamodb_follower_test.go`](../../main_dynamodb_follower_test.go) covers both modes and malformed configuration. Redis, S3, and SQS map builders are unchanged.
 
 All production callers of the changed functions were audited with `rg`: three `commitItemWrite` callers (legacy, first dedup attempt, reused dedup attempt), one `runTransactWriteAttempt` caller, and one `buildLeaderDynamo` caller in runtime configuration.
@@ -110,6 +110,7 @@ All production callers of the changed functions were audited with `rg`: three `c
 ### Follower-ingress Jepsen evidence
 
 [`dynamodb_seal_workload.clj`](../../jepsen/src/elastickv/dynamodb_seal_workload.clj) reuses the existing DynamoDB append workload and Jepsen generator/checker library. Its local nemesis invokes the repository's `raftadmin`, verifies that leadership actually moves to a different node, and records the endpoints in the history. A separate checker rejects zero verified transfers or any failed transfer; a successful append checker alone is insufficient.
+Its DB setup deletes the previous `jepsen_append` table once before any client setup begins; the existing clients then recreate an empty generation. Only a missing table is ignored. This prevents a prior append history on the same cluster from contaminating the new check.
 
 The local run `20261022T231204.299+0900` used three separate server processes on loopback, no `raftDynamoMap`, 15 seconds, rate 30, concurrency 9, maximum transaction length 4, and a two-second transfer interval. The checker output was:
 
@@ -122,6 +123,18 @@ The local run `20261022T231204.299+0900` used three separate server processes on
 The raw history, `test.jepsen`, checker results, and workload log remain in `jepsen/store/elastickv-dynamodb-snapshot-seal/20261022T231204.299+0900/` in the acceptance worktree. The external launcher retains the per-node logs and topology separately. This is short-run safety evidence, not a claim of production availability or a partition/kill campaign; indeterminate client results are permitted by the existing workload.
 
 The [`Jepsen CI workflow`](../../.github/workflows/jepsen-test.yml) now omits the HTTP leader map and runs this workload in both encryption legs. Its artifact retains the seal history and tested revision even on success. Those new CI executions must be checked separately from the local run.
+
+### OS-process snapshot/restart evidence
+
+At source revision `69f2d932d03dfb45a1cd535418f8bbb076d8a43c`, a second local run (`20261022T232208.506+0900`) enabled `ELASTICKV_RAFT_SNAPSHOT_COUNT=20` on three separate server processes. The append and leader-change checkers passed with six verified transfers and no failed transfers. After the workload stopped, all three processes were terminated and reopened from their original data directories and bootstrap membership. The pre/post statuses were:
+
+| Node | Snapshot index before/after | Applied index before/after | Term before/after |
+| --- | ---: | ---: | ---: |
+| n1 | 401 / 401 | 404 / 407 | 8 / 9 |
+| n2 | 402 / 402 | 404 / 407 | 8 / 9 |
+| n3 | 402 / 402 | 404 / 407 | 8 / 9 |
+
+Consistent scans before and after restart matched all 17 items, including list order and values. The per-node logs, topology, and complete pre/post status plus item JSON are retained under `/private/tmp/elastickv-seal-jepsen-luUUDo/`; the Jepsen history remains in the acceptance worktree. The server binary SHA-256 was `6260694477d19fb7c6c9628accebfa5dcacbe6761ba7848e822b84420ca7f022`. The Go snapshot regression separately checks exact seal-timestamp preservation and stale-write rejection; the process experiment checks the persisted real-cluster data path, not just an in-memory restore.
 
 ### Contention measurements
 
@@ -141,7 +154,7 @@ All measured operations completed. Collision/hot-item contention increased retri
 
 - The real-Raft tests, all DynamoDB and existing one-phase dedup tests passed with `-race`; the leader-change case also passed ten consecutive runs.
 - `TestBuildLeaderDynamoWithoutHTTPMap` and scoped main/adapter lint passed. Lint used the repository's Go 1.26.6 toolchain because the locally installed analyzer cannot consume Go 1.27 export data.
-- The complete Jepsen unit suite passed: 207 tests, 579 assertions, zero failures/errors.
-- Full local `go test ./...` is not a pass: the pre-existing FUSE test references Linux-only `syscall.Statfs_t.Namelen` on macOS. Linux CI, the new encryption on/off Jepsen runs, and review of the acceptance changes remain gates.
+- The complete Jepsen unit suite after review fixes passed: 209 tests, 586 assertions, zero failures/errors.
+- Full local `go test ./...` is not a pass: the pre-existing FUSE test references Linux-only `syscall.Statfs_t.Namelen` on macOS, an unchanged backup renewal test hit its deadline (five isolated reruns passed), and vet overlapped a transient test edit (subsequent target runs passed). Linux CI, the new encryption on/off Jepsen runs, and current-HEAD review of the acceptance changes remain gates.
 
-The design remains Partial until those gates and the process-restart evidence are reconciled. Adding tests or changing the status alone does not complete acceptance.
+The design remains Partial until those CI and review gates are reconciled. Adding tests or changing the status alone does not complete acceptance.

@@ -3,9 +3,12 @@
   (:gen-class)
   (:require [clojure.java.shell :as shell]
             [clojure.string :as str]
+            [cognitect.aws.client.api :as aws]
             [elastickv.cli :as cli]
             [elastickv.dynamodb-workload :as dynamo]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
+            [jepsen.db :as db]
             [jepsen.generator :as gen]
             [jepsen.nemesis :as nemesis]))
 
@@ -56,6 +59,22 @@
          :verified-leader-changes (count changes)
          :failures (vec failures)}))))
 
+(defn fresh-append-db []
+  (reify db/DB
+    (setup! [_ test node]
+      ;; DB setup completes on every node before any client setup starts.
+      ;; Delete once; the existing clients recreate an empty new generation.
+      (when (= node (first (:nodes test)))
+        (let [opened (client/open! (:client test) test node)]
+          (try
+            (let [response (aws/invoke (:ddb opened)
+                                      {:op :DeleteTable :request {:TableName "jepsen_append"}})]
+              (when (and (:cognitect.anomalies/category response)
+                         (not= "ResourceNotFoundException" (:__type response)))
+                (throw (ex-info "cannot reset append table" {:response response}))))
+            (finally (client/close! opened test))))))
+    (teardown! [_ _ _] nil)))
+
 (defn seal-test [opts]
   (when-not (and (:local opts) (seq (:raftadmin-bin opts)) (seq (:raft-addresses opts)))
     (throw (ex-info "seal acceptance requires local mode, raftadmin-bin and raft-addresses" {})))
@@ -64,6 +83,7 @@
         interval (or (:leader-change-interval opts) 2)]
     (assoc base
       :name "elastickv-dynamodb-snapshot-seal"
+      :db (fresh-append-db)
       :nemesis (leader-transfer-nemesis (:raftadmin-bin opts) (:raft-addresses opts))
       :checker (checker/compose {:append (:checker workload) :leader-changes (leader-change-checker)})
       :generator (->> (:generator workload)

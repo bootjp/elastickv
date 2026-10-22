@@ -83,8 +83,8 @@ func sealRaftAppend(table, value string) updateItemInput {
 	return in
 }
 
-func sealRaftTxnUpdate(table, value string) transactWriteItem {
-	in := sealRaftAppend(table, value)
+func sealRaftTxnUpdate(table string) transactWriteItem {
+	in := sealRaftAppend(table, "3")
 	return transactWriteItem{Update: &transactUpdateInput{
 		TableName: in.TableName, Key: in.Key, UpdateExpression: in.UpdateExpression,
 		ExpressionAttributeNames: in.ExpressionAttributeNames, ExpressionAttributeValues: in.ExpressionAttributeValues,
@@ -180,7 +180,7 @@ func TestDynamoDBSnapshotSealRealRaftLeaderChangeFollowerIngress(t *testing.T) {
 	txnDone := make(chan error, 1)
 	go func() {
 		txnDone <- sealRaftHTTPCall(ctx, strings.TrimPrefix(httpServer.URL, "http://"), "TransactWriteItems", transactWriteItemsInput{
-			TransactItems: []transactWriteItem{sealRaftTxnUpdate(schema.TableName, "3")},
+			TransactItems: []transactWriteItem{sealRaftTxnUpdate(schema.TableName)},
 		})
 	}()
 	var sealed uint64
@@ -256,7 +256,7 @@ func TestDynamoDBSnapshotSealRealRaftTwoDataGroups(t *testing.T) {
 	second, secondCoord, releaseSecond := newDelayedSealRaftServer(t, server, true)
 	defer releaseSecond()
 	input := transactWriteItemsInput{TransactItems: []transactWriteItem{
-		sealRaftTxnUpdate(left.TableName, "3"), sealRaftTxnUpdate(right.TableName, "3"),
+		sealRaftTxnUpdate(left.TableName), sealRaftTxnUpdate(right.TableName),
 	}}
 	body, err := json.Marshal(input)
 	require.NoError(t, err)
