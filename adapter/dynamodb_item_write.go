@@ -483,9 +483,9 @@ func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInpu
 
 func (d *DynamoDBServer) commitItemWrite(ctx context.Context, readTimestamp kv.ReadTimestamp, req *kv.OperationGroup[kv.OP]) error {
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req)
+	_, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req)
 	if err != nil {
-		return errors.WithStack(normalizeDynamoWriteDispatchError(err))
+		return errors.WithStack(err)
 	}
 	return nil
 }

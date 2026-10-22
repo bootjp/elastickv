@@ -752,8 +752,7 @@ func (d *DynamoDBServer) runTransactWriteAttempt(
 		return true, nil
 	}
 	dispatchCtx := reqs.readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, reqs.group); err != nil {
-		err = normalizeDynamoWriteDispatchError(err)
+	if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, reqs.group); err != nil {
 		wrapped := errors.WithStack(err)
 		if !isRetryableTransactWriteError(err) {
 			return false, wrapped

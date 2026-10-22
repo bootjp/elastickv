@@ -205,7 +205,7 @@ func (d *DynamoDBServer) createTableWithRetry(ctx context.Context, tableName str
 		}
 		req.StartTS = readTS
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
+		if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err == nil {
 			return nil
 		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
@@ -319,7 +319,7 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 			},
 		}
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err != nil {
+		if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err != nil {
 			if !isRetryableTransactWriteError(err) {
 				return errors.WithStack(err)
 			}
@@ -377,6 +377,7 @@ func (d *DynamoDBServer) dispatchDeletedTableCleanupPrefix(ctx context.Context, 
 				{Op: kv.DelPrefix, Key: prefix},
 			},
 		})
+		err = normalizeDynamoWriteDispatchError(err)
 		if err == nil {
 			return nil
 		}
@@ -403,7 +404,7 @@ func (d *DynamoDBServer) dispatchDeleteBatch(ctx context.Context, keys [][]byte)
 	}
 	_, err := d.coordinator.Dispatch(ctx, req)
 	if err != nil {
-		return errors.WithStack(err)
+		return errors.WithStack(normalizeDynamoWriteDispatchError(err))
 	}
 	return nil
 }

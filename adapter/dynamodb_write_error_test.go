@@ -53,13 +53,57 @@ func TestNormalizeDynamoWriteDispatchError(t *testing.T) {
 type forwardedDynamoLockCoordinator struct {
 	kv.Coordinator
 	rejected atomic.Bool
+	failure  error
+	seal     bool
 }
 
 func (c *forwardedDynamoLockCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	if req != nil && req.IsTxn && !isDynamoSnapshotSealRequest(req) && c.rejected.CompareAndSwap(false, true) {
+	if req != nil && req.IsTxn && isDynamoSnapshotSealRequest(req) == c.seal && c.rejected.CompareAndSwap(false, true) {
+		if c.failure != nil {
+			return nil, c.failure
+		}
 		return nil, status.Error(codes.Unknown, "key: pending: txn locked")
 	}
 	return c.Coordinator.Dispatch(ctx, req)
+}
+
+func TestDynamoDBRetriesForwardedSnapshotSealConflict(t *testing.T) {
+	t.Parallel()
+	for _, sentinel := range []error{store.ErrWriteConflict, kv.ErrTxnLocked} {
+		t.Run(sentinel.Error(), func(t *testing.T) {
+			st := store.NewMVCCStore()
+			defer st.Close()
+			schema := dedupItemTable()
+			seedDedupItem(t, st, schema, "1")
+			coord := &forwardedDynamoLockCoordinator{
+				Coordinator: newOCCAdapterCoordinator(st),
+				seal:        true,
+				failure:     status.Error(codes.Aborted, "key: !ddb|seal|pending: "+sentinel.Error()),
+			}
+			server := NewDynamoDBServer(nil, st, coord)
+			_, err := server.updateItemWithRetry(context.Background(), appendListInput())
+			require.NoError(t, err)
+			require.True(t, coord.rejected.Load())
+			require.Equal(t, []string{"1", "3"}, readListValues(t, server, schema))
+		})
+	}
+}
+
+func TestDynamoDBCreateTableRetriesForwardedConflict(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	defer st.Close()
+	coord := &forwardedDynamoLockCoordinator{
+		Coordinator: newOCCAdapterCoordinator(st),
+		failure:     status.Error(codes.Unknown, "key: !ddb|meta|table|test: write conflict"),
+	}
+	server := NewDynamoDBServer(nil, st, coord)
+	schema := dedupItemTable()
+	require.NoError(t, server.createTableWithRetry(context.Background(), schema.TableName, schema))
+	require.True(t, coord.rejected.Load())
+	exists, err := server.tableExistsAt(context.Background(), schema.TableName, consistentReadLatestTS)
+	require.NoError(t, err)
+	require.True(t, exists)
 }
 
 func TestDynamoDBRetriesForwardedTxnLock(t *testing.T) {

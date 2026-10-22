@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"context"
 	"strings"
 
 	"github.com/bootjp/elastickv/kv"
@@ -9,6 +10,11 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+func (d *DynamoDBServer) dispatchWriteWithReadTimestamp(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	resp, err := kv.DispatchWithReadTimestamp(ctx, d.coordinator, req)
+	return resp, normalizeDynamoWriteDispatchError(err)
+}
 
 // Forwarded OCC conflicts lose their Go error chain. Restore only the known
 // wire envelope so item retries retain the existing exact-timestamp dedup path.

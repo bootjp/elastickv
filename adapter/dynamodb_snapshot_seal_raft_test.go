@@ -216,6 +216,35 @@ func sealRaftAdvanceWatermark(t *testing.T, ctx context.Context, coord kv.Coordi
 	require.NoError(t, err)
 }
 
+func TestDynamoDBRealRaftFollowerConcurrentCreateTable(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	nodes, _, _ := createNode(t, 3)
+	defer shutdown(nodes)
+	input := map[string]any{
+		"TableName":             "concurrent_seal_setup",
+		"AttributeDefinitions":  []map[string]string{{"AttributeName": "pk", "AttributeType": "S"}},
+		"KeySchema":             []map[string]string{{"AttributeName": "pk", "KeyType": "HASH"}},
+		"ProvisionedThroughput": map[string]int{"ReadCapacityUnits": 5, "WriteCapacityUnits": 5},
+	}
+	const clients = 9
+	done := make(chan error, clients)
+	for i := range clients {
+		address := nodes[1+i%2].dynamoAddress
+		go func() { done <- sealRaftHTTPCall(ctx, address, "CreateTable", input) }()
+	}
+	created := 0
+	for range clients {
+		err := sealRaftReceive(t, ctx, done)
+		if err == nil {
+			created++
+		} else {
+			require.ErrorContains(t, err, "ResourceInUseException", "concurrent setup must not leak a forwarded OCC conflict")
+		}
+	}
+	require.Equal(t, 1, created)
+}
+
 func TestDynamoDBSnapshotSealRealRaftTwoDataGroups(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
 	defer cancel()
