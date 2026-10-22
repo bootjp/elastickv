@@ -3358,6 +3358,7 @@ func startRaftServers(
 			relay,
 			append(internalOpts,
 				adapter.WithInternalStore(rt.store),
+				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 			)...,

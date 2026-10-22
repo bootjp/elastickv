@@ -41,12 +41,11 @@ durable state to confirm a primary ever recorded that commit timestamp.
 **Right:** the phase flag proves nothing. The exemption's entire evidence is
 attacker-supplied.
 
-**Overstated:** the summary reads as though this PR opens a hole. It does not.
-`kv/tso.go` does not exist on `origin/main`; `Internal.Forward` on main accepts
-*any* forwarded start and commit timestamp with no validation at all. This PR
-closes the general case and leaves one narrow window open. The window is a
-regression only against the PR's own stated invariant, not against shipped
-behaviour.
+**Historical context:** the original finding was against the Phase-D validation
+proposal, before `kv/tso.go` shipped. At that time the main branch accepted
+forwarded timestamps without these checks. The general validation and bounded
+creation window have since shipped; the remaining local-primary evidence check
+is described below.
 
 Also worth stating precisely: the invariant `ValidateDurablePersistenceTimestamp`
 exists to protect — "never persist at a timestamp group 0 has not issued yet" —
@@ -155,14 +154,31 @@ The production allocator wrappers expose `PhaseDFloor()`; a Phase-D allocator
 without a usable floor refuses new pre-D PREPAREs. COMMIT and ABORT bypass the
 creation window so they can resolve existing intents indefinitely.
 
-§4.1's decision is implemented and tested as `ClassifyPrePhaseDCommit`, but is
-**not yet wired**. It needs a signal the commit-validation path does not
-currently have: whether this node can definitively read the primary's record,
-as distinct from simply not finding one. `ShardStore.primaryTxnRecordedStatus`
-already draws that distinction with its `done` return, and exposing it to the
-forwarded-commit path is the remaining work. Wiring it without that signal
-would make a remote primary indistinguishable from a missing record and refuse
-exactly the cross-shard resolutions §4.1 is careful to preserve.
+§4.1 is wired through `WithInternalPrimaryCommitEvidence` in the production
+Internal service. `ValidateForwardedTxnCommitTimestamp` invokes the evidence
+check only when both timestamps enter its legacy resolution carve-out.
+`Internal.Forward` refuses a COMMIT before proposing it if the locally readable
+primary record is missing or disagrees. ABORT and valid post-D commits do not
+perform the additional evidence read.
+
+`ShardStore.PrimaryCommitEvidence` provides the separate readability signal.
+It uses the primary's physical owner, including partition-map routing, requires
+a local active/non-staged store and verified leadership, and reads directly
+without proxying to another primary. It discards the verdict if catalog version,
+partition owner, or leadership changes while reading. Unavailable, remote,
+follower, or migration-staged owners return an unknown verdict rather than a
+missing record; actual storage or decoding failures return errors.
+
+The older `primaryTxnRecordedStatus` helper is not this signal: its `done`
+return means a transaction decision was found, not that an absent record was
+read authoritatively. Reusing it would conflate missing and unavailable records.
+
+Regression coverage includes missing/matching/mismatched decisions, unknown
+and follower owners, partition routing and ownership changes, ABORT/post-D
+bypass, every primary in a batch, proposal rejection, corrupt records, and
+commit-record persistence across Pebble reopen. Full distributed cutover and
+leader-change acceptance have not been demonstrated by these focused tests;
+the document remains Partial until that acceptance evidence is available.
 
 ## 5. Open questions for review
 
@@ -177,5 +193,6 @@ exactly the cross-shard resolutions §4.1 is careful to preserve.
 4. Should the `ABORT` path get its own rule, given its timestamp is synthesised
    rather than recorded?
 
-Settled in §4a. The carve-out is now bounded by §4.2; §4.1 remains to be wired
-behind a local-primary readability signal.
+Settled in §4a. Both mechanisms are wired. Remaining acceptance must exercise
+the real forwarded path across Phase-D activation and leader changes, including
+a remote-primary resolution after the creation window has closed.

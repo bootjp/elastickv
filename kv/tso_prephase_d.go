@@ -1,13 +1,14 @@
 package kv
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/errors"
 )
 
 // The §4.3 closure of the pre-Phase-D resolution carve-out
-// (docs/design/2026_09_02_proposed_prephase_d_resolution_evidence.md).
+// (docs/design/2026_09_02_partial_prephase_d_resolution_evidence.md).
 //
 // The carve-out exists because a cross-shard transaction that began before the
 // Phase-D marker can still hold unresolved intents afterwards, and resolving
@@ -103,6 +104,12 @@ type PrimaryCommitEvidence struct {
 	Found bool
 	// CommitTS is the timestamp that record carries.
 	CommitTS uint64
+}
+
+// PrimaryCommitEvidenceReader distinguishes a missing local record from a
+// primary whose authoritative record cannot be read on this node.
+type PrimaryCommitEvidenceReader interface {
+	PrimaryCommitEvidence(context.Context, []byte, uint64) (PrimaryCommitEvidence, error)
 }
 
 // ClassifyPrePhaseDCommit decides whether a pre-Phase-D commit resolution may

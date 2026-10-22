@@ -353,6 +353,8 @@ func ValidateDurablePersistenceTimestamp(ctx context.Context, alloc TimestampAll
 
 // ValidateForwardedTxnCommitTimestamp validates the commit timestamp of a
 // forwarded transaction whose caller already stamped it.
+// verifyLegacyResolution, when provided, checks durable primary evidence only
+// for the pre-Phase-D resolution carve-out; it is not called for valid new timestamps.
 //
 // It is ValidateDurablePersistenceTimestamp with one carve-out: a commit
 // timestamp that predates Phase D is accepted when the transaction's own start
@@ -379,6 +381,7 @@ func ValidateForwardedTxnCommitTimestamp(
 	commitTS uint64,
 	resolution bool,
 	label string,
+	verifyLegacyResolution func(context.Context) error,
 ) error {
 	err := ValidateDurablePersistenceTimestamp(ctx, alloc, commitTS, label)
 	if err == nil || !errors.Is(err, ErrTSOTimestampPrePhaseD) {
@@ -393,6 +396,9 @@ func ValidateForwardedTxnCommitTimestamp(
 	}
 	startErr := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
 	if startErr != nil && errors.Is(startErr, ErrTSOTimestampPrePhaseD) {
+		if verifyLegacyResolution != nil {
+			return errors.WithStack(verifyLegacyResolution(ctx))
+		}
 		return nil
 	}
 	return err

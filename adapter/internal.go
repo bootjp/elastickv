@@ -55,6 +55,12 @@ func WithInternalStore(st store.MVCCStore) InternalOption {
 	}
 }
 
+func WithInternalPrimaryCommitEvidence(reader kv.PrimaryCommitEvidenceReader) InternalOption {
+	return func(i *Internal) {
+		i.primaryCommitEvidence = reader
+	}
+}
+
 func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption {
 	return func(i *Internal) {
 		i.migrationProposer = proposer
@@ -127,6 +133,7 @@ type Internal struct {
 	lastCommitTimestamp     func() uint64
 	relay                   *RedisPubSubRelay
 	store                   store.MVCCStore
+	primaryCommitEvidence   kv.PrimaryCommitEvidenceReader
 	migrationProposer       raftengine.Proposer
 	migrationImportGate     func(context.Context) error
 	migrationPromoteGate    func(context.Context) error
@@ -1111,7 +1118,9 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		}
 	} else if err := kv.ValidateForwardedTxnCommitTimestamp(
 		ctx, i.tsAllocator, startTS, commitTS, resolution,
-		"fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
+		"fillForwardedTxnCommitTS: forwarded commit ts", func(ctx context.Context) error {
+			return i.verifyLegacyCommitEvidence(ctx, reqs, startTS, commitTS)
+		}); err != nil {
 		// A commit timestamp that arrived already set in the transaction meta
 		// is the timestamp every mutation in this batch is persisted under, and
 		// it never passed through the coordinator's own validation. A legacy
@@ -1128,6 +1137,33 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		return 0, err
 	}
 	return commitTS, nil
+}
+
+func (i *Internal) verifyLegacyCommitEvidence(ctx context.Context, reqs []*pb.Request, startTS, commitTS uint64) error {
+	if i.primaryCommitEvidence == nil {
+		return nil
+	}
+	for _, req := range reqs {
+		if req == nil || req.Phase != pb.Phase_COMMIT {
+			continue
+		}
+		mutation, ok := forwardedTxnMetaMutation(req, []byte(kv.TxnMetaPrefix))
+		if !ok {
+			continue
+		}
+		meta, err := kv.DecodeTxnMeta(mutation.Value)
+		if err != nil {
+			return errors.WithStack(err)
+		}
+		evidence, err := i.primaryCommitEvidence.PrimaryCommitEvidence(ctx, meta.PrimaryKey, startTS)
+		if err != nil {
+			return errors.Wrap(err, "validate legacy primary commit evidence")
+		}
+		if err := kv.ClassifyPrePhaseDCommit(evidence, commitTS, false); err != nil {
+			return errors.Wrap(err, "validate legacy primary commit decision")
+		}
+	}
+	return nil
 }
 
 func stampRequestMutationCommitTS(reqs []*pb.Request, commitTS uint64) error {
