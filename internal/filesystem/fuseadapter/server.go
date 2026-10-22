@@ -636,8 +636,29 @@ func newServerContext(ctx context.Context, fs *RawFileSystem, mountPoint string,
 		}
 		return res.server, nil
 	case <-ctx.Done():
-		go releaseAbandonedMount(results, fs, mountPoint, fuseTypeFor(opts.Name))
+		fs.cancelInFlight()
+		if !joinAbandonedMount(func() {
+			releaseAbandonedMount(results, fs, mountPoint, fuseTypeFor(opts.Name))
+		}, abandonedUnmountTimeout+abandonedDetachTimeout) {
+			slog.ErrorContext(ctx, "filesystem late mount cleanup exceeded shutdown budget", "mount_point", mountPoint)
+		}
 		return nil, errors.Wrap(ctx.Err(), "filesystem FUSE mount cancelled while waiting for the mount helper")
+	}
+}
+
+func joinAbandonedMount(release func(), timeout time.Duration) bool {
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		release()
+	}()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+		return true
+	case <-timer.C:
+		return false
 	}
 }
 
