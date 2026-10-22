@@ -1514,7 +1514,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// applying this log entry. The retention-window > max-retry-latency
 	// invariant prevents the rare case where a real never-landed retry
 	// arrives with PrevCommitTS below pebble's compacted floor.
-	dedup, err := f.dedupProbeOnePhase(ctx, meta, r.ReadKeys)
+	dedup, err := f.dedupProbeOnePhase(ctx, meta, r.ReadKeys, muts)
 	if err != nil {
 		return err
 	}
@@ -1531,7 +1531,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	if err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
+	if err := f.store.ApplyMutationsRaftAtFenced(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObservers(commitTS, uniq)
@@ -1630,7 +1630,7 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorWithSnapshot(muts []*pb.Mutation, co
 // Returns (true, nil) → the entry must no-op (prior attempt landed).
 // Returns (false, nil) → fall through to normal apply.
 // Returns (false, err) → propagate err; apply must not proceed.
-func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [][]byte) (bool, error) {
+func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [][]byte, muts []*pb.Mutation) (bool, error) {
 	if meta.PrevCommitTS == 0 {
 		return false, nil
 	}
@@ -1639,7 +1639,7 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [
 		return false, errors.WithStack(err)
 	}
 	if landed {
-		return true, nil
+		return f.priorListItemsMatch(ctx, muts, readKeys, meta.PrevCommitTS)
 	}
 	for _, stagedKey := range stagedVisibilityKeysForReadAlias(readKeys, meta.PrimaryKey, meta.PrimaryKey) {
 		landed, err = f.store.CommittedVersionAt(ctx, stagedKey, meta.PrevCommitTS)
@@ -1647,10 +1647,42 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [
 			return false, errors.WithStack(err)
 		}
 		if landed {
-			return true, nil
+			return f.priorListItemsMatch(ctx, muts, readKeys, meta.PrevCommitTS)
 		}
 	}
 	return false, nil
+}
+
+// A timestamp may be issued by two leaders during a handoff. The existence
+// of an item version at PrevCommitTS alone cannot identify this retry: a
+// different append can have written the same list position at that timestamp.
+func (f *kvFSM) priorListItemsMatch(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, prevTS uint64) (bool, error) {
+	for _, mut := range muts {
+		if mut == nil || !store.IsListItemKey(mut.Key) || mut.Op != pb.Op_PUT {
+			continue
+		}
+		keys := append([][]byte{mut.Key}, stagedVisibilityKeysForReadAlias(readKeys, mut.Key, mut.Key)...)
+		matched := false
+		for _, key := range keys {
+			landed, err := f.store.CommittedVersionAt(ctx, key, prevTS)
+			if err != nil {
+				return false, errors.WithStack(err)
+			}
+			if !landed {
+				continue
+			}
+			value, err := f.store.GetAt(ctx, key, prevTS)
+			if err != nil {
+				return false, errors.WithStack(err)
+			}
+			matched = bytes.Equal(value, mut.Value)
+			break
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func stagedVisibilityJobIDsForReadAlias(readKeys [][]byte, aliasRawKey []byte) []uint64 {

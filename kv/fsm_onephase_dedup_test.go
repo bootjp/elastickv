@@ -69,6 +69,36 @@ func TestOnePhaseDedup_NoOpsWhenPriorAttemptLanded(t *testing.T) {
 	require.Equal(t, uint64(20), latest, "newest version must remain attempt 1's at 20")
 }
 
+func TestOnePhaseDedup_DifferentWriteAtPriorTimestampIsNotOurAttempt(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+	key := store.ListItemKey([]byte("jepsen-list"), 43)
+	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(10, 20, 0, key, []byte("45"))))
+
+	// A second append allocated the same timestamp, but its first attempt
+	// never landed. Its retry must not mistake the first append for itself.
+	err := applyFSMRequest(t, fsm, onePhaseReq(10, 40, 20, key, []byte("44")))
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	got, err := st.GetAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.Equal(t, []byte("45"), got)
+}
+
+func TestOnePhaseDedup_ListItemRetryWithMatchingValueNoOps(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+	key := store.ListItemKey([]byte("jepsen-list"), 43)
+	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(10, 20, 0, key, []byte("44"))))
+	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(30, 40, 20, key, []byte("44"))))
+	landed, err := st.CommittedVersionAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.False(t, landed)
+}
+
 func TestOnePhaseDedup_NoOpsWhenPriorAttemptLandedAsStagedVersion(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
