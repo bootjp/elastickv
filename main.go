@@ -1262,6 +1262,9 @@ func runFilesystemLeaseReaper(
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
+		if ctx.Err() != nil {
+			return nil
+		}
 		stats, err := reaper.ReapExpiredOpenHandleLeases(ctx, 0)
 		if err != nil && ctx.Err() == nil {
 			slog.WarnContext(ctx, "filesystem lease reaper failed", "err", err)
