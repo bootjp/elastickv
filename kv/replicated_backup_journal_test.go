@@ -238,3 +238,40 @@ func TestReplicatedPinJournalMissingOrCorruptStateStaysInactive(t *testing.T) {
 		require.Error(t, err, "corrupt state %s", value)
 	}
 }
+
+func TestReplicatedPinJournalLeavesLegacyUserNamespaceUntouched(t *testing.T) {
+	t.Parallel()
+	for _, deleted := range []bool{false, true} {
+		t.Run(map[bool]string{false: "value", true: "tombstone"}[deleted], func(t *testing.T) {
+			t.Parallel()
+			st := g17OpenStore(t, t.TempDir())
+			ctx := context.Background()
+			legacyKey := []byte("!txn|control|backup-pins")
+			require.NoError(t, st.PutAt(ctx, legacyKey, []byte("user"), 10, 0))
+			if deleted {
+				require.NoError(t, st.DeleteAt(ctx, legacyKey, 11))
+			}
+			seedActivatedPinJournal(t, st)
+			journal := newPinJournal(t, st)
+			require.NoError(t, journal.apply(ctx, 2, pinCommand(replicatedPinAdmit, 1)))
+			snapshot, err := st.Snapshot()
+			require.NoError(t, err)
+			defer snapshot.Close()
+			var data bytes.Buffer
+			_, err = snapshot.WriteTo(&data)
+			require.NoError(t, err)
+			target := g17OpenStore(t, t.TempDir())
+			require.NoError(t, target.Restore(&data))
+			require.Equal(t, journal.snapshot(), newPinJournal(t, target).snapshot())
+			for _, current := range []store.MVCCStore{st, target} {
+				got, err := current.GetAt(ctx, legacyKey, ^uint64(0))
+				if deleted {
+					require.ErrorIs(t, err, store.ErrKeyNotFound)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, []byte("user"), got)
+				}
+			}
+		})
+	}
+}

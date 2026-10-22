@@ -8,7 +8,11 @@ import (
 	"github.com/cockroachdb/pebble/v2"
 )
 
-const ReplicatedControlPrefix = "!txn|control|"
+// This is a child of the already-reserved transaction metadata namespace.
+// Reserving a new !txn| family would hide valid pre-upgrade user keys.
+const ReplicatedControlPrefix = "!txn|meta|ttl-inline-control|"
+
+var ErrReplicatedControlCollision = errors.New("replicated control state collides with existing MVCC versions")
 
 // ReplicatedControlStore persists one FSM control-state replacement and its
 // applied index atomically. False means the durable store already applied that
@@ -40,6 +44,14 @@ func (s *mvccStore) ApplyReplicatedControlState(ctx context.Context, key, value 
 	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if value, exists := s.tree.Get(key); exists {
+		versions, _ := value.([]VersionedValue)
+		for _, version := range versions {
+			if version.TS != 0 || version.Tombstone || version.ExpireAt != 0 {
+				return false, errors.WithStack(ErrReplicatedControlCollision)
+			}
+		}
+	}
 	// Version zero is a fixed internal metadata slot, not a user timestamp.
 	// Replacing it allocates no HLC value and cannot raise LastCommitTS.
 	s.putVersionLocked(key, value, 0, 0)
@@ -63,7 +75,37 @@ func (s *pebbleStore) ApplyReplicatedControlState(ctx context.Context, key, valu
 			return false, nil
 		}
 	}
+	if err := s.checkReplicatedControlCollision(ctx, key); err != nil {
+		return false, err
+	}
 	return s.writeReplicatedControlBatch(key, value, appliedIndex)
+}
+
+func (s *pebbleStore) checkReplicatedControlCollision(ctx context.Context, key []byte) error {
+	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	defer iter.Close()
+	var seekKey, upperBound []byte
+	ts, exists, err := s.latestCommitTSWithIter(ctx, iter, key, &seekKey, &upperBound, false, 0)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return nil
+	}
+	if ts != 0 {
+		return errors.WithStack(ErrReplicatedControlCollision)
+	}
+	tombstone, expireAt, _, err := decodeValueHeader(iter.Value())
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if tombstone || expireAt != 0 {
+		return errors.WithStack(ErrReplicatedControlCollision)
+	}
+	return nil
 }
 
 func (s *pebbleStore) writeReplicatedControlBatch(key, value []byte, appliedIndex uint64) (bool, error) {

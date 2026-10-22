@@ -107,3 +107,36 @@ func TestReplicatedControlStateEncryptedSnapshotAndReopen(t *testing.T) {
 	require.True(t, present)
 	require.Equal(t, uint64(7), index)
 }
+
+func TestReplicatedControlStateRejectsExistingVersionOrTombstone(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	for name, factory := range absenceTestStores(t) {
+		for _, deleted := range []bool{false, true} {
+			t.Run(name+map[bool]string{false: "/value", true: "/tombstone"}[deleted], func(t *testing.T) {
+				t.Parallel()
+				st := factory(t)
+				key := []byte(ReplicatedControlPrefix + "backup-pins")
+				require.NoError(t, st.PutAt(ctx, key, []byte("preexisting"), 10, 0))
+				if deleted {
+					require.NoError(t, st.DeleteAt(ctx, key, 11))
+				}
+				applied, err := controlStore(t, st).ApplyReplicatedControlState(ctx, key, []byte("control"), 7)
+				require.ErrorIs(t, err, ErrReplicatedControlCollision)
+				require.False(t, applied)
+				got, err := st.GetAt(ctx, key, ^uint64(0))
+				if deleted {
+					require.ErrorIs(t, err, ErrKeyNotFound)
+				} else {
+					require.NoError(t, err)
+					require.Equal(t, []byte("preexisting"), got)
+				}
+				if reader, ok := st.(interface{ LastAppliedIndex() (uint64, bool, error) }); ok {
+					_, present, err := reader.LastAppliedIndex()
+					require.NoError(t, err)
+					require.False(t, present, "a refused installation must not publish its applied index")
+				}
+			})
+		}
+	}
+}
