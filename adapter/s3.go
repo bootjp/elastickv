@@ -1175,18 +1175,12 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		}
 		if !found {
 			cleanupManifest = nil
-			return nil
+			return validateS3AbsentObjectDelete(r, bucket, objectKey)
 		}
-		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-			IsTxn:   true,
-			StartTS: startTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: headKey},
-			},
-		})
-		if err != nil {
-			return errors.WithStack(err)
+		if err := s.dispatchConditionalObjectDelete(
+			r, readTimestamp, startTS, headKey, manifest, bucket, objectKey,
+		); err != nil {
+			return err
 		}
 		cleanupManifest = manifest
 		generation = meta.Generation
@@ -1200,6 +1194,14 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, cleanupManifest)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func validateS3AbsentObjectDelete(r *http.Request, bucket, objectKey string) error {
+	if _, conditional := r.Header[http.CanonicalHeaderKey("If-Match")]; conditional {
+		return newS3ResponseError(http.StatusNotFound, "NoSuchKey",
+			"object not found", bucket, objectKey)
+	}
+	return nil
 }
 
 func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
@@ -2659,6 +2661,89 @@ func validateS3PutPreconditions(ifMatch, ifNoneMatch string, previous *s3ObjectM
 		}
 	}
 	return nil
+}
+
+// dispatchConditionalObjectDelete evaluates If-Match against the manifest the
+// surrounding transaction already loaded, then removes the head key.
+//
+// DELETE honours If-Match, like PUT does via validateS3PutPreconditions.
+// Accepting the header and deleting anyway is worse than not supporting it: a
+// caller that reads an object, decides it is reclaimable, and sends a
+// conditional delete believes the condition protects it against a concurrent
+// rewrite. It did not -- the object was removed whatever its current ETag -- so
+// the rewrite was silently lost.
+func (s *S3Server) dispatchConditionalObjectDelete(
+	r *http.Request,
+	readTimestamp kv.ReadTimestamp,
+	startTS uint64,
+	headKey []byte,
+	manifest *s3ObjectManifest,
+	bucket, objectKey string,
+) error {
+	if err := validateS3DeletePreconditions(r, manifest); err != nil {
+		return newS3ResponseError(http.StatusPreconditionFailed, "PreconditionFailed",
+			err.Error(), bucket, objectKey)
+	}
+	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: headKey},
+		},
+	}); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// validateS3DeletePreconditions enforces If-Match on DELETE.
+//
+// Separate from validateS3PutPreconditions because the two headers mean
+// different things on a delete: If-Match is a guard against removing a
+// version the caller has not seen, while If-None-Match: * ("only if
+// absent") is meaningless for an operation whose whole purpose is to
+// remove something that exists, so it is not honoured here.
+//
+// previous is the manifest the surrounding transaction already loaded at
+// its read timestamp, so the comparison is against the same version the
+// delete will remove -- not a separately-read one that could have moved
+// in between.
+func validateS3DeletePreconditions(r *http.Request, previous *s3ObjectManifest) error {
+	if r == nil {
+		return nil
+	}
+	values, present := r.Header[http.CanonicalHeaderKey("If-Match")]
+	if !present {
+		return nil
+	}
+	if previous == nil {
+		return errors.New("etag precondition failed")
+	}
+	for _, value := range values {
+		// S3 ETags contain no commas; multiple header lines and HTTP's
+		// comma-separated validator list have the same any-match rule.
+		for _, candidate := range strings.Split(value, ",") {
+			if s3DeleteIfMatchCandidateMatches(candidate, previous.ETag) {
+				return nil
+			}
+		}
+	}
+	return errors.New("etag precondition failed")
+}
+
+func s3DeleteIfMatchCandidateMatches(candidate, etag string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "*" {
+		return true
+	}
+	if strings.HasPrefix(candidate, "W/") {
+		return false // If-Match requires a strong comparison.
+	}
+	if strings.HasPrefix(candidate, `"`) && strings.HasSuffix(candidate, `"`) && len(candidate) >= 2 {
+		candidate = candidate[1 : len(candidate)-1]
+	}
+	return candidate != "" && candidate == etag
 }
 
 func cloneLeaderAddrMap(src map[string]string) map[string]string {
