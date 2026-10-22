@@ -485,7 +485,7 @@ func (d *DynamoDBServer) commitItemWrite(ctx context.Context, readTimestamp kv.R
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	_, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req)
 	if err != nil {
-		return errors.WithStack(err)
+		return errors.WithStack(normalizeDynamoWriteDispatchError(err))
 	}
 	return nil
 }
