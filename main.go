@@ -408,9 +408,13 @@ func startFSMCompactorIfEnabled(ctx context.Context, eg *errgroup.Group, runtime
 	slog.Info("fsm compactor disabled", "env", fsmCompactorEnabledEnvVar)
 }
 
-func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator) *adapter.DeltaCompactor {
+func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Coordinator, metricsRegistry *monitoring.Registry) *adapter.DeltaCompactor {
 	if enabledEnv(redisDeltaCompactorEnabledEnvVar) {
-		return adapter.NewDeltaCompactor(shardStore, coordinate)
+		var opts []adapter.DeltaCompactorOption
+		if obs := metricsRegistry.RedisTTLInlineMigrationObserver(); obs != nil {
+			opts = append(opts, adapter.WithDeltaCompactorTTLInlineMigrationObserver(obs))
+		}
+		return adapter.NewDeltaCompactor(shardStore, coordinate, opts...)
 	}
 	slog.Info("redis delta compactor disabled", "env", redisDeltaCompactorEnabledEnvVar)
 	return nil
@@ -511,6 +515,12 @@ func run() error {
 	); err != nil {
 		return err
 	}
+	// Startup has hydrated every keystore, so the KEK unwrap cache has
+	// served its purpose. Seal it: the same wrapper is retained by
+	// every applier for the process lifetime, and an unsealed cache
+	// would keep a plaintext copy of every DEK a later rotation
+	// unwraps.
+	encryption.SealStartupUnwrapCache(kekUnwrapper)
 
 	// Record the active FSM apply sync mode so operators can see on the
 	// /metrics endpoint which durability posture this node is running in.
@@ -1853,6 +1863,15 @@ func loadKEKAndRunStartupGuards(unwrapObserver monitoring.KEKUnwrapObserver) (ke
 	// elastickv_encryption_kek_unwrap_seconds empty despite completed
 	// KMS calls.
 	kekWrapper = monitoring.NewTimedKEKUnwrapper(kekWrapper, unwrapObserver)
+	// Memoize unwraps across the startup phase. The §9.1 guards and
+	// HydrateKeystoreFromSidecar each unwrap every wrapped DEK, which
+	// was free under the file KEK but is a doubled network round-trip
+	// per DEK now that Stage 9B shipped the KMS providers.
+	//
+	// The cache sits OUTSIDE the timer on purpose: a cache hit must
+	// not be recorded as a zero-duration KMS call, which would flatten
+	// elastickv_encryption_kek_unwrap_seconds.
+	kekWrapper = encryption.NewStartupUnwrapCache(kekWrapper)
 	if err := encryption.CheckStartupGuards(encryption.StartupConfig{
 		EncryptionEnabled: *encryptionEnabled,
 		KEKConfigured:     kekWrapper != nil,
@@ -3487,7 +3506,7 @@ func prepareRedisServer(ctx context.Context, lc *net.ListenConfig, redisAddr str
 	if err != nil {
 		return nil, nil, nil, errors.Wrapf(err, "failed to listen on %s", redisAddr)
 	}
-	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate)
+	deltaCompactor := newRedisDeltaCompactorIfEnabled(shardStore, coordinate, metricsRegistry)
 	redisOpts := []adapter.RedisServerOption{
 		adapter.WithRedisActiveTimestampTracker(readTracker),
 		adapter.WithRedisRequestObserver(metricsRegistry.RedisObserver()),

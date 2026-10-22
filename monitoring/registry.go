@@ -14,25 +14,26 @@ type Registry struct {
 	registerer   prometheus.Registerer
 	gatherer     prometheus.Gatherer
 
-	dynamo        *DynamoDBMetrics
-	redis         *RedisMetrics
-	raft          *RaftMetrics
-	lua           *LuaMetrics
-	hotPath       *HotPathMetrics
-	pebble        *PebbleMetrics
-	writeConflict *WriteConflictMetrics
-	sqs           *SQSMetrics
-	sqsObserver   *SQSObserver
-	fs            *FileSystemMetrics
-	s3            *S3Metrics
-	hlc           *HLCMetrics
-	hlcObserver   *HLCObserver
-	coldStart     *ColdStartMetrics
-	coldStartObs  *ColdStartObserver
-	tso           *TSOMetrics
-	tsoObserver   *TSOObserver
-	encryption    *EncryptionMetrics
-	encryptionObs *EncryptionStateObserver
+	dynamo         *DynamoDBMetrics
+	redis          *RedisMetrics
+	raft           *RaftMetrics
+	lua            *LuaMetrics
+	hotPath        *HotPathMetrics
+	pebble         *PebbleMetrics
+	writeConflict  *WriteConflictMetrics
+	sqs            *SQSMetrics
+	sqsObserver    *SQSObserver
+	fs             *FileSystemMetrics
+	s3             *S3Metrics
+	hlc            *HLCMetrics
+	hlcObserver    *HLCObserver
+	coldStart      *ColdStartMetrics
+	coldStartObs   *ColdStartObserver
+	tso            *TSOMetrics
+	tsoObserver    *TSOObserver
+	encryption     *EncryptionMetrics
+	encryptionObs  *EncryptionStateObserver
+	redisTTLInline *RedisTTLInlineMigrationMetrics
 }
 
 // NewRegistry builds a registry with constant labels that identify the local node.
@@ -67,6 +68,7 @@ func NewRegistry(nodeID string, nodeAddress string) *Registry {
 	r.tsoObserver = newTSOObserver(r.tso)
 	r.encryption = newEncryptionMetrics(registerer)
 	r.encryptionObs = newEncryptionStateObserver(r.encryption)
+	r.redisTTLInline = newRedisTTLInlineMigrationMetrics(registerer)
 	return r
 }
 
@@ -286,6 +288,15 @@ func (r *Registry) HLCObserver() *HLCObserver {
 		return nil
 	}
 	return r.hlcObserver
+}
+
+// RedisTTLInlineMigrationObserver returns the observer the Redis delta
+// compactor reports its completed TTL-inline migration passes to.
+func (r *Registry) RedisTTLInlineMigrationObserver() RedisTTLInlineMigrationObserver {
+	if r == nil || r.redisTTLInline == nil {
+		return nil
+	}
+	return r.redisTTLInline
 }
 
 // TSOObserver returns the shared runtime TSO observer. The kv package consumes

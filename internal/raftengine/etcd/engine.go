@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"io"
 	"log/slog"
+	"maps"
 	"math"
 	"os"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
 	etcdraft "go.etcd.io/raft/v3"
 	raftpb "go.etcd.io/raft/v3/raftpb"
+	"go.etcd.io/raft/v3/tracker"
 	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/proto"
 )
@@ -1597,7 +1599,9 @@ func (e *Engine) Status() raftengine.Status {
 	}
 	e.mu.RLock()
 	defer e.mu.RUnlock()
-	return e.status
+	status := e.status
+	status.PerPeer = maps.Clone(status.PerPeer)
+	return status
 }
 
 func (e *Engine) Configuration(ctx context.Context) (raftengine.Configuration, error) {
@@ -3858,8 +3862,51 @@ func (e *Engine) resolveReadyReads() {
 	}
 }
 
+// peerProgress snapshots the leader's replication tracker.
+//
+// Only the leader tracks progress, so a follower returns nil rather
+// than an empty map: the two would otherwise be indistinguishable, and
+// an operator reading an empty map on a follower could conclude the
+// cluster has no peers.
+//
+// rawNode.WithProgress is used instead of rawNode.Status() because
+// this runs on every Ready: Status() deep-copies the whole progress
+// map plus the config, while WithProgress visits in place and lets us
+// allocate exactly one small map sized to the peer count.
+func (e *Engine) peerProgress(state raftengine.State) map[uint64]raftengine.PeerProgress {
+	if state != raftengine.StateLeader {
+		return nil
+	}
+	// Allocated up front, not lazily inside the visitor: a
+	// single-node leader visits only itself, which is skipped, and a
+	// lazily-built map would leave a healthy peerless leader
+	// reporting nil — indistinguishable from a follower to any
+	// consumer testing PerPeer == nil.
+	out := make(map[uint64]raftengine.PeerProgress)
+	e.rawNode.WithProgress(func(id uint64, _ etcdraft.ProgressType, pr tracker.Progress) {
+		if id == e.nodeID {
+			// The leader's own entry tracks itself; operators care
+			// about remote replicas.
+			return
+		}
+		e.mu.RLock()
+		peerID := e.peers[id].ID
+		e.mu.RUnlock()
+		out[id] = raftengine.PeerProgress{
+			ID:           peerID,
+			Match:        pr.Match,
+			Next:         pr.Next,
+			IsLearner:    pr.IsLearner,
+			RecentActive: pr.RecentActive,
+		}
+	})
+	return out
+}
+
 func (e *Engine) refreshStatus() {
-	previous := e.Status().State
+	e.mu.RLock()
+	previous := e.status.State
+	e.mu.RUnlock()
 	basic := e.rawNode.BasicStatus()
 	lastLogIndex, _ := e.storage.LastIndex()
 	snapshot, _ := e.storage.Snapshot()
@@ -3882,12 +3929,14 @@ func (e *Engine) refreshStatus() {
 		ConfigurationIndex: e.currentConfigIndex(),
 		LeadTransferee:     basic.LeadTransferee,
 		PendingConfChange:  e.hasPendingConfChange(),
+		PerPeer:            e.peerProgress(state),
 	}
 
 	e.mu.Lock()
 	e.status = status
 	if e.closed {
 		e.status.State = raftengine.StateShutdown
+		e.status.PerPeer = nil
 	}
 	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
 	// cluster correctly hits the leader-of-1 fast path: a learner does
@@ -3952,6 +4001,7 @@ func (e *Engine) shutdown() {
 	wasLeader := e.status.State == raftengine.StateLeader
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
+	e.status.PerPeer = nil
 	e.mu.Unlock()
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
@@ -4010,6 +4060,7 @@ func (e *Engine) fail(err error) {
 	}
 	e.closed = true
 	e.status.State = raftengine.StateShutdown
+	e.status.PerPeer = nil
 	e.mu.Unlock()
 	// Signal the run loop so that callers which invoke fail without returning
 	// from run themselves (notably handleStep) still exit on the next select.

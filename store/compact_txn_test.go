@@ -12,62 +12,24 @@ import (
 
 // --- mvccStore: txn internal key compaction ---
 
-// TestMVCCStore_Compact_TxnLockSingleVersionPreserved verifies that an active
-// lock (single version) is not removed by compaction.
-func TestMVCCStore_Compact_TxnLockSingleVersionPreserved(t *testing.T) {
-	ctx := context.Background()
-	st := NewMVCCStore()
-
-	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock|k1")...)
-
-	require.NoError(t, st.PutAt(ctx, txnKey, []byte("lock-data"), 10, 0))
-
-	require.NoError(t, st.Compact(ctx, 20))
-
-	val, err := st.GetAt(ctx, txnKey, 20)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("lock-data"), val)
-}
-
-// TestMVCCStore_Compact_TxnLockOldVersionRemoved verifies that after a lock is
-// resolved (tombstoned), compaction removes the old lock data version.
-func TestMVCCStore_Compact_TxnLockOldVersionRemoved(t *testing.T) {
-	ctx := context.Background()
-	st := NewMVCCStore()
-
-	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock|k1")...)
-
-	// PREPARE writes lock at TS=10, COMMIT writes tombstone at TS=20.
-	require.NoError(t, st.PutAt(ctx, txnKey, []byte("lock-data"), 10, 0))
-	require.NoError(t, st.DeleteAt(ctx, txnKey, 20))
-
-	// Before compaction: 2 versions
-	require.NoError(t, st.Compact(ctx, 25))
-
-	// After compaction: old version (TS=10) removed, tombstone (TS=20) kept.
-	// Reading the key should return not-found (tombstone).
-	_, err := st.GetAt(ctx, txnKey, 25)
-	require.ErrorIs(t, err, ErrKeyNotFound)
-}
-
 // TestMVCCStore_Compact_TxnCommitRecordPreserved verifies that a commit record
 // (single version) is not removed by compaction.
 func TestMVCCStore_Compact_TxnCommitRecordPreserved(t *testing.T) {
-	ctx := context.Background()
-	st := NewMVCCStore()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	cmtKey := append([]byte(nil), txnInternalKeyPrefix...)
-	cmtKey = append(cmtKey, []byte("cmt|pk1\x00\x00\x00\x00\x00\x00\x00\x0a")...)
+		cmtKey := append([]byte(nil), txnInternalKeyPrefix...)
+		cmtKey = append(cmtKey, []byte("cmt|pk1\x00\x00\x00\x00\x00\x00\x00\x0a")...)
 
-	require.NoError(t, st.PutAt(ctx, cmtKey, []byte("commit-record"), 20, 0))
+		require.NoError(t, st.PutAt(ctx, cmtKey, []byte("commit-record"), 20, 0))
 
-	require.NoError(t, st.Compact(ctx, 30))
+		require.NoError(t, st.Compact(ctx, 30))
 
-	val, err := st.GetAt(ctx, cmtKey, 30)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("commit-record"), val)
+		val, err := st.GetAt(ctx, cmtKey, 30)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("commit-record"), val)
+	})
 }
 
 // --- mvccStore: minRetainedTS advancement ---
@@ -75,35 +37,42 @@ func TestMVCCStore_Compact_TxnCommitRecordPreserved(t *testing.T) {
 // TestMVCCStore_Compact_AdvancesMinRetainedTSWithNoPending verifies that
 // minRetainedTS advances even when there are no keys to compact.
 func TestMVCCStore_Compact_AdvancesMinRetainedTSWithNoPending(t *testing.T) {
-	ctx := context.Background()
-	st := NewMVCCStore()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	// Only a single version per key — nothing to compact.
-	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v"), 50, 0))
+		// Only a single version per key — nothing to compact.
+		require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("v"), 50, 0))
 
-	require.NoError(t, st.Compact(ctx, 100))
+		require.NoError(t, st.Compact(ctx, 100))
+		retention, ok := st.(RetentionController)
+		require.True(t, ok)
+		require.Equal(t, uint64(100), retention.MinRetainedTS())
 
-	// Reads below minRetainedTS should be rejected.
-	_, err := st.GetAt(ctx, []byte("k"), 99)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
+		// Reads below minRetainedTS should be rejected.
+		_, err := st.GetAt(ctx, []byte("k"), 99)
+		require.ErrorIs(t, err, ErrReadTSCompacted)
 
-	// Read at minRetainedTS should work.
-	val, err := st.GetAt(ctx, []byte("k"), 100)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("v"), val)
+		// Read at minRetainedTS should work.
+		val, err := st.GetAt(ctx, []byte("k"), 100)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("v"), val)
+	})
 }
 
 // TestMVCCStore_Compact_AdvancesMinRetainedTSEmptyStore verifies that
 // minRetainedTS advances even with an empty store.
 func TestMVCCStore_Compact_AdvancesMinRetainedTSEmptyStore(t *testing.T) {
-	ctx := context.Background()
-	st := NewMVCCStore()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		st := newStore(t)
 
-	require.NoError(t, st.Compact(ctx, 100))
+		require.NoError(t, st.Compact(ctx, 100))
 
-	// Any read below 100 should be rejected.
-	_, err := st.GetAt(ctx, []byte("k"), 99)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
+		// Any read below 100 should be rejected.
+		_, err := st.GetAt(ctx, []byte("k"), 99)
+		require.ErrorIs(t, err, ErrReadTSCompacted)
+	})
 }
 
 // --- pebbleStore: txn internal key compaction ---
@@ -111,36 +80,32 @@ func TestMVCCStore_Compact_AdvancesMinRetainedTSEmptyStore(t *testing.T) {
 // TestPebbleStore_Compact_TxnLockLifecycle verifies the full lock lifecycle:
 // PREPARE creates a version, COMMIT tombstones it, compaction cleans up.
 func TestPebbleStore_Compact_TxnLockLifecycle(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-txn-lifecycle-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		s := newStore(t)
 
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
+		ctx := context.Background()
+		txnKey := append([]byte(nil), txnInternalKeyPrefix...)
+		txnKey = append(txnKey, []byte("lock|k1")...)
 
-	ctx := context.Background()
-	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock|k1")...)
+		// PREPARE: lock at TS=10
+		require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 10, 0))
+		// COMMIT: tombstone at TS=20
+		require.NoError(t, s.DeleteAt(ctx, txnKey, 20))
 
-	// PREPARE: lock at TS=10
-	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 10, 0))
-	// COMMIT: tombstone at TS=20
-	require.NoError(t, s.DeleteAt(ctx, txnKey, 20))
+		initialVersions := countConformanceVersions(t, s)
 
-	initialVersions := countPebbleVersions(t, s)
+		// Compact above commitTS.
+		require.NoError(t, s.Compact(ctx, 25))
 
-	// Compact above commitTS.
-	require.NoError(t, s.Compact(ctx, 25))
+		afterVersions := countConformanceVersions(t, s)
+		// Old lock version at TS=10 should be removed.
+		assert.Less(t, afterVersions, initialVersions,
+			"compaction should remove old txn lock version")
 
-	afterVersions := countPebbleVersions(t, s)
-	// Old lock version at TS=10 should be removed.
-	assert.Less(t, afterVersions, initialVersions,
-		"compaction should remove old txn lock version")
-
-	// Lock should not be readable (tombstone).
-	_, err = s.GetAt(ctx, txnKey, 25)
-	require.ErrorIs(t, err, ErrKeyNotFound)
+		// Lock should not be readable (tombstone).
+		_, err := s.GetAt(ctx, txnKey, 25)
+		require.ErrorIs(t, err, ErrKeyNotFound)
+	})
 }
 
 // TestPebbleStore_Compact_TxnIntentLifecycle verifies that intent key versions
@@ -173,57 +138,29 @@ func TestPebbleStore_Compact_TxnIntentLifecycle(t *testing.T) {
 // TestPebbleStore_Compact_TxnActiveLockPreserved verifies that an active lock
 // (not yet committed/aborted) is preserved during compaction.
 func TestPebbleStore_Compact_TxnActiveLockPreserved(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-txn-active-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		s := newStore(t)
 
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
+		ctx := context.Background()
+		txnKey := append([]byte(nil), txnInternalKeyPrefix...)
+		txnKey = append(txnKey, []byte("lock|k1")...)
 
-	ctx := context.Background()
-	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock|k1")...)
+		// Only PREPARE, no COMMIT — single version.
+		require.NoError(t, s.PutAt(ctx, txnKey, []byte("active-lock"), 10, 0))
 
-	// Only PREPARE, no COMMIT — single version.
-	require.NoError(t, s.PutAt(ctx, txnKey, []byte("active-lock"), 10, 0))
+		before := countConformanceVersions(t, s)
+		require.NoError(t, s.Compact(ctx, 20))
+		after := countConformanceVersions(t, s)
 
-	before := countPebbleVersions(t, s)
-	require.NoError(t, s.Compact(ctx, 20))
-	after := countPebbleVersions(t, s)
+		assert.Equal(t, before, after, "active lock should not be compacted")
 
-	assert.Equal(t, before, after, "active lock should not be compacted")
-
-	val, err := s.GetAt(ctx, txnKey, 20)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("active-lock"), val)
+		val, err := s.GetAt(ctx, txnKey, 20)
+		require.NoError(t, err)
+		assert.Equal(t, []byte("active-lock"), val)
+	})
 }
 
 // --- pebbleStore: minRetainedTS advancement ---
-
-// TestPebbleStore_Compact_AdvancesMinRetainedTSWithNoPending verifies that
-// minRetainedTS advances even when no versions need trimming.
-func TestPebbleStore_Compact_AdvancesMinRetainedTSWithNoPending(t *testing.T) {
-	dir, err := os.MkdirTemp("", "pebble-compact-nopending-*")
-	require.NoError(t, err)
-	defer os.RemoveAll(dir)
-
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-	// Single version — nothing to compact.
-	require.NoError(t, s.PutAt(ctx, []byte("k"), []byte("v"), 50, 0))
-
-	require.NoError(t, s.Compact(ctx, 100))
-
-	retention := requirePebbleRetentionController(t, s)
-	assert.Equal(t, uint64(100), retention.MinRetainedTS())
-
-	_, err = s.GetAt(ctx, []byte("k"), 99)
-	require.ErrorIs(t, err, ErrReadTSCompacted)
-}
 
 // --- pebbleStore: ApplyMutations serialization ---
 

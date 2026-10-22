@@ -33,6 +33,8 @@ type putItemInput struct {
 	ExpressionAttributeNames  map[string]string         `json:"ExpressionAttributeNames"`
 	ExpressionAttributeValues map[string]attributeValue `json:"ExpressionAttributeValues"`
 	ReturnValues              string                    `json:"ReturnValues"`
+	adminPathKey              map[string]AdminAttributeValue
+	checkAdminPathKey         bool
 }
 
 type deleteItemInput struct {
@@ -444,6 +446,9 @@ func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInpu
 	if !exists {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrResourceNotFound, "table not found")
 	}
+	if err := validatePutItemAdminPathKey(in, schema); err != nil {
+		return nil, err
+	}
 	itemKey, err := schema.itemKeyFromAttributes(in.Item)
 	if err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
@@ -479,6 +484,13 @@ func (d *DynamoDBServer) preparePutItemWrite(ctx context.Context, in putItemInpu
 		current:    cloneAttributeValueMap(current),
 		next:       cloneAttributeValueMap(in.Item),
 	}, nil
+}
+
+func validatePutItemAdminPathKey(in putItemInput, schema *dynamoTableSchema) error {
+	if !in.checkAdminPathKey {
+		return nil
+	}
+	return validateAdminPathKeyCoversPrimaryKey(schema, in.adminPathKey, in.Item)
 }
 
 func (d *DynamoDBServer) commitItemWrite(ctx context.Context, readTimestamp kv.ReadTimestamp, req *kv.OperationGroup[kv.OP]) error {
