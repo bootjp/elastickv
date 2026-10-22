@@ -195,7 +195,7 @@ func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, nam
 	defer done()
 	for attempt := range createRetryLimit {
 		status := r.createOrOpen(ctx, input, []byte(name), out)
-		if (status == fuse.Status(syscall.EAGAIN) || status == fuse.Status(syscall.ENOENT)) && attempt+1 < createRetryLimit {
+		if status == fuse.Status(syscall.EAGAIN) && attempt+1 < createRetryLimit {
 			continue
 		}
 		return status
@@ -211,56 +211,17 @@ func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, 
 	}
 	result, errno := r.adapter.Create(ctx, input.NodeId, name, opts)
 	if errno == syscall.EEXIST && input.Flags&syscall.O_EXCL == 0 {
-		stat, lookupErrno := r.adapter.Lookup(ctx, input.NodeId, name)
-		if lookupErrno != 0 {
-			return fuse.Status(lookupErrno)
-		}
-		return r.openExistingForCreate(ctx, input, stat, out)
+		// A successful FUSE_CREATE always marks the descriptor newly created.
+		// ESTALE makes Linux do_filp_open retry path lookup with LOOKUP_REVAL,
+		// preserving normal permission checks, truncation and created status.
+		return fuse.Status(syscall.ESTALE)
 	}
 	if errno != 0 {
-		return fuse.Status(errno)
+		return fuse.ToStatus(errno)
 	}
 	r.fillEntry(&out.EntryOut, result.Stat)
 	out.Fh = result.FH
 	return fuse.OK
-}
-
-func (r *RawFileSystem) openExistingForCreate(
-	ctx context.Context,
-	input *fuse.CreateIn,
-	stat filesystem.Stat,
-	out *fuse.CreateOut,
-) fuse.Status {
-	if stat.Type == filesystem.TypeDirectory {
-		return fuse.Status(syscall.EISDIR)
-	}
-	if !canOpenExisting(input, stat) {
-		return fuse.Status(syscall.EACCES)
-	}
-	fh, errno := r.adapter.Open(ctx, stat.Inode)
-	if errno != 0 {
-		return fuse.Status(errno)
-	}
-	if input.Flags&syscall.O_TRUNC != 0 {
-		mask, attrs := existingTruncateAttrs(input.Uid, stat.Mode)
-		truncated, setattrErrno := r.adapter.SetAttr(ctx, stat.Inode, mask, attrs)
-		if setattrErrno != 0 {
-			r.releaseFailedCreate(ctx, stat.Inode, fh)
-			return fuse.Status(setattrErrno)
-		}
-		stat = truncated
-	}
-	r.fillEntry(&out.EntryOut, stat)
-	out.Fh = fh
-	return fuse.OK
-}
-
-func (r *RawFileSystem) releaseFailedCreate(ctx context.Context, inode, fh uint64) {
-	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultHandleKeepaliveTimeout)
-	defer cancel()
-	if errno := r.adapter.Release(cleanupCtx, inode, fh); errno != 0 {
-		slog.Warn("release failed FUSE create handle", "inode", inode, "fh", fh, "error", errno)
-	}
 }
 
 func (r *RawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
