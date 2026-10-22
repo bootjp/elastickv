@@ -33,6 +33,8 @@ Legacy jobs missing their source group first recover it from current routes or c
 
 ## 1. Background
 
+Catalog cross-group split migration rejects a moving interval containing `!sqs|route|global` with `FailedPrecondition`, before allocating a job or arming source guards. SQS partition ownership is maintained by its separate resolver, and catalog cutover does not update that partition map. The same structural restriction applies to resumed pre-cutover jobs; an older overlapping job must be abandoned rather than retried into a catalog fence. Abandonment and post-cutover cleanup remain available for recovery. Ordinary SQS data, partition ownership, generic export brackets and same-group splits are unchanged. A moving interval whose exclusive end equals the global SQS route, or which leaves that route on the source side, remains supported.
+
 M1 landed the control plane:
 
 - `distribution/catalog.go` — durable `RouteDescriptor` records in the default Raft group's MVCC state.

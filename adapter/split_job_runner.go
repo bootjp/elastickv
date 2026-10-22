@@ -187,6 +187,9 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 	if s.splitMigrationClientFactory == nil {
 		return errors.New("split migration client factory is not configured")
 	}
+	if err := s.verifySplitJobMigrationRange(ctx, job); err != nil {
+		return err
+	}
 	job, err := s.backfillSplitJobSourceGroup(ctx, job)
 	if err != nil {
 		return err
@@ -195,6 +198,25 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 		return s.runSplitJobCopyPhase(ctx, job)
 	}
 	return s.runSplitJobControlPhase(ctx, job)
+}
+
+func (s *DistributionServer) verifySplitJobMigrationRange(ctx context.Context, job distribution.SplitJob) error {
+	// Recovery must remain possible for jobs admitted by an older binary.
+	if job.Phase == distribution.SplitJobPhaseAbandoning || job.Phase == distribution.SplitJobPhaseCleanup {
+		return nil
+	}
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	_, routeEnd, found := splitJobSourceRouteState(snapshot.Routes, job)
+	if !found {
+		return errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
+	}
+	if err := distribution.ValidateSplitMigrationRouteRange(job.SplitKey, routeEnd); err != nil {
+		return splitMigrationRangeStatusError(err)
+	}
+	return nil
 }
 
 // backfillSplitJobSourceGroup records SourceGroupID on a job that predates the

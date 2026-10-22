@@ -954,7 +954,7 @@ func (s *DistributionServer) startSplitMigrationParent(
 	if err := validateSplitKey(parent, splitKey); err != nil {
 		return distribution.RouteDescriptor{}, err
 	}
-	if err := distribution.ValidateMigrationRouteRange(splitKey, parent.End); err != nil {
+	if err := distribution.ValidateSplitMigrationRouteRange(splitKey, parent.End); err != nil {
 		return distribution.RouteDescriptor{}, splitMigrationRangeStatusError(err)
 	}
 	if parent.GroupID == req.GetTargetGroupId() {
@@ -2144,6 +2144,8 @@ func splitJobCatalogStatusError(err error) error {
 
 func splitMigrationRangeStatusError(err error) error {
 	switch {
+	case errors.Is(err, distribution.ErrMigrationResolverOwnedRange):
+		return grpcStatusError(codes.FailedPrecondition, err.Error())
 	case errors.Is(err, distribution.ErrMigrationReservedRange),
 		errors.Is(err, distribution.ErrMigrationInvalidRoute):
 		return grpcStatusError(codes.InvalidArgument, err.Error())

@@ -103,6 +103,7 @@ const (
 
 var (
 	ErrMigrationReservedRange      = errors.New("migration range intersects reserved control prefix")
+	ErrMigrationResolverOwnedRange = errors.New("catalog migration range intersects resolver-owned SQS route")
 	ErrMigrationInvalidRoute       = errors.New("migration route is invalid")
 	ErrMigrationDataMoveRequired   = errors.New("migration data move is not implemented")
 	ErrMigrationSourceRouteChanged = errors.New("migration source route does not match split job")
@@ -492,6 +493,11 @@ func InitializeSplitJobPlan(job SplitJob, source RouteDescriptor, nowMs int64) (
 	}
 	routeStart := CloneBytes(job.SplitKey)
 	routeEnd := CloneBytes(normalizeMigrationRouteEnd(source.End))
+	if job.TargetGroupID != source.GroupID {
+		if err := ValidateSplitMigrationRouteRange(routeStart, routeEnd); err != nil {
+			return SplitJob{}, err
+		}
+	}
 	brackets, err := PlanExportBrackets(routeStart, routeEnd)
 	if err != nil {
 		return SplitJob{}, err
@@ -566,6 +572,19 @@ func ValidateMigrationRouteRange(routeStart, routeEnd []byte) error {
 		if rangesIntersect(routeStart, routeEnd, prefix, prefixScanEnd(prefix)) {
 			return errors.WithStack(ErrMigrationReservedRange)
 		}
+	}
+	return nil
+}
+
+// ValidateSplitMigrationRouteRange keeps catalog cutover away from the SQS
+// partition resolver's ownership domain. A catalog migration cannot update its
+// partition map, so even a temporary catalog fence would stop still-owned rows.
+func ValidateSplitMigrationRouteRange(routeStart, routeEnd []byte) error {
+	if err := ValidateMigrationRouteRange(routeStart, routeEnd); err != nil {
+		return err
+	}
+	if routeKeyInRange([]byte("!sqs|route|global"), routeStart, routeEnd) {
+		return errors.WithStack(ErrMigrationResolverOwnedRange)
 	}
 	return nil
 }
