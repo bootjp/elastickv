@@ -5,6 +5,8 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
+	"os"
+	"path/filepath"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
@@ -58,6 +60,58 @@ func TestVerifyKEKBeforeMutators(t *testing.T) {
 	*encryptionEnabled = true
 	*encryptionSidecarPath = ""
 	require.NoError(t, verifyKEKBeforeMutators(failingStartupKEK{}))
+}
+
+func TestStartupKEKSourceWiringCachesGuardUnwrapThroughHydration(t *testing.T) {
+	previousEnabled := *encryptionEnabled
+	previousSidecar := *encryptionSidecarPath
+	previousFile := *kekFile
+	previousURI := *kekURI
+	t.Cleanup(func() {
+		*encryptionEnabled = previousEnabled
+		*encryptionSidecarPath = previousSidecar
+		*kekFile = previousFile
+		*kekURI = previousURI
+	})
+
+	staticKEK := bytes.Repeat([]byte{0x71}, encryption.KeySize)
+	*kekFile = filepath.Join(t.TempDir(), "kek")
+	require.NoError(t, os.WriteFile(*kekFile, staticKEK, 0o600))
+	*kekURI = ""
+	*encryptionEnabled = true
+	*encryptionSidecarPath = filepath.Join(t.TempDir(), encryption.SidecarFilename)
+
+	source, err := kek.NewWrapperFromSources(context.Background(), *kekFile, "")
+	require.NoError(t, err)
+	dek := bytes.Repeat([]byte{0x72}, encryption.KeySize)
+	wrapped, err := source.Wrap(dek)
+	require.NoError(t, err)
+	sidecar := &encryption.Sidecar{
+		Version: encryption.SidecarVersion,
+		Keys: map[string]encryption.SidecarKey{
+			"7": {Purpose: encryption.SidecarPurposeStorage, Wrapped: wrapped},
+		},
+	}
+	require.NoError(t, encryption.WriteSidecar(*encryptionSidecarPath, sidecar))
+
+	observer := &countingKEKObserver{}
+	wrapper, err := loadKEKAndRunStartupGuards(observer)
+	require.NoError(t, err)
+	require.IsType(t, &encryption.StartupUnwrapCache{}, wrapper,
+		"production source wiring must retain the startup cache")
+	guardUnwraps := observer.total()
+	require.GreaterOrEqual(t, guardUnwraps, 2, "preflight and sidecar guards must reach the provider")
+
+	keystore := encryption.NewKeystore()
+	require.NoError(t, encryption.HydrateKeystoreFromSidecar(keystore, wrapper, sidecar))
+	require.Equal(t, guardUnwraps, observer.total(),
+		"hydration must reuse the sidecar unwrap from the guard")
+
+	encryption.SealStartupUnwrapCache(wrapper)
+	_, err = wrapper.Unwrap(wrapped)
+	require.NoError(t, err)
+	require.Equal(t, guardUnwraps+1, observer.total(),
+		"the retained wrapper must stop caching after startup")
 }
 
 func TestEnvKEKBootstrapCutoverSnapshotRestore(t *testing.T) {

@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -70,7 +71,8 @@ type kvFSM struct {
 	// cutoverSource provides the writer-side view of the Phase-2
 	// envelope cutover index for snapshot v1/v2 selection (Stage
 	// 8a §3.3). nil = always v1 output.
-	cutoverSource CutoverSource
+	cutoverSource        CutoverSource
+	encryptionCheckpoint encryption.SnapshotCheckpoint
 	// snapLatch enforces the §3.3 no-downgrade invariant: once a
 	// non-zero cutover is observed, all subsequent snapshots from
 	// this FSM emit v2 even if the sidecar later reads 0.
@@ -1015,6 +1017,9 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 	if err := f.rejectSnapshotWithActiveBackupPin(); err != nil {
 		return nil, err
 	}
+	if err := f.checkSnapshotCheckpointConsistency(); err != nil {
+		return nil, err
+	}
 	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1025,13 +1030,14 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 		cutover = f.cutoverSource.RaftEnvelopeCutoverIndex()
 	}
 	emitted := f.snapLatch.observe(cutover)
-	useV2 := emitted != 0 || f.snapLatch.latched()
+	useV2 := emitted != 0 || f.snapLatch.latched() || f.encryptionCheckpoint.Index != 0
 
 	return &kvFSMSnapshot{
-		snapshot:  snapshot,
-		ceilingMs: hlcCeilingFromHLC(f.hlc),
-		cutover:   emitted,
-		useV2:     useV2,
+		snapshot:   snapshot,
+		ceilingMs:  hlcCeilingFromHLC(f.hlc),
+		cutover:    emitted,
+		useV2:      useV2,
+		checkpoint: f.encryptionCheckpoint,
 	}, nil
 }
 
@@ -1047,7 +1053,7 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	if !ok {
 		br = bufio.NewReader(r)
 	}
-	ceilingU, cutover, err := ReadSnapshotHeader(br)
+	ceilingU, cutover, checkpoint, err := ReadSnapshotHeaderWithCheckpoint(br)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1061,6 +1067,11 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	if err := f.store.Restore(io.NopCloser(br)); err != nil {
 		return errors.WithStack(err)
 	}
+	checkpoint, err = f.checkpointForDurableFSM(checkpoint, false)
+	if err != nil {
+		return err
+	}
+	f.encryptionCheckpoint = checkpoint
 	// Volatile pins do not travel in a snapshot, and the entries that would
 	// have released them are compacted away by the time this replica installs
 	// one. A pin this node applied before falling behind would otherwise keep
@@ -1514,7 +1525,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	// applying this log entry. The retention-window > max-retry-latency
 	// invariant prevents the rare case where a real never-landed retry
 	// arrives with PrevCommitTS below pebble's compacted floor.
-	dedup, err := f.dedupProbeOnePhase(ctx, meta, r.ReadKeys)
+	dedup, err := f.dedupProbeOnePhase(ctx, meta, r.ReadKeys, muts)
 	if err != nil {
 		return err
 	}
@@ -1531,7 +1542,7 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	if err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
+	if err := f.store.ApplyMutationsRaftAtFenced(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObservers(commitTS, uniq)
@@ -1630,7 +1641,7 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorWithSnapshot(muts []*pb.Mutation, co
 // Returns (true, nil) → the entry must no-op (prior attempt landed).
 // Returns (false, nil) → fall through to normal apply.
 // Returns (false, err) → propagate err; apply must not proceed.
-func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [][]byte) (bool, error) {
+func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [][]byte, muts []*pb.Mutation) (bool, error) {
 	if meta.PrevCommitTS == 0 {
 		return false, nil
 	}
@@ -1639,7 +1650,7 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [
 		return false, errors.WithStack(err)
 	}
 	if landed {
-		return true, nil
+		return f.priorMutationValuesMatch(ctx, muts, readKeys, meta.PrevCommitTS)
 	}
 	for _, stagedKey := range stagedVisibilityKeysForReadAlias(readKeys, meta.PrimaryKey, meta.PrimaryKey) {
 		landed, err = f.store.CommittedVersionAt(ctx, stagedKey, meta.PrevCommitTS)
@@ -1647,10 +1658,46 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [
 			return false, errors.WithStack(err)
 		}
 		if landed {
-			return true, nil
+			return f.priorMutationValuesMatch(ctx, muts, readKeys, meta.PrevCommitTS)
 		}
 	}
 	return false, nil
+}
+
+// A timestamp may be issued by two leaders during a handoff. An exact
+// version at PrevCommitTS alone cannot identify the retry, even for scalar
+// writes. Compare every final PUT value in the retained write set.
+func (f *kvFSM) priorMutationValuesMatch(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, prevTS uint64) (bool, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return false, err
+	}
+	for _, mut := range uniq {
+		if mut.Op != pb.Op_PUT {
+			continue
+		}
+		keys := append([][]byte{mut.Key}, stagedVisibilityKeysForReadAlias(readKeys, mut.Key, mut.Key)...)
+		matched := false
+		for _, key := range keys {
+			landed, err := f.store.CommittedVersionAt(ctx, key, prevTS)
+			if err != nil {
+				return false, errors.WithStack(err)
+			}
+			if !landed {
+				continue
+			}
+			value, err := f.store.GetAt(ctx, key, prevTS)
+			if err != nil {
+				return false, errors.WithStack(err)
+			}
+			matched = bytes.Equal(value, mut.Value)
+			break
+		}
+		if !matched {
+			return false, nil
+		}
+	}
+	return true, nil
 }
 
 func stagedVisibilityJobIDsForReadAlias(readKeys [][]byte, aliasRawKey []byte) []uint64 {

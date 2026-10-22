@@ -14,6 +14,11 @@
     :default default-nodes-str]
    [nil "--local" "Run locally without SSH or nemesis."
     :default false]
+   ;; §8.4: the encrypted acceptance gate is the EXISTING suites run
+   ;; against an encrypted cluster, so this is a cluster-setup switch
+   ;; rather than a workload selector — every workload honours it.
+   [nil "--encryption" "Run against a cluster with data-at-rest encryption enabled."
+    :default false]
    [nil "--host HOST" "Host override for clients."
     :default nil]
    [nil "--grpc-port PORT" "gRPC/Raft port."
@@ -96,6 +101,9 @@
                    (->> (remove str/blank?)
                         (map (comp keyword str/lower-case))
                         vec))]
+    (when (and local? (:encryption options))
+      (throw (ex-info "--encryption requires managed Jepsen nodes; --local does not set up encryption"
+                      {:local true :encryption true})))
     (assoc options
       :nodes node-list
       :faults faults

@@ -246,6 +246,10 @@ type RedisServer struct {
 	onePhaseTxnDedup bool
 
 	route map[string]func(conn redcon.Conn, cmd redcon.Command)
+
+	// inflight counts the commands being executed so Stop can wait for them,
+	// bounded, after closing the listener; see inflightGate.
+	inflight *inflightGate
 }
 
 type RedisServerOption func(*RedisServer)
@@ -557,6 +561,7 @@ func NewRedisServer(listen net.Listener, redisAddr string, store store.MVCCStore
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_REDIS_ONEPHASE_DEDUP") != "0",
 		baseCtx:          baseCtx,
 		baseCancel:       baseCancel,
+		inflight:         newInflightGate(),
 		streamWaiters:    newKeyWaiterRegistry(),
 		zsetWaiters:      newKeyWaiterRegistry(),
 	}
@@ -824,6 +829,11 @@ func (r *RedisServer) RegisterLuaPoolMetrics(registerer prometheus.Registerer) e
 func (r *RedisServer) Run() error {
 	err := redcon.Serve(r.listen,
 		func(conn redcon.Conn, cmd redcon.Command) {
+			if !r.inflight.enter() {
+				conn.WriteError("ERR server is shutting down")
+				return
+			}
+			defer r.inflight.exit()
 			needsTiming := r.requestObserver != nil || r.traceCommands
 			var start time.Time
 			if needsTiming {
@@ -1004,6 +1014,16 @@ func (r *RedisServer) Stop() {
 				slog.Any("err", err),
 			)
 		}
+	}
+	// redcon closes the connections when Serve returns but does not join
+	// the handlers; give the commands still running their bounded window
+	// before the caller tears down the stores they use.
+	if !r.inflight.drain(redisShutdownTimeout) {
+		slog.Warn("redis server: commands still running after the shutdown bound, continuing",
+			slog.String("addr", r.redisAddr),
+			slog.Int64("in_flight", r.inflight.remaining()),
+			slog.Duration("timeout", redisShutdownTimeout),
+		)
 	}
 }
 

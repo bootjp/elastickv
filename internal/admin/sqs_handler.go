@@ -197,6 +197,40 @@ type SqsHandler struct {
 	source QueuesSource
 	roles  RoleStore
 	logger *slog.Logger
+	// admin counts the §3.6 purge / peek outcomes that never reach the
+	// adapter. Authorization, path and query-parameter rejections all
+	// return from the handler before AdminPurgeQueue / AdminPeekQueue
+	// runs, so without this the advertised forbidden and validation
+	// outcomes were absent from the metric for the most common cases --
+	// under-reporting exactly the rejections an operator is looking for.
+	admin AdminQueueObserver
+}
+
+// AdminQueueObserver counts admin queue-operation outcomes.
+//
+// Declared here so the handler can record its own pre-dispatch exits
+// without importing the adapter; *monitoring.SQSMetrics satisfies it
+// structurally, so production passes the same counters the adapter uses and
+// the two halves of each metric cannot drift apart.
+type AdminQueueObserver interface {
+	ObserveAdminPurgeQueue(queue string, outcome string)
+	ObserveAdminPeekQueue(queue string, outcome string)
+}
+
+// AdminQueueObserverSource is the optional capability a QueuesSource can
+// implement to hand the handler the counters it already records through.
+type AdminQueueObserverSource interface {
+	AdminQueueObserver() AdminQueueObserver
+}
+
+// adminQueueObserverFrom returns the source's counters, or nil when the
+// source does not expose any.
+func adminQueueObserverFrom(source QueuesSource) AdminQueueObserver {
+	provider, ok := source.(AdminQueueObserverSource)
+	if !ok {
+		return nil
+	}
+	return provider.AdminQueueObserver()
 }
 
 // NewSqsHandler binds the source and seeds logging with
@@ -215,6 +249,57 @@ func (h *SqsHandler) WithLogger(l *slog.Logger) *SqsHandler {
 	}
 	h.logger = l
 	return h
+}
+
+// WithAdminQueueObserver installs the §3.6 counters so the handler can
+// record the rejections it serves itself. No-ops on nil; the handler then
+// records nothing and the adapter-side outcomes are unaffected.
+func (h *SqsHandler) WithAdminQueueObserver(o AdminQueueObserver) *SqsHandler {
+	if o == nil {
+		return h
+	}
+	h.admin = o
+	return h
+}
+
+// observePurgeRejection records a purge outcome decided in the handler.
+func (h *SqsHandler) observePurgeRejection(name, outcome string) {
+	if h.admin == nil {
+		return
+	}
+	h.admin.ObserveAdminPurgeQueue(name, outcome)
+}
+
+// recordPurgeRejection counts AND audits a purge refused before the adapter.
+//
+// The same pairing the adapter uses, for the same reason: an exit that records
+// the counter and skips the audit leaves the §3.6 signal silent about exactly
+// the attempts an operator is looking for. Field names match the adapter's
+// record so both halves of admin.sqs.purge_queue parse identically.
+func (h *SqsHandler) recordPurgeRejection(r *http.Request, principal AuthPrincipal, name, outcome string) {
+	h.observePurgeRejection(name, outcome)
+
+	h.logger.LogAttrs(r.Context(), slog.LevelInfo, "admin.sqs.purge_queue",
+		slog.String("access_key", principal.AccessKey),
+		slog.String("role", string(principal.Role)),
+		slog.String("queue", name),
+		slog.String("outcome", outcome))
+}
+
+func (h *SqsHandler) purgeAuditPrincipal(r *http.Request) AuthPrincipal {
+	principal, _ := PrincipalFromContext(r.Context())
+	if h.roles != nil && principal.AccessKey != "" {
+		principal.Role, _ = h.roles.LookupRole(principal.AccessKey)
+	}
+	return principal
+}
+
+// observePeekRejection records a peek outcome decided in the handler.
+func (h *SqsHandler) observePeekRejection(name, outcome string) {
+	if h.admin == nil {
+		return
+	}
+	h.admin.ObserveAdminPeekQueue(name, outcome)
 }
 
 // WithRoleStore enables per-request role revalidation on the delete
@@ -268,9 +353,36 @@ func (h *SqsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	segments, ok := h.parseSqsRouteSegments(w, escaped)
 	if !ok {
+		// §3.6 counts invalid paths as validation failures, and the route
+		// never reaches the per-operation handlers, so the outcome has to be
+		// attributed here. The path and method name the intended operation
+		// even when the path is malformed -- `/queues/orders//messages` with
+		// DELETE is a purge attempt whatever else is wrong with it.
+		h.observeRouteRejection(r, escaped, adminQueueOutcomeValidation)
 		return
 	}
 	h.dispatchSqsRoute(w, r, segments)
+}
+
+// observeRouteRejection records an outcome for a request rejected before the
+// router could identify its handler.
+//
+// The queue name is unusable by definition here, so the counter is recorded
+// with an empty queue label rather than a guess parsed out of a path the
+// validator just refused. The METHOD still identifies the operation, which is
+// what the §3.6 series is keyed on.
+func (h *SqsHandler) observeRouteRejection(r *http.Request, escaped, outcome string) {
+	if !strings.Contains(escaped, "/"+sqsSubResourceMessages) {
+		// Not a messages route, so neither purge nor peek: queue CRUD has no
+		// §3.6 counter of its own.
+		return
+	}
+	switch r.Method {
+	case http.MethodDelete:
+		h.recordPurgeRejection(r, h.purgeAuditPrincipal(r), "", outcome)
+	case http.MethodGet:
+		h.observePeekRejection("", outcome)
+	}
 }
 
 // serveCollectionRoot handles the .../queues and .../queues/ paths
@@ -394,6 +506,30 @@ func (h *SqsHandler) dispatchAttributesResource(w http.ResponseWriter, r *http.R
 		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only PUT")
 	}
 }
+
+// The handler-side half of the §3.6 outcome vocabulary, spelled identically
+// to the adapter's so a dashboard does not see two spellings of one outcome.
+const (
+	adminQueueOutcomeForbidden     = "forbidden"
+	adminQueueOutcomeValidation    = "validation"
+	adminQueueOutcomeInternalError = "internal_error"
+)
+
+// gateOutcome classifies why a principal gate refused.
+//
+// A boolean was not enough: a missing session principal is a WIRING fault that
+// returns 401 at the shared authorization boundary, but counting it as
+// `forbidden` would hide the fault from the internal_error series and report an
+// authorization rejection that never happened.
+type gateOutcome string
+
+const (
+	gateAllowed  gateOutcome = ""
+	gateForbid   gateOutcome = adminQueueOutcomeForbidden
+	gateInternal gateOutcome = adminQueueOutcomeInternalError
+)
+
+func (o gateOutcome) ok() bool { return o == gateAllowed }
 
 // isValidSqsPathSegment enforces the step-4 rules. Every segment is
 // rejected if it is empty, contains a percent sign (closes the
@@ -533,12 +669,14 @@ func (h *SqsHandler) handleSetAttributes(w http.ResponseWriter, r *http.Request,
 // TypeScript client adapter does the case translation at the
 // request boundary.
 func (h *SqsHandler) handlePeek(w http.ResponseWriter, r *http.Request, name string) {
-	principal, ok := h.principalForReadSensitive(w, r)
-	if !ok {
+	principal, outcome := h.gateReadSensitive(w, r)
+	if !outcome.ok() {
+		h.observePeekRejection(name, string(outcome))
 		return
 	}
 	opts, ok := parsePeekQueryParams(w, r)
 	if !ok {
+		h.observePeekRejection(name, adminQueueOutcomeValidation)
 		return
 	}
 	result, err := h.source.AdminPeekQueue(r.Context(), principal, name, opts)
@@ -592,11 +730,19 @@ func parsePeekQueryParams(w http.ResponseWriter, r *http.Request) (PeekMessageOp
 // 60-second rate limit surfaces as 429 with the Retry-After header
 // and a retry_after_seconds JSON body via writeQueuesError.
 func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name string) {
-	principal, ok := h.principalForWriteOnPurge(w, r)
-	if !ok {
+	principal, outcome := h.gateWriteOnPurge(w, r)
+	if !outcome.ok() {
+		// Counted AND audited. The adapter owns the audit line for everything
+		// that reaches it, but a refusal here never gets there, so the
+		// operation-specific record has to come from this side -- otherwise an
+		// unauthorized purge attempt appears in the counter and in the generic
+		// HTTP audit, but never in admin.sqs.purge_queue, which is the record
+		// an operator greps.
+		h.recordPurgeRejection(r, principal, name, string(outcome))
 		return
 	}
 	if strings.TrimSpace(name) == "" {
+		h.recordPurgeRejection(r, principal, name, adminQueueOutcomeValidation)
 		writeJSONError(w, http.StatusBadRequest, "invalid_queue_name", "queue name is required")
 		return
 	}
@@ -608,33 +754,53 @@ func (h *SqsHandler) handlePurge(w http.ResponseWriter, r *http.Request, name st
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// principalForReadSensitive gates peek (and any future read endpoint
-// that surfaces stored payload content) with the RoleReadOnly tier.
-// List / Describe stay on the looser session-auth gate because their
-// output is queue metadata already shown on the SPA's queue list page;
-// peek returns the stored message bodies themselves (Codex r9 P1 on
-// the design doc flagged the security-class distinction). The policy
-// lives in authorizePrincipal.
-func (h *SqsHandler) principalForReadSensitive(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
-	return authorizePrincipal(w, r, h.roles, accessRead, "this access key is not authorised to read queue contents")
+// gateReadSensitive applies the shared content-read policy while preserving a
+// classified outcome for the admin metrics.
+func (h *SqsHandler) gateReadSensitive(w http.ResponseWriter, r *http.Request) (AuthPrincipal, gateOutcome) {
+	return h.gatePrincipal(w, r, accessRead,
+		"this access key is not authorised to read queue contents")
 }
 
-// principalForWriteOnPurge wraps principalForWrite with the verb the
-// purge handler wants on rejection messages. Without this, an
-// operator clicking Purge sees a 403 body saying "not authorised to
-// delete queues" (the SqsHandler's principalForWrite was authored
-// before the purge handler existed). Claude r1 caught the misleading
-// wording.
-func (h *SqsHandler) principalForWriteOnPurge(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
-	return h.principalForWrite(w, r, "purge messages")
+// gateWriteOnPurge applies the shared write policy and keeps the refusal
+// classified so the caller can count and audit it.
+func (h *SqsHandler) gateWriteOnPurge(w http.ResponseWriter, r *http.Request) (AuthPrincipal, gateOutcome) {
+	return h.gatePrincipal(w, r, accessWrite,
+		"this access key is not authorised to purge messages")
 }
 
 // principalForWrite gates the state-changing queue endpoints. The
-// action verb (e.g. "delete queues", "purge messages") is woven into
-// the 403 body so an operator sees the operation they attempted
-// (Claude r1 on PR #797). The policy lives in authorizePrincipal.
+// action verb is woven into the 403 body so an operator sees the operation
+// they attempted. The policy lives in authorizePrincipal.
 func (h *SqsHandler) principalForWrite(w http.ResponseWriter, r *http.Request, action string) (AuthPrincipal, bool) {
 	return authorizePrincipal(w, r, h.roles, accessWrite, "this access key is not authorised to "+action)
+}
+
+// gatePrincipal delegates the authorization decision and response to the
+// shared policy, then enriches denials with the principal data needed by the
+// purge audit. A missing principal is an internal metrics outcome because it
+// indicates a broken middleware chain, even though the HTTP policy returns 401.
+func (h *SqsHandler) gatePrincipal(
+	w http.ResponseWriter,
+	r *http.Request,
+	access roleAccess,
+	deny string,
+) (AuthPrincipal, gateOutcome) {
+	principal, present := PrincipalFromContext(r.Context())
+	authorized, ok := authorizePrincipal(w, r, h.roles, access, deny)
+	if ok {
+		return authorized, gateAllowed
+	}
+	if !present {
+		return AuthPrincipal{}, gateInternal
+	}
+	if access.allowedBy(principal.Role) && h.roles != nil {
+		if live, exists := h.roles.LookupRole(principal.AccessKey); exists {
+			principal.Role = live
+		} else {
+			principal.Role = ""
+		}
+	}
+	return principal, gateForbid
 }
 
 // writeQueuesError translates a QueuesSource error onto an HTTP

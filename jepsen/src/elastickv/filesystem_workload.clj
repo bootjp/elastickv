@@ -18,10 +18,12 @@
    The backend is optimistically concurrent: open/write/close on a file that
    another mount is writing can fail with EAGAIN (a write conflict), and a
    follower mount that lost its forwarded proposal may report EIO. Both are
-   retried a bounded number of times (`--max-retries`); a write that exhausts
-   its retries is recorded as indeterminate because an attempt may already
-   have been committed. Reads additionally retry ENOENT, short and malformed
-   records: FUSE splits open(2) into LOOKUP + OPEN, so a reader racing a
+   retried a bounded number of times (`--max-retries`) for reads and for
+   writes that provably failed before mutation. A possibly applied write is
+   immediately indeterminate: replaying it could overwrite a newer value and
+   give one history operation multiple effects. Reads additionally retry
+   ENOENT, short and malformed records: FUSE splits open(2) into LOOKUP + OPEN,
+   so a reader racing a
    rename on another mount can briefly miss the replaced inode. A main-phase
    read that exhausts those retries is still a plain :fail, because under
    write contention a bounded retry window cannot tell that race from loss.
@@ -102,7 +104,7 @@
   10)
 
 (def ^:const default-max-retries
-  "Attempts per operation before giving up on EAGAIN/EIO."
+  "Attempt limit for reads/setup and pre-mutation write failures."
   8)
 
 (def ^:const retry-backoff-ms 20)
@@ -474,12 +476,9 @@
       (instance? FileAlreadyExistsException e)))
 
 (defn invoke-write!
-  "Executes a write, retrying retryable errors. The outcome is classified
-   over every attempt, not just the last exception: an op is :fail only when
-   all attempts failed before touching the backend, because a single earlier
-   write/close/rename error may already have been committed and a later
-   EAGAIN at open (which RandomAccessFile reports as FileNotFoundException)
-   must not downgrade it to a definite failure."
+  "Retries only errors known to precede mutation. A write/close/rename or
+   SSH failure may follow a committed write, so it ends the operation as
+   indeterminate instead of replaying an old value over a concurrent write."
   [{:keys [local? mount-dir write-mode max-retries]} test node op k v]
   (let [maybe-applied? (volatile! false)
         attempt! (fn []
@@ -497,7 +496,9 @@
                          (vreset! maybe-applied? true))
                        (throw e))))]
     (try
-      (with-retries max-retries attempt!)
+      (with-retries max-retries
+        #(and (pre-mutation-error? %) (retryable-error? %))
+        attempt!)
       (assoc op :type :ok)
       (catch Exception e
         (if (and (not @maybe-applied?) (pre-mutation-error? e))
@@ -528,7 +529,7 @@
         (assoc op :type :ok :value (independent/tuple k kind) :error (io-error-label e))
         (fail op (io-error-label e))))))
 
-(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount node mount-dir local?]
+(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount setup-lock node mount-dir local?]
   client/Client
   (open! [this test node]
     (let [dir (or (get node->mount-dir node)
@@ -542,11 +543,14 @@
     (let [keys (range key-count)]
       (when (and local? require-fuse-mount)
         (require-local-fuse-mount! mount-dir))
-      (with-retries max-retries
-        (fn []
-          (if local?
-            (local-setup! mount-dir keys)
-            (remote-exec! test node (remote-setup-cmd mount-dir keys)))))))
+      (if local?
+        ;; Every local client sees the same mounted filesystem. Serialize
+        ;; setup writes to avoid self-conflicts, while still resetting the
+        ;; registers each time setup is called for a new test.
+        (locking setup-lock
+          (with-retries max-retries #(local-setup! mount-dir keys)))
+        (with-retries max-retries
+          #(remote-exec! test node (remote-setup-cmd mount-dir keys))))))
 
   (teardown! [_this test]
     ;; Jepsen runs teardown! before setup! and again after the test, so the
@@ -657,7 +661,7 @@
         require-fuse    (if (contains? opts :require-fuse-mount) (boolean (:require-fuse-mount opts)) true)
         node->dir       (or (:node->mount-dir opts)
                             (node->mount-dir default-nodes nil default-mount-dir))
-        client          (->FilesystemClient node->dir write-mode key-count max-retries require-fuse nil nil false)]
+        client          (->FilesystemClient node->dir write-mode key-count max-retries require-fuse (Object.) nil nil false)]
     (when-not (contains? write-modes write-mode)
       (throw (ex-info "unknown write mode" {:write-mode write-mode})))
     {:client    client
@@ -684,7 +688,8 @@
                                  :redis-port       (or (:redis-port opts) 6379)
                                  :filesystem-mount node->dir
                                  :raft-groups      (:raft-groups opts)
-                                 :shard-ranges     (:shard-ranges opts)}))
+                                 :shard-ranges     (:shard-ranges opts)
+                                 :encryption       (:encryption opts)}))
          rate        (double (or (:rate opts) 5))
          concurrency (or (:concurrency opts) default-concurrency)
          threads-per-key (or (:threads-per-key opts) default-threads-per-key)
@@ -774,7 +779,7 @@
    [nil "--concurrency N" "Number of worker threads (a multiple of --threads-per-key; at least the node count to final-read every mount)."
     :default default-concurrency
     :parse-fn #(Integer/parseInt %)]
-   [nil "--max-retries N" "Attempts per operation before an EAGAIN/EIO is reported."
+   [nil "--max-retries N" "Attempt limit; possibly applied writes are never replayed."
     :default default-max-retries
     :parse-fn #(Integer/parseInt %)]
    [nil "--allow-non-fuse-mount" "Skip the check that every --mount-dirs entry is a FUSE mount (local runs only)."

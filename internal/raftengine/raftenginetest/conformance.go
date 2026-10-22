@@ -152,7 +152,7 @@ func createSingleNode(t *testing.T, factory raftengine.Factory, dir string, sm *
 
 func testSingleNodeProposeAndRead(t *testing.T, factory raftengine.Factory) {
 	sm := &TestStateMachine{}
-	result := createSingleNode(t, factory, t.TempDir(), sm)
+	result := NewSingleNode(t, factory, sm)
 
 	ctx := context.Background()
 	pr, err := result.Engine.Propose(ctx, []byte("hello"))

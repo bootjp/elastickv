@@ -415,7 +415,7 @@
       (finally
         (delete-tree! dir)))))
 
-(deftest local-client-write-retries-exhausted-is-indeterminate
+(deftest local-client-ambiguous-write-is-indeterminate
   (let [dir (scratch-dir)]
     (try
       (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir]
@@ -432,7 +432,56 @@
       (finally
         (delete-tree! dir)))))
 
-(deftest write-classification-uses-every-attempt
+(deftest an-ambiguous-write-cannot-replay-over-a-newer-write
+  (doseq [mode [:overwrite :rename]]
+    (let [dir (scratch-dir)]
+      (try
+        (workload/local-setup! dir [0])
+        (let [path (workload/register-path dir 0)
+              calls (atom 0)
+              observed (atom [])
+              overwrite! workload/local-overwrite!
+              rename! workload/local-rename-write!
+              apply! (fn [v]
+                       (case mode
+                         :overwrite (overwrite! path v)
+                         :rename (rename! dir 0 v)))
+              attempt! (fn [v]
+                         (swap! calls inc)
+                         (apply! v)
+                         (when (= 1 @calls)
+                           (swap! observed conj (workload/local-read path))
+                           (apply! 29)
+                           (swap! observed conj (workload/local-read path))
+                           (throw (java.io.IOException. "Resource temporarily unavailable"))))]
+          (with-redefs [workload/local-overwrite! (fn [_ v] (attempt! v))
+                        workload/local-rename-write! (fn [_ _ v] (attempt! v))]
+            (let [result (workload/invoke-write!
+                           {:local? true :mount-dir dir :write-mode mode :max-retries 3}
+                           {} "n1" {:type :invoke :f :write :value (independent/tuple 0 24)} 0 24)]
+              (is (= [24 29] @observed))
+              (is (= :info (:type result)) (str mode))
+              (is (= 1 @calls) (str mode " must not replay a possibly applied write"))
+              (is (= 29 (workload/local-read path)) (str mode " must retain the newer write")))))
+        (finally
+          (delete-tree! dir))))))
+
+(deftest remote-ambiguous-writes-are-not-replayed
+  (doseq [mode [:overwrite :rename]]
+    (let [calls (atom 0)]
+      (with-redefs-fn
+        {#'workload/remote-exec! (fn [& _]
+                                  (swap! calls inc)
+                                  (throw (ex-info "SSH command failed"
+                                                  {:exit 1 :err "Input/output error"})))}
+        (fn []
+          (let [result (workload/invoke-write!
+                         {:local? false :mount-dir "/mnt/fs" :write-mode mode :max-retries 3}
+                         {} "n1" {:type :invoke :f :write :value (independent/tuple 0 24)} 0 24)]
+            (is (= :info (:type result)))
+            (is (= 1 @calls))))))))
+
+(deftest writes-retry-only-pre-mutation-errors
   (let [dir (scratch-dir)]
     (try
       (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir]
@@ -445,8 +494,7 @@
         ;; Every attempt fails at open: nothing reached the backend -> :fail.
         (with-redefs [workload/local-overwrite! (fn [_ _] (throw (eagain)))]
           (is (= :fail (:type (write)))))
-        ;; First attempt fails after open (write/close EIO), later attempts
-        ;; fail at open: the first one may have committed -> :info.
+        ;; A write/close EIO may follow application: never try it again.
         (let [calls (atom 0)]
           (with-redefs [workload/local-overwrite! (fn [_ _]
                                                     (if (= 1 (swap! calls inc))
@@ -454,8 +502,15 @@
                                                       (throw (eagain))))]
             (let [w (write)]
               (is (= :info (:type w)))
-              (is (= 3 @calls))
-              (is (str/includes? (:error w) "Resource temporarily unavailable")))))
+              (is (= 1 @calls))
+              (is (str/includes? (:error w) "Input/output error")))))
+        ;; Retrying an open failure remains safe because it had no effect.
+        (let [calls (atom 0)]
+          (with-redefs [workload/local-overwrite! (fn [_ _]
+                                                    (when (< (swap! calls inc) 3)
+                                                      (throw (eagain))))]
+            (is (= :ok (:type (write))))
+            (is (= 3 @calls))))
         ;; A genuinely missing file is still a definite failure.
         (with-redefs [workload/local-overwrite! (fn [_ _] (throw (java.nio.file.NoSuchFileException. "reg-0")))]
           (is (= :fail (:type (write))))))

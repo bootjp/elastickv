@@ -1,6 +1,7 @@
 package admin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -552,7 +553,20 @@ type rowMergeAcc struct {
 	routeIDsTruncated bool
 	routeCount        uint64
 	label             string
-	cells             []cellMergeAcc
+	// subBucket / subBucketCount carry the §K sub-range identity through the
+	// merge. Without them every merged response omitted both, so
+	// subRangeLabel returned null and the sub-range label and narrowed
+	// Start/End captions vanished specifically in the cluster-wide view --
+	// the one view where an operator is most likely to be looking.
+	//
+	// A nonzero value from ANY peer wins: during a rolling upgrade the
+	// bucket is reported by both old peers (which omit the fields) and new
+	// ones, and taking the first peer's zero would discard what the upgraded
+	// peers know.
+	subBucket               int
+	subBucketCount          int
+	subBucketBoundsConflict bool
+	cells                   []cellMergeAcc
 }
 
 // cellMergeAcc tracks merge state for one (bucket, column) cell.
@@ -630,11 +644,14 @@ func mergeRowInto(
 			routeIDsTruncated: row.RouteIDsTruncated,
 			routeCount:        row.RouteCount,
 			label:             row.Label,
+			subBucket:         row.SubBucket,
+			subBucketCount:    row.SubBucketCount,
 			cells:             make([]cellMergeAcc, mergedWidth),
 		}
 		accByBucket[row.BucketID] = acc
 		*bucketOrder = append(*bucketOrder, row.BucketID)
 	}
+	reconcileSubRangeMetadata(acc, row)
 	for j, ts := range srcColumns {
 		idx, ok := indexByColumn[ts]
 		if !ok || j >= len(row.Values) {
@@ -653,6 +670,24 @@ func mergeRowInto(
 		} else {
 			acc.cells[idx].addRead(value, group, term)
 		}
+	}
+}
+
+func reconcileSubRangeMetadata(acc *rowMergeAcc, row *KeyVizRow) {
+	// The same bucket ID can denote different bounds while peers run with
+	// different K values. Never label a merged row with one peer's range.
+	if !bytes.Equal(acc.start, row.Start) || !bytes.Equal(acc.end, row.End) ||
+		(acc.subBucketCount != 0 && row.SubBucketCount != 0 &&
+			(acc.subBucket != row.SubBucket || acc.subBucketCount != row.SubBucketCount)) {
+		acc.subBucket = 0
+		acc.subBucketCount = 0
+		acc.subBucketBoundsConflict = true
+		return
+	}
+	// Accept metadata from a modern peer when a legacy peer was first.
+	if !acc.subBucketBoundsConflict && acc.subBucketCount == 0 && row.SubBucketCount != 0 {
+		acc.subBucket = row.SubBucket
+		acc.subBucketCount = row.SubBucketCount
 	}
 }
 
@@ -748,6 +783,8 @@ func resolveRowMergeAcc(acc *rowMergeAcc, useGroupTermDedupe bool) KeyVizRow {
 	row := KeyVizRow{
 		BucketID:          acc.bucketID,
 		Label:             acc.label,
+		SubBucket:         acc.subBucket,
+		SubBucketCount:    acc.subBucketCount,
 		Start:             acc.start,
 		End:               acc.end,
 		Aggregate:         acc.aggregate,
