@@ -54,6 +54,15 @@ The witness deliberately cannot authorize a nonce epoch reset.
 
 ## Compatibility and Scope
 
+Older binaries do not recognize the reserved operational key
+`_meta_encryption_snapshot_checkpoint`. The ability to skip the v2 header
+extension does not establish compatibility with this physical body record.
+Downgrading a store written by this version has not been validated as safe.
+Mixed-version native physical snapshot transfer to an older follower is not
+supported by this change: upgrade the receiving follower before allowing it
+to install a snapshot produced by this version. Do not delete the checkpoint
+record or bypass snapshot, sidecar, or epoch checks to enable a downgrade.
+
 An old snapshot without a witness does **not** authorize skipping compacted
 history. Such a node can still refuse startup and needs an independently
 validated operational recovery path. This change does not manufacture
@@ -71,6 +80,9 @@ consistency anomaly is fixed. No change from PR #1286 is included.
   payload, invalid encrypted-tail tag, and a rolled-back local epoch.
 - Snapshot witness tests cover full restore and the verified header-only
   skip path, including subsequent snapshot production.
+- When the sidecar index equals or exceeds the engine's applied index, the
+  gap guard does not reopen the snapshot. Engine restore still verifies its
+  full CRC; any nonempty gap retains snapshot verification and suffix scans.
 - `go test . ./kv ./internal/encryption ./internal/raftengine/etcd -count=1`
   passed. The encryption/snapshot/skip-gate selection also passed with `-race`.
 - Scoped `golangci-lint` passed with Go 1.26.6 (0 issues).
@@ -87,3 +99,6 @@ verified-header skip path, both encryption apply handlers, the startup gap
 guard and scanner factory, and the scanner's sole per-entry predicate call.
 The old three-result header API remains available to callers that do not
 consume the extension. The pure `GuardSidecarBehindRaftLog` API is unchanged.
+The no-gap fast path keeps the original sidecar index rather than advancing
+it. Its sole production caller still invokes the pure gap guard afterward;
+the engine's full-restore and header-only-skip CRC checks are unchanged.

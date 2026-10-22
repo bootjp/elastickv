@@ -11,6 +11,11 @@ import (
 
 func sidecarGapStartFromSnapshot(engine encryptionGapEngine, sc *encryption.Sidecar) (uint64, error) {
 	start := sc.RaftAppliedIndex
+	if start >= engine.AppliedIndex() {
+		// Engine restore already validated the installed snapshot. No
+		// compacted gap needs a witness, so do not repeat its full CRC scan.
+		return start, nil
+	}
 	source, ok := engine.(interface {
 		EncryptionSnapshot() (io.ReadCloser, uint64, error)
 	})

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"encoding/binary"
+	"fmt"
 	"io"
 	"path/filepath"
 	"testing"
@@ -20,10 +21,33 @@ type checkpointGapEngine struct {
 	payload       []byte
 	snapshotIndex uint64
 	snapshotErr   error
+	snapshotCalls int
 }
 
 func (e *checkpointGapEngine) EncryptionSnapshot() (io.ReadCloser, uint64, error) {
+	e.snapshotCalls++
 	return io.NopCloser(bytes.NewReader(e.payload)), e.snapshotIndex, e.snapshotErr
+}
+
+func TestEncryptionCheckpointReadsSnapshotOnlyForGap(t *testing.T) {
+	for _, applied := range []uint64{5, 6, 7} {
+		t.Run(fmt.Sprintf("applied-%d", applied), func(t *testing.T) {
+			engine := &checkpointGapEngine{
+				stubGapEngine: stubGapEngine{appliedIndex: applied},
+				snapshotErr:   io.ErrUnexpectedEOF,
+			}
+			sc := &encryption.Sidecar{RaftAppliedIndex: 6}
+			start, err := sidecarGapStartFromSnapshot(engine, sc)
+			if applied > sc.RaftAppliedIndex {
+				require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+				require.Equal(t, 1, engine.snapshotCalls)
+				return
+			}
+			require.NoError(t, err)
+			require.Equal(t, sc.RaftAppliedIndex, start)
+			require.Zero(t, engine.snapshotCalls)
+		})
+	}
 }
 
 type checkpointScanner struct {
