@@ -16,3 +16,6 @@ if [[ -n "$violations" ]]; then
   printf 'Production dependency on test support:\n%s\n' "$violations" >&2
   exit 1
 fi
+
+# The active dependency graph omits other platforms and build-tagged files.
+go run ./internal/testutil/cmd/importguard

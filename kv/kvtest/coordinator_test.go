@@ -246,3 +246,11 @@ func TestLocalCoordinatorDelete(t *testing.T) {
 		require.ErrorIs(t, err, store.ErrKeyNotFound)
 	}
 }
+
+func TestLocalCoordinatorIgnoresNonTxnStartTS(t *testing.T) {
+	c := kvtest.NewLocalCoordinator(store.NewMVCCStore(), kvtest.LocalOptions{})
+	const unrelatedStartTS = uint64(1) << 63
+	response, err := c.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{StartTS: unrelatedStartTS, Elems: []*kv.Elem[kv.OP]{put("key")}})
+	require.NoError(t, err)
+	require.Less(t, response.CommitTS, unrelatedStartTS, "non-transactional StartTS must not advance the HLC")
+}

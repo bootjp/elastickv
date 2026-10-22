@@ -192,7 +192,9 @@ func (c *LocalCoordinator) requestCommitTS(req *kv.OperationGroup[kv.OP]) (uint6
 	}
 	switch c.options.CommitTimestamp {
 	case TimestampHLC:
-		c.Clock().Observe(req.StartTS)
+		if req.IsTxn {
+			c.Clock().Observe(req.StartTS)
+		}
 		return c.Clock().Next(), nil
 	case TimestampStoreIncrement:
 		return incrementTimestamp(c.st.LastCommitTS())
