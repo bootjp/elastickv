@@ -2491,7 +2491,10 @@ locally.
   member for bootstrap, applies both envelope cutovers after membership
   is established, and waits for every node to report both active before
   releasing the workload. `--local --encryption` is rejected because a
-  no-op DB adapter cannot provision or verify that cluster.
+  no-op DB adapter cannot provision or verify that cluster. Multi-group
+  managed runs are also rejected before setup because the current Raft
+  envelope cutover is defined only for a single shard group; they must not
+  bootstrap keys or enable the storage envelope and then fail halfway through.
 - **Evidence (first run, this PR).** Against an encrypted cluster
   built from this branch: Redis list-append pass, Redis ZSet safety
   pass, DynamoDB list-append pass (30 s), all ten DynamoDB per-type

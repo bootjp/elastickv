@@ -540,4 +540,9 @@
           :shard-ranges \":m=1,m:=2\"
           :server-env {\"ELASTICKV_RAFT_SEND_STREAM\" \"true\"}}"
   ([] (->ElastickvDB {}))
-  ([opts] (->ElastickvDB opts)))
+  ([opts]
+   (when (and (:encryption opts)
+              (> (count (:raft-groups opts)) 1))
+     (throw (ex-info "--encryption currently requires exactly one Raft group"
+                     {:raft-group-count (count (:raft-groups opts))})))
+   (->ElastickvDB opts)))

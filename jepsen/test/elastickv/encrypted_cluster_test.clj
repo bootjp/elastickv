@@ -14,6 +14,7 @@
             [elastickv.dynamodb-multi-table-workload :as multi]
             [elastickv.dynamodb-types-workload :as types]
             [elastickv.dynamodb-workload :as dynamo]
+            [elastickv.filesystem-workload :as filesystem]
             [elastickv.redis-workload :as redis]
             [elastickv.redis-zset-safety-workload :as zset]
             [elastickv.s3-workload :as s3]
@@ -56,6 +57,16 @@
   ;; construction rather than being dropped by a destructuring form.
   (let [db (ekdb/db {:grpc-port 50051 :encryption true})]
     (is (true? (get-in db [:opts :encryption])))))
+
+(deftest multi-group-encryption-is-rejected-before-setup
+  ;; Raft envelope cutover is currently single-group. Reject the unsupported
+  ;; shape while constructing the DB, before setup can bootstrap keys or apply
+  ;; the storage-envelope mutation.
+  (is (thrown-with-msg? clojure.lang.ExceptionInfo
+                        #"requires exactly one Raft group"
+                        (ekdb/db {:encryption true
+                                  :raft-groups {1 50051, 2 50052}})))
+  (is (some? (ekdb/db {:encryption true :raft-groups {1 50051}}))))
 
 (deftest managed-encryption-builds-the-production-server
   ;; cmd/server is the demo binary and does not expose EncryptionAdmin or the
@@ -247,7 +258,8 @@
                         ["dynamodb-types"        types/elastickv-dynamodb-types-test]
                         ["dynamodb-multi-table"  multi/elastickv-dynamodb-multi-table-test]
                         ["s3"                    s3/elastickv-s3-test]
-                        ["sqs-htfifo"            sqs/elastickv-sqs-htfifo-test]]]
+                        ["sqs-htfifo"            sqs/elastickv-sqs-htfifo-test]
+                        ["filesystem"             filesystem/elastickv-filesystem-test]]]
     (testing label
       (is (true? (get-in (ctor {:encryption true}) [:db :opts :encryption]))
           (str label " accepts --encryption from common-cli-opts but drops it"))
