@@ -176,17 +176,18 @@ var (
 	// below — both can be enabled simultaneously, and operators can pick
 	// whichever auth path they need (gRPC bearer token vs. HTTP cookies +
 	// SigV4 access keys).
-	adminTokenFile                = flag.String("adminTokenFile", "", "Path to the read-only Admin bearer token; does not authorize split migration")
-	adminInsecureNoAuth           = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
-	splitMigrationTokenFile       = flag.String("splitMigrationTokenFile", "", "Path to a dedicated cluster-shared migration controller/node token, distinct from Admin and S3 peer tokens")
-	grpcTLSCAFile                 = flag.String("grpcTLSCAFile", "", "CA certificates for verifying peer gRPC TLS; requires grpcTLSCertFile and grpcTLSKeyFile")
-	grpcTLSCertFile               = flag.String("grpcTLSCertFile", "", "PEM certificate enabling TLS on group gRPC listeners and peer clients")
-	grpcTLSKeyFile                = flag.String("grpcTLSKeyFile", "", "PEM private key for group gRPC TLS")
-	s3BlobPeerTokenFile           = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
-	backupDefaultTTL              = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
-	backupMaxTTL                  = flag.Duration("backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
-	backupBeginDeadline           = flag.Duration("backupBeginDeadline", defaultBackupDeadline, "Deadline for live-backup peer gates and pin fan-out")
-	backupSnapshotHeadroomEntries = flag.Uint64(
+	adminTokenFile                 = flag.String("adminTokenFile", "", "Path to the read-only Admin bearer token; does not authorize split migration")
+	adminInsecureNoAuth            = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	splitMigrationTokenFile        = flag.String("splitMigrationTokenFile", "", "Path to a dedicated cluster-shared migration controller/node token, distinct from Admin and S3 peer tokens")
+	splitMigrationPeerAuthEnforced = flag.Bool("splitMigrationPeerAuthEnforced", false, "Require TLS peer Forward credentials and enable migration only after every node sends the migration token")
+	grpcTLSCAFile                  = flag.String("grpcTLSCAFile", "", "CA certificates for verifying peer gRPC TLS; requires grpcTLSCertFile and grpcTLSKeyFile")
+	grpcTLSCertFile                = flag.String("grpcTLSCertFile", "", "PEM certificate enabling TLS on group gRPC listeners and peer clients")
+	grpcTLSKeyFile                 = flag.String("grpcTLSKeyFile", "", "PEM private key for group gRPC TLS")
+	s3BlobPeerTokenFile            = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
+	backupDefaultTTL               = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
+	backupMaxTTL                   = flag.Duration("backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
+	backupBeginDeadline            = flag.Duration("backupBeginDeadline", defaultBackupDeadline, "Deadline for live-backup peer gates and pin fan-out")
+	backupSnapshotHeadroomEntries  = flag.Uint64(
 		"backupSnapshotHeadroomEntries", defaultBackupHeadroom,
 		"Minimum Raft entries remaining before the next snapshot when a live backup begins",
 	)
@@ -2370,7 +2371,10 @@ func splitMigrationVoter(groupID uint64, member raftengine.Server, connCache *kv
 	return adapter.SplitMigrationVoter{ID: member.ID, Address: addr, Client: newSplitMigrationInternalClient(conn, token)}, nil
 }
 
-func splitMigrationLocalReadinessGate(context.Context) error {
+func splitMigrationLocalReadinessGate(ctx context.Context) error {
+	if err := splitMigrationPeerAuthReadinessGate(ctx); err != nil {
+		return err
+	}
 	if !adapter.MigrationImportOpcodeEnabledFromEnv() {
 		return errors.Errorf("%s is disabled", adapter.MigrationImportOpcodeEnv)
 	}
@@ -2383,8 +2387,18 @@ func splitMigrationLocalReadinessGate(context.Context) error {
 	return nil
 }
 
+func splitMigrationPeerAuthReadinessGate(context.Context) error {
+	if *adminInsecureNoAuth || *splitMigrationPeerAuthEnforced {
+		return nil
+	}
+	return errors.New("migration is paused during peer auth rollout; enable --splitMigrationPeerAuthEnforced only after every node sends the token")
+}
+
 func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
 	if eg == nil || server == nil {
+		return
+	}
+	if splitMigrationPeerAuthReadinessGate(ctx) != nil {
 		return
 	}
 	eg.Go(func() error {
@@ -3238,7 +3252,7 @@ func configureAdminService(
 	icept := adminGRPCInterceptors{token: auth.adminToken}
 	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
 	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
-	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth)
+	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth, *splitMigrationPeerAuthEnforced)
 	appendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
 	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
 	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)

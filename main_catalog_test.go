@@ -184,6 +184,9 @@ func TestSplitMigrationCapabilityGateFailsClosedWhenLocalReadinessFails(t *testi
 }
 
 func TestSplitMigrationLocalReadinessGateRequiresMigrationOpcodes(t *testing.T) {
+	oldEnforced := *splitMigrationPeerAuthEnforced
+	*splitMigrationPeerAuthEnforced = true
+	t.Cleanup(func() { *splitMigrationPeerAuthEnforced = oldEnforced })
 	t.Setenv(adapter.MigrationImportOpcodeEnv, "")
 	t.Setenv(adapter.MigrationPromoteOpcodeEnv, "1")
 	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "1")

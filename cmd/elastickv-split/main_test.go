@@ -128,7 +128,7 @@ func TestRunSendsMigrationControllerToken(t *testing.T) {
 	var listenConfig net.ListenConfig
 	listener, err := listenConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	unary, _ := adapter.SplitMigrationTokenAuth("test-migration-token", false)
+	unary, _ := adapter.SplitMigrationTokenAuth("test-migration-token", false, true)
 	tlsFixture := httptest.NewTLSServer(nil)
 	tlsFixture.Close()
 	caPath := filepath.Join(t.TempDir(), "ca.pem")

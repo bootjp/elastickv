@@ -32,7 +32,7 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 	}
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {
-			unary, stream := SplitMigrationTokenAuth("migration-secret", false)
+			unary, stream := SplitMigrationTokenAuth("migration-secret", false, true)
 			for _, credential := range []string{"", "Bearer wrong", "Bearer migration-secret"} {
 				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", credential))
 				ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
@@ -61,7 +61,7 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 
 func TestSplitMigrationTokenAuthRejectsPlaintextEvenWithValidToken(t *testing.T) {
 	t.Parallel()
-	unary, stream := SplitMigrationTokenAuth("migration-secret", false)
+	unary, stream := SplitMigrationTokenAuth("migration-secret", false, true)
 	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer migration-secret"))
 	_, err := unary(ctx, nil, &grpc.UnaryServerInfo{FullMethod: pb.Internal_CleanupMigration_FullMethodName}, func(context.Context, any) (any, error) {
 		t.Fatal("plaintext token must not reach the handler")
@@ -79,7 +79,7 @@ func TestSplitMigrationTokenAuthRejectsPlaintextEvenWithValidToken(t *testing.T)
 
 func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 	t.Parallel()
-	unary, _ := SplitMigrationTokenAuth("", false)
+	unary, _ := SplitMigrationTokenAuth("", false, true)
 	for _, method := range []string{
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
@@ -104,7 +104,7 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, "routes", resp)
-	insecureUnary, insecureStream := SplitMigrationTokenAuth("", true)
+	insecureUnary, insecureStream := SplitMigrationTokenAuth("", true, false)
 	require.Nil(t, insecureUnary)
 	require.Nil(t, insecureStream)
 }
@@ -112,7 +112,7 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 func TestSplitMigrationTokenAuthLeavesNormalPeerRPCsUnchanged(t *testing.T) {
 	t.Parallel()
 	for _, token := range []string{"", "migration-secret"} {
-		unary, stream := SplitMigrationTokenAuth(token, false)
+		unary, stream := SplitMigrationTokenAuth(token, false, true)
 		for _, method := range []string{
 			pb.Internal_Forward_FullMethodName,
 			pb.Distribution_ListRoutes_FullMethodName,
@@ -137,5 +137,29 @@ func TestSplitMigrationTokenAuthLeavesNormalPeerRPCsUnchanged(t *testing.T) {
 			require.NoError(t, err)
 			require.True(t, called)
 		}
+	}
+}
+
+func TestSplitMigrationPeerAuthRolloutAcceptsLegacyForwardBeforeEnforcement(t *testing.T) {
+	t.Parallel()
+	for _, enforced := range []bool{false, true} {
+		unary, _ := SplitMigrationTokenAuth("migration-secret", false, enforced)
+		called := false
+		_, err := unary(context.Background(), &pb.ForwardRequest{}, &grpc.UnaryServerInfo{FullMethod: pb.Internal_Forward_FullMethodName}, func(context.Context, any) (any, error) {
+			called = true
+			return nil, nil
+		})
+		if enforced {
+			require.Equal(t, codes.Unauthenticated, status.Code(err))
+			require.False(t, called)
+		} else {
+			require.NoError(t, err)
+			require.True(t, called, "send-only stage must accept old peers during rolling upgrade")
+		}
+		_, err = unary(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: pb.Internal_CleanupMigration_FullMethodName}, func(context.Context, any) (any, error) {
+			t.Fatal("rollout never exposes privileged migration RPCs")
+			return nil, nil
+		})
+		require.Equal(t, codes.Unauthenticated, status.Code(err))
 	}
 }

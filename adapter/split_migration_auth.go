@@ -39,23 +39,25 @@ func splitMigrationProtectedMethod(method string) bool {
 	}
 }
 
-func splitMigrationAuthenticatedMethod(method, token string) bool {
+func splitMigrationAuthenticatedMethod(method, token string, peerAuthEnforced bool) bool {
 	// Forward can write arbitrary system/transaction metadata. In a migration
 	// cluster it is a privileged peer RPC, not an alternative public write API.
-	return splitMigrationProtectedMethod(method) || (token != "" && method == pb.Internal_Forward_FullMethodName)
+	return splitMigrationProtectedMethod(method) || (peerAuthEnforced && token != "" && method == pb.Internal_Forward_FullMethodName)
 }
 
 // SplitMigrationTokenAuth protects migration control and raw MVCC exports.
 // Without a configured token, only an explicit insecure opt-in enables access.
-func SplitMigrationTokenAuth(token string, insecureNoAuth bool) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
+// Peer enforcement follows a send-first rollout; the runner must stay paused
+// until enforcement is enabled (except in explicit isolated-test no-auth mode).
+func SplitMigrationTokenAuth(token string, insecureNoAuth, peerAuthEnforced bool) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
 	if token == "" && insecureNoAuth {
 		return nil, nil
 	}
 	authUnary, authStream := bearerTokenAuth(token, func(method string) bool {
-		return splitMigrationAuthenticatedMethod(method, token)
+		return splitMigrationAuthenticatedMethod(method, token, peerAuthEnforced)
 	}, "split migration controller")
 	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if err := checkSplitMigrationTransport(ctx, info.FullMethod, token); err != nil {
+		if err := checkSplitMigrationTransport(ctx, info.FullMethod, token, peerAuthEnforced); err != nil {
 			return nil, err
 		}
 		if authUnary != nil {
@@ -64,7 +66,7 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth bool) (grpc.UnaryServe
 		return handler(ctx, req)
 	}
 	stream := func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if err := checkSplitMigrationTransport(ss.Context(), info.FullMethod, token); err != nil {
+		if err := checkSplitMigrationTransport(ss.Context(), info.FullMethod, token, peerAuthEnforced); err != nil {
 			return err
 		}
 		if authStream != nil {
@@ -75,8 +77,8 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth bool) (grpc.UnaryServe
 	return unary, stream
 }
 
-func checkSplitMigrationTransport(ctx context.Context, method, token string) error {
-	if !splitMigrationAuthenticatedMethod(method, token) {
+func checkSplitMigrationTransport(ctx context.Context, method, token string, peerAuthEnforced bool) error {
+	if !splitMigrationAuthenticatedMethod(method, token, peerAuthEnforced) {
 		return nil
 	}
 	if token == "" {

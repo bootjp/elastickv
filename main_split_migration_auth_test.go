@@ -15,6 +15,7 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -24,6 +25,9 @@ import (
 )
 
 func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
+	oldEnforced := *splitMigrationPeerAuthEnforced
+	*splitMigrationPeerAuthEnforced = true
+	t.Cleanup(func() { *splitMigrationPeerAuthEnforced = oldEnforced })
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
@@ -139,6 +143,36 @@ func TestSplitMigrationOpcodesRequireExplicitAuthentication(t *testing.T) {
 			require.NoError(t, err)
 		})
 	}
+}
+
+func TestSplitMigrationPeerAuthRolloutPausesRunnerAndCapability(t *testing.T) {
+	oldEnforced, oldNoAuth := *splitMigrationPeerAuthEnforced, *adminInsecureNoAuth
+	*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = false, false
+	t.Cleanup(func() {
+		*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = oldEnforced, oldNoAuth
+	})
+	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
+		t.Setenv(env, "true")
+	}
+	require.ErrorContains(t, splitMigrationLocalReadinessGate(context.Background()), "peer auth rollout")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	group := new(errgroup.Group)
+	startDistributionSplitJobRunner(ctx, group, adapter.NewDistributionServer(nil, nil))
+	done := make(chan error, 1)
+	go func() { done <- group.Wait() }()
+	select {
+	case err := <-done:
+		require.NoError(t, err)
+	case <-time.After(time.Second):
+		cancel()
+		<-done
+		t.Fatal("send-only rollout stage must not start a privileged runner")
+	}
+	*splitMigrationPeerAuthEnforced = true
+	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()))
+	*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = false, true
+	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()), "isolated no-auth tests retain explicit opt-in")
 }
 
 func TestSplitMigrationTokenMustBeDedicated(t *testing.T) {
