@@ -720,6 +720,7 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+	handoff.arm(runCtx, eg, runtimes)
 	startLeaderBalanceScheduler(
 		runCtx,
 		eg,
@@ -727,7 +728,6 @@ func run() error {
 		leaderBalanceConfigFromFlags(*raftId, cfg.defaultGroup, cfg.sqsFifoPartitionMap, metricsRegistry.Registerer()),
 	)
 
-	handoff.arm(runCtx, eg, runtimes)
 	return waitRunGroup(eg)
 }
 
