@@ -28,6 +28,7 @@ func TestProductionImportGuard(t *testing.T) {
 		{"github.com/stretchr/testify/require", true},
 		{"github.com/bootjp/elastickv/internal/testutil", true},
 		{"github.com/bootjp/elastickv/internal/testutil/grpctest", true},
+		{"github.com/bootjp/elastickv/internal/testutil/cmd/importguard", true},
 		{"github.com/bootjp/elastickv/internal/raftengine/raftenginetest", true},
 		{"github.com/bootjp/elastickv/internal/encryption/encryptiontest", true},
 		{"github.com/bootjp/elastickv/store/storetest", true},

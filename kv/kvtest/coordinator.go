@@ -166,7 +166,7 @@ func operationShape(elems []*kv.Elem[kv.OP]) (bool, bool, error) {
 }
 
 func (c *LocalCoordinator) commitTS(req *kv.OperationGroup[kv.OP]) (uint64, error) {
-	if req.IsTxn && req.StartTS == math.MaxUint64 {
+	if req.CommitTS == math.MaxUint64 || (req.IsTxn && req.StartTS >= math.MaxUint64-1) {
 		return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
 	}
 	ts, err := c.requestCommitTS(req)
@@ -179,11 +179,18 @@ func (c *LocalCoordinator) commitTS(req *kv.OperationGroup[kv.OP]) (uint64, erro
 			return 0, err
 		}
 	}
-	if req.IsTxn && ts <= req.StartTS {
-		return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
+	if err := validateResolvedTimestamp(req, ts); err != nil {
+		return 0, err
 	}
 	c.Clock().Observe(ts)
 	return ts, nil
+}
+
+func validateResolvedTimestamp(req *kv.OperationGroup[kv.OP], ts uint64) error {
+	if ts == 0 || ts == math.MaxUint64 || (req.IsTxn && ts <= req.StartTS) {
+		return errors.WithStack(kv.ErrTxnCommitTSRequired)
+	}
+	return nil
 }
 
 func (c *LocalCoordinator) requestCommitTS(req *kv.OperationGroup[kv.OP]) (uint64, error) {
@@ -192,10 +199,7 @@ func (c *LocalCoordinator) requestCommitTS(req *kv.OperationGroup[kv.OP]) (uint6
 	}
 	switch c.options.CommitTimestamp {
 	case TimestampHLC:
-		if req.IsTxn {
-			c.Clock().Observe(req.StartTS)
-		}
-		return c.Clock().Next(), nil
+		return c.nextHLCTimestamp(req)
 	case TimestampStoreIncrement:
 		return incrementTimestamp(c.st.LastCommitTS())
 	case TimestampRequest:
@@ -203,6 +207,16 @@ func (c *LocalCoordinator) requestCommitTS(req *kv.OperationGroup[kv.OP]) (uint6
 	default:
 		return 0, errors.WithStack(kv.ErrInvalidRequest)
 	}
+}
+
+func (c *LocalCoordinator) nextHLCTimestamp(req *kv.OperationGroup[kv.OP]) (uint64, error) {
+	if c.Clock().Current() >= math.MaxUint64-1 {
+		return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
+	}
+	if req.IsTxn {
+		c.Clock().Observe(req.StartTS)
+	}
+	return c.Clock().Next(), nil
 }
 
 func (c *LocalCoordinator) raiseCommitTS(req *kv.OperationGroup[kv.OP], ts uint64) (uint64, error) {
@@ -217,7 +231,7 @@ func (c *LocalCoordinator) raiseCommitTS(req *kv.OperationGroup[kv.OP], ts uint6
 }
 
 func incrementTimestamp(ts uint64) (uint64, error) {
-	if ts == math.MaxUint64 {
+	if ts >= math.MaxUint64-1 {
 		return 0, errors.WithStack(kv.ErrTxnCommitTSRequired)
 	}
 	return ts + 1, nil

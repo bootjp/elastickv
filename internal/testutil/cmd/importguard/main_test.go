@@ -53,6 +53,7 @@ func TestForbiddenImport(t *testing.T) {
 	for _, path := range []string{
 		"testing", "testing/quick", "github.com/stretchr/testify/require",
 		"github.com/bootjp/elastickv/internal/testutil", "github.com/bootjp/elastickv/internal/testutil/grpctest",
+		"github.com/bootjp/elastickv/internal/testutil/cmd/importguard",
 		"github.com/bootjp/elastickv/kv/kvtest", "github.com/bootjp/elastickv/store/storetest",
 		"github.com/bootjp/elastickv/internal/encryption/encryptiontest", "github.com/bootjp/elastickv/internal/raftengine/raftenginetest",
 		"net/http/httptest", "example.com/newtest/nested", "github.com/cockroachdb/pebble/v2/internal/blobtest/nested",

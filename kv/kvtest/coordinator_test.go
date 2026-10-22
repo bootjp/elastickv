@@ -254,3 +254,62 @@ func TestLocalCoordinatorIgnoresNonTxnStartTS(t *testing.T) {
 	require.NoError(t, err)
 	require.Less(t, response.CommitTS, unrelatedStartTS, "non-transactional StartTS must not advance the HLC")
 }
+
+func TestLocalCoordinatorRejectsExhaustingTimestampsWithoutChangingClock(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		opts    kvtest.LocalOptions
+		storeTS uint64
+		req     kv.OperationGroup[kv.OP]
+	}{
+		{"explicit maximum", kvtest.LocalOptions{}, 0, kv.OperationGroup[kv.OP]{CommitTS: math.MaxUint64}},
+		{"transaction start has no usable successor", kvtest.LocalOptions{}, 0, kv.OperationGroup[kv.OP]{IsTxn: true, StartTS: math.MaxUint64 - 1}},
+		{"store increment reaches maximum", kvtest.LocalOptions{CommitTimestamp: kvtest.TimestampStoreIncrement}, math.MaxUint64 - 1, kv.OperationGroup[kv.OP]{}},
+		{"clamp reaches maximum", kvtest.LocalOptions{AdvanceCommitTS: true}, math.MaxUint64 - 1, kv.OperationGroup[kv.OP]{CommitTS: 1}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			st := store.NewMVCCStore()
+			if tc.storeTS != 0 {
+				require.NoError(t, st.PutAt(context.Background(), []byte("seed"), nil, tc.storeTS, 0))
+			}
+			c := kvtest.NewLocalCoordinator(st, tc.opts)
+			tc.req.Elems = []*kv.Elem[kv.OP]{put("untouched")}
+			_, err := c.Dispatch(context.Background(), &tc.req)
+			require.ErrorIs(t, err, kv.ErrTxnCommitTSRequired)
+			require.Zero(t, c.Clock().Current(), "invalid requests must not poison the HLC")
+			require.Equal(t, tc.storeTS, st.LastCommitTS())
+			_, err = st.GetAt(context.Background(), []byte("untouched"), math.MaxUint64)
+			require.ErrorIs(t, err, store.ErrKeyNotFound)
+		})
+	}
+}
+
+func TestLocalCoordinatorRejectsAutomaticTimestampAtClockBoundary(t *testing.T) {
+	for _, floor := range []uint64{math.MaxUint64 - 1, math.MaxUint64} {
+		st := store.NewMVCCStore()
+		c := kvtest.NewLocalCoordinator(st, kvtest.LocalOptions{})
+		c.Clock().Observe(floor)
+		_, err := c.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{put("untouched")}})
+		require.ErrorIs(t, err, kv.ErrTxnCommitTSRequired)
+		require.Equal(t, floor, c.Clock().Current())
+		require.Zero(t, st.LastCommitTS())
+	}
+}
+
+func TestLocalCoordinatorAllowsLastNonexhaustingTimestamp(t *testing.T) {
+	for _, req := range []*kv.OperationGroup[kv.OP]{
+		{CommitTS: math.MaxUint64 - 1},
+		{IsTxn: true, StartTS: math.MaxUint64 - 2},
+	} {
+		st := store.NewMVCCStore()
+		c := kvtest.NewLocalCoordinator(st, kvtest.LocalOptions{})
+		req.Elems = []*kv.Elem[kv.OP]{put("last")}
+		response, err := c.Dispatch(context.Background(), req)
+		require.NoError(t, err)
+		require.Equal(t, uint64(math.MaxUint64-1), response.CommitTS)
+		_, err = c.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{put("untouched")}})
+		require.ErrorIs(t, err, kv.ErrTxnCommitTSRequired)
+		require.Equal(t, response.CommitTS, c.Clock().Current())
+		require.Equal(t, response.CommitTS, st.LastCommitTS())
+	}
+}
