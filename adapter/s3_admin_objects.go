@@ -77,6 +77,7 @@ var ErrAdminInvalidContinuationToken = errors.New("s3 admin: invalid continuatio
 //   - ErrAdminNotLeader          — follower
 //   - ErrAdminBucketNotFound     — bucket absent
 //   - ErrAdminInvalidObjectKey   — empty key
+//   - ErrAdminS3Stopping         — Stop has begun
 func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincipal, bucket, key string) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
@@ -90,10 +91,22 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 	if err := validateS3BucketName(bucket); err != nil {
 		return errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
 	}
+	// Counted like the other admin object operations so Stop waits for
+	// the delete before it closes the cleanup gate: the blob cleanup the
+	// delete schedules once it has committed must not be refused.
+	if err := s.enterAdminBlobUse(); err != nil {
+		return err
+	}
+	defer s.exitAdminBlobUse()
 
+	cleanup, err := s.reserveAdminCleanup()
+	if err != nil {
+		return err
+	}
+	defer cleanup.release()
 	var cleanupManifest *s3ObjectManifest
 	var generation uint64
-	err := s.retryS3Mutation(ctx, func() error {
+	err = s.retryS3Mutation(ctx, func() error {
 		manifest, gen, err := s.adminDeleteObjectTxn(ctx, bucket, key)
 		if err != nil {
 			return err
@@ -106,7 +119,9 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 		return err //nolint:wrapcheck // sentinels propagate as-is; wrapped values already carry context.
 	}
 	if cleanupManifest != nil {
-		s.cleanupManifestBlobsAsync(bucket, generation, key, cleanupManifest)
+		cleanup.start(func(cleanupCtx context.Context) {
+			s.cleanupManifestBlobs(cleanupCtx, bucket, generation, key, cleanupManifest)
+		})
 	}
 	return nil
 }
@@ -185,6 +200,10 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 	if !s.isVerifiedS3Leader(ctx) {
 		return ErrAdminNotLeader
 	}
+	if err := s.enterAdminBlobUse(); err != nil {
+		return err
+	}
+	defer s.exitAdminBlobUse()
 	if key == "" {
 		return ErrAdminInvalidObjectKey
 	}
@@ -212,6 +231,11 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 // the admin sentinels. It makes a single attempt: the chunk fan-out has no
 // idempotency token, so a retry would leak the first attempt's chunks.
 func (s *S3Server) adminPutObject(ctx context.Context, in *s3PutObjectInput, bucket, key string) error {
+	cleanup, err := s.reserveAdminCleanup()
+	if err != nil {
+		return err
+	}
+	defer cleanup.release()
 	state, err := s.prepareS3PutObject(ctx, in, bucket, key)
 	if err != nil {
 		var respErr *s3ResponseError
@@ -237,7 +261,9 @@ func (s *S3Server) adminPutObject(ctx context.Context, in *s3PutObjectInput, buc
 		return errors.WithStack(err)
 	}
 	if state.previous != nil {
-		s.cleanupManifestBlobsAsync(bucket, state.meta.Generation, key, state.previous)
+		cleanup.start(func(cleanupCtx context.Context) {
+			s.cleanupManifestBlobs(cleanupCtx, bucket, state.meta.Generation, key, state.previous)
+		})
 	}
 	return nil
 }
@@ -293,12 +319,20 @@ func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal,
 		return nil, AdminObject{}, errors.Wrapf(ErrAdminInvalidBucketName, "%s", err.Error())
 	}
 
+	// The body fetches chunks (offloaded ones through the blob peer
+	// cluster) until the caller closes it, so the registration is
+	// released by the body's Close, not on return.
+	if err := s.enterAdminBlobUse(); err != nil {
+		return nil, AdminObject{}, err
+	}
 	manifest, generation, readTS, readPin, err := s.adminLoadObjectForRead(ctx, bucket, key)
 	if err != nil {
+		s.exitAdminBlobUse()
 		return nil, AdminObject{}, err
 	}
 
 	body := newS3AdminObjectReader(ctx, s, bucket, generation, key, manifest, readTS, readPin)
+	body.release = s.exitAdminBlobUse
 
 	adminMeta := AdminObject{
 		Key:          key,
@@ -358,8 +392,10 @@ func (s *S3Server) adminLoadObjectForRead(ctx context.Context, bucket, key strin
 //
 // Lifecycle: holds a read-tracker pin (the readTS the manifest was
 // loaded at) so concurrent MVCC GC cannot reclaim chunks mid-read.
-// The pin is released by Close. Calling Close more than once is
-// safe (the underlying token's Release is idempotent on nil).
+// The pin, and the server's admin blob-use registration that keeps
+// Stop from closing the blob peer cluster under the read, are released
+// by Close. Calling Close more than once is safe (both are cleared on
+// the first call).
 type s3AdminObjectReader struct {
 	ctx        context.Context
 	server     *S3Server
@@ -369,6 +405,9 @@ type s3AdminObjectReader struct {
 	manifest   *s3ObjectManifest
 	readTS     uint64
 	pin        *kv.ActiveTimestampToken
+	// release ends the server's admin blob-use registration (see
+	// S3Server.enterAdminBlobUse); called once, by Close.
+	release func()
 
 	// Cursor state.
 	partIdx  int    // index into manifest.Parts
@@ -469,6 +508,10 @@ func (r *s3AdminObjectReader) Close() error {
 	if r.pin != nil {
 		r.pin.Release()
 		r.pin = nil
+	}
+	if r.release != nil {
+		r.release()
+		r.release = nil
 	}
 	return nil
 }

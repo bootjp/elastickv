@@ -122,6 +122,7 @@ type DynamoDBServer struct {
 	store           store.MVCCStore
 	coordinator     kv.Coordinator
 	httpServer      *http.Server
+	httpConns       *httpConnTracker
 	targetHandlers  map[string]func(http.ResponseWriter, *http.Request)
 	readTracker     *kv.ActiveTimestampTracker
 	requestObserver monitoring.DynamoDBRequestObserver
@@ -138,6 +139,13 @@ type DynamoDBServer struct {
 	// Set ELASTICKV_DYNAMODB_ONEPHASE_DEDUP=0 or pass
 	// WithDynamoOnePhaseTxnDedup(false) for an operator rollback.
 	onePhaseTxnDedup bool
+
+	// tableCleanups runs the cleanup of a deleted table's old generation
+	// (see launchDeletedTableCleanup) so Stop can join it, bounded, before
+	// the stores close underneath it. Its slot is reserved before the change
+	// that orphans the generation commits, whichever surface (public
+	// listener, admin HTTP or gRPC forwarder) the change came through.
+	tableCleanups *backgroundWorkers
 }
 
 // WithDynamoDBRequestObserver enables Prometheus-compatible request metrics.
@@ -264,6 +272,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 		store:            st,
 		coordinator:      kv.WithKeyVizLabel(coordinate, keyviz.LabelDynamo),
 		onePhaseTxnDedup: os.Getenv("ELASTICKV_DYNAMODB_ONEPHASE_DEDUP") != "0",
+		tableCleanups:    newBackgroundWorkers(),
 	}
 	for i := range d.itemUpdateLocks {
 		d.itemUpdateLocks[i] = make(chan struct{}, 1)
@@ -287,6 +296,7 @@ func NewDynamoDBServer(listen net.Listener, st store.MVCCStore, coordinate kv.Co
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", d.handle)
 	d.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	d.httpConns = trackHTTPConns(d.httpServer)
 	for _, opt := range opts {
 		if opt != nil {
 			opt(d)
@@ -308,11 +318,35 @@ func (d *DynamoDBServer) Run() error {
 	return nil
 }
 
+// Stop drains the HTTP listener (bounded, see shutdownHTTPServer), then
+// waits, under one more bound, for the deleted-table cleanups already
+// started or reserved by a delete still committing, cancelling and briefly
+// joining any still running, so none is dispatching when the stores close
+// after Stop. From then on a change that would need a cleanup is refused
+// with ErrDynamoServerStopping.
 func (d *DynamoDBServer) Stop() {
 	if d.httpServer != nil {
-		_ = d.httpServer.Shutdown(context.Background())
+		shutdownHTTPServer(d.httpServer, d.httpConns, "dynamodb")
 	}
+	d.tableCleanups.stop("dynamodb server", httpShutdownTimeout, dynamoTableCleanupJoinTimeout)
 }
+
+// ErrDynamoServerStopping is returned by a table delete, or a legacy-table
+// migration step, that would orphan a table generation once Stop has begun:
+// the generation's cleanup can no longer start, so the change is refused
+// before it commits, and the table is left as it was. The public listener
+// answers it with 503 ServiceUnavailable, which clients retry. It is also
+// marked as ErrAdminNotLeader, so the admin bridge answers it with the
+// not-leader response and the admin client retries against another node.
+var ErrDynamoServerStopping = errors.Mark(
+	newDynamoAPIError(http.StatusServiceUnavailable, dynamoErrServiceUnavailable, "server is stopping"),
+	ErrAdminNotLeader,
+)
+
+// dynamoTableCleanupJoinTimeout bounds how long Stop waits, after
+// cancelling the table cleanups that outlived the shutdown bound, for them
+// to return. A variable so tests can shorten it.
+var dynamoTableCleanupJoinTimeout = 2 * time.Second
 
 // proxyToLeader forwards the HTTP request to the current DynamoDB leader when
 // this node is not the Raft leader.  Returns true if the request was handled

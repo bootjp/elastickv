@@ -151,6 +151,72 @@
       (fn [] (#'ekdb/finish-bootstrap-setup! test "n1" opts)))
     (is (= [:grpc-ready :mount-checked :activate] @events))))
 
+(deftest encrypted-bootstrap-keeps-the-reserved-learner-out-of-membership
+  (let [test {:nodes ["n1" "n2" "n3" "n4"]}
+        opts {:encryption true :reserve-learner "n4"}
+        events (atom [])
+        discoveries (atom [])
+        verified (atom [])]
+    (with-redefs-fn
+      {#'ekdb/wait-for-node-grpc! (fn [node _] (swap! events conj [:ready node]))
+       #'ekdb/wait-for-mount! (fn [& _])
+       #'ekdb/join-peer! (fn [_ peer _] (swap! events conj [:join peer]))
+       #'ekdb/enable-peer-mount! (fn [_ peer _] (swap! events conj [:mount peer]))
+       #'ekdb/wrap-fresh-dek! (constantly "wrapped")
+       #'ekdb/encryption-command!
+       (fn [_ args]
+         (swap! events conj [:admin (nth args 2)])
+         (when (= "bootstrap" (nth args 2))
+           (swap! discoveries into (filter #(.startsWith ^String % "--discover-from=") args))))
+       #'ekdb/encryption-status
+       (fn [_ endpoint]
+         (swap! verified conj endpoint)
+         {:full-node-id 11 :local-epoch 1
+          :storage-envelope-active true :raft-envelope-active true})}
+      (fn [] (#'ekdb/finish-bootstrap-setup! test "n1" opts)))
+    (is (= [[:ready "n1"] [:join "n2"] [:mount "n2"]
+            [:join "n3"] [:mount "n3"] [:ready "n4"] [:admin "bootstrap"]
+            [:admin "enable-storage-envelope"] [:admin "enable-raft-envelope"]]
+           @events))
+    (is (= ["--discover-from=n1:50051" "--discover-from=n2:50051"
+            "--discover-from=n3:50051"] @discoveries))
+    (is (= #{"n1:50051" "n2:50051" "n3:50051"} (set @verified)))
+    (is (= ["n1:50051" "n2:50051" "n3:50051"] (vec (take-last 3 @verified))))))
+
+(deftest a-reserved-candidate-that-never-listens-fails-database-setup
+  (let [activated? (atom false)]
+    (with-redefs-fn
+      {#'ekdb/wait-for-node-grpc! (fn [node _]
+                                    (when (= "n4" node)
+                                      (throw (ex-info "candidate did not start" {}))))
+       #'ekdb/wait-for-mount! (fn [& _])
+       #'ekdb/join-peer! (fn [& _])
+       #'ekdb/enable-peer-mount! (fn [& _])
+       #'ekdb/activate-encryption! (fn [& _] (reset! activated? true))}
+      (fn []
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"candidate did not start"
+                             (#'ekdb/finish-bootstrap-setup!
+                               {:nodes ["n1" "n2" "n3" "n4"]} "n1"
+                               {:encryption true :reserve-learner "n4"})))))
+    (is (false? @activated?))))
+
+(deftest encrypted-candidate-keeps-join-flags-on-every-start
+  (let [test {:nodes ["n1" "n2" "n3" "n4"]}
+        opts {:encryption true :reserve-learner "n4" :filesystem-mount "/mnt/kv"}
+        candidate (#'ekdb/node-start-opts test "n4" opts)
+        voter (#'ekdb/node-start-opts test "n2" opts)
+        args (ekdb/server-args
+               (merge candidate {:node "n4" :grpc "n4:50051" :redis "n4:6379"
+                                 :raft-redis-map "n1=n1:6379"}))]
+    (is (true? (:encryption candidate)))
+    (is (true? (:join-as-learner candidate)))
+    (is (= "n1=n1:50051,n2=n2:50051,n3=n3:50051,n4=n4:50051"
+           (:join-members candidate)))
+    (is (nil? (:join-as-learner voter)))
+    (doseq [flag ["--encryptionSidecarPath" "--encryption-enabled" "--kekFile"
+                  "--raftJoinAsLearner" "--raftJoinMembers" "--filesystemMount"]]
+      (is (some #{flag} args) flag))))
+
 (deftest activation-follows-leadership-between-each-operation
   (let [commands (atom [])
         status-reads (atom [])
