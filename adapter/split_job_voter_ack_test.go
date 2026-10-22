@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"errors"
 	"testing"
 
 	pb "github.com/bootjp/elastickv/proto"
@@ -55,6 +56,33 @@ func TestSplitMigrationVoterBarrierReopensForMembershipChanges(t *testing.T) {
 	_, complete, err = server.syncSplitMigrationVoterBarrier(context.Background(), 1, cursor, nil, req)
 	require.NoError(t, err)
 	require.False(t, complete, "an address change must be treated as a new voter endpoint")
+}
+
+func TestSplitMigrationVoterBarrierClearsAckWhenFreshProbeFails(t *testing.T) {
+	t.Parallel()
+
+	client := &splitMigrationClientStub{probeFn: func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		return &pb.ProbeMigrationStateResponse{Ready: true}, nil
+	}}
+	server := &DistributionServer{splitMigrationVoterFactory: func(context.Context, uint64) ([]SplitMigrationVoter, error) {
+		return []SplitMigrationVoter{{ID: "n1", Address: "n1:50051", Client: client}}, nil
+	}}
+	req := &pb.ProbeMigrationStateRequest{JobId: 7, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED}
+
+	cursor, complete, err := server.syncSplitMigrationVoterBarrier(context.Background(), 1, nil, nil, req)
+	require.NoError(t, err)
+	require.True(t, complete)
+
+	client.probeFn = func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		return nil, errors.New("connection refused")
+	}
+	cursor, complete, err = server.syncSplitMigrationVoterBarrier(context.Background(), 1, cursor, nil, req)
+	require.NoError(t, err)
+	require.False(t, complete, "a saved ack must not survive a failed fresh probe")
+	acks, err := decodeSplitVoterAckCursor(cursor)
+	require.NoError(t, err)
+	require.Len(t, acks, 1)
+	require.False(t, acks[0].acked)
 }
 
 func TestSplitVoterAckCursorRejectsCorruption(t *testing.T) {

@@ -594,6 +594,12 @@ var ErrTargetReadinessApply = errors.New("target staged readiness: FSM apply cou
 // ErrRouteCutoverPending itself.
 var errTargetReadinessUnproven = errors.New("target staged readiness unproven from the local catalog view")
 
+// errMigrationTrackerPersistence marks process-local failures while recording
+// the minimum admitted write timestamp for an armed migration. A voter that
+// advances past the entry without this record can later report a higher safe
+// frontier than peers that persisted it.
+var errMigrationTrackerPersistence = errors.New("migration write tracker persistence failed")
+
 func (f *kvFSM) applyRequest(ctx context.Context, r *pb.Request) any {
 	if err := f.applyRequestErr(ctx, r); err != nil {
 		return applyErrorResponse(err)
@@ -627,6 +633,9 @@ func applyErrorResponse(err error) any {
 func haltResponseFor(err error) *haltApplyResponse {
 	if errors.Is(err, errTargetReadinessUnproven) {
 		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: apply target readiness"))
+	}
+	if errors.Is(err, errMigrationTrackerPersistence) {
+		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: persist migration write tracker"))
 	}
 	return nil
 }
@@ -2171,7 +2180,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	storeMuts, err := f.buildCommitStoreMutations(ctx, uniq, meta, startTS, commitTS, r.ReadKeys)
+	storeMuts, err := f.buildCommitStoreMutations(ctx, uniq, meta, startTS, commitTS, applyStartTS == commitTS, r.ReadKeys)
 	if err != nil {
 		return err
 	}
@@ -2356,7 +2365,7 @@ func (f *kvFSM) buildOnePhaseStoreMutations(ctx context.Context, muts []*pb.Muta
 	return storeMuts, nil
 }
 
-func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutation, meta TxnMeta, startTS, commitTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, error) {
+func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutation, meta TxnMeta, startTS, commitTS uint64, primaryAlreadyCommitted bool, readKeys [][]byte) ([]*store.KVPairMutation, error) {
 	storeMuts := make([]*store.KVPairMutation, 0, len(muts)*txnCommitStoreMutationFactor+txnCommitStoreMutationSlack)
 
 	committingPrimary := false
@@ -2366,9 +2375,12 @@ func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutati
 			committingPrimary = true
 		}
 
-		keyMuts, err := f.commitTxnKeyMutations(ctx, key, meta.PrimaryKey, startTS, readKeys)
+		keyMuts, prepared, err := f.commitTxnKeyMutations(ctx, key, meta.PrimaryKey, startTS, readKeys)
 		if err != nil {
 			return nil, err
+		}
+		if bytes.Equal(key, meta.PrimaryKey) && !prepared && !primaryAlreadyCommitted {
+			return nil, errors.Wrapf(ErrTxnInvalidMeta, "primary lock missing for key %s", string(key))
 		}
 		storeMuts = append(storeMuts, keyMuts...)
 	}
@@ -2613,40 +2625,40 @@ func storeMutationForIntent(key []byte, intent txnIntent) (*store.KVPairMutation
 	}
 }
 
-func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byte, startTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, error) {
+func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byte, startTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, bool, error) {
 	lock, lockKey, intentKey, ok, err := f.txnLockForMutationKey(ctx, key, readKeys)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	if !ok {
 		// Already resolved (committed/rolled back).
-		return nil, nil
+		return nil, false, nil
 	}
 	if lock.StartTS != startTS {
-		return nil, NewTxnLockedError(key)
+		return nil, false, NewTxnLockedError(key)
 	}
 	if !bytes.Equal(lock.PrimaryKey, primaryKey) {
-		return nil, errors.Wrapf(ErrTxnInvalidMeta, "lock primary_key mismatch for key %s", string(key))
+		return nil, false, errors.Wrapf(ErrTxnInvalidMeta, "lock primary_key mismatch for key %s", string(key))
 	}
 
 	intent, ok, err := f.txnIntentForCommit(ctx, intentKey)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	out := make([]*store.KVPairMutation, 0, txnCommitStoreMutationFactor)
 	if ok {
 		if intent.StartTS != startTS {
-			return nil, errors.Wrapf(ErrTxnInvalidMeta, "intent start_ts mismatch for key %s", string(key))
+			return nil, false, errors.Wrapf(ErrTxnInvalidMeta, "intent start_ts mismatch for key %s", string(key))
 		}
 		mut, err := storeMutationForIntent(key, intent)
 		if err != nil {
-			return nil, err
+			return nil, false, err
 		}
 		out = append(out, mut)
 	}
 	out = append(out, txnCleanupMutationsForKeys(lockKey, intentKey)...)
-	return out, nil
+	return out, true, nil
 }
 
 // abortCleanupMutationsForKey reports whether this abort request must emit

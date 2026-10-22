@@ -4524,15 +4524,19 @@ func (s *ShardStore) LatestCommitTSGroupWithReadFence(ctx context.Context, key [
 	if !ok || g.Store == nil {
 		return 0, false, nil
 	}
+	route, err := s.routeForExplicitGroupKey(groupID, key)
+	if err != nil {
+		return 0, false, err
+	}
 
 	if engineForGroup(g) == nil {
-		ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+		ts, exists, err := s.localLatestCommitTS(ctx, g, route, key)
 		return ts, exists, errors.WithStack(err)
 	}
 
 	if engine := engineForGroup(g); isLeaderEngine(engine) {
 		if _, err := leaseReadEngineCtx(ctx, engine); err == nil {
-			ts, exists, err := g.Store.LatestCommitTS(ctx, key)
+			ts, exists, err := s.localLatestCommitTS(ctx, g, route, key)
 			return ts, exists, errors.WithStack(err)
 		}
 	}

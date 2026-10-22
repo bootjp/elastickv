@@ -58,19 +58,13 @@ func (s *DistributionServer) syncSplitMigrationVoterBarrier(
 	if err != nil {
 		return nil, false, err
 	}
-	prior, err := decodeSplitVoterAckCursor(existing)
-	if err != nil {
+	if _, err := decodeSplitVoterAckCursor(existing); err != nil {
 		return nil, false, err
-	}
-	priorAcked := make(map[string]bool, len(prior))
-	for _, voter := range prior {
-		priorAcked[splitVoterAckKey(voter.id, voter.address)] = voter.acked
 	}
 	acks := make([]splitVoterAck, 0, len(voters))
 	complete := true
 	for _, voter := range voters {
-		key := splitVoterAckKey(voter.ID, voter.Address)
-		acked := priorAcked[key]
+		acked := false
 		resp, probeErr := voter.Client.ProbeMigrationState(ctx, req)
 		if probeErr == nil {
 			acked = resp.GetReady()
@@ -117,10 +111,6 @@ func validateSplitMigrationVoters(voters []SplitMigrationVoter) error {
 		}
 	}
 	return nil
-}
-
-func splitVoterAckKey(id, address string) string {
-	return id + "\x00" + address
 }
 
 func encodeSplitVoterAckCursor(acks []splitVoterAck) []byte {

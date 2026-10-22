@@ -939,6 +939,10 @@ func TestShardStoreExplicitGroupReads_MergeStagedVisibility(t *testing.T) {
 	got, err := st.GetGroupAt(ctx, 1, []byte("b"), 25)
 	require.NoError(t, err)
 	require.Equal(t, []byte("staged-b"), got)
+	latest, exists, err := st.LatestCommitTSGroupWithReadFence(ctx, []byte("b"), 1, 0)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint64(20), latest)
 
 	kvs, err := st.ScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 35)
 	require.NoError(t, err)
@@ -1001,6 +1005,9 @@ func TestShardStoreExplicitGroupReads_FailClosedWhenRouteMovedToStagedGroup(t *t
 	require.NoError(t, groups[2].Store.PutAt(ctx, distribution.MigrationStagedDataKey(9, []byte("b")), []byte("staged-target"), 20, 0))
 
 	_, err := st.GetGroupAt(ctx, 1, []byte("b"), 25)
+	require.ErrorIs(t, err, ErrExplicitGroupStagedVisibilityUnresolved)
+
+	_, _, err = st.LatestCommitTSGroupWithReadFence(ctx, []byte("b"), 1, 0)
 	require.ErrorIs(t, err, ErrExplicitGroupStagedVisibilityUnresolved)
 
 	_, err = st.ScanGroupAt(ctx, 1, []byte("a"), []byte("z"), 10, 25)
@@ -4797,6 +4804,9 @@ func TestShardStoreSourceReadFenceRejectsPointRead(t *testing.T) {
 	_, err := st.GetAt(ctx, []byte("n"), 60)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 
+	_, _, err = st.LatestCommitTSGroupWithReadFence(ctx, []byte("n"), 1, 0)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
 	_, err = st.ScanAt(ctx, []byte("m"), []byte("z"), 60, 0)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 }
@@ -4901,6 +4911,9 @@ func TestShardStoreTargetReadinessFailsClosedWithoutDescriptorProof(t *testing.T
 	applyTargetReadiness(t, group)
 
 	_, err := st.GetAt(ctx, []byte("k"), 120)
+	require.ErrorIs(t, err, ErrRouteCutoverPending)
+
+	_, _, err = st.LatestCommitTSGroupWithReadFence(ctx, []byte("k"), 1, 0)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
 
 	err = st.PutAt(ctx, []byte("k"), []byte("v"), 120, 0)

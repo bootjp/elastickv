@@ -15,7 +15,8 @@ import (
 // readinessWriteFailureStore fails only the readiness persistence write.
 type readinessWriteFailureStore struct {
 	store.MVCCStore
-	err error
+	err    error
+	states []store.TargetStagedReadinessState
 }
 
 func (s *readinessWriteFailureStore) ApplyTargetStagedReadiness(context.Context, store.TargetStagedReadinessState) error {
@@ -27,7 +28,7 @@ func (s *readinessWriteFailureStore) ApplyTargetStagedReadinessAt(context.Contex
 }
 
 func (s *readinessWriteFailureStore) MigrationTargetReadinessStates(context.Context) ([]store.TargetStagedReadinessState, error) {
-	return nil, nil
+	return s.states, nil
 }
 
 // Persisting the readiness guard is a local Pebble write. A replica that
@@ -49,6 +50,39 @@ func TestApplyTargetStagedReadinessHaltsOnLocalPersistFailure(t *testing.T) {
 
 	halt := haltApplyOf(fsm.Apply(cmd))
 	require.Error(t, halt, "a local readiness persistence failure must halt apply")
+	require.True(t, errors.Is(halt, ErrTargetReadinessApply), "got %v", halt)
+	require.ErrorIs(t, halt, local)
+}
+
+func TestApplyRawRequestHaltsOnMigrationTrackerPersistFailure(t *testing.T) {
+	t.Parallel()
+
+	local := errors.New("pebble: commit failed")
+	fsm := &kvFSM{store: &readinessWriteFailureStore{
+		MVCCStore: store.NewMVCCStore(),
+		err:       local,
+		states: []store.TargetStagedReadinessState{{
+			JobID:         9,
+			RouteStart:    []byte("a"),
+			RouteEnd:      []byte("z"),
+			Armed:         true,
+			TrackWrites:   true,
+			MinAdmittedTS: 100,
+		}},
+	}}
+	req := &pb.Request{
+		Ts: 50,
+		Mutations: []*pb.Mutation{{
+			Op:    pb.Op_PUT,
+			Key:   []byte("k"),
+			Value: []byte("v"),
+		}},
+	}
+	data, err := proto.Marshal(req)
+	require.NoError(t, err)
+
+	halt := haltApplyOf(fsm.Apply(data))
+	require.Error(t, halt, "a local migration tracker persistence failure must halt apply")
 	require.True(t, errors.Is(halt, ErrTargetReadinessApply), "got %v", halt)
 	require.ErrorIs(t, halt, local)
 }
