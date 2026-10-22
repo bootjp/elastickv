@@ -14,6 +14,8 @@ const (
 	snapshotPayloadBucketBase   = 1 << 20 // 1 MiB
 	snapshotPayloadBucketFactor = 4
 	snapshotPayloadBucketCount  = 8 // 1 MiB through ~16 GiB
+	snapshotOffloadGroupIDLabel = "group_id"
+	snapshotOffloadReasonLabel  = "reason"
 )
 
 // SnapshotOffloadMetrics exposes the physical snapshot offload
@@ -39,28 +41,28 @@ func newSnapshotOffloadMetrics(registerer prometheus.Registerer) *SnapshotOffloa
 				Name: "elastickv_snapshot_offload_published_total",
 				Help: "Total physical snapshots published to the object store, by Raft group.",
 			},
-			[]string{"group_id"},
+			[]string{snapshotOffloadGroupIDLabel},
 		),
 		skipped: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_snapshot_offload_skipped_total",
 				Help: "Total offload scans that published nothing, by Raft group and reason. Routine on a follower or an unchanged snapshot.",
 			},
-			[]string{"group_id", "reason"},
+			[]string{snapshotOffloadGroupIDLabel, snapshotOffloadReasonLabel},
 		),
 		failed: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_snapshot_offload_failed_total",
 				Help: "Total offload attempts that failed, by Raft group. A sustained rate means backups are not being taken.",
 			},
-			[]string{"group_id"},
+			[]string{snapshotOffloadGroupIDLabel},
 		),
 		lastPublishIndex: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_snapshot_offload_last_published_index",
 				Help: "Raft index of the most recent snapshot this process published, by group. Staleness here is the backup-freshness signal.",
 			},
-			[]string{"group_id"},
+			[]string{snapshotOffloadGroupIDLabel},
 		),
 		publishSeconds: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -68,7 +70,7 @@ func newSnapshotOffloadMetrics(registerer prometheus.Registerer) *SnapshotOffloa
 				Help:    "Wall time to spool, upload and commit one snapshot.",
 				Buckets: []float64{0.5, 1, 5, 15, 30, 60, 300, 900, 1800, 3600},
 			},
-			[]string{"group_id"},
+			[]string{snapshotOffloadGroupIDLabel},
 		),
 		payloadBytes: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -80,7 +82,7 @@ func newSnapshotOffloadMetrics(registerer prometheus.Registerer) *SnapshotOffloa
 					snapshotPayloadBucketCount,
 				),
 			},
-			[]string{"group_id"},
+			[]string{snapshotOffloadGroupIDLabel},
 		),
 	}
 	registerer.MustRegister(
