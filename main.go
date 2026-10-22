@@ -305,7 +305,7 @@ var shutdownSignals = []os.Signal{syscall.SIGTERM, syscall.SIGINT}
 const shutdownSignalHandlerJoinTimeout = time.Second
 
 // signalShutdown is set by the signal handler once a shutdown signal has
-// cancelled the root context, so main can tell a requested stop from a
+// requested a stop, so main can tell a requested stop from a
 // failure when the errgroup surfaces context.Canceled while unwinding.
 var signalShutdown atomic.Bool
 
@@ -551,7 +551,8 @@ func run() error {
 	// closers so it is still swallowing repeat signals while CleanupStack
 	// syncs and closes them.
 	ctx, cancel := context.WithCancel(context.Background())
-	cleanup.Add(installShutdownSignalHandler(cancel))
+	handoff := newShutdownHandoff(cancel)
+	cleanup.Add(installShutdownSignalHandler(handoff.requestShutdown))
 
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
@@ -729,11 +730,18 @@ func run() error {
 	}); err != nil {
 		return err
 	}
+	balanceCtx, stopBalance := context.WithCancel(runCtx)
+	defer stopBalance()
+	balanceDone := make(chan struct{})
+	handoff.arm(runCtx, eg, runtimes, func(ctx context.Context) error {
+		return stopLeaderBalanceForShutdown(ctx, stopBalance, balanceDone)
+	})
 	startLeaderBalanceScheduler(
-		runCtx,
+		balanceCtx,
 		eg,
 		runtimes,
 		leaderBalanceConfigFromFlags(*raftId, cfg.defaultGroup, cfg.sqsFifoPartitionMap, metricsRegistry.Registerer()),
+		balanceDone,
 	)
 
 	return waitRunGroup(eg)
@@ -3842,10 +3850,11 @@ func stopGRPCServerBounded(ctx context.Context, srv *grpc.Server, name string) {
 }
 
 // installShutdownSignalHandler routes SIGTERM/SIGINT (or the given signals)
-// into cancel so the process unwinds through the same path the memory
-// watchdog uses: the errgroup drains, the FUSE mount is unmounted, and the
-// CleanupStack syncs the WAL. The first signal cancels; later ones are
-// logged and otherwise ignored so a second SIGTERM from a supervisor cannot
+// into the supplied shutdown callback. Cleanup follows the memory watchdog's
+// path: the errgroup drains, the FUSE mount is unmounted, and the
+// CleanupStack syncs the WAL. Startup passes an immediate cancellation;
+// after startup, the callback requests a leadership handoff first. Later signals
+// are logged and ignored so a second SIGTERM from a supervisor cannot
 // cut the shutdown short (SIGKILL still can, which no handler prevents).
 // The returned function releases the registration and must be called once
 // the cleanup that needs protection has run.
@@ -3863,7 +3872,7 @@ func installShutdownSignalHandler(cancel context.CancelFunc, signals ...os.Signa
 			select {
 			case sig := <-sigCh:
 				if signalShutdown.CompareAndSwap(false, true) {
-					// Cancel before logging: a log write that blocks (a
+					// Request shutdown before logging: a log write that blocks (a
 					// backpressured stderr, a synchronous shipper) must not
 					// hold the shutdown back, and later signals are ignored.
 					cancel()
@@ -3895,9 +3904,10 @@ func installShutdownSignalHandler(cancel context.CancelFunc, signals ...os.Signa
 // watcher is off by default; it is enabled only when the operator sets
 // ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB. On threshold crossing the
 // callback flips the memoryPressureExit sentinel and cancels the root
-// context, routing through the exact same shutdown path SIGTERM would
-// use (errgroup unwinds, CleanupStack runs, WAL is synced). We do NOT
-// send a signal, call os.Exit, or touch the raft engine directly here.
+// context so errgroup unwinds, CleanupStack runs, and the WAL is synced.
+// It skips the signal handler's leadership handoff to relieve pressure
+// immediately. We do NOT send a signal, call os.Exit, or touch the raft
+// engine directly here.
 func startMemoryWatchdog(ctx context.Context, eg *errgroup.Group, cancel context.CancelFunc) {
 	cfg, enabled := memwatchConfigFromEnv()
 	if !enabled {

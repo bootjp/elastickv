@@ -87,14 +87,15 @@ type leaderBalanceDecision struct {
 	reason string
 }
 
-func startLeaderBalanceScheduler(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, cfg leaderBalanceConfig) {
+func startLeaderBalanceScheduler(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, cfg leaderBalanceConfig, done chan<- struct{}) {
 	if cfg.logger == nil {
 		cfg.logger = slog.Default()
 	}
 	if cfg.metrics != nil {
 		cfg.metrics.setEnabled(cfg.enabled)
 	}
-	if !cfg.enabled || eg == nil {
+	if !cfg.enabled || eg == nil || ctx.Err() != nil {
+		close(done)
 		return
 	}
 	cfg.normalize()
@@ -106,6 +107,7 @@ func startLeaderBalanceScheduler(ctx context.Context, eg *errgroup.Group, runtim
 		groupCooldownUntil: make(map[uint64]time.Time),
 	}
 	eg.Go(func() error {
+		defer close(done)
 		defer func() {
 			if err := loop.connCache.Close(); err != nil {
 				cfg.logger.Warn("leader-balance: failed to close grpc cache", "err", err)
@@ -159,6 +161,9 @@ func (c *leaderBalanceConfig) normalize() {
 }
 
 func (l *leaderBalanceLoop) run(ctx context.Context) {
+	if ctx.Err() != nil {
+		return
+	}
 	if l.defaultRuntime == nil {
 		l.cfg.logger.Warn("leader-balance: default raft group runtime not found", "group", l.cfg.defaultGroupID)
 		return
@@ -177,6 +182,9 @@ func (l *leaderBalanceLoop) run(ctx context.Context) {
 }
 
 func (l *leaderBalanceLoop) tick(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
 	defaultEngine := l.defaultRuntime.snapshotEngine()
 	defaultLeader := defaultEngine != nil && defaultEngine.State() == raftengine.StateLeader
 	if !defaultLeader {
@@ -249,6 +257,9 @@ func (l *leaderBalanceLoop) killSwitchActive() bool {
 }
 
 func (l *leaderBalanceLoop) executeMove(ctx context.Context, move leaderBalanceMove) error {
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
 	if len(move.candidates) == 0 {
 		return errors.New("leader-balance: move has no target candidates")
 	}
