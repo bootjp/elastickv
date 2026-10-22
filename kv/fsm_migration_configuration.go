@@ -9,7 +9,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-var migrationConfigurationIndexKey = []byte(txnMetaPrefix + "migration_configuration_index")
+var migrationConfigurationIndexKey = store.MigrationConfigurationIndexKey()
 
 var ErrMigrationConfigurationChanged = errors.New("migration cleanup configuration changed; retry voter barriers")
 

@@ -5,14 +5,11 @@ import (
 	"io"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
 var ErrExternalSnapshotRestoreUnsupported = errors.New("store lacks external snapshot validation")
-
-type externalSnapshotStore interface {
-	RestoreExternal(context.Context, io.Reader) error
-}
 
 var _ raftengine.ContextSnapshotRestorer = (*kvFSM)(nil)
 
@@ -27,7 +24,7 @@ func (f *kvFSM) RestoreWithContext(ctx context.Context, r io.Reader, opts raften
 	case raftengine.SnapshotRestoreRaft:
 		return f.Restore(r)
 	case raftengine.SnapshotRestoreExternalRebase:
-		st, ok := f.store.(externalSnapshotStore)
+		st, ok := f.store.(store.ExternalSnapshotRestorer)
 		if !ok {
 			return errors.WithStack(ErrExternalSnapshotRestoreUnsupported)
 		}
