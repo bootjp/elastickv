@@ -190,9 +190,6 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 		return 0, errno
 	}
 	n, err := a.core.Write(ctx, inode, fh, offset, data)
-	if err != nil {
-		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "size", len(data), "error", err)
-	}
 	return n, Errno(err)
 }
 
@@ -280,11 +277,7 @@ func (a *Adapter) StatFS(ctx context.Context, inode uint64) (filesystem.StatFS, 
 }
 
 func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
-	err := a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID)
-	if err != nil {
-		slog.WarnContext(ctx, "filesystem FUSE handle refresh failed", "inode", inode, "fh", fh, "error", err)
-	}
-	return Errno(err)
+	return Errno(a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID))
 }
 
 func (a *Adapter) trackOpenHandle(inode uint64, fh uint64) {

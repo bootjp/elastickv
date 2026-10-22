@@ -2560,7 +2560,6 @@ func checkCommitTSFence(mutations []*KVPairMutation, commitTS, watermark uint64,
 	}
 	for _, mut := range mutations {
 		if mut != nil && len(mut.Key) > 0 {
-			slog.Warn("one-phase write rejected below applied watermark", "key", string(mut.Key), "commit_ts", commitTS, "last_commit_ts", watermark)
 			return NewWriteConflictError(mut.Key)
 		}
 	}
