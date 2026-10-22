@@ -41,6 +41,7 @@ type DistributionServer struct {
 	splitJobRunnerReadinessGate SplitMigrationCapabilityGate
 	splitPromotionClientFactory SplitPromotionClientFactory
 	splitMigrationClientFactory SplitMigrationClientFactory
+	splitMigrationGroupFactory  SplitMigrationGroupClientFactory
 	splitMigrationVoterFactory  SplitMigrationVoterFactory
 	knownRaftGroups             map[uint64]struct{}
 	splitJobHistoryGCLast       time.Time
@@ -90,6 +91,10 @@ type SplitMigrationClient interface {
 
 // SplitMigrationClientFactory resolves both participating group leaders.
 type SplitMigrationClientFactory func(context.Context, distribution.SplitJob, uint64) (source SplitMigrationClient, target SplitMigrationClient, err error)
+
+// SplitMigrationGroupClientFactory resolves one group without requiring the
+// other participant to be available during source recovery.
+type SplitMigrationGroupClientFactory func(context.Context, uint64) (SplitMigrationClient, error)
 
 type SplitMigrationVoter struct {
 	ID      string
@@ -191,6 +196,12 @@ func WithSplitPromotionClientFactory(factory SplitPromotionClientFactory) Distri
 func WithSplitMigrationClientFactory(factory SplitMigrationClientFactory) DistributionServerOption {
 	return func(s *DistributionServer) {
 		s.splitMigrationClientFactory = factory
+	}
+}
+
+func WithSplitMigrationGroupClientFactory(factory SplitMigrationGroupClientFactory) DistributionServerOption {
+	return func(s *DistributionServer) {
+		s.splitMigrationGroupFactory = factory
 	}
 }
 

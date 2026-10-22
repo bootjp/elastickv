@@ -900,6 +900,11 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
+		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(
+			splitMigrationGroupLeaderResolver(in.shardGroups),
+			splitMigrationConnCache,
+			auth.migrationToken,
+		)),
 		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
 		adapter.WithSplitJobRunnerReady(),
 	)
@@ -2551,30 +2556,37 @@ func splitPromotionClientFactory(resolve splitPromotionLeaderResolver, connCache
 }
 
 func splitMigrationClientFactory(resolve splitMigrationLeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationClientFactory {
-	return func(_ context.Context, job distribution.SplitJob, sourceGroupID uint64) (adapter.SplitMigrationClient, adapter.SplitMigrationClient, error) {
-		if resolve == nil {
-			return nil, nil, errors.New("split migration leader resolver is not configured")
-		}
-		if connCache == nil {
-			return nil, nil, errors.New("split migration gRPC connection cache is not configured")
-		}
-		sourceAddr, err := resolve(sourceGroupID)
+	groupClient := splitMigrationGroupClientFactory(resolve, connCache, token)
+	return func(ctx context.Context, job distribution.SplitJob, sourceGroupID uint64) (adapter.SplitMigrationClient, adapter.SplitMigrationClient, error) {
+		source, err := groupClient(ctx, sourceGroupID)
 		if err != nil {
 			return nil, nil, err
 		}
-		targetAddr, err := resolve(job.TargetGroupID)
+		target, err := groupClient(ctx, job.TargetGroupID)
 		if err != nil {
-			return nil, nil, errors.WithStack(err)
+			return nil, nil, err
 		}
-		sourceConn, err := connCache.ConnFor(sourceAddr)
+		return source, target, nil
+	}
+}
+
+func splitMigrationGroupClientFactory(resolve splitMigrationLeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationGroupClientFactory {
+	return func(_ context.Context, groupID uint64) (adapter.SplitMigrationClient, error) {
+		if resolve == nil {
+			return nil, errors.New("split migration leader resolver is not configured")
+		}
+		if connCache == nil {
+			return nil, errors.New("split migration gRPC connection cache is not configured")
+		}
+		addr, err := resolve(groupID)
 		if err != nil {
-			return nil, nil, errors.WithStack(err)
+			return nil, errors.WithStack(err)
 		}
-		targetConn, err := connCache.ConnFor(targetAddr)
+		conn, err := connCache.ConnFor(addr)
 		if err != nil {
-			return nil, nil, errors.WithStack(err)
+			return nil, errors.WithStack(err)
 		}
-		return newSplitMigrationInternalClient(sourceConn, token), newSplitMigrationInternalClient(targetConn, token), nil
+		return newSplitMigrationInternalClient(conn, token), nil
 	}
 }
 

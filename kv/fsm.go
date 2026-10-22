@@ -2191,6 +2191,9 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorWithSnapshot(
 	commitTS uint64,
 	floorSnap RouteSnapshot,
 ) ([]*pb.Mutation, error) {
+	// COMMIT must drain pre-fence locks. Unlike PREPARE/one-phase admission,
+	// this path skips both write fences; buildCommitStoreMutations validates
+	// each live lock's start timestamp and primary before applying its intent.
 	uniq, err := uniqueTxnMutations(muts)
 	if err != nil {
 		return nil, err

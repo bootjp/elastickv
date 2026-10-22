@@ -322,7 +322,7 @@ func (s *DistributionServer) probeSplitJobSourceGroups(ctx context.Context, job 
 func (s *DistributionServer) probeSplitJobSourceGroup(ctx context.Context, job distribution.SplitJob, groupID uint64, routeEnd []byte) (bool, error) {
 	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationVoterProbeTimeout)
 	defer cancel()
-	source, _, err := s.splitMigrationClientFactory(attemptCtx, job, groupID)
+	source, err := s.splitJobSourceClient(attemptCtx, job, groupID)
 	if err != nil {
 		return false, errors.WithStack(err)
 	}
@@ -765,14 +765,16 @@ func decodeSplitCleanupCursor(raw []byte, bracketCount int) (int, []byte, bool, 
 }
 
 func (s *DistributionServer) abandonSplitJob(ctx context.Context, job distribution.SplitJob) error {
+	// Clear and attest the source guard while the catalog still fences new
+	// writes. Target cleanup may remain unavailable indefinitely.
+	if !bytes.Equal(job.SourceCutoverAckCursor, splitCleanupDoneCursor) {
+		return s.cleanupAbandonedSplitJobSource(ctx, job)
+	}
 	if err := s.rollbackAbandonedSplitJobFence(ctx, job); err != nil {
 		return err
 	}
 	if !bytes.Equal(job.TargetClearedDescriptorAckCursor, splitCleanupDoneCursor) {
 		return s.cleanupAbandonedSplitJobTarget(ctx, job)
-	}
-	if !bytes.Equal(job.SourceCutoverAckCursor, splitCleanupDoneCursor) {
-		return s.cleanupAbandonedSplitJobSource(ctx, job)
 	}
 	return s.finishSplitJobHistory(ctx, job, distribution.SplitJobPhaseAbandoned)
 }
@@ -871,7 +873,11 @@ func (s *DistributionServer) cleanupAbandonedSplitJobSource(ctx context.Context,
 }
 
 func (s *DistributionServer) cleanupSplitJobSourceMetadata(ctx context.Context, job distribution.SplitJob) error {
-	source, _, _, err := s.splitJobMigrationClients(ctx, job)
+	sourceGroupID, err := s.splitJobSourceGroupID(ctx, job)
+	if err != nil {
+		return err
+	}
+	source, err := s.splitJobSourceClient(ctx, job, sourceGroupID)
 	if err != nil {
 		return err
 	}
@@ -880,10 +886,6 @@ func (s *DistributionServer) cleanupSplitJobSourceMetadata(ctx context.Context, 
 		Mode:  pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA,
 	}); err != nil {
 		return errors.WithStack(err)
-	}
-	sourceGroupID, err := s.splitJobSourceGroupID(ctx, job)
-	if err != nil {
-		return err
 	}
 	_, metadataComplete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceGroupID, nil, source, &pb.ProbeMigrationStateRequest{
 		JobId: job.JobID,
@@ -896,6 +898,27 @@ func (s *DistributionServer) cleanupSplitJobSourceMetadata(ctx context.Context, 
 		return splitMigrationVoterBarrierIncompleteError(job.JobID, pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED)
 	}
 	return nil
+}
+
+func (s *DistributionServer) splitJobSourceClient(ctx context.Context, job distribution.SplitJob, groupID uint64) (SplitMigrationClient, error) {
+	var client SplitMigrationClient
+	var err error
+	switch {
+	case s.splitMigrationGroupFactory != nil:
+		client, err = s.splitMigrationGroupFactory(ctx, groupID)
+	case s.splitMigrationClientFactory != nil:
+		// Preserve existing embedders, including source discovery candidates.
+		client, _, err = s.splitMigrationClientFactory(ctx, job, groupID)
+	default:
+		return nil, errors.New("split migration client factory is not configured")
+	}
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if client == nil {
+		return nil, errors.New("split migration source client is nil")
+	}
+	return client, nil
 }
 
 func (s *DistributionServer) rollbackAbandonedSplitJobFence(ctx context.Context, job distribution.SplitJob) error {
@@ -1106,7 +1129,7 @@ func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job dist
 	if err != nil {
 		return err
 	}
-	source, _, err := s.splitMigrationClientFactory(ctx, job, parent.GroupID)
+	source, err := s.splitJobSourceClient(ctx, job, parent.GroupID)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1464,7 +1487,7 @@ func (s *DistributionServer) applySplitJobFenceBarrier(
 	snapshot distribution.CatalogSnapshot,
 	sourceRoute distribution.RouteDescriptor,
 ) (SplitMigrationClient, uint64, []byte, bool, error) {
-	source, _, err := s.splitMigrationClientFactory(ctx, job, sourceRoute.GroupID)
+	source, err := s.splitJobSourceClient(ctx, job, sourceRoute.GroupID)
 	if err != nil {
 		return nil, 0, nil, false, errors.WithStack(err)
 	}

@@ -79,7 +79,14 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	}, &cache, "migration-secret")(ctx, 2)
 	require.NoError(t, err)
 	require.Len(t, voters, 1)
-	for _, client := range []adapter.SplitMigrationClient{source, target, voters[0].Client} {
+	sourceOnly, err := splitMigrationGroupClientFactory(func(groupID uint64) (string, error) {
+		if groupID != 1 {
+			return "", status.Error(codes.Unavailable, "target leader unavailable")
+		}
+		return lis.Addr().String(), nil
+	}, &cache, "migration-secret")(ctx, 1)
+	require.NoError(t, err, "source recovery must not resolve the unavailable target")
+	for _, client := range []adapter.SplitMigrationClient{source, target, voters[0].Client, sourceOnly} {
 		_, err = client.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{})
 		require.NoError(t, err)
 		_, err = client.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{})

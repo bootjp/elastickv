@@ -2,6 +2,8 @@
   (:require [clojure.java.shell :as shell]
             [clojure.test :refer :all]
             [elastickv.split-workload :as split]
+            [jepsen.checker :as checker]
+            [jepsen.history :as history]
             [jepsen.nemesis :as nemesis]))
 
 (defn- routes-json []
@@ -44,3 +46,23 @@
                  "--route-id" "100" "--split-key" "m2-split"
                  "--expected-version" "7" "--target-group-id" "2"]]
                @calls))))))
+
+(deftest split-run-requires-successful-lifecycle
+  (let [test (split/elastickv-split-test {:local true})
+        start {:process :nemesis :type :info :f :start-cross-group-split
+               :value {:job-id 44}}
+        verify {:process :nemesis :type :info :f :verify-cross-group-split
+                :value {:job-id 44 :phase "SPLIT_JOB_PHASE_DONE"}}
+        check-history #(checker/check (:checker test) test (history/history %) {})]
+    (is (false? (:valid? (check-history []))))
+    (is (false? (:valid? (check-history [start]))))
+    (is (false? (:valid? (check-history [(assoc start :type :fail) verify]))))
+    (is (false? (:valid? (check-history [start (assoc verify :type :fail)]))))
+    (is (false? (:valid? (check-history [verify start]))))
+    (is (false? (:valid? (check-history [start (assoc-in verify [:value :job-id] 45)]))))
+    (is (false? (:valid? (check-history [start (assoc-in verify [:value :phase] "SPLIT_JOB_PHASE_FENCE")]))))
+    (is (true? (:valid? (check-history [start verify]))))
+    (let [test (split/elastickv-split-test {:local true :abandon-at-fence true})
+          check-history #(checker/check (:checker test) test (history/history %) {})]
+      (is (false? (:valid? (check-history [start verify]))))
+      (is (true? (:valid? (check-history [start (assoc-in verify [:value :phase] "SPLIT_JOB_PHASE_ABANDONED")])))))))

@@ -191,6 +191,32 @@
             :stop #{:verify-cross-group-split}
             :color "#4A90E2"}}})
 
+(defn split-lifecycle-checker [opts]
+  (reify checker/Checker
+    (check [_ _test history _checker-opts]
+      (let [operations (filter #(and (= :nemesis (:process %))
+                                     (contains? #{:start-cross-group-split :verify-cross-group-split} (:f %)))
+                               history)
+            failures (filter #(or (= :fail (:type %)) (:error %)) operations)
+            ;; Jepsen also logs invocation placeholders with no result value.
+            completions (vec (filter #(map? (:value %)) operations))
+            [start verify] completions
+            job-id (get-in start [:value :job-id])
+            expected (if (:abandon-at-fence opts)
+                       "SPLIT_JOB_PHASE_ABANDONED"
+                       "SPLIT_JOB_PHASE_DONE")]
+        {:valid? (and (empty? failures)
+                      (= 2 (count completions))
+                      (= :start-cross-group-split (:f start))
+                      (= :verify-cross-group-split (:f verify))
+                      (every? #(contains? #{:info :ok} (:type %)) completions)
+                      (integer? job-id) (pos? job-id)
+                      (= job-id (get-in verify [:value :job-id]))
+                      (= expected (get-in verify [:value :phase])))
+         :expected-phase expected
+         :completions completions
+         :failures (vec failures)}))))
+
 (defn elastickv-split-test
   ([] (elastickv-split-test {}))
   ([opts]
@@ -228,6 +254,8 @@
                          (when local? {:dummy true}) (:ssh opts))
              :remote control/ssh
              :nemesis (:nemesis package)
+             :checker (checker/compose {:register (:checker workload)
+                                        :split-lifecycle (split-lifecycle-checker opts)})
              :final-generator nil
              :concurrency (or (:concurrency opts) 6)
              :generator (->> (:generator workload)
