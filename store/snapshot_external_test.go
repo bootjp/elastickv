@@ -86,12 +86,39 @@ func externalTestCases() map[string]func(*mvccStore) {
 
 func externalTestOwnership(role MigrationOwnershipRole) MigrationOwnershipState {
 	owner := uint64(1)
+	operation := MigrationOwnershipAcquire
 	if role == MigrationNonOwner {
 		owner = 2
+		operation = MigrationOwnershipClear
 	}
-	return MigrationOwnershipState{JobID: 7, LocalGroupID: 1, OwnerGroupID: owner, CatalogVersion: 10,
+	state := MigrationOwnershipState{JobID: 7, LocalGroupID: 1, OwnerGroupID: owner, CatalogVersion: 10,
 		ConfigurationIndex: 3, AppliedIndex: 9, MinWriteTSExclusive: 100,
+		Generation: "0123456789abcdef0123456789abcdef", DescriptorHash: bytes.Repeat([]byte{1}, 32), RouteID: 3, ParentRouteID: 1,
 		RouteStart: []byte("a"), RouteEnd: []byte("z"), Role: role, Staged: role == MigrationOwner}
+	state.Receipts = []MigrationOwnershipReceipt{ownershipOperationReceipt(state, operation)}
+	return state
+}
+
+func TestExternalSnapshotOwnershipFixtureClone(t *testing.T) {
+	for _, role := range []MigrationOwnershipRole{MigrationOwner, MigrationNonOwner} {
+		state := externalTestOwnership(role)
+		require.True(t, validMigrationOwnership(state))
+		require.True(t, validOwnershipReceipts(state))
+		encoded, err := encodeMigrationOwnership([]MigrationOwnershipState{state})
+		require.NoError(t, err)
+		decoded, err := decodeMigrationOwnership(encoded)
+		require.NoError(t, err)
+		require.Equal(t, []MigrationOwnershipState{state}, decoded)
+		cloned := cloneMigrationOwnership(decoded)
+		require.Equal(t, decoded, cloned)
+		cloned[0].RouteStart[0]++
+		cloned[0].RouteEnd[0]++
+		cloned[0].DescriptorHash[0]++
+		cloned[0].Receipts[0].DescriptorHash[0]++
+		cloned[0].Receipts[0].CatalogVersion++
+		require.Equal(t, []MigrationOwnershipState{state}, decoded)
+		require.Equal(t, externalTestOwnership(role), state)
+	}
 }
 
 func TestExternalSnapshotMigrationMetadataRejectedBeforePublication(t *testing.T) {
