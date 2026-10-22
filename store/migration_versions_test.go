@@ -1873,7 +1873,8 @@ func TestPebbleMigrationApplyPathsAcquireApplyMuBeforeDBMu(t *testing.T) {
 	st, err := NewPebbleStore(dir)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
-	pebble := st.(*pebbleStore)
+	pebble, ok := st.(*pebbleStore)
+	require.True(t, ok)
 
 	tests := []struct {
 		name string
