@@ -381,7 +381,11 @@ func (s *pubsubSession) dispatchRegularCommand(name string, args [][]byte) {
 	}
 
 	s.writeMu.Lock()
-	writeResponse(s.dconn, resp, err)
+	if cat == CmdAdmin {
+		writeAdminResponse(s.dconn, name, args, resp, err)
+	} else {
+		writeCommandResponse(s.dconn, name, args, resp, err)
+	}
 	s.flushOrClose()
 	s.writeMu.Unlock()
 }
@@ -462,7 +466,7 @@ func (s *pubsubSession) execTxn() {
 	case len(results) > 0:
 		lastResult := results[len(results)-1]
 		resp, rErr := lastResult.Result()
-		writeResponse(s.dconn, resp, rErr)
+		writeTxnResponse(s.dconn, queue, resp, rErr)
 	default:
 		s.dconn.WriteError("ERR empty transaction response")
 	}

@@ -19,6 +19,11 @@ const (
 	cmdNameAUTH       = "AUTH"
 	cmdNameSELECT     = "SELECT"
 	cmdNameXREADGROUP = "XREADGROUP"
+	cmdNameBLPOP      = "BLPOP"
+	cmdNameBRPOP      = "BRPOP"
+	cmdNameBZPOPMIN   = "BZPOPMIN"
+	cmdNameBZPOPMAX   = "BZPOPMAX"
+	cmdNameXREAD      = "XREAD"
 )
 
 var commandTable = map[string]CommandCategory{

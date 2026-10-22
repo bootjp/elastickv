@@ -98,38 +98,94 @@ func (s *stubQueuesSource) AdminPurgeQueue(_ context.Context, principal AuthPrin
 	return s.purgeResult, nil
 }
 
-// TestSqsHandler_DeleteQueue_LivePromotion pins the live-role
-// forwarding contract: a JWT minted while the access key was
-// read_only must, after the operator promotes the key to full in
-// the live RoleStore, be allowed to delete *and* the principal
-// arriving at AdminDeleteQueue must carry the live role (full),
-// not the JWT's stale role.
-//
-// The bug before this fix: principalCanWrite returned true based on
-// the live role, but the unmodified principal (with JWT read_only)
-// was passed to AdminDeleteQueue, which independently checked
-// principal.Role.canWrite() and returned ErrAdminForbidden. The
-// user saw 403 and had to log out + back in for the new role to
-// take effect.
-func TestSqsHandler_DeleteQueue_LivePromotion(t *testing.T) {
-	src := &stubQueuesSource{queues: []string{"orders"}}
-	roles := MapRoleStore{"AKIA_PROMOTED": RoleFull}
-	h := NewSqsHandler(src).WithRoleStore(roles)
+// sqsWriteRequests builds one request per SQS admin write endpoint
+// (delete queue, set attributes, purge) so the role-gate tests cover
+// every write the handler serves.
+func sqsWriteRequests() map[string]func() *http.Request {
+	return map[string]func() *http.Request{
+		"delete queue": func() *http.Request {
+			return httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders", nil)
+		},
+		"set attributes": func() *http.Request {
+			return httptest.NewRequest(http.MethodPut, pathPrefixSqsQueues+"orders/attributes",
+				strings.NewReader(`{"attributes":{"RedriveAllowPolicy":"{}"}}`))
+		},
+		"purge": func() *http.Request {
+			return httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
+		},
+	}
+}
 
-	req := httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders", nil)
-	// JWT was minted while the key was still read_only. The live
-	// role store has since been updated to full.
+func (s *stubQueuesSource) reachedWrite() bool {
+	return s.lastDeleteName != "" || s.lastSetAttrsName != "" || s.lastPurgeName != ""
+}
+
+// TestSqsHandler_Writes_LivePromotionDoesNotWidenJWTRole pins the
+// admin authorisation policy DynamoDB and S3 already follow: the JWT
+// freezes the role at login and the live role can only narrow it
+// (Codex P2 and CodeRabbit on PR #669). A JWT minted while the key
+// was read_only stays read-only after the operator promotes the key
+// to full; the operator logs in again to pick up the promotion. SQS
+// used to gate on the live role alone, so the stale read_only JWT
+// could delete, reconfigure and purge queues.
+func TestSqsHandler_Writes_LivePromotionDoesNotWidenJWTRole(t *testing.T) {
+	for name, newReq := range sqsWriteRequests() {
+		t.Run(name, func(t *testing.T) {
+			src := &stubQueuesSource{queues: []string{"orders"}}
+			h := NewSqsHandler(src).WithRoleStore(MapRoleStore{"AKIA_PROMOTED": RoleFull})
+
+			req := newReq()
+			req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
+				AuthPrincipal{AccessKey: "AKIA_PROMOTED", Role: RoleReadOnly}))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+
+			require.Equal(t, http.StatusForbidden, rec.Code, "body=%s", rec.Body.String())
+			require.False(t, src.reachedWrite(), "a read_only JWT must not reach the source")
+		})
+	}
+}
+
+// TestSqsHandler_PeekMessages_LivePromotionDoesNotWidenJWTRole is the
+// sensitive-read side of the same policy: a JWT minted without read
+// access cannot peek message bodies because the live role index now
+// grants read.
+func TestSqsHandler_PeekMessages_LivePromotionDoesNotWidenJWTRole(t *testing.T) {
+	src := &stubQueuesSource{queues: []string{"orders"}}
+	h := NewSqsHandler(src).WithRoleStore(MapRoleStore{"AKIA_PROMOTED": RoleReadOnly})
+
+	req := httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders/messages", nil)
 	req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
-		AuthPrincipal{AccessKey: "AKIA_PROMOTED", Role: RoleReadOnly}))
+		AuthPrincipal{AccessKey: "AKIA_PROMOTED", Role: ""}))
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
 
-	require.Equal(t, http.StatusNoContent, rec.Code,
-		"promoted key must succeed at the handler layer; body=%s", rec.Body.String())
-	require.Equal(t, "orders", src.lastDeleteName)
-	require.Equal(t, RoleFull, src.lastDeletePrincipal.Role,
-		"principal forwarded to AdminDeleteQueue must carry the live role (RoleFull), not the JWT's stale RoleReadOnly")
-	require.Equal(t, "AKIA_PROMOTED", src.lastDeletePrincipal.AccessKey)
+	require.Equal(t, http.StatusForbidden, rec.Code, "body=%s", rec.Body.String())
+	require.Empty(t, src.lastPeekName, "a role-less JWT must not reach the peek source")
+}
+
+// TestSqsHandler_MissingPrincipalIsUnauthenticated pins the answer
+// when no session principal is on the context: 401, as on the
+// DynamoDB and S3 handlers. SessionAuth attaches the principal before
+// any handler runs, so this only fires if a routing change bypasses
+// the middleware.
+func TestSqsHandler_MissingPrincipalIsUnauthenticated(t *testing.T) {
+	requests := sqsWriteRequests()
+	requests["peek"] = func() *http.Request {
+		return httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders/messages", nil)
+	}
+	for name, newReq := range requests {
+		t.Run(name, func(t *testing.T) {
+			src := &stubQueuesSource{queues: []string{"orders"}}
+			h := NewSqsHandler(src).WithRoleStore(MapRoleStore{"AKIA_FULL": RoleFull})
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, newReq())
+
+			require.Equal(t, http.StatusUnauthorized, rec.Code, "body=%s", rec.Body.String())
+			require.False(t, src.reachedWrite(), "an unauthenticated request must not reach the source")
+			require.Empty(t, src.lastPeekName, "an unauthenticated request must not reach the source")
+		})
+	}
 }
 
 // TestSqsHandler_DeleteQueue_LiveRevocation is the symmetric case

@@ -1,6 +1,6 @@
 # TSO Batch Slot Claims
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-08-29
 
@@ -39,11 +39,17 @@ one timestamp. That breaks the uniqueness OCC ordering assumes: the conflict
 check is `latestTS(key) > startTS`, and two commits sharing a timestamp can each
 read the other as not-newer.
 
-**Exposure.** `adminTokenProtectedMethod` (`adapter/admin_grpc.go:515`) matches
-only the `/Admin/` prefix, so `Internal.Forward` is not behind the admin token.
-This is peer-port reach, not public-client reach, but it is unauthenticated at
-the gRPC layer, and the window is open for as long as the batch survives —
-unbounded under low write traffic.
+**Exposure (as of 2026-08-29; still open).** `adminTokenProtectedMethod`
+(`adapter/admin_grpc.go`) matched only the `/Admin/` prefix, so `Internal.Forward`
+was not behind the admin token. That was peer-port reach, not public-client
+reach, but it was unauthenticated at the gRPC layer, and the window stayed open
+for as long as the batch survived — unbounded under low write traffic.
+
+An attempted bearer-token gate was withdrawn after review: old followers cannot
+attach the new header during a rolling upgrade, the peer transport is plaintext,
+and the legacy coordinator has a separate forwarding path. A safe staged rollout
+and authenticated transport are prerequisites for §3.3. The slot-claim hole
+itself still needs §3.2.
 
 ## 2. Non-goals
 
@@ -94,10 +100,40 @@ Phase-D path and therefore an operator-visible tradeoff, not an implementation
 detail. **This document exists to get that tradeoff decided before either lands.**
 3.3 should be tracked separately.
 
+## 4a. Decision (2026-09-15)
+
+**Phase D stays batched.** §3.1 is rejected as an interim: `CLAUDE.md` states
+that no Raft round trip per `Next()` is a design invariant — it is what batching
+exists for — and §3.1 would violate it on exactly the Phase-D path. Trading a
+throughput regression for a window that narrows but does not close is not worth
+that.
+
+§3.2 remains the fix and needs its own proposal, because the claim record is a
+wire/on-disk decision (§5 questions 2 and 3).
+
+Landed now, independent of that decision:
+
+- **§6's invariant tests that do not depend on the option chosen.** Uniqueness
+  across concurrent allocators (direct and batched) and strict monotonicity:
+  these must hold under §3.1, §3.2 or neither, so they are the fixed point any
+  of those changes has to preserve.
+
+Deliberately **not** added: a test asserting that an unclaimed slot inside a
+committed window is refused. It is not refused today — that is the hole — and
+asserting current behaviour there would lock in the bug.
+
+### Lifecycle
+
+This document is `_partial_`: the decision-independent half of §6 has shipped.
+§3.3 needs a safe staged authentication rollout and authenticated peer transport;
+§3.2 needs a durable per-slot claim. It becomes `_implemented_` only when the
+claim record lands and the unclaimed-slot test in §6 passes.
+
 ## 5. Open questions
 
-1. Is a per-timestamp group-0 round trip acceptable on the Phase-D path as an
-   interim, or should Phase D stay batched until 3.2 ships?
+1. ~~Is a per-timestamp group-0 round trip acceptable on the Phase-D path as an
+   interim, or should Phase D stay batched until 3.2 ships?~~ **Resolved in §4a
+   (2026-09-15): Phase D stays batched; §3.1 is rejected.**
 2. Should a claim be per-timestamp or a per-owner watermark? A watermark is far
    cheaper and still refuses any slot ahead of what an owner actually issued.
 3. What is the retention story for claims across leadership change and snapshot?

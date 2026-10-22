@@ -2,9 +2,12 @@
 // decoder described in
 // docs/design/2026_04_29_proposed_snapshot_logical_decoder.md.
 //
-// It reads a Pebble snapshot (`.fsm`) emitted by the live FSM
-// (store/lsm_store.go) and writes a vendor-independent per-adapter
-// directory tree rooted at --output. The output tree carries a
+// It reads a snapshot in any form backup.ReadSnapshotFile accepts: the
+// `fsm-snap/<index>.fsm` file a node persists (FSM snapshot header,
+// store payload, CRC32C footer, which is verified), an encoder-produced
+// stream, or a store's SST ingest bundle. It keeps the newest version
+// of each key and writes a vendor-independent per-adapter directory
+// tree rooted at --output. The output tree carries a
 // MANIFEST.json describing the dump and a sha256sum(1)-compatible
 // CHECKSUMS file the operator can verify with stock UNIX tooling
 // — `sha256sum -c CHECKSUMS` from the dump root suffices, with no
@@ -241,10 +244,14 @@ func decodeOne(cfg *config, logger *slog.Logger) error {
 		"s3", res.Counters.S3,
 		"redis", res.Counters.Redis,
 		"sqs", res.Counters.SQS,
+		"superseded", res.Counters.Superseded,
 		"tombstone", res.Counters.Tombstone,
 		"internal", res.Counters.Internal,
 		"unknown", res.Counters.Unknown,
-		"last_commit_ts", res.Header.LastCommitTS)
+		"last_commit_ts", res.Header.LastCommitTS,
+		"fsm_header", res.Framing.FSMHeader,
+		"store_format", res.Framing.StoreFormat,
+		"footer_verified", res.Framing.FooterVerified)
 
 	if err := emitManifest(cfg, res); err != nil {
 		return err
@@ -258,7 +265,8 @@ func decodeOne(cfg *config, logger *slog.Logger) error {
 // emitManifest writes MANIFEST.json under cfg.outputRoot. Source
 // metadata (FSM path and parsed snapshot_index) come from the CLI
 // invocation; last_commit_ts comes from the snapshot header the
-// dispatcher surfaces.
+// dispatcher surfaces, and source.fsm_crc32c from the CRC32C footer
+// the reader verified, when the input carried one.
 func emitManifest(cfg *config, res backup.DecodeResult) error {
 	m := backup.NewPhase0SnapshotManifest(time.Now())
 	m.ElastickvVersion = version
@@ -268,6 +276,9 @@ func emitManifest(cfg *config, res backup.DecodeResult) error {
 		m.SnapshotIndex = idx
 	}
 	m.Source = &backup.Source{FSMPath: cfg.inputPath}
+	if res.Framing.FooterVerified {
+		m.Source.FSMCRC32C = fmt.Sprintf("%08x", res.Framing.FooterCRC32C)
+	}
 	m.Adapters = populateAdapterScopes(cfg.adapters, res)
 	m.Exclusions = &backup.Exclusions{
 		IncludeIncompleteUploads: cfg.includeIncompleteUploads,

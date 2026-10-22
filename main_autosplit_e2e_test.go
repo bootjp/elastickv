@@ -9,6 +9,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/distribution/autosplit"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/serverwiring"
 	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
@@ -148,11 +149,11 @@ func newAutoSplitE2EScheduler(
 		},
 		Reconciler: autosplit.NewRouteReconciler(sampler),
 	}
-	applyAutoSplitLeadership(&cfg, node.coordinate)
+	serverwiring.ApplyLeadership(&cfg, node.coordinate)
 	return clock, sampler, runtime, autosplit.NewScheduler(
 		cfg,
 		node.distCatalog,
-		autoSplitDistributionSplitter{server: node.distServer},
+		serverwiring.DistributionSplitter{Server: node.distServer},
 		sampler,
 		sampler,
 	)
