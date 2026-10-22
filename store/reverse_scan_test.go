@@ -10,25 +10,7 @@ import (
 
 func TestMVCCStore_ReverseScanAt(t *testing.T) {
 	t.Parallel()
-	testReverseScanAt(t, func(t *testing.T) MVCCStore {
-		t.Helper()
-		return NewMVCCStore()
-	})
-}
-
-func TestPebbleStore_ReverseScanAt(t *testing.T) {
-	t.Parallel()
-	testReverseScanAt(t, func(t *testing.T) MVCCStore {
-		t.Helper()
-		dir, err := os.MkdirTemp("", "pebble-reverse-scan-test")
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = os.RemoveAll(dir) })
-
-		st, err := NewPebbleStore(dir)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = st.Close() })
-		return st
-	})
+	forEachMVCCStore(t, testReverseScanAt)
 }
 
 func TestPebbleStore_ReverseScanAt_IgnoresInternalMetaKeys(t *testing.T) {

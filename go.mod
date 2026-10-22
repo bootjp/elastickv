@@ -1,8 +1,8 @@
 module github.com/bootjp/elastickv
 
-go 1.26
+go 1.26.0
 
-toolchain go1.26.6
+toolchain go1.27.1
 
 require (
 	github.com/Jille/grpc-multi-resolver v1.3.0
@@ -19,7 +19,7 @@ require (
 	github.com/getsentry/sentry-go v0.49.0
 	github.com/goccy/go-json v0.10.6
 	github.com/hanwen/go-fuse/v2 v2.11.0
-	github.com/klauspost/compress v1.19.2
+	github.com/klauspost/compress v1.20.1
 	github.com/pkg/errors v0.9.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/prometheus/client_model v0.6.3
@@ -34,7 +34,7 @@ require (
 	go.etcd.io/raft/v3 v3.7.0
 	go.uber.org/zap v1.28.0
 	golang.org/x/sync v0.22.0
-	golang.org/x/sys v0.47.0
+	golang.org/x/sys v0.48.0
 	google.golang.org/grpc v1.83.2
 	google.golang.org/protobuf v1.36.12
 	pgregory.net/rapid v1.3.0

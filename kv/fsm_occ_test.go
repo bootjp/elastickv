@@ -180,14 +180,15 @@ func TestOnePhaseTxnNilReadKeysSkipsReadWriteValidation(t *testing.T) {
 	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
 
-	// nil ReadKeys: read-write check is skipped entirely.
+	// nil ReadKeys: read-write check is skipped entirely. Use a commit
+	// timestamp above the applied watermark so the apply-order fence permits it.
 	req := &pb.Request{
 		IsTxn:    true,
 		Phase:    pb.Phase_NONE,
 		Ts:       100,
 		ReadKeys: nil,
 		Mutations: []*pb.Mutation{
-			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("wk"), CommitTS: 120})},
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: []byte("wk"), CommitTS: 220})},
 			{Op: pb.Op_PUT, Key: []byte("wk"), Value: []byte("val")},
 		},
 	}
