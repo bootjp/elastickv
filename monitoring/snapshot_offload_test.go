@@ -58,8 +58,11 @@ func TestSnapshotOffloadMetricsBoundTheSkipReasonLabel(t *testing.T) {
 	m.ObserveSnapshotOffloadSkipped(1, "something-new")
 	m.ObserveSnapshotOffloadSkipped(1, "something-else")
 	m.ObserveSnapshotOffloadSkipped(1, "")
+	m.ObserveSnapshotOffloadSkipped(1, "object_claimed")
 
-	require.Equal(t, 1, testutil.CollectAndCount(m.skipped))
+	require.Equal(t, 2, testutil.CollectAndCount(m.skipped))
+	require.InDelta(t, 1.0,
+		testutil.ToFloat64(m.skipped.WithLabelValues("1", snapshotOffloadSkipObjectClaimed)), 0.0001)
 	require.InDelta(t, 3.0,
 		testutil.ToFloat64(m.skipped.WithLabelValues("1", snapshotOffloadSkipUnknown)), 0.0001)
 }

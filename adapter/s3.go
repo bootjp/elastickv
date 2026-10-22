@@ -227,6 +227,11 @@ type s3BucketEntry struct {
 	CreationDate string `xml:"CreationDate"`
 }
 
+type s3VersioningConfiguration struct {
+	XMLName xml.Name `xml:"VersioningConfiguration"`
+	XMLNS   string   `xml:"xmlns,attr,omitempty"`
+}
+
 type s3AccessControlPolicy struct {
 	XMLName           xml.Name            `xml:"AccessControlPolicy"`
 	XMLNS             string              `xml:"xmlns,attr,omitempty"`
@@ -507,6 +512,14 @@ func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 //nolint:cyclop // handleBucket routes to sub-handlers based on method+query; branching is by design.
 func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	query := r.URL.Query()
+	if query.Has("versioning") {
+		if r.Method == http.MethodGet {
+			s.getBucketVersioning(w, r, bucket)
+		} else {
+			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method", bucket, "")
+		}
+		return
+	}
 	if query.Has("acl") {
 		switch r.Method {
 		case http.MethodGet:
@@ -702,6 +715,25 @@ func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *S3Server) getBucketVersioning(w http.ResponseWriter, r *http.Request, bucket string) {
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	_, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		return
+	}
+	// The bundled endpoint does not implement object versions. An empty
+	// VersioningConfiguration is the S3 response for an unversioned bucket.
+	writeS3XML(w, http.StatusOK, s3VersioningConfiguration{XMLNS: s3XMLNamespace})
 }
 
 func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -1144,52 +1176,12 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 	var cleanupManifest *s3ObjectManifest
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
+		manifest, objectGeneration, err := s.deleteObjectAttempt(r, bucket, objectKey)
 		if err != nil {
-			return errors.Wrap(err, "s3: allocate startTS for mutation")
-		}
-		readTS = readTimestamp.Timestamp()
-		startTS := readTS
-		readPin := s.pinReadTS(readTS)
-		defer readPin.Release()
-
-		meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !exists || meta == nil {
-			return &s3ResponseError{
-				Status:  http.StatusNotFound,
-				Code:    "NoSuchBucket",
-				Message: "bucket not found",
-				Bucket:  bucket,
-				Key:     objectKey,
-			}
-		}
-
-		headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
-		manifest, found, err := s.loadObjectManifestAt(r.Context(), headKey, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !found {
-			cleanupManifest = nil
-			return nil
-		}
-		dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
-		_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
-			IsTxn:   true,
-			StartTS: startTS,
-			Elems: []*kv.Elem[kv.OP]{
-				{Op: kv.Del, Key: headKey},
-			},
-		})
-		if err != nil {
-			return errors.WithStack(err)
+			return err
 		}
 		cleanupManifest = manifest
-		generation = meta.Generation
+		generation = objectGeneration
 		return nil
 	})
 	if err != nil {
@@ -1200,6 +1192,54 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, cleanupManifest)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *S3Server) deleteObjectAttempt(
+	r *http.Request, bucket string, objectKey string,
+) (*s3ObjectManifest, uint64, error) {
+	readTS := s.readTS()
+	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "s3: allocate startTS for mutation")
+	}
+	readTS = readTimestamp.Timestamp()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	if !exists || meta == nil {
+		return nil, 0, &s3ResponseError{
+			Status:  http.StatusNotFound,
+			Code:    "NoSuchBucket",
+			Message: "bucket not found",
+			Bucket:  bucket,
+			Key:     objectKey,
+		}
+	}
+
+	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
+	manifest, found, err := s.loadObjectManifestAt(r.Context(), headKey, readTS)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	if !found {
+		return nil, meta.Generation, validateS3AbsentObjectDelete(r, bucket, objectKey)
+	}
+	if err := s.dispatchConditionalObjectDelete(r, readTimestamp, readTS, headKey, manifest, bucket, objectKey); err != nil {
+		return nil, 0, err
+	}
+	return manifest, meta.Generation, nil
+}
+
+func validateS3AbsentObjectDelete(r *http.Request, bucket, objectKey string) error {
+	if _, conditional := r.Header[http.CanonicalHeaderKey("If-Match")]; conditional {
+		return newS3ResponseError(http.StatusNotFound, "NoSuchKey",
+			"object not found", bucket, objectKey)
+	}
+	return nil
 }
 
 func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request, bucket string, objectKey string) {
@@ -2603,6 +2643,9 @@ func isReadOnlyS3Request(r *http.Request) bool {
 // isReadOnlyBucketOp returns true for bucket-level read-only operations
 // (HeadBucket, ListObjectsV2).
 func isReadOnlyBucketOp(method string, q url.Values) bool {
+	if q.Has("versioning") {
+		return false
+	}
 	switch method {
 	case http.MethodHead:
 		// HeadBucket: no query params (or only "location").
@@ -2654,11 +2697,94 @@ func validateS3PutPreconditions(ifMatch, ifNoneMatch string, previous *s3ObjectM
 		return errors.New("object already exists")
 	}
 	if ifMatch != "" {
-		if previous == nil || strings.Trim(ifMatch, `"`) != previous.ETag {
+		if previous == nil || (ifMatch != "*" && strings.Trim(ifMatch, `"`) != previous.ETag) {
 			return errors.New("etag precondition failed")
 		}
 	}
 	return nil
+}
+
+// dispatchConditionalObjectDelete evaluates If-Match against the manifest the
+// surrounding transaction already loaded, then removes the head key.
+//
+// DELETE honours If-Match, like PUT does via validateS3PutPreconditions.
+// Accepting the header and deleting anyway is worse than not supporting it: a
+// caller that reads an object, decides it is reclaimable, and sends a
+// conditional delete believes the condition protects it against a concurrent
+// rewrite. It did not -- the object was removed whatever its current ETag -- so
+// the rewrite was silently lost.
+func (s *S3Server) dispatchConditionalObjectDelete(
+	r *http.Request,
+	readTimestamp kv.ReadTimestamp,
+	startTS uint64,
+	headKey []byte,
+	manifest *s3ObjectManifest,
+	bucket, objectKey string,
+) error {
+	if err := validateS3DeletePreconditions(r, manifest); err != nil {
+		return newS3ResponseError(http.StatusPreconditionFailed, "PreconditionFailed",
+			err.Error(), bucket, objectKey)
+	}
+	dispatchCtx := readTimestamp.WithDispatchVoucher(r.Context())
+	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
+		IsTxn:   true,
+		StartTS: startTS,
+		Elems: []*kv.Elem[kv.OP]{
+			{Op: kv.Del, Key: headKey},
+		},
+	}); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+// validateS3DeletePreconditions enforces If-Match on DELETE.
+//
+// Separate from validateS3PutPreconditions because the two headers mean
+// different things on a delete: If-Match is a guard against removing a
+// version the caller has not seen, while If-None-Match: * ("only if
+// absent") is meaningless for an operation whose whole purpose is to
+// remove something that exists, so it is not honoured here.
+//
+// previous is the manifest the surrounding transaction already loaded at
+// its read timestamp, so the comparison is against the same version the
+// delete will remove -- not a separately-read one that could have moved
+// in between.
+func validateS3DeletePreconditions(r *http.Request, previous *s3ObjectManifest) error {
+	if r == nil {
+		return nil
+	}
+	values, present := r.Header[http.CanonicalHeaderKey("If-Match")]
+	if !present {
+		return nil
+	}
+	if previous == nil {
+		return errors.New("etag precondition failed")
+	}
+	for _, value := range values {
+		// S3 ETags contain no commas; multiple header lines and HTTP's
+		// comma-separated validator list have the same any-match rule.
+		for _, candidate := range strings.Split(value, ",") {
+			if s3DeleteIfMatchCandidateMatches(candidate, previous.ETag) {
+				return nil
+			}
+		}
+	}
+	return errors.New("etag precondition failed")
+}
+
+func s3DeleteIfMatchCandidateMatches(candidate, etag string) bool {
+	candidate = strings.TrimSpace(candidate)
+	if candidate == "*" {
+		return true
+	}
+	if strings.HasPrefix(candidate, "W/") {
+		return false // If-Match requires a strong comparison.
+	}
+	if strings.HasPrefix(candidate, `"`) && strings.HasSuffix(candidate, `"`) && len(candidate) >= 2 {
+		candidate = candidate[1 : len(candidate)-1]
+	}
+	return candidate != "" && candidate == etag
 }
 
 func cloneLeaderAddrMap(src map[string]string) map[string]string {

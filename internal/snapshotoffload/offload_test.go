@@ -12,6 +12,7 @@ import (
 	"time"
 
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -188,6 +189,15 @@ func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, first.ManifestKey, second.ManifestKey)
 	require.Equal(t, first.Payload.Key, second.Payload.Key)
+	require.Equal(t, opts.CreatedAt.Add(time.Nanosecond), second.CreatedAt)
+	require.NotEqual(t, first.ManifestSHA256, second.ManifestSHA256)
+
+	third, err := PublishPersistedSnapshot(ctx, opts)
+	require.NoError(t, err)
+	require.Equal(t, first.ManifestKey, third.ManifestKey)
+	require.Equal(t, first.Payload.Key, third.Payload.Key)
+	require.Equal(t, opts.CreatedAt.Add(2*time.Nanosecond), third.CreatedAt)
+	require.NotEqual(t, second.ManifestSHA256, third.ManifestSHA256)
 }
 
 func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
@@ -206,12 +216,13 @@ func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
 
 	first, err := PublishPersistedSnapshot(ctx, opts)
 	require.NoError(t, err)
+	firstCreatedAt := first.CreatedAt
 	time.Sleep(time.Millisecond)
 	second, err := PublishPersistedSnapshot(ctx, opts)
 	require.NoError(t, err)
 	require.Equal(t, first.ManifestKey, second.ManifestKey)
-	require.Equal(t, first.ManifestSHA256, second.ManifestSHA256)
-	require.Equal(t, first.CreatedAt, second.CreatedAt)
+	require.Equal(t, firstCreatedAt.Add(time.Nanosecond), second.CreatedAt)
+	require.NotEqual(t, first.ManifestSHA256, second.ManifestSHA256)
 }
 
 func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
@@ -248,9 +259,27 @@ func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
 
 	candidate := existing
 	candidate.CreatedAt = time.Unix(401, 0).UTC()
+	lost := errors.New("leadership lost during create conflict")
+	checks := 0
+	racingAfterDemotion := &headMissOnceStore{ObjectStore: store, key: key}
+	err = putManifest(ctx, racingAfterDemotion, &candidate, true, func(context.Context) error {
+		checks++
+		if checks > 1 {
+			return lost
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, lost)
+	require.Equal(t, 2, checks)
+	unchanged, err := LoadManifest(ctx, store, key)
+	require.NoError(t, err)
+	require.Equal(t, existing.CreatedAt, unchanged.CreatedAt)
+
+	candidate = existing
+	candidate.CreatedAt = time.Unix(401, 0).UTC()
 	racingStore := &headMissOnceStore{ObjectStore: store, key: key}
 	require.NoError(t, putManifest(ctx, racingStore, &candidate, true, nil))
-	require.Equal(t, existing.CreatedAt, candidate.CreatedAt)
+	require.Equal(t, existing.CreatedAt.Add(time.Nanosecond), candidate.CreatedAt)
 	require.NotEmpty(t, candidate.ManifestSHA256)
 }
 
@@ -637,6 +666,7 @@ func newTestLocalStore(t *testing.T, root string) *LocalStore {
 	t.Helper()
 	store, err := NewLocalStore(root)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return store
 }
 
@@ -657,6 +687,20 @@ type countingObjectStore struct {
 	getObjectCalls int
 }
 
+func (s *countingObjectStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *countingObjectStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
+}
+
 func (s *countingObjectStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
 	s.getObjectCalls++
 	return s.ObjectStore.GetObject(ctx, key)
@@ -666,6 +710,20 @@ type headMissOnceStore struct {
 	ObjectStore
 	key  string
 	miss bool
+}
+
+func (s *headMissOnceStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *headMissOnceStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
 }
 
 func (s *headMissOnceStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
@@ -687,6 +745,30 @@ type headOrderingStore struct {
 	ObjectStore
 	manifestKey string
 	calls       []string
+}
+
+func (s *headOrderingStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *headOrderingStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
+}
+
+func refreshWrappedObject(
+	ctx context.Context, store ObjectStore, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	refresher, ok := store.(ObjectRefresher)
+	if !ok {
+		return ObjectInfo{}, errors.Wrap(ErrInvalidOptions, "wrapped object store cannot refresh objects")
+	}
+	return refresher.RefreshObject(ctx, key, body, opts)
 }
 
 func (s *headOrderingStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {

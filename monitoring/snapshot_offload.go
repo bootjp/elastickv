@@ -138,6 +138,7 @@ const (
 	snapshotOffloadSkipNoSnapshot       = "no_persisted_snapshot"
 	snapshotOffloadSkipInFlight         = "already_in_flight"
 	snapshotOffloadSkipUnknownLeader    = "leadership_unknown"
+	snapshotOffloadSkipObjectClaimed    = "object_claimed"
 	snapshotOffloadSkipUnknown          = "unknown"
 )
 
@@ -149,7 +150,8 @@ func normalizeSnapshotOffloadSkip(reason string) string {
 		snapshotOffloadSkipAlreadyPublished,
 		snapshotOffloadSkipNoSnapshot,
 		snapshotOffloadSkipInFlight,
-		snapshotOffloadSkipUnknownLeader:
+		snapshotOffloadSkipUnknownLeader,
+		snapshotOffloadSkipObjectClaimed:
 		return reason
 	default:
 		return snapshotOffloadSkipUnknown

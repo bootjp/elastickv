@@ -6,9 +6,9 @@ those artifacts.
 
 Design: [`design/2026_07_19_partial_physical_snapshot_object_offload.md`](design/2026_07_19_partial_physical_snapshot_object_offload.md).
 
-> **Note:** §4 (Retention) describes the retention/GC subsystem implemented in
-> PR #1222. That PR remains unmerged and its implementation is not included
-> here. Everything else here is live once this change ships.
+Dependency order: merge #1245, then #1222, then this runtime integration (#1224).
+Retention reuses #1222's GC and claim protocol. Publication and reclamation
+have separate opt-ins; configuring a backup destination never enables deletion.
 
 ## Scope
 
@@ -36,7 +36,8 @@ Payloads are **content-addressed and shared**: two groups (or two generations)
 whose snapshots hash identically converge on one object. This matters for
 retention — see §4.
 
-Manifests are immutable and self-hashing. A manifest names exactly one payload.
+Manifests are self-hashing. Reusing a matching manifest advances its generation
+under a claim; snapshot identity and payload remain unchanged.
 
 ## 2. Enabling offload
 
@@ -108,12 +109,45 @@ Skip reasons and what they mean:
 | `already_published` | Snapshot unchanged since this process last published it. | None. |
 | `no_persisted_snapshot` | The group has not produced a snapshot yet. | None on a young cluster. Investigate if it persists on a busy group. |
 | `already_in_flight` | Another scan is publishing this group. | None. |
+| `object_claimed` | A publisher or GC holds the same object claim. | Retry on the next scan; inspect persistent orphan claims before recovering ownership. |
 | `leadership_unknown` | Engine unavailable, typically during shutdown. | None if the node is stopping. |
 
 **A group whose `last_published_index` never advances has no backups**, even
 though nothing is failing. Alert on staleness, not only on errors.
 
 ## 4. Retention
+
+GC is off by default. Upgrade every server and standalone CLI publisher sharing
+the destination/prefix to the claims protocol, stop and drain all legacy
+publications, then enable one designated retention worker with both:
+
+```text
+--snapshotOffloadGCEnabled=true
+--snapshotOffloadGCClaimsRolloutComplete=true
+```
+
+The second setting is an explicit operator assertion about the entire
+destination/prefix, not automatic membership discovery. Without it, enabling GC
+fails startup. The runtime supplies #1222's mandatory verifier before every GC
+pass. Before starting any legacy publisher or rolling back, disable GC, stop
+and drain its worker, and only then resume legacy publication. Stopping the
+server cancels publication and retention, waits for both workers, then closes
+the local store descriptor.
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--snapshotOffloadGCInterval` | `1h` | Delay after each serial GC pass. |
+| `--snapshotOffloadGCTimeout` | `10m` | Deadline for a pass; failures log and retry on the next interval. |
+| `--snapshotOffloadGCMinGenerations` | `3` | Minimum retained generations per group. |
+| `--snapshotOffloadGCMaxAge` | `336h` | Retain manifests inside this age window too. |
+| `--snapshotOffloadGCPayloadGrace` | `24h` | Delay before an unreferenced payload can be marked. |
+| `--snapshotOffloadGCMinMarkAge` | `24h` | Delay between marking and reclaiming an unchanged payload. |
+| `--snapshotOffloadAllowVersionedWithLifecycle` | `false` | Assert noncurrent-version expiration is configured on a versioned bucket. |
+
+All policy values, interval and timeout must be positive. GC also requires an
+offload destination. Startup validates bucket policy when GC is enabled; every
+pass validates it again before scanning or deleting. Read-only restore and
+publication-only workers do not require `s3:GetBucketVersioning`.
 
 Retention is per group, and runs in two phases.
 
@@ -127,9 +161,9 @@ reclaims only unreferenced objects, using **two-pass mark-and-sweep**: a pass
 marks an eligible payload, and only a later pass, with the object unchanged and
 the mark older than `MinMarkAge`, deletes it.
 
-The second pass exists because a publisher reusing a payload rewrites identical
-bytes, which no general-purpose S3 precondition can detect (`If-Match` compares
-a content-derived ETag; `IfMatchLastModifiedTime` is directory-buckets only).
+Publishers and GC coordinate with storage-visible object claims because
+content-preserving reuse cannot be detected by a general-purpose S3 ETag
+precondition. The two-pass delay adds protection against stale evidence.
 **`MinMarkAge` must exceed your longest plausible publish.**
 
 Retention refuses to delete anything when it cannot prove the live set:
@@ -150,9 +184,11 @@ delete only writes a delete marker: the bytes survive as a noncurrent version
 that later listings cannot see, so GC reports successful reclamation while
 storage grows without bound.
 
-**A versioned backup bucket requires a noncurrent-version expiration lifecycle
-rule.** Whether to instead enumerate versions directly, or refuse versioned
-buckets at startup, is an open decision.
+GC refuses Enabled/Suspended versioning unless noncurrent-version expiration
+has been configured and `--snapshotOffloadAllowVersionedWithLifecycle=true`
+acknowledges it. Unknown status or missing `s3:GetBucketVersioning` permission
+aborts GC. Restore requires object reads and applicable KMS decrypt permission,
+not lifecycle acknowledgement or bucket-versioning access.
 
 ## 5. Restore
 

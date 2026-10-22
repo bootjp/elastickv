@@ -223,7 +223,7 @@ func snapshotOffloadEnabled() bool {
 // leave which destination actually receives the artifacts ambiguous,
 // and a backup written to the wrong place is discovered only when a
 // restore is attempted.
-func buildSnapshotOffloadStore(ctx context.Context) (snapshotoffload.ObjectStore, error) {
+func buildSnapshotOffloadStore(ctx context.Context) (snapshotOffloadStore, error) {
 	bucket := strings.TrimSpace(*snapshotOffloadBucket)
 	localDir := strings.TrimSpace(*snapshotOffloadLocalDir)
 	if bucket != "" && localDir != "" {
@@ -241,14 +241,15 @@ func buildSnapshotOffloadStore(ctx context.Context) (snapshotoffload.ObjectStore
 		return nil, err
 	}
 	store, err := snapshotoffload.NewS3Store(ctx, snapshotoffload.S3StoreConfig{
-		Bucket:               bucket,
-		Region:               strings.TrimSpace(*snapshotOffloadRegion),
-		Endpoint:             strings.TrimSpace(*snapshotOffloadEndpoint),
-		Profile:              strings.TrimSpace(*snapshotOffloadProfile),
-		ForcePathStyle:       *snapshotOffloadForcePathStyle,
-		ServerSideEncryption: strings.TrimSpace(*snapshotOffloadSSE),
-		SSEKMSKeyID:          strings.TrimSpace(*snapshotOffloadSSEKMSKeyID),
-		HTTPClientDecorator:  snapshotOffloadHTTPClient,
+		Bucket:                            bucket,
+		Region:                            strings.TrimSpace(*snapshotOffloadRegion),
+		Endpoint:                          strings.TrimSpace(*snapshotOffloadEndpoint),
+		Profile:                           strings.TrimSpace(*snapshotOffloadProfile),
+		ForcePathStyle:                    *snapshotOffloadForcePathStyle,
+		ServerSideEncryption:              strings.TrimSpace(*snapshotOffloadSSE),
+		SSEKMSKeyID:                       strings.TrimSpace(*snapshotOffloadSSEKMSKeyID),
+		HTTPClientDecorator:               snapshotOffloadHTTPClient,
+		AllowVersionedBucketWithLifecycle: *snapshotOffloadAllowVersionedLifecycle,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "snapshot offload: s3 store")
@@ -349,7 +350,10 @@ func startSnapshotOffload(
 	multi bool,
 	observer snapshotoffload.SchedulerObserver,
 	logger *slog.Logger,
-) error {
+) (retErr error) {
+	if *snapshotOffloadGCEnabled && !snapshotOffloadEnabled() {
+		return errors.Wrap(snapshotoffload.ErrInvalidOptions, "snapshot retention requires an offload destination")
+	}
 	if !snapshotOffloadEnabled() {
 		return nil
 	}
@@ -363,20 +367,12 @@ func startSnapshotOffload(
 	if err != nil {
 		return err
 	}
-
-	opts := []snapshotoffload.SchedulerOption{
-		snapshotoffload.WithSchedulerInterval(*snapshotOffloadInterval),
-		snapshotoffload.WithSchedulerConcurrency(*snapshotOffloadConcurrency),
-		snapshotoffload.WithSchedulerPublishTimeout(*snapshotOffloadPublishTimeout),
-		snapshotoffload.WithSchedulerObserver(observer),
-		snapshotoffload.WithSchedulerLogger(logger),
-	}
-	if *snapshotOffloadJitter > 0 {
-		opts = append(opts, snapshotoffload.WithSchedulerJitter(*snapshotOffloadJitter))
-	}
-	if dir := strings.TrimSpace(*snapshotOffloadSpoolDir); dir != "" {
-		opts = append(opts, snapshotoffload.WithSchedulerSpoolDir(dir))
-	}
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			retErr = errors.CombineErrors(retErr, closeSnapshotOffloadStore(store))
+		}
+	}()
 
 	scheduler, err := snapshotoffload.NewScheduler(
 		store,
@@ -384,10 +380,14 @@ func startSnapshotOffload(
 		strings.TrimSpace(*snapshotOffloadPrefix),
 		strings.TrimSpace(*snapshotOffloadSourceCluster),
 		buildVersion(),
-		opts...,
+		snapshotOffloadSchedulerOptions(observer, logger)...,
 	)
 	if err != nil {
 		return errors.Wrap(err, "snapshot offload: scheduler")
+	}
+	retention, err := buildSnapshotOffloadRetention(ctx, store, logger)
+	if err != nil {
+		return err
 	}
 
 	// Clean only aged leftovers before starting this process's publishers.
@@ -402,10 +402,25 @@ func startSnapshotOffload(
 		// Run returns only on context cancellation; a failing group is
 		// retried on the next tick rather than tearing the process
 		// down, because an object-store outage must not stop serving.
-		if err := scheduler.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
-			return errors.Wrap(err, "snapshot offload scheduler")
-		}
-		return nil
+		return runSnapshotOffloadWorkers(ctx, store, scheduler, retention)
 	})
+	handedOff = true
 	return nil
+}
+
+func snapshotOffloadSchedulerOptions(observer snapshotoffload.SchedulerObserver, logger *slog.Logger) []snapshotoffload.SchedulerOption {
+	opts := []snapshotoffload.SchedulerOption{
+		snapshotoffload.WithSchedulerInterval(*snapshotOffloadInterval),
+		snapshotoffload.WithSchedulerConcurrency(*snapshotOffloadConcurrency),
+		snapshotoffload.WithSchedulerPublishTimeout(*snapshotOffloadPublishTimeout),
+		snapshotoffload.WithSchedulerObserver(observer),
+		snapshotoffload.WithSchedulerLogger(logger),
+	}
+	if *snapshotOffloadJitter > 0 {
+		opts = append(opts, snapshotoffload.WithSchedulerJitter(*snapshotOffloadJitter))
+	}
+	if dir := strings.TrimSpace(*snapshotOffloadSpoolDir); dir != "" {
+		opts = append(opts, snapshotoffload.WithSchedulerSpoolDir(dir))
+	}
+	return opts
 }

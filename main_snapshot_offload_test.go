@@ -62,6 +62,7 @@ func TestSnapshotOffloadBuildsALocalStore(t *testing.T) {
 
 	store, err := buildSnapshotOffloadStore(context.Background())
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, closeSnapshotOffloadStore(store)) })
 	require.NotNil(t, store)
 	_, ok := store.(*snapshotoffload.LocalStore)
 	require.True(t, ok)
