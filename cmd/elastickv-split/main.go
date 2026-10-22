@@ -27,14 +27,17 @@ import (
 	"os"
 	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/metadata"
 )
 
 const (
-	rpcTimeout = 10 * time.Second
+	rpcTimeout         = 10 * time.Second
+	maxAdminTokenBytes = 4 << 10
 )
 
 var (
@@ -45,6 +48,7 @@ var (
 	targetGroupID   = flag.Uint64("target-group-id", 0, "Target Raft group for an asynchronous cross-group migration; zero uses the existing same-group split")
 	abandonJobID    = flag.Uint64("abandon-job-id", 0, "Abandon a pre-cutover migration job; mutually exclusive with split flags")
 	getJobID        = flag.Uint64("get-job-id", 0, "Print one migration job; mutually exclusive with mutation flags")
+	tokenFile       = flag.String("token-file", "", "File containing the admin bearer token for migration operations")
 )
 
 func main() {
@@ -79,6 +83,13 @@ func run() error {
 
 	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer rpcCancel()
+	if *tokenFile != "" {
+		token, err := internalutil.LoadBearerTokenFile(*tokenFile, maxAdminTokenBytes, "admin token")
+		if err != nil {
+			return errors.Wrap(err, "load split migration token")
+		}
+		rpcCtx = metadata.AppendToOutgoingContext(rpcCtx, "authorization", "Bearer "+token)
+	}
 	if *getJobID != 0 {
 		return runGetSplitJob(rpcCtx, client)
 	}

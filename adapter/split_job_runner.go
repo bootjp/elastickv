@@ -19,17 +19,18 @@ import (
 )
 
 const (
-	defaultSplitMigrationChunkBytes      = 1 << 20
-	defaultSplitMigrationMaxScannedBytes = 4 << 20
-	defaultSplitMigrationLockProbeLimit  = 1024
-	defaultSplitMigrationReadFenceGrace  = 30 * time.Second
-	splitCleanupCursorVersion            = byte(1)
-	splitVoterAckCursorVersion           = byte(1)
-	splitCleanupCursorHeaderBytes        = 5
-	splitJobHistoryLimit                 = 1000
-	splitJobHistoryDeleteBatchLimit      = 1000
-	splitJobHistoryTTL                   = 7 * 24 * time.Hour
-	splitJobHistoryGCInterval            = time.Minute
+	defaultSplitMigrationChunkBytes        = 1 << 20
+	defaultSplitMigrationMaxScannedBytes   = 4 << 20
+	defaultSplitMigrationLockProbeLimit    = 1024
+	defaultSplitMigrationReadFenceGrace    = 30 * time.Second
+	defaultSplitMigrationVoterProbeTimeout = 500 * time.Millisecond
+	splitCleanupCursorVersion              = byte(1)
+	splitVoterAckCursorVersion             = byte(1)
+	splitCleanupCursorHeaderBytes          = 5
+	splitJobHistoryLimit                   = 1000
+	splitJobHistoryDeleteBatchLimit        = 1000
+	splitJobHistoryTTL                     = 7 * 24 * time.Hour
+	splitJobHistoryGCInterval              = time.Minute
 )
 
 var (
@@ -65,7 +66,9 @@ func (s *DistributionServer) syncSplitMigrationVoterBarrier(
 	complete := true
 	for _, voter := range voters {
 		acked := false
-		resp, probeErr := voter.Client.ProbeMigrationState(ctx, req)
+		attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationVoterProbeTimeout)
+		resp, probeErr := voter.Client.ProbeMigrationState(attemptCtx, req)
+		cancel()
 		if probeErr == nil {
 			acked = resp.GetReady()
 		}

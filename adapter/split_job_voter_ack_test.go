@@ -4,9 +4,11 @@ import (
 	"context"
 	"errors"
 	"testing"
+	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 func TestSplitMigrationVoterBarrierReopensForMembershipChanges(t *testing.T) {
@@ -92,4 +94,38 @@ func TestSplitVoterAckCursorRejectsCorruption(t *testing.T) {
 	require.Error(t, err)
 	_, err = decodeSplitVoterAckCursor([]byte{splitVoterAckCursorVersion, 1, 4, 'n'})
 	require.Error(t, err)
+}
+
+type stalledSplitVoterClient struct {
+	splitMigrationClientStub
+}
+
+func (*stalledSplitVoterClient) ProbeMigrationState(ctx context.Context, _ *pb.ProbeMigrationStateRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestSplitMigrationVoterBarrierBoundsStalledProbe(t *testing.T) {
+	t.Parallel()
+	healthy := &splitMigrationClientStub{}
+	server := &DistributionServer{splitMigrationVoterFactory: func(context.Context, uint64) ([]SplitMigrationVoter, error) {
+		return []SplitMigrationVoter{
+			{ID: "n1", Address: "n1:50051", Client: &stalledSplitVoterClient{}},
+			{ID: "n2", Address: "n2:50051", Client: healthy},
+		}, nil
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*defaultSplitMigrationVoterProbeTimeout)
+	defer cancel()
+	start := time.Now()
+	cursor, complete, err := server.syncSplitMigrationVoterBarrier(ctx, 1, nil, nil, &pb.ProbeMigrationStateRequest{JobId: 7})
+	require.NoError(t, err)
+	require.NoError(t, ctx.Err(), "a voter must not consume the runner's parent deadline")
+	require.Less(t, time.Since(start), 5*defaultSplitMigrationVoterProbeTimeout)
+	require.False(t, complete)
+	acks, err := decodeSplitVoterAckCursor(cursor)
+	require.NoError(t, err)
+	require.Len(t, acks, 2)
+	require.False(t, acks[0].acked)
+	require.True(t, acks[1].acked)
+	require.Len(t, healthy.probes, 1)
 }

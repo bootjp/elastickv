@@ -1,11 +1,18 @@
 package main
 
 import (
+	"context"
 	"flag"
+	"net"
+	"os"
+	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/adapter"
+	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
 )
 
 // TestValidateFlags_RejectsMissingRequired pins the smoke-test
@@ -96,5 +103,44 @@ func resetFlags(t *testing.T) {
 	*abandonJobID = 0
 	*getJobID = 0
 	*address = "127.0.0.1:50051"
+	*tokenFile = ""
 	_ = flag.CommandLine // touch to avoid unused import on future trims
+}
+
+type splitAuthTestServer struct {
+	pb.UnimplementedDistributionServer
+	jobs chan uint64
+}
+
+func (s *splitAuthTestServer) AbandonSplitJob(_ context.Context, req *pb.AbandonSplitJobRequest) (*pb.AbandonSplitJobResponse, error) {
+	s.jobs <- req.GetJobId()
+	return &pb.AbandonSplitJobResponse{}, nil
+}
+
+func TestRunSendsMigrationAdminToken(t *testing.T) {
+	resetFlags(t)
+	t.Cleanup(func() { resetFlags(t) })
+	var listenConfig net.ListenConfig
+	listener, err := listenConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	unary, _ := adapter.SplitMigrationTokenAuth("test-admin-token", false)
+	server := grpc.NewServer(grpc.UnaryInterceptor(unary))
+	svc := &splitAuthTestServer{jobs: make(chan uint64, 1)}
+	pb.RegisterDistributionServer(server, svc)
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		require.NoError(t, <-serveResult)
+	})
+	*address = listener.Addr().String()
+	*abandonJobID = 7
+	err = run()
+	require.ErrorContains(t, err, "Unauthenticated")
+	require.Empty(t, svc.jobs)
+	path := filepath.Join(t.TempDir(), "token")
+	require.NoError(t, os.WriteFile(path, []byte("test-admin-token\n"), 0o600))
+	*tokenFile = path
+	require.NoError(t, run())
+	require.Equal(t, uint64(7), <-svc.jobs)
 }

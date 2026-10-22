@@ -42,8 +42,8 @@ func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
-	if srv != nil || !icept.empty() {
-		t.Fatalf("disabled service should return nil server and empty interceptors; got %v %+v", srv, icept)
+	if srv != nil || len(icept.unary) != 1 || len(icept.stream) != 1 {
+		t.Fatalf("disabled admin service should still deny migration mutations; got %v %+v", srv, icept)
 	}
 }
 
@@ -186,8 +186,8 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if srv == nil {
 		t.Fatal("expected an AdminServer instance")
 	}
-	if len(icept.unary) != 2 || len(icept.stream) != 2 {
-		t.Fatalf("expected separate admin and peer interceptors, got %d + %d", len(icept.unary), len(icept.stream))
+	if len(icept.unary) != 3 || len(icept.stream) != 3 {
+		t.Fatalf("expected admin, migration and peer interceptors, got %d + %d", len(icept.unary), len(icept.stream))
 	}
 	if !icept.s3BlobFetchEnabled {
 		t.Fatal("token-authenticated configuration should enable S3BlobFetch")

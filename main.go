@@ -176,7 +176,7 @@ var (
 	// below — both can be enabled simultaneously, and operators can pick
 	// whichever auth path they need (gRPC bearer token vs. HTTP cookies +
 	// SigV4 access keys).
-	adminTokenFile                = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
+	adminTokenFile                = flag.String("adminTokenFile", "", "Path to the bearer token required on Admin and split-migration control RPCs (leave blank with --adminInsecureNoAuth off to disable Admin and reject migration control)")
 	adminInsecureNoAuth           = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
 	s3BlobPeerTokenFile           = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
 	backupDefaultTTL              = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
@@ -3221,6 +3221,8 @@ func configureAdminService(
 	icept := adminGRPCInterceptors{token: auth.adminToken}
 	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
 	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
+	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.adminToken, insecureNoAuth)
+	appendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
 	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
 	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
 	icept.s3BlobFetchEnabled = auth.peerToken != ""
