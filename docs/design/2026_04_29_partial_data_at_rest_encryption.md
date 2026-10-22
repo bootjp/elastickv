@@ -2485,6 +2485,22 @@ locally.
   server and `elastickv-admin`, generates the KEK under the run's
   data dir, starts the cluster, runs the cutover, and then runs the
   same workloads as the cleartext invocation.
+- **Managed Jepsen.** Every workload accepts `--encryption` and passes
+  it to the shared DB adapter. The adapter builds the repository-root
+  production server, provisions the shared test KEK, discovers every
+  member for bootstrap, applies both envelope cutovers after membership
+  is established, and waits for every node to report both active before
+  releasing the workload. Each mutation retries across all members during
+  elections; each cutover reads the proposer identity from the selected
+  endpoint. Transient status errors remain inside the per-member readiness
+  poll. The Jepsen `await-fn` helper retries exceptions, so unavailable leaders,
+  inactive envelopes, and failed joins throw rather than return a falsey
+  value; regression tests exercise the actual helper. Managed S3 and SQS nodes receive cluster-wide Raft-to-frontend maps
+  so requests sent to followers can reach the leader. `--local --encryption` is rejected because a
+  no-op DB adapter cannot provision or verify that cluster. Multi-group
+  managed runs are also rejected before setup because the current Raft
+  envelope cutover is defined only for a single shard group; they must not
+  bootstrap keys or enable the storage envelope and then fail halfway through.
 - **Evidence (first run, this PR).** Against an encrypted cluster
   built from this branch: Redis list-append pass, Redis ZSet safety
   pass, DynamoDB list-append pass (30 s), all ten DynamoDB per-type

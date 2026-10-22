@@ -687,7 +687,8 @@
                                  :redis-port       (or (:redis-port opts) 6379)
                                  :filesystem-mount node->dir
                                  :raft-groups      (:raft-groups opts)
-                                 :shard-ranges     (:shard-ranges opts)}))
+                                 :shard-ranges     (:shard-ranges opts)
+                                 :encryption       (:encryption opts)}))
          rate        (double (or (:rate opts) 5))
          concurrency (or (:concurrency opts) default-concurrency)
          threads-per-key (or (:threads-per-key opts) default-threads-per-key)
