@@ -36,6 +36,7 @@ Date: 2026-04-29
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
 | 9C-2 | Sidecar/KEK observability: `active_dek_id{purpose}`, `sidecar_raft_index`, `kek_unwrap_seconds` (§9.2) | shipped | — |
+| 9C-5 | §5.4 DEK retirement eligibility: storage references and a cluster-wide write-fence generation, plus WAL-driven raft criteria evaluated per Raft group. Reports are bound to the retiring key and must show a different key active. Cluster-wide, no override. | shipped | — |
 | 9D | Encrypted Jepsen acceptance gate (§8.4): `elastickv-admin encryption wrap-dek` (local KEK-wrap helper so an operator or a script can produce the `bootstrap` / `rotate-dek` material without hand-rolling AES-GCM), `scripts/jepsen-enable-encryption.sh` (bootstrap → `enable-storage-envelope` → `enable-raft-envelope` → wait for every member), `scripts/run-jepsen-local.sh --encrypted`, and an `encryption: [off, on]` matrix on the per-push `Jepsen Test` workflow so every Redis / DynamoDB / S3 / SQS / filesystem workload also runs against an encrypted 3-node cluster. | shipped | this PR |
 | 9C+ | Rotation budget/rewrap/retire/rewrite, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks (§5.2, §5.4, §6.5, §8.3) | open | — |
 
@@ -1247,12 +1248,25 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
    — overriding is silently equivalent to "lose data on the
    next read or replay."
 
-   **Storage-purpose DEKs** must satisfy both of:
+   **Storage-purpose DEKs** must satisfy all of:
+   - A cluster-wide, non-zero retiring-key write-fence token is
+     installed and remains held through the `retire-dek` apply that
+     unloads the key. Every node reports under that same token, and
+     every write that captured the retiring key before the fence has
+     drained. This closes the window where a pre-rotation write can
+     commit old-key ciphertext after the eligibility scan.
    - The rewrite cursor for that DEK has reached the end of
      the keyspace AND
      `elastickv_encryption_values_per_dek{key_id} == 0`
      across every node (verified by `encryption status
      --verify`).
+   - No persisted rewrite cursor envelope references the retiring
+     DEK. Cursor records are counted separately from rewritten user
+     values because a stalled job may resume after the key is unloaded.
+   - No retained or otherwise restorable FSM snapshot contains a
+     storage envelope under the retiring DEK. The snapshot inventory
+     records per-DEK references; a post-rewrite snapshot alone is not
+     sufficient until every older restorable snapshot is purged.
    - `minRetainedTS` on every node is greater than the
      largest `commit_ts` ever written under the retiring DEK.
      Until this holds, a snapshot or lease read can still
@@ -1262,8 +1276,9 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
    **Raft-purpose DEKs** must satisfy a different,
    WAL-driven criterion because retaining MVCC versions does
    not cover their use sites — the raft envelope ciphertext
-   lives in the etcd raft WAL and in raft snapshots, not in
-   Pebble values. Specifically:
+   lives in the etcd raft WAL, not in the FSM snapshots or Pebble
+   values. Snapshot indexes still matter because they bound the WAL
+   range replayed during restore. Specifically:
    - Every node's persisted Raft log start index (the lower
      bound of un-truncated entries; advances with snapshot
      installs and `wal.purge`) must be **strictly greater
@@ -1273,12 +1288,23 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
      `elastickv_encryption_last_proposed_index_per_raft_dek{key_id}`,
      updated on every leader Wrap. The former is exposed as
      `etcd_raft_log_compact_index` per node.
-   - Every node's last committed Raft snapshot must have
-     been **taken under the new raft DEK** (i.e., its FSM
-     snapshot header §4.4 carries
-     `raft_envelope_cutover_index` past the rotation entry).
-     A node restored from an older snapshot would replay
-     entries that still need the retiring DEK to decode.
+   - Every node's last committed Raft snapshot must be **at or past
+     that group's largest index proposed under the retiring DEK**. A
+     node restored from an older snapshot would replay entries that
+     still need the retiring DEK to decode. Non-default groups have
+     no rotation entry in their own index space, so the per-group
+     old-key high-water mark is the boundary to check. The signal is
+     the snapshot's own Raft index (`raftpb.SnapshotMetadata.Index`),
+     which advances with every snapshot install.
+
+   The raft criteria are evaluated per Raft group. Log and snapshot
+   indexes live in independent per-group index spaces while the raft
+   DEK is cluster-wide and installed on every attached `ShardGroup`.
+   Every report and high-water boundary names the retiring key, every
+   node and group must be covered exactly once, and a different
+   successor key must be active everywhere. The one-shot
+   `raft_envelope_cutover_index` is not a retirement boundary: it is
+   frozen at Phase-2 enablement and cannot describe later rotations.
 
    Without the WAL guard, retiring a raft DEK while the WAL
    still contains entries encrypted under it would cause
