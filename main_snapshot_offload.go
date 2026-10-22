@@ -21,6 +21,7 @@ import (
 const (
 	snapshotOffloadMaxRedirects  = 10
 	snapshotOffloadStaleSpoolAge = 24 * time.Hour
+	snapshotOffloadSpoolDirPerm  = 0o755
 )
 
 // Physical snapshot object offload (design doc §4 / §7). Opt-in: the
@@ -166,7 +167,7 @@ func validateSnapshotOffloadSpoolDir() error {
 	if dir == "" {
 		return nil
 	}
-	if err := os.MkdirAll(dir, 0o755); err != nil {
+	if err := os.MkdirAll(dir, snapshotOffloadSpoolDirPerm); err != nil {
 		return errors.Wrap(err, "snapshot offload: create spool dir")
 	}
 	info, err := os.Stat(dir)
