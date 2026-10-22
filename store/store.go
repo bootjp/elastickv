@@ -267,12 +267,10 @@ type MVCCStore interface {
 	// CommittedVersionAt reports whether a committed version stamped
 	// EXACTLY commitTS exists for key. Unlike GetAt (newest version
 	// <= ts) this is an exact-timestamp existence check, used by the
-	// one-phase transaction idempotency probe to ask "did the previous
-	// attempt — which committed at this exact commit_ts — land?". Because
-	// commit timestamps are issued by the strictly-monotonic, unique HLC
-	// (Clock().Next()), a version at an exact commitTS on a given key can
-	// only have come from the transaction that was assigned that timestamp,
-	// so an exact hit unambiguously identifies that attempt. A tombstone
+	// one-phase transaction idempotency probe to ask whether the previous
+	// attempt may have landed. A leader handoff can assign the same timestamp
+	// to distinct attempts, so an exact hit alone does not identify the retry.
+	// A tombstone
 	// counts as a landed version (the attempt committed a delete). See
 	// docs/design/2026_05_21_proposed_txn_secondary_idempotency.md.
 	CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error)
@@ -317,6 +315,11 @@ type MVCCStore interface {
 	// key", matching ApplyMutationsRaft semantics for callers that have
 	// not yet been wired to the raftengine.ApplyIndexAware seam.
 	ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error
+	// ApplyMutationsRaftAtFenced rejects a live one-phase write whose
+	// commit timestamp is at or below the already-applied watermark. A write
+	// below that watermark could appear after a reader took that snapshot.
+	// PREPARE and 2PC COMMIT use the unfenced method above.
+	ApplyMutationsRaftAtFenced(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error
 	// DeletePrefixAt atomically deletes all visible (non-tombstone, non-expired)
 	// keys matching prefix at commitTS by writing tombstone versions. An empty
 	// prefix means "all keys". Keys matching excludePrefix are preserved.

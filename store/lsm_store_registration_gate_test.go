@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/cockroachdb/errors"
 )
 
@@ -224,16 +225,7 @@ func TestRegistrationGate_PromoteVersionsNeverGated(t *testing.T) {
 func TestRegistrationGate_NotEncryptingIsUngated(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	dek[0] = 0xDD
-	if err := ks.Set(7, dek); err != nil {
-		t.Fatalf("Keystore.Set: %v", err)
-	}
-	c, err := encryption.NewCipher(ks)
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
+	c := encryptiontest.NewCipher(t, 7)
 	dir := filepath.Join(t.TempDir(), "pebble")
 	registered := false
 	mvcc, err := NewPebbleStore(dir,
