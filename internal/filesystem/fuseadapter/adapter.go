@@ -126,6 +126,10 @@ func (a *Adapter) Close() {
 	})
 }
 
+// Errno maps a backend error to the errno reported to the kernel. Write
+// conflicts are retryable, so both the typed store.ErrWriteConflict and the
+// gRPC envelope a follower mount sees after leader forwarding map to EAGAIN
+// instead of EIO.
 func Errno(err error) syscall.Errno {
 	if err == nil {
 		return 0
@@ -134,6 +138,9 @@ func Errno(err error) syscall.Errno {
 		if errors.Is(err, mapping.err) {
 			return mapping.errno
 		}
+	}
+	if filesystem.IsWriteConflict(err) {
+		return syscall.EAGAIN
 	}
 	return syscall.EIO
 }

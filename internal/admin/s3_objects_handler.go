@@ -106,6 +106,12 @@ var ErrObjectsValidation = errors.New("admin s3 objects: invalid request")
 // adapter's ErrAdminUploadTooLarge to this.
 var ErrObjectsUploadTooLarge = errors.New("admin s3 objects: upload exceeds cap")
 
+// ErrObjectsUploadThrottled — the node's S3 PUT admission budget,
+// shared with SigV4 uploads, is exhausted. 503 + Retry-After: 1; the
+// same upload can be retried. The bridge translates the adapter's
+// ErrAdminUploadThrottled to this.
+var ErrObjectsUploadThrottled = errors.New("admin s3 objects: upload throttled")
+
 // ---------- handler entry points (called from S3Handler.ServeHTTP) ----------
 
 // handleObjectsCollection serves GET /buckets/{name}/objects.
@@ -353,46 +359,10 @@ const (
 
 // ---------- principal helpers ----------
 
-// principalForObjectRead is the read-side companion to principalForWrite
-// for the object-content paths. Same defence-in-depth gate as
-// principalForWrite — the JWT role check fires unconditionally
-// before the optional live-role re-validation, so a token minted
-// with role=none (or one that drifted past a revocation) cannot
-// slip through even when the live RoleStore says the access key
-// is now allowed (Claude review on PR #814 r2 caught the
-// asymmetry between principalForObjectRead and principalForWrite
-// — the latter has had this pattern since PR #669, the former
-// shipped without it).
-//
-// AllowsRead (RoleReadOnly OR RoleFull) is the right gate for
-// object-content reads.
+// principalForObjectRead gates the object-content reads (RoleReadOnly
+// or RoleFull). The policy lives in authorizePrincipal.
 func (h *S3Handler) principalForObjectRead(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
-	principal, ok := PrincipalFromContext(r.Context())
-	if !ok {
-		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
-		return AuthPrincipal{}, false
-	}
-	// JWT role gate fires first, unconditionally. The live re-check
-	// below can only further constrain — it can never relax what
-	// the token was minted with.
-	if !principal.Role.AllowsRead() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to read object contents")
-		return AuthPrincipal{}, false
-	}
-	if h.roles != nil {
-		live, exists := h.roles.LookupRole(principal.AccessKey)
-		if !exists || !live.AllowsRead() {
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to read object contents")
-			return AuthPrincipal{}, false
-		}
-		// Use the live role downstream — the JWT may carry a stale
-		// value but the live one is authoritative once both gates
-		// agree the request is allowed.
-		principal.Role = live
-	}
-	return principal, true
+	return authorizePrincipal(w, r, h.roles, accessRead, "this access key is not authorised to read object contents")
 }
 
 // ---------- query / key parsing ----------
@@ -488,6 +458,10 @@ func (h *S3Handler) writeObjectsError(w http.ResponseWriter, r *http.Request, op
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	case errors.Is(err, ErrObjectsUploadTooLarge):
 		WriteMaxBytesError(w)
+	case errors.Is(err, ErrObjectsUploadThrottled):
+		w.Header().Set("Retry-After", "1")
+		writeJSONError(w, http.StatusServiceUnavailable, "upload_throttled",
+			"this node's upload budget is exhausted; retry shortly")
 	default:
 		h.logger.LogAttrs(r.Context(), slog.LevelError, "admin s3 "+op+" object failed",
 			slog.String("bucket", bucket),

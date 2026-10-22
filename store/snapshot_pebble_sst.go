@@ -186,12 +186,16 @@ func (s *pebbleStore) newSSTIngestSnapshot() (Snapshot, error) {
 	// Checkpoint must represent the exact state visible when the Raft run loop
 	// calls Snapshot. Block compaction/restore and all commit paths while the
 	// memtable is flushed and Pebble hard-links the stable checkpoint files.
+	// applyMu comes before dbMu (see the lock ordering on pebbleStore): an
+	// applier that holds applyMu across several dbMu sections, such as
+	// ApplyRaftEntry, must never find this checkpoint holding dbMu while it
+	// waits for applyMu.
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
-	s.dbMu.Lock()
-	defer s.dbMu.Unlock()
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	s.dbMu.Lock()
+	defer s.dbMu.Unlock()
 
 	fallback := func(reason error) (Snapshot, error) {
 		snap, err := s.newLegacyPebbleSnapshotLocked()

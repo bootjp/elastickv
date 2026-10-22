@@ -23,7 +23,43 @@ func WithApplyObserver(observer ApplyObserver) FSMOption {
 	}
 }
 
+// beginDeferredApplyNotices starts holding observer notifications back
+// until flushDeferredApplyNotices delivers them in order or
+// discardDeferredApplyNotices drops them. Used while a batched Raft entry is
+// staged, so observers never learn about a write that did not land.
+func (f *kvFSM) beginDeferredApplyNotices() {
+	f.deferApplyNotices = true
+	f.deferredApplyNotices = f.deferredApplyNotices[:0]
+}
+
+func (f *kvFSM) discardDeferredApplyNotices() {
+	f.deferApplyNotices = false
+	f.deferredApplyNotices = nil
+}
+
+func (f *kvFSM) flushDeferredApplyNotices() {
+	notices := f.deferredApplyNotices
+	f.deferApplyNotices = false
+	f.deferredApplyNotices = nil
+	for _, notice := range notices {
+		notice()
+	}
+}
+
+// deferApplyNotice queues notice while notifications are deferred and
+// reports whether it did; the caller delivers immediately otherwise.
+func (f *kvFSM) deferApplyNotice(notice func()) bool {
+	if !f.deferApplyNotices {
+		return false
+	}
+	f.deferredApplyNotices = append(f.deferredApplyNotices, notice)
+	return true
+}
+
 func (f *kvFSM) notifyApplyObservers(commitTS uint64, muts []*pb.Mutation) {
+	if f.deferApplyNotice(func() { f.notifyApplyObservers(commitTS, muts) }) {
+		return
+	}
 	f.observeAppliedCommitTS(commitTS)
 	for _, mut := range muts {
 		if mut == nil {
@@ -34,6 +70,9 @@ func (f *kvFSM) notifyApplyObservers(commitTS uint64, muts []*pb.Mutation) {
 }
 
 func (f *kvFSM) notifyApplyObserversForStoreMutations(commitTS uint64, muts []*store.KVPairMutation) {
+	if f.deferApplyNotice(func() { f.notifyApplyObserversForStoreMutations(commitTS, muts) }) {
+		return
+	}
 	f.observeAppliedCommitTS(commitTS)
 	for _, mut := range muts {
 		if mut == nil || isTxnInternalKey(mut.Key) {
@@ -49,6 +88,9 @@ func (f *kvFSM) notifyApplyObserversForStoreMutations(commitTS uint64, muts []*s
 }
 
 func (f *kvFSM) notifyApplyObserver(commitTS uint64, op pb.Op, key []byte) {
+	if f.deferApplyNotice(func() { f.notifyApplyObserver(commitTS, op, key) }) {
+		return
+	}
 	f.observeAppliedCommitTS(commitTS)
 	f.notifyApplyObserverAfterObserve(op, key)
 }

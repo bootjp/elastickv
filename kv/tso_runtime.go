@@ -153,6 +153,19 @@ func (d *DynamicTimestampAllocator) Next(ctx context.Context) (uint64, error) {
 	return timestamp, errors.Wrap(err, "dynamic tso next")
 }
 
+func (d *DynamicTimestampAllocator) FreshAdmissionTimestamp(ctx context.Context) (uint64, error) {
+	allocator := d.currentTimestampAllocator()
+	if allocator == nil {
+		return 0, errors.WithStack(ErrTSOAllocatorRequired)
+	}
+	issuer, ok := allocator.(TSOFreshAdmissionTimestampIssuer)
+	if !ok {
+		return 0, errors.WithStack(ErrTSOProtocolUnsupported)
+	}
+	timestamp, err := issuer.FreshAdmissionTimestamp(ctx)
+	return timestamp, errors.Wrap(err, "dynamic tso fresh admission timestamp")
+}
+
 func (d *DynamicTimestampAllocator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
 	allocator := d.currentTimestampAllocator()
 	if allocator == nil {
@@ -185,6 +198,14 @@ func (d *DynamicTimestampAllocator) PhaseDActive() bool {
 func (d *DynamicTimestampAllocator) PhaseDRequired() bool {
 	state, ok := d.currentTimestampAllocator().(TSOPhaseDState)
 	return ok && state.PhaseDRequired()
+}
+
+func (d *DynamicTimestampAllocator) PhaseDFloor() uint64 {
+	source, ok := d.currentTimestampAllocator().(TSOPhaseDFloorSource)
+	if !ok {
+		return 0
+	}
+	return source.PhaseDFloor()
 }
 
 func (d *DynamicTimestampAllocator) Invalidate() {

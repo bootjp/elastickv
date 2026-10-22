@@ -94,7 +94,7 @@ func maxLatestCommitTSParallel(ctx context.Context, st store.MVCCStore, keys [][
 		})
 	}
 	if err := eg.Wait(); err != nil {
-		return 0, err
+		return 0, errors.WithStack(err)
 	}
 	return maxTS, nil
 }
