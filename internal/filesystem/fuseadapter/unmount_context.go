@@ -23,27 +23,42 @@ func (s *Server) UnmountContext(ctx context.Context) error {
 }
 
 func unmountFUSEMount(ctx context.Context, mountPoint, fsType string) error {
-	if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
+	if err := verifyOrdinaryUnmount(ctx, mountPoint, fsType); err != nil {
 		if errors.Is(err, errNoFUSEMount) {
 			return nil
 		}
 		return errors.WithStack(err)
 	}
 	var helperErr error
-	for _, helper := range detachMountHelpers {
+	for _, helper := range []string{"fusermount3", "fusermount", "umount"} {
 		bin, err := lookupMountHelperContext(ctx, helper)
 		if err != nil {
 			helperErr = err
 			continue
 		}
-		if err := requireFUSEMount(ctx, mountPoint, fsType); err != nil {
+		if err := verifyOrdinaryUnmount(ctx, mountPoint, fsType); err != nil {
 			return errors.WithStack(err)
 		}
-		if err := runUnmountHelper(ctx, bin, mountPoint, false); err != nil {
+		args := []string{mountPoint}
+		if helper != "umount" {
+			args = append([]string{"-u"}, args...)
+		}
+		if err := runMountHelper(ctx, bin, args); err != nil {
 			helperErr = err
 			continue
 		}
 		return nil
 	}
 	return errors.Wrap(helperErr, "ordinary FUSE unmount helper failed")
+}
+
+func verifyOrdinaryUnmount(ctx context.Context, mountPoint, fsType string) error {
+	err := requireFUSEMount(ctx, mountPoint, fsType)
+	var unavailable *mountTableUnavailableError
+	if errors.As(err, &unavailable) {
+		// Startup permits this platform/container configuration. Only ordinary
+		// unmount is allowed without the table; lazy detach stays type-guarded.
+		return nil
+	}
+	return errors.WithStack(err)
 }
