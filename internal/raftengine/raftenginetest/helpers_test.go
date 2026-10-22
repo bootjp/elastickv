@@ -123,6 +123,7 @@ func TestProposersOwnBytesAndSerialize(t *testing.T) {
 
 func TestLeaseCapabilityIsOptIn(t *testing.T) {
 	s := &raftenginetest.StubLeaseEngine{LeaseDurationValue: time.Second, AppliedIndexValue: 7, QuorumAck: monoclock.Now()}
+	s.StateValue = raftengine.StateLeader
 	var callbacks int
 	deregister := s.RegisterLeaderLossCallback(func() { callbacks++ })
 	s.NotifyLeaderLoss()
@@ -133,6 +134,25 @@ func TestLeaseCapabilityIsOptIn(t *testing.T) {
 	require.Equal(t, time.Second, s.LeaseDuration())
 	require.Equal(t, uint64(7), s.AppliedIndex())
 	require.Equal(t, s.QuorumAck, s.LastQuorumAck())
+}
+
+func TestLeaseEngineNonLeadersHaveNoQuorumAck(t *testing.T) {
+	ack := monoclock.Now()
+	for _, state := range []raftengine.State{"", raftengine.StateUnknown, raftengine.StateFollower, raftengine.StateCandidate, raftengine.StateShutdown} {
+		s := &raftenginetest.StubLeaseEngine{QuorumAck: ack}
+		s.StateValue = state
+		require.True(t, s.LastQuorumAck().IsZero(), "state %q must not advertise a quorum acknowledgment", state)
+	}
+}
+
+func TestLeaseEngineContainsEachCallbackPanic(t *testing.T) {
+	s := &raftenginetest.StubLeaseEngine{}
+	var count int
+	s.RegisterLeaderLossCallback(func() { count++ })
+	s.RegisterLeaderLossCallback(func() { panic("broken lease holder") })
+	s.RegisterLeaderLossCallback(func() { count++ })
+	require.NotPanics(t, s.NotifyLeaderLoss)
+	require.Equal(t, 2, count, "every healthy holder must be invalidated")
 }
 
 func TestNewSingleNodeWithRealFactory(t *testing.T) {

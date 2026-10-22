@@ -192,9 +192,14 @@ type StubLeaseEngine struct {
 	callbacks          map[uint64]func()
 }
 
-func (s *StubLeaseEngine) LeaseDuration() time.Duration     { return s.LeaseDurationValue }
-func (s *StubLeaseEngine) AppliedIndex() uint64             { return s.AppliedIndexValue }
-func (s *StubLeaseEngine) LastQuorumAck() monoclock.Instant { return s.QuorumAck }
+func (s *StubLeaseEngine) LeaseDuration() time.Duration { return s.LeaseDurationValue }
+func (s *StubLeaseEngine) AppliedIndex() uint64         { return s.AppliedIndexValue }
+func (s *StubLeaseEngine) LastQuorumAck() monoclock.Instant {
+	if s.State() != raftengine.StateLeader {
+		return monoclock.Instant{}
+	}
+	return s.QuorumAck
+}
 func (s *StubLeaseEngine) RegisterLeaderLossCallback(fn func()) func() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -220,8 +225,14 @@ func (s *StubLeaseEngine) NotifyLeaderLoss() {
 	}
 	s.mu.Unlock()
 	for _, fn := range callbacks {
-		fn()
+		notifyLeaderLossCallback(fn)
 	}
+}
+
+func notifyLeaderLossCallback(fn func()) {
+	// One broken holder must not prevent other holders from losing their lease.
+	defer func() { _ = recover() }()
+	fn()
 }
 
 var (
