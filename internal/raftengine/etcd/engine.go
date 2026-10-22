@@ -3719,6 +3719,15 @@ func (e *Engine) protectedReceivedFSMSnapshotIndexesLocked() map[uint64]bool {
 // If fsmSnapDir is not set (e.g., engines created directly in unit tests),
 // falls back to the legacy in-memory []byte path.
 func (e *Engine) snapshotPayloadLocked(index uint64) ([]byte, error) {
+	// Config capture may have waited behind a newer snapshot publication.
+	// Do not serialize over a retained .fsm before CreateSnapshot rejects it.
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if index <= current.GetMetadata().GetIndex() {
+		return nil, errors.WithStack(raftengine.ErrSnapshotDeferred)
+	}
 	if e.fsmSnapDir == "" {
 		snapshot, err := e.fsm.Snapshot()
 		if err != nil {
@@ -5486,6 +5495,13 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return errors.Join(errors.WithStack(err), errors.WithStack(req.snapshot.Close()))
+	}
+	if req.index <= current.GetMetadata().GetIndex() {
+		return errors.WithStack(req.snapshot.Close())
+	}
 	if err := e.prepareFSMSnapshotWrite(req.index); err != nil {
 		slog.Warn("failed to prepare fsm snapshot write",
 			"index", req.index,

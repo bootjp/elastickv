@@ -30,6 +30,7 @@ type externalRestoreOrigin struct {
 	CRC32C  uint32 `json:"crc32c"`
 	// The entire FSM payload, including its header, excluding only the footer.
 	PayloadSHA256 string `json:"fsm_payload_sha256"`
+	Completed     bool   `json:"completed,omitempty"`
 }
 
 func writeExternalRestoreOrigin(dir string, opts ExternalSnapshotRestoreOptions, crc uint32) error {
@@ -155,15 +156,50 @@ func (m externalRestoreOrigin) matchesSnapshot(snapshot raftpb.Snapshot, token s
 		token.Index == m.Index && token.CRC32C == m.CRC32C
 }
 
-// Called only after validation/full restore and Open's pre-start checks succeed.
-// A crash before removal repeats validation; after removal the validated state
-// must already be durable under ContextSnapshotRestorer's success contract.
+// Completion permits later WAL-published native snapshots, never ordinary
+// restore of the original bytes. Keep the immutable binding for every fallback.
+// Open persists this before starting transport or the snapshot/apply workers.
 func completeExternalRestoreOrigin(dir string, validated bool) error {
 	if !validated {
 		return nil
 	}
-	if err := os.Remove(filepath.Join(dir, externalRestoreOriginFile)); err != nil {
+	marker, err := readExternalRestoreOrigin(dir)
+	if err != nil {
+		return err
+	}
+	if marker == nil {
+		return errors.WithStack(ErrExternalSnapshotRestoreOrigin)
+	}
+	if marker.Completed {
+		return nil
+	}
+	marker.Completed = true
+	data, err := json.Marshal(marker)
+	if err != nil {
 		return errors.WithStack(err)
 	}
-	return syncDir(dir)
+	return writeAndSyncFile(filepath.Join(dir, externalRestoreOriginFile), data)
+}
+
+// This decision requires the real WAL selection and successful ReadAll, not an
+// arbitrary snapshot whose index merely exceeds the imported snapshot's index.
+// Preparation seeds a fresh directory with only the original snapshot; Open
+// durably completes validation before local/config capture or received Ready
+// can publish any later snapshot. The selected WAL boundary is their provenance.
+func validateNativeAfterExternalRestore(selected *walRestoreState, marker *externalRestoreOrigin, dir string) error {
+	snapshot := selected.snapshot
+	token, err := decodeSnapshotToken(snapshot.Data)
+	if err != nil {
+		return errors.Wrap(ErrExternalSnapshotRestoreOrigin, "later native snapshot requires a supported FSM token")
+	}
+	meta := snapshot.GetMetadata()
+	if !marker.Completed || meta.GetIndex() <= marker.Index || meta.GetTerm() < marker.Term ||
+		token.Index != meta.GetIndex() || selected.hardState.GetCommit() < meta.GetIndex() ||
+		selected.hardState.GetTerm() < meta.GetTerm() {
+		return errors.WithStack(ErrExternalSnapshotRestoreOrigin)
+	}
+	// Validate the entire file even when the ordinary cold-start gate would
+	// use only its header. Neither copied epoch rows nor an applied index are
+	// evidence that an unvalidated snapshot belongs to this Raft lineage.
+	return verifyFSMSnapshotFile(fsmSnapPath(dir, token.Index), token.CRC32C)
 }

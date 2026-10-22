@@ -102,38 +102,41 @@ func TestExternalOriginBindsWrappedHeaderAndPreservesInputHash(t *testing.T) {
 }
 
 func TestExternalOriginRejectsMarkerMismatchBeforeFSM(t *testing.T) {
-	for _, field := range []string{"version", "index", "term", "crc", "sha", "truncated", "oversized"} {
-		t.Run(field, func(t *testing.T) {
-			dir, _ := prepareOriginFixture(t)
-			marker, err := readExternalRestoreOrigin(dir)
-			require.NoError(t, err)
-			switch field {
-			case "version":
-				marker.Version++
-			case "index":
-				marker.Index++
-			case "term":
-				marker.Term++
-			case "crc":
-				marker.CRC32C++
-			case "sha":
-				marker.PayloadSHA256 = hex.EncodeToString(make([]byte, sha256.Size))
-			}
-			data, err := json.Marshal(marker)
-			require.NoError(t, err)
-			if field == "truncated" {
-				data = []byte("{")
-			}
-			if field == "oversized" {
-				data = make([]byte, externalRestoreOriginMaxBytes+1)
-			}
-			require.NoError(t, os.WriteFile(filepath.Join(dir, externalRestoreOriginFile), data, 0o600))
-			fsm := &originRecordingFSM{}
-			_, err = loadOriginFixture(dir, fsm)
-			require.ErrorIs(t, err, ErrExternalSnapshotRestoreOrigin)
-			require.Empty(t, fsm.origins)
-			require.FileExists(t, filepath.Join(dir, externalRestoreOriginFile))
-		})
+	for _, completed := range []bool{false, true} {
+		for _, field := range []string{"version", "index", "term", "crc", "sha", "truncated", "oversized"} {
+			t.Run(field+map[bool]string{false: "/pending", true: "/completed"}[completed], func(t *testing.T) {
+				dir, _ := prepareOriginFixture(t)
+				marker, err := readExternalRestoreOrigin(dir)
+				require.NoError(t, err)
+				marker.Completed = completed
+				switch field {
+				case "version":
+					marker.Version++
+				case "index":
+					marker.Index++
+				case "term":
+					marker.Term++
+				case "crc":
+					marker.CRC32C++
+				case "sha":
+					marker.PayloadSHA256 = hex.EncodeToString(make([]byte, sha256.Size))
+				}
+				data, err := json.Marshal(marker)
+				require.NoError(t, err)
+				if field == "truncated" {
+					data = []byte("{")
+				}
+				if field == "oversized" {
+					data = make([]byte, externalRestoreOriginMaxBytes+1)
+				}
+				require.NoError(t, os.WriteFile(filepath.Join(dir, externalRestoreOriginFile), data, 0o600))
+				fsm := &originRecordingFSM{}
+				_, err = loadOriginFixture(dir, fsm)
+				require.ErrorIs(t, err, ErrExternalSnapshotRestoreOrigin)
+				require.Empty(t, fsm.origins)
+				require.FileExists(t, filepath.Join(dir, externalRestoreOriginFile))
+			})
+		}
 	}
 }
 
@@ -204,7 +207,7 @@ func TestExternalOriginWrapperMustForwardCapability(t *testing.T) {
 	require.Empty(t, inner.origins)
 }
 
-func TestExternalOriginSuccessfulOpenConsumesMarker(t *testing.T) {
+func TestExternalOriginSuccessfulOpenRetainsCompletedBinding(t *testing.T) {
 	dir, _ := prepareOriginFixture(t)
 	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 	defer cancel()
@@ -212,14 +215,16 @@ func TestExternalOriginSuccessfulOpenConsumesMarker(t *testing.T) {
 	engine, err := Open(ctx, OpenConfig{NodeID: 1, LocalID: "n1", LocalAddress: "127.0.0.1:12001", DataDir: dir,
 		StateMachine: fsm, TickInterval: 10 * time.Millisecond, ElectionTick: 5, HeartbeatTick: 1})
 	require.NoError(t, err)
-	require.NoFileExists(t, filepath.Join(dir, externalRestoreOriginFile))
+	marker, err := readExternalRestoreOrigin(dir)
+	require.NoError(t, err)
+	require.NotNil(t, marker)
+	require.True(t, marker.Completed)
 	require.NoError(t, engine.Close())
 	require.Equal(t, []raftengine.SnapshotRestoreOrigin{raftengine.SnapshotRestoreExternalRebase}, fsm.origins)
-	// The capability-less FSM is allowed again only after successful validation.
+	// Completion never lets the original bytes bypass origin validation.
 	ordinary := &skipGateFSM{applied: 42, appliedPresent: true}
-	disk, err := loadOriginFixture(dir, ordinary)
-	require.NoError(t, err)
-	require.NoError(t, closePersist(disk.Persist))
+	_, err = loadOriginFixture(dir, ordinary)
+	require.ErrorIs(t, err, ErrExternalSnapshotRestoreUnsupported)
 }
 
 func TestExternalOriginMissingWALCannotBootstrap(t *testing.T) {
