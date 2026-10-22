@@ -122,6 +122,9 @@ func (f *kvFSM) applyBootstrap(raftIdx uint64, data []byte) any {
 		return haltErr(errors.Wrap(errors.Mark(err, encryption.ErrEncryptionApply),
 			"kv/fsm: apply bootstrap"))
 	}
+	if err := f.captureEncryptionCheckpoint(raftIdx); err != nil {
+		return haltErr(errors.Mark(err, encryption.ErrEncryptionApply))
+	}
 	return nil
 }
 
@@ -136,6 +139,9 @@ func (f *kvFSM) applyRotation(raftIdx uint64, data []byte) any {
 	if err := f.encryption.ApplyRotation(raftIdx, p); err != nil {
 		return haltErr(errors.Wrap(errors.Mark(err, encryption.ErrEncryptionApply),
 			"kv/fsm: apply rotation"))
+	}
+	if err := f.captureEncryptionCheckpoint(raftIdx); err != nil {
+		return haltErr(errors.Mark(err, encryption.ErrEncryptionApply))
 	}
 	return nil
 }

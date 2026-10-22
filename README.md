@@ -26,6 +26,23 @@ Elastickv is an experimental distributed key-value store backed by Raft. It expo
 ## Development Status
 Elastickv remains experimental. Protocol and POSIX compatibility are limited to the operations documented below. Contributions and feedback are welcome.
 
+## Graceful shutdown
+
+The production server (`go run .`) handles SIGTERM and SIGINT by transferring
+leadership of every locally led Raft group before stopping its servers and
+closing storage. Transfers run in parallel with a shared five-second deadline;
+groups are rechecked for leadership acquired during another handoff. The Raft
+transport stays available until they finish. Only active voting
+replicas can receive leadership; learners are excluded.
+
+If a group has no eligible successor or a transfer times out, the server logs a
+warning and continues shutdown. Followers shut down without initiating a
+transfer. gRPC requests then have up to ten seconds to drain before remaining
+streams are closed, using the common bounded shutdown path. Allow the five-second
+handoff window in addition to the listener and FUSE drain budgets and storage
+cleanup when setting the supervisor's termination grace period. During startup,
+signals cancel immediately; repeated signals are ignored throughout cleanup.
+
 ## Architecture
 
 Architecture diagrams are available in:
@@ -220,7 +237,7 @@ printf 'hello\n' > /tmp/elastickv-mount/docs/hello.txt
 cat /tmp/elastickv-mount/docs/hello.txt
 ```
 
-The root owner and mode flags apply when the filesystem root is first created; the defaults are UID/GID `0` and mode `0755`, and the mount enforces `default_permissions`, so set them to the user that will write to the mount. `--filesystemClientID` defaults to `--raftId` and identifies open-handle leases. `--filesystemCapacity` and `--filesystemMaxFiles` set values reported by `statfs`; they do not enforce write quotas. The server mounts through `fusermount3` (package `fuse3`) after its network listeners are up. Stopping the process with a signal leaves the mount attached in a `Transport endpoint is not connected` state; run `fusermount3 -uz <mount-point>` before restarting.
+The root owner and mode flags apply when the filesystem root is first created; the defaults are UID/GID `0` and mode `0755`, and the mount enforces `default_permissions`, so set them to the user that will write to the mount. `--filesystemClientID` defaults to `--raftId` and identifies open-handle leases. `--filesystemCapacity` and `--filesystemMaxFiles` set values reported by `statfs`; they do not enforce write quotas. The server mounts through `fusermount3` (package `fuse3`) after its network listeners are up. The server unmounts the filesystem when it stops, including on `SIGTERM`/`SIGINT`, and a restart after `SIGKILL` or a crash detaches the dead mount it finds at the mount point before mounting again. See the [FUSE filesystem guide](docs/filesystem.md) for details.
 
 This FUSE implementation supports regular files and directories, but not cross-directory rename, hard links, symbolic links, extended attributes, or full POSIX locking. Concurrent modifications from different mounts are resolved optimistically: the loser gets `EAGAIN`. Most operations can simply be retried, but `close` must not be, and an `O_APPEND` write that other mounts may also be appending to must not be either; the guide's Concurrency section has the per-operation rules. See the [FUSE filesystem guide](docs/filesystem.md) for prerequisites, multi-node setup, semantics, monitoring, and troubleshooting, and the [filesystem design](docs/design/2026_02_24_implemented_filesystem_on_elastickv.md) for the supported operations and placement model.
 

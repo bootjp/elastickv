@@ -46,6 +46,54 @@ func TestFSMReplicatedBackupRequiresCapabilityAndActivatedEpoch(t *testing.T) {
 	require.ErrorIs(t, err, ErrTTLInlineCapabilityRequired, "binary support cannot manufacture an epoch")
 }
 
+func TestFSMReplicatedBackupCoexistsWithPrepareEvidence(t *testing.T) {
+	t.Parallel()
+	for _, backend := range []string{"memory", "pebble"} {
+		t.Run(backend, func(t *testing.T) {
+			t.Parallel()
+			open := func() store.MVCCStore {
+				if backend == "pebble" {
+					return g17OpenStore(t, t.TempDir())
+				}
+				st := store.NewMVCCStore()
+				t.Cleanup(func() { require.NoError(t, st.Close()) })
+				return st
+			}
+			st := open()
+			seedActivatedPinJournal(t, st)
+			f := activatedPinFSM(t, st)
+			pin := replicatedBackupWireFixtures()[0]
+			payload, err := EncodeReplicatedBackupCommand(pin)
+			require.NoError(t, err)
+			commands := [][]byte{EncodePrepareEvidenceFence(0), EncodePrepareEvidenceSeal(), payload,
+				EncodePrepareEvidenceFence(pin.ReadTS), EncodePrepareEvidenceRelease(pin.ReadTS)}
+			for index, command := range commands {
+				f.SetApplyIndex(uint64(index) + 2)
+				require.Nil(t, f.Apply(command), "timestamp controls are not legacy backup lifecycle commands")
+			}
+			snapshot, err := f.Snapshot()
+			require.NoError(t, err)
+			t.Cleanup(func() { require.NoError(t, snapshot.Close()) })
+			var image bytes.Buffer
+			_, err = snapshot.WriteTo(&image)
+			require.NoError(t, err)
+			restored := activatedPinFSM(t, open())
+			require.NoError(t, restored.Restore(&image))
+			for _, current := range []*kvFSM{f, restored} {
+				require.True(t, current.prepareEvidenceEnabled.Load())
+				require.False(t, current.prepareCreationSealed.Load())
+				require.Equal(t, pin.ReadTS, current.prepareEvidenceReleaseFloor.Load())
+				require.Equal(t, pin.ReadTS, current.prepareEvidenceTimestampFloor.Load())
+				require.Equal(t, f.replicatedPins.snapshot(), current.replicatedPins.snapshot())
+				legacy := EncodeBackupReleaseEntry(BackupReleaseEntry{PinID: pin.PinID})
+				response, ok := current.Apply(legacy).(error)
+				require.True(t, ok)
+				require.ErrorIs(t, response, ErrInvalidBackupPin)
+			}
+		})
+	}
+}
+
 func TestFSMReplicatedBackupPreservesRetentionAndWriteFenceThroughRestore(t *testing.T) {
 	t.Parallel()
 	st := g17OpenStore(t, t.TempDir())

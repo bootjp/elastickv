@@ -19,9 +19,30 @@ const (
 
 var (
 	ErrInvalidOptions = errors.New("snapshot offload: invalid options")
-	ErrIntegrity      = errors.New("snapshot offload: integrity check failed")
-	ErrObjectConflict = errors.New("snapshot offload: object conflict")
-	ErrObjectNotFound = errors.New("snapshot offload: object not found")
+
+	// ErrRestoreGroupMismatch reports a restore whose manifest belongs to a
+	// different Raft group than the operator named. It is deliberately its
+	// own sentinel: an operator repeating the restore command across groups
+	// needs to see "wrong group", not a generic invalid-options error.
+	ErrRestoreGroupMismatch = errors.New("snapshot offload: manifest group does not match the requested group")
+
+	// ErrRestoreSourceClusterMismatch reports a restore whose manifest was
+	// published by a different cluster than the operator named. Its own
+	// sentinel, like the group mismatch: "another cluster's backup" and
+	// "another group's backup" are different operator mistakes with
+	// different fixes.
+	ErrRestoreSourceClusterMismatch = errors.New("snapshot offload: manifest source cluster does not match the requested cluster")
+	ErrIntegrity                    = errors.New("snapshot offload: integrity check failed")
+	ErrObjectConflict               = errors.New("snapshot offload: object conflict")
+	ErrObjectNotFound               = errors.New("snapshot offload: object not found")
+	ErrObjectClaimed                = errors.New("snapshot offload: object claimed by another operation")
+
+	// ErrObjectModified is returned by DeleteObjectIfUnmodified when
+	// the object changed after the caller validated it. For retention
+	// this is not a failure: it means a concurrent publish changed the
+	// target object, so the correct response is to leave it alone. The
+	// target may be either a payload or a manifest.
+	ErrObjectModified = errors.New("snapshot offload: object modified since validation")
 
 	// ErrNoPersistedSnapshot reports that the LOCAL data dir has no
 	// persisted snapshot yet. It is deliberately distinct from
@@ -118,6 +139,8 @@ func validateManifestIdentity(manifest Manifest) error {
 		return errors.Wrapf(ErrInvalidOptions, "unsupported manifest schema version %d", manifest.SchemaVersion)
 	case manifest.GroupID == 0 && strings.TrimSpace(manifest.SourceCluster) == "":
 		return errors.Wrap(ErrInvalidOptions, "source cluster is required for group 0 manifests")
+	case manifest.CreatedAt.IsZero():
+		return errors.Wrap(ErrInvalidOptions, "manifest creation time is required")
 	case manifest.SnapshotIndex == 0:
 		return errors.Wrap(ErrInvalidOptions, "snapshot index must be > 0")
 	case manifest.SnapshotTerm == 0:

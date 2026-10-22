@@ -204,6 +204,7 @@ func TestRaftTSOAllocatorRejectsTermChangeAfterPhaseDMarker(t *testing.T) {
 		&ShardGroup{Engine: engine, TSOState: fsm},
 		clock,
 		WithTSOCutoverFloorProvider(provider),
+		WithTSOPhaseDActivationGate(&testPhaseDGate{}),
 	)
 	require.NoError(t, err)
 
@@ -213,11 +214,12 @@ func TestRaftTSOAllocatorRejectsTermChangeAfterPhaseDMarker(t *testing.T) {
 	require.Zero(t, fsm.AllocationFloor())
 
 	payloads := engine.proposedPayloads()
-	require.Len(t, payloads, 2)
+	require.Len(t, payloads, 3)
 	require.Equal(t, []byte(tsoCutoverEnvelope), payloads[0])
-	require.True(t, bytes.HasPrefix(payloads[1], []byte(tsoPhaseDEnvelope)))
+	require.Equal(t, marshalTSOPendingPhaseD(fsm.PhaseDFloor()), payloads[1])
+	require.True(t, bytes.HasPrefix(payloads[2], []byte(tsoPhaseDEnvelope)))
 	require.Greater(t, fsm.PhaseDFloor(), uint64(0))
-	require.Equal(t, marshalTSOPhaseD(fsm.PhaseDFloor()), payloads[1])
+	require.Equal(t, marshalTSOPhaseD(fsm.PhaseDFloor()), payloads[2])
 }
 
 func TestRaftTSOAllocatorCommitsCutoverBeforeProductionWindow(t *testing.T) {
@@ -257,6 +259,7 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 		&ShardGroup{Engine: engine, TSOState: fsm},
 		clock,
 		WithTSOCutoverFloorProvider(provider),
+		WithTSOPhaseDActivationGate(&testPhaseDGate{}),
 	)
 	require.NoError(t, err)
 
@@ -269,10 +272,11 @@ func TestRaftTSOAllocatorCommitsPhaseDBeforeWindowAndValidatesRange(t *testing.T
 	require.Greater(t, reservation.Base, reservation.PhaseDFloor)
 
 	payloads := engine.proposedPayloads()
-	require.Len(t, payloads, 3)
+	require.Len(t, payloads, 4)
 	require.Equal(t, []byte(tsoCutoverEnvelope), payloads[0])
-	require.Equal(t, marshalTSOPhaseD(reservation.Base-1), payloads[1])
-	require.True(t, bytes.HasPrefix(payloads[2], []byte(tsoAllocationFloorEnvelope)))
+	require.Equal(t, marshalTSOPendingPhaseD(reservation.Base-1), payloads[1])
+	require.Equal(t, marshalTSOPhaseD(reservation.Base-1), payloads[2])
+	require.True(t, bytes.HasPrefix(payloads[3], []byte(tsoAllocationFloorEnvelope)))
 
 	end := reservation.Base + positiveIntToUint64(reservation.Count) - 1
 	require.NoError(t, alloc.ValidateDurableTimestamp(context.Background(), reservation.Base))
@@ -299,6 +303,7 @@ func TestRaftTSOAllocatorPhaseDReservationsFollowWallClockJump(t *testing.T) {
 		&ShardGroup{Engine: engine, TSOState: fsm},
 		clock,
 		WithTSOCutoverFloorProvider(provider),
+		WithTSOPhaseDActivationGate(&testPhaseDGate{}),
 	)
 	require.NoError(t, err)
 
@@ -361,6 +366,7 @@ func TestRaftTSOAllocatorResamplesCommitFloorWhenActivatingPhaseDInInitializedTe
 		clock,
 		WithTSOCutoverFloorProvider(provider),
 	)
+	alloc.phaseDGate = &testPhaseDGate{}
 	require.NoError(t, err)
 
 	_, err = alloc.Next(context.Background())
@@ -862,7 +868,8 @@ type recordingTSOFloorProvider struct {
 
 func newTestRaftTSOAllocator(group *ShardGroup, clock *HLC) (*RaftTSOAllocator, error) {
 	return NewRaftTSOAllocator(group, clock,
-		WithTSOCutoverFloorProvider(&recordingTSOFloorProvider{}))
+		WithTSOCutoverFloorProvider(&recordingTSOFloorProvider{}),
+		WithTSOPhaseDActivationGate(&testPhaseDGate{}))
 }
 
 func (p *recordingTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {

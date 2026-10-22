@@ -261,6 +261,80 @@ func TestDistributionServerValidateTimestamp(t *testing.T) {
 	require.Equal(t, codes.OutOfRange, status.Code(err))
 }
 
+type pendingResolutionAllocator struct {
+	*distributionTSOAllocator
+	pendingFloor uint64
+}
+
+func (a *pendingResolutionAllocator) ValidateDurableTimestamp(ctx context.Context, timestamp uint64) error {
+	if !a.phaseD {
+		return kv.ErrTSOPhaseDInactive
+	}
+	return a.distributionTSOAllocator.ValidateDurableTimestamp(ctx, timestamp)
+}
+
+func (a *pendingResolutionAllocator) ValidateLegacyResolutionTimestamps(_ context.Context, start, commit uint64) error {
+	if a.phaseD {
+		return kv.ErrTSOPhaseDInactive
+	}
+	if start == 0 || start >= commit || (a.pendingFloor != 0 && commit > a.pendingFloor) {
+		return kv.ErrTSOTimestampInvalid
+	}
+	return nil
+}
+
+func TestDistributionServerPendingLegacyResolutionMode(t *testing.T) {
+	alloc := &pendingResolutionAllocator{distributionTSOAllocator: &distributionTSOAllocator{leader: true}, pendingFloor: 100}
+	s := NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(alloc))
+	ctx := context.Background()
+	resp, err := s.ValidateTimestamp(ctx, &pb.ValidateTimestampRequest{Timestamp: 100, StartTimestamp: 50, LegacyResolution: true})
+	require.NoError(t, err)
+	require.True(t, resp.GetValid())
+	require.True(t, resp.GetLegacyResolutionValidated())
+	require.False(t, resp.GetPhaseDActive())
+	for _, req := range []*pb.ValidateTimestampRequest{
+		{Timestamp: 100, LegacyResolution: true},
+		{Timestamp: 100, StartTimestamp: 100, LegacyResolution: true},
+		{Timestamp: 101, StartTimestamp: 50, LegacyResolution: true},
+		{Timestamp: 100, StartTimestamp: 50},
+	} {
+		_, err := s.ValidateTimestamp(ctx, req)
+		require.Equal(t, codes.InvalidArgument, status.Code(err))
+	}
+	_, err = s.ValidateTimestamp(ctx, &pb.ValidateTimestampRequest{Timestamp: 100})
+	require.Error(t, err, "ordinary validation must remain closed before M7")
+	alloc.pendingFloor = 0
+	resp, err = s.ValidateTimestamp(ctx, &pb.ValidateTimestampRequest{Timestamp: 101, StartTimestamp: 50, LegacyResolution: true})
+	require.NoError(t, err, "pre-pending drain must admit existing resolutions above the future barrier")
+	require.True(t, resp.GetLegacyResolutionValidated())
+	alloc.phaseD = true
+	_, err = s.ValidateTimestamp(ctx, &pb.ValidateTimestampRequest{Timestamp: 100, StartTimestamp: 50, LegacyResolution: true})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+func TestDistributionServerPendingLegacyResolutionRoutedWrappers(t *testing.T) {
+	alloc := &pendingResolutionAllocator{distributionTSOAllocator: &distributionTSOAllocator{leader: true}, pendingFloor: 100}
+	addr := serveDistributionTestServer(t, NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(alloc)))
+	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView{addr: addr})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, routed.Close()) })
+	batch, err := kv.NewBatchAllocator(routed, 2)
+	require.NoError(t, err)
+	dynamic := kv.NewDynamicTimestampAllocator(batch)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	require.ErrorIs(t, dynamic.ValidateDurableTimestamp(ctx, 100), kv.ErrTSOPhaseDInactive)
+	require.NoError(t, dynamic.ValidateLegacyResolutionTimestamps(ctx, 50, 100))
+	require.NoError(t, ctx.Err(), "inactive must not consume the retry budget before resolution")
+	require.Error(t, batch.ValidateLegacyResolutionTimestamps(context.Background(), 50, 101))
+}
+
+func TestDistributionServerPendingLegacyResolutionRejectsUnsupportedAllocator(t *testing.T) {
+	s := NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(&distributionTSOAllocator{}))
+	_, err := s.ValidateTimestamp(context.Background(), &pb.ValidateTimestampRequest{Timestamp: 100, StartTimestamp: 50, LegacyResolution: true})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
 func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
 	serverAlloc := &distributionTSOAllocator{
 		base:        701,
@@ -402,7 +476,7 @@ func TestDistributionServerGetTimestamp_LeaderRoutedActivatesCutover(t *testing.
 	require.True(t, serverAlloc.activate)
 }
 
-func serveDistributionTestServer(t *testing.T, server *DistributionServer) string {
+func serveDistributionTestServer(t *testing.T, server pb.DistributionServer) string {
 	t.Helper()
 	listener, err := new(net.ListenConfig).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -419,6 +493,22 @@ func serveDistributionTestServer(t *testing.T, server *DistributionServer) strin
 		}
 	})
 	return listener.Addr().String()
+}
+
+type legacyIgnoringTimestampValidationServer struct {
+	pb.UnimplementedDistributionServer
+}
+
+func (legacyIgnoringTimestampValidationServer) ValidateTimestamp(context.Context, *pb.ValidateTimestampRequest) (*pb.ValidateTimestampResponse, error) {
+	return &pb.ValidateTimestampResponse{Valid: true, PhaseDActive: true}, nil
+}
+
+func TestDistributionServerPendingLegacyResolutionRejectsOldModeIgnoringServer(t *testing.T) {
+	addr := serveDistributionTestServer(t, legacyIgnoringTimestampValidationServer{})
+	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView{addr: addr})
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, routed.Close()) })
+	require.ErrorIs(t, routed.ValidateLegacyResolutionTimestamps(context.Background(), 50, 100), kv.ErrTSOProtocolUnsupported)
 }
 
 func TestNewDistributionServer_DefaultCatalogReloadRetryPolicy(t *testing.T) {

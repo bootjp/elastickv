@@ -19,13 +19,14 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	Internal_Forward_FullMethodName               = "/Internal/Forward"
-	Internal_ForwardAdminProposal_FullMethodName  = "/Internal/ForwardAdminProposal"
-	Internal_ForwardLeaseRead_FullMethodName      = "/Internal/ForwardLeaseRead"
-	Internal_RelayPublish_FullMethodName          = "/Internal/RelayPublish"
-	Internal_ExportRangeVersions_FullMethodName   = "/Internal/ExportRangeVersions"
-	Internal_ImportRangeVersions_FullMethodName   = "/Internal/ImportRangeVersions"
-	Internal_PromoteStagedVersions_FullMethodName = "/Internal/PromoteStagedVersions"
+	Internal_Forward_FullMethodName                 = "/Internal/Forward"
+	Internal_ForwardAdminProposal_FullMethodName    = "/Internal/ForwardAdminProposal"
+	Internal_ForwardLeaseRead_FullMethodName        = "/Internal/ForwardLeaseRead"
+	Internal_GetPrepareEvidenceState_FullMethodName = "/Internal/GetPrepareEvidenceState"
+	Internal_RelayPublish_FullMethodName            = "/Internal/RelayPublish"
+	Internal_ExportRangeVersions_FullMethodName     = "/Internal/ExportRangeVersions"
+	Internal_ImportRangeVersions_FullMethodName     = "/Internal/ImportRangeVersions"
+	Internal_PromoteStagedVersions_FullMethodName   = "/Internal/PromoteStagedVersions"
 )
 
 // InternalClient is the client API for Internal service.
@@ -36,6 +37,7 @@ type InternalClient interface {
 	Forward(ctx context.Context, in *ForwardRequest, opts ...grpc.CallOption) (*ForwardResponse, error)
 	ForwardAdminProposal(ctx context.Context, in *ForwardAdminProposalRequest, opts ...grpc.CallOption) (*ForwardAdminProposalResponse, error)
 	ForwardLeaseRead(ctx context.Context, in *ForwardLeaseReadRequest, opts ...grpc.CallOption) (*ForwardLeaseReadResponse, error)
+	GetPrepareEvidenceState(ctx context.Context, in *PrepareEvidenceStateRequest, opts ...grpc.CallOption) (*PrepareEvidenceStateResponse, error)
 	RelayPublish(ctx context.Context, in *RelayPublishRequest, opts ...grpc.CallOption) (*RelayPublishResponse, error)
 	ExportRangeVersions(ctx context.Context, in *ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[ExportRangeVersionsResponse], error)
 	ImportRangeVersions(ctx context.Context, in *ImportRangeVersionsRequest, opts ...grpc.CallOption) (*ImportRangeVersionsResponse, error)
@@ -74,6 +76,16 @@ func (c *internalClient) ForwardLeaseRead(ctx context.Context, in *ForwardLeaseR
 	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
 	out := new(ForwardLeaseReadResponse)
 	err := c.cc.Invoke(ctx, Internal_ForwardLeaseRead_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
+func (c *internalClient) GetPrepareEvidenceState(ctx context.Context, in *PrepareEvidenceStateRequest, opts ...grpc.CallOption) (*PrepareEvidenceStateResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PrepareEvidenceStateResponse)
+	err := c.cc.Invoke(ctx, Internal_GetPrepareEvidenceState_FullMethodName, in, out, cOpts...)
 	if err != nil {
 		return nil, err
 	}
@@ -137,6 +149,7 @@ type InternalServer interface {
 	Forward(context.Context, *ForwardRequest) (*ForwardResponse, error)
 	ForwardAdminProposal(context.Context, *ForwardAdminProposalRequest) (*ForwardAdminProposalResponse, error)
 	ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error)
+	GetPrepareEvidenceState(context.Context, *PrepareEvidenceStateRequest) (*PrepareEvidenceStateResponse, error)
 	RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error)
 	ExportRangeVersions(*ExportRangeVersionsRequest, grpc.ServerStreamingServer[ExportRangeVersionsResponse]) error
 	ImportRangeVersions(context.Context, *ImportRangeVersionsRequest) (*ImportRangeVersionsResponse, error)
@@ -159,6 +172,9 @@ func (UnimplementedInternalServer) ForwardAdminProposal(context.Context, *Forwar
 }
 func (UnimplementedInternalServer) ForwardLeaseRead(context.Context, *ForwardLeaseReadRequest) (*ForwardLeaseReadResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method ForwardLeaseRead not implemented")
+}
+func (UnimplementedInternalServer) GetPrepareEvidenceState(context.Context, *PrepareEvidenceStateRequest) (*PrepareEvidenceStateResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method GetPrepareEvidenceState not implemented")
 }
 func (UnimplementedInternalServer) RelayPublish(context.Context, *RelayPublishRequest) (*RelayPublishResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RelayPublish not implemented")
@@ -247,6 +263,24 @@ func _Internal_ForwardLeaseRead_Handler(srv interface{}, ctx context.Context, de
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Internal_GetPrepareEvidenceState_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PrepareEvidenceStateRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(InternalServer).GetPrepareEvidenceState(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Internal_GetPrepareEvidenceState_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(InternalServer).GetPrepareEvidenceState(ctx, req.(*PrepareEvidenceStateRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 func _Internal_RelayPublish_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
 	in := new(RelayPublishRequest)
 	if err := dec(in); err != nil {
@@ -330,6 +364,10 @@ var Internal_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "ForwardLeaseRead",
 			Handler:    _Internal_ForwardLeaseRead_Handler,
+		},
+		{
+			MethodName: "GetPrepareEvidenceState",
+			Handler:    _Internal_GetPrepareEvidenceState_Handler,
 		},
 		{
 			MethodName: "RelayPublish",

@@ -8,6 +8,7 @@ import (
 	"sync"
 	"sync/atomic"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -109,9 +110,10 @@ type kvFSMSnapshot struct {
 	// useV2 records the v1/v2 selection made at construction time so a
 	// concurrent sidecar mutation after Snapshot() returns cannot flip
 	// the format mid-write.
-	useV2 bool
-	once  sync.Once
-	err   error
+	useV2      bool
+	checkpoint encryption.SnapshotCheckpoint
+	once       sync.Once
+	err        error
 }
 
 func (f *kvFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
@@ -133,8 +135,8 @@ func (f *kvFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 // and returns the populated prefix length. v2 emits the minimum payload
 // (ceiling+cutover) — forward-compat trailing bytes are a reader-side
 // concern; the writer never emits unused trailing slots.
-func (f *kvFSMSnapshot) encodeHeader() ([hlcSnapshotV2HeaderLen]byte, int) {
-	var hdr [hlcSnapshotV2HeaderLen]byte
+func (f *kvFSMSnapshot) encodeHeader() ([snapshotCheckpointHeaderLen]byte, int) {
+	var hdr [snapshotCheckpointHeaderLen]byte
 	if !f.useV2 {
 		copy(hdr[:8], hlcSnapshotMagic[:])
 		binary.BigEndian.PutUint64(hdr[8:16], uint64(f.ceilingMs)) //nolint:gosec // ceiling is a Unix ms timestamp, always positive
@@ -144,6 +146,13 @@ func (f *kvFSMSnapshot) encodeHeader() ([hlcSnapshotV2HeaderLen]byte, int) {
 	binary.BigEndian.PutUint16(hdr[8:10], uint16(hlcSnapshotV2MinPayload))
 	binary.BigEndian.PutUint64(hdr[10:18], uint64(f.ceilingMs)) //nolint:gosec // same as v1
 	binary.BigEndian.PutUint64(hdr[18:26], f.cutover)
+	if f.checkpoint.Index != 0 {
+		binary.BigEndian.PutUint16(hdr[8:10], uint16(hlcSnapshotV2MinPayload+encryptionCheckpointBytes))
+		copy(hdr[26:34], encryptionCheckpointMagic)
+		binary.BigEndian.PutUint64(hdr[34:42], f.checkpoint.Index)
+		copy(hdr[42:74], f.checkpoint.State[:])
+		return hdr, snapshotCheckpointHeaderLen
+	}
 	return hdr, hlcSnapshotV2HeaderLen
 }
 
@@ -185,6 +194,11 @@ func (f *kvFSMSnapshot) closeSnapshot() error {
 //   - Anything else (including streams shorter than 8 bytes): (0, 0, nil)
 //     and ALL bytes left in the *bufio.Reader for the inner-store path.
 func ReadSnapshotHeader(r *bufio.Reader) (ceiling, cutover uint64, err error) {
+	ceiling, cutover, _, err = ReadSnapshotHeaderWithCheckpoint(r)
+	return ceiling, cutover, err
+}
+
+func ReadSnapshotHeaderWithCheckpoint(r *bufio.Reader) (ceiling, cutover uint64, checkpoint encryption.SnapshotCheckpoint, err error) {
 	// Step 0: peek up to 8 bytes. Short streams (< 8 bytes) fall through
 	// to the headerless-legacy branch with the partial bytes left in
 	// place — this preserves TestFSMSnapshotRestoreSmallLegacy and is
@@ -197,25 +211,26 @@ func ReadSnapshotHeader(r *bufio.Reader) (ceiling, cutover uint64, err error) {
 	peeked, perr := r.Peek(8) //nolint:mnd
 	if len(peeked) < 8 {      //nolint:mnd
 		if perr != nil && !errors.Is(perr, io.EOF) && !errors.Is(perr, io.ErrUnexpectedEOF) {
-			return 0, 0, errors.Wrap(perr, "snapshot header: peek")
+			return 0, 0, checkpoint, errors.Wrap(perr, "snapshot header: peek")
 		}
 		// io.EOF / io.ErrUnexpectedEOF on a short stream: treat as
 		// headerless legacy. Bytes that were peeked stay in r per
 		// bufio.Reader semantics.
-		return 0, 0, nil
+		return 0, 0, checkpoint, nil
 	}
 
 	switch {
 	case isV2Magic(peeked):
 		return readV2(r)
 	case isV1Magic(peeked):
-		return readV1(r)
+		ceiling, err = readV1(r)
+		return ceiling, 0, checkpoint, err
 	case isUnknownEKVTHLC(peeked):
-		return 0, 0, ErrSnapshotHeaderUnknownMagic
+		return 0, 0, checkpoint, ErrSnapshotHeaderUnknownMagic
 	default:
 		// Headerless legacy: leave the peeked bytes in r so the
 		// inner-store path sees the payload from byte 0.
-		return 0, 0, nil
+		return 0, 0, checkpoint, nil
 	}
 }
 
@@ -245,28 +260,29 @@ func isUnknownEKVTHLC(p []byte) bool {
 		p[6] == hlcSnapshotMagicPrefix[6]
 }
 
-func readV1(r *bufio.Reader) (uint64, uint64, error) {
+func readV1(r *bufio.Reader) (uint64, error) {
 	var rest [16]byte //nolint:mnd
 	if _, err := io.ReadFull(r, rest[:]); err != nil {
-		return 0, 0, errors.Wrap(err, "v1 header: read magic+ceiling")
+		return 0, errors.Wrap(err, "v1 header: read magic+ceiling")
 	}
 	ceiling := binary.BigEndian.Uint64(rest[8:16])
-	return ceiling, 0, nil
+	return ceiling, nil
 }
 
-func readV2(r *bufio.Reader) (uint64, uint64, error) {
+func readV2(r *bufio.Reader) (uint64, uint64, encryption.SnapshotCheckpoint, error) {
+	var checkpoint encryption.SnapshotCheckpoint
 	// Consume the 8 magic bytes.
 	if _, err := r.Discard(8); err != nil { //nolint:mnd
-		return 0, 0, errors.Wrap(err, "v2 header: discard magic")
+		return 0, 0, checkpoint, errors.Wrap(err, "v2 header: discard magic")
 	}
 	// Read the 2-byte length prefix.
 	var lenBuf [hlcSnapshotV2LenBytes]byte
 	if _, err := io.ReadFull(r, lenBuf[:]); err != nil {
-		return 0, 0, errors.Wrap(err, "v2 header: read length prefix")
+		return 0, 0, checkpoint, errors.Wrap(err, "v2 header: read length prefix")
 	}
 	plen := int(binary.BigEndian.Uint16(lenBuf[:]))
 	if plen < hlcSnapshotV2MinPayload || plen > maxSnapshotHeaderPayload {
-		return 0, 0, ErrSnapshotHeaderInvalidLength
+		return 0, 0, checkpoint, ErrSnapshotHeaderInvalidLength
 	}
 	// Read exactly plen payload bytes. Parse ceiling/cutover from the
 	// first 16; ignore the remainder (forward-compat extension area).
@@ -276,9 +292,10 @@ func readV2(r *bufio.Reader) (uint64, uint64, error) {
 	var buf [maxSnapshotHeaderPayload]byte
 	payload := buf[:plen]
 	if _, err := io.ReadFull(r, payload); err != nil {
-		return 0, 0, errors.Wrap(err, "v2 header: read payload")
+		return 0, 0, checkpoint, errors.Wrap(err, "v2 header: read payload")
 	}
 	ceiling := binary.BigEndian.Uint64(payload[0:8])
 	cutover := binary.BigEndian.Uint64(payload[8:16])
-	return ceiling, cutover, nil
+	checkpoint, err := decodeSnapshotCheckpoint(payload)
+	return ceiling, cutover, checkpoint, err
 }

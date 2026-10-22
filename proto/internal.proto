@@ -8,6 +8,7 @@ service Internal {
   rpc Forward(ForwardRequest) returns (ForwardResponse) {}
   rpc ForwardAdminProposal(ForwardAdminProposalRequest) returns (ForwardAdminProposalResponse) {}
   rpc ForwardLeaseRead(ForwardLeaseReadRequest) returns (ForwardLeaseReadResponse) {}
+  rpc GetPrepareEvidenceState(PrepareEvidenceStateRequest) returns (PrepareEvidenceStateResponse) {}
   rpc RelayPublish(RelayPublishRequest) returns (RelayPublishResponse) {}
   rpc ExportRangeVersions(ExportRangeVersionsRequest) returns (stream ExportRangeVersionsResponse) {}
   rpc ImportRangeVersions(ImportRangeVersionsRequest) returns (ImportRangeVersionsResponse) {}
@@ -74,6 +75,10 @@ message Request {
   // checks only for those exact point mutations; prefixes and unmarked keys
   // still fail closed.
   repeated bytes write_fence_bypass_keys = 7;
+  // timestamp_admission_floor identifies the data group's durable Phase-D
+  // creation epoch. Producers set it only after validating the unchanged
+  // persistence timestamp against the durable TSO allocation range.
+  uint64 timestamp_admission_floor = 8;
 }
 
 message RaftCommand {
@@ -105,6 +110,22 @@ message ForwardLeaseReadRequest {}
 message ForwardLeaseReadResponse {
   uint64 applied_index = 1;
   uint64 last_commit_ts = 2;
+}
+
+message PrepareEvidenceStateRequest {
+  uint64 floor = 1;
+  // Capability probes are read-only and may be answered by any replica.
+  bool capability_only = 2;
+}
+
+message PrepareEvidenceStateResponse {
+  bool supported = 1;
+  bool proof_enabled = 2;
+  bool unproven_locks = 3;
+  uint64 fence_floor = 4;
+  uint64 applied_index = 5;
+  bool cutover_applied = 6;
+  bool dedicated_tso_configured = 7;
 }
 
 message RelayPublishRequest {

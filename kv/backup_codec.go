@@ -11,11 +11,14 @@ import (
 const (
 	raftEncodeBackup byte = 0x0e
 
-	backupSubtypePin       byte = 0x01
-	backupSubtypeExtend    byte = 0x02
-	backupSubtypeRelease   byte = 0x03
-	backupSubtypeReserve   byte = 0x04
-	backupSubtypeUnreserve byte = 0x05
+	backupSubtypePin             byte = 0x01
+	backupSubtypeExtend          byte = 0x02
+	backupSubtypeRelease         byte = 0x03
+	backupSubtypeReserve         byte = 0x04
+	backupSubtypeUnreserve       byte = 0x05
+	backupSubtypePrepareEvidence byte = 0x06
+	backupSubtypePrepareSeal     byte = 0x07
+	backupSubtypePrepareRelease  byte = 0x08
 
 	backupPinIDBytes = 16
 	backupUint64Size = 8
@@ -63,10 +66,29 @@ type BackupReserveEntry = BackupPinEntry
 type BackupUnreserveEntry = BackupReleaseEntry
 
 type backupEntry struct {
-	subtype byte
-	pin     BackupPinEntry
-	extend  BackupExtendEntry
-	release BackupReleaseEntry
+	subtype      byte
+	pin          BackupPinEntry
+	extend       BackupExtendEntry
+	release      BackupReleaseEntry
+	prepareFloor uint64
+}
+
+// EncodePrepareEvidenceFence enables durable PREPARE evidence after protocol
+// negotiation. A nonzero floor also seals all new writes at or below the cut.
+func EncodePrepareEvidenceFence(floor uint64) []byte {
+	out := []byte{raftEncodeBackup, backupSubtypePrepareEvidence}
+	return binary.BigEndian.AppendUint64(out, floor)
+}
+
+// EncodePrepareEvidenceSeal stops new write creation at the data FSM while
+// retaining existing transaction resolution during the final cutover fence.
+func EncodePrepareEvidenceSeal() []byte {
+	return []byte{raftEncodeBackup, backupSubtypePrepareSeal}
+}
+
+// EncodePrepareEvidenceRelease reopens creation strictly above the Phase-D floor.
+func EncodePrepareEvidenceRelease(floor uint64) []byte {
+	return binary.BigEndian.AppendUint64([]byte{raftEncodeBackup, backupSubtypePrepareRelease}, floor)
 }
 
 func EncodeBackupPinEntry(entry BackupPinEntry) []byte {
@@ -120,6 +142,8 @@ func decodeBackupPayload(data []byte) (backupEntry, error) {
 		return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
 	}
 	switch data[0] {
+	case backupSubtypePrepareEvidence, backupSubtypePrepareSeal, backupSubtypePrepareRelease:
+		return decodePrepareEvidenceFencePayload(data)
 	case backupSubtypePin, backupSubtypeReserve:
 		if len(data) != backupPinEntryLen-1 {
 			return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
@@ -162,6 +186,19 @@ func decodeBackupPayload(data []byte) (backupEntry, error) {
 	default:
 		return backupEntry{}, errors.WithStack(ErrBackupWireSubtype)
 	}
+}
+
+func decodePrepareEvidenceFencePayload(data []byte) (backupEntry, error) {
+	if data[0] == backupSubtypePrepareSeal {
+		if len(data) != 1 {
+			return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
+		}
+		return backupEntry{subtype: data[0]}, nil
+	}
+	if len(data) != 1+backupUint64Size {
+		return backupEntry{}, errors.WithStack(ErrBackupWireMalformed)
+	}
+	return backupEntry{subtype: data[0], prepareFloor: binary.BigEndian.Uint64(data[1:])}, nil
 }
 
 func backupDeadlineMillis(deadline time.Time) uint64 {

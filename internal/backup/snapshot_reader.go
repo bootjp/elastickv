@@ -272,6 +272,7 @@ var pebbleOperationalKeys = [][]byte{
 	[]byte("_meta_min_retained_ts"),
 	[]byte("_meta_pending_min_retained_ts"),
 	[]byte("_meta_applied_index"),
+	[]byte("_meta_encryption_snapshot_checkpoint"),
 	[]byte("_migack"),
 	[]byte("_mighlc"),
 	[]byte("_migpromote"),

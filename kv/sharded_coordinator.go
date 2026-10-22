@@ -975,6 +975,7 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 				g.Txn = &leaseRefreshingTxn{inner: g.Txn, g: g, coord: c}
 			}
 		}
+		c.configureTimestampAdmissionForGroup(g)
 		router.Register(gid, g.Txn, g.Store)
 		// Resolve the optional LeaseProvider capability once so
 		// groupLeaseRead / maybeRefresh test g.lp for nil instead of
@@ -2051,7 +2052,10 @@ type preparedGroup struct {
 }
 
 func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS uint64, primaryKey []byte, grouped map[uint64][]*pb.Mutation, gids []uint64, groupedReadKeys map[uint64][][]byte, observedRouteVersion uint64, bypassKeysByGroup map[uint64][][]byte) ([]preparedGroup, error) {
-	prepareMeta := txnMetaMutation(primaryKey, defaultTxnLockTTLms, 0)
+	prepareMetas, err := c.prepareEvidenceMetas(ctx, primaryKey, commitTS, gids)
+	if err != nil {
+		return nil, err
+	}
 	prepared := make([]preparedGroup, 0, len(gids))
 
 	for _, gid := range gids {
@@ -2063,7 +2067,7 @@ func (c *ShardedCoordinator) prewriteTxn(ctx context.Context, startTS, commitTS 
 			IsTxn:                true,
 			Phase:                pb.Phase_PREPARE,
 			Ts:                   startTS,
-			Mutations:            append([]*pb.Mutation{prepareMeta}, grouped[gid]...),
+			Mutations:            append([]*pb.Mutation{prepareMetas[gid]}, grouped[gid]...),
 			ReadKeys:             groupedReadKeys[gid],
 			ObservedRouteVersion: observedRouteVersion,
 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
@@ -3267,7 +3271,11 @@ func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[O
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
-	return buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion, bypassKeysByGroup)
+	logs, err := buildTxnLogs(reqs.StartTS, commitTS, grouped, gids, reqs.ObservedRouteVersion, bypassKeysByGroup)
+	if err != nil {
+		return nil, err
+	}
+	return c.bindTxnLogPrepareEvidence(ctx, logs, commitTS, gids)
 }
 
 // observeMutation: counted pre-commit, so a mutation that subsequently

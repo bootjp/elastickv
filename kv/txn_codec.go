@@ -13,6 +13,7 @@ const (
 	txnMetaVersion     byte = 1
 	txnMetaVersionV1   byte = txnMetaVersion
 	txnMetaVersionV2   byte = 2
+	txnMetaVersionV3   byte = 3
 	txnLockVersion     byte = 1
 	txnIntentVersion   byte = 1
 	txnCommitVersion   byte = 1
@@ -20,7 +21,10 @@ const (
 	txnReadChunkSize        = 4096
 )
 
-const txnLockFlagPrimary byte = 0x01
+const (
+	txnLockFlagPrimary  byte = 0x01
+	txnLockFlagCommitTS byte = 0x02
+)
 
 const (
 	txnMetaFlagLockTTL      byte = 0x01
@@ -50,9 +54,17 @@ type TxnMeta struct {
 	LockTTLms    uint64
 	CommitTS     uint64
 	PrevCommitTS uint64
+	// PrepareCommitTS binds a PREPARE to its chosen commit timestamp. V3 is
+	// emitted only after all replicas support durable prepare evidence.
+	PrepareCommitTS uint64
 }
 
 func EncodeTxnMeta(m TxnMeta) []byte {
+	if m.PrepareCommitTS != 0 {
+		encoded := encodeTxnMetaV2(m)
+		encoded[0] = txnMetaVersionV3
+		return binary.BigEndian.AppendUint64(encoded, m.PrepareCommitTS)
+	}
 	// Keep v1 as the default wire format until the cluster can guarantee that
 	// every node understands v2 during rolling upgrades. The only field that
 	// requires v2 is PrevCommitTS (the one-phase dedup probe), which is set
@@ -120,6 +132,19 @@ func DecodeTxnMeta(b []byte) (TxnMeta, error) {
 		return decodeTxnMetaV1(b)
 	case txnMetaVersionV2:
 		return decodeTxnMetaV2(b)
+	case txnMetaVersionV3:
+		if len(b) < txnMetaHeaderSize+2*uint64FieldSize {
+			return TxnMeta{}, errors.New("txn meta: prepared commit timestamp truncated")
+		}
+		meta, err := decodeTxnMetaV2(b[:len(b)-uint64FieldSize])
+		if err != nil {
+			return TxnMeta{}, err
+		}
+		meta.PrepareCommitTS = binary.BigEndian.Uint64(b[len(b)-uint64FieldSize:])
+		if meta.PrepareCommitTS == 0 {
+			return TxnMeta{}, errors.Wrap(ErrTxnInvalidMeta, "txn meta: prepared commit timestamp is zero")
+		}
+		return meta, nil
 	default:
 		return TxnMeta{}, errors.WithStack(errors.Newf("txn meta: unsupported version %d", b[0]))
 	}
@@ -222,6 +247,7 @@ func optionalV2Fields(m *TxnMeta) []struct {
 
 type txnLock struct {
 	StartTS      uint64
+	CommitTS     uint64
 	TTLExpireAt  uint64
 	PrimaryKey   []byte
 	IsPrimaryKey bool
@@ -230,6 +256,9 @@ type txnLock struct {
 func encodeTxnLock(l txnLock) []byte {
 	// version(1) + StartTS(8) + TTLExpireAt(8) + flags(1) + primaryLen(8) + primaryKey
 	size := 1 + uint64FieldSize + uint64FieldSize + 1 + uint64FieldSize + len(l.PrimaryKey)
+	if l.CommitTS != 0 {
+		size += uint64FieldSize
+	}
 	b := make([]byte, size)
 	b[0] = txnLockVersion
 	binary.BigEndian.PutUint64(b[1:], l.StartTS)
@@ -237,6 +266,10 @@ func encodeTxnLock(l txnLock) []byte {
 	var flags byte
 	if l.IsPrimaryKey {
 		flags |= txnLockFlagPrimary
+	}
+	if l.CommitTS != 0 {
+		flags |= txnLockFlagCommitTS
+		binary.BigEndian.PutUint64(b[size-uint64FieldSize:], l.CommitTS)
 	}
 	b[17] = flags
 	binary.BigEndian.PutUint64(b[18:], uint64(len(l.PrimaryKey)))
@@ -272,12 +305,28 @@ func decodeTxnLock(b []byte) (txnLock, error) {
 	if err != nil {
 		return txnLock{}, err
 	}
-	return txnLock{
+	lock := txnLock{
 		StartTS:      startTS,
 		TTLExpireAt:  ttlExpireAt,
 		PrimaryKey:   primaryKey,
 		IsPrimaryKey: (flags & txnLockFlagPrimary) != 0,
-	}, nil
+	}
+	if flags&txnLockFlagCommitTS != 0 {
+		return decodeTxnLockCommitEvidence(r, lock)
+	}
+	return lock, nil
+}
+
+func decodeTxnLockCommitEvidence(r *bytes.Reader, lock txnLock) (txnLock, error) {
+	commitTS, err := readTxnUint64(r, "txn lock: commit ts truncated")
+	if err != nil {
+		return txnLock{}, err
+	}
+	if commitTS <= lock.StartTS || r.Len() != 0 {
+		return txnLock{}, errors.Wrap(ErrTxnInvalidMeta, "txn lock: invalid prepared commit timestamp")
+	}
+	lock.CommitTS = commitTS
+	return lock, nil
 }
 
 type txnIntent struct {

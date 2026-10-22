@@ -97,7 +97,7 @@ func (d *DynamoDBServer) startLegacyTableKeyMigration(
 	}
 	req.StartTS = readTS
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err != nil {
+	if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err != nil {
 		return errors.WithStack(err)
 	}
 	return nil
@@ -186,7 +186,7 @@ func (d *DynamoDBServer) migrateLegacyItem(
 		req.StartTS = readTS
 		req.ReadKeys = append(req.ReadKeys, sealKey)
 		dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-		if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err == nil {
+		if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err == nil {
 			return nil
 		} else if !isRetryableTransactWriteError(err) {
 			return errors.WithStack(err)
@@ -318,6 +318,13 @@ func (d *DynamoDBServer) finalizeLegacyTableMigration(ctx context.Context, schem
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	// As for a table delete, the old generation's cleanup slot is claimed
+	// before the schema switch can commit.
+	cleanup, ok := d.tableCleanups.reserve()
+	if !ok {
+		return errors.WithStack(ErrDynamoServerStopping)
+	}
+	defer cleanup.release()
 	readTimestamp, err := d.beginTxnReadTimestamp(ctx, "dynamodb finalize migration: begin read timestamp", dynamoTableMetaKey(schema.TableName))
 	if err != nil {
 		return errors.WithStack(err)
@@ -331,9 +338,9 @@ func (d *DynamoDBServer) finalizeLegacyTableMigration(ctx context.Context, schem
 		},
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
-	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, d.coordinator, req); err != nil {
+	if _, err := d.dispatchWriteWithReadTimestamp(dispatchCtx, req); err != nil {
 		return errors.WithStack(err)
 	}
-	d.launchDeletedTableCleanup(schema.TableName, oldGeneration)
+	d.launchDeletedTableCleanup(cleanup, schema.TableName, oldGeneration)
 	return nil
 }

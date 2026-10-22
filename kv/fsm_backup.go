@@ -29,6 +29,9 @@ var backupTimestampFloorKey = []byte(txnBackupPrefix + "timestamp_floor")
 const backupTimestampFloorValueSize = 8
 
 func (f *kvFSM) applyBackup(data []byte) any {
+	if result, handled := f.applyPrepareEvidenceBackup(data); handled {
+		return result
+	}
 	if f.replicatedPins != nil && f.replicatedPins.snapshot().Pins.Epoch != 0 {
 		return errors.Wrap(ErrInvalidBackupPin, "legacy backup command rejected after epoch activation")
 	}
@@ -47,6 +50,20 @@ func (f *kvFSM) applyBackup(data []byte) any {
 		return err
 	}
 	return haltErr(errors.Wrap(errors.Mark(err, ErrBackupApply), "kv/fsm: apply backup entry"))
+}
+
+func (f *kvFSM) applyPrepareEvidenceBackup(data []byte) (any, bool) {
+	if len(data) == 0 || !isPrepareEvidenceControlSubtype(data[0]) {
+		return nil, false
+	}
+	entry, err := decodeBackupPayload(data)
+	if err == nil {
+		err = f.applyPrepareEvidenceControl(entry)
+	}
+	if err != nil {
+		return haltErr(errors.Wrap(err, "apply prepare evidence fence")), true
+	}
+	return nil, true
 }
 
 func (f *kvFSM) applyDecodedBackup(entry backupEntry) error {
@@ -98,6 +115,9 @@ func (f *kvFSM) persistBackupTimestampFloor(ctx context.Context, readTS uint64) 
 func (f *kvFSM) reloadBackupTimestampFloor(ctx context.Context) error {
 	if f == nil || f.store == nil {
 		return nil
+	}
+	if err := f.reloadPrepareEvidence(ctx); err != nil {
+		return err
 	}
 	value, err := f.store.GetAt(ctx, backupTimestampFloorKey, ^uint64(0))
 	if err != nil {

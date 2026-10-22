@@ -64,6 +64,7 @@ jobs:
           go mod download
           go build -o /tmp/elastickv-bin .
           go build -o /tmp/elastickv-admin-bin ./cmd/elastickv-admin
+          go build -o /tmp/elastickv-raftadmin-bin ./cmd/raftadmin
       - name: Warm Leiningen Maven cache
         working-directory: jepsen
         run: |
@@ -90,7 +91,8 @@ jobs:
           BOOTSTRAP_MEMBERS="n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053"
           RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
           RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
-          RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802,127.0.0.1:50053=127.0.0.1:63803"
+          # No raftDynamoMap: DynamoDB workloads must exercise follower gRPC
+          # forwarding and leader-issued seals instead of HTTP leader proxying.
           RAFT_SQS_MAP="127.0.0.1:50051=127.0.0.1:63501,127.0.0.1:50052=127.0.0.1:63502,127.0.0.1:50053=127.0.0.1:63503"
 
           # Encrypted leg: one random owner-only file KEK shared by the
@@ -132,7 +134,6 @@ jobs:
               --raftBootstrapMembers "$BOOTSTRAP_MEMBERS" \
               --raftRedisMap "$RAFT_REDIS_MAP" \
               --raftS3Map "$RAFT_S3_MAP" \
-              --raftDynamoMap "$RAFT_DYNAMO_MAP" \
               --raftSqsMap "$RAFT_SQS_MAP" \
               "${ENC_ARGS[@]}" \
               > "/tmp/elastickv-demo-n${node}.log" 2>&1 &
@@ -183,6 +184,26 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.dynamodb-workload --local --time-limit 5 --rate 5 --concurrency 5 --dynamo-ports 63801,63802,63803 --host 127.0.0.1
+      - name: Run DynamoDB seal workload with recorded leader changes
+        working-directory: jepsen
+        run: |
+          printf 'run_sha=%s\n' "$GITHUB_SHA" > /tmp/dynamodb-seal-source.txt
+          timeout 150 ~/lein run -m elastickv.dynamodb-seal-workload --local \
+            --time-limit 15 --rate 30 --concurrency 9 --max-txn-length 4 \
+            --dynamo-ports 63801,63802,63803 --host 127.0.0.1 \
+            --raftadmin-bin /tmp/elastickv-raftadmin-bin \
+            --raft-addresses 127.0.0.1:50051,127.0.0.1:50052,127.0.0.1:50053 \
+            --leader-change-interval 2
+      - name: Upload DynamoDB seal acceptance history
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: dynamodb-seal-encryption-${{ matrix.encryption }}
+          path: |
+            jepsen/store/elastickv-dynamodb-snapshot-seal/
+            /tmp/dynamodb-seal-source.txt
+          retention-days: 7
+          if-no-files-found: ignore
       - name: Run DynamoDB per-type Jepsen workloads against elastickv
         working-directory: jepsen
         timeout-minutes: 10

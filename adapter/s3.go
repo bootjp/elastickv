@@ -108,6 +108,7 @@ type S3Server struct {
 	staticCreds          map[string]string
 	readTracker          *kv.ActiveTimestampTracker
 	httpServer           *http.Server
+	httpConns            *httpConnTracker
 	cleanupSem           chan struct{}
 	putAdmission         *s3PutAdmission
 	putAdmissionObserver S3PutAdmissionObserver
@@ -120,6 +121,19 @@ type S3Server struct {
 	blobMinReplicas      int
 	blobPushBlocked      func() bool
 	blobBackfiller       *S3BlobBackfiller
+	// adminBlobUsers counts the admin object operations that may use
+	// blobCluster from outside the HTTP listener (see enterAdminBlobUse),
+	// so Stop can wait for them before closing the cluster.
+	adminBlobUsers *inflightGate
+	// cleanupWorkers counts the background cleanups (see startCleanup) so
+	// Stop can join them, bounded, before the blob cluster and the stores
+	// close underneath them.
+	cleanupWorkers   *inflightGate
+	reservedCleanups *backgroundWorkers
+	// cleanupCtx is the parent of every background cleanup's context;
+	// cancelCleanups ends it once Stop has waited its bound.
+	cleanupCtx     context.Context
+	cancelCleanups context.CancelFunc
 }
 
 type s3BucketMeta struct {
@@ -225,6 +239,11 @@ type s3BucketsCollection struct {
 type s3BucketEntry struct {
 	Name         string `xml:"Name"`
 	CreationDate string `xml:"CreationDate"`
+}
+
+type s3VersioningConfiguration struct {
+	XMLName xml.Name `xml:"VersioningConfiguration"`
+	XMLNS   string   `xml:"xmlns,attr,omitempty"`
 }
 
 type s3AccessControlPolicy struct {
@@ -362,7 +381,11 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		cleanupSem:         make(chan struct{}, s3ManifestCleanupWorkers),
 		putAdmission:       newS3PutAdmissionFromEnv(),
 		blobOffloadEnabled: S3BlobOffloadEnabledFromEnv(),
+		adminBlobUsers:     newInflightGate(),
+		cleanupWorkers:     newInflightGate(),
+		reservedCleanups:   newBackgroundWorkers(),
 	}
+	s.cleanupCtx, s.cancelCleanups = context.WithCancel(context.Background())
 	if localStores, ok := st.(S3BlobLocalStoreResolver); ok {
 		s.blobLocalStores = localStores
 	}
@@ -384,6 +407,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 	mux := http.NewServeMux()
 	mux.HandleFunc("/", s.handle)
 	s.httpServer = &http.Server{Handler: mux, ReadHeaderTimeout: time.Second}
+	s.httpConns = trackHTTPConns(s.httpServer)
 	return s
 }
 
@@ -406,15 +430,39 @@ func (s *S3Server) Run() error {
 	return nil
 }
 
+// Stop ends the background backfill, drains the HTTP listener (bounded,
+// see shutdownHTTPServer), then waits, under one more bound, for the admin
+// object operations still using the blob peer cluster (see
+// enterAdminBlobUse) and for the background cleanups those requests
+// started (see startCleanup). Only then does it close the cluster: an
+// in-flight upload or read that replicates or fetches chunk blobs through
+// it keeps its peers for the whole graceful window instead of failing at
+// once with a closed cluster, and a cleanup finishes its deletes before
+// the stores are closed after Stop. The admin operations are counted
+// separately because they reach this server through the admin listener or
+// the gRPC admin forwarder, which drain on their own; an idle S3 listener
+// finishes its drain at once.
 func (s *S3Server) Stop() {
-	if s != nil && s.blobBackfiller != nil {
+	if s == nil {
+		return
+	}
+	if s.blobBackfiller != nil {
 		s.blobBackfiller.Stop()
 	}
-	if s != nil && s.blobCluster != nil {
-		_ = s.blobCluster.Close()
+	if s.httpServer != nil {
+		shutdownHTTPServer(s.httpServer, s.httpConns, "s3")
 	}
-	if s != nil && s.httpServer != nil {
-		_ = s.httpServer.Shutdown(context.Background())
+	deadline := time.Now().Add(httpShutdownTimeout)
+	if !s.adminBlobUsers.drain(time.Until(deadline)) {
+		slog.Warn("s3 server: admin object operations still running after the shutdown bound, closing the blob cluster",
+			slog.Int64("in_flight", s.adminBlobUsers.remaining()),
+			slog.Duration("timeout", httpShutdownTimeout),
+		)
+	}
+	s.reservedCleanups.stop("s3 reserved cleanup", time.Until(deadline), s3CleanupJoinTimeout)
+	s.drainCleanups(time.Until(deadline))
+	if s.blobCluster != nil {
+		_ = s.blobCluster.Close()
 	}
 }
 
@@ -507,6 +555,14 @@ func (s *S3Server) handleRoot(w http.ResponseWriter, r *http.Request) {
 //nolint:cyclop // handleBucket routes to sub-handlers based on method+query; branching is by design.
 func (s *S3Server) handleBucket(w http.ResponseWriter, r *http.Request, bucket string) {
 	query := r.URL.Query()
+	if query.Has("versioning") {
+		if r.Method == http.MethodGet {
+			s.getBucketVersioning(w, r, bucket)
+		} else {
+			writeS3Error(w, http.StatusMethodNotAllowed, "MethodNotAllowed", "unsupported method", bucket, "")
+		}
+		return
+	}
 	if query.Has("acl") {
 		switch r.Method {
 		case http.MethodGet:
@@ -702,6 +758,25 @@ func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 	w.WriteHeader(http.StatusOK)
+}
+
+func (s *S3Server) getBucketVersioning(w http.ResponseWriter, r *http.Request, bucket string) {
+	readTS := s.readTS()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	_, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		writeS3InternalError(w, err)
+		return
+	}
+	if !exists {
+		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		return
+	}
+	// The bundled endpoint does not implement object versions. An empty
+	// VersioningConfiguration is the S3 response for an unversioned bucket.
+	writeS3XML(w, http.StatusOK, s3VersioningConfiguration{XMLNS: s3XMLNamespace})
 }
 
 func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket string) {
@@ -1144,46 +1219,12 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 	var cleanupManifest *s3ObjectManifest
 	var generation uint64
 	err := s.retryS3Mutation(r.Context(), func() error {
-		readTS := s.readTS()
-		readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
+		manifest, objectGeneration, err := s.deleteObjectAttempt(r, bucket, objectKey)
 		if err != nil {
-			return errors.Wrap(err, "s3: allocate startTS for mutation")
-		}
-		readTS = readTimestamp.Timestamp()
-		startTS := readTS
-		readPin := s.pinReadTS(readTS)
-		defer readPin.Release()
-
-		meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !exists || meta == nil {
-			return &s3ResponseError{
-				Status:  http.StatusNotFound,
-				Code:    "NoSuchBucket",
-				Message: "bucket not found",
-				Bucket:  bucket,
-				Key:     objectKey,
-			}
-		}
-
-		headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
-		manifest, found, err := s.loadObjectManifestAt(r.Context(), headKey, readTS)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		if !found {
-			cleanupManifest = nil
-			return validateS3AbsentObjectDelete(r, bucket, objectKey)
-		}
-		if err := s.dispatchConditionalObjectDelete(
-			r, readTimestamp, startTS, headKey, manifest, bucket, objectKey,
-		); err != nil {
 			return err
 		}
 		cleanupManifest = manifest
-		generation = meta.Generation
+		generation = objectGeneration
 		return nil
 	})
 	if err != nil {
@@ -1194,6 +1235,46 @@ func (s *S3Server) deleteObject(w http.ResponseWriter, r *http.Request, bucket s
 		s.cleanupManifestBlobsAsync(bucket, generation, objectKey, cleanupManifest)
 	}
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func (s *S3Server) deleteObjectAttempt(
+	r *http.Request, bucket string, objectKey string,
+) (*s3ObjectManifest, uint64, error) {
+	readTS := s.readTS()
+	readTimestamp, err := s.beginTxnReadTimestamp(r.Context(), readTS, "s3 delete object: begin read timestamp")
+	if err != nil {
+		return nil, 0, errors.Wrap(err, "s3: allocate startTS for mutation")
+	}
+	readTS = readTimestamp.Timestamp()
+	readPin := s.pinReadTS(readTS)
+	defer readPin.Release()
+
+	meta, exists, err := s.loadBucketMetaAt(r.Context(), bucket, readTS)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	if !exists || meta == nil {
+		return nil, 0, &s3ResponseError{
+			Status:  http.StatusNotFound,
+			Code:    "NoSuchBucket",
+			Message: "bucket not found",
+			Bucket:  bucket,
+			Key:     objectKey,
+		}
+	}
+
+	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
+	manifest, found, err := s.loadObjectManifestAt(r.Context(), headKey, readTS)
+	if err != nil {
+		return nil, 0, errors.WithStack(err)
+	}
+	if !found {
+		return nil, meta.Generation, validateS3AbsentObjectDelete(r, bucket, objectKey)
+	}
+	if err := s.dispatchConditionalObjectDelete(r, readTimestamp, readTS, headKey, manifest, bucket, objectKey); err != nil {
+		return nil, 0, err
+	}
+	return manifest, meta.Generation, nil
 }
 
 func validateS3AbsentObjectDelete(r *http.Request, bucket, objectKey string) error {
@@ -1481,18 +1562,9 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 }
 
 func (s *S3Server) cleanupUploadPartsAsync(bucket string, generation uint64, objectKey string, uploadID string) {
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		s.cleanupUploadParts(ctx, bucket, generation, objectKey, uploadID)
-	}()
+	})
 }
 
 func (s *S3Server) cleanupUploadParts(ctx context.Context, bucket string, generation uint64, objectKey string, uploadID string) {
@@ -1515,16 +1587,7 @@ func (s *S3Server) cleanupPartBlobsAsync(
 	chunkRefVersion uint64,
 	offloaded bool,
 ) {
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		pending := make([]*kv.Elem[kv.OP], 0, s3MetaBatchOps)
 		flush := func() {
 			if len(pending) == 0 {
@@ -1555,20 +1618,11 @@ func (s *S3Server) cleanupPartBlobsAsync(
 			}
 		}
 		flush()
-	}()
+	})
 }
 
 func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, objectKey string, uploadID string) {
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		// Delete part descriptors.
 		s.cleanupUploadParts(ctx, bucket, generation, objectKey, uploadID)
 		// Delete legacy blob chunks and offloaded chunk references. Content-
@@ -1577,7 +1631,7 @@ func (s *S3Server) cleanupUploadDataAsync(bucket string, generation uint64, obje
 		s.deleteByPrefix(ctx, blobPrefix, bucket, generation, objectKey, uploadID)
 		chunkRefPrefix := s3keys.ChunkRefPrefixForUpload(bucket, generation, objectKey, uploadID)
 		s.deleteByPrefix(ctx, chunkRefPrefix, bucket, generation, objectKey, uploadID)
-	}()
+	})
 }
 
 func (s *S3Server) deleteByPrefix(ctx context.Context, prefix []byte, bucket string, generation uint64, objectKey string, uploadID string) {
@@ -1755,18 +1809,9 @@ func (s *S3Server) cleanupManifestBlobsAsync(bucket string, generation uint64, o
 	if manifest == nil {
 		return
 	}
-	select {
-	case s.cleanupSem <- struct{}{}:
-	default:
-		// Semaphore saturated; skip to avoid unbounded goroutine accumulation.
-		return
-	}
-	go func() {
-		defer func() { <-s.cleanupSem }()
-		ctx, cancel := context.WithTimeout(context.Background(), s3ManifestCleanupTimeout)
-		defer cancel()
+	s.startCleanup(func(ctx context.Context) {
 		s.cleanupManifestBlobs(ctx, bucket, generation, objectKey, manifest)
-	}()
+	})
 }
 
 func (s *S3Server) cleanupManifestBlobs(ctx context.Context, bucket string, generation uint64, objectKey string, manifest *s3ObjectManifest) {
@@ -2605,6 +2650,9 @@ func isReadOnlyS3Request(r *http.Request) bool {
 // isReadOnlyBucketOp returns true for bucket-level read-only operations
 // (HeadBucket, ListObjectsV2).
 func isReadOnlyBucketOp(method string, q url.Values) bool {
+	if q.Has("versioning") {
+		return false
+	}
 	switch method {
 	case http.MethodHead:
 		// HeadBucket: no query params (or only "location").
@@ -2656,7 +2704,7 @@ func validateS3PutPreconditions(ifMatch, ifNoneMatch string, previous *s3ObjectM
 		return errors.New("object already exists")
 	}
 	if ifMatch != "" {
-		if previous == nil || strings.Trim(ifMatch, `"`) != previous.ETag {
+		if previous == nil || (ifMatch != "*" && strings.Trim(ifMatch, `"`) != previous.ETag) {
 			return errors.New("etag precondition failed")
 		}
 	}

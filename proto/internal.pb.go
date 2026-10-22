@@ -238,8 +238,12 @@ type Request struct {
 	// checks only for those exact point mutations; prefixes and unmarked keys
 	// still fail closed.
 	WriteFenceBypassKeys [][]byte `protobuf:"bytes,7,rep,name=write_fence_bypass_keys,json=writeFenceBypassKeys,proto3" json:"write_fence_bypass_keys,omitempty"`
-	unknownFields        protoimpl.UnknownFields
-	sizeCache            protoimpl.SizeCache
+	// timestamp_admission_floor identifies the data group's durable Phase-D
+	// creation epoch. Producers set it only after validating the unchanged
+	// persistence timestamp against the durable TSO allocation range.
+	TimestampAdmissionFloor uint64 `protobuf:"varint,8,opt,name=timestamp_admission_floor,json=timestampAdmissionFloor,proto3" json:"timestamp_admission_floor,omitempty"`
+	unknownFields           protoimpl.UnknownFields
+	sizeCache               protoimpl.SizeCache
 }
 
 func (x *Request) Reset() {
@@ -319,6 +323,13 @@ func (x *Request) GetWriteFenceBypassKeys() [][]byte {
 		return x.WriteFenceBypassKeys
 	}
 	return nil
+}
+
+func (x *Request) GetTimestampAdmissionFloor() uint64 {
+	if x != nil {
+		return x.TimestampAdmissionFloor
+	}
+	return 0
 }
 
 type RaftCommand struct {
@@ -654,6 +665,151 @@ func (x *ForwardLeaseReadResponse) GetLastCommitTs() uint64 {
 	return 0
 }
 
+type PrepareEvidenceStateRequest struct {
+	state protoimpl.MessageState `protogen:"open.v1"`
+	Floor uint64                 `protobuf:"varint,1,opt,name=floor,proto3" json:"floor,omitempty"`
+	// Capability probes are read-only and may be answered by any replica.
+	CapabilityOnly bool `protobuf:"varint,2,opt,name=capability_only,json=capabilityOnly,proto3" json:"capability_only,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PrepareEvidenceStateRequest) Reset() {
+	*x = PrepareEvidenceStateRequest{}
+	mi := &file_internal_proto_msgTypes[9]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrepareEvidenceStateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrepareEvidenceStateRequest) ProtoMessage() {}
+
+func (x *PrepareEvidenceStateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[9]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrepareEvidenceStateRequest.ProtoReflect.Descriptor instead.
+func (*PrepareEvidenceStateRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{9}
+}
+
+func (x *PrepareEvidenceStateRequest) GetFloor() uint64 {
+	if x != nil {
+		return x.Floor
+	}
+	return 0
+}
+
+func (x *PrepareEvidenceStateRequest) GetCapabilityOnly() bool {
+	if x != nil {
+		return x.CapabilityOnly
+	}
+	return false
+}
+
+type PrepareEvidenceStateResponse struct {
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	Supported              bool                   `protobuf:"varint,1,opt,name=supported,proto3" json:"supported,omitempty"`
+	ProofEnabled           bool                   `protobuf:"varint,2,opt,name=proof_enabled,json=proofEnabled,proto3" json:"proof_enabled,omitempty"`
+	UnprovenLocks          bool                   `protobuf:"varint,3,opt,name=unproven_locks,json=unprovenLocks,proto3" json:"unproven_locks,omitempty"`
+	FenceFloor             uint64                 `protobuf:"varint,4,opt,name=fence_floor,json=fenceFloor,proto3" json:"fence_floor,omitempty"`
+	AppliedIndex           uint64                 `protobuf:"varint,5,opt,name=applied_index,json=appliedIndex,proto3" json:"applied_index,omitempty"`
+	CutoverApplied         bool                   `protobuf:"varint,6,opt,name=cutover_applied,json=cutoverApplied,proto3" json:"cutover_applied,omitempty"`
+	DedicatedTsoConfigured bool                   `protobuf:"varint,7,opt,name=dedicated_tso_configured,json=dedicatedTsoConfigured,proto3" json:"dedicated_tso_configured,omitempty"`
+	unknownFields          protoimpl.UnknownFields
+	sizeCache              protoimpl.SizeCache
+}
+
+func (x *PrepareEvidenceStateResponse) Reset() {
+	*x = PrepareEvidenceStateResponse{}
+	mi := &file_internal_proto_msgTypes[10]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PrepareEvidenceStateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PrepareEvidenceStateResponse) ProtoMessage() {}
+
+func (x *PrepareEvidenceStateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[10]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PrepareEvidenceStateResponse.ProtoReflect.Descriptor instead.
+func (*PrepareEvidenceStateResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{10}
+}
+
+func (x *PrepareEvidenceStateResponse) GetSupported() bool {
+	if x != nil {
+		return x.Supported
+	}
+	return false
+}
+
+func (x *PrepareEvidenceStateResponse) GetProofEnabled() bool {
+	if x != nil {
+		return x.ProofEnabled
+	}
+	return false
+}
+
+func (x *PrepareEvidenceStateResponse) GetUnprovenLocks() bool {
+	if x != nil {
+		return x.UnprovenLocks
+	}
+	return false
+}
+
+func (x *PrepareEvidenceStateResponse) GetFenceFloor() uint64 {
+	if x != nil {
+		return x.FenceFloor
+	}
+	return 0
+}
+
+func (x *PrepareEvidenceStateResponse) GetAppliedIndex() uint64 {
+	if x != nil {
+		return x.AppliedIndex
+	}
+	return 0
+}
+
+func (x *PrepareEvidenceStateResponse) GetCutoverApplied() bool {
+	if x != nil {
+		return x.CutoverApplied
+	}
+	return false
+}
+
+func (x *PrepareEvidenceStateResponse) GetDedicatedTsoConfigured() bool {
+	if x != nil {
+		return x.DedicatedTsoConfigured
+	}
+	return false
+}
+
 type RelayPublishRequest struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	Channel       []byte                 `protobuf:"bytes,1,opt,name=channel,proto3" json:"channel,omitempty"`
@@ -664,7 +820,7 @@ type RelayPublishRequest struct {
 
 func (x *RelayPublishRequest) Reset() {
 	*x = RelayPublishRequest{}
-	mi := &file_internal_proto_msgTypes[9]
+	mi := &file_internal_proto_msgTypes[11]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -676,7 +832,7 @@ func (x *RelayPublishRequest) String() string {
 func (*RelayPublishRequest) ProtoMessage() {}
 
 func (x *RelayPublishRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[9]
+	mi := &file_internal_proto_msgTypes[11]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -689,7 +845,7 @@ func (x *RelayPublishRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayPublishRequest.ProtoReflect.Descriptor instead.
 func (*RelayPublishRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{9}
+	return file_internal_proto_rawDescGZIP(), []int{11}
 }
 
 func (x *RelayPublishRequest) GetChannel() []byte {
@@ -715,7 +871,7 @@ type RelayPublishResponse struct {
 
 func (x *RelayPublishResponse) Reset() {
 	*x = RelayPublishResponse{}
-	mi := &file_internal_proto_msgTypes[10]
+	mi := &file_internal_proto_msgTypes[12]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -727,7 +883,7 @@ func (x *RelayPublishResponse) String() string {
 func (*RelayPublishResponse) ProtoMessage() {}
 
 func (x *RelayPublishResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[10]
+	mi := &file_internal_proto_msgTypes[12]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -740,7 +896,7 @@ func (x *RelayPublishResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use RelayPublishResponse.ProtoReflect.Descriptor instead.
 func (*RelayPublishResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{10}
+	return file_internal_proto_rawDescGZIP(), []int{12}
 }
 
 func (x *RelayPublishResponse) GetSubscribers() int64 {
@@ -776,7 +932,7 @@ type ExportRangeVersionsRequest struct {
 
 func (x *ExportRangeVersionsRequest) Reset() {
 	*x = ExportRangeVersionsRequest{}
-	mi := &file_internal_proto_msgTypes[11]
+	mi := &file_internal_proto_msgTypes[13]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -788,7 +944,7 @@ func (x *ExportRangeVersionsRequest) String() string {
 func (*ExportRangeVersionsRequest) ProtoMessage() {}
 
 func (x *ExportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[11]
+	mi := &file_internal_proto_msgTypes[13]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -801,7 +957,7 @@ func (x *ExportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportRangeVersionsRequest.ProtoReflect.Descriptor instead.
 func (*ExportRangeVersionsRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{11}
+	return file_internal_proto_rawDescGZIP(), []int{13}
 }
 
 func (x *ExportRangeVersionsRequest) GetRangeStart() []byte {
@@ -899,7 +1055,7 @@ type ExportRangeVersionsResponse struct {
 
 func (x *ExportRangeVersionsResponse) Reset() {
 	*x = ExportRangeVersionsResponse{}
-	mi := &file_internal_proto_msgTypes[12]
+	mi := &file_internal_proto_msgTypes[14]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -911,7 +1067,7 @@ func (x *ExportRangeVersionsResponse) String() string {
 func (*ExportRangeVersionsResponse) ProtoMessage() {}
 
 func (x *ExportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[12]
+	mi := &file_internal_proto_msgTypes[14]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -924,7 +1080,7 @@ func (x *ExportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ExportRangeVersionsResponse.ProtoReflect.Descriptor instead.
 func (*ExportRangeVersionsResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{12}
+	return file_internal_proto_rawDescGZIP(), []int{14}
 }
 
 func (x *ExportRangeVersionsResponse) GetVersions() []*MVCCVersion {
@@ -962,7 +1118,7 @@ type MVCCVersion struct {
 
 func (x *MVCCVersion) Reset() {
 	*x = MVCCVersion{}
-	mi := &file_internal_proto_msgTypes[13]
+	mi := &file_internal_proto_msgTypes[15]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -974,7 +1130,7 @@ func (x *MVCCVersion) String() string {
 func (*MVCCVersion) ProtoMessage() {}
 
 func (x *MVCCVersion) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[13]
+	mi := &file_internal_proto_msgTypes[15]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -987,7 +1143,7 @@ func (x *MVCCVersion) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use MVCCVersion.ProtoReflect.Descriptor instead.
 func (*MVCCVersion) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{13}
+	return file_internal_proto_rawDescGZIP(), []int{15}
 }
 
 func (x *MVCCVersion) GetKey() []byte {
@@ -1045,7 +1201,7 @@ type ImportRangeVersionsRequest struct {
 
 func (x *ImportRangeVersionsRequest) Reset() {
 	*x = ImportRangeVersionsRequest{}
-	mi := &file_internal_proto_msgTypes[14]
+	mi := &file_internal_proto_msgTypes[16]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1057,7 +1213,7 @@ func (x *ImportRangeVersionsRequest) String() string {
 func (*ImportRangeVersionsRequest) ProtoMessage() {}
 
 func (x *ImportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[14]
+	mi := &file_internal_proto_msgTypes[16]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1070,7 +1226,7 @@ func (x *ImportRangeVersionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportRangeVersionsRequest.ProtoReflect.Descriptor instead.
 func (*ImportRangeVersionsRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{14}
+	return file_internal_proto_rawDescGZIP(), []int{16}
 }
 
 func (x *ImportRangeVersionsRequest) GetJobId() uint64 {
@@ -1117,7 +1273,7 @@ type ImportRangeVersionsResponse struct {
 
 func (x *ImportRangeVersionsResponse) Reset() {
 	*x = ImportRangeVersionsResponse{}
-	mi := &file_internal_proto_msgTypes[15]
+	mi := &file_internal_proto_msgTypes[17]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1129,7 +1285,7 @@ func (x *ImportRangeVersionsResponse) String() string {
 func (*ImportRangeVersionsResponse) ProtoMessage() {}
 
 func (x *ImportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[15]
+	mi := &file_internal_proto_msgTypes[17]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1142,7 +1298,7 @@ func (x *ImportRangeVersionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use ImportRangeVersionsResponse.ProtoReflect.Descriptor instead.
 func (*ImportRangeVersionsResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{15}
+	return file_internal_proto_rawDescGZIP(), []int{17}
 }
 
 func (x *ImportRangeVersionsResponse) GetAckedCursor() []byte {
@@ -1165,7 +1321,7 @@ type PromoteStagedVersionsRequest struct {
 
 func (x *PromoteStagedVersionsRequest) Reset() {
 	*x = PromoteStagedVersionsRequest{}
-	mi := &file_internal_proto_msgTypes[16]
+	mi := &file_internal_proto_msgTypes[18]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1177,7 +1333,7 @@ func (x *PromoteStagedVersionsRequest) String() string {
 func (*PromoteStagedVersionsRequest) ProtoMessage() {}
 
 func (x *PromoteStagedVersionsRequest) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[16]
+	mi := &file_internal_proto_msgTypes[18]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1190,7 +1346,7 @@ func (x *PromoteStagedVersionsRequest) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteStagedVersionsRequest.ProtoReflect.Descriptor instead.
 func (*PromoteStagedVersionsRequest) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{16}
+	return file_internal_proto_rawDescGZIP(), []int{18}
 }
 
 func (x *PromoteStagedVersionsRequest) GetJobId() uint64 {
@@ -1240,7 +1396,7 @@ type PromoteStagedVersionsResponse struct {
 
 func (x *PromoteStagedVersionsResponse) Reset() {
 	*x = PromoteStagedVersionsResponse{}
-	mi := &file_internal_proto_msgTypes[17]
+	mi := &file_internal_proto_msgTypes[19]
 	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 	ms.StoreMessageInfo(mi)
 }
@@ -1252,7 +1408,7 @@ func (x *PromoteStagedVersionsResponse) String() string {
 func (*PromoteStagedVersionsResponse) ProtoMessage() {}
 
 func (x *PromoteStagedVersionsResponse) ProtoReflect() protoreflect.Message {
-	mi := &file_internal_proto_msgTypes[17]
+	mi := &file_internal_proto_msgTypes[19]
 	if x != nil {
 		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
 		if ms.LoadMessageInfo() == nil {
@@ -1265,7 +1421,7 @@ func (x *PromoteStagedVersionsResponse) ProtoReflect() protoreflect.Message {
 
 // Deprecated: Use PromoteStagedVersionsResponse.ProtoReflect.Descriptor instead.
 func (*PromoteStagedVersionsResponse) Descriptor() ([]byte, []int) {
-	return file_internal_proto_rawDescGZIP(), []int{17}
+	return file_internal_proto_rawDescGZIP(), []int{19}
 }
 
 func (x *PromoteStagedVersionsResponse) GetNextCursor() []byte {
@@ -1306,7 +1462,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
 	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\x12%\n" +
-	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\x81\x02\n" +
+	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\xbd\x02\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
@@ -1314,7 +1470,8 @@ const file_internal_proto_rawDesc = "" +
 	"\tmutations\x18\x04 \x03(\v2\t.MutationR\tmutations\x12\x1b\n" +
 	"\tread_keys\x18\x05 \x03(\fR\breadKeys\x124\n" +
 	"\x16observed_route_version\x18\x06 \x01(\x04R\x14observedRouteVersion\x125\n" +
-	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\"3\n" +
+	"\x17write_fence_bypass_keys\x18\a \x03(\fR\x14writeFenceBypassKeys\x12:\n" +
+	"\x19timestamp_admission_floor\x18\b \x01(\x04R\x17timestampAdmissionFloor\"3\n" +
 	"\vRaftCommand\x12$\n" +
 	"\brequests\x18\x01 \x03(\v2\b.RequestR\brequests\"M\n" +
 	"\x0eForwardRequest\x12\x15\n" +
@@ -1331,7 +1488,19 @@ const file_internal_proto_rawDesc = "" +
 	"\x17ForwardLeaseReadRequest\"e\n" +
 	"\x18ForwardLeaseReadResponse\x12#\n" +
 	"\rapplied_index\x18\x01 \x01(\x04R\fappliedIndex\x12$\n" +
-	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"I\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs\"\\\n" +
+	"\x1bPrepareEvidenceStateRequest\x12\x14\n" +
+	"\x05floor\x18\x01 \x01(\x04R\x05floor\x12'\n" +
+	"\x0fcapability_only\x18\x02 \x01(\bR\x0ecapabilityOnly\"\xb1\x02\n" +
+	"\x1cPrepareEvidenceStateResponse\x12\x1c\n" +
+	"\tsupported\x18\x01 \x01(\bR\tsupported\x12#\n" +
+	"\rproof_enabled\x18\x02 \x01(\bR\fproofEnabled\x12%\n" +
+	"\x0eunproven_locks\x18\x03 \x01(\bR\runprovenLocks\x12\x1f\n" +
+	"\vfence_floor\x18\x04 \x01(\x04R\n" +
+	"fenceFloor\x12#\n" +
+	"\rapplied_index\x18\x05 \x01(\x04R\fappliedIndex\x12'\n" +
+	"\x0fcutover_applied\x18\x06 \x01(\bR\x0ecutoverApplied\x128\n" +
+	"\x18dedicated_tso_configured\x18\a \x01(\bR\x16dedicatedTsoConfigured\"I\n" +
 	"\x13RelayPublishRequest\x12\x18\n" +
 	"\achannel\x18\x01 \x01(\fR\achannel\x12\x18\n" +
 	"\amessage\x18\x02 \x01(\fR\amessage\"8\n" +
@@ -1399,11 +1568,12 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032\x9f\x04\n" +
+	"\x05ABORT\x10\x032\xf9\x04\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
-	"\x10ForwardLeaseRead\x12\x18.ForwardLeaseReadRequest\x1a\x19.ForwardLeaseReadResponse\"\x00\x12=\n" +
+	"\x10ForwardLeaseRead\x12\x18.ForwardLeaseReadRequest\x1a\x19.ForwardLeaseReadResponse\"\x00\x12X\n" +
+	"\x17GetPrepareEvidenceState\x12\x1c.PrepareEvidenceStateRequest\x1a\x1d.PrepareEvidenceStateResponse\"\x00\x12=\n" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
 	"\x13ExportRangeVersions\x12\x1b.ExportRangeVersionsRequest\x1a\x1c.ExportRangeVersionsResponse\"\x000\x01\x12R\n" +
 	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00\x12X\n" +
@@ -1422,7 +1592,7 @@ func file_internal_proto_rawDescGZIP() []byte {
 }
 
 var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 18)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
 var file_internal_proto_goTypes = []any{
 	(Op)(0),                               // 0: Op
 	(Phase)(0),                            // 1: Phase
@@ -1435,15 +1605,17 @@ var file_internal_proto_goTypes = []any{
 	(*ForwardAdminProposalResponse)(nil),  // 8: ForwardAdminProposalResponse
 	(*ForwardLeaseReadRequest)(nil),       // 9: ForwardLeaseReadRequest
 	(*ForwardLeaseReadResponse)(nil),      // 10: ForwardLeaseReadResponse
-	(*RelayPublishRequest)(nil),           // 11: RelayPublishRequest
-	(*RelayPublishResponse)(nil),          // 12: RelayPublishResponse
-	(*ExportRangeVersionsRequest)(nil),    // 13: ExportRangeVersionsRequest
-	(*ExportRangeVersionsResponse)(nil),   // 14: ExportRangeVersionsResponse
-	(*MVCCVersion)(nil),                   // 15: MVCCVersion
-	(*ImportRangeVersionsRequest)(nil),    // 16: ImportRangeVersionsRequest
-	(*ImportRangeVersionsResponse)(nil),   // 17: ImportRangeVersionsResponse
-	(*PromoteStagedVersionsRequest)(nil),  // 18: PromoteStagedVersionsRequest
-	(*PromoteStagedVersionsResponse)(nil), // 19: PromoteStagedVersionsResponse
+	(*PrepareEvidenceStateRequest)(nil),   // 11: PrepareEvidenceStateRequest
+	(*PrepareEvidenceStateResponse)(nil),  // 12: PrepareEvidenceStateResponse
+	(*RelayPublishRequest)(nil),           // 13: RelayPublishRequest
+	(*RelayPublishResponse)(nil),          // 14: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),    // 15: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil),   // 16: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                   // 17: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),    // 18: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil),   // 19: ImportRangeVersionsResponse
+	(*PromoteStagedVersionsRequest)(nil),  // 20: PromoteStagedVersionsRequest
+	(*PromoteStagedVersionsResponse)(nil), // 21: PromoteStagedVersionsResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
@@ -1451,24 +1623,26 @@ var file_internal_proto_depIdxs = []int32{
 	2,  // 2: Request.mutations:type_name -> Mutation
 	3,  // 3: RaftCommand.requests:type_name -> Request
 	3,  // 4: ForwardRequest.requests:type_name -> Request
-	15, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
-	15, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
+	17, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
+	17, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
 	5,  // 7: Internal.Forward:input_type -> ForwardRequest
 	7,  // 8: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
 	9,  // 9: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
-	11, // 10: Internal.RelayPublish:input_type -> RelayPublishRequest
-	13, // 11: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	16, // 12: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	18, // 13: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	6,  // 14: Internal.Forward:output_type -> ForwardResponse
-	8,  // 15: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	10, // 16: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	12, // 17: Internal.RelayPublish:output_type -> RelayPublishResponse
-	14, // 18: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	17, // 19: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	19, // 20: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	14, // [14:21] is the sub-list for method output_type
-	7,  // [7:14] is the sub-list for method input_type
+	11, // 10: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
+	13, // 11: Internal.RelayPublish:input_type -> RelayPublishRequest
+	15, // 12: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	18, // 13: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	20, // 14: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	6,  // 15: Internal.Forward:output_type -> ForwardResponse
+	8,  // 16: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	10, // 17: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	12, // 18: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	14, // 19: Internal.RelayPublish:output_type -> RelayPublishResponse
+	16, // 20: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	19, // 21: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	21, // 22: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	15, // [15:23] is the sub-list for method output_type
+	7,  // [7:15] is the sub-list for method input_type
 	7,  // [7:7] is the sub-list for extension type_name
 	7,  // [7:7] is the sub-list for extension extendee
 	0,  // [0:7] is the sub-list for field type_name
@@ -1485,7 +1659,7 @@ func file_internal_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
 			NumEnums:      2,
-			NumMessages:   18,
+			NumMessages:   20,
 			NumExtensions: 0,
 			NumServices:   1,
 		},
