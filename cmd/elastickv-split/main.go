@@ -32,7 +32,6 @@ import (
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/metadata"
 )
 
 const (
@@ -49,6 +48,7 @@ var (
 	abandonJobID    = flag.Uint64("abandon-job-id", 0, "Abandon a pre-cutover migration job; mutually exclusive with split flags")
 	getJobID        = flag.Uint64("get-job-id", 0, "Print one migration job; mutually exclusive with mutation flags")
 	tokenFile       = flag.String("token-file", "", "File containing the admin bearer token for migration operations")
+	tlsCAFile       = flag.String("tls-ca-file", "", "PEM CA certificates for verified gRPC TLS; token-file always requires TLS (system roots if omitted)")
 )
 
 func main() {
@@ -64,7 +64,11 @@ func run() error {
 		return err
 	}
 
-	conn, err := grpc.NewClient(*address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	dialOpts, err := splitDialOptions()
+	if err != nil {
+		return err
+	}
+	conn, err := grpc.NewClient(*address, dialOpts...)
 	if err != nil {
 		return errors.Wrapf(err, "dial %s", *address)
 	}
@@ -83,13 +87,6 @@ func run() error {
 
 	rpcCtx, rpcCancel := context.WithTimeout(context.Background(), rpcTimeout)
 	defer rpcCancel()
-	if *tokenFile != "" {
-		token, err := internalutil.LoadBearerTokenFile(*tokenFile, maxAdminTokenBytes, "admin token")
-		if err != nil {
-			return errors.Wrap(err, "load split migration token")
-		}
-		rpcCtx = metadata.AppendToOutgoingContext(rpcCtx, "authorization", "Bearer "+token)
-	}
 	if *getJobID != 0 {
 		return runGetSplitJob(rpcCtx, client)
 	}
@@ -111,6 +108,26 @@ func run() error {
 	}
 	printResponse(resp)
 	return nil
+}
+
+func splitDialOptions() ([]grpc.DialOption, error) {
+	opts := []grpc.DialOption{internalutil.GRPCCallOptions()}
+	if *tokenFile == "" && *tlsCAFile == "" {
+		return append(opts, grpc.WithTransportCredentials(insecure.NewCredentials())), nil
+	}
+	creds, err := internalutil.GRPCClientTLSCredentials(*tlsCAFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "load split TLS credentials")
+	}
+	opts = append(opts, grpc.WithTransportCredentials(creds))
+	if *tokenFile != "" {
+		token, err := internalutil.LoadBearerTokenFile(*tokenFile, maxAdminTokenBytes, "admin token")
+		if err != nil {
+			return nil, errors.Wrap(err, "load split migration token")
+		}
+		opts = append(opts, grpc.WithPerRPCCredentials(internalutil.GRPCBearerToken(token)))
+	}
+	return opts, nil
 }
 
 func runGetSplitJob(ctx context.Context, client pb.DistributionClient) error {

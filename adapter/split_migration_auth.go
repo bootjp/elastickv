@@ -4,8 +4,11 @@ import (
 	"context"
 
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials"
+	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
 
@@ -24,26 +27,51 @@ func splitMigrationMutatingMethod(method string) bool {
 	}
 }
 
-// SplitMigrationTokenAuth requires the admin bearer token for migration control.
-// Without a configured token, only an explicit insecure opt-in enables mutation.
+func splitMigrationProtectedMethod(method string) bool {
+	return splitMigrationMutatingMethod(method) || method == pb.Internal_ExportRangeVersions_FullMethodName
+}
+
+// SplitMigrationTokenAuth protects migration control and raw MVCC exports.
+// Without a configured token, only an explicit insecure opt-in enables access.
 func SplitMigrationTokenAuth(token string, insecureNoAuth bool) (grpc.UnaryServerInterceptor, grpc.StreamServerInterceptor) {
-	if token != "" {
-		return bearerTokenAuth(token, splitMigrationMutatingMethod, "split migration admin")
-	}
-	if insecureNoAuth {
+	if token == "" && insecureNoAuth {
 		return nil, nil
 	}
+	authUnary, authStream := bearerTokenAuth(token, splitMigrationProtectedMethod, "split migration admin")
 	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
-		if splitMigrationMutatingMethod(info.FullMethod) {
-			return nil, status.Error(codes.Unauthenticated, "split migration requires a configured admin token")
+		if err := checkSplitMigrationTransport(ctx, info.FullMethod, token); err != nil {
+			return nil, err
+		}
+		if authUnary != nil {
+			return authUnary(ctx, req, info, handler)
 		}
 		return handler(ctx, req)
 	}
 	stream := func(srv any, ss grpc.ServerStream, info *grpc.StreamServerInfo, handler grpc.StreamHandler) error {
-		if splitMigrationMutatingMethod(info.FullMethod) {
-			return status.Error(codes.Unauthenticated, "split migration requires a configured admin token")
+		if err := checkSplitMigrationTransport(ss.Context(), info.FullMethod, token); err != nil {
+			return err
+		}
+		if authStream != nil {
+			return authStream(srv, ss, info, handler)
 		}
 		return handler(srv, ss)
 	}
 	return unary, stream
+}
+
+func checkSplitMigrationTransport(ctx context.Context, method, token string) error {
+	if !splitMigrationProtectedMethod(method) {
+		return nil
+	}
+	if token == "" {
+		return errors.WithStack(status.Error(codes.Unauthenticated, "split migration requires a configured admin token"))
+	}
+	p, ok := peer.FromContext(ctx)
+	if !ok {
+		return errors.WithStack(status.Error(codes.Unauthenticated, "split migration token requires TLS"))
+	}
+	if _, ok := p.AuthInfo.(credentials.TLSInfo); !ok {
+		return errors.WithStack(status.Error(codes.Unauthenticated, "split migration token requires TLS"))
+	}
+	return nil
 }

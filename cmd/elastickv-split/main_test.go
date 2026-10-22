@@ -2,8 +2,11 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
+	"encoding/pem"
 	"flag"
 	"net"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"testing"
@@ -13,6 +16,7 @@ import (
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials"
 )
 
 // TestValidateFlags_RejectsMissingRequired pins the smoke-test
@@ -104,6 +108,7 @@ func resetFlags(t *testing.T) {
 	*getJobID = 0
 	*address = "127.0.0.1:50051"
 	*tokenFile = ""
+	*tlsCAFile = ""
 	_ = flag.CommandLine // touch to avoid unused import on future trims
 }
 
@@ -124,7 +129,14 @@ func TestRunSendsMigrationAdminToken(t *testing.T) {
 	listener, err := listenConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	unary, _ := adapter.SplitMigrationTokenAuth("test-admin-token", false)
-	server := grpc.NewServer(grpc.UnaryInterceptor(unary))
+	tlsFixture := httptest.NewTLSServer(nil)
+	tlsFixture.Close()
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: tlsFixture.Certificate().Raw}), 0o600))
+	*tlsCAFile = caPath
+	server := grpc.NewServer(grpc.UnaryInterceptor(unary), grpc.Creds(credentials.NewTLS(&tls.Config{
+		MinVersion: tls.VersionTLS12, Certificates: tlsFixture.TLS.Certificates,
+	})))
 	svc := &splitAuthTestServer{jobs: make(chan uint64, 1)}
 	pb.RegisterDistributionServer(server, svc)
 	serveResult := make(chan error, 1)

@@ -178,6 +178,9 @@ var (
 	// SigV4 access keys).
 	adminTokenFile                = flag.String("adminTokenFile", "", "Path to the bearer token required on Admin and split-migration control RPCs (leave blank with --adminInsecureNoAuth off to disable Admin and reject migration control)")
 	adminInsecureNoAuth           = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	grpcTLSCAFile                 = flag.String("grpcTLSCAFile", "", "CA certificates for verifying peer gRPC TLS; requires grpcTLSCertFile and grpcTLSKeyFile")
+	grpcTLSCertFile               = flag.String("grpcTLSCertFile", "", "PEM certificate enabling TLS on group gRPC listeners and peer clients")
+	grpcTLSKeyFile                = flag.String("grpcTLSKeyFile", "", "PEM private key for group gRPC TLS")
 	s3BlobPeerTokenFile           = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
 	backupDefaultTTL              = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
 	backupMaxTTL                  = flag.Duration("backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
@@ -418,6 +421,9 @@ func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Co
 }
 
 func run() error {
+	if err := internalutil.ConfigureGRPCTLS(*grpcTLSCAFile, *grpcTLSCertFile, *grpcTLSKeyFile); err != nil {
+		return errors.Wrap(err, "configure peer gRPC transport")
+	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs()
 	if err != nil {
 		return err

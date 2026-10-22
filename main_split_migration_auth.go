@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -16,10 +17,23 @@ type splitMigrationAuthConn struct {
 }
 
 func (c splitMigrationAuthConn) Invoke(ctx context.Context, method string, args, reply any, opts ...grpc.CallOption) error {
+	ctx = migrationCredentialContext(ctx)
+	opts = append(opts, grpc.PerRPCCredentials(internalutil.GRPCBearerToken(c.token)))
+	return errors.WithStack(c.ClientConnInterface.Invoke(ctx, method, args, reply, opts...))
+}
+
+func (c splitMigrationAuthConn) NewStream(ctx context.Context, desc *grpc.StreamDesc, method string, opts ...grpc.CallOption) (grpc.ClientStream, error) {
+	ctx = migrationCredentialContext(ctx)
+	opts = append(opts, grpc.PerRPCCredentials(internalutil.GRPCBearerToken(c.token)))
+	stream, err := c.ClientConnInterface.NewStream(ctx, desc, method, opts...)
+	return stream, errors.WithStack(err)
+}
+
+func migrationCredentialContext(ctx context.Context) context.Context {
 	md, _ := metadata.FromOutgoingContext(ctx)
 	md = md.Copy()
-	md.Set("authorization", "Bearer "+c.token)
-	return errors.WithStack(c.ClientConnInterface.Invoke(metadata.NewOutgoingContext(ctx, md), method, args, reply, opts...))
+	md.Delete("authorization")
+	return metadata.NewOutgoingContext(ctx, md)
 }
 
 func newSplitMigrationInternalClient(conn grpc.ClientConnInterface, token string) pb.InternalClient {
