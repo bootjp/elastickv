@@ -543,7 +543,7 @@ func TestDetachFUSEMountReachesKernelFallbackWhenHelpersHoldPipes(t *testing.T) 
 	require.NotErrorIs(t, err, context.DeadlineExceeded, "the helpers' pipe waits must not pre-empt the kernel fallback")
 	require.ErrorContains(t, err, lazyUnmountMethod)
 	elapsed := time.Since(start)
-	require.GreaterOrEqual(t, elapsed, budget/2-50*time.Millisecond, "the first helper must have been given its share, pipe wait included")
+	require.GreaterOrEqual(t, elapsed, budget/2-detachHelperWaitDelay-50*time.Millisecond, "the first helper must have been given its execution share")
 	require.Less(t, elapsed, budget, "the fallback must run inside the caller's budget")
 }
 

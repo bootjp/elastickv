@@ -1029,6 +1029,7 @@ func mountFilesystemService(
 // lifecycle drives; tests substitute a fake to exercise the failure paths.
 type filesystemMountServer interface {
 	Unmount() error
+	UnmountContext(context.Context) error
 	UnmountLazy(context.Context) error
 }
 
@@ -1048,7 +1049,9 @@ func installFilesystemServerLifecycle(
 	serveDone <-chan struct{},
 	mountPoint string,
 ) {
-	unmounter := newFilesystemUnmounter(server.Unmount)
+	unmountCtx, cancelUnmount := context.WithCancel(context.Background())
+	unmounter := newFilesystemUnmounter(func() error { return server.UnmountContext(unmountCtx) })
+	unmounter.cancel = cancelUnmount
 	cleanup.Add(func() {
 		// Normally the lifecycle goroutine has already run the shutdown by
 		// the time CleanupStack runs (eg.Wait precedes it); then there is
@@ -1064,6 +1067,7 @@ func installFilesystemServerLifecycle(
 				slog.Warn("filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
 			}
 		case <-time.After(filesystemServeStopTimeout):
+			cancelUnmount()
 			slog.Error("filesystem FUSE unmount did not return in time during cleanup, continuing",
 				"mount_point", mountPoint,
 				"timeout", filesystemServeStopTimeout,
@@ -1090,10 +1094,9 @@ func installFilesystemServerLifecycle(
 
 // stopFilesystemServer unmounts during a shutdown within one bounded budget
 // (filesystemServeStopTimeout). The plain unmount runs in its own goroutine
-// because go-fuse's Unmount waits for its event loops after the kernel
-// unmount, and a loop stuck in a backend request (leader unavailable) never
-// returns; a plain unmount also fails with EBUSY while a client holds files
-// on the mount open. In either case the mount is detached lazily, which
+// because a plain unmount can block or fail with EBUSY while a client holds
+// files open. Its helper is context-bound and must be killed and reaped
+// before the lazy detach can start. The mount is then detached lazily, which
 // also cancels the requests still in flight so a handler blocked in the
 // backend returns before the stores close, and the wait for the serve loop
 // is bounded, so the rest of the shutdown (WAL sync, store close) still runs
@@ -1128,6 +1131,12 @@ func stopFilesystemServer(
 		// Fall through: the reserved remainder of the budget still waits for
 		// the serve loop, so a request that finishes in time is not cut off
 		// by the store close that follows.
+		// Killing a context-aware unmount must also reap its helper before
+		// another path-based unmount can target a replacement filesystem.
+		if !unmounter.cancelAndJoin(stopCtx) {
+			slog.ErrorContext(ctx, "filesystem unmount helper did not exit; refusing concurrent lazy detach", "mount_point", mountPoint)
+			return
+		}
 		lazyDetachFilesystem(ctx, stopCtx, server, mountPoint)
 	}
 	select {
@@ -1140,13 +1149,14 @@ func stopFilesystemServer(
 	}
 }
 
-// filesystemUnmounter runs Server.Unmount at most once, in the background,
+// filesystemUnmounter runs the context-bound unmount at most once, in the background,
 // and lets any number of waiters observe its completion without a later
 // caller ever blocking on an earlier call that is stuck (go-fuse's Unmount
 // waits for an event loop that may be held by a hung backend request;
 // sync.OnceValue would make the second caller wait for the first).
 type filesystemUnmounter struct {
 	run     func() error
+	cancel  context.CancelFunc
 	started atomic.Bool
 	done    chan struct{}
 	err     error
@@ -1154,6 +1164,19 @@ type filesystemUnmounter struct {
 	// (unmounted, or gave up after its budget), so the CleanupStack entry
 	// knows there is nothing left to wait for.
 	handled atomic.Bool
+}
+
+func (u *filesystemUnmounter) cancelAndJoin(ctx context.Context) bool {
+	if u.cancel == nil {
+		return true
+	}
+	u.cancel()
+	select {
+	case <-u.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
 }
 
 func newFilesystemUnmounter(run func() error) *filesystemUnmounter {
