@@ -203,17 +203,34 @@ providers and must not appear in process arguments or manifests.
 bucket with S3 versioning enabled a keyed delete only writes a delete
 marker, so the bytes persist as a noncurrent version that later
 listings cannot see: GC reports successful reclamation while storage
-grows without bound. `NewS3Store` therefore checks bucket versioning and
+grows without bound. Each GC pass calls `RetentionStore.ValidateRetention`
+to check bucket versioning before scanning or deleting anything, and
 rejects `Enabled` or `Suspended` by default. Operators that have already
 configured noncurrent-version expiration must acknowledge that policy
 explicitly with `--s3-allow-versioned-with-lifecycle`; the code cannot
-prove the lifecycle configuration itself.
+prove the lifecycle configuration itself. Store construction and read-only
+restore do not query versioning or require this acknowledgement. Unknown
+versioning modes and versioning-query failures abort GC.
+
+**Claims rollout gate.** GC is disabled unless its caller supplies
+`GCOptions.VerifyPublishersUseClaims`. Before every pass, this callback must
+confirm that all publishers sharing the prefix, including standalone CLI jobs,
+use the claims protocol and that legacy in-flight publications have drained.
+Upgrade publishers first while GC is disabled, drain/stop all legacy jobs, then
+enable the verifier. Before rollback or restarting any legacy publisher, make
+the verifier fail, stop and drain any active GC pass, and only then resume the
+legacy publisher. Claims cannot protect a publisher that ignores them; a
+process-local build version or successful claim acquisition is not evidence
+that the rollout is complete. Runtime verifier wiring is part of the separate
+runtime integration work; `NewGC` refuses a missing verifier.
 
 Storage-envelope encryption protects values but not all physical keys and
 metadata. The external bucket therefore requires private ACLs, TLS, and
 server-side encryption (SSE-S3 or SSE-KMS). Anonymous reads and writes are a
 deployment failure. Object credentials need only scoped list/get/put/delete
-permissions below the configured prefix, plus `s3:GetBucketVersioning`.
+permissions below the configured prefix. GC additionally requires
+`s3:GetBucketVersioning`; a restore role needs only object reads (and any
+applicable KMS decrypt permission).
 
 ## 8. Milestones
 

@@ -19,6 +19,8 @@ import (
 
 const retentionPrefix = "cluster-a"
 
+func verifyTestPublishersUseClaims(context.Context) error { return nil }
+
 // gcFixture is a LocalStore-backed prefix plus a controllable clock.
 type gcFixture struct {
 	root  string
@@ -43,10 +45,11 @@ func (f *gcFixture) gc(t *testing.T, policy RetentionPolicy) *GC {
 		policy.MinMarkAge = time.Hour
 	}
 	gc, err := NewGC(GCOptions{
-		Store:  f.store,
-		Prefix: retentionPrefix,
-		Policy: policy,
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     f.store,
+		Prefix:                    retentionPrefix,
+		Policy:                    policy,
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 	return gc
@@ -334,10 +337,11 @@ func TestGCPreservesMalformedManifestEvidenceFromTheInitialScan(t *testing.T) {
 		malformedKey:   badKey,
 	}
 	gc, err := NewGC(GCOptions{
-		Store:  store,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     store,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -452,10 +456,11 @@ func TestGCRevalidatesPayloadReferenceCommittedAfterInitialPayloadList(t *testin
 		},
 	}
 	gc, err := NewGC(GCOptions{
-		Store:  store,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     store,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -521,10 +526,11 @@ func TestGCPerformsNoDeletesWhenListingFails(t *testing.T) {
 
 	failing := &failingListStore{RetentionStore: f.store, failOn: "v1/groups"}
 	gc, err := NewGC(GCOptions{
-		Store:  failing,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     failing,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -545,10 +551,11 @@ func TestGCPerformsNoDeletesWhenPayloadListingFails(t *testing.T) {
 
 	failing := &failingListStore{RetentionStore: f.store, failOn: "v1/payloads"}
 	gc, err := NewGC(GCOptions{
-		Store:  failing,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     failing,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -569,10 +576,11 @@ func TestGCAbortsOnManifestTransportFailure(t *testing.T) {
 
 	failing := &failingGetStore{RetentionStore: f.store, failKey: m1.ManifestKey}
 	gc, err := NewGC(GCOptions{
-		Store:  failing,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     failing,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -683,6 +691,84 @@ func TestNewGCRequiresStore(t *testing.T) {
 	_, err := NewGC(GCOptions{Prefix: retentionPrefix})
 	require.Error(t, err)
 	require.True(t, errors.Is(err, ErrInvalidOptions))
+}
+
+func TestGCRequiresCompletedClaimsRolloutBeforeEveryPass(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	stale := f.publishManifest(t, 1, 10, []byte("old generation"), 365*24*time.Hour)
+	f.publishManifest(t, 1, 20, []byte("live generation"), 365*24*time.Hour)
+	opts := GCOptions{
+		Store: f.store, Prefix: retentionPrefix,
+		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour, MinMarkAge: time.Hour},
+		Now:    func() time.Time { return f.now },
+	}
+	gc, err := NewGC(opts)
+	require.ErrorIs(t, err, ErrInvalidOptions)
+	require.Nil(t, gc, "GC must not default to allowing legacy publishers")
+
+	legacyActive := true
+	legacyErr := errors.New("legacy publisher active")
+	opts.VerifyPublishersUseClaims = func(context.Context) error {
+		if legacyActive {
+			return legacyErr
+		}
+		return nil
+	}
+	gc, err = NewGC(opts)
+	require.NoError(t, err)
+	_, err = gc.RunOnce(context.Background())
+	require.ErrorIs(t, err, legacyErr)
+	require.True(t, f.exists(t, stale.ManifestKey))
+	require.True(t, f.exists(t, stale.Payload.Key))
+
+	legacyActive = false
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	f.now = f.now.Add(2 * time.Hour)
+	legacyActive = true
+	_, err = gc.RunOnce(context.Background())
+	require.ErrorIs(t, err, legacyErr)
+	require.True(t, f.exists(t, stale.Payload.Key), "a sweepable payload must survive when legacy publishing resumes")
+
+	legacyActive = false
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	require.False(t, f.exists(t, stale.Payload.Key))
+}
+
+type invalidRetentionStore struct {
+	RetentionStore
+	err error
+}
+
+func (s *invalidRetentionStore) ValidateRetention(context.Context) error { return s.err }
+
+func TestGCValidatesRetentionStoreBeforeEveryPass(t *testing.T) {
+	t.Parallel()
+	f := newGCFixture(t)
+	stale := f.publishManifest(t, 1, 10, []byte("stale"), 365*24*time.Hour)
+	f.publishManifest(t, 1, 20, []byte("live"), 365*24*time.Hour)
+	validationErr := errors.New("bucket policy unavailable")
+	backend := &invalidRetentionStore{RetentionStore: f.store, err: validationErr}
+	gc, err := NewGC(GCOptions{
+		Store: backend, Prefix: retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour, MinMarkAge: time.Hour},
+		Now:                       func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+	})
+	require.NoError(t, err)
+	_, err = gc.RunOnce(context.Background())
+	require.ErrorIs(t, err, validationErr)
+	require.True(t, f.exists(t, stale.ManifestKey))
+	backend.err = nil
+	_, err = gc.RunOnce(context.Background())
+	require.NoError(t, err)
+	f.now = f.now.Add(2 * time.Hour)
+	backend.err = validationErr
+	_, err = gc.RunOnce(context.Background())
+	require.ErrorIs(t, err, validationErr)
+	require.True(t, f.exists(t, stale.Payload.Key))
 }
 
 func TestRetentionPolicyDefaults(t *testing.T) {
@@ -938,8 +1024,9 @@ func TestGCHoldsPayloadClaimAcrossTheFinalManifestScan(t *testing.T) {
 		manifestKey:    orphan.ManifestKey,
 	}
 	gc, err := NewGC(GCOptions{
-		Store:  store,
-		Prefix: retentionPrefix,
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     store,
+		Prefix:                    retentionPrefix,
 		Policy: RetentionPolicy{
 			MinGenerations: 1,
 			MaxAge:         time.Hour,
@@ -1111,10 +1198,11 @@ func TestGCDoesNotDeleteManifestRewrittenByAConcurrentPublish(t *testing.T) {
 	}
 
 	gc, err := NewGC(GCOptions{
-		Store:  rewriting,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     rewriting,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -1159,10 +1247,11 @@ func TestGCKeepsManifestRefreshedBeforeItsClaim(t *testing.T) {
 		},
 	}
 	gc, err := NewGC(GCOptions{
-		Store:  store,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     store,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -1210,10 +1299,11 @@ func TestGCKeepsManifestWhoseContentChangedWithStableFilesystemMetadata(t *testi
 		},
 	}
 	gc, err := NewGC(GCOptions{
-		Store:  store,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     store,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 
@@ -1251,8 +1341,9 @@ func TestGCKeepsPayloadWhenExpiredManifestClaimIsBusy(t *testing.T) {
 		manifestKey:    stale.ManifestKey,
 	}
 	gc, err := NewGC(GCOptions{
-		Store:  store,
-		Prefix: retentionPrefix,
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     store,
+		Prefix:                    retentionPrefix,
 		Policy: RetentionPolicy{
 			MinGenerations: 1,
 			MaxAge:         time.Hour,
@@ -1308,8 +1399,9 @@ func TestGCRevalidatesReferencesOncePerPassNotPerPayload(t *testing.T) {
 
 	counting := &countingListStore{RetentionStore: f.store}
 	gc, err := NewGC(GCOptions{
-		Store:  counting,
-		Prefix: retentionPrefix,
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     counting,
+		Prefix:                    retentionPrefix,
 		Policy: RetentionPolicy{
 			MinGenerations: 1, MaxAge: time.Hour,
 			PayloadGrace: time.Hour, MinMarkAge: time.Hour,
@@ -1429,10 +1521,11 @@ func TestGCDeduplicatesListedManifestKeys(t *testing.T) {
 
 	dup := &duplicateListingStore{RetentionStore: f.store, target: only.ManifestKey}
 	gc, err := NewGC(GCOptions{
-		Store:  dup,
-		Prefix: retentionPrefix,
-		Policy: RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
-		Now:    func() time.Time { return f.now },
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+		Store:                     dup,
+		Prefix:                    retentionPrefix,
+		Policy:                    RetentionPolicy{MinGenerations: 1, MaxAge: time.Hour, PayloadGrace: time.Hour},
+		Now:                       func() time.Time { return f.now },
 	})
 	require.NoError(t, err)
 

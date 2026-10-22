@@ -54,6 +54,52 @@ func TestPublishAndRestorePhysicalSnapshotRoundTripWithS3Store(t *testing.T) {
 	require.Equal(t, manifest.Payload.SHA256, result.PayloadSHA256)
 }
 
+func TestS3RestoreDoesNotRequireBucketVersioningPermission(t *testing.T) {
+	t.Parallel()
+	for _, status := range []types.BucketVersioningStatus{"", types.BucketVersioningStatusEnabled, "FutureVersioningMode"} {
+		t.Run(string(status), func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			dataDir := seedPhysicalSnapshot(t, root, []byte("EKVTHLC1read-only-restore"), 50, 8, singlePeer())
+			client := newFakeS3Client()
+			manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
+				Store: newTestS3Store(t, client), DataDir: dataDir,
+				Prefix: "cluster-s3", GroupID: 3, SourceCluster: "cluster-s3",
+			})
+			require.NoError(t, err)
+			client.versioningStatus = status
+			client.versioningErr = errors.New("AccessDenied: s3:GetBucketVersioning")
+			putsBefore, deletesBefore := client.attempts, len(client.deletes)
+			readerStore := newTestS3Store(t, client)
+			result, err := RestorePhysicalSnapshot(ctx, RestoreOptions{
+				Store: readerStore, ManifestKey: manifest.ManifestKey, DataDir: root + "/restored",
+				Peers: []etcdraftengine.Peer{{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002"}},
+			})
+			require.NoError(t, err)
+			require.Equal(t, manifest.Payload.SHA256, result.PayloadSHA256)
+			require.Zero(t, client.versioningCalls)
+			require.Equal(t, putsBefore, client.attempts)
+			require.Len(t, client.deletes, deletesBefore)
+		})
+	}
+}
+
+func TestS3GCRequiresBucketVersioningPermissionBeforeScanning(t *testing.T) {
+	t.Parallel()
+	client := newFakeS3Client()
+	client.versioningErr = errors.New("AccessDenied: s3:GetBucketVersioning")
+	gc, err := NewGC(GCOptions{
+		Store: newTestS3Store(t, client), Prefix: "cluster-s3",
+		VerifyPublishersUseClaims: verifyTestPublishersUseClaims,
+	})
+	require.NoError(t, err)
+	_, err = gc.RunOnce(context.Background())
+	require.ErrorIs(t, err, client.versioningErr)
+	require.Equal(t, 1, client.versioningCalls)
+	require.Empty(t, client.listPrefixes)
+	require.Empty(t, client.deletes)
+}
+
 func TestS3StorePutHeadGetPreservesIntegrityMetadata(t *testing.T) {
 	ctx := context.Background()
 	fake := newFakeS3Client()
@@ -350,11 +396,13 @@ func TestS3StoreRejectsVersionedBucketsWithoutLifecycleAssertion(t *testing.T) {
 			t.Parallel()
 			client := newFakeS3Client()
 			client.versioningStatus = status
-			_, err := NewS3Store(context.Background(), S3StoreConfig{
+			store, err := NewS3Store(context.Background(), S3StoreConfig{
 				Client:               client,
 				Bucket:               "backup-bucket",
 				ServerSideEncryption: string(types.ServerSideEncryptionAes256),
 			})
+			require.NoError(t, err)
+			err = store.ValidateRetention(context.Background())
 			require.ErrorIs(t, err, ErrInvalidOptions)
 			require.ErrorContains(t, err, "noncurrent-version expiration")
 		})
@@ -374,6 +422,7 @@ func TestS3StoreAllowsVersionedBucketWithLifecycleAssertion(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.NotNil(t, store)
+	require.NoError(t, store.ValidateRetention(context.Background()))
 }
 
 func TestS3StoreRejectsUnknownVersioningStatus(t *testing.T) {
@@ -381,12 +430,14 @@ func TestS3StoreRejectsUnknownVersioningStatus(t *testing.T) {
 	for _, allow := range []bool{false, true} {
 		client := newFakeS3Client()
 		client.versioningStatus = "UnknownVersionedMode"
-		_, err := NewS3Store(context.Background(), S3StoreConfig{
+		store, err := NewS3Store(context.Background(), S3StoreConfig{
 			Client:                            client,
 			Bucket:                            "backup-bucket",
 			ServerSideEncryption:              string(types.ServerSideEncryptionAes256),
 			AllowVersionedBucketWithLifecycle: allow,
 		})
+		require.NoError(t, err)
+		err = store.ValidateRetention(context.Background())
 		require.ErrorIs(t, err, ErrIntegrity)
 		require.ErrorContains(t, err, "unknown versioning status")
 	}
@@ -447,6 +498,7 @@ type fakeS3Client struct {
 	deletes                     []string
 	versioningStatus            types.BucketVersioningStatus
 	versioningErr               error
+	versioningCalls             int
 }
 
 type fakeS3Object struct {
@@ -951,6 +1003,7 @@ func (c *fakeS3Client) GetBucketVersioning(
 ) (*s3.GetBucketVersioningOutput, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.versioningCalls++
 	if c.versioningErr != nil {
 		return nil, c.versioningErr
 	}

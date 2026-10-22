@@ -127,11 +127,12 @@ type GCResult struct {
 // GC implements the §5 retention and payload-reclamation passes over
 // one object-store prefix.
 type GC struct {
-	store  RetentionStore
-	prefix string
-	policy RetentionPolicy
-	now    func() time.Time
-	log    *slog.Logger
+	store                     RetentionStore
+	prefix                    string
+	policy                    RetentionPolicy
+	now                       func() time.Time
+	log                       *slog.Logger
+	verifyPublishersUseClaims func(context.Context) error
 
 	// marks is the §5 two-pass sweep state: the first pass that finds
 	// a payload unreferenced and past grace records what it saw, and
@@ -168,6 +169,11 @@ type GCOptions struct {
 	Store  RetentionStore
 	Prefix string
 	Policy RetentionPolicy
+	// VerifyPublishersUseClaims must confirm that every publisher sharing
+	// this prefix uses object claims and all legacy in-flight publishes have
+	// drained. It runs before each pass; fail it before allowing a downgrade
+	// or a legacy publisher to resume. A missing verifier disables GC.
+	VerifyPublishersUseClaims func(context.Context) error
 	// Now defaults to time.Now. Injected so tests can drive the age
 	// windows deterministically rather than by sleeping.
 	Now    func() time.Time
@@ -178,6 +184,9 @@ func NewGC(opts GCOptions) (*GC, error) {
 	if opts.Store == nil {
 		return nil, errors.Wrap(ErrInvalidOptions, "retention requires an object store")
 	}
+	if opts.VerifyPublishersUseClaims == nil {
+		return nil, errors.Wrap(ErrInvalidOptions, "retention requires a publisher claims rollout verifier")
+	}
 	now := opts.Now
 	if now == nil {
 		now = time.Now
@@ -187,22 +196,29 @@ func NewGC(opts GCOptions) (*GC, error) {
 		log = slog.Default()
 	}
 	return &GC{
-		store:  opts.Store,
-		prefix: cleanObjectPrefix(opts.Prefix),
-		policy: opts.Policy.withDefaults(),
-		now:    now,
-		log:    log,
-		marks:  make(map[string]payloadMark),
+		store:                     opts.Store,
+		prefix:                    cleanObjectPrefix(opts.Prefix),
+		policy:                    opts.Policy.withDefaults(),
+		now:                       now,
+		log:                       log,
+		verifyPublishersUseClaims: opts.VerifyPublishersUseClaims,
+		marks:                     make(map[string]payloadMark),
 	}, nil
 }
 
-// RunOnce executes both phases. It returns an error only when the scan
-// itself failed; a scan that completes but declines to reclaim
-// payloads returns a nil error and a GCResult with
+// RunOnce verifies rollout and backend prerequisites, then executes both
+// phases. A prerequisite or scan failure returns an error; a completed scan
+// that declines to reclaim payloads returns a nil error and a GCResult with
 // PayloadPhaseSkipped set.
 func (g *GC) RunOnce(ctx context.Context) (result GCResult, retErr error) {
 	if g == nil {
 		return GCResult{}, errors.Wrap(ErrInvalidOptions, "gc is required")
+	}
+	if err := g.verifyPublishersUseClaims(ctx); err != nil {
+		return GCResult{}, errors.Wrap(err, "retention: publishers have not completed the claims rollout")
+	}
+	if err := g.store.ValidateRetention(ctx); err != nil {
+		return GCResult{}, errors.Wrap(err, "retention: validate object store")
 	}
 
 	scan, err := g.scanManifests(ctx)

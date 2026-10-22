@@ -188,7 +188,7 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	fs.StringVar(&cfg.storeKind, "store", storeLocal, "Object store backend: local or s3")
 	fs.StringVar(&cfg.localRoot, "local-root", "", "Local object store root when --store=local")
 	fs.StringVar(&cfg.s3Bucket, "s3-bucket", "",
-		"S3 bucket when --store=s3; credentials require s3:GetBucketVersioning")
+		"S3 bucket when --store=s3")
 	fs.StringVar(&cfg.s3Region, "s3-region", cfg.s3Region, "S3 signing region")
 	fs.StringVar(&cfg.s3Endpoint, "s3-endpoint", "", "S3-compatible endpoint URL")
 	fs.StringVar(&cfg.s3Profile, "s3-profile", "", "AWS shared config profile")
@@ -196,7 +196,7 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	fs.StringVar(&cfg.s3ServerSideEncryption, "s3-sse", cfg.s3ServerSideEncryption, "Server-side encryption algorithm for uploaded objects: AES256 or aws:kms")
 	fs.StringVar(&cfg.s3KMSKeyID, "s3-kms-key-id", "", "KMS key ARN or bare key ID when --s3-sse=aws:kms; aliases are rejected")
 	fs.BoolVar(&cfg.s3DisableChecksumHeaders, "s3-disable-checksum-headers", false, "Do not send S3 checksum headers; keep metadata and restore-time verification")
-	fs.BoolVar(&cfg.s3AllowVersionedLifecycle, "s3-allow-versioned-with-lifecycle", false, "Allow an S3 versioned bucket after confirming noncurrent-version expiration is configured")
+	fs.BoolVar(&cfg.s3AllowVersionedLifecycle, "s3-allow-versioned-with-lifecycle", false, "Allow retention on an S3 versioned bucket after confirming noncurrent-version expiration is configured; not required for restore")
 }
 
 func validateStoreFlags(cfg storeFlags) error {

@@ -60,20 +60,21 @@ type S3StoreConfig struct {
 	DisableChecksumHeaders bool
 	// AllowVersionedBucketWithLifecycle is an explicit operator assertion
 	// that the bucket has a noncurrent-version expiration lifecycle. The
-	// store rejects Enabled/Suspended versioning by default because keyed
+	// GC rejects Enabled/Suspended versioning by default because keyed
 	// retention deletes otherwise create delete markers without reclaiming
 	// bytes.
 	AllowVersionedBucketWithLifecycle bool
 }
 
 type S3Store struct {
-	client                 S3ObjectClient
-	bucket                 string
-	serverSideEncryption   string
-	sseKMSKeyID            string
-	disableChecksumHeaders bool
-	multipartThreshold     int64
-	multipartPartSize      int64
+	client                            S3ObjectClient
+	bucket                            string
+	serverSideEncryption              string
+	sseKMSKeyID                       string
+	disableChecksumHeaders            bool
+	multipartThreshold                int64
+	multipartPartSize                 int64
+	allowVersionedBucketWithLifecycle bool
 }
 
 func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
@@ -97,18 +98,22 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 		})
 	}
 	bucket := stringsTrim(cfg.Bucket)
-	if err := validateS3BucketVersioning(ctx, client, bucket, cfg.AllowVersionedBucketWithLifecycle); err != nil {
-		return nil, err
-	}
 	return &S3Store{
-		client:                 client,
-		bucket:                 bucket,
-		serverSideEncryption:   stringsTrim(cfg.ServerSideEncryption),
-		sseKMSKeyID:            stringsTrim(cfg.SSEKMSKeyID),
-		disableChecksumHeaders: cfg.DisableChecksumHeaders,
-		multipartThreshold:     s3MaxSinglePutBytes,
-		multipartPartSize:      s3DefaultMultipartPart,
+		client:                            client,
+		bucket:                            bucket,
+		serverSideEncryption:              stringsTrim(cfg.ServerSideEncryption),
+		sseKMSKeyID:                       stringsTrim(cfg.SSEKMSKeyID),
+		disableChecksumHeaders:            cfg.DisableChecksumHeaders,
+		multipartThreshold:                s3MaxSinglePutBytes,
+		multipartPartSize:                 s3DefaultMultipartPart,
+		allowVersionedBucketWithLifecycle: cfg.AllowVersionedBucketWithLifecycle,
 	}, nil
+}
+
+// ValidateRetention checks versioning immediately before GC, without imposing
+// bucket-policy permissions or lifecycle requirements on read-only restores.
+func (s *S3Store) ValidateRetention(ctx context.Context) error {
+	return validateS3BucketVersioning(ctx, s.client, s.bucket, s.allowVersionedBucketWithLifecycle)
 }
 
 func validateS3BucketVersioning(

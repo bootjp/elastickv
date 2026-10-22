@@ -104,6 +104,9 @@ func PreconditionFor(ref ObjectRef) DeletePrecondition {
 type RetentionStore interface {
 	ObjectStore
 	ObjectClaimStore
+	// ValidateRetention checks backend-specific reclamation prerequisites
+	// before each pass. Read-only restore must not require these permissions.
+	ValidateRetention(ctx context.Context) error
 	ListObjects(ctx context.Context, prefix string) ([]ObjectRef, error)
 	DeleteObject(ctx context.Context, key string) error
 
@@ -123,6 +126,11 @@ type RetentionStore interface {
 
 var _ RetentionStore = (*LocalStore)(nil)
 var _ PublishStore = (*LocalStore)(nil)
+
+// ValidateRetention checks the pass context; local stores have no bucket policy.
+func (s *LocalStore) ValidateRetention(ctx context.Context) error {
+	return errors.WithStack(ctx.Err())
+}
 
 // ListObjects walks the pinned local root below prefix. Directories and
 // irregular files are skipped, while symlinks fail the all-or-error listing
