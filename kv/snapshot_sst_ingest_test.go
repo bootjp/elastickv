@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	store3 "github.com/bootjp/elastickv/store"
+	"github.com/bootjp/elastickv/store/storetest"
 	"github.com/stretchr/testify/require"
 )
 
@@ -28,9 +29,7 @@ func TestKVFSMSnapshotRoundTripsSSTIngestPayload(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, snapshot.Close())
 
-	dstStore, err := store3.NewPebbleStore(filepath.Join(t.TempDir(), "dst"))
-	require.NoError(t, err)
-	defer dstStore.Close()
+	dstStore := storetest.NewPebble(t)
 	dstFSM := NewKvFSMWithHLC(dstStore, NewHLC())
 	require.NoError(t, dstFSM.Restore(io.NopCloser(bytes.NewReader(payload.Bytes()))))
 

@@ -33,12 +33,12 @@ import (
 // dance is straightforward; reproducing it inside rapid.Check
 // would tangle with Cleanup ordering for marginal extra signal.
 func TestEncryption_Property_PutGet(t *testing.T) {
+	mvcc := newPropEncryptedStore(t)
 	rapid.Check(t, func(rt *rapid.T) {
 		key := nonEmptyBytes.Draw(rt, "key")
 		value := rapid.SliceOf(rapid.Byte()).Draw(rt, "value")
 		ts := rapid.Uint64Range(1, ^uint64(0)>>1).Draw(rt, "ts")
 
-		mvcc := newPropEncryptedStore(t)
 		ctx := context.Background()
 		require.NoError(rt, mvcc.PutAt(ctx, key, value, ts, 0))
 		got, err := mvcc.GetAt(ctx, key, ts)
@@ -52,12 +52,8 @@ func TestEncryption_Property_PutGet(t *testing.T) {
 	})
 }
 
-// newPropEncryptedStore builds a fresh encrypted MVCCStore for each
-// rapid.Check iteration. Constructing per iteration keeps the
-// CounterNonceFactory's atomic counter local to the draw — a
-// regression in the factory's uniqueness guarantee would still
-// surface across multiple PutAt calls within one iteration (rapid
-// shrinks toward minimal failing examples).
+// newPropEncryptedStore builds one encrypted fixture per Check so the nonce
+// counter is shared by all generated writes, including shrinking attempts.
 func newPropEncryptedStore(t *testing.T) MVCCStore {
 	t.Helper()
 	ks := encryption.NewKeystore()

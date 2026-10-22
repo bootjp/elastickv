@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"os"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -76,22 +75,6 @@ func runCommittedVersionAtSuite(t *testing.T, newStore func(t *testing.T) MVCCSt
 	})
 }
 
-func TestCommittedVersionAt_MVCCStore(t *testing.T) {
-	runCommittedVersionAtSuite(t, func(t *testing.T) MVCCStore {
-		t.Helper()
-		return NewMVCCStore()
-	})
-}
-
-func TestCommittedVersionAt_PebbleStore(t *testing.T) {
-	runCommittedVersionAtSuite(t, func(t *testing.T) MVCCStore {
-		t.Helper()
-		dir, err := os.MkdirTemp("", "committed-version-at")
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = os.RemoveAll(dir) })
-		s, err := NewPebbleStore(dir)
-		require.NoError(t, err)
-		t.Cleanup(func() { _ = s.Close() })
-		return s
-	})
+func TestCommittedVersionAt(t *testing.T) {
+	forEachMVCCStore(t, runCommittedVersionAtSuite)
 }

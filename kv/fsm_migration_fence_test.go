@@ -903,6 +903,9 @@ func TestFSMMigrationWriteTrackerCoversAllAdmissionPaths(t *testing.T) {
 	}, 70))
 	require.Equal(t, uint64(70), migrationTrackerMinimum(t, fsm))
 
+	// Live one-phase commits must be above the store-wide apply-order fence.
+	// Use a fresh tracker to verify this admission path independently.
+	fsm = newMigrationWriteTrackerFSM(t)
 	require.NoError(t, fsm.handleTxnRequest(ctx, &pb.Request{
 		IsTxn: true,
 		Ts:    50,

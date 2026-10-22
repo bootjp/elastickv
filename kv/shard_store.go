@@ -5507,6 +5507,19 @@ func (s *ShardStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*stor
 	return errors.WithStack(group.Store.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
 }
 
+func (s *ShardStore) ApplyMutationsRaftAtFenced(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	group, err := s.resolveSingleShardGroup(mutations)
+	if err != nil || group == nil {
+		return err
+	}
+	if err := s.ensureMutationWriteTimestampFloors(mutations, commitTS); err != nil {
+		return err
+	}
+	readKeys = s.readKeysWithStagedVisibilityAliases(group, readKeys)
+	readKeys = s.readKeysWithStagedVisibilityMutationAliases(group, readKeys, mutations)
+	return errors.WithStack(group.Store.ApplyMutationsRaftAtFenced(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
 func ensureRouteWriteTimestampFloor(route distribution.Route, key []byte, commitTS uint64) error {
 	if route.MinWriteTSExclusive == 0 || commitTS == 0 || commitTS > route.MinWriteTSExclusive {
 		return nil

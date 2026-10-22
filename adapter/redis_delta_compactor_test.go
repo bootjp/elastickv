@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"encoding/json"
+	"fmt"
+	"log/slog"
 	"strconv"
 	"sync"
 	"testing"
@@ -12,7 +15,9 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -664,7 +669,7 @@ func TestDeltaCompactor_TTLInlineRotatesPlansAcrossTicksThatRunOutOfBudget(t *te
 	for range plans {
 		ctx, cancel := context.WithCancel(context.Background())
 		st.endTick = cancel
-		require.ErrorIs(t, c.migrateTTLInlineOnce(ctx, 10), context.Canceled)
+		require.ErrorIs(t, c.migrateTTLInlineOnce(ctx, 10, time.Now()), context.Canceled)
 		cancel()
 	}
 
@@ -2281,4 +2286,501 @@ func TestListInlineMetaCompaction(t *testing.T) {
 	remaining, err := st.ScanAt(ctx, prefix, scanEnd, threshold+1, afterTS)
 	require.NoError(t, err)
 	require.Empty(t, remaining, "all list delta keys must be removed after inline compaction")
+}
+
+// ttlInlinePassTestCoordinator leads the data groups in groupIDs and, when
+// leadsKeys is set, every key. Its failDispatch-th non-empty dispatch fails.
+type ttlInlinePassTestCoordinator struct {
+	*localAdapterCoordinator
+
+	mu           sync.Mutex
+	groupIDs     []uint64
+	leadsKeys    bool
+	dispatches   int
+	failDispatch int
+}
+
+func (c *ttlInlinePassTestCoordinator) IsLeader() bool { return false }
+
+func (c *ttlInlinePassTestCoordinator) IsLeaderForKey([]byte) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.leadsKeys
+}
+
+func (c *ttlInlinePassTestCoordinator) LocalLeaderGroupIDs() ([]uint64, bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]uint64(nil), c.groupIDs...), true
+}
+
+func (c *ttlInlinePassTestCoordinator) setGroupIDs(ids []uint64) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.groupIDs = ids
+}
+
+func (c *ttlInlinePassTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if req != nil && len(req.Elems) > 0 {
+		c.mu.Lock()
+		c.dispatches++
+		fail := c.dispatches == c.failDispatch
+		c.mu.Unlock()
+		if fail {
+			return nil, errors.New("injected dispatch failure")
+		}
+	}
+	return c.localAdapterCoordinator.Dispatch(ctx, req)
+}
+
+type ttlInlinePassObservation struct {
+	typeName string
+	groupID  uint64
+	outcome  string
+}
+
+type recordedTTLInlinePass struct {
+	ttlInlinePassObservation
+	startedAt time.Time
+}
+
+type recordingTTLInlinePassObserver struct {
+	mu     sync.Mutex
+	passes []recordedTTLInlinePass
+}
+
+func (o *recordingTTLInlinePassObserver) ObserveRedisTTLInlineMigrationPass(typeName string, groupID uint64, outcome string, startedAt time.Time) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	o.passes = append(o.passes, recordedTTLInlinePass{
+		ttlInlinePassObservation: ttlInlinePassObservation{typeName: typeName, groupID: groupID, outcome: outcome},
+		startedAt:                startedAt,
+	})
+}
+
+func (o *recordingTTLInlinePassObserver) forType(typeName string) []ttlInlinePassObservation {
+	var out []ttlInlinePassObservation
+	for _, p := range o.recordedForType(typeName) {
+		out = append(out, p.ttlInlinePassObservation)
+	}
+	return out
+}
+
+func (o *recordingTTLInlinePassObserver) recordedForType(typeName string) []recordedTTLInlinePass {
+	o.mu.Lock()
+	defer o.mu.Unlock()
+	var out []recordedTTLInlinePass
+	for _, p := range o.passes {
+		if p.typeName == typeName {
+			out = append(out, p)
+		}
+	}
+	return out
+}
+
+type lockedLogBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedLogBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	n, err := b.buf.Write(p)
+	return n, errors.WithStack(err)
+}
+
+// ttlInlinePassLine is the part of a "pass complete" log line the tests check.
+type ttlInlinePassLine struct {
+	Level        string `json:"level"`
+	Type         string `json:"type"`
+	GroupID      uint64 `json:"group_id"`
+	Clean        bool   `json:"clean"`
+	FullPass     bool   `json:"full_pass"`
+	Pages        int    `json:"pages"`
+	KeysScanned  int    `json:"keys_scanned"`
+	KeysMigrated int    `json:"keys_migrated"`
+	KeysSkipped  int    `json:"keys_skipped"`
+	KeysFailed   int    `json:"keys_failed"`
+}
+
+func (b *lockedLogBuffer) ttlInlinePasses(t *testing.T, typeName string) []ttlInlinePassLine {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []ttlInlinePassLine
+	for _, line := range bytes.Split(b.buf.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Msg string `json:"msg"`
+			ttlInlinePassLine
+		}
+		require.NoError(t, json.Unmarshal(line, &rec))
+		if rec.Msg == "ttl inline migrator: pass complete" && rec.Type == typeName {
+			out = append(out, rec.ttlInlinePassLine)
+		}
+	}
+	return out
+}
+
+// wantTTLInlinePassOutcome is the monitoring outcome a pass should report: a
+// pass that is not clean but found nothing to rewrite, skip or fail did not
+// read its whole prefix, so it is partial.
+func wantTTLInlinePassOutcome(clean, foundNothing bool) string {
+	switch {
+	case clean:
+		return monitoring.RedisTTLInlinePassClean
+	case foundNothing:
+		return monitoring.RedisTTLInlinePassPartial
+	default:
+		return monitoring.RedisTTLInlinePassNotClean
+	}
+}
+
+func seedTTLInlinePassStrings(t *testing.T, st store.MVCCStore, n uint64, legacy bool) {
+	t.Helper()
+	ctx := context.Background()
+	for i := uint64(0); i < n; i++ {
+		key := []byte(fmt.Sprintf("ttl:pass:%04d", i))
+		value := []byte("value")
+		if !legacy {
+			value = encodeRedisStr(value, nil)
+		}
+		require.NoError(t, st.PutAt(ctx, redisStrKey(key), value, i+1, 0))
+	}
+}
+
+// The migrator reports each pass a scan plan completes over its prefix, so an
+// operator can tell from a clean pass on every anchor type and group that the
+// legacy TTL backlog has drained. A pass runs from the first page of the
+// prefix to the first page that is not truncated, its counters restart with
+// the next pass, and a pass that resumed a cursor from an earlier leadership
+// term, migrated keys, or left anchors unchecked is not clean.
+func TestDeltaCompactor_TTLInlineReportsCompletedPasses(t *testing.T) {
+	t.Parallel()
+
+	const typeName = "ttl-inline-string"
+	group1 := []uint64{1}
+	type pass struct {
+		level        string
+		clean        bool
+		full         bool
+		pages        int
+		keysScanned  int
+		keysMigrated int
+		keysSkipped  int
+		keysFailed   int
+	}
+	clean := func(level string, pages, scanned int) pass {
+		return pass{level: level, clean: true, full: true, pages: pages, keysScanned: scanned}
+	}
+	tests := []struct {
+		name         string
+		seed         func(*testing.T, store.MVCCStore)
+		notLeader    bool
+		failDispatch int
+		// ticks lists the groups this node leads at each tick.
+		ticks [][]uint64
+		want  []pass
+	}{
+		{
+			name:  "clean pass",
+			seed:  func(t *testing.T, st store.MVCCStore) { seedTTLInlinePassStrings(t, st, 3, false) },
+			ticks: [][]uint64{group1},
+			want:  []pass{clean("INFO", 1, 3)},
+		},
+		{
+			name:  "pass that migrated keys, then clean passes",
+			seed:  func(t *testing.T, st store.MVCCStore) { seedTTLInlinePassStrings(t, st, 3, true) },
+			ticks: [][]uint64{group1, group1, group1},
+			want: []pass{
+				{level: "INFO", full: true, pages: 1, keysScanned: 3, keysMigrated: 3},
+				clean("INFO", 1, 3),
+				clean("DEBUG", 1, 3),
+			},
+		},
+		{
+			name: "pass spanning several ticks",
+			seed: func(t *testing.T, st store.MVCCStore) {
+				seedTTLInlinePassStrings(t, st, ttlInlineMigrationTickScanLimit+88, true)
+			},
+			ticks: [][]uint64{group1, group1, group1, group1},
+			want: []pass{
+				{level: "INFO", full: true, pages: 2, keysScanned: ttlInlineMigrationTickScanLimit + 88, keysMigrated: ttlInlineMigrationTickScanLimit + 88},
+				clean("INFO", 2, ttlInlineMigrationTickScanLimit+88),
+			},
+		},
+		{
+			name: "leadership moves away mid-pass and back",
+			seed: func(t *testing.T, st store.MVCCStore) {
+				seedTTLInlinePassStrings(t, st, ttlInlineMigrationTickScanLimit+88, false)
+			},
+			ticks: [][]uint64{group1, {}, group1, group1, group1},
+			want: []pass{
+				{level: "INFO", full: false, pages: 1, keysScanned: 88},
+				clean("INFO", 2, ttlInlineMigrationTickScanLimit+88),
+			},
+		},
+		{
+			name:      "anchors this node does not lead",
+			seed:      func(t *testing.T, st store.MVCCStore) { seedTTLInlinePassStrings(t, st, 3, false) },
+			notLeader: true,
+			ticks:     [][]uint64{group1},
+			want:      []pass{{level: "INFO", full: true, pages: 1, keysScanned: 3, keysSkipped: 3}},
+		},
+		{
+			name: "anchor whose rewrite cannot be built",
+			seed: func(t *testing.T, st store.MVCCStore) {
+				ctx := context.Background()
+				require.NoError(t, st.PutAt(ctx, redisStrKey([]byte("ttl:pass:bad")), []byte("value"), 1, 0))
+				require.NoError(t, st.PutAt(ctx, redisTTLKey([]byte("ttl:pass:bad")), []byte{1}, 2, 0))
+			},
+			ticks: [][]uint64{group1},
+			want:  []pass{{level: "INFO", full: true, pages: 1, keysScanned: 1, keysFailed: 1}},
+		},
+		{
+			// The first batch of 32 commits and the second fails. The next
+			// tick reads the page again and rewrites the 33rd key; the pass
+			// counts the page once and both batches' keys.
+			name: "page retried after a failed batch",
+			seed: func(t *testing.T, st store.MVCCStore) {
+				seedTTLInlinePassStrings(t, st, ttlInlineMigrationBatchKeyLimit+1, true)
+			},
+			failDispatch: 2,
+			ticks:        [][]uint64{group1, group1},
+			want: []pass{
+				{level: "INFO", full: true, pages: 1, keysScanned: ttlInlineMigrationBatchKeyLimit + 1, keysMigrated: ttlInlineMigrationBatchKeyLimit + 1},
+			},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := &recordingTTLInlineGroupScanStore{MVCCStore: store.NewMVCCStore()}
+			tc.seed(t, st)
+			coord := &ttlInlinePassTestCoordinator{
+				localAdapterCoordinator: newLocalAdapterCoordinator(st),
+				leadsKeys:               !tc.notLeader,
+				failDispatch:            tc.failDispatch,
+			}
+			logs := &lockedLogBuffer{}
+			observer := &recordingTTLInlinePassObserver{}
+			c := NewDeltaCompactor(st, coord,
+				WithDeltaCompactorTimeout(time.Minute),
+				WithDeltaCompactorLogger(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+				WithDeltaCompactorTTLInlineMigrationObserver(observer),
+			)
+
+			for _, groups := range tc.ticks {
+				coord.setGroupIDs(groups)
+				err := c.SyncOnce(ctx)
+				if tc.failDispatch == 0 {
+					require.NoError(t, err)
+				}
+			}
+
+			lines := logs.ttlInlinePasses(t, typeName)
+			got := make([]pass, 0, len(lines))
+			for _, l := range lines {
+				require.Equal(t, uint64(1), l.GroupID)
+				got = append(got, pass{
+					level: l.Level, clean: l.Clean, full: l.FullPass, pages: l.Pages,
+					keysScanned: l.KeysScanned, keysMigrated: l.KeysMigrated,
+					keysSkipped: l.KeysSkipped, keysFailed: l.KeysFailed,
+				})
+			}
+			require.Equal(t, tc.want, got)
+
+			wantObserved := make([]ttlInlinePassObservation, 0, len(tc.want))
+			for _, p := range tc.want {
+				outcome := wantTTLInlinePassOutcome(p.clean, p.keysMigrated+p.keysSkipped+p.keysFailed == 0)
+				wantObserved = append(wantObserved, ttlInlinePassObservation{typeName: typeName, groupID: 1, outcome: outcome})
+			}
+			require.Equal(t, wantObserved, observer.forType(typeName))
+		})
+	}
+}
+
+// hookedTTLInlineScanStore runs onScan before each group scan of prefix.
+type hookedTTLInlineScanStore struct {
+	store.MVCCStore
+
+	prefix []byte
+	onScan func()
+}
+
+func (s *hookedTTLInlineScanStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
+	if bytes.HasPrefix(start, s.prefix) && s.onScan != nil {
+		s.onScan()
+	}
+	return scanPageWithResume(ctx, s.MVCCStore, start, end, limit, ts)
+}
+
+func newHookedTTLInlinePassCompactor(t *testing.T, st *hookedTTLInlineScanStore) (*DeltaCompactor, *lockedLogBuffer) {
+	t.Helper()
+	coord := &ttlInlinePassTestCoordinator{
+		localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		groupIDs:                []uint64{1},
+		leadsKeys:               true,
+	}
+	logs := &lockedLogBuffer{}
+	c := NewDeltaCompactor(st, coord,
+		WithDeltaCompactorTimeout(time.Minute),
+		WithDeltaCompactorLogger(slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))),
+	)
+	return c, logs
+}
+
+// TTL-inline migration ticks never overlap. A tick that starts while another
+// is migrating skips migration, so a page is scanned, tallied and reported by
+// one tick only. Overlapping ticks double-counted a middle page; on a one-page
+// plan, where the cursor resets to empty, the second tick even reported the
+// same page as a second pass.
+func TestDeltaCompactor_TTLInlineTicksDoNotOverlap(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name  string
+		keys  uint64
+		ticks int
+		pages int
+	}{
+		{name: "one-page plan", keys: 3, ticks: 1, pages: 1},
+		{name: "middle page", keys: 2*ttlInlineMigrationTickScanLimit + 88, ticks: 3, pages: 3},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			ctx := context.Background()
+			st := &hookedTTLInlineScanStore{MVCCStore: store.NewMVCCStore(), prefix: []byte(redisStrPrefix)}
+			seedTTLInlinePassStrings(t, st, tc.keys, false)
+			c, logs := newHookedTTLInlinePassCompactor(t, st)
+
+			// The scan of the last page runs a whole tick in between, as a
+			// concurrent SyncOnce would.
+			scans, nested := 0, false
+			st.onScan = func() {
+				scans++
+				if scans == tc.pages && !nested {
+					nested = true
+					require.NoError(t, c.SyncOnce(ctx))
+				}
+			}
+			for range tc.ticks {
+				require.NoError(t, c.SyncOnce(ctx))
+			}
+
+			require.Equal(t, tc.pages, scans, "the overlapping tick must not scan")
+			passes := logs.ttlInlinePasses(t, "ttl-inline-string")
+			require.Len(t, passes, 1)
+			require.Equal(t, tc.pages, passes[0].Pages)
+			require.EqualValues(t, tc.keys, passes[0].KeysScanned)
+			require.True(t, passes[0].Clean)
+		})
+	}
+}
+
+// A pass's duration includes its first page: the pass starts before that
+// page's scan, not when the page has been migrated.
+func TestDeltaCompactor_TTLInlinePassDurationIncludesFirstPage(t *testing.T) {
+	t.Parallel()
+
+	const scanDelay = 50 * time.Millisecond
+	st := &hookedTTLInlineScanStore{
+		MVCCStore: store.NewMVCCStore(),
+		prefix:    []byte(redisStrPrefix),
+		onScan:    func() { time.Sleep(scanDelay) },
+	}
+	seedTTLInlinePassStrings(t, st, 3, false)
+	c, logs := newHookedTTLInlinePassCompactor(t, st)
+	observer := &recordingTTLInlinePassObserver{}
+	c.ttlInlineObserver = observer
+
+	before := time.Now()
+	require.NoError(t, c.SyncOnce(context.Background()))
+	after := time.Now()
+
+	durations := logs.ttlInlinePassDurations(t, "ttl-inline-string")
+	require.Len(t, durations, 1)
+	require.GreaterOrEqual(t, durations[0], scanDelay)
+
+	// The observer gets the pass's start, which precedes its first page's
+	// scan: a gate can then require a pass that started after an event.
+	passes := observer.recordedForType("ttl-inline-string")
+	require.Len(t, passes, 1)
+	require.False(t, passes[0].startedAt.Before(before))
+	require.LessOrEqual(t, passes[0].startedAt, after.Add(-scanDelay))
+}
+
+func (b *lockedLogBuffer) ttlInlinePassDurations(t *testing.T, typeName string) []time.Duration {
+	t.Helper()
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	var out []time.Duration
+	for _, line := range bytes.Split(b.buf.Bytes(), []byte("\n")) {
+		if len(line) == 0 {
+			continue
+		}
+		var rec struct {
+			Msg      string        `json:"msg"`
+			Type     string        `json:"type"`
+			Duration time.Duration `json:"duration"`
+		}
+		require.NoError(t, json.Unmarshal(line, &rec))
+		if rec.Msg == "ttl inline migrator: pass complete" && rec.Type == typeName {
+			out = append(out, rec.Duration)
+		}
+	}
+	return out
+}
+
+// snapshotTimingCoordinator records when the compactor first asks for its
+// clock, which is when SyncOnce acquires the tick's read timestamp, and then
+// delays, as a slow read-timestamp acquisition would.
+type snapshotTimingCoordinator struct {
+	*ttlInlinePassTestCoordinator
+
+	once       sync.Once
+	snapshotAt time.Time
+}
+
+func (c *snapshotTimingCoordinator) Clock() *kv.HLC {
+	c.once.Do(func() {
+		c.snapshotAt = time.Now()
+		time.Sleep(10 * time.Millisecond)
+	})
+	return c.ttlInlinePassTestCoordinator.Clock()
+}
+
+// A pass reads its pages at the tick's read timestamp, so it starts no later
+// than that timestamp is acquired. Stamping it when the scan began let a route
+// change between the two give a pass that read a snapshot from before the
+// change a start after it.
+func TestDeltaCompactor_TTLInlinePassStartsNoLaterThanItsReadTimestamp(t *testing.T) {
+	t.Parallel()
+
+	st := &recordingTTLInlineGroupScanStore{MVCCStore: store.NewMVCCStore()}
+	seedTTLInlinePassStrings(t, st, 3, false)
+	coord := &snapshotTimingCoordinator{ttlInlinePassTestCoordinator: &ttlInlinePassTestCoordinator{
+		localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		groupIDs:                []uint64{1},
+		leadsKeys:               true,
+	}}
+	observer := &recordingTTLInlinePassObserver{}
+	c := NewDeltaCompactor(st, coord,
+		WithDeltaCompactorTimeout(time.Minute),
+		WithDeltaCompactorTTLInlineMigrationObserver(observer),
+	)
+
+	require.NoError(t, c.SyncOnce(context.Background()))
+
+	passes := observer.recordedForType("ttl-inline-string")
+	require.Len(t, passes, 1)
+	require.False(t, coord.snapshotAt.IsZero(), "SyncOnce must read the coordinator's clock")
+	require.LessOrEqual(t, passes[0].startedAt, coord.snapshotAt)
 }
