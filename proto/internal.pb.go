@@ -186,6 +186,9 @@ const (
 	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED      MigrationStateProbeKind = 3
 	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED       MigrationStateProbeKind = 4
 	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED          MigrationStateProbeKind = 5
+	// Identifies the durable source guard by job and moving range, independently
+	// of compactable catalog route history. Target-only readiness is excluded.
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT MigrationStateProbeKind = 6
 )
 
 // Enum value maps for MigrationStateProbeKind.
@@ -197,6 +200,7 @@ var (
 		3: "MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED",
 		4: "MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED",
 		5: "MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED",
+		6: "MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT",
 	}
 	MigrationStateProbeKind_value = map[string]int32{
 		"MIGRATION_STATE_PROBE_KIND_UNSPECIFIED":               0,
@@ -205,6 +209,7 @@ var (
 		"MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED":      3,
 		"MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED":       4,
 		"MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED":          5,
+		"MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT":      6,
 	}
 )
 
@@ -2409,14 +2414,15 @@ const file_internal_proto_rawDesc = "" +
 	"\x14MigrationCleanupMode\x12&\n" +
 	"\"MIGRATION_CLEANUP_MODE_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fMIGRATION_CLEANUP_MODE_VERSIONS\x10\x01\x12#\n" +
-	"\x1fMIGRATION_CLEANUP_MODE_METADATA\x10\x02*\xc9\x02\n" +
+	"\x1fMIGRATION_CLEANUP_MODE_METADATA\x10\x02*\xfe\x02\n" +
 	"\x17MigrationStateProbeKind\x12*\n" +
 	"&MIGRATION_STATE_PROBE_KIND_UNSPECIFIED\x10\x00\x12.\n" +
 	"*MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED\x10\x01\x128\n" +
 	"4MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED\x10\x02\x123\n" +
 	"/MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED\x10\x03\x122\n" +
 	".MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED\x10\x04\x12/\n" +
-	"+MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED\x10\x052\xd1\a\n" +
+	"+MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED\x10\x05\x123\n" +
+	"/MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT\x10\x062\xd1\a\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +

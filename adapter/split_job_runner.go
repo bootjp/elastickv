@@ -227,12 +227,9 @@ func (s *DistributionServer) backfillSplitJobSourceGroup(
 	if err != nil {
 		return job, err
 	}
-	groupID, needed := splitJobSourceGroupBackfill(snapshot.Routes, job)
-	if !needed {
-		groupID, needed, err = s.legacySplitJobSourceGroup(ctx, job)
-		if err != nil {
-			return job, err
-		}
+	groupID, needed, err := s.resolveLegacySplitJobSourceGroup(ctx, job, snapshot.Routes)
+	if err != nil {
+		return job, err
 	}
 	if !needed {
 		return job, nil
@@ -253,6 +250,24 @@ func (s *DistributionServer) backfillSplitJobSourceGroup(
 	return job, nil
 }
 
+func (s *DistributionServer) resolveLegacySplitJobSourceGroup(ctx context.Context, job distribution.SplitJob, routes []distribution.RouteDescriptor) (uint64, bool, error) {
+	if groupID, needed := splitJobSourceGroupBackfill(routes, job); needed {
+		return groupID, true, nil
+	}
+	groupID, found, historyErr := s.legacySplitJobSourceGroup(ctx, job)
+	if found {
+		return groupID, true, nil
+	}
+	groupID, found, err := s.discoverSplitJobSourceGroup(ctx, job, routes)
+	if err != nil {
+		return 0, false, err
+	}
+	if found {
+		return groupID, true, nil
+	}
+	return 0, false, historyErr
+}
+
 // A current predecessor may itself have migrated. Recover the original owner
 // from catalog ancestry instead of guessing from its present-day group.
 func (s *DistributionServer) legacySplitJobSourceGroup(ctx context.Context, job distribution.SplitJob) (uint64, bool, error) {
@@ -271,6 +286,56 @@ func (s *DistributionServer) legacySplitJobSourceGroup(ctx context.Context, job 
 		}
 	}
 	return 0, false, lastErr
+}
+
+func (s *DistributionServer) discoverSplitJobSourceGroup(ctx context.Context, job distribution.SplitJob, routes []distribution.RouteDescriptor) (uint64, bool, error) {
+	if s.splitMigrationClientFactory == nil {
+		return 0, false, nil
+	}
+	for _, route := range routes {
+		if route.ParentRouteID == job.SourceRouteID && bytes.Equal(route.Start, job.SplitKey) {
+			return s.probeSplitJobSourceGroups(ctx, job, route.End)
+		}
+	}
+	return 0, false, nil
+}
+
+func (s *DistributionServer) probeSplitJobSourceGroups(ctx context.Context, job distribution.SplitJob, routeEnd []byte) (uint64, bool, error) {
+	var owner uint64
+	for groupID := range s.knownRaftGroups {
+		ready, err := s.probeSplitJobSourceGroup(ctx, job, groupID, routeEnd)
+		if err != nil {
+			return 0, false, err
+		}
+		if !ready {
+			continue
+		}
+		if owner != 0 {
+			return 0, false, errors.New("multiple groups report a source guard for the migration job")
+		}
+		owner = groupID
+	}
+	return owner, owner != 0, nil
+}
+
+func (s *DistributionServer) probeSplitJobSourceGroup(ctx context.Context, job distribution.SplitJob, groupID uint64, routeEnd []byte) (bool, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationVoterProbeTimeout)
+	defer cancel()
+	source, _, err := s.splitMigrationClientFactory(attemptCtx, job, groupID)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	if source == nil {
+		return false, errors.New("split migration source discovery client is nil")
+	}
+	resp, err := source.ProbeMigrationState(attemptCtx, &pb.ProbeMigrationStateRequest{
+		JobId: job.JobID, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT,
+		RouteStart: job.SplitKey, RouteEnd: routeEnd,
+	})
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	return resp.GetReady(), nil
 }
 
 // splitJobSourceGroupBackfill decides whether job needs its SourceGroupID
@@ -421,7 +486,7 @@ func (s *DistributionServer) cleanupSplitJobTargetProofs(ctx context.Context, jo
 	if !descriptorComplete {
 		return s.persistSplitJobTargetCleanupCursor(ctx, job.JobID, descriptorCursor)
 	}
-	if _, err := target.CleanupMigration(ctx, &pb.CleanupMigrationRequest{
+	if _, err := cleanupSplitMigration(ctx, target, &pb.CleanupMigrationRequest{
 		JobId: job.JobID,
 		Mode:  pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA,
 	}); err != nil {
@@ -545,7 +610,7 @@ func (s *DistributionServer) cleanupSplitJobSourceData(ctx context.Context, job 
 		return err
 	}
 	bracket := brackets[index]
-	resp, err := source.CleanupMigration(ctx, splitMigrationCleanupRequest(job, routeEnd, bracket, cursor, job.FenceTS))
+	resp, err := cleanupSplitMigration(ctx, source, splitMigrationCleanupRequest(job, routeEnd, bracket, cursor, job.FenceTS))
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -665,7 +730,7 @@ func (s *DistributionServer) cleanupAbandonedSplitJobTarget(ctx context.Context,
 			return err
 		}
 	}
-	if _, err := target.CleanupMigration(ctx, &pb.CleanupMigrationRequest{
+	if _, err := cleanupSplitMigration(ctx, target, &pb.CleanupMigrationRequest{
 		JobId: job.JobID,
 		Mode:  pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA,
 	}); err != nil {
@@ -697,7 +762,7 @@ func (s *DistributionServer) cleanupAbandonedSplitJobTargetVersions(
 	cursor []byte,
 ) (bool, error) {
 	prefix := distribution.MigrationStagedDataKeyPrefix(job.JobID)
-	resp, err := target.CleanupMigration(ctx, &pb.CleanupMigrationRequest{
+	resp, err := cleanupSplitMigration(ctx, target, &pb.CleanupMigrationRequest{
 		JobId:           job.JobID,
 		Mode:            pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
 		RangeStart:      prefix,
@@ -748,7 +813,7 @@ func (s *DistributionServer) cleanupSplitJobSourceMetadata(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	if _, err := source.CleanupMigration(ctx, &pb.CleanupMigrationRequest{
+	if _, err := cleanupSplitMigration(ctx, source, &pb.CleanupMigrationRequest{
 		JobId: job.JobID,
 		Mode:  pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA,
 	}); err != nil {
@@ -1064,8 +1129,6 @@ func (s *DistributionServer) copySplitJobPhase(
 	minCommitTS uint64,
 	maxCommitTS uint64,
 ) error {
-	ctx, cancel := context.WithTimeout(ctx, defaultSplitMigrationCopyTimeout)
-	defer cancel()
 	if maxCommitTS == 0 {
 		return errors.New("split migration copy upper timestamp is zero")
 	}
@@ -1089,7 +1152,9 @@ func (s *DistributionServer) copySplitJobPhase(
 		return errors.New("split migration source or target client is nil")
 	}
 	progress := job.BracketProgress[progressIndex]
-	stream, err := source.ExportRangeVersions(ctx, &pb.ExportRangeVersionsRequest{
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationCopyTimeout)
+	defer cancel()
+	stream, err := source.ExportRangeVersions(attemptCtx, &pb.ExportRangeVersionsRequest{
 		RangeStart:           bracket.Start,
 		RangeEnd:             bracket.End,
 		MaxCommitTs:          maxCommitTS,
@@ -1106,11 +1171,12 @@ func (s *DistributionServer) copySplitJobPhase(
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return s.copySplitJobStream(ctx, job, progressIndex, bracket, progress, stream, target)
+	return s.copySplitJobStream(ctx, attemptCtx, job, progressIndex, bracket, progress, stream, target)
 }
 
 func (s *DistributionServer) copySplitJobStream(
 	ctx context.Context,
+	rpcCtx context.Context,
 	job distribution.SplitJob,
 	progressIndex int,
 	bracket distribution.MigrationBracket,
@@ -1128,7 +1194,7 @@ func (s *DistributionServer) copySplitJobStream(
 		}
 		nextCursor := distribution.CloneBytes(resp.GetNextCursor())
 		batchSeq := progress.LastAckedBatchSeq + 1
-		ackedCursor, duplicate, err := importSplitJobChunk(ctx, target, job, bracket, batchSeq, resp.GetVersions(), nextCursor)
+		ackedCursor, duplicate, err := importSplitJobChunk(rpcCtx, target, job, bracket, batchSeq, resp.GetVersions(), nextCursor)
 		if err != nil {
 			return err
 		}
@@ -1162,6 +1228,13 @@ func (s *DistributionServer) copySplitJobStream(
 			return nil
 		}
 	}
+}
+
+func cleanupSplitMigration(ctx context.Context, client SplitMigrationClient, req *pb.CleanupMigrationRequest) (*pb.CleanupMigrationResponse, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationCopyTimeout)
+	defer cancel()
+	resp, err := client.CleanupMigration(attemptCtx, req)
+	return resp, errors.WithStack(err)
 }
 
 // importSplitJobChunk hands one exported chunk to the target and returns the

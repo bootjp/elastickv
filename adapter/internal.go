@@ -257,6 +257,8 @@ func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMig
 	switch req.GetKind() {
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED:
 		return i.probeMigrationControl(ctx, req)
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT:
+		return i.probeMigrationSourceGuard(ctx, req)
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED:
 		return i.probeMigrationRoute(req, true), nil
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED:
@@ -273,6 +275,35 @@ func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMig
 	default:
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "unknown migration probe kind"))
 	}
+}
+
+func (i *Internal) probeMigrationSourceGuard(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+	if len(req.GetRouteStart()) == 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "source guard probe requires route_start"))
+	}
+	if err := i.verifyInternalLeaderApplied(ctx); err != nil {
+		return nil, err
+	}
+	reader, ok := i.store.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration readiness reader is not configured"))
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	for _, state := range states {
+		if migrationSourceGuardMatches(state, req) {
+			return &pb.ProbeMigrationStateResponse{Ready: true, CatalogVersion: i.migrationCatalogVersion()}, nil
+		}
+	}
+	return &pb.ProbeMigrationStateResponse{}, nil
+}
+
+func migrationSourceGuardMatches(state store.TargetStagedReadinessState, req *pb.ProbeMigrationStateRequest) bool {
+	return state.JobID == req.GetJobId() && state.MigrationJobID == req.GetJobId() && state.Armed &&
+		(state.TrackWrites || state.SourceWriteFence || state.SourceReadFence) &&
+		bytes.Equal(state.RouteStart, req.GetRouteStart()) && bytes.Equal(state.RouteEnd, normalizeOptionalEnd(req.GetRouteEnd()))
 }
 
 // sourceReadsDrained reports whether every read that could still observe the

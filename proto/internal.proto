@@ -256,6 +256,9 @@ enum MigrationStateProbeKind {
   MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED = 3;
   MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED = 4;
   MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED = 5;
+  // Identifies the durable source guard by job and moving range, independently
+  // of compactable catalog route history. Target-only readiness is excluded.
+  MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT = 6;
 }
 
 message ProbeMigrationStateRequest {
