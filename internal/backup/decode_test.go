@@ -439,8 +439,8 @@ func TestDecodeSnapshot_ChunkBlobGCKeyspacesDropAsInternal(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	b := newSnapBuilder(0)
-	b.WriteEntry([]byte(S3ChunkRefRCPrefix+"sha"), 1, []byte("rc"), false, 0, snapshotEncStateCleartx)
 	b.WriteEntry([]byte(S3ChunkBlobGCQueuePrefix+"ts|sha"), 2, []byte{}, false, 0, snapshotEncStateCleartx)
+	b.WriteEntry([]byte(S3ChunkRefRCPrefix+"sha"), 1, []byte("rc"), false, 0, snapshotEncStateCleartx)
 	res, err := DecodeSnapshot(bytes.NewReader(b.Bytes()), DecodeOptions{
 		OutRoot:  root,
 		Adapters: AllAdapters(),
