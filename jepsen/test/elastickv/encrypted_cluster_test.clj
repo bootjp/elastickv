@@ -175,13 +175,30 @@
           :storage-envelope-active true :raft-envelope-active true})}
       (fn [] (#'ekdb/finish-bootstrap-setup! test "n1" opts)))
     (is (= [[:ready "n1"] [:join "n2"] [:mount "n2"]
-            [:join "n3"] [:mount "n3"] [:admin "bootstrap"]
+            [:join "n3"] [:mount "n3"] [:ready "n4"] [:admin "bootstrap"]
             [:admin "enable-storage-envelope"] [:admin "enable-raft-envelope"]]
            @events))
     (is (= ["--discover-from=n1:50051" "--discover-from=n2:50051"
             "--discover-from=n3:50051"] @discoveries))
     (is (= #{"n1:50051" "n2:50051" "n3:50051"} (set @verified)))
     (is (= ["n1:50051" "n2:50051" "n3:50051"] (vec (take-last 3 @verified))))))
+
+(deftest a-reserved-candidate-that-never-listens-fails-database-setup
+  (let [activated? (atom false)]
+    (with-redefs-fn
+      {#'ekdb/wait-for-node-grpc! (fn [node _]
+                                    (when (= "n4" node)
+                                      (throw (ex-info "candidate did not start" {}))))
+       #'ekdb/wait-for-mount! (fn [& _])
+       #'ekdb/join-peer! (fn [& _])
+       #'ekdb/enable-peer-mount! (fn [& _])
+       #'ekdb/activate-encryption! (fn [& _] (reset! activated? true))}
+      (fn []
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"candidate did not start"
+                             (#'ekdb/finish-bootstrap-setup!
+                               {:nodes ["n1" "n2" "n3" "n4"]} "n1"
+                               {:encryption true :reserve-learner "n4"})))))
+    (is (false? @activated?))))
 
 (deftest encrypted-candidate-keeps-join-flags-on-every-start
   (let [test {:nodes ["n1" "n2" "n3" "n4"]}

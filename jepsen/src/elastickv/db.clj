@@ -590,6 +590,8 @@
   (doseq [peer (voter-peers (:nodes test) (:reserve-learner opts))]
     (join-peer! node peer opts)
     (enable-peer-mount! test peer opts))
+  (when-let [candidate (:reserve-learner opts)]
+    (wait-for-node-grpc! candidate opts))
   (when (:encryption opts)
     (activate-encryption! (assoc test :nodes (into [(first (:nodes test))]
                                                  (voter-peers (:nodes test) (:reserve-learner opts))))
