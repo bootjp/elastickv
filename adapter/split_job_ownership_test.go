@@ -26,8 +26,9 @@ func (l ownershipRuntimeLeader) AppliedConfigurationIndex() (uint64, bool) {
 }
 
 type ownershipRuntimeProposer struct {
-	fsm   kv.FSM
-	index uint64
+	fsm       kv.FSM
+	index     uint64
+	followers []kv.FSM
 }
 
 func (p *ownershipRuntimeProposer) Propose(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
@@ -37,7 +38,18 @@ func (p *ownershipRuntimeProposer) Propose(_ context.Context, data []byte) (*raf
 		return nil, store.ErrNotSupported
 	}
 	aware.SetApplyIndex(p.index)
-	return &raftengine.ProposalResult{CommitIndex: p.index, Response: p.fsm.Apply(data)}, nil
+	response := p.fsm.Apply(data)
+	for _, follower := range p.followers {
+		aware, ok := follower.(raftengine.ApplyIndexAware)
+		if !ok {
+			return nil, store.ErrNotSupported
+		}
+		aware.SetApplyIndex(p.index)
+		if err, failed := follower.Apply(data).(error); failed {
+			return nil, err
+		}
+	}
+	return &raftengine.ProposalResult{CommitIndex: p.index, Response: response}, nil
 }
 
 func (p *ownershipRuntimeProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
@@ -49,6 +61,7 @@ type ownershipRuntimeClient struct {
 	internal      *Internal
 	beforeCleanup func()
 	blockGuard    bool
+	blockMetadata bool
 }
 
 func (c *ownershipRuntimeClient) CleanupMigration(ctx context.Context, req *pb.CleanupMigrationRequest, _ ...grpc.CallOption) (*pb.CleanupMigrationResponse, error) {
@@ -59,12 +72,21 @@ func (c *ownershipRuntimeClient) CleanupMigration(ctx context.Context, req *pb.C
 	return c.internal.CleanupMigration(ctx, req)
 }
 
+func (c *ownershipRuntimeClient) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest, _ ...grpc.CallOption) (*pb.TargetStagedReadinessResponse, error) {
+	c.controls = append(c.controls, req)
+	return c.internal.ApplyTargetStagedReadiness(ctx, req)
+}
+
 func (c *ownershipRuntimeClient) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrationStateRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error) {
 	if c.blockGuard && (req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT ||
 		req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED) {
 		return &pb.ProbeMigrationStateResponse{}, nil
 	}
-	return c.internal.ProbeMigrationState(ctx, req)
+	resp, err := c.internal.ProbeMigrationState(ctx, req)
+	if c.blockMetadata && req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED {
+		resp.Ready = false
+	}
+	return resp, err
 }
 
 func newOwnershipRuntimeClient(t *testing.T, st store.MVCCStore, groupID uint64) (*ownershipRuntimeClient, raftengine.AppliedConfigurationAware) {

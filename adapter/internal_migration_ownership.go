@@ -11,7 +11,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-const migrationOwnershipProtocol = 1
+const migrationOwnershipProtocol = 2
 
 // WithInternalMigrationOwnershipReady must be wired to the real public
 // proposal/read and deterministic-apply integrations, not an environment flag.
@@ -27,6 +27,7 @@ func (i *Internal) ownershipAdmissionReady() bool {
 func ownershipCleanupMode(mode pb.MigrationCleanupMode) bool {
 	return mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE ||
 		mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR ||
+		mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE ||
 		mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH
 }
 
@@ -69,7 +70,7 @@ func (i *Internal) probeMigrationOwnership(ctx context.Context, req *pb.ProbeMig
 func migrationOwnershipGeneration(states []store.MigrationOwnershipState) (string, bool) {
 	var generation string
 	for _, state := range states {
-		if len(state.Generation) < 16 || len(state.DescriptorHash) != 32 || len(state.Receipts) == 0 {
+		if !store.MigrationOwnershipEvidenceValid(state) {
 			return "", false
 		}
 		if generation != "" && state.Generation != generation {

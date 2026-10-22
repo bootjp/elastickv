@@ -27,22 +27,25 @@ const (
 type MigrationOwnershipState struct {
 	// Generation is a replicated ownership namespace, never a configuration
 	// index, snapshot index, peer list, or watcher-derived value.
-	Generation          string
-	JobID               uint64
-	LocalGroupID        uint64
-	OwnerGroupID        uint64
-	CatalogVersion      uint64
-	ConfigurationIndex  uint64
-	AppliedIndex        uint64
-	MinWriteTSExclusive uint64
-	RouteStart          []byte
-	RouteEnd            []byte
-	Role                MigrationOwnershipRole
-	Staged              bool
-	RouteID             uint64
-	ParentRouteID       uint64
-	DescriptorHash      []byte
-	Receipts            []MigrationOwnershipReceipt
+	Generation           string
+	JobID                uint64
+	LocalGroupID         uint64
+	OwnerGroupID         uint64
+	CatalogVersion       uint64
+	ConfigurationIndex   uint64
+	AppliedIndex         uint64
+	MinWriteTSExclusive  uint64
+	RouteStart           []byte
+	RouteEnd             []byte
+	Role                 MigrationOwnershipRole
+	Staged               bool
+	RouteID              uint64
+	ParentRouteID        uint64
+	DescriptorHash       []byte
+	Receipts             []MigrationOwnershipReceipt
+	WriteFloorKnown      bool
+	SourceTrackerVersion uint64
+	SourceAppliedIndex   uint64
 }
 
 type MigrationOwnershipOperation uint8
@@ -105,7 +108,8 @@ func validMigrationOwnership(state MigrationOwnershipState) bool {
 
 func validMigrationOwnershipIdentity(state MigrationOwnershipState) bool {
 	return state.JobID != 0 && state.LocalGroupID != 0 && state.OwnerGroupID != 0 &&
-		state.CatalogVersion != 0 && state.ConfigurationIndex != 0 && state.AppliedIndex != 0 && state.MinWriteTSExclusive != 0
+		state.CatalogVersion != 0 && state.ConfigurationIndex != 0 && state.AppliedIndex != 0 &&
+		(state.MinWriteTSExclusive != 0 || state.WriteFloorKnown)
 }
 
 func cloneMigrationOwnership(states []MigrationOwnershipState) []MigrationOwnershipState {
@@ -256,6 +260,10 @@ func ownershipOperationReceipt(state MigrationOwnershipState, operation Migratio
 }
 
 func updateMigrationOwnershipAttestation(old, state MigrationOwnershipState, operation MigrationOwnershipOperation) (MigrationOwnershipState, error) {
+	if operation == MigrationOwnershipClear && ownershipSourceTransition(old, state) {
+		state.Receipts = append(append([]MigrationOwnershipReceipt(nil), old.Receipts...), ownershipOperationReceipt(state, operation))
+		return state, nil
+	}
 	if !sameMigrationOwnershipDescriptor(old, state) {
 		return MigrationOwnershipState{}, errors.WithStack(ErrMigrationOwnership)
 	}
@@ -293,6 +301,7 @@ func replayMigrationOwnershipOperation(old, state MigrationOwnershipState, opera
 
 func sameMigrationOwnershipDescriptor(a, b MigrationOwnershipState) bool {
 	return sameMigrationOwnershipRange(a, b) && a.Generation == b.Generation && a.Role == b.Role &&
+		ownershipWriteFloorKnown(a) == ownershipWriteFloorKnown(b) && a.SourceTrackerVersion == b.SourceTrackerVersion && a.SourceAppliedIndex == b.SourceAppliedIndex &&
 		a.MinWriteTSExclusive == b.MinWriteTSExclusive && a.RouteID == b.RouteID && a.ParentRouteID == b.ParentRouteID
 }
 
@@ -370,7 +379,7 @@ func validateOwnershipAcquisition(state MigrationOwnershipState, guards []Target
 		return errors.WithStack(ErrMigrationOwnership)
 	}
 	for _, guard := range guards {
-		if ownershipGuardMatchesRange(state, guard) && ownershipTargetMatches(state, guard) {
+		if ownershipGuardMatchesRange(state, guard) && (ownershipTargetMatches(state, guard) || ownershipSourceAcquisitionMatches(state, guard)) {
 			return nil
 		}
 	}
@@ -395,6 +404,9 @@ func (s *mvccStore) AcquireMigrationOwnership(_ context.Context, state Migration
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	state.AppliedIndex = appliedIndex
+	if state.SourceTrackerVersion != 0 {
+		state.SourceAppliedIndex = appliedIndex
+	}
 	if _, retired := s.migrationRetired[state.JobID]; retired {
 		return errors.WithStack(ErrMigrationRetired)
 	}
@@ -414,6 +426,9 @@ func (s *pebbleStore) AcquireMigrationOwnership(_ context.Context, state Migrati
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
 	state.AppliedIndex = appliedIndex
+	if state.SourceTrackerVersion != 0 {
+		state.SourceAppliedIndex = appliedIndex
+	}
 	if err := s.checkMigrationNotRetiredLocked(state.JobID); err != nil {
 		return err
 	}

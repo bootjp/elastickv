@@ -917,6 +917,9 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 // pending.length fast-path during churn. Mirrors LeaderRoutedStore's fix
 // for codex P1 #796.
 func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	if err := s.awaitReadRouteVersion(ctx, 0); err != nil {
+		return false, err
+	}
 	route, g, ok := s.routeAndGroupForKey(key)
 	if !ok || g.Store == nil {
 		return false, nil
@@ -1005,6 +1008,9 @@ func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end 
 }
 
 func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
@@ -1110,6 +1116,9 @@ func (s *ShardStore) canonicalizeRedisWideColumnScanKeys(ctx context.Context, ke
 }
 
 func (s *ShardStore) ScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	if err := s.awaitReadRouteVersion(ctx, 0); err != nil {
+		return nil, false, err
+	}
 	if visibleLimit <= 0 || physicalLimit <= 0 {
 		return []*store.KVPair{}, false, nil
 	}
@@ -1157,6 +1166,9 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 // on any other node the read is forwarded, and the leader serves it as
 // ScanGroupAt, which may refuse such a range.
 func (s *ShardStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
+	if err := s.awaitReadRouteVersion(ctx, 0); err != nil {
+		return nil, nil, err
+	}
 	if limit <= 0 {
 		return []*store.KVPair{}, nil, nil
 	}
@@ -1240,6 +1252,9 @@ func (s *ShardStore) ownerHoldsNoVersionAt(ctx context.Context, owner distributi
 }
 
 func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64, reverse bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
@@ -1308,6 +1323,9 @@ func (s *ShardStore) ReverseScanGroupAt(ctx context.Context, groupID uint64, sta
 // ScanGroupKeysAt scans keys on the explicitly selected Raft group without
 // materializing values over proxy links.
 func (s *ShardStore) ScanGroupKeysAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([][]byte, error) {
+	if err := s.awaitReadRouteVersion(ctx, 0); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		return [][]byte{}, nil
 	}
@@ -1319,6 +1337,9 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 }
 
 func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, err
+	}
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
@@ -1336,6 +1357,9 @@ func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byt
 }
 
 func (s *ShardStore) ReverseScanAtPhysicalLimit(ctx context.Context, start []byte, end []byte, visibleLimit, physicalLimit int, ts uint64) ([]*store.KVPair, bool, error) {
+	if err := s.awaitReadRouteVersion(ctx, 0); err != nil {
+		return nil, false, err
+	}
 	if visibleLimit <= 0 || physicalLimit <= 0 {
 		return []*store.KVPair{}, false, nil
 	}

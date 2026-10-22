@@ -288,6 +288,18 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 }
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+	if migrationOwnershipProbeKind(req.GetKind()) {
+		return i.probeMigrationOwnership(ctx, req)
+	}
+	return i.probeLegacyMigrationStateKind(ctx, req)
+}
+
+func migrationOwnershipProbeKind(kind pb.MigrationStateProbeKind) bool {
+	return kind == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY ||
+		kind == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED
+}
+
+func (i *Internal) probeLegacyMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
 	switch req.GetKind() {
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY,
 		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED:
@@ -301,16 +313,20 @@ func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMig
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED:
 		return i.probeMigrationRoute(req, false), nil
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED:
-		return &pb.ProbeMigrationStateResponse{
-			Ready:          time.Now().UnixMilli() >= req.GetReadDrainNotBeforeMs() && i.sourceReadsDrained(req.GetReadDrainMinTs()),
-			CatalogVersion: i.migrationCatalogVersion(),
-		}, nil
+		return i.probeMigrationReadDrain(req), nil
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED:
 		return i.probeMigrationMetadataCleared(ctx, req.GetJobId())
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_UNSPECIFIED:
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "migration probe kind is required"))
 	default:
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "unknown migration probe kind"))
+	}
+}
+
+func (i *Internal) probeMigrationReadDrain(req *pb.ProbeMigrationStateRequest) *pb.ProbeMigrationStateResponse {
+	return &pb.ProbeMigrationStateResponse{
+		Ready:          time.Now().UnixMilli() >= req.GetReadDrainNotBeforeMs() && i.sourceReadsDrained(req.GetReadDrainMinTs()),
+		CatalogVersion: i.migrationCatalogVersion(),
 	}
 }
 
@@ -842,12 +858,17 @@ func validateCleanupMigrationRequest(req *pb.CleanupMigrationRequest) error {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup key_family is required"))
 	}
 	if ownershipCleanupMode(req.GetMode()) {
-		if !req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() == 0 {
-			return errors.WithStack(status.Error(codes.InvalidArgument, "ownership control requires applied configuration"))
-		}
-		if _, err := kv.MigrationOwnershipStateFromProto(req.GetJobId(), req.GetOwnership()); err != nil {
-			return errors.WithStack(status.Error(codes.InvalidArgument, "invalid migration ownership proof"))
-		}
+		return validateOwnershipCleanupRequest(req)
+	}
+	return nil
+}
+
+func validateOwnershipCleanupRequest(req *pb.CleanupMigrationRequest) error {
+	if !req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() == 0 {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "ownership control requires applied configuration"))
+	}
+	if _, err := kv.MigrationOwnershipStateFromProto(req.GetJobId(), req.GetOwnership()); err != nil {
+		return errors.WithStack(status.Error(codes.InvalidArgument, "invalid migration ownership proof"))
 	}
 	return nil
 }

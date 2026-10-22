@@ -976,6 +976,9 @@ func NewShardedCoordinator(engine *distribution.Engine, groups map[uint64]*Shard
 			}
 		}
 		c.configureTimestampAdmissionForGroup(g)
+		if gid != 0 {
+			configureMigrationRequestAdmission(g.Txn, g.Store, gid)
+		}
 		router.Register(gid, g.Txn, g.Store)
 		// Resolve the optional LeaseProvider capability once so
 		// groupLeaseRead / maybeRefresh test g.lp for nil instead of
@@ -3122,18 +3125,22 @@ func (c *ShardedCoordinator) validateReadKeysOnShard(ctx context.Context, gid ui
 }
 
 func (c *ShardedCoordinator) verifyTargetReadinessForReadKeyOnShard(ctx context.Context, gid uint64, g *ShardGroup, key []byte) error {
-	reader, ok := g.Store.(store.MigrationTargetReadinessReader)
-	if !ok {
-		return nil
-	}
-	states, err := reader.MigrationTargetReadinessStates(ctx)
+	view, err := readMigrationServingState(ctx, g.Store)
 	if err != nil {
-		return errors.WithStack(err)
+		return err
 	}
+	routeStart, routeEnd := readinessRouteRange(key, nextScanCursor(key))
+	serving := &ShardStore{engine: c.engine, groups: c.groups}
+	if err := serving.verifyMigrationServingFloor(ctx, 0); err != nil {
+		return err
+	}
+	if err := serving.verifyMigrationServingRange(view, distribution.Route{GroupID: gid}, routeStart, routeEnd); err != nil {
+		return err
+	}
+	states := view.Readiness
 	if len(states) == 0 {
 		return nil
 	}
-	routeStart, routeEnd := readinessRouteRange(key, nextScanCursor(key))
 	if sourceReadFenceApplies(states, routeStart, routeEnd) {
 		return errors.WithStack(ErrRouteCutoverPending)
 	}

@@ -24,6 +24,7 @@ func retireServingSource(t *testing.T, st store.MVCCStore) {
 	proofs, ok := st.(store.MigrationOwnershipStore)
 	require.True(t, ok)
 	require.NoError(t, proofs.ClearMigrationStateWithOwnership(t.Context(), store.MigrationOwnershipState{
+		Generation: "0123456789abcdef0123456789abcdef", RouteID: 3, DescriptorHash: make([]byte, 32),
 		JobID: 7, LocalGroupID: 1, OwnerGroupID: 2, CatalogVersion: 10, ConfigurationIndex: 3,
 		MinWriteTSExclusive: 100, Role: store.MigrationNonOwner, RouteStart: []byte("m"), RouteEnd: []byte("z"),
 	}, 9))
@@ -115,6 +116,8 @@ func TestMigrationServingCoalescedRequestsKeepIndependentResults(t *testing.T) {
 
 func TestMigrationServingProofRejectsMixedAndFutureVersions(t *testing.T) {
 	states := []store.MigrationOwnershipState{{JobID: 8, LocalGroupID: 1, OwnerGroupID: 1, Role: store.MigrationOwner,
+		Generation: "0123456789abcdef0123456789abcdef", RouteID: 3, ConfigurationIndex: 3, AppliedIndex: 9, DescriptorHash: make([]byte, 32),
+		Receipts:       []store.MigrationOwnershipReceipt{{Operation: store.MigrationOwnershipClear, CatalogVersion: 12, ConfigurationIndex: 3, AppliedIndex: 9, DescriptorHash: make([]byte, 32)}},
 		CatalogVersion: 12, RouteStart: []byte("m"), RouteEnd: []byte("z"), MinWriteTSExclusive: 100}}
 	for _, version := range []uint64{11, 13} {
 		_, err := migrationApplyOwnershipProofs(states, []migrationApplyRange{{[]byte("n"), []byte("o")}}, 1, version)

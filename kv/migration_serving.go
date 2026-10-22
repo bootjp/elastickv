@@ -13,6 +13,9 @@ import (
 func migrationServingFloor(states []store.MigrationOwnershipState) uint64 {
 	var floor uint64
 	for _, state := range states {
+		if !store.MigrationOwnershipEvidenceValid(state) {
+			continue
+		}
 		floor = max(floor, state.CatalogVersion)
 	}
 	return floor
@@ -71,6 +74,20 @@ func (s *ShardStore) verifyMigrationServingFloor(ctx context.Context, requested 
 	return nil
 }
 
+// MigrationReadAdmissionReady reports the concrete read gate/store pairing,
+// not an environment flag. The Internal runtime separately attests its epoch.
+func (s *ShardStore) MigrationReadAdmissionReady(groupID uint64) bool {
+	if s == nil || s.engine == nil || groupID == 0 {
+		return false
+	}
+	group := s.groups[groupID]
+	if group == nil {
+		return false
+	}
+	_, ok := group.Store.(store.MigrationOwnershipStore)
+	return ok
+}
+
 func (s *ShardStore) verifyMigrationServingRange(view store.MigrationServingState, route distribution.Route, start, end []byte) error {
 	if len(view.Ownership) == 0 {
 		return nil
@@ -83,6 +100,9 @@ func (s *ShardStore) verifyMigrationServingRange(view store.MigrationServingStat
 		return err
 	}
 	if proof.LocalGroupID != route.GroupID || proof.Role != store.MigrationOwner {
+		return errors.WithStack(ErrRouteCutoverPending)
+	}
+	if !store.MigrationOwnershipEvidenceValid(proof) {
 		return errors.WithStack(ErrRouteCutoverPending)
 	}
 	return s.verifyMigrationServingOwnerRoutes(proof, route, start, end)
@@ -143,7 +163,7 @@ func migrationApplyOwnershipProofs(states []store.MigrationOwnershipState, range
 			uncovered = true
 			continue
 		}
-		if proof.LocalGroupID != groupID || proof.Role != store.MigrationOwner || proof.CatalogVersion != version {
+		if !store.MigrationOwnershipEvidenceValid(proof) || proof.LocalGroupID != groupID || proof.Role != store.MigrationOwner || proof.CatalogVersion != version {
 			return nil, errors.WithStack(ErrRouteCutoverPending)
 		}
 		proofs = append(proofs, proof)

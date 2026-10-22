@@ -136,9 +136,10 @@ const (
 	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA    MigrationCleanupMode = 2
 	// New modes deliberately fail on old runtimes instead of letting unknown
 	// proof fields silently degrade to an unbound metadata clear.
-	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE MigrationCleanupMode = 3
-	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR   MigrationCleanupMode = 4
-	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH MigrationCleanupMode = 5
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE        MigrationCleanupMode = 3
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR          MigrationCleanupMode = 4
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH        MigrationCleanupMode = 5
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE MigrationCleanupMode = 6
 )
 
 // Enum value maps for MigrationCleanupMode.
@@ -150,14 +151,16 @@ var (
 		3: "MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE",
 		4: "MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR",
 		5: "MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH",
+		6: "MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE",
 	}
 	MigrationCleanupMode_value = map[string]int32{
-		"MIGRATION_CLEANUP_MODE_UNSPECIFIED":       0,
-		"MIGRATION_CLEANUP_MODE_VERSIONS":          1,
-		"MIGRATION_CLEANUP_MODE_METADATA":          2,
-		"MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE": 3,
-		"MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR":   4,
-		"MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH": 5,
+		"MIGRATION_CLEANUP_MODE_UNSPECIFIED":              0,
+		"MIGRATION_CLEANUP_MODE_VERSIONS":                 1,
+		"MIGRATION_CLEANUP_MODE_METADATA":                 2,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE":        3,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR":          4,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH":        5,
+		"MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE": 6,
 	}
 )
 
@@ -1914,21 +1917,24 @@ func (x *ProbeMigrationLocksResponse) GetPendingCount() uint32 {
 }
 
 type MigrationOwnershipProof struct {
-	state               protoimpl.MessageState `protogen:"open.v1"`
-	Generation          string                 `protobuf:"bytes,1,opt,name=generation,proto3" json:"generation,omitempty"`
-	LocalGroupId        uint64                 `protobuf:"varint,2,opt,name=local_group_id,json=localGroupId,proto3" json:"local_group_id,omitempty"`
-	OwnerGroupId        uint64                 `protobuf:"varint,3,opt,name=owner_group_id,json=ownerGroupId,proto3" json:"owner_group_id,omitempty"`
-	CatalogVersion      uint64                 `protobuf:"varint,4,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
-	MinWriteTsExclusive uint64                 `protobuf:"varint,5,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
-	RouteStart          []byte                 `protobuf:"bytes,6,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
-	RouteEnd            []byte                 `protobuf:"bytes,7,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
-	RouteId             uint64                 `protobuf:"varint,8,opt,name=route_id,json=routeId,proto3" json:"route_id,omitempty"`
-	ParentRouteId       uint64                 `protobuf:"varint,9,opt,name=parent_route_id,json=parentRouteId,proto3" json:"parent_route_id,omitempty"`
-	Staged              bool                   `protobuf:"varint,10,opt,name=staged,proto3" json:"staged,omitempty"`
-	Role                MigrationOwnershipRole `protobuf:"varint,11,opt,name=role,proto3,enum=MigrationOwnershipRole" json:"role,omitempty"`
-	DescriptorHash      []byte                 `protobuf:"bytes,12,opt,name=descriptor_hash,json=descriptorHash,proto3" json:"descriptor_hash,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Generation           string                 `protobuf:"bytes,1,opt,name=generation,proto3" json:"generation,omitempty"`
+	LocalGroupId         uint64                 `protobuf:"varint,2,opt,name=local_group_id,json=localGroupId,proto3" json:"local_group_id,omitempty"`
+	OwnerGroupId         uint64                 `protobuf:"varint,3,opt,name=owner_group_id,json=ownerGroupId,proto3" json:"owner_group_id,omitempty"`
+	CatalogVersion       uint64                 `protobuf:"varint,4,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	MinWriteTsExclusive  uint64                 `protobuf:"varint,5,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
+	RouteStart           []byte                 `protobuf:"bytes,6,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd             []byte                 `protobuf:"bytes,7,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	RouteId              uint64                 `protobuf:"varint,8,opt,name=route_id,json=routeId,proto3" json:"route_id,omitempty"`
+	ParentRouteId        uint64                 `protobuf:"varint,9,opt,name=parent_route_id,json=parentRouteId,proto3" json:"parent_route_id,omitempty"`
+	Staged               bool                   `protobuf:"varint,10,opt,name=staged,proto3" json:"staged,omitempty"`
+	Role                 MigrationOwnershipRole `protobuf:"varint,11,opt,name=role,proto3,enum=MigrationOwnershipRole" json:"role,omitempty"`
+	DescriptorHash       []byte                 `protobuf:"bytes,12,opt,name=descriptor_hash,json=descriptorHash,proto3" json:"descriptor_hash,omitempty"`
+	WriteFloorKnown      bool                   `protobuf:"varint,13,opt,name=write_floor_known,json=writeFloorKnown,proto3" json:"write_floor_known,omitempty"`
+	SourceTrackerVersion uint64                 `protobuf:"varint,14,opt,name=source_tracker_version,json=sourceTrackerVersion,proto3" json:"source_tracker_version,omitempty"`
+	SourceAppliedIndex   uint64                 `protobuf:"varint,15,opt,name=source_applied_index,json=sourceAppliedIndex,proto3" json:"source_applied_index,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *MigrationOwnershipProof) Reset() {
@@ -2043,6 +2049,27 @@ func (x *MigrationOwnershipProof) GetDescriptorHash() []byte {
 		return x.DescriptorHash
 	}
 	return nil
+}
+
+func (x *MigrationOwnershipProof) GetWriteFloorKnown() bool {
+	if x != nil {
+		return x.WriteFloorKnown
+	}
+	return false
+}
+
+func (x *MigrationOwnershipProof) GetSourceTrackerVersion() uint64 {
+	if x != nil {
+		return x.SourceTrackerVersion
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetSourceAppliedIndex() uint64 {
+	if x != nil {
+		return x.SourceAppliedIndex
+	}
+	return 0
 }
 
 type CleanupMigrationRequest struct {
@@ -2803,7 +2830,7 @@ const file_internal_proto_rawDesc = "" +
 	"\troute_end\x18\x02 \x01(\fR\brouteEnd\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\rR\x05limit\"B\n" +
 	"\x1bProbeMigrationLocksResponse\x12#\n" +
-	"\rpending_count\x18\x01 \x01(\rR\fpendingCount\"\xd2\x03\n" +
+	"\rpending_count\x18\x01 \x01(\rR\fpendingCount\"\xe6\x04\n" +
 	"\x17MigrationOwnershipProof\x12\x1e\n" +
 	"\n" +
 	"generation\x18\x01 \x01(\tR\n" +
@@ -2820,7 +2847,10 @@ const file_internal_proto_rawDesc = "" +
 	"\x06staged\x18\n" +
 	" \x01(\bR\x06staged\x12+\n" +
 	"\x04role\x18\v \x01(\x0e2\x17.MigrationOwnershipRoleR\x04role\x12'\n" +
-	"\x0fdescriptor_hash\x18\f \x01(\fR\x0edescriptorHash\"\xa2\x06\n" +
+	"\x0fdescriptor_hash\x18\f \x01(\fR\x0edescriptorHash\x12*\n" +
+	"\x11write_floor_known\x18\r \x01(\bR\x0fwriteFloorKnown\x124\n" +
+	"\x16source_tracker_version\x18\x0e \x01(\x04R\x14sourceTrackerVersion\x120\n" +
+	"\x14source_applied_index\x18\x0f \x01(\x04R\x12sourceAppliedIndex\"\xa2\x06\n" +
 	"\x17CleanupMigrationRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12)\n" +
 	"\x04mode\x18\x02 \x01(\x0e2\x15.MigrationCleanupModeR\x04mode\x12\x1f\n" +
@@ -2895,14 +2925,15 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x03*\x90\x02\n" +
+	"\x05ABORT\x10\x03*\xc5\x02\n" +
 	"\x14MigrationCleanupMode\x12&\n" +
 	"\"MIGRATION_CLEANUP_MODE_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fMIGRATION_CLEANUP_MODE_VERSIONS\x10\x01\x12#\n" +
 	"\x1fMIGRATION_CLEANUP_MODE_METADATA\x10\x02\x12,\n" +
 	"(MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE\x10\x03\x12*\n" +
 	"&MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR\x10\x04\x12,\n" +
-	"(MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH\x10\x05*\x8d\x01\n" +
+	"(MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH\x10\x05\x123\n" +
+	"/MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE\x10\x06*\x8d\x01\n" +
 	"\x16MigrationOwnershipRole\x12(\n" +
 	"$MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eMIGRATION_OWNERSHIP_ROLE_OWNER\x10\x01\x12%\n" +

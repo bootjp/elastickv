@@ -36,6 +36,7 @@ func deterministicMigrationOwner(t *testing.T, st store.MVCCStore) {
 	writer, ok := st.(store.MigrationOwnershipStore)
 	require.True(t, ok)
 	require.NoError(t, writer.AcquireMigrationOwnership(t.Context(), store.MigrationOwnershipState{
+		Generation: "0123456789abcdef0123456789abcdef", RouteID: 3, DescriptorHash: make([]byte, 32),
 		JobID: 7, LocalGroupID: 1, OwnerGroupID: 1, Role: store.MigrationOwner,
 		RouteStart: []byte("m"), RouteEnd: []byte("z"), CatalogVersion: 10,
 		ConfigurationIndex: 3, MinWriteTSExclusive: 100, Staged: true,

@@ -134,3 +134,36 @@ intersects migration evidence; and helper-level matching-resolution admission
 does not prove the subsequent target/composed/floor path or durable idempotent
 retry succeeds. Separate immutable operation receipts from refreshable replicated
 serving attestations, and test the complete apply path before claiming closure.
+
+## 8. SOURCE creation and public admission checkpoint
+
+SOURCE tracking uses the actual root descriptor after a root-leader applied
+barrier. Its inherited write floor is separately marked known; a verified zero
+is not the tracker's positive retention/HLC floor. The tracker is applied first
+in the data log, then a configuration-bound SOURCE acquisition records its own
+applied boundary. Until that acquisition, creation retries deterministically.
+The immutable acquisition receipt retains this boundary across later unchanged-
+descriptor REFRESH attestations and native snapshot/reopen. Source fences still
+deny creation, while authenticated persisted COMMIT/ABORT resolutions drain.
+
+Operational evidence requires generation, descriptor identity/hash, operation
+receipt, configuration and applied boundary. The decoder remains compatible
+with older records, but such unknown records cannot authorize their range.
+Unrelated ordinary KV does not require migration evidence. SOURCE controls use
+explicit opcode mode 6 and protocol 2; every voter must attest support before
+the runner submits them. An epoch change invalidates SOURCE creation until a
+new all-voter, configuration-bound attestation.
+
+The common TransactionManager proposal path checks final requests after queue
+waiting and preserves independent results for coalesced requests. ShardStore
+scan/physical/exact-version entry points and coordinator read-key checks share
+the durable serving gate. Apply repeats admission independently of proposal.
+Unpinned or incompletely covered affected requests retry before any mutation;
+there is no watcher or fabricated floor-zero fallback. Production wiring and
+the authenticated cross-leader refresh consumer remain integration gates.
+
+A later split of a certificate-bearing route can change the retained left
+descriptor hash even when that prefix keeps its owner. Unchanged-descriptor
+REFRESH cannot repair that case. A durable pre-effect catalog mutation gate or
+an explicitly replicated retained-prefix reacquisition is still required;
+this checkpoint does not claim sequential split availability or merge readiness.

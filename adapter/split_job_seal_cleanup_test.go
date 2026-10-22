@@ -25,6 +25,10 @@ func (c *routedSealCleanupClient) CleanupMigration(ctx context.Context, req *pb.
 	return c.server.CleanupMigration(ctx, req)
 }
 
+func (c *routedSealCleanupClient) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrationStateRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error) {
+	return c.server.ProbeMigrationState(ctx, req)
+}
+
 func TestSplitJobSourceCleanupRetiresRoutedDynamoSeals(t *testing.T) {
 	t.Parallel()
 	for _, legacyDone := range []bool{false, true} {
@@ -51,7 +55,7 @@ func testSplitJobSealCleanup(t *testing.T, legacyDone bool) {
 	end := append(append([]byte(nil), start...), 0)
 	catalogStore := store.NewMVCCStore()
 	catalog := distribution.NewCatalogStore(catalogStore, distribution.WithCatalogRouteDescriptorV2Writes(true))
-	_, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{RouteID: 3, ParentRouteID: 42, Start: start, End: end, GroupID: 9}})
+	snapshot, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{RouteID: 3, ParentRouteID: 42, Start: start, End: end, GroupID: 9, MinWriteTSExclusive: 50}})
 	require.NoError(t, err)
 	job := promotionCompleteDistributionJob()
 	job.SourceGroupID, job.TargetGroupID, job.FenceTS = 7, 9, 50
@@ -63,13 +67,20 @@ func testSplitJobSealCleanup(t *testing.T, legacyDone bool) {
 		job.Cursor = distribution.CloneBytes(splitCleanupDoneCursor)
 	}
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
-	client := &routedSealCleanupClient{server: NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
-		WithInternalStore(sourceStore),
-		WithInternalMigrationProposer(&applyingMigrationProposer{fsm: kv.NewKvFSMWithHLC(sourceStore, nil)}),
-		WithInternalMigrationCleanupGate(func(context.Context) error { return nil }),
-	)}
+	runtime, _ := newOwnershipRuntimeClient(t, sourceStore, 7)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(snapshot))
+	runtime.internal.routeEngine = engine
+	_, err = runtime.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{JobId: job.JobID, MigrationJobId: job.JobID,
+		RouteStart: start, RouteEnd: end, Armed: true, SourceWriteFence: true, SourceReadFence: true,
+		ExpectedCutoverVersion: snapshot.Version, MinWriteTsExclusive: job.FenceTS, RetentionPinTs: 1})
+	require.NoError(t, err)
+	client := &routedSealCleanupClient{server: runtime.internal}
 	server := NewDistributionServer(distribution.NewEngine(), catalog,
 		WithDistributionCoordinator(newDistributionCoordinatorStub(catalogStore, true)),
+		WithSplitMigrationVoterFactory(func(context.Context, uint64) ([]SplitMigrationVoter, error) {
+			return []SplitMigrationVoter{{ID: "source", Address: "source:1", Client: client}}, nil
+		}),
 		WithSplitMigrationClientFactory(func(_ context.Context, _ distribution.SplitJob, groupID uint64) (SplitMigrationClient, SplitMigrationClient, error) {
 			require.Equal(t, uint64(7), groupID)
 			return client, &splitMigrationClientStub{}, nil

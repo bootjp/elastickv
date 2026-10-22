@@ -246,6 +246,7 @@ enum MigrationCleanupMode {
   MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE = 3;
   MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR = 4;
   MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH = 5;
+  MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE = 6;
 }
 
 enum MigrationOwnershipRole {
@@ -267,6 +268,9 @@ message MigrationOwnershipProof {
   bool staged = 10;
   MigrationOwnershipRole role = 11;
   bytes descriptor_hash = 12;
+  bool write_floor_known = 13;
+  uint64 source_tracker_version = 14;
+  uint64 source_applied_index = 15;
 }
 
 message CleanupMigrationRequest {

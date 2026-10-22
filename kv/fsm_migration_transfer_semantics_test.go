@@ -19,12 +19,13 @@ func TestMigrationTransferDoesNotChangeLargeWriteAdmission(t *testing.T) {
 		phase         pb.Phase
 	}{{false, pb.Phase_NONE}, {true, pb.Phase_NONE}, {true, pb.Phase_PREPARE}} {
 		fsm := newMigrationWriteTrackerFSM(t)
+		installSourceOwnershipForTest(t, fsm, 0)
 		key := []byte("n")
 		mutations := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: value}}
 		if test.transactional {
 			mutations = append([]*pb.Mutation{{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: key, CommitTS: 60, LockTTLms: defaultTxnLockTTLms})}}, mutations...)
 		}
-		request := &pb.Request{IsTxn: test.transactional, Phase: test.phase, Ts: 50, Mutations: mutations}
+		request := &pb.Request{IsTxn: test.transactional, Phase: test.phase, Ts: 50, Mutations: mutations, ObservedRouteVersion: EncodeObservedRouteVersion(1)}
 		require.Less(t, proto.Size(request), internalutil.GRPCMaxMessageBytes)
 		require.NoError(t, fsm.applyRequestErr(ctx, request))
 		if test.phase == pb.Phase_NONE {

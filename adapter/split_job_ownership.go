@@ -86,7 +86,8 @@ func splitOwnershipProof(snapshot distribution.CatalogSnapshot, job distribution
 			role = pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_OWNER
 		}
 		return &pb.MigrationOwnershipProof{Generation: generation, LocalGroupId: localGroupID, OwnerGroupId: route.GroupID,
-			CatalogVersion: snapshot.Version, RouteStart: bytes.Clone(job.SplitKey), RouteEnd: bytes.Clone(route.End),
+			WriteFloorKnown: true,
+			CatalogVersion:  snapshot.Version, RouteStart: bytes.Clone(job.SplitKey), RouteEnd: bytes.Clone(route.End),
 			RouteId: route.RouteID, ParentRouteId: route.ParentRouteID, MinWriteTsExclusive: route.MinWriteTSExclusive,
 			Staged: localGroupID == route.GroupID && route.StagedVisibilityActive, Role: role, DescriptorHash: digest[:]}, nil
 	}
@@ -225,8 +226,24 @@ func (s *DistributionServer) prepareSplitOwnershipRollback(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	if _, _, err := s.splitOwnershipConfiguration(ctx, job.JobID, groupID, source); err != nil {
+	configuration, _, err := s.splitOwnershipConfiguration(ctx, job.JobID, groupID, source)
+	if err != nil {
 		return err
+	}
+	_, retired, err := s.syncSplitMigrationVoterBarrier(ctx, groupID, nil, source, &pb.ProbeMigrationStateRequest{
+		JobId: job.JobID, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED,
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration,
+	})
+	if err != nil {
+		return err
+	}
+	if !retired {
+		// Backfill tracking allows creation. Close it in the source log before
+		// the root publishes the rollback floor, without blocking old resolutions.
+		if _, err := applySplitMigrationControl(ctx, source, job, end, snapshot.Version,
+			max(initialMigrationRetentionPinTS, job.SnapshotTS, job.FenceTS), true, false, true, initialMigrationRetentionPinTS); err != nil {
+			return err
+		}
 	}
 	_, err = s.splitAbandonedSourceConfiguration(ctx, job, source, end)
 	return err

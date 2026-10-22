@@ -52,16 +52,7 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrMigrationCleanupApply), "kv/fsm: migration cleanup store"))
 	}
 	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA {
-		if err := f.verifyLegacyMigrationMetadataClear(ctx, req.GetJobId()); err != nil {
-			if errors.Is(err, store.ErrMigrationOwnership) || errors.Is(err, store.ErrNotSupported) {
-				return err
-			}
-			return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: inspect legacy metadata clear"))
-		}
-		if err := cleaner.ClearMigrationState(ctx, req.GetJobId(), f.pendingApplyIdx); err != nil {
-			return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: clear migration state"))
-		}
-		return nil
+		return f.applyLegacyMigrationMetadataClear(ctx, cleaner, req.GetJobId())
 	}
 	result, err := cleaner.CleanupVersions(ctx, migrationCleanupOptionsFromProto(req, f.pendingApplyIdx))
 	if err != nil {
@@ -71,6 +62,19 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: apply migration cleanup"))
 	}
 	return result
+}
+
+func (f *kvFSM) applyLegacyMigrationMetadataClear(ctx context.Context, cleaner store.MigrationCleaner, jobID uint64) any {
+	if err := f.verifyLegacyMigrationMetadataClear(ctx, jobID); err != nil {
+		if errors.Is(err, store.ErrMigrationOwnership) || errors.Is(err, store.ErrNotSupported) {
+			return err
+		}
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: inspect legacy metadata clear"))
+	}
+	if err := cleaner.ClearMigrationState(ctx, jobID, f.pendingApplyIdx); err != nil {
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: clear migration state"))
+	}
+	return nil
 }
 
 // isMigrationCleanupOrdinaryApplyError separates deterministic verdicts on the

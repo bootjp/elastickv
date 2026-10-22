@@ -821,8 +821,12 @@ func splitMigrationCleanupRequest(job distribution.SplitJob, routeEnd []byte, br
 }
 
 func (s *DistributionServer) cleanupSplitJobSourceProofs(ctx context.Context, job distribution.SplitJob) error {
-	if complete, err := s.refreshSplitJobSourceCleanupBarriers(ctx, job); err != nil || !complete {
+	complete, err := s.refreshSplitJobSourceCleanupBarriers(ctx, job)
+	if err != nil {
 		return err
+	}
+	if !complete {
+		return errors.WithStack(errSplitMigrationVoterBarrierIncomplete)
 	}
 	if err := s.cleanupSplitJobSourceMetadata(ctx, job); err != nil {
 		return err
@@ -1243,7 +1247,7 @@ func splitJobSourceSibling(routes []distribution.RouteDescriptor, job distributi
 }
 
 func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job distribution.SplitJob) error {
-	snapshot, parent, err := s.splitJobSourceRoute(ctx, job)
+	_, parent, err := s.splitJobSourceRoute(ctx, job)
 	if err != nil {
 		return err
 	}
@@ -1257,7 +1261,7 @@ func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job dist
 	if err := s.verifySplitOwnershipRuntimes(ctx, job, parent.GroupID, source); err != nil {
 		return err
 	}
-	ackCursor, complete, err := s.armSplitJobSourceTracker(ctx, job, snapshot, parent, source)
+	ackCursor, complete, err := s.armSplitJobSourceTracker(ctx, job, parent, source)
 	if err != nil {
 		return err
 	}
@@ -1279,27 +1283,10 @@ const initialMigrationRetentionPinTS = uint64(1)
 func (s *DistributionServer) armSplitJobSourceTracker(
 	ctx context.Context,
 	job distribution.SplitJob,
-	snapshot distribution.CatalogSnapshot,
 	parent distribution.RouteDescriptor,
 	source SplitMigrationClient,
 ) ([]byte, bool, error) {
-	// Arm the write tracker and its no-prune retention pin before choosing the
-	// snapshot boundary. This closes the window where a low-ts write could land
-	// after timestamp selection without being represented in the delta floor.
-	if _, err := applySplitMigrationControl(ctx, source, job, parent.End, snapshot.Version+1, initialMigrationRetentionPinTS, false, false, true, initialMigrationRetentionPinTS); err != nil {
-		return nil, false, err
-	}
-	return s.syncSplitMigrationVoterBarrier(ctx, parent.GroupID, job.FenceAckCursor, source, &pb.ProbeMigrationStateRequest{
-		JobId:                  job.JobID,
-		Kind:                   pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED,
-		RouteStart:             job.SplitKey,
-		RouteEnd:               parent.End,
-		ExpectedCatalogVersion: snapshot.Version + 1,
-		MigrationJobId:         job.JobID,
-		MinWriteTsExclusive:    initialMigrationRetentionPinTS,
-		TrackWrites:            true,
-		RetentionPinTs:         initialMigrationRetentionPinTS,
-	})
+	return s.armSplitSourceOwnership(ctx, job, parent.GroupID, source)
 }
 
 func (s *DistributionServer) persistSplitJobBackfillAck(ctx context.Context, jobID uint64, ackCursor []byte) error {

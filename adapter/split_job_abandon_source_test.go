@@ -59,18 +59,19 @@ func TestSplitJobAbandonRestoresSourceBeforeUnavailableTarget(t *testing.T) {
 					JobID: job.JobID, MigrationJobID: job.JobID, Armed: true, SourceWriteFence: true,
 					RouteStart: job.SplitKey, RouteEnd: []byte("z"), MinWriteTSExclusive: 1, RetentionPinTS: 1,
 				}))
-				cleaner, ok := sourceStore.(store.MigrationCleaner)
-				require.True(t, ok)
-				source := &abandonSourceClient{cleaner: cleaner}
-				source.probeFn = func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+				source, _ := newOwnershipRuntimeClient(t, sourceStore, 7)
+				source.blockGuard = !barrierReady
+				source.beforeCleanup = func() {
 					snapshot, loadErr := catalog.Snapshot(ctx)
 					require.NoError(t, loadErr)
-					require.NotNil(t, abandonedSplitJobFencedRoute(snapshot.Routes, job), "catalog must still fence writes during source cleanup")
-					return &pb.ProbeMigrationStateResponse{Ready: barrierReady}, nil
+					require.Nil(t, abandonedSplitJobFencedRoute(snapshot.Routes, job), "actual rollback must precede atomic OWNER/guard replacement")
 				}
 				target := &abandonUnavailableTarget{}
 				server := NewDistributionServer(distribution.NewEngine(), catalog,
-					WithDistributionCoordinator(newDistributionCoordinatorStub(st, true)),
+					WithDistributionCoordinator(&ownershipCatalogCoordinator{distributionCoordinatorStub: newDistributionCoordinatorStub(st, true)}),
+					WithSplitMigrationVoterFactory(func(context.Context, uint64) ([]SplitMigrationVoter, error) {
+						return []SplitMigrationVoter{{ID: "source", Address: "source:1", Client: source}}, nil
+					}),
 					WithSplitMigrationGroupClientFactory(func(_ context.Context, groupID uint64) (SplitMigrationClient, error) {
 						require.Equal(t, uint64(7), groupID)
 						return source, nil
@@ -93,12 +94,13 @@ func TestSplitJobAbandonRestoresSourceBeforeUnavailableTarget(t *testing.T) {
 				require.True(t, ok)
 				states, err := reader.MigrationTargetReadinessStates(ctx)
 				require.NoError(t, err)
-				require.Empty(t, states, "the durable source guard must be gone even when target cleanup cannot finish")
 				if barrierReady {
+					require.Empty(t, states, "a proven source recovers without waiting for the target")
 					require.Nil(t, abandonedSplitJobFencedRoute(snapshot.Routes, job))
 					require.Equal(t, splitCleanupDoneCursor, job.SourceCutoverAckCursor)
 					require.ErrorContains(t, server.abandonSplitJob(ctx, job), "target offline")
 				} else {
+					require.Len(t, states, 1, "an unproven voter must retain the source guard")
 					require.NotNil(t, abandonedSplitJobFencedRoute(snapshot.Routes, job))
 					require.Empty(t, job.SourceCutoverAckCursor)
 				}

@@ -38,7 +38,13 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrTargetReadinessApply), "kv/fsm: target staged readiness store"))
 	}
 	state := targetStagedReadinessStateFromProto(req)
-	state = f.preserveMigrationTrackerMinimum(ctx, state)
+	state, err := f.preserveMigrationTrackerMinimum(ctx, state)
+	if err != nil {
+		if errors.Is(err, store.ErrMigrationOwnership) {
+			return err
+		}
+		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: inspect source migration control"))
+	}
 	if err := applyTargetStagedReadinessAt(ctx, writer, state, f.pendingApplyIdx); err != nil {
 		// Validation is a pure function of the entry, so every replica rejects
 		// the same malformed request. Halting on it would let one bad internal
@@ -59,24 +65,54 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 	return nil
 }
 
-func (f *kvFSM) preserveMigrationTrackerMinimum(ctx context.Context, state store.TargetStagedReadinessState) store.TargetStagedReadinessState {
-	if !state.TrackWrites {
-		return state
-	}
+func (f *kvFSM) preserveMigrationTrackerMinimum(ctx context.Context, state store.TargetStagedReadinessState) (store.TargetStagedReadinessState, error) {
 	reader, ok := f.store.(store.MigrationTargetReadinessReader)
 	if !ok {
-		return state
+		return state, nil
 	}
 	states, err := reader.MigrationTargetReadinessStates(ctx)
 	if err != nil {
-		return state
+		return state, errors.WithStack(err)
 	}
 	for _, current := range states {
-		if current.JobID == state.JobID && (state.MinAdmittedTS == 0 || current.MinAdmittedTS < state.MinAdmittedTS) {
-			state.MinAdmittedTS = current.MinAdmittedTS
+		if current.JobID == state.JobID {
+			return preserveSourceMigrationControl(state, current)
 		}
 	}
+	return state, nil
+}
+
+func preserveSourceMigrationControl(state, current store.TargetStagedReadinessState) (store.TargetStagedReadinessState, error) {
+	if armedSourceMigrationControl(current) {
+		if !sameSourceMigrationControlRange(state, current) {
+			return state, errors.WithStack(store.ErrMigrationOwnership)
+		}
+		state = mergeSourceMigrationControl(state, current)
+	}
+	if state.TrackWrites && (state.MinAdmittedTS == 0 || current.MinAdmittedTS < state.MinAdmittedTS) {
+		state.MinAdmittedTS = current.MinAdmittedTS
+	}
+	return state, nil
+}
+
+func armedSourceMigrationControl(state store.TargetStagedReadinessState) bool {
+	return state.Armed && (state.TrackWrites || state.SourceWriteFence || state.SourceReadFence)
+}
+
+func mergeSourceMigrationControl(state, current store.TargetStagedReadinessState) store.TargetStagedReadinessState {
+	state.SourceWriteFence = state.SourceWriteFence || current.SourceWriteFence
+	state.SourceReadFence = state.SourceReadFence || current.SourceReadFence
+	state.TrackWrites = state.TrackWrites || current.TrackWrites
+	state.MinWriteTSExclusive = max(state.MinWriteTSExclusive, current.MinWriteTSExclusive)
+	if state.RetentionPinTS == 0 || current.RetentionPinTS < state.RetentionPinTS {
+		state.RetentionPinTS = current.RetentionPinTS
+	}
 	return state
+}
+
+func sameSourceMigrationControlRange(state, current store.TargetStagedReadinessState) bool {
+	return state.Armed && state.MigrationJobID == current.MigrationJobID &&
+		bytes.Equal(state.RouteStart, current.RouteStart) && bytes.Equal(state.RouteEnd, current.RouteEnd)
 }
 
 func (f *kvFSM) recordMigrationWrite(ctx context.Context, muts []*pb.Mutation, commitTS uint64) error {

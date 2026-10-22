@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -103,12 +104,19 @@ func TestSplitJobStaleFailureDoesNotOverwriteConcurrentProgress(t *testing.T) {
 	for range maxSplitJobPhaseFailures - 1 {
 		require.Error(t, server.RunSplitJobRunnerOnce(ctx))
 	}
+	// Fresh route/read-drain ACKs are legitimate durable progress too. Race
+	// against the current record, not the pre-ACK fixture that CAS must reject.
+	observed, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	job = observed
 	progressed := distribution.CloneSplitJob(job)
 	progressed.Cursor = distribution.CloneBytes(splitSourceCleanupDoneCursor)
 	progressed.UpdatedAtMs++
 	original := server.splitMigrationClientFactory
+	var advance sync.Once
 	server.splitMigrationClientFactory = func(ctx context.Context, current distribution.SplitJob, group uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-		require.NoError(t, catalog.SaveSplitJob(ctx, job, progressed))
+		advance.Do(func() { require.NoError(t, catalog.SaveSplitJob(ctx, job, progressed)) })
 		return original(ctx, current, group)
 	}
 	require.ErrorContains(t, server.RunSplitJobRunnerOnce(ctx), "invalid split cleanup cursor")
@@ -137,7 +145,7 @@ func failedCleanupFixture(t *testing.T) (context.Context, *DistributionServer, *
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
 	client := &splitMigrationClientStub{}
 	server := NewDistributionServer(distribution.NewEngine(), catalog,
-		WithDistributionCoordinator(newDistributionCoordinatorStub(st, true)),
+		WithDistributionCoordinator(&ownershipCatalogCoordinator{distributionCoordinatorStub: newDistributionCoordinatorStub(st, true)}),
 		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
 			return client, client, nil
 		}),
