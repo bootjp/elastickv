@@ -13,7 +13,11 @@ func splitMigrationMutatingMethod(method string) bool {
 	switch method {
 	case pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
-		pb.Distribution_RetrySplitJob_FullMethodName:
+		pb.Distribution_RetrySplitJob_FullMethodName,
+		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
+		pb.Internal_ImportRangeVersions_FullMethodName,
+		pb.Internal_PromoteStagedVersions_FullMethodName,
+		pb.Internal_CleanupMigration_FullMethodName:
 		return true
 	default:
 		return false

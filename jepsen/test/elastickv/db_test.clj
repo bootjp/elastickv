@@ -3,11 +3,29 @@
             [clojure.java.shell :as sh]
             [clojure.string :as str]
             [clojure.test :refer :all]
-            [elastickv.db :as db])
+            [elastickv.db :as db]
+            [jepsen.control :as c]
+            [jepsen.control.util :as cu])
   (:import (java.nio.file Files)
            (java.nio.file.attribute FileAttribute)))
 
 (def ^:private awkward-dir "/mnt/elastickv test's dir")
+
+(deftest migration-nodes-explicitly-allow-unauthenticated-test-helpers
+  (doseq [enabled? [false true]]
+    (let [started (atom nil)]
+      (with-redefs [c/session (constantly :test-session)
+                    c/disconnect (constantly nil)
+                    c/exec (constantly nil)
+                    cu/start-daemon! (fn [opts _bin & args]
+                                       (reset! started {:opts opts :args (set args)}))]
+        (#'db/start-node! {:nodes ["n1"]} "n1"
+                         {:bootstrap-node "n1" :grpc-port 50051 :redis-port 6379
+                          :data-dir "/tmp/test" :migration-enabled enabled?}))
+      (is (= enabled? (contains? (:args @started) "--adminInsecureNoAuth")))
+      (doseq [opcode ["IMPORT" "PROMOTE" "CLEANUP"]]
+        (is (= (when enabled? "true")
+               (get-in @started [:opts :env (str "ELASTICKV_ENABLE_MIGRATION_" opcode "_OPCODE")])))))))
 
 (defn- bash-parses? [script]
   (zero? (:exit (sh/sh "bash" "-n" "-c" script))))

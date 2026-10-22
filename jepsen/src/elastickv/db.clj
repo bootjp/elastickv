@@ -219,6 +219,8 @@
                mount-dir (conj "--filesystemMount" mount-dir)
                (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
                (seq shard-ranges) (conj "--shardRanges" shard-ranges)
+               ;; Isolated migration tests intentionally use unauthenticated helpers.
+               migration-enabled (conj "--adminInsecureNoAuth")
                bootstrap? (conj "--raftBootstrap"))
         effective-server-env (cond-> (or server-env {})
                                migration-enabled

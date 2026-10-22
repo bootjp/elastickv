@@ -18,6 +18,10 @@ func TestSplitMigrationTokenAuthProtectsMutators(t *testing.T) {
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
+		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
+		pb.Internal_ImportRangeVersions_FullMethodName,
+		pb.Internal_PromoteStagedVersions_FullMethodName,
+		pb.Internal_CleanupMigration_FullMethodName,
 	}
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {
@@ -54,6 +58,10 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
+		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
+		pb.Internal_ImportRangeVersions_FullMethodName,
+		pb.Internal_PromoteStagedVersions_FullMethodName,
+		pb.Internal_CleanupMigration_FullMethodName,
 	} {
 		_, err := unary(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
 			t.Fatal("unauthenticated migration must not reach the handler")
@@ -69,4 +77,36 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 	insecureUnary, insecureStream := SplitMigrationTokenAuth("", true)
 	require.Nil(t, insecureUnary)
 	require.Nil(t, insecureStream)
+}
+
+func TestSplitMigrationTokenAuthLeavesNormalPeerRPCsUnchanged(t *testing.T) {
+	t.Parallel()
+	for _, token := range []string{"", "admin-secret"} {
+		unary, stream := SplitMigrationTokenAuth(token, false)
+		for _, method := range []string{
+			pb.Internal_Forward_FullMethodName,
+			pb.Internal_ExportRangeVersions_FullMethodName,
+			pb.Internal_ProbeMigrationState_FullMethodName,
+			pb.Internal_ProbeMigrationLocks_FullMethodName,
+			pb.Internal_IssueMigrationTimestamp_FullMethodName,
+			pb.Distribution_ListRoutes_FullMethodName,
+			pb.Distribution_GetSplitMigrationCapability_FullMethodName,
+		} {
+			ctx := context.Background()
+			called := false
+			_, err := unary(ctx, nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
+				called = true
+				return nil, nil
+			})
+			require.NoError(t, err)
+			require.True(t, called)
+			called = false
+			err = stream(nil, &adminAuthTestServerStream{ctx: ctx}, &grpc.StreamServerInfo{FullMethod: method}, func(any, grpc.ServerStream) error {
+				called = true
+				return nil
+			})
+			require.NoError(t, err)
+			require.True(t, called)
+		}
+	}
 }
