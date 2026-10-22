@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8, 9A–9B, 9C-1, 9C-2, and 9D shipped (5E deferred); remaining Stage 9 work open
+Status: Partial — Stages 0–8, 9A–9B, 9C-1, 9C-2, 9C-4, and 9D shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -36,8 +36,10 @@ Date: 2026-04-29
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
 | 9C-2 | Sidecar/KEK observability: `active_dek_id{purpose}`, `sidecar_raft_index`, `kek_unwrap_seconds` (§9.2) | shipped | — |
+| 9C-3 | Startup KEK unwrap cache and production wiring (§6.5) | in review | PR #1226 |
+| 9C-4 | §5.2 writes-per-DEK rotation budget: the 2^32 per-(DEK, process-load) ceiling, the 90% refuse-and-rotate threshold, and per-DEK accounting. The §9.2 `writes_per_dek` counter ships separately in 9C-1, from the storage-envelope path; wiring this budget to the same accounting is part of the open row below. | shipped | this PR |
 | 9D | Encrypted Jepsen acceptance gate (§8.4): `elastickv-admin encryption wrap-dek` (local KEK-wrap helper so an operator or a script can produce the `bootstrap` / `rotate-dek` material without hand-rolling AES-GCM), `scripts/jepsen-enable-encryption.sh` (bootstrap → `enable-storage-envelope` → `enable-raft-envelope` → wait for every member), `scripts/run-jepsen-local.sh --encrypted`, and an `encryption: [off, on]` matrix on the per-push `Jepsen Test` workflow so every Redis / DynamoDB / S3 / SQS / filesystem workload also runs against an encrypted 3-node cluster. | shipped | this PR |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks (§5.2, §5.4, §6.5, §8.3) | open | — |
+| 9C+ | Rotation rewrap/retire/rewrite, admission-control and auto-propose wiring for the budget above, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks (§5.2, §5.4, §6.5, §8.3, §9.2) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
