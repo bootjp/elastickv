@@ -31,6 +31,7 @@ func TestValidateRawMutationRejectsReservedControlKeys(t *testing.T) {
 		[]byte("!migstage|7|victim"),
 		[]byte("!migwrite|7"),
 		[]byte("!migfence|7"),
+		[]byte(store.ReplicatedControlPrefix + "ttl-inline"),
 	} {
 		err := f.validateRawMutationForApply(ctx, &pb.Mutation{Op: pb.Op_PUT, Key: key, Value: []byte("v")}, nil, 10, nil)
 		require.ErrorIs(t, err, ErrInvalidRequest, "key %q must be refused", key)
@@ -106,6 +107,7 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 		distribution.MigrationStagedDataKey(7, []byte("victim")),
 		[]byte("!migwrite|7"),
 		[]byte("!migfence|7"),
+		[]byte(store.ReplicatedControlPrefix + "ttl-inline"),
 	} {
 		muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}}
 		_, err := f.uniqueMutationsAboveFloor(muts, 10)

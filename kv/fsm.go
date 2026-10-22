@@ -451,6 +451,7 @@ func firstOperationalRequestFailure(results []error) error {
 func isRawApplyVerdict(err error) bool {
 	return errors.Is(err, ErrInvalidRequest) ||
 		errors.Is(err, ErrUnknownRequestType) ||
+		errors.Is(err, ErrTTLInlineCapabilityRequired) ||
 		errors.Is(err, ErrBackupTimestampFenced) ||
 		errors.Is(err, ErrRouteWriteFenced) ||
 		errors.Is(err, ErrRouteWriteTimestampTooLow) ||
@@ -1536,10 +1537,6 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 	if err != nil {
 		return err
 	}
-	if err := validateAbsenceMutationKinds(uniq); err != nil {
-		return err
-	}
-
 	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
 	if err != nil {
 		return err
@@ -1602,7 +1599,7 @@ func rejectReservedControlMutations(muts []*pb.Mutation) error {
 		if mut == nil {
 			continue
 		}
-		if distribution.IsMigrationOnlyControlKey(mut.Key) {
+		if distribution.IsMigrationOnlyControlKey(mut.Key) || store.IsReplicatedControlKey(mut.Key) {
 			return errors.WithStack(ErrInvalidRequest)
 		}
 	}
@@ -2357,6 +2354,9 @@ func txnLockConflictError(lockBytes []byte, key, primaryKey []byte, startTS uint
 }
 
 func toStoreMutations(muts []*pb.Mutation) ([]*store.KVPairMutation, error) {
+	if err := validateAbsenceMutationKinds(muts); err != nil {
+		return nil, err
+	}
 	out := make([]*store.KVPairMutation, 0, len(muts))
 	for _, mut := range muts {
 		switch mut.Op {

@@ -3,6 +3,8 @@ package kv
 import (
 	"bytes"
 	"encoding/binary"
+
+	"github.com/bootjp/elastickv/store"
 )
 
 const (
@@ -87,6 +89,7 @@ func isTxnInternalKey(key []byte) bool {
 		bytes.HasPrefix(key, txnRollbackPrefixBytes) ||
 		bytes.HasPrefix(key, txnSuccessPrefixBytes) ||
 		bytes.HasPrefix(key, txnMetaPrefixBytes) ||
+		store.IsReplicatedControlKey(key) ||
 		bytes.Equal(key, backupTimestampFloorKey)
 }
 

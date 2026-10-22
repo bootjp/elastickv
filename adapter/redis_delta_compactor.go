@@ -81,10 +81,9 @@ type DeltaCompactor struct {
 
 	stateMu      sync.Mutex
 	backoffUntil time.Time
-	// handlerCursor and ttlInlinePlanCursor are where the next tick's
-	// background handlers and TTL-inline scan plans start, so a tick that runs
-	// out of budget hands the rest of the rotation to the next one.
-	handlerCursor       int
+	// backgroundCursor rotates delta handlers and migration plans together.
+	// ttlInlinePlanCursor supports standalone migration passes.
+	backgroundCursor    int
 	ttlInlinePlanCursor int
 
 	ttlInlineGroupsUnknownOnce sync.Once
@@ -350,39 +349,12 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	tickCtx = readTimestamp.WithDispatchVoucher(tickCtx)
 	readTS := readTimestamp.Timestamp()
 
-	combined := c.compactBackgroundHandlers(tickCtx, readTS)
-	if tickCtx.Err() == nil {
-		if err := c.migrateTTLInlineOnce(tickCtx, readTS, snapshotAt); err != nil && !errors.Is(err, context.Canceled) {
-			combined = errors.CombineErrors(combined, err)
-		}
-	}
+	combined := c.compactBackgroundRotation(tickCtx, readTS, snapshotAt)
 	if deltaCompactorBudgetExhausted(combined, tickCtx, ctx) {
 		c.backoffBackgroundCompaction(c.timeoutBackoff)
 		c.logger.WarnContext(ctx, "delta compactor: backing off after timeout",
 			"backoff", c.timeoutBackoff,
 			"error", combined)
-	}
-	return errors.WithStack(combined)
-}
-
-func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS uint64) error {
-	if !c.coord.IsLeader() {
-		return nil
-	}
-	handlers := c.allHandlers()
-	start := c.rotationStart(&c.handlerCursor, len(handlers))
-	var combined error
-	for offset := range handlers {
-		if ctx.Err() != nil {
-			return errors.WithStack(errors.CombineErrors(combined, ctx.Err()))
-		}
-		idx := (start + offset) % len(handlers)
-		h := handlers[idx]
-		err := c.compactHandlerSafely(ctx, h, readTS)
-		c.advanceRotation(&c.handlerCursor, idx, len(handlers))
-		if err != nil && !errors.Is(err, context.Canceled) {
-			combined = errors.CombineErrors(combined, err)
-		}
 	}
 	return errors.WithStack(combined)
 }

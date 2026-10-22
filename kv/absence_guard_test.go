@@ -73,6 +73,44 @@ func TestAbsenceGuardCapabilityAndPhaseAdmission(t *testing.T) {
 	require.Equal(t, []byte("migration"), got)
 }
 
+func TestAbsenceGuardRawBatchRefusalDoesNotHalt(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	s, err := store.NewPebbleStore(dir)
+	require.NoError(t, err)
+	closed := false
+	t.Cleanup(func() {
+		if !closed {
+			_ = s.Close()
+		}
+	})
+	f := g17FSM(t, s)
+	guarded := g17RawPut(10, "guarded", "blocked")
+	guarded.Mutations[0].RequireAbsent = true
+	response := f.Apply(g17Entry(t, guarded, g17RawPut(11, "ordinary", "accepted")))
+	result, ok := response.(*fsmApplyResponse)
+	require.True(t, ok, "a deterministic capability refusal must not halt apply: %T", response)
+	require.Len(t, result.results, 2)
+	require.ErrorIs(t, result.results[0], ErrTTLInlineCapabilityRequired)
+	require.NoError(t, result.results[1])
+	require.False(t, g17Exists(t, s, "guarded"))
+	require.True(t, g17Exists(t, s, "ordinary"))
+	index, present := g17AppliedIndex(t, s)
+	require.True(t, present)
+	require.Equal(t, g17EntryIndex, index)
+	require.NoError(t, s.Close())
+	closed = true
+
+	reopened := g17OpenStore(t, dir)
+	index, present = g17AppliedIndex(t, reopened)
+	require.True(t, present)
+	require.Equal(t, g17EntryIndex, index, "restart must not replay a poison entry")
+	require.True(t, g17Exists(t, reopened, "ordinary"))
+	next := g17FSM(t, reopened)
+	next.SetApplyIndex(index + 1)
+	require.Nil(t, next.Apply(g17Entry(t, g17RawPut(12, "next", "accepted"))))
+}
+
 func TestAbsenceGuardLeavesLegacyRequestsUnchanged(t *testing.T) {
 	t.Parallel()
 	s := store.NewMVCCStore()

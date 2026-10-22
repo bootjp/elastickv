@@ -46,8 +46,8 @@ type ttlInlineMigrationTickPlan struct {
 
 // migrateTTLInlineOnce runs every handler's scan plans under the tick's
 // budget. The plans share that budget, so each tick starts at the plan after
-// the last one the previous tick ran, as compactBackgroundHandlers rotates its
-// handlers; starting from the first plan every tick starved the later handlers
+// the last one the previous tick ran. SyncOnce uses the combined background
+// rotation instead; starting from the first plan every tick starved later handlers
 // and groups whenever the earlier plans used up the budget.
 //
 // snapshotAt is a wall-clock time no later than the acquisition of readTS. A
