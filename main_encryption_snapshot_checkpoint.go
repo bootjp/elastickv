@@ -7,7 +7,32 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/cockroachdb/errors"
+	etcdraft "go.etcd.io/raft/v3"
 )
+
+const maxEncryptionSnapshotGapAttempts = 3
+
+func verifySidecarGapWithSnapshot(engine encryptionGapEngine, sc *encryption.Sidecar) error {
+	var previousStart uint64
+	var scanErr error
+	for range maxEncryptionSnapshotGapAttempts {
+		start, err := sidecarGapStartFromSnapshot(engine, sc)
+		if err != nil {
+			return err
+		}
+		if scanErr != nil && start <= previousStart {
+			return errors.Wrap(scanErr, "encryption startup guard: snapshot proof did not advance")
+		}
+		scanErr = encryption.GuardSidecarBehindRaftLog(start, engine.AppliedIndex(), engine.EncryptionScanner())
+		if !errors.Is(scanErr, etcdraft.ErrCompacted) {
+			return errors.Wrap(scanErr, "encryption startup guard: scan retained suffix")
+		}
+		// Snapshot work can compact the selected generation during the scan.
+		// Retry only if a freshly verified witness advances its covered prefix.
+		previousStart = start
+	}
+	return errors.Wrap(scanErr, "encryption startup guard: snapshot compaction retry limit")
+}
 
 func sidecarGapStartFromSnapshot(engine encryptionGapEngine, sc *encryption.Sidecar) (uint64, error) {
 	start := sc.RaftAppliedIndex

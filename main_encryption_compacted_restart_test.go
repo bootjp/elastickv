@@ -56,6 +56,80 @@ type checkpointScanner struct {
 	hit        bool
 }
 
+type advancingCheckpointScanner struct {
+	t       *testing.T
+	engine  *checkpointGapEngine
+	variant string
+	calls   int
+}
+
+func (s *advancingCheckpointScanner) HasEncryptionRelevantEntryInRange(start, end uint64) (bool, error) {
+	s.calls++
+	require.Equal(s.t, uint64(877), end)
+	if s.variant == "keeps-compacting" {
+		require.Equal(s.t, s.engine.snapshotIndex, start)
+		s.engine.snapshotIndex++
+		return false, etcdraft.ErrCompacted
+	}
+	if s.calls > 1 {
+		require.Equal(s.t, uint64(870), start)
+		return s.variant == "retained-rotation", nil
+	}
+	require.Equal(s.t, uint64(860), start)
+	if s.variant == "unavailable" {
+		return false, etcdraft.ErrUnavailable
+	}
+	if s.variant != "unchanged" {
+		s.engine.snapshotIndex = 870
+	}
+	switch s.variant {
+	case "missing-proof":
+		s.engine.payload = []byte("EKVTHLC1\x00\x00\x00\x00\x00\x00\x00\x01")
+	case "changed-proof":
+		s.engine.payload[len(s.engine.payload)-1] ^= 1
+	case "verification-error":
+		s.engine.snapshotErr = io.ErrUnexpectedEOF
+	}
+	return false, etcdraft.ErrCompacted
+}
+
+func TestEncryptionCheckpointRetriesCompactionOnlyWithNewProof(t *testing.T) {
+	for _, variant := range []string{"advance", "unchanged", "missing-proof", "changed-proof", "verification-error", "retained-rotation", "unavailable", "keeps-compacting"} {
+		t.Run(variant, func(t *testing.T) {
+			sc := &encryption.Sidecar{Version: encryption.SidecarVersion, RaftAppliedIndex: 6}
+			engine := &checkpointGapEngine{
+				stubGapEngine: stubGapEngine{appliedIndex: 877},
+				payload:       checkpointHeader(t, sc), snapshotIndex: 860,
+			}
+			scanner := &advancingCheckpointScanner{t: t, engine: engine, variant: variant}
+			engine.scanner = scanner
+			path := filepath.Join(t.TempDir(), "keys.json")
+			require.NoError(t, encryption.WriteSidecar(path, sc))
+			err := runSidecarBehindRaftLogGuard(engine, path, 1)
+			if variant == "advance" {
+				require.NoError(t, err)
+				require.Equal(t, 2, scanner.calls)
+			} else {
+				require.Error(t, err)
+			}
+			switch variant {
+			case "unchanged", "missing-proof", "keeps-compacting":
+				require.ErrorIs(t, err, etcdraft.ErrCompacted)
+			case "changed-proof", "retained-rotation":
+				require.ErrorIs(t, err, encryption.ErrSidecarBehindRaftLog)
+			case "verification-error":
+				require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			case "unavailable":
+				require.ErrorIs(t, err, etcdraft.ErrUnavailable)
+				require.Equal(t, 1, scanner.calls)
+			}
+			if variant == "keeps-compacting" {
+				require.Equal(t, 3, scanner.calls, "continuous compaction must stop at the retry bound")
+			}
+		})
+	}
+}
+
 func (s *checkpointScanner) HasEncryptionRelevantEntryInRange(start, end uint64) (bool, error) {
 	if start < s.start {
 		return false, etcdraft.ErrCompacted

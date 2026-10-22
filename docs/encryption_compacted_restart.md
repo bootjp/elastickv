@@ -48,6 +48,14 @@ retained suffix remains subject to the original gap scan; encrypted entries
 are authenticated and decrypted before inspecting their opcode. Missing
 keys or invalid authentication tags are startup failures, never "no hit".
 
+A newer snapshot can compact the retained suffix between snapshot selection
+and its scan. Only `ErrCompacted` from that scan triggers a retry against the
+currently installed, fully reverified snapshot. The verified covered prefix
+must advance, and at most three scans are attempted. Absent or inconsistent
+proof, CRC/authentication errors, a nonadvancing snapshot, or continuous
+compaction past that bound still refuse startup. No compacted history is
+treated as harmless merely because a scan was overtaken.
+
 The membership/collision, pre-bump epoch rollback, post-replay epoch rollback,
 writer-registration, and physical snapshot recovery paths remain enabled.
 The witness deliberately cannot authorize a nonce epoch reset.
@@ -102,3 +110,7 @@ consume the extension. The pure `GuardSidecarBehindRaftLog` API is unchanged.
 The no-gap fast path keeps the original sidecar index rather than advancing
 it. Its sole production caller still invokes the pure gap guard afterward;
 the engine's full-restore and header-only-skip CRC checks are unchanged.
+The snapshot-gap retry helper has one production caller, the startup guard.
+Each retry recomputes the gap from the unchanged sidecar and a freshly verified
+installed snapshot; only the typed suffix-compaction error is retried. The
+pure guard and all its other callers retain their original semantics.
