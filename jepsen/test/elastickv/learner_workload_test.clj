@@ -12,7 +12,8 @@
             [elastickv.jepsen-test :as jt]
             [elastickv.learner-workload :as lw]
             [jepsen.checker :as checker]
-            [jepsen.nemesis]))
+            [jepsen.nemesis :as nemesis]
+            [jepsen.net :as net]))
 
 (defn- check [history]
   (checker/check (lw/learner-safety-checker) {} history {}))
@@ -490,7 +491,26 @@
     ;; And the nemesis must claim exactly those.
     (let [n (lw/learner-partition-nemesis nodes)]
       (is (some? n))
-      (is (satisfies? jepsen.nemesis/Nemesis n)))))
+      (is (satisfies? nemesis/Nemesis n)))))
+
+(deftest partition-counters-are-sampled-inside-the-network-boundaries
+  (let [nodes  ["n1" "n2" "n3" "n4"]
+        test   {:nodes nodes :net :test-net}
+        n      (lw/learner-partition-nemesis nodes)
+        events (atom [])]
+    (with-redefs [net/drop-all! (fn [_test _grudge]
+                                  (swap! events conj :partition-installed))
+                  net/heal! (fn [_net _test]
+                              (swap! events conj :partition-healed))
+                  ekdb/lease-read-counters (fn [_node]
+                                             (swap! events conj :counter-sampled)
+                                             {:hit 1 :miss 0})]
+      (nemesis/invoke! n test {:type :info :f :start-partition})
+      (is (= [:partition-installed :counter-sampled] @events))
+
+      (reset! events [])
+      (nemesis/invoke! n test {:type :info :f :stop-partition})
+      (is (= [:counter-sampled :partition-healed] @events)))))
 
 (deftest the-learner-partition-runs-once-not-in-a-cycle
   ;; The promotion converts the candidate into a voter, so a later window

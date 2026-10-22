@@ -739,21 +739,25 @@
         ;; being empty.
         (let [probe-node (first (:nodes test))]
           (case (:f op)
-            :start-partition (let [before (ekdb/lease-read-counters probe-node)]
-                               ;; jepsen.net/drop-all! is the 2-arity wrapper in
-                               ;; jepsen.net -- it reads (:net test) itself. Only
-                               ;; jepsen.net.proto/drop-all! takes net first, and
-                               ;; heal! below differs because it is import-vars'd
-                               ;; straight from the protocol.
+            :start-partition (do
+                               ;; The interval begins only after the network
+                               ;; fault is installed. Sampling before drop-all!
+                               ;; would admit pre-partition reads into the delta.
                                (net/drop-all! test grudge)
-                               (assoc op :value {:scope          :learners-only
-                                                 :isolated       [learner]
-                                                 :lease-counters before}))
-            :stop-partition  (do (net/heal! (:net test) test)
+                               (let [before (ekdb/lease-read-counters probe-node)]
                                  (assoc op :value {:scope          :learners-only
-                                                   :healed         true
-                                                   :lease-counters (ekdb/lease-read-counters
-                                                                     probe-node)}))
+                                                   :isolated       [learner]
+                                                   :lease-counters before})))
+            :stop-partition  (let [after (try
+                                           ;; Sample while isolation is still
+                                           ;; active; finally guarantees that a
+                                           ;; failed scrape cannot strand it.
+                                           (ekdb/lease-read-counters probe-node)
+                                           (finally
+                                             (net/heal! (:net test) test)))]
+                               (assoc op :value {:scope          :learners-only
+                                                 :healed         true
+                                                 :lease-counters after}))
             (assoc op :value :unsupported))))
 
       (teardown! [_this test]

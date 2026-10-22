@@ -613,22 +613,16 @@ func adminObjectListingFromAdapter(in adapter.AdminObjectListing) admin.AdminObj
 // object-only sentinels (UploadTooLarge, InvalidObjectKey,
 // ObjectNotFound) that the bucket-tier path never sees.
 func translateAdminObjectsError(err error) error {
-	switch {
-	case err == nil:
+	if err == nil {
 		return nil
-	case errors.Is(err, adapter.ErrAdminForbidden):
-		return admin.ErrObjectsForbidden
-	case errors.Is(err, adapter.ErrAdminNotLeader):
-		return admin.ErrObjectsNotLeader
-	case errors.Is(err, adapter.ErrAdminBucketNotFound):
-		return admin.ErrObjectsBucketNotFound
-	case errors.Is(err, adapter.ErrAdminObjectNotFound):
-		return admin.ErrObjectsNotFound
-	case errors.Is(err, adapter.ErrAdminUploadTooLarge):
-		return admin.ErrObjectsUploadTooLarge
-	case errors.Is(err, adapter.ErrAdminInvalidBucketName),
-		errors.Is(err, adapter.ErrAdminInvalidObjectKey),
-		errors.Is(err, adapter.ErrAdminInvalidContinuationToken):
+	}
+	for _, m := range adminObjectsSentinels {
+		if errors.Is(err, m.from) {
+			return m.to
+		}
+	}
+	switch {
+	case isAdminObjectsValidationError(err):
 		// Wrap the adapter's text so the handler's ErrObjectsValidation
 		// branch surfaces a useful message rather than the bare
 		// sentinel string. Same pattern translateAdminBucketsError
@@ -639,6 +633,25 @@ func translateAdminObjectsError(err error) error {
 	default:
 		return err //nolint:wrapcheck // forwarded so the handler logs but does not surface it.
 	}
+}
+
+// adminObjectsSentinels pairs each adapter object-tier sentinel with the
+// admin sentinel the HTTP handler matches on.
+var adminObjectsSentinels = []struct{ from, to error }{
+	{from: adapter.ErrAdminForbidden, to: admin.ErrObjectsForbidden},
+	{from: adapter.ErrAdminNotLeader, to: admin.ErrObjectsNotLeader},
+	{from: adapter.ErrAdminBucketNotFound, to: admin.ErrObjectsBucketNotFound},
+	{from: adapter.ErrAdminObjectNotFound, to: admin.ErrObjectsNotFound},
+	{from: adapter.ErrAdminUploadTooLarge, to: admin.ErrObjectsUploadTooLarge},
+	{from: adapter.ErrAdminUploadThrottled, to: admin.ErrObjectsUploadThrottled},
+}
+
+// isAdminObjectsValidationError reports whether err is one of the adapter's
+// object-tier request validation sentinels (answered with 400).
+func isAdminObjectsValidationError(err error) bool {
+	return errors.Is(err, adapter.ErrAdminInvalidBucketName) ||
+		errors.Is(err, adapter.ErrAdminInvalidObjectKey) ||
+		errors.Is(err, adapter.ErrAdminInvalidContinuationToken)
 }
 
 func bucketSummaryFromAdapter(in adapter.AdminBucketSummary) admin.BucketSummary {

@@ -50,7 +50,7 @@
   "Install minimal packages on a node."
   [node]
   (c/on node
-    (debian/install [:curl :netcat-openbsd :rsync :iptables :chrony :libfaketime])))
+    (debian/install [:curl :netcat-openbsd :rsync :iptables :chrony :libfaketime :fuse3])))
 
 (defn- upload-binaries!
   "Copy built binaries to the given node."
@@ -75,16 +75,16 @@
   Numeric fields come back as longs and quoted strings unquoted, so a caller
   can ask for :commit_index or :applied_index without re-deriving the format."
   [out]
-  (->> (clojure.string/split-lines (or out ""))
+  (->> (str/split-lines (or out ""))
        (keep (fn [line]
                (when-let [[_ k v] (re-matches #"\s*([a-z_]+):\s+(.*)" line)]
-                 (let [v (clojure.string/trim v)]
+                 (let [v (str/trim v)]
                    [(keyword k)
                     (cond
                       (re-matches #"-?\d+" v) (Long/parseLong v)
                       (and (> (count v) 1)
-                           (clojure.string/starts-with? v "\"")
-                           (clojure.string/ends-with? v "\""))
+                           (str/starts-with? v "\"")
+                           (str/ends-with? v "\""))
                       (subs v 1 (dec (count v)))
                       :else v)]))))
        (into {})))
@@ -102,14 +102,12 @@
   "Reads elastickv_lease_read_total{outcome=...} from a node's metrics
   endpoint, as {:hit n :miss n}.
 
-  This is the only direct evidence of WHICH read path ran. A lease read that
-  loses the fast path does not fail -- kv/raft_engine.go falls back to
-  LinearizableRead -- and on a single-host cluster that fallback costs
-  milliseconds, so latency cannot separate the two either. The counter can:
-  the metric's own help text defines miss as \"fell back to LinearizableRead\".
+  This is the only direct evidence of which read path ran. A lease read that
+  loses the fast path falls back to LinearizableRead instead of failing, so
+  latency alone cannot identify the regression.
 
-  Returns nil when the endpoint is unreachable, so a caller can tell \"no
-  samples\" apart from \"zero misses\"."
+  Returns nil when the endpoint is unreachable, so callers can distinguish no
+  samples from zero misses."
   [node]
   (try
     (let [out (c/on node
@@ -170,41 +168,111 @@
 (defn- build-raft-dynamo-map [nodes grpc-port dynamo-port raft-groups]
   (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
+(defn- filesystem-mount-dir
+  "Resolves the FUSE mount directory for node from the :filesystem-mount
+   option, which is either a single path applied to every node or a map of
+   node -> path. nil disables the filesystem frontend."
+  [filesystem-mount node]
+  (cond
+    (nil? filesystem-mount) nil
+    (map? filesystem-mount) (get filesystem-mount node)
+    :else                   filesystem-mount))
+
+(defn- sh-quote
+  "Single-quotes s for use inside a bash -c script."
+  [s]
+  (str "'" (clojure.string/replace (str s) "'" "'\\''") "'"))
+
+(defn- proc-mounts-escape
+  "Encodes a path the way /proc/mounts prints mount points: backslash, space,
+   tab and newline become octal escapes."
+  [path]
+  (-> (str path)
+      (clojure.string/replace "\\" "\\134")
+      (clojure.string/replace " " "\\040")
+      (clojure.string/replace "\t" "\\011")
+      (clojure.string/replace "\n" "\\012")))
+
+(defn- unmount-filesystem-cmd
+  "Shell snippet that lazily detaches a (possibly dangling) FUSE mount. A
+   node killed with SIGKILL leaves its mount point in a 'transport endpoint
+   is not connected' state, which would make the next --filesystemMount fail.
+   The filesystem type comes from the mounts table (mountpoint(1) cannot stat
+   a dangling mount) and only a FUSE mount is touched: the snippet runs as
+   root, so a mis-typed --filesystem-mount naming an unrelated volume must
+   warn rather than reach the generic umount fallback. The path is quoted
+   because the snippet runs through bash -c."
+  ([mount-dir]
+   (unmount-filesystem-cmd mount-dir "/proc/mounts"))
+  ([mount-dir mounts-file]
+   (let [q   (sh-quote mount-dir)
+         esc (sh-quote (proc-mounts-escape mount-dir))
+         mf  (sh-quote mounts-file)]
+     (str "fstype=$(while read -r _ mp fs _; do [ \"$mp\" = " esc " ] && printf '%s\\n' \"$fs\"; done < " mf " | tail -n 1); "
+          "case \"$fstype\" in "
+          "'') ;; "
+          "fuse|fuse.*|fuseblk) fusermount3 -uz " q " 2>/dev/null || fusermount -uz " q " 2>/dev/null || umount -l " q " || true ;; "
+          "*) echo \"refusing to unmount non-FUSE filesystem ($fstype) at \"" q " >&2 ;; "
+          "esac"))))
+
+(defn- wait-for-mount-cmd
+  "Shell snippet that waits up to ~60s for mount-dir to become a mountpoint.
+   The server mounts the filesystem after its public listeners are up, so a
+   gRPC readiness check alone would let clients hit the bare directory."
+  [mount-dir]
+  (let [q (sh-quote mount-dir)]
+    (str "for i in $(seq 1 60); do if mountpoint -q " q "; then exit 0; fi; sleep 1; done; "
+         "echo \"Timed out waiting for FUSE mount at \"" q "; exit 1")))
+
+(defn- prepare-filesystem-mount!
+  "Ensures mount-dir exists and holds no stale mount before the server starts."
+  [mount-dir]
+  (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))
+  (c/exec :mkdir :-p mount-dir))
+
+(defn- wait-for-mount!
+  "Blocks until node has mounted the filesystem at mount-dir (no-op when nil)."
+  [node mount-dir]
+  (when mount-dir
+    (c/on node
+      (c/exec :bash "-c" (wait-for-mount-cmd mount-dir)))))
+
+(defn- cleanup-filesystem-mount!
+  "Detaches the node's mount after the server stopped."
+  [node mount-dir]
+  (when mount-dir
+    (c/on node
+      (c/su
+        (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
+
 (defn server-args
   "The server argv for one node.
 
   Pure and exported so the flags are assertable without SSH: a test that could
   only observe the process would pass while a flag was silently dropped."
   [{:keys [node grpc redis data-dir raft-engine raft-redis-map dynamo
-           raft-dynamo-map s3 sqs sqs-region raft-groups shard-ranges
-           bootstrap? join-as-learner join-members]}]
+           raft-dynamo-map s3 sqs sqs-region filesystem-mount raft-groups
+           shard-ranges bootstrap? join-as-learner join-members]}]
   (cond-> ["--address" grpc
-                      "--redisAddress" redis
-                      "--raftId" (name node)
-                      "--raftDataDir" data-dir
-                      "--raftEngine" (or raft-engine "etcd")
-                      "--raftRedisMap" raft-redis-map]
-               dynamo (conj "--dynamoAddress" dynamo
-                            "--raftDynamoMap" raft-dynamo-map)
-               s3 (conj "--s3Address" s3)
-               sqs (conj "--sqsAddress" sqs)
-               (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
-               (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
-               (seq shard-ranges) (conj "--shardRanges" shard-ranges)
-               bootstrap? (conj "--raftBootstrap")
-               ;; A node held out of the voter set still has to START. With a
-               ;; fresh data dir, no --raftBootstrap and no peer list, the etcd
-               ;; engine refuses to self-bootstrap (errNoPeersConfigured) and
-               ;; the process exits before anything can attach it as a
-               ;; learner. --raftJoinMembers supplies transport discovery for
-               ;; the existing cluster, and --raftJoinAsLearner declares the
-               ;; intent so a ConfState that lists this node as a voter raises
-               ;; the §4.5 alarm.
-               join-as-learner (conj "--raftJoinAsLearner")
-               (and join-as-learner join-members) (conj "--raftJoinMembers" join-members)))
+           "--redisAddress" redis
+           "--raftId" (name node)
+           "--raftDataDir" data-dir
+           "--raftEngine" (or raft-engine "etcd")
+           "--raftRedisMap" raft-redis-map]
+    dynamo (conj "--dynamoAddress" dynamo
+                 "--raftDynamoMap" raft-dynamo-map)
+    s3 (conj "--s3Address" s3)
+    sqs (conj "--sqsAddress" sqs)
+    (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
+    filesystem-mount (conj "--filesystemMount" filesystem-mount)
+    (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
+    (seq shard-ranges) (conj "--shardRanges" shard-ranges)
+    bootstrap? (conj "--raftBootstrap")
+    join-as-learner (conj "--raftJoinAsLearner")
+    (and join-as-learner join-members) (conj "--raftJoinMembers" join-members)))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env join-as-learner join-members]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env filesystem-mount join-as-learner join-members]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -222,13 +290,14 @@
         raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
         raft-dynamo-map (when dynamo
                           (build-raft-dynamo-map (:nodes test) grpc-port dynamo-port raft-groups))
+        mount-dir (filesystem-mount-dir filesystem-mount node)
         bootstrap? (= node bootstrap-node)
         args (server-args {:node node :grpc grpc :redis redis :data-dir data-dir
                            :raft-engine raft-engine :raft-redis-map raft-redis-map
                            :dynamo dynamo :raft-dynamo-map raft-dynamo-map
                            :s3 s3 :sqs sqs :sqs-region sqs-region
-                           :raft-groups raft-groups :shard-ranges shard-ranges
-                           :bootstrap? bootstrap?
+                           :filesystem-mount mount-dir :raft-groups raft-groups
+                           :shard-ranges shard-ranges :bootstrap? bootstrap?
                            :join-as-learner join-as-learner
                            :join-members join-members})
         daemon-opts (cond-> {:chdir bin-dir
@@ -239,6 +308,8 @@
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)
+        (when mount-dir
+          (prepare-filesystem-mount! mount-dir))
         (apply cu/start-daemon! daemon-opts server-bin args)))))
 
 (defn- stop-node!
@@ -270,16 +341,22 @@
                 "for i in $(seq 1 60); do if nc -z -w 1 $1 $2; then exit 0; fi; sleep 1; done; echo \\\"Timed out waiting for $1:$2\\\"; exit 1"
                 "--" (name node) (str p))))))
 
+(defn- join-node!
+  "Join peer into cluster via raftadmin, executed on bootstrap node."
+  [bootstrap-node leader-addr peer-id peer-addr]
+  (c/on bootstrap-node
+    (c/su
+      (try (c/exec :pkill :-f "raftadmin") (catch Exception _))
+      (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
+              raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
+
 (defn join-members-arg
   "The --raftJoinMembers value for a learner candidate: raftID=host:port pairs.
 
-  The candidate is INCLUDED, at its own listener address. Excluding it looks
-  right -- it is joining, not already a member -- but `resolveJoinServers`
-  (main.go) refuses to start when the list omits the local --raftId, returning
-  ErrJoinMembersMissingLocalNode, and it also requires the entry's address to
-  equal the local listener address. So a candidate handed a members list
-  without itself receives the join flags and then exits during startup
-  validation, which is not a learner that can be attached."
+  The candidate is included at its own listener address. resolveJoinServers
+  rejects a list that omits the local --raftId or gives it another address, so
+  the candidate must remain present even though setup does not add it as a
+  voter."
   [nodes reserved grpc-port]
   (let [reserved (when reserved (name reserved))
         members  (->> nodes
@@ -290,20 +367,74 @@
          (clojure.string/join ","))))
 
 (defn voter-peers
-  "The peers setup! joins as voters: every node after the bootstrap one,
-  minus any reserved learner candidate."
+  "The peers setup joins as voters: every node after the bootstrap one, minus
+  any reserved learner candidate."
   [nodes reserved]
   (let [reserved (when reserved (name reserved))]
     (vec (remove #(= reserved (name %)) (rest nodes)))))
 
-(defn- join-node!
-  "Join peer into cluster via raftadmin, executed on bootstrap node."
-  [bootstrap-node leader-addr peer-id peer-addr]
-  (c/on bootstrap-node
-    (c/su
-      (try (c/exec :pkill :-f "raftadmin") (catch Exception _))
-      (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
-              raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
+(defn- node-start-opts
+  [test node opts]
+  (let [grpc-port (or (:grpc-port opts) 50051)
+        reserved  (:reserve-learner opts)
+        learner?  (and reserved (= (name node) (name reserved)))]
+    (merge {:data-dir data-dir
+            :grpc-port grpc-port
+            :redis-port (or (:redis-port opts) 6379)
+            :bootstrap-node (first (:nodes test))}
+           opts
+           (when learner?
+             {:join-as-learner true
+              :join-members (join-members-arg (:nodes test) reserved grpc-port)}))))
+
+(defn- wait-for-node-grpc!
+  [node opts]
+  (if-let [raft-groups (:raft-groups opts)]
+    (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
+                              (group-ids raft-groups)))
+    (wait-for-grpc! node (or (:grpc-port opts) 50051))))
+
+(defn- join-peer!
+  "Adds peer to the cluster led by bootstrap-node, retrying until it answers."
+  [bootstrap-node peer opts]
+  (let [raft-groups (:raft-groups opts)
+        grpc-port (or (:grpc-port opts) 50051)
+        group-ids (when (seq raft-groups) (group-ids raft-groups))]
+    (util/await-fn
+      (fn []
+        (try
+          (if (seq raft-groups)
+            (doseq [gid group-ids]
+              (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
+              (join-node! bootstrap-node
+                          (group-addr bootstrap-node raft-groups gid)
+                          (name peer)
+                          (group-addr peer raft-groups gid)))
+            (do
+              (wait-for-grpc! peer grpc-port)
+              (join-node! bootstrap-node
+                          (node-addr bootstrap-node grpc-port)
+                          (name peer)
+                          (node-addr peer grpc-port))))
+          true
+          (catch Throwable t
+            (warn t "retrying join for" peer)
+            nil)))
+      {:timeout 120000
+       :log-message (str "joining " peer)})))
+
+(defn- enable-peer-mount!
+  "Restarts a freshly joined peer with its FUSE mount. The server initializes
+   the filesystem root synchronously at startup and needs a Raft leader for
+   that, which an unjoined peer does not have, so peers start without the
+   mount and only get it once they are cluster members."
+  [test peer opts]
+  (when-let [mount-dir (filesystem-mount-dir (:filesystem-mount opts) peer)]
+    (stop-node! peer)
+    (start-node! test peer (node-start-opts test peer opts))
+    (wait-for-node-grpc! peer opts)
+    (wait-for-mount! peer mount-dir)
+    (info "filesystem mounted on joined peer" peer)))
 
 (defrecord ElastickvDB [opts]
   db/DB
@@ -314,51 +445,18 @@
       (c/su
         (c/exec :mkdir :-p data-dir)
         (c/exec :rm :-f log-file transport-metrics-file)))
-    (let [grpc-port (or (:grpc-port opts) 50051)
-          reserved   (:reserve-learner opts)
-          learner?   (and reserved (= (name node) (name reserved)))]
-      (start-node! test node (merge {:data-dir data-dir
-                                     :grpc-port grpc-port
-                                     :redis-port (or (:redis-port opts) 6379)
-                                     :bootstrap-node (first (:nodes test))}
-                                    opts
-                                    ;; The reserved candidate joins an existing
-                                    ;; cluster instead of bootstrapping one.
-                                    (when learner?
-                                      {:join-as-learner true
-                                       :join-members (join-members-arg
-                                                       (:nodes test) reserved grpc-port)}))))
-    (when (= node (first (:nodes test)))
-      (let [raft-groups (:raft-groups opts)
-            grpc-port (or (:grpc-port opts) 50051)
-            group-ids (when (seq raft-groups) (group-ids raft-groups))]
-        ;; A reserved node is deliberately NOT made a voter, so a learner
-        ;; workload has a non-member to attach. Without this every node is a
-        ;; voter before the workload starts and :add-learner has nothing to
-        ;; act on.
+    (let [bootstrap? (= node (first (:nodes test)))
+          start-opts (node-start-opts test node opts)]
+      ;; Only the bootstrap node mounts immediately; peers are restarted with
+      ;; their mount by enable-peer-mount! once they have joined.
+      (start-node! test node (if bootstrap?
+                               start-opts
+                               (assoc start-opts :filesystem-mount nil)))
+      (when bootstrap?
+        (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
         (doseq [peer (voter-peers (:nodes test) (:reserve-learner opts))]
-          (util/await-fn
-            (fn []
-              (try
-                (if (seq raft-groups)
-                  (doseq [gid group-ids]
-                    (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
-                    (join-node! node
-                                (group-addr node raft-groups gid)
-                                (name peer)
-                                (group-addr peer raft-groups gid)))
-                  (do
-                    (wait-for-grpc! peer grpc-port)
-                    (join-node! node
-                                (node-addr node grpc-port)
-                                (name peer)
-                                (node-addr peer grpc-port))))
-                true
-                (catch Throwable t
-                  (warn t "retrying join for" peer)
-                  nil)))
-            {:timeout 120000
-             :log-message (str "joining " peer)}))))
+          (join-peer! node peer opts)
+          (enable-peer-mount! test peer opts))))
     (info "node started" node))
 
   (teardown! [_ _test node]
@@ -370,6 +468,10 @@
       (stop-node! node)
       (catch Throwable t
         (warn t "teardown stop failed")))
+    (try
+      (cleanup-filesystem-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
+      (catch Throwable t
+        (warn t "teardown unmount failed")))
     (c/on node
       (c/su
         (c/exec :rm :-rf data-dir))))
@@ -381,15 +483,9 @@
 
   db/Kill
   (start! [this test node]
-    (start-node! test node (merge {:data-dir data-dir
-                                   :grpc-port (or (:grpc-port opts) 50051)
-                                   :redis-port (or (:redis-port opts) 6379)
-                                   :bootstrap-node (first (:nodes test))}
-                                  opts))
-    (if-let [raft-groups (:raft-groups opts)]
-      (wait-for-grpc! node (map (fn [gid] (port-for (get raft-groups gid) node))
-                                (group-ids raft-groups)))
-      (wait-for-grpc! node (or (:grpc-port opts) 50051)))
+    (start-node! test node (node-start-opts test node opts))
+    (wait-for-node-grpc! node opts)
+    (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
     (info "node started" node)
     this)
   (kill! [this _test node]
@@ -398,6 +494,10 @@
       (catch Throwable t
         (warn t "transport metrics snapshot before kill failed")))
     (stop-node! node)
+    (try
+      (cleanup-filesystem-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
+      (catch Throwable t
+        (warn t "unmount after kill failed")))
     this)
 
   db/Pause
@@ -417,6 +517,7 @@
 (defn db
   "Constructs an ElastickvDB with optional opts.
    opts: {:grpc-port 50051 :redis-port 6379
+          :filesystem-mount \"/mnt/elastickv\" ; or {node -> dir}; nil disables FUSE
           :raft-groups {1 50051 2 50052}
           :shard-ranges \":m=1,m:=2\"
           :server-env {\"ELASTICKV_RAFT_SEND_STREAM\" \"true\"}}"

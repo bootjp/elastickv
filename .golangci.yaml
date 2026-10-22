@@ -38,7 +38,10 @@ linters:
           - funlen
           - goconst
           - wrapcheck
-        path: (.*)test(.*).go
+        # Test files plus test-support packages (directories named *test,
+        # e.g. raftenginetest, fstest). Anchored so production files whose
+        # names merely contain "test" (latest_commit_ts.go) stay linted.
+        path: (_test\.go$|(^|/)[a-z0-9]+test/)
       - linters:
           - govet
         path: internal/raftengine/etcd/.*\.go
