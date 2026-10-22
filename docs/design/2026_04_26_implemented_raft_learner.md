@@ -875,7 +875,11 @@ single-process 3-node demo cluster, attaches a learner via
   changes).
 - Promote precondition: surface `Progress[nodeID].Match` in
   `Status.PerPeer` so an operator can choose `min_applied_index`
-  without guessing.
+  without guessing. The independent progress projection is tracked in
+  [#1227](https://github.com/bootjp/elastickv/pull/1227); this workload does
+  not depend on exposing that field through the RaftAdmin RPC. Operators
+  must choose a target such as the leader's `CommitIndex`, not pass the
+  learner's own current `Match` back as a vacuously satisfied bound.
 - Decision gate for follower-served reads: write a separate proposal,
   do not extend this one.
 
@@ -897,6 +901,15 @@ against `min-applied-index`. The engine's own test is
 call and the correct one (pick a target, wait for `Match` to reach it) end with
 `min-applied-index == Match`. That equality distinguishes nothing; only the
 leader's position does.
+
+The managed workload also accepts `--encryption`. Setup starts the reserved
+candidate with the same KEK and encryption capability flags as the voters,
+but excludes it from initial voter joins, bootstrap writer discovery, and
+initial envelope-cutover checks. The `AddLearner` membership interceptor
+registers its writer identity for both active DEKs before attachment. The
+workload then waits for both cutovers on the candidate before reporting
+attachment successful. Catch-up and promotion still use the leader's commit
+target; encryption does not change the learner reservation or quorum rules.
 
 ## 7. Risks
 

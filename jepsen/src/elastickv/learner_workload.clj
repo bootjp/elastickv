@@ -654,6 +654,9 @@
           (let [candidate (name (:value op))]
             (raftadmin! leader addr "add_learner" candidate
                         (str candidate ":" (:grpc-port test 50051)) "0")
+            (when (:encryption test)
+              (ekdb/await-node-encryption! leader
+                                          (str candidate ":" (:grpc-port test 50051))))
             (assoc op :type :ok))
 
           ;; Asks the server for something it must refuse: promotion at a
@@ -838,6 +841,7 @@
                           (repeat (count nodes) redis-port) nodes))]
      {:name        "elastickv-learner"
       :nodes       nodes
+      :encryption  (boolean (:encryption opts))
       ;; Carried into the test map so LearnerClient.open! can honour it.
       ;; Without this a programmatic caller could not override the host, and
       ;; local or port-mapped runs tried to resolve each logical node name.

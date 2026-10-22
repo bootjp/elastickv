@@ -12,11 +12,35 @@
             [elastickv.jepsen-test :as jt]
             [elastickv.learner-workload :as lw]
             [jepsen.checker :as checker]
+            [jepsen.client :as client]
             [jepsen.nemesis :as nemesis]
             [jepsen.net :as net]))
 
 (defn- check [history]
   (checker/check (lw/learner-safety-checker) {} history {}))
+
+(deftest encrypted-attachment-waits-for-the-candidates-cutovers
+  (let [test (lw/elastickv-learner-test {:nodes ["n1" "n2" "n3" "n4"] :encryption true})
+        events (atom [])]
+    (is (true? (get-in test [:db :opts :encryption])))
+    (is (= "n4" (get-in test [:db :opts :reserve-learner])))
+    (with-redefs-fn
+      {#'lw/raftadmin! (fn [& args] (swap! events conj (vec args)))
+       #'ekdb/await-node-encryption! (fn [& args] (swap! events conj (vec args)))}
+      (fn []
+        (is (= :ok (:type (client/invoke! (:client test) test
+                                          {:f :add-learner :value "n4"}))))))
+    (is (= [["n1" "n1:50051" "add_learner" "n4" "n4:50051" "0"]
+            ["n1" "n4:50051"]] @events))))
+
+(deftest an-inactive-encrypted-candidate-is-not-a-successful-attachment
+  (let [test (lw/elastickv-learner-test {:nodes ["n1" "n2" "n3" "n4"] :encryption true})]
+    (with-redefs-fn
+      {#'lw/raftadmin! (fn [& _])
+       #'ekdb/await-node-encryption! (fn [& _] (throw (ex-info "cutovers inactive" {})))}
+      (fn []
+        (is (= :fail (:type (client/invoke! (:client test) test
+                                            {:f :add-learner :value "n4"}))))))))
 
 (def ^:private healthy-prefix
   [{:type :invoke :f :write :value 1 :time 10 :process 0}
