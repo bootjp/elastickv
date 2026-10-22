@@ -109,6 +109,13 @@ type PrimaryCommitEvidence struct {
 	// It permits the first primary COMMIT to create its decision, but is not
 	// evidence that a claimed commit timestamp was previously issued.
 	PrimaryPrepared bool
+	// PreparedCommitTS is the chosen timestamp atomically persisted with the
+	// matching lock and intent. Zero identifies an unproven legacy PREPARE.
+	PreparedCommitTS uint64
+	// LegacyPreparedAllowed keeps an already-active old Phase-D cluster
+	// resolvable while the new protocol drains its preexisting unproven locks.
+	// The authoritative creation seal or release permanently clears it.
+	LegacyPreparedAllowed bool
 }
 
 // PrimaryCommitEvidenceReader distinguishes a missing local record from a

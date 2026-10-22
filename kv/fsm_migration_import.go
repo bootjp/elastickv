@@ -36,6 +36,9 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 	if err := proto.Unmarshal(data, req); err != nil {
 		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationImportApply), "kv/fsm: decode migration import"))
 	}
+	if err := f.validateImportedPrepareEvidence(req.GetVersions()); err != nil {
+		return err
+	}
 	staged := migrationStoreVersionsFromProto(req.GetJobId(), req.GetVersions())
 	if err := validateStagedKeySizes(staged); err != nil {
 		// Ordinary, not halting: the batch is rejected and the migrator can
@@ -64,6 +67,28 @@ func (f *kvFSM) applyMigrationImport(ctx context.Context, data []byte) any {
 		f.hlc.Observe(result.MaxImportedTS)
 	}
 	return result
+}
+
+func (f *kvFSM) validateImportedPrepareEvidence(versions []*pb.MVCCVersion) error {
+	for _, version := range versions {
+		if version == nil {
+			continue
+		}
+		if isTxnPeerLocalControlKey(version.GetKey()) {
+			return errors.Wrap(ErrInvalidRequest, "migration cannot import peer-local timestamp protocol state")
+		}
+		if !f.prepareEvidenceEnabled.Load() || version.GetTombstone() {
+			continue
+		}
+		blocked, err := unprovenPrepareEvidenceRow(version.GetKey(), version.GetValue(), ^uint64(0))
+		if err != nil {
+			return err
+		}
+		if blocked {
+			return errors.Wrap(ErrBackupTimestampFenced, "migration cannot introduce an unproven legacy prepare below the activation fence")
+		}
+	}
+	return nil
 }
 
 // isMigrationImportOrdinaryApplyError reports whether err is a verdict on the

@@ -30,7 +30,11 @@ func TestPrimaryCommitEvidenceDistinguishesMissingFromUnavailable(t *testing.T) 
 		{name: "prepared primary", prepare: func(g *ShardGroup) {
 			require.NoError(t, g.Store.PutAt(ctx, txnLockKey([]byte("key")), encodeTxnLock(txnLock{StartTS: 50, PrimaryKey: []byte("key"), IsPrimaryKey: true}), 50, 0))
 			require.NoError(t, g.Store.PutAt(ctx, txnIntentKey([]byte("key")), encodeTxnIntent(txnIntent{StartTS: 50, Op: txnIntentOpPut, Value: []byte("v")}), 50, 0))
-		}, want: PrimaryCommitEvidence{Readable: true, PrimaryPrepared: true}},
+		}, want: PrimaryCommitEvidence{Readable: true, PrimaryPrepared: true, LegacyPreparedAllowed: true}},
+		{name: "primary with durable prepare timestamp", prepare: func(g *ShardGroup) {
+			require.NoError(t, g.Store.PutAt(ctx, txnLockKey([]byte("key")), encodeTxnLock(txnLock{StartTS: 50, CommitTS: 60, PrimaryKey: []byte("key"), IsPrimaryKey: true}), 50, 0))
+			require.NoError(t, g.Store.PutAt(ctx, txnIntentKey([]byte("key")), encodeTxnIntent(txnIntent{StartTS: 50, Op: txnIntentOpPut, Value: []byte("v")}), 50, 0))
+		}, want: PrimaryCommitEvidence{Readable: true, PrimaryPrepared: true, PreparedCommitTS: 60}},
 		{name: "primary lock without intent", prepare: func(g *ShardGroup) {
 			require.NoError(t, g.Store.PutAt(ctx, txnLockKey([]byte("key")), encodeTxnLock(txnLock{StartTS: 50, PrimaryKey: []byte("key"), IsPrimaryKey: true}), 50, 0))
 		}, want: PrimaryCommitEvidence{Readable: true}},

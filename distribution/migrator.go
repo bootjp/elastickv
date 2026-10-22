@@ -72,16 +72,19 @@ const (
 	// Keep this literal in sync with kv.backupTimestampFloorKey. distribution
 	// cannot import kv without a cycle, and only this exact control key is
 	// reserved; user keys under !txn|backup| remain migratable.
-	migrationTxnBackupTimestampFloorKey = "!txn|backup|timestamp_floor"
-	migrationRedisPrefix                = "!redis|"
-	migrationHashPrefix                 = "!hs|"
-	migrationSetPrefix                  = "!st|"
-	migrationZSetPrefix                 = "!zs|"
-	migrationDynamoMetaPrefix           = "!ddb|meta|table|"
-	migrationDynamoGenPrefix            = "!ddb|meta|gen|"
-	migrationDynamoItemPrefix           = "!ddb|item|"
-	migrationDynamoGSIPrefix            = "!ddb|gsi|"
-	migrationStagedDataPrefix           = "!dist|migstage|"
+	migrationTxnBackupTimestampFloorKey   = "!txn|backup|timestamp_floor"
+	migrationTxnPrepareEvidenceEnabledKey = "!txn|backup|prepare_evidence_enabled"
+	migrationTxnPrepareEvidenceGateKey    = "!txn|backup|prepare_evidence_gate"
+	migrationTxnPrepareEvidenceFloorKey   = "!txn|backup|prepare_evidence_timestamp_floor"
+	migrationRedisPrefix                  = "!redis|"
+	migrationHashPrefix                   = "!hs|"
+	migrationSetPrefix                    = "!st|"
+	migrationZSetPrefix                   = "!zs|"
+	migrationDynamoMetaPrefix             = "!ddb|meta|table|"
+	migrationDynamoGenPrefix              = "!ddb|meta|gen|"
+	migrationDynamoItemPrefix             = "!ddb|item|"
+	migrationDynamoGSIPrefix              = "!ddb|gsi|"
+	migrationStagedDataPrefix             = "!dist|migstage|"
 )
 
 const (
@@ -238,6 +241,9 @@ var migrationInternalFamilyPrefixes = [][]byte{
 
 var migrationInternalExactKeys = [][]byte{
 	[]byte(migrationTxnBackupTimestampFloorKey),
+	[]byte(migrationTxnPrepareEvidenceEnabledKey),
+	[]byte(migrationTxnPrepareEvidenceGateKey),
+	[]byte(migrationTxnPrepareEvidenceFloorKey),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -400,6 +406,11 @@ func MigrationStagedDataKey(jobID uint64, rawKey []byte) []byte {
 // one migration job.
 func MigrationStagedDataKeyPrefix(jobID uint64) []byte {
 	return MigrationStagedDataKey(jobID, nil)
+}
+
+// MigrationStagedDataScanPrefix covers staged rows from every migration job.
+func MigrationStagedDataScanPrefix() []byte {
+	return []byte(migrationStagedDataPrefix)
 }
 
 func IsMigrationStagedDataKey(key []byte) bool {

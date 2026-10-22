@@ -13,9 +13,10 @@ import (
 const legacyCommitEvidenceTimeout = 5 * time.Second
 
 func (i *Internal) verifyLegacyCommitEvidence(ctx context.Context, reqs []*pb.Request, startTS, commitTS uint64) error {
-	if i.primaryCommitEvidence == nil {
-		return nil
-	}
+	return i.verifyCommitEvidence(ctx, reqs, startTS, commitTS, false)
+}
+
+func (i *Internal) verifyCommitEvidence(ctx context.Context, reqs []*pb.Request, startTS, commitTS uint64, pending bool) error {
 	ctx, cancel := context.WithTimeout(ctx, legacyCommitEvidenceTimeout)
 	defer cancel()
 	keys, err := collectLegacyPrimaryKeys(ctx, reqs)
@@ -25,6 +26,9 @@ func (i *Internal) verifyLegacyCommitEvidence(ctx context.Context, reqs []*pb.Re
 	if len(keys) == 0 {
 		return nil
 	}
+	if i.primaryCommitEvidence == nil {
+		return errors.Wrap(kv.ErrTSOProtocolUnsupported, "primary commit evidence reader is required")
+	}
 	results, err := i.readLegacyPrimaryEvidence(ctx, keys, startTS)
 	if err != nil {
 		return err
@@ -33,7 +37,7 @@ func (i *Internal) verifyLegacyCommitEvidence(ctx context.Context, reqs []*pb.Re
 	for index, key := range keys {
 		evidence[string(key)] = results[index]
 	}
-	return classifyLegacyRequests(ctx, reqs, evidence, commitTS)
+	return classifyLegacyRequests(ctx, reqs, evidence, commitTS, pending)
 }
 
 func legacyCommitMeta(req *pb.Request) (kv.TxnMeta, bool, error) {
@@ -100,7 +104,7 @@ func (i *Internal) readLegacyPrimaryEvidence(ctx context.Context, keys [][]byte,
 	return results, nil
 }
 
-func classifyLegacyRequests(ctx context.Context, reqs []*pb.Request, evidence map[string]kv.PrimaryCommitEvidence, commitTS uint64) error {
+func classifyLegacyRequests(ctx context.Context, reqs []*pb.Request, evidence map[string]kv.PrimaryCommitEvidence, commitTS uint64, pending bool) error {
 	for _, req := range reqs {
 		if err := ctx.Err(); err != nil {
 			return errors.WithStack(err)
@@ -113,7 +117,7 @@ func classifyLegacyRequests(ctx context.Context, reqs []*pb.Request, evidence ma
 			continue
 		}
 		proof := evidence[string(meta.PrimaryKey)]
-		if forwardedTxnHasPreparedPrimary(req, meta.PrimaryKey, proof) {
+		if forwardedTxnHasPreparedPrimary(req, meta.PrimaryKey, commitTS, proof, pending) {
 			continue
 		}
 		if err := kv.ClassifyPrePhaseDCommit(proof, commitTS, false); err != nil {
@@ -123,8 +127,11 @@ func classifyLegacyRequests(ctx context.Context, reqs []*pb.Request, evidence ma
 	return nil
 }
 
-func forwardedTxnHasPreparedPrimary(req *pb.Request, primaryKey []byte, evidence kv.PrimaryCommitEvidence) bool {
+func forwardedTxnHasPreparedPrimary(req *pb.Request, primaryKey []byte, commitTS uint64, evidence kv.PrimaryCommitEvidence, pending bool) bool {
 	if !evidence.Readable || evidence.Found || !evidence.PrimaryPrepared {
+		return false
+	}
+	if !preparedPrimaryTimestampMatches(evidence, commitTS, pending) {
 		return false
 	}
 	for _, mutation := range req.Mutations[1:] {
@@ -133,4 +140,11 @@ func forwardedTxnHasPreparedPrimary(req *pb.Request, primaryKey []byte, evidence
 		}
 	}
 	return false
+}
+
+func preparedPrimaryTimestampMatches(evidence kv.PrimaryCommitEvidence, commitTS uint64, pending bool) bool {
+	if evidence.PreparedCommitTS == commitTS {
+		return true
+	}
+	return evidence.PreparedCommitTS == 0 && (pending || evidence.LegacyPreparedAllowed)
 }

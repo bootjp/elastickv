@@ -107,7 +107,8 @@ func (s *ShardStore) readPrimaryCommitEvidence(ctx context.Context, group *Shard
 	}
 	if errors.Is(err, store.ErrKeyNotFound) {
 		prepared, prepareErr := s.primaryPreparedForEvidence(ctx, group, route, key, startTS)
-		return PrimaryCommitEvidence{Readable: true, PrimaryPrepared: prepared}, prepareErr
+		prepared.Readable = true
+		return prepared, prepareErr
 	}
 	commitTS, err := decodeTxnCommitRecord(value)
 	if err != nil {
@@ -116,22 +117,42 @@ func (s *ShardStore) readPrimaryCommitEvidence(ctx context.Context, group *Shard
 	return PrimaryCommitEvidence{Readable: true, Found: true, CommitTS: commitTS}, nil
 }
 
-func (s *ShardStore) primaryPreparedForEvidence(ctx context.Context, group *ShardGroup, route distribution.Route, key []byte, startTS uint64) (bool, error) {
+func (s *ShardStore) primaryPreparedForEvidence(ctx context.Context, group *ShardGroup, route distribution.Route, key []byte, startTS uint64) (PrimaryCommitEvidence, error) {
 	value, err := s.localGetAt(ctx, group, route, txnLockKey(key), ^uint64(0))
 	if errors.Is(err, store.ErrKeyNotFound) {
-		return false, nil
+		return PrimaryCommitEvidence{}, nil
 	}
 	if err != nil {
-		return false, errors.WithStack(err)
+		return PrimaryCommitEvidence{}, errors.WithStack(err)
 	}
 	lock, err := decodeTxnLock(value)
 	if err != nil {
-		return false, errors.Wrap(err, "read prepared primary lock")
+		return PrimaryCommitEvidence{}, errors.Wrap(err, "read prepared primary lock")
 	}
 	if !lock.IsPrimaryKey || lock.StartTS != startTS || !bytes.Equal(lock.PrimaryKey, key) {
-		return false, nil
+		return PrimaryCommitEvidence{}, nil
 	}
-	value, err = s.localGetAt(ctx, group, route, txnIntentKey(key), ^uint64(0))
+	matches, err := s.primaryPreparedIntentMatches(ctx, group, route, key, startTS)
+	if err != nil || !matches {
+		return PrimaryCommitEvidence{}, err
+	}
+	return preparedPrimaryEvidenceWithLegacyGate(ctx, group.Store, lock)
+}
+
+func preparedPrimaryEvidenceWithLegacyGate(ctx context.Context, st store.MVCCStore, lock txnLock) (PrimaryCommitEvidence, error) {
+	evidence := PrimaryCommitEvidence{PrimaryPrepared: true, PreparedCommitTS: lock.CommitTS}
+	if lock.CommitTS == 0 {
+		sealed, released, err := readPrepareEvidenceCreationGate(ctx, st)
+		if err != nil {
+			return PrimaryCommitEvidence{}, err
+		}
+		evidence.LegacyPreparedAllowed = !sealed && released == 0
+	}
+	return evidence, nil
+}
+
+func (s *ShardStore) primaryPreparedIntentMatches(ctx context.Context, group *ShardGroup, route distribution.Route, key []byte, startTS uint64) (bool, error) {
+	value, err := s.localGetAt(ctx, group, route, txnIntentKey(key), ^uint64(0))
 	if errors.Is(err, store.ErrKeyNotFound) {
 		return false, nil
 	}

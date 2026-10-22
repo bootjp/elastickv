@@ -82,8 +82,8 @@ func TestConfigureCoordinatorTSOPhaseDWorksThroughAdapterDecorators(t *testing.T
 	require.NotZero(t, readTS.Timestamp())
 	require.True(t, fsm.CutoverActive())
 	require.True(t, fsm.PhaseDActive())
-	require.Equal(t, uint64(3), engine.proposals.Load(),
-		"cutover and phase-D markers must commit before the timestamp window")
+	require.Equal(t, uint64(4), engine.proposals.Load(),
+		"cutover, pending, and phase-D markers must commit before the timestamp window")
 }
 
 func TestConfigureCoordinatorTSOPhaseDRequiresCutoverMode(t *testing.T) {
@@ -402,6 +402,13 @@ func (t *mainForwardTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionR
 func (p mainTSOFloorProvider) GlobalCommittedTimestampFloor(context.Context) (uint64, error) {
 	return p.floor, nil
 }
+
+// These fixtures have no data groups; the tests exercise allocator/decorator
+// wiring rather than the production data-group activation gate.
+func (mainTSOFloorProvider) CheckPhaseDProtocol(context.Context) error   { return nil }
+func (mainTSOFloorProvider) SealPhaseDCreation(context.Context) error    { return nil }
+func (mainTSOFloorProvider) PreparePhaseD(context.Context, uint64) error { return nil }
+func (mainTSOFloorProvider) FinishPhaseD(context.Context, uint64) error  { return nil }
 
 func (e *mainTSOEngine) Propose(_ context.Context, payload []byte) (*raftengine.ProposalResult, error) {
 	e.proposals.Add(1)

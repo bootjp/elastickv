@@ -4,6 +4,7 @@ import (
 	"context"
 	"math"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -15,7 +16,8 @@ import (
 type TransactionManager struct {
 	proposer raftengine.Proposer
 
-	proposalObserver ProposalObserver
+	proposalObserver   ProposalObserver
+	timestampAdmission atomic.Pointer[transactionTimestampAdmission]
 
 	mu          sync.Mutex
 	rawPending  []*rawCommitItem
@@ -203,6 +205,11 @@ func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
+	owned, err := t.timestampAdmission.Load().prepare(ctx, reqs)
+	if err != nil {
+		return nil, err
+	}
+	reqs = owned
 	if hasTxnRequests(reqs) {
 		return t.commitSequential(ctx, reqs)
 	}

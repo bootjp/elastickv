@@ -585,10 +585,14 @@ func (x *GetTimestampResponse) GetPhaseDFloor() uint64 {
 }
 
 type ValidateTimestampRequest struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state     protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	// A separate pre-pending drain / pending-D resolution check, never ordinary
+	// timestamp validity. The caller must verify durable transaction evidence.
+	LegacyResolution bool   `protobuf:"varint,2,opt,name=legacy_resolution,json=legacyResolution,proto3" json:"legacy_resolution,omitempty"`
+	StartTimestamp   uint64 `protobuf:"varint,3,opt,name=start_timestamp,json=startTimestamp,proto3" json:"start_timestamp,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *ValidateTimestampRequest) Reset() {
@@ -628,14 +632,31 @@ func (x *ValidateTimestampRequest) GetTimestamp() uint64 {
 	return 0
 }
 
+func (x *ValidateTimestampRequest) GetLegacyResolution() bool {
+	if x != nil {
+		return x.LegacyResolution
+	}
+	return false
+}
+
+func (x *ValidateTimestampRequest) GetStartTimestamp() uint64 {
+	if x != nil {
+		return x.StartTimestamp
+	}
+	return 0
+}
+
 type ValidateTimestampResponse struct {
 	state           protoimpl.MessageState `protogen:"open.v1"`
 	Valid           bool                   `protobuf:"varint,1,opt,name=valid,proto3" json:"valid,omitempty"`
 	PhaseDActive    bool                   `protobuf:"varint,2,opt,name=phase_d_active,json=phaseDActive,proto3" json:"phase_d_active,omitempty"`
 	PhaseDFloor     uint64                 `protobuf:"varint,3,opt,name=phase_d_floor,json=phaseDFloor,proto3" json:"phase_d_floor,omitempty"`
 	AllocationFloor uint64                 `protobuf:"varint,4,opt,name=allocation_floor,json=allocationFloor,proto3" json:"allocation_floor,omitempty"`
-	unknownFields   protoimpl.UnknownFields
-	sizeCache       protoimpl.SizeCache
+	// Explicit acknowledgement prevents old servers ignoring the request mode
+	// from authorizing a legacy resolution through ordinary validation.
+	LegacyResolutionValidated bool `protobuf:"varint,5,opt,name=legacy_resolution_validated,json=legacyResolutionValidated,proto3" json:"legacy_resolution_validated,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *ValidateTimestampResponse) Reset() {
@@ -694,6 +715,13 @@ func (x *ValidateTimestampResponse) GetAllocationFloor() uint64 {
 		return x.AllocationFloor
 	}
 	return 0
+}
+
+func (x *ValidateTimestampResponse) GetLegacyResolutionValidated() bool {
+	if x != nil {
+		return x.LegacyResolutionValidated
+	}
+	return false
 }
 
 type RouteDescriptor struct {
@@ -2573,14 +2601,17 @@ const file_distribution_proto_rawDesc = "" +
 	"\x19previous_allocation_floor\x18\x04 \x01(\x04R\x17previousAllocationFloor\x12%\n" +
 	"\x0ecutover_active\x18\x05 \x01(\bR\rcutoverActive\x12$\n" +
 	"\x0ephase_d_active\x18\x06 \x01(\bR\fphaseDActive\x12\"\n" +
-	"\rphase_d_floor\x18\a \x01(\x04R\vphaseDFloor\"8\n" +
+	"\rphase_d_floor\x18\a \x01(\x04R\vphaseDFloor\"\x8e\x01\n" +
 	"\x18ValidateTimestampRequest\x12\x1c\n" +
-	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\"\xa6\x01\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12+\n" +
+	"\x11legacy_resolution\x18\x02 \x01(\bR\x10legacyResolution\x12'\n" +
+	"\x0fstart_timestamp\x18\x03 \x01(\x04R\x0estartTimestamp\"\xe6\x01\n" +
 	"\x19ValidateTimestampResponse\x12\x14\n" +
 	"\x05valid\x18\x01 \x01(\bR\x05valid\x12$\n" +
 	"\x0ephase_d_active\x18\x02 \x01(\bR\fphaseDActive\x12\"\n" +
 	"\rphase_d_floor\x18\x03 \x01(\x04R\vphaseDFloor\x12)\n" +
-	"\x10allocation_floor\x18\x04 \x01(\x04R\x0fallocationFloor\"\xfe\x02\n" +
+	"\x10allocation_floor\x18\x04 \x01(\x04R\x0fallocationFloor\x12>\n" +
+	"\x1blegacy_resolution_validated\x18\x05 \x01(\bR\x19legacyResolutionValidated\"\xfe\x02\n" +
 	"\x0fRouteDescriptor\x12\x19\n" +
 	"\broute_id\x18\x01 \x01(\x04R\arouteId\x12\x14\n" +
 	"\x05start\x18\x02 \x01(\fR\x05start\x12\x10\n" +

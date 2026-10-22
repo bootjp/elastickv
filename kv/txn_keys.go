@@ -87,7 +87,14 @@ func isTxnInternalKey(key []byte) bool {
 		bytes.HasPrefix(key, txnRollbackPrefixBytes) ||
 		bytes.HasPrefix(key, txnSuccessPrefixBytes) ||
 		bytes.HasPrefix(key, txnMetaPrefixBytes) ||
-		bytes.Equal(key, backupTimestampFloorKey)
+		isTxnPeerLocalControlKey(key)
+}
+
+func isTxnPeerLocalControlKey(key []byte) bool {
+	return bytes.Equal(key, backupTimestampFloorKey) ||
+		bytes.Equal(key, prepareEvidenceEnabledKey) ||
+		bytes.Equal(key, prepareEvidenceGateKey) ||
+		bytes.Equal(key, prepareEvidenceTimestampFloorKey)
 }
 
 func isTxnMetaKey(key []byte) bool {

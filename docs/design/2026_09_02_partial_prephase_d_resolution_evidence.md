@@ -194,11 +194,11 @@ An unprepared primary, secondary resolution without a decision, or a mismatched
 existing decision is still rejected. The FSM retains its existing commit versus
 rollback and intent checks.
 
-A prepared primary proves an in-flight transaction, not issuance of its claimed
+A prepared primary alone proves an in-flight transaction, not issuance of its claimed
 commitTS. An untrusted caller can still fabricate a fresh primary PREPARE and
 first COMMIT inside the bounded creation window. Closing that remaining gap
-needs a durable chosen-commit proof or a revised admission protocol; this PR
-does not claim the full retroactive-write carve-out is closed. In particular,
+needs a durable chosen-commit proof or a revised admission protocol. The
+extension accepted below replaces that incomplete first-primary exception. In particular,
 silently allocating a replacement timestamp after PREPARE is not a safe shortcut:
 prepared values may already embed the original commit timestamp.
 
@@ -209,6 +209,107 @@ commit-record persistence across Pebble reopen, first-primary admission, and
 waiting for a committed decision's read index to apply. Full distributed cutover and
 leader-change acceptance have not been demonstrated by these focused tests;
 the document remains Partial until that acceptance evidence is available.
+
+## 4b. Durable PREPARE evidence and activation gate (2026-10-23)
+
+The accepted extension persists the selected commit timestamp with PREPARE
+and waits for older, unproven PREPAREs to resolve before activating the stronger
+protocol. It does not retimestamp an already prepared value or force an
+otherwise resolvable transaction to abort merely to finish the rollout.
+
+### Evidence Format and Rollout
+
+`TxnMeta.PrepareCommitTS` uses a new V3 metadata format. V1 and V2 encodings
+remain unchanged; in particular, a historical V1 PREPARE's `CommitTS` is not
+retroactively reinterpreted as evidence when replaying its log. The chosen
+timestamp is saved atomically with each primary or secondary lock and intent.
+An idempotent PREPARE cannot add, remove, or change this proof, and a COMMIT
+cannot substitute a different timestamp.
+
+Before V3 can mutate a data FSM, an authenticated protocol negotiation checks
+every voter and learner in every configured group, including group zero. The
+check also requires each existing member to have applied dedicated-TSO cutover;
+an outdated mode file cannot justify continued HLC issuance after that marker.
+Membership admission checks the same protocol before adding another member.
+A fresh learner may join before applying cutover, but a cutover cluster requires
+that it configure the dedicated timestamp runtime. Its catch-up must precede
+public serving. Old binaries cannot be admitted after this protocol is required.
+
+The replicated enable marker then requires proof for every new PREPARE in its
+data group. An existing unproven lock may retry with its original identity and
+may COMMIT or ABORT, but a retry cannot manufacture proof retroactively.
+Primary and secondary unproven locks, including staged migration locks, must
+all drain. Checking only primaries would not justify the remote-primary unknown
+verdict retained by the compatibility classifier. New migration imports cannot
+introduce unproven locks after the enable marker.
+
+Before creating proof, both the local coordinator and forwarded ingress ensure
+that the chosen timestamp is covered by the dedicated TSO's durable reservation
+range. Before Phase D, reserving and discarding a timestamp above the chosen
+value can extend that range without modifying the already stamped values.
+After Phase D, ordinary strict timestamp validation applies. This is not a claim
+that every numeric slot in a reserved batch was individually issued; the separate
+slot-claim design remains responsible for that stronger property.
+
+### Activation Order
+
+1. Commit cutover, negotiate support and applied cutover with all members, and
+   enable required PREPARE evidence on all data groups.
+2. Wait for all old unproven locks to resolve. Return a retryable pending result
+   between attempts instead of holding the allocator mutex while waiting for
+   COMMIT or ABORT traffic that needs it.
+3. Replicate a creation seal on every data group. It rejects raw, one-phase, and
+   PREPARE creation at FSM apply, while existing COMMIT and ABORT remain usable.
+   This closes the late-apply race: an old raw timestamp greater than a sampled
+   floor must not land between that sample and activation.
+4. Read fresh authoritative committed floors and compute the final boundary B.
+   Persist a pending-D marker with that fixed boundary in group zero. Retries,
+   snapshots, restarts, and leadership changes preserve B. Ordinary timestamp
+   issuance, including cached batch slots, stops while this marker is pending.
+5. Apply the permanent timestamp floor B to every data group, verify the drain
+   through applied leader fences, and commit Phase D at B in group zero.
+6. Replicate the idempotent creation release on every data group, retaining the
+   permanent floor. Only then return new allocations. Release failures must be
+   retried even if the group-zero Phase-D marker is already active.
+
+After release, every creation request also carries the released admission floor
+as its epoch. Both forwarded ingress and the local transaction-manager queue
+discard any incoming epoch, strictly validate the unchanged persistence timestamp
+against group zero, and then stamp the current epoch. The FSM rejects an old
+epoch even when its timestamp exceeds B. A temporary seal alone would not stop
+a request validated before cutover but delayed until after release. Requests
+queued before the seal must retain their original epoch, not observe a later
+retry's mutation of a shared request object.
+
+The cutover timestamp floor is separate from the backup-pin floor. Raw and
+one-phase creation must persist above B. A new proof-bearing PREPARE may keep
+an older applied-read snapshot as its startTS, but its chosen commit timestamp
+must validate above B and its admission epoch must match. Existing applied-read
+vouchers remain usable even after the old creation-grace window expires. A real
+backup pin retains its original startTS fence; cutover does not weaken it.
+
+The enable, seal, and release records belong to the local group, not its user
+ranges. User mutations cannot forge them, and range migration does not export
+or promote them as application data. The seal is a deterministic refusal, not
+an operational error that halts a raw-batch replica.
+
+### Already Active Clusters
+
+Snapshots from an older implementation can already have Phase D active but no
+PREPARE-proof protocol marker. Such a cluster must bootstrap the stronger
+protocol without changing its existing Phase-D floor or stranding old locks.
+An authoritative primary may keep the old first-COMMIT exception only until its
+creation seal or release is durable. Required-proof admission has already stopped
+new unproven PREPAREs before that drain finishes. Once sealed or released, a
+first primary COMMIT requires the durable chosen timestamp to match exactly.
+
+### Acceptance Status
+
+The implementation and focused regression tests are being integrated in the
+existing PR. The document remains Partial until end-to-end forwarded cutover,
+leader changes, pending restart/snapshot recovery, release retry, and late legacy
+creation are verified together. Code presence or a classifier-only test is not
+completion evidence for this protocol.
 
 ## 5. Open questions for review
 
@@ -223,7 +324,7 @@ the document remains Partial until that acceptance evidence is available.
 4. Should the `ABORT` path get its own rule, given its timestamp is synthesised
    rather than recorded?
 
-Settled in §4a, subject to the first-primary proof gap above. Remaining work
-must close that gap without rejecting valid cutover transactions. Acceptance must exercise
+Settled in §4a and extended by §4b. Remaining acceptance work must demonstrate
+closure without rejecting valid cutover transactions. Acceptance must exercise
 the real forwarded path across Phase-D activation and leader changes, including
 a remote-primary resolution after the creation window has closed.

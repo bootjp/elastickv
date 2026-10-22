@@ -763,6 +763,7 @@ var adminMethodPrefix = "/" + pb.Admin_ServiceDesc.ServiceName + "/"
 func adminTokenProtectedMethod(fullMethod string) bool {
 	return strings.HasPrefix(fullMethod, adminMethodPrefix) ||
 		fullMethod == pb.Internal_ForwardAdminProposal_FullMethodName ||
+		fullMethod == pb.Internal_GetPrepareEvidenceState_FullMethodName ||
 		fullMethod == pb.Internal_ForwardLeaseRead_FullMethodName
 }
 

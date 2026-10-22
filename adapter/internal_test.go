@@ -244,6 +244,7 @@ func TestStampTxnTimestamps_UsesSingleTxnStartTS(t *testing.T) {
 		Phase: pb.Phase_PREPARE,
 		Ts:    0,
 		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k")})},
 			{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
 		},
 	}
@@ -671,7 +672,8 @@ func TestFillForwardedTxnCommitTS_AllowsPrePhaseDResolutionReplay(t *testing.T) 
 	t.Parallel()
 
 	alloc := &phaseDForwardAllocator{floor: 100}
-	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc),
+		WithInternalPrimaryCommitEvidence(recordedPrimaryCommitEvidence(60)))
 
 	resolution := func(commitTS uint64) []*pb.Request {
 		return []*pb.Request{{
@@ -760,10 +762,13 @@ func TestStampTxnTimestamps_ValidatesForwardedStartTS(t *testing.T) {
 
 	prepare := func(startTS uint64) []*pb.Request {
 		return []*pb.Request{{
-			IsTxn:     true,
-			Phase:     pb.Phase_PREPARE,
-			Ts:        startTS,
-			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+			IsTxn: true,
+			Phase: pb.Phase_PREPARE,
+			Ts:    startTS,
+			Mutations: []*pb.Mutation{
+				{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("k")})},
+				{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")},
+			},
 		}}
 	}
 
@@ -792,7 +797,8 @@ func TestFillForwardedTxnCommitTS_MixedPhaseBatchGetsNoLegacyExemption(t *testin
 	t.Parallel()
 
 	alloc := &phaseDForwardAllocator{floor: 100}
-	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc),
+		WithInternalPrimaryCommitEvidence(recordedPrimaryCommitEvidence(60)))
 
 	meta := func(phase pb.Phase, commitTS uint64) *pb.Request {
 		return &pb.Request{
@@ -866,7 +872,8 @@ func TestStampTimestamps_RejectsRawRequestInsideTxnEnvelope(t *testing.T) {
 	t.Parallel()
 
 	alloc := &phaseDForwardAllocator{floor: 100, ceiling: 200}
-	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc))
+	i := NewInternalWithEngine(nil, nil, nil, nil, WithInternalTimestampAllocator(alloc),
+		WithInternalPrimaryCommitEvidence(recordedPrimaryCommitEvidence(60)))
 
 	resolution := &pb.Request{
 		IsTxn: true,

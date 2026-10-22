@@ -2456,10 +2456,14 @@ func configureDedicatedCoordinatorTSO(
 	observer kv.TSOObserver,
 ) (coordinatorTSOWiring, error) {
 	var wiring coordinatorTSOWiring
+	opts := []kv.RaftTSOAllocatorOption{kv.WithTSOCutoverFloorProvider(floorProvider)}
+	if gate, ok := floorProvider.(kv.TSOPhaseDActivationGate); ok {
+		opts = append(opts, kv.WithTSOPhaseDActivationGate(gate))
+	}
 	local, err := kv.NewRaftTSOAllocator(
 		tsoGroup,
 		coordinate.Clock(),
-		kv.WithTSOCutoverFloorProvider(floorProvider),
+		opts...,
 	)
 	if err != nil {
 		return wiring, errors.Wrap(err, "configure dedicated tso allocator")
@@ -3343,6 +3347,7 @@ func startRaftServers(
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id], rt.spec.id)
+		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -3394,7 +3399,7 @@ func startRaftServers(
 			rt.engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			confChangeInterceptor,
+			newPrepareEvidenceMembershipGate(shardStore, rt.spec.id, confChangeInterceptor),
 		)
 		reflection.Register(gs)
 

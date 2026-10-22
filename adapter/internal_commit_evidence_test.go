@@ -10,6 +10,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func recordedPrimaryCommitEvidence(commitTS uint64) kv.PrimaryCommitEvidenceReader {
+	return primaryCommitEvidenceFunc(func(context.Context, []byte, uint64) (kv.PrimaryCommitEvidence, error) {
+		return kv.PrimaryCommitEvidence{Readable: true, Found: true, CommitTS: commitTS}, nil
+	})
+}
+
 type primaryCommitEvidenceFunc func(context.Context, []byte, uint64) (kv.PrimaryCommitEvidence, error)
 
 func (f primaryCommitEvidenceFunc) PrimaryCommitEvidence(ctx context.Context, key []byte, startTS uint64) (kv.PrimaryCommitEvidence, error) {
@@ -103,14 +109,19 @@ func TestFillForwardedTxnCommitTSChecksEveryPrimary(t *testing.T) {
 func TestInternalForwardAllowsPreparedFirstPrimaryCommitAcrossActivation(t *testing.T) {
 	t.Parallel()
 	for _, test := range []struct {
-		name     string
-		key      string
-		prepared bool
-		found    bool
-		decision uint64
-		wantErr  bool
+		name          string
+		key           string
+		prepared      bool
+		found         bool
+		decision      uint64
+		proofTS       uint64
+		legacyAllowed bool
+		wantErr       bool
 	}{
-		{name: "first primary commit", key: "primary", prepared: true},
+		{name: "unproven legacy primary cannot cross completed activation", key: "primary", prepared: true, wantErr: true},
+		{name: "existing active cluster drains old primary before protocol seal", key: "primary", prepared: true, legacyAllowed: true},
+		{name: "first primary with durable timestamp", key: "primary", prepared: true, proofTS: 60},
+		{name: "first primary timestamp differs from prepare", key: "primary", prepared: true, proofTS: 61, wantErr: true},
 		{name: "unprepared primary", key: "primary", wantErr: true},
 		{name: "secondary still requires decision", key: "secondary", prepared: true, wantErr: true},
 		{name: "prepared primary cannot replace existing decision", key: "primary", prepared: true, found: true, decision: 61, wantErr: true},
@@ -120,7 +131,7 @@ func TestInternalForwardAllowsPreparedFirstPrimaryCommitAcrossActivation(t *test
 			i := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil,
 				WithInternalTimestampAllocator(&phaseDForwardAllocator{floor: 100}),
 				WithInternalPrimaryCommitEvidence(primaryCommitEvidenceFunc(func(context.Context, []byte, uint64) (kv.PrimaryCommitEvidence, error) {
-					return kv.PrimaryCommitEvidence{Readable: true, Found: test.found, CommitTS: test.decision, PrimaryPrepared: test.prepared}, nil
+					return kv.PrimaryCommitEvidence{Readable: true, Found: test.found, CommitTS: test.decision, PrimaryPrepared: test.prepared, PreparedCommitTS: test.proofTS, LegacyPreparedAllowed: test.legacyAllowed}, nil
 				})))
 			response, err := i.Forward(context.Background(), &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{{
 				Ts: 50, IsTxn: true, Phase: pb.Phase_COMMIT, Mutations: []*pb.Mutation{
