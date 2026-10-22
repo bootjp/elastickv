@@ -640,27 +640,7 @@ func TestLeaderAwareRedisBackend_InitialCommandWaitsForLeaderDiscovery(t *testin
 		},
 		{
 			name: "NewPubSub",
-			run: func(ctx context.Context, backend *LeaderAwareRedisBackend) error {
-				ps := backend.NewPubSub(ctx)
-				if ps == nil {
-					return ErrNoLeaderBackend
-				}
-				defer ps.Close()
-				if err := ps.Subscribe(ctx, "events"); err != nil {
-					return err
-				}
-				// Subscribe only flushes the request; the acknowledgment
-				// proves the discovered leader has actually processed it.
-				reply, err := ps.Receive(ctx)
-				if err != nil {
-					return err
-				}
-				ack, ok := reply.(*redis.Subscription)
-				if !ok || ack.Kind != "subscribe" || ack.Channel != "events" {
-					return fmt.Errorf("unexpected subscription acknowledgment: %v", reply)
-				}
-				return nil
-			},
+			run:  subscribeAndWaitForInitialAck,
 		},
 	}
 
@@ -711,6 +691,28 @@ func TestLeaderAwareRedisBackend_InitialCommandWaitsForLeaderDiscovery(t *testin
 			require.Equal(t, aliveLeader.addr, backend.CurrentLeader())
 		})
 	}
+}
+
+func subscribeAndWaitForInitialAck(ctx context.Context, backend *LeaderAwareRedisBackend) error {
+	ps := backend.NewPubSub(ctx)
+	if ps == nil {
+		return ErrNoLeaderBackend
+	}
+	defer ps.Close()
+	if err := ps.Subscribe(ctx, "events"); err != nil {
+		return err
+	}
+	// Subscribe only flushes the request; the acknowledgment proves the
+	// discovered leader has actually processed it.
+	reply, err := ps.Receive(ctx)
+	if err != nil {
+		return err
+	}
+	ack, ok := reply.(*redis.Subscription)
+	if !ok || strings.ToUpper(ack.Kind) != cmdSubscribe || ack.Channel != "events" {
+		return fmt.Errorf("unexpected subscription acknowledgment: %v", reply)
+	}
+	return nil
 }
 
 func TestLeaderAwareRedisBackend_NewPubSubFallsBackToSeedWhenNoLeaderDiscovered(t *testing.T) {
