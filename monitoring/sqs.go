@@ -31,6 +31,7 @@ const (
 	sqsMaxTrackedQueues = 512
 	// Mirrors adapter.validateQueueName without importing the adapter.
 	sqsMaxAdminQueueLabelBytes = 80
+	sqsAdminOutcomeLabel       = "outcome"
 
 	// sqsQueueOverflow is the placeholder label used when a queue
 	// name is not in the tracked set (cap exceeded). Operators see
@@ -242,14 +243,14 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 			Name: "elastickv_sqs_admin_purge_queue_total",
 			Help: "Total admin PurgeQueue calls by queue and outcome.",
 		},
-		[]string{"queue", "outcome"},
+		[]string{"queue", sqsAdminOutcomeLabel},
 	)
 	m.adminPeekQueue = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "elastickv_sqs_admin_peek_queue_total",
 			Help: "Total admin PeekQueue calls by queue and outcome.",
 		},
-		[]string{"queue", "outcome"},
+		[]string{"queue", sqsAdminOutcomeLabel},
 	)
 	registerer.MustRegister(m.partitionMessages)
 	registerer.MustRegister(m.queueDepth)

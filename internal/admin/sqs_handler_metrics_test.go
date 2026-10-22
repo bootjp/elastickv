@@ -65,7 +65,7 @@ func TestSqsHandlerCountsRejectionsItServesItself(t *testing.T) {
 			WithRoleStore(MapRoleStore{"AKIA_RO": RoleReadOnly}).
 			WithAdminQueueObserver(adminQueueObserverFrom(src))
 
-		req := httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodDelete, pathPrefixSqsQueues+"orders/messages", nil)
 		req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
 			AuthPrincipal{AccessKey: "AKIA_RO", Role: RoleFull}))
 		rec := httptest.NewRecorder()
@@ -89,7 +89,7 @@ func TestSqsHandlerCountsRejectionsItServesItself(t *testing.T) {
 			WithRoleStore(MapRoleStore{"AKIA_NONE": Role("")}).
 			WithAdminQueueObserver(adminQueueObserverFrom(src))
 
-		req := httptest.NewRequest(http.MethodGet, pathPrefixSqsQueues+"orders/messages", nil)
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, pathPrefixSqsQueues+"orders/messages", nil)
 		req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
 			AuthPrincipal{AccessKey: "AKIA_NONE", Role: RoleFull}))
 		rec := httptest.NewRecorder()
@@ -112,7 +112,7 @@ func TestSqsHandlerCountsRejectionsItServesItself(t *testing.T) {
 			WithRoleStore(MapRoleStore{"AKIA_FULL": RoleFull}).
 			WithAdminQueueObserver(adminQueueObserverFrom(src))
 
-		req := httptest.NewRequest(http.MethodGet,
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
 			pathPrefixSqsQueues+"orders/messages?limit=abc", nil)
 		req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal,
 			AuthPrincipal{AccessKey: "AKIA_FULL", Role: RoleFull}))
