@@ -128,7 +128,8 @@ type S3Server struct {
 	// cleanupWorkers counts the background cleanups (see startCleanup) so
 	// Stop can join them, bounded, before the blob cluster and the stores
 	// close underneath them.
-	cleanupWorkers *inflightGate
+	cleanupWorkers   *inflightGate
+	reservedCleanups *backgroundWorkers
 	// cleanupCtx is the parent of every background cleanup's context;
 	// cancelCleanups ends it once Stop has waited its bound.
 	cleanupCtx     context.Context
@@ -377,6 +378,7 @@ func NewS3Server(listen net.Listener, s3Addr string, st store.MVCCStore, coordin
 		blobOffloadEnabled: S3BlobOffloadEnabledFromEnv(),
 		adminBlobUsers:     newInflightGate(),
 		cleanupWorkers:     newInflightGate(),
+		reservedCleanups:   newBackgroundWorkers(),
 	}
 	s.cleanupCtx, s.cancelCleanups = context.WithCancel(context.Background())
 	if localStores, ok := st.(S3BlobLocalStoreResolver); ok {
@@ -452,6 +454,7 @@ func (s *S3Server) Stop() {
 			slog.Duration("timeout", httpShutdownTimeout),
 		)
 	}
+	s.reservedCleanups.stop("s3 reserved cleanup", time.Until(deadline), s3CleanupJoinTimeout)
 	s.drainCleanups(time.Until(deadline))
 	if s.blobCluster != nil {
 		_ = s.blobCluster.Close()

@@ -82,3 +82,31 @@ func TestS3ServerStopWaitsForAdminDeleteAndItsCleanup(t *testing.T) {
 	err := s.AdminDeleteObject(context.Background(), fullAdminBucketsPrincipal(), "deletable", "k1")
 	require.ErrorIs(t, err, ErrAdminS3Stopping)
 }
+
+func TestS3ServerTimedOutAdminDeleteRetainsCleanupReservation(t *testing.T) {
+	shortenHTTPShutdownTimeout(t, 10*time.Millisecond)
+	st := store.NewMVCCStore()
+	coord := newFirstDispatchHoldingCoordinator(st)
+	s := NewS3Server(nil, "", st, coord, nil)
+	putObjectForAdminTest(t, s, "deletable", "k1", "hello")
+	coord.armed.Store(true)
+	deleteDone := make(chan error, 1)
+	go func() {
+		deleteDone <- s.AdminDeleteObject(context.Background(), fullAdminBucketsPrincipal(), "deletable", "k1")
+	}()
+	select {
+	case <-coord.entered:
+	case <-time.After(time.Second):
+		t.Fatal("delete did not dispatch")
+	}
+	stopDone := stopInBackground(s)
+	select {
+	case <-s.reservedCleanups.ctx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("Stop did not reach reserved cleanup cancellation")
+	}
+	close(coord.release)
+	require.NoError(t, <-deleteDone)
+	waitStopped(t, stopDone)
+	require.Positive(t, coord.after.Load(), "late committed delete must clean its manifest blobs")
+}
