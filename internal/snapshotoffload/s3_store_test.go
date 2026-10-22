@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math"
 	"sort"
 	"strings"
 	"sync"
@@ -823,9 +824,13 @@ func (c *fakeS3Client) ListObjectsV2(
 	c.listPrefixes = append(c.listPrefixes, wantPrefix)
 	keys := c.listObjectKeysLocked(bucketPrefix, wantPrefix)
 	start, end := c.listPageBounds(keys, input.ContinuationToken)
+	pageSize := end - start
+	if pageSize < 0 || pageSize >= math.MaxInt32 {
+		return nil, errors.New("fake s3 list page size exceeds key count range")
+	}
 	out := &s3.ListObjectsV2Output{
 		Contents: c.listPageContentsLocked(bucketPrefix, keys[start:end]),
-		KeyCount: aws.Int32(int32(end - start)),
+		KeyCount: aws.Int32(int32(pageSize)),
 	}
 	if c.listBadKeyCount {
 		out.KeyCount = aws.Int32(*out.KeyCount + 1)
