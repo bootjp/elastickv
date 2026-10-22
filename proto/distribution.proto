@@ -70,6 +70,10 @@ message GetTimestampResponse {
 
 message ValidateTimestampRequest {
   uint64 timestamp = 1;
+  // A separate pre-pending drain / pending-D resolution check, never ordinary
+  // timestamp validity. The caller must verify durable transaction evidence.
+  bool legacy_resolution = 2;
+  uint64 start_timestamp = 3;
 }
 
 message ValidateTimestampResponse {
@@ -77,6 +81,9 @@ message ValidateTimestampResponse {
   bool phase_d_active = 2;
   uint64 phase_d_floor = 3;
   uint64 allocation_floor = 4;
+  // Explicit acknowledgement prevents old servers ignoring the request mode
+  // from authorizing a legacy resolution through ordinary validation.
+  bool legacy_resolution_validated = 5;
 }
 
 enum RouteState {

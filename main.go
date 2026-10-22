@@ -923,6 +923,17 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	}
 	startMonitoringCollectors(in.ctx, in.metricsRegistry, in.runtimes, in.clock, in.encWiring.cache)
 	startFSMCompactorIfEnabled(in.ctx, in.eg, in.runtimes, in.readTracker)
+	// §4 physical snapshot offload. Opt-in, and a hard error when
+	// configured-but-unbuildable: an operator who set a backup
+	// destination and silently got no backups is worse off than one
+	// whose node refused to start.
+	if err := startSnapshotOffload(
+		in.ctx, in.eg, in.runtimes, *raftDir, in.raftID, in.cfg.multi,
+		in.metricsRegistry.SnapshotOffloadObserver(), slog.Default(),
+	); err != nil {
+		in.cancel()
+		return distributionStartup{}, err
+	}
 	return distributionStartup{
 		defaultRuntime:   defaultRuntime,
 		distServer:       distServer,
@@ -1757,6 +1768,11 @@ func validateSQSFifoPartitionMapNoDedicatedTSOGroup(partitionMap map[string]sqsF
 }
 
 func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {
+	// An absent HTTP map selects the coordinator's gRPC follower path. A
+	// self-only map cannot resolve a remote leader and rejects every request.
+	if strings.TrimSpace(raftDynamoMap) == "" {
+		return nil, nil
+	}
 	return buildLeaderAddrMap(groups, dynamoAddr, raftDynamoMap, parseRaftDynamoMap)
 }
 
@@ -3078,10 +3094,14 @@ func configureDedicatedCoordinatorTSO(
 	observer kv.TSOObserver,
 ) (coordinatorTSOWiring, error) {
 	var wiring coordinatorTSOWiring
+	opts := []kv.RaftTSOAllocatorOption{kv.WithTSOCutoverFloorProvider(floorProvider)}
+	if gate, ok := floorProvider.(kv.TSOPhaseDActivationGate); ok {
+		opts = append(opts, kv.WithTSOPhaseDActivationGate(gate))
+	}
 	local, err := kv.NewRaftTSOAllocator(
 		tsoGroup,
 		coordinate.Clock(),
-		kv.WithTSOCutoverFloorProvider(floorProvider),
+		opts...,
 	)
 	if err != nil {
 		return wiring, errors.Wrap(err, "configure dedicated tso allocator")
@@ -4129,6 +4149,7 @@ func startRaftServers(
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id], rt.spec.id)
+		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -4143,7 +4164,9 @@ func startRaftServers(
 			coordinate.Clock(),
 			relay,
 			append(internalOpts,
+				adapter.WithInternalPrepareEvidenceToken(adminGRPCOpts.token),
 				adapter.WithInternalStore(rt.store),
+				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
 				adapter.WithInternalActiveTimestampTracker(readTracker),
@@ -4181,7 +4204,7 @@ func startRaftServers(
 			rt.engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			confChangeInterceptor,
+			newPrepareEvidenceMembershipGate(shardStore, rt.spec.id, confChangeInterceptor),
 		)
 		reflection.Register(gs)
 

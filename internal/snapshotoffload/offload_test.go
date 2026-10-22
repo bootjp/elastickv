@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
@@ -11,6 +12,7 @@ import (
 	"time"
 
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -58,6 +60,8 @@ func TestPublishAndRestorePhysicalSnapshotRoundTrip(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 9, ID: "n9", Address: "127.0.0.1:19009"},
 		},
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.NoError(t, err)
 	require.Equal(t, int64(len(payload)), result.PayloadBytes)
@@ -95,10 +99,12 @@ func TestRestoreRejectsCorruptPayloadAndLeavesDestinationAbsent(t *testing.T) {
 
 	restoreDataDir := filepath.Join(root, "restored")
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:       store,
-		ManifestKey: manifest.ManifestKey,
-		DataDir:     restoreDataDir,
-		Peers:       singlePeer(),
+		Store:               store,
+		ManifestKey:         manifest.ManifestKey,
+		DataDir:             restoreDataDir,
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, ErrIntegrity)
 	_, statErr := os.Stat(restoreDataDir)
@@ -183,6 +189,15 @@ func TestPublishReusesExistingObjectsWithoutHeadChecksum(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, first.ManifestKey, second.ManifestKey)
 	require.Equal(t, first.Payload.Key, second.Payload.Key)
+	require.Equal(t, opts.CreatedAt.Add(time.Nanosecond), second.CreatedAt)
+	require.NotEqual(t, first.ManifestSHA256, second.ManifestSHA256)
+
+	third, err := PublishPersistedSnapshot(ctx, opts)
+	require.NoError(t, err)
+	require.Equal(t, first.ManifestKey, third.ManifestKey)
+	require.Equal(t, first.Payload.Key, third.Payload.Key)
+	require.Equal(t, opts.CreatedAt.Add(2*time.Nanosecond), third.CreatedAt)
+	require.NotEqual(t, second.ManifestSHA256, third.ManifestSHA256)
 }
 
 func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
@@ -201,12 +216,13 @@ func TestPublishReusesExistingManifestWhenCreatedAtOmitted(t *testing.T) {
 
 	first, err := PublishPersistedSnapshot(ctx, opts)
 	require.NoError(t, err)
+	firstCreatedAt := first.CreatedAt
 	time.Sleep(time.Millisecond)
 	second, err := PublishPersistedSnapshot(ctx, opts)
 	require.NoError(t, err)
 	require.Equal(t, first.ManifestKey, second.ManifestKey)
-	require.Equal(t, first.ManifestSHA256, second.ManifestSHA256)
-	require.Equal(t, first.CreatedAt, second.CreatedAt)
+	require.Equal(t, firstCreatedAt.Add(time.Nanosecond), second.CreatedAt)
+	require.NotEqual(t, first.ManifestSHA256, second.ManifestSHA256)
 }
 
 func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
@@ -243,9 +259,27 @@ func TestPutManifestReusesExistingManifestAfterCreateConflict(t *testing.T) {
 
 	candidate := existing
 	candidate.CreatedAt = time.Unix(401, 0).UTC()
+	lost := errors.New("leadership lost during create conflict")
+	checks := 0
+	racingAfterDemotion := &headMissOnceStore{ObjectStore: store, key: key}
+	err = putManifest(ctx, racingAfterDemotion, &candidate, true, func(context.Context) error {
+		checks++
+		if checks > 1 {
+			return lost
+		}
+		return nil
+	})
+	require.ErrorIs(t, err, lost)
+	require.Equal(t, 2, checks)
+	unchanged, err := LoadManifest(ctx, store, key)
+	require.NoError(t, err)
+	require.Equal(t, existing.CreatedAt, unchanged.CreatedAt)
+
+	candidate = existing
+	candidate.CreatedAt = time.Unix(401, 0).UTC()
 	racingStore := &headMissOnceStore{ObjectStore: store, key: key}
 	require.NoError(t, putManifest(ctx, racingStore, &candidate, true, nil))
-	require.Equal(t, existing.CreatedAt, candidate.CreatedAt)
+	require.Equal(t, existing.CreatedAt.Add(time.Nanosecond), candidate.CreatedAt)
 	require.NotEmpty(t, candidate.ManifestSHA256)
 }
 
@@ -288,26 +322,30 @@ func TestDecodeManifestAcceptsJointConsensusConfState(t *testing.T) {
 	require.Equal(t, manifest.ConfState, decoded.ConfState)
 }
 
-func TestPublishRejectsGroupZeroWithoutSourceClusterBeforePayload(t *testing.T) {
-	ctx := context.Background()
-	root := t.TempDir()
-	payload := []byte("EKVTHLC1payload-invalid-group-zero")
-	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 18, 11, singlePeer())
-	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+func TestPublishRejectsEveryGroupWithoutSourceClusterBeforePayload(t *testing.T) {
+	for _, groupID := range []uint64{0, 7} {
+		t.Run(fmt.Sprintf("group-%d", groupID), func(t *testing.T) {
+			ctx := context.Background()
+			root := t.TempDir()
+			payload := []byte("EKVTHLC1payload-invalid-source-cluster")
+			sourceDataDir := seedPhysicalSnapshot(t, root, payload, 18, 11, singlePeer())
+			store := newTestLocalStore(t, filepath.Join(root, "objects"))
 
-	_, err := PublishPersistedSnapshot(ctx, PublishOptions{
-		Store:   store,
-		DataDir: sourceDataDir,
-		Prefix:  "cluster-a",
-		GroupID: 0,
-	})
-	require.ErrorIs(t, err, ErrInvalidOptions)
+			_, err := PublishPersistedSnapshot(ctx, PublishOptions{
+				Store:   store,
+				DataDir: sourceDataDir,
+				Prefix:  "cluster-a",
+				GroupID: groupID,
+			})
+			require.ErrorIs(t, err, ErrInvalidOptions)
 
-	payloadKey, err := payloadKey("cluster-a", hexSHA256Bytes(payload))
-	require.NoError(t, err)
-	_, ok, err := store.HeadObject(ctx, payloadKey)
-	require.NoError(t, err)
-	require.False(t, ok)
+			payloadKey, err := payloadKey("cluster-a", hexSHA256Bytes(payload))
+			require.NoError(t, err)
+			_, ok, err := store.HeadObject(ctx, payloadKey)
+			require.NoError(t, err)
+			require.False(t, ok)
+		})
+	}
 }
 
 func TestPublishUsesDataDirLocalSpoolByDefault(t *testing.T) {
@@ -376,10 +414,12 @@ func TestRestoreInlineManifestRejectsStaleSelfHashBeforePayloadDownload(t *testi
 	tracked := &countingObjectStore{ObjectStore: store}
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:    tracked,
-		Manifest: &tampered,
-		DataDir:  filepath.Join(root, "restored"),
-		Peers:    singlePeer(),
+		Store:               tracked,
+		Manifest:            &tampered,
+		DataDir:             filepath.Join(root, "restored"),
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(tampered.GroupID),
+		ExpectSourceCluster: tampered.SourceCluster,
 	})
 	require.ErrorIs(t, err, ErrIntegrity)
 	require.Zero(t, tracked.getObjectCalls)
@@ -480,10 +520,12 @@ func TestRestorePreflightsExistingDestinationBeforePayloadDownload(t *testing.T)
 	require.NoError(t, os.Mkdir(restoreDataDir, 0o755))
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:       store,
-		ManifestKey: manifest.ManifestKey,
-		DataDir:     restoreDataDir,
-		Peers:       singlePeer(),
+		Store:               store,
+		ManifestKey:         manifest.ManifestKey,
+		DataDir:             restoreDataDir,
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, etcdraftengine.ErrExternalSnapshotRestoreExists)
 }
@@ -511,6 +553,8 @@ func TestRestoreRejectsInvalidPeersBeforePayloadDownload(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 0, ID: "n0", Address: "127.0.0.1:12000"},
 		},
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, ErrInvalidOptions)
 	require.Zero(t, tracked.getObjectCalls)
@@ -534,10 +578,12 @@ func TestRestoreHonorsCancelledContextBeforePayloadDownload(t *testing.T) {
 	tracked := &countingObjectStore{ObjectStore: store}
 
 	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
-		Store:    tracked,
-		Manifest: manifest,
-		DataDir:  filepath.Join(root, "restored"),
-		Peers:    singlePeer(),
+		Store:               tracked,
+		Manifest:            manifest,
+		DataDir:             filepath.Join(root, "restored"),
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.ErrorIs(t, err, context.Canceled)
 	require.Zero(t, tracked.getObjectCalls)
@@ -620,6 +666,7 @@ func newTestLocalStore(t *testing.T, root string) *LocalStore {
 	t.Helper()
 	store, err := NewLocalStore(root)
 	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, store.Close()) })
 	return store
 }
 
@@ -640,6 +687,20 @@ type countingObjectStore struct {
 	getObjectCalls int
 }
 
+func (s *countingObjectStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *countingObjectStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
+}
+
 func (s *countingObjectStore) GetObject(ctx context.Context, key string) (io.ReadCloser, ObjectInfo, error) {
 	s.getObjectCalls++
 	return s.ObjectStore.GetObject(ctx, key)
@@ -649,6 +710,20 @@ type headMissOnceStore struct {
 	ObjectStore
 	key  string
 	miss bool
+}
+
+func (s *headMissOnceStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *headMissOnceStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
 }
 
 func (s *headMissOnceStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
@@ -670,6 +745,30 @@ type headOrderingStore struct {
 	ObjectStore
 	manifestKey string
 	calls       []string
+}
+
+func (s *headOrderingStore) AcquireObjectClaim(ctx context.Context, key string) (ObjectClaim, error) {
+	claimStore, err := objectClaimStore(s.ObjectStore)
+	if err != nil {
+		return nil, err
+	}
+	return claimStore.AcquireObjectClaim(ctx, key)
+}
+
+func (s *headOrderingStore) RefreshObject(
+	ctx context.Context, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	return refreshWrappedObject(ctx, s.ObjectStore, key, body, opts)
+}
+
+func refreshWrappedObject(
+	ctx context.Context, store ObjectStore, key string, body io.Reader, opts PutOptions,
+) (ObjectInfo, error) {
+	refresher, ok := store.(ObjectRefresher)
+	if !ok {
+		return ObjectInfo{}, errors.Wrap(ErrInvalidOptions, "wrapped object store cannot refresh objects")
+	}
+	return refresher.RefreshObject(ctx, key, body, opts)
 }
 
 func (s *headOrderingStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
@@ -723,4 +822,209 @@ func TestPublishVerifiesLeadershipAfterTheManifestAbsenceProbe(t *testing.T) {
 		"leadership must be re-verified AFTER the manifest absence probe")
 	require.NotContains(t, verifiedAfter, "put-manifest",
 		"and before the manifest object is created")
+}
+
+// expectGroup is the RestoreOptions.ExpectGroupID helper. The field is a
+// pointer because group 0 is a real group (the dedicated TSO group), so zero
+// cannot double as "not supplied".
+func expectGroup(groupID uint64) *uint64 {
+	return &groupID
+}
+
+// TestCleanStaleSpoolFilesRemovesOrphansFromAKilledProcess covers the spool
+// leak.
+//
+// spoolExport removes its file with a defer, which never runs if the process is
+// killed or the host loses power mid-publish. Nothing else removed them, so
+// repeated crashes during large snapshots accumulated full payload copies until
+// the spool volume filled.
+func TestCleanStaleSpoolFilesRemovesOrphansFromAKilledProcess(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	orphan := filepath.Join(dir, "elastickv-snapshot-offload-123456.fsm")
+	require.NoError(t, os.WriteFile(orphan, []byte("payload"), 0o600))
+
+	// Files that are not spool files must be left alone: the spool dir can be
+	// shared, and deleting an unrelated file would be far worse than the leak.
+	unrelated := filepath.Join(dir, "keep-me.txt")
+	require.NoError(t, os.WriteFile(unrelated, []byte("data"), 0o600))
+	manifest := filepath.Join(dir, "manifest.json")
+	require.NoError(t, os.WriteFile(manifest, []byte("{}"), 0o600))
+
+	removed, err := CleanStaleSpoolFiles(dir, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []string{orphan}, removed)
+
+	require.NoFileExists(t, orphan)
+	require.FileExists(t, unrelated)
+	require.FileExists(t, manifest)
+}
+
+// A file newer than the cutoff may belong to a concurrently running publish, so
+// it must survive: deleting it would break a live upload to fix a leak.
+func TestCleanStaleSpoolFilesSparesAFileNewerThanTheCutoff(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	inFlight := filepath.Join(dir, "elastickv-snapshot-offload-inflight.fsm")
+	require.NoError(t, os.WriteFile(inFlight, []byte("partial"), 0o600))
+
+	removed, err := CleanStaleSpoolFiles(dir, time.Now().Add(-time.Hour))
+	require.NoError(t, err)
+	require.Empty(t, removed)
+	require.FileExists(t, inFlight)
+}
+
+// A missing spool dir is not an error: offload may never have run.
+func TestCleanStaleSpoolFilesToleratesAMissingDirectory(t *testing.T) {
+	t.Parallel()
+
+	removed, err := CleanStaleSpoolFiles(filepath.Join(t.TempDir(), "absent"), time.Now())
+	require.NoError(t, err)
+	require.Empty(t, removed)
+}
+
+func TestCleanStaleSpoolFilesRequiresADirectory(t *testing.T) {
+	t.Parallel()
+
+	_, err := CleanStaleSpoolFiles("  ", time.Now())
+	require.ErrorIs(t, err, ErrInvalidOptions)
+}
+
+// TestSpoolDirForMatchesWhatAPublishUses pins that a caller cleaning the spool
+// dir targets the same directory a publish writes into -- a cleaner pointed at
+// the wrong path silently does nothing.
+func TestSpoolDirForMatchesWhatAPublishUses(t *testing.T) {
+	t.Parallel()
+
+	require.Equal(t,
+		filepath.Join("/srv", "raft", ".snapshot-offload-spool"),
+		SpoolDirFor("", "/srv/raft/n1"),
+		"the default spool dir is a sibling of the data dir, so it shares its filesystem "+
+			"and the spooled payload can be renamed rather than copied")
+	require.Equal(t, filepath.Clean("/spool"), SpoolDirFor("/spool", "/srv/raft/n1"),
+		"an explicit spool dir wins")
+}
+
+// TestRestoreRejectsAnotherClustersManifestBeforeTheDownload pins that the
+// cluster check, like the group check, runs before the payload download and
+// before the destination is created.
+func TestRestoreRejectsAnotherClustersManifestBeforeTheDownload(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1payload-for-cross-cluster-restore")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 31, 11, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "shared-bucket",
+		GroupID:       1,
+		SourceCluster: "cluster-b",
+	})
+	require.NoError(t, err)
+
+	tracked := &countingObjectStore{ObjectStore: store}
+	dest := filepath.Join(root, "restored")
+	_, err = RestorePhysicalSnapshot(ctx, RestoreOptions{
+		Store:    tracked,
+		Manifest: manifest,
+		DataDir:  dest,
+		Peers:    singlePeer(),
+		// The group MATCHES; only the cluster identity differs, which is the
+		// case the group check alone cannot catch.
+		ExpectGroupID:                expectGroup(manifest.GroupID),
+		ExpectSourceCluster:          "cluster-a",
+		AllowLegacySourceClusterless: true,
+	})
+	require.ErrorIs(t, err, ErrRestoreSourceClusterMismatch)
+	require.Zero(t, tracked.getObjectCalls,
+		"the payload must not be downloaded for a manifest from another cluster")
+	_, statErr := os.Stat(dest)
+	require.True(t, os.IsNotExist(statErr), "the destination must not be created")
+}
+
+func TestRestoreLegacySourceClusterlessManifestRequiresExplicitOverride(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	root := t.TempDir()
+	payload := []byte("EKVTHLC1legacy-source-clusterless-payload")
+	sourceDataDir := seedPhysicalSnapshot(t, root, payload, 32, 12, singlePeer())
+	store := newTestLocalStore(t, filepath.Join(root, "objects"))
+	manifest, err := PublishPersistedSnapshot(ctx, PublishOptions{
+		Store:         store,
+		DataDir:       sourceDataDir,
+		Prefix:        "legacy",
+		GroupID:       1,
+		SourceCluster: "cluster-a",
+	})
+	require.NoError(t, err)
+
+	legacy := *manifest
+	legacy.SourceCluster = ""
+	_, legacy.ManifestSHA256, err = legacy.MarshalCanonical()
+	require.NoError(t, err)
+
+	base := RestoreOptions{
+		Store:               store,
+		Manifest:            &legacy,
+		Peers:               singlePeer(),
+		ExpectGroupID:       expectGroup(legacy.GroupID),
+		ExpectSourceCluster: "cluster-a",
+	}
+	withoutOverride := base
+	withoutOverride.DataDir = filepath.Join(root, "without-override")
+	_, err = RestorePhysicalSnapshot(ctx, withoutOverride)
+	require.ErrorIs(t, err, ErrRestoreSourceClusterMismatch)
+
+	withOverride := base
+	withOverride.DataDir = filepath.Join(root, "with-override")
+	withOverride.AllowLegacySourceClusterless = true
+	_, err = RestorePhysicalSnapshot(ctx, withOverride)
+	require.NoError(t, err)
+}
+
+// TestCleanStaleSpoolFilesTreatsTheDirectoryAsAPathNotAPattern is the glob
+// regression.
+//
+// filepath.Glob interprets the whole joined path as a pattern, so a configured
+// spool dir containing a metacharacter — /tmp/spool[12] — matched /tmp/spool1
+// and /tmp/spool2 and deleted the spool files under THOSE, while the directory
+// the operator actually configured was never examined. A configured path is a
+// path.
+func TestCleanStaleSpoolFilesTreatsTheDirectoryAsAPathNotAPattern(t *testing.T) {
+	t.Parallel()
+
+	root := t.TempDir()
+	// The configured directory, whose name contains glob metacharacters.
+	configured := filepath.Join(root, "spool[12]")
+	require.NoError(t, os.MkdirAll(configured, 0o750))
+	mine := filepath.Join(configured, "elastickv-snapshot-offload-mine.fsm")
+	require.NoError(t, os.WriteFile(mine, []byte("mine"), 0o600))
+
+	// Directories the pattern would have matched instead. Their files must be
+	// untouched: they belong to someone else.
+	var bystanders []string
+	for _, name := range []string{"spool1", "spool2"} {
+		dir := filepath.Join(root, name)
+		require.NoError(t, os.MkdirAll(dir, 0o750))
+		f := filepath.Join(dir, "elastickv-snapshot-offload-theirs.fsm")
+		require.NoError(t, os.WriteFile(f, []byte("theirs"), 0o600))
+		bystanders = append(bystanders, f)
+	}
+
+	removed, err := CleanStaleSpoolFiles(configured, time.Now().Add(time.Minute))
+	require.NoError(t, err)
+	require.Equal(t, []string{mine}, removed,
+		"only the configured directory's own spool file may be removed")
+
+	require.NoFileExists(t, mine)
+	for _, f := range bystanders {
+		require.FileExists(t, f,
+			"a directory that merely MATCHES the configured name is not the configured directory")
+	}
 }

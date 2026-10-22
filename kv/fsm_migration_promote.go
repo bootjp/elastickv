@@ -58,8 +58,25 @@ func (f *kvFSM) applyMigrationPromote(ctx context.Context, data []byte) any {
 	if !ok {
 		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrMigrationPromoteApply), "kv/fsm: migration promote store"))
 	}
-	result, err := promoter.PromoteVersions(ctx, migrationPromoteOptionsFromProto(req, f.pendingApplyIdx))
+	opts := migrationPromoteOptionsFromProto(req, f.pendingApplyIdx)
+	mapTarget := opts.TargetKey
+	rejectedPeerLocal := false
+	opts.TargetKey = func(stagedKey []byte) ([]byte, bool) {
+		key, valid := mapTarget(stagedKey)
+		if valid && isTxnPeerLocalControlKey(key) {
+			rejectedPeerLocal = true
+			return nil, false
+		}
+		return key, valid
+	}
+	result, err := promoter.PromoteVersions(ctx, opts)
 	if err != nil {
+		// A legacy staged control row is a deterministic input refusal, not
+		// a store failure that should halt replication. Promotion plans the
+		// entire chunk before applying it, so no row has been moved here.
+		if rejectedPeerLocal {
+			return errors.Wrap(ErrInvalidRequest, "migration cannot promote peer-local timestamp protocol state")
+		}
 		if isMigrationPromoteOrdinaryApplyError(err) {
 			return errors.Wrap(err, "kv/fsm: apply migration promote")
 		}

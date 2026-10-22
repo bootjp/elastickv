@@ -3,12 +3,14 @@ package fuseadapter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"syscall"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/store"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
 )
@@ -166,6 +168,194 @@ func TestRawFileSystemCreateMapsErrors(t *testing.T) {
 	require.Equal(t, fuse.Status(syscall.EAGAIN), status)
 	require.Zero(t, out.Fh)
 	require.Empty(t, adapter.openHandleSnapshot())
+}
+
+func TestRawFileSystemCreateRevalidatesExistingFileWithoutExcl(t *testing.T) {
+	core := &fakeCore{
+		createErr:    filesystem.ErrExists,
+		resolveInode: 7,
+		stat:         filesystem.Stat{Inode: 7, Generation: 2, Type: filesystem.TypeFile, Mode: 0o644, Size: 5},
+		openFH:       9,
+	}
+	raw, adapter := newRawFileSystem(t, core)
+
+	var out fuse.CreateOut
+	status := raw.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Flags:    syscall.O_RDWR | syscall.O_CREAT,
+	}, "file", &out)
+	require.Equal(t, fuse.Status(syscall.ESTALE), status)
+	require.Zero(t, out.NodeId)
+	require.Zero(t, out.Fh)
+	require.Zero(t, core.resolveParent)
+	require.Zero(t, core.openInode)
+	require.Empty(t, adapter.openHandleSnapshot())
+}
+
+func TestRawFileSystemCreateDefersExistingTruncationToKernel(t *testing.T) {
+	core := &fakeCore{
+		createErr:    filesystem.ErrExists,
+		resolveInode: 7,
+		stat:         filesystem.Stat{Inode: 7, Generation: 2, Type: filesystem.TypeFile, Mode: 0o644, Size: 5},
+		openFH:       9,
+		setAttrStat:  filesystem.Stat{Inode: 7, Generation: 2, Type: filesystem.TypeFile, Mode: 0o644, Size: 0},
+	}
+	raw, _ := newRawFileSystem(t, core)
+
+	var out fuse.CreateOut
+	status := raw.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Flags:    syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC,
+	}, "file", &out)
+	require.Equal(t, fuse.Status(syscall.ESTALE), status)
+	require.Zero(t, core.setAttrInode)
+	require.Zero(t, out.Size)
+	require.Zero(t, out.Fh)
+}
+
+func TestRawFileSystemCreateExclusiveExistingFileReturnsExists(t *testing.T) {
+	core := &fakeCore{createErr: filesystem.ErrExists, resolveInode: 7, openFH: 9}
+	raw, adapter := newRawFileSystem(t, core)
+
+	var out fuse.CreateOut
+	status := raw.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Flags:    syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL,
+	}, "file", &out)
+	require.Equal(t, fuse.Status(syscall.EEXIST), status)
+	require.Zero(t, core.resolveParent)
+	require.Zero(t, core.openInode)
+	require.Zero(t, out.Fh)
+	require.Empty(t, adapter.openHandleSnapshot())
+}
+
+func TestRawFileSystemCreateExistingDirectoryRevalidates(t *testing.T) {
+	core := &fakeCore{
+		createErr:    filesystem.ErrExists,
+		resolveInode: 7,
+		stat:         filesystem.Stat{Inode: 7, Type: filesystem.TypeDirectory, Mode: 0o755},
+	}
+	raw, adapter := newRawFileSystem(t, core)
+
+	var out fuse.CreateOut
+	status := raw.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Flags:    syscall.O_RDWR | syscall.O_CREAT,
+	}, "dir", &out)
+	require.Equal(t, fuse.Status(syscall.ESTALE), status)
+	require.Zero(t, core.openInode)
+	require.Zero(t, out.Fh)
+	require.Empty(t, adapter.openHandleSnapshot())
+}
+
+type disappearingCreateCore struct {
+	*fakeCore
+	createCalls   int
+	alwaysExists  bool
+	conflictFirst bool
+}
+
+func (c *disappearingCreateCore) Create(
+	ctx context.Context,
+	parent uint64,
+	name []byte,
+	opts filesystem.CreateOptions,
+) (filesystem.CreateResult, error) {
+	c.createCalls++
+	if c.createCalls == 1 && c.conflictFirst {
+		return filesystem.CreateResult{}, store.ErrWriteConflict
+	}
+	if c.createCalls == 1 || c.alwaysExists {
+		return filesystem.CreateResult{}, filesystem.ErrExists
+	}
+	return c.fakeCore.Create(ctx, parent, name, opts)
+}
+
+func TestRawFileSystemCreateDoesNotReplayAmbiguousWriteConflict(t *testing.T) {
+	for _, flags := range []uint32{syscall.O_RDWR | syscall.O_CREAT, syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL} {
+		t.Run(fmt.Sprint(flags), func(t *testing.T) {
+			core := &disappearingCreateCore{
+				fakeCore: &fakeCore{createResult: filesystem.CreateResult{
+					Inode: 7,
+					FH:    9,
+					Stat:  filesystem.Stat{Inode: 7, Type: filesystem.TypeFile, Mode: 0o644},
+				}},
+				conflictFirst: true,
+			}
+			raw, _ := newRawFileSystem(t, core)
+
+			var out fuse.CreateOut
+			status := raw.Create(nil, &fuse.CreateIn{
+				InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+				Flags:    flags,
+			}, "file", &out)
+			require.Equal(t, fuse.Status(syscall.EAGAIN), status)
+			require.Equal(t, 1, core.createCalls)
+			require.Zero(t, out.NodeId)
+			require.Zero(t, out.Fh)
+		})
+	}
+}
+
+func TestRawFileSystemCreateDefersVanishedEntryLookupToKernel(t *testing.T) {
+	core := &disappearingCreateCore{fakeCore: &fakeCore{
+		resolveErr: filesystem.ErrNotFound,
+		createResult: filesystem.CreateResult{
+			Inode: 7,
+			FH:    9,
+			Stat:  filesystem.Stat{Inode: 7, Type: filesystem.TypeFile, Mode: 0o644},
+		},
+	}}
+	raw, _ := newRawFileSystem(t, core)
+
+	var out fuse.CreateOut
+	status := raw.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Flags:    syscall.O_RDWR | syscall.O_CREAT,
+	}, "file", &out)
+	require.Equal(t, fuse.Status(syscall.ESTALE), status)
+	require.Equal(t, 1, core.createCalls)
+	require.Zero(t, out.NodeId)
+	require.Zero(t, out.Fh)
+}
+
+func TestRawFileSystemCreateDoesNotRetryCollisionInUserspace(t *testing.T) {
+	core := &disappearingCreateCore{
+		fakeCore:     &fakeCore{resolveErr: filesystem.ErrNotFound},
+		alwaysExists: true,
+	}
+	raw, _ := newRawFileSystem(t, core)
+
+	var out fuse.CreateOut
+	status := raw.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Flags:    syscall.O_RDWR | syscall.O_CREAT,
+	}, "file", &out)
+	require.Equal(t, fuse.Status(syscall.ESTALE), status)
+	require.Equal(t, 1, core.createCalls)
+	require.Zero(t, out.Fh)
+}
+
+func TestRawFileSystemCreateCollisionDoesNotAllocateTruncateHandle(t *testing.T) {
+	core := &fakeCore{
+		createErr:    filesystem.ErrExists,
+		resolveInode: 7,
+		stat:         filesystem.Stat{Inode: 7, Type: filesystem.TypeFile, Mode: 0o644, Size: 5},
+		openFH:       9,
+		setAttrErr:   filesystem.ErrNotFound,
+	}
+	raw, adapter := newRawFileSystem(t, core)
+
+	var out fuse.CreateOut
+	status := raw.Create(nil, &fuse.CreateIn{
+		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+		Flags:    syscall.O_RDWR | syscall.O_CREAT | syscall.O_TRUNC,
+	}, "file", &out)
+	require.Equal(t, fuse.Status(syscall.ESTALE), status)
+	require.Zero(t, core.releaseInode)
+	require.Zero(t, core.releaseFH)
+	require.Empty(t, adapter.openHandleSnapshot())
+	require.Zero(t, out.Fh)
 }
 
 func TestRawFileSystemUnlinkAndRmdirForwardNames(t *testing.T) {

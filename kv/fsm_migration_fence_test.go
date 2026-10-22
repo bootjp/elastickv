@@ -1654,7 +1654,7 @@ func TestFSMPrepareUsesCommitTSForRouteFloorWhenPresent(t *testing.T) {
 	require.NoError(t, err)
 	lock, err := decodeTxnLock(rawLock)
 	require.NoError(t, err)
-	require.Equal(t, commitTS, lock.CommitTS)
+	require.Zero(t, lock.CommitTS, "a legacy floor hint must not become durable prepare evidence")
 }
 
 func TestFSMPrepareWithoutCommitTSUsesStartTSForRouteFloor(t *testing.T) {

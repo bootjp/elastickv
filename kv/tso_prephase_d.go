@@ -1,13 +1,14 @@
 package kv
 
 import (
+	"context"
 	"time"
 
 	"github.com/cockroachdb/errors"
 )
 
 // The §4.3 closure of the pre-Phase-D resolution carve-out
-// (docs/design/2026_09_02_proposed_prephase_d_resolution_evidence.md).
+// (docs/design/2026_09_02_partial_prephase_d_resolution_evidence.md).
 //
 // The carve-out exists because a cross-shard transaction that began before the
 // Phase-D marker can still hold unresolved intents afterwards, and resolving
@@ -22,7 +23,8 @@ import (
 // timestamp, inserting a write retroactively below timestamps that have already
 // been read.
 //
-// Two mechanisms close it, because neither covers the whole surface:
+// Two mechanisms bound creation and strengthen resolution; the first-primary
+// proof gap documented in the design remains open:
 //
 //   - Durable evidence, where it exists. For a COMMIT whose primary key this
 //     node can read, the primary's own commit record has to agree with the
@@ -103,6 +105,29 @@ type PrimaryCommitEvidence struct {
 	Found bool
 	// CommitTS is the timestamp that record carries.
 	CommitTS uint64
+	// PrimaryPrepared confirms a matching durable primary lock and intent.
+	// It permits the first primary COMMIT to create its decision, but is not
+	// evidence that a claimed commit timestamp was previously issued.
+	PrimaryPrepared bool
+	// PreparedCommitTS is the chosen timestamp atomically persisted with the
+	// matching lock and intent. Zero identifies an unproven legacy PREPARE.
+	PreparedCommitTS uint64
+	// LegacyPreparedAllowed keeps an already-active old Phase-D cluster
+	// resolvable while the new protocol drains its preexisting unproven locks.
+	// The authoritative creation seal or release permanently clears it.
+	LegacyPreparedAllowed bool
+}
+
+// PrimaryCommitEvidenceReader distinguishes a missing local record from a
+// primary whose authoritative record cannot be read on this node.
+type PrimaryCommitEvidenceReader interface {
+	PrimaryCommitEvidence(context.Context, []byte, uint64) (PrimaryCommitEvidence, error)
+}
+
+// PrimaryCommitEvidenceBatchReader shares applied read fences between primary
+// keys with the same local owner. Results have the same order as primaryKeys.
+type PrimaryCommitEvidenceBatchReader interface {
+	PrimaryCommitEvidenceBatch(context.Context, [][]byte, uint64) ([]PrimaryCommitEvidence, error)
 }
 
 // ClassifyPrePhaseDCommit decides whether a pre-Phase-D commit resolution may

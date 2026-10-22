@@ -13,6 +13,7 @@ const (
 	txnMetaVersion     byte = 1
 	txnMetaVersionV1   byte = txnMetaVersion
 	txnMetaVersionV2   byte = 2
+	txnMetaVersionV3   byte = 3
 	txnLockVersion     byte = 1
 	txnIntentVersion   byte = 1
 	txnCommitVersion   byte = 1
@@ -56,9 +57,17 @@ type TxnMeta struct {
 	LockTTLms    uint64
 	CommitTS     uint64
 	PrevCommitTS uint64
+	// PrepareCommitTS binds a PREPARE to its chosen commit timestamp. V3 is
+	// emitted only after all replicas support durable prepare evidence.
+	PrepareCommitTS uint64
 }
 
 func EncodeTxnMeta(m TxnMeta) []byte {
+	if m.PrepareCommitTS != 0 {
+		encoded := encodeTxnMetaV2(m)
+		encoded[0] = txnMetaVersionV3
+		return binary.BigEndian.AppendUint64(encoded, m.PrepareCommitTS)
+	}
 	// Keep v1 as the default wire format until the cluster can guarantee that
 	// every node understands v2 during rolling upgrades. The only field that
 	// requires v2 is PrevCommitTS (the one-phase dedup probe), which is set
@@ -126,6 +135,19 @@ func DecodeTxnMeta(b []byte) (TxnMeta, error) {
 		return decodeTxnMetaV1(b)
 	case txnMetaVersionV2:
 		return decodeTxnMetaV2(b)
+	case txnMetaVersionV3:
+		if len(b) < txnMetaHeaderSize+2*uint64FieldSize {
+			return TxnMeta{}, errors.New("txn meta: prepared commit timestamp truncated")
+		}
+		meta, err := decodeTxnMetaV2(b[:len(b)-uint64FieldSize])
+		if err != nil {
+			return TxnMeta{}, err
+		}
+		meta.PrepareCommitTS = binary.BigEndian.Uint64(b[len(b)-uint64FieldSize:])
+		if meta.PrepareCommitTS == 0 {
+			return TxnMeta{}, errors.Wrap(ErrTxnInvalidMeta, "txn meta: prepared commit timestamp is zero")
+		}
+		return meta, nil
 	default:
 		return TxnMeta{}, errors.WithStack(errors.Newf("txn meta: unsupported version %d", b[0]))
 	}
@@ -228,10 +250,10 @@ func optionalV2Fields(m *TxnMeta) []struct {
 
 type txnLock struct {
 	StartTS      uint64
+	CommitTS     uint64
 	TTLExpireAt  uint64
 	PrimaryKey   []byte
 	IsPrimaryKey bool
-	CommitTS     uint64
 }
 
 func encodeTxnLock(l txnLock) []byte {
@@ -311,15 +333,23 @@ func decodeTxnLockRequired(r *bytes.Reader) (txnLock, byte, error) {
 
 func decodeTxnLockOptional(lock txnLock, flags byte, r *bytes.Reader) (txnLock, error) {
 	if flags&txnLockFlagCommitTS != 0 {
-		commitTS, rerr := readTxnUint64(r, "txn lock: commit ts truncated")
-		if rerr != nil {
-			return txnLock{}, rerr
-		}
-		lock.CommitTS = commitTS
+		return decodeTxnLockCommitEvidence(r, lock)
 	}
 	if r.Len() != 0 {
 		return txnLock{}, errors.WithStack(errors.Newf("txn lock: unexpected trailing bytes %d", r.Len()))
 	}
+	return lock, nil
+}
+
+func decodeTxnLockCommitEvidence(r *bytes.Reader, lock txnLock) (txnLock, error) {
+	commitTS, err := readTxnUint64(r, "txn lock: commit ts truncated")
+	if err != nil {
+		return txnLock{}, err
+	}
+	if commitTS <= lock.StartTS || r.Len() != 0 {
+		return txnLock{}, errors.Wrap(ErrTxnInvalidMeta, "txn lock: invalid prepared commit timestamp")
+	}
+	lock.CommitTS = commitTS
 	return lock, nil
 }
 

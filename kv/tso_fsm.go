@@ -46,12 +46,13 @@ const (
 // TSO FSM's own applied state so unrelated shard-group lease renewals cannot
 // advance group-0 state outside the group-0 log.
 type TSOStateMachine struct {
-	hlc             *HLC
-	ceilingMs       atomic.Int64
-	allocationFloor atomic.Uint64
-	cutoverActive   atomic.Bool
-	phaseDActive    atomic.Bool
-	phaseDFloor     atomic.Uint64
+	hlc                *HLC
+	ceilingMs          atomic.Int64
+	allocationFloor    atomic.Uint64
+	cutoverActive      atomic.Bool
+	phaseDActive       atomic.Bool
+	phaseDFloor        atomic.Uint64
+	pendingPhaseDFloor atomic.Uint64
 	// observer publishes durable marker state from the apply and restore
 	// paths. Without it the gauges only move on a successful reservation or a
 	// runtime mode transition, so a replica that applies a marker but serves no
@@ -136,6 +137,8 @@ func (f *TSOStateMachine) Apply(data []byte) any {
 		return f.applyCutoverEntry(data)
 	case bytes.HasPrefix(data, []byte(tsoPhaseDEnvelope)):
 		return f.applyPhaseDEntry(data)
+	case bytes.HasPrefix(data, []byte(tsoPendingPhaseDEnvelope)):
+		return f.applyPendingPhaseDEntry(data)
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return rejectLegacyTSOEncryptionEntry(data)
 	default:
@@ -197,6 +200,9 @@ func (f *TSOStateMachine) applyAllocationFloorEntry(data []byte) any {
 		return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry, "zero TSO allocation floor"))
 	}
 	if f != nil {
+		if pending := f.PendingPhaseDFloor(); pending != 0 && floor > pending {
+			return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry, "allocation exceeds pending phase-D floor"))
+		}
 		f.applyAllocationFloor(floor)
 	}
 	return nil
@@ -228,6 +234,9 @@ func (f *TSOStateMachine) applyPhaseDEntry(data []byte) any {
 			"TSO phase-D marker requires the durable cutover marker"))
 	}
 	floor := binary.BigEndian.Uint64(data[len(tsoPhaseDEnvelope):])
+	if pending := f.pendingPhaseDFloor.Load(); pending != 0 && pending != floor {
+		return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry, "phase-D floor disagrees with pending marker"))
+	}
 	if f.phaseDActive.Load() && f.phaseDFloor.Load() != floor {
 		return haltErr(errors.Wrapf(ErrTSOStateMachineInvalidEntry,
 			"TSO phase-D floor changed from %d to %d", f.phaseDFloor.Load(), floor))
@@ -281,12 +290,14 @@ func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 	var cutoverActive bool
 	var phaseDActive bool
 	var phaseDFloor uint64
+	var pendingFloor uint64
 	if f != nil {
 		ceilingMs = f.ceilingMs.Load()
 		allocationFloor = f.allocationFloor.Load()
 		cutoverActive = f.cutoverActive.Load()
 		phaseDActive = f.phaseDActive.Load()
 		phaseDFloor = f.phaseDFloor.Load()
+		pendingFloor = f.pendingPhaseDFloor.Load()
 	}
 	return &tsoFSMSnapshot{
 		ceilingMs:       ceilingMs,
@@ -294,6 +305,7 @@ func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 		cutoverActive:   cutoverActive,
 		phaseDActive:    phaseDActive,
 		phaseDFloor:     phaseDFloor,
+		pendingFloor:    pendingFloor,
 	}, nil
 }
 
@@ -305,11 +317,14 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 	if legacy, err := restoreLegacyKVFSMSnapshot(f, br); legacy || err != nil {
 		return err
 	}
-	ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, err := readTSOSnapshotState(br)
+	ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, pendingFloor, err := readTSOSnapshotState(br)
 	if err != nil {
 		return err
 	}
 	if f != nil {
+		if err := f.restorePendingPhaseDFloor(pendingFloor, allocationFloor, phaseDActive, phaseDFloor); err != nil {
+			return err
+		}
 		f.restoreSnapshotState(ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor)
 	}
 	return nil
@@ -322,22 +337,26 @@ func tsoSnapshotReader(r io.Reader) *bufio.Reader {
 	return bufio.NewReader(r)
 }
 
-func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, bool, bool, uint64, error) {
-	payload, err := io.ReadAll(io.LimitReader(br, tsoSnapshotV4Len+1))
+func readTSOSnapshotState(br *bufio.Reader) (int64, uint64, bool, bool, uint64, uint64, error) {
+	payload, err := io.ReadAll(io.LimitReader(br, tsoSnapshotV5Len+1))
 	if err != nil {
-		return 0, 0, false, false, 0, errors.Wrap(err, "restore tso fsm snapshot")
+		return 0, 0, false, false, 0, 0, errors.Wrap(err, "restore tso fsm snapshot")
+	}
+	pendingFloor, payload, err := decodePendingPhaseDSnapshot(payload)
+	if err != nil {
+		return 0, 0, false, false, 0, 0, err
 	}
 	ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, legacySnapshot, err := decodeTSOSnapshotPayload(payload)
 	if err != nil {
-		return 0, 0, false, false, 0, err
+		return 0, 0, false, false, 0, 0, err
 	}
-	if ceilingMs < 0 {
-		return 0, 0, false, false, 0, errors.Wrapf(ErrTSOStateMachineInvalidEntry, "tso fsm snapshot: negative ceiling %d", ceilingMs)
+	if err := validatePendingPhaseDSnapshot(pendingFloor, allocationFloor, cutoverActive, phaseDActive, phaseDFloor); err != nil {
+		return 0, 0, false, false, 0, 0, err
 	}
 	if legacySnapshot && ceilingMs > 0 {
 		allocationFloor = tsoLeaseAllocationFloor(ceilingMs)
 	}
-	return ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, nil
+	return ceilingMs, allocationFloor, cutoverActive, phaseDActive, phaseDFloor, pendingFloor, nil
 }
 
 func decodeTSOSnapshotPayload(payload []byte) (int64, uint64, bool, bool, uint64, bool, error) {
@@ -522,6 +541,9 @@ func legacyKVFSMStoreSnapshotMagics() [][]byte {
 }
 
 func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {
+	if isTSOPendingPhaseDEntry(payload) {
+		return true
+	}
 	if bytes.Equal(payload, []byte(tsoCutoverEnvelope)) {
 		return true
 	}
@@ -647,37 +669,16 @@ type tsoFSMSnapshot struct {
 	cutoverActive   bool
 	phaseDActive    bool
 	phaseDFloor     uint64
+	pendingFloor    uint64
 }
 
 func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 	if w == nil {
 		return 0, errors.New("tso fsm snapshot: writer is nil")
 	}
-	var ceilingMs int64
-	var allocationFloor uint64
-	var cutoverActive bool
-	var phaseDActive bool
-	var phaseDFloor uint64
-	if s != nil {
-		ceilingMs = s.ceilingMs
-		allocationFloor = s.allocationFloor
-		cutoverActive = s.cutoverActive
-		phaseDActive = s.phaseDActive
-		phaseDFloor = s.phaseDFloor
-	}
-	buf := make([]byte, tsoSnapshotLenFor(ceilingMs, allocationFloor, cutoverActive, phaseDActive))
-	if err := encodeTSOCeiling(buf, ceilingMs); err != nil {
+	buf, err := s.encode()
+	if err != nil {
 		return 0, err
-	}
-	if len(buf) >= tsoSnapshotV2Len {
-		binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:tsoSnapshotV2Len], allocationFloor)
-	}
-	if cutoverActive {
-		buf[tsoSnapshotV2Len] = 1
-	}
-	if phaseDActive {
-		buf[tsoSnapshotV3Len] = 1
-		binary.BigEndian.PutUint64(buf[tsoSnapshotV3Len+1:], phaseDFloor)
 	}
 	n, err := w.Write(buf)
 	if err != nil {
@@ -687,6 +688,34 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 		return int64(n), errors.WithStack(io.ErrShortWrite)
 	}
 	return int64(n), nil
+}
+
+func (s *tsoFSMSnapshot) encode() ([]byte, error) {
+	if s == nil {
+		s = &tsoFSMSnapshot{}
+	}
+	size := tsoSnapshotLenFor(s.ceilingMs, s.allocationFloor, s.cutoverActive, s.phaseDActive)
+	if s.pendingFloor != 0 {
+		size = tsoSnapshotV5Len
+	}
+	buf := make([]byte, size)
+	if err := encodeTSOCeiling(buf, s.ceilingMs); err != nil {
+		return nil, err
+	}
+	if len(buf) >= tsoSnapshotV2Len {
+		binary.BigEndian.PutUint64(buf[hlcLeasePayloadLen:tsoSnapshotV2Len], s.allocationFloor)
+	}
+	if s.cutoverActive {
+		buf[tsoSnapshotV2Len] = 1
+	}
+	if s.phaseDActive {
+		buf[tsoSnapshotV3Len] = 1
+		binary.BigEndian.PutUint64(buf[tsoSnapshotV3Len+1:], s.phaseDFloor)
+	}
+	if s.pendingFloor != 0 {
+		binary.BigEndian.PutUint64(buf[tsoSnapshotV4Len:], s.pendingFloor)
+	}
+	return buf, nil
 }
 
 // tsoSnapshotLenFor returns the shortest snapshot layout that can carry this

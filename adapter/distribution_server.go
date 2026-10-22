@@ -18,6 +18,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
@@ -687,6 +688,12 @@ func (s *DistributionServer) ValidateTimestamp(
 	if req == nil || req.GetTimestamp() == 0 {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "timestamp is required"))
 	}
+	if req.GetLegacyResolution() {
+		return s.validateLegacyResolutionTimestamp(ctx, req)
+	}
+	if req.GetStartTimestamp() != 0 {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "start timestamp requires legacy resolution mode"))
+	}
 	validator, ok := s.timestampAllocator.(kv.DurableTimestampValidator)
 	if !ok {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition,
@@ -704,6 +711,20 @@ func (s *DistributionServer) ValidateTimestamp(
 		resp.AllocationFloor = state.AllocationFloor()
 	}
 	return resp, nil
+}
+
+func (s *DistributionServer) validateLegacyResolutionTimestamp(ctx context.Context, req *pb.ValidateTimestampRequest) (*pb.ValidateTimestampResponse, error) {
+	if req.GetStartTimestamp() == 0 || req.GetStartTimestamp() >= req.GetTimestamp() {
+		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "legacy resolution requires 0 < start < commit"))
+	}
+	validator, ok := s.timestampAllocator.(kv.DurableLegacyResolutionValidator)
+	if !ok {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "pending legacy resolution validation is not configured"))
+	}
+	if err := validator.ValidateLegacyResolutionTimestamps(ctx, req.GetStartTimestamp(), req.GetTimestamp()); err != nil {
+		return nil, timestampRPCError(err)
+	}
+	return &pb.ValidateTimestampResponse{Valid: true, LegacyResolutionValidated: true}, nil
 }
 
 func (s *DistributionServer) allocateTimestampReservation(
@@ -775,6 +796,9 @@ func timestampRPCError(err error) error {
 	if code := status.Code(err); code != codes.Unknown {
 		return err
 	}
+	if mapped := phaseDActivationRPCError(err); mapped != nil {
+		return mapped
+	}
 	switch {
 	case errors.Is(err, context.Canceled):
 		return errors.WithStack(status.Error(codes.Canceled, err.Error()))
@@ -788,11 +812,33 @@ func timestampRPCError(err error) error {
 		return errors.WithStack(status.Error(codes.OutOfRange, err.Error()))
 	case errors.Is(err, kv.ErrTSOTimestampInvalid):
 		return errors.WithStack(status.Error(codes.InvalidArgument, err.Error()))
-	case errors.Is(err, kv.ErrTSOPhaseDInactive):
-		return errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
 	default:
 		return errors.WithStack(status.Error(codes.Unavailable, err.Error()))
 	}
+}
+
+func phaseDActivationRPCError(err error) error {
+	switch {
+	case errors.Is(err, kv.ErrTSOPhaseDInactive):
+		return inactiveTimestampRPCError(err)
+	case errors.Is(err, kv.ErrTSOPhaseDActivationPending):
+		return errors.WithStack(status.Error(codes.ResourceExhausted, err.Error()))
+	case errors.Is(err, kv.ErrTSOPhaseDActivationGateRequired):
+		return errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
+	default:
+		return nil
+	}
+}
+
+func inactiveTimestampRPCError(err error) error {
+	s := status.New(codes.FailedPrecondition, err.Error())
+	withDetail, detailErr := s.WithDetails(&errdetails.ErrorInfo{
+		Domain: kv.TSOValidationErrorDomain, Reason: kv.TSOPhaseDInactiveReason,
+	})
+	if detailErr != nil {
+		return errors.WithStack(s.Err())
+	}
+	return errors.WithStack(withDetail.Err())
 }
 
 // ListRoutes returns all durable routes from catalog storage.

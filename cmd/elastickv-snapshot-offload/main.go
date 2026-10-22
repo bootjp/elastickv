@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"sort"
+	"strconv"
 	"strings"
 
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -31,16 +32,17 @@ const (
 )
 
 type storeFlags struct {
-	storeKind                string
-	localRoot                string
-	s3Bucket                 string
-	s3Region                 string
-	s3Endpoint               string
-	s3Profile                string
-	s3PathStyle              bool
-	s3ServerSideEncryption   string
-	s3KMSKeyID               string
-	s3DisableChecksumHeaders bool
+	storeKind                 string
+	localRoot                 string
+	s3Bucket                  string
+	s3Region                  string
+	s3Endpoint                string
+	s3Profile                 string
+	s3PathStyle               bool
+	s3ServerSideEncryption    string
+	s3KMSKeyID                string
+	s3DisableChecksumHeaders  bool
+	s3AllowVersionedLifecycle bool
 }
 
 type publishConfig struct {
@@ -58,6 +60,13 @@ type restoreConfig struct {
 	manifestKey string
 	dataDir     string
 	peerCSV     string
+	// expectGroupRaw is the flag text; empty means the operator did not
+	// supply one, which is an error. Parsed into expectGroupID because
+	// group 0 is a real group and cannot double as "unset".
+	expectGroupRaw               string
+	expectGroupID                uint64
+	expectCluster                string
+	allowLegacySourceClusterless bool
 }
 
 func main() {
@@ -122,7 +131,7 @@ func parsePublishFlags(argv []string) (*publishConfig, error) {
 	fs.StringVar(&cfg.dataDir, "data-dir", "", "Source raft data directory containing a persisted snapshot (required)")
 	fs.StringVar(&cfg.prefix, "prefix", "", "Object key prefix for published snapshot objects")
 	fs.Uint64Var(&cfg.groupID, "group-id", 0, "Raft group ID recorded in the manifest")
-	fs.StringVar(&cfg.sourceCluster, "source-cluster", "", "Source cluster identifier (required for group 0 manifests)")
+	fs.StringVar(&cfg.sourceCluster, "source-cluster", "", "Source cluster identifier (required; restore matches it against the manifest)")
 	fs.StringVar(&cfg.binaryVersion, "binary-version", "", "Binary version recorded in the manifest")
 	fs.StringVar(&cfg.spoolDir, "spool-dir", "", "Temporary spool directory for the payload stream")
 	if err := fs.Parse(argv); err != nil {
@@ -134,8 +143,14 @@ func parsePublishFlags(argv []string) (*publishConfig, error) {
 	if strings.TrimSpace(cfg.dataDir) == "" {
 		return nil, errors.New("--data-dir is required")
 	}
-	if cfg.groupID == 0 && strings.TrimSpace(cfg.sourceCluster) == "" {
-		return nil, errors.New("--source-cluster is required when --group-id is 0")
+	// Required for EVERY group, not just group 0. restore rejects an empty
+	// --expect-source-cluster outright and then compares it against the
+	// manifest's own value, so a manifest published without one can never
+	// match: a nonzero-group backup taken with this CLI would be
+	// unrestorable by it. Relaxing the restore side instead would give back
+	// the wrong-cluster restore that check exists to prevent.
+	if strings.TrimSpace(cfg.sourceCluster) == "" {
+		return nil, errors.New("--source-cluster is required")
 	}
 	if err := validateStoreFlags(cfg.store); err != nil {
 		return nil, err
@@ -151,6 +166,16 @@ func parseRestoreFlags(argv []string) (*restoreConfig, error) {
 	fs.StringVar(&cfg.manifestKey, "manifest-key", "", "Object key of the snapshot manifest to restore (required)")
 	fs.StringVar(&cfg.dataDir, "data-dir", "", "Fresh target raft data directory to create (required; must not already exist)")
 	fs.StringVar(&cfg.peerCSV, "peers", "", "Comma-separated raft peers id=addr,id=addr (required)")
+	fs.StringVar(&cfg.expectCluster, "expect-source-cluster", "",
+		"Source cluster this data dir is for (required). The restore is refused if the "+
+			"manifest was published by a different cluster -- which the group check alone "+
+			"cannot catch when one bucket holds backups from several clusters.")
+	fs.StringVar(&cfg.expectGroupRaw, "expect-group", "",
+		"Raft group id this data dir is for (required). The restore is refused if the manifest "+
+			"belongs to a different group, which is otherwise undetectable: nothing downstream "+
+			"records the group, so the wrong group's FSM would start under this group's identity.")
+	fs.BoolVar(&cfg.allowLegacySourceClusterless, "allow-legacy-source-clusterless", false,
+		"allow an older nonzero-group manifest without source_cluster; source identity cannot be verified")
 	if err := fs.Parse(argv); err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -166,6 +191,17 @@ func parseRestoreFlags(argv []string) (*restoreConfig, error) {
 	if strings.TrimSpace(cfg.peerCSV) == "" {
 		return nil, errors.New("--peers is required")
 	}
+	if strings.TrimSpace(cfg.expectGroupRaw) == "" {
+		return nil, errors.New("--expect-group is required")
+	}
+	if strings.TrimSpace(cfg.expectCluster) == "" {
+		return nil, errors.New("--expect-source-cluster is required")
+	}
+	groupID, err := strconv.ParseUint(strings.TrimSpace(cfg.expectGroupRaw), 10, 64)
+	if err != nil {
+		return nil, errors.Wrapf(err, "parse --expect-group %q", cfg.expectGroupRaw)
+	}
+	cfg.expectGroupID = groupID
 	if err := validateStoreFlags(cfg.store); err != nil {
 		return nil, err
 	}
@@ -186,7 +222,8 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	cfg.s3ServerSideEncryption = string(s3SSEAES256)
 	fs.StringVar(&cfg.storeKind, "store", storeLocal, "Object store backend: local or s3")
 	fs.StringVar(&cfg.localRoot, "local-root", "", "Local object store root when --store=local")
-	fs.StringVar(&cfg.s3Bucket, "s3-bucket", "", "S3 bucket when --store=s3")
+	fs.StringVar(&cfg.s3Bucket, "s3-bucket", "",
+		"S3 bucket when --store=s3")
 	fs.StringVar(&cfg.s3Region, "s3-region", cfg.s3Region, "S3 signing region")
 	fs.StringVar(&cfg.s3Endpoint, "s3-endpoint", "", "S3-compatible endpoint URL")
 	fs.StringVar(&cfg.s3Profile, "s3-profile", "", "AWS shared config profile")
@@ -194,6 +231,7 @@ func addStoreFlags(fs *flag.FlagSet, cfg *storeFlags) {
 	fs.StringVar(&cfg.s3ServerSideEncryption, "s3-sse", cfg.s3ServerSideEncryption, "Server-side encryption algorithm for uploaded objects: AES256 or aws:kms")
 	fs.StringVar(&cfg.s3KMSKeyID, "s3-kms-key-id", "", "KMS key ARN or bare key ID when --s3-sse=aws:kms; aliases are rejected")
 	fs.BoolVar(&cfg.s3DisableChecksumHeaders, "s3-disable-checksum-headers", false, "Do not send S3 checksum headers; keep metadata and restore-time verification")
+	fs.BoolVar(&cfg.s3AllowVersionedLifecycle, "s3-allow-versioned-with-lifecycle", false, "Allow retention on an S3 versioned bucket after confirming noncurrent-version expiration is configured; not required for restore")
 }
 
 func validateStoreFlags(cfg storeFlags) error {
@@ -215,11 +253,12 @@ func validateStoreFlags(cfg storeFlags) error {
 	return nil
 }
 
-func runPublish(ctx context.Context, cfg *publishConfig, stdout io.Writer, logger *slog.Logger) error {
-	store, err := openObjectStore(ctx, cfg.store)
+func runPublish(ctx context.Context, cfg *publishConfig, stdout io.Writer, logger *slog.Logger) (retErr error) {
+	store, closeStore, err := openObjectStore(ctx, cfg.store)
 	if err != nil {
 		return err
 	}
+	defer func() { retErr = errors.CombineErrors(retErr, closeStore()) }()
 	manifest, err := snapshotoffload.PublishPersistedSnapshot(ctx, snapshotoffload.PublishOptions{
 		Store:         store,
 		DataDir:       cfg.dataDir,
@@ -249,20 +288,27 @@ func runPublish(ctx context.Context, cfg *publishConfig, stdout io.Writer, logge
 	return nil
 }
 
-func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) error {
-	store, err := openObjectStore(ctx, cfg.store)
+func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) (retErr error) {
+	store, closeStore, err := openObjectStore(ctx, cfg.store)
 	if err != nil {
 		return err
 	}
+	defer func() { retErr = errors.CombineErrors(retErr, closeStore()) }()
 	peers, err := parsePeers(cfg.peerCSV)
 	if err != nil {
 		return err
 	}
+	if cfg.allowLegacySourceClusterless {
+		logger.Warn("restoring with legacy source-cluster compatibility; manifest source identity may be unverifiable")
+	}
 	result, err := snapshotoffload.RestorePhysicalSnapshot(ctx, snapshotoffload.RestoreOptions{
-		Store:       store,
-		ManifestKey: cfg.manifestKey,
-		DataDir:     cfg.dataDir,
-		Peers:       peers,
+		Store:                        store,
+		ManifestKey:                  cfg.manifestKey,
+		DataDir:                      cfg.dataDir,
+		Peers:                        peers,
+		ExpectGroupID:                &cfg.expectGroupID,
+		ExpectSourceCluster:          cfg.expectCluster,
+		AllowLegacySourceClusterless: cfg.allowLegacySourceClusterless,
 	})
 	if err != nil {
 		return errors.Wrap(err, "restore physical snapshot")
@@ -279,31 +325,34 @@ func runRestore(ctx context.Context, cfg *restoreConfig, logger *slog.Logger) er
 	return nil
 }
 
-func openObjectStore(ctx context.Context, cfg storeFlags) (snapshotoffload.ObjectStore, error) {
+func openObjectStore(
+	ctx context.Context, cfg storeFlags,
+) (snapshotoffload.PublishStore, func() error, error) {
 	switch cfg.storeKind {
 	case storeLocal:
 		store, err := snapshotoffload.NewLocalStore(cfg.localRoot)
 		if err != nil {
-			return nil, errors.Wrap(err, "open local object store")
+			return nil, nil, errors.Wrap(err, "open local object store")
 		}
-		return store, nil
+		return store, store.Close, nil
 	case storeS3:
 		store, err := snapshotoffload.NewS3Store(ctx, snapshotoffload.S3StoreConfig{
-			Bucket:                 cfg.s3Bucket,
-			Region:                 cfg.s3Region,
-			Endpoint:               cfg.s3Endpoint,
-			Profile:                cfg.s3Profile,
-			ForcePathStyle:         cfg.s3PathStyle,
-			ServerSideEncryption:   cfg.s3ServerSideEncryption,
-			SSEKMSKeyID:            cfg.s3KMSKeyID,
-			DisableChecksumHeaders: cfg.s3DisableChecksumHeaders,
+			Bucket:                            cfg.s3Bucket,
+			Region:                            cfg.s3Region,
+			Endpoint:                          cfg.s3Endpoint,
+			Profile:                           cfg.s3Profile,
+			ForcePathStyle:                    cfg.s3PathStyle,
+			ServerSideEncryption:              cfg.s3ServerSideEncryption,
+			SSEKMSKeyID:                       cfg.s3KMSKeyID,
+			DisableChecksumHeaders:            cfg.s3DisableChecksumHeaders,
+			AllowVersionedBucketWithLifecycle: cfg.s3AllowVersionedLifecycle,
 		})
 		if err != nil {
-			return nil, errors.Wrap(err, "open s3 object store")
+			return nil, nil, errors.Wrap(err, "open s3 object store")
 		}
-		return store, nil
+		return store, func() error { return nil }, nil
 	default:
-		return nil, errors.Errorf("unknown --store %q", cfg.storeKind)
+		return nil, nil, errors.Errorf("unknown --store %q", cfg.storeKind)
 	}
 }
 

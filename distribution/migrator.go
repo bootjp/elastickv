@@ -73,17 +73,20 @@ const (
 	// Keep this literal in sync with kv.backupTimestampFloorKey. distribution
 	// cannot import kv without a cycle, and only this exact control key is
 	// reserved; user keys under !txn|backup| remain migratable.
-	migrationTxnBackupTimestampFloorKey = "!txn|backup|timestamp_floor"
-	migrationRedisPrefix                = "!redis|"
-	migrationHashPrefix                 = "!hs|"
-	migrationSetPrefix                  = "!st|"
-	migrationZSetPrefix                 = "!zs|"
-	migrationDynamoMetaPrefix           = "!ddb|meta|table|"
-	migrationDynamoGenPrefix            = "!ddb|meta|gen|"
-	migrationDynamoItemPrefix           = "!ddb|item|"
-	migrationDynamoGSIPrefix            = "!ddb|gsi|"
-	migrationDynamoSealPrefix           = "!ddb|seal|"
-	migrationStagedDataPrefix           = "!dist|migstage|"
+	migrationTxnBackupTimestampFloorKey   = "!txn|backup|timestamp_floor"
+	migrationTxnPrepareEvidenceEnabledKey = migrationTxnMetaPrefix + "prepare_evidence/enabled"
+	migrationTxnPrepareEvidenceGateKey    = migrationTxnMetaPrefix + "prepare_evidence/gate"
+	migrationTxnPrepareEvidenceFloorKey   = migrationTxnMetaPrefix + "prepare_evidence/timestamp_floor"
+	migrationRedisPrefix                  = "!redis|"
+	migrationHashPrefix                   = "!hs|"
+	migrationSetPrefix                    = "!st|"
+	migrationZSetPrefix                   = "!zs|"
+	migrationDynamoMetaPrefix             = "!ddb|meta|table|"
+	migrationDynamoGenPrefix              = "!ddb|meta|gen|"
+	migrationDynamoItemPrefix             = "!ddb|item|"
+	migrationDynamoGSIPrefix              = "!ddb|gsi|"
+	migrationDynamoSealPrefix             = "!ddb|seal|"
+	migrationStagedDataPrefix             = "!dist|migstage|"
 )
 
 const (
@@ -242,6 +245,9 @@ var migrationInternalFamilyPrefixes = [][]byte{
 
 var migrationInternalExactKeys = [][]byte{
 	[]byte(migrationTxnBackupTimestampFloorKey),
+	[]byte(migrationTxnPrepareEvidenceEnabledKey),
+	[]byte(migrationTxnPrepareEvidenceGateKey),
+	[]byte(migrationTxnPrepareEvidenceFloorKey),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -333,6 +339,9 @@ func SplitJobBracketProgressForPlan(brackets []MigrationBracket, phase SplitJobE
 // interval after applying bracket-local exclusions. Route ownership still
 // requires the caller's RouteKeyFilter for every bracket.
 func (b MigrationBracket) ContainsRawKey(rawKey []byte) bool {
+	if hasAnyExactKey(rawKey, migrationInternalExactKeys) {
+		return false
+	}
 	if bytes.Compare(rawKey, b.Start) < 0 {
 		return false
 	}
@@ -418,6 +427,11 @@ func MigrationStagedDataKey(jobID uint64, rawKey []byte) []byte {
 // one migration job.
 func MigrationStagedDataKeyPrefix(jobID uint64) []byte {
 	return MigrationStagedDataKey(jobID, nil)
+}
+
+// MigrationStagedDataScanPrefix covers staged rows from every migration job.
+func MigrationStagedDataScanPrefix() []byte {
+	return []byte(migrationStagedDataPrefix)
 }
 
 func IsMigrationStagedDataKey(key []byte) bool {

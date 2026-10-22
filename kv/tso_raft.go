@@ -18,6 +18,7 @@ import (
 const (
 	defaultTSORouteRetryBudget   = 5 * time.Second
 	defaultTSORouteRetryInterval = 25 * time.Millisecond
+	tsoRequestPathLocal          = "local"
 )
 
 var (
@@ -59,12 +60,16 @@ type tsoCutoverState interface {
 // Failed proposals may leak a local window, but they can never expose an
 // uncommitted timestamp or make a later leader reuse a returned timestamp.
 type RaftTSOAllocator struct {
-	group           *ShardGroup
-	clock           *HLC
-	state           *TSOStateMachine
-	floorProvider   TSOCutoverFloorProvider
-	initializedTerm uint64
-	mu              sync.Mutex
+	group                  *ShardGroup
+	clock                  *HLC
+	state                  *TSOStateMachine
+	floorProvider          TSOCutoverFloorProvider
+	phaseDGate             TSOPhaseDActivationGate
+	initializedTerm        uint64
+	phaseDFinishedTerm     uint64
+	phaseDBootstrapTerm    uint64
+	phaseDBootstrapRetryAt time.Time
+	mu                     sync.Mutex
 }
 
 type RaftTSOAllocatorOption func(*RaftTSOAllocator)
@@ -158,6 +163,13 @@ func (a *RaftTSOAllocator) reserveBatchAfterLocked(
 	if term == 0 {
 		return empty, errors.Wrap(ErrTSONotLeader, "tso leader has no active term")
 	}
+	pending, err := a.preparePhaseDActivation(ctx, engine, term, activatePhaseD)
+	if err != nil {
+		return empty, err
+	}
+	if pending != 0 {
+		return a.resumePendingPhaseD(ctx, engine, term, n, min, pending)
+	}
 	previousFloor, commitPhaseD, err := a.prepareLeaderTermReservation(ctx, engine, term, activateCutover, activatePhaseD)
 	if err != nil {
 		return empty, err
@@ -168,10 +180,7 @@ func (a *RaftTSOAllocator) reserveBatchAfterLocked(
 	}
 	reservationFloor := previousFloor
 	if commitPhaseD {
-		reservationFloor, err = a.commitPhaseDReservation(ctx, engine, term, base)
-		if err != nil {
-			return empty, err
-		}
+		return a.beginPendingPhaseD(ctx, engine, term, n, min, base-1)
 	}
 	if err := a.commitAllocationFloor(ctx, engine, end); err != nil {
 		return empty, err
@@ -200,6 +209,13 @@ func (a *RaftTSOAllocator) reservePreparedLocalWindow(
 	if phaseDContiguous && min > previousFloor {
 		return 0, 0, errors.Wrapf(ErrTSOTimestampInvalid,
 			"phase-D TSO minimum %d exceeds contiguous allocation floor %d", min, previousFloor)
+	}
+	if commitPhaseD {
+		if previousFloor == ^uint64(0) {
+			return 0, 0, errors.WithStack(ErrTxnCommitTSRequired)
+		}
+		// Leave room for abortTSFrom(maxObservedStart, 0) below the fixed B.
+		return a.reserveLocalWindow(n, previousFloor+1, true)
 	}
 	return a.reserveLocalWindow(n, max(min, previousFloor), phaseDContiguous)
 }
@@ -274,25 +290,6 @@ func (a *RaftTSOAllocator) reservePhaseDWindow(n int, floor uint64) (uint64, uin
 	return base, end, nil
 }
 
-func (a *RaftTSOAllocator) commitPhaseDReservation(
-	ctx context.Context,
-	engine raftengine.Engine,
-	term uint64,
-	base uint64,
-) (uint64, error) {
-	if base == 0 {
-		return 0, errors.Wrap(ErrTxnCommitTSRequired, "tso phase-D reservation base is zero")
-	}
-	reservationFloor := base - 1
-	if err := a.commitPhaseD(ctx, engine, reservationFloor); err != nil {
-		return 0, err
-	}
-	if err := verifyTSOLeaderTerm(ctx, engine, term, true); err != nil {
-		return 0, err
-	}
-	return reservationFloor, nil
-}
-
 func (a *RaftTSOAllocator) prepareLeaderTermReservation(
 	ctx context.Context,
 	engine raftengine.Engine,
@@ -359,8 +356,17 @@ func (a *RaftTSOAllocator) verifiedLeader(ctx context.Context) (raftengine.Engin
 	if !isLeaderEngine(engine) {
 		return nil, errors.WithStack(ErrTSONotLeader)
 	}
-	if err := verifyLeaderEngineCtx(ctx, engine); err != nil {
-		return nil, errors.Wrap(stderrors.Join(ErrTSONotLeader, err), "tso verify leader")
+	if _, ok := ctx.Deadline(); !ok {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, verifyLeaderTimeout)
+		defer cancel()
+	}
+	term := engine.Status().Term
+	if _, err := linearizableReadEngineCtx(ctx, engine); err != nil {
+		return nil, errors.Wrap(stderrors.Join(ErrTSONotLeader, err), "tso verify applied leader state")
+	}
+	if status := engine.Status(); status.State != raftengine.StateLeader || status.Term != term {
+		return nil, errors.WithStack(ErrTSONotLeader)
 	}
 	return engine, nil
 }
@@ -651,7 +657,7 @@ func (a *LeaderRoutedTSOAllocator) tryBatch(
 	if a.local.IsLeader() {
 		started := time.Now()
 		reservation, err := a.tryLocalBatch(ctx, n, min, activate, activatePhaseD, requireReservation)
-		a.observeRequest("reserve", "local", err, time.Since(started))
+		a.observeRequest("reserve", tsoRequestPathLocal, err, time.Since(started))
 		return reservation, err
 	}
 	addr := leaderAddrFromEngine(a.leader)
@@ -722,6 +728,9 @@ func (a *LeaderRoutedTSOAllocator) requestRemoteBatch(
 		ActivatePhaseD:  activatePhaseD,
 	})
 	if err != nil {
+		if status.Code(err) == codes.ResourceExhausted {
+			return empty, errors.Wrap(ErrTSOPhaseDActivationPending, err.Error())
+		}
 		return empty, errors.Wrap(err, "tso request leader batch")
 	}
 	count := uint32(n) //nolint:gosec // n is validated before this request.
@@ -765,7 +774,7 @@ func (a *LeaderRoutedTSOAllocator) ValidateDurableTimestamp(ctx context.Context,
 			}
 			started := time.Now()
 			lastErr = errors.WithStack(validator.ValidateDurableTimestamp(ctx, timestamp))
-			a.observeRequest("validate", "local", lastErr, time.Since(started))
+			a.observeRequest("validate", tsoRequestPathLocal, lastErr, time.Since(started))
 		} else {
 			addr := leaderAddrFromEngine(a.leader)
 			if addr == "" {
@@ -780,7 +789,7 @@ func (a *LeaderRoutedTSOAllocator) ValidateDurableTimestamp(ctx context.Context,
 		if lastErr == nil {
 			return nil
 		}
-		if !isTransientTSORouteError(lastErr) {
+		if errors.Is(lastErr, ErrTSOPhaseDInactive) || !isTransientTSORouteError(lastErr) {
 			return lastErr
 		}
 		if err := waitTSORouteRetry(ctx, a.retryInterval); err != nil {
@@ -796,14 +805,7 @@ func (a *LeaderRoutedTSOAllocator) requestRemoteValidation(ctx context.Context, 
 	}
 	resp, err := pb.NewDistributionClient(conn).ValidateTimestamp(ctx, &pb.ValidateTimestampRequest{Timestamp: timestamp})
 	if err != nil {
-		code := status.Code(err)
-		if code == codes.OutOfRange {
-			return errors.Wrap(stderrors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD), err.Error())
-		}
-		if code == codes.InvalidArgument {
-			return errors.Wrap(ErrTSOTimestampInvalid, err.Error())
-		}
-		return errors.Wrap(err, "tso validate timestamp at leader")
+		return tsoValidationRPCError(err)
 	}
 	if !resp.GetValid() || !resp.GetPhaseDActive() {
 		return errors.Wrapf(ErrTSOTimestampInvalid,

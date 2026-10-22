@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -70,7 +71,8 @@ type kvFSM struct {
 	// cutoverSource provides the writer-side view of the Phase-2
 	// envelope cutover index for snapshot v1/v2 selection (Stage
 	// 8a §3.3). nil = always v1 output.
-	cutoverSource CutoverSource
+	cutoverSource        CutoverSource
+	encryptionCheckpoint encryption.SnapshotCheckpoint
 	// snapLatch enforces the §3.3 no-downgrade invariant: once a
 	// non-zero cutover is observed, all subsequent snapshots from
 	// this FSM emit v2 even if the sidecar later reads 0.
@@ -110,8 +112,12 @@ type kvFSM struct {
 	// backupTimestampFloor is the highest replicated BackupPin read timestamp.
 	// New raw, one-phase, and PREPARE entries at or below this floor were
 	// timestamped before the backup cut and reached apply too late.
-	backupTimestampFloor atomic.Uint64
-	backupFloorLoadErr   error
+	backupTimestampFloor          atomic.Uint64
+	backupFloorLoadErr            error
+	prepareEvidenceEnabled        atomic.Bool
+	prepareCreationSealed         atomic.Bool
+	prepareEvidenceReleaseFloor   atomic.Uint64
+	prepareEvidenceTimestampFloor atomic.Uint64
 }
 
 // RouteHistory is the kv-side interface to the route catalog's
@@ -465,6 +471,7 @@ func isRawApplyVerdict(err error) bool {
 	return errors.Is(err, ErrInvalidRequest) ||
 		errors.Is(err, ErrUnknownRequestType) ||
 		errors.Is(err, ErrBackupTimestampFenced) ||
+		errors.Is(err, ErrPrepareCreationSealed) ||
 		errors.Is(err, ErrRouteWriteFenced) ||
 		errors.Is(err, ErrRouteWriteTimestampTooLow) ||
 		errors.Is(err, ErrComposed1VersionGCd) ||
@@ -733,6 +740,9 @@ func haltResponseFor(err error) *haltApplyResponse {
 }
 
 func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
+	if err := f.verifyPrepareCreationGate(r); err != nil {
+		return err
+	}
 	commitTS, err := requestCommitTS(r)
 	if err != nil {
 		return err
@@ -1447,6 +1457,9 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 	if err := f.rejectSnapshotWithActiveBackupPin(); err != nil {
 		return nil, err
 	}
+	if err := f.checkSnapshotCheckpointConsistency(); err != nil {
+		return nil, err
+	}
 	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1457,13 +1470,14 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 		cutover = f.cutoverSource.RaftEnvelopeCutoverIndex()
 	}
 	emitted := f.snapLatch.observe(cutover)
-	useV2 := emitted != 0 || f.snapLatch.latched()
+	useV2 := emitted != 0 || f.snapLatch.latched() || f.encryptionCheckpoint.Index != 0
 
 	return &kvFSMSnapshot{
-		snapshot:  snapshot,
-		ceilingMs: hlcCeilingFromHLC(f.hlc),
-		cutover:   emitted,
-		useV2:     useV2,
+		snapshot:   snapshot,
+		ceilingMs:  hlcCeilingFromHLC(f.hlc),
+		cutover:    emitted,
+		useV2:      useV2,
+		checkpoint: f.encryptionCheckpoint,
 	}, nil
 }
 
@@ -1479,7 +1493,7 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	if !ok {
 		br = bufio.NewReader(r)
 	}
-	ceilingU, cutover, err := ReadSnapshotHeader(br)
+	ceilingU, cutover, checkpoint, err := ReadSnapshotHeaderWithCheckpoint(br)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1493,6 +1507,11 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	if err := f.store.Restore(io.NopCloser(br)); err != nil {
 		return errors.WithStack(err)
 	}
+	checkpoint, err = f.checkpointForDurableFSM(checkpoint, false)
+	if err != nil {
+		return err
+	}
+	f.encryptionCheckpoint = checkpoint
 	// Volatile pins do not travel in a snapshot, and the entries that would
 	// have released them are compacted away by the time this replica installs
 	// one. A pin this node applied before falling behind would otherwise keep
@@ -1942,9 +1961,15 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	}
 
 	startTS := r.Ts
+	if err := f.validatePrepareEvidenceMeta(meta, startTS); err != nil {
+		return err
+	}
 	floorTS := startTS
 	if meta.CommitTS != 0 {
 		floorTS = meta.CommitTS
+	}
+	if meta.PrepareCommitTS != 0 {
+		floorTS = meta.PrepareCommitTS
 	}
 	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, r.ReadKeys, nil); err != nil {
 		return err
@@ -1959,7 +1984,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 
 	expireAt := txnLockExpireAt(meta.LockTTLms)
 
-	storeMuts, err := f.buildPrepareStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, expireAt, meta.CommitTS)
+	storeMuts, err := f.buildPrepareStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, expireAt, meta.PrepareCommitTS)
 	if err != nil {
 		return err
 	}
@@ -2539,7 +2564,7 @@ func (f *kvFSM) buildCommitStoreMutations(ctx context.Context, muts []*pb.Mutati
 			committingPrimary = true
 		}
 
-		keyMuts, prepared, err := f.commitTxnKeyMutations(ctx, key, meta.PrimaryKey, startTS, readKeys)
+		keyMuts, prepared, err := f.commitTxnKeyMutations(ctx, key, meta.PrimaryKey, startTS, commitTS, readKeys)
 		if err != nil {
 			return nil, err
 		}
@@ -2681,16 +2706,19 @@ func (f *kvFSM) txnCommitTSAtKey(ctx context.Context, key []byte) (uint64, bool,
 }
 
 func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primaryKey []byte, startTS, expireAt, commitTS uint64) ([]*store.KVPairMutation, error) {
-	if err := f.assertNoConflictingTxnLock(ctx, mut.Key, primaryKey, startTS); err != nil {
+	if isTxnInternalKey(mut.Key) || distribution.IsMigrationOnlyControlKey(mut.Key) {
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
+	if err := f.validatePrepareLock(ctx, mut.Key, primaryKey, startTS, commitTS); err != nil {
 		return nil, err
 	}
 
 	lockVal := encodeTxnLock(txnLock{
 		StartTS:      startTS,
+		CommitTS:     commitTS,
 		TTLExpireAt:  expireAt,
 		PrimaryKey:   primaryKey,
 		IsPrimaryKey: bytes.Equal(mut.Key, primaryKey),
-		CommitTS:     commitTS,
 	})
 	intent, err := txnIntentFromPBMutation(mut, startTS)
 	if err != nil {
@@ -2789,7 +2817,7 @@ func storeMutationForIntent(key []byte, intent txnIntent) (*store.KVPairMutation
 	}
 }
 
-func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byte, startTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, bool, error) {
+func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byte, startTS, commitTS uint64, readKeys [][]byte) ([]*store.KVPairMutation, bool, error) {
 	lock, lockKey, intentKey, ok, err := f.txnLockForMutationKey(ctx, key, readKeys)
 	if err != nil {
 		return nil, false, err
@@ -2798,11 +2826,8 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 		// Already resolved (committed/rolled back).
 		return nil, false, nil
 	}
-	if lock.StartTS != startTS {
-		return nil, false, NewTxnLockedError(key)
-	}
-	if !bytes.Equal(lock.PrimaryKey, primaryKey) {
-		return nil, false, errors.Wrapf(ErrTxnInvalidMeta, "lock primary_key mismatch for key %s", string(key))
+	if err := validatePreparedCommitLock(lock, key, primaryKey, startTS, commitTS); err != nil {
+		return nil, false, err
 	}
 
 	intent, ok, err := f.txnIntentForCommit(ctx, intentKey)
@@ -2823,6 +2848,22 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 	}
 	out = append(out, txnCleanupMutationsForKeys(lockKey, intentKey)...)
 	return out, true, nil
+}
+
+func validatePreparedCommitLock(lock txnLock, key, primaryKey []byte, startTS, commitTS uint64) error {
+	if isTxnInternalKey(key) || distribution.IsMigrationOnlyControlKey(key) {
+		return errors.WithStack(ErrInvalidRequest)
+	}
+	if lock.StartTS != startTS {
+		return NewTxnLockedError(key)
+	}
+	if !bytes.Equal(lock.PrimaryKey, primaryKey) {
+		return errors.Wrapf(ErrTxnInvalidMeta, "lock primary_key mismatch for key %s", string(key))
+	}
+	if lock.CommitTS != 0 && lock.CommitTS != commitTS {
+		return errors.Wrap(ErrTxnInvalidMeta, "commit timestamp does not match durable prepare evidence")
+	}
+	return nil
 }
 
 // abortCleanupMutationsForKey reports whether this abort request must emit

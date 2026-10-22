@@ -17,7 +17,7 @@ import (
 )
 
 type PublishOptions struct {
-	Store         ObjectStore
+	Store         PublishStore
 	DataDir       string
 	Prefix        string
 	GroupID       uint64
@@ -45,7 +45,7 @@ type PublishOptions struct {
 	SkipIfNotNewerThan uint64
 }
 
-func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manifest, error) {
+func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (result *Manifest, retErr error) {
 	if err := validatePublishOptions(opts); err != nil {
 		return nil, err
 	}
@@ -56,9 +56,8 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	defer func() { _ = export.Close() }()
 
 	metadata := export.Metadata()
-	if opts.SkipIfNotNewerThan > 0 && metadata.Index <= opts.SkipIfNotNewerThan {
-		return nil, errors.Wrapf(ErrSnapshotNotNewer,
-			"persisted snapshot index %d is not newer than %d", metadata.Index, opts.SkipIfNotNewerThan)
+	if err := rejectSnapshotNotNewer(metadata.Index, opts.SkipIfNotNewerThan); err != nil {
+		return nil, err
 	}
 	payloadFile, payloadSHA, payloadBytes, err := spoolExport(ctx, export, publishSpoolDir(opts))
 	if err != nil {
@@ -75,10 +74,25 @@ func PublishPersistedSnapshot(ctx context.Context, opts PublishOptions) (*Manife
 	if err != nil {
 		return nil, err
 	}
+	payloadClaim, err := acquireObjectClaimWaiting(ctx, opts.Store, payloadObjectKey)
+	if err != nil {
+		return nil, errors.Wrap(err, "claim snapshot payload")
+	}
+	defer func() {
+		retErr = errors.CombineErrors(retErr, releaseObjectClaim(ctx, payloadClaim))
+	}()
 	if err := putPayload(ctx, opts.Store, payloadObjectKey, payloadFile, payloadBytes, payloadSHA); err != nil {
 		return nil, err
 	}
 	return commitManifest(ctx, opts, metadata, payloadObjectKey, payloadSHA)
+}
+
+func rejectSnapshotNotNewer(index uint64, threshold uint64) error {
+	if threshold > 0 && index <= threshold {
+		return errors.Wrapf(ErrSnapshotNotNewer,
+			"persisted snapshot index %d is not newer than %d", index, threshold)
+	}
+	return nil
 }
 
 // commitManifest builds, validates and commits the manifest once the payload is
@@ -150,21 +164,32 @@ func buildManifest(
 
 func putManifest(
 	ctx context.Context,
-	store ObjectStore,
+	store PublishStore,
 	manifest *Manifest,
 	reuseExistingCreatedAt bool,
 	verifyLeader func(context.Context) error,
-) error {
+) (retErr error) {
+	claim, err := acquireObjectClaimWaiting(ctx, store, manifest.ManifestKey)
+	if err != nil {
+		return errors.Wrap(err, "claim snapshot manifest")
+	}
+	defer func() {
+		retErr = errors.CombineErrors(retErr, releaseObjectClaim(ctx, claim))
+	}()
+
 	data, manifestSHA, err := manifest.MarshalCanonical()
 	if err != nil {
 		return err
 	}
 	size := int64(len(data))
 	objectSHA := hexSHA256Bytes(data)
-	if exists, err := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); err != nil {
+	if exists, err := verifyExistingManifest(ctx, store, manifest, reuseExistingCreatedAt); err != nil {
 		return err
 	} else if exists {
-		return nil
+		if err := verifyPublishLeadership(ctx, verifyLeader, "manifest reuse"); err != nil {
+			return err
+		}
+		return refreshExistingManifest(ctx, store, manifest)
 	}
 	// §4: leadership must hold at the instant the manifest is created,
 	// not merely before the absence probe above. That probe is a remote
@@ -172,26 +197,65 @@ func putManifest(
 	// so checking before it leaves a window in which a demoted node
 	// still commits a manifest — precisely the guarantee this
 	// scheduler exists to provide.
-	if verifyLeader != nil {
-		if err := verifyLeader(ctx); err != nil {
-			return errors.Wrap(err, "snapshot offload: leadership lost before manifest commit")
-		}
+	if err := verifyPublishLeadership(ctx, verifyLeader, "manifest commit"); err != nil {
+		return err
 	}
-	if err := createManifestObject(ctx, store, manifest, data, size, objectSHA, reuseExistingCreatedAt); err != nil {
+	if err := createManifestObject(ctx, store, manifest, data, size, objectSHA, reuseExistingCreatedAt, verifyLeader); err != nil {
 		return err
 	}
 	manifest.ManifestSHA256 = manifestSHA
-	return verifyCommittedManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt)
+	return verifyCommittedManifest(ctx, store, manifest, reuseExistingCreatedAt)
+}
+
+func verifyPublishLeadership(ctx context.Context, verify func(context.Context) error, operation string) error {
+	if verify == nil {
+		return nil
+	}
+	if err := verify(ctx); err != nil {
+		return errors.Wrapf(err, "snapshot offload: leadership lost before %s", operation)
+	}
+	return nil
+}
+
+// refreshExistingManifest changes the storage-visible state of a reused
+// manifest while preserving its canonical bytes. The manifest is small, and
+// the refresh makes a retention scan taken before this publish skip the object
+// after it acquires the shared claim and revalidates the listed state.
+func refreshExistingManifest(ctx context.Context, store PublishStore, manifest *Manifest) error {
+	// CreatedAt is part of schema v1's canonical self-hash. Advancing the
+	// stored value produces a distinct object version without adding a field
+	// that older restore binaries would omit when recomputing that hash.
+	manifest.CreatedAt = manifest.CreatedAt.Add(time.Nanosecond)
+	data, manifestSHA, err := manifest.MarshalCanonical()
+	if err != nil {
+		return err
+	}
+	opts := PutOptions{
+		Size:        int64(len(data)),
+		SHA256:      hexSHA256Bytes(data),
+		ContentType: "application/json",
+	}
+	info, err := store.RefreshObject(ctx, manifest.ManifestKey, bytes.NewReader(data), opts)
+	if err != nil {
+		return errors.Wrap(err, "refresh existing snapshot manifest")
+	}
+	if info.Size != opts.Size || (info.SHA256 != "" && info.SHA256 != opts.SHA256) {
+		return errors.Wrapf(ErrIntegrity,
+			"manifest object %s remote integrity mismatch after refresh", manifest.ManifestKey)
+	}
+	manifest.ManifestSHA256 = manifestSHA
+	return nil
 }
 
 func createManifestObject(
 	ctx context.Context,
-	store ObjectStore,
+	store PublishStore,
 	manifest *Manifest,
 	data []byte,
 	size int64,
 	objectSHA string,
 	reuseExistingCreatedAt bool,
+	verifyLeader func(context.Context) error,
 ) error {
 	info, err := store.PutObject(ctx, manifest.ManifestKey, bytes.NewReader(data), PutOptions{
 		Size:        size,
@@ -199,7 +263,7 @@ func createManifestObject(
 		ContentType: "application/json",
 	})
 	if err != nil {
-		return handleManifestPutError(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt, err)
+		return handleManifestPutError(ctx, store, manifest, reuseExistingCreatedAt, verifyLeader, err)
 	}
 	if info.Size != size || (info.SHA256 != "" && info.SHA256 != objectSHA) {
 		return errors.Wrapf(ErrIntegrity, "manifest object %s remote integrity mismatch", manifest.ManifestKey)
@@ -209,20 +273,22 @@ func createManifestObject(
 
 func handleManifestPutError(
 	ctx context.Context,
-	store ObjectStore,
+	store PublishStore,
 	manifest *Manifest,
-	size int64,
-	objectSHA string,
 	reuseExistingCreatedAt bool,
+	verifyLeader func(context.Context) error,
 	err error,
 ) error {
 	if !errors.Is(err, ErrIntegrity) {
 		return errors.Wrap(err, "put snapshot manifest")
 	}
-	if exists, verifyErr := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); verifyErr != nil {
+	if exists, verifyErr := verifyExistingManifest(ctx, store, manifest, reuseExistingCreatedAt); verifyErr != nil {
 		return errors.Wrap(verifyErr, "verify conflicting snapshot manifest")
 	} else if exists {
-		return nil
+		if err := verifyPublishLeadership(ctx, verifyLeader, "conflicting manifest reuse"); err != nil {
+			return err
+		}
+		return refreshExistingManifest(ctx, store, manifest)
 	}
 	return errors.Wrap(err, "put snapshot manifest")
 }
@@ -231,11 +297,9 @@ func verifyCommittedManifest(
 	ctx context.Context,
 	store ObjectStore,
 	manifest *Manifest,
-	size int64,
-	objectSHA string,
 	reuseExistingCreatedAt bool,
 ) error {
-	if exists, err := verifyExistingManifest(ctx, store, manifest, size, objectSHA, reuseExistingCreatedAt); err != nil {
+	if exists, err := verifyExistingManifest(ctx, store, manifest, reuseExistingCreatedAt); err != nil {
 		return errors.Wrap(err, "verify committed snapshot manifest")
 	} else if !exists {
 		return errors.Wrapf(ErrIntegrity, "manifest object %s missing after put", manifest.ManifestKey)
@@ -247,26 +311,19 @@ func verifyExistingManifest(
 	ctx context.Context,
 	store ObjectStore,
 	manifest *Manifest,
-	size int64,
-	sha string,
 	reuseExistingCreatedAt bool,
 ) (bool, error) {
-	info, ok, err := store.HeadObject(ctx, manifest.ManifestKey)
+	_, ok, err := store.HeadObject(ctx, manifest.ManifestKey)
 	if err != nil {
 		return false, errors.Wrap(err, "head existing snapshot manifest")
 	}
 	if !ok {
 		return false, nil
 	}
-	if info.Size != size && !reuseExistingCreatedAt {
-		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different size", manifest.ManifestKey)
-	}
-	if info.SHA256 != "" && info.SHA256 != sha && !reuseExistingCreatedAt {
-		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different sha256", manifest.ManifestKey)
-	}
 	existing, err := LoadManifest(ctx, store, manifest.ManifestKey)
 	if err != nil {
-		return true, errors.Wrap(err, "load existing snapshot manifest")
+		return true, errors.Wrapf(ErrIntegrity,
+			"load existing snapshot manifest %s: %v", manifest.ManifestKey, err)
 	}
 	if !manifestMatchesCandidate(existing, *manifest, reuseExistingCreatedAt) {
 		return true, errors.Wrapf(ErrIntegrity, "manifest object %s already exists with different content", manifest.ManifestKey)
@@ -279,8 +336,19 @@ func manifestMatchesCandidate(existing Manifest, candidate Manifest, reuseExisti
 	if reuseExistingCreatedAt {
 		return sameManifestExceptCreation(existing, candidate)
 	}
+	originalCreatedAt := candidate.CreatedAt
 	candidate.ManifestSHA256 = existing.ManifestSHA256
-	return reflect.DeepEqual(existing, candidate)
+	if reflect.DeepEqual(existing, candidate) {
+		return true
+	}
+	// Refreshing a reused schema-v1 manifest advances CreatedAt by one
+	// nanosecond so the canonical bytes and self-hash form a new generation
+	// without adding a field older restore binaries cannot verify. A later
+	// retry with the caller's original explicit timestamp must still match
+	// that refreshed object. Only accept a forward-advanced stored timestamp;
+	// a candidate attempting to replace the audit timestamp with a newer value
+	// remains a conflict.
+	return existing.CreatedAt.After(originalCreatedAt) && sameManifestExceptCreation(existing, candidate)
 }
 
 // sameManifestExceptCreation compares a retry's candidate against the
@@ -308,11 +376,110 @@ func validatePublishOptions(opts PublishOptions) error {
 		return errors.Wrap(ErrInvalidOptions, "object store is required")
 	case stringsTrim(opts.DataDir) == "":
 		return errors.Wrap(ErrInvalidOptions, "data dir is required")
-	case opts.GroupID == 0 && stringsTrim(opts.SourceCluster) == "":
-		return errors.Wrap(ErrInvalidOptions, "source cluster is required for group 0 manifests")
+	case stringsTrim(opts.SourceCluster) == "":
+		return errors.Wrap(ErrInvalidOptions, "source cluster is required")
 	default:
 		return nil
 	}
+}
+
+// spoolFilePattern is the glob matching spool files spoolExport creates.
+// Exported via CleanStaleSpoolFiles so a caller can identify them without
+// duplicating the name.
+const spoolFilePattern = "elastickv-snapshot-offload-*.fsm"
+
+// CleanStaleSpoolFiles removes spool files left behind by a previous process.
+//
+// spoolExport removes its file with a defer, which never runs if the process
+// is killed or the host loses power mid-publish. Nothing else removed them, so
+// repeated crashes during large snapshots accumulated full payload copies
+// until the spool volume filled.
+//
+// olderThan guards against deleting a file a CONCURRENTLY RUNNING publish is
+// still writing: only files whose mtime predates the cutoff are removed. A
+// caller at startup must still use a real stale-age cutoff because another
+// process may share the directory and be publishing concurrently.
+//
+// Returns the files removed. Individual failures are collected rather than
+// aborting, because one undeletable file must not leave the rest to
+// accumulate.
+func CleanStaleSpoolFiles(spoolDir string, olderThan time.Time) ([]string, error) {
+	spoolDir = stringsTrim(spoolDir)
+	if spoolDir == "" {
+		return nil, errors.Wrap(ErrInvalidOptions, "spool dir is required")
+	}
+	// The directory is READ, not globbed. filepath.Glob interprets the whole
+	// joined path as a pattern, so a configured spool dir containing a glob
+	// metacharacter -- /tmp/spool[12] -- would match /tmp/spool1 and
+	// /tmp/spool2 and delete files under THOSE, while the real
+	// /tmp/spool[12] was never examined. A configured path is a path, never a
+	// pattern; only the entry names are matched against the pattern.
+	spoolDir = filepath.Clean(spoolDir)
+	entries, err := os.ReadDir(spoolDir)
+	if err != nil {
+		if os.IsNotExist(err) {
+			// Offload may never have run here.
+			return nil, nil
+		}
+		return nil, errors.Wrapf(err, "read spool dir %s", spoolDir)
+	}
+	var (
+		removed  []string
+		failures []error
+		examined int
+	)
+	for _, entry := range entries {
+		matched, err := filepath.Match(spoolFilePattern, entry.Name())
+		if err != nil {
+			return removed, errors.Wrapf(err, "match spool pattern %q", spoolFilePattern)
+		}
+		if !matched {
+			continue
+		}
+		examined++
+		path := filepath.Join(spoolDir, entry.Name())
+		gone, err := removeStaleSpoolFile(path, olderThan)
+		if err != nil {
+			failures = append(failures, err)
+			continue
+		}
+		if gone {
+			removed = append(removed, path)
+		}
+	}
+	if len(failures) > 0 {
+		return removed, errors.Wrapf(errors.Join(failures...),
+			"clean spool dir %s: %d of %d files failed", spoolDir, len(failures), examined)
+	}
+	return removed, nil
+}
+
+// removeStaleSpoolFile removes one spool file if it is a regular file older
+// than the cutoff, reporting whether it was removed.
+//
+// A file that vanished between the glob and here is not a failure: another
+// process's cleanup, or the owning publish finishing, is the expected race.
+func removeStaleSpoolFile(path string, olderThan time.Time) (bool, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, errors.Wrapf(err, "stat spool file %s", path)
+	}
+	if !info.Mode().IsRegular() || !info.ModTime().Before(olderThan) {
+		return false, nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return false, errors.Wrapf(err, "remove spool file %s", path)
+	}
+	return true, nil
+}
+
+// SpoolDirFor reports the spool directory a publish with these options uses,
+// so a caller can clean it without re-deriving the default.
+func SpoolDirFor(spoolDir, dataDir string) string {
+	return publishSpoolDir(PublishOptions{SpoolDir: spoolDir, DataDir: dataDir})
 }
 
 func publishSpoolDir(opts PublishOptions) string {
@@ -326,7 +493,7 @@ func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotEx
 	if err := os.MkdirAll(spoolDir, localStoreDirPerm); err != nil {
 		return nil, "", 0, errors.WithStack(err)
 	}
-	tmp, err := os.CreateTemp(spoolDir, "elastickv-snapshot-offload-*.fsm")
+	tmp, err := os.CreateTemp(spoolDir, spoolFilePattern)
 	if err != nil {
 		return nil, "", 0, errors.WithStack(err)
 	}
@@ -359,23 +526,41 @@ func spoolExport(ctx context.Context, export *etcdraftengine.PersistedSnapshotEx
 }
 
 func putPayload(ctx context.Context, store ObjectStore, key string, file *os.File, size int64, sha string) error {
-	if exists, err := verifyExistingStoreObject(ctx, store, key, size, sha); err != nil {
-		return errors.Wrap(err, "verify existing snapshot payload")
-	} else if exists {
-		return nil
-	}
-	if _, err := file.Seek(0, io.SeekStart); err != nil {
-		return errors.WithStack(err)
-	}
-	info, err := store.PutObject(ctx, key, file, PutOptions{
+	opts := PutOptions{
 		Size:        size,
 		SHA256:      sha,
 		ContentType: "application/octet-stream",
-	})
+	}
+	exists, err := verifyExistingStoreObject(ctx, store, key, size, sha)
+	if err != nil {
+		return errors.Wrap(err, "verify existing snapshot payload")
+	}
+	if exists {
+		// The caller holds the payload's storage-visible claim until the
+		// manifest commits. Rewriting a multi-terabyte content-addressed
+		// payload merely to move its mtime would defeat deduplication; the
+		// shared claim is the lightweight coordination primitive instead.
+		return nil
+	}
+	if err := seekPayloadFile(file); err != nil {
+		return err
+	}
+	info, err := store.PutObject(ctx, key, file, opts)
 	if err != nil {
 		return errors.Wrap(err, "put snapshot payload")
 	}
-	if info.Size != size || (info.SHA256 != "" && info.SHA256 != sha) {
+	return validatePayloadObjectInfo(key, info, opts)
+}
+
+func seekPayloadFile(file *os.File) error {
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
+}
+
+func validatePayloadObjectInfo(key string, info ObjectInfo, opts PutOptions) error {
+	if info.Size != opts.Size || (info.SHA256 != "" && info.SHA256 != opts.SHA256) {
 		return errors.Wrapf(ErrIntegrity, "payload object %s remote integrity mismatch", key)
 	}
 	return nil
