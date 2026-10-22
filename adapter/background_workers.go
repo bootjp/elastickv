@@ -3,25 +3,29 @@ package adapter
 import (
 	"context"
 	"log/slog"
+	"sync"
 	"time"
 )
 
 // backgroundWorkers runs the jobs a request starts but does not wait for,
 // such as the cleanup of a deleted table's old generation. Each job is
 // counted in an inflightGate so the server's Stop can join it, bounded,
-// before the stores close underneath it, and its context derives from a
-// parent Stop cancels once the bound has passed. A nil *backgroundWorkers
+// before the stores close underneath it. Stop cancels jobs already started
+// once the bound has passed; reservations that commit later get a live
+// timeout and stay counted in the final join. A nil *backgroundWorkers
 // runs every job detached under context.Background() and has nothing to
 // stop, which keeps zero-value servers in tests working.
 type backgroundWorkers struct {
-	gate   *inflightGate
-	ctx    context.Context
-	cancel context.CancelFunc
+	gate    *inflightGate
+	ctx     context.Context
+	cancel  context.CancelFunc
+	mu      sync.Mutex
+	running map[*backgroundReservation]context.CancelFunc
 }
 
 func newBackgroundWorkers() *backgroundWorkers {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &backgroundWorkers{gate: newInflightGate(), ctx: ctx, cancel: cancel}
+	return &backgroundWorkers{gate: newInflightGate(), ctx: ctx, cancel: cancel, running: make(map[*backgroundReservation]context.CancelFunc)}
 }
 
 // backgroundReservation is a job slot claimed before the commit that makes
@@ -49,16 +53,22 @@ func (r *backgroundReservation) start(timeout time.Duration, run func(ctx contex
 		return
 	}
 	r.used = true
-	parent := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	if r.w != nil {
-		parent = r.w.ctx
+		r.w.mu.Lock()
+		r.w.running[r] = cancel
+		r.w.mu.Unlock()
 	}
 	go func() {
+		defer cancel()
 		if r.w != nil {
 			defer r.w.gate.exit()
+			defer func() {
+				r.w.mu.Lock()
+				delete(r.w.running, r)
+				r.w.mu.Unlock()
+			}()
 		}
-		ctx, cancel := context.WithTimeout(parent, timeout)
-		defer cancel()
 		run(ctx)
 	}()
 }
@@ -86,7 +96,7 @@ func (w *backgroundWorkers) stop(name string, timeout, joinTimeout time.Duration
 		return
 	}
 	finished := w.gate.drain(timeout)
-	w.cancel()
+	w.cancelRunning()
 	if finished {
 		return
 	}
@@ -99,5 +109,17 @@ func (w *backgroundWorkers) stop(name string, timeout, joinTimeout time.Duration
 			slog.Int64("in_flight", w.gate.remaining()),
 			slog.Duration("timeout", joinTimeout),
 		)
+	}
+}
+
+func (w *backgroundWorkers) cancelRunning() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.cancel()
+	// Reservations still owned by a mutation are not jobs yet. If that
+	// mutation commits later, its cleanup gets a live, independently bounded
+	// context and remains counted in the join window.
+	for _, cancel := range w.running {
+		cancel()
 	}
 }

@@ -441,9 +441,10 @@ func TestDynamoDBAdminPutUsesItemLock(t *testing.T) {
 	require.NoError(t, err)
 	done := make(chan error, 1)
 	go func() {
-		done <- server.AdminPutItem(context.Background(), fullAdminPrincipal, schema.TableName, AdminItem{
-			Attributes: map[string]AdminAttributeValue{"pk": stringAttr(dedupTestKey)},
-		})
+		done <- server.AdminPutItem(context.Background(), fullAdminPrincipal, schema.TableName,
+			map[string]AdminAttributeValue{"pk": stringAttr(dedupTestKey)}, AdminItem{
+				Attributes: map[string]AdminAttributeValue{"pk": stringAttr(dedupTestKey)},
+			})
 	}()
 	select {
 	case err := <-done:

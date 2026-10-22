@@ -99,9 +99,14 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 	}
 	defer s.exitAdminBlobUse()
 
+	cleanup, err := s.reserveAdminCleanup()
+	if err != nil {
+		return err
+	}
+	defer cleanup.release()
 	var cleanupManifest *s3ObjectManifest
 	var generation uint64
-	err := s.retryS3Mutation(ctx, func() error {
+	err = s.retryS3Mutation(ctx, func() error {
 		manifest, gen, err := s.adminDeleteObjectTxn(ctx, bucket, key)
 		if err != nil {
 			return err
@@ -114,7 +119,9 @@ func (s *S3Server) AdminDeleteObject(ctx context.Context, principal AdminPrincip
 		return err //nolint:wrapcheck // sentinels propagate as-is; wrapped values already carry context.
 	}
 	if cleanupManifest != nil {
-		s.cleanupManifestBlobsAsync(bucket, generation, key, cleanupManifest)
+		cleanup.start(func(cleanupCtx context.Context) {
+			s.cleanupManifestBlobs(cleanupCtx, bucket, generation, key, cleanupManifest)
+		})
 	}
 	return nil
 }
@@ -224,6 +231,11 @@ func (s *S3Server) AdminPutObject(ctx context.Context, principal AdminPrincipal,
 // the admin sentinels. It makes a single attempt: the chunk fan-out has no
 // idempotency token, so a retry would leak the first attempt's chunks.
 func (s *S3Server) adminPutObject(ctx context.Context, in *s3PutObjectInput, bucket, key string) error {
+	cleanup, err := s.reserveAdminCleanup()
+	if err != nil {
+		return err
+	}
+	defer cleanup.release()
 	state, err := s.prepareS3PutObject(ctx, in, bucket, key)
 	if err != nil {
 		var respErr *s3ResponseError
@@ -249,7 +261,9 @@ func (s *S3Server) adminPutObject(ctx context.Context, in *s3PutObjectInput, buc
 		return errors.WithStack(err)
 	}
 	if state.previous != nil {
-		s.cleanupManifestBlobsAsync(bucket, state.meta.Generation, key, state.previous)
+		cleanup.start(func(cleanupCtx context.Context) {
+			s.cleanupManifestBlobs(cleanupCtx, bucket, state.meta.Generation, key, state.previous)
+		})
 	}
 	return nil
 }

@@ -570,6 +570,13 @@ func (s *LeaderRoutedStore) ApplyMutationsRaftAt(ctx context.Context, mutations 
 	return errors.WithStack(s.local.ApplyMutationsRaftAt(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
 }
 
+func (s *LeaderRoutedStore) ApplyMutationsRaftAtFenced(ctx context.Context, mutations []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	if s == nil || s.local == nil {
+		return errors.WithStack(store.ErrNotSupported)
+	}
+	return errors.WithStack(s.local.ApplyMutationsRaftAtFenced(ctx, mutations, readKeys, startTS, commitTS, appliedIndex))
+}
+
 func (s *LeaderRoutedStore) DeletePrefixAt(ctx context.Context, prefix []byte, excludePrefix []byte, commitTS uint64) error {
 	if s == nil || s.local == nil {
 		return errors.WithStack(store.ErrNotSupported)

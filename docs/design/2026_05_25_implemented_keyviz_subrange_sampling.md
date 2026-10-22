@@ -402,10 +402,13 @@ gains a sub-range discriminator keyed on `SubBucketCount` (§4.3):
 
 The SPA heatmap renders rows by `Start`/`End` and already supports an
 arbitrary number of rows under the row budget, so **no structural SPA
-change is required** to see hot sub-ranges. Two small polish items
-(optional, can be a follow-up PR): the `RowDetail` panel labels a
-sub-row with its narrowed range, and tooltips show "route N · sub-range
-i/K". The fan-out wire fields (`conflicts[]`, `raft_group_ids[]`,
+change is required** to see hot sub-ranges. Two small polish items, **now implemented**: the `RowDetail` panel
+labels a sub-row with `sub-range i/K` and renames its Start/End rows to
+`Sub-range start`/`Sub-range end` so the narrowed bounds are not read as
+the whole route's, with a tooltip explaining the split. The wire carries
+`sub_bucket` / `sub_bucket_count` for this, both omitted unless the
+route is genuinely sub-divided so the payload is byte-identical at the
+`K=1` default. The fan-out wire fields (`conflicts[]`, `raft_group_ids[]`,
 `leader_terms[]`) are unaffected — they are per-column and travel on
 each sub-row unchanged.
 
@@ -453,7 +456,8 @@ of 1024). Two consequences to document for operators:
 - The per-request `rows` budget (`keyVizRowBudgetCap`, 1024) now buys
   roughly `budget / active_subbuckets_per_route` *routes* shown at full
   resolution — i.e. raising `K` trades route breadth for intra-route
-  depth at a fixed payload size. The doc/flag help text should say so.
+  depth at a fixed payload size. **The `--keyvizKeyBucketsPerRoute` help
+  text now states this.**
 - The intermediate 160k-row materialisation is bounded and transient
   (one column build), but if it proves heavy, `Flush` can apply a
   cheap per-slot top-sub-bucket cap before the global budget. Noted as

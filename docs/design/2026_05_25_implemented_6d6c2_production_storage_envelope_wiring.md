@@ -267,7 +267,11 @@ hydrate+bump is gated on an active DEK:
 
 ## 5. Resolved decisions and deferred follow-ups
 
-- **Redundant KEK unwrap at startup is deferred to Stage 9.**
+- **Redundant KEK unwrap at startup — RESOLVED in Stage 9C.**
+  Stage 9B shipped the KMS providers, so the condition this deferral
+  was waiting on arrived. `encryption.StartupUnwrapCache` memoizes
+  unwraps across the startup phase, collapsing the guard and hydration
+  passes back to one provider call per wrapped DEK. Original note:
    `HydrateKeystoreFromSidecar` re-unwraps every wrapped DEK that
    `CheckStartupGuards` already unwrapped to verify the KEK. For the
    file-mode KEK (the only provider today) the unwrap is a local AES
