@@ -72,3 +72,55 @@ func TestSplitJobCleanupAttemptsHaveIndependentDeadlines(t *testing.T) {
 		})
 	}
 }
+
+type stalledControlClient struct {
+	splitMigrationClientStub
+}
+
+func (*stalledControlClient) ApplyTargetStagedReadiness(ctx context.Context, _ *pb.TargetStagedReadinessRequest, _ ...grpc.CallOption) (*pb.TargetStagedReadinessResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*stalledControlClient) IssueMigrationTimestamp(ctx context.Context, _ *pb.IssueMigrationTimestampRequest, _ ...grpc.CallOption) (*pb.IssueMigrationTimestampResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (*stalledControlClient) ProbeMigrationLocks(ctx context.Context, _ *pb.ProbeMigrationLocksRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationLocksResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestSplitJobControlRPCsHaveIndependentDeadlines(t *testing.T) {
+	t.Parallel()
+	job := splitJobForSourceGroupTest(t)
+	for _, tc := range []struct {
+		name string
+		run  func(context.Context, SplitMigrationClient) error
+	}{
+		{"fence", func(ctx context.Context, client SplitMigrationClient) error {
+			_, err := applySplitMigrationControl(ctx, client, job, []byte("z"), 1, 1, true, false, true, 1)
+			return err
+		}},
+		{"capability guard", func(ctx context.Context, client SplitMigrationClient) error {
+			_, err := (&DistributionServer{}).applyAndProbeSplitMigrationControl(ctx, 7, client, &pb.TargetStagedReadinessRequest{JobId: 7})
+			return err
+		}},
+		{"timestamp", func(ctx context.Context, client SplitMigrationClient) error {
+			_, err := issueSplitMigrationTimestamp(ctx, client)
+			return err
+		}},
+		{"lock drain", func(ctx context.Context, client SplitMigrationClient) error {
+			_, err := splitJobPendingLocks(ctx, client, []byte("m"), []byte("z"))
+			return err
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			require.ErrorIs(t, tc.run(ctx, &stalledControlClient{}), context.DeadlineExceeded)
+			require.NoError(t, ctx.Err())
+		})
+	}
+}

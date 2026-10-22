@@ -61,7 +61,7 @@ func TestSplitJobCopyAttemptBoundsStalledExportAndImport(t *testing.T) {
 			err = server.copySplitJobPhase(ctx, job, distribution.SplitJobExportPhaseBackfill, 0, job.SnapshotTS)
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 			require.NoError(t, ctx.Err())
-			require.Less(t, time.Since(start), 5*defaultSplitMigrationCopyTimeout)
+			require.Less(t, time.Since(start), 5*defaultSplitMigrationAttemptTimeout)
 			persisted, found, err := catalog.SplitJob(ctx, job.JobID)
 			require.NoError(t, err)
 			require.True(t, found)

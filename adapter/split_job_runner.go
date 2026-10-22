@@ -24,7 +24,7 @@ const (
 	defaultSplitMigrationLockProbeLimit    = 1024
 	defaultSplitMigrationReadFenceGrace    = 30 * time.Second
 	defaultSplitMigrationVoterProbeTimeout = 500 * time.Millisecond
-	defaultSplitMigrationCopyTimeout       = 2 * time.Second
+	defaultSplitMigrationAttemptTimeout    = 2 * time.Second
 	splitCleanupCursorVersion              = byte(1)
 	splitVoterAckCursorVersion             = byte(1)
 	splitCleanupCursorHeaderBytes          = 5
@@ -1100,7 +1100,7 @@ func (s *DistributionServer) persistSplitJobBackfillAck(ctx context.Context, job
 }
 
 func (s *DistributionServer) openSplitJobBackfill(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient) error {
-	issued, err := source.IssueMigrationTimestamp(ctx, &pb.IssueMigrationTimestampRequest{})
+	issued, err := issueSplitMigrationTimestamp(ctx, source)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1152,7 +1152,7 @@ func (s *DistributionServer) copySplitJobPhase(
 		return errors.New("split migration source or target client is nil")
 	}
 	progress := job.BracketProgress[progressIndex]
-	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationCopyTimeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
 	defer cancel()
 	stream, err := source.ExportRangeVersions(attemptCtx, &pb.ExportRangeVersionsRequest{
 		RangeStart:           bracket.Start,
@@ -1231,7 +1231,7 @@ func (s *DistributionServer) copySplitJobStream(
 }
 
 func cleanupSplitMigration(ctx context.Context, client SplitMigrationClient, req *pb.CleanupMigrationRequest) (*pb.CleanupMigrationResponse, error) {
-	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationCopyTimeout)
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
 	defer cancel()
 	resp, err := client.CleanupMigration(attemptCtx, req)
 	return resp, errors.WithStack(err)
@@ -1363,7 +1363,7 @@ func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job dist
 	if !complete {
 		return s.persistSplitJobFenceAck(ctx, job.JobID, ackCursor)
 	}
-	issued, err := source.IssueMigrationTimestamp(ctx, &pb.IssueMigrationTimestampRequest{})
+	issued, err := issueSplitMigrationTimestamp(ctx, source)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1516,7 +1516,9 @@ func (s *DistributionServer) ensureSplitJobCatalogFence(
 }
 
 func splitJobPendingLocks(ctx context.Context, source SplitMigrationClient, routeStart []byte, routeEnd []byte) (bool, error) {
-	resp, err := source.ProbeMigrationLocks(ctx, &pb.ProbeMigrationLocksRequest{
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
+	defer cancel()
+	resp, err := source.ProbeMigrationLocks(attemptCtx, &pb.ProbeMigrationLocksRequest{
 		RouteStart: routeStart,
 		RouteEnd:   routeEnd,
 		Limit:      defaultSplitMigrationLockProbeLimit,
@@ -1658,7 +1660,7 @@ func applySplitMigrationControl(
 	if client == nil {
 		return 0, errors.New("split migration control client is nil")
 	}
-	resp, err := client.ApplyTargetStagedReadiness(ctx, splitMigrationControlRequest(
+	resp, err := applySplitMigrationControlRequest(ctx, client, splitMigrationControlRequest(
 		job,
 		routeEnd,
 		expectedVersion,
@@ -1672,6 +1674,20 @@ func applySplitMigrationControl(
 		return 0, errors.WithStack(err)
 	}
 	return resp.GetMinAdmittedTs(), nil
+}
+
+func applySplitMigrationControlRequest(ctx context.Context, client SplitMigrationClient, req *pb.TargetStagedReadinessRequest) (*pb.TargetStagedReadinessResponse, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
+	defer cancel()
+	resp, err := client.ApplyTargetStagedReadiness(attemptCtx, req)
+	return resp, errors.WithStack(err)
+}
+
+func issueSplitMigrationTimestamp(ctx context.Context, client SplitMigrationClient) (*pb.IssueMigrationTimestampResponse, error) {
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
+	defer cancel()
+	resp, err := client.IssueMigrationTimestamp(attemptCtx, &pb.IssueMigrationTimestampRequest{})
+	return resp, errors.WithStack(err)
 }
 
 func splitMigrationControlRequest(
@@ -1865,7 +1881,7 @@ func (s *DistributionServer) applyAndProbeSplitMigrationControl(
 	if client == nil {
 		return false, errors.New("split migration control client is nil")
 	}
-	if _, err := client.ApplyTargetStagedReadiness(ctx, req); err != nil {
+	if _, err := applySplitMigrationControlRequest(ctx, client, req); err != nil {
 		return false, errors.WithStack(err)
 	}
 	_, complete, err := s.syncSplitMigrationVoterBarrier(ctx, groupID, nil, client, probeMigrationControlRequest(req))
