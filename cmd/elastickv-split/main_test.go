@@ -122,13 +122,13 @@ func (s *splitAuthTestServer) AbandonSplitJob(_ context.Context, req *pb.Abandon
 	return &pb.AbandonSplitJobResponse{}, nil
 }
 
-func TestRunSendsMigrationAdminToken(t *testing.T) {
+func TestRunSendsMigrationControllerToken(t *testing.T) {
 	resetFlags(t)
 	t.Cleanup(func() { resetFlags(t) })
 	var listenConfig net.ListenConfig
 	listener, err := listenConfig.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	unary, _ := adapter.SplitMigrationTokenAuth("test-admin-token", false)
+	unary, _ := adapter.SplitMigrationTokenAuth("test-migration-token", false)
 	tlsFixture := httptest.NewTLSServer(nil)
 	tlsFixture.Close()
 	caPath := filepath.Join(t.TempDir(), "ca.pem")
@@ -151,7 +151,7 @@ func TestRunSendsMigrationAdminToken(t *testing.T) {
 	require.ErrorContains(t, err, "Unauthenticated")
 	require.Empty(t, svc.jobs)
 	path := filepath.Join(t.TempDir(), "token")
-	require.NoError(t, os.WriteFile(path, []byte("test-admin-token\n"), 0o600))
+	require.NoError(t, os.WriteFile(path, []byte("test-migration-token\n"), 0o600))
 	*tokenFile = path
 	require.NoError(t, run())
 	require.Equal(t, uint64(7), <-svc.jobs)

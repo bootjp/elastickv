@@ -176,8 +176,9 @@ var (
 	// below — both can be enabled simultaneously, and operators can pick
 	// whichever auth path they need (gRPC bearer token vs. HTTP cookies +
 	// SigV4 access keys).
-	adminTokenFile                = flag.String("adminTokenFile", "", "Path to the bearer token required on Admin and split-migration control RPCs (leave blank with --adminInsecureNoAuth off to disable Admin and reject migration control)")
+	adminTokenFile                = flag.String("adminTokenFile", "", "Path to the read-only Admin bearer token; does not authorize split migration")
 	adminInsecureNoAuth           = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	splitMigrationTokenFile       = flag.String("splitMigrationTokenFile", "", "Path to a dedicated cluster-shared migration controller/node token, distinct from Admin and S3 peer tokens")
 	grpcTLSCAFile                 = flag.String("grpcTLSCAFile", "", "CA certificates for verifying peer gRPC TLS; requires grpcTLSCertFile and grpcTLSKeyFile")
 	grpcTLSCertFile               = flag.String("grpcTLSCertFile", "", "PEM certificate enabling TLS on group gRPC listeners and peer clients")
 	grpcTLSKeyFile                = flag.String("grpcTLSKeyFile", "", "PEM private key for group gRPC TLS")
@@ -754,7 +755,7 @@ type distributionStartup struct {
 }
 
 func startDistributionStartup(in distributionStartupInput) (distributionStartup, error) {
-	auth, err := loadNodeGRPCAuth(*adminTokenFile, *adminInsecureNoAuth, *s3BlobPeerTokenFile)
+	auth, err := loadNodeGRPCAuth(*adminTokenFile, *adminInsecureNoAuth, *s3BlobPeerTokenFile, *splitMigrationTokenFile)
 	if err != nil {
 		return distributionStartup{}, err
 	}
@@ -806,17 +807,17 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
 			splitPromotionTargetLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
-			auth.adminToken,
+			auth.migrationToken,
 		)),
 		adapter.WithSplitMigrationClientFactory(splitMigrationClientFactory(
 			splitMigrationGroupLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,
-			auth.adminToken,
+			auth.migrationToken,
 		)),
 		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(
 			in.shardGroups,
 			splitMigrationConnCache,
-			auth.adminToken,
+			auth.migrationToken,
 		)),
 		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
 		adapter.WithSplitJobRunnerReady(),
@@ -2916,6 +2917,7 @@ func setupAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
 		*s3BlobPeerTokenFile,
+		*splitMigrationTokenFile,
 		adapter.S3BlobOffloadEnabledFromEnv(),
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
@@ -3207,13 +3209,14 @@ func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
 	s3BlobPeerTokenPath string,
+	migrationTokenPath string,
 	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
 	connCache *kv.GRPCConnCache,
 	backupDeps ...adminBackupDependencies,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
-	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath)
+	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath, migrationTokenPath)
 	if err != nil {
 		return nil, adminGRPCInterceptors{}, err
 	}
@@ -3234,7 +3237,7 @@ func configureAdminService(
 	icept := adminGRPCInterceptors{token: auth.adminToken}
 	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
 	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
-	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.adminToken, insecureNoAuth)
+	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth)
 	appendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
 	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
 	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
@@ -3243,12 +3246,13 @@ func configureAdminService(
 }
 
 type nodeGRPCAuthConfig struct {
-	adminToken   string
-	peerToken    string
-	adminEnabled bool
+	adminToken     string
+	peerToken      string
+	migrationToken string
+	adminEnabled   bool
 }
 
-func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath string) (nodeGRPCAuthConfig, error) {
+func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath, migrationTokenPath string) (nodeGRPCAuthConfig, error) {
 	if tokenPath != "" && insecureNoAuth {
 		return nodeGRPCAuthConfig{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
 	}
@@ -3268,10 +3272,40 @@ func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath strin
 		}
 		cfg.peerToken = loaded
 	}
-	if cfg.adminToken != "" && cfg.peerToken == cfg.adminToken {
-		return nodeGRPCAuthConfig{}, errors.New("S3 blob peer token must differ from the read-only admin token")
+	if err := validateNodeGRPCPeerToken(cfg.adminToken, cfg.peerToken); err != nil {
+		return nodeGRPCAuthConfig{}, err
 	}
+	migrationToken, err := loadSplitMigrationToken(migrationTokenPath, insecureNoAuth, cfg.adminToken, cfg.peerToken)
+	if err != nil {
+		return nodeGRPCAuthConfig{}, err
+	}
+	cfg.migrationToken = migrationToken
 	return cfg, nil
+}
+
+func validateNodeGRPCPeerToken(adminToken, peerToken string) error {
+	if adminToken != "" && peerToken == adminToken {
+		return errors.New("S3 blob peer token must differ from the read-only admin token")
+	}
+	return nil
+}
+
+func loadSplitMigrationToken(path string, insecureNoAuth bool, adminToken, peerToken string) (string, error) {
+	if path == "" {
+		return "", nil
+	}
+	if insecureNoAuth {
+		return "", errors.New("--adminInsecureNoAuth and --splitMigrationTokenFile are mutually exclusive")
+	}
+	const maxMigrationTokenBytes = 4 << 10
+	token, err := internalutil.LoadBearerTokenFile(path, maxMigrationTokenBytes, "migration token")
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	if token == adminToken || token == peerToken {
+		return "", errors.New("migration token must differ from Admin and S3 peer tokens")
+	}
+	return token, nil
 }
 
 func appendGRPCBearerInterceptors(

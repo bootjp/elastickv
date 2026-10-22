@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"net"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -28,9 +30,17 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	unary, streamAuth := adapter.SplitMigrationTokenAuth("migration-secret", false)
-	serverOpts := append(internalutil.GRPCServerOptions(), grpc.StreamInterceptor(streamAuth), grpc.ChainUnaryInterceptor(unary,
-		func(ctx context.Context, _ any, _ *grpc.UnaryServerInfo, _ grpc.UnaryHandler) (any, error) {
+	adminPath := filepath.Join(t.TempDir(), "admin-token")
+	migrationPath := filepath.Join(t.TempDir(), "migration-token")
+	require.NoError(t, os.WriteFile(adminPath, []byte("read-only-admin"), 0o600))
+	require.NoError(t, os.WriteFile(migrationPath, []byte("migration-secret"), 0o600))
+	adminServer, auth, err := configureAdminService(adminPath, false, "", migrationPath, false, adapter.NodeIdentity{}, nil, nil)
+	require.NoError(t, err)
+	serverOpts := append(raftGRPCServerOptions(auth), grpc.ChainUnaryInterceptor(
+		func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+			if info.FullMethod == pb.Admin_GetNodeVersion_FullMethodName {
+				return handler(ctx, req)
+			}
 			md, _ := metadata.FromIncomingContext(ctx)
 			require.Equal(t, []string{"Bearer migration-secret"}, md.Get("authorization"))
 			require.Equal(t, []string{"preserved"}, md.Get("trace-id"))
@@ -38,6 +48,7 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 		}))
 	server := grpc.NewServer(serverOpts...)
 	pb.RegisterInternalServer(server, migrationAuthExportServer{})
+	pb.RegisterAdminServer(server, adminServer)
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- server.Serve(lis) }()
 	t.Cleanup(func() {
@@ -89,6 +100,38 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	require.NoError(t, err)
 	_, err = pb.NewInternalClient(conn).CleanupMigration(ctx, &pb.CleanupMigrationRequest{})
 	require.Equal(t, codes.Unauthenticated, status.Code(err), "runner token must not leak into cached connections")
+	adminCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer read-only-admin"))
+	_, err = pb.NewInternalClient(conn).ApplyTargetStagedReadiness(adminCtx, &pb.TargetStagedReadinessRequest{})
+	require.Equal(t, codes.Unauthenticated, status.Code(err), "read-only admin token must not authorize migration fences")
+	_, err = pb.NewAdminClient(conn).GetNodeVersion(adminCtx, &pb.GetNodeVersionRequest{})
+	require.NoError(t, err, "read-only admin operations retain their own credential")
+	migrationCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer migration-secret"))
+	_, err = pb.NewAdminClient(conn).GetNodeVersion(migrationCtx, &pb.GetNodeVersionRequest{})
+	require.Equal(t, codes.Unauthenticated, status.Code(err), "migration credential must not gain unrelated Admin access")
+}
+
+func TestSplitMigrationTokenMustBeDedicated(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	adminPath, peerPath := filepath.Join(dir, "admin"), filepath.Join(dir, "peer")
+	require.NoError(t, os.WriteFile(adminPath, []byte("read-only-admin"), 0o600))
+	require.NoError(t, os.WriteFile(peerPath, []byte("blob-peer"), 0o600))
+	for _, token := range []string{"read-only-admin", "blob-peer", "migration-secret"} {
+		path := filepath.Join(t.TempDir(), "migration")
+		require.NoError(t, os.WriteFile(path, []byte(token), 0o600))
+		cfg, err := loadNodeGRPCAuth(adminPath, false, peerPath, path)
+		if token != "migration-secret" {
+			require.ErrorContains(t, err, "migration token must differ")
+			continue
+		}
+		require.NoError(t, err)
+		require.Equal(t, "migration-secret", cfg.migrationToken)
+		_, err = loadNodeGRPCAuth("", true, "", path)
+		require.ErrorContains(t, err, "mutually exclusive")
+	}
+	cfg, err := loadNodeGRPCAuth(adminPath, false, peerPath, "")
+	require.NoError(t, err)
+	require.Empty(t, cfg.migrationToken, "an Admin token must never implicitly configure migration authority")
 }
 
 type migrationAuthExportServer struct {

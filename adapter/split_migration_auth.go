@@ -37,7 +37,7 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth bool) (grpc.UnaryServe
 	if token == "" && insecureNoAuth {
 		return nil, nil
 	}
-	authUnary, authStream := bearerTokenAuth(token, splitMigrationProtectedMethod, "split migration admin")
+	authUnary, authStream := bearerTokenAuth(token, splitMigrationProtectedMethod, "split migration controller")
 	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if err := checkSplitMigrationTransport(ctx, info.FullMethod, token); err != nil {
 			return nil, err
@@ -64,7 +64,7 @@ func checkSplitMigrationTransport(ctx context.Context, method, token string) err
 		return nil
 	}
 	if token == "" {
-		return errors.WithStack(status.Error(codes.Unauthenticated, "split migration requires a configured admin token"))
+		return errors.WithStack(status.Error(codes.Unauthenticated, "split migration requires a configured migration token"))
 	}
 	p, ok := peer.FromContext(ctx)
 	if !ok {

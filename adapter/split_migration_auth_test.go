@@ -28,8 +28,8 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 	}
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {
-			unary, stream := SplitMigrationTokenAuth("admin-secret", false)
-			for _, credential := range []string{"", "Bearer wrong", "Bearer admin-secret"} {
+			unary, stream := SplitMigrationTokenAuth("migration-secret", false)
+			for _, credential := range []string{"", "Bearer wrong", "Bearer migration-secret"} {
 				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", credential))
 				ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
 				called := false
@@ -38,7 +38,7 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 					return nil, nil
 				})
 				want := codes.Unauthenticated
-				if credential == "Bearer admin-secret" {
+				if credential == "Bearer migration-secret" {
 					want = codes.OK
 				}
 				require.Equal(t, want, status.Code(err))
@@ -57,8 +57,8 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 
 func TestSplitMigrationTokenAuthRejectsPlaintextEvenWithValidToken(t *testing.T) {
 	t.Parallel()
-	unary, stream := SplitMigrationTokenAuth("admin-secret", false)
-	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer admin-secret"))
+	unary, stream := SplitMigrationTokenAuth("migration-secret", false)
+	ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", "Bearer migration-secret"))
 	_, err := unary(ctx, nil, &grpc.UnaryServerInfo{FullMethod: pb.Internal_CleanupMigration_FullMethodName}, func(context.Context, any) (any, error) {
 		t.Fatal("plaintext token must not reach the handler")
 		return nil, nil
@@ -104,7 +104,7 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 
 func TestSplitMigrationTokenAuthLeavesNormalPeerRPCsUnchanged(t *testing.T) {
 	t.Parallel()
-	for _, token := range []string{"", "admin-secret"} {
+	for _, token := range []string{"", "migration-secret"} {
 		unary, stream := SplitMigrationTokenAuth(token, false)
 		for _, method := range []string{
 			pb.Internal_Forward_FullMethodName,

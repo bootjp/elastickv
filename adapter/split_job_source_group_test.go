@@ -1,9 +1,12 @@
 package adapter
 
 import (
+	"context"
+	"strconv"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -163,12 +166,6 @@ func TestSplitJobSourceGroupBackfillSkipsWhatItMustNotWrite(t *testing.T) {
 		{RouteID: 2, ParentRouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 7},
 		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
 	}
-	degraded := []distribution.RouteDescriptor{
-		{RouteID: 4, ParentRouteID: 2, Start: []byte("a"), End: []byte("f"), GroupID: 7},
-		{RouteID: 5, ParentRouteID: 2, Start: []byte("f"), End: []byte("m"), GroupID: 7},
-		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
-	}
-
 	t.Run("the field is already recorded", func(t *testing.T) {
 		t.Parallel()
 		job := splitJobForSourceGroupTest(t)
@@ -196,15 +193,72 @@ func TestSplitJobSourceGroupBackfillSkipsWhatItMustNotWrite(t *testing.T) {
 		})
 	}
 
-	t.Run("the shape cannot answer either", func(t *testing.T) {
-		t.Parallel()
-		job := splitJobForSourceGroupTest(t)
-		job.SourceGroupID = 0
-		job.Phase = distribution.SplitJobPhaseCleanup
+}
 
-		// Nothing to record, and the phase must surface the real error rather
-		// than a backfill failure.
-		_, needed := splitJobSourceGroupBackfill(degraded, job)
-		require.False(t, needed)
+func TestSplitJobSourceGroupBackfillRecoversAlreadyDegradedLegacyJob(t *testing.T) {
+	t.Parallel()
+	for _, predecessorGroup := range []uint64{7, 4} {
+		t.Run(strconv.FormatUint(predecessorGroup, 10), func(t *testing.T) {
+			t.Parallel()
+			ctx := context.Background()
+			st := store.NewMVCCStore()
+			catalog := distribution.NewCatalogStore(st)
+			initial, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 7}})
+			require.NoError(t, err)
+			job := splitJobForSourceGroupTest(t)
+			job.SourceGroupID = 0
+			job.SnapshotTS = catalog.LatestCommitTS()
+			job.Phase = distribution.SplitJobPhaseCleanup
+			require.NoError(t, catalog.CreateSplitJob(ctx, job))
+			current, err := catalog.Save(ctx, initial.Version, []distribution.RouteDescriptor{
+				{RouteID: 4, ParentRouteID: 2, Start: []byte("a"), End: []byte("f"), GroupID: predecessorGroup},
+				{RouteID: 5, ParentRouteID: 2, Start: []byte("f"), End: []byte("m"), GroupID: predecessorGroup},
+				{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
+			})
+			require.NoError(t, err)
+			server := NewDistributionServer(distribution.NewEngine(), catalog, WithDistributionCoordinator(newDistributionCoordinatorStub(st, true)))
+			repaired, err := server.backfillSplitJobSourceGroup(ctx, job)
+			require.NoError(t, err)
+			require.Equal(t, uint64(7), repaired.SourceGroupID, "a migrated predecessor must not redirect source cleanup")
+			persisted, found, err := catalog.SplitJob(ctx, job.JobID)
+			require.NoError(t, err)
+			require.True(t, found)
+			require.Equal(t, uint64(7), persisted.SourceGroupID)
+			group, end, ok := splitJobSourceRouteState(current.Routes, persisted)
+			require.True(t, ok)
+			require.Equal(t, uint64(7), group)
+			require.Equal(t, []byte("z"), end)
+		})
+	}
+}
+
+func TestSplitJobSourceGroupRecoveryUsesRetainedFenceTimestamp(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore())
+	initial, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+		{RouteID: 2, ParentRouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 7},
+		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
 	})
+	require.NoError(t, err)
+	fenceTS := catalog.LatestCommitTS()
+	_, err = catalog.Save(ctx, initial.Version, []distribution.RouteDescriptor{
+		{RouteID: 4, ParentRouteID: 2, Start: []byte("a"), End: []byte("f"), GroupID: 4},
+		{RouteID: 5, ParentRouteID: 2, Start: []byte("f"), End: []byte("m"), GroupID: 4},
+		{RouteID: 3, ParentRouteID: 1, Start: []byte("m"), End: []byte("z"), GroupID: 9},
+	})
+	require.NoError(t, err)
+	job := splitJobForSourceGroupTest(t)
+	job.SourceGroupID = 0
+	job.Phase = distribution.SplitJobPhaseCleanup
+	job.FenceTS = fenceTS
+	server := &DistributionServer{catalog: catalog}
+	group, found, err := server.legacySplitJobSourceGroup(ctx, job)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, uint64(7), group)
+	job.FenceTS = 0
+	_, found, err = server.legacySplitJobSourceGroup(ctx, job)
+	require.NoError(t, err)
+	require.False(t, found, "never guess the old source from a different current owner")
 }

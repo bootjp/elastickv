@@ -24,6 +24,7 @@ const (
 	defaultSplitMigrationLockProbeLimit    = 1024
 	defaultSplitMigrationReadFenceGrace    = 30 * time.Second
 	defaultSplitMigrationVoterProbeTimeout = 500 * time.Millisecond
+	defaultSplitMigrationCopyTimeout       = 2 * time.Second
 	splitCleanupCursorVersion              = byte(1)
 	splitVoterAckCursorVersion             = byte(1)
 	splitCleanupCursorHeaderBytes          = 5
@@ -196,7 +197,7 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 }
 
 // backfillSplitJobSourceGroup records SourceGroupID on a job that predates the
-// field, while the live route shape can still supply it.
+// field, using current routes or retained catalog ancestry.
 //
 // InitializeSplitJobPlan fills the field for every job it creates, but it runs
 // only at plan time: a job persisted by an earlier binary decodes as zero and is
@@ -212,10 +213,9 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 // ErrMigrationSourceRouteChanged on every attempt and held the job, its guards
 // and its retention pin indefinitely.
 //
-// Backfilling before the phase runs closes the window, because while the job is
-// still progressing the route shape does resolve, so the durable value is
-// written long before anything needs it. The write is a no-op once the field is
-// set, and is skipped for phases that will never read it.
+// The historical fallback also repairs jobs already in that degraded state.
+// The write is a no-op once the field is set, and is skipped for phases that
+// will never read it.
 func (s *DistributionServer) backfillSplitJobSourceGroup(
 	ctx context.Context,
 	job distribution.SplitJob,
@@ -228,6 +228,12 @@ func (s *DistributionServer) backfillSplitJobSourceGroup(
 		return job, err
 	}
 	groupID, needed := splitJobSourceGroupBackfill(snapshot.Routes, job)
+	if !needed {
+		groupID, needed, err = s.legacySplitJobSourceGroup(ctx, job)
+		if err != nil {
+			return job, err
+		}
+	}
 	if !needed {
 		return job, nil
 	}
@@ -245,6 +251,26 @@ func (s *DistributionServer) backfillSplitJobSourceGroup(
 	}
 	job.SourceGroupID = groupID
 	return job, nil
+}
+
+// A current predecessor may itself have migrated. Recover the original owner
+// from catalog ancestry instead of guessing from its present-day group.
+func (s *DistributionServer) legacySplitJobSourceGroup(ctx context.Context, job distribution.SplitJob) (uint64, bool, error) {
+	var lastErr error
+	for _, ts := range []uint64{job.SnapshotTS, job.FenceTS} {
+		if ts == 0 {
+			continue
+		}
+		snapshot, err := s.loadCatalogSnapshotAt(ctx, ts)
+		if err != nil {
+			lastErr = err
+			continue
+		}
+		if groupID, needed := splitJobSourceGroupBackfill(snapshot.Routes, job); needed {
+			return groupID, true, nil
+		}
+	}
+	return 0, false, lastErr
 }
 
 // splitJobSourceGroupBackfill decides whether job needs its SourceGroupID
@@ -1038,6 +1064,8 @@ func (s *DistributionServer) copySplitJobPhase(
 	minCommitTS uint64,
 	maxCommitTS uint64,
 ) error {
+	ctx, cancel := context.WithTimeout(ctx, defaultSplitMigrationCopyTimeout)
+	defer cancel()
 	if maxCommitTS == 0 {
 		return errors.New("split migration copy upper timestamp is zero")
 	}
@@ -1255,19 +1283,12 @@ func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job dist
 	if err != nil {
 		return err
 	}
-	source, minAdmittedTS, ackCursor, complete, err := s.applySplitJobFenceBarrier(ctx, job, snapshot, sourceRoute)
+	source, minAdmittedTS, ackCursor, complete, err := s.drainedSplitJobFenceBarrier(ctx, job, snapshot, sourceRoute)
 	if err != nil {
 		return err
 	}
 	if !complete {
 		return s.persistSplitJobFenceAck(ctx, job.JobID, ackCursor)
-	}
-	pendingLocks, err := splitJobPendingLocks(ctx, source, job.SplitKey, sourceRoute.End)
-	if err != nil {
-		return err
-	}
-	if pendingLocks {
-		return nil
 	}
 	issued, err := source.IssueMigrationTimestamp(ctx, &pb.IssueMigrationTimestampRequest{})
 	if err != nil {
@@ -1277,6 +1298,28 @@ func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job dist
 		return errors.New("split migration source issued an invalid fence timestamp")
 	}
 	return s.commitSplitJobFenceState(ctx, job, snapshot.Version, minAdmittedTS, ackCursor, issued.GetTimestamp())
+}
+
+func (s *DistributionServer) drainedSplitJobFenceBarrier(
+	ctx context.Context,
+	job distribution.SplitJob,
+	snapshot distribution.CatalogSnapshot,
+	sourceRoute distribution.RouteDescriptor,
+) (SplitMigrationClient, uint64, []byte, bool, error) {
+	source, minimum, cursor, complete, err := s.applySplitJobFenceBarrier(ctx, job, snapshot, sourceRoute)
+	if err != nil || !complete {
+		return source, minimum, cursor, complete, err
+	}
+	pending, err := splitJobPendingLocks(ctx, source, job.SplitKey, sourceRoute.End)
+	if err != nil {
+		return nil, 0, nil, false, err
+	}
+	if pending {
+		return source, minimum, cursor, false, nil
+	}
+	// Reapplying the identical Raft control preserves and reads the tracker
+	// minimum after every pre-fence transaction has released its lock.
+	return s.applySplitJobFenceBarrier(ctx, job, snapshot, sourceRoute)
 }
 
 func (s *DistributionServer) applySplitJobFenceBarrier(

@@ -5,6 +5,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -44,6 +45,28 @@ func TestPendingTxnLocksInRouteFiltersLocksByRouteKey(t *testing.T) {
 	require.Equal(t, uint64(101), pending[0].CommitTS)
 	require.True(t, pending[0].IsPrimaryKey)
 	require.Equal(t, txnLockKey(itemKey), pending[0].LockKey)
+}
+
+func TestPendingTxnLocksInRouteIncludesS3AuxiliaryOwnership(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	start := s3keys.RoutePrefixForBucketAnyGeneration("moving-bucket")
+	end := append(bytes.Clone(start), 0xff)
+	keys := [][]byte{s3keys.BucketMetaKey("moving-bucket"), s3keys.BucketGenerationKey("moving-bucket")}
+	for _, key := range append(keys, s3keys.BucketMetaKey("outside-bucket")) {
+		require.NoError(t, st.PutAt(ctx, txnLockKey(key), encodeTxnLock(txnLock{StartTS: 11, PrimaryKey: key}), 1, 0))
+	}
+	for _, key := range keys {
+		require.False(t, keyInMigrationRouteRange(routeKey(key), start, end), "raw auxiliary keys must not accidentally satisfy the test")
+	}
+	pending, err := PendingTxnLocksInRoute(ctx, st, start, end, ^uint64(0), 10)
+	require.NoError(t, err)
+	var got [][]byte
+	for _, entry := range pending {
+		got = append(got, entry.UserKey)
+	}
+	require.ElementsMatch(t, keys, got)
 }
 
 func TestPendingTxnLocksInRouteHonorsCanceledContext(t *testing.T) {

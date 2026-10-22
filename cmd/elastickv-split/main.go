@@ -35,8 +35,8 @@ import (
 )
 
 const (
-	rpcTimeout         = 10 * time.Second
-	maxAdminTokenBytes = 4 << 10
+	rpcTimeout             = 10 * time.Second
+	maxMigrationTokenBytes = 4 << 10
 )
 
 var (
@@ -47,7 +47,7 @@ var (
 	targetGroupID   = flag.Uint64("target-group-id", 0, "Target Raft group for an asynchronous cross-group migration; zero uses the existing same-group split")
 	abandonJobID    = flag.Uint64("abandon-job-id", 0, "Abandon a pre-cutover migration job; mutually exclusive with split flags")
 	getJobID        = flag.Uint64("get-job-id", 0, "Print one migration job; mutually exclusive with mutation flags")
-	tokenFile       = flag.String("token-file", "", "File containing the admin bearer token for migration operations")
+	tokenFile       = flag.String("token-file", "", "File containing the dedicated migration controller bearer token; not the read-only Admin token")
 	tlsCAFile       = flag.String("tls-ca-file", "", "PEM CA certificates for verified gRPC TLS; token-file always requires TLS (system roots if omitted)")
 )
 
@@ -121,7 +121,7 @@ func splitDialOptions() ([]grpc.DialOption, error) {
 	}
 	opts = append(opts, grpc.WithTransportCredentials(creds))
 	if *tokenFile != "" {
-		token, err := internalutil.LoadBearerTokenFile(*tokenFile, maxAdminTokenBytes, "admin token")
+		token, err := internalutil.LoadBearerTokenFile(*tokenFile, maxMigrationTokenBytes, "migration token")
 		if err != nil {
 			return nil, errors.Wrap(err, "load split migration token")
 		}
