@@ -11,6 +11,7 @@ import (
 	"sync/atomic"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -70,7 +71,8 @@ type kvFSM struct {
 	// cutoverSource provides the writer-side view of the Phase-2
 	// envelope cutover index for snapshot v1/v2 selection (Stage
 	// 8a §3.3). nil = always v1 output.
-	cutoverSource CutoverSource
+	cutoverSource        CutoverSource
+	encryptionCheckpoint encryption.SnapshotCheckpoint
 	// snapLatch enforces the §3.3 no-downgrade invariant: once a
 	// non-zero cutover is observed, all subsequent snapshots from
 	// this FSM emit v2 even if the sidecar later reads 0.
@@ -1025,13 +1027,14 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 		cutover = f.cutoverSource.RaftEnvelopeCutoverIndex()
 	}
 	emitted := f.snapLatch.observe(cutover)
-	useV2 := emitted != 0 || f.snapLatch.latched()
+	useV2 := emitted != 0 || f.snapLatch.latched() || f.encryptionCheckpoint.Index != 0
 
 	return &kvFSMSnapshot{
-		snapshot:  snapshot,
-		ceilingMs: hlcCeilingFromHLC(f.hlc),
-		cutover:   emitted,
-		useV2:     useV2,
+		snapshot:   snapshot,
+		ceilingMs:  hlcCeilingFromHLC(f.hlc),
+		cutover:    emitted,
+		useV2:      useV2,
+		checkpoint: f.encryptionCheckpoint,
 	}, nil
 }
 
@@ -1047,7 +1050,7 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	if !ok {
 		br = bufio.NewReader(r)
 	}
-	ceilingU, cutover, err := ReadSnapshotHeader(br)
+	ceilingU, cutover, checkpoint, err := ReadSnapshotHeaderWithCheckpoint(br)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -1061,6 +1064,7 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	if err := f.store.Restore(io.NopCloser(br)); err != nil {
 		return errors.WithStack(err)
 	}
+	f.encryptionCheckpoint = checkpoint
 	// Volatile pins do not travel in a snapshot, and the entries that would
 	// have released them are compacted away by the time this replica installs
 	// one. A pin this node applied before falling behind would otherwise keep
