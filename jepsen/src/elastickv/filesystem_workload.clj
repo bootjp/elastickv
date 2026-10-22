@@ -528,7 +528,7 @@
         (assoc op :type :ok :value (independent/tuple k kind) :error (io-error-label e))
         (fail op (io-error-label e))))))
 
-(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount node mount-dir local?]
+(defrecord FilesystemClient [node->mount-dir write-mode key-count max-retries require-fuse-mount setup-lock node mount-dir local?]
   client/Client
   (open! [this test node]
     (let [dir (or (get node->mount-dir node)
@@ -542,11 +542,14 @@
     (let [keys (range key-count)]
       (when (and local? require-fuse-mount)
         (require-local-fuse-mount! mount-dir))
-      (with-retries max-retries
-        (fn []
-          (if local?
-            (local-setup! mount-dir keys)
-            (remote-exec! test node (remote-setup-cmd mount-dir keys)))))))
+      (if local?
+        ;; Every local client sees the same mounted filesystem. Serialize
+        ;; setup writes to avoid self-conflicts, while still resetting the
+        ;; registers each time setup is called for a new test.
+        (locking setup-lock
+          (with-retries max-retries #(local-setup! mount-dir keys)))
+        (with-retries max-retries
+          #(remote-exec! test node (remote-setup-cmd mount-dir keys))))))
 
   (teardown! [_this test]
     ;; Jepsen runs teardown! before setup! and again after the test, so the
@@ -657,7 +660,7 @@
         require-fuse    (if (contains? opts :require-fuse-mount) (boolean (:require-fuse-mount opts)) true)
         node->dir       (or (:node->mount-dir opts)
                             (node->mount-dir default-nodes nil default-mount-dir))
-        client          (->FilesystemClient node->dir write-mode key-count max-retries require-fuse nil nil false)]
+        client          (->FilesystemClient node->dir write-mode key-count max-retries require-fuse (Object.) nil nil false)]
     (when-not (contains? write-modes write-mode)
       (throw (ex-info "unknown write mode" {:write-mode write-mode})))
     {:client    client

@@ -98,6 +98,27 @@ func TestApplyMutationsRaftAt_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, []byte("v1"), val)
 }
 
+func TestApplyMutationsRaftAt_DistinctEntryWithSameTimestampIsNotReplay(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	key := []byte("jepsen-list")
+	itemKey := ListItemKey(key, 43)
+	deltaKey := ListMetaDeltaKey(key, 100, 0)
+	appendAt := func(value string) []*KVPairMutation {
+		return []*KVPairMutation{
+			{Op: OpTypePut, Key: itemKey, Value: []byte(value)},
+			{Op: OpTypePut, Key: deltaKey, Value: MarshalListMetaDelta(ListMetaDelta{LenDelta: 1})},
+		}
+	}
+
+	require.NoError(t, st.ApplyMutationsRaftAt(ctx, appendAt("45"), nil, 99, 100, 10))
+	err := st.ApplyMutationsRaftAt(ctx, appendAt("44"), nil, 99, 100, 11)
+	require.ErrorIs(t, err, ErrWriteConflict, "a distinct append must not be acknowledged as a replay")
+	got, err := st.GetAt(ctx, itemKey, 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("45"), got)
+}
+
 func TestPromoteVersions_BundlesMetaAppliedIndex(t *testing.T) {
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
@@ -257,7 +278,7 @@ func TestRetireMigrationRaft_BundlesMetaAppliedIndex(t *testing.T) {
 	require.Equal(t, []byte("v100"), val, "retirement must leave imported data intact")
 }
 
-func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.T) {
+func TestApplyMutationsRaftAt_EqualVersionWithoutRaftIndexIsNotReplay(t *testing.T) {
 	ctx := context.Background()
 	st := newApplyIndexPebbleStore(t)
 	ps := pebbleStoreApplied(t, st)
@@ -277,12 +298,12 @@ func TestApplyMutationsRaftAt_AlreadyLandedAdvancesStaleAppliedIndex(t *testing.
 	binary.LittleEndian.PutUint64(staleAppliedIndex[:], entryIdx-1)
 	require.NoError(t, ps.db.Set(metaAppliedIndexBytes, staleAppliedIndex[:], pebble.Sync))
 
-	require.NoError(t, ps.ApplyMutationsRaftAt(ctx, muts, nil, startTS, commitTS, entryIdx))
+	require.ErrorIs(t, ps.ApplyMutationsRaftAt(ctx, muts, nil, startTS, commitTS, entryIdx), ErrWriteConflict)
 
 	got, present, err := ps.LastAppliedIndex()
 	require.NoError(t, err)
 	require.True(t, present)
-	require.Equal(t, entryIdx, got)
+	require.Equal(t, entryIdx-1, got)
 
 	val, err := ps.GetAt(ctx, []byte("k1"), commitTS)
 	require.NoError(t, err)
