@@ -94,10 +94,10 @@ func (s *pebbleStore) ApplyTargetStagedReadinessAt(_ context.Context, state Targ
 	if err := validateTargetStagedReadinessState(state); err != nil {
 		return err
 	}
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	writeAppliedIndex, err := s.shouldWriteAppliedIndexLocked(appliedIndex)
 	if err != nil {

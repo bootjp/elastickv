@@ -91,10 +91,10 @@ func (s *pebbleStore) CleanupVersions(ctx context.Context, opts CleanupVersionsO
 	if opts.MaxVersions <= 0 {
 		return CleanupVersionsResult{Done: true}, nil
 	}
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	exported, err := s.exportVersionsLocked(ctx, cleanupExportOptions(opts))
 	if err != nil {
@@ -122,10 +122,10 @@ func (s *pebbleStore) ClearMigrationState(_ context.Context, jobID, appliedIndex
 	if jobID == 0 {
 		return errors.New("migration cleanup job id is required")
 	}
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	metadata, err := s.migrationMetadataWithoutJob(jobID)
 	if err != nil {

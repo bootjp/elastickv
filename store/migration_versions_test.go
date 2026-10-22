@@ -7,6 +7,7 @@ import (
 	"math"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/pebble/v2"
@@ -1864,4 +1865,75 @@ func TestClearMigrationStateRemovesPerJobProofs(t *testing.T) {
 			require.NotEqual(t, uint64(7), state.JobID)
 		}
 	})
+}
+
+func TestPebbleMigrationApplyPathsAcquireApplyMuBeforeDBMu(t *testing.T) {
+	dir := t.TempDir()
+	st, err := NewPebbleStore(dir)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	pebble := st.(*pebbleStore)
+
+	tests := []struct {
+		name string
+		run  func() error
+	}{
+		{
+			name: "cleanup versions",
+			run: func() error {
+				_, cleanupErr := pebble.CleanupVersions(context.Background(), CleanupVersionsOptions{
+					MaxVersions: 1,
+				})
+				return cleanupErr
+			},
+		},
+		{
+			name: "clear migration state",
+			run: func() error {
+				return pebble.ClearMigrationState(context.Background(), 1, 0)
+			},
+		},
+		{
+			name: "apply target readiness",
+			run: func() error {
+				return pebble.ApplyTargetStagedReadinessAt(context.Background(), TargetStagedReadinessState{
+					JobID:                  1,
+					RouteStart:             []byte("a"),
+					RouteEnd:               []byte("z"),
+					ExpectedCutoverVersion: 2,
+					MigrationJobID:         1,
+					MinWriteTSExclusive:    10,
+					Armed:                  true,
+				}, 1)
+			},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			pebble.applyMu.Lock()
+			started := make(chan struct{})
+			done := make(chan error, 1)
+			go func() {
+				close(started)
+				done <- tt.run()
+			}()
+			<-started
+
+			deadline := time.Now().Add(time.Second)
+			acquiredDB := false
+			for time.Now().Before(deadline) {
+				if pebble.dbMu.TryLock() {
+					pebble.dbMu.Unlock()
+					acquiredDB = true
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			pebble.applyMu.Unlock()
+
+			require.True(t, acquiredDB, "operation held dbMu while waiting for applyMu")
+			require.NoError(t, <-done)
+		})
+	}
 }
