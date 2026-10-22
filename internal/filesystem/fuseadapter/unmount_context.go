@@ -19,6 +19,9 @@ func (s *Server) UnmountContext(ctx context.Context) error {
 	if s.inner == nil || s.isReleased() || s.mountPoint == "" {
 		return nil
 	}
+	// Ordinary unmount can succeed before backend handlers leave Serve.
+	// Cancel their common parent before the lifecycle can close stores.
+	defer s.fs.cancelInFlight()
 	return unmountFUSEMount(ctx, s.mountPoint, s.fsType)
 }
 

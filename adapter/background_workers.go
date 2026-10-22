@@ -12,7 +12,10 @@ import (
 // counted in an inflightGate so the server's Stop can join it, bounded,
 // before the stores close underneath it. Stop cancels jobs already started
 // once the bound has passed; reservations that commit later get a live
-// timeout and stay counted in the final join. A nil *backgroundWorkers
+// timeout and stay counted in the final join. Reservations cannot start
+// cleanup after that final join ends. This bounded drain does not provide
+// durable recovery of cleanup for mutations that outlive shutdown.
+// A nil *backgroundWorkers
 // runs every job detached under context.Background() and has nothing to
 // stop, which keeps zero-value servers in tests working.
 type backgroundWorkers struct {
@@ -21,6 +24,7 @@ type backgroundWorkers struct {
 	cancel  context.CancelFunc
 	mu      sync.Mutex
 	running map[*backgroundReservation]context.CancelFunc
+	closed  bool
 }
 
 func newBackgroundWorkers() *backgroundWorkers {
@@ -33,6 +37,7 @@ func newBackgroundWorkers() *backgroundWorkers {
 // stop began in between: stop waits for the slot as for a running job. The
 // holder either starts the job through it or releases it.
 type backgroundReservation struct {
+	mu   sync.Mutex
 	w    *backgroundWorkers
 	used bool
 }
@@ -49,6 +54,8 @@ func (w *backgroundWorkers) reserve() (*backgroundReservation, bool) {
 // start runs run on its own goroutine under a context bounded by timeout,
 // handing it the reserved slot. A reservation starts at most one job.
 func (r *backgroundReservation) start(timeout time.Duration, run func(ctx context.Context)) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.used {
 		return
 	}
@@ -56,6 +63,12 @@ func (r *backgroundReservation) start(timeout time.Duration, run func(ctx contex
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	if r.w != nil {
 		r.w.mu.Lock()
+		if r.w.closed {
+			r.w.mu.Unlock()
+			cancel()
+			r.w.gate.exit()
+			return
+		}
 		r.w.running[r] = cancel
 		r.w.mu.Unlock()
 	}
@@ -76,6 +89,8 @@ func (r *backgroundReservation) start(timeout time.Duration, run func(ctx contex
 // release gives back a slot no job was started through; it is a no-op once
 // start ran or after an earlier release.
 func (r *backgroundReservation) release() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	if r.used {
 		return
 	}
@@ -95,6 +110,7 @@ func (w *backgroundWorkers) stop(name string, timeout, joinTimeout time.Duration
 	if w == nil {
 		return
 	}
+	defer w.closeReservations()
 	finished := w.gate.drain(timeout)
 	w.cancelRunning()
 	if finished {
@@ -109,6 +125,15 @@ func (w *backgroundWorkers) stop(name string, timeout, joinTimeout time.Duration
 			slog.Int64("in_flight", w.gate.remaining()),
 			slog.Duration("timeout", joinTimeout),
 		)
+	}
+}
+
+func (w *backgroundWorkers) closeReservations() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	w.closed = true
+	for _, cancel := range w.running {
+		cancel()
 	}
 }
 
