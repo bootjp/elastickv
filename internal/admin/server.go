@@ -245,7 +245,13 @@ func buildSqsHandlerForDeps(deps ServerDeps, logger *slog.Logger) http.Handler {
 	}
 	return NewSqsHandler(deps.Queues).
 		WithLogger(logger).
-		WithRoleStore(MapRoleStore(deps.Roles))
+		WithRoleStore(MapRoleStore(deps.Roles)).
+		// Taken from the source rather than wired separately, so the
+		// handler's pre-dispatch rejections land on the SAME counters the
+		// adapter records through. Separate wiring could silently diverge,
+		// and a metric assembled from two halves that disagree is worse
+		// than one with a known gap.
+		WithAdminQueueObserver(adminQueueObserverFrom(deps.Queues))
 }
 
 // Handler returns an http.Handler that serves the full admin surface.
