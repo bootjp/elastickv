@@ -30,6 +30,7 @@ const (
 	mvccSnapshotVersionV3 = uint32(3)
 	mvccSnapshotVersionV4 = uint32(4)
 	mvccSnapshotVersionV5 = uint32(5)
+	mvccSnapshotVersionV6 = uint32(6)
 	maxSnapshotKeySize    = 1 << 20 // 1 MiB per logical key
 	// maxSnapshotInternalKeyEnvelope reserves snapshot headroom for internal
 	// stored-key envelopes such as migration staging. Logical source keys keep
@@ -90,6 +91,7 @@ type mvccStore struct {
 	migrationPromotions map[uint64]PromotionState
 	migrationReadiness  map[uint64]TargetStagedReadinessState
 	migrationRetired    map[uint64]struct{}
+	migrationOwnership  []MigrationOwnershipState
 	// migrationReadinessCache is the snapshot-order projection of
 	// migrationReadiness; it is what the V4 trailer serialises.
 	migrationReadinessCache []TargetStagedReadinessState
@@ -950,6 +952,9 @@ func (s *mvccStore) writeSnapshotFile(f *os.File) error {
 
 	version := mvccSnapshotVersionForState(
 		s.migrationAcks, s.migrationHLCFloors, s.migrationPromotions, s.migrationReadinessCache, s.migrationRetired)
+	if len(s.migrationOwnership) > 0 {
+		version = mvccSnapshotVersionV6
+	}
 	checksumOffset, err := writeMVCCSnapshotHeader(f, version)
 	if err != nil {
 		return err
@@ -1023,6 +1028,7 @@ func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32,
 		s.migrationPromotions,
 		s.migrationReadinessCache,
 		s.migrationRetired,
+		s.migrationOwnership,
 	); err != nil {
 		return 0, err
 	}
@@ -1056,6 +1062,7 @@ func writeMVCCSnapshotMetadata(
 	migrationPromotions map[uint64]PromotionState,
 	migrationReadiness []TargetStagedReadinessState,
 	migrationRetired map[uint64]struct{},
+	migrationOwnership ...[]MigrationOwnershipState,
 ) error {
 	if err := binary.Write(w, binary.LittleEndian, lastCommitTS); err != nil {
 		return errors.WithStack(err)
@@ -1087,7 +1094,21 @@ func writeMVCCSnapshotMetadata(
 	if version < mvccSnapshotVersionV5 {
 		return nil
 	}
-	return writeMVCCSnapshotBytes(w, encodeMigrationRetiredJobs(migrationRetired))
+	if err := writeMVCCSnapshotBytes(w, encodeMigrationRetiredJobs(migrationRetired)); err != nil {
+		return err
+	}
+	if version < mvccSnapshotVersionV6 {
+		return nil
+	}
+	var ownership []MigrationOwnershipState
+	if len(migrationOwnership) > 0 {
+		ownership = migrationOwnership[0]
+	}
+	data, err := encodeMigrationOwnership(ownership)
+	if err != nil {
+		return err
+	}
+	return writeMVCCSnapshotBytes(w, data)
 }
 
 // writeMVCCSnapshotReadinessStates emits the V4 trailer: a count followed by
@@ -1230,6 +1251,7 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.migrationPromotions = meta.promotions
 	s.migrationReadiness = targetReadinessStateMap(meta.readiness)
 	s.migrationRetired = meta.retired
+	s.migrationOwnership = meta.ownership
 	s.migrationReadinessCache = cloneTargetStagedReadinessStates(meta.readiness)
 	return nil
 }
@@ -1250,7 +1272,7 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	if version != mvccSnapshotVersionV1 &&
 		version != mvccSnapshotVersionV2 &&
 		version != mvccSnapshotVersionV3 &&
-		version != mvccSnapshotVersionV4 && version != mvccSnapshotVersionV5 {
+		version != mvccSnapshotVersionV4 && version != mvccSnapshotVersionV5 && version != mvccSnapshotVersionV6 {
 		return 0, 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
 	}
 
@@ -1337,12 +1359,24 @@ func readMVCCSnapshotMetadata(
 		}
 	}
 
+	var ownership []MigrationOwnershipState
+	if version >= mvccSnapshotVersionV6 {
+		data, readErr := readMVCCSnapshotBytes(r, "snapshot migration ownership")
+		if readErr != nil {
+			return 0, 0, mvccSnapshotMigrationMetadata{}, readErr
+		}
+		ownership, err = decodeMigrationOwnership(data)
+		if err != nil {
+			return 0, 0, mvccSnapshotMigrationMetadata{}, err
+		}
+	}
 	return lastCommitTS, minRetainedTS, mvccSnapshotMigrationMetadata{
 		acks:       migrationAcks,
 		floors:     migrationHLCFloors,
 		promotions: migrationPromotions,
 		readiness:  migrationReadiness,
 		retired:    retired,
+		ownership:  ownership,
 	}, nil
 }
 
@@ -1358,6 +1392,7 @@ type mvccSnapshotMigrationMetadata struct {
 	promotions map[uint64]PromotionState
 	readiness  []TargetStagedReadinessState
 	retired    map[uint64]struct{}
+	ownership  []MigrationOwnershipState
 }
 
 func emptyMVCCSnapshotMigrationMetadata() mvccSnapshotMigrationMetadata {

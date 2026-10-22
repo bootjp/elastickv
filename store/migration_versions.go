@@ -10,6 +10,17 @@ import (
 	"github.com/emirpasic/gods/maps/treemap"
 )
 
+// MigrationPagePayloadBudget leaves framing headroom in the 64 MiB peer
+// transport. A source tracker admits only versions that fit even with a
+// full-key cursor, so delta copy cannot discover an untransferable new row.
+const MigrationPagePayloadBudget = 63 << 20
+
+func MigrationVersionFitsTransfer(key, value []byte) bool {
+	const cursorAndFramingBytes = 128
+	return len(key) <= (MigrationPagePayloadBudget-cursorAndFramingBytes)/2 &&
+		len(value) <= MigrationPagePayloadBudget-cursorAndFramingBytes-2*len(key)
+}
+
 const (
 	exportCursorTagEmitted byte = iota
 	exportCursorTagScanned
@@ -213,7 +224,8 @@ func migrationReadyKey(jobID uint64) []byte {
 }
 
 func isMigrationMetadataKey(rawKey []byte) bool {
-	return bytes.Equal(rawKey, migrationRetiredMetaKeyBytes) ||
+	return bytes.Equal(rawKey, migrationOwnershipMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationRetiredMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes) ||
@@ -378,6 +390,9 @@ func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, boo
 }
 
 func validateImportVersion(version MVCCVersion) error {
+	if IsMigrationOwnershipMetadataKey(version.Key) {
+		return errors.Wrap(ErrInvalidImportVersion, "migration cannot import ownership metadata")
+	}
 	if bytes.Equal(version.Key, migrationRetiredMetaKeyBytes) {
 		return errors.Wrap(ErrInvalidImportVersion, "migration cannot import retirement metadata")
 	}

@@ -47,6 +47,20 @@ type ApplyIndexAware interface {
 	SetApplyIndex(idx uint64)
 }
 
+// AppliedConfigurationAware records the actual ConfChange index on the serial
+// apply loop before its FSM snapshot is captured. Unlike Status.ConfigurationIndex,
+// this value must survive snapshots without becoming the snapshot's data index.
+type AppliedConfigurationAware interface {
+	RecordAppliedConfiguration(index uint64) error
+	AppliedConfigurationIndex() uint64
+}
+
+// AppliedConfigurationReader identifies runtimes that supply the ordered hook.
+// A copied metadata row alone does not prove that the running engine supports it.
+type AppliedConfigurationReader interface {
+	AppliedConfigurationIndex() (uint64, bool)
+}
+
 // AppliedIndexReader is an OPTIONAL extension that lets the engine
 // query the FSM's durable applied-index for the cold-start skip gate.
 // See docs/design/2026_06_02_implemented_idempotent_snapshot_restore.md §3.

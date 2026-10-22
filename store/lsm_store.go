@@ -463,6 +463,10 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		cleanupOnInitFail()
 		return nil, err
 	}
+	if _, err := s.readMigrationOwnership(); err != nil {
+		cleanupOnInitFail()
+		return nil, err
+	}
 	s.lastCommitTS = maxTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
@@ -731,6 +735,13 @@ func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error
 		return errors.WithStack(err)
 	}
 	if err := batch.Set(migrationRetiredMetaKeyBytes, encodeMigrationRetiredJobs(meta.migrationRetired), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	ownership, err := encodeMigrationOwnership(meta.migrationOwnership)
+	if err != nil {
+		return err
+	}
+	if err := batch.Set(migrationOwnershipMetaKeyBytes, ownership, nil); err != nil {
 		return errors.WithStack(err)
 	}
 	// Readiness states live one row per job rather than in a single meta key,
@@ -3527,6 +3538,7 @@ type streamingMVCCRestoreMetadata struct {
 	migrationPromotions map[uint64]PromotionState
 	migrationReadiness  []TargetStagedReadinessState
 	migrationRetired    map[uint64]struct{}
+	migrationOwnership  []MigrationOwnershipState
 }
 
 func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, streamingMVCCRestoreMetadata, error) {
@@ -3549,6 +3561,7 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 		migrationPromotions: snapshotMeta.promotions,
 		migrationReadiness:  snapshotMeta.readiness,
 		migrationRetired:    snapshotMeta.retired,
+		migrationOwnership:  snapshotMeta.ownership,
 	}
 	return body, hash, expectedChecksum, meta, nil
 }
@@ -3677,6 +3690,9 @@ func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSn
 		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
 	if _, err := s.readMigrationRetiredJobs(); err != nil {
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
+	}
+	if _, err := s.readMigrationOwnership(); err != nil {
 		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
 	s.lastCommitTS = lastCommitTS

@@ -77,6 +77,7 @@ const (
 	migrationTxnPrepareEvidenceEnabledKey = migrationTxnMetaPrefix + "prepare_evidence/enabled"
 	migrationTxnPrepareEvidenceGateKey    = migrationTxnMetaPrefix + "prepare_evidence/gate"
 	migrationTxnPrepareEvidenceFloorKey   = migrationTxnMetaPrefix + "prepare_evidence/timestamp_floor"
+	migrationConfigurationIndexKey        = migrationTxnMetaPrefix + "migration_configuration_index"
 	migrationRedisPrefix                  = "!redis|"
 	migrationHashPrefix                   = "!hs|"
 	migrationSetPrefix                    = "!st|"
@@ -248,6 +249,7 @@ var migrationInternalExactKeys = [][]byte{
 	[]byte(migrationTxnPrepareEvidenceEnabledKey),
 	[]byte(migrationTxnPrepareEvidenceGateKey),
 	[]byte(migrationTxnPrepareEvidenceFloorKey),
+	[]byte(migrationConfigurationIndexKey),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.

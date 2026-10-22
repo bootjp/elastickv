@@ -2998,6 +2998,9 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change index=%d", entry.GetIndex())
 	}
+	if err := e.recordFSMConfiguration(entry.GetIndex()); err != nil {
+		return err
+	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
@@ -3019,6 +3022,9 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change v2 index=%d", entry.GetIndex())
 	}
+	if err := e.recordFSMConfiguration(entry.GetIndex()); err != nil {
+		return err
+	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
@@ -3026,6 +3032,22 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	e.clearPendingConfChange(entry.GetIndex())
 	e.setApplied(entry.GetIndex())
 	return nil
+}
+
+func (e *Engine) recordFSMConfiguration(index uint64) error {
+	if aware, ok := e.fsm.(raftengine.AppliedConfigurationAware); ok {
+		return errors.WithStack(aware.RecordAppliedConfiguration(index))
+	}
+	return nil
+}
+
+func (e *Engine) AppliedConfigurationIndex() (uint64, bool) {
+	aware, ok := e.fsm.(raftengine.AppliedConfigurationAware)
+	if !ok {
+		return 0, false
+	}
+	index := aware.AppliedConfigurationIndex()
+	return index, index != 0
 }
 
 // applyNormalEntry decodes the raft envelope, optionally unwraps the

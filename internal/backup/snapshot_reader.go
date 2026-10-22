@@ -276,6 +276,8 @@ var pebbleOperationalKeys = [][]byte{
 	[]byte("_migack"),
 	[]byte("_mighlc"),
 	[]byte("_migpromote"),
+	[]byte("!migstage|retired"),
+	[]byte("!migstage|ownership"),
 }
 
 // Writer-registry rows: mirror internal/encryption.WriterRegistryPrefix,
@@ -310,7 +312,9 @@ func isPebbleOperationalKey(rawKey []byte) bool {
 			return true
 		}
 	}
-	return isPebbleWriterRegistryKey(rawKey)
+	const readinessPrefix = "!migstage|ready|"
+	return isPebbleWriterRegistryKey(rawKey) ||
+		(len(rawKey) == len(readinessPrefix)+snapshotTSSize && bytes.HasPrefix(rawKey, []byte(readinessPrefix)))
 }
 
 // readOneEntry handles one (key, value) tuple plus the callback

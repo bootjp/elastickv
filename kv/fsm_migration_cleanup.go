@@ -38,6 +38,12 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 	if err := proto.Unmarshal(data, req); err != nil {
 		return errors.WithStack(err)
 	}
+	if err := f.verifyMigrationCleanupConfiguration(ctx, req); err != nil {
+		if errors.Is(err, ErrMigrationConfigurationChanged) {
+			return err
+		}
+		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: inspect cleanup configuration"))
+	}
 	cleaner, ok := f.store.(store.MigrationCleaner)
 	if !ok {
 		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrMigrationCleanupApply), "kv/fsm: migration cleanup store"))

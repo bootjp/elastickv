@@ -219,7 +219,7 @@ const (
 	// entries come to tens of kilobytes, so a mebibyte covers them with room
 	// to spare.
 	migrationExportPageFramingHeadroom = 1 << 20
-	migrationExportPageByteBudget      = internal.GRPCMaxMessageBytes - migrationExportPageFramingHeadroom
+	migrationExportPageByteBudget      = store.MigrationPagePayloadBudget
 )
 
 func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.ForwardResponse, error) {
@@ -268,7 +268,22 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 	if req == nil || req.GetJobId() == 0 {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "migration probe job_id is required"))
 	}
-	return i.probeMigrationStateKind(ctx, req)
+	resp, err := i.probeMigrationStateKind(ctx, req)
+	if err != nil {
+		return nil, err
+	}
+	if req.GetRequireConfigurationIndex() {
+		reader, supported := i.leader.(raftengine.AppliedConfigurationReader)
+		if !supported {
+			resp.Ready = false
+			return resp, nil
+		}
+		index, supported := reader.AppliedConfigurationIndex()
+		resp.AppliedConfigurationIndex = index
+		resp.Ready = resp.GetReady() && supported && index != 0 &&
+			(req.GetExpectedConfigurationIndex() == 0 || req.GetExpectedConfigurationIndex() == index)
+	}
+	return resp, nil
 }
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
@@ -788,6 +803,9 @@ func (i *Internal) CleanupMigration(ctx context.Context, req *pb.CleanupMigratio
 	}
 	result, err := i.proposeMigrationCleanup(ctx, req)
 	if err != nil {
+		if errors.Is(err, kv.ErrMigrationConfigurationChanged) {
+			return nil, errors.WithStack(status.Error(codes.Aborted, kv.ErrMigrationConfigurationChanged.Error()))
+		}
 		return nil, errors.WithStack(err)
 	}
 	return &pb.CleanupMigrationResponse{

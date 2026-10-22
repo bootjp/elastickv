@@ -3277,8 +3277,7 @@ func TestDistributionServerCleanupSplitJobSourceProofsWaitsForMetadataBarrier(t 
 	readyVoter := &splitMigrationClientStub{}
 	blockedVoter := &splitMigrationClientStub{
 		probeFn: func(req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
-			require.Equal(t, pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED, req.GetKind())
-			return &pb.ProbeMigrationStateResponse{}, nil
+			return &pb.ProbeMigrationStateResponse{Ready: req.GetKind() != pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED}, nil
 		},
 	}
 	s := NewDistributionServer(
@@ -3678,7 +3677,7 @@ func (s *splitMigrationClientStub) ProbeMigrationState(
 	if s.probeFn != nil {
 		return s.probeFn(req)
 	}
-	return &pb.ProbeMigrationStateResponse{Ready: true, CatalogVersion: req.GetExpectedCatalogVersion()}, nil
+	return &pb.ProbeMigrationStateResponse{Ready: true, CatalogVersion: req.GetExpectedCatalogVersion(), AppliedConfigurationIndex: 1}, nil
 }
 
 func (s *splitMigrationClientStub) IssueMigrationTimestamp(

@@ -84,6 +84,9 @@ func (s *ShardStore) ReadRouteVersion() uint64 {
 }
 
 func (s *ShardStore) awaitReadRouteVersion(ctx context.Context, requested uint64) error {
+	if err := s.verifyMigrationServingFloor(ctx, requested); err != nil {
+		return err
+	}
 	if requested == 0 || s.ReadRouteVersion() >= requested {
 		return nil
 	}
@@ -286,6 +289,9 @@ func (s *ShardStore) GetGroupAt(ctx context.Context, groupID uint64, key []byte,
 }
 
 func (s *ShardStore) getGroupAtWithReadFence(ctx context.Context, groupID uint64, key []byte, ts uint64, readRouteVersion uint64) ([]byte, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return nil, err
+	}
 	g, ok := s.groupForID(groupID)
 	if !ok || g.Store == nil {
 		return nil, store.ErrKeyNotFound
@@ -394,6 +400,9 @@ func (s *ShardStore) routeHasVersionAtOrBefore(ctx context.Context, route distri
 	}
 	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
 		return false, false, nil
+	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return false, true, err
 	}
 	checker, ok := g.Store.(store.VersionPresenceReader)
 	if !ok {
@@ -559,14 +568,14 @@ func (s *ShardStore) targetReadyRoutesForRouteRange(ctx context.Context, g *Shar
 	if g == nil || g.Store == nil {
 		return []distribution.Route{route}, nil
 	}
-	reader, ok := g.Store.(store.MigrationTargetReadinessReader)
-	if !ok {
-		return []distribution.Route{route}, nil
-	}
-	states, err := reader.MigrationTargetReadinessStates(ctx)
+	view, err := readMigrationServingState(ctx, g.Store)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if err := s.verifyMigrationServingRange(view, route, routeStart, routeEnd); err != nil {
+		return nil, err
+	}
+	states := view.Readiness
 	if sourceReadFenceApplies(states, routeStart, routeEnd) {
 		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
@@ -2927,6 +2936,11 @@ func (s *ShardStore) routeHasVersionsAtOrBefore(
 	}
 	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
 		return out, false, nil
+	}
+	for _, key := range keys {
+		if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+			return out, true, err
+		}
 	}
 	exists, err := versionsExistAtOrBefore(ctx, g.Store, keys, ts)
 	return exists, true, errors.WithStack(err)

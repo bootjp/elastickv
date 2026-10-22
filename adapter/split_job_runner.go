@@ -27,6 +27,7 @@ const (
 	defaultSplitMigrationAttemptTimeout    = 2 * time.Second
 	splitCleanupCursorVersion              = byte(1)
 	splitVoterAckCursorVersion             = byte(1)
+	splitVoterAckConfigurationVersion      = byte(2)
 	splitCleanupCursorHeaderBytes          = 5
 	splitJobHistoryLimit                   = 1000
 	splitJobHistoryDeleteBatchLimit        = 1000
@@ -41,9 +42,10 @@ var (
 )
 
 type splitVoterAck struct {
-	id      string
-	address string
-	acked   bool
+	id                 string
+	address            string
+	acked              bool
+	configurationIndex uint64
 }
 
 func splitMigrationVoterBarrierIncompleteError(jobID uint64, kind pb.MigrationStateProbeKind) error {
@@ -74,8 +76,16 @@ func (s *DistributionServer) syncSplitMigrationVoterBarrier(
 		if probeErr == nil {
 			acked = resp.GetReady()
 		}
+		index := resp.GetAppliedConfigurationIndex()
+		if req.GetRequireConfigurationIndex() && (index == 0 ||
+			(req.GetExpectedConfigurationIndex() != 0 && index != req.GetExpectedConfigurationIndex())) {
+			acked = false
+		}
 		complete = complete && acked
-		acks = append(acks, splitVoterAck{id: voter.ID, address: voter.Address, acked: acked})
+		acks = append(acks, splitVoterAck{id: voter.ID, address: voter.Address, acked: acked, configurationIndex: index})
+	}
+	if req.GetRequireConfigurationIndex() && splitCleanupAckConfiguration(acks) == 0 {
+		complete = false
 	}
 	return encodeSplitVoterAckCursor(acks), complete, nil
 }
@@ -119,7 +129,13 @@ func validateSplitMigrationVoters(voters []SplitMigrationVoter) error {
 }
 
 func encodeSplitVoterAckCursor(acks []splitVoterAck) []byte {
-	out := []byte{splitVoterAckCursorVersion}
+	version := splitVoterAckCursorVersion
+	for _, ack := range acks {
+		if ack.configurationIndex != 0 {
+			version = splitVoterAckConfigurationVersion
+		}
+	}
+	out := []byte{version}
 	out = binary.AppendUvarint(out, uint64(len(acks)))
 	for _, ack := range acks {
 		out = binary.AppendUvarint(out, uint64(len(ack.id)))
@@ -131,6 +147,9 @@ func encodeSplitVoterAckCursor(acks []splitVoterAck) []byte {
 		} else {
 			out = append(out, 0)
 		}
+		if version == splitVoterAckConfigurationVersion {
+			out = binary.AppendUvarint(out, ack.configurationIndex)
+		}
 	}
 	return out
 }
@@ -139,7 +158,8 @@ func decodeSplitVoterAckCursor(raw []byte) ([]splitVoterAck, error) {
 	if len(raw) == 0 {
 		return nil, nil
 	}
-	if raw[0] != splitVoterAckCursorVersion {
+	version := raw[0]
+	if version != splitVoterAckCursorVersion && version != splitVoterAckConfigurationVersion {
 		return nil, errors.New("invalid split voter ack cursor version")
 	}
 	raw = raw[1:]
@@ -158,8 +178,15 @@ func decodeSplitVoterAckCursor(raw []byte) ([]splitVoterAck, error) {
 		if err != nil || len(next) == 0 || next[0] > 1 {
 			return nil, errors.New("invalid split voter ack cursor entry")
 		}
-		acks = append(acks, splitVoterAck{id: id, address: address, acked: next[0] == 1})
+		ack := splitVoterAck{id: id, address: address, acked: next[0] == 1}
 		raw = next[1:]
+		if version == splitVoterAckConfigurationVersion {
+			ack.configurationIndex, raw, err = consumeSplitCursorUvarint(raw)
+			if err != nil {
+				return nil, err
+			}
+		}
+		acks = append(acks, ack)
 	}
 	if len(raw) != 0 {
 		return nil, errors.New("split voter ack cursor has trailing bytes")
@@ -453,17 +480,8 @@ func (s *DistributionServer) cleanupVerifiedSplitJob(ctx context.Context, job di
 		}
 		return nil
 	}
-	if !bytes.Equal(job.SourceCutoverAckCursor, splitCleanupDoneCursor) {
-		if err := s.ackSplitJobSourceRouteRemoval(ctx, job); err != nil {
-			return err
-		}
-		return nil
-	}
-	if !bytes.Equal(job.SourceReadDrainCursor, splitCleanupDoneCursor) {
-		if err := s.ackSplitJobSourceReadDrain(ctx, job); err != nil {
-			return err
-		}
-		return nil
+	if complete, err := s.refreshSplitJobSourceCleanupBarriers(ctx, job); err != nil || !complete {
+		return err
 	}
 	if !bytes.Equal(job.Cursor, splitSourceCleanupDoneCursor) {
 		return s.cleanupSplitJobSourceData(ctx, job)
@@ -591,67 +609,97 @@ func (s *DistributionServer) persistSplitJobTargetCleanupCursor(ctx context.Cont
 	})
 }
 
-func (s *DistributionServer) ackSplitJobSourceRouteRemoval(ctx context.Context, job distribution.SplitJob) error {
+func (s *DistributionServer) ackSplitJobSourceRouteRemoval(ctx context.Context, job distribution.SplitJob) (bool, error) {
 	source, _, routeEnd, err := s.splitJobMigrationClients(ctx, job)
 	if err != nil {
-		return err
+		return false, err
 	}
 	sourceGroupID, err := s.splitJobSourceGroupID(ctx, job)
 	if err != nil {
-		return err
+		return false, err
 	}
-	cursor, complete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceGroupID, job.SourceCutoverAckCursor, source, &pb.ProbeMigrationStateRequest{
-		JobId:                  job.JobID,
-		Kind:                   pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED,
-		RouteStart:             job.SplitKey,
-		RouteEnd:               routeEnd,
-		ExpectedCatalogVersion: job.CutoverVersion,
-		ExpectedGroupId:        job.TargetGroupID,
+	cursor, complete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceGroupID, reusableSplitCleanupAckCursor(job.SourceCutoverAckCursor), source, &pb.ProbeMigrationStateRequest{
+		JobId:                     job.JobID,
+		Kind:                      pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED,
+		RouteStart:                job.SplitKey,
+		RouteEnd:                  routeEnd,
+		ExpectedCatalogVersion:    job.CutoverVersion,
+		ExpectedGroupId:           job.TargetGroupID,
+		RequireConfigurationIndex: true,
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
+	if bytes.Equal(cursor, job.SourceCutoverAckCursor) {
+		return complete, nil
+	}
+	err = s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase == distribution.SplitJobPhaseCleanup {
 			current.SourceCutoverAckCursor = distribution.CloneBytes(cursor)
-			if complete {
-				current.SourceCutoverAckCursor = distribution.CloneBytes(splitCleanupDoneCursor)
-			}
 			current.UpdatedAtMs = time.Now().UnixMilli()
 		}
 		return current, nil
 	})
+	return complete, err
 }
 
-func (s *DistributionServer) ackSplitJobSourceReadDrain(ctx context.Context, job distribution.SplitJob) error {
+func (s *DistributionServer) ackSplitJobSourceReadDrain(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	configurationIndex, err := splitCleanupCursorConfiguration(job.SourceCutoverAckCursor)
+	if err != nil {
+		return false, err
+	}
 	source, _, _, err := s.splitJobMigrationClients(ctx, job)
 	if err != nil {
-		return err
+		return false, err
 	}
 	sourceGroupID, err := s.splitJobSourceGroupID(ctx, job)
 	if err != nil {
-		return err
+		return false, err
 	}
 	notBefore := int64(job.PromotionCompletedTS>>kv.HLCLogicalBits) + defaultSplitMigrationReadFenceGrace.Milliseconds() //nolint:gosec // HLC physical millis fit int64.
-	cursor, complete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceGroupID, job.SourceReadDrainCursor, source, &pb.ProbeMigrationStateRequest{
-		JobId:                job.JobID,
-		Kind:                 pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED,
-		ReadDrainNotBeforeMs: notBefore,
-		ReadDrainMinTs:       job.PromotionCompletedTS,
+	cursor, complete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceGroupID, reusableSplitCleanupAckCursor(job.SourceReadDrainCursor), source, &pb.ProbeMigrationStateRequest{
+		JobId:                      job.JobID,
+		Kind:                       pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED,
+		ReadDrainNotBeforeMs:       notBefore,
+		ReadDrainMinTs:             job.PromotionCompletedTS,
+		RequireConfigurationIndex:  true,
+		ExpectedConfigurationIndex: configurationIndex,
 	})
 	if err != nil {
-		return err
+		return false, err
 	}
-	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
+	if bytes.Equal(cursor, job.SourceReadDrainCursor) {
+		return complete, nil
+	}
+	err = s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase == distribution.SplitJobPhaseCleanup {
 			current.SourceReadDrainCursor = distribution.CloneBytes(cursor)
-			if complete {
-				current.SourceReadDrainCursor = distribution.CloneBytes(splitCleanupDoneCursor)
-			}
 			current.UpdatedAtMs = time.Now().UnixMilli()
 		}
 		return current, nil
 	})
+	return complete, err
+}
+
+func reusableSplitCleanupAckCursor(cursor []byte) []byte {
+	if bytes.Equal(cursor, splitCleanupDoneCursor) {
+		return nil
+	}
+	return cursor
+}
+
+func (s *DistributionServer) refreshSplitJobSourceCleanupBarriers(ctx context.Context, job distribution.SplitJob) (bool, error) {
+	complete, err := s.ackSplitJobSourceRouteRemoval(ctx, job)
+	if err != nil || !complete {
+		return false, err
+	}
+	// Route ACK publication may have replaced a legacy cursor or observed a
+	// new configuration. Bind the read-drain ACK to that exact durable proof.
+	job, found, err := s.catalog.SplitJob(ctx, job.JobID)
+	if err != nil || !found {
+		return false, errors.Wrap(errSplitMigrationVoterBarrierIncomplete, "source cleanup job proof unavailable")
+	}
+	return s.ackSplitJobSourceReadDrain(ctx, job)
 }
 
 func (s *DistributionServer) splitJobSourceGroupID(ctx context.Context, job distribution.SplitJob) (uint64, error) {
@@ -680,7 +728,11 @@ func (s *DistributionServer) cleanupSplitJobSourceData(ctx context.Context, job 
 		return err
 	}
 	bracket := brackets[index]
-	resp, err := cleanupSplitMigration(ctx, source, splitMigrationCleanupRequest(job, routeEnd, bracket, cursor, job.FenceTS))
+	req := splitMigrationCleanupRequest(job, routeEnd, bracket, cursor, job.FenceTS)
+	if err := s.bindSplitSourceCleanup(ctx, job, source, routeEnd, req); err != nil {
+		return err
+	}
+	resp, err := cleanupSplitMigration(ctx, source, req)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -745,12 +797,14 @@ func splitMigrationCleanupRequest(job distribution.SplitJob, routeEnd []byte, br
 }
 
 func (s *DistributionServer) cleanupSplitJobSourceProofs(ctx context.Context, job distribution.SplitJob) error {
+	if complete, err := s.refreshSplitJobSourceCleanupBarriers(ctx, job); err != nil || !complete {
+		return err
+	}
 	if err := s.cleanupSplitJobSourceMetadata(ctx, job); err != nil {
 		return err
 	}
 	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase == distribution.SplitJobPhaseCleanup {
-			current.SourceCutoverAckCursor = distribution.CloneBytes(splitCleanupDoneCursor)
 			current.SourceRetentionPinTS = math.MaxUint64
 			current.UpdatedAtMs = time.Now().UnixMilli()
 		}
@@ -903,10 +957,22 @@ func (s *DistributionServer) cleanupSplitJobSourceMetadata(ctx context.Context, 
 	if err != nil {
 		return err
 	}
-	if _, err := cleanupSplitMigration(ctx, source, &pb.CleanupMigrationRequest{
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	_, routeEnd, ok := splitJobSourceRouteState(snapshot.Routes, job)
+	if !ok {
+		return errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
+	}
+	req := &pb.CleanupMigrationRequest{
 		JobId: job.JobID,
 		Mode:  pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA,
-	}); err != nil {
+	}
+	if err := s.bindSplitSourceCleanup(ctx, job, source, routeEnd, req); err != nil {
+		return err
+	}
+	if _, err := cleanupSplitMigration(ctx, source, req); err != nil {
 		return errors.WithStack(err)
 	}
 	_, metadataComplete, err := s.syncSplitMigrationVoterBarrier(ctx, sourceGroupID, nil, source, &pb.ProbeMigrationStateRequest{
@@ -1164,6 +1230,13 @@ func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job dist
 	}
 	if !complete {
 		return s.persistSplitJobBackfillAck(ctx, job.JobID, ackCursor)
+	}
+	// PREPARE entries predating the tracker may still carry large values.
+	// Let them commit without imposing a retroactive limit, then choose the
+	// snapshot so backfill detects every such row before any source fence.
+	pending, err := splitJobPendingLocks(ctx, source, job.SplitKey, parent.End)
+	if err != nil || pending {
+		return err
 	}
 	return s.openSplitJobBackfill(ctx, job, source)
 }

@@ -118,6 +118,7 @@ type kvFSM struct {
 	prepareCreationSealed         atomic.Bool
 	prepareEvidenceReleaseFloor   atomic.Uint64
 	prepareEvidenceTimestampFloor atomic.Uint64
+	migrationConfigurationIndex   atomic.Uint64
 }
 
 // RouteHistory is the kv-side interface to the route catalog's
@@ -468,7 +469,11 @@ func firstOperationalRequestFailure(results []error) error {
 // isRawApplyVerdict reports whether err is a deterministic verdict of the
 // raw apply path, on the FSM side or the store side.
 func isRawApplyVerdict(err error) bool {
+	if errors.Is(err, errTargetReadinessUnproven) {
+		return false
+	}
 	return errors.Is(err, ErrInvalidRequest) ||
+		errors.Is(err, ErrRouteCutoverPending) ||
 		errors.Is(err, ErrUnknownRequestType) ||
 		errors.Is(err, ErrBackupTimestampFenced) ||
 		errors.Is(err, ErrPrepareCreationSealed) ||
@@ -740,6 +745,18 @@ func haltResponseFor(err error) *haltApplyResponse {
 }
 
 func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
+	var err error
+	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
+	if err != nil {
+		return err
+	}
+	ctx, err = f.withMigrationApplyRoutes(ctx, r)
+	if err != nil {
+		return err
+	}
+	if err := f.verifyMigrationValueAdmission(ctx, r); err != nil {
+		return err
+	}
 	if err := f.verifyPrepareCreationGate(r); err != nil {
 		return err
 	}

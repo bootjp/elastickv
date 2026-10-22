@@ -91,7 +91,8 @@ func isTxnInternalKey(key []byte) bool {
 }
 
 func isTxnPeerLocalControlKey(key []byte) bool {
-	return bytes.Equal(key, backupTimestampFloorKey) ||
+	return bytes.Equal(key, migrationConfigurationIndexKey) ||
+		bytes.Equal(key, backupTimestampFloorKey) ||
 		bytes.Equal(key, prepareEvidenceEnabledKey) ||
 		bytes.Equal(key, prepareEvidenceGateKey) ||
 		bytes.Equal(key, prepareEvidenceTimestampFloorKey)

@@ -1865,8 +1865,12 @@ type CleanupMigrationRequest struct {
 	ExcludePrefixes       [][]byte               `protobuf:"bytes,14,rep,name=exclude_prefixes,json=excludePrefixes,proto3" json:"exclude_prefixes,omitempty"`
 	RequiresRouteKeyCheck bool                   `protobuf:"varint,15,opt,name=requires_route_key_check,json=requiresRouteKeyCheck,proto3" json:"requires_route_key_check,omitempty"`
 	RequiresDecodedS3     bool                   `protobuf:"varint,16,opt,name=requires_decoded_s3,json=requiresDecodedS3,proto3" json:"requires_decoded_s3,omitempty"`
-	unknownFields         protoimpl.UnknownFields
-	sizeCache             protoimpl.SizeCache
+	// Source cleanup is conditional on the all-voter ACK configuration, checked
+	// against the FSM's durable ConfChange index before any cleanup side effect.
+	ExpectedConfigurationIndex uint64 `protobuf:"varint,17,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
+	RequireConfigurationIndex  bool   `protobuf:"varint,18,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *CleanupMigrationRequest) Reset() {
@@ -2011,6 +2015,20 @@ func (x *CleanupMigrationRequest) GetRequiresDecodedS3() bool {
 	return false
 }
 
+func (x *CleanupMigrationRequest) GetExpectedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ExpectedConfigurationIndex
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetRequireConfigurationIndex() bool {
+	if x != nil {
+		return x.RequireConfigurationIndex
+	}
+	return false
+}
+
 type CleanupMigrationResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	NextCursor    []byte                 `protobuf:"bytes,1,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
@@ -2105,9 +2123,11 @@ type ProbeMigrationStateRequest struct {
 	// Reads pinned at or below this HLC timestamp were admitted before the
 	// source read fence armed, so only those still block SOURCE_READ_DRAINED.
 	// Zero keeps the legacy behaviour of requiring an empty tracker.
-	ReadDrainMinTs uint64 `protobuf:"varint,14,opt,name=read_drain_min_ts,json=readDrainMinTs,proto3" json:"read_drain_min_ts,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	ReadDrainMinTs             uint64 `protobuf:"varint,14,opt,name=read_drain_min_ts,json=readDrainMinTs,proto3" json:"read_drain_min_ts,omitempty"`
+	RequireConfigurationIndex  bool   `protobuf:"varint,15,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
+	ExpectedConfigurationIndex uint64 `protobuf:"varint,16,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *ProbeMigrationStateRequest) Reset() {
@@ -2238,13 +2258,28 @@ func (x *ProbeMigrationStateRequest) GetReadDrainMinTs() uint64 {
 	return 0
 }
 
+func (x *ProbeMigrationStateRequest) GetRequireConfigurationIndex() bool {
+	if x != nil {
+		return x.RequireConfigurationIndex
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetExpectedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ExpectedConfigurationIndex
+	}
+	return 0
+}
+
 type ProbeMigrationStateResponse struct {
-	state          protoimpl.MessageState `protogen:"open.v1"`
-	Ready          bool                   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
-	CatalogVersion uint64                 `protobuf:"varint,2,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
-	MinAdmittedTs  uint64                 `protobuf:"varint,3,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
-	unknownFields  protoimpl.UnknownFields
-	sizeCache      protoimpl.SizeCache
+	state                     protoimpl.MessageState `protogen:"open.v1"`
+	Ready                     bool                   `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
+	CatalogVersion            uint64                 `protobuf:"varint,2,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	MinAdmittedTs             uint64                 `protobuf:"varint,3,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
+	AppliedConfigurationIndex uint64                 `protobuf:"varint,4,opt,name=applied_configuration_index,json=appliedConfigurationIndex,proto3" json:"applied_configuration_index,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
 }
 
 func (x *ProbeMigrationStateResponse) Reset() {
@@ -2294,6 +2329,13 @@ func (x *ProbeMigrationStateResponse) GetCatalogVersion() uint64 {
 func (x *ProbeMigrationStateResponse) GetMinAdmittedTs() uint64 {
 	if x != nil {
 		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetAppliedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.AppliedConfigurationIndex
 	}
 	return 0
 }
@@ -2515,7 +2557,7 @@ const file_internal_proto_rawDesc = "" +
 	"\troute_end\x18\x02 \x01(\fR\brouteEnd\x12\x14\n" +
 	"\x05limit\x18\x03 \x01(\rR\x05limit\"B\n" +
 	"\x1bProbeMigrationLocksResponse\x12#\n" +
-	"\rpending_count\x18\x01 \x01(\rR\fpendingCount\"\xe8\x04\n" +
+	"\rpending_count\x18\x01 \x01(\rR\fpendingCount\"\xea\x05\n" +
 	"\x17CleanupMigrationRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12)\n" +
 	"\x04mode\x18\x02 \x01(\x0e2\x15.MigrationCleanupModeR\x04mode\x12\x1f\n" +
@@ -2536,14 +2578,16 @@ const file_internal_proto_rawDesc = "" +
 	"\x16exclude_known_internal\x18\r \x01(\bR\x14excludeKnownInternal\x12)\n" +
 	"\x10exclude_prefixes\x18\x0e \x03(\fR\x0fexcludePrefixes\x127\n" +
 	"\x18requires_route_key_check\x18\x0f \x01(\bR\x15requiresRouteKeyCheck\x12.\n" +
-	"\x13requires_decoded_s3\x18\x10 \x01(\bR\x11requiresDecodedS3\"\xbc\x01\n" +
+	"\x13requires_decoded_s3\x18\x10 \x01(\bR\x11requiresDecodedS3\x12@\n" +
+	"\x1cexpected_configuration_index\x18\x11 \x01(\x04R\x1aexpectedConfigurationIndex\x12>\n" +
+	"\x1brequire_configuration_index\x18\x12 \x01(\bR\x19requireConfigurationIndex\"\xbc\x01\n" +
 	"\x18CleanupMigrationResponse\x12\x1f\n" +
 	"\vnext_cursor\x18\x01 \x01(\fR\n" +
 	"nextCursor\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12!\n" +
 	"\fdeleted_rows\x18\x03 \x01(\x04R\vdeletedRows\x12#\n" +
 	"\rdeleted_bytes\x18\x04 \x01(\x04R\fdeletedBytes\x12#\n" +
-	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xee\x04\n" +
+	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xf0\x05\n" +
 	"\x1aProbeMigrationStateRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12,\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x18.MigrationStateProbeKindR\x04kind\x12\x1f\n" +
@@ -2560,11 +2604,14 @@ const file_internal_proto_rawDesc = "" +
 	"\ftrack_writes\x18\v \x01(\bR\vtrackWrites\x12(\n" +
 	"\x10retention_pin_ts\x18\f \x01(\x04R\x0eretentionPinTs\x126\n" +
 	"\x18read_drain_not_before_ms\x18\r \x01(\x03R\x14readDrainNotBeforeMs\x12)\n" +
-	"\x11read_drain_min_ts\x18\x0e \x01(\x04R\x0ereadDrainMinTs\"\x84\x01\n" +
+	"\x11read_drain_min_ts\x18\x0e \x01(\x04R\x0ereadDrainMinTs\x12>\n" +
+	"\x1brequire_configuration_index\x18\x0f \x01(\bR\x19requireConfigurationIndex\x12@\n" +
+	"\x1cexpected_configuration_index\x18\x10 \x01(\x04R\x1aexpectedConfigurationIndex\"\xc4\x01\n" +
 	"\x1bProbeMigrationStateResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
-	"\x0fmin_admitted_ts\x18\x03 \x01(\x04R\rminAdmittedTs\" \n" +
+	"\x0fmin_admitted_ts\x18\x03 \x01(\x04R\rminAdmittedTs\x12>\n" +
+	"\x1bapplied_configuration_index\x18\x04 \x01(\x04R\x19appliedConfigurationIndex\" \n" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +

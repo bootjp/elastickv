@@ -67,7 +67,11 @@ func (s *mvccStore) ClearMigrationState(_ context.Context, jobID, _ uint64) erro
 	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	s.clearMigrationStateLocked(jobID)
+	return nil
+}
 
+func (s *mvccStore) clearMigrationStateLocked(jobID uint64) {
 	for id := range s.migrationAcks {
 		if id.jobID == jobID {
 			delete(s.migrationAcks, id)
@@ -81,7 +85,6 @@ func (s *mvccStore) ClearMigrationState(_ context.Context, jobID, _ uint64) erro
 		s.migrationRetired = make(map[uint64]struct{})
 	}
 	s.migrationRetired[jobID] = struct{}{}
-	return nil
 }
 
 func upsertReadinessCacheWithoutJob(states []TargetStagedReadinessState, jobID uint64) []TargetStagedReadinessState {

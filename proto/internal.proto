@@ -260,6 +260,10 @@ message CleanupMigrationRequest {
   repeated bytes exclude_prefixes = 14;
   bool requires_route_key_check = 15;
   bool requires_decoded_s3 = 16;
+  // Source cleanup is conditional on the all-voter ACK configuration, checked
+  // against the FSM's durable ConfChange index before any cleanup side effect.
+  uint64 expected_configuration_index = 17;
+  bool require_configuration_index = 18;
 }
 
 message CleanupMigrationResponse {
@@ -300,12 +304,15 @@ message ProbeMigrationStateRequest {
   // source read fence armed, so only those still block SOURCE_READ_DRAINED.
   // Zero keeps the legacy behaviour of requiring an empty tracker.
   uint64 read_drain_min_ts = 14;
+  bool require_configuration_index = 15;
+  uint64 expected_configuration_index = 16;
 }
 
 message ProbeMigrationStateResponse {
   bool ready = 1;
   uint64 catalog_version = 2;
   uint64 min_admitted_ts = 3;
+  uint64 applied_configuration_index = 4;
 }
 
 message IssueMigrationTimestampRequest {}
