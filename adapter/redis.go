@@ -1098,6 +1098,15 @@ func (r *RedisServer) validateCmd(cmd redcon.Command) error {
 	return nil
 }
 
-func (r *RedisServer) ping(conn redcon.Conn, _ redcon.Command) {
-	conn.WriteString("PONG")
+const pingMessageArgCount = 2
+
+func (r *RedisServer) ping(conn redcon.Conn, cmd redcon.Command) {
+	switch len(cmd.Args) {
+	case 1:
+		conn.WriteString("PONG")
+	case pingMessageArgCount:
+		conn.WriteBulk(cmd.Args[1])
+	default:
+		conn.WriteError("ERR wrong number of arguments for 'ping' command")
+	}
 }
