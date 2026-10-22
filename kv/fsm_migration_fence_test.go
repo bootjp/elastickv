@@ -543,7 +543,7 @@ func TestFSMComposed1UsesS3BucketAuxiliaryRouteOwner(t *testing.T) {
 	applyComposed1Snapshot(t, engine, 1, s3BucketAuxiliaryStagedRoutes(bucket, 3, 4))
 	fsm := newComposed1FSM(t, engine, 4)
 
-	err := fsm.verifyComposed1(&pb.Request{
+	err := fsm.verifyComposed1(context.Background(), &pb.Request{
 		IsTxn:                true,
 		Phase:                pb.Phase_PREPARE,
 		Ts:                   10,

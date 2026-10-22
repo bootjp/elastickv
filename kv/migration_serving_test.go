@@ -3,6 +3,7 @@ package kv
 import (
 	"bytes"
 	"context"
+	"strconv"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -48,7 +49,7 @@ func TestMigrationServingJoinedVoterRejectsStaleCatalogReadsAndApply(t *testing.
 	require.NoError(t, err)
 	require.NoError(t, snapshot.Close())
 	for _, version := range []uint64{9, 10, 11} {
-		t.Run(string(rune('a'+version-9)), func(t *testing.T) {
+		t.Run(strconv.FormatUint(version, 10), func(t *testing.T) {
 			joined, err := store.NewPebbleStore(t.TempDir())
 			require.NoError(t, err)
 			t.Cleanup(func() { require.NoError(t, joined.Close()) })
@@ -166,7 +167,7 @@ func TestMigrationServingScopedHistoryCarriesOwnershipFloor(t *testing.T) {
 		Role: store.MigrationOwner, Staged: true, RouteStart: []byte("m"), RouteEnd: []byte("z"), MinWriteTSExclusive: 200,
 	}}, 12)
 	require.NoError(t, err)
-	scoped := context.WithValue(t.Context(), migrationApplyRoutesKey{}, history)
+	scoped := withApplyRouteHistory(t.Context(), history)
 	snapshot, ok := fsm.routeHistoryForContext(scoped).Current()
 	require.True(t, ok)
 	require.Equal(t, uint64(12), snapshot.Version())

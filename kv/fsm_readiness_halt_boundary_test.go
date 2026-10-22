@@ -78,10 +78,10 @@ func TestApplyRawRequestHaltsOnMigrationTrackerPersistFailure(t *testing.T) {
 			Value: []byte("v"),
 		}},
 	}
-	data, err := proto.Marshal(req)
-	require.NoError(t, err)
-
-	halt := haltApplyOf(fsm.Apply(data))
+	// The admission gate now rejects an unproven source tracker before writes.
+	// Exercise the underlying write/persistence boundary independently.
+	err := fsm.handleRawRequest(context.Background(), req, req.Ts)
+	halt := haltApplyOf(applyErrorResponse(err))
 	require.Error(t, halt, "a local migration tracker persistence failure must halt apply")
 	require.True(t, errors.Is(halt, ErrTargetReadinessApply), "got %v", halt)
 	require.ErrorIs(t, halt, local)
@@ -221,7 +221,7 @@ func TestApplyHaltBoundaryFollowsProcessLocalityNotCallSite(t *testing.T) {
 // readiness verdict in a coalesced write therefore advanced this voter's
 // applied index while its peers applied the write -- the committed-state
 // divergence the halt exists to prevent, reachable only through batching.
-func TestApplyHaltsOnUnprovenReadinessInsideABatchedCommand(t *testing.T) {
+func TestApplyRejectsUnprovenReadinessInsideABatchedCommand(t *testing.T) {
 	t.Parallel()
 
 	ctx := context.Background()
@@ -264,12 +264,15 @@ func TestApplyHaltsOnUnprovenReadinessInsideABatchedCommand(t *testing.T) {
 	require.NoError(t, err)
 
 	resp := fsm.Apply(data)
-	_, perRequestResults := resp.(*fsmApplyResponse)
-	require.False(t, perRequestResults,
-		"a batched apply carrying an unproven readiness verdict must halt, not "+
-			"return per-request results and advance the applied index")
-
-	halt := haltApplyOf(resp)
-	require.Error(t, halt, "the batch path must produce a halt response")
-	require.True(t, errors.Is(halt, ErrTargetReadinessApply), "got %v", halt)
+	results, perRequestResults := resp.(*fsmApplyResponse)
+	require.True(t, perRequestResults, "incomplete replicated proof is a deterministic request verdict")
+	require.NoError(t, haltApplyOf(resp))
+	for _, err := range results.results {
+		require.ErrorIs(t, err, ErrRouteCutoverPending)
+	}
+	for _, key := range []string{"b", "c"} {
+		exists, err := fsm.store.ExistsAt(ctx, []byte(key), 201)
+		require.NoError(t, err)
+		require.False(t, exists)
+	}
 }

@@ -477,11 +477,15 @@ func isRawApplyVerdict(err error) bool {
 		errors.Is(err, ErrUnknownRequestType) ||
 		errors.Is(err, ErrBackupTimestampFenced) ||
 		errors.Is(err, ErrPrepareCreationSealed) ||
-		errors.Is(err, ErrRouteWriteFenced) ||
-		errors.Is(err, ErrRouteWriteTimestampTooLow) ||
-		errors.Is(err, ErrComposed1VersionGCd) ||
+		isRawRouteVerdict(err) ||
 		errors.Is(err, ErrTxnLocked) ||
 		store.IsApplyVerdict(err)
+}
+
+func isRawRouteVerdict(err error) bool {
+	return errors.Is(err, ErrRouteWriteFenced) ||
+		errors.Is(err, ErrRouteWriteTimestampTooLow) ||
+		errors.Is(err, ErrComposed1VersionGCd)
 }
 
 func (f *kvFSM) applyRequestsOneByOne(ctx context.Context, reqs []*pb.Request, results []error) bool {
@@ -750,13 +754,6 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	ctx, err = f.withMigrationApplyRoutes(ctx, r)
-	if err != nil {
-		return err
-	}
-	if err := f.verifyMigrationValueAdmission(ctx, r); err != nil {
-		return err
-	}
 	if err := f.verifyPrepareCreationGate(r); err != nil {
 		return err
 	}
@@ -784,10 +781,10 @@ func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint6
 }
 
 func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
-	if err := f.verifyWriteFence(r); err != nil {
+	if err := f.verifyWriteFence(ctx, r); err != nil {
 		return err
 	}
-	floorSnap, err := f.routeFloorSnapshotForRequest(r)
+	floorSnap, err := f.routeFloorSnapshotForRequest(ctx, r)
 	if err != nil {
 		return err
 	}
@@ -866,7 +863,7 @@ func (f *kvFSM) verifyRawMutationFencesAndFloors(
 		return err
 	}
 	if _, bypass := writeFenceBypassKeys[string(key)]; !bypass {
-		if err := f.verifyRouteNotFencedForKey(key); err != nil {
+		if err := f.verifyRouteNotFencedForKey(ctx, key); err != nil {
 			return err
 		}
 	}
@@ -878,7 +875,7 @@ func (f *kvFSM) verifyRawMutationFencesAndFloors(
 	// writes the pinned view admits. An unpinned apply has no observed view, so
 	// the current snapshot's floor is the only one that can bound it.
 	if floorSnap == nil {
-		if err := f.verifyRouteWriteFloorForKey(key, commitTS); err != nil {
+		if err := f.verifyRouteWriteFloorForKey(ctx, key, commitTS); err != nil {
 			return err
 		}
 	}
@@ -919,7 +916,7 @@ func (f *kvFSM) handleDelPrefixWithFloorSnapshot(ctx context.Context, prefix []b
 		return err
 	}
 	if floorSnap == nil {
-		if err := f.verifyRouteWriteFloorForPrefix(prefix, commitTS); err != nil {
+		if err := f.verifyRouteWriteFloorForPrefix(ctx, prefix, commitTS); err != nil {
 			return err
 		}
 	}
@@ -930,7 +927,7 @@ func (f *kvFSM) handleDelPrefixWithFloorSnapshot(ctx context.Context, prefix []b
 		Prefix:        prefix,
 		ExcludePrefix: txnCommonPrefix,
 	}}
-	for _, del := range f.stagedVisibilityPrefixDeletesForApply(prefix, txnCommonPrefix) {
+	for _, del := range f.stagedVisibilityPrefixDeletesForApply(ctx, prefix, txnCommonPrefix) {
 		deletes = append(deletes, store.PrefixDelete{
 			Prefix:        del.prefix,
 			ExcludePrefix: del.excludePrefix,
@@ -943,15 +940,16 @@ func (f *kvFSM) handleDelPrefixWithFloorSnapshot(ctx context.Context, prefix []b
 	return nil
 }
 
-func (f *kvFSM) routeFloorSnapshotForRequest(r *pb.Request) (RouteSnapshot, error) {
-	if f.routes == nil || f.shardGroupID == 0 {
+func (f *kvFSM) routeFloorSnapshotForRequest(ctx context.Context, r *pb.Request) (RouteSnapshot, error) {
+	routes := f.routeHistoryForContext(ctx)
+	if routes == nil || f.shardGroupID == 0 {
 		return nil, nil
 	}
 	observedVer, pinned := DecodeObservedRouteVersion(r.GetObservedRouteVersion())
 	if !pinned {
 		return nil, nil
 	}
-	snap, ok := f.routes.SnapshotAt(observedVer)
+	snap, ok := routes.SnapshotAt(observedVer)
 	if !ok {
 		return nil, errors.WithStack(ErrComposed1VersionGCd)
 	}
@@ -963,11 +961,15 @@ type fsmStagedVisibilityPrefixDelete struct {
 	excludePrefix []byte
 }
 
-func (f *kvFSM) stagedVisibilityPrefixDeletesForApply(prefix []byte, excludePrefix []byte) []fsmStagedVisibilityPrefixDelete {
-	if f == nil || f.routes == nil || f.shardGroupID == 0 {
+func (f *kvFSM) stagedVisibilityPrefixDeletesForApply(ctx context.Context, prefix []byte, excludePrefix []byte) []fsmStagedVisibilityPrefixDelete {
+	if f == nil || f.shardGroupID == 0 {
 		return nil
 	}
-	snap, ok := f.routes.Current()
+	history := f.routeHistoryForContext(ctx)
+	if history == nil {
+		return nil
+	}
+	snap, ok := history.Current()
 	if !ok {
 		return nil
 	}
@@ -1005,18 +1007,19 @@ func (f *kvFSM) verifyRouteNotFencedForMutations(ctx context.Context, muts []*pb
 		if _, bypass := bypassKeys[string(mut.Key)]; bypass {
 			continue
 		}
-		if err := f.verifyRouteNotFencedForKey(mut.Key); err != nil {
+		if err := f.verifyRouteNotFencedForKey(ctx, mut.Key); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func (f *kvFSM) verifyRouteNotFencedForKey(key []byte) error {
-	if f.routes == nil {
+func (f *kvFSM) verifyRouteNotFencedForKey(ctx context.Context, key []byte) error {
+	routes := f.routeHistoryForContext(ctx)
+	if routes == nil {
 		return nil
 	}
-	snap, ok := f.routes.Current()
+	snap, ok := routes.Current()
 	if !ok {
 		return nil
 	}
@@ -1039,10 +1042,11 @@ func (f *kvFSM) verifyRouteNotFencedForPrefix(ctx context.Context, prefix []byte
 	if err := f.verifySourceWriteFenceForRouteRange(ctx, start, end); err != nil {
 		return err
 	}
-	if f.routes == nil {
+	routes := f.routeHistoryForContext(ctx)
+	if routes == nil {
 		return nil
 	}
-	snap, ok := f.routes.Current()
+	snap, ok := routes.Current()
 	if !ok {
 		return nil
 	}
@@ -1119,12 +1123,12 @@ func verifyRouteWriteTimestampFloorForPrefixFromSnapshot(snap RouteSnapshot, pre
 	return nil
 }
 
-func (f *kvFSM) verifyRouteWriteFloorForMutations(muts []*pb.Mutation, commitTS uint64) error {
+func (f *kvFSM) verifyRouteWriteFloorForMutations(ctx context.Context, muts []*pb.Mutation, commitTS uint64) error {
 	for _, mut := range muts {
 		if mut == nil || len(mut.Key) == 0 || isTxnInternalKey(mut.Key) {
 			continue
 		}
-		if err := f.verifyRouteWriteFloorForKey(mut.Key, commitTS); err != nil {
+		if err := f.verifyRouteWriteFloorForKey(ctx, mut.Key, commitTS); err != nil {
 			return err
 		}
 	}
@@ -1229,7 +1233,7 @@ func (f *kvFSM) targetReadyRoutesForRange(ctx context.Context, start []byte, end
 }
 
 func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) ([]distribution.Route, error) {
-	routes, catalogVersion, proof := f.currentShardRoutesForRouteRange(routeStart, routeEnd)
+	routes, catalogVersion, proof := f.currentShardRoutesForRouteRange(ctx, routeStart, routeEnd)
 
 	reader, ok := f.store.(store.MigrationTargetReadinessReader)
 	if !ok {
@@ -1255,11 +1259,12 @@ func (f *kvFSM) targetReadyRoutesForRouteRange(ctx context.Context, routeStart [
 	return nil, errors.WithStack(errors.Mark(ErrRouteCutoverPending, errTargetReadinessUnproven))
 }
 
-func (f *kvFSM) currentShardRoutesForRouteRange(routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
-	if f.routes == nil {
+func (f *kvFSM) currentShardRoutesForRouteRange(ctx context.Context, routeStart []byte, routeEnd []byte) ([]distribution.Route, uint64, bool) {
+	history := f.routeHistoryForContext(ctx)
+	if history == nil {
 		return nil, 0, false
 	}
-	snap, ok := f.routes.Current()
+	snap, ok := history.Current()
 	if !ok {
 		return nil, 0, false
 	}
@@ -1310,11 +1315,12 @@ func routesSatisfyTargetReadiness(routes []distribution.Route, ready store.Targe
 	return matched
 }
 
-func (f *kvFSM) verifyRouteWriteFloorForKey(key []byte, commitTS uint64) error {
-	if f.routes == nil {
+func (f *kvFSM) verifyRouteWriteFloorForKey(ctx context.Context, key []byte, commitTS uint64) error {
+	routes := f.routeHistoryForContext(ctx)
+	if routes == nil {
 		return nil
 	}
-	snap, ok := f.routes.Current()
+	snap, ok := routes.Current()
 	if !ok {
 		return nil
 	}
@@ -1353,11 +1359,12 @@ func (f *kvFSM) verifyS3BucketAuxiliaryRouteWriteFloor(snap RouteSnapshot, key [
 		commitTS, route.MinWriteTSExclusive, key, start, end)
 }
 
-func (f *kvFSM) verifyRouteWriteFloorForPrefix(prefix []byte, commitTS uint64) error {
-	if f.routes == nil || commitTS == 0 {
+func (f *kvFSM) verifyRouteWriteFloorForPrefix(ctx context.Context, prefix []byte, commitTS uint64) error {
+	routes := f.routeHistoryForContext(ctx)
+	if routes == nil || commitTS == 0 {
 		return nil
 	}
-	snap, ok := f.routes.Current()
+	snap, ok := routes.Current()
 	if !ok {
 		return nil
 	}
@@ -1616,10 +1623,7 @@ func (f *kvFSM) IsVolatileOnlyPayload(payload []byte) bool {
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
-	if err := f.verifyWriteFence(r); err != nil {
-		return err
-	}
-	if err := f.verifyComposed1(r); err != nil {
+	if err := f.verifyTxnRouteAdmission(ctx, r); err != nil {
 		return err
 	}
 	switch r.Phase {
@@ -1634,6 +1638,16 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 	default:
 		return errors.WithStack(ErrUnknownRequestType)
 	}
+}
+
+func (f *kvFSM) verifyTxnRouteAdmission(ctx context.Context, r *pb.Request) error {
+	if migrationResolutionAuthorized(ctx, r) {
+		return nil
+	}
+	if err := f.verifyWriteFence(ctx, r); err != nil {
+		return err
+	}
+	return f.verifyComposed1(ctx, r)
 }
 
 // verifyComposed1 is the M3 apply-time Composed-1 gate per
@@ -1665,7 +1679,7 @@ func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS ui
 // Returns ErrComposed1VersionGCd when the observed version is
 // outside the ring (M4 retry), and ErrComposed1Violation wrapped
 // with per-key context otherwise.
-func (f *kvFSM) verifyComposed1(r *pb.Request) error {
+func (f *kvFSM) verifyComposed1(ctx context.Context, r *pb.Request) error {
 	// ABORT requests MUST always reach the abort handler so the
 	// txn's intent locks get released.  If a route shifted between
 	// PREPARE and ABORT (or the observed version was evicted), a
@@ -1688,7 +1702,8 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 	// to silently reject every pinned txn — no real Raft group
 	// has ID 0, so OwnerOf would never match (coderabbit MAJOR on
 	// PR #895).
-	if f.routes == nil || f.shardGroupID == 0 {
+	routes := f.routeHistoryForContext(ctx)
+	if routes == nil || f.shardGroupID == 0 {
 		return nil
 	}
 	observedVer, pinned := DecodeObservedRouteVersion(r.GetObservedRouteVersion())
@@ -1698,7 +1713,7 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 	bypassKeys := writeFenceBypassKeySet(r.GetWriteFenceBypassKeys())
 
 	// (a) Observed-version check.
-	observedSnap, ok := f.routes.SnapshotAt(observedVer)
+	observedSnap, ok := routes.SnapshotAt(observedVer)
 	if !ok {
 		return errors.WithStack(ErrComposed1VersionGCd)
 	}
@@ -1707,7 +1722,7 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 	}
 
 	// (b) Current-version cross-version-read fence.
-	currentSnap, ok := f.routes.Current()
+	currentSnap, ok := routes.Current()
 	if !ok {
 		// No current snapshot — engine has no history, nothing
 		// to compare against.  Fall through (matches the
@@ -1717,21 +1732,22 @@ func (f *kvFSM) verifyComposed1(r *pb.Request) error {
 	return f.verifyOwnerFromSnapshot(r.GetMutations(), bypassKeys, currentSnap, currentSnap.Version(), "current")
 }
 
-func (f *kvFSM) verifyWriteFence(r *pb.Request) error {
+func (f *kvFSM) verifyWriteFence(ctx context.Context, r *pb.Request) error {
 	if requestBypassesWriteFence(r) {
 		return nil
 	}
 	observedVer := r.GetObservedRouteVersion()
-	if !f.writeFenceHistoryReady() {
+	if !f.writeFenceHistoryReady(ctx) {
 		return nil
 	}
-	currentSnap, ok := f.routes.Current()
+	routes := f.routeHistoryForContext(ctx)
+	currentSnap, ok := routes.Current()
 	if !ok {
 		return nil
 	}
 
 	if observedVer != 0 {
-		observedSnap, ok := f.routes.SnapshotAt(observedVer)
+		observedSnap, ok := routes.SnapshotAt(observedVer)
 		if !ok {
 			return errors.WithStack(ErrComposed1VersionGCd)
 		}
@@ -1759,8 +1775,8 @@ func requestBypassesWriteFence(r *pb.Request) bool {
 	return false
 }
 
-func (f *kvFSM) writeFenceHistoryReady() bool {
-	return f.routes != nil && f.shardGroupID != 0
+func (f *kvFSM) writeFenceHistoryReady(ctx context.Context) bool {
+	return f.routeHistoryForContext(ctx) != nil && f.shardGroupID != 0
 }
 
 func verifyWriteFenceFromSnapshot(mutations []*pb.Mutation, writeFenceBypassKeys [][]byte, snap RouteSnapshot, snapVer uint64, phase string) error {
@@ -1985,13 +2001,7 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if err := f.validatePrepareEvidenceMeta(meta, startTS); err != nil {
 		return err
 	}
-	floorTS := startTS
-	if meta.CommitTS != 0 {
-		floorTS = meta.CommitTS
-	}
-	if meta.PrepareCommitTS != 0 {
-		floorTS = meta.PrepareCommitTS
-	}
+	floorTS := prepareRouteFloorTimestamp(meta, startTS)
 	if err := f.verifyTargetReadinessForTxnFootprint(ctx, muts, r.ReadKeys, nil); err != nil {
 		return err
 	}
@@ -2010,6 +2020,16 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 		return err
 	}
 	return f.recordAndApplyPrepare(ctx, uniq, storeMuts, r.ReadKeys, floorTS, startTS)
+}
+
+func prepareRouteFloorTimestamp(meta TxnMeta, startTS uint64) uint64 {
+	if meta.PrepareCommitTS != 0 {
+		return meta.PrepareCommitTS
+	}
+	if meta.CommitTS != 0 {
+		return meta.CommitTS
+	}
+	return startTS
 }
 
 func (f *kvFSM) recordAndApplyPrepare(ctx context.Context, muts []*pb.Mutation, storeMuts []*store.KVPairMutation, readKeys [][]byte, floorTS, startTS uint64) error {
@@ -2150,7 +2170,7 @@ func (f *kvFSM) uniqueMutationsAboveFloorForRequest(
 	muts []*pb.Mutation,
 	commitTS uint64,
 ) ([]*pb.Mutation, error) {
-	floorSnap, err := f.routeFloorSnapshotForRequest(r)
+	floorSnap, err := f.routeFloorSnapshotForRequest(ctx, r)
 	if err != nil {
 		return nil, err
 	}
@@ -2183,7 +2203,7 @@ func (f *kvFSM) uniqueMutationsAboveFloorWithSnapshot(
 	// Only for requests that pinned no route version; see
 	// validateRawMutationForApply for why a pinned view must not be re-checked.
 	if floorSnap == nil {
-		if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {
+		if err := f.verifyRouteWriteFloorForMutations(ctx, uniq, commitTS); err != nil {
 			return nil, err
 		}
 	}
@@ -2224,11 +2244,25 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorForRequest(
 	muts []*pb.Mutation,
 	commitTS uint64,
 ) ([]*pb.Mutation, error) {
-	floorSnap, err := f.routeFloorSnapshotForRequest(r)
+	if migrationResolutionAuthorized(ctx, r) {
+		return migrationResolutionMutations(muts)
+	}
+	floorSnap, err := f.routeFloorSnapshotForRequest(ctx, r)
 	if err != nil {
 		return nil, err
 	}
 	return f.uniqueTxnMutationsAboveFloorWithSnapshot(ctx, muts, commitTS, floorSnap)
+}
+
+func migrationResolutionMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
+	uniq, err := uniqueTxnMutations(muts)
+	if err != nil {
+		return nil, err
+	}
+	if err := rejectReservedControlMutations(uniq); err != nil {
+		return nil, err
+	}
+	return uniq, nil
 }
 
 func (f *kvFSM) uniqueTxnMutationsAboveFloorWithSnapshot(
@@ -2256,7 +2290,7 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorWithSnapshot(
 	// Only for requests that pinned no route version; see
 	// validateRawMutationForApply for why a pinned view must not be re-checked.
 	if floorSnap == nil {
-		if err := f.verifyRouteWriteFloorForMutations(uniq, commitTS); err != nil {
+		if err := f.verifyRouteWriteFloorForMutations(ctx, uniq, commitTS); err != nil {
 			return nil, err
 		}
 	}
