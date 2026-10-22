@@ -19,9 +19,9 @@ import "github.com/cockroachdb/errors"
 // leaving it for the sweeper to re-validate.
 
 // maxMutationsPerDelta is the most keys one SHA's delta can produce:
-// its reference-count record, plus at most one GC-queue insert or
-// delete. Named so the pre-size reads as the bound it is.
-const maxMutationsPerDelta = 2
+// its reference-count record, plus a stale GC-queue delete and a new
+// GC-queue insert. Named so the pre-size reads as the bound it is.
+const maxMutationsPerDelta = 3
 
 // ErrChunkRefRCUnderflow reports a decrement that would drive a
 // reference count below zero.
@@ -173,19 +173,12 @@ func planOneChunkRefDelta(
 		// Newly unreachable. Record WHEN so the sweeper's grace window
 		// has a time signal, and queue it.
 		//
-		// An already-queued record keeps its original timestamp: the
-		// blob has been continuously unreachable, and restamping it
-		// would silently restart a grace period that was already
-		// running.
-		if existing.Queued() {
-			next.QueuedAtTS = existing.QueuedAtTS
-		} else {
-			next.QueuedAtTS = commitTS
-			mutations = append(mutations, ChunkRefRCMutation{
-				Key:   ChunkBlobGCQueueKey(commitTS, delta.ContentSHA256),
-				Value: []byte{},
-			})
-		}
+		// An already-unreachable, already-queued record keeps its original
+		// timestamp: restamping it would silently restart a grace period
+		// that was already running. A live record, however, starts a new
+		// grace period even if it carries a stale queue timestamp.
+		next.QueuedAtTS, mutations = planZeroCountQueueMutations(
+			delta.ContentSHA256, existing, commitTS)
 	case existing.Queued():
 		// Reachable again before the sweeper ran. The queue must
 		// reflect CURRENTLY RC==0, so the entry goes away in this same
@@ -201,4 +194,25 @@ func planOneChunkRefDelta(
 		Key:   ChunkRefRCKey(delta.ContentSHA256),
 		Value: EncodeChunkRefRC(next),
 	}), nil
+}
+
+func planZeroCountQueueMutations(
+	sha [chunkBlobSHA256Bytes]byte, existing ChunkRefRC, commitTS uint64,
+) (uint64, []ChunkRefRCMutation) {
+	if existing.Count == 0 && existing.Queued() {
+		return existing.QueuedAtTS, nil
+	}
+
+	var mutations []ChunkRefRCMutation
+	if existing.Queued() && existing.QueuedAtTS != commitTS {
+		mutations = append(mutations, ChunkRefRCMutation{
+			Key:    ChunkBlobGCQueueKey(existing.QueuedAtTS, sha),
+			Delete: true,
+		})
+	}
+	mutations = append(mutations, ChunkRefRCMutation{
+		Key:   ChunkBlobGCQueueKey(commitTS, sha),
+		Value: []byte{},
+	})
+	return commitTS, mutations
 }

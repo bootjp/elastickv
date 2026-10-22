@@ -67,6 +67,32 @@ func TestPlanLastReferenceRemovalQueuesWithTheCommitTimestamp(t *testing.T) {
 	requireRCValue(t, plan, sha, s3keys.ChunkRefRC{Count: 0, QueuedAtTS: planCommitTS})
 }
 
+// TestPlanLiveToZeroReplacesStaleQueueTimestamp pins recovery from an
+// inconsistent live RC record. The transition to zero starts a new grace
+// window even if the live record still carries an old queue timestamp.
+func TestPlanLiveToZeroReplacesStaleQueueTimestamp(t *testing.T) {
+	t.Parallel()
+
+	sha := testSHA("payload")
+	const staleQueuedAt = uint64(1_699_000_000_000) << 16
+
+	plan, err := s3keys.PlanChunkRefRCMutations(
+		[]s3keys.ChunkRefDelta{{ContentSHA256: sha, Removed: 1}},
+		map[[32]byte]s3keys.ChunkRefRC{sha: {Count: 1, QueuedAtTS: staleQueuedAt}},
+		planCommitTS)
+	require.NoError(t, err)
+	require.Len(t, plan, 3)
+
+	stale, ok := findMutation(t, plan, s3keys.ChunkBlobGCQueueKey(staleQueuedAt, sha))
+	require.True(t, ok, "the stale queue entry must be removed")
+	require.True(t, stale.Delete)
+
+	fresh, ok := findMutation(t, plan, s3keys.ChunkBlobGCQueueKey(planCommitTS, sha))
+	require.True(t, ok, "the live-to-zero transition must start a fresh grace window")
+	require.False(t, fresh.Delete)
+	requireRCValue(t, plan, sha, s3keys.ChunkRefRC{Count: 0, QueuedAtTS: planCommitTS})
+}
+
 // TestPlanReReferenceDeletesTheExistingQueueEntry is the clause that
 // forced the timestamp into the RC value: §3.5 requires the queue to
 // reflect *currently* RC==0, not *ever was* zero, so a txn that makes a

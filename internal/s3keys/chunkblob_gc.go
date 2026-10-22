@@ -213,13 +213,25 @@ func ChunkBlobGCGraceBoundary(nowTS uint64, grace time.Duration) uint64 {
 		return 0
 	}
 	physicalMs := nowTS >> hlcLogicalBits
-	graceMs := uint64(0)
-	if ms := grace.Milliseconds(); ms > 0 {
-		// Guarded above zero, so the conversion cannot go negative.
-		graceMs = uint64(ms)
-	}
+	graceMs := ceilPositiveDurationMillis(grace)
 	if graceMs >= physicalMs {
 		return 0
 	}
 	return (physicalMs - graceMs) << hlcLogicalBits
+}
+
+func ceilPositiveDurationMillis(duration time.Duration) uint64 {
+	if duration <= 0 {
+		return 0
+	}
+	// HLC physical timestamps have millisecond precision. Round a positive
+	// fractional millisecond up so the configured grace is never shortened.
+	millis := duration / time.Millisecond
+	if duration%time.Millisecond != 0 {
+		millis++
+	}
+	if millis < 0 {
+		return 0
+	}
+	return uint64(millis) // #nosec G115 -- duration and rounded millis are proven positive above.
 }

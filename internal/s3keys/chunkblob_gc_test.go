@@ -224,6 +224,30 @@ func TestChunkBlobGCGraceBoundaryWorksInTheHLCDomain(t *testing.T) {
 	require.Positive(t, bytes.Compare(outside, end))
 }
 
+func TestChunkBlobGCGraceBoundaryRoundsUpFractionalMilliseconds(t *testing.T) {
+	t.Parallel()
+
+	nowMs := uint64(10)
+	nowTS := nowMs << kv.HLCLogicalBits
+	tests := []struct {
+		name    string
+		grace   time.Duration
+		graceMs uint64
+	}{
+		{name: "one nanosecond", grace: time.Nanosecond, graceMs: 1},
+		{name: "sub millisecond", grace: time.Millisecond - 1, graceMs: 1},
+		{name: "exact millisecond", grace: time.Millisecond, graceMs: 1},
+		{name: "fractional second millisecond", grace: time.Millisecond + 1, graceMs: 2},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			require.Equal(t, (nowMs-tc.graceMs)<<kv.HLCLogicalBits,
+				s3keys.ChunkBlobGCGraceBoundary(nowTS, tc.grace))
+		})
+	}
+}
+
 // TestChunkBlobGCGraceBoundaryClampsAtTheEpoch pins that an absurd
 // grace period sweeps NOTHING rather than wrapping around to sweep
 // everything.
