@@ -13,10 +13,12 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const (
-	metricsReadHeaderTimeout = time.Second
-	metricsShutdownTimeout   = 5 * time.Second
-)
+const metricsReadHeaderTimeout = time.Second
+
+// metricsShutdownTimeout bounds how long the metrics and pprof servers wait
+// for in-flight requests on shutdown before the remaining connections are
+// closed (ShutdownHTTPServer). A variable so tests can shorten it.
+var metricsShutdownTimeout = 5 * time.Second
 
 // AddressRequiresToken reports whether the address is exposed beyond loopback
 // and therefore requires bearer-token protection.
@@ -76,7 +78,10 @@ func NewMetricsServer(handler http.Handler, bearerToken string) *http.Server {
 	}
 }
 
-// MetricsShutdownTask returns an errgroup task that stops the metrics server on context cancellation.
+// MetricsShutdownTask returns an errgroup task that stops the metrics server
+// on context cancellation: a graceful drain bounded by
+// metricsShutdownTimeout, then a forced close of whatever is still
+// connected, so a scrape that stalls cannot hold the shutdown open.
 func MetricsShutdownTask(ctx context.Context, server *http.Server, address string) func() error {
 	return func() error {
 		if server == nil {
@@ -84,13 +89,7 @@ func MetricsShutdownTask(ctx context.Context, server *http.Server, address strin
 		}
 		<-ctx.Done()
 		slog.Info("Shutting down metrics server", "address", address, "reason", ctx.Err())
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), metricsShutdownTimeout)
-		defer cancel()
-		err := server.Shutdown(shutdownCtx)
-		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-			return nil
-		}
-		return errors.WithStack(err)
+		return ShutdownHTTPServer(ctx, server, "metrics", metricsShutdownTimeout)
 	}
 }
 
