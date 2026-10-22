@@ -703,6 +703,13 @@ func (s *mvccStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPai
 	return s.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
 
+// ApplyRaftEntry satisfies RaftEntryApplier. The in-memory store has no
+// durable state that a crash could tear, so the callback simply runs and
+// each request applies as it does on the per-request path.
+func (s *mvccStore) ApplyRaftEntry(ctx context.Context, _ uint64, fn func(ctx context.Context) error) error {
+	return fn(ctx)
+}
+
 func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()

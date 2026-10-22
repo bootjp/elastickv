@@ -5,6 +5,7 @@
             [elastickv.dynamodb-workload :as dynamodb-workload]
             [elastickv.dynamodb-types-workload :as dynamodb-types-workload]
             [elastickv.s3-workload :as s3-workload]
+            [elastickv.filesystem-workload :as filesystem-workload]
             [elastickv.sqs-htfifo-workload :as sqs-htfifo-workload]
             [elastickv.split-workload :as split-workload]
             [jepsen.cli :as cli]))
@@ -25,6 +26,10 @@
   ([] (elastickv-s3-test {}))
   ([opts] (s3-workload/elastickv-s3-test opts)))
 
+(defn elastickv-filesystem-test
+  ([] (elastickv-filesystem-test {}))
+  ([opts] (filesystem-workload/elastickv-filesystem-test opts)))
+
 (defn elastickv-zset-safety-test
   ([] (elastickv-zset-safety-test {}))
   ([opts] (zset-safety-workload/elastickv-zset-safety-test opts)))
@@ -42,6 +47,7 @@
    "elastickv-zset-safety-test" elastickv-zset-safety-test
    "elastickv-dynamodb-test"    elastickv-dynamodb-test
    "elastickv-s3-test"          elastickv-s3-test
+   "elastickv-filesystem-test"  elastickv-filesystem-test
    "elastickv-split-test"       elastickv-split-test})
 
 (defn elastickv-sqs-htfifo-test
@@ -58,8 +64,9 @@
     lein run -m elastickv.jepsen-test <test-name> [jepsen-subcmd] [jepsen-opts ...]
 
   Supported <test-name>s: elastickv-test, elastickv-zset-safety-test,
-  elastickv-dynamodb-test, elastickv-s3-test. When the first positional
-  arg is not a known test name, we default to `elastickv-test` for
+  elastickv-dynamodb-test, elastickv-s3-test, elastickv-filesystem-test,
+  elastickv-split-test. When the first positional arg is not a known test name,
+  we default to `elastickv-test` for
   backward compatibility and forward ALL args to jepsen.cli/run!.
 
   The jepsen subcommand (`test` or `analyze`) is auto-prepended when

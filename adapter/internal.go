@@ -1407,8 +1407,7 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 			return 0, err
 		}
 		startTS = ts
-	} else if err := kv.ValidateForwardedTxnStartTimestamp(
-		ctx, i.tsAllocator, startTS, "stampTxnTimestamps: forwarded start ts"); err != nil {
+	} else if err := i.validateForwardedTxnStartForPhase(ctx, reqs, startTS); err != nil {
 		// A PREPARE carries no transaction meta, so the commit-timestamp check
 		// below never sees it -- yet handlePrepareRequest persists the intent at
 		// this value.
@@ -1433,6 +1432,32 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 		return 0, err
 	}
 	return commitTS, nil
+}
+
+func (i *Internal) validateForwardedTxnStartForPhase(ctx context.Context, reqs []*pb.Request, startTS uint64) error {
+	const label = "stampTxnTimestamps: forwarded start ts"
+	if forwardedTxnResolutionOnly(reqs) {
+		err := kv.ValidateDurablePersistenceTimestamp(ctx, i.tsAllocator, startTS, label)
+		if errors.Is(err, kv.ErrTSOTimestampPrePhaseD) {
+			return nil // Existing intents may need COMMIT or ABORT after the creation window closes.
+		}
+		return errors.WithStack(err)
+	}
+	return errors.WithStack(kv.ValidateForwardedTxnStartTimestamp(ctx, i.tsAllocator, startTS, label))
+}
+
+func forwardedTxnResolutionOnly(reqs []*pb.Request) bool {
+	seen := false
+	for _, r := range reqs {
+		if r == nil {
+			continue
+		}
+		if !r.IsTxn || (r.Phase != pb.Phase_COMMIT && r.Phase != pb.Phase_ABORT) {
+			return false
+		}
+		seen = true
+	}
+	return seen
 }
 
 func (i *Internal) ensureTxnWritesAllowed(reqs []*pb.Request, commitTS uint64) error {

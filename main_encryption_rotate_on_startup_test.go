@@ -612,7 +612,7 @@ func TestStartupGatedCoordinator_BlocksAdapterDispatchDuringAsyncRotation(t *tes
 	blocked := true
 	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
 	gate.markReady()
-	coord := startupGatedCoordinator{inner: inner, gate: gate}
+	coord := newStartupGatedCoordinator(inner, gate)
 
 	if _, err := coord.Dispatch(context.Background(), nil); status.Code(err) != codes.Unavailable {
 		t.Fatalf("blocked Dispatch err=%v, want Unavailable", err)
@@ -640,10 +640,7 @@ func TestStartupGatedCoordinator_ForwardsTimestampCapabilities(t *testing.T) {
 	blocked := true
 	gate := &startupPublicKVGate{blockMutator: func() bool { return blocked }}
 	gate.markReady()
-	coord := startupGatedCoordinator{
-		inner: inner,
-		gate:  gate,
-	}
+	coord := newStartupGatedCoordinator(inner, gate)
 
 	assertStartupGatedTimestampBlocked(t, coord)
 	blocked = false
@@ -714,9 +711,7 @@ func TestRuntimeServerRunner_PrepareAdminForwardServersDoesNotBindPublicListener
 		s3Address:       heldS3.Addr().String(),
 		s3PathStyleOnly: true,
 		metricsRegistry: monitoring.NewRegistry("test-node", "127.0.0.1:0"),
-		coordinate: startupGatedCoordinator{
-			inner: &stubStartupCoordinator{clock: kv.NewHLC()},
-		},
+		coordinate:      newStartupGatedCoordinator(&stubStartupCoordinator{clock: kv.NewHLC()}, nil),
 	}
 	if err := runner.prepareAdminForwardServers(); err != nil {
 		t.Fatalf("prepareAdminForwardServers: %v", err)

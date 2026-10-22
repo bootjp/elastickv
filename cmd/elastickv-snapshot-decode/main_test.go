@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"encoding/json"
 	"io"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/backup"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
 
@@ -31,7 +33,7 @@ const (
 func TestRun_DecodesSimpleRedisStringSnapshot(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
-	in := filepath.Join(dir, "0000000000000064.fsm")
+	in := filepath.Join(dir, "0000000000000040.fsm")
 	out := filepath.Join(dir, "out")
 	mustWriteFSM(t, in, redisStringSnapshot(t, "greeting", "hello"))
 
@@ -55,6 +57,68 @@ func TestRun_DecodesSimpleRedisStringSnapshot(t *testing.T) {
 	if err := backup.VerifyChecksums(out); err != nil {
 		t.Fatalf("VerifyChecksums: %v", err)
 	}
+}
+
+// TestRun_DecodesLivePebbleSnapshot drives the CLI over a snapshot taken
+// from a real Pebble store, which carries the store's reserved metadata
+// keys (`_meta_last_commit_ts`, `_meta_applied_index`) next to the MVCC
+// versions. The decoder used to reject every such snapshot on the first
+// metadata key, so the offline decode path only worked on encoder-produced
+// input (serializable isolation audit, A0 status).
+func TestRun_DecodesLivePebbleSnapshot(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	in := filepath.Join(dir, "0000000000000040.fsm")
+	out := filepath.Join(dir, "out")
+	mustWriteFSM(t, in, liveRedisStringSnapshot(t, "greeting", "hello"))
+
+	var stderr bytes.Buffer
+	if err := run([]string{
+		"-input", in,
+		"-output", out,
+		"-cluster-id", "ek-live",
+	}, &stderr); err != nil {
+		t.Fatalf("run: %v\nstderr=%s", err, stderr.String())
+	}
+	assertBlobMatches(t, filepath.Join(out, "redis", "db_0", "strings", "greeting.bin"), "hello")
+	assertManifest(t, filepath.Join(out, "MANIFEST.json"), manifestShape{
+		Phase:         "phase0-snapshot-decode",
+		SnapshotIndex: 64,
+		ClusterID:     "ek-live",
+	})
+	if err := backup.VerifyChecksums(out); err != nil {
+		t.Fatalf("VerifyChecksums: %v", err)
+	}
+}
+
+// liveRedisStringSnapshot writes one Redis string through a real Pebble
+// store with a Raft applied index and returns the store's native snapshot
+// stream, the bytes a `.fsm` file holds on a running node.
+func liveRedisStringSnapshot(t *testing.T, userKey, body string) []byte {
+	t.Helper()
+	st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), "fsm.db"))
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	t.Cleanup(func() { _ = st.Close() })
+
+	// 0xFF 0x01 0x00 is the live Redis string-value envelope (magic,
+	// version, flags with no TTL) the adapter writes before the body.
+	value := append([]byte{0xFF, 0x01, 0x00}, body...)
+	muts := []*store.KVPairMutation{{Op: store.OpTypePut, Key: []byte(backup.RedisStringPrefix + userKey), Value: value}}
+	if err := st.ApplyMutationsRaftAt(context.Background(), muts, nil, 1, 1, 64); err != nil {
+		t.Fatalf("apply: %v", err)
+	}
+	snap, err := st.Snapshot()
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	defer snap.Close()
+	var buf bytes.Buffer
+	if _, err := snap.WriteTo(&buf); err != nil {
+		t.Fatalf("write snapshot: %v", err)
+	}
+	return buf.Bytes()
 }
 
 // assertBlobMatches reads path and asserts its bytes equal want.

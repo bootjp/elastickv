@@ -1125,6 +1125,111 @@ func (s *ShardStore) ScanGroupAt(ctx context.Context, groupID uint64, start []by
 	return s.scanExplicitGroupAtWithReadFence(ctx, groupID, start, end, limit, ts, false, 0, nil, nil)
 }
 
+// ScanGroupOwnedAt reads one physical page of up to limit rows of [start, end)
+// from groupID's own store. It returns, in key order, the rows of that page the
+// group serves, and the last key the page read when the page was full (nil once
+// the range is exhausted); the caller resumes just after that key. ScanGroupAt
+// first resolves the requested range through the route catalog, and a bare
+// internal prefix such as "!redis|str|" resolves to the first route only, so it
+// refuses every other group. Maintenance that walks a whole prefix one group at
+// a time uses this instead, at a cost of one page per call however few of its
+// rows are kept.
+//
+// A group serves the keys whose route it owns, plus Redis hash, set, zset and
+// stream rows still stored at the route of their raw key while the logical owner
+// holds no version of the key: point reads fall back to such a row exactly then,
+// so it is the value a reader sees. Only the owner's leader can tell, so on any
+// other node those rows are left out. Every served row is thus the value a point
+// read returns, and the page skips the point-read pass other scans give
+// wide-column rows. Rows of ranges the group no longer owns
+// are skipped. Keys of a route under staged visibility are skipped too: the page
+// reads live rows only, and an older live copy must not be acted on while a
+// newer staged copy waits for promotion. It is meant for the group's own leader:
+// on any other node the read is forwarded, and the leader serves it as
+// ScanGroupAt, which may refuse such a range.
+func (s *ShardStore) ScanGroupOwnedAt(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, []byte, error) {
+	if limit <= 0 {
+		return []*store.KVPair{}, nil, nil
+	}
+	g, ok := s.groupForID(groupID)
+	if !ok || g == nil || g.Store == nil {
+		return []*store.KVPair{}, nil, nil
+	}
+	page, err := s.scanRouteAtForwardStoredPage(ctx, distribution.Route{GroupID: groupID}, g, start, end, limit, ts, true, 0, nil, nil)
+	if err != nil {
+		return nil, nil, err
+	}
+	var resume []byte
+	if page.full {
+		resume = page.advanceKey
+	}
+	out, err := s.rowsGroupServesAt(ctx, groupID, page.kvs, ts)
+	if err != nil {
+		return nil, nil, err
+	}
+	return out, resume, nil
+}
+
+func (s *ShardStore) rowsGroupServesAt(ctx context.Context, groupID uint64, kvs []*store.KVPair, ts uint64) ([]*store.KVPair, error) {
+	out := make([]*store.KVPair, 0, len(kvs))
+	for _, kvp := range kvs {
+		if kvp == nil {
+			continue
+		}
+		serves, err := s.groupServesKeyAt(ctx, groupID, kvp.Key, ts)
+		if err != nil {
+			return nil, err
+		}
+		if serves {
+			out = append(out, kvp)
+		}
+	}
+	return out, nil
+}
+
+// groupServesKeyAt reports whether groupID serves key at ts: it owns the key's
+// route, or key is stored at its legacy raw-key route in groupID and the
+// logical owner holds no version of key at ts. Then the group's own row is the
+// value a point read returns.
+func (s *ShardStore) groupServesKeyAt(ctx context.Context, groupID uint64, key []byte, ts uint64) (bool, error) {
+	route, _, ok := s.routeAndGroupForKey(key)
+	if !ok || routeHasStagedVisibility(route) {
+		return false, nil
+	}
+	if route.GroupID == groupID {
+		return true, nil
+	}
+	if !s.legacyRouteInGroup(groupID, key) {
+		return false, nil
+	}
+	return s.ownerHoldsNoVersionAt(ctx, route, key, ts)
+}
+
+// legacyRouteInGroup reports whether key's raw-key route, which point reads
+// fall back to, belongs to groupID and is not under staged visibility.
+func (s *ShardStore) legacyRouteInGroup(groupID uint64, key []byte) bool {
+	legacyKey := legacyPointRouteKey(key)
+	if legacyKey == nil {
+		return false
+	}
+	legacy, ok := s.engine.GetRoute(legacyKey)
+	return ok && legacy.GroupID == groupID && !routeHasStagedVisibility(legacy)
+}
+
+// ownerHoldsNoVersionAt reports whether owner, the route of key's logical
+// owner, holds no version of key at ts. Only the owner's leader on this node
+// can answer; anywhere else it reports false.
+func (s *ShardStore) ownerHoldsNoVersionAt(ctx context.Context, owner distribution.Route, key []byte, ts uint64) (bool, error) {
+	if g, ok := s.groupForID(owner.GroupID); !ok || g == nil || g.Store == nil {
+		return false, nil
+	}
+	exists, answered, err := s.routeHasVersionAtOrBefore(ctx, owner, key, ts)
+	if err != nil {
+		return false, err
+	}
+	return answered && !exists, nil
+}
+
 func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64, reverse bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
@@ -3319,12 +3424,39 @@ func (s *ShardStore) scanRouteAtForwardPage(
 	routeStart []byte,
 	routeEnd []byte,
 ) (scanRoutePage, error) {
+	page, err := s.scanRouteAtForwardStoredPage(ctx, route, g, start, end, limit, ts, explicitGroup, readRouteVersion, routeStart, routeEnd)
+	if err != nil {
+		return scanRoutePage{}, err
+	}
+	page.kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, page.kvs, start, ts, readRouteVersion)
+	if err != nil {
+		return scanRoutePage{}, err
+	}
+	return page, nil
+}
+
+// scanRouteAtForwardStoredPage reads one forward page like
+// scanRouteAtForwardPage but returns wide-column rows as the group stores
+// them, without re-reading each through the point-read path.
+func (s *ShardStore) scanRouteAtForwardStoredPage(
+	ctx context.Context,
+	route distribution.Route,
+	g *ShardGroup,
+	start []byte,
+	end []byte,
+	limit int,
+	ts uint64,
+	explicitGroup bool,
+	readRouteVersion uint64,
+	routeStart []byte,
+	routeEnd []byte,
+) (scanRoutePage, error) {
 	engine := engineForGroup(g)
 	if engine == nil {
-		return s.scanRouteAtForwardLocalPage(ctx, g, route, start, end, limit, ts, readRouteVersion)
+		return s.scanRouteAtForwardLocalPage(ctx, g, route, start, end, limit, ts)
 	}
 	if isLinearizableRaftLeader(ctx, engine) {
-		return s.scanRouteAtForwardLeaderPage(ctx, g, route, start, end, limit, ts, readRouteVersion)
+		return s.scanRouteAtForwardLeaderPage(ctx, g, route, start, end, limit, ts)
 	}
 	return s.scanRouteAtForwardProxyPage(ctx, route, g, start, end, limit, ts, explicitGroup, readRouteVersion, routeStart, routeEnd)
 }
@@ -3337,18 +3469,13 @@ func (s *ShardStore) scanRouteAtForwardLocalPage(
 	end []byte,
 	limit int,
 	ts uint64,
-	readRouteVersion uint64,
 ) (scanRoutePage, error) {
 	raw, err := s.scanRouteLocal(ctx, g, route, start, end, limit, ts, false)
 	if err != nil {
 		return scanRoutePage{}, errors.WithStack(err)
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterScanInternalKVs(raw), start, ts, readRouteVersion)
-	if err != nil {
-		return scanRoutePage{}, err
-	}
 	return scanRoutePage{
-		kvs:        kvs,
+		kvs:        filterScanInternalKVs(raw),
 		advanceKey: lastKVKey(raw),
 		full:       len(raw) >= limit,
 	}, nil
@@ -3362,7 +3489,6 @@ func (s *ShardStore) scanRouteAtForwardLeaderPage(
 	end []byte,
 	limit int,
 	ts uint64,
-	readRouteVersion uint64,
 ) (scanRoutePage, error) {
 	raw, err := s.scanRouteLocal(ctx, g, route, start, end, limit, ts, false)
 	if err != nil {
@@ -3377,12 +3503,8 @@ func (s *ShardStore) scanRouteAtForwardLeaderPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err = s.canonicalizeRedisWideColumnScanResults(ctx, filterScanInternalKVs(kvs), start, ts, readRouteVersion)
-	if err != nil {
-		return scanRoutePage{}, err
-	}
 	return scanRoutePage{
-		kvs:        kvs,
+		kvs:        filterScanInternalKVs(kvs),
 		advanceKey: lastKVKey(raw),
 		full:       len(raw) >= limit,
 	}, nil
@@ -3406,12 +3528,8 @@ func (s *ShardStore) scanRouteAtForwardProxyPage(
 	if err != nil {
 		return scanRoutePage{}, err
 	}
-	kvs, err := s.canonicalizeRedisWideColumnScanResults(ctx, filterScanInternalKVs(raw), start, ts, readRouteVersion)
-	if err != nil {
-		return scanRoutePage{}, err
-	}
 	return scanRoutePage{
-		kvs:        kvs,
+		kvs:        filterScanInternalKVs(raw),
 		advanceKey: lastKVKey(raw),
 		full:       len(raw) >= limit,
 	}, nil

@@ -351,11 +351,11 @@ func (s *pebbleStore) ImportVersionsRaft(ctx context.Context, opts ImportVersion
 }
 
 func (s *pebbleStore) importVersionsWithOpts(ctx context.Context, opts ImportVersionsOptions, writeOpts *pebble.WriteOptions, gateRegistration bool) (ImportVersionsResult, error) {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	duplicate, ackedCursor, err := s.validatePebbleImportBatch(opts)
 	if err != nil {

@@ -2,7 +2,9 @@ package adapter
 
 import (
 	"context"
+	"io"
 	"net/http"
+	"strings"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/kv"
@@ -10,6 +12,50 @@ import (
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
 )
+
+// s3PutObjectInput is one PutObject upload, independent of the protocol that
+// delivered it. putObject fills it from the SigV4 request and AdminPutObject
+// from its arguments; prepareS3PutObject, uploadS3ObjectData and
+// commitS3PutObject read nothing else.
+type s3PutObjectInput struct {
+	// ifMatch and ifNoneMatch are the conditional-write preconditions.
+	ifMatch     string
+	ifNoneMatch string
+
+	// body is the payload, already bounded by the caller's size cap;
+	// contentLength is its length, or -1 when unknown. Both are set once the
+	// caller has wrapped the body, after prepareS3PutObject.
+	body          io.Reader
+	contentLength int64
+	streamBody    *s3StreamingBody
+	// payloadSHA is the X-Amz-Content-Sha256 value. A hex digest is verified
+	// against the body; payload markers and the empty string skip the check.
+	payloadSHA      string
+	tooLargeMessage string
+
+	contentType        string
+	contentEncoding    string
+	cacheControl       string
+	contentDisposition string
+	userMetadata       map[string]string
+}
+
+// s3PutObjectInputFromHeaders reads the SigV4 PutObject headers. The body is
+// attached once prepareStreamingPutBody has wrapped it.
+func s3PutObjectInputFromHeaders(h http.Header) *s3PutObjectInput {
+	return &s3PutObjectInput{
+		ifMatch:            strings.TrimSpace(h.Get("If-Match")),
+		ifNoneMatch:        strings.TrimSpace(h.Get("If-None-Match")),
+		contentLength:      -1,
+		payloadSHA:         normalizeS3PayloadHash(h.Get("X-Amz-Content-Sha256")),
+		tooLargeMessage:    "object exceeds maximum allowed size",
+		contentType:        s3ContentTypeOrDefault(h.Get("Content-Type")),
+		contentEncoding:    cleanStoredContentEncoding(h.Get("Content-Encoding")),
+		cacheControl:       h.Get("Cache-Control"),
+		contentDisposition: h.Get("Content-Disposition"),
+		userMetadata:       collectS3UserMetadata(h),
+	}
+}
 
 type s3PutObjectState struct {
 	startTS       uint64
@@ -21,7 +67,7 @@ type s3PutObjectState struct {
 	readPin       *kv.ActiveTimestampToken
 }
 
-func (s *S3Server) prepareS3PutObject(ctx context.Context, request *http.Request, bucket, objectKey string) (*s3PutObjectState, error) {
+func (s *S3Server) prepareS3PutObject(ctx context.Context, in *s3PutObjectInput, bucket, objectKey string) (*s3PutObjectState, error) {
 	readTS := s.readTS()
 	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 put object: begin read timestamp")
 	if err != nil {
@@ -50,7 +96,7 @@ func (s *S3Server) prepareS3PutObject(ctx context.Context, request *http.Request
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if err := validateS3PutPreconditions(request, state.previous); err != nil {
+	if err := validateS3PutPreconditions(in.ifMatch, in.ifNoneMatch, state.previous); err != nil {
 		return nil, newS3ResponseError(http.StatusPreconditionFailed, "PreconditionFailed", err.Error(), bucket, objectKey)
 	}
 	state.uploadID = newS3UploadID(s.clock())
@@ -58,16 +104,17 @@ func (s *S3Server) prepareS3PutObject(ctx context.Context, request *http.Request
 	return state, nil
 }
 
-func (s *S3Server) uploadS3ObjectData(ctx context.Context, request *http.Request, streamBody *s3StreamingBody, state *s3PutObjectState, bucket, objectKey, expectedPayloadSHA string, offloaded bool) (s3ChunkUploadResult, *s3PutBodyError, error) {
-	payloadChecksum := expectedPayloadSHA
+func (s *S3Server) uploadS3ObjectData(ctx context.Context, in *s3PutObjectInput, state *s3PutObjectState, bucket, objectKey string, offloaded bool) (s3ChunkUploadResult, *s3PutBodyError, error) {
+	payloadChecksum := in.payloadSHA
 	if isS3PayloadMarker(payloadChecksum) {
 		payloadChecksum = ""
 	}
 	return s.uploadS3Chunks(ctx, s3ChunkUploadConfig{
-		request:            request,
-		streamBody:         streamBody,
-		admissionProtocol:  s3PutAdmissionProtocolForPayload(expectedPayloadSHA),
-		tooLargeMessage:    "object exceeds maximum allowed size",
+		body:               in.body,
+		contentLength:      in.contentLength,
+		streamBody:         in.streamBody,
+		admissionProtocol:  s3PutAdmissionProtocolForPayload(in.payloadSHA),
+		tooLargeMessage:    in.tooLargeMessage,
 		expectedPayloadSHA: payloadChecksum,
 		chunkKey: func(chunkNo uint64) []byte {
 			return s3keys.BlobKey(bucket, state.meta.Generation, objectKey, state.uploadID, 1, chunkNo)
@@ -92,7 +139,7 @@ func (s *S3Server) cleanupS3PutObjectChunks(ctx context.Context, state *s3PutObj
 	s.cleanupManifestBlobs(ctx, bucket, state.meta.Generation, objectKey, manifest)
 }
 
-func (s *S3Server) commitS3PutObject(ctx context.Context, request *http.Request, state *s3PutObjectState, upload s3ChunkUploadResult, bucket string) (bool, error) {
+func (s *S3Server) commitS3PutObject(ctx context.Context, in *s3PutObjectInput, state *s3PutObjectState, upload s3ChunkUploadResult, bucket string) (bool, error) {
 	commitTS, err := s.nextTxnCommitTS(ctx, state.startTS)
 	if err != nil {
 		return false, errors.WithStack(err)
@@ -102,11 +149,11 @@ func (s *S3Server) commitS3PutObject(ctx context.Context, request *http.Request,
 		ETag:               upload.ETag,
 		SizeBytes:          upload.SizeBytes,
 		LastModifiedHLC:    commitTS,
-		ContentType:        headerOrDefault(request.Header.Get("Content-Type"), "application/octet-stream"),
-		ContentEncoding:    cleanStoredContentEncoding(request.Header.Get("Content-Encoding")),
-		CacheControl:       request.Header.Get("Cache-Control"),
-		ContentDisposition: request.Header.Get("Content-Disposition"),
-		UserMetadata:       collectS3UserMetadata(request.Header),
+		ContentType:        in.contentType,
+		ContentEncoding:    in.contentEncoding,
+		CacheControl:       in.cacheControl,
+		ContentDisposition: in.contentDisposition,
+		UserMetadata:       in.userMetadata,
 	}
 	if upload.SizeBytes > 0 {
 		manifest.Parts = []s3ObjectPart{{
