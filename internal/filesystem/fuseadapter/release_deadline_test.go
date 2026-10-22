@@ -1,6 +1,7 @@
 package fuseadapter
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -29,13 +30,10 @@ func TestReleaseAfterReadinessSharesTheUnmountDeadline(t *testing.T) {
 	marker := writeRecordingMountHelper(t)
 	ready := make(chan error, 1)
 	time.AfterFunc(1600*time.Millisecond, func() { ready <- nil })
-	hung := make(chan struct{})
-	t.Cleanup(func() { close(hung) })
-
 	start := time.Now()
-	releaseAfterReadiness(ready, func() error {
-		<-hung
-		return nil
+	releaseAfterReadiness(ready, func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
 	}, mountPoint, fuseTypeFor(filesystemName))
 	elapsed := time.Since(start)
 	require.FileExists(t, marker, "the hung unmount must be followed by the lazy detach")
@@ -56,7 +54,7 @@ func TestReleaseAfterReadinessBoundsTheLazyDetach(t *testing.T) {
 
 	unmounted := make(chan struct{}, 1)
 	start := time.Now()
-	releaseAfterReadiness(make(chan error), func() error {
+	releaseAfterReadiness(make(chan error), func(context.Context) error {
 		unmounted <- struct{}{}
 		return nil
 	}, mountPoint, fuseTypeFor(filesystemName))
@@ -76,7 +74,7 @@ func TestReleaseAbandonedSkipsUnmountPastItsDeadline(t *testing.T) {
 	marker := writeRecordingMountHelper(t)
 	unmounted := make(chan struct{}, 1)
 
-	releaseAbandonedBy(time.Now().Add(-time.Millisecond), func() error {
+	releaseAbandonedBy(time.Now().Add(-time.Millisecond), func(context.Context) error {
 		unmounted <- struct{}{}
 		return nil
 	}, mountPoint, fuseTypeFor(filesystemName))

@@ -618,13 +618,17 @@ func runDetachHelper(ctx context.Context, bin, mountPoint string) error {
 }
 
 func runUnmountHelper(ctx context.Context, bin, mountPoint string, lazy bool) error {
-	cmdCtx, cancel := context.WithTimeout(ctx, detachHelperTimeout(ctx))
-	defer cancel()
 	args := []string{"-u"}
 	if lazy {
 		args = append(args, "-z")
 	}
 	args = append(args, mountPoint)
+	return runMountHelper(ctx, bin, args)
+}
+
+func runMountHelper(ctx context.Context, bin string, args []string) error {
+	cmdCtx, cancel := context.WithTimeout(ctx, detachHelperTimeout(ctx))
+	defer cancel()
 	//nolint:gosec // bin comes from LookPath over two fixed helper names and mountPoint is the operator's configured path.
 	cmd := exec.CommandContext(cmdCtx, bin, args...)
 	finish := isolateMountHelper(cmd)
