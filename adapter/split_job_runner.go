@@ -437,6 +437,10 @@ func (s *DistributionServer) runSplitJobCopyPhase(ctx context.Context, job distr
 	if job.Phase == distribution.SplitJobPhaseBackfill {
 		return s.copySplitJobPhase(ctx, job, distribution.SplitJobExportPhaseBackfill, 0, job.SnapshotTS)
 	}
+	ready, err := s.preflightSplitJobTransfer(ctx, job)
+	if err != nil || !ready {
+		return err
+	}
 	return s.copySplitJobPhase(ctx, job, distribution.SplitJobExportPhaseDeltaCopy, job.DeltaFloor, job.FenceTS)
 }
 
@@ -1349,7 +1353,7 @@ func (s *DistributionServer) copySplitJobPhase(
 		ExcludePrefixes:      bracket.ExcludePrefixes,
 	})
 	if err != nil {
-		return errors.WithStack(err)
+		return errors.WithStack(migrationSourceExportError(err))
 	}
 	return s.copySplitJobStream(ctx, job, progressIndex, bracket, progress, stream, target)
 }
@@ -1369,7 +1373,7 @@ func (s *DistributionServer) copySplitJobStream(
 			return nil
 		}
 		if recvErr != nil {
-			return errors.WithStack(recvErr)
+			return errors.WithStack(migrationSourceExportError(recvErr))
 		}
 		nextCursor := distribution.CloneBytes(resp.GetNextCursor())
 		batchSeq := progress.LastAckedBatchSeq + 1
@@ -1529,6 +1533,10 @@ func (s *DistributionServer) advanceCompletedCopyPhase(ctx context.Context, job 
 }
 
 func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job distribution.SplitJob) error {
+	ready, err := s.preflightSplitJobTransfer(ctx, job)
+	if err != nil || !ready {
+		return err
+	}
 	snapshot, sourceRoute, err := s.splitJobSourceRoute(ctx, job)
 	if err != nil {
 		return err
@@ -1667,6 +1675,13 @@ func (s *DistributionServer) ensureSplitJobCatalogFence(
 	if sourceRoute.RouteID != job.SourceRouteID {
 		return snapshot, sourceRoute, nil
 	}
+	current, found, err := s.catalog.SplitJobAt(ctx, job.JobID, snapshot.ReadTS)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, errors.WithStack(err)
+	}
+	if !found || current.Phase != distribution.SplitJobPhaseFence {
+		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, errors.WithStack(store.ErrWriteConflict)
+	}
 	leftID, rightID, err := s.allocateChildRouteIDs(ctx, snapshot.ReadTS, snapshot.Routes)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, err
@@ -1686,7 +1701,7 @@ func (s *DistributionServer) ensureSplitJobCatalogFence(
 		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, grpcStatusErrorf(
 			codes.Internal, "begin split job fence snapshot: %v", err)
 	}
-	snapshot, err = s.saveSplitResultViaCoordinator(ctx, readTimestamp, snapshot.Version, sourceRoute.RouteID, nil, left, right)
+	snapshot, err = s.saveSplitResultViaCoordinator(ctx, readTimestamp, snapshot.Version, sourceRoute.RouteID, [][]byte{distribution.CatalogSplitJobKey(job.JobID)}, left, right)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, err
 	}

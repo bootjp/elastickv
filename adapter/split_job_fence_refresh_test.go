@@ -44,7 +44,13 @@ func TestSplitJobFenceRefreshesMinimumAfterDrainingLocks(t *testing.T) {
 	job.SnapshotTS = 40
 	job.Phase = distribution.SplitJobPhaseFence
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
-	require.NoError(t, server.finalizeSplitJobFence(ctx, job))
+	for range len(job.BracketProgress) + 3 {
+		require.NoError(t, server.finalizeSplitJobFence(ctx, job))
+		job = loadTransferJob(t, ctx, catalog, job.JobID)
+		if job.Phase == distribution.SplitJobPhaseDeltaCopy {
+			break
+		}
+	}
 	persisted, found, err := catalog.SplitJob(ctx, job.JobID)
 	require.NoError(t, err)
 	require.True(t, found)

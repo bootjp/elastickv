@@ -3111,7 +3111,16 @@ func TestDistributionServerRunSplitJobRunnerOnce_CompletesCrossGroupMigration(t 
 	require.NotEmpty(t, source.controls)
 	require.NotEmpty(t, target.controls)
 	require.NotEmpty(t, source.exports)
-	require.Len(t, target.imports, len(source.exports))
+	require.True(t, completed.TransferPreflightDone)
+	preflightExports := 0
+	for _, req := range source.exports {
+		if req.GetMaxCommitTs() == completed.TransferPreflightTS {
+			require.Zero(t, req.GetMinCommitTs())
+			preflightExports++
+		}
+	}
+	require.Equal(t, len(completed.TransferPreflightProgress), preflightExports)
+	require.Len(t, target.imports, len(source.exports)-preflightExports)
 	require.GreaterOrEqual(t, len(source.events), 2)
 	require.Equal(t, []string{"control", "timestamp"}, source.events[:2], "the tracker barrier must precede snapshot timestamp selection")
 

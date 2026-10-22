@@ -26,7 +26,9 @@ func RetrySplitJobState(job SplitJob, nowMs int64) (SplitJob, error) {
 	if out.Phase != SplitJobPhaseAbandoning {
 		out.AbandonFromPhase = SplitJobPhaseNone
 	}
-	out.LastError = ""
+	if out.Phase != SplitJobPhaseAbandoning {
+		out.LastError = ""
+	}
 	out.UpdatedAtMs = nowMs
 	return out, nil
 }
@@ -39,6 +41,9 @@ func FailSplitJobState(job SplitJob, diagnostic string, nowMs int64) (SplitJob, 
 	}
 	out := CloneSplitJob(job)
 	out.Phase, out.RetryPhase = SplitJobPhaseFailed, job.Phase
+	if job.Phase == SplitJobPhaseAbandoning && job.LastError != "" {
+		diagnostic = job.LastError
+	}
 	out.LastError, out.UpdatedAtMs = diagnostic, nowMs
 	return out, nil
 }

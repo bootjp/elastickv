@@ -654,6 +654,11 @@ func (i *Internal) streamExportRangeVersions(req *pb.ExportRangeVersionsRequest,
 // Carrying values that large needs a chunked migration wire format, which is a
 // protocol change rather than a fix here.
 func checkMigrationExportPageSize(resp *pb.ExportRangeVersionsResponse) error {
+	for _, version := range resp.GetVersions() {
+		if !store.MigrationVersionFitsTransfer(version.GetKey(), version.GetValue()) {
+			return migrationOversizedVersionError(version)
+		}
+	}
 	if migrationExportPagePayloadBytes(resp) <= migrationExportPageByteBudget {
 		return nil
 	}

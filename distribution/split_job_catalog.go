@@ -135,6 +135,10 @@ type SplitJobBracketProgress struct {
 
 // SplitJob is the durable default-group state for a range split migration.
 type SplitJob struct {
+	TransferPreflightVersion         uint32
+	TransferPreflightTS              uint64
+	TransferPreflightProgress        []SplitJobBracketProgress
+	TransferPreflightDone            bool
 	JobID                            uint64
 	SourceRouteID                    uint64
 	SourceGroupID                    uint64
@@ -588,7 +592,10 @@ func validateSplitJob(job SplitJob) error {
 	if err := validateSplitJobBarriers(job); err != nil {
 		return err
 	}
-	return validateSplitJobBracketProgress(job.BracketProgress)
+	if err := validateSplitJobBracketProgress(job.BracketProgress); err != nil {
+		return err
+	}
+	return validateSplitJobBracketProgress(job.TransferPreflightProgress)
 }
 
 func validateSplitJobPhases(job SplitJob) error {
@@ -924,6 +931,10 @@ func splitJobLess(left, right SplitJob) bool {
 
 func CloneSplitJob(job SplitJob) SplitJob {
 	return SplitJob{
+		TransferPreflightVersion:         job.TransferPreflightVersion,
+		TransferPreflightTS:              job.TransferPreflightTS,
+		TransferPreflightProgress:        cloneSplitJobBracketProgress(job.TransferPreflightProgress),
+		TransferPreflightDone:            job.TransferPreflightDone,
 		JobID:                            job.JobID,
 		SourceRouteID:                    job.SourceRouteID,
 		SplitKey:                         CloneBytes(job.SplitKey),
@@ -970,6 +981,10 @@ func SplitJobToProto(job SplitJob) *pb.SplitJob {
 func splitJobToProto(job SplitJob) *pb.SplitJob {
 	job = CloneSplitJob(job)
 	return &pb.SplitJob{
+		TransferPreflightVersion:         job.TransferPreflightVersion,
+		TransferPreflightTs:              job.TransferPreflightTS,
+		TransferPreflightProgress:        splitJobBracketProgressToProto(job.TransferPreflightProgress),
+		TransferPreflightDone:            job.TransferPreflightDone,
 		JobId:                            job.JobID,
 		SourceRouteId:                    job.SourceRouteID,
 		SplitKey:                         job.SplitKey,
@@ -1036,6 +1051,10 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 	if err != nil {
 		return SplitJob{}, err
 	}
+	preflightProgress, err := splitJobBracketProgressFromProto(msg.GetTransferPreflightProgress())
+	if err != nil {
+		return SplitJob{}, err
+	}
 	return SplitJob{
 		JobID:                            msg.GetJobId(),
 		SourceRouteID:                    msg.GetSourceRouteId(),
@@ -1065,6 +1084,10 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 		SourceReadDrainCursor:            CloneBytes(msg.GetSourceReadDrainCursor()),
 		TargetClearedDescriptorAckCursor: CloneBytes(msg.GetTargetClearedDescriptorAckCursor()),
 		BracketProgress:                  bracketProgress,
+		TransferPreflightVersion:         msg.GetTransferPreflightVersion(),
+		TransferPreflightTS:              msg.GetTransferPreflightTs(),
+		TransferPreflightProgress:        preflightProgress,
+		TransferPreflightDone:            msg.GetTransferPreflightDone(),
 		SourceRetentionPinTS:             msg.GetSourceRetentionPinTs(),
 		LastError:                        msg.GetLastError(),
 		StartedAtMs:                      msg.GetStartedAtMs(),

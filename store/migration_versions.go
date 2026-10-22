@@ -11,8 +11,8 @@ import (
 )
 
 // MigrationPagePayloadBudget leaves framing headroom in the 64 MiB peer
-// transport. A source tracker admits only versions that fit even with a
-// full-key cursor, so delta copy cannot discover an untransferable new row.
+// transport. Transfer checks include a full-key cursor; this is not a limit
+// on ordinary writes, which retain their existing admission semantics.
 const MigrationPagePayloadBudget = 63 << 20
 
 func MigrationVersionFitsTransfer(key, value []byte) bool {

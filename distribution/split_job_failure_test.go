@@ -28,7 +28,11 @@ func TestSplitJobFailurePreservesExactRetryPhase(t *testing.T) {
 			require.Equal(t, job.AbandonFromPhase, retried.AbandonFromPhase)
 			require.Equal(t, job.SourceRetentionPinTS, retried.SourceRetentionPinTS)
 			require.Equal(t, job.FenceTS, retried.FenceTS)
-			require.Empty(t, retried.LastError)
+			if phase == SplitJobPhaseAbandoning {
+				require.Equal(t, "broken phase", retried.LastError, "compensation retries retain the original failure evidence")
+			} else {
+				require.Empty(t, retried.LastError)
+			}
 			_, err = EncodeSplitJob(retried)
 			require.NoError(t, err)
 		})

@@ -184,6 +184,12 @@ message SplitJob {
   // time because the route shape it can otherwise be recovered from
   // disappears once the source child is itself split.
   uint64 source_group_id = 35;
+  // Version 1 preflight checks every transfer family and relevant MVCC version.
+  // Missing fields on legacy jobs never attest that this scan completed.
+  uint32 transfer_preflight_version = 36;
+  uint64 transfer_preflight_ts = 37;
+  repeated SplitJobBracketProgress transfer_preflight_progress = 38;
+  bool transfer_preflight_done = 39;
 }
 
 message ListRoutesRequest {}

@@ -25,6 +25,9 @@ type splitJobFailureState struct {
 
 func (s *DistributionServer) runSplitJobAttempt(ctx context.Context, job distribution.SplitJob) error {
 	err := s.runSplitJobPhase(ctx, job)
+	if errors.Is(err, errMigrationOversizedSourceVersion) && splitTransferCanAutoAbandon(job.Phase) {
+		return errors.WithStack(errors.CombineErrors(err, s.abandonOversizedSplitTransfer(ctx, job, err)))
+	}
 	key := splitJobAttemptKey{jobID: job.JobID, phase: job.Phase}
 	if splitJobPhaseErrorRetryable(err) {
 		s.resetSplitJobFailures(key)
