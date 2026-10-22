@@ -36,6 +36,7 @@ const (
 
 var (
 	splitCleanupDoneCursor                  = []byte{splitCleanupCursorVersion, 0xff, 0xff, 0xff, 0xff}
+	splitSourceCleanupDoneCursor            = []byte{2, 0xff, 0xff, 0xff, 0xff}
 	errSplitMigrationVoterBarrierIncomplete = errors.New("split migration voter barrier incomplete")
 )
 
@@ -442,7 +443,7 @@ func (s *DistributionServer) cleanupVerifiedSplitJob(ctx context.Context, job di
 		}
 		return nil
 	}
-	if !bytes.Equal(job.Cursor, splitCleanupDoneCursor) {
+	if !bytes.Equal(job.Cursor, splitSourceCleanupDoneCursor) {
 		return s.cleanupSplitJobSourceData(ctx, job)
 	}
 	if job.SourceRetentionPinTS != math.MaxUint64 {
@@ -648,11 +649,11 @@ func (s *DistributionServer) cleanupSplitJobSourceData(ctx context.Context, job 
 	if err != nil {
 		return err
 	}
-	brackets, err := distribution.PlanExportBrackets(job.SplitKey, routeEnd)
+	brackets, err := distribution.PlanCleanupBrackets(job.SplitKey, routeEnd)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	index, cursor, done, err := decodeSplitCleanupCursor(job.Cursor, len(brackets))
+	index, cursor, done, err := decodeSplitSourceCleanupCursor(job.Cursor, len(brackets))
 	if err != nil || done {
 		return err
 	}
@@ -665,6 +666,9 @@ func (s *DistributionServer) cleanupSplitJobSourceData(ctx context.Context, job 
 	if err != nil {
 		return err
 	}
+	if bytes.Equal(encoded, splitCleanupDoneCursor) {
+		encoded = distribution.CloneBytes(splitSourceCleanupDoneCursor)
+	}
 	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase == distribution.SplitJobPhaseCleanup && bytes.Equal(current.Cursor, job.Cursor) {
 			current.Cursor = encoded
@@ -672,6 +676,17 @@ func (s *DistributionServer) cleanupSplitJobSourceData(ctx context.Context, job 
 		}
 		return current, nil
 	})
+}
+
+func decodeSplitSourceCleanupCursor(raw []byte, bracketCount int) (int, []byte, bool, error) {
+	if bytes.Equal(raw, splitSourceCleanupDoneCursor) {
+		return bracketCount, nil, true, nil
+	}
+	if bytes.Equal(raw, splitCleanupDoneCursor) {
+		// A live job completed the old plan before seals had a cleanup bracket.
+		return bracketCount - 1, nil, false, nil
+	}
+	return decodeSplitCleanupCursor(raw, bracketCount)
 }
 
 func nextSplitCleanupCursor(resp *pb.CleanupMigrationResponse, cursor []byte, index, bracketCount int) ([]byte, error) {

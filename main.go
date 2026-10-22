@@ -423,8 +423,8 @@ func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Co
 }
 
 func run() error {
-	if err := internalutil.ConfigureGRPCTLS(*grpcTLSCAFile, *grpcTLSCertFile, *grpcTLSKeyFile); err != nil {
-		return errors.Wrap(err, "configure peer gRPC transport")
+	if err := configureNodeGRPCTransport(); err != nil {
+		return err
 	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs()
 	if err != nil {
@@ -3304,6 +3304,34 @@ func validateMigrationOpcodeAuth(token string, insecureNoAuth bool) error {
 	}
 	if adapter.MigrationImportOpcodeEnabledFromEnv() || adapter.MigrationPromoteOpcodeEnabledFromEnv() || adapter.MigrationCleanupOpcodeEnabledFromEnv() {
 		return errors.New("migration opcodes require --splitMigrationTokenFile or explicit test-only --adminInsecureNoAuth")
+	}
+	return nil
+}
+
+func validateMigrationStartupAuth() error {
+	auth, err := loadNodeGRPCAuth(*adminTokenFile, *adminInsecureNoAuth, *s3BlobPeerTokenFile, *splitMigrationTokenFile)
+	if err != nil {
+		return err
+	}
+	return validateMigrationPeerSecurity(auth.migrationToken, *adminInsecureNoAuth, *splitMigrationPeerAuthEnforced, *grpcTLSCertFile != "" && *grpcTLSKeyFile != "")
+}
+
+func configureNodeGRPCTransport() error {
+	if err := internalutil.ConfigureGRPCTLS(*grpcTLSCAFile, *grpcTLSCertFile, *grpcTLSKeyFile); err != nil {
+		return errors.Wrap(err, "configure peer gRPC transport")
+	}
+	return validateMigrationStartupAuth()
+}
+
+func validateMigrationPeerSecurity(token string, insecureNoAuth, enforced, tlsEnabled bool) error {
+	if insecureNoAuth {
+		return nil
+	}
+	if enforced && token == "" {
+		return errors.New("--splitMigrationPeerAuthEnforced requires --splitMigrationTokenFile")
+	}
+	if token != "" && !tlsEnabled {
+		return errors.New("--splitMigrationTokenFile requires gRPC TLS certificate and key configuration")
 	}
 	return nil
 }

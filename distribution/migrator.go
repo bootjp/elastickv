@@ -60,6 +60,7 @@ const (
 	// would renumber families that peers already use.
 	MigrationFamilyFilesystemChunk
 	MigrationFamilyFilesystemUsage
+	MigrationFamilyDynamoSnapshotSeal
 )
 
 const (
@@ -81,6 +82,7 @@ const (
 	migrationDynamoGenPrefix            = "!ddb|meta|gen|"
 	migrationDynamoItemPrefix           = "!ddb|item|"
 	migrationDynamoGSIPrefix            = "!ddb|gsi|"
+	migrationDynamoSealPrefix           = "!ddb|seal|"
 	migrationStagedDataPrefix           = "!dist|migstage|"
 )
 
@@ -199,6 +201,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(migrationDynamoGenPrefix),
 	[]byte(migrationDynamoItemPrefix),
 	[]byte(migrationDynamoGSIPrefix),
+	[]byte(migrationDynamoSealPrefix),
 	[]byte(migrationSQSQueueMetaPrefix),
 	[]byte(migrationSQSQueueGenPrefix),
 	[]byte(migrationSQSQueueSeqPrefix),
@@ -292,6 +295,20 @@ func PlanExportBrackets(routeStart, routeEnd []byte) ([]MigrationBracket, error)
 		out = append(out, bracket)
 	}
 	return out, nil
+}
+
+// PlanCleanupBrackets preserves export-plan cursor indexes and appends OCC
+// seals. Seals are local conflict witnesses, not snapshot data to import.
+func PlanCleanupBrackets(routeStart, routeEnd []byte) ([]MigrationBracket, error) {
+	brackets, err := PlanExportBrackets(routeStart, routeEnd)
+	if err != nil {
+		return nil, err
+	}
+	start := []byte(migrationDynamoSealPrefix)
+	return append(brackets, MigrationBracket{
+		BracketID: uint64(MigrationFamilyDynamoSnapshotSeal), Family: MigrationFamilyDynamoSnapshotSeal,
+		Start: start, End: prefixScanEnd(start), RequiresRouteKeyCheck: true,
+	}), nil
 }
 
 // SplitJobBracketProgressForPlan creates durable per-bracket resume state for

@@ -81,6 +81,7 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 	t.Parallel()
 	unary, _ := SplitMigrationTokenAuth("", false, true)
 	for _, method := range []string{
+		pb.Internal_Forward_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
@@ -112,15 +113,12 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 func TestSplitMigrationTokenAuthLeavesNormalPeerRPCsUnchanged(t *testing.T) {
 	t.Parallel()
 	for _, token := range []string{"", "migration-secret"} {
-		unary, stream := SplitMigrationTokenAuth(token, false, true)
+		unary, stream := SplitMigrationTokenAuth(token, false, false)
 		for _, method := range []string{
 			pb.Internal_Forward_FullMethodName,
 			pb.Distribution_ListRoutes_FullMethodName,
 			pb.Distribution_GetSplitMigrationCapability_FullMethodName,
 		} {
-			if token != "" && method == pb.Internal_Forward_FullMethodName {
-				continue
-			}
 			ctx := context.Background()
 			called := false
 			_, err := unary(ctx, nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {

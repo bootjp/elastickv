@@ -39,10 +39,10 @@ func splitMigrationProtectedMethod(method string) bool {
 	}
 }
 
-func splitMigrationAuthenticatedMethod(method, token string, peerAuthEnforced bool) bool {
+func splitMigrationAuthenticatedMethod(method string, peerAuthEnforced bool) bool {
 	// Forward can write arbitrary system/transaction metadata. In a migration
 	// cluster it is a privileged peer RPC, not an alternative public write API.
-	return splitMigrationProtectedMethod(method) || (peerAuthEnforced && token != "" && method == pb.Internal_Forward_FullMethodName)
+	return splitMigrationProtectedMethod(method) || (peerAuthEnforced && method == pb.Internal_Forward_FullMethodName)
 }
 
 // SplitMigrationTokenAuth protects migration control and raw MVCC exports.
@@ -54,7 +54,7 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth, peerAuthEnforced bool
 		return nil, nil
 	}
 	authUnary, authStream := bearerTokenAuth(token, func(method string) bool {
-		return splitMigrationAuthenticatedMethod(method, token, peerAuthEnforced)
+		return splitMigrationAuthenticatedMethod(method, peerAuthEnforced)
 	}, "split migration controller")
 	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 		if err := checkSplitMigrationTransport(ctx, info.FullMethod, token, peerAuthEnforced); err != nil {
@@ -78,7 +78,7 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth, peerAuthEnforced bool
 }
 
 func checkSplitMigrationTransport(ctx context.Context, method, token string, peerAuthEnforced bool) error {
-	if !splitMigrationAuthenticatedMethod(method, token, peerAuthEnforced) {
+	if !splitMigrationAuthenticatedMethod(method, peerAuthEnforced) {
 		return nil
 	}
 	if token == "" {
