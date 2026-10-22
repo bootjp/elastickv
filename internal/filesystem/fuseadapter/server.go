@@ -201,13 +201,26 @@ func (r *RawFileSystem) Access(cancel <-chan struct{}, input *fuse.AccessIn) fus
 func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
-	result, errno := r.adapter.Create(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
+	// EAGAIN can hide an already-applied create whose reply was lost. Do not
+	// replay it and turn its original outcome into a collision/open result.
+	return r.createOrOpen(ctx, input, []byte(name), out)
+}
+
+func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, name []byte, out *fuse.CreateOut) fuse.Status {
+	opts := filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
 		UID:  input.Uid,
 		GID:  input.Gid,
-	})
+	}
+	result, errno := r.adapter.Create(ctx, input.NodeId, name, opts)
+	if errno == syscall.EEXIST && input.Flags&syscall.O_EXCL == 0 {
+		// A successful FUSE_CREATE always marks the descriptor newly created.
+		// ESTALE makes Linux do_filp_open retry path lookup with LOOKUP_REVAL,
+		// preserving normal permission checks, truncation and created status.
+		return fuse.Status(syscall.ESTALE)
+	}
 	if errno != 0 {
-		return fuse.Status(errno)
+		return fuse.ToStatus(errno)
 	}
 	r.fillEntry(&out.EntryOut, result.Stat)
 	out.Fh = result.FH

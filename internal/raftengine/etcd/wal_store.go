@@ -542,7 +542,16 @@ func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) 
 		return errors.Wrapf(ErrFSMSnapshotFileCRC,
 			"path=%s footer=%08x computed=%08x", snapPath, footer, computed)
 	}
+	return applyVerifiedSnapshotHeader(fsm, file, info.Size()-fsmFooterSize)
+}
 
+func applyVerifiedSnapshotHeader(fsm StateMachine, file *os.File, payloadSize int64) error {
+	if setter, ok := fsm.(interface{ RestoreSnapshotHeader(io.Reader) error }); ok {
+		if _, err := file.Seek(0, io.SeekStart); err != nil {
+			return errors.WithStack(err)
+		}
+		return errors.Wrap(setter.RestoreSnapshotHeader(io.LimitReader(file, payloadSize)), "restore verified snapshot header")
+	}
 	setter, hasSetter := fsm.(raftengine.SnapshotHeaderApplier)
 	if !hasSetter {
 		return nil
@@ -551,7 +560,6 @@ func applyHeaderStateOnSkip(fsm StateMachine, snapPath string, tokenCRC uint32) 
 	if _, err := file.Seek(0, io.SeekStart); err != nil {
 		return errors.WithStack(err)
 	}
-	payloadSize := info.Size() - fsmFooterSize
 	ceiling, cutover, err := setter.ParseSnapshotHeader(io.LimitReader(file, payloadSize))
 	if err != nil {
 		return errors.WithStack(err)
