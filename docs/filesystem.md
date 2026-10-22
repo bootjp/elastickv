@@ -228,15 +228,21 @@ filesystem it was asked to expose.
 ## Stopping and restarting
 
 `SIGTERM` and `SIGINT` stop the server gracefully: the first signal is logged
-as `shutdown signal received, stopping`, the FUSE mount is unmounted, the
+as `shutdown signal received, stopping`. Once startup has completed, the server
+first transfers its Raft leaderships under one shared five-second deadline,
+rechecking groups that acquire leadership during another handoff. The transport
+stays available during that window. Startup signals cancel immediately so mount
+startup can unwind. Afterwards, the FUSE mount is unmounted, the
 listeners drain, and the WAL is synced before the process exits with status
 0. That status is for a clean shutdown, one whose only errors are the
 cancellation itself; a component that fails while stopping still makes the
 process exit with an error after the same cleanup. Repeated
 `SIGTERM`/`SIGINT` while that shutdown is running are logged and ignored so
 a supervisor's second stop attempt cannot cut the cleanup short.
-This is the same path the server takes when a component fails or the memory
-watchdog trips (which still exits with status 2). If the unmount fails because
+After the handoff, cleanup follows the same path as a component failure or a
+memory-watchdog stop (which still exits with status 2); those stops skip the
+handoff. Include its five-second window in the supervisor's grace period in
+addition to the drain budgets below and storage cleanup. If the unmount fails because
 a client still holds files on the mount open (`EBUSY`), the server detaches
 the mount lazily instead: new lookups see the plain directory at once, and
 the server stops serving, so a request still in flight, or one made through

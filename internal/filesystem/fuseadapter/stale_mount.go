@@ -480,8 +480,19 @@ var mountHelperFallbackDir = "/bin"
 
 // lookupMountHelperFn locates a helper; a variable so tests can stand in a
 // lookup that blocks, as exec.LookPath does when a PATH directory sits on an
-// unresponsive filesystem.
-var lookupMountHelperFn = lookupMountHelper
+// unresponsive filesystem. Nil selects the default lookup with a snapshot of
+// its fallback directory, taken before launching the bounded worker.
+var lookupMountHelperFn func(string) (string, error)
+
+func snapshotMountHelperLookup() func(string) (string, error) {
+	if lookup := lookupMountHelperFn; lookup != nil {
+		return lookup
+	}
+	fallbackDir := mountHelperFallbackDir
+	return func(name string) (string, error) {
+		return lookupMountHelperIn(name, fallbackDir)
+	}
+}
 
 // lookupMountHelperContext runs the helper lookup under the same share of
 // ctx's deadline a helper invocation gets. exec.LookPath stats each PATH
@@ -490,17 +501,24 @@ var lookupMountHelperFn = lookupMountHelper
 // wait is bounded; a lookup that does not answer in time counts as the
 // helper not being found, which keeps the kernel fallback reachable.
 func lookupMountHelperContext(ctx context.Context, name string) (string, error) {
+	if err := ctx.Err(); err != nil {
+		return "", errors.Wrapf(err, "locate mount helper %s", name)
+	}
+	timeout := detachHelperTimeout(ctx)
+	if timeout <= 0 {
+		return "", errors.Errorf("locate mount helper %s: no answer within its share of the detach budget", name)
+	}
 	type lookupResult struct {
 		path string
 		err  error
 	}
 	results := make(chan lookupResult, 1)
-	lookup := lookupMountHelperFn
+	lookup := snapshotMountHelperLookup()
 	go func() {
 		path, err := lookup(name)
 		results <- lookupResult{path: path, err: err}
 	}()
-	timer := time.NewTimer(detachHelperTimeout(ctx))
+	timer := time.NewTimer(timeout)
 	defer timer.Stop()
 	select {
 	case res := <-results:
@@ -515,10 +533,14 @@ func lookupMountHelperContext(ctx context.Context, name string) (string, error) 
 // lookupMountHelper finds a fusermount helper the way go-fuse does: PATH
 // first, then mountHelperFallbackDir.
 func lookupMountHelper(name string) (string, error) {
+	return lookupMountHelperIn(name, mountHelperFallbackDir)
+}
+
+func lookupMountHelperIn(name, fallbackDir string) (string, error) {
 	if path, err := exec.LookPath(name); err == nil {
 		return path, nil
 	}
-	path, err := exec.LookPath(filepath.Join(mountHelperFallbackDir, name))
+	path, err := exec.LookPath(filepath.Join(fallbackDir, name))
 	if err != nil {
 		return "", errors.Wrapf(err, "locate mount helper %s", name)
 	}

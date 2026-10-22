@@ -747,7 +747,9 @@ func writeRecordingMountHelper(t *testing.T) string {
 	t.Helper()
 	helperDir := t.TempDir()
 	marker := filepath.Join(helperDir, "ran")
-	script := "#!/bin/sh\n: > " + marker + "\nexit 0\n"
+	t.Setenv("ELASTICKV_TEST_DETACH_MARKER", marker)
+	// Shell redirection keeps this helper portable across Linux and macOS.
+	script := "#!/bin/sh\n: > \"$ELASTICKV_TEST_DETACH_MARKER\"\nexit 0\n"
 	require.NoError(t, os.WriteFile(filepath.Join(helperDir, "fusermount3"), []byte(script), 0o700)) //nolint:gosec // the helper stand-in must be executable.
 	onlyMountHelpersIn(t, helperDir)
 	return marker
