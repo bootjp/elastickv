@@ -48,7 +48,7 @@ func (s *DistributionServer) runSplitJobAttempt(ctx context.Context, job distrib
 }
 
 func splitJobPhaseErrorRetryable(err error) bool {
-	if err == nil || splitJobRunnerContextDone(err) || errors.Is(err, errSplitMigrationVoterBarrierIncomplete) || errors.Is(err, store.ErrWriteConflict) {
+	if err == nil || splitJobRunnerContextDone(err) || splitJobCoordinatorLeadershipError(err) || errors.Is(err, errSplitMigrationVoterBarrierIncomplete) || errors.Is(err, store.ErrWriteConflict) {
 		return true
 	}
 	switch status.Code(err) {

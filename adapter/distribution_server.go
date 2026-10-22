@@ -2282,7 +2282,7 @@ func splitJobCoordinatorLeadershipError(err error) bool {
 }
 
 var splitJobLeaderErrorPhrases = []string{
-	"not leader",
+	ErrNotLeader.Error(),
 	"leader not found",
 	"leadership lost",
 	"leadership transfer in progress",

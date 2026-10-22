@@ -2025,14 +2025,22 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 		return nil
 	}
 
-	uniq, storeMuts, err := f.onePhaseStoreMutations(ctx, r, muts, r.ReadKeys, startTS, commitTS)
+	uniq, storeMuts, err := f.onePhaseStoreMutations(ctx, r, muts, commitTS)
+	if err != nil {
+		return err
+	}
+	return f.recordAndApplyOnePhase(ctx, uniq, storeMuts, r.ReadKeys, startTS, commitTS)
+}
+
+func (f *kvFSM) recordAndApplyOnePhase(ctx context.Context, uniq []*pb.Mutation, storeMuts []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	readKeys, err := f.onePhaseConflictReadKeys(ctx, uniq, readKeys)
 	if err != nil {
 		return err
 	}
 	if err := f.recordMigrationWrite(ctx, uniq, commitTS); err != nil {
 		return err
 	}
-	if err := f.store.ApplyMutationsRaftAtFenced(ctx, storeMuts, r.ReadKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
+	if err := f.store.ApplyMutationsRaftAtFenced(ctx, storeMuts, readKeys, startTS, commitTS, f.pendingApplyIdx); err != nil {
 		return errors.WithStack(err)
 	}
 	f.notifyApplyObservers(commitTS, uniq)
@@ -2043,15 +2051,10 @@ func (f *kvFSM) onePhaseStoreMutations(
 	ctx context.Context,
 	r *pb.Request,
 	muts []*pb.Mutation,
-	readKeys [][]byte,
-	startTS uint64,
 	commitTS uint64,
 ) ([]*pb.Mutation, []*store.KVPairMutation, error) {
 	uniq, err := f.uniqueMutationsAboveFloorForRequest(ctx, r, muts, commitTS)
 	if err != nil {
-		return nil, nil, err
-	}
-	if err := f.validateTxnConflicts(ctx, uniq, readKeys, startTS); err != nil {
 		return nil, nil, err
 	}
 	storeMuts, err := f.buildOnePhaseStoreMutations(ctx, uniq)
@@ -2059,6 +2062,36 @@ func (f *kvFSM) onePhaseStoreMutations(
 		return nil, nil, err
 	}
 	return uniq, storeMuts, nil
+}
+
+// Check staged versions under the store's atomic conflict/replay boundary.
+// Pre-checking live versions here would reject replay of the same Raft entry.
+func (f *kvFSM) onePhaseConflictReadKeys(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte) ([][]byte, error) {
+	keys := append([][]byte(nil), readKeys...)
+	for _, mut := range muts {
+		keys = append(keys, mut.Key)
+	}
+	out := append([][]byte(nil), readKeys...)
+	seen := make(map[string]struct{}, len(keys))
+	for _, key := range keys {
+		if len(key) == 0 || isTxnInternalKey(key) {
+			continue
+		}
+		if _, found := seen[string(key)]; found {
+			continue
+		}
+		seen[string(key)] = struct{}{}
+		routes, err := f.targetReadyRoutesForRange(ctx, key, nextScanCursor(key))
+		if err != nil {
+			return nil, err
+		}
+		for _, route := range routes {
+			if routeHasStagedVisibility(route) {
+				out = append(out, distribution.MigrationStagedDataKey(route.MigrationJobID, key))
+			}
+		}
+	}
+	return out, nil
 }
 
 func (f *kvFSM) uniqueMutationsAboveFloor(ctx context.Context, muts []*pb.Mutation, commitTS uint64) ([]*pb.Mutation, error) {

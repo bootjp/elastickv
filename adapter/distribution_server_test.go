@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	stderrors "errors"
 	"io"
+	"math"
 	"net"
 	"testing"
 	"time"
@@ -3521,7 +3522,11 @@ func (s *splitMigrationClientStub) ExportRangeVersions(
 	if req.GetMinCommitTs() != 0 {
 		phaseByte = 1
 	}
-	cursor := []byte{byte(req.GetKeyFamily()), phaseByte}
+	family := req.GetKeyFamily()
+	if family > math.MaxUint8 {
+		return nil, errors.New("test key family overflows cleanup cursor")
+	}
+	cursor := []byte{byte(family), phaseByte}
 	return &splitMigrationStreamStub{responses: []*pb.ExportRangeVersionsResponse{{
 		Versions: []*pb.MVCCVersion{{
 			Key:       []byte("n"),

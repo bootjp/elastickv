@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -16,6 +18,8 @@ import (
 func TestSplitJobPhaseErrorClassification(t *testing.T) {
 	t.Parallel()
 	for _, err := range []error{nil, context.Canceled, context.DeadlineExceeded, store.ErrWriteConflict, errSplitMigrationVoterBarrierIncomplete,
+		kv.ErrLeaderNotFound, ErrNotLeader, raftengine.ErrNotLeader, raftengine.ErrLeadershipLost, raftengine.ErrLeadershipTransferInProgress,
+		status.Error(codes.Unknown, "not leader"), status.Error(codes.Unknown, "leader not found"),
 		status.Error(codes.Unavailable, "leader"), status.Error(codes.Aborted, "conflict"), status.Error(codes.ResourceExhausted, "busy")} {
 		require.True(t, splitJobPhaseErrorRetryable(errors.WithStack(err)))
 	}
@@ -23,6 +27,24 @@ func TestSplitJobPhaseErrorClassification(t *testing.T) {
 		status.Error(codes.PermissionDenied, "denied"), status.Error(codes.FailedPrecondition, "witness"), status.Error(codes.DataLoss, "corrupt")} {
 		require.False(t, splitJobPhaseErrorRetryable(errors.WithStack(err)))
 	}
+}
+
+func TestSplitJobLeaderChurnNeverConsumesFailureBudget(t *testing.T) {
+	t.Parallel()
+	ctx, server, catalog, job := failedCleanupFixture(t)
+	for _, leaderErr := range []error{kv.ErrLeaderNotFound, ErrNotLeader, status.Error(codes.Unknown, "not leader"), status.Error(codes.Unknown, "leader not found")} {
+		server.splitMigrationClientFactory = func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+			return nil, nil, leaderErr
+		}
+		for range maxSplitJobPhaseFailures + 1 {
+			require.Error(t, server.RunSplitJobRunnerOnce(ctx))
+		}
+	}
+	current, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.True(t, distribution.SplitJobsEquivalent(job, current))
+	require.Empty(t, server.splitJobFailures)
 }
 
 func TestSplitJobPersistentFailureIsDurableAndRetryable(t *testing.T) {
