@@ -29,6 +29,7 @@ func readyStorage(node string, minRetained uint64) encryption.StorageRetirementR
 		ActiveKeyID:                        successorKeyID,
 		RewriteCursorComplete:              true,
 		ValuesPerDEK:                       0,
+		ValuesPerDEKObserved:               true,
 		MinRetainedTS:                      minRetained,
 		WriteFenceToken:                    writeFenceToken,
 		InFlightWriteDrainObserved:         true,
@@ -86,7 +87,7 @@ func TestRetirementRejectsReportsOutsideMembership(t *testing.T) {
 
 func boundaries(largestProposed uint64) map[uint64]encryption.RaftGroupBoundary {
 	return map[uint64]encryption.RaftGroupBoundary{
-		retireGroup: {KeyID: retiringKeyID, LargestProposedIndex: largestProposed},
+		retireGroup: {KeyID: retiringKeyID, LargestProposedIndex: largestProposed, Observed: true},
 	}
 }
 
@@ -106,6 +107,42 @@ func readyRaft(node string, compact, snapshot uint64) encryption.RaftRetirementR
 // ---------------------------------------------------------------------------
 // Storage purpose
 // ---------------------------------------------------------------------------
+
+func TestStorageRetirementRejectsUnobservedValueCount(t *testing.T) {
+	t.Parallel()
+	for _, count := range []uint64{0, 7} {
+		reports := []encryption.StorageRetirementReport{
+			readyStorage("n1", 200), readyStorage("n2", 200), readyStorage("n3", 200),
+		}
+		reports[1].ValuesPerDEK = count
+		reports[1].ValuesPerDEKObserved = false
+		d, err := classifyStorage(retireMembers, reports, retiringKeyID, 100)
+		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+		require.ErrorContains(t, err, "n2")
+		require.ErrorContains(t, err, "old-key value scan")
+		require.False(t, d.Eligible)
+	}
+}
+
+func TestRaftRetirementRequiresObservedHighWaterMark(t *testing.T) {
+	t.Parallel()
+	reports := []encryption.RaftRetirementReport{
+		readyRaft("n1", 500, 400), readyRaft("n2", 500, 400), readyRaft("n3", 500, 400),
+	}
+	for _, proposed := range []uint64{0, 300} {
+		bounds := boundaries(proposed)
+		boundary := bounds[retireGroup]
+		boundary.Observed = false
+		bounds[retireGroup] = boundary
+		d, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID, bounds)
+		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
+		require.ErrorContains(t, err, "not observed")
+		require.False(t, d.Eligible)
+	}
+	d, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID, boundaries(0))
+	require.NoError(t, err)
+	require.True(t, d.Eligible, "an observed unused key is safe when all remaining criteria pass")
+}
 
 func TestStorageRetirementEligibleWhenEveryCriterionHolds(t *testing.T) {
 	t.Parallel()
@@ -644,9 +681,9 @@ func TestRaftRetirementChecksEveryGroupAgainstItsOwnBoundary(t *testing.T) {
 
 	bounds := map[uint64]encryption.RaftGroupBoundary{
 		// A busy group with high indexes...
-		1: {KeyID: retiringKeyID, LargestProposedIndex: 10_000},
+		1: {KeyID: retiringKeyID, LargestProposedIndex: 10_000, Observed: true},
 		// ...and a quiet one whose indexes are far lower.
-		2: {KeyID: retiringKeyID, LargestProposedIndex: 40},
+		2: {KeyID: retiringKeyID, LargestProposedIndex: 40, Observed: true},
 	}
 
 	t.Run("every group past its own boundary is eligible", func(t *testing.T) {
@@ -724,7 +761,7 @@ func TestRaftRetirementChecksEveryGroupAgainstItsOwnBoundary(t *testing.T) {
 		}
 
 		_, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID,
-			map[uint64]encryption.RaftGroupBoundary{1: {KeyID: retiringKeyID, LargestProposedIndex: 10_000}})
+			map[uint64]encryption.RaftGroupBoundary{1: {KeyID: retiringKeyID, LargestProposedIndex: 10_000, Observed: true}})
 		require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
 	})
 }
@@ -810,7 +847,7 @@ func TestRaftRetirementRejectsReportedGroupsWithoutABoundary(t *testing.T) {
 
 	_, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID,
 		map[uint64]encryption.RaftGroupBoundary{
-			1: {KeyID: retiringKeyID, LargestProposedIndex: 10_000},
+			1: {KeyID: retiringKeyID, LargestProposedIndex: 10_000, Observed: true},
 		})
 	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
 	require.ErrorContains(t, err, "no boundary")
@@ -834,7 +871,7 @@ func TestRaftRetirementRejectsABoundaryForAnotherKey(t *testing.T) {
 
 	_, err := encryption.ClassifyRaftDEKRetirement(retireMembers, reports, retiringKeyID,
 		map[uint64]encryption.RaftGroupBoundary{
-			retireGroup: {KeyID: retiringKeyID + 1, LargestProposedIndex: 10},
+			retireGroup: {KeyID: retiringKeyID + 1, LargestProposedIndex: 10, Observed: true},
 		})
 	require.ErrorIs(t, err, encryption.ErrIncompleteRetirementReport)
 	require.ErrorContains(t, err, "not the retiring key")

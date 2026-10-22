@@ -74,6 +74,9 @@ type StorageRetirementReport struct {
 	// ValuesPerDEK is elastickv_encryption_values_per_dek{key_id} on
 	// this node; zero is required.
 	ValuesPerDEK uint64
+	// ValuesPerDEKObserved is true only after a complete scan of retained
+	// values; an unavailable or partial scan cannot establish a zero count.
+	ValuesPerDEKObserved bool
 	// MinRetainedTS is this node's MVCC retention floor. It must have
 	// advanced past every commit_ts written under the retiring DEK,
 	// or a snapshot read can still legitimately ask for one of those
@@ -145,6 +148,9 @@ type RaftGroupRetirementReport struct {
 
 // RaftGroupBoundary is the old-key high-water mark for one Raft group.
 type RaftGroupBoundary struct {
+	// Observed distinguishes a measured high-water mark (including an unused
+	// key's zero) from an unavailable or incomplete proposal history.
+	Observed bool
 	// KeyID is the DEK this boundary describes. Checked against the key
 	// being retired for the same reason the reports are: without it, a
 	// boundary collected for a different DEK -- key 8's lower
@@ -280,52 +286,69 @@ func storageRetirementBlockers(
 	var blockers []string
 	for _, node := range members {
 		r := byNode[node]
-		if err := checkReportKeyBinding(node, r.ReportedKeyID, r.ActiveKeyID, retiringKeyID); err != nil {
+		if err := validateStorageRetirementEvidence(node, r, retiringKeyID, boundary); err != nil {
 			return nil, err
 		}
-		if r.WriteFenceToken != boundary.WriteFenceToken {
-			return nil, errors.Wrapf(ErrIncompleteRetirementReport,
-				"node %s reported write fence token %d, expected %d",
-				node, r.WriteFenceToken, boundary.WriteFenceToken)
-		}
-		if !r.InFlightWriteDrainObserved {
-			return nil, missingStorageEvidenceErr(node, "in-flight old-key write drain")
-		}
-		if !r.RewriteCursorReferencesObserved {
-			return nil, missingStorageEvidenceErr(node, "rewrite cursor reference scan")
-		}
-		if !r.RetainedSnapshotReferencesObserved {
-			return nil, missingStorageEvidenceErr(node, "retained snapshot reference inventory")
-		}
-		if !r.RewriteCursorComplete {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: rewrite cursor has not reached the end of the keyspace", node))
-		}
-		if r.ValuesPerDEK != 0 {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: %d values still encrypted under this DEK", node, r.ValuesPerDEK))
-		}
-		if r.InFlightOldKeyWrites != 0 {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: %d retiring-key writes are still in flight", node, r.InFlightOldKeyWrites))
-		}
-		if r.RewriteCursorReferences != 0 {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: %d rewrite cursors still reference this DEK", node, r.RewriteCursorReferences))
-		}
-		if r.RetainedSnapshotReferences != 0 {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: %d retained snapshots still reference this DEK", node, r.RetainedSnapshotReferences))
-		}
-		// Strictly greater: a minRetainedTS EQUAL to the largest
-		// commit_ts still admits a read at exactly that version.
-		if boundary.LargestCommitTS != 0 && r.MinRetainedTS <= boundary.LargestCommitTS {
-			blockers = append(blockers,
-				fmt.Sprintf("%s: minRetainedTS %d has not advanced past commit_ts %d",
-					node, r.MinRetainedTS, boundary.LargestCommitTS))
-		}
+		blockers = append(blockers, storageNodeBlockers(node, r, boundary.LargestCommitTS)...)
 	}
 	return blockers, nil
+}
+
+func validateStorageRetirementEvidence(
+	node string, r StorageRetirementReport, retiringKeyID uint32, boundary StorageRetirementBoundary,
+) error {
+	if err := checkReportKeyBinding(node, r.ReportedKeyID, r.ActiveKeyID, retiringKeyID); err != nil {
+		return err
+	}
+	if r.WriteFenceToken != boundary.WriteFenceToken {
+		return errors.Wrapf(ErrIncompleteRetirementReport,
+			"node %s reported write fence token %d, expected %d",
+			node, r.WriteFenceToken, boundary.WriteFenceToken)
+	}
+	if !r.ValuesPerDEKObserved {
+		return missingStorageEvidenceErr(node, "old-key value scan")
+	}
+	if !r.InFlightWriteDrainObserved {
+		return missingStorageEvidenceErr(node, "in-flight old-key write drain")
+	}
+	if !r.RewriteCursorReferencesObserved {
+		return missingStorageEvidenceErr(node, "rewrite cursor reference scan")
+	}
+	if !r.RetainedSnapshotReferencesObserved {
+		return missingStorageEvidenceErr(node, "retained snapshot reference inventory")
+	}
+	return nil
+}
+
+func storageNodeBlockers(node string, r StorageRetirementReport, largestCommitTS uint64) []string {
+	var blockers []string
+	if !r.RewriteCursorComplete {
+		blockers = append(blockers,
+			fmt.Sprintf("%s: rewrite cursor has not reached the end of the keyspace", node))
+	}
+	if r.ValuesPerDEK != 0 {
+		blockers = append(blockers,
+			fmt.Sprintf("%s: %d values still encrypted under this DEK", node, r.ValuesPerDEK))
+	}
+	if r.InFlightOldKeyWrites != 0 {
+		blockers = append(blockers,
+			fmt.Sprintf("%s: %d retiring-key writes are still in flight", node, r.InFlightOldKeyWrites))
+	}
+	if r.RewriteCursorReferences != 0 {
+		blockers = append(blockers,
+			fmt.Sprintf("%s: %d rewrite cursors still reference this DEK", node, r.RewriteCursorReferences))
+	}
+	if r.RetainedSnapshotReferences != 0 {
+		blockers = append(blockers,
+			fmt.Sprintf("%s: %d retained snapshots still reference this DEK", node, r.RetainedSnapshotReferences))
+	}
+	// Equality still admits a read at exactly the last old-key version.
+	if largestCommitTS != 0 && r.MinRetainedTS <= largestCommitTS {
+		blockers = append(blockers,
+			fmt.Sprintf("%s: minRetainedTS %d has not advanced past commit_ts %d",
+				node, r.MinRetainedTS, largestCommitTS))
+	}
+	return blockers
 }
 
 func missingStorageEvidenceErr(node, evidence string) error {
@@ -335,9 +358,7 @@ func missingStorageEvidenceErr(node, evidence string) error {
 
 // ClassifyRaftDEKRetirement applies the §5.4 raft criteria.
 //
-// largestProposedIndex is the largest log index ever proposed under the
-// retiring DEK; rotationIndex is the index of the rotation entry that
-// installed its successor.
+// boundaries contains an observed, key-bound high-water mark for every group.
 func ClassifyRaftDEKRetirement(
 	members []string, reports []RaftRetirementReport,
 	retiringKeyID uint32, boundaries map[uint64]RaftGroupBoundary,
@@ -519,6 +540,10 @@ func raftGroupBlockers(
 	var blockers []string
 	for _, groupID := range groupIDs {
 		boundary := boundaries[groupID]
+		if !boundary.Observed {
+			return nil, errors.Wrapf(ErrIncompleteRetirementReport,
+				"group %d proposal high-water mark was not observed", groupID)
+		}
 		if boundary.KeyID != retiringKeyID {
 			return nil, errors.Wrapf(ErrIncompleteRetirementReport,
 				"group %d boundary describes key %d, not the retiring key %d",

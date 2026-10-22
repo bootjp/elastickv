@@ -1260,6 +1260,8 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
      `elastickv_encryption_values_per_dek{key_id} == 0`
      across every node (verified by `encryption status
      --verify`).
+     The count requires a completed value scan; a missing or partial
+     scan is incomplete evidence even when its numeric count is zero.
    - No persisted rewrite cursor envelope references the retiring
      DEK. Cursor records are counted separately from rewritten user
      values because a stalled job may resume after the key is unloaded.
@@ -1305,6 +1307,9 @@ that DEK is unloaded. The rewrite must therefore be MVCC-aware:
    successor key must be active everywhere. The one-shot
    `raft_envelope_cutover_index` is not a retirement boundary: it is
    frozen at Phase-2 enablement and cannot describe later rotations.
+   Each group's high-water mark must be explicitly observed. An absent
+   or incomplete proposal history cannot use a default zero boundary;
+   an observed zero denotes a key that was never used in that group.
 
    Without the WAL guard, retiring a raft DEK while the WAL
    still contains entries encrypted under it would cause
