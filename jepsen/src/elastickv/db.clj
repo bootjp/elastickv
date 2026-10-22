@@ -374,14 +374,18 @@
   [endpoints operation]
   (util/await-fn
     (fn []
-      (some (fn [endpoint]
-              (try
-                (operation endpoint)
-                true
-                (catch Exception t
-                  (warn t "retrying encryption activation" endpoint)
-                  nil)))
-            endpoints))
+      (or (some (fn [endpoint]
+                  (try
+                    (operation endpoint)
+                    true
+                    (catch InterruptedException t
+                      (throw t))
+                    (catch Exception t
+                      (warn t "retrying encryption activation" endpoint)
+                      nil)))
+                endpoints)
+          (throw (ex-info "no member accepted the encryption operation"
+                          {:endpoints endpoints}))))
     {:timeout 120000
      :log-message "waiting for an encryption leader"}))
 
@@ -412,13 +416,12 @@
       (let [peer-endpoint (encryption-endpoint peer grpc-port raft-groups)]
         (util/await-fn
           (fn []
-            (try
-              (let [state (encryption-status node peer-endpoint)]
-                (and (:storage-envelope-active state)
-                     (:raft-envelope-active state)))
-              (catch Exception t
-                (warn t "retrying encryption status" peer-endpoint)
-                nil)))
+            (let [state (encryption-status node peer-endpoint)]
+              (when-not (and (:storage-envelope-active state)
+                             (:raft-envelope-active state))
+                (throw (ex-info "encryption envelopes are not active on member"
+                                {:endpoint peer-endpoint :state state})))
+              true))
           {:timeout 60000
            :log-message (str "waiting for both envelope cutovers on " peer)})))
     (info "encryption active on every node")))
@@ -446,24 +449,20 @@
         group-ids (when (seq raft-groups) (group-ids raft-groups))]
     (util/await-fn
       (fn []
-        (try
-          (if (seq raft-groups)
-            (doseq [gid group-ids]
-              (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
-              (join-node! bootstrap-node
-                          (group-addr bootstrap-node raft-groups gid)
-                          (name peer)
-                          (group-addr peer raft-groups gid)))
-            (do
-              (wait-for-grpc! peer grpc-port)
-              (join-node! bootstrap-node
-                          (node-addr bootstrap-node grpc-port)
-                          (name peer)
-                          (node-addr peer grpc-port))))
-          true
-          (catch Throwable t
-            (warn t "retrying join for" peer)
-            nil)))
+        (if (seq raft-groups)
+          (doseq [gid group-ids]
+            (wait-for-grpc! peer (port-for (get raft-groups gid) peer))
+            (join-node! bootstrap-node
+                        (group-addr bootstrap-node raft-groups gid)
+                        (name peer)
+                        (group-addr peer raft-groups gid)))
+          (do
+            (wait-for-grpc! peer grpc-port)
+            (join-node! bootstrap-node
+                        (node-addr bootstrap-node grpc-port)
+                        (name peer)
+                        (node-addr peer grpc-port))))
+        true)
       {:timeout 120000
        :log-message (str "joining " peer)})))
 
