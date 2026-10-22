@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal"
@@ -53,6 +54,16 @@ func WithInternalStore(st store.MVCCStore) InternalOption {
 	return func(i *Internal) {
 		i.store = st
 	}
+}
+
+func WithInternalPrimaryCommitEvidence(reader kv.PrimaryCommitEvidenceReader) InternalOption {
+	return func(i *Internal) {
+		i.primaryCommitEvidence = reader
+	}
+}
+
+func WithInternalTSOCutoverState(state interface{ CutoverActive() bool }) InternalOption {
+	return func(i *Internal) { i.tsoCutoverState = state }
 }
 
 func WithInternalMigrationProposer(proposer raftengine.Proposer) InternalOption {
@@ -127,6 +138,10 @@ type Internal struct {
 	lastCommitTimestamp     func() uint64
 	relay                   *RedisPubSubRelay
 	store                   store.MVCCStore
+	primaryCommitEvidence   kv.PrimaryCommitEvidenceReader
+	tsoCutoverState         interface{ CutoverActive() bool }
+	prepareEvidenceToken    string
+	prepareEvidenceScanning atomic.Bool
 	migrationProposer       raftengine.Proposer
 	migrationImportGate     func(context.Context) error
 	migrationPromoteGate    func(context.Context) error
@@ -191,6 +206,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 			Success:     false,
 			CommitIndex: 0,
 		}, errors.WithStack(err)
+	}
+	if err := kv.StampTimestampAdmission(ctx, i.tsAllocator, i.store, req.GetRequests()); err != nil {
+		return nil, errors.WithStack(err)
 	}
 
 	r, err := i.transactionManager.Commit(ctx, req.Requests)
@@ -998,6 +1016,9 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 		}
 	}
 
+	if err := i.validateForwardedPrepareEvidence(ctx, reqs, startTS); err != nil {
+		return 0, err
+	}
 	commitTS, err := i.fillForwardedTxnCommitTS(ctx, reqs, startTS)
 	if err != nil {
 		return 0, err
@@ -1010,9 +1031,19 @@ func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (
 
 func (i *Internal) validateForwardedTxnStartForPhase(ctx context.Context, reqs []*pb.Request, startTS uint64) error {
 	const label = "stampTxnTimestamps: forwarded start ts"
-	if forwardedTxnResolutionOnly(reqs) {
+	if forwardedTxnCreationsHavePrepareProof(reqs) {
 		err := kv.ValidateDurablePersistenceTimestamp(ctx, i.tsAllocator, startTS, label)
 		if errors.Is(err, kv.ErrTSOTimestampPrePhaseD) {
+			// Applied-read vouchers can legitimately retain an old startTS.
+			// The chosen commit proof and current admission epoch are validated
+			// before proposing; no legacy creation-window exemption is needed.
+			return nil
+		}
+		return errors.WithStack(err)
+	}
+	if forwardedTxnResolutionOnly(reqs) {
+		err := kv.ValidateDurablePersistenceTimestamp(ctx, i.tsAllocator, startTS, label)
+		if errors.Is(err, kv.ErrTSOTimestampPrePhaseD) || errors.Is(err, kv.ErrTSOPhaseDInactive) {
 			return nil // Existing intents may need COMMIT or ABORT after the creation window closes.
 		}
 		return errors.WithStack(err)
@@ -1111,7 +1142,9 @@ func (i *Internal) fillForwardedTxnCommitTS(ctx context.Context, reqs []*pb.Requ
 		}
 	} else if err := kv.ValidateForwardedTxnCommitTimestamp(
 		ctx, i.tsAllocator, startTS, commitTS, resolution,
-		"fillForwardedTxnCommitTS: forwarded commit ts"); err != nil {
+		"fillForwardedTxnCommitTS: forwarded commit ts", func(ctx context.Context, pending bool) error {
+			return i.verifyCommitEvidence(ctx, reqs, startTS, commitTS, pending)
+		}); err != nil {
 		// A commit timestamp that arrived already set in the transaction meta
 		// is the timestamp every mutation in this batch is persisted under, and
 		// it never passed through the coordinator's own validation. A legacy

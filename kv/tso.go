@@ -353,6 +353,8 @@ func ValidateDurablePersistenceTimestamp(ctx context.Context, alloc TimestampAll
 
 // ValidateForwardedTxnCommitTimestamp validates the commit timestamp of a
 // forwarded transaction whose caller already stamped it.
+// verifyLegacyResolution, when provided, checks durable primary evidence only
+// for the pre-Phase-D resolution carve-out; it is not called for valid new timestamps.
 //
 // It is ValidateDurablePersistenceTimestamp with one carve-out: a commit
 // timestamp that predates Phase D is accepted when the transaction's own start
@@ -379,8 +381,12 @@ func ValidateForwardedTxnCommitTimestamp(
 	commitTS uint64,
 	resolution bool,
 	label string,
+	verifyLegacyResolution func(context.Context, bool) error,
 ) error {
 	err := ValidateDurablePersistenceTimestamp(ctx, alloc, commitTS, label)
+	if pendingLegacyResolutionNeedsValidation(err, resolution, startTS) {
+		return validatePendingLegacyResolution(ctx, alloc, startTS, commitTS, label, verifyLegacyResolution)
+	}
 	if err == nil || !errors.Is(err, ErrTSOTimestampPrePhaseD) {
 		return err
 	}
@@ -393,9 +399,27 @@ func ValidateForwardedTxnCommitTimestamp(
 	}
 	startErr := ValidateDurablePersistenceTimestamp(ctx, alloc, startTS, label)
 	if startErr != nil && errors.Is(startErr, ErrTSOTimestampPrePhaseD) {
+		if verifyLegacyResolution != nil {
+			return errors.WithStack(verifyLegacyResolution(ctx, false))
+		}
 		return nil
 	}
 	return err
+}
+
+func pendingLegacyResolutionNeedsValidation(err error, resolution bool, startTS uint64) bool {
+	return resolution && startTS != 0 && errors.Is(err, ErrTSOPhaseDInactive)
+}
+
+func validatePendingLegacyResolution(ctx context.Context, alloc TimestampAllocator, startTS, commitTS uint64, label string, verify func(context.Context, bool) error) error {
+	validator, ok := alloc.(DurableLegacyResolutionValidator)
+	if !ok || verify == nil {
+		return errors.Wrap(ErrTSOProtocolUnsupported, label+": pending resolution proof unavailable")
+	}
+	if err := validator.ValidateLegacyResolutionTimestamps(ctx, startTS, commitTS); err != nil {
+		return errors.Wrap(err, label+": pending resolution timestamp bound")
+	}
+	return errors.WithStack(verify(ctx, true))
 }
 
 // ValidateForwardedTxnStartTimestamp validates a start timestamp a forwarded
@@ -894,7 +918,13 @@ func (b *BatchAllocator) FreshAdmissionTimestamp(ctx context.Context) (uint64, e
 		return 0, errors.WithStack(ErrTSOAllocatorRequired)
 	}
 	timestamp, err := b.tso.NextBatch(ctx, 1)
-	return timestamp, errors.Wrap(err, "issue fresh TSO admission timestamp")
+	if err == nil {
+		err = b.rejectPendingPhaseD()
+	}
+	if err != nil {
+		return 0, errors.Wrap(err, "issue fresh TSO admission timestamp")
+	}
+	return timestamp, nil
 }
 
 func (b *BatchAllocator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
@@ -938,15 +968,11 @@ func (b *BatchAllocator) nextAfter(ctx context.Context, min uint64) (uint64, err
 		if err := ctxErr(ctx); err != nil {
 			return 0, err
 		}
-		phaseDAtStart, invalidated := b.ensurePhaseDTransition()
-		if invalidated {
-			continue
+		ts, ok, err := b.claimCurrentWindow(min)
+		if err != nil {
+			return 0, err
 		}
-		if ts, ok := b.tryWindowAfter(min); ok {
-			phaseDAfterClaim, invalidated := b.ensurePhaseDTransition()
-			if invalidated || phaseDAfterClaim != phaseDAtStart {
-				continue
-			}
+		if ok {
 			return ts, nil
 		}
 		if err := b.refill(ctx, min); err != nil {
@@ -1038,6 +1064,17 @@ func (b *BatchAllocator) refill(ctx context.Context, min uint64) error {
 }
 
 func (b *BatchAllocator) nextRefillBatch(ctx context.Context, min uint64) (uint64, error) {
+	base, err := b.requestRefillBatch(ctx, min)
+	if err != nil {
+		return 0, err
+	}
+	if err := b.rejectPendingPhaseD(); err != nil {
+		return 0, err
+	}
+	return base, nil
+}
+
+func (b *BatchAllocator) requestRefillBatch(ctx context.Context, min uint64) (uint64, error) {
 	if after, ok := b.tso.(tsoBatchAfterAllocator); ok && min > 0 {
 		base, err := after.NextBatchAfter(ctx, b.batchSize, min)
 		return base, errors.Wrap(err, "tso next batch after observed ts")

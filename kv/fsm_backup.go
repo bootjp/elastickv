@@ -29,6 +29,16 @@ var backupTimestampFloorKey = []byte(txnBackupPrefix + "timestamp_floor")
 const backupTimestampFloorValueSize = 8
 
 func (f *kvFSM) applyBackup(data []byte) any {
+	if len(data) != 0 && isPrepareEvidenceControlSubtype(data[0]) {
+		entry, err := decodeBackupPayload(data)
+		if err == nil {
+			err = f.applyPrepareEvidenceControl(entry)
+		}
+		if err != nil {
+			return haltErr(errors.Wrap(err, "apply prepare evidence fence"))
+		}
+		return nil
+	}
 	if f.readTracker == nil {
 		return haltErr(errors.Wrap(ErrBackupApply, "kv/fsm: backup entry arrived but no ActiveTimestampTracker is wired"))
 	}
@@ -95,6 +105,9 @@ func (f *kvFSM) persistBackupTimestampFloor(ctx context.Context, readTS uint64) 
 func (f *kvFSM) reloadBackupTimestampFloor(ctx context.Context) error {
 	if f == nil || f.store == nil {
 		return nil
+	}
+	if err := f.reloadPrepareEvidence(ctx); err != nil {
+		return err
 	}
 	value, err := f.store.GetAt(ctx, backupTimestampFloorKey, ^uint64(0))
 	if err != nil {
