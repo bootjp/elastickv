@@ -733,6 +733,7 @@ func (a *phaseDWindowTSO) ValidateDurableTimestamp(_ context.Context, timestamp 
 
 func (a *phaseDWindowTSO) PhaseDActive() bool   { return a.phaseD }
 func (a *phaseDWindowTSO) PhaseDRequired() bool { return a.phaseD }
+func (a *phaseDWindowTSO) PhaseDFloor() uint64  { return a.floor }
 
 func (f *fakeTSOAllocator) Next(ctx context.Context) (uint64, error) {
 	return f.NextBatch(ctx, 1)
