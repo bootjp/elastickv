@@ -24,6 +24,7 @@ import (
 	"github.com/bootjp/elastickv/internal/filesystem/fuseadapter"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -146,6 +147,7 @@ func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
 		}
 		close(start)
 		first, second := <-results, <-results
+		assertOneCreatedDescriptor(t, first.file, second.file)
 		if first.file != nil {
 			require.NoError(t, first.file.Close())
 		}
@@ -158,6 +160,21 @@ func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
 		require.FileExists(t, pathB)
 	}
 	require.Positive(t, svc.collisions.Load(), "must exercise an actual FUSE_CREATE collision, not just existing-file Open")
+}
+
+func assertOneCreatedDescriptor(t *testing.T, first, second *os.File) {
+	t.Helper()
+	if first == nil || second == nil {
+		return // The caller reports the underlying open errors.
+	}
+	a, err := unix.FcntlInt(first.Fd(), unix.F_CREATED_QUERY, 0)
+	if errors.Is(err, syscall.EINVAL) {
+		return // Older kernels do not implement F_CREATED_QUERY.
+	}
+	require.NoError(t, err)
+	b, err := unix.FcntlInt(second.Fd(), unix.F_CREATED_QUERY, 0)
+	require.NoError(t, err)
+	require.Equal(t, 1, a+b, "only the actual creator may report a newly created descriptor")
 }
 
 type collidingMountCore struct {
