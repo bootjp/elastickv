@@ -4,20 +4,12 @@ import (
 	"context"
 	"errors"
 	"math"
-	"net"
-	"os"
 	"sync/atomic"
-	"syscall"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc"
-	"google.golang.org/grpc/credentials/insecure"
-	"google.golang.org/grpc/health"
-	healthpb "google.golang.org/grpc/health/grpc_health_v1"
-	"google.golang.org/grpc/test/bufconn"
 )
 
 type shutdownEngineStub struct {
@@ -85,9 +77,9 @@ func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
 		{spec: groupSpec{id: 2}, engine: shutdownTestEngine(transfer)},
 		{spec: groupSpec{id: 3}, engine: follower},
 	}
-	signals := make(chan os.Signal, 1)
-	signals <- syscall.SIGTERM
-	shutdownOnSignal(ctx, cancel, runtimes, signals, time.Second)
+	requests := make(chan struct{})
+	close(requests)
+	shutdownAfterRequest(ctx, cancel, runtimes, requests, time.Second)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.Equal(t, int32(2), calls.Load())
 }
@@ -109,12 +101,12 @@ func TestShutdownSignalTransfersLeadershipAcquiredDuringHandoff(t *testing.T) {
 		follower.leader.Store(true)
 		return nil
 	})
-	signals := make(chan os.Signal, 1)
-	signals <- syscall.SIGTERM
-	shutdownOnSignal(ctx, cancel, []*raftGroupRuntime{
+	requests := make(chan struct{})
+	close(requests)
+	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{
 		{spec: groupSpec{id: 1}, engine: follower},
 		{spec: groupSpec{id: 2}, engine: leader},
-	}, signals, time.Second)
+	}, requests, time.Second)
 	require.Equal(t, int32(1), followerTransfers.Load())
 	require.Equal(t, raftengine.StateFollower, follower.State())
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
@@ -134,11 +126,11 @@ func TestShutdownSignalSharesDeadlineAcrossGroups(t *testing.T) {
 		{spec: groupSpec{id: 1}, engine: shutdownTestEngine(transfer)},
 		{spec: groupSpec{id: 2}, engine: shutdownTestEngine(transfer)},
 	}
-	signals := make(chan os.Signal, 1)
-	signals <- syscall.SIGTERM
+	requests := make(chan struct{})
+	close(requests)
 	done := make(chan struct{})
 	go func() {
-		shutdownOnSignal(ctx, cancel, runtimes, signals, 200*time.Millisecond)
+		shutdownAfterRequest(ctx, cancel, runtimes, requests, 200*time.Millisecond)
 		close(done)
 	}()
 	for range runtimes {
@@ -208,38 +200,5 @@ func TestShutdownAlreadyCanceledDoesNotTransfer(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	shutdownOnSignal(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, make(chan os.Signal), time.Second)
-}
-
-func TestShutdownGRPCServerClosesPersistentStreams(t *testing.T) {
-	t.Parallel()
-	const bufferSize = 1 << 20
-	listener := bufconn.Listen(bufferSize)
-	server := grpc.NewServer()
-	healthpb.RegisterHealthServer(server, health.NewServer())
-	t.Cleanup(server.Stop)
-	go func() { _ = server.Serve(listener) }()
-	conn, err := grpc.NewClient("passthrough:///shutdown-test",
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
-		grpc.WithContextDialer(func(ctx context.Context, _ string) (net.Conn, error) {
-			return listener.DialContext(ctx)
-		}))
-	require.NoError(t, err)
-	t.Cleanup(func() { _ = conn.Close() })
-	stream, err := healthpb.NewHealthClient(conn).Watch(t.Context(), &healthpb.HealthCheckRequest{})
-	require.NoError(t, err)
-	_, err = stream.Recv()
-	require.NoError(t, err, "establish an active stream before stopping the server")
-	done := make(chan struct{})
-	go func() {
-		stopGRPCServer(server, shutdownTransferRetryDelay)
-		close(done)
-	}()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("a persistent stream blocked gRPC shutdown")
-	}
-	_, err = stream.Recv()
-	require.Error(t, err)
+	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, make(chan struct{}), time.Second)
 }

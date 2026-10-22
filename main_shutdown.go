@@ -4,22 +4,17 @@ import (
 	"context"
 	"log/slog"
 	"math"
-	"os"
-	"os/signal"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
-	"google.golang.org/grpc"
 )
 
 const (
 	shutdownTransferTimeout    = 5 * time.Second
 	shutdownTransferRetryDelay = 50 * time.Millisecond
-	shutdownGRPCGracePeriod    = 5 * time.Second
 	shutdownVoterSuffrage      = "voter"
 )
 
@@ -29,37 +24,61 @@ type shutdownLeadershipController interface {
 	TransferLeadershipToServerIfEligible(context.Context, []raftengine.TransferTarget, uint64) error
 }
 
-func stopGRPCServer(server *grpc.Server, gracePeriod time.Duration) {
-	// Raft and catalog streams can remain open indefinitely. Give in-flight
-	// requests time to finish, then release streams so storage cleanup can run.
-	forceStop := time.AfterFunc(gracePeriod, server.Stop)
-	defer forceStop.Stop()
-	server.GracefulStop()
+// shutdownHandoff keeps startup cancellation immediate, then switches the
+// existing signal handler to request a handoff once startup has completed.
+type shutdownHandoff struct {
+	mu      sync.Mutex
+	request context.CancelFunc
+	cancel  context.CancelFunc
 }
 
-func startSignalShutdown(ctx context.Context, eg *errgroup.Group, cancel context.CancelFunc, runtimes []*raftGroupRuntime) func() {
-	signals := make(chan os.Signal, 1)
-	signal.Notify(signals, os.Interrupt, syscall.SIGTERM)
+func newShutdownHandoff(cancel context.CancelFunc) *shutdownHandoff {
+	return &shutdownHandoff{request: cancel, cancel: cancel}
+}
+
+func (h *shutdownHandoff) requestShutdown() {
+	h.mu.Lock()
+	request := h.request
+	h.mu.Unlock()
+	request()
+}
+
+func (h *shutdownHandoff) arm(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if ctx.Err() != nil {
+		return
+	}
+	requests := make(chan struct{})
+	h.request = sync.OnceFunc(func() { close(requests) })
 	eg.Go(func() error {
-		shutdownOnSignal(ctx, cancel, runtimes, signals, shutdownTransferTimeout)
+		shutdownAfterRequest(ctx, h.cancel, runtimes, requests, shutdownTransferTimeout)
 		return nil
 	})
-	return func() { signal.Stop(signals) }
 }
 
-func shutdownOnSignal(ctx context.Context, cancel context.CancelFunc, runtimes []*raftGroupRuntime, signals <-chan os.Signal, timeout time.Duration) {
+func shutdownAfterRequest(ctx context.Context, cancel context.CancelFunc, runtimes []*raftGroupRuntime, requests <-chan struct{}, timeout time.Duration) {
 	select {
 	case <-ctx.Done():
 		return
-	case sig := <-signals:
-		slog.Info("shutdown signal received", "signal", sig)
+	case <-requests:
 	}
 	defer cancel()
 	// Keep the server context alive until the transfers finish: canceling it
 	// first would close the Raft transport needed to elect the successors.
 	transferCtx, stop := context.WithTimeout(ctx, timeout)
 	defer stop()
-	transferLeadershipOnShutdown(transferCtx, runtimes)
+	done := make(chan struct{})
+	go func() {
+		transferLeadershipOnShutdown(transferCtx, runtimes)
+		close(done)
+	}()
+	// Logging may be backpressured. It must not hold root cancellation or
+	// the errgroup beyond the handoff deadline.
+	select {
+	case <-done:
+	case <-transferCtx.Done():
+	}
 }
 
 func transferLeadershipOnShutdown(ctx context.Context, runtimes []*raftGroupRuntime) {

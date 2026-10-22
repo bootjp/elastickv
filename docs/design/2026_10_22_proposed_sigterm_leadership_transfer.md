@@ -12,10 +12,15 @@ still be able to shut down.
 
 ## Shutdown order
 
-1. Register the signal handler after constructing the group runtimes, before
-   starting the servers. Stop the signal subscription during cleanup.
+1. Reuse the single early `installShutdownSignalHandler` from PR #1273. Before
+   startup finishes, its callback cancels immediately. After all servers and the
+   filesystem start, `shutdownHandoff.arm` switches the callback to a handoff
+   request. Repeated signals remain ignored through storage cleanup; the existing
+   clean-exit handling and bounded signal-handler join are preserved.
 2. Snapshot each runtime's engine through `snapshotEngine`. For each local
-   leader, run a transfer concurrently under one five-second deadline.
+   leader, run a transfer concurrently under one five-second deadline. Re-scan
+   after each round until no local leaders remain or that deadline expires, so
+   followers promoted during another group's handoff are not missed.
 3. Read the group's committed membership, exclude the local voter and learners,
    and call the existing `TransferLeadershipToServerIfEligible` API. The engine
    checks recent activity; Raft catches up the target before sending TimeoutNow.
@@ -23,9 +28,10 @@ still be able to shut down.
    A concurrent loss of leadership ends the attempt successfully.
 4. Log transfer failures and continue shutdown. Cancel the server context only
    after the attempts finish, so transfer messages can still use the transport.
-5. Drain gRPC requests for up to five more seconds, then force remaining streams
-   closed. Finally, the existing cleanup stack closes services, engines, and
-   storage. The supervisor's grace period must also allow storage cleanup.
+5. Reuse #1273's `stopGRPCServerBounded`: drain gRPC requests for up to ten
+   seconds, then force remaining streams closed. There is one shared drain policy. Finally, the existing cleanup stack closes services, engines, and
+   storage. The supervisor's grace period must include the handoff window, the
+   listener/FUSE drain budgets, and storage cleanup.
 
 The bounded gRPC drain is necessary because established Raft streams can keep
 `GracefulStop` blocked indefinitely. The initial three-node reproduction
@@ -59,7 +65,7 @@ production-node lifecycle change.
   Linux-only `Statfs_t.Namelen` field and currently prevents full-suite test and
   lint typechecking on macOS.
 
-Local validation on macOS with Go 1.26.6:
+Initial validation on macOS with Go 1.26.6, before integrating PR #1273:
 
 - `go test . -run '^TestShutdown' -count=1`: passed, including actual SIGTERM.
 - The same command with `-race`: passed.
@@ -72,3 +78,23 @@ Local validation on macOS with Go 1.26.6:
 - The upstream Redis submodule's unit suite could not load `jepsen.redis`;
   its checked-in test references that absent namespace and contains a placeholder
   failing assertion. The Redis workload tests in the root Jepsen suite passed.
+
+
+## Review integration with PR #1273
+
+This branch incorporates dependency commit `3eb6989351d360079d7b9e8416a52de8357a2fa0`
+from #1273; that PR should merge first. Its early signal handler and bounded
+gRPC/HTTP/Redis/FUSE cleanup are reused rather than registering a second signal
+handler or retaining a second gRPC drain implementation. The five-second handoff
+manager also bounds cancellation independently of backpressured log writes.
+
+The follower-acquisition regression failed before the re-scan fix. The actual
+SIGTERM E2E also failed when both original signal registrations were present.
+After integration, the shutdown, signal, clean-exit, gRPC, and filesystem lifecycle
+tests passed with the race detector, and full-package lint reported zero issues.
+The FUSE Linux-only typecheck issue listed in the initial validation is fixed by
+the dependency's platform tags; kernel-mount checks still require Linux FUSE.
+The inherited recording-helper fixture now uses shell redirection so it also
+runs on macOS without `/bin/touch`. The FUSE package passed its full race suite;
+targeted adapter/monitoring shutdown tests also passed with the race detector.
+The root Jepsen suite again passed all 204 tests and 566 assertions.
