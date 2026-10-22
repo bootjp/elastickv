@@ -64,6 +64,7 @@ func TestEncryptionSnapshotRequiresMatchingPhysicalEnvelope(t *testing.T) {
 			}
 			require.NoError(t, err)
 			defer reader.Close()
+			require.NoError(t, os.Remove(path), "an opened descriptor remains valid after snapshot purge")
 			got, err := io.ReadAll(reader)
 			require.NoError(t, err)
 			require.Equal(t, payload, got)

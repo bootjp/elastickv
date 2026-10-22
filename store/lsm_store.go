@@ -727,6 +727,7 @@ func isPebbleMetaKey(rawKey []byte) bool {
 		bytes.Equal(rawKey, metaMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaPendingMinRetainedTSBytes) ||
 		bytes.Equal(rawKey, metaAppliedIndexBytes) ||
+		bytes.Equal(rawKey, encryptionCheckpointKey) ||
 		isMigrationMetadataKey(rawKey) ||
 		isPebbleWriterRegistryKey(rawKey)
 }

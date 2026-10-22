@@ -1017,6 +1017,9 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 	if err := f.rejectSnapshotWithActiveBackupPin(); err != nil {
 		return nil, err
 	}
+	if err := f.checkSnapshotCheckpointConsistency(); err != nil {
+		return nil, err
+	}
 	snapshot, err := f.store.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -1063,6 +1066,10 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	f.restoredCutover = cutover
 	if err := f.store.Restore(io.NopCloser(br)); err != nil {
 		return errors.WithStack(err)
+	}
+	checkpoint, err = f.checkpointForDurableFSM(checkpoint, false)
+	if err != nil {
+		return err
 	}
 	f.encryptionCheckpoint = checkpoint
 	// Volatile pins do not travel in a snapshot, and the entries that would

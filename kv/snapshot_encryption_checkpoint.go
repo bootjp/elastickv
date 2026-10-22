@@ -46,6 +46,13 @@ func (f *kvFSM) captureEncryptionCheckpoint(index uint64) error {
 	// During WAL replay the sidecar can already represent a later entry.
 	// Do not claim that future state in a snapshot of an earlier prefix.
 	if checkpoint.Index == index {
+		if sink, ok := f.store.(interface {
+			SaveEncryptionSnapshotCheckpoint(encryption.SnapshotCheckpoint) error
+		}); ok {
+			if err := sink.SaveEncryptionSnapshotCheckpoint(checkpoint); err != nil {
+				return errors.Wrap(err, "persist applied encryption checkpoint")
+			}
+		}
 		f.encryptionCheckpoint = checkpoint
 	}
 	return nil
@@ -58,7 +65,60 @@ func (f *kvFSM) RestoreSnapshotHeader(r io.Reader) error {
 	if err != nil {
 		return err
 	}
+	checkpoint, err = f.checkpointForDurableFSM(checkpoint, true)
+	if err != nil {
+		return err
+	}
 	f.ApplySnapshotHeader(ceiling, cutover)
 	f.encryptionCheckpoint = checkpoint
+	return nil
+}
+
+func (f *kvFSM) checkpointForDurableFSM(snapshot encryption.SnapshotCheckpoint, skip bool) (encryption.SnapshotCheckpoint, error) {
+	source, ok := f.store.(interface {
+		LoadEncryptionSnapshotCheckpoint() (encryption.SnapshotCheckpoint, bool, error)
+	})
+	if !ok {
+		return snapshot, nil
+	}
+	stored, present, err := source.LoadEncryptionSnapshotCheckpoint()
+	if err != nil {
+		return snapshot, errors.Wrap(err, "load durable FSM encryption checkpoint")
+	}
+	if !present {
+		return snapshot, nil
+	}
+	if stored == snapshot {
+		return stored, nil
+	}
+	if !skip || stored.Index <= snapshot.Index {
+		return snapshot, errors.New("encryption checkpoint: physical snapshot header and FSM record disagree")
+	}
+	applied, present, err := f.LastAppliedIndex()
+	if err != nil {
+		return snapshot, err
+	}
+	if present && stored.Index <= applied {
+		return stored, nil
+	}
+	// The durable checkpoint may precede a crash before the applied-index
+	// marker. That tail is not skipped and must replay through the handler.
+	return snapshot, nil
+}
+
+func (f *kvFSM) checkSnapshotCheckpointConsistency() error {
+	source, ok := f.store.(interface {
+		LoadEncryptionSnapshotCheckpoint() (encryption.SnapshotCheckpoint, bool, error)
+	})
+	if !ok {
+		return nil
+	}
+	stored, present, err := source.LoadEncryptionSnapshotCheckpoint()
+	if err != nil {
+		return errors.Wrap(err, "verify snapshot checkpoint before capture")
+	}
+	if present && stored != f.encryptionCheckpoint {
+		return errors.New("encryption checkpoint: durable tail must reconcile before snapshot capture")
+	}
 	return nil
 }

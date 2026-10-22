@@ -25,10 +25,25 @@ CRC and Raft-token validation. A newly captured snapshot reuses the witness
 restored from its predecessor, rather than trusting a new disk-sidecar read
 to rewrite the history represented by that snapshot.
 
+The same witness is synchronously persisted as reserved operational FSM
+metadata after each successful encryption apply, before the apply handler
+returns. It does not issue a user timestamp or nonce. When the cold-start
+skip gate retains a newer durable FSM, it can retain that FSM's newer
+witness only through its durable applied index. A checkpoint ahead of that
+index must be reconciled by normal WAL replay; new snapshot capture refuses
+to pair an unreconciled durable record with an older header. Full restore
+requires its body record to match the header. Native physical snapshots
+preserve the record and the offline decoder classifies it as operational
+metadata rather than an MVCC user version.
+
 The startup guard opens the engine's installed snapshot, not an arbitrary
 file in the snapshot directory. Token index, Raft metadata index, token CRC,
 payload CRC, checkpoint index, sidecar state digest, and envelope cutover
 must agree. Only then does that snapshot cover the compacted prefix. The
+snapshot is selected and opened under `snapshotMu`; full checksum verification
+and reads then use that same descriptor without holding up snapshot work.
+Removing the old path after it has been opened cannot invalidate that reader.
+The
 retained suffix remains subject to the original gap scan; encrypted entries
 are authenticated and decrypted before inspecting their opcode. Missing
 keys or invalid authentication tags are startup failures, never "no hit".
