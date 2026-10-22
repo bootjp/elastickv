@@ -1625,16 +1625,19 @@ func elemToMutation(req *Elem[OP]) *pb.Mutation {
 			Key:                 req.Key,
 			Value:               value,
 			CommitTsValueOffset: req.CommitTSValueOffset,
+			RequireAbsent:       req.RequireAbsent,
 		}
 	case Del:
 		return &pb.Mutation{
-			Op:  pb.Op_DEL,
-			Key: req.Key,
+			Op:            pb.Op_DEL,
+			Key:           req.Key,
+			RequireAbsent: req.RequireAbsent,
 		}
 	case DelPrefix:
 		return &pb.Mutation{
-			Op:  pb.Op_DEL_PREFIX,
-			Key: req.Key, // prefix (may be empty for "all keys")
+			Op:            pb.Op_DEL_PREFIX,
+			Key:           req.Key, // prefix (may be empty for "all keys")
+			RequireAbsent: req.RequireAbsent,
 		}
 	}
 	panic("unreachable")

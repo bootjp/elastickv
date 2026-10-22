@@ -378,6 +378,10 @@ type KVPairMutation struct {
 	Op    OpType
 	Key   []byte
 	Value []byte
+	// RequireAbsent rejects the entire batch if Key has any committed version,
+	// including a tombstone or a version at/below StartTS. Checked atomically
+	// with application; ordinary mutations leave this false.
+	RequireAbsent bool
 	// ExpireAt is an HLC timestamp; 0 means no TTL.
 	ExpireAt uint64
 }

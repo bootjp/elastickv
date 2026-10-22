@@ -2550,6 +2550,9 @@ func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPa
 // batch and a predicate that also counts the entry's staged commits inside
 // a Raft entry scope.
 func (s *pebbleStore) checkApplyConflictsWith(ctx context.Context, r pebble.Reader, hasCommitsAfter func(uint64) bool, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64, force bool) error {
+	if err := s.checkAbsenceGuardsWith(ctx, r, mutations); err != nil {
+		return err
+	}
 	if !force && !hasCommitsAfter(startTS) {
 		return nil
 	}

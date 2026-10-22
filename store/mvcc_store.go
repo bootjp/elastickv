@@ -708,7 +708,7 @@ func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutat
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 
-	if s.lastCommitTS > startTS {
+	if s.lastCommitTS > startTS || hasAbsenceGuards(mutations) {
 		if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
 			return err
 		}
@@ -775,7 +775,7 @@ func (s *mvccStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mu
 
 func (s *mvccStore) checkConflictsLocked(mutations []*KVPairMutation, readKeys [][]byte, startTS uint64) error {
 	for _, mut := range mutations {
-		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && latestVer.TS > startTS {
+		if latestVer, ok := s.latestVersionLocked(mut.Key); ok && (mut.RequireAbsent || latestVer.TS > startTS) {
 			s.writeConflicts.record(WriteConflictKindWrite, classifyWriteConflictKey(mut.Key))
 			return NewWriteConflictError(mut.Key)
 		}

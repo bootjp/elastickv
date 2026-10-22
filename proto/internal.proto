@@ -36,6 +36,10 @@ message Mutation {
   // that durably embed their own creation timestamp but still need leader-side
   // timestamp allocation after redirect/retry.
   uint64 commit_ts_value_offset = 4;
+  // require_absent is the TTL-inline relocation precondition: no committed
+  // version of key, including tombstones, may exist when the 1PC applies.
+  // It requires the replicated TTL-inline capability on every voter/learner.
+  bool require_absent = 5;
 }
 
 enum Phase {

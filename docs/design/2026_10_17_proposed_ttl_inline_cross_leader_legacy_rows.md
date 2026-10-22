@@ -319,3 +319,15 @@ For A, A′, B and C, the 16 is ⌈512 / 32⌉, where n_P is the number of a pag
 2. Where does the explicit-group purge belong: a `ShardStore` method behind a coordinator capability, or a dedicated internal RPC?
 3. Should the absence condition be a field on `pb.Mutation`, or a transaction-level list of keys that must be absent? The field is simpler; the list keeps the condition out of every other mutation path.
 4. Should the replicated read floor be group-wide, as proposed, or scoped to the purged raw keys, so that other reads in L keep their full retention window? The alternative to purging at all is teaching the import path to ignore tombstones written by evacuation.
+
+## Implementation progress
+
+This proposal's design review is not implementation acceptance. The runtime changes below are being consolidated in this PR; no complete milestone or operational migration is claimed yet.
+
+| Component | Current implementation evidence | Remaining acceptance |
+|---|---|---|
+| M1 physical-page reporting | `ShardStore.ScanGroupOwnedPageAt` returns served rows, four legacy base-metadata dispositions, catalog version and the physical resume key without remote owner probes. KV tests and race passed. | Production integration, fair top-level scheduling, valid completed snapshots, status and one-shot audit. |
+| M1b atomic absence | Store apply-lock checks include old committed versions and tombstones on memory/Pebble and entry-scoped batches. Protobuf, coordinator and 1PC preserve the condition, including duplicate-key mutation reduction. Store/KV race suites and scoped lint passed. | Durable replicated capability/activation is not implemented yet, so guarded requests remain refused by default. Retention state, downgrade fencing, drain, read-admission and compaction requirements above remain mandatory. |
+| M2-M4 | Not implemented. | Peer relocation, bounded checkpointing, reserved purge, completed-snapshot gate and seeded Jepsen acceptance. Both read fallbacks stay enabled. |
+
+Existing pass metrics and bookkeeping are reused from bootjp/elastickv#1283 as a stack dependency; they do not implement cross-leader migration or M1's classification snapshots. No duplicate metric families are added here.

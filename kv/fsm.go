@@ -39,6 +39,8 @@ func observeStoreLastCommitTS(hlc *HLC, st store.MVCCStore) {
 type kvFSM struct {
 	store store.MVCCStore
 	log   *slog.Logger
+	// Set only by the replicated protocol activation, never by a process flag.
+	ttlInlineCapability atomic.Bool
 	// hlc is the shared HLC instance updated when a HLC lease entry is applied.
 	// May be nil for nodes that do not participate in physical ceiling tracking.
 	hlc *HLC
@@ -637,6 +639,9 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.validateAbsenceRequest(r); err != nil {
+		return err
+	}
 	switch {
 	case r.IsTxn:
 		return f.handleTxnRequest(ctx, r, commitTS)
@@ -1415,7 +1420,7 @@ func uniqueMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 	if len(muts) == 0 {
 		return []*pb.Mutation{}, nil
 	}
-	seen := make(map[string]struct{}, len(muts))
+	seen := make(map[string]int, len(muts))
 	reversed := make([]*pb.Mutation, 0, len(muts))
 	// Keep the last mutation per key to avoid dropping final operations like
 	// PUT followed by DEL in the same transactional batch.
@@ -1425,10 +1430,15 @@ func uniqueMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 			return nil, errors.WithStack(ErrInvalidRequest)
 		}
 		keyStr := string(mut.Key)
-		if _, ok := seen[keyStr]; ok {
+		if index, ok := seen[keyStr]; ok {
+			if mut.RequireAbsent {
+				kept := proto.CloneOf(reversed[index])
+				kept.RequireAbsent = true
+				reversed[index] = kept
+			}
 			continue
 		}
-		seen[keyStr] = struct{}{}
+		seen[keyStr] = len(reversed)
 		reversed = append(reversed, mut)
 	}
 
@@ -1524,6 +1534,9 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 
 	uniq, err := f.uniqueMutationsAboveFloorForRequest(r, muts, commitTS)
 	if err != nil {
+		return err
+	}
+	if err := validateAbsenceMutationKinds(uniq); err != nil {
 		return err
 	}
 
@@ -2349,14 +2362,16 @@ func toStoreMutations(muts []*pb.Mutation) ([]*store.KVPairMutation, error) {
 		switch mut.Op {
 		case pb.Op_PUT:
 			out = append(out, &store.KVPairMutation{
-				Op:    store.OpTypePut,
-				Key:   mut.Key,
-				Value: mut.Value,
+				Op:            store.OpTypePut,
+				Key:           mut.Key,
+				Value:         mut.Value,
+				RequireAbsent: mut.RequireAbsent,
 			})
 		case pb.Op_DEL:
 			out = append(out, &store.KVPairMutation{
-				Op:  store.OpTypeDelete,
-				Key: mut.Key,
+				Op:            store.OpTypeDelete,
+				Key:           mut.Key,
+				RequireAbsent: mut.RequireAbsent,
 			})
 		case pb.Op_DEL_PREFIX:
 			return nil, ErrUnknownRequestType
