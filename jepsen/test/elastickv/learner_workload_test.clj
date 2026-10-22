@@ -8,6 +8,8 @@
   valid. Several properties were also measuring the wrong thing. Each test
   below names the way it used to pass wrongly."
   (:require [clojure.test :refer :all]
+            [clojure.tools.cli :as tools.cli]
+            [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
             [elastickv.jepsen-test :as jt]
             [elastickv.learner-workload :as lw]
@@ -228,6 +230,21 @@
                          [{:type :invoke :f :read :time 500}
                           {:type :fail   :f :read :value {:lease? true} :time 510}]))]
     (is (:valid? r) (str "failures=" (:learner-read-failures r)))))
+
+(deftest failed-lease-reads-are-attributed-by-their-own-invocations
+  (let [history (concat (partition-window 100 200)
+                        [{:type :invoke :f :read :time 90 :process 1}
+                         {:type :fail :f :read :time 110 :process 1
+                          :value {:lease? true} :error "before isolation"}
+                         {:type :invoke :f :read :time 120 :process 1}
+                         {:type :fail :f :read :time 250 :process 1
+                          :value {:lease? true} :error "during isolation"}
+                         {:type :invoke :f :read :time 300 :process 1}
+                         {:type :fail :f :read :time 310 :process 1
+                          :value {:lease? true} :error "after isolation"}])
+        failures (lw/learner-partition-read-failures history)]
+    (is (= ["during isolation"] (mapv :error failures)))
+    (is (= [250] (mapv :time failures)))))
 
 ;; ---------------------------------------------------------------------------
 ;; The checker must not pass a run that proved nothing
@@ -557,6 +574,21 @@
     (is (= ["n1" "n2" "n3"] (:nodes prepared))
         "a comma-separated string must be split before it reaches the constructor")
     (is (= "n3" (lw/learner-candidate (:nodes prepared))))))
+
+(deftest unsupported-topology-options-are-not-silently-ignored
+  (doseq [args [["--raft-groups" "1=50061"]
+               ["--raft-groups" "1=50061,2=50062"]
+               ["--shard-ranges" "a:z=1"]]
+          local? [false true]]
+    (let [{:keys [options errors]} (tools.cli/parse-opts args cli/common-cli-opts)
+          prepared (lw/prepare-learner-opts (assoc options :local local?))]
+      (is (empty? errors))
+      (is (thrown-with-msg? clojure.lang.ExceptionInfo #"default single Raft group"
+                            (lw/elastickv-learner-test prepared))
+          (str args " local=" local?))))
+  (let [{:keys [options errors]} (tools.cli/parse-opts [] cli/common-cli-opts)]
+    (is (empty? errors))
+    (is (map? (lw/elastickv-learner-test (lw/prepare-learner-opts options))))))
 
 (deftest the-redis-host-override-reaches-the-test-map
   ;; LearnerClient.open! reads :redis-host from the completed test map, so the

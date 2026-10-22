@@ -274,7 +274,7 @@
        last))
 
 (defn- read-invocation-times
-  "Each successful read paired with the time it was actually invoked.
+  "Each completed read paired with the time it was actually invoked.
 
   A process set is not enough. If process P invokes a read before t, completes
   it after t, and then invokes another read after t, P is in the set of
@@ -295,8 +295,7 @@
                               :done    done}
                      (:ok :fail :info)
                      {:pending (dissoc pending (:process op))
-                      :done    (if (and (= :ok (:type op))
-                                        (contains? pending (:process op)))
+                      :done    (if (contains? pending (:process op))
                                  (conj done (assoc op ::invoked-at
                                                    (get pending (:process op))))
                                  done)}
@@ -314,6 +313,7 @@
   THIS completion's invoke event, not from any invoke the same process made."
   [history t]
   (->> (read-invocation-times history)
+       (filter #(= :ok (:type %)))
        (filter #(> (::invoked-at %) t))
        (sort-by :time)
        first))
@@ -461,7 +461,7 @@
        vec))
 
 (defn learner-partition-read-failures
-  "Lease reads that failed while only learners were partitioned.
+  "Failed lease reads invoked while only learners were partitioned.
 
   Reads, not writes. The learner is excluded from the write-commit quorum by
   the voter set, but `quorumAckTracker` feeds `LastQuorumAck`, which gates the
@@ -470,20 +470,23 @@
   exact regression it claims to catch -- it stalls the lease the leader serves
   fast reads from.
 
-  So the property is expressed on lease reads: isolating a non-voter must not
-  make them fail."
+  Attribute by invocation, not completion: a pre-isolation timeout is not
+  evidence about the fault, and a read begun during isolation still counts
+  when it remains stalled until after healing."
   [history]
   (let [windows (learner-partition-windows history)]
     (if (empty? windows)
       []
-      (->> history
+      (->> (read-invocation-times history)
            (filter #(and (= :read (:f %))
                          (= :fail (:type %))
                          (true? (:lease? (:value %)))))
            (filter (fn [op]
                      (some (fn [[start stop]]
-                             (and (>= (:time op) start) (<= (:time op) stop)))
+                             (and (>= (::invoked-at op) start)
+                                  (<= (::invoked-at op) stop)))
                            windows)))
+           (map #(dissoc % ::invoked-at))
            vec))))
 
 ;; ---------------------------------------------------------------------------
@@ -823,6 +826,9 @@
   "Builds a Jepsen test map exercising learner attach and promotion."
   ([] (elastickv-learner-test {}))
   ([opts]
+   (when (or (some? (:raft-groups opts)) (some? (:shard-ranges opts)))
+     (throw (ex-info "learner workload requires the default single Raft group; --raft-groups and --shard-ranges are unsupported"
+                     (select-keys opts [:raft-groups :shard-ranges]))))
    (let [nodes      (or (:nodes opts) default-nodes)
          local?     (:local opts)
          grpc-port  (or (:grpc-port opts) 50051)
