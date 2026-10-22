@@ -17,6 +17,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/cockroachdb/errors"
 	"golang.org/x/sync/errgroup"
 )
@@ -33,7 +34,6 @@ const (
 	adminReadHeaderTimeout = 5 * time.Second
 	adminWriteTimeout      = 10 * time.Second
 	adminIdleTimeout       = 30 * time.Second
-	adminShutdownTimeout   = 5 * time.Second
 )
 
 // adminBuildVersion is surfaced by both GET /admin/api/v1/cluster and the
@@ -233,6 +233,21 @@ func newSqsQueuesSource(sqsServer *adapter.SQSServer) admin.QueuesSource {
 // is the drift signal we want.
 type sqsQueuesBridge struct {
 	server *adapter.SQSServer
+}
+
+// AdminQueueObserver satisfies admin.AdminQueueObserverSource so the admin
+// handler's pre-dispatch rejections are counted on the same metrics the
+// adapter uses. Returns nil when the server has no observer, which
+// WithAdminQueueObserver treats as "do not count".
+func (b *sqsQueuesBridge) AdminQueueObserver() admin.AdminQueueObserver {
+	if b == nil || b.server == nil {
+		return nil
+	}
+	observer := b.server.AdminObserver()
+	if observer == nil {
+		return nil
+	}
+	return observer
 }
 
 func (b *sqsQueuesBridge) AdminListQueues(ctx context.Context) ([]string, error) {
@@ -1204,6 +1219,11 @@ func newAdminHTTPServer(server *admin.Server) *http.Server {
 	}
 }
 
+// adminShutdownTimeout bounds how long the admin listener waits for
+// in-flight requests on shutdown before the remaining connections are
+// closed (monitoring.ShutdownHTTPServer). A variable so tests can shorten it.
+var adminShutdownTimeout = 5 * time.Second
+
 func registerAdminLifecycle(
 	ctx context.Context,
 	eg *errgroup.Group,
@@ -1214,15 +1234,12 @@ func registerAdminLifecycle(
 	version string,
 ) {
 	addr := adminCfg.Listen
+	handlers := trackAdminHandlers(httpSrv)
 	eg.Go(func() error {
 		<-ctx.Done()
 		slog.Info("shutting down admin listener", "address", addr, "reason", ctx.Err())
-		shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), adminShutdownTimeout)
-		defer cancel()
-		err := httpSrv.Shutdown(shutdownCtx)
-		if err == nil || errors.Is(err, http.ErrServerClosed) || errors.Is(err, net.ErrClosed) {
-			return nil
-		}
+		err := monitoring.ShutdownHTTPServer(ctx, httpSrv, "admin", adminShutdownTimeout)
+		handlers.join(adminHandlerJoinTimeout)
 		return errors.WithStack(err)
 	})
 	eg.Go(func() error {

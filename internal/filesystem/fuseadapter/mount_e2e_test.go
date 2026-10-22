@@ -1,3 +1,9 @@
+//go:build linux
+
+// The kernel-mount tests drive a real /dev/fuse mount and read Linux statfs
+// fields, so they only build on Linux; elsewhere the package's portable
+// tests still run.
+
 package fuseadapter_test
 
 import (
@@ -5,6 +11,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -27,6 +34,28 @@ const (
 // ELASTICKV_REQUIRE_FUSE is set, in which case a mount failure is fatal.
 func mountMemoryFilesystem(t *testing.T) string {
 	t.Helper()
+	mountPoint := t.TempDir()
+	mountMemoryFilesystemAt(t, mountPoint)
+	return mountPoint
+}
+
+// mountMemoryFilesystemAt mounts a fresh in-memory filesystem at an existing
+// directory and unmounts it when the test ends.
+func mountMemoryFilesystemAt(t *testing.T, mountPoint string) {
+	t.Helper()
+	mountMemoryFilesystemServer(t, mountPoint)
+}
+
+// e2eMount is a kernel mount owned by a test. unmount is idempotent so a
+// test may unmount early and let the cleanup run harmlessly afterwards.
+type e2eMount struct {
+	server    *fuseadapter.Server
+	serveDone <-chan struct{}
+	unmount   func() error
+}
+
+func mountMemoryFilesystemServer(t *testing.T, mountPoint string) *e2eMount {
+	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
@@ -35,7 +64,6 @@ func mountMemoryFilesystem(t *testing.T) string {
 	uid, gid := uint32(os.Getuid()), uint32(os.Getgid()) //nolint:gosec // test process ids fit uint32.
 	require.NoError(t, svc.InitializeRoot(t.Context(), e2eRootMode, uid, gid))
 
-	mountPoint := t.TempDir()
 	adapter := fuseadapter.New(svc, []byte("e2e-mount"))
 	server, err := fuseadapter.Mount(mountPoint, adapter, &fuse.MountOptions{DirectMount: os.Geteuid() == 0})
 	if err != nil {
@@ -52,15 +80,16 @@ func mountMemoryFilesystem(t *testing.T) string {
 		<-serveDone
 		skipOrFail(t, "FUSE mount did not come up: %v", err)
 	}
+	mount := &e2eMount{server: server, serveDone: serveDone, unmount: sync.OnceValue(server.Unmount)}
 	t.Cleanup(func() {
-		require.NoError(t, server.Unmount())
+		require.NoError(t, mount.unmount())
 		select {
 		case <-serveDone:
 		case <-time.After(10 * time.Second):
 			t.Error("FUSE server did not stop after unmount")
 		}
 	})
-	return mountPoint
+	return mount
 }
 
 func skipOrFail(t *testing.T, format string, args ...any) {

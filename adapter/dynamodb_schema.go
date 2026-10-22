@@ -295,6 +295,14 @@ func decodeDeleteTableInput(bodyReader io.Reader) (deleteTableInput, error) {
 }
 
 func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName string) error {
+	// Claim the cleanup's slot before the metadata delete can commit: once
+	// Stop has begun the cleanup could no longer start, and a committed
+	// delete without it would leave the generation's items behind.
+	cleanup, ok := d.tableCleanups.reserve()
+	if !ok {
+		return errors.WithStack(ErrDynamoServerStopping)
+	}
+	defer cleanup.release()
 	backoff := transactRetryInitialBackoff
 	deadline := time.Now().Add(transactRetryMaxDuration)
 	for range transactRetryMaxAttempts {
@@ -324,7 +332,7 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 				return errors.WithStack(err)
 			}
 		} else {
-			d.launchDeletedTableCleanup(tableName, schema.Generation)
+			d.launchDeletedTableCleanup(cleanup, tableName, schema.Generation)
 			return nil
 		}
 
@@ -336,10 +344,11 @@ func (d *DynamoDBServer) deleteTableWithRetry(ctx context.Context, tableName str
 	return newDynamoAPIError(http.StatusInternalServerError, dynamoErrInternal, "delete table retry attempts exhausted")
 }
 
-func (d *DynamoDBServer) launchDeletedTableCleanup(tableName string, generation uint64) {
-	go func() {
-		ctx, cancel := context.WithTimeout(context.Background(), tableCleanupAsyncTimeout)
-		defer cancel()
+// launchDeletedTableCleanup removes a deleted generation's items, seals and
+// index entries in the background, through the slot the caller reserved
+// before committing the change that orphaned them.
+func (d *DynamoDBServer) launchDeletedTableCleanup(cleanup *backgroundReservation, tableName string, generation uint64) {
+	cleanup.start(tableCleanupAsyncTimeout, func(ctx context.Context) {
 		if err := d.cleanupDeletedTableGeneration(ctx, tableName, generation); err != nil {
 			slog.Error("dynamodb delete table cleanup failed",
 				"table", tableName,
@@ -347,7 +356,7 @@ func (d *DynamoDBServer) launchDeletedTableCleanup(tableName string, generation 
 				"error", err,
 			)
 		}
-	}()
+	})
 }
 
 func (d *DynamoDBServer) cleanupDeletedTableGeneration(ctx context.Context, tableName string, generation uint64) error {

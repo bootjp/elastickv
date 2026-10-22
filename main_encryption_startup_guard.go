@@ -184,11 +184,7 @@ func runSidecarBehindRaftLogGuard(
 			slog.Uint64("engine_applied_index", gapEngine.AppliedIndex()))
 		return nil
 	}
-	if err := encryption.GuardSidecarBehindRaftLog(
-		sidecar.RaftAppliedIndex,
-		gapEngine.AppliedIndex(),
-		gapEngine.EncryptionScanner(),
-	); err != nil {
+	if err := verifySidecarGapWithSnapshot(gapEngine, sidecarPath, sidecar); err != nil {
 		return pkgerrors.Wrapf(err,
 			"encryption startup guard: sidecar=%q default_group=%d",
 			sidecarPath, defaultGroup)
