@@ -10,53 +10,55 @@ import (
 
 func TestMVCCStore_SnapshotRestoreRoundTrip(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		src := newStore(t)
+		require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
+		require.NoError(t, src.PutAt(ctx, []byte("k2"), []byte("v2"), 20, 0))
 
-	ctx := context.Background()
-	src := newTestMVCCStore(t)
-	require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
-	require.NoError(t, src.PutAt(ctx, []byte("k2"), []byte("v2"), 20, 0))
+		snap, err := src.Snapshot()
+		require.NoError(t, err)
+		defer func() { require.NoError(t, snap.Close()) }()
 
-	snap, err := src.Snapshot()
-	require.NoError(t, err)
-	defer snap.Close()
+		raw := snapshotBytes(t, snap)
 
-	raw := snapshotBytes(t, snap)
+		// Mutate source after snapshot so restore must reflect snapshot point-in-time.
+		require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v3"), 30, 0))
 
-	// Mutate source after snapshot so restore must reflect snapshot point-in-time.
-	require.NoError(t, src.PutAt(ctx, []byte("k1"), []byte("v3"), 30, 0))
+		dst := newStore(t)
+		require.NoError(t, dst.Restore(bytes.NewReader(raw)))
+		require.Equal(t, uint64(20), dst.LastCommitTS())
 
-	dst := newTestMVCCStore(t)
-	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
-	require.Equal(t, uint64(20), dst.LastCommitTS())
+		v, err := dst.GetAt(ctx, []byte("k1"), 30)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v1"), v)
 
-	v, err := dst.GetAt(ctx, []byte("k1"), 30)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v1"), v)
-
-	v, err = dst.GetAt(ctx, []byte("k2"), 30)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v2"), v)
+		v, err = dst.GetAt(ctx, []byte("k2"), 30)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v2"), v)
+	})
 }
 
 func TestMVCCStore_SnapshotRestoreMaxStoredKey(t *testing.T) {
 	t.Parallel()
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		ctx := context.Background()
+		src := newStore(t)
+		key := bytes.Repeat([]byte("k"), MaxSnapshotStoredKeySize)
+		require.NoError(t, src.PutAt(ctx, key, []byte("v"), 10, 0))
 
-	ctx := context.Background()
-	src := newTestMVCCStore(t)
-	key := bytes.Repeat([]byte("k"), MaxSnapshotStoredKeySize)
-	require.NoError(t, src.PutAt(ctx, key, []byte("v"), 10, 0))
+		snap, err := src.Snapshot()
+		require.NoError(t, err)
+		defer func() { require.NoError(t, snap.Close()) }()
+		raw := snapshotBytes(t, snap)
 
-	snap, err := src.Snapshot()
-	require.NoError(t, err)
-	defer snap.Close()
-	raw := snapshotBytes(t, snap)
+		dst := newStore(t)
+		require.NoError(t, dst.Restore(bytes.NewReader(raw)))
 
-	dst := newTestMVCCStore(t)
-	require.NoError(t, dst.Restore(bytes.NewReader(raw)))
-
-	got, err := dst.GetAt(ctx, key, 10)
-	require.NoError(t, err)
-	require.Equal(t, []byte("v"), got)
+		got, err := dst.GetAt(ctx, key, 10)
+		require.NoError(t, err)
+		require.Equal(t, []byte("v"), got)
+	})
 }
 
 func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
@@ -74,7 +76,11 @@ func TestMVCCStore_RestoreRejectsInvalidChecksum(t *testing.T) {
 	require.NotEmpty(t, raw)
 	raw[len(raw)-1] ^= 0xFF
 
-	require.ErrorIs(t, st.Restore(bytes.NewReader(raw)), ErrInvalidChecksum)
+	// Always use the streaming MVCC payload; Pebble Snapshot normally emits
+	// its native format, which has a different restore path.
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		require.ErrorIs(t, newStore(t).Restore(bytes.NewReader(raw)), ErrInvalidChecksum)
+	})
 }
 
 func TestMVCCStore_RestoreClearsMigrationMetadata(t *testing.T) {
