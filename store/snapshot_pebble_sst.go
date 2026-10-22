@@ -589,7 +589,7 @@ func (b *pebbleSSTIngestBundle) Close() error {
 	return errors.WithStack(err)
 }
 
-func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader) error {
+func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader, validate func(string) error) error {
 	manifest, err := readPebbleSSTIngestManifest(r)
 	if err != nil {
 		return err
@@ -611,6 +611,9 @@ func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader) error {
 	metadata := metadataFromSSTIngestManifest(manifest)
 	if err := ingestSSTSnapshotIntoTempDB(tmpDir, paths, metadata, s.cipher != nil); err != nil {
 		_ = os.RemoveAll(tmpDir)
+		return err
+	}
+	if err := validateRestoreTempDB(tmpDir, validate); err != nil {
 		return err
 	}
 	return s.swapInTempDBWithMetadata(tmpDir, &metadata)

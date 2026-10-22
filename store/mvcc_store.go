@@ -920,6 +920,10 @@ func (s *mvccStore) Snapshot() (Snapshot, error) {
 }
 
 func (s *mvccStore) Restore(r io.Reader) error {
+	return s.restoreSnapshot(r, nil)
+}
+
+func (s *mvccStore) restoreSnapshot(r io.Reader, validate func(*treemap.Map, mvccSnapshotMigrationMetadata) error) error {
 	br := bufio.NewReader(r)
 	streaming, err := isStreamingMVCCSnapshot(br)
 	if err != nil {
@@ -928,7 +932,7 @@ func (s *mvccStore) Restore(r io.Reader) error {
 	if !streaming {
 		return errors.New("unrecognized snapshot format: unknown magic header")
 	}
-	return s.restoreStreamingSnapshot(br)
+	return s.restoreStreamingSnapshot(br, validate)
 }
 
 func isStreamingMVCCSnapshot(r *bufio.Reader) (bool, error) {
@@ -1091,6 +1095,10 @@ func writeMVCCSnapshotMetadata(
 	if err := writeMVCCSnapshotReadinessStates(w, migrationReadiness); err != nil {
 		return err
 	}
+	return writeMVCCSnapshotServingMetadata(w, version, migrationRetired, migrationOwnership...)
+}
+
+func writeMVCCSnapshotServingMetadata(w io.Writer, version uint32, migrationRetired map[uint64]struct{}, migrationOwnership ...[]MigrationOwnershipState) error {
 	if version < mvccSnapshotVersionV5 {
 		return nil
 	}
@@ -1227,7 +1235,7 @@ func mvccSnapshotTombstoneByte(tombstone bool) byte {
 	return 0
 }
 
-func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
+func (s *mvccStore) restoreStreamingSnapshot(r io.Reader, validate func(*treemap.Map, mvccSnapshotMigrationMetadata) error) error {
 	version, expected, err := readMVCCSnapshotHeader(r)
 	if err != nil {
 		return err
@@ -1240,9 +1248,14 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	if actual != expected {
 		return errors.WithStack(ErrInvalidChecksum)
 	}
-
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if validate != nil {
+		if err := validate(tree, meta); err != nil {
+			return err
+		}
+	}
+
 	s.tree = tree
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
@@ -1269,10 +1282,7 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
-	if version != mvccSnapshotVersionV1 &&
-		version != mvccSnapshotVersionV2 &&
-		version != mvccSnapshotVersionV3 &&
-		version != mvccSnapshotVersionV4 && version != mvccSnapshotVersionV5 && version != mvccSnapshotVersionV6 {
+	if version < mvccSnapshotVersionV1 || version > mvccSnapshotVersionV6 {
 		return 0, 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
 	}
 
@@ -1319,22 +1329,9 @@ func readMVCCSnapshotMetadata(
 		return lastCommitTS, minRetainedTS, emptyMVCCSnapshotMigrationMetadata(), nil
 	}
 
-	ackData, err := readMVCCSnapshotBytes(r, "snapshot migration acks")
+	migrationAcks, migrationHLCFloors, err := readMVCCSnapshotImportMetadata(r)
 	if err != nil {
 		return 0, 0, mvccSnapshotMigrationMetadata{}, err
-	}
-	migrationAcks, ok := decodeMigrationImportAcks(ackData)
-	if !ok {
-		return 0, 0, mvccSnapshotMigrationMetadata{}, errors.New("invalid snapshot migration acks")
-	}
-
-	floorData, err := readMVCCSnapshotBytes(r, "snapshot migration hlc floors")
-	if err != nil {
-		return 0, 0, mvccSnapshotMigrationMetadata{}, err
-	}
-	migrationHLCFloors, ok := decodeMigrationHLCFloors(floorData)
-	if !ok {
-		return 0, 0, mvccSnapshotMigrationMetadata{}, errors.New("invalid snapshot migration hlc floors")
 	}
 
 	migrationPromotions, err := readMVCCSnapshotPromotionMetadata(r, version)
@@ -1346,29 +1343,9 @@ func readMVCCSnapshotMetadata(
 	if err != nil {
 		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
-	retired := make(map[uint64]struct{})
-	if version >= mvccSnapshotVersionV5 {
-		data, readErr := readMVCCSnapshotBytes(r, "snapshot migration retirement")
-		if readErr != nil {
-			return 0, 0, mvccSnapshotMigrationMetadata{}, readErr
-		}
-		var valid bool
-		retired, valid = decodeMigrationRetiredJobs(data)
-		if !valid {
-			return 0, 0, mvccSnapshotMigrationMetadata{}, errors.New("invalid snapshot migration retirement")
-		}
-	}
-
-	var ownership []MigrationOwnershipState
-	if version >= mvccSnapshotVersionV6 {
-		data, readErr := readMVCCSnapshotBytes(r, "snapshot migration ownership")
-		if readErr != nil {
-			return 0, 0, mvccSnapshotMigrationMetadata{}, readErr
-		}
-		ownership, err = decodeMigrationOwnership(data)
-		if err != nil {
-			return 0, 0, mvccSnapshotMigrationMetadata{}, err
-		}
+	retired, ownership, err := readMVCCSnapshotServingMetadata(r, version)
+	if err != nil {
+		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
 	return lastCommitTS, minRetainedTS, mvccSnapshotMigrationMetadata{
 		acks:       migrationAcks,
@@ -1378,6 +1355,55 @@ func readMVCCSnapshotMetadata(
 		retired:    retired,
 		ownership:  ownership,
 	}, nil
+}
+
+func readMVCCSnapshotImportMetadata(r io.Reader) (map[migrationAckID]migrationImportAck, map[uint64]uint64, error) {
+	ackData, err := readMVCCSnapshotBytes(r, "snapshot migration acks")
+	if err != nil {
+		return nil, nil, err
+	}
+	acks, ok := decodeMigrationImportAcks(ackData)
+	if !ok {
+		return nil, nil, errors.New("invalid snapshot migration acks")
+	}
+	floorData, err := readMVCCSnapshotBytes(r, "snapshot migration hlc floors")
+	if err != nil {
+		return nil, nil, err
+	}
+	floors, ok := decodeMigrationHLCFloors(floorData)
+	if !ok {
+		return nil, nil, errors.New("invalid snapshot migration hlc floors")
+	}
+	return acks, floors, nil
+}
+
+func readMVCCSnapshotServingMetadata(r io.Reader, version uint32) (map[uint64]struct{}, []MigrationOwnershipState, error) {
+	retired := make(map[uint64]struct{})
+	if version >= mvccSnapshotVersionV5 {
+		data, readErr := readMVCCSnapshotBytes(r, "snapshot migration retirement")
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		var valid bool
+		retired, valid = decodeMigrationRetiredJobs(data)
+		if !valid {
+			return nil, nil, errors.New("invalid snapshot migration retirement")
+		}
+	}
+
+	var ownership []MigrationOwnershipState
+	if version >= mvccSnapshotVersionV6 {
+		data, readErr := readMVCCSnapshotBytes(r, "snapshot migration ownership")
+		if readErr != nil {
+			return nil, nil, readErr
+		}
+		var err error
+		ownership, err = decodeMigrationOwnership(data)
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	return retired, ownership, nil
 }
 
 // mvccSnapshotMigrationMetadata is the version-layered trailer that follows

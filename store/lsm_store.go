@@ -454,16 +454,8 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		cleanupOnInitFail()
 		return nil, err
 	}
-	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
+	readinessStates, err := s.loadMigrationServingMetadata()
 	if err != nil {
-		cleanupOnInitFail()
-		return nil, err
-	}
-	if _, err := s.readMigrationRetiredJobs(); err != nil {
-		cleanupOnInitFail()
-		return nil, err
-	}
-	if _, err := s.readMigrationOwnership(); err != nil {
 		cleanupOnInitFail()
 		return nil, err
 	}
@@ -737,12 +729,8 @@ func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error
 	if err := batch.Set(migrationRetiredMetaKeyBytes, encodeMigrationRetiredJobs(meta.migrationRetired), nil); err != nil {
 		return errors.WithStack(err)
 	}
-	ownership, err := encodeMigrationOwnership(meta.migrationOwnership)
-	if err != nil {
+	if err := stageSnapshotOwnership(batch, meta.migrationOwnership); err != nil {
 		return err
-	}
-	if err := batch.Set(migrationOwnershipMetaKeyBytes, ownership, nil); err != nil {
-		return errors.WithStack(err)
 	}
 	// Readiness states live one row per job rather than in a single meta key,
 	// so they are staged into the same batch instead of a separate write.
@@ -3349,6 +3337,10 @@ func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 }
 
 func (s *pebbleStore) Restore(r io.Reader) error {
+	return s.restoreSnapshot(r, nil)
+}
+
+func (s *pebbleStore) restoreSnapshot(r io.Reader, validate func(string) error) error {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 
@@ -3371,14 +3363,14 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 	case bytes.Equal(header, pebbleSnapshotMagic[:]):
 		// Native Pebble format: restorePebbleNativeAtomic performs a temp-dir
 		// swap so the existing DB is preserved if the restore fails midway.
-		return s.restorePebbleNativeAtomic(br)
+		return s.restorePebbleNativeAtomic(br, validate)
 	case bytes.Equal(header, pebbleSSTIngestSnapshotMagic[:]):
-		return s.restorePebbleSSTIngestAtomic(br)
+		return s.restorePebbleSSTIngestAtomic(br, validate)
 	case bytes.Equal(header, mvccSnapshotMagic[:]):
 		// Streaming MVCC format: restoreFromStreamingMVCC performs an atomic
 		// temp-dir swap, so the existing DB is preserved until checksum
 		// verification succeeds.
-		return s.restoreFromStreamingMVCC(br)
+		return s.restoreFromStreamingMVCC(br, validate)
 	default:
 		return errors.WithStack(errors.Newf("unrecognized snapshot format: unknown magic header"))
 	}
@@ -3442,7 +3434,7 @@ func (s *pebbleStore) reopenFreshDB() error {
 // It writes all entries into a temporary sibling directory and only swaps the
 // temp directory into s.dir after a full successful read, preserving the
 // existing DB on any failure.
-func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
+func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader, validate func(string) error) error {
 	magic, ts, err := readPebbleNativeHeader(r)
 	if err != nil {
 		return err
@@ -3461,6 +3453,9 @@ func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
 		return err
 	}
 
+	if err := validateRestoreTempDB(tmpDir, validate); err != nil {
+		return err
+	}
 	if err := s.swapInTempDB(tmpDir); err != nil {
 		return err
 	}
@@ -3605,7 +3600,7 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 	return tmpDir, nil
 }
 
-func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
+func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader, validate func(string) error) error {
 	body, hash, expectedChecksum, meta, err := readStreamingMVCCRestoreHeader(r)
 	if err != nil {
 		return err
@@ -3613,6 +3608,9 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 
 	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, meta, s.cipher != nil)
 	if err != nil {
+		return err
+	}
+	if err := validateRestoreTempDB(tmpDir, validate); err != nil {
 		return err
 	}
 	return s.swapInTempDB(tmpDir)
@@ -3685,14 +3683,8 @@ func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSn
 	if err != nil {
 		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
-	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
+	readinessStates, err := s.loadMigrationServingMetadata()
 	if err != nil {
-		return errors.Join(err, s.restoreSwapBackup(backupDir))
-	}
-	if _, err := s.readMigrationRetiredJobs(); err != nil {
-		return errors.Join(err, s.restoreSwapBackup(backupDir))
-	}
-	if _, err := s.readMigrationOwnership(); err != nil {
 		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
 	s.lastCommitTS = lastCommitTS
