@@ -80,6 +80,93 @@ func seedOwnershipRefreshState(t *testing.T, writer store.MigrationOwnershipStor
 	require.NoError(t, writer.ClearMigrationStateWithOwnership(t.Context(), state, index))
 }
 
+func TestOwnershipRefreshConsumerSequentialSplitRequiresRemainingRangeReacquisition(t *testing.T) {
+	root, original := ownershipRefreshCatalog(t)
+	snapshot := advanceOwnershipRefreshCatalog(t, root, 12)
+	original.CatalogVersion = snapshot.Version
+	// Job 1 owned [m,z]. Job 2 keeps the same left route ID but shrinks its
+	// descriptor to [m,x], moving [x,z] to another group. This is not an
+	// unchanged-descriptor refresh of Job 1, even though its left side remains.
+	snapshot.Routes[1].End = []byte("x")
+	right := distribution.RouteDescriptor{RouteID: 4, ParentRouteID: 3,
+		Start: []byte("x"), End: []byte("z"), GroupID: 9,
+		State: distribution.RouteStateActive, MinWriteTSExclusive: 200}
+	snapshot.Routes = append(snapshot.Routes, right)
+	_, err := root.catalog.Save(t.Context(), snapshot.Version, snapshot.Routes)
+	require.NoError(t, err)
+	snapshot = advanceOwnershipRefreshCatalog(t, root, 15)
+	encoded, err := distribution.EncodeRouteDescriptorForCatalogWrite(right, true)
+	require.NoError(t, err)
+	digest := sha256.Sum256(encoded)
+	nonowner := proto.CloneOf(original)
+	nonowner.CatalogVersion, nonowner.RouteId, nonowner.ParentRouteId = snapshot.Version, right.RouteID, right.ParentRouteID
+	nonowner.RouteStart, nonowner.RouteEnd = bytes.Clone(right.Start), bytes.Clone(right.End)
+	nonowner.OwnerGroupId, nonowner.MinWriteTsExclusive = right.GroupID, right.MinWriteTSExclusive
+	nonowner.Role, nonowner.DescriptorHash = pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_NONOWNER, digest[:]
+	st := store.NewMVCCStore()
+	_, _ = newOwnershipRuntimeClient(t, st, 7)
+	writer, ok := st.(store.MigrationOwnershipStore)
+	require.True(t, ok)
+	seedOwnershipRefreshState(t, writer, 7, original, 10)
+	seedOwnershipRefreshState(t, writer, 8, nonowner, 11)
+	before, err := writer.MigrationServingState(t.Context())
+	require.NoError(t, err)
+	advanceOwnershipRefreshCatalog(t, root, 16)
+	rootClient, closeClient := newBufconnDistributionClient(t, root)
+	defer closeClient()
+	consumer, client, _ := ownershipRefreshConsumer(t, st, rootClient, nonowner)
+	require.ErrorContains(t, consumer.RunMigrationOwnershipRefreshOnce(t.Context()), "descriptor changed")
+	require.Len(t, client.cleanups, 1, "no proposal may clip or refresh the hash-changed old proof")
+	require.EqualValues(t, 8, client.cleanups[0].GetJobId())
+	after, err := writer.MigrationServingState(t.Context())
+	require.NoError(t, err)
+	require.Len(t, after.Ownership, 2)
+	assertSequentialSplitOwnershipRetained(t, before.Ownership, after.Ownership, nonowner)
+	retirement, ok := st.(store.MigrationRetirementReader)
+	require.True(t, ok)
+	retired, err := retirement.MigrationRetired(t.Context(), 8)
+	require.NoError(t, err)
+	require.True(t, retired, "refresh must not reopen the retired nonowner job")
+	for _, key := range []string{"n", "y"} {
+		err := kv.CheckMigrationRequest(t.Context(), st, 7, &pb.Request{Ts: 300, ObservedRouteVersion: 16,
+			Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte(key), Value: []byte("not admitted")}}})
+		require.ErrorIs(t, err, kv.ErrRouteCutoverPending, "remaining-left proof needs reacquisition; moved-right stays nonowner")
+	}
+}
+
+func advanceOwnershipRefreshCatalog(t *testing.T, root *DistributionServer, version uint64) distribution.CatalogSnapshot {
+	t.Helper()
+	snapshot, err := root.catalog.Snapshot(t.Context())
+	require.NoError(t, err)
+	for snapshot.Version < version {
+		snapshot.Routes[0].MinWriteTSExclusive++
+		_, err = root.catalog.Save(t.Context(), snapshot.Version, snapshot.Routes)
+		require.NoError(t, err)
+		snapshot, err = root.catalog.Snapshot(t.Context())
+		require.NoError(t, err)
+	}
+	return snapshot
+}
+
+func assertSequentialSplitOwnershipRetained(t *testing.T, before, after []store.MigrationOwnershipState, nonowner *pb.MigrationOwnershipProof) {
+	t.Helper()
+	prior := make(map[uint64]store.MigrationOwnershipState, len(before))
+	for _, state := range before {
+		prior[state.JobID] = state
+	}
+	for _, state := range after {
+		if state.JobID == 7 {
+			require.Equal(t, prior[7], state, "old full [m,z] OWNER proof must remain byte-for-byte intact at C12")
+			continue
+		}
+		require.EqualValues(t, 8, state.JobID)
+		expected := proto.CloneOf(nonowner)
+		expected.CatalogVersion = 16
+		require.True(t, proto.Equal(expected, kv.MigrationOwnershipProofFromState(state)))
+		require.Equal(t, prior[8].Receipts, state.Receipts, "NONOWNER receipt C15 must survive its valid unchanged-descriptor refresh")
+	}
+}
+
 type ownershipRefreshEngine struct {
 	raftengine.Engine
 	configuration raftengine.AppliedConfigurationAware
