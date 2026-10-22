@@ -162,6 +162,15 @@ primary record is missing or disagrees, except for the first-primary case
 below. ABORT and valid post-D commits do not
 perform the additional evidence read.
 
+Evidence is bounded per forwarded batch: duplicate primary keys are read once,
+at most 64 distinct primary keys are admitted (checked before any evidence I/O),
+and the whole evidence phase shares one five-second budget, respecting any
+earlier caller deadline. The batch reader shares one applied read fence per
+local owning group rather than starting a new quorum round trip per metadata
+entry. A route-version change makes that cached owner's verdict unknown instead
+of refencing repeatedly. This prevents repeated metadata in a large Forward
+request from multiplying quorum reads or resetting a five-second timeout.
+
 `ShardStore.PrimaryCommitEvidence` provides the separate readability signal.
 It uses the primary's physical owner, including partition-map routing, requires
 a local active/non-staged store and an applied linearizable-read fence, and reads directly

@@ -117,6 +117,12 @@ type PrimaryCommitEvidenceReader interface {
 	PrimaryCommitEvidence(context.Context, []byte, uint64) (PrimaryCommitEvidence, error)
 }
 
+// PrimaryCommitEvidenceBatchReader shares applied read fences between primary
+// keys with the same local owner. Results have the same order as primaryKeys.
+type PrimaryCommitEvidenceBatchReader interface {
+	PrimaryCommitEvidenceBatch(context.Context, [][]byte, uint64) ([]PrimaryCommitEvidence, error)
+}
+
 // ClassifyPrePhaseDCommit decides whether a pre-Phase-D commit resolution may
 // be admitted.
 //
