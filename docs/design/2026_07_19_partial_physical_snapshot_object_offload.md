@@ -1,9 +1,9 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1/M2 implemented; M3 retention/GC implemented, remaining M3 items pending
+Status: Partial — M0/M1/M2 implemented; M3 publication and retention runtime, corruption drills, operations runbook and bounded three-node/single-group local recovery acceptance implemented; broader operational acceptance pending
 Author: bootjp
 Date: 2026-07-19
-Updated: 2026-07-23
+Updated: 2026-10-22
 
 ## 1. Scope
 
@@ -48,7 +48,13 @@ The M1 object-store-neutral substrate now adds:
 - `cmd/elastickv-snapshot-offload publish` and `restore` for local and
   S3-backed operator workflows.
 
-The runtime scheduler remains pending. Retention/GC and corruption tests are implemented; the remaining M3 items (restore drills, multi-node acceptance, operator documentation) are pending.
+The runtime scheduler is implemented and wired into main.go, opt-in via
+`--snapshotOffloadBucket` (or `--snapshotOffloadLocalDir`). Retention/GC and
+corruption drills from PR #1222 are integrated. GC requires a separate explicit
+rollout gate; publication alone never enables deletion. A bounded three-node,
+single-data-group local recovery drill has passed; remote-S3, multi-group and
+long-duration operational acceptance remain outside that receipt. The runbook is at
+[`../snapshot_offload_operations.md`](../snapshot_offload_operations.md).
 
 ## 2. Safety boundary
 
@@ -110,6 +116,10 @@ The schedule is opt-in. Initial defaults are one scan every 15 minutes and one
 upload at a time per process. Jitter spreads multi-group work. Snapshot
 creation cadence remains owned by the Raft engine; object offload never forces
 an extra state-machine snapshot in this milestone.
+
+Each publication has a configurable deadline (`--snapshotOffloadPublishTimeout`,
+default 10 minutes). Deadline expiry releases the upload slot, records a failed
+attempt, and lets the scheduler retry on a later scan.
 
 ## 5. Retention and reference lifecycle
 
@@ -221,8 +231,13 @@ enable the verifier. Before rollback or restarting any legacy publisher, make
 the verifier fail, stop and drain any active GC pass, and only then resume the
 legacy publisher. Claims cannot protect a publisher that ignores them; a
 process-local build version or successful claim acquisition is not evidence
-that the rollout is complete. Runtime verifier wiring is part of the separate
-runtime integration work; `NewGC` refuses a missing verifier.
+that the rollout is complete. The runtime supplies the verifier only after the
+operator sets `--snapshotOffloadGCClaimsRolloutComplete`; `NewGC` refuses a
+missing verifier. GC remains disabled unless `--snapshotOffloadGCEnabled` is
+also set. Passes run serially with configurable interval, timeout and policy.
+Shutdown cancels and drains both workers before closing their shared store.
+The rollout assertion covers standalone publishers as well as Raft members;
+it is not automatic cluster capability discovery.
 
 Storage-envelope encryption protects values but not all physical keys and
 metadata. The external bucket therefore requires private ACLs, TLS, and
@@ -238,8 +253,8 @@ applicable KMS decrypt permission).
 |---|---|---|
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
-| M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Not yet wired into `main.go` — the runtime flags are M3. |
-| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: the §5 two-phase retention/GC (`retention.go`) with cross-process publish/GC claims and `RetentionStore` list/delete on both the local and S3 stores. Restore corruption drills are implemented (`restore_corruption_test.go`: truncated, over-length, missing and tampered-descriptor payloads, plus a positive restore-into-fresh-dir drill). Versioned buckets are rejected unless the operator explicitly confirms noncurrent-version expiration. Multi-node acceptance and the complete operator runbook remain pending. |
+| M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Runtime wiring and flags shipped in the M3 slice below. |
+| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: publication runtime, opt-in gated GC using the §5 implementation from #1222, metrics and operations runbook. Corruption drills cover truncated, over-length, missing and tampered payloads. GC validates versioning and requires explicit claims rollout verification. Bounded three-node/single-data-group acceptance passes periodic publication, surviving-quorum writes, actual GC and isolated replacement recovery with local FSM/adapter values and applied-index checks. Remote-S3, multi-group and long-duration acceptance are not established by that test. |
 
 The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to
@@ -265,6 +280,16 @@ old path is absent before requesting review.
   unbounded concurrent uploads.
 - A multi-node drill restores each group from external objects into fresh data
   directories and passes adapter reads after normal Raft startup.
+
+The bounded local acceptance drill uses the existing three-node gRPC bootstrap
+fixture with one data group and an independent durable filesystem object root.
+It must observe scheduler-created generations (not seeded snapshot files), keep
+committing writes with one replica stopped, reclaim old generations through the
+runtime GC, and restore the retained generation into an isolated replacement
+cluster with fresh directories and addresses. Acceptance checks adapter values,
+Raft/FSM applied indexes and a new replicated write after restore. This narrow
+drill does not establish long-duration stability, remote-S3 behavior or every
+multi-group topology; its execution receipt belongs in the operations runbook.
 
 ## 10. Intentional non-goals
 

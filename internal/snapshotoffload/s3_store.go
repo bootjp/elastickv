@@ -22,7 +22,7 @@ import (
 
 const (
 	s3MetadataSHA256          = "elastickv-sha256"
-	s3LoadConfigOptionCapHint = 4
+	s3LoadConfigOptionCapHint = 5
 	s3ConditionalWriteRetries = 3
 	s3MaxSinglePutBytes       = int64(5 * 1024 * 1024 * 1024)
 	s3DefaultMultipartPart    = int64(64 * 1024 * 1024)
@@ -58,6 +58,7 @@ type S3StoreConfig struct {
 	ServerSideEncryption   string
 	SSEKMSKeyID            string
 	DisableChecksumHeaders bool
+	HTTPClientDecorator    func(aws.HTTPClient) (aws.HTTPClient, error)
 	// AllowVersionedBucketWithLifecycle is an explicit operator assertion
 	// that the bucket has a noncurrent-version expiration lifecycle. The
 	// GC rejects Enabled/Suspended versioning by default because keyed
@@ -86,16 +87,11 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 	}
 	client := cfg.Client
 	if client == nil {
-		awsCfg, err := loadS3AWSConfig(ctx, cfg)
+		var err error
+		client, err = newS3ObjectClient(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}
-		client = s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-			o.UsePathStyle = cfg.ForcePathStyle
-			if stringsTrim(cfg.Endpoint) != "" {
-				o.BaseEndpoint = aws.String(stringsTrim(cfg.Endpoint))
-			}
-		})
 	}
 	bucket := stringsTrim(cfg.Bucket)
 	return &S3Store{
@@ -108,6 +104,26 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 		multipartPartSize:                 s3DefaultMultipartPart,
 		allowVersionedBucketWithLifecycle: cfg.AllowVersionedBucketWithLifecycle,
 	}, nil
+}
+
+func newS3ObjectClient(ctx context.Context, cfg S3StoreConfig) (*s3.Client, error) {
+	awsCfg, err := loadS3AWSConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.HTTPClientDecorator != nil {
+		client, err := cfg.HTTPClientDecorator(awsCfg.HTTPClient)
+		if err != nil {
+			return nil, errors.Wrap(err, "configure s3 http client")
+		}
+		awsCfg.HTTPClient = client
+	}
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = cfg.ForcePathStyle
+		if stringsTrim(cfg.Endpoint) != "" {
+			o.BaseEndpoint = aws.String(stringsTrim(cfg.Endpoint))
+		}
+	}), nil
 }
 
 // ValidateRetention checks versioning immediately before GC, without imposing

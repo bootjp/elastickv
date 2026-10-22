@@ -50,6 +50,63 @@ func (o *recordingObserver) snapshot() ([]uint64, []string, []error) {
 
 const schedulerTestIndex = 42
 
+type stalledHeadStore struct {
+	PublishStore
+	stall atomic.Bool
+}
+
+func TestSchedulerRejectsNonpositivePublishTimeout(t *testing.T) {
+	t.Parallel()
+	store := newTestLocalStore(t, t.TempDir())
+	for _, timeout := range []time.Duration{0, -time.Second} {
+		_, err := NewScheduler(store, nil, "", "cluster-a", "test",
+			WithSchedulerPublishTimeout(timeout))
+		require.ErrorIs(t, err, ErrInvalidOptions)
+	}
+}
+
+func (s *stalledHeadStore) HeadObject(ctx context.Context, key string) (ObjectInfo, bool, error) {
+	if s.stall.Load() {
+		<-ctx.Done()
+		return ObjectInfo{}, false, ctx.Err()
+	}
+	return s.PublishStore.HeadObject(ctx, key)
+}
+
+func TestSchedulerPublicationTimeoutReleasesScanAndAllowsRetry(t *testing.T) {
+	t.Parallel()
+	root := t.TempDir()
+	dataDir := seedSchedulerGroup(t, root, "group")
+	store := &stalledHeadStore{PublishStore: newTestLocalStore(t, filepath.Join(root, "objects"))}
+	store.stall.Store(true)
+	observer := &recordingObserver{}
+	scheduler := newTestScheduler(t, store, []OffloadGroup{{
+		GroupID: 7, DataDir: dataDir,
+		IsLeader:     func() bool { return true },
+		VerifyLeader: func(context.Context) error { return nil },
+	}}, WithSchedulerPublishTimeout(500*time.Millisecond), WithSchedulerObserver(observer))
+
+	done := make(chan struct{})
+	go func() {
+		scheduler.SyncOnce(context.Background())
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stalled store must not block the scan indefinitely")
+	}
+	_, _, failures := observer.snapshot()
+	require.Len(t, failures, 1)
+	require.ErrorIs(t, failures[0], context.DeadlineExceeded)
+	require.Zero(t, scheduler.LastPublishedIndex(7))
+
+	store.stall.Store(false)
+	scheduler.publishTimeout = 5 * time.Second
+	scheduler.SyncOnce(context.Background())
+	require.Equal(t, uint64(schedulerTestIndex), scheduler.LastPublishedIndex(7))
+}
+
 func seedSchedulerGroup(t *testing.T, root, name string) string {
 	t.Helper()
 	dir := filepath.Join(root, name)

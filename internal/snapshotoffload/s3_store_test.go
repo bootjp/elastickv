@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"math"
+	"net/http"
 	"sort"
 	"strings"
 	"sync"
@@ -49,9 +50,34 @@ func TestPublishAndRestorePhysicalSnapshotRoundTripWithS3Store(t *testing.T) {
 		Peers: []etcdraftengine.Peer{
 			{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002"},
 		},
+		ExpectGroupID:       expectGroup(manifest.GroupID),
+		ExpectSourceCluster: manifest.SourceCluster,
 	})
 	require.NoError(t, err)
 	require.Equal(t, manifest.Payload.SHA256, result.PayloadSHA256)
+}
+
+func TestS3StoreUsesConfiguredHTTPClientOnlyForS3(t *testing.T) {
+	client := &http.Client{}
+	cfg := S3StoreConfig{
+		Bucket:               "snapshots",
+		Region:               "us-east-1",
+		ServerSideEncryption: "AES256",
+		AccessKeyID:          "test-access-key",
+		SecretAccessKey:      "test-secret-key",
+		HTTPClientDecorator: func(aws.HTTPClient) (aws.HTTPClient, error) {
+			return client, nil
+		},
+	}
+	awsCfg, err := loadS3AWSConfig(context.Background(), cfg)
+	require.NoError(t, err)
+	require.NotEqual(t, client, awsCfg.HTTPClient,
+		"credential providers must retain their own transport for IMDS and ECS")
+	store, err := NewS3Store(context.Background(), cfg)
+	require.NoError(t, err)
+	s3Client, ok := store.client.(*s3.Client)
+	require.True(t, ok)
+	require.Same(t, client, s3Client.Options().HTTPClient)
 }
 
 func TestS3RestoreDoesNotRequireBucketVersioningPermission(t *testing.T) {
@@ -73,6 +99,7 @@ func TestS3RestoreDoesNotRequireBucketVersioningPermission(t *testing.T) {
 			readerStore := newTestS3Store(t, client)
 			result, err := RestorePhysicalSnapshot(ctx, RestoreOptions{
 				Store: readerStore, ManifestKey: manifest.ManifestKey, DataDir: root + "/restored",
+				ExpectGroupID: expectGroup(3), ExpectSourceCluster: "cluster-s3",
 				Peers: []etcdraftengine.Peer{{NodeID: 2, ID: "n2", Address: "127.0.0.1:12002"}},
 			})
 			require.NoError(t, err)

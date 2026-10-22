@@ -38,10 +38,11 @@ func publishForRestoreDrill(t *testing.T, root string, payload []byte) (*LocalSt
 func requireRestoreFailsClosed(t *testing.T, store *LocalStore, manifestKey, dataDir string) error {
 	t.Helper()
 	_, err := RestorePhysicalSnapshot(context.Background(), RestoreOptions{
-		Store:       store,
-		ManifestKey: manifestKey,
-		DataDir:     dataDir,
-		Peers:       singlePeer(),
+		Store:         store,
+		ManifestKey:   manifestKey,
+		DataDir:       dataDir,
+		Peers:         singlePeer(),
+		ExpectGroupID: expectGroup(1), ExpectSourceCluster: "cluster-a",
 	})
 	require.Error(t, err)
 	_, statErr := os.Stat(dataDir)
@@ -169,10 +170,11 @@ func TestRestoreDrillSucceedsIntoAFreshDirectory(t *testing.T) {
 
 	restoreDataDir := filepath.Join(root, "restored")
 	result, err := RestorePhysicalSnapshot(context.Background(), RestoreOptions{
-		Store:       store,
-		ManifestKey: manifest.ManifestKey,
-		DataDir:     restoreDataDir,
-		Peers:       singlePeer(),
+		Store:         store,
+		ManifestKey:   manifest.ManifestKey,
+		DataDir:       restoreDataDir,
+		Peers:         singlePeer(),
+		ExpectGroupID: expectGroup(1), ExpectSourceCluster: "cluster-a",
 	})
 	require.NoError(t, err)
 	require.NotNil(t, result)
@@ -182,10 +184,11 @@ func TestRestoreDrillSucceedsIntoAFreshDirectory(t *testing.T) {
 	// than overwrite: the preflight is what protects an operator who
 	// re-runs the drill against a live node's data dir.
 	_, err = RestorePhysicalSnapshot(context.Background(), RestoreOptions{
-		Store:       store,
-		ManifestKey: manifest.ManifestKey,
-		DataDir:     restoreDataDir,
-		Peers:       singlePeer(),
+		Store:         store,
+		ManifestKey:   manifest.ManifestKey,
+		DataDir:       restoreDataDir,
+		Peers:         singlePeer(),
+		ExpectGroupID: expectGroup(1), ExpectSourceCluster: "cluster-a",
 	})
 	require.Error(t, err, "restore must refuse a destination that already exists")
 }
