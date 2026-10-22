@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bootjp/elastickv/internal/testutil"
 )
 
 // waitForDone asserts the watcher's goroutine exits within d, returning
@@ -53,11 +55,7 @@ func TestWatcher_FiresOnceAboveThreshold(t *testing.T) {
 	defer cancel()
 	go w.Start(ctx)
 
-	select {
-	case <-fired:
-	case <-time.After(2 * time.Second):
-		t.Fatalf("OnExceed was not invoked")
-	}
+	testutil.Recv(t, fired, 2*time.Second, "OnExceed was not invoked")
 
 	// Give the loop several more poll intervals to prove it does not fire
 	// again. The watcher should have already returned on first fire, so

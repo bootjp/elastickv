@@ -468,6 +468,28 @@ type GroupLeaderRoutableCoordinator interface {
 	RaftLeaderForGroup(groupID uint64) string
 }
 
+// LocalLeaderGroupsCoordinator is the optional capability implemented by
+// coordinators that know which data groups this process currently leads.
+// Background maintenance uses it to scan only those groups instead of the whole
+// keyspace. known is false when the coordinator cannot tell -- a decorator whose
+// inner coordinator lacks the capability -- and callers must treat that as
+// unknown, not as leading no group: a decorator answering "no groups" there
+// silently stopped the Redis TTL-inline migration.
+type LocalLeaderGroupsCoordinator interface {
+	LocalLeaderGroupIDs() (ids []uint64, known bool)
+}
+
+// LocalLeaderGroupIDsThrough returns the data groups c leads, with known false
+// when c does not expose the capability. Decorators forward through it so an
+// inner coordinator without the capability stays unknown.
+func LocalLeaderGroupIDsThrough(c Coordinator) ([]uint64, bool) {
+	lg, ok := c.(LocalLeaderGroupsCoordinator)
+	if !ok {
+		return nil, false
+	}
+	return lg.LocalLeaderGroupIDs()
+}
+
 // LeaseReadGroupTargets collapses targets to one per Raft group, preferring the
 // group id a target already carries over re-deriving it from the key bytes. A
 // target with GroupID 0 falls back to key resolution, which is what plain

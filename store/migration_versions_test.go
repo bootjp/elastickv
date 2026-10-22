@@ -15,17 +15,8 @@ import (
 
 func runMigrationStoreSuite(t *testing.T, test func(t *testing.T, st MVCCStore)) {
 	t.Helper()
-	t.Run("memory", func(t *testing.T) {
-		test(t, NewMVCCStore())
-	})
-	t.Run("pebble", func(t *testing.T) {
-		dir, err := os.MkdirTemp("", "migration-versions-*")
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, os.RemoveAll(dir)) })
-		st, err := NewPebbleStore(dir)
-		require.NoError(t, err)
-		t.Cleanup(func() { require.NoError(t, st.Close()) })
-		test(t, st)
+	forEachMVCCStore(t, func(t *testing.T, newStore func(*testing.T) MVCCStore) {
+		test(t, newStore(t))
 	})
 }
 

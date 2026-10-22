@@ -360,37 +360,6 @@ func TestPebbleStore_LatestCommitTS_NotFound(t *testing.T) {
 // Compact
 // ---------------------------------------------------------------------------
 
-func TestPebbleStore_Compact_RemovesOldVersions(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v2"), 20, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v3"), 30, 0))
-
-	// Compact with minTS=25. The first version <= 25 is TS=20 (kept);
-	// TS=10 is older and should be removed. TS=30 is above minTS, kept.
-	require.NoError(t, s.Compact(ctx, 25))
-
-	// TS=30 still visible.
-	val, err := s.GetAt(ctx, []byte("k1"), 30)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("v3"), val)
-
-	// TS=25 returns the anchor version (v2 at TS=20).
-	val, err = s.GetAt(ctx, []byte("k1"), 25)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("v2"), val)
-
-	// Reads below minTS=25 are rejected as compacted.
-	_, err = s.GetAt(ctx, []byte("k1"), 15)
-	assert.ErrorIs(t, err, ErrReadTSCompacted)
-}
-
 func TestPebbleStore_Compact_KeepsNewestVersion(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
@@ -412,30 +381,6 @@ func TestPebbleStore_Compact_KeepsNewestVersion(t *testing.T) {
 
 	// Reads below minTS are rejected.
 	_, err = s.GetAt(ctx, []byte("k1"), 10)
-	assert.ErrorIs(t, err, ErrReadTSCompacted)
-}
-
-func TestPebbleStore_Compact_TombstoneCleanup(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
-	require.NoError(t, s.DeleteAt(ctx, []byte("k1"), 20))
-
-	// Compact with minTS=25. The tombstone at TS=20 is kept as anchor;
-	// the put at TS=10 is older and should be removed.
-	require.NoError(t, s.Compact(ctx, 25))
-
-	// Read at minTS=25 — the tombstone anchor makes the key "not found".
-	_, err = s.GetAt(ctx, []byte("k1"), 25)
-	assert.ErrorIs(t, err, ErrKeyNotFound)
-
-	// Reads below minTS are rejected as compacted.
-	_, err = s.GetAt(ctx, []byte("k1"), 15)
 	assert.ErrorIs(t, err, ErrReadTSCompacted)
 }
 
@@ -465,61 +410,6 @@ func TestPebbleStore_Compact_MetaKeyNotAffected(t *testing.T) {
 	defer s2.Close()
 
 	assert.Equal(t, lastBefore, s2.LastCommitTS())
-}
-
-func TestPebbleStore_Compact_TxnInternalKeySingleVersionPreserved(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	// Write a transaction internal key with a single version (active lock).
-	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock|k1")...)
-	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 5, 0))
-
-	// Also write a regular key with two versions.
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 10, 0))
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v2"), 20, 0))
-
-	// Compact. The single-version txn key is preserved (nothing older to remove).
-	require.NoError(t, s.Compact(ctx, 15))
-
-	// The txn internal key should still be readable.
-	val, err := s.GetAt(ctx, txnKey, 15)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("lock-data"), val)
-
-	// Regular key: TS=20 is above minTS, kept. TS=10 is the anchor, kept.
-	val, err = s.GetAt(ctx, []byte("k1"), 20)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("v2"), val)
-}
-
-func TestPebbleStore_Compact_TxnInternalKeyOldVersionRemoved(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	// Simulate a lock lifecycle: PREPARE writes lock at startTS, COMMIT
-	// writes tombstone at commitTS.
-	txnKey := append([]byte(nil), txnInternalKeyPrefix...)
-	txnKey = append(txnKey, []byte("lock|k1")...)
-	require.NoError(t, s.PutAt(ctx, txnKey, []byte("lock-data"), 10, 0))
-	require.NoError(t, s.DeleteAt(ctx, txnKey, 20))
-
-	// Compact with minTS above commitTS. The old version (TS=10) should be
-	// removed, keeping only the tombstone at TS=20.
-	require.NoError(t, s.Compact(ctx, 25))
-
-	// The lock should not be readable (tombstone).
-	_, err = s.GetAt(ctx, txnKey, 25)
-	require.ErrorIs(t, err, ErrKeyNotFound)
 }
 
 func TestPebbleStore_Compact_MultipleKeys(t *testing.T) {
@@ -573,35 +463,6 @@ func TestPebbleStore_Compact_MultipleKeys(t *testing.T) {
 // Read-write conflict detection (SSI)
 // ---------------------------------------------------------------------------
 
-func TestPebbleStore_ApplyMutations_ReadConflict(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	// Commit k1 at TS=20.
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
-
-	// A transaction that started at TS=10 writes k2 but reads k1.
-	// k1 was committed at TS=20 > startTS=10 → read-write conflict.
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 30)
-	require.Error(t, err)
-	assert.True(t, errors.Is(err, ErrWriteConflict))
-
-	conflictKey, ok := WriteConflictKey(err)
-	assert.True(t, ok)
-	assert.Equal(t, []byte("k1"), conflictKey)
-
-	// k2 should NOT have been written.
-	_, err = s.GetAt(ctx, []byte("k2"), 30)
-	assert.ErrorIs(t, err, ErrKeyNotFound)
-}
-
 func TestPebbleStore_ApplyMutations_ReadConflictPreservesInputOrder(t *testing.T) {
 	dir := t.TempDir()
 	s, err := NewPebbleStore(dir)
@@ -627,67 +488,6 @@ func TestPebbleStore_ApplyMutations_ReadConflictPreservesInputOrder(t *testing.T
 	conflictKey, ok := WriteConflictKey(err)
 	require.True(t, ok)
 	assert.Equal(t, []byte("z-read"), conflictKey)
-}
-
-func TestPebbleStore_ApplyMutations_ReadConflict_NoConflictWhenReadKeyUnchanged(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	// Commit k1 at TS=5.
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 5, 0))
-
-	// Transaction starts at TS=10. k1 was committed at TS=5 <= startTS=10 → no conflict.
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("k1")}, 10, 20)
-	require.NoError(t, err)
-
-	val, err := s.GetAt(ctx, []byte("k2"), 20)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("v2"), val)
-}
-
-func TestPebbleStore_ApplyMutations_ReadConflict_NonexistentReadKey(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	// Reading a key that doesn't exist should not cause a conflict.
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k1"), Value: []byte("v1")},
-	}
-	err = s.ApplyMutations(ctx, mutations, [][]byte{[]byte("nonexistent")}, 10, 20)
-	require.NoError(t, err)
-
-	val, err := s.GetAt(ctx, []byte("k1"), 20)
-	require.NoError(t, err)
-	assert.Equal(t, []byte("v1"), val)
-}
-
-func TestPebbleStore_ApplyMutations_ReadConflict_NilReadKeys(t *testing.T) {
-	dir := t.TempDir()
-	s, err := NewPebbleStore(dir)
-	require.NoError(t, err)
-	defer s.Close()
-
-	ctx := context.Background()
-
-	// Passing nil readKeys should behave as before (write-write only).
-	require.NoError(t, s.PutAt(ctx, []byte("k1"), []byte("v1"), 20, 0))
-
-	mutations := []*KVPairMutation{
-		{Op: OpTypePut, Key: []byte("k2"), Value: []byte("v2")},
-	}
-	err = s.ApplyMutations(ctx, mutations, nil, 10, 30)
-	require.NoError(t, err)
 }
 
 func TestPebbleStore_ApplyMutations_ReadConflict_PartialConflict(t *testing.T) {

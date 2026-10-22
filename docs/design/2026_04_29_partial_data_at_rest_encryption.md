@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8, 9A–9B, 9C-1, 9C-2, and 9D shipped (5E deferred); remaining Stage 9 work open
+Status: Partial — Stages 0–8, 9A–9B, 9C-1 through 9C-3, and 9D shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -36,8 +36,10 @@ Date: 2026-04-29
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
 | 9C-2 | Sidecar/KEK observability: `active_dek_id{purpose}`, `sidecar_raft_index`, `kek_unwrap_seconds` (§9.2) | shipped | — |
+| 9C-3 | Startup KEK-unwrap memoization: collapses the guard + hydration double-unwrap that Stage 9B's KMS providers turned into doubled startup round-trips | shipped | — |
 | 9D | Encrypted Jepsen acceptance gate (§8.4): `elastickv-admin encryption wrap-dek` (local KEK-wrap helper so an operator or a script can produce the `bootstrap` / `rotate-dek` material without hand-rolling AES-GCM), `scripts/jepsen-enable-encryption.sh` (bootstrap → `enable-storage-envelope` → `enable-raft-envelope` → wait for every member), `scripts/run-jepsen-local.sh --encrypted`, and an `encryption: [off, on]` matrix on the per-push `Jepsen Test` workflow so every Redis / DynamoDB / S3 / SQS / filesystem workload also runs against an encrypted 3-node cluster. | shipped | this PR |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks (§5.2, §5.4, §6.5, §8.3) | open | — |
+| 9C-6 | §5.4 rewrite-job decisions: `ClassifyMVCCRewrite` (which MVCC versions a rotation must re-encrypt, iterating `(user_key, version_ts)` rather than `user_key`, so history under the retiring DEK is not left behind) and `RewriteThrottle` (the `--rate=N MiB/s` inter-batch yield, using a virtual deadline that advances for every batch so a stalled job cannot bank idle time and burst). Decision layer only — no store, no clock, no Raft. | shipped | — |
+| 9C+ | Rotation budget/rewrap/retire, the rewrite job's execution half, admission-control wiring, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), and remaining benchmarks (§5.2, §5.4, §6.5, §8.3) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
@@ -2485,6 +2487,22 @@ locally.
   server and `elastickv-admin`, generates the KEK under the run's
   data dir, starts the cluster, runs the cutover, and then runs the
   same workloads as the cleartext invocation.
+- **Managed Jepsen.** Every workload accepts `--encryption` and passes
+  it to the shared DB adapter. The adapter builds the repository-root
+  production server, provisions the shared test KEK, discovers every
+  member for bootstrap, applies both envelope cutovers after membership
+  is established, and waits for every node to report both active before
+  releasing the workload. Each mutation retries across all members during
+  elections; each cutover reads the proposer identity from the selected
+  endpoint. Transient status errors remain inside the per-member readiness
+  poll. The Jepsen `await-fn` helper retries exceptions, so unavailable leaders,
+  inactive envelopes, and failed joins throw rather than return a falsey
+  value; regression tests exercise the actual helper. Managed S3 and SQS nodes receive cluster-wide Raft-to-frontend maps
+  so requests sent to followers can reach the leader. `--local --encryption` is rejected because a
+  no-op DB adapter cannot provision or verify that cluster. Multi-group
+  managed runs are also rejected before setup because the current Raft
+  envelope cutover is defined only for a single shard group; they must not
+  bootstrap keys or enable the storage envelope and then fail halfway through.
 - **Evidence (first run, this PR).** Against an encrypted cluster
   built from this branch: Redis list-append pass, Redis ZSet safety
   pass, DynamoDB list-append pass (30 s), all ten DynamoDB per-type

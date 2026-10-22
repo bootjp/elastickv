@@ -222,6 +222,10 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 // indexed batch, the mutations are encoded before anything is staged so a
 // validation failure leaves the batch untouched, and nothing is committed.
 func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raftEntryScope, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	return s.stageMutationsInRaftEntryWithFence(ctx, scope, mutations, readKeys, startTS, commitTS, appliedIndex, false)
+}
+
+func (s *pebbleStore) stageMutationsInRaftEntryWithFence(ctx context.Context, scope *raftEntryScope, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64, fenced bool) error {
 	if scope.failed != nil {
 		return scope.failed
 	}
@@ -234,17 +238,17 @@ func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raft
 		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
 	}
 
-	if appliedIndex > 0 {
-		landed, err := s.raftApplyAlreadyLandedWith(scope.batch, mutations, commitTS)
-		if err != nil {
-			return scope.fail(err)
-		}
-		if landed {
-			scope.observe(commitTS, true)
-			return nil
-		}
+	landed, observe, err := s.raftEntryMutationAlreadyLanded(scope, mutations, commitTS, appliedIndex, fenced)
+	if err != nil {
+		return scope.fail(err)
 	}
-	if err := s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, false); err != nil {
+	if landed {
+		if observe {
+			scope.observe(commitTS, true)
+		}
+		return nil
+	}
+	if err := s.checkRaftEntryMutationConflicts(ctx, scope, mutations, readKeys, startTS, commitTS, fenced); err != nil {
 		return scope.failUnlessVerdict(err)
 	}
 	encoded, err := s.encodeMutationsForBatch(mutations, commitTS, false)
@@ -256,6 +260,31 @@ func (s *pebbleStore) stageMutationsInRaftEntry(ctx context.Context, scope *raft
 	}
 	scope.observe(commitTS, true)
 	return nil
+}
+
+func (s *pebbleStore) checkRaftEntryMutationConflicts(ctx context.Context, scope *raftEntryScope, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, fenced bool) error {
+	if err := checkCommitTSFence(mutations, commitTS, s.LastCommitTS(), fenced); err != nil {
+		return err
+	}
+	return s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, false)
+}
+
+func (s *pebbleStore) raftEntryMutationAlreadyLanded(scope *raftEntryScope, mutations []*KVPairMutation, commitTS, appliedIndex uint64, fenced bool) (bool, bool, error) {
+	if appliedIndex == 0 {
+		return false, false, nil
+	}
+	persisted, present, err := s.readAppliedIndexLocked()
+	if err != nil {
+		return false, false, err
+	}
+	if present && appliedIndex < persisted {
+		return true, false, nil
+	}
+	if (present && appliedIndex == persisted) || (scope.touched && !fenced) {
+		landed, err := s.raftApplyAlreadyLandedWith(scope.batch, mutations, commitTS)
+		return landed, landed, err
+	}
+	return false, false, nil
 }
 
 // failUnlessVerdict returns a per-request verdict untouched and fails the

@@ -772,6 +772,9 @@ decoder's answer:
   disjoint, and reads each SST with Pebble's sstable reader, yielding the
   same entries as the legacy stream. This is the one place the package
   links a storage library, because the files are in Pebble's format.
+  The package's import-boundary test allows exactly
+  `github.com/cockroachdb/pebble/v2/sstable`; importing the Pebble
+  engine or any other Pebble package fails it.
 - **Key budget.** The reader capped keys at the 1 MiB logical size, while
   the store streams stored keys up to `MaxSnapshotStoredKeySize`, 1 MiB
   plus a 32-byte internal envelope such as migration staging. The reader
