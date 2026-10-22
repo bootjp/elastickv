@@ -875,11 +875,15 @@ single-process 3-node demo cluster, attaches a learner via
   changes).
 - Promote precondition: surface `Progress[nodeID].Match` in
   `Status.PerPeer` so an operator can choose `min_applied_index`
-  without guessing. The independent progress projection is tracked in
-  [#1227](https://github.com/bootjp/elastickv/pull/1227); this workload does
-  not depend on exposing that field through the RaftAdmin RPC. Operators
-  must choose a target such as the leader's `CommitIndex`, not pass the
-  learner's own current `Match` back as a vacuously satisfied bound.
+  without guessing. **Implemented** — `Status.PerPeer` reports each
+  remote replica's `Match`/`Next`/`IsLearner`/`RecentActive` from the
+  leader's tracker, and is nil on a follower (non-nil, possibly empty,
+  on a leader). Operators watch `Match` climb to a target such as the
+  same snapshot's `CommitIndex` and pass the TARGET as
+  `min_applied_index`: passing the learner's own current `Match` would
+  satisfy the engine's `Match >= minAppliedIndex` check by
+  construction and promote a lagging replica. Exposing it over the
+  RaftAdmin `Status` RPC needs a proto change and is a follow-up.
 - Decision gate for follower-served reads: write a separate proposal,
   do not extend this one.
 
@@ -887,9 +891,9 @@ The shipped learner primitive includes the engine API, etcd backend learner
 handling, v2 peers-file suffrage persistence, admin RPC/CLI surface,
 join-as-learner alarm, monitoring suffrage labels, promotion precondition
 checks against leader `Progress.Match`, and the operator runbook
-(`docs/raft_learner_operations.md`). Remaining Milestone 3 hardening is not
-claimed shipped here: a first-class `Status.PerPeer` progress field is still
-open, and follower-served read routing remains a separate proposal. The learner
+(`docs/raft_learner_operations.md`). The `Status.PerPeer` progress field has
+also landed (see §6); exposing it over the RaftAdmin RPC is a follow-up, and
+follower-served read routing remains a separate proposal. The learner
 attach/promote-under-partition Jepsen workload has landed; its checker pins
 three properties — promotion never outruns catch-up, no acknowledged write lost
 across a promotion, and a learner never counted in the voter quorum.
