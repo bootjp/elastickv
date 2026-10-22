@@ -46,6 +46,7 @@ var (
 	expectedVersion = flag.Uint64("expected-version", 0, "Expected catalog version for OCC; obtain by calling ListRoutes first (required, must be >= 1 — catalog version is 1-based)")
 	targetGroupID   = flag.Uint64("target-group-id", 0, "Target Raft group for an asynchronous cross-group migration; zero uses the existing same-group split")
 	abandonJobID    = flag.Uint64("abandon-job-id", 0, "Abandon a pre-cutover migration job; mutually exclusive with split flags")
+	retryJobID      = flag.Uint64("retry-job-id", 0, "Resume a FAILED migration at its recorded phase; mutually exclusive with other job/split flags")
 	getJobID        = flag.Uint64("get-job-id", 0, "Print one migration job; mutually exclusive with mutation flags")
 	tokenFile       = flag.String("token-file", "", "File containing the dedicated migration controller bearer token; not the read-only Admin token")
 	tlsCAFile       = flag.String("tls-ca-file", "", "PEM CA certificates for verified gRPC TLS; token-file always requires TLS (system roots if omitted)")
@@ -92,6 +93,9 @@ func run() error {
 	}
 	if *abandonJobID != 0 {
 		return runAbandonSplitJob(rpcCtx, client)
+	}
+	if *retryJobID != 0 {
+		return runRetrySplitJob(rpcCtx, client)
 	}
 
 	if *targetGroupID != 0 {
@@ -148,6 +152,14 @@ func runAbandonSplitJob(ctx context.Context, client pb.DistributionClient) error
 	return nil
 }
 
+func runRetrySplitJob(ctx context.Context, client pb.DistributionClient) error {
+	if _, err := client.RetrySplitJob(ctx, &pb.RetrySplitJobRequest{JobId: *retryJobID}); err != nil {
+		return errors.Wrap(err, "RetrySplitJob")
+	}
+	fmt.Printf("retried_job_id: %d\n", *retryJobID)
+	return nil
+}
+
 func runStartSplitMigration(ctx context.Context, client pb.DistributionClient) error {
 	resp, err := client.StartSplitMigration(ctx, &pb.StartSplitMigrationRequest{
 		ExpectedCatalogVersion: *expectedVersion,
@@ -163,17 +175,9 @@ func runStartSplitMigration(ctx context.Context, client pb.DistributionClient) e
 }
 
 func validateFlags() error {
-	if *getJobID != 0 {
-		if splitMutationFlagsSet() || *abandonJobID != 0 {
-			return errors.New("--get-job-id is mutually exclusive with mutation flags")
-		}
-		return nil
-	}
-	if *abandonJobID != 0 {
-		if splitMutationFlagsSet() {
-			return errors.New("--abandon-job-id is mutually exclusive with split flags")
-		}
-		return nil
+	jobMode, err := validateJobModeFlags()
+	if err != nil || jobMode {
+		return err
 	}
 	switch {
 	case *routeID == 0:
@@ -184,6 +188,22 @@ func validateFlags() error {
 		return errors.New("--expected-version is required and must be > 0")
 	}
 	return nil
+}
+
+func validateJobModeFlags() (bool, error) {
+	modes := 0
+	for _, id := range []uint64{*getJobID, *abandonJobID, *retryJobID} {
+		if id != 0 {
+			modes++
+		}
+	}
+	if modes == 0 {
+		return false, nil
+	}
+	if modes > 1 || splitMutationFlagsSet() {
+		return false, errors.New("--get-job-id, --abandon-job-id and --retry-job-id are mutually exclusive with each other and split flags")
+	}
+	return true, nil
 }
 
 func splitMutationFlagsSet() bool {

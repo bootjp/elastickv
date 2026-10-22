@@ -1,8 +1,10 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 
+	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -56,7 +58,14 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth, peerAuthEnforced bool
 	authUnary, authStream := bearerTokenAuth(token, func(method string) bool {
 		return splitMigrationAuthenticatedMethod(method, peerAuthEnforced)
 	}, "split migration controller")
+	controlAuth, _ := bearerTokenAuth(token, func(string) bool { return true }, "split migration peer")
 	unary := func(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
+		if info.FullMethod == pb.Internal_Forward_FullMethodName && splitForwardWritesJobControl(req) {
+			if err := checkSplitMigrationTransport(ctx, info.FullMethod, token, true); err != nil {
+				return nil, err
+			}
+			return controlAuth(ctx, req, info, handler)
+		}
 		if err := checkSplitMigrationTransport(ctx, info.FullMethod, token, peerAuthEnforced); err != nil {
 			return nil, err
 		}
@@ -75,6 +84,36 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth, peerAuthEnforced bool
 		return handler(srv, ss)
 	}
 	return unary, stream
+}
+
+// Job authority must never be planted during the send-first stage. Ordinary
+// legacy peer writes (including transaction metadata) remain compatible.
+func splitForwardWritesJobControl(req any) bool {
+	forward, ok := req.(*pb.ForwardRequest)
+	if !ok {
+		return false
+	}
+	for _, request := range forward.GetRequests() {
+		for _, mutation := range request.GetMutations() {
+			if splitJobControlMutation(mutation) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func splitJobControlMutation(mutation *pb.Mutation) bool {
+	key := mutation.GetKey()
+	if distribution.IsCatalogSplitJobKey(key) || distribution.IsCatalogSplitJobHistoryKey(key) || bytes.Equal(key, distribution.CatalogNextSplitJobIDKey()) {
+		return true
+	}
+	if mutation.GetOp() != pb.Op_DEL_PREFIX || len(key) == 0 {
+		return false
+	}
+	return bytes.HasPrefix(distribution.CatalogSplitJobKey(0), key) ||
+		bytes.HasPrefix(distribution.CatalogSplitJobHistoryKey(0, 0), key) ||
+		bytes.HasPrefix(distribution.CatalogNextSplitJobIDKey(), key)
 }
 
 func checkSplitMigrationTransport(ctx context.Context, method, token string, peerAuthEnforced bool) error {

@@ -79,6 +79,20 @@ func TestValidateFlags_AcceptsGetOnly(t *testing.T) {
 	require.NoError(t, validateFlags())
 }
 
+func TestValidateFlags_RetryIsExclusive(t *testing.T) {
+	resetFlags(t)
+	t.Cleanup(func() { resetFlags(t) })
+	*retryJobID = 42
+	require.NoError(t, validateFlags())
+	for _, other := range []*uint64{routeID, expectedVersion, targetGroupID, abandonJobID, getJobID} {
+		*other = 1
+		require.ErrorContains(t, validateFlags(), "mutually exclusive")
+		*other = 0
+	}
+	*splitKey = "m"
+	require.ErrorContains(t, validateFlags(), "mutually exclusive")
+}
+
 func TestValidateFlags_RejectsGetWithMutationFlags(t *testing.T) {
 	resetFlags(t)
 	*getJobID = 42
@@ -105,6 +119,7 @@ func resetFlags(t *testing.T) {
 	*expectedVersion = 0
 	*targetGroupID = 0
 	*abandonJobID = 0
+	*retryJobID = 0
 	*getJobID = 0
 	*address = "127.0.0.1:50051"
 	*tokenFile = ""
@@ -120,6 +135,11 @@ type splitAuthTestServer struct {
 func (s *splitAuthTestServer) AbandonSplitJob(_ context.Context, req *pb.AbandonSplitJobRequest) (*pb.AbandonSplitJobResponse, error) {
 	s.jobs <- req.GetJobId()
 	return &pb.AbandonSplitJobResponse{}, nil
+}
+
+func (s *splitAuthTestServer) RetrySplitJob(_ context.Context, req *pb.RetrySplitJobRequest) (*pb.RetrySplitJobResponse, error) {
+	s.jobs <- req.GetJobId()
+	return &pb.RetrySplitJobResponse{}, nil
 }
 
 func TestRunSendsMigrationControllerToken(t *testing.T) {
@@ -155,4 +175,8 @@ func TestRunSendsMigrationControllerToken(t *testing.T) {
 	*tokenFile = path
 	require.NoError(t, run())
 	require.Equal(t, uint64(7), <-svc.jobs)
+	*abandonJobID = 0
+	*retryJobID = 8
+	require.NoError(t, run())
+	require.Equal(t, uint64(8), <-svc.jobs)
 }

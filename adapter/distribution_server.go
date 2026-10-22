@@ -397,10 +397,8 @@ func (s *DistributionServer) handleSplitJobCapabilityRegression(ctx context.Cont
 }
 
 func (s *DistributionServer) markSplitJobCapabilityRegressed(ctx context.Context, job distribution.SplitJob, cause error) (distribution.SplitJob, bool, error) {
-	if job.CapabilityRegressed {
-		return job, true, nil
-	}
 	marked := false
+	markedJob := job
 	err := s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase != job.Phase {
 			return current, nil
@@ -411,13 +409,13 @@ func (s *DistributionServer) markSplitJobCapabilityRegressed(ctx context.Context
 			current.LastError = "cluster migration capability regressed: " + cause.Error()
 			current.UpdatedAtMs = time.Now().UnixMilli()
 		}
+		markedJob = distribution.CloneSplitJob(current)
 		return current, nil
 	})
 	if err != nil || !marked {
 		return job, marked, err
 	}
-	job.CapabilityRegressed = true
-	return job, true, nil
+	return markedJob, true, nil
 }
 
 func (s *DistributionServer) clearSplitJobCapabilityRegression(ctx context.Context, job distribution.SplitJob) (bool, error) {
@@ -2234,8 +2232,19 @@ func splitJobListStartIndex(jobs []distribution.SplitJob, cursor []byte) (int, e
 		if job.JobID == jobID && splitJobListCursorTerminalAtMs(job) == terminalAtMs {
 			return i + 1, nil
 		}
+		if terminalAtMs > 0 && splitJobHistoryAfterCursor(job, terminalAtMs, jobID) {
+			return i, nil
+		}
 	}
-	return 0, grpcStatusError(codes.InvalidArgument, "split job page cursor does not match the filtered result set")
+	if terminalAtMs > 0 {
+		return len(jobs), nil
+	}
+	return 0, grpcStatusError(codes.InvalidArgument, "live split job page cursor is no longer available")
+}
+
+func splitJobHistoryAfterCursor(job distribution.SplitJob, terminalAtMs, jobID uint64) bool {
+	jobTerminalAtMs := splitJobListCursorTerminalAtMs(job)
+	return jobTerminalAtMs > 0 && (jobTerminalAtMs < terminalAtMs || (jobTerminalAtMs == terminalAtMs && job.JobID < jobID))
 }
 
 func encodeSplitJobListCursor(job distribution.SplitJob) []byte {

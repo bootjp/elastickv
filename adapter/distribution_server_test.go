@@ -2642,9 +2642,9 @@ func TestDistributionServerListSplitJobs_RejectsInvalidCursor(t *testing.T) {
 
 	missing := sampleDistributionSplitJob(999)
 	missing.TerminalAtMs = 9999
-	_, err = s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: encodeSplitJobListCursor(missing)})
-	require.Error(t, err)
-	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	page, err := s.ListSplitJobs(ctx, &pb.ListSplitJobsRequest{PageCursor: encodeSplitJobListCursor(missing)})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1}, splitJobIDs(page.Jobs))
 }
 
 func TestDistributionServerRetrySplitJob_UsesCoordinatorCAS(t *testing.T) {

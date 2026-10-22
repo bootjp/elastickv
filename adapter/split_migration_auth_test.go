@@ -4,6 +4,7 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -13,6 +14,42 @@ import (
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
 )
+
+func TestSplitMigrationRolloutRejectsJobInjectionBeforeEnforcement(t *testing.T) {
+	t.Parallel()
+	for _, token := range []string{"", "migration-secret"} {
+		unary, _ := SplitMigrationTokenAuth(token, false, false)
+		for _, mutation := range []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: distribution.CatalogSplitJobKey(7)},
+			{Op: pb.Op_DEL, Key: distribution.CatalogSplitJobHistoryKey(1000, 7)},
+			{Op: pb.Op_PUT, Key: distribution.CatalogNextSplitJobIDKey()},
+			{Op: pb.Op_DEL_PREFIX, Key: []byte("!dist|j")},
+		} {
+			req := &pb.ForwardRequest{Requests: []*pb.Request{{Mutations: []*pb.Mutation{mutation}}}}
+			for _, credential := range []string{"", "Bearer wrong", "Bearer migration-secret"} {
+				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", credential))
+				ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+				called := false
+				_, err := unary(ctx, req, &grpc.UnaryServerInfo{FullMethod: pb.Internal_Forward_FullMethodName}, func(context.Context, any) (any, error) {
+					called = true
+					return nil, nil
+				})
+				allowed := token != "" && credential == "Bearer migration-secret"
+				require.Equal(t, allowed, called)
+				if allowed {
+					require.NoError(t, err)
+				} else {
+					require.Equal(t, codes.Unauthenticated, status.Code(err))
+				}
+			}
+		}
+		legacy := &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{{IsTxn: true, Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte("!txn|meta")}, {Op: pb.Op_PUT, Key: []byte("customer")},
+		}}}}
+		_, err := unary(context.Background(), legacy, &grpc.UnaryServerInfo{FullMethod: pb.Internal_Forward_FullMethodName}, func(context.Context, any) (any, error) { return nil, nil })
+		require.NoError(t, err, "ordinary legacy peer transactions must remain compatible")
+	}
+}
 
 func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 	t.Parallel()
