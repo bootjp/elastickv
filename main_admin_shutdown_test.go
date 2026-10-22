@@ -20,7 +20,7 @@ func TestAdminHandlerDrainJoinsHandlerAfterForcedClose(t *testing.T) {
 		<-release
 	})}
 	drain := trackAdminHandlers(srv)
-	go srv.Handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/", nil))
+	go srv.Handler.ServeHTTP(httptest.NewRecorder(), httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
 	<-entered
 	done := make(chan struct{})
 	go func() { drain.join(time.Second); close(done) }()
@@ -36,7 +36,7 @@ func TestAdminHandlerDrainJoinsHandlerAfterForcedClose(t *testing.T) {
 		t.Fatal("handler did not join")
 	}
 	response := httptest.NewRecorder()
-	srv.Handler.ServeHTTP(response, httptest.NewRequest(http.MethodGet, "/", nil))
+	srv.Handler.ServeHTTP(response, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/", nil))
 	require.Equal(t, http.StatusServiceUnavailable, response.Code)
 }
 
