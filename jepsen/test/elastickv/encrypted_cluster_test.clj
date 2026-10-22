@@ -110,6 +110,19 @@
     (is (some #{"--filesystemMount"} args))
     (is (some #{"/mnt/elastickv"} args))))
 
+(deftest single-node-bootstrap-waits-for-grpc-before-encryption
+  (let [events (atom [])
+        test   {:nodes ["n1"]}
+        opts   {:encryption true}]
+    (with-redefs-fn
+      {#'ekdb/wait-for-node-grpc! (fn [_ _] (swap! events conj :grpc-ready))
+       #'ekdb/wait-for-mount!     (fn [_ _] (swap! events conj :mount-checked))
+       #'ekdb/join-peer!          (fn [& _] (throw (ex-info "unexpected peer join" {})))
+       #'ekdb/enable-peer-mount!  (fn [& _] (throw (ex-info "unexpected peer mount" {})))
+       #'ekdb/activate-encryption! (fn [& _] (swap! events conj :activate))}
+      (fn [] (#'ekdb/finish-bootstrap-setup! test "n1" opts)))
+    (is (= [:grpc-ready :mount-checked :activate] @events))))
+
 ;; ---------------------------------------------------------------------------
 ;; The switch must ACTIVATE encryption, not just reach the server
 ;; ---------------------------------------------------------------------------

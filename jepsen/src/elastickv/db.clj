@@ -442,6 +442,18 @@
     (wait-for-mount! peer mount-dir)
     (info "filesystem mounted on joined peer" peer)))
 
+(defn- finish-bootstrap-setup!
+  "Waits for the bootstrap listener, joins peers, then activates encryption."
+  [test node opts]
+  (wait-for-node-grpc! node opts)
+  (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
+  (doseq [peer (rest (:nodes test))]
+    (join-peer! node peer opts)
+    (enable-peer-mount! test peer opts))
+  (when (:encryption opts)
+    (activate-encryption! test node (or (:grpc-port opts) 50051)
+                          (:raft-groups opts))))
+
 (defrecord ElastickvDB [opts]
   db/DB
   (setup! [_ test node]
@@ -461,13 +473,7 @@
                                start-opts
                                (assoc start-opts :filesystem-mount nil)))
       (when bootstrap?
-        (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
-        (doseq [peer (rest (:nodes test))]
-          (join-peer! node peer opts)
-          (enable-peer-mount! test peer opts))
-        (when (:encryption opts)
-          (activate-encryption! test node (or (:grpc-port opts) 50051)
-                                (:raft-groups opts)))))
+        (finish-bootstrap-setup! test node opts)))
     (info "node started" node))
 
   (teardown! [_ _test node]
