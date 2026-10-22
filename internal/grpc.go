@@ -29,6 +29,7 @@ func GRPCDialOptions() []grpc.DialOption {
 	}
 	return []grpc.DialOption{
 		grpc.WithTransportCredentials(creds),
+		grpc.WithChainUnaryInterceptor(forwardTokenClientInterceptor),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(GRPCMaxMessageBytes),
 			grpc.MaxCallSendMsgSize(GRPCMaxMessageBytes),

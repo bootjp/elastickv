@@ -3388,11 +3388,13 @@ func sampleDistributionSplitJob(jobID uint64) distribution.SplitJob {
 
 func promotionCompleteDistributionJob() distribution.SplitJob {
 	return distribution.SplitJob{
-		JobID:         99,
-		SourceRouteID: 42,
-		SplitKey:      []byte("m"),
-		TargetGroupID: 2,
-		Phase:         distribution.SplitJobPhaseCleanup,
+		JobID:          99,
+		SourceRouteID:  42,
+		SplitKey:       []byte("m"),
+		TargetGroupID:  2,
+		Phase:          distribution.SplitJobPhaseCleanup,
+		FenceTS:        777,
+		CutoverVersion: 1,
 		// Set because InitializeSplitJobPlan records it for every job it
 		// creates, so a job that reached CLEANUP always carries it. Leaving it
 		// zero made this fixture a legacy job, which runSplitJobPhase repairs

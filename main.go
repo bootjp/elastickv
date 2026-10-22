@@ -759,6 +759,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	if err != nil {
 		return distributionStartup{}, err
 	}
+	internalutil.ConfigureGRPCForwardToken(auth.migrationToken)
 	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
 		in.ctx, in.eg, in.runtimes, in.cfg.engine,
 		in.coordinate, in.defaultGroup, in.cfg.defaultGroup,
@@ -3283,6 +3284,16 @@ func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath, migr
 	return cfg, nil
 }
 
+func validateMigrationOpcodeAuth(token string, insecureNoAuth bool) error {
+	if token != "" || insecureNoAuth {
+		return nil
+	}
+	if adapter.MigrationImportOpcodeEnabledFromEnv() || adapter.MigrationPromoteOpcodeEnabledFromEnv() || adapter.MigrationCleanupOpcodeEnabledFromEnv() {
+		return errors.New("migration opcodes require --splitMigrationTokenFile or explicit test-only --adminInsecureNoAuth")
+	}
+	return nil
+}
+
 func validateNodeGRPCPeerToken(adminToken, peerToken string) error {
 	if adminToken != "" && peerToken == adminToken {
 		return errors.New("S3 blob peer token must differ from the read-only admin token")
@@ -3292,7 +3303,7 @@ func validateNodeGRPCPeerToken(adminToken, peerToken string) error {
 
 func loadSplitMigrationToken(path string, insecureNoAuth bool, adminToken, peerToken string) (string, error) {
 	if path == "" {
-		return "", nil
+		return "", validateMigrationOpcodeAuth("", insecureNoAuth)
 	}
 	if insecureNoAuth {
 		return "", errors.New("--adminInsecureNoAuth and --splitMigrationTokenFile are mutually exclusive")

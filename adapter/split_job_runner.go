@@ -414,6 +414,13 @@ func (s *DistributionServer) runSplitJobControlPhase(ctx context.Context, job di
 }
 
 func (s *DistributionServer) cleanupSplitJob(ctx context.Context, job distribution.SplitJob) error {
+	if err := s.verifySplitJobCleanupCutover(ctx, job); err != nil {
+		return err
+	}
+	return s.cleanupVerifiedSplitJob(ctx, job)
+}
+
+func (s *DistributionServer) cleanupVerifiedSplitJob(ctx context.Context, job distribution.SplitJob) error {
 	if !job.TargetPromotionDone {
 		return s.promoteSplitJobTargetAndComplete(ctx, job)
 	}
@@ -442,6 +449,46 @@ func (s *DistributionServer) cleanupSplitJob(ctx context.Context, job distributi
 		return s.cleanupSplitJobSourceProofs(ctx, job)
 	}
 	return s.finishSplitJobHistory(ctx, job, distribution.SplitJobPhaseDone)
+}
+
+func (s *DistributionServer) verifySplitJobCleanupCutover(ctx context.Context, job distribution.SplitJob) error {
+	snapshot, err := s.loadCatalogSnapshot(ctx)
+	if err != nil {
+		return err
+	}
+	if !validSplitJobCleanupWitness(job, snapshot.Version) {
+		return errors.New("split cleanup lacks a valid cutover witness")
+	}
+	if _, found := findRouteByID(snapshot.Routes, job.SourceRouteID); found {
+		return errors.New("split cleanup source route has not been cut over")
+	}
+	for _, route := range snapshot.Routes {
+		if splitJobCleanupTargetAttests(route, job) {
+			return nil
+		}
+	}
+	return errors.New("split cleanup target descriptor does not attest the cutover")
+}
+
+func validSplitJobCleanupWitness(job distribution.SplitJob, catalogVersion uint64) bool {
+	return job.CutoverVersion != 0 && job.CutoverVersion <= catalogVersion &&
+		job.FenceTS != 0 && job.FenceTS != math.MaxUint64 && job.FenceTS >= job.SnapshotTS &&
+		job.SourceGroupID != 0 && job.SourceGroupID != job.TargetGroupID
+}
+
+func splitJobCleanupTargetAttests(route distribution.RouteDescriptor, job distribution.SplitJob) bool {
+	if !splitJobCleanupTargetIdentity(route, job) {
+		return false
+	}
+	if job.TargetPromotionDone {
+		return !route.StagedVisibilityActive && route.MigrationJobID == 0
+	}
+	return route.StagedVisibilityActive && route.MigrationJobID == job.JobID
+}
+
+func splitJobCleanupTargetIdentity(route distribution.RouteDescriptor, job distribution.SplitJob) bool {
+	return route.ParentRouteID == job.SourceRouteID && bytes.Equal(route.Start, job.SplitKey) &&
+		route.GroupID == job.TargetGroupID && route.State == distribution.RouteStateActive && route.MinWriteTSExclusive == job.FenceTS
 }
 
 func (s *DistributionServer) splitJobMigrationClients(ctx context.Context, job distribution.SplitJob) (SplitMigrationClient, SplitMigrationClient, []byte, error) {

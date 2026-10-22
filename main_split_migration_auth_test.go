@@ -27,6 +27,8 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
+	internalutil.ConfigureGRPCForwardToken("migration-secret")
+	t.Cleanup(func() { internalutil.ConfigureGRPCForwardToken("") })
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
@@ -104,6 +106,14 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	require.Equal(t, []string{"Bearer stale"}, md.Get("authorization"))
 	conn, err := cache.ConnFor(lis.Addr().String())
 	require.NoError(t, err)
+	require.NoError(t, conn.Invoke(ctx, pb.Internal_Forward_FullMethodName, &pb.ForwardRequest{}, &pb.ForwardResponse{}), "normal peer forwarding uses the configured TLS credential")
+	clientTLS, err := internalutil.GRPCClientTLSCredentials(cert)
+	require.NoError(t, err)
+	untrustedConn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(clientTLS))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, untrustedConn.Close()) })
+	err = untrustedConn.Invoke(context.Background(), pb.Internal_Forward_FullMethodName, &pb.ForwardRequest{}, &pb.ForwardResponse{})
+	require.Equal(t, codes.Unauthenticated, status.Code(err), "untrusted clients must not forge catalog or transaction metadata through Forward")
 	_, err = pb.NewInternalClient(conn).CleanupMigration(ctx, &pb.CleanupMigrationRequest{})
 	require.Equal(t, codes.Unauthenticated, status.Code(err), "runner token must not leak into cached connections")
 	adminCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer read-only-admin"))
@@ -114,6 +124,21 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	migrationCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer migration-secret"))
 	_, err = pb.NewAdminClient(conn).GetNodeVersion(migrationCtx, &pb.GetNodeVersionRequest{})
 	require.Equal(t, codes.Unauthenticated, status.Code(err), "migration credential must not gain unrelated Admin access")
+}
+
+func TestSplitMigrationOpcodesRequireExplicitAuthentication(t *testing.T) {
+	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
+		t.Setenv(env, "false")
+	}
+	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
+		t.Run(env, func(t *testing.T) {
+			t.Setenv(env, "true")
+			_, err := loadNodeGRPCAuth("", false, "", "")
+			require.ErrorContains(t, err, "migration opcodes require")
+			_, err = loadNodeGRPCAuth("", true, "", "")
+			require.NoError(t, err)
+		})
+	}
 }
 
 func TestSplitMigrationTokenMustBeDedicated(t *testing.T) {

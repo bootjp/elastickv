@@ -90,6 +90,12 @@ func isTxnInternalKey(key []byte) bool {
 		bytes.Equal(key, backupTimestampFloorKey)
 }
 
+// IsTxnInternalKey identifies the concrete namespaces reserved for transaction
+// machinery, without reserving ordinary user keys under the !txn| umbrella.
+func IsTxnInternalKey(key []byte) bool {
+	return isTxnInternalKey(key)
+}
+
 func isTxnMetaKey(key []byte) bool {
 	return bytes.HasPrefix(key, txnMetaPrefixBytes)
 }
