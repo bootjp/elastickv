@@ -10,12 +10,14 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"slices"
 	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
+	"syscall"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
@@ -38,6 +40,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/hanwen/go-fuse/v2/fuse"
 	"golang.org/x/sync/errgroup"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -285,6 +288,21 @@ var memoryPressureExit atomic.Bool
 // so log scraping can tell them apart.
 const exitCodeMemoryPressure = 2
 
+// shutdownSignals are the signals that start a graceful stop. Without a
+// handler Go's default disposition ends the process immediately, which
+// skips the CleanupStack: the WAL is not synced and a FUSE mount stays
+// attached to a dead server (`Transport endpoint is not connected`).
+var shutdownSignals = []os.Signal{syscall.SIGTERM, syscall.SIGINT}
+
+// shutdownSignalHandlerJoinTimeout bounds how long stopping the signal
+// handler waits for its goroutine, which a blocked log write can hold.
+const shutdownSignalHandlerJoinTimeout = time.Second
+
+// signalShutdown is set by the signal handler once a shutdown signal has
+// cancelled the root context, so main can tell a requested stop from a
+// failure when the errgroup surfaces context.Canceled while unwinding.
+var signalShutdown atomic.Bool
+
 // memoryShutdownThresholdEnvVar configures the heap-inuse ceiling at
 // which memwatch triggers a graceful shutdown. Empty or "0" disables the
 // watchdog (the default; existing operators see no behaviour change).
@@ -319,9 +337,47 @@ func main() {
 		}
 		os.Exit(exitCodeMemoryPressure)
 	}
-	if err != nil {
+	if err := ignoreCanceledAfterSignal(err); err != nil {
 		log.Fatalf("%v", err)
 	}
+}
+
+// ignoreCanceledAfterSignal maps the context.Canceled an errgroup member may
+// surface while unwinding after SIGTERM/SIGINT to a clean exit. The
+// cancellation is the shutdown the operator asked for, not a failure; any
+// other error (or a cancellation nobody requested) is reported unchanged.
+// A joined error (waitErrgroupAfterStartupFailure combines the startup error
+// with the drain error) is only clean when every branch is a cancellation.
+func ignoreCanceledAfterSignal(err error) error {
+	if err == nil || !signalShutdown.Load() || !onlyContextCanceled(err) {
+		return err
+	}
+	slog.Info("graceful shutdown after signal completed")
+	return nil
+}
+
+// onlyContextCanceled reports whether err carries nothing but
+// context.Canceled: a plain or wrapped cancellation, or a joined error whose
+// every branch is one. errors.Is alone would accept a join that also holds a
+// real failure, hiding it behind exit status 0.
+func onlyContextCanceled(err error) bool {
+	if err == nil {
+		return false
+	}
+	var joined interface{ Unwrap() []error }
+	if errors.As(err, &joined) {
+		branches := joined.Unwrap()
+		if len(branches) == 0 {
+			return false
+		}
+		for _, branch := range branches {
+			if !onlyContextCanceled(branch) {
+				return false
+			}
+		}
+		return true
+	}
+	return errors.Is(err, context.Canceled)
 }
 
 // memwatchConfigFromEnv resolves the memwatch Config from environment
@@ -475,6 +531,19 @@ func run() error {
 	readTracker := kv.NewActiveTimestampTracker(kv.WithActiveTimestampTrackerMaxBackupPins(*backupMaxActivePins))
 	s3BlobBackfiller := adapter.NewS3BlobBackfiller(cfg.s3BlobBackfillConfig)
 
+	cleanup := internalutil.CleanupStack{}
+	defer cleanup.Run()
+	// The root context and the SIGTERM/SIGINT handler are installed before
+	// the Raft/Pebble runtimes are opened, so a stop requested during a slow
+	// open or snapshot restore is recorded (ctx is cancelled) instead of
+	// killing the process mid-open through the default disposition; startup
+	// then unwinds through the normal cancelled-context path once the
+	// runtimes exist. The handler is registered before the store/runtime
+	// closers so it is still swallowing repeat signals while CleanupStack
+	// syncs and closes them.
+	ctx, cancel := context.WithCancel(context.Background())
+	cleanup.Add(installShutdownSignalHandler(cancel))
+
 	// Stage 6D-6c: buildShardGroupsWithEncryptionWiring assembles the
 	// storage-envelope write-path wiring (cipher + deterministic nonce
 	// factory + the process-shared StateCache) before opening any
@@ -529,11 +598,7 @@ func run() error {
 	// shards share the same env and therefore the same label).
 	recordFSMApplySyncMode(metricsRegistry, runtimes)
 
-	cleanup := internalutil.CleanupStack{}
-	defer cleanup.Run()
 	cleanup.Add(readTracker.Close)
-
-	ctx, cancel := context.WithCancel(context.Background())
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
 	cleanup.Add(func() {
 		_ = shardStore.Close()
@@ -604,7 +669,11 @@ func run() error {
 		tsoWiring:       tsoWiring,
 	})
 	if err != nil {
-		return err
+		// Members already run on eg (TSO reloader, raft lifecycle
+		// watchers, the registration gate); drain them before the deferred
+		// CleanupStack closes the stores they still use. A SIGTERM during
+		// the registration retry surfaces here as context.Canceled.
+		return waitErrgroupAfterStartupFailure(cancel, eg, err)
 	}
 	defaultRuntime := distStartup.defaultRuntime
 	distServer := distStartup.distServer
@@ -853,6 +922,9 @@ type filesystemStartConfig struct {
 	rootMode   uint32
 	rootUID    uint32
 	rootGID    uint32
+	// mountOptions overrides go-fuse's mount options. Production leaves it
+	// nil (fusermount3 path); tests set DirectMount where no helper exists.
+	mountOptions *fuse.MountOptions
 }
 
 func filesystemStartConfigFromFlags() (filesystemStartConfig, error) {
@@ -912,7 +984,7 @@ func startFilesystemIfEnabled(
 	); err != nil {
 		return errors.Wrap(err, "initialize filesystem root")
 	}
-	server, serveDone, err := mountFilesystemService(service, config)
+	server, serveDone, err := mountFilesystemService(ctx, service, config)
 	if err != nil {
 		return err
 	}
@@ -923,12 +995,17 @@ func startFilesystemIfEnabled(
 	return nil
 }
 
+// mountFilesystemService mounts service at the configured mount point. ctx
+// bounds only the pre-mount work (stale-mount detach, intent recovery) so a
+// shutdown signal during startup is not held up by it; the mount itself is
+// ended by the lifecycle installed afterwards.
 func mountFilesystemService(
+	ctx context.Context,
 	service *filesystem.Service,
 	config filesystemStartConfig,
 ) (*fuseadapter.Server, <-chan struct{}, error) {
 	frontend := fuseadapter.New(service, []byte(config.clientID))
-	server, err := fuseadapter.Mount(config.mountPoint, frontend, nil)
+	server, err := fuseadapter.MountContext(ctx, config.mountPoint, frontend, config.mountOptions)
 	if err != nil {
 		frontend.Close()
 		return nil, nil, errors.Wrap(err, "mount filesystem frontend")
@@ -946,27 +1023,59 @@ func mountFilesystemService(
 	return server, serveDone, nil
 }
 
+// filesystemMountServer is the part of *fuseadapter.Server the shutdown
+// lifecycle drives; tests substitute a fake to exercise the failure paths.
+type filesystemMountServer interface {
+	Unmount() error
+	UnmountContext(context.Context) error
+	UnmountLazy(context.Context) error
+}
+
+// filesystemServeStopTimeout bounds how long a signal shutdown waits for the
+// FUSE serve loop after the unmount. After a plain unmount failed (EBUSY: a
+// client still holds files open) the mount is detached lazily and the loop
+// only ends once those handles close, which may never happen; the shutdown
+// proceeds after this wait so a SIGTERM cannot hang the process until
+// SIGKILL. A variable so tests can shorten it.
+var filesystemServeStopTimeout = 10 * time.Second
+
 func installFilesystemServerLifecycle(
 	ctx context.Context,
 	eg *errgroup.Group,
 	cleanup *internalutil.CleanupStack,
-	server *fuseadapter.Server,
+	server filesystemMountServer,
 	serveDone <-chan struct{},
 	mountPoint string,
 ) {
-	unmount := sync.OnceValue(server.Unmount)
+	unmountCtx, cancelUnmount := context.WithCancel(context.Background())
+	unmounter := newFilesystemUnmounter(func() error { return server.UnmountContext(unmountCtx) })
+	unmounter.cancel = cancelUnmount
 	cleanup.Add(func() {
-		if err := unmount(); err != nil {
-			slog.Warn("filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+		// Normally the lifecycle goroutine has already run the shutdown by
+		// the time CleanupStack runs (eg.Wait precedes it); then there is
+		// nothing left to do, and re-waiting on an unmount that is stuck in
+		// a backend request would hang the WAL sync and store close that
+		// follow. Only an unmount nobody started yet is run here, bounded.
+		if unmounter.handled.Load() {
+			return
+		}
+		select {
+		case <-unmounter.begin():
+			if err := unmounter.result(); err != nil {
+				slog.Warn("filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
+			}
+		case <-time.After(filesystemServeStopTimeout):
+			cancelUnmount()
+			slog.Error("filesystem FUSE unmount did not return in time during cleanup, continuing",
+				"mount_point", mountPoint,
+				"timeout", filesystemServeStopTimeout,
+			)
 		}
 	})
 	eg.Go(func() error {
 		select {
 		case <-ctx.Done():
-			if err := unmount(); err != nil {
-				slog.WarnContext(ctx, "filesystem FUSE unmount failed", "mount_point", mountPoint, "err", err)
-			}
-			<-serveDone
+			stopFilesystemServer(ctx, unmounter, server, serveDone, mountPoint)
 			return nil
 		case <-serveDone:
 			select {
@@ -979,6 +1088,125 @@ func installFilesystemServerLifecycle(
 			}
 		}
 	})
+}
+
+// stopFilesystemServer unmounts during a shutdown within one bounded budget
+// (filesystemServeStopTimeout). The plain unmount runs in its own goroutine
+// because a plain unmount can block or fail with EBUSY while a client holds
+// files open. Its helper is context-bound and must be killed and reaped
+// before the lazy detach can start. The mount is then detached lazily, which
+// also cancels the requests still in flight so a handler blocked in the
+// backend returns before the stores close, and the wait for the serve loop
+// is bounded, so the rest of the shutdown (WAL sync, store close) still runs
+// and the process exits. Exiting closes the /dev/fuse descriptor, which
+// makes the kernel drop whatever the lazy detach left behind.
+func stopFilesystemServer(
+	ctx context.Context,
+	unmounter *filesystemUnmounter,
+	server filesystemMountServer,
+	serveDone <-chan struct{},
+	mountPoint string,
+) {
+	defer unmounter.handled.Store(true)
+	// ctx is already cancelled; the whole shutdown shares one budget.
+	stopCtx, cancel := context.WithTimeout(context.Background(), filesystemServeStopTimeout)
+	defer cancel()
+	// The plain unmount may use most of the budget, but a slice is kept so
+	// the lazy detach still runs inside it when the unmount hangs.
+	unmountWait := time.NewTimer(filesystemServeStopTimeout - filesystemServeStopTimeout/filesystemLazyDetachShare)
+	defer unmountWait.Stop()
+	select {
+	case <-unmounter.begin():
+		if err := unmounter.result(); err != nil {
+			slog.WarnContext(ctx, "filesystem FUSE unmount failed, detaching lazily", "mount_point", mountPoint, "err", err)
+			lazyDetachFilesystem(ctx, stopCtx, server, mountPoint)
+		}
+	case <-unmountWait.C:
+		slog.ErrorContext(ctx, "filesystem FUSE unmount did not return in time (a request may be stuck in the backend), detaching lazily and continuing shutdown",
+			"mount_point", mountPoint,
+			"timeout", filesystemServeStopTimeout,
+		)
+		// Fall through: the reserved remainder of the budget still waits for
+		// the serve loop, so a request that finishes in time is not cut off
+		// by the store close that follows.
+		// Killing a context-aware unmount must also reap its helper before
+		// another path-based unmount can target a replacement filesystem.
+		if !unmounter.cancelAndJoin(stopCtx) {
+			slog.ErrorContext(ctx, "filesystem unmount helper did not exit; refusing concurrent lazy detach", "mount_point", mountPoint)
+			return
+		}
+		lazyDetachFilesystem(ctx, stopCtx, server, mountPoint)
+	}
+	select {
+	case <-serveDone:
+	case <-stopCtx.Done():
+		slog.ErrorContext(ctx, "filesystem FUSE serve loop did not stop in time, continuing shutdown",
+			"mount_point", mountPoint,
+			"timeout", filesystemServeStopTimeout,
+		)
+	}
+}
+
+// filesystemUnmounter runs the context-bound unmount at most once, in the background,
+// and lets any number of waiters observe its completion without a later
+// caller ever blocking on an earlier call that is stuck (go-fuse's Unmount
+// waits for an event loop that may be held by a hung backend request;
+// sync.OnceValue would make the second caller wait for the first).
+type filesystemUnmounter struct {
+	run     func() error
+	cancel  context.CancelFunc
+	started atomic.Bool
+	done    chan struct{}
+	err     error
+	// handled is set once the lifecycle's shutdown has run to completion
+	// (unmounted, or gave up after its budget), so the CleanupStack entry
+	// knows there is nothing left to wait for.
+	handled atomic.Bool
+}
+
+func (u *filesystemUnmounter) cancelAndJoin(ctx context.Context) bool {
+	if u.cancel == nil {
+		return true
+	}
+	u.cancel()
+	select {
+	case <-u.done:
+		return true
+	case <-ctx.Done():
+		return false
+	}
+}
+
+func newFilesystemUnmounter(run func() error) *filesystemUnmounter {
+	return &filesystemUnmounter{run: run, done: make(chan struct{})}
+}
+
+// begin starts the unmount the first time it is called and returns a channel
+// that is closed when it finishes; later calls return the same channel.
+func (u *filesystemUnmounter) begin() <-chan struct{} {
+	if u.started.CompareAndSwap(false, true) {
+		go func() {
+			defer close(u.done)
+			u.err = u.run()
+		}()
+	}
+	return u.done
+}
+
+// result is the unmount's error; valid once the channel from begin is closed.
+func (u *filesystemUnmounter) result() error { return u.err }
+
+// filesystemLazyDetachShare is the fraction (1/n) of filesystemServeStopTimeout
+// held back from the plain-unmount wait so the lazy detach fallback still
+// runs inside the one advertised budget when the unmount hangs.
+const filesystemLazyDetachShare = 5
+
+// lazyDetachFilesystem runs the lazy detach fallback within the shutdown's
+// remaining budget (stopCtx); logCtx only correlates the log line.
+func lazyDetachFilesystem(logCtx, stopCtx context.Context, server filesystemMountServer, mountPoint string) {
+	if err := server.UnmountLazy(stopCtx); err != nil {
+		slog.WarnContext(logCtx, "filesystem FUSE lazy detach failed", "mount_point", mountPoint, "err", err)
+	}
 }
 
 func startFilesystemPlacementCollector(
@@ -2210,14 +2438,26 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 		return err
 	}
 	runner.startAdminHTTP()
-	return startFilesystemIfEnabled(
+	return startFilesystemAfterServing(in)
+}
+
+// startFilesystemAfterServing mounts the optional FUSE filesystem once the
+// public services are up. On failure the public services are already serving
+// on eg, so they are drained before the deferred CleanupStack closes the
+// stores they use; a shutdown signal during the FUSE pre-mount work surfaces
+// here as context.Canceled and must not skip that drain either.
+func startFilesystemAfterServing(in serversInput) error {
+	if err := startFilesystemIfEnabled(
 		in.ctx,
 		in.eg,
 		in.cleanup,
 		in.shardStore,
 		in.coordinate,
 		in.metricsRegistry.FileSystemObserver(),
-	)
+	); err != nil {
+		return waitErrgroupAfterStartupFailure(in.cancel, in.eg, err)
+	}
+	return nil
 }
 
 func startupRoleStoreFromFlags(enabled bool) admin.RoleStore {
@@ -3113,6 +3353,86 @@ func loadS3BlobPeerTokenFile(path string) (string, error) {
 	return tok, nil
 }
 
+// grpcGracefulStopTimeout bounds how long a gRPC server's GracefulStop may
+// wait for in-flight RPCs during shutdown. Long-lived streams (catalog
+// watches, the Raft transport's SendStream) only end when their client goes
+// away, so without a bound a SIGTERM would wait on them for as long as a
+// peer stays connected while repeat signals are swallowed. After the bound,
+// Stop closes the remaining streams. A variable so tests can shorten it.
+var grpcGracefulStopTimeout = 10 * time.Second
+
+// stopGRPCServerBounded drains srv for at most grpcGracefulStopTimeout and
+// then forces Stop, which also makes the pending GracefulStop return.
+func stopGRPCServerBounded(ctx context.Context, srv *grpc.Server, name string) {
+	done := make(chan struct{})
+	go func() {
+		srv.GracefulStop()
+		close(done)
+	}()
+	timer := time.NewTimer(grpcGracefulStopTimeout)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		slog.WarnContext(ctx, "gRPC graceful stop did not finish in time, closing remaining streams",
+			"server", name,
+			"timeout", grpcGracefulStopTimeout,
+		)
+		srv.Stop()
+		<-done
+	}
+}
+
+// installShutdownSignalHandler routes SIGTERM/SIGINT (or the given signals)
+// into cancel so the process unwinds through the same path the memory
+// watchdog uses: the errgroup drains, the FUSE mount is unmounted, and the
+// CleanupStack syncs the WAL. The first signal cancels; later ones are
+// logged and otherwise ignored so a second SIGTERM from a supervisor cannot
+// cut the shutdown short (SIGKILL still can, which no handler prevents).
+// The returned function releases the registration and must be called once
+// the cleanup that needs protection has run.
+func installShutdownSignalHandler(cancel context.CancelFunc, signals ...os.Signal) func() {
+	if len(signals) == 0 {
+		signals = shutdownSignals
+	}
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, signals...)
+	stopCh := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for {
+			select {
+			case sig := <-sigCh:
+				if signalShutdown.CompareAndSwap(false, true) {
+					// Cancel before logging: a log write that blocks (a
+					// backpressured stderr, a synchronous shipper) must not
+					// hold the shutdown back, and later signals are ignored.
+					cancel()
+					slog.Info("shutdown signal received, stopping", "signal", sig.String())
+					continue
+				}
+				slog.Warn("shutdown already in progress, ignoring repeated signal", "signal", sig.String())
+			case <-stopCh:
+				return
+			}
+		}
+	}()
+	return sync.OnceFunc(func() {
+		signal.Stop(sigCh)
+		close(stopCh)
+		// Wait for the goroutine, but bounded: it may be stuck in a log
+		// write that never completes, and this runs at the very end of the
+		// shutdown, which must not hang on it.
+		timer := time.NewTimer(shutdownSignalHandlerJoinTimeout)
+		defer timer.Stop()
+		select {
+		case <-done:
+		case <-timer.C:
+		}
+	})
+}
+
 // startMemoryWatchdog optionally starts the memwatch goroutine. The
 // watcher is off by default; it is enabled only when the operator sets
 // ELASTICKV_MEMORY_SHUTDOWN_THRESHOLD_MB. On threshold crossing the
@@ -3441,7 +3761,7 @@ func startRaftServers(
 			go func() {
 				select {
 				case <-ctx.Done():
-					srv.GracefulStop()
+					stopGRPCServerBounded(ctx, srv, rt.spec.address)
 					_ = lis.Close()
 					closeService()
 				case <-stop:

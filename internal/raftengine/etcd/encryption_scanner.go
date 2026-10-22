@@ -42,6 +42,8 @@ const scanMaxBytes uint64 = 64 << 20 // 64 MiB
 // operator's primary problem; the scanner just reports honestly.
 type encryptionScanner struct {
 	storage *etcdraft.MemoryStorage
+	cipher  *encryption.Cipher
+	cutover RaftCutoverIndex
 }
 
 // HasEncryptionRelevantEntryInRange satisfies the
@@ -101,7 +103,11 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 				cursor, hi))
 		}
 		for _, ent := range batch {
-			if isEncryptionRelevantEntry(ent) {
+			hit, err := s.isEncryptionRelevantEntry(ent)
+			if err != nil {
+				return false, err
+			}
+			if hit {
 				return true, nil
 			}
 		}
@@ -128,15 +134,25 @@ func (s *encryptionScanner) HasEncryptionRelevantEntryInRange(startExclusive, en
 // version 0x01 — NEVER the FSM opcode. A scanner that misreads
 // the layout would return false for every entry in a real Raft
 // log, silently defeating the §9.1 ErrSidecarBehindRaftLog guard.
-func isEncryptionRelevantEntry(ent *raftpb.Entry) bool {
+func (s *encryptionScanner) isEncryptionRelevantEntry(ent *raftpb.Entry) (bool, error) {
 	if ent.GetType() != raftpb.EntryNormal {
-		return false
+		return false, nil
 	}
 	_, payload, ok := decodeProposalEnvelope(ent.GetData())
 	if !ok || len(payload) == 0 {
-		return false
+		return false, nil
 	}
-	return encryption.IsEncryptionRelevantOpcode(payload[0])
+	if s.cutover != nil && ent.GetIndex() > s.cutover() {
+		if s.cipher == nil {
+			return false, errors.Wrap(ErrRaftUnwrapFailed, "encryption scanner: cipher missing after cutover")
+		}
+		var err error
+		payload, err = unwrapRaftPayload(s.cipher, payload)
+		if err != nil {
+			return false, errors.Wrap(err, "encryption scanner: unwrap retained entry")
+		}
+	}
+	return len(payload) > 0 && encryption.IsEncryptionRelevantOpcode(payload[0]), nil
 }
 
 // EncryptionScanner returns the engine's
@@ -161,5 +177,5 @@ func (e *Engine) EncryptionScanner() encryption.EncryptionRelevantScanner {
 	if e == nil {
 		return &encryptionScanner{}
 	}
-	return &encryptionScanner{storage: e.storage}
+	return &encryptionScanner{storage: e.storage, cipher: e.raftCipher, cutover: e.raftCutoverIndex}
 }
