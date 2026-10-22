@@ -312,7 +312,13 @@ func (d *DynamoDBServer) adminLoadReadableSchema(ctx context.Context, principal 
 //   - ErrAdminNotLeader        — follower
 //   - ErrAdminDynamoNotFound   — table absent
 //   - ErrAdminDynamoValidation — empty / malformed input
-func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrincipal, tableName string, item AdminItem) error {
+func (d *DynamoDBServer) AdminPutItem(
+	ctx context.Context,
+	principal AdminPrincipal,
+	tableName string,
+	pathKey map[string]AdminAttributeValue,
+	item AdminItem,
+) error {
 	if !principal.Role.canWrite() {
 		return ErrAdminForbidden
 	}
@@ -332,8 +338,10 @@ func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrinci
 		return err
 	}
 	in := putItemInput{
-		TableName: tableName,
-		Item:      adminToInternalAttributeMap(item.Attributes),
+		TableName:         tableName,
+		Item:              adminToInternalAttributeMap(item.Attributes),
+		adminPathKey:      pathKey,
+		checkAdminPathKey: true,
 	}
 	unlock, err := d.lockItemForWrite(ctx, tableName, in.Item)
 	if err != nil {
@@ -342,6 +350,39 @@ func (d *DynamoDBServer) AdminPutItem(ctx context.Context, principal AdminPrinci
 	defer unlock()
 	if _, err := d.putItemWithRetry(ctx, in); err != nil {
 		return translateDynamoAdminError(err)
+	}
+	return nil
+}
+
+// validateAdminPathKeyCoversPrimaryKey checks the URL key against the
+// schema and item loaded during write preparation at its fenced timestamp.
+func validateAdminPathKeyCoversPrimaryKey(
+	schema *dynamoTableSchema, pathKey map[string]AdminAttributeValue, item map[string]attributeValue,
+) error {
+	required := []string{schema.PrimaryKey.HashKey}
+	if schema.PrimaryKey.RangeKey != "" && schema.PrimaryKey.RangeKey != schema.PrimaryKey.HashKey {
+		required = append(required, schema.PrimaryKey.RangeKey)
+	}
+	for _, name := range required {
+		pathValue, ok := pathKey[name]
+		if !ok {
+			return errors.Wrapf(ErrAdminDynamoValidation,
+				"path key is missing primary key attribute %q", name)
+		}
+		bodyValue, ok := item[name]
+		if !ok || !attributeValueEqual(adminToInternalAttributeValue(pathValue), bodyValue) {
+			return errors.Wrapf(ErrAdminDynamoValidation,
+				"path key attribute %q does not match the item", name)
+		}
+	}
+	// Reject extras too: a URL key carrying an attribute the schema
+	// does not treat as part of the primary key means the caller and
+	// the table disagree about identity, and silently ignoring it
+	// would let the mismatch through.
+	if len(pathKey) != len(required) {
+		return errors.Wrapf(ErrAdminDynamoValidation,
+			"path key declares %d attributes but the primary key has %d",
+			len(pathKey), len(required))
 	}
 	return nil
 }
