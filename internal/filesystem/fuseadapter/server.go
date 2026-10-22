@@ -193,54 +193,59 @@ func (r *RawFileSystem) Access(cancel <-chan struct{}, input *fuse.AccessIn) fus
 func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 	ctx, done := requestContext(cancel)
 	defer done()
-	nameBytes := []byte(name)
+	for attempt := range createRetryLimit {
+		status := r.createOrOpen(ctx, input, []byte(name), out)
+		if (status == fuse.Status(syscall.EAGAIN) || status == fuse.Status(syscall.ENOENT)) && attempt+1 < createRetryLimit {
+			continue
+		}
+		return status
+	}
+	return fuse.Status(syscall.ENOENT)
+}
+
+func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, name []byte, out *fuse.CreateOut) fuse.Status {
 	opts := filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
 		UID:  input.Uid,
 		GID:  input.Gid,
 	}
-	for attempt := range createRetryLimit {
-		result, errno := r.adapter.Create(ctx, input.NodeId, nameBytes, opts)
-		if errno == syscall.EAGAIN && attempt+1 < createRetryLimit {
-			continue
+	result, errno := r.adapter.Create(ctx, input.NodeId, name, opts)
+	if errno == syscall.EEXIST && input.Flags&syscall.O_EXCL == 0 {
+		stat, lookupErrno := r.adapter.Lookup(ctx, input.NodeId, name)
+		if lookupErrno != 0 {
+			return fuse.Status(lookupErrno)
 		}
-		if errno == syscall.EEXIST && input.Flags&syscall.O_EXCL == 0 {
-			stat, lookupErrno := r.adapter.Lookup(ctx, input.NodeId, nameBytes)
-			if lookupErrno == syscall.ENOENT && attempt+1 < createRetryLimit {
-				continue
-			}
-			if lookupErrno != 0 {
-				return fuse.Status(lookupErrno)
-			}
-			return r.openExistingForCreate(ctx, input.Flags, stat, out)
-		}
-		if errno != 0 {
-			return fuse.Status(errno)
-		}
-		r.fillEntry(&out.EntryOut, result.Stat)
-		out.Fh = result.FH
-		return fuse.OK
+		return r.openExistingForCreate(ctx, input, stat, out)
 	}
-	return fuse.Status(syscall.ENOENT)
+	if errno != 0 {
+		return fuse.Status(errno)
+	}
+	r.fillEntry(&out.EntryOut, result.Stat)
+	out.Fh = result.FH
+	return fuse.OK
 }
 
 func (r *RawFileSystem) openExistingForCreate(
 	ctx context.Context,
-	flags uint32,
+	input *fuse.CreateIn,
 	stat filesystem.Stat,
 	out *fuse.CreateOut,
 ) fuse.Status {
 	if stat.Type == filesystem.TypeDirectory {
 		return fuse.Status(syscall.EISDIR)
 	}
+	if !canOpenExisting(input, stat) {
+		return fuse.Status(syscall.EACCES)
+	}
 	fh, errno := r.adapter.Open(ctx, stat.Inode)
 	if errno != 0 {
 		return fuse.Status(errno)
 	}
-	if flags&syscall.O_TRUNC != 0 {
-		truncated, setattrErrno := r.adapter.SetAttr(ctx, stat.Inode, filesystem.SetAttrMask{Size: true}, filesystem.SetAttr{Size: 0})
+	if input.Flags&syscall.O_TRUNC != 0 {
+		mask, attrs := existingTruncateAttrs(input.Uid, stat.Mode)
+		truncated, setattrErrno := r.adapter.SetAttr(ctx, stat.Inode, mask, attrs)
 		if setattrErrno != 0 {
-			_ = r.adapter.Release(ctx, stat.Inode, fh)
+			r.releaseFailedCreate(ctx, stat.Inode, fh)
 			return fuse.Status(setattrErrno)
 		}
 		stat = truncated
@@ -248,6 +253,14 @@ func (r *RawFileSystem) openExistingForCreate(
 	r.fillEntry(&out.EntryOut, stat)
 	out.Fh = fh
 	return fuse.OK
+}
+
+func (r *RawFileSystem) releaseFailedCreate(ctx context.Context, inode, fh uint64) {
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), defaultHandleKeepaliveTimeout)
+	defer cancel()
+	if errno := r.adapter.Release(cleanupCtx, inode, fh); errno != 0 {
+		slog.Warn("release failed FUSE create handle", "inode", inode, "fh", fh, "error", errno)
+	}
 }
 
 func (r *RawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
