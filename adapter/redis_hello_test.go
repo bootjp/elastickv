@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
@@ -192,7 +193,7 @@ func decodeHello(t *testing.T, writes []helloReplyElement) decodedHello {
 func TestHello_NoArgs_ReturnsExpectedMap(t *testing.T) {
 	t.Parallel()
 
-	r := newHelloTestServer(t, true)
+	r := &RedisServer{coordinator: &kvtest.NopCoordinator{}}
 	conn := &helloRecordingConn{}
 
 	r.hello(conn, redcon.Command{Args: [][]byte{[]byte(cmdHello)}})
