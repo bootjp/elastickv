@@ -82,7 +82,7 @@ func TestStartupGatedCoordinatorForwardsWriteGateAndObserver(t *testing.T) {
 	t.Parallel()
 
 	inner := &writeGateStubCoordinator{}
-	wrapped := startupGatedCoordinator{inner: inner}
+	wrapped := newStartupGatedCoordinator(inner, nil)
 
 	gate, ok := any(wrapped).(kv.MutationWriteGate)
 	require.True(t, ok, "startupGatedCoordinator must satisfy kv.MutationWriteGate")
@@ -110,7 +110,7 @@ func TestStartupGatedCoordinatorForwardsWriteGateAndObserver(t *testing.T) {
 func TestStartupGatedCoordinatorWriteGateAllowsWithoutRouteTable(t *testing.T) {
 	t.Parallel()
 
-	wrapped := startupGatedCoordinator{inner: struct{ kv.Coordinator }{}}
+	wrapped := newStartupGatedCoordinator(struct{ kv.Coordinator }{}, nil)
 	gate, ok := any(wrapped).(kv.MutationWriteGate)
 	require.True(t, ok)
 	require.NoError(t, gate.EnsureMutationsWriteAllowed([]*pb.Mutation{{Key: []byte("k")}}, 1))

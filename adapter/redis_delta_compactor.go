@@ -10,6 +10,7 @@ import (
 
 	"github.com/bootjp/elastickv/keyviz"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -65,6 +66,12 @@ type DeltaCompactor struct {
 	// called from a test while Run is active).
 	cursorMu sync.Mutex
 	cursors  map[string][]byte
+	// ttlInlinePlans tracks each TTL-inline scan plan's pass, keyed like
+	// cursors by the plan's cursor name. Guarded by cursorMu so a pass moves
+	// together with its plan's cursor.
+	ttlInlinePlans map[string]*ttlInlineMigrationPlanState
+	// ttlInlineObserver, when set, receives every completed TTL-inline pass.
+	ttlInlineObserver monitoring.RedisTTLInlineMigrationObserver
 
 	// urgentCh receives requests to immediately compact a single key whose
 	// delta count has exceeded MaxDeltaScanLimit, making reads fail. The Run
@@ -72,9 +79,20 @@ type DeltaCompactor struct {
 	// quickly without waiting for the next scheduled pass.
 	urgentCh chan urgentCompactionRequest
 
-	stateMu       sync.Mutex
-	backoffUntil  time.Time
-	handlerCursor int
+	stateMu      sync.Mutex
+	backoffUntil time.Time
+	// handlerCursor and ttlInlinePlanCursor are where the next tick's
+	// background handlers and TTL-inline scan plans start, so a tick that runs
+	// out of budget hands the rest of the rotation to the next one.
+	handlerCursor       int
+	ttlInlinePlanCursor int
+
+	ttlInlineGroupsUnknownOnce sync.Once
+
+	// ttlInlineMu lets one tick at a time run the TTL-inline migration, so a
+	// plan's pages are scanned, tallied and reported in order. A tick that
+	// finds it held skips the migration.
+	ttlInlineMu sync.Mutex
 }
 
 // DeltaCompactorOption configures a DeltaCompactor.
@@ -128,6 +146,14 @@ func WithDeltaCompactorLogger(l *slog.Logger) DeltaCompactorOption {
 	}
 }
 
+// WithDeltaCompactorTTLInlineMigrationObserver reports every pass the
+// TTL-inline migration completes over an anchor type and data group.
+func WithDeltaCompactorTTLInlineMigrationObserver(o monitoring.RedisTTLInlineMigrationObserver) DeltaCompactorOption {
+	return func(c *DeltaCompactor) {
+		c.ttlInlineObserver = o
+	}
+}
+
 // NewDeltaCompactor creates a DeltaCompactor that operates on st using coord.
 func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCompactorOption) *DeltaCompactor {
 	c := &DeltaCompactor{
@@ -139,6 +165,7 @@ func NewDeltaCompactor(st store.MVCCStore, coord kv.Coordinator, opts ...DeltaCo
 		timeout:        defaultDeltaCompactorTimeout,
 		timeoutBackoff: defaultDeltaCompactorTimeoutBackoff,
 		cursors:        make(map[string][]byte),
+		ttlInlinePlans: make(map[string]*ttlInlineMigrationPlanState),
 		urgentCh:       make(chan urgentCompactionRequest, urgentCompactionChanSize),
 	}
 	for _, opt := range opts {
@@ -312,6 +339,9 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 	}
 	tickCtx, cancel := context.WithTimeout(ctx, c.timeout)
 	defer cancel()
+	// snapshotAt precedes the read timestamp, so a TTL-inline pass that reads
+	// at readTS never reports a start later than its snapshot.
+	snapshotAt := time.Now()
 	readTimestamp, err := kv.BeginReadTimestampThrough(tickCtx, c.coord, snapshotTS(c.coord.Clock(), c.st),
 		"redis delta compactor: begin read timestamp")
 	if err != nil {
@@ -322,7 +352,7 @@ func (c *DeltaCompactor) SyncOnce(ctx context.Context) error {
 
 	combined := c.compactBackgroundHandlers(tickCtx, readTS)
 	if tickCtx.Err() == nil {
-		if err := c.migrateTTLInlineOnce(tickCtx, readTS); err != nil && !errors.Is(err, context.Canceled) {
+		if err := c.migrateTTLInlineOnce(tickCtx, readTS, snapshotAt); err != nil && !errors.Is(err, context.Canceled) {
 			combined = errors.CombineErrors(combined, err)
 		}
 	}
@@ -340,7 +370,7 @@ func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS u
 		return nil
 	}
 	handlers := c.allHandlers()
-	start := c.backgroundHandlerStart(len(handlers))
+	start := c.rotationStart(&c.handlerCursor, len(handlers))
 	var combined error
 	for offset := range handlers {
 		if ctx.Err() != nil {
@@ -349,7 +379,7 @@ func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS u
 		idx := (start + offset) % len(handlers)
 		h := handlers[idx]
 		err := c.compactHandlerSafely(ctx, h, readTS)
-		c.advanceBackgroundHandlerCursor(idx, len(handlers))
+		c.advanceRotation(&c.handlerCursor, idx, len(handlers))
 		if err != nil && !errors.Is(err, context.Canceled) {
 			combined = errors.CombineErrors(combined, err)
 		}
@@ -357,25 +387,28 @@ func (c *DeltaCompactor) compactBackgroundHandlers(ctx context.Context, readTS u
 	return errors.WithStack(combined)
 }
 
-func (c *DeltaCompactor) backgroundHandlerStart(total int) int {
+// rotationStart returns where a rotation over total items starts this tick.
+// cursor is one of the compactor's rotation cursors, guarded by stateMu.
+func (c *DeltaCompactor) rotationStart(cursor *int, total int) int {
 	if total <= 0 {
 		return 0
 	}
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	if c.handlerCursor < 0 || c.handlerCursor >= total {
-		c.handlerCursor = 0
+	if *cursor < 0 || *cursor >= total {
+		*cursor = 0
 	}
-	return c.handlerCursor
+	return *cursor
 }
 
-func (c *DeltaCompactor) advanceBackgroundHandlerCursor(current, total int) {
+// advanceRotation moves cursor past current, the item a tick just ran.
+func (c *DeltaCompactor) advanceRotation(cursor *int, current, total int) {
 	if total <= 0 {
 		return
 	}
 	c.stateMu.Lock()
 	defer c.stateMu.Unlock()
-	c.handlerCursor = (current + 1) % total
+	*cursor = (current + 1) % total
 }
 
 func (c *DeltaCompactor) compactHandlerSafely(ctx context.Context, h collectionDeltaHandler, readTS uint64) (err error) {
@@ -481,11 +514,19 @@ func (c *DeltaCompactor) scanDeltaRaw(ctx context.Context, h collectionDeltaHand
 func (c *DeltaCompactor) advanceCursor(typeName string, lastScannedKey []byte, truncated bool) {
 	c.cursorMu.Lock()
 	defer c.cursorMu.Unlock()
+	c.advanceCursorLocked(typeName, lastScannedKey, truncated)
+}
+
+// advanceCursorLocked is advanceCursor for callers holding cursorMu. It
+// reports whether the cursor was reset, i.e. the scan reached the end of the
+// prefix and the next one starts from the beginning.
+func (c *DeltaCompactor) advanceCursorLocked(typeName string, lastScannedKey []byte, truncated bool) (reset bool) {
 	if truncated && len(lastScannedKey) > 0 {
 		c.cursors[typeName] = bytes.Clone(lastScannedKey)
-	} else {
-		delete(c.cursors, typeName)
+		return false
 	}
+	delete(c.cursors, typeName)
+	return true
 }
 
 // compactHandler scans the delta prefix for h, groups entries by userKey,

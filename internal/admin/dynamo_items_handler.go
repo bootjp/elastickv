@@ -247,7 +247,7 @@ func (h *DynamoHandler) handleItemPut(w http.ResponseWriter, r *http.Request, ta
 		writeJSONError(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	if err := h.source.AdminPutItem(r.Context(), principal, table, item); err != nil {
+	if err := h.source.AdminPutItem(r.Context(), principal, table, key, item); err != nil {
 		h.writeItemsError(w, r, "put", table, err)
 		return
 	}
@@ -305,52 +305,12 @@ func (h *DynamoHandler) handleItemDelete(w http.ResponseWriter, r *http.Request,
 
 // ---------- helpers ----------
 
-// principalForItemRead is the read-side companion to principalForWrite
-// (live-role re-check + RoleReadOnly OR RoleFull). The payload
-// returned by scan/get is item content — `principalForReadSensitive`
-// equivalent on the Dynamo side. Defined locally here rather than as
-// a method on DynamoHandler because it's only used by item-level
-// handlers; the existing list/describe paths use the looser session-
-// auth gate (their output is metadata, not content).
-//
-// JWT role gate fires unconditionally before the optional live-store
-// re-check (matches principalForWrite's defence-in-depth pattern from
-// PR #669). A token minted with role=none cannot slip through reads
-// via a later live-role promotion; the live re-check can only further
-// constrain. Claude review on PR #814 r2 caught the parallel S3
-// asymmetry; this fix lands on PR #813 to keep the items handler
-// consistent with the contract documented in principalForWrite.
+// principalForItemRead gates the item-content reads (scan/get), which
+// return stored item content; list/describe stay on the looser
+// session-auth gate because their output is metadata. RoleReadOnly or
+// RoleFull passes. The policy lives in authorizePrincipal.
 func (h *DynamoHandler) principalForItemRead(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
-	principal, ok := PrincipalFromContext(r.Context())
-	if !ok {
-		// 401 matches principalForWrite (s3_handler.go,
-		// dynamo_handler.go.principalForWrite) — semantically,
-		// "no session principal" is unauthenticated, not internal
-		// failure. The path is unreachable in production
-		// (SessionAuth always attaches a principal upstream); the
-		// 401 keeps the contract symmetric with the rest of the
-		// admin surface (Claude review on PR #813 r2).
-		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
-		return AuthPrincipal{}, false
-	}
-	if !principal.Role.AllowsRead() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this access key is not authorised to read table contents")
-		return AuthPrincipal{}, false
-	}
-	if h.roles != nil {
-		live, exists := h.roles.LookupRole(principal.AccessKey)
-		if !exists || !live.AllowsRead() {
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this access key is not authorised to read table contents")
-			return AuthPrincipal{}, false
-		}
-		// Use the live role downstream — the JWT may carry a stale
-		// value but the live one is authoritative once both gates
-		// agree the request is allowed.
-		principal.Role = live
-	}
-	return principal, true
+	return authorizePrincipal(w, r, h.roles, accessRead, "this access key is not authorised to read table contents")
 }
 
 // parseAdminScanItemsQuery extracts ?limit and ?next_cursor from

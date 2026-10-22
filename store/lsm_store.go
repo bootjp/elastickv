@@ -225,15 +225,21 @@ var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 // Lock ordering (must always be acquired in this order to avoid deadlocks):
 //
 //  1. maintenanceMu – serialises Compact/Restore/Close.
-//  2. dbMu          – guards the s.db pointer; held as a write-lock while the
-//     DB is being swapped (Restore/Close), and as a read-lock by every
-//     operation that accesses s.db.
-//  3. applyMu       – serialises raft-apply conflict-check → batch-commit so
-//     concurrent ApplyMutationsRaft/At cannot both pass checkConflicts and
-//     then both commit. Also held by deletePrefixAtWithOpts and by
-//     SetDurableAppliedIndex's read-modify-write monotonic guard
-//     (PR #915 round-3) so the snapshot-persist checkpoint cannot rewind
-//     metaAppliedIndex below a concurrent per-Apply value.
+//  2. applyMu       – serialises every applier from its conflict check to
+//     its batch commit so two appliers cannot both pass checkConflicts and
+//     then both commit: applyMutationsWithOpts, deletePrefixesAtWithOpts,
+//     importVersionsWithOpts, PromoteVersions, SetDurableAppliedIndex's
+//     read-modify-write monotonic guard (PR #915 round-3, so the
+//     snapshot-persist checkpoint cannot rewind metaAppliedIndex below a
+//     concurrent per-Apply value), the SST checkpoint, and ApplyRaftEntry,
+//     which holds it across a whole batched Raft entry. It is taken BEFORE
+//     dbMu so an applier that holds it across several dbMu sections never
+//     waits for dbMu behind a writer that is itself waiting for applyMu
+//     (the inverted order deadlocked ApplyRaftEntry against
+//     newSSTIngestSnapshot; found in review).
+//  3. dbMu          – guards the s.db pointer; held as a write-lock while the
+//     DB is being swapped (Restore/Close) or checkpointed, and as a
+//     read-lock by every operation that accesses s.db.
 //  4. mtx           – guards the in-memory metadata fields
 //     (lastCommitTS, minRetainedTS, pendingMinRetainedTS).
 type pebbleStore struct {
@@ -755,6 +761,18 @@ func isPebbleOperationalKey(rawKey []byte) bool {
 	return isPebbleMetaKey(rawKey)
 }
 
+// IsPebbleOperationalKey reports whether rawKey, as it appears in a native
+// Pebble snapshot stream, is one of the store's reserved metadata keys
+// (`_meta_last_commit_ts`, the retention and applied-index markers, the
+// migration records, the encryption writer registry) rather than an MVCC
+// version. It is the live side of the classifier that
+// internal/backup/snapshot_reader.go mirrors for the offline decoder,
+// which must not link this package; the mirror's tests call it to pin the
+// two sides against each other.
+func IsPebbleOperationalKey(rawKey []byte) bool {
+	return isPebbleOperationalKey(rawKey)
+}
+
 func (s *pebbleStore) findMaxCommitTS() (uint64, error) {
 	metaTS, err := readPebbleUint64(s.db, metaLastCommitTSBytes)
 	if err != nil {
@@ -890,14 +908,14 @@ func (s *pebbleStore) LastAppliedIndex() (uint64, bool, error) {
 // deletePrefixAtWithOpts (both hold it across their batch commit),
 // and the read-modify-write keeps the meta key strictly monotonic.
 //
-// Lock order: dbMu.RLock before applyMu.Lock matches the existing
-// discipline in applyMutationsWithOpts (lsm_store.go around :1438 /
-// :1444). No deadlock.
+// Lock order: applyMu.Lock before dbMu.RLock matches the discipline in
+// applyMutationsWithOpts (see the lock ordering on pebbleStore). No
+// deadlock.
 func (s *pebbleStore) SetDurableAppliedIndex(idx uint64) error {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	existing, present, err := s.readAppliedIndexLocked()
 	if err != nil {
@@ -1310,11 +1328,15 @@ func (s *pebbleStore) CommittedVersionAt(_ context.Context, key []byte, commitTS
 }
 
 func (s *pebbleStore) committedVersionAtLocked(key []byte, commitTS uint64) (bool, error) {
+	return committedVersionAtWith(s.db, key, commitTS)
+}
+
+func committedVersionAtWith(r pebble.Reader, key []byte, commitTS uint64) (bool, error) {
 	encoded := encodeKey(key, commitTS)
 	if isPebbleOperationalKey(encoded) {
 		return false, nil
 	}
-	_, closer, err := s.db.Get(encoded)
+	_, closer, err := r.Get(encoded)
 	if err != nil {
 		if errors.Is(err, pebble.ErrNotFound) {
 			return false, nil
@@ -2192,11 +2214,15 @@ func nextConflictCheckKeyGroup(keys []conflictCheckKey, start int) ([]byte, int,
 	return current, minOriginalIndex, next
 }
 
-func (s *pebbleStore) firstConflictKey(ctx context.Context, keys []conflictCheckKey, startTS uint64) ([]byte, bool, error) {
+// firstConflictKeyWith scans for the first key in keys with a version above
+// startTS, reading through r: the DB on the per-request path, the entry's
+// indexed batch inside a Raft entry scope, so a request sees the versions
+// earlier requests of the same entry staged.
+func (s *pebbleStore) firstConflictKeyWith(ctx context.Context, r pebble.Reader, keys []conflictCheckKey, startTS uint64) ([]byte, bool, error) {
 	if len(keys) == 0 {
 		return nil, false, nil
 	}
-	iter, err := s.db.NewIter(&pebble.IterOptions{})
+	iter, err := r.NewIter(&pebble.IterOptions{})
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -2227,8 +2253,11 @@ func (s *pebbleStore) firstConflictKey(ctx context.Context, keys []conflictCheck
 	return firstConflictKey, true, nil
 }
 
-func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMutation, startTS uint64) error {
-	conflictKey, found, err := s.firstConflictKey(ctx, sortedMutationConflictKeys(mutations), startTS)
+// checkConflictsWith rejects the mutations whose key has a version above
+// startTS, reading through r (the DB, or the entry's indexed batch inside a
+// Raft entry scope).
+func (s *pebbleStore) checkConflictsWith(ctx context.Context, r pebble.Reader, mutations []*KVPairMutation, startTS uint64) error {
+	conflictKey, found, err := s.firstConflictKeyWith(ctx, r, sortedMutationConflictKeys(mutations), startTS)
 	if err != nil {
 		return err
 	}
@@ -2243,8 +2272,11 @@ func (s *pebbleStore) checkConflicts(ctx context.Context, mutations []*KVPairMut
 	return nil
 }
 
-func (s *pebbleStore) checkReadConflicts(ctx context.Context, readKeys [][]byte, startTS uint64) error {
-	conflictKey, found, err := s.firstConflictKey(ctx, sortedReadConflictKeys(readKeys), startTS)
+// checkReadConflictsWith rejects the read keys that have a version above
+// startTS, reading through r (the DB, or the entry's indexed batch inside a
+// Raft entry scope).
+func (s *pebbleStore) checkReadConflictsWith(ctx context.Context, r pebble.Reader, readKeys [][]byte, startTS uint64) error {
+	conflictKey, found, err := s.firstConflictKeyWith(ctx, r, sortedReadConflictKeys(readKeys), startTS)
 	if err != nil {
 		return err
 	}
@@ -2273,29 +2305,56 @@ func (s *pebbleStore) WriteConflictCount() uint64 {
 }
 
 func (s *pebbleStore) applyMutationsBatch(b *pebble.Batch, mutations []*KVPairMutation, commitTS uint64, gateRegistration bool) error {
+	encoded, err := s.encodeMutationsForBatch(mutations, commitTS, gateRegistration)
+	if err != nil {
+		return err
+	}
+	return stageEncodedMutations(b, encoded)
+}
+
+// encodedMutation is one Pebble key / value pair ready to be staged.
+type encodedMutation struct {
+	key   []byte
+	value []byte
+}
+
+// encodeMutationsForBatch validates and encodes every mutation before any
+// of them is staged, so a validation failure (an unknown op, an oversized
+// value, a key colliding with a reserved meta key, an encryption error)
+// leaves the batch untouched. A Raft entry scope relies on that: its batch
+// is shared by every request of the entry.
+func (s *pebbleStore) encodeMutationsForBatch(mutations []*KVPairMutation, commitTS uint64, gateRegistration bool) ([]encodedMutation, error) {
+	encoded := make([]encodedMutation, 0, len(mutations))
 	for _, mut := range mutations {
 		k, err := encodePebbleUserVersionKey(mut.Key, commitTS)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		var v []byte
 
 		switch mut.Op {
 		case OpTypePut:
 			if err := validateValueSize(mut.Value); err != nil {
-				return err
+				return nil, err
 			}
 			body, encState, encErr := s.encryptForKey(k, mut.Value, mut.ExpireAt, gateRegistration)
 			if encErr != nil {
-				return encErr
+				return nil, encErr
 			}
 			v = encodeValue(body, false, mut.ExpireAt, encState)
 		case OpTypeDelete:
 			v = encodeValue(nil, true, 0, encStateCleartext)
 		default:
-			return ErrUnknownOp
+			return nil, ErrUnknownOp
 		}
-		if err := b.Set(k, v, nil); err != nil {
+		encoded = append(encoded, encodedMutation{key: k, value: v})
+	}
+	return encoded, nil
+}
+
+func stageEncodedMutations(b *pebble.Batch, encoded []encodedMutation) error {
+	for _, m := range encoded {
+		if err := b.Set(m.key, m.value, nil); err != nil {
 			return errors.WithStack(err)
 		}
 	}
@@ -2330,14 +2389,14 @@ func (s *pebbleStore) ApplyMutations(ctx context.Context, mutations []*KVPairMut
 	// registration commits.
 	// appliedIndex=0: direct path has no raft index; the leaf treats 0 as
 	// "do not write metaAppliedIndex" so the meta key stays unchanged.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, true)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, true, false)
 }
 
 // ApplyMutationsPreservingLastCommitTS is a direct, durable write path for
 // local auxiliary MVCC keys that must not advance the store-wide safe snapshot
 // watermark. It still uses pebble.Sync and the direct writer-registration gate.
 func (s *pebbleStore) ApplyMutationsPreservingLastCommitTS(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, false)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.directApplyWriteOpts(), true, 0, false, false)
 }
 
 // ApplyMutationsRaft is the raft-apply commit path. Durability is governed
@@ -2366,7 +2425,7 @@ func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPai
 	// land here; their LastAppliedIndex() will stay behind the snapshot
 	// pointer and the skip optimisation will fall back to full restore
 	// for them. Preferred path is ApplyMutationsRaftAt.
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0, true)
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, 0, true, false)
 }
 
 // ApplyMutationsRaftAt is ApplyMutationsRaft with the raft entry
@@ -2378,10 +2437,27 @@ func (s *pebbleStore) ApplyMutationsRaft(ctx context.Context, mutations []*KVPai
 // Production callers (kvFSM.applyXxx with f.pendingApplyIdx) SHOULD
 // pass the entry.Index value the engine delivered via SetApplyIndex.
 func (s *pebbleStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
-	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex, true)
+	if scope := s.raftEntryScopeFrom(ctx); scope != nil {
+		return s.stageMutationsInRaftEntry(ctx, scope, mutations, readKeys, startTS, commitTS, appliedIndex)
+	}
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex, true, false)
+}
+
+func (s *pebbleStore) ApplyMutationsRaftAtFenced(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, appliedIndex uint64) error {
+	if scope := s.raftEntryScopeFrom(ctx); scope != nil {
+		return s.stageMutationsInRaftEntryWithFence(ctx, scope, mutations, readKeys, startTS, commitTS, appliedIndex, true)
+	}
+	return s.applyMutationsWithOpts(ctx, mutations, readKeys, startTS, commitTS, s.raftApplyWriteOpts(), false, appliedIndex, true, true)
 }
 
 func (s *pebbleStore) raftApplyAlreadyLandedLocked(mutations []*KVPairMutation, commitTS uint64) (bool, error) {
+	return s.raftApplyAlreadyLandedWith(s.db, mutations, commitTS)
+}
+
+// raftApplyAlreadyLandedWith is raftApplyAlreadyLandedLocked reading through
+// r, which is the DB on the per-request path and the entry's indexed batch
+// inside a Raft entry scope.
+func (s *pebbleStore) raftApplyAlreadyLandedWith(r pebble.Reader, mutations []*KVPairMutation, commitTS uint64) (bool, error) {
 	if len(mutations) == 0 {
 		return false, nil
 	}
@@ -2390,7 +2466,7 @@ func (s *pebbleStore) raftApplyAlreadyLandedLocked(mutations []*KVPairMutation, 
 		if mut == nil || len(mut.Key) == 0 {
 			continue
 		}
-		landed, err := s.committedVersionAtLocked(mut.Key, commitTS)
+		landed, err := committedVersionAtWith(r, mut.Key, commitTS)
 		if err != nil || !landed {
 			return false, err
 		}
@@ -2458,11 +2534,36 @@ func (s *pebbleStore) staleRaftApplyFastPathLocked(mutations []*KVPairMutation, 
 	if appliedIndex == 0 {
 		return false, nil
 	}
+	persisted, present, err := s.readAppliedIndexLocked()
+	if err != nil || !present {
+		return false, err
+	}
+	if appliedIndex < persisted {
+		return true, nil
+	}
+	if appliedIndex > persisted {
+		return false, nil
+	}
 	landed, err := s.raftApplyAlreadyLandedLocked(mutations, commitTS)
 	if err != nil || !landed {
 		return false, err
 	}
 	return true, s.markRaftApplyAlreadyLandedLocked(commitTS, appliedIndex, writeOpts)
+}
+
+// checkCommitTSFence runs while the apply lock is held. Readers can use the
+// applied watermark as a snapshot only if a later Raft entry cannot add a
+// version at or below it.
+func checkCommitTSFence(mutations []*KVPairMutation, commitTS, watermark uint64, fenced bool) error {
+	if !fenced || commitTS > watermark {
+		return nil
+	}
+	for _, mut := range mutations {
+		if mut != nil && len(mut.Key) > 0 {
+			return NewWriteConflictError(mut.Key)
+		}
+	}
+	return nil
 }
 
 func (s *pebbleStore) hasCommitsAfter(startTS uint64) bool {
@@ -2472,23 +2573,33 @@ func (s *pebbleStore) hasCommitsAfter(startTS uint64) bool {
 }
 
 func (s *pebbleStore) checkApplyConflicts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64, force bool) error {
-	if !force && !s.hasCommitsAfter(startTS) {
-		return nil
-	}
-	if err := s.checkConflicts(ctx, mutations, startTS); err != nil {
-		return err
-	}
-	return s.checkReadConflicts(ctx, readKeys, startTS)
+	return s.checkApplyConflictsWith(ctx, s.db, s.hasCommitsAfter, mutations, readKeys, startTS, force)
 }
 
-func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64, advanceLastCommitTS bool) error {
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
+// checkApplyConflictsWith is checkApplyConflicts with the reader and the
+// "any commit after startTS" predicate supplied by the caller: the DB and
+// the in-memory lastCommitTS on the per-request path, the entry's indexed
+// batch and a predicate that also counts the entry's staged commits inside
+// a Raft entry scope.
+func (s *pebbleStore) checkApplyConflictsWith(ctx context.Context, r pebble.Reader, hasCommitsAfter func(uint64) bool, mutations []*KVPairMutation, readKeys [][]byte, startTS uint64, force bool) error {
+	if !force && !hasCommitsAfter(startTS) {
+		return nil
+	}
+	if err := s.checkConflictsWith(ctx, r, mutations, startTS); err != nil {
+		return err
+	}
+	return s.checkReadConflictsWith(ctx, r, readKeys, startTS)
+}
 
+func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, writeOpts *pebble.WriteOptions, gateRegistration bool, appliedIndex uint64, advanceLastCommitTS, fenceCommitTS bool) error {
 	// Serialize conflict check → batch commit so concurrent ApplyMutations
-	// cannot both pass checkConflicts and then both commit.
+	// cannot both pass checkConflicts and then both commit. applyMu comes
+	// before dbMu (see the lock ordering on pebbleStore).
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	fastPathDone, err := s.staleRaftApplyFastPathLocked(mutations, commitTS, appliedIndex, writeOpts)
 	if err != nil {
@@ -2496,6 +2607,9 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	}
 	if fastPathDone {
 		return nil
+	}
+	if err := checkCommitTSFence(mutations, commitTS, s.LastCommitTS(), fenceCommitTS); err != nil {
+		return err
 	}
 
 	b := s.db.NewBatch()
@@ -2521,10 +2635,8 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	// meta key so a crash either commits all three atomically or none.
 	// appliedIndex==0 is the legacy / non-raft callers (ApplyMutations
 	// or ApplyMutationsRaft); they leave the key unchanged.
-	if appliedIndex > 0 {
-		if err := setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex); err != nil {
-			return err
-		}
+	if err := stageAppliedIndexInBatch(b, appliedIndex); err != nil {
+		return err
 	}
 	if err := b.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
@@ -2534,6 +2646,13 @@ func (s *pebbleStore) applyMutationsWithOpts(ctx context.Context, mutations []*K
 	}
 
 	return nil
+}
+
+func stageAppliedIndexInBatch(b *pebble.Batch, appliedIndex uint64) error {
+	if appliedIndex == 0 {
+		return nil
+	}
+	return setPebbleUint64InBatch(b, metaAppliedIndexBytes, appliedIndex)
 }
 
 func (s *pebbleStore) stageLastCommitTSInBatch(b *pebble.Batch, commitTS uint64, advance bool) (uint64, func(), error) {
@@ -2593,6 +2712,9 @@ func (s *pebbleStore) DeletePrefixAtRaftAt(ctx context.Context, prefix []byte, e
 }
 
 func (s *pebbleStore) DeletePrefixesAtRaftAt(ctx context.Context, deletes []PrefixDelete, commitTS, appliedIndex uint64) error {
+	if scope := s.raftEntryScopeFrom(ctx); scope != nil {
+		return s.stagePrefixDeletesInRaftEntry(scope, deletes, commitTS, appliedIndex)
+	}
 	return s.deletePrefixesAtWithOpts(ctx, deletes, commitTS, s.raftApplyWriteOpts(), appliedIndex)
 }
 
@@ -2601,11 +2723,11 @@ func (s *pebbleStore) deletePrefixesAtWithOpts(_ context.Context, deletes []Pref
 		return nil
 	}
 
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
+
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
 
 	iter, err := s.newDeletePrefixesIterator(deletes)
 	if err != nil {
@@ -2623,11 +2745,15 @@ func (s *pebbleStore) deletePrefixesAtWithOpts(_ context.Context, deletes []Pref
 }
 
 func (s *pebbleStore) newDeletePrefixesIterator(deletes []PrefixDelete) (*pebble.Iterator, error) {
+	return newDeletePrefixesIteratorWith(s.db, deletes)
+}
+
+func newDeletePrefixesIteratorWith(r pebble.Reader, deletes []PrefixDelete) (*pebble.Iterator, error) {
 	var lowerBound []byte
 	if len(deletes) == 1 && len(deletes[0].Prefix) > 0 {
 		lowerBound = encodeKey(deletes[0].Prefix, math.MaxUint64)
 	}
-	iter, err := s.db.NewIter(&pebble.IterOptions{LowerBound: lowerBound})
+	iter, err := r.NewIter(&pebble.IterOptions{LowerBound: lowerBound})
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -3171,8 +3297,7 @@ func flushSnapshotBatchIfNeeded(db *pebble.DB, batch **pebble.Batch, kLen, vLen 
 }
 
 // restoreBatchLoopInto reads raw Pebble key-value entries from r and writes
-// them into db using batched commits. It is used for both the direct and the
-// temp-dir atomic native Pebble restore paths.
+// them into db using batched commits for the temp-dir atomic native restore.
 func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 	batch := db.NewBatch()
 	var keyBuf []byte // reused across entries to reduce per-entry allocations
@@ -3276,48 +3401,6 @@ func (s *pebbleStore) reopenFreshDB() error {
 	}
 	s.db = db
 	s.cache = cache
-	return nil
-}
-
-// restorePebbleNative restores from the current Pebble snapshot format
-// (magic "EKVPBBL1" + lastCommitTS + raw key-value entries) into s.db directly.
-//
-// Format history / compatibility:
-//   - The pebbleSnapshotMagic header ("EKVPBBL1") was introduced along with
-//     this snapshot format. Older Pebble snapshots that pre-date this header
-//     (i.e. those that started directly with lastCommitTS) are not handled
-//     here. A stream dispatched to this function MUST start with the magic;
-//     otherwise "invalid pebble snapshot magic header" is returned.
-func (s *pebbleStore) restorePebbleNative(r io.Reader) error {
-	var magic [8]byte
-	if _, err := io.ReadFull(r, magic[:]); err != nil {
-		return errors.WithStack(err)
-	}
-	if !bytes.Equal(magic[:], pebbleSnapshotMagic[:]) {
-		return errors.New("invalid pebble snapshot magic header")
-	}
-
-	var ts uint64
-	if err := binary.Read(r, binary.LittleEndian, &ts); err != nil {
-		return errors.WithStack(err)
-	}
-	if err := s.saveLastCommitTS(ts); err != nil {
-		return err
-	}
-	if err := restoreBatchLoopInto(r, s.db); err != nil {
-		return err
-	}
-	minRetainedTS, err := s.findMinRetainedTS()
-	if err != nil {
-		return err
-	}
-	pendingMinRetainedTS, err := s.findPendingMinRetainedTS()
-	if err != nil {
-		return err
-	}
-	s.lastCommitTS = ts
-	s.minRetainedTS = minRetainedTS
-	s.pendingMinRetainedTS = pendingMinRetainedTS
 	return nil
 }
 

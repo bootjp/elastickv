@@ -254,7 +254,13 @@ func (c *grpcS3BlobCluster) PushChunkBlob(ctx context.Context, replica S3BlobRep
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	if err := sendS3ChunkBlobPushFrames(stream, digest, payload, commitTS); err != nil {
+	// gRPC reports a stream the server has already terminated to the sender as
+	// a bare io.EOF; the status it terminated with is only readable from the
+	// receive side. Falling through to CloseAndRecv is what turns an opaque EOF
+	// into the Unauthenticated or ResourceExhausted the replicator needs in
+	// order to decide whether this push is worth retrying.
+	if err := sendS3ChunkBlobPushFrames(stream, digest, payload, commitTS); err != nil &&
+		!errors.Is(err, io.EOF) {
 		return err
 	}
 	resp, err := stream.CloseAndRecv()

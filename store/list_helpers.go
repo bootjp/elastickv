@@ -88,6 +88,14 @@ func ListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
 	return buf
 }
 
+// LegacyListMetaDeltaKey builds the pre-upgrade key, including an explicit sequence.
+// New writes should use ListMetaDeltaKey; this helper supports upgrade fixtures.
+func LegacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
+	buf := LegacyListMetaDeltaScanPrefix(userKey)
+	buf = binary.BigEndian.AppendUint64(buf, commitTS)
+	return binary.BigEndian.AppendUint32(buf, seqInTxn)
+}
+
 // ListMetaDeltaScanPrefix returns the prefix used to scan all delta keys for a userKey.
 func ListMetaDeltaScanPrefix(userKey []byte) []byte {
 	return listMetaDeltaScanPrefixFor(ListMetaDeltaPrefix, userKey)

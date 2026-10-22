@@ -10,7 +10,6 @@ import (
 	"strconv"
 
 	pb "github.com/bootjp/elastickv/proto"
-	"github.com/bootjp/elastickv/store"
 	cockroachdberr "github.com/cockroachdb/errors"
 	gproto "google.golang.org/protobuf/proto"
 )
@@ -54,8 +53,14 @@ const (
 	// redisStreamMetaSize is the legacy on-disk size of one !stream|meta|
 	// value: Length(8) || LastMs(8) || LastSeq(8).
 	redisStreamMetaSize = 24
-	// redisStreamMetaInlineTTLSize is the current shape with trailing ExpireAtMs(8).
+	// redisStreamMetaInlineTTLSize is the shape with trailing ExpireAtMs(8).
 	redisStreamMetaInlineTTLSize = 32
+	// redisStreamMetaTrimSize is the current shape the live store writes:
+	// the inline-TTL shape followed by the head-trim seek cursor,
+	// TrimmedMs(8) || TrimmedSeq(8). Mirror of
+	// store.StreamMetaTrimBinarySize, pinned by
+	// TestRedisStreamSizesMirrorLiveStore.
+	redisStreamMetaTrimSize = 48
 
 	// redisStreamIDBytes is the per-entry-key suffix size: ms(8)
 	// || seq(8). Mirrors store.StreamIDBytes.
@@ -126,10 +131,10 @@ func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	}
 	if len(value) != redisStreamMetaSize &&
 		len(value) != redisStreamMetaInlineTTLSize &&
-		len(value) != store.StreamMetaTrimBinarySize {
+		len(value) != redisStreamMetaTrimSize {
 		return cockroachdberr.Wrapf(ErrRedisInvalidStreamMeta,
 			"length %d not in {%d,%d,%d}",
-			len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize, store.StreamMetaTrimBinarySize)
+			len(value), redisStreamMetaSize, redisStreamMetaInlineTTLSize, redisStreamMetaTrimSize)
 	}
 	rawLen := binary.BigEndian.Uint64(value[0:8])
 	if rawLen > math.MaxInt64 {
@@ -141,9 +146,10 @@ func (r *RedisDB) HandleStreamMeta(key, value []byte) error {
 	st.lastMs = binary.BigEndian.Uint64(value[8:16])
 	st.lastSeq = binary.BigEndian.Uint64(value[16:24])
 	st.metaSeen = true
-	// The trim-cursor shape is store.StreamMetaTrimBinarySize; backup accepts
-	// it for compatibility but omits TrimmedMs/TrimmedSeq from logical JSONL.
-	if len(value) == redisStreamMetaInlineTTLSize || len(value) == store.StreamMetaTrimBinarySize {
+	// Backup accepts the trim-cursor shape but omits TrimmedMs/TrimmedSeq
+	// from logical JSONL: the cursor is a live-side scan hint, not stream
+	// state.
+	if len(value) == redisStreamMetaInlineTTLSize || len(value) == redisStreamMetaTrimSize {
 		expireAtMs := binary.BigEndian.Uint64(value[24:32])
 		st.expireAtMs = expireAtMs
 		st.hasTTL = expireAtMs != 0
