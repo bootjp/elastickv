@@ -2492,7 +2492,9 @@ locally.
   is established, and waits for every node to report both active before
   releasing the workload. Each mutation retries across all members during
   elections; each cutover reads the proposer identity from the selected
-  endpoint. `--local --encryption` is rejected because a
+  endpoint. Transient status errors remain inside the per-member readiness
+  poll. Managed S3 and SQS nodes receive cluster-wide Raft-to-frontend maps
+  so requests sent to followers can reach the leader. `--local --encryption` is rejected because a
   no-op DB adapter cannot provision or verify that cluster. Multi-group
   managed runs are also rejected before setup because the current Raft
   envelope cutover is defined only for a single shard group; they must not

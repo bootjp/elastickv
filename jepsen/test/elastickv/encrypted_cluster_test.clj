@@ -122,6 +122,23 @@
     (is (some #{"--filesystemMount"} args))
     (is (some #{"/mnt/elastickv"} args))))
 
+(deftest managed-http-frontends-map-every-member-and-group
+  (doseq [groups [nil {1 50061, 2 50062}]
+          service-ports [6390 {"n1" 6391, "n2" 6392}]]
+    (let [maps (#'ekdb/frontend-maps ["n1" "n2"] 50051 6379 nil
+                                    service-ports service-ports groups)
+          args (args-for (merge maps {:s3 "n1:6391" :sqs "n1:6392"}))
+          expected (clojure.string/join
+                     ","
+                     (for [node ["n1" "n2"]
+                           grpc-port (if groups [50061 50062] [50051])]
+                       (str node ":" grpc-port "=" node ":"
+                            (if (map? service-ports) (service-ports node) service-ports))))]
+      (is (= expected (:raft-s3-map maps)))
+      (is (= expected (:raft-sqs-map maps)))
+      (is (= expected (second (drop-while #(not= "--raftS3Map" %) args))))
+      (is (= expected (second (drop-while #(not= "--raftSqsMap" %) args)))))))
+
 (deftest single-node-bootstrap-waits-for-grpc-before-encryption
   (let [events (atom [])
         test   {:nodes ["n1"]}
@@ -187,6 +204,33 @@
           (when (or (zero? @round) (= endpoint "n1:50051"))
             (throw (ex-info "election in progress" {}))))))
     (is (= ["n1:50051" "n2:50051" "n1:50051" "n2:50051"] @attempts))))
+
+(deftest activation-verification-retries-status-errors-and-inactive-members
+  (let [reads (atom 0)
+        retries (atom 0)]
+    (with-redefs-fn
+      {#'ekdb/wrap-fresh-dek! (constantly "wrapped")
+       #'ekdb/encryption-command! (fn [& _])
+       #'ekdb/encryption-status
+       (fn [& _]
+         (case (swap! reads inc)
+           3 (throw (ex-info "member temporarily unavailable" {}))
+           4 {:storage-envelope-active true :raft-envelope-active false}
+           {:full-node-id 11 :local-epoch 1
+            :storage-envelope-active true :raft-envelope-active true}))
+       #'util/await-fn
+       (fn [f _]
+         (loop [remaining 3]
+           (if (f)
+             true
+             (do
+               (swap! retries inc)
+               (if (> remaining 1)
+                 (recur (dec remaining))
+                 (throw (ex-info "poll timed out" {})))))))}
+      (fn [] (#'ekdb/activate-encryption! {:nodes ["n1"]} "n1" 50051 nil)))
+    (is (= 5 @reads))
+    (is (= 2 @retries))))
 
 ;; ---------------------------------------------------------------------------
 ;; The switch must ACTIVATE encryption, not just reach the server

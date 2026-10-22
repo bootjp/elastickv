@@ -124,10 +124,20 @@
 (defn- build-raft-dynamo-map [nodes grpc-port dynamo-port raft-groups]
   (build-raft-service-map nodes grpc-port dynamo-port raft-groups))
 
+(defn- frontend-maps
+  [nodes grpc-port redis-port dynamo-port s3-port sqs-port raft-groups]
+  {:raft-redis-map (build-raft-redis-map nodes grpc-port redis-port raft-groups)
+   :raft-dynamo-map (when dynamo-port
+                      (build-raft-dynamo-map nodes grpc-port dynamo-port raft-groups))
+   :raft-s3-map (when s3-port
+                  (build-raft-service-map nodes grpc-port s3-port raft-groups))
+   :raft-sqs-map (when sqs-port
+                   (build-raft-service-map nodes grpc-port sqs-port raft-groups))})
+
 (defn server-args
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
-           raft-redis-map raft-dynamo-map raft-groups shard-ranges
+           raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
            filesystem-mount encryption bootstrap?]}]
   (cond-> ["--address" grpc
            "--redisAddress" redis
@@ -137,8 +147,8 @@
            "--raftRedisMap" raft-redis-map]
     dynamo (conj "--dynamoAddress" dynamo
                  "--raftDynamoMap" raft-dynamo-map)
-    s3 (conj "--s3Address" s3)
-    sqs (conj "--sqsAddress" sqs)
+    s3 (conj "--s3Address" s3 "--raftS3Map" raft-s3-map)
+    sqs (conj "--sqsAddress" sqs "--raftSqsMap" raft-sqs-map)
     (and sqs sqs-region) (conj "--sqsRegion" sqs-region)
     filesystem-mount (conj "--filesystemMount" filesystem-mount)
     (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
@@ -241,15 +251,15 @@
              (node-addr node (port-for s3-port node)))
         sqs (when sqs-port
               (node-addr node (port-for sqs-port node)))
-        raft-redis-map (build-raft-redis-map (:nodes test) grpc-port redis-port raft-groups)
-        raft-dynamo-map (when dynamo
-                          (build-raft-dynamo-map (:nodes test) grpc-port dynamo-port raft-groups))
+        {:keys [raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map]}
+        (frontend-maps (:nodes test) grpc-port redis-port dynamo-port s3-port sqs-port raft-groups)
         mount-dir (filesystem-mount-dir filesystem-mount node)
         bootstrap? (= node bootstrap-node)
         args (server-args
                {:node node :grpc grpc :redis redis :dynamo dynamo :s3 s3 :sqs sqs
                 :sqs-region sqs-region :data-dir data-dir :raft-engine raft-engine
                 :raft-redis-map raft-redis-map :raft-dynamo-map raft-dynamo-map
+                :raft-s3-map raft-s3-map :raft-sqs-map raft-sqs-map
                 :raft-groups raft-groups :shard-ranges shard-ranges
                 :filesystem-mount mount-dir :encryption encryption
                 :bootstrap? bootstrap?})
@@ -402,9 +412,13 @@
       (let [peer-endpoint (encryption-endpoint peer grpc-port raft-groups)]
         (util/await-fn
           (fn []
-            (let [state (encryption-status node peer-endpoint)]
-              (and (:storage-envelope-active state)
-                   (:raft-envelope-active state))))
+            (try
+              (let [state (encryption-status node peer-endpoint)]
+                (and (:storage-envelope-active state)
+                     (:raft-envelope-active state)))
+              (catch Exception t
+                (warn t "retrying encryption status" peer-endpoint)
+                nil)))
           {:timeout 60000
            :log-message (str "waiting for both envelope cutovers on " peer)})))
     (info "encryption active on every node")))
