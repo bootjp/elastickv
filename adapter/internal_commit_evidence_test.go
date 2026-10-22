@@ -99,3 +99,44 @@ func TestFillForwardedTxnCommitTSChecksEveryPrimary(t *testing.T) {
 	require.ErrorIs(t, err, kv.ErrPrePhaseDCommitUnproven)
 	require.Equal(t, []string{"first", "second"}, readKeys)
 }
+
+func TestInternalForwardAllowsPreparedFirstPrimaryCommitAcrossActivation(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct {
+		name     string
+		key      string
+		prepared bool
+		found    bool
+		decision uint64
+		wantErr  bool
+	}{
+		{name: "first primary commit", key: "primary", prepared: true},
+		{name: "unprepared primary", key: "primary", wantErr: true},
+		{name: "secondary still requires decision", key: "secondary", prepared: true, wantErr: true},
+		{name: "prepared primary cannot replace existing decision", key: "primary", prepared: true, found: true, decision: 61, wantErr: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			txn := &forwardObserverTxn{}
+			i := NewInternalWithEngine(txn, forwardObserverLeader{}, nil, nil,
+				WithInternalTimestampAllocator(&phaseDForwardAllocator{floor: 100}),
+				WithInternalPrimaryCommitEvidence(primaryCommitEvidenceFunc(func(context.Context, []byte, uint64) (kv.PrimaryCommitEvidence, error) {
+					return kv.PrimaryCommitEvidence{Readable: true, Found: test.found, CommitTS: test.decision, PrimaryPrepared: test.prepared}, nil
+				})))
+			response, err := i.Forward(context.Background(), &pb.ForwardRequest{IsTxn: true, Requests: []*pb.Request{{
+				Ts: 50, IsTxn: true, Phase: pb.Phase_COMMIT, Mutations: []*pb.Mutation{
+					{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte("primary"), CommitTS: 60})},
+					{Op: pb.Op_PUT, Key: []byte(test.key)},
+				},
+			}}})
+			if test.wantErr {
+				require.ErrorIs(t, err, kv.ErrPrePhaseDCommitUnproven)
+				require.Empty(t, txn.reqs)
+				return
+			}
+			require.NoError(t, err)
+			require.True(t, response.Success)
+			require.Equal(t, uint64(60), response.CommitTs)
+			require.Len(t, txn.reqs, 1)
+		})
+	}
+}

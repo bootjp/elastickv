@@ -158,12 +158,13 @@ creation window so they can resolve existing intents indefinitely.
 Internal service. `ValidateForwardedTxnCommitTimestamp` invokes the evidence
 check only when both timestamps enter its legacy resolution carve-out.
 `Internal.Forward` refuses a COMMIT before proposing it if the locally readable
-primary record is missing or disagrees. ABORT and valid post-D commits do not
+primary record is missing or disagrees, except for the first-primary case
+below. ABORT and valid post-D commits do not
 perform the additional evidence read.
 
 `ShardStore.PrimaryCommitEvidence` provides the separate readability signal.
 It uses the primary's physical owner, including partition-map routing, requires
-a local active/non-staged store and verified leadership, and reads directly
+a local active/non-staged store and an applied linearizable-read fence, and reads directly
 without proxying to another primary. It discards the verdict if catalog version,
 partition owner, or leadership changes while reading. Unavailable, remote,
 follower, or migration-staged owners return an unknown verdict rather than a
@@ -173,10 +174,30 @@ The older `primaryTxnRecordedStatus` helper is not this signal: its `done`
 return means a transaction decision was found, not that an absent record was
 read authoritatively. Reusing it would conflate missing and unavailable records.
 
+### First primary COMMIT and the remaining proof gap
+
+The first primary COMMIT creates `txnCommitKey` itself; demanding that record
+already exist would abort a valid transaction whose PREPARE finished before
+Phase-D activation but whose primary COMMIT is forwarded afterward. This path
+is admitted only when the request actually commits its primary key and this
+node finds a matching durable primary lock and intent for the same startTS.
+An unprepared primary, secondary resolution without a decision, or a mismatched
+existing decision is still rejected. The FSM retains its existing commit versus
+rollback and intent checks.
+
+A prepared primary proves an in-flight transaction, not issuance of its claimed
+commitTS. An untrusted caller can still fabricate a fresh primary PREPARE and
+first COMMIT inside the bounded creation window. Closing that remaining gap
+needs a durable chosen-commit proof or a revised admission protocol; this PR
+does not claim the full retroactive-write carve-out is closed. In particular,
+silently allocating a replacement timestamp after PREPARE is not a safe shortcut:
+prepared values may already embed the original commit timestamp.
+
 Regression coverage includes missing/matching/mismatched decisions, unknown
 and follower owners, partition routing and ownership changes, ABORT/post-D
 bypass, every primary in a batch, proposal rejection, corrupt records, and
-commit-record persistence across Pebble reopen. Full distributed cutover and
+commit-record persistence across Pebble reopen, first-primary admission, and
+waiting for a committed decision's read index to apply. Full distributed cutover and
 leader-change acceptance have not been demonstrated by these focused tests;
 the document remains Partial until that acceptance evidence is available.
 
@@ -193,6 +214,7 @@ the document remains Partial until that acceptance evidence is available.
 4. Should the `ABORT` path get its own rule, given its timestamp is synthesised
    rather than recorded?
 
-Settled in §4a. Both mechanisms are wired. Remaining acceptance must exercise
+Settled in §4a, subject to the first-primary proof gap above. Remaining work
+must close that gap without rejecting valid cutover transactions. Acceptance must exercise
 the real forwarded path across Phase-D activation and leader changes, including
 a remote-primary resolution after the creation window has closed.

@@ -23,7 +23,8 @@ import (
 // timestamp, inserting a write retroactively below timestamps that have already
 // been read.
 //
-// Two mechanisms close it, because neither covers the whole surface:
+// Two mechanisms bound creation and strengthen resolution; the first-primary
+// proof gap documented in the design remains open:
 //
 //   - Durable evidence, where it exists. For a COMMIT whose primary key this
 //     node can read, the primary's own commit record has to agree with the
@@ -104,6 +105,10 @@ type PrimaryCommitEvidence struct {
 	Found bool
 	// CommitTS is the timestamp that record carries.
 	CommitTS uint64
+	// PrimaryPrepared confirms a matching durable primary lock and intent.
+	// It permits the first primary COMMIT to create its decision, but is not
+	// evidence that a claimed commit timestamp was previously issued.
+	PrimaryPrepared bool
 }
 
 // PrimaryCommitEvidenceReader distinguishes a missing local record from a

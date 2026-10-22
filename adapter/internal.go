@@ -1159,11 +1159,26 @@ func (i *Internal) verifyLegacyCommitEvidence(ctx context.Context, reqs []*pb.Re
 		if err != nil {
 			return errors.Wrap(err, "validate legacy primary commit evidence")
 		}
+		if forwardedTxnHasPreparedPrimary(req, meta.PrimaryKey, evidence) {
+			continue
+		}
 		if err := kv.ClassifyPrePhaseDCommit(evidence, commitTS, false); err != nil {
 			return errors.Wrap(err, "validate legacy primary commit decision")
 		}
 	}
 	return nil
+}
+
+func forwardedTxnHasPreparedPrimary(req *pb.Request, primaryKey []byte, evidence kv.PrimaryCommitEvidence) bool {
+	if !evidence.Readable || evidence.Found || !evidence.PrimaryPrepared {
+		return false
+	}
+	for _, mutation := range req.Mutations[1:] {
+		if mutation != nil && bytes.Equal(mutation.Key, primaryKey) {
+			return true
+		}
+	}
+	return false
 }
 
 func stampRequestMutationCommitTS(reqs []*pb.Request, commitTS uint64) error {

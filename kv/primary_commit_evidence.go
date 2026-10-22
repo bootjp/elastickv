@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 
 	"github.com/bootjp/elastickv/distribution"
@@ -48,13 +49,43 @@ func (s *ShardStore) readPrimaryCommitEvidence(ctx context.Context, group *Shard
 		return PrimaryCommitEvidence{}, errors.WithStack(err)
 	}
 	if errors.Is(err, store.ErrKeyNotFound) {
-		return PrimaryCommitEvidence{Readable: true}, nil
+		prepared, prepareErr := s.primaryPreparedForEvidence(ctx, group, route, key, startTS)
+		return PrimaryCommitEvidence{Readable: true, PrimaryPrepared: prepared}, prepareErr
 	}
 	commitTS, err := decodeTxnCommitRecord(value)
 	if err != nil {
 		return PrimaryCommitEvidence{}, errors.Wrap(err, "read primary commit evidence")
 	}
 	return PrimaryCommitEvidence{Readable: true, Found: true, CommitTS: commitTS}, nil
+}
+
+func (s *ShardStore) primaryPreparedForEvidence(ctx context.Context, group *ShardGroup, route distribution.Route, key []byte, startTS uint64) (bool, error) {
+	value, err := s.localGetAt(ctx, group, route, txnLockKey(key), ^uint64(0))
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	lock, err := decodeTxnLock(value)
+	if err != nil {
+		return false, errors.Wrap(err, "read prepared primary lock")
+	}
+	if !lock.IsPrimaryKey || lock.StartTS != startTS || !bytes.Equal(lock.PrimaryKey, key) {
+		return false, nil
+	}
+	value, err = s.localGetAt(ctx, group, route, txnIntentKey(key), ^uint64(0))
+	if errors.Is(err, store.ErrKeyNotFound) {
+		return false, nil
+	}
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	intent, err := decodeTxnIntent(value)
+	if err != nil {
+		return false, errors.Wrap(err, "read prepared primary intent")
+	}
+	return intent.StartTS == startTS, nil
 }
 
 func (s *ShardStore) primaryEvidenceRoute(key []byte) (distribution.Route, *ShardGroup, uint64, bool) {
@@ -92,7 +123,9 @@ func primaryEvidenceLeaderReady(ctx context.Context, group *ShardGroup) (bool, e
 	if !isLeaderEngine(engine) {
 		return false, nil
 	}
-	if err := verifyLeaderEngineCtx(ctx, engine); err != nil {
+	readCtx, cancel := context.WithTimeout(ctx, verifyLeaderTimeout)
+	defer cancel()
+	if _, err := linearizableReadEngineCtx(readCtx, engine); err != nil {
 		if ctx.Err() != nil {
 			return false, errors.WithStack(ctx.Err())
 		}
