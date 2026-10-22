@@ -26,11 +26,12 @@ import (
 // it. No store/FSM/transport is mocked: the later seal must reject this plan.
 type delayedSealRaftCoordinator struct {
 	kv.Coordinator
-	blocked   atomic.Bool
-	entered   chan uint64
-	release   chan struct{}
-	result    chan error
-	unstamped bool
+	blocked       atomic.Bool
+	entered       chan uint64
+	release       chan struct{}
+	result        chan error
+	unstamped     bool
+	freshCommitTS uint64
 }
 
 func (c *delayedSealRaftCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -46,6 +47,13 @@ func (c *delayedSealRaftCoordinator) Dispatch(ctx context.Context, req *kv.Opera
 	case <-c.release:
 	case <-ctx.Done():
 		return nil, ctx.Err()
+	}
+	return c.dispatchReleased(ctx, req)
+}
+
+func (c *delayedSealRaftCoordinator) dispatchReleased(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if c.freshCommitTS != 0 {
+		req.CommitTS = c.freshCommitTS
 	}
 	resp, err := c.Coordinator.Dispatch(ctx, req)
 	c.result <- err
@@ -145,6 +153,15 @@ func sealRaftHTTPCall(ctx context.Context, address, action string, input any) er
 }
 
 func TestDynamoDBSnapshotSealRealRaftLeaderChangeFollowerIngress(t *testing.T) {
+	for _, restamp := range []bool{false, true} {
+		t.Run(map[bool]string{false: "delayed-commit-watermark", true: "fresh-commit-stale-read-seal"}[restamp], func(t *testing.T) {
+			testSnapshotSealRaftLeaderChange(t, restamp)
+		})
+	}
+}
+
+func testSnapshotSealRaftLeaderChange(t *testing.T, restamp bool) {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 	nodes, _, _ := createNode(t, 3)
@@ -192,8 +209,20 @@ func TestDynamoDBSnapshotSealRealRaftLeaderChangeFollowerIngress(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	require.Greater(t, sealed, commitTS)
+	if restamp {
+		// Keep the stale read plan but allocate its commit timestamp after R.
+		// The global apply-order fence must not hide whether the seal rejects it.
+		fresh, err := kv.NextTimestampAfterThrough(ctx, nodes[1].dynamoServer.coordinator, sealed, "seal regression: fresh commit for stale read plan")
+		require.NoError(t, err)
+		require.Greater(t, fresh, sealed)
+		coord.freshCommitTS = fresh
+	}
 	release()
-	require.ErrorContains(t, sealRaftReceive(t, ctx, coord.result), dynamoSealPrefix, "only the seal changed since the first read")
+	conflict := sealRaftReceive(t, ctx, coord.result)
+	require.ErrorContains(t, conflict, "write conflict", "the delayed write must never be acknowledged")
+	if restamp {
+		require.ErrorContains(t, conflict, dynamoSealPrefix, "a fresh commit timestamp bypasses the global fence, so the seal itself must reject the stale read")
+	}
 	require.NoError(t, sealRaftReceive(t, ctx, done))
 	releaseSecond()
 	require.NoError(t, sealRaftReceive(t, ctx, txnDone))
