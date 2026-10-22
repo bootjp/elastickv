@@ -241,6 +241,32 @@ enum MigrationCleanupMode {
   MIGRATION_CLEANUP_MODE_UNSPECIFIED = 0;
   MIGRATION_CLEANUP_MODE_VERSIONS = 1;
   MIGRATION_CLEANUP_MODE_METADATA = 2;
+  // New modes deliberately fail on old runtimes instead of letting unknown
+  // proof fields silently degrade to an unbound metadata clear.
+  MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE = 3;
+  MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR = 4;
+  MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH = 5;
+}
+
+enum MigrationOwnershipRole {
+  MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED = 0;
+  MIGRATION_OWNERSHIP_ROLE_OWNER = 1;
+  MIGRATION_OWNERSHIP_ROLE_NONOWNER = 2;
+}
+
+message MigrationOwnershipProof {
+  string generation = 1;
+  uint64 local_group_id = 2;
+  uint64 owner_group_id = 3;
+  uint64 catalog_version = 4;
+  uint64 min_write_ts_exclusive = 5;
+  bytes route_start = 6;
+  bytes route_end = 7;
+  uint64 route_id = 8;
+  uint64 parent_route_id = 9;
+  bool staged = 10;
+  MigrationOwnershipRole role = 11;
+  bytes descriptor_hash = 12;
 }
 
 message CleanupMigrationRequest {
@@ -264,6 +290,7 @@ message CleanupMigrationRequest {
   // against the FSM's durable ConfChange index before any cleanup side effect.
   uint64 expected_configuration_index = 17;
   bool require_configuration_index = 18;
+  MigrationOwnershipProof ownership = 19;
 }
 
 message CleanupMigrationResponse {
@@ -284,6 +311,8 @@ enum MigrationStateProbeKind {
   // Identifies the durable source guard by job and moving range, independently
   // of compactable catalog route history. Target-only readiness is excluded.
   MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT = 6;
+  MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY = 7;
+  MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED = 8;
 }
 
 message ProbeMigrationStateRequest {
@@ -306,6 +335,7 @@ message ProbeMigrationStateRequest {
   uint64 read_drain_min_ts = 14;
   bool require_configuration_index = 15;
   uint64 expected_configuration_index = 16;
+  MigrationOwnershipProof ownership = 17;
 }
 
 message ProbeMigrationStateResponse {
@@ -313,6 +343,10 @@ message ProbeMigrationStateResponse {
   uint64 catalog_version = 2;
   uint64 min_admitted_ts = 3;
   uint64 applied_configuration_index = 4;
+  string ownership_generation = 5;
+  uint32 ownership_protocol = 6;
+  MigrationOwnershipProof ownership = 7;
+  bool ownership_cleared = 8;
 }
 
 message IssueMigrationTimestampRequest {}

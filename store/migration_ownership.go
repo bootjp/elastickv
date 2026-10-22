@@ -25,6 +25,9 @@ const (
 // not an ownership acquisition: only a newer replicated certificate can replace
 // a NONOWNER verdict for the same range.
 type MigrationOwnershipState struct {
+	// Generation is a replicated ownership namespace, never a configuration
+	// index, snapshot index, peer list, or watcher-derived value.
+	Generation          string
 	JobID               uint64
 	LocalGroupID        uint64
 	OwnerGroupID        uint64
@@ -36,6 +39,29 @@ type MigrationOwnershipState struct {
 	RouteEnd            []byte
 	Role                MigrationOwnershipRole
 	Staged              bool
+	RouteID             uint64
+	ParentRouteID       uint64
+	DescriptorHash      []byte
+	Receipts            []MigrationOwnershipReceipt
+}
+
+type MigrationOwnershipOperation uint8
+
+const (
+	MigrationOwnershipAcquire MigrationOwnershipOperation = iota + 1
+	MigrationOwnershipClear
+	MigrationOwnershipRefresh
+)
+
+// Receipts name immutable operations; the outer state's version/index fields
+// are the latest separately replicated unchanged-descriptor attestation.
+type MigrationOwnershipReceipt struct {
+	Operation          MigrationOwnershipOperation
+	CatalogVersion     uint64
+	ConfigurationIndex uint64
+	AppliedIndex       uint64
+	Staged             bool
+	DescriptorHash     []byte
 }
 
 type MigrationServingState struct {
@@ -50,6 +76,12 @@ type MigrationOwnershipStore interface {
 	MigrationServingState(context.Context) (MigrationServingState, error)
 	AcquireMigrationOwnership(context.Context, MigrationOwnershipState, uint64) error
 	ClearMigrationStateWithOwnership(context.Context, MigrationOwnershipState, uint64) error
+}
+
+// MigrationOwnershipRefresher is separate so old runtimes cannot accidentally
+// advertise refresh support by embedding the original ownership interface.
+type MigrationOwnershipRefresher interface {
+	RefreshMigrationOwnership(context.Context, MigrationOwnershipState, uint64) error
 }
 
 func IsMigrationOwnershipMetadataKey(key []byte) bool {
@@ -82,6 +114,11 @@ func cloneMigrationOwnership(states []MigrationOwnershipState) []MigrationOwners
 		out[i] = state
 		out[i].RouteStart = bytes.Clone(state.RouteStart)
 		out[i].RouteEnd = bytes.Clone(state.RouteEnd)
+		out[i].Receipts = append([]MigrationOwnershipReceipt(nil), state.Receipts...)
+		out[i].DescriptorHash = bytes.Clone(state.DescriptorHash)
+		for j := range out[i].Receipts {
+			out[i].Receipts[j].DescriptorHash = bytes.Clone(state.Receipts[j].DescriptorHash)
+		}
 	}
 	return out
 }
@@ -106,12 +143,33 @@ func decodeMigrationOwnership(data []byte) ([]MigrationOwnershipState, error) {
 	}
 	seen := make(map[uint64]struct{}, len(states))
 	for _, state := range states {
-		if _, duplicate := seen[state.JobID]; duplicate || !validMigrationOwnership(state) {
+		if _, duplicate := seen[state.JobID]; duplicate || !validMigrationOwnership(state) || !validOwnershipReceipts(state) {
 			return nil, errors.New("invalid migration ownership certificate")
 		}
 		seen[state.JobID] = struct{}{}
 	}
 	return states, nil
+}
+
+func validOwnershipReceipts(state MigrationOwnershipState) bool {
+	const maxOwnershipReceipts = 2
+	if len(state.Receipts) > maxOwnershipReceipts {
+		return false
+	}
+	seen := make(map[MigrationOwnershipOperation]bool)
+	for _, receipt := range state.Receipts {
+		if seen[receipt.Operation] || !validOwnershipReceipt(state, receipt) {
+			return false
+		}
+		seen[receipt.Operation] = true
+	}
+	return true
+}
+
+func validOwnershipReceipt(state MigrationOwnershipState, receipt MigrationOwnershipReceipt) bool {
+	return (receipt.Operation == MigrationOwnershipAcquire || receipt.Operation == MigrationOwnershipClear) &&
+		receipt.CatalogVersion != 0 && receipt.CatalogVersion <= state.CatalogVersion && receipt.ConfigurationIndex != 0 &&
+		receipt.ConfigurationIndex <= state.ConfigurationIndex && receipt.AppliedIndex != 0 && receipt.AppliedIndex <= state.AppliedIndex
 }
 
 func (s *pebbleStore) readMigrationOwnership() ([]MigrationOwnershipState, error) {
@@ -163,34 +221,79 @@ func cloneReadinessStates(states []TargetStagedReadinessState) []TargetStagedRea
 	return out
 }
 
-func replaceMigrationOwnership(states []MigrationOwnershipState, state MigrationOwnershipState) ([]MigrationOwnershipState, error) {
+func replaceMigrationOwnership(states []MigrationOwnershipState, state MigrationOwnershipState, operation MigrationOwnershipOperation) ([]MigrationOwnershipState, error) {
 	if !validMigrationOwnership(state) {
 		return nil, errors.WithStack(ErrMigrationOwnership)
 	}
 	out := cloneMigrationOwnership(states)
-	for _, old := range out {
-		if old.LocalGroupID != state.LocalGroupID {
+	for i, old := range out {
+		if old.LocalGroupID != state.LocalGroupID || old.Generation != state.Generation {
 			return nil, errors.WithStack(ErrMigrationOwnership)
 		}
 		if old.JobID == state.JobID {
-			// Retrying a completed clear cannot revise its committed certificate.
-			state.AppliedIndex = old.AppliedIndex
-			if !sameMigrationOwnership(old, state) {
-				return nil, errors.WithStack(ErrMigrationOwnership)
+			updated, err := updateMigrationOwnershipAttestation(old, state, operation)
+			if err != nil {
+				return nil, err
 			}
+			out[i] = updated
 			return out, nil
 		}
 		if migrationOwnershipOverlaps(old, state) && old.CatalogVersion >= state.CatalogVersion {
 			return nil, errors.WithStack(ErrMigrationOwnership)
 		}
 	}
+	if operation == MigrationOwnershipRefresh {
+		return nil, errors.WithStack(ErrMigrationOwnership)
+	}
+	state.Receipts = []MigrationOwnershipReceipt{ownershipOperationReceipt(state, operation)}
 	return append(out, cloneMigrationOwnership([]MigrationOwnershipState{state})[0]), nil
 }
 
-func sameMigrationOwnership(a, b MigrationOwnershipState) bool {
-	return sameMigrationOwnershipRange(a, b) && a.CatalogVersion == b.CatalogVersion && a.ConfigurationIndex == b.ConfigurationIndex &&
-		a.AppliedIndex == b.AppliedIndex && a.MinWriteTSExclusive == b.MinWriteTSExclusive &&
-		a.Role == b.Role && a.Staged == b.Staged
+func ownershipOperationReceipt(state MigrationOwnershipState, operation MigrationOwnershipOperation) MigrationOwnershipReceipt {
+	return MigrationOwnershipReceipt{Operation: operation, CatalogVersion: state.CatalogVersion,
+		ConfigurationIndex: state.ConfigurationIndex, AppliedIndex: state.AppliedIndex, Staged: state.Staged,
+		DescriptorHash: bytes.Clone(state.DescriptorHash)}
+}
+
+func updateMigrationOwnershipAttestation(old, state MigrationOwnershipState, operation MigrationOwnershipOperation) (MigrationOwnershipState, error) {
+	if !sameMigrationOwnershipDescriptor(old, state) {
+		return MigrationOwnershipState{}, errors.WithStack(ErrMigrationOwnership)
+	}
+	if operation == MigrationOwnershipRefresh {
+		return refreshMigrationOwnershipAttestation(old, state)
+	}
+	return replayMigrationOwnershipOperation(old, state, operation)
+}
+
+func refreshMigrationOwnershipAttestation(old, state MigrationOwnershipState) (MigrationOwnershipState, error) {
+	if state.CatalogVersion < old.CatalogVersion || state.ConfigurationIndex < old.ConfigurationIndex || state.AppliedIndex < old.AppliedIndex ||
+		state.Staged != old.Staged || !bytes.Equal(state.DescriptorHash, old.DescriptorHash) {
+		return MigrationOwnershipState{}, errors.WithStack(ErrMigrationOwnership)
+	}
+	state.Receipts = append([]MigrationOwnershipReceipt(nil), old.Receipts...)
+	return state, nil
+}
+
+func replayMigrationOwnershipOperation(old, state MigrationOwnershipState, operation MigrationOwnershipOperation) (MigrationOwnershipState, error) {
+	for _, receipt := range old.Receipts {
+		if receipt.Operation != operation {
+			continue
+		}
+		if receipt.CatalogVersion != state.CatalogVersion || receipt.Staged != state.Staged || !bytes.Equal(receipt.DescriptorHash, state.DescriptorHash) {
+			return MigrationOwnershipState{}, errors.WithStack(ErrMigrationOwnership)
+		}
+		return old, nil
+	}
+	if operation != MigrationOwnershipClear || !old.Staged || state.Staged || state.CatalogVersion < old.CatalogVersion {
+		return MigrationOwnershipState{}, errors.WithStack(ErrMigrationOwnership)
+	}
+	state.Receipts = append(append([]MigrationOwnershipReceipt(nil), old.Receipts...), ownershipOperationReceipt(state, operation))
+	return state, nil
+}
+
+func sameMigrationOwnershipDescriptor(a, b MigrationOwnershipState) bool {
+	return sameMigrationOwnershipRange(a, b) && a.Generation == b.Generation && a.Role == b.Role &&
+		a.MinWriteTSExclusive == b.MinWriteTSExclusive && a.RouteID == b.RouteID && a.ParentRouteID == b.ParentRouteID
 }
 
 func sameMigrationOwnershipRange(a, b MigrationOwnershipState) bool {
@@ -203,7 +306,7 @@ func migrationOwnershipOverlaps(a, b MigrationOwnershipState) bool {
 		(len(b.RouteEnd) == 0 || bytes.Compare(a.RouteStart, b.RouteEnd) < 0)
 }
 
-func validateOwnershipGuard(state MigrationOwnershipState, guards []TargetStagedReadinessState, retired bool) error {
+func validateOwnershipGuard(state MigrationOwnershipState, guards []TargetStagedReadinessState, retired bool, promoted ...bool) error {
 	if retired {
 		return nil // The immutable existing certificate is checked by replacement.
 	}
@@ -211,16 +314,35 @@ func validateOwnershipGuard(state MigrationOwnershipState, guards []TargetStaged
 		if !ownershipGuardMatchesRange(state, guard) {
 			continue
 		}
-		if ownershipSourceRemovalMatches(state, guard) {
-			return nil
-		}
 		// Rollback to the source retains its tracked live data. Target ownership
 		// acquisition needs a separate data-ready control and is not accepted here.
-		if ownershipRollbackMatches(state, guard) {
+		if ownershipClearMatches(state, guard, len(promoted) > 0 && promoted[0]) {
 			return nil
 		}
 	}
+	if !ownershipJobGuardExists(guards, state.JobID) && !state.Staged && len(state.Generation) >= 16 && len(state.DescriptorHash) == 32 {
+		return nil
+	}
 	return errors.WithStack(ErrMigrationOwnership)
+}
+
+func ownershipClearMatches(state MigrationOwnershipState, guard TargetStagedReadinessState, promoted bool) bool {
+	return ownershipSourceRemovalMatches(state, guard) || ownershipAbandonedTargetMatches(state, guard) ||
+		ownershipRollbackMatches(state, guard) || (promoted && ownershipPromotedTargetMatches(state, guard))
+}
+
+func ownershipJobGuardExists(guards []TargetStagedReadinessState, jobID uint64) bool {
+	for _, guard := range guards {
+		if guard.JobID == jobID {
+			return true
+		}
+	}
+	return false
+}
+
+func ownershipPromotedTargetMatches(state MigrationOwnershipState, guard TargetStagedReadinessState) bool {
+	return state.Role == MigrationOwner && !state.Staged && !guard.TrackWrites && !guard.SourceWriteFence && !guard.SourceReadFence &&
+		state.CatalogVersion >= guard.ExpectedCutoverVersion && state.MinWriteTSExclusive == guard.MinWriteTSExclusive
 }
 
 func ownershipGuardMatchesRange(state MigrationOwnershipState, guard TargetStagedReadinessState) bool {
@@ -235,7 +357,12 @@ func ownershipSourceRemovalMatches(state MigrationOwnershipState, guard TargetSt
 
 func ownershipRollbackMatches(state MigrationOwnershipState, guard TargetStagedReadinessState) bool {
 	return state.Role == MigrationOwner && (guard.TrackWrites || guard.SourceWriteFence) && !state.Staged &&
-		state.CatalogVersion > guard.ExpectedCutoverVersion && state.MinWriteTSExclusive == guard.MinWriteTSExclusive
+		state.CatalogVersion >= guard.ExpectedCutoverVersion && state.MinWriteTSExclusive >= guard.MinWriteTSExclusive
+}
+
+func ownershipAbandonedTargetMatches(state MigrationOwnershipState, guard TargetStagedReadinessState) bool {
+	return state.Role == MigrationNonOwner && !guard.TrackWrites && !guard.SourceWriteFence && !guard.SourceReadFence &&
+		state.CatalogVersion >= guard.ExpectedCutoverVersion && state.MinWriteTSExclusive >= guard.MinWriteTSExclusive
 }
 
 func validateOwnershipAcquisition(state MigrationOwnershipState, guards []TargetStagedReadinessState) error {
@@ -252,7 +379,16 @@ func validateOwnershipAcquisition(state MigrationOwnershipState, guards []Target
 
 func ownershipTargetMatches(state MigrationOwnershipState, guard TargetStagedReadinessState) bool {
 	return !guard.TrackWrites && !guard.SourceWriteFence && !guard.SourceReadFence && state.Staged &&
-		guard.ExpectedCutoverVersion == state.CatalogVersion && guard.MinWriteTSExclusive == state.MinWriteTSExclusive
+		ownershipAcquisitionVersionMatches(state, guard) && guard.MinWriteTSExclusive == state.MinWriteTSExclusive
+}
+
+func ownershipAcquisitionVersionMatches(state MigrationOwnershipState, guard TargetStagedReadinessState) bool {
+	if guard.ExpectedCutoverVersion == state.CatalogVersion {
+		return true
+	}
+	// Only the authenticated committed-descriptor control may attest a later
+	// version. Legacy unversioned controls never gain this ability implicitly.
+	return len(state.Generation) >= 16 && len(state.DescriptorHash) == 32 && state.CatalogVersion > guard.ExpectedCutoverVersion
 }
 
 func (s *mvccStore) AcquireMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
@@ -265,7 +401,7 @@ func (s *mvccStore) AcquireMigrationOwnership(_ context.Context, state Migration
 	if err := validateOwnershipAcquisition(state, s.migrationReadinessCache); err != nil {
 		return err
 	}
-	states, err := replaceMigrationOwnership(s.migrationOwnership, state)
+	states, err := replaceMigrationOwnership(s.migrationOwnership, state, MigrationOwnershipAcquire)
 	if err == nil {
 		s.migrationOwnership = states
 	}
@@ -291,10 +427,60 @@ func (s *pebbleStore) AcquireMigrationOwnership(_ context.Context, state Migrati
 	if err != nil {
 		return err
 	}
-	states, err = replaceMigrationOwnership(states, state)
+	states, err = replaceMigrationOwnership(states, state, MigrationOwnershipAcquire)
 	if err != nil {
 		return err
 	}
+	data, err := encodeMigrationOwnership(states)
+	if err != nil {
+		return err
+	}
+	batch := s.db.NewBatch()
+	defer batch.Close()
+	if err := batch.Set(migrationOwnershipMetaKeyBytes, data, nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+		return err
+	}
+	return errors.WithStack(batch.Commit(s.cleanupWriteOpts(appliedIndex)))
+}
+
+func (s *mvccStore) RefreshMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	state.AppliedIndex = appliedIndex
+	if state.Generation == "" || state.RouteID == 0 {
+		return errors.WithStack(ErrMigrationOwnership)
+	}
+	states, err := replaceMigrationOwnership(s.migrationOwnership, state, MigrationOwnershipRefresh)
+	if err == nil {
+		s.migrationOwnership = states
+	}
+	return err
+}
+
+func (s *pebbleStore) RefreshMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	state.AppliedIndex = appliedIndex
+	if state.Generation == "" || state.RouteID == 0 {
+		return errors.WithStack(ErrMigrationOwnership)
+	}
+	states, err := s.readMigrationOwnership()
+	if err != nil {
+		return err
+	}
+	states, err = replaceMigrationOwnership(states, state, MigrationOwnershipRefresh)
+	if err != nil {
+		return err
+	}
+	return s.persistMigrationOwnershipLocked(states, appliedIndex)
+}
+
+func (s *pebbleStore) persistMigrationOwnershipLocked(states []MigrationOwnershipState, appliedIndex uint64) error {
 	data, err := encodeMigrationOwnership(states)
 	if err != nil {
 		return err
@@ -315,10 +501,10 @@ func (s *mvccStore) ClearMigrationStateWithOwnership(_ context.Context, state Mi
 	defer s.mtx.Unlock()
 	state.AppliedIndex = appliedIndex
 	_, retired := s.migrationRetired[state.JobID]
-	if err := validateOwnershipGuard(state, s.migrationReadinessCache, retired); err != nil {
+	if err := validateOwnershipGuard(state, s.migrationReadinessCache, retired, s.migrationPromotions[state.JobID].Done); err != nil {
 		return err
 	}
-	states, err := replaceMigrationOwnership(s.migrationOwnership, state)
+	states, err := replaceMigrationOwnership(s.migrationOwnership, state, MigrationOwnershipClear)
 	if err != nil {
 		return err
 	}
@@ -354,8 +540,12 @@ func (s *pebbleStore) ClearMigrationStateWithOwnership(_ context.Context, state 
 		return err
 	}
 	_, isRetired := retired[state.JobID]
+	promotions, err := s.readPebblePromotionStates()
+	if err != nil {
+		return err
+	}
 	s.mtx.RLock()
-	err = validateOwnershipGuard(state, s.migrationReadinessCache, isRetired)
+	err = validateOwnershipGuard(state, s.migrationReadinessCache, isRetired, promotions[state.JobID].Done)
 	s.mtx.RUnlock()
 	if err != nil {
 		return err
@@ -363,7 +553,7 @@ func (s *pebbleStore) ClearMigrationStateWithOwnership(_ context.Context, state 
 	if isRetired && !hasMigrationOwnership(states, state.JobID) {
 		return errors.WithStack(ErrMigrationOwnership)
 	}
-	states, err = replaceMigrationOwnership(states, state)
+	states, err = replaceMigrationOwnership(states, state, MigrationOwnershipClear)
 	if err != nil {
 		return err
 	}

@@ -64,6 +64,12 @@ func TestMigrationCleanupConfigurationRejectsBeforeSideEffects(t *testing.T) {
 			require.NoError(t, err)
 			resp = fsm.Apply(cmd)
 			require.NoError(t, haltApplyOf(resp))
+			if mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA {
+				responseErr, ok = resp.(error)
+				require.True(t, ok)
+				require.ErrorIs(t, responseErr, store.ErrMigrationOwnership, "the current epoch alone cannot replace a live serving guard")
+				return
+			}
 			if applyErr, ok := resp.(error); ok {
 				require.NoError(t, applyErr)
 			}

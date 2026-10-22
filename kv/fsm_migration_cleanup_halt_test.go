@@ -26,6 +26,15 @@ func (s *cleanupFailureStore) ClearMigrationState(context.Context, uint64, uint6
 	return s.err
 }
 
+func (s *cleanupFailureStore) MigrationTargetReadinessStates(ctx context.Context) ([]store.TargetStagedReadinessState, error) {
+	reader, ok := s.MVCCStore.(store.MigrationTargetReadinessReader)
+	if !ok {
+		return nil, errors.WithStack(store.ErrNotSupported)
+	}
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	return states, errors.WithStack(err)
+}
+
 func cleanupCommand(t *testing.T, mode pb.MigrationCleanupMode) []byte {
 	t.Helper()
 	cmd, err := MarshalMigrationCleanupCommand(&pb.CleanupMigrationRequest{

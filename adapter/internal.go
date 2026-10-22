@@ -178,6 +178,7 @@ type Internal struct {
 	migrationImportGate     func(context.Context) error
 	migrationPromoteGate    func(context.Context) error
 	migrationCleanupGate    func(context.Context) error
+	migrationOwnershipReady func() bool
 	routeEngine             *distribution.Engine
 	readTracker             *kv.ActiveTimestampTracker
 	migrationExportGroupID  uint64
@@ -288,6 +289,9 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
 	switch req.GetKind() {
+	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY,
+		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED:
+		return i.probeMigrationOwnership(ctx, req)
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED:
 		return i.probeMigrationControl(ctx, req)
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT:
@@ -797,6 +801,9 @@ func (i *Internal) CleanupMigration(ctx context.Context, req *pb.CleanupMigratio
 	if err := validateCleanupMigrationRequest(req); err != nil {
 		return nil, err
 	}
+	if ownershipCleanupMode(req.GetMode()) && !i.ownershipAdmissionReady() {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration ownership data admission is not wired"))
+	}
 	if i.migrationProposer == nil {
 		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration cleanup proposer is not configured"))
 	}
@@ -808,8 +815,8 @@ func (i *Internal) CleanupMigration(ctx context.Context, req *pb.CleanupMigratio
 	}
 	result, err := i.proposeMigrationCleanup(ctx, req)
 	if err != nil {
-		if errors.Is(err, kv.ErrMigrationConfigurationChanged) {
-			return nil, errors.WithStack(status.Error(codes.Aborted, kv.ErrMigrationConfigurationChanged.Error()))
+		if errors.Is(err, kv.ErrMigrationConfigurationChanged) || errors.Is(err, store.ErrMigrationOwnership) {
+			return nil, errors.WithStack(status.Error(codes.Aborted, err.Error()))
 		}
 		return nil, errors.WithStack(err)
 	}
@@ -829,10 +836,18 @@ func validateCleanupMigrationRequest(req *pb.CleanupMigrationRequest) error {
 	case req.GetJobId() == 0:
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup job_id is required"))
 	case req.GetMode() != pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS &&
-		req.GetMode() != pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA:
+		req.GetMode() != pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA && !ownershipCleanupMode(req.GetMode()):
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup mode is invalid"))
 	case req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS && req.GetKeyFamily() == 0:
 		return errors.WithStack(status.Error(codes.InvalidArgument, "migration cleanup key_family is required"))
+	}
+	if ownershipCleanupMode(req.GetMode()) {
+		if !req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() == 0 {
+			return errors.WithStack(status.Error(codes.InvalidArgument, "ownership control requires applied configuration"))
+		}
+		if _, err := kv.MigrationOwnershipStateFromProto(req.GetJobId(), req.GetOwnership()); err != nil {
+			return errors.WithStack(status.Error(codes.InvalidArgument, "invalid migration ownership proof"))
+		}
 	}
 	return nil
 }

@@ -44,11 +44,20 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 		}
 		return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: inspect cleanup configuration"))
 	}
+	if migrationOwnershipControlMode(req.GetMode()) {
+		return f.applyMigrationOwnershipControl(ctx, req)
+	}
 	cleaner, ok := f.store.(store.MigrationCleaner)
 	if !ok {
 		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrMigrationCleanupApply), "kv/fsm: migration cleanup store"))
 	}
 	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA {
+		if err := f.verifyLegacyMigrationMetadataClear(ctx, req.GetJobId()); err != nil {
+			if errors.Is(err, store.ErrMigrationOwnership) || errors.Is(err, store.ErrNotSupported) {
+				return err
+			}
+			return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: inspect legacy metadata clear"))
+		}
 		if err := cleaner.ClearMigrationState(ctx, req.GetJobId(), f.pendingApplyIdx); err != nil {
 			return haltErr(errors.Wrap(errors.Mark(err, ErrMigrationCleanupApply), "kv/fsm: clear migration state"))
 		}
