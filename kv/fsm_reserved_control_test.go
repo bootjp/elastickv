@@ -137,3 +137,16 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 		require.NoError(t, err, "key %q must be accepted", key)
 	}
 }
+
+func TestWholeKeyspaceDeletePreservesReplicatedControlState(t *testing.T) {
+	t.Parallel()
+	st := g17OpenStore(t, t.TempDir())
+	seedActivatedPinJournal(t, st)
+	before := newPinJournal(t, st).snapshot()
+	f := g17FSM(t, st)
+	require.Nil(t, f.Apply(g17Entry(t, g17RawPut(10, "ordinary", "value"))))
+	f.SetApplyIndex(g17EntryIndex + 1)
+	require.Nil(t, f.Apply(g17Entry(t, g17RawDelPrefix(11, ""))))
+	require.False(t, g17Exists(t, st, "ordinary"))
+	require.Equal(t, before, newPinJournal(t, st).snapshot())
+}
