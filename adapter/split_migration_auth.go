@@ -32,6 +32,7 @@ func splitMigrationMutatingMethod(method string) bool {
 func splitMigrationProtectedMethod(method string) bool {
 	switch method {
 	case pb.Internal_ExportRangeVersions_FullMethodName,
+		pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.Internal_ProbeMigrationLocks_FullMethodName,
 		pb.Internal_ProbeMigrationState_FullMethodName,
 		pb.Internal_IssueMigrationTimestamp_FullMethodName:

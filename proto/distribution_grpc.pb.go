@@ -34,6 +34,7 @@ const (
 	Distribution_ListSplitJobs_FullMethodName               = "/Distribution/ListSplitJobs"
 	Distribution_AbandonSplitJob_FullMethodName             = "/Distribution/AbandonSplitJob"
 	Distribution_RetrySplitJob_FullMethodName               = "/Distribution/RetrySplitJob"
+	Distribution_AttestMigrationOwnership_FullMethodName    = "/Distribution/AttestMigrationOwnership"
 )
 
 // DistributionClient is the client API for Distribution service.
@@ -55,6 +56,8 @@ type DistributionClient interface {
 	ListSplitJobs(ctx context.Context, in *ListSplitJobsRequest, opts ...grpc.CallOption) (*ListSplitJobsResponse, error)
 	AbandonSplitJob(ctx context.Context, in *AbandonSplitJobRequest, opts ...grpc.CallOption) (*AbandonSplitJobResponse, error)
 	RetrySplitJob(ctx context.Context, in *RetrySplitJobRequest, opts ...grpc.CallOption) (*RetrySplitJobResponse, error)
+	// Privileged peer RPC: reads the committed root descriptor, never a watcher.
+	AttestMigrationOwnership(ctx context.Context, in *AttestMigrationOwnershipRequest, opts ...grpc.CallOption) (*AttestMigrationOwnershipResponse, error)
 }
 
 type distributionClient struct {
@@ -224,6 +227,16 @@ func (c *distributionClient) RetrySplitJob(ctx context.Context, in *RetrySplitJo
 	return out, nil
 }
 
+func (c *distributionClient) AttestMigrationOwnership(ctx context.Context, in *AttestMigrationOwnershipRequest, opts ...grpc.CallOption) (*AttestMigrationOwnershipResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(AttestMigrationOwnershipResponse)
+	err := c.cc.Invoke(ctx, Distribution_AttestMigrationOwnership_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // DistributionServer is the server API for Distribution service.
 // All implementations must embed UnimplementedDistributionServer
 // for forward compatibility.
@@ -243,6 +256,8 @@ type DistributionServer interface {
 	ListSplitJobs(context.Context, *ListSplitJobsRequest) (*ListSplitJobsResponse, error)
 	AbandonSplitJob(context.Context, *AbandonSplitJobRequest) (*AbandonSplitJobResponse, error)
 	RetrySplitJob(context.Context, *RetrySplitJobRequest) (*RetrySplitJobResponse, error)
+	// Privileged peer RPC: reads the committed root descriptor, never a watcher.
+	AttestMigrationOwnership(context.Context, *AttestMigrationOwnershipRequest) (*AttestMigrationOwnershipResponse, error)
 	mustEmbedUnimplementedDistributionServer()
 }
 
@@ -297,6 +312,9 @@ func (UnimplementedDistributionServer) AbandonSplitJob(context.Context, *Abandon
 }
 func (UnimplementedDistributionServer) RetrySplitJob(context.Context, *RetrySplitJobRequest) (*RetrySplitJobResponse, error) {
 	return nil, status.Error(codes.Unimplemented, "method RetrySplitJob not implemented")
+}
+func (UnimplementedDistributionServer) AttestMigrationOwnership(context.Context, *AttestMigrationOwnershipRequest) (*AttestMigrationOwnershipResponse, error) {
+	return nil, status.Error(codes.Unimplemented, "method AttestMigrationOwnership not implemented")
 }
 func (UnimplementedDistributionServer) mustEmbedUnimplementedDistributionServer() {}
 func (UnimplementedDistributionServer) testEmbeddedByValue()                      {}
@@ -582,6 +600,24 @@ func _Distribution_RetrySplitJob_Handler(srv interface{}, ctx context.Context, d
 	return interceptor(ctx, in, info, handler)
 }
 
+func _Distribution_AttestMigrationOwnership_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(AttestMigrationOwnershipRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(DistributionServer).AttestMigrationOwnership(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: Distribution_AttestMigrationOwnership_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(DistributionServer).AttestMigrationOwnership(ctx, req.(*AttestMigrationOwnershipRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // Distribution_ServiceDesc is the grpc.ServiceDesc for Distribution service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -644,6 +680,10 @@ var Distribution_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "RetrySplitJob",
 			Handler:    _Distribution_RetrySplitJob_Handler,
+		},
+		{
+			MethodName: "AttestMigrationOwnership",
+			Handler:    _Distribution_AttestMigrationOwnership_Handler,
 		},
 	},
 	Streams: []grpc.StreamDesc{

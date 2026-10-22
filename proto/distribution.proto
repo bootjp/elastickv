@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+import "internal.proto";
+
 option go_package = "github.com/bootjp/elastickv/proto";
 
 service Distribution {
@@ -18,6 +20,8 @@ service Distribution {
   rpc ListSplitJobs (ListSplitJobsRequest) returns (ListSplitJobsResponse) {}
   rpc AbandonSplitJob (AbandonSplitJobRequest) returns (AbandonSplitJobResponse) {}
   rpc RetrySplitJob (RetrySplitJobRequest) returns (RetrySplitJobResponse) {}
+  // Privileged peer RPC: reads the committed root descriptor, never a watcher.
+  rpc AttestMigrationOwnership (AttestMigrationOwnershipRequest) returns (AttestMigrationOwnershipResponse) {}
 }
 
 message GetRouteRequest {
@@ -328,3 +332,13 @@ message RetrySplitJobRequest {
 }
 
 message RetrySplitJobResponse {}
+
+message AttestMigrationOwnershipRequest {
+  uint64 job_id = 1;
+  MigrationOwnershipProof prior = 2;
+}
+
+message AttestMigrationOwnershipResponse {
+  uint32 ownership_protocol = 1;
+  MigrationOwnershipProof ownership = 2;
+}

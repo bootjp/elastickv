@@ -450,6 +450,7 @@ func TestStartupPublicKVGate_BlocksMutatorsUntilReady(t *testing.T) {
 		pb.Distribution_SplitRange_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_GetSplitMigrationCapability_FullMethodName,
+		pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,

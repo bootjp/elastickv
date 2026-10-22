@@ -57,6 +57,7 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 	methods := []string{
 		pb.Internal_Forward_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
+		pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
@@ -121,6 +122,7 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 	for _, method := range []string{
 		pb.Internal_Forward_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
+		pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,

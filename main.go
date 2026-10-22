@@ -914,6 +914,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			auth.migrationToken,
 		)),
 		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
+		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
 		adapter.WithSplitJobRunnerReady(),
 	)
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
@@ -2818,6 +2819,7 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	publicKVGate.markReady()
 	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
+	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
@@ -3476,6 +3478,7 @@ func startupRotationGatedMethod(fullMethod string) bool {
 		pb.Distribution_SplitRange_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_GetSplitMigrationCapability_FullMethodName,
+		pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
