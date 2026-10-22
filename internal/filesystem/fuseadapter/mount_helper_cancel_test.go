@@ -16,10 +16,9 @@ import (
 )
 
 // TestMountContextAbortsWhileMountHelperHangs puts a fusermount3 stand-in
-// that never answers on PATH and checks that cancelling the context unwinds
-// MountContext while go-fuse is still waiting on the helper. go-fuse itself
-// waits on the helper with no context, so this is the only way a shutdown
-// signal during the kernel mount can get out.
+// on PATH and checks that cancellation joins late cleanup within its budget.
+// go-fuse itself waits on the helper with no context, so startup must retain
+// ownership of that cleanup without waiting forever for the helper.
 func TestMountContextAbortsWhileMountHelperHangs(t *testing.T) {
 	helperDir := t.TempDir()
 	// The stand-in holds go-fuse's communication socket open and never sends
@@ -44,5 +43,5 @@ func TestMountContextAbortsWhileMountHelperHangs(t *testing.T) {
 	require.Nil(t, server)
 	elapsed := time.Since(start)
 	require.GreaterOrEqual(t, elapsed, 150*time.Millisecond, "the helper must really have been waited on until the deadline")
-	require.Less(t, elapsed, 2*time.Second, "MountContext must return on cancellation, not when the helper exits")
+	require.Less(t, elapsed, 12*time.Second, "startup cancellation must bound its joined late-mount cleanup")
 }

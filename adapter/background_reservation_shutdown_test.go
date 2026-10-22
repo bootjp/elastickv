@@ -24,3 +24,19 @@ func TestBackgroundReservationStartsLiveAfterShutdownBound(t *testing.T) {
 		t.Fatal("stop did not join reserved cleanup")
 	}
 }
+
+func TestBackgroundReservationCannotStartAfterStopReturns(t *testing.T) {
+	w := newBackgroundWorkers()
+	r, ok := w.reserve()
+	require.True(t, ok)
+	w.stop("test", time.Millisecond, time.Millisecond)
+	ran := make(chan struct{}, 1)
+	r.start(time.Second, func(context.Context) { ran <- struct{}{} })
+	r.release()
+	require.Zero(t, w.gate.remaining())
+	select {
+	case <-ran:
+		t.Fatal("cleanup started after shutdown returned")
+	case <-time.After(time.Millisecond):
+	}
+}
