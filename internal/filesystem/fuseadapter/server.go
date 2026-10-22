@@ -22,7 +22,6 @@ const (
 	fuseBlockUnit          = 512
 	rootDirHandle          = 1
 	permissionModeMask     = 0o7777
-	createRetryLimit       = 4
 	startupRecoveryTimeout = 5 * time.Minute
 	startupRecoveryBatch   = 256
 	filesystemName         = "elastickv"
@@ -202,14 +201,9 @@ func (r *RawFileSystem) Access(cancel <-chan struct{}, input *fuse.AccessIn) fus
 func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
-	for attempt := range createRetryLimit {
-		status := r.createOrOpen(ctx, input, []byte(name), out)
-		if status == fuse.Status(syscall.EAGAIN) && attempt+1 < createRetryLimit {
-			continue
-		}
-		return status
-	}
-	return fuse.Status(syscall.ENOENT)
+	// EAGAIN can hide an already-applied create whose reply was lost. Do not
+	// replay it and turn its original outcome into a collision/open result.
+	return r.createOrOpen(ctx, input, []byte(name), out)
 }
 
 func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, name []byte, out *fuse.CreateOut) fuse.Status {

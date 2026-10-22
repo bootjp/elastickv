@@ -3,6 +3,7 @@ package fuseadapter
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
 	"syscall"
 	"testing"
@@ -270,26 +271,30 @@ func (c *disappearingCreateCore) Create(
 	return c.fakeCore.Create(ctx, parent, name, opts)
 }
 
-func TestRawFileSystemCreateRetriesWriteConflict(t *testing.T) {
-	core := &disappearingCreateCore{
-		fakeCore: &fakeCore{createResult: filesystem.CreateResult{
-			Inode: 7,
-			FH:    9,
-			Stat:  filesystem.Stat{Inode: 7, Type: filesystem.TypeFile, Mode: 0o644},
-		}},
-		conflictFirst: true,
-	}
-	raw, _ := newRawFileSystem(t, core)
+func TestRawFileSystemCreateDoesNotReplayAmbiguousWriteConflict(t *testing.T) {
+	for _, flags := range []uint32{syscall.O_RDWR | syscall.O_CREAT, syscall.O_RDWR | syscall.O_CREAT | syscall.O_EXCL} {
+		t.Run(fmt.Sprint(flags), func(t *testing.T) {
+			core := &disappearingCreateCore{
+				fakeCore: &fakeCore{createResult: filesystem.CreateResult{
+					Inode: 7,
+					FH:    9,
+					Stat:  filesystem.Stat{Inode: 7, Type: filesystem.TypeFile, Mode: 0o644},
+				}},
+				conflictFirst: true,
+			}
+			raw, _ := newRawFileSystem(t, core)
 
-	var out fuse.CreateOut
-	status := raw.Create(nil, &fuse.CreateIn{
-		InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
-		Flags:    syscall.O_RDWR | syscall.O_CREAT,
-	}, "file", &out)
-	require.Equal(t, fuse.OK, status)
-	require.Equal(t, 2, core.createCalls)
-	require.EqualValues(t, 7, out.NodeId)
-	require.EqualValues(t, 9, out.Fh)
+			var out fuse.CreateOut
+			status := raw.Create(nil, &fuse.CreateIn{
+				InHeader: fuse.InHeader{NodeId: filesystem.RootInode},
+				Flags:    flags,
+			}, "file", &out)
+			require.Equal(t, fuse.Status(syscall.EAGAIN), status)
+			require.Equal(t, 1, core.createCalls)
+			require.Zero(t, out.NodeId)
+			require.Zero(t, out.Fh)
+		})
+	}
 }
 
 func TestRawFileSystemCreateDefersVanishedEntryLookupToKernel(t *testing.T) {
