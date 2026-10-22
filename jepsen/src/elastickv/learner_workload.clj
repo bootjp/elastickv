@@ -375,13 +375,18 @@
   Each start is paired with its OWN stop. Taking the first start and the
   first later stop examined one window and silently ignored every subsequent
   learner-isolation period, so a regression in the second or later window
-  could not fail the check."
+  could not fail the check. Only the completion acknowledging a successful
+  heal ends the window; invoking stop does not restore the network."
   [history]
   (let [nemesis (->> history (filter #(= :nemesis (:process %))) (sort-by :time))
         starts  (->> nemesis
                      (filter #(= :start-partition (:f %)))
                      (filter #(= :learners-only (get-in % [:value :scope]))))
-        stops   (->> nemesis (filter #(= :stop-partition (:f %))) (map :time) vec)]
+        stops   (->> nemesis
+                     (filter #(and (= :stop-partition (:f %))
+                                   (= :info (:type %))
+                                   (true? (get-in % [:value :healed]))))
+                     (map :time) vec)]
     (->> starts
          (map (fn [start]
                 (let [t (:time start)]
@@ -398,7 +403,9 @@
                                    (= :info (:type %))))
                      vec)
         stops   (->> nemesis
-                     (filter #(and (= :stop-partition (:f %)) (= :info (:type %))))
+                     (filter #(and (= :stop-partition (:f %))
+                                   (= :info (:type %))
+                                   (true? (get-in % [:value :healed]))))
                      vec)]
     (->> starts
          (keep (fn [start]

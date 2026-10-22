@@ -195,7 +195,7 @@
    [{:type :info :process :nemesis :f :start-partition
      :value {:scope :learners-only :lease-counters before} :time start}
     {:type :info :process :nemesis :f :stop-partition
-     :value {:scope :learners-only :lease-counters after} :time stop}]))
+     :value {:scope :learners-only :healed true :lease-counters after} :time stop}]))
 
 (deftest a-lease-read-failing-under-learner-isolation-is-rejected
   ;; Reads, not writes: quorumAckTracker feeds LastQuorumAck and the
@@ -245,6 +245,22 @@
         failures (lw/learner-partition-read-failures history)]
     (is (= ["during isolation"] (mapv :error failures)))
     (is (= [250] (mapv :time failures)))))
+
+(deftest isolation-ends-at-the-confirmed-heal-not-the-stop-invocation
+  (doseq [invocation-type [:invoke :info]]
+    (let [history (concat (partition-window 100 300)
+                          [{:type invocation-type :process :nemesis
+                            :f :stop-partition :time 200}
+                           {:type :invoke :f :read :process 1 :time 250}
+                           {:type :fail :f :read :process 1 :time 350
+                            :value {:lease? true} :error "still isolated"}
+                           {:type :invoke :f :read :process 1 :time 400}
+                           {:type :fail :f :read :process 1 :time 410
+                            :value {:lease? true} :error "already healed"}])]
+      (is (= [[100 300]] (lw/learner-partition-windows history)))
+      (is (= ["still isolated"]
+             (mapv :error (lw/learner-partition-read-failures history))))
+      (is (empty? (lw/unmeasured-partition-windows history))))))
 
 ;; ---------------------------------------------------------------------------
 ;; The checker must not pass a run that proved nothing
@@ -550,7 +566,8 @@
       (is (= [:partition-installed :counter-sampled] @events))
 
       (reset! events [])
-      (nemesis/invoke! n test {:type :info :f :stop-partition})
+      (is (true? (get-in (nemesis/invoke! n test {:type :info :f :stop-partition})
+                         [:value :healed])))
       (is (= [:counter-sampled :partition-healed] @events)))))
 
 (deftest the-learner-partition-runs-once-not-in-a-cycle
