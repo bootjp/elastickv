@@ -38,7 +38,8 @@ Date: 2026-04-29
 | 9C-2 | Sidecar/KEK observability: `active_dek_id{purpose}`, `sidecar_raft_index`, `kek_unwrap_seconds` (§9.2) | shipped | — |
 | 9C-3 | Startup KEK-unwrap memoization: collapses the guard + hydration double-unwrap that Stage 9B's KMS providers turned into doubled startup round-trips | shipped | — |
 | 9D | Encrypted Jepsen acceptance gate (§8.4): `elastickv-admin encryption wrap-dek` (local KEK-wrap helper so an operator or a script can produce the `bootstrap` / `rotate-dek` material without hand-rolling AES-GCM), `scripts/jepsen-enable-encryption.sh` (bootstrap → `enable-storage-envelope` → `enable-raft-envelope` → wait for every member), `scripts/run-jepsen-local.sh --encrypted`, and an `encryption: [off, on]` matrix on the per-push `Jepsen Test` workflow so every Redis / DynamoDB / S3 / SQS / filesystem workload also runs against an encrypted 3-node cluster. | shipped | this PR |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks (§5.2, §5.4, §6.5, §8.3) | open | — |
+| 9C-6 | §5.4 rewrite-job decisions: `ClassifyMVCCRewrite` (which MVCC versions a rotation must re-encrypt, iterating `(user_key, version_ts)` rather than `user_key`, so history under the retiring DEK is not left behind) and `RewriteThrottle` (the `--rate=N MiB/s` inter-batch yield, using a virtual deadline that advances for every batch so a stalled job cannot bank idle time and burst). Decision layer only — no store, no clock, no Raft. | shipped | — |
+| 9C+ | Rotation budget/rewrap/retire, the rewrite job's execution half, admission-control wiring, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), and remaining benchmarks (§5.2, §5.4, §6.5, §8.3) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
