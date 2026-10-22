@@ -124,6 +124,7 @@ func resetFlags(t *testing.T) {
 	*address = "127.0.0.1:50051"
 	*tokenFile = ""
 	*tlsCAFile = ""
+	*tlsServerName = ""
 	_ = flag.CommandLine // touch to avoid unused import on future trims
 }
 
@@ -173,6 +174,10 @@ func TestRunSendsMigrationControllerToken(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "token")
 	require.NoError(t, os.WriteFile(path, []byte("test-migration-token\n"), 0o600))
 	*tokenFile = path
+	*tlsServerName = "wrong.invalid"
+	require.ErrorContains(t, run(), "certificate")
+	require.Empty(t, svc.jobs)
+	*tlsServerName = "example.com"
 	require.NoError(t, run())
 	require.Equal(t, uint64(7), <-svc.jobs)
 	*abandonJobID = 0

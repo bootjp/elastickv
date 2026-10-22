@@ -2,6 +2,7 @@
   "Jepsen DB adapter that builds, deploys, and manages elastickv nodes."
   (:require [clojure.java.io :as io]
             [clojure.java.shell :as sh]
+            [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [jepsen [db :as db]
                     [util :as util]]
@@ -78,6 +79,73 @@
         (c/upload (str build-dir "/" bin) (str bin-dir "/" bin))
         (c/exec :chmod "755" (str bin-dir "/" bin))))))
 
+(defn raftadmin-binary
+  "Path to the uploaded raftadmin helper. Exposed so workloads that drive
+  membership changes do not each hardcode it."
+  []
+  raftadmin-bin)
+
+(defn parse-raft-status
+  "Parses `raftadmin status` output into a keyword map.
+
+  Numeric fields come back as longs and quoted strings unquoted, so a caller
+  can ask for :commit_index or :applied_index without re-deriving the format."
+  [out]
+  (->> (str/split-lines (or out ""))
+       (keep (fn [line]
+               (when-let [[_ k v] (re-matches #"\s*([a-z_]+):\s+(.*)" line)]
+                 (let [v (str/trim v)]
+                   [(keyword k)
+                    (cond
+                      (re-matches #"-?\d+" v) (Long/parseLong v)
+                      (and (> (count v) 1)
+                           (str/starts-with? v "\"")
+                           (str/ends-with? v "\""))
+                      (subs v 1 (dec (count v)))
+                      :else v)]))))
+       (into {})))
+
+(defn raft-status
+  "Runs `raftadmin status` from node against addr and returns the parsed map."
+  [node addr]
+  (parse-raft-status
+    (c/on node (c/su (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
+                             raftadmin-bin addr "status")))))
+
+(def ^:private metrics-port 9090)
+
+(defn parse-lease-read-counters
+  "Reads lease outcomes independently of const-label order."
+  [out]
+  (let [samples (keep (fn [line]
+                        (when-let [[_ labels value]
+                                   (re-matches #"elastickv_lease_read_total\{(.*)\}\s+([0-9.eE+-]+)\s*" line)]
+                          (when-let [[_ outcome]
+                                     (re-find #"(?:^|,)outcome=\"(hit|miss)\"(?:,|$)" labels)]
+                            [(keyword outcome) (long (Double/parseDouble value))])))
+                      (str/split-lines (or out "")))
+        counts  (reduce (fn [acc [outcome n]] (update acc outcome (fnil + 0) n))
+                        {} samples)]
+    (when (contains? counts :hit)
+      (merge {:miss 0} counts))))
+
+(defn lease-read-counters
+  "Reads elastickv_lease_read_total{outcome=...} from a node's metrics
+  endpoint, as {:hit n :miss n}.
+
+  This is the only direct evidence of which read path ran. A lease read that
+  loses the fast path falls back to LinearizableRead instead of failing, so
+  latency alone cannot identify the regression.
+
+  Returns nil when the endpoint is unreachable, so callers can distinguish no
+  samples from zero misses."
+  [node]
+  (try
+    (let [out (c/on node
+                (c/su (c/exec :curl :--connect-timeout 2 :--max-time 5 :-fsS
+                              (str "http://127.0.0.1:" metrics-port "/metrics"))))]
+      (parse-lease-read-counters out))
+    (catch Exception _ nil)))
 (defn- provision-kek!
   "Writes the test-only file KEK before the encryption-capable server starts."
   [node]
@@ -142,7 +210,7 @@
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
-           filesystem-mount encryption migration-enabled bootstrap?]}]
+           filesystem-mount encryption migration-enabled bootstrap? join-as-learner join-members]}]
   (cond-> ["--address" grpc
            "--redisAddress" redis
            "--raftId" (name node)
@@ -162,7 +230,9 @@
     encryption (conj "--encryptionSidecarPath" sidecar-file
                      "--encryption-enabled"
                      "--kekFile" kek-file)
-    bootstrap? (conj "--raftBootstrap")))
+    bootstrap? (conj "--raftBootstrap")
+    join-as-learner (conj "--raftJoinAsLearner")
+    (and join-as-learner join-members) (conj "--raftJoinMembers" join-members)))
 
 (defn- filesystem-mount-dir
   "Resolves the FUSE mount directory for node from the :filesystem-mount
@@ -242,7 +312,7 @@
         (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -268,7 +338,8 @@
                 :raft-s3-map raft-s3-map :raft-sqs-map raft-sqs-map
                 :raft-groups raft-groups :shard-ranges shard-ranges
                 :filesystem-mount mount-dir :encryption encryption :migration-enabled migration-enabled
-                :bootstrap? bootstrap?})
+                :bootstrap? bootstrap? :join-as-learner join-as-learner
+                :join-members join-members})
         effective-server-env (cond-> (or server-env {})
                                migration-enabled
                                (merge {"ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE" "true"
@@ -324,6 +395,28 @@
       (c/exec :env "RAFTADMIN_ALLOW_INSECURE=true"
               raftadmin-bin leader-addr "add_voter" peer-id peer-addr "0"))))
 
+(defn join-members-arg
+  "The --raftJoinMembers value for a learner candidate: raftID=host:port pairs.
+
+  The candidate is included at its own listener address. resolveJoinServers
+  rejects a list that omits the local --raftId or gives it another address, so
+  the candidate must remain present even though setup does not add it as a
+  voter."
+  [nodes reserved grpc-port]
+  (let [reserved (when reserved (name reserved))
+        members  (->> nodes
+                      (map name)
+                      (remove #(= reserved %)))]
+    (->> (if reserved (conj (vec members) reserved) (vec members))
+         (map #(str % "=" % ":" grpc-port))
+         (clojure.string/join ","))))
+
+(defn voter-peers
+  "The peers setup joins as voters: every node after the bootstrap one, minus
+  any reserved learner candidate."
+  [nodes reserved]
+  (let [reserved (when reserved (name reserved))]
+    (vec (remove #(= reserved (name %)) (rest nodes)))))
 (defn encryption-endpoint
   "Returns the default Raft group's gRPC address for EncryptionAdmin."
   [node grpc-port raft-groups]
@@ -411,6 +504,20 @@
                           {:endpoint endpoint})))
         (encryption-command! node (args-fn endpoint full-node-id local-epoch))))))
 
+(defn await-node-encryption!
+  "Waits for an attached member to apply both envelope cutovers."
+  [controller-node endpoint]
+  (util/await-fn
+    (fn []
+      (let [state (encryption-status controller-node endpoint)]
+        (when-not (and (:storage-envelope-active state)
+                       (:raft-envelope-active state))
+          (throw (ex-info "encryption envelopes are not active on member"
+                          {:endpoint endpoint :state state})))
+        true))
+    {:timeout 60000
+     :log-message (str "waiting for both envelope cutovers on " endpoint)}))
+
 (defn- activate-encryption!
   "Bootstraps both DEKs, activates both envelopes, and verifies every member."
   [test node grpc-port raft-groups]
@@ -424,26 +531,22 @@
     (cutover-encryption! node peers enable-storage-envelope-args)
     (cutover-encryption! node peers enable-raft-envelope-args)
     (doseq [peer (:nodes test)]
-      (let [peer-endpoint (encryption-endpoint peer grpc-port raft-groups)]
-        (util/await-fn
-          (fn []
-            (let [state (encryption-status node peer-endpoint)]
-              (when-not (and (:storage-envelope-active state)
-                             (:raft-envelope-active state))
-                (throw (ex-info "encryption envelopes are not active on member"
-                                {:endpoint peer-endpoint :state state})))
-              true))
-          {:timeout 60000
-           :log-message (str "waiting for both envelope cutovers on " peer)})))
+      (await-node-encryption! node (encryption-endpoint peer grpc-port raft-groups)))
     (info "encryption active on every node")))
 
 (defn- node-start-opts
-  [test opts]
-  (merge {:data-dir data-dir
-          :grpc-port (or (:grpc-port opts) 50051)
-          :redis-port (or (:redis-port opts) 6379)
-          :bootstrap-node (first (:nodes test))}
-         opts))
+  [test node opts]
+  (let [grpc-port (or (:grpc-port opts) 50051)
+        reserved  (:reserve-learner opts)
+        learner?  (and reserved (= (name node) (name reserved)))]
+    (merge {:data-dir data-dir
+            :grpc-port grpc-port
+            :redis-port (or (:redis-port opts) 6379)
+            :bootstrap-node (first (:nodes test))}
+           opts
+           (when learner?
+             {:join-as-learner true
+              :join-members (join-members-arg (:nodes test) reserved grpc-port)}))))
 
 (defn- wait-for-node-grpc!
   [node opts]
@@ -485,7 +588,7 @@
   [test peer opts]
   (when-let [mount-dir (filesystem-mount-dir (:filesystem-mount opts) peer)]
     (stop-node! peer)
-    (start-node! test peer (node-start-opts test opts))
+    (start-node! test peer (node-start-opts test peer opts))
     (wait-for-node-grpc! peer opts)
     (wait-for-mount! peer mount-dir)
     (info "filesystem mounted on joined peer" peer)))
@@ -495,11 +598,15 @@
   [test node opts]
   (wait-for-node-grpc! node opts)
   (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
-  (doseq [peer (rest (:nodes test))]
+  (doseq [peer (voter-peers (:nodes test) (:reserve-learner opts))]
     (join-peer! node peer opts)
     (enable-peer-mount! test peer opts))
+  (when-let [candidate (:reserve-learner opts)]
+    (wait-for-node-grpc! candidate opts))
   (when (:encryption opts)
-    (activate-encryption! test node (or (:grpc-port opts) 50051)
+    (activate-encryption! (assoc test :nodes (into [(first (:nodes test))]
+                                                 (voter-peers (:nodes test) (:reserve-learner opts))))
+                          node (or (:grpc-port opts) 50051)
                           (:raft-groups opts))))
 
 (defrecord ElastickvDB [opts]
@@ -514,7 +621,7 @@
     (when (:encryption opts)
       (provision-kek! node))
     (let [bootstrap? (= node (first (:nodes test)))
-          start-opts (node-start-opts test opts)]
+          start-opts (node-start-opts test node opts)]
       ;; Only the bootstrap node mounts immediately; peers are restarted with
       ;; their mount by enable-peer-mount! once they have joined.
       (start-node! test node (if bootstrap?
@@ -548,7 +655,7 @@
 
   db/Kill
   (start! [this test node]
-    (start-node! test node (node-start-opts test opts))
+    (start-node! test node (node-start-opts test node opts))
     (wait-for-node-grpc! node opts)
     (wait-for-mount! node (filesystem-mount-dir (:filesystem-mount opts) node))
     (info "node started" node)

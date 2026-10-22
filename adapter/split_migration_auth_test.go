@@ -20,6 +20,7 @@ func TestSplitMigrationRolloutRejectsJobInjectionBeforeEnforcement(t *testing.T)
 	for _, token := range []string{"", "migration-secret"} {
 		unary, _ := SplitMigrationTokenAuth(token, false, false)
 		for _, mutation := range []*pb.Mutation{
+			{Op: pb.Op_DEL_PREFIX},
 			{Op: pb.Op_PUT, Key: distribution.CatalogSplitJobKey(7)},
 			{Op: pb.Op_DEL, Key: distribution.CatalogSplitJobHistoryKey(1000, 7)},
 			{Op: pb.Op_PUT, Key: distribution.CatalogNextSplitJobIDKey()},

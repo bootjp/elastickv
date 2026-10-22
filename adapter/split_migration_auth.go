@@ -108,7 +108,7 @@ func splitJobControlMutation(mutation *pb.Mutation) bool {
 	if distribution.IsCatalogSplitJobKey(key) || distribution.IsCatalogSplitJobHistoryKey(key) || bytes.Equal(key, distribution.CatalogNextSplitJobIDKey()) {
 		return true
 	}
-	if mutation.GetOp() != pb.Op_DEL_PREFIX || len(key) == 0 {
+	if mutation.GetOp() != pb.Op_DEL_PREFIX {
 		return false
 	}
 	return bytes.HasPrefix(distribution.CatalogSplitJobKey(0), key) ||

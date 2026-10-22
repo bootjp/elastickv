@@ -27,6 +27,17 @@
         (is (= (when enabled? "true")
                (get-in @started [:opts :env (str "ELASTICKV_ENABLE_MIGRATION_" opcode "_OPCODE")])))))))
 
+(deftest lease-counters-accept-production-const-labels
+  (is (= {:hit 2 :miss 1}
+         (db/parse-lease-read-counters
+           (str "# TYPE elastickv_lease_read_total counter\n"
+                "elastickv_lease_read_total{node_address=\"10.0.0.1:50051\",node_id=\"n1\",outcome=\"hit\"} 2\n"
+                "elastickv_lease_read_total{outcome=\"miss\",node_id=\"n1\",node_address=\"10.0.0.1:50051\"} 1\n"))))
+  (is (= {:hit 1000 :miss 0}
+         (db/parse-lease-read-counters "elastickv_lease_read_total{outcome=\"hit\"} 1e3")))
+  (is (nil? (db/parse-lease-read-counters "other_metric{outcome=\"hit\"} 7")))
+  (is (nil? (db/parse-lease-read-counters "elastickv_lease_read_total{other_outcome=\"hit\"} 7"))))
+
 (defn- bash-parses? [script]
   (zero? (:exit (sh/sh "bash" "-n" "-c" script))))
 

@@ -34,12 +34,12 @@ const (
 // startReaper kicks off the retention sweeper on the leader. It is
 // safe to call multiple times; the first call wins and subsequent
 // calls are no-ops. Stop() cancels the context so the goroutine
-// returns promptly.
+// returns promptly, and joins it (bounded) before returning.
 func (s *SQSServer) startReaper(ctx context.Context) {
 	if s == nil || s.coordinator == nil || s.store == nil {
 		return
 	}
-	go s.runReaper(ctx)
+	s.workers.start(func() { s.runReaper(ctx) })
 }
 
 func (s *SQSServer) runReaper(ctx context.Context) {

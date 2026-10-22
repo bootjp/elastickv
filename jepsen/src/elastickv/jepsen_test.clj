@@ -1,6 +1,7 @@
 (ns elastickv.jepsen-test
   (:gen-class)
-  (:require [elastickv.redis-workload :as redis-workload]
+  (:require [elastickv.learner-workload :as learner-workload]
+            [elastickv.redis-workload :as redis-workload]
             [elastickv.redis-zset-safety-workload :as zset-safety-workload]
             [elastickv.dynamodb-workload :as dynamodb-workload]
             [elastickv.dynamodb-types-workload :as dynamodb-types-workload]
@@ -30,6 +31,10 @@
   ([] (elastickv-filesystem-test {}))
   ([opts] (filesystem-workload/elastickv-filesystem-test opts)))
 
+(defn elastickv-learner-test
+  ([] (elastickv-learner-test {}))
+  ([opts] (learner-workload/elastickv-learner-test opts)))
+
 (defn elastickv-zset-safety-test
   ([] (elastickv-zset-safety-test {}))
   ([opts] (zset-safety-workload/elastickv-zset-safety-test opts)))
@@ -48,7 +53,8 @@
    "elastickv-dynamodb-test"    elastickv-dynamodb-test
    "elastickv-s3-test"          elastickv-s3-test
    "elastickv-filesystem-test"  elastickv-filesystem-test
-   "elastickv-split-test"       elastickv-split-test})
+   "elastickv-split-test"       elastickv-split-test
+   "elastickv-learner-test"     elastickv-learner-test})
 
 (defn elastickv-sqs-htfifo-test
   "HT-FIFO Jepsen test (PR 7b). Run via the workload's own -main:
@@ -65,8 +71,8 @@
 
   Supported <test-name>s: elastickv-test, elastickv-zset-safety-test,
   elastickv-dynamodb-test, elastickv-s3-test, elastickv-filesystem-test,
-  elastickv-split-test. When the first positional arg is not a known test name,
-  we default to `elastickv-test` for
+  elastickv-split-test, elastickv-learner-test. When the first positional arg is not a known test
+  name, we default to `elastickv-test` for
   backward compatibility and forward ALL args to jepsen.cli/run!.
 
   The jepsen subcommand (`test` or `analyze`) is auto-prepended when

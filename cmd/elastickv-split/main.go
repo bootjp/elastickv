@@ -50,6 +50,7 @@ var (
 	getJobID        = flag.Uint64("get-job-id", 0, "Print one migration job; mutually exclusive with mutation flags")
 	tokenFile       = flag.String("token-file", "", "File containing the dedicated migration controller bearer token; not the read-only Admin token")
 	tlsCAFile       = flag.String("tls-ca-file", "", "PEM CA certificates for verified gRPC TLS; token-file always requires TLS (system roots if omitted)")
+	tlsServerName   = flag.String("tls-server-name", "", "Expected TLS server name when different from the address; implies verified TLS")
 )
 
 func main() {
@@ -116,7 +117,7 @@ func run() error {
 
 func splitDialOptions() ([]grpc.DialOption, error) {
 	opts := []grpc.DialOption{internalutil.GRPCCallOptions()}
-	if *tokenFile == "" && *tlsCAFile == "" {
+	if *tokenFile == "" && *tlsCAFile == "" && *tlsServerName == "" {
 		return append(opts, grpc.WithTransportCredentials(insecure.NewCredentials())), nil
 	}
 	creds, err := internalutil.GRPCClientTLSCredentials(*tlsCAFile)
@@ -124,6 +125,9 @@ func splitDialOptions() ([]grpc.DialOption, error) {
 		return nil, errors.Wrap(err, "load split TLS credentials")
 	}
 	opts = append(opts, grpc.WithTransportCredentials(creds))
+	if *tlsServerName != "" {
+		opts = append(opts, grpc.WithAuthority(*tlsServerName))
+	}
 	if *tokenFile != "" {
 		token, err := internalutil.LoadBearerTokenFile(*tokenFile, maxMigrationTokenBytes, "migration token")
 		if err != nil {
