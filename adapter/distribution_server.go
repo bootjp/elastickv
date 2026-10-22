@@ -44,6 +44,7 @@ type DistributionServer struct {
 	splitMigrationVoterFactory  SplitMigrationVoterFactory
 	knownRaftGroups             map[uint64]struct{}
 	splitJobHistoryGCLast       time.Time
+	splitJobFailures            map[uint64]splitJobFailureState
 	reloadRetry                 struct {
 		attempts int
 		interval time.Duration
@@ -362,7 +363,7 @@ func (s *DistributionServer) RunSplitJobRunnerOnce(ctx context.Context) error {
 				return gateErr
 			}
 		}
-		return s.runSplitJobPhase(ctx, job)
+		return s.runSplitJobAttempt(ctx, job)
 	}
 	return s.gcSplitJobHistory(ctx, jobs, time.Now())
 }
@@ -986,6 +987,9 @@ func normalizeSplitMigrationSplitKey(req *pb.StartSplitMigrationRequest) []byte 
 }
 
 func (s *DistributionServer) GetSplitJob(ctx context.Context, req *pb.GetSplitJobRequest) (*pb.GetSplitJobResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	if req.GetJobId() == 0 {
 		return nil, grpcStatusError(codes.InvalidArgument, distribution.ErrCatalogSplitJobIDRequired.Error())
 	}
@@ -1003,6 +1007,9 @@ func (s *DistributionServer) GetSplitJob(ctx context.Context, req *pb.GetSplitJo
 }
 
 func (s *DistributionServer) ListSplitJobs(ctx context.Context, req *pb.ListSplitJobsRequest) (*pb.ListSplitJobsResponse, error) {
+	if err := s.requireReadReady(); err != nil {
+		return nil, err
+	}
 	if s.catalog == nil {
 		return nil, grpcStatusError(codes.FailedPrecondition, errDistributionCatalogNotConfigured.Error())
 	}

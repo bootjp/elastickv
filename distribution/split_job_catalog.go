@@ -612,7 +612,7 @@ func (job SplitJob) retryPhaseValidForPhase() bool {
 }
 
 func (job SplitJob) abandonFromPhaseValidForPhase() bool {
-	if job.Phase == SplitJobPhaseAbandoning {
+	if job.Phase == SplitJobPhaseAbandoning || (job.Phase == SplitJobPhaseFailed && job.RetryPhase == SplitJobPhaseAbandoning) {
 		return job.AbandonFromPhase.abandonable()
 	}
 	return job.AbandonFromPhase == SplitJobPhaseNone
@@ -620,17 +620,17 @@ func (job SplitJob) abandonFromPhaseValidForPhase() bool {
 
 func (p SplitJobPhase) retryable() bool {
 	switch p {
-	case SplitJobPhaseBackfill,
+	case SplitJobPhasePlanned,
+		SplitJobPhaseAbandoning,
+		SplitJobPhaseBackfill,
 		SplitJobPhaseFence,
 		SplitJobPhaseDeltaCopy,
 		SplitJobPhaseCutover,
 		SplitJobPhaseCleanup:
 		return true
 	case SplitJobPhaseNone,
-		SplitJobPhasePlanned,
 		SplitJobPhaseDone,
 		SplitJobPhaseFailed,
-		SplitJobPhaseAbandoning,
 		SplitJobPhaseAbandoned:
 		return false
 	default:

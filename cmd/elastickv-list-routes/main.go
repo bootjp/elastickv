@@ -41,6 +41,7 @@ import (
 	"os"
 	"time"
 
+	internalutil "github.com/bootjp/elastickv/internal"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -49,7 +50,12 @@ import (
 
 const rpcTimeout = 10 * time.Second
 
-var address = flag.String("address", "127.0.0.1:50051", "gRPC address of an elastickv server (any node works — the Distribution service is replicated)")
+var (
+	address       = flag.String("address", "127.0.0.1:50051", "gRPC address of an elastickv server (any node works — the Distribution service is replicated)")
+	tlsEnabled    = flag.Bool("tls", false, "Use verified TLS with system roots unless tls-ca-file is provided")
+	tlsCAFile     = flag.String("tls-ca-file", "", "PEM CA certificates for verified gRPC TLS; implies TLS")
+	tlsServerName = flag.String("tls-server-name", "", "Expected TLS server name when different from the address; implies TLS")
+)
 
 // routeJSON is the on-the-wire shape this tool emits.  Field names
 // are snake_case to match the proto's wire format; Start/End are
@@ -76,7 +82,11 @@ func main() {
 }
 
 func run() error {
-	conn, err := grpc.NewClient(*address, grpc.WithTransportCredentials(insecure.NewCredentials()))
+	opts, err := routesDialOptions()
+	if err != nil {
+		return err
+	}
+	conn, err := grpc.NewClient(*address, opts...)
 	if err != nil {
 		return errors.Wrapf(err, "dial %s", *address)
 	}
@@ -98,6 +108,22 @@ func run() error {
 		return errors.Wrap(err, "ListRoutes")
 	}
 	return emit(resp, os.Stdout)
+}
+
+func routesDialOptions() ([]grpc.DialOption, error) {
+	opts := []grpc.DialOption{internalutil.GRPCCallOptions()}
+	if !*tlsEnabled && *tlsCAFile == "" && *tlsServerName == "" {
+		return append(opts, grpc.WithTransportCredentials(insecure.NewCredentials())), nil
+	}
+	creds, err := internalutil.GRPCClientTLSCredentials(*tlsCAFile)
+	if err != nil {
+		return nil, errors.Wrap(err, "load route-list TLS credentials")
+	}
+	opts = append(opts, grpc.WithTransportCredentials(creds))
+	if *tlsServerName != "" {
+		opts = append(opts, grpc.WithAuthority(*tlsServerName))
+	}
+	return opts, nil
 }
 
 // emit serialises resp as JSON to w.  Extracted from run() so the

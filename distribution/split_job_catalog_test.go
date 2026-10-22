@@ -151,9 +151,9 @@ func TestSplitJobCodecRejectsInvalidRestartPhases(t *testing.T) {
 			retryPhase: SplitJobPhaseNone,
 		},
 		{
-			name:       "failed retry to planned",
+			name:       "failed abandoning without origin",
 			phase:      SplitJobPhaseFailed,
-			retryPhase: SplitJobPhasePlanned,
+			retryPhase: SplitJobPhaseAbandoning,
 		},
 		{
 			name:       "failed retry to terminal",

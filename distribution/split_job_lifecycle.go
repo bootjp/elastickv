@@ -23,9 +23,23 @@ func RetrySplitJobState(job SplitJob, nowMs int64) (SplitJob, error) {
 	}
 	out.Phase = out.RetryPhase
 	out.RetryPhase = SplitJobPhaseNone
-	out.AbandonFromPhase = SplitJobPhaseNone
+	if out.Phase != SplitJobPhaseAbandoning {
+		out.AbandonFromPhase = SplitJobPhaseNone
+	}
 	out.LastError = ""
 	out.UpdatedAtMs = nowMs
+	return out, nil
+}
+
+// FailSplitJobState preserves the exact phase and cleanup witnesses required
+// for an explicit operator retry. It never drops fences or retention pins.
+func FailSplitJobState(job SplitJob, diagnostic string, nowMs int64) (SplitJob, error) {
+	if !job.Phase.retryable() {
+		return SplitJob{}, errors.WithStack(ErrCatalogInvalidSplitJobPhase)
+	}
+	out := CloneSplitJob(job)
+	out.Phase, out.RetryPhase = SplitJobPhaseFailed, job.Phase
+	out.LastError, out.UpdatedAtMs = diagnostic, nowMs
 	return out, nil
 }
 
@@ -100,9 +114,9 @@ func (s *CatalogStore) LiveSplitJobForUpdate(ctx context.Context, jobID uint64) 
 
 func splitJobRetryPhaseAllowed(phase SplitJobPhase) bool {
 	switch phase {
-	case SplitJobPhaseBackfill, SplitJobPhaseFence, SplitJobPhaseDeltaCopy, SplitJobPhaseCutover, SplitJobPhaseCleanup:
+	case SplitJobPhasePlanned, SplitJobPhaseBackfill, SplitJobPhaseFence, SplitJobPhaseDeltaCopy, SplitJobPhaseCutover, SplitJobPhaseCleanup, SplitJobPhaseAbandoning:
 		return true
-	case SplitJobPhaseNone, SplitJobPhasePlanned, SplitJobPhaseDone, SplitJobPhaseFailed, SplitJobPhaseAbandoning, SplitJobPhaseAbandoned:
+	case SplitJobPhaseNone, SplitJobPhaseDone, SplitJobPhaseFailed, SplitJobPhaseAbandoned:
 		return false
 	}
 	return false
