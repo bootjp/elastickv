@@ -1499,6 +1499,10 @@ func (f *kvFSM) Snapshot() (raftengine.Snapshot, error) {
 }
 
 func (f *kvFSM) Restore(r io.Reader) error {
+	return f.restoreSnapshot(r, f.store.Restore)
+}
+
+func (f *kvFSM) restoreSnapshot(r io.Reader, restoreStore func(io.Reader) error) error {
 	// Stage 8a §3.2: the bufio.Reader is owned by the caller (us) and
 	// MUST be passed unchanged to the inner-store path on every branch
 	// — buffered bytes can sit between the header consumption and the
@@ -1514,6 +1518,9 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	if err := restoreStore(io.NopCloser(br)); err != nil {
+		return errors.WithStack(err)
+	}
 	if f.hlc != nil && ceilingU > 0 {
 		f.hlc.SetPhysicalCeiling(int64(ceilingU)) //nolint:gosec // ceiling is a Unix ms timestamp encoded as uint64
 	}
@@ -1521,9 +1528,6 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	// 6E's apply-hook to read on the next apply. Stays 0 for v1 and
 	// headerless-legacy restores.
 	f.restoredCutover = cutover
-	if err := f.store.Restore(io.NopCloser(br)); err != nil {
-		return errors.WithStack(err)
-	}
 	checkpoint, err = f.checkpointForDurableFSM(checkpoint, false)
 	if err != nil {
 		return err
