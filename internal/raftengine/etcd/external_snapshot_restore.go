@@ -132,6 +132,12 @@ func prepareExternalSnapshotRestore(
 			"copied payload has %s, expected %s", payloadSHA, opts.ExpectedPayloadSHA256)
 	}
 	token := encodeSnapshotToken(opts.Index, crc)
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := writeExternalRestoreOrigin(tempDir, opts, crc); err != nil {
+		return nil, err
+	}
 	if err := seedExternalSnapshotRestoreDir(ctx, tempDir, opts, token); err != nil {
 		return nil, err
 	}

@@ -710,6 +710,10 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
 	}
+	if err := completeExternalRestoreOrigin(prepared.cfg.DataDir, prepared.disk.ExternalRestoreValidated); err != nil {
+		_ = closePersist(prepared.disk.Persist)
+		return nil, err
+	}
 	engine.initTransport(prepared.cfg)
 	engine.initSnapshotWorker()
 	engine.refreshStatus()

@@ -34,7 +34,8 @@ type diskState struct {
 	// already represented in the FSM. Zero when no override applies
 	// (legacy path / execute-restore path); the engine then falls
 	// back to maxAppliedIndex(LocalSnap). Codex P1 #934.
-	EffectiveApplied uint64
+	EffectiveApplied         uint64
+	ExternalRestoreValidated bool
 }
 
 func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
@@ -42,6 +43,13 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	walDir := filepath.Join(cfg.DataDir, walDirName)
 	snapDir := filepath.Join(cfg.DataDir, snapDirName)
 	fsmSnapDir := filepath.Join(cfg.DataDir, fsmSnapDirName)
+	marker, err := readExternalRestoreOrigin(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	if marker != nil && !wal.Exist(walDir) {
+		return nil, errors.Wrap(ErrExternalSnapshotRestoreOrigin, "external restore requires its prepared WAL")
+	}
 
 	if err := prepareDataDirs(cfg.DataDir, snapDir, fsmSnapDir); err != nil {
 		return nil, err
@@ -159,7 +167,7 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 		return nil, err
 	}
 	committedReplayTarget := coldStartReplayTarget(snapshot, hardState)
-	effectiveApplied, err := restoreSnapshotState(fsm, snapshot, committedReplayTarget, fsmSnapDir, obs, logger)
+	effectiveApplied, externalValidated, err := restoreSnapshotWithOrigin(fsm, snapshot, committedReplayTarget, fsmSnapDir, obs, logger)
 	if err != nil {
 		if closeErr := w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after restoreSnapshotState error",
@@ -186,11 +194,25 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	}
 
 	return &diskState{
-		Storage:          storage,
-		Persist:          etcdstorage.NewStorage(logger, w, snapshotter),
-		LocalSnap:        snapshot,
-		EffectiveApplied: effectiveApplied,
+		Storage:                  storage,
+		Persist:                  etcdstorage.NewStorage(logger, w, snapshotter),
+		LocalSnap:                snapshot,
+		EffectiveApplied:         effectiveApplied,
+		ExternalRestoreValidated: externalValidated,
 	}, nil
+}
+
+func restoreSnapshotWithOrigin(fsm StateMachine, snapshot raftpb.Snapshot, target uint64, dir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, bool, error) {
+	marker, err := readExternalRestoreOrigin(filepath.Dir(dir))
+	if err != nil {
+		return 0, false, err
+	}
+	if marker != nil {
+		index, err := restoreWithExternalOrigin(fsm, snapshot, dir, marker)
+		return index, err == nil, err
+	}
+	index, err := restoreSnapshotState(fsm, snapshot, target, dir, obs, logger)
+	return index, false, err
 }
 
 // reportColdStartExecute emits the executed-arm of the cold-start
