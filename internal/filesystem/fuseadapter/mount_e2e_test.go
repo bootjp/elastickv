@@ -180,6 +180,7 @@ func assertOneCreatedDescriptor(t *testing.T, first, second *os.File) {
 type collidingMountCore struct {
 	fuseadapter.Core
 	ready      chan struct{}
+	createMu   sync.Mutex
 	creates    atomic.Int32
 	collisions atomic.Int32
 }
@@ -195,6 +196,11 @@ func (c *collidingMountCore) Create(ctx context.Context, parent uint64, name []b
 			return filesystem.CreateResult{}, context.DeadlineExceeded
 		}
 	}
+	// Exercise a definite EEXIST, not a concurrent OCC failure whose commit
+	// outcome the adapter cannot safely replay. The initial barrier above
+	// forces both mounts into FUSE_CREATE before either backend call finishes.
+	c.createMu.Lock()
+	defer c.createMu.Unlock()
 	result, err := c.Core.Create(ctx, parent, name, opts)
 	if errors.Is(err, filesystem.ErrExists) {
 		c.collisions.Add(1)
