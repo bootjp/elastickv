@@ -119,6 +119,20 @@ func (t *ActiveTimestampTracker) SetBackupTimestampFloorObserver(observer func(u
 	t.mu.Unlock()
 }
 
+// Replicated pin retention stays in the journal; only its timestamp-cache
+// invalidation notification is shared with legacy backup machinery.
+func (t *ActiveTimestampTracker) observeReplicatedBackupTimestampFloor(readTS uint64) {
+	if t == nil {
+		return
+	}
+	t.mu.Lock()
+	observer := t.backupFloorObserver
+	t.mu.Unlock()
+	if observer != nil {
+		observer(readTS)
+	}
+}
+
 func (t *ActiveTimestampTracker) Pin(ts uint64) *ActiveTimestampToken {
 	if t == nil || ts == 0 || ts == ^uint64(0) {
 		return &ActiveTimestampToken{}

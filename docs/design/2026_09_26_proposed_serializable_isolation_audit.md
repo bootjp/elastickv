@@ -5,7 +5,7 @@ Author: bootjp
 Date: 2026-09-26
 Related: `2026_09_26_proposed_positioning_and_roadmap.md` §5 and §6.3 (the
 claim this audit backs), `2026_08_29_proposed_tso_batch_slot_claims.md` and
-`2026_09_02_proposed_prephase_d_resolution_evidence.md` (timestamp
+`2026_09_02_partial_prephase_d_resolution_evidence.md` (timestamp
 uniqueness, which the conflict check assumes).
 
 ## 1. Claim and scope

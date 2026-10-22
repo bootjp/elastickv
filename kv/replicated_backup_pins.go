@@ -28,8 +28,10 @@ type replicatedBackupPins struct {
 	RetiredThrough uint64
 	PinGeneration  uint64
 	ReadFloor      uint64
-	Capacity       uint32
-	Active         map[uint64]replicatedBackupPin
+	// A released/expired backup never reopens admission of delayed writes.
+	WriteTimestampFloor uint64
+	Capacity            uint32
+	Active              map[uint64]replicatedBackupPin
 }
 
 type replicatedPinOperation byte
@@ -116,6 +118,7 @@ func (s *replicatedBackupPins) admit(command replicatedPinCommand) (bool, error)
 		return false, errors.WithStack(ErrTooManyActiveBackups)
 	}
 	s.Active[command.Identity.Generation] = pin
+	s.WriteTimestampFloor = max(s.WriteTimestampFloor, command.ReadTS)
 	return true, nil
 }
 

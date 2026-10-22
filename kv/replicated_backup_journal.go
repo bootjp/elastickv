@@ -91,7 +91,7 @@ func (r replicatedPinStateRecord) validate() error {
 		return err
 	}
 	for generation, pin := range r.Pins.Active {
-		if generation == 0 || !pin.validAtFloor(r.Pins.ReadFloor) {
+		if generation == 0 || !pin.validAtFloor(r.Pins.ReadFloor) || pin.ReadTS > r.Pins.WriteTimestampFloor {
 			return errors.New("invalid active replicated backup pin")
 		}
 	}
@@ -120,7 +120,7 @@ func (r replicatedPinStateRecord) validateAllocator() error {
 }
 
 func (r replicatedPinStateRecord) validHeader() bool {
-	return r.Version == replicatedPinStateVersion && r.AppliedIndex != 0 && r.Pins.Epoch != 0 && r.Pins.ReadFloor != math.MaxUint64
+	return r.Version == replicatedPinStateVersion && r.AppliedIndex != 0 && r.Pins.Epoch != 0 && r.Pins.ReadFloor != math.MaxUint64 && r.Pins.WriteTimestampFloor != math.MaxUint64
 }
 
 func (p replicatedBackupPin) validAtFloor(floor uint64) bool {

@@ -29,6 +29,9 @@ var backupTimestampFloorKey = []byte(txnBackupPrefix + "timestamp_floor")
 const backupTimestampFloorValueSize = 8
 
 func (f *kvFSM) applyBackup(data []byte) any {
+	if f.replicatedPins != nil && f.replicatedPins.snapshot().Pins.Epoch != 0 {
+		return errors.Wrap(ErrInvalidBackupPin, "legacy backup command rejected after epoch activation")
+	}
 	if f.readTracker == nil {
 		return haltErr(errors.Wrap(ErrBackupApply, "kv/fsm: backup entry arrived but no ActiveTimestampTracker is wired"))
 	}

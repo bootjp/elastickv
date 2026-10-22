@@ -7,7 +7,7 @@ import (
 )
 
 // The §4.3 closure of the pre-Phase-D resolution carve-out
-// (docs/design/2026_09_02_proposed_prephase_d_resolution_evidence.md).
+// (docs/design/2026_09_02_partial_prephase_d_resolution_evidence.md).
 //
 // The carve-out exists because a cross-shard transaction that began before the
 // Phase-D marker can still hold unresolved intents afterwards, and resolving

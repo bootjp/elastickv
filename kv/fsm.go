@@ -114,6 +114,8 @@ type kvFSM struct {
 	// timestamped before the backup cut and reached apply too late.
 	backupTimestampFloor atomic.Uint64
 	backupFloorLoadErr   error
+	replicatedPins       *replicatedPinJournal
+	replicatedPinLoadErr error
 }
 
 // RouteHistory is the kv-side interface to the route catalog's
@@ -297,6 +299,7 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
 		opt(f)
 	}
 	f.backupFloorLoadErr = f.reloadBackupTimestampFloor(context.Background())
+	f.replicatedPinLoadErr = f.reloadReplicatedBackupPins(context.Background())
 	f.snapLatch.log = f.log
 	observeStoreLastCommitTS(hlc, store)
 	return f
@@ -358,6 +361,9 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
+	if f.replicatedPinLoadErr != nil {
+		return replicatedBackupHalt(f.replicatedPinLoadErr, "load journal")
+	}
 	if f.backupFloorLoadErr != nil {
 		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
 	}
@@ -514,12 +520,10 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 		return f.applyMigrationRetire(ctx, data[1:]), true
 	case data[0] == raftEncodeMigrationPromote:
 		return f.applyMigrationPromote(ctx, data[1:]), true
-	case data[0] == raftEncodeBackup:
-		return f.applyBackup(data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
-		return nil, false
+		return f.applyBackupOpcode(ctx, data[0], data[1:])
 	}
 }
 
@@ -1079,6 +1083,10 @@ func (f *kvFSM) Restore(r io.Reader) error {
 	f.backupFloorLoadErr = f.reloadBackupTimestampFloor(context.Background())
 	if f.backupFloorLoadErr != nil {
 		return errors.Wrap(f.backupFloorLoadErr, "restore backup timestamp floor")
+	}
+	f.replicatedPinLoadErr = f.reloadReplicatedBackupPins(context.Background())
+	if f.replicatedPinLoadErr != nil {
+		return errors.Wrap(f.replicatedPinLoadErr, "restore replicated backup pins")
 	}
 	observeStoreLastCommitTS(f.hlc, f.store)
 	return nil
