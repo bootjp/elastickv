@@ -2,9 +2,11 @@ package main
 
 import (
 	"context"
+	"encoding/pem"
 	"io"
 	"log/slog"
 	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -12,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -273,6 +276,7 @@ func TestRejectPlaintextOffloadEndpoint(t *testing.T) {
 		{name: "empty means the AWS default, which is https", endpoint: "", wantErr: false},
 		{name: "https without a host is refused", endpoint: "https://", wantErr: true},
 		{name: "opaque https URL is refused", endpoint: "https:example.com", wantErr: true},
+		{name: "malformed development endpoint is refused", endpoint: "http://", allow: true, wantErr: true},
 		{name: "http is refused", endpoint: "http://s3.example.com", wantErr: true},
 		{
 			// The AWS SDK resolves a scheme-less endpoint as http, so it is
@@ -317,19 +321,75 @@ func TestSnapshotOffloadRedirectPolicy(t *testing.T) {
 	}
 
 	httpsRedirect := redirect("https://s3.example.com/next", http.StatusTemporaryRedirect)
-	require.NoError(t, checkSnapshotOffloadRedirect(httpsRedirect, []*http.Request{origin}))
+	require.NoError(t, checkSnapshotOffloadRedirect(httpsRedirect, []*http.Request{origin}, false))
 
 	plaintextRedirect := redirect("http://s3.example.com/next", http.StatusTemporaryRedirect)
-	require.ErrorIs(t, checkSnapshotOffloadRedirect(plaintextRedirect, []*http.Request{origin}),
+	require.ErrorIs(t, checkSnapshotOffloadRedirect(plaintextRedirect, []*http.Request{origin}, false),
 		snapshotoffload.ErrInvalidOptions)
 
 	unsupportedRedirect := redirect("https://s3.example.com/next", http.StatusFound)
-	require.ErrorIs(t, checkSnapshotOffloadRedirect(unsupportedRedirect, []*http.Request{origin}),
+	require.ErrorIs(t, checkSnapshotOffloadRedirect(unsupportedRedirect, []*http.Request{origin}, false),
 		http.ErrUseLastResponse)
 
 	crossHost := redirect("https://other.example.com/next", http.StatusPermanentRedirect)
-	require.ErrorIs(t, checkSnapshotOffloadRedirect(crossHost, []*http.Request{origin}),
+	require.ErrorIs(t, checkSnapshotOffloadRedirect(crossHost, []*http.Request{origin}, false),
 		snapshotoffload.ErrInvalidOptions)
+}
+
+func TestSnapshotOffloadInsecureClientStillRestrictsRedirects(t *testing.T) {
+	previous := *snapshotOffloadAllowInsecureEndpoint
+	*snapshotOffloadAllowInsecureEndpoint = true
+	t.Cleanup(func() { *snapshotOffloadAllowInsecureEndpoint = previous })
+
+	base := &http.Client{Transport: &recordingRoundTripper{}}
+	wrapped, err := snapshotOffloadHTTPClient(base)
+	require.NoError(t, err)
+	client, ok := wrapped.(*http.Client)
+	require.True(t, ok)
+	origin, err := http.NewRequestWithContext(context.Background(), http.MethodPut,
+		"http://s3.example.com/object", nil)
+	require.NoError(t, err)
+	response, err := client.Do(origin)
+	require.NoError(t, err)
+	require.NoError(t, response.Body.Close())
+	redirect := origin.Clone(context.Background())
+	redirect.URL, err = url.Parse("http://other.s3.example.com/object")
+	require.NoError(t, err)
+	redirect.Response = &http.Response{StatusCode: http.StatusTemporaryRedirect}
+	require.ErrorIs(t, client.CheckRedirect(redirect, []*http.Request{origin}),
+		snapshotoffload.ErrInvalidOptions)
+}
+
+func TestSnapshotOffloadPreservesSDKCABundle(t *testing.T) {
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(server.Close)
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	require.NoError(t, os.WriteFile(caPath, pem.EncodeToMemory(&pem.Block{
+		Type: "CERTIFICATE", Bytes: server.Certificate().Raw,
+	}), 0o600))
+	t.Setenv("AWS_CA_BUNDLE", caPath)
+	t.Setenv("AWS_EC2_METADATA_DISABLED", "true")
+	previous := *snapshotOffloadAllowInsecureEndpoint
+	*snapshotOffloadAllowInsecureEndpoint = false
+	t.Cleanup(func() { *snapshotOffloadAllowInsecureEndpoint = previous })
+
+	var resolved aws.HTTPClient
+	store, err := snapshotoffload.NewS3Store(context.Background(), snapshotoffload.S3StoreConfig{
+		Bucket: "snapshot-test", Region: "us-east-1", Endpoint: server.URL,
+		ForcePathStyle: true, ServerSideEncryption: "AES256",
+		AccessKeyID: "test-key", SecretAccessKey: "test-secret",
+		HTTPClientDecorator: func(base aws.HTTPClient) (aws.HTTPClient, error) {
+			resolved = base
+			return snapshotOffloadHTTPClient(base)
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resolved, "the SDK must supply the CA-configured client")
+	_, found, err := store.HeadObject(context.Background(), "snapshot")
+	require.NoError(t, err, "the guarded client must trust the SDK CA bundle")
+	require.False(t, found)
 }
 
 type recordingRoundTripper struct {

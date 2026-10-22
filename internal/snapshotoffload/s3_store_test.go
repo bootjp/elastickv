@@ -62,7 +62,9 @@ func TestS3StoreUsesConfiguredHTTPClientOnlyForS3(t *testing.T) {
 		ServerSideEncryption: "AES256",
 		AccessKeyID:          "test-access-key",
 		SecretAccessKey:      "test-secret-key",
-		HTTPClient:           client,
+		HTTPClientDecorator: func(aws.HTTPClient) (aws.HTTPClient, error) {
+			return client, nil
+		},
 	}
 	awsCfg, err := loadS3AWSConfig(context.Background(), cfg)
 	require.NoError(t, err)

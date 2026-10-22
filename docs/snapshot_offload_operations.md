@@ -64,6 +64,7 @@ elastickv \
 | `--snapshotOffloadInterval` | Scan cadence. Default 15m. |
 | `--snapshotOffloadJitter` | Spread across groups. Default: a quarter of the interval. |
 | `--snapshotOffloadConcurrency` | Concurrent uploads per process. Default 1. |
+| `--snapshotOffloadPublishTimeout` | Deadline for each publication, including spooling and store operations. Default 10m; must be positive. |
 | `--snapshotOffloadSpoolDir` | Where payloads are spooled before upload. Needs room for the largest snapshot. |
 
 **A misconfigured offload refuses to start the node.** That is deliberate: an
@@ -247,7 +248,9 @@ whole node.
   `--snapshotOffloadEndpoint` and also rejects plaintext URLs resolved by the
   AWS SDK configuration chain. Redirects must preserve both HTTPS and the
   endpoint host. For a local MinIO during development, pass
-  `--snapshotOffloadAllowInsecureEndpoint` explicitly.
+  `--snapshotOffloadAllowInsecureEndpoint` explicitly; host-changing redirects
+  remain prohibited. The AWS SDK's CA bundle and credential-provider settings
+  are preserved.
 - **Stale spool files are cleaned at startup.** A publish spools the
   payload to `<parent of data dir>/.snapshot-offload-spool` (or
   `--snapshotOffloadSpoolDir`) and removes it on completion; a process

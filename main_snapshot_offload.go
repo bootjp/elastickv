@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	awshttp "github.com/aws/aws-sdk-go-v2/aws/transport/http"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/internal/snapshotoffload"
@@ -56,6 +57,8 @@ var (
 		"random spread applied to the offload schedule; zero uses a quarter of the interval")
 	snapshotOffloadConcurrency = flag.Int("snapshotOffloadConcurrency", snapshotoffload.DefaultSchedulerConcurrency,
 		"maximum concurrent snapshot uploads for this process")
+	snapshotOffloadPublishTimeout = flag.Duration("snapshotOffloadPublishTimeout", snapshotoffload.DefaultSchedulerPublishTimeout,
+		"deadline for each physical snapshot publication")
 	snapshotOffloadSpoolDir = flag.String("snapshotOffloadSpoolDir", "",
 		"directory for snapshot spool files; empty uses the data dir's filesystem")
 	snapshotOffloadSourceCluster = flag.String("snapshotOffloadSourceCluster", "",
@@ -79,7 +82,7 @@ var snapshotOffloadAllowInsecureEndpoint = flag.Bool("snapshotOffloadAllowInsecu
 // it fails startup instead.
 func rejectPlaintextOffloadEndpoint() error {
 	endpoint := strings.TrimSpace(*snapshotOffloadEndpoint)
-	if endpoint == "" || *snapshotOffloadAllowInsecureEndpoint {
+	if endpoint == "" {
 		return nil
 	}
 	parsed, err := url.Parse(endpoint)
@@ -88,7 +91,9 @@ func rejectPlaintextOffloadEndpoint() error {
 	}
 	// A scheme-less host:port is ambiguous rather than known-plaintext, but
 	// the AWS SDK resolves it as http, so it is refused too.
-	if !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" || parsed.Opaque != "" {
+	allowedScheme := strings.EqualFold(parsed.Scheme, "https") ||
+		(*snapshotOffloadAllowInsecureEndpoint && strings.EqualFold(parsed.Scheme, "http"))
+	if !allowedScheme || parsed.Hostname() == "" || parsed.Opaque != "" {
 		return errors.Wrapf(snapshotoffload.ErrInvalidOptions,
 			"--snapshotOffloadEndpoint %q is not a valid https URL; snapshot payloads and credentials "+
 				"would cross the network unencrypted. Pass an https:// endpoint, or "+
@@ -98,24 +103,39 @@ func rejectPlaintextOffloadEndpoint() error {
 	return nil
 }
 
-func snapshotOffloadHTTPClient() *http.Client {
-	if *snapshotOffloadAllowInsecureEndpoint {
-		return nil
+func snapshotOffloadHTTPClient(base aws.HTTPClient) (aws.HTTPClient, error) {
+	var client http.Client
+	switch resolved := base.(type) {
+	case nil:
+		client.Transport = awshttp.NewBuildableClient().GetTransport()
+	case *awshttp.BuildableClient:
+		client.Transport = resolved.GetTransport()
+		client.Timeout = resolved.GetTimeout()
+	case *http.Client:
+		client = *resolved
+	default:
+		return nil, errors.Wrapf(snapshotoffload.ErrInvalidOptions,
+			"unsupported snapshot offload SDK http client %T", base)
 	}
-	return &http.Client{
-		Transport: snapshotOffloadHTTPSTransport{
-			next: awshttp.NewBuildableClient().GetTransport(),
-		},
-		CheckRedirect: checkSnapshotOffloadRedirect,
+	transport := client.Transport
+	if transport == nil {
+		transport = http.DefaultTransport
 	}
+	allowInsecure := *snapshotOffloadAllowInsecureEndpoint
+	client.Transport = snapshotOffloadHTTPSTransport{next: transport, allowInsecure: allowInsecure}
+	client.CheckRedirect = func(req *http.Request, via []*http.Request) error {
+		return checkSnapshotOffloadRedirect(req, via, allowInsecure)
+	}
+	return &client, nil
 }
 
 type snapshotOffloadHTTPSTransport struct {
-	next http.RoundTripper
+	next          http.RoundTripper
+	allowInsecure bool
 }
 
 func (t snapshotOffloadHTTPSTransport) RoundTrip(req *http.Request) (*http.Response, error) {
-	if req == nil || req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") {
+	if !snapshotOffloadRequestAllowed(req, t.allowInsecure) {
 		return nil, errors.Wrap(snapshotoffload.ErrInvalidOptions,
 			"snapshot offload request must use https")
 	}
@@ -127,8 +147,16 @@ func (t snapshotOffloadHTTPSTransport) RoundTrip(req *http.Request) (*http.Respo
 	return response, errors.Wrap(err, "snapshot offload request")
 }
 
-func checkSnapshotOffloadRedirect(req *http.Request, via []*http.Request) error {
-	if req == nil || req.URL == nil || !strings.EqualFold(req.URL.Scheme, "https") {
+func snapshotOffloadRequestAllowed(req *http.Request, allowInsecure bool) bool {
+	if req == nil || req.URL == nil {
+		return false
+	}
+	return strings.EqualFold(req.URL.Scheme, "https") ||
+		(allowInsecure && strings.EqualFold(req.URL.Scheme, "http"))
+}
+
+func checkSnapshotOffloadRedirect(req *http.Request, via []*http.Request, allowInsecure bool) error {
+	if !snapshotOffloadRequestAllowed(req, allowInsecure) {
 		return errors.Wrap(snapshotoffload.ErrInvalidOptions,
 			"snapshot offload redirect must preserve https")
 	}
@@ -220,7 +248,7 @@ func buildSnapshotOffloadStore(ctx context.Context) (snapshotoffload.ObjectStore
 		ForcePathStyle:       *snapshotOffloadForcePathStyle,
 		ServerSideEncryption: strings.TrimSpace(*snapshotOffloadSSE),
 		SSEKMSKeyID:          strings.TrimSpace(*snapshotOffloadSSEKMSKeyID),
-		HTTPClient:           snapshotOffloadHTTPClient(),
+		HTTPClientDecorator:  snapshotOffloadHTTPClient,
 	})
 	if err != nil {
 		return nil, errors.Wrap(err, "snapshot offload: s3 store")
@@ -339,6 +367,7 @@ func startSnapshotOffload(
 	opts := []snapshotoffload.SchedulerOption{
 		snapshotoffload.WithSchedulerInterval(*snapshotOffloadInterval),
 		snapshotoffload.WithSchedulerConcurrency(*snapshotOffloadConcurrency),
+		snapshotoffload.WithSchedulerPublishTimeout(*snapshotOffloadPublishTimeout),
 		snapshotoffload.WithSchedulerObserver(observer),
 		snapshotoffload.WithSchedulerLogger(logger),
 	}

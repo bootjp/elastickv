@@ -32,6 +32,8 @@ type Scheduler struct {
 	observer    SchedulerObserver
 	logger      *slog.Logger
 	now         func() time.Time
+
+	publishTimeout time.Duration
 	// published caches the highest index this process has published per group.
 	// It is an optimisation only: restart idempotency comes from the object
 	// store, not from this map.
@@ -78,11 +80,18 @@ func (nopSchedulerObserver) ObserveSnapshotOffloadFailed(uint64, error)         
 
 // Default scheduling parameters from §4.
 const (
-	DefaultSchedulerInterval    = 15 * time.Minute
-	DefaultSchedulerConcurrency = 1
+	DefaultSchedulerInterval       = 15 * time.Minute
+	DefaultSchedulerConcurrency    = 1
+	DefaultSchedulerPublishTimeout = 10 * time.Minute
 )
 
 type SchedulerOption func(*Scheduler)
+
+// WithSchedulerPublishTimeout bounds one publication, including store requests
+// and spooling, so a stalled group cannot prevent later scans.
+func WithSchedulerPublishTimeout(d time.Duration) SchedulerOption {
+	return func(s *Scheduler) { s.publishTimeout = d }
+}
 
 func WithSchedulerInterval(d time.Duration) SchedulerOption {
 	return func(s *Scheduler) {
@@ -160,6 +169,8 @@ func NewScheduler(store ObjectStore, groups []OffloadGroup, prefix, sourceCluste
 		now:         time.Now,
 		published:   make(map[uint64]uint64),
 		inFlight:    make(map[uint64]struct{}),
+
+		publishTimeout: DefaultSchedulerPublishTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -191,6 +202,8 @@ func (s *Scheduler) validate() error {
 		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires an object store")
 	case s.sourceName == "":
 		return errors.Wrap(ErrInvalidOptions, "snapshot offload scheduler requires a source cluster name")
+	case s.publishTimeout <= 0:
+		return errors.Wrap(ErrInvalidOptions, "snapshot offload publication timeout must be positive")
 	}
 	// Both leadership callbacks are mandatory. Treating a nil callback
 	// as "leader" would let a miswired scheduler publish from a
@@ -335,7 +348,9 @@ func (s *Scheduler) publishGroupBounded(ctx context.Context, group OffloadGroup)
 		return
 	}
 	defer s.endGroup(group.GroupID)
-	s.publishGroup(ctx, group)
+	bounded, cancel := context.WithTimeout(ctx, s.publishTimeout)
+	defer cancel()
+	s.publishGroup(bounded, group)
 }
 
 // staggeredGroup pairs a group with the absolute instant its work may
@@ -400,7 +415,7 @@ func (s *Scheduler) publishGroup(ctx context.Context, group OffloadGroup) {
 		SkipIfNotNewerThan: s.publishedIndex(group.GroupID),
 	})
 	if err != nil {
-		if errors.Is(err, context.Canceled) || ctx.Err() != nil {
+		if errors.Is(err, context.Canceled) || errors.Is(ctx.Err(), context.Canceled) {
 			return
 		}
 		if errors.Is(err, ErrSnapshotNotNewer) {

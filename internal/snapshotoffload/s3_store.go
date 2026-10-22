@@ -6,7 +6,6 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"io"
-	"net/http"
 	"strings"
 	"time"
 
@@ -55,7 +54,7 @@ type S3StoreConfig struct {
 	ServerSideEncryption   string
 	SSEKMSKeyID            string
 	DisableChecksumHeaders bool
-	HTTPClient             *http.Client
+	HTTPClientDecorator    func(aws.HTTPClient) (aws.HTTPClient, error)
 }
 
 type S3Store struct {
@@ -77,19 +76,11 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 	}
 	client := cfg.Client
 	if client == nil {
-		awsCfg, err := loadS3AWSConfig(ctx, cfg)
+		var err error
+		client, err = newS3ObjectClient(ctx, cfg)
 		if err != nil {
 			return nil, err
 		}
-		client = s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-			o.UsePathStyle = cfg.ForcePathStyle
-			if cfg.HTTPClient != nil {
-				o.HTTPClient = cfg.HTTPClient
-			}
-			if stringsTrim(cfg.Endpoint) != "" {
-				o.BaseEndpoint = aws.String(stringsTrim(cfg.Endpoint))
-			}
-		})
 	}
 	return &S3Store{
 		client:                 client,
@@ -100,6 +91,26 @@ func NewS3Store(ctx context.Context, cfg S3StoreConfig) (*S3Store, error) {
 		multipartThreshold:     s3MaxSinglePutBytes,
 		multipartPartSize:      s3DefaultMultipartPart,
 	}, nil
+}
+
+func newS3ObjectClient(ctx context.Context, cfg S3StoreConfig) (*s3.Client, error) {
+	awsCfg, err := loadS3AWSConfig(ctx, cfg)
+	if err != nil {
+		return nil, err
+	}
+	if cfg.HTTPClientDecorator != nil {
+		client, err := cfg.HTTPClientDecorator(awsCfg.HTTPClient)
+		if err != nil {
+			return nil, errors.Wrap(err, "configure s3 http client")
+		}
+		awsCfg.HTTPClient = client
+	}
+	return s3.NewFromConfig(awsCfg, func(o *s3.Options) {
+		o.UsePathStyle = cfg.ForcePathStyle
+		if stringsTrim(cfg.Endpoint) != "" {
+			o.BaseEndpoint = aws.String(stringsTrim(cfg.Endpoint))
+		}
+	}), nil
 }
 
 func loadS3AWSConfig(ctx context.Context, cfg S3StoreConfig) (aws.Config, error) {

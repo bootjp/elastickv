@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1/M2 implemented; M3 runtime wiring and the operations runbook implemented; retention/GC, restore drills, multi-node acceptance, and the versioned-bucket decision pending
+Status: Partial — M0/M1/M2 implemented; M3 runtime wiring and the operations runbook implemented; retention/GC integration (#1222 implemented, unmerged), restore drills, multi-node acceptance, and the versioned-bucket decision pending
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-09-25
@@ -116,6 +116,10 @@ The schedule is opt-in. Initial defaults are one scan every 15 minutes and one
 upload at a time per process. Jitter spreads multi-group work. Snapshot
 creation cadence remains owned by the Raft engine; object offload never forces
 an extra state-machine snapshot in this milestone.
+
+Each publication has a configurable deadline (`--snapshotOffloadPublishTimeout`,
+default 10 minutes). Deadline expiry releases the upload slot, records a failed
+attempt, and lets the scheduler retry on a later scan.
 
 ## 5. Retention and reference lifecycle
 
