@@ -6,6 +6,7 @@ import (
 	"encoding/binary"
 	"math"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -1920,19 +1921,19 @@ func TestPebbleMigrationApplyPathsAcquireApplyMuBeforeDBMu(t *testing.T) {
 			}()
 			<-started
 
-			deadline := time.Now().Add(time.Second)
-			acquiredDB := false
+			deadline := time.Now().Add(100 * time.Millisecond)
+			dbRemainedAvailable := true
 			for time.Now().Before(deadline) {
-				if pebble.dbMu.TryLock() {
-					pebble.dbMu.Unlock()
-					acquiredDB = true
+				runtime.Gosched()
+				if !pebble.dbMu.TryLock() {
+					dbRemainedAvailable = false
 					break
 				}
-				time.Sleep(time.Millisecond)
+				pebble.dbMu.Unlock()
 			}
 			pebble.applyMu.Unlock()
 
-			require.True(t, acquiredDB, "operation held dbMu while waiting for applyMu")
+			require.True(t, dbRemainedAvailable, "operation held dbMu while waiting for applyMu")
 			require.NoError(t, <-done)
 		})
 	}
