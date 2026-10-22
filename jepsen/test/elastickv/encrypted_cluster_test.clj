@@ -18,7 +18,8 @@
             [elastickv.redis-workload :as redis]
             [elastickv.redis-zset-safety-workload :as zset]
             [elastickv.s3-workload :as s3]
-            [elastickv.sqs-htfifo-workload :as sqs]))
+            [elastickv.sqs-htfifo-workload :as sqs]
+            [jepsen.util :as util]))
 
 (deftest encryption-flag-is-available-to-every-workload
   ;; It lives in common-cli-opts rather than per-workload, so a future
@@ -133,6 +134,59 @@
        #'ekdb/activate-encryption! (fn [& _] (swap! events conj :activate))}
       (fn [] (#'ekdb/finish-bootstrap-setup! test "n1" opts)))
     (is (= [:grpc-ready :mount-checked :activate] @events))))
+
+(deftest activation-follows-leadership-between-each-operation
+  (let [commands (atom [])
+        status-reads (atom [])
+        leaders {"bootstrap" "n2:50051"
+                 "enable-storage-envelope" "n3:50051"
+                 "enable-raft-envelope" "n1:50051"}
+        identities {"n1:50051" [11 1], "n2:50051" [22 2], "n3:50051" [33 3]}]
+    (with-redefs-fn
+      {#'ekdb/wrap-fresh-dek! (constantly "wrapped")
+       #'ekdb/encryption-status
+       (fn [_ endpoint]
+         (swap! status-reads conj endpoint)
+         (let [[id epoch] (identities endpoint)]
+           {:full-node-id id :local-epoch epoch
+            :storage-envelope-active true :raft-envelope-active true}))
+       #'ekdb/encryption-command!
+       (fn [_ args]
+         (let [command (nth args 2)
+               endpoint (subs (first (filter #(.startsWith ^String % "--endpoint=") args)) 11)]
+           (swap! commands conj [command endpoint (vec args)])
+           (when-not (= endpoint (leaders command))
+             (throw (ex-info "not leader" {:endpoint endpoint})))))
+       #'util/await-fn (fn [f _] (or (f) (throw (ex-info "not ready" {}))))}
+      (fn [] (#'ekdb/activate-encryption! {:nodes ["n1" "n2" "n3"]} "n1" 50051 nil)))
+    (is (= [["bootstrap" "n1:50051"] ["bootstrap" "n2:50051"]
+            ["enable-storage-envelope" "n1:50051"]
+            ["enable-storage-envelope" "n2:50051"]
+            ["enable-storage-envelope" "n3:50051"]
+            ["enable-raft-envelope" "n1:50051"]]
+           (mapv #(subvec % 0 2) @commands)))
+    (doseq [[command endpoint args] @commands
+            :when (not= "bootstrap" command)]
+      (let [[id epoch] (identities endpoint)]
+        (is (some #{(str "--proposer-node-id=" id)} args))
+        (is (some #{(str "--proposer-local-epoch=" epoch)} args))))
+    (is (= ["n1:50051" "n2:50051" "n3:50051"] (vec (take-last 3 @status-reads))))))
+
+(deftest activation-retries-after-a-round-without-a-leader
+  (let [attempts (atom [])
+        round (atom 0)]
+    (with-redefs [util/await-fn
+                  (fn [f _]
+                    (is (nil? (f)))
+                    (reset! round 1)
+                    (is (true? (f))))]
+      (#'ekdb/on-encryption-leader!
+        ["n1:50051" "n2:50051"]
+        (fn [endpoint]
+          (swap! attempts conj endpoint)
+          (when (or (zero? @round) (= endpoint "n1:50051"))
+            (throw (ex-info "election in progress" {}))))))
+    (is (= ["n1:50051" "n2:50051" "n1:50051" "n2:50051"] @attempts))))
 
 ;; ---------------------------------------------------------------------------
 ;; The switch must ACTIVATE encryption, not just reach the server

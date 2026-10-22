@@ -355,25 +355,49 @@
   (clojure.string/trim
     (c/on node (c/su (c/exec encryption-setup-bin (str "--kek-file=" kek-file))))))
 
+(defn- encryption-command!
+  [node args]
+  (c/on node (c/su (apply c/exec args))))
+
+(defn- on-encryption-leader!
+  "Retries an activation operation across members while elections settle."
+  [endpoints operation]
+  (util/await-fn
+    (fn []
+      (some (fn [endpoint]
+              (try
+                (operation endpoint)
+                true
+                (catch Exception t
+                  (warn t "retrying encryption activation" endpoint)
+                  nil)))
+            endpoints))
+    {:timeout 120000
+     :log-message "waiting for an encryption leader"}))
+
+(defn- cutover-encryption!
+  [node endpoints args-fn]
+  (on-encryption-leader!
+    endpoints
+    (fn [endpoint]
+      (let [{:keys [full-node-id local-epoch]} (encryption-status node endpoint)]
+        (when-not (and full-node-id (pos? full-node-id) (some? local-epoch))
+          (throw (ex-info "encryption status did not report a proposer identity"
+                          {:endpoint endpoint})))
+        (encryption-command! node (args-fn endpoint full-node-id local-epoch))))))
+
 (defn- activate-encryption!
   "Bootstraps both DEKs, activates both envelopes, and verifies every member."
   [test node grpc-port raft-groups]
-  (let [endpoint  (encryption-endpoint node grpc-port raft-groups)
-        peers     (map #(encryption-endpoint % grpc-port raft-groups) (:nodes test))
+  (let [peers     (mapv #(encryption-endpoint % grpc-port raft-groups) (:nodes test))
         wrapped-s (wrap-fresh-dek! node)
         wrapped-r (wrap-fresh-dek! node)]
-    (info "bootstrapping encryption" endpoint)
-    (c/on node (c/su (apply c/exec (bootstrap-args endpoint peers wrapped-s wrapped-r))))
-    (let [{:keys [full-node-id local-epoch]} (encryption-status node endpoint)]
-      (when-not (and full-node-id (pos? full-node-id) (some? local-epoch))
-        (throw (ex-info "encryption status did not report a proposer identity"
-                        {:endpoint endpoint})))
-      (info "enabling storage envelope" endpoint full-node-id local-epoch)
-      (c/on node (c/su (apply c/exec (enable-storage-envelope-args
-                                       endpoint full-node-id local-epoch))))
-      (info "enabling Raft envelope" endpoint full-node-id local-epoch)
-      (c/on node (c/su (apply c/exec (enable-raft-envelope-args
-                                       endpoint full-node-id local-epoch)))))
+    (on-encryption-leader!
+      peers
+      (fn [endpoint]
+        (encryption-command! node (bootstrap-args endpoint peers wrapped-s wrapped-r))))
+    (cutover-encryption! node peers enable-storage-envelope-args)
+    (cutover-encryption! node peers enable-raft-envelope-args)
     (doseq [peer (:nodes test)]
       (let [peer-endpoint (encryption-endpoint peer grpc-port raft-groups)]
         (util/await-fn
