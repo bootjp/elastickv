@@ -1,0 +1,456 @@
+# Positioning and near-term roadmap
+
+Status: Proposed
+Author: bootjp
+Date: 2026-09-26
+
+This is a roadmap document (the kind `docs/design/README.md` admits under
+"Concrete implementation plans"). It records where elastickv is aimed, what it
+claims, how that is proven, and in what order the next work lands. It proposes
+no implementation itself; the milestones it orders each get their own design
+doc. It supersedes the priority ordering implied by
+`2026_06_23_proposed_scaling_roadmap.md`, which stays in force as the
+description of the future scale-out track.
+
+The content was settled in a structured design interview on 2026-09-26; the
+answers are recorded under **Decisions** at the end so later readers can see
+what was chosen and what was merely assumed. Every statement about current
+code or docs was re-checked against `main` at `4ca7e90d` before this doc was
+written.
+
+---
+
+## 1. What elastickv is for
+
+**Who.** People who build against AWS-style APIs (DynamoDB, S3, SQS) and Redis
+and need to run the same application outside AWS: on-premises, at the edge, or
+inside an air-gapped network, on three to five machines they operate
+themselves.
+
+**What.** One Raft-replicated, MVCC/OCC store that speaks those protocols from
+a single binary, targeting serializable multi-key transactions and per-key
+linearizability (§4 and §5 record which of those hold on `main` today), and
+no external timestamp or placement service to run alongside it.
+
+**Proof.** The engineering record is a deliverable, not a by-product: every
+non-trivial change has a design doc, safety properties are model-checked in
+TLA+ (`tla/`), and the Redis, DynamoDB, and S3 surfaces each have a Jepsen
+workload (`jepsen/src/elastickv/`; the SQS workload exists but validates
+nothing today because of a harness bug recorded in the audit's A4, and gRPC
+and the filesystem have none yet, see §6.3). The same artifact therefore serves two audiences:
+adopters who want a self-hosted AWS-compatible store, and readers who want a
+documented, verified multi-raft transactional KV in Go.
+
+**Success, in order.** (1) Research, learning, and technical proof: write-ups
+and talks backed by the verification record. (2) Adoption: other people run it
+and report issues. Capacity is one maintainer plus coding agents, a few hours a
+week, no deadline; the plan below is sized for that.
+
+## 2. Comparison
+
+| Dimension | FoundationDB | TiKV | DynamoDB | Bigtable | elastickv |
+|---|---|---|---|---|---|
+| API surface | Key-value core plus separately deployed layers (Record Layer, Document Layer) | Raw KV + transactional KV (gRPC), coprocessor; SQL via TiDB | Item API (partition key model), transactions | Wide-column (HBase API) | gRPC RawKV / TransactionalKV, Redis, DynamoDB, S3, SQS, and a FUSE filesystem, in one process |
+| Transactions | Strict serializable ACID | Percolator: snapshot isolation, optimistic or pessimistic | Serializable for `TransactWriteItems` / `TransactGetItems` | Single-row atomicity only | Atomic within a shard; across shards 2PC with OCC validation of write and read sets at FSM apply, whose atomicity is not yet claimed (G12, G13, and G14, all reproduced: aliased identities commit a mix, a PREPARE at the previous commit's timestamp is swallowed as a replay on the secondary group alone so the primary lands while the secondary write is lost, and a secondary can be rolled back before the primary lock exists) until A2's transaction id and primary-first PREPARE and A0's index-based replay detection land; serializable is the target pending the audit's A0 to A2, G11, and G13 (§6.3); per-key linearizable for blind writes and reads on leader-issued paths; read-modify-write operations wait for A0 (G0) and the G10 paths for A0b |
+| Timestamps / ordering | Sequencer process role | PD as global TSO | Managed | Managed | HLC issued by the owning Raft leader (the post-A0b design; on `main` today the default legacy-TSO mode stamps on the dispatching node and `Internal.Forward` keeps that stamp, audit gap G10); physical half fenced by a Raft-agreed ceiling; optional centralized TSO (group 0, Phase D, opt-in via `--tsoPhaseDEnabled`) with batch allocation; no external service |
+| Scale-out | Data distribution + storage roles; single region primary + DR | Auto region split / merge / rebalance via PD | Elastic, managed | Massive, managed | Multi-raft groups with a durable route catalog and streaming delta watch; automatic same-group split (keyviz-driven); cross-group migration in progress; no merge, no automatic rebalancing yet |
+| Operations | Many process classes, cluster file | PD + TiKV nodes, tiup | None (managed) | None (managed) | Single binary per node, `rolling-update.sh` over Tailscale from GitHub Actions; learner join, fenced voter replacement; admin dashboard + key visualizer; no Kubernetes operator |
+| Verification story | Deterministic simulation | Jepsen (TiDB), tests | Internal (formal methods, TLA+) | Internal | Design docs, TLA+ (HLC, OCC, MVCC, routes, composed), Jepsen for Redis / DynamoDB / S3 (Elle list-append, knossos, custom checkers; the SQS workload exists but validates nothing today, §1) |
+| Where elastickv is weaker today | Strict serializability, simulation testing | Auto migration / merge / rebalance, PD ecosystem, published numbers | Elasticity, global tables, zero ops | Scale | See §3 (future goals) and §4 (open gaps) |
+
+Read the table as: DynamoDB is the API reference, TiKV is the architectural
+peer, FoundationDB is the correctness bar, Bigtable is not a peer.
+
+## 3. Scope today and future goals
+
+README will present scope in two tiers instead of a non-goals section.
+
+**Today (what a release must hold).**
+
+- Three to five voters per Raft group, optional learners, single region.
+  Membership operations: learner add / promote, fresh learner join for wiped
+  nodes, fenced same-ID voter replacement.
+- Protocol surfaces: gRPC RawKV / TransactionalKV (single-key operations;
+  `PreWrite` / `Commit` / `Rollback` are not implemented, so multi-key
+  transactions are reached through the protocol adapters below), Redis, DynamoDB
+  (13 operations incl. `Scan`, `BatchWriteItem`, `TransactWriteItems`,
+  `TransactGetItems`), S3 (path-style, SigV4 static credentials), SQS
+  (opt-in, incl. HT-FIFO, DLQ redrive), FUSE filesystem
+  (`2026_02_24_implemented_filesystem_on_elastickv.md`).
+- Consistency: per-key linearizable is the target for every path. For blind
+  writes and reads on paths whose timestamps the owning group's leader issues
+  (in a single-group deployment: every Redis write except `EVAL`, DynamoDB,
+  S3, SQS), the timestamp-order component holds today, but the per-key claim
+  also waits for A6/G11's outcome-unknown mapping: a write reported as
+  `NOTLEADER` can still commit. Read-modify-write operations on those same
+  paths are excluded until A0 lands, because a delayed write
+  below the watermark can be missed and then overwritten by a
+  read-modify-write that began at the watermark (G0, reproduced; two
+  leader-issued timestamps that cannot be linearized); `EVAL`, gRPC `RawKV` /
+  `TransactionalKV`, the filesystem, the asynchronous cleanups, and, in
+  multi-group deployments, every cross-group operation (2PC, cross-group
+  Redis commands, `FLUSHALL`, cross-group S3 / DynamoDB / SQS / filesystem
+  transactions, whose COMMIT timestamp the coordinating leader stamps for
+  groups it does not lead) are excluded until A0b and its remaining
+  `Internal.Forward` work land (G10, reproduced);
+  multi-key transactions atomic within a shard, and across shards once
+  A2's transaction id, the primary-first PREPARE order, and the secondary
+  re-apply (G12 and G14) and A0's index-based replay detection (G13: a
+  PREPARE swallowed as a replay on the secondary group alone leaves the
+  primary committed and the secondary write missing) land, all three
+  reproduced and fixed on local branches, with OCC validation of write and
+  read sets at apply; resolver-routed keys (SQS FIFO queues placed with
+  `--sqsFifoPartitionMap`) stay outside both the serializable and the
+  cross-shard claim until the resolver-aware route gate lands (§6.1).
+  **Serializable is the
+  target, not yet the claim**: the audit (§6.3) found and reproduced that validation assumes
+  entries apply in commit-timestamp order, which nothing enforces (G0), and
+  that 2PC read keys are unprotected between PREPARE and COMMIT (G1); both
+  have failing tests on `main`. README
+  makes the serializable claim only after the full §6.1 gate: the audit's
+  A0 to A2, G11, G15, and G13 fixes merged **and** A7's transaction-format
+  gate landed with V2 in effect cluster-wide, the `txn-v2` marker the
+  drain's completion step writes (merging alone activates nothing, and
+  activation alone is not the gate). Leader reads via ReadIndex or leader lease; no follower reads.
+- Durability and operations: at-rest encryption (storage and Raft envelopes,
+  compress-then-encrypt, KEK from file, AWS KMS, GCP KMS, or Vault Transit),
+  live point-in-time logical backup plus offline snapshot encode / decode /
+  restore tooling (since #1267 and #1276 the decoder reads the
+  `fsm-snap/<index>.fsm` file a node persists, in either store snapshot
+  format, as well as encoder output, and dumps that group's DynamoDB, S3,
+  Redis, and SQS keyspaces; a snapshot holding encrypted entries is not
+  decodable offline, and a dump is not a complete restore source, for the
+  reasons the §4 row lists), physical snapshot publish / restore tooling
+  for an
+  S3-compatible object store (the periodic scheduler is not yet wired into
+  the server; that is the design's M3), Pebble SST ingest snapshot
+  transfer, admin dashboard with data
+  browser, key visualizer with automatic same-group split, Prometheus
+  metrics, rolling update over Tailscale.
+
+**Future goals (stated in README as such, not promised for any release).**
+
+- TiKV-class horizontal scale: cross-group range migration (hotspot split
+  M2, partial), range merge, automatic rebalancing, and the rest of
+  `2026_06_23_proposed_scaling_roadmap.md`.
+- Multi-region / geo-replication.
+
+## 4. Open gaps that the next milestones close
+
+| Gap | Evidence (on `main` at `4ca7e90d`) | Closed by |
+|---|---|---|
+| No authentication on the DynamoDB, Redis, and gRPC data planes; no TLS on any data-plane listener | `adapter/dynamodb*.go` has no SigV4 path (only the admin and migration files mention it); `adapter/redis_server_cmds.go` rejects `HELLO AUTH` ("elastickv's Redis adapter has no AUTH layer"); the only `--*TLSCertFile` flags are the admin listener's | DynamoDB, Redis, and TLS: security milestone (§6.2). gRPC `RawKV` / `TransactionalKV` authentication (mTLS or bearer) is deferred by §6.2 and **stays open** after it; until then the gRPC listener must sit inside a private network or tailnet |
+| Serializability has known holes: commit timestamps are allocated before proposal and the apply path never rejects an entry below the watermark that reads use as their snapshot (G0); 2PC read keys are validated only at PREPARE apply, with locks on write keys only and no re-check at COMMIT (G1); 2PC read-only shards are validated outside the FSM lock; the S3 adapter populates `ReadKeys` only in the upload-part path and never re-reads multipart part descriptors at the commit snapshot; Lua scripts do not surface reads of keys they do not write; several Redis paths (standalone `DEL` and the other emptying paths, `SETNX`, `MULTI` type probes) bypass the collection fences; gRPC `TransactionalKV` has no read-set-bearing transaction API (audit Appendix A); in the default TSO mode `ShardedCoordinator` stamps commit timestamps on whichever node runs `Dispatch` (`EVAL`, gRPC `RawKV` / `TransactionalKV`, the filesystem, async cleanups, multi-group stamping) and the store's stale-reapply fast path treats an equal `commitTS` as "already applied", so two writers on two nodes can both read the same value, both be told OK, and one write is lost (audit G10, reproduced) | `resolveDispatchCommitTS` in `kv/coordinator.go`; `alignCommitTS` in `store/`; `verifyBackupTimestampFloor` in `kv/fsm_backup.go` (the backup-only fence); `handlePrepareRequest` / `handleCommitRequest` in `kv/fsm.go`; `grep ReadKeys adapter/s3*.go`; `luaWideFenceReadKeysForPlan` in `adapter/redis_lua_context.go` | Serializable isolation audit (§6.3) |
+| `tla/occ/OCC.tla` does not validate `readObs` at commit and has no property forbidding write skew (OCC-2 covers write sets only) | `Prepare` / `Commit` actions in `tla/occ/OCC.tla` | Serializable isolation audit (§6.3) |
+| No published performance numbers; six `*_benchmark_test.go` files; no `bench/` | `docs/redis_hotpath_dashboard.md` is directional only | Benchmark harness (§6.4) |
+| README's "Implemented Features" omits SQS, encryption, backup, snapshot offload, and the filesystem, and its consistency bullet says only "write-after-read checks … are covered by tests" | `README.md` §Implemented Features | README refresh after §6.1 lands |
+| `elastickv-snapshot-decode` could not decode a snapshot taken from a live Pebble store, so the offline decode / restore path worked only on encoder-produced snapshots, although §3 lists the tooling; it still rejects encrypted entries, and a dump is not a complete restore source | #1267 (merged 2026-10-15 as `95889d1f`) removed the first failure: `ReadSnapshot` no longer rejects the store's reserved metadata keys (it failed on `_meta_last_commit_ts`, "encoded value length 8 < 9"). #1276 (merged 2026-10-16 as `184351ae`) closed the gaps found in review on #1275: `ReadSnapshotFile` strips the FSM snapshot header (`EKVTHLC1` / `EKVTHLC2`, `kvFSMSnapshot.WriteTo`) of an on-disk `fsm-snap/<index>.fsm` and verifies the engine's CRC32C footer (`writeFSMSnapshotPayload`); `DecodeSnapshot` keeps only the newest version of each key, so a dump no longer carries stale values or resurrects deleted keys from MVCC history; the reader accepts the SST-ingest format (`EKVSSTI1`) and the store's `MaxSnapshotStoredKeySize`; `SnapshotIndexFromPath` parses the engine's hex `%016x.fsm` names; and `TestRun_DecodesOnDiskFSMFile` decodes a file written through the engine's snapshot path. Still rejected: encrypted entries (`ErrSnapshotEncryptedEntry`, pinned by `TestReadSnapshot_RejectsEncryptedEntry`). Omitted from a dump without an error: a committed transaction's write whose secondary lock was still unresolved when the snapshot was taken (the decoder drops the `!txn` intent and lock records); a value staged by a range migration with staged visibility active, which `getAtWithStagedVisibility` in `kv/shard_store.go` reads from the staging keyspace (`distribution.MigrationStagedDataKey`) ahead of the live key while the decoder drops every `!dist` control entry as internal; and keyspaces outside the four adapters, such as gRPC `RawKV` / `TransactionalKV` keys and filesystem keys (`internal/fskeys`), which `dispatcher.route` counts as `Unknown` without dumping. Not applied: a version's storage-level expiry (the value header's `ExpireAt`, which the store's `PutWithTTLAt` and `ExpireAt` methods set and range-migration imports carry over), which `dispatcher.handleEntry` drops, so a version past its expiry but not yet compacted dumps as live and a future expiry is lost. Not covered: the Raft log tail after the snapshot's applied index, and a point in time shared by several groups, both stated non-goals of the decoder design (found in review on #1275) | Open, not scheduled: offline decoding of encrypted snapshots, unresolved secondary locks, staged migration values, storage-level expiry, and the gRPC and filesystem keyspaces. The Raft log tail and cross-group point-in-time dumps are Phase 1 logical backup's job, not the offline decoder's. README may describe the decoder as reading persisted `.fsm` files from cleartext stores, with the §6.1 caveats |
+| Stale docs: `docs/docker_multinode_manual_run.md` listed `Scan` / `BatchWriteItem` as unsupported; `docs/review_todo.md` 4.2 described the engine as snapshot isolation | Fixed in the same change as this doc | — |
+
+## 5. Consistency claims
+
+What README and `docs/architecture_overview.md` will state, and the evidence
+behind each claim.
+
+1. **Per-key linearizability.** All writes go through the owning Raft group's
+   leader; reads are leader reads (ReadIndex) or leader-lease reads. On
+   `main` today this holds only for blind writes and reads where the
+   leader issues the commit timestamp; read-modify-write operations wait for
+   A0 (G0: a delayed lower-timestamp write is missed and overwritten), and
+   the G10 paths (`EVAL`, gRPC `RawKV` / `TransactionalKV`, the
+   filesystem, asynchronous cleanups, and every cross-group operation in a
+   multi-group deployment) can lose a write with both clients told OK, so
+   the unconditional claim waits for A0b, its `Internal.Forward` follow-up,
+   and the G11 outcome-unknown error (a `NOTLEADER` reported for a proposal
+   that later commits is a definite failure the client can observe as
+   applied). Evidence:
+   `jepsen/src/elastickv/dynamodb_types_workload.clj` and `s3_workload.clj`
+   (knossos linearizable register).
+2. **Multi-key transactions are atomic.** Single-shard transactions apply in
+   one Raft entry; multi-shard transactions use two-phase commit with a
+   primary key and lock resolution (`kv/lock_resolver.go`). Not yet claimed
+   for multi-shard transactions: two concurrent 2PC transactions that share
+   a primary key and a start timestamp are treated as one owner and can
+   commit a mix of their writes (audit gap G12); a PREPARE whose `StartTS`
+   equals the previous commit's timestamp is skipped as a replay, and when
+   that happens on the secondary group alone the primary commits while the
+   secondary write is silently omitted (G13); and group-id PREPARE
+   ordering lets a reader abort a secondary before the primary lock exists,
+   after which the primary commits and the secondary COMMIT writes nothing
+   (G14); the claim waits for A2's transaction id, the primary-first PREPARE
+   order, and the secondary re-apply, and for A0's index-based replay
+   detection, all reproduced and fixed on local branches, and, as every
+   consistency claim does, for A7's V2 format in effect cluster-wide
+   (§6.1): until then V1 entries keep the legacy identity
+   and replay semantics, and merging the fixes excludes nothing.
+3. **Multi-key transactions are serializable.** The FSM validates the
+   transaction's write set and read set against every commit newer than
+   `StartTS` under the store's apply lock (`checkConflictsLocked` in
+   `store/mvcc_store.go`), so two transactions that read each other's writes
+   cannot both commit: write skew is rejected as a write conflict. Coverage
+   today: no path can be called serializable yet. The audit's A2 analysis
+   found, and reproduced with a test, that the check assumes apply order
+   equals commit-timestamp order, which is not enforced (G0), and that 2PC read keys are unprotected between
+   PREPARE and COMMIT (G1); S3 handlers and Lua string reads do not surface
+   their reads at all (G2, G3). The claim is made once A0 to A2, G11, G15, and G13 (a 2PC PREPARE at the
+   previous commit's timestamp swallowed as a replay, closed by A0's
+   index-based replay detection) of §6.3 are merged and A7's V2 format
+   is in effect cluster-wide, the full §6.1 gate. Evidence
+   today: Elle list-append under `:strict-serializable` for Redis MULTI/EXEC
+   and DynamoDB `TransactGetItems` + `TransactWriteItems`. That workload
+   cannot exhibit write skew (every anti-dependency comes with a write-write
+   dependency on the same key), so the audit added rw-register workloads that
+   can; they are red on `main` and green on the audit's fix branches under
+   the same load, including repeated leader kills (audit A4); partitions
+   and multi-group faults are not covered yet.
+4. **Caveat.** Leader-lease reads rely on bounded clock drift; under an
+   arbitrary partition a deposed leader may serve a lease read until its
+   lease expires (`2026_04_20_implemented_lease_read.md`). README states
+   this. "Strict serializable" is not claimed until the lease caveat is
+   either removed or bounded by a documented clock assumption.
+
+## 6. Milestones, in order
+
+Each milestone that changes code gets its own design doc before
+implementation, per `CLAUDE.md`.
+
+### 6.1 This doc and the audit doc
+
+`2026_09_26_proposed_positioning_and_roadmap.md` (this) and
+`2026_09_26_proposed_serializable_isolation_audit.md`. README gets a short
+"Who is this for" section and the two-tier scope once both docs land; the
+consistency claims go into README only after the audit's A0 to A2 fixes,
+the G11 fix (the server-side outcome-unknown error and its mapping in
+every adapter), G15 (a forwarded write whose reply is lost after reaching
+the leader is reported as outcome unknown instead of being retried, on
+every data-plane forwarder and the admin forwarder, since a retried
+non-idempotent write applies twice and the fence cannot see it), and G13
+(a 2PC PREPARE swallowed as a replay, closed by A0's index-based replay
+detection, with its regression test) are merged
+**and** A7's transaction-format gate has landed with **V2 in effect**
+cluster-wide, the `txn-v2` form of the `raft-engine` marker that the
+drain's completion step writes once the `txn_format_v2` activation epoch
+has applied on every data group, no legacy-shape lock row is left, and
+every legacy commit record written since activation has had its
+secondaries confirmed (corrected in review: activation alone is not the
+gate, because V2 transactions run next to the drain of the legacy
+outcomes and the audit's guarantees are forward-looking from the drain's
+completion, not from the activation entry). Merging alone activates
+nothing, because V1
+entries deliberately keep the old semantics (the timestamp replay fast
+path, no fence, no read locks, no transaction id, no watermark advance)
+until every member advertises V2, and an operator may pin a cluster to
+V1. The README caveat states that a V1-pinned or mid-upgrade cluster,
+one activated but still draining included, runs
+without these guarantees. The claims also exclude Phase-D clusters
+(`--tsoPhaseDEnabled`) until both TSO admission proposals
+(`2026_08_29_proposed_tso_batch_slot_claims.md`,
+`2026_09_02_proposed_prephase_d_resolution_evidence.md`) have landed:
+under Phase D the batch-window validator accepts any timestamp inside a
+committed window whether or not it was issued, and the pre-Phase-D
+resolution carve-out accepts a caller-asserted legacy timestamp, so a
+write can persist at a timestamp the audit's fence and conflict predicate
+assume was uniquely and durably issued. The README caveat names that
+exclusion next to the V1 one; in legacy TSO mode those validators are not
+in the write path (leader-issued identity there is A0b's job), so the
+claim for legacy-mode clusters does not wait on them. The claims also
+exclude resolver-routed keys, today the SQS FIFO queues an operator
+places with `--sqsFifoPartitionMap` (HT-FIFO, `PartitionResolver`):
+`ShardRouter` resolves them through the resolver rather than the catalog,
+so the catalog-version pin A2 extends to every read-write transaction
+cannot fence a routing change for them between the read and the PREPARE,
+and A2 keeps their exemption until the resolver-aware form of the
+Composed-1 gate (the Composed-1 design's M5 "error on unpinned" step,
+extended to resolver-routed keys, in its own design doc) lands. The README
+caveat names this third exclusion with the other two. The README backup
+section may describe `elastickv-snapshot-decode` as reading the `.fsm`
+files a node persists (#1267, #1276) for the DynamoDB, S3, Redis, and SQS
+keyspaces of one group, and names the limits the §4 row keeps open: a
+snapshot holding encrypted entries is not decodable offline; a dump
+silently omits a committed write whose secondary lock was still
+unresolved, a value staged by an in-flight range migration, and data
+written through gRPC `RawKV` / `TransactionalKV` or the filesystem; it
+ignores storage-level expiry, so a version past its expiry but not yet
+compacted dumps as live and a future expiry is lost; it reflects the
+snapshot's applied index, not the Raft log after it; and dumps of
+several groups do not share a point in time. A dump is therefore not a
+complete restore source; Phase 1 logical backup, not the offline
+decoder, covers the log tail and the cross-group point in time. A
+`NOTLEADER` that a later read contradicts is an anomaly independent of
+the timestamp and read-lock fixes.
+
+### 6.2 Security milestone
+
+Prerequisite for the on-premises showcase. Scope:
+
+- DynamoDB adapter: SigV4 with static credentials, reusing the S3 / SQS
+  credentials loader (`--dynamoCredentialsFile`).
+- Redis adapter: `AUTH` with a static password (`requirepass` equivalent);
+  `HELLO AUTH` accepted. ACLs are out of scope.
+- TLS on every listener (gRPC, Redis, DynamoDB, S3, SQS, and the metrics
+  and pprof listeners, whose bearer tokens otherwise travel in clear text
+  the moment `--metricsAddress` / `--pprofAddress` leave loopback, as the
+  multinode runbook's `http://10.0.0.11:9090` example shows), reusing the
+  admin listener's certificate flags; without a certificate those two
+  listeners refuse a non-loopback bind.
+- The internal forwarding clients get the same settings, or follower
+  forwarding breaks the moment the controls are on: the Redis leader
+  clients (`redis_proxy_leader.go`, built with only an address and pool
+  size) take the password and TLS config; the DynamoDB / SQS shared reverse
+  proxy and the S3 reverse proxy (`leader_http_proxy.go`, hard-coded
+  `http`) take the scheme, CA, server name, and the SigV4 credentials they
+  must re-sign or pass through; `GRPCConnCache` takes the client TLS
+  config instead of the insecure dial options; and the Raft transport,
+  which shares the gRPC listener (`startGRPCServers` registers it on the
+  same server) and dials peers through the same insecure
+  `internal.GRPCDialOptions()` (`internal/raftengine/etcd/grpc_transport.go`),
+  gets the client TLS config too, or Raft moves to its own listener, since
+  enabling TLS on the shared listener without that would stop peers from
+  exchanging messages and cost the cluster its quorum. Alternative if that
+  plumbing is larger than it looks: separate authenticated internal
+  endpoints for forwarding, decided in the milestone's design doc.
+- Deferred: gRPC mTLS or bearer tokens; node-to-node Raft authentication
+  (assumed to run inside a private network or tailnet).
+
+### 6.3 Serializable isolation audit
+
+See the audit doc. Summary: reproduce and close the apply-order gap with a
+permanent commit-timestamp fence at apply (A0), audit every read-then-write
+path per adapter for `ReadKeys` coverage (S3 and Lua first, A1), protect 2PC
+read keys with read locks installed at PREPARE, which also replaces the
+out-of-lock read-only-shard check (A2), model allocation and apply
+separately in `tla/occ` and add a no-write-skew property (A3), add
+write-skew Jepsen workloads for Redis, DynamoDB, and Lua (A4; gRPC has no
+read-set-bearing transaction API, G8, so its evidence stays the engine-level
+Go reproductions until such an API exists), and
+rewrite the consistency sections of README, `architecture_overview.md`, and
+`review_todo.md` (A5), and make an outcome the server cannot determine
+(a proposal pending at leadership loss) distinguishable from a definite
+failure on every surface (A6, G11). The A0 reproduction test is the first thing to run;
+its result decides what README may say.
+
+The two open TSO proposals (`2026_08_29_proposed_tso_batch_slot_claims.md`,
+`2026_09_02_proposed_prephase_d_resolution_evidence.md`) protect the
+timestamp-uniqueness assumption the OCC check relies on. They belong to the
+same correctness track and are listed as active in §7. Their order relative
+to the audit's fixes is open (§9), but they gate the README claims for
+Phase-D clusters (§6.1): until both land, README states the claims for
+legacy-mode clusters only.
+
+### 6.4 Benchmark harness and published numbers
+
+- Harness under `bench/`, runbook in `docs/benchmarks.md`, summary in README.
+- Workloads: DynamoDB (YCSB A/B/C-equivalent mixes over `PutItem` / `GetItem`
+  / `UpdateItem`), Redis (`GET` / `SET` via memtier or redis-benchmark), and
+  failover latency (leader kill during a run: p99 and time to recover).
+- Topology: three identical Linux nodes; exact hosts and specs are fixed in
+  the harness design doc (open question, §9).
+- Absolute numbers for elastickv only. No side-by-side runs of other systems;
+  the harness is public so others can compare on their own hardware.
+- Runs after 6.3 so the numbers include the final validation path.
+
+### 6.5 HLC ceiling and lease read write-up
+
+External (blog or talk). Material: `kv/hlc.go`, `kv/lease_state.go`,
+`tla/hlc/HLC.tla`, `2026_04_20_implemented_lease_read.md`,
+`2026_04_16_implemented_centralized_tso.md`. The repo gets a pointer, nothing
+more. Can proceed in parallel with 6.2 to 6.4.
+
+### 6.6 On-premises showcase
+
+- A three-node install guide (systemd units, extending
+  `docs/deploy_via_tailscale_runbook.md` and `docs/docker_multinode_manual_run.md`).
+- A sample application under `examples/` in Go with AWS SDK for Go v2, using
+  DynamoDB + S3 + SQS with the endpoint overridden and, for S3,
+  `s3.Options.UsePathStyle = true` (the server is path-style only; the
+  SDK's default virtual-hosted addressing would send requests to
+  `bucket.<endpoint>`, as `internal/snapshotoffload/s3_store.go` already
+  works around), with that setting explained in the sample's README.
+
+### 6.7 Feature track (in-flight partial designs, continued after 6.2 to 6.6)
+
+1. `2026_07_19_partial_physical_snapshot_object_offload.md`: M3 (the
+   dominant work on `main` since July; continues at its current pace).
+2. `2026_04_25_partial_s3_raft_blob_offload.md`: M3 reference counting,
+   grace queue, orphan scanner, GC readiness; M4 legacy `BlobKey` migrator.
+3. `2026_06_11_partial_hotspot_split_milestone2_migration.md`:
+   `StartSplitMigration`, migrator state machine, fence, cutover, cleanup.
+   Parent: `2026_02_18_partial_hotspot_shard_split.md`.
+
+## 7. Status of existing design docs
+
+| Track | Docs |
+|---|---|
+| Active, correctness | this doc; `2026_09_26_proposed_serializable_isolation_audit.md`; `2026_08_29_proposed_tso_batch_slot_claims.md`; `2026_09_02_proposed_prephase_d_resolution_evidence.md`; the security and benchmark docs to be written |
+| Active, features | `2026_07_19_partial_physical_snapshot_object_offload.md` (M3); `2026_04_25_partial_s3_raft_blob_offload.md` (M3, M4); `2026_06_11_partial_hotspot_split_milestone2_migration.md` with parent `2026_02_18_partial_hotspot_shard_split.md` |
+| Future track (horizontal scale) | `2026_06_23_proposed_scaling_roadmap.md` (its 06/12 predecessor is already marked superseded). Referenced from README's future goals; re-evaluated when the active list is empty. |
+| Deferred | Remaining Stage 9 of `2026_04_29_partial_data_at_rest_encryption.md` (9C+: rotation budget, rewrap / retire / rewrite, `last_proposed_index_per_raft_dek`, encrypted Jepsen). Stage 5E (the capability fan-out helper) is shipped and wired (`buildEncryptionCapabilityFanout` in `main.go`) although that doc's header still says deferred; the header is corrected in the A5 documentation pass. |
+| Closed since the interview's inputs were gathered | `logical_backup`, `raft_learner`, `centralized_tso`, `hotspot_split_milestone3_automation`, `ttl_inline_value`, `fsm_apply_observer`, `filesystem_on_elastickv`, `deploy_via_tailscale`, `9a_encryption_compression`, `9b_kek_providers` are all `implemented` on `main`; the interview's active / deferred choices that named them are moot and are not carried into the table above. |
+
+## 8. Decisions
+
+Recorded from the 2026-09-26 design interview, then reconciled with `main`.
+
+- Success is research and technical proof first, adoption second. Capacity:
+  one maintainer plus agents, a few hours a week, no deadline.
+- Main arena: self-hosted AWS-compatible store plus correctness evidence. First
+  showcase: on-premises / edge / air-gapped deployment, delivered as an install
+  guide plus a sample app.
+- Consistency claim (targets, not yet made for every path): per-key
+  linearizable; multi-key transactions atomic and serializable. Write skew must not occur. The Jepsen strict-serializable
+  checkers are evidence for the claim, and write-skew workloads are added per
+  adapter.
+- README uses a two-tier scope (today / future goals); there is no non-goals
+  section. Horizontal scale of TiKV class and multi-region are future goals.
+- Hotspot split M2 stays active (M3 is already implemented). The scaling
+  roadmap doc is the future track, not abandoned.
+- Performance: absolute numbers on three nodes for DynamoDB, Redis, and
+  failover latency; elastickv only; harness published.
+- Security milestone scope: DynamoDB SigV4 static credentials, Redis AUTH,
+  TLS on all listeners. gRPC mTLS deferred.
+- Order: security → serializable audit implementation → benchmarks → HLC
+  write-up (parallel) → showcase → feature track.
+- Spec of record is `docs/design/`; no ADRs; decisions live in design docs
+  (this section is the pattern); repository artifacts are English.
+- The audit's A2 analysis found gaps G0 and G1 on `main`, and both are
+  reproduced by failing tests; the serializable claim is the target and is
+  not made for any path until the full §6.1 gate holds: A0 to A2, G11,
+  G15, and G13 merged and A7's V2 format in effect cluster-wide (the
+  `txn-v2` marker, not the activation entry).
+- Cross-shard atomicity is gated on G12, G13, and G14 together: A2's
+  transaction id and PREPARE order plus A0's index-based replay detection,
+  merged and in effect through A7's `txn-v2` marker cluster-wide, as for
+  every consistency claim.
+- The README consistency claims exclude Phase-D clusters until both TSO
+  admission proposals land; legacy-mode clusters do not wait on them.
+- The README consistency claims exclude resolver-routed keys (SQS FIFO
+  queues placed with `--sqsFifoPartitionMap`) until the resolver-aware
+  Composed-1 gate lands: A2's catalog-version pin cannot fence a route
+  the catalog does not own.
+
+Assumptions made while reconciling with `main` (not put to the interview):
+
+- The two TSO admission proposals are treated as active correctness work
+  alongside the audit rather than deferred.
+- Physical snapshot object offload M3 keeps its current momentum and is
+  listed first in the feature track.
+- Encryption 9C+ stays deferred even though 9A / 9B (compression, KMS
+  providers) shipped; the interview's "defer Stage 9" answer is applied to
+  what remains.
+
+## 9. Open questions
+
+1. Benchmark hosts: which three machines, and their CPU / memory / disk / NIC.
+   Fixed in the benchmark harness design doc.
+2. Order of the two TSO admission proposals relative to the serializable
+   audit's fixes (before, after, or interleaved). Settled only as far as
+   the claims go: both must land before README covers Phase-D clusters
+   (§6.1); whether they land before or after A0 to A2 is still open.
+3. Sample app scope: which DynamoDB / S3 / SQS operations it exercises, and
+   whether Redis and the FUSE filesystem are included.
+4. What "multi-region" means for a future milestone: async replica, or a
+   second Raft group set with cross-region routes. Not needed until the
+   future track opens.
+5. Whether to run the audit's A0 reproduction test before the security
+   milestone: it is about a day of work and decides the claim, so the
+   recommendation is yes, without changing the rest of the order.

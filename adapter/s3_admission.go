@@ -233,12 +233,25 @@ func (s *S3Server) admitS3PutRequest(w http.ResponseWriter, r *http.Request, buc
 		writeS3Error(w, http.StatusLengthRequired, "MissingContentLength", err.Error(), bucket, objectKey)
 		return false
 	}
-	if err := s.putAdmission.peekHeadroom(bytes); err != nil {
-		s.observeS3PutAdmissionRejection(s3PutAdmissionStagePrereserve, protocol)
+	if err := s.checkS3PutHeadroom(bytes, protocol); err != nil {
 		writeS3AdmissionError(w, bucket, objectKey, s.s3PutAdmissionRetryAfter())
 		return false
 	}
 	return true
+}
+
+// checkS3PutHeadroom is the admission pre-check every PUT runs before it
+// reads the body. It fails with errS3PutAdmissionExhausted when the limiter
+// cannot fit probeBytes right now.
+func (s *S3Server) checkS3PutHeadroom(probeBytes int64, protocol string) error {
+	if s == nil || s.putAdmission == nil {
+		return nil
+	}
+	if err := s.putAdmission.peekHeadroom(probeBytes); err != nil {
+		s.observeS3PutAdmissionRejection(s3PutAdmissionStagePrereserve, protocol)
+		return err
+	}
+	return nil
 }
 
 func (s *S3Server) s3PutAdmissionProbeBytes(r *http.Request, maxDecoded int64) (int64, string, error) {

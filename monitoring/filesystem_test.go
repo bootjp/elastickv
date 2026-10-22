@@ -90,3 +90,31 @@ func TestRegistryReturnsFileSystemObserver(t *testing.T) {
 	registry := NewRegistry("n1", "127.0.0.1:0")
 	require.NotNil(t, registry.FileSystemObserver())
 }
+
+func TestFileSystemMetricsSeparateLocalMoveJobsFromScan(t *testing.T) {
+	t.Parallel()
+
+	// Two mounted nodes resume different durable move jobs before either has
+	// run a placement scan. The cluster-wide gauge is scan-derived and must
+	// not pick up node-local observations (it is aggregated with max across
+	// nodes), while the per-node gauge counts what this process is running
+	// (aggregated with sum).
+	nodeA := newFileSystemMetrics(prometheus.NewRegistry())
+	nodeB := newFileSystemMetrics(prometheus.NewRegistry())
+	nodeA.ObserveMoveJob([]byte("job-a"), true)
+	nodeB.ObserveMoveJob([]byte("job-b"), true)
+
+	require.Equal(t, float64(0), testutil.ToFloat64(nodeA.fileMoveInflight), "scan gauge must not include local jobs")
+	require.Equal(t, float64(0), testutil.ToFloat64(nodeB.fileMoveInflight), "scan gauge must not include local jobs")
+	require.Equal(t, float64(1), testutil.ToFloat64(nodeA.fileMoveActiveLocal))
+	require.Equal(t, float64(1), testutil.ToFloat64(nodeB.fileMoveActiveLocal))
+
+	nodeA.ObservePlacementStats(filesystem.PlacementStats{MoveInflight: 2})
+	nodeB.ObservePlacementStats(filesystem.PlacementStats{MoveInflight: 2})
+	require.Equal(t, float64(2), testutil.ToFloat64(nodeA.fileMoveInflight))
+	require.Equal(t, float64(2), testutil.ToFloat64(nodeB.fileMoveInflight))
+
+	nodeA.ObserveMoveJob([]byte("job-a"), false)
+	require.Equal(t, float64(0), testutil.ToFloat64(nodeA.fileMoveActiveLocal))
+	require.Equal(t, float64(2), testutil.ToFloat64(nodeA.fileMoveInflight), "the durable scan remains authoritative")
+}

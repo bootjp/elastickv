@@ -28,7 +28,8 @@ const encryptionDialTimeout = 5 * time.Second
 // Subcommand surface (in shipping order): status, rotate-dek,
 // register-writer, bootstrap, probe-node-id,
 // enable-storage-envelope (6D-6b), enable-raft-envelope (6E-1b;
-// the server method is gated until 6E-2 ships wrap-on-propose).
+// the server method is gated until 6E-2 ships wrap-on-propose),
+// wrap-dek (9D; local KEK-wrap helper for bootstrap / rotate-dek).
 // ResyncSidecar is a server-side §5.5 fallback (no CLI surface).
 func encryptionMain(args []string) error {
 	if len(args) == 0 {
@@ -43,13 +44,13 @@ func encryptionMain(args []string) error {
 		// subcommands; returning nil keeps the exit code at 0
 		// so shell scripts using $? to detect success do not
 		// trip on a help request.
-		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap\n  enable-storage-envelope\n  enable-raft-envelope\n  probe-node-id")
+		_, err := fmt.Fprintln(os.Stdout, "usage: elastickv-admin encryption <subcommand> [flags]\n\nsubcommands:\n  status\n  rotate-dek\n  register-writer\n  bootstrap\n  enable-storage-envelope\n  enable-raft-envelope\n  probe-node-id\n  wrap-dek")
 		if err != nil {
 			return errors.Wrap(err, "write usage")
 		}
 		return nil
 	}
-	return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap, enable-storage-envelope, enable-raft-envelope, probe-node-id)", sub)
+	return errors.Errorf("encryption: unknown subcommand %q (supported: status, rotate-dek, register-writer, bootstrap, enable-storage-envelope, enable-raft-envelope, probe-node-id, wrap-dek)", sub)
 }
 
 // encryptionSubcommands is the dispatch table for the encryption
@@ -66,6 +67,7 @@ func encryptionSubcommands() map[string]func(args []string, out io.Writer) error
 		"enable-storage-envelope": runEncryptionEnableStorageEnvelope,
 		"enable-raft-envelope":    runEncryptionEnableRaftEnvelope,
 		"probe-node-id":           runEncryptionProbeNodeID,
+		"wrap-dek":                runEncryptionWrapDEK,
 	}
 }
 

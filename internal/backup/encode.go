@@ -45,11 +45,19 @@ import (
 // `.fsm` whose Pebble image depends on insertion order.
 var ErrEncodeDuplicateKey = errors.New("backup: duplicate encoded key in snapshot build")
 
-// ErrEncodeKeyTooLarge / ErrEncodeValueTooLarge mirror the decode-side
-// MaxSnapshotEncodedKeySize / MaxSnapshotEncodedValueSize caps. A
-// reconstructed entry exceeding them would produce a `.fsm` the live
-// restore path rejects, so the encoder fails closed before writing a
-// single byte rather than emit an unloadable file.
+// maxEncodedLogicalKeySize caps the keys the encoder writes: a logical key
+// up to store.MaxSnapshotKeySize (1 MiB), the largest key guaranteed to
+// round-trip through a snapshot, plus the timestamp suffix. The reader's
+// MaxSnapshotEncodedKeySize is larger by the store's 32-byte internal
+// envelope, which only the store's own staging keys use; the encoder
+// writes user keys, so it keeps the logical cap.
+const maxEncodedLogicalKeySize = maxSnapshotUserKeySize + snapshotTSSize
+
+// ErrEncodeKeyTooLarge / ErrEncodeValueTooLarge enforce
+// maxEncodedLogicalKeySize and the decode-side MaxSnapshotEncodedValueSize.
+// A reconstructed entry exceeding them would produce a `.fsm` the live
+// restore path rejects or cannot round-trip, so the encoder fails closed
+// before writing a single byte rather than emit an unloadable file.
 var ErrEncodeKeyTooLarge = errors.New("backup: encoded key length exceeds limit")
 var ErrEncodeValueTooLarge = errors.New("backup: encoded value length exceeds limit")
 
@@ -170,9 +178,9 @@ func (b *snapshotBuilder) Add(userKey, userValue []byte, expireAt uint64) error 
 	// framed buffers — encKey = userKey + snapshotTSSize, encVal =
 	// snapshotValueHeaderSize + userValue — so an oversize record
 	// fails closed without a wasted allocation (claude review nit).
-	if uint64(len(userKey))+snapshotTSSize > MaxSnapshotEncodedKeySize {
+	if uint64(len(userKey))+snapshotTSSize > maxEncodedLogicalKeySize {
 		return errors.Wrapf(ErrEncodeKeyTooLarge,
-			"length %d > %d", len(userKey)+snapshotTSSize, MaxSnapshotEncodedKeySize)
+			"length %d > %d", len(userKey)+snapshotTSSize, maxEncodedLogicalKeySize)
 	}
 	if uint64(len(userValue))+snapshotValueHeaderSize > MaxSnapshotEncodedValueSize {
 		return errors.Wrapf(ErrEncodeValueTooLarge,

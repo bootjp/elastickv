@@ -1,6 +1,6 @@
 # Data-at-rest encryption for elastickv
 
-Status: Partial — Stages 0–8, 9A–9B, 9C-1, and 9C-2 shipped (5E deferred); remaining Stage 9 work open
+Status: Partial — Stages 0–8, 9A–9B, 9C-1, 9C-2, and 9D shipped (5E deferred); remaining Stage 9 work open
 Author: bootjp
 Date: 2026-04-29
 
@@ -36,7 +36,8 @@ Date: 2026-04-29
 | 9B | AWS KMS, GCP KMS, Vault Transit, and test/CI env KEK providers; mutually-exclusive source loader and loaded-provider mutator gate (§5.1, §6.1, §6.5) | shipped | `2026_07_18_implemented_9b_kek_providers.md` |
 | 9C-1 | Storage-envelope observability: `decrypt_failures_total`, `writes_per_dek`, `value_overhead_bytes`, wired from the storage envelope path through `monitoring.Registry` (§9.2) | shipped | — |
 | 9C-2 | Sidecar/KEK observability: `active_dek_id{purpose}`, `sidecar_raft_index`, `kek_unwrap_seconds` (§9.2) | shipped | — |
-| 9C+ | Rotation budget/rewrap/retire/rewrite, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks and encrypted Jepsen (§5.2, §5.4, §6.5, §8) | open | — |
+| 9D | Encrypted Jepsen acceptance gate (§8.4): `elastickv-admin encryption wrap-dek` (local KEK-wrap helper so an operator or a script can produce the `bootstrap` / `rotate-dek` material without hand-rolling AES-GCM), `scripts/jepsen-enable-encryption.sh` (bootstrap → `enable-storage-envelope` → `enable-raft-envelope` → wait for every member), `scripts/run-jepsen-local.sh --encrypted`, and an `encryption: [off, on]` matrix on the per-push `Jepsen Test` workflow so every Redis / DynamoDB / S3 / SQS / filesystem workload also runs against an encrypted 3-node cluster. | shipped | this PR |
+| 9C+ | Rotation budget/rewrap/retire/rewrite, `last_proposed_index_per_raft_dek` (needs the §5.4 raft-DEK Wrap path), remaining benchmarks (§5.2, §5.4, §6.5, §8.3) | open | — |
 
 Stages 0–4 ship the entire byte-tag pipeline (storage envelope, raft
 envelope, FSM dispatch, halt-on-error) but leave it **production
@@ -2447,14 +2448,56 @@ different output bytes; FSM apply still deterministic), so no new
 Jepsen workload is required. A pass under the existing suite is the
 acceptance gate.
 
-**Implemented.** `lein test :only ...` aside, any workload accepts
-`--encryption`, which provisions the §5.1 KEK file on each node and
-starts the server with `--encryption-enabled`, `--kekFile` and
-`--encryptionSidecarPath`. The switch defaults off so the existing
-unencrypted runs are unchanged, and `server-args` is a pure function so
-a test can assert the flags actually reach the server — a `--encryption`
-run that silently produced an unencrypted cluster would report PASS and
-be recorded as evidence for this gate.
+**Status (Stage 9D, shipped):** the gate runs on every push and
+locally.
+
+- **Cluster shape.** The same 3-node single-group cluster the
+  cleartext Jepsen runs use, started with `--encryption-enabled
+  --kekFile <kek> --encryptionSidecarPath <datadir>/keys.json` on
+  every node. The KEK is a random 32-byte owner-only file shared by
+  the three nodes (the file provider from §5.1; KMS providers are
+  exercised by their unit tests, not by Jepsen).
+- **Cutover.** `scripts/jepsen-enable-encryption.sh <elastickv-admin>
+  <kek-file> <grpc-endpoint>...` drives the §7.1 rollout before the
+  first workload: it wraps two fresh DEKs with `elastickv-admin
+  encryption wrap-dek --kek-file`, proposes `encryption bootstrap
+  --discover-from=<every member>` (storage DEK id 1, raft DEK id 2),
+  then `enable-storage-envelope` and `enable-raft-envelope` with the
+  proposer identity read from the accepting member's own
+  `GetCapability` report, retrying across endpoints until the leader
+  accepts. It exits non-zero unless every member reports
+  `storage_envelope_active: true` and a non-zero
+  `raft_envelope_cutover_index` within 30 s, so a workload can never
+  silently run against a half-encrypted cluster.
+- **Workloads.** Unchanged: Redis list-append, Redis ZSet safety,
+  DynamoDB list-append, the ten DynamoDB per-type register workloads,
+  S3, SQS HT-FIFO, and the filesystem register workload in both write
+  modes. All user writes after the cutover go through the §4.1 storage
+  envelope and every Raft entry after the cutover index through the
+  §4.2 raft envelope, so the encrypted leg covers the storage cipher,
+  the deterministic-nonce writer registry, and the engine pre-apply
+  unwrap hook under the same nemeses as the cleartext leg.
+- **CI.** `.github/workflows/jepsen-test.yml` runs the job as a
+  `matrix.encryption: ['off', 'on']` pair; the `on` leg adds the
+  encryption flags at cluster launch and an "Enable data-at-rest
+  encryption" step that calls the script above. Both legs must pass.
+- **Local.** `./scripts/run-jepsen-local.sh --encrypted` builds the
+  server and `elastickv-admin`, generates the KEK under the run's
+  data dir, starts the cluster, runs the cutover, and then runs the
+  same workloads as the cleartext invocation.
+- **Managed Jepsen.** Every workload accepts `--encryption` and passes
+  it to the shared DB adapter. The adapter builds the repository-root
+  production server, provisions the shared test KEK, discovers every
+  member for bootstrap, applies both envelope cutovers after membership
+  is established, and waits for every node to report both active before
+  releasing the workload. `--local --encryption` is rejected because a
+  no-op DB adapter cannot provision or verify that cluster.
+- **Evidence (first run, this PR).** Against an encrypted cluster
+  built from this branch: Redis list-append pass, Redis ZSet safety
+  pass, DynamoDB list-append pass (30 s), all ten DynamoDB per-type
+  workloads pass (20 s each), S3 pass, SQS HT-FIFO pass. A cleartext
+  marker written through Redis after the cutover was not found by a
+  byte search of any file under the three nodes' data directories.
 
 ---
 
@@ -2692,7 +2735,8 @@ eventual code change.
      across a rotation boundary, follower with stale sidecar
      refuses to start.
    - Jepsen Redis + DynamoDB suites against an encrypted 3-node
-     cluster as the acceptance gate.
+     cluster as the acceptance gate (shipped in Stage 9D as the
+     `encryption: on` leg of the `Jepsen Test` workflow; see §8.4).
 
 ---
 

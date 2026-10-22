@@ -57,6 +57,14 @@
   (let [db (ekdb/db {:grpc-port 50051 :encryption true})]
     (is (true? (get-in db [:opts :encryption])))))
 
+(deftest managed-encryption-builds-the-production-server
+  ;; cmd/server is the demo binary and does not expose EncryptionAdmin or the
+  ;; encryption flags. The managed harness must build the repository root.
+  (let [builds @#'ekdb/binary-builds
+        server-args (second (first (filter #(= "elastickv" (first %)) builds)))]
+    (is (= "." (last server-args)))
+    (is (not-any? #{"./cmd/server"} server-args))))
+
 ;; ---------------------------------------------------------------------------
 ;; The load-bearing property: the switch must actually reach the server
 ;; ---------------------------------------------------------------------------
@@ -96,6 +104,11 @@
            (set (remove #(or (= % "/var/lib/elastickv/keys.json")
                              (= % "/var/lib/elastickv/kek.bin"))
                         plain))))))
+
+(deftest server-args-preserves-the-filesystem-mount
+  (let [args (args-for {:filesystem-mount "/mnt/elastickv"})]
+    (is (some #{"--filesystemMount"} args))
+    (is (some #{"/mnt/elastickv"} args))))
 
 ;; ---------------------------------------------------------------------------
 ;; The switch must ACTIVATE encryption, not just reach the server
