@@ -160,6 +160,14 @@ func (m externalRestoreOrigin) matchesSnapshot(snapshot raftpb.Snapshot, token s
 // restore of the original bytes. Keep the immutable binding for every fallback.
 // Open persists this before starting transport or the snapshot/apply workers.
 func completeExternalRestoreOrigin(dir string, validated bool) error {
+	return completeExternalRestoreOriginWithPersistence(dir, validated, writeAndSyncFile, syncDir)
+}
+
+// Dependencies are explicit so tests can reproduce a visible rename whose
+// directory flush failed, without process-wide filesystem hooks.
+func completeExternalRestoreOriginWithPersistence(dir string, validated bool,
+	writeCompletion func(string, []byte) error, syncCompletion func(string) error,
+) error {
 	if !validated {
 		return nil
 	}
@@ -171,14 +179,15 @@ func completeExternalRestoreOrigin(dir string, validated bool) error {
 		return errors.WithStack(ErrExternalSnapshotRestoreOrigin)
 	}
 	if marker.Completed {
-		return nil
+		// A previous rename may be visible despite a failed directory fsync.
+		return errors.WithStack(syncCompletion(dir))
 	}
 	marker.Completed = true
 	data, err := json.Marshal(marker)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return writeAndSyncFile(filepath.Join(dir, externalRestoreOriginFile), data)
+	return errors.WithStack(writeCompletion(filepath.Join(dir, externalRestoreOriginFile), data))
 }
 
 // This decision requires the real WAL selection and successful ReadAll, not an

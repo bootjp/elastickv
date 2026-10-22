@@ -233,3 +233,37 @@ func TestExternalOriginMissingWALCannotBootstrap(t *testing.T) {
 	_, err := openDiskState(OpenConfig{DataDir: dir, StateMachine: &originRecordingFSM{}, Bootstrap: true}, nil)
 	require.ErrorIs(t, err, ErrExternalSnapshotRestoreOrigin)
 }
+
+func TestExternalOriginCompletionRetriesDirectoryFlush(t *testing.T) {
+	dir, _ := prepareOriginFixture(t)
+	failure := errors.New("completion directory flush failed after rename")
+	flushes, writes := 0, 0
+	flush := func(path string) error {
+		require.Equal(t, dir, path)
+		flushes++
+		if flushes < 3 {
+			return failure
+		}
+		return syncDir(path)
+	}
+	write := func(path string, data []byte) error {
+		writes++
+		// Publish real, valid completed bytes atomically, then inject the
+		// post-rename error returned by the completion writer's contract.
+		require.NoError(t, writeAndSyncFile(path, data))
+		return flush(filepath.Dir(path))
+	}
+	for attempt := range 3 {
+		err := completeExternalRestoreOriginWithPersistence(dir, true, write, flush)
+		if attempt < 2 {
+			require.ErrorIs(t, err, failure, "Open must remain gated while completion durability is uncertain")
+		} else {
+			require.NoError(t, err)
+		}
+		marker, readErr := readExternalRestoreOrigin(dir)
+		require.NoError(t, readErr)
+		require.True(t, marker.Completed, "a visible completed flag is not proof that its directory flush succeeded")
+	}
+	require.Equal(t, 1, writes, "completed retries must not rewrite the immutable binding")
+	require.Equal(t, 3, flushes, "every retry must re-establish the completion durability barrier")
+}
