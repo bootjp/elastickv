@@ -53,7 +53,7 @@ func (a *LeaderRoutedTSOAllocator) ValidateLegacyResolutionTimestamps(ctx contex
 
 func (a *LeaderRoutedTSOAllocator) tryLegacyResolutionValidation(ctx context.Context, start, commit uint64) (string, error) {
 	if a.local.IsLeader() {
-		return "local", validateLegacyResolutionThrough(ctx, a.local, start, commit)
+		return tsoRequestPathLocal, validateLegacyResolutionThrough(ctx, a.local, start, commit)
 	}
 	addr := leaderAddrFromEngine(a.leader)
 	if addr == "" {

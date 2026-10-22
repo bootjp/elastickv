@@ -18,6 +18,7 @@ import (
 const (
 	defaultTSORouteRetryBudget   = 5 * time.Second
 	defaultTSORouteRetryInterval = 25 * time.Millisecond
+	tsoRequestPathLocal          = "local"
 )
 
 var (
@@ -656,7 +657,7 @@ func (a *LeaderRoutedTSOAllocator) tryBatch(
 	if a.local.IsLeader() {
 		started := time.Now()
 		reservation, err := a.tryLocalBatch(ctx, n, min, activate, activatePhaseD, requireReservation)
-		a.observeRequest("reserve", "local", err, time.Since(started))
+		a.observeRequest("reserve", tsoRequestPathLocal, err, time.Since(started))
 		return reservation, err
 	}
 	addr := leaderAddrFromEngine(a.leader)
@@ -773,7 +774,7 @@ func (a *LeaderRoutedTSOAllocator) ValidateDurableTimestamp(ctx context.Context,
 			}
 			started := time.Now()
 			lastErr = errors.WithStack(validator.ValidateDurableTimestamp(ctx, timestamp))
-			a.observeRequest("validate", "local", lastErr, time.Since(started))
+			a.observeRequest("validate", tsoRequestPathLocal, lastErr, time.Since(started))
 		} else {
 			addr := leaderAddrFromEngine(a.leader)
 			if addr == "" {

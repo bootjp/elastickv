@@ -305,11 +305,22 @@ first primary COMMIT requires the durable chosen timestamp to match exactly.
 
 ### Acceptance Status
 
-The implementation and focused regression tests are being integrated in the
-existing PR. The document remains Partial until end-to-end forwarded cutover,
-leader changes, pending restart/snapshot recovery, release retry, and late legacy
-creation are verified together. Code presence or a classifier-only test is not
-completion evidence for this protocol.
+The existing PR includes a real nine-engine, three-group gRPC acceptance test
+covering forwarded cutover, leadership transfer, release failures, and late
+creation. Separate joint-recovery tests restore group-zero pending or active
+snapshots together with partially released data groups, keep B fixed, and block
+issuance until every release completes. Pebble snapshot/reopen tests cover both
+V1 and V3 PREPARE followed by repeated ABORT and rejection of a later COMMIT.
+
+Restored pre-upgrade staging is checked again at promotion: a peer-local
+control row refuses the whole chunk without moving ordinary rows, advancing
+the migration checkpoint, or halting replication. The staged input is retained
+for explicit recovery rather than silently deleted. Actual storage failures
+retain their existing halt classification.
+
+These tests do not establish a full process-level rolling upgrade or production
+stability. The document remains Partial until that deployment acceptance is
+available; code presence and in-process tests alone do not establish it.
 
 ## 5. Open questions for review
 
