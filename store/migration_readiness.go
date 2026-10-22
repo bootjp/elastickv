@@ -62,6 +62,10 @@ func (s *mvccStore) ApplyTargetStagedReadiness(_ context.Context, state TargetSt
 	cloned := cloneTargetStagedReadinessState(state)
 	s.migrationReadiness[state.JobID] = cloned
 	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, cloned)
+	if state.Armed {
+		s.lastCommitTS = max(s.lastCommitTS, state.MinWriteTSExclusive)
+		s.migrationHLCFloors[state.JobID] = max(s.migrationHLCFloors[state.JobID], state.MinWriteTSExclusive)
+	}
 	return nil
 }
 
@@ -76,21 +80,14 @@ func (s *mvccStore) MigrationTargetReadinessStates(_ context.Context) ([]TargetS
 }
 
 func (s *pebbleStore) ApplyTargetStagedReadiness(_ context.Context, state TargetStagedReadinessState) error {
-	if err := validateTargetStagedReadinessState(state); err != nil {
-		return err
-	}
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	if err := s.db.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), s.directApplyWriteOpts()); err != nil {
-		return errors.WithStack(err)
-	}
-	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
-	return nil
+	return s.applyTargetStagedReadiness(state, 0, false)
 }
 
 func (s *pebbleStore) ApplyTargetStagedReadinessAt(_ context.Context, state TargetStagedReadinessState, appliedIndex uint64) error {
+	return s.applyTargetStagedReadiness(state, appliedIndex, true)
+}
+
+func (s *pebbleStore) applyTargetStagedReadiness(state TargetStagedReadinessState, appliedIndex uint64, raftApply bool) error {
 	if err := validateTargetStagedReadinessState(state); err != nil {
 		return err
 	}
@@ -115,11 +112,25 @@ func (s *pebbleStore) ApplyTargetStagedReadinessAt(_ context.Context, state Targ
 		}
 	}
 
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
-	if err := batch.Commit(s.raftApplyWriteOpts()); err != nil {
+	// The clock floor must survive the same crash boundary as the guard and
+	// applied index, even when the moved range contains no imported versions.
+	floor := uint64(0)
+	if state.Armed {
+		floor = state.MinWriteTSExclusive
+	}
+	unlock, lastTS, err := s.stageMigrationClockMetadata(batch, state.JobID, floor)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	writeOpts := s.directApplyWriteOpts()
+	if raftApply {
+		writeOpts = s.raftApplyWriteOpts()
+	}
+	if err := batch.Commit(writeOpts); err != nil {
 		return errors.WithStack(err)
 	}
+	s.lastCommitTS = lastTS
 	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
 	return nil
 }

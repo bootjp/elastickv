@@ -53,6 +53,9 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 		// runner's voter probe cannot repair after the fact.
 		return haltErr(errors.Wrap(errors.Mark(err, ErrTargetReadinessApply), "kv/fsm: persist target staged readiness"))
 	}
+	if state.Armed && f.hlc != nil {
+		f.hlc.Observe(max(state.MinWriteTSExclusive, f.store.LastCommitTS()))
+	}
 	return nil
 }
 

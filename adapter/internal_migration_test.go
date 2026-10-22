@@ -938,10 +938,11 @@ func TestInternalApplyTargetStagedReadinessProposesThroughRaft(t *testing.T) {
 
 	ctx := context.Background()
 	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
 	proposer := &applyingMigrationProposer{
 		fsm: kv.NewKvFSMWithHLC(st, nil),
 	}
-	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
 		WithInternalStore(st),
 		WithInternalMigrationProposer(proposer),
 		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
@@ -958,6 +959,8 @@ func TestInternalApplyTargetStagedReadinessProposesThroughRaft(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, uint64(1), proposer.calls)
+	require.Equal(t, uint64(100), st.LastCommitTS())
+	require.GreaterOrEqual(t, clock.Current(), uint64(100))
 
 	reader, ok := st.(store.MigrationTargetReadinessReader)
 	require.True(t, ok)

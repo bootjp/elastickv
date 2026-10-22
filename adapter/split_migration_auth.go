@@ -28,7 +28,15 @@ func splitMigrationMutatingMethod(method string) bool {
 }
 
 func splitMigrationProtectedMethod(method string) bool {
-	return splitMigrationMutatingMethod(method) || method == pb.Internal_ExportRangeVersions_FullMethodName
+	switch method {
+	case pb.Internal_ExportRangeVersions_FullMethodName,
+		pb.Internal_ProbeMigrationLocks_FullMethodName,
+		pb.Internal_ProbeMigrationState_FullMethodName,
+		pb.Internal_IssueMigrationTimestamp_FullMethodName:
+		return true
+	default:
+		return splitMigrationMutatingMethod(method)
+	}
 }
 
 // SplitMigrationTokenAuth protects migration control and raw MVCC exports.

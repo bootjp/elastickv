@@ -25,6 +25,9 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 		pb.Internal_PromoteStagedVersions_FullMethodName,
 		pb.Internal_CleanupMigration_FullMethodName,
 		pb.Internal_ExportRangeVersions_FullMethodName,
+		pb.Internal_ProbeMigrationState_FullMethodName,
+		pb.Internal_ProbeMigrationLocks_FullMethodName,
+		pb.Internal_IssueMigrationTimestamp_FullMethodName,
 	}
 	for _, method := range methods {
 		t.Run(method, func(t *testing.T) {
@@ -85,6 +88,9 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 		pb.Internal_PromoteStagedVersions_FullMethodName,
 		pb.Internal_CleanupMigration_FullMethodName,
 		pb.Internal_ExportRangeVersions_FullMethodName,
+		pb.Internal_ProbeMigrationState_FullMethodName,
+		pb.Internal_ProbeMigrationLocks_FullMethodName,
+		pb.Internal_IssueMigrationTimestamp_FullMethodName,
 	} {
 		_, err := unary(context.Background(), nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
 			t.Fatal("unauthenticated migration must not reach the handler")
@@ -108,9 +114,6 @@ func TestSplitMigrationTokenAuthLeavesNormalPeerRPCsUnchanged(t *testing.T) {
 		unary, stream := SplitMigrationTokenAuth(token, false)
 		for _, method := range []string{
 			pb.Internal_Forward_FullMethodName,
-			pb.Internal_ProbeMigrationState_FullMethodName,
-			pb.Internal_ProbeMigrationLocks_FullMethodName,
-			pb.Internal_IssueMigrationTimestamp_FullMethodName,
 			pb.Distribution_ListRoutes_FullMethodName,
 			pb.Distribution_GetSplitMigrationCapability_FullMethodName,
 		} {

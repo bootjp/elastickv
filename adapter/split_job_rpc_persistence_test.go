@@ -3,7 +3,6 @@ package adapter
 import (
 	"context"
 	"testing"
-	"time"
 
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
@@ -12,9 +11,11 @@ import (
 
 type lateImportAckClient struct {
 	*realImportTargetStub
+	attemptCtx context.Context
 }
 
 func (s *lateImportAckClient) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeVersionsRequest, opts ...grpc.CallOption) (*pb.ImportRangeVersionsResponse, error) {
+	s.attemptCtx = ctx
 	resp, err := s.realImportTargetStub.ImportRangeVersions(ctx, req, opts...)
 	if err != nil {
 		return nil, err
@@ -36,11 +37,10 @@ func TestSplitJobCopyPersistsLateAndDuplicateAcknowledgements(t *testing.T) {
 				_, err := target.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{JobId: job.JobID, BracketId: bracket.BracketID, BatchSeq: 1, Cursor: cursor, Versions: versions})
 				require.NoError(t, err)
 			}
-			rpcCtx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
-			defer cancel()
 			stream := &splitMigrationStreamStub{responses: []*pb.ExportRangeVersionsResponse{{Versions: versions, NextCursor: []byte("new-cursor"), Done: true}}}
-			require.NoError(t, server.copySplitJobStream(ctx, rpcCtx, job, 0, bracket, job.BracketProgress[0], stream, &lateImportAckClient{realImportTargetStub: target}))
-			require.ErrorIs(t, rpcCtx.Err(), context.DeadlineExceeded)
+			client := &lateImportAckClient{realImportTargetStub: target}
+			require.NoError(t, server.copySplitJobStream(ctx, job, 0, bracket, job.BracketProgress[0], stream, client))
+			require.ErrorIs(t, client.attemptCtx.Err(), context.DeadlineExceeded)
 			require.NoError(t, ctx.Err())
 			persisted, found, err := catalog.SplitJob(ctx, job.JobID)
 			require.NoError(t, err)

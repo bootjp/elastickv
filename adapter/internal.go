@@ -734,6 +734,13 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
 		return nil, errors.WithStack(err)
 	}
+	if req.GetArmed() && i.clock != nil {
+		floor := req.GetMinWriteTsExclusive()
+		if i.store != nil {
+			floor = max(floor, i.store.LastCommitTS())
+		}
+		i.clock.Observe(floor)
+	}
 	return &pb.TargetStagedReadinessResponse{MinAdmittedTs: i.migrationMinAdmittedTS(ctx, req.GetJobId())}, nil
 }
 

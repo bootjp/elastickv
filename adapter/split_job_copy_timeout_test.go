@@ -34,6 +34,44 @@ type stalledSplitCopyStream struct {
 	ctx context.Context
 }
 
+type freshBudgetImportClient struct {
+	*realImportTargetStub
+	t *testing.T
+}
+
+func (s *freshBudgetImportClient) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeVersionsRequest, opts ...grpc.CallOption) (*pb.ImportRangeVersionsResponse, error) {
+	s.t.Helper()
+	require.NoError(s.t, ctx.Err())
+	deadline, ok := ctx.Deadline()
+	require.True(s.t, ok)
+	require.Greater(s.t, time.Until(deadline), defaultSplitMigrationAttemptTimeout/2)
+	return s.realImportTargetStub.ImportRangeVersions(ctx, req, opts...)
+}
+
+type expiredExportBudgetStream struct {
+	grpc.ClientStream
+	ctx context.Context
+}
+
+func (s *expiredExportBudgetStream) Recv() (*pb.ExportRangeVersionsResponse, error) {
+	<-s.ctx.Done()
+	return &pb.ExportRangeVersionsResponse{NextCursor: []byte("cursor"), Done: true}, nil
+}
+
+func TestSplitJobImportBudgetIsIndependentOfExport(t *testing.T) {
+	t.Parallel()
+	ctx, server, catalog, job, bracket, target := importReplayFixture(t)
+	exportCtx, cancel := context.WithCancel(ctx)
+	cancel()
+	stream := &expiredExportBudgetStream{ctx: exportCtx}
+	client := &freshBudgetImportClient{realImportTargetStub: target, t: t}
+	require.NoError(t, server.copySplitJobStream(ctx, job, 0, bracket, job.BracketProgress[0], stream, client))
+	persisted, found, err := catalog.SplitJob(ctx, job.JobID)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, []byte("cursor"), persisted.BracketProgress[0].Cursor)
+}
+
 func (s *stalledSplitCopyStream) Recv() (*pb.ExportRangeVersionsResponse, error) {
 	<-s.ctx.Done()
 	return nil, s.ctx.Err()

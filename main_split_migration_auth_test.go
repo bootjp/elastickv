@@ -82,6 +82,12 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 		require.NoError(t, err)
 		_, err = client.CleanupMigration(ctx, &pb.CleanupMigrationRequest{})
 		require.NoError(t, err)
+		_, err = client.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{})
+		require.NoError(t, err)
+		_, err = client.ProbeMigrationLocks(ctx, &pb.ProbeMigrationLocksRequest{})
+		require.NoError(t, err)
+		_, err = client.IssueMigrationTimestamp(ctx, &pb.IssueMigrationTimestampRequest{})
+		require.NoError(t, err)
 		stream, streamErr := client.ExportRangeVersions(ctx, &pb.ExportRangeVersionsRequest{})
 		require.NoError(t, streamErr)
 		page, recvErr := stream.Recv()
@@ -175,6 +181,6 @@ func TestSplitMigrationClientNeverSendsTokenOnPlaintext(t *testing.T) {
 	}
 	require.Equal(t, codes.Unauthenticated, status.Code(err))
 	require.ErrorContains(t, err, "cannot send secure credentials")
-	_, err = newSplitMigrationInternalClient(conn, "").ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{})
+	err = conn.Invoke(ctx, pb.Internal_Forward_FullMethodName, &emptypb.Empty{}, &emptypb.Empty{})
 	require.Equal(t, codes.Unimplemented, status.Code(err), "ordinary plaintext peer calls must still reach the handler")
 }

@@ -1171,12 +1171,11 @@ func (s *DistributionServer) copySplitJobPhase(
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return s.copySplitJobStream(ctx, attemptCtx, job, progressIndex, bracket, progress, stream, target)
+	return s.copySplitJobStream(ctx, job, progressIndex, bracket, progress, stream, target)
 }
 
 func (s *DistributionServer) copySplitJobStream(
 	ctx context.Context,
-	rpcCtx context.Context,
 	job distribution.SplitJob,
 	progressIndex int,
 	bracket distribution.MigrationBracket,
@@ -1194,7 +1193,7 @@ func (s *DistributionServer) copySplitJobStream(
 		}
 		nextCursor := distribution.CloneBytes(resp.GetNextCursor())
 		batchSeq := progress.LastAckedBatchSeq + 1
-		ackedCursor, duplicate, err := importSplitJobChunk(rpcCtx, target, job, bracket, batchSeq, resp.GetVersions(), nextCursor)
+		ackedCursor, duplicate, err := importSplitJobChunk(ctx, target, job, bracket, batchSeq, resp.GetVersions(), nextCursor)
 		if err != nil {
 			return err
 		}
@@ -1250,7 +1249,9 @@ func importSplitJobChunk(
 	versions []*pb.MVCCVersion,
 	nextCursor []byte,
 ) ([]byte, bool, error) {
-	resp, err := target.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
+	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
+	defer cancel()
+	resp, err := target.ImportRangeVersions(attemptCtx, &pb.ImportRangeVersionsRequest{
 		JobId:     job.JobID,
 		Versions:  versions,
 		Cursor:    nextCursor,

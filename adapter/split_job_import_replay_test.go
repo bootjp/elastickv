@@ -137,7 +137,7 @@ func TestCopySplitJobStreamAdoptsDuplicateImportAck(t *testing.T) {
 		Done:       true,
 	}}}
 
-	require.NoError(t, s.copySplitJobStream(ctx, ctx, job, 0, bracket, progress, stream, target))
+	require.NoError(t, s.copySplitJobStream(ctx, job, 0, bracket, progress, stream, target))
 
 	loaded, found, err := catalog.SplitJob(ctx, job.JobID)
 	require.NoError(t, err)
@@ -167,7 +167,7 @@ func TestCopySplitJobStreamRejectsUnexplainedCursorMismatch(t *testing.T) {
 		Done:       true,
 	}}}
 
-	err := s.copySplitJobStream(ctx, ctx, job, 0, bracket, progress, stream, lying)
+	err := s.copySplitJobStream(ctx, job, 0, bracket, progress, stream, lying)
 	require.ErrorContains(t, err, "acknowledged a different cursor")
 }
 
