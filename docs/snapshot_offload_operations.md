@@ -331,3 +331,48 @@ logs a warning and still requires `--expect-source-cluster`.
   which retention reclaims. It can never leave a committed manifest.
 - Mark state is per-process and in memory. A restart delays reclamation by one
   pass; it never advances it.
+
+## 8. Bounded local recovery acceptance
+
+`TestSnapshotOffloadThreeNodeRecoveryAcceptance` reuses the real bootstrap
+fixture, not mocked leadership or seeded snapshot files. It runs three etcd/Raft
+nodes with Pebble FSMs, loopback gRPC adapters and one data group. The durable
+filesystem object root is independent of all source and replacement data dirs.
+
+The test starts the actual periodic offload runtime on the source nodes,
+observes a committed generation, stops one follower, and keeps writing through
+the surviving quorum. It restarts the publishers and enables runtime retention
+on one worker with the claims-rollout acknowledgement. Retention must actually
+remove the old manifest **and** its payload; writes continue after reclamation.
+No direct publication, forced snapshot, fake timestamp or direct deletion is
+used. A few checkpoint writes advance the fixture's normal snapshot threshold
+past the asserted user data; offload itself never forces a snapshot.
+
+After stopping all publishers/GC and source nodes, the test reopens the object
+root and restores the retained latest generation into absent data dirs for an
+isolated three-node cluster with new IDs and addresses. Group/source identity,
+target peer metadata and payload SHA are checked. All replacement nodes must
+expose the data in their **local FSM**, report Raft and durable FSM applied indexes
+at least the manifest index, pass RawKV adapter reads, and apply a new replicated
+write. Local checks are necessary because an adapter can forward to the leader.
+
+Reproduce with bounded concurrency and a hard test-process deadline:
+
+```sh
+GOMAXPROCS=4 go test -race . \
+  -run '^TestSnapshotOffloadThreeNodeRecoveryAcceptance$' \
+  -count=3 -timeout=3m -v
+```
+
+Local receipt, 2026-10-23 JST, Go 1.26.6/darwin-arm64: all three race runs passed
+in 28.769 seconds total. Each observed periodic snapshot indexes `17 -> 33 -> 49`,
+reclaimed the first generation, and verified 36 user keys (in addition to
+checkpoint writes). Each replacement restored index 49, initially reported
+Raft applied index 50 and durable FSM applied index 49, and read all 37 asserted
+keys after the post-restore replicated write. Per-run elapsed times were
+9.37, 8.53 and 8.99 seconds.
+
+All data, object roots and sockets are ephemeral/local; the test does not
+deploy, contact production, delete production data or provision paid cloud
+resources. It is **not** a 30-day burn-in, remote-S3 acceptance, a multi-group/TSO
+topology drill or operational closure. The design remains `partial`.

@@ -1,6 +1,6 @@
 # Physical Snapshot Object Offload
 
-Status: Partial — M0/M1/M2 implemented; M3 publication and retention runtime, corruption drills and operations runbook implemented; multi-node acceptance pending
+Status: Partial — M0/M1/M2 implemented; M3 publication and retention runtime, corruption drills, operations runbook and bounded three-node/single-group local recovery acceptance implemented; broader operational acceptance pending
 Author: bootjp
 Date: 2026-07-19
 Updated: 2026-10-22
@@ -51,8 +51,9 @@ The M1 object-store-neutral substrate now adds:
 The runtime scheduler is implemented and wired into main.go, opt-in via
 `--snapshotOffloadBucket` (or `--snapshotOffloadLocalDir`). Retention/GC and
 corruption drills from PR #1222 are integrated. GC requires a separate explicit
-rollout gate; publication alone never enables deletion. Multi-node acceptance
-remains pending; the operator runbook is at
+rollout gate; publication alone never enables deletion. A bounded three-node,
+single-data-group local recovery drill has passed; remote-S3, multi-group and
+long-duration operational acceptance remain outside that receipt. The runbook is at
 [`../snapshot_offload_operations.md`](../snapshot_offload_operations.md).
 
 ## 2. Safety boundary
@@ -253,7 +254,7 @@ applicable KMS decrypt permission).
 | M0 | Persisted snapshot export handle, complete-payload restore preparation, focused design | Implemented in the first substrate PR |
 | M1 | Object client interface, S3-compatible implementation, immutable payload/manifest publication, download verification, operator CLI | Implemented: local and S3 stores, manifest schema, payload-first publish, verified restore, and publish/restore CLI |
 | M2 | Leader-only per-group scheduler, metrics, jitter, concurrency bounds, cancellation and restart idempotency | Implemented: `internal/snapshotoffload/scheduler.go`. Leadership is checked before the snapshot is opened and re-checked immediately before the manifest commit via `PublishOptions.VerifyLeader`; uploads are bounded (default one per process) with interval jitter; cancellation is treated as shutdown rather than publish failure; restart idempotency comes from the object store, since publish reuses a matching committed manifest. Runtime wiring and flags shipped in the M3 slice below. |
-| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: publication runtime, opt-in gated GC using the §5 implementation from #1222, metrics and operations runbook. Corruption drills cover truncated, over-length, missing and tampered payloads. GC validates versioning and requires explicit claims rollout verification. Multi-node acceptance remains pending. |
+| M3 | Retention/GC, restore drills, corruption tests, multi-node acceptance, operational documentation | Partially implemented: publication runtime, opt-in gated GC using the §5 implementation from #1222, metrics and operations runbook. Corruption drills cover truncated, over-length, missing and tampered payloads. GC validates versioning and requires explicit claims rollout verification. Bounded three-node/single-data-group acceptance passes periodic publication, surviving-quorum writes, actual GC and isolated replacement recovery with local FSM/adapter values and applied-index checks. Remote-S3, multi-group and long-duration acceptance are not established by that test. |
 
 The filename and header remain `partial` until M1-M3 complete the central
 object-offload subsystem. At that point the completion PR must use `git mv` to
@@ -279,6 +280,16 @@ old path is absent before requesting review.
   unbounded concurrent uploads.
 - A multi-node drill restores each group from external objects into fresh data
   directories and passes adapter reads after normal Raft startup.
+
+The bounded local acceptance drill uses the existing three-node gRPC bootstrap
+fixture with one data group and an independent durable filesystem object root.
+It must observe scheduler-created generations (not seeded snapshot files), keep
+committing writes with one replica stopped, reclaim old generations through the
+runtime GC, and restore the retained generation into an isolated replacement
+cluster with fresh directories and addresses. Acceptance checks adapter values,
+Raft/FSM applied indexes and a new replicated write after restore. This narrow
+drill does not establish long-duration stability, remote-S3 behavior or every
+multi-group topology; its execution receipt belongs in the operations runbook.
 
 ## 10. Intentional non-goals
 
