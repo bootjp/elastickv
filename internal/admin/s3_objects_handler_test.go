@@ -647,6 +647,7 @@ func TestS3Objects_TranslatesSentinelsToStatus(t *testing.T) {
 		"object-not-found": {ErrObjectsNotFound, http.StatusNotFound},
 		"validation":       {ErrObjectsValidation, http.StatusBadRequest},
 		"upload-too-large": {ErrObjectsUploadTooLarge, http.StatusRequestEntityTooLarge},
+		"upload-throttled": {ErrObjectsUploadThrottled, http.StatusServiceUnavailable},
 		"internal": {errors.New("storage backing failure"),
 			http.StatusInternalServerError},
 	}
@@ -662,6 +663,9 @@ func TestS3Objects_TranslatesSentinelsToStatus(t *testing.T) {
 			rec := httptest.NewRecorder()
 			h.ServeHTTP(rec, req)
 			require.Equal(t, tc.wantCode, rec.Code)
+			if tc.wantCode == http.StatusServiceUnavailable {
+				require.Equal(t, "1", rec.Header().Get("Retry-After"), "503s are retryable")
+			}
 		})
 	}
 }

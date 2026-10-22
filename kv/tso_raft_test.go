@@ -608,8 +608,9 @@ func TestShadowTimestampAllocatorBypassesLegacyAfterObservedCutover(t *testing.T
 }
 
 func TestShadowAndCutoverAllocatorsSerializeMigrationOnGroupZero(t *testing.T) {
+	ceiling := time.Now().Add(testTSOFutureCeiling).UnixMilli()
 	tsoClock := NewHLC()
-	tsoClock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	tsoClock.SetPhysicalCeiling(ceiling)
 	fsm := NewTSOStateMachine(tsoClock)
 	engine := &recordingTSOEngine{
 		state:  raftengine.StateLeader,
@@ -621,7 +622,7 @@ func TestShadowAndCutoverAllocatorsSerializeMigrationOnGroupZero(t *testing.T) {
 	require.NoError(t, err)
 
 	legacyClock := NewHLC()
-	legacyClock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
+	legacyClock.SetPhysicalCeiling(ceiling)
 	shadowRoute, err := NewLeaderRoutedTSOAllocator(local, engine, WithTSORoutedClock(legacyClock))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, shadowRoute.Close()) })

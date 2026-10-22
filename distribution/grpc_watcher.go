@@ -285,7 +285,7 @@ func catalogDeltaFromProto(record *pb.CatalogDeltaRecord) (CatalogDelta, error) 
 			mutation.Op = CatalogMutationDelete
 		case pb.CatalogDeltaMutationOp_CATALOG_DELTA_MUTATION_OP_UPSERT:
 			mutation.Op = CatalogMutationUpsert
-			route, err := routeDescriptorFromProto(raw.GetRoute())
+			route, err := RouteDescriptorFromProto(raw.GetRoute())
 			if err != nil {
 				return CatalogDelta{}, err
 			}
@@ -304,7 +304,7 @@ func catalogDeltaFromProto(record *pb.CatalogDeltaRecord) (CatalogDelta, error) 
 func routeDescriptorsFromProto(routes []*pb.RouteDescriptor) ([]RouteDescriptor, error) {
 	out := make([]RouteDescriptor, 0, len(routes))
 	for _, raw := range routes {
-		route, err := routeDescriptorFromProto(raw)
+		route, err := RouteDescriptorFromProto(raw)
 		if err != nil {
 			return nil, err
 		}
@@ -313,7 +313,11 @@ func routeDescriptorsFromProto(routes []*pb.RouteDescriptor) ([]RouteDescriptor,
 	return out, nil
 }
 
-func routeDescriptorFromProto(raw *pb.RouteDescriptor) (RouteDescriptor, error) {
+// RouteDescriptorFromProto converts a wire route descriptor, keeping every
+// field, and rejects a nil descriptor, an unspecified state and a descriptor
+// that fails validation. The catalog watcher and the autosplit splitter both
+// use it, so a field added to RouteDescriptor is converted in one place.
+func RouteDescriptorFromProto(raw *pb.RouteDescriptor) (RouteDescriptor, error) {
 	if raw == nil {
 		return RouteDescriptor{}, errors.WithStack(ErrCatalogWatchEventInvalid)
 	}

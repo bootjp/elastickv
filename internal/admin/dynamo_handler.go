@@ -539,55 +539,10 @@ func (h *DynamoHandler) handleDelete(w http.ResponseWriter, r *http.Request, nam
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// principalForWrite is the centralised authorisation gate for
-// state-changing endpoints. It pulls the principal out of the
-// request context (failing closed if SessionAuth somehow did not
-// attach one), enforces RoleFull on the JWT-embedded role, and —
-// when a RoleStore is configured — re-validates the access key
-// against the live cluster role index so a downgraded or revoked
-// key cannot continue mutating with a still-valid JWT (Codex P1
-// on PR #635).
-//
-// On any rejection the helper writes the appropriate HTTP error
-// directly and returns ok=false so callers can early-exit with no
-// further work. The forward server applies the same re-validation
-// on its side, so leader-direct and forwarded write requests have
-// matching authorisation contracts.
+// principalForWrite gates the state-changing table and item endpoints.
+// The policy lives in authorizePrincipal.
 func (h *DynamoHandler) principalForWrite(w http.ResponseWriter, r *http.Request) (AuthPrincipal, bool) {
-	principal, ok := PrincipalFromContext(r.Context())
-	if !ok {
-		// Should be unreachable — SessionAuth runs before this
-		// handler and rejects any request without a principal —
-		// but failing closed here is the right defence-in-depth
-		// posture for any future routing change that might bypass
-		// the middleware chain.
-		writeJSONError(w, http.StatusUnauthorized, "unauthenticated", "no session principal")
-		return AuthPrincipal{}, false
-	}
-	if !principal.Role.AllowsWrite() {
-		writeJSONError(w, http.StatusForbidden, "forbidden",
-			"this endpoint requires a full-access role")
-		return AuthPrincipal{}, false
-	}
-	// Live re-validation against the current role map. Skip when
-	// no RoleStore is configured (single-tenant deployments where
-	// the JWT-embedded role is authoritative); production wiring
-	// always sets one.
-	if h.roles != nil {
-		liveRole, exists := h.roles.LookupRole(principal.AccessKey)
-		if !exists || !liveRole.AllowsWrite() {
-			// Don't surface "your key was revoked" vs "your key
-			// was downgraded" — both are 403 forbidden, and the
-			// distinction is operator-visible only.
-			writeJSONError(w, http.StatusForbidden, "forbidden",
-				"this endpoint requires a full-access role")
-			return AuthPrincipal{}, false
-		}
-		// Use the live role downstream; the JWT may carry a
-		// stale value but the live one is authoritative.
-		principal.Role = liveRole
-	}
-	return principal, true
+	return authorizePrincipal(w, r, h.roles, accessWrite, "this endpoint requires a full-access role")
 }
 
 // tryForwardDelete is the DELETE counterpart of tryForwardCreate.

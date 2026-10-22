@@ -1,11 +1,11 @@
 # Closing the pre-Phase-D resolution carve-out
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-09-02
 
-Related: [2026_08_29_proposed_tso_batch_slot_claims.md](2026_08_29_proposed_tso_batch_slot_claims.md)
-(the other open TSO admission question on the same PR).
+Related: [2026_08_29_partial_tso_batch_slot_claims.md](2026_08_29_partial_tso_batch_slot_claims.md)
+(the separate TSO slot-claim question).
 
 ## 1. The finding
 
@@ -98,10 +98,12 @@ expired and resolvable. So `ValidateForwardedTxnStartTimestamp` can admit a
 pre-D start only while
 
 ```
-wall_now < phaseD_activation_time + maxTxnLockTTLms + grace
+tso_issued_physical_ms < phaseD_activation_time + maxTxnLockTTLms + grace
 ```
 
-where `phaseD_activation_time` is the physical half of `PhaseDFloor()`. After
+where `phaseD_activation_time` is the physical half of `PhaseDFloor()`, and
+`tso_issued_physical_ms` comes from a fresh timestamp issued by the same
+durable TSO group. After
 the window closes, no new pre-D intent can be created, and the §3 commit
 carve-out is then only ever usable against intents that genuinely predate the
 marker — which is what it was written for. The commit carve-out stays open
@@ -109,10 +111,8 @@ indefinitely, as correctness requires.
 
 Costs and open problems:
 
-- The bound is a wall-clock comparison, which `CLAUDE.md` restricts to
-  diagnostics. It would be an *admission* bound rather than an ordering
-  decision, but it is still a clock read on a validation path and needs to be
-  argued explicitly, not assumed acceptable.
+- Each pre-D PREPARE needs a fresh TSO timestamp for the admission check.
+  The durable TSO value cannot regress with the receiver's wall clock.
 - Picking `grace` is an operational knob, and getting it wrong strands
   legitimate long-TTL transactions.
 - It does not stop an attacker who acts inside the window.
@@ -121,7 +121,48 @@ Costs and open problems:
 
 §4.2 closes the fabrication route in steady state; §4.1 closes it during the
 window for the same-group case, where the primary record is locally readable,
-and falls back to §4.2's bound when it is not.
+while §4.2 bounds new intent creation when the primary is remote.
+
+## 4a. Decision (2026-09-15)
+
+**§4.3**, with §4.1 where the primary record is readable and §4.2's bound
+on PREPARE everywhere else. Answers to §5 in order:
+
+1. §4.3. §4.1 alone has no verdict when the primary is remote, and §4.2 alone
+   never consults durable evidence even when it is sitting there.
+2. A leader that cannot read the primary permits legacy resolution rather
+   than refusing or issuing a second RPC. The window applies to PREPARE, so
+   no new pre-D intent can be created after it closes; existing cross-shard
+   intents can still resolve.
+3. `grace` is one hour on top of `maxTxnLockTTLms`. It absorbs clock skew
+   between nodes and the spread of a rolling Phase-D activation, both of which
+   can make a legitimately in-flight transaction look older than it is. Too
+   small strands long-TTL transactions; too large only extends a window that is
+   already bounded, so it errs long.
+4. `ABORT` remains admissible after the creation window closes. Its timestamp
+   is synthesised by `abortTSFrom`, so no record can support it, and requiring
+   one would refuse legitimate abort resolution.
+
+The admission bound uses a fresh timestamp from the durable TSO group, not
+the receiver's wall clock. Its physical component is monotonic across local
+clock rollback, so the closed window cannot reopen on the receiver.
+
+### What has shipped
+
+§4.2 is wired for PREPARE: `ValidateForwardedTxnStartTimestamp` admits a
+pre-Phase-D start only inside the window, which removes step 1 of the attack.
+The production allocator wrappers expose `PhaseDFloor()`; a Phase-D allocator
+without a usable floor refuses new pre-D PREPAREs. COMMIT and ABORT bypass the
+creation window so they can resolve existing intents indefinitely.
+
+§4.1's decision is implemented and tested as `ClassifyPrePhaseDCommit`, but is
+**not yet wired**. It needs a signal the commit-validation path does not
+currently have: whether this node can definitively read the primary's record,
+as distinct from simply not finding one. `ShardStore.primaryTxnRecordedStatus`
+already draws that distinction with its `done` return, and exposing it to the
+forwarded-commit path is the remaining work. Wiring it without that signal
+would make a remote primary indistinguishable from a missing record and refuse
+exactly the cross-shard resolutions §4.1 is careful to preserve.
 
 ## 5. Open questions for review
 
@@ -136,6 +177,5 @@ and falls back to §4.2's bound when it is not.
 4. Should the `ABORT` path get its own rule, given its timestamp is synthesised
    rather than recorded?
 
-Until this is settled the carve-out stays as written, with this document as the
-record of why. It is narrower than main's behaviour, and widening it is not
-possible without also changing `ValidateForwardedTxnStartTimestamp`.
+Settled in §4a. The carve-out is now bounded by §4.2; §4.1 remains to be wired
+behind a local-primary readability signal.

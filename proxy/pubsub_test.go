@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"errors"
 	"io"
 	"net"
@@ -10,6 +11,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
 )
 
@@ -504,6 +506,40 @@ func TestPubSub_SelectAuthSilentlyAccepted(t *testing.T) {
 			assert.Contains(t, writes, "STR:OK")
 		})
 	}
+}
+
+func TestPubSub_DetachedSessionCommandReplyTypes(t *testing.T) {
+	primary := newMockBackend("redis")
+	primary.doFunc = makeCmd("OK", nil)
+	dual := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly}, newTestMetrics(), newTestSentry(), testLogger)
+	defer dual.Close()
+
+	dconn := newMockDetachedConn()
+	s := newTestSession(dconn)
+	s.proxy = &ProxyServer{dual: dual, shutdownCtx: context.Background()}
+	s.dispatchNormalCommand("SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
+	s.dispatchNormalCommand("GET", [][]byte{[]byte("GET"), []byte("k")})
+	require.Equal(t, []any{"STR:OK", "BULKSTR:OK"}, dconn.getWrites())
+}
+
+func TestPubSub_DetachedSessionTransactionReplyTypes(t *testing.T) {
+	primary := newMockBackend("redis")
+	primary.pipelineFunc = func(ctx context.Context, cmds [][]any) ([]*redis.Cmd, error) {
+		exec := redis.NewCmd(ctx, "EXEC")
+		exec.SetVal([]any{"OK", "OK"})
+		return []*redis.Cmd{exec}, nil
+	}
+	dual := NewDualWriter(primary, nil, ProxyConfig{Mode: ModeRedisOnly}, newTestMetrics(), newTestSentry(), testLogger)
+	defer dual.Close()
+
+	dconn := newMockDetachedConn()
+	s := newTestSession(dconn)
+	s.proxy = &ProxyServer{dual: dual}
+	s.dispatchNormalCommand("MULTI", [][]byte{[]byte("MULTI")})
+	s.dispatchNormalCommand("SET", [][]byte{[]byte("SET"), []byte("k"), []byte("v")})
+	s.dispatchNormalCommand("GET", [][]byte{[]byte("GET"), []byte("k")})
+	s.dispatchNormalCommand("EXEC", [][]byte{[]byte("EXEC")})
+	require.Equal(t, []any{"STR:OK", "STR:QUEUED", "STR:QUEUED", respArray{2}, "STR:OK", "BULKSTR:OK"}, dconn.getWrites())
 }
 
 // TestPubSub_CleanupClosesUpstream verifies that cleanup closes upstream and dconn.

@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/keyviz"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
@@ -38,7 +39,7 @@ func TestCoordinateDispatchTxn_RejectsNonMonotonicCommitTS(t *testing.T) {
 
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, nil, startTS, 0, 0, 0)
+	}, nil, startTS, 0, 0, 0, keyviz.LabelLegacy)
 	require.ErrorIs(t, err, ErrTxnCommitTSRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -54,7 +55,7 @@ func TestCoordinateDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: nil, Value: []byte("v")},
-	}, nil, 1, 0, 0, 0)
+	}, nil, 1, 0, 0, 0, keyviz.LabelLegacy)
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 	require.Equal(t, 0, tx.commits)
 }
@@ -72,7 +73,7 @@ func TestCoordinateDispatchTxn_UsesOnePhaseRequest(t *testing.T) {
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("b"), Value: []byte("v1")},
 		{Op: Del, Key: []byte("x")},
-	}, nil, startTS, 0, 0, 0)
+	}, nil, startTS, 0, 0, 0, keyviz.LabelLegacy)
 	require.NoError(t, err)
 	require.Equal(t, 1, tx.commits)
 	require.Len(t, tx.reqs, 1)
@@ -109,7 +110,7 @@ func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	commitTS := uint64(25)
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, nil, startTS, commitTS, 0, 0)
+	}, nil, startTS, commitTS, 0, 0, keyviz.LabelLegacy)
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)
@@ -133,7 +134,7 @@ func TestCoordinateDispatchTxn_StampsCommitTSValueOffsetWithoutMutatingElem(t *t
 	value := make([]byte, 16)
 	resp, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: value, CommitTSValueOffset: 4},
-	}, nil, startTS, commitTS, 0, 0)
+	}, nil, startTS, commitTS, 0, 0, keyviz.LabelLegacy)
 	require.NoError(t, err)
 	require.Equal(t, commitTS, resp.CommitTS)
 	require.Len(t, tx.reqs, 1)
@@ -156,7 +157,7 @@ func TestCoordinateDispatchTxn_PassesReadKeysToRaftEntry(t *testing.T) {
 	readKeys := [][]byte{[]byte("rk1"), []byte("rk2")}
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, readKeys, 10, 0, 0, 0)
+	}, readKeys, 10, 0, 0, 0, keyviz.LabelLegacy)
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)
@@ -187,7 +188,7 @@ func TestCoordinateDispatchTxn_PassesObservedRouteVersionToRaftEntry(t *testing.
 	const pinnedVer = uint64(42)
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, nil, 10, 25, 0, pinnedVer)
+	}, nil, 10, 25, 0, pinnedVer, keyviz.LabelLegacy)
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)
@@ -212,7 +213,7 @@ func TestCoordinateDispatchTxn_UnpinnedObservedRouteVersionStaysZero(t *testing.
 
 	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
 		{Op: Put, Key: []byte("k"), Value: []byte("v")},
-	}, nil, 10, 25, 0, 0)
+	}, nil, 10, 25, 0, 0, keyviz.LabelLegacy)
 	require.NoError(t, err)
 	require.Len(t, tx.reqs, 1)
 	require.Len(t, tx.reqs[0], 1)

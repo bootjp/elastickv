@@ -822,6 +822,17 @@ func (a *LeaderRoutedTSOAllocator) PhaseDRequired() bool {
 	return a != nil && (activatePhaseD || a.PhaseDActive())
 }
 
+func (a *LeaderRoutedTSOAllocator) PhaseDFloor() uint64 {
+	if a == nil {
+		return 0
+	}
+	source, ok := a.local.(TSOPhaseDFloorSource)
+	if !ok {
+		return 0
+	}
+	return source.PhaseDFloor()
+}
+
 func (a *LeaderRoutedTSOAllocator) observeReservation(reservation TSOReservation) {
 	if a == nil || a.clock == nil || reservation.Base == 0 || reservation.Count <= 0 {
 		return

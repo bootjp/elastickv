@@ -149,7 +149,9 @@ func buildMux(fan *fanout) *http.ServeMux {
 			return
 		}
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-		_, _ = w.Write([]byte("elastickv-admin: phase 0 — SPA not yet embedded\n"))
+		if _, err := w.Write([]byte("elastickv-admin: phase 0 — SPA not yet embedded\n")); err != nil {
+			log.Printf("elastickv-admin: write root response: %v", err)
+		}
 	})
 	return mux
 }
