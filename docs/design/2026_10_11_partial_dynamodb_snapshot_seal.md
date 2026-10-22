@@ -158,4 +158,14 @@ All measured operations completed. Collision/hot-item contention increased retri
 - The complete Jepsen unit suite after review fixes passed: 209 tests, 586 assertions, zero failures/errors.
 - Full local `go test ./...` is not a pass: the pre-existing FUSE test references Linux-only `syscall.Statfs_t.Namelen` on macOS, an unchanged backup renewal test hit its deadline (five isolated reruns passed), and vet overlapped a transient test edit (subsequent target runs passed). Linux CI, the new encryption on/off Jepsen runs, and current-HEAD review of the acceptance changes remain gates.
 
-The design remains Partial until those CI and review gates are reconciled. Adding tests or changing the status alone does not complete acceptance.
+At `8db0155d632aec73a433cc3478f0a474c6921e8d`, current-head code/security reviews had no findings and all required CI passed, including the complete Ubuntu Go suite and encryption off/on Jepsen. The non-root local Linux full-suite attempt was not a pass: an unchanged SQS FIFO visibility test failed under load, then passed twenty isolated repetitions. The separate Ubuntu CI result does not erase that local failure.
+
+### Outstanding encrypted stress findings
+
+The design remains Partial despite the short successful CI and review results:
+
+- Additional encrypted three-process stress at `8db0155d`, with snapshot interval 20, a preceding append workload, fresh-table reset, and six verified leader changes, returned `valid? false` with `G-single-item-realtime` and `G1c-realtime`. An acknowledged append 37 to key 16 was absent from a later successful read including 46. History `20261022T235149.907+0900` and the per-node logs under `/private/tmp/elastickv-seal-jepsen-FpXSbX/` are retained. This run is not counted as a success.
+- Existing [PR #1286](https://github.com/bootjp/elastickv/pull/1286) addresses an overlapping Raft apply/timestamp problem. A diagnostic build combining its `78cab1ba` with `8db0155d` passed one identical encrypted workload with six verified transfers. This suggests overlap, not a causal proof or a completed stress campaign. The comparison was made in a separate worktree; this acceptance PR does not duplicate that implementation.
+- The combined run's subsequent encrypted restart failed: the startup guard attempted to scan Raft entries `(6, 877]` after compaction and MemoryStorage returned `requested index is unavailable due to compaction`. The unmodified `8db0155d` binary also refuses startup on that retained diagnostic state, without the #1286 patch. Logs are under `/private/tmp/elastickv-seal-jepsen-dscUKN/`. The earlier plaintext restart success is not evidence that encrypted restart is safe.
+
+Before declaring this design complete, coordinate the existing Raft fix without duplication, cover and resolve the encrypted compacted-snapshot startup failure, and rerun the acceptance matrix. Adding tests, receiving a clean review, or changing status alone does not complete acceptance.
