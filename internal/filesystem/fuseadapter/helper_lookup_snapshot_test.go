@@ -57,3 +57,24 @@ func TestCanceledMountHelperLookupDoesNotLaunchWorker(t *testing.T) {
 	case <-time.After(10 * time.Millisecond):
 	}
 }
+
+func TestMountHelperLookupSnapshotSurvivesConcurrentOwner(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	previous := mountHelperFallbackDir
+	mountHelperFallbackDir = t.TempDir()
+	nextDir := t.TempDir()
+	t.Cleanup(func() { mountHelperFallbackDir = previous })
+	lookup := snapshotMountHelperLookup()
+	started := make(chan struct{})
+	finished := make(chan error, 1)
+	go func() {
+		close(started)
+		_, err := lookup("fusermount3")
+		finished <- err
+	}()
+	<-started
+	// No release handshake orders this mutation before or after the worker's
+	// lookup. A lookup that still reads the global races under -race.
+	mountHelperFallbackDir = nextDir
+	require.Error(t, <-finished)
+}
