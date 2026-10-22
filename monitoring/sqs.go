@@ -2,6 +2,7 @@ package monitoring
 
 import (
 	"context"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -28,6 +29,8 @@ const (
 	// generates random queue names) cannot blow up the
 	// Prometheus cardinality budget. Mirrors dynamoMaxTrackedTables.
 	sqsMaxTrackedQueues = 512
+	// Mirrors adapter.validateQueueName without importing the adapter.
+	sqsMaxAdminQueueLabelBytes = 80
 
 	// sqsQueueOverflow is the placeholder label used when a queue
 	// name is not in the tracked set (cap exceeded). Operators see
@@ -35,6 +38,8 @@ const (
 	// the application logs for the real names.
 	sqsQueueOverflow = "_other"
 )
+
+var sqsAdminQueueLabelPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{1,80}(\.fifo)?$`)
 
 // SQSPartitionObserver records per-(queue, partition, action)
 // counters for HT-FIFO operations. The interface is small so
@@ -292,14 +297,16 @@ func (m *SQSMetrics) ObserveAdminPeekQueue(queue, outcome string) {
 }
 
 func (m *SQSMetrics) admitForAdminCounterBudget(queue string) string {
-	if strings.TrimSpace(queue) == "" {
-		// Empty and whitespace-only names are validation rejections with no
-		// usable queue to attribute to.
+	if len(queue) > sqsMaxAdminQueueLabelBytes || !sqsAdminQueueLabelPattern.MatchString(queue) {
+		// Reject before retaining attacker-controlled label text. A count
+		// limit alone does not bound memory when names can be arbitrarily long.
 		return sqsQueueOverflow
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return admitCounterQueueLocked(queue, m.trackedAdminCounterQueues)
+	// A short name may be a substring of a much larger request URL. Copy it
+	// so neither the admission map nor the metric retains that backing data.
+	return admitCounterQueueLocked(strings.Clone(queue), m.trackedAdminCounterQueues)
 }
 
 // normalizeSQSAdminPurgeOutcome keeps the purge label inside §3.6's
