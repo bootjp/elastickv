@@ -86,6 +86,21 @@ func TestOnePhaseDedup_DifferentWriteAtPriorTimestampIsNotOurAttempt(t *testing.
 	require.Equal(t, []byte("45"), got)
 }
 
+func TestOnePhaseDedup_DifferentScalarWriteAtPriorTimestampIsNotOurAttempt(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+	key := []byte("jepsen-register")
+	require.NoError(t, applyFSMRequest(t, fsm, onePhaseReq(10, 20, 0, key, []byte("45"))))
+
+	err := applyFSMRequest(t, fsm, onePhaseReq(10, 40, 20, key, []byte("44")))
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	got, err := st.GetAt(ctx, key, 40)
+	require.NoError(t, err)
+	require.Equal(t, []byte("45"), got)
+}
+
 func TestOnePhaseDedup_ListItemRetryWithMatchingValueNoOps(t *testing.T) {
 	ctx := context.Background()
 	st := store.NewMVCCStore()

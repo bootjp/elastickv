@@ -54,3 +54,22 @@ func TestOnePhaseRaftEntryRejectsCollidingAppend(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, []byte("45"), got)
 }
+
+func TestOnePhaseRaftEntryRejectsCollidingWriteInSameBatch(t *testing.T) {
+	ctx := context.Background()
+	st := newApplyIndexPebbleStore(t)
+	applier := raftEntryApplier(t, st)
+	key := ListItemKey([]byte("jepsen-list"), 43)
+	put := func(value string) []*KVPairMutation {
+		return []*KVPairMutation{{Op: OpTypePut, Key: key, Value: []byte(value)}}
+	}
+	require.NoError(t, applier.ApplyRaftEntry(ctx, 10, func(ctx context.Context) error {
+		require.NoError(t, st.ApplyMutationsRaftAtFenced(ctx, put("45"), nil, 99, 100, 10))
+		err := st.ApplyMutationsRaftAtFenced(ctx, put("44"), nil, 99, 100, 10)
+		require.ErrorIs(t, err, ErrWriteConflict)
+		return nil
+	}))
+	got, err := st.GetAt(ctx, key, 100)
+	require.NoError(t, err)
+	require.Equal(t, []byte("45"), got)
+}

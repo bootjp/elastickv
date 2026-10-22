@@ -238,7 +238,7 @@ func (s *pebbleStore) stageMutationsInRaftEntryWithFence(ctx context.Context, sc
 		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
 	}
 
-	landed, observe, err := s.raftEntryMutationAlreadyLanded(scope, mutations, commitTS, appliedIndex)
+	landed, observe, err := s.raftEntryMutationAlreadyLanded(scope, mutations, commitTS, appliedIndex, fenced)
 	if err != nil {
 		return scope.fail(err)
 	}
@@ -269,7 +269,7 @@ func (s *pebbleStore) checkRaftEntryMutationConflicts(ctx context.Context, scope
 	return s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, false)
 }
 
-func (s *pebbleStore) raftEntryMutationAlreadyLanded(scope *raftEntryScope, mutations []*KVPairMutation, commitTS, appliedIndex uint64) (bool, bool, error) {
+func (s *pebbleStore) raftEntryMutationAlreadyLanded(scope *raftEntryScope, mutations []*KVPairMutation, commitTS, appliedIndex uint64, fenced bool) (bool, bool, error) {
 	if appliedIndex == 0 {
 		return false, false, nil
 	}
@@ -280,7 +280,7 @@ func (s *pebbleStore) raftEntryMutationAlreadyLanded(scope *raftEntryScope, muta
 	if present && appliedIndex < persisted {
 		return true, false, nil
 	}
-	if (present && appliedIndex == persisted) || scope.touched {
+	if (present && appliedIndex == persisted) || (scope.touched && !fenced) {
 		landed, err := s.raftApplyAlreadyLandedWith(scope.batch, mutations, commitTS)
 		return landed, landed, err
 	}

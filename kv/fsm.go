@@ -1639,7 +1639,7 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [
 		return false, errors.WithStack(err)
 	}
 	if landed {
-		return f.priorListItemsMatch(ctx, muts, readKeys, meta.PrevCommitTS)
+		return f.priorMutationValuesMatch(ctx, muts, readKeys, meta.PrevCommitTS)
 	}
 	for _, stagedKey := range stagedVisibilityKeysForReadAlias(readKeys, meta.PrimaryKey, meta.PrimaryKey) {
 		landed, err = f.store.CommittedVersionAt(ctx, stagedKey, meta.PrevCommitTS)
@@ -1647,18 +1647,22 @@ func (f *kvFSM) dedupProbeOnePhase(ctx context.Context, meta TxnMeta, readKeys [
 			return false, errors.WithStack(err)
 		}
 		if landed {
-			return f.priorListItemsMatch(ctx, muts, readKeys, meta.PrevCommitTS)
+			return f.priorMutationValuesMatch(ctx, muts, readKeys, meta.PrevCommitTS)
 		}
 	}
 	return false, nil
 }
 
-// A timestamp may be issued by two leaders during a handoff. The existence
-// of an item version at PrevCommitTS alone cannot identify this retry: a
-// different append can have written the same list position at that timestamp.
-func (f *kvFSM) priorListItemsMatch(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, prevTS uint64) (bool, error) {
-	for _, mut := range muts {
-		if mut == nil || !store.IsListItemKey(mut.Key) || mut.Op != pb.Op_PUT {
+// A timestamp may be issued by two leaders during a handoff. An exact
+// version at PrevCommitTS alone cannot identify the retry, even for scalar
+// writes. Compare every final PUT value in the retained write set.
+func (f *kvFSM) priorMutationValuesMatch(ctx context.Context, muts []*pb.Mutation, readKeys [][]byte, prevTS uint64) (bool, error) {
+	uniq, err := uniqueMutations(muts)
+	if err != nil {
+		return false, err
+	}
+	for _, mut := range uniq {
+		if mut.Op != pb.Op_PUT {
 			continue
 		}
 		keys := append([][]byte{mut.Key}, stagedVisibilityKeysForReadAlias(readKeys, mut.Key, mut.Key)...)
