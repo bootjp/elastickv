@@ -395,6 +395,9 @@ func (s *pebbleStore) commitPebbleImportAppliedIndex(appliedIndex uint64, writeO
 }
 
 func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (bool, []byte, error) {
+	if err := s.checkMigrationNotRetiredLocked(opts.JobID); err != nil {
+		return false, nil, err
+	}
 	existing, hasExisting, err := s.readMigrationImportAck(opts.JobID, opts.BracketID)
 	if err != nil {
 		return false, nil, err
@@ -618,6 +621,9 @@ func (s *pebbleStore) retireMigrationWithOpts(ctx context.Context, jobID uint64,
 	}
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
+	if _, err := s.readMigrationRetiredJobs(); err != nil {
+		return err
+	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()

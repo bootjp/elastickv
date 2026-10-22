@@ -43,7 +43,7 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 		// Validation is a pure function of the entry, so every replica rejects
 		// the same malformed request. Halting on it would let one bad internal
 		// RPC stop the group instead of returning InvalidArgument to its caller.
-		if errors.Is(err, store.ErrInvalidReadinessState) {
+		if errors.Is(err, store.ErrInvalidReadinessState) || errors.Is(err, store.ErrMigrationRetired) {
 			return errors.Wrap(err, "kv/fsm: target staged readiness")
 		}
 		// Anything else is a local Pebble write. A replica that returns an

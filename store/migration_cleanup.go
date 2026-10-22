@@ -37,11 +37,14 @@ func cleanupResult(exported ExportVersionsResult) CleanupVersionsResult {
 }
 
 func (s *mvccStore) CleanupVersions(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if _, retired := s.migrationRetired[opts.JobID]; retired {
+		return CleanupVersionsResult{}, errors.WithStack(ErrMigrationRetired)
+	}
 	if opts.MaxVersions <= 0 {
 		return CleanupVersionsResult{Done: true}, nil
 	}
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
 
 	exportOpts := normalizeExportVersionsOptions(cleanupExportOptions(opts))
 	pos, err := decodeExportCursorForOptions(exportOpts)
@@ -74,6 +77,10 @@ func (s *mvccStore) ClearMigrationState(_ context.Context, jobID, _ uint64) erro
 	delete(s.migrationPromotions, jobID)
 	delete(s.migrationReadiness, jobID)
 	s.migrationReadinessCache = upsertReadinessCacheWithoutJob(s.migrationReadinessCache, jobID)
+	if s.migrationRetired == nil {
+		s.migrationRetired = make(map[uint64]struct{})
+	}
+	s.migrationRetired[jobID] = struct{}{}
 	return nil
 }
 
@@ -88,13 +95,16 @@ func upsertReadinessCacheWithoutJob(states []TargetStagedReadinessState, jobID u
 }
 
 func (s *pebbleStore) CleanupVersions(ctx context.Context, opts CleanupVersionsOptions) (CleanupVersionsResult, error) {
-	if opts.MaxVersions <= 0 {
-		return CleanupVersionsResult{Done: true}, nil
-	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if err := s.checkMigrationNotRetiredLocked(opts.JobID); err != nil {
+		return CleanupVersionsResult{}, err
+	}
+	if opts.MaxVersions <= 0 {
+		return CleanupVersionsResult{Done: true}, nil
+	}
 
 	exported, err := s.exportVersionsLocked(ctx, cleanupExportOptions(opts))
 	if err != nil {
@@ -150,6 +160,7 @@ type migrationMetadataState struct {
 	acks       map[migrationAckID]migrationImportAck
 	floors     map[uint64]uint64
 	promotions map[uint64]PromotionState
+	retired    map[uint64]struct{}
 }
 
 func (s *pebbleStore) migrationMetadataWithoutJob(jobID uint64) (migrationMetadataState, error) {
@@ -172,7 +183,12 @@ func (s *pebbleStore) migrationMetadataWithoutJob(jobID uint64) (migrationMetada
 		return migrationMetadataState{}, err
 	}
 	delete(promotions, jobID)
-	return migrationMetadataState{acks: acks, floors: floors, promotions: promotions}, nil
+	retired, err := s.readMigrationRetiredJobs()
+	if err != nil {
+		return migrationMetadataState{}, err
+	}
+	retired[jobID] = struct{}{}
+	return migrationMetadataState{acks: acks, floors: floors, promotions: promotions, retired: retired}, nil
 }
 
 func stageMigrationMetadataCleanup(batch *pebble.Batch, jobID, appliedIndex uint64, metadata migrationMetadataState) error {
@@ -186,6 +202,9 @@ func stageMigrationMetadataCleanup(batch *pebble.Batch, jobID, appliedIndex uint
 		return errors.WithStack(err)
 	}
 	if err := batch.Delete(migrationReadyKey(jobID), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationRetiredMetaKeyBytes, encodeMigrationRetiredJobs(metadata.retired), nil); err != nil {
 		return errors.WithStack(err)
 	}
 	if appliedIndex == 0 {

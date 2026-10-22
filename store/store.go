@@ -245,6 +245,12 @@ type MigrationCleaner interface {
 	ClearMigrationState(ctx context.Context, jobID, appliedIndex uint64) error
 }
 
+// MigrationRetirementReader proves that cleanup permanently fenced the job.
+// Retirement witnesses are independent of live guards, pins and progress.
+type MigrationRetirementReader interface {
+	MigrationRetired(context.Context, uint64) (bool, error)
+}
+
 // MigrationPromotionStateReader reads target-local staged promotion state.
 type MigrationPromotionStateReader interface {
 	MigrationPromotionState(ctx context.Context, jobID uint64) (PromotionState, bool, error)

@@ -29,6 +29,7 @@ const (
 	mvccSnapshotVersionV2 = uint32(2)
 	mvccSnapshotVersionV3 = uint32(3)
 	mvccSnapshotVersionV4 = uint32(4)
+	mvccSnapshotVersionV5 = uint32(5)
 	maxSnapshotKeySize    = 1 << 20 // 1 MiB per logical key
 	// maxSnapshotInternalKeyEnvelope reserves snapshot headroom for internal
 	// stored-key envelopes such as migration staging. Logical source keys keep
@@ -88,6 +89,7 @@ type mvccStore struct {
 	migrationHLCFloors  map[uint64]uint64
 	migrationPromotions map[uint64]PromotionState
 	migrationReadiness  map[uint64]TargetStagedReadinessState
+	migrationRetired    map[uint64]struct{}
 	// migrationReadinessCache is the snapshot-order projection of
 	// migrationReadiness; it is what the V4 trailer serialises.
 	migrationReadinessCache []TargetStagedReadinessState
@@ -141,6 +143,7 @@ func NewMVCCStore(opts ...MVCCStoreOption) MVCCStore {
 		migrationHLCFloors:  make(map[uint64]uint64),
 		migrationPromotions: make(map[uint64]PromotionState),
 		migrationReadiness:  make(map[uint64]TargetStagedReadinessState),
+		migrationRetired:    make(map[uint64]struct{}),
 		writeConflicts:      newWriteConflictCounter(),
 	}
 	for _, opt := range opts {
@@ -946,7 +949,7 @@ func (s *mvccStore) writeSnapshotFile(f *os.File) error {
 	defer s.mtx.RUnlock()
 
 	version := mvccSnapshotVersionForState(
-		s.migrationAcks, s.migrationHLCFloors, s.migrationPromotions, s.migrationReadinessCache)
+		s.migrationAcks, s.migrationHLCFloors, s.migrationPromotions, s.migrationReadinessCache, s.migrationRetired)
 	checksumOffset, err := writeMVCCSnapshotHeader(f, version)
 	if err != nil {
 		return err
@@ -972,8 +975,11 @@ func mvccSnapshotVersionForState(
 	floors map[uint64]uint64,
 	promotions map[uint64]PromotionState,
 	readiness []TargetStagedReadinessState,
+	retired ...map[uint64]struct{},
 ) uint32 {
 	switch {
+	case len(retired) > 0 && len(retired[0]) > 0:
+		return mvccSnapshotVersionV5
 	case len(readiness) > 0:
 		return mvccSnapshotVersionV4
 	case len(promotions) > 0:
@@ -1016,6 +1022,7 @@ func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32,
 		s.migrationHLCFloors,
 		s.migrationPromotions,
 		s.migrationReadinessCache,
+		s.migrationRetired,
 	); err != nil {
 		return 0, err
 	}
@@ -1048,6 +1055,7 @@ func writeMVCCSnapshotMetadata(
 	migrationHLCFloors map[uint64]uint64,
 	migrationPromotions map[uint64]PromotionState,
 	migrationReadiness []TargetStagedReadinessState,
+	migrationRetired map[uint64]struct{},
 ) error {
 	if err := binary.Write(w, binary.LittleEndian, lastCommitTS); err != nil {
 		return errors.WithStack(err)
@@ -1073,7 +1081,13 @@ func writeMVCCSnapshotMetadata(
 	if version < mvccSnapshotVersionV4 {
 		return nil
 	}
-	return writeMVCCSnapshotReadinessStates(w, migrationReadiness)
+	if err := writeMVCCSnapshotReadinessStates(w, migrationReadiness); err != nil {
+		return err
+	}
+	if version < mvccSnapshotVersionV5 {
+		return nil
+	}
+	return writeMVCCSnapshotBytes(w, encodeMigrationRetiredJobs(migrationRetired))
 }
 
 // writeMVCCSnapshotReadinessStates emits the V4 trailer: a count followed by
@@ -1215,6 +1229,7 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader) error {
 	s.migrationHLCFloors = meta.floors
 	s.migrationPromotions = meta.promotions
 	s.migrationReadiness = targetReadinessStateMap(meta.readiness)
+	s.migrationRetired = meta.retired
 	s.migrationReadinessCache = cloneTargetStagedReadinessStates(meta.readiness)
 	return nil
 }
@@ -1235,7 +1250,7 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	if version != mvccSnapshotVersionV1 &&
 		version != mvccSnapshotVersionV2 &&
 		version != mvccSnapshotVersionV3 &&
-		version != mvccSnapshotVersionV4 {
+		version != mvccSnapshotVersionV4 && version != mvccSnapshotVersionV5 {
 		return 0, 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
 	}
 
@@ -1309,18 +1324,32 @@ func readMVCCSnapshotMetadata(
 	if err != nil {
 		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
+	retired := make(map[uint64]struct{})
+	if version >= mvccSnapshotVersionV5 {
+		data, readErr := readMVCCSnapshotBytes(r, "snapshot migration retirement")
+		if readErr != nil {
+			return 0, 0, mvccSnapshotMigrationMetadata{}, readErr
+		}
+		var valid bool
+		retired, valid = decodeMigrationRetiredJobs(data)
+		if !valid {
+			return 0, 0, mvccSnapshotMigrationMetadata{}, errors.New("invalid snapshot migration retirement")
+		}
+	}
 
 	return lastCommitTS, minRetainedTS, mvccSnapshotMigrationMetadata{
 		acks:       migrationAcks,
 		floors:     migrationHLCFloors,
 		promotions: migrationPromotions,
 		readiness:  migrationReadiness,
+		retired:    retired,
 	}, nil
 }
 
 // mvccSnapshotMigrationMetadata is the version-layered trailer that follows
 // (lastCommitTS, minRetainedTS). Each version adds exactly one field to its
-// predecessor: V2 adds acks+floors, V3 adds promotions, V4 adds readiness.
+// predecessor: V2 adds acks+floors, V3 adds promotions, V4 adds readiness,
+// and V5 adds permanent per-job retirement witnesses.
 // Bundling them keeps the reader/restore signatures from growing a return
 // value per layer.
 type mvccSnapshotMigrationMetadata struct {
@@ -1328,6 +1357,7 @@ type mvccSnapshotMigrationMetadata struct {
 	floors     map[uint64]uint64
 	promotions map[uint64]PromotionState
 	readiness  []TargetStagedReadinessState
+	retired    map[uint64]struct{}
 }
 
 func emptyMVCCSnapshotMigrationMetadata() mvccSnapshotMigrationMetadata {
@@ -1335,6 +1365,7 @@ func emptyMVCCSnapshotMigrationMetadata() mvccSnapshotMigrationMetadata {
 		acks:       make(map[migrationAckID]migrationImportAck),
 		floors:     make(map[uint64]uint64),
 		promotions: make(map[uint64]PromotionState),
+		retired:    make(map[uint64]struct{}),
 	}
 }
 

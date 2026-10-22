@@ -59,6 +59,9 @@ func (s *mvccStore) ApplyTargetStagedReadiness(_ context.Context, state TargetSt
 	}
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if _, retired := s.migrationRetired[state.JobID]; retired {
+		return errors.WithStack(ErrMigrationRetired)
+	}
 	cloned := cloneTargetStagedReadinessState(state)
 	s.migrationReadiness[state.JobID] = cloned
 	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, cloned)
@@ -95,6 +98,9 @@ func (s *pebbleStore) applyTargetStagedReadiness(state TargetStagedReadinessStat
 	defer s.applyMu.Unlock()
 	s.dbMu.RLock()
 	defer s.dbMu.RUnlock()
+	if err := s.checkMigrationNotRetiredLocked(state.JobID); err != nil {
+		return err
+	}
 
 	writeAppliedIndex, err := s.shouldWriteAppliedIndexLocked(appliedIndex)
 	if err != nil {
@@ -103,13 +109,8 @@ func (s *pebbleStore) applyTargetStagedReadiness(state TargetStagedReadinessStat
 
 	batch := s.db.NewBatch()
 	defer func() { _ = batch.Close() }()
-	if err := batch.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), nil); err != nil {
-		return errors.WithStack(err)
-	}
-	if writeAppliedIndex {
-		if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
-			return err
-		}
+	if err := stageTargetReadinessGuard(batch, state, appliedIndex, writeAppliedIndex); err != nil {
+		return err
 	}
 
 	// The clock floor must survive the same crash boundary as the guard and
@@ -132,6 +133,16 @@ func (s *pebbleStore) applyTargetStagedReadiness(state TargetStagedReadinessStat
 	}
 	s.lastCommitTS = lastTS
 	s.migrationReadinessCache = upsertTargetStagedReadinessStateCache(s.migrationReadinessCache, state)
+	return nil
+}
+
+func stageTargetReadinessGuard(batch *pebble.Batch, state TargetStagedReadinessState, appliedIndex uint64, writeAppliedIndex bool) error {
+	if err := batch.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if writeAppliedIndex {
+		return setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex)
+	}
 	return nil
 }
 

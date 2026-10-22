@@ -64,7 +64,8 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 // (Pebble read, decrypt, batch, commit), which must halt rather than let this
 // voter skip a committed cleanup.
 func isMigrationCleanupOrdinaryApplyError(err error) bool {
-	return errors.Is(err, ErrInvalidRequest) ||
+	return errors.Is(err, store.ErrMigrationRetired) ||
+		errors.Is(err, ErrInvalidRequest) ||
 		errors.Is(err, store.ErrInvalidImportVersion) ||
 		// A malformed or out-of-range cursor is decided from the request alone,
 		// so every replica rejects it identically.

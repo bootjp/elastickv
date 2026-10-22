@@ -58,15 +58,17 @@ func promotedVersionsFromStaged(opts PromoteVersionsOptions, versions []MVCCVers
 }
 
 func (s *mvccStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if _, retired := s.migrationRetired[opts.JobID]; retired {
+		return PromoteVersionsResult{}, errors.WithStack(ErrMigrationRetired)
+	}
 	if err := validatePromoteVersionsOptions(opts); err != nil {
 		return PromoteVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
 		return PromoteVersionsResult{Done: true}, nil
 	}
-
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
 
 	state, cursor := s.promotionStateAndCursorLocked(opts)
 	if opts.JobID != 0 && state.Done {
@@ -172,18 +174,19 @@ func findVersionIndex(versions []VersionedValue, commitTS uint64) int {
 }
 
 func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error) {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := s.checkMigrationNotRetiredLocked(opts.JobID); err != nil {
+		return PromoteVersionsResult{}, err
+	}
 	if err := validatePromoteVersionsOptions(opts); err != nil {
 		return PromoteVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
 		return PromoteVersionsResult{Done: true}, nil
 	}
-
-	s.applyMu.Lock()
-	defer s.applyMu.Unlock()
-
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 
 	state, cursor, err := s.pebblePromotionStateAndCursor(opts)
 	if err != nil {

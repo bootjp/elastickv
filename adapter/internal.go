@@ -410,6 +410,17 @@ func (i *Internal) probeMigrationRoute(req *pb.ProbeMigrationStateRequest, requi
 }
 
 func (i *Internal) probeMigrationMetadataCleared(ctx context.Context, jobID uint64) (*pb.ProbeMigrationStateResponse, error) {
+	reader, supported := i.store.(store.MigrationRetirementReader)
+	if !supported {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration retirement proof is unavailable"))
+	}
+	retired, err := reader.MigrationRetired(ctx, jobID)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if !retired {
+		return &pb.ProbeMigrationStateResponse{CatalogVersion: i.migrationCatalogVersion()}, nil
+	}
 	present, err := i.migrationReadinessMetadataPresent(ctx, jobID)
 	if err != nil {
 		return nil, err
@@ -454,7 +465,7 @@ func (i *Internal) migrationReadinessMetadataPresent(ctx context.Context, jobID 
 func (i *Internal) migrationPromotionMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
 	promotion, ok := i.store.(store.MigrationPromotionStateReader)
 	if !ok {
-		return false, nil
+		return false, errors.WithStack(status.Error(codes.FailedPrecondition, "migration promotion reader is not configured"))
 	}
 	_, found, err := promotion.MigrationPromotionState(ctx, jobID)
 	if err != nil {
@@ -466,7 +477,7 @@ func (i *Internal) migrationPromotionMetadataPresent(ctx context.Context, jobID 
 func (i *Internal) migrationImportMetadataPresent(ctx context.Context, jobID uint64) (bool, error) {
 	importMetadata, ok := i.store.(store.MigrationImportMetadataReader)
 	if !ok {
-		return false, nil
+		return false, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import metadata reader is not configured"))
 	}
 	present, err := importMetadata.MigrationImportMetadataPresent(ctx, jobID)
 	if err != nil {

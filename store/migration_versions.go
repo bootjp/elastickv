@@ -213,7 +213,8 @@ func migrationReadyKey(jobID uint64) []byte {
 }
 
 func isMigrationMetadataKey(rawKey []byte) bool {
-	return bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
+	return bytes.Equal(rawKey, migrationRetiredMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes) ||
 		(len(rawKey) == len(migrationReadyPrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationReadyPrefix)))
@@ -377,6 +378,9 @@ func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, boo
 }
 
 func validateImportVersion(version MVCCVersion) error {
+	if bytes.Equal(version.Key, migrationRetiredMetaKeyBytes) {
+		return errors.Wrap(ErrInvalidImportVersion, "migration cannot import retirement metadata")
+	}
 	if version.CommitTS == 0 {
 		return errors.Wrap(ErrInvalidImportVersion, "migration import version has zero commit_ts")
 	}
@@ -680,6 +684,9 @@ func exportMemoryVersionsForKey(
 func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if _, retired := s.migrationRetired[opts.JobID]; retired {
+		return ImportVersionsResult{}, errors.WithStack(ErrMigrationRetired)
+	}
 
 	id := migrationAckID{jobID: opts.JobID, bracketID: opts.BracketID}
 	existing, hasExisting := s.migrationAcks[id]

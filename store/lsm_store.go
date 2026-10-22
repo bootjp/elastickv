@@ -459,6 +459,10 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		cleanupOnInitFail()
 		return nil, err
 	}
+	if _, err := s.readMigrationRetiredJobs(); err != nil {
+		cleanupOnInitFail()
+		return nil, err
+	}
 	s.lastCommitTS = maxTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
@@ -724,6 +728,9 @@ func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error
 		return errors.WithStack(err)
 	}
 	if err := batch.Set(migrationPromoteMetaKeyBytes, encodeMigrationPromotionStates(meta.migrationPromotions), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationRetiredMetaKeyBytes, encodeMigrationRetiredJobs(meta.migrationRetired), nil); err != nil {
 		return errors.WithStack(err)
 	}
 	// Readiness states live one row per job rather than in a single meta key,
@@ -3519,6 +3526,7 @@ type streamingMVCCRestoreMetadata struct {
 	migrationHLCFloors  map[uint64]uint64
 	migrationPromotions map[uint64]PromotionState
 	migrationReadiness  []TargetStagedReadinessState
+	migrationRetired    map[uint64]struct{}
 }
 
 func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, streamingMVCCRestoreMetadata, error) {
@@ -3540,6 +3548,7 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 		migrationHLCFloors:  snapshotMeta.floors,
 		migrationPromotions: snapshotMeta.promotions,
 		migrationReadiness:  snapshotMeta.readiness,
+		migrationRetired:    snapshotMeta.retired,
 	}
 	return body, hash, expectedChecksum, meta, nil
 }
@@ -3665,6 +3674,9 @@ func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSn
 	}
 	readinessStates, err := s.loadPebbleTargetReadinessStatesFromDB()
 	if err != nil {
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
+	}
+	if _, err := s.readMigrationRetiredJobs(); err != nil {
 		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
 	s.lastCommitTS = lastCommitTS

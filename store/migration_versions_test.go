@@ -1890,11 +1890,11 @@ func TestPebbleMigrationApplyPathsAcquireApplyMuBeforeDBMu(t *testing.T) {
 			name: "apply target readiness",
 			run: func() error {
 				return pebble.ApplyTargetStagedReadinessAt(context.Background(), TargetStagedReadinessState{
-					JobID:                  1,
+					JobID:                  2,
 					RouteStart:             []byte("a"),
 					RouteEnd:               []byte("z"),
 					ExpectedCutoverVersion: 2,
-					MigrationJobID:         1,
+					MigrationJobID:         2,
 					MinWriteTSExclusive:    10,
 					Armed:                  true,
 				}, 1)
