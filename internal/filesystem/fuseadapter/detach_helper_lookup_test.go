@@ -51,7 +51,7 @@ func TestDetachFUSEMountRechecksAfterHelperLookup(t *testing.T) {
 	helperDir := t.TempDir()
 	marker := filepath.Join(helperDir, "helper-ran")
 	helper := filepath.Join(helperDir, "fusermount3")
-	require.NoError(t, os.WriteFile(helper, []byte("#!/bin/sh\n/bin/touch "+marker+"\nexit 0\n"), 0o700)) //nolint:gosec // the helper stand-in must be executable.
+	require.NoError(t, os.WriteFile(helper, []byte("#!/bin/sh\n: > "+marker+"\nexit 0\n"), 0o700)) //nolint:gosec // the helper stand-in must be executable.
 	old := lookupMountHelperFn
 	lookupMountHelperFn = func(string) (string, error) {
 		// The plain unmount finishes while the lookup runs and a foreign

@@ -23,7 +23,7 @@ func TestDetachFUSEMountRechecksBeforeSecondHelper(t *testing.T) {
 	first := "#!/bin/sh\n/bin/cp " + replacement + " " + table + "\nexit 1\n"
 	require.NoError(t, os.WriteFile(filepath.Join(helperDir, "fusermount3"), []byte(first), 0o700)) //nolint:gosec // the helper stand-in must be executable.
 	marker := filepath.Join(helperDir, "second-ran")
-	second := "#!/bin/sh\n/bin/touch " + marker + "\nexit 0\n"
+	second := "#!/bin/sh\n: > " + marker + "\nexit 0\n"
 	require.NoError(t, os.WriteFile(filepath.Join(helperDir, "fusermount"), []byte(second), 0o700)) //nolint:gosec // the helper stand-in must be executable.
 	onlyMountHelpersIn(t, helperDir)
 
