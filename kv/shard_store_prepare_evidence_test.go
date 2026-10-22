@@ -228,7 +228,7 @@ func TestPrepareEvidenceSafetyMarkerBlocksLateLegacyImportAtAnyStart(t *testing.
 }
 
 func TestPrepareEvidenceSafetyMarkerIsExcludedFromMigration(t *testing.T) {
-	brackets, err := distribution.PlanExportBrackets([]byte(txnBackupPrefix), []byte("!txn|backup}"))
+	brackets, err := distribution.PlanExportBrackets([]byte(txnBackupPrefix), []byte("!txn|meta}"))
 	require.NoError(t, err)
 	for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey} {
 		require.True(t, distribution.IsMigrationKnownInternalKey(key),

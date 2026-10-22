@@ -5,6 +5,7 @@ import (
 	"context"
 	"os"
 	"strings"
+	"sync/atomic"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal"
@@ -139,6 +140,8 @@ type Internal struct {
 	store                   store.MVCCStore
 	primaryCommitEvidence   kv.PrimaryCommitEvidenceReader
 	tsoCutoverState         interface{ CutoverActive() bool }
+	prepareEvidenceToken    string
+	prepareEvidenceScanning atomic.Bool
 	migrationProposer       raftengine.Proposer
 	migrationImportGate     func(context.Context) error
 	migrationPromoteGate    func(context.Context) error

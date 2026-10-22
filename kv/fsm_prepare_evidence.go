@@ -10,10 +10,12 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-var prepareEvidenceEnabledKey = []byte(txnBackupPrefix + "prepare_evidence_enabled")
+// This entire namespace was reserved before the proof protocol. The old
+// !txn|backup|prepare_evidence_* names remain ordinary user data.
+var prepareEvidenceEnabledKey = []byte(txnMetaPrefix + "prepare_evidence/enabled")
 var prepareEvidenceEnabledValue = []byte{1}
-var prepareEvidenceGateKey = []byte(txnBackupPrefix + "prepare_evidence_gate")
-var prepareEvidenceTimestampFloorKey = []byte(txnBackupPrefix + "prepare_evidence_timestamp_floor")
+var prepareEvidenceGateKey = []byte(txnMetaPrefix + "prepare_evidence/gate")
+var prepareEvidenceTimestampFloorKey = []byte(txnMetaPrefix + "prepare_evidence/timestamp_floor")
 
 func (f *kvFSM) validatePrepareEvidenceMeta(meta TxnMeta, startTS uint64) error {
 	if meta.PrepareCommitTS == 0 {

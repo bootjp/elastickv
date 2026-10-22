@@ -234,6 +234,24 @@ Membership admission checks the same protocol before adding another member.
 A fresh learner may join before applying cutover, but a cutover cluster requires
 that it configure the dedicated timestamp runtime. Its catch-up must precede
 public serving. Old binaries cannot be admitted after this protocol is required.
+Dedicated-runtime capability requires both a non-nil group-zero state and an
+allocator actually installed in the serving coordinator. Merely hosting the TSO
+FSM in legacy warm-up is not readiness, even if it later applies cutover.
+
+The prepare-evidence RPC checks the configured forwarded-control credential at
+the handler boundary, including capability-only probes. An absent credential
+disables this RPC even when Admin is disabled or explicitly insecure; disabling
+Admin authentication does not make peer inspection public. The current runtime
+uses its existing leader-read/admin control credential, not the S3 blob token or
+an unmerged migration-controller credential. Every per-group registration must
+provide that credential, and peer callers already attach it through their group.
+Each data-group handler permits at most one authoritative inspection at a time;
+additional requests return a retryable resource-exhausted result before a quorum
+read or scan. The applied read fence and all scan pages share one server-owned
+five-second deadline, shortened by an earlier caller deadline. Capability-only
+negotiation performs no scan and does not wait behind an inspection. Exhaustion,
+cancellation and scan errors never attest that old locks have drained; callers
+retry activation rather than using a partial result.
 
 The replicated enable marker then requires proof for every new PREPARE in its
 data group. An existing unproven lock may retry with its original identity and
@@ -292,6 +310,18 @@ The enable, seal, and release records belong to the local group, not its user
 ranges. User mutations cannot forge them, and range migration does not export
 or promote them as application data. The seal is a deterministic refusal, not
 an operational error that halts a raw-batch replica.
+Their exact keys live under the already-reserved `!txn|meta|prepare_evidence/`
+namespace. The earlier draft's `!txn|backup|prepare_evidence_*` names were valid
+user keys before this change; their values are never decoded as protocol state,
+overwritten by activation, or excluded from migration. No data rewrite or backup
+floor wire-format change is needed. Migration excludes the exact peer-local
+keys even from the transaction-metadata family bracket.
+The earlier layout was unreleased and was not deployed to production. There is
+no content-based fallback: genuine prototype protocol rows cannot be
+distinguished from valid legacy user rows, even when their bytes match exactly.
+A known deployment of that unreleased layout must stop and use an explicitly
+validated offline recovery or rebuild; silently reinterpreting or dropping its
+active state during an in-place upgrade is not supported.
 
 ### Already Active Clusters
 

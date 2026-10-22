@@ -51,6 +51,7 @@ func prepareSafetyInternalClient(t *testing.T, server *Internal) pb.InternalClie
 	lis, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	auth, _ := AdminTokenAuth("prepare-safety-token")
+	WithInternalPrepareEvidenceToken("prepare-safety-token")(server)
 	srv := grpc.NewServer(grpc.UnaryInterceptor(auth))
 	pb.RegisterInternalServer(srv, server)
 	go func() { _ = srv.Serve(lis) }()
@@ -116,7 +117,7 @@ func TestPrepareEvidenceSafetyCapabilityReportsLocalCutoverOnFollowers(t *testin
 			state := &prepareSafetyCutoverState{}
 			var options []InternalOption
 			if configured {
-				options = append(options, WithInternalTSOCutoverState(state))
+				options = append(options, WithInternalTSOCutoverState(state), WithInternalTimestampAllocator(&phaseDForwardAllocator{}))
 			}
 			client := prepareSafetyInternalClient(t, NewInternalWithEngine(nil, leader, nil, nil, options...))
 			ctx, cancel := context.WithTimeout(context.Background(), time.Second)

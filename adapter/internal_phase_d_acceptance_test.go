@@ -129,6 +129,7 @@ func (c *phaseDAcceptanceCluster) serveNode(t *testing.T, node *phaseDAcceptance
 		node.txns[group] = kv.NewTransactionWithProposer(result.Engine,
 			kv.WithTimestampAdmission(shard.Store, func() kv.TimestampAllocator { return node.batch }))
 		options := []InternalOption{WithInternalTimestampAllocator(node.batch),
+			WithInternalPrepareEvidenceToken(c.token),
 			WithInternalTSOCutoverState(node.state), WithInternalPrimaryCommitEvidence(node.shards),
 			WithInternalAdminProposer(result.Engine)}
 		if group == 0 {

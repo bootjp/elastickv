@@ -791,24 +791,8 @@ func bearerTokenAuth(
 	if token == "" {
 		return nil, nil
 	}
-	expected := []byte(token)
 	check := func(ctx context.Context) error {
-		md, ok := metadata.FromIncomingContext(ctx)
-		if !ok {
-			return status.Error(codes.Unauthenticated, "missing authorization metadata")
-		}
-		values := md.Get("authorization")
-		if len(values) == 0 {
-			return status.Error(codes.Unauthenticated, "missing authorization header")
-		}
-		got, ok := strings.CutPrefix(values[0], "Bearer ")
-		if !ok {
-			return status.Error(codes.Unauthenticated, "authorization is not a bearer token")
-		}
-		if subtle.ConstantTimeCompare([]byte(got), expected) != 1 {
-			return status.Errorf(codes.Unauthenticated, "invalid %s token", credentialName)
-		}
-		return nil
+		return checkBearerToken(ctx, token, credentialName)
 	}
 	unary := func(
 		ctx context.Context,
@@ -839,6 +823,28 @@ func bearerTokenAuth(
 		return handler(srv, ss)
 	}
 	return unary, stream
+}
+
+func checkBearerToken(ctx context.Context, token, credentialName string) error {
+	if token == "" {
+		return status.Errorf(codes.Unauthenticated, "%s credential is not configured", credentialName)
+	}
+	md, ok := metadata.FromIncomingContext(ctx)
+	if !ok {
+		return errors.WithStack(status.Error(codes.Unauthenticated, "missing authorization metadata"))
+	}
+	values := md.Get("authorization")
+	if len(values) == 0 {
+		return errors.WithStack(status.Error(codes.Unauthenticated, "missing authorization header"))
+	}
+	got, ok := strings.CutPrefix(values[0], "Bearer ")
+	if !ok {
+		return errors.WithStack(status.Error(codes.Unauthenticated, "authorization is not a bearer token"))
+	}
+	if subtle.ConstantTimeCompare([]byte(got), []byte(token)) != 1 {
+		return status.Errorf(codes.Unauthenticated, "invalid %s token", credentialName)
+	}
+	return nil
 }
 
 // ErrAdminTokenRequired is returned by NewAdminServer helpers when the operator

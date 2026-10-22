@@ -2,16 +2,31 @@ package adapter
 
 import (
 	"context"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
+
+const prepareEvidenceInspectionTimeout = 5 * time.Second
+
+// WithInternalPrepareEvidenceToken supplies the existing forwarded-control
+// credential. An omitted or empty credential leaves this peer RPC disabled,
+// independently of whether the Admin service/interceptor is installed.
+func WithInternalPrepareEvidenceToken(token string) InternalOption {
+	return func(i *Internal) { i.prepareEvidenceToken = token }
+}
 
 // GetPrepareEvidenceState serves read-only protocol negotiation on every
 // replica, and authoritative drain inspection only on an applied leader.
 func (i *Internal) GetPrepareEvidenceState(ctx context.Context, req *pb.PrepareEvidenceStateRequest) (*pb.PrepareEvidenceStateResponse, error) {
+	if err := checkBearerToken(ctx, i.prepareEvidenceToken, "prepare evidence peer"); err != nil {
+		return nil, err
+	}
 	if req == nil {
 		return nil, errors.WithStack(kv.ErrInvalidRequest)
 	}
@@ -21,16 +36,32 @@ func (i *Internal) GetPrepareEvidenceState(ctx context.Context, req *pb.PrepareE
 	if i.kvForwardRejected || i.store == nil {
 		return nil, errors.WithStack(ErrKVForwardNotSupported)
 	}
+	return i.inspectPrepareEvidence(ctx, req.GetFloor())
+}
+
+func (i *Internal) inspectPrepareEvidence(ctx context.Context, requestedFloor uint64) (*pb.PrepareEvidenceStateResponse, error) {
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
+	if !i.prepareEvidenceScanning.CompareAndSwap(false, true) {
+		return nil, errors.WithStack(status.Error(codes.ResourceExhausted, "prepare evidence inspection already running"))
+	}
+	defer i.prepareEvidenceScanning.Store(false)
+	ctx, cancel := context.WithTimeout(ctx, prepareEvidenceInspectionTimeout)
+	defer cancel()
 	index, err := i.leader.LinearizableRead(ctx)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	enabled, unproven, floor, err := kv.InspectPrepareEvidence(ctx, i.store, req.GetFloor())
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(status.FromContextError(err).Err())
+	}
+	enabled, unproven, floor, err := kv.InspectPrepareEvidence(ctx, i.store, requestedFloor)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(status.FromContextError(err).Err())
 	}
 	if i.leader.State() != raftengine.StateLeader {
 		return nil, errors.WithStack(ErrNotLeader)
@@ -43,7 +74,7 @@ func (i *Internal) GetPrepareEvidenceState(ctx context.Context, req *pb.PrepareE
 
 func (i *Internal) prepareEvidenceCapabilities() *pb.PrepareEvidenceStateResponse {
 	return &pb.PrepareEvidenceStateResponse{
-		Supported: true, DedicatedTsoConfigured: i.tsoCutoverState != nil,
+		Supported: true, DedicatedTsoConfigured: i.tsoCutoverState != nil && i.tsAllocator != nil,
 		CutoverApplied: i.tsoCutoverState != nil && i.tsoCutoverState.CutoverActive(),
 	}
 }

@@ -3704,6 +3704,7 @@ func startRaftServers(
 			coordinate.Clock(),
 			relay,
 			append(internalOpts,
+				adapter.WithInternalPrepareEvidenceToken(adminGRPCOpts.token),
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),

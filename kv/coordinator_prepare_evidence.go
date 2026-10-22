@@ -8,35 +8,27 @@ import (
 
 func (c *ShardedCoordinator) prepareEvidenceMetas(ctx context.Context, primaryKey []byte, commitTS uint64, ids []uint64) (map[uint64]*pb.Mutation, error) {
 	metas := make(map[uint64]*pb.Mutation, len(ids))
+	needsReservation := false
 	for _, id := range ids {
-		meta, err := c.prepareEvidenceMeta(ctx, primaryKey, commitTS, []uint64{id})
+		meta, err := c.prepareEvidenceTxnMeta(ctx, primaryKey, commitTS, []uint64{id})
 		if err != nil {
 			return nil, err
 		}
-		metas[id] = meta
+		needsReservation = needsReservation || meta.PrepareCommitTS != 0
+		metas[id] = &pb.Mutation{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(meta)}
+	}
+	if needsReservation {
+		if err := reservePrepareEvidenceTimestamp(ctx, c.tsAllocator, commitTS); err != nil {
+			return nil, err
+		}
 	}
 	return metas, nil
 }
 
 func (c *ShardedCoordinator) prepareEvidenceMeta(ctx context.Context, primaryKey []byte, commitTS uint64, groupIDs []uint64) (*pb.Mutation, error) {
-	meta := TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, PrepareCommitTS: commitTS}
-	for _, id := range groupIDs {
-		group, err := c.txnGroupForID(id)
-		if err != nil {
-			return nil, err
-		}
-		if group.Store == nil {
-			meta.PrepareCommitTS = 0
-			break
-		}
-		enabled, err := PrepareEvidenceEnabled(ctx, group.Store)
-		if err != nil {
-			return nil, err
-		}
-		if !enabled {
-			meta.PrepareCommitTS = 0
-			break
-		}
+	meta, err := c.prepareEvidenceTxnMeta(ctx, primaryKey, commitTS, groupIDs)
+	if err != nil {
+		return nil, err
 	}
 	if meta.PrepareCommitTS != 0 {
 		if err := reservePrepareEvidenceTimestamp(ctx, c.tsAllocator, commitTS); err != nil {
@@ -44,6 +36,29 @@ func (c *ShardedCoordinator) prepareEvidenceMeta(ctx context.Context, primaryKey
 		}
 	}
 	return &pb.Mutation{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(meta)}, nil
+}
+
+func (c *ShardedCoordinator) prepareEvidenceTxnMeta(ctx context.Context, primaryKey []byte, commitTS uint64, groupIDs []uint64) (TxnMeta, error) {
+	meta := TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, PrepareCommitTS: commitTS}
+	for _, id := range groupIDs {
+		group, err := c.txnGroupForID(id)
+		if err != nil {
+			return TxnMeta{}, err
+		}
+		if group.Store == nil {
+			meta.PrepareCommitTS = 0
+			break
+		}
+		enabled, err := PrepareEvidenceEnabled(ctx, group.Store)
+		if err != nil {
+			return TxnMeta{}, err
+		}
+		if !enabled {
+			meta.PrepareCommitTS = 0
+			break
+		}
+	}
+	return meta, nil
 }
 
 // Reservation advances the durable TSO range without changing values already

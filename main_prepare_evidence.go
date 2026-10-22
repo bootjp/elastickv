@@ -10,7 +10,7 @@ import (
 )
 
 func dedicatedTimestampCutoverOptions(groups map[uint64]*kv.ShardGroup) []adapter.InternalOption {
-	if group := groups[dedicatedTSORaftGroupID]; group != nil {
+	if group := groups[dedicatedTSORaftGroupID]; group != nil && group.TSOState != nil {
 		return []adapter.InternalOption{adapter.WithInternalTSOCutoverState(group.TSOState)}
 	}
 	return nil
