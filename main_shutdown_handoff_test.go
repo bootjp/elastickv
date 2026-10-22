@@ -28,7 +28,7 @@ func TestShutdownHandoffStartupSignalCancelsBeforeArming(t *testing.T) {
 		t.Fatal("a signal during startup must cancel immediately")
 	}
 	eg, runCtx := errgroup.WithContext(ctx)
-	handoff.arm(runCtx, eg, nil)
+	handoff.arm(runCtx, eg, nil, nil)
 	require.NoError(t, eg.Wait(), "arming after startup cancellation must not wait for another signal")
 	require.True(t, signalShutdown.Load())
 }
@@ -54,7 +54,7 @@ func TestShutdownHandoffSignalWaitsForTransferAndIgnoresRepeats(t *testing.T) {
 	stop := installShutdownSignalHandler(handoff.requestShutdown, syscall.SIGUSR2)
 	t.Cleanup(stop)
 	eg, runCtx := errgroup.WithContext(ctx)
-	handoff.arm(runCtx, eg, []*raftGroupRuntime{{spec: groupSpec{id: 1}, engine: engine}})
+	handoff.arm(runCtx, eg, []*raftGroupRuntime{{spec: groupSpec{id: 1}, engine: engine}}, nil)
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
 	select {
 	case <-started:
@@ -97,7 +97,7 @@ func TestShutdownHandoffDeadlineSurvivesBlockedLogging(t *testing.T) {
 	close(requests)
 	done := make(chan struct{})
 	go func() {
-		shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, requests, shutdownTransferRetryDelay)
+		shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, requests, shutdownTransferRetryDelay, nil)
 		close(done)
 	}()
 	select {

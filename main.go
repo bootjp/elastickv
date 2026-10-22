@@ -720,12 +720,18 @@ func run() error {
 	}); err != nil {
 		return err
 	}
-	handoff.arm(runCtx, eg, runtimes)
+	balanceCtx, stopBalance := context.WithCancel(runCtx)
+	defer stopBalance()
+	balanceDone := make(chan struct{})
+	handoff.arm(runCtx, eg, runtimes, func(ctx context.Context) error {
+		return stopLeaderBalanceForShutdown(ctx, stopBalance, balanceDone)
+	})
 	startLeaderBalanceScheduler(
-		runCtx,
+		balanceCtx,
 		eg,
 		runtimes,
 		leaderBalanceConfigFromFlags(*raftId, cfg.defaultGroup, cfg.sqsFifoPartitionMap, metricsRegistry.Registerer()),
+		balanceDone,
 	)
 
 	return waitRunGroup(eg)

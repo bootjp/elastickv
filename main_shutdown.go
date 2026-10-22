@@ -43,7 +43,7 @@ func (h *shutdownHandoff) requestShutdown() {
 	request()
 }
 
-func (h *shutdownHandoff) arm(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime) {
+func (h *shutdownHandoff) arm(ctx context.Context, eg *errgroup.Group, runtimes []*raftGroupRuntime, quiesce func(context.Context) error) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if ctx.Err() != nil {
@@ -52,12 +52,12 @@ func (h *shutdownHandoff) arm(ctx context.Context, eg *errgroup.Group, runtimes 
 	requests := make(chan struct{})
 	h.request = sync.OnceFunc(func() { close(requests) })
 	eg.Go(func() error {
-		shutdownAfterRequest(ctx, h.cancel, runtimes, requests, shutdownTransferTimeout)
+		shutdownAfterRequest(ctx, h.cancel, runtimes, requests, shutdownTransferTimeout, quiesce)
 		return nil
 	})
 }
 
-func shutdownAfterRequest(ctx context.Context, cancel context.CancelFunc, runtimes []*raftGroupRuntime, requests <-chan struct{}, timeout time.Duration) {
+func shutdownAfterRequest(ctx context.Context, cancel context.CancelFunc, runtimes []*raftGroupRuntime, requests <-chan struct{}, timeout time.Duration, quiesce func(context.Context) error) {
 	select {
 	case <-ctx.Done():
 		return
@@ -70,14 +70,30 @@ func shutdownAfterRequest(ctx context.Context, cancel context.CancelFunc, runtim
 	defer stop()
 	done := make(chan struct{})
 	go func() {
+		defer close(done)
+		if quiesce != nil {
+			if err := quiesce(transferCtx); err != nil {
+				slog.Warn("shutdown: leader balance did not quiesce before handoff", "err", err)
+				return
+			}
+		}
 		transferLeadershipOnShutdown(transferCtx, runtimes)
-		close(done)
 	}()
 	// Logging may be backpressured. It must not hold root cancellation or
 	// the errgroup beyond the handoff deadline.
 	select {
 	case <-done:
 	case <-transferCtx.Done():
+	}
+}
+
+func stopLeaderBalanceForShutdown(ctx context.Context, cancel context.CancelFunc, done <-chan struct{}) error {
+	cancel()
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return errors.Wrap(ctx.Err(), "join leader balance before shutdown handoff")
 	}
 }
 

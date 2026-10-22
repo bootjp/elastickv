@@ -17,7 +17,11 @@ still be able to shut down.
    filesystem start, `shutdownHandoff.arm` switches the callback to a handoff
    request. Repeated signals remain ignored through storage cleanup; the existing
    clean-exit handling and bounded signal-handler join are preserved.
-2. Snapshot each runtime's engine through `snapshotEngine`. For each local
+2. Cancel the local leader-balancer's separate context and join its loop/RPC
+   before handing off. This join shares the same five-second deadline as all
+   transfers; a stuck balancer skips handoff and still permits bounded shutdown.
+   Raft transport and ordinary server contexts remain alive during this step.
+   Snapshot each runtime's engine through `snapshotEngine`. For each local
    leader, run a transfer concurrently under one five-second deadline. Re-scan
    after each round until no local leaders remain or that deadline expires, so
    followers promoted during another group's handoff are not missed.

@@ -79,7 +79,7 @@ func TestShutdownSignalTransfersAllLeadersBeforeCancellation(t *testing.T) {
 	}
 	requests := make(chan struct{})
 	close(requests)
-	shutdownAfterRequest(ctx, cancel, runtimes, requests, time.Second)
+	shutdownAfterRequest(ctx, cancel, runtimes, requests, time.Second, nil)
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 	require.Equal(t, int32(2), calls.Load())
 }
@@ -106,7 +106,7 @@ func TestShutdownSignalTransfersLeadershipAcquiredDuringHandoff(t *testing.T) {
 	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{
 		{spec: groupSpec{id: 1}, engine: follower},
 		{spec: groupSpec{id: 2}, engine: leader},
-	}, requests, time.Second)
+	}, requests, time.Second, nil)
 	require.Equal(t, int32(1), followerTransfers.Load())
 	require.Equal(t, raftengine.StateFollower, follower.State())
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
@@ -130,7 +130,7 @@ func TestShutdownSignalSharesDeadlineAcrossGroups(t *testing.T) {
 	close(requests)
 	done := make(chan struct{})
 	go func() {
-		shutdownAfterRequest(ctx, cancel, runtimes, requests, 200*time.Millisecond)
+		shutdownAfterRequest(ctx, cancel, runtimes, requests, 200*time.Millisecond, nil)
 		close(done)
 	}()
 	for range runtimes {
@@ -200,5 +200,5 @@ func TestShutdownAlreadyCanceledDoesNotTransfer(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, make(chan struct{}), time.Second)
+	shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, make(chan struct{}), time.Second, nil)
 }
