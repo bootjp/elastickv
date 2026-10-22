@@ -568,7 +568,7 @@ func TestDetachFUSEMountRefusesPathWithoutFUSEMount(t *testing.T) {
 	mountPoint := t.TempDir()
 	helperDir := t.TempDir()
 	marker := filepath.Join(helperDir, "ran")
-	script := "#!/bin/sh\n/bin/touch " + marker + "\nexit 0\n"
+	script := "#!/bin/sh\n: > " + marker + "\nexit 0\n"
 	require.NoError(t, os.WriteFile(filepath.Join(helperDir, "fusermount3"), []byte(script), 0o700)) //nolint:gosec // the helper stand-in must be executable.
 	onlyMountHelpersIn(t, helperDir)
 
