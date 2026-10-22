@@ -57,19 +57,28 @@ type RawFileSystem struct {
 	attrTTL    time.Duration
 	entryTTL   time.Duration
 	filesystem string
+
+	// requests is the parent of every request's context. cancelRequests
+	// ends it, which makes in-flight backend calls return so the kernel
+	// gets an answer for each request it already handed to this server.
+	requests       context.Context
+	cancelRequests context.CancelFunc
 }
 
 // NewRawFileSystem creates the request bridge without mounting it. Tests and
 // embedders can exercise this surface directly; Mount performs the kernel bind.
 func NewRawFileSystem(adapter *Adapter) *RawFileSystem {
+	requests, cancelRequests := context.WithCancel(context.Background())
 	return &RawFileSystem{
-		RawFileSystem: fuse.NewDefaultRawFileSystem(),
-		adapter:       adapter,
-		nextDirFH:     rootDirHandle,
-		dirHandles:    make(map[uint64]*directoryHandle),
-		attrTTL:       defaultAttrTTL,
-		entryTTL:      defaultEntryTTL,
-		filesystem:    filesystemName,
+		RawFileSystem:  fuse.NewDefaultRawFileSystem(),
+		adapter:        adapter,
+		nextDirFH:      rootDirHandle,
+		dirHandles:     make(map[uint64]*directoryHandle),
+		attrTTL:        defaultAttrTTL,
+		entryTTL:       defaultEntryTTL,
+		filesystem:     filesystemName,
+		requests:       requests,
+		cancelRequests: cancelRequests,
 	}
 }
 
@@ -82,7 +91,7 @@ func (r *RawFileSystem) String() string {
 }
 
 func (r *RawFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	stat, errno := r.adapter.Lookup(ctx, header.NodeId, []byte(name))
 	if errno != 0 {
@@ -93,7 +102,7 @@ func (r *RawFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, na
 }
 
 func (r *RawFileSystem) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, out *fuse.AttrOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	stat, errno := r.adapter.GetAttr(ctx, input.NodeId)
 	if errno != 0 {
@@ -105,7 +114,7 @@ func (r *RawFileSystem) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, o
 }
 
 func (r *RawFileSystem) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	mask, attrs := fuseSetAttr(input)
 	stat, errno := r.adapter.SetAttr(ctx, input.NodeId, mask, attrs)
@@ -121,7 +130,7 @@ func (r *RawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name 
 	if input.Mode&syscall.S_IFMT != syscall.S_IFREG {
 		return fuse.Status(syscall.EOPNOTSUPP)
 	}
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	result, errno := r.adapter.Mknod(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
@@ -136,7 +145,7 @@ func (r *RawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name 
 }
 
 func (r *RawFileSystem) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	result, errno := r.adapter.Mkdir(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
@@ -151,13 +160,13 @@ func (r *RawFileSystem) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name 
 }
 
 func (r *RawFileSystem) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	return fuse.Status(r.adapter.Unlink(ctx, header.NodeId, []byte(name)))
 }
 
 func (r *RawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	return fuse.Status(r.adapter.Rmdir(ctx, header.NodeId, []byte(name)))
 }
@@ -166,7 +175,7 @@ func (r *RawFileSystem) Rename(cancel <-chan struct{}, input *fuse.RenameIn, old
 	if input.Flags != 0 {
 		return fuse.Status(syscall.EOPNOTSUPP)
 	}
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	return fuse.Status(r.adapter.Rename(ctx, input.NodeId, []byte(oldName), input.Newdir, []byte(newName)))
 }
@@ -184,14 +193,14 @@ func (r *RawFileSystem) Readlink(<-chan struct{}, *fuse.InHeader) ([]byte, fuse.
 }
 
 func (r *RawFileSystem) Access(cancel <-chan struct{}, input *fuse.AccessIn) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	_, errno := r.adapter.GetAttr(ctx, input.NodeId)
 	return fuse.Status(errno)
 }
 
 func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	for attempt := range createRetryLimit {
 		status := r.createOrOpen(ctx, input, []byte(name), out)
@@ -225,7 +234,7 @@ func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, 
 }
 
 func (r *RawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	fh, errno := r.adapter.Open(ctx, input.NodeId)
 	if errno == 0 {
@@ -235,7 +244,7 @@ func (r *RawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fu
 }
 
 func (r *RawFileSystem) Read(cancel <-chan struct{}, input *fuse.ReadIn, _ []byte) (fuse.ReadResult, fuse.Status) {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	data, errno := r.adapter.Read(ctx, input.NodeId, input.Fh, input.Offset, uint64(input.Size))
 	if errno != 0 {
@@ -245,7 +254,7 @@ func (r *RawFileSystem) Read(cancel <-chan struct{}, input *fuse.ReadIn, _ []byt
 }
 
 func (r *RawFileSystem) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	n, errno := r.adapter.Write(ctx, input.NodeId, input.Fh, input.Offset, data)
 	if errno != 0 {
@@ -258,7 +267,7 @@ func (r *RawFileSystem) Write(cancel <-chan struct{}, input *fuse.WriteIn, data 
 }
 
 func (r *RawFileSystem) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	if errno := r.adapter.Release(ctx, input.NodeId, input.Fh); errno != 0 {
 		slog.WarnContext(ctx, "filesystem FUSE release failed", "inode", input.NodeId, "fh", input.Fh, "errno", errno)
@@ -266,20 +275,20 @@ func (r *RawFileSystem) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 }
 
 func (r *RawFileSystem) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	return fuse.Status(r.adapter.Flush(ctx, input.NodeId, input.Fh))
 }
 
 func (r *RawFileSystem) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	datasync := input.FsyncFlags&1 != 0
 	return fuse.Status(r.adapter.Fsync(ctx, input.NodeId, input.Fh, datasync))
 }
 
 func (r *RawFileSystem) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	stat, errno := r.adapter.GetAttr(ctx, input.NodeId)
 	if errno != 0 {
@@ -293,7 +302,7 @@ func (r *RawFileSystem) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out 
 }
 
 func (r *RawFileSystem) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out *fuse.DirEntryList) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	handle, ok := r.directoryHandle(input.Fh)
 	if !ok {
@@ -360,7 +369,7 @@ func (r *RawFileSystem) FsyncDir(<-chan struct{}, *fuse.FsyncIn) fuse.Status {
 }
 
 func (r *RawFileSystem) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {
-	ctx, done := requestContext(cancel)
+	ctx, done := r.requestContext(cancel)
 	defer done()
 	stat, errno := r.adapter.StatFS(ctx, input.NodeId)
 	if errno != 0 {
@@ -412,8 +421,31 @@ func (r *RawFileSystem) directoryHandle(fh uint64) (*directoryHandle, bool) {
 	return handle, ok
 }
 
+// requestContext is the context of one FUSE request: it ends when the
+// kernel interrupts the request (cancel) or when the server cancels all of
+// its requests (cancelInFlight).
+func (r *RawFileSystem) requestContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
+	parent := context.Background()
+	if r != nil && r.requests != nil {
+		parent = r.requests
+	}
+	return requestContextWithin(parent, cancel)
+}
+
+// cancelInFlight ends the context of every request in flight and of any
+// that arrives later. A nil RawFileSystem is a no-op.
+func (r *RawFileSystem) cancelInFlight() {
+	if r != nil && r.cancelRequests != nil {
+		r.cancelRequests()
+	}
+}
+
 func requestContext(cancel <-chan struct{}) (context.Context, context.CancelFunc) {
-	ctx, done := context.WithCancel(context.Background())
+	return requestContextWithin(context.Background(), cancel)
+}
+
+func requestContextWithin(parent context.Context, cancel <-chan struct{}) (context.Context, context.CancelFunc) {
+	ctx, done := context.WithCancel(parent)
 	if cancel == nil {
 		return ctx, done
 	}
@@ -508,33 +540,198 @@ func saturatingAdd(left uint64, right uint64) uint64 {
 
 // Server owns an active kernel mount and its adapter session.
 type Server struct {
-	inner   *fuse.Server
-	adapter *Adapter
+	inner      *fuse.Server
+	adapter    *Adapter
+	mountPoint string
+	// fsType is the mounts-table type of this mount (`fuse.<Name>`, the
+	// subtype go-fuse mounts with); the lazy detach refuses to act on
+	// anything else at the mount point.
+	fsType string
+	// fs is the request bridge the kernel mount serves.
+	fs *RawFileSystem
+	// startCtx is the context MountContext ran under. It bounds only
+	// WaitMount: go-fuse's readiness check opens a file on the new mount,
+	// the kernel's permission check on the root sends a getattr through to
+	// the backend, and that read can block while no leader is available.
+	startCtx context.Context
+	// released is closed once WaitMount gave up on a cancelled startup and
+	// released the mount; Unmount and Serve then return at once.
+	released    chan struct{}
+	releaseOnce sync.Once
 }
 
 // Mount attaches adapter to mountPoint using go-fuse. The returned server is
-// ready for Serve; callers should call Unmount during shutdown.
+// ready for Serve; callers should call Unmount during shutdown. It is
+// MountContext with a background context; servers that can be told to stop
+// during startup should use MountContext.
+//
+// A dangling FUSE mount left at mountPoint by a server that died without
+// unmounting (SIGKILL, a crash) is detached first, because fusermount3
+// refuses to mount over a mount point whose transport is not connected. Only
+// a mount the mounts table reports with this server's own type
+// (`fuse.<Name>`) and whose stat fails with ENOTCONN is touched; a live
+// mount or a filesystem of any other type at the path is left alone.
 func Mount(mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Server, error) {
+	return MountContext(context.Background(), mountPoint, adapter, options)
+}
+
+// MountContext is Mount whose pre-mount work (the stale-mount detach and the
+// intent recovery) stops when ctx is cancelled, so a shutdown requested
+// during startup does not wait on a hung fusermount helper, an unavailable
+// leader, or a long recovery backlog. The returned Server's WaitMount stops
+// on ctx too, releasing the mount; otherwise the kernel mount and the
+// Server are not bound to ctx, and Unmount ends them.
+func MountContext(ctx context.Context, mountPoint string, adapter *Adapter, options *fuse.MountOptions) (*Server, error) {
 	if adapter == nil || adapter.core == nil {
 		return nil, errors.New("filesystem FUSE adapter is required")
 	}
 	if strings.TrimSpace(mountPoint) == "" {
 		return nil, errors.New("filesystem FUSE mount point is required")
 	}
+	if err := ctx.Err(); err != nil {
+		return nil, errors.Wrap(err, "filesystem FUSE mount aborted before start")
+	}
 	opts := defaultMountOptions(options)
+	if _, err := detachStaleMount(ctx, mountPoint, opts.Name, slog.Default()); err != nil {
+		return nil, errors.Wrap(err, "detach stale filesystem FUSE mount")
+	}
 	if recoverer, ok := adapter.core.(intentRecoverer); ok {
-		recoveryCtx, cancel := context.WithTimeout(context.Background(), startupRecoveryTimeout)
+		recoveryCtx, cancel := context.WithTimeout(ctx, startupRecoveryTimeout)
 		recoveryErr := recoverIntentsBeforeMount(recoveryCtx, recoverer)
 		cancel()
 		if recoveryErr != nil {
 			return nil, errors.Wrap(recoveryErr, "recover filesystem intents before FUSE mount")
 		}
 	}
-	inner, err := fuse.NewServer(NewRawFileSystem(adapter), mountPoint, opts)
+	fs := NewRawFileSystem(adapter)
+	inner, err := newServerContext(ctx, fs, mountPoint, opts)
 	if err != nil {
-		return nil, errors.Wrap(err, "mount filesystem FUSE server")
+		return nil, err
 	}
-	return &Server{inner: inner, adapter: adapter}, nil
+	return &Server{
+		inner:      inner,
+		adapter:    adapter,
+		mountPoint: mountPoint,
+		fsType:     fuseTypeFor(opts.Name),
+		fs:         fs,
+		startCtx:   ctx,
+		released:   make(chan struct{}),
+	}, nil
+}
+
+type newServerResult struct {
+	server *fuse.Server
+	err    error
+}
+
+// newServerContext runs fuse.NewServer in its own goroutine so a cancelled
+// ctx can unwind startup: go-fuse waits for the fusermount helper with no
+// context of its own, and a hung helper would otherwise block the mount, the
+// errgroup drain and the WAL sync behind it forever. A mount that completes
+// after the caller gave up is unmounted again so no kernel mount leaks.
+func newServerContext(ctx context.Context, fs *RawFileSystem, mountPoint string, opts *fuse.MountOptions) (*fuse.Server, error) {
+	results := make(chan newServerResult, 1)
+	go func() {
+		server, err := fuse.NewServer(fs, mountPoint, opts)
+		results <- newServerResult{server: server, err: err}
+	}()
+	select {
+	case res := <-results:
+		if res.err != nil {
+			return nil, errors.Wrap(res.err, "mount filesystem FUSE server")
+		}
+		return res.server, nil
+	case <-ctx.Done():
+		go releaseAbandonedMount(results, fs, mountPoint, fuseTypeFor(opts.Name))
+		return nil, errors.Wrap(ctx.Err(), "filesystem FUSE mount cancelled while waiting for the mount helper")
+	}
+}
+
+// abandonedUnmountTimeout and abandonedDetachTimeout split the one window a
+// mount whose caller gave up on it is released in. The plain unmount (go-fuse
+// runs the unmount helper without a bound and then waits for its event
+// loops, either of which can hang), together with the wait for a cancelled
+// readiness check before it, must finish within abandonedUnmountTimeout of
+// the start of the release; the lazy detach that may follow must finish
+// within abandonedDetachTimeout after that deadline. A release therefore
+// never takes longer than their sum, a stop requested during startup
+// included. Variables so tests can shorten them.
+var (
+	abandonedUnmountTimeout = 7 * time.Second
+	abandonedDetachTimeout  = 3 * time.Second
+)
+
+// releaseAbandonedMount tears down a mount that completed after MountContext
+// had already given up on it. It first cancels every request the late mount
+// serves, now and later (fs is its request bridge), so a client request that
+// reached the backend before the release returns instead of running on
+// while the caller's unwinding closes the stores. go-fuse's NewServer
+// registers the event loop with its wait group and Unmount waits for that
+// group, but only Serve runs the loop that releases it, so Serve must be
+// running for Unmount to return; the loop exits by itself once the kernel
+// unmount closes the connection.
+func releaseAbandonedMount(results <-chan newServerResult, fs *RawFileSystem, mountPoint, fsType string) {
+	res := <-results
+	if res.server == nil {
+		return
+	}
+	fs.cancelInFlight()
+	go res.server.Serve()
+	releaseAbandoned(res.server.Unmount, mountPoint, fsType)
+}
+
+// releaseAbandoned releases a mount in a release window that starts now
+// (see releaseAbandonedBy).
+func releaseAbandoned(unmount func() error, mountPoint, fsType string) {
+	releaseAbandonedBy(time.Now().Add(abandonedUnmountTimeout), unmount, mountPoint, fsType)
+}
+
+// releaseAbandonedBy runs unmount until unmountBy. When it fails or does
+// not return in time, the mount is detached lazily instead, by
+// abandonedDetachTimeout after unmountBy, so no kernel mount is left
+// behind; the lazy detach itself refuses a path that no longer holds a
+// mount of fsType, so an unmount that did succeed late is not followed by a
+// detach of whatever sits underneath. When unmountBy has already passed,
+// unmount is not started at all: go-fuse's unmount runs without a bound,
+// and one left running beside the lazy detach could act, by path, on a
+// mount the detach exposed.
+func releaseAbandonedBy(unmountBy time.Time, unmount func() error, mountPoint, fsType string) {
+	if wait := time.Until(unmountBy); wait <= 0 {
+		slog.Warn("filesystem FUSE unmount of an abandoned mount has no time left, detaching lazily",
+			"mount_point", mountPoint,
+			"timeout", abandonedUnmountTimeout,
+		)
+	} else if !unmountWithin(wait, unmount, mountPoint) {
+		return
+	}
+	ctx, cancel := context.WithDeadline(context.Background(), unmountBy.Add(abandonedDetachTimeout))
+	defer cancel()
+	if _, err := detachFUSEMount(ctx, mountPoint, fsType); err != nil && !errors.Is(err, errNoFUSEMount) {
+		slog.Warn("filesystem FUSE lazy detach of an abandoned mount failed", "mount_point", mountPoint, "err", err)
+	}
+}
+
+// unmountWithin runs unmount for up to wait and reports whether the mount
+// still needs the lazy detach: true when unmount failed or did not return
+// in time, false when it unmounted cleanly.
+func unmountWithin(wait time.Duration, unmount func() error, mountPoint string) bool {
+	done := make(chan error, 1)
+	go func() { done <- unmount() }()
+	timer := time.NewTimer(wait)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		if err == nil {
+			return false
+		}
+		slog.Warn("filesystem FUSE unmount of an abandoned mount failed, detaching lazily", "mount_point", mountPoint, "err", err)
+	case <-timer.C:
+		slog.Warn("filesystem FUSE unmount of an abandoned mount did not return in time, detaching lazily",
+			"mount_point", mountPoint,
+			"timeout", abandonedUnmountTimeout,
+		)
+	}
+	return true
 }
 
 func recoverIntentsBeforeMount(ctx context.Context, recoverer intentRecoverer) error {
@@ -578,17 +775,106 @@ func containsMountOption(options []string, want string) bool {
 	return false
 }
 
+// Serve runs the request loop until the kernel mount goes away. After
+// WaitMount released the mount of a cancelled startup it returns once that
+// release has finished, even when a backend request that ignores its
+// context still holds one of go-fuse's loops.
 func (s *Server) Serve() {
-	if s != nil && s.inner != nil {
+	if s == nil || s.inner == nil {
+		return
+	}
+	if s.released == nil {
 		s.inner.Serve()
+		return
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		s.inner.Serve()
+	}()
+	select {
+	case <-done:
+	case <-s.released:
 	}
 }
 
+// WaitMount waits until the kernel mount answers requests. When the context
+// MountContext ran under is cancelled first, it releases the mount (see
+// release) and returns the cancellation, so a shutdown requested while the
+// readiness check is stuck in a backend request is not held up by it.
+// Serve must be running, as for go-fuse's own WaitMount.
 func (s *Server) WaitMount() error {
 	if s == nil || s.inner == nil {
 		return nil
 	}
-	return errors.WithStack(s.inner.WaitMount())
+	ready := make(chan error, 1)
+	inner := s.inner
+	go func() { ready <- inner.WaitMount() }()
+	var stop <-chan struct{}
+	if s.startCtx != nil {
+		stop = s.startCtx.Done()
+	}
+	select {
+	case err := <-ready:
+		return errors.WithStack(err)
+	case <-stop:
+		s.release(ready)
+		return errors.Wrap(s.startCtx.Err(), "filesystem FUSE mount cancelled while waiting for it to become ready")
+	}
+}
+
+// release tears down a mount whose startup was cancelled. It first cancels
+// every request in flight: the kernel caller of a request already handed to
+// this server waits for the answer uninterruptibly (here go-fuse's readiness
+// check in this very process), so the handler must return before anything
+// else can. It then waits for the readiness check (ready) and unmounts,
+// falling back to the guarded lazy detach, inside one release window (see
+// releaseAfterReadiness). The Server is then marked released.
+func (s *Server) release(ready <-chan error) {
+	s.releaseOnce.Do(func() {
+		s.fs.cancelInFlight()
+		releaseAfterReadiness(ready, s.inner.Unmount, s.mountPoint, s.fsType)
+		if s.released != nil {
+			close(s.released)
+		}
+	})
+}
+
+// releaseAfterReadiness waits for the cancelled readiness check (ready) and
+// then releases the mount with releaseAbandonedBy, all inside one release
+// window: the readiness wait and the plain unmount share its unmount
+// deadline, so a check that returns late leaves the unmount only what is
+// left of it, and the lazy detach runs by its end. A check still running at
+// the unmount deadline means a backend request is ignoring its context, and
+// go-fuse's Unmount (which must not run alongside the check, and would wait
+// on the stuck request) is skipped for the lazy detach alone.
+func releaseAfterReadiness(ready <-chan error, unmount func() error, mountPoint, fsType string) {
+	unmountBy := time.Now().Add(abandonedUnmountTimeout)
+	timer := time.NewTimer(abandonedUnmountTimeout)
+	select {
+	case <-ready:
+	case <-timer.C:
+		unmount = func() error { return errReadinessStuck }
+	}
+	timer.Stop()
+	releaseAbandonedBy(unmountBy, unmount, mountPoint, fsType)
+}
+
+// errReadinessStuck reports that go-fuse's readiness check did not return
+// after its backend requests were cancelled, so the plain unmount is skipped.
+var errReadinessStuck = errors.New("filesystem FUSE readiness check did not return after cancellation")
+
+// isReleased reports whether WaitMount already released the mount.
+func (s *Server) isReleased() bool {
+	if s.released == nil {
+		return false
+	}
+	select {
+	case <-s.released:
+		return true
+	default:
+		return false
+	}
 }
 
 func (s *Server) Wait() {
@@ -604,8 +890,39 @@ func (s *Server) Unmount() error {
 	if s.adapter != nil {
 		s.adapter.Close()
 	}
-	if s.inner == nil {
+	if s.inner == nil || s.isReleased() {
 		return nil
 	}
 	return errors.WithStack(s.inner.Unmount())
+}
+
+// UnmountLazy detaches the mount from the namespace even while clients still
+// hold files on it open (`fusermount -u -z`, or a lazy unmount(2)): new
+// lookups see the plain directory at once, and the kernel releases the FUSE
+// connection, ending Serve, once the last open handle is closed. It is the
+// fallback for an Unmount that failed with EBUSY or did not return during
+// shutdown, so it first stops serving: every request in flight, and every
+// one that arrives later, has its context cancelled. A handler blocked in
+// the backend (the reason the Unmount hung) therefore returns before the
+// stores behind it are closed, and requests through a handle that is still
+// open get an error from then on. The detach itself acts only on a mount of
+// this server's own type still present at the mount point: when the kernel
+// mount is already gone (Unmount removed it and is merely waiting for its
+// event loop), or a filesystem of any other type is exposed there, nothing
+// is touched and nil is returned. A nil or never-mounted Server is a no-op
+// apart from the cancellation.
+func (s *Server) UnmountLazy(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.fs.cancelInFlight()
+	if s.inner == nil || s.mountPoint == "" {
+		return nil
+	}
+	_, err := detachFUSEMount(ctx, s.mountPoint, s.fsType)
+	if errors.Is(err, errNoFUSEMount) {
+		slog.InfoContext(ctx, "filesystem FUSE mount is already gone, nothing to detach", "mount_point", s.mountPoint)
+		return nil
+	}
+	return err
 }

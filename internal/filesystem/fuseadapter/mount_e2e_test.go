@@ -1,12 +1,20 @@
 //go:build linux
 
+// The kernel-mount tests drive a real /dev/fuse mount and read Linux statfs
+// fields, so they only build on Linux; elsewhere the package's portable
+// tests still run.
+
 package fuseadapter_test
 
 import (
+	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -29,10 +37,32 @@ const (
 // ELASTICKV_REQUIRE_FUSE is set, in which case a mount failure is fatal.
 func mountMemoryFilesystem(t *testing.T) string {
 	t.Helper()
+	mountPoint := t.TempDir()
+	mountMemoryFilesystemAt(t, mountPoint)
+	return mountPoint
+}
+
+// mountMemoryFilesystemAt mounts a fresh in-memory filesystem at an existing
+// directory and unmounts it when the test ends.
+func mountMemoryFilesystemAt(t *testing.T, mountPoint string) {
+	t.Helper()
+	mountMemoryFilesystemServer(t, mountPoint)
+}
+
+// e2eMount is a kernel mount owned by a test. unmount is idempotent so a
+// test may unmount early and let the cleanup run harmlessly afterwards.
+type e2eMount struct {
+	server    *fuseadapter.Server
+	serveDone <-chan struct{}
+	unmount   func() error
+}
+
+func mountMemoryFilesystemServer(t *testing.T, mountPoint string) *e2eMount {
+	t.Helper()
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
-	return mountMemoryService(t, newMemoryServiceForMount(t), "e2e-mount")
+	return mountMemoryServiceAt(t, newMemoryServiceForMount(t), "e2e-mount", mountPoint)
 }
 
 func newMemoryServiceForMount(t *testing.T) *filesystem.Service {
@@ -47,9 +77,15 @@ func newMemoryServiceForMount(t *testing.T) *filesystem.Service {
 	return svc
 }
 
-func mountMemoryService(t *testing.T, svc *filesystem.Service, clientID string) string {
+func mountMemoryService(t *testing.T, svc fuseadapter.Core, clientID string) string {
 	t.Helper()
 	mountPoint := t.TempDir()
+	mountMemoryServiceAt(t, svc, clientID, mountPoint)
+	return mountPoint
+}
+
+func mountMemoryServiceAt(t *testing.T, svc fuseadapter.Core, clientID, mountPoint string) *e2eMount {
+	t.Helper()
 	adapter := fuseadapter.New(svc, []byte(clientID))
 	server, err := fuseadapter.Mount(mountPoint, adapter, &fuse.MountOptions{DirectMount: os.Geteuid() == 0})
 	if err != nil {
@@ -66,22 +102,23 @@ func mountMemoryService(t *testing.T, svc *filesystem.Service, clientID string) 
 		<-serveDone
 		skipOrFail(t, "FUSE mount did not come up: %v", err)
 	}
+	mount := &e2eMount{server: server, serveDone: serveDone, unmount: sync.OnceValue(server.Unmount)}
 	t.Cleanup(func() {
-		require.NoError(t, server.Unmount())
+		require.NoError(t, mount.unmount())
 		select {
 		case <-serveDone:
 		case <-time.After(10 * time.Second):
 			t.Error("FUSE server did not stop after unmount")
 		}
 	})
-	return mountPoint
+	return mount
 }
 
 func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
-	svc := newMemoryServiceForMount(t)
+	svc := &collidingMountCore{Core: newMemoryServiceForMount(t), ready: make(chan struct{})}
 
 	mountA := mountMemoryService(t, svc, "e2e-mount-a")
 	mountB := mountMemoryService(t, svc, "e2e-mount-b")
@@ -120,6 +157,32 @@ func TestKernelMountConcurrentCreateAcrossMounts(t *testing.T) {
 		require.FileExists(t, pathA)
 		require.FileExists(t, pathB)
 	}
+	require.Positive(t, svc.collisions.Load(), "must exercise an actual FUSE_CREATE collision, not just existing-file Open")
+}
+
+type collidingMountCore struct {
+	fuseadapter.Core
+	ready      chan struct{}
+	creates    atomic.Int32
+	collisions atomic.Int32
+}
+
+func (c *collidingMountCore) Create(ctx context.Context, parent uint64, name []byte, opts filesystem.CreateOptions) (filesystem.CreateResult, error) {
+	if attempt := c.creates.Add(1); attempt <= 2 {
+		if attempt == 2 {
+			close(c.ready)
+		}
+		select {
+		case <-c.ready:
+		case <-time.After(5 * time.Second):
+			return filesystem.CreateResult{}, context.DeadlineExceeded
+		}
+	}
+	result, err := c.Core.Create(ctx, parent, name, opts)
+	if errors.Is(err, filesystem.ErrExists) {
+		c.collisions.Add(1)
+	}
+	return result, err
 }
 
 func skipOrFail(t *testing.T, format string, args ...any) {
