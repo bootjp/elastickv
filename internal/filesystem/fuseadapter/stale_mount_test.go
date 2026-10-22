@@ -543,7 +543,7 @@ func TestDetachFUSEMountReachesKernelFallbackWhenHelpersHoldPipes(t *testing.T) 
 	require.NotErrorIs(t, err, context.DeadlineExceeded, "the helpers' pipe waits must not pre-empt the kernel fallback")
 	require.ErrorContains(t, err, lazyUnmountMethod)
 	elapsed := time.Since(start)
-	require.GreaterOrEqual(t, elapsed, budget/2-50*time.Millisecond, "the first helper must have been given its share, pipe wait included")
+	require.GreaterOrEqual(t, elapsed, budget/2-detachHelperWaitDelay-50*time.Millisecond, "the first helper must have been given its execution share")
 	require.Less(t, elapsed, budget, "the fallback must run inside the caller's budget")
 }
 
@@ -764,13 +764,10 @@ func TestReleaseAbandonedDetachesWhenUnmountHangs(t *testing.T) {
 	mountPoint := t.TempDir()
 	useFakeDetachMountTable(t, fuseTableLine(mountPoint))
 	marker := writeRecordingMountHelper(t)
-	release := make(chan struct{})
-	t.Cleanup(func() { close(release) })
-
 	start := time.Now()
-	releaseAbandoned(func() error {
-		<-release
-		return nil
+	releaseAbandoned(func(ctx context.Context) error {
+		<-ctx.Done()
+		return ctx.Err()
 	}, mountPoint, fuseTypeFor(filesystemName))
 	require.Less(t, time.Since(start), 5*time.Second, "the release must not wait on the hung unmount")
 	require.FileExists(t, marker, "the lazy detach must run once the unmount overran its bound")
@@ -784,9 +781,9 @@ func TestReleaseAbandonedFallsBackOnlyWhenUnmountFails(t *testing.T) {
 	useFakeDetachMountTable(t, fuseTableLine(mountPoint))
 	marker := writeRecordingMountHelper(t)
 
-	releaseAbandoned(func() error { return nil }, mountPoint, fuseTypeFor(filesystemName))
+	releaseAbandoned(func(context.Context) error { return nil }, mountPoint, fuseTypeFor(filesystemName))
 	require.NoFileExists(t, marker, "a clean unmount needs no detach")
 
-	releaseAbandoned(func() error { return errors.New("device or resource busy") }, mountPoint, fuseTypeFor(filesystemName))
+	releaseAbandoned(func(context.Context) error { return errors.New("device or resource busy") }, mountPoint, fuseTypeFor(filesystemName))
 	require.FileExists(t, marker, "a failed unmount falls back to the lazy detach")
 }

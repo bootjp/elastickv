@@ -1219,10 +1219,13 @@ func registerAdminLifecycle(
 	version string,
 ) {
 	addr := adminCfg.Listen
+	handlers := trackAdminHandlers(httpSrv)
 	eg.Go(func() error {
 		<-ctx.Done()
 		slog.Info("shutting down admin listener", "address", addr, "reason", ctx.Err())
-		return monitoring.ShutdownHTTPServer(ctx, httpSrv, "admin", adminShutdownTimeout)
+		err := monitoring.ShutdownHTTPServer(ctx, httpSrv, "admin", adminShutdownTimeout)
+		handlers.join(adminHandlerJoinTimeout)
+		return errors.WithStack(err)
 	})
 	eg.Go(func() error {
 		slog.Info("starting admin listener", "address", addr, "tls", tlsEnabled, "version", version)

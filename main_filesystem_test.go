@@ -294,6 +294,17 @@ func (f *fakeFilesystemMountServer) Unmount() error {
 	return f.unmountErr
 }
 
+func (f *fakeFilesystemMountServer) UnmountContext(ctx context.Context) error {
+	if f.unmountBlock != nil {
+		select {
+		case <-f.unmountBlock:
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	return f.Unmount()
+}
+
 func (f *fakeFilesystemMountServer) UnmountLazy(context.Context) error {
 	f.lazyCalls++
 	if f.onLazy != nil {
