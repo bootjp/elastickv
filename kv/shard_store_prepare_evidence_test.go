@@ -230,7 +230,8 @@ func TestPrepareEvidenceSafetyMarkerBlocksLateLegacyImportAtAnyStart(t *testing.
 func TestPrepareEvidenceSafetyMarkerIsExcludedFromMigration(t *testing.T) {
 	brackets, err := distribution.PlanExportBrackets([]byte(txnBackupPrefix), []byte("!txn|meta}"))
 	require.NoError(t, err)
-	for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey} {
+	for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey,
+		replicatedPinStateKey, []byte(store.ReplicatedControlPrefix + "future-state")} {
 		require.True(t, distribution.IsMigrationKnownInternalKey(key),
 			"the source must not export a group-local protocol marker as user data")
 		for _, bracket := range brackets {
@@ -239,12 +240,36 @@ func TestPrepareEvidenceSafetyMarkerIsExcludedFromMigration(t *testing.T) {
 	}
 }
 
+func TestReplicatedControlMigrationPreservesNormalizedUserKey(t *testing.T) {
+	raw := replicatedPinStateKey
+	normalized := ExtractTxnUserKey(raw)
+	require.Equal(t, []byte("ttl-inline-control|backup-pins"), normalized)
+	end := append(bytes.Clone(normalized), 0)
+	brackets, err := distribution.PlanExportBrackets(normalized, end)
+	require.NoError(t, err)
+	userBracketSeen := false
+	for _, bracket := range brackets {
+		require.False(t, bracket.ContainsRawKey(raw), "raw journal must not enter its normalized route's export")
+		if bracket.Family == distribution.MigrationFamilyUser {
+			userBracketSeen = true
+			require.True(t, bracket.ContainsRawKey(normalized), "a literal user key with the normalized name remains migratable")
+		}
+	}
+	require.True(t, userBracketSeen)
+	require.False(t, isTxnPeerLocalControlKey(normalized))
+}
+
 func TestPrepareEvidenceSafetyMigrationCannotReplaceLocalProtocolState(t *testing.T) {
 	for _, enabled := range []bool{false, true} {
 		for _, tombstone := range []bool{false, true} {
-			for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey} {
+			for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey,
+				replicatedPinStateKey, []byte(store.ReplicatedControlPrefix + "future-state")} {
 				t.Run(fmt.Sprintf("enabled-%t-delete-%t-%s", enabled, tombstone, key), func(t *testing.T) {
 					_, _, fsm := newPrepareSafetyGate(t)
+					if bytes.Equal(key, replicatedPinStateKey) {
+						seedActivatedPinJournal(t, fsm.store)
+						require.NoError(t, fsm.reloadReplicatedBackupPins(t.Context()))
+					}
 					if enabled {
 						require.Nil(t, fsm.Apply(EncodePrepareEvidenceFence(0)))
 					}

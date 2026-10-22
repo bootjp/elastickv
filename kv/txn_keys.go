@@ -3,6 +3,8 @@ package kv
 import (
 	"bytes"
 	"encoding/binary"
+
+	"github.com/bootjp/elastickv/store"
 )
 
 const (
@@ -91,7 +93,7 @@ func isTxnInternalKey(key []byte) bool {
 }
 
 func isTxnPeerLocalControlKey(key []byte) bool {
-	return bytes.Equal(key, backupTimestampFloorKey) ||
+	return store.IsReplicatedControlKey(key) || bytes.Equal(key, backupTimestampFloorKey) ||
 		bytes.Equal(key, prepareEvidenceEnabledKey) ||
 		bytes.Equal(key, prepareEvidenceGateKey) ||
 		bytes.Equal(key, prepareEvidenceTimestampFloorKey)

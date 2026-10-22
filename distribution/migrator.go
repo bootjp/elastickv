@@ -321,7 +321,7 @@ func SplitJobBracketProgressForPlan(brackets []MigrationBracket, phase SplitJobE
 // interval after applying bracket-local exclusions. Route ownership still
 // requires the caller's RouteKeyFilter for every bracket.
 func (b MigrationBracket) ContainsRawKey(rawKey []byte) bool {
-	if hasAnyExactKey(rawKey, migrationInternalExactKeys) {
+	if store.IsReplicatedControlKey(rawKey) || hasAnyExactKey(rawKey, migrationInternalExactKeys) {
 		return false
 	}
 	if bytes.Compare(rawKey, b.Start) < 0 {
