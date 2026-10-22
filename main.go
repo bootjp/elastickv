@@ -1570,6 +1570,11 @@ func validateSQSFifoPartitionMapNoDedicatedTSOGroup(partitionMap map[string]sqsF
 }
 
 func buildLeaderDynamo(groups []groupSpec, dynamoAddr string, raftDynamoMap string) (map[string]string, error) {
+	// An absent HTTP map selects the coordinator's gRPC follower path. A
+	// self-only map cannot resolve a remote leader and rejects every request.
+	if strings.TrimSpace(raftDynamoMap) == "" {
+		return nil, nil
+	}
 	return buildLeaderAddrMap(groups, dynamoAddr, raftDynamoMap, parseRaftDynamoMap)
 }
 

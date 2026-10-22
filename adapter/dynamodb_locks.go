@@ -391,8 +391,9 @@ func (d *DynamoDBServer) tryTxnWriteTimestamp(ctx context.Context, label string,
 		var resp *kv.CoordinateResponse
 		if sealTS == 0 {
 			resp, err = kv.DispatchWithLeaderIssuedCommitTS(floor.WithDispatchVoucher(ctx), d.coordinator, request)
+			err = normalizeDynamoWriteDispatchError(err)
 		} else {
-			resp, err = kv.DispatchWithReadTimestamp(floor.WithDispatchVoucher(ctx), d.coordinator, request)
+			resp, err = d.dispatchWriteWithReadTimestamp(floor.WithDispatchVoucher(ctx), request)
 		}
 		if err != nil {
 			return kv.ReadTimestamp{}, errors.WithStack(err)

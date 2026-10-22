@@ -90,11 +90,82 @@ This is three-node smoke evidence, not evidence of the follower path with the HT
 [`elastickv-dynamodb-test`](../../jepsen/src/elastickv/dynamodb_workload.clj) disables the nemesis in local mode.
 The multi-table workload exists in [`dynamodb_multi_table_workload.clj`](../../jepsen/src/elastickv/dynamodb_multi_table_workload.clj), but that existence and its unit tests are not a recorded execution of the seal failure schedule across data groups.
 
-### Remaining acceptance work
+### Follow-up acceptance tests (2026-10-22)
 
-- Run the allocated/unproposed-write regression through real Raft with follower ingress and an election, retaining the history and final item assertion.
-- Repeat the delayed-write schedule with two touched data groups, and cover seal persistence through snapshot restore and process restart.
-- Exercise follower ingress with the HTTP leader map disabled and leader changes in Jepsen, retaining the exact revision, topology, nemesis configuration, histories, and checker results.
-- Measure the extra seal transaction under hot-item contention, digest collisions, and independent buckets. No seal-specific benchmark function or recorded contention measurement was found in the audited tracked files, and #1259 explicitly reports production throughput as unmeasured. Existing Redis benchmarks are not evidence for this requirement.
+The audit above describes main at `429f5ee7`; the following additions address its validation gaps without replacing #1259's seal protocol.
 
-These are validation and measurement gaps. This audit found the seal protocol and all item entry-point wiring already present; it does not add a second implementation or claim that the remaining acceptance work has passed.
+[`dynamodb_snapshot_seal_raft_test.go`](../../adapter/dynamodb_snapshot_seal_raft_test.go) uses the existing etcd/Raft test fixtures:
+
+- `TestDynamoDBSnapshotSealRealRaftLeaderChangeFollowerIngress` holds a write after allocating C, advances an unrelated key, transfers real three-voter Raft leadership, and sends HTTP to a follower with no HTTP leader map. It pauses the second transaction after sealing and planning, but before commit. The old write must fail on the **seal key**, before any second item write commits. Both retried appends must survive, in order, without duplicates. The test also writes through the follower's single-item path. The leader-change case passed ten consecutive race-enabled runs after waiting for every replica to recognize the new leader.
+- `TestDynamoDBSnapshotSealRealRaftTwoDataGroups` repeats the delayed-write schedule using two independent durable one-voter Raft groups, one per table route. It checks that the stored seals have the same R in the two different stores, rejects the old write, and asserts both tables' contents. This is not a two-group, three-replica-per-group topology.
+- `TestDynamoDBSnapshotSealRealRaftSnapshotRestart` forces a durable Raft snapshot, closes the engine and store, and opens the same Raft directory with an empty FSM. It checks the exact restored seal timestamp and item, rejects a stale plan against the restored seal, then accepts a fresh append. This fixture is a cold engine/FSM restart inside the test process, not an OS process-kill experiment.
+
+These tests exposed two runtime gaps, rather than a missing seal implementation:
+
+1. Forwarded write conflicts and transaction locks arrive as gRPC statuses without the local sentinel chain. [`normalizeDynamoWriteDispatchError`](../../adapter/dynamodb_write_error.go) recognizes only known `Unknown`/`Aborted` key-conflict/key-lock envelopes. All DynamoDB write dispatches normalize failures: item/transaction commits, snapshot seals, table schema/migration, and cleanup. The common read-timestamp dispatch helper preserves the existing voucher handling; leader-issued seal and nontransactional cleanup dispatches retain their original timestamp paths. Existing dedup and recompute behavior remains in place. `TestDynamoDBRetriesForwardedTxnLock`, `TestDynamoDBRetriesForwardedSnapshotSealConflict`, and `TestDynamoDBCreateTableRetriesForwardedConflict` cover these retry boundaries. The shared retry predicates, including their SQS callers, are unchanged.
+2. [`buildLeaderDynamo`](../../main.go) previously synthesized a self-only HTTP map even when the flag was omitted. A follower could not resolve a remote leader in that map. An omitted DynamoDB map now selects the existing coordinator gRPC path; explicit maps retain the previous local-entry completion. [`main_dynamodb_follower_test.go`](../../main_dynamodb_follower_test.go) covers both modes and malformed configuration. Redis, S3, and SQS map builders are unchanged.
+
+All production callers of the changed functions were audited with `rg`: three `commitItemWrite` callers (legacy, first dedup attempt, reused dedup attempt), one `runTransactWriteAttempt` caller, and one `buildLeaderDynamo` caller in runtime configuration.
+The follow-up dispatch audit covers all eight reusable read-timestamp write sites plus the leader-issued seal and two direct cleanup dispatches; no DynamoDB write dispatch remains outside normalization. `TestDynamoDBRealRaftFollowerConcurrentCreateTable` sends nine concurrent HTTP setup requests through followers and requires one creation plus ResourceInUse responses, never leaked OCC errors; five race-enabled repetitions passed.
+
+### Follower-ingress Jepsen evidence
+
+[`dynamodb_seal_workload.clj`](../../jepsen/src/elastickv/dynamodb_seal_workload.clj) reuses the existing DynamoDB append workload and Jepsen generator/checker library. Its local nemesis invokes the repository's `raftadmin`, verifies that leadership actually moves to a different node, and records the endpoints in the history. A separate checker rejects zero verified transfers or any failed transfer; a successful append checker alone is insufficient.
+Its DB setup deletes the previous `jepsen_append` table once before any client setup begins; the existing clients then recreate an empty generation. Only a missing table is ignored. This prevents a prior append history on the same cluster from contaminating the new check.
+
+The local run `20261022T231204.299+0900` used three separate server processes on loopback, no `raftDynamoMap`, 15 seconds, rate 30, concurrency 9, maximum transaction length 4, and a two-second transfer interval. The checker output was:
+
+```clojure
+{:append {:valid? true},
+ :leader-changes {:valid? true, :verified-leader-changes 5, :failures []},
+ :valid? true}
+```
+
+The raw history, `test.jepsen`, checker results, and workload log remain in `jepsen/store/elastickv-dynamodb-snapshot-seal/20261022T231204.299+0900/` in the acceptance worktree. The external launcher retains the per-node logs and topology separately. This is short-run safety evidence, not a claim of production availability or a partition/kill campaign; indeterminate client results are permitted by the existing workload.
+
+The [`Jepsen CI workflow`](../../.github/workflows/jepsen-test.yml) now omits the HTTP leader map and runs this workload in both encryption legs. Its artifact retains the seal history and tested revision even on success. Those new CI executions must be checked separately from the local run.
+
+### OS-process snapshot/restart evidence
+
+At source revision `69f2d932d03dfb45a1cd535418f8bbb076d8a43c`, a second local run (`20261022T232208.506+0900`) enabled `ELASTICKV_RAFT_SNAPSHOT_COUNT=20` on three separate server processes. The append and leader-change checkers passed with six verified transfers and no failed transfers. After the workload stopped, all three processes were terminated and reopened from their original data directories and bootstrap membership. The pre/post statuses were:
+
+| Node | Snapshot index before/after | Applied index before/after | Term before/after |
+| --- | ---: | ---: | ---: |
+| n1 | 401 / 401 | 404 / 407 | 8 / 9 |
+| n2 | 402 / 402 | 404 / 407 | 8 / 9 |
+| n3 | 402 / 402 | 404 / 407 | 8 / 9 |
+
+Consistent scans before and after restart matched all 17 items, including list order and values. The per-node logs, topology, and complete pre/post status plus item JSON are retained under `/private/tmp/elastickv-seal-jepsen-luUUDo/`; the Jepsen history remains in the acceptance worktree. The server binary SHA-256 was `6260694477d19fb7c6c9628accebfa5dcacbe6761ba7848e822b84420ca7f022`. The Go snapshot regression separately checks exact seal-timestamp preservation and stale-write rejection; the process experiment checks the persisted real-cluster data path, not just an in-memory restore.
+
+### Contention measurements
+
+[`BenchmarkDynamoDBSnapshotSealRealRaft`](../../adapter/dynamodb_snapshot_seal_benchmark_test.go) uses a durable single-voter Raft engine, four independent frontends, and constant-size PutItem replacements. The independent case uses four different buckets; the collision case searches for four different item keys mapping to one actual digest bucket. A hot-item case uses one item across frontends. Local item locks are not shared between frontends.
+
+Command: `go test ./adapter -run '^$' -bench '^BenchmarkDynamoDBSnapshotSealRealRaft$' -benchtime=100x -count=3 -cpu=4 -benchmem` on Darwin/arm64, Apple M1 Max.
+
+| Case | ns/op range (three samples) | OCC conflicts/op | Seal dispatches/op |
+| --- | ---: | ---: | ---: |
+| Independent buckets | 9,750,054-10,273,370 | 0 | 1.00 |
+| Hot item | 21,095,990-22,904,492 | 1.82-2.23 | 2.46-2.72 |
+| Digest collision | 21,698,244-23,050,694 | 1.97-2.01 | 2.59-2.62 |
+
+All measured operations completed. Collision/hot-item contention increased retries and seal work in this fixture. These measurements include adapter and local durable Raft costs, not network quorum latency, Pebble production compaction, or a before/after throughput delta against an unsafe seal-free implementation. Production throughput remains unmeasured.
+
+### Verification and remaining gates
+
+- The real-Raft tests, all DynamoDB and existing one-phase dedup tests passed with `-race`; the leader-change case also passed ten consecutive runs.
+- `TestBuildLeaderDynamoWithoutHTTPMap` and scoped main/adapter lint passed. Lint used the repository's Go 1.26.6 toolchain because the locally installed analyzer cannot consume Go 1.27 export data.
+- The complete Jepsen unit suite after review fixes passed: 209 tests, 586 assertions, zero failures/errors.
+- Full local `go test ./...` is not a pass: the pre-existing FUSE test references Linux-only `syscall.Statfs_t.Namelen` on macOS, an unchanged backup renewal test hit its deadline (five isolated reruns passed), and vet overlapped a transient test edit (subsequent target runs passed). Linux CI, the new encryption on/off Jepsen runs, and current-HEAD review of the acceptance changes remain gates.
+
+At `8db0155d632aec73a433cc3478f0a474c6921e8d`, current-head code/security reviews had no findings and all required CI passed, including the complete Ubuntu Go suite and encryption off/on Jepsen. The non-root local Linux full-suite attempt was not a pass: an unchanged SQS FIFO visibility test failed under load, then passed twenty isolated repetitions. The separate Ubuntu CI result does not erase that local failure.
+
+### Outstanding encrypted stress findings
+
+The design remains Partial despite the short successful CI and review results:
+
+- Additional encrypted three-process stress at `8db0155d`, with snapshot interval 20, a preceding append workload, fresh-table reset, and six verified leader changes, returned `valid? false` with `G-single-item-realtime` and `G1c-realtime`. An acknowledged append 37 to key 16 was absent from a later successful read including 46. History `20261022T235149.907+0900` and the per-node logs under `/private/tmp/elastickv-seal-jepsen-FpXSbX/` are retained. This run is not counted as a success.
+- Existing [PR #1286](https://github.com/bootjp/elastickv/pull/1286) addresses an overlapping Raft apply/timestamp problem. A diagnostic build combining its `78cab1ba` with `8db0155d` passed one identical encrypted workload with six verified transfers. This suggests overlap, not a causal proof or a completed stress campaign. The comparison was made in a separate worktree; this acceptance PR does not duplicate that implementation.
+- The combined run's subsequent encrypted restart failed: the startup guard attempted to scan Raft entries `(6, 877]` after compaction and MemoryStorage returned `requested index is unavailable due to compaction`. The unmodified `8db0155d` binary also refuses startup on that retained diagnostic state, without the #1286 patch. Logs are under `/private/tmp/elastickv-seal-jepsen-dscUKN/`. The earlier plaintext restart success is not evidence that encrypted restart is safe.
+
+Before declaring this design complete, coordinate the existing Raft fix without duplication, cover and resolve the encrypted compacted-snapshot startup failure, and rerun the acceptance matrix. Adding tests, receiving a clean review, or changing status alone does not complete acceptance.
