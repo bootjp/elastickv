@@ -697,6 +697,10 @@ func (s *mvccStore) ApplyMutationsRaftAt(ctx context.Context, mutations []*KVPai
 	return s.ApplyMutations(ctx, mutations, readKeys, startTS, commitTS)
 }
 
+func (s *mvccStore) ApplyMutationsRaftAtFenced(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS, _ uint64) error {
+	return s.applyMutations(ctx, mutations, readKeys, startTS, commitTS, true)
+}
+
 // ApplyRaftEntry satisfies RaftEntryApplier. The in-memory store has no
 // durable state that a crash could tear, so the callback simply runs and
 // each request applies as it does on the per-request path.
@@ -705,8 +709,15 @@ func (s *mvccStore) ApplyRaftEntry(ctx context.Context, _ uint64, fn func(ctx co
 }
 
 func (s *mvccStore) ApplyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	return s.applyMutations(ctx, mutations, readKeys, startTS, commitTS, false)
+}
+
+func (s *mvccStore) applyMutations(ctx context.Context, mutations []*KVPairMutation, readKeys [][]byte, startTS, commitTS uint64, fenced bool) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if err := checkCommitTSFence(mutations, commitTS, s.lastCommitTS, fenced); err != nil {
+		return err
+	}
 
 	if s.lastCommitTS > startTS {
 		if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {

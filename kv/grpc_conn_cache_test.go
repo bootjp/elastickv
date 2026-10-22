@@ -6,6 +6,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
@@ -24,20 +25,7 @@ func TestGRPCConnCache_ConnForEmptyAddr(t *testing.T) {
 func TestGRPCConnCache_ReusesConnection(t *testing.T) {
 	t.Parallel()
 
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	srv := grpc.NewServer()
-	go func() {
-		_ = srv.Serve(lis)
-	}()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
-
-	addr := lis.Addr().String()
+	addr := grpctest.Serve(t, func(*grpc.Server) {})
 
 	var c GRPCConnCache
 	conn1, err := c.ConnFor(addr)
