@@ -38,6 +38,10 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 			req.GetExpectedConfigurationIndex() != f.AppliedConfigurationIndex()) {
 		return errors.WithStack(ErrMigrationConfigurationChanged)
 	}
+	return f.applyTargetStagedReadinessRequest(ctx, req)
+}
+
+func (f *kvFSM) applyTargetStagedReadinessRequest(ctx context.Context, req *pb.TargetStagedReadinessRequest) any {
 	writer, ok := f.store.(store.MigrationTargetReadinessWriter)
 	if !ok {
 		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrTargetReadinessApply), "kv/fsm: target staged readiness store"))

@@ -47,6 +47,10 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION {
 		return f.applyMigrationPartitionControl(ctx, req)
 	}
+	return f.applyMigrationCleanupRequest(ctx, req)
+}
+
+func (f *kvFSM) applyMigrationCleanupRequest(ctx context.Context, req *pb.CleanupMigrationRequest) any {
 	if err := f.verifyMigrationCleanupConfiguration(ctx, req); err != nil {
 		if errors.Is(err, ErrMigrationConfigurationChanged) {
 			return err

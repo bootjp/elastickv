@@ -47,9 +47,8 @@ func validateTargetStagedReadinessState(state TargetStagedReadinessState) error 
 }
 
 func validateSourceMigrationControlState(state TargetStagedReadinessState) error {
-	if state.TransferSizeGuardVersion != 0 &&
-		(state.TransferSizeGuardVersion != MigrationTransferSizeGuardVersion || !state.Armed || !state.TrackWrites) {
-		return invalidReadinessState("transfer size guard requires supported version and armed source tracker")
+	if err := validateMigrationTransferSizeGuard(state); err != nil {
+		return err
 	}
 	if state.SourceReadFence && !state.SourceWriteFence {
 		return invalidReadinessState("source read fence requires source write fence")
@@ -59,6 +58,14 @@ func validateSourceMigrationControlState(state TargetStagedReadinessState) error
 	}
 	if state.TrackWrites && state.RetentionPinTS == 0 {
 		return invalidReadinessState("migration write tracker retention pin is required")
+	}
+	return nil
+}
+
+func validateMigrationTransferSizeGuard(state TargetStagedReadinessState) error {
+	if state.TransferSizeGuardVersion != 0 &&
+		(state.TransferSizeGuardVersion != MigrationTransferSizeGuardVersion || !state.Armed || !state.TrackWrites) {
+		return invalidReadinessState("transfer size guard requires supported version and armed source tracker")
 	}
 	return nil
 }
@@ -263,14 +270,7 @@ func decodeTargetReadinessHeader(data []byte) (TargetStagedReadinessState, []byt
 		return TargetStagedReadinessState{}, nil, false
 	}
 	sourceFlags := data[2]
-	allowedFlags := targetReadinessSourceWrite | targetReadinessSourceRead | targetReadinessTrackWrites
-	if data[0] == targetReadinessGuardCodecVersion {
-		allowedFlags |= targetReadinessTransferSizeGuard
-		if sourceFlags&targetReadinessTransferSizeGuard == 0 {
-			return TargetStagedReadinessState{}, nil, false
-		}
-	}
-	if sourceFlags & ^allowedFlags != 0 {
+	if !validTargetReadinessSourceFlags(data[0], sourceFlags) {
 		return TargetStagedReadinessState{}, nil, false
 	}
 	state := TargetStagedReadinessState{
@@ -296,6 +296,17 @@ func decodeTargetReadinessHeader(data []byte) (TargetStagedReadinessState, []byt
 	state.MinAdmittedTS = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
 	rest = rest[migrationUint64Bytes:]
 	return state, rest, true
+}
+
+func validTargetReadinessSourceFlags(version, sourceFlags byte) bool {
+	allowedFlags := targetReadinessSourceWrite | targetReadinessSourceRead | targetReadinessTrackWrites
+	if version == targetReadinessGuardCodecVersion {
+		allowedFlags |= targetReadinessTransferSizeGuard
+		if sourceFlags&targetReadinessTransferSizeGuard == 0 {
+			return false
+		}
+	}
+	return sourceFlags & ^allowedFlags == 0
 }
 
 func decodeTargetReadinessHeaderV1(data []byte) (TargetStagedReadinessState, []byte, bool) {
