@@ -35,7 +35,7 @@ var (
 	redisAddress   = flag.String("redisAddress", ":6379", "Redis address")
 	dynamoAddress  = flag.String("dynamoAddress", ":8000", "DynamoDB-compatible API address")
 	s3Address      = flag.String("s3Address", ":9000", "S3-compatible API address")
-	s3Region       = flag.String("s3Region", "us-east-1", "S3 signing region")
+	s3Region       = flag.String("s3Region", demoS3Region, "S3 signing region")
 	s3CredsFile    = flag.String("s3CredentialsFile", "", "Path to a JSON file containing static S3 credentials")
 	s3PathStyle    = flag.Bool("s3PathStyleOnly", true, "Only accept path-style S3 requests")
 	metricsAddress = flag.String("metricsAddress", "127.0.0.1:9090", "Prometheus metrics address")
@@ -64,6 +64,7 @@ const (
 	demoElectionTick    = 10
 	demoMaxSizePerMsg   = 1 << 20
 	demoMaxInflightMsg  = 256
+	demoS3Region        = "us-east-1"
 )
 
 func init() {
@@ -142,7 +143,7 @@ func main() {
 				redisAddress:   "127.0.0.1:63791",
 				dynamoAddress:  "127.0.0.1:63801",
 				s3Address:      "127.0.0.1:63901",
-				s3Region:       "us-east-1",
+				s3Region:       demoS3Region,
 				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9091",
 				metricsToken:   demoMetricsToken,
@@ -156,7 +157,7 @@ func main() {
 				redisAddress:   "127.0.0.1:63792",
 				dynamoAddress:  "127.0.0.1:63802",
 				s3Address:      "127.0.0.1:63902",
-				s3Region:       "us-east-1",
+				s3Region:       demoS3Region,
 				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9092",
 				metricsToken:   demoMetricsToken,
@@ -170,7 +171,7 @@ func main() {
 				redisAddress:   "127.0.0.1:63793",
 				dynamoAddress:  "127.0.0.1:63803",
 				s3Address:      "127.0.0.1:63903",
-				s3Region:       "us-east-1",
+				s3Region:       demoS3Region,
 				s3PathStyle:    true,
 				metricsAddress: "0.0.0.0:9093",
 				metricsToken:   demoMetricsToken,

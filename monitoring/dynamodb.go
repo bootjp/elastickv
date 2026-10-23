@@ -15,7 +15,7 @@ const (
 	dynamoOutcomeUserError              = "user_error"
 	dynamoOutcomeSystemError            = "system_error"
 	dynamoOutcomeConditionalCheckFailed = "conditional_check_failed"
-	dynamoOperationUnknown              = "unknown"
+	dynamoOperationUnknown              = labelValueUnknown
 	dynamoTableOverflow                 = "_other"
 	dynamoMaxTrackedTables              = 512
 )
@@ -85,21 +85,21 @@ func newDynamoDBMetrics(registerer prometheus.Registerer) *DynamoDBMetrics {
 				Name: "elastickv_dynamodb_inflight_requests",
 				Help: "Current number of in-flight DynamoDB-compatible API requests.",
 			},
-			[]string{"operation"},
+			[]string{labelOperation},
 		),
 		requestsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_requests_total",
 				Help: "Total number of DynamoDB-compatible API requests by operation and outcome.",
 			},
-			[]string{"operation", "outcome"},
+			[]string{labelOperation, labelOutcome},
 		),
 		tableRequests: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_table_requests_total",
 				Help: "Total number of table-scoped DynamoDB-compatible API requests by operation and outcome.",
 			},
-			[]string{"operation", "table", "outcome"},
+			[]string{labelOperation, labelTable, labelOutcome},
 		),
 		requestDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -107,7 +107,7 @@ func newDynamoDBMetrics(registerer prometheus.Registerer) *DynamoDBMetrics {
 				Help:    "End-to-end latency of DynamoDB-compatible API requests.",
 				Buckets: []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5},
 			},
-			[]string{"operation", "outcome"},
+			[]string{labelOperation, labelOutcome},
 		),
 		requestSize: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -115,7 +115,7 @@ func newDynamoDBMetrics(registerer prometheus.Registerer) *DynamoDBMetrics {
 				Help:    "Observed DynamoDB-compatible request sizes in bytes.",
 				Buckets: []float64{128, 512, 1024, 4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024},
 			},
-			[]string{"operation"},
+			[]string{labelOperation},
 		),
 		responseSize: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -123,49 +123,49 @@ func newDynamoDBMetrics(registerer prometheus.Registerer) *DynamoDBMetrics {
 				Help:    "Observed DynamoDB-compatible response sizes in bytes.",
 				Buckets: []float64{128, 512, 1024, 4 * 1024, 16 * 1024, 64 * 1024, 256 * 1024, 512 * 1024, 1024 * 1024},
 			},
-			[]string{"operation", "outcome"},
+			[]string{labelOperation, labelOutcome},
 		),
 		returnedItems: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_returned_items_total",
 				Help: "Total number of items returned by DynamoDB-compatible read APIs.",
 			},
-			[]string{"operation", "table"},
+			[]string{labelOperation, labelTable},
 		),
 		scannedItems: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_scanned_items_total",
 				Help: "Total number of items scanned by DynamoDB-compatible read APIs.",
 			},
-			[]string{"operation", "table"},
+			[]string{labelOperation, labelTable},
 		),
 		writtenItems: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_written_items_total",
 				Help: "Total number of items written or deleted by DynamoDB-compatible write APIs.",
 			},
-			[]string{"operation", "table"},
+			[]string{labelOperation, labelTable},
 		),
 		userErrors: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_user_errors_total",
 				Help: "Total number of client-caused DynamoDB-compatible API errors.",
 			},
-			[]string{"operation", "table"},
+			[]string{labelOperation, labelTable},
 		),
 		systemErrors: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_system_errors_total",
 				Help: "Total number of server-side DynamoDB-compatible API errors.",
 			},
-			[]string{"operation", "table"},
+			[]string{labelOperation, labelTable},
 		),
 		conditionalFails: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_dynamodb_conditional_check_failed_total",
 				Help: "Total number of conditional check failures returned by DynamoDB-compatible APIs.",
 			},
-			[]string{"operation", "table"},
+			[]string{labelOperation, labelTable},
 		),
 		trackedTables: make(map[string]struct{}),
 	}

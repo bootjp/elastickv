@@ -38,10 +38,37 @@ linters:
           - funlen
           - goconst
           - wrapcheck
-        # Test files plus test-support packages (directories named *test,
-        # e.g. raftenginetest, fstest). Anchored so production files whose
-        # names merely contain "test" (latest_commit_ts.go) stay linted.
+          - errcheck
+          - gosec
+          - noctx
+          - unparam
+        # Scope: test-only code. These linters stay fully enabled for
+        # production code; the exclusion applies only to test files plus
+        # test-support packages (directories named *test, e.g.
+        # raftenginetest, fstest, and testutil/). Test code routinely uses
+        # context-free HTTP calls (noctx), ignores Close() errors
+        # (errcheck), uses fixed temp paths/permissions (gosec), and has
+        # helpers with constant arguments (unparam). Anchored so production
+        # files whose names merely contain "test" (latest_commit_ts.go)
+        # stay linted. Do not add production paths here.
         path: (_test\.go$|(^|/)[a-z0-9]+test/|(^|/)testutil/)
+      - linters:
+          - gosec
+        # Operator CLIs only: these binaries take file paths from flags or
+        # env vars by design, so G703 (path traversal via taint from
+        # os.Args/os.Getenv) has no trust boundary to enforce. Scoped to
+        # G703 and these four binaries; every other gosec rule still applies.
+        path: (^|/)cmd/(elastickv-snapshot-(archive|decode|encode)|raftadmin)/
+        text: G703
+      - linters:
+          - gosec
+        # Admin auth cookies: G124 only accepts a constant `true` for
+        # Secure/HttpOnly, but Secure must follow the operator's
+        # secure-cookie setting (plain-HTTP listeners) and the CSRF cookie
+        # must stay readable by the SPA. adminCookie is the single place
+        # that sets them; TestAdminCookieAttributes pins every combination.
+        path: (^|/)internal/admin/auth_handler\.go$
+        text: G124
       - linters:
           - govet
         path: internal/raftengine/etcd/.*\.go

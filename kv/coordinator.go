@@ -172,7 +172,7 @@ func normalizeLeaseObserver(observer LeaseReadObserver) LeaseReadObserver {
 	}
 	v := reflect.ValueOf(observer)
 	switch v.Kind() { //nolint:exhaustive
-	case reflect.Ptr, reflect.Interface, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice:
+	case reflect.Pointer, reflect.Interface, reflect.Func, reflect.Chan, reflect.Map, reflect.Slice:
 		if v.IsNil() {
 			return nil
 		}

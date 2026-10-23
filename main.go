@@ -2553,7 +2553,7 @@ func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, lo
 
 func configurationContainsMember(configuration raftengine.Configuration, localID string) bool {
 	for _, server := range configuration.Servers {
-		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == "voter") {
+		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == shutdownVoterSuffrage) {
 			return true
 		}
 	}

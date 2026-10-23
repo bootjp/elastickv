@@ -382,7 +382,7 @@ func (sp *shadowPubSub) reportDivergence(d divergenceEvent) {
 	logAttrs := []any{
 		"channel", truncateValue(d.channel),
 		"payload", truncateValue(d.payload),
-		"kind", d.kind.String(),
+		labelKind, d.kind.String(),
 	}
 	if d.pattern != "" {
 		logAttrs = append(logAttrs, "pattern", truncateValue(d.pattern))

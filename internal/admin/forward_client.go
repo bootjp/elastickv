@@ -220,7 +220,7 @@ func (c *gRPCForwardClient) forward(ctx context.Context, op pb.AdminOperation, p
 		// The leader server always sets a content type, but be
 		// defensive: a future change that drops it must not
 		// produce a SPA response with no Content-Type header.
-		out.ContentType = "application/json; charset=utf-8"
+		out.ContentType = contentTypeJSONUTF8
 	}
 	if out.StatusCode == 0 {
 		// status_code 0 is the proto's zero value, which the

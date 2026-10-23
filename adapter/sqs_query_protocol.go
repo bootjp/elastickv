@@ -1056,7 +1056,7 @@ type querySendMessageResult struct {
 
 func querySendMessageResultFromMap(out map[string]string) querySendMessageResult {
 	return querySendMessageResult{
-		MessageId:              out["MessageId"],
+		MessageId:              out[sqsFieldMessageID],
 		MD5OfMessageBody:       out["MD5OfMessageBody"],
 		MD5OfMessageAttributes: out["MD5OfMessageAttributes"],
 		SequenceNumber:         out["SequenceNumber"],
@@ -1093,7 +1093,7 @@ func queryReceiveMessageResultFromMaps(messages []map[string]any) queryReceiveMe
 	out := queryReceiveMessageResult{Messages: make([]queryMessage, 0, len(messages))}
 	for _, m := range messages {
 		qm := queryMessage{
-			MessageId:              stringValueFromAny(m["MessageId"]),
+			MessageId:              stringValueFromAny(m[sqsFieldMessageID]),
 			ReceiptHandle:          stringValueFromAny(m["ReceiptHandle"]),
 			MD5OfBody:              stringValueFromAny(m["MD5OfBody"]),
 			Body:                   stringValueFromAny(m["Body"]),

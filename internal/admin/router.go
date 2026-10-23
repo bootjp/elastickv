@@ -46,6 +46,9 @@ const (
 	pathPrefixAssets  = pathAssetsRoot + "/"
 	pathRootAssetsDir = "assets"
 	pathIndexHTML     = "index.html"
+
+	// contentTypeJSONUTF8 is the Content-Type every admin JSON response carries.
+	contentTypeJSONUTF8 = "application/json; charset=utf-8"
 )
 
 // LeaderProbe is the cheap healthz contract used by /admin/healthz/leader.
@@ -382,7 +385,7 @@ func writeJSONNotFound(w http.ResponseWriter, _ *http.Request) {
 }
 
 func writeJSONError(w http.ResponseWriter, status int, code, msg string) {
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	// Defence-in-depth header: the admin surface is JSON-only, so
 	// declare nosniff to prevent a misbehaving browser from
 	// content-sniffing an error body into something executable.

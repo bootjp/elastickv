@@ -1542,19 +1542,28 @@ func (r *RedisServer) xlen(conn redcon.Conn, cmd redcon.Command) {
 	conn.WriteInt64(int64(len(stream.Entries)))
 }
 
+// xrangeOptionsIndex is the index of the first option after
+// XRANGE/XREVRANGE key start end.
+const xrangeOptionsIndex = 4
+
 func parseRangeStreamCount(args [][]byte) (int, error) {
 	count := -1
-	for i := 4; i < len(args); i += redisPairWidth {
-		// args[i] is safe: the for-loop guard `i < len(args)` ensures it.
-		// gosec G602 false-positives here under flow analysis.
-		if i+1 >= len(args) || !strings.EqualFold(string(args[i]), redisKeywordCount) { //nolint:gosec
+	// Options start after XRANGE key start end. Walk them as a shrinking
+	// slice so every index is bounded by an explicit length check.
+	var opts [][]byte
+	if len(args) > xrangeOptionsIndex {
+		opts = args[xrangeOptionsIndex:]
+	}
+	for len(opts) > 0 {
+		if len(opts) < redisPairWidth || !strings.EqualFold(string(opts[0]), redisKeywordCount) {
 			return 0, errors.New("ERR syntax error")
 		}
-		nextCount, err := strconv.Atoi(string(args[i+1]))
+		nextCount, err := strconv.Atoi(string(opts[1]))
 		if err != nil || nextCount < 0 {
 			return 0, errors.New("ERR syntax error")
 		}
 		count = nextCount
+		opts = opts[redisPairWidth:]
 	}
 	// Clamp client-supplied COUNT for XRANGE / XREVRANGE the same way XREAD
 	// clamps it (parseXReadCountArg). The negative sentinel -1 (no COUNT)

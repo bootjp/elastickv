@@ -3,9 +3,10 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"math"
-	rand "math/rand/v2"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
@@ -245,8 +246,34 @@ func orderedS3BlobPeers(writeReplicas []S3BlobReplica, currentReplicas []S3BlobR
 			peers = appendUniqueS3BlobPeer(peers, seen, replica, selfNodeID)
 		}
 	}
-	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	shuffleS3BlobPeers(peers)
 	return append(sources, peers...)
+}
+
+// shuffleS3BlobPeers permutes peers in place (Fisher-Yates) so fetch load
+// spreads across replicas. Randomness comes from crypto/rand; the modulo
+// bias is negligible for replica-sized lists and irrelevant to load
+// spreading.
+//
+// Swap indices are peeled off one random 64-bit word in mixed radix, and a
+// new word is drawn only once the remaining range is smaller than the next
+// modulus. Lists of up to 20 peers (20! < 2^64) take a single 8-byte read,
+// which is the cheapest rand.Read size.
+func shuffleS3BlobPeers(peers []S3BlobReplica) {
+	var buf [8]byte
+	var r, capacity uint64
+	for i := len(peers) - 1; i > 0; i-- {
+		m := uint64(i + 1)
+		if capacity < m {
+			_, _ = rand.Read(buf[:])
+			r = binary.LittleEndian.Uint64(buf[:])
+			capacity = math.MaxUint64
+		}
+		j := r % m
+		r /= m
+		capacity /= m
+		peers[i], peers[j] = peers[j], peers[i]
+	}
 }
 
 func appendUniqueS3BlobPeer(dst []S3BlobReplica, seen map[string]struct{}, replica S3BlobReplica, selfNodeID string) []S3BlobReplica {

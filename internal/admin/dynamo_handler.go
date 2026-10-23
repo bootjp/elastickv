@@ -3,6 +3,7 @@ package admin
 import (
 	"bytes"
 	"context"
+	stdjson "encoding/json"
 	"errors"
 	"io"
 	"log/slog"
@@ -561,17 +562,41 @@ func (h *DynamoHandler) tryForwardDelete(w http.ResponseWriter, r *http.Request,
 	return true
 }
 
-// writeForwardResult re-emits the leader's structured response
-// verbatim. Status, payload, and content-type all come from the
-// gRPC response so a forwarded request looks identical to a
-// leader-direct call from the SPA's point of view.
+// writeForwardResult re-emits the leader's structured response.
+// Status and content-type come from the gRPC response so a forwarded
+// request looks identical to a leader-direct call from the SPA's point
+// of view.
 func (h *DynamoHandler) writeForwardResult(w http.ResponseWriter, r *http.Request, res *ForwardResult) {
+	writeForwardedResult(w, r, h.logger, res, "admin forward response write failed")
+}
+
+// writeForwardedResult relays a leader's forwarded response for both the
+// Dynamo and S3 handlers. The body is re-encoded with encoding/json first:
+// the leader always emits JSON, and re-encoding validates that and escapes
+// HTML-significant characters (<, >, &), so a forwarded body cannot carry
+// live markup. The result is the same JSON document, compacted. A body
+// that is not valid JSON is answered with 502 instead of being relayed.
+func writeForwardedResult(w http.ResponseWriter, r *http.Request, logger *slog.Logger, res *ForwardResult, writeFailedMsg string) {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	var payload []byte
+	if len(res.Payload) > 0 {
+		encoded, err := stdjson.Marshal(stdjson.RawMessage(res.Payload))
+		if err != nil {
+			logger.LogAttrs(r.Context(), slog.LevelWarn, "admin forward response is not valid JSON",
+				slog.String("error", err.Error()),
+			)
+			writeMalformedForwardResult(w, res.StatusCode)
+			return
+		}
+		payload = encoded
+	}
 	w.Header().Set("Content-Type", res.ContentType)
 	// Match writeAdminJSONStatus's hardening on the leader-direct
 	// path: forwarded responses must also carry nosniff so a SPA
 	// request that happened to traverse a follower does not
-	// silently lose the MIME-sniff protection. Claude review on
-	// PR #644 caught the parity gap.
+	// silently lose the MIME-sniff protection.
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	// 503 from the leader (e.g. it stepped down mid-request) must
@@ -582,13 +607,30 @@ func (h *DynamoHandler) writeForwardResult(w http.ResponseWriter, r *http.Reques
 		w.Header().Set("Retry-After", "1")
 	}
 	w.WriteHeader(res.StatusCode)
-	if len(res.Payload) > 0 {
-		if _, err := w.Write(res.Payload); err != nil {
-			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin forward response write failed",
-				slog.String("error", err.Error()),
-			)
-		}
+	if len(payload) == 0 {
+		return
 	}
+	if _, err := w.Write(payload); err != nil {
+		logger.LogAttrs(r.Context(), slog.LevelWarn, writeFailedMsg,
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// writeMalformedForwardResult answers a forwarded response whose body is
+// not valid JSON. A leader error status (4xx/5xx) is kept, with
+// Retry-After on 503, so the client's retry contract does not depend on
+// the body. A non-error status with a malformed body becomes 502, since
+// the client cannot use the result.
+func writeMalformedForwardResult(w http.ResponseWriter, leaderStatus int) {
+	status := http.StatusBadGateway
+	if leaderStatus >= http.StatusBadRequest {
+		status = leaderStatus
+	}
+	if status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "1")
+	}
+	writeJSONError(w, status, "bad_gateway", "leader returned a malformed response")
 }
 
 // writeForwardFailure handles forwarder errors that did not
@@ -867,7 +909,10 @@ func writeAdminJSON(w http.ResponseWriter, ctx context.Context, logger *slog.Log
 // has no way to recover from. Marshalling first lets us upgrade an
 // encode failure to a clean 500 with a well-formed error envelope.
 func writeAdminJSONStatus(w http.ResponseWriter, ctx context.Context, logger *slog.Logger, status int, body any) {
-	payload, err := json.Marshal(body)
+	// encoding/json escapes HTML-significant characters (<, >, &) in
+	// every string, so the body cannot carry live markup even for a
+	// client that ignores nosniff.
+	payload, err := stdjson.Marshal(body)
 	if err != nil {
 		if logger == nil {
 			logger = slog.Default()
@@ -878,7 +923,7 @@ func writeAdminJSONStatus(w http.ResponseWriter, ctx context.Context, logger *sl
 		writeJSONError(w, http.StatusInternalServerError, "internal", "failed to encode response")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	// Defence-in-depth: tell the browser not to MIME-sniff the
 	// response body. The admin surface is JSON-only, so a sniffed
 	// "this might be HTML" guess is never useful and could enable

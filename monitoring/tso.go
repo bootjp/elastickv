@@ -33,14 +33,14 @@ func newTSOMetrics(registerer prometheus.Registerer) *TSOMetrics {
 				Help:    "End-to-end duration of dedicated TSO reserve and validation attempts by local or remote leader path and outcome.",
 				Buckets: tsoRequestDurationBuckets,
 			},
-			[]string{"operation", "path", "outcome"},
+			[]string{labelOperation, "path", labelOutcome},
 		),
 		shadowComparison: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_tso_shadow_comparisons_total",
 				Help: "Shadow migration comparisons by bounded result: legacy_ahead, legacy_overlap, cutover_active, or error.",
 			},
-			[]string{"result"},
+			[]string{labelResult},
 		),
 		shadowDivergence: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -48,21 +48,21 @@ func newTSOMetrics(registerer prometheus.Registerer) *TSOMetrics {
 				Help:    "Absolute timestamp distance between a shadow legacy candidate and the preceding durable TSO allocation floor.",
 				Buckets: prometheus.ExponentialBuckets(1, tsoDivergenceBucketFactor, tsoDivergenceBucketCount),
 			},
-			[]string{"result"},
+			[]string{labelResult},
 		),
 		mode: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_tso_mode",
 				Help: "Current process-local TSO mode as a one-hot gauge.",
 			},
-			[]string{"mode"},
+			[]string{labelMode},
 		),
 		reloads: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_tso_mode_reload_total",
 				Help: "Runtime TSO mode reload outcomes.",
 			},
-			[]string{"result"},
+			[]string{labelResult},
 		),
 		durableState: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{

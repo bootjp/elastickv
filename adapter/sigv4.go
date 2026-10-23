@@ -23,6 +23,10 @@ const (
 	sigv4RequestTimeMaxSkew = 15 * time.Minute
 	sigv4ScopeTerminator    = "aws4_request"
 	sigv4ScopeParts         = 5
+
+	sigv4ErrMsgUnsupportedAlgorithm = "unsupported signature algorithm"
+	sigv4ErrMsgUnknownAccessKey     = "unknown access key"
+	sigv4ErrMsgRegionMismatch       = "credential scope region does not match server region"
 )
 
 // sigv4AuthorizationHeader captures the Credential scope fields extracted

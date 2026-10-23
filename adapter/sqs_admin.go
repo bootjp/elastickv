@@ -531,14 +531,14 @@ func (s *SQSServer) AdminDeleteQueue(ctx context.Context, principal AdminPrincip
 // client-side.
 func metaAttributesForAdmin(meta *sqsQueueMeta, queueArn string) map[string]string {
 	out := map[string]string{
-		"QueueArn":                      queueArn,
-		"VisibilityTimeout":             strconv.FormatInt(meta.VisibilityTimeoutSeconds, 10),
-		"MessageRetentionPeriod":        strconv.FormatInt(meta.MessageRetentionSeconds, 10),
-		"DelaySeconds":                  strconv.FormatInt(meta.DelaySeconds, 10),
-		"ReceiveMessageWaitTimeSeconds": strconv.FormatInt(meta.ReceiveMessageWaitSeconds, 10),
-		"MaximumMessageSize":            strconv.FormatInt(meta.MaximumMessageSize, 10),
-		"FifoQueue":                     strconv.FormatBool(meta.IsFIFO),
-		"ContentBasedDeduplication":     strconv.FormatBool(meta.ContentBasedDedup),
+		"QueueArn":                           queueArn,
+		sqsAttrVisibilityTimeout:             strconv.FormatInt(meta.VisibilityTimeoutSeconds, 10),
+		sqsAttrMessageRetentionPeriod:        strconv.FormatInt(meta.MessageRetentionSeconds, 10),
+		sqsAttrDelaySeconds:                  strconv.FormatInt(meta.DelaySeconds, 10),
+		sqsAttrReceiveMessageWaitTimeSeconds: strconv.FormatInt(meta.ReceiveMessageWaitSeconds, 10),
+		sqsAttrMaximumMessageSize:            strconv.FormatInt(meta.MaximumMessageSize, 10),
+		sqsAttrFifoQueue:                     strconv.FormatBool(meta.IsFIFO),
+		sqsAttrContentBasedDeduplication:     strconv.FormatBool(meta.ContentBasedDedup),
 	}
 	if mod := meta.LastModifiedAtMillis; mod > 0 {
 		out["LastModifiedTimestamp"] = strconv.FormatInt(mod/sqsMillisPerSecond, 10)
