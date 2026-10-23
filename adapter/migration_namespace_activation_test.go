@@ -19,9 +19,11 @@ type namespaceRuntimeClient struct {
 	version       uint32
 	configuration uint64
 	proposals     int
+	probes        int
 }
 
 func (c *namespaceRuntimeClient) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrationStateRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error) {
+	c.probes++
 	response, err := c.internal.probeMigrationNamespace(ctx, req)
 	if err != nil {
 		return nil, err
@@ -77,6 +79,145 @@ func TestNamespaceAdmissionControllerBootstrapsBeforeOperationalGuards(t *testin
 	require.Equal(t, 1, clients[0].proposals)
 	for _, client := range clients {
 		require.NoError(t, kv.RequireMigrationNamespaceAdmission(t.Context(), client.internal.store))
+	}
+}
+
+func TestNamespaceAdmissionControllerActiveGroupDoesNotPropose(t *testing.T) {
+	members, clients := namespaceRuntimeFixture(t)
+	require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
+	for range 3 {
+		before := make([]int, len(clients))
+		for index, client := range clients {
+			before[index] = client.probes
+		}
+		require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
+		require.Equal(t, 1, clients[0].proposals)
+		for index, client := range clients {
+			// Three inventory reads, negotiation, and the final durable ACK.
+			require.Equal(t, before[index]+5, client.probes)
+		}
+	}
+}
+
+type namespaceProbeFunc func(context.Context, *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error)
+
+func (f namespaceProbeFunc) ProbeMigrationState(ctx context.Context, request *pb.ProbeMigrationStateRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error) {
+	return f(ctx, request)
+}
+
+func namespaceRuntimeSnapshot(members []SplitMigrationVoter) NamespaceAdmissionSnapshot {
+	snapshot := NamespaceAdmissionSnapshot{ConfigurationIndex: 9}
+	for _, member := range members {
+		snapshot.Members = append(snapshot.Members, NamespaceAdmissionPeer{
+			MemberID: etcd.DeriveNodeID(member.ID), Address: member.Address, Client: member.Client,
+		})
+	}
+	return snapshot
+}
+
+func TestNamespaceAdmissionNegotiationRequiresEveryMemberReady(t *testing.T) {
+	members, clients := namespaceRuntimeFixture(t)
+	require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
+	state := namespaceRuntimeSnapshot(members)
+	state.Members[2].Client = namespaceProbeFunc(func(ctx context.Context, request *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		response, err := clients[2].ProbeMigrationState(ctx, request)
+		if err == nil {
+			response.Ready = false
+		}
+		return response, err
+	})
+	_, alreadyActive, err := namespaceNegotiation(t.Context(), state, nil)
+	require.NoError(t, err)
+	require.False(t, alreadyActive)
+	require.NoError(t, kv.RequireMigrationNamespaceAdmission(t.Context(), clients[0].internal.store))
+}
+
+func TestNamespaceAdmissionActiveGroupJoiningStillRefreshes(t *testing.T) {
+	members, clients := namespaceRuntimeFixture(t)
+	require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
+	state := namespaceRuntimeSnapshot(members)
+	snapshot := func(context.Context) (NamespaceAdmissionSnapshot, error) { return state, nil }
+	activate := func(ctx context.Context, command kv.NamespaceAdmissionCommand) error {
+		request, err := kv.NewNamespaceAdmissionRequest(1, command)
+		if err != nil {
+			return err
+		}
+		_, err = clients[0].CleanupMigration(ctx, request)
+		return err
+	}
+	candidateStore := store.NewMVCCStore()
+	candidateFSM := kv.NewKvFSMWithHLC(candidateStore, nil)
+	candidate := NewInternalWithEngine(nil, nil, nil, nil, WithInternalStore(candidateStore),
+		WithMigrationNamespaceAdmissionReady(func() bool {
+			return kv.MigrationNamespaceInstalledVersion(candidateStore, candidateFSM) == kv.MigrationNamespaceVersion
+		}))
+	candidate.migrationProposer = clients[0].internal.migrationProposer
+	joiningID := etcd.DeriveNodeID("joining")
+	joining := []NamespaceAdmissionPeer{{MemberID: joiningID, Address: "joining:7001",
+		Client: namespaceProbeFunc(candidate.probeMigrationNamespace)}}
+	for round := range 2 {
+		require.NoError(t, EnsureMigrationNamespaceAdmissionWithSnapshot(t.Context(), snapshot, activate, joining))
+		require.Equal(t, 2+round, clients[0].proposals)
+		for _, client := range clients {
+			require.NoError(t, kv.CheckMigrationNamespacePrejoin(t.Context(), client.internal.store, 9, joiningID, kv.MigrationNamespaceVersion))
+		}
+	}
+}
+
+func TestNamespaceAdmissionActiveGroupStillRequiresFinalACK(t *testing.T) {
+	for _, failure := range []string{"ready", "version", "configuration"} {
+		t.Run(failure, func(t *testing.T) {
+			members, clients := namespaceRuntimeFixture(t)
+			require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
+			state := namespaceRuntimeSnapshot(members)
+			probes := 0
+			state.Members[2].Client = namespaceProbeFunc(func(ctx context.Context, request *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+				response, err := clients[2].ProbeMigrationState(ctx, request)
+				probes++
+				if probes == 2 {
+					switch failure {
+					case "ready":
+						response.Ready = false
+					case "version":
+						response.NamespaceAdmissionVersion = 0
+					case "configuration":
+						response.AppliedConfigurationIndex = 8
+					}
+				}
+				return response, err
+			})
+			snapshot := func(context.Context) (NamespaceAdmissionSnapshot, error) { return state, nil }
+			activate := func(context.Context, kv.NamespaceAdmissionCommand) error {
+				t.Fatal("active group must not propose")
+				return nil
+			}
+			require.ErrorIs(t, EnsureMigrationNamespaceAdmissionWithSnapshot(t.Context(), snapshot, activate, nil), kv.ErrMigrationNamespaceProtocol)
+			require.Equal(t, 2, probes)
+			require.Equal(t, 1, clients[0].proposals)
+		})
+	}
+}
+
+func TestNamespaceAdmissionActiveGroupRevalidatesSnapshots(t *testing.T) {
+	for _, changeAt := range []int{2, 3} {
+		members, clients := namespaceRuntimeFixture(t)
+		require.NoError(t, EnsureMigrationNamespaceAdmission(t.Context(), clients[0], members))
+		state := namespaceRuntimeSnapshot(members)
+		calls := 0
+		snapshot := func(context.Context) (NamespaceAdmissionSnapshot, error) {
+			calls++
+			if calls == changeAt {
+				state.ConfigurationIndex++
+			}
+			return state, nil
+		}
+		activate := func(context.Context, kv.NamespaceAdmissionCommand) error {
+			t.Fatal("active group must not propose")
+			return nil
+		}
+		require.ErrorIs(t, EnsureMigrationNamespaceAdmissionWithSnapshot(t.Context(), snapshot, activate, nil), kv.ErrMigrationNamespaceProtocol)
+		require.Equal(t, changeAt, calls)
+		require.Equal(t, 1, clients[0].proposals)
 	}
 }
 

@@ -82,15 +82,17 @@ func EnsureMigrationNamespaceAdmissionWithSnapshot(ctx context.Context,
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	command, err := namespaceNegotiation(ctx, before, joining)
+	command, alreadyActive, err := namespaceNegotiation(ctx, before, joining)
 	if err != nil {
 		return err
 	}
 	if err := revalidateNamespaceSnapshot(ctx, snapshot, before); err != nil {
 		return err
 	}
-	if err := activate(ctx, command); err != nil {
-		return errors.WithStack(err)
+	if !alreadyActive || len(joining) != 0 {
+		if err := activate(ctx, command); err != nil {
+			return errors.WithStack(err)
+		}
 	}
 	for _, member := range before.Members {
 		if _, err := probeNamespacePeer(ctx, member, before.ConfigurationIndex, true); err != nil {
@@ -100,40 +102,42 @@ func EnsureMigrationNamespaceAdmissionWithSnapshot(ctx context.Context,
 	return revalidateNamespaceSnapshot(ctx, snapshot, before)
 }
 
-func namespaceNegotiation(ctx context.Context, snapshot NamespaceAdmissionSnapshot, joining []NamespaceAdmissionPeer) (kv.NamespaceAdmissionCommand, error) {
+func namespaceNegotiation(ctx context.Context, snapshot NamespaceAdmissionSnapshot, joining []NamespaceAdmissionPeer) (kv.NamespaceAdmissionCommand, bool, error) {
 	command := kv.NamespaceAdmissionCommand{Version: kv.MigrationNamespaceVersion, ConfigurationIndex: snapshot.ConfigurationIndex}
 	if snapshot.ConfigurationIndex == 0 || len(snapshot.Members) == 0 {
-		return command, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+		return command, false, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
+	alreadyActive := true
 	addresses := make(map[string]bool)
 	ids := make(map[uint64]bool)
 	for _, member := range snapshot.Members {
 		if ids[member.MemberID] || addresses[member.Address] {
-			return command, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+			return command, false, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 		}
 		response, err := probeNamespacePeer(ctx, member, snapshot.ConfigurationIndex, false)
 		if err != nil {
-			return command, err
+			return command, false, err
 		}
+		alreadyActive = alreadyActive && response.GetReady()
 		ids[member.MemberID], addresses[member.Address] = true, true
 		command.ApplyMembers = append(command.ApplyMembers, member.MemberID)
 		command.Members = append(command.Members, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: snapshot.ConfigurationIndex})
 	}
 	for _, member := range joining {
 		if ids[member.MemberID] || addresses[member.Address] {
-			return command, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+			return command, false, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 		}
 		// A candidate does not yet have a source-group configuration. Only its
 		// installed support is probed; authorization is bound to source cfg.
 		response, err := probeNamespacePeer(ctx, member, 0, false)
 		if err != nil {
-			return command, err
+			return command, false, err
 		}
 		ids[member.MemberID], addresses[member.Address] = true, true
 		command.Joining = append(command.Joining, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: snapshot.ConfigurationIndex})
 	}
 	slices.Sort(command.ApplyMembers)
-	return command, nil
+	return command, alreadyActive, nil
 }
 
 func probeNamespacePeer(ctx context.Context, member NamespaceAdmissionPeer, configuration uint64, activated bool) (*pb.ProbeMigrationStateResponse, error) {
