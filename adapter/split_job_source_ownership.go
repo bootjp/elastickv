@@ -26,9 +26,7 @@ func (s *DistributionServer) armSplitSourceOwnership(ctx context.Context, job di
 	if err != nil {
 		return nil, false, err
 	}
-	prior, err := source.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{JobId: job.JobID,
-		Kind:                      pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED,
-		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration})
+	prior, err := probeSplitSourceOwnershipState(ctx, source, job.JobID, configuration)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -92,9 +90,7 @@ func splitSourceOwnershipOperation(proof *pb.MigrationOwnershipProof, prior *pb.
 }
 
 func (s *DistributionServer) ackSplitSourceOwnership(ctx context.Context, job distribution.SplitJob, groupID, configuration uint64, source SplitMigrationClient, proof *pb.MigrationOwnershipProof) ([]byte, bool, error) {
-	resp, err := source.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{JobId: job.JobID,
-		Kind:                      pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED,
-		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration})
+	resp, err := probeSplitSourceOwnershipState(ctx, source, job.JobID, configuration)
 	if err != nil {
 		return nil, false, errors.WithStack(err)
 	}
@@ -109,4 +105,13 @@ func (s *DistributionServer) ackSplitSourceOwnership(ctx context.Context, job di
 	return s.syncSplitMigrationVoterBarrier(ctx, groupID, nil, source, &pb.ProbeMigrationStateRequest{JobId: job.JobID,
 		Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED, Ownership: expected,
 		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration})
+}
+
+func probeSplitSourceOwnershipState(ctx context.Context, source SplitMigrationClient, jobID, configuration uint64) (*pb.ProbeMigrationStateResponse, error) {
+	attempt, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
+	defer cancel()
+	resp, err := source.ProbeMigrationState(attempt, &pb.ProbeMigrationStateRequest{JobId: jobID,
+		Kind:                      pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED,
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: configuration})
+	return resp, errors.WithStack(err)
 }
