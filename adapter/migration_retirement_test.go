@@ -53,6 +53,11 @@ func (p *retirementVoterProposer) Propose(_ context.Context, data []byte) (*raft
 	p.index++
 	var response any
 	for _, voter := range p.voters {
+		aware, ok := voter.(raftengine.ApplyIndexAware)
+		if !ok {
+			return nil, store.ErrNotSupported
+		}
+		aware.SetApplyIndex(p.index)
 		response = voter.Apply(data)
 	}
 	return &raftengine.ProposalResult{CommitIndex: p.index, Response: response}, nil
@@ -89,9 +94,12 @@ func TestMigrationRetirementRejectsOldRunnerAfterAllVoterCleanupProbes(t *testin
 	t.Parallel()
 	ctx := t.Context()
 	engine := distribution.NewEngine()
+	catalog := distribution.NewCatalogStore(store.NewMVCCStore(), distribution.WithCatalogRouteDescriptorV2Writes(true))
 	route := distribution.RouteDescriptor{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 7, State: distribution.RouteStateWriteFenced}
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{Version: 1, Routes: []distribution.RouteDescriptor{route}}))
-	proposer := &retirementVoterProposer{}
+	snapshot, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{route})
+	require.NoError(t, err)
+	require.NoError(t, engine.ApplySnapshot(snapshot))
+	proposer := &retirementVoterProposer{index: 20}
 	stores := make([]store.MVCCStore, 3)
 	servers := make([]*Internal, 3)
 	for index := range stores {
@@ -101,9 +109,14 @@ func TestMigrationRetirementRejectsOldRunnerAfterAllVoterCleanupProbes(t *testin
 		require.True(t, ok)
 		require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, store.TargetStagedReadinessState{JobID: 7, MigrationJobID: 7,
 			RouteStart: []byte("m"), RouteEnd: []byte("z"), Armed: true, TrackWrites: true, MinWriteTSExclusive: 1, RetentionPinTS: 1}))
-		proposer.voters = append(proposer.voters, kv.NewKvFSMWithHLC(st, kv.NewHLC(), kv.WithRouteHistory(kv.WrapDistributionEngine(engine), 7)))
-		servers[index] = NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st),
-			WithInternalMigrationProposer(proposer), WithInternalMigrationCleanupGate(func(context.Context) error { return nil }))
+		fsm := kv.NewKvFSMWithHLC(st, kv.NewHLC(), kv.WithRouteHistory(kv.WrapDistributionEngine(engine), 7))
+		configuration, ok := fsm.(raftengine.AppliedConfigurationAware)
+		require.True(t, ok)
+		require.NoError(t, configuration.RecordAppliedConfiguration(9))
+		proposer.voters = append(proposer.voters, fsm)
+		servers[index] = NewInternalWithEngine(nil, ownershipRuntimeLeader{configuration: configuration}, nil, nil, WithInternalStore(st),
+			WithInternalMigrationProposer(proposer), WithInternalMigrationOwnershipReady(func() bool { return true }),
+			WithInternalMigrationCleanupGate(func(context.Context) error { return nil }))
 	}
 	late := &pb.TargetStagedReadinessRequest{JobId: 7, MigrationJobId: 7, RouteStart: []byte("m"), RouteEnd: []byte("z"),
 		Armed: true, SourceWriteFence: true, MinWriteTsExclusive: 500, RetentionPinTs: 1}
@@ -121,15 +134,24 @@ func TestMigrationRetirementRejectsOldRunnerAfterAllVoterCleanupProbes(t *testin
 	case callErr := <-result:
 		t.Fatalf("old RPC did not reach the proposal barrier: %v", callErr)
 	}
-	_, err = servers[0].CleanupMigration(ctx, &pb.CleanupMigrationRequest{JobId: 7, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA})
+	// Commit the rollback descriptor before atomically replacing the guard.
+	route.State, route.MinWriteTSExclusive = distribution.RouteStateActive, 1
+	snapshot, err = catalog.Save(ctx, snapshot.Version, []distribution.RouteDescriptor{route})
+	require.NoError(t, err)
+	require.NoError(t, engine.ApplySnapshot(snapshot))
+	job := distribution.SplitJob{JobID: 7, SourceRouteID: 1, SourceGroupID: 7, TargetGroupID: 9,
+		SplitKey: []byte("m"), Phase: distribution.SplitJobPhaseAbandoning}
+	ownership, err := splitOwnershipProof(snapshot, job, 7, "0123456789abcdef0123456789abcdef")
+	require.NoError(t, err)
+	_, err = servers[0].CleanupMigration(ctx, &pb.CleanupMigrationRequest{JobId: 7,
+		Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR, Ownership: ownership,
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: 9})
 	require.NoError(t, err)
 	for _, server := range servers {
 		proof, probeErr := server.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{JobId: 7, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED})
 		require.NoError(t, probeErr)
 		require.True(t, proof.GetReady())
 	}
-	route.State = distribution.RouteStateActive
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{Version: 2, Routes: []distribution.RouteDescriptor{route}}))
 	release()
 	require.ErrorIs(t, <-result, store.ErrMigrationRetired)
 	for _, st := range stores {
@@ -142,7 +164,8 @@ func TestMigrationRetirementRejectsOldRunnerAfterAllVoterCleanupProbes(t *testin
 	}
 	txn := kv.NewTransactionWithProposer(proposer)
 	t.Cleanup(txn.Close)
-	_, err = txn.Commit(ctx, []*pb.Request{{Ts: 100, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("n"), Value: []byte("active")}}}})
+	_, err = txn.Commit(ctx, []*pb.Request{{Ts: 100, ObservedRouteVersion: kv.EncodeObservedRouteVersion(snapshot.Version),
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("n"), Value: []byte("active")}}}})
 	require.NoError(t, err)
 	for _, st := range stores {
 		value, readErr := st.GetAt(ctx, []byte("n"), 100)

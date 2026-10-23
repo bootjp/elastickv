@@ -2945,20 +2945,10 @@ func TestDistributionServerRunSplitJobRunnerOnce_PromotesCleanupJob(t *testing.T
 			{Done: true},
 		},
 	}
-	sourceMigration := &splitMigrationClientStub{}
-	targetMigration := &splitMigrationClientStub{}
-	coordinator := newDistributionCoordinatorStub(baseStore, true)
-	s := NewDistributionServer(
-		distribution.NewEngine(),
-		catalog,
-		WithDistributionCoordinator(coordinator),
-		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
-			return client, nil
-		}),
-		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-			return sourceMigration, targetMigration, nil
-		}),
-	)
+	s, _, _ := newSplitRuntimeRunner(t, baseStore, catalog, job)
+	coordinator, ok := s.coordinator.(*ownershipCatalogCoordinator)
+	require.True(t, ok)
+	s.splitPromotionClientFactory = func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) { return client, nil }
 
 	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
 	require.Equal(t, 2, client.calls)
@@ -3010,20 +3000,7 @@ func TestDistributionServerRunSplitJobRunnerOnce_TerminalizesPromotedCleanupJob(
 	job.UpdatedAtMs = 2000
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
 
-	source := &splitMigrationClientStub{}
-	target := &splitMigrationClientStub{}
-	coordinator := newDistributionCoordinatorStub(baseStore, true)
-	s := NewDistributionServer(
-		distribution.NewEngine(),
-		catalog,
-		WithDistributionCoordinator(coordinator),
-		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
-			return target, nil
-		}),
-		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-			return source, target, nil
-		}),
-	)
+	s, _, target := newSplitRuntimeRunner(t, baseStore, catalog, job)
 
 	for range 200 {
 		require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
@@ -3071,22 +3048,7 @@ func TestDistributionServerRunSplitJobRunnerOnce_CompletesCrossGroupMigration(t 
 	require.NoError(t, err)
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
 
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(saved))
-	source := &splitMigrationClientStub{}
-	target := &splitMigrationClientStub{}
-	coordinator := newDistributionCoordinatorStub(baseStore, true)
-	s := NewDistributionServer(
-		engine,
-		catalog,
-		WithDistributionCoordinator(coordinator),
-		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
-			return target, nil
-		}),
-		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-			return source, target, nil
-		}),
-	)
+	s, source, target := newSplitRuntimeRunner(t, baseStore, catalog, job)
 
 	for range 200 {
 		require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
@@ -3132,6 +3094,11 @@ func TestDistributionServerRunSplitJobRunnerOnce_CompletesCrossGroupMigration(t 
 	require.Equal(t, distribution.RouteStateActive, right.State)
 	require.False(t, right.StagedVisibilityActive)
 	require.Equal(t, completed.FenceTS, right.MinWriteTSExclusive)
+	value, err := target.internal.store.GetAt(ctx, []byte("n"), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("v"), value, "the real import and promotion must retain source data")
+	_, err = source.internal.store.GetAt(ctx, []byte("n"), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "source cleanup must remove the transferred version")
 }
 
 func TestDistributionServerRunSplitJobRunnerOnce_CompletesAbandonCleanup(t *testing.T) {
@@ -3159,20 +3126,7 @@ func TestDistributionServerRunSplitJobRunnerOnce_CompletesAbandonCleanup(t *test
 	job.AbandonFromPhase = distribution.SplitJobPhaseBackfill
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
 
-	source := &splitMigrationClientStub{}
-	target := &splitMigrationClientStub{}
-	coordinator := newDistributionCoordinatorStub(baseStore, true)
-	s := NewDistributionServer(
-		distribution.NewEngine(),
-		catalog,
-		WithDistributionCoordinator(coordinator),
-		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
-			return target, nil
-		}),
-		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-			return source, target, nil
-		}),
-	)
+	s, source, target := newSplitRuntimeRunner(t, baseStore, catalog, job)
 
 	for range 10 {
 		require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
@@ -3216,22 +3170,9 @@ func TestDistributionServerRunSplitJobRunnerOnce_PausesOnCapabilityRegression(t 
 	require.NoError(t, err)
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
 
-	source := &splitMigrationClientStub{}
-	target := &splitMigrationClientStub{}
-	coordinator := newDistributionCoordinatorStub(baseStore, true)
 	capabilityErr := errors.New("node capability missing")
-	s := NewDistributionServer(
-		distribution.NewEngine(),
-		catalog,
-		WithDistributionCoordinator(coordinator),
-		WithSplitMigrationCapabilityGate(func(context.Context) error { return capabilityErr }),
-		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
-			return target, nil
-		}),
-		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-			return source, target, nil
-		}),
-	)
+	s, source, _ := newSplitRuntimeRunner(t, baseStore, catalog, job)
+	s.migrationCapabilityGate = func(context.Context) error { return capabilityErr }
 
 	require.NoError(t, s.RunSplitJobRunnerOnce(ctx))
 	paused, found, err := catalog.SplitJob(ctx, job.JobID)

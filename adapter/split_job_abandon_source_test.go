@@ -20,17 +20,6 @@ func (c *abandonUnavailableTarget) CleanupMigration(context.Context, *pb.Cleanup
 	return nil, status.Error(codes.Unavailable, "target offline")
 }
 
-type abandonSourceClient struct {
-	splitMigrationClientStub
-	cleaner store.MigrationCleaner
-}
-
-func (c *abandonSourceClient) CleanupMigration(ctx context.Context, req *pb.CleanupMigrationRequest, _ ...grpc.CallOption) (*pb.CleanupMigrationResponse, error) {
-	c.cleanups = append(c.cleanups, req)
-	err := c.cleaner.ClearMigrationState(ctx, req.GetJobId(), 0)
-	return &pb.CleanupMigrationResponse{Done: err == nil}, err
-}
-
 func TestSplitJobAbandonRestoresSourceBeforeUnavailableTarget(t *testing.T) {
 	t.Parallel()
 	for _, phase := range []distribution.SplitJobPhase{distribution.SplitJobPhaseFence, distribution.SplitJobPhaseDeltaCopy} {

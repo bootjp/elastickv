@@ -370,6 +370,9 @@ func (s *DistributionServer) RunSplitJobRunnerOnce(ctx context.Context) error {
 		return splitJobCatalogStatusError(err)
 	}
 	if job, ok := nextRunnableSplitJob(jobs); ok {
+		if err := s.verifySplitJobCleanupDispatch(ctx, job); err != nil {
+			return err
+		}
 		if job.Phase != distribution.SplitJobPhaseAbandoning {
 			ready, gateErr := s.splitJobCapabilityReady(ctx, job)
 			if gateErr != nil || !ready {

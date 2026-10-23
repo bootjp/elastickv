@@ -222,6 +222,9 @@ func consumeSplitCursorUvarint(raw []byte) (uint64, []byte, error) {
 }
 
 func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribution.SplitJob) error {
+	if err := s.verifySplitJobCleanupDispatch(ctx, job); err != nil {
+		return err
+	}
 	if s.splitMigrationClientFactory == nil {
 		return errors.New("split migration client factory is not configured")
 	}
@@ -519,6 +522,29 @@ func (s *DistributionServer) verifySplitJobCleanupCutover(ctx context.Context, j
 	if err != nil {
 		return err
 	}
+	return verifySplitJobCleanupSnapshot(job, snapshot)
+}
+
+// Validate before capability recovery or source discovery can dispatch RPCs.
+func (s *DistributionServer) verifySplitJobCleanupDispatch(ctx context.Context, job distribution.SplitJob) error {
+	if job.Phase != distribution.SplitJobPhaseCleanup {
+		return nil
+	}
+	snapshot, err := s.loadCommittedMigrationCatalog(ctx)
+	if err != nil {
+		return err
+	}
+	current, found, err := s.catalog.SplitJobAt(ctx, job.JobID, snapshot.ReadTS)
+	if err != nil {
+		return splitJobCatalogStatusError(err)
+	}
+	if !found || !distribution.SplitJobsEquivalent(current, job) {
+		return errors.WithStack(distribution.ErrCatalogSplitJobConflict)
+	}
+	return verifySplitJobCleanupSnapshot(current, snapshot)
+}
+
+func verifySplitJobCleanupSnapshot(job distribution.SplitJob, snapshot distribution.CatalogSnapshot) error {
 	if !validSplitJobCleanupWitness(job, snapshot.Version) {
 		return errors.New("split cleanup lacks a valid cutover witness")
 	}
@@ -1776,7 +1802,7 @@ func (s *DistributionServer) applySplitJobCutoverBarriers(
 	if _, err := applySplitMigrationControl(ctx, target, job, sourceRoute.End, expectedVersion, job.FenceTS, false, false, false, 0); err != nil {
 		return nil, nil, false, false, err
 	}
-	if _, err := applySplitMigrationControl(ctx, source, job, sourceRoute.End, expectedVersion, job.FenceTS, true, true, false, 1); err != nil {
+	if _, err := applySplitMigrationControl(ctx, source, job, sourceRoute.End, expectedVersion, job.FenceTS, true, true, job.WriteTrackerArmed, 1); err != nil {
 		return nil, nil, false, false, err
 	}
 	targetCursor, targetComplete, err := s.syncSplitMigrationVoterBarrier(ctx, job.TargetGroupID, job.TargetStagedReadinessAckCursor, target, &pb.ProbeMigrationStateRequest{
@@ -1801,6 +1827,7 @@ func (s *DistributionServer) applySplitJobCutoverBarriers(
 		MinWriteTsExclusive:    job.FenceTS,
 		SourceWriteFence:       true,
 		SourceReadFence:        true,
+		TrackWrites:            job.WriteTrackerArmed,
 		RetentionPinTs:         1,
 	})
 	if err != nil {

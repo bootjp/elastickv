@@ -56,7 +56,7 @@ func TestSplitJobAbandonsLegacySQSOverlapWithoutLosingData(t *testing.T) {
 	st, sourceStore := store.NewMVCCStore(), store.NewMVCCStore()
 	catalog := distribution.NewCatalogStore(st, distribution.WithCatalogRouteDescriptorV2Writes(true))
 	global, end := []byte("!sqs|route|global"), []byte("!sqs|route|z")
-	_, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
+	snapshot, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{
 		{RouteID: 2, ParentRouteID: 1, Start: []byte("!sqs|route|"), End: global, GroupID: 7},
 		{RouteID: 3, ParentRouteID: 1, Start: global, End: end, GroupID: 7, State: distribution.RouteStateWriteFenced},
 	})
@@ -72,17 +72,15 @@ func TestSplitJobAbandonsLegacySQSOverlapWithoutLosingData(t *testing.T) {
 		JobID: job.JobID, MigrationJobID: job.JobID, RouteStart: global, RouteEnd: end,
 		Armed: true, SourceWriteFence: true, MinWriteTSExclusive: 1, RetentionPinTS: 1,
 	}))
-	cleaner, ok := sourceStore.(store.MigrationCleaner)
-	require.True(t, ok)
-	source, target := &abandonSourceClient{cleaner: cleaner}, &splitMigrationClientStub{}
-	server := NewDistributionServer(distribution.NewEngine(), catalog,
-		WithDistributionCoordinator(newDistributionCoordinatorStub(st, true)),
-		WithSplitMigrationGroupClientFactory(func(context.Context, uint64) (SplitMigrationClient, error) { return source, nil }),
-		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-			return source, target, nil
-		}),
-		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) { return target, nil }),
-	)
+	engine := distribution.NewEngine()
+	require.NoError(t, engine.ApplySnapshot(snapshot))
+	source := newSplitRuntimeClient(t, engine, sourceStore, job.SourceGroupID)
+	target := newSplitRuntimeClient(t, engine, store.NewMVCCStore(), job.TargetGroupID)
+	options := splitRuntimeOptions(source, target, job.SourceGroupID)
+	options = append(options, WithDistributionCoordinator(&ownershipCatalogCoordinator{
+		distributionCoordinatorStub: newDistributionCoordinatorStub(st, true),
+	}))
+	server := NewDistributionServer(engine, catalog, options...)
 	for range 8 {
 		require.NoError(t, server.RunSplitJobRunnerOnce(ctx))
 	}
@@ -94,9 +92,10 @@ func TestSplitJobAbandonsLegacySQSOverlapWithoutLosingData(t *testing.T) {
 	value, err := sharded.GetGroupAt(ctx, 7, key, 100)
 	require.NoError(t, err)
 	require.Equal(t, []byte("retained"), value)
-	txn := kv.NewTransactionWithProposer(&applyingMigrationProposer{fsm: kv.NewKvFSMWithHLC(sourceStore, kv.NewHLC(), kv.WithRouteHistory(kv.WrapDistributionEngine(server.engine), 7))})
+	txn := kv.NewTransactionWithProposer(source.internal.migrationProposer, kv.WithMigrationRequestAdmission(sourceStore, 7))
 	t.Cleanup(txn.Close)
-	_, err = txn.Commit(ctx, []*pb.Request{{Ts: 100, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("available")}}}})
+	_, err = txn.Commit(ctx, []*pb.Request{{Ts: 100, ObservedRouteVersion: kv.EncodeObservedRouteVersion(server.engine.Version()),
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("available")}}}})
 	require.NoError(t, err)
 	value, err = sharded.GetGroupAt(ctx, 7, key, 100)
 	require.NoError(t, err)

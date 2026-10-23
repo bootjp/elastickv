@@ -27,7 +27,11 @@ func TestSplitJobForgedCleanupCannotDispatchPrivilegedRPC(t *testing.T) {
 	job.SourceReadDrainCursor = distribution.CloneBytes(splitCleanupDoneCursor)
 	require.NoError(t, catalog.CreateSplitJob(ctx, job))
 	server := NewDistributionServer(distribution.NewEngine(), catalog,
-		WithDistributionCoordinator(newDistributionCoordinatorStub(st, true)),
+		WithDistributionCoordinator(&ownershipCatalogCoordinator{distributionCoordinatorStub: newDistributionCoordinatorStub(st, true)}),
+		WithSplitMigrationCapabilityGate(func(context.Context) error {
+			t.Fatal("forged cleanup must be rejected before capability RPCs")
+			return nil
+		}),
 		WithSplitPromotionClientFactory(func(context.Context, distribution.SplitJob) (SplitPromotionClient, error) {
 			t.Fatal("forged job must not dispatch promotion")
 			return nil, nil
@@ -51,7 +55,8 @@ func TestSplitJobCleanupRequiresAuthoritativeCutoverDescriptor(t *testing.T) {
 			job, routes := splitCleanupWitnessFixture(name)
 			_, err := catalog.Save(ctx, 0, routes)
 			require.NoError(t, err)
-			server := NewDistributionServer(distribution.NewEngine(), catalog)
+			server := NewDistributionServer(distribution.NewEngine(), catalog,
+				WithDistributionCoordinator(&ownershipCatalogCoordinator{distributionCoordinatorStub: newDistributionCoordinatorStub(st, true)}))
 			err = server.verifySplitJobCleanupCutover(ctx, job)
 			if name == "staged target" || name == "promoted target" {
 				require.NoError(t, err)
@@ -60,6 +65,26 @@ func TestSplitJobCleanupRequiresAuthoritativeCutoverDescriptor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestSplitJobCleanupDispatchRejectsStaleRootJob(t *testing.T) {
+	t.Parallel()
+	st := store.NewMVCCStore()
+	catalog := distribution.NewCatalogStore(st, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	job, routes := splitCleanupWitnessFixture("staged target")
+	_, err := catalog.Save(t.Context(), 0, routes)
+	require.NoError(t, err)
+	require.NoError(t, catalog.CreateSplitJob(t.Context(), job))
+	stale := distribution.CloneSplitJob(job)
+	job.CapabilityRegressed = true
+	require.NoError(t, catalog.SaveSplitJob(t.Context(), stale, job))
+	server := NewDistributionServer(distribution.NewEngine(), catalog,
+		WithDistributionCoordinator(&ownershipCatalogCoordinator{distributionCoordinatorStub: newDistributionCoordinatorStub(st, true)}),
+		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+			t.Fatal("a stale cleanup job must not discover privileged clients")
+			return nil, nil, nil
+		}))
+	require.ErrorIs(t, server.runSplitJobPhase(t.Context(), stale), distribution.ErrCatalogSplitJobConflict)
 }
 
 func splitCleanupWitnessFixture(name string) (distribution.SplitJob, []distribution.RouteDescriptor) {
