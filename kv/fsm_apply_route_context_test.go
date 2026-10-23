@@ -167,6 +167,11 @@ func TestApplyRouteContextReadinessOCCAndPrefixDelete(t *testing.T) {
 
 func newApplyRouteContextStagedFSM(t *testing.T, view string) (context.Context, *kvFSM) {
 	t.Helper()
+	return newApplyRouteContextStagedFSMWithStore(t, view, store.NewMVCCStore())
+}
+
+func newApplyRouteContextStagedFSMWithStore(t *testing.T, view string, st store.MVCCStore) (context.Context, *kvFSM) {
+	t.Helper()
 	route := applyRouteContextDescriptor()
 	history := applyRouteContextWithObserved(t, route, route)
 	ctx := withApplyRouteHistory(context.Background(), history)
@@ -182,20 +187,8 @@ func newApplyRouteContextStagedFSM(t *testing.T, view string) (context.Context, 
 	case "other-owner":
 		local.GroupID = 2
 	}
-	f := &kvFSM{store: store.NewMVCCStore(), routes: applyRouteContextHistory(t, version, local), shardGroupID: 1}
-	writer, ok := f.store.(store.MigrationTargetReadinessWriter)
-	require.True(t, ok)
-	require.NoError(t, writer.ApplyTargetStagedReadiness(ctx, store.TargetStagedReadinessState{
-		JobID: 11, RouteStart: []byte("a"), RouteEnd: []byte("z"),
-		ExpectedCutoverVersion: 7, MigrationJobID: 11, MinWriteTSExclusive: 100, Armed: true,
-	}))
-	ownership, ok := f.store.(store.MigrationOwnershipStore)
-	require.True(t, ok)
-	require.NoError(t, ownership.AcquireMigrationOwnership(ctx, store.MigrationOwnershipState{
-		JobID: 11, LocalGroupID: 1, OwnerGroupID: 1, CatalogVersion: 7, ConfigurationIndex: 1,
-		RouteStart: []byte("a"), RouteEnd: []byte("z"), MinWriteTSExclusive: 100,
-		Role: store.MigrationOwner, Staged: true,
-	}, 1))
+	f := &kvFSM{store: st, routes: applyRouteContextHistory(t, version, local), shardGroupID: 1}
+	installStagedOwnershipEvidence(t, f, 7, route)
 	return ctx, f
 }
 
@@ -241,9 +234,11 @@ func TestApplyRouteContextTransactionPaths(t *testing.T) {
 					key := []byte("k")
 					require.NoError(t, f.store.PutAt(ctx, distribution.MigrationStagedDataKey(11, key), []byte("old"), 120, 0))
 					r := applyRouteContextTxn(phase, 130, 200, key)
+					f.SetApplyIndex(4)
 					require.NoError(t, f.applyRequestErr(ctx, r))
 					if phase == pb.Phase_PREPARE {
 						commit := applyRouteContextTxn(pb.Phase_COMMIT, 130, 200, key)
+						f.SetApplyIndex(5)
 						require.NoError(t, f.applyRequestErr(ctx, commit))
 					}
 					value, err := f.store.GetAt(ctx, key, 200)
@@ -275,13 +270,14 @@ func TestApplyRouteContextBatchVerdictsAndLegacyFallback(t *testing.T) {
 			name = "pebble"
 		}
 		t.Run(name, func(t *testing.T) {
-			ctx, f := newApplyRouteContextStagedFSM(t, "fenced")
+			st := store.NewMVCCStore()
 			if pebble {
-				st, err := store.NewPebbleStore(t.TempDir())
+				var err error
+				st, err = store.NewPebbleStore(t.TempDir())
 				require.NoError(t, err)
 				t.Cleanup(func() { require.NoError(t, st.Close()) })
-				f.store = st
 			}
+			ctx, f := newApplyRouteContextStagedFSMWithStore(t, "fenced", st)
 			f.pendingApplyIdx = 42
 			requests := []*pb.Request{
 				{Ts: 100, ObservedRouteVersion: 7, Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("too-old")}}},
