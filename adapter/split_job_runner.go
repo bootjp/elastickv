@@ -1397,12 +1397,9 @@ func (s *DistributionServer) copySplitJobPhase(
 		}
 		return s.advanceCompletedCopyPhase(ctx, job, exportPhase)
 	}
-	source, target, err := s.splitMigrationClientFactory(ctx, job, sourceRoute.GroupID)
+	source, target, err := s.splitCopyClients(ctx, job, sourceRoute.GroupID)
 	if err != nil {
-		return errors.WithStack(err)
-	}
-	if source == nil || target == nil {
-		return errors.New("split migration source or target client is nil")
+		return err
 	}
 	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
 		return err
@@ -1437,6 +1434,17 @@ func (s *DistributionServer) splitCopySourceAdmission(ctx context.Context, job d
 	}
 	witness, err := s.ensureSplitJobTransferPhase(ctx, job, nil, nil)
 	return route, witness, err
+}
+
+func (s *DistributionServer) splitCopyClients(ctx context.Context, job distribution.SplitJob, groupID uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+	source, target, err := s.splitMigrationClientFactory(ctx, job, groupID)
+	if err != nil {
+		return nil, nil, errors.WithStack(err)
+	}
+	if source == nil || target == nil {
+		return nil, nil, errors.New("split migration source or target client is nil")
+	}
+	return source, target, nil
 }
 
 func (s *DistributionServer) copySplitJobStream(

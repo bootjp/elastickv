@@ -49,7 +49,10 @@ func migrationOwnershipRootClientFactory(resolve func() (string, error), cache *
 
 func migrationOwnershipRefreshOption(groups map[uint64]*kv.ShardGroup, root *raftGroupRuntime, cache *kv.GRPCConnCache, token string, enforced bool) adapter.DistributionServerOption {
 	if token == "" || !enforced {
-		return nil
+		// Keep durable ownership visible to metadata preflight even when the
+		// authenticated mutation protocol is disabled. Do not install a root
+		// client or advertise a configured refresh runtime in this case.
+		return adapter.WithMigrationOwnershipRefresh(groups, nil)
 	}
 	return adapter.WithMigrationOwnershipRefresh(groups, migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(root), cache, token))
 }

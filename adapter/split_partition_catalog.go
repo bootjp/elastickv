@@ -53,7 +53,13 @@ func (s *DistributionServer) catalogSplitManifest(ctx context.Context, readTS, p
 		manifest.JobID = workingJob.JobID
 	}
 	mutation, err := s.catalog.BuildOwnershipPartitionMutationAt(ctx, readTS, manifest)
-	return mutation, errors.WithStack(err)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := s.validateSplitPartitionBudget(ctx, parent, mutation.Value, manifest.Version); err != nil {
+		return nil, err
+	}
+	return mutation, nil
 }
 
 func (s *DistributionServer) catalogWorkingSourceOp(ctx context.Context, readTS, parentID, rightID uint64, workingJob distribution.SplitJob) (*kv.Elem[kv.OP], error) {

@@ -277,6 +277,12 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 		return nil, err
 	}
 	resp.NamespaceAdmissionVersion = i.migrationNamespaceProtocolVersion()
+	i.decorateMigrationTransferCapability(req, resp)
+	i.bindMigrationProbeConfiguration(req, resp)
+	return resp, nil
+}
+
+func (i *Internal) decorateMigrationTransferCapability(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) {
 	if i.MigrationTransferSizeGuardSupported() {
 		resp.TransferSizeGuardVersion = store.MigrationTransferSizeGuardVersion
 	}
@@ -284,18 +290,21 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 		(req.GetTransferSizeGuardVersion() != resp.GetTransferSizeGuardVersion() || !i.MigrationTransferSizeGuardReady()) {
 		resp.Ready = false
 	}
-	if req.GetRequireConfigurationIndex() {
-		reader, supported := i.leader.(raftengine.AppliedConfigurationReader)
-		if !supported {
-			resp.Ready = false
-			return resp, nil
-		}
-		index, supported := reader.AppliedConfigurationIndex()
-		resp.AppliedConfigurationIndex = index
-		resp.Ready = resp.GetReady() && supported && index != 0 &&
-			(req.GetExpectedConfigurationIndex() == 0 || req.GetExpectedConfigurationIndex() == index)
+}
+
+func (i *Internal) bindMigrationProbeConfiguration(req *pb.ProbeMigrationStateRequest, resp *pb.ProbeMigrationStateResponse) {
+	if !req.GetRequireConfigurationIndex() {
+		return
 	}
-	return resp, nil
+	reader, supported := i.leader.(raftengine.AppliedConfigurationReader)
+	if !supported {
+		resp.Ready = false
+		return
+	}
+	index, supported := reader.AppliedConfigurationIndex()
+	resp.AppliedConfigurationIndex = index
+	resp.Ready = resp.GetReady() && supported && index != 0 &&
+		(req.GetExpectedConfigurationIndex() == 0 || req.GetExpectedConfigurationIndex() == index)
 }
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
@@ -441,11 +450,14 @@ func migrationControlMatches(state store.TargetStagedReadinessState, req *pb.Pro
 		state.ExpectedCutoverVersion == req.GetExpectedCatalogVersion() &&
 		state.MigrationJobID == req.GetMigrationJobId() &&
 		state.MinWriteTSExclusive == req.GetMinWriteTsExclusive() &&
-		state.SourceWriteFence == req.GetSourceWriteFence() &&
-		state.SourceReadFence == req.GetSourceReadFence() &&
-		state.TrackWrites == req.GetTrackWrites() &&
+		migrationControlModesMatch(state, req) &&
 		(req.GetTransferSizeGuardVersion() == 0 || state.TransferSizeGuardVersion == req.GetTransferSizeGuardVersion()) &&
 		state.RetentionPinTS == req.GetRetentionPinTs()
+}
+
+func migrationControlModesMatch(state store.TargetStagedReadinessState, req *pb.ProbeMigrationStateRequest) bool {
+	return state.SourceWriteFence == req.GetSourceWriteFence() && state.SourceReadFence == req.GetSourceReadFence() &&
+		state.TrackWrites == req.GetTrackWrites()
 }
 
 func (i *Internal) probeMigrationRoute(req *pb.ProbeMigrationStateRequest, requireCleared bool) *pb.ProbeMigrationStateResponse {
