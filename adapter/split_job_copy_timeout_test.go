@@ -13,18 +13,22 @@ import (
 )
 
 type stalledSplitCopyClient struct {
-	splitMigrationClientStub
-	export bool
+	*splitRuntimeClient
+	export        bool
+	exportStarted bool
+	importStarted bool
 }
 
 func (s *stalledSplitCopyClient) ExportRangeVersions(ctx context.Context, req *pb.ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error) {
 	if s.export {
+		s.exportStarted = true
 		return &stalledSplitCopyStream{ctx: ctx}, nil
 	}
-	return s.splitMigrationClientStub.ExportRangeVersions(ctx, req, opts...)
+	return s.splitRuntimeClient.ExportRangeVersions(ctx, req, opts...)
 }
 
 func (s *stalledSplitCopyClient) ImportRangeVersions(ctx context.Context, _ *pb.ImportRangeVersionsRequest, _ ...grpc.CallOption) (*pb.ImportRangeVersionsResponse, error) {
+	s.importStarted = true
 	<-ctx.Done()
 	return nil, ctx.Err()
 }
@@ -84,22 +88,33 @@ func TestSplitJobCopyAttemptBoundsStalledExportAndImport(t *testing.T) {
 			t.Parallel()
 			ctx := context.Background()
 			st := store.NewMVCCStore()
-			catalog := distribution.NewCatalogStore(st)
+			catalog := distribution.NewCatalogStore(st, distribution.WithCatalogRouteDescriptorV2Writes(true))
 			_, err := catalog.Save(ctx, 0, []distribution.RouteDescriptor{{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: 7}})
 			require.NoError(t, err)
 			job := splitJobForSourceGroupTest(t)
 			job.Phase = distribution.SplitJobPhaseBackfill
 			job.SnapshotTS = catalog.LatestCommitTS()
 			require.NoError(t, catalog.CreateSplitJob(ctx, job))
-			client := &stalledSplitCopyClient{export: export}
-			server := NewDistributionServer(distribution.NewEngine(), catalog, WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
-				return client, client, nil
-			}))
+			server, source, target := newSplitRuntimeRunner(t, st, catalog, job)
+			_, complete, err := server.armSplitSourceOwnership(ctx, job, job.SourceGroupID, source)
+			require.NoError(t, err)
+			require.True(t, complete)
+			sourceClient := &stalledSplitCopyClient{splitRuntimeClient: source, export: export}
+			targetClient := &stalledSplitCopyClient{splitRuntimeClient: target}
+			server.splitMigrationClientFactory = func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
+				return sourceClient, targetClient, nil
+			}
 			start := time.Now()
 			err = server.copySplitJobPhase(ctx, job, distribution.SplitJobExportPhaseBackfill, 0, job.SnapshotTS)
 			require.ErrorIs(t, err, context.DeadlineExceeded)
 			require.NoError(t, ctx.Err())
 			require.Less(t, time.Since(start), 5*defaultSplitMigrationAttemptTimeout)
+			requireRuntimeTransferGuard(t, source)
+			require.Equal(t, export, sourceClient.exportStarted)
+			require.Equal(t, !export, targetClient.importStarted)
+			if !export {
+				require.NotEmpty(t, source.exports, "the import timeout must follow a real source export")
+			}
 			persisted, found, err := catalog.SplitJob(ctx, job.JobID)
 			require.NoError(t, err)
 			require.True(t, found)
