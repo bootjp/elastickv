@@ -126,6 +126,7 @@ var (
 // coordinator -- SplitRange does exactly that.
 var migrationOnlyControlPrefixes = [][]byte{
 	[]byte(migrationStagedDataPrefix),
+	[]byte("!migstage|"),
 	[]byte("!migwrite|"),
 	[]byte("!migfence|"),
 }
@@ -135,11 +136,26 @@ var migrationOnlyControlPrefixes = [][]byte{
 // path's reserved-key test: the raw path can refuse every control namespace
 // because nothing legitimate writes one as a raw mutation, but the catalog
 // reaches the store through a transaction, so the transactional test has to be
-// the narrower one. A staged-data row is the case that matters -- a client
-// write landing there is promoted as user data.
+// the narrower one. Include the store's typed metadata namespace and exact
+// migration configuration key, but not ordinary aliases of those names.
 func IsMigrationOnlyControlKey(key []byte) bool {
 	for _, prefix := range migrationOnlyControlPrefixes {
 		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return bytes.Equal(key, []byte(migrationConfigurationIndexKey))
+}
+
+// MigrationOnlyControlPrefixIntersects identifies nonempty prefix deletes
+// aimed at typed migration namespaces. Exact transaction-local control keys
+// remain excluded by the existing transaction prefix exclusion on that path.
+func MigrationOnlyControlPrefixIntersects(prefix []byte) bool {
+	if len(prefix) == 0 {
+		return false
+	}
+	for _, reserved := range migrationOnlyControlPrefixes {
+		if bytes.HasPrefix(prefix, reserved) || bytes.HasPrefix(reserved, prefix) {
 			return true
 		}
 	}

@@ -749,6 +749,9 @@ func haltResponseFor(err error) *haltApplyResponse {
 }
 
 func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
+	if err := verifyRequestMigrationControlKeys(r); err != nil {
+		return err
+	}
 	var err error
 	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
 	if err != nil {

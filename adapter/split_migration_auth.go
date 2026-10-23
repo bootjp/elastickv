@@ -5,6 +5,7 @@ import (
 	"context"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc"
@@ -87,8 +88,8 @@ func SplitMigrationTokenAuth(token string, insecureNoAuth, peerAuthEnforced bool
 	return unary, stream
 }
 
-// Job authority must never be planted during the send-first stage. Ordinary
-// legacy peer writes (including transaction metadata) remain compatible.
+// Job authority and typed migration metadata must never be planted during
+// send-first rollout. Ordinary legacy peer transaction writes remain compatible.
 func splitForwardWritesJobControl(req any) bool {
 	forward, ok := req.(*pb.ForwardRequest)
 	if !ok {
@@ -106,15 +107,23 @@ func splitForwardWritesJobControl(req any) bool {
 
 func splitJobControlMutation(mutation *pb.Mutation) bool {
 	key := mutation.GetKey()
-	if distribution.IsCatalogSplitJobKey(key) || distribution.IsCatalogSplitJobHistoryKey(key) || bytes.Equal(key, distribution.CatalogNextSplitJobIDKey()) {
+	embedded := kv.ExtractTxnUserKey(key)
+	if splitMigrationControlKey(key) || splitMigrationControlKey(embedded) {
 		return true
 	}
 	if mutation.GetOp() != pb.Op_DEL_PREFIX {
 		return false
 	}
-	return bytes.HasPrefix(distribution.CatalogSplitJobKey(0), key) ||
+	return distribution.MigrationOnlyControlPrefixIntersects(key) ||
+		distribution.MigrationOnlyControlPrefixIntersects(embedded) ||
+		bytes.HasPrefix(distribution.CatalogSplitJobKey(0), key) ||
 		bytes.HasPrefix(distribution.CatalogSplitJobHistoryKey(0, 0), key) ||
 		bytes.HasPrefix(distribution.CatalogNextSplitJobIDKey(), key)
+}
+
+func splitMigrationControlKey(key []byte) bool {
+	return distribution.IsMigrationOnlyControlKey(key) || distribution.IsCatalogSplitJobKey(key) ||
+		distribution.IsCatalogSplitJobHistoryKey(key) || bytes.Equal(key, distribution.CatalogNextSplitJobIDKey())
 }
 
 func checkSplitMigrationTransport(ctx context.Context, method, token string, peerAuthEnforced bool) error {

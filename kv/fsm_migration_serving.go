@@ -17,6 +17,9 @@ func CheckMigrationRequest(ctx context.Context, localStore store.MVCCStore, grou
 	if localStore == nil || req == nil {
 		return errors.WithStack(ErrInvalidRequest)
 	}
+	if err := verifyRequestMigrationControlKeys(req); err != nil {
+		return err
+	}
 	f := &kvFSM{store: localStore, shardGroupID: groupID}
 	index, err := MigrationConfigurationIndex(ctx, localStore)
 	if err != nil {
