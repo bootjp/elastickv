@@ -83,11 +83,15 @@ func migrationAdmissionCertificate(proofs []migrationAdmissionProof, start, end 
 			selected = proof
 		}
 	}
-	if selected.identity == "" || bytes.Compare(selected.RouteStart, start) > 0 ||
-		(len(selected.RouteEnd) > 0 && (len(end) == 0 || bytes.Compare(end, selected.RouteEnd) > 0)) {
+	if selected.identity == "" || !migrationAdmissionProofCovers(selected, start, end) {
 		return selected, errors.WithStack(ErrRouteCutoverPending)
 	}
 	return selected, nil
+}
+
+func migrationAdmissionProofCovers(proof migrationAdmissionProof, start, end []byte) bool {
+	return bytes.Compare(proof.RouteStart, start) <= 0 &&
+		(len(proof.RouteEnd) == 0 || (len(end) != 0 && bytes.Compare(end, proof.RouteEnd) <= 0))
 }
 
 func migrationAdmissionRangeProofs(view store.MigrationServingState, r migrationApplyRange) ([]migrationAdmissionProof, error) {
@@ -139,53 +143,4 @@ func migrationAdmissionOwnershipProofs(view store.MigrationServingState, ranges 
 		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
 	return proofs, nil
-}
-
-// Partition only the checked interval, never the certificates themselves.
-// Every segment must select its newest complete certificate; holes, stale
-// versions and superseding NONOWNER records cannot borrow adjacent authority.
-func migrationApplyRangeProofs(states []store.MigrationOwnershipState, r migrationApplyRange, groupID, version uint64) ([]store.MigrationOwnershipState, error) {
-	boundaries, intersects := migrationApplyProofBoundaries(states, r)
-	if !intersects {
-		return nil, nil
-	}
-	proofs := make([]store.MigrationOwnershipState, 0, len(boundaries))
-	for i, start := range boundaries {
-		end := r.end
-		if i+1 < len(boundaries) {
-			end = boundaries[i+1]
-		}
-		proof, found, err := migrationServingCertificate(states, start, end)
-		if err != nil {
-			return nil, err
-		}
-		if !found || !migrationApplyProofAuthorizes(proof, groupID, version) {
-			return nil, errors.WithStack(ErrRouteCutoverPending)
-		}
-		proofs = append(proofs, proof)
-	}
-	return proofs, nil
-}
-
-func migrationApplyProofAuthorizes(proof store.MigrationOwnershipState, groupID, version uint64) bool {
-	return store.MigrationOwnershipEvidenceValid(proof) && proof.LocalGroupID == groupID &&
-		proof.Role == store.MigrationOwner && proof.CatalogVersion == version
-}
-
-func migrationApplyProofBoundaries(states []store.MigrationOwnershipState, r migrationApplyRange) ([][]byte, bool) {
-	boundaries := [][]byte{r.start}
-	var intersects bool
-	for _, proof := range states {
-		if !routeRangeIntersects(r.start, r.end, proof.RouteStart, proof.RouteEnd) {
-			continue
-		}
-		intersects = true
-		for _, boundary := range [][]byte{proof.RouteStart, proof.RouteEnd} {
-			if bytes.Compare(boundary, r.start) > 0 && (len(r.end) == 0 || bytes.Compare(boundary, r.end) < 0) {
-				boundaries = append(boundaries, boundary)
-			}
-		}
-	}
-	slices.SortFunc(boundaries, bytes.Compare)
-	return slices.CompactFunc(boundaries, bytes.Equal), intersects
 }

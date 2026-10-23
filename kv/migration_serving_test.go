@@ -119,15 +119,16 @@ func TestMigrationServingProofRejectsMixedAndFutureVersions(t *testing.T) {
 		Generation: "0123456789abcdef0123456789abcdef", RouteID: 3, ConfigurationIndex: 3, AppliedIndex: 9, DescriptorHash: make([]byte, 32),
 		Receipts:       []store.MigrationOwnershipReceipt{{Operation: store.MigrationOwnershipClear, CatalogVersion: 12, ConfigurationIndex: 3, AppliedIndex: 9, DescriptorHash: make([]byte, 32)}},
 		CatalogVersion: 12, RouteStart: []byte("m"), RouteEnd: []byte("z"), MinWriteTSExclusive: 100}}
+	view := store.MigrationServingState{Ownership: states}
 	for _, version := range []uint64{11, 13} {
-		_, err := migrationApplyOwnershipProofs(states, []migrationApplyRange{{[]byte("n"), []byte("o")}}, 1, version)
+		_, err := migrationAdmissionOwnershipProofs(view, []migrationApplyRange{{[]byte("n"), []byte("o")}}, 1, version)
 		require.ErrorIs(t, err, ErrRouteCutoverPending)
 	}
-	_, err := migrationApplyOwnershipProofs(states, []migrationApplyRange{{[]byte("n"), []byte("o")}, {[]byte("b"), []byte("c")}}, 1, 12)
+	_, err := migrationAdmissionOwnershipProofs(view, []migrationApplyRange{{[]byte("n"), []byte("o")}, {[]byte("b"), []byte("c")}}, 1, 12)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
-	_, err = migrationApplyOwnershipProofs(states, []migrationApplyRange{{[]byte("a"), []byte("z")}}, 1, 12)
+	_, err = migrationAdmissionOwnershipProofs(view, []migrationApplyRange{{[]byte("a"), []byte("z")}}, 1, 12)
 	require.ErrorIs(t, err, ErrRouteCutoverPending)
-	proofs, err := migrationApplyOwnershipProofs(states, []migrationApplyRange{{[]byte("n"), []byte("o")}}, 1, 12)
+	proofs, err := migrationAdmissionOwnershipProofs(view, []migrationApplyRange{{[]byte("n"), []byte("o")}}, 1, 12)
 	require.NoError(t, err)
 	require.Len(t, proofs, 1)
 	request := &pb.Request{IsTxn: true, Mutations: []*pb.Mutation{
@@ -136,12 +137,12 @@ func TestMigrationServingProofRejectsMixedAndFutureVersions(t *testing.T) {
 	}}
 	ranges, err := migrationServingFootprint(request)
 	require.NoError(t, err)
-	_, err = migrationApplyOwnershipProofs(states, ranges, 1, 12)
+	_, err = migrationAdmissionOwnershipProofs(view, ranges, 1, 12)
 	require.NoError(t, err, "a remote primary reference does not add a local participant")
 	request.Mutations = append(request.Mutations, &pb.Mutation{Op: pb.Op_PUT, Key: []byte("b")})
 	ranges, err = migrationServingFootprint(request)
 	require.NoError(t, err)
-	_, err = migrationApplyOwnershipProofs(states, ranges, 1, 12)
+	_, err = migrationAdmissionOwnershipProofs(view, ranges, 1, 12)
 	require.ErrorIs(t, err, ErrRouteCutoverPending, "a participating primary footprint cannot bypass mixed admission")
 }
 
@@ -165,10 +166,11 @@ func TestMigrationServingMatchingCommitAbortDrain(t *testing.T) {
 
 func TestMigrationServingScopedHistoryCarriesOwnershipFloor(t *testing.T) {
 	fsm := newComposed1FSM(t, staleServingEngine(t, 9), 1)
-	history, err := migrationOwnershipHistory([]store.MigrationOwnershipState{{
+	proofs := migrationAdmissionProofs(store.MigrationServingState{Ownership: []store.MigrationOwnershipState{{
 		JobID: 8, LocalGroupID: 1, OwnerGroupID: 1, CatalogVersion: 12,
 		Role: store.MigrationOwner, Staged: true, RouteStart: []byte("m"), RouteEnd: []byte("z"), MinWriteTSExclusive: 200,
-	}}, 12)
+	}}})
+	history, err := migrationAdmissionHistory(proofs, 12)
 	require.NoError(t, err)
 	scoped := withApplyRouteHistory(t.Context(), history)
 	snapshot, ok := fsm.routeHistoryForContext(scoped).Current()

@@ -12,11 +12,7 @@ import (
 func MigrationPartitionRequestAdmissionReady(tx Transactional) bool {
 	switch t := tx.(type) {
 	case *TransactionManager:
-		if t == nil || migrationPartitionComponentNil(t.proposer) {
-			return false
-		}
-		admission := t.migrationAdmission.Load()
-		return admission != nil && admission.groupID != 0 && migrationPartitionStoreReady(admission.store)
+		return migrationPartitionManagerReady(t)
 	case *LeaderProxy:
 		return t != nil && MigrationPartitionRequestAdmissionReady(t.tm)
 	case *leaseRefreshingTxn:
@@ -26,6 +22,14 @@ func MigrationPartitionRequestAdmissionReady(tx Transactional) bool {
 	default:
 		return false
 	}
+}
+
+func migrationPartitionManagerReady(t *TransactionManager) bool {
+	if t == nil || migrationPartitionComponentNil(t.proposer) {
+		return false
+	}
+	admission := t.migrationAdmission.Load()
+	return admission != nil && admission.groupID != 0 && migrationPartitionStoreReady(admission.store)
 }
 
 // MigrationPartitionReadAdmissionReady attests the actual public selected-route
@@ -53,7 +57,11 @@ func migrationPartitionComponentNil(component any) bool {
 	switch v.Kind() {
 	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
 		return v.IsNil()
-	default:
+	case reflect.Invalid, reflect.Bool, reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64,
+		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64, reflect.Uintptr,
+		reflect.Float32, reflect.Float64, reflect.Complex64, reflect.Complex128, reflect.Array,
+		reflect.String, reflect.Struct, reflect.UnsafePointer:
 		return false
 	}
+	return false
 }

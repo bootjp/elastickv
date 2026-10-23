@@ -21,30 +21,6 @@ func migrationServingFloor(states []store.MigrationOwnershipState) uint64 {
 	return floor
 }
 
-// Partially covered or partially superseded requests retry as one request.
-// An uncovered portion must not acquire a fabricated floor-zero proof.
-func migrationServingCertificate(states []store.MigrationOwnershipState, start, end []byte) (store.MigrationOwnershipState, bool, error) {
-	var selected store.MigrationOwnershipState
-	var intersects bool
-	for _, state := range states {
-		if !routeRangeIntersects(start, end, state.RouteStart, state.RouteEnd) {
-			continue
-		}
-		intersects = true
-		if state.CatalogVersion > selected.CatalogVersion {
-			selected = state
-		}
-	}
-	if !intersects {
-		return selected, false, nil
-	}
-	if bytes.Compare(selected.RouteStart, start) > 0 ||
-		(len(selected.RouteEnd) > 0 && (end == nil || bytes.Compare(end, selected.RouteEnd) > 0)) {
-		return selected, true, errors.WithStack(ErrRouteCutoverPending)
-	}
-	return selected, true, nil
-}
-
 func readMigrationServingState(ctx context.Context, st store.MVCCStore) (store.MigrationServingState, error) {
 	if reader, ok := st.(store.MigrationServingAdmissionReader); ok {
 		view, err := reader.MigrationServingAdmissionState(ctx)
@@ -151,8 +127,7 @@ func (s *ShardStore) verifyMigrationAdmissionOwnerRoutes(proof migrationAdmissio
 	routes, _, _ := s.readinessProofRoutes(route, start, end)
 	cursor := start
 	for _, candidate := range routes {
-		if bytes.Compare(candidate.Start, cursor) > 0 || routeHasStagedVisibility(candidate) != proof.Staged ||
-			(proof.Staged && candidate.MigrationJobID != proof.JobID) {
+		if !migrationAdmissionRouteMatches(proof, candidate, cursor) {
 			return errors.WithStack(ErrRouteCutoverPending)
 		}
 		if len(candidate.End) == 0 || (len(end) != 0 && bytes.Compare(candidate.End, end) >= 0) {
@@ -161,6 +136,11 @@ func (s *ShardStore) verifyMigrationAdmissionOwnerRoutes(proof migrationAdmissio
 		cursor = candidate.End
 	}
 	return errors.WithStack(ErrRouteCutoverPending)
+}
+
+func migrationAdmissionRouteMatches(proof migrationAdmissionProof, route distribution.Route, cursor []byte) bool {
+	return bytes.Compare(route.Start, cursor) <= 0 && routeHasStagedVisibility(route) == proof.Staged &&
+		(!proof.Staged || route.MigrationJobID == proof.JobID)
 }
 
 func (s *ShardStore) verifyMigrationServingOwnerRoutes(proof store.MigrationOwnershipState, route distribution.Route, start, end []byte) error {
@@ -204,30 +184,6 @@ func migrationPrimaryParticipates(req *pb.Request, primary []byte) bool {
 		}
 	}
 	return false
-}
-
-func migrationApplyOwnershipProofs(states []store.MigrationOwnershipState, ranges []migrationApplyRange, groupID, version uint64) ([]store.MigrationOwnershipState, error) {
-	proofs := make([]store.MigrationOwnershipState, 0, len(ranges))
-	var uncovered bool
-	for _, r := range ranges {
-		rangeProofs, err := migrationApplyRangeProofs(states, r, groupID, version)
-		if err != nil {
-			return nil, err
-		}
-		if len(rangeProofs) == 0 {
-			uncovered = true
-			continue
-		}
-		proofs = append(proofs, rangeProofs...)
-	}
-	if uncovered && len(proofs) > 0 {
-		return nil, errors.WithStack(ErrRouteCutoverPending)
-	}
-	return proofs, nil
-}
-
-func migrationOwnershipHistory(proofs []store.MigrationOwnershipState, version uint64) (RouteHistory, error) {
-	return migrationAdmissionHistory(migrationAdmissionProofs(store.MigrationServingState{Ownership: proofs}), version)
 }
 
 func migrationAdmissionHistory(proofs []migrationAdmissionProof, version uint64) (RouteHistory, error) {

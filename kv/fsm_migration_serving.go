@@ -136,9 +136,17 @@ func migrationAdmissionGuardMatches(proof migrationAdmissionProof, guard store.T
 		return false
 	}
 	if guard.TrackWrites {
-		return configuration != 0 && proof.ConfigurationIndex == configuration && !proof.Staged &&
-			guard.RetentionPinTS != 0 && proof.SourceTrackerVersion != 0 && proof.SourceTrackerVersion == guard.ExpectedCutoverVersion
+		return migrationAdmissionSourceGuardMatches(proof, guard, configuration)
 	}
+	return migrationAdmissionTargetGuardMatches(proof, guard)
+}
+
+func migrationAdmissionSourceGuardMatches(proof migrationAdmissionProof, guard store.TargetStagedReadinessState, configuration uint64) bool {
+	return configuration != 0 && proof.ConfigurationIndex == configuration && !proof.Staged &&
+		guard.RetentionPinTS != 0 && proof.SourceTrackerVersion != 0 && proof.SourceTrackerVersion == guard.ExpectedCutoverVersion
+}
+
+func migrationAdmissionTargetGuardMatches(proof migrationAdmissionProof, guard store.TargetStagedReadinessState) bool {
 	if !proof.Staged || proof.MinWriteTSExclusive != guard.MinWriteTSExclusive {
 		return false
 	}
