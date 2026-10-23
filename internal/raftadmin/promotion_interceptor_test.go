@@ -69,6 +69,7 @@ func TestPromotionInterceptorRejectsMissingAddressOrPendingConfiguration(t *test
 			}
 			if name == "pending-configuration" {
 				engine.status.PendingConfChange = true
+				engine.config.Servers = []raftengine.Server{{ID: "candidate", Address: "candidate:50051", Suffrage: "learner"}}
 			}
 			hook := &promotionInterceptor{promote: func(context.Context, string, string) error {
 				t.Fatal("invalid configuration must not reach the capability probe")
@@ -81,4 +82,16 @@ func TestPromotionInterceptorRejectsMissingAddressOrPendingConfiguration(t *test
 			require.Empty(t, engine.promoteLearnerCalls)
 		})
 	}
+}
+
+func TestPromotionPreservesAddOnlyInterceptor(t *testing.T) {
+	t.Parallel()
+	engine := &fakeEngine{}
+	hook := &recordingInterceptor{retErr: context.DeadlineExceeded}
+	server := NewServerWithInterceptor(engine, hook)
+	resp, err := server.PromoteLearner(t.Context(), &pb.RaftAdminPromoteLearnerRequest{Id: "candidate", MinAppliedIndex: 99})
+	require.NoError(t, err)
+	require.Equal(t, uint64(44), resp.GetIndex())
+	require.Len(t, engine.promoteLearnerCalls, 1)
+	require.Empty(t, hook.calls, "legacy registration hooks must not run on promotion")
 }
