@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net"
@@ -22,7 +23,10 @@ import (
 	"google.golang.org/grpc"
 )
 
-const quorumAcceptanceGroup = uint64(7)
+const (
+	quorumAcceptanceGroup          = uint64(7)
+	quorumAcceptanceCatalogVersion = uint64(4)
+)
 
 // Real data-group elections, WAL, transport, ConfChanges and native snapshots.
 // Internal handlers are called directly; this is NOT peer-auth/TLS acceptance.
@@ -301,9 +305,48 @@ func quorumAcceptanceAcquire(t *testing.T, ctx context.Context, n *quorumAccepta
 		RequireConfigurationIndex: true, ExpectedConfigurationIndex: epoch,
 		Ownership: &pb.MigrationOwnershipProof{Generation: "0123456789abcdef0123456789abcdef", LocalGroupId: quorumAcceptanceGroup, OwnerGroupId: quorumAcceptanceGroup,
 			CatalogVersion: version, RouteId: route.RouteID, ParentRouteId: route.ParentRouteID, RouteStart: []byte(start), RouteEnd: route.End,
-			WriteFloorKnown: true, SourceTrackerVersion: version, DescriptorHash: hash, Role: pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_OWNER}})
+			MinWriteTsExclusive: route.MinWriteTSExclusive, WriteFloorKnown: true, SourceTrackerVersion: version, DescriptorHash: hash, Role: pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_OWNER}})
 	require.NoError(t, err)
 	return control
+}
+
+func (c *quorumAcceptanceCluster) completeInitialOwner(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode, epoch uint64, route distribution.RouteDescriptor) {
+	t.Helper()
+	quorumAcceptanceAcquire(t, ctx, leader, 11, epoch, 1, route, "a")
+	hash, err := distribution.OwnershipPartitionDescriptorHash(route)
+	require.NoError(t, err)
+	// The authoritative root stub has committed the unchanged-owner rollback
+	// at V2. Retire the SOURCE tracker atomically with its terminal OWNER proof;
+	// leaving it armed would model an invalid pair of overlapping live jobs.
+	proof := &pb.MigrationOwnershipProof{Generation: "0123456789abcdef0123456789abcdef", LocalGroupId: quorumAcceptanceGroup, OwnerGroupId: quorumAcceptanceGroup,
+		CatalogVersion: 2, RouteId: route.RouteID, RouteStart: route.Start, RouteEnd: route.End, MinWriteTsExclusive: route.MinWriteTSExclusive,
+		WriteFloorKnown: true, DescriptorHash: hash, Role: pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_OWNER}
+	_, err = leader.client.CleanupMigration(ctx, &pb.CleanupMigrationRequest{JobId: 11, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR,
+		RequireConfigurationIndex: true, ExpectedConfigurationIndex: epoch, Ownership: proof})
+	require.NoError(t, err)
+	quorumAcceptanceEventually(t, func() error {
+		for _, n := range c.nodes[:3] {
+			ack, err := n.client.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{JobId: 11, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED,
+				RequireConfigurationIndex: true, ExpectedConfigurationIndex: epoch, Ownership: proof})
+			if err != nil {
+				return err
+			}
+			if !ack.GetReady() || !ack.GetOwnershipCleared() || ack.GetAppliedConfigurationIndex() != epoch {
+				return errors.New("completed initial owner is not ACKed by every actual voter")
+			}
+		}
+		return nil
+	})
+	for _, n := range c.nodes[:3] {
+		reader, ok := n.store.(store.MigrationOwnershipStore)
+		require.True(t, ok)
+		view, err := reader.MigrationServingState(ctx)
+		require.NoError(t, err)
+		require.Empty(t, view.Readiness, "native ownership clear must remove the old guard, not raw fixture cleanup")
+		require.Len(t, view.Ownership, 1)
+		require.True(t, store.MigrationOwnershipEvidenceValid(view.Ownership[0]))
+		require.Zero(t, view.Ownership[0].SourceTrackerVersion)
+	}
 }
 
 func TestMigrationQuorumPartitionAcceptance(t *testing.T) {
@@ -320,28 +363,28 @@ func TestMigrationQuorumPartitionAcceptance(t *testing.T) {
 	require.Zero(t, leader.mode8.Load(), "unsupported member must prevent namespace proposal")
 	c.nodes[2].namespace.Store(true)
 	quorumAcceptanceEventually(t, func() error { return EnsureMigrationNamespaceAdmission(ctx, leader.client, members) })
-	parent := distribution.RouteDescriptor{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: quorumAcceptanceGroup}
-	quorumAcceptanceAcquire(t, ctx, leader, 11, epoch, 1, parent, "a")
+	parent := distribution.RouteDescriptor{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: quorumAcceptanceGroup, MinWriteTSExclusive: 1}
+	c.completeInitialOwner(t, ctx, leader, epoch, parent)
 	left, right := parent, parent
 	left.RouteID, left.ParentRouteID, left.End = 2, 1, []byte("m")
 	right.RouteID, right.ParentRouteID, right.Start = 3, 1, []byte("m")
 	left.SplitAtHLC, right.SplitAtHLC = 1, 1
-	root := quorumAcceptanceRoot{manifest: distribution.OwnershipPartitionManifest{PreviousVersion: 1, Version: 2, Parent: parent, Children: []distribution.RouteDescriptor{left, right}}}
+	root := quorumAcceptanceRoot{manifest: distribution.OwnershipPartitionManifest{PreviousVersion: 2, Version: 3, Parent: parent, Children: []distribution.RouteDescriptor{left, right}}}
 	consumer := c.consumer(t, leader, root)
 	c.nodes[2].partition.Store(false)
 	require.Error(t, consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup))
 	require.Zero(t, leader.mode7.Load(), "field10=0 must prevent partition proposal despite real voter quorum")
 	c.nodes[2].partition.Store(true)
 	quorumAcceptanceEventually(t, func() error { return consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup) })
-	_, err = leader.tx.Commit(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_PREPARE, 2)})
+	_, err = leader.tx.Commit(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_PREPARE, 3)})
 	require.NoError(t, err, "retained-left PREPARE precedes the later split, learner join and restart")
 	kept, moving := right, right
 	kept.RouteID, kept.ParentRouteID, kept.End, kept.SplitAtHLC = 4, 3, []byte("t"), 2
 	moving.RouteID, moving.ParentRouteID, moving.Start, moving.SplitAtHLC = 5, 3, []byte("t"), 2
-	root.later = &distribution.OwnershipPartitionManifest{PreviousVersion: 2, Version: 3, Parent: right, Children: []distribution.RouteDescriptor{kept, moving}}
+	root.later = &distribution.OwnershipPartitionManifest{PreviousVersion: 3, Version: quorumAcceptanceCatalogVersion, Parent: right, Children: []distribution.RouteDescriptor{kept, moving}}
 	consumer = c.consumer(t, leader, root)
 	quorumAcceptanceEventually(t, func() error { return consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup) })
-	control := quorumAcceptanceAcquire(t, ctx, leader, 12, epoch, 3, moving, "t")
+	control := quorumAcceptanceAcquire(t, ctx, leader, 12, epoch, quorumAcceptanceCatalogVersion, moving, "t")
 	job := distribution.SplitJob{JobID: 12, SourceRouteID: 5, SplitKey: []byte("t")}
 	c.nodes[2].size.Store(false)
 	_, err = consumer.ensureSplitJobTransferControl(ctx, job, quorumAcceptanceGroup, leader.client, control, nil)
@@ -487,19 +530,38 @@ func (c *quorumAcceptanceCluster) checkReplicas(t *testing.T, ctx context.Contex
 		require.Equal(t, uint32(1), response.GetOwnershipPartitionProtocol())
 		require.Equal(t, uint32(1), response.GetNamespaceAdmissionVersion())
 		guard := &pb.ProbeMigrationStateRequest{JobId: 12, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED,
-			RouteStart: []byte("t"), RouteEnd: []byte("z"), ExpectedCatalogVersion: 3, MigrationJobId: 12,
+			RouteStart: []byte("t"), RouteEnd: []byte("z"), ExpectedCatalogVersion: quorumAcceptanceCatalogVersion, MigrationJobId: 12,
 			MinWriteTsExclusive: 1, RetentionPinTs: 1, TrackWrites: true, TransferSizeGuardVersion: 1,
 			RequireConfigurationIndex: true, ExpectedConfigurationIndex: epoch}
 		response, err = n.client.ProbeMigrationState(ctx, guard)
 		require.NoError(t, err)
 		require.True(t, response.GetReady())
 		require.Equal(t, epoch, response.GetAppliedConfigurationIndex())
+		// Advisory admission checks ownership, not the encoded-row size verdict.
+		// The public leader commits below exercise the real FSM's typed guard.
+		require.NoError(t, kv.CheckMigrationRequest(ctx, n.store, quorumAcceptanceGroup, quorumAcceptanceWriteRequest("u", []byte("moving-small"), 101)),
+			"every configured member must restore coherent moving-range ownership admission")
+		require.NoError(t, kv.CheckMigrationRequest(ctx, n.store, quorumAcceptanceGroup, quorumAcceptanceWriteRequest("b", []byte("left"), 110)))
+		guards, ok := n.store.(store.MigrationTargetReadinessReader)
+		require.True(t, ok)
+		states, err := guards.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Len(t, states, 1, "completed job11 must not remain a live overlapping SOURCE guard")
+		require.Equal(t, uint64(12), states[0].JobID)
+		require.Equal(t, uint32(1), states[0].TransferSizeGuardVersion)
 	}
 }
 
-func quorumAcceptanceWrite(ctx context.Context, n *quorumAcceptanceNode, key string, value []byte, timestamp uint64) error {
-	_, err := n.tx.Commit(ctx, []*pb.Request{{Ts: timestamp, ObservedRouteVersion: kv.EncodeObservedRouteVersion(3), Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte(key), Value: value}}}})
-	return err
+func quorumAcceptanceWriteRequest(key string, value []byte, timestamp uint64) *pb.Request {
+	return &pb.Request{Ts: timestamp, ObservedRouteVersion: kv.EncodeObservedRouteVersion(quorumAcceptanceCatalogVersion), Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte(key), Value: value}}}
+}
+
+func quorumAcceptanceWrite(ctx context.Context, n *quorumAcceptanceNode, key string, value []byte, timestamp uint64) (uint64, error) {
+	response, err := n.tx.Commit(ctx, []*pb.Request{quorumAcceptanceWriteRequest(key, value, timestamp)})
+	if err != nil {
+		return 0, err
+	}
+	return response.CommitIndex, nil
 }
 
 func quorumAcceptancePrepare(phase pb.Phase, version uint64) *pb.Request {
@@ -512,16 +574,17 @@ func quorumAcceptancePrepare(phase pb.Phase, version uint64) *pb.Request {
 func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode, root quorumAcceptanceRoot, epoch uint64) {
 	t.Helper()
 	large := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
-	// Current new-source acquisition leaves an equal-C legacy job beside the
-	// active partition. Public creation correctly fails closed as ambiguous;
-	// this is NOT evidence of the guard's typed oversize verdict or successful
-	// moving-range write availability. The full production gate stays closed.
-	require.ErrorIs(t, quorumAcceptanceWrite(ctx, leader, "u", large, 100), kv.ErrRouteCutoverPending)
-	t.Log("moving-source equal-catalog overlap fails closed; typed size rejection is NOT established; production gate remains closed")
-	require.NoError(t, quorumAcceptanceWrite(ctx, leader, "b", large, 110), "retained-left writes keep the global size contract")
+	_, err := quorumAcceptanceWrite(ctx, leader, "u", large, 100)
+	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
+	_, err = quorumAcceptanceWrite(ctx, leader, "u", []byte("moving-small"), 101)
+	require.NoError(t, err, "moving-range creation must remain available below the transfer budget")
+	target, err := quorumAcceptanceWrite(ctx, leader, "b", large, 110)
+	require.NoError(t, err, "retained-left writes keep the global size contract")
+	require.Positive(t, target)
+	t.Logf("retained write ACK index %d; cached status applied %d; current applied %d", target, leader.engine.Status().AppliedIndex, leader.engine.AppliedIndex())
 	// All members, including the learner, must have an actual persisted native
-	// snapshot newer than the guard/partition controls and prepared intent.
-	target := leader.engine.Status().AppliedIndex
+	// snapshot covering the ACKed write itself. Status() is a periodically
+	// refreshed diagnostic and can lag the proposal's returned CommitIndex.
 	require.Eventually(t, func() bool {
 		for _, n := range c.nodes {
 			if n.engine.Status().LastSnapshotIndex < target {
@@ -530,7 +593,7 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.C
 		}
 		return true
 	}, 5*time.Second, 20*time.Millisecond)
-	t.Logf("all four members persisted native snapshots at or above applied index %d", target)
+	t.Logf("all four members persisted native snapshots covering ACKed write index %d", target)
 	for _, n := range c.nodes {
 		n.tx.Close()
 		n.tx = nil
@@ -544,19 +607,33 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.C
 	}
 	leader = c.leader(t)
 	require.Equal(t, epoch, c.waitConfiguration(t, 4))
+	// Election reports leadership, not completion of a linearizable data read.
+	readIndex, err := leader.engine.LinearizableRead(ctx)
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, readIndex, target)
+	require.GreaterOrEqual(t, leader.engine.AppliedIndex(), readIndex)
 	c.checkReplicas(t, ctx, epoch)
+	for _, n := range c.nodes {
+		value, err := n.store.GetAt(ctx, []byte("b"), 1000)
+		require.NoError(t, err, "every voter and learner must restore the ACKed retained-left value")
+		require.True(t, bytes.Equal(large, value))
+	}
 	mirror := distribution.NewEngine()
 	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: root.version(), Routes: root.routes()}))
 	reader := kv.NewShardStore(mirror, map[uint64]*kv.ShardGroup{quorumAcceptanceGroup: {Store: leader.store, Engine: leader.engine, Txn: leader.tx}})
 	value, err := reader.GetGroupAt(ctx, quorumAcceptanceGroup, []byte("b"), 1000)
 	require.NoError(t, err)
-	require.Len(t, value, len(large))
-	_, err = leader.tx.Commit(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_COMMIT, 3)})
+	require.True(t, bytes.Equal(large, value), "native restart must restore the ACKed retained-left value")
+	_, err = quorumAcceptanceWrite(ctx, leader, "u", large, 100)
+	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
+	t.Log("typed moving-range size rejection and unrestricted retained-left oversized data survive native restart on all four members")
+	_, err = leader.tx.Commit(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_COMMIT, quorumAcceptanceCatalogVersion)})
 	require.NoError(t, err, "native snapshot must retain PREPARE resolution evidence")
 	value, err = reader.GetGroupAt(ctx, quorumAcceptanceGroup, []byte("c"), 1000)
 	require.NoError(t, err)
 	require.Equal(t, []byte("prepared-left"), value)
-	require.NoError(t, quorumAcceptanceWrite(ctx, leader, "d", []byte("left-after-restart"), 1000))
+	_, err = quorumAcceptanceWrite(ctx, leader, "d", []byte("left-after-restart"), 1000)
+	require.NoError(t, err)
 	consumer := c.consumer(t, leader, root)
 	quorumAcceptanceEventually(t, func() error { return consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup) })
 	c.checkNoQuorum(t, ctx, leader)
@@ -576,7 +653,8 @@ func (c *quorumAcceptanceCluster) checkNoQuorum(t *testing.T, ctx context.Contex
 	}
 	attempt, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
-	require.Error(t, quorumAcceptanceWrite(attempt, leader, "e", []byte("must-not-commit"), 1100))
-	_, err := leader.store.GetAt(ctx, []byte("e"), 2000)
+	_, err := quorumAcceptanceWrite(attempt, leader, "e", []byte("must-not-commit"), 1100)
+	require.Error(t, err)
+	_, err = leader.store.GetAt(ctx, []byte("e"), 2000)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }
