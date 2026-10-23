@@ -53,7 +53,7 @@ jobs:
       - name: Install netcat, graphviz and fuse3
         # fuse3 provides fusermount3 for the --filesystemMount nodes used by
         # the filesystem Jepsen workload.
-        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3 sqlite3
       - name: Install Leiningen
         run: |
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
@@ -369,6 +369,15 @@ jobs:
             echo "FAILED modes: ${FAILED[*]}"
             exit 1
           fi
+      - name: Run SQLite Jepsen workload on FUSE
+        working-directory: jepsen
+        timeout-minutes: 12
+        run: |
+          timeout 600 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit ${{ inputs.time-limit || '150' }} \
+            --rate ${{ inputs.rate || '10' }} \
+            --concurrency 8 --key-count 16 --max-writes-per-key 64 \
+            --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
       - name: Upload Jepsen store on failure
         if: failure()
         uses: actions/upload-artifact@v7
