@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"net"
 	"sync"
 	"sync/atomic"
@@ -20,7 +21,11 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 const (
@@ -46,6 +51,8 @@ type quorumAcceptanceNode struct {
 	client                     *quorumAcceptanceClient
 	namespace, partition, size atomic.Bool
 	mode7, mode8, guards       atomic.Uint64
+	writeFences, timestamps    atomic.Uint64
+	exports                    []*pb.ExportRangeVersionsRequest
 }
 
 type quorumAcceptanceClient struct {
@@ -71,7 +78,39 @@ func (c *quorumAcceptanceClient) ApplyTargetStagedReadiness(ctx context.Context,
 	if req.GetTransferSizeGuardVersion() != 0 {
 		c.node.guards.Add(1)
 	}
+	if req.GetSourceWriteFence() {
+		c.node.writeFences.Add(1)
+	}
 	return c.node.internal.ApplyTargetStagedReadiness(ctx, req)
+}
+
+func (c *quorumAcceptanceClient) ProbeMigrationLocks(ctx context.Context, req *pb.ProbeMigrationLocksRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationLocksResponse, error) {
+	return c.node.internal.ProbeMigrationLocks(ctx, req)
+}
+
+func (c *quorumAcceptanceClient) IssueMigrationTimestamp(ctx context.Context, req *pb.IssueMigrationTimestampRequest, _ ...grpc.CallOption) (*pb.IssueMigrationTimestampResponse, error) {
+	c.node.timestamps.Add(1)
+	return c.node.internal.IssueMigrationTimestamp(ctx, req)
+}
+
+func (c *quorumAcceptanceClient) ExportRangeVersions(ctx context.Context, req *pb.ExportRangeVersionsRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error) {
+	c.node.exports = append(c.node.exports, proto.CloneOf(req))
+	capture := &captureExportRangeVersionsStream{ctx: ctx}
+	err := c.node.internal.ExportRangeVersions(req, capture)
+	return &quorumAcceptanceExportStream{splitMigrationStreamStub: &splitMigrationStreamStub{responses: capture.responses}, terminal: err}, nil
+}
+
+type quorumAcceptanceExportStream struct {
+	*splitMigrationStreamStub
+	terminal error
+}
+
+func (s *quorumAcceptanceExportStream) Recv() (*pb.ExportRangeVersionsResponse, error) {
+	response, err := s.splitMigrationStreamStub.Recv()
+	if errors.Is(err, io.EOF) && s.terminal != nil {
+		return nil, s.terminal
+	}
+	return response, err
 }
 
 type quorumAcceptanceCluster struct{ nodes []*quorumAcceptanceNode }
@@ -187,7 +226,10 @@ func (c *quorumAcceptanceCluster) waitConfiguration(t *testing.T, count int) uin
 	return epoch
 }
 
-func (c *quorumAcceptanceCluster) members(ctx context.Context, _ uint64) ([]SplitMigrationVoter, error) {
+func (c *quorumAcceptanceCluster) members(ctx context.Context, groupID uint64) ([]SplitMigrationVoter, error) {
+	if groupID != quorumAcceptanceGroup {
+		return nil, errors.New("quorum fixture has no runtime for the requested group")
+	}
 	var engine *etcdraft.Engine
 	for _, n := range c.nodes {
 		if n.engine != nil && n.engine.State() == raftengine.StateLeader {
@@ -204,16 +246,22 @@ func (c *quorumAcceptanceCluster) members(ctx context.Context, _ uint64) ([]Spli
 	}
 	var members []SplitMigrationVoter
 	for _, configured := range cfg.Servers {
-		for _, n := range c.nodes {
-			if configured.ID == n.peer.ID {
-				members = append(members, SplitMigrationVoter{ID: n.peer.ID, Address: n.peer.Address, Client: n.client})
-			}
+		member, err := c.configuredMember(configured.ID)
+		if err != nil {
+			return nil, err
 		}
-	}
-	if len(members) != len(cfg.Servers) {
-		return nil, errors.New("configured apply member missing from real cluster")
+		members = append(members, member)
 	}
 	return members, nil
+}
+
+func (c *quorumAcceptanceCluster) configuredMember(id string) (SplitMigrationVoter, error) {
+	for _, n := range c.nodes {
+		if n.peer.ID == id {
+			return SplitMigrationVoter{ID: n.peer.ID, Address: n.peer.Address, Client: n.client}, nil
+		}
+	}
+	return SplitMigrationVoter{}, errors.New("configured apply member missing from real cluster")
 }
 
 // The stub models a committed immutable root manifest and current descriptors.
@@ -273,7 +321,12 @@ func (c *quorumAcceptanceCluster) consumer(t *testing.T, leader *quorumAcceptanc
 	mirror := distribution.NewEngine()
 	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: root.version(), Routes: root.routes()}))
 	groups := map[uint64]*kv.ShardGroup{quorumAcceptanceGroup: {Store: leader.store, Txn: leader.tx, Engine: leader.engine}}
-	return NewDistributionServer(mirror, nil, WithSplitMigrationGroupClientFactory(func(context.Context, uint64) (SplitMigrationClient, error) { return leader.client, nil }),
+	return NewDistributionServer(mirror, nil, WithSplitMigrationGroupClientFactory(func(_ context.Context, groupID uint64) (SplitMigrationClient, error) {
+		if groupID != quorumAcceptanceGroup {
+			return nil, errors.New("quorum fixture has no client for the requested group")
+		}
+		return leader.client, nil
+	}),
 		WithSplitMigrationVoterFactory(c.members), WithMigrationOwnershipRefresh(groups, func(context.Context) (MigrationOwnershipAttestor, error) { return root, nil }),
 		WithMigrationPartitionRuntime(kv.NewShardStore(mirror, groups), c.members),
 		WithSplitMigrationApplyMemberSnapshotFactory(func(ctx context.Context, groupID uint64) (SplitMigrationApplyMemberSnapshot, error) {
@@ -657,4 +710,175 @@ func (c *quorumAcceptanceCluster) checkNoQuorum(t *testing.T, ctx context.Contex
 	require.Error(t, err)
 	_, err = leader.store.GetAt(ctx, []byte("e"), 2000)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+func TestMigrationQuorumPreparedDrainAndHistoricalPreflight(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	defer cancel()
+	c := newQuorumAcceptanceCluster(t, ctx)
+	leader := c.leader(t)
+	epoch := c.waitConfiguration(t, 3)
+	members, err := c.members(ctx, quorumAcceptanceGroup)
+	require.NoError(t, err)
+	quorumAcceptanceEventually(t, func() error { return EnsureMigrationNamespaceAdmission(ctx, leader.client, members) })
+	consumer, root := c.partitionedSourceForDrain(t, ctx, leader, epoch)
+	moving := root.later.Children[1]
+	control := quorumAcceptanceAcquire(t, ctx, leader, 12, epoch, quorumAcceptanceCatalogVersion, moving, "t")
+	large := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
+	for _, key := range []string{"u", "w"} {
+		prepare := quorumAcceptanceDrainRequest(pb.Phase_PREPARE, key, large)
+		require.Less(t, proto.Size(prepare), internalutil.GRPCMaxMessageBytes, "legacy PREPARE fits the unchanged 64 MiB transport limit")
+		_, err = leader.tx.Commit(ctx, []*pb.Request{prepare})
+		require.NoError(t, err, "oversized PREPARE predates transfer-size activation")
+	}
+	locks, err := leader.client.ProbeMigrationLocks(ctx, &pb.ProbeMigrationLocksRequest{RouteStart: moving.Start, RouteEnd: moving.End, Limit: 10})
+	require.NoError(t, err)
+	require.Equal(t, uint32(2), locks.GetPendingCount())
+	job := distribution.SplitJob{JobID: 12, SourceRouteID: 5, SplitKey: []byte("t")}
+	var witness *splitTransferAdmissionWitness
+	quorumAcceptanceEventually(t, func() error {
+		witness, err = consumer.ensureSplitJobTransferControl(ctx, job, quorumAcceptanceGroup, leader.client, control, nil)
+		return err
+	})
+	require.NoError(t, consumer.revalidateSplitTransferAdmission(ctx, witness))
+	for _, resolution := range []struct {
+		phase pb.Phase
+		key   string
+	}{{pb.Phase_COMMIT, "u"}, {pb.Phase_ABORT, "w"}} {
+		// No replacement value is sent: COMMIT must use authenticated bytes
+		// from the oversized old intent, not admit a new oversized creation.
+		_, err = leader.tx.Commit(ctx, []*pb.Request{quorumAcceptanceDrainRequest(resolution.phase, resolution.key, nil)})
+		require.NoError(t, err, "existing oversized PREPARE must drain after guard activation")
+	}
+	locks, err = leader.client.ProbeMigrationLocks(ctx, &pb.ProbeMigrationLocksRequest{RouteStart: moving.Start, RouteEnd: moving.End, Limit: 10})
+	require.NoError(t, err)
+	require.Zero(t, locks.GetPendingCount())
+	committed, err := leader.store.GetAt(ctx, []byte("u"), 60)
+	require.NoError(t, err)
+	require.True(t, bytes.Equal(large, committed))
+	_, err = leader.store.GetAt(ctx, []byte("w"), 1000)
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "ABORT must not publish its prepared oversized value")
+	index, err := quorumAcceptanceWrite(ctx, leader, "u", []byte("small latest"), 90)
+	require.NoError(t, err)
+	require.Eventually(t, func() bool {
+		for _, n := range c.nodes[:3] {
+			if n.engine.AppliedIndex() < index {
+				return false
+			}
+		}
+		return true
+	}, 5*time.Second, 20*time.Millisecond)
+	c.historicalPreflightBeforeFence(t, ctx, leader, consumer, root, large)
+}
+
+func quorumAcceptanceDrainRequest(phase pb.Phase, key string, value []byte) *pb.Request {
+	return &pb.Request{Ts: 50, IsTxn: true, Phase: phase, ObservedRouteVersion: kv.EncodeObservedRouteVersion(quorumAcceptanceCatalogVersion), Mutations: []*pb.Mutation{
+		{Op: pb.Op_PUT, Key: []byte(kv.TxnMetaPrefix), Value: kv.EncodeTxnMeta(kv.TxnMeta{PrimaryKey: []byte(key), CommitTS: 60, LockTTLms: 60000})},
+		{Op: pb.Op_PUT, Key: []byte(key), Value: value},
+	}}
+}
+
+func (c *quorumAcceptanceCluster) partitionedSourceForDrain(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode, epoch uint64) (*DistributionServer, quorumAcceptanceRoot) {
+	t.Helper()
+	parent := distribution.RouteDescriptor{RouteID: 1, Start: []byte("a"), End: []byte("z"), GroupID: quorumAcceptanceGroup, MinWriteTSExclusive: 1}
+	c.completeInitialOwner(t, ctx, leader, epoch, parent)
+	left, right := parent, parent
+	left.RouteID, left.ParentRouteID, left.End, left.SplitAtHLC = 2, 1, []byte("m"), 1
+	right.RouteID, right.ParentRouteID, right.Start, right.SplitAtHLC = 3, 1, []byte("m"), 1
+	root := quorumAcceptanceRoot{manifest: distribution.OwnershipPartitionManifest{PreviousVersion: 2, Version: 3, Parent: parent, Children: []distribution.RouteDescriptor{left, right}}}
+	consumer := c.consumer(t, leader, root)
+	quorumAcceptanceEventually(t, func() error { return consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup) })
+	kept, moving := right, right
+	kept.RouteID, kept.ParentRouteID, kept.End, kept.SplitAtHLC = 4, 3, []byte("t"), 2
+	moving.RouteID, moving.ParentRouteID, moving.Start, moving.SplitAtHLC = 5, 3, []byte("t"), 2
+	root.later = &distribution.OwnershipPartitionManifest{PreviousVersion: 3, Version: quorumAcceptanceCatalogVersion, Parent: right, Children: []distribution.RouteDescriptor{kept, moving}}
+	consumer = c.consumer(t, leader, root)
+	quorumAcceptanceEventually(t, func() error { return consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup) })
+	return consumer, root
+}
+
+func (c *quorumAcceptanceCluster) historicalPreflightBeforeFence(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode, consumer *DistributionServer, root quorumAcceptanceRoot, large []byte) {
+	t.Helper()
+	// Only root metadata uses the explicit catalog/coordinator stub. Every
+	// data-group request, control, timestamp, export and verdict remains real.
+	metadata := store.NewMVCCStore()
+	t.Cleanup(func() { require.NoError(t, metadata.Close()) })
+	catalog := distribution.NewCatalogStore(metadata, distribution.WithCatalogRouteDescriptorV2Writes(true))
+	var version uint64
+	for _, routes := range [][]distribution.RouteDescriptor{{root.manifest.Parent}, {root.manifest.Parent}, root.manifest.Children, root.routes()} {
+		snapshot, err := catalog.Save(ctx, version, routes)
+		require.NoError(t, err)
+		version = snapshot.Version
+	}
+	require.Equal(t, quorumAcceptanceCatalogVersion, version)
+	job, err := distribution.InitializeSplitJobPlan(distribution.SplitJob{JobID: 12, SourceRouteID: 3, SplitKey: []byte("t"), TargetGroupID: 9}, root.later.Parent, 1000)
+	require.NoError(t, err)
+	job.WorkingSourceRouteID, job.SnapshotTS, job.Phase = 5, 40, distribution.SplitJobPhaseFence
+	job.WriteTrackerArmed, job.SourceRetentionPinTS = true, 1
+	job.Cursor = []byte("saved-copy-progress")
+	require.NoError(t, catalog.CreateSplitJob(ctx, job))
+	consumer.catalog, consumer.coordinator = catalog, newDistributionCoordinatorStub(metadata, true)
+	_, err = consumer.splitMigrationGroupFactory(ctx, job.TargetGroupID)
+	require.Error(t, err, "a source-only fixture must never substitute its leader for a missing target group")
+	for range len(job.BracketProgress) + 3 {
+		// The whole runner additionally negotiates the target namespace. This
+		// source-only harness exercises the real preflight/fence phase and its
+		// compensation helper, not a fictitious cross-group runner acceptance.
+		err = consumer.finalizeSplitJobFence(ctx, job)
+		if errors.Is(err, errMigrationOversizedSourceVersion) {
+			require.NoError(t, consumer.abandonOversizedSplitTransfer(ctx, job, err))
+		}
+		job = loadTransferJob(t, ctx, catalog, job.JobID)
+		if job.Phase == distribution.SplitJobPhaseAbandoning {
+			break
+		}
+		require.NoError(t, err)
+	}
+	require.True(t, errors.Is(err, errMigrationOversizedSourceVersion), "only the authenticated structured source verdict authorizes compensation")
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	details := status.Convert(err).Details()
+	require.Len(t, details, 1)
+	info, ok := details[0].(*errdetails.ErrorInfo)
+	require.True(t, ok)
+	require.Equal(t, migrationTransferErrorDomain, info.GetDomain())
+	require.Equal(t, migrationOversizedVersionReason, info.GetReason())
+	require.Equal(t, "60", info.GetMetadata()["commit_ts"], "the rejected historical committed version predates the latest small value")
+	require.Equal(t, distribution.SplitJobPhaseAbandoning, job.Phase)
+	require.Equal(t, distribution.SplitJobPhaseFence, job.AbandonFromPhase)
+	require.False(t, job.TransferPreflightDone)
+	require.Positive(t, job.TransferPreflightProgress[0].AcceptedRows, "preserve the valid streamed page before the later historical error")
+	require.NotEmpty(t, job.TransferPreflightProgress[0].Cursor)
+	require.Positive(t, job.TransferPreflightTS)
+	require.Zero(t, job.FenceTS)
+	require.Equal(t, []byte("saved-copy-progress"), job.Cursor)
+	require.NotEmpty(t, job.LastError)
+	snapshot, err := catalog.Snapshot(ctx)
+	require.NoError(t, err)
+	require.Equal(t, quorumAcceptanceCatalogVersion, snapshot.Version)
+	require.Equal(t, root.routes(), snapshot.Routes, "historical oversize must be found before publishing a catalog write fence")
+	require.NotEmpty(t, leader.exports)
+	require.Positive(t, leader.timestamps.Load())
+	for _, request := range leader.exports {
+		require.Zero(t, request.GetMinCommitTs(), "preflight must include retained history, not only the latest small value")
+		require.Equal(t, job.TransferPreflightTS, request.GetMaxCommitTs())
+	}
+	for _, n := range c.nodes[:3] {
+		require.Zero(t, n.writeFences.Load(), "no source write-fence control may precede full-history preflight")
+		reader, ok := n.store.(store.MigrationTargetReadinessReader)
+		require.True(t, ok)
+		states, err := reader.MigrationTargetReadinessStates(ctx)
+		require.NoError(t, err)
+		require.Len(t, states, 1)
+		require.Equal(t, uint32(1), states[0].TransferSizeGuardVersion)
+		require.False(t, states[0].SourceWriteFence)
+		require.False(t, states[0].SourceReadFence)
+		historical, err := n.store.GetAt(ctx, []byte("u"), 60)
+		require.NoError(t, err)
+		require.True(t, bytes.Equal(large, historical), "every data replica must preserve the oversized pre-guard COMMIT")
+		_, err = n.store.GetAt(ctx, []byte("w"), 1000)
+		require.ErrorIs(t, err, store.ErrKeyNotFound, "every data replica must preserve the old PREPARE's ABORT")
+		latest, err := n.store.GetAt(ctx, []byte("u"), 1000)
+		require.NoError(t, err)
+		require.Equal(t, []byte("small latest"), latest)
+	}
 }
