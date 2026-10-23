@@ -1695,15 +1695,15 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 		errMu    sync.Mutex
 		wg       sync.WaitGroup
 	)
-	groups, err := c.allShardGroups()
+	participants, err := c.admitBroadcastRequests(ctx, requests)
 	if err != nil {
 		return nil, err
 	}
-	for _, g := range groups {
+	for _, participant := range participants {
 		wg.Add(1)
-		go func(g *ShardGroup) {
+		go func(participant admittedBroadcastParticipant) {
 			defer wg.Done()
-			r, err := g.Txn.Commit(ctx, requests)
+			r, err := participant.group.Txn.Commit(ctx, participant.requests)
 			if err != nil {
 				errMu.Lock()
 				if firstErr == nil {
@@ -1720,7 +1720,7 @@ func (c *ShardedCoordinator) broadcastToAllGroups(ctx context.Context, requests 
 					}
 				}
 			}
-		}(g)
+		}(participant)
 	}
 	wg.Wait()
 
