@@ -24,6 +24,72 @@ import (
 	"google.golang.org/protobuf/types/known/emptypb"
 )
 
+type splitRangeAuthRPCServer struct {
+	pb.UnimplementedDistributionServer
+}
+
+func (splitRangeAuthRPCServer) SplitRange(context.Context, *pb.SplitRangeRequest) (*pb.SplitRangeResponse, error) {
+	return &pb.SplitRangeResponse{CatalogVersion: 2}, nil
+}
+
+func (splitRangeAuthRPCServer) ListRoutes(context.Context, *pb.ListRoutesRequest) (*pb.ListRoutesResponse, error) {
+	return &pb.ListRoutesResponse{CatalogVersion: 1}, nil
+}
+
+func TestSplitRangeProductionAuthRequiresDedicatedTokenDuringSendFirst(t *testing.T) {
+	oldEnforced := *splitMigrationPeerAuthEnforced
+	*splitMigrationPeerAuthEnforced = false
+	t.Cleanup(func() { *splitMigrationPeerAuthEnforced = oldEnforced })
+	for _, env := range []string{adapter.MigrationImportOpcodeEnv, adapter.MigrationPromoteOpcodeEnv, adapter.MigrationCleanupOpcodeEnv} {
+		t.Setenv(env, "false")
+	}
+	cert, key := writeSelfSignedCert(t)
+	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
+	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
+	dir := t.TempDir()
+	for name, token := range map[string]string{"admin": "read-only-admin", "peer": "blob-peer", "migration": "migration-secret"} {
+		require.NoError(t, os.WriteFile(filepath.Join(dir, name), []byte(token), 0o600))
+	}
+	adminServer, auth, err := configureAdminService(filepath.Join(dir, "admin"), false, filepath.Join(dir, "peer"), filepath.Join(dir, "migration"),
+		false, adapter.NodeIdentity{}, nil, nil)
+	require.NoError(t, err)
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer(raftGRPCServerOptions(auth)...)
+	pb.RegisterDistributionServer(server, splitRangeAuthRPCServer{})
+	pb.RegisterAdminServer(server, adminServer)
+	serveResult := make(chan error, 1)
+	go func() { serveResult <- server.Serve(listener) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = listener.Close()
+		require.NoError(t, <-serveResult)
+	})
+	conn, err := grpc.NewClient(listener.Addr().String(), internalutil.GRPCDialOptions()...)
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, conn.Close()) })
+	client := pb.NewDistributionClient(conn)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	request := &pb.SplitRangeRequest{RouteId: 1, SplitKey: []byte("m"), ExpectedCatalogVersion: 1}
+	for _, credential := range []string{"", "Bearer read-only-admin", "Bearer blob-peer", "Bearer wrong"} {
+		callCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", credential))
+		_, err := client.SplitRange(callCtx, request)
+		require.Equal(t, codes.Unauthenticated, status.Code(err), credential)
+		_, err = client.ListRoutes(callCtx, &pb.ListRoutesRequest{})
+		require.NoError(t, err, "ordinary catalog reads remain public")
+	}
+	migrationCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer migration-secret"))
+	response, err := client.SplitRange(migrationCtx, request)
+	require.NoError(t, err, "operator split is authenticated independently of migration opcode flags")
+	require.EqualValues(t, 2, response.GetCatalogVersion())
+	adminCtx := metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer read-only-admin"))
+	_, err = pb.NewAdminClient(conn).GetNodeVersion(adminCtx, &pb.GetNodeVersionRequest{})
+	require.NoError(t, err)
+	_, err = pb.NewAdminClient(conn).GetNodeVersion(migrationCtx, &pb.GetNodeVersionRequest{})
+	require.Equal(t, codes.Unauthenticated, status.Code(err), "migration token must not gain unrelated Admin authority")
+}
+
 func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	oldEnforced := *splitMigrationPeerAuthEnforced
 	*splitMigrationPeerAuthEnforced = true

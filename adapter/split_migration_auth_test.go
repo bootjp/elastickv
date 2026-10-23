@@ -56,6 +56,7 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 	t.Parallel()
 	methods := []string{
 		pb.Internal_Forward_FullMethodName,
+		pb.Distribution_SplitRange_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
@@ -121,6 +122,7 @@ func TestSplitMigrationTokenAuthNoTokenRequiresExplicitOptIn(t *testing.T) {
 	unary, _ := SplitMigrationTokenAuth("", false, true)
 	for _, method := range []string{
 		pb.Internal_Forward_FullMethodName,
+		pb.Distribution_SplitRange_FullMethodName,
 		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AttestMigrationOwnership_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,

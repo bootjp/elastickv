@@ -17,7 +17,8 @@ import (
 
 func splitMigrationMutatingMethod(method string) bool {
 	switch method {
-	case pb.Distribution_StartSplitMigration_FullMethodName,
+	case pb.Distribution_SplitRange_FullMethodName,
+		pb.Distribution_StartSplitMigration_FullMethodName,
 		pb.Distribution_AbandonSplitJob_FullMethodName,
 		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
@@ -49,7 +50,8 @@ func splitMigrationAuthenticatedMethod(method string, peerAuthEnforced bool) boo
 	return splitMigrationProtectedMethod(method) || (peerAuthEnforced && method == pb.Internal_Forward_FullMethodName)
 }
 
-// SplitMigrationTokenAuth protects migration control and raw MVCC exports.
+// SplitMigrationTokenAuth protects catalog splits, migration control and raw MVCC exports.
+// Even a proof-free SplitRange advances the global catalog and needs operator authority.
 // Without a configured token, only an explicit insecure opt-in enables access.
 // Peer enforcement follows a send-first rollout; the runner must stay paused
 // until enforcement is enabled (except in explicit isolated-test no-auth mode).
