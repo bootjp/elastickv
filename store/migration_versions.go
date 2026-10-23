@@ -224,7 +224,7 @@ func migrationReadyKey(jobID uint64) []byte {
 }
 
 func isMigrationMetadataKey(rawKey []byte) bool {
-	return bytes.Equal(rawKey, migrationOwnershipMetaKeyBytes) ||
+	return IsMigrationOwnershipPartitionMetadataKey(rawKey) || bytes.Equal(rawKey, migrationOwnershipMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationRetiredMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes) ||
@@ -390,7 +390,7 @@ func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, boo
 }
 
 func validateImportVersion(version MVCCVersion) error {
-	if IsMigrationOwnershipMetadataKey(version.Key) {
+	if IsMigrationOwnershipMetadataKey(version.Key) || IsMigrationOwnershipPartitionMetadataKey(version.Key) {
 		return errors.Wrap(ErrInvalidImportVersion, "migration cannot import ownership metadata")
 	}
 	if bytes.Equal(version.Key, migrationRetiredMetaKeyBytes) {

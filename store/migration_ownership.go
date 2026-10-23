@@ -68,8 +68,9 @@ type MigrationOwnershipReceipt struct {
 }
 
 type MigrationServingState struct {
-	Ownership []MigrationOwnershipState
-	Readiness []TargetStagedReadinessState
+	Ownership  []MigrationOwnershipState
+	Readiness  []TargetStagedReadinessState
+	Partitions MigrationOwnershipPartitionState
 }
 
 // MigrationOwnershipStore reads guard and serving evidence in one store view.
@@ -192,8 +193,9 @@ func (s *mvccStore) MigrationServingState(_ context.Context) (MigrationServingSt
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	return MigrationServingState{
-		Ownership: cloneMigrationOwnership(s.migrationOwnership),
-		Readiness: cloneReadinessStates(s.migrationReadinessCache),
+		Ownership:  cloneMigrationOwnership(s.migrationOwnership),
+		Readiness:  cloneReadinessStates(s.migrationReadinessCache),
+		Partitions: clonePartitionState(s.migrationPartitions),
 	}, nil
 }
 
@@ -210,9 +212,13 @@ func (s *pebbleStore) MigrationServingState(ctx context.Context) (MigrationServi
 	if err != nil {
 		return MigrationServingState{}, err
 	}
+	partitions, err := s.readMigrationOwnershipPartitions()
+	if err != nil {
+		return MigrationServingState{}, err
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return MigrationServingState{Ownership: states, Readiness: cloneReadinessStates(s.migrationReadinessCache)}, nil
+	return MigrationServingState{Ownership: states, Readiness: cloneReadinessStates(s.migrationReadinessCache), Partitions: partitions}, nil
 }
 
 func cloneReadinessStates(states []TargetStagedReadinessState) []TargetStagedReadinessState {
@@ -407,6 +413,9 @@ func (s *mvccStore) AcquireMigrationOwnership(_ context.Context, state Migration
 	if state.SourceTrackerVersion != 0 {
 		state.SourceAppliedIndex = appliedIndex
 	}
+	if partitionJobReplay(s.migrationPartitions, s.migrationOwnership, state, MigrationOwnershipAcquire) {
+		return nil
+	}
 	if _, retired := s.migrationRetired[state.JobID]; retired {
 		return errors.WithStack(ErrMigrationRetired)
 	}
@@ -414,13 +423,22 @@ func (s *mvccStore) AcquireMigrationOwnership(_ context.Context, state Migration
 		return err
 	}
 	states, err := replaceMigrationOwnership(s.migrationOwnership, state, MigrationOwnershipAcquire)
-	if err == nil {
-		s.migrationOwnership = states
+	if err != nil {
+		return err
 	}
-	return err
+	partitions, err := s.syncPartitionJobLocked(states, state, MigrationOwnershipAcquire, appliedIndex)
+	if err != nil {
+		return err
+	}
+	s.migrationOwnership, s.migrationPartitions = states, partitions
+	s.migrationAdmission = buildMigrationServingAdmission(states, partitions)
+	return nil
 }
 
-func (s *pebbleStore) AcquireMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+func (s *pebbleStore) AcquireMigrationOwnership(ctx context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	if s.raftEntryScopeFrom(ctx) != nil {
+		return errors.WithStack(ErrMigrationOwnership)
+	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	s.dbMu.RLock()
@@ -429,36 +447,35 @@ func (s *pebbleStore) AcquireMigrationOwnership(_ context.Context, state Migrati
 	if state.SourceTrackerVersion != 0 {
 		state.SourceAppliedIndex = appliedIndex
 	}
+	old, err := s.readMigrationOwnership()
+	if err != nil {
+		return err
+	}
+	partitions, err := s.readMigrationOwnershipPartitions()
+	if err != nil {
+		return err
+	}
+	if partitionJobReplay(partitions, old, state, MigrationOwnershipAcquire) {
+		return s.persistMigrationOwnershipLocked(old, appliedIndex, partitions)
+	}
 	if err := s.checkMigrationNotRetiredLocked(state.JobID); err != nil {
 		return err
 	}
 	s.mtx.RLock()
-	err := validateOwnershipAcquisition(state, s.migrationReadinessCache)
+	err = validateOwnershipAcquisition(state, s.migrationReadinessCache)
 	s.mtx.RUnlock()
 	if err != nil {
 		return err
 	}
-	states, err := s.readMigrationOwnership()
+	states, err := replaceMigrationOwnership(old, state, MigrationOwnershipAcquire)
 	if err != nil {
 		return err
 	}
-	states, err = replaceMigrationOwnership(states, state, MigrationOwnershipAcquire)
+	partitions, err = s.syncPartitionJobLocked(ctx, partitions, old, states, state, MigrationOwnershipAcquire, appliedIndex)
 	if err != nil {
 		return err
 	}
-	data, err := encodeMigrationOwnership(states)
-	if err != nil {
-		return err
-	}
-	batch := s.db.NewBatch()
-	defer batch.Close()
-	if err := batch.Set(migrationOwnershipMetaKeyBytes, data, nil); err != nil {
-		return errors.WithStack(err)
-	}
-	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
-		return err
-	}
-	return errors.WithStack(batch.Commit(s.cleanupWriteOpts(appliedIndex)))
+	return s.persistMigrationOwnershipLocked(states, appliedIndex, partitions)
 }
 
 func (s *mvccStore) RefreshMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
@@ -469,13 +486,22 @@ func (s *mvccStore) RefreshMigrationOwnership(_ context.Context, state Migration
 		return errors.WithStack(ErrMigrationOwnership)
 	}
 	states, err := replaceMigrationOwnership(s.migrationOwnership, state, MigrationOwnershipRefresh)
-	if err == nil {
-		s.migrationOwnership = states
+	if err != nil {
+		return err
 	}
-	return err
+	partitions, err := s.syncPartitionJobLocked(states, state, MigrationOwnershipRefresh, appliedIndex)
+	if err != nil {
+		return err
+	}
+	s.migrationOwnership, s.migrationPartitions = states, partitions
+	s.migrationAdmission = buildMigrationServingAdmission(states, partitions)
+	return nil
 }
 
-func (s *pebbleStore) RefreshMigrationOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+func (s *pebbleStore) RefreshMigrationOwnership(ctx context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	if s.raftEntryScopeFrom(ctx) != nil {
+		return errors.WithStack(ErrMigrationOwnership)
+	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	s.dbMu.RLock()
@@ -488,14 +514,23 @@ func (s *pebbleStore) RefreshMigrationOwnership(_ context.Context, state Migrati
 	if err != nil {
 		return err
 	}
+	old := states
 	states, err = replaceMigrationOwnership(states, state, MigrationOwnershipRefresh)
 	if err != nil {
 		return err
 	}
-	return s.persistMigrationOwnershipLocked(states, appliedIndex)
+	partitions, err := s.readMigrationOwnershipPartitions()
+	if err != nil {
+		return err
+	}
+	partitions, err = s.syncPartitionJobLocked(ctx, partitions, old, states, state, MigrationOwnershipRefresh, appliedIndex)
+	if err != nil {
+		return err
+	}
+	return s.persistMigrationOwnershipLocked(states, appliedIndex, partitions)
 }
 
-func (s *pebbleStore) persistMigrationOwnershipLocked(states []MigrationOwnershipState, appliedIndex uint64) error {
+func (s *pebbleStore) persistMigrationOwnershipLocked(states []MigrationOwnershipState, appliedIndex uint64, partitions MigrationOwnershipPartitionState) error {
 	data, err := encodeMigrationOwnership(states)
 	if err != nil {
 		return err
@@ -505,16 +540,28 @@ func (s *pebbleStore) persistMigrationOwnershipLocked(states []MigrationOwnershi
 	if err := batch.Set(migrationOwnershipMetaKeyBytes, data, nil); err != nil {
 		return errors.WithStack(err)
 	}
-	if err := setPebbleUint64InBatch(batch, metaAppliedIndexBytes, appliedIndex); err != nil {
+	if err := stageSnapshotPartitions(batch, partitions); err != nil {
 		return err
 	}
-	return errors.WithStack(batch.Commit(s.cleanupWriteOpts(appliedIndex)))
+	if err := s.stagePartitionAppliedIndex(batch, appliedIndex); err != nil {
+		return err
+	}
+	if err := batch.Commit(s.cleanupWriteOpts(appliedIndex)); err != nil {
+		return errors.WithStack(err)
+	}
+	s.mtx.Lock()
+	s.migrationAdmission = buildMigrationServingAdmission(states, partitions)
+	s.mtx.Unlock()
+	return nil
 }
 
 func (s *mvccStore) ClearMigrationStateWithOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
 	state.AppliedIndex = appliedIndex
+	if partitionJobReplay(s.migrationPartitions, s.migrationOwnership, state, MigrationOwnershipClear) {
+		return nil
+	}
 	_, retired := s.migrationRetired[state.JobID]
 	if err := validateOwnershipGuard(state, s.migrationReadinessCache, retired, s.migrationPromotions[state.JobID].Done); err != nil {
 		return err
@@ -523,10 +570,15 @@ func (s *mvccStore) ClearMigrationStateWithOwnership(_ context.Context, state Mi
 	if err != nil {
 		return err
 	}
-	if retired && !hasMigrationOwnership(s.migrationOwnership, state.JobID) {
-		return errors.WithStack(ErrMigrationOwnership)
+	if err := validateRetiredOwnership(s.migrationOwnership, state.JobID, retired); err != nil {
+		return err
 	}
-	s.migrationOwnership = states
+	partitions, err := s.syncPartitionJobLocked(states, state, MigrationOwnershipClear, appliedIndex)
+	if err != nil {
+		return err
+	}
+	s.migrationOwnership, s.migrationPartitions = states, partitions
+	s.migrationAdmission = buildMigrationServingAdmission(states, partitions)
 	s.clearMigrationStateLocked(state.JobID)
 	return nil
 }
@@ -540,7 +592,17 @@ func hasMigrationOwnership(states []MigrationOwnershipState, jobID uint64) bool 
 	return false
 }
 
-func (s *pebbleStore) ClearMigrationStateWithOwnership(_ context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+func validateRetiredOwnership(states []MigrationOwnershipState, jobID uint64, retired bool) error {
+	if retired && !hasMigrationOwnership(states, jobID) {
+		return errors.WithStack(ErrMigrationOwnership)
+	}
+	return nil
+}
+
+func (s *pebbleStore) ClearMigrationStateWithOwnership(ctx context.Context, state MigrationOwnershipState, appliedIndex uint64) error {
+	if s.raftEntryScopeFrom(ctx) != nil {
+		return errors.WithStack(ErrMigrationOwnership)
+	}
 	s.applyMu.Lock()
 	defer s.applyMu.Unlock()
 	s.dbMu.RLock()
@@ -550,6 +612,29 @@ func (s *pebbleStore) ClearMigrationStateWithOwnership(_ context.Context, state 
 	if err != nil {
 		return err
 	}
+	partitions, err := s.readMigrationOwnershipPartitions()
+	if err != nil {
+		return err
+	}
+	if partitionJobReplay(partitions, states, state, MigrationOwnershipClear) {
+		return s.persistMigrationOwnershipLocked(states, appliedIndex, partitions)
+	}
+	if err := s.validateOwnershipClearLocked(state, states); err != nil {
+		return err
+	}
+	old := states
+	states, err = replaceMigrationOwnership(states, state, MigrationOwnershipClear)
+	if err != nil {
+		return err
+	}
+	partitions, err = s.syncPartitionJobLocked(ctx, partitions, old, states, state, MigrationOwnershipClear, appliedIndex)
+	if err != nil {
+		return err
+	}
+	return s.clearMigrationStateWithOwnershipLocked(state.JobID, appliedIndex, states, partitions)
+}
+
+func (s *pebbleStore) validateOwnershipClearLocked(state MigrationOwnershipState, states []MigrationOwnershipState) error {
 	retired, err := s.readMigrationRetiredJobs()
 	if err != nil {
 		return err
@@ -565,17 +650,10 @@ func (s *pebbleStore) ClearMigrationStateWithOwnership(_ context.Context, state 
 	if err != nil {
 		return err
 	}
-	if isRetired && !hasMigrationOwnership(states, state.JobID) {
-		return errors.WithStack(ErrMigrationOwnership)
-	}
-	states, err = replaceMigrationOwnership(states, state, MigrationOwnershipClear)
-	if err != nil {
-		return err
-	}
-	return s.clearMigrationStateWithOwnershipLocked(state.JobID, appliedIndex, states)
+	return validateRetiredOwnership(states, state.JobID, isRetired)
 }
 
-func (s *pebbleStore) clearMigrationStateWithOwnershipLocked(jobID, appliedIndex uint64, states []MigrationOwnershipState) error {
+func (s *pebbleStore) clearMigrationStateWithOwnershipLocked(jobID, appliedIndex uint64, states []MigrationOwnershipState, partitions MigrationOwnershipPartitionState) error {
 	metadata, err := s.migrationMetadataWithoutJob(jobID)
 	if err != nil {
 		return err
@@ -592,10 +670,17 @@ func (s *pebbleStore) clearMigrationStateWithOwnershipLocked(jobID, appliedIndex
 	if err := batch.Set(migrationOwnershipMetaKeyBytes, data, nil); err != nil {
 		return errors.WithStack(err)
 	}
+	if err := stageSnapshotPartitions(batch, partitions); err != nil {
+		return err
+	}
+	if err := s.stagePartitionAppliedIndex(batch, appliedIndex); err != nil {
+		return err
+	}
 	if err := batch.Commit(s.cleanupWriteOpts(appliedIndex)); err != nil {
 		return errors.WithStack(err)
 	}
 	s.mtx.Lock()
+	s.migrationAdmission = buildMigrationServingAdmission(states, partitions)
 	s.migrationReadinessCache = upsertReadinessCacheWithoutJob(s.migrationReadinessCache, jobID)
 	s.mtx.Unlock()
 	return nil

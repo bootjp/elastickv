@@ -251,6 +251,7 @@ type pebbleStore struct {
 	minRetainedTS           uint64
 	pendingMinRetainedTS    uint64
 	migrationReadinessCache []TargetStagedReadinessState
+	migrationAdmission      migrationServingAdmissionIndex
 	mtx                     sync.RWMutex
 	applyMu                 sync.Mutex // serializes ApplyMutations: conflict check → commit
 	maintenanceMu           sync.Mutex
@@ -729,15 +730,8 @@ func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error
 	if err := batch.Set(migrationRetiredMetaKeyBytes, encodeMigrationRetiredJobs(meta.migrationRetired), nil); err != nil {
 		return errors.WithStack(err)
 	}
-	if err := stageSnapshotOwnership(batch, meta.migrationOwnership); err != nil {
+	if err := stageSnapshotServingMetadata(batch, meta); err != nil {
 		return err
-	}
-	// Readiness states live one row per job rather than in a single meta key,
-	// so they are staged into the same batch instead of a separate write.
-	for _, state := range meta.migrationReadiness {
-		if err := batch.Set(migrationReadyKey(state.JobID), encodeTargetStagedReadinessState(state), nil); err != nil {
-			return errors.WithStack(err)
-		}
 	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
 }
@@ -3394,6 +3388,7 @@ func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
 	s.minRetainedTS = 0
 	s.pendingMinRetainedTS = 0
 	s.migrationReadinessCache = nil
+	s.migrationAdmission = migrationServingAdmissionIndex{}
 	if setErr := writePebbleUint64(s.db, metaLastCommitTSBytes, 0, pebble.NoSync); setErr != nil {
 		return errors.WithStack(setErr)
 	}
@@ -3534,6 +3529,7 @@ type streamingMVCCRestoreMetadata struct {
 	migrationReadiness  []TargetStagedReadinessState
 	migrationRetired    map[uint64]struct{}
 	migrationOwnership  []MigrationOwnershipState
+	migrationPartitions MigrationOwnershipPartitionState
 }
 
 func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, streamingMVCCRestoreMetadata, error) {
@@ -3557,6 +3553,7 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 		migrationReadiness:  snapshotMeta.readiness,
 		migrationRetired:    snapshotMeta.retired,
 		migrationOwnership:  snapshotMeta.ownership,
+		migrationPartitions: snapshotMeta.partitions,
 	}
 	return body, hash, expectedChecksum, meta, nil
 }

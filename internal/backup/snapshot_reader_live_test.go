@@ -140,6 +140,8 @@ func TestIsPebbleOperationalKey_MatchesStore(t *testing.T) {
 		{name: "migration hlc floor", key: []byte("_mighlc"), want: true},
 		{name: "migration promote", key: []byte("_migpromote"), want: true},
 		{name: "migration ownership", key: []byte("!migstage|ownership"), want: true},
+		{name: "migration partitions", key: []byte("!migstage|ownership_partition"), want: true},
+		{name: "partition near miss", key: []byte("!migstage|ownership_partition-user"), want: false},
 		{name: "migration retirement", key: []byte("!migstage|retired"), want: true},
 		{name: "migration readiness", key: append([]byte("!migstage|ready|"), make([]byte, snapshotTSSize)...), want: true},
 		{name: "ownership near miss", key: []byte("!migstage|ownership-user"), want: false},

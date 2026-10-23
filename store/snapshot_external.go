@@ -56,7 +56,7 @@ func validateRestoreTempDB(dir string, validate func(string) error) error {
 }
 
 func validateExternalMVCCTree(ctx context.Context, tree *treemap.Map, meta mvccSnapshotMigrationMetadata) error {
-	if len(meta.acks)+len(meta.floors)+len(meta.promotions)+len(meta.readiness)+len(meta.retired)+len(meta.ownership) != 0 {
+	if len(meta.acks)+len(meta.floors)+len(meta.promotions)+len(meta.readiness)+len(meta.retired)+len(meta.ownership) != 0 || partitionHasEvidence(meta.partitions) {
 		return errors.WithStack(ErrExternalSnapshotMigrationState)
 	}
 	iter := tree.Iterator()
@@ -128,6 +128,8 @@ func validateExternalPebbleRow(key, value []byte) error {
 
 func validateExternalMigrationRow(key, value []byte) error {
 	switch {
+	case IsMigrationOwnershipPartitionMetadataKey(key):
+		return validateExternalPartitionRow(value)
 	case bytes.Equal(key, migrationOwnershipMetaKeyBytes):
 		states, err := decodeMigrationOwnership(value)
 		if err != nil {
@@ -154,6 +156,14 @@ func validateExternalMigrationRow(key, value []byte) error {
 	}
 }
 
+func validateExternalPartitionRow(value []byte) error {
+	state, err := decodeMigrationOwnershipPartitions(value)
+	if err != nil {
+		return err
+	}
+	return externalMigrationCollection(len(state.Partitions)+len(state.Receipts), true)
+}
+
 func externalMigrationCollection(size int, valid bool) error {
 	if !valid {
 		return errors.New("corrupt external snapshot migration metadata")
@@ -167,7 +177,7 @@ func externalMigrationCollection(size int, valid bool) error {
 func validateExternalTypedMigrationKey(key []byte) error {
 	// Keep these logical-key guards aligned with distribution's migration-only
 	// control namespaces. Raw store metadata is decoded separately above.
-	for _, prefix := range []string{"!dist|migstage|", "!migstage|", "!migwrite|", "!migfence|"} {
+	for _, prefix := range []string{"!dist|migstage|", "!migstage|", "!migwrite|", "!migfence|", "!dist|meta|ownership_partition/"} {
 		if bytes.HasPrefix(key, []byte(prefix)) {
 			return errors.WithStack(ErrExternalSnapshotMigrationState)
 		}

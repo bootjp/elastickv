@@ -278,6 +278,7 @@ var pebbleOperationalKeys = [][]byte{
 	[]byte("_migpromote"),
 	[]byte("!migstage|retired"),
 	[]byte("!migstage|ownership"),
+	[]byte("!migstage|ownership_partition"),
 }
 
 // Writer-registry rows: mirror internal/encryption.WriterRegistryPrefix,

@@ -31,6 +31,7 @@ const (
 	mvccSnapshotVersionV4 = uint32(4)
 	mvccSnapshotVersionV5 = uint32(5)
 	mvccSnapshotVersionV6 = uint32(6)
+	mvccSnapshotVersionV7 = uint32(7)
 	maxSnapshotKeySize    = 1 << 20 // 1 MiB per logical key
 	// maxSnapshotInternalKeyEnvelope reserves snapshot headroom for internal
 	// stored-key envelopes such as migration staging. Logical source keys keep
@@ -92,6 +93,8 @@ type mvccStore struct {
 	migrationReadiness  map[uint64]TargetStagedReadinessState
 	migrationRetired    map[uint64]struct{}
 	migrationOwnership  []MigrationOwnershipState
+	migrationPartitions MigrationOwnershipPartitionState
+	migrationAdmission  migrationServingAdmissionIndex
 	// migrationReadinessCache is the snapshot-order projection of
 	// migrationReadiness; it is what the V4 trailer serialises.
 	migrationReadinessCache []TargetStagedReadinessState
@@ -959,6 +962,9 @@ func (s *mvccStore) writeSnapshotFile(f *os.File) error {
 	if len(s.migrationOwnership) > 0 {
 		version = mvccSnapshotVersionV6
 	}
+	if partitionHasEvidence(s.migrationPartitions) {
+		version = mvccSnapshotVersionV7
+	}
 	checksumOffset, err := writeMVCCSnapshotHeader(f, version)
 	if err != nil {
 		return err
@@ -1035,6 +1041,15 @@ func (s *mvccStore) writeSnapshotBodyLocked(f *os.File, version uint32) (uint32,
 		s.migrationOwnership,
 	); err != nil {
 		return 0, err
+	}
+	if version >= mvccSnapshotVersionV7 {
+		data, err := encodeMigrationOwnershipPartitions(s.migrationPartitions)
+		if err != nil {
+			return 0, err
+		}
+		if err := writeMVCCSnapshotBytes(w, data); err != nil {
+			return 0, err
+		}
 	}
 	iter := s.tree.Iterator()
 	for iter.Next() {
@@ -1265,6 +1280,8 @@ func (s *mvccStore) restoreStreamingSnapshot(r io.Reader, validate func(*treemap
 	s.migrationReadiness = targetReadinessStateMap(meta.readiness)
 	s.migrationRetired = meta.retired
 	s.migrationOwnership = meta.ownership
+	s.migrationPartitions = meta.partitions
+	s.migrationAdmission = buildMigrationServingAdmission(meta.ownership, meta.partitions)
 	s.migrationReadinessCache = cloneTargetStagedReadinessStates(meta.readiness)
 	return nil
 }
@@ -1282,7 +1299,7 @@ func readMVCCSnapshotHeader(r io.Reader) (uint32, uint32, error) {
 	if err := binary.Read(r, binary.LittleEndian, &version); err != nil {
 		return 0, 0, errors.WithStack(err)
 	}
-	if version < mvccSnapshotVersionV1 || version > mvccSnapshotVersionV6 {
+	if version < mvccSnapshotVersionV1 || version > mvccSnapshotVersionV7 {
 		return 0, 0, errors.WithStack(errors.Newf("unsupported mvcc snapshot version %d", version))
 	}
 
@@ -1347,6 +1364,10 @@ func readMVCCSnapshotMetadata(
 	if err != nil {
 		return 0, 0, mvccSnapshotMigrationMetadata{}, err
 	}
+	partitions, err := readSnapshotPartitions(r, version)
+	if err != nil {
+		return 0, 0, mvccSnapshotMigrationMetadata{}, err
+	}
 	return lastCommitTS, minRetainedTS, mvccSnapshotMigrationMetadata{
 		acks:       migrationAcks,
 		floors:     migrationHLCFloors,
@@ -1354,6 +1375,7 @@ func readMVCCSnapshotMetadata(
 		readiness:  migrationReadiness,
 		retired:    retired,
 		ownership:  ownership,
+		partitions: partitions,
 	}, nil
 }
 
@@ -1419,6 +1441,7 @@ type mvccSnapshotMigrationMetadata struct {
 	readiness  []TargetStagedReadinessState
 	retired    map[uint64]struct{}
 	ownership  []MigrationOwnershipState
+	partitions MigrationOwnershipPartitionState
 }
 
 func emptyMVCCSnapshotMigrationMetadata() mvccSnapshotMigrationMetadata {
