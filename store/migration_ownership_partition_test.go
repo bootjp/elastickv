@@ -89,6 +89,12 @@ func TestOwnershipPartitionAtomicSplitRefreshAndLateReplay(t *testing.T) {
 			require.NoError(t, readErr)
 			require.True(t, found)
 			require.Equal(t, uint64(12), index)
+			require.NoError(t, ps.SetDurableAppliedIndex(99))
+			require.NoError(t, proofs.ApplyMigrationOwnershipPartition(t.Context(), tx, 10))
+			index, found, readErr = ps.LastAppliedIndex()
+			require.NoError(t, readErr)
+			require.True(t, found)
+			require.Equal(t, uint64(99), index, "late duplicate cannot rewind an unrelated later Raft watermark")
 		}
 		view.Partitions.Partitions[0].Origins[0].DescriptorHash[0]++
 		view.Partitions.Receipts[0].Transition.After[0].DescriptorHash[0]++

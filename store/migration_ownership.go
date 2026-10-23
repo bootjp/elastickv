@@ -245,7 +245,7 @@ func replaceMigrationOwnership(states []MigrationOwnershipState, state Migration
 			if err != nil {
 				return nil, err
 			}
-			out[i] = updated
+			out[i] = cloneMigrationOwnership([]MigrationOwnershipState{updated})[0]
 			return out, nil
 		}
 		if migrationOwnershipOverlaps(old, state) && old.CatalogVersion >= state.CatalogVersion {

@@ -177,3 +177,25 @@ func TestMigrationServingAdmissionConcurrentPublication(t *testing.T) {
 		wg.Wait()
 	})
 }
+
+func TestMigrationServingAdmissionLegacyRefreshDoesNotBorrowCallerSlices(t *testing.T) {
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		old, _ := partitionFixture(t, st)
+		old.CatalogVersion++
+		refresher, ok := st.(MigrationOwnershipRefresher)
+		require.True(t, ok)
+		require.NoError(t, refresher.RefreshMigrationOwnership(t.Context(), old, 10))
+		before, err := ownershipStore(t, st).MigrationServingState(t.Context())
+		require.NoError(t, err)
+		old.RouteStart[0]++
+		old.RouteEnd[0]++
+		old.DescriptorHash[0]++
+		old.Receipts[0].DescriptorHash[0]++
+		after, err := ownershipStore(t, st).MigrationServingState(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, before, after)
+		admission, err := admissionReader(t, st).MigrationServingAdmissionState(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, before, admission)
+	})
+}
