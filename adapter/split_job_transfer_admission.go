@@ -141,7 +141,13 @@ func probeSplitTransferMember(ctx context.Context, member SplitMigrationVoter, r
 	if err != nil {
 		return nil, errors.Wrapf(err, "transfer guard member %s", member.ID)
 	}
-	if !resp.GetReady() || resp.GetAppliedConfigurationIndex() != req.GetExpectedConfigurationIndex() ||
+	if resp == nil {
+		return nil, errors.Errorf("transfer guard member %s returned no probe response", member.ID)
+	}
+	if !resp.GetReady() {
+		return nil, errors.Wrapf(errSplitMigrationVoterBarrierIncomplete, "transfer guard member %s awaits applied configuration or size admission ACK", member.ID)
+	}
+	if resp.GetAppliedConfigurationIndex() != req.GetExpectedConfigurationIndex() ||
 		resp.GetTransferSizeGuardVersion() != store.MigrationTransferSizeGuardVersion {
 		return nil, errors.Errorf("transfer guard member %s lacks applied configuration or size admission ACK", member.ID)
 	}

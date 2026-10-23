@@ -118,11 +118,14 @@ func (s *quorumAcceptanceExportStream) Recv() (*pb.ExportRangeVersionsResponse, 
 	return response, err
 }
 
-type quorumAcceptanceCluster struct{ nodes []*quorumAcceptanceNode }
+type quorumAcceptanceCluster struct {
+	nodes    []*quorumAcceptanceNode
+	lifetime context.Context
+}
 
 func newQuorumAcceptanceCluster(t *testing.T, ctx context.Context) *quorumAcceptanceCluster {
 	t.Helper()
-	c := &quorumAcceptanceCluster{}
+	c := &quorumAcceptanceCluster{lifetime: ctx}
 	for index := range 4 {
 		listener, err := (&net.ListenConfig{}).Listen(ctx, "tcp", "127.0.0.1:0")
 		require.NoError(t, err)
@@ -412,9 +415,13 @@ func (c *quorumAcceptanceCluster) completeInitialOwner(t *testing.T, ctx context
 
 func TestMigrationQuorumPartitionAcceptance(t *testing.T) {
 	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", fmt.Sprint(quorumAcceptanceSnapshotEvery))
-	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
+	lifetime, stop := context.WithTimeout(t.Context(), 3*time.Minute)
+	defer stop()
+	ctx, cancel := context.WithTimeout(lifetime, 60*time.Second)
 	defer cancel()
-	c := newQuorumAcceptanceCluster(t, ctx)
+	// Bound each costly acceptance phase independently; request cancellation
+	// must not double as the lifetime of the cluster needed by the next phase.
+	c := newQuorumAcceptanceCluster(t, lifetime)
 	leader := c.leader(t)
 	epoch := c.waitConfiguration(t, 3)
 	members, err := c.members(ctx, quorumAcceptanceGroup)
@@ -468,7 +475,7 @@ func (c *quorumAcceptanceCluster) exerciseLearner(t *testing.T, ctx context.Cont
 	for index, n := range c.nodes {
 		peers[index] = n.peer
 	}
-	require.NoError(t, joining.open(ctx, peers, false))
+	require.NoError(t, joining.open(c.lifetime, peers, false))
 	joiningEpoch, joiningSupported := joining.engine.AppliedConfigurationIndex()
 	require.False(t, joiningSupported)
 	require.Zero(t, joiningEpoch, "prejoin negotiation must not invent a candidate epoch")
@@ -539,7 +546,8 @@ func (c *quorumAcceptanceCluster) exerciseLearner(t *testing.T, ctx context.Cont
 	require.Equal(t, newEpoch, witness.snapshot.ConfigurationIndex)
 	require.Len(t, witness.snapshot.Members, 4)
 	c.checkReplicas(t, ctx, newEpoch)
-	c.retainedAndRestart(t, ctx, root, newEpoch)
+	require.NoError(t, ctx.Err(), "configuration/guard phase must finish within its own budget")
+	c.retainedAndRestart(t, root, newEpoch)
 }
 
 func (c *quorumAcceptanceCluster) namespaceSnapshot(ctx context.Context) (NamespaceAdmissionSnapshot, error) {
@@ -666,8 +674,11 @@ func quorumAcceptancePrepare(phase pb.Phase, version uint64) *pb.Request {
 	}}
 }
 
-func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.Context, root quorumAcceptanceRoot, epoch uint64) {
+func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAcceptanceRoot, epoch uint64) {
 	t.Helper()
+	ctx, cancel := context.WithTimeout(c.lifetime, 60*time.Second)
+	defer cancel()
+	started := time.Now()
 	large := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
 	_, _, err := c.write(ctx, "u", large, 100)
 	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
@@ -703,8 +714,14 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.C
 		require.NoError(t, n.store.Close())
 		n.store = nil
 	}
+	require.NoError(t, ctx.Err(), "large-write/snapshot phase must finish within its own budget")
+	t.Logf("large-write/snapshot phase completed in %s", time.Since(started))
+	cancel()
+	ctx, cancel = context.WithTimeout(c.lifetime, 60*time.Second)
+	defer cancel()
+	started = time.Now()
 	for _, n := range c.nodes {
-		require.NoError(t, n.open(ctx, nil, false))
+		require.NoError(t, n.open(c.lifetime, nil, false))
 	}
 	leader = c.leader(t)
 	require.Equal(t, epoch, c.waitConfiguration(t, 4))
@@ -739,6 +756,8 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.C
 	consumer := c.consumer(t, leader, root)
 	quorumAcceptanceEventually(t, func() error { return consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup) })
 	c.checkNoQuorum(t, ctx, leader)
+	require.NoError(t, ctx.Err(), "restart/admission phase must finish within its own budget")
+	t.Logf("restart/admission phase completed in %s", time.Since(started))
 }
 
 func (c *quorumAcceptanceCluster) checkNoQuorum(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode) {

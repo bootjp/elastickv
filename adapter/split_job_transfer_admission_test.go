@@ -156,9 +156,14 @@ func TestSplitTransferAdmissionRejectsMissingPersistedLearnerACK(t *testing.T) {
 		return resp, err
 	}
 	witness, err := f.server.ensureSplitTransferAdmission(t.Context(), f.job, 2, f.source, f.control, f.proof)
-	require.Error(t, err)
+	require.ErrorIs(t, err, errSplitMigrationVoterBarrierIncomplete)
+	require.True(t, splitJobPhaseErrorRetryable(err))
 	require.Nil(t, witness)
 	require.Len(t, f.applied, 1, "proposal success alone is not persisted all-member evidence")
+	learner.probe = probe
+	witness, err = f.server.ensureSplitTransferAdmission(t.Context(), f.job, 2, f.source, f.control, f.proof)
+	require.NoError(t, err, "catch-up must allow a fresh admission attempt")
+	require.NoError(t, f.server.revalidateSplitTransferAdmission(t.Context(), witness))
 }
 
 func TestSplitTransferAdmissionMembershipChangesBeforeApply(t *testing.T) {

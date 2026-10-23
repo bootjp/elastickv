@@ -148,6 +148,8 @@ and authorized joining IDs. Ordered ConfChange application, native snapshot
 restore and prejoin hooks preserve this state. Catalog watchers do not authorize
 activation. New migration mutation RPCs require the marker; the strictly typed
 namespace activation control is the only bootstrap exception.
+Activation uses the bounded cleanup RPC attempt, never the runner's process
+lifetime alone. Parent cancellation and an earlier parent deadline are retained.
 
 Forwarded admin proposals use an exact typed allowlist for existing backup and
 PREPARE-evidence controls. Migration, encrypted, user and malformed payloads
@@ -162,6 +164,11 @@ neighbors remain writable. Existing matching PREPAREs may COMMIT or ABORT withou
 retroactive size rejection. All actual source members acknowledge the guard
 before copying or the write fence. A full historical-value preflight detects
 untransferable data before a catalog fence and safely abandons the move.
+An otherwise successful probe reporting `Ready: false` is an incomplete voter
+barrier, not a terminal phase failure. Learner catch-up therefore does not consume
+the failure budget or strand a fenced job in FAILED. Readiness is still required
+before advancing; invalid configuration/protocol evidence and authentication
+errors do not become successful ACKs.
 
 ## Acceptance Gates
 
