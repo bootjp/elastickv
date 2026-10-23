@@ -51,8 +51,12 @@ are supported, not permanently refused. An abandon may leave the harmless
 same-owner metadata split but cannot lower floors or restore a negative owner.
 Before publishing the manifest or either route, encode the complete downstream
 partition control against the current native frontier and its configuration.
-Reject controls exceeding the 4 MiB envelope, with a small reserve for index
-growth. The 16 MiB manifest limit alone does not bound the repeated, base64-encoded
+Reject controls exceeding the 4 MiB envelope after reserving the full uint64
+decimal width at every numeric position. Working-source creation checks both
+the source and required target, including historical negative evidence. A data
+leader read fence, or an exact-group leader fence followed by local applied-index
+catch-up, precedes even an empty-frontier decision. The 16 MiB manifest limit
+alone does not bound the repeated, base64-encoded
 priors and tiles. This is a metadata-operation limit, not a global RawKV limit.
 
 ## Persistence Hook Map

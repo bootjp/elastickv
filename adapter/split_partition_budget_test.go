@@ -77,3 +77,21 @@ func TestSplitRangeCannotTreatMissingOwnerStoreAsProofFree(t *testing.T) {
 	require.Equal(t, before.Version, after.Version)
 	require.Equal(t, before.Routes, after.Routes)
 }
+
+func TestSplitPartitionBudgetAccountsForAllNumericStampGrowth(t *testing.T) {
+	t.Parallel()
+	// A constant 4 KiB reserve cannot cover even one growing stamp on each
+	// of 256 priors. Numeric-looking descriptor bytes are strings, not stamps.
+	row := []byte(`{"AppliedIndex":1,"CatalogVersion":9,"Hash":"123456789"}`)
+	encoded := append([]byte{'['}, bytes.Repeat(append(bytes.Clone(row), ','), 255)...)
+	encoded = append(encoded, row...)
+	encoded = append(encoded, ']')
+	maximum, err := maximumSplitPartitionControlSize(encoded)
+	require.NoError(t, err)
+	require.Equal(t, len(encoded)+256*2*19, maximum)
+	require.Greater(t, maximum-len(encoded), 4<<10)
+	wide := []byte(`{"AppliedIndex":18446744073709551615}`)
+	maximum, err = maximumSplitPartitionControlSize(wide)
+	require.NoError(t, err)
+	require.Len(t, wide, maximum)
+}

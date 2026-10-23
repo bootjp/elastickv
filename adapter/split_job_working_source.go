@@ -21,6 +21,9 @@ func sourceLookupRouteID(job distribution.SplitJob) uint64 {
 
 func (s *DistributionServer) prepareSplitJobWorkingSource(ctx context.Context, job distribution.SplitJob) (distribution.SplitJob, error) {
 	if !s.MigrationPartitionRuntimeConfigured(job.SourceGroupID) {
+		if s.ownershipRefresh != nil {
+			return job, errors.WithStack(store.ErrNotSupported)
+		}
 		return job, nil
 	}
 	if err := s.ensureSplitJobNamespaceAdmission(ctx, job); err != nil {

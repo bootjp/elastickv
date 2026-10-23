@@ -56,7 +56,7 @@ func (s *DistributionServer) catalogSplitManifest(ctx context.Context, readTS, p
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if err := s.validateSplitPartitionBudget(ctx, parent, mutation.Value, manifest.Version); err != nil {
+	if err := s.validateSplitPartitionBudget(ctx, parent, mutation.Value, manifest.Version, workingJob); err != nil {
 		return nil, err
 	}
 	return mutation, nil

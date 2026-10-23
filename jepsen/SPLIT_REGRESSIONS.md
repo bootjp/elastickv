@@ -56,16 +56,22 @@ Redis register writes are integers; the helpers expose only job ID/phase, not
 guard activation, durable fence indexes, preflight cause, or pending PREPAREs.
 Adding payload padding alone cannot establish a pre-fence admission test.
 
-Real-cluster acceptance still needs an authenticated fixture that can hold an
-existing PREPARE before guard activation, observe committed activation on real
-voters, reject an oversized new moving-range write/PREPARE before fencing,
-and COMMIT/ABORT the old PREPARE unaffected. It must also seed a historical
-oversized moving-range row, prove size-caused abandonment before any durable
-source fence, check continued source reads/writes and unaffected neighbor ranges,
-and repeat the splits across quorums/restarts. This change does not supply those
-fixtures, enable a production migration path, or open main's hard activation gate.
-Synthetic histories and stubbed helper responses test only scheduling/oracles;
-they are not real quorum acceptance evidence.
+The Go adapter's `TestMigrationQuorumPartitionAcceptance` separately exercises
+three real data voters, a new learner, configuration/leader changes and native
+snapshot restart. It asserts typed moving-range rejection, retained-left large
+writes and exact restored bytes. `TestMigrationQuorumPreparedDrainAndHistoricalPreflight`
+holds large PREPAREs before guard activation, resolves COMMIT and ABORT through
+real Raft, and detects a retained oversized historical version beneath a small
+latest value before either a source or catalog write fence. Root metadata in
+these data-quorum tests is explicitly stubbed; they do not establish TLS/auth
+or full cross-group root/data fault-injection acceptance. Deterministic controller
+regressions separately cover repeated cross-group moves and retained negative owners.
+
+Production activation remains opt-in through authentication and opcode flags,
+installed read/proposal/consumer hooks, a supported applied configuration and
+all-current-apply-member negotiation. Flags alone cannot bypass namespace
+activation or authorize imported data. The Jepsen additions here are scheduling
+and oracle unit coverage, not a completed real-cluster fault-injection campaign.
 
 Run focused coverage and the full harness suite from `jepsen/`:
 

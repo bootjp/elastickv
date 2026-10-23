@@ -40,7 +40,7 @@ func TestSplitRangeWithoutOwnershipDoesNotRequireMigrationProtocols(t *testing.T
 	server, version := seededDistributionServer(t)
 	coordinator, ok := server.coordinator.(*distributionCoordinatorStub)
 	require.True(t, ok)
-	groups := map[uint64]*kv.ShardGroup{7: {Store: coordinator.store}}
+	groups := map[uint64]*kv.ShardGroup{7: {Store: coordinator.store, Engine: ownershipRefreshEngine{}}}
 	WithMigrationOwnershipRefresh(groups, func(context.Context) (MigrationOwnershipAttestor, error) {
 		t.Fatal("ordinary split attempted ownership attestation")
 		return nil, nil
