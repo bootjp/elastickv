@@ -13,6 +13,17 @@
            (java.nio.file.attribute FileAttribute)))
 
 (def sqlite-subdir "jepsen-sqlite")
+(def ^:const max-retries 32)
+
+(defn retryable-sqlite-error? [e]
+  (let [msg (.getMessage e)]
+    (boolean (some #(str/includes? msg %)
+                   ["disk I/O error" "unable to open database"
+                    "readonly database" "database is locked"
+                    "Resource temporarily unavailable" "SQLite database missing"]))))
+
+(defn with-sqlite-retries [f]
+  (fs/with-retries max-retries retryable-sqlite-error? f))
 
 (defn database-path [mount-dir k]
   (str mount-dir "/" sqlite-subdir "/reg-" k ".db"))
@@ -33,15 +44,19 @@
     (Files/createDirectories dir (make-array FileAttribute 0))
     (doseq [k (range key-count)]
       (let [path (database-path mount-dir k)]
-        (sqlite! path (str "PRAGMA journal_mode=DELETE; "
+        (with-sqlite-retries #(sqlite! path (str "PRAGMA journal_mode=PERSIST; "
                            "PRAGMA synchronous=FULL; "
                            "CREATE TABLE IF NOT EXISTS register "
                            "(id INTEGER PRIMARY KEY CHECK(id=1), value INTEGER NOT NULL); "
-                           "INSERT OR REPLACE INTO register VALUES (1, -1);"))))))
+                           "INSERT OR REPLACE INTO register VALUES (1, -1);")))))))
 
 (defn write-value! [path v]
-  (sqlite! path (str "BEGIN IMMEDIATE; UPDATE register SET value=" (long v)
-                     " WHERE id=1; COMMIT;")))
+  ;; One worker owns each database. Retrying this idempotent value after an
+  ;; ambiguous I/O error cannot overwrite a newer operation on that key.
+  (with-sqlite-retries
+    #(sqlite! path (str "PRAGMA synchronous=FULL; BEGIN IMMEDIATE; "
+                        "UPDATE register SET value=" (long v)
+                        " WHERE id=1; COMMIT;"))))
 
 (defn read-value [path]
   ;; sqlite3 opens a missing path by creating a new empty database. Detect
@@ -85,7 +100,8 @@
                    (assoc op :type :info :error (.getMessage e))))
         :read (try
                 (require-sqlite-mount! mount-dir require-fuse-mount)
-                (assoc op :type :ok :value (independent/tuple k (read-value path)))
+                (assoc op :type :ok :value
+                       (independent/tuple k (with-sqlite-retries #(read-value path))))
                 (catch Exception e
                   (if (and (:final op)
                            (or (not (Files/exists (Paths/get path (make-array String 0))
