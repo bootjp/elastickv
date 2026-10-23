@@ -18,12 +18,13 @@ func (s *DistributionServer) prepareSplitRangePartitions(ctx context.Context, sn
 		return nil, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
 	}
 	active, err := s.splitRangeGroupHasOwnership(ctx, parent, s.ownershipRefresh.groups[parent.GroupID])
-	if err != nil || !active {
+	if err != nil {
 		return nil, err
 	}
-	// Historical NONOWNER groups keep denying with their old proofs. They can
-	// replay retained manifests after reconnecting and need not ACK this split.
-	groups := []uint64{parent.GroupID}
+	groups, err := s.splitRangeOwnerGroups(ctx, snapshot, parent, active)
+	if err != nil || len(groups) == 0 {
+		return nil, err
+	}
 	if s.splitJobRunnerReadinessGate == nil {
 		return nil, errors.WithStack(store.ErrNotSupported)
 	}
@@ -33,7 +34,7 @@ func (s *DistributionServer) prepareSplitRangePartitions(ctx context.Context, sn
 	if err := s.ensureMigrationNamespaces(ctx, groups); err != nil {
 		return nil, err
 	}
-	return groups, nil
+	return groups, s.reconcileSplitRangePartitions(ctx, groups)
 }
 
 func (s *DistributionServer) splitRangeGroupHasOwnership(ctx context.Context, parent distribution.RouteDescriptor, group *kv.ShardGroup) (bool, error) {
@@ -64,7 +65,7 @@ func splitRangeOwnershipIntersects(view store.MigrationServingState, parent dist
 
 func (s *DistributionServer) reconcileSplitRangePartitions(ctx context.Context, groups []uint64) error {
 	for _, groupID := range groups {
-		if err := s.reconcileMigrationPartitions(ctx, groupID); err != nil {
+		if err := s.reconcileSplitServingOwners(ctx, groupID); err != nil {
 			return err
 		}
 	}

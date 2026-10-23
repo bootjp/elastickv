@@ -27,10 +27,10 @@ func TestMigrationQuorumCommitFollowsForcedLeadershipTransfer(t *testing.T) {
 	_, root := c.partitionedSourceForDrain(t, ctx, initial, epoch)
 	control := quorumAcceptanceAcquire(t, ctx, initial, 12, epoch, quorumAcceptanceCatalogVersion, root.later.Children[1], "t")
 	large := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
-	old, prepared, err := c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptanceDrainRequest(pb.Phase_PREPARE, "u", large)})
+	_, prepared, err := c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptanceDrainRequest(pb.Phase_PREPARE, "u", large)})
 	require.NoError(t, err)
 	require.Positive(t, prepared.CommitIndex)
-	old, _, err = c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptanceWriteRequest("a-ready", []byte("ready"), 90)})
+	old, _, err := c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptanceWriteRequest("a-ready", []byte("ready"), 90)})
 	require.NoError(t, err)
 	consumer := c.consumer(t, old, root)
 	job := distribution.SplitJob{JobID: 12, SourceRouteID: 5, SplitKey: []byte("t")}

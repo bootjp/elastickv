@@ -531,7 +531,7 @@ func (c *quorumAcceptanceCluster) exerciseLearner(t *testing.T, ctx context.Cont
 	require.Equal(t, newEpoch, witness.snapshot.ConfigurationIndex)
 	require.Len(t, witness.snapshot.Members, 4)
 	c.checkReplicas(t, ctx, newEpoch)
-	c.retainedAndRestart(t, ctx, leader, root, newEpoch)
+	c.retainedAndRestart(t, ctx, root, newEpoch)
 }
 
 func (c *quorumAcceptanceCluster) namespaceSnapshot(ctx context.Context) (NamespaceAdmissionSnapshot, error) {
@@ -609,12 +609,46 @@ func quorumAcceptanceWriteRequest(key string, value []byte, timestamp uint64) *p
 	return &pb.Request{Ts: timestamp, ObservedRouteVersion: kv.EncodeObservedRouteVersion(quorumAcceptanceCatalogVersion), Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte(key), Value: value}}}
 }
 
-func quorumAcceptanceWrite(ctx context.Context, n *quorumAcceptanceNode, key string, value []byte, timestamp uint64) (uint64, error) {
-	response, err := n.tx.Commit(ctx, []*pb.Request{quorumAcceptanceWriteRequest(key, value, timestamp)})
-	if err != nil {
-		return 0, err
+func (c *quorumAcceptanceCluster) commitToCurrentLeader(ctx context.Context, requests []*pb.Request) (*quorumAcceptanceNode, *kv.TransactionResponse, error) {
+	ticker := time.NewTicker(splitPartitionApplyPoll)
+	defer ticker.Stop()
+	for {
+		if leader := c.currentLeader(); leader != nil {
+			// Selection is not a read barrier. A newly elected voter must apply
+			// its committed ownership controls before local request admission.
+			_, err := leader.engine.LinearizableRead(ctx)
+			if err == nil {
+				response, commitErr := leader.tx.Commit(ctx, requests)
+				if !errors.Is(commitErr, raftengine.ErrNotLeader) {
+					return leader, response, commitErr
+				}
+			} else if !errors.Is(err, raftengine.ErrNotLeader) {
+				return leader, nil, err
+			}
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, errors.WithStack(ctx.Err())
+		case <-ticker.C:
+		}
 	}
-	return response.CommitIndex, nil
+}
+
+func (c *quorumAcceptanceCluster) currentLeader() *quorumAcceptanceNode {
+	for _, node := range c.nodes {
+		if node.engine != nil && node.engine.State() == raftengine.StateLeader {
+			return node
+		}
+	}
+	return nil
+}
+
+func (c *quorumAcceptanceCluster) write(ctx context.Context, key string, value []byte, timestamp uint64) (*quorumAcceptanceNode, uint64, error) {
+	leader, response, err := c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptanceWriteRequest(key, value, timestamp)})
+	if err != nil {
+		return leader, 0, err
+	}
+	return leader, response.CommitIndex, nil
 }
 
 func quorumAcceptancePrepare(phase pb.Phase, version uint64) *pb.Request {
@@ -624,14 +658,14 @@ func quorumAcceptancePrepare(phase pb.Phase, version uint64) *pb.Request {
 	}}
 }
 
-func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.Context, leader *quorumAcceptanceNode, root quorumAcceptanceRoot, epoch uint64) {
+func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.Context, root quorumAcceptanceRoot, epoch uint64) {
 	t.Helper()
 	large := make([]byte, store.MigrationPagePayloadBudget+(1<<19))
-	_, err := quorumAcceptanceWrite(ctx, leader, "u", large, 100)
+	_, _, err := c.write(ctx, "u", large, 100)
 	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
-	_, err = quorumAcceptanceWrite(ctx, leader, "u", []byte("moving-small"), 101)
+	_, _, err = c.write(ctx, "u", []byte("moving-small"), 101)
 	require.NoError(t, err, "moving-range creation must remain available below the transfer budget")
-	target, err := quorumAcceptanceWrite(ctx, leader, "b", large, 110)
+	leader, target, err := c.write(ctx, "b", large, 110)
 	require.NoError(t, err, "retained-left writes keep the global size contract")
 	require.Positive(t, target)
 	t.Logf("retained write ACK index %d; cached status applied %d; current applied %d", target, leader.engine.Status().AppliedIndex, leader.engine.AppliedIndex())
@@ -677,15 +711,16 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.C
 	value, err := reader.GetGroupAt(ctx, quorumAcceptanceGroup, []byte("b"), 1000)
 	require.NoError(t, err)
 	require.True(t, bytes.Equal(large, value), "native restart must restore the ACKed retained-left value")
-	_, err = quorumAcceptanceWrite(ctx, leader, "u", large, 100)
+	_, _, err = c.write(ctx, "u", large, 100)
 	require.ErrorIs(t, err, kv.ErrMigrationTransferTooLarge)
 	t.Log("typed moving-range size rejection and unrestricted retained-left oversized data survive native restart on all four members")
-	_, err = leader.tx.Commit(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_COMMIT, quorumAcceptanceCatalogVersion)})
+	leader, _, err = c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptancePrepare(pb.Phase_COMMIT, quorumAcceptanceCatalogVersion)})
 	require.NoError(t, err, "native snapshot must retain PREPARE resolution evidence")
+	reader = kv.NewShardStore(mirror, map[uint64]*kv.ShardGroup{quorumAcceptanceGroup: {Store: leader.store, Engine: leader.engine, Txn: leader.tx}})
 	value, err = reader.GetGroupAt(ctx, quorumAcceptanceGroup, []byte("c"), 1000)
 	require.NoError(t, err)
 	require.Equal(t, []byte("prepared-left"), value)
-	_, err = quorumAcceptanceWrite(ctx, leader, "d", []byte("left-after-restart"), 1000)
+	leader, _, err = c.write(ctx, "d", []byte("left-after-restart"), 1000)
 	require.NoError(t, err)
 	consumer := c.consumer(t, leader, root)
 	quorumAcceptanceEventually(t, func() error { return consumer.reconcileMigrationPartitions(ctx, quorumAcceptanceGroup) })
@@ -706,7 +741,9 @@ func (c *quorumAcceptanceCluster) checkNoQuorum(t *testing.T, ctx context.Contex
 	}
 	attempt, cancel := context.WithTimeout(ctx, 250*time.Millisecond)
 	defer cancel()
-	_, err := quorumAcceptanceWrite(attempt, leader, "e", []byte("must-not-commit"), 1100)
+	// Exercise proposal quorum directly: a preliminary read fence would reject
+	// before proposing and would not establish that the learner cannot vote.
+	_, err := leader.tx.Commit(attempt, []*pb.Request{quorumAcceptanceWriteRequest("e", []byte("must-not-commit"), 1100)})
 	require.Error(t, err)
 	_, err = leader.store.GetAt(ctx, []byte("e"), 2000)
 	require.ErrorIs(t, err, store.ErrKeyNotFound)
@@ -728,13 +765,14 @@ func TestMigrationQuorumPreparedDrainAndHistoricalPreflight(t *testing.T) {
 	for _, key := range []string{"u", "w"} {
 		prepare := quorumAcceptanceDrainRequest(pb.Phase_PREPARE, key, large)
 		require.Less(t, proto.Size(prepare), internalutil.GRPCMaxMessageBytes, "legacy PREPARE fits the unchanged 64 MiB transport limit")
-		_, err = leader.tx.Commit(ctx, []*pb.Request{prepare})
+		leader, _, err = c.commitToCurrentLeader(ctx, []*pb.Request{prepare})
 		require.NoError(t, err, "oversized PREPARE predates transfer-size activation")
 	}
 	locks, err := leader.client.ProbeMigrationLocks(ctx, &pb.ProbeMigrationLocksRequest{RouteStart: moving.Start, RouteEnd: moving.End, Limit: 10})
 	require.NoError(t, err)
 	require.Equal(t, uint32(2), locks.GetPendingCount())
 	job := distribution.SplitJob{JobID: 12, SourceRouteID: 5, SplitKey: []byte("t")}
+	consumer = c.consumer(t, leader, root)
 	var witness *splitTransferAdmissionWitness
 	quorumAcceptanceEventually(t, func() error {
 		witness, err = consumer.ensureSplitJobTransferControl(ctx, job, quorumAcceptanceGroup, leader.client, control, nil)
@@ -747,7 +785,7 @@ func TestMigrationQuorumPreparedDrainAndHistoricalPreflight(t *testing.T) {
 	}{{pb.Phase_COMMIT, "u"}, {pb.Phase_ABORT, "w"}} {
 		// No replacement value is sent: COMMIT must use authenticated bytes
 		// from the oversized old intent, not admit a new oversized creation.
-		_, err = leader.tx.Commit(ctx, []*pb.Request{quorumAcceptanceDrainRequest(resolution.phase, resolution.key, nil)})
+		leader, _, err = c.commitToCurrentLeader(ctx, []*pb.Request{quorumAcceptanceDrainRequest(resolution.phase, resolution.key, nil)})
 		require.NoError(t, err, "existing oversized PREPARE must drain after guard activation")
 	}
 	locks, err = leader.client.ProbeMigrationLocks(ctx, &pb.ProbeMigrationLocksRequest{RouteStart: moving.Start, RouteEnd: moving.End, Limit: 10})
@@ -758,7 +796,7 @@ func TestMigrationQuorumPreparedDrainAndHistoricalPreflight(t *testing.T) {
 	require.True(t, bytes.Equal(large, committed))
 	_, err = leader.store.GetAt(ctx, []byte("w"), 1000)
 	require.ErrorIs(t, err, store.ErrKeyNotFound, "ABORT must not publish its prepared oversized value")
-	index, err := quorumAcceptanceWrite(ctx, leader, "u", []byte("small latest"), 90)
+	leader, index, err := c.write(ctx, "u", []byte("small latest"), 90)
 	require.NoError(t, err)
 	require.Eventually(t, func() bool {
 		for _, n := range c.nodes[:3] {
@@ -768,6 +806,7 @@ func TestMigrationQuorumPreparedDrainAndHistoricalPreflight(t *testing.T) {
 		}
 		return true
 	}, 5*time.Second, 20*time.Millisecond)
+	consumer = c.consumer(t, leader, root)
 	c.historicalPreflightBeforeFence(t, ctx, leader, consumer, root, large)
 }
 

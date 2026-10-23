@@ -1362,10 +1362,10 @@ func (s *DistributionServer) commitSplitRangePlan(ctx context.Context, read kv.R
 	if err != nil {
 		return saved, err
 	}
-	if err := s.applyEngineSnapshot(saved); err != nil {
+	if err := s.reconcileSplitRangePartitions(ctx, groups); err != nil {
 		return saved, err
 	}
-	return saved, s.reconcileSplitRangePartitions(ctx, groups)
+	return saved, s.applyEngineSnapshot(saved)
 }
 
 func (s *DistributionServer) planSplitRange(ctx context.Context, snapshot distribution.CatalogSnapshot, req *pb.SplitRangeRequest) (splitRangePlan, error) {

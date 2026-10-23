@@ -59,6 +59,18 @@ catch-up, precedes even an empty-frontier decision. The 16 MiB manifest limit
 alone does not bound the repeated, base64-encoded
 priors and tiles. This is a metadata-operation limit, not a global RawKV limit.
 
+SplitRange is authenticated control-plane traffic even for a proof-free parent.
+Advancing its global catalog version also affects disjoint native OWNER proofs.
+Metadata/working-child splits therefore discover and fence serving owners across
+groups, establish current-version readiness before mutation, and synchronously
+refresh/ACK them at the actual committed new version before returning or updating
+the local route engine. A four-item background refresh budget is not the foreground
+availability mechanism. Historical negative-only closures may remain offline;
+already-fenced SOURCE intervals stay denied rather than acquiring new authority.
+The root transaction is still committed before data-group refresh: independent
+watchers may briefly observe a version whose owner ACK is pending and retry.
+This is not atomic root/data publication or a claim of zero transient retries.
+
 ## Persistence Hook Map
 
 The implementation uses the following persistence hooks:

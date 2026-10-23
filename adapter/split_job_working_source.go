@@ -50,6 +50,10 @@ func (s *DistributionServer) ensureSplitWorkingSource(ctx context.Context, job d
 	if err != nil {
 		return job, err
 	}
+	groups, err := s.prepareSplitRangePartitions(ctx, snapshot, job.SourceRouteID)
+	if err != nil {
+		return job, err
+	}
 	read, err := kv.BeginReadTimestampThrough(ctx, s.coordinator, snapshot.ReadTS, "split working source: catalog transaction")
 	if err != nil {
 		return job, errors.WithStack(err)
@@ -59,14 +63,21 @@ func (s *DistributionServer) ensureSplitWorkingSource(ctx context.Context, job d
 	if err != nil {
 		return job, err
 	}
+	if err := s.reconcileSplitRangePartitions(ctx, groups); err != nil {
+		return job, err
+	}
 	if err := s.applyEngineSnapshot(saved); err != nil {
 		return job, err
 	}
-	updated, exists, err := s.catalog.SplitJobAt(ctx, job.JobID, saved.ReadTS)
+	return s.reloadSplitWorkingSourceAt(ctx, job, right.RouteID, saved.ReadTS)
+}
+
+func (s *DistributionServer) reloadSplitWorkingSourceAt(ctx context.Context, job distribution.SplitJob, routeID, readTS uint64) (distribution.SplitJob, error) {
+	updated, exists, err := s.catalog.SplitJobAt(ctx, job.JobID, readTS)
 	if err != nil {
 		return job, errors.WithStack(err)
 	}
-	if !exists || updated.WorkingSourceRouteID != right.RouteID {
+	if !exists || updated.WorkingSourceRouteID != routeID {
 		return job, errors.WithStack(distribution.ErrCatalogSplitJobConflict)
 	}
 	return updated, nil
