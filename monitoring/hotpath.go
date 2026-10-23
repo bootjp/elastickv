@@ -84,77 +84,77 @@ func newHotPathMetrics(registerer prometheus.Registerer) *HotPathMetrics {
 				Name: "elastickv_lease_read_total",
 				Help: "Lease-read outcomes from the kv Coordinator (hit = served from local AppliedIndex, miss = fell back to LinearizableRead).",
 			},
-			[]string{"outcome"},
+			[]string{labelOutcome},
 		),
 		dispatchDroppedTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_dispatch_dropped_total",
 				Help: "Outbound raft messages dropped before transport because the per-peer channel was full. Mirrors etcd raft Engine.dispatchDropCount.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		dispatchErrorsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_dispatch_errors_total",
 				Help: "Outbound raft dispatches that reached the transport but failed. Mirrors etcd raft Engine.dispatchErrorCount.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		stepQueueFullTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_step_queue_full_total",
 				Help: "Inbound raft messages that found the selected step queue full. Blocking replication messages wait for space; best-effort messages may still be rejected. Indicates the raft loop is starved.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		sendStreamOpensTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_send_stream_opens_total",
 				Help: "Successful outbound Raft SendStream opens, including reconnects.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		sendStreamReconnectsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_send_stream_reconnects_total",
 				Help: "Successful outbound Raft SendStream reopens for peer addresses previously streamed to.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		sendStreamMessagesTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_send_stream_messages_total",
 				Help: "Regular Raft messages accepted by the outbound SendStream path.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		snapshotStreamSendsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_snapshot_stream_sends_total",
 				Help: "Outbound Raft snapshot streams acknowledged by peers.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		snapshotPayloadBytesTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_snapshot_stream_payload_bytes_total",
 				Help: "Payload bytes in outbound Raft snapshot streams acknowledged by peers.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		dispatchErrorsByCodeTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_dispatch_errors_by_code_total",
 				Help: "elastickv_raft_dispatch_errors_total subdivided by grpc status code so operators can tell whether the transport is failing because peers are unreachable (Unavailable), slow (DeadlineExceeded), or flow-controlled (ResourceExhausted).",
 			},
-			[]string{"group", "code"},
+			[]string{labelGroup, "code"},
 		),
 		luaFastPathTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_lua_cmd_fastpath_total",
 				Help: "Per-redis.call() fast-path outcome inside Lua scripts. cmd identifies the command (zrangebyscore, zscore, ...); outcome is hit, skip_loaded, skip_cached_type, or fallback_* (subdivided by reason: ineligible, missing_key, wrong_type, truncated, large_offset, other).",
 			},
-			[]string{"cmd", "outcome"},
+			[]string{"cmd", labelOutcome},
 		),
 	}
 

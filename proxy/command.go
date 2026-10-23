@@ -24,6 +24,14 @@ const (
 	cmdNameBZPOPMIN   = "BZPOPMIN"
 	cmdNameBZPOPMAX   = "BZPOPMAX"
 	cmdNameXREAD      = "XREAD"
+	cmdNameBRPOPLPUSH = "BRPOPLPUSH"
+	cmdNameBLMOVE     = "BLMOVE"
+	cmdNameBLMPOP     = "BLMPOP"
+	cmdNameDEBUG      = "DEBUG"
+	cmdNameACL        = "ACL"
+	cmdNameFUNCTION   = "FUNCTION"
+	cmdNameFCALL      = "FCALL"
+	cmdNameFCALLRO    = "FCALL_RO"
 )
 
 var commandTable = map[string]CommandCategory{
@@ -178,13 +186,13 @@ var commandTable = map[string]CommandCategory{
 	"PUBLISH":           CmdWrite, // write to both backends
 
 	// ---- Blocking commands ----
-	"BLPOP":      CmdBlocking,
-	"BRPOP":      CmdBlocking,
-	"BRPOPLPUSH": CmdBlocking,
-	"BLMOVE":     CmdBlocking,
-	"BLMPOP":     CmdBlocking,
-	"BZPOPMIN":   CmdBlocking,
-	"BZPOPMAX":   CmdBlocking,
+	cmdNameBLPOP:      CmdBlocking,
+	cmdNameBRPOP:      CmdBlocking,
+	cmdNameBRPOPLPUSH: CmdBlocking,
+	cmdNameBLMOVE:     CmdBlocking,
+	cmdNameBLMPOP:     CmdBlocking,
+	cmdNameBZPOPMIN:   CmdBlocking,
+	cmdNameBZPOPMAX:   CmdBlocking,
 	// XREAD/XREADGROUP handled specially in ClassifyCommand (BLOCK arg check)
 
 	// ---- PubSub commands ----
@@ -197,29 +205,29 @@ var commandTable = map[string]CommandCategory{
 	"PUBSUB":       CmdPubSub,
 
 	// ---- Admin commands — forwarded to primary only ----
-	"PING":    CmdAdmin,
-	"ECHO":    CmdAdmin,
-	"INFO":    CmdAdmin,
-	"CLIENT":  CmdAdmin,
-	"SELECT":  CmdAdmin,
-	"QUIT":    CmdAdmin,
-	"RESET":   CmdAdmin,
-	"DBSIZE":  CmdAdmin,
-	"SCAN":    CmdAdmin,
-	"AUTH":    CmdAdmin,
-	"HELLO":   CmdAdmin,
-	"WAIT":    CmdAdmin,
-	"CONFIG":  CmdAdmin,
-	"DEBUG":   CmdAdmin,
-	"CLUSTER": CmdAdmin,
-	"COMMAND": CmdAdmin,
-	"TIME":    CmdAdmin,
-	"SLOWLOG": CmdAdmin,
-	"MEMORY":  CmdAdmin,
-	"LATENCY": CmdAdmin,
-	"MODULE":  CmdAdmin,
-	"ACL":     CmdAdmin,
-	"SWAPDB":  CmdAdmin,
+	"PING":       CmdAdmin,
+	"ECHO":       CmdAdmin,
+	"INFO":       CmdAdmin,
+	"CLIENT":     CmdAdmin,
+	"SELECT":     CmdAdmin,
+	"QUIT":       CmdAdmin,
+	"RESET":      CmdAdmin,
+	"DBSIZE":     CmdAdmin,
+	"SCAN":       CmdAdmin,
+	"AUTH":       CmdAdmin,
+	"HELLO":      CmdAdmin,
+	"WAIT":       CmdAdmin,
+	"CONFIG":     CmdAdmin,
+	cmdNameDEBUG: CmdAdmin,
+	"CLUSTER":    CmdAdmin,
+	"COMMAND":    CmdAdmin,
+	"TIME":       CmdAdmin,
+	"SLOWLOG":    CmdAdmin,
+	"MEMORY":     CmdAdmin,
+	"LATENCY":    CmdAdmin,
+	"MODULE":     CmdAdmin,
+	cmdNameACL:   CmdAdmin,
+	"SWAPDB":     CmdAdmin,
 	// WATCH/UNWATCH: connection-scoped optimistic locking.
 	// Forwarded to primary only since the proxy uses a shared connection pool
 	// and per-connection WATCH state cannot be maintained.
@@ -227,19 +235,19 @@ var commandTable = map[string]CommandCategory{
 	"UNWATCH": CmdAdmin,
 
 	// ---- Transaction commands ----
-	"MULTI":   CmdTxn,
-	"EXEC":    CmdTxn,
+	cmdMulti:  CmdTxn,
+	cmdExec:   CmdTxn,
 	"DISCARD": CmdTxn,
 
 	// ---- Script commands ----
-	"EVAL":       CmdScript,
-	"EVALSHA":    CmdScript,
-	"EVAL_RO":    CmdScript,
-	"EVALSHA_RO": CmdScript,
-	"SCRIPT":     CmdScript,
-	"FUNCTION":   CmdScript,
-	"FCALL":      CmdScript,
-	"FCALL_RO":   CmdScript,
+	"EVAL":          CmdScript,
+	"EVALSHA":       CmdScript,
+	"EVAL_RO":       CmdScript,
+	"EVALSHA_RO":    CmdScript,
+	cmdScript:       CmdScript,
+	cmdNameFUNCTION: CmdScript,
+	cmdNameFCALL:    CmdScript,
+	cmdNameFCALLRO:  CmdScript,
 }
 
 // ClassifyCommand returns the category for a Redis command name.

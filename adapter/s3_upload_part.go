@@ -50,7 +50,7 @@ func (s *S3Server) prepareS3UploadPart(ctx context.Context, bucket, objectKey, u
 		return nil, errors.WithStack(err)
 	}
 	if !exists || meta == nil {
-		return nil, newS3ResponseError(http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		return nil, newS3ResponseError(http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
 	}
 	state.meta = meta
 	state.uploadMetaKey = s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)

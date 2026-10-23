@@ -77,7 +77,7 @@ func newEncryptionMetrics(registerer prometheus.Registerer) *EncryptionMetrics {
 				Name: "elastickv_encryption_decrypt_failures_total",
 				Help: "Total encrypted-value reads that failed to decode or authenticate, by failure reason. Any non-zero value is a paging-grade signal.",
 			},
-			[]string{"reason"},
+			[]string{labelReason},
 		),
 		writesPerDEK: prometheus.NewCounterVec(
 			prometheus.CounterOpts{

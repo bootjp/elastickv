@@ -130,7 +130,7 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if authHeader == "" {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AccessDenied",
+			Code:    s3ErrAccessDenied,
 			Message: "missing Authorization header",
 		}
 	}
@@ -138,7 +138,7 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if payloadHash == "" {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AccessDenied",
+			Code:    s3ErrAccessDenied,
 			Message: "missing x-amz-content-sha256 header",
 		}
 	}
@@ -147,15 +147,15 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AccessDenied",
+			Code:    s3ErrAccessDenied,
 			Message: "invalid Authorization header",
 		}
 	}
 	if parsed.Algorithm != s3SigV4Algorithm {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AccessDenied",
-			Message: "unsupported signature algorithm",
+			Code:    s3ErrAccessDenied,
+			Message: sigv4ErrMsgUnsupportedAlgorithm,
 		}
 	}
 	secretAccessKey, ok := s.staticCreds[parsed.AccessKeyID]
@@ -163,21 +163,21 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
 			Code:    "InvalidAccessKeyId",
-			Message: "unknown access key",
+			Message: sigv4ErrMsgUnknownAccessKey,
 		}
 	}
 	if parsed.Service != "s3" {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationHeaderMalformed",
+			Code:    s3ErrAuthorizationHeaderMalformed,
 			Message: "credential scope service must be s3",
 		}
 	}
 	if parsed.Region != s.effectiveRegion() {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationHeaderMalformed",
-			Message: "credential scope region does not match server region",
+			Code:    s3ErrAuthorizationHeaderMalformed,
+			Message: sigv4ErrMsgRegionMismatch,
 		}
 	}
 
@@ -185,7 +185,7 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if amzDate == "" {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AccessDenied",
+			Code:    s3ErrAccessDenied,
 			Message: "missing x-amz-date header",
 		}
 	}
@@ -193,14 +193,14 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AccessDenied",
+			Code:    s3ErrAccessDenied,
 			Message: "invalid x-amz-date header",
 		}
 	}
 	if parsed.Date != signingTime.UTC().Format("20060102") {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationHeaderMalformed",
+			Code:    s3ErrAuthorizationHeaderMalformed,
 			Message: "credential scope date does not match x-amz-date",
 		}
 	}
@@ -211,8 +211,8 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if skew > s3RequestTimeMaxSkew {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "RequestTimeTooSkewed",
-			Message: "The difference between the request time and the server's time is too large",
+			Code:    s3ErrRequestTimeTooSkewed,
+			Message: s3ErrRequestTimeTooSkewedMsg,
 		}
 	}
 
@@ -220,7 +220,7 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AccessDenied",
+			Code:    s3ErrAccessDenied,
 			Message: "failed to verify request signature",
 		}
 	}
@@ -232,7 +232,7 @@ func (s *S3Server) authorizeRequest(r *http.Request) *s3AuthError {
 	if gotSig == "" || subtle.ConstantTimeCompare([]byte(gotSig), []byte(expectedSig)) != 1 {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "SignatureDoesNotMatch",
+			Code:    s3ErrSignatureDoesNotMatch,
 			Message: "request signature does not match",
 		}
 	}
@@ -251,7 +251,7 @@ func checkPresignExpiry(expiresStr string, signingTime time.Time) *s3AuthError {
 	if expiresStr == "" {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
+			Code:    s3ErrAuthorizationQueryParameters,
 			Message: "X-Amz-Expires is required for presigned URLs",
 		}
 	}
@@ -259,12 +259,12 @@ func checkPresignExpiry(expiresStr string, signingTime time.Time) *s3AuthError {
 	if err != nil || expires <= 0 || expires > s3PresignMaxExpiry {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
+			Code:    s3ErrAuthorizationQueryParameters,
 			Message: "X-Amz-Expires must be between 1 and 604800",
 		}
 	}
 	if time.Now().UTC().After(signingTime.UTC().Add(time.Duration(expires) * time.Second)) {
-		return &s3AuthError{Status: http.StatusForbidden, Code: "AccessDenied", Message: "presigned URL has expired"}
+		return &s3AuthError{Status: http.StatusForbidden, Code: s3ErrAccessDenied, Message: "presigned URL has expired"}
 	}
 	return nil
 }
@@ -276,8 +276,8 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if algorithm != s3SigV4Algorithm {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
-			Message: "unsupported signature algorithm",
+			Code:    s3ErrAuthorizationQueryParameters,
+			Message: sigv4ErrMsgUnsupportedAlgorithm,
 		}
 	}
 	credential := strings.TrimSpace(query.Get("X-Amz-Credential"))
@@ -289,7 +289,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if credential == "" || amzDate == "" || signedHeaders == "" || signature == "" {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
+			Code:    s3ErrAuthorizationQueryParameters,
 			Message: "missing required presigned URL parameters",
 		}
 	}
@@ -299,7 +299,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if len(scope) != 5 || scope[4] != "aws4_request" || scope[3] != "s3" {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
+			Code:    s3ErrAuthorizationQueryParameters,
 			Message: "credential scope is malformed",
 		}
 	}
@@ -311,14 +311,14 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
 			Code:    "InvalidAccessKeyId",
-			Message: "unknown access key",
+			Message: sigv4ErrMsgUnknownAccessKey,
 		}
 	}
 	if scopeRegion != s.effectiveRegion() {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
-			Message: "credential scope region does not match server region",
+			Code:    s3ErrAuthorizationQueryParameters,
+			Message: sigv4ErrMsgRegionMismatch,
 		}
 	}
 
@@ -326,14 +326,14 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
+			Code:    s3ErrAuthorizationQueryParameters,
 			Message: "invalid X-Amz-Date",
 		}
 	}
 	if scope[1] != signingTime.UTC().Format("20060102") {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "AuthorizationQueryParametersError",
+			Code:    s3ErrAuthorizationQueryParameters,
 			Message: "credential scope date does not match X-Amz-Date",
 		}
 	}
@@ -343,8 +343,8 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if signingTime.UTC().After(time.Now().UTC().Add(s3RequestTimeMaxSkew)) {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "RequestTimeTooSkewed",
-			Message: "The difference between the request time and the server's time is too large",
+			Code:    s3ErrRequestTimeTooSkewed,
+			Message: s3ErrRequestTimeTooSkewedMsg,
 		}
 	}
 
@@ -366,7 +366,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "SignatureDoesNotMatch",
+			Code:    s3ErrSignatureDoesNotMatch,
 			Message: "failed to verify presigned request signature",
 		}
 	}
@@ -400,7 +400,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if err != nil {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "SignatureDoesNotMatch",
+			Code:    s3ErrSignatureDoesNotMatch,
 			Message: "failed to verify presigned request signature",
 		}
 	}
@@ -408,7 +408,7 @@ func (s *S3Server) authorizePresignedRequest(r *http.Request) *s3AuthError {
 	if expectedSig == "" || subtle.ConstantTimeCompare([]byte(signature), []byte(expectedSig)) != 1 {
 		return &s3AuthError{
 			Status:  http.StatusForbidden,
-			Code:    "SignatureDoesNotMatch",
+			Code:    s3ErrSignatureDoesNotMatch,
 			Message: "presigned URL signature does not match",
 		}
 	}

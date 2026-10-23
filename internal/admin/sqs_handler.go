@@ -581,7 +581,7 @@ func (h *SqsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 	if names == nil {
 		names = []string{}
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(listQueuesResponse{Queues: names}); err != nil {
@@ -606,7 +606,7 @@ func (h *SqsHandler) handleDescribe(w http.ResponseWriter, r *http.Request, name
 			"no queue is registered with that name")
 		return
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(summary); err != nil {
@@ -690,7 +690,7 @@ func (h *SqsHandler) handlePeek(w http.ResponseWriter, r *http.Request, name str
 		// array directly and would crash on null.
 		result.Messages = []PeekedMessage{}
 	}
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(result); err != nil {
@@ -849,7 +849,7 @@ func writePurgeInProgress(w http.ResponseWriter, err *PurgeInProgressError) {
 		secs = 1
 	}
 	w.Header().Set("Retry-After", strconv.FormatInt(secs, 10))
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusTooManyRequests)

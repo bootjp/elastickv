@@ -193,10 +193,10 @@ func (s *SQSServer) sendFifoMessage(
 		// message-id, no error. Idempotent-by-design retries from a
 		// crashed-and-restarted producer keep working.
 		return map[string]string{
-			"MessageId":              dedup.MessageID,
-			"MD5OfMessageBody":       sqsMD5Hex([]byte(in.MessageBody)),
-			"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
-			"SequenceNumber":         strconv.FormatUint(dedup.OriginalSequence, 10),
+			sqsFieldMessageID:              dedup.MessageID,
+			sqsFieldMD5OfMessageBody:       sqsMD5Hex([]byte(in.MessageBody)),
+			sqsFieldMD5OfMessageAttributes: md5OfAttributesHex(in.MessageAttributes),
+			"SequenceNumber":               strconv.FormatUint(dedup.OriginalSequence, 10),
 		}, false, nil
 	}
 
@@ -265,7 +265,7 @@ func (s *SQSServer) sendFifoMessage(
 		s.observePartitionMessage(queueName, partition, SQSPartitionActionSend)
 	}
 	return map[string]string{
-		"MessageId":              rec.MessageID,
+		sqsFieldMessageID:        rec.MessageID,
 		"MD5OfMessageBody":       rec.MD5OfBody,
 		"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
 		"SequenceNumber":         strconv.FormatUint(nextSeq, 10),

@@ -217,6 +217,19 @@ func writeS3ResponseOrInternalError(w http.ResponseWriter, err error) {
 	writeS3InternalError(w, err)
 }
 
+const (
+	s3ErrNoSuchBucket                 = "NoSuchBucket"
+	s3ErrNoSuchBucketMsg              = "bucket not found"
+	s3ErrInvalidRequest               = "InvalidRequest"
+	s3StorageClassStandard            = "STANDARD"
+	s3ErrAccessDenied                 = "AccessDenied"
+	s3ErrAuthorizationHeaderMalformed = "AuthorizationHeaderMalformed"
+	s3ErrRequestTimeTooSkewed         = "RequestTimeTooSkewed"
+	s3ErrRequestTimeTooSkewedMsg      = "The difference between the request time and the server's time is too large"
+	s3ErrSignatureDoesNotMatch        = "SignatureDoesNotMatch"
+	s3ErrAuthorizationQueryParameters = "AuthorizationQueryParametersError"
+)
+
 type s3ErrorResponse struct {
 	XMLName xml.Name `xml:"Error"`
 	XMLNS   string   `xml:"xmlns,attr,omitempty"`
@@ -754,7 +767,7 @@ func (s *S3Server) headBucket(w http.ResponseWriter, r *http.Request, bucket str
 		return
 	}
 	if !exists {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, "")
 		return
 	}
 	w.WriteHeader(http.StatusOK)
@@ -771,7 +784,7 @@ func (s *S3Server) getBucketVersioning(w http.ResponseWriter, r *http.Request, b
 		return
 	}
 	if !exists {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, "")
 		return
 	}
 	// The bundled endpoint does not implement object versions. An empty
@@ -799,8 +812,8 @@ func (s *S3Server) deleteBucket(w http.ResponseWriter, r *http.Request, bucket s
 		if !exists || meta == nil {
 			return &s3ResponseError{
 				Status:  http.StatusNotFound,
-				Code:    "NoSuchBucket",
-				Message: "bucket not found",
+				Code:    s3ErrNoSuchBucket,
+				Message: s3ErrNoSuchBucketMsg,
 				Bucket:  bucket,
 			}
 		}
@@ -863,7 +876,7 @@ func (s *S3Server) getBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 		return
 	}
 	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, "")
 		return
 	}
 
@@ -953,8 +966,8 @@ func (s *S3Server) putBucketAcl(w http.ResponseWriter, r *http.Request, bucket s
 		if !exists || meta == nil {
 			return &s3ResponseError{
 				Status:  http.StatusNotFound,
-				Code:    "NoSuchBucket",
-				Message: "bucket not found",
+				Code:    s3ErrNoSuchBucket,
+				Message: s3ErrNoSuchBucketMsg,
 				Bucket:  bucket,
 			}
 		}
@@ -1030,7 +1043,7 @@ func (s *S3Server) getObject(w http.ResponseWriter, r *http.Request, bucket stri
 		return
 	}
 	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
 		return
 	}
 
@@ -1256,8 +1269,8 @@ func (s *S3Server) deleteObjectAttempt(
 	if !exists || meta == nil {
 		return nil, 0, &s3ResponseError{
 			Status:  http.StatusNotFound,
-			Code:    "NoSuchBucket",
-			Message: "bucket not found",
+			Code:    s3ErrNoSuchBucket,
+			Message: s3ErrNoSuchBucketMsg,
 			Bucket:  bucket,
 			Key:     objectKey,
 		}
@@ -1302,7 +1315,7 @@ func (s *S3Server) createMultipartUpload(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
 		return
 	}
 
@@ -1441,8 +1454,8 @@ func (s *S3Server) abortMultipartUpload(w http.ResponseWriter, r *http.Request, 
 		if !exists || meta == nil {
 			return &s3ResponseError{
 				Status:  http.StatusNotFound,
-				Code:    "NoSuchBucket",
-				Message: "bucket not found",
+				Code:    s3ErrNoSuchBucket,
+				Message: s3ErrNoSuchBucketMsg,
 				Bucket:  bucket,
 				Key:     objectKey,
 			}
@@ -1498,7 +1511,7 @@ func (s *S3Server) listParts(w http.ResponseWriter, r *http.Request, bucket stri
 		return
 	}
 	if !exists || meta == nil {
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
 		return
 	}
 
@@ -1735,7 +1748,7 @@ func (s *S3Server) listObjectsV2(w http.ResponseWriter, r *http.Request, bucket 
 			LastModified: formatS3ISOTime(obj.Manifest.LastModifiedHLC),
 			ETag:         quoteS3ETag(obj.Manifest.ETag),
 			Size:         obj.Manifest.SizeBytes,
-			StorageClass: "STANDARD",
+			StorageClass: s3StorageClassStandard,
 		})
 	}
 	for _, prefix := range page.CommonPrefixes {
@@ -1754,7 +1767,7 @@ func writeS3ListingError(w http.ResponseWriter, bucket string, err error) {
 	case errors.Is(err, errS3ListingTokenExpired):
 		writeS3Error(w, http.StatusBadRequest, "InvalidArgument", "continuation token has expired", bucket, "")
 	case errors.Is(err, errS3ListingNoSuchBucket):
-		writeS3Error(w, http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, "")
+		writeS3Error(w, http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, "")
 	default:
 		writeS3InternalError(w, err)
 	}
@@ -1904,7 +1917,7 @@ func (s *S3Server) maybeProxyToLeader(w http.ResponseWriter, r *http.Request) bo
 		writeS3Error(w, http.StatusServiceUnavailable, "ServiceUnavailable", "leader endpoint not found", "", "")
 		return true
 	}
-	target := &url.URL{Scheme: "http", Host: targetHost}
+	target := &url.URL{Scheme: httpSchemePlain, Host: targetHost}
 	proxy := &httputil.ReverseProxy{
 		Rewrite: func(req *httputil.ProxyRequest) {
 			req.SetURL(target)
@@ -2115,7 +2128,7 @@ func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded 
 		// raw framed bytes as-is (and cleanStoredContentEncoding would
 		// later drop the only hint that the object is still encoded).
 		if hasAwsChunkedEncoding {
-			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: "Content-Encoding: aws-chunked requires a streaming X-Amz-Content-Sha256 marker"}
+			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: s3ErrInvalidRequest, Message: "Content-Encoding: aws-chunked requires a streaming X-Amz-Content-Sha256 marker"}
 		}
 		r.Body = http.MaxBytesReader(w, r.Body, maxDecoded)
 		return &s3StreamingBody{}, nil
@@ -2126,7 +2139,7 @@ func prepareStreamingPutBody(w http.ResponseWriter, r *http.Request, maxDecoded 
 	if declaredRaw != "" {
 		parsed, err := strconv.ParseInt(declaredRaw, 10, 64)
 		if err != nil || parsed < 0 {
-			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: "invalid X-Amz-Decoded-Content-Length"}
+			return nil, &s3PutBodyError{Status: http.StatusBadRequest, Code: s3ErrInvalidRequest, Message: "invalid X-Amz-Decoded-Content-Length"}
 		}
 		if parsed > maxDecoded {
 			return nil, &s3PutBodyError{Status: http.StatusRequestEntityTooLarge, Code: "EntityTooLarge", Message: tooLargeMessage}
@@ -2227,7 +2240,7 @@ func classifyS3BodyReadErr(err error, tooLargeMessage string) (*s3PutBodyError, 
 	}
 	var chunkedErr *awsChunkedError
 	if errors.As(err, &chunkedErr) {
-		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "InvalidRequest", Message: chunkedErr.Error()}, true
+		return &s3PutBodyError{Status: http.StatusBadRequest, Code: s3ErrInvalidRequest, Message: chunkedErr.Error()}, true
 	}
 	if errors.Is(err, errS3PutIncompleteBody) || errors.Is(err, io.ErrUnexpectedEOF) {
 		return &s3PutBodyError{Status: http.StatusBadRequest, Code: "IncompleteBody", Message: errS3PutIncompleteBody.Error()}, true

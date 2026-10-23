@@ -307,13 +307,13 @@ func (sc *pubsubConn) bgrunner(ps *redisPubSub) {
 // It returns true if the connection should be closed (quit).
 func (sc *pubsubConn) dispatchCommand(ps *redisPubSub, args [][]byte) bool {
 	switch strings.ToLower(string(args[0])) {
-	case "subscribe":
+	case redisCommandNameSubscribe:
 		sc.handleSubscribe(ps, args)
 	case "unsubscribe":
 		sc.handleUnsubscribe(ps, args)
-	case "ping":
+	case redisCommandNamePing:
 		sc.handlePing(args)
-	case "quit":
+	case redisCommandNameQuit:
 		return true
 	default:
 		sc.rejectCommand(args[0])

@@ -30,6 +30,8 @@ const (
 	defaultDDBBundleSizeBytes = 64 << 20
 	ddbUnbundledWarnItems     = 1_000_000
 	ddbGenerationSlots        = 2
+
+	ddbAttrTypeNull = "NULL"
 )
 
 // Stored value magic prefixes. Mirror adapter/dynamodb_storage_codec.go:15-16.
@@ -737,7 +739,7 @@ func attributeValueToPublic(av *pb.DynamoAttributeValue) map[string]any {
 	// Empty oneof. AWS treats this as malformed; preserve as NULL so
 	// the dump remains deserialisable rather than embedding an empty
 	// object that downstream tools might reject.
-	return map[string]any{"NULL": true}
+	return map[string]any{ddbAttrTypeNull: true}
 }
 
 func scalarAttributeValueToPublic(av *pb.DynamoAttributeValue) map[string]any {
@@ -751,7 +753,7 @@ func scalarAttributeValueToPublic(av *pb.DynamoAttributeValue) map[string]any {
 	case *pb.DynamoAttributeValue_BoolValue:
 		return map[string]any{"BOOL": v.BoolValue}
 	case *pb.DynamoAttributeValue_NullValue:
-		return map[string]any{"NULL": v.NullValue}
+		return map[string]any{ddbAttrTypeNull: v.NullValue}
 	}
 	return nil
 }

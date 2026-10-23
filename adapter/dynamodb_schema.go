@@ -17,6 +17,17 @@ import (
 	json "github.com/goccy/go-json"
 )
 
+const (
+	dynamoKeyTypeHash       = "HASH"
+	dynamoKeyTypeRange      = "RANGE"
+	dynamoAttrAttributeName = "AttributeName"
+	dynamoAttrKeyType       = "KeyType"
+	dynamoAttrTableName     = "TableName"
+	dynamoAttrTableStatus   = "TableStatus"
+	dynamoTableStatusActive = "ACTIVE"
+	dynamoProjectionTypeAll = "ALL"
+)
+
 type createTableAttributeDefinition struct {
 	AttributeName string `json:"AttributeName"`
 	AttributeType string `json:"AttributeType"`
@@ -103,8 +114,8 @@ func (d *DynamoDBServer) createTable(w http.ResponseWriter, r *http.Request) {
 	d.observeTables(r.Context(), schema.TableName)
 	writeDynamoJSON(w, map[string]any{
 		"TableDescription": map[string]any{
-			"TableName":   in.TableName,
-			"TableStatus": "ACTIVE",
+			dynamoAttrTableName:   in.TableName,
+			dynamoAttrTableStatus: dynamoTableStatusActive,
 		},
 	})
 }
@@ -165,8 +176,8 @@ func buildCreateTableSchema(in createTableInput) (*dynamoTableSchema, error) {
 
 func buildCreateTableProjection(in createTableProjection) (dynamoGSIProjection, error) {
 	switch strings.TrimSpace(in.ProjectionType) {
-	case "", "ALL":
-		return dynamoGSIProjection{ProjectionType: "ALL"}, nil
+	case "", dynamoProjectionTypeAll:
+		return dynamoGSIProjection{ProjectionType: dynamoProjectionTypeAll}, nil
 	case "KEYS_ONLY":
 		return dynamoGSIProjection{ProjectionType: "KEYS_ONLY"}, nil
 	case "INCLUDE":
@@ -272,8 +283,8 @@ func (d *DynamoDBServer) deleteTable(w http.ResponseWriter, r *http.Request) {
 	}
 	resp := map[string]any{
 		"TableDescription": map[string]any{
-			"TableName":   in.TableName,
-			"TableStatus": "DELETING",
+			"TableName":           in.TableName,
+			dynamoAttrTableStatus: "DELETING",
 		},
 	}
 	writeDynamoJSON(w, resp)
@@ -531,9 +542,9 @@ func parseCreateTableKeySchema(elems []createTableKeySchemaElement) (dynamoKeySc
 	var ks dynamoKeySchema
 	for _, e := range elems {
 		switch strings.ToUpper(strings.TrimSpace(e.KeyType)) {
-		case "HASH":
+		case dynamoKeyTypeHash:
 			ks.HashKey = e.AttributeName
-		case "RANGE":
+		case dynamoKeyTypeRange:
 			ks.RangeKey = e.AttributeName
 		}
 	}
@@ -844,28 +855,28 @@ func describeTableShape(t *dynamoTableSchema) map[string]any {
 	attrDefs := make([]map[string]string, 0, len(t.AttributeDefinitions))
 	for name, typ := range t.AttributeDefinitions {
 		attrDefs = append(attrDefs, map[string]string{
-			"AttributeName": name,
-			"AttributeType": typ,
+			dynamoAttrAttributeName: name,
+			"AttributeType":         typ,
 		})
 	}
 	sort.Slice(attrDefs, func(i, j int) bool {
-		return attrDefs[i]["AttributeName"] < attrDefs[j]["AttributeName"]
+		return attrDefs[i][dynamoAttrAttributeName] < attrDefs[j][dynamoAttrAttributeName]
 	})
 
 	keySchema := []map[string]string{{
-		"AttributeName": t.PrimaryKey.HashKey,
-		"KeyType":       "HASH",
+		dynamoAttrAttributeName: t.PrimaryKey.HashKey,
+		dynamoAttrKeyType:       dynamoKeyTypeHash,
 	}}
 	if t.PrimaryKey.RangeKey != "" {
 		keySchema = append(keySchema, map[string]string{
-			"AttributeName": t.PrimaryKey.RangeKey,
-			"KeyType":       "RANGE",
+			dynamoAttrAttributeName: t.PrimaryKey.RangeKey,
+			dynamoAttrKeyType:       dynamoKeyTypeRange,
 		})
 	}
 
 	resp := map[string]any{
 		"TableName":            t.TableName,
-		"TableStatus":          "ACTIVE",
+		dynamoAttrTableStatus:  dynamoTableStatusActive,
 		"KeySchema":            keySchema,
 		"AttributeDefinitions": attrDefs,
 	}

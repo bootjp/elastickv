@@ -162,6 +162,13 @@ func classifyEncodeError(err error) int {
 // manifests that omit the Adapters block deliberately are expected
 // to pass `--adapter` set to only what they DO contain; that case
 // is operator-driven and surfaces the same fail-closed error here.
+const (
+	adapterNameDynamoDB = "dynamodb"
+	adapterNameS3       = "s3"
+	adapterNameRedis    = "redis"
+	adapterNameSQS      = "sqs"
+)
+
 func validateAdaptersAgainstManifest(selected backup.AdapterSet, m backup.Manifest, inputPath string) error {
 	checks := []struct {
 		name     string
@@ -169,10 +176,10 @@ func validateAdaptersAgainstManifest(selected backup.AdapterSet, m backup.Manife
 		scope    *backup.Adapter
 		subdir   string
 	}{
-		{"dynamodb", selected.DynamoDB, manifestAdapterField(m.Adapters, "dynamodb"), "dynamodb"},
-		{"s3", selected.S3, manifestAdapterField(m.Adapters, "s3"), "s3"},
-		{"redis", selected.Redis, manifestAdapterField(m.Adapters, "redis"), "redis"},
-		{"sqs", selected.SQS, manifestAdapterField(m.Adapters, "sqs"), "sqs"},
+		{adapterNameDynamoDB, selected.DynamoDB, manifestAdapterField(m.Adapters, adapterNameDynamoDB), adapterNameDynamoDB},
+		{adapterNameS3, selected.S3, manifestAdapterField(m.Adapters, adapterNameS3), adapterNameS3},
+		{adapterNameRedis, selected.Redis, manifestAdapterField(m.Adapters, adapterNameRedis), adapterNameRedis},
+		{adapterNameSQS, selected.SQS, manifestAdapterField(m.Adapters, adapterNameSQS), adapterNameSQS},
 	}
 	for _, c := range checks {
 		if err := checkOneAdapterScope(c.name, c.selected, c.scope, filepath.Join(inputPath, c.subdir)); err != nil {
@@ -405,7 +412,7 @@ func encodeOne(cfg *config, logger *slog.Logger) error {
 	encodeOpts := buildEncodeOptions(cfg, effectiveTS, manifest)
 
 	mismatchPath := cfg.outputPath + ".mismatch.txt"
-	_ = os.Remove(mismatchPath) // stale-mismatch cleanup (gemini medium v6 #896)
+	_ = os.Remove(mismatchPath) // stale-mismatch cleanup
 	// Do NOT pre-clean the sidecar here. The sidecar describes the
 	// .fsm at cfg.outputPath; the .fsm is preserved when a run fails
 	// in the adapter encoders (non-self-test exit-2 path), so wiping

@@ -603,13 +603,13 @@ func mustForwardJSON(status int, body any) *pb.AdminForwardResponse {
 		return &pb.AdminForwardResponse{
 			StatusCode:  http.StatusInternalServerError,
 			Payload:     []byte(`{"error":"internal","message":"failed to encode response"}`),
-			ContentType: "application/json; charset=utf-8",
+			ContentType: contentTypeJSONUTF8,
 		}
 	}
 	return &pb.AdminForwardResponse{
 		StatusCode:  int32(status), //nolint:gosec // status fits in int32; net/http codes are 100-599.
 		Payload:     payload,
-		ContentType: "application/json; charset=utf-8",
+		ContentType: contentTypeJSONUTF8,
 	}
 }
 
