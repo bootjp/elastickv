@@ -76,11 +76,11 @@ func TestInternalForwardAdminProposalUsesLeaderProposer(t *testing.T) {
 
 	resp, err := internal.ForwardAdminProposal(
 		context.Background(),
-		&pb.ForwardAdminProposalRequest{Payload: []byte("pin")},
+		&pb.ForwardAdminProposalRequest{Payload: kv.EncodeBackupReleaseEntry(kv.BackupReleaseEntry{})},
 	)
 	require.NoError(t, err)
 	require.Equal(t, uint64(17), resp.GetCommitIndex())
-	require.Equal(t, []byte("pin"), proposer.payload)
+	require.Equal(t, kv.EncodeBackupReleaseEntry(kv.BackupReleaseEntry{}), proposer.payload)
 }
 
 func TestInternalForwardAdminProposalFailsClosed(t *testing.T) {
@@ -115,7 +115,9 @@ func TestInternalForwardAdminProposalFailsClosed(t *testing.T) {
 				nil,
 				WithInternalAdminProposer(tc.proposer),
 			)
-			_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{})
+			_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{
+				Payload: kv.EncodeBackupReleaseEntry(kv.BackupReleaseEntry{}),
+			})
 			if tc.errTarget != nil {
 				require.ErrorIs(t, err, tc.errTarget)
 			}

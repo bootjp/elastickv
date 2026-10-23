@@ -558,6 +558,9 @@ func (i *Internal) ForwardAdminProposal(
 	if i.adminProposer == nil {
 		return nil, errors.New("admin proposer is unavailable")
 	}
+	if err := kv.ValidateForwardedAdminPayload(req.GetPayload()); err != nil {
+		return nil, status.Error(codes.PermissionDenied, "admin forwarding requires a supported typed admin entry")
+	}
 	result, err := i.adminProposer.ProposeAdmin(ctx, req.GetPayload())
 	if err != nil {
 		return nil, errors.WithStack(err)

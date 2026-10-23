@@ -116,14 +116,20 @@ func splitJobControlMutation(mutation *pb.Mutation) bool {
 	}
 	return distribution.MigrationOnlyControlPrefixIntersects(key) ||
 		distribution.MigrationOnlyControlPrefixIntersects(embedded) ||
+		splitPartitionControlPrefix(key, embedded) ||
 		bytes.HasPrefix(distribution.CatalogSplitJobKey(0), key) ||
 		bytes.HasPrefix(distribution.CatalogSplitJobHistoryKey(0, 0), key) ||
 		bytes.HasPrefix(distribution.CatalogNextSplitJobIDKey(), key)
 }
 
 func splitMigrationControlKey(key []byte) bool {
-	return distribution.IsMigrationOnlyControlKey(key) || distribution.IsCatalogSplitJobKey(key) ||
+	return distribution.IsMigrationOnlyControlKey(key) || distribution.IsCatalogOwnershipPartitionKey(key) || distribution.IsCatalogSplitJobKey(key) ||
 		distribution.IsCatalogSplitJobHistoryKey(key) || bytes.Equal(key, distribution.CatalogNextSplitJobIDKey())
+}
+
+func splitPartitionControlPrefix(key, embedded []byte) bool {
+	return distribution.CatalogOwnershipPartitionPrefixIntersects(key) ||
+		(embedded != nil && distribution.CatalogOwnershipPartitionPrefixIntersects(embedded))
 }
 
 func checkSplitMigrationTransport(ctx context.Context, method, token string, peerAuthEnforced bool) error {
