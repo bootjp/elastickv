@@ -320,13 +320,13 @@ jobs:
             exit 1
           fi
           if ! strace -f -o /tmp/elastickv-sqlite.strace sqlite3 /tmp/elastickv-ci/fs-n2/sqlite-probe.db \
-              'PRAGMA synchronous=FULL; BEGIN IMMEDIATE; UPDATE probe SET value=2; COMMIT;'; then
+              'PRAGMA journal_mode=PERSIST; PRAGMA synchronous=FULL; BEGIN IMMEDIATE; UPDATE probe SET value=2; COMMIT;'; then
             tail -n 160 /tmp/elastickv-sqlite.strace
             exit 1
           fi
           for node in 1 2 3; do
             if ! strace -f -o /tmp/elastickv-sqlite.strace sqlite3 "/tmp/elastickv-ci/fs-n${node}/sqlite-probe.db" \
-                'SELECT value FROM probe;'; then
+                'PRAGMA journal_mode=PERSIST; SELECT value FROM probe;'; then
               tail -n 160 /tmp/elastickv-sqlite.strace
               exit 1
             fi
