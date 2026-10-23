@@ -61,7 +61,7 @@ func EnsureMigrationNamespaceAdmission(ctx context.Context, client SplitMigratio
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		_, err = client.CleanupMigration(ctx, request)
+		_, err = cleanupSplitMigration(ctx, client, request)
 		return errors.WithStack(err)
 	}
 	return EnsureMigrationNamespaceAdmissionWithSnapshot(ctx, snapshot, activate, nil)
