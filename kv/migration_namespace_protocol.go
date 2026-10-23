@@ -3,7 +3,6 @@ package kv
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"encoding/json"
 	"slices"
 
@@ -15,7 +14,7 @@ import (
 
 // MigrationNamespaceVersion is installed support, not permission to change
 // committed-entry admission. Only the configuration-bound control activates it.
-const MigrationNamespaceVersion uint32 = 1
+const MigrationNamespaceVersion = store.MigrationNamespaceVersion
 
 var ErrMigrationNamespaceProtocol = errors.New("namespace admission protocol is not proven for this configuration")
 
@@ -42,15 +41,7 @@ type NamespaceAdmissionCommand struct {
 // Reuse the existing exact peer-local MVCC key. Its versions already survive
 // native snapshots and are all stripped by external/rebased restore. Until
 // activation it retains the legacy eight-byte value and snapshot compatibility.
-type namespaceConfiguration struct {
-	Index       uint64
-	Version     uint32
-	ActivatedAt uint64
-	Members     []uint64
-	Joining     []uint64
-}
-
-var namespaceConfigurationMagic = []byte("EKVNS1\x00")
+type namespaceConfiguration = store.MigrationNamespaceConfiguration
 
 func readNamespaceConfiguration(ctx context.Context, st store.MVCCStore) (namespaceConfiguration, error) {
 	value, err := st.GetAt(ctx, migrationConfigurationIndexKey, ^uint64(0))
@@ -60,20 +51,8 @@ func readNamespaceConfiguration(ctx context.Context, st store.MVCCStore) (namesp
 	if err != nil {
 		return namespaceConfiguration{}, errors.WithStack(err)
 	}
-	if len(value) == 8 && binary.BigEndian.Uint64(value) != 0 {
-		return namespaceConfiguration{Index: binary.BigEndian.Uint64(value)}, nil
-	}
-	var state namespaceConfiguration
-	if !bytes.HasPrefix(value, namespaceConfigurationMagic) {
-		return state, errors.Wrap(ErrMigrationNamespaceProtocol, "invalid durable migration configuration index")
-	}
-	if err := json.Unmarshal(value[len(namespaceConfigurationMagic):], &state); err != nil {
-		return state, errors.WithStack(err)
-	}
-	if state.Index == 0 || state.Version != MigrationNamespaceVersion || state.ActivatedAt == 0 || state.ActivatedAt > state.Index || !validNamespaceMembers(state.Members) || !validNamespaceJoining(state.Joining, state.Members) {
-		return state, errors.WithStack(ErrMigrationNamespaceProtocol)
-	}
-	return state, nil
+	state, err := store.DecodeMigrationNamespaceConfiguration(value)
+	return state, errors.WithStack(errors.Mark(err, ErrMigrationNamespaceProtocol))
 }
 
 func validNamespaceMembers(ids []uint64) bool {
@@ -96,13 +75,9 @@ func validNamespaceJoining(ids, members []uint64) bool {
 }
 
 func (f *kvFSM) persistNamespaceConfiguration(ctx context.Context, state namespaceConfiguration, applyIndex uint64) error {
-	value := binary.BigEndian.AppendUint64(nil, state.Index)
-	if state.Version != 0 {
-		encoded, err := json.Marshal(state)
-		if err != nil {
-			return errors.WithStack(err)
-		}
-		value = append(slices.Clone(namespaceConfigurationMagic), encoded...)
+	value, err := store.EncodeMigrationNamespaceConfiguration(state)
+	if err != nil {
+		return errors.WithStack(err)
 	}
 	ts := max(f.store.LastCommitTS(), 1)
 	if err := f.store.ApplyMutationsRaftAt(ctx, []*store.KVPairMutation{{Op: store.OpTypePut, Key: migrationConfigurationIndexKey, Value: value}}, nil, ts, ts, applyIndex); err != nil {
@@ -173,6 +148,14 @@ func (f *kvFSM) RecoverNamespaceConfiguration(snapshotIndex uint64, members []ui
 }
 
 func MarshalNamespaceAdmissionCommand(command NamespaceAdmissionCommand) ([]byte, error) {
+	request, err := NewNamespaceAdmissionRequest(1, command)
+	if err != nil {
+		return nil, err
+	}
+	return MarshalMigrationCleanupCommand(request)
+}
+
+func NewNamespaceAdmissionRequest(jobID uint64, command NamespaceAdmissionCommand) (*pb.CleanupMigrationRequest, error) {
 	if err := validateNamespaceAdmissionCommand(command); err != nil {
 		return nil, err
 	}
@@ -180,11 +163,26 @@ func MarshalNamespaceAdmissionCommand(command NamespaceAdmissionCommand) ([]byte
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	return MarshalMigrationCleanupCommand(&pb.CleanupMigrationRequest{
+	return &pb.CleanupMigrationRequest{
+		JobId:                      jobID,
 		Mode:                       pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION,
 		ExpectedConfigurationIndex: command.ConfigurationIndex, RequireConfigurationIndex: true,
 		NamespaceAdmission: data,
-	})
+	}, nil
+}
+
+func ValidateNamespaceAdmissionRequest(request *pb.CleanupMigrationRequest) error {
+	if request == nil || request.GetMode() != pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION || !request.GetRequireConfigurationIndex() {
+		return errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	var command NamespaceAdmissionCommand
+	if err := json.Unmarshal(request.GetNamespaceAdmission(), &command); err != nil {
+		return errors.WithStack(err)
+	}
+	if command.ConfigurationIndex != request.GetExpectedConfigurationIndex() {
+		return errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	return validateNamespaceAdmissionCommand(command)
 }
 
 func validateNamespaceAdmissionCommand(command NamespaceAdmissionCommand) error {
@@ -229,7 +227,12 @@ func (f *kvFSM) applyNamespaceAdmission(ctx context.Context, data []byte) any {
 	if f.pendingApplyIdx <= state.Index {
 		return errors.WithStack(ErrMigrationNamespaceProtocol)
 	}
-	state.Version, state.Members, state.Joining = command.Version, members, joining
+	// Concurrent controllers may refresh activation while membership admission
+	// is between its prejoin control and ConfChange. Never revoke an already
+	// committed permission inside the same configuration.
+	joining = append(slices.Clone(state.Joining), joining...)
+	slices.Sort(joining)
+	state.Version, state.Members, state.Joining = command.Version, members, slices.Compact(joining)
 	if state.ActivatedAt == 0 {
 		state.ActivatedAt = state.Index
 	}

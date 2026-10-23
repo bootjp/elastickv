@@ -180,6 +180,7 @@ type Internal struct {
 	migrationCleanupGate            func(context.Context) error
 	migrationOwnershipReady         func() bool
 	migrationPartitionProtocolReady func() bool
+	migrationNamespaceReady         func() bool
 	transferSizeReady               func() bool
 	routeEngine                     *distribution.Engine
 	readTracker                     *kv.ActiveTimestampTracker
