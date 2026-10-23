@@ -706,6 +706,10 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.appliedIndex.Store(initialApplied)
+	if err := recoverNamespaceConfiguration(engine.fsm, prepared.disk.LocalSnap); err != nil {
+		_ = closePersist(prepared.disk.Persist)
+		return nil, errors.Wrap(err, "recover namespace configuration")
+	}
 	if err := engine.restorePendingConfChangeFenceFromStorage(rawNodeApplied); err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
@@ -714,7 +718,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		// External preparation seeded this destination ConfState at this index.
 		// Bind only after store validation and RawNode restoration succeed; never
 		// reuse an imported epoch or a later native snapshot's data index.
-		if err := engine.recordFSMConfiguration(prepared.disk.LocalSnap.GetMetadata().GetIndex()); err != nil {
+		if err := engine.recordFSMConfiguration(prepared.disk.LocalSnap.GetMetadata().GetIndex(), confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())); err != nil {
 			_ = closePersist(prepared.disk.Persist)
 			return nil, errors.Wrap(err, "bind external restore destination configuration")
 		}
@@ -2705,6 +2709,9 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
 		}
 	}
+	if err := recoverNamespaceConfiguration(e.fsm, *snapshot); err != nil {
+		return errors.Wrap(err, "recover snapshot namespace configuration")
+	}
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
 			snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm())
@@ -3011,7 +3018,7 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change index=%d", entry.GetIndex())
 	}
-	if err := e.recordFSMConfiguration(entry.GetIndex()); err != nil {
+	if err := e.recordFSMConfiguration(entry.GetIndex(), confStateValue(confState)); err != nil {
 		return err
 	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
@@ -3035,7 +3042,7 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change v2 index=%d", entry.GetIndex())
 	}
-	if err := e.recordFSMConfiguration(entry.GetIndex()); err != nil {
+	if err := e.recordFSMConfiguration(entry.GetIndex(), confStateValue(confState)); err != nil {
 		return err
 	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
@@ -3047,11 +3054,8 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	return nil
 }
 
-func (e *Engine) recordFSMConfiguration(index uint64) error {
-	if aware, ok := e.fsm.(raftengine.AppliedConfigurationAware); ok {
-		return errors.WithStack(aware.RecordAppliedConfiguration(index))
-	}
-	return nil
+func (e *Engine) recordFSMConfiguration(index uint64, state raftpb.ConfState) error {
+	return recordNamespaceConfiguration(e.fsm, index, state)
 }
 
 func (e *Engine) AppliedConfigurationIndex() (uint64, bool) {

@@ -119,6 +119,8 @@ type kvFSM struct {
 	prepareEvidenceReleaseFloor   atomic.Uint64
 	prepareEvidenceTimestampFloor atomic.Uint64
 	migrationConfigurationIndex   atomic.Uint64
+	migrationNamespaceVersion     atomic.Uint32
+	migrationNamespaceMembers     []uint64 // serial Raft configuration/apply loop only
 }
 
 // RouteHistory is the kv-side interface to the route catalog's
@@ -750,8 +752,10 @@ func haltResponseFor(err error) *haltApplyResponse {
 }
 
 func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
-	if err := verifyRequestMigrationControlKeys(r); err != nil {
-		return err
+	if f.migrationNamespaceVersion.Load() != 0 {
+		if err := verifyRequestMigrationControlKeys(r); err != nil {
+			return err
+		}
 	}
 	var err error
 	ctx, err = f.withMigrationOwnershipEvidence(ctx, r)
@@ -2200,7 +2204,7 @@ func (f *kvFSM) uniqueMutationsAboveFloorWithSnapshot(
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectReservedControlMutations(uniq); err != nil {
+	if err := f.rejectReservedControlMutations(uniq); err != nil {
 		return nil, err
 	}
 	if err := f.verifyRouteNotFencedForMutations(ctx, uniq, writeFenceBypassKeySet(writeFenceBypassKeys)); err != nil {
@@ -2234,12 +2238,12 @@ func (f *kvFSM) uniqueMutationsAboveFloorWithSnapshot(
 // The verdict is a pure function of the key, so every replica reaches it for
 // the same entry. The typed migration commands (import, promote, fence) do not
 // pass through here and keep writing these namespaces.
-func rejectReservedControlMutations(muts []*pb.Mutation) error {
+func (f *kvFSM) rejectReservedControlMutations(muts []*pb.Mutation) error {
 	for _, mut := range muts {
 		if mut == nil {
 			continue
 		}
-		if distribution.IsMigrationOnlyControlKey(mut.Key) {
+		if f.isMigrationOnlyControlKeyForApply(mut.Key) {
 			return errors.WithStack(ErrInvalidRequest)
 		}
 	}
@@ -2257,7 +2261,7 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorForRequest(
 	commitTS uint64,
 ) ([]*pb.Mutation, error) {
 	if migrationResolutionAuthorized(ctx, r) {
-		return migrationResolutionMutations(muts)
+		return f.migrationResolutionMutations(muts)
 	}
 	floorSnap, err := f.routeFloorSnapshotForRequest(ctx, r)
 	if err != nil {
@@ -2266,12 +2270,12 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorForRequest(
 	return f.uniqueTxnMutationsAboveFloorWithSnapshot(ctx, muts, commitTS, floorSnap)
 }
 
-func migrationResolutionMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
+func (f *kvFSM) migrationResolutionMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 	uniq, err := uniqueTxnMutations(muts)
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectReservedControlMutations(uniq); err != nil {
+	if err := f.rejectReservedControlMutations(uniq); err != nil {
 		return nil, err
 	}
 	return uniq, nil
@@ -2290,7 +2294,7 @@ func (f *kvFSM) uniqueTxnMutationsAboveFloorWithSnapshot(
 	if err != nil {
 		return nil, err
 	}
-	if err := rejectReservedControlMutations(uniq); err != nil {
+	if err := f.rejectReservedControlMutations(uniq); err != nil {
 		return nil, err
 	}
 	if err := f.verifyTargetReadinessForMutations(ctx, uniq); err != nil {
@@ -2773,7 +2777,7 @@ func (f *kvFSM) txnCommitTSAtKey(ctx context.Context, key []byte) (uint64, bool,
 }
 
 func (f *kvFSM) prepareTxnMutation(ctx context.Context, mut *pb.Mutation, primaryKey []byte, startTS, expireAt, commitTS uint64) ([]*store.KVPairMutation, error) {
-	if isTxnInternalKey(mut.Key) || distribution.IsMigrationOnlyControlKey(mut.Key) {
+	if isTxnInternalKey(mut.Key) || f.isMigrationOnlyControlKeyForApply(mut.Key) {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 	if err := f.validatePrepareLock(ctx, mut.Key, primaryKey, startTS, commitTS); err != nil {
@@ -2893,7 +2897,7 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 		// Already resolved (committed/rolled back).
 		return nil, false, nil
 	}
-	if err := validatePreparedCommitLock(lock, key, primaryKey, startTS, commitTS); err != nil {
+	if err := f.validatePreparedCommitLock(lock, key, primaryKey, startTS, commitTS); err != nil {
 		return nil, false, err
 	}
 
@@ -2917,8 +2921,8 @@ func (f *kvFSM) commitTxnKeyMutations(ctx context.Context, key, primaryKey []byt
 	return out, true, nil
 }
 
-func validatePreparedCommitLock(lock txnLock, key, primaryKey []byte, startTS, commitTS uint64) error {
-	if isTxnInternalKey(key) || distribution.IsMigrationOnlyControlKey(key) {
+func (f *kvFSM) validatePreparedCommitLock(lock txnLock, key, primaryKey []byte, startTS, commitTS uint64) error {
+	if isTxnInternalKey(key) || f.isMigrationOnlyControlKeyForApply(key) {
 		return errors.WithStack(ErrInvalidRequest)
 	}
 	if lock.StartTS != startTS {

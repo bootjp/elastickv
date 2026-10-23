@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 	"testing"
@@ -31,6 +32,7 @@ func TestMigrationNamespaceRejectsAllTransactionPhasesAndAdvisory(t *testing.T) 
 			t.Run(phase.String()+"/"+string(key), func(t *testing.T) {
 				st := store.NewMVCCStore()
 				f := &kvFSM{store: st, shardGroupID: 1}
+				activateMigrationNamespace(t, f)
 				request := migrationNamespaceRequest(phase, key)
 				if phase == pb.Phase_COMMIT || phase == pb.Phase_ABORT {
 					seedLegacyMigrationIntent(t, st, key)
@@ -38,7 +40,12 @@ func TestMigrationNamespaceRejectsAllTransactionPhasesAndAdvisory(t *testing.T) 
 				require.ErrorIs(t, CheckMigrationRequest(t.Context(), st, 1, request), ErrInvalidRequest)
 				require.ErrorIs(t, applyFSMRequest(t, f, request), ErrInvalidRequest)
 				_, err := st.GetAt(t.Context(), key, ^uint64(0))
-				require.ErrorIs(t, err, store.ErrKeyNotFound)
+				if bytes.Equal(key, migrationConfigurationIndexKey) {
+					require.NoError(t, err)
+					require.NoError(t, RequireMigrationNamespaceAdmission(t.Context(), st))
+				} else {
+					require.ErrorIs(t, err, store.ErrKeyNotFound)
+				}
 				if phase == pb.Phase_COMMIT || phase == pb.Phase_ABORT {
 					_, err = st.GetAt(t.Context(), txnIntentKey(key), ^uint64(0))
 					require.NoError(t, err, "rejected resolution must not mutate the legacy intent")
@@ -62,6 +69,7 @@ func TestMigrationNamespacePebbleRemainsReopenableAfterRejectedWrite(t *testing.
 	require.NoError(t, err)
 	f, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
 	require.True(t, ok)
+	activateMigrationNamespace(t, f)
 	assert.ErrorIs(t, applyFSMRequest(t, f, migrationNamespaceRequest(pb.Phase_NONE, []byte("!migstage|ready|"))), ErrInvalidRequest)
 	for _, key := range []string{"_migack", "_mighlc", "_migpromote"} {
 		require.NoError(t, applyFSMRequest(t, f, &pb.Request{Ts: 30, Mutations: []*pb.Mutation{
@@ -100,6 +108,7 @@ func TestMigrationNamespacePreservesOrdinaryAliases(t *testing.T) {
 		t.Run(string(key), func(t *testing.T) {
 			st := store.NewMVCCStore()
 			f := &kvFSM{store: st, shardGroupID: 1}
+			activateMigrationNamespace(t, f)
 			request := migrationNamespaceRequest(pb.Phase_NONE, key)
 			require.NoError(t, CheckMigrationRequest(context.Background(), st, 1, request))
 			require.NoError(t, applyFSMRequest(t, f, request))
@@ -118,6 +127,7 @@ func TestMigrationNamespaceRejectsPrefixDeletesAndCancelledAdvisory(t *testing.T
 		for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE, pb.Phase_COMMIT, pb.Phase_ABORT} {
 			st := store.NewMVCCStore()
 			f := &kvFSM{store: st, shardGroupID: 1}
+			activateMigrationNamespace(t, f)
 			request := migrationNamespaceRequest(phase, key)
 			request.Mutations[1].Op = pb.Op_DEL_PREFIX
 			ctx, cancel := context.WithCancel(t.Context())

@@ -251,6 +251,7 @@ enum MigrationCleanupMode {
   MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR = 4;
   MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH = 5;
   MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE = 6;
+  MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION = 8;
 }
 
 enum MigrationOwnershipRole {
@@ -299,6 +300,9 @@ message CleanupMigrationRequest {
   uint64 expected_configuration_index = 17;
   bool require_configuration_index = 18;
   MigrationOwnershipProof ownership = 19;
+  // Versioned namespace activation/prejoin control. Never propose until every
+  // apply member (including learners) acknowledged support at this ConfChange.
+  bytes namespace_admission = 21;
 }
 
 message CleanupMigrationResponse {
@@ -321,6 +325,7 @@ enum MigrationStateProbeKind {
   MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT = 6;
   MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY = 7;
   MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED = 8;
+  MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION = 10;
 }
 
 message ProbeMigrationStateRequest {
@@ -361,6 +366,8 @@ message ProbeMigrationStateResponse {
   // Installed support, observable before a candidate has an applied ConfState.
   // This is not operational ownership readiness or an activation override.
   uint32 ownership_partition_protocol = 10;
+  // Installed support only; the durable group activation is separately probed.
+  uint32 namespace_admission_version = 11;
 }
 
 message IssueMigrationTimestampRequest {}

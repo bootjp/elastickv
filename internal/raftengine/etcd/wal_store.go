@@ -115,10 +115,8 @@ func joinWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string) (*disk
 func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {
 	// Bootstrap snapshot always has index 1.
 	const bootstrapIndex = uint64(1)
-	if aware, ok := fsm.(raftengine.AppliedConfigurationAware); ok {
-		if err := aware.RecordAppliedConfiguration(bootstrapIndex); err != nil {
-			return nil, errors.WithStack(err)
-		}
+	if err := recordNamespaceConfiguration(fsm, bootstrapIndex, confStateForPeers(peers)); err != nil {
+		return nil, errors.WithStack(err)
 	}
 	snapshot, err := fsm.Snapshot()
 	if err != nil {

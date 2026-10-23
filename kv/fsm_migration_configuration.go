@@ -17,17 +17,8 @@ var ErrMigrationConfigurationChanged = errors.New("migration cleanup configurati
 // configuration through the upgraded apply loop. Such stores cannot attest a
 // configuration-bound cleanup barrier.
 func MigrationConfigurationIndex(ctx context.Context, st store.MVCCStore) (uint64, error) {
-	value, err := st.GetAt(ctx, migrationConfigurationIndexKey, ^uint64(0))
-	if errors.Is(err, store.ErrKeyNotFound) {
-		return 0, nil
-	}
-	if err != nil {
-		return 0, errors.WithStack(err)
-	}
-	if len(value) != 8 || binary.BigEndian.Uint64(value) == 0 {
-		return 0, errors.New("invalid durable migration configuration index")
-	}
-	return binary.BigEndian.Uint64(value), nil
+	state, err := readNamespaceConfiguration(ctx, st)
+	return state.Index, err
 }
 
 func (f *kvFSM) AppliedConfigurationIndex() uint64 {
@@ -41,6 +32,9 @@ func (f *kvFSM) RecordAppliedConfiguration(index uint64) error {
 	if index == 0 || index <= f.AppliedConfigurationIndex() {
 		return nil
 	}
+	if f.migrationNamespaceVersion.Load() != 0 {
+		return errors.Wrap(ErrMigrationNamespaceProtocol, "active namespace protocol requires the full ordered configuration hook")
+	}
 	// Reuse the replicated store frontier; configuration bookkeeping must not
 	// issue a wall-clock timestamp or change user transaction admission.
 	ts := max(f.store.LastCommitTS(), 1)
@@ -53,13 +47,16 @@ func (f *kvFSM) RecordAppliedConfiguration(index uint64) error {
 		return errors.WithStack(err)
 	}
 	f.migrationConfigurationIndex.Store(index)
+	f.migrationNamespaceMembers = nil // Index-only hooks cannot prove apply membership.
 	return nil
 }
 
 func (f *kvFSM) reloadMigrationConfiguration(ctx context.Context) error {
-	index, err := MigrationConfigurationIndex(ctx, f.store)
+	state, err := readNamespaceConfiguration(ctx, f.store)
 	if err == nil {
-		f.migrationConfigurationIndex.Store(index)
+		f.migrationConfigurationIndex.Store(state.Index)
+		f.migrationNamespaceVersion.Store(state.Version)
+		f.migrationNamespaceMembers = state.Members
 	}
 	return err
 }

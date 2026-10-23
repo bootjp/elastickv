@@ -38,6 +38,12 @@ func (f *kvFSM) applyMigrationCleanup(ctx context.Context, data []byte) any {
 	if err := proto.Unmarshal(data, req); err != nil {
 		return errors.WithStack(err)
 	}
+	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
+		if !req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() != f.AppliedConfigurationIndex() {
+			return errors.WithStack(ErrMigrationNamespaceProtocol)
+		}
+		return f.applyNamespaceAdmission(ctx, req.GetNamespaceAdmission())
+	}
 	if err := f.verifyMigrationCleanupConfiguration(ctx, req); err != nil {
 		if errors.Is(err, ErrMigrationConfigurationChanged) {
 			return err

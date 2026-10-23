@@ -187,7 +187,7 @@ func (f *kvFSM) migrationResolutionMutationsMatch(ctx context.Context, req *pb.R
 		if mut == nil || len(mut.GetKey()) == 0 || isTxnInternalKey(mut.GetKey()) {
 			return false, errors.WithStack(ErrInvalidRequest)
 		}
-		if err := rejectReservedControlMutations([]*pb.Mutation{mut}); err != nil {
+		if err := f.rejectReservedControlMutations([]*pb.Mutation{mut}); err != nil {
 			return false, err
 		}
 		matches, err := f.migrationResolutionKeyMatches(ctx, req, meta, mut.GetKey())
