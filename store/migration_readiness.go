@@ -11,13 +11,19 @@ import (
 )
 
 const (
-	targetReadinessCodecVersionV1 byte = 1
-	targetReadinessCodecVersion   byte = 2
-	targetReadinessArmedFlag      byte = 1
-	targetReadinessSourceWrite    byte = 1
-	targetReadinessSourceRead     byte = 2
-	targetReadinessTrackWrites    byte = 4
+	targetReadinessCodecVersionV1    byte = 1
+	targetReadinessCodecVersion      byte = 2
+	targetReadinessGuardCodecVersion byte = 3
+	targetReadinessArmedFlag         byte = 1
+	targetReadinessSourceWrite       byte = 1
+	targetReadinessSourceRead        byte = 2
+	targetReadinessTrackWrites       byte = 4
+	targetReadinessTransferSizeGuard byte = 8
 )
+
+// MigrationTransferSizeGuardVersion is independent of the ownership protocol
+// and does not change the admission contract of legacy write trackers.
+const MigrationTransferSizeGuardVersion uint32 = 1
 
 // invalidReadinessState marks a validation verdict so apply can tell it apart
 // from a replica-local persistence failure: the former is a pure function of
@@ -41,6 +47,10 @@ func validateTargetStagedReadinessState(state TargetStagedReadinessState) error 
 }
 
 func validateSourceMigrationControlState(state TargetStagedReadinessState) error {
+	if state.TransferSizeGuardVersion != 0 &&
+		(state.TransferSizeGuardVersion != MigrationTransferSizeGuardVersion || !state.Armed || !state.TrackWrites) {
+		return invalidReadinessState("transfer size guard requires supported version and armed source tracker")
+	}
 	if state.SourceReadFence && !state.SourceWriteFence {
 		return invalidReadinessState("source read fence requires source write fence")
 	}
@@ -188,6 +198,9 @@ func isTargetReadinessRecordKey(rawKey []byte) bool {
 func encodeTargetStagedReadinessState(state TargetStagedReadinessState) []byte {
 	buf := make([]byte, 0, targetReadinessEncodedSize(state))
 	buf = append(buf, targetReadinessCodecVersion)
+	if state.TransferSizeGuardVersion != 0 {
+		buf[0] = targetReadinessGuardCodecVersion
+	}
 	if state.Armed {
 		buf = append(buf, targetReadinessArmedFlag)
 	} else {
@@ -202,6 +215,9 @@ func encodeTargetStagedReadinessState(state TargetStagedReadinessState) []byte {
 	}
 	if state.TrackWrites {
 		sourceFlags |= targetReadinessTrackWrites
+	}
+	if state.TransferSizeGuardVersion == MigrationTransferSizeGuardVersion {
+		sourceFlags |= targetReadinessTransferSizeGuard
 	}
 	buf = append(buf, sourceFlags)
 	buf = binary.BigEndian.AppendUint64(buf, state.JobID)
@@ -240,14 +256,21 @@ func decodeTargetReadinessHeader(data []byte) (TargetStagedReadinessState, []byt
 	if data[0] == targetReadinessCodecVersionV1 {
 		return decodeTargetReadinessHeaderV1(data)
 	}
-	if len(data) < 3+6*migrationUint64Bytes || data[0] != targetReadinessCodecVersion {
+	if len(data) < 3+6*migrationUint64Bytes || (data[0] != targetReadinessCodecVersion && data[0] != targetReadinessGuardCodecVersion) {
 		return TargetStagedReadinessState{}, nil, false
 	}
 	if data[1] != 0 && data[1] != targetReadinessArmedFlag {
 		return TargetStagedReadinessState{}, nil, false
 	}
 	sourceFlags := data[2]
-	if sourceFlags & ^(targetReadinessSourceWrite|targetReadinessSourceRead|targetReadinessTrackWrites) != 0 {
+	allowedFlags := targetReadinessSourceWrite | targetReadinessSourceRead | targetReadinessTrackWrites
+	if data[0] == targetReadinessGuardCodecVersion {
+		allowedFlags |= targetReadinessTransferSizeGuard
+		if sourceFlags&targetReadinessTransferSizeGuard == 0 {
+			return TargetStagedReadinessState{}, nil, false
+		}
+	}
+	if sourceFlags & ^allowedFlags != 0 {
 		return TargetStagedReadinessState{}, nil, false
 	}
 	state := TargetStagedReadinessState{
@@ -255,6 +278,9 @@ func decodeTargetReadinessHeader(data []byte) (TargetStagedReadinessState, []byt
 		SourceWriteFence: sourceFlags&targetReadinessSourceWrite != 0,
 		SourceReadFence:  sourceFlags&targetReadinessSourceRead != 0,
 		TrackWrites:      sourceFlags&targetReadinessTrackWrites != 0,
+	}
+	if sourceFlags&targetReadinessTransferSizeGuard != 0 {
+		state.TransferSizeGuardVersion = MigrationTransferSizeGuardVersion
 	}
 	rest := data[3:]
 	state.JobID = binary.BigEndian.Uint64(rest[:migrationUint64Bytes])
@@ -334,18 +360,19 @@ func readVarBytes(data []byte) ([]byte, []byte, bool) {
 
 func cloneTargetStagedReadinessState(state TargetStagedReadinessState) TargetStagedReadinessState {
 	return TargetStagedReadinessState{
-		JobID:                  state.JobID,
-		RouteStart:             bytes.Clone(state.RouteStart),
-		RouteEnd:               bytes.Clone(state.RouteEnd),
-		ExpectedCutoverVersion: state.ExpectedCutoverVersion,
-		MigrationJobID:         state.MigrationJobID,
-		MinWriteTSExclusive:    state.MinWriteTSExclusive,
-		Armed:                  state.Armed,
-		SourceWriteFence:       state.SourceWriteFence,
-		SourceReadFence:        state.SourceReadFence,
-		RetentionPinTS:         state.RetentionPinTS,
-		TrackWrites:            state.TrackWrites,
-		MinAdmittedTS:          state.MinAdmittedTS,
+		JobID:                    state.JobID,
+		RouteStart:               bytes.Clone(state.RouteStart),
+		RouteEnd:                 bytes.Clone(state.RouteEnd),
+		ExpectedCutoverVersion:   state.ExpectedCutoverVersion,
+		MigrationJobID:           state.MigrationJobID,
+		MinWriteTSExclusive:      state.MinWriteTSExclusive,
+		Armed:                    state.Armed,
+		SourceWriteFence:         state.SourceWriteFence,
+		SourceReadFence:          state.SourceReadFence,
+		RetentionPinTS:           state.RetentionPinTS,
+		TrackWrites:              state.TrackWrites,
+		MinAdmittedTS:            state.MinAdmittedTS,
+		TransferSizeGuardVersion: state.TransferSizeGuardVersion,
 	}
 }
 

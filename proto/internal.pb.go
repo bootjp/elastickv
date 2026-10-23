@@ -1650,8 +1650,12 @@ type TargetStagedReadinessRequest struct {
 	RetentionPinTs   uint64 `protobuf:"varint,10,opt,name=retention_pin_ts,json=retentionPinTs,proto3" json:"retention_pin_ts,omitempty"`
 	TrackWrites      bool   `protobuf:"varint,11,opt,name=track_writes,json=trackWrites,proto3" json:"track_writes,omitempty"`
 	MinAdmittedTs    uint64 `protobuf:"varint,12,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
-	unknownFields    protoimpl.UnknownFields
-	sizeCache        protoimpl.SizeCache
+	// Explicit opt-in; zero preserves legacy tracker write admission.
+	TransferSizeGuardVersion   uint32 `protobuf:"varint,13,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
+	RequireConfigurationIndex  bool   `protobuf:"varint,14,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
+	ExpectedConfigurationIndex uint64 `protobuf:"varint,15,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *TargetStagedReadinessRequest) Reset() {
@@ -1764,6 +1768,27 @@ func (x *TargetStagedReadinessRequest) GetTrackWrites() bool {
 func (x *TargetStagedReadinessRequest) GetMinAdmittedTs() uint64 {
 	if x != nil {
 		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetTransferSizeGuardVersion() uint32 {
+	if x != nil {
+		return x.TransferSizeGuardVersion
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetRequireConfigurationIndex() bool {
+	if x != nil {
+		return x.RequireConfigurationIndex
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetExpectedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ExpectedConfigurationIndex
 	}
 	return 0
 }
@@ -2360,6 +2385,7 @@ type ProbeMigrationStateRequest struct {
 	RequireConfigurationIndex  bool                     `protobuf:"varint,15,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
 	ExpectedConfigurationIndex uint64                   `protobuf:"varint,16,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
 	Ownership                  *MigrationOwnershipProof `protobuf:"bytes,17,opt,name=ownership,proto3" json:"ownership,omitempty"`
+	TransferSizeGuardVersion   uint32                   `protobuf:"varint,18,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
 	unknownFields              protoimpl.UnknownFields
 	sizeCache                  protoimpl.SizeCache
 }
@@ -2513,6 +2539,13 @@ func (x *ProbeMigrationStateRequest) GetOwnership() *MigrationOwnershipProof {
 	return nil
 }
 
+func (x *ProbeMigrationStateRequest) GetTransferSizeGuardVersion() uint32 {
+	if x != nil {
+		return x.TransferSizeGuardVersion
+	}
+	return 0
+}
+
 type ProbeMigrationStateResponse struct {
 	state                     protoimpl.MessageState   `protogen:"open.v1"`
 	Ready                     bool                     `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
@@ -2523,6 +2556,8 @@ type ProbeMigrationStateResponse struct {
 	OwnershipProtocol         uint32                   `protobuf:"varint,6,opt,name=ownership_protocol,json=ownershipProtocol,proto3" json:"ownership_protocol,omitempty"`
 	Ownership                 *MigrationOwnershipProof `protobuf:"bytes,7,opt,name=ownership,proto3" json:"ownership,omitempty"`
 	OwnershipCleared          bool                     `protobuf:"varint,8,opt,name=ownership_cleared,json=ownershipCleared,proto3" json:"ownership_cleared,omitempty"`
+	// Local support, not proof that the requested job's guard is applied.
+	TransferSizeGuardVersion uint32 `protobuf:"varint,9,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
 	// Installed support, observable before a candidate has an applied ConfState.
 	// This is not operational ownership readiness or an activation override.
 	OwnershipPartitionProtocol uint32 `protobuf:"varint,10,opt,name=ownership_partition_protocol,json=ownershipPartitionProtocol,proto3" json:"ownership_partition_protocol,omitempty"`
@@ -2614,6 +2649,13 @@ func (x *ProbeMigrationStateResponse) GetOwnershipCleared() bool {
 		return x.OwnershipCleared
 	}
 	return false
+}
+
+func (x *ProbeMigrationStateResponse) GetTransferSizeGuardVersion() uint32 {
+	if x != nil {
+		return x.TransferSizeGuardVersion
+	}
+	return 0
 }
 
 func (x *ProbeMigrationStateResponse) GetOwnershipPartitionProtocol() uint32 {
@@ -2816,7 +2858,7 @@ const file_internal_proto_rawDesc = "" +
 	"nextCursor\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
 	"\rpromoted_rows\x18\x03 \x01(\x04R\fpromotedRows\x12&\n" +
-	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xf1\x03\n" +
+	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xb2\x05\n" +
 	"\x1cTargetStagedReadinessRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x1f\n" +
 	"\vroute_start\x18\x02 \x01(\fR\n" +
@@ -2831,7 +2873,10 @@ const file_internal_proto_rawDesc = "" +
 	"\x10retention_pin_ts\x18\n" +
 	" \x01(\x04R\x0eretentionPinTs\x12!\n" +
 	"\ftrack_writes\x18\v \x01(\bR\vtrackWrites\x12&\n" +
-	"\x0fmin_admitted_ts\x18\f \x01(\x04R\rminAdmittedTs\"G\n" +
+	"\x0fmin_admitted_ts\x18\f \x01(\x04R\rminAdmittedTs\x12=\n" +
+	"\x1btransfer_size_guard_version\x18\r \x01(\rR\x18transferSizeGuardVersion\x12>\n" +
+	"\x1brequire_configuration_index\x18\x0e \x01(\bR\x19requireConfigurationIndex\x12@\n" +
+	"\x1cexpected_configuration_index\x18\x0f \x01(\x04R\x1aexpectedConfigurationIndex\"G\n" +
 	"\x1dTargetStagedReadinessResponse\x12&\n" +
 	"\x0fmin_admitted_ts\x18\x01 \x01(\x04R\rminAdmittedTs\"p\n" +
 	"\x1aProbeMigrationLocksRequest\x12\x1f\n" +
@@ -2891,7 +2936,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12!\n" +
 	"\fdeleted_rows\x18\x03 \x01(\x04R\vdeletedRows\x12#\n" +
 	"\rdeleted_bytes\x18\x04 \x01(\x04R\fdeletedBytes\x12#\n" +
-	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xa8\x06\n" +
+	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xe7\x06\n" +
 	"\x1aProbeMigrationStateRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12,\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x18.MigrationStateProbeKindR\x04kind\x12\x1f\n" +
@@ -2911,7 +2956,8 @@ const file_internal_proto_rawDesc = "" +
 	"\x11read_drain_min_ts\x18\x0e \x01(\x04R\x0ereadDrainMinTs\x12>\n" +
 	"\x1brequire_configuration_index\x18\x0f \x01(\bR\x19requireConfigurationIndex\x12@\n" +
 	"\x1cexpected_configuration_index\x18\x10 \x01(\x04R\x1aexpectedConfigurationIndex\x126\n" +
-	"\townership\x18\x11 \x01(\v2\x18.MigrationOwnershipProofR\townership\"\xcd\x03\n" +
+	"\townership\x18\x11 \x01(\v2\x18.MigrationOwnershipProofR\townership\x12=\n" +
+	"\x1btransfer_size_guard_version\x18\x12 \x01(\rR\x18transferSizeGuardVersion\"\x8c\x04\n" +
 	"\x1bProbeMigrationStateResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
@@ -2920,7 +2966,8 @@ const file_internal_proto_rawDesc = "" +
 	"\x14ownership_generation\x18\x05 \x01(\tR\x13ownershipGeneration\x12-\n" +
 	"\x12ownership_protocol\x18\x06 \x01(\rR\x11ownershipProtocol\x126\n" +
 	"\townership\x18\a \x01(\v2\x18.MigrationOwnershipProofR\townership\x12+\n" +
-	"\x11ownership_cleared\x18\b \x01(\bR\x10ownershipCleared\x12@\n" +
+	"\x11ownership_cleared\x18\b \x01(\bR\x10ownershipCleared\x12=\n" +
+	"\x1btransfer_size_guard_version\x18\t \x01(\rR\x18transferSizeGuardVersion\x12@\n" +
 	"\x1cownership_partition_protocol\x18\n" +
 	" \x01(\rR\x1aownershipPartitionProtocol\" \n" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +

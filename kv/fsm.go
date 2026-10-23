@@ -473,6 +473,7 @@ func isRawApplyVerdict(err error) bool {
 		return false
 	}
 	return errors.Is(err, ErrInvalidRequest) ||
+		errors.Is(err, ErrMigrationTransferTooLarge) ||
 		errors.Is(err, ErrRouteCutoverPending) ||
 		errors.Is(err, ErrUnknownRequestType) ||
 		errors.Is(err, ErrBackupTimestampFenced) ||
@@ -801,13 +802,15 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	if err := f.validateRawMutationsForApply(ctx, r, commitTS, floorSnap); err != nil {
 		return err
 	}
-	if err := f.recordMigrationWrite(ctx, r.Mutations, commitTS); err != nil {
-		return err
-	}
-
 	muts, err := toStoreMutations(r.Mutations)
 	if err != nil {
 		return errors.WithStack(err)
+	}
+	if err := f.verifyMigrationTransferSize(ctx, muts); err != nil {
+		return err
+	}
+	if err := f.recordMigrationWrite(ctx, r.Mutations, commitTS); err != nil {
+		return err
 	}
 	// Raw requests always commit against the latest state; use commitTS as both
 	// the validation snapshot and the commit timestamp.
@@ -2036,6 +2039,9 @@ func prepareRouteFloorTimestamp(meta TxnMeta, startTS uint64) uint64 {
 }
 
 func (f *kvFSM) recordAndApplyPrepare(ctx context.Context, muts []*pb.Mutation, storeMuts []*store.KVPairMutation, readKeys [][]byte, floorTS, startTS uint64) error {
+	if err := f.verifyMigrationTransferSize(ctx, storeMuts); err != nil {
+		return err
+	}
 	if err := f.recordMigrationWrite(ctx, muts, floorTS); err != nil {
 		return err
 	}
@@ -2102,6 +2108,9 @@ func (f *kvFSM) handleOnePhaseTxnRequest(ctx context.Context, r *pb.Request, com
 }
 
 func (f *kvFSM) recordAndApplyOnePhase(ctx context.Context, uniq []*pb.Mutation, storeMuts []*store.KVPairMutation, readKeys [][]byte, startTS, commitTS uint64) error {
+	if err := f.verifyMigrationTransferSize(ctx, storeMuts); err != nil {
+		return err
+	}
 	readKeys, err := f.onePhaseConflictReadKeys(ctx, uniq, readKeys)
 	if err != nil {
 		return err

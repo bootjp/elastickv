@@ -230,6 +230,9 @@ type TargetStagedReadinessState struct {
 	RetentionPinTS         uint64
 	TrackWrites            bool
 	MinAdmittedTS          uint64
+	// TransferSizeGuardVersion explicitly opts this source interval into
+	// deterministic transfer-size admission; legacy trackers leave it zero.
+	TransferSizeGuardVersion uint32
 }
 
 // MigrationPromoter is implemented by stores that can promote staged range

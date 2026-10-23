@@ -180,6 +180,7 @@ type Internal struct {
 	migrationCleanupGate            func(context.Context) error
 	migrationOwnershipReady         func() bool
 	migrationPartitionProtocolReady func() bool
+	transferSizeReady               func() bool
 	routeEngine                     *distribution.Engine
 	readTracker                     *kv.ActiveTimestampTracker
 	migrationExportGroupID          uint64
@@ -273,6 +274,13 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 	resp, err := i.probeMigrationStateKind(ctx, req)
 	if err != nil {
 		return nil, err
+	}
+	if i.MigrationTransferSizeGuardSupported() {
+		resp.TransferSizeGuardVersion = store.MigrationTransferSizeGuardVersion
+	}
+	if req.GetTransferSizeGuardVersion() != 0 &&
+		(req.GetTransferSizeGuardVersion() != resp.GetTransferSizeGuardVersion() || !i.MigrationTransferSizeGuardReady()) {
+		resp.Ready = false
 	}
 	if req.GetRequireConfigurationIndex() {
 		reader, supported := i.leader.(raftengine.AppliedConfigurationReader)
@@ -426,6 +434,7 @@ func migrationControlMatches(state store.TargetStagedReadinessState, req *pb.Pro
 		state.SourceWriteFence == req.GetSourceWriteFence() &&
 		state.SourceReadFence == req.GetSourceReadFence() &&
 		state.TrackWrites == req.GetTrackWrites() &&
+		(req.GetTransferSizeGuardVersion() == 0 || state.TransferSizeGuardVersion == req.GetTransferSizeGuardVersion()) &&
 		state.RetentionPinTS == req.GetRetentionPinTs()
 }
 
@@ -793,6 +802,9 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 
 func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest) (*pb.TargetStagedReadinessResponse, error) {
 	if err := validateTargetStagedReadinessRequest(req); err != nil {
+		return nil, err
+	}
+	if err := i.validateTransferSizeGuardActivation(ctx, req); err != nil {
 		return nil, err
 	}
 	if i.migrationProposer == nil {

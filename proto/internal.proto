@@ -221,6 +221,10 @@ message TargetStagedReadinessRequest {
   uint64 retention_pin_ts = 10;
   bool track_writes = 11;
   uint64 min_admitted_ts = 12;
+  // Explicit opt-in; zero preserves legacy tracker write admission.
+  uint32 transfer_size_guard_version = 13;
+  bool require_configuration_index = 14;
+  uint64 expected_configuration_index = 15;
 }
 
 message TargetStagedReadinessResponse {
@@ -340,6 +344,7 @@ message ProbeMigrationStateRequest {
   bool require_configuration_index = 15;
   uint64 expected_configuration_index = 16;
   MigrationOwnershipProof ownership = 17;
+  uint32 transfer_size_guard_version = 18;
 }
 
 message ProbeMigrationStateResponse {
@@ -351,6 +356,8 @@ message ProbeMigrationStateResponse {
   uint32 ownership_protocol = 6;
   MigrationOwnershipProof ownership = 7;
   bool ownership_cleared = 8;
+  // Local support, not proof that the requested job's guard is applied.
+  uint32 transfer_size_guard_version = 9;
   // Installed support, observable before a candidate has an applied ConfState.
   // This is not operational ownership readiness or an activation override.
   uint32 ownership_partition_protocol = 10;

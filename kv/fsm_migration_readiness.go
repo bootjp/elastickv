@@ -33,6 +33,11 @@ func (f *kvFSM) applyTargetStagedReadiness(ctx context.Context, data []byte) any
 	if err := proto.Unmarshal(data, req); err != nil {
 		return errors.WithStack(err)
 	}
+	if req.GetTransferSizeGuardVersion() != 0 &&
+		(!req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() == 0 ||
+			req.GetExpectedConfigurationIndex() != f.AppliedConfigurationIndex()) {
+		return errors.WithStack(ErrMigrationConfigurationChanged)
+	}
 	writer, ok := f.store.(store.MigrationTargetReadinessWriter)
 	if !ok {
 		return haltErr(errors.Wrap(errors.Mark(store.ErrNotSupported, ErrTargetReadinessApply), "kv/fsm: target staged readiness store"))
@@ -103,6 +108,7 @@ func mergeSourceMigrationControl(state, current store.TargetStagedReadinessState
 	state.SourceWriteFence = state.SourceWriteFence || current.SourceWriteFence
 	state.SourceReadFence = state.SourceReadFence || current.SourceReadFence
 	state.TrackWrites = state.TrackWrites || current.TrackWrites
+	state.TransferSizeGuardVersion = max(state.TransferSizeGuardVersion, current.TransferSizeGuardVersion)
 	state.MinWriteTSExclusive = max(state.MinWriteTSExclusive, current.MinWriteTSExclusive)
 	if state.RetentionPinTS == 0 || current.RetentionPinTS < state.RetentionPinTS {
 		state.RetentionPinTS = current.RetentionPinTS
@@ -203,17 +209,18 @@ func targetStagedReadinessStateFromProto(req *pb.TargetStagedReadinessRequest) s
 		return store.TargetStagedReadinessState{}
 	}
 	return store.TargetStagedReadinessState{
-		JobID:                  req.GetJobId(),
-		RouteStart:             bytes.Clone(req.GetRouteStart()),
-		RouteEnd:               bytes.Clone(req.GetRouteEnd()),
-		ExpectedCutoverVersion: req.GetExpectedCutoverVersion(),
-		MigrationJobID:         req.GetMigrationJobId(),
-		MinWriteTSExclusive:    req.GetMinWriteTsExclusive(),
-		Armed:                  req.GetArmed(),
-		SourceWriteFence:       req.GetSourceWriteFence(),
-		SourceReadFence:        req.GetSourceReadFence(),
-		RetentionPinTS:         req.GetRetentionPinTs(),
-		TrackWrites:            req.GetTrackWrites(),
-		MinAdmittedTS:          req.GetMinAdmittedTs(),
+		JobID:                    req.GetJobId(),
+		RouteStart:               bytes.Clone(req.GetRouteStart()),
+		RouteEnd:                 bytes.Clone(req.GetRouteEnd()),
+		ExpectedCutoverVersion:   req.GetExpectedCutoverVersion(),
+		MigrationJobID:           req.GetMigrationJobId(),
+		MinWriteTSExclusive:      req.GetMinWriteTsExclusive(),
+		Armed:                    req.GetArmed(),
+		SourceWriteFence:         req.GetSourceWriteFence(),
+		SourceReadFence:          req.GetSourceReadFence(),
+		RetentionPinTS:           req.GetRetentionPinTs(),
+		TrackWrites:              req.GetTrackWrites(),
+		MinAdmittedTS:            req.GetMinAdmittedTs(),
+		TransferSizeGuardVersion: req.GetTransferSizeGuardVersion(),
 	}
 }
