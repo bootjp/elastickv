@@ -2523,8 +2523,11 @@ type ProbeMigrationStateResponse struct {
 	OwnershipProtocol         uint32                   `protobuf:"varint,6,opt,name=ownership_protocol,json=ownershipProtocol,proto3" json:"ownership_protocol,omitempty"`
 	Ownership                 *MigrationOwnershipProof `protobuf:"bytes,7,opt,name=ownership,proto3" json:"ownership,omitempty"`
 	OwnershipCleared          bool                     `protobuf:"varint,8,opt,name=ownership_cleared,json=ownershipCleared,proto3" json:"ownership_cleared,omitempty"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	// Installed support, observable before a candidate has an applied ConfState.
+	// This is not operational ownership readiness or an activation override.
+	OwnershipPartitionProtocol uint32 `protobuf:"varint,10,opt,name=ownership_partition_protocol,json=ownershipPartitionProtocol,proto3" json:"ownership_partition_protocol,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
 }
 
 func (x *ProbeMigrationStateResponse) Reset() {
@@ -2611,6 +2614,13 @@ func (x *ProbeMigrationStateResponse) GetOwnershipCleared() bool {
 		return x.OwnershipCleared
 	}
 	return false
+}
+
+func (x *ProbeMigrationStateResponse) GetOwnershipPartitionProtocol() uint32 {
+	if x != nil {
+		return x.OwnershipPartitionProtocol
+	}
+	return 0
 }
 
 type IssueMigrationTimestampRequest struct {
@@ -2901,7 +2911,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x11read_drain_min_ts\x18\x0e \x01(\x04R\x0ereadDrainMinTs\x12>\n" +
 	"\x1brequire_configuration_index\x18\x0f \x01(\bR\x19requireConfigurationIndex\x12@\n" +
 	"\x1cexpected_configuration_index\x18\x10 \x01(\x04R\x1aexpectedConfigurationIndex\x126\n" +
-	"\townership\x18\x11 \x01(\v2\x18.MigrationOwnershipProofR\townership\"\x8b\x03\n" +
+	"\townership\x18\x11 \x01(\v2\x18.MigrationOwnershipProofR\townership\"\xcd\x03\n" +
 	"\x1bProbeMigrationStateResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
@@ -2910,7 +2920,9 @@ const file_internal_proto_rawDesc = "" +
 	"\x14ownership_generation\x18\x05 \x01(\tR\x13ownershipGeneration\x12-\n" +
 	"\x12ownership_protocol\x18\x06 \x01(\rR\x11ownershipProtocol\x126\n" +
 	"\townership\x18\a \x01(\v2\x18.MigrationOwnershipProofR\townership\x12+\n" +
-	"\x11ownership_cleared\x18\b \x01(\bR\x10ownershipCleared\" \n" +
+	"\x11ownership_cleared\x18\b \x01(\bR\x10ownershipCleared\x12@\n" +
+	"\x1cownership_partition_protocol\x18\n" +
+	" \x01(\rR\x1aownershipPartitionProtocol\" \n" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +

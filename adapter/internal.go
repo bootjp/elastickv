@@ -162,28 +162,29 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	leader                  raftengine.LeaderView
-	transactionManager      kv.Transactional
-	clock                   *kv.HLC
-	tsAllocator             kv.TimestampAllocator
-	adminProposer           raftengine.Proposer
-	lastCommitTimestamp     func() uint64
-	relay                   *RedisPubSubRelay
-	store                   store.MVCCStore
-	primaryCommitEvidence   kv.PrimaryCommitEvidenceReader
-	tsoCutoverState         interface{ CutoverActive() bool }
-	prepareEvidenceToken    string
-	prepareEvidenceScanning atomic.Bool
-	migrationProposer       raftengine.Proposer
-	migrationImportGate     func(context.Context) error
-	migrationPromoteGate    func(context.Context) error
-	migrationCleanupGate    func(context.Context) error
-	migrationOwnershipReady func() bool
-	routeEngine             *distribution.Engine
-	readTracker             *kv.ActiveTimestampTracker
-	migrationExportGroupID  uint64
-	migrationExportResolver kv.PartitionResolver
-	writeGate               kv.MutationWriteGate
+	leader                          raftengine.LeaderView
+	transactionManager              kv.Transactional
+	clock                           *kv.HLC
+	tsAllocator                     kv.TimestampAllocator
+	adminProposer                   raftengine.Proposer
+	lastCommitTimestamp             func() uint64
+	relay                           *RedisPubSubRelay
+	store                           store.MVCCStore
+	primaryCommitEvidence           kv.PrimaryCommitEvidenceReader
+	tsoCutoverState                 interface{ CutoverActive() bool }
+	prepareEvidenceToken            string
+	prepareEvidenceScanning         atomic.Bool
+	migrationProposer               raftengine.Proposer
+	migrationImportGate             func(context.Context) error
+	migrationPromoteGate            func(context.Context) error
+	migrationCleanupGate            func(context.Context) error
+	migrationOwnershipReady         func() bool
+	migrationPartitionProtocolReady func() bool
+	routeEngine                     *distribution.Engine
+	readTracker                     *kv.ActiveTimestampTracker
+	migrationExportGroupID          uint64
+	migrationExportResolver         kv.PartitionResolver
+	writeGate                       kv.MutationWriteGate
 	// kvForwardRejected marks a runtime whose state machine cannot apply KV
 	// entries -- the dedicated TSO group. See WithKVForwardRejected.
 	kvForwardRejected    bool

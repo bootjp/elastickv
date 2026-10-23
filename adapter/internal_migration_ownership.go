@@ -32,7 +32,7 @@ func ownershipCleanupMode(mode pb.MigrationCleanupMode) bool {
 }
 
 func (i *Internal) probeMigrationOwnership(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
-	resp := &pb.ProbeMigrationStateResponse{}
+	resp := &pb.ProbeMigrationStateResponse{OwnershipPartitionProtocol: i.implementedPartitionProtocol()}
 	if !i.ownershipAdmissionReady() {
 		return resp, nil
 	}

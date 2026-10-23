@@ -351,6 +351,9 @@ message ProbeMigrationStateResponse {
   uint32 ownership_protocol = 6;
   MigrationOwnershipProof ownership = 7;
   bool ownership_cleared = 8;
+  // Installed support, observable before a candidate has an applied ConfState.
+  // This is not operational ownership readiness or an activation override.
+  uint32 ownership_partition_protocol = 10;
 }
 
 message IssueMigrationTimestampRequest {}
