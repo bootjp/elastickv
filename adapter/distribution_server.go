@@ -1329,15 +1329,13 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err != nil {
 		return nil, err
 	}
-
-	saved, err := s.saveSplitResultViaCoordinator(ctx, readTimestamp, req.GetExpectedCatalogVersion(), plan.parentID, plan.readKeys, plan.left, plan.right)
+	partitionGroups, err := s.prepareSplitRangePartitions(ctx, snapshot, plan.parentID)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.applyEngineSnapshot(saved); err != nil {
-		return nil, err
-	}
-	if err := s.reconcileSplitRangePartitions(ctx); err != nil {
+
+	saved, err := s.commitSplitRangePlan(ctx, readTimestamp, req.GetExpectedCatalogVersion(), plan, partitionGroups)
+	if err != nil {
 		return nil, err
 	}
 	savedLeft, savedRight, err := splitChildrenFromSnapshot(saved, plan.left.RouteID, plan.right.RouteID)
@@ -1357,6 +1355,17 @@ type splitRangePlan struct {
 	readKeys [][]byte
 	left     distribution.RouteDescriptor
 	right    distribution.RouteDescriptor
+}
+
+func (s *DistributionServer) commitSplitRangePlan(ctx context.Context, read kv.ReadTimestamp, version uint64, plan splitRangePlan, groups []uint64) (distribution.CatalogSnapshot, error) {
+	saved, err := s.saveSplitResultViaCoordinator(ctx, read, version, plan.parentID, plan.readKeys, plan.left, plan.right)
+	if err != nil {
+		return saved, err
+	}
+	if err := s.applyEngineSnapshot(saved); err != nil {
+		return saved, err
+	}
+	return saved, s.reconcileSplitRangePartitions(ctx, groups)
 }
 
 func (s *DistributionServer) planSplitRange(ctx context.Context, snapshot distribution.CatalogSnapshot, req *pb.SplitRangeRequest) (splitRangePlan, error) {
@@ -1480,13 +1489,9 @@ func (s *DistributionServer) saveSplitPartitionViaCoordinator(
 			{Op: distribution.CatalogMutationUpsert, RouteID: right.RouteID, Route: right},
 		},
 	}
-	deltaMutations, err := s.catalog.BuildDeltaMutationsAt(ctx, readTS, delta)
+	deltaOps, err := s.catalogDeltaMutationOps(ctx, readTS, delta)
 	if err != nil {
-		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "build catalog delta mutations: %v", err)
-	}
-	deltaOps, err := catalogStoreMutationsToOps(deltaMutations)
-	if err != nil {
-		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "convert catalog delta mutations: %v", err)
+		return distribution.CatalogSnapshot{}, err
 	}
 	ops = append(ops, deltaOps...)
 	partitionOps, partitionReads, err := s.catalogSplitPartitionOps(ctx, readTS, parentID, left, right, expectedVersion, workingJob)
@@ -1514,6 +1519,18 @@ func (s *DistributionServer) saveSplitPartitionViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusError(codes.Internal, "split commit timestamp missing")
 	}
 	return s.loadCatalogSnapshotAtVersion(ctx, resp.CommitTS, nextVersion)
+}
+
+func (s *DistributionServer) catalogDeltaMutationOps(ctx context.Context, readTS uint64, delta distribution.CatalogDelta) ([]*kv.Elem[kv.OP], error) {
+	mutations, err := s.catalog.BuildDeltaMutationsAt(ctx, readTS, delta)
+	if err != nil {
+		return nil, grpcStatusErrorf(codes.Internal, "build catalog delta mutations: %v", err)
+	}
+	ops, err := catalogStoreMutationsToOps(mutations)
+	if err != nil {
+		return nil, grpcStatusErrorf(codes.Internal, "convert catalog delta mutations: %v", err)
+	}
+	return ops, nil
 }
 
 func nextCatalogSplitIDs(expectedVersion uint64, rightRouteID uint64) (uint64, uint64, error) {

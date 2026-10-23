@@ -5,6 +5,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftadmin"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -13,6 +14,22 @@ import (
 func migrationMemberProtocolsConfigured() bool {
 	return adapter.MigrationImportOpcodeEnabledFromEnv() || adapter.MigrationPromoteOpcodeEnabledFromEnv() ||
 		adapter.MigrationCleanupOpcodeEnabledFromEnv()
+}
+
+func migrationMembershipInterceptor(runtime *raftGroupRuntime, shards *kv.ShardStore, proposer raftengine.Proposer,
+	token string, next raftadmin.MembershipChangeInterceptor,
+) raftadmin.MembershipChangeInterceptor {
+	if runtime == nil {
+		return next
+	}
+	prepare := newPrepareEvidenceMembershipGate(shards, runtime.spec.id, next)
+	// Dedicated TSO has neither KV migration controls nor an MVCC namespace.
+	if runtime.spec.id == 0 {
+		return prepare
+	}
+	protocols := newMigrationMembershipGate(runtime.store, migrationMemberProtocolsConfigured(),
+		newMigrationMemberProtocolProbe(token), prepare)
+	return newMigrationNamespaceMembershipGate(runtime.store, runtime.snapshotEngine(), proposer, token, protocols)
 }
 
 // Check support before any new member can race a guarded-control proposal.

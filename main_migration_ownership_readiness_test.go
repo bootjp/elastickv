@@ -17,9 +17,13 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+type migrationProviderConfigEngine struct{ capabilityConfigEngine }
+
+func (migrationProviderConfigEngine) AppliedConfigurationIndex() (uint64, bool) { return 0, false }
+
 func TestMigrationOwnershipProviderWiringDoesNotAuthorizeIncompleteCoverage(t *testing.T) {
 	st := store.NewMVCCStore()
-	engine := capabilityConfigEngine{}
+	engine := migrationProviderConfigEngine{}
 	tx := newInternalMigrationTransaction(engine, nil, st, 7)
 	t.Cleanup(tx.Close)
 	groups := map[uint64]*kv.ShardGroup{7: {Engine: engine, Store: st, Txn: tx}}

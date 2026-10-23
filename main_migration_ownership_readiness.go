@@ -45,7 +45,7 @@ func migrationCoverageUnaryGate(ctx context.Context, req any, info *grpc.UnarySe
 	if info.FullMethod == pb.Internal_CleanupMigration_FullMethodName {
 		if control, ok := req.(*pb.CleanupMigrationRequest); ok && control.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
 			if err := kv.ValidateNamespaceAdmissionRequest(control); err != nil {
-				return nil, status.Error(codes.InvalidArgument, "invalid namespace admission control")
+				return nil, errors.WithStack(status.Error(codes.InvalidArgument, "invalid namespace admission control"))
 			}
 			return handler(ctx, req)
 		}

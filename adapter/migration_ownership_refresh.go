@@ -96,9 +96,6 @@ func (s *DistributionServer) RunMigrationOwnershipRefresh(ctx context.Context) e
 }
 
 func (s *DistributionServer) RunMigrationOwnershipRefreshOnce(ctx context.Context) error {
-	if s.ownershipRefresh != nil && s.ownershipRefresh.partitionRuntime != nil {
-		return s.runMigrationPartitionRefreshOnce(ctx)
-	}
 	if s.ownershipRefresh == nil || s.ownershipRefresh.root == nil || s.splitJobRunnerReadinessGate == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}
@@ -107,6 +104,9 @@ func (s *DistributionServer) RunMigrationOwnershipRefreshOnce(ctx context.Contex
 	}
 	if err := s.splitJobRunnerReadinessGate(ctx); err != nil {
 		return err
+	}
+	if s.ownershipRefresh.partitionRuntime != nil {
+		return s.runMigrationPartitionRefreshOnce(ctx)
 	}
 	attempt, cancel := context.WithTimeout(ctx, ownershipRefreshBudget)
 	defer cancel()

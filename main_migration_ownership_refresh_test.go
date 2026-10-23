@@ -98,6 +98,7 @@ func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testin
 	dataShards := kv.NewShardStore(dataRoutes, groups)
 	dataTx := newInternalMigrationTransaction(data.group.Engine, nil, data.group.Store, 7)
 	t.Cleanup(dataTx.Close)
+	data.group.Txn = dataTx
 	var cache kv.GRPCConnCache
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	groupFactory := splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, token)
@@ -108,7 +109,8 @@ func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testin
 		adapter.WithSplitJobRunnerReadinessGate(func(context.Context) error { return migrationOwnershipActivationGate() }),
 		adapter.WithSplitMigrationGroupClientFactory(groupFactory),
 		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, token)),
-		adapter.WithMigrationOwnershipRefresh(groups, rootFactory))
+		adapter.WithMigrationOwnershipRefresh(groups, rootFactory),
+		migrationPartitionRuntimeOption(dataShards, groups, &cache, token, true))
 	require.True(t, migrationOwnershipRuntimeHooksInstalled(dataTx, dataShards, consumer, 7))
 	pb.RegisterInternalServer(data.server, adapter.NewInternalWithEngine(nil, data.group.Engine, nil, nil,
 		adapter.WithInternalStore(data.group.Store), adapter.WithInternalMigrationProposer(data.group.Engine),

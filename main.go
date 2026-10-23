@@ -4175,18 +4175,7 @@ func startRaftServers(
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
 			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id)
 		}))
-		internalOpts = append(internalOpts,
-			adapter.WithInternalMigrationTransferSizeGuardReady(func() bool {
-				return migrationOwnershipRuntimeHooksInstalled(trx, shardStore, distServer, rt.spec.id)
-			}),
-			adapter.WithInternalMigrationPartitionProtocolReady(func() bool {
-				return migrationOwnershipRuntimeHooksInstalled(trx, shardStore, distServer, rt.spec.id)
-			}),
-			adapter.WithMigrationNamespaceAdmissionReady(func() bool {
-				return migrationOwnershipRuntimeHooksInstalled(trx, shardStore, distServer, rt.spec.id) &&
-					kv.MigrationNamespaceInstalledVersion(rt.store, rt.stateMachine) == kv.MigrationNamespaceVersion
-			}),
-		)
+		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -4241,9 +4230,7 @@ func startRaftServers(
 			rt.engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			newMigrationMembershipGate(rt.store, rt.spec.id != 0 && migrationMemberProtocolsConfigured(),
-				newMigrationMemberProtocolProbe(adminGRPCOpts.migrationToken),
-				newPrepareEvidenceMembershipGate(shardStore, rt.spec.id, confChangeInterceptor)),
+			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.migrationToken, confChangeInterceptor),
 		)
 		reflection.Register(gs)
 

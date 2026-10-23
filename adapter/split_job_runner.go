@@ -235,6 +235,11 @@ func (s *DistributionServer) runSplitJobPhase(ctx context.Context, job distribut
 	if err != nil {
 		return err
 	}
+	if splitJobTransferNamespaceRequired(job.Phase) && s.MigrationPartitionRuntimeConfigured(job.SourceGroupID) {
+		if err := s.ensureSplitJobNamespaceAdmission(ctx, job); err != nil {
+			return err
+		}
+	}
 	if job.Phase == distribution.SplitJobPhaseBackfill || job.Phase == distribution.SplitJobPhaseDeltaCopy {
 		return s.runSplitJobCopyPhase(ctx, job)
 	}
@@ -1273,28 +1278,12 @@ func splitJobSourceSibling(routes []distribution.RouteDescriptor, job distributi
 }
 
 func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job distribution.SplitJob) error {
-	if s.MigrationPartitionRuntimeConfigured(job.SourceGroupID) {
-		var err error
-		job, err = s.ensureSplitWorkingSource(ctx, job)
-		if err != nil {
-			return err
-		}
-		if err := s.reconcileMigrationPartitions(ctx, job.SourceGroupID); err != nil {
-			return err
-		}
-	}
-	_, parent, err := s.splitJobSourceRoute(ctx, job)
+	job, err := s.prepareSplitJobWorkingSource(ctx, job)
 	if err != nil {
 		return err
 	}
-	source, err := s.splitJobSourceClient(ctx, job, parent.GroupID)
+	parent, source, err := s.loadSplitBackfillSource(ctx, job)
 	if err != nil {
-		return errors.WithStack(err)
-	}
-	if source == nil {
-		return errors.New("split migration source client is nil")
-	}
-	if err := s.verifySplitOwnershipRuntimes(ctx, job, parent.GroupID, source); err != nil {
 		return err
 	}
 	ackCursor, complete, err := s.armSplitJobSourceTracker(ctx, job, parent, source)
@@ -1316,6 +1305,21 @@ func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job dist
 		return err
 	}
 	return s.openSplitJobBackfill(ctx, job, source, witness)
+}
+
+func (s *DistributionServer) loadSplitBackfillSource(ctx context.Context, job distribution.SplitJob) (distribution.RouteDescriptor, SplitMigrationClient, error) {
+	_, parent, err := s.splitJobSourceRoute(ctx, job)
+	if err != nil {
+		return parent, nil, err
+	}
+	source, err := s.splitJobSourceClient(ctx, job, parent.GroupID)
+	if err != nil {
+		return parent, nil, errors.WithStack(err)
+	}
+	if source == nil {
+		return parent, nil, errors.New("split migration source client is nil")
+	}
+	return parent, source, s.verifySplitOwnershipRuntimes(ctx, job, parent.GroupID, source)
 }
 
 const initialMigrationRetentionPinTS = uint64(1)
@@ -1378,11 +1382,7 @@ func (s *DistributionServer) copySplitJobPhase(
 	if maxCommitTS == 0 {
 		return errors.New("split migration copy upper timestamp is zero")
 	}
-	_, sourceRoute, err := s.splitJobSourceRoute(ctx, job)
-	if err != nil {
-		return err
-	}
-	witness, err := s.ensureSplitJobTransferPhase(ctx, job, nil, nil)
+	sourceRoute, witness, err := s.splitCopySourceAdmission(ctx, job)
 	if err != nil {
 		return err
 	}
@@ -1428,6 +1428,15 @@ func (s *DistributionServer) copySplitJobPhase(
 		return errors.WithStack(migrationSourceExportError(err))
 	}
 	return s.copySplitJobStream(ctx, job, progressIndex, bracket, progress, stream, target)
+}
+
+func (s *DistributionServer) splitCopySourceAdmission(ctx context.Context, job distribution.SplitJob) (distribution.RouteDescriptor, *splitTransferAdmissionWitness, error) {
+	_, route, err := s.splitJobSourceRoute(ctx, job)
+	if err != nil {
+		return route, nil, err
+	}
+	witness, err := s.ensureSplitJobTransferPhase(ctx, job, nil, nil)
+	return route, witness, err
 }
 
 func (s *DistributionServer) copySplitJobStream(
@@ -1605,19 +1614,8 @@ func (s *DistributionServer) advanceCompletedCopyPhase(ctx context.Context, job 
 }
 
 func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job distribution.SplitJob) error {
-	ready, err := s.preflightSplitJobTransfer(ctx, job)
+	snapshot, sourceRoute, ready, err := s.prepareSplitJobCatalogFence(ctx, job)
 	if err != nil || !ready {
-		return err
-	}
-	snapshot, sourceRoute, err := s.splitJobSourceRoute(ctx, job)
-	if err != nil {
-		return err
-	}
-	if _, err := s.ensureSplitJobTransferPhase(ctx, job, nil, nil); err != nil {
-		return err
-	}
-	snapshot, sourceRoute, err = s.ensureSplitJobCatalogFence(ctx, job, snapshot, sourceRoute)
-	if err != nil {
 		return err
 	}
 	source, minAdmittedTS, ackCursor, complete, err := s.drainedSplitJobFenceBarrier(ctx, job, snapshot, sourceRoute)
@@ -1642,6 +1640,22 @@ func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job dist
 		return err
 	}
 	return s.commitSplitJobFenceState(ctx, job, snapshot.Version, minAdmittedTS, ackCursor, issued.GetTimestamp())
+}
+
+func (s *DistributionServer) prepareSplitJobCatalogFence(ctx context.Context, job distribution.SplitJob) (distribution.CatalogSnapshot, distribution.RouteDescriptor, bool, error) {
+	ready, err := s.preflightSplitJobTransfer(ctx, job)
+	if err != nil || !ready {
+		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, false, err
+	}
+	snapshot, route, err := s.splitJobSourceRoute(ctx, job)
+	if err != nil {
+		return snapshot, route, false, err
+	}
+	if _, err := s.ensureSplitJobTransferPhase(ctx, job, nil, nil); err != nil {
+		return snapshot, route, false, err
+	}
+	snapshot, route, err = s.ensureSplitJobCatalogFence(ctx, job, snapshot, route)
+	return snapshot, route, err == nil, err
 }
 
 func (s *DistributionServer) drainedSplitJobFenceBarrier(

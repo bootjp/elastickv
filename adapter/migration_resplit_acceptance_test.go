@@ -74,7 +74,19 @@ func newResplitAcceptanceRuntime(t *testing.T) *resplitAcceptanceRuntime {
 		}),
 		WithSplitMigrationGroupClientFactory(func(_ context.Context, id uint64) (SplitMigrationClient, error) { return r.clients[id], nil }),
 		WithSplitMigrationVoterFactory(func(_ context.Context, id uint64) ([]SplitMigrationVoter, error) {
-			return []SplitMigrationVoter{{ID: "runtime", Address: "runtime", Client: r.clients[id]}}, nil
+			return []SplitMigrationVoter{{ID: "voter", Address: "voter:1", Client: r.clients[id]}}, nil
+		}),
+		WithSplitMigrationApplyMemberSnapshotFactory(func(_ context.Context, id uint64) (SplitMigrationApplyMemberSnapshot, error) {
+			reader, ok := r.clients[id].internal.leader.(raftengine.AppliedConfigurationReader)
+			if !ok {
+				return SplitMigrationApplyMemberSnapshot{}, store.ErrNotSupported
+			}
+			index, supported := reader.AppliedConfigurationIndex()
+			if !supported {
+				return SplitMigrationApplyMemberSnapshot{}, store.ErrNotSupported
+			}
+			return SplitMigrationApplyMemberSnapshot{ConfigurationIndex: index,
+				Members: []SplitMigrationVoter{{ID: "voter", Address: "voter:1", Client: r.clients[id]}}}, nil
 		}),
 		WithSplitPromotionClientFactory(func(_ context.Context, job distribution.SplitJob) (SplitPromotionClient, error) {
 			return r.clients[job.TargetGroupID], nil
@@ -84,6 +96,20 @@ func newResplitAcceptanceRuntime(t *testing.T) *resplitAcceptanceRuntime {
 	t.Cleanup(closeClient)
 	WithMigrationOwnershipRefresh(r.groups, func(context.Context) (MigrationOwnershipAttestor, error) { return r.client, nil })(r.server)
 	r.reader = kv.NewShardStore(engine, r.groups)
+	WithMigrationPartitionRuntime(r.reader, func(_ context.Context, id uint64) ([]SplitMigrationVoter, error) {
+		return []SplitMigrationVoter{{ID: "voter", Address: "voter:1", Client: r.clients[id]}}, nil
+	})(r.server)
+	for id, client := range r.clients {
+		client.internal.migrationPartitionProtocolReady = func() bool { return r.server.MigrationPartitionRuntimeConfigured(id) }
+		client.internal.transferSizeReady = func() bool {
+			return r.server.MigrationPartitionRuntimeConfigured(id) && kv.MigrationPartitionRequestAdmissionReady(r.groups[id].Txn)
+		}
+		client.internal.migrationNamespaceReady = func() bool {
+			proposer, ok := client.internal.migrationProposer.(*ownershipRuntimeProposer)
+			return ok && r.server.MigrationPartitionRuntimeConfigured(id) &&
+				kv.MigrationNamespaceInstalledVersion(client.internal.store, proposer.fsm) == kv.MigrationNamespaceVersion
+		}
+	}
 	return r
 }
 

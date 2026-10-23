@@ -2,23 +2,77 @@ package adapter
 
 import (
 	"context"
-	"slices"
+
+	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 )
 
-func (s *DistributionServer) reconcileSplitRangePartitions(ctx context.Context) error {
+func (s *DistributionServer) prepareSplitRangePartitions(ctx context.Context, snapshot distribution.CatalogSnapshot, parentID uint64) ([]uint64, error) {
 	if s.ownershipRefresh == nil {
-		return nil
+		return nil, nil
 	}
-	groups := make([]uint64, 0, len(s.ownershipRefresh.groups))
-	for groupID := range s.ownershipRefresh.groups {
-		groups = append(groups, groupID)
+	parent, found := findRouteByID(snapshot.Routes, parentID)
+	if !found {
+		return nil, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
 	}
-	slices.Sort(groups)
+	active, err := s.splitRangeGroupHasOwnership(ctx, parent, s.ownershipRefresh.groups[parent.GroupID])
+	if err != nil || !active {
+		return nil, err
+	}
+	// Historical NONOWNER groups keep denying with their old proofs. They can
+	// replay retained manifests after reconnecting and need not ACK this split.
+	groups := []uint64{parent.GroupID}
+	if s.splitJobRunnerReadinessGate == nil {
+		return nil, errors.WithStack(store.ErrNotSupported)
+	}
+	if err := s.splitJobRunnerReadinessGate(ctx); err != nil {
+		return nil, err
+	}
+	if err := s.ensureMigrationNamespaces(ctx, groups); err != nil {
+		return nil, err
+	}
+	return groups, nil
+}
+
+func (s *DistributionServer) splitRangeGroupHasOwnership(ctx context.Context, parent distribution.RouteDescriptor, group *kv.ShardGroup) (bool, error) {
+	if group == nil || group.Store == nil {
+		return false, nil
+	}
+	reader, ok := group.Store.(store.MigrationServingAdmissionReader)
+	if !ok {
+		return false, errors.WithStack(store.ErrNotSupported)
+	}
+	view, err := reader.MigrationServingAdmissionState(ctx)
+	if err != nil {
+		return false, errors.WithStack(err)
+	}
+	active := splitRangeOwnershipIntersects(view, parent)
+	if active && !s.MigrationPartitionRuntimeConfigured(parent.GroupID) {
+		return false, errors.WithStack(store.ErrNotSupported)
+	}
+	return active, nil
+}
+
+func splitRangeOwnershipIntersects(view store.MigrationServingState, parent distribution.RouteDescriptor) bool {
+	for _, proof := range view.Ownership {
+		if routeRangeIntersects(proof.RouteStart, proof.RouteEnd, parent.Start, parent.End) {
+			return true
+		}
+	}
+	for _, partition := range view.Partitions.Partitions {
+		if routeRangeIntersects(partition.RouteStart, partition.RouteEnd, parent.Start, parent.End) {
+			return true
+		}
+	}
+	return false
+}
+
+func (s *DistributionServer) reconcileSplitRangePartitions(ctx context.Context, groups []uint64) error {
 	for _, groupID := range groups {
-		if s.MigrationPartitionRuntimeConfigured(groupID) {
-			if err := s.reconcileMigrationPartitions(ctx, groupID); err != nil {
-				return err
-			}
+		if err := s.reconcileMigrationPartitions(ctx, groupID); err != nil {
+			return err
 		}
 	}
 	return nil

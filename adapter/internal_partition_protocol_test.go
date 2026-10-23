@@ -24,7 +24,7 @@ func (s *partitionProtocolStore) ApplyMigrationOwnershipPartition(context.Contex
 }
 
 func TestMigrationPartitionProtocolSupportsUnconfiguredCandidate(t *testing.T) {
-	st := &partitionProtocolStore{MVCCStore: store.NewMVCCStore()}
+	st := store.NewMVCCStore()
 	proposer := &ownershipRuntimeProposer{fsm: kv.NewKvFSMWithHLC(st, nil)}
 	tx := kv.NewTransactionWithProposer(proposer, kv.WithMigrationRequestAdmission(st, 7))
 	t.Cleanup(tx.Close)
