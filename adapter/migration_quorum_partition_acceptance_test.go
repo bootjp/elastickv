@@ -35,6 +35,7 @@ const (
 	quorumAcceptanceElectionTicks  = 500
 	quorumAcceptanceHeartbeatTicks = 10
 	quorumAcceptanceElectionWait   = 3 * quorumAcceptanceTick * quorumAcceptanceElectionTicks
+	quorumAcceptanceSnapshotEvery  = 8
 )
 
 // Real data-group elections, WAL, transport, ConfChanges and native snapshots.
@@ -410,7 +411,7 @@ func (c *quorumAcceptanceCluster) completeInitialOwner(t *testing.T, ctx context
 }
 
 func TestMigrationQuorumPartitionAcceptance(t *testing.T) {
-	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", "1")
+	t.Setenv("ELASTICKV_RAFT_SNAPSHOT_COUNT", fmt.Sprint(quorumAcceptanceSnapshotEvery))
 	ctx, cancel := context.WithTimeout(t.Context(), 60*time.Second)
 	defer cancel()
 	c := newQuorumAcceptanceCluster(t, ctx)
@@ -676,6 +677,12 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, ctx context.C
 	require.NoError(t, err, "retained-left writes keep the global size contract")
 	require.Positive(t, target)
 	t.Logf("retained write ACK index %d; cached status applied %d; current applied %d", target, leader.engine.Status().AppliedIndex, leader.engine.AppliedIndex())
+	// Cross a snapshot interval after the value's ACK without snapshotting
+	// 64 MiB on every control, rejection and post-restart probe in this test.
+	for i := range quorumAcceptanceSnapshotEvery {
+		_, _, err = c.write(ctx, "a-snapshot", []byte("snapshot barrier"), uint64(111+i))
+		require.NoError(t, err)
+	}
 	// All members, including the learner, must have an actual persisted native
 	// snapshot covering the ACKed write itself. Status() is a periodically
 	// refreshed diagnostic and can lag the proposal's returned CommitIndex.
