@@ -35,6 +35,54 @@ make run     # single-process 3-node demo
 
 Short imperative summary with an optional scope prefix matching the touched area (`store:`, `adapter:`, `kv:`, `docs:`, …).
 
+### Developer Certificate of Origin
+
+Every commit submitted in a pull request must include a `Signed-off-by` trailer
+with the commit author's name and email, certifying the [DCO 1.1](DCO). This
+applies to maintainers, bots, and merge commits within the PR. Existing commits
+already on the target branch are outside the check.
+
+Read the DCO before signing off. Configure your own Git identity, then use:
+
+```bash
+git commit --signoff -m "store: handle expired values"
+```
+
+Git adds a trailer using your committer identity:
+
+```text
+Signed-off-by: Your Name <your-email@example.com>
+```
+
+Your author and sign-off identities must match exactly. When applying another
+person's commit, preserve their author and existing sign-off; your own sign-off
+alone does not certify their authorship. A DCO sign-off is separate from a GPG
+or SSH commit signature; a verified signature alone does not satisfy this check.
+
+To repair your latest commit, **only if you are its author and can certify it**:
+
+```bash
+git commit --amend --no-edit --signoff
+```
+
+For several commits you authored and can certify, use an interactive rebase,
+mark each unsigned commit as `edit`, amend it with `--signoff`, and continue with
+`git rebase --continue`. Coordinate history rewrites with collaborators; after
+amending an already-pushed branch, use `git push --force-with-lease`. Do not add
+another contributor's sign-off on their behalf.
+
+The `DCO` workflow checks all commits in the event's `base..head` range, including
+unsigned earlier commits even when the latest commit is signed off. Check the
+same range locally with:
+
+```bash
+python3 scripts/check-dco.py origin/main HEAD
+```
+
+Renovate uses `:gitSignOff` to sign off its dependency updates. After this
+workflow is merged, add `DCO` as a required status check in branch protection or
+the repository ruleset to block merges when it fails.
+
 ## Issues
 
 Bug reports and questions are welcome as GitHub Issues. They are triaged with the labels in `docs/agents/triage-labels.md`. Maintainer work is planned in design docs, not issues.
