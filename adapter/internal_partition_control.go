@@ -20,7 +20,7 @@ func validatePartitionCleanupRequest(req *pb.CleanupMigrationRequest) error {
 	return nil
 }
 
-func (i *Internal) validateMigrationCleanupAdmission(req *pb.CleanupMigrationRequest) error {
+func (i *Internal) validateMigrationCleanupAdmission(ctx context.Context, req *pb.CleanupMigrationRequest) error {
 	if err := validateCleanupMigrationRequest(req); err != nil {
 		return errors.WithStack(err)
 	}
@@ -33,7 +33,20 @@ func (i *Internal) validateMigrationCleanupAdmission(req *pb.CleanupMigrationReq
 	if i.migrationProposer == nil {
 		return errors.WithStack(status.Error(codes.FailedPrecondition, "migration cleanup proposer is not configured"))
 	}
+	if !i.MigrationNamespaceAdmissionSupported() {
+		return errors.WithStack(status.Error(codes.FailedPrecondition, "migration namespace admission is not installed"))
+	}
+	if err := kv.RequireMigrationNamespaceAdmission(ctx, i.store); err != nil {
+		return errors.WithStack(err)
+	}
 	return nil
+}
+
+func (i *Internal) migrationNamespaceProtocolVersion() uint32 {
+	if i.MigrationNamespaceAdmissionSupported() {
+		return kv.MigrationNamespaceVersion
+	}
+	return 0
 }
 
 func (i *Internal) probeMigrationPartition(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {

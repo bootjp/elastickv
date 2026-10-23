@@ -311,7 +311,7 @@ func (s *DistributionServer) reconcileMigrationPartitionPrior(ctx context.Contex
 	if prior.LocalGroupID != id {
 		return errors.WithStack(store.ErrMigrationOwnership)
 	}
-	members, err := s.partitionApplyMembers(ctx, id)
+	members, err := s.partitionMembersWithNamespace(ctx, id)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -320,10 +320,7 @@ func (s *DistributionServer) reconcileMigrationPartitionPrior(ctx context.Contex
 	}
 	c, err := s.fetchMigrationPartitionAttestation(ctx, partitions, legacy, index)
 	if err != nil {
-		if unchangedLegacyPartitionFallback(err, len(partitions), len(legacy)) {
-			return s.reconcileLegacyOwnershipPartition(ctx, id, g, index, members, legacy[0])
-		}
-		return errors.WithStack(err)
+		return s.reconcileMigrationPartitionFailure(ctx, id, g, index, members, legacy, err, len(partitions))
 	}
 	term := g.Engine.Status().Term
 	transition := c.Transition
@@ -342,6 +339,13 @@ func (s *DistributionServer) reconcileMigrationPartitionPrior(ctx context.Contex
 		}
 	}
 	return s.finishMigrationPartitionAcknowledgement(ctx, id, g, index, term, members, prior.MigrationJobID, transition)
+}
+
+func (s *DistributionServer) reconcileMigrationPartitionFailure(ctx context.Context, id uint64, g *kv.ShardGroup, index uint64, members []SplitMigrationVoter, legacy []store.MigrationOwnershipState, err error, partitions int) error {
+	if unchangedLegacyPartitionFallback(err, partitions, len(legacy)) {
+		return s.reconcileLegacyOwnershipPartition(ctx, id, g, index, members, legacy[0])
+	}
+	return errors.WithStack(err)
 }
 
 func unchangedLegacyPartitionFallback(err error, partitions, legacy int) bool {
@@ -464,7 +468,7 @@ func verifyPartitionConsumerEpoch(ctx context.Context, g *kv.ShardGroup, index, 
 }
 
 func (s *DistributionServer) verifyEmptyMigrationPartitionGroup(ctx context.Context, id, index uint64) error {
-	members, err := s.partitionApplyMembers(ctx, id)
+	members, err := s.partitionMembersWithNamespace(ctx, id)
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -478,6 +482,21 @@ func (s *DistributionServer) verifyEmptyMigrationPartitionGroup(ctx context.Cont
 		}
 	}
 	return nil
+}
+
+func (s *DistributionServer) partitionMembersWithNamespace(ctx context.Context, id uint64) ([]SplitMigrationVoter, error) {
+	members, err := s.partitionApplyMembers(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	client, err := s.splitMigrationGroupFactory(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	if err := EnsureMigrationNamespaceAdmission(ctx, client, members); err != nil {
+		return nil, err
+	}
+	return members, nil
 }
 
 func (s *DistributionServer) fetchMigrationPartitionAttestation(ctx context.Context, partitions []store.MigrationOwnershipPartition, legacy []store.MigrationOwnershipState, index uint64) (kv.MigrationPartitionControl, error) {

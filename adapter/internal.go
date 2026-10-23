@@ -276,6 +276,7 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 	if err != nil {
 		return nil, err
 	}
+	resp.NamespaceAdmissionVersion = i.migrationNamespaceProtocolVersion()
 	if i.MigrationTransferSizeGuardSupported() {
 		resp.TransferSizeGuardVersion = store.MigrationTransferSizeGuardVersion
 	}
@@ -298,6 +299,9 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 }
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+	if req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION {
+		return i.probeMigrationNamespace(ctx, req)
+	}
 	if req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED {
 		return i.probeMigrationPartition(ctx, req)
 	}
@@ -316,6 +320,7 @@ func (i *Internal) probeLegacyMigrationStateKind(ctx context.Context, req *pb.Pr
 	switch req.GetKind() {
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY,
 		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED,
+		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION,
 		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED:
 		return i.probeMigrationStateKind(ctx, req)
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED:
@@ -835,7 +840,10 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 }
 
 func (i *Internal) CleanupMigration(ctx context.Context, req *pb.CleanupMigrationRequest) (*pb.CleanupMigrationResponse, error) {
-	if err := i.validateMigrationCleanupAdmission(req); err != nil {
+	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
+		return i.applyMigrationNamespaceAdmission(ctx, req)
+	}
+	if err := i.validateMigrationCleanupAdmission(ctx, req); err != nil {
 		return nil, err
 	}
 	if err := i.verifyInternalLeader(ctx); err != nil {

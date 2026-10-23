@@ -82,7 +82,7 @@ func verifyLegacyPartitionLocalRecord(ctx context.Context, st store.MVCCStore, b
 		if actual.JobID != before.JobID {
 			continue
 		}
-		if !store.MigrationOwnershipEvidenceValid(actual) || actual.ConfigurationIndex != index || !proto.Equal(kv.MigrationOwnershipProofFromState(actual), proof) {
+		if !legacyPartitionRecordMatches(actual, proof, index) {
 			return errors.WithStack(store.ErrMigrationOwnership)
 		}
 		x, err := kv.EncodeMigrationPartitionJSON(before.Receipts)
@@ -99,4 +99,8 @@ func verifyLegacyPartitionLocalRecord(ctx context.Context, st store.MVCCStore, b
 		return nil
 	}
 	return errors.WithStack(errSplitMigrationVoterBarrierIncomplete)
+}
+
+func legacyPartitionRecordMatches(actual store.MigrationOwnershipState, proof *pb.MigrationOwnershipProof, index uint64) bool {
+	return store.MigrationOwnershipEvidenceValid(actual) && actual.ConfigurationIndex == index && proto.Equal(kv.MigrationOwnershipProofFromState(actual), proof)
 }

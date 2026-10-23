@@ -116,6 +116,7 @@ func (f *kvFSM) applyMigrationOwnershipOperation(ctx context.Context, mode pb.Mi
 		return errors.WithStack(refresher.RefreshMigrationOwnership(ctx, state, f.pendingApplyIdx))
 	case pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_UNSPECIFIED,
 		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION,
+		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION,
 		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
 		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA:
 		return errors.WithStack(ErrInvalidRequest)
@@ -132,6 +133,7 @@ func migrationOwnershipSourceModeValid(mode pb.MigrationCleanupMode, state store
 		return true
 	case pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_UNSPECIFIED, pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
 		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION,
+		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION,
 		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA, pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE,
 		pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR:
 		return state.SourceTrackerVersion == 0 && state.SourceAppliedIndex == 0

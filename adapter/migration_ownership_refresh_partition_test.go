@@ -5,6 +5,8 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -75,7 +77,7 @@ func newPartitionRefreshHarness(t *testing.T, local uint64) *partitionRefreshHar
 		CatalogVersion: 1, ConfigurationIndex: 9, RouteID: 1, RouteStart: h.parent.Start, RouteEnd: h.parent.End, DescriptorHash: hash, Role: role, WriteFloorKnown: true, MinWriteTSExclusive: 100}
 	for range 3 {
 		st := store.NewMVCCStore()
-		client, _ := newOwnershipRuntimeClient(t, st, local)
+		client := newPartitionRuntimeClient(t, st, local)
 		writer, ok := st.(store.MigrationOwnershipStore)
 		require.True(t, ok)
 		require.NoError(t, writer.ClearMigrationStateWithOwnership(t.Context(), state, 10))
@@ -92,6 +94,14 @@ func newPartitionRefreshHarness(t *testing.T, local uint64) *partitionRefreshHar
 		p, ok := client.internal.migrationProposer.(*ownershipRuntimeProposer)
 		require.True(t, ok)
 		proposer.followers = append(proposer.followers, p.fsm)
+	}
+	ids := []uint64{etcd.DeriveNodeID("voter1"), etcd.DeriveNodeID("voter2"), etcd.DeriveNodeID("learner")}
+	for _, client := range h.clients {
+		p, ok := client.internal.migrationProposer.(*ownershipRuntimeProposer)
+		require.True(t, ok)
+		aware, ok := p.fsm.(raftengine.NamespaceConfigurationAware)
+		require.True(t, ok)
+		require.NoError(t, aware.RecordAppliedNamespaceConfiguration(9, ids))
 	}
 	configuration, ok := proposer.fsm.(interface {
 		AppliedConfigurationIndex() uint64
@@ -110,6 +120,30 @@ func newPartitionRefreshHarness(t *testing.T, local uint64) *partitionRefreshHar
 		WithMigrationPartitionRuntime(kv.NewShardStore(mirror, groups), members))
 	require.True(t, h.consumer.MigrationPartitionRuntimeConfigured(local))
 	return h
+}
+
+func newPartitionRuntimeClient(t *testing.T, st store.MVCCStore, group uint64) *ownershipRuntimeClient {
+	t.Helper()
+	fsm := kv.NewKvFSMWithHLC(st, nil, kv.WithRouteHistory(nil, group))
+	configuration, ok := fsm.(raftengine.AppliedConfigurationAware)
+	require.True(t, ok)
+	require.NoError(t, configuration.RecordAppliedConfiguration(9))
+	proposer := &ownershipRuntimeProposer{fsm: fsm, index: 20}
+	i := NewInternalWithEngine(nil, ownershipRuntimeLeader{configuration: configuration}, nil, nil,
+		WithInternalStore(st), WithInternalMigrationProposer(proposer), WithInternalMigrationOwnershipReady(func() bool { return true }),
+		WithInternalMigrationCleanupGate(func(context.Context) error { return nil }),
+		WithMigrationNamespaceAdmissionReady(func() bool { return kv.MigrationNamespaceInstalledVersion(st, fsm) == kv.MigrationNamespaceVersion }))
+	return &ownershipRuntimeClient{internal: i}
+}
+
+func partitionOnlyCleanups(client *partitionProbeClient) []*pb.CleanupMigrationRequest {
+	var result []*pb.CleanupMigrationRequest
+	for _, req := range client.cleanups {
+		if req.GetMode() != pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
+			result = append(result, req)
+		}
+	}
+	return result
 }
 
 func (h *partitionRefreshHarness) split(t *testing.T, parent distribution.RouteDescriptor, leftID, rightID uint64, key string) []distribution.RouteDescriptor {
@@ -175,7 +209,7 @@ func TestPartitionRefreshLearnerCapabilityAndReceiptAreMandatory(t *testing.T) {
 	h.split(t, h.parent, 2, 3, "m")
 	h.clients[2].old = true
 	require.Error(t, h.consumer.reconcileMigrationPartitions(t.Context(), 7))
-	require.Empty(t, h.clients[0].cleanups, "no all-member proof means no proposal")
+	require.Empty(t, partitionOnlyCleanups(h.clients[0]), "no all-member proof means no partition proposal")
 	h.clients[2].old = false
 	h.clients[2].wrong = true
 	require.Error(t, h.consumer.reconcileMigrationPartitions(t.Context(), 7))
@@ -258,7 +292,7 @@ func TestPartitionRefreshUnadoptedLegacyUsesRootAndPreservesReceipts(t *testing.
 	before, err := writer.MigrationServingState(t.Context())
 	require.NoError(t, err)
 	require.NoError(t, h.consumer.reconcileMigrationPartitions(t.Context(), 7), "same C still requires root and all-member ACK")
-	require.Empty(t, h.clients[0].cleanups)
+	require.Empty(t, partitionOnlyCleanups(h.clients[0]))
 	require.NotZero(t, h.rootClient.calls)
 	_, err = h.root.catalog.Save(t.Context(), 1, []distribution.RouteDescriptor{h.parent})
 	require.NoError(t, err)
@@ -268,6 +302,28 @@ func TestPartitionRefreshUnadoptedLegacyUsesRootAndPreservesReceipts(t *testing.
 	require.EqualValues(t, 2, view.Ownership[0].CatalogVersion)
 	require.Equal(t, before.Ownership[0].Receipts, view.Ownership[0].Receipts)
 	require.Empty(t, h.frontier(t, 0).Partitions, "ordinary legacy refresh never manufactures child authority")
-	require.Len(t, h.clients[0].cleanups, 1)
-	require.Equal(t, pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH, h.clients[0].cleanups[0].GetMode())
+	cleanups := partitionOnlyCleanups(h.clients[0])
+	require.Len(t, cleanups, 1)
+	require.Equal(t, pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH, cleanups[0].GetMode())
+}
+
+func TestPartitionRefreshNamespaceNeedsEveryApplyMember(t *testing.T) {
+	h := newPartitionRefreshHarness(t, 7)
+	h.split(t, h.parent, 2, 3, "m")
+	h.clients[2].internal.migrationNamespaceReady = nil
+	require.Error(t, h.consumer.reconcileMigrationPartitions(t.Context(), 7))
+	require.Empty(t, h.clients[0].cleanups, "missing member static namespace proof forbids even MODE8")
+	require.Empty(t, h.frontier(t, 0).Partitions)
+}
+
+func TestPartitionRefreshCleanupMarkerRequiredExceptNamespaceBootstrap(t *testing.T) {
+	h := newPartitionRefreshHarness(t, 7)
+	_, err := h.clients[0].internal.CleanupMigration(t.Context(), &pb.CleanupMigrationRequest{JobId: 11, Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA})
+	require.Error(t, err, "ordinary cleanup cannot bootstrap its own marker")
+	require.Empty(t, h.clients[0].cleanups)
+	h.split(t, h.parent, 2, 3, "m")
+	require.NoError(t, h.consumer.reconcileMigrationPartitions(t.Context(), 7), "MODE8 must bypass ordinary cleanup/ownership readiness")
+	for _, st := range h.stores {
+		require.NoError(t, kv.RequireMigrationNamespaceAdmission(t.Context(), st))
+	}
 }
