@@ -155,18 +155,15 @@ func migrationApplyOwnershipProofs(states []store.MigrationOwnershipState, range
 	proofs := make([]store.MigrationOwnershipState, 0, len(ranges))
 	var uncovered bool
 	for _, r := range ranges {
-		proof, found, err := migrationServingCertificate(states, r.start, r.end)
+		rangeProofs, err := migrationApplyRangeProofs(states, r, groupID, version)
 		if err != nil {
 			return nil, err
 		}
-		if !found {
+		if len(rangeProofs) == 0 {
 			uncovered = true
 			continue
 		}
-		if !store.MigrationOwnershipEvidenceValid(proof) || proof.LocalGroupID != groupID || proof.Role != store.MigrationOwner || proof.CatalogVersion != version {
-			return nil, errors.WithStack(ErrRouteCutoverPending)
-		}
-		proofs = append(proofs, proof)
+		proofs = append(proofs, rangeProofs...)
 	}
 	if uncovered && len(proofs) > 0 {
 		return nil, errors.WithStack(ErrRouteCutoverPending)

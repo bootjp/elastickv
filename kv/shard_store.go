@@ -6009,22 +6009,69 @@ func (s *ShardStore) verifyPrefixDeleteRoutes(ctx context.Context, prefix []byte
 	if len(routes) == 0 {
 		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
+	coverageRequired, err := s.prefixDeleteRequiresCoverage(ctx, routes, routeStart, routeEnd)
+	if err != nil {
+		return nil, err
+	}
+	return s.verifiedPrefixDeleteRoutes(ctx, routes, routeStart, routeEnd, commitTS, coverageRequired)
+}
+
+func (s *ShardStore) verifiedPrefixDeleteRoutes(ctx context.Context, routes []distribution.Route, routeStart, routeEnd []byte, commitTS uint64, coverageRequired bool) ([]distribution.Route, error) {
 	verified := make([]distribution.Route, 0, len(routes))
+	cursor := routeStart
 	for _, route := range routes {
-		g, ok := s.groupForID(route.GroupID)
-		if !ok || g == nil || g.Store == nil {
-			return nil, store.ErrNotSupported
+		start, end := prefixDeleteRouteIntersection(route, routeStart, routeEnd)
+		if coverageRequired && bytes.Compare(start, cursor) > 0 {
+			return nil, errors.WithStack(ErrRouteCutoverPending)
 		}
-		proofRoutes, err := s.verifyPrefixDeleteRoute(ctx, g, route, routeStart, routeEnd, commitTS)
+		proofRoutes, err := s.verifyPrefixDeleteRoute(ctx, route, start, end, commitTS)
 		if err != nil {
 			return nil, err
 		}
 		verified = append(verified, proofRoutes...)
+		if len(end) == 0 || bytes.Equal(end, routeEnd) {
+			return verified, nil
+		}
+		cursor = end
+	}
+	if coverageRequired {
+		return nil, errors.WithStack(ErrRouteCutoverPending)
 	}
 	return verified, nil
 }
 
-func (s *ShardStore) verifyPrefixDeleteRoute(ctx context.Context, g *ShardGroup, route distribution.Route, routeStart []byte, routeEnd []byte, commitTS uint64) ([]distribution.Route, error) {
+func (s *ShardStore) prefixDeleteRequiresCoverage(ctx context.Context, routes []distribution.Route, start, end []byte) (bool, error) {
+	for _, route := range routes {
+		g, ok := s.groupForID(route.GroupID)
+		if !ok || g == nil || g.Store == nil {
+			return false, store.ErrNotSupported
+		}
+		view, err := readMigrationServingState(ctx, g.Store)
+		if err != nil {
+			return false, err
+		}
+		if migrationApplyIntersects(view, []migrationApplyRange{{start: start, end: end}}) {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+func prefixDeleteRouteIntersection(route distribution.Route, start, end []byte) ([]byte, []byte) {
+	if bytes.Compare(route.Start, start) > 0 {
+		start = route.Start
+	}
+	if len(end) == 0 || (len(route.End) > 0 && bytes.Compare(route.End, end) < 0) {
+		end = route.End
+	}
+	return start, end
+}
+
+func (s *ShardStore) verifyPrefixDeleteRoute(ctx context.Context, route distribution.Route, routeStart []byte, routeEnd []byte, commitTS uint64) ([]distribution.Route, error) {
+	g, ok := s.groupForID(route.GroupID)
+	if !ok || g == nil || g.Store == nil {
+		return nil, store.ErrNotSupported
+	}
 	proofRoutes, err := s.targetReadyRoutesForRouteRange(ctx, g, route, routeStart, routeEnd)
 	if err != nil {
 		return nil, err
