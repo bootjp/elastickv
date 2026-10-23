@@ -84,9 +84,8 @@ func (s *ShardStore) ReadRouteVersion() uint64 {
 }
 
 func (s *ShardStore) awaitReadRouteVersion(ctx context.Context, requested uint64) error {
-	if err := s.verifyMigrationServingFloor(ctx, requested); err != nil {
-		return err
-	}
+	// Migration floors are proved against the selected route's coherent store
+	// view before data access, including when no catalog version was requested.
 	if requested == 0 || s.ReadRouteVersion() >= requested {
 		return nil
 	}
@@ -251,6 +250,7 @@ func (s *ShardStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, 
 }
 
 func (s *ShardStore) GetAtWithReadFence(ctx context.Context, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
 	}
@@ -289,6 +289,7 @@ func (s *ShardStore) GetGroupAt(ctx context.Context, groupID uint64, key []byte,
 }
 
 func (s *ShardStore) getGroupAtWithReadFence(ctx context.Context, groupID uint64, key []byte, ts uint64, readRouteVersion uint64) ([]byte, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
 	}
@@ -318,6 +319,9 @@ func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, route distri
 	}
 	if isLinearizableRaftLeader(ctx, engineForGroup(g)) {
 		return s.leaderGetAt(ctx, g, route, key, ts)
+	}
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return nil, err
 	}
 	return s.proxyRawGet(ctx, g, key, ts, groupID, readRouteVersion)
 }
@@ -379,6 +383,7 @@ func (s *ShardStore) routeHasVersionAtOrBeforeRemote(ctx context.Context, route 
 // could answer authoritatively; a replica that is no longer the group leader
 // says no rather than guessing.
 func (s *ShardStore) VersionExistsAtOrBeforeGroupWithReadFence(ctx context.Context, key []byte, groupID uint64, ts uint64, readRouteVersion uint64) (bool, bool, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return false, false, err
 	}
@@ -398,11 +403,11 @@ func (s *ShardStore) routeHasVersionAtOrBefore(ctx context.Context, route distri
 	if !ok || g.Store == nil {
 		return false, true, nil
 	}
-	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
-		return false, false, nil
-	}
 	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
 		return false, true, err
+	}
+	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
+		return false, false, nil
 	}
 	checker, ok := g.Store.(store.VersionPresenceReader)
 	if !ok {
@@ -571,6 +576,9 @@ func (s *ShardStore) targetReadyRoutesForRouteRange(ctx context.Context, g *Shar
 	view, err := readMigrationServingState(ctx, g.Store)
 	if err != nil {
 		return nil, errors.WithStack(err)
+	}
+	if err := s.verifyMigrationServingReadFloor(ctx, view); err != nil {
+		return nil, err
 	}
 	if err := s.verifyMigrationServingRange(view, route, routeStart, routeEnd); err != nil {
 		return nil, err
@@ -992,6 +1000,7 @@ func (s *ShardStore) ScanAt(ctx context.Context, start []byte, end []byte, limit
 }
 
 func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, reverse bool, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if limit <= 0 {
 		return []*store.KVPair{}, nil
 	}
@@ -1008,6 +1017,7 @@ func (s *ShardStore) ScanAtWithReadFence(ctx context.Context, start []byte, end 
 }
 
 func (s *ShardStore) scanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, groupID uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
 	}
@@ -1040,6 +1050,7 @@ func (s *ShardStore) ScanKeysAt(ctx context.Context, start []byte, end []byte, l
 }
 
 func (s *ShardStore) ScanKeysAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, groupID uint64, readRouteVersion uint64) ([][]byte, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if limit <= 0 {
 		return [][]byte{}, nil
 	}
@@ -1252,6 +1263,7 @@ func (s *ShardStore) ownerHoldsNoVersionAt(ctx context.Context, owner distributi
 }
 
 func (s *ShardStore) scanExplicitGroupAtWithReadFence(ctx context.Context, groupID uint64, start []byte, end []byte, limit int, ts uint64, reverse bool, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
 	}
@@ -1337,6 +1349,7 @@ func (s *ShardStore) ReverseScanAt(ctx context.Context, start []byte, end []byte
 }
 
 func (s *ShardStore) reverseScanAtWithReadFence(ctx context.Context, start []byte, end []byte, limit int, ts uint64, readRouteVersion uint64, routeStart []byte, routeEnd []byte) ([]*store.KVPair, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, err
 	}
@@ -2958,13 +2971,13 @@ func (s *ShardStore) routeHasVersionsAtOrBefore(
 	if !ok || g.Store == nil {
 		return out, true, nil
 	}
-	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
-		return out, false, nil
-	}
 	for _, key := range keys {
 		if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
 			return out, true, err
 		}
+	}
+	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
+		return out, false, nil
 	}
 	exists, err := versionsExistAtOrBefore(ctx, g.Store, keys, ts)
 	return exists, true, errors.WithStack(err)
@@ -3200,6 +3213,9 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterProxyPage(
 	routeStart []byte,
 	routeEnd []byte,
 ) ([]*store.KVPair, []*store.KVPair, error) {
+	if err := s.verifyTargetReadinessForRouteRange(ctx, g, route, routeStart, routeEnd); err != nil {
+		return nil, nil, err
+	}
 	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, routeStart, routeEnd)
 	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, reverse, groupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
@@ -3286,6 +3302,9 @@ func (s *ShardStore) scanRouteAtReverse(
 		return markScanRouteGroup(kvs, route.GroupID, markRouteGroup), err
 	}
 
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, start, end); err != nil {
+		return nil, err
+	}
 	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, routeStart, routeEnd)
 	kvs, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, true, groupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
@@ -3561,6 +3580,9 @@ func (s *ShardStore) scanRouteAtForwardProxyPage(
 	routeStart []byte,
 	routeEnd []byte,
 ) (scanRoutePage, error) {
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, start, end); err != nil {
+		return scanRoutePage{}, err
+	}
 	groupID := proxyScanGroupID(route, explicitGroup, readRouteVersion, routeStart, routeEnd)
 	raw, err := s.proxyRawScanAt(ctx, g, start, end, limit, ts, false, groupID, readRouteVersion, routeStart, routeEnd)
 	if err != nil {
@@ -4636,6 +4658,7 @@ func (s *ShardStore) LatestCommitTS(ctx context.Context, key []byte) (uint64, bo
 }
 
 func (s *ShardStore) LatestCommitTSWithReadFence(ctx context.Context, key []byte, readRouteVersion uint64) (uint64, bool, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return 0, false, err
 	}
@@ -4666,10 +4689,14 @@ func (s *ShardStore) LatestCommitTSWithReadFence(ctx context.Context, key []byte
 		}
 	}
 
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return 0, false, err
+	}
 	return s.proxyLatestCommitTS(ctx, g, key, readRouteVersion)
 }
 
 func (s *ShardStore) LatestCommitTSGroupWithReadFence(ctx context.Context, key []byte, groupID uint64, readRouteVersion uint64) (uint64, bool, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if groupID == 0 {
 		return s.LatestCommitTSWithReadFence(ctx, key, readRouteVersion)
 	}
@@ -4697,10 +4724,14 @@ func (s *ShardStore) LatestCommitTSGroupWithReadFence(ctx context.Context, key [
 		}
 	}
 
+	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
+		return 0, false, err
+	}
 	return s.proxyLatestCommitTSGroup(ctx, g, key, groupID, readRouteVersion)
 }
 
 func (s *ShardStore) VersionsExistAtOrBeforeGroupWithReadFence(ctx context.Context, keys [][]byte, groupID uint64, ts uint64, readRouteVersion uint64) ([]bool, bool, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	if groupID == 0 {
 		return s.versionsExistAtOrBeforeWithReadFence(ctx, keys, ts, readRouteVersion)
 	}
@@ -4711,6 +4742,7 @@ func (s *ShardStore) VersionsExistAtOrBeforeGroupWithReadFence(ctx context.Conte
 }
 
 func (s *ShardStore) versionsExistAtOrBeforeWithReadFence(ctx context.Context, keys [][]byte, ts uint64, readRouteVersion uint64) ([]bool, bool, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
 	out := make([]bool, len(keys))
 	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return nil, false, err

@@ -46,6 +46,10 @@ func migrationServingCertificate(states []store.MigrationOwnershipState, start, 
 }
 
 func readMigrationServingState(ctx context.Context, st store.MVCCStore) (store.MigrationServingState, error) {
+	if reader, ok := st.(store.MigrationServingAdmissionReader); ok {
+		view, err := reader.MigrationServingAdmissionState(ctx)
+		return view, errors.WithStack(err)
+	}
 	if reader, ok := st.(store.MigrationOwnershipStore); ok {
 		view, err := reader.MigrationServingState(ctx)
 		return view, errors.WithStack(err)
@@ -57,21 +61,50 @@ func readMigrationServingState(ctx context.Context, st store.MVCCStore) (store.M
 	return store.MigrationServingState{}, nil
 }
 
+type migrationServingReadVersionKey struct{}
+
+func migrationServingReadContext(ctx context.Context, version uint64) context.Context {
+	if version == 0 {
+		return ctx
+	}
+	if prior, ok := ctx.Value(migrationServingReadVersionKey{}).(uint64); ok && prior <= version {
+		return ctx
+	}
+	return context.WithValue(ctx, migrationServingReadVersionKey{}, version)
+}
+
+func (s *ShardStore) verifyMigrationServingReadFloor(ctx context.Context, view store.MigrationServingState) error {
+	floor := migrationAdmissionFloor(view)
+	requested, _ := ctx.Value(migrationServingReadVersionKey{}).(uint64)
+	if floor > s.ReadRouteVersion() || (requested != 0 && requested < floor) {
+		return errors.WithStack(ErrRouteCutoverPending)
+	}
+	return nil
+}
+
 func (s *ShardStore) verifyMigrationServingFloor(ctx context.Context, requested uint64) error {
 	for _, group := range s.groups {
 		if group == nil || group.Store == nil {
 			continue
 		}
-		view, err := readMigrationServingState(ctx, group.Store)
+		floor, err := migrationStoreServingFloor(ctx, group.Store)
 		if err != nil {
 			return err
 		}
-		floor := migrationServingFloor(view.Ownership)
 		if floor > s.ReadRouteVersion() || (requested != 0 && requested < floor) {
 			return errors.WithStack(ErrRouteCutoverPending)
 		}
 	}
 	return nil
+}
+
+func migrationStoreServingFloor(ctx context.Context, st store.MVCCStore) (uint64, error) {
+	if reader, ok := st.(store.MigrationServingSummaryReader); ok {
+		summary, err := reader.MigrationServingSummary(ctx)
+		return summary.CatalogVersionFloor, errors.WithStack(err)
+	}
+	view, err := readMigrationServingState(ctx, st)
+	return migrationAdmissionFloor(view), err
 }
 
 // MigrationReadAdmissionReady reports the concrete read gate/store pairing,
@@ -89,23 +122,45 @@ func (s *ShardStore) MigrationReadAdmissionReady(groupID uint64) bool {
 }
 
 func (s *ShardStore) verifyMigrationServingRange(view store.MigrationServingState, route distribution.Route, start, end []byte) error {
-	if len(view.Ownership) == 0 {
-		return nil
-	}
-	if s.ReadRouteVersion() < migrationServingFloor(view.Ownership) {
+	if s.ReadRouteVersion() < migrationAdmissionFloor(view) {
 		return errors.WithStack(ErrRouteCutoverPending)
 	}
-	proof, found, err := migrationServingCertificate(view.Ownership, start, end)
-	if err != nil || !found {
+	proofs, err := migrationAdmissionRangeProofs(view, migrationApplyRange{start, end})
+	if err != nil {
 		return err
 	}
-	if proof.LocalGroupID != route.GroupID || proof.Role != store.MigrationOwner {
-		return errors.WithStack(ErrRouteCutoverPending)
+	for _, proof := range proofs {
+		if proof.LocalGroupID != route.GroupID || proof.Role != store.MigrationOwner {
+			return errors.WithStack(ErrRouteCutoverPending)
+		}
+		proofStart, proofEnd := prefixDeleteRouteIntersection(distribution.Route{Start: proof.RouteStart, End: proof.RouteEnd}, start, end)
+		if err := s.verifyMigrationAdmissionOwnerRoutes(proof, route, proofStart, proofEnd); err != nil {
+			return err
+		}
 	}
-	if !store.MigrationOwnershipEvidenceValid(proof) {
-		return errors.WithStack(ErrRouteCutoverPending)
+	return nil
+}
+
+func (s *ShardStore) verifyMigrationAdmissionOwnerRoutes(proof migrationAdmissionProof, route distribution.Route, start, end []byte) error {
+	if err := s.verifyMigrationServingOwnerRoutes(proof.MigrationOwnershipState, route, start, end); err != nil {
+		return err
 	}
-	return s.verifyMigrationServingOwnerRoutes(proof, route, start, end)
+	if proof.partition == nil {
+		return nil
+	}
+	routes, _, _ := s.readinessProofRoutes(route, start, end)
+	cursor := start
+	for _, candidate := range routes {
+		if bytes.Compare(candidate.Start, cursor) > 0 || routeHasStagedVisibility(candidate) != proof.Staged ||
+			(proof.Staged && candidate.MigrationJobID != proof.JobID) {
+			return errors.WithStack(ErrRouteCutoverPending)
+		}
+		if len(candidate.End) == 0 || (len(end) != 0 && bytes.Compare(candidate.End, end) >= 0) {
+			return nil
+		}
+		cursor = candidate.End
+	}
+	return errors.WithStack(ErrRouteCutoverPending)
 }
 
 func (s *ShardStore) verifyMigrationServingOwnerRoutes(proof store.MigrationOwnershipState, route distribution.Route, start, end []byte) error {
@@ -172,14 +227,22 @@ func migrationApplyOwnershipProofs(states []store.MigrationOwnershipState, range
 }
 
 func migrationOwnershipHistory(proofs []store.MigrationOwnershipState, version uint64) (RouteHistory, error) {
+	return migrationAdmissionHistory(migrationAdmissionProofs(store.MigrationServingState{Ownership: proofs}), version)
+}
+
+func migrationAdmissionHistory(proofs []migrationAdmissionProof, version uint64) (RouteHistory, error) {
 	routes := make([]distribution.RouteDescriptor, 0, len(proofs))
-	seen := make(map[uint64]struct{})
+	seen := make(map[string]bool)
 	for _, proof := range proofs {
-		if _, duplicate := seen[proof.JobID]; duplicate {
+		if seen[proof.identity] {
 			continue
 		}
-		seen[proof.JobID] = struct{}{}
-		route := distribution.RouteDescriptor{RouteID: proof.JobID, Start: proof.RouteStart, End: proof.RouteEnd,
+		seen[proof.identity] = true
+		routeID := proof.RouteID
+		if proof.partition == nil {
+			routeID = proof.JobID
+		}
+		route := distribution.RouteDescriptor{RouteID: routeID, Start: proof.RouteStart, End: proof.RouteEnd,
 			GroupID: proof.LocalGroupID, State: distribution.RouteStateActive, MinWriteTSExclusive: proof.MinWriteTSExclusive}
 		if proof.Staged {
 			route.MigrationJobID, route.StagedVisibilityActive = proof.JobID, true

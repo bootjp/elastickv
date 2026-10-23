@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 
+	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -55,14 +56,18 @@ func (f *kvFSM) withMigrationCreationEvidence(ctx context.Context, req *pb.Reque
 	if !migrationCreationGuardsProven(view, ranges, f.AppliedConfigurationIndex()) {
 		return ctx, errors.WithStack(ErrRouteCutoverPending)
 	}
-	proofs, version, err := migrationRequestOwnershipProofs(view.Ownership, req, f.shardGroupID)
+	version, pinned := DecodeObservedRouteVersion(req.GetObservedRouteVersion())
+	if !pinned {
+		return ctx, errors.WithStack(ErrRouteCutoverPending)
+	}
+	proofs, err := migrationAdmissionOwnershipProofs(view, ranges, f.shardGroupID, version)
 	if err != nil {
 		return ctx, err
 	}
 	if len(proofs) == 0 {
 		return ctx, errors.WithStack(ErrRouteCutoverPending)
 	}
-	history, err := migrationOwnershipHistory(proofs, version)
+	history, err := migrationAdmissionHistory(proofs, version)
 	if err != nil {
 		return ctx, errors.Wrap(ErrRouteCutoverPending, "incomplete migration apply history")
 	}
@@ -78,7 +83,7 @@ func migrationResolutionAuthorized(ctx context.Context, req *pb.Request) bool {
 
 func migrationApplyIntersects(view store.MigrationServingState, ranges []migrationApplyRange) bool {
 	for _, r := range ranges {
-		for _, proof := range view.Ownership {
+		for _, proof := range migrationAdmissionProofs(view) {
 			if routeRangeIntersects(r.start, r.end, proof.RouteStart, proof.RouteEnd) {
 				return true
 			}
@@ -94,11 +99,55 @@ func migrationApplyIntersects(view store.MigrationServingState, ranges []migrati
 
 func migrationCreationGuardsProven(view store.MigrationServingState, ranges []migrationApplyRange, configuration uint64) bool {
 	for _, guard := range view.Readiness {
-		if guard.Armed && migrationGuardIntersects(guard, ranges) && !migrationGuardOwnershipProven(guard, view.Ownership, configuration) {
+		if guard.Armed && migrationGuardIntersects(guard, ranges) && !migrationAdmissionGuardProven(view, guard, ranges, configuration) {
 			return false
 		}
 	}
 	return true
+}
+
+func migrationAdmissionGuardProven(view store.MigrationServingState, guard store.TargetStagedReadinessState, ranges []migrationApplyRange, configuration uint64) bool {
+	if guard.SourceReadFence || guard.SourceWriteFence {
+		return false
+	}
+	for _, r := range ranges {
+		if !routeRangeIntersects(r.start, r.end, guard.RouteStart, guard.RouteEnd) {
+			continue
+		}
+		start, end := prefixDeleteRouteIntersection(distribution.Route{Start: guard.RouteStart, End: guard.RouteEnd}, r.start, r.end)
+		proofs, err := migrationAdmissionRangeProofs(view, migrationApplyRange{start, end})
+		if err != nil || len(proofs) == 0 {
+			return false
+		}
+		for _, proof := range proofs {
+			if !migrationAdmissionGuardMatches(proof, guard, configuration) {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+func migrationAdmissionGuardMatches(proof migrationAdmissionProof, guard store.TargetStagedReadinessState, configuration uint64) bool {
+	if proof.partition == nil {
+		return migrationGuardOwnershipProven(guard, []store.MigrationOwnershipState{proof.MigrationOwnershipState}, configuration)
+	}
+	if proof.Role != store.MigrationOwner || proof.JobID != guard.JobID || guard.MigrationJobID != guard.JobID {
+		return false
+	}
+	if guard.TrackWrites {
+		return configuration != 0 && proof.ConfigurationIndex == configuration && !proof.Staged &&
+			guard.RetentionPinTS != 0 && proof.SourceTrackerVersion != 0 && proof.SourceTrackerVersion == guard.ExpectedCutoverVersion
+	}
+	if !proof.Staged || proof.MinWriteTSExclusive != guard.MinWriteTSExclusive {
+		return false
+	}
+	for _, origin := range proof.partition.Origins {
+		if origin.JobID == guard.JobID && origin.Staged && origin.CatalogVersion >= guard.ExpectedCutoverVersion {
+			return true
+		}
+	}
+	return false
 }
 
 func migrationGuardOwnershipProven(guard store.TargetStagedReadinessState, proofs []store.MigrationOwnershipState, configuration uint64) bool {
@@ -150,22 +199,6 @@ func migrationTargetOwnershipMatches(proof store.MigrationOwnershipState, guard 
 	return store.MigrationOwnershipEvidenceValid(proof) && guard.MigrationJobID == guard.JobID && proof.JobID == guard.JobID && proof.Role == store.MigrationOwner && proof.Staged &&
 		proof.Receipts[0].CatalogVersion >= guard.ExpectedCutoverVersion && proof.MinWriteTSExclusive == guard.MinWriteTSExclusive &&
 		bytes.Equal(proof.RouteStart, guard.RouteStart) && bytes.Equal(proof.RouteEnd, guard.RouteEnd)
-}
-
-func migrationRequestOwnershipProofs(states []store.MigrationOwnershipState, req *pb.Request, groupID uint64) ([]store.MigrationOwnershipState, uint64, error) {
-	ranges, err := migrationServingFootprint(req)
-	if err != nil || len(ranges) == 0 {
-		return nil, 0, err
-	}
-	if !migrationApplyIntersects(store.MigrationServingState{Ownership: states}, ranges) {
-		return nil, 0, nil
-	}
-	version, pinned := DecodeObservedRouteVersion(req.GetObservedRouteVersion())
-	if !pinned {
-		return nil, version, errors.WithStack(ErrRouteCutoverPending)
-	}
-	proofs, err := migrationApplyOwnershipProofs(states, ranges, groupID, version)
-	return proofs, version, err
 }
 
 func (f *kvFSM) matchesMigrationResolution(ctx context.Context, req *pb.Request) (bool, error) {
