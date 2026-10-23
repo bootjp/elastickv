@@ -230,7 +230,7 @@ func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, 
 		return toStatus(syscall.ESTALE)
 	}
 	if errno != 0 {
-		return fuse.ToStatus(errno)
+		return toStatus(errno)
 	}
 	r.fillEntry(&out.EntryOut, result.Stat)
 	out.Fh = result.FH
@@ -264,10 +264,10 @@ func (r *RawFileSystem) Write(cancel <-chan struct{}, input *fuse.WriteIn, data 
 	if errno != 0 {
 		return 0, toStatus(errno)
 	}
-	if n < 0 || uint64(n) > math.MaxUint32 {
+	if n < 0 || int64(n) > math.MaxUint32 {
 		return 0, toStatus(syscall.EOVERFLOW)
 	}
-	return uint32(n), fuse.OK //nolint:gosec // n is bounded by math.MaxUint32 immediately above.
+	return uint32(n), fuse.OK
 }
 
 func (r *RawFileSystem) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {

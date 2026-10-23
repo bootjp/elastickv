@@ -137,21 +137,33 @@ func removeArchiveOutputRoot(outputRoot string) {
 // the tree. A symlinked outputRoot is left untouched (RemoveAll then removes
 // only the link).
 func makeArchiveTreeWritable(outputRoot string) {
+	makeArchiveTreeWritableAfterLstat(outputRoot, func() {})
+}
+
+// makeArchiveTreeWritableAfterLstat is makeArchiveTreeWritable with a hook
+// that runs right after the initial Lstat, so tests can swap outputRoot in
+// that window.
+func makeArchiveTreeWritableAfterLstat(outputRoot string, afterLstat func()) {
 	const perm = archiveDefaultDirPerm | archiveWritableDirPerm
 	info, err := os.Lstat(outputRoot)
 	if err != nil || !info.IsDir() {
 		return
 	}
-	// The root itself may be unreadable; fix it first so it can be opened.
-	_ = os.Chmod(outputRoot, perm)
+	afterLstat()
+	// outputRoot is always created readable (createArchiveOutputRoot, and
+	// extraction never re-modes the root), so opening it needs no chmod.
+	// Every chmod below goes through this identity-checked handle.
 	root, err := os.OpenRoot(outputRoot)
 	if err != nil {
 		return
 	}
 	defer func() { _ = root.Close() }()
+	// Chmod nothing until the opened directory is proven to be the one
+	// Lstat saw: a swap after Lstat (e.g. for a symlink) stops here.
 	if opened, err := root.Stat("."); err != nil || !os.SameFile(info, opened) {
 		return
 	}
+	_ = root.Chmod(".", perm)
 	_ = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
 			_ = root.Chmod(path, perm)

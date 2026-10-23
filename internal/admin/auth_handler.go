@@ -455,26 +455,22 @@ func nonZero(v, fallback int) int {
 	return v
 }
 
-// adminCookie returns an admin cookie that starts with every protective
-// attribute on, then relaxes only what the deployment and the cookie's
-// purpose require: Secure follows the operator's InsecureCookie opt-out
-// (plain-HTTP listeners), and HttpOnly is off only for the CSRF cookie the
-// SPA must read. SameSite is always Strict.
+// adminCookie builds every admin cookie. SameSite is always Strict.
+// Secure follows the operator's secure-cookie setting (off only for
+// plain-HTTP listeners), and HttpOnly is off only for the CSRF cookie the
+// SPA must read.
 func (s *AuthService) adminCookie(name, value string, httpOnly bool, maxAge int, expires time.Time) *http.Cookie {
-	c := &http.Cookie{
+	return &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     pathPrefixAdmin,
 		Domain:   s.cookieDomain,
 		MaxAge:   maxAge,
 		Expires:  expires,
-		Secure:   true,
-		HttpOnly: true,
+		Secure:   s.secureCookie,
+		HttpOnly: httpOnly,
 		SameSite: http.SameSiteStrictMode,
 	}
-	c.Secure = s.secureCookie
-	c.HttpOnly = httpOnly
-	return c
 }
 
 func (s *AuthService) buildCookie(name, value string, httpOnly bool) *http.Cookie {

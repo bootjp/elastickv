@@ -61,6 +61,15 @@ linters:
         path: (^|/)cmd/(elastickv-snapshot-(archive|decode|encode)|raftadmin)/
         text: G703
       - linters:
+          - gosec
+        # Admin auth cookies: G124 only accepts a constant `true` for
+        # Secure/HttpOnly, but Secure must follow the operator's
+        # secure-cookie setting (plain-HTTP listeners) and the CSRF cookie
+        # must stay readable by the SPA. adminCookie is the single place
+        # that sets them; TestAdminCookieAttributes pins every combination.
+        path: (^|/)internal/admin/auth_handler\.go$
+        text: G124
+      - linters:
           - govet
         path: internal/raftengine/etcd/.*\.go
         text: "copylocks: .*go.etcd.io/raft/v3/raftpb"

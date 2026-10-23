@@ -71,6 +71,33 @@ func TestWriteForwardedResultRejectsMalformedPayload(t *testing.T) {
 	require.JSONEq(t, `{"error":"bad_gateway","message":"leader returned a malformed response"}`, rec.Body.String())
 }
 
+func TestWriteForwardedResultMalformedErrorKeepsLeaderStatus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name      string
+		status    int
+		wantRetry string
+	}{
+		{"503 keeps status and Retry-After", http.StatusServiceUnavailable, "1"},
+		{"500 keeps status", http.StatusInternalServerError, ""},
+		{"404 keeps status", http.StatusNotFound, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			rec := httptest.NewRecorder()
+			req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/dynamo/tables", nil)
+			res := &ForwardResult{StatusCode: tc.status, Payload: []byte(`<html>upstream error</html>`), ContentType: "text/html"}
+			writeForwardedResult(rec, req, nil, res, "write failed")
+			require.Equal(t, tc.status, rec.Code)
+			require.Equal(t, tc.wantRetry, rec.Header().Get("Retry-After"))
+			require.Equal(t, contentTypeJSONUTF8, rec.Header().Get("Content-Type"))
+			require.Equal(t, "nosniff", rec.Header().Get("X-Content-Type-Options"))
+			require.JSONEq(t, `{"error":"bad_gateway","message":"leader returned a malformed response"}`, rec.Body.String())
+		})
+	}
+}
+
 func TestAdminCookieAttributes(t *testing.T) {
 	t.Parallel()
 	cases := []struct {

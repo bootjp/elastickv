@@ -254,11 +254,24 @@ func orderedS3BlobPeers(writeReplicas []S3BlobReplica, currentReplicas []S3BlobR
 // spreads across replicas. Randomness comes from crypto/rand; the modulo
 // bias is negligible for replica-sized lists and irrelevant to load
 // spreading.
+//
+// Swap indices are peeled off one random 64-bit word in mixed radix, and a
+// new word is drawn only once the remaining range is smaller than the next
+// modulus. Lists of up to 20 peers (20! < 2^64) take a single 8-byte read,
+// which is the cheapest rand.Read size.
 func shuffleS3BlobPeers(peers []S3BlobReplica) {
 	var buf [8]byte
+	var r, capacity uint64
 	for i := len(peers) - 1; i > 0; i-- {
-		_, _ = rand.Read(buf[:])
-		j := binary.LittleEndian.Uint64(buf[:]) % uint64(i+1)
+		m := uint64(i + 1)
+		if capacity < m {
+			_, _ = rand.Read(buf[:])
+			r = binary.LittleEndian.Uint64(buf[:])
+			capacity = math.MaxUint64
+		}
+		j := r % m
+		r /= m
+		capacity /= m
 		peers[i], peers[j] = peers[j], peers[i]
 	}
 }

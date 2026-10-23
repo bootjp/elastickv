@@ -274,3 +274,22 @@ func TestRemoveArchiveOutputRootLeavesSymlinkTargetModes(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o555), info.Mode().Perm(), "the symlink target must not be chmodded")
 }
+
+func TestMakeArchiveTreeWritableIgnoresRootSwappedForSymlink(t *testing.T) {
+	outside := filepath.Join(t.TempDir(), "outside")
+	require.NoError(t, os.Mkdir(outside, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(outside, 0o755) })
+	out := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.Mkdir(out, 0o755))
+
+	makeArchiveTreeWritableAfterLstat(out, func() {
+		// Swap the already-Lstat'd directory for a symlink to a tree
+		// outside the output root.
+		require.NoError(t, os.Remove(out))
+		require.NoError(t, os.Symlink(outside, out))
+	})
+
+	info, err := os.Stat(outside)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o555), info.Mode().Perm(), "a root swapped for a symlink must not have its target chmodded")
+}

@@ -587,7 +587,7 @@ func writeForwardedResult(w http.ResponseWriter, r *http.Request, logger *slog.L
 			logger.LogAttrs(r.Context(), slog.LevelWarn, "admin forward response is not valid JSON",
 				slog.String("error", err.Error()),
 			)
-			writeJSONError(w, http.StatusBadGateway, "bad_gateway", "leader returned a malformed response")
+			writeMalformedForwardResult(w, res.StatusCode)
 			return
 		}
 		payload = encoded
@@ -615,6 +615,22 @@ func writeForwardedResult(w http.ResponseWriter, r *http.Request, logger *slog.L
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+// writeMalformedForwardResult answers a forwarded response whose body is
+// not valid JSON. A leader error status (4xx/5xx) is kept, with
+// Retry-After on 503, so the client's retry contract does not depend on
+// the body. A non-error status with a malformed body becomes 502, since
+// the client cannot use the result.
+func writeMalformedForwardResult(w http.ResponseWriter, leaderStatus int) {
+	status := http.StatusBadGateway
+	if leaderStatus >= http.StatusBadRequest {
+		status = leaderStatus
+	}
+	if status == http.StatusServiceUnavailable {
+		w.Header().Set("Retry-After", "1")
+	}
+	writeJSONError(w, status, "bad_gateway", "leader returned a malformed response")
 }
 
 // writeForwardFailure handles forwarder errors that did not
