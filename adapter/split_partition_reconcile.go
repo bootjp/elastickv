@@ -38,7 +38,7 @@ func (s *DistributionServer) prepareSplitRangePartitions(ctx context.Context, sn
 
 func (s *DistributionServer) splitRangeGroupHasOwnership(ctx context.Context, parent distribution.RouteDescriptor, group *kv.ShardGroup) (bool, error) {
 	if group == nil || group.Store == nil {
-		return false, nil
+		return false, errors.WithStack(store.ErrNotSupported)
 	}
 	reader, ok := group.Store.(store.MigrationServingAdmissionReader)
 	if !ok {

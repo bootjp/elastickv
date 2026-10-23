@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 )
@@ -57,6 +58,21 @@ func TestSplitRangeWithoutAuthCannotIgnoreDurableOwnership(t *testing.T) {
 		SplitKey: []byte("t"), ExpectedCatalogVersion: before.Version})
 	require.Error(t, err)
 	after, err := r.server.catalog.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, before.Version, after.Version)
+	require.Equal(t, before.Routes, after.Routes)
+}
+
+func TestSplitRangeCannotTreatMissingOwnerStoreAsProofFree(t *testing.T) {
+	t.Parallel()
+	server, version := seededDistributionServer(t)
+	before, err := server.catalog.Snapshot(t.Context())
+	require.NoError(t, err)
+	WithMigrationOwnershipRefresh(map[uint64]*kv.ShardGroup{}, nil)(server)
+	_, err = server.SplitRange(t.Context(), &pb.SplitRangeRequest{RouteId: 1,
+		SplitKey: []byte("g"), ExpectedCatalogVersion: version})
+	require.Error(t, err, "unknown ownership is not an empty ownership frontier")
+	after, err := server.catalog.Snapshot(t.Context())
 	require.NoError(t, err)
 	require.Equal(t, before.Version, after.Version)
 	require.Equal(t, before.Routes, after.Routes)

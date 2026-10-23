@@ -19,7 +19,7 @@ func (s *DistributionServer) validateSplitPartitionBudget(ctx context.Context, p
 	}
 	group := s.ownershipRefresh.groups[parent.GroupID]
 	if group == nil || group.Store == nil {
-		return nil
+		return errors.WithStack(store.ErrNotSupported)
 	}
 	reader, ok := group.Store.(store.MigrationServingAdmissionReader)
 	if !ok {
@@ -41,6 +41,10 @@ func (s *DistributionServer) validateSplitPartitionBudget(ctx context.Context, p
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	return validateSplitPartitionControlSize(control)
+}
+
+func validateSplitPartitionControlSize(control kv.MigrationPartitionControl) error {
 	encoded, err := kv.EncodeMigrationPartitionControl(control)
 	if err != nil {
 		return errors.WithStack(err)
