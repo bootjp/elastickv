@@ -2,7 +2,6 @@ package store
 
 import (
 	"context"
-	"encoding/binary"
 
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
@@ -37,10 +36,11 @@ func partitionConfiguration(value []byte, err error) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if len(value) != 8 || binary.BigEndian.Uint64(value) == 0 {
-		return 0, errors.New("invalid durable migration configuration index")
+	index, err := DecodeMigrationConfigurationIndex(value)
+	if err != nil {
+		return 0, errors.WithStack(err)
 	}
-	return binary.BigEndian.Uint64(value), nil
+	return index, nil
 }
 
 func (s *mvccStore) partitionConfigurationLocked() (uint64, error) {
