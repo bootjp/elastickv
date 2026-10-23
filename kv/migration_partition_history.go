@@ -37,34 +37,3 @@ func MigrationPartitionHistoryPresent(ctx context.Context, st store.MVCCStore) (
 	}
 	return false, nil
 }
-
-// MigrationPartitionRequestAdmissionReady reports installed proposal/store
-// integration, not an active epoch or migration activation permission.
-func MigrationPartitionRequestAdmissionReady(tx Transactional) bool {
-	switch t := tx.(type) {
-	case *TransactionManager:
-		if !migrationTransactionManagerReady(t) {
-			return false
-		}
-		_, supported := t.migrationAdmission.Load().store.(store.MigrationOwnershipPartitionStore)
-		return supported
-	case *LeaderProxy:
-		return t != nil && MigrationPartitionRequestAdmissionReady(t.tm)
-	case *leaseRefreshingTxn:
-		return t != nil && MigrationPartitionRequestAdmissionReady(t.inner)
-	case *timestampAdmissionTransactional:
-		return t != nil && MigrationPartitionRequestAdmissionReady(t.inner)
-	default:
-		return false
-	}
-}
-
-// MigrationPartitionReadAdmissionReady reports the public read/store pairing;
-// the runtime additionally checks its installed committed-root consumer.
-func (s *ShardStore) MigrationPartitionReadAdmissionReady(groupID uint64) bool {
-	if !s.MigrationReadAdmissionReady(groupID) {
-		return false
-	}
-	_, supported := s.groups[groupID].Store.(store.MigrationOwnershipPartitionStore)
-	return supported
-}
