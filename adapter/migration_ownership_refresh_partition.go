@@ -160,16 +160,31 @@ func migrationPartitionCandidates(view store.MigrationServingState, state store.
 				consumed[ref.LegacyJobID] = true
 			}
 		}
+		consumeMigrationPartitionJobOperation(state.Generation, r, consumed)
 	}
 	for i := range state.Partitions {
 		result = append(result, migrationPartitionPrior{partition: &state.Partitions[i]})
 	}
 	for i := range view.Ownership {
-		if !consumed[view.Ownership[i].JobID] {
+		if !consumed[view.Ownership[i].JobID] || !store.MigrationOwnershipEvidenceValid(view.Ownership[i]) {
 			result = append(result, migrationPartitionPrior{legacy: &view.Ownership[i]})
 		}
 	}
 	return result
+}
+
+func consumeMigrationPartitionJobOperation(generation string, receipt store.MigrationOwnershipPartitionReceipt, consumed map[uint64]bool) {
+	if receipt.Transition.Operation != store.MigrationOwnershipPartitionJobOperation {
+		return
+	}
+	// Validate historical outputs against their own immutable receipt, not the
+	// current frontier: a later split may already have replaced these children.
+	historical := store.MigrationOwnershipPartitionState{Generation: generation, Partitions: receipt.Transition.After, Receipts: []store.MigrationOwnershipPartitionReceipt{receipt}}
+	for _, p := range receipt.Transition.After {
+		if store.MigrationOwnershipPartitionEvidenceValid(historical, p) {
+			consumed[p.MigrationJobID] = true
+		}
+	}
 }
 
 func partitionRangesOverlap(a, b store.MigrationOwnershipPartition) bool {
