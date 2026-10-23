@@ -668,6 +668,7 @@ func run() error {
 		runtimes:        runtimes,
 		cfg:             cfg,
 		coordinate:      coordinate,
+		shardStore:      shardStore,
 		defaultGroup:    shardGroups[cfg.defaultGroup],
 		encWiring:       encWiring,
 		raftID:          *raftId,
@@ -818,6 +819,7 @@ type distributionStartupInput struct {
 	runtimes        []*raftGroupRuntime
 	cfg             runtimeConfig
 	coordinate      *kv.ShardedCoordinator
+	shardStore      *kv.ShardStore
 	defaultGroup    *kv.ShardGroup
 	encWiring       encryptionWriteWiring
 	raftID          string
@@ -916,6 +918,7 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 		// Do not advertise cap_migration_v2 before protocol coverage is accepted.
 		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
 		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
+		migrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
 	)
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,
@@ -4174,6 +4177,10 @@ func startRaftServers(
 			adapter.WithInternalMigrationPartitionProtocolReady(func() bool {
 				return migrationOwnershipRuntimeHooksInstalled(trx, shardStore, distServer, rt.spec.id)
 			}),
+			adapter.WithMigrationNamespaceAdmissionReady(func() bool {
+				return migrationOwnershipRuntimeHooksInstalled(trx, shardStore, distServer, rt.spec.id) &&
+					kv.MigrationNamespaceInstalledVersion(rt.store, rt.stateMachine) == kv.MigrationNamespaceVersion
+			}),
 		)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
@@ -4229,7 +4236,7 @@ func startRaftServers(
 			rt.engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			newMigrationMembershipGate(rt.store, migrationMemberProtocolsConfigured(),
+			newMigrationMembershipGate(rt.store, rt.spec.id != 0 && migrationMemberProtocolsConfigured(),
 				newMigrationMemberProtocolProbe(adminGRPCOpts.migrationToken),
 				newPrepareEvidenceMembershipGate(shardStore, rt.spec.id, confChangeInterceptor)),
 		)

@@ -22,7 +22,7 @@ func TestMigrationOwnershipProviderWiringDoesNotAuthorizeIncompleteCoverage(t *t
 	engine := capabilityConfigEngine{}
 	tx := newInternalMigrationTransaction(engine, nil, st, 7)
 	t.Cleanup(tx.Close)
-	groups := map[uint64]*kv.ShardGroup{7: {Engine: engine, Store: st}}
+	groups := map[uint64]*kv.ShardGroup{7: {Engine: engine, Store: st, Txn: tx}}
 	routes := distribution.NewEngine()
 	shards := kv.NewShardStore(routes, groups)
 	var cache kv.GRPCConnCache
@@ -30,7 +30,8 @@ func TestMigrationOwnershipProviderWiringDoesNotAuthorizeIncompleteCoverage(t *t
 	server := adapter.NewDistributionServer(routes, nil,
 		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, t.Name())),
 		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, t.Name())),
-		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{engine: engine}, &cache, t.Name(), true))
+		migrationOwnershipRefreshOption(groups, &raftGroupRuntime{engine: engine}, &cache, t.Name(), true),
+		migrationPartitionRuntimeOption(shards, groups, &cache, t.Name(), true))
 	require.True(t, kv.MigrationRequestAdmissionReady(tx))
 	require.True(t, shards.MigrationReadAdmissionReady(7))
 	require.True(t, server.MigrationOwnershipRefreshConfigured(7))

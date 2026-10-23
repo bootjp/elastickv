@@ -91,4 +91,20 @@ func TestSplitWorkingSourcePersistsJobWithManifestAndRecovers(t *testing.T) {
 	resumed, err := s.ensureSplitWorkingSource(t.Context(), loaded)
 	require.NoError(t, err)
 	require.Equal(t, updated, resumed)
+	fencing := distribution.CloneSplitJob(loaded)
+	fencing.Phase = distribution.SplitJobPhaseFence
+	fencing.SnapshotTS = 100
+	require.NoError(t, s.catalog.SaveSplitJob(t.Context(), loaded, fencing))
+	fenceSnapshot, moving, err := s.splitJobSourceRoute(t.Context(), fencing)
+	require.NoError(t, err)
+	fenced, moving, err := s.ensureSplitJobCatalogFence(t.Context(), fencing, fenceSnapshot, moving)
+	require.NoError(t, err)
+	require.Len(t, fenced.Routes, 2, "the working child must not be split at its start key again")
+	require.Equal(t, route.RouteID, moving.RouteID)
+	require.Equal(t, distribution.RouteStateWriteFenced, moving.State)
+	require.Equal(t, after.Routes[0], fenced.Routes[0], "the retained side keeps its descriptor and floor")
+	replayed, replayedMoving, err := s.ensureSplitJobCatalogFence(t.Context(), fencing, fenced, moving)
+	require.NoError(t, err)
+	require.Equal(t, fenced.Version, replayed.Version)
+	require.Equal(t, moving, replayedMoving)
 }

@@ -1337,6 +1337,9 @@ func (s *DistributionServer) SplitRange(ctx context.Context, req *pb.SplitRangeR
 	if err := s.applyEngineSnapshot(saved); err != nil {
 		return nil, err
 	}
+	if err := s.reconcileSplitRangePartitions(ctx); err != nil {
+		return nil, err
+	}
 	savedLeft, savedRight, err := splitChildrenFromSnapshot(saved, plan.left.RouteID, plan.right.RouteID)
 	if err != nil {
 		return nil, err

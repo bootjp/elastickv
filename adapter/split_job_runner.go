@@ -1273,6 +1273,16 @@ func splitJobSourceSibling(routes []distribution.RouteDescriptor, job distributi
 }
 
 func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job distribution.SplitJob) error {
+	if s.MigrationPartitionRuntimeConfigured(job.SourceGroupID) {
+		var err error
+		job, err = s.ensureSplitWorkingSource(ctx, job)
+		if err != nil {
+			return err
+		}
+		if err := s.reconcileMigrationPartitions(ctx, job.SourceGroupID); err != nil {
+			return err
+		}
+	}
 	_, parent, err := s.splitJobSourceRoute(ctx, job)
 	if err != nil {
 		return err
