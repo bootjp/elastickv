@@ -371,7 +371,7 @@ func (s *AuthService) issueSession(w http.ResponseWriter, principal AuthPrincipa
 	http.SetCookie(w, s.buildCookie(sessionCookieName, token, true))
 	http.SetCookie(w, s.buildCookie(csrfCookieName, csrf, false))
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(loginResponse{Role: principal.Role, ExpiresAt: expires})
 }
@@ -455,31 +455,34 @@ func nonZero(v, fallback int) int {
 	return v
 }
 
-func (s *AuthService) buildCookie(name, value string, httpOnly bool) *http.Cookie {
-	return &http.Cookie{
+// adminCookie returns an admin cookie that starts with every protective
+// attribute on, then relaxes only what the deployment and the cookie's
+// purpose require: Secure follows the operator's InsecureCookie opt-out
+// (plain-HTTP listeners), and HttpOnly is off only for the CSRF cookie the
+// SPA must read. SameSite is always Strict.
+func (s *AuthService) adminCookie(name, value string, httpOnly bool, maxAge int, expires time.Time) *http.Cookie {
+	c := &http.Cookie{
 		Name:     name,
 		Value:    value,
 		Path:     pathPrefixAdmin,
 		Domain:   s.cookieDomain,
-		MaxAge:   int(s.sessionTTL.Seconds()),
-		Secure:   s.secureCookie,
-		HttpOnly: httpOnly,
+		MaxAge:   maxAge,
+		Expires:  expires,
+		Secure:   true,
+		HttpOnly: true,
 		SameSite: http.SameSiteStrictMode,
 	}
+	c.Secure = s.secureCookie
+	c.HttpOnly = httpOnly
+	return c
+}
+
+func (s *AuthService) buildCookie(name, value string, httpOnly bool) *http.Cookie {
+	return s.adminCookie(name, value, httpOnly, int(s.sessionTTL.Seconds()), time.Time{})
 }
 
 func (s *AuthService) buildExpiredCookie(name string, httpOnly bool) *http.Cookie {
-	return &http.Cookie{
-		Name:     name,
-		Value:    "",
-		Path:     pathPrefixAdmin,
-		Domain:   s.cookieDomain,
-		MaxAge:   -1,
-		Expires:  time.Unix(0, 0),
-		Secure:   s.secureCookie,
-		HttpOnly: httpOnly,
-		SameSite: http.SameSiteStrictMode,
-	}
+	return s.adminCookie(name, "", httpOnly, -1, time.Unix(0, 0))
 }
 
 func newCSRFToken() (string, error) {

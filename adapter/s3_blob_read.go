@@ -3,9 +3,10 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
+	"encoding/binary"
 	"math"
-	rand "math/rand/v2"
 
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/store"
@@ -245,8 +246,21 @@ func orderedS3BlobPeers(writeReplicas []S3BlobReplica, currentReplicas []S3BlobR
 			peers = appendUniqueS3BlobPeer(peers, seen, replica, selfNodeID)
 		}
 	}
-	rand.Shuffle(len(peers), func(i, j int) { peers[i], peers[j] = peers[j], peers[i] })
+	shuffleS3BlobPeers(peers)
 	return append(sources, peers...)
+}
+
+// shuffleS3BlobPeers permutes peers in place (Fisher-Yates) so fetch load
+// spreads across replicas. Randomness comes from crypto/rand; the modulo
+// bias is negligible for replica-sized lists and irrelevant to load
+// spreading.
+func shuffleS3BlobPeers(peers []S3BlobReplica) {
+	var buf [8]byte
+	for i := len(peers) - 1; i > 0; i-- {
+		_, _ = rand.Read(buf[:])
+		j := binary.LittleEndian.Uint64(buf[:]) % uint64(i+1)
+		peers[i], peers[j] = peers[j], peers[i]
+	}
 }
 
 func appendUniqueS3BlobPeer(dst []S3BlobReplica, seen map[string]struct{}, replica S3BlobReplica, selfNodeID string) []S3BlobReplica {

@@ -538,7 +538,7 @@ func isNilCredentialStore(cs CredentialStore) bool {
 // — an explicit allow-list of nilable kinds — easier to audit.
 var nilableKinds = map[reflect.Kind]struct{}{
 	reflect.Map:       {},
-	reflect.Ptr:       {},
+	reflect.Pointer:   {},
 	reflect.Slice:     {},
 	reflect.Chan:      {},
 	reflect.Func:      {},

@@ -608,7 +608,7 @@ func (r *RedisServer) loadSetMembersAt(ctx context.Context, key []byte, readTS u
 }
 
 func (r *RedisServer) loadSetAt(ctx context.Context, kind string, key []byte, readTS uint64) (redisSetValue, error) {
-	if kind == "set" {
+	if kind == setKind {
 		// Wide-column path: check !st|mem| prefix first.
 		prefix := store.SetMemberScanPrefix(key)
 		end := store.PrefixScanEnd(prefix)

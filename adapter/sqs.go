@@ -43,6 +43,24 @@ const (
 )
 
 const (
+	sqsAttrFifoQueue                     = "FifoQueue"
+	sqsAttrVisibilityTimeout             = "VisibilityTimeout"
+	sqsAttrMessageRetentionPeriod        = "MessageRetentionPeriod"
+	sqsAttrDelaySeconds                  = "DelaySeconds"
+	sqsAttrReceiveMessageWaitTimeSeconds = "ReceiveMessageWaitTimeSeconds"
+	sqsAttrMaximumMessageSize            = "MaximumMessageSize"
+	sqsAttrContentBasedDeduplication     = "ContentBasedDeduplication"
+	sqsFieldMessageID                    = "MessageId"
+	sqsFieldMD5OfMessageBody             = "MD5OfMessageBody"
+	sqsFieldMD5OfMessageAttributes       = "MD5OfMessageAttributes"
+	sqsFieldSuccessful                   = "Successful"
+	sqsFieldFailed                       = "Failed"
+	sqsErrIncompleteSignature            = "IncompleteSignature"
+	sqsErrSignatureDoesNotMatch          = "SignatureDoesNotMatch"
+	sqsErrRequestTimeTooSkewed           = "RequestTimeTooSkewed"
+)
+
+const (
 	sqsHealthPath       = "/sqs_health"
 	sqsLeaderHealthPath = "/sqs_leader_health"
 )

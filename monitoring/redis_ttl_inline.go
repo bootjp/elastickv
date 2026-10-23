@@ -47,14 +47,14 @@ func newRedisTTLInlineMigrationMetrics(registerer prometheus.Registerer) *RedisT
 				Name: "elastickv_redis_ttl_inline_migration_passes_total",
 				Help: "Completed Redis TTL-inline migration passes by anchor type, data group, and outcome (clean, partial, not_clean).",
 			},
-			[]string{"type", "group", "outcome"},
+			[]string{"type", labelGroup, labelOutcome},
 		),
 		lastPassStart: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_redis_ttl_inline_migration_last_pass_start_timestamp_seconds",
 				Help: "Unix time at which the latest Redis TTL-inline migration pass this node completed began, by anchor type, data group, and outcome (clean, partial, not_clean).",
 			},
-			[]string{"type", "group", "outcome"},
+			[]string{"type", labelGroup, labelOutcome},
 		),
 	}
 	if registerer != nil {

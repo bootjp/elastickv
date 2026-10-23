@@ -298,7 +298,12 @@ func writeCommandDocEntry(conn redcon.Conn, meta redisCommandMeta) {
 }
 
 const (
-	redisCommandNameCommand = "command"
+	redisCommandNameCommand   = "command"
+	redisCommandNamePing      = "ping"
+	redisCommandNamePubSub    = "pubsub"
+	redisCommandNameQuit      = "quit"
+	redisCommandNameSet       = "set"
+	redisCommandNameSubscribe = "subscribe"
 )
 
 func redisCommandGroup(name string) string {
@@ -326,11 +331,11 @@ func redisCommandGroup(name string) string {
 
 func redisCommandFixedGroup(name string) (string, bool) {
 	switch name {
-	case "get", "getdel", setKind, "setex", "setnx", "incr":
+	case "get", "getdel", redisCommandNameSet, "setex", "setnx", "incr":
 		return "string", true
 	case "bzpopmin", "elastickv.zremfast":
 		return "sorted-set", true
-	case "client", "hello", "ping", "quit", "select":
+	case "client", "hello", redisCommandNamePing, redisCommandNameQuit, "select":
 		return "connection", true
 	case redisCommandNameCommand, "dbsize", "info", "flushall", "flushdb", "flushlegacy":
 		return "server", true
@@ -338,7 +343,7 @@ func redisCommandFixedGroup(name string) (string, bool) {
 		return "scripting", true
 	case "multi", "exec", "discard":
 		return "transactions", true
-	case "publish", "pubsub", "subscribe":
+	case "publish", redisCommandNamePubSub, redisCommandNameSubscribe:
 		return "pubsub", true
 	case "rename", "scan":
 		return "generic", true

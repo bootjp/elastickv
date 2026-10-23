@@ -89,7 +89,7 @@ func (s *SQSServer) authorizeSQSRequest(r *http.Request) *sqsAuthError {
 	}
 	secretAccessKey, ok := s.staticCreds[parsed.AccessKeyID]
 	if !ok {
-		return &sqsAuthError{Status: http.StatusForbidden, Code: "InvalidClientTokenId", Message: "unknown access key"}
+		return &sqsAuthError{Status: http.StatusForbidden, Code: "InvalidClientTokenId", Message: sigv4ErrMsgUnknownAccessKey}
 	}
 	signingTime, authErr := validateSQSAuthDate(r, parsed)
 	if authErr != nil {
@@ -107,16 +107,16 @@ func (s *SQSServer) authorizeSQSRequest(r *http.Request) *sqsAuthError {
 func (s *SQSServer) validateSQSAuthScope(authHeader string) (sigv4AuthorizationHeader, *sqsAuthError) {
 	parsed, err := parseSigV4AuthorizationHeader(authHeader)
 	if err != nil {
-		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: "IncompleteSignature", Message: "invalid Authorization header"}
+		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrIncompleteSignature, Message: "invalid Authorization header"}
 	}
 	if parsed.Algorithm != sigv4Algorithm {
-		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: "IncompleteSignature", Message: "unsupported signature algorithm"}
+		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrIncompleteSignature, Message: sigv4ErrMsgUnsupportedAlgorithm}
 	}
 	if parsed.Service != sqsSigV4Service {
-		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: "SignatureDoesNotMatch", Message: "credential scope service must be sqs"}
+		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrSignatureDoesNotMatch, Message: "credential scope service must be sqs"}
 	}
 	if parsed.Region != s.effectiveRegion() {
-		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: "SignatureDoesNotMatch", Message: "credential scope region does not match server region"}
+		return sigv4AuthorizationHeader{}, &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrSignatureDoesNotMatch, Message: sigv4ErrMsgRegionMismatch}
 	}
 	return parsed, nil
 }
@@ -130,17 +130,17 @@ func validateSQSAuthDate(r *http.Request, parsed sigv4AuthorizationHeader) (time
 	}
 	signingTime, err := time.Parse(sigv4DateHeaderFormat, amzDate)
 	if err != nil {
-		return time.Time{}, &sqsAuthError{Status: http.StatusForbidden, Code: "IncompleteSignature", Message: "invalid x-amz-date header"}
+		return time.Time{}, &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrIncompleteSignature, Message: "invalid x-amz-date header"}
 	}
 	if parsed.Date != signingTime.UTC().Format(sigv4ScopeDateFormat) {
-		return time.Time{}, &sqsAuthError{Status: http.StatusForbidden, Code: "SignatureDoesNotMatch", Message: "credential scope date does not match x-amz-date"}
+		return time.Time{}, &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrSignatureDoesNotMatch, Message: "credential scope date does not match x-amz-date"}
 	}
 	skew := time.Now().UTC().Sub(signingTime.UTC())
 	if skew < 0 {
 		skew = -skew
 	}
 	if skew > sigv4RequestTimeMaxSkew {
-		return time.Time{}, &sqsAuthError{Status: http.StatusForbidden, Code: "RequestTimeTooSkewed", Message: "The difference between the request time and the server's time is too large"}
+		return time.Time{}, &sqsAuthError{Status: http.StatusForbidden, Code: sqsErrRequestTimeTooSkewed, Message: s3ErrRequestTimeTooSkewedMsg}
 	}
 	return signingTime, nil
 }

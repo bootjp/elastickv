@@ -610,24 +610,11 @@ func (h *S3Handler) tryForwardDeleteBucket(w http.ResponseWriter, r *http.Reques
 	return true
 }
 
-// writeForwardResult re-emits the leader's structured response
-// verbatim. Mirrors DynamoHandler.writeForwardResult — same headers
-// and 503-+-Retry-After contract.
+// writeForwardResult re-emits the leader's structured response through
+// writeForwardedResult, shared with DynamoHandler — same headers, JSON
+// re-encoding and 503-+-Retry-After contract.
 func (h *S3Handler) writeForwardResult(w http.ResponseWriter, r *http.Request, res *ForwardResult) {
-	w.Header().Set("Content-Type", res.ContentType)
-	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("Cache-Control", "no-store")
-	if res.StatusCode == http.StatusServiceUnavailable {
-		w.Header().Set("Retry-After", "1")
-	}
-	w.WriteHeader(res.StatusCode)
-	if len(res.Payload) > 0 {
-		if _, err := w.Write(res.Payload); err != nil {
-			h.logger.LogAttrs(r.Context(), slog.LevelWarn, "admin s3 forward response write failed",
-				slog.String("error", err.Error()),
-			)
-		}
-	}
+	writeForwardedResult(w, r, h.logger, res, "admin s3 forward response write failed")
 }
 
 // writeForwardFailure handles forwarder-side errors that did not

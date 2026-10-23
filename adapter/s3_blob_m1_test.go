@@ -867,3 +867,33 @@ func (c *fakeS3BlobCluster) clearBlobs() {
 	c.blobs = map[string]map[[sha256.Size]byte][]byte{}
 	c.mu.Unlock()
 }
+
+func TestShuffleS3BlobPeersPreservesElements(t *testing.T) {
+	t.Parallel()
+
+	for n := 0; n <= 8; n++ {
+		peers := make([]S3BlobReplica, n)
+		for i := range peers {
+			peers[i] = S3BlobReplica{NodeID: string(rune('a' + i)), Address: string(rune('a'+i)) + ":50051"}
+		}
+		want := append([]S3BlobReplica(nil), peers...)
+		for range 50 {
+			shuffleS3BlobPeers(peers)
+			require.ElementsMatch(t, want, peers)
+		}
+	}
+}
+
+func TestShuffleS3BlobPeersReachesEveryPosition(t *testing.T) {
+	t.Parallel()
+
+	// Every peer must be able to land first, otherwise fetch load would
+	// not spread across replicas.
+	first := map[string]bool{}
+	peers := []S3BlobReplica{{NodeID: "a", Address: "a:1"}, {NodeID: "b", Address: "b:1"}, {NodeID: "c", Address: "c:1"}}
+	for range 500 {
+		shuffleS3BlobPeers(peers)
+		first[peers[0].NodeID] = true
+	}
+	require.Len(t, first, len(peers))
+}

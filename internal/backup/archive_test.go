@@ -243,11 +243,34 @@ func writeArchiveFixture(t *testing.T) string {
 	return root
 }
 
-func makeArchiveTreeWritable(root string) {
-	_ = filepath.WalkDir(root, func(path string, d os.DirEntry, err error) error {
-		if err == nil && d.IsDir() {
-			_ = os.Chmod(path, 0o755)
-		}
-		return nil
-	})
+func TestRemoveArchiveOutputRootRemovesNestedReadOnlyDirs(t *testing.T) {
+	out := filepath.Join(t.TempDir(), "out")
+	nested := filepath.Join(out, "a", "b")
+	require.NoError(t, os.MkdirAll(nested, 0o755))
+	require.NoError(t, os.WriteFile(filepath.Join(nested, "f"), []byte("x"), 0o600))
+	require.NoError(t, os.Chmod(nested, 0o555))
+	require.NoError(t, os.Chmod(filepath.Join(out, "a"), 0o555))
+	require.NoError(t, os.Chmod(out, 0o555))
+
+	removeArchiveOutputRoot(out)
+
+	_, err := os.Lstat(out)
+	require.True(t, os.IsNotExist(err))
+}
+
+func TestRemoveArchiveOutputRootLeavesSymlinkTargetModes(t *testing.T) {
+	target := t.TempDir()
+	readOnly := filepath.Join(target, "readonly")
+	require.NoError(t, os.Mkdir(readOnly, 0o555))
+	t.Cleanup(func() { _ = os.Chmod(readOnly, 0o755) })
+	link := filepath.Join(t.TempDir(), "out")
+	require.NoError(t, os.Symlink(target, link))
+
+	removeArchiveOutputRoot(link)
+
+	_, err := os.Lstat(link)
+	require.True(t, os.IsNotExist(err), "the symlink itself is removed")
+	info, err := os.Stat(readOnly)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o555), info.Mode().Perm(), "the symlink target must not be chmodded")
 }

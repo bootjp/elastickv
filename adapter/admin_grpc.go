@@ -690,7 +690,7 @@ func (s *AdminServer) probeLeaderVersionAsync(ctx context.Context, key string, a
 		md = incoming.Copy()
 	}
 	go func() {
-		probeCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		probeCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), timeout)
 		defer cancel()
 		version := ""
 		for _, address := range candidates {

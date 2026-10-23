@@ -126,13 +126,38 @@ func createArchiveOutputRoot(outputRoot string) error {
 }
 
 func removeArchiveOutputRoot(outputRoot string) {
-	_ = filepath.WalkDir(outputRoot, func(path string, d os.DirEntry, err error) error {
+	makeArchiveTreeWritable(outputRoot)
+	_ = os.RemoveAll(outputRoot)
+}
+
+// makeArchiveTreeWritable restores owner write and search permission on
+// every directory under outputRoot so RemoveAll can delete entries that
+// extraction left read-only. The walk runs through an os.Root, so a
+// directory swapped for a symlink mid-walk cannot redirect a chmod outside
+// the tree. A symlinked outputRoot is left untouched (RemoveAll then removes
+// only the link).
+func makeArchiveTreeWritable(outputRoot string) {
+	const perm = archiveDefaultDirPerm | archiveWritableDirPerm
+	info, err := os.Lstat(outputRoot)
+	if err != nil || !info.IsDir() {
+		return
+	}
+	// The root itself may be unreadable; fix it first so it can be opened.
+	_ = os.Chmod(outputRoot, perm)
+	root, err := os.OpenRoot(outputRoot)
+	if err != nil {
+		return
+	}
+	defer func() { _ = root.Close() }()
+	if opened, err := root.Stat("."); err != nil || !os.SameFile(info, opened) {
+		return
+	}
+	_ = fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, err error) error {
 		if err == nil && d.IsDir() {
-			_ = os.Chmod(path, archiveDefaultDirPerm|archiveWritableDirPerm)
+			_ = root.Chmod(path, perm)
 		}
 		return nil
 	})
-	_ = os.RemoveAll(outputRoot)
 }
 
 func resolveArchiveDumpRoot(root string) (string, error) {

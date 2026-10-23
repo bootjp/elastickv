@@ -104,8 +104,8 @@ func (s *SQSServer) sendMessageBatch(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp := map[string]any{
-		"Successful": successful,
-		"Failed":     failed,
+		sqsFieldSuccessful: successful,
+		sqsFieldFailed:     failed,
 	}
 	writeSQSJSON(w, resp)
 }
@@ -344,7 +344,7 @@ func (s *SQSServer) sendOneFifoBatchEntry(
 	}
 	return true, sqsSendMessageBatchResultEntry{
 		Id:                     entry.Id,
-		MessageId:              resp["MessageId"],
+		MessageId:              resp[sqsFieldMessageID],
 		MD5OfMessageBody:       resp["MD5OfMessageBody"],
 		MD5OfMessageAttributes: resp["MD5OfMessageAttributes"],
 		SequenceNumber:         resp["SequenceNumber"],
@@ -546,7 +546,7 @@ func (s *SQSServer) deleteMessageBatch(w http.ResponseWriter, r *http.Request) {
 			failed = append(failed, sqsBatchResultErrorEntry{
 				Id:          entry.Id,
 				Code:        sqsErrReceiptHandleInvalid,
-				Message:     "receipt handle is not parseable",
+				Message:     sqsErrMsgReceiptHandleUnparseable,
 				SenderFault: true,
 			})
 			continue
@@ -558,8 +558,8 @@ func (s *SQSServer) deleteMessageBatch(w http.ResponseWriter, r *http.Request) {
 		successful = append(successful, sqsBatchResultEntry{Id: entry.Id})
 	}
 	writeSQSJSON(w, map[string]any{
-		"Successful": successful,
-		"Failed":     failed,
+		sqsFieldSuccessful: successful,
+		sqsFieldFailed:     failed,
 	})
 }
 
@@ -585,7 +585,7 @@ func (s *SQSServer) deleteMessageBatchCore(ctx context.Context, queueName string
 			failed = append(failed, sqsBatchResultErrorEntry{
 				Id:          entry.Id,
 				Code:        sqsErrReceiptHandleInvalid,
-				Message:     "receipt handle is not parseable",
+				Message:     sqsErrMsgReceiptHandleUnparseable,
 				SenderFault: true,
 			})
 			continue
@@ -650,8 +650,8 @@ func (s *SQSServer) changeMessageVisibilityBatch(w http.ResponseWriter, r *http.
 		successful = append(successful, sqsBatchResultEntry{Id: entry.Id})
 	}
 	writeSQSJSON(w, map[string]any{
-		"Successful": successful,
-		"Failed":     failed,
+		sqsFieldSuccessful: successful,
+		sqsFieldFailed:     failed,
 	})
 }
 
@@ -709,7 +709,7 @@ func (s *SQSServer) applyChangeVisibilityBatchEntry(ctx context.Context, queueNa
 		return false, sqsBatchResultErrorEntry{
 			Id:          entry.Id,
 			Code:        sqsErrReceiptHandleInvalid,
-			Message:     "receipt handle is not parseable",
+			Message:     sqsErrMsgReceiptHandleUnparseable,
 			SenderFault: true,
 		}
 	}

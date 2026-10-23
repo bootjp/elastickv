@@ -89,12 +89,22 @@ func (r *RawFileSystem) String() string {
 
 }
 
+// toStatus converts an adapter errno into a FUSE status. Errno values
+// outside the int32 range of fuse.Status cannot be a real errno, so they
+// map to EIO instead of being truncated.
+func toStatus(errno syscall.Errno) fuse.Status {
+	if errno > math.MaxInt32 {
+		return fuse.EIO
+	}
+	return fuse.Status(int32(errno))
+}
+
 func (r *RawFileSystem) Lookup(cancel <-chan struct{}, header *fuse.InHeader, name string, out *fuse.EntryOut) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
 	stat, errno := r.adapter.Lookup(ctx, header.NodeId, []byte(name))
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	r.fillEntry(out, stat)
 	return fuse.OK
@@ -105,7 +115,7 @@ func (r *RawFileSystem) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, o
 	defer done()
 	stat, errno := r.adapter.GetAttr(ctx, input.NodeId)
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	out.Attr = fuseAttr(stat)
 	out.SetTimeout(r.attrTTL)
@@ -118,7 +128,7 @@ func (r *RawFileSystem) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, o
 	mask, attrs := fuseSetAttr(input)
 	stat, errno := r.adapter.SetAttr(ctx, input.NodeId, mask, attrs)
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	out.Attr = fuseAttr(stat)
 	out.SetTimeout(r.attrTTL)
@@ -137,7 +147,7 @@ func (r *RawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name 
 		GID:  input.Gid,
 	})
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	r.fillEntry(out, result.Stat)
 	return fuse.OK
@@ -152,7 +162,7 @@ func (r *RawFileSystem) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name 
 		GID:  input.Gid,
 	})
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	r.fillEntry(out, result.Stat)
 	return fuse.OK
@@ -161,41 +171,41 @@ func (r *RawFileSystem) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name 
 func (r *RawFileSystem) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
-	return fuse.Status(r.adapter.Unlink(ctx, header.NodeId, []byte(name)))
+	return toStatus(r.adapter.Unlink(ctx, header.NodeId, []byte(name)))
 }
 
 func (r *RawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
-	return fuse.Status(r.adapter.Rmdir(ctx, header.NodeId, []byte(name)))
+	return toStatus(r.adapter.Rmdir(ctx, header.NodeId, []byte(name)))
 }
 
 func (r *RawFileSystem) Rename(cancel <-chan struct{}, input *fuse.RenameIn, oldName string, newName string) fuse.Status {
 	if input.Flags != 0 {
-		return fuse.Status(syscall.EOPNOTSUPP)
+		return toStatus(syscall.EOPNOTSUPP)
 	}
 	ctx, done := r.requestContext(cancel)
 	defer done()
-	return fuse.Status(r.adapter.Rename(ctx, input.NodeId, []byte(oldName), input.Newdir, []byte(newName)))
+	return toStatus(r.adapter.Rename(ctx, input.NodeId, []byte(oldName), input.Newdir, []byte(newName)))
 }
 
 func (r *RawFileSystem) Link(<-chan struct{}, *fuse.LinkIn, string, *fuse.EntryOut) fuse.Status {
-	return fuse.Status(syscall.EOPNOTSUPP)
+	return toStatus(syscall.EOPNOTSUPP)
 }
 
 func (r *RawFileSystem) Symlink(<-chan struct{}, *fuse.InHeader, string, string, *fuse.EntryOut) fuse.Status {
-	return fuse.Status(syscall.EOPNOTSUPP)
+	return toStatus(syscall.EOPNOTSUPP)
 }
 
 func (r *RawFileSystem) Readlink(<-chan struct{}, *fuse.InHeader) ([]byte, fuse.Status) {
-	return nil, fuse.Status(syscall.EOPNOTSUPP)
+	return nil, toStatus(syscall.EOPNOTSUPP)
 }
 
 func (r *RawFileSystem) Access(cancel <-chan struct{}, input *fuse.AccessIn) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
 	_, errno := r.adapter.GetAttr(ctx, input.NodeId)
-	return fuse.Status(errno)
+	return toStatus(errno)
 }
 
 func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
@@ -217,7 +227,7 @@ func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, 
 		// A successful FUSE_CREATE always marks the descriptor newly created.
 		// ESTALE makes Linux do_filp_open retry path lookup with LOOKUP_REVAL,
 		// preserving normal permission checks, truncation and created status.
-		return fuse.Status(syscall.ESTALE)
+		return toStatus(syscall.ESTALE)
 	}
 	if errno != 0 {
 		return fuse.ToStatus(errno)
@@ -234,7 +244,7 @@ func (r *RawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fu
 	if errno == 0 {
 		out.Fh = fh
 	}
-	return fuse.Status(errno)
+	return toStatus(errno)
 }
 
 func (r *RawFileSystem) Read(cancel <-chan struct{}, input *fuse.ReadIn, _ []byte) (fuse.ReadResult, fuse.Status) {
@@ -242,7 +252,7 @@ func (r *RawFileSystem) Read(cancel <-chan struct{}, input *fuse.ReadIn, _ []byt
 	defer done()
 	data, errno := r.adapter.Read(ctx, input.NodeId, input.Fh, input.Offset, uint64(input.Size))
 	if errno != 0 {
-		return nil, fuse.Status(errno)
+		return nil, toStatus(errno)
 	}
 	return fuse.ReadResultData(data), fuse.OK
 }
@@ -252,10 +262,10 @@ func (r *RawFileSystem) Write(cancel <-chan struct{}, input *fuse.WriteIn, data 
 	defer done()
 	n, errno := r.adapter.Write(ctx, input.NodeId, input.Fh, input.Offset, data)
 	if errno != 0 {
-		return 0, fuse.Status(errno)
+		return 0, toStatus(errno)
 	}
 	if n < 0 || uint64(n) > math.MaxUint32 {
-		return 0, fuse.Status(syscall.EOVERFLOW)
+		return 0, toStatus(syscall.EOVERFLOW)
 	}
 	return uint32(n), fuse.OK //nolint:gosec // n is bounded by math.MaxUint32 immediately above.
 }
@@ -271,14 +281,14 @@ func (r *RawFileSystem) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 func (r *RawFileSystem) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
-	return fuse.Status(r.adapter.Flush(ctx, input.NodeId, input.Fh))
+	return toStatus(r.adapter.Flush(ctx, input.NodeId, input.Fh))
 }
 
 func (r *RawFileSystem) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
 	ctx, done := r.requestContext(cancel)
 	defer done()
 	datasync := input.FsyncFlags&1 != 0
-	return fuse.Status(r.adapter.Fsync(ctx, input.NodeId, input.Fh, datasync))
+	return toStatus(r.adapter.Fsync(ctx, input.NodeId, input.Fh, datasync))
 }
 
 func (r *RawFileSystem) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
@@ -286,10 +296,10 @@ func (r *RawFileSystem) OpenDir(cancel <-chan struct{}, input *fuse.OpenIn, out 
 	defer done()
 	stat, errno := r.adapter.GetAttr(ctx, input.NodeId)
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	if stat.Type != filesystem.TypeDirectory {
-		return fuse.Status(syscall.ENOTDIR)
+		return toStatus(syscall.ENOTDIR)
 	}
 	out.Fh = r.allocateDirHandle()
 	return fuse.OK
@@ -300,20 +310,20 @@ func (r *RawFileSystem) ReadDir(cancel <-chan struct{}, input *fuse.ReadIn, out 
 	defer done()
 	handle, ok := r.directoryHandle(input.Fh)
 	if !ok {
-		return fuse.Status(syscall.EBADF)
+		return toStatus(syscall.EBADF)
 	}
 	handle.mu.Lock()
 	defer handle.mu.Unlock()
 	position, ok := handle.positions[input.Offset]
 	if !ok {
-		return fuse.Status(syscall.EINVAL)
+		return toStatus(syscall.EINVAL)
 	}
 	if position.eof {
 		return fuse.OK
 	}
 	result, errno := r.adapter.Readdir(ctx, input.NodeId, position.cookie)
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	return addDirEntries(handle, input.Offset, position, result, out)
 }
@@ -326,7 +336,7 @@ func addDirEntries(
 	out *fuse.DirEntryList,
 ) fuse.Status {
 	if position.skip > len(result.Entries) {
-		return fuse.Status(syscall.EIO)
+		return toStatus(syscall.EIO)
 	}
 	offset := inputOffset
 	for index := position.skip; index < len(result.Entries); index++ {
@@ -367,7 +377,7 @@ func (r *RawFileSystem) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out
 	defer done()
 	stat, errno := r.adapter.StatFS(ctx, input.NodeId)
 	if errno != 0 {
-		return fuse.Status(errno)
+		return toStatus(errno)
 	}
 	blockSize := stat.ChunkSize
 	if blockSize == 0 || blockSize > math.MaxUint32 {
@@ -845,7 +855,12 @@ func releaseAfterReadiness(ready <-chan error, unmount func(context.Context) err
 	unmountBy := time.Now().Add(abandonedUnmountTimeout)
 	timer := time.NewTimer(abandonedUnmountTimeout)
 	select {
-	case <-ready:
+	case err := <-ready:
+		// The check was cancelled, so an error here is expected; it is
+		// recorded for diagnosis and the release proceeds either way.
+		if err != nil {
+			slog.Debug("filesystem FUSE readiness check ended after cancellation", "mount_point", mountPoint, "err", err)
+		}
 	case <-timer.C:
 		unmount = func(context.Context) error { return errReadinessStuck }
 	}

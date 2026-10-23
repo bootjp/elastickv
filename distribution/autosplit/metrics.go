@@ -6,6 +6,10 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
+// metricLabelReason is the bounded-cardinality outcome label shared by the
+// scheduler's failure, skip, and isolation-decline counters.
+const metricLabelReason = "reason"
+
 // Observer receives bounded-cardinality scheduler outcomes. Implementations
 // must not attach route IDs or key bytes as metric labels.
 type Observer interface {
@@ -48,15 +52,15 @@ func NewPrometheusObserver(registerer prometheus.Registerer) Observer {
 		splitsFailed: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "autosplit_splits_failed_total",
 			Help: "Automatic SplitRange RPC failures by bounded reason.",
-		}, []string{"reason"}),
+		}, []string{metricLabelReason}),
 		skipped: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "autosplit_skipped_total",
 			Help: "Automatic split decisions skipped before an RPC by bounded reason.",
-		}, []string{"reason"}),
+		}, []string{metricLabelReason}),
 		isolationDeclined: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "autosplit_isolation_declined_total",
 			Help: "Top-K isolation attempts declined by bounded reason.",
-		}, []string{"reason"}),
+		}, []string{metricLabelReason}),
 		compoundPartial: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "autosplit_compound_partial_total",
 			Help: "Compound isolations whose first split committed but second split did not.",

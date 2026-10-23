@@ -68,56 +68,56 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 				Name: "elastickv_pebble_l0_sublevels",
 				Help: "Current L0 sublevel count reported by Pebble. Climbing sublevels are the canonical precursor to a write stall; alert when this exceeds the L0CompactionThreshold for a sustained period.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		l0NumFiles: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_l0_num_files",
 				Help: "Current number of sstables in L0 reported by Pebble. Paired with elastickv_pebble_l0_sublevels to diagnose L0 pressure.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		compactEstimatedDebt: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_compact_estimated_debt_bytes",
 				Help: "Estimated number of bytes Pebble still needs to compact for the LSM to reach a stable state. Growth indicates compactions are falling behind ingest.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		compactInProgress: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_compact_in_progress",
 				Help: "Number of compactions currently in progress.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		compactCountTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_pebble_compact_count_total",
 				Help: "Cumulative number of compactions completed by Pebble since the process started.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		memtableCount: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_memtable_count",
 				Help: "Current count of memtables (active + queued for flush).",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		memtableSizeBytes: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_memtable_size_bytes",
 				Help: "Current bytes allocated by memtables and large flushable batches.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		memtableZombieCount: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_pebble_memtable_zombie_count",
 				Help: "Current count of zombie memtables (no longer referenced by the DB but pinned by open iterators).",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		blockCacheSizeBytes: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
@@ -152,7 +152,7 @@ func newPebbleMetrics(registerer prometheus.Registerer) *PebbleMetrics {
 				Name: "elastickv_fsm_apply_sync_mode",
 				Help: "Active ELASTICKV_FSM_SYNC_MODE on this node. Gauge is 1 for the active mode and 0 for the other. \"sync\" means every FSM apply issues a Pebble fsync; \"nosync\" relies on raft-log replay for crash recovery of the FSM state.",
 			},
-			[]string{"mode"},
+			[]string{labelMode},
 		),
 	}
 

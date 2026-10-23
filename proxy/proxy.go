@@ -459,11 +459,11 @@ func (p *ProxyServer) execTxn(conn redcon.Conn, state *proxyConnState) {
 
 	// Build pipeline: MULTI + queued commands + EXEC
 	cmds := make([][]any, 0, len(queue)+txnCommandsOverhead)
-	cmds = append(cmds, []any{"MULTI"})
+	cmds = append(cmds, []any{cmdMulti})
 	for _, args := range queue {
 		cmds = append(cmds, bytesArgsToInterfaces(args))
 	}
-	cmds = append(cmds, []any{"EXEC"})
+	cmds = append(cmds, []any{cmdExec})
 
 	results, err := p.dual.Primary().Pipeline(ctx, cmds)
 	switch {
@@ -522,7 +522,7 @@ func writeCommandResponse(w respWriter, name string, args [][]byte, resp any, er
 }
 
 func writeCommandValue(w respWriter, name string, args [][]byte, resp any) {
-	if name == "DEBUG" && writeDebugDigestValues(w, args, resp) {
+	if name == cmdNameDEBUG && writeDebugDigestValues(w, args, resp) {
 		return
 	}
 	if isScriptReturnCommand(name) {
@@ -580,7 +580,7 @@ func writeDebugDigestValues(w respWriter, args [][]byte, resp any) bool {
 // primary transport can expose the upstream RESP type directly.
 func isScriptReturnCommand(name string) bool {
 	switch name {
-	case cmdEval, cmdEvalSHA, cmdEvalRO, cmdEvalSHARO, "FCALL", "FCALL_RO":
+	case cmdEval, cmdEvalSHA, cmdEvalRO, cmdEvalSHARO, cmdNameFCALL, cmdNameFCALLRO:
 		return true
 	default:
 		return false
@@ -607,12 +607,12 @@ func isDefaultRoutedStatus(name string, args [][]byte, value string) bool {
 }
 
 func isACLDRYRUNSuccess(name string, args [][]byte, value string) bool {
-	return name == "ACL" && hasSubcommand(args, "DRYRUN") && value == "OK"
+	return name == cmdNameACL && hasSubcommand(args, "DRYRUN") && value == "OK"
 }
 
 func isNullArrayResponse(name string) bool {
 	switch name {
-	case cmdNameBLPOP, cmdNameBRPOP, cmdNameBZPOPMIN, cmdNameBZPOPMAX, cmdNameXREAD, cmdNameXREADGROUP, "EXEC":
+	case cmdNameBLPOP, cmdNameBRPOP, cmdNameBZPOPMIN, cmdNameBZPOPMAX, cmdNameXREAD, cmdNameXREADGROUP, cmdExec:
 		return true
 	default:
 		return false
@@ -637,8 +637,8 @@ func isSimpleStringSubcommand(name string, args [][]byte) bool {
 	case "CLIENT":
 		return isSimpleClientSubcommand(args)
 	case cmdScript:
-		return hasSubcommand(args, "FLUSH", "KILL", "DEBUG")
-	case "FUNCTION":
+		return hasSubcommand(args, "FLUSH", "KILL", cmdNameDEBUG)
+	case cmdNameFUNCTION:
 		return hasSubcommand(args, "FLUSH", "KILL", "DELETE", "RESTORE")
 	case "XGROUP":
 		return hasSubcommand(args, "CREATE", "SETID")
@@ -659,7 +659,7 @@ func isSimpleAdminSubcommand(name string, args [][]byte) bool {
 	switch name {
 	case "CONFIG":
 		return hasSubcommand(args, "SET", "RESETSTAT", "REWRITE")
-	case "ACL":
+	case cmdNameACL:
 		return isSimpleACLSubcommand(args)
 	case "MODULE":
 		return hasSubcommand(args, "LOAD", "LOADEX", "UNLOAD")
@@ -669,7 +669,7 @@ func isSimpleAdminSubcommand(name string, args [][]byte) bool {
 		return hasSubcommand(args, "PURGE")
 	case "CLUSTER":
 		return hasSubcommand(args, "ADDSLOTS", "ADDSLOTSRANGE", "DELSLOTS", "DELSLOTSRANGE", "FAILOVER", "FLUSHSLOTS", "FORGET", "MEET", "REPLICATE", "RESET", "SAVECONFIG", "SET-CONFIG-EPOCH", "SETSLOT")
-	case "DEBUG":
+	case cmdNameDEBUG:
 		return isSimpleDebugSubcommand(args)
 	default:
 		return false
@@ -689,7 +689,7 @@ func isSimpleDebugSubcommand(args [][]byte) bool {
 		"SET-SKIP-CHECKSUM-VALIDATION", "ENABLE-KEYMETA-RUNTIME-REGISTRATION", "AOF-FLUSH-SLEEP",
 		"REPLICATE", "CHANGE-REPL-ID", "STRINGMATCH-TEST", "SET-DISABLE-DENY-SCRIPTS",
 		"CONFIG-REWRITE-FORCE-ALL", "PAUSE-CRON", "REPLYBUFFER", "REPLY-COPY-AVOIDANCE",
-		"REPL-PAUSE", "DICT-RESIZING", "SCRIPT", "MARK-INTERNAL-CLIENT", "ASM-FAILPOINT", "ASM-TRIM-METHOD":
+		"REPL-PAUSE", "DICT-RESIZING", cmdScript, "MARK-INTERNAL-CLIENT", "ASM-FAILPOINT", "ASM-TRIM-METHOD":
 		return true
 	default:
 		return false
@@ -749,7 +749,7 @@ func isFixedSimpleStringCommand(name string) bool {
 
 func writeTxnResponse(w respWriter, queue [][][]byte, resp any, err error) {
 	if err != nil {
-		writeCommandResponse(w, "EXEC", nil, nil, err)
+		writeCommandResponse(w, cmdExec, nil, nil, err)
 		return
 	}
 	values, ok := resp.([]any)
