@@ -246,7 +246,7 @@ func migrationPartitionTiles(before []store.MigrationOwnershipPartition, parent 
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	negativeOnly := migrationPartitionNegativeBeforeMatchesParent(before, parent) && migrationPartitionNegativeGeometryAllowed(before, routes, parentHash)
+	negativeOnly := migrationPartitionNegativeOnlyForGeometry(before, parent, routes, parentHash)
 	boundaries, err := migrationPartitionBoundaries(before, parent, routes, version, configuration)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -386,6 +386,10 @@ func migrationPartitionNegativeGeometryAllowed(before []store.MigrationOwnership
 		}
 	}
 	return true
+}
+
+func migrationPartitionNegativeOnlyForGeometry(before []store.MigrationOwnershipPartition, parent distribution.RouteDescriptor, routes []distribution.RouteDescriptor, parentHash []byte) bool {
+	return migrationPartitionNegativeBeforeMatchesParent(before, parent) && migrationPartitionNegativeGeometryAllowed(before, routes, parentHash)
 }
 
 func projectMigrationPartitionTile(p store.MigrationOwnershipPartition, routes []distribution.RouteDescriptor, start, end []byte, version, configuration uint64) (store.MigrationOwnershipPartition, error) {
