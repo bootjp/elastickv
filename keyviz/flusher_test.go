@@ -88,7 +88,9 @@ func TestRunFlusherAttachesAlignedHotKeysWindow(t *testing.T) {
 	}
 }
 
-// waitForColumns blocks until s has retained at least n columns.
+// waitForColumns blocks until s has retained at least n columns. It has no
+// wall-clock budget; only the go test -timeout bounds a flusher that never
+// produces the column.
 func waitForColumns(s *MemSampler, n int) {
 	for len(s.Snapshot(time.Time{}, time.Time{})) < n {
 		time.Sleep(time.Millisecond)
