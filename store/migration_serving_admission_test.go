@@ -199,3 +199,33 @@ func TestMigrationServingAdmissionLegacyRefreshDoesNotBorrowCallerSlices(t *test
 		require.Equal(t, before, admission)
 	})
 }
+
+func TestMigrationServingAdmissionDoesNotHideUnknownAdoptedLegacy(t *testing.T) {
+	source := NewMVCCStore()
+	_, tx := partitionFixture(t, source)
+	require.NoError(t, partitionStore(t, source).ApplyMigrationOwnershipPartition(t.Context(), tx, 10))
+	ms, ok := source.(*mvccStore)
+	require.True(t, ok)
+	// Decodable legacy history cannot become ignorable just because its job
+	// ID appeared in a historical adoption receipt with a different digest.
+	ms.migrationOwnership[0].Receipts = nil
+	raw := externalTestSnapshot(t, source)
+	runMigrationStoreSuite(t, func(t *testing.T, st MVCCStore) {
+		require.NoError(t, st.Restore(bytes.NewReader(raw)))
+		view, err := admissionReader(t, st).MigrationServingAdmissionState(t.Context())
+		require.NoError(t, err)
+		require.Len(t, view.Ownership, 1)
+		require.False(t, MigrationOwnershipEvidenceValid(view.Ownership[0]))
+		p := view.Partitions.Partitions[0]
+		ref, err := MigrationOwnershipPartitionReferenceFor(p)
+		require.NoError(t, err)
+		refresh := tx
+		refresh.Operation, refresh.OperationID, refresh.CatalogVersion = MigrationOwnershipPartitionRefresh, "unknown/refresh", 13
+		refresh.Before, refresh.After = []MigrationOwnershipPartitionReference{ref}, []MigrationOwnershipPartition{p}
+		finalizePartitionTransition(t, &refresh)
+		require.ErrorIs(t, partitionStore(t, st).ApplyMigrationOwnershipPartition(t.Context(), refresh, 13), ErrMigrationOwnership)
+		after, err := admissionReader(t, st).MigrationServingAdmissionState(t.Context())
+		require.NoError(t, err)
+		require.Equal(t, view, after)
+	})
+}

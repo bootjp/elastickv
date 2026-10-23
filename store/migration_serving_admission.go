@@ -47,14 +47,7 @@ func buildMigrationServingAdmission(ownership []MigrationOwnershipState, partiti
 			}
 		}
 	}
-	for _, old := range ownership {
-		if MigrationOwnershipEvidenceValid(old) {
-			index.summary.CatalogVersionFloor = max(index.summary.CatalogVersionFloor, old.CatalogVersion)
-		}
-		if !consumed[old.JobID] {
-			index.state.Ownership = append(index.state.Ownership, old)
-		}
-	}
+	index.state.Ownership, index.summary.CatalogVersionFloor = admissionLegacyOwnership(ownership, consumed)
 	index.state.Partitions.Generation = partitions.Generation
 	index.state.Partitions.Partitions = partitions.Partitions
 	used := make(map[string]bool)
@@ -69,6 +62,22 @@ func buildMigrationServingAdmission(ownership []MigrationOwnershipState, partiti
 	index.state.Ownership = cloneMigrationOwnership(index.state.Ownership)
 	index.state.Partitions = clonePartitionState(index.state.Partitions)
 	return index
+}
+
+func admissionLegacyOwnership(ownership []MigrationOwnershipState, consumed map[uint64]bool) ([]MigrationOwnershipState, uint64) {
+	var retained []MigrationOwnershipState
+	var floor uint64
+	for _, old := range ownership {
+		if !MigrationOwnershipEvidenceValid(old) {
+			retained = append(retained, old)
+			continue
+		}
+		floor = max(floor, old.CatalogVersion)
+		if !consumed[old.JobID] {
+			retained = append(retained, old)
+		}
+	}
+	return retained, floor
 }
 
 func (i migrationServingAdmissionIndex) view(readiness []TargetStagedReadinessState) MigrationServingState {

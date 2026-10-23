@@ -270,7 +270,7 @@ func partitionCandidates(s MigrationOwnershipPartitionState, legacy []MigrationO
 		out = append(out, partitionCandidate{p, ref})
 	}
 	for _, p := range legacy {
-		if consumed[p.JobID] {
+		if consumed[p.JobID] && MigrationOwnershipEvidenceValid(p) {
 			continue
 		}
 		// Unknown legacy evidence is kept as a negative candidate. It cannot be
