@@ -338,9 +338,12 @@ message RetrySplitJobResponse {}
 message AttestMigrationOwnershipRequest {
   uint64 job_id = 1;
   MigrationOwnershipProof prior = 2;
+  bytes prior_partition = 3;
+  bytes prior_ownership_state = 4;
 }
 
 message AttestMigrationOwnershipResponse {
   uint32 ownership_protocol = 1;
   MigrationOwnershipProof ownership = 2;
+  bytes partition_transition = 3;
 }

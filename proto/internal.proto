@@ -251,6 +251,7 @@ enum MigrationCleanupMode {
   MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR = 4;
   MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH = 5;
   MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE = 6;
+  MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION = 7;
   MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION = 8;
 }
 
@@ -300,6 +301,8 @@ message CleanupMigrationRequest {
   uint64 expected_configuration_index = 17;
   bool require_configuration_index = 18;
   MigrationOwnershipProof ownership = 19;
+  // Strict canonical bounded JSON control; never a raw metadata mutation.
+  bytes partition_transition = 20;
   // Versioned namespace activation/prejoin control. Never propose until every
   // apply member (including learners) acknowledged support at this ConfChange.
   bytes namespace_admission = 21;
@@ -325,6 +328,7 @@ enum MigrationStateProbeKind {
   MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT = 6;
   MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY = 7;
   MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED = 8;
+  MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED = 9;
   MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION = 10;
 }
 
@@ -350,6 +354,7 @@ message ProbeMigrationStateRequest {
   uint64 expected_configuration_index = 16;
   MigrationOwnershipProof ownership = 17;
   uint32 transfer_size_guard_version = 18;
+  bytes partition_transition = 19;
 }
 
 message ProbeMigrationStateResponse {
@@ -368,6 +373,7 @@ message ProbeMigrationStateResponse {
   uint32 ownership_partition_protocol = 10;
   // Installed support only; the durable group activation is separately probed.
   uint32 namespace_admission_version = 11;
+  bytes partition_receipt_id = 12;
 }
 
 message IssueMigrationTimestampRequest {}

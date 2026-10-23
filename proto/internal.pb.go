@@ -140,6 +140,7 @@ const (
 	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR          MigrationCleanupMode = 4
 	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH        MigrationCleanupMode = 5
 	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE MigrationCleanupMode = 6
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION      MigrationCleanupMode = 7
 	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION      MigrationCleanupMode = 8
 )
 
@@ -153,6 +154,7 @@ var (
 		4: "MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR",
 		5: "MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH",
 		6: "MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE",
+		7: "MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION",
 		8: "MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION",
 	}
 	MigrationCleanupMode_value = map[string]int32{
@@ -163,6 +165,7 @@ var (
 		"MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR":          4,
 		"MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH":        5,
 		"MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE": 6,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION":      7,
 		"MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION":      8,
 	}
 )
@@ -257,6 +260,7 @@ const (
 	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT MigrationStateProbeKind = 6
 	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY MigrationStateProbeKind = 7
 	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED    MigrationStateProbeKind = 8
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED    MigrationStateProbeKind = 9
 	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION  MigrationStateProbeKind = 10
 )
 
@@ -272,6 +276,7 @@ var (
 		6:  "MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT",
 		7:  "MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY",
 		8:  "MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED",
+		9:  "MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED",
 		10: "MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION",
 	}
 	MigrationStateProbeKind_value = map[string]int32{
@@ -284,6 +289,7 @@ var (
 		"MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT":      6,
 		"MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY":      7,
 		"MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED":         8,
+		"MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED":         9,
 		"MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION":       10,
 	}
 )
@@ -2126,6 +2132,8 @@ type CleanupMigrationRequest struct {
 	ExpectedConfigurationIndex uint64                   `protobuf:"varint,17,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
 	RequireConfigurationIndex  bool                     `protobuf:"varint,18,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
 	Ownership                  *MigrationOwnershipProof `protobuf:"bytes,19,opt,name=ownership,proto3" json:"ownership,omitempty"`
+	// Strict canonical bounded JSON control; never a raw metadata mutation.
+	PartitionTransition []byte `protobuf:"bytes,20,opt,name=partition_transition,json=partitionTransition,proto3" json:"partition_transition,omitempty"`
 	// Versioned namespace activation/prejoin control. Never propose until every
 	// apply member (including learners) acknowledged support at this ConfChange.
 	NamespaceAdmission []byte `protobuf:"bytes,21,opt,name=namespace_admission,json=namespaceAdmission,proto3" json:"namespace_admission,omitempty"`
@@ -2296,6 +2304,13 @@ func (x *CleanupMigrationRequest) GetOwnership() *MigrationOwnershipProof {
 	return nil
 }
 
+func (x *CleanupMigrationRequest) GetPartitionTransition() []byte {
+	if x != nil {
+		return x.PartitionTransition
+	}
+	return nil
+}
+
 func (x *CleanupMigrationRequest) GetNamespaceAdmission() []byte {
 	if x != nil {
 		return x.NamespaceAdmission
@@ -2402,6 +2417,7 @@ type ProbeMigrationStateRequest struct {
 	ExpectedConfigurationIndex uint64                   `protobuf:"varint,16,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
 	Ownership                  *MigrationOwnershipProof `protobuf:"bytes,17,opt,name=ownership,proto3" json:"ownership,omitempty"`
 	TransferSizeGuardVersion   uint32                   `protobuf:"varint,18,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
+	PartitionTransition        []byte                   `protobuf:"bytes,19,opt,name=partition_transition,json=partitionTransition,proto3" json:"partition_transition,omitempty"`
 	unknownFields              protoimpl.UnknownFields
 	sizeCache                  protoimpl.SizeCache
 }
@@ -2562,6 +2578,13 @@ func (x *ProbeMigrationStateRequest) GetTransferSizeGuardVersion() uint32 {
 	return 0
 }
 
+func (x *ProbeMigrationStateRequest) GetPartitionTransition() []byte {
+	if x != nil {
+		return x.PartitionTransition
+	}
+	return nil
+}
+
 type ProbeMigrationStateResponse struct {
 	state                     protoimpl.MessageState   `protogen:"open.v1"`
 	Ready                     bool                     `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
@@ -2579,6 +2602,7 @@ type ProbeMigrationStateResponse struct {
 	OwnershipPartitionProtocol uint32 `protobuf:"varint,10,opt,name=ownership_partition_protocol,json=ownershipPartitionProtocol,proto3" json:"ownership_partition_protocol,omitempty"`
 	// Installed support only; the durable group activation is separately probed.
 	NamespaceAdmissionVersion uint32 `protobuf:"varint,11,opt,name=namespace_admission_version,json=namespaceAdmissionVersion,proto3" json:"namespace_admission_version,omitempty"`
+	PartitionReceiptId        []byte `protobuf:"bytes,12,opt,name=partition_receipt_id,json=partitionReceiptId,proto3" json:"partition_receipt_id,omitempty"`
 	unknownFields             protoimpl.UnknownFields
 	sizeCache                 protoimpl.SizeCache
 }
@@ -2688,6 +2712,13 @@ func (x *ProbeMigrationStateResponse) GetNamespaceAdmissionVersion() uint32 {
 		return x.NamespaceAdmissionVersion
 	}
 	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetPartitionReceiptId() []byte {
+	if x != nil {
+		return x.PartitionReceiptId
+	}
+	return nil
 }
 
 type IssueMigrationTimestampRequest struct {
@@ -2930,7 +2961,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x0fdescriptor_hash\x18\f \x01(\fR\x0edescriptorHash\x12*\n" +
 	"\x11write_floor_known\x18\r \x01(\bR\x0fwriteFloorKnown\x124\n" +
 	"\x16source_tracker_version\x18\x0e \x01(\x04R\x14sourceTrackerVersion\x120\n" +
-	"\x14source_applied_index\x18\x0f \x01(\x04R\x12sourceAppliedIndex\"\xd3\x06\n" +
+	"\x14source_applied_index\x18\x0f \x01(\x04R\x12sourceAppliedIndex\"\x86\a\n" +
 	"\x17CleanupMigrationRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12)\n" +
 	"\x04mode\x18\x02 \x01(\x0e2\x15.MigrationCleanupModeR\x04mode\x12\x1f\n" +
@@ -2954,7 +2985,8 @@ const file_internal_proto_rawDesc = "" +
 	"\x13requires_decoded_s3\x18\x10 \x01(\bR\x11requiresDecodedS3\x12@\n" +
 	"\x1cexpected_configuration_index\x18\x11 \x01(\x04R\x1aexpectedConfigurationIndex\x12>\n" +
 	"\x1brequire_configuration_index\x18\x12 \x01(\bR\x19requireConfigurationIndex\x126\n" +
-	"\townership\x18\x13 \x01(\v2\x18.MigrationOwnershipProofR\townership\x12/\n" +
+	"\townership\x18\x13 \x01(\v2\x18.MigrationOwnershipProofR\townership\x121\n" +
+	"\x14partition_transition\x18\x14 \x01(\fR\x13partitionTransition\x12/\n" +
 	"\x13namespace_admission\x18\x15 \x01(\fR\x12namespaceAdmission\"\xbc\x01\n" +
 	"\x18CleanupMigrationResponse\x12\x1f\n" +
 	"\vnext_cursor\x18\x01 \x01(\fR\n" +
@@ -2962,7 +2994,7 @@ const file_internal_proto_rawDesc = "" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12!\n" +
 	"\fdeleted_rows\x18\x03 \x01(\x04R\vdeletedRows\x12#\n" +
 	"\rdeleted_bytes\x18\x04 \x01(\x04R\fdeletedBytes\x12#\n" +
-	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\xe7\x06\n" +
+	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\x9a\a\n" +
 	"\x1aProbeMigrationStateRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12,\n" +
 	"\x04kind\x18\x02 \x01(\x0e2\x18.MigrationStateProbeKindR\x04kind\x12\x1f\n" +
@@ -2983,7 +3015,8 @@ const file_internal_proto_rawDesc = "" +
 	"\x1brequire_configuration_index\x18\x0f \x01(\bR\x19requireConfigurationIndex\x12@\n" +
 	"\x1cexpected_configuration_index\x18\x10 \x01(\x04R\x1aexpectedConfigurationIndex\x126\n" +
 	"\townership\x18\x11 \x01(\v2\x18.MigrationOwnershipProofR\townership\x12=\n" +
-	"\x1btransfer_size_guard_version\x18\x12 \x01(\rR\x18transferSizeGuardVersion\"\xcc\x04\n" +
+	"\x1btransfer_size_guard_version\x18\x12 \x01(\rR\x18transferSizeGuardVersion\x121\n" +
+	"\x14partition_transition\x18\x13 \x01(\fR\x13partitionTransition\"\xfe\x04\n" +
 	"\x1bProbeMigrationStateResponse\x12\x14\n" +
 	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
 	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
@@ -2996,7 +3029,8 @@ const file_internal_proto_rawDesc = "" +
 	"\x1btransfer_size_guard_version\x18\t \x01(\rR\x18transferSizeGuardVersion\x12@\n" +
 	"\x1cownership_partition_protocol\x18\n" +
 	" \x01(\rR\x1aownershipPartitionProtocol\x12>\n" +
-	"\x1bnamespace_admission_version\x18\v \x01(\rR\x19namespaceAdmissionVersion\" \n" +
+	"\x1bnamespace_admission_version\x18\v \x01(\rR\x19namespaceAdmissionVersion\x120\n" +
+	"\x14partition_receipt_id\x18\f \x01(\fR\x12partitionReceiptId\" \n" +
 	"\x1eIssueMigrationTimestampRequest\"e\n" +
 	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
 	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +
@@ -3011,7 +3045,7 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x03*\xf5\x02\n" +
+	"\x05ABORT\x10\x03*\xa5\x03\n" +
 	"\x14MigrationCleanupMode\x12&\n" +
 	"\"MIGRATION_CLEANUP_MODE_UNSPECIFIED\x10\x00\x12#\n" +
 	"\x1fMIGRATION_CLEANUP_MODE_VERSIONS\x10\x01\x12#\n" +
@@ -3020,11 +3054,12 @@ const file_internal_proto_rawDesc = "" +
 	"&MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR\x10\x04\x12,\n" +
 	"(MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH\x10\x05\x123\n" +
 	"/MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE\x10\x06\x12.\n" +
+	"*MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION\x10\a\x12.\n" +
 	"*MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION\x10\b*\x8d\x01\n" +
 	"\x16MigrationOwnershipRole\x12(\n" +
 	"$MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED\x10\x00\x12\"\n" +
 	"\x1eMIGRATION_OWNERSHIP_ROLE_OWNER\x10\x01\x12%\n" +
-	"!MIGRATION_OWNERSHIP_ROLE_NONOWNER\x10\x02*\x99\x04\n" +
+	"!MIGRATION_OWNERSHIP_ROLE_NONOWNER\x10\x02*\xcb\x04\n" +
 	"\x17MigrationStateProbeKind\x12*\n" +
 	"&MIGRATION_STATE_PROBE_KIND_UNSPECIFIED\x10\x00\x12.\n" +
 	"*MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED\x10\x01\x128\n" +
@@ -3034,7 +3069,8 @@ const file_internal_proto_rawDesc = "" +
 	"+MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED\x10\x05\x123\n" +
 	"/MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT\x10\x06\x123\n" +
 	"/MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY\x10\a\x120\n" +
-	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x122\n" +
+	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x120\n" +
+	",MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED\x10\t\x122\n" +
 	".MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION\x10\n" +
 	"2\xab\b\n" +
 	"\bInternal\x12.\n" +

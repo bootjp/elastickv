@@ -30,13 +30,14 @@ type MigrationOwnershipAttestor interface {
 type MigrationOwnershipAttestorFactory func(context.Context) (MigrationOwnershipAttestor, error)
 
 type migrationOwnershipRefresh struct {
-	mu        sync.Mutex
-	groups    map[uint64]*kv.ShardGroup
-	root      MigrationOwnershipAttestorFactory
-	next      map[uint64]int
-	retry     map[ownershipRefreshKey]ownershipRefreshFailure
-	acked     map[ownershipRefreshKey]ownershipRefreshAck
-	groupNext int
+	mu               sync.Mutex
+	groups           map[uint64]*kv.ShardGroup
+	root             MigrationOwnershipAttestorFactory
+	next             map[uint64]int
+	retry            map[ownershipRefreshKey]ownershipRefreshFailure
+	acked            map[ownershipRefreshKey]ownershipRefreshAck
+	groupNext        int
+	partitionRuntime *migrationPartitionRuntime
 }
 
 type ownershipRefreshKey struct{ group, job uint64 }
@@ -95,6 +96,9 @@ func (s *DistributionServer) RunMigrationOwnershipRefresh(ctx context.Context) e
 }
 
 func (s *DistributionServer) RunMigrationOwnershipRefreshOnce(ctx context.Context) error {
+	if s.ownershipRefresh != nil && s.ownershipRefresh.partitionRuntime != nil {
+		return s.runMigrationPartitionRefreshOnce(ctx)
+	}
 	if s.ownershipRefresh == nil || s.ownershipRefresh.root == nil || s.splitJobRunnerReadinessGate == nil {
 		return errors.WithStack(store.ErrNotSupported)
 	}

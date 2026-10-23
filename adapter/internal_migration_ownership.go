@@ -25,7 +25,8 @@ func (i *Internal) ownershipAdmissionReady() bool {
 }
 
 func ownershipCleanupMode(mode pb.MigrationCleanupMode) bool {
-	return mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE ||
+	return mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION ||
+		mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE ||
 		mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR ||
 		mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE ||
 		mode == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH

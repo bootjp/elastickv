@@ -298,6 +298,9 @@ func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrati
 }
 
 func (i *Internal) probeMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+	if req.GetKind() == pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED {
+		return i.probeMigrationPartition(ctx, req)
+	}
 	if migrationOwnershipProbeKind(req.GetKind()) {
 		return i.probeMigrationOwnership(ctx, req)
 	}
@@ -312,8 +315,9 @@ func migrationOwnershipProbeKind(kind pb.MigrationStateProbeKind) bool {
 func (i *Internal) probeLegacyMigrationStateKind(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
 	switch req.GetKind() {
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY,
-		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED:
-		return i.probeMigrationOwnership(ctx, req)
+		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED,
+		pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED:
+		return i.probeMigrationStateKind(ctx, req)
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED:
 		return i.probeMigrationControl(ctx, req)
 	case pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT:
@@ -831,14 +835,8 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 }
 
 func (i *Internal) CleanupMigration(ctx context.Context, req *pb.CleanupMigrationRequest) (*pb.CleanupMigrationResponse, error) {
-	if err := validateCleanupMigrationRequest(req); err != nil {
+	if err := i.validateMigrationCleanupAdmission(req); err != nil {
 		return nil, err
-	}
-	if ownershipCleanupMode(req.GetMode()) && !i.ownershipAdmissionReady() {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration ownership data admission is not wired"))
-	}
-	if i.migrationProposer == nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration cleanup proposer is not configured"))
 	}
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
@@ -881,6 +879,9 @@ func validateCleanupMigrationRequest(req *pb.CleanupMigrationRequest) error {
 }
 
 func validateOwnershipCleanupRequest(req *pb.CleanupMigrationRequest) error {
+	if req.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION {
+		return validatePartitionCleanupRequest(req)
+	}
 	if !req.GetRequireConfigurationIndex() || req.GetExpectedConfigurationIndex() == 0 {
 		return errors.WithStack(status.Error(codes.InvalidArgument, "ownership control requires applied configuration"))
 	}

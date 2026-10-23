@@ -13,6 +13,9 @@ import (
 // AttestMigrationOwnership is a privileged root-leader peer RPC. Unlike route
 // read RPCs, its producer waits for the committed catalog's applied boundary.
 func (s *DistributionServer) AttestMigrationOwnership(ctx context.Context, req *pb.AttestMigrationOwnershipRequest) (*pb.AttestMigrationOwnershipResponse, error) {
+	if len(req.GetPriorPartition()) != 0 || len(req.GetPriorOwnershipState()) != 0 {
+		return s.attestMigrationPartition(ctx, req)
+	}
 	if req.GetJobId() == 0 {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "ownership attestation requires job_id"))
 	}
@@ -22,7 +25,7 @@ func (s *DistributionServer) AttestMigrationOwnership(ctx context.Context, req *
 	if err := s.requireReadReady(); err != nil {
 		return nil, err
 	}
-	proof, err := s.AttestUnchangedMigrationOwnership(ctx, req.GetPrior())
+	proof, err := s.attestUnchangedOwnershipAtCommittedRoot(ctx, req.GetPrior())
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

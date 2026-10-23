@@ -2729,11 +2729,13 @@ func (*RetrySplitJobResponse) Descriptor() ([]byte, []int) {
 }
 
 type AttestMigrationOwnershipRequest struct {
-	state         protoimpl.MessageState   `protogen:"open.v1"`
-	JobId         uint64                   `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
-	Prior         *MigrationOwnershipProof `protobuf:"bytes,2,opt,name=prior,proto3" json:"prior,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	state               protoimpl.MessageState   `protogen:"open.v1"`
+	JobId               uint64                   `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Prior               *MigrationOwnershipProof `protobuf:"bytes,2,opt,name=prior,proto3" json:"prior,omitempty"`
+	PriorPartition      []byte                   `protobuf:"bytes,3,opt,name=prior_partition,json=priorPartition,proto3" json:"prior_partition,omitempty"`
+	PriorOwnershipState []byte                   `protobuf:"bytes,4,opt,name=prior_ownership_state,json=priorOwnershipState,proto3" json:"prior_ownership_state,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *AttestMigrationOwnershipRequest) Reset() {
@@ -2780,12 +2782,27 @@ func (x *AttestMigrationOwnershipRequest) GetPrior() *MigrationOwnershipProof {
 	return nil
 }
 
+func (x *AttestMigrationOwnershipRequest) GetPriorPartition() []byte {
+	if x != nil {
+		return x.PriorPartition
+	}
+	return nil
+}
+
+func (x *AttestMigrationOwnershipRequest) GetPriorOwnershipState() []byte {
+	if x != nil {
+		return x.PriorOwnershipState
+	}
+	return nil
+}
+
 type AttestMigrationOwnershipResponse struct {
-	state             protoimpl.MessageState   `protogen:"open.v1"`
-	OwnershipProtocol uint32                   `protobuf:"varint,1,opt,name=ownership_protocol,json=ownershipProtocol,proto3" json:"ownership_protocol,omitempty"`
-	Ownership         *MigrationOwnershipProof `protobuf:"bytes,2,opt,name=ownership,proto3" json:"ownership,omitempty"`
-	unknownFields     protoimpl.UnknownFields
-	sizeCache         protoimpl.SizeCache
+	state               protoimpl.MessageState   `protogen:"open.v1"`
+	OwnershipProtocol   uint32                   `protobuf:"varint,1,opt,name=ownership_protocol,json=ownershipProtocol,proto3" json:"ownership_protocol,omitempty"`
+	Ownership           *MigrationOwnershipProof `protobuf:"bytes,2,opt,name=ownership,proto3" json:"ownership,omitempty"`
+	PartitionTransition []byte                   `protobuf:"bytes,3,opt,name=partition_transition,json=partitionTransition,proto3" json:"partition_transition,omitempty"`
+	unknownFields       protoimpl.UnknownFields
+	sizeCache           protoimpl.SizeCache
 }
 
 func (x *AttestMigrationOwnershipResponse) Reset() {
@@ -2828,6 +2845,13 @@ func (x *AttestMigrationOwnershipResponse) GetOwnershipProtocol() uint32 {
 func (x *AttestMigrationOwnershipResponse) GetOwnership() *MigrationOwnershipProof {
 	if x != nil {
 		return x.Ownership
+	}
+	return nil
+}
+
+func (x *AttestMigrationOwnershipResponse) GetPartitionTransition() []byte {
+	if x != nil {
+		return x.PartitionTransition
 	}
 	return nil
 }
@@ -3019,13 +3043,16 @@ const file_distribution_proto_rawDesc = "" +
 	"\x17AbandonSplitJobResponse\"-\n" +
 	"\x14RetrySplitJobRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\"\x17\n" +
-	"\x15RetrySplitJobResponse\"h\n" +
+	"\x15RetrySplitJobResponse\"\xc5\x01\n" +
 	"\x1fAttestMigrationOwnershipRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12.\n" +
-	"\x05prior\x18\x02 \x01(\v2\x18.MigrationOwnershipProofR\x05prior\"\x89\x01\n" +
+	"\x05prior\x18\x02 \x01(\v2\x18.MigrationOwnershipProofR\x05prior\x12'\n" +
+	"\x0fprior_partition\x18\x03 \x01(\fR\x0epriorPartition\x122\n" +
+	"\x15prior_ownership_state\x18\x04 \x01(\fR\x13priorOwnershipState\"\xbc\x01\n" +
 	" AttestMigrationOwnershipResponse\x12-\n" +
 	"\x12ownership_protocol\x18\x01 \x01(\rR\x11ownershipProtocol\x126\n" +
-	"\townership\x18\x02 \x01(\v2\x18.MigrationOwnershipProofR\townership*\xa3\x01\n" +
+	"\townership\x18\x02 \x01(\v2\x18.MigrationOwnershipProofR\townership\x121\n" +
+	"\x14partition_transition\x18\x03 \x01(\fR\x13partitionTransition*\xa3\x01\n" +
 	"\n" +
 	"RouteState\x12\x1b\n" +
 	"\x17ROUTE_STATE_UNSPECIFIED\x10\x00\x12\x16\n" +
