@@ -194,6 +194,8 @@ message SplitJob {
   uint64 transfer_preflight_ts = 37;
   repeated SplitJobBracketProgress transfer_preflight_progress = 38;
   bool transfer_preflight_done = 39;
+  // Durable moving child created with its same-owner partition manifest.
+  uint64 working_source_route_id = 40;
 }
 
 message ListRoutesRequest {}

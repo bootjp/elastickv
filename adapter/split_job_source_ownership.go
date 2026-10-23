@@ -55,7 +55,7 @@ func (s *DistributionServer) armSplitSourceOwnership(ctx context.Context, job di
 }
 
 func splitSourceOwnershipProof(snapshot distribution.CatalogSnapshot, job distribution.SplitJob, groupID uint64, generation string) (*pb.MigrationOwnershipProof, error) {
-	route, found := findRouteByID(snapshot.Routes, job.SourceRouteID)
+	route, found := findRouteByID(snapshot.Routes, sourceLookupRouteID(job))
 	if !found || route.GroupID != groupID || route.State != distribution.RouteStateActive || route.StagedVisibilityActive ||
 		!splitOwnershipRouteContains(route, job.SplitKey) || snapshot.Version == 0 {
 		return nil, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)

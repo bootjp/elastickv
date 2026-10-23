@@ -3337,6 +3337,7 @@ type adminGRPCInterceptors struct {
 	unary              []grpc.UnaryServerInterceptor
 	stream             []grpc.StreamServerInterceptor
 	token              string
+	migrationToken     string
 	s3BlobFetchEnabled bool
 }
 
@@ -3554,7 +3555,7 @@ func configureAdminService(
 	}
 	// token is what setupAdminService hands to SetLeaderReadToken and the
 	// per-group backup proposer, so it has to survive the interceptor build.
-	icept := adminGRPCInterceptors{token: auth.adminToken}
+	icept := adminGRPCInterceptors{token: auth.adminToken, migrationToken: auth.migrationToken}
 	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
 	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
 	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth, *splitMigrationPeerAuthEnforced)
@@ -4166,6 +4167,14 @@ func startRaftServers(
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
 			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id)
 		}))
+		internalOpts = append(internalOpts,
+			adapter.WithInternalMigrationTransferSizeGuardReady(func() bool {
+				return migrationOwnershipRuntimeHooksInstalled(trx, shardStore, distServer, rt.spec.id)
+			}),
+			adapter.WithInternalMigrationPartitionProtocolReady(func() bool {
+				return migrationOwnershipRuntimeHooksInstalled(trx, shardStore, distServer, rt.spec.id)
+			}),
+		)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -4220,7 +4229,9 @@ func startRaftServers(
 			rt.engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			newPrepareEvidenceMembershipGate(shardStore, rt.spec.id, confChangeInterceptor),
+			newMigrationMembershipGate(rt.store, migrationMemberProtocolsConfigured(),
+				newMigrationMemberProtocolProbe(adminGRPCOpts.migrationToken),
+				newPrepareEvidenceMembershipGate(shardStore, rt.spec.id, confChangeInterceptor)),
 		)
 		reflection.Register(gs)
 

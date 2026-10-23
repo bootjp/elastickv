@@ -3,11 +3,17 @@ package main
 import (
 	"context"
 
+	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/raftadmin"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
+
+func migrationMemberProtocolsConfigured() bool {
+	return adapter.MigrationImportOpcodeEnabledFromEnv() || adapter.MigrationPromoteOpcodeEnabledFromEnv() ||
+		adapter.MigrationCleanupOpcodeEnabledFromEnv()
+}
 
 // Check support before any new member can race a guarded-control proposal.
 // Existing durable evidence keeps the requirement after feature flags change.

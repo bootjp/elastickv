@@ -141,6 +141,7 @@ type SplitJob struct {
 	TransferPreflightDone            bool
 	JobID                            uint64
 	SourceRouteID                    uint64
+	WorkingSourceRouteID             uint64
 	SourceGroupID                    uint64
 	SplitKey                         []byte
 	TargetGroupID                    uint64
@@ -937,6 +938,7 @@ func CloneSplitJob(job SplitJob) SplitJob {
 		TransferPreflightDone:            job.TransferPreflightDone,
 		JobID:                            job.JobID,
 		SourceRouteID:                    job.SourceRouteID,
+		WorkingSourceRouteID:             job.WorkingSourceRouteID,
 		SplitKey:                         CloneBytes(job.SplitKey),
 		TargetGroupID:                    job.TargetGroupID,
 		Phase:                            job.Phase,
@@ -987,6 +989,7 @@ func splitJobToProto(job SplitJob) *pb.SplitJob {
 		TransferPreflightDone:            job.TransferPreflightDone,
 		JobId:                            job.JobID,
 		SourceRouteId:                    job.SourceRouteID,
+		WorkingSourceRouteId:             job.WorkingSourceRouteID,
 		SplitKey:                         job.SplitKey,
 		TargetGroupId:                    job.TargetGroupID,
 		Phase:                            pb.SplitJobPhase(job.Phase),
@@ -1058,6 +1061,7 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 	return SplitJob{
 		JobID:                            msg.GetJobId(),
 		SourceRouteID:                    msg.GetSourceRouteId(),
+		WorkingSourceRouteID:             msg.GetWorkingSourceRouteId(),
 		SplitKey:                         CloneBytes(msg.GetSplitKey()),
 		TargetGroupID:                    msg.GetTargetGroupId(),
 		Phase:                            phase,

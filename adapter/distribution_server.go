@@ -1438,6 +1438,17 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 	left distribution.RouteDescriptor,
 	right distribution.RouteDescriptor,
 ) (distribution.CatalogSnapshot, error) {
+	return s.saveSplitPartitionViaCoordinator(ctx, readTimestamp, expectedVersion, parentID, readKeys, left, right, nil)
+}
+
+func (s *DistributionServer) saveSplitPartitionViaCoordinator(
+	ctx context.Context,
+	readTimestamp kv.ReadTimestamp,
+	expectedVersion, parentID uint64,
+	readKeys [][]byte,
+	left, right distribution.RouteDescriptor,
+	workingJob *distribution.SplitJob,
+) (distribution.CatalogSnapshot, error) {
 	nextVersion, nextRouteID, err := nextCatalogSplitIDs(expectedVersion, right.RouteID)
 	if err != nil {
 		return distribution.CatalogSnapshot{}, err
@@ -1474,6 +1485,13 @@ func (s *DistributionServer) saveSplitResultViaCoordinator(
 		return distribution.CatalogSnapshot{}, grpcStatusErrorf(codes.Internal, "convert catalog delta mutations: %v", err)
 	}
 	ops = append(ops, deltaOps...)
+	partitionOps, partitionReads, err := s.catalogSplitPartitionOps(ctx, readTS, parentID, left, right, expectedVersion, workingJob)
+	if err != nil {
+		return distribution.CatalogSnapshot{}, err
+	}
+	ops = append(ops, partitionOps...)
+	readKeys = append(readKeys, distribution.CatalogVersionKey(), distribution.CatalogRouteKey(parentID), distribution.CatalogNextRouteIDKey())
+	readKeys = append(readKeys, partitionReads...)
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	resp, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
 		Elems:    ops,

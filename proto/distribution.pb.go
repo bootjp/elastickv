@@ -986,8 +986,10 @@ type SplitJob struct {
 	TransferPreflightTs       uint64                     `protobuf:"varint,37,opt,name=transfer_preflight_ts,json=transferPreflightTs,proto3" json:"transfer_preflight_ts,omitempty"`
 	TransferPreflightProgress []*SplitJobBracketProgress `protobuf:"bytes,38,rep,name=transfer_preflight_progress,json=transferPreflightProgress,proto3" json:"transfer_preflight_progress,omitempty"`
 	TransferPreflightDone     bool                       `protobuf:"varint,39,opt,name=transfer_preflight_done,json=transferPreflightDone,proto3" json:"transfer_preflight_done,omitempty"`
-	unknownFields             protoimpl.UnknownFields
-	sizeCache                 protoimpl.SizeCache
+	// Durable moving child created with its same-owner partition manifest.
+	WorkingSourceRouteId uint64 `protobuf:"varint,40,opt,name=working_source_route_id,json=workingSourceRouteId,proto3" json:"working_source_route_id,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
 }
 
 func (x *SplitJob) Reset() {
@@ -1291,6 +1293,13 @@ func (x *SplitJob) GetTransferPreflightDone() bool {
 		return x.TransferPreflightDone
 	}
 	return false
+}
+
+func (x *SplitJob) GetWorkingSourceRouteId() uint64 {
+	if x != nil {
+		return x.WorkingSourceRouteId
+	}
+	return 0
 }
 
 type ListRoutesRequest struct {
@@ -2879,7 +2888,7 @@ const file_distribution_proto_rawDesc = "" +
 	"\x04done\x18\x05 \x01(\bR\x04done\x12#\n" +
 	"\rscanned_bytes\x18\x06 \x01(\x04R\fscannedBytes\x12#\n" +
 	"\raccepted_rows\x18\a \x01(\x04R\facceptedRows\x12/\n" +
-	"\x14last_acked_batch_seq\x18\b \x01(\x04R\x11lastAckedBatchSeq\"\xc8\x0f\n" +
+	"\x14last_acked_batch_seq\x18\b \x01(\x04R\x11lastAckedBatchSeq\"\xff\x0f\n" +
 	"\bSplitJob\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12&\n" +
 	"\x0fsource_route_id\x18\x02 \x01(\x04R\rsourceRouteId\x12\x1b\n" +
@@ -2924,7 +2933,8 @@ const file_distribution_proto_rawDesc = "" +
 	"\x1atransfer_preflight_version\x18$ \x01(\rR\x18transferPreflightVersion\x122\n" +
 	"\x15transfer_preflight_ts\x18% \x01(\x04R\x13transferPreflightTs\x12X\n" +
 	"\x1btransfer_preflight_progress\x18& \x03(\v2\x18.SplitJobBracketProgressR\x19transferPreflightProgress\x126\n" +
-	"\x17transfer_preflight_done\x18' \x01(\bR\x15transferPreflightDone\"\x13\n" +
+	"\x17transfer_preflight_done\x18' \x01(\bR\x15transferPreflightDone\x125\n" +
+	"\x17working_source_route_id\x18( \x01(\x04R\x14workingSourceRouteId\"\x13\n" +
 	"\x11ListRoutesRequest\"g\n" +
 	"\x12ListRoutesResponse\x12'\n" +
 	"\x0fcatalog_version\x18\x01 \x01(\x04R\x0ecatalogVersion\x12(\n" +

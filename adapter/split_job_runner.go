@@ -1714,6 +1714,9 @@ func (s *DistributionServer) ensureSplitJobCatalogFence(
 	snapshot distribution.CatalogSnapshot,
 	sourceRoute distribution.RouteDescriptor,
 ) (distribution.CatalogSnapshot, distribution.RouteDescriptor, error) {
+	if job.WorkingSourceRouteID != 0 {
+		return s.fenceSplitWorkingSource(ctx, job, snapshot, sourceRoute)
+	}
 	if sourceRoute.RouteID != job.SourceRouteID {
 		return snapshot, sourceRoute, nil
 	}
@@ -2221,7 +2224,7 @@ func (s *DistributionServer) splitJobSourceRoute(
 	if err != nil {
 		return distribution.CatalogSnapshot{}, distribution.RouteDescriptor{}, err
 	}
-	if parent, found := findRouteByID(snapshot.Routes, job.SourceRouteID); found {
+	if parent, found := findRouteByID(snapshot.Routes, sourceLookupRouteID(job)); found {
 		return snapshot, parent, nil
 	}
 	for _, route := range snapshot.Routes {
