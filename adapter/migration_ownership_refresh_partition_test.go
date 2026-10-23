@@ -114,6 +114,7 @@ func newPartitionRefreshHarness(t *testing.T, local uint64) *partitionRefreshHar
 	}
 	mirror := distribution.NewEngine()
 	h.consumer = NewDistributionServer(mirror, nil,
+		WithSplitJobRunnerReadinessGate(func(context.Context) error { return nil }),
 		WithSplitMigrationGroupClientFactory(func(context.Context, uint64) (SplitMigrationClient, error) { return h.clients[0], nil }),
 		WithSplitMigrationVoterFactory(members),
 		WithMigrationOwnershipRefresh(groups, func(context.Context) (MigrationOwnershipAttestor, error) { return h.rootClient, nil }),

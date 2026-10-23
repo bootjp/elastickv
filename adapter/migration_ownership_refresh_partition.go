@@ -239,6 +239,7 @@ func (s *DistributionServer) reconcileMigrationPartitionGroup(ctx context.Contex
 	}
 	r := s.ownershipRefresh.partitionRuntime
 	start := r.next[id] % len(candidates)
+	background := limit > 0
 	if limit == 0 {
 		limit = len(candidates)
 	}
@@ -257,7 +258,7 @@ func (s *DistributionServer) reconcileMigrationPartitionGroup(ctx context.Contex
 		}
 		used++
 		err := s.reconcileMigrationPartitionPrior(ctx, id, g, index, state, partitions, legacy)
-		result = errors.CombineErrors(result, err)
+		result = errors.CombineErrors(result, migrationPartitionBackgroundResult(err, background))
 		if ctx.Err() != nil {
 			break
 		}
@@ -335,7 +336,7 @@ func (s *DistributionServer) reconcileMigrationPartitionPrior(ctx context.Contex
 	}
 	c, err := s.fetchMigrationPartitionAttestation(ctx, partitions, legacy, index)
 	if err != nil {
-		return s.reconcileMigrationPartitionFailure(ctx, id, g, index, members, legacy, err, len(partitions))
+		return s.reconcileMigrationPartitionFailure(ctx, id, g, index, members, legacy, err, partitions)
 	}
 	term := g.Engine.Status().Term
 	transition := c.Transition
@@ -356,8 +357,11 @@ func (s *DistributionServer) reconcileMigrationPartitionPrior(ctx context.Contex
 	return s.finishMigrationPartitionAcknowledgement(ctx, id, g, index, term, members, prior.MigrationJobID, transition)
 }
 
-func (s *DistributionServer) reconcileMigrationPartitionFailure(ctx context.Context, id uint64, g *kv.ShardGroup, index uint64, members []SplitMigrationVoter, legacy []store.MigrationOwnershipState, err error, partitions int) error {
-	if unchangedLegacyPartitionFallback(err, partitions, len(legacy)) {
+func (s *DistributionServer) reconcileMigrationPartitionFailure(ctx context.Context, id uint64, g *kv.ShardGroup, index uint64, members []SplitMigrationVoter, legacy []store.MigrationOwnershipState, err error, partitions []store.MigrationOwnershipPartition) error {
+	if deferredMigrationNegativePartition(err, partitions, legacy) {
+		return errors.WithStack(ErrMigrationNegativePartitionDeferred)
+	}
+	if unchangedLegacyPartitionFallback(err, len(partitions), len(legacy)) {
 		return s.reconcileLegacyOwnershipPartition(ctx, id, g, index, members, legacy[0])
 	}
 	return errors.WithStack(err)

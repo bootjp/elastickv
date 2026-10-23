@@ -104,7 +104,7 @@ func (s *DistributionServer) attestMigrationPartition(ctx context.Context, req *
 	if snapshot.Version < prior.CatalogVersion {
 		return nil, errors.WithStack(store.ErrMigrationOwnership)
 	}
-	raw, unchanged, err := s.migrationPartitionManifestAt(ctx, snapshot, prior)
+	raw, unchanged, err := s.migrationPartitionManifestForPriors(ctx, snapshot, prior, partitions, legacy)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -181,7 +181,7 @@ func (s *DistributionServer) migrationPartitionManifestAt(ctx context.Context, s
 		return nil, nil, errors.WithStack(hashErr)
 	}
 	if !bytes.Equal(hash, prior.DescriptorHash) {
-		return nil, nil, errors.New("committed partition descriptor changed; no manifest")
+		return nil, nil, errors.WithStack(errMigrationPartitionDescriptorChanged)
 	}
 	return nil, &route, nil
 }

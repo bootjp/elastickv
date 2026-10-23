@@ -246,6 +246,7 @@ func migrationPartitionTiles(before []store.MigrationOwnershipPartition, parent 
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	negativeOnly := migrationPartitionNegativeBeforeMatchesParent(before, parent) && migrationPartitionNegativeGeometryAllowed(before, routes, parentHash)
 	boundaries, err := migrationPartitionBoundaries(before, parent, routes, version, configuration)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -259,7 +260,7 @@ func migrationPartitionTiles(before []store.MigrationOwnershipPartition, parent 
 		if i+1 < len(boundaries) {
 			end = boundaries[i+1]
 		}
-		p, found, err := migrationPartitionIntervalTile(before, parent, parentHash, routes, start, end, version, configuration)
+		p, found, err := migrationPartitionIntervalTile(before, parent, parentHash, routes, start, end, version, configuration, negativeOnly)
 		if err != nil {
 			return nil, errors.WithStack(err)
 		}
@@ -274,12 +275,12 @@ func migrationPartitionTiles(before []store.MigrationOwnershipPartition, parent 
 	return after, nil
 }
 
-func migrationPartitionIntervalTile(before []store.MigrationOwnershipPartition, parent distribution.RouteDescriptor, hash []byte, routes []distribution.RouteDescriptor, start, end []byte, version, configuration uint64) (store.MigrationOwnershipPartition, bool, error) {
+func migrationPartitionIntervalTile(before []store.MigrationOwnershipPartition, parent distribution.RouteDescriptor, hash []byte, routes []distribution.RouteDescriptor, start, end []byte, version, configuration uint64, negativeOnly bool) (store.MigrationOwnershipPartition, bool, error) {
 	p, found, err := migrationPartitionCovering(before, start, end)
 	if err != nil || !found {
 		return p, found, err
 	}
-	if !migrationPartitionParentMatches(p, parent, hash) {
+	if !migrationPartitionParentMatches(p, parent, hash, negativeOnly) {
 		return p, false, errors.WithStack(store.ErrMigrationOwnership)
 	}
 	p, err = projectMigrationPartitionTile(p, routes, start, end, version, configuration)
@@ -316,9 +317,75 @@ func migrationPartitionRangeContained(p store.MigrationOwnershipPartition, start
 	return bytes.Compare(p.RouteStart, start) >= 0 && (len(end) == 0 || (len(p.RouteEnd) != 0 && bytes.Compare(p.RouteEnd, end) <= 0))
 }
 
-func migrationPartitionParentMatches(p store.MigrationOwnershipPartition, parent distribution.RouteDescriptor, hash []byte) bool {
-	return p.RouteID == parent.RouteID && p.OwnerGroupID == parent.GroupID && bytes.Equal(p.DescriptorHash, hash) &&
+func migrationPartitionParentMatches(p store.MigrationOwnershipPartition, parent distribution.RouteDescriptor, hash []byte, negativeOnly bool) bool {
+	strict := p.RouteID == parent.RouteID && p.OwnerGroupID == parent.GroupID && bytes.Equal(p.DescriptorHash, hash) &&
 		p.MinWriteTSExclusive == parent.MinWriteTSExclusive && (p.Role != store.MigrationOwner || p.Staged == parent.StagedVisibilityActive)
+	return strict || (negativeOnly && migrationPartitionNegativeParentMatches(p, parent))
+}
+
+// MigrationPartitionNegativePriors validates complete native references before
+// permitting geometry discovery or a non-authorizing background deferral.
+func MigrationPartitionNegativePriors(partitions []store.MigrationOwnershipPartition, legacy []store.MigrationOwnershipState) bool {
+	if !migrationPartitionCountValid(len(partitions) + len(legacy)) {
+		return false
+	}
+	before, _, err := migrationPartitionPriorEvidence(partitions, legacy)
+	return err == nil && migrationPartitionNegativeBefore(before)
+}
+
+func MigrationPartitionNegativePriorsMatchParent(partitions []store.MigrationOwnershipPartition, legacy []store.MigrationOwnershipState, parent distribution.RouteDescriptor) bool {
+	if !migrationPartitionCountValid(len(partitions) + len(legacy)) {
+		return false
+	}
+	before, _, err := migrationPartitionPriorEvidence(partitions, legacy)
+	return err == nil && migrationPartitionNegativeBeforeMatchesParent(before, parent)
+}
+
+func migrationPartitionNegativeBefore(before []store.MigrationOwnershipPartition) bool {
+	if len(before) == 0 {
+		return false
+	}
+	for _, p := range before {
+		if !migrationPartitionNegativeRole(p) || p.Generation != before[0].Generation || p.LocalGroupID != before[0].LocalGroupID {
+			return false
+		}
+	}
+	return true
+}
+
+func migrationPartitionNegativeRole(p store.MigrationOwnershipPartition) bool {
+	return p.Role == store.MigrationNonOwner && p.SourceTrackerVersion == 0 && p.SourceAppliedIndex == 0 && !p.Staged && p.WriteFloorKnown
+}
+
+func migrationPartitionNegativeBeforeMatchesParent(before []store.MigrationOwnershipPartition, parent distribution.RouteDescriptor) bool {
+	if !migrationPartitionNegativeBefore(before) {
+		return false
+	}
+	for _, p := range before {
+		if !migrationPartitionNegativeParentMatches(p, parent) {
+			return false
+		}
+	}
+	return true
+}
+
+func migrationPartitionNegativeParentMatches(p store.MigrationOwnershipPartition, parent distribution.RouteDescriptor) bool {
+	return migrationPartitionNegativeRole(p) && parent.GroupID != p.LocalGroupID && parent.MinWriteTSExclusive >= p.MinWriteTSExclusive &&
+		p.RouteID == parent.RouteID && p.ParentRouteID == parent.ParentRouteID && bytes.Equal(p.RouteStart, parent.Start) && bytes.Equal(p.RouteEnd, parent.End)
+}
+
+func migrationPartitionNegativeGeometryAllowed(before []store.MigrationOwnershipPartition, routes []distribution.RouteDescriptor, parentHash []byte) bool {
+	if len(routes) > 1 {
+		return true
+	}
+	// An unchanged refresh may retain a historical owner/floor, but cannot
+	// invent a new descriptor hash without a committed geometry manifest.
+	for _, p := range before {
+		if !bytes.Equal(p.DescriptorHash, parentHash) {
+			return false
+		}
+	}
+	return true
 }
 
 func projectMigrationPartitionTile(p store.MigrationOwnershipPartition, routes []distribution.RouteDescriptor, start, end []byte, version, configuration uint64) (store.MigrationOwnershipPartition, error) {
