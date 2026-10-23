@@ -31,6 +31,10 @@ import (
 const (
 	quorumAcceptanceGroup          = uint64(7)
 	quorumAcceptanceCatalogVersion = uint64(4)
+	quorumAcceptanceTick           = 10 * time.Millisecond
+	quorumAcceptanceElectionTicks  = 500
+	quorumAcceptanceHeartbeatTicks = 10
+	quorumAcceptanceElectionWait   = 3 * quorumAcceptanceTick * quorumAcceptanceElectionTicks
 )
 
 // Real data-group elections, WAL, transport, ConfChanges and native snapshots.
@@ -174,7 +178,10 @@ func (n *quorumAcceptanceNode) open(ctx context.Context, peers []etcdraft.Peer, 
 	n.fsm = kv.NewKvFSMWithHLC(n.store, nil, kv.WithRouteHistory(nil, quorumAcceptanceGroup))
 	engine, err := etcdraft.Open(ctx, etcdraft.OpenConfig{NodeID: n.peer.NodeID, LocalID: n.peer.ID, LocalAddress: n.peer.Address,
 		DataDir: n.dir, Peers: peers, Bootstrap: bootstrap, JoinAsLearner: !bootstrap && len(peers) != 0, Transport: n.transport, StateMachine: n.fsm,
-		TickInterval: 10 * time.Millisecond, ElectionTick: 100, HeartbeatTick: 1})
+		// Large-value acceptance is not a one-second failover latency test.
+		// Race-instrumented 64 MiB applies on a small CI runner must fit the
+		// modeled election window. Explicit transfers still exercise churn.
+		TickInterval: quorumAcceptanceTick, ElectionTick: quorumAcceptanceElectionTicks, HeartbeatTick: quorumAcceptanceHeartbeatTicks})
 	if err != nil {
 		return errors.WithStack(err)
 	}
@@ -202,7 +209,7 @@ func (c *quorumAcceptanceCluster) leader(t *testing.T) *quorumAcceptanceNode {
 			active = append(active, n)
 		}
 	}
-	return active[raftenginetest.WaitForLeader(t, 5*time.Second, views...)]
+	return active[raftenginetest.WaitForLeader(t, quorumAcceptanceElectionWait, views...)]
 }
 
 func (c *quorumAcceptanceCluster) waitConfiguration(t *testing.T, count int) uint64 {

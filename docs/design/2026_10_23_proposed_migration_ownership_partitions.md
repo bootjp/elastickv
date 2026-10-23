@@ -70,6 +70,13 @@ already-fenced SOURCE intervals stay denied rather than acquiring new authority.
 The root transaction is still committed before data-group refresh: independent
 watchers may briefly observe a version whose owner ACK is pending and retry.
 This is not atomic root/data publication or a claim of zero transient retries.
+Recovery of a persisted working child repeats the complete serving-owner barrier
+against the committed catalog before publishing locally or arming its tracker.
+The durable child ID proves the root transaction, not completion of those ACKs;
+an unavailable disjoint owner keeps recovery pending without reallocating routes.
+Move-back also replays the target's retained negative geometry in the foreground
+before control-size preflight. Deferred geometry is not a readiness ACK: complete
+size validation and the post-commit target barrier still precede acquisition.
 
 ## Persistence Hook Map
 

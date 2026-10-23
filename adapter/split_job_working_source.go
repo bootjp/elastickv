@@ -29,6 +29,9 @@ func (s *DistributionServer) prepareSplitJobWorkingSource(ctx context.Context, j
 	if err := s.ensureSplitJobNamespaceAdmission(ctx, job); err != nil {
 		return job, err
 	}
+	if err := s.prepareSplitTargetGeometry(ctx, job); err != nil {
+		return job, err
+	}
 	updated, err := s.ensureSplitWorkingSource(ctx, job)
 	if err != nil {
 		return job, err
@@ -42,9 +45,24 @@ func (s *DistributionServer) prepareSplitJobWorkingSource(ctx context.Context, j
 	return updated, s.reconcileMigrationPartitions(ctx, updated.TargetGroupID)
 }
 
+func (s *DistributionServer) prepareSplitTargetGeometry(ctx context.Context, job distribution.SplitJob) error {
+	if job.WorkingSourceRouteID != 0 {
+		return nil
+	}
+	err := s.reconcileMigrationPartitions(ctx, job.TargetGroupID)
+	// Replay retained manifests before sizing the future control. An exact
+	// historical NONOWNER may still await the not-yet-committed working split;
+	// that is not an ACK. The size preflight and post-commit target barrier
+	// independently validate its complete priors before any acquisition.
+	if errors.Is(err, ErrMigrationNegativePartitionDeferred) {
+		return nil
+	}
+	return err
+}
+
 func (s *DistributionServer) ensureSplitWorkingSource(ctx context.Context, job distribution.SplitJob) (distribution.SplitJob, error) {
 	if job.WorkingSourceRouteID != 0 {
-		return job, nil
+		return s.recoverSplitWorkingSource(ctx, job)
 	}
 	snapshot, left, right, err := s.planWorkingSourceSplit(ctx, job)
 	if err != nil {
@@ -70,6 +88,23 @@ func (s *DistributionServer) ensureSplitWorkingSource(ctx context.Context, job d
 		return job, err
 	}
 	return s.reloadSplitWorkingSourceAt(ctx, job, right.RouteID, saved.ReadTS)
+}
+
+func (s *DistributionServer) recoverSplitWorkingSource(ctx context.Context, job distribution.SplitJob) (distribution.SplitJob, error) {
+	snapshot, err := s.loadCommittedMigrationCatalog(ctx)
+	if err != nil {
+		return job, err
+	}
+	route, found := findRouteByID(snapshot.Routes, job.WorkingSourceRouteID)
+	if !found || !workingSourceFenceRouteMatches(job, route) || route.State != distribution.RouteStateActive || route.ParentRouteID != job.SourceRouteID {
+		return job, errors.WithStack(distribution.ErrMigrationSourceRouteChanged)
+	}
+	// The route ID proves only the root transaction. A previous attempt may
+	// have stopped before any disjoint owner's new-version ACK completed.
+	if _, err := s.prepareSplitRangePartitions(ctx, snapshot, route.RouteID); err != nil {
+		return job, err
+	}
+	return job, s.applyEngineSnapshot(snapshot)
 }
 
 func (s *DistributionServer) reloadSplitWorkingSourceAt(ctx context.Context, job distribution.SplitJob, routeID, readTS uint64) (distribution.SplitJob, error) {

@@ -25,3 +25,12 @@ func TestMigrationResplitMoveBackReacquiresHistoricalNonOwner(t *testing.T) {
 	require.ErrorIs(t, r.put(t, 2, "n", "too-old", first.FenceTS), kv.ErrRouteWriteTimestampTooLow)
 	require.Error(t, r.put(t, 3, "y", "retired-owner", third.FenceTS+102))
 }
+
+func TestMigrationResplitMoveBackDoesNotRequireBackgroundGeometryRefresh(t *testing.T) {
+	r := newResplitAcceptanceRuntime(t)
+	r.migrate(t, 1, 2, "m")
+	r.migrate(t, r.ownership(t, 2)[0].RouteID, 3, "t")
+	returned := r.migrate(t, r.ownership(t, 3)[0].RouteID, 1, "x")
+	require.NoError(t, r.put(t, 1, "y", "returned-without-background", returned.FenceTS+100))
+	r.read(t, "y", "returned-without-background")
+}
