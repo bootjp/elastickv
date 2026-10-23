@@ -37,15 +37,10 @@ type migrationServingAdmissionIndex struct {
 func buildMigrationServingAdmission(ownership []MigrationOwnershipState, partitions MigrationOwnershipPartitionState) migrationServingAdmissionIndex {
 	index := migrationServingAdmissionIndex{}
 	index.summary.Present = len(ownership) != 0 || partitionHasEvidence(partitions)
-	consumed := make(map[uint64]bool)
+	consumed := partitionAdoptedJobs(partitions)
 	receipts := make(map[string]MigrationOwnershipPartitionReceipt, len(partitions.Receipts))
 	for _, r := range partitions.Receipts {
 		receipts[string(r.ReceiptID)] = r
-		for _, ref := range r.Transition.Before {
-			if ref.LegacyJobID != 0 {
-				consumed[ref.LegacyJobID] = true
-			}
-		}
 	}
 	index.state.Ownership, index.summary.CatalogVersionFloor = admissionLegacyOwnership(ownership, consumed)
 	index.state.Partitions.Generation = partitions.Generation
@@ -62,6 +57,27 @@ func buildMigrationServingAdmission(ownership []MigrationOwnershipState, partiti
 	index.state.Ownership = cloneMigrationOwnership(index.state.Ownership)
 	index.state.Partitions = clonePartitionState(index.state.Partitions)
 	return index
+}
+
+func partitionAdoptedJobs(state MigrationOwnershipPartitionState) map[uint64]bool {
+	consumed := make(map[uint64]bool)
+	for _, receipt := range state.Receipts {
+		for _, ref := range receipt.Transition.Before {
+			if ref.LegacyJobID != 0 {
+				consumed[ref.LegacyJobID] = true
+			}
+		}
+		// Guarded Acquire/Clear creates a new job certificate and frontier in
+		// the same commit; its Before references name the superseded partition,
+		// not the newly created job. That new ledger is history, not a second
+		// certificate competing with the frontier at the same catalog version.
+		if receipt.Transition.Operation == MigrationOwnershipPartitionJobOperation {
+			for _, after := range receipt.Transition.After {
+				consumed[after.MigrationJobID] = true
+			}
+		}
+	}
+	return consumed
 }
 
 func admissionLegacyOwnership(ownership []MigrationOwnershipState, consumed map[uint64]bool) ([]MigrationOwnershipState, uint64) {

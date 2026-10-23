@@ -37,6 +37,11 @@ func TestOwnershipPartitionGuardedMoveBackAndClear(t *testing.T) {
 		require.Equal(t, uint64(8), right.MigrationJobID)
 		require.Equal(t, uint64(12), right.SourceAppliedIndex)
 		require.True(t, MigrationOwnershipPartitionEvidenceValid(acquired.Partitions, right))
+		admission, err := admissionReader(t, st).MigrationServingAdmissionState(t.Context())
+		require.NoError(t, err)
+		for _, legacy := range admission.Ownership {
+			require.NotEqual(t, incoming.JobID, legacy.JobID, "a job represented by the active frontier must not compete with its own partition")
+		}
 		require.NoError(t, proofs.AcquireMigrationOwnership(t.Context(), incoming, 13))
 		guard.SourceWriteFence, guard.SourceReadFence, guard.ExpectedCutoverVersion = true, true, 15
 		require.NoError(t, writer.ApplyTargetStagedReadinessAt(t.Context(), guard, 14))

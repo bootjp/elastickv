@@ -254,14 +254,7 @@ type partitionCandidate struct {
 
 func partitionCandidates(s MigrationOwnershipPartitionState, legacy []MigrationOwnershipState) ([]partitionCandidate, error) {
 	var out []partitionCandidate
-	consumed := make(map[uint64]bool)
-	for _, r := range s.Receipts {
-		for _, ref := range r.Transition.Before {
-			if ref.LegacyJobID != 0 {
-				consumed[ref.LegacyJobID] = true
-			}
-		}
-	}
+	consumed := partitionAdoptedJobs(s)
 	for _, p := range s.Partitions {
 		ref, err := MigrationOwnershipPartitionReferenceFor(p)
 		if err != nil {
