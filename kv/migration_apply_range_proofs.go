@@ -101,6 +101,51 @@ func migrationAdmissionRangeProofs(view store.MigrationServingState, r migration
 		}
 	}
 	all := migrationAdmissionProofs(view)
+	intersecting := all[:0]
+	for _, proof := range all {
+		if routeRangeIntersects(r.start, r.end, proof.RouteStart, proof.RouteEnd) {
+			intersecting = append(intersecting, proof)
+		}
+	}
+	slices.SortFunc(intersecting, func(a, b migrationAdmissionProof) int {
+		return bytes.Compare(a.RouteStart, b.RouteStart)
+	})
+	if migrationAdmissionProofsDisjoint(intersecting) {
+		return migrationAdmissionDisjointRangeProofs(view, intersecting, r)
+	}
+	// Overlapping legacy certificates retain the original conservative tie and
+	// newest-version selection order, including negative/unknown barriers.
+	return migrationAdmissionOverlappingRangeProofs(view, migrationAdmissionProofs(view), r)
+}
+
+func migrationAdmissionProofsDisjoint(proofs []migrationAdmissionProof) bool {
+	for i := 1; i < len(proofs); i++ {
+		end := proofs[i-1].RouteEnd
+		if len(end) == 0 || bytes.Compare(end, proofs[i].RouteStart) > 0 {
+			return false
+		}
+	}
+	return true
+}
+
+func migrationAdmissionDisjointRangeProofs(view store.MigrationServingState, proofs []migrationAdmissionProof, r migrationApplyRange) ([]migrationAdmissionProof, error) {
+	if len(proofs) == 0 {
+		return nil, nil
+	}
+	cursor := r.start
+	for _, proof := range proofs {
+		if bytes.Compare(proof.RouteStart, cursor) > 0 || !proof.evidenceValid(view) {
+			return nil, errors.WithStack(ErrRouteCutoverPending)
+		}
+		if len(proof.RouteEnd) == 0 || (len(r.end) != 0 && bytes.Compare(proof.RouteEnd, r.end) >= 0) {
+			return proofs, nil
+		}
+		cursor = proof.RouteEnd
+	}
+	return nil, errors.WithStack(ErrRouteCutoverPending)
+}
+
+func migrationAdmissionOverlappingRangeProofs(view store.MigrationServingState, all []migrationAdmissionProof, r migrationApplyRange) ([]migrationAdmissionProof, error) {
 	boundaries, intersects := migrationAdmissionBoundaries(all, r)
 	if !intersects {
 		return nil, nil

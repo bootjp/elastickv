@@ -96,6 +96,13 @@ func samePartition(a, b MigrationOwnershipPartition) bool {
 }
 
 func MigrationOwnershipPartitionEvidenceValid(s MigrationOwnershipPartitionState, p MigrationOwnershipPartition) bool {
+	if s.servingEvidence != nil {
+		return s.servingEvidence.valid(s, p)
+	}
+	return migrationPartitionEvidenceUncached(s, p)
+}
+
+func migrationPartitionEvidenceUncached(s MigrationOwnershipPartitionState, p MigrationOwnershipPartition) bool {
 	if s.Generation != p.Generation || !validPartition(p) || !partitionIsActive(s, p) {
 		return false
 	}

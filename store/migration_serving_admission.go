@@ -56,6 +56,7 @@ func buildMigrationServingAdmission(ownership []MigrationOwnershipState, partiti
 	}
 	index.state.Ownership = cloneMigrationOwnership(index.state.Ownership)
 	index.state.Partitions = clonePartitionState(index.state.Partitions)
+	index.state.Partitions.servingEvidence = buildPartitionEvidenceIndex(index.state.Partitions)
 	return index
 }
 

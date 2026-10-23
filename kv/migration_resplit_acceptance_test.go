@@ -15,7 +15,7 @@ import (
 // This is the negative half of the runtime re-split contract. The adapter
 // acceptance owns real SplitRange/runner/partition progress; no child authority
 // is synthesized here to turn a newer watcher into a committed proof.
-func resplitSourceReceiptFixture(t *testing.T) (*kvFSM, *distribution.CatalogStore, *distribution.Engine, store.MigrationOwnershipState) {
+func resplitSourceReceiptFixture(t testing.TB) (*kvFSM, *distribution.CatalogStore, *distribution.Engine, store.MigrationOwnershipState) {
 	t.Helper()
 	root := store.NewMVCCStore()
 	catalog := distribution.NewCatalogStore(root, distribution.WithCatalogRouteDescriptorV2Writes(true))

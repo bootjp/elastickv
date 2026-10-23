@@ -89,6 +89,10 @@ type MigrationOwnershipPartitionState struct {
 	Generation string
 	Partitions []MigrationOwnershipPartition
 	Receipts   []MigrationOwnershipPartitionReceipt
+
+	// Only the durable serving-cache builder seals evidence. Shared by clones,
+	// never serialized, and never derived from caller-owned public fields.
+	servingEvidence *partitionEvidenceIndex
 }
 
 // MigrationOwnershipPartitionStore atomically replaces serving evidence,
