@@ -207,7 +207,7 @@ func TestSplitMigrationLocalReadinessGateRequiresMigrationOpcodes(t *testing.T) 
 	require.ErrorContains(t, err, adapter.MigrationCleanupOpcodeEnv)
 
 	t.Setenv(adapter.MigrationCleanupOpcodeEnv, "1")
-	require.ErrorContains(t, splitMigrationLocalReadinessGate(context.Background()), "protocol not enabled")
+	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()))
 }
 
 func TestSplitMigrationCapabilityPeersFromConfigurationUsesCurrentMembers(t *testing.T) {

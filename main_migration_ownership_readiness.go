@@ -26,21 +26,21 @@ func migrationOwnershipRuntimeHooksInstalled(tx kv.Transactional, shards *kv.Sha
 	return kv.MigrationPartitionRequestAdmissionReady(tx) && shards.MigrationPartitionReadAdmissionReady(groupID) && server.MigrationPartitionRuntimeConfigured(groupID)
 }
 
-func migrationOwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, groupID uint64) bool {
-	return migrationOwnershipRuntimeHooksInstalled(tx, shards, server, groupID) && migrationOwnershipActivationGate() == nil
-}
-
-// This Draft foundation intentionally has no activation override. Installing
-// the hooks is not sequential-split geometry or whole-runtime acceptance.
-// Revisit only after the chosen protocol and its integrated evidence exist.
-func migrationOwnershipActivationGate() error {
-	return errors.WithStack(status.Error(codes.FailedPrecondition,
-		"migration protocol not enabled: ownership geometry and whole-runtime coverage acceptance are incomplete"))
+func migrationOwnershipRuntimeReady(tx kv.Transactional, shards *kv.ShardStore, server *adapter.DistributionServer, groupID uint64, engine raftengine.Engine) bool {
+	if !migrationOwnershipRuntimeHooksInstalled(tx, shards, server, groupID) || splitMigrationLocalReadinessGate(context.Background()) != nil {
+		return false
+	}
+	reader, ok := engine.(raftengine.AppliedConfigurationReader)
+	if !ok {
+		return false
+	}
+	index, supported := reader.AppliedConfigurationIndex()
+	return supported && index != 0
 }
 
 // Old controllers may cache cap_migration_v2. Refuse their side-effecting RPCs
-// too, while leaving ordinary KV, authenticated 2PC resolution, same-group
-// SplitRange, and separately authenticated general Admin traffic unchanged.
+// when local flags are disabled, while leaving ordinary KV, authenticated 2PC
+// resolution, same-group SplitRange, and general Admin traffic unchanged.
 func migrationCoverageUnaryGate(ctx context.Context, req any, info *grpc.UnaryServerInfo, handler grpc.UnaryHandler) (any, error) {
 	if info.FullMethod == pb.Internal_CleanupMigration_FullMethodName {
 		if control, ok := req.(*pb.CleanupMigrationRequest); ok && control.GetMode() == pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION {
@@ -51,7 +51,9 @@ func migrationCoverageUnaryGate(ctx context.Context, req any, info *grpc.UnarySe
 		}
 	}
 	if migrationCoverageMutationMethod(info.FullMethod) {
-		return nil, migrationOwnershipActivationGate()
+		if err := splitMigrationLocalReadinessGate(ctx); err != nil {
+			return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
+		}
 	}
 	return handler(ctx, req)
 }

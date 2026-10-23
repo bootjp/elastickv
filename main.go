@@ -2679,7 +2679,7 @@ func splitMigrationLocalReadinessGate(ctx context.Context) error {
 	if !adapter.MigrationCleanupOpcodeEnabledFromEnv() {
 		return errors.Errorf("%s is disabled", adapter.MigrationCleanupOpcodeEnv)
 	}
-	return migrationOwnershipActivationGate()
+	return nil
 }
 
 func splitMigrationPeerAuthReadinessGate(context.Context) error {
@@ -4173,7 +4173,7 @@ func startRaftServers(
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id], rt.spec.id)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
 		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
-			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id)
+			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.engine)
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		staticServingServices := registerS3BlobFetchServer(

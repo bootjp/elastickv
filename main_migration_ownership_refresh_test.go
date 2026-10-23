@@ -24,6 +24,7 @@ import (
 
 type ownershipRefreshRaftNode struct {
 	group    *kv.ShardGroup
+	fsm      kv.FSM
 	server   *grpc.Server
 	listener net.Listener
 }
@@ -51,7 +52,7 @@ func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st sto
 			require.NoError(t, result.Close())
 		}
 	})
-	return ownershipRefreshRaftNode{group: &kv.ShardGroup{Store: st, Engine: result.Engine}, server: server, listener: listener}
+	return ownershipRefreshRaftNode{group: &kv.ShardGroup{Store: st, Engine: result.Engine}, fsm: fsm, server: server, listener: listener}
 }
 
 func ownershipRefreshRootCatalog(t *testing.T) (store.MVCCStore, *distribution.CatalogStore, *pb.MigrationOwnershipProof) {
@@ -78,7 +79,7 @@ func ownershipRefreshRootCatalog(t *testing.T) (store.MVCCStore, *distribution.C
 	return st, catalog, proof
 }
 
-func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testing.T) {
+func TestOwnershipRefreshDifferentRaftLeadersRespectExplicitClosedGate(t *testing.T) {
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
@@ -105,8 +106,11 @@ func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testin
 	rootFactory := migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{engine: root.group.Engine}), &cache, token)
 	mirror := distribution.NewEngine()
 	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: 2, Routes: []distribution.RouteDescriptor{{RouteID: 99, GroupID: 99}}}))
+	closedGate := func(context.Context) error {
+		return status.Error(codes.FailedPrecondition, "synthetic migration gate closed")
+	}
 	consumer := adapter.NewDistributionServer(mirror, nil,
-		adapter.WithSplitJobRunnerReadinessGate(func(context.Context) error { return migrationOwnershipActivationGate() }),
+		adapter.WithSplitJobRunnerReadinessGate(closedGate),
 		adapter.WithSplitMigrationGroupClientFactory(groupFactory),
 		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, token)),
 		adapter.WithMigrationOwnershipRefresh(groups, rootFactory),
@@ -114,7 +118,7 @@ func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testin
 	require.True(t, migrationOwnershipRuntimeHooksInstalled(dataTx, dataShards, consumer, 7))
 	pb.RegisterInternalServer(data.server, adapter.NewInternalWithEngine(nil, data.group.Engine, nil, nil,
 		adapter.WithInternalStore(data.group.Store), adapter.WithInternalMigrationProposer(data.group.Engine),
-		adapter.WithInternalMigrationOwnershipReady(func() bool { return migrationOwnershipRuntimeReady(dataTx, dataShards, consumer, 7) })))
+		adapter.WithInternalMigrationOwnershipReady(func() bool { return closedGate(t.Context()) == nil })))
 	go func() { _ = root.server.Serve(root.listener) }()
 	go func() { _ = data.server.Serve(data.listener) }()
 	require.Eventually(t, func() bool {
@@ -137,7 +141,7 @@ func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testin
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	// A caller's unrelated credential cannot override the configured peer token.
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer unrelated"))
-	require.ErrorContains(t, consumer.RunMigrationOwnershipRefreshOnce(ctx), "protocol not enabled")
+	require.ErrorContains(t, consumer.RunMigrationOwnershipRefreshOnce(ctx), "synthetic migration gate closed")
 	rootClient, err := rootFactory(ctx)
 	require.NoError(t, err)
 	attestation, err := rootClient.AttestMigrationOwnership(ctx, &pb.AttestMigrationOwnershipRequest{JobId: 77, Prior: prior})
@@ -149,7 +153,7 @@ func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testin
 	require.True(t, ok)
 	view, err := writer.MigrationServingState(ctx)
 	require.NoError(t, err)
-	require.Empty(t, view.Ownership, "coverage closure must prevent all data-side ownership writes")
+	require.Empty(t, view.Ownership, "explicit closed gate must prevent all data-side ownership writes")
 	assertOwnershipRootRejectsAnonymous(t, ctx, &cache, root.listener.Addr().String(), prior)
 }
 

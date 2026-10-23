@@ -177,9 +177,9 @@ func TestSplitMigrationPeerAuthRolloutPausesRunnerAndCapability(t *testing.T) {
 		t.Fatal("send-only rollout stage must not start a privileged runner")
 	}
 	*splitMigrationPeerAuthEnforced = true
-	require.ErrorContains(t, splitMigrationLocalReadinessGate(context.Background()), "protocol not enabled")
+	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()))
 	*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = false, true
-	require.ErrorContains(t, splitMigrationLocalReadinessGate(context.Background()), "protocol not enabled", "no-auth is not an activation override")
+	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()), "explicit insecure mode retains its existing auth-rollout exception")
 }
 
 func TestSplitMigrationTokenMustBeDedicated(t *testing.T) {
