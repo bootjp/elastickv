@@ -540,6 +540,36 @@
       (finally
         (delete-tree! dir)))))
 
+(deftest final-read-outlasts-transient-fuse-conflicts
+  (let [dir (scratch-dir)]
+    (try
+      (let [test-map (workload/elastickv-filesystem-test {:nodes ["n1"] :mount-dirs [dir]
+                                                          :local true :key-count 1 :max-retries 3
+                                                          :require-fuse-mount false})
+            c        (client/open! (:client test-map) test-map "n1")
+            real     workload/local-read
+            calls    (atom 0)
+            read     (fn [final?]
+                       (client/invoke! c test-map
+                                       (cond-> {:type :invoke :f :read
+                                                :value (independent/tuple 0 nil)}
+                                         final? (assoc :final true))))]
+        (client/setup! c test-map)
+        (with-redefs [workload/local-read (fn [path]
+                                            (if (<= (swap! calls inc) 8)
+                                              (throw (java.io.IOException. "Resource temporarily unavailable"))
+                                              (real path)))]
+          (is (= :ok (:type (read true))))
+          (is (= 9 @calls)))
+        (reset! calls 0)
+        (with-redefs [workload/local-read (fn [_]
+                                            (swap! calls inc)
+                                            (throw (java.io.IOException. "Resource temporarily unavailable")))]
+          (is (= :fail (:type (read false))))
+          (is (= 3 @calls))))
+      (finally
+        (delete-tree! dir)))))
+
 (deftest persistent-read-errors-surface-as-data-loss-sentinels-in-final-reads
   (let [dir (scratch-dir)]
     (try
@@ -559,7 +589,7 @@
               (is (= :ok (:type r)))
               (is (= (independent/tuple 0 :missing) (:value r)))
               (is (str/includes? (:error r) "No such file or directory"))
-              (is (= 3 @calls))))
+              (is (= workload/final-read-min-retries @calls))))
           ;; The same exhaustion during the main phase cannot be told apart
           ;; from the LOOKUP/OPEN race against a concurrent rename: :fail.
           (reset! calls 0)

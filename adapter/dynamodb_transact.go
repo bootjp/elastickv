@@ -379,12 +379,19 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 	// snapshot timestamp is resolved, so the quorum-freshness bound is
 	// established without changing the single-snapshot-ts semantics. The
 	// timestamp below is still sampled once and shared by all items.
-	if !d.leaseCheckTransactGetItems(w, r, in) {
+	groupKeys, ok := d.leaseCheckTransactGetItemsWithKeys(w, r, in)
+	if !ok {
 		return
 	}
 
-	// Acquire a single read timestamp for all items to guarantee a consistent snapshot.
-	readTS := d.nextTxnReadTS()
+	// A lease can confirm leadership without waiting for a committed entry
+	// from the prior leader to be applied. Fence the touched groups with
+	// ReadIndex before choosing the single snapshot timestamp.
+	readTS, err := d.fencedTransactGetReadTS(r.Context(), groupKeys)
+	if err != nil {
+		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, err.Error())
+		return
+	}
 	pin := d.pinReadTS(readTS)
 	defer pin.Release()
 
@@ -397,6 +404,33 @@ func (d *DynamoDBServer) transactGetItems(w http.ResponseWriter, r *http.Request
 		d.observeReadMetrics(r.Context(), table, m.found, m.requested)
 	}
 	writeDynamoJSON(w, map[string]any{"Responses": responses})
+}
+
+func (d *DynamoDBServer) fencedTransactGetReadTS(ctx context.Context, groupKeys [][]byte) (uint64, error) {
+	if len(groupKeys) == 0 {
+		// Validation will fail before a store read for malformed requests.
+		return d.nextTxnReadTS(), nil
+	}
+	fenceCtx, cancel := context.WithTimeout(ctx, dynamoLeaseReadTimeout)
+	defer cancel()
+	var (
+		readTS uint64
+		err    error
+	)
+	if floor, ok := d.store.(keyedCommittedTimestampFloorProvider); ok {
+		readTS, err = floor.CommittedTimestampFloorForKeys(fenceCtx, groupKeys)
+	} else if floor, ok := d.store.(committedTimestampFloorProvider); ok {
+		readTS, err = floor.GlobalCommittedTimestampFloor(fenceCtx)
+	} else {
+		_, err = d.coordinator.LinearizableRead(fenceCtx)
+		if err == nil {
+			readTS = d.nextTxnReadTS()
+		}
+	}
+	if readTS == 0 {
+		readTS = 1
+	}
+	return readTS, errors.WithStack(err)
 }
 
 func decodeTransactGetItemsInput(bodyReader io.Reader) (transactGetItemsInput, error) {

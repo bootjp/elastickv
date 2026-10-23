@@ -38,7 +38,7 @@ jobs:
       - name: Install netcat, graphviz and fuse3
         # fuse3 provides fusermount3 for the --filesystemMount nodes used by
         # the filesystem Jepsen workload.
-        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3 sqlite3 strace
       - name: Install Leiningen
         run: |
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
@@ -309,12 +309,46 @@ jobs:
             echo "FAILED modes: ${FAILED[*]}"
             exit 1
           fi
+      - name: Run SQLite Jepsen workload on FUSE
+        working-directory: jepsen
+        timeout-minutes: 3
+        run: |
+          probe=/tmp/elastickv-ci/fs-n1/sqlite-probe.db
+          if ! strace -f -o /tmp/elastickv-sqlite.strace sqlite3 "$probe" \
+              'PRAGMA journal_mode=PERSIST; PRAGMA synchronous=FULL; CREATE TABLE probe (value INTEGER); INSERT INTO probe VALUES (1);'; then
+            tail -n 160 /tmp/elastickv-sqlite.strace
+            exit 1
+          fi
+          if ! strace -f -o /tmp/elastickv-sqlite.strace sqlite3 /tmp/elastickv-ci/fs-n2/sqlite-probe.db \
+              'PRAGMA journal_mode=PERSIST; PRAGMA synchronous=FULL; BEGIN IMMEDIATE; UPDATE probe SET value=2; COMMIT;'; then
+            tail -n 160 /tmp/elastickv-sqlite.strace
+            exit 1
+          fi
+          for node in 1 2 3; do
+            if ! actual=$(strace -f -o /tmp/elastickv-sqlite.strace sqlite3 -batch -noheader \
+                "/tmp/elastickv-ci/fs-n${node}/sqlite-probe.db" \
+                'PRAGMA journal_mode=PERSIST; SELECT value FROM probe;'); then
+              tail -n 160 /tmp/elastickv-sqlite.strace
+              exit 1
+            fi
+            if [[ "$actual" != $'persist\n2' ]]; then
+              printf 'SQLite probe on n%s: expected PERSIST mode and value 2, got %q\n' "$node" "$actual" >&2
+              tail -n 160 /tmp/elastickv-sqlite.strace
+              exit 1
+            fi
+          done
+          timeout 150 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit 5 --rate 5 --concurrency 6 \
+            --key-count 6 --max-writes-per-key 16 \
+            --mount-dirs /tmp/elastickv-ci/fs-n1,/tmp/elastickv-ci/fs-n2,/tmp/elastickv-ci/fs-n3
       - name: Upload Jepsen store on filesystem failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: jepsen-store-filesystem-encryption-${{ matrix.encryption }}
-          path: jepsen/store/elastickv-filesystem-register-*
+          path: |
+            jepsen/store/elastickv-filesystem-register-*
+            jepsen/store/elastickv-sqlite-register-*
           retention-days: 7
           if-no-files-found: ignore
       - name: Dump demo cluster logs on failure
