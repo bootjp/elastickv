@@ -44,3 +44,22 @@
       (finally
         (doseq [f (reverse (file-seq (io/file dir)))]
           (io/delete-file f true))))))
+
+(deftest sqlite-final-read-distinguishes-corruption-from-mount-failure
+  (let [dir (str (Files/createTempDirectory "elastickv-sqlite" (make-array FileAttribute 0)))
+        test (workload/elastickv-sqlite-test
+               {:local true :nodes ["n1"] :node->mount-dir {"n1" dir}
+                :concurrency 1 :key-count 1 :require-fuse-mount false})
+        c (client/open! (:client test) test "n1")
+        op {:f :read :value (independent/tuple 0 nil) :final true}]
+    (try
+      (client/setup! c test)
+      (spit (workload/database-path dir 0) "not a SQLite database")
+      (is (= (independent/tuple 0 :corrupt)
+             (:value (client/invoke! c test op))))
+      (with-redefs [workload/require-sqlite-mount!
+                   (fn [_ _] (throw (ex-info "mount unavailable" {})))]
+        (is (= :fail (:type (client/invoke! c test op)))))
+      (finally
+        (doseq [f (reverse (file-seq (io/file dir)))]
+          (io/delete-file f true))))))

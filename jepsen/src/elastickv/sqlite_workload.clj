@@ -9,8 +9,8 @@
             [elastickv.filesystem-workload :as fs]
             [jepsen.client :as client]
             [jepsen.independent :as independent])
-  (:import (java.nio.file Files LinkOption Paths)
-           (java.nio.file.attribute FileAttribute)))
+  (:import (java.nio.file Files LinkOption NoSuchFileException Paths)
+           (java.nio.file.attribute BasicFileAttributes FileAttribute)))
 
 (def sqlite-subdir "jepsen-sqlite")
 (def ^:const max-retries 32)
@@ -54,20 +54,33 @@
   ;; One worker owns each database. Retrying this idempotent value after an
   ;; ambiguous I/O error cannot overwrite a newer operation on that key.
   (with-sqlite-retries
-    #(sqlite! path (str "PRAGMA synchronous=FULL; BEGIN IMMEDIATE; "
+    #(sqlite! path (str "PRAGMA journal_mode=PERSIST; PRAGMA synchronous=FULL; "
+                        "BEGIN IMMEDIATE; "
                         "UPDATE register SET value=" (long v)
                         " WHERE id=1; COMMIT;"))))
 
 (defn read-value [path]
   ;; sqlite3 opens a missing path by creating a new empty database. Detect
   ;; loss before invoking it so a final read never repairs the evidence.
-  (when-not (Files/exists (Paths/get path (make-array String 0))
-                          (make-array LinkOption 0))
-    (throw (ex-info "SQLite database missing" {:path path})))
+  (try
+    (Files/readAttributes (Paths/get path (make-array String 0))
+                          BasicFileAttributes (make-array LinkOption 0))
+    (catch NoSuchFileException e
+      (throw (ex-info "SQLite database missing" {:path path :kind :missing} e))))
   (let [out (sqlite! path "SELECT value FROM register WHERE id=1;")]
     (when (str/blank? out)
-      (throw (ex-info "SQLite register row missing" {:path path})))
+      (throw (ex-info "SQLite register row missing" {:path path :kind :missing})))
     (Long/parseLong out)))
+
+(defn final-read-loss-kind [e]
+  (let [msg (.getMessage e)]
+    (cond
+      (= :missing (:kind (ex-data e))) :missing
+      (instance? NumberFormatException e) :corrupt
+      (some #(str/includes? msg %)
+            ["database disk image is malformed" "file is not a database"
+             "no such table: register" "database schema is corrupt"]) :corrupt
+      :else nil)))
 
 (defn require-sqlite-mount! [mount-dir require-fuse-mount]
   (when (or (and require-fuse-mount (not (fs/local-fuse-mount? mount-dir)))
@@ -76,7 +89,7 @@
                    (make-array LinkOption 0))))
     (throw (ex-info (str fs/mount-unavailable-message ": " mount-dir) {}))))
 
-(defrecord SQLiteClient [node->mount-dir key-count require-fuse-mount initialized node mount-dir]
+(defrecord SQLiteClient [node->mount-dir key-count require-fuse-mount initialized final-read-lock node mount-dir]
   client/Client
   (open! [this _test node]
     (assoc this :node node :mount-dir (or (get node->mount-dir node)
@@ -99,16 +112,15 @@
                  (catch Exception e
                    (assoc op :type :info :error (.getMessage e))))
         :read (try
-                (require-sqlite-mount! mount-dir require-fuse-mount)
-                (assoc op :type :ok :value
-                       (independent/tuple k (with-sqlite-retries #(read-value path))))
+                (let [read! (fn [] (require-sqlite-mount! mount-dir require-fuse-mount)
+                              (with-sqlite-retries #(read-value path)))
+                      value (if (:final op)
+                              (locking final-read-lock (read!))
+                              (read!))]
+                  (assoc op :type :ok :value (independent/tuple k value)))
                 (catch Exception e
-                  (if (and (:final op)
-                           (or (not (Files/exists (Paths/get path (make-array String 0))
-                                                  (make-array LinkOption 0)))
-                               (str/includes? (.getMessage e) "row missing")))
-                    (assoc op :type :ok :value (independent/tuple k :missing)
-                           :error (.getMessage e))
+                  (if-let [kind (and (:final op) (final-read-loss-kind e))]
+                    (assoc op :type :ok :value (independent/tuple k kind) :error (.getMessage e))
                     (assoc op :type :fail :error (.getMessage e)))))))))
 
 (defn elastickv-sqlite-test
@@ -124,7 +136,7 @@
             :client (->SQLiteClient (:node->mount-dir base) key-count
                                     (if (contains? opts :require-fuse-mount)
                                       (:require-fuse-mount opts) true)
-                                    (atom false) nil nil)))))
+                                    (atom false) (Object.) nil nil)))))
 
 (def sqlite-cli-opts
   (vec (remove #(= "--write-mode MODE" (second %)) fs/cli-opts)))

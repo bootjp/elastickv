@@ -330,12 +330,22 @@ jobs:
         run: |
           # Knossos checks each register independently. Bound each history's
           # ambiguous writes while keeping the requested total write budget.
-          if [[ ! "$FS_REQUESTED_KEYS" =~ ^[1-9][0-9]*$ || ! "$FS_REQUESTED_WRITES" =~ ^[1-9][0-9]*$ ]]; then
-            echo "key-count and max-writes-per-key must be positive integers" >&2
+          valid_java_positive_int() {
+            [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 1
+            [[ ${#1} -lt 10 ]] && return 0
+            [[ ${#1} -eq 10 ]] || return 1
+            (( 10#$1 <= 2147483647 ))
+          }
+          if ! valid_java_positive_int "$FS_REQUESTED_KEYS" || ! valid_java_positive_int "$FS_REQUESTED_WRITES"; then
+            echo "key-count and max-writes-per-key must be positive 32-bit integers" >&2
             exit 1
           fi
           FS_MAX_WRITES=$((FS_REQUESTED_WRITES < 64 ? FS_REQUESTED_WRITES : 64))
           FS_KEY_COUNT=$(((FS_REQUESTED_KEYS * FS_REQUESTED_WRITES + FS_MAX_WRITES - 1) / FS_MAX_WRITES))
+          if (( FS_KEY_COUNT > 2147483647 )); then
+            echo "calculated filesystem key count exceeds the 32-bit CLI limit" >&2
+            exit 1
+          fi
           echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
           declare -A RESULT
           FAILED=()
