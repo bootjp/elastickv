@@ -37,10 +37,11 @@ Short imperative summary with an optional scope prefix matching the touched area
 
 ### Developer Certificate of Origin
 
-Every commit submitted in a pull request must include a `Signed-off-by` trailer
-with the commit author's name and email, certifying the [DCO 1.1](DCO). This
-applies to maintainers, bots, and merge commits within the PR. Existing commits
-already on the target branch are outside the check.
+Sign off your commits with a `Signed-off-by` trailer containing the commit
+author's name and email, certifying the [DCO 1.1](DCO). This also applies to the
+repository owner and maintainers. The [Probot DCO App](https://probot.github.io/apps/dco/)
+checks pull requests; its standard behavior excludes bot and merge commits.
+Existing commits already on the target branch are outside the check.
 
 Read the DCO before signing off. Configure your own Git identity, then use:
 
@@ -54,7 +55,7 @@ Git adds a trailer using your committer identity:
 Signed-off-by: Your Name <your-email@example.com>
 ```
 
-Your author and sign-off identities must match exactly. When applying another
+Your author and sign-off identities must match. When applying another
 person's commit, preserve their author and existing sign-off; your own sign-off
 alone does not certify their authorship. A DCO sign-off is separate from a GPG
 or SSH commit signature; a verified signature alone does not satisfy this check.
@@ -71,17 +72,17 @@ mark each unsigned commit as `edit`, amend it with `--signoff`, and continue wit
 amending an already-pushed branch, use `git push --force-with-lease`. Do not add
 another contributor's sign-off on their behalf.
 
-The `DCO` workflow checks all commits in the event's `base..head` range, including
-unsigned earlier commits even when the latest commit is signed off. Check the
-same range locally with:
+The App reports a `DCO` check on the PR. Configuration in `.github/dco.yml`
+requires sign-offs from repository members and disables both individual and
+third-party remediation commits. Repair the unsigned commits themselves;
+signing off only the latest commit does not fix earlier unsigned commits.
+The App reads this configuration from the default branch after it is merged.
 
-```bash
-python3 scripts/check-dco.py origin/main HEAD
-```
-
-Renovate uses `:gitSignOff` to sign off its dependency updates. After this
-workflow is merged, add `DCO` as a required status check in branch protection or
-the repository ruleset to block merges when it fails.
+Renovate uses `:gitSignOff` to sign off its dependency updates, even though the
+App skips bot commits. Install the [DCO App](https://github.com/apps/dco) for
+`bootjp/elastickv`, then make its `DCO` check required in branch protection or
+the repository ruleset, selecting the DCO App as the expected source. No custom
+GitHub Actions workflow is needed. See the [App's required-check setup](https://github.com/dcoapp/app/blob/main/docs/required-statuses.md).
 
 ## Issues
 
