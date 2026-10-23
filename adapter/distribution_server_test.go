@@ -3083,8 +3083,8 @@ func TestDistributionServerRunSplitJobRunnerOnce_CompletesCrossGroupMigration(t 
 	}
 	require.Equal(t, len(completed.TransferPreflightProgress), preflightExports)
 	require.Len(t, target.imports, len(source.exports)-preflightExports)
-	require.GreaterOrEqual(t, len(source.events), 2)
-	require.Equal(t, []string{"control", "timestamp"}, source.events[:2], "the tracker barrier must precede snapshot timestamp selection")
+	require.GreaterOrEqual(t, len(source.events), 4)
+	require.Equal(t, []string{"control", "guard", "locks", "timestamp"}, source.events[:4], "tracker and transfer guard barriers must precede lock drain and snapshot timestamp selection")
 
 	finalSnapshot, err := catalog.Snapshot(ctx)
 	require.NoError(t, err)

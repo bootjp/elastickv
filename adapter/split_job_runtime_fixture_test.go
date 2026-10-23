@@ -5,8 +5,11 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 )
@@ -18,8 +21,17 @@ type splitRuntimeClient struct {
 }
 
 func (c *splitRuntimeClient) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest, opts ...grpc.CallOption) (*pb.TargetStagedReadinessResponse, error) {
-	c.events = append(c.events, "control")
+	event := "control"
+	if req.GetTransferSizeGuardVersion() != 0 {
+		event = "guard"
+	}
+	c.events = append(c.events, event)
 	return c.ownershipRuntimeClient.ApplyTargetStagedReadiness(ctx, req, opts...)
+}
+
+func (c *splitRuntimeClient) ProbeMigrationLocks(ctx context.Context, req *pb.ProbeMigrationLocksRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationLocksResponse, error) {
+	c.events = append(c.events, "locks")
+	return c.internal.ProbeMigrationLocks(ctx, req)
 }
 
 func (c *splitRuntimeClient) ExportRangeVersions(ctx context.Context, req *pb.ExportRangeVersionsRequest, _ ...grpc.CallOption) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error) {
@@ -48,11 +60,31 @@ func newSplitRuntimeClient(t *testing.T, engine *distribution.Engine, st store.M
 	client.internal.routeEngine = engine
 	client.internal.migrationImportGate = func(context.Context) error { return nil }
 	client.internal.migrationPromoteGate = func(context.Context) error { return nil }
+	client.internal.transferSizeReady = func() bool { return true }
+	client.internal.migrationPartitionProtocolReady = func() bool { return true }
+	tx := kv.NewTransactionWithProposer(client.internal.migrationProposer, kv.WithMigrationRequestAdmission(st, groupID))
+	t.Cleanup(tx.Close)
+	client.internal.transactionManager = tx
 	return &splitRuntimeClient{ownershipRuntimeClient: client}
 }
 
 func splitRuntimeOptions(source, target *splitRuntimeClient, sourceGroupID uint64) []DistributionServerOption {
 	return []DistributionServerOption{
+		WithSplitMigrationApplyMemberSnapshotFactory(func(_ context.Context, groupID uint64) (SplitMigrationApplyMemberSnapshot, error) {
+			client := target
+			if groupID == sourceGroupID {
+				client = source
+			}
+			reader, ok := client.internal.leader.(raftengine.AppliedConfigurationReader)
+			if !ok {
+				return SplitMigrationApplyMemberSnapshot{}, errors.New("runtime fixture lacks applied configuration reader")
+			}
+			index, supported := reader.AppliedConfigurationIndex()
+			if !supported {
+				return SplitMigrationApplyMemberSnapshot{}, errors.New("runtime fixture configuration is unsupported")
+			}
+			return SplitMigrationApplyMemberSnapshot{ConfigurationIndex: index, Members: []SplitMigrationVoter{{ID: "voter", Address: "voter:1", Client: client}}}, nil
+		}),
 		WithSplitMigrationClientFactory(func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
 			return source, target, nil
 		}),

@@ -910,6 +910,11 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
+		adapter.WithSplitMigrationApplyMemberSnapshotFactory(splitMigrationApplyMemberSnapshotFactory(
+			in.shardGroups,
+			splitMigrationConnCache,
+			auth.migrationToken,
+		)),
 		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(
 			splitMigrationGroupLeaderResolver(in.shardGroups),
 			splitMigrationConnCache,

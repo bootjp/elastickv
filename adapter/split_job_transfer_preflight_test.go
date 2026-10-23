@@ -13,11 +13,32 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/status"
+	"google.golang.org/protobuf/proto"
 )
 
 type transferSourceClient struct {
 	splitMigrationClientStub
 	exportFn func(context.Context, *pb.ExportRangeVersionsRequest) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error)
+}
+
+func (c *transferSourceClient) ApplyTargetStagedReadiness(ctx context.Context, req *pb.TargetStagedReadinessRequest, opts ...grpc.CallOption) (*pb.TargetStagedReadinessResponse, error) {
+	cloned := proto.CloneOf(req)
+	if len(c.controls) != 0 {
+		current := c.controls[len(c.controls)-1]
+		cloned.TransferSizeGuardVersion = max(cloned.GetTransferSizeGuardVersion(), current.GetTransferSizeGuardVersion())
+		cloned.SourceWriteFence = cloned.GetSourceWriteFence() || current.GetSourceWriteFence()
+		cloned.SourceReadFence = cloned.GetSourceReadFence() || current.GetSourceReadFence()
+		cloned.MinWriteTsExclusive = max(cloned.GetMinWriteTsExclusive(), current.GetMinWriteTsExclusive())
+	}
+	if cloned.GetTransferSizeGuardVersion() != 0 {
+		c.events = append(c.events, "guard")
+	}
+	return c.splitMigrationClientStub.ApplyTargetStagedReadiness(ctx, cloned, opts...)
+}
+
+func (c *transferSourceClient) ProbeMigrationLocks(ctx context.Context, req *pb.ProbeMigrationLocksRequest, opts ...grpc.CallOption) (*pb.ProbeMigrationLocksResponse, error) {
+	c.events = append(c.events, "locks")
+	return c.splitMigrationClientStub.ProbeMigrationLocks(ctx, req, opts...)
 }
 
 func (c *transferSourceClient) ExportRangeVersions(ctx context.Context, req *pb.ExportRangeVersionsRequest, opts ...grpc.CallOption) (grpc.ServerStreamingClient[pb.ExportRangeVersionsResponse], error) {
@@ -38,6 +59,7 @@ func transferPreflightFixture(t *testing.T) (context.Context, *DistributionServe
 	server.splitMigrationClientFactory = func(context.Context, distribution.SplitJob, uint64) (SplitMigrationClient, SplitMigrationClient, error) {
 		return source, target, nil
 	}
+	installTransferPhaseFixture(t, server, next, source)
 	return ctx, server, catalog, next, source
 }
 
@@ -77,7 +99,11 @@ func TestTransferPreflightPersistsEveryFamilyBeforeFence(t *testing.T) {
 		require.Equal(t, job.TransferPreflightTS, req.GetMaxCommitTs())
 		require.Equal(t, uint32(defaultSplitMigrationChunkBytes), req.GetChunkBytes())
 	}
-	require.Empty(t, source.controls, "preflight must not install a source write fence")
+	require.NotEmpty(t, source.controls)
+	for _, control := range source.controls {
+		require.False(t, control.GetSourceWriteFence(), "preflight must not install a source write fence")
+		require.Equal(t, uint32(1), control.GetTransferSizeGuardVersion())
+	}
 	require.NoError(t, server.finalizeSplitJobFence(ctx, job))
 	job = loadTransferJob(t, ctx, catalog, job.JobID)
 	require.Equal(t, distribution.SplitJobPhaseDeltaCopy, job.Phase)
@@ -266,8 +292,8 @@ func TestTransferPreflightRaceAfterCompletionAutoAbandonsDelta(t *testing.T) {
 	}
 	require.True(t, job.TransferPreflightDone)
 	require.Equal(t, distribution.SplitJobPhaseFence, job.Phase)
-	// A normal write after preflight is not refused. It must instead fail the
-	// later delta export and enter durable compensation before owner cutover.
+	// Inject an old authenticated prepared resolution after preflight. The guard
+	// must not impose a retroactive limit; delta export still compensates it.
 	require.NoError(t, data.PutAt(ctx, []byte("n"), make([]byte, store.MigrationPagePayloadBudget+(1<<19)), 150, 0))
 	source.nextTS = 200
 	require.NoError(t, server.finalizeSplitJobFence(ctx, job))

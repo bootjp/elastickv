@@ -27,8 +27,12 @@ func (s *DistributionServer) preflightSplitJobTransfer(ctx context.Context, job 
 	if err != nil {
 		return false, err
 	}
+	witness, err := s.ensureSplitJobTransferPhase(ctx, job, source, nil)
+	if err != nil {
+		return false, err
+	}
 	if job.TransferPreflightVersion == 0 {
-		return false, s.initializeSplitTransferPreflight(ctx, job, source, brackets)
+		return false, s.initializeSplitTransferPreflight(ctx, job, source, brackets, witness)
 	}
 	if err := validateSplitTransferPreflight(job, brackets); err != nil {
 		return false, err
@@ -38,15 +42,15 @@ func (s *DistributionServer) preflightSplitJobTransfer(ctx context.Context, job 
 	}
 	for index, progress := range job.TransferPreflightProgress {
 		if !progress.Done {
-			return false, s.preflightSplitTransferPage(ctx, job, source, route.End, brackets[index], index)
+			return false, s.preflightSplitTransferPage(ctx, job, source, route.End, brackets[index], index, witness)
 		}
 	}
 	next := distribution.CloneSplitJob(job)
 	next.TransferPreflightDone = true
-	return false, s.persistSplitTransferPreflight(ctx, job, next)
+	return false, s.persistSplitTransferPreflight(ctx, job, next, witness)
 }
 
-func (s *DistributionServer) initializeSplitTransferPreflight(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, brackets []distribution.MigrationBracket) error {
+func (s *DistributionServer) initializeSplitTransferPreflight(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, brackets []distribution.MigrationBracket, witness *splitTransferAdmissionWitness) error {
 	issued, err := issueSplitMigrationTimestamp(ctx, source)
 	if err != nil {
 		return err
@@ -59,7 +63,7 @@ func (s *DistributionServer) initializeSplitTransferPreflight(ctx context.Contex
 	next.TransferPreflightTS = issued.GetTimestamp()
 	next.TransferPreflightProgress = distribution.SplitJobBracketProgressForPlan(brackets, distribution.SplitJobExportPhaseBackfill)
 	next.TransferPreflightDone = false
-	return s.persistSplitTransferPreflight(ctx, job, next)
+	return s.persistSplitTransferPreflight(ctx, job, next, witness)
 }
 
 func validateSplitTransferPreflight(job distribution.SplitJob, brackets []distribution.MigrationBracket) error {
@@ -76,7 +80,7 @@ func validateSplitTransferPreflight(job distribution.SplitJob, brackets []distri
 	return nil
 }
 
-func (s *DistributionServer) preflightSplitTransferPage(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, routeEnd []byte, bracket distribution.MigrationBracket, index int) error {
+func (s *DistributionServer) preflightSplitTransferPage(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, routeEnd []byte, bracket distribution.MigrationBracket, index int, witness *splitTransferAdmissionWitness) error {
 	progress := job.TransferPreflightProgress[index]
 	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
 	defer cancel()
@@ -109,10 +113,13 @@ func (s *DistributionServer) preflightSplitTransferPage(ctx context.Context, job
 		next.TransferPreflightProgress[index].Cursor = nil
 	}
 	next.TransferPreflightProgress[index].AcceptedRows += uint64(len(resp.GetVersions()))
-	return s.persistSplitTransferPreflight(ctx, job, next)
+	return s.persistSplitTransferPreflight(ctx, job, next, witness)
 }
 
-func (s *DistributionServer) persistSplitTransferPreflight(ctx context.Context, expected, next distribution.SplitJob) error {
+func (s *DistributionServer) persistSplitTransferPreflight(ctx context.Context, expected, next distribution.SplitJob, witness *splitTransferAdmissionWitness) error {
+	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
+		return err
+	}
 	return s.updateSplitJobViaCoordinator(ctx, expected.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if !distribution.SplitJobsEquivalent(current, expected) {
 			return current, nil

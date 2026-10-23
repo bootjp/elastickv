@@ -1304,6 +1304,10 @@ func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job dist
 	if !complete {
 		return s.persistSplitJobBackfillAck(ctx, job.JobID, ackCursor)
 	}
+	witness, err := s.ensureSplitJobTransferPhase(ctx, job, source, ackCursor)
+	if err != nil {
+		return err
+	}
 	// PREPARE entries predating the tracker may still carry large values.
 	// Let them commit without imposing a retroactive limit, then choose the
 	// snapshot so backfill detects every such row before any source fence.
@@ -1311,7 +1315,7 @@ func (s *DistributionServer) beginSplitJobBackfill(ctx context.Context, job dist
 	if err != nil || pending {
 		return err
 	}
-	return s.openSplitJobBackfill(ctx, job, source)
+	return s.openSplitJobBackfill(ctx, job, source, witness)
 }
 
 const initialMigrationRetentionPinTS = uint64(1)
@@ -1335,7 +1339,10 @@ func (s *DistributionServer) persistSplitJobBackfillAck(ctx context.Context, job
 	})
 }
 
-func (s *DistributionServer) openSplitJobBackfill(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient) error {
+func (s *DistributionServer) openSplitJobBackfill(ctx context.Context, job distribution.SplitJob, source SplitMigrationClient, witness *splitTransferAdmissionWitness) error {
+	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
+		return err
+	}
 	issued, err := issueSplitMigrationTimestamp(ctx, source)
 	if err != nil {
 		return errors.WithStack(err)
@@ -1343,6 +1350,9 @@ func (s *DistributionServer) openSplitJobBackfill(ctx context.Context, job distr
 	snapshotTS := issued.GetTimestamp()
 	if snapshotTS == 0 || snapshotTS <= issued.GetLastCommitTs() {
 		return errors.New("split migration source issued an invalid snapshot timestamp")
+	}
+	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
+		return err
 	}
 	return s.updateSplitJobViaCoordinator(ctx, job.JobID, func(current distribution.SplitJob) (distribution.SplitJob, error) {
 		if current.Phase != distribution.SplitJobPhasePlanned {
@@ -1372,12 +1382,19 @@ func (s *DistributionServer) copySplitJobPhase(
 	if err != nil {
 		return err
 	}
+	witness, err := s.ensureSplitJobTransferPhase(ctx, job, nil, nil)
+	if err != nil {
+		return err
+	}
 	brackets, err := distribution.PlanExportBrackets(job.SplitKey, sourceRoute.End)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	progressIndex, bracket, ok := nextSplitJobBracket(job, brackets, exportPhase)
 	if !ok {
+		if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
+			return err
+		}
 		return s.advanceCompletedCopyPhase(ctx, job, exportPhase)
 	}
 	source, target, err := s.splitMigrationClientFactory(ctx, job, sourceRoute.GroupID)
@@ -1386,6 +1403,9 @@ func (s *DistributionServer) copySplitJobPhase(
 	}
 	if source == nil || target == nil {
 		return errors.New("split migration source or target client is nil")
+	}
+	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
+		return err
 	}
 	progress := job.BracketProgress[progressIndex]
 	attemptCtx, cancel := context.WithTimeout(ctx, defaultSplitMigrationAttemptTimeout)
@@ -1593,6 +1613,9 @@ func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job dist
 	if err != nil {
 		return err
 	}
+	if _, err := s.ensureSplitJobTransferPhase(ctx, job, nil, nil); err != nil {
+		return err
+	}
 	snapshot, sourceRoute, err = s.ensureSplitJobCatalogFence(ctx, job, snapshot, sourceRoute)
 	if err != nil {
 		return err
@@ -1604,12 +1627,19 @@ func (s *DistributionServer) finalizeSplitJobFence(ctx context.Context, job dist
 	if !complete {
 		return s.persistSplitJobFenceAck(ctx, job.JobID, ackCursor)
 	}
+	witness, err := s.ensureSplitJobTransferPhase(ctx, job, source, nil)
+	if err != nil {
+		return err
+	}
 	issued, err := issueSplitMigrationTimestamp(ctx, source)
 	if err != nil {
 		return errors.WithStack(err)
 	}
 	if issued.GetTimestamp() == 0 || issued.GetTimestamp() <= issued.GetLastCommitTs() {
 		return errors.New("split migration source issued an invalid fence timestamp")
+	}
+	if err := s.revalidateSplitTransferAdmission(ctx, witness); err != nil {
+		return err
 	}
 	return s.commitSplitJobFenceState(ctx, job, snapshot.Version, minAdmittedTS, ackCursor, issued.GetTimestamp())
 }
