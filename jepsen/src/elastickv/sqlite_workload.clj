@@ -67,10 +67,14 @@
                           BasicFileAttributes (make-array LinkOption 0))
     (catch NoSuchFileException e
       (throw (ex-info "SQLite database missing" {:path path :kind :missing} e))))
-  (let [out (sqlite! path "SELECT value FROM register WHERE id=1;")]
-    (when (str/blank? out)
+  (let [out (sqlite! path (str "PRAGMA journal_mode=PERSIST; "
+                               "SELECT value FROM register WHERE id=1;"))
+        [mode value] (str/split-lines out)]
+    (when-not (= "persist" mode)
+      (throw (ex-info "SQLite PERSIST journal mode unavailable" {:path path :mode mode})))
+    (when (str/blank? value)
       (throw (ex-info "SQLite register row missing" {:path path :kind :missing})))
-    (Long/parseLong out)))
+    (Long/parseLong value)))
 
 (defn final-read-loss-kind [e]
   (let [msg (.getMessage e)]
