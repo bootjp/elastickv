@@ -14,8 +14,9 @@ func MigrationConfigurationIndexKey() []byte {
 	return []byte("!txn|meta|migration_configuration_index")
 }
 
-// Only the unpublished external-restore tempDB is writable here. An exact
-// decoded-key comparison preserves adjacent logical keys sharing this prefix.
+// Only the unpublished external-restore tempDB is writable here. Remove the
+// source Raft watermark as well: it cannot suppress destination Raft writes.
+// An exact decoded-key comparison preserves adjacent logical keys.
 func sanitizeExternalConfigurationEpoch(ctx context.Context, db *pebble.DB) error {
 	key := MigrationConfigurationIndexKey()
 	iter, err := db.NewIter(&pebble.IterOptions{LowerBound: key, UpperBound: PrefixScanEnd(key)})
@@ -44,6 +45,9 @@ func sanitizeExternalConfigurationEpoch(ctx context.Context, db *pebble.DB) erro
 	}
 	if err := errors.Join(errors.WithStack(iter.Error()), errors.WithStack(ctx.Err())); err != nil {
 		return err
+	}
+	if err := batch.Delete(metaAppliedIndexBytes, nil); err != nil {
+		return errors.WithStack(err)
 	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
 }

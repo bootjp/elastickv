@@ -616,6 +616,13 @@ func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader, validate func(st
 	if err := validateRestoreTempDB(tmpDir, validate); err != nil {
 		return err
 	}
+	if validate != nil {
+		// External validation removes the source lineage's Raft watermark.
+		// Ingest verified the original manifest before this rebasing step;
+		// publication must verify its absence, not restore the source index.
+		metadata.AppliedIndex = 0
+		metadata.AppliedIndexPresent = false
+	}
 	return s.swapInTempDBWithMetadata(tmpDir, &metadata)
 }
 

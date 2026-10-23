@@ -710,6 +710,15 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
 	}
+	if prepared.disk.ExternalRestoreValidated {
+		// External preparation seeded this destination ConfState at this index.
+		// Bind only after store validation and RawNode restoration succeed; never
+		// reuse an imported epoch or a later native snapshot's data index.
+		if err := engine.recordFSMConfiguration(prepared.disk.LocalSnap.GetMetadata().GetIndex()); err != nil {
+			_ = closePersist(prepared.disk.Persist)
+			return nil, errors.Wrap(err, "bind external restore destination configuration")
+		}
+	}
 	if err := completeExternalRestoreOrigin(prepared.cfg.DataDir, prepared.disk.ExternalRestoreValidated); err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
