@@ -44,6 +44,7 @@ type DistributionServer struct {
 	splitMigrationClientFactory SplitMigrationClientFactory
 	splitMigrationGroupFactory  SplitMigrationGroupClientFactory
 	splitMigrationVoterFactory  SplitMigrationVoterFactory
+	splitApplyMemberFactory     SplitMigrationApplyMemberSnapshotFactory
 	ownershipRefresh            *migrationOwnershipRefresh
 	knownRaftGroups             map[uint64]struct{}
 	splitJobHistoryGCLast       time.Time
