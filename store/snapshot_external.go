@@ -65,11 +65,8 @@ func validateExternalMVCCTree(ctx context.Context, tree *treemap.Map, meta mvccS
 			return errors.WithStack(err)
 		}
 		key, _ := iter.Key().([]byte)
-		versions, _ := iter.Value().([]VersionedValue)
-		for _, version := range versions {
-			if err := validateExternalMigrationRow(key, version.Value); err != nil {
-				return err
-			}
+		if err := validateExternalTypedMigrationKey(key); err != nil {
+			return err
 		}
 	}
 	if err := ctx.Err(); err != nil {
@@ -124,16 +121,9 @@ func validateExternalPebbleRow(key, value []byte) error {
 	if userKey == nil {
 		return errors.New("invalid external snapshot MVCC key")
 	}
-	if isMigrationMetadataKey(userKey) {
-		decoded, err := decodeValue(value)
-		if err != nil {
-			return err
-		}
-		return validateExternalMigrationRow(userKey, decoded.Value)
-	}
-	// Typed control namespaces are reserved regardless of their row payload.
-	// Other user values need not be decrypted or scanned for metadata strings.
-	return validateExternalMigrationRow(userKey, nil)
+	// Decoded MVCC keys are logical keys, not the raw metadata namespace.
+	// In particular, _migack/_mighlc/_migpromote remain ordinary user keys.
+	return validateExternalTypedMigrationKey(userKey)
 }
 
 func validateExternalMigrationRow(key, value []byte) error {
@@ -175,10 +165,9 @@ func externalMigrationCollection(size int, valid bool) error {
 }
 
 func validateExternalTypedMigrationKey(key []byte) error {
-	// These are the typed-only namespaces in distribution.migrationOnlyControlPrefixes.
-	// store cannot import distribution; tracker/fence state otherwise lives in
-	// decoded TargetStagedReadinessState fields, not a separate row codec.
-	for _, prefix := range []string{"!dist|migstage|", "!migwrite|", "!migfence|"} {
+	// Keep these logical-key guards aligned with distribution's migration-only
+	// control namespaces. Raw store metadata is decoded separately above.
+	for _, prefix := range []string{"!dist|migstage|", "!migstage|", "!migwrite|", "!migfence|"} {
 		if bytes.HasPrefix(key, []byte(prefix)) {
 			return errors.WithStack(ErrExternalSnapshotMigrationState)
 		}
