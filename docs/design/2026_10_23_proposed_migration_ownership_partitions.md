@@ -150,6 +150,9 @@ activation. New migration mutation RPCs require the marker; the strictly typed
 namespace activation control is the only bootstrap exception.
 Activation uses the bounded cleanup RPC attempt, never the runner's process
 lifetime alone. Parent cancellation and an earlier parent deadline are retained.
+After activation, supported peers at the matching configuration may still await
+the entry. Their incomplete ACK is retryable without consuming the phase failure
+budget; unsupported versions or mismatched configurations remain refused.
 
 Forwarded admin proposals use an exact typed allowlist for existing backup and
 PREPARE-evidence controls. Migration, encrypted, user and malformed payloads

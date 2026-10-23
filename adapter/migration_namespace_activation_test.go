@@ -191,7 +191,14 @@ func TestNamespaceAdmissionActiveGroupStillRequiresFinalACK(t *testing.T) {
 				t.Fatal("active group must not propose")
 				return nil
 			}
-			require.ErrorIs(t, EnsureMigrationNamespaceAdmissionWithSnapshot(t.Context(), snapshot, activate, nil), kv.ErrMigrationNamespaceProtocol)
+			err := EnsureMigrationNamespaceAdmissionWithSnapshot(t.Context(), snapshot, activate, nil)
+			if failure == "ready" {
+				require.ErrorIs(t, err, errSplitMigrationVoterBarrierIncomplete)
+				require.True(t, splitJobPhaseErrorRetryable(err))
+			} else {
+				require.ErrorIs(t, err, kv.ErrMigrationNamespaceProtocol)
+				require.False(t, splitJobPhaseErrorRetryable(err))
+			}
 			require.Equal(t, 2, probes)
 			require.Equal(t, 1, clients[0].proposals)
 		})

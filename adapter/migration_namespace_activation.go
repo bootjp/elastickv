@@ -173,8 +173,11 @@ func probeNamespacePeer(ctx context.Context, member NamespaceAdmissionPeer, conf
 		return nil, errors.Wrapf(err, "namespace member %d", member.MemberID)
 	}
 	if response.GetNamespaceAdmissionVersion() < kv.MigrationNamespaceVersion ||
-		(configuration != 0 && response.GetAppliedConfigurationIndex() != configuration) || (activated && !response.GetReady()) {
+		(configuration != 0 && response.GetAppliedConfigurationIndex() != configuration) {
 		return nil, errors.Wrapf(kv.ErrMigrationNamespaceProtocol, "namespace member %d support/configuration/activation unproven", member.MemberID)
+	}
+	if activated && !response.GetReady() {
+		return nil, errors.Wrapf(errSplitMigrationVoterBarrierIncomplete, "namespace member %d awaits activation ACK", member.MemberID)
 	}
 	return response, nil
 }
