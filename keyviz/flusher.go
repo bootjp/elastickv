@@ -26,11 +26,19 @@ func RunFlusher(ctx context.Context, s *MemSampler, step time.Duration) {
 	}
 	t := time.NewTicker(step)
 	defer t.Stop()
+	runFlusherTicks(ctx, s, t.C)
+}
+
+// runFlusherTicks is the RunFlusher loop with the tick source injected,
+// so tests can drive exact window boundaries instead of racing a
+// wall-clock ticker. Each received time closes the window that started
+// at the previous boundary.
+func runFlusherTicks(ctx context.Context, s *MemSampler, ticks <-chan time.Time) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case at := <-t.C:
+		case at := <-ticks:
 			if !s.flushWindow(ctx, at) {
 				return
 			}
