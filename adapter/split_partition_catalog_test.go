@@ -1,12 +1,37 @@
 package adapter
 
 import (
+	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSplitPartitionManifestConflictDoesNotPublishRoutes(t *testing.T) {
+	t.Parallel()
+	s, version := seededDistributionServer(t)
+	before, err := s.catalog.Snapshot(t.Context())
+	require.NoError(t, err)
+	hash, err := distribution.OwnershipPartitionDescriptorHash(before.Routes[0])
+	require.NoError(t, err)
+	key, err := distribution.CatalogOwnershipPartitionKey(1, hash)
+	require.NoError(t, err)
+	coordinator, ok := s.coordinator.(*distributionCoordinatorStub)
+	require.True(t, ok)
+	coordinator.beforeApply = func(ctx context.Context, st store.MVCCStore) error {
+		return st.PutAt(ctx, key, []byte("conflicting ledger publication"), coordinator.lastCommitTS, 0)
+	}
+	_, err = s.SplitRange(t.Context(), &pb.SplitRangeRequest{RouteId: 1, SplitKey: []byte("g"), ExpectedCatalogVersion: version})
+	require.Error(t, err)
+	after, err := s.catalog.Snapshot(t.Context())
+	require.NoError(t, err)
+	require.Equal(t, before.Version, after.Version)
+	require.Equal(t, before.Routes, after.Routes)
+	requireReadKeysContain(t, coordinator.lastReadKeys, key)
+}
 
 func TestSplitRangeCommitsPartitionManifestWithRoutes(t *testing.T) {
 	t.Parallel()
