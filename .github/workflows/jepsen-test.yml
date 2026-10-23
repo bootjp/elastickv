@@ -325,8 +325,14 @@ jobs:
             exit 1
           fi
           for node in 1 2 3; do
-            if ! strace -f -o /tmp/elastickv-sqlite.strace sqlite3 "/tmp/elastickv-ci/fs-n${node}/sqlite-probe.db" \
-                'PRAGMA journal_mode=PERSIST; SELECT value FROM probe;'; then
+            if ! actual=$(strace -f -o /tmp/elastickv-sqlite.strace sqlite3 -batch -noheader \
+                "/tmp/elastickv-ci/fs-n${node}/sqlite-probe.db" \
+                'PRAGMA journal_mode=PERSIST; SELECT value FROM probe;'); then
+              tail -n 160 /tmp/elastickv-sqlite.strace
+              exit 1
+            fi
+            if [[ "$actual" != $'persist\n2' ]]; then
+              printf 'SQLite probe on n%s: expected PERSIST mode and value 2, got %q\n' "$node" "$actual" >&2
               tail -n 160 /tmp/elastickv-sqlite.strace
               exit 1
             fi
