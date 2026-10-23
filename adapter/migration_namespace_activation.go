@@ -59,7 +59,7 @@ func EnsureMigrationNamespaceAdmission(ctx context.Context, client SplitMigratio
 	activate := func(ctx context.Context, command kv.NamespaceAdmissionCommand) error {
 		request, err := kv.NewNamespaceAdmissionRequest(1, command)
 		if err != nil {
-			return err
+			return errors.WithStack(err)
 		}
 		_, err = client.CleanupMigration(ctx, request)
 		return errors.WithStack(err)
@@ -123,21 +123,31 @@ func namespaceNegotiation(ctx context.Context, snapshot NamespaceAdmissionSnapsh
 		command.ApplyMembers = append(command.ApplyMembers, member.MemberID)
 		command.Members = append(command.Members, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: snapshot.ConfigurationIndex})
 	}
+	var err error
+	command.Joining, err = probeNamespaceJoining(ctx, snapshot.ConfigurationIndex, joining, ids, addresses)
+	if err != nil {
+		return command, false, err
+	}
+	slices.Sort(command.ApplyMembers)
+	return command, alreadyActive, nil
+}
+
+func probeNamespaceJoining(ctx context.Context, configuration uint64, joining []NamespaceAdmissionPeer, ids map[uint64]bool, addresses map[string]bool) ([]kv.NamespaceMemberCapability, error) {
+	var capabilities []kv.NamespaceMemberCapability
 	for _, member := range joining {
 		if ids[member.MemberID] || addresses[member.Address] {
-			return command, false, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+			return nil, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 		}
 		// A candidate does not yet have a source-group configuration. Only its
 		// installed support is probed; authorization is bound to source cfg.
 		response, err := probeNamespacePeer(ctx, member, 0, false)
 		if err != nil {
-			return command, false, err
+			return nil, err
 		}
 		ids[member.MemberID], addresses[member.Address] = true, true
-		command.Joining = append(command.Joining, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: snapshot.ConfigurationIndex})
+		capabilities = append(capabilities, kv.NamespaceMemberCapability{MemberID: member.MemberID, Version: response.GetNamespaceAdmissionVersion(), ConfigurationIndex: configuration})
 	}
-	slices.Sort(command.ApplyMembers)
-	return command, alreadyActive, nil
+	return capabilities, nil
 }
 
 func probeNamespacePeer(ctx context.Context, member NamespaceAdmissionPeer, configuration uint64, activated bool) (*pb.ProbeMigrationStateResponse, error) {

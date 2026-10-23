@@ -706,24 +706,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.appliedIndex.Store(initialApplied)
-	if err := recoverNamespaceConfiguration(engine.fsm, prepared.disk.LocalSnap); err != nil {
-		_ = closePersist(prepared.disk.Persist)
-		return nil, errors.Wrap(err, "recover namespace configuration")
-	}
-	if err := engine.restorePendingConfChangeFenceFromStorage(rawNodeApplied); err != nil {
-		_ = closePersist(prepared.disk.Persist)
-		return nil, err
-	}
-	if prepared.disk.ExternalRestoreValidated {
-		// External preparation seeded this destination ConfState at this index.
-		// Bind only after store validation and RawNode restoration succeed; never
-		// reuse an imported epoch or a later native snapshot's data index.
-		if err := engine.recordFSMConfiguration(prepared.disk.LocalSnap.GetMetadata().GetIndex(), confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())); err != nil {
-			_ = closePersist(prepared.disk.Persist)
-			return nil, errors.Wrap(err, "bind external restore destination configuration")
-		}
-	}
-	if err := completeExternalRestoreOrigin(prepared.cfg.DataDir, prepared.disk.ExternalRestoreValidated); err != nil {
+	if err := engine.recoverOpenConfiguration(prepared, rawNodeApplied); err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
 	}
@@ -755,6 +738,24 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	opened = true
 	return openedEngine, nil
+}
+
+func (e *Engine) recoverOpenConfiguration(prepared preparedOpenState, rawNodeApplied uint64) error {
+	if err := recoverNamespaceConfiguration(e.fsm, prepared.disk.LocalSnap); err != nil {
+		return errors.Wrap(err, "recover namespace configuration")
+	}
+	if err := e.restorePendingConfChangeFenceFromStorage(rawNodeApplied); err != nil {
+		return err
+	}
+	if prepared.disk.ExternalRestoreValidated {
+		// External preparation seeded this destination ConfState at this index.
+		// Bind only after store validation and RawNode restoration succeed; never
+		// reuse an imported epoch or a later native snapshot's data index.
+		if err := e.recordFSMConfiguration(prepared.disk.LocalSnap.GetMetadata().GetIndex(), confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())); err != nil {
+			return errors.Wrap(err, "bind external restore destination configuration")
+		}
+	}
+	return completeExternalRestoreOrigin(prepared.cfg.DataDir, prepared.disk.ExternalRestoreValidated)
 }
 
 func (e *Engine) warnIfLeaseReadDisabled() {
@@ -2695,22 +2696,8 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	// Snapshot application is intentionally synchronous with the raft loop: the
 	// local FSM must reflect the incoming raft snapshot before Ready can advance
 	// and later committed entries can be applied safely.
-	if isSnapshotToken(snapshot.GetData()) {
-		tok, err := decodeSnapshotToken(snapshot.GetData())
-		if err != nil {
-			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.GetMetadata().GetIndex())
-		}
-		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
-			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
-		}
-	} else {
-		// Legacy format: full FSM payload in snapshot.Data.
-		if err := e.fsm.Restore(bytes.NewReader(snapshot.GetData())); err != nil {
-			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
-		}
-	}
-	if err := recoverNamespaceConfiguration(e.fsm, *snapshot); err != nil {
-		return errors.Wrap(err, "recover snapshot namespace configuration")
+	if err := e.restoreReadySnapshotFSM(snapshot); err != nil {
+		return err
 	}
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
@@ -2738,6 +2725,27 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 		return err
 	}
 	e.alarmIfJoinedAsVoter(confState)
+	return nil
+}
+
+func (e *Engine) restoreReadySnapshotFSM(snapshot *raftpb.Snapshot) error {
+	if isSnapshotToken(snapshot.GetData()) {
+		tok, err := decodeSnapshotToken(snapshot.GetData())
+		if err != nil {
+			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.GetMetadata().GetIndex())
+		}
+		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
+			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
+		}
+	} else {
+		// Legacy format: full FSM payload in snapshot.Data.
+		if err := e.fsm.Restore(bytes.NewReader(snapshot.GetData())); err != nil {
+			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
+		}
+	}
+	if err := recoverNamespaceConfiguration(e.fsm, *snapshot); err != nil {
+		return errors.Wrap(err, "recover snapshot namespace configuration")
+	}
 	return nil
 }
 

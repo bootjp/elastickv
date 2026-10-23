@@ -26,7 +26,11 @@ type namespaceGateEngine struct {
 func (e *namespaceGateEngine) ProposeAdmin(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	e.proposals++
 	e.index++
-	e.fsm.(raftengine.ApplyIndexAware).SetApplyIndex(e.index)
+	aware, ok := e.fsm.(raftengine.ApplyIndexAware)
+	if !ok {
+		return nil, kv.ErrMigrationNamespaceProtocol
+	}
+	aware.SetApplyIndex(e.index)
 	return &raftengine.ProposalResult{CommitIndex: e.index, Response: e.fsm.Apply(data)}, nil
 }
 func (e *namespaceGateEngine) Configuration(context.Context) (raftengine.Configuration, error) {
@@ -62,7 +66,9 @@ func newNamespaceGateFixture(t *testing.T, active bool) (*migrationNamespaceMemb
 	st := store.NewMVCCStore()
 	fsm := kv.NewKvFSMWithHLC(st, nil)
 	ids := []uint64{etcd.DeriveNodeID("n1"), etcd.DeriveNodeID("learner")}
-	require.NoError(t, fsm.(raftengine.NamespaceConfigurationAware).RecordAppliedNamespaceConfiguration(7, ids))
+	aware, ok := fsm.(raftengine.NamespaceConfigurationAware)
+	require.True(t, ok)
+	require.NoError(t, aware.RecordAppliedNamespaceConfiguration(7, ids))
 	engine := &namespaceGateEngine{store: st, fsm: fsm, index: 7, configuration: raftengine.Configuration{Servers: []raftengine.Server{{ID: "n1", Address: "n1:7001", Suffrage: "voter"}, {ID: "learner", Address: "learner:7001", Suffrage: "learner"}}}}
 	if active {
 		slices.Sort(ids)

@@ -740,23 +740,11 @@ func (i *Internal) ImportRangeVersions(ctx context.Context, req *pb.ImportRangeV
 	if err := validateImportRangeVersionsRequest(req); err != nil {
 		return nil, err
 	}
-	if i.migrationProposer == nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import proposer is not configured"))
-	}
-	if i.migrationImportGate == nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration import opcode gate is not configured"))
-	}
-	if err := i.verifyInternalLeader(ctx); err != nil {
+	if err := i.verifyMigrationImportProposal(ctx); err != nil {
 		return nil, err
 	}
-	if err := i.verifyMigrationImportEnabled(ctx); err != nil {
+	if err := i.requireMigrationNamespaceAdmission(ctx); err != nil {
 		return nil, err
-	}
-	if err := kv.RequireMigrationNamespaceAdmission(ctx, i.store); err != nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
-	}
-	if !i.MigrationNamespaceAdmissionSupported() {
-		return nil, errors.WithStack(errMigrationNamespaceAdmissionNotConfigured)
 	}
 	result, err := i.proposeMigrationImport(ctx, req)
 	if err != nil {
@@ -795,26 +783,14 @@ func (i *Internal) PromoteStagedVersions(ctx context.Context, req *pb.PromoteSta
 	if req.GetJobId() == 0 {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "promote staged versions job_id is required"))
 	}
-	if i.migrationProposer == nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote proposer is not configured"))
-	}
-	if i.migrationPromoteGate == nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "migration promote opcode gate is not configured"))
-	}
-	if err := i.verifyInternalLeader(ctx); err != nil {
-		return nil, err
-	}
-	if err := i.verifyMigrationPromoteEnabled(ctx); err != nil {
+	if err := i.verifyMigrationPromoteProposal(ctx); err != nil {
 		return nil, err
 	}
 	if err := validatePromoteStagedVersionsRequest(req); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if err := kv.RequireMigrationNamespaceAdmission(ctx, i.store); err != nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
-	}
-	if !i.MigrationNamespaceAdmissionSupported() {
-		return nil, errors.WithStack(errMigrationNamespaceAdmissionNotConfigured)
+	if err := i.requireMigrationNamespaceAdmission(ctx); err != nil {
+		return nil, err
 	}
 	result, err := i.proposeMigrationPromote(ctx, req)
 	if err != nil {
@@ -844,11 +820,8 @@ func (i *Internal) ApplyTargetStagedReadiness(ctx context.Context, req *pb.Targe
 	if err := i.verifyInternalLeader(ctx); err != nil {
 		return nil, err
 	}
-	if err := kv.RequireMigrationNamespaceAdmission(ctx, i.store); err != nil {
-		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, err.Error()))
-	}
-	if !i.MigrationNamespaceAdmissionSupported() {
-		return nil, errors.WithStack(errMigrationNamespaceAdmissionNotConfigured)
+	if err := i.requireMigrationNamespaceAdmission(ctx); err != nil {
+		return nil, err
 	}
 	if err := i.proposeTargetStagedReadiness(ctx, req); err != nil {
 		return nil, errors.WithStack(err)

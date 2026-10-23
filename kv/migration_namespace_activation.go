@@ -87,15 +87,8 @@ func ActivateMigrationNamespace(ctx context.Context, st store.MVCCStore, propose
 	if err != nil {
 		return err
 	}
-	result, err := proposer.ProposeAdmin(ctx, data)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	if result == nil {
-		return errors.WithStack(ErrMigrationNamespaceProtocol)
-	}
-	if err, ok := result.Response.(error); ok {
-		return errors.WithStack(err)
+	if err := proposeNamespaceAdmission(ctx, proposer, data); err != nil {
+		return err
 	}
 	if err := RequireMigrationNamespaceAdmission(ctx, st); err != nil {
 		return err
@@ -106,6 +99,20 @@ func ActivateMigrationNamespace(ctx context.Context, st store.MVCCStore, propose
 	}
 	if index != command.ConfigurationIndex {
 		return errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	return nil
+}
+
+func proposeNamespaceAdmission(ctx context.Context, proposer raftengine.Proposer, data []byte) error {
+	result, err := proposer.ProposeAdmin(ctx, data)
+	if err != nil {
+		return errors.WithStack(err)
+	}
+	if result == nil {
+		return errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	if err, ok := result.Response.(error); ok {
+		return errors.WithStack(err)
 	}
 	return nil
 }

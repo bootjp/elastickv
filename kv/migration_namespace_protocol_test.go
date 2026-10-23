@@ -43,25 +43,7 @@ func TestMigrationNamespaceActivationRequiresEveryApplyMember(t *testing.T) {
 			before, err := st.GetAt(t.Context(), migrationConfigurationIndexKey, ^uint64(0))
 			require.NoError(t, err)
 			require.Len(t, before, 8, "inactive records keep the old snapshot layout")
-			command := namespaceCommand(5, 1, 2, 3)
-			switch kind {
-			case "missing-learner":
-				command.Members = command.Members[:2]
-			case "old-member":
-				command.Members[2].Version = 0
-			case "wrong-member-config":
-				command.Members[2].ConfigurationIndex = 4
-			case "extra-member":
-				command.Members = append(command.Members, NamespaceMemberCapability{4, 1, 5})
-			case "duplicate":
-				command.Members[2] = command.Members[1]
-			case "wrong-roster":
-				command = namespaceCommand(5, 1, 2)
-			case "stale-config":
-				require.NoError(t, f.RecordAppliedNamespaceConfiguration(6, []uint64{1, 2, 3}))
-			case "zero-version":
-				command.Version = 0
-			}
+			command := namespaceActivationTestCommand(t, f, kind)
 			response := applyNamespaceCommand(t, f, 7, command)
 			if kind == "valid" {
 				require.Nil(t, response)
@@ -75,6 +57,30 @@ func TestMigrationNamespaceActivationRequiresEveryApplyMember(t *testing.T) {
 			require.ErrorIs(t, RequireMigrationNamespaceAdmission(t.Context(), st), ErrMigrationNamespaceProtocol)
 		})
 	}
+}
+
+func namespaceActivationTestCommand(t *testing.T, f *kvFSM, kind string) NamespaceAdmissionCommand {
+	t.Helper()
+	command := namespaceCommand(5, 1, 2, 3)
+	switch kind {
+	case "missing-learner":
+		command.Members = command.Members[:2]
+	case "old-member":
+		command.Members[2].Version = 0
+	case "wrong-member-config":
+		command.Members[2].ConfigurationIndex = 4
+	case "extra-member":
+		command.Members = append(command.Members, NamespaceMemberCapability{4, 1, 5})
+	case "duplicate":
+		command.Members[2] = command.Members[1]
+	case "wrong-roster":
+		command = namespaceCommand(5, 1, 2)
+	case "stale-config":
+		require.NoError(t, f.RecordAppliedNamespaceConfiguration(6, []uint64{1, 2, 3}))
+	case "zero-version":
+		command.Version = 0
+	}
+	return command
 }
 
 func TestMigrationNamespacePrejoinAndConfigurationMonotonicity(t *testing.T) {
@@ -100,7 +106,7 @@ func TestMigrationNamespacePrejoinAndConfigurationMonotonicity(t *testing.T) {
 func TestMigrationNamespaceActivationSnapshotRestartAndExternalRebase(t *testing.T) {
 	for _, backend := range []string{"mvcc", "pebble"} {
 		t.Run(backend, func(t *testing.T) {
-			var source store.MVCCStore = store.NewMVCCStore()
+			source := store.NewMVCCStore()
 			if backend == "pebble" {
 				var err error
 				source, err = store.NewPebbleStore(t.TempDir())
@@ -120,14 +126,17 @@ func TestMigrationNamespaceActivationSnapshotRestartAndExternalRebase(t *testing
 				target, err := store.NewPebbleStore(dir)
 				require.NoError(t, err)
 				if external {
-					require.NoError(t, target.(store.ExternalSnapshotRestorer).RestoreExternal(t.Context(), bytes.NewReader(raw.Bytes())))
+					restorer, ok := target.(store.ExternalSnapshotRestorer)
+					require.True(t, ok)
+					require.NoError(t, restorer.RestoreExternal(t.Context(), bytes.NewReader(raw.Bytes())))
 				} else {
 					require.NoError(t, target.Restore(bytes.NewReader(raw.Bytes())))
 				}
 				require.NoError(t, target.Close())
 				target, err = store.NewPebbleStore(dir)
 				require.NoError(t, err)
-				restored := NewKvFSMWithHLC(target, nil).(*kvFSM)
+				restored, ok := NewKvFSMWithHLC(target, nil).(*kvFSM)
+				require.True(t, ok)
 				if external {
 					require.Zero(t, restored.migrationNamespaceVersion.Load())
 					// The destination may reuse exactly the source configuration index.
@@ -146,7 +155,9 @@ func TestMigrationNamespaceActivationSnapshotRestartAndExternalRebase(t *testing
 			}
 			target := store.NewMVCCStore()
 			defer target.Close()
-			require.NoError(t, target.(store.ExternalSnapshotRestorer).RestoreExternal(t.Context(), bytes.NewReader(raw.Bytes())))
+			restorer, ok := target.(store.ExternalSnapshotRestorer)
+			require.True(t, ok)
+			require.NoError(t, restorer.RestoreExternal(t.Context(), bytes.NewReader(raw.Bytes())))
 			require.ErrorIs(t, RequireMigrationNamespaceAdmission(t.Context(), target), ErrMigrationNamespaceProtocol)
 		})
 	}

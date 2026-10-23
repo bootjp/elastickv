@@ -103,18 +103,9 @@ func (f *kvFSM) RecordAppliedNamespaceConfiguration(index uint64, members []uint
 	if err != nil || index < state.Index {
 		return err
 	}
-	if state.Version != 0 {
-		for _, id := range members {
-			if !slices.Contains(state.Members, id) && !slices.Contains(state.Joining, id) {
-				return errors.WithStack(ErrMigrationNamespaceProtocol)
-			}
-		}
-		if index == state.Index && !slices.Equal(state.Members, members) {
-			return errors.WithStack(ErrMigrationNamespaceProtocol)
-		}
-		if index != state.Index {
-			state.Joining = nil // Prejoin acknowledgements cannot cross a ConfChange.
-		}
+	state, err = namespaceConfigurationForMembers(state, index, members)
+	if err != nil {
+		return err
 	}
 	if index == state.Index {
 		// Cold-start replays ConfChanges below the store's data frontier. Only
@@ -128,6 +119,24 @@ func (f *kvFSM) RecordAppliedNamespaceConfiguration(index uint64, members []uint
 	}
 	f.migrationNamespaceMembers = members
 	return nil
+}
+
+func namespaceConfigurationForMembers(state namespaceConfiguration, index uint64, members []uint64) (namespaceConfiguration, error) {
+	if state.Version == 0 {
+		return state, nil
+	}
+	for _, id := range members {
+		if !slices.Contains(state.Members, id) && !slices.Contains(state.Joining, id) {
+			return state, errors.WithStack(ErrMigrationNamespaceProtocol)
+		}
+	}
+	if index == state.Index && !slices.Equal(state.Members, members) {
+		return state, errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	if index != state.Index {
+		state.Joining = nil // Prejoin acknowledgements cannot cross a ConfChange.
+	}
+	return state, nil
 }
 
 // RecoverNamespaceConfiguration binds an inactive replica to the actual
@@ -213,19 +222,9 @@ func (f *kvFSM) applyNamespaceAdmission(ctx context.Context, data []byte) any {
 	if state.Version != 0 {
 		members = state.Members
 	}
-	if validateNamespaceAdmissionCommand(command) != nil || command.ConfigurationIndex != state.Index || !slices.Equal(command.ApplyMembers, members) || !validNamespaceMembers(members) {
-		return errors.WithStack(ErrMigrationNamespaceProtocol)
-	}
-	proved, err := namespaceCapabilityIDs(command.Members, command.ConfigurationIndex)
-	if err != nil || !slices.Equal(proved, members) {
-		return errors.WithStack(ErrMigrationNamespaceProtocol)
-	}
-	joining, err := namespaceCapabilityIDs(command.Joining, command.ConfigurationIndex)
-	if err != nil || !validNamespaceJoining(joining, members) {
-		return errors.WithStack(ErrMigrationNamespaceProtocol)
-	}
-	if f.pendingApplyIdx <= state.Index {
-		return errors.WithStack(ErrMigrationNamespaceProtocol)
+	joining, err := validateNamespaceAdmissionState(command, state, members, f.pendingApplyIdx)
+	if err != nil {
+		return err
 	}
 	// Concurrent controllers may refresh activation while membership admission
 	// is between its prejoin control and ConfChange. Never revoke an already
@@ -240,6 +239,24 @@ func (f *kvFSM) applyNamespaceAdmission(ctx context.Context, data []byte) any {
 		return haltErr(errors.Wrap(err, "persist namespace admission control"))
 	}
 	return nil
+}
+
+func validateNamespaceAdmissionState(command NamespaceAdmissionCommand, state namespaceConfiguration, members []uint64, applyIndex uint64) ([]uint64, error) {
+	if validateNamespaceAdmissionCommand(command) != nil || command.ConfigurationIndex != state.Index || !slices.Equal(command.ApplyMembers, members) || !validNamespaceMembers(members) {
+		return nil, errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	proved, err := namespaceCapabilityIDs(command.Members, command.ConfigurationIndex)
+	if err != nil || !slices.Equal(proved, members) {
+		return nil, errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	joining, err := namespaceCapabilityIDs(command.Joining, command.ConfigurationIndex)
+	if err != nil || !validNamespaceJoining(joining, members) {
+		return nil, errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	if applyIndex <= state.Index {
+		return nil, errors.WithStack(ErrMigrationNamespaceProtocol)
+	}
+	return joining, nil
 }
 
 func namespaceCapabilityIDs(capabilities []NamespaceMemberCapability, index uint64) ([]uint64, error) {

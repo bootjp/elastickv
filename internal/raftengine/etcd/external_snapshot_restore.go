@@ -135,10 +135,7 @@ func prepareExternalSnapshotRestore(
 	if err := ctx.Err(); err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if err := writeExternalRestoreOrigin(tempDir, opts, crc); err != nil {
-		return nil, err
-	}
-	if err := seedExternalSnapshotRestoreDir(ctx, tempDir, opts, token); err != nil {
+	if err := seedExternalSnapshotRestoreWithOrigin(ctx, tempDir, opts, token, crc); err != nil {
 		return nil, err
 	}
 	if err := finalizeExternalSnapshotRestoreDir(ctx, tempDir, destDataDir); err != nil {
@@ -155,6 +152,13 @@ func prepareExternalSnapshotRestore(
 		PayloadSHA256: payloadSHA,
 		Peers:         len(opts.Peers),
 	}, nil
+}
+
+func seedExternalSnapshotRestoreWithOrigin(ctx context.Context, tempDir string, opts ExternalSnapshotRestoreOptions, token []byte, crc uint32) error {
+	if err := writeExternalRestoreOrigin(tempDir, opts, crc); err != nil {
+		return err
+	}
+	return seedExternalSnapshotRestoreDir(ctx, tempDir, opts, token)
 }
 
 func finalizeExternalSnapshotRestoreDir(ctx context.Context, tempDir string, destDataDir string) error {

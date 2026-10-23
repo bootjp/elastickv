@@ -75,46 +75,62 @@ func (g *migrationNamespaceMembershipGate) authorize(ctx context.Context, id, ad
 	}
 	version, err := kv.MigrationNamespaceAdmissionVersion(ctx, g.store)
 	if err != nil || version == 0 {
-		return err
-	}
-	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || address == "" || g.engine == nil || g.proposer == nil || g.probe == nil {
-		return errors.WithStack(kv.ErrMigrationNamespaceProtocol)
-	}
-	peer := g.peer(etcd.DeriveNodeID(id), address)
-	attempt, cancel := context.WithTimeout(ctx, namespaceMembershipHandshakeTimeout)
-	response, err := peer.Client.ProbeMigrationState(attempt, &pb.ProbeMigrationStateRequest{JobId: 1, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION})
-	cancel()
-	if err != nil {
 		return errors.WithStack(err)
 	}
-	if response.GetNamespaceAdmissionVersion() < version {
-		return errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+	peer, installedVersion, err := g.probeNamespaceCandidate(ctx, id, address, version)
+	if err != nil {
+		return err
 	}
 	snapshot := func(ctx context.Context) (adapter.NamespaceAdmissionSnapshot, error) { return g.snapshot(ctx) }
 	current, err := snapshot(ctx)
 	if err != nil {
 		return err
 	}
-	joining := []adapter.NamespaceAdmissionPeer{peer}
-	for _, member := range current.Members {
-		if member.MemberID == peer.MemberID {
-			if member.Address != address {
-				return errors.WithStack(kv.ErrMigrationNamespaceProtocol)
-			}
-			joining = nil
-		}
+	joining, err := namespaceJoiningCandidate(current, peer)
+	if err != nil {
+		return err
 	}
 	activate := func(ctx context.Context, command kv.NamespaceAdmissionCommand) error {
-		return kv.ActivateMigrationNamespace(ctx, g.store, g.proposer, command)
+		return errors.WithStack(kv.ActivateMigrationNamespace(ctx, g.store, g.proposer, command))
 	}
 	if err := adapter.EnsureMigrationNamespaceAdmissionWithSnapshot(ctx, snapshot, activate, joining); err != nil {
-		return err
+		return errors.WithStack(err)
 	}
 	configuration, err := kv.MigrationConfigurationIndex(ctx, g.store)
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	return kv.CheckMigrationNamespacePrejoin(ctx, g.store, configuration, peer.MemberID, response.GetNamespaceAdmissionVersion())
+	return errors.WithStack(kv.CheckMigrationNamespacePrejoin(ctx, g.store, configuration, peer.MemberID, installedVersion))
+}
+
+func (g *migrationNamespaceMembershipGate) probeNamespaceCandidate(ctx context.Context, id, address string, version uint32) (adapter.NamespaceAdmissionPeer, uint32, error) {
+	if strings.TrimSpace(id) == "" || id != strings.TrimSpace(id) || address == "" || g.engine == nil || g.proposer == nil || g.probe == nil {
+		return adapter.NamespaceAdmissionPeer{}, 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+	}
+	peer := g.peer(etcd.DeriveNodeID(id), address)
+	attempt, cancel := context.WithTimeout(ctx, namespaceMembershipHandshakeTimeout)
+	response, err := peer.Client.ProbeMigrationState(attempt, &pb.ProbeMigrationStateRequest{JobId: 1, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION})
+	cancel()
+	if err != nil {
+		return peer, 0, errors.WithStack(err)
+	}
+	if response.GetNamespaceAdmissionVersion() < version {
+		return peer, 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+	}
+	return peer, response.GetNamespaceAdmissionVersion(), nil
+}
+
+func namespaceJoiningCandidate(current adapter.NamespaceAdmissionSnapshot, peer adapter.NamespaceAdmissionPeer) ([]adapter.NamespaceAdmissionPeer, error) {
+	joining := []adapter.NamespaceAdmissionPeer{peer}
+	for _, member := range current.Members {
+		if member.MemberID == peer.MemberID {
+			if member.Address != peer.Address {
+				return nil, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+			}
+			joining = nil
+		}
+	}
+	return joining, nil
 }
 
 type namespaceMembershipProbeClient struct {
@@ -138,9 +154,9 @@ func (g *migrationNamespaceMembershipGate) snapshot(ctx context.Context) (adapte
 	if !ok {
 		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
-	before, supported := reader.AppliedConfigurationIndex()
-	if !supported || before == 0 || g.engine.Status().PendingConfChange {
-		return adapter.NamespaceAdmissionSnapshot{}, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+	before, err := g.namespaceSnapshotConfigurationIndex(reader)
+	if err != nil {
+		return adapter.NamespaceAdmissionSnapshot{}, err
 	}
 	configuration, err := g.engine.Configuration(ctx)
 	if err != nil {
@@ -153,9 +169,20 @@ func (g *migrationNamespaceMembershipGate) snapshot(ctx context.Context) (adapte
 		}
 		result.Members = append(result.Members, g.peer(etcd.DeriveNodeID(member.ID), member.Address))
 	}
-	after, supported := reader.AppliedConfigurationIndex()
-	if !supported || before != after || g.engine.Status().PendingConfChange {
+	after, err := g.namespaceSnapshotConfigurationIndex(reader)
+	if err != nil {
+		return result, err
+	}
+	if before != after {
 		return result, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
 	}
 	return result, nil
+}
+
+func (g *migrationNamespaceMembershipGate) namespaceSnapshotConfigurationIndex(reader raftengine.AppliedConfigurationReader) (uint64, error) {
+	index, supported := reader.AppliedConfigurationIndex()
+	if !supported || index == 0 || g.engine.Status().PendingConfChange {
+		return 0, errors.WithStack(kv.ErrMigrationNamespaceProtocol)
+	}
+	return index, nil
 }
