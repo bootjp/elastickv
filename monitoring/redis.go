@@ -168,7 +168,7 @@ func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 				Name: "elastickv_redis_requests_total",
 				Help: "Total number of Redis API requests by command and outcome.",
 			},
-			[]string{"command", "outcome"},
+			[]string{labelCommand, labelOutcome},
 		),
 		requestDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -176,21 +176,21 @@ func newRedisMetrics(registerer prometheus.Registerer) *RedisMetrics {
 				Help:    "End-to-end latency of Redis API requests.",
 				Buckets: []float64{0.001, 0.0025, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60},
 			},
-			[]string{"command", "outcome"},
+			[]string{labelCommand, labelOutcome},
 		),
 		errorsTotal: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_redis_errors_total",
 				Help: "Total number of Redis API errors by command.",
 			},
-			[]string{"command"},
+			[]string{labelCommand},
 		),
 		unsupportedCommands: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_redis_unsupported_commands_total",
 				Help: "Count of Redis commands rejected as unsupported, labelled with the actual command name (bounded cardinality).",
 			},
-			[]string{"command"},
+			[]string{labelCommand},
 		),
 		unsupportedNames: make(map[string]struct{}, maxUnsupportedCommandLabels),
 	}

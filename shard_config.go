@@ -381,7 +381,7 @@ func parseRaftBootstrapMembers(raw string) ([]raftengine.Server, error) {
 		}
 		seen[id] = struct{}{}
 		servers = append(servers, raftengine.Server{
-			Suffrage: "voter",
+			Suffrage: shutdownVoterSuffrage,
 			ID:       id,
 			Address:  addr,
 		})

@@ -181,21 +181,27 @@ func (l *leaderBalanceLoop) run(ctx context.Context) {
 	}
 }
 
-func (l *leaderBalanceLoop) tick(ctx context.Context, now time.Time) {
-	if ctx.Err() != nil {
-		return
-	}
+func (l *leaderBalanceLoop) checkDefaultLeader(now time.Time) bool {
 	defaultEngine := l.defaultRuntime.snapshotEngine()
-	defaultLeader := defaultEngine != nil && defaultEngine.State() == raftengine.StateLeader
-	if !defaultLeader {
+	if defaultEngine == nil || defaultEngine.State() != raftengine.StateLeader {
 		l.wasDefaultLeader = false
-		return
+		return false
 	}
 	if !l.wasDefaultLeader {
 		l.wasDefaultLeader = true
 		l.groupCooldownUntil = make(map[uint64]time.Time)
 		l.globalCooldownUntil = time.Time{}
 		l.startupGraceUntil = now.Add(l.cfg.startupGrace)
+	}
+	return true
+}
+
+func (l *leaderBalanceLoop) tick(ctx context.Context, now time.Time) {
+	if ctx.Err() != nil {
+		return
+	}
+	if !l.checkDefaultLeader(now) {
+		return
 	}
 	obs := observeLeaderBalance(ctx, l.runtimes, l.cfg.localNodeID)
 	if l.cfg.metrics != nil {

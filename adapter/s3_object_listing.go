@@ -46,7 +46,7 @@ var (
 	errS3ListingMalformedToken = errors.New("malformed continuation token")
 	errS3ListingTokenMismatch  = errors.New("continuation token does not match request")
 	errS3ListingTokenExpired   = errors.New("continuation token readTS has been compacted")
-	errS3ListingNoSuchBucket   = errors.New("bucket not found")
+	errS3ListingNoSuchBucket   = errors.New(s3ErrNoSuchBucketMsg)
 )
 
 // scanS3ObjectListing runs one listing page: it decodes and validates the

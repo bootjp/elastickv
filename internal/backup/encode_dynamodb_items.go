@@ -358,7 +358,7 @@ func decodeScalarAV(typ string, val any) (*pb.DynamoAttributeValue, bool, error)
 	case "BOOL":
 		av, err := decodeAVBool(val)
 		return av, true, err
-	case "NULL":
+	case ddbAttrTypeNull:
 		av, err := decodeAVNull(val)
 		return av, true, err
 	}

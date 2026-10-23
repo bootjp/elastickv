@@ -55,7 +55,7 @@ func newFileSystemMetrics(registerer prometheus.Registerer) *FileSystemMetrics {
 				Name: "elastickv_fs_file_pinned_hotspot_total",
 				Help: "Total filesystem file-pinned hotspot split planner skips by reason.",
 			},
-			[]string{"reason"},
+			[]string{labelReason},
 		),
 		fileMultiShardTotal: prometheus.NewCounter(prometheus.CounterOpts{
 			Name: "elastickv_fs_file_multi_shard_detected_total",

@@ -239,7 +239,7 @@ func (s *S3Server) adminPutObject(ctx context.Context, in *s3PutObjectInput, buc
 	state, err := s.prepareS3PutObject(ctx, in, bucket, key)
 	if err != nil {
 		var respErr *s3ResponseError
-		if errors.As(err, &respErr) && respErr.Code == "NoSuchBucket" {
+		if errors.As(err, &respErr) && respErr.Code == s3ErrNoSuchBucket {
 			return ErrAdminBucketNotFound
 		}
 		return errors.WithStack(err)
@@ -340,7 +340,7 @@ func (s *S3Server) AdminGetObject(ctx context.Context, principal AdminPrincipal,
 		ContentType:  manifest.ContentType,
 		ETag:         manifest.ETag,
 		LastModified: hlcToTime(manifest.LastModifiedHLC),
-		StorageClass: "STANDARD",
+		StorageClass: s3StorageClassStandard,
 	}
 	if adminMeta.ContentType == "" {
 		adminMeta.ContentType = defaultS3ContentType
@@ -606,7 +606,7 @@ func (s *S3Server) AdminListObjects(ctx context.Context, principal AdminPrincipa
 			ContentType:  ct,
 			ETag:         obj.Manifest.ETag,
 			LastModified: hlcToTime(obj.Manifest.LastModifiedHLC),
-			StorageClass: "STANDARD",
+			StorageClass: s3StorageClassStandard,
 		})
 	}
 	return out, nil
