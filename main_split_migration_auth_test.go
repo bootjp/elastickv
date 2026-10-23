@@ -88,19 +88,19 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	require.NoError(t, err, "source recovery must not resolve the unavailable target")
 	for _, client := range []adapter.SplitMigrationClient{source, target, voters[0].Client, sourceOnly} {
 		_, err = client.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{})
-		require.NoError(t, err)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
 		_, err = client.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{})
-		require.NoError(t, err)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
 		_, err = client.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{})
-		require.NoError(t, err)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
 		_, err = client.CleanupMigration(ctx, &pb.CleanupMigrationRequest{})
-		require.NoError(t, err)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
 		_, err = client.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{})
 		require.NoError(t, err)
 		_, err = client.ProbeMigrationLocks(ctx, &pb.ProbeMigrationLocksRequest{})
 		require.NoError(t, err)
 		_, err = client.IssueMigrationTimestamp(ctx, &pb.IssueMigrationTimestampRequest{})
-		require.NoError(t, err)
+		require.Equal(t, codes.FailedPrecondition, status.Code(err))
 		stream, streamErr := client.ExportRangeVersions(ctx, &pb.ExportRangeVersionsRequest{})
 		require.NoError(t, streamErr)
 		page, recvErr := stream.Recv()
@@ -112,7 +112,7 @@ func TestSplitMigrationFactoriesPropagateCredentials(t *testing.T) {
 	}, &cache, "migration-secret")(ctx, job)
 	require.NoError(t, err)
 	_, err = promoter.PromoteStagedVersions(ctx, &pb.PromoteStagedVersionsRequest{})
-	require.NoError(t, err)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	md, _ := metadata.FromOutgoingContext(ctx)
 	require.Equal(t, []string{"Bearer stale"}, md.Get("authorization"))
 	conn, err := cache.ConnFor(lis.Addr().String())
@@ -177,9 +177,9 @@ func TestSplitMigrationPeerAuthRolloutPausesRunnerAndCapability(t *testing.T) {
 		t.Fatal("send-only rollout stage must not start a privileged runner")
 	}
 	*splitMigrationPeerAuthEnforced = true
-	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()))
+	require.ErrorContains(t, splitMigrationLocalReadinessGate(context.Background()), "protocol not enabled")
 	*splitMigrationPeerAuthEnforced, *adminInsecureNoAuth = false, true
-	require.NoError(t, splitMigrationLocalReadinessGate(context.Background()), "isolated no-auth tests retain explicit opt-in")
+	require.ErrorContains(t, splitMigrationLocalReadinessGate(context.Background()), "protocol not enabled", "no-auth is not an activation override")
 }
 
 func TestSplitMigrationTokenMustBeDedicated(t *testing.T) {

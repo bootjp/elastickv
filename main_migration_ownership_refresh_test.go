@@ -38,7 +38,7 @@ func newOwnershipRefreshRaftNode(t *testing.T, id string, groupID uint64, st sto
 		DataDir: t.TempDir(), Peers: []raftengine.Server{{ID: id, Address: listener.Addr().String(), Suffrage: "voter"}}, Bootstrap: true, StateMachine: fsm})
 	require.NoError(t, err)
 	auth, _ := adapter.SplitMigrationTokenAuth(token, false, true)
-	options := append(internalutil.GRPCServerOptions(), grpc.ChainUnaryInterceptor(auth))
+	options := raftGRPCServerOptions(adminGRPCInterceptors{unary: []grpc.UnaryServerInterceptor{auth}})
 	server := grpc.NewServer(options...)
 	if result.RegisterTransport != nil {
 		result.RegisterTransport(server)
@@ -68,7 +68,7 @@ func ownershipRefreshRootCatalog(t *testing.T) (store.MVCCStore, *distribution.C
 	require.NoError(t, err)
 	digest := sha256.Sum256(encoded)
 	proof := &pb.MigrationOwnershipProof{Generation: "native-generation-for-refresh", LocalGroupId: 7, OwnerGroupId: 7,
-		CatalogVersion: 1, RouteStart: []byte("m"), RouteId: 2, MinWriteTsExclusive: 100,
+		CatalogVersion: 1, RouteStart: []byte("m"), RouteId: 2, MinWriteTsExclusive: 100, WriteFloorKnown: true,
 		Role: pb.MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_OWNER, DescriptorHash: digest[:]}
 	// Bootstrap the root store at a later C with the migrated descriptor intact.
 	// No SplitJob/history is created: the terminal job may already have been GC'd.
@@ -78,7 +78,7 @@ func ownershipRefreshRootCatalog(t *testing.T) (store.MVCCStore, *distribution.C
 	return st, catalog, proof
 }
 
-func TestOwnershipRefreshDifferentRaftLeadersOverAuthenticatedRPC(t *testing.T) {
+func TestOwnershipRefreshDifferentRaftLeadersRemainClosedUntilCoverage(t *testing.T) {
 	cert, key := writeSelfSignedCert(t)
 	require.NoError(t, internalutil.ConfigureGRPCTLS(cert, cert, key))
 	t.Cleanup(func() { require.NoError(t, internalutil.ConfigureGRPCTLS("", "", "")) })
@@ -92,50 +92,62 @@ func TestOwnershipRefreshDifferentRaftLeadersOverAuthenticatedRPC(t *testing.T) 
 	rootShards := kv.NewShardStore(rootRoutes, rootGroups)
 	coordinate := kv.NewShardedCoordinator(rootRoutes, rootGroups, 1, kv.NewHLC(), rootShards)
 	pb.RegisterDistributionServer(root.server, adapter.NewDistributionServer(rootRoutes, catalog, adapter.WithDistributionCoordinator(coordinate)))
-	// This fixture exercises the real FSM; production readiness is separately
-	// wired to the public read/proposal hooks, never this test-only callback.
+	groups := map[uint64]*kv.ShardGroup{7: data.group}
+	dataRoutes := distribution.NewEngine()
+	dataRoutes.UpdateRoute(nil, nil, 7)
+	dataShards := kv.NewShardStore(dataRoutes, groups)
+	dataTx := newInternalMigrationTransaction(data.group.Engine, nil, data.group.Store, 7)
+	t.Cleanup(dataTx.Close)
+	var cache kv.GRPCConnCache
+	t.Cleanup(func() { require.NoError(t, cache.Close()) })
+	groupFactory := splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, token)
+	rootFactory := migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{engine: root.group.Engine}), &cache, token)
+	mirror := distribution.NewEngine()
+	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: 2, Routes: []distribution.RouteDescriptor{{RouteID: 99, GroupID: 99}}}))
+	consumer := adapter.NewDistributionServer(mirror, nil,
+		adapter.WithSplitJobRunnerReadinessGate(func(context.Context) error { return migrationOwnershipActivationGate() }),
+		adapter.WithSplitMigrationGroupClientFactory(groupFactory),
+		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, token)),
+		adapter.WithMigrationOwnershipRefresh(groups, rootFactory))
+	require.True(t, migrationOwnershipRuntimeHooksInstalled(dataTx, dataShards, consumer, 7))
 	pb.RegisterInternalServer(data.server, adapter.NewInternalWithEngine(nil, data.group.Engine, nil, nil,
 		adapter.WithInternalStore(data.group.Store), adapter.WithInternalMigrationProposer(data.group.Engine),
-		adapter.WithInternalMigrationOwnershipReady(func() bool { return true }),
-		adapter.WithInternalMigrationCleanupGate(func(context.Context) error { return nil })))
+		adapter.WithInternalMigrationOwnershipReady(func() bool { return migrationOwnershipRuntimeReady(dataTx, dataShards, consumer, 7) })))
 	go func() { _ = root.server.Serve(root.listener) }()
 	go func() { _ = data.server.Serve(data.listener) }()
 	require.Eventually(t, func() bool {
 		return root.group.Engine.State() == raftengine.StateLeader && data.group.Engine.State() == raftengine.StateLeader
 	}, 5*time.Second, 10*time.Millisecond)
 	require.NotEqual(t, root.group.Engine.Leader().ID, data.group.Engine.Leader().ID)
-	var cache kv.GRPCConnCache
-	t.Cleanup(func() { require.NoError(t, cache.Close()) })
-	groups := map[uint64]*kv.ShardGroup{7: data.group}
-	groupFactory := splitMigrationGroupClientFactory(splitMigrationGroupLeaderResolver(groups), &cache, token)
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
 	dataClient, err := groupFactory(ctx, 7)
 	require.NoError(t, err)
+	capability, err := dataClient.ProbeMigrationState(ctx, &pb.ProbeMigrationStateRequest{JobId: 77,
+		Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY})
+	require.NoError(t, err)
+	require.False(t, capability.GetReady())
 	index, err := kv.MigrationConfigurationIndex(ctx, data.group.Store)
 	require.NoError(t, err)
 	_, err = dataClient.CleanupMigration(ctx, &pb.CleanupMigrationRequest{JobId: 77,
 		Mode: pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR, Ownership: prior,
 		RequireConfigurationIndex: true, ExpectedConfigurationIndex: index})
-	require.NoError(t, err)
-	mirror := distribution.NewEngine()
-	require.NoError(t, mirror.ApplySnapshot(distribution.CatalogSnapshot{Version: 2, Routes: []distribution.RouteDescriptor{{RouteID: 99, GroupID: 99}}}))
-	rootFactory := migrationOwnershipRootClientFactory(migrationOwnershipRootLeaderResolver(&raftGroupRuntime{engine: root.group.Engine}), &cache, token)
-	consumer := adapter.NewDistributionServer(mirror, nil,
-		adapter.WithSplitJobRunnerReadinessGate(func(context.Context) error { return nil }),
-		adapter.WithSplitMigrationGroupClientFactory(groupFactory),
-		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(groups, &cache, token)),
-		adapter.WithMigrationOwnershipRefresh(groups, rootFactory))
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	// A caller's unrelated credential cannot override the configured peer token.
 	ctx = metadata.NewOutgoingContext(ctx, metadata.Pairs("authorization", "Bearer unrelated"))
-	require.NoError(t, consumer.RunMigrationOwnershipRefreshOnce(ctx))
+	require.ErrorContains(t, consumer.RunMigrationOwnershipRefreshOnce(ctx), "protocol not enabled")
+	rootClient, err := rootFactory(ctx)
+	require.NoError(t, err)
+	attestation, err := rootClient.AttestMigrationOwnership(ctx, &pb.AttestMigrationOwnershipRequest{JobId: 77, Prior: prior})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, attestation.GetOwnershipProtocol())
+	require.EqualValues(t, 2, attestation.GetOwnership().GetCatalogVersion())
+	require.True(t, attestation.GetOwnership().GetWriteFloorKnown())
 	writer, ok := data.group.Store.(store.MigrationOwnershipStore)
 	require.True(t, ok)
 	view, err := writer.MigrationServingState(ctx)
 	require.NoError(t, err)
-	require.EqualValues(t, 2, view.Ownership[0].CatalogVersion)
-	require.Equal(t, prior.GetGeneration(), view.Ownership[0].Generation)
-	require.EqualValues(t, 1, view.Ownership[0].Receipts[0].CatalogVersion)
+	require.Empty(t, view.Ownership, "coverage closure must prevent all data-side ownership writes")
 	assertOwnershipRootRejectsAnonymous(t, ctx, &cache, root.listener.Addr().String(), prior)
 }
 

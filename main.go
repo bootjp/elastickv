@@ -913,9 +913,9 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			splitMigrationConnCache,
 			auth.migrationToken,
 		)),
+		// Do not advertise cap_migration_v2 before protocol coverage is accepted.
 		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
 		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
-		adapter.WithSplitJobRunnerReady(),
 	)
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,
@@ -2671,7 +2671,7 @@ func splitMigrationLocalReadinessGate(ctx context.Context) error {
 	if !adapter.MigrationCleanupOpcodeEnabledFromEnv() {
 		return errors.Errorf("%s is disabled", adapter.MigrationCleanupOpcodeEnv)
 	}
-	return nil
+	return migrationOwnershipActivationGate()
 }
 
 func splitMigrationPeerAuthReadinessGate(context.Context) error {
@@ -2685,7 +2685,7 @@ func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, se
 	if eg == nil || server == nil {
 		return
 	}
-	if splitMigrationPeerAuthReadinessGate(ctx) != nil {
+	if splitMigrationLocalReadinessGate(ctx) != nil {
 		return
 	}
 	eg.Go(func() error {
@@ -4093,9 +4093,9 @@ func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOpt
 	// (single-interceptor) option added anywhere in this chain cannot
 	// silently overwrite the admin auth gate — gRPC-Go keeps only the
 	// last option of the same type.
-	if len(adminGRPCOpts.unary) > 0 {
-		opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
-	}
+	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.unary...)
+	unary = append(unary, migrationCoverageUnaryGate)
+	opts = append(opts, grpc.ChainUnaryInterceptor(unary...))
 	if len(adminGRPCOpts.stream) > 0 {
 		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
 	}
@@ -4157,12 +4157,15 @@ func startRaftServers(
 	)
 	for _, rt := range runtimes {
 		gs := grpc.NewServer(raftGRPCServerOptions(adminGRPCOpts)...)
-		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
+		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.spec.id), rt.store, rt.spec.id)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id], rt.spec.id)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
+		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
+			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id)
+		}))
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,

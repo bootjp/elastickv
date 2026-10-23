@@ -286,7 +286,7 @@ func TestOwnershipRefreshConsumerRetriesExactAppliedAckWithoutNewProposal(t *tes
 }
 
 func TestOwnershipRefreshConsumerRejectsLegacyAndGenerationMismatch(t *testing.T) {
-	for _, mismatch := range []string{"legacy", "generation", "configuration", "exact proof", "closed readiness"} {
+	for _, mismatch := range []string{"legacy", "legacy v1", "generation", "configuration", "exact proof", "closed readiness"} {
 		t.Run(mismatch, func(t *testing.T) {
 			root, prior := ownershipRefreshCatalog(t)
 			rootClient, closeClient := newBufconnDistributionClient(t, root)
@@ -296,6 +296,8 @@ func TestOwnershipRefreshConsumerRejectsLegacyAndGenerationMismatch(t *testing.T
 				switch mismatch {
 				case "legacy":
 					resp.OwnershipProtocol = 0
+				case "legacy v1":
+					resp.OwnershipProtocol = 1
 				case "generation":
 					resp.OwnershipGeneration = "different-native-generation"
 				case "configuration":
@@ -435,12 +437,48 @@ func TestOwnershipAttestationRPCUsesCommittedCatalogWithoutJobHistory(t *testing
 	defer closeClient()
 	resp, err := client.AttestMigrationOwnership(t.Context(), &pb.AttestMigrationOwnershipRequest{JobId: 7, Prior: prior})
 	require.NoError(t, err)
-	require.EqualValues(t, 1, resp.GetOwnershipProtocol())
+	require.EqualValues(t, 2, resp.GetOwnershipProtocol())
 	require.Equal(t, prior.GetCatalogVersion()+1, resp.GetOwnership().GetCatalogVersion())
 	require.Equal(t, prior.GetDescriptorHash(), resp.GetOwnership().GetDescriptorHash())
 	server.coordinator = newDistributionCoordinatorStub(store.NewMVCCStore(), false)
 	_, err = client.AttestMigrationOwnership(t.Context(), &pb.AttestMigrationOwnershipRequest{JobId: 7, Prior: prior})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+}
+
+func TestOwnershipAttestationRPCPreservesProtocolTwoSourceBoundary(t *testing.T) {
+	server, prior := ownershipRefreshCatalog(t)
+	prior.WriteFloorKnown, prior.SourceTrackerVersion, prior.SourceAppliedIndex = true, 1, 10
+	client, closeClient := newBufconnDistributionClient(t, server)
+	defer closeClient()
+	resp, err := client.AttestMigrationOwnership(t.Context(), &pb.AttestMigrationOwnershipRequest{JobId: 7, Prior: prior})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, resp.GetOwnershipProtocol())
+	require.True(t, resp.GetOwnership().GetWriteFloorKnown())
+	require.EqualValues(t, 1, resp.GetOwnership().GetSourceTrackerVersion())
+	require.EqualValues(t, 10, resp.GetOwnership().GetSourceAppliedIndex())
+	expected := proto.CloneOf(prior)
+	expected.CatalogVersion = 2
+	require.True(t, proto.Equal(expected, resp.GetOwnership()), "only C may advance across the authenticated producer RPC")
+}
+
+type legacyOwnershipAttestationServer struct {
+	pb.UnimplementedDistributionServer
+	proof *pb.MigrationOwnershipProof
+}
+
+func (s legacyOwnershipAttestationServer) AttestMigrationOwnership(context.Context, *pb.AttestMigrationOwnershipRequest) (*pb.AttestMigrationOwnershipResponse, error) {
+	return &pb.AttestMigrationOwnershipResponse{OwnershipProtocol: 1, Ownership: s.proof}, nil
+}
+
+func TestOwnershipRefreshConsumerRejectsProtocolOneRoot(t *testing.T) {
+	_, prior := ownershipRefreshCatalog(t)
+	refreshed := proto.CloneOf(prior)
+	refreshed.CatalogVersion = 2
+	client, closeClient := newBufconnDistributionClient(t, legacyOwnershipAttestationServer{proof: refreshed})
+	defer closeClient()
+	consumer, data, _ := ownershipRefreshConsumer(t, store.NewMVCCStore(), client, prior)
+	require.ErrorIs(t, consumer.RunMigrationOwnershipRefreshOnce(t.Context()), store.ErrNotSupported)
+	require.Empty(t, data.cleanups, "protocol 1 cannot attest the protocol 2 source boundary")
 }
 
 func TestOwnershipAttestationRPCRequiresMigrationCredential(t *testing.T) {

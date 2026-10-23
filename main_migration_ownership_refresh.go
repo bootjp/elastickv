@@ -55,7 +55,7 @@ func migrationOwnershipRefreshOption(groups map[uint64]*kv.ShardGroup, root *raf
 }
 
 func startMigrationOwnershipRefresh(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
-	if eg == nil || server == nil || splitMigrationPeerAuthReadinessGate(ctx) != nil {
+	if eg == nil || server == nil || splitMigrationLocalReadinessGate(ctx) != nil {
 		return
 	}
 	eg.Go(func() error { return server.RunMigrationOwnershipRefresh(ctx) })
