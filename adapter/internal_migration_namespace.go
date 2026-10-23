@@ -11,6 +11,8 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+var errMigrationNamespaceAdmissionNotConfigured = status.Error(codes.FailedPrecondition, "migration namespace admission is not configured")
+
 func WithMigrationNamespaceAdmissionReady(ready func() bool) InternalOption {
 	return func(i *Internal) { i.migrationNamespaceReady = ready }
 }

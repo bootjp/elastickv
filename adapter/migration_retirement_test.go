@@ -3,11 +3,13 @@ package adapter
 import (
 	"bytes"
 	"context"
+	"slices"
 	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -102,6 +104,8 @@ func TestMigrationRetirementRejectsOldRunnerAfterAllVoterCleanupProbes(t *testin
 	proposer := &retirementVoterProposer{index: 20}
 	stores := make([]store.MVCCStore, 3)
 	servers := make([]*Internal, 3)
+	members := []uint64{etcd.DeriveNodeID("voter1"), etcd.DeriveNodeID("voter2"), etcd.DeriveNodeID("voter3")}
+	slices.Sort(members)
 	for index := range stores {
 		st := store.NewMVCCStore()
 		stores[index] = st
@@ -112,12 +116,20 @@ func TestMigrationRetirementRejectsOldRunnerAfterAllVoterCleanupProbes(t *testin
 		fsm := kv.NewKvFSMWithHLC(st, kv.NewHLC(), kv.WithRouteHistory(kv.WrapDistributionEngine(engine), 7))
 		configuration, ok := fsm.(raftengine.AppliedConfigurationAware)
 		require.True(t, ok)
-		require.NoError(t, configuration.RecordAppliedConfiguration(9))
+		inventory, ok := fsm.(raftengine.NamespaceConfigurationAware)
+		require.True(t, ok)
+		require.NoError(t, inventory.RecordAppliedNamespaceConfiguration(9, members))
 		proposer.voters = append(proposer.voters, fsm)
 		servers[index] = NewInternalWithEngine(nil, ownershipRuntimeLeader{configuration: configuration}, nil, nil, WithInternalStore(st),
 			WithInternalMigrationProposer(proposer), WithInternalMigrationOwnershipReady(func() bool { return true }),
+			WithMigrationNamespaceAdmissionReady(func() bool { return kv.MigrationNamespaceInstalledVersion(st, fsm) == kv.MigrationNamespaceVersion }),
 			WithInternalMigrationCleanupGate(func(context.Context) error { return nil }))
 	}
+	commandActivation := kv.NamespaceAdmissionCommand{Version: kv.MigrationNamespaceVersion, ConfigurationIndex: 9, ApplyMembers: members}
+	for _, member := range members {
+		commandActivation.Members = append(commandActivation.Members, kv.NamespaceMemberCapability{MemberID: member, Version: kv.MigrationNamespaceVersion, ConfigurationIndex: 9})
+	}
+	require.NoError(t, kv.ActivateMigrationNamespace(ctx, stores[0], proposer, commandActivation))
 	late := &pb.TargetStagedReadinessRequest{JobId: 7, MigrationJobId: 7, RouteStart: []byte("m"), RouteEnd: []byte("z"),
 		Armed: true, SourceWriteFence: true, MinWriteTsExclusive: 500, RetentionPinTs: 1}
 	command, err := kv.MarshalTargetStagedReadinessCommand(late)
@@ -126,7 +138,10 @@ func TestMigrationRetirementRejectsOldRunnerAfterAllVoterCleanupProbes(t *testin
 	release := sync.OnceFunc(func() { close(held.release) })
 	t.Cleanup(release)
 	oldRunner := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(stores[0]),
-		WithInternalMigrationProposer(held), WithInternalMigrationImportGate(func(context.Context) error { return nil }))
+		WithInternalMigrationProposer(held), WithInternalMigrationImportGate(func(context.Context) error { return nil }),
+		WithMigrationNamespaceAdmissionReady(func() bool {
+			return kv.MigrationNamespaceInstalledVersion(stores[0], proposer.voters[0]) == kv.MigrationNamespaceVersion
+		}))
 	result := make(chan error, 1)
 	go func() { _, callErr := oldRunner.ApplyTargetStagedReadiness(ctx, late); result <- callErr }()
 	select {

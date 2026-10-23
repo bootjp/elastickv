@@ -60,12 +60,17 @@ func (l *recordingInternalLeader) LinearizableRead(context.Context) (uint64, err
 type applyingMigrationProposer struct {
 	fsm   raftengine.StateMachine
 	calls uint64
+	index uint64
 }
 
 func (p *applyingMigrationProposer) Propose(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	p.calls++
+	p.index++
+	if aware, ok := p.fsm.(raftengine.ApplyIndexAware); ok {
+		aware.SetApplyIndex(p.index)
+	}
 	return &raftengine.ProposalResult{
-		CommitIndex: p.calls,
+		CommitIndex: p.index,
 		Response:    p.fsm.Apply(data),
 	}, nil
 }
@@ -661,6 +666,8 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 		WithInternalMigrationProposer(proposer),
 		WithInternalMigrationImportGate(func(context.Context) error { return nil }),
 	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
 
 	resp, err := internal.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
 		JobId:     7,
@@ -673,7 +680,7 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []byte("cursor-1"), resp.GetAckedCursor())
-	require.Equal(t, uint64(1), proposer.calls)
+	require.Equal(t, before+1, proposer.calls)
 
 	staged := distribution.MigrationStagedDataKey(7, []byte("k"))
 	got, err := st.GetAt(ctx, staged, 30)
@@ -836,6 +843,8 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 		WithInternalMigrationProposer(proposer),
 		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
 	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
 
 	staged := distribution.MigrationStagedDataKey(7, []byte("k"))
 	require.NoError(t, st.PutAt(ctx, staged, []byte("v"), 30, 0))
@@ -848,7 +857,7 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 	require.True(t, resp.GetDone())
 	require.Equal(t, uint64(1), resp.GetPromotedRows())
 	require.Equal(t, uint64(30), resp.GetMaxPromotedTs())
-	require.Equal(t, uint64(1), proposer.calls)
+	require.Equal(t, before+1, proposer.calls)
 
 	got, err := st.GetAt(ctx, []byte("k"), 30)
 	require.NoError(t, err)
@@ -904,6 +913,8 @@ func TestInternalApplyTargetStagedReadinessBypassesOpcodeGateForSafetyGuard(t *t
 			return status.Error(codes.FailedPrecondition, "migration opcode disabled for test")
 		}),
 	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
 
 	resp, err := internal.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{
 		JobId:                  9,
@@ -916,7 +927,7 @@ func TestInternalApplyTargetStagedReadinessBypassesOpcodeGateForSafetyGuard(t *t
 	})
 	require.NoError(t, err)
 	require.NotNil(t, resp)
-	require.Equal(t, uint64(1), proposer.calls)
+	require.Equal(t, before+1, proposer.calls)
 
 	reader, ok := st.(store.MigrationTargetReadinessReader)
 	require.True(t, ok)
@@ -947,6 +958,8 @@ func TestInternalApplyTargetStagedReadinessProposesThroughRaft(t *testing.T) {
 		WithInternalMigrationProposer(proposer),
 		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
 	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
 
 	_, err := internal.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{
 		JobId:                  9,
@@ -958,7 +971,7 @@ func TestInternalApplyTargetStagedReadinessProposesThroughRaft(t *testing.T) {
 		Armed:                  true,
 	})
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), proposer.calls)
+	require.Equal(t, before+1, proposer.calls)
 	require.Equal(t, uint64(100), st.LastCommitTS())
 	require.GreaterOrEqual(t, clock.Current(), uint64(100))
 

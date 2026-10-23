@@ -4,6 +4,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -19,11 +20,21 @@ func newTransferGuardInternal(t *testing.T, index uint64, ready func() bool) (*I
 	fsm := kv.NewKvFSMWithHLC(st, nil, kv.WithRouteHistory(nil, 1))
 	configuration, ok := fsm.(raftengine.AppliedConfigurationAware)
 	require.True(t, ok)
+	inventory, ok := fsm.(raftengine.NamespaceConfigurationAware)
+	require.True(t, ok)
+	member := etcd.DeriveNodeID("voter")
+	configuration = ownershipRuntimeConfiguration{AppliedConfigurationAware: configuration, inventory: inventory, members: []uint64{member}}
+	proposer := &ownershipRuntimeProposer{fsm: fsm, index: 20}
 	if index != 0 {
 		require.NoError(t, configuration.RecordAppliedConfiguration(index))
+		require.NoError(t, kv.ActivateMigrationNamespace(t.Context(), st, proposer, kv.NamespaceAdmissionCommand{
+			Version: kv.MigrationNamespaceVersion, ConfigurationIndex: index, ApplyMembers: []uint64{member},
+			Members: []kv.NamespaceMemberCapability{{MemberID: member, Version: kv.MigrationNamespaceVersion, ConfigurationIndex: index}},
+		}))
 	}
 	i := NewInternalWithEngine(nil, ownershipRuntimeLeader{configuration: configuration}, nil, nil,
-		WithInternalStore(st), WithInternalMigrationProposer(&ownershipRuntimeProposer{fsm: fsm, index: 20}),
+		WithInternalStore(st), WithInternalMigrationProposer(proposer),
+		WithMigrationNamespaceAdmissionReady(func() bool { return kv.MigrationNamespaceInstalledVersion(st, fsm) == kv.MigrationNamespaceVersion }),
 		WithInternalMigrationOwnershipReady(func() bool { return true }), WithInternalMigrationTransferSizeGuardReady(ready))
 	return i, configuration
 }

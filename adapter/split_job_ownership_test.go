@@ -6,6 +6,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -23,6 +24,18 @@ type ownershipRuntimeLeader struct {
 func (l ownershipRuntimeLeader) AppliedConfigurationIndex() (uint64, bool) {
 	index := l.configuration.AppliedConfigurationIndex()
 	return index, index != 0
+}
+
+// A simulated ConfChange still uses the full ordered inventory hook after
+// activation; the legacy index-only hook intentionally cannot replace it.
+type ownershipRuntimeConfiguration struct {
+	raftengine.AppliedConfigurationAware
+	inventory raftengine.NamespaceConfigurationAware
+	members   []uint64
+}
+
+func (c ownershipRuntimeConfiguration) RecordAppliedConfiguration(index uint64) error {
+	return c.inventory.RecordAppliedNamespaceConfiguration(index, c.members)
 }
 
 type ownershipRuntimeProposer struct {
@@ -94,10 +107,19 @@ func newOwnershipRuntimeClient(t *testing.T, st store.MVCCStore, groupID uint64)
 	fsm := kv.NewKvFSMWithHLC(st, nil, kv.WithRouteHistory(nil, groupID))
 	configuration, ok := fsm.(raftengine.AppliedConfigurationAware)
 	require.True(t, ok)
-	require.NoError(t, configuration.RecordAppliedConfiguration(9))
+	inventory, ok := fsm.(raftengine.NamespaceConfigurationAware)
+	require.True(t, ok)
+	member := etcd.DeriveNodeID("voter")
+	require.NoError(t, inventory.RecordAppliedNamespaceConfiguration(9, []uint64{member}))
+	configuration = ownershipRuntimeConfiguration{AppliedConfigurationAware: configuration, inventory: inventory, members: []uint64{member}}
 	proposer := &ownershipRuntimeProposer{fsm: fsm, index: 20}
+	require.NoError(t, kv.ActivateMigrationNamespace(t.Context(), st, proposer, kv.NamespaceAdmissionCommand{
+		Version: kv.MigrationNamespaceVersion, ConfigurationIndex: 9, ApplyMembers: []uint64{member},
+		Members: []kv.NamespaceMemberCapability{{MemberID: member, Version: kv.MigrationNamespaceVersion, ConfigurationIndex: 9}},
+	}))
 	i := NewInternalWithEngine(nil, ownershipRuntimeLeader{configuration: configuration}, nil, nil,
 		WithInternalStore(st), WithInternalMigrationProposer(proposer), WithInternalMigrationOwnershipReady(func() bool { return true }),
+		WithMigrationNamespaceAdmissionReady(func() bool { return kv.MigrationNamespaceInstalledVersion(st, fsm) == kv.MigrationNamespaceVersion }),
 		WithInternalMigrationCleanupGate(func(context.Context) error { return nil }))
 	return &ownershipRuntimeClient{internal: i}, configuration
 }
