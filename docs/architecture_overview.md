@@ -12,6 +12,8 @@ flowchart TB
     GC["gRPC RawKV/Transactional Client"]
     OC["Operator Client (grpcurl/SDK)"]
     SC["S3 Client (AWS CLI / SDKs / rclone)"]
+    SQSC["SQS Client (AWS CLI / SDKs)"]
+    FC["FuseFS Client (POSIX Apps / Kernel VFS)"]
     RP["redis-proxy (cmd/redis-proxy)"]
   end
 
@@ -22,6 +24,8 @@ flowchart TB
       GS["gRPC Server (adapter/grpc.go)"]
       DS["Distribution Server (adapter/distribution_server.go)"]
       S3S["S3 Server (adapter/s3.go)"]
+      SQSS["SQS Server (adapter/sqs.go)"]
+      FS["FuseFS (internal/filesystem/fuseadapter)"]
     end
 
     subgraph DataPlane["Data Plane"]
@@ -52,6 +56,8 @@ flowchart TB
   GC --> GS
   OC --> DS
   SC --> S3S
+  SQSC --> SQSS
+  FC --> FS
   RP --> RS
 
   RS --> SCC
@@ -59,6 +65,10 @@ flowchart TB
   GS --> SCC
   GS --> SS
   S3S --> SCC
+  SQSS --> SCC
+  SQSS --> SS
+  FS --> SCC
+  FS --> SS
   SCC --> SR
   SCC --> DE
   SS --> DE
@@ -87,7 +97,7 @@ flowchart TB
 flowchart LR
   subgraph Cluster["Elastickv Cluster"]
     subgraph N1["Node A"]
-      AIN["Ingress (gRPC/Redis/DynamoDB/S3)"]
+      AIN["Ingress (gRPC/Redis/DynamoDB/S3/SQS/FuseFS)"]
       ADE["Route Engine"]
       ACW["Catalog Watcher"]
       ARG0["Default Group Runtime (Catalog Keys)"]
@@ -95,7 +105,7 @@ flowchart LR
     end
 
     subgraph N2["Node B"]
-      BIN["Ingress (gRPC/Redis/DynamoDB/S3)"]
+      BIN["Ingress (gRPC/Redis/DynamoDB/S3/SQS/FuseFS)"]
       BDE["Route Engine"]
       BCW["Catalog Watcher"]
       BRG0["Default Group Runtime (Catalog Keys)"]
@@ -103,7 +113,7 @@ flowchart LR
     end
 
     subgraph N3["Node C"]
-      CIN["Ingress (gRPC/Redis/DynamoDB/S3)"]
+      CIN["Ingress (gRPC/Redis/DynamoDB/S3/SQS/FuseFS)"]
       CDE["Route Engine"]
       CCW["Catalog Watcher"]
       CRG0["Default Group Runtime (Catalog Keys)"]
@@ -170,14 +180,14 @@ sequenceDiagram
   participant H as "HLC (all nodes)"
   participant Tx as "Txn / MVCC read-write path"
 
-	  loop "every hlcRenewalInterval (=1s; <20s)"
-	    L->>RG: "Propose HLC lease (now + hlcPhysicalWindowMs)"
-    RG-->>F: "Apply HLC lease entry"
-    F->>H: "SetPhysicalCeiling(ms)"
+  loop every hlcRenewalInterval (=1s, <20s)
+    L->>RG: Propose HLC lease (now + hlcPhysicalWindowMs)
+    RG-->>F: Apply HLC lease entry
+    F->>H: SetPhysicalCeiling(ms)
   end
 
-  Tx->>H: "Next()"
-  H-->>Tx: "ts = max(wall, ceiling)<<16 | logical_counter"
+  Tx->>H: Next()
+  H-->>Tx: ts = max(wall, ceiling)<<16 | logical_counter
 ```
 
 ## 5. Notes
