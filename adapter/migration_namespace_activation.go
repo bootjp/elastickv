@@ -82,6 +82,21 @@ func EnsureMigrationNamespaceAdmissionWithSnapshot(ctx context.Context,
 	if err != nil {
 		return errors.WithStack(err)
 	}
+	if err := activateNamespaceWithSnapshot(ctx, snapshot, before, activate, joining); err != nil {
+		return err
+	}
+	for _, member := range before.Members {
+		if _, err := probeNamespacePeer(ctx, member, before.ConfigurationIndex, true); err != nil {
+			return err
+		}
+	}
+	return revalidateNamespaceSnapshot(ctx, snapshot, before)
+}
+
+func activateNamespaceWithSnapshot(ctx context.Context,
+	snapshot func(context.Context) (NamespaceAdmissionSnapshot, error), before NamespaceAdmissionSnapshot,
+	activate func(context.Context, kv.NamespaceAdmissionCommand) error, joining []NamespaceAdmissionPeer,
+) error {
 	command, alreadyActive, err := namespaceNegotiation(ctx, before, joining)
 	if err != nil {
 		return err
@@ -94,12 +109,7 @@ func EnsureMigrationNamespaceAdmissionWithSnapshot(ctx context.Context,
 			return errors.WithStack(err)
 		}
 	}
-	for _, member := range before.Members {
-		if _, err := probeNamespacePeer(ctx, member, before.ConfigurationIndex, true); err != nil {
-			return err
-		}
-	}
-	return revalidateNamespaceSnapshot(ctx, snapshot, before)
+	return nil
 }
 
 func namespaceNegotiation(ctx context.Context, snapshot NamespaceAdmissionSnapshot, joining []NamespaceAdmissionPeer) (kv.NamespaceAdmissionCommand, bool, error) {
