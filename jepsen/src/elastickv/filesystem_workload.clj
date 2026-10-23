@@ -107,6 +107,10 @@
   "Attempt limit for reads/setup and pre-mutation write failures."
   8)
 
+(def ^:const final-read-min-retries
+  "Final reads run after writers stop and must outlast transient FUSE conflicts."
+  32)
+
 (def ^:const retry-backoff-ms 20)
 
 (def retryable-messages
@@ -515,7 +519,10 @@
    LOOKUP/OPEN race against a concurrent rename."
   [{:keys [local? mount-dir max-retries require-fuse-mount]} test node op k]
   (try
-    (let [v (with-retries max-retries read-retryable-error?
+    (let [attempts (if (:final op)
+                     (max max-retries final-read-min-retries)
+                     max-retries)
+          v (with-retries attempts read-retryable-error?
               (fn []
                 (if local?
                   (do (require-local-mount! mount-dir require-fuse-mount)

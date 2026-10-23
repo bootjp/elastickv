@@ -53,7 +53,7 @@ jobs:
       - name: Install netcat, graphviz and fuse3
         # fuse3 provides fusermount3 for the --filesystemMount nodes used by
         # the filesystem Jepsen workload.
-        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3
+        run: sudo apt-get update && sudo apt-get install -y netcat-openbsd graphviz fuse3 sqlite3
       - name: Install Leiningen
         run: |
           curl -L https://raw.githubusercontent.com/technomancy/leiningen/stable/bin/lein > ~/lein
@@ -324,7 +324,29 @@ jobs:
         # one fails so the summary shows which mode broke.
         # See jepsen/src/elastickv/filesystem_workload.clj.
         timeout-minutes: 20
+        env:
+          FS_REQUESTED_KEYS: ${{ inputs.key-count || '16' }}
+          FS_REQUESTED_WRITES: ${{ inputs.max-writes-per-key || '250' }}
         run: |
+          # Knossos checks each register independently. Bound each history's
+          # ambiguous writes while keeping the requested total write budget.
+          valid_java_positive_int() {
+            [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 1
+            [[ ${#1} -lt 10 ]] && return 0
+            [[ ${#1} -eq 10 ]] || return 1
+            (( 10#$1 <= 2147483647 ))
+          }
+          if ! valid_java_positive_int "$FS_REQUESTED_KEYS" || ! valid_java_positive_int "$FS_REQUESTED_WRITES"; then
+            echo "key-count and max-writes-per-key must be positive 32-bit integers" >&2
+            exit 1
+          fi
+          FS_MAX_WRITES=$((FS_REQUESTED_WRITES < 64 ? FS_REQUESTED_WRITES : 64))
+          FS_KEY_COUNT=$(((FS_REQUESTED_KEYS * FS_REQUESTED_WRITES + FS_MAX_WRITES - 1) / FS_MAX_WRITES))
+          if (( FS_KEY_COUNT > 2147483647 )); then
+            echo "calculated filesystem key count exceeds the 32-bit CLI limit" >&2
+            exit 1
+          fi
+          echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
           declare -A RESULT
           FAILED=()
           for mode in overwrite rename; do
@@ -334,8 +356,8 @@ jobs:
               --time-limit ${{ inputs.time-limit || '150' }} \
               --rate ${{ inputs.rate || '10' }} \
               --concurrency ${{ inputs.concurrency || '8' }} \
-              --key-count ${{ inputs.key-count || '16' }} \
-              --max-writes-per-key ${{ inputs.max-writes-per-key || '250' }} \
+              --key-count "$FS_KEY_COUNT" \
+              --max-writes-per-key "$FS_MAX_WRITES" \
               --write-mode "${mode}" \
               --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
             rc=$?
@@ -357,6 +379,15 @@ jobs:
             echo "FAILED modes: ${FAILED[*]}"
             exit 1
           fi
+      - name: Run SQLite Jepsen workload on FUSE
+        working-directory: jepsen
+        timeout-minutes: 12
+        run: |
+          timeout 600 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit ${{ inputs.time-limit || '150' }} \
+            --rate ${{ inputs.rate || '10' }} \
+            --concurrency 8 --key-count 16 --max-writes-per-key 64 \
+            --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
       - name: Upload Jepsen store on failure
         if: failure()
         uses: actions/upload-artifact@v7
