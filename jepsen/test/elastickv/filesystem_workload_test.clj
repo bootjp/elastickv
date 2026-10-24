@@ -294,7 +294,8 @@
   ;; reported by knossos as well as by the final-reads checker.
   (let [check (fn [history]
                 (:valid? (checker/check (workload/filesystem-register-checker)
-                                        {:name "fs-test" :start-time 0}
+                                        {:name "fs-test"
+                                         :start-time (java.time.OffsetDateTime/parse "1970-01-01T00:00:00Z")}
                                         (history/history history)
                                         {})))]
     (is (true? (check [{:process 0 :type :invoke :f :write :value 3}
