@@ -1,0 +1,41 @@
+name: Review approval events
+
+on:
+  pull_request_review:
+    types: [submitted, edited, dismissed]
+  pull_request_review_comment:
+    types: [created, edited, deleted]
+  pull_request:
+    paths:
+      - '.github/scripts/review-approval-label*'
+      - '.github/workflows/review-approval-*.yml'
+      - '.github/workflows/claude.yml'
+  push:
+    paths:
+      - '.github/scripts/review-approval-label*'
+      - '.github/workflows/review-approval-*.yml'
+      - '.github/workflows/claude.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  notify:
+    if: >-
+      github.event_name == 'pull_request_review' ||
+      github.event_name == 'pull_request_review_comment'
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    steps:
+      # The privileged workflow_run consumer reads current API state only.
+      # No PR code, tokens with write access, or artifacts are needed here.
+      - run: ':'
+  test:
+    if: github.event_name == 'pull_request' || github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - run: node --test .github/scripts/review-approval-label.test.cjs
