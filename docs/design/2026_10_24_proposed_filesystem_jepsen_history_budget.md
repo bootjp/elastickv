@@ -14,10 +14,17 @@ successfully.
 
 ## Change
 
-Keep the 64-write cap for `overwrite`. Limit `rename` to 16 writes per key
-and increase its key count to retain the requested aggregate write budget.
+Limit both write modes to 16 writes per key and increase key count to retain
+the requested aggregate write budget. A schedule-equivalent CI replay showed
+that `overwrite` can also exhaust Knossos at 64 writes per key.
 Calculate each mode's budget immediately before invoking the workload.
 Reject a calculated key count that exceeds the Java CLI integer limit.
+
+The same replay found one `rename` final read that remained transiently
+unavailable after the existing 32 retry attempts. Extend only final-phase
+read retries to 128 attempts. Main-phase retries remain bounded at the
+configured value, and a persistent final read failure still gives an unknown
+or data-loss result rather than being ignored.
 
 The checker and its register model remain unchanged, so every completed
 history is still checked for linearizability. Final reads still cover every
@@ -26,11 +33,12 @@ register on every mount.
 ## Verification
 
 Test the default 16-key × 250-write request in both modes, a small request
-below the cap, and the integer-limit rejection. Run the filesystem Jepsen
-unit tests and the scheduled workflow with the new budget.
+below the cap, and the integer-limit rejection. Add a final-read regression
+for a read that succeeds after 32 transient EAGAIN results. Run the filesystem
+Jepsen unit tests and the scheduled workflow with the new budget.
 
 ## Risk
 
-The default `rename` workload initializes 250 files instead of 63 and reads
+Both default filesystem workloads initialize 250 files instead of 63 and read
 them at the end. The scheduled job timeout must cover that extra work; a full
 workflow run is needed to validate runtime and checker completion.
