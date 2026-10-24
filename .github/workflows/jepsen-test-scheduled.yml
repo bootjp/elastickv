@@ -388,12 +388,15 @@ jobs:
             --rate ${{ inputs.rate || '10' }} \
             --concurrency 8 --key-count 16 --max-writes-per-key 64 \
             --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
+      - name: Archive Jepsen store on failure
+        if: failure()
+        run: bash scripts/archive-jepsen-store.sh jepsen/store /tmp/jepsen-store-types.tar.gz
       - name: Upload Jepsen store on failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: jepsen-store-types
-          path: jepsen/store
+          path: /tmp/jepsen-store-types.tar.gz
           retention-days: 7
       - name: Dump demo cluster log on failure
         if: failure()

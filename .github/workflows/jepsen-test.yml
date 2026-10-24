@@ -84,6 +84,8 @@ jobs:
       - name: Run Jepsen unit tests
         working-directory: jepsen
         run: ~/lein test
+      - name: Test Jepsen evidence archiving
+        run: bash scripts/test-archive-jepsen-store.sh
       - name: Launch etcd-backed cluster
         run: |
           set -euo pipefail
@@ -194,13 +196,16 @@ jobs:
             --raftadmin-bin /tmp/elastickv-raftadmin-bin \
             --raft-addresses 127.0.0.1:50051,127.0.0.1:50052,127.0.0.1:50053 \
             --leader-change-interval 2
+      - name: Archive DynamoDB seal acceptance history
+        if: always()
+        run: bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-dynamodb-snapshot-seal /tmp/dynamodb-seal-history.tar.gz
       - name: Upload DynamoDB seal acceptance history
         if: always()
         uses: actions/upload-artifact@v7
         with:
           name: dynamodb-seal-encryption-${{ matrix.encryption }}
           path: |
-            jepsen/store/elastickv-dynamodb-snapshot-seal/
+            /tmp/dynamodb-seal-history.tar.gz
             /tmp/dynamodb-seal-source.txt
           retention-days: 7
           if-no-files-found: ignore
@@ -239,12 +244,15 @@ jobs:
             echo "FAILED types: ${FAILED[*]}"
             exit 1
           fi
+      - name: Archive Jepsen store on per-type failure
+        if: failure()
+        run: bash scripts/archive-jepsen-store.sh jepsen/store /tmp/jepsen-store-types.tar.gz
       - name: Upload Jepsen store on per-type failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: jepsen-store-types-encryption-${{ matrix.encryption }}
-          path: jepsen/store
+          path: /tmp/jepsen-store-types.tar.gz
           retention-days: 7
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
@@ -341,14 +349,15 @@ jobs:
             --time-limit 5 --rate 5 --concurrency 6 \
             --key-count 6 --max-writes-per-key 16 \
             --mount-dirs /tmp/elastickv-ci/fs-n1,/tmp/elastickv-ci/fs-n2,/tmp/elastickv-ci/fs-n3
+      - name: Archive Jepsen store on filesystem failure
+        if: failure()
+        run: bash scripts/archive-jepsen-store.sh jepsen/store /tmp/jepsen-store-filesystem.tar.gz
       - name: Upload Jepsen store on filesystem failure
         if: failure()
         uses: actions/upload-artifact@v7
         with:
           name: jepsen-store-filesystem-encryption-${{ matrix.encryption }}
-          path: |
-            jepsen/store/elastickv-filesystem-register-*
-            jepsen/store/elastickv-sqlite-register-*
+          path: /tmp/jepsen-store-filesystem.tar.gz
           retention-days: 7
           if-no-files-found: ignore
       - name: Dump demo cluster logs on failure
