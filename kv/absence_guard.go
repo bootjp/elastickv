@@ -32,3 +32,19 @@ func validateAbsenceMutationKinds(mutations []*pb.Mutation) error {
 	}
 	return nil
 }
+
+// refuseAbsenceProposal keeps require_absent out of the log entirely until
+// M1b fences every voter and learner onto the capability. A pre-capability
+// binary decodes the field as unknown and applies the PUT that a current FSM
+// refuses, so proposing it in a mixed-version group diverges replicas at the
+// same applied index. Internal.Forward hands caller-supplied mutations here.
+func refuseAbsenceProposal(reqs []*pb.Request) error {
+	for _, req := range reqs {
+		for _, mutation := range req.GetMutations() {
+			if mutation.GetRequireAbsent() {
+				return errors.WithStack(ErrTTLInlineCapabilityRequired)
+			}
+		}
+	}
+	return nil
+}

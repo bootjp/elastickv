@@ -205,6 +205,9 @@ func (t *TransactionManager) Commit(ctx context.Context, reqs []*pb.Request) (*T
 	if len(reqs) == 0 {
 		return &TransactionResponse{}, nil
 	}
+	if err := refuseAbsenceProposal(reqs); err != nil {
+		return nil, err
+	}
 	owned, err := t.timestampAdmission.Load().prepare(ctx, reqs)
 	if err != nil {
 		return nil, err
