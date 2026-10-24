@@ -20,6 +20,7 @@ func TestIsTxnInternalKeyReservesOnlyKnownFamilies(t *testing.T) {
 		[]byte(txnCommitPrefix + "k"),
 		[]byte(txnRollbackPrefix + "k"),
 		[]byte(txnMetaPrefix + "k"),
+		[]byte("!txn|meta|ttl-inline-control|backup-pins"),
 		backupTimestampFloorKey,
 	} {
 		require.True(t, isTxnInternalKey(key), "reserved key %q", key)
@@ -27,6 +28,7 @@ func TestIsTxnInternalKeyReservesOnlyKnownFamilies(t *testing.T) {
 
 	for _, key := range [][]byte{
 		[]byte("!txn|foo"),
+		[]byte("!txn|control|backup-pins"),
 		[]byte("!txn|"),
 		[]byte("!txnfoo"),
 		// The backup family reserves the exact floor key, not the prefix: a

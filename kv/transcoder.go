@@ -54,6 +54,9 @@ type Elem[T OP] struct {
 	Op    T
 	Key   []byte
 	Value []byte
+	// RequireAbsent is an apply-time precondition for a capability-gated,
+	// single-owner TTL-inline relocation. Tombstones also count as present.
+	RequireAbsent bool
 	// CommitTSValueOffset, when non-zero, asks the coordinator or forwarded
 	// leader to stamp the resolved transaction commit timestamp into Value at
 	// this byte offset before committing the mutation.

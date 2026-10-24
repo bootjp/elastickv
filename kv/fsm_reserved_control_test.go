@@ -31,6 +31,7 @@ func TestValidateRawMutationRejectsReservedControlKeys(t *testing.T) {
 		[]byte("!migstage|7|victim"),
 		[]byte("!migwrite|7"),
 		[]byte("!migfence|7"),
+		[]byte(store.ReplicatedControlPrefix + "ttl-inline"),
 	} {
 		err := f.validateRawMutationForApply(ctx, &pb.Mutation{Op: pb.Op_PUT, Key: key, Value: []byte("v")}, nil, 10, nil)
 		require.ErrorIs(t, err, ErrInvalidRequest, "key %q must be refused", key)
@@ -106,6 +107,7 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 		distribution.MigrationStagedDataKey(7, []byte("victim")),
 		[]byte("!migwrite|7"),
 		[]byte("!migfence|7"),
+		[]byte(store.ReplicatedControlPrefix + "ttl-inline"),
 	} {
 		muts := []*pb.Mutation{{Op: pb.Op_PUT, Key: key, Value: []byte("v")}}
 		_, err := f.uniqueMutationsAboveFloor(context.Background(), muts, 10)
@@ -134,4 +136,17 @@ func TestTxnMutationHelpersRejectReservedControlKeys(t *testing.T) {
 		_, err = f.uniqueTxnMutationsAboveFloor(context.Background(), muts, 10)
 		require.NoError(t, err, "key %q must be accepted", key)
 	}
+}
+
+func TestWholeKeyspaceDeletePreservesReplicatedControlState(t *testing.T) {
+	t.Parallel()
+	st := g17OpenStore(t, t.TempDir())
+	seedActivatedPinJournal(t, st)
+	before := newPinJournal(t, st).snapshot()
+	f := g17FSM(t, st)
+	require.Nil(t, f.Apply(g17Entry(t, g17RawPut(10, "ordinary", "value"))))
+	f.SetApplyIndex(g17EntryIndex + 1)
+	require.Nil(t, f.Apply(g17Entry(t, g17RawDelPrefix(11, ""))))
+	require.False(t, g17Exists(t, st, "ordinary"))
+	require.Equal(t, before, newPinJournal(t, st).snapshot())
 }

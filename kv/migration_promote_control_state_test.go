@@ -12,7 +12,7 @@ import (
 )
 
 func TestMigrationPromoteRestoredStagingPreservesLocalControl(t *testing.T) {
-	for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey} {
+	for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey, replicatedPinStateKey} {
 		for _, tombstone := range []bool{false, true} {
 			t.Run(fmt.Sprintf("%s-delete-%t", key, tombstone), func(t *testing.T) {
 				assertRestoredPromotionPreservesControl(t, key, tombstone)
@@ -27,6 +27,9 @@ func assertRestoredPromotionPreservesControl(t *testing.T, key []byte, tombstone
 	source, err := store.NewPebbleStore(t.TempDir())
 	require.NoError(t, err)
 	defer func() { require.NoError(t, source.Close()) }()
+	if bytes.Equal(key, replicatedPinStateKey) {
+		seedActivatedPinJournal(t, source)
+	}
 	fsm := newPrepareSafetyFSM(t, source)
 	require.NoError(t, fsm.persistBackupTimestampFloor(ctx, 100))
 	for _, command := range [][]byte{EncodePrepareEvidenceFence(0), EncodePrepareEvidenceSeal(), EncodePrepareEvidenceFence(100), EncodePrepareEvidenceRelease(100)} {

@@ -1636,7 +1636,7 @@ func TestDeltaCompactor_TTLInlineStopsAfterTimeout(t *testing.T) {
 	require.True(t, bytes.HasPrefix(st.starts[0], []byte(redisStrPrefix)))
 }
 
-func TestDeltaCompactor_RotatesHandlerAfterTimeout(t *testing.T) {
+func TestDeltaCompactor_RotatesAllBackgroundWorkAfterTimeout(t *testing.T) {
 	t.Parallel()
 
 	base := store.NewMVCCStore()
@@ -1655,8 +1655,11 @@ func TestDeltaCompactor_RotatesHandlerAfterTimeout(t *testing.T) {
 		store.HashMetaDeltaPrefix,
 		store.SetMetaDeltaPrefix,
 		store.ZSetMetaDeltaPrefix,
-		store.ListMetaDeltaPrefix,
 	}
+	for _, handler := range c.ttlInlineMigrationHandlers() {
+		wantPrefixes = append(wantPrefixes, string(handler.prefix))
+	}
+	wantPrefixes = append(wantPrefixes, store.ListMetaDeltaPrefix)
 	for _, prefix := range wantPrefixes {
 		err := c.SyncOnce(context.Background())
 		require.ErrorIs(t, err, context.DeadlineExceeded)

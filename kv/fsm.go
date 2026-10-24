@@ -40,6 +40,8 @@ func observeStoreLastCommitTS(hlc *HLC, st store.MVCCStore) {
 type kvFSM struct {
 	store store.MVCCStore
 	log   *slog.Logger
+	// Set only by the replicated protocol activation, never by a process flag.
+	ttlInlineCapability atomic.Bool
 	// hlc is the shared HLC instance updated when a HLC lease entry is applied.
 	// May be nil for nodes that do not participate in physical ceiling tracking.
 	hlc *HLC
@@ -114,6 +116,8 @@ type kvFSM struct {
 	// timestamped before the backup cut and reached apply too late.
 	backupTimestampFloor          atomic.Uint64
 	backupFloorLoadErr            error
+	replicatedPins                *replicatedPinJournal
+	replicatedPinLoadErr          error
 	prepareEvidenceEnabled        atomic.Bool
 	prepareCreationSealed         atomic.Bool
 	prepareEvidenceReleaseFloor   atomic.Uint64
@@ -313,6 +317,7 @@ func NewKvFSMWithHLC(store store.MVCCStore, hlc *HLC, opts ...FSMOption) FSM {
 		opt(f)
 	}
 	f.backupFloorLoadErr = f.reloadBackupTimestampFloor(context.Background())
+	f.replicatedPinLoadErr = f.reloadReplicatedBackupPins(context.Background())
 	f.snapLatch.log = f.log
 	observeStoreLastCommitTS(hlc, store)
 	return f
@@ -374,6 +379,9 @@ type fsmApplyResponse struct {
 }
 
 func (f *kvFSM) Apply(data []byte) any {
+	if f.replicatedPinLoadErr != nil {
+		return replicatedBackupHalt(f.replicatedPinLoadErr, "load journal")
+	}
 	if f.backupFloorLoadErr != nil {
 		return haltErr(errors.Wrap(errors.Mark(f.backupFloorLoadErr, ErrBackupApply), "kv/fsm: load backup timestamp floor"))
 	}
@@ -478,6 +486,7 @@ func isRawApplyVerdict(err error) bool {
 		errors.Is(err, ErrMigrationTransferTooLarge) ||
 		errors.Is(err, ErrRouteCutoverPending) ||
 		errors.Is(err, ErrUnknownRequestType) ||
+		errors.Is(err, ErrTTLInlineCapabilityRequired) ||
 		errors.Is(err, ErrBackupTimestampFenced) ||
 		errors.Is(err, ErrPrepareCreationSealed) ||
 		isRawRouteVerdict(err) ||
@@ -539,12 +548,13 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
-	case data[0] == raftEncodeBackup:
-		return f.applyBackup(data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
-		return f.applyMigrationOpcode(ctx, data)
+		if resp, handled := f.applyMigrationOpcode(ctx, data); handled {
+			return resp, true
+		}
+		return f.applyBackupOpcode(ctx, data[0], data[1:])
 	}
 }
 
@@ -780,6 +790,9 @@ func (f *kvFSM) applyRequestErr(ctx context.Context, r *pb.Request) error {
 }
 
 func (f *kvFSM) handleRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
+	if err := f.validateAbsenceRequest(r); err != nil {
+		return err
+	}
 	switch {
 	case r.IsTxn:
 		return f.handleTxnRequest(ctx, r, commitTS)
@@ -1563,6 +1576,10 @@ func (f *kvFSM) restoreSnapshot(r io.Reader, restoreStore func(io.Reader) error)
 	if f.backupFloorLoadErr != nil {
 		return errors.Wrap(f.backupFloorLoadErr, "restore backup timestamp floor")
 	}
+	f.replicatedPinLoadErr = f.reloadReplicatedBackupPins(context.Background())
+	if f.replicatedPinLoadErr != nil {
+		return errors.Wrap(f.replicatedPinLoadErr, "restore replicated backup pins")
+	}
 	observeStoreLastCommitTS(f.hlc, f.store)
 	return nil
 }
@@ -1971,7 +1988,7 @@ func uniqueMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 	if len(muts) == 0 {
 		return []*pb.Mutation{}, nil
 	}
-	seen := make(map[string]struct{}, len(muts))
+	seen := make(map[string]int, len(muts))
 	reversed := make([]*pb.Mutation, 0, len(muts))
 	// Keep the last mutation per key to avoid dropping final operations like
 	// PUT followed by DEL in the same transactional batch.
@@ -1981,10 +1998,15 @@ func uniqueMutations(muts []*pb.Mutation) ([]*pb.Mutation, error) {
 			return nil, errors.WithStack(ErrInvalidRequest)
 		}
 		keyStr := string(mut.Key)
-		if _, ok := seen[keyStr]; ok {
+		if index, ok := seen[keyStr]; ok {
+			if mut.RequireAbsent {
+				kept := proto.CloneOf(reversed[index])
+				kept.RequireAbsent = true
+				reversed[index] = kept
+			}
 			continue
 		}
-		seen[keyStr] = struct{}{}
+		seen[keyStr] = len(reversed)
 		reversed = append(reversed, mut)
 	}
 
@@ -2243,7 +2265,7 @@ func (f *kvFSM) rejectReservedControlMutations(muts []*pb.Mutation) error {
 		if mut == nil {
 			continue
 		}
-		if f.isMigrationOnlyControlKeyForApply(mut.Key) {
+		if f.isMigrationOnlyControlKeyForApply(mut.Key) || store.IsReplicatedControlKey(mut.Key) {
 			return errors.WithStack(ErrInvalidRequest)
 		}
 	}
@@ -3106,19 +3128,24 @@ func txnLockConflictError(lockBytes []byte, key, primaryKey []byte, startTS uint
 }
 
 func toStoreMutations(muts []*pb.Mutation) ([]*store.KVPairMutation, error) {
+	if err := validateAbsenceMutationKinds(muts); err != nil {
+		return nil, err
+	}
 	out := make([]*store.KVPairMutation, 0, len(muts))
 	for _, mut := range muts {
 		switch mut.Op {
 		case pb.Op_PUT:
 			out = append(out, &store.KVPairMutation{
-				Op:    store.OpTypePut,
-				Key:   mut.Key,
-				Value: mut.Value,
+				Op:            store.OpTypePut,
+				Key:           mut.Key,
+				Value:         mut.Value,
+				RequireAbsent: mut.RequireAbsent,
 			})
 		case pb.Op_DEL:
 			out = append(out, &store.KVPairMutation{
-				Op:  store.OpTypeDelete,
-				Key: mut.Key,
+				Op:            store.OpTypeDelete,
+				Key:           mut.Key,
+				RequireAbsent: mut.RequireAbsent,
 			})
 		case pb.Op_DEL_PREFIX:
 			return nil, ErrUnknownRequestType

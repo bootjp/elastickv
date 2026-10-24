@@ -29,15 +29,11 @@ var backupTimestampFloorKey = []byte(txnBackupPrefix + "timestamp_floor")
 const backupTimestampFloorValueSize = 8
 
 func (f *kvFSM) applyBackup(data []byte) any {
-	if len(data) != 0 && isPrepareEvidenceControlSubtype(data[0]) {
-		entry, err := decodeBackupPayload(data)
-		if err == nil {
-			err = f.applyPrepareEvidenceControl(entry)
-		}
-		if err != nil {
-			return haltErr(errors.Wrap(err, "apply prepare evidence fence"))
-		}
-		return nil
+	if result, handled := f.applyPrepareEvidenceBackup(data); handled {
+		return result
+	}
+	if f.replicatedPins != nil && f.replicatedPins.snapshot().Pins.Epoch != 0 {
+		return errors.Wrap(ErrInvalidBackupPin, "legacy backup command rejected after epoch activation")
 	}
 	if f.readTracker == nil {
 		return haltErr(errors.Wrap(ErrBackupApply, "kv/fsm: backup entry arrived but no ActiveTimestampTracker is wired"))
@@ -54,6 +50,20 @@ func (f *kvFSM) applyBackup(data []byte) any {
 		return err
 	}
 	return haltErr(errors.Wrap(errors.Mark(err, ErrBackupApply), "kv/fsm: apply backup entry"))
+}
+
+func (f *kvFSM) applyPrepareEvidenceBackup(data []byte) (any, bool) {
+	if len(data) == 0 || !isPrepareEvidenceControlSubtype(data[0]) {
+		return nil, false
+	}
+	entry, err := decodeBackupPayload(data)
+	if err == nil {
+		err = f.applyPrepareEvidenceControl(entry)
+	}
+	if err != nil {
+		return haltErr(errors.Wrap(err, "apply prepare evidence fence")), true
+	}
+	return nil, true
 }
 
 func (f *kvFSM) applyDecodedBackup(entry backupEntry) error {

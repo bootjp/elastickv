@@ -244,6 +244,9 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 
 	compactCtx, cancel := c.compactContext(ctx, status)
 	defer cancel()
+	if err := requireLegacyCompactionState(compactCtx, runtime.Store); err != nil {
+		return errors.Wrapf(err, "compact group %d retention protocol", runtime.GroupID)
+	}
 
 	if err := runtime.Store.Compact(compactCtx, safeMinTS); err != nil {
 		c.handleCompactError(ctx, runtime.GroupID, status, compactCtx, err)
@@ -257,6 +260,23 @@ func (c *FSMCompactor) compactRuntime(ctx context.Context, runtime FSMCompactRun
 		"min_retained_ts", safeMinTS,
 		"last_commit_ts", lastCommitTS,
 	)
+	return nil
+}
+
+// New-protocol state must never fall back to the wall-clock-expiring legacy
+// tracker. Until the ReadIndex/prepare/drain/floor path is wired, its persisted
+// epoch keeps reclamation closed, even with an empty active set or after restore.
+func requireLegacyCompactionState(ctx context.Context, st store.MVCCStore) error {
+	if _, supported := st.(store.ReplicatedControlStore); !supported {
+		return nil
+	}
+	journal, err := openReplicatedPinJournal(ctx, st)
+	if err != nil {
+		return errors.Wrap(err, "load replicated retention state")
+	}
+	if journal.snapshot().Pins.Epoch != 0 {
+		return errors.Wrap(ErrTTLInlineCapabilityRequired, "replicated retention requires a fresh quorum barrier and prepared read floor")
+	}
 	return nil
 }
 

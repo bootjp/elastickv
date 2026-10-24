@@ -332,8 +332,12 @@ type Mutation struct {
 	// that durably embed their own creation timestamp but still need leader-side
 	// timestamp allocation after redirect/retry.
 	CommitTsValueOffset uint64 `protobuf:"varint,4,opt,name=commit_ts_value_offset,json=commitTsValueOffset,proto3" json:"commit_ts_value_offset,omitempty"`
-	unknownFields       protoimpl.UnknownFields
-	sizeCache           protoimpl.SizeCache
+	// require_absent is the TTL-inline relocation precondition: no committed
+	// version of key, including tombstones, may exist when the 1PC applies.
+	// It requires the replicated TTL-inline capability on every voter/learner.
+	RequireAbsent bool `protobuf:"varint,5,opt,name=require_absent,json=requireAbsent,proto3" json:"require_absent,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
 }
 
 func (x *Mutation) Reset() {
@@ -392,6 +396,13 @@ func (x *Mutation) GetCommitTsValueOffset() uint64 {
 		return x.CommitTsValueOffset
 	}
 	return 0
+}
+
+func (x *Mutation) GetRequireAbsent() bool {
+	if x != nil {
+		return x.RequireAbsent
+	}
+	return false
 }
 
 type Request struct {
@@ -2813,12 +2824,13 @@ var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
 	"\n" +
-	"\x0einternal.proto\"|\n" +
+	"\x0einternal.proto\"\xa3\x01\n" +
 	"\bMutation\x12\x13\n" +
 	"\x02op\x18\x01 \x01(\x0e2\x03.OpR\x02op\x12\x10\n" +
 	"\x03key\x18\x02 \x01(\fR\x03key\x12\x14\n" +
 	"\x05value\x18\x03 \x01(\fR\x05value\x123\n" +
-	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\"\xbd\x02\n" +
+	"\x16commit_ts_value_offset\x18\x04 \x01(\x04R\x13commitTsValueOffset\x12%\n" +
+	"\x0erequire_absent\x18\x05 \x01(\bR\rrequireAbsent\"\xbd\x02\n" +
 	"\aRequest\x12\x15\n" +
 	"\x06is_txn\x18\x01 \x01(\bR\x05isTxn\x12\x1c\n" +
 	"\x05phase\x18\x02 \x01(\x0e2\x06.PhaseR\x05phase\x12\x0e\n" +
