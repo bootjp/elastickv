@@ -109,7 +109,7 @@
 
 (def ^:const final-read-min-retries
   "Final reads run after writers stop and must outlast transient FUSE conflicts."
-  32)
+  128)
 
 (def ^:const retry-backoff-ms 20)
 
