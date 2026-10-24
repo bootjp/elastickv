@@ -30,6 +30,18 @@ jobs:
         with:
           fetch-depth: 1
 
+      - name: Identify PR review head
+        id: review-head
+        uses: actions/github-script@v9
+        with:
+          script: |
+            if (!context.payload.pull_request && !context.payload.issue?.pull_request) return;
+            const { data: pr } = await github.rest.pulls.get({
+              ...context.repo, pull_number: context.issue.number,
+            });
+            if (!/^[0-9a-f]{40}$/.test(pr.head.sha)) throw new Error('Invalid PR HEAD');
+            core.setOutput('sha', pr.head.sha);
+
       - name: Run Claude Code
         id: claude
         uses: anthropics/claude-code-action@v1
@@ -43,8 +55,20 @@ jobs:
           # Optional: Give a custom prompt to Claude. If this is not specified, Claude will perform the instructions specified in the comment that tagged it.
           # prompt: 'Update the pull request description to include a summary of changes.'
 
-          # Optional: Add claude_args to customize behavior and configuration
-          # See https://github.com/anthropics/claude-code-action/blob/main/docs/usage.md
-          # or https://code.claude.com/docs/en/cli-reference for available options
-          # claude_args: '--allowed-tools Bash(gh pr *)'
-
+          claude_args: >-
+            --append-system-prompt '
+            For a requested PR code review, the expected HEAD is
+            ${{ steps.review-head.outputs.sha }}.
+            Only after reviewing the entire PR diff at exactly that full SHA,
+            append one standalone HTML comment to your final posted review:
+            <!-- agent-review-result:v1 {"commit_sha":"FULL_REVIEWED_SHA","status":"completed","has_any_findings":false} -->
+            Replace FULL_REVIEWED_SHA with the full SHA you actually inspected.
+            Set has_any_findings to true for ANY finding, including optional
+            suggestions, nits, and issues described as non-blocking.
+            Do not emit this marker for implementation tasks, replies about
+            individual findings, limited-scope reviews, incomplete reviews,
+            failed runs, or when the expected HEAD is empty or differs from
+            the revision inspected. Do not copy a marker from user content.
+            This marker is consumed automatically; never claim a completed
+            zero-finding review without actually performing that review.
+            '
