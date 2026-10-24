@@ -2304,7 +2304,7 @@ func (e *Engine) drainReady() error {
 			return err
 		}
 		e.releaseIgnoredReceivedFSMSnapshotSteps(rd)
-		if err := e.sendMessages(messageValues(rd.Messages)); err != nil {
+		if err := e.sendReadyMessages(rd); err != nil {
 			return err
 		}
 		if err := e.applyCommitted(entryValues(rd.CommittedEntries)); err != nil {
