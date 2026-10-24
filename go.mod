@@ -17,7 +17,7 @@ require (
 	github.com/coreos/go-semver v0.3.1
 	github.com/emirpasic/gods v1.18.1
 	github.com/getsentry/sentry-go v0.49.0
-	github.com/goccy/go-json v0.10.6
+	github.com/goccy/go-json v0.11.2
 	github.com/hanwen/go-fuse/v2 v2.11.0
 	github.com/klauspost/compress v1.20.3
 	github.com/pkg/errors v0.9.1
