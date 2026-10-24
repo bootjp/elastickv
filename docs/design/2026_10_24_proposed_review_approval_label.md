@@ -88,7 +88,7 @@ label preservation, and HEAD changes around label writes.
 
 ## Validation and self-review
 
-The 79 Node regression tests pass. Actionlint passes for the updater, event
+The 83 Node regression tests pass. Actionlint passes for the updater, event
 workflow, and changed Claude workflow. A read-only check against PR #1321's actual
 REST comments recognizes its full-SHA Codex result as a completed zero-finding
 code review. That PR is now closed; reconciliation does not approve closed PRs.
@@ -144,4 +144,10 @@ implementation is changed.
 
 Validation: both Phase-D cases passed 30 times each under `go test -race`
 (60 cases, 131.150s). Differential golangci-lint against `origin/main` reports
-zero issues. The 79 Node tests remain green.
+zero issues. The 83 Node tests remain green.
+
+A subsequent review isolated the fenced-only case: a documentation comment
+containing only a fenced marker example was classified as malformed evidence,
+overriding a previous clean review. Marker presence is now checked again after
+removing fences, so these comments contribute no evidence. Four regressions
+cover both reviewers and fence styles and failed before the one-line fix.

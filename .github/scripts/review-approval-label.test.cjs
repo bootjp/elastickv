@@ -121,6 +121,11 @@ for (const reviewer of ['codex', 'claude']) {
       result.body = `${fence}html\n${result.body}\n${fence}\n${result.body}`;
       assert.equal(evaluateApproval({ head: HEAD, comments: [result] }).approved, true);
     });
+    test(`${reviewer} fenced-only example does not replace clean evidence (${fence})`, () => {
+      const example = comment(reviewer, null, { id: 2, updated_at: '2026-10-24T11:00:00Z' });
+      example.body = `${fence}html\n${example.body}\n${fence}`;
+      assert.equal(evaluateApproval({ head: HEAD, comments: [comment(reviewer), example] }).approved, true);
+    });
   }
 }
 

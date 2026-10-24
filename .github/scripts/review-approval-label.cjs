@@ -27,6 +27,7 @@ function marker(body, name) {
     }
     return !fence;
   }).join('\n');
+  if (!prose.includes(`<!-- ${name}:`)) return;
   const matches = [...prose.matchAll(new RegExp(`^<!-- ${name}:v1 (.+) -->[ \\t]*$`, 'gm'))];
   if (matches.length !== 1 || prose.split(`<!-- ${name}:`).length !== 2) return null;
   try {
