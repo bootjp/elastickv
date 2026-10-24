@@ -53,6 +53,28 @@ type phaseDAcceptanceCluster struct {
 	releaseFaults  atomic.Int32
 }
 
+// phaseDReleaseFaultEngine keeps the injected release fault active when a
+// data leader becomes local to the TSO leader and no admin RPC is needed.
+type phaseDReleaseFaultEngine struct {
+	raftengine.Engine
+	cluster *phaseDAcceptanceCluster
+}
+
+// ProposeAdmin rejects only release entries while the shared fault is active.
+func (e *phaseDReleaseFaultEngine) ProposeAdmin(ctx context.Context, payload []byte) (*raftengine.ProposalResult, error) {
+	if e.cluster.releaseBlocked.Load() && isPhaseDAcceptanceRelease(payload) {
+		e.cluster.releaseFaults.Add(1)
+		return nil, status.Error(codes.Unavailable, "injected local release proposal failure")
+	}
+	return e.Engine.ProposeAdmin(ctx, payload)
+}
+
+// isPhaseDAcceptanceRelease recognizes the existing fixed-size release envelope.
+func isPhaseDAcceptanceRelease(payload []byte) bool {
+	release := kv.EncodePrepareEvidenceRelease(1)
+	return len(payload) == len(release) && bytes.Equal(payload[:2], release[:2])
+}
+
 func newPhaseDAcceptanceCluster(t *testing.T) *phaseDAcceptanceCluster {
 	t.Helper()
 	credential := make([]byte, 32)
@@ -97,6 +119,9 @@ func newPhaseDAcceptanceCluster(t *testing.T) *phaseDAcceptanceCluster {
 				Peers:        peers, Bootstrap: true, StateMachine: fsm})
 			require.NoError(t, err)
 			node.results[group], shard.Engine = result, result.Engine
+			if group == 2 {
+				shard.Engine = &phaseDReleaseFaultEngine{Engine: result.Engine, cluster: c}
+			}
 			shard.Txn = kv.NewLeaderProxyWithEngine(result.Engine,
 				kv.WithTimestampAdmission(shard.Store, func() kv.TimestampAllocator { return node.batch }))
 			shard.SetLeaderReadToken(c.token)
@@ -161,8 +186,7 @@ func (c *phaseDAcceptanceCluster) observeRPC(group uint64) grpc.UnaryServerInter
 		case pb.Internal_ForwardAdminProposal_FullMethodName:
 			c.adminCalls.Add(1)
 			admin, ok := request.(*pb.ForwardAdminProposalRequest)
-			if ok && group == 2 && c.releaseBlocked.Load() && len(admin.GetPayload()) == len(kv.EncodePrepareEvidenceRelease(1)) &&
-				bytes.Equal(admin.GetPayload()[:2], kv.EncodePrepareEvidenceRelease(1)[:2]) {
+			if ok && group == 2 && c.releaseBlocked.Load() && isPhaseDAcceptanceRelease(admin.GetPayload()) {
 				c.releaseFaults.Add(1)
 				return nil, status.Error(codes.Unavailable, "injected release RPC failure")
 			}
@@ -300,6 +324,16 @@ func TestInternalPhaseDAcceptanceThreeVotersThreeGroups(t *testing.T) {
 		window.GetPhaseDFloor(), start, proof, window.GetTimestamp(), c.forwardCalls.Load(), c.adminCalls.Load(), c.stateCalls.Load(), c.releaseFaults.Load())
 }
 
+func TestInternalPhaseDAcceptanceReleaseLeaderColocation(t *testing.T) {
+	c := newPhaseDAcceptanceCluster(t)
+	c.placeLeader(t, 2, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 35*time.Second)
+	defer cancel()
+	auth := c.adoptCutover(t, ctx)
+	_, proof := c.prepare(t, auth)
+	c.finishAfterLeaderChange(t, auth, proof)
+}
+
 func (c *phaseDAcceptanceCluster) adoptCutover(t *testing.T, ctx context.Context) context.Context {
 	t.Helper()
 	auth := metadata.AppendToOutgoingContext(ctx, "authorization", "Bearer "+c.token)
@@ -361,7 +395,7 @@ func (c *phaseDAcceptanceCluster) finishAfterLeaderChange(t *testing.T, auth con
 	require.Equal(t, previousAllocation, c.nodes[0].state.AllocationFloor(), "an unfinished release must not reserve a new window")
 	barrier := c.nodes[0].state.PhaseDFloor()
 	require.GreaterOrEqual(t, barrier, proof)
-	require.Positive(t, c.releaseFaults.Load(), "the fault must hit the actual authenticated remote admin RPC")
+	require.Positive(t, c.releaseFaults.Load(), "the fault must hit a remote RPC or local release proposal")
 
 	c.placeLeader(t, 0, 1)
 	require.Eventually(t, func() bool { return c.nodes[1].state.PhaseDActive() }, 5*time.Second, 10*time.Millisecond)
@@ -375,6 +409,8 @@ func (c *phaseDAcceptanceCluster) finishAfterLeaderChange(t *testing.T, auth con
 	require.Equal(t, barrier, window.GetPhaseDFloor())
 	require.Greater(t, window.GetTimestamp(), barrier)
 	require.True(t, window.GetPhaseDActive())
+	// The remaining resolution checks use node 2 as the secondary leader.
+	c.placeLeader(t, 2, 2)
 	return window
 }
 

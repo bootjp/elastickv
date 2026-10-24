@@ -111,9 +111,9 @@ The five review lenses were checked separately:
    unsubmitted reviews cannot establish approval.
 5. Test coverage: the Node suite exercises both reviewers, malformed and stale
    evidence, revocation, API failures, pagination use, idempotence, and mutations
-   around label writes. Application and Jepsen tests are not required for these
-   CI-only changes. Activation and live write verification require merging the
-   workflow into the default branch.
+   around label writes. The Go CI also exposed a pre-existing Phase-D acceptance
+   fixture failure, reproduced and addressed below. Activation and live write
+   verification require merging the workflow into the default branch.
 
 The PR review identified an ordering defect: a late result for an old SHA could
 hide current-HEAD findings or approval from the same reviewer. Five regressions
@@ -127,3 +127,21 @@ the failure before switching both operations to the same unfenced prose. Five
 added cases cover both bots, both fence styles, and rejection of an ambiguous
 quoted marker beside a real result. Named production and fixture helpers now
 document their contracts to address the review's docstring-coverage warning.
+
+The Go CI failed `TestInternalPhaseDAcceptanceThreeVotersThreeGroups` because its
+release fault covered only remote admin RPCs. A data leader colocated with the
+replacement TSO leader could legitimately finish release locally, contradicting
+the test's expectation that the injected fault was still active. The added
+`TestInternalPhaseDAcceptanceReleaseLeaderColocation` reproduces that exact
+assertion failure without load or sleeps. The fixture now also intercepts local
+release proposals for the affected data group, before they enter Raft; ordinary
+proposals and non-release admin commands still reach the real engine. Both
+placement cases retain the error and unchanged-allocation-floor assertions,
+then allocate successfully once the fault is removed. The original scenario
+restores its intended secondary-leader placement before retaining the remaining
+commit, resolution, and replica checks. No production protocol or storage
+implementation is changed.
+
+Validation: both Phase-D cases passed 30 times each under `go test -race`
+(60 cases, 131.150s). Differential golangci-lint against `origin/main` reports
+zero issues. The 79 Node tests remain green.
