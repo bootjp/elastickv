@@ -20,7 +20,8 @@ implementation. This document remains proposed until the implementation lands.
 - Codex publishes `codex-review-state:v1` JSON in its summary comment. Require
   `code_review.commit_sha == HEAD`, `status == completed`,
   `has_any_findings == false`, and `has_unresolved_findings == false`.
-  The latest summary is authoritative; do not fall back to an older clean one.
+  Within each reviewed SHA and review kind, the latest result is authoritative;
+  do not fall back to an older clean result for that SHA.
   The format was observed in PR #1321; an unknown format fails closed.
 - Claude adds an `agent-review-result:v1` JSON marker to its final PR review
   comment. Pin the requested SHA before invoking Claude and instruct it to emit
@@ -33,8 +34,11 @@ implementation. This document remains proposed until the implementation lands.
   including Codex security findings, veto it. Trusted inline findings, change
   requests, and dismissed reviews for that HEAD also veto it. Resolving a finding
   alone does not turn a review that had findings into a zero-finding review.
-- Choose the latest result per reviewer. Require one unambiguous marker and
-  strictly typed fields. Never infer a SHA from comment time or a short prefix.
+- Choose the latest result per reviewer, reviewed SHA, and review kind. A later
+  result for an old SHA cannot replace either approval or findings for HEAD.
+  Code and security results are selected independently, even when bundled in
+  the same summary. Require one unambiguous marker and strictly typed fields.
+  Never infer a SHA from comment time or a short prefix.
 
 ## Workflows
 
@@ -84,7 +88,7 @@ label preservation, and HEAD changes around label writes.
 
 ## Validation and self-review
 
-The 66 Node regression tests pass. Actionlint passes for the updater, event
+The 74 Node regression tests pass. Actionlint passes for the updater, event
 workflow, and changed Claude workflow. A read-only check against PR #1321's actual
 REST comments recognizes its full-SHA Codex result as a completed zero-finding
 code review. That PR is now closed; reconciliation does not approve closed PRs.
@@ -102,7 +106,7 @@ The five review lenses were checked separately:
    PRs are reconciled serially to limit request bursts. No model invocations are
    added, and the periodic sweep runs hourly.
 4. Data consistency: full SHAs, strict bot identities, explicit false booleans,
-   current-HEAD finding vetoes, and an authoritative latest result prevent stale
+   current-HEAD finding vetoes, and an authoritative latest result per SHA prevent stale
    or ambiguous evidence from establishing approval. Code-fenced examples and
    unsubmitted reviews cannot establish approval.
 5. Test coverage: the Node suite exercises both reviewers, malformed and stale
@@ -110,3 +114,9 @@ The five review lenses were checked separately:
    around label writes. Application and Jepsen tests are not required for these
    CI-only changes. Activation and live write verification require merging the
    workflow into the default branch.
+
+The PR review identified an ordering defect: a late result for an old SHA could
+hide current-HEAD findings or approval from the same reviewer. Five regressions
+failed before the fix. Results are now scoped by SHA before selecting the latest
+code and security result independently; eight added regressions cover both bots,
+mixed-SHA summaries, and label removal when stale results arrive late.

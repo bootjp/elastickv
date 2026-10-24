@@ -42,6 +42,19 @@ function latest(items) {
   })[0];
 }
 
+function currentResults(results, reviewer, kind, head) {
+  return results.flatMap(result => {
+    // An unreadable marker cannot establish which SHA it describes.
+    if (!result.value) return [result];
+    const value = reviewer === 'codex' ? result.value[kind] : result.value;
+    if (value == null) return [];
+    // Filter by SHA before choosing the latest result. A late stale review
+    // must not replace either approval or findings for the current HEAD.
+    if (/^[0-9a-f]{40}$/.test(value.commit_sha || '') && value.commit_sha !== head) return [];
+    return [{ item: result.item, value }];
+  });
+}
+
 function evaluateApproval({ head, comments = [], reviews = [], inlineComments = [] }) {
   if (!/^[0-9a-f]{40}$/.test(head || '')) return { approved: false, reason: 'Invalid HEAD SHA' };
   const trustedReviews = reviews.filter(review => reviewerOf(review) && review.commit_id === head);
@@ -63,29 +76,30 @@ function evaluateApproval({ head, comments = [], reviews = [], inlineComments = 
 
   const approvedBy = [];
   for (const reviewer of ['codex', 'claude']) {
-    const result = latest(results[reviewer]);
+    // Code and security can finish for different SHAs in the same summary.
+    const securityResult = reviewer === 'codex'
+      ? latest(currentResults(results[reviewer], reviewer, 'security_review', head)) : undefined;
+    if (securityResult) {
+      const security = securityResult.value;
+      if (!security || security.commit_sha !== head ||
+          typeof security.has_any_findings !== 'boolean' ||
+          typeof security.has_unresolved_findings !== 'boolean') {
+        return { approved: false, reason: 'Invalid current-HEAD security fields' };
+      }
+      if (security.has_any_findings || security.has_unresolved_findings) {
+        return { approved: false, reason: 'Current-HEAD security findings exist' };
+      }
+    }
+    const result = latest(currentResults(results[reviewer], reviewer, 'code_review', head));
     if (!result) continue;
     if (!result.value) return { approved: false, reason: `Invalid ${reviewer} result marker` };
-    const code = reviewer === 'codex' ? result.value.code_review : result.value;
-    const security = reviewer === 'codex' ? result.value.security_review : undefined;
-    if (security?.commit_sha === head &&
-        (typeof security.has_any_findings !== 'boolean' ||
-         typeof security.has_unresolved_findings !== 'boolean')) {
-      return { approved: false, reason: 'Invalid current-HEAD security fields' };
-    }
-    if (security?.commit_sha === head &&
-        (security.has_any_findings === true || security.has_unresolved_findings === true)) {
-      return { approved: false, reason: 'Current-HEAD security findings exist' };
-    }
-    // A security-only result cannot approve code, but another reviewer can.
-    if (code == null) continue;
+    const code = result.value;
     if (!/^[0-9a-f]{40}$/.test(code.commit_sha || '')) {
       return { approved: false, reason: `Missing ${reviewer} code-review SHA` };
     }
     if (result.item.commit_id && result.item.commit_id !== code.commit_sha) {
       return { approved: false, reason: `Mismatched ${reviewer} review commit` };
     }
-    if (code.commit_sha !== head) continue;
     if (typeof code.has_any_findings !== 'boolean' || typeof code.status !== 'string' ||
         (reviewer === 'codex' && typeof code.has_unresolved_findings !== 'boolean')) {
       return { approved: false, reason: `Invalid ${reviewer} code-review fields` };

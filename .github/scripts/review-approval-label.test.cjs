@@ -111,6 +111,65 @@ for (const [name, input, approved] of cases) {
   test(name, () => assert.equal(evaluateApproval({ head: HEAD, ...input }).approved, approved));
 }
 
+for (const reviewer of ['codex', 'claude']) {
+  test(`late stale ${reviewer} result cannot hide current-HEAD findings`, () => {
+    const result = overrides => reviewer === 'codex'
+      ? { code_review: codeResult(overrides) } : codeResult(overrides);
+    const comments = [
+      comment(reviewer === 'codex' ? 'claude' : 'codex'),
+      comment(reviewer, result({ has_any_findings: true }), { id: 2 }),
+    ];
+    assert.equal(evaluateApproval({ head: HEAD, comments }).approved, false);
+    comments.push(comment(reviewer, result({ commit_sha: OLD }), {
+      id: 3, updated_at: '2026-10-24T11:00:00Z',
+    }));
+    assert.equal(evaluateApproval({ head: HEAD, comments }).approved, false);
+  });
+
+  test(`late stale ${reviewer} result cannot hide current-HEAD approval`, () => {
+    const result = overrides => reviewer === 'codex'
+      ? { code_review: codeResult(overrides) } : codeResult(overrides);
+    const comments = [
+      comment(reviewer),
+      comment(reviewer, result({ commit_sha: OLD, has_any_findings: true }), {
+        id: 2, updated_at: '2026-10-24T11:00:00Z',
+      }),
+    ];
+    assert.equal(evaluateApproval({ head: HEAD, comments }).approved, true);
+  });
+}
+
+test('late stale code result cannot hide current-HEAD security findings', () => {
+  const comments = [
+    comment('claude'),
+    comment('codex', { code_review: codeResult(), security_review: codeResult({ has_any_findings: true }) }),
+    comment('codex', { code_review: codeResult({ commit_sha: OLD }), security_review: codeResult({ commit_sha: OLD }) }, {
+      id: 2, updated_at: '2026-10-24T11:00:00Z',
+    }),
+  ];
+  assert.equal(evaluateApproval({ head: HEAD, comments }).approved, false);
+});
+
+test('late stale security result cannot hide current-HEAD security findings', () => {
+  const comments = [
+    comment('codex', { code_review: codeResult(), security_review: codeResult({ has_any_findings: true }) }),
+    comment('codex', { code_review: codeResult(), security_review: codeResult({ commit_sha: OLD }) }, {
+      id: 2, updated_at: '2026-10-24T11:00:00Z',
+    }),
+  ];
+  assert.equal(evaluateApproval({ head: HEAD, comments }).approved, false);
+});
+
+test('code and security results are selected independently by SHA', () => {
+  const comments = [
+    comment('codex', { code_review: codeResult(), security_review: codeResult({ commit_sha: OLD }) }),
+    comment('codex', { code_review: codeResult({ commit_sha: OLD }), security_review: codeResult() }, {
+      id: 2, updated_at: '2026-10-24T11:00:00Z',
+    }),
+  ];
+  assert.equal(evaluateApproval({ head: HEAD, comments }).approved, true);
+});
+
 function fakeGitHub(options = {}) {
   const state = {
     calls: [], gets: 0, labelExists: options.labelExists ?? true,
@@ -190,6 +249,17 @@ test('removes a stale approval without modifying other labels', async () => {
   const { state, args } = fakeGitHub({ labeled: true, comments: [comment('claude', codeResult({ commit_sha: OLD }))] });
   assert.equal((await reconcilePullRequest(args)).approved, false);
   assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
+});
+
+test('late stale review does not restore a label vetoed by current-HEAD findings', async () => {
+  const { state, args } = fakeGitHub({ labeled: true, comments: [
+    comment('codex'),
+    comment('claude', codeResult({ has_any_findings: true })),
+    comment('claude', codeResult({ commit_sha: OLD }), { id: 2, updated_at: '2026-10-24T11:00:00Z' }),
+  ] });
+  assert.equal((await reconcilePullRequest(args)).approved, false);
+  assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
+  assert.equal(state.calls.some(([name]) => name === 'addLabels'), false);
 });
 
 test('does not attempt to remove an absent label', async () => {
