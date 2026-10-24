@@ -60,6 +60,7 @@ const (
 	// would renumber families that peers already use.
 	MigrationFamilyFilesystemChunk
 	MigrationFamilyFilesystemUsage
+	MigrationFamilyDynamoSnapshotSeal
 )
 
 const (
@@ -76,6 +77,7 @@ const (
 	migrationTxnPrepareEvidenceEnabledKey = migrationTxnMetaPrefix + "prepare_evidence/enabled"
 	migrationTxnPrepareEvidenceGateKey    = migrationTxnMetaPrefix + "prepare_evidence/gate"
 	migrationTxnPrepareEvidenceFloorKey   = migrationTxnMetaPrefix + "prepare_evidence/timestamp_floor"
+	migrationConfigurationIndexKey        = migrationTxnMetaPrefix + "migration_configuration_index"
 	migrationRedisPrefix                  = "!redis|"
 	migrationHashPrefix                   = "!hs|"
 	migrationSetPrefix                    = "!st|"
@@ -84,6 +86,7 @@ const (
 	migrationDynamoGenPrefix              = "!ddb|meta|gen|"
 	migrationDynamoItemPrefix             = "!ddb|item|"
 	migrationDynamoGSIPrefix              = "!ddb|gsi|"
+	migrationDynamoSealPrefix             = "!ddb|seal|"
 	migrationStagedDataPrefix             = "!dist|migstage|"
 )
 
@@ -104,6 +107,7 @@ const (
 
 var (
 	ErrMigrationReservedRange      = errors.New("migration range intersects reserved control prefix")
+	ErrMigrationResolverOwnedRange = errors.New("catalog migration range intersects resolver-owned SQS route")
 	ErrMigrationInvalidRoute       = errors.New("migration route is invalid")
 	ErrMigrationDataMoveRequired   = errors.New("migration data move is not implemented")
 	ErrMigrationSourceRouteChanged = errors.New("migration source route does not match split job")
@@ -122,6 +126,7 @@ var (
 // coordinator -- SplitRange does exactly that.
 var migrationOnlyControlPrefixes = [][]byte{
 	[]byte(migrationStagedDataPrefix),
+	[]byte("!migstage|"),
 	[]byte("!migwrite|"),
 	[]byte("!migfence|"),
 }
@@ -131,11 +136,26 @@ var migrationOnlyControlPrefixes = [][]byte{
 // path's reserved-key test: the raw path can refuse every control namespace
 // because nothing legitimate writes one as a raw mutation, but the catalog
 // reaches the store through a transaction, so the transactional test has to be
-// the narrower one. A staged-data row is the case that matters -- a client
-// write landing there is promoted as user data.
+// the narrower one. Include the store's typed metadata namespace and exact
+// migration configuration key, but not ordinary aliases of those names.
 func IsMigrationOnlyControlKey(key []byte) bool {
 	for _, prefix := range migrationOnlyControlPrefixes {
 		if bytes.HasPrefix(key, prefix) {
+			return true
+		}
+	}
+	return bytes.Equal(key, []byte(migrationConfigurationIndexKey))
+}
+
+// MigrationOnlyControlPrefixIntersects identifies nonempty prefix deletes
+// aimed at typed migration namespaces. Exact transaction-local control keys
+// remain excluded by the existing transaction prefix exclusion on that path.
+func MigrationOnlyControlPrefixIntersects(prefix []byte) bool {
+	if len(prefix) == 0 {
+		return false
+	}
+	for _, reserved := range migrationOnlyControlPrefixes {
+		if bytes.HasPrefix(prefix, reserved) || bytes.HasPrefix(reserved, prefix) {
 			return true
 		}
 	}
@@ -202,6 +222,7 @@ var migrationInternalFamilyPrefixes = [][]byte{
 	[]byte(migrationDynamoGenPrefix),
 	[]byte(migrationDynamoItemPrefix),
 	[]byte(migrationDynamoGSIPrefix),
+	[]byte(migrationDynamoSealPrefix),
 	[]byte(migrationSQSQueueMetaPrefix),
 	[]byte(migrationSQSQueueGenPrefix),
 	[]byte(migrationSQSQueueSeqPrefix),
@@ -244,6 +265,7 @@ var migrationInternalExactKeys = [][]byte{
 	[]byte(migrationTxnPrepareEvidenceEnabledKey),
 	[]byte(migrationTxnPrepareEvidenceGateKey),
 	[]byte(migrationTxnPrepareEvidenceFloorKey),
+	[]byte(migrationConfigurationIndexKey),
 }
 
 // MigrationBracket is a raw MVCC export or drain slice used by the migrator.
@@ -298,6 +320,20 @@ func PlanExportBrackets(routeStart, routeEnd []byte) ([]MigrationBracket, error)
 		out = append(out, bracket)
 	}
 	return out, nil
+}
+
+// PlanCleanupBrackets preserves export-plan cursor indexes and appends OCC
+// seals. Seals are local conflict witnesses, not snapshot data to import.
+func PlanCleanupBrackets(routeStart, routeEnd []byte) ([]MigrationBracket, error) {
+	brackets, err := PlanExportBrackets(routeStart, routeEnd)
+	if err != nil {
+		return nil, err
+	}
+	start := []byte(migrationDynamoSealPrefix)
+	return append(brackets, MigrationBracket{
+		BracketID: uint64(MigrationFamilyDynamoSnapshotSeal), Family: MigrationFamilyDynamoSnapshotSeal,
+		Start: start, End: prefixScanEnd(start), RequiresRouteKeyCheck: true,
+	}), nil
 }
 
 // SplitJobBracketProgressForPlan creates durable per-bracket resume state for
@@ -439,8 +475,25 @@ func (b MigrationBracket) containsDecodedS3Route(rawKey, routeStart, routeEnd []
 	if routeKeyInRange(rawKey, routeStart, routeEnd) {
 		return true
 	}
+	return S3BucketAuxiliaryRouteSelected(bucket, routeStart, routeEnd)
+}
+
+// S3BucketAuxiliaryRouteSelected reports whether the slice [routeStart,routeEnd)
+// is the OWNER of a bucket's auxiliary rows -- its metadata and generation keys.
+//
+// Ownership is point containment of the bucket's route start, not intersection.
+// A split inside a bucket's route interval leaves that bucket's auxiliary rows
+// with the preceding slice, so exactly one slice claims them. Intersection would
+// let every slice overlapping the bucket claim the same rows, which duplicates
+// them on export and -- far worse -- lets CLEANUP delete rows a moving slice
+// never exported and does not own.
+//
+// This is the single definition. adapter's export filter and the migration
+// bracket both route through it precisely so they cannot drift apart again:
+// export and cleanup disagreeing about ownership is silent data loss.
+func S3BucketAuxiliaryRouteSelected(bucket string, routeStart, routeEnd []byte) bool {
 	bucketRouteStart := s3keys.RoutePrefixForBucketAnyGeneration(bucket)
-	return rangesIntersect(routeStart, routeEnd, bucketRouteStart, prefixScanEnd(bucketRouteStart))
+	return routeKeyInRange(bucketRouteStart, routeStart, normalizeMigrationRouteEnd(routeEnd))
 }
 
 func (b MigrationBracket) decodedS3Bucket(rawKey []byte) (string, bool) {
@@ -472,12 +525,25 @@ func InitializeSplitJobPlan(job SplitJob, source RouteDescriptor, nowMs int64) (
 	}
 	routeStart := CloneBytes(job.SplitKey)
 	routeEnd := CloneBytes(normalizeMigrationRouteEnd(source.End))
+	if job.TargetGroupID != source.GroupID {
+		if err := ValidateSplitMigrationRouteRange(routeStart, routeEnd); err != nil {
+			return SplitJob{}, err
+		}
+	}
 	brackets, err := PlanExportBrackets(routeStart, routeEnd)
 	if err != nil {
 		return SplitJob{}, err
 	}
 
 	out := CloneSplitJob(job)
+	if out.SourceGroupID == 0 {
+		// The source side keeps this group for the life of the job. Recording it
+		// now is the only durable handle on it: the sibling route it would
+		// otherwise be read back from is replaced by grandchildren as soon as the
+		// source child is split again, which SplitRange permits because that split
+		// is disjoint from the moving range.
+		out.SourceGroupID = source.GroupID
+	}
 	if out.Phase == SplitJobPhaseNone {
 		out.Phase = SplitJobPhasePlanned
 	}
@@ -538,6 +604,19 @@ func ValidateMigrationRouteRange(routeStart, routeEnd []byte) error {
 		if rangesIntersect(routeStart, routeEnd, prefix, prefixScanEnd(prefix)) {
 			return errors.WithStack(ErrMigrationReservedRange)
 		}
+	}
+	return nil
+}
+
+// ValidateSplitMigrationRouteRange keeps catalog cutover away from the SQS
+// partition resolver's ownership domain. A catalog migration cannot update its
+// partition map, so even a temporary catalog fence would stop still-owned rows.
+func ValidateSplitMigrationRouteRange(routeStart, routeEnd []byte) error {
+	if err := ValidateMigrationRouteRange(routeStart, routeEnd); err != nil {
+		return err
+	}
+	if routeKeyInRange([]byte("!sqs|route|global"), routeStart, routeEnd) {
+		return errors.WithStack(ErrMigrationResolverOwnedRange)
 	}
 	return nil
 }

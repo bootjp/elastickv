@@ -34,7 +34,8 @@ type diskState struct {
 	// already represented in the FSM. Zero when no override applies
 	// (legacy path / execute-restore path); the engine then falls
 	// back to maxAppliedIndex(LocalSnap). Codex P1 #934.
-	EffectiveApplied uint64
+	EffectiveApplied         uint64
+	ExternalRestoreValidated bool
 }
 
 func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
@@ -42,6 +43,13 @@ func openDiskState(cfg OpenConfig, peers []Peer) (*diskState, error) {
 	walDir := filepath.Join(cfg.DataDir, walDirName)
 	snapDir := filepath.Join(cfg.DataDir, snapDirName)
 	fsmSnapDir := filepath.Join(cfg.DataDir, fsmSnapDirName)
+	marker, err := readExternalRestoreOrigin(cfg.DataDir)
+	if err != nil {
+		return nil, err
+	}
+	if marker != nil && !wal.Exist(walDir) {
+		return nil, errors.Wrap(ErrExternalSnapshotRestoreOrigin, "external restore requires its prepared WAL")
+	}
 
 	if err := prepareDataDirs(cfg.DataDir, snapDir, fsmSnapDir); err != nil {
 		return nil, err
@@ -107,6 +115,9 @@ func joinWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string) (*disk
 func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, peers []Peer) (*diskState, error) {
 	// Bootstrap snapshot always has index 1.
 	const bootstrapIndex = uint64(1)
+	if err := recordNamespaceConfiguration(fsm, bootstrapIndex, confStateForPeers(peers)); err != nil {
+		return nil, errors.WithStack(err)
+	}
 	snapshot, err := fsm.Snapshot()
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -124,7 +135,17 @@ func bootstrapWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, f
 	return persistBootState(logger, walDir, snapDir, fsmSnapDir, fsm, boot)
 }
 
-func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver) (*diskState, error) {
+// walRestoreState is constructed only by readWALRestoreState, which selects a
+// WAL-valid snapshot and successfully reads the WAL from that exact boundary.
+// Its unexported type carries that provenance into the origin-aware restorer.
+type walRestoreState struct {
+	snapshot  raftpb.Snapshot
+	w         *wal.WAL
+	hardState raftpb.HardState
+	entries   []raftpb.Entry
+}
+
+func readWALRestoreState(logger *zap.Logger, walDir, snapDir string) (*walRestoreState, error) {
 	// Scope the repair retry tightly to WAL-only reads: both
 	// loadPersistedSnapshot (scans WAL via wal.ValidSnapshotEntries)
 	// and openAndReadWAL's ReadAll can surface io.ErrUnexpectedEOF
@@ -153,10 +174,18 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	if err != nil {
 		return nil, err
 	}
-	committedReplayTarget := coldStartReplayTarget(snapshot, hardState)
-	effectiveApplied, err := restoreSnapshotState(fsm, snapshot, committedReplayTarget, fsmSnapDir, obs, logger)
+	return &walRestoreState{snapshot: snapshot, w: w, hardState: hardState, entries: entries}, nil
+}
+
+func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm StateMachine, obs raftengine.ColdStartObserver) (*diskState, error) {
+	selected, err := readWALRestoreState(logger, walDir, snapDir)
 	if err != nil {
-		if closeErr := w.Close(); closeErr != nil {
+		return nil, err
+	}
+	committedReplayTarget := coldStartReplayTarget(selected.snapshot, selected.hardState)
+	effectiveApplied, externalValidated, err := restoreSnapshotWithOrigin(fsm, selected, committedReplayTarget, fsmSnapDir, obs, logger)
+	if err != nil {
+		if closeErr := selected.w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after restoreSnapshotState error",
 				zap.String("dir", walDir),
 				zap.Error(closeErr),
@@ -166,12 +195,12 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	}
 
 	storage, err := newMemoryStorage(persistedState{
-		HardState: hardState,
-		Snapshot:  snapshot,
-		Entries:   entries,
+		HardState: selected.hardState,
+		Snapshot:  selected.snapshot,
+		Entries:   selected.entries,
 	})
 	if err != nil {
-		if closeErr := w.Close(); closeErr != nil {
+		if closeErr := selected.w.Close(); closeErr != nil {
 			logger.Warn("WAL close failed after storage init error",
 				zap.String("dir", walDir),
 				zap.Error(closeErr),
@@ -181,11 +210,34 @@ func loadWalState(logger *zap.Logger, walDir, snapDir, fsmSnapDir string, fsm St
 	}
 
 	return &diskState{
-		Storage:          storage,
-		Persist:          etcdstorage.NewStorage(logger, w, snapshotter),
-		LocalSnap:        snapshot,
-		EffectiveApplied: effectiveApplied,
+		Storage:                  storage,
+		Persist:                  etcdstorage.NewStorage(logger, selected.w, snap.New(logger, snapDir)),
+		LocalSnap:                selected.snapshot,
+		EffectiveApplied:         effectiveApplied,
+		ExternalRestoreValidated: externalValidated,
 	}, nil
+}
+
+func restoreSnapshotWithOrigin(fsm StateMachine, selected *walRestoreState, target uint64, dir string, obs raftengine.ColdStartObserver, logger *zap.Logger) (uint64, bool, error) {
+	if selected == nil || selected.w == nil {
+		return 0, false, errors.Wrap(ErrExternalSnapshotRestoreOrigin, "restore requires WAL-selected state")
+	}
+	snapshot := selected.snapshot
+	marker, err := readExternalRestoreOrigin(filepath.Dir(dir))
+	if err != nil {
+		return 0, false, err
+	}
+	if marker != nil && snapshot.GetMetadata().GetIndex() == marker.Index {
+		index, err := restoreWithExternalOrigin(fsm, snapshot, dir, marker)
+		return index, err == nil, err
+	}
+	if marker != nil {
+		if err := validateNativeAfterExternalRestore(selected, marker, dir); err != nil {
+			return 0, false, err
+		}
+	}
+	index, err := restoreSnapshotState(fsm, snapshot, target, dir, obs, logger)
+	return index, false, err
 }
 
 // reportColdStartExecute emits the executed-arm of the cold-start
@@ -262,8 +314,8 @@ func coldStartApplied(disk *diskState) uint64 {
 
 // loadPersistedSnapshotWithRepair wraps loadPersistedSnapshot with one
 // wal.Repair attempt on io.ErrUnexpectedEOF. The caller passes in a
-// shared snapshotter so loadWalState does not instantiate snap.New
-// twice per open.
+// shared snapshotter so both the initial scan and the repair retry use the
+// same instance.
 func loadPersistedSnapshotWithRepair(logger *zap.Logger, walDir string, snapshotter *snap.Snapshotter) (raftpb.Snapshot, error) {
 	snapshot, err := loadPersistedSnapshot(logger, walDir, snapshotter)
 	if err == nil || !errors.Is(err, io.ErrUnexpectedEOF) {

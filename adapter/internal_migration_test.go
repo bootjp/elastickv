@@ -60,12 +60,17 @@ func (l *recordingInternalLeader) LinearizableRead(context.Context) (uint64, err
 type applyingMigrationProposer struct {
 	fsm   raftengine.StateMachine
 	calls uint64
+	index uint64
 }
 
 func (p *applyingMigrationProposer) Propose(_ context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	p.calls++
+	p.index++
+	if aware, ok := p.fsm.(raftengine.ApplyIndexAware); ok {
+		aware.SetApplyIndex(p.index)
+	}
 	return &raftengine.ProposalResult{
-		CommitIndex: p.calls,
+		CommitIndex: p.index,
 		Response:    p.fsm.Apply(data),
 	}, nil
 }
@@ -661,6 +666,8 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 		WithInternalMigrationProposer(proposer),
 		WithInternalMigrationImportGate(func(context.Context) error { return nil }),
 	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
 
 	resp, err := internal.ImportRangeVersions(ctx, &pb.ImportRangeVersionsRequest{
 		JobId:     7,
@@ -673,7 +680,7 @@ func TestInternalImportRangeVersionsAppliesStoreBatch(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, []byte("cursor-1"), resp.GetAckedCursor())
-	require.Equal(t, uint64(1), proposer.calls)
+	require.Equal(t, before+1, proposer.calls)
 
 	staged := distribution.MigrationStagedDataKey(7, []byte("k"))
 	got, err := st.GetAt(ctx, staged, 30)
@@ -836,6 +843,8 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 		WithInternalMigrationProposer(proposer),
 		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
 	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
 
 	staged := distribution.MigrationStagedDataKey(7, []byte("k"))
 	require.NoError(t, st.PutAt(ctx, staged, []byte("v"), 30, 0))
@@ -848,7 +857,7 @@ func TestInternalPromoteStagedVersionsAppliesStoreBatch(t *testing.T) {
 	require.True(t, resp.GetDone())
 	require.Equal(t, uint64(1), resp.GetPromotedRows())
 	require.Equal(t, uint64(30), resp.GetMaxPromotedTs())
-	require.Equal(t, uint64(1), proposer.calls)
+	require.Equal(t, before+1, proposer.calls)
 
 	got, err := st.GetAt(ctx, []byte("k"), 30)
 	require.NoError(t, err)
@@ -887,4 +896,145 @@ func TestInternalExportRangeVersionsRefusesOversizedPage(t *testing.T) {
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 	require.Contains(t, err.Error(), `"a"`)
 	require.Empty(t, stream.responses, "an unsendable page must not be sent")
+}
+
+func TestInternalApplyTargetStagedReadinessBypassesOpcodeGateForSafetyGuard(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, nil),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration opcode disabled for test")
+		}),
+	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
+
+	resp, err := internal.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{
+		JobId:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobId:         7,
+		MinWriteTsExclusive:    100,
+		Armed:                  true,
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.Equal(t, before+1, proposer.calls)
+
+	reader, ok := st.(store.MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []store.TargetStagedReadinessState{{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobID:         7,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}}, states)
+}
+
+func TestInternalApplyTargetStagedReadinessProposesThroughRaft(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	clock := kv.NewHLC()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, nil),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, clock, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
+	)
+	activateInternalMigrationTestNamespace(t, internal, proposer)
+	before := proposer.calls
+
+	_, err := internal.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{
+		JobId:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobId:         7,
+		MinWriteTsExclusive:    100,
+		Armed:                  true,
+	})
+	require.NoError(t, err)
+	require.Equal(t, before+1, proposer.calls)
+	require.Equal(t, uint64(100), st.LastCommitTS())
+	require.GreaterOrEqual(t, clock.Current(), uint64(100))
+
+	reader, ok := st.(store.MigrationTargetReadinessReader)
+	require.True(t, ok)
+	states, err := reader.MigrationTargetReadinessStates(ctx)
+	require.NoError(t, err)
+	require.Equal(t, []store.TargetStagedReadinessState{{
+		JobID:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobID:         7,
+		MinWriteTSExclusive:    100,
+		Armed:                  true,
+	}}, states)
+}
+
+func TestInternalApplyTargetStagedReadinessRejectsArmedZeroMinWriteTS(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	proposer := &applyingMigrationProposer{
+		fsm: kv.NewKvFSMWithHLC(st, nil),
+	}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalStore(st),
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationPromoteGate(func(context.Context) error { return nil }),
+	)
+
+	resp, err := internal.ApplyTargetStagedReadiness(ctx, &pb.TargetStagedReadinessRequest{
+		JobId:                  9,
+		RouteStart:             []byte("a"),
+		RouteEnd:               []byte("z"),
+		ExpectedCutoverVersion: 3,
+		MigrationJobId:         7,
+		Armed:                  true,
+	})
+	require.Nil(t, resp)
+	require.Error(t, err)
+	require.Equal(t, codes.InvalidArgument, status.Code(err))
+	require.Equal(t, uint64(0), proposer.calls)
+}
+
+func TestInternalCleanupMigrationRejectsWhenOpcodeGateClosed(t *testing.T) {
+	t.Parallel()
+
+	proposer := &applyingMigrationProposer{fsm: kv.NewKvFSMWithHLC(store.NewMVCCStore(), nil)}
+	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil,
+		WithInternalMigrationProposer(proposer),
+		WithInternalMigrationCleanupGate(func(context.Context) error {
+			return status.Error(codes.FailedPrecondition, "migration cleanup disabled for test")
+		}),
+	)
+
+	resp, err := internal.CleanupMigration(context.Background(), &pb.CleanupMigrationRequest{
+		JobId:     9,
+		Mode:      pb.MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS,
+		KeyFamily: distribution.MigrationFamilyUser,
+	})
+	require.Nil(t, resp)
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Zero(t, proposer.calls)
 }

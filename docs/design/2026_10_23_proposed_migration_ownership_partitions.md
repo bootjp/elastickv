@@ -1,0 +1,187 @@
+# Replicated ownership partitions for subsequent range splits
+
+Status: Implementation in PR #1090; final acceptance, review and merge pending
+Author: bootjp
+Date: 2026-10-23
+
+This extends the bounded native-lineage ownership work in
+[apply-time readiness evidence](2026_09_05_proposed_apply_time_readiness_evidence.md).
+The Milestone 2 design's historical Implemented label does not mean the current
+PR #1090 ownership integration has shipped. Final acceptance, latest-HEAD review
+and CI are tracked separately; this proposal keeps its filename until merge.
+
+## Contract
+
+The canonical Go interface is
+`store/migration_ownership_partition_types.go`. Both memory and Pebble stores
+implement it. Immutable per-job Acquire/Clear receipts remain keyed by job ID.
+The active, non-overlapping serving frontier has independent partition IDs;
+several children can retain the same immutable job receipt. Never flatten the
+job ledger into child records or deduplicate active children by job ID.
+
+Same-owner partition controls preserve the complete prior union, role, known
+floor, staged-data lineage and protected SOURCE boundary. References identify
+the exact prior attestation, including every overlapping negative proof. A
+NONOWNER cannot become OWNER through partition or unchanged-descriptor refresh.
+Only an ordinary newer guarded acquisition with data-ready evidence can reopen
+ownership. Semantic mismatches deterministically retry before effects.
+
+Root geometry transactions atomically persist a manifest with their descriptor,
+catalog-version, route allocation and working-source mutations. Only a manifest
+reloaded after the root leader's linearizable applied-read barrier can attest
+actual committed C. Data leaders install it in their own logs with generation
+and applied-configuration preconditions. Apply never consults a catalog watcher
+for authority. Historical NONOWNER groups discover retained manifest chains by
+old descriptor identity through the authenticated refresh consumer, including
+after job-history GC. Historical all-NONOWNER evidence may discover a manifest
+by the never-reused native route ID plus exact full bounds and parent ID when
+a remote handoff changed the old descriptor hash. This bounded lookup rejects
+ambiguous records, preserves the historical owner, floor, role and origins,
+and never substitutes for positive ownership attestation. With no new geometry,
+background refresh retains DENY; a foreground move remains pending rather than
+claiming an ACK. Negative groups need not be online for a same-owner metadata split;
+their old negative proof continues denying until reconciliation/acquisition.
+
+Before a cross-group suffix move, commit and replicate a full same-owner
+partition into retained left and working moving child. SOURCE tracker, catalog
+fence, write floor, cutover and rollback then operate only on that moving child.
+The job records its working source durably so retries do not allocate children
+again. Same-group SplitRange uses this partition protocol too; subsequent splits
+are supported, not permanently refused. An abandon may leave the harmless
+same-owner metadata split but cannot lower floors or restore a negative owner.
+Before publishing the manifest or either route, encode the complete downstream
+partition control against the current native frontier and its configuration.
+Reject controls exceeding the 4 MiB envelope after reserving the full uint64
+decimal width at every numeric position. Working-source creation checks both
+the source and required target, including historical negative evidence. A data
+leader read fence, or an exact-group leader fence followed by local applied-index
+catch-up, precedes even an empty-frontier decision. The 16 MiB manifest limit
+alone does not bound the repeated, base64-encoded
+priors and tiles. This is a metadata-operation limit, not a global RawKV limit.
+
+SplitRange is authenticated control-plane traffic even for a proof-free parent.
+Advancing its global catalog version also affects disjoint native OWNER proofs.
+Metadata/working-child splits therefore discover and fence serving owners across
+groups, establish current-version readiness before mutation, and synchronously
+refresh/ACK them at the actual committed new version before returning or updating
+the local route engine. A four-item background refresh budget is not the foreground
+availability mechanism. Historical negative-only closures may remain offline;
+already-fenced SOURCE intervals stay denied rather than acquiring new authority.
+The root transaction is still committed before data-group refresh: independent
+watchers may briefly observe a version whose owner ACK is pending and retry.
+This is not atomic root/data publication or a claim of zero transient retries.
+Recovery of a persisted working child repeats the complete serving-owner barrier
+against the committed catalog before publishing locally or arming its tracker.
+The durable child ID proves the root transaction, not completion of those ACKs;
+an unavailable disjoint owner keeps recovery pending without reallocating routes.
+Move-back also replays the target's retained negative geometry in the foreground
+before control-size preflight. Deferred geometry is not a readiness ACK: complete
+size validation and the post-commit target barrier still precede acquisition.
+
+## Persistence Hook Map
+
+The implementation uses the following persistence hooks:
+
+| File | Required hook |
+| --- | --- |
+| `store/migration_ownership_partition*.go` | New raw container `!migstage|ownership_partition`, codec v1, canonical identities/references, validators, atomic memory/Pebble transition and immutable receipts. |
+| `store/migration_ownership.go` | Add `Partitions MigrationOwnershipPartitionState` to the coherent serving view; couple existing guarded Acquire/Clear/Refresh to the frontier in the same lock/batch as the old job ledger and applied index. SOURCE uses this same acquire path. |
+| `store/migration_ownership_evidence.go` | Preserve full origin, known-floor and SOURCE data-log-boundary validation. Do not globally reject decodable legacy job records. |
+| `store/mvcc_store.go` | New in-memory container, V7 trailer only when needed, V1..V6 compatibility, coherent snapshot capture and atomic restored-tree/metadata publication. |
+| `store/snapshot_migration_metadata.go` | Validate on reopen and stage the exact new raw key in streaming MVCC-to-Pebble restore before publication. |
+| `store/lsm_store.go` | Pass the V7 metadata into the temporary restore DB; native/SST carry the raw key and must validate it. Preserve encrypted snapshot plumbing. |
+| `store/migration_versions.go` | Classify/exclude/protect the new raw metadata key in export/import/cleanup. Do not confuse decoded MVCC user keys with raw metadata. |
+| `store/snapshot_external.go` | Refuse nonempty frontier or receipts before tree/DB publication under external rebase, including receipt-only evidence; ordinary proof-free restore remains compatible. |
+| `internal/backup/snapshot_reader.go` | Mirror exact raw-key filtering for the standalone offline reader. This is the store worker's single assigned non-store hook. |
+
+The new container is independent of `!migstage|ownership`. Both native histories
+must survive reopen, MVCC streaming, native/SST/encrypted snapshots and voter
+join. External restore must not reuse copied configuration epochs as lineage.
+Protocol auth, Raft controls and public/FSM admission live in `proto`,
+`distribution`, `adapter` and `kv`; process membership wiring lives in main.
+The serving cache publishes a coherent native frontier after each durable
+metadata commit. Ordinary reads do not enumerate all groups' Pebble metadata
+or acquire every apply mutex. Unknown legacy barriers remain in that view.
+
+## Helper Interfaces
+
+The following helpers implement the canonical identities alongside the types:
+
+```go
+MigrationOwnershipPartitionReferenceFor(MigrationOwnershipPartition) (MigrationOwnershipPartitionReference, error)
+MigrationOwnershipLegacyReferenceFor(MigrationOwnershipState) (MigrationOwnershipPartitionReference, error)
+MigrationOwnershipPartitionIDFor(MigrationOwnershipPartitionTransition, int) ([]byte, error)
+MigrationOwnershipPartitionReceiptIDFor(MigrationOwnershipPartitionTransition) ([]byte, error)
+MigrationOwnershipPartitionEvidenceValid(MigrationOwnershipPartitionState, MigrationOwnershipPartition) bool
+MigrationOwnershipPartitionMetadataKey() []byte
+IsMigrationOwnershipPartitionMetadataKey([]byte) bool
+```
+
+IDs/digests are domain-separated SHA-256 with canonical encoding, never ad hoc
+JSON hashing by a caller. Partition IDs survive refresh; receipt IDs bind exact
+operations. Legacy references require complete operational old evidence and
+hash the entire current job state. Complete old positive and negative coverage
+must be validated before adoption; unknown legacy records cannot seed authority.
+The internal-only JobOperation receipt kind can be produced only by existing
+validated Acquire/Clear operations, not external partition controls.
+
+## Runtime Capability
+
+The geometry capability is `cap_migration_partition_v1`, version 1. The static
+probe is `ProbeMigrationStateResponse.ownership_partition_protocol = 10` and
+the option is `WithInternalMigrationPartitionProtocolReady(func() bool)`.
+
+Static implemented support must be observable on a new learner before it has
+an applied configuration. Operational ownership readiness, guard installation
+and ACKs independently require a real nonzero applied configuration, generation
+and all-member support. Static support never overrides configured authentication,
+opcode flags, installed read/proposal/consumer hooks or the all-current-member barrier.
+
+## Rolling Namespace Activation
+
+New binaries preserve legacy committed KV/transaction semantics until an
+ordered, durable namespace activation command is applied. Every actual apply
+member, including learners, must advertise installed support at the same
+configuration before activation; a leader-only fallback is not permitted.
+The durable marker carries configuration, activation index, member inventory
+and authorized joining IDs. Ordered ConfChange application, native snapshot
+restore and prejoin hooks preserve this state. Catalog watchers do not authorize
+activation. New migration mutation RPCs require the marker; the strictly typed
+namespace activation control is the only bootstrap exception.
+Activation uses the bounded cleanup RPC attempt, never the runner's process
+lifetime alone. Parent cancellation and an earlier parent deadline are retained.
+After activation, supported peers at the matching configuration may still await
+the entry. Their incomplete ACK is retryable without consuming the phase failure
+budget; unsupported versions or mismatched configurations remain refused.
+
+Forwarded admin proposals use an exact typed allowlist for existing backup and
+PREPARE-evidence controls. Migration, encrypted, user and malformed payloads
+cannot bypass their authenticated mutation paths through this RPC.
+
+## Moving-Range Size Guard
+
+RawKV's global 64 MiB limit is unchanged. A versioned replicated guard limits
+only new writes and PREPARE creation in a migrating range to the transfer-page
+budget, including intent-key/value overhead and actual command framing. Retained
+neighbors remain writable. Existing matching PREPAREs may COMMIT or ABORT without
+retroactive size rejection. All actual source members acknowledge the guard
+before copying or the write fence. A full historical-value preflight detects
+untransferable data before a catalog fence and safely abandons the move.
+An otherwise successful probe reporting `Ready: false` is an incomplete voter
+barrier, not a terminal phase failure. Learner catch-up therefore does not consume
+the failure budget or strand a fenced job in FAILED. Readiness is still required
+before advancing; invalid configuration/protocol evidence and authentication
+errors do not become successful ACKs.
+
+## Acceptance Gates
+
+The independent harness owns existing-public-interface regressions for both
+same-group resplit and cross-group suffix migration of a previously migrated
+range. Retained-left reads and raw/1PC/PREPARE writes must survive the split and
+unrelated later C without descriptor-hash guesses or floor changes. Also require
+negative-owner safety, real move-back, full matching COMMIT/ABORT drain, exact and
+conflicting retries, leader/config changes at each phase, three voters with
+different caches, batch failure, job GC, reopen and every native snapshot path.
+
+No focused test, type compilation or capability advertisement completes these
+gates or declares PR #1090 merge/deployment ready.

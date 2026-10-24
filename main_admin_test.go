@@ -38,12 +38,12 @@ import (
 
 func TestConfigureAdminServiceDisabledByDefault(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", false, "", false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService("", false, "", "", false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("disabled-by-default should not error: %v", err)
 	}
-	if srv != nil || !icept.empty() {
-		t.Fatalf("disabled service should return nil server and empty interceptors; got %v %+v", srv, icept)
+	if srv != nil || len(icept.unary) != 1 || len(icept.stream) != 1 {
+		t.Fatalf("disabled admin service should still deny migration mutations; got %v %+v", srv, icept)
 	}
 }
 
@@ -163,7 +163,7 @@ func TestConfigureAdminServiceRejectsMutualExclusion(t *testing.T) {
 	if err := os.WriteFile(tokPath, []byte("x"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := configureAdminService(tokPath, true, "", false, adapter.NodeIdentity{}, nil, nil); err == nil {
+	if _, _, err := configureAdminService(tokPath, true, "", "", false, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected mutual-exclusion error")
 	}
 }
@@ -179,15 +179,15 @@ func TestConfigureAdminServiceTokenFile(t *testing.T) {
 	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, peerPath, true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(tokPath, false, peerPath, "", true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
 	if srv == nil {
 		t.Fatal("expected an AdminServer instance")
 	}
-	if len(icept.unary) != 2 || len(icept.stream) != 2 {
-		t.Fatalf("expected separate admin and peer interceptors, got %d + %d", len(icept.unary), len(icept.stream))
+	if len(icept.unary) != 3 || len(icept.stream) != 3 {
+		t.Fatalf("expected admin, migration and peer interceptors, got %d + %d", len(icept.unary), len(icept.stream))
 	}
 	if !icept.s3BlobFetchEnabled {
 		t.Fatal("token-authenticated configuration should enable S3BlobFetch")
@@ -211,7 +211,7 @@ func TestConfigureAdminServiceRejectsSharedAdminAndPeerToken(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	if _, _, err := configureAdminService(adminPath, false, peerPath, true, adapter.NodeIdentity{}, nil, nil); err == nil {
+	if _, _, err := configureAdminService(adminPath, false, peerPath, "", true, adapter.NodeIdentity{}, nil, nil); err == nil {
 		t.Fatal("expected shared admin and peer token to be rejected")
 	}
 }
@@ -227,7 +227,7 @@ func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T
 	if err := os.WriteFile(peerPath, []byte("peer-secret\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	srv, icept, err := configureAdminService(tokPath, false, peerPath, false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService(tokPath, false, peerPath, "", false, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("configureAdminService: %v", err)
 	}
@@ -245,7 +245,7 @@ func TestConfigureAdminServiceDoesNotAdvertiseDisabledS3BlobOffload(t *testing.T
 
 func TestConfigureAdminServiceInsecureNoAuth(t *testing.T) {
 	t.Parallel()
-	srv, icept, err := configureAdminService("", true, "", true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
+	srv, icept, err := configureAdminService("", true, "", "", true, adapter.NodeIdentity{NodeID: "n1"}, nil, nil)
 	if err != nil {
 		t.Fatalf("insecure mode should succeed: %v", err)
 	}
@@ -295,6 +295,7 @@ func TestConfigureAdminServiceWiresLeaderVersionProbe(t *testing.T) {
 		"",
 		true,
 		"",
+		"",
 		false,
 		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},
 		nil,
@@ -328,6 +329,7 @@ func TestConfigureAdminServiceUsesStampedBuildVersion(t *testing.T) {
 	srv, _, err := configureAdminService(
 		"",
 		true,
+		"",
 		"",
 		false,
 		adapter.NodeIdentity{NodeID: "n1", GRPCAddress: "127.0.0.1:50051"},

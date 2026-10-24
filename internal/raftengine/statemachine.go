@@ -1,6 +1,28 @@
 package raftengine
 
-import "io"
+import (
+	"context"
+	"io"
+)
+
+type SnapshotRestoreOrigin uint8
+
+const (
+	SnapshotRestoreRaft SnapshotRestoreOrigin = iota
+	SnapshotRestoreExternalRebase
+)
+
+type SnapshotRestoreOptions struct {
+	Origin SnapshotRestoreOrigin
+}
+
+// ContextSnapshotRestorer is required for externally rebased snapshots. Success
+// must mean the decoded state was validated for this origin and durably restored.
+// Wrappers must forward the origin to their underlying implementation, never
+// downgrade an external restore to StateMachine.Restore.
+type ContextSnapshotRestorer interface {
+	RestoreWithContext(context.Context, io.Reader, SnapshotRestoreOptions) error
+}
 
 // Snapshot is an owned export handle from the state machine. Callers are
 // responsible for closing it after WriteTo completes.
@@ -45,6 +67,20 @@ type StateMachine interface {
 // for the field this hint backs.
 type ApplyIndexAware interface {
 	SetApplyIndex(idx uint64)
+}
+
+// AppliedConfigurationAware records the actual ConfChange index on the serial
+// apply loop before its FSM snapshot is captured. Unlike Status.ConfigurationIndex,
+// this value must survive snapshots without becoming the snapshot's data index.
+type AppliedConfigurationAware interface {
+	RecordAppliedConfiguration(index uint64) error
+	AppliedConfigurationIndex() uint64
+}
+
+// AppliedConfigurationReader identifies runtimes that supply the ordered hook.
+// A copied metadata row alone does not prove that the running engine supports it.
+type AppliedConfigurationReader interface {
+	AppliedConfigurationIndex() (uint64, bool)
 }
 
 // AppliedIndexReader is an OPTIONAL extension that lets the engine

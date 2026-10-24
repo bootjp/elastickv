@@ -10,17 +10,26 @@ const GRPCMaxMessageBytes = 64 << 20
 // GRPCServerOptions keeps Raft replication and the public/internal APIs aligned
 // on the same message-size budget.
 func GRPCServerOptions() []grpc.ServerOption {
-	return []grpc.ServerOption{
+	opts := []grpc.ServerOption{
 		grpc.MaxRecvMsgSize(GRPCMaxMessageBytes),
 		grpc.MaxSendMsgSize(GRPCMaxMessageBytes),
 	}
+	if cfg := grpcTLS.Load(); cfg != nil {
+		opts = append(opts, grpc.Creds(cfg.server.Clone()))
+	}
+	return opts
 }
 
-// GRPCDialOptions returns the common insecure dial options used by node-local
-// and node-to-node traffic.
+// GRPCDialOptions returns the common transport and message-size options for
+// node-local and node-to-node traffic. TLS is explicitly configured at startup.
 func GRPCDialOptions() []grpc.DialOption {
+	creds := insecure.NewCredentials()
+	if cfg := grpcTLS.Load(); cfg != nil {
+		creds = cfg.client.Clone()
+	}
 	return []grpc.DialOption{
-		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithTransportCredentials(creds),
+		grpc.WithChainUnaryInterceptor(forwardTokenClientInterceptor),
 		grpc.WithDefaultCallOptions(
 			grpc.MaxCallRecvMsgSize(GRPCMaxMessageBytes),
 			grpc.MaxCallSendMsgSize(GRPCMaxMessageBytes),

@@ -589,7 +589,7 @@ func (b *pebbleSSTIngestBundle) Close() error {
 	return errors.WithStack(err)
 }
 
-func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader) error {
+func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader, validate func(string) error) error {
 	manifest, err := readPebbleSSTIngestManifest(r)
 	if err != nil {
 		return err
@@ -612,6 +612,16 @@ func (s *pebbleStore) restorePebbleSSTIngestAtomic(r io.Reader) error {
 	if err := ingestSSTSnapshotIntoTempDB(tmpDir, paths, metadata, s.cipher != nil); err != nil {
 		_ = os.RemoveAll(tmpDir)
 		return err
+	}
+	if err := validateRestoreTempDB(tmpDir, validate); err != nil {
+		return err
+	}
+	if validate != nil {
+		// External validation removes the source lineage's Raft watermark.
+		// Ingest verified the original manifest before this rebasing step;
+		// publication must verify its absence, not restore the source index.
+		metadata.AppliedIndex = 0
+		metadata.AppliedIndexPresent = false
 	}
 	return s.swapInTempDBWithMetadata(tmpDir, &metadata)
 }

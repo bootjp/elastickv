@@ -421,6 +421,33 @@ func TestCommitRejectsMissingPrimaryKey(t *testing.T) {
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
 }
 
+func TestCommitRejectsMissingPrimaryLockWithoutCommitRecord(t *testing.T) {
+	t.Parallel()
+
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	fsm, ok := NewKvFSMWithHLC(st, NewHLC()).(*kvFSM)
+	require.True(t, ok)
+
+	primary := []byte("p")
+	startTS := uint64(10)
+	commitTS := uint64(20)
+	commit := &pb.Request{
+		IsTxn: true,
+		Phase: pb.Phase_COMMIT,
+		Ts:    startTS,
+		Mutations: []*pb.Mutation{
+			{Op: pb.Op_PUT, Key: []byte(txnMetaPrefix), Value: EncodeTxnMeta(TxnMeta{PrimaryKey: primary, CommitTS: commitTS})},
+			{Op: pb.Op_PUT, Key: primary},
+		},
+	}
+
+	err := applyFSMRequest(t, fsm, commit)
+	require.ErrorIs(t, err, ErrTxnInvalidMeta)
+	_, err = st.GetAt(ctx, txnCommitKey(primary, startTS), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "a missing primary lock must not produce only a commit record")
+}
+
 func TestCommitRejectsMismatchedPrimaryKey(t *testing.T) {
 	t.Parallel()
 

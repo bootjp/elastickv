@@ -91,10 +91,17 @@ func isTxnInternalKey(key []byte) bool {
 }
 
 func isTxnPeerLocalControlKey(key []byte) bool {
-	return bytes.Equal(key, backupTimestampFloorKey) ||
+	return bytes.Equal(key, migrationConfigurationIndexKey) ||
+		bytes.Equal(key, backupTimestampFloorKey) ||
 		bytes.Equal(key, prepareEvidenceEnabledKey) ||
 		bytes.Equal(key, prepareEvidenceGateKey) ||
 		bytes.Equal(key, prepareEvidenceTimestampFloorKey)
+}
+
+// IsTxnInternalKey identifies the concrete namespaces reserved for transaction
+// machinery, without reserving ordinary user keys under the !txn| umbrella.
+func IsTxnInternalKey(key []byte) bool {
+	return isTxnInternalKey(key)
 }
 
 func isTxnMetaKey(key []byte) bool {

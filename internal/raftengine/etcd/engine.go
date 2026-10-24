@@ -706,7 +706,7 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	engine.configIndex.Store(maxAppliedIndex(prepared.disk.LocalSnap))
 	engine.appliedIndex.Store(initialApplied)
-	if err := engine.restorePendingConfChangeFenceFromStorage(rawNodeApplied); err != nil {
+	if err := engine.recoverOpenConfiguration(prepared, rawNodeApplied); err != nil {
 		_ = closePersist(prepared.disk.Persist)
 		return nil, err
 	}
@@ -738,6 +738,24 @@ func Open(ctx context.Context, cfg OpenConfig) (*Engine, error) {
 	}
 	opened = true
 	return openedEngine, nil
+}
+
+func (e *Engine) recoverOpenConfiguration(prepared preparedOpenState, rawNodeApplied uint64) error {
+	if err := recoverNamespaceConfiguration(e.fsm, prepared.disk.LocalSnap); err != nil {
+		return errors.Wrap(err, "recover namespace configuration")
+	}
+	if err := e.restorePendingConfChangeFenceFromStorage(rawNodeApplied); err != nil {
+		return err
+	}
+	if prepared.disk.ExternalRestoreValidated {
+		// External preparation seeded this destination ConfState at this index.
+		// Bind only after store validation and RawNode restoration succeed; never
+		// reuse an imported epoch or a later native snapshot's data index.
+		if err := e.recordFSMConfiguration(prepared.disk.LocalSnap.GetMetadata().GetIndex(), confStateValue(prepared.disk.LocalSnap.GetMetadata().GetConfState())); err != nil {
+			return errors.Wrap(err, "bind external restore destination configuration")
+		}
+	}
+	return completeExternalRestoreOrigin(prepared.cfg.DataDir, prepared.disk.ExternalRestoreValidated)
 }
 
 func (e *Engine) warnIfLeaseReadDisabled() {
@@ -2678,19 +2696,8 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 	// Snapshot application is intentionally synchronous with the raft loop: the
 	// local FSM must reflect the incoming raft snapshot before Ready can advance
 	// and later committed entries can be applied safely.
-	if isSnapshotToken(snapshot.GetData()) {
-		tok, err := decodeSnapshotToken(snapshot.GetData())
-		if err != nil {
-			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.GetMetadata().GetIndex())
-		}
-		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
-			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
-		}
-	} else {
-		// Legacy format: full FSM payload in snapshot.Data.
-		if err := e.fsm.Restore(bytes.NewReader(snapshot.GetData())); err != nil {
-			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
-		}
+	if err := e.restoreReadySnapshotFSM(snapshot); err != nil {
+		return err
 	}
 	if err := e.storage.ApplySnapshot(snapshot); err != nil {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
@@ -2718,6 +2725,27 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 		return err
 	}
 	e.alarmIfJoinedAsVoter(confState)
+	return nil
+}
+
+func (e *Engine) restoreReadySnapshotFSM(snapshot *raftpb.Snapshot) error {
+	if isSnapshotToken(snapshot.GetData()) {
+		tok, err := decodeSnapshotToken(snapshot.GetData())
+		if err != nil {
+			return errors.Wrapf(err, "decode snapshot token index=%d", snapshot.GetMetadata().GetIndex())
+		}
+		if err := openAndRestoreFSMSnapshot(e.fsm, fsmSnapPath(e.fsmSnapDir, tok.Index), tok.CRC32C); err != nil {
+			return errors.Wrapf(err, "restore fsm snapshot file index=%d crc=%08x", tok.Index, tok.CRC32C)
+		}
+	} else {
+		// Legacy format: full FSM payload in snapshot.Data.
+		if err := e.fsm.Restore(bytes.NewReader(snapshot.GetData())); err != nil {
+			return errors.Wrapf(err, "restore fsm from legacy snapshot payload index=%d", snapshot.GetMetadata().GetIndex())
+		}
+	}
+	if err := recoverNamespaceConfiguration(e.fsm, *snapshot); err != nil {
+		return errors.Wrap(err, "recover snapshot namespace configuration")
+	}
 	return nil
 }
 
@@ -2998,6 +3026,9 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change index=%d", entry.GetIndex())
 	}
+	if err := e.recordFSMConfiguration(entry.GetIndex(), confStateValue(confState)); err != nil {
+		return err
+	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
@@ -3019,6 +3050,9 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	if err != nil {
 		return errors.Wrapf(err, "build peer inventory for config change v2 index=%d", entry.GetIndex())
 	}
+	if err := e.recordFSMConfiguration(entry.GetIndex(), confStateValue(confState)); err != nil {
+		return err
+	}
 	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
 		return err
 	}
@@ -3026,6 +3060,19 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	e.clearPendingConfChange(entry.GetIndex())
 	e.setApplied(entry.GetIndex())
 	return nil
+}
+
+func (e *Engine) recordFSMConfiguration(index uint64, state raftpb.ConfState) error {
+	return recordNamespaceConfiguration(e.fsm, index, state)
+}
+
+func (e *Engine) AppliedConfigurationIndex() (uint64, bool) {
+	aware, ok := e.fsm.(raftengine.AppliedConfigurationAware)
+	if !ok {
+		return 0, false
+	}
+	index := aware.AppliedConfigurationIndex()
+	return index, index != 0
 }
 
 // applyNormalEntry decodes the raft envelope, optionally unwraps the
@@ -3693,6 +3740,15 @@ func (e *Engine) protectedReceivedFSMSnapshotIndexesLocked() map[uint64]bool {
 // If fsmSnapDir is not set (e.g., engines created directly in unit tests),
 // falls back to the legacy in-memory []byte path.
 func (e *Engine) snapshotPayloadLocked(index uint64) ([]byte, error) {
+	// Config capture may have waited behind a newer snapshot publication.
+	// Do not serialize over a retained .fsm before CreateSnapshot rejects it.
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if index <= current.GetMetadata().GetIndex() {
+		return nil, errors.WithStack(raftengine.ErrSnapshotDeferred)
+	}
 	if e.fsmSnapDir == "" {
 		snapshot, err := e.fsm.Snapshot()
 		if err != nil {
@@ -5460,6 +5516,13 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
+	current, err := e.storage.Snapshot()
+	if err != nil {
+		return errors.Join(errors.WithStack(err), errors.WithStack(req.snapshot.Close()))
+	}
+	if req.index <= current.GetMetadata().GetIndex() {
+		return errors.WithStack(req.snapshot.Close())
+	}
 	if err := e.prepareFSMSnapshotWrite(req.index); err != nil {
 		slog.Warn("failed to prepare fsm snapshot write",
 			"index", req.index,

@@ -26,3 +26,9 @@ type MembershipChangeInterceptor interface {
 	// target node's Raft/gRPC endpoint and may be used for capability checks.
 	PreAddMember(ctx context.Context, raftID, address string) error
 }
+
+// MembershipPromotionInterceptor optionally rechecks a learner before promotion.
+// It does not repeat PreAddMember's potentially mutating registration work.
+type MembershipPromotionInterceptor interface {
+	PrePromoteMember(ctx context.Context, raftID, address string) error
+}

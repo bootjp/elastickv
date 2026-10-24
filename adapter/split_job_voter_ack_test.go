@@ -1,0 +1,131 @@
+package adapter
+
+import (
+	"context"
+	"errors"
+	"testing"
+	"time"
+
+	pb "github.com/bootjp/elastickv/proto"
+	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc"
+)
+
+func TestSplitMigrationVoterBarrierReopensForMembershipChanges(t *testing.T) {
+	t.Parallel()
+
+	ready := func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		return &pb.ProbeMigrationStateResponse{Ready: true}, nil
+	}
+	blocked := func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		return &pb.ProbeMigrationStateResponse{}, nil
+	}
+	n1 := &splitMigrationClientStub{probeFn: ready}
+	n2 := &splitMigrationClientStub{probeFn: ready}
+	n3 := &splitMigrationClientStub{probeFn: blocked}
+	voters := []SplitMigrationVoter{
+		{ID: "n1", Address: "n1:50051", Client: n1},
+		{ID: "n2", Address: "n2:50051", Client: n2},
+	}
+	server := &DistributionServer{splitMigrationVoterFactory: func(context.Context, uint64) ([]SplitMigrationVoter, error) {
+		return voters, nil
+	}}
+	req := &pb.ProbeMigrationStateRequest{JobId: 7, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED}
+
+	cursor, complete, err := server.syncSplitMigrationVoterBarrier(context.Background(), 1, nil, nil, req)
+	require.NoError(t, err)
+	require.True(t, complete)
+	acks, err := decodeSplitVoterAckCursor(cursor)
+	require.NoError(t, err)
+	require.Len(t, acks, 2)
+
+	voters = append(voters, SplitMigrationVoter{ID: "n3", Address: "n3:50051", Client: n3})
+	cursor, complete, err = server.syncSplitMigrationVoterBarrier(context.Background(), 1, cursor, nil, req)
+	require.NoError(t, err)
+	require.False(t, complete)
+	acks, err = decodeSplitVoterAckCursor(cursor)
+	require.NoError(t, err)
+	require.Len(t, acks, 3)
+	require.False(t, acks[2].acked)
+
+	n3.probeFn = ready
+	_, complete, err = server.syncSplitMigrationVoterBarrier(context.Background(), 1, cursor, nil, req)
+	require.NoError(t, err)
+	require.True(t, complete)
+
+	n2.probeFn = blocked
+	voters[1].Address = "n2:50052"
+	_, complete, err = server.syncSplitMigrationVoterBarrier(context.Background(), 1, cursor, nil, req)
+	require.NoError(t, err)
+	require.False(t, complete, "an address change must be treated as a new voter endpoint")
+}
+
+func TestSplitMigrationVoterBarrierClearsAckWhenFreshProbeFails(t *testing.T) {
+	t.Parallel()
+
+	client := &splitMigrationClientStub{probeFn: func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		return &pb.ProbeMigrationStateResponse{Ready: true}, nil
+	}}
+	server := &DistributionServer{splitMigrationVoterFactory: func(context.Context, uint64) ([]SplitMigrationVoter, error) {
+		return []SplitMigrationVoter{{ID: "n1", Address: "n1:50051", Client: client}}, nil
+	}}
+	req := &pb.ProbeMigrationStateRequest{JobId: 7, Kind: pb.MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED}
+
+	cursor, complete, err := server.syncSplitMigrationVoterBarrier(context.Background(), 1, nil, nil, req)
+	require.NoError(t, err)
+	require.True(t, complete)
+
+	client.probeFn = func(*pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {
+		return nil, errors.New("connection refused")
+	}
+	cursor, complete, err = server.syncSplitMigrationVoterBarrier(context.Background(), 1, cursor, nil, req)
+	require.NoError(t, err)
+	require.False(t, complete, "a saved ack must not survive a failed fresh probe")
+	acks, err := decodeSplitVoterAckCursor(cursor)
+	require.NoError(t, err)
+	require.Len(t, acks, 1)
+	require.False(t, acks[0].acked)
+}
+
+func TestSplitVoterAckCursorRejectsCorruption(t *testing.T) {
+	t.Parallel()
+
+	_, err := decodeSplitVoterAckCursor([]byte{99})
+	require.Error(t, err)
+	_, err = decodeSplitVoterAckCursor([]byte{splitVoterAckCursorVersion, 1, 4, 'n'})
+	require.Error(t, err)
+}
+
+type stalledSplitVoterClient struct {
+	splitMigrationClientStub
+}
+
+func (*stalledSplitVoterClient) ProbeMigrationState(ctx context.Context, _ *pb.ProbeMigrationStateRequest, _ ...grpc.CallOption) (*pb.ProbeMigrationStateResponse, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func TestSplitMigrationVoterBarrierBoundsStalledProbe(t *testing.T) {
+	t.Parallel()
+	healthy := &splitMigrationClientStub{}
+	server := &DistributionServer{splitMigrationVoterFactory: func(context.Context, uint64) ([]SplitMigrationVoter, error) {
+		return []SplitMigrationVoter{
+			{ID: "n1", Address: "n1:50051", Client: &stalledSplitVoterClient{}},
+			{ID: "n2", Address: "n2:50051", Client: healthy},
+		}, nil
+	}}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*defaultSplitMigrationVoterProbeTimeout)
+	defer cancel()
+	start := time.Now()
+	cursor, complete, err := server.syncSplitMigrationVoterBarrier(ctx, 1, nil, nil, &pb.ProbeMigrationStateRequest{JobId: 7})
+	require.NoError(t, err)
+	require.NoError(t, ctx.Err(), "a voter must not consume the runner's parent deadline")
+	require.Less(t, time.Since(start), 5*defaultSplitMigrationVoterProbeTimeout)
+	require.False(t, complete)
+	acks, err := decodeSplitVoterAckCursor(cursor)
+	require.NoError(t, err)
+	require.Len(t, acks, 2)
+	require.False(t, acks[0].acked)
+	require.True(t, acks[1].acked)
+	require.Len(t, healthy.probes, 1)
+}

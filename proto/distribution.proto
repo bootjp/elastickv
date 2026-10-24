@@ -1,5 +1,7 @@
 syntax = "proto3";
 
+import "internal.proto";
+
 option go_package = "github.com/bootjp/elastickv/proto";
 
 service Distribution {
@@ -11,12 +13,15 @@ service Distribution {
   rpc GetCatalogCapabilities (CatalogCapabilitiesRequest) returns (CatalogCapabilitiesResponse) {}
   rpc WatchCatalog (CatalogWatchRequest) returns (stream CatalogWatchEvent) {}
   rpc StartSplitMigration (StartSplitMigrationRequest) returns (StartSplitMigrationResponse) {}
+  rpc GetSplitMigrationCapability (GetSplitMigrationCapabilityRequest) returns (GetSplitMigrationCapabilityResponse) {}
   rpc GetRouteOwnership (GetRouteOwnershipRequest) returns (GetRouteOwnershipResponse) {}
   rpc GetIntersectingRoutes (GetIntersectingRoutesRequest) returns (GetIntersectingRoutesResponse) {}
   rpc GetSplitJob (GetSplitJobRequest) returns (GetSplitJobResponse) {}
   rpc ListSplitJobs (ListSplitJobsRequest) returns (ListSplitJobsResponse) {}
   rpc AbandonSplitJob (AbandonSplitJobRequest) returns (AbandonSplitJobResponse) {}
   rpc RetrySplitJob (RetrySplitJobRequest) returns (RetrySplitJobResponse) {}
+  // Privileged peer RPC: reads the committed root descriptor, never a watcher.
+  rpc AttestMigrationOwnership (AttestMigrationOwnershipRequest) returns (AttestMigrationOwnershipResponse) {}
 }
 
 message GetRouteRequest {
@@ -178,6 +183,19 @@ message SplitJob {
   int64 started_at_ms = 31;
   int64 updated_at_ms = 32;
   int64 terminal_at_ms = 33;
+  bool capability_regressed = 34;
+  // Group that still owns the source side of the split. Recorded at plan
+  // time because the route shape it can otherwise be recovered from
+  // disappears once the source child is itself split.
+  uint64 source_group_id = 35;
+  // Version 1 preflight checks every transfer family and relevant MVCC version.
+  // Missing fields on legacy jobs never attest that this scan completed.
+  uint32 transfer_preflight_version = 36;
+  uint64 transfer_preflight_ts = 37;
+  repeated SplitJobBracketProgress transfer_preflight_progress = 38;
+  bool transfer_preflight_done = 39;
+  // Durable moving child created with its same-owner partition manifest.
+  uint64 working_source_route_id = 40;
 }
 
 message ListRoutesRequest {}
@@ -257,6 +275,13 @@ message StartSplitMigrationResponse {
   uint64 job_id = 2;
 }
 
+message GetSplitMigrationCapabilityRequest {}
+
+message GetSplitMigrationCapabilityResponse {
+  bool migration_capable = 1;
+  repeated string capabilities = 2;
+}
+
 message GetRouteOwnershipRequest {
   bytes key = 1;
   uint64 catalog_version = 2;
@@ -309,3 +334,16 @@ message RetrySplitJobRequest {
 }
 
 message RetrySplitJobResponse {}
+
+message AttestMigrationOwnershipRequest {
+  uint64 job_id = 1;
+  MigrationOwnershipProof prior = 2;
+  bytes prior_partition = 3;
+  bytes prior_ownership_state = 4;
+}
+
+message AttestMigrationOwnershipResponse {
+  uint32 ownership_protocol = 1;
+  MigrationOwnershipProof ownership = 2;
+  bytes partition_transition = 3;
+}
