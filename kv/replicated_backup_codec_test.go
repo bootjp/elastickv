@@ -24,7 +24,7 @@ func replicatedBackupWireFixtures() []ReplicatedBackupCommand {
 func TestReplicatedBackupWireRoundTrip(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, replicatedBackupPayloadSize, binary.Size(replicatedBackupWire{}))
-	require.Equal(t, byte(0x0f), raftEncodeReplicatedBackup)
+	require.Equal(t, byte(0x16), raftEncodeReplicatedBackup)
 	require.Equal(t, byte(replicatedPinAdmit), byte(ReplicatedBackupPin))
 	require.Equal(t, byte(replicatedPinExtend), byte(ReplicatedBackupExtend))
 	require.Equal(t, byte(replicatedPinRelease), byte(ReplicatedBackupRelease))

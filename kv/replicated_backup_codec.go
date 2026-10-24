@@ -7,10 +7,13 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// 0x0f is an invalid protobuf wire type, not a valid legacy Request prefix.
-// No producer may emit it until the configuration-bound capability gate and
-// durable legacy drain activate the new backup epoch.
-const raftEncodeReplicatedBackup byte = 0x0f
+// 0x16 (field 2, wire type 6) is an invalid protobuf prefix, so it cannot be
+// mistaken for a legacy bare Request or RaftCommand. 0x0f was this opcode's
+// value while the branch was open, but main assigned 0x0f to
+// raftEncodeTargetReadiness first; aliasing it would misroute committed
+// entries. No producer may emit it until the configuration-bound capability
+// gate and durable legacy drain activate the new backup epoch.
+const raftEncodeReplicatedBackup byte = 0x16
 
 const (
 	replicatedBackupWireVersion = byte(1)
