@@ -330,6 +330,8 @@ jobs:
         run: |
           # Knossos checks each register independently. Bound each history's
           # ambiguous writes while keeping the requested total write budget.
+          # Rename needs a smaller cap because an indeterminate replacement
+          # leaves more states for Knossos to explore.
           valid_java_positive_int() {
             [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 1
             [[ ${#1} -lt 10 ]] && return 0
@@ -340,17 +342,14 @@ jobs:
             echo "key-count and max-writes-per-key must be positive 32-bit integers" >&2
             exit 1
           fi
-          FS_MAX_WRITES=$((FS_REQUESTED_WRITES < 64 ? FS_REQUESTED_WRITES : 64))
-          FS_KEY_COUNT=$(((FS_REQUESTED_KEYS * FS_REQUESTED_WRITES + FS_MAX_WRITES - 1) / FS_MAX_WRITES))
-          if (( FS_KEY_COUNT > 2147483647 )); then
-            echo "calculated filesystem key count exceeds the 32-bit CLI limit" >&2
-            exit 1
-          fi
-          echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
+          bash test/filesystem_budget_test.sh
+          source ./filesystem_budget.sh
           declare -A RESULT
           FAILED=()
           for mode in overwrite rename; do
             echo "::group::write-mode=${mode}"
+            filesystem_budget "$mode" "$FS_REQUESTED_KEYS" "$FS_REQUESTED_WRITES"
+            echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
             set +e
             timeout 480 ~/lein run -m elastickv.filesystem-workload --local \
               --time-limit ${{ inputs.time-limit || '150' }} \
