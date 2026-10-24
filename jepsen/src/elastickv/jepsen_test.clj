@@ -8,6 +8,7 @@
             [elastickv.s3-workload :as s3-workload]
             [elastickv.filesystem-workload :as filesystem-workload]
             [elastickv.sqs-htfifo-workload :as sqs-htfifo-workload]
+            [elastickv.split-workload :as split-workload]
             [jepsen.cli :as cli]))
 
 (defn elastickv-test
@@ -38,6 +39,10 @@
   ([] (elastickv-zset-safety-test {}))
   ([opts] (zset-safety-workload/elastickv-zset-safety-test opts)))
 
+(defn elastickv-split-test
+  ([] (elastickv-split-test {}))
+  ([opts] (split-workload/elastickv-split-test opts)))
+
 (def ^:private test-fns
   "Map of user-facing test names to their constructor fns. The first
   positional CLI arg selects which workload runs; if absent or unknown,
@@ -48,6 +53,7 @@
    "elastickv-dynamodb-test"    elastickv-dynamodb-test
    "elastickv-s3-test"          elastickv-s3-test
    "elastickv-filesystem-test"  elastickv-filesystem-test
+   "elastickv-split-test"       elastickv-split-test
    "elastickv-learner-test"     elastickv-learner-test})
 
 (defn elastickv-sqs-htfifo-test
@@ -65,7 +71,7 @@
 
   Supported <test-name>s: elastickv-test, elastickv-zset-safety-test,
   elastickv-dynamodb-test, elastickv-s3-test, elastickv-filesystem-test,
-  elastickv-learner-test. When the first positional arg is not a known test
+  elastickv-split-test, elastickv-learner-test. When the first positional arg is not a known test
   name, we default to `elastickv-test` for
   backward compatibility and forward ALL args to jepsen.cli/run!.
 

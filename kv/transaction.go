@@ -18,6 +18,7 @@ type TransactionManager struct {
 
 	proposalObserver   ProposalObserver
 	timestampAdmission atomic.Pointer[transactionTimestampAdmission]
+	migrationAdmission atomic.Pointer[transactionMigrationAdmission]
 
 	mu          sync.Mutex
 	rawPending  []*rawCommitItem
@@ -149,7 +150,10 @@ func prependByte(prefix byte, data []byte) []byte {
 // HashiCorp Raft delivers FSM responses via ApplyFuture.Response(), not Error(),
 // so we must inspect the response to avoid silently treating failed writes as
 // successes.
-func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, proposalObserver ProposalObserver) (uint64, []error, error) {
+func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb.Request, proposalObserver ProposalObserver, admission ...*transactionMigrationAdmission) (uint64, []error, error) {
+	if len(admission) > 0 && admission[0] != nil {
+		return admission[0].apply(ctx, proposer, reqs, proposalObserver)
+	}
 	b, err := marshalRaftCommand(reqs)
 	if err != nil {
 		return 0, nil, errors.WithStack(err)
@@ -232,7 +236,7 @@ func (t *TransactionManager) commitSequential(ctx context.Context, reqs []*pb.Re
 	commitIndex, err := func() (uint64, error) {
 		commitIndex := uint64(0)
 		for _, req := range reqs {
-			idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver)
+			idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load())
 			if err != nil {
 				return 0, err
 			}
@@ -419,7 +423,7 @@ func (t *TransactionManager) applyRawBatch(batch []*rawCommitItem) {
 	// see the commitRaw comment. Use Background here; per-caller
 	// cancellation is honoured at the wait site in commitRaw via select
 	// on item.done vs ctx.Done.
-	idx, results, err := applyRequests(context.Background(), t.proposer, reqs, t.proposalObserver)
+	idx, results, err := applyRequests(context.Background(), t.proposer, reqs, t.proposalObserver, t.migrationAdmission.Load())
 	if err != nil {
 		for _, item := range batch {
 			item.done <- rawCommitResult{err: err}
@@ -458,7 +462,7 @@ func (t *TransactionManager) Abort(ctx context.Context, reqs []*pb.Request) (*Tr
 
 	var commitIndex uint64
 	for _, req := range abortReqs {
-		idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver)
+		idx, results, err := applyRequests(ctx, t.proposer, []*pb.Request{req}, t.proposalObserver, t.migrationAdmission.Load())
 		if err != nil {
 			return nil, err
 		}

@@ -611,6 +611,9 @@ func storeKeysFromKVPairs(kvs []*store.KVPair) [][]byte {
 }
 
 func (r *GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.RawPutResponse, error) {
+	if err := validatePublicMutationKey(req.GetKey()); err != nil {
+		return nil, err
+	}
 	m, err := r.grpcTranscoder.RawPutToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -631,6 +634,9 @@ func (r *GRPCServer) RawPut(ctx context.Context, req *pb.RawPutRequest) (*pb.Raw
 }
 
 func (r *GRPCServer) RawDelete(ctx context.Context, req *pb.RawDeleteRequest) (*pb.RawDeleteResponse, error) {
+	if err := validatePublicMutationKey(req.GetKey()); err != nil {
+		return nil, err
+	}
 	m, err := r.grpcTranscoder.RawDeleteToRequest(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -663,6 +669,9 @@ func (r *GRPCServer) Rollback(ctx context.Context, req *pb.RollbackRequest) (*pb
 }
 
 func (r *GRPCServer) Put(ctx context.Context, req *pb.PutRequest) (*pb.PutResponse, error) {
+	if err := validatePublicMutationKey(req.GetKey()); err != nil {
+		return nil, err
+	}
 	reqs, err := r.grpcTranscoder.TransactionalPutToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)
@@ -713,6 +722,9 @@ func (r *GRPCServer) Get(ctx context.Context, req *pb.GetRequest) (*pb.GetRespon
 }
 
 func (r *GRPCServer) Delete(ctx context.Context, req *pb.DeleteRequest) (*pb.DeleteResponse, error) {
+	if err := validatePublicMutationKey(req.GetKey()); err != nil {
+		return nil, err
+	}
 	reqs, err := r.grpcTranscoder.TransactionalDeleteToRequests(req)
 	if err != nil {
 		return nil, errors.WithStack(err)

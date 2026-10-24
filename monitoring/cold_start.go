@@ -35,11 +35,11 @@ func newColdStartMetrics(registerer prometheus.Registerer) *ColdStartMetrics {
 		restoreTotal: prometheus.NewCounterVec(prometheus.CounterOpts{
 			Name: "elastickv_fsm_cold_start_restore_total",
 			Help: "Cumulative count of cold-start snapshot-restore skip-gate outcomes. outcome=skipped means the gate fired (LastAppliedIndex >= snapshot.Index); outcome=executed means the FSM was genuinely stale; outcome=fallback means the strictly-additive fallback path ran (FSM did not opt in, meta key missing, or read error). fallback_reason is empty for skipped/executed.",
-		}, []string{"outcome", "fallback_reason"}),
+		}, []string{labelOutcome, "fallback_reason"}),
 		appliedIndexGap: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "elastickv_fsm_cold_start_applied_index_gap",
 			Help: "Absolute distance between the snapshot pointer and the FSM's reported applied index at cold start, in Raft log entries. outcome=skipped reports how far ahead the live store was; outcome=executed reports how far behind it was.",
-		}, []string{"outcome"}),
+		}, []string{labelOutcome}),
 	}
 	if registerer != nil {
 		registerer.MustRegister(m.restoreTotal)

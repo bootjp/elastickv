@@ -2762,7 +2762,7 @@ func putElems(args ...any) ([]*kv.Elem[kv.OP], error) {
 		return nil, ErrInvalid
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, len(args)/keyValuePairArity)
-	for i := 0; i < len(args); i += keyValuePairArity {
+	for i := 0; i+1 < len(args); i += keyValuePairArity {
 		key, ok := args[i].([]byte)
 		if !ok {
 			return nil, ErrInvalid

@@ -116,6 +116,9 @@ func (f *kvFSM) reloadBackupTimestampFloor(ctx context.Context) error {
 	if f == nil || f.store == nil {
 		return nil
 	}
+	if err := f.reloadMigrationConfiguration(ctx); err != nil {
+		return err
+	}
 	if err := f.reloadPrepareEvidence(ctx); err != nil {
 		return err
 	}

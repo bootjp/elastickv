@@ -10,6 +10,17 @@ import (
 	"github.com/emirpasic/gods/maps/treemap"
 )
 
+// MigrationPagePayloadBudget leaves framing headroom in the 64 MiB peer
+// transport. Transfer checks include a full-key cursor; this is not a limit
+// on ordinary writes, which retain their existing admission semantics.
+const MigrationPagePayloadBudget = 63 << 20
+
+func MigrationVersionFitsTransfer(key, value []byte) bool {
+	const cursorAndFramingBytes = 128
+	return len(key) <= (MigrationPagePayloadBudget-cursorAndFramingBytes)/2 &&
+		len(value) <= MigrationPagePayloadBudget-cursorAndFramingBytes-2*len(key)
+}
+
 const (
 	exportCursorTagEmitted byte = iota
 	exportCursorTagScanned
@@ -22,7 +33,9 @@ const (
 	migrationMetadataVersion = 1
 
 	migrationAckPrefix                 = "!migstage|ack|"
+	migrationReadyPrefix               = "!migstage|ready|"
 	migrationUint64Bytes               = 8
+	migrationAckKeyIDBytes             = 2 * migrationUint64Bytes
 	exportVersionSizeOverhead          = 24
 	defaultSparseExportMaxScannedBytes = 1 << 20
 )
@@ -203,10 +216,20 @@ func exportUsesSparseScanBudget(opts ExportVersionsOptions) bool {
 		opts.EndKey != nil
 }
 
+func migrationReadyKey(jobID uint64) []byte {
+	key := make([]byte, len(migrationReadyPrefix)+migrationUint64Bytes)
+	copy(key, migrationReadyPrefix)
+	binary.BigEndian.PutUint64(key[len(migrationReadyPrefix):], jobID)
+	return key
+}
+
 func isMigrationMetadataKey(rawKey []byte) bool {
-	return bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
+	return IsMigrationOwnershipPartitionMetadataKey(rawKey) || bytes.Equal(rawKey, migrationOwnershipMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationRetiredMetaKeyBytes) ||
+		bytes.Equal(rawKey, migrationAckMetaKeyBytes) ||
 		bytes.Equal(rawKey, migrationHLCFloorMetaKeyBytes) ||
-		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes)
+		bytes.Equal(rawKey, migrationPromoteMetaKeyBytes) ||
+		(len(rawKey) == len(migrationReadyPrefix)+migrationUint64Bytes && bytes.HasPrefix(rawKey, []byte(migrationReadyPrefix)))
 }
 
 func encodeMigrationImportAcks(acks map[migrationAckID]migrationImportAck) []byte {
@@ -367,6 +390,12 @@ func decodeMigrationPromotionStates(data []byte) (map[uint64]PromotionState, boo
 }
 
 func validateImportVersion(version MVCCVersion) error {
+	if IsMigrationOwnershipMetadataKey(version.Key) || IsMigrationOwnershipPartitionMetadataKey(version.Key) {
+		return errors.Wrap(ErrInvalidImportVersion, "migration cannot import ownership metadata")
+	}
+	if bytes.Equal(version.Key, migrationRetiredMetaKeyBytes) {
+		return errors.Wrap(ErrInvalidImportVersion, "migration cannot import retirement metadata")
+	}
 	if version.CommitTS == 0 {
 		return errors.Wrap(ErrInvalidImportVersion, "migration import version has zero commit_ts")
 	}
@@ -431,7 +460,14 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if err := s.checkExportReadTSLocked(opts); err != nil {
+		return ExportVersionsResult{}, err
+	}
 
+	return s.exportVersionsLocked(ctx, opts, pos)
+}
+
+func (s *mvccStore) exportVersionsLocked(ctx context.Context, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
 	result := newExportVersionsResult(opts.MaxVersions)
 	it := s.tree.Iterator()
 	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
@@ -460,6 +496,20 @@ func (s *mvccStore) ExportVersions(ctx context.Context, opts ExportVersionsOptio
 	result.Done = true
 	result.NextCursor = nil
 	return result, nil
+}
+
+func (s *mvccStore) checkExportReadTSLocked(opts ExportVersionsOptions) error {
+	if readTSCompacted(exportRetentionReadTS(opts), s.minRetainedTS) {
+		return ErrReadTSCompacted
+	}
+	return nil
+}
+
+func exportRetentionReadTS(opts ExportVersionsOptions) uint64 {
+	if opts.ReadTS != 0 {
+		return opts.ReadTS
+	}
+	return opts.MaxCommitTSInclusive
 }
 
 var errExportReachedEnd = errors.New("export reached end")
@@ -649,6 +699,9 @@ func exportMemoryVersionsForKey(
 func (s *mvccStore) ImportVersions(_ context.Context, opts ImportVersionsOptions) (ImportVersionsResult, error) {
 	s.mtx.Lock()
 	defer s.mtx.Unlock()
+	if _, retired := s.migrationRetired[opts.JobID]; retired {
+		return ImportVersionsResult{}, errors.WithStack(ErrMigrationRetired)
+	}
 
 	id := migrationAckID{jobID: opts.JobID, bracketID: opts.BracketID}
 	existing, hasExisting := s.migrationAcks[id]
@@ -692,6 +745,20 @@ func (s *mvccStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64, 
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
 	return s.migrationHLCFloors[jobID], nil
+}
+
+func (s *mvccStore) MigrationImportMetadataPresent(_ context.Context, jobID uint64) (bool, error) {
+	s.mtx.RLock()
+	defer s.mtx.RUnlock()
+	if s.migrationHLCFloors[jobID] != 0 {
+		return true, nil
+	}
+	for id := range s.migrationAcks {
+		if id.jobID == jobID {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 func (s *mvccStore) RetireMigration(ctx context.Context, jobID uint64) error {

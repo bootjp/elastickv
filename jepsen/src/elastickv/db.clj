@@ -17,6 +17,8 @@
 (def ^:private pid-file "/var/run/elastickv.pid")
 (def ^:private server-bin (str bin-dir "/elastickv"))
 (def ^:private raftadmin-bin (str bin-dir "/raftadmin"))
+(def ^:private split-bin (str bin-dir "/elastickv-split"))
+(def ^:private list-routes-bin (str bin-dir "/elastickv-list-routes"))
 (def ^:private admin-bin (str bin-dir "/elastickv-admin"))
 (def ^:private encryption-setup-bin (str bin-dir "/jepsen-encryption-setup"))
 (def ^:private kek-file (str data-dir "/kek.bin"))
@@ -36,6 +38,8 @@
 (def ^:private binary-builds
   [["elastickv" ["go" "build" "-o" (str build-dir "/elastickv") "."]]
    ["raftadmin" ["go" "build" "-o" (str build-dir "/raftadmin") "./cmd/raftadmin"]]
+   ["elastickv-split" ["go" "build" "-o" (str build-dir "/elastickv-split") "./cmd/elastickv-split"]]
+   ["elastickv-list-routes" ["go" "build" "-o" (str build-dir "/elastickv-list-routes") "./cmd/elastickv-list-routes"]]
    ["elastickv-admin" ["go" "build" "-o" (str build-dir "/elastickv-admin") "./cmd/elastickv-admin"]]
    ["jepsen-encryption-setup" ["go" "build" "-o" (str build-dir "/jepsen-encryption-setup") "./cmd/jepsen-encryption-setup"]]])
 
@@ -71,7 +75,7 @@
   (c/on node
     (c/su
       (c/exec :mkdir :-p bin-dir)
-      (doseq [bin ["elastickv" "raftadmin" "elastickv-admin" "jepsen-encryption-setup"]]
+      (doseq [[bin _] binary-builds]
         (c/upload (str build-dir "/" bin) (str bin-dir "/" bin))
         (c/exec :chmod "755" (str bin-dir "/" bin))))))
 
@@ -206,7 +210,7 @@
   "Builds the production server argv for one managed Jepsen node."
   [{:keys [node grpc redis dynamo s3 sqs sqs-region data-dir raft-engine
            raft-redis-map raft-dynamo-map raft-s3-map raft-sqs-map raft-groups shard-ranges
-           filesystem-mount encryption bootstrap? join-as-learner join-members]}]
+           filesystem-mount encryption migration-enabled bootstrap? join-as-learner join-members]}]
   (cond-> ["--address" grpc
            "--redisAddress" redis
            "--raftId" (name node)
@@ -221,6 +225,8 @@
     filesystem-mount (conj "--filesystemMount" filesystem-mount)
     (seq raft-groups) (conj "--raftGroups" (build-raft-groups-arg node raft-groups))
     (seq shard-ranges) (conj "--shardRanges" shard-ranges)
+    ;; Isolated migration tests intentionally use unauthenticated helpers.
+    migration-enabled (conj "--adminInsecureNoAuth")
     encryption (conj "--encryptionSidecarPath" sidecar-file
                      "--encryption-enabled"
                      "--kekFile" kek-file)
@@ -306,7 +312,7 @@
         (c/exec :bash "-c" (unmount-filesystem-cmd mount-dir))))))
 
 (defn- start-node!
-  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env filesystem-mount encryption join-as-learner join-members]}]
+  [test node {:keys [bootstrap-node grpc-port redis-port dynamo-port s3-port sqs-port sqs-region data-dir raft-groups shard-ranges raft-engine server-env migration-enabled filesystem-mount encryption join-as-learner join-members]}]
   (when (and (seq raft-groups)
              (> (count raft-groups) 1)
              (nil? shard-ranges))
@@ -331,14 +337,19 @@
                 :raft-redis-map raft-redis-map :raft-dynamo-map raft-dynamo-map
                 :raft-s3-map raft-s3-map :raft-sqs-map raft-sqs-map
                 :raft-groups raft-groups :shard-ranges shard-ranges
-                :filesystem-mount mount-dir :encryption encryption
-                 :bootstrap? bootstrap? :join-as-learner join-as-learner
-                 :join-members join-members})
+                :filesystem-mount mount-dir :encryption encryption :migration-enabled migration-enabled
+                :bootstrap? bootstrap? :join-as-learner join-as-learner
+                :join-members join-members})
+        effective-server-env (cond-> (or server-env {})
+                               migration-enabled
+                               (merge {"ELASTICKV_ENABLE_MIGRATION_IMPORT_OPCODE" "true"
+                                       "ELASTICKV_ENABLE_MIGRATION_PROMOTE_OPCODE" "true"
+                                       "ELASTICKV_ENABLE_MIGRATION_CLEANUP_OPCODE" "true"}))
         daemon-opts (cond-> {:chdir bin-dir
                              :logfile log-file
                              :pidfile pid-file
                              :background? true}
-                      (seq server-env) (assoc :env server-env))]
+                      (seq effective-server-env) (assoc :env effective-server-env))]
     (c/on node
       (c/su
         (c/exec :mkdir :-p data-dir)

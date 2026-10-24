@@ -327,7 +327,7 @@ func decodeSQSJSONInput(r *http.Request, v any) error {
 // the endpoint the client addressed so SDKs that re-sign subsequent requests
 // against the same URL keep working behind reverse proxies.
 func (s *SQSServer) queueURL(r *http.Request, queueName string) string {
-	scheme := "http"
+	scheme := httpSchemePlain
 	if r.TLS != nil {
 		scheme = "https"
 	}
@@ -455,48 +455,48 @@ var sqsAttributeAppliers = map[string]attributeApplier{
 	// FifoQueue is applied after applyAttributes returns (see
 	// parseAttributesIntoMeta) because it needs cross-field validation
 	// against the queue name.
-	"FifoQueue": func(_ *sqsQueueMeta, _ string) error { return nil },
-	"VisibilityTimeout": func(m *sqsQueueMeta, v string) error {
-		n, err := parseIntAttr("VisibilityTimeout", v, 0, sqsMaxVisibilityTimeoutSeconds)
+	sqsAttrFifoQueue: func(_ *sqsQueueMeta, _ string) error { return nil },
+	sqsAttrVisibilityTimeout: func(m *sqsQueueMeta, v string) error {
+		n, err := parseIntAttr(sqsAttrVisibilityTimeout, v, 0, sqsMaxVisibilityTimeoutSeconds)
 		if err != nil {
 			return err
 		}
 		m.VisibilityTimeoutSeconds = n
 		return nil
 	},
-	"MessageRetentionPeriod": func(m *sqsQueueMeta, v string) error {
-		n, err := parseIntAttr("MessageRetentionPeriod", v, sqsMinRetentionSeconds, sqsMaxRetentionSeconds)
+	sqsAttrMessageRetentionPeriod: func(m *sqsQueueMeta, v string) error {
+		n, err := parseIntAttr(sqsAttrMessageRetentionPeriod, v, sqsMinRetentionSeconds, sqsMaxRetentionSeconds)
 		if err != nil {
 			return err
 		}
 		m.MessageRetentionSeconds = n
 		return nil
 	},
-	"DelaySeconds": func(m *sqsQueueMeta, v string) error {
-		n, err := parseIntAttr("DelaySeconds", v, 0, sqsMaxDelaySeconds)
+	sqsAttrDelaySeconds: func(m *sqsQueueMeta, v string) error {
+		n, err := parseIntAttr(sqsAttrDelaySeconds, v, 0, sqsMaxDelaySeconds)
 		if err != nil {
 			return err
 		}
 		m.DelaySeconds = n
 		return nil
 	},
-	"ReceiveMessageWaitTimeSeconds": func(m *sqsQueueMeta, v string) error {
-		n, err := parseIntAttr("ReceiveMessageWaitTimeSeconds", v, 0, sqsMaxReceiveMessageWaitSeconds)
+	sqsAttrReceiveMessageWaitTimeSeconds: func(m *sqsQueueMeta, v string) error {
+		n, err := parseIntAttr(sqsAttrReceiveMessageWaitTimeSeconds, v, 0, sqsMaxReceiveMessageWaitSeconds)
 		if err != nil {
 			return err
 		}
 		m.ReceiveMessageWaitSeconds = n
 		return nil
 	},
-	"MaximumMessageSize": func(m *sqsQueueMeta, v string) error {
-		n, err := parseIntAttr("MaximumMessageSize", v, sqsMinMaximumMessageSize, sqsMaximumAllowedMaximumMessageSize)
+	sqsAttrMaximumMessageSize: func(m *sqsQueueMeta, v string) error {
+		n, err := parseIntAttr(sqsAttrMaximumMessageSize, v, sqsMinMaximumMessageSize, sqsMaximumAllowedMaximumMessageSize)
 		if err != nil {
 			return err
 		}
 		m.MaximumMessageSize = n
 		return nil
 	},
-	"ContentBasedDeduplication": func(m *sqsQueueMeta, v string) error {
+	sqsAttrContentBasedDeduplication: func(m *sqsQueueMeta, v string) error {
 		b, err := strconv.ParseBool(v)
 		if err != nil {
 			return newSQSAPIError(http.StatusBadRequest, sqsErrInvalidAttributeValue, "ContentBasedDeduplication must be a boolean")

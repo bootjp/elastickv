@@ -241,19 +241,21 @@ var metaAppliedIndexBytes = []byte(metaAppliedIndex)
 //     DB is being swapped (Restore/Close) or checkpointed, and as a
 //     read-lock by every operation that accesses s.db.
 //  4. mtx           – guards the in-memory metadata fields
-//     (lastCommitTS, minRetainedTS, pendingMinRetainedTS).
+//     (lastCommitTS, minRetainedTS, pendingMinRetainedTS, migrationReadinessCache).
 type pebbleStore struct {
-	db                   *pebble.DB
-	cache                *pebble.Cache // owns one ref; Unref on Close / reopen.
-	dbMu                 sync.RWMutex  // guards s.db pointer – see lock ordering above
-	log                  *slog.Logger
-	lastCommitTS         uint64
-	minRetainedTS        uint64
-	pendingMinRetainedTS uint64
-	mtx                  sync.RWMutex
-	applyMu              sync.Mutex // serializes ApplyMutations: conflict check → commit
-	maintenanceMu        sync.Mutex
-	dir                  string
+	db                      *pebble.DB
+	cache                   *pebble.Cache // owns one ref; Unref on Close / reopen.
+	dbMu                    sync.RWMutex  // guards s.db pointer – see lock ordering above
+	log                     *slog.Logger
+	lastCommitTS            uint64
+	minRetainedTS           uint64
+	pendingMinRetainedTS    uint64
+	migrationReadinessCache []TargetStagedReadinessState
+	migrationAdmission      migrationServingAdmissionIndex
+	mtx                     sync.RWMutex
+	applyMu                 sync.Mutex // serializes ApplyMutations: conflict check → commit
+	maintenanceMu           sync.Mutex
+	dir                     string
 	// sstIngestSnapshots enables the cluster-wide opt-in snapshot format
 	// implemented in snapshot_pebble_sst.go. Receivers always understand the
 	// format; senders keep the legacy stream by default for rolling-upgrade
@@ -453,9 +455,15 @@ func NewPebbleStore(dir string, opts ...PebbleStoreOption) (MVCCStore, error) {
 		cleanupOnInitFail()
 		return nil, err
 	}
+	readinessStates, err := s.loadMigrationServingMetadata()
+	if err != nil {
+		cleanupOnInitFail()
+		return nil, err
+	}
 	s.lastCommitTS = maxTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.migrationReadinessCache = readinessStates
 	// A backup is only stale after the live directory has opened and its
 	// metadata has been read successfully. Before this point it is the recovery
 	// source for a process crash between the two restore renames.
@@ -718,6 +726,12 @@ func writeTempDBMetadata(db *pebble.DB, meta streamingMVCCRestoreMetadata) error
 	}
 	if err := batch.Set(migrationPromoteMetaKeyBytes, encodeMigrationPromotionStates(meta.migrationPromotions), nil); err != nil {
 		return errors.WithStack(err)
+	}
+	if err := batch.Set(migrationRetiredMetaKeyBytes, encodeMigrationRetiredJobs(meta.migrationRetired), nil); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := stageSnapshotServingMetadata(batch, meta); err != nil {
+		return err
 	}
 	return errors.WithStack(batch.Commit(pebble.Sync))
 }
@@ -3320,6 +3334,10 @@ func restoreBatchLoopInto(r io.Reader, db *pebble.DB) error {
 }
 
 func (s *pebbleStore) Restore(r io.Reader) error {
+	return s.restoreSnapshot(r, nil)
+}
+
+func (s *pebbleStore) restoreSnapshot(r io.Reader, validate func(string) error) error {
 	s.maintenanceMu.Lock()
 	defer s.maintenanceMu.Unlock()
 
@@ -3342,14 +3360,14 @@ func (s *pebbleStore) Restore(r io.Reader) error {
 	case bytes.Equal(header, pebbleSnapshotMagic[:]):
 		// Native Pebble format: restorePebbleNativeAtomic performs a temp-dir
 		// swap so the existing DB is preserved if the restore fails midway.
-		return s.restorePebbleNativeAtomic(br)
+		return s.restorePebbleNativeAtomic(br, validate)
 	case bytes.Equal(header, pebbleSSTIngestSnapshotMagic[:]):
-		return s.restorePebbleSSTIngestAtomic(br)
+		return s.restorePebbleSSTIngestAtomic(br, validate)
 	case bytes.Equal(header, mvccSnapshotMagic[:]):
 		// Streaming MVCC format: restoreFromStreamingMVCC performs an atomic
 		// temp-dir swap, so the existing DB is preserved until checksum
 		// verification succeeds.
-		return s.restoreFromStreamingMVCC(br)
+		return s.restoreFromStreamingMVCC(br, validate)
 	default:
 		return errors.WithStack(errors.Newf("unrecognized snapshot format: unknown magic header"))
 	}
@@ -3372,6 +3390,8 @@ func (s *pebbleStore) handleRestorePeekError(err error, header []byte) error {
 	s.lastCommitTS = 0
 	s.minRetainedTS = 0
 	s.pendingMinRetainedTS = 0
+	s.migrationReadinessCache = nil
+	s.migrationAdmission = migrationServingAdmissionIndex{}
 	if setErr := writePebbleUint64(s.db, metaLastCommitTSBytes, 0, pebble.NoSync); setErr != nil {
 		return errors.WithStack(setErr)
 	}
@@ -3412,7 +3432,7 @@ func (s *pebbleStore) reopenFreshDB() error {
 // It writes all entries into a temporary sibling directory and only swaps the
 // temp directory into s.dir after a full successful read, preserving the
 // existing DB on any failure.
-func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
+func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader, validate func(string) error) error {
 	magic, ts, err := readPebbleNativeHeader(r)
 	if err != nil {
 		return err
@@ -3431,6 +3451,9 @@ func (s *pebbleStore) restorePebbleNativeAtomic(r io.Reader) error {
 		return err
 	}
 
+	if err := validateRestoreTempDB(tmpDir, validate); err != nil {
+		return err
+	}
 	if err := s.swapInTempDB(tmpDir); err != nil {
 		return err
 	}
@@ -3506,6 +3529,10 @@ type streamingMVCCRestoreMetadata struct {
 	migrationAcks       map[migrationAckID]migrationImportAck
 	migrationHLCFloors  map[uint64]uint64
 	migrationPromotions map[uint64]PromotionState
+	migrationReadiness  []TargetStagedReadinessState
+	migrationRetired    map[uint64]struct{}
+	migrationOwnership  []MigrationOwnershipState
+	migrationPartitions MigrationOwnershipPartitionState
 }
 
 func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32, streamingMVCCRestoreMetadata, error) {
@@ -3516,16 +3543,20 @@ func readStreamingMVCCRestoreHeader(r io.Reader) (io.Reader, hash.Hash32, uint32
 
 	hash := crc32.NewIEEE()
 	body := io.TeeReader(r, hash)
-	lastCommitTS, minRetainedTS, migrationAcks, migrationHLCFloors, migrationPromotions, err := readMVCCSnapshotMetadata(body, version)
+	lastCommitTS, minRetainedTS, snapshotMeta, err := readMVCCSnapshotMetadata(body, version)
 	if err != nil {
 		return nil, nil, 0, streamingMVCCRestoreMetadata{}, err
 	}
 	meta := streamingMVCCRestoreMetadata{
 		lastCommitTS:        lastCommitTS,
 		minRetainedTS:       minRetainedTS,
-		migrationAcks:       migrationAcks,
-		migrationHLCFloors:  migrationHLCFloors,
-		migrationPromotions: migrationPromotions,
+		migrationAcks:       snapshotMeta.acks,
+		migrationHLCFloors:  snapshotMeta.floors,
+		migrationPromotions: snapshotMeta.promotions,
+		migrationReadiness:  snapshotMeta.readiness,
+		migrationRetired:    snapshotMeta.retired,
+		migrationOwnership:  snapshotMeta.ownership,
+		migrationPartitions: snapshotMeta.partitions,
 	}
 	return body, hash, expectedChecksum, meta, nil
 }
@@ -3569,7 +3600,7 @@ func writeStreamingMVCCRestoreTempDB(dir string, body io.Reader, hash hash.Hash3
 	return tmpDir, nil
 }
 
-func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
+func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader, validate func(string) error) error {
 	body, hash, expectedChecksum, meta, err := readStreamingMVCCRestoreHeader(r)
 	if err != nil {
 		return err
@@ -3577,6 +3608,9 @@ func (s *pebbleStore) restoreFromStreamingMVCC(r io.Reader) error {
 
 	tmpDir, err := writeStreamingMVCCRestoreTempDB(s.dir, body, hash, expectedChecksum, meta, s.cipher != nil)
 	if err != nil {
+		return err
+	}
+	if err := validateRestoreTempDB(tmpDir, validate); err != nil {
 		return err
 	}
 	return s.swapInTempDB(tmpDir)
@@ -3649,9 +3683,14 @@ func (s *pebbleStore) swapInTempDBWithMetadata(tmpDir string, expected *pebbleSn
 	if err != nil {
 		return errors.Join(err, s.restoreSwapBackup(backupDir))
 	}
+	readinessStates, err := s.loadMigrationServingMetadata()
+	if err != nil {
+		return errors.Join(err, s.restoreSwapBackup(backupDir))
+	}
 	s.lastCommitTS = lastCommitTS
 	s.minRetainedTS = minRetainedTS
 	s.pendingMinRetainedTS = pendingMinRetainedTS
+	s.migrationReadinessCache = readinessStates
 	if err := os.RemoveAll(backupDir); err != nil {
 		s.log.Warn("failed to remove restore backup", "path", backupDir, "error", err)
 	}

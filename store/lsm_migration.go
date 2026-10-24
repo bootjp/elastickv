@@ -25,6 +25,9 @@ func (s *pebbleStore) exportVersionsLocked(ctx context.Context, opts ExportVersi
 	if opts.MaxVersions <= 0 {
 		return ExportVersionsResult{}, errors.WithStack(ErrInvalidExportBudget)
 	}
+	if readTSCompacted(exportRetentionReadTS(opts), s.effectiveMinRetainedTS()) {
+		return ExportVersionsResult{}, ErrReadTSCompacted
+	}
 
 	iter, err := s.db.NewIter(pebbleExportIterOptions(opts))
 	if err != nil {
@@ -392,6 +395,9 @@ func (s *pebbleStore) commitPebbleImportAppliedIndex(appliedIndex uint64, writeO
 }
 
 func (s *pebbleStore) validatePebbleImportBatch(opts ImportVersionsOptions) (bool, []byte, error) {
+	if err := s.checkMigrationNotRetiredLocked(opts.JobID); err != nil {
+		return false, nil, err
+	}
 	existing, hasExisting, err := s.readMigrationImportAck(opts.JobID, opts.BracketID)
 	if err != nil {
 		return false, nil, err
@@ -579,6 +585,28 @@ func (s *pebbleStore) MigrationHLCFloor(_ context.Context, jobID uint64) (uint64
 	return floor, nil
 }
 
+func (s *pebbleStore) MigrationImportMetadataPresent(_ context.Context, jobID uint64) (bool, error) {
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	floors, err := s.readMigrationHLCFloors()
+	if err != nil {
+		return false, err
+	}
+	if floors[jobID] != 0 {
+		return true, nil
+	}
+	acks, err := s.readMigrationImportAcks()
+	if err != nil {
+		return false, err
+	}
+	for id := range acks {
+		if id.jobID == jobID {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
 func (s *pebbleStore) RetireMigration(ctx context.Context, jobID uint64) error {
 	return s.retireMigrationWithOpts(ctx, jobID, s.directApplyWriteOpts(), 0)
 }
@@ -593,6 +621,9 @@ func (s *pebbleStore) retireMigrationWithOpts(ctx context.Context, jobID uint64,
 	}
 	s.dbMu.Lock()
 	defer s.dbMu.Unlock()
+	if _, err := s.readMigrationRetiredJobs(); err != nil {
+		return err
+	}
 
 	batch := s.db.NewBatch()
 	defer batch.Close()

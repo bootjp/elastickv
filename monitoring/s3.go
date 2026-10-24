@@ -79,7 +79,7 @@ func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 				Name: "elastickv_s3_blob_offload_write_decisions_total",
 				Help: "Total S3 write-path blob offload decisions by selected mode and fallback reason.",
 			},
-			[]string{"mode", "reason"},
+			[]string{labelMode, labelReason},
 		),
 		chunkBlobReplicationDegraded: prometheus.NewCounter(
 			prometheus.CounterOpts{
@@ -110,7 +110,7 @@ func newS3Metrics(registerer prometheus.Registerer) *S3Metrics {
 				Name: "elastickv_s3_chunkblob_backfill_results_total",
 				Help: "Total S3 chunkblob backfill outcomes.",
 			},
-			[]string{"result"},
+			[]string{labelResult},
 		),
 	}
 	registerer.MustRegister(

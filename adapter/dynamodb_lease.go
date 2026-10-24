@@ -360,6 +360,11 @@ func gsiQueryLeasePlan(in queryInput, schema *dynamoTableSchema) queryLeasePlan 
 // after writing the same InternalServerError getItem produces on lease failure;
 // the caller should simply return.
 func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *http.Request, in transactGetItemsInput) bool {
+	_, ok := d.leaseCheckTransactGetItemsWithKeys(w, r, in)
+	return ok
+}
+
+func (d *DynamoDBServer) leaseCheckTransactGetItemsWithKeys(w http.ResponseWriter, r *http.Request, in transactGetItemsInput) ([][]byte, bool) {
 	// leaseCtx bounds the entire pre-pass — both the per-item schema reads
 	// that resolve keys and the lease reads themselves — so a stalled
 	// schema read (Pebble backpressure, iterator leak) cannot block the
@@ -369,17 +374,17 @@ func (d *DynamoDBServer) leaseCheckTransactGetItems(w http.ResponseWriter, r *ht
 	uniqueKeys, skipLease, transientErr := d.resolveTransactGetItemKeys(leaseCtx, in)
 	if transientErr != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, transientErr.Error())
-		return false
+		return nil, false
 	}
 	if skipLease {
-		return true
+		return nil, true
 	}
 	groupKeys := kv.LeaseReadGroupKeys(d.coordinator, uniqueKeys)
 	if leaseErr := d.leaseReadGroupKeys(leaseCtx, groupKeys); leaseErr != nil {
 		writeDynamoError(w, http.StatusInternalServerError, dynamoErrInternal, leaseErr.Error())
-		return false
+		return nil, false
 	}
-	return true
+	return groupKeys, true
 }
 
 // resolveTransactGetItemKeys runs the per-item schema resolution that the

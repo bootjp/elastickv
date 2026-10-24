@@ -128,6 +128,199 @@ func (Phase) EnumDescriptor() ([]byte, []int) {
 	return file_internal_proto_rawDescGZIP(), []int{1}
 }
 
+type MigrationCleanupMode int32
+
+const (
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_UNSPECIFIED MigrationCleanupMode = 0
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_VERSIONS    MigrationCleanupMode = 1
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_METADATA    MigrationCleanupMode = 2
+	// New modes deliberately fail on old runtimes instead of letting unknown
+	// proof fields silently degrade to an unbound metadata clear.
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE        MigrationCleanupMode = 3
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR          MigrationCleanupMode = 4
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH        MigrationCleanupMode = 5
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE MigrationCleanupMode = 6
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION      MigrationCleanupMode = 7
+	MigrationCleanupMode_MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION      MigrationCleanupMode = 8
+)
+
+// Enum value maps for MigrationCleanupMode.
+var (
+	MigrationCleanupMode_name = map[int32]string{
+		0: "MIGRATION_CLEANUP_MODE_UNSPECIFIED",
+		1: "MIGRATION_CLEANUP_MODE_VERSIONS",
+		2: "MIGRATION_CLEANUP_MODE_METADATA",
+		3: "MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE",
+		4: "MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR",
+		5: "MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH",
+		6: "MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE",
+		7: "MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION",
+		8: "MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION",
+	}
+	MigrationCleanupMode_value = map[string]int32{
+		"MIGRATION_CLEANUP_MODE_UNSPECIFIED":              0,
+		"MIGRATION_CLEANUP_MODE_VERSIONS":                 1,
+		"MIGRATION_CLEANUP_MODE_METADATA":                 2,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE":        3,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR":          4,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH":        5,
+		"MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE": 6,
+		"MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION":      7,
+		"MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION":      8,
+	}
+)
+
+func (x MigrationCleanupMode) Enum() *MigrationCleanupMode {
+	p := new(MigrationCleanupMode)
+	*p = x
+	return p
+}
+
+func (x MigrationCleanupMode) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MigrationCleanupMode) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[2].Descriptor()
+}
+
+func (MigrationCleanupMode) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[2]
+}
+
+func (x MigrationCleanupMode) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MigrationCleanupMode.Descriptor instead.
+func (MigrationCleanupMode) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{2}
+}
+
+type MigrationOwnershipRole int32
+
+const (
+	MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED MigrationOwnershipRole = 0
+	MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_OWNER       MigrationOwnershipRole = 1
+	MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_NONOWNER    MigrationOwnershipRole = 2
+)
+
+// Enum value maps for MigrationOwnershipRole.
+var (
+	MigrationOwnershipRole_name = map[int32]string{
+		0: "MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED",
+		1: "MIGRATION_OWNERSHIP_ROLE_OWNER",
+		2: "MIGRATION_OWNERSHIP_ROLE_NONOWNER",
+	}
+	MigrationOwnershipRole_value = map[string]int32{
+		"MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED": 0,
+		"MIGRATION_OWNERSHIP_ROLE_OWNER":       1,
+		"MIGRATION_OWNERSHIP_ROLE_NONOWNER":    2,
+	}
+)
+
+func (x MigrationOwnershipRole) Enum() *MigrationOwnershipRole {
+	p := new(MigrationOwnershipRole)
+	*p = x
+	return p
+}
+
+func (x MigrationOwnershipRole) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MigrationOwnershipRole) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[3].Descriptor()
+}
+
+func (MigrationOwnershipRole) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[3]
+}
+
+func (x MigrationOwnershipRole) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MigrationOwnershipRole.Descriptor instead.
+func (MigrationOwnershipRole) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{3}
+}
+
+type MigrationStateProbeKind int32
+
+const (
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_UNSPECIFIED               MigrationStateProbeKind = 0
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED           MigrationStateProbeKind = 1
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED MigrationStateProbeKind = 2
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED      MigrationStateProbeKind = 3
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED       MigrationStateProbeKind = 4
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED          MigrationStateProbeKind = 5
+	// Identifies the durable source guard by job and moving range, independently
+	// of compactable catalog route history. Target-only readiness is excluded.
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT MigrationStateProbeKind = 6
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY MigrationStateProbeKind = 7
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED    MigrationStateProbeKind = 8
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED    MigrationStateProbeKind = 9
+	MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION  MigrationStateProbeKind = 10
+)
+
+// Enum value maps for MigrationStateProbeKind.
+var (
+	MigrationStateProbeKind_name = map[int32]string{
+		0:  "MIGRATION_STATE_PROBE_KIND_UNSPECIFIED",
+		1:  "MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED",
+		2:  "MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED",
+		3:  "MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED",
+		4:  "MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED",
+		5:  "MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED",
+		6:  "MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT",
+		7:  "MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY",
+		8:  "MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED",
+		9:  "MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED",
+		10: "MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION",
+	}
+	MigrationStateProbeKind_value = map[string]int32{
+		"MIGRATION_STATE_PROBE_KIND_UNSPECIFIED":               0,
+		"MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED":           1,
+		"MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED": 2,
+		"MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED":      3,
+		"MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED":       4,
+		"MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED":          5,
+		"MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT":      6,
+		"MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY":      7,
+		"MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED":         8,
+		"MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED":         9,
+		"MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION":       10,
+	}
+)
+
+func (x MigrationStateProbeKind) Enum() *MigrationStateProbeKind {
+	p := new(MigrationStateProbeKind)
+	*p = x
+	return p
+}
+
+func (x MigrationStateProbeKind) String() string {
+	return protoimpl.X.EnumStringOf(x.Descriptor(), protoreflect.EnumNumber(x))
+}
+
+func (MigrationStateProbeKind) Descriptor() protoreflect.EnumDescriptor {
+	return file_internal_proto_enumTypes[4].Descriptor()
+}
+
+func (MigrationStateProbeKind) Type() protoreflect.EnumType {
+	return &file_internal_proto_enumTypes[4]
+}
+
+func (x MigrationStateProbeKind) Number() protoreflect.EnumNumber {
+	return protoreflect.EnumNumber(x)
+}
+
+// Deprecated: Use MigrationStateProbeKind.Descriptor instead.
+func (MigrationStateProbeKind) EnumDescriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{4}
+}
+
 type Mutation struct {
 	state protoimpl.MessageState `protogen:"open.v1"`
 	Op    Op                     `protobuf:"varint,1,opt,name=op,proto3,enum=Op" json:"op,omitempty"`
@@ -1265,8 +1458,13 @@ func (x *ImportRangeVersionsRequest) GetBatchSeq() uint64 {
 }
 
 type ImportRangeVersionsResponse struct {
-	state         protoimpl.MessageState `protogen:"open.v1"`
-	AckedCursor   []byte                 `protobuf:"bytes,1,opt,name=acked_cursor,json=ackedCursor,proto3" json:"acked_cursor,omitempty"`
+	state       protoimpl.MessageState `protogen:"open.v1"`
+	AckedCursor []byte                 `protobuf:"bytes,1,opt,name=acked_cursor,json=ackedCursor,proto3" json:"acked_cursor,omitempty"`
+	// Set when the target already held a durable acknowledgement for this
+	// batch_seq and discarded the resent rows. acked_cursor is then the cursor
+	// the target recorded for that batch, which need not be the cursor the
+	// caller just sent.
+	Duplicate     bool `protobuf:"varint,2,opt,name=duplicate,proto3" json:"duplicate,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -1306,6 +1504,13 @@ func (x *ImportRangeVersionsResponse) GetAckedCursor() []byte {
 		return x.AckedCursor
 	}
 	return nil
+}
+
+func (x *ImportRangeVersionsResponse) GetDuplicate() bool {
+	if x != nil {
+		return x.Duplicate
+	}
+	return false
 }
 
 type PromoteStagedVersionsRequest struct {
@@ -1452,6 +1657,1169 @@ func (x *PromoteStagedVersionsResponse) GetMaxPromotedTs() uint64 {
 	return 0
 }
 
+type TargetStagedReadinessRequest struct {
+	state                  protoimpl.MessageState `protogen:"open.v1"`
+	JobId                  uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	RouteStart             []byte                 `protobuf:"bytes,2,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd               []byte                 `protobuf:"bytes,3,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	ExpectedCutoverVersion uint64                 `protobuf:"varint,4,opt,name=expected_cutover_version,json=expectedCutoverVersion,proto3" json:"expected_cutover_version,omitempty"`
+	MigrationJobId         uint64                 `protobuf:"varint,5,opt,name=migration_job_id,json=migrationJobId,proto3" json:"migration_job_id,omitempty"`
+	MinWriteTsExclusive    uint64                 `protobuf:"varint,6,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
+	Armed                  bool                   `protobuf:"varint,7,opt,name=armed,proto3" json:"armed,omitempty"`
+	// Source-side controls reuse the same Raft-replicated durable record. They
+	// are ignored by target staged-readiness checks.
+	SourceWriteFence bool   `protobuf:"varint,8,opt,name=source_write_fence,json=sourceWriteFence,proto3" json:"source_write_fence,omitempty"`
+	SourceReadFence  bool   `protobuf:"varint,9,opt,name=source_read_fence,json=sourceReadFence,proto3" json:"source_read_fence,omitempty"`
+	RetentionPinTs   uint64 `protobuf:"varint,10,opt,name=retention_pin_ts,json=retentionPinTs,proto3" json:"retention_pin_ts,omitempty"`
+	TrackWrites      bool   `protobuf:"varint,11,opt,name=track_writes,json=trackWrites,proto3" json:"track_writes,omitempty"`
+	MinAdmittedTs    uint64 `protobuf:"varint,12,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
+	// Explicit opt-in; zero preserves legacy tracker write admission.
+	TransferSizeGuardVersion   uint32 `protobuf:"varint,13,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
+	RequireConfigurationIndex  bool   `protobuf:"varint,14,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
+	ExpectedConfigurationIndex uint64 `protobuf:"varint,15,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
+}
+
+func (x *TargetStagedReadinessRequest) Reset() {
+	*x = TargetStagedReadinessRequest{}
+	mi := &file_internal_proto_msgTypes[20]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TargetStagedReadinessRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TargetStagedReadinessRequest) ProtoMessage() {}
+
+func (x *TargetStagedReadinessRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[20]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TargetStagedReadinessRequest.ProtoReflect.Descriptor instead.
+func (*TargetStagedReadinessRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{20}
+}
+
+func (x *TargetStagedReadinessRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *TargetStagedReadinessRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *TargetStagedReadinessRequest) GetExpectedCutoverVersion() uint64 {
+	if x != nil {
+		return x.ExpectedCutoverVersion
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetMigrationJobId() uint64 {
+	if x != nil {
+		return x.MigrationJobId
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetMinWriteTsExclusive() uint64 {
+	if x != nil {
+		return x.MinWriteTsExclusive
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetArmed() bool {
+	if x != nil {
+		return x.Armed
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetSourceWriteFence() bool {
+	if x != nil {
+		return x.SourceWriteFence
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetSourceReadFence() bool {
+	if x != nil {
+		return x.SourceReadFence
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetRetentionPinTs() uint64 {
+	if x != nil {
+		return x.RetentionPinTs
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetTrackWrites() bool {
+	if x != nil {
+		return x.TrackWrites
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetMinAdmittedTs() uint64 {
+	if x != nil {
+		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetTransferSizeGuardVersion() uint32 {
+	if x != nil {
+		return x.TransferSizeGuardVersion
+	}
+	return 0
+}
+
+func (x *TargetStagedReadinessRequest) GetRequireConfigurationIndex() bool {
+	if x != nil {
+		return x.RequireConfigurationIndex
+	}
+	return false
+}
+
+func (x *TargetStagedReadinessRequest) GetExpectedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ExpectedConfigurationIndex
+	}
+	return 0
+}
+
+type TargetStagedReadinessResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	MinAdmittedTs uint64                 `protobuf:"varint,1,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *TargetStagedReadinessResponse) Reset() {
+	*x = TargetStagedReadinessResponse{}
+	mi := &file_internal_proto_msgTypes[21]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *TargetStagedReadinessResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*TargetStagedReadinessResponse) ProtoMessage() {}
+
+func (x *TargetStagedReadinessResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[21]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use TargetStagedReadinessResponse.ProtoReflect.Descriptor instead.
+func (*TargetStagedReadinessResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{21}
+}
+
+func (x *TargetStagedReadinessResponse) GetMinAdmittedTs() uint64 {
+	if x != nil {
+		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+type ProbeMigrationLocksRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	RouteStart    []byte                 `protobuf:"bytes,1,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd      []byte                 `protobuf:"bytes,2,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	Limit         uint32                 `protobuf:"varint,3,opt,name=limit,proto3" json:"limit,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationLocksRequest) Reset() {
+	*x = ProbeMigrationLocksRequest{}
+	mi := &file_internal_proto_msgTypes[22]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationLocksRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationLocksRequest) ProtoMessage() {}
+
+func (x *ProbeMigrationLocksRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[22]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationLocksRequest.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationLocksRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{22}
+}
+
+func (x *ProbeMigrationLocksRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *ProbeMigrationLocksRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *ProbeMigrationLocksRequest) GetLimit() uint32 {
+	if x != nil {
+		return x.Limit
+	}
+	return 0
+}
+
+type ProbeMigrationLocksResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	PendingCount  uint32                 `protobuf:"varint,1,opt,name=pending_count,json=pendingCount,proto3" json:"pending_count,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationLocksResponse) Reset() {
+	*x = ProbeMigrationLocksResponse{}
+	mi := &file_internal_proto_msgTypes[23]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationLocksResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationLocksResponse) ProtoMessage() {}
+
+func (x *ProbeMigrationLocksResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[23]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationLocksResponse.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationLocksResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{23}
+}
+
+func (x *ProbeMigrationLocksResponse) GetPendingCount() uint32 {
+	if x != nil {
+		return x.PendingCount
+	}
+	return 0
+}
+
+type MigrationOwnershipProof struct {
+	state                protoimpl.MessageState `protogen:"open.v1"`
+	Generation           string                 `protobuf:"bytes,1,opt,name=generation,proto3" json:"generation,omitempty"`
+	LocalGroupId         uint64                 `protobuf:"varint,2,opt,name=local_group_id,json=localGroupId,proto3" json:"local_group_id,omitempty"`
+	OwnerGroupId         uint64                 `protobuf:"varint,3,opt,name=owner_group_id,json=ownerGroupId,proto3" json:"owner_group_id,omitempty"`
+	CatalogVersion       uint64                 `protobuf:"varint,4,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	MinWriteTsExclusive  uint64                 `protobuf:"varint,5,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
+	RouteStart           []byte                 `protobuf:"bytes,6,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd             []byte                 `protobuf:"bytes,7,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	RouteId              uint64                 `protobuf:"varint,8,opt,name=route_id,json=routeId,proto3" json:"route_id,omitempty"`
+	ParentRouteId        uint64                 `protobuf:"varint,9,opt,name=parent_route_id,json=parentRouteId,proto3" json:"parent_route_id,omitempty"`
+	Staged               bool                   `protobuf:"varint,10,opt,name=staged,proto3" json:"staged,omitempty"`
+	Role                 MigrationOwnershipRole `protobuf:"varint,11,opt,name=role,proto3,enum=MigrationOwnershipRole" json:"role,omitempty"`
+	DescriptorHash       []byte                 `protobuf:"bytes,12,opt,name=descriptor_hash,json=descriptorHash,proto3" json:"descriptor_hash,omitempty"`
+	WriteFloorKnown      bool                   `protobuf:"varint,13,opt,name=write_floor_known,json=writeFloorKnown,proto3" json:"write_floor_known,omitempty"`
+	SourceTrackerVersion uint64                 `protobuf:"varint,14,opt,name=source_tracker_version,json=sourceTrackerVersion,proto3" json:"source_tracker_version,omitempty"`
+	SourceAppliedIndex   uint64                 `protobuf:"varint,15,opt,name=source_applied_index,json=sourceAppliedIndex,proto3" json:"source_applied_index,omitempty"`
+	unknownFields        protoimpl.UnknownFields
+	sizeCache            protoimpl.SizeCache
+}
+
+func (x *MigrationOwnershipProof) Reset() {
+	*x = MigrationOwnershipProof{}
+	mi := &file_internal_proto_msgTypes[24]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *MigrationOwnershipProof) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*MigrationOwnershipProof) ProtoMessage() {}
+
+func (x *MigrationOwnershipProof) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[24]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use MigrationOwnershipProof.ProtoReflect.Descriptor instead.
+func (*MigrationOwnershipProof) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{24}
+}
+
+func (x *MigrationOwnershipProof) GetGeneration() string {
+	if x != nil {
+		return x.Generation
+	}
+	return ""
+}
+
+func (x *MigrationOwnershipProof) GetLocalGroupId() uint64 {
+	if x != nil {
+		return x.LocalGroupId
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetOwnerGroupId() uint64 {
+	if x != nil {
+		return x.OwnerGroupId
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetCatalogVersion() uint64 {
+	if x != nil {
+		return x.CatalogVersion
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetMinWriteTsExclusive() uint64 {
+	if x != nil {
+		return x.MinWriteTsExclusive
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *MigrationOwnershipProof) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *MigrationOwnershipProof) GetRouteId() uint64 {
+	if x != nil {
+		return x.RouteId
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetParentRouteId() uint64 {
+	if x != nil {
+		return x.ParentRouteId
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetStaged() bool {
+	if x != nil {
+		return x.Staged
+	}
+	return false
+}
+
+func (x *MigrationOwnershipProof) GetRole() MigrationOwnershipRole {
+	if x != nil {
+		return x.Role
+	}
+	return MigrationOwnershipRole_MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED
+}
+
+func (x *MigrationOwnershipProof) GetDescriptorHash() []byte {
+	if x != nil {
+		return x.DescriptorHash
+	}
+	return nil
+}
+
+func (x *MigrationOwnershipProof) GetWriteFloorKnown() bool {
+	if x != nil {
+		return x.WriteFloorKnown
+	}
+	return false
+}
+
+func (x *MigrationOwnershipProof) GetSourceTrackerVersion() uint64 {
+	if x != nil {
+		return x.SourceTrackerVersion
+	}
+	return 0
+}
+
+func (x *MigrationOwnershipProof) GetSourceAppliedIndex() uint64 {
+	if x != nil {
+		return x.SourceAppliedIndex
+	}
+	return 0
+}
+
+type CleanupMigrationRequest struct {
+	state                 protoimpl.MessageState `protogen:"open.v1"`
+	JobId                 uint64                 `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Mode                  MigrationCleanupMode   `protobuf:"varint,2,opt,name=mode,proto3,enum=MigrationCleanupMode" json:"mode,omitempty"`
+	RangeStart            []byte                 `protobuf:"bytes,3,opt,name=range_start,json=rangeStart,proto3" json:"range_start,omitempty"`
+	RangeEnd              []byte                 `protobuf:"bytes,4,opt,name=range_end,json=rangeEnd,proto3" json:"range_end,omitempty"`
+	Cursor                []byte                 `protobuf:"bytes,5,opt,name=cursor,proto3" json:"cursor,omitempty"`
+	MaxCommitTs           uint64                 `protobuf:"varint,6,opt,name=max_commit_ts,json=maxCommitTs,proto3" json:"max_commit_ts,omitempty"`
+	MaxVersions           uint32                 `protobuf:"varint,7,opt,name=max_versions,json=maxVersions,proto3" json:"max_versions,omitempty"`
+	MaxBytes              uint64                 `protobuf:"varint,8,opt,name=max_bytes,json=maxBytes,proto3" json:"max_bytes,omitempty"`
+	MaxScannedBytes       uint64                 `protobuf:"varint,9,opt,name=max_scanned_bytes,json=maxScannedBytes,proto3" json:"max_scanned_bytes,omitempty"`
+	KeyFamily             uint32                 `protobuf:"varint,10,opt,name=key_family,json=keyFamily,proto3" json:"key_family,omitempty"`
+	RouteStart            []byte                 `protobuf:"bytes,11,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd              []byte                 `protobuf:"bytes,12,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	ExcludeKnownInternal  bool                   `protobuf:"varint,13,opt,name=exclude_known_internal,json=excludeKnownInternal,proto3" json:"exclude_known_internal,omitempty"`
+	ExcludePrefixes       [][]byte               `protobuf:"bytes,14,rep,name=exclude_prefixes,json=excludePrefixes,proto3" json:"exclude_prefixes,omitempty"`
+	RequiresRouteKeyCheck bool                   `protobuf:"varint,15,opt,name=requires_route_key_check,json=requiresRouteKeyCheck,proto3" json:"requires_route_key_check,omitempty"`
+	RequiresDecodedS3     bool                   `protobuf:"varint,16,opt,name=requires_decoded_s3,json=requiresDecodedS3,proto3" json:"requires_decoded_s3,omitempty"`
+	// Source cleanup is conditional on the all-voter ACK configuration, checked
+	// against the FSM's durable ConfChange index before any cleanup side effect.
+	ExpectedConfigurationIndex uint64                   `protobuf:"varint,17,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
+	RequireConfigurationIndex  bool                     `protobuf:"varint,18,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
+	Ownership                  *MigrationOwnershipProof `protobuf:"bytes,19,opt,name=ownership,proto3" json:"ownership,omitempty"`
+	// Strict canonical bounded JSON control; never a raw metadata mutation.
+	PartitionTransition []byte `protobuf:"bytes,20,opt,name=partition_transition,json=partitionTransition,proto3" json:"partition_transition,omitempty"`
+	// Versioned namespace activation/prejoin control. Never propose until every
+	// apply member (including learners) acknowledged support at this ConfChange.
+	NamespaceAdmission []byte `protobuf:"bytes,21,opt,name=namespace_admission,json=namespaceAdmission,proto3" json:"namespace_admission,omitempty"`
+	unknownFields      protoimpl.UnknownFields
+	sizeCache          protoimpl.SizeCache
+}
+
+func (x *CleanupMigrationRequest) Reset() {
+	*x = CleanupMigrationRequest{}
+	mi := &file_internal_proto_msgTypes[25]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CleanupMigrationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CleanupMigrationRequest) ProtoMessage() {}
+
+func (x *CleanupMigrationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[25]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CleanupMigrationRequest.ProtoReflect.Descriptor instead.
+func (*CleanupMigrationRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{25}
+}
+
+func (x *CleanupMigrationRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMode() MigrationCleanupMode {
+	if x != nil {
+		return x.Mode
+	}
+	return MigrationCleanupMode_MIGRATION_CLEANUP_MODE_UNSPECIFIED
+}
+
+func (x *CleanupMigrationRequest) GetRangeStart() []byte {
+	if x != nil {
+		return x.RangeStart
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetRangeEnd() []byte {
+	if x != nil {
+		return x.RangeEnd
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetCursor() []byte {
+	if x != nil {
+		return x.Cursor
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetMaxCommitTs() uint64 {
+	if x != nil {
+		return x.MaxCommitTs
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMaxVersions() uint32 {
+	if x != nil {
+		return x.MaxVersions
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMaxBytes() uint64 {
+	if x != nil {
+		return x.MaxBytes
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetMaxScannedBytes() uint64 {
+	if x != nil {
+		return x.MaxScannedBytes
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetKeyFamily() uint32 {
+	if x != nil {
+		return x.KeyFamily
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetExcludeKnownInternal() bool {
+	if x != nil {
+		return x.ExcludeKnownInternal
+	}
+	return false
+}
+
+func (x *CleanupMigrationRequest) GetExcludePrefixes() [][]byte {
+	if x != nil {
+		return x.ExcludePrefixes
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetRequiresRouteKeyCheck() bool {
+	if x != nil {
+		return x.RequiresRouteKeyCheck
+	}
+	return false
+}
+
+func (x *CleanupMigrationRequest) GetRequiresDecodedS3() bool {
+	if x != nil {
+		return x.RequiresDecodedS3
+	}
+	return false
+}
+
+func (x *CleanupMigrationRequest) GetExpectedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ExpectedConfigurationIndex
+	}
+	return 0
+}
+
+func (x *CleanupMigrationRequest) GetRequireConfigurationIndex() bool {
+	if x != nil {
+		return x.RequireConfigurationIndex
+	}
+	return false
+}
+
+func (x *CleanupMigrationRequest) GetOwnership() *MigrationOwnershipProof {
+	if x != nil {
+		return x.Ownership
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetPartitionTransition() []byte {
+	if x != nil {
+		return x.PartitionTransition
+	}
+	return nil
+}
+
+func (x *CleanupMigrationRequest) GetNamespaceAdmission() []byte {
+	if x != nil {
+		return x.NamespaceAdmission
+	}
+	return nil
+}
+
+type CleanupMigrationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	NextCursor    []byte                 `protobuf:"bytes,1,opt,name=next_cursor,json=nextCursor,proto3" json:"next_cursor,omitempty"`
+	Done          bool                   `protobuf:"varint,2,opt,name=done,proto3" json:"done,omitempty"`
+	DeletedRows   uint64                 `protobuf:"varint,3,opt,name=deleted_rows,json=deletedRows,proto3" json:"deleted_rows,omitempty"`
+	DeletedBytes  uint64                 `protobuf:"varint,4,opt,name=deleted_bytes,json=deletedBytes,proto3" json:"deleted_bytes,omitempty"`
+	ScannedBytes  uint64                 `protobuf:"varint,5,opt,name=scanned_bytes,json=scannedBytes,proto3" json:"scanned_bytes,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *CleanupMigrationResponse) Reset() {
+	*x = CleanupMigrationResponse{}
+	mi := &file_internal_proto_msgTypes[26]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *CleanupMigrationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*CleanupMigrationResponse) ProtoMessage() {}
+
+func (x *CleanupMigrationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[26]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use CleanupMigrationResponse.ProtoReflect.Descriptor instead.
+func (*CleanupMigrationResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{26}
+}
+
+func (x *CleanupMigrationResponse) GetNextCursor() []byte {
+	if x != nil {
+		return x.NextCursor
+	}
+	return nil
+}
+
+func (x *CleanupMigrationResponse) GetDone() bool {
+	if x != nil {
+		return x.Done
+	}
+	return false
+}
+
+func (x *CleanupMigrationResponse) GetDeletedRows() uint64 {
+	if x != nil {
+		return x.DeletedRows
+	}
+	return 0
+}
+
+func (x *CleanupMigrationResponse) GetDeletedBytes() uint64 {
+	if x != nil {
+		return x.DeletedBytes
+	}
+	return 0
+}
+
+func (x *CleanupMigrationResponse) GetScannedBytes() uint64 {
+	if x != nil {
+		return x.ScannedBytes
+	}
+	return 0
+}
+
+type ProbeMigrationStateRequest struct {
+	state                  protoimpl.MessageState  `protogen:"open.v1"`
+	JobId                  uint64                  `protobuf:"varint,1,opt,name=job_id,json=jobId,proto3" json:"job_id,omitempty"`
+	Kind                   MigrationStateProbeKind `protobuf:"varint,2,opt,name=kind,proto3,enum=MigrationStateProbeKind" json:"kind,omitempty"`
+	RouteStart             []byte                  `protobuf:"bytes,3,opt,name=route_start,json=routeStart,proto3" json:"route_start,omitempty"`
+	RouteEnd               []byte                  `protobuf:"bytes,4,opt,name=route_end,json=routeEnd,proto3" json:"route_end,omitempty"`
+	ExpectedCatalogVersion uint64                  `protobuf:"varint,5,opt,name=expected_catalog_version,json=expectedCatalogVersion,proto3" json:"expected_catalog_version,omitempty"`
+	ExpectedGroupId        uint64                  `protobuf:"varint,6,opt,name=expected_group_id,json=expectedGroupId,proto3" json:"expected_group_id,omitempty"`
+	MigrationJobId         uint64                  `protobuf:"varint,7,opt,name=migration_job_id,json=migrationJobId,proto3" json:"migration_job_id,omitempty"`
+	MinWriteTsExclusive    uint64                  `protobuf:"varint,8,opt,name=min_write_ts_exclusive,json=minWriteTsExclusive,proto3" json:"min_write_ts_exclusive,omitempty"`
+	SourceWriteFence       bool                    `protobuf:"varint,9,opt,name=source_write_fence,json=sourceWriteFence,proto3" json:"source_write_fence,omitempty"`
+	SourceReadFence        bool                    `protobuf:"varint,10,opt,name=source_read_fence,json=sourceReadFence,proto3" json:"source_read_fence,omitempty"`
+	TrackWrites            bool                    `protobuf:"varint,11,opt,name=track_writes,json=trackWrites,proto3" json:"track_writes,omitempty"`
+	RetentionPinTs         uint64                  `protobuf:"varint,12,opt,name=retention_pin_ts,json=retentionPinTs,proto3" json:"retention_pin_ts,omitempty"`
+	ReadDrainNotBeforeMs   int64                   `protobuf:"varint,13,opt,name=read_drain_not_before_ms,json=readDrainNotBeforeMs,proto3" json:"read_drain_not_before_ms,omitempty"`
+	// Reads pinned at or below this HLC timestamp were admitted before the
+	// source read fence armed, so only those still block SOURCE_READ_DRAINED.
+	// Zero keeps the legacy behaviour of requiring an empty tracker.
+	ReadDrainMinTs             uint64                   `protobuf:"varint,14,opt,name=read_drain_min_ts,json=readDrainMinTs,proto3" json:"read_drain_min_ts,omitempty"`
+	RequireConfigurationIndex  bool                     `protobuf:"varint,15,opt,name=require_configuration_index,json=requireConfigurationIndex,proto3" json:"require_configuration_index,omitempty"`
+	ExpectedConfigurationIndex uint64                   `protobuf:"varint,16,opt,name=expected_configuration_index,json=expectedConfigurationIndex,proto3" json:"expected_configuration_index,omitempty"`
+	Ownership                  *MigrationOwnershipProof `protobuf:"bytes,17,opt,name=ownership,proto3" json:"ownership,omitempty"`
+	TransferSizeGuardVersion   uint32                   `protobuf:"varint,18,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
+	PartitionTransition        []byte                   `protobuf:"bytes,19,opt,name=partition_transition,json=partitionTransition,proto3" json:"partition_transition,omitempty"`
+	unknownFields              protoimpl.UnknownFields
+	sizeCache                  protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationStateRequest) Reset() {
+	*x = ProbeMigrationStateRequest{}
+	mi := &file_internal_proto_msgTypes[27]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationStateRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationStateRequest) ProtoMessage() {}
+
+func (x *ProbeMigrationStateRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[27]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationStateRequest.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationStateRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{27}
+}
+
+func (x *ProbeMigrationStateRequest) GetJobId() uint64 {
+	if x != nil {
+		return x.JobId
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetKind() MigrationStateProbeKind {
+	if x != nil {
+		return x.Kind
+	}
+	return MigrationStateProbeKind_MIGRATION_STATE_PROBE_KIND_UNSPECIFIED
+}
+
+func (x *ProbeMigrationStateRequest) GetRouteStart() []byte {
+	if x != nil {
+		return x.RouteStart
+	}
+	return nil
+}
+
+func (x *ProbeMigrationStateRequest) GetRouteEnd() []byte {
+	if x != nil {
+		return x.RouteEnd
+	}
+	return nil
+}
+
+func (x *ProbeMigrationStateRequest) GetExpectedCatalogVersion() uint64 {
+	if x != nil {
+		return x.ExpectedCatalogVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetExpectedGroupId() uint64 {
+	if x != nil {
+		return x.ExpectedGroupId
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetMigrationJobId() uint64 {
+	if x != nil {
+		return x.MigrationJobId
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetMinWriteTsExclusive() uint64 {
+	if x != nil {
+		return x.MinWriteTsExclusive
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetSourceWriteFence() bool {
+	if x != nil {
+		return x.SourceWriteFence
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetSourceReadFence() bool {
+	if x != nil {
+		return x.SourceReadFence
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetTrackWrites() bool {
+	if x != nil {
+		return x.TrackWrites
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetRetentionPinTs() uint64 {
+	if x != nil {
+		return x.RetentionPinTs
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetReadDrainNotBeforeMs() int64 {
+	if x != nil {
+		return x.ReadDrainNotBeforeMs
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetReadDrainMinTs() uint64 {
+	if x != nil {
+		return x.ReadDrainMinTs
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetRequireConfigurationIndex() bool {
+	if x != nil {
+		return x.RequireConfigurationIndex
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateRequest) GetExpectedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.ExpectedConfigurationIndex
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetOwnership() *MigrationOwnershipProof {
+	if x != nil {
+		return x.Ownership
+	}
+	return nil
+}
+
+func (x *ProbeMigrationStateRequest) GetTransferSizeGuardVersion() uint32 {
+	if x != nil {
+		return x.TransferSizeGuardVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateRequest) GetPartitionTransition() []byte {
+	if x != nil {
+		return x.PartitionTransition
+	}
+	return nil
+}
+
+type ProbeMigrationStateResponse struct {
+	state                     protoimpl.MessageState   `protogen:"open.v1"`
+	Ready                     bool                     `protobuf:"varint,1,opt,name=ready,proto3" json:"ready,omitempty"`
+	CatalogVersion            uint64                   `protobuf:"varint,2,opt,name=catalog_version,json=catalogVersion,proto3" json:"catalog_version,omitempty"`
+	MinAdmittedTs             uint64                   `protobuf:"varint,3,opt,name=min_admitted_ts,json=minAdmittedTs,proto3" json:"min_admitted_ts,omitempty"`
+	AppliedConfigurationIndex uint64                   `protobuf:"varint,4,opt,name=applied_configuration_index,json=appliedConfigurationIndex,proto3" json:"applied_configuration_index,omitempty"`
+	OwnershipGeneration       string                   `protobuf:"bytes,5,opt,name=ownership_generation,json=ownershipGeneration,proto3" json:"ownership_generation,omitempty"`
+	OwnershipProtocol         uint32                   `protobuf:"varint,6,opt,name=ownership_protocol,json=ownershipProtocol,proto3" json:"ownership_protocol,omitempty"`
+	Ownership                 *MigrationOwnershipProof `protobuf:"bytes,7,opt,name=ownership,proto3" json:"ownership,omitempty"`
+	OwnershipCleared          bool                     `protobuf:"varint,8,opt,name=ownership_cleared,json=ownershipCleared,proto3" json:"ownership_cleared,omitempty"`
+	// Local support, not proof that the requested job's guard is applied.
+	TransferSizeGuardVersion uint32 `protobuf:"varint,9,opt,name=transfer_size_guard_version,json=transferSizeGuardVersion,proto3" json:"transfer_size_guard_version,omitempty"`
+	// Installed support, observable before a candidate has an applied ConfState.
+	// This is not operational ownership readiness or an activation override.
+	OwnershipPartitionProtocol uint32 `protobuf:"varint,10,opt,name=ownership_partition_protocol,json=ownershipPartitionProtocol,proto3" json:"ownership_partition_protocol,omitempty"`
+	// Installed support only; the durable group activation is separately probed.
+	NamespaceAdmissionVersion uint32 `protobuf:"varint,11,opt,name=namespace_admission_version,json=namespaceAdmissionVersion,proto3" json:"namespace_admission_version,omitempty"`
+	PartitionReceiptId        []byte `protobuf:"bytes,12,opt,name=partition_receipt_id,json=partitionReceiptId,proto3" json:"partition_receipt_id,omitempty"`
+	unknownFields             protoimpl.UnknownFields
+	sizeCache                 protoimpl.SizeCache
+}
+
+func (x *ProbeMigrationStateResponse) Reset() {
+	*x = ProbeMigrationStateResponse{}
+	mi := &file_internal_proto_msgTypes[28]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *ProbeMigrationStateResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*ProbeMigrationStateResponse) ProtoMessage() {}
+
+func (x *ProbeMigrationStateResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[28]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use ProbeMigrationStateResponse.ProtoReflect.Descriptor instead.
+func (*ProbeMigrationStateResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{28}
+}
+
+func (x *ProbeMigrationStateResponse) GetReady() bool {
+	if x != nil {
+		return x.Ready
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateResponse) GetCatalogVersion() uint64 {
+	if x != nil {
+		return x.CatalogVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetMinAdmittedTs() uint64 {
+	if x != nil {
+		return x.MinAdmittedTs
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetAppliedConfigurationIndex() uint64 {
+	if x != nil {
+		return x.AppliedConfigurationIndex
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetOwnershipGeneration() string {
+	if x != nil {
+		return x.OwnershipGeneration
+	}
+	return ""
+}
+
+func (x *ProbeMigrationStateResponse) GetOwnershipProtocol() uint32 {
+	if x != nil {
+		return x.OwnershipProtocol
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetOwnership() *MigrationOwnershipProof {
+	if x != nil {
+		return x.Ownership
+	}
+	return nil
+}
+
+func (x *ProbeMigrationStateResponse) GetOwnershipCleared() bool {
+	if x != nil {
+		return x.OwnershipCleared
+	}
+	return false
+}
+
+func (x *ProbeMigrationStateResponse) GetTransferSizeGuardVersion() uint32 {
+	if x != nil {
+		return x.TransferSizeGuardVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetOwnershipPartitionProtocol() uint32 {
+	if x != nil {
+		return x.OwnershipPartitionProtocol
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetNamespaceAdmissionVersion() uint32 {
+	if x != nil {
+		return x.NamespaceAdmissionVersion
+	}
+	return 0
+}
+
+func (x *ProbeMigrationStateResponse) GetPartitionReceiptId() []byte {
+	if x != nil {
+		return x.PartitionReceiptId
+	}
+	return nil
+}
+
+type IssueMigrationTimestampRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IssueMigrationTimestampRequest) Reset() {
+	*x = IssueMigrationTimestampRequest{}
+	mi := &file_internal_proto_msgTypes[29]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueMigrationTimestampRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueMigrationTimestampRequest) ProtoMessage() {}
+
+func (x *IssueMigrationTimestampRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[29]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueMigrationTimestampRequest.ProtoReflect.Descriptor instead.
+func (*IssueMigrationTimestampRequest) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{29}
+}
+
+type IssueMigrationTimestampResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Timestamp     uint64                 `protobuf:"varint,1,opt,name=timestamp,proto3" json:"timestamp,omitempty"`
+	LastCommitTs  uint64                 `protobuf:"varint,2,opt,name=last_commit_ts,json=lastCommitTs,proto3" json:"last_commit_ts,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *IssueMigrationTimestampResponse) Reset() {
+	*x = IssueMigrationTimestampResponse{}
+	mi := &file_internal_proto_msgTypes[30]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *IssueMigrationTimestampResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*IssueMigrationTimestampResponse) ProtoMessage() {}
+
+func (x *IssueMigrationTimestampResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_internal_proto_msgTypes[30]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use IssueMigrationTimestampResponse.ProtoReflect.Descriptor instead.
+func (*IssueMigrationTimestampResponse) Descriptor() ([]byte, []int) {
+	return file_internal_proto_rawDescGZIP(), []int{30}
+}
+
+func (x *IssueMigrationTimestampResponse) GetTimestamp() uint64 {
+	if x != nil {
+		return x.Timestamp
+	}
+	return 0
+}
+
+func (x *IssueMigrationTimestampResponse) GetLastCommitTs() uint64 {
+	if x != nil {
+		return x.LastCommitTs
+	}
+	return 0
+}
+
 var File_internal_proto protoreflect.FileDescriptor
 
 const file_internal_proto_rawDesc = "" +
@@ -1543,9 +2911,10 @@ const file_internal_proto_rawDesc = "" +
 	"\x06cursor\x18\x03 \x01(\fR\x06cursor\x12\x1d\n" +
 	"\n" +
 	"bracket_id\x18\x04 \x01(\x04R\tbracketId\x12\x1b\n" +
-	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\"@\n" +
+	"\tbatch_seq\x18\x05 \x01(\x04R\bbatchSeq\"^\n" +
 	"\x1bImportRangeVersionsResponse\x12!\n" +
-	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor\"\xb9\x01\n" +
+	"\facked_cursor\x18\x01 \x01(\fR\vackedCursor\x12\x1c\n" +
+	"\tduplicate\x18\x02 \x01(\bR\tduplicate\"\xb9\x01\n" +
 	"\x1cPromoteStagedVersionsRequest\x12\x15\n" +
 	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x16\n" +
 	"\x06cursor\x18\x02 \x01(\fR\x06cursor\x12!\n" +
@@ -1557,7 +2926,127 @@ const file_internal_proto_rawDesc = "" +
 	"nextCursor\x12\x12\n" +
 	"\x04done\x18\x02 \x01(\bR\x04done\x12#\n" +
 	"\rpromoted_rows\x18\x03 \x01(\x04R\fpromotedRows\x12&\n" +
-	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs*&\n" +
+	"\x0fmax_promoted_ts\x18\x04 \x01(\x04R\rmaxPromotedTs\"\xb2\x05\n" +
+	"\x1cTargetStagedReadinessRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12\x1f\n" +
+	"\vroute_start\x18\x02 \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\x03 \x01(\fR\brouteEnd\x128\n" +
+	"\x18expected_cutover_version\x18\x04 \x01(\x04R\x16expectedCutoverVersion\x12(\n" +
+	"\x10migration_job_id\x18\x05 \x01(\x04R\x0emigrationJobId\x123\n" +
+	"\x16min_write_ts_exclusive\x18\x06 \x01(\x04R\x13minWriteTsExclusive\x12\x14\n" +
+	"\x05armed\x18\a \x01(\bR\x05armed\x12,\n" +
+	"\x12source_write_fence\x18\b \x01(\bR\x10sourceWriteFence\x12*\n" +
+	"\x11source_read_fence\x18\t \x01(\bR\x0fsourceReadFence\x12(\n" +
+	"\x10retention_pin_ts\x18\n" +
+	" \x01(\x04R\x0eretentionPinTs\x12!\n" +
+	"\ftrack_writes\x18\v \x01(\bR\vtrackWrites\x12&\n" +
+	"\x0fmin_admitted_ts\x18\f \x01(\x04R\rminAdmittedTs\x12=\n" +
+	"\x1btransfer_size_guard_version\x18\r \x01(\rR\x18transferSizeGuardVersion\x12>\n" +
+	"\x1brequire_configuration_index\x18\x0e \x01(\bR\x19requireConfigurationIndex\x12@\n" +
+	"\x1cexpected_configuration_index\x18\x0f \x01(\x04R\x1aexpectedConfigurationIndex\"G\n" +
+	"\x1dTargetStagedReadinessResponse\x12&\n" +
+	"\x0fmin_admitted_ts\x18\x01 \x01(\x04R\rminAdmittedTs\"p\n" +
+	"\x1aProbeMigrationLocksRequest\x12\x1f\n" +
+	"\vroute_start\x18\x01 \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\x02 \x01(\fR\brouteEnd\x12\x14\n" +
+	"\x05limit\x18\x03 \x01(\rR\x05limit\"B\n" +
+	"\x1bProbeMigrationLocksResponse\x12#\n" +
+	"\rpending_count\x18\x01 \x01(\rR\fpendingCount\"\xe6\x04\n" +
+	"\x17MigrationOwnershipProof\x12\x1e\n" +
+	"\n" +
+	"generation\x18\x01 \x01(\tR\n" +
+	"generation\x12$\n" +
+	"\x0elocal_group_id\x18\x02 \x01(\x04R\flocalGroupId\x12$\n" +
+	"\x0eowner_group_id\x18\x03 \x01(\x04R\fownerGroupId\x12'\n" +
+	"\x0fcatalog_version\x18\x04 \x01(\x04R\x0ecatalogVersion\x123\n" +
+	"\x16min_write_ts_exclusive\x18\x05 \x01(\x04R\x13minWriteTsExclusive\x12\x1f\n" +
+	"\vroute_start\x18\x06 \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\a \x01(\fR\brouteEnd\x12\x19\n" +
+	"\broute_id\x18\b \x01(\x04R\arouteId\x12&\n" +
+	"\x0fparent_route_id\x18\t \x01(\x04R\rparentRouteId\x12\x16\n" +
+	"\x06staged\x18\n" +
+	" \x01(\bR\x06staged\x12+\n" +
+	"\x04role\x18\v \x01(\x0e2\x17.MigrationOwnershipRoleR\x04role\x12'\n" +
+	"\x0fdescriptor_hash\x18\f \x01(\fR\x0edescriptorHash\x12*\n" +
+	"\x11write_floor_known\x18\r \x01(\bR\x0fwriteFloorKnown\x124\n" +
+	"\x16source_tracker_version\x18\x0e \x01(\x04R\x14sourceTrackerVersion\x120\n" +
+	"\x14source_applied_index\x18\x0f \x01(\x04R\x12sourceAppliedIndex\"\x86\a\n" +
+	"\x17CleanupMigrationRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12)\n" +
+	"\x04mode\x18\x02 \x01(\x0e2\x15.MigrationCleanupModeR\x04mode\x12\x1f\n" +
+	"\vrange_start\x18\x03 \x01(\fR\n" +
+	"rangeStart\x12\x1b\n" +
+	"\trange_end\x18\x04 \x01(\fR\brangeEnd\x12\x16\n" +
+	"\x06cursor\x18\x05 \x01(\fR\x06cursor\x12\"\n" +
+	"\rmax_commit_ts\x18\x06 \x01(\x04R\vmaxCommitTs\x12!\n" +
+	"\fmax_versions\x18\a \x01(\rR\vmaxVersions\x12\x1b\n" +
+	"\tmax_bytes\x18\b \x01(\x04R\bmaxBytes\x12*\n" +
+	"\x11max_scanned_bytes\x18\t \x01(\x04R\x0fmaxScannedBytes\x12\x1d\n" +
+	"\n" +
+	"key_family\x18\n" +
+	" \x01(\rR\tkeyFamily\x12\x1f\n" +
+	"\vroute_start\x18\v \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\f \x01(\fR\brouteEnd\x124\n" +
+	"\x16exclude_known_internal\x18\r \x01(\bR\x14excludeKnownInternal\x12)\n" +
+	"\x10exclude_prefixes\x18\x0e \x03(\fR\x0fexcludePrefixes\x127\n" +
+	"\x18requires_route_key_check\x18\x0f \x01(\bR\x15requiresRouteKeyCheck\x12.\n" +
+	"\x13requires_decoded_s3\x18\x10 \x01(\bR\x11requiresDecodedS3\x12@\n" +
+	"\x1cexpected_configuration_index\x18\x11 \x01(\x04R\x1aexpectedConfigurationIndex\x12>\n" +
+	"\x1brequire_configuration_index\x18\x12 \x01(\bR\x19requireConfigurationIndex\x126\n" +
+	"\townership\x18\x13 \x01(\v2\x18.MigrationOwnershipProofR\townership\x121\n" +
+	"\x14partition_transition\x18\x14 \x01(\fR\x13partitionTransition\x12/\n" +
+	"\x13namespace_admission\x18\x15 \x01(\fR\x12namespaceAdmission\"\xbc\x01\n" +
+	"\x18CleanupMigrationResponse\x12\x1f\n" +
+	"\vnext_cursor\x18\x01 \x01(\fR\n" +
+	"nextCursor\x12\x12\n" +
+	"\x04done\x18\x02 \x01(\bR\x04done\x12!\n" +
+	"\fdeleted_rows\x18\x03 \x01(\x04R\vdeletedRows\x12#\n" +
+	"\rdeleted_bytes\x18\x04 \x01(\x04R\fdeletedBytes\x12#\n" +
+	"\rscanned_bytes\x18\x05 \x01(\x04R\fscannedBytes\"\x9a\a\n" +
+	"\x1aProbeMigrationStateRequest\x12\x15\n" +
+	"\x06job_id\x18\x01 \x01(\x04R\x05jobId\x12,\n" +
+	"\x04kind\x18\x02 \x01(\x0e2\x18.MigrationStateProbeKindR\x04kind\x12\x1f\n" +
+	"\vroute_start\x18\x03 \x01(\fR\n" +
+	"routeStart\x12\x1b\n" +
+	"\troute_end\x18\x04 \x01(\fR\brouteEnd\x128\n" +
+	"\x18expected_catalog_version\x18\x05 \x01(\x04R\x16expectedCatalogVersion\x12*\n" +
+	"\x11expected_group_id\x18\x06 \x01(\x04R\x0fexpectedGroupId\x12(\n" +
+	"\x10migration_job_id\x18\a \x01(\x04R\x0emigrationJobId\x123\n" +
+	"\x16min_write_ts_exclusive\x18\b \x01(\x04R\x13minWriteTsExclusive\x12,\n" +
+	"\x12source_write_fence\x18\t \x01(\bR\x10sourceWriteFence\x12*\n" +
+	"\x11source_read_fence\x18\n" +
+	" \x01(\bR\x0fsourceReadFence\x12!\n" +
+	"\ftrack_writes\x18\v \x01(\bR\vtrackWrites\x12(\n" +
+	"\x10retention_pin_ts\x18\f \x01(\x04R\x0eretentionPinTs\x126\n" +
+	"\x18read_drain_not_before_ms\x18\r \x01(\x03R\x14readDrainNotBeforeMs\x12)\n" +
+	"\x11read_drain_min_ts\x18\x0e \x01(\x04R\x0ereadDrainMinTs\x12>\n" +
+	"\x1brequire_configuration_index\x18\x0f \x01(\bR\x19requireConfigurationIndex\x12@\n" +
+	"\x1cexpected_configuration_index\x18\x10 \x01(\x04R\x1aexpectedConfigurationIndex\x126\n" +
+	"\townership\x18\x11 \x01(\v2\x18.MigrationOwnershipProofR\townership\x12=\n" +
+	"\x1btransfer_size_guard_version\x18\x12 \x01(\rR\x18transferSizeGuardVersion\x121\n" +
+	"\x14partition_transition\x18\x13 \x01(\fR\x13partitionTransition\"\xfe\x04\n" +
+	"\x1bProbeMigrationStateResponse\x12\x14\n" +
+	"\x05ready\x18\x01 \x01(\bR\x05ready\x12'\n" +
+	"\x0fcatalog_version\x18\x02 \x01(\x04R\x0ecatalogVersion\x12&\n" +
+	"\x0fmin_admitted_ts\x18\x03 \x01(\x04R\rminAdmittedTs\x12>\n" +
+	"\x1bapplied_configuration_index\x18\x04 \x01(\x04R\x19appliedConfigurationIndex\x121\n" +
+	"\x14ownership_generation\x18\x05 \x01(\tR\x13ownershipGeneration\x12-\n" +
+	"\x12ownership_protocol\x18\x06 \x01(\rR\x11ownershipProtocol\x126\n" +
+	"\townership\x18\a \x01(\v2\x18.MigrationOwnershipProofR\townership\x12+\n" +
+	"\x11ownership_cleared\x18\b \x01(\bR\x10ownershipCleared\x12=\n" +
+	"\x1btransfer_size_guard_version\x18\t \x01(\rR\x18transferSizeGuardVersion\x12@\n" +
+	"\x1cownership_partition_protocol\x18\n" +
+	" \x01(\rR\x1aownershipPartitionProtocol\x12>\n" +
+	"\x1bnamespace_admission_version\x18\v \x01(\rR\x19namespaceAdmissionVersion\x120\n" +
+	"\x14partition_receipt_id\x18\f \x01(\fR\x12partitionReceiptId\" \n" +
+	"\x1eIssueMigrationTimestampRequest\"e\n" +
+	"\x1fIssueMigrationTimestampResponse\x12\x1c\n" +
+	"\ttimestamp\x18\x01 \x01(\x04R\ttimestamp\x12$\n" +
+	"\x0elast_commit_ts\x18\x02 \x01(\x04R\flastCommitTs*&\n" +
 	"\x02Op\x12\a\n" +
 	"\x03PUT\x10\x00\x12\a\n" +
 	"\x03DEL\x10\x01\x12\x0e\n" +
@@ -1568,7 +3057,34 @@ const file_internal_proto_rawDesc = "" +
 	"\aPREPARE\x10\x01\x12\n" +
 	"\n" +
 	"\x06COMMIT\x10\x02\x12\t\n" +
-	"\x05ABORT\x10\x032\xf9\x04\n" +
+	"\x05ABORT\x10\x03*\xa5\x03\n" +
+	"\x14MigrationCleanupMode\x12&\n" +
+	"\"MIGRATION_CLEANUP_MODE_UNSPECIFIED\x10\x00\x12#\n" +
+	"\x1fMIGRATION_CLEANUP_MODE_VERSIONS\x10\x01\x12#\n" +
+	"\x1fMIGRATION_CLEANUP_MODE_METADATA\x10\x02\x12,\n" +
+	"(MIGRATION_CLEANUP_MODE_OWNERSHIP_ACQUIRE\x10\x03\x12*\n" +
+	"&MIGRATION_CLEANUP_MODE_OWNERSHIP_CLEAR\x10\x04\x12,\n" +
+	"(MIGRATION_CLEANUP_MODE_OWNERSHIP_REFRESH\x10\x05\x123\n" +
+	"/MIGRATION_CLEANUP_MODE_SOURCE_OWNERSHIP_ACQUIRE\x10\x06\x12.\n" +
+	"*MIGRATION_CLEANUP_MODE_OWNERSHIP_PARTITION\x10\a\x12.\n" +
+	"*MIGRATION_CLEANUP_MODE_NAMESPACE_ADMISSION\x10\b*\x8d\x01\n" +
+	"\x16MigrationOwnershipRole\x12(\n" +
+	"$MIGRATION_OWNERSHIP_ROLE_UNSPECIFIED\x10\x00\x12\"\n" +
+	"\x1eMIGRATION_OWNERSHIP_ROLE_OWNER\x10\x01\x12%\n" +
+	"!MIGRATION_OWNERSHIP_ROLE_NONOWNER\x10\x02*\xcb\x04\n" +
+	"\x17MigrationStateProbeKind\x12*\n" +
+	"&MIGRATION_STATE_PROBE_KIND_UNSPECIFIED\x10\x00\x12.\n" +
+	"*MIGRATION_STATE_PROBE_KIND_CONTROL_APPLIED\x10\x01\x128\n" +
+	"4MIGRATION_STATE_PROBE_KIND_TARGET_DESCRIPTOR_CLEARED\x10\x02\x123\n" +
+	"/MIGRATION_STATE_PROBE_KIND_SOURCE_ROUTE_REMOVED\x10\x03\x122\n" +
+	".MIGRATION_STATE_PROBE_KIND_SOURCE_READ_DRAINED\x10\x04\x12/\n" +
+	"+MIGRATION_STATE_PROBE_KIND_METADATA_CLEARED\x10\x05\x123\n" +
+	"/MIGRATION_STATE_PROBE_KIND_SOURCE_GUARD_PRESENT\x10\x06\x123\n" +
+	"/MIGRATION_STATE_PROBE_KIND_OWNERSHIP_CAPABILITY\x10\a\x120\n" +
+	",MIGRATION_STATE_PROBE_KIND_OWNERSHIP_APPLIED\x10\b\x120\n" +
+	",MIGRATION_STATE_PROBE_KIND_PARTITION_APPLIED\x10\t\x122\n" +
+	".MIGRATION_STATE_PROBE_KIND_NAMESPACE_ADMISSION\x10\n" +
+	"2\xab\b\n" +
 	"\bInternal\x12.\n" +
 	"\aForward\x12\x0f.ForwardRequest\x1a\x10.ForwardResponse\"\x00\x12U\n" +
 	"\x14ForwardAdminProposal\x12\x1c.ForwardAdminProposalRequest\x1a\x1d.ForwardAdminProposalResponse\"\x00\x12I\n" +
@@ -1577,7 +3093,12 @@ const file_internal_proto_rawDesc = "" +
 	"\fRelayPublish\x12\x14.RelayPublishRequest\x1a\x15.RelayPublishResponse\"\x00\x12T\n" +
 	"\x13ExportRangeVersions\x12\x1b.ExportRangeVersionsRequest\x1a\x1c.ExportRangeVersionsResponse\"\x000\x01\x12R\n" +
 	"\x13ImportRangeVersions\x12\x1b.ImportRangeVersionsRequest\x1a\x1c.ImportRangeVersionsResponse\"\x00\x12X\n" +
-	"\x15PromoteStagedVersions\x12\x1d.PromoteStagedVersionsRequest\x1a\x1e.PromoteStagedVersionsResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
+	"\x15PromoteStagedVersions\x12\x1d.PromoteStagedVersionsRequest\x1a\x1e.PromoteStagedVersionsResponse\"\x00\x12]\n" +
+	"\x1aApplyTargetStagedReadiness\x12\x1d.TargetStagedReadinessRequest\x1a\x1e.TargetStagedReadinessResponse\"\x00\x12R\n" +
+	"\x13ProbeMigrationLocks\x12\x1b.ProbeMigrationLocksRequest\x1a\x1c.ProbeMigrationLocksResponse\"\x00\x12I\n" +
+	"\x10CleanupMigration\x12\x18.CleanupMigrationRequest\x1a\x19.CleanupMigrationResponse\"\x00\x12R\n" +
+	"\x13ProbeMigrationState\x12\x1b.ProbeMigrationStateRequest\x1a\x1c.ProbeMigrationStateResponse\"\x00\x12^\n" +
+	"\x17IssueMigrationTimestamp\x12\x1f.IssueMigrationTimestampRequest\x1a .IssueMigrationTimestampResponse\"\x00B#Z!github.com/bootjp/elastickv/protob\x06proto3"
 
 var (
 	file_internal_proto_rawDescOnce sync.Once
@@ -1591,61 +3112,91 @@ func file_internal_proto_rawDescGZIP() []byte {
 	return file_internal_proto_rawDescData
 }
 
-var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 2)
-var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 20)
+var file_internal_proto_enumTypes = make([]protoimpl.EnumInfo, 5)
+var file_internal_proto_msgTypes = make([]protoimpl.MessageInfo, 31)
 var file_internal_proto_goTypes = []any{
-	(Op)(0),                               // 0: Op
-	(Phase)(0),                            // 1: Phase
-	(*Mutation)(nil),                      // 2: Mutation
-	(*Request)(nil),                       // 3: Request
-	(*RaftCommand)(nil),                   // 4: RaftCommand
-	(*ForwardRequest)(nil),                // 5: ForwardRequest
-	(*ForwardResponse)(nil),               // 6: ForwardResponse
-	(*ForwardAdminProposalRequest)(nil),   // 7: ForwardAdminProposalRequest
-	(*ForwardAdminProposalResponse)(nil),  // 8: ForwardAdminProposalResponse
-	(*ForwardLeaseReadRequest)(nil),       // 9: ForwardLeaseReadRequest
-	(*ForwardLeaseReadResponse)(nil),      // 10: ForwardLeaseReadResponse
-	(*PrepareEvidenceStateRequest)(nil),   // 11: PrepareEvidenceStateRequest
-	(*PrepareEvidenceStateResponse)(nil),  // 12: PrepareEvidenceStateResponse
-	(*RelayPublishRequest)(nil),           // 13: RelayPublishRequest
-	(*RelayPublishResponse)(nil),          // 14: RelayPublishResponse
-	(*ExportRangeVersionsRequest)(nil),    // 15: ExportRangeVersionsRequest
-	(*ExportRangeVersionsResponse)(nil),   // 16: ExportRangeVersionsResponse
-	(*MVCCVersion)(nil),                   // 17: MVCCVersion
-	(*ImportRangeVersionsRequest)(nil),    // 18: ImportRangeVersionsRequest
-	(*ImportRangeVersionsResponse)(nil),   // 19: ImportRangeVersionsResponse
-	(*PromoteStagedVersionsRequest)(nil),  // 20: PromoteStagedVersionsRequest
-	(*PromoteStagedVersionsResponse)(nil), // 21: PromoteStagedVersionsResponse
+	(Op)(0),                                 // 0: Op
+	(Phase)(0),                              // 1: Phase
+	(MigrationCleanupMode)(0),               // 2: MigrationCleanupMode
+	(MigrationOwnershipRole)(0),             // 3: MigrationOwnershipRole
+	(MigrationStateProbeKind)(0),            // 4: MigrationStateProbeKind
+	(*Mutation)(nil),                        // 5: Mutation
+	(*Request)(nil),                         // 6: Request
+	(*RaftCommand)(nil),                     // 7: RaftCommand
+	(*ForwardRequest)(nil),                  // 8: ForwardRequest
+	(*ForwardResponse)(nil),                 // 9: ForwardResponse
+	(*ForwardAdminProposalRequest)(nil),     // 10: ForwardAdminProposalRequest
+	(*ForwardAdminProposalResponse)(nil),    // 11: ForwardAdminProposalResponse
+	(*ForwardLeaseReadRequest)(nil),         // 12: ForwardLeaseReadRequest
+	(*ForwardLeaseReadResponse)(nil),        // 13: ForwardLeaseReadResponse
+	(*PrepareEvidenceStateRequest)(nil),     // 14: PrepareEvidenceStateRequest
+	(*PrepareEvidenceStateResponse)(nil),    // 15: PrepareEvidenceStateResponse
+	(*RelayPublishRequest)(nil),             // 16: RelayPublishRequest
+	(*RelayPublishResponse)(nil),            // 17: RelayPublishResponse
+	(*ExportRangeVersionsRequest)(nil),      // 18: ExportRangeVersionsRequest
+	(*ExportRangeVersionsResponse)(nil),     // 19: ExportRangeVersionsResponse
+	(*MVCCVersion)(nil),                     // 20: MVCCVersion
+	(*ImportRangeVersionsRequest)(nil),      // 21: ImportRangeVersionsRequest
+	(*ImportRangeVersionsResponse)(nil),     // 22: ImportRangeVersionsResponse
+	(*PromoteStagedVersionsRequest)(nil),    // 23: PromoteStagedVersionsRequest
+	(*PromoteStagedVersionsResponse)(nil),   // 24: PromoteStagedVersionsResponse
+	(*TargetStagedReadinessRequest)(nil),    // 25: TargetStagedReadinessRequest
+	(*TargetStagedReadinessResponse)(nil),   // 26: TargetStagedReadinessResponse
+	(*ProbeMigrationLocksRequest)(nil),      // 27: ProbeMigrationLocksRequest
+	(*ProbeMigrationLocksResponse)(nil),     // 28: ProbeMigrationLocksResponse
+	(*MigrationOwnershipProof)(nil),         // 29: MigrationOwnershipProof
+	(*CleanupMigrationRequest)(nil),         // 30: CleanupMigrationRequest
+	(*CleanupMigrationResponse)(nil),        // 31: CleanupMigrationResponse
+	(*ProbeMigrationStateRequest)(nil),      // 32: ProbeMigrationStateRequest
+	(*ProbeMigrationStateResponse)(nil),     // 33: ProbeMigrationStateResponse
+	(*IssueMigrationTimestampRequest)(nil),  // 34: IssueMigrationTimestampRequest
+	(*IssueMigrationTimestampResponse)(nil), // 35: IssueMigrationTimestampResponse
 }
 var file_internal_proto_depIdxs = []int32{
 	0,  // 0: Mutation.op:type_name -> Op
 	1,  // 1: Request.phase:type_name -> Phase
-	2,  // 2: Request.mutations:type_name -> Mutation
-	3,  // 3: RaftCommand.requests:type_name -> Request
-	3,  // 4: ForwardRequest.requests:type_name -> Request
-	17, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
-	17, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
-	5,  // 7: Internal.Forward:input_type -> ForwardRequest
-	7,  // 8: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
-	9,  // 9: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
-	11, // 10: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
-	13, // 11: Internal.RelayPublish:input_type -> RelayPublishRequest
-	15, // 12: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
-	18, // 13: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
-	20, // 14: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
-	6,  // 15: Internal.Forward:output_type -> ForwardResponse
-	8,  // 16: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
-	10, // 17: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
-	12, // 18: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
-	14, // 19: Internal.RelayPublish:output_type -> RelayPublishResponse
-	16, // 20: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
-	19, // 21: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
-	21, // 22: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
-	15, // [15:23] is the sub-list for method output_type
-	7,  // [7:15] is the sub-list for method input_type
-	7,  // [7:7] is the sub-list for extension type_name
-	7,  // [7:7] is the sub-list for extension extendee
-	0,  // [0:7] is the sub-list for field type_name
+	5,  // 2: Request.mutations:type_name -> Mutation
+	6,  // 3: RaftCommand.requests:type_name -> Request
+	6,  // 4: ForwardRequest.requests:type_name -> Request
+	20, // 5: ExportRangeVersionsResponse.versions:type_name -> MVCCVersion
+	20, // 6: ImportRangeVersionsRequest.versions:type_name -> MVCCVersion
+	3,  // 7: MigrationOwnershipProof.role:type_name -> MigrationOwnershipRole
+	2,  // 8: CleanupMigrationRequest.mode:type_name -> MigrationCleanupMode
+	29, // 9: CleanupMigrationRequest.ownership:type_name -> MigrationOwnershipProof
+	4,  // 10: ProbeMigrationStateRequest.kind:type_name -> MigrationStateProbeKind
+	29, // 11: ProbeMigrationStateRequest.ownership:type_name -> MigrationOwnershipProof
+	29, // 12: ProbeMigrationStateResponse.ownership:type_name -> MigrationOwnershipProof
+	8,  // 13: Internal.Forward:input_type -> ForwardRequest
+	10, // 14: Internal.ForwardAdminProposal:input_type -> ForwardAdminProposalRequest
+	12, // 15: Internal.ForwardLeaseRead:input_type -> ForwardLeaseReadRequest
+	14, // 16: Internal.GetPrepareEvidenceState:input_type -> PrepareEvidenceStateRequest
+	16, // 17: Internal.RelayPublish:input_type -> RelayPublishRequest
+	18, // 18: Internal.ExportRangeVersions:input_type -> ExportRangeVersionsRequest
+	21, // 19: Internal.ImportRangeVersions:input_type -> ImportRangeVersionsRequest
+	23, // 20: Internal.PromoteStagedVersions:input_type -> PromoteStagedVersionsRequest
+	25, // 21: Internal.ApplyTargetStagedReadiness:input_type -> TargetStagedReadinessRequest
+	27, // 22: Internal.ProbeMigrationLocks:input_type -> ProbeMigrationLocksRequest
+	30, // 23: Internal.CleanupMigration:input_type -> CleanupMigrationRequest
+	32, // 24: Internal.ProbeMigrationState:input_type -> ProbeMigrationStateRequest
+	34, // 25: Internal.IssueMigrationTimestamp:input_type -> IssueMigrationTimestampRequest
+	9,  // 26: Internal.Forward:output_type -> ForwardResponse
+	11, // 27: Internal.ForwardAdminProposal:output_type -> ForwardAdminProposalResponse
+	13, // 28: Internal.ForwardLeaseRead:output_type -> ForwardLeaseReadResponse
+	15, // 29: Internal.GetPrepareEvidenceState:output_type -> PrepareEvidenceStateResponse
+	17, // 30: Internal.RelayPublish:output_type -> RelayPublishResponse
+	19, // 31: Internal.ExportRangeVersions:output_type -> ExportRangeVersionsResponse
+	22, // 32: Internal.ImportRangeVersions:output_type -> ImportRangeVersionsResponse
+	24, // 33: Internal.PromoteStagedVersions:output_type -> PromoteStagedVersionsResponse
+	26, // 34: Internal.ApplyTargetStagedReadiness:output_type -> TargetStagedReadinessResponse
+	28, // 35: Internal.ProbeMigrationLocks:output_type -> ProbeMigrationLocksResponse
+	31, // 36: Internal.CleanupMigration:output_type -> CleanupMigrationResponse
+	33, // 37: Internal.ProbeMigrationState:output_type -> ProbeMigrationStateResponse
+	35, // 38: Internal.IssueMigrationTimestamp:output_type -> IssueMigrationTimestampResponse
+	26, // [26:39] is the sub-list for method output_type
+	13, // [13:26] is the sub-list for method input_type
+	13, // [13:13] is the sub-list for extension type_name
+	13, // [13:13] is the sub-list for extension extendee
+	0,  // [0:13] is the sub-list for field type_name
 }
 
 func init() { file_internal_proto_init() }
@@ -1658,8 +3209,8 @@ func file_internal_proto_init() {
 		File: protoimpl.DescBuilder{
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_internal_proto_rawDesc), len(file_internal_proto_rawDesc)),
-			NumEnums:      2,
-			NumMessages:   20,
+			NumEnums:      5,
+			NumMessages:   31,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

@@ -345,7 +345,7 @@ func appendKeySchema(out *createTableInput, in AdminCreateTableInput, addAttr fu
 	}
 	out.KeySchema = append(out.KeySchema, createTableKeySchemaElement{
 		AttributeName: in.PartitionKey.Name,
-		KeyType:       "HASH",
+		KeyType:       dynamoKeyTypeHash,
 	})
 	if in.SortKey == nil {
 		return nil
@@ -355,7 +355,7 @@ func appendKeySchema(out *createTableInput, in AdminCreateTableInput, addAttr fu
 	}
 	out.KeySchema = append(out.KeySchema, createTableKeySchemaElement{
 		AttributeName: in.SortKey.Name,
-		KeyType:       "RANGE",
+		KeyType:       dynamoKeyTypeRange,
 	})
 	return nil
 }

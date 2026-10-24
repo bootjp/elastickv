@@ -9,6 +9,9 @@ import (
 	"github.com/bootjp/elastickv/kv"
 )
 
+// httpSchemePlain is the URL scheme for plain-text HTTP adapter endpoints.
+const httpSchemePlain = "http"
+
 // httpLeaderErrorWriter writes an adapter-specific error envelope (JSON for
 // DynamoDB/SQS, XML for S3, RESP for Redis, ...) when the HTTP leader proxy
 // cannot forward a follower request. The adapter owns the shape of the body;
@@ -54,7 +57,7 @@ func proxyHTTPRequestToLeader(
 		errWriter(w, http.StatusServiceUnavailable, "leader address not found")
 		return true
 	}
-	target := &url.URL{Scheme: "http", Host: targetAddr}
+	target := &url.URL{Scheme: httpSchemePlain, Host: targetAddr}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ErrorHandler = func(rw http.ResponseWriter, _ *http.Request, err error) {
 		errWriter(rw, http.StatusServiceUnavailable, "leader proxy error: "+err.Error())

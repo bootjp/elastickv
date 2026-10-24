@@ -15,7 +15,7 @@ const (
 	snapshotPayloadBucketFactor = 4
 	snapshotPayloadBucketCount  = 8 // 1 MiB through ~16 GiB
 	snapshotOffloadGroupIDLabel = "group_id"
-	snapshotOffloadReasonLabel  = "reason"
+	snapshotOffloadReasonLabel  = labelReason
 )
 
 // SnapshotOffloadMetrics exposes the physical snapshot offload

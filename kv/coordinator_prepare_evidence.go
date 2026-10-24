@@ -39,7 +39,9 @@ func (c *ShardedCoordinator) prepareEvidenceMeta(ctx context.Context, primaryKey
 }
 
 func (c *ShardedCoordinator) prepareEvidenceTxnMeta(ctx context.Context, primaryKey []byte, commitTS uint64, groupIDs []uint64) (TxnMeta, error) {
-	meta := TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, PrepareCommitTS: commitTS}
+	// The legacy timestamp remains a migration-floor hint, not durable proof.
+	// Only the negotiated V3 field may be persisted into a prepared lock.
+	meta := TxnMeta{PrimaryKey: primaryKey, LockTTLms: defaultTxnLockTTLms, CommitTS: commitTS, PrepareCommitTS: commitTS}
 	for _, id := range groupIDs {
 		group, err := c.txnGroupForID(id)
 		if err != nil {

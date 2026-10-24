@@ -554,7 +554,7 @@ func (b *LeaderAwareRedisBackend) pipeline(ctx context.Context, readTimeout time
 
 func isRedisScriptCommandName(name string) bool {
 	switch strings.ToUpper(name) {
-	case "EVAL", "EVALSHA", "EVAL_RO", "EVALSHA_RO", "FCALL", "FCALL_RO", "FUNCTION", "SCRIPT":
+	case cmdEval, cmdEvalSHA, cmdEvalRO, cmdEvalSHARO, cmdNameFCALL, cmdNameFCALLRO, cmdNameFUNCTION, cmdScript:
 		return true
 	default:
 		return false

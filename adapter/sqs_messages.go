@@ -76,6 +76,8 @@ const (
 	sqsErrInvalidReceiptHandle = "InvalidReceiptHandle"
 	sqsErrMessageTooLong       = "InvalidParameterValue"
 	sqsErrMessageNotInflight   = "MessageNotInflight"
+
+	sqsErrMsgReceiptHandleUnparseable = "receipt handle is not parseable"
 )
 
 // sqsMessageAttributeValue is the AWS-shaped MessageAttribute payload.
@@ -555,9 +557,9 @@ func (s *SQSServer) sendMessage(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeSQSJSON(w, map[string]string{
-		"MessageId":              rec.MessageID,
-		"MD5OfMessageBody":       rec.MD5OfBody,
-		"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
+		sqsFieldMessageID:              rec.MessageID,
+		sqsFieldMD5OfMessageBody:       rec.MD5OfBody,
+		sqsFieldMD5OfMessageAttributes: md5OfAttributesHex(in.MessageAttributes),
 	})
 }
 
@@ -608,7 +610,7 @@ func (s *SQSServer) sendMessageCore(ctx context.Context, queueName string, in sq
 		return nil, errors.WithStack(err)
 	}
 	return map[string]string{
-		"MessageId":              rec.MessageID,
+		sqsFieldMessageID:        rec.MessageID,
 		"MD5OfMessageBody":       rec.MD5OfBody,
 		"MD5OfMessageAttributes": md5OfAttributesHex(in.MessageAttributes),
 	}, nil
@@ -1476,11 +1478,11 @@ func (s *SQSServer) commitReceiveRotation(ctx context.Context, queueName string,
 	}
 	sysAttrs := buildReceiveSysAttributes(rec)
 	resp := map[string]any{
-		"MessageId":     cand.messageID,
-		"ReceiptHandle": handle,
-		"Body":          string(rec.Body),
-		"MD5OfBody":     rec.MD5OfBody,
-		"Attributes":    sysAttrs,
+		sqsFieldMessageID: cand.messageID,
+		"ReceiptHandle":   handle,
+		"Body":            string(rec.Body),
+		"MD5OfBody":       rec.MD5OfBody,
+		"Attributes":      sysAttrs,
 	}
 	if filtered := selectMessageAttributes(rec.MessageAttributes, opts.MessageAttributeNames); len(filtered) > 0 {
 		resp["MessageAttributes"] = filtered
@@ -1858,7 +1860,7 @@ func (s *SQSServer) parseQueueAndReceipt(queueUrl, receiptHandle string) (string
 	}
 	handle, err := decodeClientReceiptHandle(receiptHandle)
 	if err != nil {
-		return "", nil, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not parseable")
+		return "", nil, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, sqsErrMsgReceiptHandleUnparseable)
 	}
 	return queueName, handle, nil
 }

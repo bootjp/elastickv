@@ -74,7 +74,7 @@ func (f *kvFSM) validateImportedPrepareEvidence(versions []*pb.MVCCVersion) erro
 		if version == nil {
 			continue
 		}
-		if isTxnPeerLocalControlKey(version.GetKey()) {
+		if isTxnPeerLocalControlKey(version.GetKey()) || store.IsMigrationRetirementMetadataKey(version.GetKey()) {
 			return errors.Wrap(ErrInvalidRequest, "migration cannot import peer-local timestamp protocol state")
 		}
 		if !f.prepareEvidenceEnabled.Load() || version.GetTombstone() {
@@ -120,7 +120,8 @@ func validateStagedKeySizes(versions []store.MVCCVersion) error {
 }
 
 func isMigrationImportOrdinaryApplyError(err error) bool {
-	return errors.Is(err, store.ErrImportBatchGap) ||
+	return errors.Is(err, store.ErrMigrationRetired) ||
+		errors.Is(err, store.ErrImportBatchGap) ||
 		errors.Is(err, store.ErrInvalidImportVersion) ||
 		errors.Is(err, store.ErrValueTooLarge) ||
 		errors.Is(err, store.ErrSnapshotKeyTooLarge)

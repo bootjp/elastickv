@@ -199,7 +199,7 @@ func TestVerifyComposed1_EncodedObservedVersionZeroRunsGate(t *testing.T) {
 	})
 	fsm := newComposed1FSM(t, e, 1)
 
-	err := fsm.verifyComposed1(commitTxnRequest(ObservedRouteVersionZero, "k"))
+	err := fsm.verifyComposed1(context.Background(), commitTxnRequest(ObservedRouteVersionZero, "k"))
 	require.ErrorIs(t, err, ErrComposed1Violation,
 		"an explicitly pinned version-0 observation must run the Composed-1 gate instead of being mistaken for the unpinned zero sentinel")
 	require.Contains(t, err.Error(), "current-version")
@@ -291,7 +291,7 @@ func TestVerifyComposed1_ValidOwnershipPassesGate(t *testing.T) {
 	})
 	fsm := newComposed1FSM(t, e, 1)
 
-	require.NoError(t, fsm.verifyComposed1(commitTxnRequest(1, "k")),
+	require.NoError(t, fsm.verifyComposed1(context.Background(), commitTxnRequest(1, "k")),
 		"verifyComposed1 must return nil when this FSM's shardGroupID matches the owner at BOTH the observed version and the current catalog version — covers the happy path neither the failure tests nor the bypass tests exercise")
 }
 
@@ -333,7 +333,7 @@ func TestVerifyComposed1_AbortPhaseSkipsGate(t *testing.T) {
 			{Op: pb.Op_DEL, Key: []byte("k")},
 		},
 	}
-	require.NoError(t, fsm.verifyComposed1(abortReq),
+	require.NoError(t, fsm.verifyComposed1(context.Background(), abortReq),
 		"ABORT requests must bypass the Composed-1 gate even with a non-zero ObservedRouteVersion pinned, so a route shift between PREPARE and ABORT cannot strand the txn's intent locks past lock-resolver TTL")
 }
 
@@ -373,6 +373,6 @@ func TestVerifyComposed1_DynamoMetaKeyNormalizedToRouteKeyBeforeOwnerOf(t *testi
 	})
 	fsm := newComposed1FSM(t, e, 2) // this FSM serves group 2
 
-	require.NoError(t, fsm.verifyComposed1(commitTxnRequest(1, string(rawMetaKey))),
+	require.NoError(t, fsm.verifyComposed1(context.Background(), commitTxnRequest(1, string(rawMetaKey))),
 		"issue #930: verifyOwnerFromSnapshot must routeKey-normalize raw adapter keys before OwnerOf, so the gate routes the same way as ShardRouter.ResolveGroup; without normalization the raw \"!ddb|meta|...\" key sorts below the \"!ddb|route|...\" range and is falsely owned by group 1")
 }

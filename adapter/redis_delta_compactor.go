@@ -1037,7 +1037,7 @@ func (c *DeltaCompactor) hashHandler() collectionDeltaHandler {
 
 func (c *DeltaCompactor) setHandler() collectionDeltaHandler {
 	return c.makeSimpleLenHandler(simpleLenHandlerParams{
-		typeName:         "set",
+		typeName:         string(redisTypeSet),
 		deltaPrefix:      store.SetMetaDeltaPrefix,
 		extractUserKey:   store.ExtractSetUserKeyFromDelta,
 		deltaKeyPrefixFn: store.SetMetaDeltaScanPrefix,

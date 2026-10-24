@@ -450,11 +450,11 @@ func (s *pubsubSession) execTxn() {
 
 	ctx := context.Background()
 	cmds := make([][]any, 0, len(queue)+txnCommandsOverhead)
-	cmds = append(cmds, []any{"MULTI"})
+	cmds = append(cmds, []any{cmdMulti})
 	for _, args := range queue {
 		cmds = append(cmds, bytesArgsToInterfaces(args))
 	}
-	cmds = append(cmds, []any{"EXEC"})
+	cmds = append(cmds, []any{cmdExec})
 
 	results, err := s.proxy.dual.Primary().Pipeline(ctx, cmds)
 

@@ -31,7 +31,7 @@ const (
 	sqsMaxTrackedQueues = 512
 	// Mirrors adapter.validateQueueName without importing the adapter.
 	sqsMaxAdminQueueLabelBytes = 80
-	sqsAdminOutcomeLabel       = "outcome"
+	sqsAdminOutcomeLabel       = labelOutcome
 
 	// sqsQueueOverflow is the placeholder label used when a queue
 	// name is not in the tracked set (cap exceeded). Operators see
@@ -205,28 +205,28 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 				Name: "elastickv_sqs_partition_messages_total",
 				Help: "Total HT-FIFO partition operations by queue, partition, and action (send / receive / delete). Non-zero only for queues with PartitionCount > 1; use to spot uneven MessageGroupId distributions across partitions.",
 			},
-			[]string{"queue", "partition", "action"},
+			[]string{labelQueue, "partition", labelAction},
 		),
 		queueDepth: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_sqs_queue_messages",
 				Help: "Approximate number of messages in each SQS queue, broken down by state. visible = ApproximateNumberOfMessages, not_visible = ApproximateNumberOfMessagesNotVisible, delayed = ApproximateNumberOfMessagesDelayed. Updated periodically by the leader's queue-depth scraper; followers report no value.",
 			},
-			[]string{"queue", "state"},
+			[]string{labelQueue, "state"},
 		),
 		throttledRequests: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_sqs_throttled_requests_total",
 				Help: "Total SQS requests rejected by per-queue throttling, labelled by queue and effective throttle bucket action.",
 			},
-			[]string{"queue", "action"},
+			[]string{labelQueue, labelAction},
 		),
 		throttleTokens: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_sqs_throttle_tokens_remaining",
 				Help: "Remaining tokens after the most recent SQS per-queue throttle decision, labelled by queue and effective throttle bucket action.",
 			},
-			[]string{"queue", "action"},
+			[]string{labelQueue, labelAction},
 		),
 		trackedCounterQueues:         map[string]struct{}{},
 		trackedAdminCounterQueues:    map[string]struct{}{},
@@ -243,14 +243,14 @@ func newSQSMetrics(registerer prometheus.Registerer) *SQSMetrics {
 			Name: "elastickv_sqs_admin_purge_queue_total",
 			Help: "Total admin PurgeQueue calls by queue and outcome.",
 		},
-		[]string{"queue", sqsAdminOutcomeLabel},
+		[]string{labelQueue, sqsAdminOutcomeLabel},
 	)
 	m.adminPeekQueue = prometheus.NewCounterVec(
 		prometheus.CounterOpts{
 			Name: "elastickv_sqs_admin_peek_queue_total",
 			Help: "Total admin PeekQueue calls by queue and outcome.",
 		},
-		[]string{"queue", sqsAdminOutcomeLabel},
+		[]string{labelQueue, sqsAdminOutcomeLabel},
 	)
 	registerer.MustRegister(m.partitionMessages)
 	registerer.MustRegister(m.queueDepth)

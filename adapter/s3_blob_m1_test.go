@@ -867,3 +867,65 @@ func (c *fakeS3BlobCluster) clearBlobs() {
 	c.blobs = map[string]map[[sha256.Size]byte][]byte{}
 	c.mu.Unlock()
 }
+
+func TestShuffleS3BlobPeersPreservesElements(t *testing.T) {
+	t.Parallel()
+
+	// Sizes past 20 need more than one random word.
+	for n := 0; n <= 24; n++ {
+		peers := makeShuffleTestPeers(n)
+		want := append([]S3BlobReplica(nil), peers...)
+		for range 50 {
+			shuffleS3BlobPeers(peers)
+			require.ElementsMatch(t, want, peers)
+		}
+	}
+}
+
+func TestShuffleS3BlobPeersReachesEveryPosition(t *testing.T) {
+	t.Parallel()
+
+	// Every peer must be able to land first, otherwise fetch load would
+	// not spread across replicas.
+	first := map[string]bool{}
+	peers := []S3BlobReplica{{NodeID: "a", Address: "a:1"}, {NodeID: "b", Address: "b:1"}, {NodeID: "c", Address: "c:1"}}
+	for range 500 {
+		shuffleS3BlobPeers(peers)
+		first[peers[0].NodeID] = true
+	}
+	require.Len(t, first, len(peers))
+}
+
+func TestShuffleS3BlobPeersReachesEveryPermutation(t *testing.T) {
+	t.Parallel()
+
+	// The swap indices share one random word, so check that the digits
+	// stay independent: all 3! orders of three peers must occur.
+	seen := map[string]bool{}
+	for range 2000 {
+		peers := makeShuffleTestPeers(3)
+		shuffleS3BlobPeers(peers)
+		seen[peers[0].NodeID+peers[1].NodeID+peers[2].NodeID] = true
+	}
+	require.Len(t, seen, 6)
+}
+
+func makeShuffleTestPeers(n int) []S3BlobReplica {
+	peers := make([]S3BlobReplica, n)
+	for i := range peers {
+		peers[i] = S3BlobReplica{NodeID: string(rune('a' + i)), Address: string(rune('a'+i)) + ":50051"}
+	}
+	return peers
+}
+
+func BenchmarkShuffleS3BlobPeers(b *testing.B) {
+	for _, n := range []int{3, 5, 24} {
+		b.Run(fmt.Sprint(n), func(b *testing.B) {
+			peers := makeShuffleTestPeers(n)
+			b.ReportAllocs()
+			for b.Loop() {
+				shuffleS3BlobPeers(peers)
+			}
+		})
+	}
+}

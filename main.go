@@ -71,6 +71,7 @@ const (
 	defaultFilesystemRootMode              = 0o755
 	defaultFilesystemPlacementScanInterval = 30 * time.Second
 	defaultFilesystemLeaseReapInterval     = 30 * time.Second
+	splitMigrationCapabilityProbeTimeout   = 2 * time.Second
 )
 
 var errInvalidLiveBackupConfig = errors.New("invalid live backup configuration")
@@ -178,13 +179,18 @@ var (
 	// below — both can be enabled simultaneously, and operators can pick
 	// whichever auth path they need (gRPC bearer token vs. HTTP cookies +
 	// SigV4 access keys).
-	adminTokenFile                = flag.String("adminTokenFile", "", "Path to a file containing the read-only bearer token required on the Admin gRPC service (leave blank with --adminInsecureNoAuth off to disable the Admin service)")
-	adminInsecureNoAuth           = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
-	s3BlobPeerTokenFile           = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
-	backupDefaultTTL              = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
-	backupMaxTTL                  = flag.Duration("backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
-	backupBeginDeadline           = flag.Duration("backupBeginDeadline", defaultBackupDeadline, "Deadline for live-backup peer gates and pin fan-out")
-	backupSnapshotHeadroomEntries = flag.Uint64(
+	adminTokenFile                 = flag.String("adminTokenFile", "", "Path to the read-only Admin bearer token; does not authorize split migration")
+	adminInsecureNoAuth            = flag.Bool("adminInsecureNoAuth", false, "Register the Admin gRPC service without bearer-token authentication; development only")
+	splitMigrationTokenFile        = flag.String("splitMigrationTokenFile", "", "Path to a dedicated cluster-shared migration controller/node token, distinct from Admin and S3 peer tokens")
+	splitMigrationPeerAuthEnforced = flag.Bool("splitMigrationPeerAuthEnforced", false, "Require TLS peer Forward credentials and enable migration only after every node sends the migration token")
+	grpcTLSCAFile                  = flag.String("grpcTLSCAFile", "", "CA certificates for verifying peer gRPC TLS; requires grpcTLSCertFile and grpcTLSKeyFile")
+	grpcTLSCertFile                = flag.String("grpcTLSCertFile", "", "PEM certificate enabling TLS on group gRPC listeners and peer clients")
+	grpcTLSKeyFile                 = flag.String("grpcTLSKeyFile", "", "PEM private key for group gRPC TLS")
+	s3BlobPeerTokenFile            = flag.String("s3BlobPeerTokenFile", "", "Path to the cluster-shared bearer token for peer S3 chunkblob RPCs")
+	backupDefaultTTL               = flag.Duration("backupDefaultTTL", defaultBackupTTL, "Default live-backup pin TTL")
+	backupMaxTTL                   = flag.Duration("backupMaxTTL", defaultBackupMaxTTL, "Maximum live-backup pin TTL per renewal")
+	backupBeginDeadline            = flag.Duration("backupBeginDeadline", defaultBackupDeadline, "Deadline for live-backup peer gates and pin fan-out")
+	backupSnapshotHeadroomEntries  = flag.Uint64(
 		"backupSnapshotHeadroomEntries", defaultBackupHeadroom,
 		"Minimum Raft entries remaining before the next snapshot when a live backup begins",
 	)
@@ -477,6 +483,9 @@ func newRedisDeltaCompactorIfEnabled(shardStore *kv.ShardStore, coordinate kv.Co
 }
 
 func run() error {
+	if err := configureNodeGRPCTransport(); err != nil {
+		return err
+	}
 	cfg, engineType, bootstrapCfg, bootstrap, err := resolveValidatedRuntimeInputs()
 	if err != nil {
 		return err
@@ -659,6 +668,7 @@ func run() error {
 		runtimes:        runtimes,
 		cfg:             cfg,
 		coordinate:      coordinate,
+		shardStore:      shardStore,
 		defaultGroup:    shardGroups[cfg.defaultGroup],
 		encWiring:       encWiring,
 		raftID:          *raftId,
@@ -668,6 +678,7 @@ func run() error {
 		metricsRegistry: metricsRegistry,
 		clock:           clock,
 		tsoWiring:       tsoWiring,
+		shardGroups:     shardGroups,
 	})
 	if err != nil {
 		// Members already run on eg (TSO reloader, raft lifecycle
@@ -808,6 +819,7 @@ type distributionStartupInput struct {
 	runtimes        []*raftGroupRuntime
 	cfg             runtimeConfig
 	coordinate      *kv.ShardedCoordinator
+	shardStore      *kv.ShardStore
 	defaultGroup    *kv.ShardGroup
 	encWiring       encryptionWriteWiring
 	raftID          string
@@ -817,6 +829,9 @@ type distributionStartupInput struct {
 	metricsRegistry *monitoring.Registry
 	clock           *kv.HLC
 	tsoWiring       coordinatorTSOWiring
+	// shardGroups feeds the split-migration promotion/voter factories, which
+	// resolve per-group leaders rather than going through the coordinator.
+	shardGroups map[uint64]*kv.ShardGroup
 }
 
 type distributionStartup struct {
@@ -830,6 +845,11 @@ type distributionStartup struct {
 }
 
 func startDistributionStartup(in distributionStartupInput) (distributionStartup, error) {
+	auth, err := loadNodeGRPCAuth(*adminTokenFile, *adminInsecureNoAuth, *s3BlobPeerTokenFile, *splitMigrationTokenFile)
+	if err != nil {
+		return distributionStartup{}, err
+	}
+	internalutil.ConfigureGRPCForwardToken(auth.migrationToken)
 	distCatalog, catalogRuntime, defaultRuntime, err := setupDistributionRuntimeDependencies(
 		in.ctx, in.eg, in.runtimes, in.cfg.engine,
 		in.coordinate, in.defaultGroup, in.cfg.defaultGroup,
@@ -854,6 +874,8 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 	serverwiring.StartFlusher(in.ctx, in.eg, in.sampler)
 	startKeyVizLeaderTermPublisher(in.ctx, in.eg, in.sampler, in.runtimes)
 	startMemoryWatchdog(in.ctx, in.eg, in.cancel)
+	splitMigrationConnCache := &kv.GRPCConnCache{}
+	in.cleanup.Add(func() { _ = splitMigrationConnCache.Close() })
 	distServer := adapter.NewDistributionServer(
 		in.cfg.engine,
 		distCatalog,
@@ -866,6 +888,42 @@ func startDistributionStartup(in distributionStartupInput) (distributionStartup,
 			return engine != nil && engine.State() == raftengine.StateLeader
 		}),
 		adapter.WithDistributionFilesystemObserver(in.metricsRegistry.FileSystemObserver()),
+		adapter.WithDistributionKnownRaftGroups(shardGroupIDs(in.shardGroups)...),
+		adapter.WithSplitMigrationCapabilityGate(newSplitMigrationCapabilityGate(
+			splitMigrationCapabilityPeerSourceForRuntimes(in.runtimes),
+			splitMigrationCapabilityProbeTimeout,
+			nil,
+			splitMigrationLocalReadinessGate,
+		)),
+		adapter.WithSplitPromotionClientFactory(splitPromotionClientFactory(
+			splitPromotionTargetLeaderResolver(in.shardGroups),
+			splitMigrationConnCache,
+			auth.migrationToken,
+		)),
+		adapter.WithSplitMigrationClientFactory(splitMigrationClientFactory(
+			splitMigrationGroupLeaderResolver(in.shardGroups),
+			splitMigrationConnCache,
+			auth.migrationToken,
+		)),
+		adapter.WithSplitMigrationVoterFactory(splitMigrationVoterFactory(
+			in.shardGroups,
+			splitMigrationConnCache,
+			auth.migrationToken,
+		)),
+		adapter.WithSplitMigrationApplyMemberSnapshotFactory(splitMigrationApplyMemberSnapshotFactory(
+			in.shardGroups,
+			splitMigrationConnCache,
+			auth.migrationToken,
+		)),
+		adapter.WithSplitMigrationGroupClientFactory(splitMigrationGroupClientFactory(
+			splitMigrationGroupLeaderResolver(in.shardGroups),
+			splitMigrationConnCache,
+			auth.migrationToken,
+		)),
+		// Do not advertise cap_migration_v2 before protocol coverage is accepted.
+		adapter.WithSplitJobRunnerReadinessGate(splitMigrationLocalReadinessGate),
+		migrationOwnershipRefreshOption(in.shardGroups, catalogRuntime, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
+		migrationPartitionRuntimeOption(in.shardStore, in.shardGroups, splitMigrationConnCache, auth.migrationToken, *splitMigrationPeerAuthEnforced),
 	)
 	autoSplitRuntime, err := setupDistributionWatcherAndAutoSplit(
 		in.ctx,
@@ -1384,6 +1442,152 @@ func cloneRaftServers(in []raftengine.Server) []raftengine.Server {
 		return nil
 	}
 	return append([]raftengine.Server(nil), in...)
+}
+
+func shardGroupIDs(groups map[uint64]*kv.ShardGroup) []uint64 {
+	ids := make([]uint64, 0, len(groups))
+	for id := range groups {
+		ids = append(ids, id)
+	}
+	slices.Sort(ids)
+	return ids
+}
+
+type splitMigrationCapabilityPeer struct {
+	ID      string
+	Address string
+}
+
+type splitMigrationCapabilityPeerSource func(context.Context) ([]splitMigrationCapabilityPeer, error)
+
+type splitMigrationCapabilityProbe func(context.Context, string) error
+
+func splitMigrationCapabilityPeerSourceForRuntimes(runtimes []*raftGroupRuntime) splitMigrationCapabilityPeerSource {
+	return func(ctx context.Context) ([]splitMigrationCapabilityPeer, error) {
+		if len(runtimes) == 0 {
+			return nil, errors.New("raft group runtimes are not configured")
+		}
+		peers := make([]splitMigrationCapabilityPeer, 0)
+		seen := make(map[string]struct{})
+		for _, rt := range runtimes {
+			if rt == nil {
+				return nil, errors.New("raft group runtime is not configured")
+			}
+			engine := rt.snapshotEngine()
+			if engine == nil {
+				return nil, errors.Errorf("raft group %d engine is not configured", rt.spec.id)
+			}
+			cfg, err := engine.Configuration(ctx)
+			if err != nil {
+				return nil, errors.Wrapf(err, "raft group %d configuration", rt.spec.id)
+			}
+			groupPeers := splitMigrationCapabilityPeersFromConfiguration(cfg)
+			if len(groupPeers) == 0 {
+				return nil, errors.Errorf("raft group %d configuration has no split migration capability peers", rt.spec.id)
+			}
+			for _, peer := range groupPeers {
+				key := peer.ID + "\x00" + peer.Address
+				if _, ok := seen[key]; ok {
+					continue
+				}
+				seen[key] = struct{}{}
+				peers = append(peers, peer)
+			}
+		}
+		return peers, nil
+	}
+}
+
+func splitMigrationCapabilityPeersFromConfiguration(cfg raftengine.Configuration) []splitMigrationCapabilityPeer {
+	servers := cfg.Servers
+	if len(servers) == 0 {
+		return nil
+	}
+	peers := make([]splitMigrationCapabilityPeer, 0, len(servers))
+	seen := make(map[string]struct{}, len(servers))
+	for _, server := range servers {
+		key := server.ID + "\x00" + server.Address
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		id := server.ID
+		if id == "" {
+			id = server.Address
+		}
+		peers = append(peers, splitMigrationCapabilityPeer{
+			ID:      id,
+			Address: server.Address,
+		})
+	}
+	return peers
+}
+
+func newSplitMigrationCapabilityGate(
+	source splitMigrationCapabilityPeerSource,
+	timeout time.Duration,
+	probe splitMigrationCapabilityProbe,
+	localGate adapter.SplitMigrationCapabilityGate,
+) adapter.SplitMigrationCapabilityGate {
+	if probe == nil {
+		probe = probeSplitMigrationCapabilityPeer
+	}
+	return func(ctx context.Context) error {
+		if localGate != nil {
+			if err := localGate(ctx); err != nil {
+				return status.Errorf(codes.FailedPrecondition, "split migration local readiness is not available: %v", err)
+			}
+		}
+		if source == nil {
+			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
+		}
+		peers, err := source(ctx)
+		if err != nil {
+			return status.Errorf(codes.FailedPrecondition, "split migration capability peers are not available: %v", err)
+		}
+		if len(peers) == 0 {
+			return status.Error(codes.FailedPrecondition, "split migration capability peers are not configured")
+		}
+		for _, peer := range peers {
+			peerCtx := ctx
+			cancel := func() {}
+			if timeout > 0 {
+				var cancelCtx context.CancelFunc
+				peerCtx, cancelCtx = context.WithTimeout(ctx, timeout)
+				cancel = cancelCtx
+			}
+			err := probe(peerCtx, peer.Address)
+			cancel()
+			if err != nil {
+				return status.Errorf(codes.FailedPrecondition, "split migration capability peer %s is not ready: %v", peer.ID, err)
+			}
+		}
+		return nil
+	}
+}
+
+func probeSplitMigrationCapabilityPeer(ctx context.Context, address string) error {
+	if strings.TrimSpace(address) == "" {
+		return errors.New("empty split migration capability peer address")
+	}
+	conn, err := grpc.NewClient(address, internalutil.GRPCDialOptions()...)
+	if err != nil {
+		return errors.Wrapf(err, "dial split migration capability peer %s", address)
+	}
+	defer func() {
+		_ = conn.Close()
+	}()
+	resp, err := pb.NewDistributionClient(conn).GetSplitMigrationCapability(ctx, &pb.GetSplitMigrationCapabilityRequest{})
+	if err != nil {
+		return errors.Wrapf(err, "probe split migration capability peer %s", address)
+	}
+	if resp == nil || !resp.GetMigrationCapable() {
+		return errors.New("peer does not advertise split migration capability")
+	}
+	if !slices.Contains(resp.GetCapabilities(), adapter.SplitMigrationCapabilityV2) {
+		return errors.Errorf("peer does not advertise %s", adapter.SplitMigrationCapabilityV2)
+	}
+	return nil
 }
 
 type runtimeConfig struct {
@@ -2333,6 +2537,170 @@ type serversInput struct {
 	encryptionConfChangeInterceptor internalraftadmin.MembershipChangeInterceptor
 }
 
+type splitPromotionLeaderResolver func(distribution.SplitJob) (string, error)
+type splitMigrationLeaderResolver func(uint64) (string, error)
+
+func splitPromotionTargetLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) splitPromotionLeaderResolver {
+	return func(job distribution.SplitJob) (string, error) {
+		sg := shardGroups[job.TargetGroupID]
+		if sg == nil || sg.Engine == nil {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split promotion target group %d", job.TargetGroupID)
+		}
+		addr := strings.TrimSpace(sg.Engine.Leader().Address)
+		if addr == "" {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split promotion target group %d", job.TargetGroupID)
+		}
+		return addr, nil
+	}
+}
+
+func splitMigrationGroupLeaderResolver(shardGroups map[uint64]*kv.ShardGroup) splitMigrationLeaderResolver {
+	return func(groupID uint64) (string, error) {
+		sg := shardGroups[groupID]
+		if sg == nil || sg.Engine == nil {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
+		}
+		addr := strings.TrimSpace(sg.Engine.Leader().Address)
+		if addr == "" {
+			return "", errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
+		}
+		return addr, nil
+	}
+}
+
+func splitPromotionClientFactory(resolve splitPromotionLeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitPromotionClientFactory {
+	return func(_ context.Context, job distribution.SplitJob) (adapter.SplitPromotionClient, error) {
+		if resolve == nil {
+			return nil, errors.New("split promotion leader resolver is not configured")
+		}
+		if connCache == nil {
+			return nil, errors.New("split promotion gRPC connection cache is not configured")
+		}
+		addr, err := resolve(job)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		conn, err := connCache.ConnFor(addr)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return newSplitMigrationInternalClient(conn, token), nil
+	}
+}
+
+func splitMigrationClientFactory(resolve splitMigrationLeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationClientFactory {
+	groupClient := splitMigrationGroupClientFactory(resolve, connCache, token)
+	return func(ctx context.Context, job distribution.SplitJob, sourceGroupID uint64) (adapter.SplitMigrationClient, adapter.SplitMigrationClient, error) {
+		source, err := groupClient(ctx, sourceGroupID)
+		if err != nil {
+			return nil, nil, err
+		}
+		target, err := groupClient(ctx, job.TargetGroupID)
+		if err != nil {
+			return nil, nil, err
+		}
+		return source, target, nil
+	}
+}
+
+func splitMigrationGroupClientFactory(resolve splitMigrationLeaderResolver, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationGroupClientFactory {
+	return func(_ context.Context, groupID uint64) (adapter.SplitMigrationClient, error) {
+		if resolve == nil {
+			return nil, errors.New("split migration leader resolver is not configured")
+		}
+		if connCache == nil {
+			return nil, errors.New("split migration gRPC connection cache is not configured")
+		}
+		addr, err := resolve(groupID)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		conn, err := connCache.ConnFor(addr)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		return newSplitMigrationInternalClient(conn, token), nil
+	}
+}
+
+func splitMigrationVoterFactory(shardGroups map[uint64]*kv.ShardGroup, connCache *kv.GRPCConnCache, token string) adapter.SplitMigrationVoterFactory {
+	return func(ctx context.Context, groupID uint64) ([]adapter.SplitMigrationVoter, error) {
+		sg := shardGroups[groupID]
+		if sg == nil || sg.Engine == nil {
+			return nil, errors.Wrapf(kv.ErrLeaderNotFound, "split migration group %d", groupID)
+		}
+		if connCache == nil {
+			return nil, errors.New("split migration voter gRPC connection cache is not configured")
+		}
+		cfg, err := sg.Engine.Configuration(ctx)
+		if err != nil {
+			return nil, errors.WithStack(err)
+		}
+		voters := make([]adapter.SplitMigrationVoter, 0, len(cfg.Servers))
+		for _, member := range cfg.Servers {
+			if member.Suffrage != raftMemberSuffrageVoter {
+				continue
+			}
+			voter, err := splitMigrationVoter(groupID, member, connCache, token)
+			if err != nil {
+				return nil, err
+			}
+			voters = append(voters, voter)
+		}
+		if len(voters) == 0 {
+			return nil, errors.Errorf("split migration group %d has no voters", groupID)
+		}
+		return voters, nil
+	}
+}
+
+func splitMigrationVoter(groupID uint64, member raftengine.Server, connCache *kv.GRPCConnCache, token string) (adapter.SplitMigrationVoter, error) {
+	addr := strings.TrimSpace(member.Address)
+	if member.ID == "" || addr == "" {
+		return adapter.SplitMigrationVoter{}, errors.Errorf("split migration group %d has voter with missing id/address", groupID)
+	}
+	conn, err := connCache.ConnFor(addr)
+	if err != nil {
+		return adapter.SplitMigrationVoter{}, errors.WithStack(err)
+	}
+	return adapter.SplitMigrationVoter{ID: member.ID, Address: addr, Client: newSplitMigrationInternalClient(conn, token)}, nil
+}
+
+func splitMigrationLocalReadinessGate(ctx context.Context) error {
+	if err := splitMigrationPeerAuthReadinessGate(ctx); err != nil {
+		return err
+	}
+	if !adapter.MigrationImportOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationImportOpcodeEnv)
+	}
+	if !adapter.MigrationPromoteOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationPromoteOpcodeEnv)
+	}
+	if !adapter.MigrationCleanupOpcodeEnabledFromEnv() {
+		return errors.Errorf("%s is disabled", adapter.MigrationCleanupOpcodeEnv)
+	}
+	return nil
+}
+
+func splitMigrationPeerAuthReadinessGate(context.Context) error {
+	if *adminInsecureNoAuth || *splitMigrationPeerAuthEnforced {
+		return nil
+	}
+	return errors.New("migration is paused during peer auth rollout; enable --splitMigrationPeerAuthEnforced only after every node sends the token")
+}
+
+func startDistributionSplitJobRunner(ctx context.Context, eg *errgroup.Group, server *adapter.DistributionServer) {
+	if eg == nil || server == nil {
+		return
+	}
+	if splitMigrationLocalReadinessGate(ctx) != nil {
+		return
+	}
+	eg.Go(func() error {
+		return server.RunSplitJobRunner(ctx)
+	})
+}
+
 // startServersAfterStartupRotation wires up the AdminServer, starts the
 // per-group Raft listeners needed for quorum traffic, waits for a fresh join
 // to catch up, prepares the public listeners, waits for any requested startup
@@ -2458,6 +2826,8 @@ func startServersAfterStartupRotation(waitRotateOnStartup startupRotationWaiter,
 	}
 	startHLCLeaseRenewal(in.ctx, in.eg, in.coordinate)
 	publicKVGate.markReady()
+	startDistributionSplitJobRunner(in.ctx, in.eg, in.distServer)
+	startMigrationOwnershipRefresh(in.ctx, in.eg, in.distServer)
 	if err := runner.startPublicServices(); err != nil {
 		return err
 	}
@@ -2553,7 +2923,7 @@ func raftJoinRuntimesReady(ctx context.Context, runtimes []*raftGroupRuntime, lo
 
 func configurationContainsMember(configuration raftengine.Configuration, localID string) bool {
 	for _, server := range configuration.Servers {
-		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == "voter") {
+		if server.ID == localID && (server.Suffrage == "learner" || server.Suffrage == raftMemberSuffrageVoter) {
 			return true
 		}
 	}
@@ -2874,6 +3244,7 @@ func setupAdminService(
 		*adminTokenFile,
 		*adminInsecureNoAuth,
 		*s3BlobPeerTokenFile,
+		*splitMigrationTokenFile,
 		adapter.S3BlobOffloadEnabledFromEnv(),
 		adapter.NodeIdentity{NodeID: nodeID, GRPCAddress: selfAddr},
 		members,
@@ -2974,6 +3345,7 @@ type adminGRPCInterceptors struct {
 	unary              []grpc.UnaryServerInterceptor
 	stream             []grpc.StreamServerInterceptor
 	token              string
+	migrationToken     string
 	s3BlobFetchEnabled bool
 }
 
@@ -3105,9 +3477,19 @@ func (g *startupPublicKVGate) blocked() bool {
 func startupRotationGatedMethod(fullMethod string) bool {
 	switch fullMethod {
 	case pb.Internal_Forward_FullMethodName,
+		pb.Internal_ApplyTargetStagedReadiness_FullMethodName,
+		pb.Internal_ImportRangeVersions_FullMethodName,
+		pb.Internal_PromoteStagedVersions_FullMethodName,
+		pb.Internal_CleanupMigration_FullMethodName,
+		pb.Internal_IssueMigrationTimestamp_FullMethodName,
 		pb.AdminForward_Forward_FullMethodName,
 		pb.Distribution_GetTimestamp_FullMethodName,
 		pb.Distribution_SplitRange_FullMethodName,
+		pb.Distribution_StartSplitMigration_FullMethodName,
+		pb.Distribution_GetSplitMigrationCapability_FullMethodName,
+		pb.Distribution_AttestMigrationOwnership_FullMethodName,
+		pb.Distribution_AbandonSplitJob_FullMethodName,
+		pb.Distribution_RetrySplitJob_FullMethodName,
 		pb.RaftAdmin_AddVoter_FullMethodName,
 		pb.RaftAdmin_AddLearner_FullMethodName,
 		pb.RaftAdmin_PromoteLearner_FullMethodName,
@@ -3156,13 +3538,14 @@ func configureAdminService(
 	tokenPath string,
 	insecureNoAuth bool,
 	s3BlobPeerTokenPath string,
+	migrationTokenPath string,
 	s3BlobOffloadEnabled bool,
 	self adapter.NodeIdentity,
 	members []adapter.NodeIdentity,
 	connCache *kv.GRPCConnCache,
 	backupDeps ...adminBackupDependencies,
 ) (*adapter.AdminServer, adminGRPCInterceptors, error) {
-	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath)
+	auth, err := loadNodeGRPCAuth(tokenPath, insecureNoAuth, s3BlobPeerTokenPath, migrationTokenPath)
 	if err != nil {
 		return nil, adminGRPCInterceptors{}, err
 	}
@@ -3180,9 +3563,11 @@ func configureAdminService(
 	}
 	// token is what setupAdminService hands to SetLeaderReadToken and the
 	// per-group backup proposer, so it has to survive the interceptor build.
-	icept := adminGRPCInterceptors{token: auth.adminToken}
+	icept := adminGRPCInterceptors{token: auth.adminToken, migrationToken: auth.migrationToken}
 	adminUnary, adminStream := adapter.AdminTokenAuth(auth.adminToken)
 	appendGRPCBearerInterceptors(&icept, adminUnary, adminStream)
+	migrationUnary, migrationStream := adapter.SplitMigrationTokenAuth(auth.migrationToken, insecureNoAuth, *splitMigrationPeerAuthEnforced)
+	appendGRPCBearerInterceptors(&icept, migrationUnary, migrationStream)
 	peerUnary, peerStream := adapter.S3BlobPeerTokenAuth(auth.peerToken)
 	appendGRPCBearerInterceptors(&icept, peerUnary, peerStream)
 	icept.s3BlobFetchEnabled = auth.peerToken != ""
@@ -3190,12 +3575,13 @@ func configureAdminService(
 }
 
 type nodeGRPCAuthConfig struct {
-	adminToken   string
-	peerToken    string
-	adminEnabled bool
+	adminToken     string
+	peerToken      string
+	migrationToken string
+	adminEnabled   bool
 }
 
-func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath string) (nodeGRPCAuthConfig, error) {
+func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath, migrationTokenPath string) (nodeGRPCAuthConfig, error) {
 	if tokenPath != "" && insecureNoAuth {
 		return nodeGRPCAuthConfig{}, errors.New("--adminInsecureNoAuth and --adminTokenFile are mutually exclusive")
 	}
@@ -3215,10 +3601,78 @@ func loadNodeGRPCAuth(tokenPath string, insecureNoAuth bool, peerTokenPath strin
 		}
 		cfg.peerToken = loaded
 	}
-	if cfg.adminToken != "" && cfg.peerToken == cfg.adminToken {
-		return nodeGRPCAuthConfig{}, errors.New("S3 blob peer token must differ from the read-only admin token")
+	if err := validateNodeGRPCPeerToken(cfg.adminToken, cfg.peerToken); err != nil {
+		return nodeGRPCAuthConfig{}, err
 	}
+	migrationToken, err := loadSplitMigrationToken(migrationTokenPath, insecureNoAuth, cfg.adminToken, cfg.peerToken)
+	if err != nil {
+		return nodeGRPCAuthConfig{}, err
+	}
+	cfg.migrationToken = migrationToken
 	return cfg, nil
+}
+
+func validateMigrationOpcodeAuth(token string, insecureNoAuth bool) error {
+	if token != "" || insecureNoAuth {
+		return nil
+	}
+	if adapter.MigrationImportOpcodeEnabledFromEnv() || adapter.MigrationPromoteOpcodeEnabledFromEnv() || adapter.MigrationCleanupOpcodeEnabledFromEnv() {
+		return errors.New("migration opcodes require --splitMigrationTokenFile or explicit test-only --adminInsecureNoAuth")
+	}
+	return nil
+}
+
+func validateMigrationStartupAuth() error {
+	auth, err := loadNodeGRPCAuth(*adminTokenFile, *adminInsecureNoAuth, *s3BlobPeerTokenFile, *splitMigrationTokenFile)
+	if err != nil {
+		return err
+	}
+	return validateMigrationPeerSecurity(auth.migrationToken, *adminInsecureNoAuth, *splitMigrationPeerAuthEnforced, *grpcTLSCertFile != "" && *grpcTLSKeyFile != "")
+}
+
+func configureNodeGRPCTransport() error {
+	if err := internalutil.ConfigureGRPCTLS(*grpcTLSCAFile, *grpcTLSCertFile, *grpcTLSKeyFile); err != nil {
+		return errors.Wrap(err, "configure peer gRPC transport")
+	}
+	return validateMigrationStartupAuth()
+}
+
+func validateMigrationPeerSecurity(token string, insecureNoAuth, enforced, tlsEnabled bool) error {
+	if insecureNoAuth {
+		return nil
+	}
+	if enforced && token == "" {
+		return errors.New("--splitMigrationPeerAuthEnforced requires --splitMigrationTokenFile")
+	}
+	if token != "" && !tlsEnabled {
+		return errors.New("--splitMigrationTokenFile requires gRPC TLS certificate and key configuration")
+	}
+	return nil
+}
+
+func validateNodeGRPCPeerToken(adminToken, peerToken string) error {
+	if adminToken != "" && peerToken == adminToken {
+		return errors.New("S3 blob peer token must differ from the read-only admin token")
+	}
+	return nil
+}
+
+func loadSplitMigrationToken(path string, insecureNoAuth bool, adminToken, peerToken string) (string, error) {
+	if path == "" {
+		return "", validateMigrationOpcodeAuth("", insecureNoAuth)
+	}
+	if insecureNoAuth {
+		return "", errors.New("--adminInsecureNoAuth and --splitMigrationTokenFile are mutually exclusive")
+	}
+	const maxMigrationTokenBytes = 4 << 10
+	token, err := internalutil.LoadBearerTokenFile(path, maxMigrationTokenBytes, "migration token")
+	if err != nil {
+		return "", errors.WithStack(err)
+	}
+	if token == adminToken || token == peerToken {
+		return "", errors.New("migration token must differ from Admin and S3 peer tokens")
+	}
+	return token, nil
 }
 
 func appendGRPCBearerInterceptors(
@@ -3648,9 +4102,9 @@ func raftGRPCServerOptions(adminGRPCOpts adminGRPCInterceptors) []grpc.ServerOpt
 	// (single-interceptor) option added anywhere in this chain cannot
 	// silently overwrite the admin auth gate — gRPC-Go keeps only the
 	// last option of the same type.
-	if len(adminGRPCOpts.unary) > 0 {
-		opts = append(opts, grpc.ChainUnaryInterceptor(adminGRPCOpts.unary...))
-	}
+	unary := append([]grpc.UnaryServerInterceptor{}, adminGRPCOpts.unary...)
+	unary = append(unary, migrationCoverageUnaryGate)
+	opts = append(opts, grpc.ChainUnaryInterceptor(unary...))
 	if len(adminGRPCOpts.stream) > 0 {
 		opts = append(opts, grpc.ChainStreamInterceptor(adminGRPCOpts.stream...))
 	}
@@ -3679,6 +4133,8 @@ func startRaftServers(
 	confChangeInterceptor internalraftadmin.MembershipChangeInterceptor,
 	encWiring encryptionWriteWiring,
 	sqsPartitionResolver kv.PartitionResolver,
+	routeEngine *distribution.Engine,
+	readTracker *kv.ActiveTimestampTracker,
 	kekConfigured bool,
 	defaultGroupID uint64,
 	s3BlobObserver adapter.S3BlobOffloadObserver,
@@ -3710,12 +4166,16 @@ func startRaftServers(
 	)
 	for _, rt := range runtimes {
 		gs := grpc.NewServer(raftGRPCServerOptions(adminGRPCOpts)...)
-		trx := kv.NewTransactionWithProposer(proposerForGroup(rt, shardGroups), kv.WithProposalObserver(observerForGroup(proposalObserverForGroup, rt.spec.id)))
+		trx := newInternalMigrationTransaction(proposerForGroup(rt, shardGroups), observerForGroup(proposalObserverForGroup, rt.spec.id), rt.store, rt.spec.id)
 		grpcSvc := adapter.NewGRPCServer(shardStore, coordinate)
 		pb.RegisterRawKVServer(gs, grpcSvc)
 		pb.RegisterTransactionalKVServer(gs, grpcSvc)
 		internalOpts := internalServerOptions(coordinate, adminServer, proposerForGroup(rt, shardGroups), shardGroups[rt.spec.id], rt.spec.id)
 		internalOpts = append(internalOpts, dedicatedTimestampCutoverOptions(shardGroups)...)
+		internalOpts = append(internalOpts, adapter.WithInternalMigrationOwnershipReady(func() bool {
+			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine())
+		}))
+		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -3734,6 +4194,8 @@ func startRaftServers(
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
+				adapter.WithInternalRouteEngine(routeEngine),
+				adapter.WithInternalActiveTimestampTracker(readTracker),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),
 			)...,
 		))
@@ -3768,7 +4230,7 @@ func startRaftServers(
 			rt.engine,
 			[]string{"RawKV"},
 			staticServingServices,
-			newPrepareEvidenceMembershipGate(shardStore, rt.spec.id, confChangeInterceptor),
+			migrationMembershipInterceptor(rt, shardStore, proposerForGroup(rt, shardGroups), adminGRPCOpts.migrationToken, confChangeInterceptor),
 		)
 		reflection.Register(gs)
 
@@ -3993,6 +4455,7 @@ func distributionCatalogStoreForGroup(runtimes []*raftGroupRuntime, groupID uint
 		}
 		if rt.spec.id == groupID {
 			return distribution.NewCatalogStore(rt.store,
+				distribution.WithCatalogRouteDescriptorV2Writes(true),
 				distribution.WithCatalogMigrationStoreResolver(catalogMigrationStoreResolver(runtimes)),
 				distribution.WithCatalogMigrationRetireResolver(catalogMigrationRetireResolver(runtimes)),
 			)
@@ -4343,6 +4806,8 @@ func (r *runtimeServerRunner) startRaftTransport() error {
 		r.encryptionConfChangeInterceptor,
 		r.encWiring,
 		sqsPartitionResolver,
+		r.routeEngine,
+		r.readTracker,
 		r.kekConfigured,
 		r.defaultGroupID,
 		r.metricsRegistry.S3BlobOffloadObserver(),

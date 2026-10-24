@@ -208,7 +208,7 @@ func dynamoGlobalSecondaryIndexFromProto(msg *pb.DynamoGlobalSecondaryIndex) dyn
 		Projection: dynamoGSIProjectionFromProto(msg.GetProjection()),
 	}
 	if strings.TrimSpace(gsi.Projection.ProjectionType) == "" {
-		gsi.Projection = dynamoGSIProjection{ProjectionType: "ALL"}
+		gsi.Projection = dynamoGSIProjection{ProjectionType: dynamoProjectionTypeAll}
 	}
 	return gsi
 }

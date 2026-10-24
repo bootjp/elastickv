@@ -41,7 +41,7 @@ func newWriteConflictMetrics(registerer prometheus.Registerer) *WriteConflictMet
 				Name: "elastickv_store_write_conflict_total",
 				Help: "OCC write conflicts detected at the MVCC store layer, bucketed by conflicting key-prefix class and conflict kind (read=read-write, write=write-write). Rate shows cluster-wide conflict pressure; sharp increases on specific prefixes point at hot keys or lock-resolver races (e.g. txn_rollback for the PR #581 incident pattern).",
 			},
-			[]string{"group", "kind", "key_prefix"},
+			[]string{labelGroup, "kind", "key_prefix"},
 		),
 	}
 	registerer.MustRegister(m.writeConflictTotal)

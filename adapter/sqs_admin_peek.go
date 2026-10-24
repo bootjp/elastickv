@@ -208,23 +208,30 @@ func clampPeekBodyBytes(b int) int {
 //   - ErrAdminSQSNotFound   — queue absent
 //   - ErrAdminSQSValidation — empty / malformed name, malformed /
 //     oversized / stale-generation cursor
+func (s *SQSServer) validateAdminPeekRequest(ctx context.Context, principal AdminPrincipal, name string) error {
+	if !principal.Role.canRead() {
+		s.observeAdminPeek(name, adminOutcomeForbidden)
+		return ErrAdminForbidden
+	}
+	if !isVerifiedSQSLeader(ctx, s.coordinator) {
+		s.observeAdminPeek(name, adminOutcomeNotLeader)
+		return ErrAdminNotLeader
+	}
+	if strings.TrimSpace(name) != name || validateQueueName(name) != nil {
+		s.observeAdminPeek(name, adminOutcomeValidation)
+		return ErrAdminSQSValidation
+	}
+	return nil
+}
+
 func (s *SQSServer) AdminPeekQueue(
 	ctx context.Context,
 	principal AdminPrincipal,
 	name string,
 	opts AdminPeekMessageOptions,
 ) ([]AdminPeekedMessage, string, error) {
-	if !principal.Role.canRead() {
-		s.observeAdminPeek(name, adminOutcomeForbidden)
-		return nil, "", ErrAdminForbidden
-	}
-	if !isVerifiedSQSLeader(ctx, s.coordinator) {
-		s.observeAdminPeek(name, adminOutcomeNotLeader)
-		return nil, "", ErrAdminNotLeader
-	}
-	if strings.TrimSpace(name) != name || validateQueueName(name) != nil {
-		s.observeAdminPeek(name, adminOutcomeValidation)
-		return nil, "", ErrAdminSQSValidation
+	if err := s.validateAdminPeekRequest(ctx, principal, name); err != nil {
+		return nil, "", err
 	}
 	limit := clampPeekLimit(opts.Limit)
 	bodyMaxBytes := clampPeekBodyBytes(opts.BodyMaxBytes)

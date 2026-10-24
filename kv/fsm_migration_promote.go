@@ -126,7 +126,7 @@ func clampMigrationPromoteBound(requested, fallback, ceiling uint64) uint64 {
 }
 
 func isMigrationPromoteOrdinaryApplyError(err error) bool {
-	return errors.Is(err, store.ErrInvalidExportCursor)
+	return errors.Is(err, store.ErrMigrationRetired) || errors.Is(err, store.ErrInvalidExportCursor) || errors.Is(err, store.ErrInvalidImportVersion)
 }
 
 func migrationPromoteTargetKey(jobID uint64) func([]byte) ([]byte, bool) {

@@ -801,7 +801,7 @@ func (c *luaScriptContext) setState(key []byte) (*luaSetState, error) {
 		return nil, wrongTypeError()
 	}
 
-	value, err := c.server.loadSetAt(context.Background(), "set", key, c.startTS)
+	value, err := c.server.loadSetAt(context.Background(), setKind, key, c.startTS)
 	if err != nil {
 		return nil, err
 	}

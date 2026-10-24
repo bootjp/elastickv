@@ -259,9 +259,9 @@ func redisUserRouteKey(userKey []byte) []byte {
 
 func redisExactSetStorageKey(kind string, userKey []byte) []byte {
 	switch kind {
-	case "set":
+	case setKind:
 		return redisSetKey(userKey)
-	case "hll":
+	case hllKind:
 		return redisHLLKey(userKey)
 	default:
 		return nil

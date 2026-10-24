@@ -80,7 +80,7 @@ func (s *S3Server) loadS3MultipartCompletion(ctx context.Context, bucket, object
 		return completion, errors.WithStack(err)
 	}
 	if !exists || meta == nil {
-		return completion, newS3ResponseError(http.StatusNotFound, "NoSuchBucket", "bucket not found", bucket, objectKey)
+		return completion, newS3ResponseError(http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
 	}
 	completion.generation = meta.Generation
 	completion.uploadMetaKey = s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
@@ -231,7 +231,7 @@ func (s *S3Server) validateS3MultipartCommitFences(ctx context.Context, readTS u
 		return nil, errors.WithStack(err)
 	}
 	if !exists || meta == nil {
-		return nil, newS3ResponseError(http.StatusNotFound, "NoSuchBucket", "bucket not found", completion.bucket, completion.objectKey)
+		return nil, newS3ResponseError(http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, completion.bucket, completion.objectKey)
 	}
 	if meta.Generation != completion.generation {
 		return nil, newS3ResponseError(http.StatusNotFound, "NoSuchUpload", "upload not found (bucket was recreated)", completion.bucket, completion.objectKey)

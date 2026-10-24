@@ -181,7 +181,7 @@ func (h *KeyVizHotKeysHandler) ServeHTTP(w http.ResponseWriter, r *http.Request)
 	}
 
 	h.audit(r, params, len(out.Keys), out.Degraded)
-	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+	w.Header().Set("Content-Type", contentTypeJSONUTF8)
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(http.StatusOK)
 	if err := json.NewEncoder(w).Encode(out); err != nil {

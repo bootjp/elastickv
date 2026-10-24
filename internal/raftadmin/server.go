@@ -152,11 +152,34 @@ func (s *Server) PromoteLearner(ctx context.Context, req *pb.RaftAdminPromoteLea
 	}
 	s.membershipMu.Lock()
 	defer s.membershipMu.Unlock()
+	if err := s.requireMembershipChangeReady(); err != nil {
+		return nil, err
+	}
+	if err := s.checkPromotionInterceptor(ctx, req.Id); err != nil {
+		return nil, err
+	}
 	index, err := s.admin.PromoteLearner(ctx, req.Id, req.PreviousIndex, req.MinAppliedIndex, req.SkipMinAppliedCheck)
 	if err != nil {
 		return nil, adminError(err)
 	}
 	return &pb.RaftAdminConfigurationChangeResponse{Index: index}, nil
+}
+
+func (s *Server) checkPromotionInterceptor(ctx context.Context, id string) error {
+	hook, ok := s.interceptor.(MembershipPromotionInterceptor)
+	if !ok {
+		return nil
+	}
+	cfg, err := s.engine.Configuration(ctx)
+	if err != nil {
+		return adminError(err)
+	}
+	for _, member := range cfg.Servers {
+		if member.ID == id && member.Address != "" {
+			return adminError(hook.PrePromoteMember(ctx, id, member.Address))
+		}
+	}
+	return grpcStatus(codes.FailedPrecondition, "promotion capability check requires a configured member address")
 }
 
 func (s *Server) RemoveServer(ctx context.Context, req *pb.RaftAdminRemoveServerRequest) (*pb.RaftAdminConfigurationChangeResponse, error) {

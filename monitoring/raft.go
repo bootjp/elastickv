@@ -16,7 +16,7 @@ var raftStates = []string{
 	"candidate",
 	"leader",
 	"shutdown",
-	"unknown",
+	labelValueUnknown,
 }
 
 const (
@@ -73,105 +73,105 @@ func newRaftMetrics(registerer prometheus.Registerer) *RaftMetrics {
 				Name: "elastickv_raft_local_state",
 				Help: "Current local raft state for each group.",
 			},
-			[]string{"group", "state"},
+			[]string{labelGroup, "state"},
 		),
 		leaderIdentity: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_leader_identity",
 				Help: "Current leader identity for each raft group, as observed by this node.",
 			},
-			[]string{"group", "leader_id", "leader_address"},
+			[]string{labelGroup, "leader_id", "leader_address"},
 		),
 		memberPresent: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_member_present",
 				Help: "Current raft configuration members known to this node.",
 			},
-			[]string{"group", "member_id", "member_address", "suffrage"},
+			[]string{labelGroup, labelMemberID, labelMemberAddress, "suffrage"},
 		),
 		memberIsLeader: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_member_is_leader",
 				Help: "Whether a raft configuration member is the current leader, as observed by this node.",
 			},
-			[]string{"group", "member_id", "member_address"},
+			[]string{labelGroup, labelMemberID, labelMemberAddress},
 		),
 		memberCount: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_members",
 				Help: "Number of raft configuration members currently known for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		commitIndex: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_commit_index",
 				Help: "Latest raft commit index for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		appliedIndex: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_applied_index",
 				Help: "Latest raft applied index for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		lastContact: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_last_contact_seconds",
 				Help: "Time since the last observed leader contact for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		term: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_term",
 				Help: "Current Raft term for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		lastLogIndex: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_last_log_index",
 				Help: "Index of the last log entry written for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		lastSnapshotIndex: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_last_snapshot_index",
 				Help: "Index of the most recent snapshot for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		fsmPending: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_fsm_pending",
 				Help: "Number of commands queued to the FSM but not yet applied for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		numPeers: prometheus.NewGaugeVec(
 			prometheus.GaugeOpts{
 				Name: "elastickv_raft_num_peers",
 				Help: "Number of other voting servers in the cluster for each group, not including this node.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		leaderChanges: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_leader_changes_seen_total",
 				Help: "Total number of observed leader changes for each group.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 		proposalsFailed: prometheus.NewCounterVec(
 			prometheus.CounterOpts{
 				Name: "elastickv_raft_proposals_failed_total",
 				Help: "Total number of raft proposals that failed before returning a usable apply response.",
 			},
-			[]string{"group"},
+			[]string{labelGroup},
 		),
 	}
 
@@ -298,7 +298,7 @@ func (o *RaftObserver) setLeaderMetric(group string, leaderID string, leaderAddr
 		o.metrics.leaderIdentity.Delete(previous)
 	}
 	current := prometheus.Labels{
-		"group":          group,
+		labelGroup:       group,
 		"leader_id":      leaderID,
 		"leader_address": leaderAddress,
 	}
@@ -349,18 +349,18 @@ func (o *RaftObserver) setMembers(group string, leaderID string, servers []rafte
 		memberKey := fmt.Sprintf("%s|%s", memberID, memberAddress)
 
 		memberLabels := prometheus.Labels{
-			"group":          group,
-			"member_id":      memberID,
-			"member_address": memberAddress,
-			"suffrage":       server.Suffrage,
+			labelGroup:         group,
+			labelMemberID:      memberID,
+			labelMemberAddress: memberAddress,
+			"suffrage":         server.Suffrage,
 		}
 		o.metrics.memberPresent.With(memberLabels).Set(1)
 		nextMembers[memberKey] = memberLabels
 
 		leaderLabels := prometheus.Labels{
-			"group":          group,
-			"member_id":      memberID,
-			"member_address": memberAddress,
+			labelGroup:         group,
+			labelMemberID:      memberID,
+			labelMemberAddress: memberAddress,
 		}
 		if memberID != "" && memberID == leaderID {
 			o.metrics.memberIsLeader.With(leaderLabels).Set(1)
@@ -385,9 +385,9 @@ func normalizeRaftState(state raftengine.State) string {
 	case raftengine.StateShutdown:
 		return "shutdown"
 	case raftengine.StateUnknown:
-		return "unknown"
+		return labelValueUnknown
 	default:
-		return "unknown"
+		return labelValueUnknown
 	}
 }
 

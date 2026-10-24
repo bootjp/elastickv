@@ -58,7 +58,7 @@ func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 				Help:    "Cumulative time inside state.PCall per invocation (includes redis.call() time). Use with redis_call_duration to isolate pure VM time.",
 				Buckets: luaDurationBuckets,
 			},
-			[]string{"outcome"},
+			[]string{labelOutcome},
 		),
 		redisCallDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -66,7 +66,7 @@ func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 				Help:    "Cumulative time spent in redis.call()/pcall() handlers (Raft reads + in-memory state) per invocation. Pure VM time = exec_duration - redis_call_duration.",
 				Buckets: luaDurationBuckets,
 			},
-			[]string{"outcome"},
+			[]string{labelOutcome},
 		),
 		redisCallCount: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -74,7 +74,7 @@ func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 				Help:    "Number of redis.call()/pcall() invocations per Lua script execution, summed across retries. High counts combined with high redis_call_duration indicate many individual Raft reads.",
 				Buckets: luaCallCountBuckets,
 			},
-			[]string{"outcome"},
+			[]string{labelOutcome},
 		),
 		commitDuration: prometheus.NewHistogramVec(
 			prometheus.HistogramOpts{
@@ -82,7 +82,7 @@ func newLuaMetrics(registerer prometheus.Registerer) *LuaMetrics {
 				Help:    "Cumulative time spent in coordinator.Dispatch (Raft + storage write) per script invocation, summed across retries.",
 				Buckets: luaDurationBuckets,
 			},
-			[]string{"outcome"},
+			[]string{labelOutcome},
 		),
 		conflictRetries: prometheus.NewHistogram(
 			prometheus.HistogramOpts{

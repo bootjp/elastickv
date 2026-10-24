@@ -58,15 +58,17 @@ func promotedVersionsFromStaged(opts PromoteVersionsOptions, versions []MVCCVers
 }
 
 func (s *mvccStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error) {
+	s.mtx.Lock()
+	defer s.mtx.Unlock()
+	if _, retired := s.migrationRetired[opts.JobID]; retired {
+		return PromoteVersionsResult{}, errors.WithStack(ErrMigrationRetired)
+	}
 	if err := validatePromoteVersionsOptions(opts); err != nil {
 		return PromoteVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
 		return PromoteVersionsResult{Done: true}, nil
 	}
-
-	s.mtx.Lock()
-	defer s.mtx.Unlock()
 
 	state, cursor := s.promotionStateAndCursorLocked(opts)
 	if opts.JobID != 0 && state.Done {
@@ -104,7 +106,7 @@ func (s *mvccStore) planMemoryPromotionLocked(
 	if err != nil {
 		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
 	}
-	exported, err := s.exportMemoryVersionsLocked(ctx, exportOpts, pos)
+	exported, err := s.exportVersionsLocked(ctx, exportOpts, pos)
 	if err != nil {
 		return ExportVersionsResult{}, nil, PromoteVersionsResult{}, err
 	}
@@ -142,55 +144,24 @@ func (s *mvccStore) MigrationPromotionState(_ context.Context, jobID uint64) (Pr
 	return clonePromotionState(state), ok, nil
 }
 
-func (s *mvccStore) exportMemoryVersionsLocked(ctx context.Context, opts ExportVersionsOptions, pos exportCursorPosition) (ExportVersionsResult, error) {
-	result := newExportVersionsResult(opts.MaxVersions)
-	it := s.tree.Iterator()
-	if !s.seekMemoryExportStart(&it, opts.StartKey, pos) {
-		result.Done = true
-		return result, nil
-	}
-	for ok := true; ok; ok = it.Next() {
-		key, keyOK := it.Key().([]byte)
-		if err := checkExportKey(ctx, key, keyOK, opts.EndKey); err != nil {
-			if errors.Is(err, errExportReachedEnd) {
-				result.Done = true
-				result.NextCursor = nil
-				return result, nil
-			}
-			return ExportVersionsResult{}, err
-		}
-		if !keyOK {
-			continue
-		}
-		done, err := exportMemoryIteratorKey(ctx, opts, pos, key, it.Value(), &result)
-		if err != nil || !done {
-			return result, err
-		}
-	}
-	result.Done = true
-	result.NextCursor = nil
-	return result, nil
-}
-
-func (s *mvccStore) removeVersionLocked(key []byte, commitTS uint64) bool {
+func (s *mvccStore) removeVersionLocked(key []byte, commitTS uint64) {
 	existing, ok := s.tree.Get(key)
 	if !ok {
-		return false
+		return
 	}
 	versions, _ := existing.([]VersionedValue)
 	idx := findVersionIndex(versions, commitTS)
 	if idx < 0 {
-		return false
+		return
 	}
 	next := make([]VersionedValue, len(versions)-1)
 	copy(next, versions[:idx])
 	copy(next[idx:], versions[idx+1:])
 	if len(next) == 0 {
 		s.tree.Remove(key)
-		return true
+		return
 	}
 	s.tree.Put(bytes.Clone(key), next)
-	return true
 }
 
 func findVersionIndex(versions []VersionedValue, commitTS uint64) int {
@@ -203,18 +174,19 @@ func findVersionIndex(versions []VersionedValue, commitTS uint64) int {
 }
 
 func (s *pebbleStore) PromoteVersions(ctx context.Context, opts PromoteVersionsOptions) (PromoteVersionsResult, error) {
+	s.applyMu.Lock()
+	defer s.applyMu.Unlock()
+	s.dbMu.RLock()
+	defer s.dbMu.RUnlock()
+	if err := s.checkMigrationNotRetiredLocked(opts.JobID); err != nil {
+		return PromoteVersionsResult{}, err
+	}
 	if err := validatePromoteVersionsOptions(opts); err != nil {
 		return PromoteVersionsResult{}, err
 	}
 	if opts.MaxVersions <= 0 {
 		return PromoteVersionsResult{Done: true}, nil
 	}
-
-	s.applyMu.Lock()
-	defer s.applyMu.Unlock()
-
-	s.dbMu.RLock()
-	defer s.dbMu.RUnlock()
 
 	state, cursor, err := s.pebblePromotionStateAndCursor(opts)
 	if err != nil {

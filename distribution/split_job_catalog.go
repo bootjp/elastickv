@@ -36,6 +36,7 @@ var (
 	ErrCatalogSplitJobConflict            = errors.New("catalog split job conflict")
 	ErrCatalogSplitJobTerminalRequired    = errors.New("catalog split job terminal state is required")
 	ErrSplitJobOverlap                    = errors.New("split job overlaps requested route")
+	ErrTooManyInFlightSplitJobs           = errors.New("too many in-flight split jobs")
 )
 
 // SplitJobPhase is the durable phase of a split migration job.
@@ -134,8 +135,14 @@ type SplitJobBracketProgress struct {
 
 // SplitJob is the durable default-group state for a range split migration.
 type SplitJob struct {
+	TransferPreflightVersion         uint32
+	TransferPreflightTS              uint64
+	TransferPreflightProgress        []SplitJobBracketProgress
+	TransferPreflightDone            bool
 	JobID                            uint64
 	SourceRouteID                    uint64
+	WorkingSourceRouteID             uint64
+	SourceGroupID                    uint64
 	SplitKey                         []byte
 	TargetGroupID                    uint64
 	Phase                            SplitJobPhase
@@ -167,6 +174,7 @@ type SplitJob struct {
 	StartedAtMs                      int64
 	UpdatedAtMs                      int64
 	TerminalAtMs                     int64
+	CapabilityRegressed              bool
 }
 
 // CatalogNextSplitJobIDKey returns the reserved key used for split-job ID allocation.
@@ -585,7 +593,10 @@ func validateSplitJob(job SplitJob) error {
 	if err := validateSplitJobBarriers(job); err != nil {
 		return err
 	}
-	return validateSplitJobBracketProgress(job.BracketProgress)
+	if err := validateSplitJobBracketProgress(job.BracketProgress); err != nil {
+		return err
+	}
+	return validateSplitJobBracketProgress(job.TransferPreflightProgress)
 }
 
 func validateSplitJobPhases(job SplitJob) error {
@@ -609,7 +620,7 @@ func (job SplitJob) retryPhaseValidForPhase() bool {
 }
 
 func (job SplitJob) abandonFromPhaseValidForPhase() bool {
-	if job.Phase == SplitJobPhaseAbandoning {
+	if job.Phase == SplitJobPhaseAbandoning || (job.Phase == SplitJobPhaseFailed && job.RetryPhase == SplitJobPhaseAbandoning) {
 		return job.AbandonFromPhase.abandonable()
 	}
 	return job.AbandonFromPhase == SplitJobPhaseNone
@@ -617,17 +628,17 @@ func (job SplitJob) abandonFromPhaseValidForPhase() bool {
 
 func (p SplitJobPhase) retryable() bool {
 	switch p {
-	case SplitJobPhaseBackfill,
+	case SplitJobPhasePlanned,
+		SplitJobPhaseAbandoning,
+		SplitJobPhaseBackfill,
 		SplitJobPhaseFence,
 		SplitJobPhaseDeltaCopy,
 		SplitJobPhaseCutover,
 		SplitJobPhaseCleanup:
 		return true
 	case SplitJobPhaseNone,
-		SplitJobPhasePlanned,
 		SplitJobPhaseDone,
 		SplitJobPhaseFailed,
-		SplitJobPhaseAbandoning,
 		SplitJobPhaseAbandoned:
 		return false
 	default:
@@ -637,12 +648,12 @@ func (p SplitJobPhase) retryable() bool {
 
 func (p SplitJobPhase) abandonable() bool {
 	switch p {
-	case SplitJobPhaseBackfill,
+	case SplitJobPhasePlanned,
+		SplitJobPhaseBackfill,
 		SplitJobPhaseFence,
 		SplitJobPhaseDeltaCopy:
 		return true
 	case SplitJobPhaseNone,
-		SplitJobPhasePlanned,
 		SplitJobPhaseCutover,
 		SplitJobPhaseCleanup,
 		SplitJobPhaseDone,
@@ -921,8 +932,13 @@ func splitJobLess(left, right SplitJob) bool {
 
 func CloneSplitJob(job SplitJob) SplitJob {
 	return SplitJob{
+		TransferPreflightVersion:         job.TransferPreflightVersion,
+		TransferPreflightTS:              job.TransferPreflightTS,
+		TransferPreflightProgress:        cloneSplitJobBracketProgress(job.TransferPreflightProgress),
+		TransferPreflightDone:            job.TransferPreflightDone,
 		JobID:                            job.JobID,
 		SourceRouteID:                    job.SourceRouteID,
+		WorkingSourceRouteID:             job.WorkingSourceRouteID,
 		SplitKey:                         CloneBytes(job.SplitKey),
 		TargetGroupID:                    job.TargetGroupID,
 		Phase:                            job.Phase,
@@ -954,14 +970,26 @@ func CloneSplitJob(job SplitJob) SplitJob {
 		StartedAtMs:                      job.StartedAtMs,
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
+		CapabilityRegressed:              job.CapabilityRegressed,
+		SourceGroupID:                    job.SourceGroupID,
 	}
+}
+
+// SplitJobToProto converts a catalog SplitJob into its wire representation.
+func SplitJobToProto(job SplitJob) *pb.SplitJob {
+	return splitJobToProto(job)
 }
 
 func splitJobToProto(job SplitJob) *pb.SplitJob {
 	job = CloneSplitJob(job)
 	return &pb.SplitJob{
+		TransferPreflightVersion:         job.TransferPreflightVersion,
+		TransferPreflightTs:              job.TransferPreflightTS,
+		TransferPreflightProgress:        splitJobBracketProgressToProto(job.TransferPreflightProgress),
+		TransferPreflightDone:            job.TransferPreflightDone,
 		JobId:                            job.JobID,
 		SourceRouteId:                    job.SourceRouteID,
+		WorkingSourceRouteId:             job.WorkingSourceRouteID,
 		SplitKey:                         job.SplitKey,
 		TargetGroupId:                    job.TargetGroupID,
 		Phase:                            pb.SplitJobPhase(job.Phase),
@@ -993,6 +1021,8 @@ func splitJobToProto(job SplitJob) *pb.SplitJob {
 		StartedAtMs:                      job.StartedAtMs,
 		UpdatedAtMs:                      job.UpdatedAtMs,
 		TerminalAtMs:                     job.TerminalAtMs,
+		CapabilityRegressed:              job.CapabilityRegressed,
+		SourceGroupId:                    job.SourceGroupID,
 	}
 }
 
@@ -1024,9 +1054,14 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 	if err != nil {
 		return SplitJob{}, err
 	}
+	preflightProgress, err := splitJobBracketProgressFromProto(msg.GetTransferPreflightProgress())
+	if err != nil {
+		return SplitJob{}, err
+	}
 	return SplitJob{
 		JobID:                            msg.GetJobId(),
 		SourceRouteID:                    msg.GetSourceRouteId(),
+		WorkingSourceRouteID:             msg.GetWorkingSourceRouteId(),
 		SplitKey:                         CloneBytes(msg.GetSplitKey()),
 		TargetGroupID:                    msg.GetTargetGroupId(),
 		Phase:                            phase,
@@ -1053,11 +1088,17 @@ func splitJobFromProto(msg *pb.SplitJob) (SplitJob, error) {
 		SourceReadDrainCursor:            CloneBytes(msg.GetSourceReadDrainCursor()),
 		TargetClearedDescriptorAckCursor: CloneBytes(msg.GetTargetClearedDescriptorAckCursor()),
 		BracketProgress:                  bracketProgress,
+		TransferPreflightVersion:         msg.GetTransferPreflightVersion(),
+		TransferPreflightTS:              msg.GetTransferPreflightTs(),
+		TransferPreflightProgress:        preflightProgress,
+		TransferPreflightDone:            msg.GetTransferPreflightDone(),
 		SourceRetentionPinTS:             msg.GetSourceRetentionPinTs(),
 		LastError:                        msg.GetLastError(),
 		StartedAtMs:                      msg.GetStartedAtMs(),
 		UpdatedAtMs:                      msg.GetUpdatedAtMs(),
 		TerminalAtMs:                     msg.GetTerminalAtMs(),
+		CapabilityRegressed:              msg.GetCapabilityRegressed(),
+		SourceGroupID:                    msg.GetSourceGroupId(),
 	}, nil
 }
 

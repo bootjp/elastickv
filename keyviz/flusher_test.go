@@ -21,67 +21,80 @@ func TestRunFlusherTicksUntilCancel(t *testing.T) {
 		RunFlusher(ctx, s, 5*time.Millisecond)
 	}()
 
-	// Drive Observe across ticker firings.
-	for i := 0; i < 10; i++ {
-		s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
-		time.Sleep(2 * time.Millisecond)
-	}
+	s.Observe(1, make([]byte, 0), OpRead, 0, LabelLegacy)
+	// No deadline: parallel CPU-bound tests (and other packages under
+	// `go test ./...`) can starve the ticker goroutine for over a second
+	// on a -race runner. A flusher that never ticks or never returns
+	// still fails, via the go test -timeout.
+	waitForColumns(s, 1)
 	cancel()
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("RunFlusher did not return after cancel")
-	}
-
-	cols := s.Snapshot(time.Time{}, time.Time{})
-	if len(cols) == 0 {
-		t.Fatal("expected at least one column from background flushes")
-	}
+	<-done
 }
 
 func TestRunFlusherAttachesAlignedHotKeysWindow(t *testing.T) {
 	t.Parallel()
+	start := time.Unix(1_700_000_000, 0)
+	step := 5 * time.Millisecond
 	s := NewMemSampler(MemSamplerOptions{
-		Step:              5 * time.Millisecond,
+		Step:              step,
 		HistoryColumns:    16,
 		HotKeysEnabled:    true,
 		HotKeysPerRoute:   8,
 		HotKeysSampleRate: 1,
 		HotKeysQueueSize:  32,
 		HotKeysMaxKeyLen:  64,
+		Now:               func() time.Time { return start },
 	})
 	require.True(t, s.RegisterRoute(1, []byte("a"), []byte("z"), 1))
 
 	ctx, cancel := context.WithCancel(context.Background())
-	var done = make(chan struct{}, 2)
+	ticks := make(chan time.Time)
+	done := make(chan struct{}, 2)
 	go func() {
 		RunHotKeysAggregator(ctx, s)
 		done <- struct{}{}
 	}()
 	go func() {
-		RunFlusher(ctx, s, s.Step())
+		runFlusherTicks(ctx, s, ticks)
 		done <- struct{}{}
 	}()
 	t.Cleanup(func() {
 		cancel()
-		for range 2 {
-			select {
-			case <-done:
-			case <-time.After(time.Second):
-				t.Fatal("hot-key workers did not return after cancel")
-			}
-		}
+		<-done
+		<-done
 	})
-	for i := 0; i < 8; i++ {
-		s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
+
+	// Drive explicit boundaries instead of a wall-clock ticker so the
+	// windows under test cannot be skipped or evicted by scheduler stalls.
+	for window, writes := range []int{8, 3} {
+		for range writes {
+			s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
+		}
+		ticks <- start.Add(time.Duration(window+1) * step)
+		waitForColumns(s, window+1)
 	}
 
-	require.Eventually(t, func() bool {
-		// Keep producing while polling: the 16-column history retains only
-		// 80ms, so a scheduler pause can evict every initial observation.
-		s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
-		return alignedHotKeysWindowObserved(s.Snapshot(time.Time{}, time.Time{}))
-	}, time.Second, 5*time.Millisecond)
+	columns := s.Snapshot(time.Time{}, time.Time{})
+	require.Len(t, columns, 2)
+	require.True(t, alignedHotKeysWindowObserved(columns))
+	for i, writes := range []uint64{8, 3} {
+		col := columns[i]
+		require.Equal(t, start.Add(time.Duration(i)*step), col.WindowStart)
+		require.Equal(t, start.Add(time.Duration(i+1)*step), col.At)
+		require.Len(t, col.HotKeys, 1)
+		require.Equal(t, writes, col.HotKeys[0].SampledN)
+		require.Len(t, col.HotKeys[0].Entries, 1)
+		require.Equal(t, []byte("hot"), col.HotKeys[0].Entries[0].Key)
+	}
+}
+
+// waitForColumns blocks until s has retained at least n columns. It has no
+// wall-clock budget; only the go test -timeout bounds a flusher that never
+// produces the column.
+func waitForColumns(s *MemSampler, n int) {
+	for len(s.Snapshot(time.Time{}, time.Time{})) < n {
+		time.Sleep(time.Millisecond)
+	}
 }
 
 func alignedHotKeysWindowObserved(columns []MatrixColumn) bool {
@@ -179,11 +192,10 @@ func TestFlushWindowKeepsHotKeyAndCounterInSameColumn(t *testing.T) {
 	case <-time.After(20 * time.Millisecond):
 	}
 	s.flushMu.Unlock()
-	select {
-	case <-observed:
-	case <-time.After(time.Second):
-		t.Fatal("Observe remained blocked after the flush boundary opened")
-	}
+	// Unbounded on purpose: a wall-clock budget here fails whenever a
+	// loaded -race runner deschedules the Observe goroutine. A real
+	// deadlock still fails via the go test -timeout.
+	<-observed
 	require.True(t, s.flushWindow(ctx, now.Add(time.Minute)))
 
 	columns := s.Snapshot(time.Time{}, time.Time{})

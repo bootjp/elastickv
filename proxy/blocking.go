@@ -68,12 +68,12 @@ type pipelineReadTimeoutBackend interface {
 
 func blockingCommandTimeout(cmd string, args [][]byte) time.Duration {
 	switch strings.ToUpper(cmd) {
-	case "BLPOP", "BRPOP", "BRPOPLPUSH", "BLMOVE", "BZPOPMIN", "BZPOPMAX":
+	case cmdNameBLPOP, cmdNameBRPOP, cmdNameBRPOPLPUSH, cmdNameBLMOVE, cmdNameBZPOPMIN, cmdNameBZPOPMAX:
 		if len(args) == 0 {
 			return 0
 		}
 		return parseBlockingSecondsArg(args[len(args)-1])
-	case "BLMPOP":
+	case cmdNameBLMPOP:
 		if len(args) < blockingMultiPopMinArgs {
 			return 0
 		}
@@ -113,17 +113,17 @@ func shouldReplayBlockingToSecondary(cmd string, resp any) bool {
 
 func secondaryBlockingReplay(cmd string, args [][]byte, resp any, secondary Backend) (string, []any, bool) {
 	switch strings.ToUpper(cmd) {
-	case "BLPOP":
+	case cmdNameBLPOP:
 		return blockingListPopReplay(1, resp)
-	case "BRPOP":
+	case cmdNameBRPOP:
 		return blockingListPopReplay(-1, resp)
-	case "BRPOPLPUSH":
+	case cmdNameBRPOPLPUSH:
 		return blockingListMoveReplay(args, resp, -1, blockingListSideLeft)
-	case "BLMOVE":
+	case cmdNameBLMOVE:
 		return blockingBLMoveReplay(args, resp)
-	case "BLMPOP":
+	case cmdNameBLMPOP:
 		return blockingBLMPopReplay(args, resp)
-	case "BZPOPMIN", "BZPOPMAX":
+	case cmdNameBZPOPMIN, cmdNameBZPOPMAX:
 		key, member, ok := zsetPopKeyMember(resp)
 		if !ok {
 			return "", nil, false
