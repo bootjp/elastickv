@@ -6,12 +6,14 @@ const BOTS = {
   'claude[bot]': { id: 209825114, reviewer: 'claude' },
 };
 
+/** Identify a reviewer only when both the bot account and numeric ID match. */
 function reviewerOf(item) {
   const bot = BOTS[item.user?.login];
   return bot && item.user.id === bot.id && item.user.type === 'Bot'
     ? bot.reviewer : undefined;
 }
 
+/** Parse one standalone versioned result, ignoring examples in code fences. */
 function marker(body, name) {
   if (typeof body !== 'string' || !body.includes(`<!-- ${name}:`)) return;
   // A quoted example inside a code fence is not a review result.
@@ -26,7 +28,7 @@ function marker(body, name) {
     return !fence;
   }).join('\n');
   const matches = [...prose.matchAll(new RegExp(`^<!-- ${name}:v1 (.+) -->[ \\t]*$`, 'gm'))];
-  if (matches.length !== 1 || body.split(`<!-- ${name}:`).length !== 2) return null;
+  if (matches.length !== 1 || prose.split(`<!-- ${name}:`).length !== 2) return null;
   try {
     const value = JSON.parse(matches[0][1]);
     return value && typeof value === 'object' && !Array.isArray(value) ? value : null;
@@ -35,6 +37,7 @@ function marker(body, name) {
   }
 }
 
+/** Select the most recently updated result, breaking timestamp ties by ID. */
 function latest(items) {
   return items.toSorted((a, b) => {
     const time = item => Date.parse(item.updated_at || item.submitted_at || item.created_at) || 0;
@@ -42,6 +45,7 @@ function latest(items) {
   })[0];
 }
 
+/** Keep the requested review kind for HEAD, retaining unreadable evidence. */
 function currentResults(results, reviewer, kind, head) {
   return results.flatMap(result => {
     // An unreadable marker cannot establish which SHA it describes.
@@ -55,6 +59,7 @@ function currentResults(results, reviewer, kind, head) {
   });
 }
 
+/** Decide whether explicit current-HEAD evidence establishes a clean review. */
 function evaluateApproval({ head, comments = [], reviews = [], inlineComments = [] }) {
   if (!/^[0-9a-f]{40}$/.test(head || '')) return { approved: false, reason: 'Invalid HEAD SHA' };
   const trustedReviews = reviews.filter(review => reviewerOf(review) && review.commit_id === head);
@@ -115,10 +120,12 @@ function evaluateApproval({ head, comments = [], reviews = [], inlineComments = 
   };
 }
 
+/** Check for the managed label without depending on other PR labels. */
 function hasLabel(pr) {
   return pr.labels.some(label => (typeof label === 'string' ? label : label.name) === LABEL);
 }
 
+/** Remove only the managed label; an already absent label needs no action. */
 async function removeLabel(github, repo, number) {
   try {
     await github.rest.issues.removeLabel({ ...repo, issue_number: number, name: LABEL });
@@ -127,6 +134,7 @@ async function removeLabel(github, repo, number) {
   }
 }
 
+/** Create the repository label if absent, tolerating concurrent creation. */
 async function ensureLabel(github, repo) {
   try {
     await github.rest.issues.getLabel({ ...repo, name: LABEL });
@@ -145,6 +153,7 @@ async function ensureLabel(github, repo) {
   }
 }
 
+/** Read every page of public review evidence through the injected API client. */
 async function readEvidence(github, repo, number) {
   const params = { ...repo, pull_number: number, per_page: 100 };
   const [comments, reviews, inlineComments] = await Promise.all([
@@ -155,6 +164,7 @@ async function readEvidence(github, repo, number) {
   return { comments, reviews, inlineComments };
 }
 
+/** Reconcile one PR and revoke approval if its HEAD, evidence, or state changes. */
 async function reconcilePullRequest({ github, repo, number, core }) {
   const params = { ...repo, pull_number: number };
   try {
@@ -198,6 +208,7 @@ async function reconcilePullRequest({ github, repo, number, core }) {
   }
 }
 
+/** Sweep open and closed labeled PRs, reporting failures after processing all. */
 async function run({ github, context, core }) {
   const repo = context.repo;
   const [pulls, closedLabeled] = await Promise.all([

@@ -14,6 +14,7 @@ const codeResult = overrides => ({
   commit_sha: HEAD, status: 'completed', has_any_findings: false,
   has_unresolved_findings: false, ...overrides,
 });
+/** Build a trusted bot comment carrying structured review evidence. */
 function comment(reviewer, result, overrides = {}) {
   const name = reviewer === 'codex' ? 'codex-review-state' : 'agent-review-result';
   const value = result || (reviewer === 'codex' ? { code_review: codeResult() } : codeResult());
@@ -22,9 +23,11 @@ function comment(reviewer, result, overrides = {}) {
     body: `<!-- ${name}:v1 ${JSON.stringify(value)} -->`, ...overrides,
   };
 }
+/** Build a submitted review bound to the current test HEAD. */
 function review(overrides = {}) {
   return { id: 10, user: USERS.claude, commit_id: HEAD, state: 'COMMENTED', body: '', ...overrides };
 }
+/** Build a root inline finding, allowing stale commits and replies in cases. */
 function inline(overrides = {}) {
   return { id: 20, user: USERS.claude, commit_id: HEAD, original_commit_id: HEAD, ...overrides };
 }
@@ -112,6 +115,22 @@ for (const [name, input, approved] of cases) {
 }
 
 for (const reviewer of ['codex', 'claude']) {
+  for (const fence of ['```', '~~~']) {
+    test(`${reviewer} fenced marker example does not invalidate the real result (${fence})`, () => {
+      const result = comment(reviewer);
+      result.body = `${fence}html\n${result.body}\n${fence}\n${result.body}`;
+      assert.equal(evaluateApproval({ head: HEAD, comments: [result] }).approved, true);
+    });
+  }
+}
+
+test('quoted marker alongside a standalone result remains ambiguous', () => {
+  const result = comment('claude');
+  result.body = `> ${result.body}\n${result.body}`;
+  assert.equal(evaluateApproval({ head: HEAD, comments: [result] }).approved, false);
+});
+
+for (const reviewer of ['codex', 'claude']) {
   test(`late stale ${reviewer} result cannot hide current-HEAD findings`, () => {
     const result = overrides => reviewer === 'codex'
       ? { code_review: codeResult(overrides) } : codeResult(overrides);
@@ -170,6 +189,7 @@ test('code and security results are selected independently by SHA', () => {
   assert.equal(evaluateApproval({ head: HEAD, comments }).approved, true);
 });
 
+/** Model API reads and label mutations, with hooks for deterministic races. */
 function fakeGitHub(options = {}) {
   const state = {
     calls: [], gets: 0, labelExists: options.labelExists ?? true,

@@ -88,7 +88,7 @@ label preservation, and HEAD changes around label writes.
 
 ## Validation and self-review
 
-The 74 Node regression tests pass. Actionlint passes for the updater, event
+The 79 Node regression tests pass. Actionlint passes for the updater, event
 workflow, and changed Claude workflow. A read-only check against PR #1321's actual
 REST comments recognizes its full-SHA Codex result as a completed zero-finding
 code review. That PR is now closed; reconciliation does not approve closed PRs.
@@ -120,3 +120,10 @@ hide current-HEAD findings or approval from the same reviewer. Five regressions
 failed before the fix. Results are now scoped by SHA before selecting the latest
 code and security result independently; eight added regressions cover both bots,
 mixed-SHA summaries, and label removal when stale results arrive late.
+
+A second review found that duplicate-marker counting still included code-fenced
+examples after marker extraction had excluded them. Four regressions reproduced
+the failure before switching both operations to the same unfenced prose. Five
+added cases cover both bots, both fence styles, and rejection of an ambiguous
+quoted marker beside a real result. Named production and fixture helpers now
+document their contracts to address the review's docstring-coverage warning.
