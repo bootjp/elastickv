@@ -5,7 +5,7 @@ set -euo pipefail
 source "$(dirname "$0")/../filesystem_budget.sh"
 
 filesystem_budget overwrite 16 250
-[[ "$FS_KEY_COUNT" == 63 && "$FS_MAX_WRITES" == 64 ]]
+[[ "$FS_KEY_COUNT" == 250 && "$FS_MAX_WRITES" == 16 ]]
 
 # An indeterminate rename can leave many possible register states. Keep each
 # Knossos history within the size that completes on the captured CI history.

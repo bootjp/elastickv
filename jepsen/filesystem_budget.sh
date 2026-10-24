@@ -4,8 +4,7 @@
 filesystem_budget() {
   local mode="$1" requested_keys="$2" requested_writes="$3" cap
   case "$mode" in
-    overwrite) cap=64 ;;
-    rename) cap=16 ;;
+    overwrite|rename) cap=16 ;;
     *) echo "unknown filesystem write mode: $mode" >&2; return 1 ;;
   esac
 

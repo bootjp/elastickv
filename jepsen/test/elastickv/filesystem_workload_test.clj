@@ -130,6 +130,26 @@
   (is (not (workload/read-retryable-error? (ex-info "mount unavailable: /mnt/fs" {}))))
   (is (not (workload/read-retryable-error? (java.io.FileNotFoundException. "reg-1 (Transport endpoint is not connected)")))))
 
+(deftest final-read-retries-after-32-transient-conflicts
+  (let [dir (scratch-dir)]
+    (try
+      (workload/local-setup! dir [0])
+      (let [attempts (atom 0)
+            op {:type :invoke :f :read :value (independent/tuple 0 nil) :final true}]
+        (with-redefs [workload/local-read
+                      (fn [_]
+                        (if (<= (swap! attempts inc) 32)
+                          (throw (java.io.IOException. "Resource temporarily unavailable"))
+                          7))]
+          (let [result (workload/invoke-read!
+                         {:local? true :mount-dir dir :max-retries 8 :require-fuse-mount false}
+                         {} "n1" op 0)]
+            (is (= :ok (:type result)))
+            (is (= (independent/tuple 0 7) (:value result)))
+            (is (= 33 @attempts)))))
+      (finally
+        (delete-tree! dir)))))
+
 (deftest with-retries-accepts-a-custom-predicate
   (let [calls (atom 0)]
     (is (thrown? java.nio.file.NoSuchFileException
