@@ -54,7 +54,7 @@ workflows cannot receive a write token. The event workflow runs the local Node
 tests for changes to the workflows, scripts, and Claude configuration.
 
 All privileged execution uses scripts checked out from the repository's default
-branch, never the PR branch. The updater has only contents/read, pull-requests/read,
+branch, never the PR branch. The updater has only contents/read, pull-requests/write,
 and issues/write permissions and modifies only its own label. It does not request
 reviews, run models, change merge rules, or merge PRs.
 
