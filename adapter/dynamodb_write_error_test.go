@@ -22,13 +22,13 @@ func TestNormalizeDynamoWriteDispatchError(t *testing.T) {
 	}{
 		{"nil", nil, nil},
 		{"local conflict", store.NewWriteConflictError([]byte("k")), store.ErrWriteConflict},
-		{"typed forwarded conflict", kv.ForwardWriteConflictStatus(store.ErrWriteConflict), store.ErrWriteConflict},
-		{"wrapped typed forwarded conflict", errors.WithStack(kv.ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("desc = k")))), store.ErrWriteConflict},
-		{"unknown outcome with typed conflict detail", errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ForwardWriteConflictStatus(store.ErrWriteConflict)), nil},
+		{"typed forwarded conflict", kv.ForwardWriteConflictStatus(), store.ErrWriteConflict},
+		{"wrapped typed forwarded conflict", errors.WithStack(kv.ForwardWriteConflictStatus()), store.ErrWriteConflict},
+		{"unknown outcome with typed conflict detail", errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ForwardWriteConflictStatus()), nil},
 		{"unknown conflict", status.Error(codes.Unknown, "key: k: write conflict"), nil},
 		{"aborted without detail", status.Error(codes.Aborted, "key: k: write conflict"), nil},
 		{"local lock", kv.NewTxnLockedError([]byte("k")), kv.ErrTxnLocked},
-		{"typed forwarded lock", kv.ForwardTxnLockedStatus(kv.NewTxnLockedError([]byte("k"))), kv.ErrTxnLocked},
+		{"typed forwarded lock", kv.ForwardTxnLockedStatus(), kv.ErrTxnLocked},
 		{"unknown lock", status.Error(codes.Unknown, "key: k: txn locked"), nil},
 		{"wrapped aborted lock without detail", errors.WithStack(status.Error(codes.Aborted, "key: k (pending): txn locked")), nil},
 		{"plain text", errors.New("key: k: write conflict"), nil},
@@ -66,7 +66,7 @@ func (c *forwardedDynamoLockCoordinator) Dispatch(ctx context.Context, req *kv.O
 		if c.failure != nil {
 			return nil, c.failure
 		}
-		return nil, kv.ForwardTxnLockedStatus(kv.NewTxnLockedError([]byte("pending")))
+		return nil, kv.ForwardTxnLockedStatus()
 	}
 	return c.Coordinator.Dispatch(ctx, req)
 }
@@ -79,9 +79,9 @@ func TestDynamoDBRetriesForwardedSnapshotSealConflict(t *testing.T) {
 			defer st.Close()
 			schema := dedupItemTable()
 			seedDedupItem(t, st, schema, "1")
-			forwarded := kv.ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("!ddb|seal|pending")))
+			forwarded := kv.ForwardWriteConflictStatus()
 			if errors.Is(sentinel, kv.ErrTxnLocked) {
-				forwarded = kv.ForwardTxnLockedStatus(kv.NewTxnLockedError([]byte("!ddb|seal|pending")))
+				forwarded = kv.ForwardTxnLockedStatus()
 			}
 			coord := &forwardedDynamoLockCoordinator{
 				Coordinator: newOCCAdapterCoordinator(st),
@@ -103,7 +103,7 @@ func TestDynamoDBCreateTableRetriesForwardedConflict(t *testing.T) {
 	defer st.Close()
 	coord := &forwardedDynamoLockCoordinator{
 		Coordinator: newOCCAdapterCoordinator(st),
-		failure:     kv.ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("!ddb|meta|table|test"))),
+		failure:     kv.ForwardWriteConflictStatus(),
 	}
 	server := NewDynamoDBServer(nil, st, coord)
 	schema := dedupItemTable()

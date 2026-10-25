@@ -49,8 +49,8 @@ func (c *forwardedRootRaceCoordinator) Dispatch(
 	return c.inner.Dispatch(ctx, req)
 }
 
-func forwardedWriteConflict(key []byte) error {
-	wire := kv.ForwardWriteConflictStatus(store.NewWriteConflictError(key))
+func forwardedWriteConflict() error {
+	wire := kv.ForwardWriteConflictStatus()
 	return cerrors.Wrapf(wire, "leader forward failed after %d retries", 3)
 }
 
@@ -59,7 +59,7 @@ func TestServiceInitializeRootRetriesForwardedWriteConflict(t *testing.T) {
 	st := store.NewMVCCStore()
 	coord := &forwardedRootRaceCoordinator{
 		inner:   &testCoordinator{st: st},
-		wireErr: forwardedWriteConflict([]byte("!fs|ino|\x00\x00\x00\x00\x00\x00\x00\x01")),
+		wireErr: forwardedWriteConflict(),
 	}
 	svc, err := NewService(st, coord, WithChunkSize(testChunkSize))
 	require.NoError(t, err)
@@ -101,7 +101,7 @@ func TestIsWriteConflict(t *testing.T) {
 		{name: "typed conflict", err: store.NewWriteConflictError(conflictKey), want: true, wantRoot: true},
 		{name: "wrapped typed conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: true, wantRoot: true},
 		{name: "unknown attempt with conflict detail", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), want: false},
-		{name: "forwarded typed status", err: forwardedWriteConflict(conflictKey), wantRoot: true},
+		{name: "forwarded typed status", err: forwardedWriteConflict(), wantRoot: true},
 		{name: "forwarded aborted status without typed marker", err: status.Error(codes.Aborted, store.NewWriteConflictError(conflictKey).Error())},
 		{name: "forwarded other code", err: status.Error(codes.Unavailable, store.NewWriteConflictError(conflictKey).Error()), want: false},
 		{name: "status without key envelope", err: status.Error(codes.Unknown, "write conflict"), want: false},
@@ -117,8 +117,7 @@ func TestIsWriteConflict(t *testing.T) {
 }
 
 func TestRootInitializationRechecksAfterUncertainForwardedConflict(t *testing.T) {
-	key := []byte("!fs|ino|root")
-	err := errors.Join(kv.ErrTransactionOutcomeUnknown, forwardedWriteConflict(key))
+	err := errors.Join(kv.ErrTransactionOutcomeUnknown, forwardedWriteConflict())
 	require.False(t, IsWriteConflict(err))
 	require.False(t, isRootInitializationConflict(err))
 }

@@ -343,9 +343,8 @@ func extractRedisInternalUserKey(key []byte) []byte {
 		}
 	}
 	// Post-migration streams: both meta and entry keys reverse-map to the
-	// logical user key so coordinator routing (doGetAt) and retryable-error
-	// normalization (normalizeRetryableRedisTxnKey) resolve to the correct
-	// stream. KEYS/SCAN visibility is separately gated by
+	// logical user key so coordinator routing (doGetAt) resolves to the
+	// correct stream. KEYS/SCAN visibility is separately gated by
 	// streamWideColumnVisibleUserKey which returns (nil, true) for entry
 	// keys, so this path is never reached from the key-enumeration code.
 	// redisTTLPrefix is internal-only.

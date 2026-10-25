@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"math/rand/v2"
@@ -84,7 +83,7 @@ const (
 
 // parseWireRedisTxnErr restores transaction error typing after an internal
 // leader redirect crosses gRPC. Structured status details preserve the
-// rejection kind and key without interpreting diagnostic messages.
+// rejection kind without interpreting diagnostic messages or transporting keys.
 // Wire write conflicts are not generally retryable: a lost forwarding response
 // can turn an already-applied write into a later self-conflict. Reuse-aware
 // callers explicitly normalize them before retrying; all other callers return
@@ -95,19 +94,9 @@ func parseWireRedisTxnErr(err error) error {
 		return nil
 	}
 	if kv.IsForwardWriteConflict(err) {
-		if key, ok := kv.ForwardWriteConflictKey(err); ok {
-			return errors.WithStack(store.NewWriteConflictError(normalizeRetryableRedisTxnKey(key)))
-		}
 		return errors.WithStack(store.ErrWriteConflict)
 	}
 	if kv.IsForwardTxnLocked(err) {
-		if key, detail, ok := kv.ForwardTxnLockedDetails(err); ok {
-			logicalKey := normalizeRetryableRedisTxnKey(key)
-			if detail != "" {
-				return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
-			}
-			return errors.WithStack(kv.NewTxnLockedError(logicalKey))
-		}
 		return errors.WithStack(kv.ErrTxnLocked)
 	}
 	if kv.IsForwardComposed1Violation(err) {
@@ -196,94 +185,11 @@ func normalizeRetryableRedisTxnErr(err error) error {
 	if parsed := parseWireRedisTxnErr(err); parsed != nil {
 		return parsed
 	}
-	if key, detail, ok := kv.TxnLockedDetails(err); ok {
-		logicalKey := normalizeRetryableRedisTxnKey(key)
-		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
-			return err
-		}
-		if detail != "" {
-			return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
-		}
-		return errors.WithStack(kv.NewTxnLockedError(logicalKey))
+	if errors.Is(err, kv.ErrTxnLocked) {
+		return errors.WithStack(kv.ErrTxnLocked)
 	}
-	if key, ok := store.WriteConflictKey(err); ok {
-		logicalKey := normalizeRetryableRedisTxnKey(key)
-		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
-			return err
-		}
-		return errors.WithStack(store.NewWriteConflictError(logicalKey))
+	if errors.Is(err, store.ErrWriteConflict) {
+		return errors.WithStack(store.ErrWriteConflict)
 	}
 	return err
-}
-
-// normalizeZSetWideColumnKey extracts the logical user key from a ZSet wide-column key.
-func normalizeZSetWideColumnKey(key []byte) ([]byte, bool) {
-	if store.IsZSetMetaDeltaKey(key) {
-		return store.ExtractZSetUserKeyFromDelta(key), true
-	}
-	if store.IsZSetMetaKey(key) {
-		return store.ExtractZSetUserKeyFromMeta(key), true
-	}
-	if store.IsZSetMemberKey(key) {
-		return store.ExtractZSetUserKeyFromMember(key), true
-	}
-	if store.IsZSetScoreKey(key) {
-		return store.ExtractZSetUserKeyFromScore(key), true
-	}
-	return nil, false
-}
-
-// normalizeWideColumnKey extracts the logical user key from any wide-column
-// internal key (hash/set/zset meta, delta, field, member, or score index).
-// Returns (key, true) when the input is a recognised wide-column key, (nil, false) otherwise.
-// Delta prefixes are checked before meta prefixes because delta keys share the
-// meta prefix as a leading substring.
-func normalizeWideColumnKey(key []byte) ([]byte, bool) {
-	if store.IsHashMetaDeltaKey(key) {
-		return store.ExtractHashUserKeyFromDelta(key), true
-	}
-	if store.IsHashMetaKey(key) {
-		return store.ExtractHashUserKeyFromMeta(key), true
-	}
-	if store.IsHashFieldKey(key) {
-		return store.ExtractHashUserKeyFromField(key), true
-	}
-	if store.IsSetMetaDeltaKey(key) {
-		return store.ExtractSetUserKeyFromDelta(key), true
-	}
-	if store.IsSetMetaKey(key) {
-		return store.ExtractSetUserKeyFromMeta(key), true
-	}
-	if store.IsSetMemberKey(key) {
-		return store.ExtractSetUserKeyFromMember(key), true
-	}
-	return normalizeZSetWideColumnKey(key)
-}
-
-func normalizeRetryableRedisTxnKey(key []byte) []byte {
-	if userKey := kv.ExtractTxnUserKey(key); userKey != nil {
-		key = userKey
-	}
-	if userKey := redisTxnWideFenceUserKey(key); userKey != nil {
-		return userKey
-	}
-	if store.IsListMetaDeltaKey(key) {
-		return store.ExtractListUserKeyFromDelta(key)
-	}
-	if store.IsListClaimKey(key) {
-		return store.ExtractListUserKeyFromClaim(key)
-	}
-	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
-		return store.ExtractListUserKey(key)
-	}
-	if wideKey, ok := normalizeWideColumnKey(key); ok {
-		return wideKey
-	}
-	if bytes.HasPrefix(key, []byte(redisTTLPrefix)) {
-		return bytes.TrimPrefix(key, []byte(redisTTLPrefix))
-	}
-	if userKey := extractRedisInternalUserKey(key); userKey != nil {
-		return userKey
-	}
-	return key
 }

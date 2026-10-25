@@ -2,7 +2,6 @@ package kv
 
 import (
 	"bytes"
-	"fmt"
 
 	"github.com/cockroachdb/errors"
 )
@@ -72,10 +71,7 @@ func TxnLockedDetails(err error) ([]byte, string, bool) {
 }
 
 func (e *TxnLockedError) Error() string {
-	if e.detail != "" {
-		return fmt.Sprintf("key: %s (%s): %v", string(e.key), e.detail, ErrTxnLocked)
-	}
-	return fmt.Sprintf("key: %s: %v", string(e.key), ErrTxnLocked)
+	return ErrTxnLocked.Error()
 }
 
 func (e *TxnLockedError) Unwrap() error {

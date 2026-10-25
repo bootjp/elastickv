@@ -273,10 +273,10 @@ func forwardCommitError(err error) error {
 		return errors.WithStack(err)
 	}
 	if errors.Is(err, store.ErrWriteConflict) {
-		return errors.WithStack(kv.ForwardWriteConflictStatus(err))
+		return errors.WithStack(kv.ForwardWriteConflictStatus())
 	}
 	if errors.Is(err, kv.ErrTxnLocked) {
-		return errors.WithStack(kv.ForwardTxnLockedStatus(err))
+		return errors.WithStack(kv.ForwardTxnLockedStatus())
 	}
 	if errors.Is(err, kv.ErrComposed1Violation) || errors.Is(err, kv.ErrComposed1VersionGCd) {
 		return errors.WithStack(kv.ForwardComposed1Status(err))

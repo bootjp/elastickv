@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
@@ -115,9 +116,13 @@ func TestInternalForwardConflictStatusSurvivesGRPC(t *testing.T) {
 			}}})
 			require.Error(t, err)
 			require.True(t, kv.IsForwardWriteConflict(err), "gRPC must preserve structured rejection: %v", err)
-			key, ok := kv.ForwardWriteConflictKey(err)
-			require.True(t, ok)
-			require.Equal(t, tc.key, key)
+			require.NotContains(t, err.Error(), string(tc.key))
+			require.Contains(t, status.Convert(err).Message(), store.ErrWriteConflict.Error())
+			for _, detail := range status.Convert(err).Details() {
+				info, ok := detail.(*errdetails.ErrorInfo)
+				require.True(t, ok)
+				require.Empty(t, info.GetMetadata())
+			}
 		})
 	}
 }
@@ -145,10 +150,13 @@ func TestInternalForwardLockStatusSurvivesGRPC(t *testing.T) {
 	}}})
 	require.Error(t, err)
 	require.True(t, kv.IsForwardTxnLocked(err), "gRPC must preserve structured lock rejection: %v", err)
-	forwardedKey, detail, ok := kv.ForwardTxnLockedDetails(err)
-	require.True(t, ok)
-	require.Equal(t, key, forwardedKey)
-	require.Equal(t, "owner \uFFFD", detail)
+	require.NotContains(t, err.Error(), string(key))
+	require.Contains(t, status.Convert(err).Message(), kv.ErrTxnLocked.Error())
+	for _, detail := range status.Convert(err).Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		require.True(t, ok)
+		require.Empty(t, info.GetMetadata())
+	}
 }
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {

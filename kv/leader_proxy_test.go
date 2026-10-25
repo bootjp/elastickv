@@ -443,10 +443,9 @@ func TestLeaderProxy_LostForwardResponseDoesNotReplay(t *testing.T) {
 func TestForwardDecisionEvidence(t *testing.T) {
 	t.Parallel()
 
-	rejected := ForwardWriteConflictStatus(store.ErrWriteConflict)
+	rejected := ForwardWriteConflictStatus()
 	require.True(t, isDefinitiveForwardConflict(rejected))
-	require.True(t, isDefinitiveForwardConflict(errors.WithStack(ForwardWriteConflictStatus(
-		store.NewWriteConflictError([]byte("desc = x"))))))
+	require.True(t, isDefinitiveForwardConflict(errors.WithStack(ForwardWriteConflictStatus())))
 	require.False(t, isDefinitiveForwardConflict(status.Error(codes.Aborted, store.ErrWriteConflict.Error())))
 	require.False(t, isDefinitiveForwardNotLeader(rejected))
 	require.False(t, isDefinitiveForwardConflict(status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())))
@@ -471,7 +470,7 @@ func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	svc := &fakeInternal{err: ForwardWriteConflictStatus(store.ErrWriteConflict)}
+	svc := &fakeInternal{err: ForwardWriteConflictStatus()}
 	srv := grpc.NewServer()
 	pb.RegisterInternalServer(srv, svc)
 	go func() { _ = srv.Serve(lis) }()
@@ -493,7 +492,7 @@ func TestLeaderProxy_SinglePhaseConflictUsesStructuredStatus(t *testing.T) {
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	svc := &fakeInternal{err: ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("desc = not leader")))}
+	svc := &fakeInternal{err: ForwardWriteConflictStatus()}
 	srv := grpc.NewServer()
 	pb.RegisterInternalServer(srv, svc)
 	go func() { _ = srv.Serve(lis) }()
@@ -516,7 +515,7 @@ func TestLeaderProxy_SinglePhaseLockUsesStructuredStatus(t *testing.T) {
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	svc := &fakeInternal{err: ForwardTxnLockedStatus(NewTxnLockedError([]byte("desc = not leader")))}
+	svc := &fakeInternal{err: ForwardTxnLockedStatus()}
 	srv := grpc.NewServer()
 	pb.RegisterInternalServer(srv, svc)
 	go func() { _ = srv.Serve(lis) }()
@@ -536,7 +535,7 @@ func TestLeaderProxy_SinglePhaseLockUsesStructuredStatus(t *testing.T) {
 
 func TestClassifyForwardConflictByPhase(t *testing.T) {
 	t.Parallel()
-	proof := ForwardWriteConflictStatus(store.ErrWriteConflict)
+	proof := ForwardWriteConflictStatus()
 	for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE} {
 		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
 		require.ErrorIs(t, err, store.ErrWriteConflict)
@@ -562,7 +561,7 @@ func TestClassifyForwardLockAndRouteByPhase(t *testing.T) {
 		proof  error
 		target error
 	}{
-		{name: "lock", proof: ForwardTxnLockedStatus(NewTxnLockedError([]byte("key"))), target: ErrTxnLocked},
+		{name: "lock", proof: ForwardTxnLockedStatus(), target: ErrTxnLocked},
 		{name: "route", proof: ForwardComposed1Status(ErrComposed1Violation), target: ErrComposed1Violation},
 		{name: "route gc", proof: ForwardComposed1Status(ErrComposed1VersionGCd), target: ErrComposed1VersionGCd},
 	} {
