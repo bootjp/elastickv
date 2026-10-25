@@ -32,3 +32,23 @@ Cover resolved old versus original-HEAD findings, unresolved/unknown threads,
 both reviewers, pagination, API failure, and resolution changing around a write.
 Replay #1337 and #1335 evidence to establish that the former can approve while
 the latter cannot approve with an unresolved mapped finding.
+
+Five regressions fail before implementation; all 98 tests pass afterward.
+Actual #1337 REST and GraphQL evidence changes from rejected to approved, while
+removing the resolved root IDs still rejects it. Missing resolution, mismatched
+root IDs, bad pagination, API failure, and reopening during writes fail closed.
+Actionlint and git diff --check pass. The existing review/comment events and
+hourly/manual reconciliation read current resolution state; thread resolution
+alone is not assumed to trigger an Actions workflow.
+
+## Self-review
+
+1. Data loss: only label evidence changes; unrelated labels are preserved.
+2. Concurrency: resolution is re-read during the post-write evidence check;
+   reopening in that interval revokes approval. Event delivery remains asynchronous.
+3. Performance: GraphQL is queried only for trusted remapped root comments;
+   threads are paginated with only root ID and resolution fields requested.
+4. Consistency: original-HEAD findings always veto; resolved old findings only
+   stop vetoing and cannot establish approval without a fresh clean HEAD review.
+5. Coverage: both bots, missing state, root ID mapping, pagination, API errors,
+   actual evidence replay, and post-write reopening are verified.
