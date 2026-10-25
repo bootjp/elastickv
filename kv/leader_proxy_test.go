@@ -510,6 +510,30 @@ func TestLeaderProxy_SinglePhaseConflictUsesStructuredStatus(t *testing.T) {
 	require.Equal(t, 1, svc.callCount())
 }
 
+func TestLeaderProxy_SinglePhaseLockUsesStructuredStatus(t *testing.T) {
+	t.Parallel()
+
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	svc := &fakeInternal{err: ForwardTxnLockedStatus(NewTxnLockedError([]byte("desc = not leader")))}
+	srv := grpc.NewServer()
+	pb.RegisterInternalServer(srv, svc)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() {
+		srv.Stop()
+		_ = lis.Close()
+	})
+
+	p := NewLeaderProxyWithEngine(&stubFollowerEngine{leaderAddr: lis.Addr().String()})
+	t.Cleanup(func() { _ = p.connCache.Close() })
+	_, err = p.Commit(context.Background(), []*pb.Request{{IsTxn: false, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, ErrTxnLocked)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.True(t, IsForwardTxnLocked(err))
+	require.Equal(t, 1, svc.callCount())
+}
+
 func TestClassifyForwardConflictByPhase(t *testing.T) {
 	t.Parallel()
 	proof := ForwardWriteConflictStatus(store.ErrWriteConflict)
@@ -528,4 +552,32 @@ func TestClassifyForwardConflictByPhase(t *testing.T) {
 	legacy := status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())
 	err := classifyForwardRPCError(legacy, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+}
+
+func TestClassifyForwardLockAndRouteByPhase(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name   string
+		proof  error
+		target error
+	}{
+		{name: "lock", proof: ForwardTxnLockedStatus(NewTxnLockedError([]byte("key"))), target: ErrTxnLocked},
+		{name: "route", proof: ForwardComposed1Status(ErrComposed1Violation), target: ErrComposed1Violation},
+		{name: "route gc", proof: ForwardComposed1Status(ErrComposed1VersionGCd), target: ErrComposed1VersionGCd},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE} {
+				err := classifyForwardRPCError(tc.proof, []*pb.Request{{IsTxn: true, Phase: phase}})
+				require.ErrorIs(t, err, tc.target)
+				require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+				require.True(t, isTerminalForwardError(err))
+			}
+			for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
+				err := classifyForwardRPCError(tc.proof, []*pb.Request{{IsTxn: true, Phase: phase}})
+				require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+			}
+		})
+	}
 }

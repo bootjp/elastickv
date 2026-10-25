@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -438,7 +439,7 @@ func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 	t.Parallel()
 
-	wireErr := errors.WithStack(kv.ForwardTxnLockedStatus(
+	wireErr := fmt.Errorf("%w: %w", kv.ErrTxnLocked, kv.ForwardTxnLockedStatus(
 		kv.NewTxnLockedError(store.ListItemKey([]byte("list"), 1))))
 	attempts := 0
 	srv := &RedisServer{}

@@ -249,7 +249,11 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 }
 
 func isTerminalForwardError(err error) bool {
-	return errors.Is(err, ErrTransactionOutcomeUnknown) || errors.Is(err, store.ErrWriteConflict)
+	return errors.Is(err, ErrTransactionOutcomeUnknown) ||
+		errors.Is(err, store.ErrWriteConflict) ||
+		errors.Is(err, ErrTxnLocked) ||
+		errors.Is(err, ErrComposed1Violation) ||
+		errors.Is(err, ErrComposed1VersionGCd)
 }
 
 func (p *LeaderProxy) forwardFailureDecision(err error, requestID uint64) (leaveCycle bool, done bool) {
@@ -317,9 +321,17 @@ func classifyForwardRPCError(err error, reqs []*pb.Request) error {
 		return errors.WithStack(err)
 	}
 	if len(reqs) == 1 && reqs[0] != nil &&
-		(reqs[0].Phase == pb.Phase_NONE || reqs[0].Phase == pb.Phase_PREPARE) &&
-		isDefinitiveForwardConflict(err) {
-		return fmt.Errorf("%w: %w", store.ErrWriteConflict, err)
+		(reqs[0].Phase == pb.Phase_NONE || reqs[0].Phase == pb.Phase_PREPARE) {
+		switch {
+		case isDefinitiveForwardConflict(err):
+			return fmt.Errorf("%w: %w", store.ErrWriteConflict, err)
+		case IsForwardTxnLocked(err):
+			return fmt.Errorf("%w: %w", ErrTxnLocked, err)
+		case IsForwardComposed1Violation(err):
+			return fmt.Errorf("%w: %w", ErrComposed1Violation, err)
+		case IsForwardComposed1VersionGCd(err):
+			return fmt.Errorf("%w: %w", ErrComposed1VersionGCd, err)
+		}
 	}
 	return fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 }
