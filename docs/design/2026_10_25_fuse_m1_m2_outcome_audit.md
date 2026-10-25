@@ -10,7 +10,7 @@ FUSE test cannot exercise the new journal until M3 routes mutations through it.
 | --- | --- | --- |
 | Terminal committed record and every participant receipt is confirmed by its current leader | Committed | Return the stored result. |
 | Terminal rejected/cancelled record | Aborted | Return the stored semantic result or cancellation. |
-| A different generation is durably visible after a successful transaction on the record key | Aborted for the old generation | A new generation may be admitted. |
+| A different generation is durably visible after a successful transaction on the record key | Aborted for the old generation | A new generation may be admitted only after an authoritative decision resolver exists; `AdvanceGeneration` currently fails closed. |
 | Pending or absent record, timeout, lost response, unsupported exact-version RPC, unavailable participant, or unverified effect | Unknown | Preserve the attempt identity; resolve or return an unknown error. |
 
 All publication attempts mutate both the record and session rows, even when

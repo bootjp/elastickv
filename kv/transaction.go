@@ -168,6 +168,10 @@ func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb
 	result, err := proposer.Propose(ctx, b)
 	if err != nil {
 		recordProposalFailure(proposalObserver)
+		if errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+			// The etcd engine returns these before appending the entry.
+			return 0, nil, errors.WithStack(err)
+		}
 		// Once Propose has been called, a timeout or leadership change does
 		// not prove that the entry was absent from the replicated log.
 		return 0, nil, fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
