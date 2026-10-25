@@ -68,7 +68,7 @@ function evaluateApproval({ head, comments = [], reviews = [], inlineComments = 
     return { approved: false, reason: 'Current-HEAD review requests changes or was dismissed' };
   }
   if (inlineComments.some(comment => reviewerOf(comment) && !comment.in_reply_to_id &&
-      (comment.original_commit_id || comment.commit_id) === head)) {
+      (comment.commit_id === head || comment.original_commit_id === head))) {
     return { approved: false, reason: 'Current-HEAD inline findings exist' };
   }
 

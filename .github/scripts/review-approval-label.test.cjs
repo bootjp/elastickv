@@ -84,7 +84,10 @@ const cases = [
   ['CRLF result marker', { comments: [comment('codex', null, { body: `Summary\r\n${comment('codex').body}\r\n` })] }, true],
   ['malformed result vetoes other clean reviewer', { comments: [comment('codex'), comment('claude', null, { body: '<!-- agent-review-result:v1 null -->' })] }, false],
   ['inline finding vetoes clean summary', { comments: [comment('codex')], inlineComments: [inline()] }, false],
-  ['old inline finding moved to new diff is not new evidence', { comments: [comment('codex')], inlineComments: [inline({ original_commit_id: OLD })] }, true],
+  ['old inline finding mapped to HEAD vetoes clean summary', { comments: [comment('codex')], inlineComments: [inline({ original_commit_id: OLD })] }, false],
+  ['Codex finding mapped to HEAD vetoes its clean summary', { comments: [comment('codex')], inlineComments: [inline({ user: USERS.codex, original_commit_id: OLD })] }, false],
+  ['wholly stale inline finding permits clean summary', { comments: [comment('codex')], inlineComments: [inline({ commit_id: OLD, original_commit_id: OLD })] }, true],
+  ['original HEAD finding vetoes even with different mapped commit', { comments: [comment('codex')], inlineComments: [inline({ commit_id: OLD })] }, false],
   ['inline replies are not new findings', { comments: [comment('codex')], inlineComments: [inline({ in_reply_to_id: 19 })] }, true],
   ['human inline comment is outside this label', { comments: [comment('codex')], inlineComments: [inline({ user: { login: 'bootjp', id: 1306365, type: 'User' } })] }, true],
   ['change request vetoes clean summary', { comments: [comment('codex')], reviews: [review({ state: 'CHANGES_REQUESTED' })] }, false],
@@ -282,6 +285,15 @@ test('late stale review does not restore a label vetoed by current-HEAD findings
     comment('claude', codeResult({ has_any_findings: true })),
     comment('claude', codeResult({ commit_sha: OLD }), { id: 2, updated_at: '2026-10-24T11:00:00Z' }),
   ] });
+  assert.equal((await reconcilePullRequest(args)).approved, false);
+  assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
+  assert.equal(state.calls.some(([name]) => name === 'addLabels'), false);
+});
+
+test('remapped root finding revokes existing approval despite clean summary', async () => {
+  const { state, args } = fakeGitHub({ labeled: true,
+    inlineComments: [inline({ user: USERS.codex, original_commit_id: OLD })],
+  });
   assert.equal((await reconcilePullRequest(args)).approved, false);
   assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
   assert.equal(state.calls.some(([name]) => name === 'addLabels'), false);
