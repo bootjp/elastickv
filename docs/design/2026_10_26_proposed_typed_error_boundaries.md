@@ -39,7 +39,7 @@ PR #1337 contains a narrower conflict and lock correction; its code is not the c
    `Error()` is diagnostic prose and is not a source of control-flow information.
 4. Transaction outcome is independent of error reason.
    A conflict, lock, route change, or leadership loss does not by itself prove whether an already submitted transaction committed.
-5. The internal forwarding seam transmits a typed decision detail containing only the schema version, reason, and proof class.
+5. The internal forwarding seam transmits a typed decision detail containing only the schema version, request phase, reason, and decision class.
    The gRPC status code and its message are presentation fields; neither is sufficient evidence for a retry.
 6. Each public adapter maps a validated internal decision to its own protocol response.
    The public response contains no physical key, transaction lock owner, route bound, or raw wrapped internal error.
@@ -80,12 +80,12 @@ For example, a conflict error may contain a private physical key and unwrap to `
 Its `Error()` returns a fixed category message.
 Internal structured logs may attach a bounded key family, shard ID, and request correlation ID under the repository's logging policy; a raw key is not implicitly logged by formatting the error.
 
-The coordinator reports a separate **decision class** after considering admission, request phase, proposal state, and durable evidence.
+The coordinator reports a separate **decision class for the logical operation**, after considering admission, request phase, proposal state, earlier attempts with the same identity, and durable evidence.
 The classes are:
 
 | Class | Meaning | Retry consequence |
 | --- | --- | --- |
-| Rejected before submission | The receiving leader did not submit the mutation. | A new attempt may be made after routing or leadership refresh. |
+| Rejected before submission | No attempt for this logical operation could have reached submission. | A new attempt may be made after routing or leadership refresh. |
 | Definitively aborted | The attempted transaction is proven not to have committed. | Retry is permitted only under the operation's own replay and ordering contract. |
 | Outcome unknown | The request may have been submitted or committed, and no authoritative terminal result is available. | Do not replay a non-idempotent effect; preserve identity and resolve, or surface an unknown outcome. |
 
@@ -116,25 +116,42 @@ It must not encode the decision by appending words to a message.
 It constructs the wire decision from its own verified admission and transaction result.
 It must not pass through a nested gRPC status supplied by another module as if that status were its own proof.
 
-A dedicated protobuf status detail should carry a schema version, a closed reason enum, and a closed decision-class enum.
-The receiver compares the detail with the request phase and accepts it only from the authenticated internal Forward call to the expected peer.
+A dedicated protobuf status detail should carry a schema version, a closed phase enum, a closed reason enum, and a closed decision-class enum.
+The phase is the single phase of the authenticated `ForwardRequest`: `PREPARE`, `COMMIT`, `ABORT`, or `ONE_PHASE_APPLY` for a request with `Phase_NONE` (including a one-phase transaction).
+The receiver derives the expected phase from the request it sent, not from the returned status.
+If a forwarded batch mixes phases or logical operation identities, the producer cannot issue a definitive detail for that batch.
+The receiver accepts a detail only from the authenticated internal Forward call to the expected peer and only when its phase equals that expected phase.
 The detail has no key, key encoding, lock text, route bounds, or arbitrary message field.
 The status message is a fixed safe phrase selected from the reason enum.
 The status code is checked for consistency with the detail, but the code alone never establishes the decision.
 Enum numbers are never reused; an added reason receives a new number and an explicit decision mapping.
 
-| Reason | Permitted decision | Additional check |
-| --- | --- | --- |
-| Write conflict or transaction lock | Definitively aborted, or outcome unknown while another participant remains unresolved | A one-phase rejection is terminal; a multi-group PREPARE rejection needs coordinator resolution. COMMIT and ABORT phases cannot inherit a prewrite proof for the whole transaction. |
-| Route fenced or ownership changed | Rejected before submission or definitively aborted | Confirm which phase was reached and that no earlier participant decision remains unresolved. |
-| Not leader before admission | Rejected before submission | The handler must generate this before timestamp admission or proposal. |
-| Leadership lost, deadline, transport failure, missing participant receipt | Outcome unknown | Resolve through durable operation or transaction evidence before any replay. |
+The request payload is authoritative for caller intent; the coordinator's admission, proposal, and durable transaction state is authoritative for the phase reached and the decision.
+Before producing a detail, the leader reconciles these sources using the logical operation identity and any earlier attempts.
+It emits `REJECTED_BEFORE_SUBMISSION` only when it can rule out every earlier live attempt with that identity.
+It emits `DEFINITIVELY_ABORTED` only from a terminal one-phase apply rejection or a durable transaction abort decision with prepared participants resolved.
+If the sources disagree, an earlier attempt cannot be ruled out, or required evidence is unavailable, it emits `OUTCOME_UNKNOWN` without a definitive proof.
+
+The following is the complete set of allowed reason and decision pairs for each phase.
+`Conflict` covers write conflict and transaction lock; `Fence` covers route fencing and ownership change; `No leader` means rejection before admission; `Interrupted` covers leadership loss, deadline, transport loss, or a missing receipt; `Aborted` means a verified terminal abort decision.
+
+| Request phase | Reason | Allowed decision | Required evidence |
+| --- | --- | --- | --- |
+| ONE_PHASE_APPLY | No leader, Fence | Rejected before submission | Admission did not occur, and no earlier attempt with this identity can be live. |
+| ONE_PHASE_APPLY | Conflict, Fence | Definitively aborted | Terminal apply result proves no effect for the logical operation. |
+| ONE_PHASE_APPLY | Conflict, Fence, No leader, Interrupted | Outcome unknown | Submission or an earlier attempt cannot be excluded. |
+| PREPARE, COMMIT, ABORT | Conflict, Fence, No leader, Interrupted | Outcome unknown | A failed RPC or participant result does not settle the logical transaction. |
+| PREPARE, COMMIT, ABORT | Aborted | Definitively aborted | Durable abort decision and participant resolution rule out commit. |
+
+No other pair is defined in version 1.
+In particular, a pre-admission refusal of COMMIT or ABORT does not prove that the transaction was never submitted.
+The producer must not attach a definitive detail to an unmatched or mixed-phase batch; the receiver treats any undefined pair as an unknown outcome.
 
 The same cause can require a different decision when the request reaches a different phase:
 
 | Observed sequence | Decision exposed by Forward | Reason |
 | --- | --- | --- |
-| Leader refuses the request before timestamp admission | Rejected before submission | No mutation was proposed. |
+| Leader refuses the first one-phase attempt before timestamp admission, with no earlier live attempt | Rejected before submission | No mutation was proposed for the logical operation. |
 | One-phase apply returns a known OCC rejection | Definitively aborted | The leader has the terminal apply result for this attempt. |
 | PREPARE rejects while another group may hold an intent | Outcome unknown until coordinator resolution | A participant rejection does not by itself establish the whole transaction's terminal decision. |
 | COMMIT reply is lost after the primary decision | Outcome unknown until durable resolution | The effect may have committed even if the caller saw a transport error. |
@@ -159,13 +176,37 @@ The adapter is the final error adapter at the public seam.
 It selects a stable public code and a fixed or explicitly request-derived message from the validated reason and decision.
 It does not serialize `err.Error()` from an internal error by default.
 
-| Public surface | Projection rule |
-| --- | --- |
-| Redis RESP | Choose a Redis error category from typed reason and outcome; preserve the distinction between retryable rejection and indeterminate write. Do not reconstruct a user key from a physical key. |
-| DynamoDB HTTP | Choose the documented DynamoDB error type and retry behavior from typed reason and outcome. Do not include the storage key or the internal gRPC message in the response body. |
-| S3 and SQS HTTP | Translate the same decision through each protocol's error vocabulary. Preserve indeterminate writes instead of reporting a definite application failure. |
-| Public gRPC | Emit its own public status detail and fixed message. Internal Forward details are not copied to a public service response. |
-| FUSE | Map typed decisions to the operation's specified `errno`. A definitive conflict may be retried within the bounded filesystem operation; an unknown mutation outcome follows the journal's resolution and sticky-error rules. |
+The adapter first projects the validated pair to one of three public failure classes.
+The reason selects a category within a class; it cannot strengthen the decision.
+
+| Validated decision and reason | Public failure class | Replay rule |
+| --- | --- | --- |
+| Rejected before submission, No leader or Fence | Not admitted | Refresh routing and retry only when the logical operation identity remains safe. |
+| Definitively aborted, Conflict or Fence on ONE_PHASE_APPLY; Aborted on PREPARE, COMMIT, or ABORT | Proven noncommit | Retry only under the operation's replay and ordering contract. |
+| Outcome unknown, any allowed reason | Indeterminate | Preserve identity and resolve; never start a fresh non-idempotent effect. |
+
+The following table specifies the proposed wire response for each class.
+Messages are fixed literals; response writers must not append an internal error or key.
+For an adapter with multiple operation families, its public type may vary only as explicitly stated below.
+
+| Surface | Not admitted | Proven noncommit | Indeterminate |
+| --- | --- | --- | --- |
+| Redis RESP | `-TRYAGAIN route unavailable` | `-TRYAGAIN transaction aborted` | `-ERR operation outcome unknown` |
+| DynamoDB HTTP | `503 ServiceUnavailable`, `Service unavailable` | `400 TransactionConflictException`, `Transaction conflict` for a single item; `400 TransactionCanceledException`, `Transaction canceled` for a transaction | `409 OperationOutcomeUnknown`, `Operation outcome unknown` |
+| S3 HTTP | `503 ServiceUnavailable`, `Service unavailable` | `409 OperationAborted`, `Operation aborted` | `409 OperationOutcomeUnknown`, `Operation outcome unknown` |
+| SQS HTTP | `503 ServiceUnavailable`, `Service unavailable` | `503 ServiceUnavailable`, `Operation aborted` | `409 OperationOutcomeUnknown`, `Operation outcome unknown` |
+| Public gRPC | `UNAVAILABLE`, `Route unavailable` | `ABORTED`, `Operation aborted` | `UNKNOWN`, `Operation outcome unknown` |
+| FUSE mutation | `ENOTCONN` for known disconnection; otherwise bounded retry followed by `EBUSY` | Bounded conflict retry followed by `EBUSY`; `ETIMEDOUT` only for a proven noncommit deadline | Journal resolution within its budget, then sticky `EIO` |
+
+Redis `TRYAGAIN`, HTTP 503, and public gRPC `UNAVAILABLE` are retry hints, not unconditional permission to replay.
+Only the typed decision and the operation's identity contract authorize replay.
+For FUSE, the operation's existing journal and deadline rules take precedence over a generic code; this row does not convert a route failure into a proven conflict.
+The public gRPC service creates a separate public detail with the failure class and no internal Forward detail.
+
+`OperationOutcomeUnknown` is a proposed extension error type for the DynamoDB, S3, and SQS compatible surfaces, not a claim that it is a native AWS error.
+Before enabling it, test the actual SDKs used by clients for parsing, automatic retry, and exposure of this type; if a client cannot preserve the indeterminate outcome, that protocol needs a versioned extension or another explicit result channel.
+The DynamoDB conflict types and S3 `OperationAborted` match their documented error vocabularies: [DynamoDB transaction APIs](https://docs.aws.amazon.com/amazondynamodb/latest/developerguide/transaction-apis.html), [S3 error responses](https://docs.aws.amazon.com/AmazonS3/latest/developerguide/ErrorResponses.html).
+Each adapter must test its response envelope as well as its code and message.
 
 The FUSE operation outcome and durability rules remain those of `2026_10_25_partial_fuse_conflict_semantics.md`.
 This proposal supplies an error classification seam; it does not make a mutation replayable or change the result of `fsync`.
