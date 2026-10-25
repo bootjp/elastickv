@@ -219,9 +219,12 @@ func testSnapshotSealRaftLeaderChange(t *testing.T, restamp bool) {
 	}
 	release()
 	conflict := sealRaftReceive(t, ctx, coord.result)
-	require.ErrorContains(t, conflict, "write conflict", "the delayed write must never be acknowledged")
+	require.True(t, kv.IsForwardWriteConflict(conflict), "the delayed write must receive a definitive forwarded conflict: %v", conflict)
+	require.NotContains(t, conflict.Error(), dynamoSealPrefix, "internal seal keys must stay behind the forwarding boundary")
 	if restamp {
-		require.ErrorContains(t, conflict, dynamoSealPrefix, "a fresh commit timestamp bypasses the global fence, so the seal itself must reject the stale read")
+		// A fresh commit timestamp bypasses the global apply-order fence;
+		// the stale read is still rejected by the seal.
+		require.Greater(t, coord.freshCommitTS, sealed)
 	}
 	require.NoError(t, sealRaftReceive(t, ctx, done))
 	releaseSecond()
