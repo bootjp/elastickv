@@ -180,6 +180,25 @@ func TestCoordinateDispatch_NonTransientErrorSurfacesImmediately(t *testing.T) {
 	require.EqualValues(t, 1, tx.commits.Load())
 }
 
+func TestCoordinateDispatch_PreservesUnknownOutcomeAfterCancellation(t *testing.T) {
+	t.Parallel()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	tx := &scriptedTransactional{
+		errs: map[uint64]error{0: fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, context.Canceled)},
+		onCommit: func(uint64) {
+			cancel()
+		},
+	}
+	c := newRetryCoordinate(tx)
+
+	_, err := c.Dispatch(ctx, &OperationGroup[OP]{
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("k"), Value: []byte("v")}},
+	})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.EqualValues(t, 1, tx.commits.Load())
+}
+
 func TestCoordinateDispatch_RefreshesStartTSOnRetry(t *testing.T) {
 	t.Parallel()
 

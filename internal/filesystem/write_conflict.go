@@ -3,6 +3,7 @@ package filesystem
 import (
 	"strings"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"google.golang.org/grpc/codes"
@@ -19,6 +20,9 @@ import (
 // mean the write was already applied.
 func IsWriteConflict(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return false
 	}
 	if errors.Is(err, store.ErrWriteConflict) {

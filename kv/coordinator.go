@@ -618,13 +618,12 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 		if lastErr == nil {
 			return lastResp, nil
 		}
-		// Caller-supplied ctx cancellation/deadline takes precedence
-		// over the error dispatchOnce returned (which may itself wrap
-		// context.Canceled / context.DeadlineExceeded propagated
-		// through boundedCtx). gRPC clients rely on the wrapped
-		// ctx.Err() to distinguish "I gave up" from "system was
-		// unavailable".
-		if err := ctx.Err(); err != nil {
+		// A canceled RPC may already have committed on the leader. Preserve
+		// the unknown decision instead of replacing it with ctx.Err().
+		// Caller cancellation takes precedence over ordinary dispatch
+		// failures, but it cannot turn an unknown commit into a claimed
+		// non-effect. The helper preserves that distinction.
+		if err := callerCancellationUnlessOutcomeUnknown(ctx, lastErr); err != nil {
 			return lastResp, errors.WithStack(err)
 		}
 		if !shouldRetryDispatch(lastErr) {
@@ -647,6 +646,16 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 			return lastResp, lastErr
 		}
 	}
+}
+
+func callerCancellationUnlessOutcomeUnknown(ctx context.Context, lastErr error) error {
+	if errors.Is(lastErr, ErrTransactionOutcomeUnknown) {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 // coordinatorAssignsTimestamps reports whether the caller expects the
@@ -826,6 +835,9 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 // was rejected on its merits".
 func isTransientLeaderError(err error) bool {
 	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrTransactionOutcomeUnknown) {
 		return false
 	}
 	if errors.Is(err, ErrLeaderNotFound) {

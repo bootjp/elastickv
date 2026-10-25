@@ -362,7 +362,7 @@ func TestLeaderProxy_CanceledForwardReleasesHalfOpenProbe(t *testing.T) {
 	time.AfterFunc(50*time.Millisecond, cancelCaller)
 	_, err := p.forward(callerCtx, proxyCtx, []*pb.Request{{IsTxn: false}}, 1)
 	cancelProxy()
-	require.ErrorIs(t, err, context.Canceled)
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 
 	require.NoError(t, p.forwardBreaker.allow(identity, 3, time.Now()))
 	require.True(t, p.forwardBreaker.owns(identity, 3))
@@ -410,7 +410,7 @@ func TestLeaderProxy_CanceledRecoveryOwnerStopsRetrying(t *testing.T) {
 	require.False(t, p.forwardBreaker.owns(identity, requestID))
 }
 
-func TestLeaderProxy_TransportFailureOwnerPerformsHalfOpenProbe(t *testing.T) {
+func TestLeaderProxy_LostForwardResponseDoesNotReplay(t *testing.T) {
 	t.Parallel()
 
 	var lc net.ListenConfig
@@ -434,7 +434,49 @@ func TestLeaderProxy_TransportFailureOwnerPerformsHalfOpenProbe(t *testing.T) {
 	t.Cleanup(func() { _ = p.connCache.Close() })
 
 	resp, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: false}})
+	require.Nil(t, resp)
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, svc.callCount())
+}
+
+func TestForwardDecisionEvidence(t *testing.T) {
+	t.Parallel()
+
+	rejected := status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())
+	require.True(t, isDefinitiveForwardConflict(rejected))
+	require.False(t, isDefinitiveForwardNotLeader(rejected))
+
+	beforeSubmit := status.Error(codes.Unknown, "not leader")
+	require.True(t, isDefinitiveForwardNotLeader(beforeSubmit))
+
+	for _, err := range []error{
+		status.Error(codes.Unknown, "raft engine: leadership lost"),
+		status.Error(codes.Unavailable, "not leader"),
+		status.Error(codes.DeadlineExceeded, "context deadline exceeded"),
+	} {
+		require.False(t, isDefinitiveForwardNotLeader(err))
+		require.False(t, isDefinitiveForwardConflict(err))
+	}
+}
+
+func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
+	t.Parallel()
+
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	require.Equal(t, uint64(77), resp.CommitIndex)
-	require.Equal(t, leaderProxyBreakerFailureThreshold+1, svc.callCount())
+	svc := &fakeInternal{err: status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())}
+	srv := grpc.NewServer()
+	pb.RegisterInternalServer(srv, svc)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() {
+		srv.Stop()
+		_ = lis.Close()
+	})
+
+	p := NewLeaderProxyWithEngine(&stubFollowerEngine{leaderAddr: lis.Addr().String()})
+	t.Cleanup(func() { _ = p.connCache.Close() })
+	_, err = p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, svc.callCount())
 }

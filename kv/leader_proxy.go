@@ -2,14 +2,19 @@ package kv
 
 import (
 	"context"
+	"fmt"
 	"io"
+	"strings"
 	"sync/atomic"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
+	"google.golang.org/grpc/status"
 )
 
 const leaderForwardTimeout = 5 * time.Second
@@ -24,6 +29,22 @@ const leaderProxyRetryBudget = 5 * time.Second
 
 // leaderProxyRetryInterval paces re-resolution of the leader address.
 const leaderProxyRetryInterval = 25 * time.Millisecond
+
+// ErrTransactionOutcomeUnknown means a forwarded mutation may have reached the
+// leader, but its result was lost. The same logical mutation must not be sent
+// again without a durable operation identity and an authoritative resolution.
+var ErrTransactionOutcomeUnknown = errors.New("transaction outcome unknown")
+
+// A Forward handler returns an OCC failure only after its FSM has rejected
+// the attempt. Keep that certificate distinct from a lost RPC response.
+func isDefinitiveForwardConflict(err error) bool {
+	st, ok := status.FromError(err)
+	if !ok || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
+		return false
+	}
+	return strings.HasPrefix(st.Message(), "key: ") &&
+		strings.HasSuffix(st.Message(), ": "+store.ErrWriteConflict.Error())
+}
 
 // LeaderProxy forwards transactional requests to the current raft leader when
 // the local node is not the leader.
@@ -222,6 +243,9 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 			return resp, nil, true
 		}
 		lastErr = err
+		if errors.Is(err, ErrTransactionOutcomeUnknown) {
+			return nil, err, true
+		}
 		if callerErr := callerCtx.Err(); callerErr != nil {
 			return nil, errors.WithStack(callerErr), true
 		}
@@ -283,13 +307,31 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 		Requests: reqs,
 	})
 	if err != nil {
-		return nil, p.recordForwardFailure(callerCtx, identity, requestID, err)
+		// Preserve the breaker accounting, but caller cancellation is not
+		// evidence that the remote mutation did not commit.
+		_ = p.recordForwardFailure(callerCtx, identity, requestID, err)
+		return nil, classifyForwardRPCError(err, reqs)
 	}
 	p.forwardBreaker.record(identity, requestID, nil, time.Now())
 	if !resp.Success {
-		return nil, ErrInvalidRequest
+		return nil, fmt.Errorf("%w: forward response lacks a decision", ErrTransactionOutcomeUnknown)
 	}
 	return &TransactionResponse{CommitIndex: resp.CommitIndex, CommitTS: resp.CommitTs}, nil
+}
+
+func classifyForwardRPCError(err error, reqs []*pb.Request) error {
+	if isDefinitiveForwardNotLeader(err) ||
+		(len(reqs) == 1 && reqs[0] != nil && reqs[0].Phase == pb.Phase_NONE && isDefinitiveForwardConflict(err)) {
+		return errors.WithStack(err)
+	}
+	return fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
+}
+
+func isDefinitiveForwardNotLeader(err error) bool {
+	st, ok := status.FromError(err)
+	// Internal.Forward returns this exact error only before it stamps or
+	// submits a mutation. A later "leadership lost" can follow submission.
+	return ok && st.Code() == codes.Unknown && st.Message() == "not leader"
 }
 
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {

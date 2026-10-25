@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -63,6 +64,7 @@ var errnoMappings = []struct {
 	err   error
 	errno syscall.Errno
 }{
+	{kv.ErrTransactionOutcomeUnknown, syscall.EIO},
 	{context.Canceled, syscall.EINTR},
 	{context.DeadlineExceeded, syscall.ETIMEDOUT},
 	{filesystem.ErrNotFound, syscall.ENOENT},
