@@ -172,8 +172,9 @@ func (a *Adapter) SetAttr(
 	if errno != 0 {
 		return filesystem.Stat{}, errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
-	stat, err := a.core.SetAttr(ctx, inode, mask, attrs)
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+	stat, err = a.core.SetAttr(ctx, inode, mask, attrs)
 	return stat, Errno(err)
 }
 
@@ -200,15 +201,16 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 	if errno != 0 {
 		return 0, errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
+	var writeErr error
+	defer func() { a.mutations.end(ticket, errors.Is(writeErr, kv.ErrTransactionOutcomeUnknown)) }()
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return 0, errno
 	}
-	n, err := a.core.Write(ctx, inode, fh, offset, data)
-	if err != nil && Errno(err) == syscall.EIO {
-		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "length", len(data), "error", err.Error())
+	n, writeErr = a.core.Write(ctx, inode, fh, offset, data)
+	if writeErr != nil && Errno(writeErr) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "length", len(data), "error", writeErr.Error())
 	}
-	return n, Errno(err)
+	return n, Errno(writeErr)
 }
 
 func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
@@ -257,9 +259,10 @@ func (a *Adapter) Create(
 	if errno != 0 {
 		return filesystem.CreateResult{}, errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
 	opts.ClientID = append([]byte(nil), a.clientID...)
-	result, err := a.core.Create(ctx, parent, name, opts)
+	result, err = a.core.Create(ctx, parent, name, opts)
 	if err == nil {
 		a.trackOpenHandle(result.Inode, result.FH)
 	}
@@ -276,9 +279,10 @@ func (a *Adapter) Mknod(
 	if errno != 0 {
 		return filesystem.CreateResult{}, errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
 	opts.ClientID = nil
-	result, err := a.core.Create(ctx, parent, name, opts)
+	result, err = a.core.Create(ctx, parent, name, opts)
 	return result, Errno(err)
 }
 
@@ -292,8 +296,9 @@ func (a *Adapter) Mkdir(
 	if errno != 0 {
 		return filesystem.CreateResult{}, errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
-	result, err := a.core.Mkdir(ctx, parent, name, opts)
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+	result, err = a.core.Mkdir(ctx, parent, name, opts)
 	return result, Errno(err)
 }
 
@@ -302,8 +307,10 @@ func (a *Adapter) Unlink(ctx context.Context, parent uint64, name []byte) (errno
 	if errno != 0 {
 		return errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
-	return Errno(a.core.Unlink(ctx, parent, name))
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+	err = a.core.Unlink(ctx, parent, name)
+	return Errno(err)
 }
 
 func (a *Adapter) Rmdir(ctx context.Context, parent uint64, name []byte) (errno syscall.Errno) {
@@ -311,8 +318,10 @@ func (a *Adapter) Rmdir(ctx context.Context, parent uint64, name []byte) (errno 
 	if errno != 0 {
 		return errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
-	return Errno(a.core.Rmdir(ctx, parent, name))
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+	err = a.core.Rmdir(ctx, parent, name)
+	return Errno(err)
 }
 
 func (a *Adapter) Rename(
@@ -326,8 +335,10 @@ func (a *Adapter) Rename(
 	if errno != 0 {
 		return errno
 	}
-	defer func() { a.mutations.end(ticket, errno) }()
-	return Errno(a.core.Rename(ctx, oldParent, oldName, newParent, newName))
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+	err = a.core.Rename(ctx, oldParent, oldName, newParent, newName)
+	return Errno(err)
 }
 
 func (a *Adapter) Readdir(ctx context.Context, inode uint64, cookie string) (filesystem.ReaddirResult, syscall.Errno) {

@@ -41,12 +41,12 @@ func (m *mutationTracker) begin(ctx context.Context, keys ...uint64) (*mutationT
 		case <-preceding.done:
 		case <-waitCtx.Done():
 			errno := Errno(waitCtx.Err())
-			m.end(ticket, 0)
+			m.end(ticket, false)
 			return nil, errno
 		}
 	}
 	if errno := m.stickyFor(ticket.keys); errno != 0 {
-		m.end(ticket, 0)
+		m.end(ticket, false)
 		return nil, errno
 	}
 	return ticket, 0
@@ -92,16 +92,16 @@ func (m *mutationTracker) stickyFor(keys []uint64) syscall.Errno {
 	return 0
 }
 
-func (m *mutationTracker) end(ticket *mutationTicket, errno syscall.Errno) {
+func (m *mutationTracker) end(ticket *mutationTicket, unknown bool) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.count--
 	for _, key := range ticket.keys {
-		if errno == syscall.EIO {
+		if unknown {
 			if m.sticky == nil {
 				m.sticky = make(map[uint64]syscall.Errno)
 			}
-			m.sticky[key] = errno
+			m.sticky[key] = syscall.EIO
 		}
 		delete(m.pending[key], ticket)
 		if len(m.pending[key]) == 0 {

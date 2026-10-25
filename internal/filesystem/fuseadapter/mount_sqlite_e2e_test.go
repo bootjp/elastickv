@@ -48,8 +48,12 @@ func TestMountSQLiteConcurrentProcesses(t *testing.T) {
 				go func() {
 					defer writers.Done()
 					for range sqliteWritesPerWriter {
-						_, err := sqliteCommand(t.Context(), path,
-							"PRAGMA busy_timeout="+strconv.Itoa(sqliteBusyTimeoutMilli)+"; PRAGMA synchronous=FULL; BEGIN IMMEDIATE; UPDATE counter SET value=value+1; COMMIT;")
+						actualMode, err := sqliteCommand(t.Context(), path,
+							"PRAGMA busy_timeout="+strconv.Itoa(sqliteBusyTimeoutMilli)+"; PRAGMA journal_mode="+mode+"; PRAGMA synchronous=FULL; BEGIN IMMEDIATE; UPDATE counter SET value=value+1; COMMIT;")
+						fields := strings.Fields(actualMode)
+						if err == nil && (len(fields) == 0 || fields[len(fields)-1] != strings.ToLower(mode)) {
+							err = fmt.Errorf("writer journal mode output %q, expected %s", strings.TrimSpace(actualMode), mode)
+						}
 						results <- err
 					}
 				}()

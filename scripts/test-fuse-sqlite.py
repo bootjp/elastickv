@@ -9,11 +9,14 @@ import sqlite3
 import uuid
 
 
-def increment(path, writes, start, results):
+def increment(path, mode, writes, start, results):
     try:
         if not start.wait(10):
             raise TimeoutError("writer start timed out")
         with closing(sqlite3.connect(path, timeout=10)) as connection:
+            actual_mode = connection.execute(f"PRAGMA journal_mode={mode}").fetchone()[0]
+            if actual_mode.upper() != mode:
+                raise AssertionError(f"journal mode {actual_mode}, expected {mode}")
             connection.execute("PRAGMA synchronous=FULL")
             for _ in range(writes):
                 connection.execute("BEGIN IMMEDIATE")
@@ -38,7 +41,7 @@ def run_mode(mount, mode, writers, writes):
     start = multiprocessing.Event()
     results = multiprocessing.Queue()
     processes = [
-        multiprocessing.Process(target=increment, args=(str(path), writes, start, results))
+        multiprocessing.Process(target=increment, args=(str(path), mode, writes, start, results))
         for _ in range(writers)
     ]
     for process in processes:

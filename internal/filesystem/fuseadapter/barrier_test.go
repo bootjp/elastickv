@@ -2,6 +2,7 @@ package fuseadapter
 
 import (
 	"context"
+	"errors"
 	"syscall"
 	"testing"
 	"time"
@@ -74,7 +75,22 @@ func TestFsyncRetainsUnknownPredecessorError(t *testing.T) {
 	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
 	require.Equal(t, syscall.EIO, errno)
 	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	core.writeErr = nil
+	_, errno = adapter.Write(t.Context(), 7, 9, 0, []byte("later"))
+	require.Equal(t, syscall.EIO, errno)
 	require.False(t, core.fsyncCalled)
+}
+
+func TestOrdinaryWriteEIODoesNotPoisonLaterMutations(t *testing.T) {
+	core := &fakeCore{writeErr: errors.New("storage unavailable")}
+	adapter := New(core, []byte("client"), WithHandleKeepaliveInterval(0))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("first"))
+	require.Equal(t, syscall.EIO, errno)
+	core.writeErr = nil
+	_, errno = adapter.Write(t.Context(), 7, 9, 0, []byte("second"))
+	require.Zero(t, errno)
+	require.Zero(t, adapter.Fsync(t.Context(), 7, 9, false))
 }
 
 func TestDirectoryFsyncWaitsForEarlierNamespaceMutation(t *testing.T) {
@@ -119,9 +135,9 @@ func TestMutationTrackerOrdersSameInodeAndReleasesCanceledWaiter(t *testing.T) {
 	}
 	cancel()
 	require.NotZero(t, <-secondDone)
-	tracker.end(first, 0)
+	tracker.end(first, false)
 	third, errno := tracker.begin(t.Context(), 7)
 	require.Zero(t, errno)
-	tracker.end(third, 0)
+	tracker.end(third, false)
 	require.Zero(t, tracker.count)
 }
