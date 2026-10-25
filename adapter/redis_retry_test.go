@@ -438,8 +438,8 @@ func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 	t.Parallel()
 
-	wireErr := errors.WithStack(status.Error(codes.Aborted,
-		kv.NewTxnLockedError(store.ListItemKey([]byte("list"), 1)).Error()))
+	wireErr := errors.WithStack(kv.ForwardTxnLockedStatus(
+		kv.NewTxnLockedError(store.ListItemKey([]byte("list"), 1))))
 	attempts := 0
 	srv := &RedisServer{}
 	err := srv.retryRedisWrite(context.Background(), func() error {
@@ -458,8 +458,7 @@ func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
 	t.Parallel()
 
-	wireErr := errors.WithStack(status.Error(codes.Aborted,
-		"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error()))
+	wireErr := errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1Violation))
 	attempts := 0
 	srv := &RedisServer{}
 	err := srv.retryRedisWrite(context.Background(), func() error {
@@ -485,13 +484,11 @@ func TestComposedRouteErrorsAreRetryableButDoNotPreserveAttempts(t *testing.T) {
 		{name: "typed gc", err: kv.ErrComposed1VersionGCd},
 		{
 			name: "wire violation",
-			err: errors.WithStack(status.Error(codes.Aborted,
-				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error())),
+			err:  errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1Violation)),
 		},
 		{
 			name: "wire gc",
-			err: errors.WithStack(status.Error(codes.Aborted,
-				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1VersionGCd.Error())),
+			err:  errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1VersionGCd)),
 		},
 	}
 
@@ -511,8 +508,8 @@ func TestRetryRedisWriteDoesNotTreatComposedSentinelInWireConflictKeyAsRouteErro
 	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
 		t.Run(sentinel.Error(), func(t *testing.T) {
 			t.Parallel()
-			wireErr := errors.WithStack(status.Error(codes.Unknown,
-				store.NewWriteConflictError([]byte("retry:"+sentinel.Error())).Error()))
+			wireErr := errors.WithStack(kv.ForwardWriteConflictStatus(
+				store.NewWriteConflictError([]byte("retry:" + sentinel.Error()))))
 			attempts := 0
 			srv := &RedisServer{}
 
@@ -534,8 +531,8 @@ func TestNormalizeRetryableRedisTxnErrPrefersWireTxnKeyEnvelope(t *testing.T) {
 	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
 		t.Run(sentinel.Error(), func(t *testing.T) {
 			t.Parallel()
-			wireErr := errors.WithStack(status.Error(codes.Aborted,
-				kv.NewTxnLockedError([]byte("locked:"+sentinel.Error())).Error()))
+			wireErr := errors.WithStack(kv.ForwardTxnLockedStatus(
+				kv.NewTxnLockedError([]byte("locked:" + sentinel.Error()))))
 
 			err := normalizeRetryableRedisTxnErr(wireErr)
 
@@ -573,8 +570,7 @@ func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 
 func TestRetryRedisWriteDoesNotReplayOrLeakWireWriteConflict(t *testing.T) {
 	internalKey := store.StreamEntryKey([]byte("retry:stream"), 1, 2)
-	wireErr := errors.WithStack(status.Error(codes.Unknown,
-		store.NewWriteConflictError(internalKey).Error()))
+	wireErr := errors.WithStack(kv.ForwardWriteConflictStatus(store.NewWriteConflictError(internalKey)))
 	attempts := 0
 	srv := &RedisServer{}
 
@@ -603,24 +599,24 @@ func TestNormalizeRetryableRedisTxnErrWireErrors(t *testing.T) {
 	}{
 		{
 			name: "write conflict",
-			wireErr: errors.WithStack(status.Error(codes.Unknown,
-				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)).Error())),
+			wireErr: errors.WithStack(kv.ForwardWriteConflictStatus(
+				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)))),
 			wantSentinel:     store.ErrWriteConflict,
 			wantKey:          "retry:stream",
 			internalKeyToken: store.StreamEntryPrefix,
 		},
 		{
-			name: "nested typed write conflict",
-			wireErr: status.Error(codes.Aborted, "rpc error: code = Aborted desc = "+
-				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)).Error()),
+			name: "wrapped typed write conflict",
+			wireErr: errors.WithStack(kv.ForwardWriteConflictStatus(
+				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)))),
 			wantSentinel:     store.ErrWriteConflict,
 			wantKey:          "retry:stream",
 			internalKeyToken: store.StreamEntryPrefix,
 		},
 		{
 			name: "transaction locked with detail",
-			wireErr: errors.WithStack(status.Error(codes.Aborted,
-				kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow").Error())),
+			wireErr: errors.WithStack(kv.ForwardTxnLockedStatus(
+				kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow"))),
 			wantSentinel:     kv.ErrTxnLocked,
 			wantKey:          "retry:list",
 			wantDetail:       "timestamp overflow",

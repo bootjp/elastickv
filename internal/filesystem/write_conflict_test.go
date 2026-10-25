@@ -50,7 +50,7 @@ func (c *forwardedRootRaceCoordinator) Dispatch(
 }
 
 func forwardedWriteConflict(key []byte) error {
-	wire := status.Error(codes.Unknown, store.NewWriteConflictError(key).Error())
+	wire := kv.ForwardWriteConflictStatus(store.NewWriteConflictError(key))
 	return cerrors.Wrapf(wire, "leader forward failed after %d retries", 3)
 }
 
@@ -101,8 +101,8 @@ func TestIsWriteConflict(t *testing.T) {
 		{name: "typed conflict", err: store.NewWriteConflictError(conflictKey), want: true, wantRoot: true},
 		{name: "wrapped typed conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: true, wantRoot: true},
 		{name: "unknown attempt with conflict detail", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), want: false},
-		{name: "forwarded unknown status", err: forwardedWriteConflict(conflictKey), wantRoot: true},
-		{name: "forwarded aborted status without typed marker", err: status.Error(codes.Aborted, store.NewWriteConflictError(conflictKey).Error()), wantRoot: true},
+		{name: "forwarded typed status", err: forwardedWriteConflict(conflictKey), wantRoot: true},
+		{name: "forwarded aborted status without typed marker", err: status.Error(codes.Aborted, store.NewWriteConflictError(conflictKey).Error())},
 		{name: "forwarded other code", err: status.Error(codes.Unavailable, store.NewWriteConflictError(conflictKey).Error()), want: false},
 		{name: "status without key envelope", err: status.Error(codes.Unknown, "write conflict"), want: false},
 		{name: "status with other suffix", err: status.Error(codes.Unknown, "key: a: not leader"), want: false},
@@ -120,5 +120,5 @@ func TestRootInitializationRechecksAfterUncertainForwardedConflict(t *testing.T)
 	key := []byte("!fs|ino|root")
 	err := errors.Join(kv.ErrTransactionOutcomeUnknown, forwardedWriteConflict(key))
 	require.False(t, IsWriteConflict(err))
-	require.True(t, isRootInitializationConflict(err))
+	require.False(t, isRootInitializationConflict(err))
 }

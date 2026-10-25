@@ -70,8 +70,16 @@ func TestInternalForwardMarksOnlyDefinitiveConflictAborted(t *testing.T) {
 			}}})
 			require.Error(t, err)
 			require.Equal(t, tt.code, status.Code(err))
+			require.Equal(t, tt.name == "definitive", kv.IsForwardWriteConflict(err))
 		})
 	}
+}
+
+func TestForwardCommitErrorCarriesTypedLockRejection(t *testing.T) {
+	err := forwardCommitError(kv.NewTxnLockedError([]byte("key")))
+	require.True(t, kv.IsForwardTxnLocked(err))
+	require.False(t, kv.IsForwardWriteConflict(err))
+	require.False(t, kv.IsForwardTxnLocked(forwardCommitError(errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ErrTxnLocked))))
 }
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {

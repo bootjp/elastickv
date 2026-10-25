@@ -352,12 +352,27 @@ func (s *Service) InitializeRoot(ctx context.Context, mode uint32, uid uint32, g
 	var lastErr error
 	for range rootInitializationRetryLimit {
 		err := s.initializeRootOnce(ctx, mode, uid, gid)
+		if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			if s.rootVisibleAfterUnknown(ctx) {
+				return nil
+			}
+			return err
+		}
 		if !isRootInitializationConflict(err) {
 			return err
 		}
 		lastErr = err
 	}
 	return lastErr
+}
+
+func (s *Service) rootVisibleAfterUnknown(ctx context.Context) bool {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return false
+	}
+	_, err = s.inodeAt(ctx, RootInode, ts)
+	return err == nil
 }
 
 func (s *Service) initializeRootOnce(ctx context.Context, mode uint32, uid uint32, gid uint32) error {

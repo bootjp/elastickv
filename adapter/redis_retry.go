@@ -5,14 +5,11 @@ import (
 	"context"
 	"log/slog"
 	"math/rand/v2"
-	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -86,90 +83,40 @@ const (
 )
 
 // parseWireRedisTxnErr restores transaction error typing after an internal
-// leader redirect crosses gRPC. Forward currently returns transaction failures
-// as a status, which strips the typed ErrWriteConflict / ErrTxnLocked /
-// Composed-1 sentinel chain. Match only known server-generated envelopes.
+// leader redirect crosses gRPC. Structured status details preserve the
+// rejection kind and key without interpreting diagnostic messages.
 // Wire write conflicts are not generally retryable: a lost forwarding response
 // can turn an already-applied write into a later self-conflict. Reuse-aware
 // callers explicitly normalize them before retrying; all other callers return
 // the normalized error without replaying the operation or exposing the internal
 // key layout.
-func wireRedisTxnStatus(err error) (*status.Status, bool) {
-	type grpcStatusCarrier interface {
-		GRPCStatus() *status.Status
-	}
-	var carrier grpcStatusCarrier
-	if !errors.As(err, &carrier) {
-		return nil, false
-	}
-	st := carrier.GRPCStatus()
-	if st == nil || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
-		return nil, false
-	}
-	return st, true
-}
-
 func parseWireRedisTxnErr(err error) error {
-	st, ok := wireRedisTxnStatus(err)
-	if !ok {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return nil
 	}
-	msg := forwardedStatusMessage(st)
-	if parsed := parseWireRedisTxnKeyErr(msg); parsed != nil {
-		return parsed
+	if kv.IsForwardWriteConflict(err) {
+		if key, ok := kv.ForwardWriteConflictKey(err); ok {
+			return errors.WithStack(store.NewWriteConflictError(normalizeRetryableRedisTxnKey(key)))
+		}
+		return errors.WithStack(store.ErrWriteConflict)
 	}
-	if isWireComposedRouteMessage(msg, kv.ErrComposed1Violation) {
+	if kv.IsForwardTxnLocked(err) {
+		if key, detail, ok := kv.ForwardTxnLockedDetails(err); ok {
+			logicalKey := normalizeRetryableRedisTxnKey(key)
+			if detail != "" {
+				return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
+			}
+			return errors.WithStack(kv.NewTxnLockedError(logicalKey))
+		}
+		return errors.WithStack(kv.ErrTxnLocked)
+	}
+	if kv.IsForwardComposed1Violation(err) {
 		return errors.WithStack(kv.ErrComposed1Violation)
 	}
-	if isWireComposedRouteMessage(msg, kv.ErrComposed1VersionGCd) {
+	if kv.IsForwardComposed1VersionGCd(err) {
 		return errors.WithStack(kv.ErrComposed1VersionGCd)
 	}
 	return nil
-}
-
-func isWireComposedRouteMessage(msg string, sentinel error) bool {
-	sentinelMsg := sentinel.Error()
-	if msg == sentinelMsg {
-		return true
-	}
-	if !strings.HasSuffix(msg, ": "+sentinelMsg) {
-		return false
-	}
-	return strings.HasPrefix(msg, "observed-version v=") ||
-		strings.HasPrefix(msg, "current-version v=")
-}
-
-func parseWireRedisTxnKeyErr(msg string) error {
-	if !strings.HasPrefix(msg, "key: ") {
-		return nil
-	}
-
-	if content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+store.ErrWriteConflict.Error()); ok {
-		logicalKey := normalizeRetryableRedisTxnKey([]byte(content))
-		return errors.WithStack(store.NewWriteConflictError(logicalKey))
-	}
-
-	content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+kv.ErrTxnLocked.Error())
-	if !ok {
-		return nil
-	}
-	keyText := content
-	detail := ""
-	// TxnLockedError's wire format does not escape the key/detail boundary.
-	// A foreign key containing " (" and ending in ")" is therefore ambiguous;
-	// splitting at the last delimiter preserves the server format, and any
-	// ambiguity affects only the reconstructed display fields, not retry typing.
-	if strings.HasSuffix(content, ")") {
-		if detailStart := strings.LastIndex(content, " ("); detailStart >= 0 {
-			keyText = content[:detailStart]
-			detail = content[detailStart+2 : len(content)-1]
-		}
-	}
-	logicalKey := normalizeRetryableRedisTxnKey([]byte(keyText))
-	if detail != "" {
-		return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
-	}
-	return errors.WithStack(kv.NewTxnLockedError(logicalKey))
 }
 
 func wireRedisTxnErrKind(err error) redisTxnWireErrKind {

@@ -233,10 +233,10 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return nil, errors.WithStack(ErrKVForwardNotSupported)
 	}
 	if i.leader == nil || i.leader.State() != raftengine.StateLeader {
-		return nil, errors.WithStack(ErrNotLeader)
+		return nil, errors.WithStack(kv.ForwardNotLeaderStatus())
 	}
 	if err := i.leader.VerifyLeader(ctx); err != nil {
-		return nil, errors.WithStack(ErrNotLeader)
+		return nil, errors.WithStack(kv.ForwardNotLeaderStatus())
 	}
 
 	commitTS, err := i.stampTimestamps(ctx, req)
@@ -269,8 +269,17 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 }
 
 func forwardCommitError(err error) error {
-	if errors.Is(err, store.ErrWriteConflict) && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
-		return errors.WithStack(status.Error(codes.Aborted, err.Error()))
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return errors.WithStack(err)
+	}
+	if errors.Is(err, store.ErrWriteConflict) {
+		return errors.WithStack(kv.ForwardWriteConflictStatus(err))
+	}
+	if errors.Is(err, kv.ErrTxnLocked) {
+		return errors.WithStack(kv.ForwardTxnLockedStatus(err))
+	}
+	if errors.Is(err, kv.ErrComposed1Violation) || errors.Is(err, kv.ErrComposed1VersionGCd) {
+		return errors.WithStack(kv.ForwardComposed1Status(err))
 	}
 	return errors.WithStack(err)
 }

@@ -22,15 +22,15 @@ func TestNormalizeDynamoWriteDispatchError(t *testing.T) {
 	}{
 		{"nil", nil, nil},
 		{"local conflict", store.NewWriteConflictError([]byte("k")), store.ErrWriteConflict},
-		{"typed forwarded conflict", status.Error(codes.Aborted, store.ErrWriteConflict.Error()), store.ErrWriteConflict},
-		{"wrapped typed forwarded conflict", errors.WithStack(status.Error(codes.Aborted, store.ErrWriteConflict.Error())), store.ErrWriteConflict},
-		{"nested keyed typed forwarded conflict", status.Error(codes.Aborted, "rpc error: code = Aborted desc = key: k: write conflict"), store.ErrWriteConflict},
-		{"unknown outcome with typed conflict detail", errors.Join(kv.ErrTransactionOutcomeUnknown, status.Error(codes.Aborted, store.ErrWriteConflict.Error())), nil},
-		{"unknown conflict", status.Error(codes.Unknown, "key: k: write conflict"), store.ErrWriteConflict},
-		{"wrapped aborted conflict", errors.WithStack(status.Error(codes.Aborted, "key: k: write conflict")), store.ErrWriteConflict},
+		{"typed forwarded conflict", kv.ForwardWriteConflictStatus(store.ErrWriteConflict), store.ErrWriteConflict},
+		{"wrapped typed forwarded conflict", errors.WithStack(kv.ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("desc = k")))), store.ErrWriteConflict},
+		{"unknown outcome with typed conflict detail", errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ForwardWriteConflictStatus(store.ErrWriteConflict)), nil},
+		{"unknown conflict", status.Error(codes.Unknown, "key: k: write conflict"), nil},
+		{"aborted without detail", status.Error(codes.Aborted, "key: k: write conflict"), nil},
 		{"local lock", kv.NewTxnLockedError([]byte("k")), kv.ErrTxnLocked},
-		{"unknown lock", status.Error(codes.Unknown, "key: k: txn locked"), kv.ErrTxnLocked},
-		{"wrapped aborted lock", errors.WithStack(status.Error(codes.Aborted, "key: k (pending): txn locked")), kv.ErrTxnLocked},
+		{"typed forwarded lock", kv.ForwardTxnLockedStatus(kv.NewTxnLockedError([]byte("k"))), kv.ErrTxnLocked},
+		{"unknown lock", status.Error(codes.Unknown, "key: k: txn locked"), nil},
+		{"wrapped aborted lock without detail", errors.WithStack(status.Error(codes.Aborted, "key: k (pending): txn locked")), nil},
 		{"plain text", errors.New("key: k: write conflict"), nil},
 		{"missing key envelope", status.Error(codes.Unknown, "write conflict"), nil},
 		{"wrong code", status.Error(codes.Internal, "key: k: write conflict"), nil},
@@ -66,7 +66,7 @@ func (c *forwardedDynamoLockCoordinator) Dispatch(ctx context.Context, req *kv.O
 		if c.failure != nil {
 			return nil, c.failure
 		}
-		return nil, status.Error(codes.Unknown, "key: pending: txn locked")
+		return nil, kv.ForwardTxnLockedStatus(kv.NewTxnLockedError([]byte("pending")))
 	}
 	return c.Coordinator.Dispatch(ctx, req)
 }
@@ -79,10 +79,14 @@ func TestDynamoDBRetriesForwardedSnapshotSealConflict(t *testing.T) {
 			defer st.Close()
 			schema := dedupItemTable()
 			seedDedupItem(t, st, schema, "1")
+			forwarded := kv.ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("!ddb|seal|pending")))
+			if errors.Is(sentinel, kv.ErrTxnLocked) {
+				forwarded = kv.ForwardTxnLockedStatus(kv.NewTxnLockedError([]byte("!ddb|seal|pending")))
+			}
 			coord := &forwardedDynamoLockCoordinator{
 				Coordinator: newOCCAdapterCoordinator(st),
 				seal:        true,
-				failure:     status.Error(codes.Aborted, "key: !ddb|seal|pending: "+sentinel.Error()),
+				failure:     forwarded,
 			}
 			server := NewDynamoDBServer(nil, st, coord)
 			_, err := server.updateItemWithRetry(context.Background(), appendListInput())
@@ -99,7 +103,7 @@ func TestDynamoDBCreateTableRetriesForwardedConflict(t *testing.T) {
 	defer st.Close()
 	coord := &forwardedDynamoLockCoordinator{
 		Coordinator: newOCCAdapterCoordinator(st),
-		failure:     status.Error(codes.Unknown, "key: !ddb|meta|table|test: write conflict"),
+		failure:     kv.ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("!ddb|meta|table|test"))),
 	}
 	server := NewDynamoDBServer(nil, st, coord)
 	schema := dedupItemTable()

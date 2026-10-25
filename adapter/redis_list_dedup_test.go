@@ -11,8 +11,6 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // dedupTestCoordinator drives the option-2 one-phase idempotency path
@@ -397,7 +395,7 @@ func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.
 	if !ok || len(key) == 0 {
 		key = minElemKey(req.Elems)
 	}
-	return status.Error(codes.Unknown, store.NewWriteConflictError(key).Error())
+	return kv.ForwardWriteConflictStatus(store.NewWriteConflictError(key))
 }
 
 func (c *dedupTestCoordinator) shouldRouteFence(dispatch int) bool {

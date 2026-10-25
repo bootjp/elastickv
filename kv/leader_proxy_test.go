@@ -443,15 +443,17 @@ func TestLeaderProxy_LostForwardResponseDoesNotReplay(t *testing.T) {
 func TestForwardDecisionEvidence(t *testing.T) {
 	t.Parallel()
 
-	rejected := status.Error(codes.Aborted, store.ErrWriteConflict.Error())
+	rejected := ForwardWriteConflictStatus(store.ErrWriteConflict)
 	require.True(t, isDefinitiveForwardConflict(rejected))
-	require.True(t, isDefinitiveForwardConflict(errors.WithStack(status.Error(codes.Aborted,
-		store.NewWriteConflictError([]byte("key")).Error()))))
+	require.True(t, isDefinitiveForwardConflict(errors.WithStack(ForwardWriteConflictStatus(
+		store.NewWriteConflictError([]byte("desc = x"))))))
+	require.False(t, isDefinitiveForwardConflict(status.Error(codes.Aborted, store.ErrWriteConflict.Error())))
 	require.False(t, isDefinitiveForwardNotLeader(rejected))
 	require.False(t, isDefinitiveForwardConflict(status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())))
 
-	beforeSubmit := status.Error(codes.Unknown, "not leader")
+	beforeSubmit := ForwardNotLeaderStatus()
 	require.True(t, isDefinitiveForwardNotLeader(beforeSubmit))
+	require.False(t, isDefinitiveForwardNotLeader(status.Error(codes.Unknown, "not leader")))
 
 	for _, err := range []error{
 		status.Error(codes.Unknown, "raft engine: leadership lost"),
@@ -469,7 +471,7 @@ func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	svc := &fakeInternal{err: status.Error(codes.Aborted, store.ErrWriteConflict.Error())}
+	svc := &fakeInternal{err: ForwardWriteConflictStatus(store.ErrWriteConflict)}
 	srv := grpc.NewServer()
 	pb.RegisterInternalServer(srv, svc)
 	go func() { _ = srv.Serve(lis) }()
@@ -485,9 +487,32 @@ func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 	require.Equal(t, 1, svc.callCount())
 }
 
+func TestLeaderProxy_SinglePhaseConflictUsesStructuredStatus(t *testing.T) {
+	t.Parallel()
+
+	var lc net.ListenConfig
+	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	svc := &fakeInternal{err: ForwardWriteConflictStatus(store.NewWriteConflictError([]byte("desc = not leader")))}
+	srv := grpc.NewServer()
+	pb.RegisterInternalServer(srv, svc)
+	go func() { _ = srv.Serve(lis) }()
+	t.Cleanup(func() {
+		srv.Stop()
+		_ = lis.Close()
+	})
+
+	p := NewLeaderProxyWithEngine(&stubFollowerEngine{leaderAddr: lis.Addr().String()})
+	t.Cleanup(func() { _ = p.connCache.Close() })
+	_, err = p.Commit(context.Background(), []*pb.Request{{IsTxn: false, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, svc.callCount())
+}
+
 func TestClassifyForwardConflictByPhase(t *testing.T) {
 	t.Parallel()
-	proof := status.Error(codes.Aborted, store.ErrWriteConflict.Error())
+	proof := ForwardWriteConflictStatus(store.ErrWriteConflict)
 	for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE} {
 		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
 		require.ErrorIs(t, err, store.ErrWriteConflict)
