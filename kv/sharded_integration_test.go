@@ -170,8 +170,10 @@ func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
 func TestShardedCoordinatorStrictCrossShardTxnConfirmsEveryEffect(t *testing.T) {
 	ctx := context.Background()
 	router := distribution.NewEngine()
-	router.UpdateRoute([]byte("a"), []byte("m"), 1)
-	router.UpdateRoute([]byte("m"), nil, 2)
+	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	})
 
 	first := store.NewMVCCStore()
 	firstRaft, closeFirst := newSingleRaft(t, "strict-g1", NewKvFSMWithHLC(first, NewHLC()))

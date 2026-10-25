@@ -64,6 +64,11 @@ func (b serviceOperationBackend) GroupIDForKey(key []byte) (uint64, error) {
 		ResolveOperationGroupForKey([]byte) (uint64, error)
 	}); ok {
 		groupID, err := router.ResolveOperationGroupForKey(key)
+		if errors.Is(err, kv.ErrOperationGroupResolverUnavailable) {
+			if _, sharded := b.service.store.(*kv.ShardStore); !sharded {
+				return 0, nil
+			}
+		}
 		return groupID, errors.Wrap(err, "route operation effect")
 	}
 	if _, sharded := b.service.store.(*kv.ShardStore); sharded {

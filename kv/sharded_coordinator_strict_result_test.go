@@ -56,8 +56,10 @@ func (nilDecisionTransactional) Abort(context.Context, []*pb.Request) (*Transact
 func TestStrictSecondaryRouteShiftNeverStartsANewTransaction(t *testing.T) {
 	t.Parallel()
 	router := distribution.NewEngine()
-	router.UpdateRoute([]byte("a"), []byte("m"), 1)
-	router.UpdateRoute([]byte("m"), nil, 2)
+	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	})
 	primary := &recordingTransactional{}
 	secondaryErrors := []error{nil}
 	for range txnSecondaryCommitRetryAttempts {
@@ -77,4 +79,44 @@ func TestStrictSecondaryRouteShiftNeverStartsANewTransaction(t *testing.T) {
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.Len(t, primary.requests, 2)
 	require.Len(t, secondary.requests, 1+txnSecondaryCommitRetryAttempts)
+}
+
+func TestStrictTxnRejectsEffectRouteChangedAfterReceiptPlacement(t *testing.T) {
+	t.Parallel()
+	router := distribution.NewEngine()
+	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 3, Start: []byte("m"), GroupID: 3},
+	})
+	first := &recordingTransactional{}
+	third := &recordingTransactional{}
+	coord := NewShardedCoordinator(router, map[uint64]*ShardGroup{
+		1: {Txn: first}, 3: {Txn: third},
+	}, 1, NewHLC(), nil)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true, RequireAllParticipants: true,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("record")},
+			{Op: Put, Key: []byte("x"), Value: []byte("effect"), ExpectedGroupID: 2, RequireGroupMatch: true},
+		},
+	})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Empty(t, first.requests)
+	require.Empty(t, third.requests)
+}
+
+func TestStrictTxnRequiresVersionedRouteSnapshot(t *testing.T) {
+	t.Parallel()
+	router := distribution.NewEngine()
+	router.UpdateRoute([]byte("a"), nil, 1)
+	participant := &recordingTransactional{}
+	coord := NewShardedCoordinator(router, map[uint64]*ShardGroup{
+		1: {Txn: participant},
+	}, 1, NewHLC(), nil)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true, RequireAllParticipants: true,
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("b"), Value: []byte("value")}},
+	})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Empty(t, participant.requests)
 }

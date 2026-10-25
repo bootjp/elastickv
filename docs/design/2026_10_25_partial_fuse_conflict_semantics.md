@@ -1,6 +1,6 @@
 # FUSE conflict resolution and operation outcomes
 
-Status: Partial (M1 and M2 infrastructure)
+Status: Partial
 Author: bootjp
 Date: 2026-10-25
 
@@ -16,8 +16,10 @@ aborted transaction.
 The central change is a filesystem operation module that resolves one logical
 request across transaction attempts, forwarding failures, and leader changes.
 It needs a durable operation identity and an atomic result record, not merely an
-`EAGAIN` loop in the FUSE adapter. The operation journal and outcome protocol
-are implemented; FUSE mutation routing and mounted validation remain in M3-M5.
+`EAGAIN` loop in the FUSE adapter. The operation journal can publish a result
+with its effects, but transaction decision resolution and authorized session
+takeover remain pending. FUSE mutation routing and mounted validation remain
+in M3-M5.
 
 This improves the contention semantics of the supported filesystem subset. It
 does **not** establish full POSIX conformance, distributed advisory locks,

@@ -137,6 +137,27 @@ type deferredOperationProofBackend struct {
 
 type partitionedOperationProofBackend struct{ operationJournalBackend }
 
+type unavailableOperationRouteCoordinator struct{ *testCoordinator }
+
+func (unavailableOperationRouteCoordinator) ResolveOperationGroupForKey([]byte) (uint64, error) {
+	return 0, kv.ErrOperationGroupResolverUnavailable
+}
+
+func TestOperationProofsAllowUnshardedCoordinatorWithoutRouteCapability(t *testing.T) {
+	st := store.NewMVCCStore()
+	service, err := NewService(st, unavailableOperationRouteCoordinator{&testCoordinator{st: st}})
+	require.NoError(t, err)
+	journal, err := NewOperationJournal(service)
+	require.NoError(t, err)
+	groups, _, effects, err := journal.operationProofs(OperationID{Sequence: 1}, []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: []byte("data"), Value: []byte("value")},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []uint64{0}, groups)
+	require.True(t, effects[0].RequireGroupMatch)
+	require.Zero(t, effects[0].ExpectedGroupID)
+}
+
 func (b partitionedOperationProofBackend) GroupIDForKey(key []byte) (uint64, error) {
 	if bytes.Equal(key, []byte("data-a")) {
 		return 1, nil
@@ -146,6 +167,27 @@ func (b partitionedOperationProofBackend) GroupIDForKey(key []byte) (uint64, err
 
 func (b partitionedOperationProofBackend) CommittedVersionAtGroup(ctx context.Context, key []byte, _ uint64, ts uint64) (bool, error) {
 	return b.CommittedVersionAt(ctx, key, ts)
+}
+
+func TestOperationProofsBindRoutedEffectsToReceiptParticipants(t *testing.T) {
+	journal, _, _ := testOperationJournal(t)
+	journal = newOperationJournalWithBackend(partitionedOperationProofBackend{journal.backend})
+	input := []*kv.Elem[kv.OP]{
+		{Op: kv.Put, Key: []byte("data-a"), Value: []byte("a")},
+		{Op: kv.Put, Key: []byte("data-b"), Value: []byte("b")},
+	}
+	groups, proofs, effects, err := journal.operationProofs(OperationID{Sequence: 1}, input)
+	require.NoError(t, err)
+	require.Equal(t, []uint64{1, 2}, groups)
+	require.Len(t, proofs, 2)
+	require.Equal(t, uint64(1), proofs[0].GroupID)
+	require.Equal(t, uint64(2), proofs[1].GroupID)
+	for index, group := range groups {
+		require.Zero(t, effects[index].GroupID)
+		require.True(t, effects[index].RequireGroupMatch)
+		require.Equal(t, group, effects[index].ExpectedGroupID)
+		require.False(t, input[index].RequireGroupMatch)
+	}
 }
 
 func (b *deferredOperationProofBackend) CommittedVersionAtGroup(ctx context.Context, key []byte, groupID, ts uint64) (bool, error) {
@@ -460,7 +502,7 @@ func TestOperationJournalAcknowledgementGapsRetireWithoutReuse(t *testing.T) {
 	}
 }
 
-func TestOperationJournalAdvancedGenerationFencesDelayedAttempt(t *testing.T) {
+func TestOperationJournalDoesNotAdvanceWithoutAbortDecision(t *testing.T) {
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -469,29 +511,25 @@ func TestOperationJournalAdvancedGenerationFencesDelayedAttempt(t *testing.T) {
 	old, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
 	_, err = journal.AdvanceGeneration(ctx, id, old.AttemptID)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 	outcome, _, err := journal.ResolveAttempt(ctx, id, old.AttemptID)
-	require.NoError(t, err)
-	require.Equal(t, AttemptAborted, outcome)
+	require.ErrorIs(t, err, ErrOperationPending)
+	require.Equal(t, AttemptUnknown, outcome)
 	current, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
-	require.Greater(t, current.Generation, old.Generation)
-	_, err = journal.Publish(ctx, id, old.AttemptID, operationAttemptPlan{
-		Intent:  []byte("write"),
-		Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old")}},
-	})
-	require.ErrorIs(t, err, ErrOperationGeneration)
+	require.Equal(t, old.AttemptID, current.AttemptID)
+	require.Equal(t, old.Generation, current.Generation)
 	_, err = journal.Publish(ctx, id, current.AttemptID, operationAttemptPlan{
 		Intent:  []byte("write"),
-		Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("new")}},
+		Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old")}},
 	})
 	require.NoError(t, err)
 	value, err := st.GetAt(ctx, []byte("data"), st.LastCommitTS())
 	require.NoError(t, err)
-	require.Equal(t, []byte("new"), value)
+	require.Equal(t, []byte("old"), value)
 }
 
-func TestOperationJournalDelayedOldCommitCannotOverwriteNewGeneration(t *testing.T) {
+func TestOperationJournalDelayedCommitCannotBeSupersededWithoutDecision(t *testing.T) {
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -514,18 +552,15 @@ func TestOperationJournalDelayedOldCommitCannotOverwriteNewGeneration(t *testing
 	}()
 	<-backend.entered
 	_, err = journal.AdvanceGeneration(ctx, id, old.AttemptID)
-	require.NoError(t, err)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 	close(backend.release)
-	require.ErrorIs(t, <-result, store.ErrWriteConflict)
+	require.NoError(t, <-result)
 	current, err := journal.BeginAttempt(ctx, id)
-	require.NoError(t, err)
-	_, err = journal.Publish(ctx, id, current.AttemptID, operationAttemptPlan{
-		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("new")}},
-	})
-	require.NoError(t, err)
+	require.ErrorIs(t, err, ErrOperationGeneration)
+	require.Equal(t, operationRecord{}, current)
 	value, err := st.GetAt(ctx, []byte("data"), st.LastCommitTS())
 	require.NoError(t, err)
-	require.Equal(t, []byte("new"), value)
+	require.Equal(t, []byte("old"), value)
 }
 
 func TestOperationJournalSnapshotRetainsTerminalAndPendingRecords(t *testing.T) {

@@ -1187,6 +1187,7 @@ func (c *ShardedCoordinator) anyResolverClaimedKey(elems []*Elem[OP]) bool {
 }
 
 func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
+	c.pinStrictRouteVersion(reqs)
 	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
@@ -1310,6 +1311,23 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 	// Unreachable — the loop body always returns on each iteration.
 	// Kept here so the function has an unambiguous return shape.
 	return nil, errors.WithStack(ErrInvalidRequest)
+}
+
+func (c *ShardedCoordinator) pinStrictRouteVersion(reqs *OperationGroup[OP]) {
+	if reqs.RequireAllParticipants && reqs.ObservedRouteVersion == 0 && c.engine != nil {
+		reqs.ObservedRouteVersion = EncodeObservedRouteVersion(c.engine.Version())
+	}
+}
+
+func (c *ShardedCoordinator) ensureStrictRouteVersion(observed uint64, strict bool) error {
+	if !strict || c.engine == nil {
+		return nil
+	}
+	pinned, tracked := DecodeObservedRouteVersion(observed)
+	if !tracked || c.engine.Version() != pinned {
+		return errors.WithStack(ErrTransactionOutcomeUnknown)
+	}
+	return nil
 }
 
 // isComposed1RetryableError reports whether err is one of the M3 gate
@@ -1747,7 +1765,7 @@ func (c *ShardedCoordinator) dispatchTxn(
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	grouped, gids, err := c.groupMutations(elems, label)
+	grouped, gids, err := c.groupTxnMutations(elems, label, observedRouteVersion, requireAllParticipantsFlag(requireAllParticipants))
 	if err != nil {
 		return nil, err
 	}
@@ -1781,6 +1799,17 @@ func (c *ShardedCoordinator) dispatchTxn(
 		return nil, err
 	}
 	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup, requireAllParticipantsFlag(requireAllParticipants))
+}
+
+func (c *ShardedCoordinator) groupTxnMutations(elems []*Elem[OP], label keyviz.Label, observedRouteVersion uint64, strict bool) (map[uint64][]*pb.Mutation, []uint64, error) {
+	grouped, gids, err := c.groupMutations(elems, label)
+	if err != nil {
+		return nil, nil, err
+	}
+	if err := c.ensureStrictRouteVersion(observedRouteVersion, strict); err != nil {
+		return nil, nil, err
+	}
+	return grouped, gids, nil
 }
 
 func requireAllParticipantsFlag(flags []bool) bool {
@@ -3562,6 +3591,9 @@ func (c *ShardedCoordinator) groupMutations(reqs []*Elem[OP], label keyviz.Label
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no shard group %d for key %q", gid, mut.Key)
 		} else if !routeOK {
 			return nil, nil, errors.Wrapf(ErrInvalidRequest, "no route for key %q", mut.Key)
+		}
+		if req.RequireGroupMatch && gid != req.ExpectedGroupID {
+			return nil, nil, errors.WithStack(ErrTransactionOutcomeUnknown)
 		}
 		c.observeMutation(routeID, mut, label)
 		grouped[gid] = append(grouped[gid], mut)

@@ -64,6 +64,10 @@ type Elem[T OP] struct {
 	// GroupID optionally pins this mutation to a shard group. Zero preserves
 	// normal key-based routing.
 	GroupID uint64
+	// RequireGroupMatch validates a previously chosen effect participant without
+	// pinning the write to an obsolete owner. ExpectedGroupID may be zero.
+	RequireGroupMatch bool
+	ExpectedGroupID   uint64
 }
 
 // OperationGroup is a group of operations that should be executed atomically.

@@ -43,28 +43,12 @@ func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (op
 	return operationRecord{}, errors.WithStack(ErrOperationGeneration)
 }
 
-// AdvanceGeneration is safe only after its transaction commits: writing the
-// same record key fences a delayed old attempt, including a prepared 2PC
-// participant. A conflict or lost response is never non-commit evidence.
-func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID, attempt [16]byte) (operationRecord, error) {
-	for range operationCASRetries {
-		ts, record, session, err := j.pendingSnapshot(ctx, id)
-		if err != nil {
-			return operationRecord{}, err
-		}
-		if record.AttemptID != attempt || attempt == [16]byte{} {
-			return operationRecord{}, errors.WithStack(ErrOperationGeneration)
-		}
-		record.AttemptID = [16]byte{}
-		if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
-			if IsWriteConflict(err) {
-				continue
-			}
-			return operationRecord{}, err
-		}
-		return record, nil
-	}
-	return operationRecord{}, errors.WithStack(ErrOperationGeneration)
+// AdvanceGeneration cannot proceed until an authoritative transaction-decision
+// resolver proves the previous attempt aborted. The journal does not yet
+// persist the underlying transaction identity, so it must fail closed rather
+// than infer abort from an absent result row or an OCC conflict.
+func (j *OperationJournal) AdvanceGeneration(_ context.Context, _ OperationID, _ [16]byte) (operationRecord, error) {
+	return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 }
 
 type operationAttemptPlan struct {
@@ -126,7 +110,7 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	if err != nil {
 		return operationRecord{}, err
 	}
-	groups, proofs, err := j.operationProofs(record.ID, plan.Effects)
+	groups, proofs, routedEffects, err := j.operationProofs(record.ID, plan.Effects)
 	if err != nil {
 		return operationRecord{}, err
 	}
@@ -135,30 +119,36 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	record.EffectKeys = effectKeys
 	record.ProofGroups = groups
 	session.Pending--
-	effects := append(slices.Clone(plan.Effects), proofs...)
+	effects := slices.Concat(routedEffects, proofs)
 	if err = j.storeRecordAndSession(ctx, ts, record, session, effects, plan.ReadKeys); err != nil {
 		return operationRecord{}, err
 	}
 	return j.Resolve(ctx, id)
 }
 
-func (j *OperationJournal) operationProofs(id OperationID, effects []*kv.Elem[kv.OP]) ([]uint64, []*kv.Elem[kv.OP], error) {
+func (j *OperationJournal) operationProofs(id OperationID, effects []*kv.Elem[kv.OP]) ([]uint64, []*kv.Elem[kv.OP], []*kv.Elem[kv.OP], error) {
 	groups := make([]uint64, 0, len(effects))
-	for _, effect := range effects {
+	routedEffects := make([]*kv.Elem[kv.OP], len(effects))
+	for index, effect := range effects {
 		groupID := effect.GroupID
+		routedEffects[index] = effect
 		if groupID == 0 {
 			var err error
 			groupID, err = j.backend.GroupIDForKey(effect.Key)
 			if err != nil {
-				return nil, nil, errors.Wrap(err, "route operation receipt")
+				return nil, nil, nil, errors.Wrap(err, "route operation receipt")
 			}
+			routed := *effect
+			routed.RequireGroupMatch = true
+			routed.ExpectedGroupID = groupID
+			routedEffects[index] = &routed
 		}
 		groups = append(groups, groupID)
 	}
 	slices.Sort(groups)
 	groups = slices.Compact(groups)
 	if len(groups) > maxOperationProofGroups {
-		return nil, nil, errors.WithStack(ErrOperationQuota)
+		return nil, nil, nil, errors.WithStack(ErrOperationQuota)
 	}
 	proofs := make([]*kv.Elem[kv.OP], 0, len(groups))
 	for _, groupID := range groups {
@@ -167,7 +157,7 @@ func (j *OperationJournal) operationProofs(id OperationID, effects []*kv.Elem[kv
 			Value: []byte{1}, GroupID: groupID,
 		})
 	}
-	return groups, proofs, nil
+	return groups, proofs, routedEffects, nil
 }
 
 func (j *OperationJournal) resolveDuplicatePublication(ctx context.Context, id OperationID, attempt [16]byte, intent []byte, originalErr error) (operationRecord, error) {
