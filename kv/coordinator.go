@@ -700,6 +700,9 @@ func shouldRetryDispatch(err error) bool {
 // budget is exhausted and the most recent non-transient lastErr is
 // the deadline marker, not a real business error.
 func finalDispatchErr(lastErr, lastTransientErr error, deadline time.Time) error {
+	if errors.Is(lastErr, ErrTransactionOutcomeUnknown) {
+		return lastErr
+	}
 	if lastTransientErr != nil && !time.Now().Before(deadline) {
 		return lastTransientErr
 	}

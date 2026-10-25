@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/binary"
+	"fmt"
 	"math"
 	"sync"
 	"testing"
@@ -13,6 +14,8 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -30,6 +33,7 @@ type rootRaceCoordinator struct {
 	inner     *testCoordinator
 	once      sync.Once
 	winnerErr error
+	ambiguous bool
 }
 
 func (c *rootRaceCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
@@ -46,7 +50,11 @@ func (c *rootRaceCoordinator) Dispatch(
 	if c.winnerErr != nil {
 		return nil, c.winnerErr
 	}
-	return c.inner.Dispatch(ctx, req)
+	resp, err := c.inner.Dispatch(ctx, req)
+	if err != nil && c.ambiguous {
+		return nil, fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, status.Error(codes.Unknown, err.Error()))
+	}
+	return resp, err
 }
 
 func (c *testCoordinator) LinearizableRead(context.Context) (uint64, error) {
@@ -269,6 +277,21 @@ func TestServiceInitializeRootToleratesConcurrentWinner(t *testing.T) {
 
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
 	require.NoError(t, coord.winnerErr)
+	root, err := svc.GetAttr(ctx, RootInode)
+	require.NoError(t, err)
+	require.Equal(t, TypeDirectory, root.Type)
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.Files)
+}
+
+func TestServiceInitializeRootResolvesUnknownForwardedConflict(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := &rootRaceCoordinator{inner: &testCoordinator{st: st}, ambiguous: true}
+	svc, err := NewService(st, coord, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
 	root, err := svc.GetAttr(ctx, RootInode)
 	require.NoError(t, err)
 	require.Equal(t, TypeDirectory, root.Type)

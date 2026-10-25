@@ -125,6 +125,15 @@ func TestShouldRetryDispatchDoesNotRetryLeaderProxyCircuitOpen(t *testing.T) {
 	require.False(t, shouldRetryDispatch(cerrors.WithStack(ErrLeaderProxyCircuitOpen)))
 }
 
+func TestFinalDispatchErrPreservesUnknownOutcomeAfterRetryDeadline(t *testing.T) {
+	t.Parallel()
+	unknown := fmt.Errorf("%w: forwarded commit response lost", ErrTransactionOutcomeUnknown)
+	transient := cerrors.WithStack(ErrLeaderNotFound)
+	got := finalDispatchErr(unknown, transient, time.Now().Add(-time.Second))
+	require.ErrorIs(t, got, ErrTransactionOutcomeUnknown)
+	require.ErrorContains(t, got, "forwarded commit response lost")
+}
+
 // newRetryCoordinate wires a Coordinate against stubLeaderEngine and the
 // supplied scripted transaction manager. No engine registration happens,
 // so the caller does not need to call Close.

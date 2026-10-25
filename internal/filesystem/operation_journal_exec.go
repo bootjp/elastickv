@@ -54,8 +54,22 @@ func (j *OperationJournal) AdvanceGeneration(_ context.Context, _ OperationID, _
 type operationAttemptPlan struct {
 	Intent   []byte
 	Effects  []*kv.Elem[kv.OP]
+	ReadTS   uint64
 	ReadKeys [][]byte
 	Result   []byte
+}
+
+// PlanSnapshot establishes the OCC timestamp before a planner reads data.
+// Every predicate key read at this timestamp must be included in ReadKeys.
+func (j *OperationJournal) PlanSnapshot(ctx context.Context, id OperationID, attempt [16]byte) (uint64, error) {
+	ts, record, _, err := j.pendingSnapshot(ctx, id)
+	if err != nil {
+		return 0, err
+	}
+	if attempt == [16]byte{} || record.AttemptID != attempt {
+		return 0, errors.WithStack(ErrOperationGeneration)
+	}
+	return ts, nil
 }
 
 // AttemptOutcome is backed by the replicated operation row. In particular,
@@ -99,7 +113,10 @@ func classifyAttemptOutcome(id OperationID, attempt [16]byte, record operationRe
 // generation. The session key is also a mutation, so closing the session and
 // an in-flight attempt cannot both succeed on the same snapshot.
 func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt [16]byte, plan operationAttemptPlan) (operationRecord, error) {
-	ts, record, session, err := j.pendingSnapshot(ctx, id)
+	if len(plan.ReadKeys) != 0 && plan.ReadTS == 0 {
+		return operationRecord{}, errors.WithStack(ErrInvalid)
+	}
+	ts, record, session, err := j.publicationSnapshot(ctx, id, plan.ReadTS)
 	if err != nil {
 		return j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, err)
 	}
@@ -121,9 +138,17 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	session.Pending--
 	effects := slices.Concat(routedEffects, proofs)
 	if err = j.storeRecordAndSession(ctx, ts, record, session, effects, plan.ReadKeys); err != nil {
-		return operationRecord{}, err
+		return j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, err)
 	}
 	return j.Resolve(ctx, id)
+}
+
+func (j *OperationJournal) publicationSnapshot(ctx context.Context, id OperationID, readTS uint64) (uint64, operationRecord, operationSession, error) {
+	if readTS == 0 {
+		return j.pendingSnapshot(ctx, id)
+	}
+	record, session, err := j.pendingSnapshotAt(ctx, id, readTS, false)
+	return readTS, record, session, err
 }
 
 func (j *OperationJournal) operationProofs(id OperationID, effects []*kv.Elem[kv.OP]) ([]uint64, []*kv.Elem[kv.OP], []*kv.Elem[kv.OP], error) {
@@ -161,7 +186,7 @@ func (j *OperationJournal) operationProofs(id OperationID, effects []*kv.Elem[kv
 }
 
 func (j *OperationJournal) resolveDuplicatePublication(ctx context.Context, id OperationID, attempt [16]byte, intent []byte, originalErr error) (operationRecord, error) {
-	if !errors.Is(originalErr, ErrOperationGeneration) {
+	if !errors.Is(originalErr, ErrOperationGeneration) && !IsWriteConflict(originalErr) {
 		return operationRecord{}, originalErr
 	}
 	record, err := j.Resolve(ctx, id)
@@ -195,8 +220,11 @@ func validateOperationPlan(record operationRecord, session operationSession, pla
 // Reject publishes a terminal semantic failure only after the caller has
 // validated its predicates on the same snapshot. OCC conflicts remain pending
 // attempts and must not be stored as semantic rejection.
-func (j *OperationJournal) Reject(ctx context.Context, id OperationID, attempt [16]byte, intent []byte, result []byte, readKeys [][]byte) (operationRecord, error) {
-	ts, record, session, err := j.pendingSnapshot(ctx, id)
+func (j *OperationJournal) Reject(ctx context.Context, id OperationID, attempt [16]byte, readTS uint64, intent []byte, result []byte, readKeys [][]byte) (operationRecord, error) {
+	if readTS == 0 {
+		return operationRecord{}, errors.WithStack(ErrInvalid)
+	}
+	ts, record, session, err := j.publicationSnapshot(ctx, id, readTS)
 	if err != nil {
 		return j.resolveDuplicateRejection(ctx, id, attempt, intent, err)
 	}
@@ -213,13 +241,13 @@ func (j *OperationJournal) Reject(ctx context.Context, id OperationID, attempt [
 	record.Result = append([]byte(nil), result...)
 	session.Pending--
 	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, readKeys); err != nil {
-		return operationRecord{}, err
+		return j.resolveDuplicateRejection(ctx, id, attempt, intent, err)
 	}
 	return j.Resolve(ctx, id)
 }
 
 func (j *OperationJournal) resolveDuplicateRejection(ctx context.Context, id OperationID, attempt [16]byte, intent []byte, originalErr error) (operationRecord, error) {
-	if !errors.Is(originalErr, ErrOperationGeneration) {
+	if !errors.Is(originalErr, ErrOperationGeneration) && !IsWriteConflict(originalErr) {
 		return operationRecord{}, originalErr
 	}
 	record, err := j.Resolve(ctx, id)
@@ -325,24 +353,29 @@ func (j *OperationJournal) pendingSnapshotAllowClosed(ctx context.Context, id Op
 	if err != nil {
 		return 0, operationRecord{}, operationSession{}, errors.Wrap(err, "fence operation attempt")
 	}
+	record, session, err := j.pendingSnapshotAt(ctx, id, ts, allowClosed)
+	return ts, record, session, err
+}
+
+func (j *OperationJournal) pendingSnapshotAt(ctx context.Context, id OperationID, ts uint64, allowClosed bool) (operationRecord, operationSession, error) {
 	session, exists, err := j.loadSessionAt(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}, ts)
 	if err != nil {
-		return 0, operationRecord{}, operationSession{}, err
+		return operationRecord{}, operationSession{}, err
 	}
 	if !exists {
-		return 0, operationRecord{}, operationSession{}, errors.WithStack(ErrOperationSessionNotFound)
+		return operationRecord{}, operationSession{}, errors.WithStack(ErrOperationSessionNotFound)
 	}
 	if session.Closed && !allowClosed {
-		return 0, operationRecord{}, operationSession{}, errors.WithStack(ErrOperationSessionClosed)
+		return operationRecord{}, operationSession{}, errors.WithStack(ErrOperationSessionClosed)
 	}
 	record, found, err := j.loadRecordAt(ctx, id, ts)
 	if err != nil {
-		return 0, operationRecord{}, operationSession{}, err
+		return operationRecord{}, operationSession{}, err
 	}
 	if err = validatePendingSnapshot(record, session, found); err != nil {
-		return 0, operationRecord{}, operationSession{}, err
+		return operationRecord{}, operationSession{}, err
 	}
-	return ts, record, session, nil
+	return record, session, nil
 }
 
 func validatePendingSnapshot(record operationRecord, session operationSession, found bool) error {

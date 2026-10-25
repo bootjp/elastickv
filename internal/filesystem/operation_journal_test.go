@@ -284,6 +284,23 @@ func TestOperationJournalRetriesLostSessionRegistrationWithSameIdentity(t *testi
 	require.NoError(t, err)
 }
 
+func TestOperationJournalReturnsSessionIdentityAfterLostRegistrationReply(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	filesystemID, err := journal.EnsureFilesystem(ctx)
+	require.NoError(t, err)
+	backend := &lostSessionRegistrationBackend{
+		operationJournalBackend: journal.backend,
+		ownerKey:                fskeys.OperationOwnerKey(filesystemID, []byte("mount-a")),
+	}
+	journal = newOperationJournalWithBackend(backend)
+	id, err := journal.RegisterSession(ctx, filesystemID, "mount-a")
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, filesystemID, id.Filesystem)
+	require.NotEqual(t, [16]byte{}, id.Session)
+	require.NoError(t, journal.RegisterSessionWithID(ctx, id, "mount-a"))
+}
+
 func TestOperationJournalWaitsForEveryEffectAfterDecision(t *testing.T) {
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
@@ -418,16 +435,59 @@ func TestOperationJournalDuplicateRejectionReturnsOriginalResult(t *testing.T) {
 	require.NoError(t, err)
 	attempt, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
-	first, err := journal.Reject(ctx, id, attempt.AttemptID, []byte("create:absent"), []byte("EEXIST"), nil)
+	readTS, err := journal.PlanSnapshot(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	first, err := journal.Reject(ctx, id, attempt.AttemptID, readTS, []byte("create:absent"), []byte("EEXIST"), nil)
 	require.NoError(t, err)
 	require.Equal(t, OperationRejected, first.State)
 	beforeDuplicate := st.LastCommitTS()
-	duplicate, err := journal.Reject(ctx, id, attempt.AttemptID, []byte("create:absent"), []byte("ENOENT"), nil)
+	duplicate, err := journal.Reject(ctx, id, attempt.AttemptID, readTS, []byte("create:absent"), []byte("ENOENT"), nil)
 	require.NoError(t, err)
 	require.Equal(t, first, duplicate)
 	require.Equal(t, beforeDuplicate, st.LastCommitTS())
-	_, err = journal.Reject(ctx, id, attempt.AttemptID, []byte("create:changed"), []byte("EEXIST"), nil)
-	require.ErrorIs(t, err, ErrOperationGeneration)
+	_, err = journal.Reject(ctx, id, attempt.AttemptID, readTS, []byte("create:changed"), []byte("EEXIST"), nil)
+	require.ErrorIs(t, err, ErrOperationIDReused)
+}
+
+func TestOperationJournalPublishUsesPlanningSnapshotForReadValidation(t *testing.T) {
+	ctx := context.Background()
+	journal, st, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("increment"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	readTS, err := journal.PlanSnapshot(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	key := []byte("counter")
+	require.NoError(t, st.PutAt(ctx, key, []byte("1"), readTS+1, 0))
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent: []byte("increment"), ReadTS: readTS, ReadKeys: [][]byte{key},
+		Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: key, Value: []byte("1")}},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.Equal(t, AttemptUnknown, outcome)
+	require.ErrorIs(t, err, ErrOperationPending)
+}
+
+func TestOperationJournalRejectUsesPlanningSnapshotForReadValidation(t *testing.T) {
+	ctx := context.Background()
+	journal, st, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("create"), 128, 0)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	readTS, err := journal.PlanSnapshot(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	key := []byte("directory-entry")
+	require.NoError(t, st.PutAt(ctx, key, []byte("new"), readTS+1, 0))
+	_, err = journal.Reject(ctx, id, attempt.AttemptID, readTS, []byte("create"), []byte("EEXIST"), [][]byte{key})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.Equal(t, AttemptUnknown, outcome)
+	require.ErrorIs(t, err, ErrOperationPending)
 }
 
 func TestOperationJournalRejectsJournalKeysAsEffects(t *testing.T) {

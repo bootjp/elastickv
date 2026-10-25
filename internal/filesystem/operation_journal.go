@@ -174,7 +174,7 @@ func (j *OperationJournal) RegisterSession(ctx context.Context, filesystemID [16
 	}
 	id := OperationSessionID{Filesystem: filesystemID, Session: token}
 	if err = j.RegisterSessionWithID(ctx, id, owner); err != nil {
-		return OperationSessionID{}, err
+		return id, err
 	}
 	return id, nil
 }

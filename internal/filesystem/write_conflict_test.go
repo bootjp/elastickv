@@ -114,3 +114,10 @@ func TestIsWriteConflict(t *testing.T) {
 		})
 	}
 }
+
+func TestRootInitializationRechecksAfterUncertainForwardedConflict(t *testing.T) {
+	key := []byte("!fs|ino|root")
+	err := errors.Join(kv.ErrTransactionOutcomeUnknown, forwardedWriteConflict(key))
+	require.False(t, IsWriteConflict(err))
+	require.True(t, isRootInitializationConflict(err))
+}
