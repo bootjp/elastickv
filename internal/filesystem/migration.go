@@ -621,7 +621,7 @@ func (s *Service) ensureActiveHomeAt(ctx context.Context, meta *InodeMeta, ts ui
 }
 
 func (s *Service) translateHomeConflict(ctx context.Context, expected *InodeMeta, dispatchErr error) error {
-	if !errors.Is(dispatchErr, store.ErrWriteConflict) || expected == nil {
+	if errors.Is(dispatchErr, kv.ErrTransactionOutcomeUnknown) || !errors.Is(dispatchErr, store.ErrWriteConflict) || expected == nil {
 		return dispatchErr
 	}
 	ts, err := s.readTS(ctx)

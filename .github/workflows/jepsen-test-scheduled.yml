@@ -314,6 +314,15 @@ jobs:
             tail -n 200 "/tmp/elastickv-fs-n${node}.log" || true
           done
           exit 1
+      - name: Verify FUSE cross-mount disjoint writes without client retries
+        run: |
+          python3 scripts/test-fuse-cross-mount.py \
+            /tmp/elastickv-fs/fs-n1 \
+            /tmp/elastickv-fs/fs-n2 \
+            /tmp/elastickv-fs/fs-n3 \
+            --iterations 50
+      - name: Verify SQLite rollback journals without client retries
+        run: python3 scripts/test-fuse-sqlite.py /tmp/elastickv-fs/fs-n1 --writes 30
       - name: Run filesystem Jepsen workloads against elastickv
         working-directory: jepsen
         # Linearizable register over the FUSE mounts, at the same stress

@@ -1,18 +1,14 @@
 package adapter
 
 import (
-	"bytes"
 	"context"
 	"log/slog"
 	"math/rand/v2"
-	"strings"
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 const (
@@ -86,90 +82,30 @@ const (
 )
 
 // parseWireRedisTxnErr restores transaction error typing after an internal
-// leader redirect crosses gRPC. Forward currently returns transaction failures
-// as a status, which strips the typed ErrWriteConflict / ErrTxnLocked /
-// Composed-1 sentinel chain. Match only known server-generated envelopes.
+// leader redirect crosses gRPC. Structured status details preserve the
+// rejection kind without interpreting diagnostic messages or transporting keys.
 // Wire write conflicts are not generally retryable: a lost forwarding response
 // can turn an already-applied write into a later self-conflict. Reuse-aware
 // callers explicitly normalize them before retrying; all other callers return
 // the normalized error without replaying the operation or exposing the internal
 // key layout.
-func wireRedisTxnStatus(err error) (*status.Status, bool) {
-	type grpcStatusCarrier interface {
-		GRPCStatus() *status.Status
-	}
-	var carrier grpcStatusCarrier
-	if !errors.As(err, &carrier) {
-		return nil, false
-	}
-	st := carrier.GRPCStatus()
-	if st == nil || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
-		return nil, false
-	}
-	return st, true
-}
-
 func parseWireRedisTxnErr(err error) error {
-	st, ok := wireRedisTxnStatus(err)
-	if !ok {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return nil
 	}
-	msg := st.Message()
-	if parsed := parseWireRedisTxnKeyErr(msg); parsed != nil {
-		return parsed
+	if kv.IsForwardWriteConflict(err) {
+		return errors.WithStack(store.ErrWriteConflict)
 	}
-	if isWireComposedRouteMessage(msg, kv.ErrComposed1Violation) {
+	if kv.IsForwardTxnLocked(err) {
+		return errors.WithStack(kv.ErrTxnLocked)
+	}
+	if kv.IsForwardComposed1Violation(err) {
 		return errors.WithStack(kv.ErrComposed1Violation)
 	}
-	if isWireComposedRouteMessage(msg, kv.ErrComposed1VersionGCd) {
+	if kv.IsForwardComposed1VersionGCd(err) {
 		return errors.WithStack(kv.ErrComposed1VersionGCd)
 	}
 	return nil
-}
-
-func isWireComposedRouteMessage(msg string, sentinel error) bool {
-	sentinelMsg := sentinel.Error()
-	if msg == sentinelMsg {
-		return true
-	}
-	if !strings.HasSuffix(msg, ": "+sentinelMsg) {
-		return false
-	}
-	return strings.HasPrefix(msg, "observed-version v=") ||
-		strings.HasPrefix(msg, "current-version v=")
-}
-
-func parseWireRedisTxnKeyErr(msg string) error {
-	if !strings.HasPrefix(msg, "key: ") {
-		return nil
-	}
-
-	if content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+store.ErrWriteConflict.Error()); ok {
-		logicalKey := normalizeRetryableRedisTxnKey([]byte(content))
-		return errors.WithStack(store.NewWriteConflictError(logicalKey))
-	}
-
-	content, ok := strings.CutSuffix(strings.TrimPrefix(msg, "key: "), ": "+kv.ErrTxnLocked.Error())
-	if !ok {
-		return nil
-	}
-	keyText := content
-	detail := ""
-	// TxnLockedError's wire format does not escape the key/detail boundary.
-	// A foreign key containing " (" and ending in ")" is therefore ambiguous;
-	// splitting at the last delimiter preserves the server format, and any
-	// ambiguity affects only the reconstructed display fields, not retry typing.
-	if strings.HasSuffix(content, ")") {
-		if detailStart := strings.LastIndex(content, " ("); detailStart >= 0 {
-			keyText = content[:detailStart]
-			detail = content[detailStart+2 : len(content)-1]
-		}
-	}
-	logicalKey := normalizeRetryableRedisTxnKey([]byte(keyText))
-	if detail != "" {
-		return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
-	}
-	return errors.WithStack(kv.NewTxnLockedError(logicalKey))
 }
 
 func wireRedisTxnErrKind(err error) redisTxnWireErrKind {
@@ -249,94 +185,11 @@ func normalizeRetryableRedisTxnErr(err error) error {
 	if parsed := parseWireRedisTxnErr(err); parsed != nil {
 		return parsed
 	}
-	if key, detail, ok := kv.TxnLockedDetails(err); ok {
-		logicalKey := normalizeRetryableRedisTxnKey(key)
-		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
-			return err
-		}
-		if detail != "" {
-			return errors.WithStack(kv.NewTxnLockedErrorWithDetail(logicalKey, detail))
-		}
-		return errors.WithStack(kv.NewTxnLockedError(logicalKey))
+	if errors.Is(err, kv.ErrTxnLocked) {
+		return errors.WithStack(kv.ErrTxnLocked)
 	}
-	if key, ok := store.WriteConflictKey(err); ok {
-		logicalKey := normalizeRetryableRedisTxnKey(key)
-		if len(logicalKey) == 0 || bytes.Equal(logicalKey, key) {
-			return err
-		}
-		return errors.WithStack(store.NewWriteConflictError(logicalKey))
+	if errors.Is(err, store.ErrWriteConflict) {
+		return errors.WithStack(store.ErrWriteConflict)
 	}
 	return err
-}
-
-// normalizeZSetWideColumnKey extracts the logical user key from a ZSet wide-column key.
-func normalizeZSetWideColumnKey(key []byte) ([]byte, bool) {
-	if store.IsZSetMetaDeltaKey(key) {
-		return store.ExtractZSetUserKeyFromDelta(key), true
-	}
-	if store.IsZSetMetaKey(key) {
-		return store.ExtractZSetUserKeyFromMeta(key), true
-	}
-	if store.IsZSetMemberKey(key) {
-		return store.ExtractZSetUserKeyFromMember(key), true
-	}
-	if store.IsZSetScoreKey(key) {
-		return store.ExtractZSetUserKeyFromScore(key), true
-	}
-	return nil, false
-}
-
-// normalizeWideColumnKey extracts the logical user key from any wide-column
-// internal key (hash/set/zset meta, delta, field, member, or score index).
-// Returns (key, true) when the input is a recognised wide-column key, (nil, false) otherwise.
-// Delta prefixes are checked before meta prefixes because delta keys share the
-// meta prefix as a leading substring.
-func normalizeWideColumnKey(key []byte) ([]byte, bool) {
-	if store.IsHashMetaDeltaKey(key) {
-		return store.ExtractHashUserKeyFromDelta(key), true
-	}
-	if store.IsHashMetaKey(key) {
-		return store.ExtractHashUserKeyFromMeta(key), true
-	}
-	if store.IsHashFieldKey(key) {
-		return store.ExtractHashUserKeyFromField(key), true
-	}
-	if store.IsSetMetaDeltaKey(key) {
-		return store.ExtractSetUserKeyFromDelta(key), true
-	}
-	if store.IsSetMetaKey(key) {
-		return store.ExtractSetUserKeyFromMeta(key), true
-	}
-	if store.IsSetMemberKey(key) {
-		return store.ExtractSetUserKeyFromMember(key), true
-	}
-	return normalizeZSetWideColumnKey(key)
-}
-
-func normalizeRetryableRedisTxnKey(key []byte) []byte {
-	if userKey := kv.ExtractTxnUserKey(key); userKey != nil {
-		key = userKey
-	}
-	if userKey := redisTxnWideFenceUserKey(key); userKey != nil {
-		return userKey
-	}
-	if store.IsListMetaDeltaKey(key) {
-		return store.ExtractListUserKeyFromDelta(key)
-	}
-	if store.IsListClaimKey(key) {
-		return store.ExtractListUserKeyFromClaim(key)
-	}
-	if store.IsListMetaKey(key) || store.IsListItemKey(key) {
-		return store.ExtractListUserKey(key)
-	}
-	if wideKey, ok := normalizeWideColumnKey(key); ok {
-		return wideKey
-	}
-	if bytes.HasPrefix(key, []byte(redisTTLPrefix)) {
-		return bytes.TrimPrefix(key, []byte(redisTTLPrefix))
-	}
-	if userKey := extractRedisInternalUserKey(key); userKey != nil {
-		return userKey
-	}
-	return key
 }

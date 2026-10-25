@@ -368,8 +368,10 @@ func (r *RawFileSystem) ReleaseDir(input *fuse.ReleaseIn) {
 	r.dirMu.Unlock()
 }
 
-func (r *RawFileSystem) FsyncDir(<-chan struct{}, *fuse.FsyncIn) fuse.Status {
-	return fuse.OK
+func (r *RawFileSystem) FsyncDir(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
+	ctx, done := r.requestContext(cancel)
+	defer done()
+	return toStatus(r.adapter.FsyncDirectory(ctx, input.NodeId))
 }
 
 func (r *RawFileSystem) StatFs(cancel <-chan struct{}, input *fuse.InHeader, out *fuse.StatfsOut) fuse.Status {

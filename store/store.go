@@ -3,7 +3,6 @@ package store
 import (
 	"bytes"
 	"context"
-	"fmt"
 	"io"
 
 	"github.com/cockroachdb/errors"
@@ -76,7 +75,7 @@ func WriteConflictKey(err error) ([]byte, bool) {
 }
 
 func (e *WriteConflictError) Error() string {
-	return fmt.Sprintf("key: %s: %v", string(e.key), ErrWriteConflict)
+	return ErrWriteConflict.Error()
 }
 
 func (e *WriteConflictError) Unwrap() error {

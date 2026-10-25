@@ -436,6 +436,54 @@ regression tests.
   mounted tests and Jepsen, benchmark record and retry costs, document results
   and canary limits, then enable strict mode. A skipped mount test is not a pass.
 
+### Remaining work after the bounded legacy-path changes
+
+The current branch adds typed forwarding of definitive write conflicts, bounded
+retries for those conflicts in several filesystem service operations, a local
+FUSE predecessor barrier, and mounted SQLite PERSIST/DELETE test coverage. These
+changes improve the legacy path but do not route FUSE mutations through the
+operation journal. In particular, `AdvanceGeneration` still fails closed, and
+`Service.Fsync` still uses an attribute read rather than a durable receipt.
+The tests for the legacy path cannot satisfy the strict-mode gates below.
+
+Complete the remaining work in dependency order:
+
+1. **Durable attempt decision (M1/M2 prerequisite).** Persist a stable
+   transaction identity for each publication attempt and expose an
+   authoritative committed/aborted/unknown decision across local, forwarded,
+   and multi-group dispatch. Retain the decision long enough to fence delayed
+   traffic after leader change or restart. Implement `AdvanceGeneration` only
+   when abort is proven; absence of a row, timeout, OCC error text, and lost
+   response remain unknown. Test lost replies before proposal, after proposal,
+   after primary decision, and after secondary application, including restart.
+2. **Journal-backed FUSE mutations (M3).** Give each mounted request a stable
+   operation ID, configured owner and session incarnation. Add typed planners
+   and stored results for write/partial write, truncate/setattr, create/open,
+   mkdir, unlink/rmdir, rename, release and lease maintenance. Route their
+   effects and semantic rejections through admission, attempt, publication,
+   resolution and acknowledgement. Resolve an unknown attempt under the same
+   identity; never rebuild it as a new logical request. Preserve create
+   revalidation, short counts, cancellation and bounded queue/deadline errors.
+   Keep participant receipt rows available across home migration and session
+   recovery. Mounted contention and fault tests must cover every mutation class.
+3. **Durable barriers (M4).** Associate successful mutations with participant
+   receipts and their predecessor order per file or directory. Make flush,
+   fsync/fdatasync and directory fsync wait for all relevant earlier operations
+   to become terminal. Audit the Raft/WAL/store sync contract and verify a
+   durable receipt before returning fsync success. A read-only attribute fence
+   and a local queue drain are insufficient. Test process and node crashes,
+   journal-before-database ordering, and unknown predecessor errors.
+4. **Fault campaign and rollout (M5).** Run race tests, the full Go suite and
+   lint, required Linux FUSE mounts, both Jepsen suites, and strict no-retry
+   syscall clients. Record seeds, versions, histories, failpoints and checker
+   output. Benchmark single- and multi-group latency, throughput, retry cost,
+   fairness and retained journal bytes. Enable strict mode only after all
+   acceptance rows below pass; document canary limits and rollback conditions.
+
+The strict mode must stay disabled while any of these gates is open. Existing
+SQLite PERSIST/DELETE runs establish only the stated single-mount scope; they
+do not establish shared-database or WAL safety across mounts.
+
 Required acceptance matrix:
 
 | Scenario | Evidence required |

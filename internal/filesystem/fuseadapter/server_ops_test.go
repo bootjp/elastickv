@@ -485,11 +485,14 @@ func TestRawFileSystemFlushAndFsyncForwardHandles(t *testing.T) {
 	require.True(t, core.fsyncDatasync)
 
 	require.Equal(t, fuse.OK, raw.FsyncDir(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: filesystem.RootInode}}))
+	require.EqualValues(t, filesystem.RootInode, core.fsyncInode)
+	require.Zero(t, core.fsyncFH)
 
 	core.flushErr = errors.New("boom")
 	core.fsyncErr = filesystem.ErrNotFound
 	require.Equal(t, fuse.Status(syscall.EIO), raw.Flush(nil, &fuse.FlushIn{InHeader: fuse.InHeader{NodeId: 7}, Fh: 9}))
 	require.Equal(t, fuse.Status(syscall.ENOENT), raw.Fsync(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: 7}, Fh: 9}))
+	require.Equal(t, fuse.Status(syscall.ENOENT), raw.FsyncDir(nil, &fuse.FsyncIn{InHeader: fuse.InHeader{NodeId: filesystem.RootInode}}))
 }
 
 func TestRawFileSystemReleaseUntracksHandleAndToleratesErrors(t *testing.T) {

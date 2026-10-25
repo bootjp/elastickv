@@ -30,6 +30,30 @@ func (s *Service) createNodeWithIntent(
 	name []byte,
 	typ FileType,
 	opts CreateOptions,
+) (CreateResult, error) {
+	ctx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	defer cancel()
+	for attempt := range writeConflictRetryLimit {
+		result, err := s.createNodeWithIntentOnce(ctx, parent, name, typ, opts)
+		if !isDefinitiveWriteConflict(err) {
+			return result, err
+		}
+		if attempt == writeConflictRetryLimit-1 {
+			return CreateResult{}, ErrContentionLimit
+		}
+		if err := waitWriteConflictRetry(ctx, attempt); err != nil {
+			return CreateResult{}, err
+		}
+	}
+	return CreateResult{}, ErrContentionLimit
+}
+
+func (s *Service) createNodeWithIntentOnce(
+	ctx context.Context,
+	parent uint64,
+	name []byte,
+	typ FileType,
+	opts CreateOptions,
 ) (result CreateResult, err error) {
 	intent, err := s.prepareNamespaceIntent(ctx, IntentKindCreate, parent, name)
 	if err != nil {

@@ -816,21 +816,10 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 //     because it just lost leadership (ErrNotLeader / ErrLeadershipLost
 //     / ErrLeadershipTransferInProgress). Recoverable by re-routing
 //     through the new leader (redirect path).
-//   - Forwarded "not leader" / "leader not found" strings — when
-//     Coordinate.redirect forwards to a stale leader, the destination
-//     node returns adapter.ErrNotLeader (its own sentinel) which gRPC
-//     transports as a generic Unknown status carrying only the message
-//     "not leader". errors.Is cannot traverse that wire boundary, so we
-//     fall back to a case-insensitive SUFFIX match on the final error
-//     text (see hasTransientLeaderPhrase). Suffix-only — not a free
-//     Contains — because store.WriteConflictError formats as
-//     "key: <user-key>: write conflict" and a user-chosen key embedding
-//     "not leader" must not be misclassified as transient.
-//     leaderErrorPhrases enumerates the exact phrases the adapter and
-//     coordinator layers emit; every observed wrapper (cockroachdb
-//     Wrapf, fmt.Errorf %w-prefix, gRPC status Errorf) places the
-//     original message at the end of the composed string so suffix
-//     matching catches the real churn signals without false positives.
+//   - Structured forwarding rejections before submission. The forwarding
+//     endpoint carries their reason across gRPC in ErrorInfo details.
+//     Older operational gRPC routes may still flatten sentinels into text;
+//     hasTransientLeaderPhrase retains their bounded compatibility fallback.
 //
 // Business-logic failures (write conflict, validation, etc.) are NOT
 // covered here — those must surface to the caller unchanged so client
@@ -846,8 +835,17 @@ func isTransientLeaderError(err error) bool {
 	if errors.Is(err, ErrLeaderNotFound) {
 		return true
 	}
+	if IsForwardNotLeader(err) {
+		return true
+	}
 	if isLeadershipLossError(err) {
 		return true
+	}
+	// Structured forwarding rejections are terminal regardless of their
+	// diagnostic message. The legacy phrase fallback must not override them.
+	if IsForwardWriteConflict(err) || IsForwardTxnLocked(err) ||
+		IsForwardComposed1Violation(err) || IsForwardComposed1VersionGCd(err) {
+		return false
 	}
 	return hasTransientLeaderPhrase(err)
 }

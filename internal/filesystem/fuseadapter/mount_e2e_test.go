@@ -67,8 +67,12 @@ func mountMemoryFilesystemServer(t *testing.T, mountPoint string) *e2eMount {
 }
 
 func newMemoryServiceForMount(t *testing.T) *filesystem.Service {
+	return newMemoryServiceForMountWithChunkSize(t, e2eChunkSize)
+}
+
+func newMemoryServiceForMountWithChunkSize(t *testing.T, chunkSize uint64) *filesystem.Service {
 	t.Helper()
-	svc, err := fstest.NewMemoryService(filesystem.WithChunkSize(e2eChunkSize))
+	svc, err := fstest.NewMemoryService(filesystem.WithChunkSize(chunkSize))
 	require.NoError(t, err)
 	info, err := os.Stat(t.TempDir())
 	require.NoError(t, err)

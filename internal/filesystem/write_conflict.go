@@ -1,23 +1,14 @@
 package filesystem
 
 import (
-	"strings"
-
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
-// IsWriteConflict reports whether err is an OCC write conflict, either the
-// typed store.ErrWriteConflict raised by a local commit or the wire envelope a
-// follower receives when its proposal was forwarded to the leader: Forward
-// returns transaction failures as a gRPC status, which strips the typed error
-// chain and leaves only the "key: <key>: write conflict" message.
-//
-// Callers that retry on it must be idempotent: a lost forwarding response can
-// mean the write was already applied.
+// IsWriteConflict reports a definitive OCC rejection. The leader proxy
+// reconstructs store.ErrWriteConflict from a typed forwarded Aborted status.
+// Textual gRPC errors cannot certify that an attempt did not commit.
 func IsWriteConflict(err error) bool {
 	if err == nil {
 		return false
@@ -25,35 +16,14 @@ func IsWriteConflict(err error) bool {
 	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return false
 	}
-	if errors.Is(err, store.ErrWriteConflict) {
-		return true
-	}
-	return isWireWriteConflict(err)
+	return errors.Is(err, store.ErrWriteConflict)
 }
 
-// isRootInitializationConflict reports whether root initialization may retry
-// err. Retrying is safe because initializeRootOnce re-reads the root inode
-// before proposing and returns nil when another node already created it, so a
-// lost forwarding response for an applied write converges on the next pass.
-// This exception is specific to root creation and never changes the general
-// IsWriteConflict classification of an uncertain transaction.
+// Root initialization may retry only a definitive conflict. An unknown reply
+// is handled by a separate read-only check of the root inode.
 func isRootInitializationConflict(err error) bool {
-	return IsWriteConflict(err) || (errors.Is(err, kv.ErrTransactionOutcomeUnknown) && isWireWriteConflict(err))
-}
-
-func isWireWriteConflict(err error) bool {
-	type grpcStatusCarrier interface {
-		GRPCStatus() *status.Status
-	}
-	var carrier grpcStatusCarrier
-	if !errors.As(err, &carrier) {
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return false
 	}
-	st := carrier.GRPCStatus()
-	if st == nil || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
-		return false
-	}
-	msg := st.Message()
-	return strings.HasPrefix(msg, "key: ") &&
-		strings.HasSuffix(msg, ": "+store.ErrWriteConflict.Error())
+	return IsWriteConflict(err) || kv.IsForwardWriteConflict(err)
 }

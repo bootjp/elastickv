@@ -3,14 +3,21 @@ package adapter
 import (
 	"context"
 	"encoding/binary"
+	"net"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/genproto/googleapis/rpc/errdetails"
+	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func TestInternalForwardObservesCommittedWrites(t *testing.T) {
@@ -39,6 +46,117 @@ func TestInternalForwardObservesCommittedWrites(t *testing.T) {
 	require.Len(t, txn.reqs, 1)
 	require.Same(t, reqs[0], txn.reqs[0])
 	require.Equal(t, uint64(1), reqs[0].Ts)
+}
+
+type forwardConflictTxn struct{ err error }
+
+func (t forwardConflictTxn) Commit(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return nil, t.err
+}
+
+func (forwardConflictTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return &kv.TransactionResponse{}, nil
+}
+
+func TestInternalForwardMarksOnlyDefinitiveConflictAborted(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{name: "definitive", err: store.ErrWriteConflict, code: codes.Aborted},
+		{name: "unknown", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), code: codes.Unknown},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			internal := NewInternalWithEngine(forwardConflictTxn{err: tt.err}, forwardObserverLeader{}, nil, nil)
+			_, err := internal.Forward(t.Context(), &pb.ForwardRequest{Requests: []*pb.Request{{
+				Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+			}}})
+			require.Error(t, err)
+			require.Equal(t, tt.code, status.Code(err))
+			require.Equal(t, tt.name == "definitive", kv.IsForwardWriteConflict(err))
+		})
+	}
+}
+
+func TestForwardCommitErrorCarriesTypedLockRejection(t *testing.T) {
+	err := forwardCommitError(kv.NewTxnLockedError([]byte("key")))
+	require.True(t, kv.IsForwardTxnLocked(err))
+	require.False(t, kv.IsForwardWriteConflict(err))
+	require.False(t, kv.IsForwardTxnLocked(forwardCommitError(errors.Join(kv.ErrTransactionOutcomeUnknown, kv.ErrTxnLocked))))
+}
+
+func TestInternalForwardConflictStatusSurvivesGRPC(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		key  []byte
+	}{
+		{name: "text envelope", key: []byte("desc = user key")},
+		{name: "binary key", key: []byte{0xff, 0xfe, 0x00}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			lis, err := net.Listen("tcp", "127.0.0.1:0")
+			require.NoError(t, err)
+			server := grpc.NewServer()
+			pb.RegisterInternalServer(server, NewInternalWithEngine(
+				forwardConflictTxn{err: store.NewWriteConflictError(tc.key)},
+				forwardObserverLeader{}, nil, nil,
+			))
+			go func() { _ = server.Serve(lis) }()
+			t.Cleanup(func() {
+				server.Stop()
+				_ = lis.Close()
+			})
+			conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+			require.NoError(t, err)
+			t.Cleanup(func() { _ = conn.Close() })
+			_, err = pb.NewInternalClient(conn).Forward(t.Context(), &pb.ForwardRequest{Requests: []*pb.Request{{
+				Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+			}}})
+			require.Error(t, err)
+			require.True(t, kv.IsForwardWriteConflict(err), "gRPC must preserve structured rejection: %v", err)
+			require.NotContains(t, err.Error(), string(tc.key))
+			require.Contains(t, status.Convert(err).Message(), store.ErrWriteConflict.Error())
+			for _, detail := range status.Convert(err).Details() {
+				info, ok := detail.(*errdetails.ErrorInfo)
+				require.True(t, ok)
+				require.Empty(t, info.GetMetadata())
+			}
+		})
+	}
+}
+
+func TestInternalForwardLockStatusSurvivesGRPC(t *testing.T) {
+	t.Parallel()
+	key := []byte{0xff, 0x00, 0xfe}
+	lis, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := grpc.NewServer()
+	pb.RegisterInternalServer(server, NewInternalWithEngine(
+		forwardConflictTxn{err: kv.NewTxnLockedErrorWithDetail(key, "owner \xfe")},
+		forwardObserverLeader{}, nil, nil,
+	))
+	go func() { _ = server.Serve(lis) }()
+	t.Cleanup(func() {
+		server.Stop()
+		_ = lis.Close()
+	})
+	conn, err := grpc.NewClient(lis.Addr().String(), grpc.WithTransportCredentials(insecure.NewCredentials()))
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = conn.Close() })
+	_, err = pb.NewInternalClient(conn).Forward(t.Context(), &pb.ForwardRequest{Requests: []*pb.Request{{
+		Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+	}}})
+	require.Error(t, err)
+	require.True(t, kv.IsForwardTxnLocked(err), "gRPC must preserve structured lock rejection: %v", err)
+	require.NotContains(t, err.Error(), string(key))
+	require.Contains(t, status.Convert(err).Message(), kv.ErrTxnLocked.Error())
+	for _, detail := range status.Convert(err).Details() {
+		info, ok := detail.(*errdetails.ErrorInfo)
+		require.True(t, ok)
+		require.Empty(t, info.GetMetadata())
+	}
 }
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {

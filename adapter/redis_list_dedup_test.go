@@ -11,8 +11,6 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
-	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 )
 
 // dedupTestCoordinator drives the option-2 one-phase idempotency path
@@ -359,22 +357,22 @@ func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGr
 		return resp, err
 	}
 	if err := c.preApplyError(n); err != nil {
-		return nil, c.maybeWireWriteConflict(req, err)
+		return nil, c.maybeWireWriteConflict(err)
 	}
 	resp, err := c.occAdapterCoordinator.Dispatch(ctx, req)
 	if err != nil {
-		return nil, c.maybeWireWriteConflict(req, err)
+		return nil, c.maybeWireWriteConflict(err)
 	}
 	if n == c.ambiguousDispatch && c.ambiguousLands {
 		// The apply LANDED, but the adapter sees an ambiguous retryable error.
-		return nil, c.maybeWireWriteConflict(req, store.ErrWriteConflict)
+		return nil, c.maybeWireWriteConflict(store.ErrWriteConflict)
 	}
 	if n == c.landThenWriteConflictAtDispatch {
 		// The apply LANDED, but leadership churn surfaces the commit as
 		// store.ErrWriteConflict — the original bug class. The adapter's
 		// self-inflicted-conflict guard must probe our just-committed
 		// commit_ts before treating this as a third-party conflict.
-		return nil, c.maybeWireWriteConflict(req, store.ErrWriteConflict)
+		return nil, c.maybeWireWriteConflict(store.ErrWriteConflict)
 	}
 	return resp, nil
 }
@@ -389,15 +387,11 @@ func (c *dedupTestCoordinator) beforeApply(ctx context.Context, req *kv.Operatio
 	return c.maybeProbe(ctx, req)
 }
 
-func (c *dedupTestCoordinator) maybeWireWriteConflict(req *kv.OperationGroup[kv.OP], err error) error {
+func (c *dedupTestCoordinator) maybeWireWriteConflict(err error) error {
 	if !c.wireWriteConflicts || !errors.Is(err, store.ErrWriteConflict) {
 		return err
 	}
-	key, ok := store.WriteConflictKey(err)
-	if !ok || len(key) == 0 {
-		key = minElemKey(req.Elems)
-	}
-	return status.Error(codes.Unknown, store.NewWriteConflictError(key).Error())
+	return kv.ForwardWriteConflictStatus()
 }
 
 func (c *dedupTestCoordinator) shouldRouteFence(dispatch int) bool {

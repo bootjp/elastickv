@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"strings"
 	"sync/atomic"
 	"time"
 
@@ -12,9 +11,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
-	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/metadata"
-	"google.golang.org/grpc/status"
 )
 
 const leaderForwardTimeout = 5 * time.Second
@@ -35,15 +32,9 @@ const leaderProxyRetryInterval = 25 * time.Millisecond
 // again without a durable operation identity and an authoritative resolution.
 var ErrTransactionOutcomeUnknown = errors.New("transaction outcome unknown")
 
-// A Forward handler returns an OCC failure only after its FSM has rejected
-// the attempt. Keep that certificate distinct from a lost RPC response.
+// Only the leader's structured rejection certifies a definitive OCC conflict.
 func isDefinitiveForwardConflict(err error) bool {
-	st, ok := status.FromError(err)
-	if !ok || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
-		return false
-	}
-	return strings.HasPrefix(st.Message(), "key: ") &&
-		strings.HasSuffix(st.Message(), ": "+store.ErrWriteConflict.Error())
+	return IsForwardWriteConflict(err)
 }
 
 // LeaderProxy forwards transactional requests to the current raft leader when
@@ -123,17 +114,15 @@ func (p *LeaderProxy) Abort(ctx context.Context, reqs []*pb.Request) (*Transacti
 //   - Forward-RPC failures are bounded by maxForwardRetries (each attempt
 //     re-resolves the leader address inside forward()).
 //   - Transient leader-unavailable errors (no leader published yet, or
-//     the forwarded RPC landed on a stale leader that returned
-//     adapter.ErrNotLeader over the wire) are bounded by
+//     the forwarded RPC landed on a stale leader that returned a typed
+//     pre-submission rejection) are bounded by
 //     leaderProxyRetryBudget so a brief re-election window does not
 //     bubble up to gRPC clients as a hard failure. Linearizable callers
 //     expect the proxy to either commit atomically or fail definitively,
 //     not to leak transient raft-internal churn.
 //
-// The wire-level "not leader" string match is necessary because a stale
-// leader's Internal.Forward returns adapter.ErrNotLeader whose error
-// chain does not survive the gRPC boundary; errors.Is against
-// ErrLeaderNotFound would miss it and exit after only the fast retries.
+// The forwarding endpoint marks pre-submission rejection in structured gRPC
+// details so a stale leader can be retried without inspecting display text.
 //
 // The overall budget is strictly enforced: no new forward() attempt is
 // started once time.Now() has passed deadline, and each per-attempt RPC
@@ -243,7 +232,7 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 			return resp, nil, true
 		}
 		lastErr = err
-		if errors.Is(err, ErrTransactionOutcomeUnknown) {
+		if isTerminalForwardError(err) {
 			return nil, err, true
 		}
 		if callerErr := callerCtx.Err(); callerErr != nil {
@@ -257,6 +246,14 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 		return nil, errors.Wrapf(lastErr, "leader forward failed after %d retries", maxForwardRetries), true
 	}
 	return nil, lastErr, false
+}
+
+func isTerminalForwardError(err error) bool {
+	return errors.Is(err, ErrTransactionOutcomeUnknown) ||
+		errors.Is(err, store.ErrWriteConflict) ||
+		errors.Is(err, ErrTxnLocked) ||
+		errors.Is(err, ErrComposed1Violation) ||
+		errors.Is(err, ErrComposed1VersionGCd)
 }
 
 func (p *LeaderProxy) forwardFailureDecision(err error, requestID uint64) (leaveCycle bool, done bool) {
@@ -320,18 +317,27 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 }
 
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
-	if isDefinitiveForwardNotLeader(err) ||
-		(len(reqs) == 1 && reqs[0] != nil && reqs[0].Phase == pb.Phase_NONE && isDefinitiveForwardConflict(err)) {
+	if isDefinitiveForwardNotLeader(err) {
 		return errors.WithStack(err)
+	}
+	if len(reqs) == 1 && reqs[0] != nil &&
+		(reqs[0].Phase == pb.Phase_NONE || reqs[0].Phase == pb.Phase_PREPARE) {
+		switch {
+		case isDefinitiveForwardConflict(err):
+			return fmt.Errorf("%w: %w", store.ErrWriteConflict, err)
+		case IsForwardTxnLocked(err):
+			return fmt.Errorf("%w: %w", ErrTxnLocked, err)
+		case IsForwardComposed1Violation(err):
+			return fmt.Errorf("%w: %w", ErrComposed1Violation, err)
+		case IsForwardComposed1VersionGCd(err):
+			return fmt.Errorf("%w: %w", ErrComposed1VersionGCd, err)
+		}
 	}
 	return fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 }
 
 func isDefinitiveForwardNotLeader(err error) bool {
-	st, ok := status.FromError(err)
-	// Internal.Forward returns this exact error only before it stamps or
-	// submits a mutation. A later "leadership lost" can follow submission.
-	return ok && st.Code() == codes.Unknown && st.Message() == "not leader"
+	return IsForwardNotLeader(err)
 }
 
 func (p *LeaderProxy) forwardLeaseRead(callerCtx context.Context) (leaseReadResult, error) {

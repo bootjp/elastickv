@@ -2,6 +2,7 @@ package adapter
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"math"
 	"net"
@@ -426,7 +427,8 @@ func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 	}})
 
 	require.NotEmpty(t, conn.err)
-	require.Contains(t, conn.err, "key: retry:stream")
+	require.Contains(t, conn.err, store.ErrWriteConflict.Error())
+	require.NotContains(t, conn.err, "retry:stream")
 	require.NotContains(t, conn.err, store.StreamEntryPrefix)
 	require.Equal(t, 1, coord.dispatches, "unsafe legacy path must fail closed instead of replaying XADD")
 	meta, found, err := srv.loadStreamMetaAt(context.Background(), []byte("retry:stream"), snapshotTS(coord.Clock(), st))
@@ -438,8 +440,7 @@ func TestRedisXAddDedupDisabledDoesNotReplayLandedWireConflict(t *testing.T) {
 func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 	t.Parallel()
 
-	wireErr := errors.WithStack(status.Error(codes.Aborted,
-		kv.NewTxnLockedError(store.ListItemKey([]byte("list"), 1)).Error()))
+	wireErr := fmt.Errorf("%w: %w", kv.ErrTxnLocked, kv.ForwardTxnLockedStatus())
 	attempts := 0
 	srv := &RedisServer{}
 	err := srv.retryRedisWrite(context.Background(), func() error {
@@ -458,8 +459,7 @@ func TestRetryRedisWriteRetriesWireTxnLocked(t *testing.T) {
 func TestRetryRedisWriteRetriesWireComposedRouteErrors(t *testing.T) {
 	t.Parallel()
 
-	wireErr := errors.WithStack(status.Error(codes.Aborted,
-		"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error()))
+	wireErr := errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1Violation))
 	attempts := 0
 	srv := &RedisServer{}
 	err := srv.retryRedisWrite(context.Background(), func() error {
@@ -485,13 +485,11 @@ func TestComposedRouteErrorsAreRetryableButDoNotPreserveAttempts(t *testing.T) {
 		{name: "typed gc", err: kv.ErrComposed1VersionGCd},
 		{
 			name: "wire violation",
-			err: errors.WithStack(status.Error(codes.Aborted,
-				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1Violation.Error())),
+			err:  errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1Violation)),
 		},
 		{
 			name: "wire gc",
-			err: errors.WithStack(status.Error(codes.Aborted,
-				"current-version v=2: key \"k\" owned by group 2: "+kv.ErrComposed1VersionGCd.Error())),
+			err:  errors.WithStack(kv.ForwardComposed1Status(kv.ErrComposed1VersionGCd)),
 		},
 	}
 
@@ -501,46 +499,6 @@ func TestComposedRouteErrorsAreRetryableButDoNotPreserveAttempts(t *testing.T) {
 
 			require.True(t, isRetryableRedisTxnErr(tt.err))
 			require.False(t, shouldPreserveRedisTxnAttempt(tt.err))
-		})
-	}
-}
-
-func TestRetryRedisWriteDoesNotTreatComposedSentinelInWireConflictKeyAsRouteError(t *testing.T) {
-	t.Parallel()
-
-	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
-		t.Run(sentinel.Error(), func(t *testing.T) {
-			t.Parallel()
-			wireErr := errors.WithStack(status.Error(codes.Unknown,
-				store.NewWriteConflictError([]byte("retry:"+sentinel.Error())).Error()))
-			attempts := 0
-			srv := &RedisServer{}
-
-			err := srv.retryRedisWrite(context.Background(), func() error {
-				attempts++
-				return wireErr
-			})
-
-			require.ErrorIs(t, err, store.ErrWriteConflict)
-			require.NotErrorIs(t, err, sentinel)
-			require.Equal(t, 1, attempts)
-		})
-	}
-}
-
-func TestNormalizeRetryableRedisTxnErrPrefersWireTxnKeyEnvelope(t *testing.T) {
-	t.Parallel()
-
-	for _, sentinel := range []error{kv.ErrComposed1Violation, kv.ErrComposed1VersionGCd} {
-		t.Run(sentinel.Error(), func(t *testing.T) {
-			t.Parallel()
-			wireErr := errors.WithStack(status.Error(codes.Aborted,
-				kv.NewTxnLockedError([]byte("locked:"+sentinel.Error())).Error()))
-
-			err := normalizeRetryableRedisTxnErr(wireErr)
-
-			require.ErrorIs(t, err, kv.ErrTxnLocked)
-			require.NotErrorIs(t, err, sentinel)
 		})
 	}
 }
@@ -572,9 +530,7 @@ func TestRetryRedisWriteDoesNotRetryUnclassifiedWireErrors(t *testing.T) {
 }
 
 func TestRetryRedisWriteDoesNotReplayOrLeakWireWriteConflict(t *testing.T) {
-	internalKey := store.StreamEntryKey([]byte("retry:stream"), 1, 2)
-	wireErr := errors.WithStack(status.Error(codes.Unknown,
-		store.NewWriteConflictError(internalKey).Error()))
+	wireErr := errors.WithStack(kv.ForwardWriteConflictStatus())
 	attempts := 0
 	srv := &RedisServer{}
 
@@ -584,111 +540,35 @@ func TestRetryRedisWriteDoesNotReplayOrLeakWireWriteConflict(t *testing.T) {
 	})
 
 	require.ErrorIs(t, err, store.ErrWriteConflict)
-	require.ErrorContains(t, err, "key: retry:stream")
+	require.Equal(t, store.ErrWriteConflict.Error(), err.Error())
 	require.NotContains(t, err.Error(), "redis txn retry limit exceeded")
 	require.NotContains(t, err.Error(), store.StreamEntryPrefix)
 	require.Equal(t, 1, attempts)
 }
 
-func TestNormalizeRetryableRedisTxnErrWireErrors(t *testing.T) {
+func TestNormalizeRetryableRedisTxnErrDropsStorageContext(t *testing.T) {
 	t.Parallel()
-
-	tests := []struct {
-		name             string
-		wireErr          error
-		wantSentinel     error
-		wantKey          string
-		wantDetail       string
-		internalKeyToken string
+	cases := []struct {
+		name   string
+		err    error
+		want   error
+		hidden string
 	}{
-		{
-			name: "write conflict",
-			wireErr: errors.WithStack(status.Error(codes.Unknown,
-				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)).Error())),
-			wantSentinel:     store.ErrWriteConflict,
-			wantKey:          "retry:stream",
-			internalKeyToken: store.StreamEntryPrefix,
-		},
-		{
-			name: "transaction locked with detail",
-			wireErr: errors.WithStack(status.Error(codes.Aborted,
-				kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow").Error())),
-			wantSentinel:     kv.ErrTxnLocked,
-			wantKey:          "retry:list",
-			wantDetail:       "timestamp overflow",
-			internalKeyToken: store.ListItemPrefix,
-		},
+		{"wire conflict", kv.ForwardWriteConflictStatus(), store.ErrWriteConflict, "key:"},
+		{"wire lock", kv.ForwardTxnLockedStatus(), kv.ErrTxnLocked, "key:"},
+		{"local list lock", kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow"), kv.ErrTxnLocked, "timestamp overflow"},
+		{"local txn TTL conflict", store.NewWriteConflictError(append([]byte("!txn|cmt|"), redisTTLKey([]byte("retry:ttl"))...)), store.ErrWriteConflict, "retry:ttl"},
+		{"local wide fence conflict", store.NewWriteConflictError(redisTxnWideHashFenceKey([]byte("retry:hash"))), store.ErrWriteConflict, "retry:hash"},
 	}
-
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-
-			normalized := normalizeRetryableRedisTxnErr(tt.wireErr)
-
-			require.ErrorIs(t, normalized, tt.wantSentinel)
-			require.ErrorContains(t, normalized, "key: "+tt.wantKey)
-			if tt.wantDetail != "" {
-				require.ErrorContains(t, normalized, tt.wantDetail)
-			}
-			require.NotContains(t, normalized.Error(), tt.internalKeyToken)
+			normalized := normalizeRetryableRedisTxnErr(tc.err)
+			require.ErrorIs(t, normalized, tc.want)
+			require.Equal(t, tc.want.Error(), normalized.Error())
+			require.NotContains(t, normalized.Error(), tc.hidden)
 		})
 	}
-}
-
-func TestNormalizeRetryableRedisTxnErrListKey(t *testing.T) {
-	t.Parallel()
-
-	internalKey := store.ListItemKey([]byte("retry:list"), 1)
-	err := kv.NewTxnLockedError(internalKey)
-
-	normalized := normalizeRetryableRedisTxnErr(err)
-
-	require.ErrorIs(t, normalized, kv.ErrTxnLocked)
-	require.ErrorContains(t, normalized, "key: retry:list")
-	require.NotContains(t, normalized.Error(), store.ListItemPrefix)
-}
-
-func TestNormalizeRetryableRedisTxnErrTxnTTLKey(t *testing.T) {
-	t.Parallel()
-
-	internalKey := append([]byte("!txn|cmt|"), redisTTLKey([]byte("retry:ttl"))...)
-	internalKey = append(internalKey, make([]byte, 8)...)
-	err := store.NewWriteConflictError(internalKey)
-
-	normalized := normalizeRetryableRedisTxnErr(err)
-
-	require.ErrorIs(t, normalized, store.ErrWriteConflict)
-	require.ErrorContains(t, normalized, "key: retry:ttl")
-	require.NotContains(t, normalized.Error(), "!txn|cmt|")
-	require.NotContains(t, normalized.Error(), redisTTLPrefix)
-}
-
-func TestNormalizeRetryableRedisTxnErrWideFenceKey(t *testing.T) {
-	t.Parallel()
-
-	err := store.NewWriteConflictError(redisTxnWideHashFenceKey([]byte("retry:hash")))
-
-	normalized := normalizeRetryableRedisTxnErr(err)
-
-	require.ErrorIs(t, normalized, store.ErrWriteConflict)
-	require.ErrorContains(t, normalized, "key: retry:hash")
-	require.NotContains(t, normalized.Error(), string(redisTxnWideHashFencePrefix))
-	require.NotContains(t, normalized.Error(), "!redis|")
-}
-
-func TestNormalizeRetryableRedisTxnErrPreservesTxnLockedDetail(t *testing.T) {
-	t.Parallel()
-
-	internalKey := store.ListItemKey([]byte("retry:list"), 2)
-	err := errors.WithStack(kv.NewTxnLockedErrorWithDetail(internalKey, "timestamp overflow"))
-
-	normalized := normalizeRetryableRedisTxnErr(err)
-
-	require.ErrorIs(t, normalized, kv.ErrTxnLocked)
-	require.ErrorContains(t, normalized, "key: retry:list")
-	require.ErrorContains(t, normalized, "timestamp overflow")
-	require.NotContains(t, normalized.Error(), store.ListItemPrefix)
 }
 
 func TestRetryPolicyForRedisTxnErr(t *testing.T) {

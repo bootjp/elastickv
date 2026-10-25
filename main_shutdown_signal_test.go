@@ -158,7 +158,11 @@ func TestShutdownSignalWithOpenFileDetachesLazily(t *testing.T) {
 		t.Fatal("shutdown hung on a busy FUSE mount")
 	}
 
-	require.NoError(t, held.Close())
+	// The signal may interrupt FUSE release after the lazy detach. The serve
+	// loop below is the shutdown assertion; an interrupted close is expected.
+	if err := held.Close(); err != nil {
+		require.ErrorIs(t, err, syscall.EINTR)
+	}
 	select {
 	case <-serveDone:
 	case <-time.After(shutdownTestTimeout):
