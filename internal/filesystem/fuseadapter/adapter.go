@@ -43,6 +43,7 @@ type Core interface {
 
 type Adapter struct {
 	core              Core
+	mutations         mutationTracker
 	clientID          []byte
 	readdirLimit      int
 	keepaliveInterval time.Duration
@@ -76,6 +77,7 @@ var errnoMappings = []struct {
 	{filesystem.ErrInvalid, syscall.EINVAL},
 	{filesystem.ErrUnsupported, syscall.EOPNOTSUPP},
 	{filesystem.ErrStaleHome, syscall.EAGAIN},
+	{filesystem.ErrContentionLimit, syscall.EBUSY},
 	{store.ErrWriteConflict, syscall.EAGAIN},
 }
 
@@ -128,10 +130,9 @@ func (a *Adapter) Close() {
 	})
 }
 
-// Errno maps a backend error to the errno reported to the kernel. Write
-// conflicts are retryable, so both the typed store.ErrWriteConflict and the
-// gRPC envelope a follower mount sees after leader forwarding map to EAGAIN
-// instead of EIO.
+// Errno maps a backend error to the errno reported to the kernel. Service
+// operations absorb definitive OCC conflicts before returning to FUSE; EAGAIN
+// remains the legacy fallback for paths not yet integrated with replanning.
 func Errno(err error) syscall.Errno {
 	if err == nil {
 		return 0
@@ -166,7 +167,12 @@ func (a *Adapter) SetAttr(
 	inode uint64,
 	mask filesystem.SetAttrMask,
 	attrs filesystem.SetAttr,
-) (filesystem.Stat, syscall.Errno) {
+) (stat filesystem.Stat, errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, inode)
+	if errno != 0 {
+		return filesystem.Stat{}, errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	stat, err := a.core.SetAttr(ctx, inode, mask, attrs)
 	return stat, Errno(err)
 }
@@ -175,6 +181,8 @@ func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno
 	fh, err := a.core.Open(ctx, inode, a.clientID)
 	if err == nil {
 		a.trackOpenHandle(inode, fh)
+	} else if Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())
 	}
 	return fh, Errno(err)
 }
@@ -187,15 +195,26 @@ func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint
 	return data, Errno(err)
 }
 
-func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uint64, data []byte) (int, syscall.Errno) {
+func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uint64, data []byte) (n int, errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, inode)
+	if errno != 0 {
+		return 0, errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return 0, errno
 	}
 	n, err := a.core.Write(ctx, inode, fh, offset, data)
+	if err != nil && Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "length", len(data), "error", err.Error())
+	}
 	return n, Errno(err)
 }
 
 func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
+	if errno := a.mutations.wait(ctx, inode); errno != 0 {
+		return errno
+	}
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return errno
 	}
@@ -203,14 +222,27 @@ func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Er
 }
 
 func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync bool) syscall.Errno {
+	if errno := a.mutations.wait(ctx, inode); errno != 0 {
+		return errno
+	}
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return errno
 	}
 	return Errno(a.core.Fsync(ctx, inode, fh, datasync))
 }
 
+func (a *Adapter) FsyncDirectory(ctx context.Context, inode uint64) syscall.Errno {
+	if errno := a.mutations.wait(ctx, inode); errno != 0 {
+		return errno
+	}
+	return Errno(a.core.Fsync(ctx, inode, 0, false))
+}
+
 func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
 	err := a.core.Release(ctx, inode, fh, a.clientID)
+	if err != nil && Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE release uncertain", "inode", inode, "fh", fh, "error", err.Error())
+	}
 	a.untrackOpenHandle(inode, fh)
 	return Errno(err)
 }
@@ -220,7 +252,12 @@ func (a *Adapter) Create(
 	parent uint64,
 	name []byte,
 	opts filesystem.CreateOptions,
-) (filesystem.CreateResult, syscall.Errno) {
+) (result filesystem.CreateResult, errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, parent)
+	if errno != 0 {
+		return filesystem.CreateResult{}, errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	opts.ClientID = append([]byte(nil), a.clientID...)
 	result, err := a.core.Create(ctx, parent, name, opts)
 	if err == nil {
@@ -234,7 +271,12 @@ func (a *Adapter) Mknod(
 	parent uint64,
 	name []byte,
 	opts filesystem.CreateOptions,
-) (filesystem.CreateResult, syscall.Errno) {
+) (result filesystem.CreateResult, errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, parent)
+	if errno != 0 {
+		return filesystem.CreateResult{}, errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	opts.ClientID = nil
 	result, err := a.core.Create(ctx, parent, name, opts)
 	return result, Errno(err)
@@ -245,16 +287,31 @@ func (a *Adapter) Mkdir(
 	parent uint64,
 	name []byte,
 	opts filesystem.CreateOptions,
-) (filesystem.CreateResult, syscall.Errno) {
+) (result filesystem.CreateResult, errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, parent)
+	if errno != 0 {
+		return filesystem.CreateResult{}, errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	result, err := a.core.Mkdir(ctx, parent, name, opts)
 	return result, Errno(err)
 }
 
-func (a *Adapter) Unlink(ctx context.Context, parent uint64, name []byte) syscall.Errno {
+func (a *Adapter) Unlink(ctx context.Context, parent uint64, name []byte) (errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, parent)
+	if errno != 0 {
+		return errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	return Errno(a.core.Unlink(ctx, parent, name))
 }
 
-func (a *Adapter) Rmdir(ctx context.Context, parent uint64, name []byte) syscall.Errno {
+func (a *Adapter) Rmdir(ctx context.Context, parent uint64, name []byte) (errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, parent)
+	if errno != 0 {
+		return errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	return Errno(a.core.Rmdir(ctx, parent, name))
 }
 
@@ -264,7 +321,12 @@ func (a *Adapter) Rename(
 	oldName []byte,
 	newParent uint64,
 	newName []byte,
-) syscall.Errno {
+) (errno syscall.Errno) {
+	ticket, errno := a.mutations.begin(ctx, oldParent, newParent)
+	if errno != 0 {
+		return errno
+	}
+	defer func() { a.mutations.end(ticket, errno) }()
 	return Errno(a.core.Rename(ctx, oldParent, oldName, newParent, newName))
 }
 
@@ -279,7 +341,11 @@ func (a *Adapter) StatFS(ctx context.Context, inode uint64) (filesystem.StatFS, 
 }
 
 func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
-	return Errno(a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID))
+	err := a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID)
+	if err != nil && Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE lease refresh failed", "inode", inode, "fh", fh, "error", err.Error())
+	}
+	return Errno(err)
 }
 
 func (a *Adapter) trackOpenHandle(inode uint64, fh uint64) {

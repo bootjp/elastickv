@@ -32,14 +32,15 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 		{name: "invalid", err: filesystem.ErrInvalid, want: syscall.EINVAL},
 		{name: "unsupported", err: filesystem.ErrUnsupported, want: syscall.EOPNOTSUPP},
 		{name: "stale home", err: filesystem.ErrStaleHome, want: syscall.EAGAIN},
+		{name: "contention limit", err: filesystem.ErrContentionLimit, want: syscall.EBUSY},
 		{name: "write conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: syscall.EAGAIN},
 		{
-			name: "forwarded write conflict",
+			name: "legacy textual forwarded conflict is uncertain",
 			err: cerrors.Wrap(
 				status.Error(codes.Unknown, store.NewWriteConflictError([]byte("!fs|ino|7")).Error()),
 				"leader forward failed after 3 retries",
 			),
-			want: syscall.EAGAIN,
+			want: syscall.EIO,
 		},
 		{name: "forwarded other failure", err: status.Error(codes.Unknown, "key: !fs|ino|7: not leader"), want: syscall.EIO},
 		{name: "canceled", err: context.Canceled, want: syscall.EINTR},

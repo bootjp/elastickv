@@ -114,7 +114,7 @@ func parseWireRedisTxnErr(err error) error {
 	if !ok {
 		return nil
 	}
-	msg := st.Message()
+	msg := forwardedStatusMessage(st)
 	if parsed := parseWireRedisTxnKeyErr(msg); parsed != nil {
 		return parsed
 	}

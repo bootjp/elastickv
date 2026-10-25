@@ -10,14 +10,9 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-// IsWriteConflict reports whether err is an OCC write conflict, either the
-// typed store.ErrWriteConflict raised by a local commit or the wire envelope a
-// follower receives when its proposal was forwarded to the leader: Forward
-// returns transaction failures as a gRPC status, which strips the typed error
-// chain and leaves only the "key: <key>: write conflict" message.
-//
-// Callers that retry on it must be idempotent: a lost forwarding response can
-// mean the write was already applied.
+// IsWriteConflict reports a definitive OCC rejection. The leader proxy
+// reconstructs store.ErrWriteConflict from a typed forwarded Aborted status.
+// Textual gRPC errors cannot certify that an attempt did not commit.
 func IsWriteConflict(err error) bool {
 	if err == nil {
 		return false
@@ -25,10 +20,7 @@ func IsWriteConflict(err error) bool {
 	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
 		return false
 	}
-	if errors.Is(err, store.ErrWriteConflict) {
-		return true
-	}
-	return isWireWriteConflict(err)
+	return errors.Is(err, store.ErrWriteConflict)
 }
 
 // isRootInitializationConflict reports whether root initialization may retry
@@ -38,7 +30,7 @@ func IsWriteConflict(err error) bool {
 // This exception is specific to root creation and never changes the general
 // IsWriteConflict classification of an uncertain transaction.
 func isRootInitializationConflict(err error) bool {
-	return IsWriteConflict(err) || (errors.Is(err, kv.ErrTransactionOutcomeUnknown) && isWireWriteConflict(err))
+	return IsWriteConflict(err) || isWireWriteConflict(err)
 }
 
 func isWireWriteConflict(err error) bool {

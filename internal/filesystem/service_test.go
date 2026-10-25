@@ -177,6 +177,131 @@ type transientWriteConflictCoordinator struct {
 	inner     *testCoordinator
 	remaining int
 	calls     int
+	failure   error
+}
+
+func TestServiceCreateReplansAfterDefinitiveConflict(t *testing.T) {
+	ctx := t.Context()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{inner: inner, remaining: 1}
+	svc.dispatch = conflicts
+	created, err := svc.Create(ctx, RootInode, []byte("retry-create"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	require.NotZero(t, created.Inode)
+	require.GreaterOrEqual(t, conflicts.calls, 2)
+	resolved, err := svc.Resolve(ctx, RootInode, []byte("retry-create"))
+	require.NoError(t, err)
+	require.Equal(t, created.Inode, resolved)
+}
+
+func TestServiceCreateDoesNotReplayUnknownOutcome(t *testing.T) {
+	ctx := t.Context()
+	svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{
+		inner: inner, remaining: 1,
+		failure: fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict),
+	}
+	svc.dispatch = conflicts
+	_, err := svc.Create(ctx, RootInode, []byte("unknown-create"), CreateOptions{Mode: testFileMode})
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, conflicts.calls)
+}
+
+func TestServiceNamespaceMutationsReplanAfterDefinitiveConflict(t *testing.T) {
+	for _, operation := range []string{"unlink", "rename"} {
+		t.Run(operation, func(t *testing.T) {
+			ctx := t.Context()
+			svc := newTestServiceWithOptions(t, []uint64{2}, WithCapacity(16))
+			require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+			created, err := svc.Create(ctx, RootInode, []byte("source"), CreateOptions{Mode: testFileMode})
+			require.NoError(t, err)
+			inner, ok := svc.dispatch.(*testCoordinator)
+			require.True(t, ok)
+			conflicts := &transientWriteConflictCoordinator{inner: inner, remaining: 1}
+			svc.dispatch = conflicts
+			if operation == "unlink" {
+				err = svc.Unlink(ctx, RootInode, []byte("source"))
+			} else {
+				err = svc.Rename(ctx, RootInode, []byte("source"), RootInode, []byte("target"))
+			}
+			require.NoError(t, err)
+			require.GreaterOrEqual(t, conflicts.calls, 2)
+			_, err = svc.Resolve(ctx, RootInode, []byte("source"))
+			require.ErrorIs(t, err, ErrNotFound)
+			if operation == "rename" {
+				resolved, err := svc.Resolve(ctx, RootInode, []byte("target"))
+				require.NoError(t, err)
+				require.Equal(t, created.Inode, resolved)
+			}
+		})
+	}
+}
+
+func TestServiceReleaseReplansAfterDefinitiveConflict(t *testing.T) {
+	ctx := t.Context()
+	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4}, WithCapacity(16))
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	clientID := []byte("release-client")
+	created, err := svc.Create(ctx, RootInode, []byte("release"), CreateOptions{
+		Mode: testFileMode, ClientID: clientID,
+	})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{inner: inner, remaining: 1}
+	svc.dispatch = conflicts
+	require.NoError(t, svc.Release(ctx, created.Inode, created.FH, clientID))
+	require.GreaterOrEqual(t, conflicts.calls, 2)
+	_, err = svc.store.GetAt(ctx, fskeys.RefKey(created.Inode, clientID, created.FH), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+}
+
+type interleavingWriteConflictCoordinator struct {
+	inner      *testCoordinator
+	compete    func(context.Context) error
+	interfered bool
+}
+
+type lostWriteResponseCoordinator struct {
+	inner *testCoordinator
+	after func(context.Context) error
+	calls int
+}
+
+func (c *lostWriteResponseCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *lostWriteResponseCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.calls++
+	if _, err := c.inner.Dispatch(ctx, req); err != nil {
+		return nil, err
+	}
+	if err := c.after(ctx); err != nil {
+		return nil, err
+	}
+	return nil, fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict)
+}
+
+func (c *interleavingWriteConflictCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.inner.LinearizableRead(ctx)
+}
+
+func (c *interleavingWriteConflictCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if !c.interfered {
+		c.interfered = true
+		if err := c.compete(ctx); err != nil {
+			return nil, err
+		}
+		return nil, store.ErrWriteConflict
+	}
+	return c.inner.Dispatch(ctx, req)
 }
 
 func (c *transientWriteConflictCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
@@ -187,6 +312,9 @@ func (c *transientWriteConflictCoordinator) Dispatch(ctx context.Context, req *k
 	c.calls++
 	if c.remaining > 0 {
 		c.remaining--
+		if c.failure != nil {
+			return nil, c.failure
+		}
 		return nil, store.ErrWriteConflict
 	}
 	return c.inner.Dispatch(ctx, req)
@@ -231,6 +359,148 @@ func (c *failNthDispatchCoordinator) Dispatch(ctx context.Context, req *kv.Opera
 		return nil, c.err
 	}
 	return c.inner.Dispatch(ctx, req)
+}
+
+func TestServiceWriteRebuildsAfterDefinitiveConflict(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{inner: inner, remaining: 2}
+	svc.dispatch = conflicts
+
+	n, err := svc.Write(ctx, created.Inode, created.FH, 0, []byte("abc"))
+	require.NoError(t, err)
+	require.Equal(t, 3, n)
+	require.Equal(t, 3, conflicts.calls)
+	read, err := svc.Read(ctx, created.Inode, created.FH, 0, 3)
+	require.NoError(t, err)
+	require.Equal(t, []byte("abc"), read)
+}
+
+func TestServiceWriteConflictRetainsConcurrentDisjointBytes(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	_, err = svc.Write(ctx, created.Inode, created.FH, 0, []byte("00"))
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	other, err := NewService(svc.store, inner, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+	conflicts := &interleavingWriteConflictCoordinator{inner: inner}
+	conflicts.compete = func(ctx context.Context) error {
+		_, err := other.Write(ctx, created.Inode, created.FH, 1, []byte("B"))
+		return err
+	}
+	svc.dispatch = conflicts
+
+	_, err = svc.Write(ctx, created.Inode, created.FH, 0, []byte("A"))
+	require.NoError(t, err)
+	require.True(t, conflicts.interfered)
+	read, err := svc.Read(ctx, created.Inode, created.FH, 0, 2)
+	require.NoError(t, err)
+	require.Equal(t, []byte("AB"), read)
+}
+
+func TestServiceWriteNeverReplaysUnknownOutcomeWithConflict(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{
+		inner: inner, remaining: 1,
+		failure: fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict),
+	}
+	svc.dispatch = conflicts
+
+	_, err = svc.Write(ctx, created.Inode, created.FH, 0, []byte("abc"))
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, conflicts.calls)
+}
+
+func TestServiceWriteLostReplyDoesNotOverwriteLaterWriter(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	other, err := NewService(svc.store, inner, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+	lost := &lostWriteResponseCoordinator{inner: inner}
+	lost.after = func(ctx context.Context) error {
+		_, err := other.Write(ctx, created.Inode, created.FH, 0, []byte("B"))
+		return err
+	}
+	svc.dispatch = lost
+
+	_, err = svc.Write(ctx, created.Inode, created.FH, 0, []byte("A"))
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, lost.calls)
+	read, err := svc.Read(ctx, created.Inode, created.FH, 0, 1)
+	require.NoError(t, err)
+	require.Equal(t, []byte("B"), read)
+}
+
+func TestServiceOpenDoesNotRetryUnknownOutcomeWithConflict(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3, 4)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{
+		inner: inner, remaining: 1,
+		failure: fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict),
+	}
+	svc.dispatch = conflicts
+
+	_, err = svc.Open(ctx, created.Inode, []byte("client-a"))
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, conflicts.calls)
+}
+
+func TestServiceOpenRebuildsAfterDefinitiveConflicts(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{inner: inner, remaining: 5}
+	svc.dispatch = conflicts
+
+	fh, err := svc.Open(ctx, created.Inode, []byte("client-a"))
+	require.NoError(t, err)
+	require.NotZero(t, fh)
+	require.Equal(t, 6, conflicts.calls)
+}
+
+func TestServiceRefreshLeaseRebuildsAfterDefinitiveConflict(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode, ClientID: []byte("client-a")})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	conflicts := &transientWriteConflictCoordinator{inner: inner, remaining: 2}
+	svc.dispatch = conflicts
+
+	require.NoError(t, svc.RefreshOpenHandleLease(ctx, created.Inode, created.FH, []byte("client-a")))
+	require.Equal(t, 3, conflicts.calls)
 }
 
 func TestServiceCreateWriteReadTruncateSparse(t *testing.T) {

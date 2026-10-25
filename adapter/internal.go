@@ -255,7 +255,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		return &pb.ForwardResponse{
 			Success:     false,
 			CommitIndex: 0,
-		}, errors.WithStack(err)
+		}, forwardCommitError(err)
 	}
 	if i.forwardWriteObserver != nil {
 		i.forwardWriteObserver(req.GetRequests())
@@ -266,6 +266,13 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 		CommitIndex: r.CommitIndex,
 		CommitTs:    commitTS,
 	}, nil
+}
+
+func forwardCommitError(err error) error {
+	if errors.Is(err, store.ErrWriteConflict) && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return errors.WithStack(status.Error(codes.Aborted, err.Error()))
+	}
+	return errors.WithStack(err)
 }
 
 func (i *Internal) ProbeMigrationState(ctx context.Context, req *pb.ProbeMigrationStateRequest) (*pb.ProbeMigrationStateResponse, error) {

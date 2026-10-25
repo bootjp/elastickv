@@ -35,15 +35,24 @@ const leaderProxyRetryInterval = 25 * time.Millisecond
 // again without a durable operation identity and an authoritative resolution.
 var ErrTransactionOutcomeUnknown = errors.New("transaction outcome unknown")
 
-// A Forward handler returns an OCC failure only after its FSM has rejected
-// the attempt. Keep that certificate distinct from a lost RPC response.
+// New Forward handlers use Aborted with a complete write-conflict suffix only
+// after their FSM rejected an OCC attempt. Older textual Unknown errors are
+// not certificates.
 func isDefinitiveForwardConflict(err error) bool {
 	st, ok := status.FromError(err)
-	if !ok || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) {
+	if !ok || st.Code() != codes.Aborted {
 		return false
 	}
-	return strings.HasPrefix(st.Message(), "key: ") &&
-		strings.HasSuffix(st.Message(), ": "+store.ErrWriteConflict.Error())
+	message := st.Message()
+	marker := store.ErrWriteConflict.Error()
+	// gRPC may preserve server-side status wrappers in the message. The
+	// Aborted code is the certificate; retain the key envelope for callers
+	// that report the rejected predicate.
+	if index := strings.LastIndex(message, "desc = "); index >= 0 {
+		message = message[index+len("desc = "):]
+	}
+	return message == marker ||
+		(strings.HasPrefix(message, "key: ") && strings.HasSuffix(message, ": "+marker))
 }
 
 // LeaderProxy forwards transactional requests to the current raft leader when
@@ -243,7 +252,7 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 			return resp, nil, true
 		}
 		lastErr = err
-		if errors.Is(err, ErrTransactionOutcomeUnknown) {
+		if isTerminalForwardError(err) {
 			return nil, err, true
 		}
 		if callerErr := callerCtx.Err(); callerErr != nil {
@@ -257,6 +266,10 @@ func (p *LeaderProxy) runForwardCycle(callerCtx context.Context, parentCtx conte
 		return nil, errors.Wrapf(lastErr, "leader forward failed after %d retries", maxForwardRetries), true
 	}
 	return nil, lastErr, false
+}
+
+func isTerminalForwardError(err error) bool {
+	return errors.Is(err, ErrTransactionOutcomeUnknown) || errors.Is(err, store.ErrWriteConflict)
 }
 
 func (p *LeaderProxy) forwardFailureDecision(err error, requestID uint64) (leaveCycle bool, done bool) {
@@ -320,9 +333,13 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 }
 
 func classifyForwardRPCError(err error, reqs []*pb.Request) error {
-	if isDefinitiveForwardNotLeader(err) ||
-		(len(reqs) == 1 && reqs[0] != nil && reqs[0].Phase == pb.Phase_NONE && isDefinitiveForwardConflict(err)) {
+	if isDefinitiveForwardNotLeader(err) {
 		return errors.WithStack(err)
+	}
+	if len(reqs) == 1 && reqs[0] != nil &&
+		(reqs[0].Phase == pb.Phase_NONE || reqs[0].Phase == pb.Phase_PREPARE) &&
+		isDefinitiveForwardConflict(err) {
+		return fmt.Errorf("%w: %w", store.ErrWriteConflict, err)
 	}
 	return fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 }

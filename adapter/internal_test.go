@@ -9,8 +9,11 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 func TestInternalForwardObservesCommittedWrites(t *testing.T) {
@@ -39,6 +42,36 @@ func TestInternalForwardObservesCommittedWrites(t *testing.T) {
 	require.Len(t, txn.reqs, 1)
 	require.Same(t, reqs[0], txn.reqs[0])
 	require.Equal(t, uint64(1), reqs[0].Ts)
+}
+
+type forwardConflictTxn struct{ err error }
+
+func (t forwardConflictTxn) Commit(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return nil, t.err
+}
+
+func (forwardConflictTxn) Abort(context.Context, []*pb.Request) (*kv.TransactionResponse, error) {
+	return &kv.TransactionResponse{}, nil
+}
+
+func TestInternalForwardMarksOnlyDefinitiveConflictAborted(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		err  error
+		code codes.Code
+	}{
+		{name: "definitive", err: store.ErrWriteConflict, code: codes.Aborted},
+		{name: "unknown", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), code: codes.Unknown},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			internal := NewInternalWithEngine(forwardConflictTxn{err: tt.err}, forwardObserverLeader{}, nil, nil)
+			_, err := internal.Forward(t.Context(), &pb.ForwardRequest{Requests: []*pb.Request{{
+				Mutations: []*pb.Mutation{{Op: pb.Op_PUT, Key: []byte("k"), Value: []byte("v")}},
+			}}})
+			require.Error(t, err)
+			require.Equal(t, tt.code, status.Code(err))
+		})
+	}
 }
 
 func TestStampTxnTimestamps_RejectsMaxStartTS(t *testing.T) {

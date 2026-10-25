@@ -22,19 +22,39 @@ func normalizeDynamoWriteDispatchError(err error) error {
 	if err == nil {
 		return nil
 	}
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return err
+	}
 	type statusCarrier interface{ GRPCStatus() *status.Status }
 	var carrier statusCarrier
 	if !errors.As(err, &carrier) {
 		return err
 	}
 	st := carrier.GRPCStatus()
-	if st == nil || (st.Code() != codes.Unknown && st.Code() != codes.Aborted) || !strings.HasPrefix(st.Message(), "key: ") {
+	if st == nil {
 		return err
 	}
-	for _, sentinel := range []error{store.ErrWriteConflict, kv.ErrTxnLocked} {
-		if strings.HasSuffix(st.Message(), ": "+sentinel.Error()) {
-			return errors.WithStack(errors.Mark(err, sentinel))
-		}
+	if sentinel := forwardedDynamoWriteSentinel(st); sentinel != nil {
+		return errors.WithStack(errors.Mark(err, sentinel))
 	}
 	return err
+}
+
+func forwardedDynamoWriteSentinel(st *status.Status) error {
+	message := forwardedStatusMessage(st)
+	if st.Code() == codes.Aborted {
+		marker := store.ErrWriteConflict.Error()
+		if message == marker || (strings.HasPrefix(message, "key: ") && strings.HasSuffix(message, ": "+marker)) {
+			return store.ErrWriteConflict
+		}
+	}
+	if (st.Code() != codes.Unknown && st.Code() != codes.Aborted) || !strings.HasPrefix(message, "key: ") {
+		return nil
+	}
+	for _, sentinel := range []error{store.ErrWriteConflict, kv.ErrTxnLocked} {
+		if strings.HasSuffix(message, ": "+sentinel.Error()) {
+			return sentinel
+		}
+	}
+	return nil
 }

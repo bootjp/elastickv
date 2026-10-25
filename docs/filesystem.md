@@ -311,11 +311,12 @@ timeouts, so every `stat` and `lookup` goes to the backend and reflects the
 latest committed state, and so does a `readdir` that starts a new listing (a
 listing already in progress keeps paging through its original snapshot; see
 [Directory listing](#semantics-worth-knowing)). Each FUSE write request is
-applied as one transaction over the chunks it touches and is durable when
-the request returns. `flush` writes no data and `fsync` only re-reads the
-inode, because there is no write-back buffer on the server side; both still
-refresh the handle's lease in the backend, so they can fail with `EAGAIN`
-(see [Concurrency](#semantics-worth-knowing)). Two caveats:
+applied as one transaction over the chunks it touches before it returns.
+The mount waits for earlier local mutations of the same inode before answering
+`flush` or `fsync`, and for earlier local namespace mutations before answering
+directory `fsync`. The backend has no write-back buffer, but `fsync` currently
+uses a read fence rather than a separate durable receipt check. Full crash
+durability guarantees for `fsync` remain under validation. Two caveats:
 
 - *A large `write(2)` is not atomic.* The kernel splits a write into FUSE
   requests of at most 128 KiB (the go-fuse default; the mount does not raise
@@ -333,31 +334,30 @@ refresh the handle's lease in the backend, so they can fail with `EAGAIN`
   remote writes through a long-lived descriptor should reopen the file or
   open it with `O_DIRECT`.
 
-**Concurrency.** The backend uses optimistic concurrency. Two callers that
-modify the same file or the same directory at the same moment can race; the
-loser's system call fails with `EAGAIN` (`Resource temporarily unavailable`).
-Any call that commits a transaction can lose such a race: `open`, `create`,
-`write`, `truncate`, `chmod`/`chown`/`utimes`, `mkdir`, `rmdir`, `rename`,
-`unlink`, `close`, and also `read`, `fsync`, and `flush`, which refresh the
-handle's lease and can collide with the mount's own once-a-minute keepalive
-on the same lease key. Retry everything except the two cases below: reads,
-lease refreshes, and rewriting the same bytes at the same offset are
-idempotent; a retried `mkdir` or `create` whose first attempt did apply
-reports `EEXIST` (`O_CREAT` without `O_EXCL` simply opens the file), and a
-retried `rmdir`, `rename`, or `unlink` reports `ENOENT`, which tells you it
-is already done. The exception is
-`O_APPEND` across mounts: the kernel picks the append offset from the size it
-last saw and the server writes at that offset, so appends from different
-nodes are not atomic with respect to each other, and retrying one after
-`EAGAIN` can land on an offset another node has since written. Give each
-appending file a single writer, or append through one mount. Never retry
-`close`:
-the kernel has already released the descriptor when it reports the error (the
-`EAGAIN` comes from the lease refresh in the final flush), and a second
-`close` could hit a descriptor another thread has since reused. Treat a
-failed `close` as a signal to redo the higher-level operation through a fresh
-descriptor. Applications that expect POSIX serialization under contention
-must retry on `EAGAIN`.
+**Concurrency.** The backend uses optimistic concurrency. Within a mount,
+mutations of the same inode or parent directory enter a local queue. Across
+mounts, `open`, `create`, `write`, `mkdir`, `rmdir`, `rename`, `unlink`, and `close`
+rebuild after a *definitive* OCC rejection, within a bounded retry budget.
+Lease refresh also retries definitive conflicts. Other mutation paths can
+still return `EAGAIN`; this is an incremental implementation of the conflict
+semantics design. If a forwarded transaction's result is unknown, the mount
+returns `EIO`. An unresolved tracked mutation also leaves a sticky barrier
+error for the affected inode or directory until remount. Do not replay a
+non-idempotent operation after that error: it may already have committed.
+An exhausted retry budget or full local mutation queue returns `EBUSY`;
+a queued request also has a 30-second wait bound. Genuine SQLite byte-range
+lock contention remains `SQLITE_BUSY`.
+`O_APPEND` across mounts remains non-atomic because each kernel picks an
+offset from the size it last observed; use one writer or one mount for each
+appending file. A failed `close` must not be retried on a potentially reused
+file descriptor.
+
+**SQLite.** PERSIST and DELETE rollback journals have been exercised with
+multiple processes on one Linux mount, including a three-node crash/restart
+check. Keep one database on one mount. Sharing the same database across mounts
+and SQLite WAL mode are not supported: byte-range locks and cached pages are
+local to each mount. This validation does not establish the pending `fsync`
+durability receipt and unknown-outcome recovery guarantees.
 
 **Open / replace race across mounts.** FUSE splits `open(2)` into a lookup and
 an open. If another mount replaces the file (for example with
@@ -491,8 +491,9 @@ filesystem backup adapter exists, there are two options:
 | Restart exits with `detach stale filesystem FUSE mount: ... stat FUSE mount at ...: no answer within 10s` | A FUSE server is still attached to the mount point but not answering (a hung previous process). Find and stop that process (`fuser -m <mount-point>` or `ps`), then restart. |
 | Restart exits with `detach stale filesystem FUSE mount: ... resolve FUSE mount point ...: no answer within 10s` | A parent directory of the mount point sits on a filesystem that is not answering (a wedged FUSE or network mount above the mount point), so the server could not even resolve the path. Repair or detach that outer filesystem, or move the mount point off it, then restart. |
 | Restart exits with `fusermount3: failed to access mountpoint ...: Transport endpoint is not connected` | The dead mount at the path is not one the server will touch: the mounts table does not list it as `fuse.elastickv` (for example a `fuseblk`, a non-FUSE filesystem, or another FUSE filesystem such as `fuse.sshfs` stacked over the mount point). Inspect `/proc/self/mounts` and detach it by hand. |
-| `Resource temporarily unavailable` (`EAGAIN`) | Another mount modified the same file or directory at the same time, or the file is being moved between groups. Retry the call, with two exceptions: never retry `close`, and do not retry an `O_APPEND` write that other mounts may also be appending to. See [Concurrency](#semantics-worth-knowing) for what a retry reports when the first attempt did apply. |
-| `Input/output error` (`EIO`) | A backend error that is not a write conflict, for example a lost connection to the leader. Check the server log; retry once the cluster is healthy. |
+| `Resource temporarily unavailable` (`EAGAIN`) | A mutation path that has not yet been converted to internal replanning encountered a conflict, or the file is moving between groups. Check the operation before deciding whether application replay is safe; never retry `close` on the same descriptor. |
+| `Device or resource busy` (`EBUSY`) | The bounded internal conflict retry budget was exhausted or the local mutation queue is full. Reduce contention or retry a higher-level operation after checking its state. |
+| `Input/output error` (`EIO`) | The backend may have committed a mutation whose result was lost, or another backend error occurred. Check the server log and current file state; do not blindly repeat a non-idempotent operation. An unresolved tracked mutation remains visible to later barriers until remount. |
 | `ENOENT` opening a file that exists | The file was replaced by `rename` from another mount between lookup and open. Retry. |
 | `Operation not supported` | Hard link, symlink, special file, or cross-directory rename. See the table at the top. |
 | `mountpoint -q` fails while the server is up | The listeners start before the mount; wait for `filesystem FUSE mounted` in the log. If it never appears, the mount failed and the server exits. |

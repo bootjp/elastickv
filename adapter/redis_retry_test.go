@@ -610,6 +610,14 @@ func TestNormalizeRetryableRedisTxnErrWireErrors(t *testing.T) {
 			internalKeyToken: store.StreamEntryPrefix,
 		},
 		{
+			name: "nested typed write conflict",
+			wireErr: status.Error(codes.Aborted, "rpc error: code = Aborted desc = "+
+				store.NewWriteConflictError(store.StreamEntryKey([]byte("retry:stream"), 1, 2)).Error()),
+			wantSentinel:     store.ErrWriteConflict,
+			wantKey:          "retry:stream",
+			internalKeyToken: store.StreamEntryPrefix,
+		},
+		{
 			name: "transaction locked with detail",
 			wireErr: errors.WithStack(status.Error(codes.Aborted,
 				kv.NewTxnLockedErrorWithDetail(store.ListItemKey([]byte("retry:list"), 2), "timestamp overflow").Error())),

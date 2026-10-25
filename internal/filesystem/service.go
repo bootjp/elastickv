@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"math"
+	"math/big"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -40,6 +41,10 @@ const (
 	openRefScanLimit                       = 2
 	openTxnRetryLimit                      = 4
 	rootInitializationRetryLimit           = 4
+	writeConflictRetryLimit                = 256
+	writeConflictRetryBudget               = 30 * time.Second
+	writeConflictMaxBackoffMillis          = 100
+	writeConflictMaxBackoffShift           = 7
 )
 
 var (
@@ -54,6 +59,7 @@ var (
 	ErrInvalid             = errors.New("filesystem: invalid argument")
 	ErrUnsupported         = errors.New("filesystem: operation not supported")
 	ErrStaleHome           = errors.New("filesystem: stale or migrating file home")
+	ErrContentionLimit     = errors.New("filesystem: contention retry limit reached")
 	ErrMoveJobNotFound     = errors.New("filesystem: move job not found")
 	ErrMoveFenceLost       = errors.New("filesystem: move job lost its epoch fence")
 	ErrPlacementRequired   = errors.New("filesystem: placement resolver is required")
@@ -554,22 +560,39 @@ func (s *Service) Mkdir(ctx context.Context, parent uint64, name []byte, opts Cr
 }
 
 func (s *Service) Open(ctx context.Context, inode uint64, clientID []byte) (uint64, error) {
-	var lastErr error
-	for range openTxnRetryLimit {
+	ctx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	defer cancel()
+	collisions := 0
+	for attempt := range writeConflictRetryLimit {
+		if err := ctx.Err(); err != nil {
+			return 0, errors.WithStack(err)
+		}
 		fh, err := s.allocID()
 		if err != nil {
 			return 0, err
 		}
-		if err := s.openWithHandle(ctx, inode, clientID, fh); err != nil {
-			if errors.Is(err, store.ErrWriteConflict) || errors.Is(err, ErrExists) {
-				lastErr = err
-				continue
+		err = s.openWithHandle(ctx, inode, clientID, fh)
+		if err == nil {
+			return fh, nil
+		}
+		if errors.Is(err, ErrExists) {
+			collisions++
+			if collisions == openTxnRetryLimit {
+				return 0, err
 			}
+			continue
+		}
+		if !isDefinitiveWriteConflict(err) {
 			return 0, err
 		}
-		return fh, nil
+		if attempt == writeConflictRetryLimit-1 {
+			return 0, ErrContentionLimit
+		}
+		if err := waitWriteConflictRetry(ctx, attempt); err != nil {
+			return 0, err
+		}
 	}
-	return 0, lastErr
+	return 0, ErrContentionLimit
 }
 
 func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []byte, fh uint64) error {
@@ -675,7 +698,6 @@ func (s *Service) Read(ctx context.Context, inode uint64, _ uint64, offset uint6
 	return out, nil
 }
 
-//nolint:cyclop // Write performs chunk read-modify-write and metadata update atomically.
 func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint64, data []byte) (int, error) {
 	started := time.Now()
 	defer func() {
@@ -683,6 +705,57 @@ func (s *Service) Write(ctx context.Context, inode uint64, _ uint64, offset uint
 			s.observer.ObserveChunkWrite(time.Since(started))
 		}
 	}()
+	// Keep the caller's bytes stable while an OCC abort causes a fresh plan.
+	data = bytes.Clone(data)
+	ctx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	defer cancel()
+	return s.retryWrite(ctx, inode, offset, data)
+}
+
+func (s *Service) retryWrite(ctx context.Context, inode uint64, offset uint64, data []byte) (int, error) {
+	for attempt := range writeConflictRetryLimit {
+		if err := ctx.Err(); err != nil {
+			return 0, errors.WithStack(err)
+		}
+		n, err := s.writeOnce(ctx, inode, offset, data)
+		if !isDefinitiveWriteConflict(err) {
+			return n, err
+		}
+		if err := ctx.Err(); err != nil {
+			return 0, errors.WithStack(err)
+		}
+		if attempt == writeConflictRetryLimit-1 {
+			return 0, ErrContentionLimit
+		}
+		if err := waitWriteConflictRetry(ctx, attempt); err != nil {
+			return 0, err
+		}
+	}
+	return 0, ErrContentionLimit
+}
+
+func isDefinitiveWriteConflict(err error) bool {
+	return err != nil && errors.Is(err, store.ErrWriteConflict) && !errors.Is(err, kv.ErrTransactionOutcomeUnknown)
+}
+
+func waitWriteConflictRetry(ctx context.Context, attempt int) error {
+	maxDelay := min(1<<min(attempt, writeConflictMaxBackoffShift), writeConflictMaxBackoffMillis)
+	jitter, err := rand.Int(rand.Reader, big.NewInt(int64(maxDelay+1)))
+	if err != nil {
+		return errors.Wrap(err, "choose filesystem write retry backoff")
+	}
+	wait := time.NewTimer(time.Duration(jitter.Int64()) * time.Millisecond)
+	defer wait.Stop()
+	select {
+	case <-ctx.Done():
+		return errors.WithStack(ctx.Err())
+	case <-wait.C:
+		return nil
+	}
+}
+
+//nolint:cyclop // writeOnce performs chunk read-modify-write and metadata update atomically.
+func (s *Service) writeOnce(ctx context.Context, inode uint64, offset uint64, data []byte) (int, error) {
 	if len(data) == 0 {
 		return 0, nil
 	}
@@ -862,15 +935,43 @@ func (s *Service) Truncate(ctx context.Context, inode uint64, size uint64) error
 }
 
 func (s *Service) Unlink(ctx context.Context, parent uint64, name []byte) error {
-	return s.unlinkWithIntent(ctx, parent, name, false)
+	return s.retryDefinitiveMutation(ctx, func(ctx context.Context) error {
+		return s.unlinkWithIntent(ctx, parent, name, false)
+	})
 }
 
 func (s *Service) Rmdir(ctx context.Context, parent uint64, name []byte) error {
-	return s.unlinkWithIntent(ctx, parent, name, true)
+	return s.retryDefinitiveMutation(ctx, func(ctx context.Context) error {
+		return s.unlinkWithIntent(ctx, parent, name, true)
+	})
+}
+
+func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, newParent uint64, newName []byte) error {
+	return s.retryDefinitiveMutation(ctx, func(ctx context.Context) error {
+		return s.renameOnce(ctx, oldParent, oldName, newParent, newName)
+	})
+}
+
+func (s *Service) retryDefinitiveMutation(ctx context.Context, mutate func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	defer cancel()
+	for attempt := range writeConflictRetryLimit {
+		err := mutate(ctx)
+		if !isDefinitiveWriteConflict(err) {
+			return err
+		}
+		if attempt == writeConflictRetryLimit-1 {
+			return ErrContentionLimit
+		}
+		if err := waitWriteConflictRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return ErrContentionLimit
 }
 
 //nolint:cyclop // Rename maps filesystem replace/error semantics into one atomic directory update.
-func (s *Service) Rename(ctx context.Context, oldParent uint64, oldName []byte, newParent uint64, newName []byte) error {
+func (s *Service) renameOnce(ctx context.Context, oldParent uint64, oldName []byte, newParent uint64, newName []byte) error {
 	if oldParent != newParent {
 		return ErrCrossDevice
 	}
@@ -1122,6 +1223,12 @@ func (s *Service) Fsync(ctx context.Context, inode uint64, _ uint64, _ bool) err
 }
 
 func (s *Service) Release(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
+	return s.retryDefinitiveMutation(ctx, func(ctx context.Context) error {
+		return s.releaseOnce(ctx, inode, fh, clientID)
+	})
+}
+
+func (s *Service) releaseOnce(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
 	ts, err := s.readTS(ctx)
 	if err != nil {
 		return err
@@ -1138,7 +1245,8 @@ func (s *Service) Release(ctx context.Context, inode uint64, fh uint64, clientID
 	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
 		return err
 	}
-	return s.finishCommittedChunkDeletes(ctx, chunkDeletes)
+	s.reclaimCommittedOrphanBestEffort(ctx, chunkDeletes)
+	return nil
 }
 
 func (s *Service) releaseRefTxnParts(
@@ -1480,6 +1588,27 @@ func freeAfterUsed(total uint64, used uint64, unknown uint64) uint64 {
 }
 
 func (s *Service) RefreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
+	ctx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	defer cancel()
+	for attempt := range writeConflictRetryLimit {
+		if err := ctx.Err(); err != nil {
+			return errors.WithStack(err)
+		}
+		err := s.refreshOpenHandleLeaseOnce(ctx, inode, fh, clientID)
+		if !isDefinitiveWriteConflict(err) {
+			return err
+		}
+		if attempt == writeConflictRetryLimit-1 {
+			return ErrContentionLimit
+		}
+		if err := waitWriteConflictRetry(ctx, attempt); err != nil {
+			return err
+		}
+	}
+	return ErrContentionLimit
+}
+
+func (s *Service) refreshOpenHandleLeaseOnce(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
 	ts, err := s.readTS(ctx)
 	if err != nil {
 		return err

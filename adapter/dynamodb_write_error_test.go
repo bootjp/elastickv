@@ -22,6 +22,10 @@ func TestNormalizeDynamoWriteDispatchError(t *testing.T) {
 	}{
 		{"nil", nil, nil},
 		{"local conflict", store.NewWriteConflictError([]byte("k")), store.ErrWriteConflict},
+		{"typed forwarded conflict", status.Error(codes.Aborted, store.ErrWriteConflict.Error()), store.ErrWriteConflict},
+		{"wrapped typed forwarded conflict", errors.WithStack(status.Error(codes.Aborted, store.ErrWriteConflict.Error())), store.ErrWriteConflict},
+		{"nested keyed typed forwarded conflict", status.Error(codes.Aborted, "rpc error: code = Aborted desc = key: k: write conflict"), store.ErrWriteConflict},
+		{"unknown outcome with typed conflict detail", errors.Join(kv.ErrTransactionOutcomeUnknown, status.Error(codes.Aborted, store.ErrWriteConflict.Error())), nil},
 		{"unknown conflict", status.Error(codes.Unknown, "key: k: write conflict"), store.ErrWriteConflict},
 		{"wrapped aborted conflict", errors.WithStack(status.Error(codes.Aborted, "key: k: write conflict")), store.ErrWriteConflict},
 		{"local lock", kv.NewTxnLockedError([]byte("k")), kv.ErrTxnLocked},

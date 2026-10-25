@@ -11,6 +11,7 @@ import (
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -442,9 +443,12 @@ func TestLeaderProxy_LostForwardResponseDoesNotReplay(t *testing.T) {
 func TestForwardDecisionEvidence(t *testing.T) {
 	t.Parallel()
 
-	rejected := status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())
+	rejected := status.Error(codes.Aborted, store.ErrWriteConflict.Error())
 	require.True(t, isDefinitiveForwardConflict(rejected))
+	require.True(t, isDefinitiveForwardConflict(errors.WithStack(status.Error(codes.Aborted,
+		store.NewWriteConflictError([]byte("key")).Error()))))
 	require.False(t, isDefinitiveForwardNotLeader(rejected))
+	require.False(t, isDefinitiveForwardConflict(status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())))
 
 	beforeSubmit := status.Error(codes.Unknown, "not leader")
 	require.True(t, isDefinitiveForwardNotLeader(beforeSubmit))
@@ -465,7 +469,7 @@ func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 	var lc net.ListenConfig
 	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
-	svc := &fakeInternal{err: status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())}
+	svc := &fakeInternal{err: status.Error(codes.Aborted, store.ErrWriteConflict.Error())}
 	srv := grpc.NewServer()
 	pb.RegisterInternalServer(srv, svc)
 	go func() { _ = srv.Serve(lis) }()
@@ -479,4 +483,24 @@ func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 	_, err = p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}})
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.Equal(t, 1, svc.callCount())
+}
+
+func TestClassifyForwardConflictByPhase(t *testing.T) {
+	t.Parallel()
+	proof := status.Error(codes.Aborted, store.ErrWriteConflict.Error())
+	for _, phase := range []pb.Phase{pb.Phase_NONE, pb.Phase_PREPARE} {
+		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
+		require.ErrorIs(t, err, store.ErrWriteConflict)
+		require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+		wrapped := errors.WithStack(proof)
+		err = classifyForwardRPCError(wrapped, []*pb.Request{{IsTxn: true, Phase: phase}})
+		require.ErrorIs(t, err, store.ErrWriteConflict)
+	}
+	for _, phase := range []pb.Phase{pb.Phase_COMMIT, pb.Phase_ABORT} {
+		err := classifyForwardRPCError(proof, []*pb.Request{{IsTxn: true, Phase: phase}})
+		require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	}
+	legacy := status.Error(codes.Unknown, store.NewWriteConflictError([]byte("key")).Error())
+	err := classifyForwardRPCError(legacy, []*pb.Request{{IsTxn: true, Phase: pb.Phase_NONE}})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 }

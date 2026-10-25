@@ -23,10 +23,10 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: 'go.mod'
-      - name: Install fuse3
+      - name: Install fuse3 and sqlite3
         # fusermount3 lets the FUSE end-to-end tests mount without root
         # (internal/filesystem/fuseadapter, TestMountFilesystemServiceServesKernelMount).
-        run: sudo apt-get update && sudo apt-get install -y fuse3
+        run: sudo apt-get update && sudo apt-get install -y fuse3 sqlite3
       - name: Reject production imports of test support
         run: bash scripts/check-production-imports.sh
       - name: Run race tests outside full-length gRPC sequences
@@ -34,6 +34,7 @@ jobs:
         env:
           # Fail, rather than skip, the kernel-mount tests when FUSE is unusable.
           ELASTICKV_REQUIRE_FUSE: "1"
+          ELASTICKV_REQUIRE_SQLITE: "1"
       # These unchanged 10,000-iteration tests need a fresh package budget
       # after the serial migration/snapshot acceptance tests have finished.
       - name: Run full-length gRPC consistency sequences
