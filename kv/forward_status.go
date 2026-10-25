@@ -2,6 +2,7 @@ package kv
 
 import (
 	"encoding/base64"
+	"strings"
 
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -60,10 +61,16 @@ func ForwardNotLeaderStatus() error {
 }
 
 func forwardStatus(code codes.Code, message, reason string, metadata map[string]string) error {
-	st, err := status.New(code, message).WithDetails(&errdetails.ErrorInfo{
+	// Protobuf status strings must be valid UTF-8. Internal conflict keys may
+	// contain arbitrary bytes; their exact value travels separately as base64.
+	cleanMetadata := make(map[string]string, len(metadata))
+	for key, value := range metadata {
+		cleanMetadata[key] = strings.ToValidUTF8(value, "\uFFFD")
+	}
+	st, err := status.New(code, strings.ToValidUTF8(message, "\uFFFD")).WithDetails(&errdetails.ErrorInfo{
 		Domain:   forwardErrorDomain,
 		Reason:   reason,
-		Metadata: metadata,
+		Metadata: cleanMetadata,
 	})
 	if err != nil {
 		return errors.WithStack(status.Error(codes.Internal, "forward status detail unavailable"))
