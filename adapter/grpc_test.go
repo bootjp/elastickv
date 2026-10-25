@@ -155,6 +155,61 @@ func TestGRPCServer_RawLatestCommitTS_EmptyKeyReturnsGlobalWatermark(t *testing.
 	assert.Equal(t, uint64(77), resp.GetTs())
 }
 
+func TestGRPCServer_RawLatestCommitTS_ExactVersionProof(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("old"), 77, 0))
+	require.NoError(t, st.PutAt(ctx, []byte("k"), []byte("new"), 99, 0))
+	server := NewGRPCServer(st, nil)
+
+	for _, test := range []struct {
+		at     uint64
+		exists bool
+	}{
+		{at: 77, exists: true},
+		{at: 88, exists: false},
+	} {
+		response, err := server.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k"), ExactVersionAtTs: test.at})
+		require.NoError(t, err)
+		require.True(t, response.GetExactVersionSupported())
+		require.Equal(t, test.exists, response.GetExactVersionExists())
+	}
+	response, err := server.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{Key: []byte("k")})
+	require.NoError(t, err)
+	require.False(t, response.GetExactVersionSupported())
+}
+
+type exactGroupProofStore struct {
+	store.MVCCStore
+	groupID uint64
+}
+
+func (s *exactGroupProofStore) LatestCommitTSGroupWithReadFence(ctx context.Context, key []byte, groupID, _ uint64) (uint64, bool, error) {
+	s.groupID = groupID
+	return s.LatestCommitTS(ctx, key)
+}
+
+func (s *exactGroupProofStore) CommittedVersionAtGroupWithReadFence(ctx context.Context, key []byte, groupID, ts, _ uint64) (bool, error) {
+	s.groupID = groupID
+	return s.CommittedVersionAt(ctx, key, ts)
+}
+
+func TestGRPCServer_RawLatestCommitTS_ExactGroupProof(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	st := &exactGroupProofStore{MVCCStore: store.NewMVCCStore()}
+	require.NoError(t, st.PutAt(ctx, []byte("receipt"), []byte{1}, 77, 0))
+	server := NewGRPCServer(st, nil)
+	response, err := server.RawLatestCommitTS(ctx, &pb.RawLatestCommitTSRequest{
+		Key: []byte("receipt"), GroupId: 42, ExactVersionAtTs: 77,
+	})
+	require.NoError(t, err)
+	require.True(t, response.GetExactVersionSupported())
+	require.True(t, response.GetExactVersionExists())
+	require.Equal(t, uint64(42), st.groupID)
+}
+
 func TestGRPCServer_RawLatestCommitTS_ExplicitGroupUsesLeaderFencedReader(t *testing.T) {
 	t.Parallel()
 

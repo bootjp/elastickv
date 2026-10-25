@@ -70,6 +70,10 @@ type Elem[T OP] struct {
 type OperationGroup[T OP] struct {
 	Elems []*Elem[T]
 	IsTxn bool
+	// RequireAllParticipants makes a committed primary insufficient for a
+	// successful response: every secondary must acknowledge apply. Used by
+	// operation-result publication, whose success includes visible effects.
+	RequireAllParticipants bool
 	// KeyVizLabel tags this operation group for KeyViz attribution.
 	// The zero value is the legacy unlabeled route-only view.
 	KeyVizLabel keyviz.Label

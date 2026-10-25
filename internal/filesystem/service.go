@@ -2648,26 +2648,38 @@ func (s *Service) dispatchTxn(
 	elems []*kv.Elem[kv.OP],
 	readKeys [][]byte,
 ) error {
+	_, err := s.dispatchTxnWithPolicy(ctx, startTS, elems, readKeys, false)
+	return err
+}
+
+func (s *Service) dispatchTxnWithPolicy(
+	ctx context.Context,
+	startTS uint64,
+	elems []*kv.Elem[kv.OP],
+	readKeys [][]byte,
+	requireAllParticipants bool,
+) (*kv.CoordinateResponse, error) {
 	startTS = normalizeEmptyStoreReadTS(startTS)
 	reqs := &kv.OperationGroup[kv.OP]{
-		Elems:    elems,
-		IsTxn:    true,
-		StartTS:  startTS,
-		ReadKeys: readKeys,
+		Elems:                  elems,
+		IsTxn:                  true,
+		RequireAllParticipants: requireAllParticipants,
+		StartTS:                startTS,
+		ReadKeys:               readKeys,
 	}
 	coord, ok := s.dispatch.(kv.Coordinator)
 	if !ok {
-		_, err := s.dispatch.Dispatch(ctx, reqs)
-		return errors.Wrap(err, "filesystem dispatch txn")
+		resp, err := s.dispatch.Dispatch(ctx, reqs)
+		return resp, errors.Wrap(err, "filesystem dispatch txn")
 	}
 	readTimestamp, err := kv.BeginReadTimestampThrough(ctx, coord, startTS,
 		"filesystem dispatch txn: begin read timestamp")
 	if err != nil {
-		return errors.WithStack(err)
+		return nil, errors.WithStack(err)
 	}
 	reqs.StartTS = readTimestamp.Timestamp()
-	_, err = kv.DispatchWithReadTimestamp(readTimestamp.WithDispatchVoucher(ctx), coord, reqs)
-	return errors.Wrap(err, "filesystem dispatch txn")
+	resp, err := kv.DispatchWithReadTimestamp(readTimestamp.WithDispatchVoucher(ctx), coord, reqs)
+	return resp, errors.Wrap(err, "filesystem dispatch txn")
 }
 
 // emptyStoreReadTS stands in for the zero applied watermark a store that has

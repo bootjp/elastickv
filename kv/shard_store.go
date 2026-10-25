@@ -776,6 +776,9 @@ func (s *ShardStore) routeForExplicitGroupKey(groupID uint64, key []byte) (distr
 var fsChunkAllPrefix = fskeys.ChunkAllPrefix()
 
 func explicitGroupResolverOwnedKey(key []byte) bool {
+	if fskeys.IsOperationProofKey(key) {
+		return true
+	}
 	if sqsRouteKey(key) != nil {
 		return true
 	}
@@ -925,7 +928,87 @@ func (s *ShardStore) ExistsAt(ctx context.Context, key []byte, ts uint64) (bool,
 // pending.length fast-path during churn. Mirrors LeaderRoutedStore's fix
 // for codex P1 #796.
 func (s *ShardStore) CommittedVersionAt(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
+	return s.CommittedVersionAtWithReadFence(ctx, key, commitTS, 0)
+}
+
+// CommittedVersionAtAuthoritative asks the current leader for the exact
+// version when a local linearizable probe is unavailable. Older leaders that
+// lack the proof field leave the outcome unknown rather than answering false.
+func (s *ShardStore) CommittedVersionAtAuthoritative(ctx context.Context, key []byte, commitTS uint64) (bool, error) {
 	if err := s.awaitReadRouteVersion(ctx, 0); err != nil {
+		return false, err
+	}
+	_, group, version, ok := s.routeAndGroupForKeyWithVersion(key)
+	if !ok || group == nil || group.Store == nil {
+		return false, errors.WithStack(ErrTransactionOutcomeUnknown)
+	}
+	engine := engineForGroup(group)
+	if engine == nil || isLinearizableRaftLeader(ctx, engine) || tryEngineLinearizableFence(ctx, engine) {
+		return s.CommittedVersionAtWithReadFence(ctx, key, commitTS, version)
+	}
+	return s.proxyCommittedVersionAt(ctx, group, key, 0, commitTS, version)
+}
+
+// CommittedVersionAtGroupAuthoritative verifies a stable receipt row in the
+// participant that applied its effect, even when catalog routing for the
+// receipt key points elsewhere.
+func (s *ShardStore) CommittedVersionAtGroupAuthoritative(ctx context.Context, key []byte, groupID, commitTS uint64) (bool, error) {
+	if groupID == 0 {
+		return s.CommittedVersionAtAuthoritative(ctx, key, commitTS)
+	}
+	g, ok := s.groupForID(groupID)
+	if !ok || g == nil || g.Store == nil {
+		return false, errors.WithStack(ErrTransactionOutcomeUnknown)
+	}
+	engine := engineForGroup(g)
+	if engine == nil || isLinearizableRaftLeader(ctx, engine) || tryEngineLinearizableFence(ctx, engine) {
+		exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+		return exists, errors.Wrap(err, "verify local participant receipt")
+	}
+	return s.proxyCommittedVersionAt(ctx, g, key, groupID, commitTS, 0)
+}
+
+func (s *ShardStore) CommittedVersionAtGroupWithReadFence(ctx context.Context, key []byte, groupID, commitTS, readRouteVersion uint64) (bool, error) {
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
+		return false, err
+	}
+	g, ok := s.groupForID(groupID)
+	if !ok || g == nil || g.Store == nil {
+		return false, errors.WithStack(ErrTransactionOutcomeUnknown)
+	}
+	if engine := engineForGroup(g); engine != nil && !isLinearizableRaftLeader(ctx, engine) {
+		return false, errors.WithStack(ErrTransactionOutcomeUnknown)
+	}
+	exists, err := g.Store.CommittedVersionAt(ctx, key, commitTS)
+	return exists, errors.Wrap(err, "verify group participant receipt")
+}
+
+func (s *ShardStore) proxyCommittedVersionAt(ctx context.Context, group *ShardGroup, key []byte, groupID, commitTS, routeVersion uint64) (bool, error) {
+	addr := leaderAddrFromEngine(engineForGroup(group))
+	if addr == "" {
+		return false, errors.WithStack(ErrLeaderNotFound)
+	}
+	conn, err := s.connCache.ConnFor(addr)
+	if err != nil {
+		return false, errors.Wrap(err, "connect to exact-version leader")
+	}
+	rpcCtx, cancel := context.WithTimeout(ctx, proxyForwardTimeout)
+	defer cancel()
+	resp, err := pb.NewRawKVClient(conn).RawLatestCommitTS(rpcCtx, &pb.RawLatestCommitTSRequest{
+		Key: key, GroupId: groupID, ReadRouteVersion: routeVersion, ExactVersionAtTs: commitTS,
+	})
+	if err != nil {
+		return false, errors.Wrap(err, "probe exact committed version")
+	}
+	if resp == nil || !resp.GetExactVersionSupported() {
+		return false, errors.WithStack(ErrTransactionOutcomeUnknown)
+	}
+	return resp.GetExactVersionExists(), nil
+}
+
+func (s *ShardStore) CommittedVersionAtWithReadFence(ctx context.Context, key []byte, commitTS, readRouteVersion uint64) (bool, error) {
+	ctx = migrationServingReadContext(ctx, readRouteVersion)
+	if err := s.awaitReadRouteVersion(ctx, readRouteVersion); err != nil {
 		return false, err
 	}
 	route, g, ok := s.routeAndGroupForKey(key)
