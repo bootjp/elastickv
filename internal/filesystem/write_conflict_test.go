@@ -99,6 +99,7 @@ func TestIsWriteConflict(t *testing.T) {
 		{name: "nil", err: nil, want: false},
 		{name: "typed conflict", err: store.NewWriteConflictError(conflictKey), want: true},
 		{name: "wrapped typed conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: true},
+		{name: "unknown attempt with conflict detail", err: errors.Join(kv.ErrTransactionOutcomeUnknown, store.ErrWriteConflict), want: false},
 		{name: "forwarded unknown status", err: forwardedWriteConflict(conflictKey), want: true},
 		{name: "forwarded aborted status", err: status.Error(codes.Aborted, store.NewWriteConflictError(conflictKey).Error()), want: true},
 		{name: "forwarded other code", err: status.Error(codes.Unavailable, store.NewWriteConflictError(conflictKey).Error()), want: false},
@@ -112,4 +113,11 @@ func TestIsWriteConflict(t *testing.T) {
 			require.Equal(t, tt.want, isRootInitializationConflict(tt.err))
 		})
 	}
+}
+
+func TestRootInitializationRechecksAfterUncertainForwardedConflict(t *testing.T) {
+	key := []byte("!fs|ino|root")
+	err := errors.Join(kv.ErrTransactionOutcomeUnknown, forwardedWriteConflict(key))
+	require.False(t, IsWriteConflict(err))
+	require.True(t, isRootInitializationConflict(err))
 }

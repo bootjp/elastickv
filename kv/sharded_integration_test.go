@@ -10,6 +10,7 @@ import (
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
+	"github.com/stretchr/testify/require"
 )
 
 const (
@@ -163,5 +164,42 @@ func TestShardedCoordinatorDispatch_CrossShardTxnSucceeds(t *testing.T) {
 	}
 	if v, err := shardStore.GetAt(ctx, []byte("x"), readTS); err != nil || string(v) != "v2" {
 		t.Fatalf("get x: %v %v", v, err)
+	}
+}
+
+func TestShardedCoordinatorStrictCrossShardTxnConfirmsEveryEffect(t *testing.T) {
+	ctx := context.Background()
+	router := distribution.NewEngine()
+	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	})
+
+	first := store.NewMVCCStore()
+	firstRaft, closeFirst := newSingleRaft(t, "strict-g1", NewKvFSMWithHLC(first, NewHLC()))
+	t.Cleanup(closeFirst)
+	second := store.NewMVCCStore()
+	secondRaft, closeSecond := newSingleRaft(t, "strict-g2", NewKvFSMWithHLC(second, NewHLC()))
+	t.Cleanup(closeSecond)
+	groups := map[uint64]*ShardGroup{
+		1: {Engine: firstRaft, Store: first, Txn: NewLeaderProxyWithEngine(firstRaft)},
+		2: {Engine: secondRaft, Store: second, Txn: NewLeaderProxyWithEngine(secondRaft)},
+	}
+	shardStore := NewShardStore(router, groups)
+	coord := NewShardedCoordinator(router, groups, 1, NewHLC(), shardStore)
+	resp, err := coord.Dispatch(ctx, &OperationGroup[OP]{
+		IsTxn: true, RequireAllParticipants: true,
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("record")},
+			{Op: Put, Key: []byte("x"), Value: []byte("effect")},
+		},
+	})
+	require.NoError(t, err)
+	require.NotNil(t, resp)
+	require.NotZero(t, resp.CommitTS)
+	for _, key := range [][]byte{[]byte("b"), []byte("x")} {
+		present, proofErr := shardStore.CommittedVersionAtAuthoritative(ctx, key, resp.CommitTS)
+		require.NoError(t, proofErr)
+		require.True(t, present)
 	}
 }

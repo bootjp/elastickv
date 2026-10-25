@@ -64,12 +64,20 @@ type Elem[T OP] struct {
 	// GroupID optionally pins this mutation to a shard group. Zero preserves
 	// normal key-based routing.
 	GroupID uint64
+	// RequireGroupMatch validates a previously chosen effect participant without
+	// pinning the write to an obsolete owner. ExpectedGroupID may be zero.
+	RequireGroupMatch bool
+	ExpectedGroupID   uint64
 }
 
 // OperationGroup is a group of operations that should be executed atomically.
 type OperationGroup[T OP] struct {
 	Elems []*Elem[T]
 	IsTxn bool
+	// RequireAllParticipants makes a committed primary insufficient for a
+	// successful response: every secondary must acknowledge apply. Used by
+	// operation-result publication, whose success includes visible effects.
+	RequireAllParticipants bool
 	// KeyVizLabel tags this operation group for KeyViz attribution.
 	// The zero value is the legacy unlabeled route-only view.
 	KeyVizLabel keyviz.Label

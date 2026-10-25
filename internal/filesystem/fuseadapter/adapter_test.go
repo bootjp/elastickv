@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	cerrors "github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -43,6 +44,7 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 		{name: "forwarded other failure", err: status.Error(codes.Unknown, "key: !fs|ino|7: not leader"), want: syscall.EIO},
 		{name: "canceled", err: context.Canceled, want: syscall.EINTR},
 		{name: "deadline", err: context.DeadlineExceeded, want: syscall.ETIMEDOUT},
+		{name: "unknown commit after deadline", err: errors.Join(kv.ErrTransactionOutcomeUnknown, context.DeadlineExceeded), want: syscall.EIO},
 		{name: "unknown", err: errors.New("boom"), want: syscall.EIO},
 	}
 

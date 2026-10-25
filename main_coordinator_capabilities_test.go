@@ -140,6 +140,11 @@ func (s *shardedCapabilitySpy) EngineGroupIDForKey([]byte) uint64 {
 	return spyIndex
 }
 
+func (s *shardedCapabilitySpy) ResolveOperationGroupForKey([]byte) (uint64, error) {
+	s.record("ResolveOperationGroupForKey")
+	return spyIndex, errSpyForwarded
+}
+
 func (s *shardedCapabilitySpy) LocalLeaderGroupIDs() ([]uint64, bool) {
 	s.record("LocalLeaderGroupIDs")
 	return []uint64{spyIndex}, true

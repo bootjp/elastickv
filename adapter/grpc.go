@@ -260,12 +260,45 @@ func (r *GRPCServer) rawLatestCommitTSSingle(ctx context.Context, req *pb.RawLat
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
+	exact, exactSupported, err := r.rawExactVersionAt(ctx, req, readRouteVersion)
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
 	return &pb.RawLatestCommitTSResponse{
 		Ts:                      ts,
 		Exists:                  exists,
 		VersionVisible:          visible,
 		VersionVisibleSupported: visibleSupported,
+		ExactVersionExists:      exact,
+		ExactVersionSupported:   exactSupported,
 	}, nil
+}
+
+func (r *GRPCServer) rawExactVersionAt(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) (bool, bool, error) {
+	if req.GetExactVersionAtTs() == 0 {
+		return false, false, nil
+	}
+	if req.GetGroupId() != 0 {
+		reader, ok := r.store.(interface {
+			CommittedVersionAtGroupWithReadFence(context.Context, []byte, uint64, uint64, uint64) (bool, error)
+		})
+		if !ok {
+			return false, false, errors.WithStack(status.Error(codes.FailedPrecondition, "exact-version group proof requires a group-aware store"))
+		}
+		exists, err := reader.CommittedVersionAtGroupWithReadFence(ctx, req.GetKey(), req.GetGroupId(), req.GetExactVersionAtTs(), readRouteVersion)
+		return exists, true, errors.Wrap(err, "probe committed group version")
+	}
+	if reader, ok := r.store.(interface {
+		CommittedVersionAtWithReadFence(context.Context, []byte, uint64, uint64) (bool, error)
+	}); ok {
+		exists, err := reader.CommittedVersionAtWithReadFence(ctx, req.GetKey(), req.GetExactVersionAtTs(), readRouteVersion)
+		return exists, true, errors.Wrap(err, "probe committed version")
+	}
+	if readRouteVersion != 0 {
+		return false, false, errors.WithStack(status.Error(codes.FailedPrecondition, "exact-version probe requires a route-fenced store"))
+	}
+	exists, err := r.store.CommittedVersionAt(ctx, req.GetKey(), req.GetExactVersionAtTs())
+	return exists, true, errors.Wrap(err, "probe committed version")
 }
 
 func (r *GRPCServer) rawVersionsVisibleAt(ctx context.Context, req *pb.RawLatestCommitTSRequest, readRouteVersion uint64) ([]bool, bool, error) {

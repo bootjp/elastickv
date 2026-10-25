@@ -21,6 +21,10 @@ type CoordinatorForwarder struct {
 	Inner Coordinator
 }
 
+// ErrOperationGroupResolverUnavailable means the wrapped coordinator has no
+// operation routing capability; a sharded filesystem must fail closed.
+var ErrOperationGroupResolverUnavailable = errors.New("operation group resolver unavailable")
+
 var (
 	_ Coordinator                          = CoordinatorForwarder{}
 	_ LeaseReadableCoordinator             = CoordinatorForwarder{}
@@ -253,6 +257,17 @@ func (f CoordinatorForwarder) EngineGroupIDForKey(key []byte) uint64 {
 		return router.EngineGroupIDForKey(key)
 	}
 	return 0
+}
+
+// ResolveOperationGroupForKey keeps receipt placement on the same route
+// resolver as effect dispatch, including through startup and label wrappers.
+func (f CoordinatorForwarder) ResolveOperationGroupForKey(key []byte) (uint64, error) {
+	resolver, ok := f.Inner.(interface{ ResolveOperationGroupForKey([]byte) (uint64, error) })
+	if !ok {
+		return 0, errors.WithStack(ErrOperationGroupResolverUnavailable)
+	}
+	group, err := resolver.ResolveOperationGroupForKey(key)
+	return group, errors.WithStack(err)
 }
 
 // LocalLeaderGroupIDs lists the data groups this process leads. The Redis

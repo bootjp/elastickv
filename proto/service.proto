@@ -82,6 +82,9 @@ message RawLatestCommitTSRequest {
   // bounded key_batch blob so untrusted clients cannot expand one request into
   // an unbounded repeated-bytes slice before the service enforces page limits.
   bytes key_batch = 5;
+  // Optional exact-version proof for a durable operation effect. A server
+  // that predates this field leaves exact_version_supported false.
+  uint64 exact_version_at_ts = 6;
 }
 
 message RawLatestCommitTSResponse {
@@ -100,6 +103,8 @@ message RawLatestCommitTSResponse {
   // while this branch was open, so the batch results take the next free tag
   // rather than colliding with a released wire format.
   repeated bool version_visible_results = 7;
+  bool exact_version_exists = 8;
+  bool exact_version_supported = 9;
 }
 
 message RawScanAtRequest {

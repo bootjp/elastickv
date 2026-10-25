@@ -418,9 +418,12 @@ type RawLatestCommitTSRequest struct {
 	// Optional batch form for version_visible_at_ts probes. Encoded as a single
 	// bounded key_batch blob so untrusted clients cannot expand one request into
 	// an unbounded repeated-bytes slice before the service enforces page limits.
-	KeyBatch      []byte `protobuf:"bytes,5,opt,name=key_batch,json=keyBatch,proto3" json:"key_batch,omitempty"`
-	unknownFields protoimpl.UnknownFields
-	sizeCache     protoimpl.SizeCache
+	KeyBatch []byte `protobuf:"bytes,5,opt,name=key_batch,json=keyBatch,proto3" json:"key_batch,omitempty"`
+	// Optional exact-version proof for a durable operation effect. A server
+	// that predates this field leaves exact_version_supported false.
+	ExactVersionAtTs uint64 `protobuf:"varint,6,opt,name=exact_version_at_ts,json=exactVersionAtTs,proto3" json:"exact_version_at_ts,omitempty"`
+	unknownFields    protoimpl.UnknownFields
+	sizeCache        protoimpl.SizeCache
 }
 
 func (x *RawLatestCommitTSRequest) Reset() {
@@ -488,6 +491,13 @@ func (x *RawLatestCommitTSRequest) GetKeyBatch() []byte {
 	return nil
 }
 
+func (x *RawLatestCommitTSRequest) GetExactVersionAtTs() uint64 {
+	if x != nil {
+		return x.ExactVersionAtTs
+	}
+	return 0
+}
+
 type RawLatestCommitTSResponse struct {
 	state  protoimpl.MessageState `protogen:"open.v1"`
 	Ts     uint64                 `protobuf:"varint,1,opt,name=ts,proto3" json:"ts,omitempty"`
@@ -505,6 +515,8 @@ type RawLatestCommitTSResponse struct {
 	// while this branch was open, so the batch results take the next free tag
 	// rather than colliding with a released wire format.
 	VersionVisibleResults []bool `protobuf:"varint,7,rep,packed,name=version_visible_results,json=versionVisibleResults,proto3" json:"version_visible_results,omitempty"`
+	ExactVersionExists    bool   `protobuf:"varint,8,opt,name=exact_version_exists,json=exactVersionExists,proto3" json:"exact_version_exists,omitempty"`
+	ExactVersionSupported bool   `protobuf:"varint,9,opt,name=exact_version_supported,json=exactVersionSupported,proto3" json:"exact_version_supported,omitempty"`
 	unknownFields         protoimpl.UnknownFields
 	sizeCache             protoimpl.SizeCache
 }
@@ -586,6 +598,20 @@ func (x *RawLatestCommitTSResponse) GetVersionVisibleResults() []bool {
 		return x.VersionVisibleResults
 	}
 	return nil
+}
+
+func (x *RawLatestCommitTSResponse) GetExactVersionExists() bool {
+	if x != nil {
+		return x.ExactVersionExists
+	}
+	return false
+}
+
+func (x *RawLatestCommitTSResponse) GetExactVersionSupported() bool {
+	if x != nil {
+		return x.ExactVersionSupported
+	}
+	return false
 }
 
 type RawScanAtRequest struct {
@@ -2635,13 +2661,14 @@ const file_service_proto_rawDesc = "" +
 	"\x03key\x18\x01 \x01(\fR\x03key\"P\n" +
 	"\x11RawDeleteResponse\x12!\n" +
 	"\fcommit_index\x18\x01 \x01(\x04R\vcommitIndex\x12\x18\n" +
-	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xc5\x01\n" +
+	"\asuccess\x18\x02 \x01(\bR\asuccess\"\xf4\x01\n" +
 	"\x18RawLatestCommitTSRequest\x12\x10\n" +
 	"\x03key\x18\x01 \x01(\fR\x03key\x12,\n" +
 	"\x12read_route_version\x18\x02 \x01(\x04R\x10readRouteVersion\x12\x19\n" +
 	"\bgroup_id\x18\x03 \x01(\x04R\agroupId\x121\n" +
 	"\x15version_visible_at_ts\x18\x04 \x01(\x04R\x12versionVisibleAtTs\x12\x1b\n" +
-	"\tkey_batch\x18\x05 \x01(\fR\bkeyBatch\"\xa0\x02\n" +
+	"\tkey_batch\x18\x05 \x01(\fR\bkeyBatch\x12-\n" +
+	"\x13exact_version_at_ts\x18\x06 \x01(\x04R\x10exactVersionAtTs\"\x8a\x03\n" +
 	"\x19RawLatestCommitTSResponse\x12\x0e\n" +
 	"\x02ts\x18\x01 \x01(\x04R\x02ts\x12\x16\n" +
 	"\x06exists\x18\x02 \x01(\bR\x06exists\x12'\n" +
@@ -2649,7 +2676,9 @@ const file_service_proto_rawDesc = "" +
 	"\x19version_visible_supported\x18\x04 \x01(\bR\x17versionVisibleSupported\x12\x19\n" +
 	"\bgroup_id\x18\x05 \x01(\x04R\agroupId\x12#\n" +
 	"\rleader_fenced\x18\x06 \x01(\bR\fleaderFenced\x126\n" +
-	"\x17version_visible_results\x18\a \x03(\bR\x15versionVisibleResults\"\xde\x02\n" +
+	"\x17version_visible_results\x18\a \x03(\bR\x15versionVisibleResults\x120\n" +
+	"\x14exact_version_exists\x18\b \x01(\bR\x12exactVersionExists\x126\n" +
+	"\x17exact_version_supported\x18\t \x01(\bR\x15exactVersionSupported\"\xde\x02\n" +
 	"\x10RawScanAtRequest\x12\x1b\n" +
 	"\tstart_key\x18\x01 \x01(\fR\bstartKey\x12\x17\n" +
 	"\aend_key\x18\x02 \x01(\fR\x06endKey\x12\x14\n" +

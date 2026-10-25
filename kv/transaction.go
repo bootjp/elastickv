@@ -2,6 +2,7 @@ package kv
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"sync"
 	"sync/atomic"
@@ -167,11 +168,17 @@ func applyRequests(ctx context.Context, proposer raftengine.Proposer, reqs []*pb
 	result, err := proposer.Propose(ctx, b)
 	if err != nil {
 		recordProposalFailure(proposalObserver)
-		return 0, nil, errors.WithStack(err)
+		if errors.Is(err, raftengine.ErrNotLeader) || errors.Is(err, raftengine.ErrLeadershipTransferInProgress) {
+			// The etcd engine returns these before appending the entry.
+			return 0, nil, errors.WithStack(err)
+		}
+		// Once Propose has been called, a timeout or leadership change does
+		// not prove that the entry was absent from the replicated log.
+		return 0, nil, fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 	}
 	if result == nil {
 		recordProposalFailure(proposalObserver)
-		return 0, nil, errors.WithStack(errors.New("raft proposal returned nil result"))
+		return 0, nil, fmt.Errorf("%w: raft proposal returned nil result", ErrTransactionOutcomeUnknown)
 	}
 
 	return interpretProposalResult(result, reqs, proposalObserver)

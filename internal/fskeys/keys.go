@@ -7,25 +7,95 @@ import (
 
 const (
 	u64Bytes               = 8
+	operationIdentityBytes = 32
 	orderedTerminatorBytes = 2
 	orderedZeroEscape      = 0xff
 
-	inodePrefix    = "!fs|ino|"
-	dirPrefix      = "!fs|dir|"
-	dirVerPrefix   = "!fs|dirv|"
-	homePrefix     = "!fs|home|"
-	chunkPrefix    = "!fs|chk|"
-	refPrefix      = "!fs|ref|"
-	refFencePrefix = "!fs|reffence|"
-	intentPrefix   = "!fs|intent|"
-	moveJobPrefix  = "!fs|job|move|"
-	usageKey       = "!fs|usage"
+	inodePrefix            = "!fs|ino|"
+	dirPrefix              = "!fs|dir|"
+	dirVerPrefix           = "!fs|dirv|"
+	homePrefix             = "!fs|home|"
+	chunkPrefix            = "!fs|chk|"
+	refPrefix              = "!fs|ref|"
+	refFencePrefix         = "!fs|reffence|"
+	intentPrefix           = "!fs|intent|"
+	operationPrefix        = "!fs|op|"
+	operationSessionPrefix = "!fs|opsession|"
+	operationOwnerPrefix   = "!fs|opowner|"
+	operationProofPrefix   = "!fs|opproof|"
+	operationFilesystemKey = "!fs|opfs"
+	moveJobPrefix          = "!fs|job|move|"
+	usageKey               = "!fs|usage"
 
 	chunkRoutePrefix = "!fs|route|chk|"
 	usageRoutePrefix = "!fs|usage|route|"
 
 	chunkRouteKeyBytes = len(chunkRoutePrefix) + 2*u64Bytes
 )
+
+// OperationFilesystemKey stores the cluster-wide filesystem identity.
+func OperationFilesystemKey() []byte {
+	return []byte(operationFilesystemKey)
+}
+
+// IsOperationMetadataKey protects the journal's identity and fencing rows
+// from being supplied as ordinary filesystem effects.
+func IsOperationMetadataKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(operationPrefix)) ||
+		bytes.HasPrefix(key, []byte(operationSessionPrefix)) ||
+		bytes.HasPrefix(key, []byte(operationOwnerPrefix)) ||
+		bytes.HasPrefix(key, []byte(operationProofPrefix)) ||
+		bytes.Equal(key, []byte(operationFilesystemKey))
+}
+
+// OperationProofKey is a stable, single-version receipt in an effect's group.
+func OperationProofKey(filesystemID, sessionID [16]byte, sequence, groupID uint64) []byte {
+	out := make([]byte, 0, len(operationProofPrefix)+operationIdentityBytes+2*u64Bytes)
+	out = append(out, operationProofPrefix...)
+	out = append(out, filesystemID[:]...)
+	out = append(out, sessionID[:]...)
+	out = appendU64(out, sequence)
+	return appendU64(out, groupID)
+}
+
+// IsOperationProofKey permits explicit group routing for receipt rows.
+func IsOperationProofKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(operationProofPrefix)) &&
+		len(key) == len(operationProofPrefix)+operationIdentityBytes+2*u64Bytes
+}
+
+// OperationKey is stable across home movement and names one logical request.
+func OperationKey(filesystemID, sessionID [16]byte, sequence uint64) []byte {
+	out := make([]byte, 0, len(operationPrefix)+16+16+u64Bytes)
+	out = append(out, operationPrefix...)
+	out = append(out, filesystemID[:]...)
+	out = append(out, sessionID[:]...)
+	return appendU64(out, sequence)
+}
+
+// OperationSessionKey names one durable mount incarnation.
+func OperationSessionKey(filesystemID, sessionID [16]byte) []byte {
+	out := make([]byte, 0, len(operationSessionPrefix)+operationIdentityBytes)
+	out = append(out, operationSessionPrefix...)
+	out = append(out, filesystemID[:]...)
+	return append(out, sessionID[:]...)
+}
+
+// OperationOwnerKey serializes mount incarnations for one configured owner.
+func OperationOwnerKey(filesystemID [16]byte, owner []byte) []byte {
+	out := make([]byte, 0, len(operationOwnerPrefix)+16+len(owner)+orderedTerminatorBytes)
+	out = append(out, operationOwnerPrefix...)
+	out = append(out, filesystemID[:]...)
+	return appendOrderedBytes(out, owner)
+}
+
+// OperationPrefix scans one mount incarnation without crossing sessions.
+func OperationPrefix(filesystemID, sessionID [16]byte) []byte {
+	out := make([]byte, 0, len(operationPrefix)+operationIdentityBytes)
+	out = append(out, operationPrefix...)
+	out = append(out, filesystemID[:]...)
+	return append(out, sessionID[:]...)
+}
 
 var (
 	chunkPrefixBytes      = []byte(chunkPrefix)

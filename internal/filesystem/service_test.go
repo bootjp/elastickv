@@ -3,6 +3,8 @@ package filesystem
 import (
 	"bytes"
 	"context"
+	"encoding/binary"
+	"fmt"
 	"math"
 	"sync"
 	"testing"
@@ -12,6 +14,8 @@ import (
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 )
 
 const (
@@ -29,6 +33,7 @@ type rootRaceCoordinator struct {
 	inner     *testCoordinator
 	once      sync.Once
 	winnerErr error
+	ambiguous bool
 }
 
 func (c *rootRaceCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
@@ -45,7 +50,11 @@ func (c *rootRaceCoordinator) Dispatch(
 	if c.winnerErr != nil {
 		return nil, c.winnerErr
 	}
-	return c.inner.Dispatch(ctx, req)
+	resp, err := c.inner.Dispatch(ctx, req)
+	if err != nil && c.ambiguous {
+		return nil, fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, status.Error(codes.Unknown, err.Error()))
+	}
+	return resp, err
 }
 
 func (c *testCoordinator) LinearizableRead(context.Context) (uint64, error) {
@@ -65,28 +74,36 @@ func (c *testCoordinator) Dispatch(
 	}
 	mutations := make([]*store.KVPairMutation, 0, len(req.Elems))
 	for _, elem := range req.Elems {
-		switch elem.Op {
-		case kv.Put:
-			mutations = append(mutations, &store.KVPairMutation{
-				Op:    store.OpTypePut,
-				Key:   append([]byte(nil), elem.Key...),
-				Value: append([]byte(nil), elem.Value...),
-			})
-		case kv.Del:
-			mutations = append(mutations, &store.KVPairMutation{
-				Op:  store.OpTypeDelete,
-				Key: append([]byte(nil), elem.Key...),
-			})
-		case kv.DelPrefix:
-			return nil, store.ErrUnknownOp
-		default:
-			return nil, store.ErrUnknownOp
+		mutation, err := testMutation(elem, commitTS)
+		if err != nil {
+			return nil, err
 		}
+		mutations = append(mutations, mutation)
 	}
 	if err := c.st.ApplyMutations(ctx, mutations, req.ReadKeys, req.StartTS, commitTS); err != nil {
 		return nil, err
 	}
 	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+}
+
+func testMutation(elem *kv.Elem[kv.OP], commitTS uint64) (*store.KVPairMutation, error) {
+	value := append([]byte(nil), elem.Value...)
+	if elem.CommitTSValueOffset != 0 {
+		if len(value) < 8 || elem.CommitTSValueOffset > uint64(len(value)-8) {
+			return nil, ErrInvalid
+		}
+		binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:], commitTS)
+	}
+	switch elem.Op {
+	case kv.Put:
+		return &store.KVPairMutation{Op: store.OpTypePut, Key: append([]byte(nil), elem.Key...), Value: value}, nil
+	case kv.Del:
+		return &store.KVPairMutation{Op: store.OpTypeDelete, Key: append([]byte(nil), elem.Key...)}, nil
+	case kv.DelPrefix:
+		return nil, store.ErrUnknownOp
+	default:
+		return nil, store.ErrUnknownOp
+	}
 }
 
 type recordingCoordinator struct {
@@ -260,6 +277,21 @@ func TestServiceInitializeRootToleratesConcurrentWinner(t *testing.T) {
 
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
 	require.NoError(t, coord.winnerErr)
+	root, err := svc.GetAttr(ctx, RootInode)
+	require.NoError(t, err)
+	require.Equal(t, TypeDirectory, root.Type)
+	stats, err := svc.StatFS(ctx, RootInode)
+	require.NoError(t, err)
+	require.EqualValues(t, 1, stats.Files)
+}
+
+func TestServiceInitializeRootResolvesUnknownForwardedConflict(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	coord := &rootRaceCoordinator{inner: &testCoordinator{st: st}, ambiguous: true}
+	svc, err := NewService(st, coord, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
 	root, err := svc.GetAttr(ctx, RootInode)
 	require.NoError(t, err)
 	require.Equal(t, TypeDirectory, root.Type)
