@@ -382,10 +382,16 @@ jobs:
         working-directory: jepsen
         timeout-minutes: 12
         run: |
+          # Keep the 1024-write budget while bounding the ambiguous writes
+          # Knossos must explore for any one SQLite database.
+          bash test/sqlite_budget_test.sh
+          source ./sqlite_budget.sh
+          sqlite_budget 16 64
+          echo "SQLite register budget: ${SQLITE_KEY_COUNT} keys, ${SQLITE_MAX_WRITES} writes per key"
           timeout 600 ~/lein run -m elastickv.sqlite-workload --local \
             --time-limit ${{ inputs.time-limit || '150' }} \
             --rate ${{ inputs.rate || '10' }} \
-            --concurrency 8 --key-count 16 --max-writes-per-key 64 \
+            --concurrency 8 --key-count "$SQLITE_KEY_COUNT" --max-writes-per-key "$SQLITE_MAX_WRITES" \
             --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
       - name: Archive Jepsen store on failure
         if: failure()
