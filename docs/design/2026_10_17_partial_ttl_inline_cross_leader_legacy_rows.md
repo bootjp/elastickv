@@ -1,6 +1,6 @@
 # TTL-inline migration of legacy-route rows across leaders
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-10-17
 
