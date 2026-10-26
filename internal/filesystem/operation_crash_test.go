@@ -28,6 +28,16 @@ type operationFenceCrashEvidence struct {
 	Attempt [16]byte    `json:"attempt"`
 }
 
+type crashReplayCoordinator struct {
+	*testCoordinator
+	dispatches int
+}
+
+func (c *crashReplayCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	c.dispatches++
+	return c.testCoordinator.Dispatch(ctx, req)
+}
+
 func TestJournalCommittedAttemptDecisionSurvivesProcessKill(t *testing.T) {
 	if dir := os.Getenv(operationDecisionCrashDirectory); dir != "" {
 		runOperationDecisionCrashHelper(t, dir)
@@ -50,7 +60,8 @@ func TestJournalCommittedAttemptDecisionSurvivesProcessKill(t *testing.T) {
 	st, err := store.NewPebbleStore(filepath.Join(dir, "pebble"))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
-	svc, err := NewService(st, &testCoordinator{st: st})
+	coordinator := &crashReplayCoordinator{testCoordinator: &testCoordinator{st: st}}
+	svc, err := NewService(st, coordinator)
 	require.NoError(t, err)
 	journal, err := NewOperationJournal(svc)
 	require.NoError(t, err)
@@ -70,6 +81,7 @@ func TestJournalCommittedAttemptDecisionSurvivesProcessKill(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, record, duplicate)
+	require.Zero(t, coordinator.dispatches, "replay must not dispatch another mutation")
 	require.Equal(t, beforeTS, st.LastCommitTS(), "replay must not publish another mutation")
 	afterVersion, exists, err := st.LatestCommitTS(t.Context(), []byte("data"))
 	require.NoError(t, err)
