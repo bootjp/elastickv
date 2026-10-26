@@ -488,6 +488,23 @@ func TestServiceOpenRebuildsAfterDefinitiveConflicts(t *testing.T) {
 	require.Equal(t, 6, conflicts.calls)
 }
 
+func TestServiceOpenWaitsForPendingTransactionLock(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestService(t, 2, 3, 4)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	created, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	locked := &transientWriteConflictCoordinator{inner: inner, remaining: 1, failure: kv.ErrTxnLocked}
+	svc.dispatch = locked
+
+	fh, err := svc.Open(ctx, created.Inode, []byte("client-a"))
+	require.NoError(t, err)
+	require.NotZero(t, fh)
+	require.Equal(t, 2, locked.calls)
+}
+
 func TestServiceRefreshLeaseRebuildsAfterDefinitiveConflict(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestService(t, 2, 3)

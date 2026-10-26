@@ -756,7 +756,8 @@ func (s *Service) retryWrite(ctx context.Context, inode uint64, offset uint64, d
 }
 
 func isDefinitiveWriteConflict(err error) bool {
-	return err != nil && errors.Is(err, store.ErrWriteConflict) && !errors.Is(err, kv.ErrTransactionOutcomeUnknown)
+	return err != nil && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) &&
+		(errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked))
 }
 
 func waitWriteConflictRetry(ctx context.Context, attempt int) error {

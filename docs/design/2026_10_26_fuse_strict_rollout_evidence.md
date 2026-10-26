@@ -146,6 +146,30 @@ the ACK path now checks the durable session retirement fence before consuming
 the record's retained-byte reservation again. Its effect on the mounted
 failure remains unverified. Both jobs must pass before the two-group
 comparison can be used for rollout.
+The long run
+[40337556125](https://github.com/bootjp/elastickv/actions/runs/40337556125)
+again failed the Redis workload and both two-group benchmarks at `f2cbf5cb`.
+The strict benchmark exposed a gap between secondary PREPARE and primary
+PREPARE: a foreground read treated the absent primary lock as an abort and
+removed the prepared secondary. The resolver now keeps that secondary pending
+until its TTL expires or a durable primary decision is visible. A two-group
+Raft regression reproduces concurrent journal admissions; a second regression
+checks the gap directly. The legacy benchmark exposed a primary identity
+collision between distinct open references. Open and release now use the
+per-reference key as their transaction primary. The Redis history classified
+a transaction that lost its leader after dispatch as a definite failure,
+although a later read observed its writes. The Jepsen client now records
+that leadership outcome as indeterminate. The corrected candidate still
+requires a complete CI run before the two-group measurements can be used.
+The same long run's SQLite job also became inconclusive: operation journal
+ACK accounting failed, subsequent operations hit the journal quota, and the
+final database reads could not open their files. It did not report a
+linearizability anomaly. The new resolver behavior may address the missing
+session update, but this must be established by a passing long run.
+In the first rerun at `ed5efef1`, the legacy two-group benchmark still
+returned a typed `txn locked` error from a concurrent open. Open now waits
+and rebuilds its transaction after that transient lock, within its existing
+30-second retry budget; unknown outcomes still stop without replay.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
