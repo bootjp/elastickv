@@ -52,6 +52,7 @@ type Adapter struct {
 	journaledMetadata bool
 	journaledUnlink   bool
 	journaledRmdir    bool
+	journaledRename   bool
 	operationSequence atomic.Uint64
 	receiptMu         sync.Mutex
 	receipts          map[uint64]map[filesystem.OperationID]struct{}
@@ -145,6 +146,14 @@ func WithJournaledRmdir(session filesystem.OperationSessionID) Option {
 	return func(a *Adapter) {
 		a.setOperationSession(session)
 		a.journaledRmdir = true
+	}
+}
+
+// WithJournaledRename journals same-directory rename requests.
+func WithJournaledRename(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledRename = true
 	}
 }
 
@@ -473,7 +482,21 @@ func (a *Adapter) Rename(
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	err = a.core.Rename(ctx, oldParent, oldName, newParent, newName)
+	if a.journaledRename {
+		renamer, ok := a.core.(interface {
+			RenameWithOperation(context.Context, filesystem.OperationID, uint64, []byte, uint64, []byte) error
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		err = renamer.RenameWithOperation(ctx, id, oldParent, oldName, newParent, newName)
+		if err == nil {
+			a.recordReceipt(oldParent, id)
+		}
+	} else {
+		err = a.core.Rename(ctx, oldParent, oldName, newParent, newName)
+	}
 	return Errno(err)
 }
 

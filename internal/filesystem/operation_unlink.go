@@ -1,6 +1,7 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
 	"encoding/binary"
 
@@ -35,6 +36,7 @@ func (s *Service) unlinkNodeWithOperation(ctx context.Context, id OperationID, p
 	if err := validateName(name); err != nil {
 		return err
 	}
+	name = bytes.Clone(name)
 	intent := make([]byte, unlinkIntentHeader+len(name))
 	intent[0] = unlinkIntentVersion
 	binary.BigEndian.PutUint64(intent[1:9], parent)

@@ -457,7 +457,8 @@ func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
 	require.NoError(t, err)
 	mountPoint := t.TempDir()
 	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-unlink", mountPoint,
-		fuseadapter.WithJournaledUnlink(session), fuseadapter.WithJournaledRmdir(session))
+		fuseadapter.WithJournaledUnlink(session), fuseadapter.WithJournaledRmdir(session),
+		fuseadapter.WithJournaledRename(session))
 	path := filepath.Join(mountPoint, "file")
 	require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
 	require.NoError(t, os.Remove(path))
@@ -484,4 +485,21 @@ func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
 	stat, err := os.Stat(dirPath)
 	require.NoError(t, err)
 	require.True(t, stat.IsDir())
+	source := filepath.Join(mountPoint, "source")
+	target := filepath.Join(mountPoint, "target")
+	require.NoError(t, os.WriteFile(source, []byte("old"), 0o600))
+	require.NoError(t, os.Rename(source, target))
+	dir, err = os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, dir.Sync())
+	require.NoError(t, dir.Close())
+	require.NoError(t, os.WriteFile(source, []byte("new"), 0o600))
+	renameID := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 3}
+	require.NoError(t, svc.RenameWithOperation(t.Context(), renameID, filesystem.RootInode, []byte("source"), filesystem.RootInode, []byte("target")))
+	sourceData, err := os.ReadFile(source)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), sourceData)
+	targetData, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), targetData)
 }
