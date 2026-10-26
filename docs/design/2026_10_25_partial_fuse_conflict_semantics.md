@@ -443,10 +443,10 @@ filesystem service operations within bounds, tracks local FUSE predecessors,
 and tests mounted SQLite PERSIST/DELETE workloads.
 This branch adds a transaction-primary generation fence and optional
 journal-backed paths for fixed-offset FUSE writes, metadata-only setattr,
-and file unlink.
+file unlink, and empty-directory removal.
 The adapter retains their successful operation IDs per inode.
 Its flush and fsync paths resolve those IDs and check participant proofs.
-Directory fsync checks the file-unlink receipts recorded for that parent.
+Directory fsync checks the removal receipts recorded for that parent.
 The default mount path still uses the legacy mutations.
 Other mutation categories lack journal-backed planners.
 `Service.Fsync` still uses an attribute read after the adapter checks the

@@ -457,7 +457,7 @@ func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
 	require.NoError(t, err)
 	mountPoint := t.TempDir()
 	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-unlink", mountPoint,
-		fuseadapter.WithJournaledUnlink(session))
+		fuseadapter.WithJournaledUnlink(session), fuseadapter.WithJournaledRmdir(session))
 	path := filepath.Join(mountPoint, "file")
 	require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
 	require.NoError(t, os.Remove(path))
@@ -471,4 +471,17 @@ func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, []byte("new"), data)
+	dirPath := filepath.Join(mountPoint, "dir")
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	require.NoError(t, os.Remove(dirPath))
+	dir, err = os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, dir.Sync())
+	require.NoError(t, dir.Close())
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	directoryID := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 2}
+	require.NoError(t, svc.RmdirWithOperation(t.Context(), directoryID, filesystem.RootInode, []byte("dir")))
+	stat, err := os.Stat(dirPath)
+	require.NoError(t, err)
+	require.True(t, stat.IsDir())
 }

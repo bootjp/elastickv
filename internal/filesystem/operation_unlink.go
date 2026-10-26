@@ -10,24 +10,37 @@ import (
 )
 
 const (
-	unlinkIntentVersion = 1
-	unlinkResultSuccess = 0
-	unlinkResultMissing = 1
-	unlinkResultNotDir  = 2
-	unlinkResultIsDir   = 3
-	unlinkEffectLimit   = 64 << 10
-	unlinkIntentHeader  = 9
+	unlinkIntentVersion  = 1
+	unlinkResultSuccess  = 0
+	unlinkResultMissing  = 1
+	unlinkResultNotDir   = 2
+	unlinkResultIsDir    = 3
+	unlinkResultNotEmpty = 4
+	unlinkEffectLimit    = 64 << 10
+	unlinkIntentHeader   = 10
 )
 
 // UnlinkWithOperation records one file removal and its result under id.
 // Directory removal has a separate emptiness predicate and planner.
 func (s *Service) UnlinkWithOperation(ctx context.Context, id OperationID, parent uint64, name []byte) error {
+	return s.unlinkNodeWithOperation(ctx, id, parent, name, false)
+}
+
+// RmdirWithOperation journals an empty-directory removal and its result.
+func (s *Service) RmdirWithOperation(ctx context.Context, id OperationID, parent uint64, name []byte) error {
+	return s.unlinkNodeWithOperation(ctx, id, parent, name, true)
+}
+
+func (s *Service) unlinkNodeWithOperation(ctx context.Context, id OperationID, parent uint64, name []byte, directory bool) error {
 	if err := validateName(name); err != nil {
 		return err
 	}
 	intent := make([]byte, unlinkIntentHeader+len(name))
 	intent[0] = unlinkIntentVersion
 	binary.BigEndian.PutUint64(intent[1:9], parent)
+	if directory {
+		intent[9] = 1
+	}
 	copy(intent[unlinkIntentHeader:], name)
 	journal, err := NewOperationJournal(s)
 	if err != nil {
@@ -44,14 +57,14 @@ func (s *Service) UnlinkWithOperation(ctx context.Context, id OperationID, paren
 	if err != nil {
 		return err
 	}
-	return s.executeUnlinkOperation(ctx, journal, id, attempt, parent, name, intent)
+	return s.executeUnlinkOperation(ctx, journal, id, attempt, parent, name, directory, intent)
 }
 
-func (s *Service) executeUnlinkOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, parent uint64, name, intent []byte) error {
+func (s *Service) executeUnlinkOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, parent uint64, name []byte, directory bool, intent []byte) error {
 	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
-		err := s.publishUnlinkOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, parent, name, intent)
+		err := s.publishUnlinkOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, parent, name, directory, intent)
 		if !isDefinitiveWriteConflict(err) {
 			return err
 		}
@@ -69,12 +82,12 @@ func (s *Service) executeUnlinkOperation(ctx context.Context, journal *Operation
 	return errors.WithStack(ErrContentionLimit)
 }
 
-func (s *Service) publishUnlinkOperationAttempt(ctx context.Context, journal *OperationJournal, id OperationID, attempt [16]byte, parent uint64, name, intent []byte) error {
+func (s *Service) publishUnlinkOperationAttempt(ctx context.Context, journal *OperationJournal, id OperationID, attempt [16]byte, parent uint64, name []byte, directory bool, intent []byte) error {
 	snapshot, err := journal.PlanSnapshotAtRoute(ctx, id, attempt)
 	if err != nil {
 		return err
 	}
-	plan, cleanup, semanticErr, err := s.planUnlinkOperation(ctx, snapshot, parent, name, intent)
+	plan, cleanup, semanticErr, err := s.planUnlinkOperation(ctx, snapshot, parent, name, directory, intent)
 	if err != nil {
 		return err
 	}
@@ -93,7 +106,7 @@ func (s *Service) publishUnlinkOperationAttempt(ctx context.Context, journal *Op
 	return err
 }
 
-func (s *Service) planUnlinkOperation(ctx context.Context, snapshot operationPlanningSnapshot, parent uint64, name, intent []byte) (operationAttemptPlan, *chunkDeletePlan, error, error) {
+func (s *Service) planUnlinkOperation(ctx context.Context, snapshot operationPlanningSnapshot, parent uint64, name []byte, directory bool, intent []byte) (operationAttemptPlan, *chunkDeletePlan, error, error) {
 	ts := snapshot.ReadTS
 	entryKey := fskeys.DirEntryKey(parent, name)
 	plan := operationAttemptPlan{Intent: intent, ReadTS: ts, RouteVersion: snapshot.RouteVersion,
@@ -105,22 +118,20 @@ func (s *Service) planUnlinkOperation(ctx context.Context, snapshot operationPla
 	if semanticErr != nil {
 		return plan, nil, semanticErr, nil
 	}
-	meta, targetKey, semanticErr, err := s.unlinkFileAt(ctx, parent, name, ts)
+	meta, targetKey, semanticErr, err := s.unlinkTargetAt(ctx, parent, name, ts, directory)
 	if err != nil {
 		return operationAttemptPlan{}, nil, nil, err
 	}
 	if len(targetKey) != 0 {
 		plan.ReadKeys = append(plan.ReadKeys, targetKey)
 	}
+	appendUnlinkDirectoryPredicate(&plan, meta, directory, semanticErr)
 	if semanticErr != nil {
 		return plan, nil, semanticErr, nil
 	}
-	if err = s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
-		return operationAttemptPlan{}, nil, nil, err
-	}
 	now := s.now().UnixNano()
 	parentMeta.MtimeNsec, parentMeta.CtimeNsec = now, now
-	fileElems, fileReads, delta, cleanup, err := s.unlinkFileTxnParts(ctx, ts, meta, now)
+	nodeElems, nodeReads, delta, cleanup, err := s.unlinkNodeTxnParts(ctx, ts, parentMeta, meta, directory, now)
 	if err != nil {
 		return operationAttemptPlan{}, nil, nil, err
 	}
@@ -128,15 +139,36 @@ func (s *Service) planUnlinkOperation(ctx context.Context, snapshot operationPla
 	if err != nil {
 		return operationAttemptPlan{}, nil, nil, err
 	}
-	plan.Effects = append([]*kv.Elem[kv.OP]{{Op: kv.Del, Key: entryKey}}, fileElems...)
+	plan.Effects = append([]*kv.Elem[kv.OP]{{Op: kv.Del, Key: entryKey}}, nodeElems...)
 	plan.Effects = append(plan.Effects, parentEffects...)
-	plan.ReadKeys = append(plan.ReadKeys, fileReads...)
+	plan.ReadKeys = append(plan.ReadKeys, nodeReads...)
 	plan.Effects, plan.ReadKeys, err = s.appendUsageUpdate(ctx, ts, plan.Effects, plan.ReadKeys, delta)
 	if err != nil {
 		return operationAttemptPlan{}, nil, nil, err
 	}
 	plan.Result = []byte{unlinkResultSuccess}
 	return plan, cleanup, nil, nil
+}
+
+func appendUnlinkDirectoryPredicate(plan *operationAttemptPlan, meta *InodeMeta, directory bool, semanticErr error) {
+	if directory && meta != nil && semanticErr != nil {
+		plan.ReadKeys = append(plan.ReadKeys, fskeys.DirVersionKey(meta.Inode))
+	}
+}
+
+func (s *Service) unlinkNodeTxnParts(ctx context.Context, ts uint64, parent, target *InodeMeta, directory bool, now int64) ([]*kv.Elem[kv.OP], [][]byte, usageDelta, *chunkDeletePlan, error) {
+	if !directory {
+		return s.unlinkFileTxnParts(ctx, ts, target, now)
+	}
+	if parent.Nlink > fileInitialNlink {
+		parent.Nlink--
+	}
+	keys := [][]byte{fskeys.InodeKey(target.Inode), fskeys.HomeKey(target.Inode), fskeys.DirVersionKey(target.Inode)}
+	effects := make([]*kv.Elem[kv.OP], 0, len(keys))
+	for _, key := range keys {
+		effects = append(effects, &kv.Elem[kv.OP]{Op: kv.Del, Key: key})
+	}
+	return effects, keys[1:], usageDelta{filesSub: 1}, nil, nil
 }
 
 func unlinkParentEffects(parent uint64, meta *InodeMeta, now int64) ([]*kv.Elem[kv.OP], error) {
@@ -165,7 +197,7 @@ func (s *Service) unlinkParentAt(ctx context.Context, parent, ts uint64) (*Inode
 	return meta, nil, nil
 }
 
-func (s *Service) unlinkFileAt(ctx context.Context, parent uint64, name []byte, ts uint64) (*InodeMeta, []byte, error, error) {
+func (s *Service) unlinkTargetAt(ctx context.Context, parent uint64, name []byte, ts uint64, directory bool) (*InodeMeta, []byte, error, error) {
 	entry, err := s.dirEntryAt(ctx, parent, name, ts)
 	if errors.Is(err, ErrNotFound) {
 		return nil, nil, ErrNotFound, nil
@@ -181,33 +213,55 @@ func (s *Service) unlinkFileAt(ctx context.Context, parent uint64, name []byte, 
 	if err != nil {
 		return nil, nil, nil, err
 	}
-	if meta.Type == TypeDirectory {
-		return nil, targetKey, ErrIsDir, nil
+	semanticErr, err := s.validateUnlinkTarget(ctx, meta, ts, directory)
+	if err != nil {
+		return nil, nil, nil, err
+	}
+	if semanticErr != nil {
+		return meta, targetKey, semanticErr, nil
 	}
 	return meta, targetKey, nil, nil
+}
+
+func (s *Service) validateUnlinkTarget(ctx context.Context, meta *InodeMeta, ts uint64, directory bool) (error, error) {
+	if directory && meta.Type != TypeDirectory {
+		return ErrNotDir, nil
+	}
+	if !directory && meta.Type == TypeDirectory {
+		return ErrIsDir, nil
+	}
+	if directory {
+		if err := s.ensureDirectoryEmpty(ctx, meta.Inode, ts); err != nil {
+			if errors.Is(err, ErrNotEmpty) {
+				return ErrNotEmpty, nil
+			}
+			return nil, err
+		}
+	} else if err := s.ensureActiveHomeAt(ctx, meta, ts); err != nil {
+		return nil, err
+	}
+	return nil, nil
 }
 
 func decodeUnlinkOperationResult(record operationRecord) error {
 	if len(record.Result) != 1 {
 		return errors.WithStack(ErrOperationRecordCorrupt)
 	}
+	if record.State == OperationCommitted && record.Result[0] == unlinkResultSuccess {
+		return nil
+	}
+	if record.State != OperationRejected {
+		return errors.WithStack(ErrOperationRecordCorrupt)
+	}
 	switch record.Result[0] {
-	case unlinkResultSuccess:
-		if record.State == OperationCommitted {
-			return nil
-		}
 	case unlinkResultMissing:
-		if record.State == OperationRejected {
-			return errors.WithStack(ErrNotFound)
-		}
+		return errors.WithStack(ErrNotFound)
 	case unlinkResultNotDir:
-		if record.State == OperationRejected {
-			return errors.WithStack(ErrNotDir)
-		}
+		return errors.WithStack(ErrNotDir)
 	case unlinkResultIsDir:
-		if record.State == OperationRejected {
-			return errors.WithStack(ErrIsDir)
-		}
+		return errors.WithStack(ErrIsDir)
+	case unlinkResultNotEmpty:
+		return errors.WithStack(ErrNotEmpty)
 	}
 	return errors.WithStack(ErrOperationRecordCorrupt)
 }
@@ -240,6 +294,8 @@ func rejectUnlinkOperation(ctx context.Context, journal *OperationJournal, id Op
 		status = unlinkResultNotDir
 	case errors.Is(semanticErr, ErrIsDir):
 		status = unlinkResultIsDir
+	case errors.Is(semanticErr, ErrNotEmpty):
+		status = unlinkResultNotEmpty
 	default:
 		return semanticErr
 	}

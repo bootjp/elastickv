@@ -51,6 +51,7 @@ type Adapter struct {
 	journaledWrites   bool
 	journaledMetadata bool
 	journaledUnlink   bool
+	journaledRmdir    bool
 	operationSequence atomic.Uint64
 	receiptMu         sync.Mutex
 	receipts          map[uint64]map[filesystem.OperationID]struct{}
@@ -136,6 +137,14 @@ func WithJournaledUnlink(session filesystem.OperationSessionID) Option {
 	return func(a *Adapter) {
 		a.setOperationSession(session)
 		a.journaledUnlink = true
+	}
+}
+
+// WithJournaledRmdir journals empty-directory removal requests.
+func WithJournaledRmdir(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledRmdir = true
 	}
 }
 
@@ -433,7 +442,21 @@ func (a *Adapter) Rmdir(ctx context.Context, parent uint64, name []byte) (errno 
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	err = a.core.Rmdir(ctx, parent, name)
+	if a.journaledRmdir {
+		remover, ok := a.core.(interface {
+			RmdirWithOperation(context.Context, filesystem.OperationID, uint64, []byte) error
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		err = remover.RmdirWithOperation(ctx, id, parent, name)
+		if err == nil {
+			a.recordReceipt(parent, id)
+		}
+	} else {
+		err = a.core.Rmdir(ctx, parent, name)
+	}
 	return Errno(err)
 }
 
