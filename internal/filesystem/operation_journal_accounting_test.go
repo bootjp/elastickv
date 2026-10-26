@@ -4,12 +4,30 @@ import (
 	"context"
 	"testing"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
 func TestOperationJournalRetainedAccountingAcrossSequenceBoundary(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		journal, _, _ := testOperationJournal(t)
+		assertOperationJournalRetainedAccountingAcrossSequenceBoundary(t, journal)
+	})
+	t.Run("pebble", func(t *testing.T) {
+		st, err := store.NewPebbleStore(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, st.Close()) })
+		service, err := NewService(st, &testCoordinator{st: st})
+		require.NoError(t, err)
+		journal, err := NewOperationJournal(service)
+		require.NoError(t, err)
+		assertOperationJournalRetainedAccountingAcrossSequenceBoundary(t, journal)
+	})
+}
+
+func assertOperationJournalRetainedAccountingAcrossSequenceBoundary(t *testing.T, journal *OperationJournal) {
+	t.Helper()
 	ctx := context.Background()
-	journal, _, _ := testOperationJournal(t)
 	first := testOperationID(t, journal, 1)
 	const batchSize = 16
 	const operations = 1280
