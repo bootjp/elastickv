@@ -61,14 +61,17 @@ function currentResults(results, reviewer, kind, head) {
 }
 
 /** Decide whether explicit current-HEAD evidence establishes a clean review. */
-function evaluateApproval({ head, comments = [], reviews = [], inlineComments = [] }) {
+function evaluateApproval({ head, comments = [], reviews = [], inlineComments = [], resolvedCommentIds = [] }) {
   if (!/^[0-9a-f]{40}$/.test(head || '')) return { approved: false, reason: 'Invalid HEAD SHA' };
   const trustedReviews = reviews.filter(review => reviewerOf(review) && review.commit_id === head);
   if (trustedReviews.some(review => ['CHANGES_REQUESTED', 'DISMISSED'].includes(review.state))) {
     return { approved: false, reason: 'Current-HEAD review requests changes or was dismissed' };
   }
+  const resolved = new Set(resolvedCommentIds);
   if (inlineComments.some(comment => reviewerOf(comment) && !comment.in_reply_to_id &&
-      (comment.commit_id === head || comment.original_commit_id === head))) {
+      (comment.original_commit_id === head || (comment.commit_id === head &&
+       !(/^[0-9a-f]{40}$/.test(comment.original_commit_id || '') &&
+         comment.original_commit_id !== head && resolved.has(comment.id)))))) {
     return { approved: false, reason: 'Current-HEAD inline findings exist' };
   }
 
@@ -162,7 +165,39 @@ async function readEvidence(github, repo, number) {
     github.paginate(github.rest.pulls.listReviews, params),
     github.paginate(github.rest.pulls.listReviewComments, params),
   ]);
-  return { comments, reviews, inlineComments };
+  const resolvedCommentIds = [];
+  if (inlineComments.some(comment => reviewerOf(comment) && !comment.in_reply_to_id &&
+      /^[0-9a-f]{40}$/.test(comment.original_commit_id || '') &&
+      comment.commit_id !== comment.original_commit_id)) {
+    let cursor = null;
+    do {
+      const result = await github.graphql(`
+        query($owner: String!, $repo: String!, $number: Int!, $cursor: String) {
+          repository(owner: $owner, name: $repo) {
+            pullRequest(number: $number) {
+              reviewThreads(first: 100, after: $cursor) {
+                nodes { isResolved comments(first: 1) { nodes { databaseId } } }
+                pageInfo { hasNextPage endCursor }
+              }
+            }
+          }
+        }`, { owner: repo.owner, repo: repo.repo, number, cursor });
+      const page = result.repository.pullRequest.reviewThreads;
+      if (!Array.isArray(page.nodes) || typeof page.pageInfo?.hasNextPage !== 'boolean') {
+        throw new Error('Invalid review thread page');
+      }
+      for (const thread of page.nodes) {
+        const root = thread.comments?.nodes?.[0]?.databaseId;
+        if (thread.isResolved === true && Number.isSafeInteger(root)) resolvedCommentIds.push(root);
+      }
+      if (!page.pageInfo.hasNextPage) break;
+      if (!page.pageInfo.endCursor || page.pageInfo.endCursor === cursor) {
+        throw new Error('Invalid review thread cursor');
+      }
+      cursor = page.pageInfo.endCursor;
+    } while (true);
+  }
+  return { comments, reviews, inlineComments, resolvedCommentIds };
 }
 
 /** Reconcile one PR and revoke approval if its HEAD, evidence, or state changes. */

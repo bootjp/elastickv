@@ -87,6 +87,12 @@ const cases = [
   ['old inline finding mapped to HEAD vetoes clean summary', { comments: [comment('codex')], inlineComments: [inline({ original_commit_id: OLD })] }, false],
   ['Codex finding mapped to HEAD vetoes its clean summary', { comments: [comment('codex')], inlineComments: [inline({ user: USERS.codex, original_commit_id: OLD })] }, false],
   ['wholly stale inline finding permits clean summary', { comments: [comment('codex')], inlineComments: [inline({ commit_id: OLD, original_commit_id: OLD })] }, true],
+  ['resolved historical finding permits fresh clean review', { comments: [comment('codex')], inlineComments: [inline({ original_commit_id: OLD })], resolvedCommentIds: [20] }, true],
+  ['resolved Codex historical finding permits fresh clean review', { comments: [comment('codex')], inlineComments: [inline({ user: USERS.codex, original_commit_id: OLD })], resolvedCommentIds: [20] }, true],
+  ['resolved original HEAD finding still vetoes approval', { comments: [comment('codex')], inlineComments: [inline()], resolvedCommentIds: [20] }, false],
+  ['resolved finding with unknown origin still vetoes approval', { comments: [comment('codex')], inlineComments: [inline({ original_commit_id: null })], resolvedCommentIds: [20] }, false],
+  ['resolved historical finding alone cannot establish approval', { inlineComments: [inline({ original_commit_id: OLD })], resolvedCommentIds: [20] }, false],
+  ['another resolved thread cannot clear the current finding', { comments: [comment('codex')], inlineComments: [inline({ original_commit_id: OLD })], resolvedCommentIds: [99] }, false],
   ['original HEAD finding vetoes even with different mapped commit', { comments: [comment('codex')], inlineComments: [inline({ commit_id: OLD })] }, false],
   ['inline replies are not new findings', { comments: [comment('codex')], inlineComments: [inline({ in_reply_to_id: 19 })] }, true],
   ['human inline comment is outside this label', { comments: [comment('codex')], inlineComments: [inline({ user: { login: 'bootjp', id: 1306365, type: 'User' } })] }, true],
@@ -207,6 +213,14 @@ function fakeGitHub(options = {}) {
     comments: () => {}, reviews: () => {}, inline: () => {}, pulls: () => {}, closed: () => {},
   };
   const github = {
+    graphql: async (_query, variables) => {
+      state.calls.push(['graphql', variables]);
+      if (options.failResolution) throw new Error('Thread API unavailable');
+      const pages = options.threadPages ?? [{ nodes: [], pageInfo: { hasNextPage: false } }];
+      const page = structuredClone(pages[Number(variables.cursor ?? 0)]);
+      if (state.reopened) page.nodes.forEach(thread => { thread.isResolved = false; });
+      return { repository: { pullRequest: { reviewThreads: page } } };
+    },
     rest: {
       pulls: {
         list: endpoints.pulls, listReviews: endpoints.reviews, listReviewComments: endpoints.inline,
@@ -297,6 +311,56 @@ test('remapped root finding revokes existing approval despite clean summary', as
   assert.equal((await reconcilePullRequest(args)).approved, false);
   assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
   assert.equal(state.calls.some(([name]) => name === 'addLabels'), false);
+});
+
+/** Build a page of resolved root IDs from GitHub's thread query. */
+function threadPage(ids, next) {
+  return { nodes: ids.map(id => ({ isResolved: true, comments: { nodes: [{ databaseId: id }] } })),
+    pageInfo: { hasNextPage: next !== undefined, endCursor: next } };
+}
+
+test('reads every thread page before permitting resolved historical findings', async () => {
+  const { state, args } = fakeGitHub({
+    inlineComments: [inline({ original_commit_id: OLD })],
+    threadPages: [threadPage([999], '1'), threadPage([20])],
+  });
+  assert.equal((await reconcilePullRequest(args)).approved, true);
+  assert.equal(state.calls.filter(([name]) => name === 'graphql').length, 4);
+});
+
+test('thread API failure revokes existing approval', async () => {
+  const { state, args } = fakeGitHub({ labeled: true, failResolution: true,
+    inlineComments: [inline({ original_commit_id: OLD })],
+  });
+  await assert.rejects(reconcilePullRequest(args), /Thread API unavailable/);
+  assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
+});
+
+test('unknown thread resolution does not approve a historical finding', async () => {
+  const page = threadPage([20]);
+  delete page.nodes[0].isResolved;
+  const { args } = fakeGitHub({ inlineComments: [inline({ original_commit_id: OLD })], threadPages: [page] });
+  assert.equal((await reconcilePullRequest(args)).approved, false);
+});
+
+test('invalid thread pagination fails closed', async () => {
+  for (const page of [{ nodes: [] }, threadPage([], '0')]) {
+    const { state, args } = fakeGitHub({ labeled: true,
+      inlineComments: [inline({ original_commit_id: OLD })], threadPages: [page],
+    });
+    await assert.rejects(reconcilePullRequest(args), /Invalid review thread/);
+    assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
+  }
+});
+
+test('reopened historical finding revokes approval during label write', async () => {
+  const { state, args } = fakeGitHub({
+    inlineComments: [inline({ original_commit_id: OLD })], threadPages: [threadPage([20])],
+    afterAdd: state => { state.reopened = true; },
+  });
+  assert.equal((await reconcilePullRequest(args)).approved, false);
+  assert.deepEqual(state.pr.labels, [{ name: 'keep-me' }]);
+  assert.equal(state.calls.some(([name]) => name === 'addLabels'), true);
 });
 
 test('does not attempt to remove an absent label', async () => {
