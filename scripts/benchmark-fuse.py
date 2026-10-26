@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure strict FUSE write plus fsync latency on one file and a hot inode."""
+"""Measure FUSE write plus fsync latency on one file and a hot inode."""
 
 import argparse
 import json
@@ -110,6 +110,7 @@ def main():
     parser.add_argument("mount", type=pathlib.Path)
     parser.add_argument("--writes", type=int, default=40)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--mode", choices=("strict", "legacy"), required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if args.writes < 1 or not 1 <= args.workers <= 255:
@@ -119,6 +120,7 @@ def main():
         "block_bytes": BLOCK,
         "writes_per_worker": args.writes,
         "workers": args.workers,
+        "mode": args.mode,
         "serial": run_serial(args.mount / f"benchmark-serial-{prefix}.dat", args.writes),
         "hot_inode": run_hot(args.mount / f"benchmark-hot-{prefix}.dat", args.workers, args.writes),
     }
