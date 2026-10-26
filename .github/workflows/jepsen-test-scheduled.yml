@@ -7,6 +7,11 @@ on:
         description: "Workload runtime seconds"
         required: false
         default: "300"
+      long-fuse-run:
+        description: "Run strict FUSE Jepsen workloads for 30 minutes"
+        type: boolean
+        required: false
+        default: false
       rate:
         description: "Ops/sec per worker"
         required: false
@@ -371,11 +376,14 @@ jobs:
         if: matrix.workload == 'filesystem-overwrite' || matrix.workload == 'filesystem-rename'
         working-directory: jepsen
         # Each write mode uses a fresh filesystem cluster on its own runner.
-        # See jepsen/src/elastickv/filesystem_workload.clj.
-        timeout-minutes: 30
+        # The scheduled run keeps enough bounded registers to exercise strict
+        # mutations for the full 30-minute workload. See filesystem_budget.sh.
+        timeout-minutes: 70
         env:
-          FS_REQUESTED_KEYS: ${{ inputs.key-count || '16' }}
-          FS_REQUESTED_WRITES: ${{ inputs.max-writes-per-key || '250' }}
+          FS_TIME_LIMIT: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1800' || inputs.time-limit || '300' }}
+          FS_RATE: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1' || inputs.rate || '10' }}
+          FS_REQUESTED_KEYS: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '512' || inputs.key-count || '16' }}
+          FS_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || inputs.max-writes-per-key || '250' }}
         run: |
           # Knossos checks each register independently. Bound each history's
           # ambiguous writes while keeping the requested total write budget.
@@ -394,9 +402,9 @@ jobs:
           MODE="${WORKLOAD#filesystem-}"
           filesystem_budget "$MODE" "$FS_REQUESTED_KEYS" "$FS_REQUESTED_WRITES"
           echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
-          timeout 720 ~/lein run -m elastickv.filesystem-workload --local \
-            --time-limit ${{ inputs.time-limit || '300' }} \
-            --rate ${{ inputs.rate || '10' }} \
+          timeout 3600 ~/lein run -m elastickv.filesystem-workload --local \
+            --time-limit "$FS_TIME_LIMIT" \
+            --rate "$FS_RATE" \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count "$FS_KEY_COUNT" \
             --max-writes-per-key "$FS_MAX_WRITES" \
@@ -405,17 +413,22 @@ jobs:
       - name: Run SQLite Jepsen workload on FUSE
         if: matrix.workload == 'sqlite'
         working-directory: jepsen
-        timeout-minutes: 20
+        timeout-minutes: 70
+        env:
+          FS_TIME_LIMIT: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1800' || inputs.time-limit || '300' }}
+          FS_RATE: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '0.25' || inputs.rate || '10' }}
+          SQLITE_REQUESTED_KEYS: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '128' || '24' }}
+          SQLITE_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || '64' }}
         run: |
           # Spread the longer run across databases while bounding the
           # ambiguous writes Knossos must explore for any one database.
           bash test/sqlite_budget_test.sh
           source ./sqlite_budget.sh
-          sqlite_budget 24 64
+          sqlite_budget "$SQLITE_REQUESTED_KEYS" "$SQLITE_REQUESTED_WRITES"
           echo "SQLite register budget: ${SQLITE_KEY_COUNT} keys, ${SQLITE_MAX_WRITES} writes per key"
-          timeout 900 ~/lein run -m elastickv.sqlite-workload --local \
-            --time-limit ${{ inputs.time-limit || '300' }} \
-            --rate ${{ inputs.rate || '10' }} \
+          timeout 3600 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit "$FS_TIME_LIMIT" \
+            --rate "$FS_RATE" \
             --concurrency 8 --key-count "$SQLITE_KEY_COUNT" --max-writes-per-key "$SQLITE_MAX_WRITES" \
             --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
       - name: Archive Jepsen history
