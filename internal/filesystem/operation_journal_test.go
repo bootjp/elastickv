@@ -694,6 +694,40 @@ func TestOperationJournalOwnerFenceAndRecovery(t *testing.T) {
 	require.ErrorIs(t, err, ErrOperationSessionClosed)
 }
 
+func TestOperationJournalRecoverOwnerSession(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	_, err = journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	require.NoError(t, journal.RecoverOwnerSession(ctx, id.Filesystem, "mount-a"))
+	record, err := journal.Resolve(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, OperationCancelled, record.State)
+	replacement, err := journal.RegisterSession(ctx, id.Filesystem, "mount-a")
+	require.NoError(t, err)
+	require.NotEqual(t, id.Session, replacement.Session)
+	require.NoError(t, journal.RecoverOwnerSession(ctx, id.Filesystem, "mount-a"))
+}
+
+func TestAcknowledgeOperationCancelsPendingReply(t *testing.T) {
+	ctx := context.Background()
+	journal, st, coord := testOperationJournal(t)
+	svc, err := NewService(st, coord)
+	require.NoError(t, err)
+	id := testOperationID(t, journal, 1)
+	_, err = journal.Admit(ctx, id, []byte("release"), 128, 1024)
+	require.NoError(t, err)
+	_, err = journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	require.NoError(t, svc.AcknowledgeOperation(ctx, id))
+	_, err = journal.Resolve(ctx, id)
+	require.ErrorIs(t, err, ErrOperationRetired)
+	require.NoError(t, journal.CloseSession(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}))
+}
+
 func TestOperationJournalAcknowledgementGapsRetireWithoutReuse(t *testing.T) {
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)

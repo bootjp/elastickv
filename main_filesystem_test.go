@@ -51,22 +51,28 @@ func TestRunFilesystemLeaseReaperRunsPeriodically(t *testing.T) {
 
 func TestFilesystemStartConfigFromFlags(t *testing.T) {
 	oldMount, oldClientID, oldRaftID := *filesystemMount, *filesystemClientID, *raftId
+	oldStrict := *filesystemStrict
+	oldStrictRecover := *filesystemStrictRecover
 	oldMode, oldUID, oldGID := *filesystemRootMode, *filesystemRootUID, *filesystemRootGID
 	t.Cleanup(func() {
 		*filesystemMount, *filesystemClientID, *raftId = oldMount, oldClientID, oldRaftID
+		*filesystemStrict = oldStrict
+		*filesystemStrictRecover = oldStrictRecover
 		*filesystemRootMode, *filesystemRootUID, *filesystemRootGID = oldMode, oldUID, oldGID
 	})
 
 	tests := []struct {
-		name     string
-		mount    string
-		clientID string
-		raftID   string
-		mode     uint
-		uid      uint
-		gid      uint
-		want     filesystemStartConfig
-		wantErr  string
+		name          string
+		mount         string
+		clientID      string
+		raftID        string
+		mode          uint
+		uid           uint
+		gid           uint
+		want          filesystemStartConfig
+		wantErr       string
+		strict        bool
+		strictRecover bool
 	}{
 		{
 			name:  "disabled when mount point is blank",
@@ -90,6 +96,22 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 			raftID:   "n1",
 			mode:     0o755,
 			want:     filesystemStartConfig{mountPoint: "/mnt/fs", clientID: "mount-a", rootMode: 0o755},
+		},
+		{
+			name:   "strict mount is explicit",
+			mount:  "/mnt/fs",
+			raftID: "n1",
+			mode:   0o755,
+			strict: true,
+			want:   filesystemStartConfig{mountPoint: "/mnt/fs", clientID: "n1", strict: true, rootMode: 0o755},
+		},
+		{
+			name:          "strict recovery needs strict mount",
+			mount:         "/mnt/fs",
+			raftID:        "n1",
+			mode:          0o755,
+			strictRecover: true,
+			wantErr:       "requires filesystemStrict",
 		},
 		{
 			name:    "client id required",
@@ -125,6 +147,8 @@ func TestFilesystemStartConfigFromFlags(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			*filesystemMount, *filesystemClientID, *raftId = tt.mount, tt.clientID, tt.raftID
+			*filesystemStrict = tt.strict
+			*filesystemStrictRecover = tt.strictRecover
 			*filesystemRootMode, *filesystemRootUID, *filesystemRootGID = tt.mode, tt.uid, tt.gid
 
 			got, err := filesystemStartConfigFromFlags()

@@ -13,16 +13,22 @@ func (s *Server) UnmountContext(ctx context.Context) error {
 	if s == nil {
 		return nil
 	}
-	if s.adapter != nil {
-		s.adapter.Close()
-	}
+	defer func() {
+		if s.adapter != nil {
+			s.adapter.Close()
+		}
+	}()
 	if s.inner == nil || s.isReleased() || s.mountPoint == "" {
 		return nil
 	}
 	// Ordinary unmount can succeed before backend handlers leave Serve.
 	// Cancel their common parent before the lifecycle can close stores.
 	defer s.fs.cancelInFlight()
-	return unmountFUSEMount(ctx, s.mountPoint, s.fsType)
+	if err := unmountFUSEMount(ctx, s.mountPoint, s.fsType); err != nil {
+		return err
+	}
+	s.finishStrictSession()
+	return nil
 }
 
 func unmountFUSEMount(ctx context.Context, mountPoint, fsType string) error {

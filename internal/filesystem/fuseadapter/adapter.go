@@ -59,6 +59,7 @@ type Adapter struct {
 	journaledOpen     bool
 	journaledRelease  bool
 	journaledLease    bool
+	strictMode        bool
 	operationSequence atomic.Uint64
 	receiptMu         sync.Mutex
 	receipts          map[uint64]map[filesystem.OperationID]struct{}
@@ -73,6 +74,11 @@ type Adapter struct {
 	handles           map[openHandleKey]struct{}
 	leaseRefreshed    map[openHandleKey]time.Time
 	leaseRenewalMu    sync.Mutex
+	replyMu           sync.Mutex
+	replyIDs          map[uint64][]filesystem.OperationID
+	ackPending        map[filesystem.OperationID]struct{}
+	ackWake           chan struct{}
+	ackCancel         context.CancelFunc
 }
 
 type Option func(*Adapter)
@@ -206,6 +212,25 @@ func WithJournaledLeaseRefresh(session filesystem.OperationSessionID) Option {
 	}
 }
 
+// WithStrictMode routes every supported mutation through the registered
+// operation session and enables reply-bound acknowledgement.
+func WithStrictMode(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.strictMode = true
+		a.journaledWrites = true
+		a.journaledMetadata = true
+		a.journaledUnlink = true
+		a.journaledRmdir = true
+		a.journaledRename = true
+		a.journaledCreate = true
+		a.journaledMkdir = true
+		a.journaledOpen = true
+		a.journaledRelease = true
+		a.journaledLease = true
+	}
+}
+
 func (a *Adapter) setOperationSession(session filesystem.OperationSessionID) {
 	if a.operationSession != (filesystem.OperationSessionID{}) && a.operationSession != session {
 		a.sessionConflict = true
@@ -230,6 +255,12 @@ func New(core Core, clientID []byte, opts ...Option) *Adapter {
 		a.keepaliveCancel = cancel
 		go a.keepOpenHandlesAlive(ctx)
 	}
+	if a.operationSession != (filesystem.OperationSessionID{}) {
+		ctx, cancel := context.WithCancel(context.Background())
+		a.ackCancel = cancel
+		a.ackWake = make(chan struct{}, 1)
+		go a.retryAcknowledgements(ctx)
+	}
 	return a
 }
 
@@ -237,6 +268,16 @@ func (a *Adapter) Close() {
 	a.closeOnce.Do(func() {
 		if a.keepaliveCancel != nil {
 			a.keepaliveCancel()
+		}
+		if a.ackCancel != nil {
+			a.ackCancel()
+		}
+		if a.strictMode {
+			ctx, cancel := context.WithTimeout(context.Background(), ackTimeout)
+			defer cancel()
+			if err := a.finishStrictSession(ctx); err != nil {
+				slog.Warn("filesystem strict session remains open after close", "error", err.Error())
+			}
 		}
 	})
 }
@@ -292,7 +333,7 @@ func (a *Adapter) SetAttr(
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return filesystem.Stat{}, syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		stat, err = setter.SetAttrWithOperation(ctx, id, inode, mask, attrs)
 		if err == nil {
 			a.recordReceipt(inode, id)
@@ -303,9 +344,11 @@ func (a *Adapter) SetAttr(
 	return stat, Errno(err)
 }
 
-func (a *Adapter) nextOperationID() filesystem.OperationID {
-	return filesystem.OperationID{Filesystem: a.operationSession.Filesystem, Session: a.operationSession.Session,
+func (a *Adapter) nextOperationID(ctx context.Context) filesystem.OperationID {
+	id := filesystem.OperationID{Filesystem: a.operationSession.Filesystem, Session: a.operationSession.Session,
 		Sequence: a.operationSequence.Add(1)}
+	a.recordReplyIdentity(ctx, id)
+	return id
 }
 
 func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
@@ -338,7 +381,7 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	id := a.nextOperationID()
+	id := a.nextOperationID(ctx)
 	fh, err := opener.OpenWithOperation(ctx, id, inode, a.clientID)
 	if err == nil {
 		a.recordReceipt(inode, id)
@@ -377,7 +420,7 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return 0, syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		n, writeErr = writer.WriteWithOperation(ctx, id, inode, offset, data)
 		if writeErr == nil {
 			a.recordReceipt(inode, id)
@@ -452,7 +495,7 @@ func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		err = releaser.ReleaseWithOperation(ctx, id, inode, fh, a.clientID)
 		if err == nil {
 			a.recordReceipt(inode, id)
@@ -486,7 +529,7 @@ func (a *Adapter) Create(
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return filesystem.CreateResult{}, syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		result, err = creator.CreateWithOperation(ctx, id, parent, name, opts)
 		if err == nil {
 			a.recordReceipt(parent, id)
@@ -521,7 +564,7 @@ func (a *Adapter) Mknod(
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return filesystem.CreateResult{}, syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		result, err = creator.CreateWithOperation(ctx, id, parent, name, opts)
 		if err == nil {
 			a.recordReceipt(parent, id)
@@ -552,7 +595,7 @@ func (a *Adapter) Mkdir(
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return filesystem.CreateResult{}, syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		result, err = creator.MkdirWithOperation(ctx, id, parent, name, opts)
 		if err == nil {
 			a.recordReceipt(parent, id)
@@ -577,7 +620,7 @@ func (a *Adapter) Unlink(ctx context.Context, parent uint64, name []byte) (errno
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		err = unlinker.UnlinkWithOperation(ctx, id, parent, name)
 		if err == nil {
 			a.recordReceipt(parent, id)
@@ -602,7 +645,7 @@ func (a *Adapter) Rmdir(ctx context.Context, parent uint64, name []byte) (errno 
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		err = remover.RmdirWithOperation(ctx, id, parent, name)
 		if err == nil {
 			a.recordReceipt(parent, id)
@@ -633,7 +676,7 @@ func (a *Adapter) Rename(
 		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return syscall.EOPNOTSUPP
 		}
-		id := a.nextOperationID()
+		id := a.nextOperationID(ctx)
 		err = renamer.RenameWithOperation(ctx, id, oldParent, oldName, newParent, newName)
 		if err == nil {
 			a.recordReceipt(oldParent, id)
@@ -691,7 +734,7 @@ func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh ui
 	if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 		return filesystem.ErrUnsupported
 	}
-	id := a.nextOperationID()
+	id := a.nextOperationID(ctx)
 	err := refresher.RefreshOpenHandleLeaseWithOperation(ctx, id, inode, fh, a.clientID)
 	if err == nil {
 		a.recordReceipt(inode, id)

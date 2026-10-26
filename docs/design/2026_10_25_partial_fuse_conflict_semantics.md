@@ -458,21 +458,23 @@ lease lifetime, capped at one minute. Other reads validate the current lease
 without extending it. A later renewal verifies the preceding lease receipt
 before removing that receipt from the local fsync set; failed verification
 keeps the older receipt.
-Its retained records still need safe acknowledgement and garbage collection.
 `Service.Fsync` still uses an attribute read after the adapter checks the
 receipts for its supported journaled operations.
 The optional receipt tracker is local to one mount and retains only successful
-operations in memory. Session acknowledgement and journal garbage collection
-are not wired to the kernel's reply boundary.
+operations in memory. Successful replies now trigger receipt verification and
+session acknowledgement after the FUSE device write attempt.
 Write planning failures before publication cancel their pending attempt with a
 typed result so a duplicate observes the same failure and the session can
 close. An uncertain cancellation remains unknown until resolution.
-In the pinned go-fuse version, `Server.handleRequest` writes the kernel reply
-after the raw filesystem method returns. The raw adapter has no callback for
-that write, so acknowledging when the adapter method returns would retire the
-operation before the reply attempt required by the journal contract.
-The baseline and optional-path tests do not satisfy the strict-mode gates
-below.
+The local go-fuse bridge now notifies the adapter after `Server.handleRequest`
+attempts the kernel reply. The adapter verifies participant receipts before
+acknowledging terminal operations and retries acknowledgements that could not
+complete. Suppressed replies do not trigger acknowledgement. The explicit
+`--filesystemStrict` mount option selects all supported journaled mutation
+paths. Recovery of a previous incarnation requires the separate
+`--filesystemStrictRecover` flag after its process has stopped.
+The explicit strict mount is available for validation, but the default remains
+the legacy path until the strict-mode acceptance gates below pass.
 
 The current Raft path persists Ready entries through `persistReadyToWAL`
 before applying them.

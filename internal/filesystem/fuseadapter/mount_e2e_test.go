@@ -393,6 +393,14 @@ func TestKernelMountStatfsReportsNameLimit(t *testing.T) {
 	require.EqualValues(t, 255, stat.Namelen)
 }
 
+func requireOperationRetired(t *testing.T, journal *filesystem.OperationJournal, id filesystem.OperationID) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		_, err := journal.Resolve(t.Context(), id)
+		return errors.Is(err, filesystem.ErrOperationRetired)
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
 func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
@@ -415,11 +423,75 @@ func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, []byte("journaled"), data)
-	record, err := journal.Resolve(t.Context(), filesystem.OperationID{
+	requireOperationRetired(t, journal, filesystem.OperationID{
 		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
 	})
+}
+
+func TestKernelMountStrictModeMutationsAndReplyAcknowledgement(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
 	require.NoError(t, err)
-	require.Equal(t, filesystem.OperationCommitted, record.State)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-strict")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mount := mountMemoryServiceAtWithOptions(t, svc, "e2e-strict", mountPoint, fuseadapter.WithStrictMode(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("strict"), 0o600))
+	require.NoError(t, os.Truncate(path, 3))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("str"), data)
+	require.NoError(t, os.Rename(path, filepath.Join(mountPoint, "renamed")))
+	require.NoError(t, os.Remove(filepath.Join(mountPoint, "renamed")))
+	directory, err := os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, directory.Sync())
+	require.NoError(t, directory.Close())
+	requireOperationRetired(t, journal, filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
+	require.NoError(t, mount.unmount())
+	_, err = journal.RegisterSession(t.Context(), filesystemID, "e2e-strict")
+	require.NoError(t, err)
+}
+
+func TestKernelMountStrictModeReclaimsJournalQuota(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-strict-quota")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-strict-quota", mountPoint, fuseadapter.WithStrictMode(session))
+	file, err := os.Create(filepath.Join(mountPoint, "file"))
+	require.NoError(t, err)
+	for range 4200 {
+		_, err = file.Write([]byte("x"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	stat, err := os.Stat(filepath.Join(mountPoint, "file"))
+	require.NoError(t, err)
+	require.EqualValues(t, 4200, stat.Size())
+	requireOperationRetired(t, journal, filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
 }
 
 func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
@@ -452,18 +524,10 @@ func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, directory.Sync())
 	require.NoError(t, directory.Close())
-	require.Eventually(t, func() bool {
-		_, err := journal.Resolve(t.Context(), filesystem.OperationID{
-			Filesystem: session.Filesystem, Session: session.Session, Sequence: 5,
-		})
-		return err == nil
-	}, 3*time.Second, 10*time.Millisecond)
 	for sequence := uint64(1); sequence <= 5; sequence++ {
-		record, err := journal.Resolve(t.Context(), filesystem.OperationID{
+		requireOperationRetired(t, journal, filesystem.OperationID{
 			Filesystem: session.Filesystem, Session: session.Session, Sequence: sequence,
 		})
-		require.NoError(t, err)
-		require.Equal(t, filesystem.OperationCommitted, record.State)
 	}
 }
 
@@ -487,11 +551,9 @@ func TestKernelMountJournaledLeaseRefreshAndFsync(t *testing.T) {
 	time.Sleep(600 * time.Millisecond)
 	require.NoError(t, file.Sync())
 	require.NoError(t, file.Close())
-	record, err := journal.Resolve(t.Context(), filesystem.OperationID{
+	requireOperationRetired(t, journal, filesystem.OperationID{
 		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
 	})
-	require.NoError(t, err)
-	require.Equal(t, filesystem.OperationCommitted, record.State)
 }
 
 func TestKernelMountJournaledMetadataChange(t *testing.T) {
@@ -555,7 +617,8 @@ func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
 	require.NoError(t, dir.Close())
 	require.NoError(t, os.WriteFile(path, []byte("new"), 0o600))
 	id := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 1}
-	require.NoError(t, svc.UnlinkWithOperation(t.Context(), id, filesystem.RootInode, []byte("file")))
+	requireOperationRetired(t, journal, id)
+	require.ErrorIs(t, svc.UnlinkWithOperation(t.Context(), id, filesystem.RootInode, []byte("file")), filesystem.ErrOperationRetired)
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, []byte("new"), data)
@@ -568,7 +631,8 @@ func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
 	require.NoError(t, dir.Close())
 	require.NoError(t, os.Mkdir(dirPath, 0o700))
 	directoryID := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 2}
-	require.NoError(t, svc.RmdirWithOperation(t.Context(), directoryID, filesystem.RootInode, []byte("dir")))
+	requireOperationRetired(t, journal, directoryID)
+	require.ErrorIs(t, svc.RmdirWithOperation(t.Context(), directoryID, filesystem.RootInode, []byte("dir")), filesystem.ErrOperationRetired)
 	stat, err := os.Stat(dirPath)
 	require.NoError(t, err)
 	require.True(t, stat.IsDir())
@@ -582,7 +646,8 @@ func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
 	require.NoError(t, dir.Close())
 	require.NoError(t, os.WriteFile(source, []byte("new"), 0o600))
 	renameID := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 3}
-	require.NoError(t, svc.RenameWithOperation(t.Context(), renameID, filesystem.RootInode, []byte("source"), filesystem.RootInode, []byte("target")))
+	requireOperationRetired(t, journal, renameID)
+	require.ErrorIs(t, svc.RenameWithOperation(t.Context(), renameID, filesystem.RootInode, []byte("source"), filesystem.RootInode, []byte("target")), filesystem.ErrOperationRetired)
 	sourceData, err := os.ReadFile(source)
 	require.NoError(t, err)
 	require.Equal(t, []byte("new"), sourceData)

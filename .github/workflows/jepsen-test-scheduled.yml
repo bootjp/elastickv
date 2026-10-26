@@ -284,6 +284,7 @@ jobs:
               --dynamoAddress "127.0.0.1:6380${node}" \
               --s3Address "127.0.0.1:6390${node}" \
               --filesystemMount "/tmp/elastickv-fs/fs-n${node}" \
+              --filesystemStrict \
               --filesystemRootUID "$(id -u)" \
               --filesystemRootGID "$(id -g)" \
               --metricsAddress "" \

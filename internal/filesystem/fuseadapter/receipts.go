@@ -6,6 +6,7 @@ import (
 	"syscall"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/cockroachdb/errors"
 )
 
 type operationReceiptVerifier interface {
@@ -40,7 +41,7 @@ func (a *Adapter) retainLatestLeaseReceipt(ctx context.Context, inode, fh uint64
 		return
 	}
 	for _, old := range previous {
-		if err := verifier.VerifyOperationReceipt(ctx, old); err != nil {
+		if err := verifier.VerifyOperationReceipt(ctx, old); err != nil && !errors.Is(err, filesystem.ErrOperationRetired) {
 			slog.WarnContext(ctx, "filesystem lease receipt verification failed", "inode", inode, "fh", fh, "error", err.Error())
 			return
 		}
@@ -51,11 +52,11 @@ func (a *Adapter) retainLatestLeaseReceipt(ctx context.Context, inode, fh uint64
 
 func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesystem.OperationID, syscall.Errno) {
 	a.receiptMu.Lock()
+	defer a.receiptMu.Unlock()
 	receipts := make([]filesystem.OperationID, 0, len(a.receipts[inode]))
 	for id := range a.receipts[inode] {
 		receipts = append(receipts, id)
 	}
-	a.receiptMu.Unlock()
 	if len(receipts) == 0 {
 		return receipts, 0
 	}

@@ -637,6 +637,32 @@ func (j *OperationJournal) FenceSession(ctx context.Context, id OperationSession
 	return j.setSessionClosed(ctx, id, true)
 }
 
+// RecoverOwnerSession fences a previous mount incarnation and resolves its
+// pending attempts before the owner registers a replacement session.
+func (j *OperationJournal) RecoverOwnerSession(ctx context.Context, filesystemID [16]byte, owner string) error {
+	if filesystemID == [16]byte{} || owner == "" {
+		return errors.WithStack(ErrInvalid)
+	}
+	ts, err := j.backend.Snapshot(ctx)
+	if err != nil {
+		return errors.Wrap(err, "snapshot previous operation owner")
+	}
+	previous, exists, err := j.loadOwnerAt(ctx, fskeys.OperationOwnerKey(filesystemID, []byte(owner)), ts)
+	if err != nil || !exists {
+		return err
+	}
+	id := OperationSessionID{Filesystem: filesystemID, Session: previous}
+	if err := j.FenceSession(ctx, id); err != nil {
+		return err
+	}
+	for {
+		resolved, err := j.RecoverClosedSession(ctx, id, defaultIntentRecoveryLimit)
+		if err != nil || resolved == 0 {
+			return err
+		}
+	}
+}
+
 func (j *OperationJournal) setSessionClosed(ctx context.Context, id OperationSessionID, allowPending bool) error {
 	for range operationCASRetries {
 		err := j.closeSessionOnce(ctx, id, allowPending)

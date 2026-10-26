@@ -123,6 +123,8 @@ var (
 	pprofToken                      = flag.String("pprofToken", "", "Bearer token for pprof; required for non-loopback pprofAddress")
 	filesystemMount                 = flag.String("filesystemMount", "", "FUSE mount point for the Elastickv filesystem; empty to disable")
 	filesystemClientID              = flag.String("filesystemClientID", "", "Stable open-handle lease client ID for the FUSE mount; empty uses raftId")
+	filesystemStrict                = flag.Bool("filesystemStrict", false, "Use the operation journal for supported FUSE mutations")
+	filesystemStrictRecover         = flag.Bool("filesystemStrictRecover", false, "Fence and recover a previous strict FUSE session for the same client ID; use only after the previous mount has stopped")
 	filesystemCapacity              = flag.Uint64("filesystemCapacity", 0, "Filesystem byte capacity reported by statfs; zero reports unlimited")
 	filesystemMaxFiles              = flag.Uint64("filesystemMaxFiles", 0, "Filesystem inode capacity reported by statfs; zero reports unlimited")
 	filesystemRootMode              = flag.Uint("filesystemRootMode", defaultFilesystemRootMode, "Root directory permission mode for first initialization")
@@ -994,11 +996,13 @@ func startRaftEngineLifecycleWatchers(ctx context.Context, eg *errgroup.Group, r
 }
 
 type filesystemStartConfig struct {
-	mountPoint string
-	clientID   string
-	rootMode   uint32
-	rootUID    uint32
-	rootGID    uint32
+	mountPoint    string
+	clientID      string
+	strict        bool
+	strictRecover bool
+	rootMode      uint32
+	rootUID       uint32
+	rootGID       uint32
 	// mountOptions overrides go-fuse's mount options. Production leaves it
 	// nil (fusermount3 path); tests set DirectMount where no helper exists.
 	mountOptions *fuse.MountOptions
@@ -1013,6 +1017,11 @@ func filesystemStartConfigFromFlags() (filesystemStartConfig, error) {
 		return filesystemStartConfig{}, errors.New("filesystem root mode, uid, or gid is out of range")
 	}
 	config.clientID = strings.TrimSpace(*filesystemClientID)
+	config.strict = *filesystemStrict
+	config.strictRecover = *filesystemStrictRecover
+	if config.strictRecover && !config.strict {
+		return filesystemStartConfig{}, errors.New("filesystemStrictRecover requires filesystemStrict")
+	}
 	if config.clientID == "" {
 		config.clientID = strings.TrimSpace(*raftId)
 	}
@@ -1081,7 +1090,11 @@ func mountFilesystemService(
 	service *filesystem.Service,
 	config filesystemStartConfig,
 ) (*fuseadapter.Server, <-chan struct{}, error) {
-	frontend := fuseadapter.New(service, []byte(config.clientID))
+	adapterOptions, err := strictFilesystemOptions(ctx, service, config)
+	if err != nil {
+		return nil, nil, err
+	}
+	frontend := fuseadapter.New(service, []byte(config.clientID), adapterOptions...)
 	server, err := fuseadapter.MountContext(ctx, config.mountPoint, frontend, config.mountOptions)
 	if err != nil {
 		frontend.Close()
@@ -1098,6 +1111,30 @@ func mountFilesystemService(
 		return nil, nil, errors.Wrap(err, "wait for filesystem FUSE mount")
 	}
 	return server, serveDone, nil
+}
+
+func strictFilesystemOptions(ctx context.Context, service *filesystem.Service, config filesystemStartConfig) ([]fuseadapter.Option, error) {
+	if !config.strict {
+		return nil, nil
+	}
+	journal, err := filesystem.NewOperationJournal(service)
+	if err != nil {
+		return nil, errors.Wrap(err, "create strict filesystem journal")
+	}
+	filesystemID, err := journal.EnsureFilesystem(ctx)
+	if err != nil {
+		return nil, errors.Wrap(err, "identify strict filesystem")
+	}
+	if config.strictRecover {
+		if err := journal.RecoverOwnerSession(ctx, filesystemID, config.clientID); err != nil {
+			return nil, errors.Wrap(err, "recover previous strict filesystem session")
+		}
+	}
+	session, err := journal.RegisterSession(ctx, filesystemID, config.clientID)
+	if err != nil {
+		return nil, errors.Wrap(err, "register strict filesystem session")
+	}
+	return []fuseadapter.Option{fuseadapter.WithStrictMode(session)}, nil
 }
 
 // filesystemMountServer is the part of *fuseadapter.Server the shutdown
