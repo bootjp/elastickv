@@ -442,6 +442,17 @@ func TestKernelMountJournaledMetadataChange(t *testing.T) {
 	stat, err := os.Stat(path)
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o640), stat.Mode().Perm())
+	require.NoError(t, os.Truncate(path, 2))
+	f, err = os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	stat, err = os.Stat(path)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stat.Size())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("da"), data)
 }
 
 func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {

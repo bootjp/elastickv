@@ -442,13 +442,13 @@ The merged baseline forwards definitive write conflicts, retries several
 filesystem service operations within bounds, tracks local FUSE predecessors,
 and tests mounted SQLite PERSIST/DELETE workloads.
 This branch adds a transaction-primary generation fence and optional
-journal-backed paths for fixed-offset FUSE writes, metadata-only setattr,
+journal-backed paths for fixed-offset FUSE writes, setattr including size changes,
 file unlink, empty-directory removal, and same-directory rename.
 The adapter retains their successful operation IDs per inode.
 Its flush and fsync paths resolve those IDs and check participant proofs.
 Directory fsync checks the removal and rename receipts recorded for that parent.
 The default mount path still uses the legacy mutations.
-Other mutation categories lack journal-backed planners.
+Create/open/mkdir, release, and lease maintenance still lack journal-backed planners.
 `Service.Fsync` still uses an attribute read after the adapter checks the
 receipts for its supported journaled operations.
 Other namespace mutations still have no durable directory receipt.

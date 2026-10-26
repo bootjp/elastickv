@@ -124,8 +124,7 @@ func WithJournaledWrites(session filesystem.OperationSessionID) Option {
 	}
 }
 
-// WithJournaledMetadata journals setattr requests that do not change size.
-// Size changes need a separate chunk-deletion planner.
+// WithJournaledMetadata journals setattr requests, including size changes.
 func WithJournaledMetadata(session filesystem.OperationSessionID) Option {
 	return func(a *Adapter) {
 		a.setOperationSession(session)
@@ -236,7 +235,7 @@ func (a *Adapter) SetAttr(
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	if a.journaledMetadata && !mask.Size {
+	if a.journaledMetadata {
 		setter, ok := a.core.(interface {
 			SetAttrWithOperation(context.Context, filesystem.OperationID, uint64, filesystem.SetAttrMask, filesystem.SetAttr) (filesystem.Stat, error)
 		})
