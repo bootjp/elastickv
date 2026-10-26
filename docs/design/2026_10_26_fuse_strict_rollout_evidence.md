@@ -30,6 +30,9 @@ the lost-response path with two live Raft groups and their lock resolver.
 `TestPrimaryCommitDecisionClassification` cover the two error classes.
 `TestJournalGenerationFenceSurvivesProcessKill` verifies that a
 restarted store still rejects an old attempt after its durable fence.
+`TestJournalCommittedAttemptDecisionSurvivesProcessKill` verifies that a
+committed attempt, stored result, and effect survive a process kill; retrying
+the same attempt returns that result without publishing another effect.
 
 ## Crash and mounted evidence
 
