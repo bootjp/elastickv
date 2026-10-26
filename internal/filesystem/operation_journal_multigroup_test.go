@@ -87,6 +87,14 @@ func TestOperationJournalTwoGroupCreateOpenWrite(t *testing.T) {
 	require.NoError(t, err)
 	held := &holdPreparedTxn{Transactional: groups[1].Txn, prepared: make(chan struct{}), release: make(chan struct{})}
 	groups[1].Txn = held
+	id.Sequence++
+	assertWriteAfterConcurrentAcknowledgement(t, ctx, journal, svc, createID, id, file.Inode, held)
+	id.Sequence++
+	require.NoError(t, svc.ReleaseWithOperation(ctx, id, file.Inode, fh, []byte("benchmark-mount")))
+}
+
+func assertWriteAfterConcurrentAcknowledgement(t *testing.T, ctx context.Context, journal *OperationJournal, svc *Service, createID, writeID OperationID, inode uint64, held *holdPreparedTxn) {
+	t.Helper()
 	ackDone := make(chan error, 1)
 	go func() { ackDone <- journal.Acknowledge(ctx, createID) }()
 	select {
@@ -94,14 +102,13 @@ func TestOperationJournalTwoGroupCreateOpenWrite(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("acknowledgement did not prepare its session participant")
 	}
-	id.Sequence++
 	type writeResult struct {
 		count int
 		err   error
 	}
 	writeDone := make(chan writeResult, 1)
 	go func() {
-		count, writeErr := svc.WriteWithOperation(ctx, id, file.Inode, 0, []byte("data"))
+		count, writeErr := svc.WriteWithOperation(ctx, writeID, inode, 0, []byte("data"))
 		writeDone <- writeResult{count, writeErr}
 	}()
 	select {
@@ -124,6 +131,4 @@ func TestOperationJournalTwoGroupCreateOpenWrite(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("write did not complete after acknowledgement")
 	}
-	id.Sequence++
-	require.NoError(t, svc.ReleaseWithOperation(ctx, id, file.Inode, fh, []byte("benchmark-mount")))
 }
