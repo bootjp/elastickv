@@ -142,6 +142,31 @@ func TestOperationJournalPublicationRejectsChangedPlanningRoute(t *testing.T) {
 	require.Equal(t, AttemptUnknown, outcome)
 }
 
+func TestOperationJournalDuplicateResultSurvivesPlanningRouteChange(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}, routeVersion: 7}
+	service, err := NewService(st, dispatch)
+	require.NoError(t, err)
+	journal, err := NewOperationJournal(service)
+	require.NoError(t, err)
+	id := testOperationID(t, journal, 1)
+	_, err = journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	snapshot, err := journal.PlanSnapshotAtRoute(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	plan := operationAttemptPlan{Intent: []byte("write"), ReadTS: snapshot.ReadTS, RouteVersion: snapshot.RouteVersion,
+		Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("value")}}, Result: []byte("5")}
+	first, err := journal.Publish(ctx, id, attempt.AttemptID, plan)
+	require.NoError(t, err)
+	dispatch.routeVersion = 8
+	duplicate, err := journal.Publish(ctx, id, attempt.AttemptID, plan)
+	require.NoError(t, err)
+	require.Equal(t, first.Result, duplicate.Result)
+}
+
 func TestOperationJournalPublishesResultWithEffectAndRetiresIdentity(t *testing.T) {
 	ctx := context.Background()
 	journal, st, coord := testOperationJournal(t)

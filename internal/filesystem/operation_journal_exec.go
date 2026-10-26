@@ -200,6 +200,9 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 		return operationRecord{}, errors.WithStack(ErrInvalid)
 	}
 	if err := j.requirePlanningRoute(plan.RouteVersion); err != nil {
+		if duplicate, resolveErr := j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, ErrOperationGeneration); resolveErr == nil {
+			return duplicate, nil
+		}
 		return operationRecord{}, err
 	}
 	ts, record, session, err := j.publicationSnapshot(ctx, id, plan.ReadTS)
@@ -325,6 +328,9 @@ func (j *OperationJournal) RejectAtRoute(ctx context.Context, id OperationID, at
 		return operationRecord{}, errors.WithStack(ErrInvalid)
 	}
 	if err := j.requirePlanningRoute(routeVersion); err != nil {
+		if duplicate, resolveErr := j.resolveDuplicateRejection(ctx, id, attempt, intent, ErrOperationGeneration); resolveErr == nil {
+			return duplicate, nil
+		}
 		return operationRecord{}, err
 	}
 	ts, record, session, err := j.publicationSnapshot(ctx, id, readTS)
