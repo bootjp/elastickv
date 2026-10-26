@@ -589,6 +589,32 @@ func TestOperationJournalDoesNotAdvanceWithoutAbortDecision(t *testing.T) {
 	require.Equal(t, []byte("old"), value)
 }
 
+func TestOperationJournalNewGenerationDoesNotProveOldAttemptAborted(t *testing.T) {
+	id := OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
+	oldAttempt := [16]byte{3}
+	newAttempt := [16]byte{4}
+	for _, tc := range []struct {
+		name  string
+		state OperationState
+	}{
+		{name: "pending", state: OperationPending},
+		{name: "committed", state: OperationCommitted},
+		{name: "rejected", state: OperationRejected},
+		{name: "cancelled", state: OperationCancelled},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			record := operationRecord{ID: id, State: tc.state, AttemptID: newAttempt, Generation: 2}
+			var resolutionErr error
+			if tc.state == OperationPending {
+				resolutionErr = ErrOperationPending
+			}
+			outcome, _, err := classifyAttemptOutcome(id, oldAttempt, record, resolutionErr)
+			require.Equal(t, AttemptUnknown, outcome)
+			require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+		})
+	}
+}
+
 func TestOperationJournalDelayedCommitCannotBeSupersededWithoutDecision(t *testing.T) {
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)

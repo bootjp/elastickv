@@ -98,7 +98,10 @@ func classifyAttemptOutcome(id OperationID, attempt [16]byte, record operationRe
 		return AttemptUnknown, record, err
 	}
 	if record.AttemptID != attempt {
-		return AttemptAborted, record, nil
+		// A newer generation is not an abort certificate for an older
+		// transaction. In particular, its primary decision may have
+		// committed before the operation row became visible here.
+		return AttemptUnknown, record, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 	}
 	if record.State == OperationCommitted && err == nil {
 		return AttemptCommitted, record, nil
