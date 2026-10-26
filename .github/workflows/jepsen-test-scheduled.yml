@@ -465,8 +465,8 @@ jobs:
             wc -l "$log" || true
           done
           tail -n 200 /tmp/elastickv-fs-n1-restarted.log || true
-      - name: Upload filesystem cluster logs on failure
-        if: failure() && (startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite')
+      - name: Upload filesystem cluster logs
+        if: (always() && matrix.workload == 'sqlite') || (failure() && startsWith(matrix.workload, 'filesystem-'))
         uses: actions/upload-artifact@v7
         with:
           name: elastickv-fs-logs-${{ matrix.workload }}
