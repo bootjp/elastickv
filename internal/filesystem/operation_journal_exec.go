@@ -659,6 +659,11 @@ func (j *OperationJournal) acknowledgeOnce(ctx context.Context, id OperationID) 
 }
 
 func reserveAckRetirement(session *operationSession, record operationRecord) error {
+	// The session fence may become visible before the primary record deletion
+	// on another group. A repeated ACK must not consume the reservation twice.
+	if session.retired(record.ID.Sequence) {
+		return errors.WithStack(ErrOperationRetired)
+	}
 	if session.RetainedCount == 0 || session.RetainedBytes < record.Reservation {
 		return errors.WithStack(ErrOperationRecordCorrupt)
 	}

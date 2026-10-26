@@ -115,14 +115,14 @@ func assertJournalCommitsDoNotCollideOnPreparedSession(t *testing.T, ctx context
 	}
 	commit := func(sequence uint64) error { return commitWithContext(ctx, sequence) }
 	first := make(chan error, 1)
-	go func() { first <- commit(100) }()
+	go func() { first <- commit(1000) }()
 	select {
 	case <-held.prepared:
 	case <-time.After(5 * time.Second):
 		t.Fatal("first journal commit did not prepare the session")
 	}
 	second := make(chan error, 1)
-	go func() { second <- commit(101) }()
+	go func() { second <- commit(1001) }()
 	select {
 	case err := <-second:
 		close(held.release)
@@ -149,7 +149,7 @@ func assertJournalCommitWaiterCanCancel(t *testing.T, ctx context.Context, held 
 	t.Helper()
 	cancelCtx, cancel := context.WithCancel(ctx)
 	cancelled := make(chan error, 1)
-	go func() { cancelled <- commit(cancelCtx, 102) }()
+	go func() { cancelled <- commit(cancelCtx, 1002) }()
 	select {
 	case err := <-cancelled:
 		close(held.release)
@@ -226,4 +226,13 @@ func TestRetryJournalLockedKeepsUnknownOutcome(t *testing.T) {
 	})
 	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 	require.Equal(t, 1, tries)
+}
+
+func TestRepeatedAcknowledgementKeepsReservation(t *testing.T) {
+	session := operationSession{RejectBefore: 1, AckGaps: []uint64{3}, RetainedCount: 1, RetainedBytes: 100}
+	record := operationRecord{ID: OperationID{Sequence: 3}, Reservation: 10}
+	require.ErrorIs(t, reserveAckRetirement(&session, record), ErrOperationRetired)
+	require.Equal(t, []uint64{3}, session.AckGaps)
+	require.Equal(t, uint32(1), session.RetainedCount)
+	require.Equal(t, uint64(100), session.RetainedBytes)
 }

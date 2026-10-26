@@ -136,6 +136,16 @@ ratios are descriptive rather than a controlled regression threshold. The
 two-group result uses a different one-voter topology and cannot be compared
 directly to the three-voter single-group result. A two-group legacy job is
 being added to supply a same-topology baseline.
+The first paired two-group run
+[40332154333](https://github.com/bootjp/elastickv/actions/runs/40332154333)
+did not produce valid throughput results. The legacy hot-writer job reported
+a primary commit timestamp mismatch on an open-handle fence. The strict job
+reported operation-record errors during acknowledgement and subsequent writes
+in the hot-writer trial. A possible duplicate-retirement path was identified:
+the ACK path now checks the durable session retirement fence before consuming
+the record's retained-byte reservation again. Its effect on the mounted
+failure remains unverified. Both jobs must pass before the two-group
+comparison can be used for rollout.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
