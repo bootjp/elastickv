@@ -1,9 +1,11 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -22,6 +24,32 @@ type holdPreparedTxn struct {
 	prepared chan struct{}
 	release  chan struct{}
 	once     sync.Once
+}
+
+type synchronizeSessionReadsBackend struct {
+	operationJournalBackend
+	sessionKey []byte
+	reads      atomic.Int32
+	both       chan struct{}
+}
+
+func (b *synchronizeSessionReadsBackend) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	value, err := b.operationJournalBackend.GetAt(ctx, key, ts)
+	if !bytes.Equal(key, b.sessionKey) {
+		return value, err
+	}
+	count := b.reads.Add(1)
+	if count == 2 {
+		close(b.both)
+	}
+	if count <= 2 {
+		select {
+		case <-b.both:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	return value, err
 }
 
 func (h *holdPreparedTxn) Commit(ctx context.Context, reqs []*pb.Request) (*kv.TransactionResponse, error) {
@@ -90,9 +118,49 @@ func TestOperationJournalTwoGroupCreateOpenWrite(t *testing.T) {
 	groups[1].Txn = held
 	id.Sequence++
 	assertWriteAfterConcurrentAcknowledgement(t, ctx, journal, svc, createID, id, file.Inode, held)
+	assertConcurrentJournalAdmissions(t, ctx, journal, session)
 	id.Sequence++
 	require.NoError(t, svc.ReleaseWithOperation(ctx, id, file.Inode, fh, []byte("benchmark-mount")))
 	assertJournalCommitsDoNotCollideOnPreparedSession(t, ctx, svc, groups[1], session)
+}
+
+func assertConcurrentJournalAdmissions(t *testing.T, ctx context.Context, journal *OperationJournal, session OperationSessionID) {
+	t.Helper()
+	backend := &synchronizeSessionReadsBackend{
+		operationJournalBackend: journal.backend,
+		sessionKey:              session.key(),
+		both:                    make(chan struct{}),
+	}
+	journal = newOperationJournalWithBackend(backend)
+	var sequence atomic.Uint64
+	sequence.Store(4)
+	var workers sync.WaitGroup
+	errorsCh := make(chan error, 2)
+	for worker := range 2 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for index := range 4 {
+				id := OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: sequence.Add(1)}
+				_, err := journal.Admit(ctx, id, []byte{byte(worker), byte(index)}, 16, 1024)
+				if err != nil {
+					errorsCh <- fmt.Errorf("admit operation %d: %w", id.Sequence, err)
+					return
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		require.NoError(t, err)
+	}
+	ts, err := journal.backend.Snapshot(ctx)
+	require.NoError(t, err)
+	actual, exists, err := journal.loadSessionAt(ctx, session, ts)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Equal(t, uint32(8), actual.Pending)
 }
 
 func assertJournalCommitsDoNotCollideOnPreparedSession(t *testing.T, ctx context.Context, svc *Service, group *kv.ShardGroup, session OperationSessionID) {
