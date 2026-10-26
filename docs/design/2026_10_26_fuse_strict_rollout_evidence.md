@@ -106,8 +106,7 @@ failed with a `txn locked` FUSE error. A subsequent run
 returned EIO while the mount was up but the catalog watcher still reported a
 connection refusal on the local Raft listener. The benchmark setup now waits
 for both listeners and a successful mounted `stat`. Neither failed run yields
-a valid two-group performance measurement; the revised setup still needs a
-passing run.
+a valid two-group performance measurement.
 Run [40328639750](https://github.com/bootjp/elastickv/actions/runs/40328639750)
 reached both listeners and still failed with a typed `txn locked` error during
 the first write. A deterministic two-group Raft test reproduced a second local
@@ -119,8 +118,24 @@ Run [40330054840](https://github.com/bootjp/elastickv/actions/runs/40330054840)
 then failed while reading a session row locked by an in-flight journal
 transaction. Journal reads and definitive prewrite lock rejections now retry
 the same timestamp and attempt with a bounded backoff; a typed unknown
-transaction outcome is never retried. The amended candidate still needs a
-passing mounted two-group run.
+transaction outcome is never retried. The amended two-group benchmark passed
+in [run 40331001888](https://github.com/bootjp/elastickv/actions/runs/40331001888)
+at `fd9a2294`. Across three trials, median serial throughput was 67.1
+write/fsync operations per second with a 28.7 ms median of trial p99 values.
+Four writers on one inode achieved 59.0 operations per second, 126.5 ms p99,
+and a 0.954 median minimum-to-maximum worker throughput ratio. This was one
+process with two single-voter Raft groups and one FUSE mount; it is not a
+multi-mount or three-voter performance result. The expanded acknowledged
+mutation node-crash job also passed at this SHA.
+The same run's separate single-group runners measured median legacy serial
+throughput of 113.0 operations per second (p50/p95/p99 8.2/12.0/14.3 ms)
+and strict serial throughput of 28.3 (34.1/42.1/45.8 ms). For the hot inode,
+legacy reached 79.0 operations per second (43.4/83.4/98.4 ms) and strict
+reached 25.6 (136.5/242.5/309.4 ms). These are separate runners, so the
+ratios are descriptive rather than a controlled regression threshold. The
+two-group result uses a different one-voter topology and cannot be compared
+directly to the three-voter single-group result. A two-group legacy job is
+being added to supply a same-topology baseline.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
