@@ -12,12 +12,15 @@ import (
 )
 
 const (
-	operationRecordVersion       = 2
+	operationRecordVersion       = 3
+	operationRecordLegacyVersion = 2
 	operationHeaderBytes         = 16
 	operationCommitTSOffset      = 8
 	maxOperationRecordBytes      = 8 << 20
 	operationReservationOverhead = 4096
 	maxOperationProofGroups      = 16
+	maxOperationFencedAttempts   = 256
+	operationFenceReservation    = 128
 )
 
 var (
@@ -54,25 +57,31 @@ type operationRecord struct {
 	Intent      []byte         `json:"intent"`
 	Generation  uint64         `json:"generation"`
 	AttemptID   [16]byte       `json:"attempt_id"`
-	Result      []byte         `json:"result,omitempty"`
-	EffectKeys  [][]byte       `json:"effect_keys,omitempty"`
-	ProofGroups []uint64       `json:"proof_groups,omitempty"`
-	Reservation uint64         `json:"reservation"`
-	ResultLimit uint32         `json:"result_limit"`
-	EffectLimit uint32         `json:"effect_limit"`
-	CommitTS    uint64         `json:"-"`
+	// RecordIsPrimary certifies that each publication of this operation
+	// selects this row as its transaction primary. Legacy rows omit it and
+	// cannot use generation fencing.
+	RecordIsPrimary bool       `json:"record_is_primary,omitempty"`
+	FencedAttempts  [][16]byte `json:"fenced_attempts,omitempty"`
+	Result          []byte     `json:"result,omitempty"`
+	EffectKeys      [][]byte   `json:"effect_keys,omitempty"`
+	ProofGroups     []uint64   `json:"proof_groups,omitempty"`
+	Reservation     uint64     `json:"reservation"`
+	ResultLimit     uint32     `json:"result_limit"`
+	EffectLimit     uint32     `json:"effect_limit"`
+	CommitTS        uint64     `json:"-"`
 }
 
 func newOperationRecord(id OperationID, intent []byte, resultLimit, effectLimit uint32) operationRecord {
 	owned := append([]byte(nil), intent...)
 	return operationRecord{
-		ID:          id,
-		State:       OperationPending,
-		Fingerprint: sha256.Sum256(owned),
-		Intent:      owned,
-		Reservation: 2*(uint64(len(owned))+uint64(resultLimit)+uint64(effectLimit)) + operationHeaderBytes + operationReservationOverhead,
-		ResultLimit: resultLimit,
-		EffectLimit: effectLimit,
+		ID:              id,
+		State:           OperationPending,
+		Fingerprint:     sha256.Sum256(owned),
+		RecordIsPrimary: true,
+		Intent:          owned,
+		Reservation:     2*(uint64(len(owned))+uint64(resultLimit)+uint64(effectLimit)) + operationHeaderBytes + operationReservationOverhead,
+		ResultLimit:     resultLimit,
+		EffectLimit:     effectLimit,
 	}
 }
 
@@ -110,26 +119,47 @@ func decodeOperationRecord(raw []byte) (operationRecord, error) {
 		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
 	}
 	record.CommitTS = binary.BigEndian.Uint64(raw[operationCommitTSOffset:])
-	if record.State != OperationPending && record.CommitTS == 0 {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
-	}
-	if record.State != OperationState(raw[5]) || validateOperationRecord(record) != nil {
+	if !validDecodedOperationRecord(raw, record) {
 		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
 	}
 	return record, nil
 }
 
+func validDecodedOperationRecord(raw []byte, record operationRecord) bool {
+	return (raw[4] != operationRecordLegacyVersion || (!record.RecordIsPrimary && len(record.FencedAttempts) == 0)) &&
+		(record.State == OperationPending || record.CommitTS != 0) &&
+		record.State == OperationState(raw[5]) && validateOperationRecord(record) == nil
+}
+
 func validOperationHeader(raw []byte) bool {
 	return len(raw) >= operationHeaderBytes && len(raw) <= maxOperationRecordBytes &&
-		bytes.Equal(raw[:4], []byte("FSOP")) && raw[4] == operationRecordVersion &&
+		bytes.Equal(raw[:4], []byte("FSOP")) &&
+		(raw[4] == operationRecordVersion || raw[4] == operationRecordLegacyVersion) &&
 		raw[6] == 0 && raw[7] == 0
 }
 
 func validateOperationRecord(record operationRecord) error {
-	if !validOperationCore(record) || !validOperationEffects(record) || !validOperationState(record) {
+	if !validOperationCore(record) || !validOperationEffects(record) || !validOperationState(record) || !validFencedAttempts(record) {
 		return errors.WithStack(ErrOperationRecordCorrupt)
 	}
 	return nil
+}
+
+func validFencedAttempts(record operationRecord) bool {
+	if len(record.FencedAttempts) > maxOperationFencedAttempts || (len(record.FencedAttempts) != 0 && !record.RecordIsPrimary) {
+		return false
+	}
+	seen := make(map[[16]byte]struct{}, len(record.FencedAttempts))
+	for _, attempt := range record.FencedAttempts {
+		if attempt == [16]byte{} || attempt == record.AttemptID {
+			return false
+		}
+		if _, duplicate := seen[attempt]; duplicate {
+			return false
+		}
+		seen[attempt] = struct{}{}
+	}
+	return true
 }
 
 func validOperationCore(record operationRecord) bool {
@@ -137,7 +167,8 @@ func validOperationCore(record operationRecord) bool {
 		record.Fingerprint == sha256.Sum256(record.Intent) && record.Reservation != 0 &&
 		record.ResultLimit != 0 && uint64(record.ResultLimit) <= maxOperationRecordBytes &&
 		uint64(len(record.Result)) <= uint64(record.ResultLimit) &&
-		record.Reservation == 2*(uint64(len(record.Intent))+uint64(record.ResultLimit)+uint64(record.EffectLimit))+operationHeaderBytes+operationReservationOverhead
+		record.Reservation == 2*(uint64(len(record.Intent))+uint64(record.ResultLimit)+uint64(record.EffectLimit))+
+			operationHeaderBytes+operationReservationOverhead+uint64(len(record.FencedAttempts))*operationFenceReservation
 }
 
 func validOperationEffects(record operationRecord) bool {

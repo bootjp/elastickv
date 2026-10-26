@@ -30,7 +30,7 @@ jobs:
       - name: Reject production imports of test support
         run: bash scripts/check-production-imports.sh
       - name: Run race tests outside full-length gRPC sequences
-        run: go test -race ./... -skip "$GRPC_SEQUENCE_TESTS"
+        run: go test -race -timeout=30m ./... -skip "$GRPC_SEQUENCE_TESTS"
         env:
           # Fail, rather than skip, the kernel-mount tests when FUSE is unusable.
           ELASTICKV_REQUIRE_FUSE: "1"
@@ -38,4 +38,4 @@ jobs:
       # These unchanged 10,000-iteration tests need a fresh package budget
       # after the serial migration/snapshot acceptance tests have finished.
       - name: Run full-length gRPC consistency sequences
-        run: go test -race ./adapter -run "$GRPC_SEQUENCE_TESTS"
+        run: go test -race -timeout=30m ./adapter -run "$GRPC_SEQUENCE_TESTS"

@@ -89,6 +89,17 @@ func (r *RawFileSystem) String() string {
 
 }
 
+// OnReplyAttempt is invoked by the local go-fuse bridge after its device write.
+func (r *RawFileSystem) OnReplyAttempt(unique uint64, _ uint32, _ fuse.Status, _ fuse.Status) {
+	r.adapter.replyAttempted(unique)
+}
+
+// OnReplySuppressed retires a request after go-fuse has decided that no FUSE
+// reply can be sent, including an interrupted request on a dead connection.
+func (r *RawFileSystem) OnReplySuppressed(unique uint64, _ uint32, _ fuse.Status) {
+	r.adapter.replySuppressed(unique)
+}
+
 // toStatus converts an adapter errno into a FUSE status. Errno values
 // outside the int32 range of fuse.Status cannot be a real errno, so they
 // map to EIO instead of being truncated.
@@ -123,7 +134,7 @@ func (r *RawFileSystem) GetAttr(cancel <-chan struct{}, input *fuse.GetAttrIn, o
 }
 
 func (r *RawFileSystem) SetAttr(cancel <-chan struct{}, input *fuse.SetAttrIn, out *fuse.AttrOut) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	mask, attrs := fuseSetAttr(input)
 	stat, errno := r.adapter.SetAttr(ctx, input.NodeId, mask, attrs)
@@ -139,7 +150,7 @@ func (r *RawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name 
 	if input.Mode&syscall.S_IFMT != syscall.S_IFREG {
 		return fuse.Status(syscall.EOPNOTSUPP)
 	}
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	result, errno := r.adapter.Mknod(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
@@ -154,7 +165,7 @@ func (r *RawFileSystem) Mknod(cancel <-chan struct{}, input *fuse.MknodIn, name 
 }
 
 func (r *RawFileSystem) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name string, out *fuse.EntryOut) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	result, errno := r.adapter.Mkdir(ctx, input.NodeId, []byte(name), filesystem.CreateOptions{
 		Mode: input.Mode & permissionModeMask,
@@ -169,13 +180,13 @@ func (r *RawFileSystem) Mkdir(cancel <-chan struct{}, input *fuse.MkdirIn, name 
 }
 
 func (r *RawFileSystem) Unlink(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, header.Unique)
 	defer done()
 	return toStatus(r.adapter.Unlink(ctx, header.NodeId, []byte(name)))
 }
 
 func (r *RawFileSystem) Rmdir(cancel <-chan struct{}, header *fuse.InHeader, name string) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, header.Unique)
 	defer done()
 	return toStatus(r.adapter.Rmdir(ctx, header.NodeId, []byte(name)))
 }
@@ -184,7 +195,7 @@ func (r *RawFileSystem) Rename(cancel <-chan struct{}, input *fuse.RenameIn, old
 	if input.Flags != 0 {
 		return toStatus(syscall.EOPNOTSUPP)
 	}
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	return toStatus(r.adapter.Rename(ctx, input.NodeId, []byte(oldName), input.Newdir, []byte(newName)))
 }
@@ -209,7 +220,7 @@ func (r *RawFileSystem) Access(cancel <-chan struct{}, input *fuse.AccessIn) fus
 }
 
 func (r *RawFileSystem) Create(cancel <-chan struct{}, input *fuse.CreateIn, name string, out *fuse.CreateOut) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	// EAGAIN can hide an already-applied create whose reply was lost. Do not
 	// replay it and turn its original outcome into a collision/open result.
@@ -238,7 +249,7 @@ func (r *RawFileSystem) createOrOpen(ctx context.Context, input *fuse.CreateIn, 
 }
 
 func (r *RawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fuse.OpenOut) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	fh, errno := r.adapter.Open(ctx, input.NodeId)
 	if errno == 0 {
@@ -248,7 +259,7 @@ func (r *RawFileSystem) Open(cancel <-chan struct{}, input *fuse.OpenIn, out *fu
 }
 
 func (r *RawFileSystem) Read(cancel <-chan struct{}, input *fuse.ReadIn, _ []byte) (fuse.ReadResult, fuse.Status) {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	data, errno := r.adapter.Read(ctx, input.NodeId, input.Fh, input.Offset, uint64(input.Size))
 	if errno != 0 {
@@ -258,7 +269,7 @@ func (r *RawFileSystem) Read(cancel <-chan struct{}, input *fuse.ReadIn, _ []byt
 }
 
 func (r *RawFileSystem) Write(cancel <-chan struct{}, input *fuse.WriteIn, data []byte) (uint32, fuse.Status) {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	n, errno := r.adapter.Write(ctx, input.NodeId, input.Fh, input.Offset, data)
 	if errno != 0 {
@@ -271,7 +282,7 @@ func (r *RawFileSystem) Write(cancel <-chan struct{}, input *fuse.WriteIn, data 
 }
 
 func (r *RawFileSystem) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	if errno := r.adapter.Release(ctx, input.NodeId, input.Fh); errno != 0 {
 		slog.WarnContext(ctx, "filesystem FUSE release failed", "inode", input.NodeId, "fh", input.Fh, "errno", errno)
@@ -279,13 +290,13 @@ func (r *RawFileSystem) Release(cancel <-chan struct{}, input *fuse.ReleaseIn) {
 }
 
 func (r *RawFileSystem) Flush(cancel <-chan struct{}, input *fuse.FlushIn) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	return toStatus(r.adapter.Flush(ctx, input.NodeId, input.Fh))
 }
 
 func (r *RawFileSystem) Fsync(cancel <-chan struct{}, input *fuse.FsyncIn) fuse.Status {
-	ctx, done := r.requestContext(cancel)
+	ctx, done := r.requestContextWithReply(cancel, input.Unique)
 	defer done()
 	datasync := input.FsyncFlags&1 != 0
 	return toStatus(r.adapter.Fsync(ctx, input.NodeId, input.Fh, datasync))
@@ -436,6 +447,11 @@ func (r *RawFileSystem) requestContext(cancel <-chan struct{}) (context.Context,
 		parent = r.requests
 	}
 	return requestContextWithin(parent, cancel)
+}
+
+func (r *RawFileSystem) requestContextWithReply(cancel <-chan struct{}, unique uint64) (context.Context, context.CancelFunc) {
+	ctx, done := r.requestContext(cancel)
+	return withReplyIdentity(ctx, unique), done
 }
 
 // cancelInFlight ends the context of every request in flight and of any
@@ -897,13 +913,19 @@ func (s *Server) Unmount() error {
 	if s == nil {
 		return nil
 	}
+	if s.inner == nil || s.isReleased() {
+		if s.adapter != nil {
+			s.adapter.Close()
+		}
+		return nil
+	}
+	if err := s.inner.Unmount(); err != nil {
+		return errors.WithStack(err)
+	}
 	if s.adapter != nil {
 		s.adapter.Close()
 	}
-	if s.inner == nil || s.isReleased() {
-		return nil
-	}
-	return errors.WithStack(s.inner.Unmount())
+	return nil
 }
 
 // UnmountLazy detaches the mount from the namespace even while clients still
@@ -927,12 +949,18 @@ func (s *Server) UnmountLazy(ctx context.Context) error {
 	}
 	s.fs.cancelInFlight()
 	if s.inner == nil || s.mountPoint == "" {
+		if s.adapter != nil {
+			s.adapter.Close()
+		}
 		return nil
 	}
 	_, err := detachFUSEMount(ctx, s.mountPoint, s.fsType)
 	if errors.Is(err, errNoFUSEMount) {
 		slog.InfoContext(ctx, "filesystem FUSE mount is already gone, nothing to detach", "mount_point", s.mountPoint)
-		return nil
+		err = nil
+	}
+	if err == nil && s.adapter != nil {
+		s.adapter.Close()
 	}
 	return err
 }

@@ -16,7 +16,7 @@ import (
 // BeginAttempt records a fresh transaction generation before any effect is
 // dispatched. A duplicate caller receives the same active attempt identity.
 func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (operationRecord, error) {
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		ts, record, session, err := j.pendingSnapshot(ctx, id)
 		if err != nil {
 			return operationRecord{}, err
@@ -34,29 +34,109 @@ func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (op
 		record.Generation++
 		if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
 			if IsWriteConflict(err) {
+				if err = waitOperationCASRetry(ctx, retry); err != nil {
+					return operationRecord{}, err
+				}
 				continue
 			}
 			return operationRecord{}, err
 		}
 		return record, nil
 	}
-	return operationRecord{}, errors.WithStack(ErrOperationGeneration)
+	return operationRecord{}, errors.WithStack(ErrContentionLimit)
 }
 
-// AdvanceGeneration cannot proceed until an authoritative transaction-decision
-// resolver proves the previous attempt aborted. The journal does not yet
-// persist the underlying transaction identity, so it must fail closed rather
-// than infer abort from an absent result row or an OCC conflict.
-func (j *OperationJournal) AdvanceGeneration(_ context.Context, _ OperationID, _ [16]byte) (operationRecord, error) {
+// AdvanceGeneration fences an old attempt by committing a new version of its
+// transaction primary. A delayed old publication either committed that primary
+// first (making this CAS fail) or must fail its read-set validation against the
+// new version. Legacy rows without the primary guarantee remain unresolved.
+func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID, old [16]byte) (operationRecord, error) {
+	if old == [16]byte{} {
+		return operationRecord{}, errors.WithStack(ErrInvalid)
+	}
+	for retry := range operationCASRetries {
+		observed, ready := j.backend.JournalRouteVersion()
+		if !ready {
+			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+		}
+		record, err := j.advanceGenerationOnce(ctx, id, old, observed)
+		if !IsWriteConflict(err) {
+			return record, err
+		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return operationRecord{}, err
+		}
+	}
 	return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 }
 
+func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id OperationID, old [16]byte, observed uint64) (operationRecord, error) {
+	ts, record, session, err := j.pendingSnapshot(ctx, id)
+	if err != nil {
+		return operationRecord{}, err
+	}
+	if slices.Contains(record.FencedAttempts, old) {
+		return record, nil
+	}
+	record, session, err = prepareGenerationFence(record, session, old)
+	if err != nil {
+		return operationRecord{}, err
+	}
+	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, observed); err != nil {
+		return operationRecord{}, err
+	}
+	return record, nil
+}
+
+func prepareGenerationFence(record operationRecord, session operationSession, old [16]byte) (operationRecord, operationSession, error) {
+	if !record.RecordIsPrimary || record.AttemptID != old {
+		return operationRecord{}, operationSession{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
+	if record.Generation == ^uint64(0) || len(record.FencedAttempts) >= maxOperationFencedAttempts {
+		return operationRecord{}, operationSession{}, errors.WithStack(ErrOperationGeneration)
+	}
+	if operationFenceReservation > session.MaxBytes-session.RetainedBytes {
+		return operationRecord{}, operationSession{}, errors.WithStack(ErrOperationQuota)
+	}
+	next, err := randomOperationToken()
+	if err != nil {
+		return operationRecord{}, operationSession{}, err
+	}
+	record.FencedAttempts = append(record.FencedAttempts, old)
+	record.AttemptID = next
+	record.Generation++
+	record.Reservation += operationFenceReservation
+	session.RetainedBytes += operationFenceReservation
+	return record, session, nil
+}
+
 type operationAttemptPlan struct {
-	Intent   []byte
-	Effects  []*kv.Elem[kv.OP]
-	ReadTS   uint64
-	ReadKeys [][]byte
-	Result   []byte
+	Intent  []byte
+	Effects []*kv.Elem[kv.OP]
+	ReadTS  uint64
+	// RouteVersion is captured before the planner reads any routed key.
+	RouteVersion uint64
+	ReadKeys     [][]byte
+	Result       []byte
+}
+
+type operationPlanningSnapshot struct {
+	ReadTS       uint64
+	RouteVersion uint64
+}
+
+// PlanSnapshotAtRoute pins the placement used by the planner. A sharded
+// planner must carry RouteVersion into publication or semantic rejection.
+func (j *OperationJournal) PlanSnapshotAtRoute(ctx context.Context, id OperationID, attempt [16]byte) (operationPlanningSnapshot, error) {
+	version, ready := j.backend.JournalRouteVersion()
+	if !ready {
+		return operationPlanningSnapshot{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
+	ts, err := j.PlanSnapshot(ctx, id, attempt)
+	if err != nil {
+		return operationPlanningSnapshot{}, err
+	}
+	return operationPlanningSnapshot{ReadTS: ts, RouteVersion: version}, nil
 }
 
 // PlanSnapshot establishes the OCC timestamp before a planner reads data.
@@ -95,10 +175,10 @@ func classifyAttemptOutcome(id OperationID, attempt [16]byte, record operationRe
 		return AttemptUnknown, record, err
 	}
 	if record.ID != id {
-		return AttemptUnknown, record, err
+		return AttemptUnknown, record, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 	}
 	if record.AttemptID != attempt {
-		return AttemptAborted, record, nil
+		return classifyPriorAttempt(attempt, record)
 	}
 	if record.State == OperationCommitted && err == nil {
 		return AttemptCommitted, record, nil
@@ -109,12 +189,27 @@ func classifyAttemptOutcome(id OperationID, attempt [16]byte, record operationRe
 	return AttemptUnknown, record, err
 }
 
+func classifyPriorAttempt(attempt [16]byte, record operationRecord) (AttemptOutcome, operationRecord, error) {
+	if record.RecordIsPrimary && slices.Contains(record.FencedAttempts, attempt) {
+		return AttemptAborted, record, nil
+	}
+	// A different attempt ID without a durable primary fence is not an abort
+	// certificate for an older transaction.
+	return AttemptUnknown, record, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+}
+
 // Publish commits the result record and every effect under the recorded
 // generation. The session key is also a mutation, so closing the session and
 // an in-flight attempt cannot both succeed on the same snapshot.
 func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt [16]byte, plan operationAttemptPlan) (operationRecord, error) {
 	if len(plan.ReadKeys) != 0 && plan.ReadTS == 0 {
 		return operationRecord{}, errors.WithStack(ErrInvalid)
+	}
+	if err := j.requirePlanningRoute(plan.RouteVersion); err != nil {
+		if duplicate, resolveErr := j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, ErrOperationGeneration); resolveErr == nil {
+			return duplicate, nil
+		}
+		return operationRecord{}, err
 	}
 	ts, record, session, err := j.publicationSnapshot(ctx, id, plan.ReadTS)
 	if err != nil {
@@ -137,10 +232,20 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	record.ProofGroups = groups
 	session.Pending--
 	effects := slices.Concat(routedEffects, proofs)
-	if err = j.storeRecordAndSession(ctx, ts, record, session, effects, plan.ReadKeys); err != nil {
+	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, effects, plan.ReadKeys, plan.RouteVersion); err != nil {
 		return j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, err)
 	}
 	return j.Resolve(ctx, id)
+}
+
+func (j *OperationJournal) requirePlanningRoute(observed uint64) error {
+	current, ready := j.backend.JournalRouteVersion()
+	// A changed catalog invalidates the planner's reads even if the commit
+	// coordinator could still find a route for every write key.
+	if !ready || (current != 0 && current != observed) {
+		return errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
+	return nil
 }
 
 func (j *OperationJournal) publicationSnapshot(ctx context.Context, id OperationID, readTS uint64) (uint64, operationRecord, operationSession, error) {
@@ -221,29 +326,46 @@ func validateOperationPlan(record operationRecord, session operationSession, pla
 // validated its predicates on the same snapshot. OCC conflicts remain pending
 // attempts and must not be stored as semantic rejection.
 func (j *OperationJournal) Reject(ctx context.Context, id OperationID, attempt [16]byte, readTS uint64, intent []byte, result []byte, readKeys [][]byte) (operationRecord, error) {
+	return j.RejectAtRoute(ctx, id, attempt, readTS, 0, intent, result, readKeys)
+}
+
+func (j *OperationJournal) RejectAtRoute(ctx context.Context, id OperationID, attempt [16]byte, readTS, routeVersion uint64, intent []byte, result []byte, readKeys [][]byte) (operationRecord, error) {
 	if readTS == 0 {
 		return operationRecord{}, errors.WithStack(ErrInvalid)
+	}
+	if err := j.requirePlanningRoute(routeVersion); err != nil {
+		if duplicate, resolveErr := j.resolveDuplicateRejection(ctx, id, attempt, intent, ErrOperationGeneration); resolveErr == nil {
+			return duplicate, nil
+		}
+		return operationRecord{}, err
 	}
 	ts, record, session, err := j.publicationSnapshot(ctx, id, readTS)
 	if err != nil {
 		return j.resolveDuplicateRejection(ctx, id, attempt, intent, err)
 	}
-	if attempt == [16]byte{} || record.AttemptID != attempt {
-		return operationRecord{}, errors.WithStack(ErrOperationGeneration)
-	}
-	if record.Fingerprint != sha256.Sum256(intent) || !bytes.Equal(record.Intent, intent) {
-		return operationRecord{}, errors.WithStack(ErrOperationIDReused)
-	}
-	if uint64(len(result)) > uint64(record.ResultLimit) {
-		return operationRecord{}, errors.WithStack(ErrOperationQuota)
+	if err := validateOperationRejection(record, attempt, intent, result); err != nil {
+		return operationRecord{}, err
 	}
 	record.State = OperationRejected
 	record.Result = append([]byte(nil), result...)
 	session.Pending--
-	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, readKeys); err != nil {
+	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, readKeys, routeVersion); err != nil {
 		return j.resolveDuplicateRejection(ctx, id, attempt, intent, err)
 	}
 	return j.Resolve(ctx, id)
+}
+
+func validateOperationRejection(record operationRecord, attempt [16]byte, intent, result []byte) error {
+	if attempt == [16]byte{} || record.AttemptID != attempt {
+		return errors.WithStack(ErrOperationGeneration)
+	}
+	if record.Fingerprint != sha256.Sum256(intent) || !bytes.Equal(record.Intent, intent) {
+		return errors.WithStack(ErrOperationIDReused)
+	}
+	if uint64(len(result)) > uint64(record.ResultLimit) {
+		return errors.WithStack(ErrOperationQuota)
+	}
+	return nil
 }
 
 func (j *OperationJournal) resolveDuplicateRejection(ctx context.Context, id OperationID, attempt [16]byte, intent []byte, originalErr error) (operationRecord, error) {
@@ -260,11 +382,25 @@ func (j *OperationJournal) resolveDuplicateRejection(ctx context.Context, id Ope
 // Cancel must win an OCC transaction against any active publication. A lost
 // cancellation response remains unknown until Resolve observes a terminal row.
 func (j *OperationJournal) Cancel(ctx context.Context, id OperationID) (operationRecord, error) {
+	return j.cancelWithResult(ctx, id, nil)
+}
+
+// CancelWithResult retains a typed failure when planning ended before any
+// publication was dispatched. The result is immutable once cancellation wins.
+func (j *OperationJournal) CancelWithResult(ctx context.Context, id OperationID, result []byte) (operationRecord, error) {
+	return j.cancelWithResult(ctx, id, result)
+}
+
+func (j *OperationJournal) cancelWithResult(ctx context.Context, id OperationID, result []byte) (operationRecord, error) {
 	ts, record, session, err := j.pendingSnapshotAllowClosed(ctx, id, true)
 	if err != nil {
 		return j.resolveWinningCancellation(ctx, id, err)
 	}
+	if uint64(len(result)) > uint64(record.ResultLimit) {
+		return operationRecord{}, errors.WithStack(ErrOperationQuota)
+	}
 	record.State = OperationCancelled
+	record.Result = append([]byte(nil), result...)
 	session.Pending--
 	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
 		return operationRecord{}, err
@@ -422,7 +558,7 @@ func (j *OperationJournal) Acknowledge(ctx context.Context, id OperationID) erro
 		}
 		return err
 	}
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		err := j.acknowledgeOnce(ctx, id)
 		if errors.Is(err, ErrOperationRetired) {
 			return nil
@@ -433,8 +569,65 @@ func (j *OperationJournal) Acknowledge(ctx context.Context, id OperationID) erro
 		if !IsWriteConflict(err) {
 			return errors.Wrap(err, "acknowledge operation")
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
 	}
-	return errors.WithStack(ErrOperationQuota)
+	return errors.WithStack(ErrContentionLimit)
+}
+
+// RetireUnadmitted fences an identity whose reply was attempted before an
+// operation record was admitted. The session and record read set makes this
+// race atomically with admission: an in-flight admission either wins and must
+// be resolved normally, or observes the retired identity and cannot publish.
+func (j *OperationJournal) RetireUnadmitted(ctx context.Context, id OperationID) error {
+	for retry := range operationCASRetries {
+		err := j.retireUnadmittedOnce(ctx, id)
+		if err == nil {
+			return nil
+		}
+		if !IsWriteConflict(err) {
+			return errors.Wrap(err, "retire unadmitted operation")
+		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
+	}
+	return errors.WithStack(ErrContentionLimit)
+}
+
+func (j *OperationJournal) retireUnadmittedOnce(ctx context.Context, id OperationID) error {
+	ts, err := j.backend.Snapshot(ctx)
+	if err != nil {
+		return errors.Wrap(err, "fence unadmitted operation retirement")
+	}
+	session, exists, err := j.loadSessionAt(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}, ts)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.WithStack(ErrOperationSessionNotFound)
+	}
+	if session.retired(id.Sequence) {
+		return nil
+	}
+	_, found, err := j.loadRecordAt(ctx, id, ts)
+	if err != nil {
+		return err
+	}
+	if found {
+		return errors.WithStack(ErrOperationGeneration)
+	}
+	if err := advanceAckWatermark(&session, id.Sequence); err != nil {
+		return err
+	}
+	raw, err := encodeOperationSession(session)
+	if err != nil {
+		return err
+	}
+	_, err = j.backend.Commit(ctx, ts, []*kv.Elem[kv.OP]{{Op: kv.Put, Key: session.ID.key(), Value: raw}},
+		[][]byte{id.key(), session.ID.key()})
+	return errors.Wrap(err, "commit unadmitted operation retirement")
 }
 
 func (j *OperationJournal) acknowledgeOnce(ctx context.Context, id OperationID) error {
@@ -507,8 +700,34 @@ func (j *OperationJournal) FenceSession(ctx context.Context, id OperationSession
 	return j.setSessionClosed(ctx, id, true)
 }
 
+// RecoverOwnerSession fences a previous mount incarnation and resolves its
+// pending attempts before the owner registers a replacement session.
+func (j *OperationJournal) RecoverOwnerSession(ctx context.Context, filesystemID [16]byte, owner string) error {
+	if filesystemID == [16]byte{} || owner == "" {
+		return errors.WithStack(ErrInvalid)
+	}
+	ts, err := j.backend.Snapshot(ctx)
+	if err != nil {
+		return errors.Wrap(err, "snapshot previous operation owner")
+	}
+	previous, exists, err := j.loadOwnerAt(ctx, fskeys.OperationOwnerKey(filesystemID, []byte(owner)), ts)
+	if err != nil || !exists {
+		return err
+	}
+	id := OperationSessionID{Filesystem: filesystemID, Session: previous}
+	if err := j.FenceSession(ctx, id); err != nil {
+		return err
+	}
+	for {
+		resolved, err := j.RecoverClosedSession(ctx, id, defaultIntentRecoveryLimit)
+		if err != nil || resolved == 0 {
+			return err
+		}
+	}
+}
+
 func (j *OperationJournal) setSessionClosed(ctx context.Context, id OperationSessionID, allowPending bool) error {
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		err := j.closeSessionOnce(ctx, id, allowPending)
 		if err == nil {
 			return nil
@@ -516,8 +735,11 @@ func (j *OperationJournal) setSessionClosed(ctx context.Context, id OperationSes
 		if !IsWriteConflict(err) {
 			return errors.Wrap(err, "close operation session")
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
 	}
-	return errors.WithStack(ErrOperationQuota)
+	return errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) closeSessionOnce(ctx context.Context, id OperationSessionID, allowPending bool) error {

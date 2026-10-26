@@ -97,6 +97,34 @@ func TestCoordinateDispatchTxn_UsesOnePhaseRequest(t *testing.T) {
 	require.Greater(t, meta.CommitTS, startTS)
 }
 
+func TestCoordinateDispatchTxn_UsesSelectedPrimary(t *testing.T) {
+	t.Parallel()
+	tx := &stubTransactional{}
+	c := &Coordinate{transactionManager: tx, clock: NewHLC()}
+	_, err := c.dispatchTxn(context.Background(), []*Elem[OP]{
+		{Op: Put, Key: []byte("a")},
+		{Op: Put, Key: []byte("z")},
+	}, nil, 10, 0, 0, 0, keyviz.LabelLegacy, []byte("z"))
+	require.NoError(t, err)
+	meta, err := DecodeTxnMeta(tx.reqs[0][0].Mutations[0].Value)
+	require.NoError(t, err)
+	require.Equal(t, []byte("z"), meta.PrimaryKey)
+}
+
+func TestCoordinateForwardTxnPreservesSelectedPrimary(t *testing.T) {
+	t.Parallel()
+	c := &Coordinate{}
+	requests, err := c.buildRedirectRequests(&OperationGroup[OP]{
+		IsTxn: true, StartTS: 10, PrimaryKey: []byte("z"),
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("a")}, {Op: Put, Key: []byte("z")}},
+	})
+	require.NoError(t, err)
+	require.Len(t, requests, 1)
+	meta, err := DecodeTxnMeta(requests[0].Mutations[0].Value)
+	require.NoError(t, err)
+	require.Equal(t, []byte("z"), meta.PrimaryKey)
+}
+
 func TestCoordinateDispatchTxn_UsesProvidedCommitTS(t *testing.T) {
 	t.Parallel()
 

@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	operationCASRetries    = 8
+	operationCASRetries    = 64
 	maxOperationEffectKeys = 65535
 	operationJournalRows   = 2
 )
@@ -23,6 +23,8 @@ type operationJournalBackend interface {
 	GetAt(context.Context, []byte, uint64) ([]byte, error)
 	ScanAt(context.Context, []byte, []byte, int, uint64) ([]*store.KVPair, error)
 	Commit(context.Context, uint64, []*kv.Elem[kv.OP], [][]byte) (*kv.CoordinateResponse, error)
+	JournalRouteVersion() (uint64, bool)
+	CommitAtRouteVersion(context.Context, uint64, []*kv.Elem[kv.OP], [][]byte, uint64) (*kv.CoordinateResponse, error)
 	CommittedVersionAt(context.Context, []byte, uint64) (bool, error)
 	CommittedVersionAtGroup(context.Context, []byte, uint64, uint64) (bool, error)
 	GroupIDForKey([]byte) (uint64, error)
@@ -45,7 +47,43 @@ func (b serviceOperationBackend) ScanAt(ctx context.Context, start, end []byte, 
 }
 
 func (b serviceOperationBackend) Commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte) (*kv.CoordinateResponse, error) {
-	return b.service.dispatchTxnWithPolicy(ctx, ts, elems, readKeys, true)
+	return b.commit(ctx, ts, elems, readKeys, 0)
+}
+
+func (b serviceOperationBackend) JournalRouteVersion() (uint64, bool) {
+	if source, ok := b.service.dispatch.(interface{ JournalRouteVersion() (uint64, bool) }); ok {
+		version, ready := source.JournalRouteVersion()
+		if ready {
+			return version, true
+		}
+		if _, sharded := b.service.store.(*kv.ShardStore); sharded {
+			return 0, false
+		}
+		return 0, true
+	}
+	_, sharded := b.service.store.(*kv.ShardStore)
+	return 0, !sharded
+}
+
+func (b serviceOperationBackend) CommitAtRouteVersion(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte, observed uint64) (*kv.CoordinateResponse, error) {
+	return b.commit(ctx, ts, elems, readKeys, observed)
+}
+
+func (b serviceOperationBackend) commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte, observed uint64) (*kv.CoordinateResponse, error) {
+	var primary []byte
+	for _, elem := range elems {
+		if elem == nil {
+			return nil, errors.WithStack(ErrInvalid)
+		}
+		if !fskeys.IsOperationKey(elem.Key) {
+			continue
+		}
+		if primary != nil {
+			return nil, errors.WithStack(ErrInvalid)
+		}
+		primary = elem.Key
+	}
+	return b.service.dispatchTxnWithPrimaryAtRoute(ctx, ts, elems, readKeys, true, primary, observed)
 }
 
 func (b serviceOperationBackend) CommittedVersionAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -119,7 +157,7 @@ func randomOperationToken() ([16]byte, error) {
 // EnsureFilesystem returns the single Raft-replicated identity shared by all
 // mounts. A conflict rereads the winner; a lost response remains unknown.
 func (j *OperationJournal) EnsureFilesystem(ctx context.Context) ([16]byte, error) {
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		ts, err := j.backend.Snapshot(ctx)
 		if err != nil {
 			return [16]byte{}, errors.Wrap(err, "fence filesystem identity")
@@ -141,8 +179,11 @@ func (j *OperationJournal) EnsureFilesystem(ctx context.Context) ([16]byte, erro
 		if !IsWriteConflict(err) {
 			return [16]byte{}, errors.Wrap(err, "register filesystem identity")
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return [16]byte{}, err
+		}
 	}
-	return [16]byte{}, errors.WithStack(ErrOperationQuota)
+	return [16]byte{}, errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) loadFilesystemAt(ctx context.Context, ts uint64) ([16]byte, bool, error) {
@@ -185,13 +226,16 @@ func (j *OperationJournal) RegisterSessionWithID(ctx context.Context, id Operati
 	if id.Filesystem == [16]byte{} || id.Session == [16]byte{} || owner == "" {
 		return errors.WithStack(ErrInvalid)
 	}
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		err := j.registerSessionOnce(ctx, id, owner)
 		if !IsWriteConflict(err) {
 			return err
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
 	}
-	return errors.WithStack(ErrOperationQuota)
+	return errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) registerSessionOnce(ctx context.Context, id OperationSessionID, owner string) error {
@@ -287,14 +331,17 @@ func (j *OperationJournal) Admit(ctx context.Context, id OperationID, intent []b
 	if err := validateOperationRecord(record); err != nil {
 		return operationRecord{}, err
 	}
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		admitted, err := j.admitOnce(ctx, record)
 		if IsWriteConflict(err) {
+			if err = waitOperationCASRetry(ctx, retry); err != nil {
+				return operationRecord{}, err
+			}
 			continue
 		}
 		return admitted, err
 	}
-	return operationRecord{}, errors.WithStack(ErrOperationQuota)
+	return operationRecord{}, errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord) (operationRecord, error) {
@@ -373,6 +420,10 @@ func (j *OperationJournal) loadRecordAt(ctx context.Context, id OperationID, ts 
 }
 
 func (j *OperationJournal) storeRecordAndSession(ctx context.Context, ts uint64, record operationRecord, session operationSession, extra []*kv.Elem[kv.OP], extraReadKeys [][]byte) error {
+	return j.storeRecordAndSessionAtRoute(ctx, ts, record, session, extra, extraReadKeys, 0)
+}
+
+func (j *OperationJournal) storeRecordAndSessionAtRoute(ctx context.Context, ts uint64, record operationRecord, session operationSession, extra []*kv.Elem[kv.OP], extraReadKeys [][]byte, observed uint64) error {
 	recordRaw, err := encodeOperationRecord(record)
 	if err != nil {
 		return err
@@ -394,7 +445,11 @@ func (j *OperationJournal) storeRecordAndSession(ctx context.Context, ts uint64,
 	readKeys := make([][]byte, 0, len(extraReadKeys)+operationJournalRows)
 	readKeys = append(readKeys, record.ID.key(), session.ID.key())
 	readKeys = append(readKeys, extraReadKeys...)
-	_, err = j.backend.Commit(ctx, ts, elems, readKeys)
+	if observed != 0 {
+		_, err = j.backend.CommitAtRouteVersion(ctx, ts, elems, readKeys, observed)
+	} else {
+		_, err = j.backend.Commit(ctx, ts, elems, readKeys)
+	}
 	return errors.Wrap(err, "publish operation journal")
 }
 

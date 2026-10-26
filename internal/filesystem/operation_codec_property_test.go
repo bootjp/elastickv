@@ -26,6 +26,33 @@ func TestOperationRecordCodecProperty(t *testing.T) {
 	})
 }
 
+func TestOperationRecordCodecPreservesGenerationFence(t *testing.T) {
+	id := OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
+	record := newOperationRecord(id, []byte("write"), 128, 1024)
+	record.AttemptID = [16]byte{4}
+	record.Generation = 2
+	record.FencedAttempts = [][16]byte{{3}}
+	record.Reservation += operationFenceReservation
+	raw, err := encodeOperationRecord(record)
+	require.NoError(t, err)
+	decoded, err := decodeOperationRecord(raw)
+	require.NoError(t, err)
+	require.Equal(t, record, decoded)
+
+	decoded.FencedAttempts = append(decoded.FencedAttempts, [16]byte{3})
+	_, err = encodeOperationRecord(decoded)
+	require.ErrorIs(t, err, ErrOperationRecordCorrupt)
+
+	legacy := newOperationRecord(id, []byte("write"), 128, 1024)
+	legacy.RecordIsPrimary = false
+	raw, err = encodeOperationRecord(legacy)
+	require.NoError(t, err)
+	raw[4] = operationRecordLegacyVersion
+	decoded, err = decodeOperationRecord(raw)
+	require.NoError(t, err)
+	require.False(t, decoded.RecordIsPrimary)
+}
+
 func TestOperationSessionCodecProperty(t *testing.T) {
 	rapid.Check(t, func(rt *rapid.T) {
 		owner := rapid.StringMatching(`[a-z]{1,16}`).Draw(rt, "owner")

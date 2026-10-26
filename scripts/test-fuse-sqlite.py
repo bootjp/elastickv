@@ -9,22 +9,33 @@ import sqlite3
 import uuid
 
 
+BUSY_TIMEOUT_SECONDS = 90
+WRITER_JOIN_SECONDS = 300
+
+
 def increment(path, mode, writes, start, results):
+    phase = "open"
     try:
-        if not start.wait(10):
-            raise TimeoutError("writer start timed out")
-        with closing(sqlite3.connect(path, timeout=10)) as connection:
+        with closing(sqlite3.connect(path, timeout=BUSY_TIMEOUT_SECONDS)) as connection:
+            # PERSIST is connection-local, so each writer must select it.
+            # Configure the connections before either starts writing.
+            phase = "configure journal mode"
             actual_mode = connection.execute(f"PRAGMA journal_mode={mode}").fetchone()[0]
             if actual_mode.upper() != mode:
                 raise AssertionError(f"journal mode {actual_mode}, expected {mode}")
             connection.execute("PRAGMA synchronous=FULL")
-            for _ in range(writes):
+            results.put("ready")
+            phase = "wait for writers"
+            if not start.wait(BUSY_TIMEOUT_SECONDS):
+                raise TimeoutError("writer start timed out")
+            for index in range(writes):
+                phase = f"write {index + 1}/{writes}"
                 connection.execute("BEGIN IMMEDIATE")
                 connection.execute("UPDATE counter SET value=value+1")
                 connection.commit()
         results.put(None)
     except Exception as exc:  # The parent reports the exact worker failure.
-        results.put(repr(exc))
+        results.put(f"{phase}: {exc!r}")
 
 
 def run_mode(mount, mode, writers, writes):
@@ -46,9 +57,12 @@ def run_mode(mount, mode, writers, writes):
     ]
     for process in processes:
         process.start()
+        ready = results.get(timeout=BUSY_TIMEOUT_SECONDS)
+        if ready != "ready":
+            raise RuntimeError(f"{mode}: writer setup failed: {ready}")
     start.set()
     for process in processes:
-        process.join(120)
+        process.join(WRITER_JOIN_SECONDS)
         if process.is_alive():
             process.terminate()
             process.join()

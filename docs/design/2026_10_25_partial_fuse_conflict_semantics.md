@@ -438,13 +438,57 @@ regression tests.
 
 ### Remaining work after the bounded legacy-path changes
 
-The current branch adds typed forwarding of definitive write conflicts, bounded
-retries for those conflicts in several filesystem service operations, a local
-FUSE predecessor barrier, and mounted SQLite PERSIST/DELETE test coverage. These
-changes improve the legacy path but do not route FUSE mutations through the
-operation journal. In particular, `AdvanceGeneration` still fails closed, and
-`Service.Fsync` still uses an attribute read rather than a durable receipt.
-The tests for the legacy path cannot satisfy the strict-mode gates below.
+The merged baseline forwards definitive write conflicts, retries several
+filesystem service operations within bounds, tracks local FUSE predecessors,
+and tests mounted SQLite PERSIST/DELETE workloads.
+This branch adds a transaction-primary generation fence and optional
+journal-backed paths for fixed-offset FUSE writes, setattr including size changes,
+create/mknod, mkdir, open, release, lease renewal, file unlink,
+empty-directory removal, and same-directory rename.
+The adapter retains their successful operation IDs per inode.
+Its flush and fsync paths resolve those IDs and check participant proofs.
+Directory fsync checks create, mkdir, removal and rename receipts recorded for
+that parent. File fsync also checks create, open and release receipts for its
+inode when those optional paths are selected.
+The default mount path still uses the legacy mutations.
+The optional lease renewal path serializes foreground and background refreshes
+with other inode mutations and blocks later fsync after an unknown renewal.
+It journals at most one renewal per handle within a quarter of the configured
+lease lifetime, capped at one minute. Other reads validate the current lease
+without extending it. A later renewal verifies the preceding lease receipt
+before removing that receipt from the local fsync set; failed verification
+keeps the older receipt.
+`Service.Fsync` still uses an attribute read after the adapter checks the
+receipts for its supported journaled operations.
+The optional receipt tracker is local to one mount and retains only successful
+operations in memory. Successful replies now trigger receipt verification and
+session acknowledgement after the FUSE device write attempt.
+Write planning failures before publication cancel their pending attempt with a
+typed result so a duplicate observes the same failure and the session can
+close. An uncertain cancellation remains unknown until resolution.
+The local go-fuse bridge now notifies the adapter after `Server.handleRequest`
+attempts the kernel reply. The adapter verifies participant receipts before
+acknowledging terminal operations and retries acknowledgements that could not
+complete. Suppressed replies do not trigger acknowledgement. The explicit
+`--filesystemStrict` mount option selects all supported journaled mutation
+paths. Recovery of a previous incarnation requires the separate
+`--filesystemStrictRecover` flag after its process has stopped.
+The explicit strict mount is available for validation, but the default remains
+the legacy path until the strict-mode acceptance gates below pass.
+
+The current Raft path persists Ready entries through `persistReadyToWAL`
+before applying them.
+The pinned etcd WAL calls sync for a Ready containing entries.
+The Pebble FSM apply path defaults to `pebble.Sync`; its optional no-sync mode
+depends on replay from the synced Raft WAL.
+Local Pebble close/reopen tests recover committed write, metadata, namespace,
+create and open results with their receipts. A separate process-kill test
+recovers create, write, truncate and rename receipts from the Pebble WAL
+without closing the store. Neither test exercises a Raft process or node
+crash.
+This code audit supports the receipt approach but does not close the M4 gate.
+Crash tests must cover failure between WAL persistence, FSM apply, proof
+visibility, FUSE reply, and the next fsync for every participant group.
 
 Complete the remaining work in dependency order:
 

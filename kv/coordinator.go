@@ -796,7 +796,7 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
-		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.ObservedRouteVersion, reqs.KeyVizLabel)
+		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.ObservedRouteVersion, reqs.KeyVizLabel, reqs.PrimaryKey)
 	} else {
 		resp, err = c.dispatchRaw(ctx, reqs.Elems, reqs.KeyVizLabel)
 	}
@@ -1315,11 +1315,14 @@ func (c *Coordinate) resolveDispatchCommitTS(ctx context.Context, commitTS, star
 	return retry, nil
 }
 
-func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64, prevCommitTS uint64, observedRouteVersion uint64, label keyviz.Label) (*CoordinateResponse, error) {
+func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys [][]byte, startTS uint64, commitTS uint64, prevCommitTS uint64, observedRouteVersion uint64, label keyviz.Label, selectedPrimary ...[]byte) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 	primary := primaryKeyForElems(reqs)
+	if len(selectedPrimary) != 0 && len(selectedPrimary[0]) != 0 {
+		primary = selectedPrimary[0]
+	}
 	if len(primary) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
@@ -1592,6 +1595,9 @@ func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Requ
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
 	primary := primaryKeyForElems(reqs.Elems)
+	if len(reqs.PrimaryKey) != 0 {
+		primary = reqs.PrimaryKey
+	}
 	if len(primary) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
@@ -1724,4 +1730,11 @@ func primaryKeyForElems(reqs []*Elem[OP]) []byte {
 		}
 	}
 	return primary
+}
+
+func transactionPrimaryKey(reqs []*Elem[OP], selected []byte) []byte {
+	if len(selected) != 0 {
+		return selected
+	}
+	return primaryKeyForElems(reqs)
 }

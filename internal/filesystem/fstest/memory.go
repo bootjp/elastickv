@@ -4,6 +4,7 @@ package fstest
 
 import (
 	"context"
+	"encoding/binary"
 	"sync"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
@@ -19,6 +20,8 @@ type MemoryDispatcher struct {
 	mu    sync.Mutex
 	store store.MVCCStore
 }
+
+const commitTimestampBytes = 8
 
 // NewMemoryDispatcher wraps st in a dispatcher that commits every group at
 // the next commit timestamp.
@@ -48,12 +51,19 @@ func (d *MemoryDispatcher) Dispatch(
 	}
 	mutations := make([]*store.KVPairMutation, 0, len(req.Elems))
 	for _, elem := range req.Elems {
+		value := append([]byte(nil), elem.Value...)
+		if elem.CommitTSValueOffset != 0 {
+			if len(value) < commitTimestampBytes || elem.CommitTSValueOffset > uint64(len(value)-commitTimestampBytes) {
+				return nil, errors.WithStack(filesystem.ErrInvalid)
+			}
+			binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:], commitTS)
+		}
 		switch elem.Op {
 		case kv.Put:
 			mutations = append(mutations, &store.KVPairMutation{
 				Op:    store.OpTypePut,
 				Key:   append([]byte(nil), elem.Key...),
-				Value: append([]byte(nil), elem.Value...),
+				Value: value,
 			})
 		case kv.Del:
 			mutations = append(mutations, &store.KVPairMutation{

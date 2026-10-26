@@ -2,6 +2,7 @@ FROM golang:latest AS build
 
 WORKDIR $GOPATH/src/app
 COPY go.mod go.sum ./
+COPY third_party/go-fuse/go.mod third_party/go-fuse/go.mod
 RUN go mod download
 COPY . .
 

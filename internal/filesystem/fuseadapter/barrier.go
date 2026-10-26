@@ -111,6 +111,15 @@ func (m *mutationTracker) end(ticket *mutationTicket, unknown bool) {
 	close(ticket.done)
 }
 
+func (m *mutationTracker) markUnknown(key uint64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.sticky == nil {
+		m.sticky = make(map[uint64]syscall.Errno)
+	}
+	m.sticky[key] = syscall.EIO
+}
+
 func (m *mutationTracker) wait(ctx context.Context, key uint64) syscall.Errno {
 	waitCtx, cancel := context.WithTimeout(ctx, mutationQueueWaitBudget)
 	defer cancel()

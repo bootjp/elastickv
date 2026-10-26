@@ -73,6 +73,13 @@ func OperationKey(filesystemID, sessionID [16]byte, sequence uint64) []byte {
 	return appendU64(out, sequence)
 }
 
+// IsOperationKey identifies an exact operation row, excluding other journal
+// metadata families and malformed prefixes.
+func IsOperationKey(key []byte) bool {
+	return bytes.HasPrefix(key, []byte(operationPrefix)) &&
+		len(key) == len(operationPrefix)+operationIdentityBytes+u64Bytes
+}
+
 // OperationSessionKey names one durable mount incarnation.
 func OperationSessionKey(filesystemID, sessionID [16]byte) []byte {
 	out := make([]byte, 0, len(operationSessionPrefix)+operationIdentityBytes)

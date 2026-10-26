@@ -36,9 +36,35 @@ permissions:
   contents: read
 jobs:
   test:
+    name: test (${{ matrix.workload }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        workload:
+          - unit
+          - redis
+          - redis-zset
+          - dynamodb
+          - dynamodb-type-string
+          - dynamodb-type-number
+          - dynamodb-type-binary
+          - dynamodb-type-bool
+          - dynamodb-type-null
+          - dynamodb-type-string-set
+          - dynamodb-type-number-set
+          - dynamodb-type-binary-set
+          - dynamodb-type-list
+          - dynamodb-type-map
+          - s3
+          - filesystem-cross-mount
+          - filesystem-sqlite-check
+          - filesystem-overwrite
+          - filesystem-rename
+          - sqlite
     env:
       GOCACHE: /tmp/go-build
+      WORKLOAD: ${{ matrix.workload }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -74,20 +100,15 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-maven-
       - name: Pre-fetch Go modules and build binaries
-        # The demo cluster is built rather than started through `go run`:
-        # `go run` execs the compiled program as a child and does not forward
-        # SIGTERM to it, so killing the recorded `go run` PID would leave the
-        # demo listening and block the filesystem cluster below. The server
-        # binary serves that filesystem stress phase: the demo cluster
-        # (cmd/server/demo.go) has no --filesystemMount, so the FUSE workload
-        # runs against three real server processes instead.
+        if: matrix.workload != 'unit'
         run: |
           mkdir -p "$GOCACHE" /tmp/go-tmp
-          GOPATH=$(go env GOPATH)
           export GOCACHE GOTMPDIR=/tmp/go-tmp
           go mod download
-          go build -o /tmp/elastickv-demo ./cmd/server
-          go build -o /tmp/elastickv-bin .
+          case "$WORKLOAD" in
+            filesystem-*|sqlite) go build -o /tmp/elastickv-bin . ;;
+            *) go build -o /tmp/elastickv-demo ./cmd/server ;;
+          esac
       # Warm the Maven cache up front so unit tests / workloads start
       # against a populated ~/.m2. `lein deps` is wrapped with a retry
       # loop because Maven Central transiently returns 429 during peak
@@ -111,16 +132,18 @@ jobs:
             sleep "$sleep_secs"
           done
       - name: Run Jepsen unit tests
+        if: matrix.workload == 'unit'
         working-directory: jepsen
         run: ~/lein test
       - name: Launch demo cluster
+        if: matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && matrix.workload != 'sqlite'
         run: |
           set -euo pipefail
           nohup /tmp/elastickv-demo > /tmp/elastickv-demo.log 2>&1 &
           echo $! > /tmp/elastickv-demo.pid
 
           echo "Waiting for redis (63791-63793), dynamo (63801-63803), and s3 (63901-63903) listeners..."
-          for i in {1..90}; do
+          for _ in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
               && nc -z 127.0.0.1 63801 && nc -z 127.0.0.1 63802 && nc -z 127.0.0.1 63803 \
               && nc -z 127.0.0.1 63901 && nc -z 127.0.0.1 63902 && nc -z 127.0.0.1 63903; then
@@ -134,11 +157,12 @@ jobs:
           tail -n 200 /tmp/elastickv-demo.log || true
           exit 1
       - name: Run Redis Jepsen workload against elastickv
+        if: matrix.workload == 'redis'
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.redis-workload \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.redis-workload \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
@@ -147,21 +171,23 @@ jobs:
             --ports 63791,63792,63793 \
             --host 127.0.0.1
       - name: Run Redis ZSet safety Jepsen workload against elastickv
+        if: matrix.workload == 'redis-zset'
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.redis-zset-safety-workload \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.redis-zset-safety-workload \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --ports 63791,63792,63793 \
             --host 127.0.0.1
       - name: Run DynamoDB Jepsen workload against elastickv
+        if: matrix.workload == 'dynamodb'
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.dynamodb-workload --local \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.dynamodb-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
@@ -169,69 +195,35 @@ jobs:
             --max-txn-length ${{ inputs.max-txn-length || '4' }} \
             --dynamo-ports 63801,63802,63803 \
             --host 127.0.0.1
-      - name: Run DynamoDB per-type Jepsen workloads against elastickv
+      - name: Run DynamoDB per-type Jepsen workload against elastickv
+        if: startsWith(matrix.workload, 'dynamodb-type-')
         working-directory: jepsen
-        # The per-type sweep is a coverage check across all 10 attribute
-        # types, not the deep stress run — it uses its own shorter
-        # time-limit so the 10-type loop fits comfortably inside the job
-        # timeout regardless of the workflow_dispatch time-limit input.
-        # The per-invocation `timeout` is derived from TYPE_TL + buffer
-        # so bumping TYPE_TL never races against the outer timeout.
-        timeout-minutes: 30
+        # Each attribute type uses a fresh cluster on its own runner.
+        timeout-minutes: 6
         env:
-          # Per-type sweep is a coverage check, not the deep stress run, so
-          # it uses its own shorter runtime and smaller history density than
-          # the parent dynamodb-workload step.  Keeping per-key ops modest
-          # also keeps Knossos's linearizability analysis inside its
-          # time budget (dense histories cause :valid? :unknown verdicts).
           TYPE_TL: "60"
           TYPE_CONCURRENCY: "4"
           TYPE_KEY_COUNT: "8"
           TYPE_MAX_WRITES: "80"
         run: |
-          # Run every type independently: one failure does not stop
-          # the sweep so the final summary shows which specific types
-          # passed/failed.  The step still fails if any type failed.
           PER_TYPE_TIMEOUT=$((TYPE_TL + 180))
-          declare -A RESULT
-          FAILED=()
-          for t in string number binary bool null string-set number-set binary-set list map; do
-            echo "::group::value-type=${t}"
-            set +e
-            timeout "${PER_TYPE_TIMEOUT}" ~/lein run -m elastickv.dynamodb-types-workload --local \
-              --time-limit "${TYPE_TL}" \
-              --rate ${{ inputs.rate || '5' }} \
-              --concurrency "${TYPE_CONCURRENCY}" \
-              --key-count "${TYPE_KEY_COUNT}" \
-              --max-writes-per-key "${TYPE_MAX_WRITES}" \
-              --value-type "${t}" \
-              --dynamo-ports 63801,63802,63803 \
-              --host 127.0.0.1
-            rc=$?
-            set -e
-            if [ "$rc" -eq 0 ]; then
-              RESULT[$t]="pass"
-            else
-              RESULT[$t]="fail(${rc})"
-              FAILED+=("$t")
-            fi
-            echo "::endgroup::"
-          done
-          echo
-          echo "=== per-type jepsen summary ==="
-          for t in string number binary bool null string-set number-set binary-set list map; do
-            printf '  %-12s %s\n' "$t" "${RESULT[$t]}"
-          done
-          if [ ${#FAILED[@]} -ne 0 ]; then
-            echo "FAILED types: ${FAILED[*]}"
-            exit 1
-          fi
+          TYPE="${WORKLOAD#dynamodb-type-}"
+          timeout "${PER_TYPE_TIMEOUT}" ~/lein run -m elastickv.dynamodb-types-workload --local \
+            --time-limit "${TYPE_TL}" \
+            --rate ${{ inputs.rate || '5' }} \
+            --concurrency "${TYPE_CONCURRENCY}" \
+            --key-count "${TYPE_KEY_COUNT}" \
+            --max-writes-per-key "${TYPE_MAX_WRITES}" \
+            --value-type "${TYPE}" \
+            --dynamo-ports 63801,63802,63803 \
+            --host 127.0.0.1
       - name: Run S3 Jepsen workload against elastickv
+        if: matrix.workload == 's3'
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.s3-workload --local \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.s3-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
@@ -239,30 +231,8 @@ jobs:
             --threads-per-key 4 \
             --s3-ports 63901,63902,63903 \
             --host 127.0.0.1
-      - name: Stop demo cluster before the filesystem cluster
-        # The filesystem stress phase needs --filesystemMount, which the
-        # single-process demo cluster does not offer, so it runs against a
-        # real-binary cluster on the same ports once the demo is down. The
-        # demo keeps its Raft state in memory; nothing is lost by stopping it.
-        # The PID is the demo binary itself (not a `go run` wrapper), so the
-        # listeners close with it; the loop below confirms that before the
-        # ports are reused.
-        run: |
-          if [ -f /tmp/elastickv-demo.pid ]; then
-            pid=$(cat /tmp/elastickv-demo.pid)
-            kill "$pid" 2>/dev/null || true
-            wait "$pid" 2>/dev/null || true
-            rm -f /tmp/elastickv-demo.pid
-          fi
-          for i in {1..30}; do
-            if ! nc -z 127.0.0.1 63791 && ! nc -z 127.0.0.1 63792 && ! nc -z 127.0.0.1 63793; then
-              exit 0
-            fi
-            sleep 1
-          done
-          echo "demo cluster listeners still open after 30s" >&2
-          exit 1
       - name: Launch filesystem cluster
+        if: startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite'
         # Mirrors the cluster in jepsen-test.yml: every node mounts the shared
         # filesystem so the workload drives leader and follower mounts alike,
         # and the root directory is owned by the runner user because the
@@ -284,6 +254,7 @@ jobs:
               --dynamoAddress "127.0.0.1:6380${node}" \
               --s3Address "127.0.0.1:6390${node}" \
               --filesystemMount "/tmp/elastickv-fs/fs-n${node}" \
+              --filesystemStrict \
               --filesystemRootUID "$(id -u)" \
               --filesystemRootGID "$(id -g)" \
               --metricsAddress "" \
@@ -299,7 +270,7 @@ jobs:
           done
 
           echo "Waiting for redis (63791-63793) listeners and FUSE mounts..."
-          for i in {1..90}; do
+          for _ in {1..90}; do
             if nc -z 127.0.0.1 63791 && nc -z 127.0.0.1 63792 && nc -z 127.0.0.1 63793 \
               && mountpoint -q /tmp/elastickv-fs/fs-n1 && mountpoint -q /tmp/elastickv-fs/fs-n2 \
               && mountpoint -q /tmp/elastickv-fs/fs-n3; then
@@ -315,6 +286,7 @@ jobs:
           done
           exit 1
       - name: Verify FUSE cross-mount disjoint writes without client retries
+        if: matrix.workload == 'filesystem-cross-mount'
         run: |
           python3 scripts/test-fuse-cross-mount.py \
             /tmp/elastickv-fs/fs-n1 \
@@ -322,25 +294,20 @@ jobs:
             /tmp/elastickv-fs/fs-n3 \
             --iterations 50
       - name: Verify SQLite rollback journals without client retries
+        if: matrix.workload == 'filesystem-sqlite-check'
         run: python3 scripts/test-fuse-sqlite.py /tmp/elastickv-fs/fs-n1 --writes 30
-      - name: Run filesystem Jepsen workloads against elastickv
+      - name: Run filesystem Jepsen workload against elastickv
+        if: matrix.workload == 'filesystem-overwrite' || matrix.workload == 'filesystem-rename'
         working-directory: jepsen
-        # Linearizable register over the FUSE mounts, at the same stress
-        # settings as the other workloads: every node mounts the same
-        # filesystem and each key is one file. `overwrite` writes the record
-        # in place (one chunk RMW); `rename` replaces it through a temp file +
-        # rename (namespace txn and remove-while-open). Both modes run even if
-        # one fails so the summary shows which mode broke.
+        # Each write mode uses a fresh filesystem cluster on its own runner.
         # See jepsen/src/elastickv/filesystem_workload.clj.
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           FS_REQUESTED_KEYS: ${{ inputs.key-count || '16' }}
           FS_REQUESTED_WRITES: ${{ inputs.max-writes-per-key || '250' }}
         run: |
           # Knossos checks each register independently. Bound each history's
           # ambiguous writes while keeping the requested total write budget.
-          # Both write modes can accumulate enough indeterminate operations
-          # to exhaust Knossos at 64 writes per key.
           valid_java_positive_int() {
             [[ "$1" =~ ^[1-9][0-9]*$ ]] || return 1
             [[ ${#1} -lt 10 ]] && return 0
@@ -353,67 +320,45 @@ jobs:
           fi
           bash test/filesystem_budget_test.sh
           source ./filesystem_budget.sh
-          declare -A RESULT
-          FAILED=()
-          for mode in overwrite rename; do
-            echo "::group::write-mode=${mode}"
-            filesystem_budget "$mode" "$FS_REQUESTED_KEYS" "$FS_REQUESTED_WRITES"
-            echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
-            set +e
-            timeout 480 ~/lein run -m elastickv.filesystem-workload --local \
-              --time-limit ${{ inputs.time-limit || '150' }} \
-              --rate ${{ inputs.rate || '10' }} \
-              --concurrency ${{ inputs.concurrency || '8' }} \
-              --key-count "$FS_KEY_COUNT" \
-              --max-writes-per-key "$FS_MAX_WRITES" \
-              --write-mode "${mode}" \
-              --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
-            rc=$?
-            set -e
-            if [ "$rc" -eq 0 ]; then
-              RESULT[$mode]="pass"
-            else
-              RESULT[$mode]="fail(${rc})"
-              FAILED+=("$mode")
-            fi
-            echo "::endgroup::"
-          done
-          echo
-          echo "=== filesystem jepsen summary ==="
-          for mode in overwrite rename; do
-            printf '  %-10s %s\n' "$mode" "${RESULT[$mode]}"
-          done
-          if [ ${#FAILED[@]} -ne 0 ]; then
-            echo "FAILED modes: ${FAILED[*]}"
-            exit 1
-          fi
+          MODE="${WORKLOAD#filesystem-}"
+          filesystem_budget "$MODE" "$FS_REQUESTED_KEYS" "$FS_REQUESTED_WRITES"
+          echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
+          timeout 720 ~/lein run -m elastickv.filesystem-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
+            --rate ${{ inputs.rate || '10' }} \
+            --concurrency ${{ inputs.concurrency || '8' }} \
+            --key-count "$FS_KEY_COUNT" \
+            --max-writes-per-key "$FS_MAX_WRITES" \
+            --write-mode "$MODE" \
+            --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
       - name: Run SQLite Jepsen workload on FUSE
+        if: matrix.workload == 'sqlite'
         working-directory: jepsen
-        timeout-minutes: 12
+        timeout-minutes: 20
         run: |
-          # Keep the 1024-write budget while bounding the ambiguous writes
-          # Knossos must explore for any one SQLite database.
+          # Spread the longer run across databases while bounding the
+          # ambiguous writes Knossos must explore for any one database.
           bash test/sqlite_budget_test.sh
           source ./sqlite_budget.sh
-          sqlite_budget 16 64
+          sqlite_budget 24 64
           echo "SQLite register budget: ${SQLITE_KEY_COUNT} keys, ${SQLITE_MAX_WRITES} writes per key"
-          timeout 600 ~/lein run -m elastickv.sqlite-workload --local \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 900 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency 8 --key-count "$SQLITE_KEY_COUNT" --max-writes-per-key "$SQLITE_MAX_WRITES" \
             --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
       - name: Archive Jepsen store on failure
-        if: failure()
+        if: failure() && matrix.workload != 'unit'
         run: bash scripts/archive-jepsen-store.sh jepsen/store /tmp/jepsen-store-types.tar.gz
       - name: Upload Jepsen store on failure
-        if: failure()
+        if: failure() && matrix.workload != 'unit'
         uses: actions/upload-artifact@v7
         with:
-          name: jepsen-store-types
+          name: jepsen-store-${{ matrix.workload }}
           path: /tmp/jepsen-store-types.tar.gz
           retention-days: 7
       - name: Dump demo cluster log on failure
-        if: failure()
+        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && matrix.workload != 'sqlite'
         # The previous `tail -n 500` truncated a 3-minute workload's
         # log down to startup-only lines, making it impossible to
         # correlate a Jepsen anomaly with the server-side state
@@ -429,15 +374,15 @@ jobs:
           echo "=== full log line count ==="
           wc -l /tmp/elastickv-demo.log || true
       - name: Upload demo cluster log on failure
-        if: failure()
+        if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && matrix.workload != 'sqlite'
         uses: actions/upload-artifact@v7
         with:
-          name: elastickv-demo-log
+          name: elastickv-demo-log-${{ matrix.workload }}
           path: /tmp/elastickv-demo.log
           retention-days: 14
           if-no-files-found: warn
       - name: Dump filesystem cluster logs on failure
-        if: failure()
+        if: failure() && (startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite')
         run: |
           for node in n1 n2 n3; do
             log=/tmp/elastickv-fs-${node}.log
@@ -450,10 +395,10 @@ jobs:
             wc -l "$log" || true
           done
       - name: Upload filesystem cluster logs on failure
-        if: failure()
+        if: failure() && (startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite')
         uses: actions/upload-artifact@v7
         with:
-          name: elastickv-fs-logs
+          name: elastickv-fs-logs-${{ matrix.workload }}
           path: |
             /tmp/elastickv-fs-n1.log
             /tmp/elastickv-fs-n2.log

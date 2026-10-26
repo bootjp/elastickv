@@ -287,15 +287,15 @@ jobs:
         # temp file + rename (namespace txn and remove-while-open). Both run
         # even if one fails so the log shows which mode broke.
         # See jepsen/src/elastickv/filesystem_workload.clj.
-        timeout-minutes: 6
+        timeout-minutes: 10
         run: |
           declare -A RESULT
           FAILED=()
           for mode in overwrite rename; do
             echo "::group::write-mode=${mode}"
             set +e
-            timeout 150 ~/lein run -m elastickv.filesystem-workload --local \
-              --time-limit 5 --rate 5 --concurrency 6 \
+            timeout 240 ~/lein run -m elastickv.filesystem-workload --local \
+              --time-limit 30 --rate 5 --concurrency 6 \
               --write-mode "${mode}" \
               --mount-dirs /tmp/elastickv-ci/fs-n1,/tmp/elastickv-ci/fs-n2,/tmp/elastickv-ci/fs-n3
             rc=$?
@@ -319,7 +319,7 @@ jobs:
           fi
       - name: Run SQLite Jepsen workload on FUSE
         working-directory: jepsen
-        timeout-minutes: 3
+        timeout-minutes: 6
         run: |
           probe=/tmp/elastickv-ci/fs-n1/sqlite-probe.db
           if ! strace -f -o /tmp/elastickv-sqlite.strace sqlite3 "$probe" \
@@ -345,9 +345,9 @@ jobs:
               exit 1
             fi
           done
-          timeout 150 ~/lein run -m elastickv.sqlite-workload --local \
-            --time-limit 5 --rate 5 --concurrency 6 \
-            --key-count 6 --max-writes-per-key 16 \
+          timeout 240 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit 30 --rate 5 --concurrency 6 \
+            --key-count 12 --max-writes-per-key 16 \
             --mount-dirs /tmp/elastickv-ci/fs-n1,/tmp/elastickv-ci/fs-n2,/tmp/elastickv-ci/fs-n3
       - name: Archive Jepsen store on filesystem failure
         if: failure()

@@ -71,8 +71,12 @@ func newMemoryServiceForMount(t *testing.T) *filesystem.Service {
 }
 
 func newMemoryServiceForMountWithChunkSize(t *testing.T, chunkSize uint64) *filesystem.Service {
+	return newMemoryServiceForMountWithOptions(t, filesystem.WithChunkSize(chunkSize))
+}
+
+func newMemoryServiceForMountWithOptions(t *testing.T, opts ...filesystem.Option) *filesystem.Service {
 	t.Helper()
-	svc, err := fstest.NewMemoryService(filesystem.WithChunkSize(chunkSize))
+	svc, err := fstest.NewMemoryService(opts...)
 	require.NoError(t, err)
 	info, err := os.Stat(t.TempDir())
 	require.NoError(t, err)
@@ -90,8 +94,12 @@ func mountMemoryService(t *testing.T, svc fuseadapter.Core, clientID string) str
 }
 
 func mountMemoryServiceAt(t *testing.T, svc fuseadapter.Core, clientID, mountPoint string) *e2eMount {
+	return mountMemoryServiceAtWithOptions(t, svc, clientID, mountPoint)
+}
+
+func mountMemoryServiceAtWithOptions(t *testing.T, svc fuseadapter.Core, clientID, mountPoint string, adapterOptions ...fuseadapter.Option) *e2eMount {
 	t.Helper()
-	adapter := fuseadapter.New(svc, []byte(clientID))
+	adapter := fuseadapter.New(svc, []byte(clientID), adapterOptions...)
 	server, err := fuseadapter.Mount(mountPoint, adapter, &fuse.MountOptions{DirectMount: os.Geteuid() == 0})
 	if err != nil {
 		adapter.Close()
@@ -383,4 +391,270 @@ func TestKernelMountStatfsReportsNameLimit(t *testing.T) {
 	require.NoError(t, syscall.Statfs(mountPoint, &stat))
 	require.NotZero(t, stat.Bsize)
 	require.EqualValues(t, 255, stat.Namelen)
+}
+
+func requireOperationRetired(t *testing.T, journal *filesystem.OperationJournal, id filesystem.OperationID) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		_, err := journal.Resolve(t.Context(), id)
+		return errors.Is(err, filesystem.ErrOperationRetired)
+	}, 5*time.Second, 10*time.Millisecond)
+}
+
+func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-write")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-write", mountPoint, fuseadapter.WithJournaledWrites(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("journaled"), 0o600))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("journaled"), data)
+	requireOperationRetired(t, journal, filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
+}
+
+func TestKernelMountStrictModeMutationsAndReplyAcknowledgement(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-strict")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mount := mountMemoryServiceAtWithOptions(t, svc, "e2e-strict", mountPoint, fuseadapter.WithStrictMode(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("strict"), 0o600))
+	require.NoError(t, os.Truncate(path, 3))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("str"), data)
+	require.NoError(t, os.Mkdir(filepath.Join(mountPoint, "directory"), 0o700))
+	err = os.Rename(path, filepath.Join(mountPoint, "directory", "cross"))
+	require.ErrorIs(t, err, syscall.EXDEV)
+	require.NoError(t, os.Rename(path, filepath.Join(mountPoint, "renamed")))
+	require.NoError(t, os.Remove(filepath.Join(mountPoint, "renamed")))
+	directory, err := os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, directory.Sync())
+	require.NoError(t, directory.Close())
+	requireOperationRetired(t, journal, filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
+	require.NoError(t, mount.unmount())
+	_, err = journal.RegisterSession(t.Context(), filesystemID, "e2e-strict")
+	require.NoError(t, err)
+}
+
+func TestKernelMountStrictModeReclaimsJournalQuota(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-strict-quota")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-strict-quota", mountPoint, fuseadapter.WithStrictMode(session))
+	file, err := os.Create(filepath.Join(mountPoint, "file"))
+	require.NoError(t, err)
+	for range 4200 {
+		_, err = file.Write([]byte("x"))
+		require.NoError(t, err)
+	}
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	stat, err := os.Stat(filepath.Join(mountPoint, "file"))
+	require.NoError(t, err)
+	require.EqualValues(t, 4200, stat.Size())
+	requireOperationRetired(t, journal, filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
+}
+
+func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-create")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-create", mountPoint,
+		fuseadapter.WithJournaledCreate(session), fuseadapter.WithJournaledMkdir(session),
+		fuseadapter.WithJournaledOpen(session), fuseadapter.WithJournaledRelease(session))
+	filePath := filepath.Join(mountPoint, "file")
+	file, err := os.Create(filePath)
+	require.NoError(t, err)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	file, err = os.Open(filePath)
+	require.NoError(t, err)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	directoryPath := filepath.Join(mountPoint, "dir")
+	require.NoError(t, os.Mkdir(directoryPath, 0o700))
+	directory, err := os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, directory.Sync())
+	require.NoError(t, directory.Close())
+	for sequence := uint64(1); sequence <= 5; sequence++ {
+		requireOperationRetired(t, journal, filesystem.OperationID{
+			Filesystem: session.Filesystem, Session: session.Session, Sequence: sequence,
+		})
+	}
+}
+
+func TestKernelMountJournaledLeaseRefreshAndFsync(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMountWithOptions(t, filesystem.WithChunkSize(e2eChunkSize),
+		filesystem.WithOpenHandleLeaseTTL(2*time.Second))
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-lease")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-lease", mountPoint,
+		fuseadapter.WithJournaledLeaseRefresh(session))
+	file, err := os.Create(filepath.Join(mountPoint, "file"))
+	require.NoError(t, err)
+	time.Sleep(600 * time.Millisecond)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	requireOperationRetired(t, journal, filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
+}
+
+func TestKernelMountJournaledMetadataChange(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-metadata")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-metadata", mountPoint,
+		fuseadapter.WithJournaledMetadata(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o600))
+	require.NoError(t, os.Chmod(path, 0o640))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	stat, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), stat.Mode().Perm())
+	require.NoError(t, os.Truncate(path, 2))
+	f, err = os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	stat, err = os.Stat(path)
+	require.NoError(t, err)
+	require.EqualValues(t, 2, stat.Size())
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("da"), data)
+}
+
+func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-unlink")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-unlink", mountPoint,
+		fuseadapter.WithJournaledUnlink(session), fuseadapter.WithJournaledRmdir(session),
+		fuseadapter.WithJournaledRename(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
+	require.NoError(t, os.Remove(path))
+	dir, err := os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, dir.Sync())
+	require.NoError(t, dir.Close())
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o600))
+	id := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 1}
+	requireOperationRetired(t, journal, id)
+	require.ErrorIs(t, svc.UnlinkWithOperation(t.Context(), id, filesystem.RootInode, []byte("file")), filesystem.ErrOperationRetired)
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), data)
+	dirPath := filepath.Join(mountPoint, "dir")
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	require.NoError(t, os.Remove(dirPath))
+	dir, err = os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, dir.Sync())
+	require.NoError(t, dir.Close())
+	require.NoError(t, os.Mkdir(dirPath, 0o700))
+	directoryID := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 2}
+	requireOperationRetired(t, journal, directoryID)
+	require.ErrorIs(t, svc.RmdirWithOperation(t.Context(), directoryID, filesystem.RootInode, []byte("dir")), filesystem.ErrOperationRetired)
+	stat, err := os.Stat(dirPath)
+	require.NoError(t, err)
+	require.True(t, stat.IsDir())
+	source := filepath.Join(mountPoint, "source")
+	target := filepath.Join(mountPoint, "target")
+	require.NoError(t, os.WriteFile(source, []byte("old"), 0o600))
+	require.NoError(t, os.Rename(source, target))
+	dir, err = os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, dir.Sync())
+	require.NoError(t, dir.Close())
+	require.NoError(t, os.WriteFile(source, []byte("new"), 0o600))
+	renameID := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 3}
+	requireOperationRetired(t, journal, renameID)
+	require.ErrorIs(t, svc.RenameWithOperation(t.Context(), renameID, filesystem.RootInode, []byte("source"), filesystem.RootInode, []byte("target")), filesystem.ErrOperationRetired)
+	sourceData, err := os.ReadFile(source)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), sourceData)
+	targetData, err := os.ReadFile(target)
+	require.NoError(t, err)
+	require.Equal(t, []byte("old"), targetData)
 }

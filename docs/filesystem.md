@@ -79,6 +79,8 @@ flags:
 |---|---|---|
 | `--filesystemMount` | empty (disabled) | Directory to mount the filesystem on. |
 | `--filesystemClientID` | value of `--raftId` | Identity recorded in open-handle lease keys and in the mount log line, for attribution. Does not have to be unique: lease keys also carry a per-open handle ID. |
+| `--filesystemStrict` | `false` | Use a registered operation session for supported FUSE mutations. This validation mode requires the reply-aware go-fuse bridge. |
+| `--filesystemStrictRecover` | `false` | Fence and recover a prior strict session for the same client ID before registering a new one. Set this only after confirming the prior mount process has stopped. Requires `--filesystemStrict`. |
 | `--filesystemRootUID` | `0` | Owner UID of the root directory. Applied only when the root is first created. |
 | `--filesystemRootGID` | `0` | Owner GID of the root directory. Applied only when the root is first created. |
 | `--filesystemRootMode` | `0755` | Permission bits of the root directory. Applied only when the root is first created. |

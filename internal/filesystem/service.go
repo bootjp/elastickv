@@ -799,16 +799,30 @@ func (s *Service) writeOnce(ctx context.Context, inode uint64, offset uint64, da
 			return 0, err
 		}
 	}
+	elems, readKeys, err := s.planWriteTxn(ctx, meta, ts, offset, end, data)
+	if err != nil {
+		return 0, err
+	}
+	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+		return 0, s.translateHomeConflict(ctx, meta, err)
+	}
+	return len(data), nil
+}
+
+// planWriteTxn reads every chunk and metadata predicate at ts. The caller
+// must dispatch the returned effects with that same timestamp.
+func (s *Service) planWriteTxn(ctx context.Context, meta *InodeMeta, ts, offset, end uint64, data []byte) ([]*kv.Elem[kv.OP], [][]byte, error) {
+	inode := meta.Inode
 	chunkSize := meta.effectiveChunkSize(s.chunkSize)
 	first := offset / chunkSize
 	last := (end - 1) / chunkSize
 	elemCap, err := checkedInt(last - first + uint64(directoryInitialNlink))
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	chunkLen, err := checkedInt(chunkSize)
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	elems := make([]*kv.Elem[kv.OP], 0, elemCap)
 	readKeys := [][]byte{fskeys.InodeKey(inode), fskeys.HomeKey(inode)}
@@ -821,18 +835,18 @@ func (s *Service) writeOnce(ctx context.Context, inode uint64, offset uint64, da
 		writeEnd := min(end, chunkEnd)
 		srcStart, err := checkedInt(writeStart - offset)
 		if err != nil {
-			return 0, err
+			return nil, nil, err
 		}
 		srcEnd, err := checkedInt(writeEnd - offset)
 		if err != nil {
-			return 0, err
+			return nil, nil, err
 		}
 		fullChunkWrite := writeStart == chunkStart && writeEnd == chunkEnd
 		oldLen, value, readChunk, err := s.writeChunkValue(
 			ctx, ts, chunkKey, chunkLen, fullChunkWrite, data, srcStart, srcEnd, writeStart, chunkStart,
 		)
 		if err != nil {
-			return 0, err
+			return nil, nil, err
 		}
 		if readChunk {
 			readKeys = append(readKeys, chunkKey)
@@ -844,25 +858,25 @@ func (s *Service) writeOnce(ctx context.Context, inode uint64, offset uint64, da
 			elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: chunkKey, Value: value})
 		}
 	}
-	now := s.now().UnixNano()
+	return s.finishWritePlan(ctx, meta, ts, end, elems, readKeys, delta)
+}
+
+func (s *Service) finishWritePlan(ctx context.Context, meta *InodeMeta, ts, end uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte, delta usageDelta) ([]*kv.Elem[kv.OP], [][]byte, error) {
 	if end > meta.Size {
 		meta.Size = end
 	}
-	meta.MtimeNsec = now
-	meta.CtimeNsec = now
-	elem, err := putElem(fskeys.InodeKey(inode), meta)
+	meta.MtimeNsec = s.now().UnixNano()
+	meta.CtimeNsec = meta.MtimeNsec
+	elem, err := putElem(fskeys.InodeKey(meta.Inode), meta)
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
 	elems = append(elems, elem)
 	elems, readKeys, err = s.appendUsageUpdate(ctx, ts, elems, readKeys, delta)
 	if err != nil {
-		return 0, err
+		return nil, nil, err
 	}
-	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
-		return 0, s.translateHomeConflict(ctx, meta, err)
-	}
-	return len(data), nil
+	return elems, readKeys, nil
 }
 
 func (s *Service) writeChunkValue(
@@ -1621,6 +1635,30 @@ func (s *Service) RefreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 		}
 	}
 	return ErrContentionLimit
+}
+
+// OpenHandleLeaseTTL exposes the configured renewal budget to FUSE.
+func (s *Service) OpenHandleLeaseTTL() time.Duration {
+	return s.openLeaseTTL
+}
+
+// ValidateOpenHandleLease checks a handle without extending its lease.
+func (s *Service) ValidateOpenHandleLease(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := s.inodeAt(ctx, inode, ts); err != nil {
+		return err
+	}
+	lease, exists, err := s.openHandleLeaseAt(ctx, fskeys.RefKey(inode, clientID, fh), ts)
+	if err != nil {
+		return err
+	}
+	if !exists || lease.expired(s.now().UnixNano()) {
+		return errors.WithStack(ErrNotFound)
+	}
+	return nil
 }
 
 func (s *Service) refreshOpenHandleLeaseOnce(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
@@ -2803,10 +2841,35 @@ func (s *Service) dispatchTxnWithPolicy(
 	readKeys [][]byte,
 	requireAllParticipants bool,
 ) (*kv.CoordinateResponse, error) {
+	return s.dispatchTxnWithPrimaryPolicy(ctx, startTS, elems, readKeys, requireAllParticipants, nil)
+}
+
+func (s *Service) dispatchTxnWithPrimaryPolicy(
+	ctx context.Context,
+	startTS uint64,
+	elems []*kv.Elem[kv.OP],
+	readKeys [][]byte,
+	requireAllParticipants bool,
+	primary []byte,
+) (*kv.CoordinateResponse, error) {
+	return s.dispatchTxnWithPrimaryAtRoute(ctx, startTS, elems, readKeys, requireAllParticipants, primary, 0)
+}
+
+func (s *Service) dispatchTxnWithPrimaryAtRoute(
+	ctx context.Context,
+	startTS uint64,
+	elems []*kv.Elem[kv.OP],
+	readKeys [][]byte,
+	requireAllParticipants bool,
+	primary []byte,
+	observedRouteVersion uint64,
+) (*kv.CoordinateResponse, error) {
 	startTS = normalizeEmptyStoreReadTS(startTS)
 	reqs := &kv.OperationGroup[kv.OP]{
 		Elems:                  elems,
 		IsTxn:                  true,
+		PrimaryKey:             primary,
+		ObservedRouteVersion:   observedRouteVersion,
 		RequireAllParticipants: requireAllParticipants,
 		StartTS:                startTS,
 		ReadKeys:               readKeys,

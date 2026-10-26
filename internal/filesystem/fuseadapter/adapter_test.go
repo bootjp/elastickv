@@ -33,6 +33,7 @@ func TestErrnoMapsFilesystemErrors(t *testing.T) {
 		{name: "unsupported", err: filesystem.ErrUnsupported, want: syscall.EOPNOTSUPP},
 		{name: "stale home", err: filesystem.ErrStaleHome, want: syscall.EAGAIN},
 		{name: "contention limit", err: filesystem.ErrContentionLimit, want: syscall.EBUSY},
+		{name: "operation journal quota", err: filesystem.ErrOperationQuota, want: syscall.ENOSPC},
 		{name: "write conflict", err: cerrors.Wrap(store.ErrWriteConflict, "txn"), want: syscall.EAGAIN},
 		{
 			name: "legacy textual forwarded conflict is uncertain",
