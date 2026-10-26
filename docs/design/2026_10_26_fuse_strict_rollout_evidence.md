@@ -209,6 +209,31 @@ database files, so the checker returned `:unknown`. No linearizability
 violation was reported, but this run does not close the SQLite gate or
 establish a rollout threshold.
 
+The next scheduled strict run on main,
+[40375070553](https://github.com/bootjp/elastickv/actions/runs/40375070553)
+at `a299b49a`, passed SQLite but returned `:unknown` for filesystem
+overwrite and rename. Their final reads failed with FUSE I/O errors. The
+overwrite server also logged an exhausted HLC ceiling; the rename server
+logged operation-record errors during ACK retirement. Neither checker
+reported `:valid? false`. This main run predates the post-admission request
+cancellation fix in the pull request, so its failures do not establish the
+outcome of the corrected candidate.
+
+For a mode comparison, the targeted legacy run
+[40378658363](https://github.com/bootjp/elastickv/actions/runs/40378658363)
+at `2f542c4f` ran the same 30-minute overwrite, rename, and SQLite workloads
+with strict mode disabled. All three checkers returned `:valid? true`.
+The production Go code is unchanged between this commit and strict run
+`40362040528`; the intervening changes are a test, this document, and
+workflow inputs. Both runs used 512 keys with 16 writes per key for each
+filesystem workload, and 128 keys with 16 writes per key for SQLite. The
+strict SQLite run was inconclusive while its legacy counterpart passed.
+These are separate runners and one trial per mode, so they do not quantify a
+failure rate or prove a successful-operation consistency regression. They
+provide evidence of an operational regression that blocks default-on strict
+mode. Repeat the comparison after correcting the ACK accounting failure.
+Require complete final reads in every strict checker.
+
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
 `elastickv_fs_operation_journal_retained_bytes` from a fenced snapshot. These
