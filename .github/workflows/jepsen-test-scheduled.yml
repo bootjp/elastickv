@@ -391,11 +391,11 @@ jobs:
         working-directory: jepsen
         timeout-minutes: 20
         run: |
-          # Keep the 1024-write budget while bounding the ambiguous writes
-          # Knossos must explore for any one SQLite database.
+          # Spread the longer run across databases while bounding the
+          # ambiguous writes Knossos must explore for any one database.
           bash test/sqlite_budget_test.sh
           source ./sqlite_budget.sh
-          sqlite_budget 16 64
+          sqlite_budget 24 64
           echo "SQLite register budget: ${SQLITE_KEY_COUNT} keys, ${SQLITE_MAX_WRITES} writes per key"
           timeout 900 ~/lein run -m elastickv.sqlite-workload --local \
             --time-limit ${{ inputs.time-limit || '300' }} \
