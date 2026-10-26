@@ -1983,13 +1983,21 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if groupedReadKeyCount(groupedReadKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	_, err = c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
+	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
 		return nil, err
 	}
 
 	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, gids, commitTS, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
+		if errors.Is(err, store.ErrWriteConflict) && !errors.Is(err, ErrTransactionOutcomeUnknown) {
+			// An applied OCC rejection is a definitive non-commit. Release
+			// prepared intents even if the caller has since cancelled.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
+			cancel()
+			return nil, errors.WithStack(err)
+		}
 		// A lost primary COMMIT response may conceal a durable commit
 		// decision. Aborting prepared secondaries here can then turn one
 		// committed transaction into a partial commit. Lock resolution must

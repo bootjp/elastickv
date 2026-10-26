@@ -320,7 +320,8 @@ jobs:
           MODE=strict
           if [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' ]]; then MODE=legacy; fi
           python3 scripts/benchmark-fuse.py /tmp/elastickv-fs/fs-n1 \
-            --mode "$MODE" --writes 40 --workers 4 --output /tmp/elastickv-fuse-benchmark.json
+            --mode "$MODE" --writes 40 --workers 4 --repetitions 3 \
+            --output /tmp/elastickv-fuse-benchmark.json
       - name: Upload FUSE benchmark results
         if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy'
         uses: actions/upload-artifact@v7

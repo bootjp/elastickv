@@ -110,20 +110,29 @@ def main():
     parser.add_argument("mount", type=pathlib.Path)
     parser.add_argument("--writes", type=int, default=40)
     parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--mode", choices=("strict", "legacy"), required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
-    if args.writes < 1 or not 1 <= args.workers <= 255:
-        parser.error("writes must be positive and workers must be between 1 and 255")
+    if args.writes < 1 or not 1 <= args.workers <= 255 or args.repetitions < 1:
+        parser.error("writes and repetitions must be positive; workers must be between 1 and 255")
     prefix = uuid.uuid4().hex
     result = {
+        "source_sha": os.environ.get("GITHUB_SHA"),
+        "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "runner_os": os.environ.get("RUNNER_OS"),
         "block_bytes": BLOCK,
         "writes_per_worker": args.writes,
         "workers": args.workers,
         "mode": args.mode,
-        "serial": run_serial(args.mount / f"benchmark-serial-{prefix}.dat", args.writes),
-        "hot_inode": run_hot(args.mount / f"benchmark-hot-{prefix}.dat", args.workers, args.writes),
+        "trials": [],
     }
+    for trial in range(args.repetitions):
+        result["trials"].append({
+            "trial": trial + 1,
+            "serial": run_serial(args.mount / f"benchmark-serial-{prefix}-{trial}.dat", args.writes),
+            "hot_inode": run_hot(args.mount / f"benchmark-hot-{prefix}-{trial}.dat", args.workers, args.writes),
+        })
     args.output.write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(result, indent=2))
 
