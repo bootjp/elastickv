@@ -33,6 +33,39 @@ func testOperationID(t *testing.T, journal *OperationJournal, sequence uint64) O
 	return OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: sequence}
 }
 
+type primaryCaptureDispatcher struct {
+	inner   *testCoordinator
+	primary []byte
+}
+
+func (d *primaryCaptureDispatcher) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
+	if len(req.PrimaryKey) != 0 {
+		d.primary = append([]byte(nil), req.PrimaryKey...)
+	}
+	return d.inner.Dispatch(ctx, req)
+}
+
+func TestOperationJournalSelectsRecordAsTransactionPrimary(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}}
+	service, err := NewService(st, dispatch)
+	require.NoError(t, err)
+	journal, err := NewOperationJournal(service)
+	require.NoError(t, err)
+	id := testOperationID(t, journal, 1)
+	_, err = journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent:  []byte("write"),
+		Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("!fs|chk|data"), Value: []byte("value")}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, id.key(), dispatch.primary)
+}
+
 func TestOperationJournalPublishesResultWithEffectAndRetiresIdentity(t *testing.T) {
 	ctx := context.Background()
 	journal, st, coord := testOperationJournal(t)
@@ -202,6 +235,29 @@ type delayedOperationCommitBackend struct {
 	once    sync.Once
 	entered chan struct{}
 	release chan struct{}
+}
+
+type lostGenerationFenceBackend struct {
+	operationJournalBackend
+	lose bool
+}
+
+func (b *lostGenerationFenceBackend) Commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte) (*kv.CoordinateResponse, error) {
+	response, err := b.operationJournalBackend.Commit(ctx, ts, elems, readKeys)
+	if err != nil {
+		return response, err
+	}
+	for _, elem := range elems {
+		if !fskeys.IsOperationKey(elem.Key) {
+			continue
+		}
+		record, decodeErr := decodeOperationRecord(elem.Value)
+		if decodeErr == nil && len(record.FencedAttempts) != 0 && b.lose {
+			b.lose = false
+			return nil, kv.ErrTransactionOutcomeUnknown
+		}
+	}
+	return response, nil
 }
 
 func (b *delayedOperationCommitBackend) Commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte) (*kv.CoordinateResponse, error) {
@@ -562,7 +618,7 @@ func TestOperationJournalAcknowledgementGapsRetireWithoutReuse(t *testing.T) {
 	}
 }
 
-func TestOperationJournalDoesNotAdvanceWithoutAbortDecision(t *testing.T) {
+func TestOperationJournalDoesNotAdvanceLegacyAttempt(t *testing.T) {
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -570,6 +626,10 @@ func TestOperationJournalDoesNotAdvanceWithoutAbortDecision(t *testing.T) {
 	require.NoError(t, err)
 	old, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
+	ts, legacy, session, err := journal.pendingSnapshot(ctx, id)
+	require.NoError(t, err)
+	legacy.RecordIsPrimary = false
+	require.NoError(t, journal.storeRecordAndSession(ctx, ts, legacy, session, nil, nil))
 	_, err = journal.AdvanceGeneration(ctx, id, old.AttemptID)
 	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 	outcome, _, err := journal.ResolveAttempt(ctx, id, old.AttemptID)
@@ -615,7 +675,7 @@ func TestOperationJournalNewGenerationDoesNotProveOldAttemptAborted(t *testing.T
 	}
 }
 
-func TestOperationJournalDelayedCommitCannotBeSupersededWithoutDecision(t *testing.T) {
+func TestOperationJournalGenerationFenceStopsDelayedOldCommit(t *testing.T) {
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
 	id := testOperationID(t, journal, 1)
@@ -637,16 +697,66 @@ func TestOperationJournalDelayedCommitCannotBeSupersededWithoutDecision(t *testi
 		result <- publishErr
 	}()
 	<-backend.entered
-	_, err = journal.AdvanceGeneration(ctx, id, old.AttemptID)
-	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	next, err := journal.AdvanceGeneration(ctx, id, old.AttemptID)
+	require.NoError(t, err)
+	require.NotEqual(t, old.AttemptID, next.AttemptID)
+	require.Equal(t, old.Generation+1, next.Generation)
 	close(backend.release)
-	require.NoError(t, <-result)
+	require.Error(t, <-result)
 	current, err := journal.BeginAttempt(ctx, id)
-	require.ErrorIs(t, err, ErrOperationGeneration)
-	require.Equal(t, operationRecord{}, current)
+	require.NoError(t, err)
+	require.Equal(t, next.AttemptID, current.AttemptID)
+	_, err = st.GetAt(ctx, []byte("data"), st.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	outcome, _, err := journal.ResolveAttempt(ctx, id, old.AttemptID)
+	require.NoError(t, err)
+	require.Equal(t, AttemptAborted, outcome)
+	_, err = journal.Publish(ctx, id, next.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("new")}},
+	})
+	require.NoError(t, err)
 	value, err := st.GetAt(ctx, []byte("data"), st.LastCommitTS())
 	require.NoError(t, err)
-	require.Equal(t, []byte("old"), value)
+	require.Equal(t, []byte("new"), value)
+}
+
+func TestOperationJournalCommittedAttemptWinsGenerationFence(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old")}},
+	})
+	require.NoError(t, err)
+	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, ErrOperationGeneration)
+	outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	require.Equal(t, AttemptCommitted, outcome)
+}
+
+func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	journal = newOperationJournalWithBackend(&lostGenerationFenceBackend{operationJournalBackend: journal.backend, lose: true})
+	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	outcome, record, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	require.Equal(t, AttemptAborted, outcome)
+	require.NotEqual(t, attempt.AttemptID, record.AttemptID)
+	current, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, record.AttemptID, current.AttemptID)
 }
 
 func TestOperationJournalSnapshotRetainsTerminalAndPendingRecords(t *testing.T) {

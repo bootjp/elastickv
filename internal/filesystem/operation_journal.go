@@ -45,7 +45,20 @@ func (b serviceOperationBackend) ScanAt(ctx context.Context, start, end []byte, 
 }
 
 func (b serviceOperationBackend) Commit(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], readKeys [][]byte) (*kv.CoordinateResponse, error) {
-	return b.service.dispatchTxnWithPolicy(ctx, ts, elems, readKeys, true)
+	var primary []byte
+	for _, elem := range elems {
+		if elem == nil {
+			return nil, errors.WithStack(ErrInvalid)
+		}
+		if !fskeys.IsOperationKey(elem.Key) {
+			continue
+		}
+		if primary != nil {
+			return nil, errors.WithStack(ErrInvalid)
+		}
+		primary = elem.Key
+	}
+	return b.service.dispatchTxnWithPrimaryPolicy(ctx, ts, elems, readKeys, true, primary)
 }
 
 func (b serviceOperationBackend) CommittedVersionAt(ctx context.Context, key []byte, ts uint64) (bool, error) {

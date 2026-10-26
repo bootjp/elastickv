@@ -43,12 +43,56 @@ func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (op
 	return operationRecord{}, errors.WithStack(ErrOperationGeneration)
 }
 
-// AdvanceGeneration cannot proceed until an authoritative transaction-decision
-// resolver proves the previous attempt aborted. The journal does not yet
-// persist the underlying transaction identity, so it must fail closed rather
-// than infer abort from an absent result row or an OCC conflict.
-func (j *OperationJournal) AdvanceGeneration(_ context.Context, _ OperationID, _ [16]byte) (operationRecord, error) {
+// AdvanceGeneration fences an old attempt by committing a new version of its
+// transaction primary. A delayed old publication either committed that primary
+// first (making this CAS fail) or must fail its read-set validation against the
+// new version. Legacy rows without the primary guarantee remain unresolved.
+func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID, old [16]byte) (operationRecord, error) {
+	if old == [16]byte{} {
+		return operationRecord{}, errors.WithStack(ErrInvalid)
+	}
+	for range operationCASRetries {
+		record, err := j.advanceGenerationOnce(ctx, id, old)
+		if !IsWriteConflict(err) {
+			return record, err
+		}
+	}
 	return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+}
+
+func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id OperationID, old [16]byte) (operationRecord, error) {
+	ts, record, session, err := j.pendingSnapshot(ctx, id)
+	if err != nil {
+		return operationRecord{}, err
+	}
+	if slices.Contains(record.FencedAttempts, old) {
+		return record, nil
+	}
+	record, err = prepareGenerationFence(record, old)
+	if err != nil {
+		return operationRecord{}, err
+	}
+	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
+		return operationRecord{}, err
+	}
+	return record, nil
+}
+
+func prepareGenerationFence(record operationRecord, old [16]byte) (operationRecord, error) {
+	if !record.RecordIsPrimary || record.AttemptID != old {
+		return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
+	if record.Generation == ^uint64(0) || len(record.FencedAttempts) >= maxOperationFencedAttempts {
+		return operationRecord{}, errors.WithStack(ErrOperationGeneration)
+	}
+	next, err := randomOperationToken()
+	if err != nil {
+		return operationRecord{}, err
+	}
+	record.FencedAttempts = append(record.FencedAttempts, old)
+	record.AttemptID = next
+	record.Generation++
+	return record, nil
 }
 
 type operationAttemptPlan struct {
@@ -98,10 +142,7 @@ func classifyAttemptOutcome(id OperationID, attempt [16]byte, record operationRe
 		return AttemptUnknown, record, err
 	}
 	if record.AttemptID != attempt {
-		// A newer generation is not an abort certificate for an older
-		// transaction. In particular, its primary decision may have
-		// committed before the operation row became visible here.
-		return AttemptUnknown, record, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+		return classifyPriorAttempt(attempt, record)
 	}
 	if record.State == OperationCommitted && err == nil {
 		return AttemptCommitted, record, nil
@@ -110,6 +151,15 @@ func classifyAttemptOutcome(id OperationID, attempt [16]byte, record operationRe
 		return AttemptAborted, record, nil
 	}
 	return AttemptUnknown, record, err
+}
+
+func classifyPriorAttempt(attempt [16]byte, record operationRecord) (AttemptOutcome, operationRecord, error) {
+	if record.RecordIsPrimary && slices.Contains(record.FencedAttempts, attempt) {
+		return AttemptAborted, record, nil
+	}
+	// A different attempt ID without a durable primary fence is not an abort
+	// certificate for an older transaction.
+	return AttemptUnknown, record, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 }
 
 // Publish commits the result record and every effect under the recorded

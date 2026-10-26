@@ -188,7 +188,7 @@ func TestShardedCoordinatorStrictCrossShardTxnConfirmsEveryEffect(t *testing.T) 
 	shardStore := NewShardStore(router, groups)
 	coord := NewShardedCoordinator(router, groups, 1, NewHLC(), shardStore)
 	resp, err := coord.Dispatch(ctx, &OperationGroup[OP]{
-		IsTxn: true, RequireAllParticipants: true,
+		IsTxn: true, RequireAllParticipants: true, PrimaryKey: []byte("x"),
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("b"), Value: []byte("record")},
 			{Op: Put, Key: []byte("x"), Value: []byte("effect")},

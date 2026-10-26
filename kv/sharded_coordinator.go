@@ -1202,6 +1202,7 @@ func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, 
 			reqs.KeyVizLabel,
 			callerSuppliedStartTS,
 			reqs.RequireAllParticipants,
+			reqs.PrimaryKey,
 		)
 		if err == nil {
 			return resp, nil
@@ -1760,17 +1761,18 @@ func (c *ShardedCoordinator) dispatchTxn(
 	observedRouteVersion uint64,
 	label keyviz.Label,
 	callerSuppliedStartTS bool,
-	requireAllParticipants ...bool,
+	requireAllParticipants bool,
+	selectedPrimary []byte,
 ) (*CoordinateResponse, error) {
 	if len(readKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	grouped, gids, err := c.groupTxnMutations(elems, label, observedRouteVersion, requireAllParticipantsFlag(requireAllParticipants))
+	grouped, gids, err := c.groupTxnMutations(elems, label, observedRouteVersion, requireAllParticipants)
 	if err != nil {
 		return nil, err
 	}
 	bypassKeysByGroup := c.writeFenceBypassKeysByGroup(elems)
-	primaryKey := primaryKeyForElems(elems)
+	primaryKey := transactionPrimaryKey(elems, selectedPrimary)
 	if len(primaryKey) == 0 {
 		return nil, errors.WithStack(ErrTxnPrimaryKeyRequired)
 	}
@@ -1798,7 +1800,7 @@ func (c *ShardedCoordinator) dispatchTxn(
 	if err := StampGroupedMutationCommitTS(grouped, commitTS); err != nil {
 		return nil, err
 	}
-	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup, requireAllParticipantsFlag(requireAllParticipants))
+	return c.dispatchMultiShardTxn(ctx, startTS, commitTS, prevCommitTS, primaryKey, grouped, gids, readKeys, observedRouteVersion, bypassKeysByGroup, requireAllParticipants)
 }
 
 func (c *ShardedCoordinator) groupTxnMutations(elems []*Elem[OP], label keyviz.Label, observedRouteVersion uint64, strict bool) (map[uint64][]*pb.Mutation, []uint64, error) {
@@ -3287,6 +3289,21 @@ func validateOperationGroup(reqs *OperationGroup[OP]) error {
 			return ErrInvalidRequest
 		}
 	}
+	if len(reqs.PrimaryKey) != 0 {
+		if !reqs.IsTxn {
+			return ErrInvalidRequest
+		}
+		found := false
+		for _, e := range reqs.Elems {
+			if bytes.Equal(e.Key, reqs.PrimaryKey) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return ErrInvalidRequest
+		}
+	}
 	return nil
 }
 
@@ -3385,6 +3402,11 @@ func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs
 func (c *ShardedCoordinator) txnLogs(ctx context.Context, reqs *OperationGroup[OP]) ([]*pb.Request, error) {
 	// NOTE: ShardedCoordinator implements distributed transactions directly in
 	// Dispatch. txnLogs is retained for compatibility and single-shard helpers.
+	if len(reqs.PrimaryKey) != 0 {
+		// This legacy builder selects a primary independently per group.
+		// Never silently discard an explicit transaction primary.
+		return nil, errors.WithStack(ErrInvalidRequest)
+	}
 	grouped, gids, err := c.groupMutations(reqs.Elems, reqs.KeyVizLabel)
 	if err != nil {
 		return nil, err

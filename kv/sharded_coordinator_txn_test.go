@@ -621,6 +621,56 @@ func TestShardedCoordinatorDispatchTxn_CrossShardPhasesAndCommitIndex(t *testing
 	require.Zero(t, binary.BigEndian.Uint64(value2[4:12]))
 }
 
+func TestShardedCoordinatorDispatchTxn_SelectedPrimaryCommitsFirst(t *testing.T) {
+	t.Parallel()
+	engine := distribution.NewEngine()
+	applyComposed1Snapshot(t, engine, 1, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	})
+	g1Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 1}, {CommitIndex: 2}}}
+	g2Txn := &recordingTransactional{responses: []*TransactionResponse{{CommitIndex: 3}, {CommitIndex: 4}}}
+	var orderMu sync.Mutex
+	var commitOrder []string
+	for group, txn := range map[string]*recordingTransactional{"a": g1Txn, "z": g2Txn} {
+		txn.onCommit = func(_ int, request *pb.Request) {
+			if request.Phase == pb.Phase_COMMIT {
+				orderMu.Lock()
+				commitOrder = append(commitOrder, group)
+				orderMu.Unlock()
+			}
+		}
+	}
+	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
+		1: {Txn: g1Txn},
+		2: {Txn: g2Txn},
+	}, 1, NewHLC(), nil)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true, StartTS: 10, PrimaryKey: []byte("z"), RequireAllParticipants: true,
+		ObservedRouteVersion: EncodeObservedRouteVersion(engine.Version()),
+		Elems:                []*Elem[OP]{{Op: Put, Key: []byte("a")}, {Op: Put, Key: []byte("z")}},
+	})
+	require.NoError(t, err)
+	require.Equal(t, []string{"z", "a"}, commitOrder)
+	require.Equal(t, pb.Phase_COMMIT, g2Txn.requests[1].Phase)
+	require.Equal(t, pb.Phase_COMMIT, g1Txn.requests[1].Phase)
+	for _, requests := range [][]*pb.Request{g1Txn.requests, g2Txn.requests} {
+		for _, request := range requests {
+			require.Equal(t, []byte("z"), requestTxnMeta(t, request).PrimaryKey)
+		}
+	}
+}
+
+func TestShardedCoordinatorRejectsUnwrittenSelectedPrimary(t *testing.T) {
+	t.Parallel()
+	coord := NewShardedCoordinator(nil, nil, 1, NewHLC(), nil)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true, PrimaryKey: []byte("missing"),
+		Elems: []*Elem[OP]{{Op: Put, Key: []byte("a")}},
+	})
+	require.ErrorIs(t, err, ErrInvalidRequest)
+}
+
 func TestShardedCoordinatorDispatchTxn_PhaseDRejectsInvalidCallerStartTSBeforeProposal(t *testing.T) {
 	t.Parallel()
 	coord, g1Txn, g2Txn, alloc := newPhaseDCrossShardCoordinator(t, ErrTSOTimestampInvalid)

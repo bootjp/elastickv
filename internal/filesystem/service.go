@@ -2803,10 +2803,22 @@ func (s *Service) dispatchTxnWithPolicy(
 	readKeys [][]byte,
 	requireAllParticipants bool,
 ) (*kv.CoordinateResponse, error) {
+	return s.dispatchTxnWithPrimaryPolicy(ctx, startTS, elems, readKeys, requireAllParticipants, nil)
+}
+
+func (s *Service) dispatchTxnWithPrimaryPolicy(
+	ctx context.Context,
+	startTS uint64,
+	elems []*kv.Elem[kv.OP],
+	readKeys [][]byte,
+	requireAllParticipants bool,
+	primary []byte,
+) (*kv.CoordinateResponse, error) {
 	startTS = normalizeEmptyStoreReadTS(startTS)
 	reqs := &kv.OperationGroup[kv.OP]{
 		Elems:                  elems,
 		IsTxn:                  true,
+		PrimaryKey:             primary,
 		RequireAllParticipants: requireAllParticipants,
 		StartTS:                startTS,
 		ReadKeys:               readKeys,

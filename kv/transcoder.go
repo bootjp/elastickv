@@ -74,6 +74,10 @@ type Elem[T OP] struct {
 type OperationGroup[T OP] struct {
 	Elems []*Elem[T]
 	IsTxn bool
+	// PrimaryKey optionally selects a written key as the transaction's
+	// primary. Empty preserves the lexicographically smallest-key default.
+	// Callers that use it must keep the same key across every attempt.
+	PrimaryKey []byte
 	// RequireAllParticipants makes a committed primary insufficient for a
 	// successful response: every secondary must acknowledge apply. Used by
 	// operation-result publication, whose success includes visible effects.
