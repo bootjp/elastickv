@@ -458,6 +458,8 @@ before applying them.
 The pinned etcd WAL calls sync for a Ready containing entries.
 The Pebble FSM apply path defaults to `pebble.Sync`; its optional no-sync mode
 depends on replay from the synced Raft WAL.
+The local Pebble close/reopen test recovers a committed write and its receipt.
+It does not exercise a Raft process or node crash.
 This code audit supports the receipt approach but does not close the M4 gate.
 Crash tests must cover failure between WAL persistence, FSM apply, proof
 visibility, FUSE reply, and the next fsync for every participant group.
