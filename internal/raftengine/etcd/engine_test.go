@@ -2489,6 +2489,28 @@ func TestErrNotLeaderMatchesRaftEngineSentinel(t *testing.T) {
 	require.True(t, errors.Is(errors.WithStack(errLeadershipTransferConfChangePending), raftengine.ErrLeadershipTransferConfChangePending))
 }
 
+func TestLeaderLossLeavesPendingProposalOutcomeUnknown(t *testing.T) {
+	t.Parallel()
+	storage := etcdraft.NewMemoryStorage()
+	req := proposalRequest{id: 1, done: make(chan proposalResult, 1)}
+	engine := &Engine{
+		nodeID:           1,
+		rawNode:          mustRawNode(t, storage, 1),
+		storage:          storage,
+		status:           raftengine.Status{State: raftengine.StateLeader},
+		pendingProposals: map[uint64]proposalRequest{req.id: req},
+		pendingReads:     map[uint64]readRequest{},
+		pendingConfigs:   map[uint64]adminRequest{},
+	}
+	// The RawNode is a follower while the published status is still leader.
+	// refreshStatus must treat the waiting proposal as possibly appended.
+	engine.refreshStatus()
+	result := <-req.done
+	require.ErrorIs(t, result.err, raftengine.ErrLeadershipLost)
+	require.NotErrorIs(t, result.err, raftengine.ErrNotLeader)
+	require.Empty(t, engine.pendingProposals)
+}
+
 // TestSelectDispatchLane_LegacyThreeLane verifies that, when the opt-in
 // multi-lane dispatcher is disabled (default), priority control traffic uses
 // the heartbeat lane, heartbeat responses use their coalescing response lane,

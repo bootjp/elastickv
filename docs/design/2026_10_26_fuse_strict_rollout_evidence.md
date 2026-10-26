@@ -53,6 +53,9 @@ acceptance requirements.
 All 23 jobs in [run 40320716183](https://github.com/bootjp/elastickv/actions/runs/40320716183)
 passed at commit `a33dad1821631f8f43a6578aa3125712161108d5`, including the
 mounted crash test, SQLite and filesystem workloads, and both benchmark jobs.
+All 23 jobs also passed in
+[run 40322309957](https://github.com/bootjp/elastickv/actions/runs/40322309957)
+at commit `daebcb77fb4715f51c6a006870ebaa9fc5ec29a7`.
 
 ## Performance evidence
 
