@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 )
 
@@ -85,6 +86,59 @@ type journalLifecycleCore struct {
 	createID  filesystem.OperationID
 	openID    filesystem.OperationID
 	releaseID filesystem.OperationID
+}
+
+type journalLeaseCore struct {
+	*receiptCore
+	leaseIDs []filesystem.OperationID
+	leaseErr error
+}
+
+func (c *journalLeaseCore) RefreshOpenHandleLeaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {
+	c.leaseIDs = append(c.leaseIDs, id)
+	return c.leaseErr
+}
+
+func TestAdapterJournaledLeaseRefreshPrecedesFsync(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledLeaseRefresh(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Read(t.Context(), 7, 9, 0, 1)
+	require.Zero(t, errno)
+	require.Zero(t, adapter.Fsync(t.Context(), 7, 9, false))
+	require.ElementsMatch(t, core.leaseIDs, core.verified)
+	require.Len(t, core.leaseIDs, 2)
+	require.True(t, core.fsyncCalled)
+}
+
+func TestAdapterUnknownLeaseRefreshStopsLaterFsync(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}, leaseErr: kv.ErrTransactionOutcomeUnknown}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledLeaseRefresh(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Read(t.Context(), 7, 9, 0, 1)
+	require.Equal(t, syscall.EIO, errno)
+	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	require.False(t, core.fsyncCalled)
+}
+
+func TestAdapterKeepaliveUsesJournaledLeaseRefresh(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledLeaseRefresh(session))
+	t.Cleanup(adapter.Close)
+	adapter.trackOpenHandle(7, 9)
+	adapter.refreshTrackedOpenHandles(t.Context())
+	require.Len(t, core.leaseIDs, 1)
+	require.Zero(t, adapter.Fsync(t.Context(), 7, 9, false))
+	require.ElementsMatch(t, core.leaseIDs, core.verified)
 }
 
 func (c *journalLifecycleCore) CreateWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte, _ filesystem.CreateOptions) (filesystem.CreateResult, error) {

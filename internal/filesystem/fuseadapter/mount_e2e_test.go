@@ -457,6 +457,31 @@ func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
 	}
 }
 
+func TestKernelMountJournaledLeaseRefreshAndFsync(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-lease")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-lease", mountPoint,
+		fuseadapter.WithJournaledLeaseRefresh(session))
+	file, err := os.Create(filepath.Join(mountPoint, "file"))
+	require.NoError(t, err)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	record, err := journal.Resolve(t.Context(), filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, filesystem.OperationCommitted, record.State)
+}
+
 func TestKernelMountJournaledMetadataChange(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)

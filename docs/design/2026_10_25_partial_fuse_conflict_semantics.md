@@ -443,18 +443,17 @@ filesystem service operations within bounds, tracks local FUSE predecessors,
 and tests mounted SQLite PERSIST/DELETE workloads.
 This branch adds a transaction-primary generation fence and optional
 journal-backed paths for fixed-offset FUSE writes, setattr including size changes,
-create/mknod, mkdir, open, release, file unlink, empty-directory removal, and
-same-directory rename.
+create/mknod, mkdir, open, release, lease renewal, file unlink,
+empty-directory removal, and same-directory rename.
 The adapter retains their successful operation IDs per inode.
 Its flush and fsync paths resolve those IDs and check participant proofs.
 Directory fsync checks create, mkdir, removal and rename receipts recorded for
 that parent. File fsync also checks create, open and release receipts for its
 inode when those optional paths are selected.
 The default mount path still uses the legacy mutations.
-Lease maintenance still uses the legacy path; a typed backend planner exists
-but is not yet connected to the adapter's foreground and background renewal
-paths. Its predecessor ordering and journal retention need completion before
-it can be selected for strict mode.
+The optional lease renewal path serializes foreground and background refreshes
+with other inode mutations and blocks later fsync after an unknown renewal.
+Its retained records still need safe acknowledgement and garbage collection.
 `Service.Fsync` still uses an attribute read after the adapter checks the
 receipts for its supported journaled operations.
 The optional receipt tracker is local to one mount and retains only successful

@@ -57,6 +57,7 @@ type Adapter struct {
 	journaledMkdir    bool
 	journaledOpen     bool
 	journaledRelease  bool
+	journaledLease    bool
 	operationSequence atomic.Uint64
 	receiptMu         sync.Mutex
 	receipts          map[uint64]map[filesystem.OperationID]struct{}
@@ -192,6 +193,14 @@ func WithJournaledRelease(session filesystem.OperationSessionID) Option {
 	}
 }
 
+// WithJournaledLeaseRefresh journals foreground and keepalive lease renewals.
+func WithJournaledLeaseRefresh(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledLease = true
+	}
+}
+
 func (a *Adapter) setOperationSession(session filesystem.OperationSessionID) {
 	if a.operationSession != (filesystem.OperationSessionID{}) && a.operationSession != session {
 		a.sessionConflict = true
@@ -321,7 +330,7 @@ func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno
 }
 
 func (a *Adapter) Read(ctx context.Context, inode uint64, fh uint64, offset uint64, size uint64) ([]byte, syscall.Errno) {
-	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh, false); errno != 0 {
 		return nil, errno
 	}
 	data, err := a.core.Read(ctx, inode, fh, offset, size)
@@ -335,7 +344,7 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 	}
 	var writeErr error
 	defer func() { a.mutations.end(ticket, errors.Is(writeErr, kv.ErrTransactionOutcomeUnknown)) }()
-	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh, true); errno != 0 {
 		return 0, errno
 	}
 	if len(data) == 0 {
@@ -366,7 +375,7 @@ func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Er
 	if errno := a.mutations.wait(ctx, inode); errno != 0 {
 		return errno
 	}
-	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh, false); errno != 0 {
 		return errno
 	}
 	if _, errno := a.verifyReceipts(ctx, inode); errno != 0 {
@@ -379,7 +388,7 @@ func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync b
 	if errno := a.mutations.wait(ctx, inode); errno != 0 {
 		return errno
 	}
-	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
+	if errno := a.refreshOpenHandleLease(ctx, inode, fh, false); errno != 0 {
 		return errno
 	}
 	receipts, errno := a.verifyReceipts(ctx, inode)
@@ -625,7 +634,44 @@ func (a *Adapter) StatFS(ctx context.Context, inode uint64) (filesystem.StatFS, 
 	return stat, Errno(err)
 }
 
-func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
+func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh uint64, alreadyTracked bool) syscall.Errno {
+	if !a.journaledLease {
+		return a.refreshLegacyLease(ctx, inode, fh)
+	}
+	var err error
+	if !alreadyTracked {
+		ticket, errno := a.mutations.begin(ctx, inode)
+		if errno != 0 {
+			return errno
+		}
+		defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+	}
+	err = a.refreshJournaledLease(ctx, inode, fh)
+	if alreadyTracked && errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		a.mutations.markUnknown(inode)
+	}
+	if err != nil && Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE lease refresh failed", "inode", inode, "fh", fh, "error", err.Error())
+	}
+	return Errno(err)
+}
+
+func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh uint64) error {
+	refresher, ok := a.core.(interface {
+		RefreshOpenHandleLeaseWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) error
+	})
+	if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+		return filesystem.ErrUnsupported
+	}
+	id := a.nextOperationID()
+	err := refresher.RefreshOpenHandleLeaseWithOperation(ctx, id, inode, fh, a.clientID)
+	if err == nil {
+		a.recordReceipt(inode, id)
+	}
+	return errors.Wrap(err, "refresh journaled open handle lease")
+}
+
+func (a *Adapter) refreshLegacyLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
 	err := a.core.RefreshOpenHandleLease(ctx, inode, fh, a.clientID)
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE lease refresh failed", "inode", inode, "fh", fh, "error", err.Error())
@@ -683,11 +729,11 @@ func (a *Adapter) keepOpenHandlesAlive(ctx context.Context) {
 func (a *Adapter) refreshTrackedOpenHandles(ctx context.Context) {
 	for _, handle := range a.openHandleSnapshot() {
 		handleCtx, cancel := context.WithTimeout(ctx, a.keepaliveTimeout)
-		err := a.core.RefreshOpenHandleLease(handleCtx, handle.inode, handle.fh, a.clientID)
+		errno := a.refreshOpenHandleLease(handleCtx, handle.inode, handle.fh, false)
 		cancel()
 		switch {
-		case err == nil:
-		case errors.Is(err, filesystem.ErrNotFound):
+		case errno == 0:
+		case errno == syscall.ENOENT:
 			a.untrackOpenHandle(handle.inode, handle.fh)
 		case ctx.Err() != nil:
 			return
@@ -695,7 +741,7 @@ func (a *Adapter) refreshTrackedOpenHandles(ctx context.Context) {
 			slog.WarnContext(ctx, "filesystem open handle lease refresh failed",
 				"inode", handle.inode,
 				"fh", handle.fh,
-				"err", err,
+				"errno", errno,
 			)
 		}
 	}
