@@ -47,8 +47,12 @@ type Adapter struct {
 	mutations         mutationTracker
 	clientID          []byte
 	operationSession  filesystem.OperationSessionID
+	sessionConflict   bool
 	journaledWrites   bool
+	journaledMetadata bool
 	operationSequence atomic.Uint64
+	receiptMu         sync.Mutex
+	receipts          map[uint64]map[filesystem.OperationID]struct{}
 	readdirLimit      int
 	keepaliveInterval time.Duration
 	keepaliveTimeout  time.Duration
@@ -112,9 +116,26 @@ func WithHandleKeepaliveTimeout(timeout time.Duration) Option {
 // write request. The caller must register the session before mounting.
 func WithJournaledWrites(session filesystem.OperationSessionID) Option {
 	return func(a *Adapter) {
-		a.operationSession = session
+		a.setOperationSession(session)
 		a.journaledWrites = true
 	}
+}
+
+// WithJournaledMetadata journals setattr requests that do not change size.
+// Size changes need a separate chunk-deletion planner.
+func WithJournaledMetadata(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledMetadata = true
+	}
+}
+
+func (a *Adapter) setOperationSession(session filesystem.OperationSessionID) {
+	if a.operationSession != (filesystem.OperationSessionID{}) && a.operationSession != session {
+		a.sessionConflict = true
+		return
+	}
+	a.operationSession = session
 }
 
 func New(core Core, clientID []byte, opts ...Option) *Adapter {
@@ -188,8 +209,27 @@ func (a *Adapter) SetAttr(
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	stat, err = a.core.SetAttr(ctx, inode, mask, attrs)
+	if a.journaledMetadata && !mask.Size {
+		setter, ok := a.core.(interface {
+			SetAttrWithOperation(context.Context, filesystem.OperationID, uint64, filesystem.SetAttrMask, filesystem.SetAttr) (filesystem.Stat, error)
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return filesystem.Stat{}, syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		stat, err = setter.SetAttrWithOperation(ctx, id, inode, mask, attrs)
+		if err == nil {
+			a.recordReceipt(inode, id)
+		}
+	} else {
+		stat, err = a.core.SetAttr(ctx, inode, mask, attrs)
+	}
 	return stat, Errno(err)
+}
+
+func (a *Adapter) nextOperationID() filesystem.OperationID {
+	return filesystem.OperationID{Filesystem: a.operationSession.Filesystem, Session: a.operationSession.Session,
+		Sequence: a.operationSequence.Add(1)}
 }
 
 func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
@@ -227,12 +267,14 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 		writer, ok := a.core.(interface {
 			WriteWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) (int, error)
 		})
-		if !ok || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
 			return 0, syscall.EOPNOTSUPP
 		}
-		id := filesystem.OperationID{Filesystem: a.operationSession.Filesystem, Session: a.operationSession.Session,
-			Sequence: a.operationSequence.Add(1)}
+		id := a.nextOperationID()
 		n, writeErr = writer.WriteWithOperation(ctx, id, inode, offset, data)
+		if writeErr == nil {
+			a.recordReceipt(inode, id)
+		}
 	} else {
 		n, writeErr = a.core.Write(ctx, inode, fh, offset, data)
 	}
@@ -249,6 +291,9 @@ func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Er
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return errno
 	}
+	if _, errno := a.verifyReceipts(ctx, inode); errno != 0 {
+		return errno
+	}
 	return Errno(a.core.Flush(ctx, inode, fh))
 }
 
@@ -259,7 +304,15 @@ func (a *Adapter) Fsync(ctx context.Context, inode uint64, fh uint64, datasync b
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return errno
 	}
-	return Errno(a.core.Fsync(ctx, inode, fh, datasync))
+	receipts, errno := a.verifyReceipts(ctx, inode)
+	if errno != 0 {
+		return errno
+	}
+	if errno := Errno(a.core.Fsync(ctx, inode, fh, datasync)); errno != 0 {
+		return errno
+	}
+	a.clearReceipts(inode, receipts)
+	return 0
 }
 
 func (a *Adapter) FsyncDirectory(ctx context.Context, inode uint64) syscall.Errno {

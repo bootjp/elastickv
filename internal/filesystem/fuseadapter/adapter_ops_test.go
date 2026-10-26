@@ -64,6 +64,92 @@ func (c *journalWriteCore) WriteWithOperation(_ context.Context, id filesystem.O
 	return len(data), nil
 }
 
+type journalMetadataCore struct {
+	*journalWriteCore
+	metadataIDs []filesystem.OperationID
+}
+
+type receiptCore struct {
+	*journalMetadataCore
+	verified  []filesystem.OperationID
+	verifyErr error
+}
+
+func (c *receiptCore) VerifyOperationReceipt(_ context.Context, id filesystem.OperationID) error {
+	c.verified = append(c.verified, id)
+	return c.verifyErr
+}
+
+func TestAdapterFsyncVerifiesJournalReceipts(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0),
+		WithJournaledWrites(session), WithJournaledMetadata(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
+	require.Zero(t, errno)
+	_, errno = adapter.SetAttr(t.Context(), 7, filesystem.SetAttrMask{Mode: true}, filesystem.SetAttr{Mode: 0o600})
+	require.Zero(t, errno)
+	require.Zero(t, adapter.Fsync(t.Context(), 7, 9, false))
+	require.ElementsMatch(t, []filesystem.OperationID{core.ids[0], core.metadataIDs[0]}, core.verified)
+	require.True(t, core.fsyncCalled)
+	core.verified = nil
+	require.Zero(t, adapter.Fsync(t.Context(), 7, 9, false))
+	require.Empty(t, core.verified)
+}
+
+func TestAdapterFsyncFailsClosedOnUnverifiedReceipt(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}, verifyErr: filesystem.ErrOperationPending}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledWrites(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
+	require.Zero(t, errno)
+	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	require.False(t, core.fsyncCalled)
+	require.Equal(t, syscall.EIO, adapter.Flush(t.Context(), 7, 9))
+	require.False(t, core.flushCalled)
+}
+
+func (c *journalMetadataCore) SetAttrWithOperation(_ context.Context, id filesystem.OperationID, inode uint64, _ filesystem.SetAttrMask, _ filesystem.SetAttr) (filesystem.Stat, error) {
+	c.metadataIDs = append(c.metadataIDs, id)
+	return filesystem.Stat{Inode: inode}, nil
+}
+
+func TestAdapterJournaledMetadataSharesWriteSequence(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalMetadataCore{journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0),
+		WithJournaledWrites(session), WithJournaledMetadata(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.SetAttr(t.Context(), 7, filesystem.SetAttrMask{Mode: true}, filesystem.SetAttr{Mode: 0o600})
+	require.Zero(t, errno)
+	_, errno = adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
+	require.Zero(t, errno)
+	require.EqualValues(t, 1, core.metadataIDs[0].Sequence)
+	require.EqualValues(t, 2, core.ids[0].Sequence)
+	require.Zero(t, core.setAttrInode)
+}
+
+func TestAdapterRejectsDifferentJournalSessions(t *testing.T) {
+	first := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	second := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{3}}
+	core := &journalMetadataCore{journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0),
+		WithJournaledWrites(first), WithJournaledMetadata(second))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
+	require.Equal(t, syscall.EOPNOTSUPP, errno)
+	_, errno = adapter.SetAttr(t.Context(), 7, filesystem.SetAttrMask{Mode: true}, filesystem.SetAttr{Mode: 0o600})
+	require.Equal(t, syscall.EOPNOTSUPP, errno)
+	require.Empty(t, core.ids)
+	require.Empty(t, core.metadataIDs)
+}
+
 func TestAdapterJournaledWritesAllocateStableSessionSequence(t *testing.T) {
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalWriteCore{fakeCore: &fakeCore{}}

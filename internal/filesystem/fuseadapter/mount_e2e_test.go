@@ -404,6 +404,10 @@ func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
 	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-write", mountPoint, fuseadapter.WithJournaledWrites(session))
 	path := filepath.Join(mountPoint, "file")
 	require.NoError(t, os.WriteFile(path, []byte("journaled"), 0o600))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
 	data, err := os.ReadFile(path)
 	require.NoError(t, err)
 	require.Equal(t, []byte("journaled"), data)
@@ -412,4 +416,30 @@ func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, filesystem.OperationCommitted, record.State)
+}
+
+func TestKernelMountJournaledMetadataChange(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-metadata")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-metadata", mountPoint,
+		fuseadapter.WithJournaledMetadata(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("data"), 0o600))
+	require.NoError(t, os.Chmod(path, 0o640))
+	f, err := os.Open(path)
+	require.NoError(t, err)
+	require.NoError(t, f.Sync())
+	require.NoError(t, f.Close())
+	stat, err := os.Stat(path)
+	require.NoError(t, err)
+	require.Equal(t, os.FileMode(0o640), stat.Mode().Perm())
 }
