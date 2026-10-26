@@ -1,6 +1,7 @@
 (ns elastickv.redis-workload-test
   (:require [clojure.test :refer :all]
-            [elastickv.redis-workload :as workload]))
+            [elastickv.redis-workload :as workload]
+            [jepsen.redis.client :as rc]))
 
 (deftest complete-mops-parses-reads
   (let [op     {:type :invoke
@@ -24,4 +25,14 @@
                 [["1"] err])]
     (is (= :info (:type result)))
     (is (= [:exec-array-error :notleader] (:error result)))
+    (is (= (:value op) (:value result)))))
+
+(deftest notleader-reply-after-dispatch-remains-indeterminate
+  (let [op     {:type :invoke :f :txn :value [[:append 6 9]]}
+        raw    (rc/with-exceptions op #{}
+                 (throw (ex-info "NOTLEADER leadership lost" {:prefix :notleader})))
+        result (#'workload/preserve-unknown-leader-outcome raw)]
+    (is (= :fail (:type raw)))
+    (is (= :info (:type result)))
+    (is (= :notleader (:error result)))
     (is (= (:value op) (:value result)))))

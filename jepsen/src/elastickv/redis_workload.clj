@@ -74,6 +74,14 @@
        (mapv (partial redis-append/apply-mop! conn))
        (complete-mops-or-error conn op)))
 
+(defn- preserve-unknown-leader-outcome [result]
+  ;; The upstream Redis client marks NOTLEADER as a definite failure. The
+  ;; reply can also arrive after EXEC committed but before its response was
+  ;; delivered, so a non-idempotent transaction remains indeterminate.
+  (if (and (= :fail (:type result)) (= :notleader (:error result)))
+    (assoc result :type :info)
+    result))
+
 (defrecord ElastickvRedisClient [node->port conn]
   client/Client
   (open! [this test node]
@@ -92,11 +100,12 @@
 
   (invoke! [this test op]
     (let [conn (:conn this)]
-      (rc/with-exceptions op #{}
-        (rc/with-conn conn
-          (if (< 1 (count (:value op)))
-            (apply-multi-op! conn op)
-            (apply-single-op! conn op)))))))
+      (preserve-unknown-leader-outcome
+        (rc/with-exceptions op #{}
+          (rc/with-conn conn
+            (if (< 1 (count (:value op)))
+              (apply-multi-op! conn op)
+              (apply-single-op! conn op))))))))
 
 (defn elastickv-append-workload
   "Append workload that reuses jepsen-io/redis logic but targets elastickv."
