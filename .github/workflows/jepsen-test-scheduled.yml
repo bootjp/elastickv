@@ -135,10 +135,10 @@ jobs:
           exit 1
       - name: Run Redis Jepsen workload against elastickv
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.redis-workload \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.redis-workload \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
@@ -148,20 +148,20 @@ jobs:
             --host 127.0.0.1
       - name: Run Redis ZSet safety Jepsen workload against elastickv
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.redis-zset-safety-workload \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.redis-zset-safety-workload \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --ports 63791,63792,63793 \
             --host 127.0.0.1
       - name: Run DynamoDB Jepsen workload against elastickv
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.dynamodb-workload --local \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.dynamodb-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
@@ -228,10 +228,10 @@ jobs:
           fi
       - name: Run S3 Jepsen workload against elastickv
         working-directory: jepsen
-        timeout-minutes: 10
+        timeout-minutes: 15
         run: |
-          timeout 480 ~/lein run -m elastickv.s3-workload --local \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 720 ~/lein run -m elastickv.s3-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count ${{ inputs.key-count || '16' }} \
@@ -332,7 +332,7 @@ jobs:
         # rename (namespace txn and remove-while-open). Both modes run even if
         # one fails so the summary shows which mode broke.
         # See jepsen/src/elastickv/filesystem_workload.clj.
-        timeout-minutes: 20
+        timeout-minutes: 30
         env:
           FS_REQUESTED_KEYS: ${{ inputs.key-count || '16' }}
           FS_REQUESTED_WRITES: ${{ inputs.max-writes-per-key || '250' }}
@@ -360,8 +360,8 @@ jobs:
             filesystem_budget "$mode" "$FS_REQUESTED_KEYS" "$FS_REQUESTED_WRITES"
             echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
             set +e
-            timeout 480 ~/lein run -m elastickv.filesystem-workload --local \
-              --time-limit ${{ inputs.time-limit || '150' }} \
+            timeout 720 ~/lein run -m elastickv.filesystem-workload --local \
+              --time-limit ${{ inputs.time-limit || '300' }} \
               --rate ${{ inputs.rate || '10' }} \
               --concurrency ${{ inputs.concurrency || '8' }} \
               --key-count "$FS_KEY_COUNT" \
@@ -389,7 +389,7 @@ jobs:
           fi
       - name: Run SQLite Jepsen workload on FUSE
         working-directory: jepsen
-        timeout-minutes: 12
+        timeout-minutes: 20
         run: |
           # Keep the 1024-write budget while bounding the ambiguous writes
           # Knossos must explore for any one SQLite database.
@@ -397,8 +397,8 @@ jobs:
           source ./sqlite_budget.sh
           sqlite_budget 16 64
           echo "SQLite register budget: ${SQLITE_KEY_COUNT} keys, ${SQLITE_MAX_WRITES} writes per key"
-          timeout 600 ~/lein run -m elastickv.sqlite-workload --local \
-            --time-limit ${{ inputs.time-limit || '150' }} \
+          timeout 900 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency 8 --key-count "$SQLITE_KEY_COUNT" --max-writes-per-key "$SQLITE_MAX_WRITES" \
             --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
