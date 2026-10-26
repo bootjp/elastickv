@@ -1,7 +1,9 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -18,6 +20,21 @@ type writeOperationFaultDispatcher struct {
 	loseAck        bool
 	loseRejection  bool
 	rejectConflict bool
+}
+
+type failWritePlanStore struct {
+	store.MVCCStore
+	key  []byte
+	err  error
+	once bool
+}
+
+func (s *failWritePlanStore) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
+	if !s.once && bytes.Equal(key, s.key) {
+		s.once = true
+		return nil, s.err
+	}
+	return s.MVCCStore.GetAt(ctx, key, ts)
 }
 
 func (d *writeOperationFaultDispatcher) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -250,4 +267,45 @@ func TestWriteWithOperationReplansDefinitiveRejectionConflict(t *testing.T) {
 	require.ErrorIs(t, err, ErrNotFound)
 	_, err = svc.WriteWithOperation(ctx, id, 999, 0, []byte("x"))
 	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestWritePlanningFailureCancelsAttemptWithStableResult(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want error
+	}{
+		{name: "quota", err: ErrOperationQuota, want: ErrOperationQuota},
+		{name: "other", err: errors.New("planner failed"), want: ErrWritePlanningFailed},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := context.Background()
+			svc := newTestServiceWithOptions(t, []uint64{2})
+			require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+			file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+			require.NoError(t, err)
+			id := testWriteOperationID(t, svc, 1)
+			journal, err := NewOperationJournal(svc)
+			require.NoError(t, err)
+			intent := encodeWriteOperationIntent(file.Inode, 0, []byte("x"))
+			limit, err := svc.writeOperationEffectLimit(ctx, file.Inode, 0, 1)
+			require.NoError(t, err)
+			_, err = journal.Admit(ctx, id, intent, writeOperationResultBytes, limit)
+			require.NoError(t, err)
+			attempt, err := journal.BeginAttempt(ctx, id)
+			require.NoError(t, err)
+			svc.store = &failWritePlanStore{MVCCStore: svc.store, key: fskeys.InodeKey(file.Inode), err: tc.err}
+			_, err = svc.executeWriteOperation(ctx, journal, id, attempt, file.Inode, 0, 1, []byte("x"), intent)
+			require.ErrorIs(t, err, tc.want)
+			_, err = svc.WriteWithOperation(ctx, id, file.Inode, 0, []byte("x"))
+			require.ErrorIs(t, err, tc.want)
+			record, err := journal.Resolve(ctx, id)
+			require.NoError(t, err)
+			require.Equal(t, OperationCancelled, record.State)
+			require.NoError(t, journal.CloseSession(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}))
+			data, err := svc.Read(ctx, file.Inode, 0, 0, 1)
+			require.NoError(t, err)
+			require.Empty(t, data)
+		})
+	}
 }

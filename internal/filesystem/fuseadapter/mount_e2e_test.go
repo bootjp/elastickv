@@ -71,8 +71,12 @@ func newMemoryServiceForMount(t *testing.T) *filesystem.Service {
 }
 
 func newMemoryServiceForMountWithChunkSize(t *testing.T, chunkSize uint64) *filesystem.Service {
+	return newMemoryServiceForMountWithOptions(t, filesystem.WithChunkSize(chunkSize))
+}
+
+func newMemoryServiceForMountWithOptions(t *testing.T, opts ...filesystem.Option) *filesystem.Service {
 	t.Helper()
-	svc, err := fstest.NewMemoryService(filesystem.WithChunkSize(chunkSize))
+	svc, err := fstest.NewMemoryService(opts...)
 	require.NoError(t, err)
 	info, err := os.Stat(t.TempDir())
 	require.NoError(t, err)
@@ -467,7 +471,8 @@ func TestKernelMountJournaledLeaseRefreshAndFsync(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)
 	}
-	svc := newMemoryServiceForMount(t)
+	svc := newMemoryServiceForMountWithOptions(t, filesystem.WithChunkSize(e2eChunkSize),
+		filesystem.WithOpenHandleLeaseTTL(2*time.Second))
 	journal, err := filesystem.NewOperationJournal(svc)
 	require.NoError(t, err)
 	filesystemID, err := journal.EnsureFilesystem(t.Context())
@@ -479,6 +484,7 @@ func TestKernelMountJournaledLeaseRefreshAndFsync(t *testing.T) {
 		fuseadapter.WithJournaledLeaseRefresh(session))
 	file, err := os.Create(filepath.Join(mountPoint, "file"))
 	require.NoError(t, err)
+	time.Sleep(600 * time.Millisecond)
 	require.NoError(t, file.Sync())
 	require.NoError(t, file.Close())
 	record, err := journal.Resolve(t.Context(), filesystem.OperationID{

@@ -453,12 +453,20 @@ inode when those optional paths are selected.
 The default mount path still uses the legacy mutations.
 The optional lease renewal path serializes foreground and background refreshes
 with other inode mutations and blocks later fsync after an unknown renewal.
+It journals at most one renewal per handle within a quarter of the configured
+lease lifetime, capped at one minute. Other reads validate the current lease
+without extending it. A later renewal verifies the preceding lease receipt
+before removing that receipt from the local fsync set; failed verification
+keeps the older receipt.
 Its retained records still need safe acknowledgement and garbage collection.
 `Service.Fsync` still uses an attribute read after the adapter checks the
 receipts for its supported journaled operations.
 The optional receipt tracker is local to one mount and retains only successful
 operations in memory. Session acknowledgement and journal garbage collection
 are not wired to the kernel's reply boundary.
+Write planning failures before publication cancel their pending attempt with a
+typed result so a duplicate observes the same failure and the session can
+close. An uncertain cancellation remains unknown until resolution.
 In the pinned go-fuse version, `Server.handleRequest` writes the kernel reply
 after the raw filesystem method returns. The raw adapter has no callback for
 that write, so acknowledging when the adapter method returns would retire the

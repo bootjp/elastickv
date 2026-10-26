@@ -1637,6 +1637,30 @@ func (s *Service) RefreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 	return ErrContentionLimit
 }
 
+// OpenHandleLeaseTTL exposes the configured renewal budget to FUSE.
+func (s *Service) OpenHandleLeaseTTL() time.Duration {
+	return s.openLeaseTTL
+}
+
+// ValidateOpenHandleLease checks a handle without extending its lease.
+func (s *Service) ValidateOpenHandleLease(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return err
+	}
+	if _, err := s.inodeAt(ctx, inode, ts); err != nil {
+		return err
+	}
+	lease, exists, err := s.openHandleLeaseAt(ctx, fskeys.RefKey(inode, clientID, fh), ts)
+	if err != nil {
+		return err
+	}
+	if !exists || lease.expired(s.now().UnixNano()) {
+		return errors.WithStack(ErrNotFound)
+	}
+	return nil
+}
+
 func (s *Service) refreshOpenHandleLeaseOnce(ctx context.Context, inode uint64, fh uint64, clientID []byte) error {
 	ts, err := s.readTS(ctx)
 	if err != nil {

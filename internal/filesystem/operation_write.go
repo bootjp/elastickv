@@ -20,9 +20,19 @@ const (
 	writeResultSuccess           = 0
 	writeResultIsDir             = 1
 	writeResultNotFound          = 2
+	writeResultPlanQuota         = 3
+	writeResultPlanContention    = 4
+	writeResultPlanInvalid       = 5
+	writeResultPlanStaleHome     = 6
+	writeResultPlanCancelled     = 7
+	writeResultPlanDeadline      = 8
+	writeResultPlanFailed        = 9
 )
 
-var errWriteCleanupChanged = errors.New("filesystem: write cleanup snapshot changed")
+var (
+	errWriteCleanupChanged = errors.New("filesystem: write cleanup snapshot changed")
+	ErrWritePlanningFailed = errors.New("filesystem: write planning failed")
+)
 
 // WriteWithOperation publishes one fixed-offset write and its original byte
 // count under id. A pending duplicate is resolved without issuing a new write.
@@ -120,7 +130,10 @@ func (s *Service) executeWriteOperation(ctx context.Context, journal *OperationJ
 func (s *Service) publishWriteOperationAttempt(ctx context.Context, journal *OperationJournal, id OperationID, attempt [16]byte, inode, offset, end uint64, data, intent []byte) (int, error) {
 	plan, semanticErr, err := s.planJournalWrite(ctx, journal, id, attempt, inode, offset, end, data, intent)
 	if err != nil {
-		return 0, err
+		if isDefinitiveWriteConflict(err) {
+			return 0, err
+		}
+		return cancelWritePlanningFailure(ctx, journal, id, err)
 	}
 	if semanticErr != nil {
 		return publishWriteRejection(ctx, journal, id, attempt, plan, semanticErr)
@@ -133,6 +146,45 @@ func (s *Service) publishWriteOperationAttempt(ctx context.Context, journal *Ope
 		return resolveWriteAttempt(ctx, journal, id, attempt)
 	}
 	return 0, err
+}
+
+func cancelWritePlanningFailure(ctx context.Context, journal *OperationJournal, id OperationID, planningErr error) (int, error) {
+	result := encodeWriteOperationResult(0, writePlanningFailureStatus(planningErr))
+	cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), writeConflictRetryBudget)
+	defer cancel()
+	for range operationCASRetries {
+		record, err := journal.CancelWithResult(cleanupCtx, id, result)
+		if err == nil {
+			return decodeWriteOperationResult(record)
+		}
+		if !isDefinitiveWriteConflict(err) {
+			break
+		}
+	}
+	record, err := journal.Resolve(cleanupCtx, id)
+	if err == nil {
+		return decodeWriteOperationResult(record)
+	}
+	return 0, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+}
+
+func writePlanningFailureStatus(err error) byte {
+	switch {
+	case errors.Is(err, ErrOperationQuota):
+		return writeResultPlanQuota
+	case errors.Is(err, ErrContentionLimit):
+		return writeResultPlanContention
+	case errors.Is(err, ErrInvalid):
+		return writeResultPlanInvalid
+	case errors.Is(err, ErrStaleHome):
+		return writeResultPlanStaleHome
+	case errors.Is(err, context.Canceled):
+		return writeResultPlanCancelled
+	case errors.Is(err, context.DeadlineExceeded):
+		return writeResultPlanDeadline
+	default:
+		return writeResultPlanFailed
+	}
 }
 
 func encodeWriteOperationIntent(inode, offset uint64, data []byte) []byte {
@@ -156,6 +208,9 @@ func decodeWriteOperationResult(record operationRecord) (int, error) {
 	if len(record.Result) != writeOperationResultBytes {
 		return 0, errors.WithStack(ErrOperationRecordCorrupt)
 	}
+	if record.State == OperationCancelled {
+		return decodeCancelledWriteResult(record.Result[0])
+	}
 	switch record.Result[0] {
 	case writeResultSuccess:
 		if record.State != OperationCommitted {
@@ -174,6 +229,32 @@ func decodeWriteOperationResult(record operationRecord) (int, error) {
 		return 0, errors.WithStack(ErrNotFound)
 	default:
 		return 0, errors.WithStack(ErrOperationRecordCorrupt)
+	}
+}
+
+func decodeCancelledWriteResult(status byte) (int, error) {
+	if status < writeResultPlanQuota || status > writeResultPlanFailed {
+		return 0, errors.WithStack(ErrOperationRecordCorrupt)
+	}
+	return 0, writePlanningFailureError(status)
+}
+
+func writePlanningFailureError(status byte) error {
+	switch status {
+	case writeResultPlanQuota:
+		return errors.WithStack(ErrOperationQuota)
+	case writeResultPlanContention:
+		return errors.WithStack(ErrContentionLimit)
+	case writeResultPlanInvalid:
+		return errors.WithStack(ErrInvalid)
+	case writeResultPlanStaleHome:
+		return errors.WithStack(ErrStaleHome)
+	case writeResultPlanCancelled:
+		return errors.WithStack(context.Canceled)
+	case writeResultPlanDeadline:
+		return errors.WithStack(context.DeadlineExceeded)
+	default:
+		return errors.WithStack(ErrWritePlanningFailed)
 	}
 }
 

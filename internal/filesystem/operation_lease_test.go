@@ -3,10 +3,29 @@ package filesystem
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/stretchr/testify/require"
 )
+
+func TestValidateOpenHandleLeaseDoesNotRenewExpiredHandle(t *testing.T) {
+	ctx := context.Background()
+	now := time.Unix(100, 0)
+	svc := newTestServiceWithOptions(t, []uint64{2, 3},
+		WithClock(func() time.Time { return now }), WithOpenHandleLeaseTTL(time.Second))
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	clientID := []byte("mount")
+	fh, err := svc.Open(ctx, file.Inode, clientID)
+	require.NoError(t, err)
+	require.Equal(t, time.Second, svc.OpenHandleLeaseTTL())
+	require.NoError(t, svc.ValidateOpenHandleLease(ctx, file.Inode, fh, clientID))
+	now = now.Add(2 * time.Second)
+	require.ErrorIs(t, svc.ValidateOpenHandleLease(ctx, file.Inode, fh, clientID), ErrNotFound)
+	require.ErrorIs(t, svc.ValidateOpenHandleLease(ctx, file.Inode, fh+1, clientID), ErrNotFound)
+}
 
 func TestLeaseOperationCannotResurrectReleasedHandle(t *testing.T) {
 	ctx := context.Background()

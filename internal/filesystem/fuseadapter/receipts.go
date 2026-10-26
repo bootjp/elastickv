@@ -2,6 +2,7 @@ package fuseadapter
 
 import (
 	"context"
+	"log/slog"
 	"syscall"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
@@ -21,6 +22,31 @@ func (a *Adapter) recordReceipt(inode uint64, id filesystem.OperationID) {
 		a.receipts[inode] = make(map[filesystem.OperationID]struct{})
 	}
 	a.receipts[inode][id] = struct{}{}
+}
+
+// retainLatestLeaseReceipt drops older lease receipts only after their
+// participant proofs have been checked. Failed checks leave them for fsync.
+func (a *Adapter) retainLatestLeaseReceipt(ctx context.Context, inode, fh uint64, id filesystem.OperationID) {
+	a.leaseReceiptMu.Lock()
+	defer a.leaseReceiptMu.Unlock()
+	key := openHandleKey{inode: inode, fh: fh}
+	if a.leaseReceipts == nil {
+		a.leaseReceipts = make(map[openHandleKey][]filesystem.OperationID)
+	}
+	previous := a.leaseReceipts[key]
+	a.leaseReceipts[key] = append(previous, id)
+	verifier, ok := a.core.(operationReceiptVerifier)
+	if !ok {
+		return
+	}
+	for _, old := range previous {
+		if err := verifier.VerifyOperationReceipt(ctx, old); err != nil {
+			slog.WarnContext(ctx, "filesystem lease receipt verification failed", "inode", inode, "fh", fh, "error", err.Error())
+			return
+		}
+	}
+	a.clearReceipts(inode, previous)
+	a.leaseReceipts[key] = []filesystem.OperationID{id}
 }
 
 func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesystem.OperationID, syscall.Errno) {

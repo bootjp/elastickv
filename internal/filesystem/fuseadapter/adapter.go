@@ -19,6 +19,7 @@ const (
 	defaultHandleKeepaliveInterval  = time.Minute
 	defaultHandleKeepaliveTimeout   = 5 * time.Second
 	disabledHandleKeepaliveInterval = 0
+	leaseRenewalFraction            = 4
 )
 
 // Core is the filesystem backend surface required by the FUSE adapter.
@@ -61,6 +62,8 @@ type Adapter struct {
 	operationSequence atomic.Uint64
 	receiptMu         sync.Mutex
 	receipts          map[uint64]map[filesystem.OperationID]struct{}
+	leaseReceiptMu    sync.Mutex
+	leaseReceipts     map[openHandleKey][]filesystem.OperationID
 	readdirLimit      int
 	keepaliveInterval time.Duration
 	keepaliveTimeout  time.Duration
@@ -68,6 +71,8 @@ type Adapter struct {
 	closeOnce         sync.Once
 	handlesMu         sync.Mutex
 	handles           map[openHandleKey]struct{}
+	leaseRefreshed    map[openHandleKey]time.Time
+	leaseRenewalMu    sync.Mutex
 }
 
 type Option func(*Adapter)
@@ -672,6 +677,14 @@ func (a *Adapter) refreshOpenHandleLease(ctx context.Context, inode uint64, fh u
 }
 
 func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh uint64) error {
+	if verifier, recent := a.recentLeaseVerifier(inode, fh); recent {
+		return errors.Wrap(verifier.ValidateOpenHandleLease(ctx, inode, fh, a.clientID), "validate open handle lease")
+	}
+	a.leaseRenewalMu.Lock()
+	defer a.leaseRenewalMu.Unlock()
+	if verifier, recent := a.recentLeaseVerifier(inode, fh); recent {
+		return errors.Wrap(verifier.ValidateOpenHandleLease(ctx, inode, fh, a.clientID), "validate open handle lease")
+	}
 	refresher, ok := a.core.(interface {
 		RefreshOpenHandleLeaseWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) error
 	})
@@ -682,8 +695,50 @@ func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh ui
 	err := refresher.RefreshOpenHandleLeaseWithOperation(ctx, id, inode, fh, a.clientID)
 	if err == nil {
 		a.recordReceipt(inode, id)
+		a.retainLatestLeaseReceipt(ctx, inode, fh, id)
+		a.markLeaseRefreshed(inode, fh)
 	}
 	return errors.Wrap(err, "refresh journaled open handle lease")
+}
+
+type leaseReadVerifier interface {
+	ValidateOpenHandleLease(context.Context, uint64, uint64, []byte) error
+	OpenHandleLeaseTTL() time.Duration
+}
+
+func (a *Adapter) recentLeaseVerifier(inode, fh uint64) (leaseReadVerifier, bool) {
+	verifier, ok := a.core.(leaseReadVerifier)
+	if !ok {
+		return nil, false
+	}
+	a.handlesMu.Lock()
+	last, known := a.leaseRefreshed[openHandleKey{inode: inode, fh: fh}]
+	a.handlesMu.Unlock()
+	if !known {
+		return nil, false
+	}
+	ttl := verifier.OpenHandleLeaseTTL()
+	if ttl == 0 || time.Since(last) < leaseRefreshWindow(ttl) {
+		return verifier, true
+	}
+	return nil, false
+}
+
+func leaseRefreshWindow(ttl time.Duration) time.Duration {
+	window := min(ttl/leaseRenewalFraction, time.Minute)
+	if window <= 0 {
+		return time.Nanosecond
+	}
+	return window
+}
+
+func (a *Adapter) markLeaseRefreshed(inode, fh uint64) {
+	a.handlesMu.Lock()
+	defer a.handlesMu.Unlock()
+	if a.leaseRefreshed == nil {
+		a.leaseRefreshed = make(map[openHandleKey]time.Time)
+	}
+	a.leaseRefreshed[openHandleKey{inode: inode, fh: fh}] = time.Now()
 }
 
 func (a *Adapter) refreshLegacyLease(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
@@ -704,15 +759,24 @@ func (a *Adapter) trackOpenHandle(inode uint64, fh uint64) {
 		a.handles = make(map[openHandleKey]struct{})
 	}
 	a.handles[openHandleKey{inode: inode, fh: fh}] = struct{}{}
+	if a.leaseRefreshed == nil {
+		a.leaseRefreshed = make(map[openHandleKey]time.Time)
+	}
+	a.leaseRefreshed[openHandleKey{inode: inode, fh: fh}] = time.Now()
 }
 
 func (a *Adapter) untrackOpenHandle(inode uint64, fh uint64) {
 	if fh == 0 {
 		return
 	}
+	key := openHandleKey{inode: inode, fh: fh}
 	a.handlesMu.Lock()
-	defer a.handlesMu.Unlock()
-	delete(a.handles, openHandleKey{inode: inode, fh: fh})
+	delete(a.handles, key)
+	delete(a.leaseRefreshed, key)
+	a.handlesMu.Unlock()
+	a.leaseReceiptMu.Lock()
+	delete(a.leaseReceipts, key)
+	a.leaseReceiptMu.Unlock()
 }
 
 func (a *Adapter) openHandleSnapshot() []openHandleKey {

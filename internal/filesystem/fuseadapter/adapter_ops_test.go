@@ -95,6 +95,51 @@ type journalLeaseCore struct {
 	leaseErr error
 }
 
+type validatingLeaseCore struct {
+	*journalLeaseCore
+	ttl           time.Duration
+	validationErr error
+	validations   int
+}
+
+func (c *validatingLeaseCore) OpenHandleLeaseTTL() time.Duration { return c.ttl }
+
+func (c *validatingLeaseCore) ValidateOpenHandleLease(context.Context, uint64, uint64, []byte) error {
+	c.validations++
+	return c.validationErr
+}
+
+func TestAdapterReadCoalescesJournaledLeaseRefresh(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &validatingLeaseCore{ttl: 5 * time.Minute, journalLeaseCore: &journalLeaseCore{
+		receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+			journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+		}},
+	}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledLeaseRefresh(session))
+	t.Cleanup(adapter.Close)
+	for range 100 {
+		_, errno := adapter.Read(t.Context(), 7, 9, 0, 1)
+		require.Zero(t, errno)
+	}
+	require.Len(t, core.leaseIDs, 1)
+	require.Equal(t, 99, core.validations)
+	adapter.handlesMu.Lock()
+	adapter.leaseRefreshed[openHandleKey{inode: 7, fh: 9}] = time.Now().Add(-2 * time.Minute)
+	adapter.handlesMu.Unlock()
+	_, errno := adapter.Read(t.Context(), 7, 9, 0, 1)
+	require.Zero(t, errno)
+	require.Len(t, core.leaseIDs, 2)
+	require.Equal(t, []filesystem.OperationID{core.leaseIDs[0]}, core.verified)
+	adapter.receiptMu.Lock()
+	require.Len(t, adapter.receipts[7], 1)
+	adapter.receiptMu.Unlock()
+	core.validationErr = filesystem.ErrNotFound
+	_, errno = adapter.Read(t.Context(), 7, 9, 0, 1)
+	require.Equal(t, syscall.ENOENT, errno)
+	require.Len(t, core.leaseIDs, 2)
+}
+
 func (c *journalLeaseCore) RefreshOpenHandleLeaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {
 	c.leaseIDs = append(c.leaseIDs, id)
 	return c.leaseErr

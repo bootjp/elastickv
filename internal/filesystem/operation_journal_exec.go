@@ -376,11 +376,25 @@ func (j *OperationJournal) resolveDuplicateRejection(ctx context.Context, id Ope
 // Cancel must win an OCC transaction against any active publication. A lost
 // cancellation response remains unknown until Resolve observes a terminal row.
 func (j *OperationJournal) Cancel(ctx context.Context, id OperationID) (operationRecord, error) {
+	return j.cancelWithResult(ctx, id, nil)
+}
+
+// CancelWithResult retains a typed failure when planning ended before any
+// publication was dispatched. The result is immutable once cancellation wins.
+func (j *OperationJournal) CancelWithResult(ctx context.Context, id OperationID, result []byte) (operationRecord, error) {
+	return j.cancelWithResult(ctx, id, result)
+}
+
+func (j *OperationJournal) cancelWithResult(ctx context.Context, id OperationID, result []byte) (operationRecord, error) {
 	ts, record, session, err := j.pendingSnapshotAllowClosed(ctx, id, true)
 	if err != nil {
 		return j.resolveWinningCancellation(ctx, id, err)
 	}
+	if uint64(len(result)) > uint64(record.ResultLimit) {
+		return operationRecord{}, errors.WithStack(ErrOperationQuota)
+	}
 	record.State = OperationCancelled
+	record.Result = append([]byte(nil), result...)
 	session.Pending--
 	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
 		return operationRecord{}, err
