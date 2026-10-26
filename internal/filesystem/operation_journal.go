@@ -83,8 +83,6 @@ func (b serviceOperationBackend) commit(ctx context.Context, ts uint64, elems []
 		}
 		primary = elem.Key
 	}
-	b.service.journalCommitMu.Lock()
-	defer b.service.journalCommitMu.Unlock()
 	return b.service.dispatchTxnWithPrimaryAtRoute(ctx, ts, elems, readKeys, true, primary, observed)
 }
 

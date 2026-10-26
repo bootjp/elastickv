@@ -269,7 +269,14 @@ jobs:
               > /tmp/elastickv-fs-n1.log 2>&1 &
             echo $! > /tmp/elastickv-fs.pid
             for _ in {1..90}; do
-              if mountpoint -q /tmp/elastickv-fs/fs-n1; then
+              if ! kill -0 "$(cat /tmp/elastickv-fs.pid)" 2>/dev/null; then
+                echo "Two-group filesystem process exited before readiness" >&2
+                tail -n 200 /tmp/elastickv-fs-n1.log || true
+                exit 1
+              fi
+              if nc -z 127.0.0.1 50051 && nc -z 127.0.0.1 50054 \
+                && mountpoint -q /tmp/elastickv-fs/fs-n1 \
+                && stat /tmp/elastickv-fs/fs-n1 >/dev/null; then
                 echo "Two-group filesystem cluster is up"
                 exit 0
               fi
