@@ -38,4 +38,4 @@ jobs:
       # These unchanged 10,000-iteration tests need a fresh package budget
       # after the serial migration/snapshot acceptance tests have finished.
       - name: Run full-length gRPC consistency sequences
-        run: go test -race ./adapter -run "$GRPC_SEQUENCE_TESTS"
+        run: go test -race -timeout=30m ./adapter -run "$GRPC_SEQUENCE_TESTS"
