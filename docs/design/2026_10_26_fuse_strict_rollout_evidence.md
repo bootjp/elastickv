@@ -41,8 +41,10 @@ the same attempt returns that result without publishing another effect.
 `TestMultiGroupPrimaryDecisionSurvivesProcessKill` runs two independent
 single-voter Raft groups with Pebble stores, kills their shared process after
 the primary COMMIT but before the secondary COMMIT, then reopens both groups.
-The restarted resolver reads the primary decision and commits the prepared
-secondary. The test covers a precise cross-group crash boundary but does not
+The test invokes the restarted resolver's decision step directly; it reads
+the primary decision and commits the prepared secondary. The test does not
+exercise the periodic lock scan. It covers a precise cross-group crash
+boundary but does not
 model a three-voter group or a crash during WAL persistence.
 
 ## Crash and mounted evidence

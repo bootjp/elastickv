@@ -1992,8 +1992,8 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if err != nil {
 		if primaryCommitDefinitelyRejected(err) {
 			// A deterministic apply verdict or pre-append leadership rejection
-			// is a definitive non-commit. Release
-			// prepared intents even if the caller has since cancelled.
+			// is a definitive non-commit. Release prepared intents even if the
+			// caller has since cancelled.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
 			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
 			cancel()
