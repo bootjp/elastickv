@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -91,6 +92,55 @@ func TestOperationJournalTwoGroupCreateOpenWrite(t *testing.T) {
 	assertWriteAfterConcurrentAcknowledgement(t, ctx, journal, svc, createID, id, file.Inode, held)
 	id.Sequence++
 	require.NoError(t, svc.ReleaseWithOperation(ctx, id, file.Inode, fh, []byte("benchmark-mount")))
+	assertJournalCommitsDoNotCollideOnPreparedSession(t, ctx, svc, groups[1], session)
+}
+
+func assertJournalCommitsDoNotCollideOnPreparedSession(t *testing.T, ctx context.Context, svc *Service, group *kv.ShardGroup, session OperationSessionID) {
+	t.Helper()
+	held := &holdPreparedTxn{Transactional: group.Txn, prepared: make(chan struct{}), release: make(chan struct{})}
+	group.Txn = held
+	backend := serviceOperationBackend{service: svc}
+	sessionKey := fskeys.OperationSessionKey(session.Filesystem, session.Session)
+	commit := func(sequence uint64) error {
+		ts, err := backend.Snapshot(ctx)
+		if err != nil {
+			return err
+		}
+		primary := fskeys.OperationKey(session.Filesystem, session.Session, sequence)
+		_, err = backend.Commit(ctx, ts, []*kv.Elem[kv.OP]{
+			{Op: kv.Put, Key: primary, Value: []byte{1}},
+			{Op: kv.Put, Key: sessionKey, Value: []byte{2}},
+		}, [][]byte{primary, sessionKey})
+		return err
+	}
+	first := make(chan error, 1)
+	go func() { first <- commit(100) }()
+	select {
+	case <-held.prepared:
+	case <-time.After(5 * time.Second):
+		t.Fatal("first journal commit did not prepare the session")
+	}
+	second := make(chan error, 1)
+	go func() { second <- commit(101) }()
+	select {
+	case err := <-second:
+		close(held.release)
+		t.Fatalf("second journal commit returned during prepared session lock: %v", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(held.release)
+	select {
+	case err := <-first:
+		require.NoError(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("first journal commit did not finish")
+	}
+	select {
+	case err := <-second:
+		require.NotErrorIs(t, err, kv.ErrTxnLocked)
+	case <-time.After(5 * time.Second):
+		t.Fatal("second journal commit did not finish")
+	}
 }
 
 func assertWriteAfterConcurrentAcknowledgement(t *testing.T, ctx context.Context, journal *OperationJournal, svc *Service, createID, writeID OperationID, inode uint64, held *holdPreparedTxn) {

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"math"
 	"math/big"
+	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -252,16 +253,19 @@ type LeaseReapStats struct {
 }
 
 type Service struct {
-	store        store.MVCCStore
-	dispatch     Dispatcher
-	chunkSize    uint64
-	openLeaseTTL time.Duration
-	capacity     uint64
-	maxFiles     uint64
-	now          func() time.Time
-	allocID      func() (uint64, error)
-	homeSlot     func(uint64) uint64
-	observer     OperationalObserver
+	// Journal commits within one mount share a session row. Keep a later
+	// two-phase prepare from meeting this mount's own prepared session lock.
+	journalCommitMu sync.Mutex
+	store           store.MVCCStore
+	dispatch        Dispatcher
+	chunkSize       uint64
+	openLeaseTTL    time.Duration
+	capacity        uint64
+	maxFiles        uint64
+	now             func() time.Time
+	allocID         func() (uint64, error)
+	homeSlot        func(uint64) uint64
+	observer        OperationalObserver
 }
 
 type Option func(*Service)

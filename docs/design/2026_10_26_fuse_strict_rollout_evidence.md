@@ -53,9 +53,10 @@ The `filesystem-node-crash` job writes and fsyncs a file, fsyncs its parent
 directory, kills one Raft node, checks the surviving mounts, restarts the
 killed node with strict session recovery, and checks the restarted mount.
 This job passed in [run 40319573770](https://github.com/bootjp/elastickv/actions/runs/40319573770).
-The current candidate extends the same job to acknowledged rename, chmod,
-unlink, mkdir/rmdir, and truncate followed by file and directory fsyncs.
-That extension has not yet passed on the current candidate SHA.
+The candidate extends the same job to acknowledged rename, chmod, unlink,
+mkdir/rmdir, and truncate followed by file and directory fsyncs. The expanded
+job passed in [run 40328639750](https://github.com/bootjp/elastickv/actions/runs/40328639750)
+at `48755a5b`.
 
 The test establishes durability after successful fsync through one node
 process crash. It does not inject a crash at each boundary between Raft WAL
@@ -107,6 +108,13 @@ connection refusal on the local Raft listener. The benchmark setup now waits
 for both listeners and a successful mounted `stat`. Neither failed run yields
 a valid two-group performance measurement; the revised setup still needs a
 passing run.
+Run [40328639750](https://github.com/bootjp/elastickv/actions/runs/40328639750)
+reached both listeners and still failed with a typed `txn locked` error during
+the first write. A deterministic two-group Raft test reproduced a second local
+journal commit reaching PREPARE while the first held the mount session lock.
+The same test passed after serializing this service's journal commits. This
+does not serialize separate mounts and does not yet establish a passing
+mounted two-group workload or an acceptable performance cost.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
