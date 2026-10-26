@@ -8,10 +8,19 @@ on:
         required: false
         default: "300"
       long-fuse-run:
-        description: "Run strict FUSE Jepsen workloads for 30 minutes"
+        description: "Run FUSE Jepsen workloads for 30 minutes"
         type: boolean
         required: false
         default: false
+      strict-mode:
+        description: "Use strict FUSE mode for filesystem workloads"
+        type: boolean
+        required: false
+        default: true
+      workloads-json:
+        description: "Optional JSON array of workload names to run"
+        required: false
+        default: ""
       rate:
         description: "Ops/sec per worker"
         required: false
@@ -46,32 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workload:
-          - unit
-          - redis
-          - redis-zset
-          - dynamodb
-          - dynamodb-type-string
-          - dynamodb-type-number
-          - dynamodb-type-binary
-          - dynamodb-type-bool
-          - dynamodb-type-null
-          - dynamodb-type-string-set
-          - dynamodb-type-number-set
-          - dynamodb-type-binary-set
-          - dynamodb-type-list
-          - dynamodb-type-map
-          - s3
-          - filesystem-cross-mount
-          - filesystem-sqlite-check
-          - filesystem-node-crash
-          - filesystem-benchmark
-          - filesystem-benchmark-legacy
-          - filesystem-benchmark-multigroup
-          - filesystem-benchmark-multigroup-legacy
-          - filesystem-overwrite
-          - filesystem-rename
-          - sqlite
+        workload: ${{ fromJSON(inputs.workloads-json || '["unit","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-legacy","filesystem-benchmark-multigroup","filesystem-benchmark-multigroup-legacy","filesystem-overwrite","filesystem-rename","sqlite"]') }}
     env:
       GOCACHE: /tmp/go-build
       WORKLOAD: ${{ matrix.workload }}
@@ -255,7 +239,8 @@ jobs:
           RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
           RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802,127.0.0.1:50053=127.0.0.1:63803"
           STRICT_FLAGS=(--filesystemStrict)
-          if [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' && "${{ inputs.strict-mode }}" == 'false' ]] ||
+             [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then
             STRICT_FLAGS=()
           fi
 
