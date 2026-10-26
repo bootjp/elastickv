@@ -448,6 +448,12 @@ func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, directory.Sync())
 	require.NoError(t, directory.Close())
+	require.Eventually(t, func() bool {
+		_, err := journal.Resolve(t.Context(), filesystem.OperationID{
+			Filesystem: session.Filesystem, Session: session.Session, Sequence: 5,
+		})
+		return err == nil
+	}, 3*time.Second, 10*time.Millisecond)
 	for sequence := uint64(1); sequence <= 5; sequence++ {
 		record, err := journal.Resolve(t.Context(), filesystem.OperationID{
 			Filesystem: session.Filesystem, Session: session.Session, Sequence: sequence,
