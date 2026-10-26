@@ -53,6 +53,9 @@ The `filesystem-node-crash` job writes and fsyncs a file, fsyncs its parent
 directory, kills one Raft node, checks the surviving mounts, restarts the
 killed node with strict session recovery, and checks the restarted mount.
 This job passed in [run 40319573770](https://github.com/bootjp/elastickv/actions/runs/40319573770).
+The current candidate extends the same job to acknowledged rename, chmod,
+unlink, mkdir/rmdir, and truncate followed by file and directory fsyncs.
+That extension has not yet passed on the current candidate SHA.
 
 The test establishes durability after successful fsync through one node
 process crash. It does not inject a crash at each boundary between Raft WAL
@@ -95,7 +98,15 @@ as required by the parent design. The current hot-inode result warrants review
 before choosing that limit.
 The benchmark now records a per-worker throughput fairness ratio for the
 hot-inode case. A separate two-group layout places operation records and file
-effects on different Raft groups; its first CI measurement is pending.
+effects on different Raft groups. Its first run
+[40325784929](https://github.com/bootjp/elastickv/actions/runs/40325784929)
+failed with a `txn locked` FUSE error. A subsequent run
+[40327671052](https://github.com/bootjp/elastickv/actions/runs/40327671052)
+returned EIO while the mount was up but the catalog watcher still reported a
+connection refusal on the local Raft listener. The benchmark setup now waits
+for both listeners and a successful mounted `stat`. Neither failed run yields
+a valid two-group performance measurement; the revised setup still needs a
+passing run.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
