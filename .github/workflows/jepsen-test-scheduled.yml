@@ -59,6 +59,7 @@ jobs:
           - s3
           - filesystem-cross-mount
           - filesystem-sqlite-check
+          - filesystem-node-crash
           - filesystem-overwrite
           - filesystem-rename
           - sqlite
@@ -296,6 +297,16 @@ jobs:
       - name: Verify SQLite rollback journals without client retries
         if: matrix.workload == 'filesystem-sqlite-check'
         run: python3 scripts/test-fuse-sqlite.py /tmp/elastickv-fs/fs-n1 --writes 30
+      - name: Verify strict FUSE fsync after Raft node crash
+        if: matrix.workload == 'filesystem-node-crash'
+        timeout-minutes: 5
+        run: |
+          python3 scripts/test-fuse-node-crash.py \
+            /tmp/elastickv-fs/fs-n1 \
+            /tmp/elastickv-fs/fs-n2 \
+            /tmp/elastickv-fs/fs-n3 \
+            --pid-file /tmp/elastickv-fs.pid \
+            --restart-log /tmp/elastickv-fs-n1-restarted.log
       - name: Run filesystem Jepsen workload against elastickv
         if: matrix.workload == 'filesystem-overwrite' || matrix.workload == 'filesystem-rename'
         working-directory: jepsen
@@ -394,6 +405,7 @@ jobs:
             echo "=== ${node}: full log line count ==="
             wc -l "$log" || true
           done
+          tail -n 200 /tmp/elastickv-fs-n1-restarted.log || true
       - name: Upload filesystem cluster logs on failure
         if: failure() && (startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite')
         uses: actions/upload-artifact@v7
@@ -403,6 +415,7 @@ jobs:
             /tmp/elastickv-fs-n1.log
             /tmp/elastickv-fs-n2.log
             /tmp/elastickv-fs-n3.log
+            /tmp/elastickv-fs-n1-restarted.log
           retention-days: 14
           if-no-files-found: ignore
       - name: Stop demo cluster

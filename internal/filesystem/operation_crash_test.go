@@ -9,15 +9,93 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
 const operationCrashDirectory = "ELASTICKV_OPERATION_CRASH_DIRECTORY"
+const operationFenceCrashDirectory = "ELASTICKV_OPERATION_FENCE_CRASH_DIRECTORY"
 
 type operationCrashEvidence struct {
 	IDs   []OperationID `json:"ids"`
 	Inode uint64        `json:"inode"`
+}
+
+type operationFenceCrashEvidence struct {
+	ID      OperationID `json:"id"`
+	Attempt [16]byte    `json:"attempt"`
+}
+
+func TestJournalGenerationFenceSurvivesProcessKill(t *testing.T) {
+	if dir := os.Getenv(operationFenceCrashDirectory); dir != "" {
+		runOperationFenceCrashHelper(t, dir)
+		return
+	}
+	dir := t.TempDir()
+	cmd := exec.Command(os.Args[0], "-test.run=^TestJournalGenerationFenceSurvivesProcessKill$")
+	cmd.Env = append(os.Environ(), operationFenceCrashDirectory+"="+dir)
+	output, err := cmd.CombinedOutput()
+	var exit *exec.ExitError
+	require.ErrorAs(t, err, &exit, string(output))
+	status, ok := exit.Sys().(syscall.WaitStatus)
+	require.True(t, ok, string(output))
+	require.Equal(t, syscall.SIGKILL, status.Signal(), string(output))
+	raw, err := os.ReadFile(filepath.Join(dir, "fence-evidence.json"))
+	require.NoError(t, err)
+	var evidence operationFenceCrashEvidence
+	require.NoError(t, json.Unmarshal(raw, &evidence))
+
+	st, err := store.NewPebbleStore(filepath.Join(dir, "pebble"))
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	svc, err := NewService(st, &testCoordinator{st: st})
+	require.NoError(t, err)
+	journal, err := NewOperationJournal(svc)
+	require.NoError(t, err)
+	outcome, record, err := journal.ResolveAttempt(t.Context(), evidence.ID, evidence.Attempt)
+	require.NoError(t, err)
+	require.Equal(t, AttemptAborted, outcome)
+	require.Contains(t, record.FencedAttempts, evidence.Attempt)
+	_, err = journal.Publish(t.Context(), evidence.ID, evidence.Attempt, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("old")}},
+	})
+	require.ErrorIs(t, err, ErrOperationGeneration)
+	_, err = st.GetAt(t.Context(), []byte("data"), st.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	_, err = journal.Publish(t.Context(), evidence.ID, record.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("new")}},
+	})
+	require.NoError(t, err)
+	value, err := st.GetAt(t.Context(), []byte("data"), st.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), value)
+}
+
+func runOperationFenceCrashHelper(t *testing.T, dir string) {
+	ctx := context.Background()
+	st, err := store.NewPebbleStore(filepath.Join(dir, "pebble"))
+	require.NoError(t, err)
+	svc, err := NewService(st, &testCoordinator{st: st})
+	require.NoError(t, err)
+	journal, err := NewOperationJournal(svc)
+	require.NoError(t, err)
+	id := testOperationID(t, journal, 1)
+	_, err = journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	raw, err := json.Marshal(operationFenceCrashEvidence{ID: id, Attempt: attempt.AttemptID})
+	require.NoError(t, err)
+	fileOnDisk, err := os.OpenFile(filepath.Join(dir, "fence-evidence.json"), os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	require.NoError(t, err)
+	_, err = fileOnDisk.Write(raw)
+	require.NoError(t, err)
+	require.NoError(t, fileOnDisk.Sync())
+	require.NoError(t, fileOnDisk.Close())
+	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGKILL))
 }
 
 func TestJournalReceiptsSurviveProcessKill(t *testing.T) {
