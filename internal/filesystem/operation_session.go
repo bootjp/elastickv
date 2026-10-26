@@ -85,10 +85,14 @@ func validateOperationSession(session operationSession) error {
 		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session identity")
 	}
 	if !validOperationSessionUsage(session) {
-		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session usage")
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"invalid operation session usage: pending=%d retained_count=%d retained_bytes=%d max_count=%d max_bytes=%d",
+			session.Pending, session.RetainedCount, session.RetainedBytes, session.MaxCount, session.MaxBytes)
 	}
 	if !validOperationAckGaps(session) {
-		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session acknowledgement gaps")
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"invalid operation session acknowledgement gaps: reject_before=%d ack_gaps=%d",
+			session.RejectBefore, len(session.AckGaps))
 	}
 	return nil
 }

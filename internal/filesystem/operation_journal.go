@@ -434,8 +434,11 @@ func (j *OperationJournal) loadSessionAt(ctx context.Context, id OperationSessio
 		return operationSession{}, false, errors.Wrap(err, "read operation session")
 	}
 	session, err := decodeOperationSession(raw)
-	if err != nil || session.ID != id {
-		return operationSession{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session row")
+	if err != nil {
+		return operationSession{}, false, errors.Wrap(err, "decode operation session row")
+	}
+	if session.ID != id {
+		return operationSession{}, false, errors.Wrap(ErrOperationRecordCorrupt, "operation session identity mismatch")
 	}
 	return session, true, nil
 }
