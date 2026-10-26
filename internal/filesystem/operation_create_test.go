@@ -1,12 +1,30 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/stretchr/testify/require"
 )
+
+func TestCreateWithOperationSupportsLongClientID(t *testing.T) {
+	ctx := t.Context()
+	svc := newTestServiceWithOptions(t, []uint64{2, 3})
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	id := testWriteOperationID(t, svc, 1)
+	clientID := bytes.Repeat([]byte("a"), 4096)
+	result, err := svc.CreateWithOperation(ctx, id, RootInode, []byte("file"), CreateOptions{
+		Mode: testFileMode, ClientID: clientID,
+	})
+	require.NoError(t, err)
+	require.NotZero(t, result.FH)
+	require.NoError(t, svc.VerifyOperationReceipt(ctx, id))
+	resolved, err := svc.Resolve(ctx, RootInode, []byte("file"))
+	require.NoError(t, err)
+	require.Equal(t, result.Inode, resolved)
+}
 
 func TestCreateWithOperationRetainsOriginalInodeAndHandle(t *testing.T) {
 	ctx := context.Background()

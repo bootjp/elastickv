@@ -53,11 +53,15 @@ func (s *Service) createNodeWithOperation(ctx context.Context, id OperationID, p
 	if err != nil {
 		return CreateResult{}, errors.Wrap(err, "encode create intent")
 	}
+	effectLimit, err := createEffectLimit(parent, name, opts.ClientID)
+	if err != nil {
+		return CreateResult{}, err
+	}
 	journal, err := NewOperationJournal(s)
 	if err != nil {
 		return CreateResult{}, err
 	}
-	admitted, err := journal.Admit(ctx, id, intent, createOperationResultLimit, createOperationEffectLimit)
+	admitted, err := journal.Admit(ctx, id, intent, createOperationResultLimit, effectLimit)
 	if err != nil {
 		return CreateResult{}, err
 	}
@@ -69,6 +73,18 @@ func (s *Service) createNodeWithOperation(ctx context.Context, id OperationID, p
 		return CreateResult{}, err
 	}
 	return s.executeCreateOperation(ctx, journal, id, attempt, parent, name, typ, opts, intent)
+}
+
+func createEffectLimit(parent uint64, name, clientID []byte) (uint32, error) {
+	keys := [][]byte{
+		fskeys.InodeKey(0), fskeys.HomeKey(0), fskeys.DirEntryKey(parent, name),
+		fskeys.InodeKey(parent), fskeys.DirVersionKey(parent),
+		fskeys.UsageRouteKey(kv.RouteKey(fskeys.InodeKey(0))),
+	}
+	if len(clientID) > 0 {
+		keys = append(keys, fskeys.RefKey(0, clientID, 0))
+	}
+	return operationEffectLimitForKeys(createOperationEffectLimit, keys...)
 }
 
 func (s *Service) executeCreateOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, parent uint64, name []byte, typ FileType, opts CreateOptions, intent []byte) (CreateResult, error) {
