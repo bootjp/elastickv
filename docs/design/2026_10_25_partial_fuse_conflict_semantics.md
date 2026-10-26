@@ -441,13 +441,26 @@ regression tests.
 The merged baseline forwards definitive write conflicts, retries several
 filesystem service operations within bounds, tracks local FUSE predecessors,
 and tests mounted SQLite PERSIST/DELETE workloads.
-This branch adds a transaction-primary generation fence and an optional
-journal-backed path for fixed-offset FUSE writes.
+This branch adds a transaction-primary generation fence and optional
+journal-backed paths for fixed-offset FUSE writes and metadata-only setattr.
+The adapter retains their successful operation IDs per inode.
+Its flush and fsync paths resolve those IDs and check participant proofs.
 The default mount path still uses the legacy mutations.
-Other mutation categories lack journal-backed planners, and `Service.Fsync`
-still uses an attribute read rather than a durable receipt.
-Neither the baseline tests nor the optional write-path test satisfies the
-strict-mode gates below.
+Other mutation categories lack journal-backed planners.
+`Service.Fsync` still uses an attribute read after the adapter checks the
+receipts for its supported journaled operations.
+Directory fsync still has no durable namespace receipt.
+The baseline and optional-path tests do not satisfy the strict-mode gates
+below.
+
+The current Raft path persists Ready entries through `persistReadyToWAL`
+before applying them.
+The pinned etcd WAL calls sync for a Ready containing entries.
+The Pebble FSM apply path defaults to `pebble.Sync`; its optional no-sync mode
+depends on replay from the synced Raft WAL.
+This code audit supports the receipt approach but does not close the M4 gate.
+Crash tests must cover failure between WAL persistence, FSM apply, proof
+visibility, FUSE reply, and the next fsync for every participant group.
 
 Complete the remaining work in dependency order:
 
