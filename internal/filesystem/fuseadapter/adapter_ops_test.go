@@ -85,6 +85,7 @@ type journalLifecycleCore struct {
 	*receiptCore
 	createID  filesystem.OperationID
 	openID    filesystem.OperationID
+	openErr   error
 	releaseID filesystem.OperationID
 }
 
@@ -148,7 +149,20 @@ func (c *journalLifecycleCore) CreateWithOperation(_ context.Context, id filesys
 
 func (c *journalLifecycleCore) OpenWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte) (uint64, error) {
 	c.openID = id
-	return 10, nil
+	return 10, c.openErr
+}
+
+func TestAdapterUnknownOpenStopsLaterFsync(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalLifecycleCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}, openErr: kv.ErrTransactionOutcomeUnknown}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledOpen(session))
+	t.Cleanup(adapter.Close)
+	_, errno := adapter.Open(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno)
+	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
+	require.False(t, core.fsyncCalled)
 }
 
 func (c *journalLifecycleCore) ReleaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {

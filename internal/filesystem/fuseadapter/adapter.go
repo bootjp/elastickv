@@ -304,26 +304,41 @@ func (a *Adapter) nextOperationID() filesystem.OperationID {
 }
 
 func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
-	var fh uint64
-	var err error
 	if a.journaledOpen {
-		opener, ok := a.core.(interface {
-			OpenWithOperation(context.Context, filesystem.OperationID, uint64, []byte) (uint64, error)
-		})
-		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
-			return 0, syscall.EOPNOTSUPP
+		fh, errno := a.openWithOperation(ctx, inode)
+		if errno == 0 {
+			a.trackOpenHandle(inode, fh)
 		}
-		id := a.nextOperationID()
-		fh, err = opener.OpenWithOperation(ctx, id, inode, a.clientID)
-		if err == nil {
-			a.recordReceipt(inode, id)
-		}
-	} else {
-		fh, err = a.core.Open(ctx, inode, a.clientID)
+		return fh, errno
 	}
+	fh, err := a.core.Open(ctx, inode, a.clientID)
 	if err == nil {
 		a.trackOpenHandle(inode, fh)
 	} else if Errno(err) == syscall.EIO {
+		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())
+	}
+	return fh, Errno(err)
+}
+
+func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
+	opener, ok := a.core.(interface {
+		OpenWithOperation(context.Context, filesystem.OperationID, uint64, []byte) (uint64, error)
+	})
+	if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+		return 0, syscall.EOPNOTSUPP
+	}
+	ticket, errno := a.mutations.begin(ctx, inode)
+	if errno != 0 {
+		return 0, errno
+	}
+	var err error
+	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+	id := a.nextOperationID()
+	fh, err := opener.OpenWithOperation(ctx, id, inode, a.clientID)
+	if err == nil {
+		a.recordReceipt(inode, id)
+	}
+	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())
 	}
 	return fh, Errno(err)
