@@ -62,6 +62,7 @@ jobs:
           - filesystem-node-crash
           - filesystem-benchmark
           - filesystem-benchmark-legacy
+          - filesystem-benchmark-multigroup
           - filesystem-overwrite
           - filesystem-rename
           - sqlite
@@ -252,6 +253,32 @@ jobs:
             STRICT_FLAGS=()
           fi
 
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' ]]; then
+            mkdir -p /tmp/elastickv-fs/fs-n1
+            nohup /tmp/elastickv-bin \
+              --address "127.0.0.1:50051" \
+              --redisAddress "" --dynamoAddress "" --s3Address "" --sqsAddress "" \
+              --filesystemMount /tmp/elastickv-fs/fs-n1 \
+              --filesystemStrict \
+              --filesystemRootUID "$(id -u)" \
+              --filesystemRootGID "$(id -g)" \
+              --metricsAddress "" --pprofAddress "" \
+              --raftId n1 --raftDataDir /tmp/elastickv-fs/n1 --raftBootstrap \
+              --raftGroups "1=127.0.0.1:50051,2=127.0.0.1:50054" \
+              --shardRanges ':!fs|op|=1,!fs|op|:=2' \
+              > /tmp/elastickv-fs-n1.log 2>&1 &
+            echo $! > /tmp/elastickv-fs.pid
+            for _ in {1..90}; do
+              if mountpoint -q /tmp/elastickv-fs/fs-n1; then
+                echo "Two-group filesystem cluster is up"
+                exit 0
+              fi
+              sleep 1
+            done
+            tail -n 200 /tmp/elastickv-fs-n1.log || true
+            exit 1
+          fi
+
           : > /tmp/elastickv-fs.pid
           for node in 1 2 3; do
             mkdir -p "/tmp/elastickv-fs/fs-n${node}"
@@ -314,17 +341,19 @@ jobs:
             --pid-file /tmp/elastickv-fs.pid \
             --restart-log /tmp/elastickv-fs-n1-restarted.log
       - name: Measure FUSE write and fsync latency
-        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy'
+        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup'
         timeout-minutes: 10
         run: |
           python3 scripts/test_benchmark_fuse.py
           MODE=strict
           if [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' ]]; then MODE=legacy; fi
+          LAYOUT=single-group
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' ]]; then LAYOUT=two-group; fi
           python3 scripts/benchmark-fuse.py /tmp/elastickv-fs/fs-n1 \
-            --mode "$MODE" --writes 40 --workers 4 --repetitions 3 \
+            --mode "$MODE" --layout "$LAYOUT" --writes 40 --workers 4 --repetitions 3 \
             --output /tmp/elastickv-fuse-benchmark.json
       - name: Upload FUSE benchmark results
-        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy'
+        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup'
         uses: actions/upload-artifact@v7
         with:
           name: elastickv-fuse-benchmark-${{ matrix.workload }}

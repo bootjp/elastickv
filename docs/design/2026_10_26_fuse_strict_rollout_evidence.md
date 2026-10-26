@@ -93,6 +93,9 @@ artifacts for all trials. A rollout
 limit must use repeated matched measurements and explicit maintainer approval,
 as required by the parent design. The current hot-inode result warrants review
 before choosing that limit.
+The benchmark now records a per-worker throughput fairness ratio for the
+hot-inode case. A separate two-group layout places operation records and file
+effects on different Raft groups; its first CI measurement is pending.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and

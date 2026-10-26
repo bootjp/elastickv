@@ -117,7 +117,11 @@ def run_hot(path, workers, writes):
     expected = b"".join(bytes([worker + 1]) * BLOCK for _ in range(writes) for worker in range(workers))
     if path.read_bytes() != expected:
         raise AssertionError("hot inode writes were not retained")
-    return summary(samples, elapsed)
+    result = summary(samples, elapsed)
+    worker_rates = [len(worker_samples) * 1_000_000_000 / sum(worker_samples)
+                    for worker_samples, _ in outcomes]
+    result["worker_fairness_min_to_max"] = round(min(worker_rates) / max(worker_rates), 3)
+    return result
 
 
 def main():
@@ -127,6 +131,7 @@ def main():
     parser.add_argument("--workers", type=int, default=4)
     parser.add_argument("--repetitions", type=int, default=3)
     parser.add_argument("--mode", choices=("strict", "legacy"), required=True)
+    parser.add_argument("--layout", choices=("single-group", "two-group"), required=True)
     parser.add_argument("--output", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if args.writes < 1 or not 1 <= args.workers <= 255 or args.repetitions < 1:
@@ -140,6 +145,7 @@ def main():
         "writes_per_worker": args.writes,
         "workers": args.workers,
         "mode": args.mode,
+        "layout": args.layout,
         "trials": [],
     }
     for trial in range(args.repetitions):
