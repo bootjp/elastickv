@@ -241,21 +241,79 @@ gauges make pending work and retained storage visible during a canary. A
 failed scan is logged; the last gauge value must not be treated as fresh
 evidence after a scan failure.
 
+## Investigation and integration decision
+
+The ACK error is a correctness blocker for strict mode.
+The guard in `reserveAckRetirement` checks a non-retired record after reading
+its session, then rejects a reservation larger than the session's retained
+usage.
+It does not establish that a duplicate ACK caused the mismatch.
+Increasing the quota, clamping the counters, or removing the guard would hide
+the violation without establishing a valid retirement decision.
+
+First, identify the earliest transition that breaks the journal's accounting
+invariants.
+At a transactionally coherent state, the retained count and bytes must equal
+the number and summed reservations of non-retired admitted records, and the
+pending count must equal the number of pending records.
+Account for a committed retirement fence whose record deletion is not yet
+visible on another group before reporting a mismatch.
+Capture the operation ID, session and generation, record and session versions,
+snapshot and commit timestamps, route and group, retirement fence, and the
+transaction decision at the first divergence.
+The diagnostic must observe durable state without repairing or discarding it.
+
+Compare one-group and split-group layouts under concurrent admission,
+generation advance, duplicate ACK, mount restart, and lost replies.
+Pause or crash at PREPARE, the primary decision, and secondary apply to
+distinguish mixed visibility from a lost update or recovery error.
+The journal writes the record and session in one transaction with both keys
+in the read set; a confirmed lost update requires investigation below the
+journal arithmetic, including OCC and cross-group recovery.
+Fix the first proven cause before changing the quota or optimizing ACKs.
+
+Investigate the HLC ceiling failure independently.
+Record lease renewal, leader changes, group headroom, and workload timing.
+Do not relax the timestamp fence to make a workload pass.
+After the ACK fix, verify that cancellation and expired decision contexts do
+not leave pending or retained work that fails to drain after recovery.
+
+Merging an opt-in implementation is separate from approving default-on strict
+mode.
+The runtime default remains disabled, and the strict scheduled Jepsen lane
+continues to expose failures while this investigation proceeds.
+The primary-decision and Raft error changes also affect non-strict
+transactions, so merge review must assess those paths independently of the
+strict rollout gate.
+A merge does not establish that the long-running strict workload or the
+multi-group recovery gate has passed.
+
 ## Remaining rollout gates
 
-1. Exercise lost replies and process or node crashes at every publication and
+1. Reproduce the ACK mismatch, identify its first invalid transition, and
+   verify the smallest correction with one-group and split-group tests.
+   Require zero accounting invariant violations and eventual drain of pending
+   and retained work after recovery.
+2. Exercise lost replies and process or node crashes at every publication and
    barrier boundary, including a multi-group secondary crash and three-voter
    primary and secondary recovery.
-2. Review the full race suite, Linux mount tests, Jepsen histories and
-   checker output for the same candidate SHA. The scheduled workflow archives
-   Jepsen histories for successful as well as failed workload jobs.
-3. Repeat the legacy and strict benchmarks. Record single- and multi-group
-   latency, throughput, conflicts, fairness, and retained journal bytes.
-   Approve numerical canary limits from those measurements.
-4. Run an opt-in canary with a verified backup and observable pending sessions.
+3. Run the race suite, Linux mount tests, and 30-minute overwrite, rename, and
+   SQLite Jepsen workloads on the same corrected candidate SHA with multiple
+   seeds.
+   Require complete final reads and `:valid? true` from every strict checker;
+   `:unknown` does not close the safety gate.
+   The scheduled workflow archives histories for successful and failed jobs.
+4. Repeat the legacy and strict tests under matched conditions and state the
+   trial count before comparing failure rates.
+   Then benchmark single- and multi-group latency, throughput, conflicts,
+   fairness, and retained journal bytes.
+   Approve numerical canary limits from repeated measurements.
+5. Run an opt-in canary with a verified backup and observable pending sessions.
    Stop the canary on data mismatch, unverifiable fsync receipts, or unresolved
-   work that does not drain after recovery. Resolve or cancel every pending
-   operation and retire its session before a supported downgrade.
+   work that does not drain after recovery.
+   Resolve or cancel every pending operation and retire its session before a
+   supported downgrade.
 
-Default-on strict mode is blocked until these gates close. A successful
-single-group smoke run cannot substitute for the multi-group crash campaign.
+Default-on strict mode is blocked until these gates close.
+A successful single-group smoke run cannot substitute for the multi-group
+crash campaign.
