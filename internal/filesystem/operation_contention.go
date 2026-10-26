@@ -13,6 +13,12 @@ func waitOperationCASRetry(ctx context.Context, retry int) error {
 	return waitWriteConflictRetry(ctx, min(retry, operationCASMaxBackoffShift))
 }
 
+// An admitted attempt needs a durable decision even if its FUSE request is
+// interrupted. The bounded context keeps publication and rejection live.
+func operationDecisionContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), writeConflictRetryBudget)
+}
+
 func cancelledOperationError(status, contentionStatus uint8) error {
 	if status == contentionStatus {
 		return errors.WithStack(ErrContentionLimit)

@@ -222,6 +222,34 @@ func TestWriteWithOperationReplansAfterDefinitiveConflict(t *testing.T) {
 	require.Equal(t, []byte("aZ"), data)
 }
 
+func TestWriteWithOperationFinishesDecisionAfterRequestCancellation(t *testing.T) {
+	requestCtx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	svc := newTestServiceWithOptions(t, []uint64{2})
+	require.NoError(t, svc.InitializeRoot(requestCtx, testRootMode, 1000, 1000))
+	file, err := svc.Create(requestCtx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	id := testWriteOperationID(t, svc, 1)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	fault := &writeOperationFaultDispatcher{inner: inner, key: fskeys.ChunkKey(file.Inode, file.Inode, 0)}
+	fault.before = func(context.Context) error {
+		cancel()
+		return nil
+	}
+	svc.dispatch = fault
+
+	n, err := svc.WriteWithOperation(requestCtx, id, file.Inode, 0, []byte("a"))
+	require.NoError(t, err)
+	require.Equal(t, 1, n)
+	require.True(t, fault.once)
+	j, err := NewOperationJournal(svc)
+	require.NoError(t, err)
+	record, err := j.Resolve(context.Background(), id)
+	require.NoError(t, err)
+	require.Equal(t, OperationCommitted, record.State)
+}
+
 func TestWriteWithOperationResolvesLostCommitReply(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})

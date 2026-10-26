@@ -169,9 +169,9 @@ jobs:
       - name: Run Redis Jepsen workload against elastickv
         if: matrix.workload == 'redis'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.redis-workload \
+          timeout 3600 ~/lein run -m elastickv.redis-workload \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
@@ -183,9 +183,9 @@ jobs:
       - name: Run Redis ZSet safety Jepsen workload against elastickv
         if: matrix.workload == 'redis-zset'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.redis-zset-safety-workload \
+          timeout 3600 ~/lein run -m elastickv.redis-zset-safety-workload \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
@@ -194,9 +194,9 @@ jobs:
       - name: Run DynamoDB Jepsen workload against elastickv
         if: matrix.workload == 'dynamodb'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.dynamodb-workload --local \
+          timeout 3600 ~/lein run -m elastickv.dynamodb-workload --local \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
@@ -230,9 +230,9 @@ jobs:
       - name: Run S3 Jepsen workload against elastickv
         if: matrix.workload == 's3'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.s3-workload --local \
+          timeout 3600 ~/lein run -m elastickv.s3-workload --local \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \

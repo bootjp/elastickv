@@ -60,7 +60,7 @@ func (s *Service) OpenWithOperation(ctx context.Context, id OperationID, inode u
 }
 
 func (s *Service) executeOpenOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, inode uint64, clientID, intent []byte) (uint64, error) {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		fh, err := s.publishOpenOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, inode, clientID, intent)

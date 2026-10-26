@@ -103,7 +103,7 @@ func (s *Service) writeOperationEffectLimit(ctx context.Context, inode, offset, 
 }
 
 func (s *Service) executeWriteOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, inode, offset, end uint64, data, intent []byte) (int, error) {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		if err := deadlineCtx.Err(); err != nil {

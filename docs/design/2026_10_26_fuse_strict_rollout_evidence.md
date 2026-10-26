@@ -180,7 +180,20 @@ ops/s and 39.5 ms. For four writers on one inode, the median legacy
 throughput was 83.9 ops/s with an 88.6 ms p99 and 0.914 worker fairness;
 the strict values were 54.9 ops/s, 276.3 ms, and 0.880. These jobs use
 separate runners, so the comparison is descriptive. The full stress run
-remains in progress; the numbers do not establish a rollout threshold.
+failed: Redis, Redis ZSet, and DynamoDB were cut off by a 720-second shell
+timeout despite their requested 1800-second workload limit. The SQLite job
+became inconclusive after operation journal ACK accounting errors and quota
+exhaustion. The workflow now allows 3600 seconds for these protocol jobs,
+including checker time. The numbers do not establish a rollout threshold.
+The push test in
+[run 40346594962](https://github.com/bootjp/elastickv/actions/runs/40346594962)
+also failed a mounted strict-mode quota test when a FUSE request was canceled
+after admission and before publishing its attempt decision. Every journaled
+mutation now uses a separate bounded decision context after BeginAttempt;
+request cancellation can no longer abandon that phase immediately. The
+formerly failing mounted test passed ten consecutive runs in a local Linux
+container with `/dev/fuse`, and the complete FUSE adapter package passed
+there. A CI rerun at the corrected SHA is still required.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
