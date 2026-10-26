@@ -337,14 +337,8 @@ func (j *OperationJournal) RejectAtRoute(ctx context.Context, id OperationID, at
 	if err != nil {
 		return j.resolveDuplicateRejection(ctx, id, attempt, intent, err)
 	}
-	if attempt == [16]byte{} || record.AttemptID != attempt {
-		return operationRecord{}, errors.WithStack(ErrOperationGeneration)
-	}
-	if record.Fingerprint != sha256.Sum256(intent) || !bytes.Equal(record.Intent, intent) {
-		return operationRecord{}, errors.WithStack(ErrOperationIDReused)
-	}
-	if uint64(len(result)) > uint64(record.ResultLimit) {
-		return operationRecord{}, errors.WithStack(ErrOperationQuota)
+	if err := validateOperationRejection(record, attempt, intent, result); err != nil {
+		return operationRecord{}, err
 	}
 	record.State = OperationRejected
 	record.Result = append([]byte(nil), result...)
@@ -353,6 +347,19 @@ func (j *OperationJournal) RejectAtRoute(ctx context.Context, id OperationID, at
 		return j.resolveDuplicateRejection(ctx, id, attempt, intent, err)
 	}
 	return j.Resolve(ctx, id)
+}
+
+func validateOperationRejection(record operationRecord, attempt [16]byte, intent, result []byte) error {
+	if attempt == [16]byte{} || record.AttemptID != attempt {
+		return errors.WithStack(ErrOperationGeneration)
+	}
+	if record.Fingerprint != sha256.Sum256(intent) || !bytes.Equal(record.Intent, intent) {
+		return errors.WithStack(ErrOperationIDReused)
+	}
+	if uint64(len(result)) > uint64(record.ResultLimit) {
+		return errors.WithStack(ErrOperationQuota)
+	}
+	return nil
 }
 
 func (j *OperationJournal) resolveDuplicateRejection(ctx context.Context, id OperationID, attempt [16]byte, intent []byte, originalErr error) (operationRecord, error) {
