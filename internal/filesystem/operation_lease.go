@@ -149,7 +149,10 @@ func rejectLeaseOperation(ctx context.Context, journal *OperationJournal, id Ope
 	record, err := journal.RejectAtRoute(ctx, id, attempt, plan.ReadTS, plan.RouteVersion, plan.Intent,
 		[]byte{leaseResultMissing}, plan.ReadKeys)
 	if err != nil {
-		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !IsWriteConflict(err) && !errors.Is(err, ErrOperationGeneration) {
+		if isDefinitiveWriteConflict(err) {
+			return err
+		}
+		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !errors.Is(err, ErrOperationGeneration) {
 			return err
 		}
 		return resolveLeaseAttempt(ctx, journal, id, attempt)

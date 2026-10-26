@@ -194,7 +194,10 @@ func rejectOpenOperation(ctx context.Context, journal *OperationJournal, id Oper
 	}
 	record, err := journal.RejectAtRoute(ctx, id, attempt, plan.ReadTS, plan.RouteVersion, plan.Intent, result, plan.ReadKeys)
 	if err != nil {
-		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !IsWriteConflict(err) && !errors.Is(err, ErrOperationGeneration) {
+		if isDefinitiveWriteConflict(err) {
+			return 0, err
+		}
+		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !errors.Is(err, ErrOperationGeneration) {
 			return 0, err
 		}
 		return resolveOpenAttempt(ctx, journal, id, attempt)

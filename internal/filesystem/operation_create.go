@@ -253,7 +253,10 @@ func rejectCreateOperation(ctx context.Context, journal *OperationJournal, id Op
 	}
 	record, err := journal.RejectAtRoute(ctx, id, attempt, plan.ReadTS, plan.RouteVersion, plan.Intent, result, plan.ReadKeys)
 	if err != nil {
-		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !IsWriteConflict(err) && !errors.Is(err, ErrOperationGeneration) {
+		if isDefinitiveWriteConflict(err) {
+			return CreateResult{}, err
+		}
+		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !errors.Is(err, ErrOperationGeneration) {
 			return CreateResult{}, err
 		}
 		return resolveCreateAttempt(ctx, journal, id, attempt)

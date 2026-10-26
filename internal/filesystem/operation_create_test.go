@@ -81,3 +81,19 @@ func TestCreateWithOperationResolvesLostCommitReply(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, result.Inode, resolved)
 }
+
+func TestCreateWithOperationReplansDefinitiveRejectionConflict(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2})
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	_, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	id := testWriteOperationID(t, svc, 1)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	svc.dispatch = &writeOperationFaultDispatcher{inner: inner, rejectConflict: true}
+	_, err = svc.CreateWithOperation(ctx, id, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.ErrorIs(t, err, ErrExists)
+	_, err = svc.CreateWithOperation(ctx, id, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.ErrorIs(t, err, ErrExists)
+}

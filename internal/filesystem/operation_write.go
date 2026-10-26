@@ -99,19 +99,9 @@ func (s *Service) executeWriteOperation(ctx context.Context, journal *OperationJ
 		if err := deadlineCtx.Err(); err != nil {
 			return 0, errors.WithStack(err)
 		}
-		plan, semanticErr, err := s.planJournalWrite(deadlineCtx, journal, id, attempt.AttemptID, inode, offset, end, data, intent)
-		if err != nil {
-			return 0, err
-		}
-		if semanticErr != nil {
-			return publishWriteRejection(deadlineCtx, journal, id, attempt.AttemptID, plan, semanticErr)
-		}
-		record, err := journal.Publish(deadlineCtx, id, attempt.AttemptID, plan)
-		if err == nil {
-			return decodeWriteOperationResult(record)
-		}
+		result, err := s.publishWriteOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, inode, offset, end, data, intent)
 		if !isDefinitiveWriteConflict(err) {
-			return resolveWriteAttempt(deadlineCtx, journal, id, attempt.AttemptID)
+			return result, err
 		}
 		attempt, err = journal.AdvanceGeneration(deadlineCtx, id, attempt.AttemptID)
 		if err != nil {
@@ -125,6 +115,24 @@ func (s *Service) executeWriteOperation(ctx context.Context, journal *OperationJ
 		}
 	}
 	return 0, errors.WithStack(ErrContentionLimit)
+}
+
+func (s *Service) publishWriteOperationAttempt(ctx context.Context, journal *OperationJournal, id OperationID, attempt [16]byte, inode, offset, end uint64, data, intent []byte) (int, error) {
+	plan, semanticErr, err := s.planJournalWrite(ctx, journal, id, attempt, inode, offset, end, data, intent)
+	if err != nil {
+		return 0, err
+	}
+	if semanticErr != nil {
+		return publishWriteRejection(ctx, journal, id, attempt, plan, semanticErr)
+	}
+	record, err := journal.Publish(ctx, id, attempt, plan)
+	if err == nil {
+		return decodeWriteOperationResult(record)
+	}
+	if !isDefinitiveWriteConflict(err) {
+		return resolveWriteAttempt(ctx, journal, id, attempt)
+	}
+	return 0, err
 }
 
 func encodeWriteOperationIntent(inode, offset uint64, data []byte) []byte {
@@ -201,7 +209,10 @@ func publishWriteRejection(ctx context.Context, journal *OperationJournal, id Op
 	record, err := journal.RejectAtRoute(ctx, id, attempt, plan.ReadTS, plan.RouteVersion, plan.Intent,
 		encodeWriteOperationResult(0, status), plan.ReadKeys)
 	if err != nil {
-		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !IsWriteConflict(err) && !errors.Is(err, ErrOperationGeneration) {
+		if isDefinitiveWriteConflict(err) {
+			return 0, err
+		}
+		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !errors.Is(err, ErrOperationGeneration) {
 			return 0, err
 		}
 		return resolveWriteAttempt(ctx, journal, id, attempt)

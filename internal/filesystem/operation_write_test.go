@@ -11,17 +11,18 @@ import (
 )
 
 type writeOperationFaultDispatcher struct {
-	inner         *testCoordinator
-	key           []byte
-	once          bool
-	before        func(context.Context) error
-	loseAck       bool
-	loseRejection bool
+	inner          *testCoordinator
+	key            []byte
+	once           bool
+	before         func(context.Context) error
+	loseAck        bool
+	loseRejection  bool
+	rejectConflict bool
 }
 
 func (d *writeOperationFaultDispatcher) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	if !d.once && d.loseRejection && isWriteOperationRejection(req) {
-		return d.rejectWithLostReply(ctx, req)
+	if response, err, handled := d.handleRejection(ctx, req); handled {
+		return response, err
 	}
 	if !d.once && writeOperationTouchesKey(req, d.key) {
 		d.once = true
@@ -37,6 +38,21 @@ func (d *writeOperationFaultDispatcher) Dispatch(ctx context.Context, req *kv.Op
 		return resp, err
 	}
 	return d.inner.Dispatch(ctx, req)
+}
+
+func (d *writeOperationFaultDispatcher) handleRejection(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error, bool) {
+	if d.once || !isWriteOperationRejection(req) {
+		return nil, nil, false
+	}
+	if d.rejectConflict {
+		d.once = true
+		return nil, store.ErrWriteConflict, true
+	}
+	if d.loseRejection {
+		response, err := d.rejectWithLostReply(ctx, req)
+		return response, err, true
+	}
+	return nil, nil, false
 }
 
 func (d *writeOperationFaultDispatcher) rejectWithLostReply(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
@@ -220,4 +236,18 @@ func TestWriteWithOperationResolvesLostRejectionReply(t *testing.T) {
 	require.ErrorIs(t, err, ErrIsDir)
 	_, err = svc.WriteWithOperation(ctx, id, RootInode, 0, []byte("x"))
 	require.ErrorIs(t, err, ErrIsDir)
+}
+
+func TestWriteWithOperationReplansDefinitiveRejectionConflict(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, nil)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	id := testWriteOperationID(t, svc, 1)
+	inner, ok := svc.dispatch.(*testCoordinator)
+	require.True(t, ok)
+	svc.dispatch = &writeOperationFaultDispatcher{inner: inner, rejectConflict: true}
+	_, err := svc.WriteWithOperation(ctx, id, 999, 0, []byte("x"))
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = svc.WriteWithOperation(ctx, id, 999, 0, []byte("x"))
+	require.ErrorIs(t, err, ErrNotFound)
 }

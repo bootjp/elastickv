@@ -301,13 +301,5 @@ func rejectUnlinkOperation(ctx context.Context, journal *OperationJournal, id Op
 	default:
 		return semanticErr
 	}
-	record, err := journal.RejectAtRoute(ctx, id, attempt, plan.ReadTS, plan.RouteVersion, plan.Intent,
-		[]byte{status}, plan.ReadKeys)
-	if err != nil {
-		if !errors.Is(err, kv.ErrTransactionOutcomeUnknown) && !IsWriteConflict(err) && !errors.Is(err, ErrOperationGeneration) {
-			return err
-		}
-		return resolveUnlinkAttempt(ctx, journal, id, attempt)
-	}
-	return decodeUnlinkOperationResult(record)
+	return rejectNamespaceOperation(ctx, journal, id, attempt, plan, status, decodeUnlinkOperationResult)
 }
