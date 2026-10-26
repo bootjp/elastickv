@@ -19,12 +19,32 @@ const (
 )
 
 type replyIdentityKey struct{}
+type backgroundOperationKey struct{}
 
 func withReplyIdentity(ctx context.Context, unique uint64) context.Context {
 	if unique == 0 {
 		return ctx
 	}
 	return context.WithValue(ctx, replyIdentityKey{}, unique)
+}
+
+func withBackgroundOperation(ctx context.Context) context.Context {
+	return context.WithValue(ctx, backgroundOperationKey{}, true)
+}
+
+func (a *Adapter) queueAcknowledgement(id filesystem.OperationID) {
+	a.replyMu.Lock()
+	if a.ackPending == nil {
+		a.ackPending = make(map[filesystem.OperationID]struct{})
+	}
+	a.ackPending[id] = struct{}{}
+	a.replyMu.Unlock()
+	if a.ackWake != nil {
+		select {
+		case a.ackWake <- struct{}{}:
+		default:
+		}
+	}
 }
 
 func (a *Adapter) recordReplyIdentity(ctx context.Context, id filesystem.OperationID) {

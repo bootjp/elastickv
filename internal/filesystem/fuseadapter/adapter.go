@@ -741,6 +741,11 @@ func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh ui
 		a.retainLatestLeaseReceipt(ctx, inode, fh, id)
 		a.markLeaseRefreshed(inode, fh)
 	}
+	// Keepalive renewals have no kernel reply. Completion of the renewal is
+	// their acknowledgement boundary; uncertain outcomes remain retained.
+	if ctx.Value(backgroundOperationKey{}) == true && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		a.queueAcknowledgement(id)
+	}
 	return errors.Wrap(err, "refresh journaled open handle lease")
 }
 
@@ -850,7 +855,7 @@ func (a *Adapter) keepOpenHandlesAlive(ctx context.Context) {
 
 func (a *Adapter) refreshTrackedOpenHandles(ctx context.Context) {
 	for _, handle := range a.openHandleSnapshot() {
-		handleCtx, cancel := context.WithTimeout(ctx, a.keepaliveTimeout)
+		handleCtx, cancel := context.WithTimeout(withBackgroundOperation(ctx), a.keepaliveTimeout)
 		errno := a.refreshOpenHandleLease(handleCtx, handle.inode, handle.fh, false)
 		cancel()
 		switch {

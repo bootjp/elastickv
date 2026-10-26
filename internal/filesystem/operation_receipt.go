@@ -31,7 +31,9 @@ func (s *Service) AcknowledgeOperation(ctx context.Context, id OperationID) erro
 		return err
 	}
 	if _, err := journal.Resolve(ctx, id); errors.Is(err, ErrOperationPending) {
-		if _, err := journal.Cancel(ctx, id); err != nil {
+		if _, err := journal.Cancel(ctx, id); errors.Is(err, ErrOperationPending) {
+			return journal.RetireUnadmitted(ctx, id)
+		} else if err != nil {
 			return err
 		}
 	} else if err != nil && !errors.Is(err, ErrOperationRetired) {

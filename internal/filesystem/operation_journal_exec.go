@@ -567,6 +567,57 @@ func (j *OperationJournal) Acknowledge(ctx context.Context, id OperationID) erro
 	return errors.WithStack(ErrOperationQuota)
 }
 
+// RetireUnadmitted fences an identity whose reply was attempted before an
+// operation record was admitted. The session and record read set makes this
+// race atomically with admission: an in-flight admission either wins and must
+// be resolved normally, or observes the retired identity and cannot publish.
+func (j *OperationJournal) RetireUnadmitted(ctx context.Context, id OperationID) error {
+	for range operationCASRetries {
+		err := j.retireUnadmittedOnce(ctx, id)
+		if err == nil {
+			return nil
+		}
+		if !IsWriteConflict(err) {
+			return errors.Wrap(err, "retire unadmitted operation")
+		}
+	}
+	return errors.WithStack(ErrOperationQuota)
+}
+
+func (j *OperationJournal) retireUnadmittedOnce(ctx context.Context, id OperationID) error {
+	ts, err := j.backend.Snapshot(ctx)
+	if err != nil {
+		return errors.Wrap(err, "fence unadmitted operation retirement")
+	}
+	session, exists, err := j.loadSessionAt(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}, ts)
+	if err != nil {
+		return err
+	}
+	if !exists {
+		return errors.WithStack(ErrOperationSessionNotFound)
+	}
+	if session.retired(id.Sequence) {
+		return nil
+	}
+	_, found, err := j.loadRecordAt(ctx, id, ts)
+	if err != nil {
+		return err
+	}
+	if found {
+		return errors.WithStack(ErrOperationGeneration)
+	}
+	if err := advanceAckWatermark(&session, id.Sequence); err != nil {
+		return err
+	}
+	raw, err := encodeOperationSession(session)
+	if err != nil {
+		return err
+	}
+	_, err = j.backend.Commit(ctx, ts, []*kv.Elem[kv.OP]{{Op: kv.Put, Key: session.ID.key(), Value: raw}},
+		[][]byte{id.key(), session.ID.key()})
+	return errors.Wrap(err, "commit unadmitted operation retirement")
+}
+
 func (j *OperationJournal) acknowledgeOnce(ctx context.Context, id OperationID) error {
 	ts, err := j.backend.Snapshot(ctx)
 	if err != nil {

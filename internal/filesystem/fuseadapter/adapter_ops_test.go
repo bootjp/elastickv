@@ -183,8 +183,28 @@ func TestAdapterKeepaliveUsesJournaledLeaseRefresh(t *testing.T) {
 	adapter.trackOpenHandle(7, 9)
 	adapter.refreshTrackedOpenHandles(t.Context())
 	require.Len(t, core.leaseIDs, 1)
+	adapter.replyMu.Lock()
+	_, queued := adapter.ackPending[core.leaseIDs[0]]
+	adapter.replyMu.Unlock()
+	require.True(t, queued)
 	require.Zero(t, adapter.Fsync(t.Context(), 7, 9, false))
 	require.ElementsMatch(t, core.leaseIDs, core.verified)
+}
+
+func TestAdapterKeepaliveRetainsUnknownLease(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}, leaseErr: kv.ErrTransactionOutcomeUnknown}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledLeaseRefresh(session))
+	t.Cleanup(adapter.Close)
+	adapter.trackOpenHandle(7, 9)
+	adapter.refreshTrackedOpenHandles(t.Context())
+	require.Len(t, core.leaseIDs, 1)
+	adapter.replyMu.Lock()
+	_, queued := adapter.ackPending[core.leaseIDs[0]]
+	adapter.replyMu.Unlock()
+	require.False(t, queued)
 }
 
 func (c *journalLifecycleCore) CreateWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte, _ filesystem.CreateOptions) (filesystem.CreateResult, error) {

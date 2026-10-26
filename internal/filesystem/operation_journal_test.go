@@ -728,6 +728,42 @@ func TestAcknowledgeOperationCancelsPendingReply(t *testing.T) {
 	require.NoError(t, journal.CloseSession(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}))
 }
 
+func TestAcknowledgeOperationRetiresUnadmittedIdentity(t *testing.T) {
+	ctx := context.Background()
+	journal, st, coord := testOperationJournal(t)
+	svc, err := NewService(st, coord)
+	require.NoError(t, err)
+	first := testOperationID(t, journal, 1)
+	second := OperationID{Filesystem: first.Filesystem, Session: first.Session, Sequence: 2}
+	_, err = journal.Admit(ctx, second, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, second)
+	require.NoError(t, err)
+	_, err = journal.Publish(ctx, second, attempt.AttemptID, operationAttemptPlan{Intent: []byte("write"), Result: []byte("done")})
+	require.NoError(t, err)
+	require.NoError(t, svc.AcknowledgeOperation(ctx, second))
+	require.NoError(t, svc.AcknowledgeOperation(ctx, first))
+	require.NoError(t, svc.AcknowledgeOperation(ctx, first))
+	for _, id := range []OperationID{first, second} {
+		_, err = journal.Resolve(ctx, id)
+		require.ErrorIs(t, err, ErrOperationRetired)
+		_, err = journal.Admit(ctx, id, []byte("write"), 128, 1024)
+		require.ErrorIs(t, err, ErrOperationRetired)
+	}
+	require.NoError(t, journal.CloseSession(ctx, OperationSessionID{Filesystem: first.Filesystem, Session: first.Session}))
+}
+
+func TestRetireUnadmittedDoesNotRetireAdmittedIdentity(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	require.ErrorIs(t, journal.RetireUnadmitted(ctx, id), ErrOperationGeneration)
+	_, err = journal.Resolve(ctx, id)
+	require.ErrorIs(t, err, ErrOperationPending)
+}
+
 func TestOperationJournalAcknowledgementGapsRetireWithoutReuse(t *testing.T) {
 	ctx := context.Background()
 	journal, _, _ := testOperationJournal(t)
