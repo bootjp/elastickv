@@ -90,8 +90,12 @@ func mountMemoryService(t *testing.T, svc fuseadapter.Core, clientID string) str
 }
 
 func mountMemoryServiceAt(t *testing.T, svc fuseadapter.Core, clientID, mountPoint string) *e2eMount {
+	return mountMemoryServiceAtWithOptions(t, svc, clientID, mountPoint)
+}
+
+func mountMemoryServiceAtWithOptions(t *testing.T, svc fuseadapter.Core, clientID, mountPoint string, adapterOptions ...fuseadapter.Option) *e2eMount {
 	t.Helper()
-	adapter := fuseadapter.New(svc, []byte(clientID))
+	adapter := fuseadapter.New(svc, []byte(clientID), adapterOptions...)
 	server, err := fuseadapter.Mount(mountPoint, adapter, &fuse.MountOptions{DirectMount: os.Geteuid() == 0})
 	if err != nil {
 		adapter.Close()
@@ -383,4 +387,29 @@ func TestKernelMountStatfsReportsNameLimit(t *testing.T) {
 	require.NoError(t, syscall.Statfs(mountPoint, &stat))
 	require.NotZero(t, stat.Bsize)
 	require.EqualValues(t, 255, stat.Namelen)
+}
+
+func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-write")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-write", mountPoint, fuseadapter.WithJournaledWrites(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("journaled"), 0o600))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("journaled"), data)
+	record, err := journal.Resolve(t.Context(), filesystem.OperationID{
+		Filesystem: session.Filesystem, Session: session.Session, Sequence: 1,
+	})
+	require.NoError(t, err)
+	require.Equal(t, filesystem.OperationCommitted, record.State)
 }

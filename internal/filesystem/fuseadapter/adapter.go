@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 
@@ -45,6 +46,9 @@ type Adapter struct {
 	core              Core
 	mutations         mutationTracker
 	clientID          []byte
+	operationSession  filesystem.OperationSessionID
+	journaledWrites   bool
+	operationSequence atomic.Uint64
 	readdirLimit      int
 	keepaliveInterval time.Duration
 	keepaliveTimeout  time.Duration
@@ -78,6 +82,7 @@ var errnoMappings = []struct {
 	{filesystem.ErrUnsupported, syscall.EOPNOTSUPP},
 	{filesystem.ErrStaleHome, syscall.EAGAIN},
 	{filesystem.ErrContentionLimit, syscall.EBUSY},
+	{filesystem.ErrOperationQuota, syscall.ENOSPC},
 	{store.ErrWriteConflict, syscall.EAGAIN},
 }
 
@@ -100,6 +105,15 @@ func WithHandleKeepaliveTimeout(timeout time.Duration) Option {
 		if timeout > 0 {
 			a.keepaliveTimeout = timeout
 		}
+	}
+}
+
+// WithJournaledWrites assigns one durable operation identity to each FUSE
+// write request. The caller must register the session before mounting.
+func WithJournaledWrites(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.operationSession = session
+		a.journaledWrites = true
 	}
 }
 
@@ -206,7 +220,19 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return 0, errno
 	}
-	n, writeErr = a.core.Write(ctx, inode, fh, offset, data)
+	if a.journaledWrites {
+		writer, ok := a.core.(interface {
+			WriteWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) (int, error)
+		})
+		if !ok || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return 0, syscall.EOPNOTSUPP
+		}
+		id := filesystem.OperationID{Filesystem: a.operationSession.Filesystem, Session: a.operationSession.Session,
+			Sequence: a.operationSequence.Add(1)}
+		n, writeErr = writer.WriteWithOperation(ctx, id, inode, offset, data)
+	} else {
+		n, writeErr = a.core.Write(ctx, inode, fh, offset, data)
+	}
 	if writeErr != nil && Errno(writeErr) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "length", len(data), "error", writeErr.Error())
 	}

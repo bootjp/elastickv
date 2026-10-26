@@ -54,6 +54,33 @@ func TestAdapterWriteRefreshesLeaseThenForwards(t *testing.T) {
 	require.Equal(t, []byte("data"), core.writeData)
 }
 
+type journalWriteCore struct {
+	*fakeCore
+	ids []filesystem.OperationID
+}
+
+func (c *journalWriteCore) WriteWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, data []byte) (int, error) {
+	c.ids = append(c.ids, id)
+	return len(data), nil
+}
+
+func TestAdapterJournaledWritesAllocateStableSessionSequence(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalWriteCore{fakeCore: &fakeCore{}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledWrites(session))
+	t.Cleanup(adapter.Close)
+	for range 2 {
+		n, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
+		require.Zero(t, errno)
+		require.Equal(t, 1, n)
+	}
+	require.False(t, core.writeCalled)
+	require.Equal(t, []filesystem.OperationID{
+		{Filesystem: session.Filesystem, Session: session.Session, Sequence: 1},
+		{Filesystem: session.Filesystem, Session: session.Session, Sequence: 2},
+	}, core.ids)
+}
+
 func TestAdapterWriteStopsWhenLeaseRefreshFails(t *testing.T) {
 	ctx := context.Background()
 	core := &fakeCore{refreshErr: filesystem.ErrStaleHome}
