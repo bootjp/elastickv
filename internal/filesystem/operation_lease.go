@@ -48,7 +48,7 @@ func (s *Service) RefreshOpenHandleLeaseWithOperation(ctx context.Context, id Op
 }
 
 func (s *Service) executeLeaseOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, inode, fh uint64, clientID, intent []byte) error {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		err := s.publishLeaseOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, inode, fh, clientID, intent)

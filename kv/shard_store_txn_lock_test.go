@@ -170,6 +170,36 @@ func TestShardStoreGetAt_ReturnsTxnLockedForPendingCrossShardTxn(t *testing.T) {
 	require.True(t, errors.Is(err, ErrTxnLocked), "expected ErrTxnLocked for secondary key, got %v", err)
 }
 
+func TestShardStoreGetAt_DoesNotAbortSecondaryBeforePrimaryPrepare(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	shardStore, groups, cleanup := setupTwoShardStore(t)
+	defer cleanup()
+
+	const startTS = uint64(10)
+	const commitTS = uint64(20)
+	primaryKey := []byte("b")
+	secondaryKey := []byte("x")
+	_, err := groups[2].Txn.Commit(ctx, []*pb.Request{
+		makePrepareRequest(startTS, secondaryKey, []byte("value"), primaryKey),
+	})
+	require.NoError(t, err)
+
+	_, err = shardStore.GetAt(ctx, secondaryKey, ^uint64(0))
+	require.ErrorIs(t, err, ErrTxnLocked)
+	_, err = groups[2].Store.GetAt(ctx, txnLockKey(secondaryKey), ^uint64(0))
+	require.NoError(t, err, "a read cannot discard a secondary intent before the primary is prepared")
+
+	_, err = groups[1].Txn.Commit(ctx, []*pb.Request{
+		makePrepareRequest(startTS, primaryKey, []byte("primary"), primaryKey),
+	})
+	require.NoError(t, err)
+	commitPrimary(t, groups[1], startTS, commitTS, primaryKey)
+	value, err := shardStore.GetAt(ctx, secondaryKey, commitTS)
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
+}
+
 func TestShardStoreGetAt_ResolvesCommittedSecondaryLock(t *testing.T) {
 	t.Parallel()
 

@@ -81,8 +81,14 @@ func decodeOperationSession(raw []byte) (operationSession, error) {
 }
 
 func validateOperationSession(session operationSession) error {
-	if !validOperationSessionIdentity(session) || !validOperationSessionUsage(session) || !validOperationAckGaps(session) {
-		return errors.WithStack(ErrOperationRecordCorrupt)
+	if !validOperationSessionIdentity(session) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session identity")
+	}
+	if !validOperationSessionUsage(session) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session usage")
+	}
+	if !validOperationAckGaps(session) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session acknowledgement gaps")
 	}
 	return nil
 }

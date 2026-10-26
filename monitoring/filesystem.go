@@ -25,6 +25,7 @@ type FileSystemObserver interface {
 	ObserveInodeIDCollisionRetry()
 	ObserveMoveJob(jobID []byte, active bool)
 	ObservePlacementStats(filesystem.PlacementStats)
+	ObserveOperationJournalStats(filesystem.OperationJournalStats)
 }
 
 type FileSystemMetrics struct {
@@ -41,6 +42,9 @@ type FileSystemMetrics struct {
 	homeEpochConflictTotal prometheus.Counter
 	openHandleLeaseActive  prometheus.Gauge
 	orphanInodeGCPending   prometheus.Gauge
+	journalSessions        prometheus.Gauge
+	journalPending         prometheus.Gauge
+	journalRetainedBytes   prometheus.Gauge
 	inodeCollisionTotal    prometheus.Counter
 	filesByGroup           *prometheus.GaugeVec
 	activeMoveJobs         map[string]struct{}
@@ -107,6 +111,18 @@ func newFileSystemMetrics(registerer prometheus.Registerer) *FileSystemMetrics {
 			Name: "elastickv_fs_inode_id_collision_retry_total",
 			Help: "Total inode allocator retries caused by reserved or already-used IDs.",
 		}),
+		journalSessions: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "elastickv_fs_operation_journal_sessions",
+			Help: "Durable strict FUSE mount sessions, including closed sessions awaiting retirement.",
+		}),
+		journalPending: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "elastickv_fs_operation_journal_pending",
+			Help: "Admitted strict FUSE operations without a terminal result.",
+		}),
+		journalRetainedBytes: prometheus.NewGauge(prometheus.GaugeOpts{
+			Name: "elastickv_fs_operation_journal_retained_bytes",
+			Help: "Bytes reserved by durable strict FUSE journal records across mount sessions.",
+		}),
 		filesByGroup: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Name: "elastickv_fs_files_by_group",
 			Help: "Current active filesystem files by owning shard group.",
@@ -129,9 +145,18 @@ func newFileSystemMetrics(registerer prometheus.Registerer) *FileSystemMetrics {
 		m.openHandleLeaseActive,
 		m.orphanInodeGCPending,
 		m.inodeCollisionTotal,
+		m.journalSessions,
+		m.journalPending,
+		m.journalRetainedBytes,
 		m.filesByGroup,
 	)
 	return m
+}
+
+func (m *FileSystemMetrics) ObserveOperationJournalStats(stats filesystem.OperationJournalStats) {
+	m.journalSessions.Set(float64(stats.Sessions))
+	m.journalPending.Set(float64(stats.Pending))
+	m.journalRetainedBytes.Set(float64(stats.RetainedBytes))
 }
 
 func (m *FileSystemMetrics) ObserveChunkRead(elapsed time.Duration) {

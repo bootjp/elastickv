@@ -6,7 +6,9 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
+	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
 
@@ -43,6 +45,23 @@ func TestCommitSecondaryTxnsRequiresNonNilDecision(t *testing.T) {
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 }
 
+func TestSingleShardTxnRequiresNonNilDecision(t *testing.T) {
+	t.Parallel()
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{1: {Txn: nilDecisionTransactional{}}}}
+	_, err := coord.dispatchSingleShardTxn(context.Background(), 10, 20, 0, []byte("primary"), 1,
+		[]*Elem[OP]{{Op: Put, Key: []byte("primary"), Value: []byte("value")}}, nil, 0, nil)
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+}
+
+func TestPrimaryTxnRequiresNonNilDecision(t *testing.T) {
+	t.Parallel()
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{1: {Txn: nilDecisionTransactional{}}}}
+	_, _, err := coord.commitPrimaryTxn(context.Background(), 10, []byte("primary"),
+		map[uint64][]*pb.Mutation{1: {{Op: pb.Op_PUT, Key: []byte("primary")}}},
+		[]uint64{1}, 20, 0, nil)
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+}
+
 type nilDecisionTransactional struct{}
 
 func (nilDecisionTransactional) Commit(context.Context, []*pb.Request) (*TransactionResponse, error) {
@@ -51,6 +70,65 @@ func (nilDecisionTransactional) Commit(context.Context, []*pb.Request) (*Transac
 
 func (nilDecisionTransactional) Abort(context.Context, []*pb.Request) (*TransactionResponse, error) {
 	return nil, nil
+}
+
+type lostPrimaryCommitReplyTxn struct {
+	Transactional
+}
+
+func (t lostPrimaryCommitReplyTxn) Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error) {
+	response, err := t.Transactional.Commit(ctx, reqs)
+	if err == nil && len(reqs) == 1 && reqs[0].Phase == pb.Phase_COMMIT {
+		return nil, errors.New("committed primary reply lost")
+	}
+	return response, err
+}
+
+func TestLostPrimaryReplyResolvesPreparedSecondaryFromDurableDecision(t *testing.T) {
+	lr, ss, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+	groups[1].Txn = lostPrimaryCommitReplyTxn{Transactional: groups[1].Txn}
+	coord := NewShardedCoordinator(ss.engine, groups, 1, NewHLC(), ss)
+	ctx := context.Background()
+	_, err := coord.dispatchMultiShardTxn(ctx, 10, 20, 0, []byte("b"),
+		map[uint64][]*pb.Mutation{
+			1: {{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte("primary")}},
+			2: {{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte("secondary")}},
+		}, []uint64{1, 2}, nil, 0, nil, true)
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+
+	primary, err := ss.GetAt(ctx, []byte("b"), 20)
+	require.NoError(t, err)
+	require.Equal(t, []byte("primary"), primary)
+	rawLock, err := groups[2].Store.GetAt(ctx, txnLockKey([]byte("x")), ^uint64(0))
+	require.NoError(t, err)
+	lock, err := decodeTxnLock(rawLock)
+	require.NoError(t, err)
+	require.NoError(t, lr.resolveExpiredLock(ctx, groups[2], []byte("x"), lock))
+	secondary, err := ss.GetAt(ctx, []byte("x"), 20)
+	require.NoError(t, err)
+	require.Equal(t, []byte("secondary"), secondary)
+}
+
+func TestRepeatedTwoGroupCommitReleasesSecondaryLocks(t *testing.T) {
+	_, ss, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+	coord := NewShardedCoordinator(ss.engine, groups, 1, NewHLC(), ss)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		start, commit uint64
+		value         string
+	}{{10, 20, "first"}, {30, 40, "second"}} {
+		_, err := coord.dispatchMultiShardTxn(ctx, tc.start, tc.commit, 0, []byte("b"),
+			map[uint64][]*pb.Mutation{
+				1: {{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte(tc.value)}},
+				2: {{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte(tc.value)}},
+			}, []uint64{1, 2}, nil, 0, nil, true)
+		require.NoError(t, err)
+	}
+	value, err := ss.GetAt(ctx, []byte("x"), 40)
+	require.NoError(t, err)
+	require.Equal(t, []byte("second"), value)
 }
 
 func TestStrictSecondaryRouteShiftNeverStartsANewTransaction(t *testing.T) {
@@ -79,6 +157,101 @@ func TestStrictSecondaryRouteShiftNeverStartsANewTransaction(t *testing.T) {
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.Len(t, primary.requests, 2)
 	require.Len(t, secondary.requests, 1+txnSecondaryCommitRetryAttempts)
+}
+
+func TestStrictLostPrimaryCommitReplyDoesNotAbortPreparedParticipants(t *testing.T) {
+	t.Parallel()
+	router := distribution.NewEngine()
+	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	})
+	responseLost := raftengine.ErrLeadershipLost
+	primary := &recordingTransactional{errs: []error{nil, responseLost}}
+	secondary := &recordingTransactional{}
+	coord := NewShardedCoordinator(router, map[uint64]*ShardGroup{
+		1: {Txn: primary}, 2: {Txn: secondary},
+	}, 1, NewHLC(), nil)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true, RequireAllParticipants: true, PrimaryKey: []byte("b"),
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("record")},
+			{Op: Put, Key: []byte("x"), Value: []byte("effect")},
+		},
+	})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.ErrorIs(t, err, responseLost)
+	require.Len(t, primary.requests, 2)
+	require.Equal(t, pb.Phase_PREPARE, primary.requests[0].Phase)
+	require.Equal(t, pb.Phase_COMMIT, primary.requests[1].Phase)
+	require.Len(t, secondary.requests, 1)
+	require.Equal(t, pb.Phase_PREPARE, secondary.requests[0].Phase)
+}
+
+func TestStrictDefinitivePrimaryConflictAbortsPreparedParticipants(t *testing.T) {
+	t.Parallel()
+	router := distribution.NewEngine()
+	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	})
+	primary := &recordingTransactional{errs: []error{nil, store.ErrWriteConflict}}
+	secondary := &recordingTransactional{}
+	coord := NewShardedCoordinator(router, map[uint64]*ShardGroup{
+		1: {Txn: primary}, 2: {Txn: secondary},
+	}, 1, NewHLC(), nil)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true, RequireAllParticipants: true, PrimaryKey: []byte("b"),
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("record")},
+			{Op: Put, Key: []byte("x"), Value: []byte("effect")},
+		},
+	})
+	require.ErrorIs(t, err, store.ErrWriteConflict)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Len(t, primary.requests, 3)
+	require.Equal(t, pb.Phase_ABORT, primary.requests[2].Phase)
+	require.Len(t, secondary.requests, 2)
+	require.Equal(t, pb.Phase_ABORT, secondary.requests[1].Phase)
+}
+
+func TestPrimaryCommitDecisionClassification(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		err      error
+		rejected bool
+	}{
+		{"conflict", store.ErrWriteConflict, true},
+		{"route version", ErrComposed1VersionGCd, true},
+		{"route moved", ErrComposed1Violation, true},
+		{"not leader before append", raftengine.ErrNotLeader, true},
+		{"ambiguous wrapped conflict", errors.Join(ErrTransactionOutcomeUnknown, store.ErrWriteConflict), false},
+		{"unclassified transport", errors.New("response lost"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.rejected, primaryCommitDefinitelyRejected(tc.err))
+		})
+	}
+}
+
+func TestPrimaryRouteVerdictAbortsPreparedParticipants(t *testing.T) {
+	t.Parallel()
+	primary := &recordingTransactional{errs: []error{nil, ErrComposed1VersionGCd}}
+	secondary := &recordingTransactional{}
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{
+		1: {Txn: primary}, 2: {Txn: secondary},
+	}}
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Key: []byte("b"), Value: []byte("record")}},
+		2: {{Key: []byte("x"), Value: []byte("effect")}},
+	}
+	_, err := coord.dispatchMultiShardTxn(context.Background(), 10, 20, 0,
+		[]byte("b"), grouped, []uint64{1, 2}, nil, 7, nil, true)
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Equal(t, pb.Phase_ABORT, primary.requests[2].Phase)
+	require.Equal(t, pb.Phase_ABORT, secondary.requests[1].Phase)
 }
 
 func TestStrictTxnRejectsEffectRouteChangedAfterReceiptPlacement(t *testing.T) {

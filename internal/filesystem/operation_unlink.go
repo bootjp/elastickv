@@ -64,7 +64,7 @@ func (s *Service) unlinkNodeWithOperation(ctx context.Context, id OperationID, p
 }
 
 func (s *Service) executeUnlinkOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, parent uint64, name []byte, directory bool, intent []byte) error {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		err := s.publishUnlinkOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, parent, name, directory, intent)

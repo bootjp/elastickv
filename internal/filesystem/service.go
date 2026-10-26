@@ -252,16 +252,19 @@ type LeaseReapStats struct {
 }
 
 type Service struct {
-	store        store.MVCCStore
-	dispatch     Dispatcher
-	chunkSize    uint64
-	openLeaseTTL time.Duration
-	capacity     uint64
-	maxFiles     uint64
-	now          func() time.Time
-	allocID      func() (uint64, error)
-	homeSlot     func(uint64) uint64
-	observer     OperationalObserver
+	// Journal commits within one mount share a session row. Keep a later
+	// two-phase prepare from meeting this mount's own prepared session lock.
+	journalCommitPermit chan struct{}
+	store               store.MVCCStore
+	dispatch            Dispatcher
+	chunkSize           uint64
+	openLeaseTTL        time.Duration
+	capacity            uint64
+	maxFiles            uint64
+	now                 func() time.Time
+	allocID             func() (uint64, error)
+	homeSlot            func(uint64) uint64
+	observer            OperationalObserver
 }
 
 type Option func(*Service)
@@ -332,16 +335,18 @@ func NewService(st store.MVCCStore, dispatch Dispatcher, opts ...Option) (*Servi
 		return nil, ErrDispatcherRequired
 	}
 	s := &Service{
-		store:        st,
-		dispatch:     dispatch,
-		chunkSize:    DefaultChunkSize,
-		openLeaseTTL: defaultOpenHandleLeaseTTL,
-		now:          time.Now,
-		allocID:      randomNonZeroUint64,
+		journalCommitPermit: make(chan struct{}, 1),
+		store:               st,
+		dispatch:            dispatch,
+		chunkSize:           DefaultChunkSize,
+		openLeaseTTL:        defaultOpenHandleLeaseTTL,
+		now:                 time.Now,
+		allocID:             randomNonZeroUint64,
 		homeSlot: func(inode uint64) uint64 {
 			return inode
 		},
 	}
+	s.journalCommitPermit <- struct{}{}
 	for _, opt := range opts {
 		opt(s)
 	}
@@ -636,11 +641,12 @@ func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []b
 	if err != nil {
 		return err
 	}
-	return s.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{refElem, fenceElem}, [][]byte{
+	_, err = s.dispatchTxnWithPrimaryPolicy(ctx, ts, []*kv.Elem[kv.OP]{refElem, fenceElem}, [][]byte{
 		fskeys.InodeKey(inode),
 		refKey,
 		fskeys.RefFenceKey(inode),
-	})
+	}, false, refKey)
+	return err
 }
 
 //nolint:cyclop // Read handles EOF, sparse chunks, and chunk boundary copying in one linear path.
@@ -750,7 +756,8 @@ func (s *Service) retryWrite(ctx context.Context, inode uint64, offset uint64, d
 }
 
 func isDefinitiveWriteConflict(err error) bool {
-	return err != nil && errors.Is(err, store.ErrWriteConflict) && !errors.Is(err, kv.ErrTransactionOutcomeUnknown)
+	return err != nil && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) &&
+		(errors.Is(err, store.ErrWriteConflict) || errors.Is(err, kv.ErrTxnLocked))
 }
 
 func waitWriteConflictRetry(ctx context.Context, attempt int) error {
@@ -1271,7 +1278,7 @@ func (s *Service) releaseOnce(ctx context.Context, inode uint64, fh uint64, clie
 	if err != nil {
 		return err
 	}
-	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+	if _, err := s.dispatchTxnWithPrimaryPolicy(ctx, ts, elems, readKeys, false, refKey); err != nil {
 		return err
 	}
 	s.reclaimCommittedOrphanBestEffort(ctx, chunkDeletes)

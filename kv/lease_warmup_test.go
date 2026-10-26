@@ -540,6 +540,8 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroupWithoutBlockingPeer
 	eng2 := newShardedLeaseEngine(200)
 	entered := make(chan struct{}, 2)
 	release := make(chan struct{})
+	releaseBlocked := sync.OnceFunc(func() { close(release) })
+	t.Cleanup(releaseBlocked)
 	eng1.proposeHook = func() {
 		entered <- struct{}{}
 		<-release
@@ -549,14 +551,17 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroupWithoutBlockingPeer
 	first := coord.renewHLCLeases(context.Background())
 	<-entered
 	require.Eventually(t, func() bool {
-		return eng2.proposeCalls.Load() == 1
-	}, time.Second, 10*time.Millisecond,
+		coord.hlcRenewalMu.Lock()
+		_, inFlight := coord.hlcRenewalInFlight[2]
+		coord.hlcRenewalMu.Unlock()
+		return eng2.proposeCalls.Load() == 1 && !inFlight
+	}, 2*time.Second, 10*time.Millisecond,
 		"precondition: the first round must fully finish for the non-blocked group")
 
 	second := coord.renewHLCLeases(context.Background())
 	require.Eventually(t, func() bool {
 		return eng2.proposeCalls.Load() == 2
-	}, time.Second, 10*time.Millisecond,
+	}, 2*time.Second, 10*time.Millisecond,
 		"other led groups must still renew while one group is in flight")
 	requireRenewalDone(t, second)
 	select {
@@ -569,7 +574,7 @@ func TestShardedCoordinator_RenewHLCLeases_SkipsInFlightGroupWithoutBlockingPeer
 	require.Equal(t, int32(2), eng2.proposeCalls.Load(),
 		"other led groups must still renew while one group is in flight")
 
-	close(release)
+	releaseBlocked()
 	requireRenewalDone(t, first)
 
 	third := coord.renewHLCLeases(context.Background())

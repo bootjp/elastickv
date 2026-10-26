@@ -4961,7 +4961,7 @@ func loadTxnLockAt(ctx context.Context, g *ShardGroup, key []byte, ts uint64) (t
 
 func (s *ShardStore) resolveTxnLockForKey(ctx context.Context, g *ShardGroup, key []byte, lock txnLock) error {
 	// Check primary transaction status to decide commit/rollback.
-	status, commitTS, err := s.primaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	status, commitTS, err := s.primaryTxnStatus(ctx, lock)
 	if err != nil {
 		return err
 	}
@@ -5125,7 +5125,7 @@ func (s *ShardStore) cachedLockTxnStatus(ctx context.Context, plan *scanLockPlan
 	if state, ok := plan.statusCache[txnKey]; ok {
 		return state, nil
 	}
-	status, commitTS, err := s.primaryTxnStatus(ctx, lock.PrimaryKey, lock.StartTS)
+	status, commitTS, err := s.primaryTxnStatus(ctx, lock)
 	if err != nil {
 		return lockTxnStatus{}, err
 	}
@@ -5418,7 +5418,8 @@ const (
 	txnStatusRolledBack
 )
 
-func (s *ShardStore) primaryTxnStatus(ctx context.Context, primaryKey []byte, startTS uint64) (txnStatus, uint64, error) {
+func (s *ShardStore) primaryTxnStatus(ctx context.Context, secondaryLock txnLock) (txnStatus, uint64, error) {
+	primaryKey, startTS := secondaryLock.PrimaryKey, secondaryLock.StartTS
 	status, commitTS, done, err := s.primaryTxnRecordedStatus(ctx, primaryKey, startTS)
 	if err != nil || done {
 		return status, commitTS, err
@@ -5429,7 +5430,12 @@ func (s *ShardStore) primaryTxnStatus(ctx context.Context, primaryKey []byte, st
 		return txnStatusPending, 0, err
 	}
 	if !locked {
-		return txnStatusRolledBack, 0, nil
+		// Secondaries are prepared before the primary. Its absent lock is not
+		// an abort decision while this secondary's lease is still live.
+		if !txnLockExpired(secondaryLock) {
+			return txnStatusPending, 0, nil
+		}
+		return s.expiredPrimaryTxnStatus(ctx, primaryKey, startTS)
 	}
 	if !txnLockExpired(lock) {
 		return txnStatusPending, 0, nil

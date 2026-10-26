@@ -67,7 +67,7 @@ func (s *Service) RenameWithOperation(ctx context.Context, id OperationID, oldPa
 }
 
 func (s *Service) executeRenameOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, parent uint64, oldName, newName, intent []byte) error {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		err := s.publishRenameOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, parent, oldName, newName, intent)

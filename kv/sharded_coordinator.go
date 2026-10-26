@@ -1990,16 +1990,20 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 
 	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, gids, commitTS, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
-		// abortPreparedTxn must run even when ctx was the reason
-		// commitPrimaryTxn failed — otherwise prewrite intents on
-		// every prepared shard linger until LockResolver picks them
-		// up at a future tick (lease window of expensive
-		// keyspace-scan work). Detach cancellation but cap with
-		// verifyLeaderTimeout so a hung Abort cannot leak.
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
-		cancel()
-		return nil, errors.WithStack(err)
+		if primaryCommitDefinitelyRejected(err) {
+			// A deterministic apply verdict or pre-append leadership rejection
+			// is a definitive non-commit. Release prepared intents even if the
+			// caller has since cancelled.
+			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
+			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
+			cancel()
+			return nil, errors.WithStack(err)
+		}
+		// A lost primary COMMIT response may conceal a durable commit
+		// decision. Aborting prepared secondaries here can then turn one
+		// committed transaction into a partial commit. Lock resolution must
+		// consult the primary decision; retain the intents until it does.
+		return nil, fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 	}
 
 	// commitSecondaryTxns propagates ObservedRouteVersion to per-
@@ -2020,6 +2024,16 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: maxIndex, CommitTS: commitTS}, nil
+}
+
+func primaryCommitDefinitelyRejected(err error) bool {
+	if errors.Is(err, ErrTransactionOutcomeUnknown) {
+		return false
+	}
+	return isRawApplyVerdict(err) ||
+		errors.Is(err, ErrComposed1Violation) ||
+		errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
 }
 
 func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, commitTS uint64) (uint64, error) {
@@ -2069,7 +2083,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 		return nil, errors.WithStack(err)
 	}
 	if resp == nil {
-		return &CoordinateResponse{}, nil
+		return nil, errors.WithStack(ErrTransactionOutcomeUnknown)
 	}
 	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
 }
@@ -2201,7 +2215,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 		return primaryGid, 0, errors.WithStack(err)
 	}
 	if r == nil {
-		return primaryGid, 0, nil
+		return primaryGid, 0, errors.WithStack(ErrTransactionOutcomeUnknown)
 	}
 	return primaryGid, r.CommitIndex, nil
 }

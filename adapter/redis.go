@@ -422,6 +422,11 @@ func isTransientLeaderRedisError(err error) bool {
 	if err == nil {
 		return false
 	}
+	// A proposal may have committed before leadership was lost. An unknown
+	// transaction outcome must not become a NOTLEADER retry instruction.
+	if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		return false
+	}
 	if errors.Is(err, ErrLeaderNotFound) ||
 		errors.Is(err, ErrNotLeader) ||
 		errors.Is(err, kv.ErrLeaderNotFound) ||

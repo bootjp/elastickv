@@ -51,6 +51,9 @@ func TestFileSystemMetricsObserveOperationsAndPlacement(t *testing.T) {
 		OpenHandleLeases: 4,
 		OrphanedInodes:   5,
 	})
+	metrics.ObserveOperationJournalStats(filesystem.OperationJournalStats{
+		Sessions: 2, Pending: 1, RetainedBytes: 4096,
+	})
 
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.chunkReadOpsTotal))
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.chunkWriteOpsTotal))
@@ -61,6 +64,9 @@ func TestFileSystemMetricsObserveOperationsAndPlacement(t *testing.T) {
 	require.Equal(t, float64(1), testutil.ToFloat64(metrics.fileMoveInflight))
 	require.Equal(t, float64(4), testutil.ToFloat64(metrics.openHandleLeaseActive))
 	require.Equal(t, float64(5), testutil.ToFloat64(metrics.orphanInodeGCPending))
+	require.Equal(t, float64(2), testutil.ToFloat64(metrics.journalSessions))
+	require.Equal(t, float64(1), testutil.ToFloat64(metrics.journalPending))
+	require.Equal(t, float64(4096), testutil.ToFloat64(metrics.journalRetainedBytes))
 	require.Equal(t, float64(2), testutil.ToFloat64(metrics.filesByGroup.WithLabelValues("1")))
 	require.Equal(t, float64(3), testutil.ToFloat64(metrics.filesByGroup.WithLabelValues("2")))
 

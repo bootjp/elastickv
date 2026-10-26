@@ -7,6 +7,20 @@ on:
         description: "Workload runtime seconds"
         required: false
         default: "300"
+      long-fuse-run:
+        description: "Run FUSE Jepsen workloads for 30 minutes"
+        type: boolean
+        required: false
+        default: false
+      strict-mode:
+        description: "Use strict FUSE mode for filesystem workloads"
+        type: boolean
+        required: false
+        default: true
+      workloads-json:
+        description: "Optional JSON array of workload names to run"
+        required: false
+        default: ""
       rate:
         description: "Ops/sec per worker"
         required: false
@@ -41,27 +55,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        workload:
-          - unit
-          - redis
-          - redis-zset
-          - dynamodb
-          - dynamodb-type-string
-          - dynamodb-type-number
-          - dynamodb-type-binary
-          - dynamodb-type-bool
-          - dynamodb-type-null
-          - dynamodb-type-string-set
-          - dynamodb-type-number-set
-          - dynamodb-type-binary-set
-          - dynamodb-type-list
-          - dynamodb-type-map
-          - s3
-          - filesystem-cross-mount
-          - filesystem-sqlite-check
-          - filesystem-overwrite
-          - filesystem-rename
-          - sqlite
+        workload: ${{ fromJSON(inputs.workloads-json || '["unit","redis","redis-zset","dynamodb","dynamodb-type-string","dynamodb-type-number","dynamodb-type-binary","dynamodb-type-bool","dynamodb-type-null","dynamodb-type-string-set","dynamodb-type-number-set","dynamodb-type-binary-set","dynamodb-type-list","dynamodb-type-map","s3","filesystem-cross-mount","filesystem-sqlite-check","filesystem-node-crash","filesystem-benchmark","filesystem-benchmark-legacy","filesystem-benchmark-multigroup","filesystem-benchmark-multigroup-legacy","filesystem-overwrite","filesystem-rename","sqlite"]') }}
     env:
       GOCACHE: /tmp/go-build
       WORKLOAD: ${{ matrix.workload }}
@@ -159,9 +153,9 @@ jobs:
       - name: Run Redis Jepsen workload against elastickv
         if: matrix.workload == 'redis'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.redis-workload \
+          timeout 3600 ~/lein run -m elastickv.redis-workload \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
@@ -173,9 +167,9 @@ jobs:
       - name: Run Redis ZSet safety Jepsen workload against elastickv
         if: matrix.workload == 'redis-zset'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.redis-zset-safety-workload \
+          timeout 3600 ~/lein run -m elastickv.redis-zset-safety-workload \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
@@ -184,9 +178,9 @@ jobs:
       - name: Run DynamoDB Jepsen workload against elastickv
         if: matrix.workload == 'dynamodb'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.dynamodb-workload --local \
+          timeout 3600 ~/lein run -m elastickv.dynamodb-workload --local \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
@@ -220,9 +214,9 @@ jobs:
       - name: Run S3 Jepsen workload against elastickv
         if: matrix.workload == 's3'
         working-directory: jepsen
-        timeout-minutes: 15
+        timeout-minutes: 70
         run: |
-          timeout 720 ~/lein run -m elastickv.s3-workload --local \
+          timeout 3600 ~/lein run -m elastickv.s3-workload --local \
             --time-limit ${{ inputs.time-limit || '300' }} \
             --rate ${{ inputs.rate || '10' }} \
             --concurrency ${{ inputs.concurrency || '8' }} \
@@ -244,6 +238,44 @@ jobs:
           RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
           RAFT_S3_MAP="127.0.0.1:50051=127.0.0.1:63901,127.0.0.1:50052=127.0.0.1:63902,127.0.0.1:50053=127.0.0.1:63903"
           RAFT_DYNAMO_MAP="127.0.0.1:50051=127.0.0.1:63801,127.0.0.1:50052=127.0.0.1:63802,127.0.0.1:50053=127.0.0.1:63803"
+          STRICT_FLAGS=(--filesystemStrict)
+          if [[ "${{ github.event_name }}" == 'workflow_dispatch' && "${{ inputs.strict-mode }}" == 'false' ]] ||
+             [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then
+            STRICT_FLAGS=()
+          fi
+
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then
+            mkdir -p /tmp/elastickv-fs/fs-n1
+            nohup /tmp/elastickv-bin \
+              --address "127.0.0.1:50051" \
+              --redisAddress "" --dynamoAddress "" --s3Address "" --sqsAddress "" \
+              --filesystemMount /tmp/elastickv-fs/fs-n1 \
+              "${STRICT_FLAGS[@]}" \
+              --filesystemRootUID "$(id -u)" \
+              --filesystemRootGID "$(id -g)" \
+              --metricsAddress "" --pprofAddress "" \
+              --raftId n1 --raftDataDir /tmp/elastickv-fs/n1 --raftBootstrap \
+              --raftGroups "1=127.0.0.1:50051,2=127.0.0.1:50054" \
+              --shardRanges ':!fs|op|=1,!fs|op|:=2' \
+              > /tmp/elastickv-fs-n1.log 2>&1 &
+            echo $! > /tmp/elastickv-fs.pid
+            for _ in {1..90}; do
+              if ! kill -0 "$(cat /tmp/elastickv-fs.pid)" 2>/dev/null; then
+                echo "Two-group filesystem process exited before readiness" >&2
+                tail -n 200 /tmp/elastickv-fs-n1.log || true
+                exit 1
+              fi
+              if nc -z 127.0.0.1 50051 && nc -z 127.0.0.1 50054 \
+                && mountpoint -q /tmp/elastickv-fs/fs-n1 \
+                && stat /tmp/elastickv-fs/fs-n1 >/dev/null; then
+                echo "Two-group filesystem cluster is up"
+                exit 0
+              fi
+              sleep 1
+            done
+            tail -n 200 /tmp/elastickv-fs-n1.log || true
+            exit 1
+          fi
 
           : > /tmp/elastickv-fs.pid
           for node in 1 2 3; do
@@ -254,7 +286,7 @@ jobs:
               --dynamoAddress "127.0.0.1:6380${node}" \
               --s3Address "127.0.0.1:6390${node}" \
               --filesystemMount "/tmp/elastickv-fs/fs-n${node}" \
-              --filesystemStrict \
+              "${STRICT_FLAGS[@]}" \
               --filesystemRootUID "$(id -u)" \
               --filesystemRootGID "$(id -g)" \
               --metricsAddress "" \
@@ -296,15 +328,47 @@ jobs:
       - name: Verify SQLite rollback journals without client retries
         if: matrix.workload == 'filesystem-sqlite-check'
         run: python3 scripts/test-fuse-sqlite.py /tmp/elastickv-fs/fs-n1 --writes 30
+      - name: Verify strict FUSE fsync after Raft node crash
+        if: matrix.workload == 'filesystem-node-crash'
+        timeout-minutes: 5
+        run: |
+          python3 scripts/test-fuse-node-crash.py \
+            /tmp/elastickv-fs/fs-n1 \
+            /tmp/elastickv-fs/fs-n2 \
+            /tmp/elastickv-fs/fs-n3 \
+            --pid-file /tmp/elastickv-fs.pid \
+            --restart-log /tmp/elastickv-fs-n1-restarted.log
+      - name: Measure FUSE write and fsync latency
+        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup' || matrix.workload == 'filesystem-benchmark-multigroup-legacy'
+        timeout-minutes: 10
+        run: |
+          python3 scripts/test_benchmark_fuse.py
+          MODE=strict
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then MODE=legacy; fi
+          LAYOUT=single-group
+          if [[ "$WORKLOAD" == 'filesystem-benchmark-multigroup' || "$WORKLOAD" == 'filesystem-benchmark-multigroup-legacy' ]]; then LAYOUT=two-group; fi
+          python3 scripts/benchmark-fuse.py /tmp/elastickv-fs/fs-n1 \
+            --mode "$MODE" --layout "$LAYOUT" --writes 40 --workers 4 --repetitions 3 \
+            --output /tmp/elastickv-fuse-benchmark.json
+      - name: Upload FUSE benchmark results
+        if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy' || matrix.workload == 'filesystem-benchmark-multigroup' || matrix.workload == 'filesystem-benchmark-multigroup-legacy'
+        uses: actions/upload-artifact@v7
+        with:
+          name: elastickv-fuse-benchmark-${{ matrix.workload }}
+          path: /tmp/elastickv-fuse-benchmark.json
+          retention-days: 14
       - name: Run filesystem Jepsen workload against elastickv
         if: matrix.workload == 'filesystem-overwrite' || matrix.workload == 'filesystem-rename'
         working-directory: jepsen
         # Each write mode uses a fresh filesystem cluster on its own runner.
-        # See jepsen/src/elastickv/filesystem_workload.clj.
-        timeout-minutes: 30
+        # The scheduled run keeps enough bounded registers to exercise strict
+        # mutations for the full 30-minute workload. See filesystem_budget.sh.
+        timeout-minutes: 70
         env:
-          FS_REQUESTED_KEYS: ${{ inputs.key-count || '16' }}
-          FS_REQUESTED_WRITES: ${{ inputs.max-writes-per-key || '250' }}
+          FS_TIME_LIMIT: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1800' || inputs.time-limit || '300' }}
+          FS_RATE: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1' || inputs.rate || '10' }}
+          FS_REQUESTED_KEYS: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '512' || inputs.key-count || '16' }}
+          FS_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || inputs.max-writes-per-key || '250' }}
         run: |
           # Knossos checks each register independently. Bound each history's
           # ambiguous writes while keeping the requested total write budget.
@@ -323,9 +387,9 @@ jobs:
           MODE="${WORKLOAD#filesystem-}"
           filesystem_budget "$MODE" "$FS_REQUESTED_KEYS" "$FS_REQUESTED_WRITES"
           echo "Filesystem register budget: ${FS_KEY_COUNT} keys, ${FS_MAX_WRITES} writes per key"
-          timeout 720 ~/lein run -m elastickv.filesystem-workload --local \
-            --time-limit ${{ inputs.time-limit || '300' }} \
-            --rate ${{ inputs.rate || '10' }} \
+          timeout 3600 ~/lein run -m elastickv.filesystem-workload --local \
+            --time-limit "$FS_TIME_LIMIT" \
+            --rate "$FS_RATE" \
             --concurrency ${{ inputs.concurrency || '8' }} \
             --key-count "$FS_KEY_COUNT" \
             --max-writes-per-key "$FS_MAX_WRITES" \
@@ -334,29 +398,35 @@ jobs:
       - name: Run SQLite Jepsen workload on FUSE
         if: matrix.workload == 'sqlite'
         working-directory: jepsen
-        timeout-minutes: 20
+        timeout-minutes: 70
+        env:
+          FS_TIME_LIMIT: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1800' || inputs.time-limit || '300' }}
+          FS_RATE: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '0.25' || inputs.rate || '10' }}
+          SQLITE_REQUESTED_KEYS: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '128' || '24' }}
+          SQLITE_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || '64' }}
         run: |
           # Spread the longer run across databases while bounding the
           # ambiguous writes Knossos must explore for any one database.
           bash test/sqlite_budget_test.sh
           source ./sqlite_budget.sh
-          sqlite_budget 24 64
+          sqlite_budget "$SQLITE_REQUESTED_KEYS" "$SQLITE_REQUESTED_WRITES"
           echo "SQLite register budget: ${SQLITE_KEY_COUNT} keys, ${SQLITE_MAX_WRITES} writes per key"
-          timeout 900 ~/lein run -m elastickv.sqlite-workload --local \
-            --time-limit ${{ inputs.time-limit || '300' }} \
-            --rate ${{ inputs.rate || '10' }} \
+          timeout 3600 ~/lein run -m elastickv.sqlite-workload --local \
+            --time-limit "$FS_TIME_LIMIT" \
+            --rate "$FS_RATE" \
             --concurrency 8 --key-count "$SQLITE_KEY_COUNT" --max-writes-per-key "$SQLITE_MAX_WRITES" \
             --mount-dirs /tmp/elastickv-fs/fs-n1,/tmp/elastickv-fs/fs-n2,/tmp/elastickv-fs/fs-n3
-      - name: Archive Jepsen store on failure
-        if: failure() && matrix.workload != 'unit'
+      - name: Archive Jepsen history
+        if: always() && matrix.workload != 'unit'
         run: bash scripts/archive-jepsen-store.sh jepsen/store /tmp/jepsen-store-types.tar.gz
-      - name: Upload Jepsen store on failure
-        if: failure() && matrix.workload != 'unit'
+      - name: Upload Jepsen history
+        if: always() && matrix.workload != 'unit'
         uses: actions/upload-artifact@v7
         with:
           name: jepsen-store-${{ matrix.workload }}
           path: /tmp/jepsen-store-types.tar.gz
           retention-days: 7
+          if-no-files-found: ignore
       - name: Dump demo cluster log on failure
         if: failure() && matrix.workload != 'unit' && !startsWith(matrix.workload, 'filesystem-') && matrix.workload != 'sqlite'
         # The previous `tail -n 500` truncated a 3-minute workload's
@@ -394,6 +464,7 @@ jobs:
             echo "=== ${node}: full log line count ==="
             wc -l "$log" || true
           done
+          tail -n 200 /tmp/elastickv-fs-n1-restarted.log || true
       - name: Upload filesystem cluster logs on failure
         if: failure() && (startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite')
         uses: actions/upload-artifact@v7
@@ -403,6 +474,7 @@ jobs:
             /tmp/elastickv-fs-n1.log
             /tmp/elastickv-fs-n2.log
             /tmp/elastickv-fs-n3.log
+            /tmp/elastickv-fs-n1-restarted.log
           retention-days: 14
           if-no-files-found: ignore
       - name: Stop demo cluster

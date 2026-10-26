@@ -66,7 +66,7 @@ func (s *Service) admitHandleOperation(ctx context.Context, id OperationID, inte
 }
 
 func (s *Service) executeReleaseOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, inode, fh uint64, clientID, intent []byte) error {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		err := s.publishReleaseOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, inode, fh, clientID, intent)

@@ -1,0 +1,162 @@
+#!/usr/bin/env python3
+"""Measure FUSE write plus fsync latency on one file and a hot inode."""
+
+import argparse
+import json
+import multiprocessing
+import os
+import pathlib
+import time
+import uuid
+
+
+BLOCK = 4096
+
+
+def percentile(samples, percent):
+    ordered = sorted(samples)
+    index = max(0, (len(ordered) * percent + 99) // 100 - 1)
+    return round(ordered[index] / 1_000_000, 3)
+
+
+def summary(samples, elapsed):
+    return {
+        "operations": len(samples),
+        "elapsed_seconds": round(elapsed, 3),
+        "ops_per_second": round(len(samples) / elapsed, 3),
+        "latency_ms": {
+            "p50": percentile(samples, 50),
+            "p95": percentile(samples, 95),
+            "p99": percentile(samples, 99),
+            "max": round(max(samples) / 1_000_000, 3),
+        },
+    }
+
+
+def write_and_sync(fd, offset, payload):
+    started = time.perf_counter_ns()
+    written = os.pwrite(fd, payload, offset)
+    if written != len(payload):
+        raise OSError(f"short pwrite: {written}/{len(payload)}")
+    os.fsync(fd)
+    return time.perf_counter_ns() - started
+
+
+def hot_writer(path, worker, writes, workers, start, results):
+    samples = []
+    try:
+        fd = os.open(path, os.O_RDWR)
+        try:
+            if not start.wait(30):
+                raise TimeoutError("hot writer start timed out")
+            payload = bytes([worker + 1]) * BLOCK
+            for index in range(writes):
+                samples.append(write_and_sync(fd, (index * workers + worker) * BLOCK, payload))
+        finally:
+            os.close(fd)
+        results.put((samples, None))
+    except Exception as exc:
+        results.put((samples, repr(exc)))
+
+
+def collect_worker_results(processes, results, timeout=300):
+    try:
+        # A worker cannot exit until its queue feeder flushes. Read each
+        # result before join so a large sample list cannot fill the pipe.
+        outcomes = [results.get(timeout=timeout) for _ in processes]
+    except Exception:
+        for process in processes:
+            process.terminate()
+            process.join()
+        raise
+    for process in processes:
+        process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            raise TimeoutError("hot writer did not exit after returning results")
+        if process.exitcode != 0:
+            raise RuntimeError(f"hot writer exited with status {process.exitcode}")
+    return outcomes
+
+
+def run_serial(path, writes):
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    samples = []
+    try:
+        started = time.perf_counter()
+        for index in range(writes):
+            samples.append(write_and_sync(fd, index * BLOCK, b"S" * BLOCK))
+        elapsed = time.perf_counter() - started
+    finally:
+        os.close(fd)
+    if path.read_bytes() != b"S" * BLOCK * writes:
+        raise AssertionError("serial writes were not retained")
+    return summary(samples, elapsed)
+
+
+def run_hot(path, workers, writes):
+    fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+    os.close(fd)
+    start = multiprocessing.Event()
+    results = multiprocessing.Queue()
+    processes = [
+        multiprocessing.Process(target=hot_writer, args=(str(path), worker, writes, workers, start, results))
+        for worker in range(workers)
+    ]
+    for process in processes:
+        process.start()
+    started = time.perf_counter()
+    start.set()
+    outcomes = collect_worker_results(processes, results)
+    failures = [error for _, error in outcomes if error]
+    if failures:
+        raise RuntimeError(f"hot writer errors: {failures}")
+    samples = [sample for worker_samples, _ in outcomes for sample in worker_samples]
+    elapsed = time.perf_counter() - started
+    expected = b"".join(bytes([worker + 1]) * BLOCK for _ in range(writes) for worker in range(workers))
+    if path.read_bytes() != expected:
+        raise AssertionError("hot inode writes were not retained")
+    result = summary(samples, elapsed)
+    worker_rates = [len(worker_samples) * 1_000_000_000 / sum(worker_samples)
+                    for worker_samples, _ in outcomes]
+    result["worker_fairness_min_to_max"] = round(min(worker_rates) / max(worker_rates), 3)
+    return result
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("mount", type=pathlib.Path)
+    parser.add_argument("--writes", type=int, default=40)
+    parser.add_argument("--workers", type=int, default=4)
+    parser.add_argument("--repetitions", type=int, default=3)
+    parser.add_argument("--mode", choices=("strict", "legacy"), required=True)
+    parser.add_argument("--layout", choices=("single-group", "two-group"), required=True)
+    parser.add_argument("--output", type=pathlib.Path, required=True)
+    args = parser.parse_args()
+    if args.writes < 1 or not 1 <= args.workers <= 255 or args.repetitions < 1:
+        parser.error("writes and repetitions must be positive; workers must be between 1 and 255")
+    prefix = uuid.uuid4().hex
+    result = {
+        "source_sha": os.environ.get("GITHUB_SHA"),
+        "workflow_run_id": os.environ.get("GITHUB_RUN_ID"),
+        "runner_os": os.environ.get("RUNNER_OS"),
+        "block_bytes": BLOCK,
+        "writes_per_worker": args.writes,
+        "workers": args.workers,
+        "mode": args.mode,
+        "layout": args.layout,
+        "trials": [],
+    }
+    for trial in range(args.repetitions):
+        result["trials"].append({
+            "trial": trial + 1,
+            "serial": run_serial(args.mount / f"benchmark-serial-{prefix}-{trial}.dat", args.writes),
+            "hot_inode": run_hot(args.mount / f"benchmark-hot-{prefix}-{trial}.dat", args.workers, args.writes),
+        })
+    args.output.write_text(json.dumps(result, indent=2) + "\n")
+    print(json.dumps(result, indent=2))
+
+
+if __name__ == "__main__":
+    main()

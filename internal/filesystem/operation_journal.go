@@ -37,12 +37,16 @@ func (b serviceOperationBackend) Snapshot(ctx context.Context) (uint64, error) {
 }
 
 func (b serviceOperationBackend) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	value, err := b.service.store.GetAt(ctx, key, ts)
+	value, err := retryJournalLocked(ctx, func(ctx context.Context) ([]byte, error) {
+		return b.service.store.GetAt(ctx, key, ts)
+	})
 	return value, errors.Wrap(err, "read operation journal")
 }
 
 func (b serviceOperationBackend) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	page, err := b.service.store.ScanAt(ctx, start, end, limit, ts)
+	page, err := retryJournalLocked(ctx, func(ctx context.Context) ([]*store.KVPair, error) {
+		return b.service.store.ScanAt(ctx, start, end, limit, ts)
+	})
 	return page, errors.Wrap(err, "scan operation journal")
 }
 
@@ -83,7 +87,39 @@ func (b serviceOperationBackend) commit(ctx context.Context, ts uint64, elems []
 		}
 		primary = elem.Key
 	}
-	return b.service.dispatchTxnWithPrimaryAtRoute(ctx, ts, elems, readKeys, true, primary, observed)
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	select {
+	case <-b.service.journalCommitPermit:
+		defer func() { b.service.journalCommitPermit <- struct{}{} }()
+	case <-ctx.Done():
+		return nil, errors.WithStack(ctx.Err())
+	}
+	return retryJournalLocked(ctx, func(ctx context.Context) (*kv.CoordinateResponse, error) {
+		return b.service.dispatchTxnWithPrimaryAtRoute(ctx, ts, elems, readKeys, true, primary, observed)
+	})
+}
+
+// A lock held by another journal transaction is a transient dependency. The
+// caller retains the same snapshot and attempt identity while the owner
+// finishes. An unknown transaction outcome is never retried here.
+func retryJournalLocked[T any](ctx context.Context, call func(context.Context) (T, error)) (T, error) {
+	var result T
+	for retry := range operationCASRetries {
+		value, err := call(ctx)
+		if !errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			return value, err
+		}
+		result = value
+		if retry == operationCASRetries-1 {
+			return result, err
+		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return result, err
+		}
+	}
+	return result, errors.WithStack(ErrContentionLimit)
 }
 
 func (b serviceOperationBackend) CommittedVersionAt(ctx context.Context, key []byte, ts uint64) (bool, error) {
@@ -399,7 +435,7 @@ func (j *OperationJournal) loadSessionAt(ctx context.Context, id OperationSessio
 	}
 	session, err := decodeOperationSession(raw)
 	if err != nil || session.ID != id {
-		return operationSession{}, false, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationSession{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session row")
 	}
 	return session, true, nil
 }
@@ -414,7 +450,7 @@ func (j *OperationJournal) loadRecordAt(ctx context.Context, id OperationID, ts 
 	}
 	record, err := decodeOperationRecord(raw)
 	if err != nil || record.ID != id {
-		return operationRecord{}, false, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationRecord{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation row")
 	}
 	return record, true, nil
 }

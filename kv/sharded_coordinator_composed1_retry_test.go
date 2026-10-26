@@ -48,7 +48,7 @@ func (s *composed1RetryingTransactional) Commit(_ context.Context, reqs []*pb.Re
 		}
 		s.prevCommitTSSeen = append(s.prevCommitTSSeen, prev)
 	}
-	if n == 1 {
+	if n == 1 && s.firstErr != nil {
 		return nil, s.firstErr
 	}
 	return &TransactionResponse{CommitIndex: uint64(n)}, nil //nolint:gosec // n is a small positive counter for test-stub responses

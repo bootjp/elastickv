@@ -61,7 +61,7 @@ func (s *Service) SetAttrWithOperation(ctx context.Context, id OperationID, inod
 }
 
 func (s *Service) executeSetAttrOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, inode uint64, mask SetAttrMask, attrs SetAttr, intent []byte) (Stat, error) {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		stat, err := s.publishSetAttrOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, inode, mask, attrs, intent)

@@ -89,7 +89,7 @@ func createEffectLimit(parent uint64, name, clientID []byte) (uint32, error) {
 }
 
 func (s *Service) executeCreateOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, parent uint64, name []byte, typ FileType, opts CreateOptions, intent []byte) (CreateResult, error) {
-	deadlineCtx, cancel := context.WithTimeout(ctx, writeConflictRetryBudget)
+	deadlineCtx, cancel := operationDecisionContext(ctx)
 	defer cancel()
 	for retry := range writeConflictRetryLimit {
 		result, err := s.publishCreateOperationAttempt(deadlineCtx, journal, id, attempt.AttemptID, parent, name, typ, opts, intent)
