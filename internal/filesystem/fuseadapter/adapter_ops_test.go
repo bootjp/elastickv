@@ -75,6 +75,30 @@ type receiptCore struct {
 	verifyErr error
 }
 
+type journalUnlinkCore struct {
+	*receiptCore
+	unlinkIDs []filesystem.OperationID
+}
+
+func (c *journalUnlinkCore) UnlinkWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte) error {
+	c.unlinkIDs = append(c.unlinkIDs, id)
+	return nil
+}
+
+func TestAdapterDirectoryFsyncVerifiesUnlinkReceipt(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalUnlinkCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledUnlink(session))
+	t.Cleanup(adapter.Close)
+	require.Zero(t, adapter.Unlink(t.Context(), filesystem.RootInode, []byte("file")))
+	require.Zero(t, adapter.FsyncDirectory(t.Context(), filesystem.RootInode))
+	require.Equal(t, core.unlinkIDs, core.verified)
+	require.True(t, core.fsyncCalled)
+	require.Zero(t, core.unlinkParent)
+}
+
 func (c *receiptCore) VerifyOperationReceipt(_ context.Context, id filesystem.OperationID) error {
 	c.verified = append(c.verified, id)
 	return c.verifyErr

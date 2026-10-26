@@ -50,6 +50,7 @@ type Adapter struct {
 	sessionConflict   bool
 	journaledWrites   bool
 	journaledMetadata bool
+	journaledUnlink   bool
 	operationSequence atomic.Uint64
 	receiptMu         sync.Mutex
 	receipts          map[uint64]map[filesystem.OperationID]struct{}
@@ -127,6 +128,14 @@ func WithJournaledMetadata(session filesystem.OperationSessionID) Option {
 	return func(a *Adapter) {
 		a.setOperationSession(session)
 		a.journaledMetadata = true
+	}
+}
+
+// WithJournaledUnlink journals file unlink requests under the same session.
+func WithJournaledUnlink(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledUnlink = true
 	}
 }
 
@@ -319,7 +328,15 @@ func (a *Adapter) FsyncDirectory(ctx context.Context, inode uint64) syscall.Errn
 	if errno := a.mutations.wait(ctx, inode); errno != 0 {
 		return errno
 	}
-	return Errno(a.core.Fsync(ctx, inode, 0, false))
+	receipts, errno := a.verifyReceipts(ctx, inode)
+	if errno != 0 {
+		return errno
+	}
+	if errno := Errno(a.core.Fsync(ctx, inode, 0, false)); errno != 0 {
+		return errno
+	}
+	a.clearReceipts(inode, receipts)
+	return 0
 }
 
 func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
@@ -391,7 +408,21 @@ func (a *Adapter) Unlink(ctx context.Context, parent uint64, name []byte) (errno
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	err = a.core.Unlink(ctx, parent, name)
+	if a.journaledUnlink {
+		unlinker, ok := a.core.(interface {
+			UnlinkWithOperation(context.Context, filesystem.OperationID, uint64, []byte) error
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		err = unlinker.UnlinkWithOperation(ctx, id, parent, name)
+		if err == nil {
+			a.recordReceipt(parent, id)
+		}
+	} else {
+		err = a.core.Unlink(ctx, parent, name)
+	}
 	return Errno(err)
 }
 

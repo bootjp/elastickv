@@ -443,3 +443,32 @@ func TestKernelMountJournaledMetadataChange(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o640), stat.Mode().Perm())
 }
+
+func TestKernelMountJournaledUnlinkAndDirectoryFsync(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-unlink")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-unlink", mountPoint,
+		fuseadapter.WithJournaledUnlink(session))
+	path := filepath.Join(mountPoint, "file")
+	require.NoError(t, os.WriteFile(path, []byte("old"), 0o600))
+	require.NoError(t, os.Remove(path))
+	dir, err := os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, dir.Sync())
+	require.NoError(t, dir.Close())
+	require.NoError(t, os.WriteFile(path, []byte("new"), 0o600))
+	id := filesystem.OperationID{Filesystem: session.Filesystem, Session: session.Session, Sequence: 1}
+	require.NoError(t, svc.UnlinkWithOperation(t.Context(), id, filesystem.RootInode, []byte("file")))
+	data, err := os.ReadFile(path)
+	require.NoError(t, err)
+	require.Equal(t, []byte("new"), data)
+}
