@@ -94,6 +94,12 @@ func (r *RawFileSystem) OnReplyAttempt(unique uint64, _ uint32, _ fuse.Status, _
 	r.adapter.replyAttempted(unique)
 }
 
+// OnReplySuppressed retires a request after go-fuse has decided that no FUSE
+// reply can be sent, including an interrupted request on a dead connection.
+func (r *RawFileSystem) OnReplySuppressed(unique uint64, _ uint32, _ fuse.Status) {
+	r.adapter.replySuppressed(unique)
+}
+
 // toStatus converts an adapter errno into a FUSE status. Errno values
 // outside the int32 range of fuse.Status cannot be a real errno, so they
 // map to EIO instead of being truncated.
@@ -907,30 +913,19 @@ func (s *Server) Unmount() error {
 	if s == nil {
 		return nil
 	}
-	defer func() {
+	if s.inner == nil || s.isReleased() {
 		if s.adapter != nil {
 			s.adapter.Close()
 		}
-	}()
-	if s.inner == nil || s.isReleased() {
 		return nil
 	}
 	if err := s.inner.Unmount(); err != nil {
 		return errors.WithStack(err)
 	}
-	s.finishStrictSession()
+	if s.adapter != nil {
+		s.adapter.Close()
+	}
 	return nil
-}
-
-func (s *Server) finishStrictSession() {
-	if s.adapter == nil {
-		return
-	}
-	ctx, cancel := context.WithTimeout(context.Background(), ackTimeout)
-	defer cancel()
-	if err := s.adapter.finishStrictSession(ctx); err != nil {
-		slog.Warn("filesystem strict session remains open after unmount", "error", err.Error())
-	}
 }
 
 // UnmountLazy detaches the mount from the namespace even while clients still
@@ -954,12 +949,18 @@ func (s *Server) UnmountLazy(ctx context.Context) error {
 	}
 	s.fs.cancelInFlight()
 	if s.inner == nil || s.mountPoint == "" {
+		if s.adapter != nil {
+			s.adapter.Close()
+		}
 		return nil
 	}
 	_, err := detachFUSEMount(ctx, s.mountPoint, s.fsType)
 	if errors.Is(err, errNoFUSEMount) {
 		slog.InfoContext(ctx, "filesystem FUSE mount is already gone, nothing to detach", "mount_point", s.mountPoint)
-		return nil
+		err = nil
+	}
+	if err == nil && s.adapter != nil {
+		s.adapter.Close()
 	}
 	return err
 }

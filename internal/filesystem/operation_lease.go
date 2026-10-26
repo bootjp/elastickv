@@ -14,7 +14,6 @@ import (
 const (
 	leaseOperationVersion     = 1
 	leaseOperationResultLimit = 1
-	leaseOperationEffectLimit = 256
 	leaseResultSuccess        = 0
 	leaseResultMissing        = 1
 )
@@ -33,7 +32,11 @@ func (s *Service) RefreshOpenHandleLeaseWithOperation(ctx context.Context, id Op
 	if err != nil {
 		return errors.Wrap(err, "encode lease intent")
 	}
-	journal, attempt, terminal, err := s.admitHandleOperation(ctx, id, intent, leaseOperationResultLimit, leaseOperationEffectLimit)
+	effectLimit, err := handleLeaseEffectLimit(inode, clientID, false)
+	if err != nil {
+		return err
+	}
+	journal, attempt, terminal, err := s.admitHandleOperation(ctx, id, intent, leaseOperationResultLimit, effectLimit)
 	if err != nil {
 		return err
 	}

@@ -69,6 +69,7 @@ type Adapter struct {
 	keepaliveInterval time.Duration
 	keepaliveTimeout  time.Duration
 	keepaliveCancel   context.CancelFunc
+	keepaliveDone     chan struct{}
 	closeOnce         sync.Once
 	handlesMu         sync.Mutex
 	handles           map[openHandleKey]struct{}
@@ -77,6 +78,7 @@ type Adapter struct {
 	replyMu           sync.Mutex
 	replyIDs          map[uint64][]filesystem.OperationID
 	ackPending        map[filesystem.OperationID]struct{}
+	ackCursor         uint64
 	ackWake           chan struct{}
 	ackCancel         context.CancelFunc
 }
@@ -253,7 +255,11 @@ func New(core Core, clientID []byte, opts ...Option) *Adapter {
 	if a.keepaliveInterval > disabledHandleKeepaliveInterval {
 		ctx, cancel := context.WithCancel(context.Background())
 		a.keepaliveCancel = cancel
-		go a.keepOpenHandlesAlive(ctx)
+		a.keepaliveDone = make(chan struct{})
+		go func() {
+			defer close(a.keepaliveDone)
+			a.keepOpenHandlesAlive(ctx)
+		}()
 	}
 	if a.operationSession != (filesystem.OperationSessionID{}) {
 		ctx, cancel := context.WithCancel(context.Background())
@@ -269,15 +275,26 @@ func (a *Adapter) Close() {
 		if a.keepaliveCancel != nil {
 			a.keepaliveCancel()
 		}
-		if a.ackCancel != nil {
-			a.ackCancel()
-		}
 		if a.strictMode {
 			ctx, cancel := context.WithTimeout(context.Background(), ackTimeout)
 			defer cancel()
-			if err := a.finishStrictSession(ctx); err != nil {
+			var err error
+			if a.keepaliveDone != nil {
+				select {
+				case <-a.keepaliveDone:
+				case <-ctx.Done():
+					err = ctx.Err()
+				}
+			}
+			if err == nil {
+				err = a.finishStrictSession(ctx)
+			}
+			if err != nil {
 				slog.Warn("filesystem strict session remains open after close", "error", err.Error())
 			}
+		}
+		if a.ackCancel != nil {
+			a.ackCancel()
 		}
 	})
 }
@@ -741,9 +758,10 @@ func (a *Adapter) refreshJournaledLease(ctx context.Context, inode uint64, fh ui
 		a.retainLatestLeaseReceipt(ctx, inode, fh, id)
 		a.markLeaseRefreshed(inode, fh)
 	}
-	// Keepalive renewals have no kernel reply. Completion of the renewal is
-	// their acknowledgement boundary; uncertain outcomes remain retained.
-	if ctx.Value(backgroundOperationKey{}) == true && !errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+	// Keepalive renewals have no kernel reply. Completion of the call is their
+	// acknowledgement boundary; the worker resolves uncertain outcomes under
+	// the journal's admission and publication fences before retirement.
+	if ctx.Value(backgroundOperationKey{}) == true {
 		a.queueAcknowledgement(id)
 	}
 	return errors.Wrap(err, "refresh journaled open handle lease")

@@ -191,7 +191,7 @@ func TestAdapterKeepaliveUsesJournaledLeaseRefresh(t *testing.T) {
 	require.ElementsMatch(t, core.leaseIDs, core.verified)
 }
 
-func TestAdapterKeepaliveRetainsUnknownLease(t *testing.T) {
+func TestAdapterKeepaliveQueuesUnknownLeaseForResolution(t *testing.T) {
 	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
 	core := &journalLeaseCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
 		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
@@ -204,7 +204,7 @@ func TestAdapterKeepaliveRetainsUnknownLease(t *testing.T) {
 	adapter.replyMu.Lock()
 	_, queued := adapter.ackPending[core.leaseIDs[0]]
 	adapter.replyMu.Unlock()
-	require.False(t, queued)
+	require.True(t, queued)
 }
 
 func (c *journalLifecycleCore) CreateWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte, _ filesystem.CreateOptions) (filesystem.CreateResult, error) {

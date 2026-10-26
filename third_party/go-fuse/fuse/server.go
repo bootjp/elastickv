@@ -520,6 +520,9 @@ func (ms *Server) handleRequest(req *requestAlloc) Status {
 	}
 	ms.protocolServer.handleRequest(h, &req.request)
 	if req.suppressReply {
+		if observer, ok := ms.fileSystem.(ReplySuppressedObserver); ok {
+			observer.OnReplySuppressed(req.inHeader().Unique, req.inHeader().Opcode, req.status)
+		}
 		return OK
 	}
 	errno := ms.fuseFD.write(&req.request)

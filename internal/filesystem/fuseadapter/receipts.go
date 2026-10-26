@@ -52,11 +52,11 @@ func (a *Adapter) retainLatestLeaseReceipt(ctx context.Context, inode, fh uint64
 
 func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesystem.OperationID, syscall.Errno) {
 	a.receiptMu.Lock()
-	defer a.receiptMu.Unlock()
 	receipts := make([]filesystem.OperationID, 0, len(a.receipts[inode]))
 	for id := range a.receipts[inode] {
 		receipts = append(receipts, id)
 	}
+	a.receiptMu.Unlock()
 	if len(receipts) == 0 {
 		return receipts, 0
 	}
@@ -65,7 +65,7 @@ func (a *Adapter) verifyReceipts(ctx context.Context, inode uint64) ([]filesyste
 		return nil, syscall.EOPNOTSUPP
 	}
 	for _, id := range receipts {
-		if err := verifier.VerifyOperationReceipt(ctx, id); err != nil {
+		if err := verifier.VerifyOperationReceipt(ctx, id); err != nil && !errors.Is(err, filesystem.ErrOperationRetired) {
 			return nil, Errno(err)
 		}
 	}

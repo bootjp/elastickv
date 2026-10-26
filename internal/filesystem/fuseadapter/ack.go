@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"slices"
+	"sort"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
@@ -81,6 +82,12 @@ func (a *Adapter) replyAttempted(unique uint64) {
 	}
 }
 
+// replySuppressed is the terminal boundary for a request that go-fuse will
+// never answer, such as an interrupted request after the connection died.
+func (a *Adapter) replySuppressed(unique uint64) {
+	a.replyAttempted(unique)
+}
+
 func (a *Adapter) retryAcknowledgements(ctx context.Context) {
 	ticker := time.NewTicker(ackRetryInterval)
 	defer ticker.Stop()
@@ -124,17 +131,23 @@ func (a *Adapter) processAcknowledgementBatch(ctx context.Context) bool {
 func (a *Adapter) pendingAcknowledgements() []filesystem.OperationID {
 	a.replyMu.Lock()
 	defer a.replyMu.Unlock()
-	ids := make([]filesystem.OperationID, 0, min(len(a.ackPending), ackBatchSize))
+	ids := make([]filesystem.OperationID, 0, len(a.ackPending))
 	for id := range a.ackPending {
 		ids = append(ids, id)
 	}
 	slices.SortFunc(ids, func(left, right filesystem.OperationID) int {
 		return cmp.Compare(left.Sequence, right.Sequence)
 	})
-	if len(ids) > ackBatchSize {
-		ids = ids[:ackBatchSize]
+	if len(ids) == 0 {
+		return ids
 	}
-	return ids
+	start := sort.Search(len(ids), func(i int) bool { return ids[i].Sequence > a.ackCursor })
+	selected := make([]filesystem.OperationID, 0, min(len(ids), ackBatchSize))
+	for i := 0; i < len(ids) && i < ackBatchSize; i++ {
+		selected = append(selected, ids[(start+i)%len(ids)])
+	}
+	a.ackCursor = selected[len(selected)-1].Sequence
+	return selected
 }
 
 func (a *Adapter) acknowledgeReceipt(ctx context.Context, id filesystem.OperationID) error {
@@ -145,25 +158,28 @@ func (a *Adapter) acknowledgeReceipt(ctx context.Context, id filesystem.Operatio
 		return filesystem.ErrUnsupported
 	}
 	a.receiptMu.Lock()
-	defer a.receiptMu.Unlock()
-	if a.hasReceiptLocked(id) {
+	hasReceipt := a.hasReceiptLocked(id)
+	a.receiptMu.Unlock()
+	if hasReceipt {
 		verifier, ok := a.core.(operationReceiptVerifier)
 		if !ok {
 			return filesystem.ErrUnsupported
 		}
-		if err := verifier.VerifyOperationReceipt(ctx, id); err != nil {
+		if err := verifier.VerifyOperationReceipt(ctx, id); err != nil && !errors.Is(err, filesystem.ErrOperationRetired) {
 			return errors.Wrap(err, "verify operation before acknowledgement")
 		}
 	}
 	if err := acker.AcknowledgeOperation(ctx, id); err != nil {
 		return errors.Wrap(err, "acknowledge operation after reply")
 	}
+	a.receiptMu.Lock()
 	for inode, ids := range a.receipts {
 		delete(ids, id)
 		if len(ids) == 0 {
 			delete(a.receipts, inode)
 		}
 	}
+	a.receiptMu.Unlock()
 	return nil
 }
 
@@ -190,7 +206,7 @@ func (a *Adapter) finishStrictSession(ctx context.Context) error {
 	defer ticker.Stop()
 	for {
 		a.replyMu.Lock()
-		pending := len(a.ackPending)
+		pending := len(a.ackPending) + len(a.replyIDs)
 		a.replyMu.Unlock()
 		if pending == 0 {
 			return errors.Wrap(closer.CloseOperationSession(ctx, a.operationSession), "close strict operation session")

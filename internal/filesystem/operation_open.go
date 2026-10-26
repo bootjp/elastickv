@@ -14,7 +14,6 @@ import (
 const (
 	openOperationVersion     = 1
 	openOperationResultLimit = 128
-	openOperationEffectLimit = 256
 	openResultMissing        = 1
 )
 
@@ -37,11 +36,15 @@ func (s *Service) OpenWithOperation(ctx context.Context, id OperationID, inode u
 	if err != nil {
 		return 0, errors.Wrap(err, "encode open intent")
 	}
+	effectLimit, err := handleLeaseEffectLimit(inode, clientID, true)
+	if err != nil {
+		return 0, err
+	}
 	journal, err := NewOperationJournal(s)
 	if err != nil {
 		return 0, err
 	}
-	admitted, err := journal.Admit(ctx, id, intent, openOperationResultLimit, openOperationEffectLimit)
+	admitted, err := journal.Admit(ctx, id, intent, openOperationResultLimit, effectLimit)
 	if err != nil {
 		return 0, err
 	}

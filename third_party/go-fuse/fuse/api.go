@@ -424,6 +424,12 @@ type ReplyAttemptObserver interface {
 	OnReplyAttempt(unique uint64, opcode uint32, replyStatus Status, writeStatus Status)
 }
 
+// ReplySuppressedObserver is called after the handler returns when the FUSE
+// connection will not send a reply for the request.
+type ReplySuppressedObserver interface {
+	OnReplySuppressed(unique uint64, opcode uint32, replyStatus Status)
+}
+
 type RawFileSystem interface {
 	String() string
 

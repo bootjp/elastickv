@@ -1,12 +1,30 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/stretchr/testify/require"
 )
+
+func TestHandleOperationsSupportLongClientID(t *testing.T) {
+	ctx := t.Context()
+	svc := newTestServiceWithOptions(t, []uint64{2, 3, 4})
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	clientID := bytes.Repeat([]byte{0}, 300) // ordered-byte encoding expands NUL bytes
+	openID := testWriteOperationID(t, svc, 1)
+	fh, err := svc.OpenWithOperation(ctx, openID, file.Inode, clientID)
+	require.NoError(t, err)
+	require.NoError(t, svc.VerifyOperationReceipt(ctx, openID))
+	leaseID := openID
+	leaseID.Sequence = 2
+	require.NoError(t, svc.RefreshOpenHandleLeaseWithOperation(ctx, leaseID, file.Inode, fh, clientID))
+	require.NoError(t, svc.VerifyOperationReceipt(ctx, leaseID))
+}
 
 func TestOpenWithOperationRetainsOneHandle(t *testing.T) {
 	ctx := context.Background()
