@@ -52,7 +52,14 @@ func (b serviceOperationBackend) Commit(ctx context.Context, ts uint64, elems []
 
 func (b serviceOperationBackend) JournalRouteVersion() (uint64, bool) {
 	if source, ok := b.service.dispatch.(interface{ JournalRouteVersion() (uint64, bool) }); ok {
-		return source.JournalRouteVersion()
+		version, ready := source.JournalRouteVersion()
+		if ready {
+			return version, true
+		}
+		if _, sharded := b.service.store.(*kv.ShardStore); sharded {
+			return 0, false
+		}
+		return 0, true
 	}
 	_, sharded := b.service.store.(*kv.ShardStore)
 	return 0, !sharded

@@ -32,6 +32,7 @@ func TestOperationRecordCodecPreservesGenerationFence(t *testing.T) {
 	record.AttemptID = [16]byte{4}
 	record.Generation = 2
 	record.FencedAttempts = [][16]byte{{3}}
+	record.Reservation += operationFenceReservation
 	raw, err := encodeOperationRecord(record)
 	require.NoError(t, err)
 	decoded, err := decodeOperationRecord(raw)

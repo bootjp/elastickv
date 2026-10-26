@@ -111,6 +111,37 @@ func TestOperationJournalGenerationFenceRejectsChangedRouteVersion(t *testing.T)
 	require.Equal(t, attempt.AttemptID, current.AttemptID)
 }
 
+func TestOperationJournalPublicationRejectsChangedPlanningRoute(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}, routeVersion: 7}
+	service, err := NewService(st, dispatch)
+	require.NoError(t, err)
+	journal, err := NewOperationJournal(service)
+	require.NoError(t, err)
+	id := testOperationID(t, journal, 1)
+	_, err = journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	snapshot, err := journal.PlanSnapshotAtRoute(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	require.Equal(t, uint64(7), snapshot.RouteVersion)
+	dispatch.routeVersion = 8
+	_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+		Intent: []byte("write"), ReadTS: snapshot.ReadTS, RouteVersion: snapshot.RouteVersion,
+		Effects: []*kv.Elem[kv.OP]{{Op: kv.Put, Key: []byte("data"), Value: []byte("value")}},
+	})
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	_, err = journal.RejectAtRoute(ctx, id, attempt.AttemptID, snapshot.ReadTS, snapshot.RouteVersion, []byte("write"), []byte("rejected"), nil)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	_, err = st.GetAt(ctx, []byte("data"), st.LastCommitTS())
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
+	outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, ErrOperationPending)
+	require.Equal(t, AttemptUnknown, outcome)
+}
+
 func TestOperationJournalPublishesResultWithEffectAndRetiresIdentity(t *testing.T) {
 	ctx := context.Background()
 	journal, st, coord := testOperationJournal(t)
@@ -720,6 +751,17 @@ func TestOperationJournalNewGenerationDoesNotProveOldAttemptAborted(t *testing.T
 	}
 }
 
+func TestOperationJournalForeignRecordNeverProvesAttemptOutcome(t *testing.T) {
+	id := OperationID{Filesystem: [16]byte{1}, Session: [16]byte{2}, Sequence: 1}
+	foreign := OperationID{Filesystem: id.Filesystem, Session: id.Session, Sequence: 2}
+	attempt := [16]byte{3}
+	outcome, _, err := classifyAttemptOutcome(id, attempt, operationRecord{
+		ID: foreign, State: OperationCommitted, AttemptID: attempt,
+	}, nil)
+	require.Equal(t, AttemptUnknown, outcome)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+}
+
 func TestOperationJournalGenerationFenceStopsDelayedOldCommit(t *testing.T) {
 	ctx := context.Background()
 	journal, st, _ := testOperationJournal(t)
@@ -802,6 +844,52 @@ func TestOperationJournalLostGenerationFenceReplyRetainsAbortProof(t *testing.T)
 	current, err := journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
 	require.Equal(t, record.AttemptID, current.AttemptID)
+}
+
+func TestOperationJournalGenerationFenceRespectsSessionQuota(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	ts, record, session, err := journal.pendingSnapshot(ctx, id)
+	require.NoError(t, err)
+	session.MaxBytes = session.RetainedBytes
+	require.NoError(t, journal.storeRecordAndSession(ctx, ts, record, session, nil, nil))
+	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, ErrOperationQuota)
+	current, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, attempt.AttemptID, current.AttemptID)
+}
+
+func TestOperationJournalGenerationFenceReleasesReservedBytesOnAcknowledgement(t *testing.T) {
+	ctx := context.Background()
+	journal, _, _ := testOperationJournal(t)
+	id := testOperationID(t, journal, 1)
+	_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	beforeTS, _, before, err := journal.pendingSnapshot(ctx, id)
+	require.NoError(t, err)
+	require.NotZero(t, beforeTS)
+	next, err := journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.NoError(t, err)
+	_, _, during, err := journal.pendingSnapshot(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, before.RetainedBytes+operationFenceReservation, during.RetainedBytes)
+	_, err = journal.Publish(ctx, id, next.AttemptID, operationAttemptPlan{Intent: []byte("write")})
+	require.NoError(t, err)
+	require.NoError(t, journal.Acknowledge(ctx, id))
+	ts, err := journal.backend.Snapshot(ctx)
+	require.NoError(t, err)
+	after, exists, err := journal.loadSessionAt(ctx, OperationSessionID{Filesystem: id.Filesystem, Session: id.Session}, ts)
+	require.NoError(t, err)
+	require.True(t, exists)
+	require.Zero(t, after.RetainedBytes)
 }
 
 func TestOperationJournalSnapshotRetainsTerminalAndPendingRecords(t *testing.T) {

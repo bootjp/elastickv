@@ -20,6 +20,7 @@ const (
 	operationReservationOverhead = 4096
 	maxOperationProofGroups      = 16
 	maxOperationFencedAttempts   = 256
+	operationFenceReservation    = 128
 )
 
 var (
@@ -166,7 +167,8 @@ func validOperationCore(record operationRecord) bool {
 		record.Fingerprint == sha256.Sum256(record.Intent) && record.Reservation != 0 &&
 		record.ResultLimit != 0 && uint64(record.ResultLimit) <= maxOperationRecordBytes &&
 		uint64(len(record.Result)) <= uint64(record.ResultLimit) &&
-		record.Reservation == 2*(uint64(len(record.Intent))+uint64(record.ResultLimit)+uint64(record.EffectLimit))+operationHeaderBytes+operationReservationOverhead
+		record.Reservation == 2*(uint64(len(record.Intent))+uint64(record.ResultLimit)+uint64(record.EffectLimit))+
+			operationHeaderBytes+operationReservationOverhead+uint64(len(record.FencedAttempts))*operationFenceReservation
 }
 
 func validOperationEffects(record operationRecord) bool {

@@ -72,7 +72,7 @@ func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id Operati
 	if slices.Contains(record.FencedAttempts, old) {
 		return record, nil
 	}
-	record, err = prepareGenerationFence(record, old)
+	record, session, err = prepareGenerationFence(record, session, old)
 	if err != nil {
 		return operationRecord{}, err
 	}
@@ -82,29 +82,55 @@ func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id Operati
 	return record, nil
 }
 
-func prepareGenerationFence(record operationRecord, old [16]byte) (operationRecord, error) {
+func prepareGenerationFence(record operationRecord, session operationSession, old [16]byte) (operationRecord, operationSession, error) {
 	if !record.RecordIsPrimary || record.AttemptID != old {
-		return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+		return operationRecord{}, operationSession{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 	}
 	if record.Generation == ^uint64(0) || len(record.FencedAttempts) >= maxOperationFencedAttempts {
-		return operationRecord{}, errors.WithStack(ErrOperationGeneration)
+		return operationRecord{}, operationSession{}, errors.WithStack(ErrOperationGeneration)
+	}
+	if operationFenceReservation > session.MaxBytes-session.RetainedBytes {
+		return operationRecord{}, operationSession{}, errors.WithStack(ErrOperationQuota)
 	}
 	next, err := randomOperationToken()
 	if err != nil {
-		return operationRecord{}, err
+		return operationRecord{}, operationSession{}, err
 	}
 	record.FencedAttempts = append(record.FencedAttempts, old)
 	record.AttemptID = next
 	record.Generation++
-	return record, nil
+	record.Reservation += operationFenceReservation
+	session.RetainedBytes += operationFenceReservation
+	return record, session, nil
 }
 
 type operationAttemptPlan struct {
-	Intent   []byte
-	Effects  []*kv.Elem[kv.OP]
-	ReadTS   uint64
-	ReadKeys [][]byte
-	Result   []byte
+	Intent  []byte
+	Effects []*kv.Elem[kv.OP]
+	ReadTS  uint64
+	// RouteVersion is captured before the planner reads any routed key.
+	RouteVersion uint64
+	ReadKeys     [][]byte
+	Result       []byte
+}
+
+type operationPlanningSnapshot struct {
+	ReadTS       uint64
+	RouteVersion uint64
+}
+
+// PlanSnapshotAtRoute pins the placement used by the planner. A sharded
+// planner must carry RouteVersion into publication or semantic rejection.
+func (j *OperationJournal) PlanSnapshotAtRoute(ctx context.Context, id OperationID, attempt [16]byte) (operationPlanningSnapshot, error) {
+	version, ready := j.backend.JournalRouteVersion()
+	if !ready {
+		return operationPlanningSnapshot{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
+	ts, err := j.PlanSnapshot(ctx, id, attempt)
+	if err != nil {
+		return operationPlanningSnapshot{}, err
+	}
+	return operationPlanningSnapshot{ReadTS: ts, RouteVersion: version}, nil
 }
 
 // PlanSnapshot establishes the OCC timestamp before a planner reads data.
@@ -143,7 +169,7 @@ func classifyAttemptOutcome(id OperationID, attempt [16]byte, record operationRe
 		return AttemptUnknown, record, err
 	}
 	if record.ID != id {
-		return AttemptUnknown, record, err
+		return AttemptUnknown, record, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 	}
 	if record.AttemptID != attempt {
 		return classifyPriorAttempt(attempt, record)
@@ -173,6 +199,9 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	if len(plan.ReadKeys) != 0 && plan.ReadTS == 0 {
 		return operationRecord{}, errors.WithStack(ErrInvalid)
 	}
+	if err := j.requirePlanningRoute(plan.RouteVersion); err != nil {
+		return operationRecord{}, err
+	}
 	ts, record, session, err := j.publicationSnapshot(ctx, id, plan.ReadTS)
 	if err != nil {
 		return j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, err)
@@ -194,10 +223,20 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	record.ProofGroups = groups
 	session.Pending--
 	effects := slices.Concat(routedEffects, proofs)
-	if err = j.storeRecordAndSession(ctx, ts, record, session, effects, plan.ReadKeys); err != nil {
+	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, effects, plan.ReadKeys, plan.RouteVersion); err != nil {
 		return j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, err)
 	}
 	return j.Resolve(ctx, id)
+}
+
+func (j *OperationJournal) requirePlanningRoute(observed uint64) error {
+	current, ready := j.backend.JournalRouteVersion()
+	// A changed catalog invalidates the planner's reads even if the commit
+	// coordinator could still find a route for every write key.
+	if !ready || (current != 0 && current != observed) {
+		return errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+	}
+	return nil
 }
 
 func (j *OperationJournal) publicationSnapshot(ctx context.Context, id OperationID, readTS uint64) (uint64, operationRecord, operationSession, error) {
@@ -278,8 +317,15 @@ func validateOperationPlan(record operationRecord, session operationSession, pla
 // validated its predicates on the same snapshot. OCC conflicts remain pending
 // attempts and must not be stored as semantic rejection.
 func (j *OperationJournal) Reject(ctx context.Context, id OperationID, attempt [16]byte, readTS uint64, intent []byte, result []byte, readKeys [][]byte) (operationRecord, error) {
+	return j.RejectAtRoute(ctx, id, attempt, readTS, 0, intent, result, readKeys)
+}
+
+func (j *OperationJournal) RejectAtRoute(ctx context.Context, id OperationID, attempt [16]byte, readTS, routeVersion uint64, intent []byte, result []byte, readKeys [][]byte) (operationRecord, error) {
 	if readTS == 0 {
 		return operationRecord{}, errors.WithStack(ErrInvalid)
+	}
+	if err := j.requirePlanningRoute(routeVersion); err != nil {
+		return operationRecord{}, err
 	}
 	ts, record, session, err := j.publicationSnapshot(ctx, id, readTS)
 	if err != nil {
@@ -297,7 +343,7 @@ func (j *OperationJournal) Reject(ctx context.Context, id OperationID, attempt [
 	record.State = OperationRejected
 	record.Result = append([]byte(nil), result...)
 	session.Pending--
-	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, readKeys); err != nil {
+	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, readKeys, routeVersion); err != nil {
 		return j.resolveDuplicateRejection(ctx, id, attempt, intent, err)
 	}
 	return j.Resolve(ctx, id)
