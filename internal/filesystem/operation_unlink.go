@@ -11,14 +11,15 @@ import (
 )
 
 const (
-	unlinkIntentVersion  = 1
-	unlinkResultSuccess  = 0
-	unlinkResultMissing  = 1
-	unlinkResultNotDir   = 2
-	unlinkResultIsDir    = 3
-	unlinkResultNotEmpty = 4
-	unlinkEffectLimit    = 64 << 10
-	unlinkIntentHeader   = 10
+	unlinkIntentVersion    = 1
+	unlinkResultSuccess    = 0
+	unlinkResultMissing    = 1
+	unlinkResultNotDir     = 2
+	unlinkResultIsDir      = 3
+	unlinkResultNotEmpty   = 4
+	unlinkResultContention = 5
+	unlinkEffectLimit      = 64 << 10
+	unlinkIntentHeader     = 10
 )
 
 // UnlinkWithOperation records one file removal and its result under id.
@@ -75,7 +76,11 @@ func (s *Service) executeUnlinkOperation(ctx context.Context, journal *Operation
 			return err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return errors.WithStack(ErrContentionLimit)
+			record, cancelErr := cancelOperationContention(ctx, journal, id, []byte{unlinkResultContention})
+			if cancelErr != nil {
+				return cancelErr
+			}
+			return decodeUnlinkOperationResult(record)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return err
@@ -251,6 +256,9 @@ func decodeUnlinkOperationResult(record operationRecord) error {
 	}
 	if record.State == OperationCommitted && record.Result[0] == unlinkResultSuccess {
 		return nil
+	}
+	if record.State == OperationCancelled {
+		return cancelledOperationError(record.Result[0], unlinkResultContention)
 	}
 	if record.State != OperationRejected {
 		return errors.WithStack(ErrOperationRecordCorrupt)

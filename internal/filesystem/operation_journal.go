@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	operationCASRetries    = 8
+	operationCASRetries    = 64
 	maxOperationEffectKeys = 65535
 	operationJournalRows   = 2
 )
@@ -157,7 +157,7 @@ func randomOperationToken() ([16]byte, error) {
 // EnsureFilesystem returns the single Raft-replicated identity shared by all
 // mounts. A conflict rereads the winner; a lost response remains unknown.
 func (j *OperationJournal) EnsureFilesystem(ctx context.Context) ([16]byte, error) {
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		ts, err := j.backend.Snapshot(ctx)
 		if err != nil {
 			return [16]byte{}, errors.Wrap(err, "fence filesystem identity")
@@ -179,8 +179,11 @@ func (j *OperationJournal) EnsureFilesystem(ctx context.Context) ([16]byte, erro
 		if !IsWriteConflict(err) {
 			return [16]byte{}, errors.Wrap(err, "register filesystem identity")
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return [16]byte{}, err
+		}
 	}
-	return [16]byte{}, errors.WithStack(ErrOperationQuota)
+	return [16]byte{}, errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) loadFilesystemAt(ctx context.Context, ts uint64) ([16]byte, bool, error) {
@@ -223,13 +226,16 @@ func (j *OperationJournal) RegisterSessionWithID(ctx context.Context, id Operati
 	if id.Filesystem == [16]byte{} || id.Session == [16]byte{} || owner == "" {
 		return errors.WithStack(ErrInvalid)
 	}
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		err := j.registerSessionOnce(ctx, id, owner)
 		if !IsWriteConflict(err) {
 			return err
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
 	}
-	return errors.WithStack(ErrOperationQuota)
+	return errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) registerSessionOnce(ctx context.Context, id OperationSessionID, owner string) error {
@@ -325,14 +331,17 @@ func (j *OperationJournal) Admit(ctx context.Context, id OperationID, intent []b
 	if err := validateOperationRecord(record); err != nil {
 		return operationRecord{}, err
 	}
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		admitted, err := j.admitOnce(ctx, record)
 		if IsWriteConflict(err) {
+			if err = waitOperationCASRetry(ctx, retry); err != nil {
+				return operationRecord{}, err
+			}
 			continue
 		}
 		return admitted, err
 	}
-	return operationRecord{}, errors.WithStack(ErrOperationQuota)
+	return operationRecord{}, errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord) (operationRecord, error) {

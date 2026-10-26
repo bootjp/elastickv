@@ -16,7 +16,7 @@ import (
 // BeginAttempt records a fresh transaction generation before any effect is
 // dispatched. A duplicate caller receives the same active attempt identity.
 func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (operationRecord, error) {
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		ts, record, session, err := j.pendingSnapshot(ctx, id)
 		if err != nil {
 			return operationRecord{}, err
@@ -34,13 +34,16 @@ func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (op
 		record.Generation++
 		if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
 			if IsWriteConflict(err) {
+				if err = waitOperationCASRetry(ctx, retry); err != nil {
+					return operationRecord{}, err
+				}
 				continue
 			}
 			return operationRecord{}, err
 		}
 		return record, nil
 	}
-	return operationRecord{}, errors.WithStack(ErrOperationGeneration)
+	return operationRecord{}, errors.WithStack(ErrContentionLimit)
 }
 
 // AdvanceGeneration fences an old attempt by committing a new version of its
@@ -51,7 +54,7 @@ func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID
 	if old == [16]byte{} {
 		return operationRecord{}, errors.WithStack(ErrInvalid)
 	}
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		observed, ready := j.backend.JournalRouteVersion()
 		if !ready {
 			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
@@ -59,6 +62,9 @@ func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID
 		record, err := j.advanceGenerationOnce(ctx, id, old, observed)
 		if !IsWriteConflict(err) {
 			return record, err
+		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return operationRecord{}, err
 		}
 	}
 	return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
@@ -552,7 +558,7 @@ func (j *OperationJournal) Acknowledge(ctx context.Context, id OperationID) erro
 		}
 		return err
 	}
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		err := j.acknowledgeOnce(ctx, id)
 		if errors.Is(err, ErrOperationRetired) {
 			return nil
@@ -563,8 +569,11 @@ func (j *OperationJournal) Acknowledge(ctx context.Context, id OperationID) erro
 		if !IsWriteConflict(err) {
 			return errors.Wrap(err, "acknowledge operation")
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
 	}
-	return errors.WithStack(ErrOperationQuota)
+	return errors.WithStack(ErrContentionLimit)
 }
 
 // RetireUnadmitted fences an identity whose reply was attempted before an
@@ -572,7 +581,7 @@ func (j *OperationJournal) Acknowledge(ctx context.Context, id OperationID) erro
 // race atomically with admission: an in-flight admission either wins and must
 // be resolved normally, or observes the retired identity and cannot publish.
 func (j *OperationJournal) RetireUnadmitted(ctx context.Context, id OperationID) error {
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		err := j.retireUnadmittedOnce(ctx, id)
 		if err == nil {
 			return nil
@@ -580,8 +589,11 @@ func (j *OperationJournal) RetireUnadmitted(ctx context.Context, id OperationID)
 		if !IsWriteConflict(err) {
 			return errors.Wrap(err, "retire unadmitted operation")
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
 	}
-	return errors.WithStack(ErrOperationQuota)
+	return errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) retireUnadmittedOnce(ctx context.Context, id OperationID) error {
@@ -715,7 +727,7 @@ func (j *OperationJournal) RecoverOwnerSession(ctx context.Context, filesystemID
 }
 
 func (j *OperationJournal) setSessionClosed(ctx context.Context, id OperationSessionID, allowPending bool) error {
-	for range operationCASRetries {
+	for retry := range operationCASRetries {
 		err := j.closeSessionOnce(ctx, id, allowPending)
 		if err == nil {
 			return nil
@@ -723,8 +735,11 @@ func (j *OperationJournal) setSessionClosed(ctx context.Context, id OperationSes
 		if !IsWriteConflict(err) {
 			return errors.Wrap(err, "close operation session")
 		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return err
+		}
 	}
-	return errors.WithStack(ErrOperationQuota)
+	return errors.WithStack(ErrContentionLimit)
 }
 
 func (j *OperationJournal) closeSessionOnce(ctx context.Context, id OperationSessionID, allowPending bool) error {

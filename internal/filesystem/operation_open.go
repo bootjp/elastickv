@@ -15,6 +15,7 @@ const (
 	openOperationVersion     = 1
 	openOperationResultLimit = 128
 	openResultMissing        = 1
+	openResultContention     = 2
 )
 
 type openOperationIntent struct {
@@ -71,7 +72,15 @@ func (s *Service) executeOpenOperation(ctx context.Context, journal *OperationJo
 			return 0, err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return 0, errors.WithStack(ErrContentionLimit)
+			result, marshalErr := json.Marshal(openOperationResult{Version: openOperationVersion, Error: openResultContention})
+			if marshalErr != nil {
+				return 0, errors.Wrap(marshalErr, "encode open contention")
+			}
+			record, cancelErr := cancelOperationContention(ctx, journal, id, result)
+			if cancelErr != nil {
+				return 0, cancelErr
+			}
+			return decodeOpenOperationResult(record)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return 0, err
@@ -162,10 +171,17 @@ func decodeOpenOperationResult(record operationRecord) (uint64, error) {
 		}
 		return 0, errors.WithStack(ErrOperationRecordCorrupt)
 	}
-	if record.State != OperationCommitted || result.Error != 0 || result.FH == 0 {
+	if record.State == OperationCancelled {
+		return 0, cancelledOperationError(result.Error, openResultContention)
+	}
+	if !validCommittedOpenResult(record, result) {
 		return 0, errors.WithStack(ErrOperationRecordCorrupt)
 	}
 	return result.FH, nil
+}
+
+func validCommittedOpenResult(record operationRecord, result openOperationResult) bool {
+	return record.State == OperationCommitted && result.Error == 0 && result.FH != 0
 }
 
 func resolveOpenOperation(ctx context.Context, journal *OperationJournal, id OperationID) (uint64, error) {

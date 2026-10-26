@@ -16,6 +16,7 @@ const (
 	leaseOperationResultLimit = 1
 	leaseResultSuccess        = 0
 	leaseResultMissing        = 1
+	leaseResultContention     = 2
 )
 
 type leaseOperationIntent struct {
@@ -59,7 +60,11 @@ func (s *Service) executeLeaseOperation(ctx context.Context, journal *OperationJ
 			return err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return errors.WithStack(ErrContentionLimit)
+			record, cancelErr := cancelOperationContention(ctx, journal, id, []byte{leaseResultContention})
+			if cancelErr != nil {
+				return cancelErr
+			}
+			return decodeLeaseOperationResult(record)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return err
@@ -122,6 +127,9 @@ func decodeLeaseOperationResult(record operationRecord) error {
 	}
 	if record.State == OperationRejected && record.Result[0] == leaseResultMissing {
 		return errors.WithStack(ErrNotFound)
+	}
+	if record.State == OperationCancelled && record.Result[0] == leaseResultContention {
+		return errors.WithStack(ErrContentionLimit)
 	}
 	return errors.WithStack(ErrOperationRecordCorrupt)
 }

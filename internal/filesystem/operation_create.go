@@ -17,6 +17,7 @@ const (
 	createResultMissing        = 1
 	createResultNotDir         = 2
 	createResultExists         = 3
+	createResultContention     = 4
 )
 
 type createOperationIntent struct {
@@ -100,7 +101,15 @@ func (s *Service) executeCreateOperation(ctx context.Context, journal *Operation
 			return CreateResult{}, err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return CreateResult{}, errors.WithStack(ErrContentionLimit)
+			result, marshalErr := json.Marshal(createOperationResult{Version: createOperationVersion, Error: createResultContention})
+			if marshalErr != nil {
+				return CreateResult{}, errors.Wrap(marshalErr, "encode create contention")
+			}
+			record, cancelErr := cancelOperationContention(ctx, journal, id, result)
+			if cancelErr != nil {
+				return CreateResult{}, cancelErr
+			}
+			return decodeCreateOperationResult(record)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return CreateResult{}, err
@@ -213,10 +222,18 @@ func decodeCreateOperationResult(record operationRecord) (CreateResult, error) {
 	if record.State == OperationRejected {
 		return CreateResult{}, rejectedCreateError(result.Error)
 	}
-	if record.State != OperationCommitted || result.Error != 0 || result.Result.Inode == 0 || result.Result.Stat.Inode != result.Result.Inode {
+	if record.State == OperationCancelled {
+		return CreateResult{}, cancelledOperationError(result.Error, createResultContention)
+	}
+	if !validCommittedCreateResult(record, result) {
 		return CreateResult{}, errors.WithStack(ErrOperationRecordCorrupt)
 	}
 	return result.Result, nil
+}
+
+func validCommittedCreateResult(record operationRecord, result createOperationResult) bool {
+	return record.State == OperationCommitted && result.Error == 0 && result.Result.Inode != 0 &&
+		result.Result.Stat.Inode == result.Result.Inode
 }
 
 func rejectedCreateError(status uint8) error {

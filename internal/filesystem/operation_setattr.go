@@ -16,6 +16,7 @@ const (
 	setAttrSizeEffectLimit      = 64 << 10
 	setAttrResultNotFound       = 1
 	setAttrResultIsDir          = 2
+	setAttrResultContention     = 3
 )
 
 type setAttrOperationIntent struct {
@@ -72,7 +73,15 @@ func (s *Service) executeSetAttrOperation(ctx context.Context, journal *Operatio
 			return Stat{}, err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return Stat{}, errors.WithStack(ErrContentionLimit)
+			result, marshalErr := json.Marshal(setAttrOperationResult{Version: setAttrOperationVersion, Error: setAttrResultContention})
+			if marshalErr != nil {
+				return Stat{}, errors.Wrap(marshalErr, "encode setattr contention")
+			}
+			record, cancelErr := cancelOperationContention(ctx, journal, id, result)
+			if cancelErr != nil {
+				return Stat{}, cancelErr
+			}
+			return decodeSetAttrOperationResult(record)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return Stat{}, err
@@ -245,6 +254,9 @@ func decodeSetAttrOperationResult(record operationRecord) (Stat, error) {
 	}
 	if record.State == OperationRejected {
 		return Stat{}, rejectedSetAttrError(result.Error)
+	}
+	if record.State == OperationCancelled {
+		return Stat{}, cancelledOperationError(result.Error, setAttrResultContention)
 	}
 	if record.State != OperationCommitted || result.Error != 0 || result.Stat.Inode == 0 {
 		return Stat{}, errors.WithStack(ErrOperationRecordCorrupt)

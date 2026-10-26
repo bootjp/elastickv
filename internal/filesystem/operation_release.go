@@ -12,6 +12,7 @@ import (
 
 const (
 	releaseOperationVersion     = 1
+	releaseResultContention     = 2
 	releaseOperationResultLimit = 1
 	releaseOperationEffectLimit = 64 << 10
 )
@@ -77,7 +78,11 @@ func (s *Service) executeReleaseOperation(ctx context.Context, journal *Operatio
 			return err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return errors.WithStack(ErrContentionLimit)
+			record, cancelErr := cancelOperationContention(ctx, journal, id, []byte{releaseResultContention})
+			if cancelErr != nil {
+				return cancelErr
+			}
+			return decodeReleaseOperationResult(record)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return err
@@ -122,6 +127,9 @@ func (s *Service) planReleaseOperation(ctx context.Context, snapshot operationPl
 }
 
 func decodeReleaseOperationResult(record operationRecord) error {
+	if record.State == OperationCancelled && len(record.Result) == 1 && record.Result[0] == releaseResultContention {
+		return errors.WithStack(ErrContentionLimit)
+	}
 	if record.State != OperationCommitted || len(record.Result) != 1 || record.Result[0] != releaseOperationVersion {
 		return errors.WithStack(ErrOperationRecordCorrupt)
 	}

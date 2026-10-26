@@ -118,7 +118,7 @@ func (s *Service) executeWriteOperation(ctx context.Context, journal *OperationJ
 			return 0, err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return 0, errors.WithStack(ErrContentionLimit)
+			return cancelWritePlanningFailure(ctx, journal, id, ErrContentionLimit)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return 0, err

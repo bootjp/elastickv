@@ -11,13 +11,14 @@ import (
 )
 
 const (
-	renameIntentVersion  = 1
-	renameEffectLimit    = 64 << 10
-	renameResultSuccess  = 0
-	renameResultMissing  = 1
-	renameResultNotDir   = 2
-	renameResultIsDir    = 3
-	renameResultNotEmpty = 4
+	renameIntentVersion    = 1
+	renameEffectLimit      = 64 << 10
+	renameResultSuccess    = 0
+	renameResultMissing    = 1
+	renameResultNotDir     = 2
+	renameResultIsDir      = 3
+	renameResultNotEmpty   = 4
+	renameResultContention = 5
 )
 
 type renameOperationIntent struct {
@@ -78,7 +79,11 @@ func (s *Service) executeRenameOperation(ctx context.Context, journal *Operation
 			return err
 		}
 		if retry == writeConflictRetryLimit-1 {
-			return errors.WithStack(ErrContentionLimit)
+			record, cancelErr := cancelOperationContention(ctx, journal, id, []byte{renameResultContention})
+			if cancelErr != nil {
+				return cancelErr
+			}
+			return decodeRenameOperationResult(record)
 		}
 		if err = waitWriteConflictRetry(deadlineCtx, retry); err != nil {
 			return err
@@ -185,6 +190,9 @@ func decodeRenameOperationResult(record operationRecord) error {
 	}
 	if record.State == OperationCommitted && record.Result[0] == renameResultSuccess {
 		return nil
+	}
+	if record.State == OperationCancelled {
+		return cancelledOperationError(record.Result[0], renameResultContention)
 	}
 	if record.State != OperationRejected {
 		return errors.WithStack(ErrOperationRecordCorrupt)
