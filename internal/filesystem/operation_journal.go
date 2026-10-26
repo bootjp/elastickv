@@ -435,7 +435,7 @@ func (j *OperationJournal) loadSessionAt(ctx context.Context, id OperationSessio
 	}
 	session, err := decodeOperationSession(raw)
 	if err != nil || session.ID != id {
-		return operationSession{}, false, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationSession{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session row")
 	}
 	return session, true, nil
 }
@@ -450,7 +450,7 @@ func (j *OperationJournal) loadRecordAt(ctx context.Context, id OperationID, ts 
 	}
 	record, err := decodeOperationRecord(raw)
 	if err != nil || record.ID != id {
-		return operationRecord{}, false, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationRecord{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation row")
 	}
 	return record, true, nil
 }

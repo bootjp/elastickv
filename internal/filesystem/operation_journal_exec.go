@@ -461,7 +461,7 @@ func (j *OperationJournal) resolveRecordAt(ctx context.Context, id OperationID, 
 		return record, errors.WithStack(ErrOperationPending)
 	}
 	if record.CommitTS == 0 {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt, "terminal operation has no commit timestamp")
 	}
 	return record, nil
 }
@@ -623,7 +623,7 @@ func (j *OperationJournal) retireUnadmittedOnce(ctx context.Context, id Operatio
 	}
 	raw, err := encodeOperationSession(session)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "encode unadmitted retirement session")
 	}
 	_, err = j.backend.Commit(ctx, ts, []*kv.Elem[kv.OP]{{Op: kv.Put, Key: session.ID.key(), Value: raw}},
 		[][]byte{id.key(), session.ID.key()})
@@ -644,7 +644,7 @@ func (j *OperationJournal) acknowledgeOnce(ctx context.Context, id OperationID) 
 	}
 	raw, err := encodeOperationSession(session)
 	if err != nil {
-		return err
+		return errors.Wrap(err, "encode acknowledged session")
 	}
 	elems := []*kv.Elem[kv.OP]{
 		{Op: kv.Del, Key: id.key()},
@@ -665,7 +665,7 @@ func reserveAckRetirement(session *operationSession, record operationRecord) err
 		return errors.WithStack(ErrOperationRetired)
 	}
 	if session.RetainedCount == 0 || session.RetainedBytes < record.Reservation {
-		return errors.WithStack(ErrOperationRecordCorrupt)
+		return errors.Wrap(ErrOperationRecordCorrupt, "ack reservation exceeds retained usage")
 	}
 	if err := advanceAckWatermark(session, record.ID.Sequence); err != nil {
 		return err
