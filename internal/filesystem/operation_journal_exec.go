@@ -519,7 +519,10 @@ func validatePendingSnapshot(record operationRecord, session operationSession, f
 		return errors.WithStack(ErrOperationGeneration)
 	}
 	if record.ID.Session != session.ID.Session || session.Pending == 0 {
-		return errors.WithStack(ErrOperationRecordCorrupt)
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"pending operation lacks session accounting: sequence=%d generation=%d pending=%d retained_count=%d retained_bytes=%d reservation=%d",
+			record.ID.Sequence, record.Generation, session.Pending, session.RetainedCount,
+			session.RetainedBytes, record.Reservation)
 	}
 	return nil
 }
