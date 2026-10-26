@@ -170,6 +170,17 @@ In the first rerun at `ed5efef1`, the legacy two-group benchmark still
 returned a typed `txn locked` error from a concurrent open. Open now waits
 and rebuilds its transaction after that transient lock, within its existing
 30-second retry budget; unknown outcomes still stop without replay.
+The same rerun passed the Redis, SQLite, and strict two-group jobs. Its
+remaining long-running rename job was superseded by the next full run.
+Both two-group benchmark jobs passed in
+[run 40345042339](https://github.com/bootjp/elastickv/actions/runs/40345042339)
+at `711a7ba5`. Across three trials, the median legacy serial throughput was
+112.1 ops/s with a 12.6 ms median trial p99; the strict values were 80.5
+ops/s and 39.5 ms. For four writers on one inode, the median legacy
+throughput was 83.9 ops/s with an 88.6 ms p99 and 0.914 worker fairness;
+the strict values were 54.9 ops/s, 276.3 ms, and 0.880. These jobs use
+separate runners, so the comparison is descriptive. The full stress run
+remains in progress; the numbers do not establish a rollout threshold.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
