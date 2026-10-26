@@ -1983,23 +1983,18 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 	if groupedReadKeyCount(groupedReadKeys) > maxReadKeys {
 		return nil, errors.WithStack(ErrInvalidRequest)
 	}
-	prepared, err := c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
+	_, err = c.prewriteTxn(ctx, startTS, commitTS, primaryKey, grouped, gids, groupedReadKeys, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
 		return nil, err
 	}
 
 	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, gids, commitTS, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
-		// abortPreparedTxn must run even when ctx was the reason
-		// commitPrimaryTxn failed — otherwise prewrite intents on
-		// every prepared shard linger until LockResolver picks them
-		// up at a future tick (lease window of expensive
-		// keyspace-scan work). Detach cancellation but cap with
-		// verifyLeaderTimeout so a hung Abort cannot leak.
-		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
-		c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
-		cancel()
-		return nil, errors.WithStack(err)
+		// A lost primary COMMIT response may conceal a durable commit
+		// decision. Aborting prepared secondaries here can then turn one
+		// committed transaction into a partial commit. Lock resolution must
+		// consult the primary decision; retain the intents until it does.
+		return nil, fmt.Errorf("%w: %w", ErrTransactionOutcomeUnknown, err)
 	}
 
 	// commitSecondaryTxns propagates ObservedRouteVersion to per-

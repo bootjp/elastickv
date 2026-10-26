@@ -81,6 +81,35 @@ func TestStrictSecondaryRouteShiftNeverStartsANewTransaction(t *testing.T) {
 	require.Len(t, secondary.requests, 1+txnSecondaryCommitRetryAttempts)
 }
 
+func TestStrictLostPrimaryCommitReplyDoesNotAbortPreparedParticipants(t *testing.T) {
+	t.Parallel()
+	router := distribution.NewEngine()
+	applyComposed1Snapshot(t, router, 7, []distribution.RouteDescriptor{
+		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
+		{RouteID: 2, Start: []byte("m"), GroupID: 2},
+	})
+	responseLost := errors.New("primary commit response lost")
+	primary := &recordingTransactional{errs: []error{nil, responseLost}}
+	secondary := &recordingTransactional{}
+	coord := NewShardedCoordinator(router, map[uint64]*ShardGroup{
+		1: {Txn: primary}, 2: {Txn: secondary},
+	}, 1, NewHLC(), nil)
+	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
+		IsTxn: true, RequireAllParticipants: true, PrimaryKey: []byte("b"),
+		Elems: []*Elem[OP]{
+			{Op: Put, Key: []byte("b"), Value: []byte("record")},
+			{Op: Put, Key: []byte("x"), Value: []byte("effect")},
+		},
+	})
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.ErrorIs(t, err, responseLost)
+	require.Len(t, primary.requests, 2)
+	require.Equal(t, pb.Phase_PREPARE, primary.requests[0].Phase)
+	require.Equal(t, pb.Phase_COMMIT, primary.requests[1].Phase)
+	require.Len(t, secondary.requests, 1)
+	require.Equal(t, pb.Phase_PREPARE, secondary.requests[0].Phase)
+}
+
 func TestStrictTxnRejectsEffectRouteChangedAfterReceiptPlacement(t *testing.T) {
 	t.Parallel()
 	router := distribution.NewEngine()

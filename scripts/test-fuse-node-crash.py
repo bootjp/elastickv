@@ -55,7 +55,9 @@ def main():
         await_contents(path, contents)
 
     pid = int(args.pid_file.read_text().splitlines()[0])
-    argv = [os.fsdecode(arg) for arg in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0") if arg]
+    # /proc cmdline ends in NUL; interior empty arguments (for example an
+    # intentionally disabled metrics address) must remain in their positions.
+    argv = [os.fsdecode(arg) for arg in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]]
     if not argv or "--filesystemStrict" not in argv:
         raise AssertionError("node was not started in strict mode")
     os.kill(pid, signal.SIGKILL)
