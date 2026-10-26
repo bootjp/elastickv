@@ -1076,6 +1076,9 @@ func startFilesystemIfEnabled(
 	}
 	installFilesystemServerLifecycle(ctx, eg, cleanup, server, serveDone, config.mountPoint)
 	startFilesystemPlacementCollector(ctx, eg, service, *filesystemPlacementScanInterval)
+	if config.strict {
+		startFilesystemJournalCollector(ctx, eg, service, observer, *filesystemPlacementScanInterval)
+	}
 	startFilesystemLeaseReaper(ctx, eg, service, *filesystemLeaseReapInterval)
 	slog.Info("filesystem FUSE mounted", "mount_point", config.mountPoint, "client_id", config.clientID)
 	return nil
@@ -1338,6 +1341,37 @@ func startFilesystemPlacementCollector(
 		for {
 			if _, err := service.ListFilePlacementStats(ctx); err != nil && ctx.Err() == nil {
 				slog.WarnContext(ctx, "filesystem placement scan failed", "err", err)
+			}
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-ticker.C:
+			}
+		}
+	})
+}
+
+func startFilesystemJournalCollector(
+	ctx context.Context,
+	eg *errgroup.Group,
+	service *filesystem.Service,
+	observer monitoring.FileSystemObserver,
+	interval time.Duration,
+) {
+	if eg == nil || service == nil || observer == nil || interval <= 0 {
+		return
+	}
+	eg.Go(func() error {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			stats, err := service.ListOperationJournalStats(ctx)
+			if err != nil {
+				if ctx.Err() == nil {
+					slog.WarnContext(ctx, "filesystem journal usage scan failed", "err", err)
+				}
+			} else {
+				observer.ObserveOperationJournalStats(stats)
 			}
 			select {
 			case <-ctx.Done():

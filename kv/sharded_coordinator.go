@@ -1990,8 +1990,9 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 
 	primaryGid, maxIndex, err := c.commitPrimaryTxn(ctx, startTS, primaryKey, grouped, gids, commitTS, observedRouteVersion, bypassKeysByGroup)
 	if err != nil {
-		if errors.Is(err, store.ErrWriteConflict) && !errors.Is(err, ErrTransactionOutcomeUnknown) {
-			// An applied OCC rejection is a definitive non-commit. Release
+		if primaryCommitDefinitelyRejected(err) {
+			// A deterministic apply verdict or pre-append leadership rejection
+			// is a definitive non-commit. Release
 			// prepared intents even if the caller has since cancelled.
 			cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), verifyLeaderTimeout)
 			c.abortPreparedTxn(cleanupCtx, startTS, primaryKey, prepared, c.abortTimestamp(cleanupCtx, startTS, commitTS))
@@ -2023,6 +2024,16 @@ func (c *ShardedCoordinator) dispatchMultiShardTxn(ctx context.Context, startTS,
 		return nil, errors.WithStack(err)
 	}
 	return &CoordinateResponse{CommitIndex: maxIndex, CommitTS: commitTS}, nil
+}
+
+func primaryCommitDefinitelyRejected(err error) bool {
+	if errors.Is(err, ErrTransactionOutcomeUnknown) {
+		return false
+	}
+	return isRawApplyVerdict(err) ||
+		errors.Is(err, ErrComposed1Violation) ||
+		errors.Is(err, raftengine.ErrNotLeader) ||
+		errors.Is(err, raftengine.ErrLeadershipTransferInProgress)
 }
 
 func (c *ShardedCoordinator) resolveTxnCommitTS(ctx context.Context, startTS, commitTS uint64) (uint64, error) {

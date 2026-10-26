@@ -17,15 +17,18 @@ itself, an abort decision.
 
 The coordinator now leaves prepared secondary intents intact when the primary
 response is missing. Lock resolution reads the primary decision before
-committing a secondary. A definitive, typed OCC rejection can still abort the
+committing a secondary. A definitive, typed apply verdict or pre-append
+leadership rejection can still abort the
 prepared intents. Nil commit responses are unknown, including on the
 single-group path.
 
 `TestLostPrimaryReplyResolvesPreparedSecondaryFromDurableDecision` exercises
 the lost-response path with two live Raft groups and their lock resolver.
 `TestStrictLostPrimaryCommitReplyDoesNotAbortPreparedParticipants` and
-`TestStrictDefinitivePrimaryConflictAbortsPreparedParticipants` cover the two
-error classes. `TestJournalGenerationFenceSurvivesProcessKill` verifies that a
+`TestStrictDefinitivePrimaryConflictAbortsPreparedParticipants`,
+`TestPrimaryRouteVerdictAbortsPreparedParticipants`, and
+`TestPrimaryCommitDecisionClassification` cover the two error classes.
+`TestJournalGenerationFenceSurvivesProcessKill` verifies that a
 restarted store still rejects an old attempt after its durable fence.
 
 ## Crash and mounted evidence
@@ -57,11 +60,27 @@ writers with disjoint offsets and no client retry.
 | One writer, 40 operations | 105.9 | 40.8 | 12.7 ms | 30.7 ms |
 | Four writers, 160 operations | 86.4 | 30.4 | 82.7 ms | 475.1 ms |
 
-These are single-run observations, not performance limits. The workflow now
-records three trials per mode and retains their JSON artifacts. A rollout
+The three-trial paired measurement in
+[run 40322309957](https://github.com/bootjp/elastickv/actions/runs/40322309957)
+used the same workload and commit on separate fresh runners. Across the three
+trials, the median serial throughput was 59.2 ops/s in legacy mode and 36.1
+ops/s in strict mode; median serial p99 was 22.7 ms and 40.0 ms. The median
+hot-inode throughput was 53.4 and 32.1 ops/s; median hot-inode p99 was 130.5
+ms and 250.2 ms. These comparisons are descriptive because the runners are
+separate and scheduling noise is not controlled.
+
+These are observations, not performance limits. The workflow retains the JSON
+artifacts for all trials. A rollout
 limit must use repeated matched measurements and explicit maintainer approval,
 as required by the parent design. The current hot-inode result warrants review
 before choosing that limit.
+
+The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
+`elastickv_fs_operation_journal_pending`, and
+`elastickv_fs_operation_journal_retained_bytes` from a fenced snapshot. These
+gauges make pending work and retained storage visible during a canary. A
+failed scan is logged; the last gauge value must not be treated as fresh
+evidence after a scan failure.
 
 ## Remaining rollout gates
 

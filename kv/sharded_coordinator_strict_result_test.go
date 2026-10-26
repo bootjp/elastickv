@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -190,6 +191,45 @@ func TestStrictDefinitivePrimaryConflictAbortsPreparedParticipants(t *testing.T)
 	require.Len(t, primary.requests, 3)
 	require.Equal(t, pb.Phase_ABORT, primary.requests[2].Phase)
 	require.Len(t, secondary.requests, 2)
+	require.Equal(t, pb.Phase_ABORT, secondary.requests[1].Phase)
+}
+
+func TestPrimaryCommitDecisionClassification(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name     string
+		err      error
+		rejected bool
+	}{
+		{"conflict", store.ErrWriteConflict, true},
+		{"route version", ErrComposed1VersionGCd, true},
+		{"route moved", ErrComposed1Violation, true},
+		{"not leader before append", raftengine.ErrNotLeader, true},
+		{"ambiguous wrapped conflict", errors.Join(ErrTransactionOutcomeUnknown, store.ErrWriteConflict), false},
+		{"unclassified transport", errors.New("response lost"), false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.rejected, primaryCommitDefinitelyRejected(tc.err))
+		})
+	}
+}
+
+func TestPrimaryRouteVerdictAbortsPreparedParticipants(t *testing.T) {
+	t.Parallel()
+	primary := &recordingTransactional{errs: []error{nil, ErrComposed1VersionGCd}}
+	secondary := &recordingTransactional{}
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{
+		1: {Txn: primary}, 2: {Txn: secondary},
+	}}
+	grouped := map[uint64][]*pb.Mutation{
+		1: {{Key: []byte("b"), Value: []byte("record")}},
+		2: {{Key: []byte("x"), Value: []byte("effect")}},
+	}
+	_, err := coord.dispatchMultiShardTxn(context.Background(), 10, 20, 0,
+		[]byte("b"), grouped, []uint64{1, 2}, nil, 7, nil, true)
+	require.ErrorIs(t, err, ErrComposed1VersionGCd)
+	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
+	require.Equal(t, pb.Phase_ABORT, primary.requests[2].Phase)
 	require.Equal(t, pb.Phase_ABORT, secondary.requests[1].Phase)
 }
 

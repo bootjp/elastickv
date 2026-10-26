@@ -54,7 +54,10 @@ def main():
     for path in paths[1:]:
         await_contents(path, contents)
 
-    pid = int(args.pid_file.read_text().splitlines()[0])
+    pids = [int(line) for line in args.pid_file.read_text().splitlines() if line.strip()]
+    if len(pids) < len(args.mounts):
+        raise AssertionError("pid file does not contain every cluster node")
+    pid = pids[0]
     # /proc cmdline ends in NUL; interior empty arguments (for example an
     # intentionally disabled metrics address) must remain in their positions.
     argv = [os.fsdecode(arg) for arg in pathlib.Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")[:-1]]
@@ -65,13 +68,16 @@ def main():
     for path in paths[1:]:
         await_contents(path, contents)
 
+    restart_argv = argv if "--filesystemStrictRecover" in argv else argv + ["--filesystemStrictRecover"]
     with args.restart_log.open("wb") as log:
-        restarted = subprocess.Popen(argv + ["--filesystemStrictRecover"], stdout=log, stderr=subprocess.STDOUT)
+        restarted = subprocess.Popen(restart_argv, stdout=log, stderr=subprocess.STDOUT)
     with args.pid_file.open("a") as pid_file:
         pid_file.write(f"{restarted.pid}\n")
     await_contents(paths[0], contents)
-    if restarted.poll() is not None:
-        raise AssertionError(f"restarted node exited with {restarted.returncode}")
+    for _ in range(10):
+        if restarted.poll() is not None:
+            raise AssertionError(f"restarted node exited with {restarted.returncode}")
+        time.sleep(0.5)
     print("PASS: strict FUSE file and directory fsync survived node SIGKILL and restart")
 
 

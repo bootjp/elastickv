@@ -80,6 +80,11 @@ func IsOperationKey(key []byte) bool {
 		len(key) == len(operationPrefix)+operationIdentityBytes+u64Bytes
 }
 
+// OperationSessionAllPrefix spans durable mount incarnation rows.
+func OperationSessionAllPrefix() []byte {
+	return []byte(operationSessionPrefix)
+}
+
 // OperationSessionKey names one durable mount incarnation.
 func OperationSessionKey(filesystemID, sessionID [16]byte) []byte {
 	out := make([]byte, 0, len(operationSessionPrefix)+operationIdentityBytes)
