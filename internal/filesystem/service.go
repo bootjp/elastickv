@@ -641,11 +641,12 @@ func (s *Service) openWithHandle(ctx context.Context, inode uint64, clientID []b
 	if err != nil {
 		return err
 	}
-	return s.dispatchTxn(ctx, ts, []*kv.Elem[kv.OP]{refElem, fenceElem}, [][]byte{
+	_, err = s.dispatchTxnWithPrimaryPolicy(ctx, ts, []*kv.Elem[kv.OP]{refElem, fenceElem}, [][]byte{
 		fskeys.InodeKey(inode),
 		refKey,
 		fskeys.RefFenceKey(inode),
-	})
+	}, false, refKey)
+	return err
 }
 
 //nolint:cyclop // Read handles EOF, sparse chunks, and chunk boundary copying in one linear path.
@@ -1276,7 +1277,7 @@ func (s *Service) releaseOnce(ctx context.Context, inode uint64, fh uint64, clie
 	if err != nil {
 		return err
 	}
-	if err := s.dispatchTxn(ctx, ts, elems, readKeys); err != nil {
+	if _, err := s.dispatchTxnWithPrimaryPolicy(ctx, ts, elems, readKeys, false, refKey); err != nil {
 		return err
 	}
 	s.reclaimCommittedOrphanBestEffort(ctx, chunkDeletes)

@@ -732,6 +732,7 @@ func TestServiceOpenUsesRefFenceWithoutTouchingInode(t *testing.T) {
 	require.EqualValues(t, 3, fh)
 	require.Len(t, rec.requests, 1)
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), fh)))
+	require.Equal(t, fskeys.RefKey(file.Inode, []byte("client-a"), fh), rec.requests[0].PrimaryKey)
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefFenceKey(file.Inode)))
 	require.False(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
 }
@@ -1067,6 +1068,7 @@ func TestServiceReleaseLastOpenHandleGcsInSingleTxn(t *testing.T) {
 	require.NoError(t, svc.Release(ctx, file.Inode, file.FH, []byte("client-a")))
 	require.Len(t, rec.requests, 1)
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH)))
+	require.Equal(t, fskeys.RefKey(file.Inode, []byte("client-a"), file.FH), rec.requests[0].PrimaryKey)
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.InodeKey(file.Inode)))
 	require.True(t, elemTouchesKey(rec.requests[0].Elems, fskeys.RefFenceKey(file.Inode)))
 	requireUsageRouteCounterWithTxn(t, rec.requests[0].Elems)
