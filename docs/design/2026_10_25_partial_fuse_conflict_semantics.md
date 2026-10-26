@@ -438,13 +438,16 @@ regression tests.
 
 ### Remaining work after the bounded legacy-path changes
 
-The current branch adds typed forwarding of definitive write conflicts, bounded
-retries for those conflicts in several filesystem service operations, a local
-FUSE predecessor barrier, and mounted SQLite PERSIST/DELETE test coverage. These
-changes improve the legacy path but do not route FUSE mutations through the
-operation journal. In particular, `AdvanceGeneration` still fails closed, and
-`Service.Fsync` still uses an attribute read rather than a durable receipt.
-The tests for the legacy path cannot satisfy the strict-mode gates below.
+The merged baseline forwards definitive write conflicts, retries several
+filesystem service operations within bounds, tracks local FUSE predecessors,
+and tests mounted SQLite PERSIST/DELETE workloads.
+This branch adds a transaction-primary generation fence and an optional
+journal-backed path for fixed-offset FUSE writes.
+The default mount path still uses the legacy mutations.
+Other mutation categories lack journal-backed planners, and `Service.Fsync`
+still uses an attribute read rather than a durable receipt.
+Neither the baseline tests nor the optional write-path test satisfies the
+strict-mode gates below.
 
 Complete the remaining work in dependency order:
 
