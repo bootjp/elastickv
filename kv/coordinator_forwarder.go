@@ -270,6 +270,16 @@ func (f CoordinatorForwarder) ResolveOperationGroupForKey(key []byte) (uint64, e
 	return group, errors.WithStack(err)
 }
 
+// JournalRouteVersion carries the route pin through coordinator wrappers.
+// An unavailable pin must remain unavailable to the operation journal.
+func (f CoordinatorForwarder) JournalRouteVersion() (uint64, bool) {
+	source, ok := f.Inner.(interface{ JournalRouteVersion() (uint64, bool) })
+	if !ok {
+		return 0, false
+	}
+	return source.JournalRouteVersion()
+}
+
 // LocalLeaderGroupIDs lists the data groups this process leads. The Redis
 // delta compactor's TTL-inline migration plans one scan per group from it.
 // An Inner without the capability stays unknown rather than leading no group,

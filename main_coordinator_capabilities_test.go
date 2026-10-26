@@ -145,6 +145,11 @@ func (s *shardedCapabilitySpy) ResolveOperationGroupForKey([]byte) (uint64, erro
 	return spyIndex, errSpyForwarded
 }
 
+func (s *shardedCapabilitySpy) JournalRouteVersion() (uint64, bool) {
+	s.record("JournalRouteVersion")
+	return spyIndex, true
+}
+
 func (s *shardedCapabilitySpy) LocalLeaderGroupIDs() ([]uint64, bool) {
 	s.record("LocalLeaderGroupIDs")
 	return []uint64{spyIndex}, true
