@@ -60,6 +60,7 @@ jobs:
           - filesystem-cross-mount
           - filesystem-sqlite-check
           - filesystem-node-crash
+          - filesystem-benchmark
           - filesystem-overwrite
           - filesystem-rename
           - sqlite
@@ -307,6 +308,19 @@ jobs:
             /tmp/elastickv-fs/fs-n3 \
             --pid-file /tmp/elastickv-fs.pid \
             --restart-log /tmp/elastickv-fs-n1-restarted.log
+      - name: Measure strict FUSE write and fsync latency
+        if: matrix.workload == 'filesystem-benchmark'
+        timeout-minutes: 10
+        run: |
+          python3 scripts/benchmark-fuse-strict.py /tmp/elastickv-fs/fs-n1 \
+            --writes 40 --workers 4 --output /tmp/elastickv-fuse-benchmark.json
+      - name: Upload strict FUSE benchmark results
+        if: matrix.workload == 'filesystem-benchmark'
+        uses: actions/upload-artifact@v7
+        with:
+          name: elastickv-fuse-benchmark
+          path: /tmp/elastickv-fuse-benchmark.json
+          retention-days: 14
       - name: Run filesystem Jepsen workload against elastickv
         if: matrix.workload == 'filesystem-overwrite' || matrix.workload == 'filesystem-rename'
         working-directory: jepsen

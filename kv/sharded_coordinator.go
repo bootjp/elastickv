@@ -2064,7 +2064,7 @@ func (c *ShardedCoordinator) dispatchSingleShardTxn(ctx context.Context, startTS
 		return nil, errors.WithStack(err)
 	}
 	if resp == nil {
-		return &CoordinateResponse{}, nil
+		return nil, errors.WithStack(ErrTransactionOutcomeUnknown)
 	}
 	return &CoordinateResponse{CommitIndex: resp.CommitIndex, CommitTS: commitTS}, nil
 }
@@ -2196,7 +2196,7 @@ func (c *ShardedCoordinator) commitPrimaryTxn(ctx context.Context, startTS uint6
 		return primaryGid, 0, errors.WithStack(err)
 	}
 	if r == nil {
-		return primaryGid, 0, nil
+		return primaryGid, 0, errors.WithStack(ErrTransactionOutcomeUnknown)
 	}
 	return primaryGid, r.CommitIndex, nil
 }

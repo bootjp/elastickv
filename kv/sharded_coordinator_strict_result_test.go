@@ -43,6 +43,23 @@ func TestCommitSecondaryTxnsRequiresNonNilDecision(t *testing.T) {
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 }
 
+func TestSingleShardTxnRequiresNonNilDecision(t *testing.T) {
+	t.Parallel()
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{1: {Txn: nilDecisionTransactional{}}}}
+	_, err := coord.dispatchSingleShardTxn(context.Background(), 10, 20, 0, []byte("primary"), 1,
+		[]*Elem[OP]{{Op: Put, Key: []byte("primary"), Value: []byte("value")}}, nil, 0, nil)
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+}
+
+func TestPrimaryTxnRequiresNonNilDecision(t *testing.T) {
+	t.Parallel()
+	coord := &ShardedCoordinator{groups: map[uint64]*ShardGroup{1: {Txn: nilDecisionTransactional{}}}}
+	_, _, err := coord.commitPrimaryTxn(context.Background(), 10, []byte("primary"),
+		map[uint64][]*pb.Mutation{1: {{Op: pb.Op_PUT, Key: []byte("primary")}}},
+		[]uint64{1}, 20, 0, nil)
+	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
+}
+
 type nilDecisionTransactional struct{}
 
 func (nilDecisionTransactional) Commit(context.Context, []*pb.Request) (*TransactionResponse, error) {
