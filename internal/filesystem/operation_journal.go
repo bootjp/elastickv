@@ -449,8 +449,11 @@ func (j *OperationJournal) loadRecordAt(ctx context.Context, id OperationID, ts 
 		return operationRecord{}, false, errors.Wrap(err, "read operation record")
 	}
 	record, err := decodeOperationRecord(raw)
-	if err != nil || record.ID != id {
-		return operationRecord{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation row")
+	if err != nil {
+		return operationRecord{}, false, errors.Wrap(err, "decode operation row")
+	}
+	if record.ID != id {
+		return operationRecord{}, false, errors.Wrap(ErrOperationRecordCorrupt, "operation row identity mismatch")
 	}
 	return record, true, nil
 }

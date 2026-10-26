@@ -665,7 +665,11 @@ func reserveAckRetirement(session *operationSession, record operationRecord) err
 		return errors.WithStack(ErrOperationRetired)
 	}
 	if session.RetainedCount == 0 || session.RetainedBytes < record.Reservation {
-		return errors.Wrap(ErrOperationRecordCorrupt, "ack reservation exceeds retained usage")
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"ack reservation exceeds retained usage: sequence=%d generation=%d state=%d retained_count=%d retained_bytes=%d reservation=%d pending=%d reject_before=%d ack_gaps=%d",
+			record.ID.Sequence, record.Generation, record.State, session.RetainedCount,
+			session.RetainedBytes, record.Reservation, session.Pending,
+			session.RejectBefore, len(session.AckGaps))
 	}
 	if err := advanceAckWatermark(session, record.ID.Sequence); err != nil {
 		return err

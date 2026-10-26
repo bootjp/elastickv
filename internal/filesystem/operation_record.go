@@ -119,16 +119,19 @@ func decodeOperationRecord(raw []byte) (operationRecord, error) {
 		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
 	}
 	record.CommitTS = binary.BigEndian.Uint64(raw[operationCommitTSOffset:])
-	if !validDecodedOperationRecord(raw, record) {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
+	if raw[4] == operationRecordLegacyVersion && (record.RecordIsPrimary || len(record.FencedAttempts) != 0) {
+		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt, "legacy operation row has primary metadata")
+	}
+	if record.State != OperationPending && record.CommitTS == 0 {
+		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt, "terminal operation row has no commit timestamp")
+	}
+	if record.State != OperationState(raw[5]) {
+		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt, "operation row state differs from header")
+	}
+	if err := validateOperationRecord(record); err != nil {
+		return operationRecord{}, errors.Wrap(err, "invalid decoded operation row")
 	}
 	return record, nil
-}
-
-func validDecodedOperationRecord(raw []byte, record operationRecord) bool {
-	return (raw[4] != operationRecordLegacyVersion || (!record.RecordIsPrimary && len(record.FencedAttempts) == 0)) &&
-		(record.State == OperationPending || record.CommitTS != 0) &&
-		record.State == OperationState(raw[5]) && validateOperationRecord(record) == nil
 }
 
 func validOperationHeader(raw []byte) bool {
