@@ -38,6 +38,12 @@ restarted store still rejects an old attempt after its durable fence.
 `TestJournalCommittedAttemptDecisionSurvivesProcessKill` verifies that a
 committed attempt, stored result, and effect survive a process kill; retrying
 the same attempt returns that result without publishing another effect.
+`TestMultiGroupPrimaryDecisionSurvivesProcessKill` runs two independent
+single-voter Raft groups with Pebble stores, kills their shared process after
+the primary COMMIT but before the secondary COMMIT, then reopens both groups.
+The restarted resolver reads the primary decision and commits the prepared
+secondary. The test covers a precise cross-group crash boundary but does not
+model a three-voter group or a crash during WAL persistence.
 
 ## Crash and mounted evidence
 
@@ -96,7 +102,8 @@ evidence after a scan failure.
 ## Remaining rollout gates
 
 1. Exercise lost replies and process or node crashes at every publication and
-   barrier boundary, including multi-group primary and secondary recovery.
+   barrier boundary, including a multi-group secondary crash and three-voter
+   primary and secondary recovery.
 2. Review the full race suite, Linux mount tests, Jepsen histories and
    checker output for the same candidate SHA. The scheduled workflow archives
    Jepsen histories for successful as well as failed workload jobs.
