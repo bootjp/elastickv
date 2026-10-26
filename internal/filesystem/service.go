@@ -2814,11 +2814,24 @@ func (s *Service) dispatchTxnWithPrimaryPolicy(
 	requireAllParticipants bool,
 	primary []byte,
 ) (*kv.CoordinateResponse, error) {
+	return s.dispatchTxnWithPrimaryAtRoute(ctx, startTS, elems, readKeys, requireAllParticipants, primary, 0)
+}
+
+func (s *Service) dispatchTxnWithPrimaryAtRoute(
+	ctx context.Context,
+	startTS uint64,
+	elems []*kv.Elem[kv.OP],
+	readKeys [][]byte,
+	requireAllParticipants bool,
+	primary []byte,
+	observedRouteVersion uint64,
+) (*kv.CoordinateResponse, error) {
 	startTS = normalizeEmptyStoreReadTS(startTS)
 	reqs := &kv.OperationGroup[kv.OP]{
 		Elems:                  elems,
 		IsTxn:                  true,
 		PrimaryKey:             primary,
+		ObservedRouteVersion:   observedRouteVersion,
 		RequireAllParticipants: requireAllParticipants,
 		StartTS:                startTS,
 		ReadKeys:               readKeys,

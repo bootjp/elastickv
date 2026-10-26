@@ -34,15 +34,33 @@ func testOperationID(t *testing.T, journal *OperationJournal, sequence uint64) O
 }
 
 type primaryCaptureDispatcher struct {
-	inner   *testCoordinator
-	primary []byte
+	inner        *testCoordinator
+	primary      []byte
+	routeVersion uint64
 }
 
 func (d *primaryCaptureDispatcher) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
 	if len(req.PrimaryKey) != 0 {
 		d.primary = append([]byte(nil), req.PrimaryKey...)
 	}
+	if req.ObservedRouteVersion != 0 && req.ObservedRouteVersion != d.routeVersion {
+		return nil, kv.ErrTransactionOutcomeUnknown
+	}
 	return d.inner.Dispatch(ctx, req)
+}
+
+func (d *primaryCaptureDispatcher) JournalRouteVersion() (uint64, bool) {
+	return d.routeVersion, d.routeVersion != 0
+}
+
+type routeSwitchOperationBackend struct {
+	operationJournalBackend
+	switchRoute func()
+}
+
+func (b *routeSwitchOperationBackend) CommitAtRouteVersion(ctx context.Context, ts uint64, elems []*kv.Elem[kv.OP], reads [][]byte, observed uint64) (*kv.CoordinateResponse, error) {
+	b.switchRoute()
+	return b.operationJournalBackend.CommitAtRouteVersion(ctx, ts, elems, reads, observed)
 }
 
 func TestOperationJournalSelectsRecordAsTransactionPrimary(t *testing.T) {
@@ -64,6 +82,33 @@ func TestOperationJournalSelectsRecordAsTransactionPrimary(t *testing.T) {
 	})
 	require.NoError(t, err)
 	require.Equal(t, id.key(), dispatch.primary)
+}
+
+func TestOperationJournalGenerationFenceRejectsChangedRouteVersion(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	dispatch := &primaryCaptureDispatcher{inner: &testCoordinator{st: st}, routeVersion: 7}
+	service, err := NewService(st, dispatch)
+	require.NoError(t, err)
+	journal, err := NewOperationJournal(service)
+	require.NoError(t, err)
+	id := testOperationID(t, journal, 1)
+	_, err = journal.Admit(ctx, id, []byte("write"), 128, 1024)
+	require.NoError(t, err)
+	attempt, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	journal = newOperationJournalWithBackend(&routeSwitchOperationBackend{
+		operationJournalBackend: journal.backend,
+		switchRoute:             func() { dispatch.routeVersion = 8 },
+	})
+	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	outcome, _, err := journal.ResolveAttempt(ctx, id, attempt.AttemptID)
+	require.ErrorIs(t, err, ErrOperationPending)
+	require.Equal(t, AttemptUnknown, outcome)
+	current, err := journal.BeginAttempt(ctx, id)
+	require.NoError(t, err)
+	require.Equal(t, attempt.AttemptID, current.AttemptID)
 }
 
 func TestOperationJournalPublishesResultWithEffectAndRetiresIdentity(t *testing.T) {

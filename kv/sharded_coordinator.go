@@ -1320,6 +1320,16 @@ func (c *ShardedCoordinator) pinStrictRouteVersion(reqs *OperationGroup[OP]) {
 	}
 }
 
+// JournalRouteVersion returns a pin for journal read/modify/write operations.
+// Version zero is not a usable pin until its wire encoding is enabled.
+func (c *ShardedCoordinator) JournalRouteVersion() (uint64, bool) {
+	if c == nil || c.engine == nil {
+		return 0, false
+	}
+	observed := EncodeObservedRouteVersion(c.engine.Version())
+	return observed, observed != 0
+}
+
 func (c *ShardedCoordinator) ensureStrictRouteVersion(observed uint64, strict bool) error {
 	if !strict || c.engine == nil {
 		return nil

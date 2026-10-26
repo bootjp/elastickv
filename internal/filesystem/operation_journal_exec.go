@@ -52,7 +52,11 @@ func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID
 		return operationRecord{}, errors.WithStack(ErrInvalid)
 	}
 	for range operationCASRetries {
-		record, err := j.advanceGenerationOnce(ctx, id, old)
+		observed, ready := j.backend.JournalRouteVersion()
+		if !ready {
+			return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
+		}
+		record, err := j.advanceGenerationOnce(ctx, id, old, observed)
 		if !IsWriteConflict(err) {
 			return record, err
 		}
@@ -60,7 +64,7 @@ func (j *OperationJournal) AdvanceGeneration(ctx context.Context, id OperationID
 	return operationRecord{}, errors.WithStack(kv.ErrTransactionOutcomeUnknown)
 }
 
-func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id OperationID, old [16]byte) (operationRecord, error) {
+func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id OperationID, old [16]byte, observed uint64) (operationRecord, error) {
 	ts, record, session, err := j.pendingSnapshot(ctx, id)
 	if err != nil {
 		return operationRecord{}, err
@@ -72,7 +76,7 @@ func (j *OperationJournal) advanceGenerationOnce(ctx context.Context, id Operati
 	if err != nil {
 		return operationRecord{}, err
 	}
-	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
+	if err = j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, observed); err != nil {
 		return operationRecord{}, err
 	}
 	return record, nil
