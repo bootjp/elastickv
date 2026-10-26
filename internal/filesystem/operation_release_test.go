@@ -1,12 +1,34 @@
 package filesystem
 
 import (
+	"bytes"
 	"context"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/stretchr/testify/require"
 )
+
+func TestReleaseWithOperationSupportsLongClientID(t *testing.T) {
+	ctx := t.Context()
+	svc := newTestServiceWithOptions(t, []uint64{2, 3})
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	clientID := bytes.Repeat([]byte("a"), 65536)
+	openID := testWriteOperationID(t, svc, 1)
+	fh, err := svc.OpenWithOperation(ctx, openID, file.Inode, clientID)
+	require.NoError(t, err)
+	releaseID := openID
+	releaseID.Sequence = 2
+	require.NoError(t, svc.ReleaseWithOperation(ctx, releaseID, file.Inode, fh, clientID))
+	require.NoError(t, svc.VerifyOperationReceipt(ctx, releaseID))
+	ts, err := svc.readTS(ctx)
+	require.NoError(t, err)
+	_, exists, err := svc.openHandleLeaseAt(ctx, fskeys.RefKey(file.Inode, clientID, fh), ts)
+	require.NoError(t, err)
+	require.False(t, exists)
+}
 
 func TestReleaseWithOperationDoesNotRemoveNewHandle(t *testing.T) {
 	ctx := context.Background()

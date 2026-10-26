@@ -21,12 +21,18 @@ func handleLeaseEffectLimit(inode uint64, clientID []byte, withFence bool) (uint
 }
 
 func operationEffectLimitForKeys(minimum uint32, keys ...[]byte) (uint32, error) {
-	limit := uint64(minimum)
-	keyBytes := uint64(0)
-	for _, key := range keys {
-		keyBytes += uint64(len(key))
+	keyBytes, err := operationEffectLimitWithSlack(0, keys...)
+	if err != nil {
+		return 0, err
 	}
-	limit = max(limit, keyBytes)
+	return max(minimum, keyBytes), nil
+}
+
+func operationEffectLimitWithSlack(slack uint32, keys ...[]byte) (uint32, error) {
+	limit := uint64(slack)
+	for _, key := range keys {
+		limit += uint64(len(key))
+	}
 	if limit > math.MaxUint32 {
 		return 0, errors.WithStack(ErrOperationQuota)
 	}

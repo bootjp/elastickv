@@ -30,7 +30,11 @@ func (s *Service) ReleaseWithOperation(ctx context.Context, id OperationID, inod
 	if err != nil {
 		return errors.Wrap(err, "encode release intent")
 	}
-	journal, attempt, terminal, err := s.admitHandleOperation(ctx, id, intent, releaseOperationResultLimit, releaseOperationEffectLimit)
+	effectLimit, err := releaseEffectLimit(inode, fh, clientID)
+	if err != nil {
+		return err
+	}
+	journal, attempt, terminal, err := s.admitHandleOperation(ctx, id, intent, releaseOperationResultLimit, effectLimit)
 	if err != nil {
 		return err
 	}
@@ -38,6 +42,10 @@ func (s *Service) ReleaseWithOperation(ctx context.Context, id OperationID, inod
 		return resolveReleaseOperation(ctx, journal, id)
 	}
 	return s.executeReleaseOperation(ctx, journal, id, attempt, inode, fh, clientID, intent)
+}
+
+func releaseEffectLimit(inode, fh uint64, clientID []byte) (uint32, error) {
+	return operationEffectLimitWithSlack(releaseOperationEffectLimit, fskeys.RefKey(inode, clientID, fh))
 }
 
 func (s *Service) admitHandleOperation(ctx context.Context, id OperationID, intent []byte, resultLimit, effectLimit uint32) (*OperationJournal, operationRecord, bool, error) {
