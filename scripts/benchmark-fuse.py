@@ -59,6 +59,27 @@ def hot_writer(path, worker, writes, workers, start, results):
         results.put((samples, repr(exc)))
 
 
+def collect_worker_results(processes, results, timeout=300):
+    try:
+        # A worker cannot exit until its queue feeder flushes. Read each
+        # result before join so a large sample list cannot fill the pipe.
+        outcomes = [results.get(timeout=timeout) for _ in processes]
+    except Exception:
+        for process in processes:
+            process.terminate()
+            process.join()
+        raise
+    for process in processes:
+        process.join(10)
+        if process.is_alive():
+            process.terminate()
+            process.join()
+            raise TimeoutError("hot writer did not exit after returning results")
+        if process.exitcode != 0:
+            raise RuntimeError(f"hot writer exited with status {process.exitcode}")
+    return outcomes
+
+
 def run_serial(path, writes):
     fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
     samples = []
@@ -87,13 +108,7 @@ def run_hot(path, workers, writes):
         process.start()
     started = time.perf_counter()
     start.set()
-    for process in processes:
-        process.join(300)
-        if process.is_alive():
-            process.terminate()
-            process.join()
-            raise TimeoutError("hot writer timed out")
-    outcomes = [results.get(timeout=1) for _ in processes]
+    outcomes = collect_worker_results(processes, results)
     failures = [error for _, error in outcomes if error]
     if failures:
         raise RuntimeError(f"hot writer errors: {failures}")

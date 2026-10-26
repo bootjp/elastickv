@@ -4029,7 +4029,11 @@ func (e *Engine) refreshStatus() {
 		e.fireLeaderAcquiredCallbacks()
 	}
 	if previous == raftengine.StateLeader && status.State != raftengine.StateLeader {
-		e.failPending(errors.WithStack(errNotLeader))
+		// Pending proposals have already passed the pre-append leader check.
+		// Some may have entered the replicated log before this transition;
+		// callers must resolve their outcome instead of treating them as a
+		// definitive not-leader rejection.
+		e.failPending(errors.WithStack(raftengine.ErrLeadershipLost))
 		// Drop the per-peer ack map so a future re-election cannot
 		// surface a stale majority-ack instant before the new term's
 		// heartbeats have actually confirmed liveness.

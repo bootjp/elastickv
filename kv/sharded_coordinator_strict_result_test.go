@@ -145,7 +145,7 @@ func TestStrictLostPrimaryCommitReplyDoesNotAbortPreparedParticipants(t *testing
 		{RouteID: 1, Start: []byte("a"), End: []byte("m"), GroupID: 1},
 		{RouteID: 2, Start: []byte("m"), GroupID: 2},
 	})
-	responseLost := errors.New("primary commit response lost")
+	responseLost := raftengine.ErrLeadershipLost
 	primary := &recordingTransactional{errs: []error{nil, responseLost}}
 	secondary := &recordingTransactional{}
 	coord := NewShardedCoordinator(router, map[uint64]*ShardGroup{

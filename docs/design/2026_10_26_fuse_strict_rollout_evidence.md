@@ -21,6 +21,9 @@ committing a secondary. A definitive, typed apply verdict or pre-append
 leadership rejection can still abort the
 prepared intents. Nil commit responses are unknown, including on the
 single-group path.
+The etcd Raft engine now returns `ErrLeadershipLost` for proposals still
+pending when the leader steps down. Those proposals may have entered the log,
+so `ErrNotLeader` is reserved for the pre-append check.
 
 `TestLostPrimaryReplyResolvesPreparedSecondaryFromDurableDecision` exercises
 the lost-response path with two live Raft groups and their lock resolver.

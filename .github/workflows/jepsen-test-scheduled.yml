@@ -317,6 +317,7 @@ jobs:
         if: matrix.workload == 'filesystem-benchmark' || matrix.workload == 'filesystem-benchmark-legacy'
         timeout-minutes: 10
         run: |
+          python3 scripts/test_benchmark_fuse.py
           MODE=strict
           if [[ "$WORKLOAD" == 'filesystem-benchmark-legacy' ]]; then MODE=legacy; fi
           python3 scripts/benchmark-fuse.py /tmp/elastickv-fs/fs-n1 \
