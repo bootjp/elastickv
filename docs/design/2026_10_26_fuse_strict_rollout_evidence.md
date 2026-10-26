@@ -24,6 +24,8 @@ single-group path.
 The etcd Raft engine now returns `ErrLeadershipLost` for proposals still
 pending when the leader steps down. Those proposals may have entered the log,
 so `ErrNotLeader` is reserved for the pre-append check.
+The Redis error adapter does not convert a wrapped unknown outcome into
+`NOTLEADER`, which clients may interpret as permission to retry a write.
 
 `TestLostPrimaryReplyResolvesPreparedSecondaryFromDurableDecision` exercises
 the lost-response path with two live Raft groups and their lock resolver.
