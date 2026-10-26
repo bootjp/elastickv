@@ -127,7 +127,9 @@ func TestMultiGroupPrimaryDecisionSurvivesProcessKill(t *testing.T) {
 	lock, err := decodeTxnLock(rawLock)
 	require.NoError(t, err)
 	require.NoError(t, resolver.resolveExpiredLock(ctx, groups[2], []byte("x"), lock))
-	secondary, err := shards.GetAt(ctx, []byte("x"), 20)
+	secondary, err := groups[2].Store.GetAt(ctx, []byte("x"), 20)
 	require.NoError(t, err)
 	require.Equal(t, []byte("secondary"), secondary)
+	_, err = groups[2].Store.GetAt(ctx, txnLockKey([]byte("x")), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound)
 }

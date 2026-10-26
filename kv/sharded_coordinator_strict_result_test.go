@@ -110,6 +110,27 @@ func TestLostPrimaryReplyResolvesPreparedSecondaryFromDurableDecision(t *testing
 	require.Equal(t, []byte("secondary"), secondary)
 }
 
+func TestRepeatedTwoGroupCommitReleasesSecondaryLocks(t *testing.T) {
+	_, ss, groups, cleanup := setupLockResolverEnv(t)
+	defer cleanup()
+	coord := NewShardedCoordinator(ss.engine, groups, 1, NewHLC(), ss)
+	ctx := context.Background()
+	for _, tc := range []struct {
+		start, commit uint64
+		value         string
+	}{{10, 20, "first"}, {30, 40, "second"}} {
+		_, err := coord.dispatchMultiShardTxn(ctx, tc.start, tc.commit, 0, []byte("b"),
+			map[uint64][]*pb.Mutation{
+				1: {{Op: pb.Op_PUT, Key: []byte("b"), Value: []byte(tc.value)}},
+				2: {{Op: pb.Op_PUT, Key: []byte("x"), Value: []byte(tc.value)}},
+			}, []uint64{1, 2}, nil, 0, nil, true)
+		require.NoError(t, err)
+	}
+	value, err := ss.GetAt(ctx, []byte("x"), 40)
+	require.NoError(t, err)
+	require.Equal(t, []byte("second"), value)
+}
+
 func TestStrictSecondaryRouteShiftNeverStartsANewTransaction(t *testing.T) {
 	t.Parallel()
 	router := distribution.NewEngine()
