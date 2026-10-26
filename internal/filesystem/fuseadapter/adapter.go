@@ -220,6 +220,9 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 	if errno := a.refreshOpenHandleLease(ctx, inode, fh); errno != 0 {
 		return 0, errno
 	}
+	if len(data) == 0 {
+		return 0, 0
+	}
 	if a.journaledWrites {
 		writer, ok := a.core.(interface {
 			WriteWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) (int, error)

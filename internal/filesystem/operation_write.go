@@ -11,14 +11,15 @@ import (
 )
 
 const (
-	writeOperationIntentVersion = 1
-	writeOperationIntentHeader  = 25
-	writeOperationResultBytes   = 9
-	writeOperationEffectLimit   = 1 << 20
-	writeOperationMaxData       = 4 << 20
-	writeResultSuccess          = 0
-	writeResultIsDir            = 1
-	writeResultNotFound         = 2
+	writeOperationIntentVersion  = 1
+	writeOperationIntentHeader   = 25
+	writeOperationResultBytes    = 9
+	writeOperationMaxEffectLimit = 1 << 20
+	writeOperationEffectSlack    = 256
+	writeOperationMaxData        = 4 << 20
+	writeResultSuccess           = 0
+	writeResultIsDir             = 1
+	writeResultNotFound          = 2
 )
 
 var errWriteCleanupChanged = errors.New("filesystem: write cleanup snapshot changed")
@@ -39,11 +40,15 @@ func (s *Service) WriteWithOperation(ctx context.Context, id OperationID, inode,
 	}
 	data = bytes.Clone(data)
 	intent := encodeWriteOperationIntent(inode, offset, data)
+	effectLimit, err := s.writeOperationEffectLimit(ctx, inode, offset, end)
+	if err != nil {
+		return 0, err
+	}
 	journal, err := NewOperationJournal(s)
 	if err != nil {
 		return 0, err
 	}
-	admitted, err := journal.Admit(ctx, id, intent, writeOperationResultBytes, writeOperationEffectLimit)
+	admitted, err := journal.Admit(ctx, id, intent, writeOperationResultBytes, effectLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -58,6 +63,33 @@ func (s *Service) WriteWithOperation(ctx context.Context, id OperationID, inode,
 		return 0, err
 	}
 	return s.executeWriteOperation(ctx, journal, id, attempt, inode, offset, end, data, intent)
+}
+
+func (s *Service) writeOperationEffectLimit(ctx context.Context, inode, offset, end uint64) (uint32, error) {
+	ts, err := s.readTS(ctx)
+	if err != nil {
+		return 0, err
+	}
+	chunkSize := s.chunkSize
+	homeSlot := inode
+	meta, err := s.inodeAt(ctx, inode, ts)
+	if err == nil {
+		chunkSize = meta.effectiveChunkSize(s.chunkSize)
+		homeSlot = meta.HomeSlot
+	} else if !errors.Is(err, ErrNotFound) {
+		return 0, err
+	}
+	chunks := (end-1)/chunkSize - offset/chunkSize + 1
+	if chunks > maxOperationEffectKeys-2 {
+		return 0, errors.WithStack(ErrOperationQuota)
+	}
+	chunkKey := fskeys.ChunkKey(homeSlot, inode, 0)
+	usageKey := fskeys.UsageRouteKey(kv.RouteKey(chunkKey))
+	limit := chunks*uint64(len(chunkKey)) + uint64(len(fskeys.InodeKey(inode))+len(usageKey)+writeOperationEffectSlack)
+	if limit > writeOperationMaxEffectLimit {
+		return 0, errors.WithStack(ErrOperationQuota)
+	}
+	return uint32(limit), nil
 }
 
 func (s *Service) executeWriteOperation(ctx context.Context, journal *OperationJournal, id OperationID, attempt operationRecord, inode, offset, end uint64, data, intent []byte) (int, error) {

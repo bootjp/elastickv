@@ -69,8 +69,11 @@ func TestAdapterJournaledWritesAllocateStableSessionSequence(t *testing.T) {
 	core := &journalWriteCore{fakeCore: &fakeCore{}}
 	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledWrites(session))
 	t.Cleanup(adapter.Close)
+	n, errno := adapter.Write(t.Context(), 7, 9, 0, nil)
+	require.Zero(t, errno)
+	require.Zero(t, n)
 	for range 2 {
-		n, errno := adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
+		n, errno = adapter.Write(t.Context(), 7, 9, 0, []byte("x"))
 		require.Zero(t, errno)
 		require.Equal(t, 1, n)
 	}

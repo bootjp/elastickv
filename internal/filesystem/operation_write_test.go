@@ -116,6 +116,31 @@ func TestWriteWithOperationRetainsSemanticFailure(t *testing.T) {
 	require.Equal(t, OperationRejected, record.State)
 }
 
+func TestWriteWithOperationRetainsMissingInodeRejection(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, nil)
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	id := testWriteOperationID(t, svc, 1)
+	_, err := svc.WriteWithOperation(ctx, id, 99, 0, []byte("x"))
+	require.ErrorIs(t, err, ErrNotFound)
+	_, err = svc.WriteWithOperation(ctx, id, 99, 0, []byte("x"))
+	require.ErrorIs(t, err, ErrNotFound)
+}
+
+func TestWriteOperationEffectLimitTracksChunkCount(t *testing.T) {
+	ctx := context.Background()
+	svc := newTestServiceWithOptions(t, []uint64{2})
+	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
+	require.NoError(t, err)
+	one, err := svc.writeOperationEffectLimit(ctx, file.Inode, 0, 1)
+	require.NoError(t, err)
+	two, err := svc.writeOperationEffectLimit(ctx, file.Inode, 0, testChunkSize+1)
+	require.NoError(t, err)
+	require.Greater(t, two, one)
+	require.Less(t, two, uint32(writeOperationMaxEffectLimit))
+}
+
 func TestWriteWithOperationDoesNotReplayPendingAttempt(t *testing.T) {
 	ctx := context.Background()
 	svc := newTestServiceWithOptions(t, []uint64{2})
@@ -125,7 +150,9 @@ func TestWriteWithOperationDoesNotReplayPendingAttempt(t *testing.T) {
 	id := testWriteOperationID(t, svc, 1)
 	journal, err := NewOperationJournal(svc)
 	require.NoError(t, err)
-	_, err = journal.Admit(ctx, id, encodeWriteOperationIntent(file.Inode, 0, []byte("x")), writeOperationResultBytes, writeOperationEffectLimit)
+	effectLimit, err := svc.writeOperationEffectLimit(ctx, file.Inode, 0, 1)
+	require.NoError(t, err)
+	_, err = journal.Admit(ctx, id, encodeWriteOperationIntent(file.Inode, 0, []byte("x")), writeOperationResultBytes, effectLimit)
 	require.NoError(t, err)
 	_, err = journal.BeginAttempt(ctx, id)
 	require.NoError(t, err)
