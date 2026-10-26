@@ -101,18 +101,19 @@ func assertJournalCommitsDoNotCollideOnPreparedSession(t *testing.T, ctx context
 	group.Txn = held
 	backend := serviceOperationBackend{service: svc}
 	sessionKey := fskeys.OperationSessionKey(session.Filesystem, session.Session)
-	commit := func(sequence uint64) error {
-		ts, err := backend.Snapshot(ctx)
+	commitWithContext := func(commitCtx context.Context, sequence uint64) error {
+		ts, err := backend.Snapshot(commitCtx)
 		if err != nil {
 			return err
 		}
 		primary := fskeys.OperationKey(session.Filesystem, session.Session, sequence)
-		_, err = backend.Commit(ctx, ts, []*kv.Elem[kv.OP]{
+		_, err = backend.Commit(commitCtx, ts, []*kv.Elem[kv.OP]{
 			{Op: kv.Put, Key: primary, Value: []byte{1}},
 			{Op: kv.Put, Key: sessionKey, Value: []byte{2}},
 		}, [][]byte{primary, sessionKey})
 		return err
 	}
+	commit := func(sequence uint64) error { return commitWithContext(ctx, sequence) }
 	first := make(chan error, 1)
 	go func() { first <- commit(100) }()
 	select {
@@ -128,6 +129,7 @@ func assertJournalCommitsDoNotCollideOnPreparedSession(t *testing.T, ctx context
 		t.Fatalf("second journal commit returned during prepared session lock: %v", err)
 	case <-time.After(100 * time.Millisecond):
 	}
+	assertJournalCommitWaiterCanCancel(t, ctx, held, commitWithContext)
 	close(held.release)
 	select {
 	case err := <-first:
@@ -140,6 +142,27 @@ func assertJournalCommitsDoNotCollideOnPreparedSession(t *testing.T, ctx context
 		require.NotErrorIs(t, err, kv.ErrTxnLocked)
 	case <-time.After(5 * time.Second):
 		t.Fatal("second journal commit did not finish")
+	}
+}
+
+func assertJournalCommitWaiterCanCancel(t *testing.T, ctx context.Context, held *holdPreparedTxn, commit func(context.Context, uint64) error) {
+	t.Helper()
+	cancelCtx, cancel := context.WithCancel(ctx)
+	cancelled := make(chan error, 1)
+	go func() { cancelled <- commit(cancelCtx, 102) }()
+	select {
+	case err := <-cancelled:
+		close(held.release)
+		t.Fatalf("journal commit returned before its waiter was cancelled: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	cancel()
+	select {
+	case err := <-cancelled:
+		require.ErrorIs(t, err, context.Canceled)
+	case <-time.After(5 * time.Second):
+		close(held.release)
+		t.Fatal("cancelled journal commit remained blocked")
 	}
 }
 

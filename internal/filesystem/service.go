@@ -9,7 +9,6 @@ import (
 	"encoding/json"
 	"math"
 	"math/big"
-	"sync"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -255,17 +254,17 @@ type LeaseReapStats struct {
 type Service struct {
 	// Journal commits within one mount share a session row. Keep a later
 	// two-phase prepare from meeting this mount's own prepared session lock.
-	journalCommitMu sync.Mutex
-	store           store.MVCCStore
-	dispatch        Dispatcher
-	chunkSize       uint64
-	openLeaseTTL    time.Duration
-	capacity        uint64
-	maxFiles        uint64
-	now             func() time.Time
-	allocID         func() (uint64, error)
-	homeSlot        func(uint64) uint64
-	observer        OperationalObserver
+	journalCommitPermit chan struct{}
+	store               store.MVCCStore
+	dispatch            Dispatcher
+	chunkSize           uint64
+	openLeaseTTL        time.Duration
+	capacity            uint64
+	maxFiles            uint64
+	now                 func() time.Time
+	allocID             func() (uint64, error)
+	homeSlot            func(uint64) uint64
+	observer            OperationalObserver
 }
 
 type Option func(*Service)
@@ -336,16 +335,18 @@ func NewService(st store.MVCCStore, dispatch Dispatcher, opts ...Option) (*Servi
 		return nil, ErrDispatcherRequired
 	}
 	s := &Service{
-		store:        st,
-		dispatch:     dispatch,
-		chunkSize:    DefaultChunkSize,
-		openLeaseTTL: defaultOpenHandleLeaseTTL,
-		now:          time.Now,
-		allocID:      randomNonZeroUint64,
+		journalCommitPermit: make(chan struct{}, 1),
+		store:               st,
+		dispatch:            dispatch,
+		chunkSize:           DefaultChunkSize,
+		openLeaseTTL:        defaultOpenHandleLeaseTTL,
+		now:                 time.Now,
+		allocID:             randomNonZeroUint64,
 		homeSlot: func(inode uint64) uint64 {
 			return inode
 		},
 	}
+	s.journalCommitPermit <- struct{}{}
 	for _, opt := range opts {
 		opt(s)
 	}

@@ -87,8 +87,15 @@ func (b serviceOperationBackend) commit(ctx context.Context, ts uint64, elems []
 		}
 		primary = elem.Key
 	}
-	b.service.journalCommitMu.Lock()
-	defer b.service.journalCommitMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return nil, errors.WithStack(err)
+	}
+	select {
+	case <-b.service.journalCommitPermit:
+		defer func() { b.service.journalCommitPermit <- struct{}{} }()
+	case <-ctx.Done():
+		return nil, errors.WithStack(ctx.Err())
+	}
 	return retryJournalLocked(ctx, func(ctx context.Context) (*kv.CoordinateResponse, error) {
 		return b.service.dispatchTxnWithPrimaryAtRoute(ctx, ts, elems, readKeys, true, primary, observed)
 	})
