@@ -459,6 +459,10 @@ receipts for its supported journaled operations.
 The optional receipt tracker is local to one mount and retains only successful
 operations in memory. Session acknowledgement and journal garbage collection
 are not wired to the kernel's reply boundary.
+In the pinned go-fuse version, `Server.handleRequest` writes the kernel reply
+after the raw filesystem method returns. The raw adapter has no callback for
+that write, so acknowledging when the adapter method returns would retire the
+operation before the reply attempt required by the journal contract.
 The baseline and optional-path tests do not satisfy the strict-mode gates
 below.
 
