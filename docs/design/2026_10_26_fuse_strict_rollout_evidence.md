@@ -193,7 +193,21 @@ mutation now uses a separate bounded decision context after BeginAttempt;
 request cancellation can no longer abandon that phase immediately. The
 formerly failing mounted test passed ten consecutive runs in a local Linux
 container with `/dev/fuse`, and the complete FUSE adapter package passed
-there. A CI rerun at the corrected SHA is still required.
+there. The corrected push test
+[40363982074](https://github.com/bootjp/elastickv/actions/runs/40363982074)
+passed at `7323b1f9`; that SHA also includes a test-only fix for an unrelated
+HLC renewal test race.
+
+The 30-minute stress run
+[40362040528](https://github.com/bootjp/elastickv/actions/runs/40362040528)
+at `3e3f4ab4` passed 24 of 25 jobs, including the formerly timed-out Redis,
+Redis ZSet, and DynamoDB jobs. Its SQLite job remained inconclusive. The
+first server-side failure was an operation-record error at sequence 1275;
+ACK retirement then reported that a record's reservation exceeded the
+session's retained usage. Several final SQLite reads could not open their
+database files, so the checker returned `:unknown`. No linearizability
+violation was reported, but this run does not close the SQLite gate or
+establish a rollout threshold.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
