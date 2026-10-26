@@ -37,12 +37,16 @@ func (b serviceOperationBackend) Snapshot(ctx context.Context) (uint64, error) {
 }
 
 func (b serviceOperationBackend) GetAt(ctx context.Context, key []byte, ts uint64) ([]byte, error) {
-	value, err := b.service.store.GetAt(ctx, key, ts)
+	value, err := retryJournalLocked(ctx, func(ctx context.Context) ([]byte, error) {
+		return b.service.store.GetAt(ctx, key, ts)
+	})
 	return value, errors.Wrap(err, "read operation journal")
 }
 
 func (b serviceOperationBackend) ScanAt(ctx context.Context, start, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
-	page, err := b.service.store.ScanAt(ctx, start, end, limit, ts)
+	page, err := retryJournalLocked(ctx, func(ctx context.Context) ([]*store.KVPair, error) {
+		return b.service.store.ScanAt(ctx, start, end, limit, ts)
+	})
 	return page, errors.Wrap(err, "scan operation journal")
 }
 
@@ -85,7 +89,30 @@ func (b serviceOperationBackend) commit(ctx context.Context, ts uint64, elems []
 	}
 	b.service.journalCommitMu.Lock()
 	defer b.service.journalCommitMu.Unlock()
-	return b.service.dispatchTxnWithPrimaryAtRoute(ctx, ts, elems, readKeys, true, primary, observed)
+	return retryJournalLocked(ctx, func(ctx context.Context) (*kv.CoordinateResponse, error) {
+		return b.service.dispatchTxnWithPrimaryAtRoute(ctx, ts, elems, readKeys, true, primary, observed)
+	})
+}
+
+// A lock held by another journal transaction is a transient dependency. The
+// caller retains the same snapshot and attempt identity while the owner
+// finishes. An unknown transaction outcome is never retried here.
+func retryJournalLocked[T any](ctx context.Context, call func(context.Context) (T, error)) (T, error) {
+	var result T
+	for retry := range operationCASRetries {
+		value, err := call(ctx)
+		if !errors.Is(err, kv.ErrTxnLocked) || errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+			return value, err
+		}
+		result = value
+		if retry == operationCASRetries-1 {
+			return result, err
+		}
+		if err = waitOperationCASRetry(ctx, retry); err != nil {
+			return result, err
+		}
+	}
+	return result, errors.WithStack(ErrContentionLimit)
 }
 
 func (b serviceOperationBackend) CommittedVersionAt(ctx context.Context, key []byte, ts uint64) (bool, error) {

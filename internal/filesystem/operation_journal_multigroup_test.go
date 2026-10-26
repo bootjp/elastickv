@@ -182,3 +182,25 @@ func assertWriteAfterConcurrentAcknowledgement(t *testing.T, ctx context.Context
 		t.Fatal("write did not complete after acknowledgement")
 	}
 }
+
+func TestRetryJournalLockedKeepsUnknownOutcome(t *testing.T) {
+	tries := 0
+	value, err := retryJournalLocked(context.Background(), func(context.Context) ([]byte, error) {
+		tries++
+		if tries < 3 {
+			return nil, kv.ErrTxnLocked
+		}
+		return []byte("visible"), nil
+	})
+	require.NoError(t, err)
+	require.Equal(t, []byte("visible"), value)
+	require.Equal(t, 3, tries)
+
+	tries = 0
+	_, err = retryJournalLocked(context.Background(), func(context.Context) ([]byte, error) {
+		tries++
+		return nil, fmt.Errorf("%w: %w", kv.ErrTransactionOutcomeUnknown, kv.ErrTxnLocked)
+	})
+	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
+	require.Equal(t, 1, tries)
+}

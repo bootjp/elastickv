@@ -115,6 +115,12 @@ journal commit reaching PREPARE while the first held the mount session lock.
 The same test passed after serializing this service's journal commits. This
 does not serialize separate mounts and does not yet establish a passing
 mounted two-group workload or an acceptable performance cost.
+Run [40330054840](https://github.com/bootjp/elastickv/actions/runs/40330054840)
+then failed while reading a session row locked by an in-flight journal
+transaction. Journal reads and definitive prewrite lock rejections now retry
+the same timestamp and attempt with a bounded backoff; a typed unknown
+transaction outcome is never retried. The amended candidate still needs a
+passing mounted two-group run.
 
 The strict mount now publishes `elastickv_fs_operation_journal_sessions`,
 `elastickv_fs_operation_journal_pending`, and
