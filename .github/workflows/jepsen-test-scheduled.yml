@@ -402,8 +402,8 @@ jobs:
         env:
           FS_TIME_LIMIT: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1800' || inputs.time-limit || '300' }}
           FS_RATE: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '0.25' || inputs.rate || '10' }}
-          SQLITE_REQUESTED_KEYS: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '128' || '24' }}
-          SQLITE_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || '64' }}
+          SQLITE_REQUESTED_KEYS: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '128' || inputs.key-count || '24' }}
+          SQLITE_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || inputs.max-writes-per-key || '64' }}
         run: |
           # Spread the longer run across databases while bounding the
           # ambiguous writes Knossos must explore for any one database.
