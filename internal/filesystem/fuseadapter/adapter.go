@@ -53,6 +53,10 @@ type Adapter struct {
 	journaledUnlink   bool
 	journaledRmdir    bool
 	journaledRename   bool
+	journaledCreate   bool
+	journaledMkdir    bool
+	journaledOpen     bool
+	journaledRelease  bool
 	operationSequence atomic.Uint64
 	receiptMu         sync.Mutex
 	receipts          map[uint64]map[filesystem.OperationID]struct{}
@@ -153,6 +157,38 @@ func WithJournaledRename(session filesystem.OperationSessionID) Option {
 	return func(a *Adapter) {
 		a.setOperationSession(session)
 		a.journaledRename = true
+	}
+}
+
+// WithJournaledCreate journals file creation and returns its original inode and handle.
+func WithJournaledCreate(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledCreate = true
+	}
+}
+
+// WithJournaledMkdir journals directory creation and its original inode.
+func WithJournaledMkdir(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledMkdir = true
+	}
+}
+
+// WithJournaledOpen journals handle allocation and its original lease.
+func WithJournaledOpen(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledOpen = true
+	}
+}
+
+// WithJournaledRelease records a terminal release for each FUSE handle.
+func WithJournaledRelease(session filesystem.OperationSessionID) Option {
+	return func(a *Adapter) {
+		a.setOperationSession(session)
+		a.journaledRelease = true
 	}
 }
 
@@ -259,7 +295,23 @@ func (a *Adapter) nextOperationID() filesystem.OperationID {
 }
 
 func (a *Adapter) Open(ctx context.Context, inode uint64) (uint64, syscall.Errno) {
-	fh, err := a.core.Open(ctx, inode, a.clientID)
+	var fh uint64
+	var err error
+	if a.journaledOpen {
+		opener, ok := a.core.(interface {
+			OpenWithOperation(context.Context, filesystem.OperationID, uint64, []byte) (uint64, error)
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return 0, syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		fh, err = opener.OpenWithOperation(ctx, id, inode, a.clientID)
+		if err == nil {
+			a.recordReceipt(inode, id)
+		}
+	} else {
+		fh, err = a.core.Open(ctx, inode, a.clientID)
+	}
 	if err == nil {
 		a.trackOpenHandle(inode, fh)
 	} else if Errno(err) == syscall.EIO {
@@ -357,11 +409,31 @@ func (a *Adapter) FsyncDirectory(ctx context.Context, inode uint64) syscall.Errn
 }
 
 func (a *Adapter) Release(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
-	err := a.core.Release(ctx, inode, fh, a.clientID)
+	defer a.untrackOpenHandle(inode, fh)
+	var err error
+	if a.journaledRelease {
+		ticket, errno := a.mutations.begin(ctx, inode)
+		if errno != 0 {
+			return errno
+		}
+		defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
+		releaser, ok := a.core.(interface {
+			ReleaseWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) error
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		err = releaser.ReleaseWithOperation(ctx, id, inode, fh, a.clientID)
+		if err == nil {
+			a.recordReceipt(inode, id)
+		}
+	} else {
+		err = a.core.Release(ctx, inode, fh, a.clientID)
+	}
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE release uncertain", "inode", inode, "fh", fh, "error", err.Error())
 	}
-	a.untrackOpenHandle(inode, fh)
 	return Errno(err)
 }
 
@@ -378,7 +450,22 @@ func (a *Adapter) Create(
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
 	opts.ClientID = append([]byte(nil), a.clientID...)
-	result, err = a.core.Create(ctx, parent, name, opts)
+	if a.journaledCreate {
+		creator, ok := a.core.(interface {
+			CreateWithOperation(context.Context, filesystem.OperationID, uint64, []byte, filesystem.CreateOptions) (filesystem.CreateResult, error)
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return filesystem.CreateResult{}, syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		result, err = creator.CreateWithOperation(ctx, id, parent, name, opts)
+		if err == nil {
+			a.recordReceipt(parent, id)
+			a.recordReceipt(result.Inode, id)
+		}
+	} else {
+		result, err = a.core.Create(ctx, parent, name, opts)
+	}
 	if err == nil {
 		a.trackOpenHandle(result.Inode, result.FH)
 	}
@@ -398,7 +485,22 @@ func (a *Adapter) Mknod(
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
 	opts.ClientID = nil
-	result, err = a.core.Create(ctx, parent, name, opts)
+	if a.journaledCreate {
+		creator, ok := a.core.(interface {
+			CreateWithOperation(context.Context, filesystem.OperationID, uint64, []byte, filesystem.CreateOptions) (filesystem.CreateResult, error)
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return filesystem.CreateResult{}, syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		result, err = creator.CreateWithOperation(ctx, id, parent, name, opts)
+		if err == nil {
+			a.recordReceipt(parent, id)
+			a.recordReceipt(result.Inode, id)
+		}
+	} else {
+		result, err = a.core.Create(ctx, parent, name, opts)
+	}
 	return result, Errno(err)
 }
 
@@ -414,7 +516,21 @@ func (a *Adapter) Mkdir(
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	result, err = a.core.Mkdir(ctx, parent, name, opts)
+	if a.journaledMkdir {
+		creator, ok := a.core.(interface {
+			MkdirWithOperation(context.Context, filesystem.OperationID, uint64, []byte, filesystem.CreateOptions) (filesystem.CreateResult, error)
+		})
+		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+			return filesystem.CreateResult{}, syscall.EOPNOTSUPP
+		}
+		id := a.nextOperationID()
+		result, err = creator.MkdirWithOperation(ctx, id, parent, name, opts)
+		if err == nil {
+			a.recordReceipt(parent, id)
+		}
+	} else {
+		result, err = a.core.Mkdir(ctx, parent, name, opts)
+	}
 	return result, Errno(err)
 }
 

@@ -443,15 +443,23 @@ filesystem service operations within bounds, tracks local FUSE predecessors,
 and tests mounted SQLite PERSIST/DELETE workloads.
 This branch adds a transaction-primary generation fence and optional
 journal-backed paths for fixed-offset FUSE writes, setattr including size changes,
-file unlink, empty-directory removal, and same-directory rename.
+create/mknod, mkdir, open, release, file unlink, empty-directory removal, and
+same-directory rename.
 The adapter retains their successful operation IDs per inode.
 Its flush and fsync paths resolve those IDs and check participant proofs.
-Directory fsync checks the removal and rename receipts recorded for that parent.
+Directory fsync checks create, mkdir, removal and rename receipts recorded for
+that parent. File fsync also checks create, open and release receipts for its
+inode when those optional paths are selected.
 The default mount path still uses the legacy mutations.
-Create/open/mkdir, release, and lease maintenance still lack journal-backed planners.
+Lease maintenance still uses the legacy path; a typed backend planner exists
+but is not yet connected to the adapter's foreground and background renewal
+paths. Its predecessor ordering and journal retention need completion before
+it can be selected for strict mode.
 `Service.Fsync` still uses an attribute read after the adapter checks the
 receipts for its supported journaled operations.
-Other namespace mutations still have no durable directory receipt.
+The optional receipt tracker is local to one mount and retains only successful
+operations in memory. Session acknowledgement and journal garbage collection
+are not wired to the kernel's reply boundary.
 The baseline and optional-path tests do not satisfy the strict-mode gates
 below.
 
@@ -460,8 +468,11 @@ before applying them.
 The pinned etcd WAL calls sync for a Ready containing entries.
 The Pebble FSM apply path defaults to `pebble.Sync`; its optional no-sync mode
 depends on replay from the synced Raft WAL.
-The local Pebble close/reopen test recovers a committed write and its receipt.
-It does not exercise a Raft process or node crash.
+Local Pebble close/reopen tests recover committed write, metadata, namespace,
+create and open results with their receipts. A separate process-kill test
+recovers create, write, truncate and rename receipts from the Pebble WAL
+without closing the store. Neither test exercises a Raft process or node
+crash.
 This code audit supports the receipt approach but does not close the M4 gate.
 Crash tests must cover failure between WAL persistence, FSM apply, proof
 visibility, FUSE reply, and the next fsync for every participant group.

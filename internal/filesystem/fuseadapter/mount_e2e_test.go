@@ -418,6 +418,45 @@ func TestKernelMountJournaledFixedOffsetWrite(t *testing.T) {
 	require.Equal(t, filesystem.OperationCommitted, record.State)
 }
 
+func TestKernelMountJournaledCreateAndMkdir(t *testing.T) {
+	if _, err := os.Stat("/dev/fuse"); err != nil {
+		skipOrFail(t, "no /dev/fuse: %v", err)
+	}
+	svc := newMemoryServiceForMount(t)
+	journal, err := filesystem.NewOperationJournal(svc)
+	require.NoError(t, err)
+	filesystemID, err := journal.EnsureFilesystem(t.Context())
+	require.NoError(t, err)
+	session, err := journal.RegisterSession(t.Context(), filesystemID, "e2e-journaled-create")
+	require.NoError(t, err)
+	mountPoint := t.TempDir()
+	mountMemoryServiceAtWithOptions(t, svc, "e2e-journaled-create", mountPoint,
+		fuseadapter.WithJournaledCreate(session), fuseadapter.WithJournaledMkdir(session),
+		fuseadapter.WithJournaledOpen(session), fuseadapter.WithJournaledRelease(session))
+	filePath := filepath.Join(mountPoint, "file")
+	file, err := os.Create(filePath)
+	require.NoError(t, err)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	file, err = os.Open(filePath)
+	require.NoError(t, err)
+	require.NoError(t, file.Sync())
+	require.NoError(t, file.Close())
+	directoryPath := filepath.Join(mountPoint, "dir")
+	require.NoError(t, os.Mkdir(directoryPath, 0o700))
+	directory, err := os.Open(mountPoint)
+	require.NoError(t, err)
+	require.NoError(t, directory.Sync())
+	require.NoError(t, directory.Close())
+	for sequence := uint64(1); sequence <= 5; sequence++ {
+		record, err := journal.Resolve(t.Context(), filesystem.OperationID{
+			Filesystem: session.Filesystem, Session: session.Session, Sequence: sequence,
+		})
+		require.NoError(t, err)
+		require.Equal(t, filesystem.OperationCommitted, record.State)
+	}
+}
+
 func TestKernelMountJournaledMetadataChange(t *testing.T) {
 	if _, err := os.Stat("/dev/fuse"); err != nil {
 		skipOrFail(t, "no /dev/fuse: %v", err)

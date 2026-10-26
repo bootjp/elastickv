@@ -80,6 +80,48 @@ type journalUnlinkCore struct {
 	unlinkIDs []filesystem.OperationID
 }
 
+type journalLifecycleCore struct {
+	*receiptCore
+	createID  filesystem.OperationID
+	openID    filesystem.OperationID
+	releaseID filesystem.OperationID
+}
+
+func (c *journalLifecycleCore) CreateWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte, _ filesystem.CreateOptions) (filesystem.CreateResult, error) {
+	c.createID = id
+	return filesystem.CreateResult{Inode: 7, FH: 9, Stat: filesystem.Stat{Inode: 7}}, nil
+}
+
+func (c *journalLifecycleCore) OpenWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte) (uint64, error) {
+	c.openID = id
+	return 10, nil
+}
+
+func (c *journalLifecycleCore) ReleaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {
+	c.releaseID = id
+	return nil
+}
+
+func TestAdapterFsyncVerifiesCreateOpenAndReleaseReceipts(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &journalLifecycleCore{receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+		journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+	}}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0),
+		WithJournaledCreate(session), WithJournaledOpen(session), WithJournaledRelease(session))
+	t.Cleanup(adapter.Close)
+	result, errno := adapter.Create(t.Context(), filesystem.RootInode, []byte("file"), filesystem.CreateOptions{Mode: 0o600})
+	require.Zero(t, errno)
+	fh, errno := adapter.Open(t.Context(), result.Inode)
+	require.Zero(t, errno)
+	require.Zero(t, adapter.Release(t.Context(), result.Inode, fh))
+	require.Zero(t, adapter.Fsync(t.Context(), result.Inode, result.FH, false))
+	require.ElementsMatch(t, []filesystem.OperationID{core.createID, core.openID, core.releaseID}, core.verified)
+	core.verified = nil
+	require.Zero(t, adapter.FsyncDirectory(t.Context(), filesystem.RootInode))
+	require.Equal(t, []filesystem.OperationID{core.createID}, core.verified)
+}
+
 func (c *journalUnlinkCore) UnlinkWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ []byte) error {
 	c.unlinkIDs = append(c.unlinkIDs, id)
 	return nil
