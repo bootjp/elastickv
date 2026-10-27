@@ -5,8 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/hex"
-	"log/slog"
 	"slices"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -666,12 +664,7 @@ func (j *OperationJournal) acknowledgeOnce(ctx context.Context, id OperationID) 
 		if response != nil {
 			commitTS = response.CommitTS
 		}
-		slog.Info("filesystem journal accounting transition", "kind", "ack", "session", hex.EncodeToString(session.ID.Session[:]),
-			"sequence", id.Sequence, "generation", record.Generation, "state", record.State,
-			"reservation", record.Reservation, "fences", len(record.FencedAttempts),
-			"retained_count", session.RetainedCount, "retained_bytes", session.RetainedBytes,
-			"pending", session.Pending, "reject_before", session.RejectBefore, "ack_gaps", len(session.AckGaps),
-			"snapshot_ts", ts, "commit_ts", commitTS)
+		traceOperationAccounting("ack", ts, commitTS, record, session)
 	}
 	return errors.Wrap(err, "commit operation acknowledgement")
 }
@@ -683,6 +676,9 @@ func reserveAckRetirement(session *operationSession, record operationRecord) err
 		return errors.WithStack(ErrOperationRetired)
 	}
 	if session.RetainedCount == 0 || session.RetainedBytes < record.Reservation {
+		if operationAccountingTrace {
+			dumpOperationAccountingTrace(session.ID)
+		}
 		return errors.Wrapf(ErrOperationRecordCorrupt,
 			"ack reservation exceeds retained usage: sequence=%d generation=%d state=%d retained_count=%d retained_bytes=%d reservation=%d pending=%d reject_before=%d ack_gaps=%d",
 			record.ID.Sequence, record.Generation, record.State, session.RetainedCount,

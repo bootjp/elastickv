@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
-	"encoding/hex"
-	"log/slog"
-	"os"
 	"slices"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -20,8 +17,6 @@ const (
 	maxOperationEffectKeys = 65535
 	operationJournalRows   = 2
 )
-
-var operationAccountingTrace = os.Getenv("ELASTICKV_FS_ACCOUNTING_TRACE") == "1"
 
 type operationJournalBackend interface {
 	Snapshot(context.Context) (uint64, error)
@@ -503,12 +498,7 @@ func (j *OperationJournal) storeRecordAndSessionAtRoute(ctx context.Context, ts 
 		if response != nil {
 			commitTS = response.CommitTS
 		}
-		slog.Info("filesystem journal accounting transition", "kind", "record", "session", hex.EncodeToString(session.ID.Session[:]),
-			"sequence", record.ID.Sequence, "generation", record.Generation, "state", record.State,
-			"reservation", record.Reservation, "fences", len(record.FencedAttempts),
-			"retained_count", session.RetainedCount, "retained_bytes", session.RetainedBytes,
-			"pending", session.Pending, "reject_before", session.RejectBefore, "ack_gaps", len(session.AckGaps),
-			"snapshot_ts", ts, "commit_ts", commitTS)
+		traceOperationAccounting("record", ts, commitTS, record, session)
 	}
 	return errors.Wrap(err, "publish operation journal")
 }
