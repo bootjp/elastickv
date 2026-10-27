@@ -5,6 +5,8 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/binary"
+	"encoding/hex"
+	"log/slog"
 	"slices"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -657,7 +659,20 @@ func (j *OperationJournal) acknowledgeOnce(ctx context.Context, id OperationID) 
 		elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del,
 			Key: fskeys.OperationProofKey(id.Filesystem, id.Session, id.Sequence, groupID), GroupID: groupID})
 	}
-	_, err = j.backend.Commit(ctx, ts, elems, [][]byte{id.key(), session.ID.key()})
+	response, commitErr := j.backend.Commit(ctx, ts, elems, [][]byte{id.key(), session.ID.key()})
+	err = commitErr
+	if err == nil && operationAccountingTrace {
+		var commitTS uint64
+		if response != nil {
+			commitTS = response.CommitTS
+		}
+		slog.Info("filesystem journal accounting transition", "kind", "ack", "session", hex.EncodeToString(session.ID.Session[:]),
+			"sequence", id.Sequence, "generation", record.Generation, "state", record.State,
+			"reservation", record.Reservation, "fences", len(record.FencedAttempts),
+			"retained_count", session.RetainedCount, "retained_bytes", session.RetainedBytes,
+			"pending", session.Pending, "reject_before", session.RejectBefore, "ack_gaps", len(session.AckGaps),
+			"snapshot_ts", ts, "commit_ts", commitTS)
+	}
 	return errors.Wrap(err, "commit operation acknowledgement")
 }
 
