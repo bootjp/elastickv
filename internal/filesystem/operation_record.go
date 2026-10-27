@@ -107,7 +107,8 @@ func encodeOperationRecord(record operationRecord) ([]byte, error) {
 
 func decodeOperationRecord(raw []byte) (operationRecord, error) {
 	if !validOperationHeader(raw) {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationRecord{}, errors.Wrapf(ErrOperationRecordCorrupt,
+			"invalid operation record header: bytes=%d", len(raw))
 	}
 	var record operationRecord
 	decoder := json.NewDecoder(bytes.NewReader(raw[operationHeaderBytes:]))
@@ -116,7 +117,8 @@ func decodeOperationRecord(raw []byte) (operationRecord, error) {
 		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt, err.Error())
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt,
+			"operation record has trailing JSON data")
 	}
 	record.CommitTS = binary.BigEndian.Uint64(raw[operationCommitTSOffset:])
 	if err := validateDecodedOperationRecord(raw, record); err != nil {
