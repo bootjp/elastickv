@@ -3,6 +3,7 @@ package filesystem
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/store"
@@ -24,6 +25,79 @@ func TestOperationJournalRetainedAccountingAcrossSequenceBoundary(t *testing.T) 
 		require.NoError(t, err)
 		assertOperationJournalRetainedAccountingAcrossSequenceBoundary(t, journal)
 	})
+}
+
+func TestOperationJournalConcurrentAcknowledgementChurn(t *testing.T) {
+	t.Run("memory", func(t *testing.T) {
+		journal, _, _ := testOperationJournal(t)
+		assertConcurrentAcknowledgementChurn(t, journal)
+	})
+	t.Run("pebble", func(t *testing.T) {
+		st, err := store.NewPebbleStore(t.TempDir())
+		require.NoError(t, err)
+		t.Cleanup(func() { require.NoError(t, st.Close()) })
+		service, err := NewService(st, &testCoordinator{st: st})
+		require.NoError(t, err)
+		journal, err := NewOperationJournal(service)
+		require.NoError(t, err)
+		assertConcurrentAcknowledgementChurn(t, journal)
+	})
+}
+
+func assertConcurrentAcknowledgementChurn(t *testing.T, journal *OperationJournal) {
+	t.Helper()
+	ctx := context.Background()
+	first := testOperationID(t, journal, 1)
+	const operations = uint64(256)
+	for sequence := uint64(1); sequence <= operations; sequence++ {
+		id := OperationID{Filesystem: first.Filesystem, Session: first.Session, Sequence: sequence}
+		_, err := journal.Admit(ctx, id, []byte("write"), 128, 1024)
+		require.NoError(t, err)
+		attempt, err := journal.BeginAttempt(ctx, id)
+		require.NoError(t, err)
+		_, err = journal.Publish(ctx, id, attempt.AttemptID, operationAttemptPlan{
+			Intent: []byte("write"), Result: []byte("done"),
+		})
+		require.NoError(t, err)
+	}
+
+	var next atomic.Uint64
+	var workers sync.WaitGroup
+	errorsCh := make(chan error, operations)
+	for range 8 {
+		workers.Add(1)
+		go func() {
+			defer workers.Done()
+			for {
+				sequence := next.Add(1)
+				if sequence > operations {
+					return
+				}
+				id := OperationID{Filesystem: first.Filesystem, Session: first.Session, Sequence: sequence}
+				if err := journal.Acknowledge(ctx, id); err != nil {
+					errorsCh <- err
+				}
+			}
+		}()
+	}
+	workers.Wait()
+	close(errorsCh)
+	for err := range errorsCh {
+		require.NoError(t, err)
+	}
+
+	ts, err := journal.backend.Snapshot(ctx)
+	require.NoError(t, err)
+	session, found, err := journal.loadSessionAt(ctx, OperationSessionID{
+		Filesystem: first.Filesystem, Session: first.Session,
+	}, ts)
+	require.NoError(t, err)
+	require.True(t, found)
+	require.Equal(t, operations, session.RejectBefore)
+	require.Empty(t, session.AckGaps)
+	require.Zero(t, session.Pending)
+	require.Zero(t, session.RetainedCount)
+	require.Zero(t, session.RetainedBytes)
 }
 
 func TestOperationJournalConcurrentAcknowledgementsPreserveAccounting(t *testing.T) {
