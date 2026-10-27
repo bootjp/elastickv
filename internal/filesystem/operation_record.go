@@ -107,7 +107,8 @@ func encodeOperationRecord(record operationRecord) ([]byte, error) {
 
 func decodeOperationRecord(raw []byte) (operationRecord, error) {
 	if !validOperationHeader(raw) {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationRecord{}, errors.Wrapf(ErrOperationRecordCorrupt,
+			"invalid operation record header: bytes=%d", len(raw))
 	}
 	var record operationRecord
 	decoder := json.NewDecoder(bytes.NewReader(raw[operationHeaderBytes:]))
@@ -116,19 +117,30 @@ func decodeOperationRecord(raw []byte) (operationRecord, error) {
 		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt, err.Error())
 	}
 	if err := decoder.Decode(new(any)); !errors.Is(err, io.EOF) {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
+		return operationRecord{}, errors.Wrap(ErrOperationRecordCorrupt,
+			"operation record has trailing JSON data")
 	}
 	record.CommitTS = binary.BigEndian.Uint64(raw[operationCommitTSOffset:])
-	if !validDecodedOperationRecord(raw, record) {
-		return operationRecord{}, errors.WithStack(ErrOperationRecordCorrupt)
+	if err := validateDecodedOperationRecord(raw, record); err != nil {
+		return operationRecord{}, err
 	}
 	return record, nil
 }
 
-func validDecodedOperationRecord(raw []byte, record operationRecord) bool {
-	return (raw[4] != operationRecordLegacyVersion || (!record.RecordIsPrimary && len(record.FencedAttempts) == 0)) &&
-		(record.State == OperationPending || record.CommitTS != 0) &&
-		record.State == OperationState(raw[5]) && validateOperationRecord(record) == nil
+func validateDecodedOperationRecord(raw []byte, record operationRecord) error {
+	if raw[4] == operationRecordLegacyVersion && (record.RecordIsPrimary || len(record.FencedAttempts) != 0) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "legacy operation row has primary metadata")
+	}
+	if record.State != OperationPending && record.CommitTS == 0 {
+		return errors.Wrap(ErrOperationRecordCorrupt, "terminal operation row has no commit timestamp")
+	}
+	if record.State != OperationState(raw[5]) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "operation row state differs from header")
+	}
+	if err := validateOperationRecord(record); err != nil {
+		return errors.Wrap(err, "invalid decoded operation row")
+	}
+	return nil
 }
 
 func validOperationHeader(raw []byte) bool {
@@ -139,8 +151,24 @@ func validOperationHeader(raw []byte) bool {
 }
 
 func validateOperationRecord(record operationRecord) error {
-	if !validOperationCore(record) || !validOperationEffects(record) || !validOperationState(record) || !validFencedAttempts(record) {
-		return errors.WithStack(ErrOperationRecordCorrupt)
+	if !validOperationCore(record) {
+		expectedReservation := 2*(uint64(len(record.Intent))+uint64(record.ResultLimit)+uint64(record.EffectLimit)) +
+			operationHeaderBytes + operationReservationOverhead +
+			uint64(len(record.FencedAttempts))*operationFenceReservation
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"invalid operation record core: sequence=%d state=%d generation=%d reservation=%d expected_reservation=%d intent_bytes=%d result_bytes=%d result_limit=%d effect_limit=%d fenced_attempts=%d fingerprint_matches=%t",
+			record.ID.Sequence, record.State, record.Generation, record.Reservation, expectedReservation,
+			len(record.Intent), len(record.Result), record.ResultLimit, record.EffectLimit,
+			len(record.FencedAttempts), record.Fingerprint == sha256.Sum256(record.Intent))
+	}
+	if !validOperationEffects(record) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation record effects")
+	}
+	if !validOperationState(record) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation record state")
+	}
+	if !validFencedAttempts(record) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation record fenced attempts")
 	}
 	return nil
 }

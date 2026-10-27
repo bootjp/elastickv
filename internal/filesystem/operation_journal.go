@@ -434,8 +434,11 @@ func (j *OperationJournal) loadSessionAt(ctx context.Context, id OperationSessio
 		return operationSession{}, false, errors.Wrap(err, "read operation session")
 	}
 	session, err := decodeOperationSession(raw)
-	if err != nil || session.ID != id {
-		return operationSession{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation session row")
+	if err != nil {
+		return operationSession{}, false, errors.Wrap(err, "decode operation session row")
+	}
+	if session.ID != id {
+		return operationSession{}, false, errors.Wrap(ErrOperationRecordCorrupt, "operation session identity mismatch")
 	}
 	return session, true, nil
 }
@@ -449,8 +452,11 @@ func (j *OperationJournal) loadRecordAt(ctx context.Context, id OperationID, ts 
 		return operationRecord{}, false, errors.Wrap(err, "read operation record")
 	}
 	record, err := decodeOperationRecord(raw)
-	if err != nil || record.ID != id {
-		return operationRecord{}, false, errors.Wrap(ErrOperationRecordCorrupt, "invalid operation row")
+	if err != nil {
+		return operationRecord{}, false, errors.Wrap(err, "decode operation row")
+	}
+	if record.ID != id {
+		return operationRecord{}, false, errors.Wrap(ErrOperationRecordCorrupt, "operation row identity mismatch")
 	}
 	return record, true, nil
 }

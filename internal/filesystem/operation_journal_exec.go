@@ -519,7 +519,10 @@ func validatePendingSnapshot(record operationRecord, session operationSession, f
 		return errors.WithStack(ErrOperationGeneration)
 	}
 	if record.ID.Session != session.ID.Session || session.Pending == 0 {
-		return errors.WithStack(ErrOperationRecordCorrupt)
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"pending operation lacks session accounting: sequence=%d generation=%d pending=%d retained_count=%d retained_bytes=%d reservation=%d",
+			record.ID.Sequence, record.Generation, session.Pending, session.RetainedCount,
+			session.RetainedBytes, record.Reservation)
 	}
 	return nil
 }
@@ -665,7 +668,11 @@ func reserveAckRetirement(session *operationSession, record operationRecord) err
 		return errors.WithStack(ErrOperationRetired)
 	}
 	if session.RetainedCount == 0 || session.RetainedBytes < record.Reservation {
-		return errors.Wrap(ErrOperationRecordCorrupt, "ack reservation exceeds retained usage")
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"ack reservation exceeds retained usage: sequence=%d generation=%d state=%d retained_count=%d retained_bytes=%d reservation=%d pending=%d reject_before=%d ack_gaps=%d",
+			record.ID.Sequence, record.Generation, record.State, session.RetainedCount,
+			session.RetainedBytes, record.Reservation, session.Pending,
+			session.RejectBefore, len(session.AckGaps))
 	}
 	if err := advanceAckWatermark(session, record.ID.Sequence); err != nil {
 		return err

@@ -18,7 +18,9 @@ func (s *Service) VerifyOperationReceipt(ctx context.Context, id OperationID) er
 		return err
 	}
 	if record.State != OperationCommitted {
-		return errors.WithStack(ErrOperationRecordCorrupt)
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"operation receipt is not committed: sequence=%d state=%d generation=%d",
+			record.ID.Sequence, record.State, record.Generation)
 	}
 	return nil
 }
