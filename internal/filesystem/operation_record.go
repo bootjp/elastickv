@@ -142,8 +142,24 @@ func validOperationHeader(raw []byte) bool {
 }
 
 func validateOperationRecord(record operationRecord) error {
-	if !validOperationCore(record) || !validOperationEffects(record) || !validOperationState(record) || !validFencedAttempts(record) {
-		return errors.WithStack(ErrOperationRecordCorrupt)
+	if !validOperationCore(record) {
+		expectedReservation := 2*(uint64(len(record.Intent))+uint64(record.ResultLimit)+uint64(record.EffectLimit)) +
+			operationHeaderBytes + operationReservationOverhead +
+			uint64(len(record.FencedAttempts))*operationFenceReservation
+		return errors.Wrapf(ErrOperationRecordCorrupt,
+			"invalid operation record core: sequence=%d state=%d generation=%d reservation=%d expected_reservation=%d intent_bytes=%d result_bytes=%d result_limit=%d effect_limit=%d fenced_attempts=%d fingerprint_matches=%t",
+			record.ID.Sequence, record.State, record.Generation, record.Reservation, expectedReservation,
+			len(record.Intent), len(record.Result), record.ResultLimit, record.EffectLimit,
+			len(record.FencedAttempts), record.Fingerprint == sha256.Sum256(record.Intent))
+	}
+	if !validOperationEffects(record) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation record effects")
+	}
+	if !validOperationState(record) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation record state")
+	}
+	if !validFencedAttempts(record) {
+		return errors.Wrap(ErrOperationRecordCorrupt, "invalid operation record fenced attempts")
 	}
 	return nil
 }
