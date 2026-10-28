@@ -163,7 +163,9 @@ write or read key has a version newer than `start_ts`; otherwise
 `RejectOnePhase`.  Multi-shard transactions settle `commit_ts` first,
 then `Prepare` validates read and write keys and locks the write keys,
 and `Commit` applies with no fence and no revalidation.  `RawWrite`
-is a non-transactional write that raises the watermark.  The lock
+is a non-transactional write that raises the watermark (refused on a
+locked key); `Prepare` raises the watermark to `start_ts`, as the lock
+rows' apply does.  The lock
 resolver is abstracted into the atomic lock drain inside
 `Commit`/`Abort`; timestamps come from one global counter (unique,
 leader-issued).  `EnableSafety` gates the commit-ts > start-ts

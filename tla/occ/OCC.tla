@@ -248,12 +248,15 @@ WriteIntent(t, k) ==
                    commitTs, readSet, readObs, lockMap, versions>>
 
 (***************************************************************************)
-(* RawWrite(k): a non-transactional write (handleRawRequest).  Allocation *)
+(* RawWrite(k): a non-transactional write (handleRawRequest).  It is     *)
+(* rejected while a txn lock sits on k (validateRawMutationForApply →     *)
+(* assertNoConflictingTxnLock).  Allocation                                *)
 (* and apply are one step here, so the raw path's own reordering window   *)
 (* is not modelled; its role is to raise the watermark.                    *)
 (***************************************************************************)
 RawWrite(k) ==
     /\ opCount < MaxOps
+    /\ ~HasLock(k)
     /\ tsCounter < MaxTs
     /\ LET ct == tsCounter + 1 IN
         /\ tsCounter' = ct
@@ -274,6 +277,7 @@ AllocateOnePhase(t) ==
     /\ writeSet[t] # {}
     /\ SingleGroup(t)
     /\ EnableSafety => tsCounter < MaxTs
+    /\ EnableSafety => FreshCommitTs > startTs[t]   \* resolveTxnCommitTS
     /\ tsCounter' = IF EnableSafety THEN tsCounter + 1 ELSE tsCounter
     /\ commitTs'  = [commitTs EXCEPT ![t] = FreshCommitTs]
     /\ txnState'  = [txnState EXCEPT ![t] = "Proposed"]
@@ -320,6 +324,7 @@ AllocateTwoPhase(t) ==
     /\ txnState[t] = "Active"
     /\ writeSet[t] # {}
     /\ EnableSafety => tsCounter < MaxTs
+    /\ EnableSafety => FreshCommitTs > startTs[t]   \* resolveTxnCommitTS
     /\ tsCounter' = IF EnableSafety THEN tsCounter + 1 ELSE tsCounter
     /\ commitTs'  = [commitTs EXCEPT ![t] = FreshCommitTs]
     /\ txnState'  = [txnState EXCEPT ![t] = "Allocated"]
@@ -329,7 +334,9 @@ AllocateTwoPhase(t) ==
 (***************************************************************************)
 (* Prepare: handlePrepareRequest validates the write and read keys        *)
 (* against start_ts and installs write locks at lockTs = start_ts.  Read  *)
-(* keys get no lock.  This is the OCC-2 enforcement point.                *)
+(* keys get no lock.  This is the OCC-2 enforcement point.  The lock rows *)
+(* are applied at start_ts through ApplyMutationsRaftAt, which raises the *)
+(* group's LastCommitTS to at least start_ts.                              *)
 (***************************************************************************)
 Prepare(t) ==
     /\ txnState[t] = "Allocated"
@@ -341,7 +348,8 @@ Prepare(t) ==
                     IF k \in writeSet[t]
                     THEN [owner |-> t, lockTs |-> startTs[t]]
                     ELSE lockMap[k]]
-    /\ UNCHANGED <<tsCounter, watermark, snapshotRead, startTs, commitTs,
+    /\ watermark' = RaiseWatermark(writeSet[t], startTs[t])
+    /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs,
                    writeSet, readSet, readObs, versions, opCount>>
 
 (***************************************************************************)
