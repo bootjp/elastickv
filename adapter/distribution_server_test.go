@@ -14,6 +14,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
 	"github.com/bootjp/elastickv/internal/s3keys"
 	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
@@ -318,7 +319,7 @@ func TestDistributionServerPendingLegacyResolutionMode(t *testing.T) {
 func TestDistributionServerPendingLegacyResolutionRoutedWrappers(t *testing.T) {
 	alloc := &pendingResolutionAllocator{distributionTSOAllocator: &distributionTSOAllocator{leader: true}, pendingFloor: 100}
 	addr := serveDistributionTestServer(t, NewDistributionServer(distribution.NewEngine(), nil, WithDistributionTimestampAllocator(alloc)))
-	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView{addr: addr})
+	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView(addr))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, routed.Close()) })
 	batch, err := kv.NewBatchAllocator(routed, 2)
@@ -352,7 +353,7 @@ func TestDistributionServerValidateTimestamp_LeaderRoutedRPC(t *testing.T) {
 	))
 	routed, err := kv.NewLeaderRoutedTSOAllocator(
 		&distributionTSOAllocator{leader: false},
-		distributionLeaderView{addr: addr},
+		distributionLeaderView(addr),
 	)
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, routed.Close()) })
@@ -410,7 +411,7 @@ func TestDistributionServerGetTimestamp_LeaderRoutedRPC(t *testing.T) {
 	))
 
 	local := &distributionTSOAllocator{leader: false}
-	routed, err := kv.NewLeaderRoutedTSOAllocator(local, distributionLeaderView{addr: addr})
+	routed, err := kv.NewLeaderRoutedTSOAllocator(local, distributionLeaderView(addr))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, routed.Close()) })
 
@@ -424,7 +425,7 @@ func TestDistributionServerGetTimestamp_LeaderRoutedRPC(t *testing.T) {
 func TestDistributionServerGetTimestamp_LeaderRoutedRejectsLegacyServer(t *testing.T) {
 	addr := serveDistributionTestServer(t, NewDistributionServer(distribution.NewEngine(), nil))
 	local := &distributionTSOAllocator{leader: false}
-	routed, err := kv.NewLeaderRoutedTSOAllocator(local, distributionLeaderView{addr: addr})
+	routed, err := kv.NewLeaderRoutedTSOAllocator(local, distributionLeaderView(addr))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, routed.Close()) })
 
@@ -467,7 +468,7 @@ func TestDistributionServerGetTimestamp_LeaderRoutedActivatesCutover(t *testing.
 	local := &distributionTSOAllocator{leader: false}
 	routed, err := kv.NewLeaderRoutedTSOAllocator(
 		local,
-		distributionLeaderView{addr: addr},
+		distributionLeaderView(addr),
 		kv.WithTSOCutoverActivation(),
 	)
 	require.NoError(t, err)
@@ -508,7 +509,7 @@ func (legacyIgnoringTimestampValidationServer) ValidateTimestamp(context.Context
 
 func TestDistributionServerPendingLegacyResolutionRejectsOldModeIgnoringServer(t *testing.T) {
 	addr := serveDistributionTestServer(t, legacyIgnoringTimestampValidationServer{})
-	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView{addr: addr})
+	routed, err := kv.NewLeaderRoutedTSOAllocator(&distributionTSOAllocator{}, distributionLeaderView(addr))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, routed.Close()) })
 	require.ErrorIs(t, routed.ValidateLegacyResolutionTimestamps(context.Background(), 50, 100), kv.ErrTSOProtocolUnsupported)
@@ -1954,22 +1955,13 @@ func (a *distributionTSOAllocator) RunLeaseRenewal(ctx context.Context) {
 	<-ctx.Done()
 }
 
-type distributionLeaderView struct {
-	addr string
-}
-
-func (distributionLeaderView) State() raftengine.State { return raftengine.StateFollower }
-
-func (v distributionLeaderView) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{ID: "leader", Address: v.addr}
-}
-
-func (distributionLeaderView) VerifyLeader(context.Context) error {
-	return raftengine.ErrNotLeader
-}
-
-func (distributionLeaderView) LinearizableRead(context.Context) (uint64, error) {
-	return 0, raftengine.ErrNotLeader
+// distributionLeaderView reports a follower whose leader is at addr.
+func distributionLeaderView(addr string) *raftenginetest.StaticLeaderView {
+	return &raftenginetest.StaticLeaderView{
+		StateValue:  raftengine.StateFollower,
+		LeaderValue: raftengine.LeaderInfo{ID: "leader", Address: addr},
+		ReadErr:     raftengine.ErrNotLeader,
+	}
 }
 
 type recordingDistributionFilesystemObserver struct {
