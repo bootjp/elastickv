@@ -76,18 +76,6 @@ func TestRedisApplyObserverZSetSignalRequiresFullRecheck(t *testing.T) {
 	require.False(t, waiter.fastSignalAllowed(), "FSM apply zset wake must not use the BZPOPMIN fast recheck")
 }
 
-func TestRedisApplyObserverPendingLocalZSetApplyStillForcesFullRecheck(t *testing.T) {
-	observer := NewRedisApplyObserver()
-	key := []byte("zset-pending-local")
-	waiter, release := observer.zsetWaiters.Register([][]byte{key})
-	defer release()
-
-	observer.OnApply(pb.Op_PUT, store.ZSetMemberKey(key, []byte("member")))
-
-	requireWaiterSignaled(t, waiter.C)
-	require.False(t, waiter.fastSignalAllowed(), "FSM apply zset wake must force the full BZPOPMIN recheck even during a local write")
-}
-
 func TestRedisApplyObserverSignalsLegacyZSetWaiters(t *testing.T) {
 	observer := NewRedisApplyObserver()
 	key := []byte("legacy-zset-key")

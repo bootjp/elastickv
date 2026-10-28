@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bufio"
 	"fmt"
 	"io"
 	"net"
@@ -11,6 +12,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/bootjp/elastickv/monitoring"
+	"github.com/bootjp/elastickv/store"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
@@ -507,49 +509,68 @@ func TestRedisMetricsUnsupportedCommandConcurrentObservers(t *testing.T) {
 	require.Equal(t, float64(workers*perWorks), total)
 }
 
-// TestRedisMetricsUnsupportedCommandRawInvalidUTF8FromAdapterPath covers
-// the regression fixed alongside this commit: the adapter's Run() loop
-// must pass RAW command bytes (not strings.ToUpper'd bytes) to the
-// unsupported-command observer. ToUpper silently rewrites invalid UTF-8
-// into the U+FFFD replacement character, so if the raw path is not
-// preserved the invalid_utf8 sentinel is never reached and a hostile
-// client can burn through the distinct-name slots with replacement-char
-// garbage. Feeding the observer directly with three invalid bytes must
-// produce the sentinel, not a synthetic "valid UTF-8" label.
+// TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes covers the
+// regression fixed in db4fa305: the adapter's Run() loop must pass RAW
+// command bytes (not strings.ToUpper'd bytes) to the unsupported-command
+// observer. ToUpper silently rewrites invalid UTF-8 into the U+FFFD
+// replacement character, so if the raw path is not preserved the
+// invalid_utf8 sentinel is never reached and a hostile client can burn
+// through the distinct-name slots with replacement-char garbage. The
+// command is sent as raw RESP so it goes through the real Run() call site.
 func TestRedisMetricsUnsupportedCommandRawInvalidUTF8Bytes(t *testing.T) {
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
-	observer := registry.RedisObserver()
-
-	raw := string([]byte{0xff, 0xff, 0xff})
-	require.False(t, utf8.ValidString(raw), "precondition: bytes must be invalid UTF-8")
-
-	require.NotPanics(t, func() {
-		observer.ObserveRedisRequest(monitoring.RedisRequestReport{
-			Command:     raw,
-			IsError:     true,
-			Duration:    time.Millisecond,
-			Unsupported: true,
-		})
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	server := NewRedisServer(l, "", store.NewMVCCStore(), nil, nil, nil,
+		WithRedisRequestObserver(registry.RedisObserver()))
+	runDone := make(chan struct{})
+	go func() {
+		defer close(runDone)
+		_ = server.Run()
+	}()
+	t.Cleanup(func() {
+		server.Stop()
+		<-runDone
 	})
 
+	raw := []byte{0xff, 0xff, 0xff}
+	require.False(t, utf8.Valid(raw), "precondition: bytes must be invalid UTF-8")
+
+	conn, err := net.DialTimeout("tcp", l.Addr().String(), time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+	require.NoError(t, conn.SetDeadline(time.Now().Add(2*time.Second)))
+	_, err = conn.Write(append(append([]byte("*1\r\n$3\r\n"), raw...), "\r\n"...))
+	require.NoError(t, err)
+	reply, err := bufio.NewReader(conn).ReadString('\n')
+	require.NoError(t, err)
+	require.True(t, strings.HasPrefix(reply, "-ERR unsupported command"), "reply = %q", reply)
+
+	// Run() writes the error reply before it records the metric.
+	require.Eventually(t, func() bool {
+		return unsupportedCommandCount(t, registry, "invalid_utf8") == 1
+	}, 2*time.Second, 10*time.Millisecond,
+		"raw invalid-UTF-8 bytes must land in the 'invalid_utf8' sentinel")
+}
+
+func unsupportedCommandCount(t *testing.T, registry *monitoring.Registry, command string) float64 {
+	t.Helper()
 	mf, err := registry.Gatherer().Gather()
 	require.NoError(t, err)
-
-	var sentinel float64
+	var total float64
 	for _, family := range mf {
 		if family.GetName() != "elastickv_redis_unsupported_commands_total" {
 			continue
 		}
 		for _, metric := range family.GetMetric() {
 			for _, lbl := range metric.GetLabel() {
-				if lbl.GetName() == "command" && lbl.GetValue() == "invalid_utf8" {
-					sentinel += metric.GetCounter().GetValue()
+				if lbl.GetName() == "command" && lbl.GetValue() == command {
+					total += metric.GetCounter().GetValue()
 				}
 			}
 		}
 	}
-	require.Equal(t, float64(1), sentinel,
-		"raw invalid-UTF-8 bytes must land in the 'invalid_utf8' sentinel")
+	return total
 }
 
 // TestRedisMetricsUnsupportedCommandRejectsPathologicalLength defends
