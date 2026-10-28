@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -49,11 +51,7 @@ func startStalledRequest(t *testing.T, addr string, started <-chan struct{}) <-c
 		}
 		done <- err
 	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler did not start for the stalled request")
-	}
+	testutil.Recv(t, started, 5*time.Second, "handler did not start for the stalled request")
 	return done
 }
 
@@ -96,11 +94,7 @@ func TestShutdownHTTPServerReturnsPromptlyWhenIdle(t *testing.T) {
 	start := time.Now()
 	require.NoError(t, ShutdownHTTPServer(context.Background(), srv, "idle", 5*time.Second))
 	require.Less(t, time.Since(start), 2*time.Second)
-	select {
-	case <-serveDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Serve did not return after the shutdown")
-	}
+	testutil.Recv(t, serveDone, 5*time.Second, "Serve did not return after the shutdown")
 }
 
 func TestShutdownHTTPServerNilIsNoop(t *testing.T) {

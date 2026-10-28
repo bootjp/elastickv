@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -174,14 +176,10 @@ func TestAdapterKeepsOpenHandlesAliveWhileIdle(t *testing.T) {
 	require.EqualValues(t, 7, core.openInode)
 	require.Equal(t, []byte("fuse-session"), core.openClientID)
 
-	select {
-	case got := <-core.refreshCh:
-		require.EqualValues(t, 7, got.inode)
-		require.EqualValues(t, 9, got.fh)
-		require.Equal(t, []byte("fuse-session"), got.clientID)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for open handle keepalive")
-	}
+	got := testutil.Recv(t, core.refreshCh, time.Second, "timed out waiting for open handle keepalive")
+	require.EqualValues(t, 7, got.inode)
+	require.EqualValues(t, 9, got.fh)
+	require.Equal(t, []byte("fuse-session"), got.clientID)
 }
 
 func TestAdapterKeepsCreatedHandlesAliveWhileIdle(t *testing.T) {
@@ -202,14 +200,10 @@ func TestAdapterKeepsCreatedHandlesAliveWhileIdle(t *testing.T) {
 	require.EqualValues(t, 7, result.Inode)
 	require.EqualValues(t, 9, result.FH)
 
-	select {
-	case got := <-core.refreshCh:
-		require.EqualValues(t, 7, got.inode)
-		require.EqualValues(t, 9, got.fh)
-		require.Equal(t, []byte("fuse-session"), got.clientID)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for created handle keepalive")
-	}
+	got := testutil.Recv(t, core.refreshCh, time.Second, "timed out waiting for created handle keepalive")
+	require.EqualValues(t, 7, got.inode)
+	require.EqualValues(t, 9, got.fh)
+	require.Equal(t, []byte("fuse-session"), got.clientID)
 }
 
 func TestAdapterKeepaliveTimeoutDoesNotBlockOtherHandles(t *testing.T) {

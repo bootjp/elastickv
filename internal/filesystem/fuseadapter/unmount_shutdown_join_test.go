@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
 )
@@ -26,11 +28,7 @@ func TestJoinAbandonedMountWaitsForCleanup(t *testing.T) {
 		done <- joinAbandonedMount(func() { close(entered); <-release }, time.Second)
 	}()
 	<-entered
-	select {
-	case <-done:
-		t.Fatal("startup returned before its late mount cleanup")
-	case <-time.After(time.Millisecond):
-	}
+	testutil.NoRecv(t, done, time.Millisecond, "startup returned before its late mount cleanup")
 	close(release)
 	require.True(t, <-done)
 }

@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -45,19 +47,11 @@ func TestShutdownJoinsBalancerBeforeHandoff(t *testing.T) {
 		shutdownAfterRequest(ctx, cancel, []*raftGroupRuntime{{engine: engine}}, requests, time.Second,
 			func(ctx context.Context) error { return stopLeaderBalanceForShutdown(ctx, stopBalance, balanceDone) })
 	}()
-	select {
-	case <-stopping:
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("balancing was not cancelled")
-	}
+	testutil.Closed(t, stopping, shutdownTestTimeout, "balancing was not cancelled")
 	require.NoError(t, ctx.Err())
 	require.Zero(t, transfers.Load())
 	unblock()
-	select {
-	case <-finished:
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("handoff did not finish after balancing joined")
-	}
+	testutil.Closed(t, finished, shutdownTestTimeout, "handoff did not finish after balancing joined")
 	require.Equal(t, int32(1), transfers.Load())
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 }

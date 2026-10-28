@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
@@ -261,11 +263,7 @@ func TestMountFilesystemServiceServesKernelMount(t *testing.T) {
 	require.Equal(t, []byte("probe"), got)
 
 	require.NoError(t, unmount())
-	select {
-	case <-serveDone:
-	case <-time.After(10 * time.Second):
-		t.Fatal("serve loop did not stop after unmount")
-	}
+	testutil.Closed(t, serveDone, 10*time.Second, "serve loop did not stop after unmount")
 }
 
 func TestInstallFilesystemServerLifecycleUnmountsOnContextCancel(t *testing.T) {
@@ -361,12 +359,8 @@ func TestInstallFilesystemServerLifecycleDetachesLazilyWhenUnmountFails(t *testi
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- eg.Wait() }()
-	select {
-	case err := <-waitDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("lifecycle did not stop after the lazy detach released the serve loop")
-	}
+	err := testutil.Recv(t, waitDone, 5*time.Second, "lifecycle did not stop after the lazy detach released the serve loop")
+	require.NoError(t, err)
 	require.Equal(t, 1, server.lazyCalls)
 	cleanup.Run()
 }
@@ -390,12 +384,8 @@ func TestInstallFilesystemServerLifecycleBoundsWaitWhenServeLoopStalls(t *testin
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- eg.Wait() }()
-	select {
-	case err := <-waitDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("lifecycle hung on a serve loop that never stops")
-	}
+	err := testutil.Recv(t, waitDone, 5*time.Second, "lifecycle hung on a serve loop that never stops")
+	require.NoError(t, err)
 	require.Equal(t, 1, server.lazyCalls)
 	cleanup.Run()
 }
@@ -418,12 +408,8 @@ func TestInstallFilesystemServerLifecycleBoundsHungUnmount(t *testing.T) {
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- eg.Wait() }()
-	select {
-	case err := <-waitDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("lifecycle hung on an Unmount that never returns")
-	}
+	err := testutil.Recv(t, waitDone, 5*time.Second, "lifecycle hung on an Unmount that never returns")
+	require.NoError(t, err)
 	require.Equal(t, 1, server.lazyCalls)
 	// The CleanupStack entry must not re-wait on the unmount that is still
 	// stuck: the lifecycle already gave up on it, and the WAL sync and store
@@ -433,11 +419,7 @@ func TestInstallFilesystemServerLifecycleBoundsHungUnmount(t *testing.T) {
 		cleanup.Run()
 		close(cleanupDone)
 	}()
-	select {
-	case <-cleanupDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("cleanup blocked on the hung unmount")
-	}
+	testutil.Closed(t, cleanupDone, 5*time.Second, "cleanup blocked on the hung unmount")
 	release()
 }
 
@@ -473,12 +455,8 @@ func TestInstallFilesystemServerLifecycleWaitsForServeLoopAfterHungUnmount(t *te
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- eg.Wait() }()
-	select {
-	case err := <-waitDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("lifecycle did not stop")
-	}
+	err := testutil.Recv(t, waitDone, 5*time.Second, "lifecycle did not stop")
+	require.NoError(t, err)
 	elapsed := time.Since(start)
 	require.Equal(t, 1, server.lazyCalls)
 	// Past the 4/5 unmount wait (1.6 s), but well before the full budget:
@@ -509,11 +487,7 @@ func TestInstallFilesystemServerLifecycleCleanupBoundsHungUnmount(t *testing.T) 
 		cleanup.Run()
 		close(cleanupDone)
 	}()
-	select {
-	case <-cleanupDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("cleanup blocked on the hung unmount")
-	}
+	testutil.Closed(t, cleanupDone, 5*time.Second, "cleanup blocked on the hung unmount")
 
 	// Teardown: let the lifecycle goroutine finish. Cancel before the serve
 	// loop ends, as a real shutdown does; the other order is the "stopped
@@ -564,12 +538,8 @@ func TestStartFilesystemPlacementCollectorStopsOnCancel(t *testing.T) {
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- eg.Wait() }()
-	select {
-	case err := <-waitDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("placement collector did not stop after cancellation")
-	}
+	err := testutil.Recv(t, waitDone, 5*time.Second, "placement collector did not stop after cancellation")
+	require.NoError(t, err)
 }
 
 func TestFilesystemBackgroundLoopsSkipWhenDisabled(t *testing.T) {

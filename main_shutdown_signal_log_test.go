@@ -7,7 +7,8 @@ import (
 	"sync"
 	"syscall"
 	"testing"
-	"time"
+
+	"github.com/bootjp/elastickv/internal/testutil"
 
 	"github.com/stretchr/testify/require"
 )
@@ -47,11 +48,7 @@ func TestInstallShutdownSignalHandlerCancelsBeforeLogging(t *testing.T) {
 	})
 
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
-	select {
-	case <-ctx.Done():
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("a blocked log write held back the shutdown")
-	}
+	testutil.Closed(t, ctx.Done(), shutdownTestTimeout, "a blocked log write held back the shutdown")
 }
 
 // The cleanup that stops the handler must not wait forever on a goroutine
@@ -71,19 +68,11 @@ func TestInstallShutdownSignalHandlerStopDoesNotWaitOnBlockedLog(t *testing.T) {
 	})
 
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
-	select {
-	case <-ctx.Done():
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("the signal did not cancel the shutdown")
-	}
+	testutil.Closed(t, ctx.Done(), shutdownTestTimeout, "the signal did not cancel the shutdown")
 	stopped := make(chan struct{})
 	go func() {
 		stop()
 		close(stopped)
 	}()
-	select {
-	case <-stopped:
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("stopping the handler waited on the goroutine stuck in the log write")
-	}
+	testutil.Closed(t, stopped, shutdownTestTimeout, "stopping the handler waited on the goroutine stuck in the log write")
 }

@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -74,12 +76,8 @@ func TestSQSServerListenlessRunReturnsAfterStop(t *testing.T) {
 	go func() { runDone <- s.Run() }()
 	time.Sleep(20 * time.Millisecond)
 	s.Stop()
-	select {
-	case err := <-runDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after Stop")
-	}
+	err := testutil.Recv(t, runDone, 5*time.Second, "Run did not return after Stop")
+	require.NoError(t, err)
 }
 
 // Stop runs from two places at once (the context waiter and the deferred

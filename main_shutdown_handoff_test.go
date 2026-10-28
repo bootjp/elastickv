@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -22,11 +24,7 @@ func TestShutdownHandoffStartupSignalCancelsBeforeArming(t *testing.T) {
 	stop := installShutdownSignalHandler(handoff.requestShutdown, syscall.SIGUSR2)
 	t.Cleanup(stop)
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
-	select {
-	case <-ctx.Done():
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("a signal during startup must cancel immediately")
-	}
+	testutil.Closed(t, ctx.Done(), shutdownTestTimeout, "a signal during startup must cancel immediately")
 	eg, runCtx := errgroup.WithContext(ctx)
 	handoff.arm(runCtx, eg, nil, nil)
 	require.NoError(t, eg.Wait(), "arming after startup cancellation must not wait for another signal")
@@ -56,18 +54,10 @@ func TestShutdownHandoffSignalWaitsForTransferAndIgnoresRepeats(t *testing.T) {
 	eg, runCtx := errgroup.WithContext(ctx)
 	handoff.arm(runCtx, eg, []*raftGroupRuntime{{spec: groupSpec{id: 1}, engine: engine}}, nil)
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
-	select {
-	case <-started:
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("the signal did not start the leadership handoff")
-	}
+	testutil.Closed(t, started, shutdownTestTimeout, "the signal did not start the leadership handoff")
 	require.NoError(t, ctx.Err(), "root cancellation must wait until the handoff finishes")
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGUSR2))
-	select {
-	case <-ctx.Done():
-		t.Fatal("a repeated signal canceled the in-flight handoff")
-	case <-time.After(shutdownTransferRetryDelay):
-	}
+	testutil.NoRecv(t, ctx.Done(), shutdownTransferRetryDelay, "a repeated signal canceled the in-flight handoff")
 	release()
 	done := make(chan error, 1)
 	go func() { done <- eg.Wait() }()

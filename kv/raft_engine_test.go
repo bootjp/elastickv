@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 )
@@ -50,11 +52,7 @@ func TestVerifyLeaderEngine_BoundsBlockingReadIndex(t *testing.T) {
 		result <- verifyLeaderEngineCtx(ctx, blockingLeaderView{})
 	}()
 	var err error
-	select {
-	case err = <-result:
-	case <-time.After(3 * verifyLeaderTimeout):
-		t.Fatal("verifyLeaderEngineCtx did not bound a deadline-less context")
-	}
+	err = testutil.Recv(t, result, 3*verifyLeaderTimeout, "verifyLeaderEngineCtx did not bound a deadline-less context")
 	elapsed := time.Since(start)
 
 	if err == nil {

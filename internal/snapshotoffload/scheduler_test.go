@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -91,11 +93,7 @@ func TestSchedulerPublicationTimeoutReleasesScanAndAllowsRetry(t *testing.T) {
 		scheduler.SyncOnce(context.Background())
 		close(done)
 	}()
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("a stalled store must not block the scan indefinitely")
-	}
+	testutil.Closed(t, done, 5*time.Second, "a stalled store must not block the scan indefinitely")
 	_, _, failures := observer.snapshot()
 	require.Len(t, failures, 1)
 	require.ErrorIs(t, failures[0], context.DeadlineExceeded)

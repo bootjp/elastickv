@@ -4,6 +4,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -20,11 +22,7 @@ func requireWaiterSignaled(t *testing.T, ch <-chan struct{}) {
 
 func requireWaiterQuiet(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
-	select {
-	case <-ch:
-		t.Fatal("waiter was unexpectedly signaled")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, ch, 20*time.Millisecond, "waiter was unexpectedly signaled")
 }
 
 func TestRedisApplyObserverSignalsStreamEntryWaiters(t *testing.T) {

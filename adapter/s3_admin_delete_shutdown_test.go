@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -65,11 +67,7 @@ func TestS3ServerStopWaitsForAdminDeleteAndItsCleanup(t *testing.T) {
 	go func() {
 		deleteDone <- s.AdminDeleteObject(context.Background(), fullAdminBucketsPrincipal(), "deletable", "k1")
 	}()
-	select {
-	case <-coord.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the admin delete never dispatched its transaction")
-	}
+	testutil.Closed(t, coord.entered, 5*time.Second, "the admin delete never dispatched its transaction")
 
 	stopDone := stopInBackground(s)
 	requireStopStillDraining(t, stopDone, cluster)
@@ -94,17 +92,9 @@ func TestS3ServerTimedOutAdminDeleteRetainsCleanupReservation(t *testing.T) {
 	go func() {
 		deleteDone <- s.AdminDeleteObject(context.Background(), fullAdminBucketsPrincipal(), "deletable", "k1")
 	}()
-	select {
-	case <-coord.entered:
-	case <-time.After(time.Second):
-		t.Fatal("delete did not dispatch")
-	}
+	testutil.Closed(t, coord.entered, time.Second, "delete did not dispatch")
 	stopDone := stopInBackground(s)
-	select {
-	case <-s.reservedCleanups.ctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("Stop did not reach reserved cleanup cancellation")
-	}
+	testutil.Closed(t, s.reservedCleanups.ctx.Done(), time.Second, "Stop did not reach reserved cleanup cancellation")
 	close(coord.release)
 	require.NoError(t, <-deleteDone)
 	waitStopped(t, stopDone)

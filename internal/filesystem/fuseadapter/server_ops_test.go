@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/store"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -629,11 +631,7 @@ func TestRequestContextCancelsWhenKernelInterrupts(t *testing.T) {
 	require.NoError(t, ctx.Err())
 
 	close(cancel)
-	select {
-	case <-ctx.Done():
-	case <-time.After(time.Second):
-		t.Fatal("request context did not observe kernel interrupt")
-	}
+	testutil.Closed(t, ctx.Done(), time.Second, "request context did not observe kernel interrupt")
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 }
 
@@ -656,12 +654,8 @@ func TestRawFileSystemPropagatesKernelInterruptToCore(t *testing.T) {
 	}()
 	<-core.started
 	close(cancel)
-	select {
-	case status := <-result:
-		require.Equal(t, fuse.Status(syscall.EINTR), status)
-	case <-time.After(time.Second):
-		t.Fatal("GetAttr did not return after kernel interrupt")
-	}
+	status := testutil.Recv(t, result, time.Second, "GetAttr did not return after kernel interrupt")
+	require.Equal(t, fuse.Status(syscall.EINTR), status)
 }
 
 func TestFuseAttrClampsNegativeTimestamps(t *testing.T) {

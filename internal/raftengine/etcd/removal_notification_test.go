@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
@@ -61,11 +63,7 @@ func testRemovalCommitAfterPeerTeardown(t *testing.T) {
 	require.NoError(t, err)
 	require.Greater(t, removeIndex, addIndex)
 	waitForConfigSize(t, leader.engine, 1)
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("final commit notification did not reach the removed peer")
-	}
+	testutil.Closed(t, entered, 5*time.Second, "final commit notification did not reach the removed peer")
 	unblock()
 	require.Eventually(t, func() bool {
 		return nodes[1].engine.State() == raftengine.StateShutdown

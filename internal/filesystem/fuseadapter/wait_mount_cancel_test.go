@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
 	"github.com/hanwen/go-fuse/v2/fuse"
@@ -71,11 +73,7 @@ func TestWaitMountStopsWhenCancelledWhileReadinessBlocks(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("Unmount blocked on the mount WaitMount had already released")
 	}
-	select {
-	case <-m.serveDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Serve did not return after the mount was released")
-	}
+	testutil.Closed(t, m.serveDone, 5*time.Second, "Serve did not return after the mount was released")
 	top, found, err := topmostMount(context.Background(), mountTablePath, m.mountPoint)
 	require.NoError(t, err)
 	require.False(t, found && top.fsType == m.server.fsType, "the released mount is still attached")
@@ -127,11 +125,7 @@ func mountWithBlockedReadiness(t *testing.T, ctx context.Context) blockedReadine
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- server.WaitMount() }()
 
-	select {
-	case <-core.entered:
-	case <-time.After(10 * time.Second):
-		t.Fatal("the readiness check never reached the backend getattr")
-	}
+	testutil.Closed(t, core.entered, 10*time.Second, "the readiness check never reached the backend getattr")
 	select {
 	case err := <-waitDone:
 		t.Fatalf("WaitMount returned (%v) while the backend getattr was blocked", err)

@@ -13,6 +13,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
@@ -545,13 +547,9 @@ func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
 		errCh <- engine.VerifyLeader(context.Background())
 	}()
 
-	select {
-	case req := <-engine.readCh:
-		require.False(t, req.waitApplied)
-		req.done <- readResult{index: 9}
-	case <-time.After(time.Second):
-		t.Fatal("verify leader did not issue read-index request")
-	}
+	req := testutil.Recv(t, engine.readCh, time.Second, "verify leader did not issue read-index request")
+	require.False(t, req.waitApplied)
+	req.done <- readResult{index: 9}
 
 	require.NoError(t, <-errCh)
 }
@@ -585,20 +583,12 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 		errCh <- engine.handleTransportMessage(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)})
 	}()
 
-	select {
-	case <-engine.stepCh:
-		t.Fatal("transport message delivered before startup")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, engine.stepCh, 20*time.Millisecond, "transport message delivered before startup")
 
 	close(engine.startedCh)
 
-	select {
-	case msg := <-engine.stepCh:
-		require.Equal(t, raftpb.MsgHeartbeat, msg.GetType())
-	case <-time.After(time.Second):
-		t.Fatal("transport message was not delivered after startup")
-	}
+	msg := testutil.Recv(t, engine.stepCh, time.Second, "transport message was not delivered after startup")
+	require.Equal(t, raftpb.MsgHeartbeat, msg.GetType())
 
 	require.NoError(t, <-errCh)
 }
@@ -919,11 +909,7 @@ func TestReportFailedDispatchReliablyQueuesMsgSnapFailure(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		t.Fatal("MsgSnap failure report must wait instead of dropping when report channel is full")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, done, 20*time.Millisecond, "MsgSnap failure report must wait instead of dropping when report channel is full")
 
 	<-engine.dispatchReportCh
 	requireSignal(t, done, time.Second, "MsgSnap failure report was not delivered after report channel drained")
@@ -978,11 +964,7 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	engine.startDispatchWorkers()
 	engine.peerDispatchers[2].heartbeat <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}}
 
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("dispatch worker did not start")
-	}
+	testutil.Closed(t, started, time.Second, "dispatch worker did not start")
 
 	done := make(chan struct{})
 	go func() {
@@ -1069,11 +1051,7 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 		engine.dispatchWG.Wait()
 		close(workerDone)
 	}()
-	select {
-	case <-workerDone:
-	case <-time.After(time.Second):
-		t.Fatal("dispatch workers did not exit after channel close")
-	}
+	testutil.Closed(t, workerDone, time.Second, "dispatch workers did not exit after channel close")
 
 	// Subsequent messages to the removed peer must be dropped without panic.
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}))
@@ -1144,21 +1122,13 @@ func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
 		t.Fatal("maybePersistLocalSnapshot blocked on snapshot persistence")
 	}
 
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("snapshot worker did not start")
-	}
+	testutil.Closed(t, fsm.started, time.Second, "snapshot worker did not start")
 
 	require.Empty(t, persist.Action())
 	release()
 
-	select {
-	case result := <-engine.snapshotResCh:
-		require.NoError(t, engine.handleSnapshotResult(result))
-	case <-time.After(time.Second):
-		t.Fatal("snapshot worker did not finish")
-	}
+	result := testutil.Recv(t, engine.snapshotResCh, time.Second, "snapshot worker did not finish")
+	require.NoError(t, engine.handleSnapshotResult(result))
 
 	actions := persist.Action()
 	require.Len(t, actions, 2)
@@ -1284,11 +1254,7 @@ func TestPersistConfigStateWaitsForDurablePublication(t *testing.T) {
 		})
 	}()
 
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("config snapshot serialization did not start")
-	}
+	testutil.Closed(t, fsm.started, time.Second, "config snapshot serialization did not start")
 
 	select {
 	case err := <-done:
@@ -1388,11 +1354,7 @@ func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
 		})
 	}()
 
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("config snapshot serialization did not start")
-	}
+	testutil.Closed(t, fsm.started, time.Second, "config snapshot serialization did not start")
 
 	restoreDone := make(chan error, 1)
 	go func() {
@@ -1887,13 +1849,9 @@ func TestWaitForOpenCanceledContextClosesMultiNodeEngine(t *testing.T) {
 	}
 	close(engine.doneCh)
 
-	select {
-	case got := <-resultCh:
-		require.Nil(t, got.engine)
-		require.ErrorIs(t, got.err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("waitForOpen did not return after Close completed")
-	}
+	got := testutil.Recv(t, resultCh, time.Second, "waitForOpen did not return after Close completed")
+	require.Nil(t, got.engine)
+	require.ErrorIs(t, got.err, context.Canceled)
 }
 
 func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
@@ -2659,11 +2617,7 @@ func TestMultiLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)}))
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), To: uint64Ptr(2)}))
 
-	select {
-	case <-replicationDone:
-	case <-time.After(time.Second):
-		t.Fatal("MsgApp did not dispatch while MsgSnap was stuck — lanes are not independent")
-	}
+	testutil.Recv(t, replicationDone, time.Second, "MsgApp did not dispatch while MsgSnap was stuck — lanes are not independent")
 
 	close(snapshotBlocking)
 	close(engine.dispatchStopCh)

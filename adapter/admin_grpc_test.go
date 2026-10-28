@@ -7,6 +7,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
@@ -207,11 +209,7 @@ func TestGetRaftGroupsLeaderVersionAsync(t *testing.T) {
 		t.Fatalf("GetRaftGroups first: %v", err)
 	}
 	requireLeaderVersion(t, resp, "", "first")
-	select {
-	case <-probeStarted:
-	case <-time.After(time.Second):
-		t.Fatal("leader version probe was not started")
-	}
+	testutil.Recv(t, probeStarted, time.Second, "leader version probe was not started")
 	second, err := srv.GetRaftGroups(context.Background(), &pb.GetRaftGroupsRequest{})
 	if err != nil {
 		t.Fatalf("GetRaftGroups second: %v", err)
@@ -498,11 +496,7 @@ func waitForLeaderVersion(t *testing.T, srv *AdminServer, want string) {
 		if len(resp.Groups) == 1 && resp.Groups[0].LeaderNodeVersion == want {
 			return
 		}
-		select {
-		case <-deadline:
-			t.Fatalf("leader version cache was not populated with %q", want)
-		case <-time.After(10 * time.Millisecond):
-		}
+		testutil.NoRecv(t, deadline, 10*time.Millisecond, "leader version cache was not populated with %q", want)
 	}
 }
 
@@ -528,13 +522,9 @@ func TestGetRaftGroupsLeaderVersionProbePropagatesAuthMetadata(t *testing.T) {
 	if _, err := srv.GetRaftGroups(ctx, &pb.GetRaftGroupsRequest{}); err != nil {
 		t.Fatalf("GetRaftGroups: %v", err)
 	}
-	select {
-	case got := <-gotAuth:
-		if len(got) != 1 || got[0] != "Bearer admin-token" {
-			t.Fatalf("authorization metadata = %v, want bearer token", got)
-		}
-	case <-time.After(time.Second):
-		t.Fatal("leader version probe did not run")
+	got := testutil.Recv(t, gotAuth, time.Second, "leader version probe did not run")
+	if len(got) != 1 || got[0] != "Bearer admin-token" {
+		t.Fatalf("authorization metadata = %v, want bearer token", got)
 	}
 }
 
@@ -746,11 +736,7 @@ func TestFanoutConfigurationCallsBoundedConcurrency(t *testing.T) {
 	}
 
 	close(release) // let everything drain
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("fanoutConfigurationCalls did not return after release")
-	}
+	testutil.Closed(t, done, 5*time.Second, "fanoutConfigurationCalls did not return after release")
 }
 
 // testProbeGroup is a minimal AdminGroup for concurrency tests; it runs cb
@@ -1137,13 +1123,9 @@ func TestCollectLiveMembersHonoursCtxCancel(t *testing.T) {
 		resCh <- collectLiveMembers(ctx, groups, "self")
 	}()
 
-	select {
-	case r := <-resCh:
-		// With ctx already cancelled, no live config landed; expect empty maps.
-		if len(r.addrByID) != 0 || len(r.order) != 0 {
-			t.Fatalf("expected empty results on early cancel, got addrByID=%v order=%v", r.addrByID, r.order)
-		}
-	case <-time.After(1 * time.Second):
-		t.Fatal("collectLiveMembers blocked past 1s despite cancelled ctx — wg.Wait() regression?")
+	r := testutil.Recv(t, resCh, 1*time.Second, "collectLiveMembers blocked past 1s despite cancelled ctx — wg.Wait() regression?")
+	// With ctx already cancelled, no live config landed; expect empty maps.
+	if len(r.addrByID) != 0 || len(r.order) != 0 {
+		t.Fatalf("expected empty results on early cancel, got addrByID=%v order=%v", r.addrByID, r.order)
 	}
 }

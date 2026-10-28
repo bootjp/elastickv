@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
@@ -46,11 +48,7 @@ func TestStopGRPCServerBoundedForcesStopOnLongLivedStream(t *testing.T) {
 	stream, err := conn.NewStream(ctx, &grpc.StreamDesc{StreamName: "Watch", ServerStreams: true, ClientStreams: true}, "/elastickv.test.LongLived/Watch")
 	require.NoError(t, err)
 	require.NotNil(t, stream)
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("server handler did not start for the long-lived stream")
-	}
+	testutil.Recv(t, started, 5*time.Second, "server handler did not start for the long-lived stream")
 
 	start := time.Now()
 	stopGRPCServerBounded(context.Background(), srv, "test")
@@ -115,11 +113,7 @@ func openLongLivedStream(t *testing.T, addr string, started <-chan struct{}) {
 	t.Cleanup(streamCancel)
 	_, err = conn.NewStream(streamCtx, &grpc.StreamDesc{StreamName: "Watch", ServerStreams: true, ClientStreams: true}, "/elastickv.test.LongLived/Watch")
 	require.NoError(t, err)
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("server handler did not start for the long-lived stream")
-	}
+	testutil.Recv(t, started, 5*time.Second, "server handler did not start for the long-lived stream")
 }
 
 // TestGRPCServeReturnsOnlyAfterBoundedStop pins the property the per-group
@@ -153,11 +147,7 @@ func TestGRPCServeReturnsOnlyAfterBoundedStop(t *testing.T) {
 		t.Fatalf("Serve returned (%v) while the bounded stop was still draining", err)
 	case <-time.After(100 * time.Millisecond):
 	}
-	select {
-	case <-stopDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the bounded stop did not finish")
-	}
+	testutil.Closed(t, stopDone, 5*time.Second, "the bounded stop did not finish")
 	select {
 	case err := <-serveDone:
 		require.NoError(t, err)

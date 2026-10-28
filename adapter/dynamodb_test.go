@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -1895,11 +1897,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 		txErrCh <- txErr
 	}()
 
-	select {
-	case <-wrapped.blockEntered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for blocked transact dispatch")
-	}
+	testutil.Closed(t, wrapped.blockEntered, 5*time.Second, "timed out waiting for blocked transact dispatch")
 
 	_, err = client1.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:        aws.String("race"),
@@ -1916,11 +1914,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 	close(wrapped.blockRelease)
 
 	var txErr error
-	select {
-	case txErr = <-txErrCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for transact result")
-	}
+	txErr = testutil.Recv(t, txErrCh, 5*time.Second, "timed out waiting for transact result")
 	require.ErrorContains(t, txErr, "conditional check failed")
 
 	targetOut, err := client0.GetItem(ctx, &dynamodb.GetItemInput{

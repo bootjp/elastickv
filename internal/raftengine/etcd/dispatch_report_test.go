@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -65,18 +67,10 @@ func TestReportSuccessfulDispatchWaitsForSnapshotFinishSlot(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		t.Fatal("snapshot finish report returned while dispatchReportCh was full")
-	case <-time.After(50 * time.Millisecond):
-	}
+	testutil.NoRecv(t, done, 50*time.Millisecond, "snapshot finish report returned while dispatchReportCh was full")
 
 	require.Equal(t, blockingReport, <-e.dispatchReportCh)
-	select {
-	case <-done:
-	case <-time.After(testDispatchReportTimeout):
-		t.Fatal("snapshot finish report did not complete after dispatchReportCh had space")
-	}
+	testutil.Closed(t, done, testDispatchReportTimeout, "snapshot finish report did not complete after dispatchReportCh had space")
 	select {
 	case got := <-e.dispatchReportCh:
 		require.Equal(t, dispatchReport{to: 2, msgType: raftpb.MsgSnap, snapshotFinish: true}, got)
@@ -100,11 +94,7 @@ func TestReportSuccessfulDispatchAbortsOnCloseWhenReportFull(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(testDispatchReportTimeout):
-		t.Fatal("snapshot finish report did not abort when closeCh was signalled")
-	}
+	testutil.Closed(t, done, testDispatchReportTimeout, "snapshot finish report did not abort when closeCh was signalled")
 }
 
 func TestReportSuccessfulDispatchIgnoresRegularMessage(t *testing.T) {

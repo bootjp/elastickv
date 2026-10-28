@@ -20,6 +20,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/aws/aws-sdk-go-v2/aws"
 	v4 "github.com/aws/aws-sdk-go-v2/aws/signer/v4"
 	"github.com/bootjp/elastickv/distribution"
@@ -237,11 +239,7 @@ func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	server.handle(rec, req)
 
 	var got proxiedRequest
-	select {
-	case got = <-proxied:
-	case <-time.After(5 * time.Second):
-		t.Fatal("request was not proxied to the leader")
-	}
+	got = testutil.Recv(t, proxied, 5*time.Second, "request was not proxied to the leader")
 	require.Equal(t, "signed-s3.example.test", got.host)
 	require.Equal(t, "/", got.path)
 	require.Equal(t, rawQuery, got.rawQuery)

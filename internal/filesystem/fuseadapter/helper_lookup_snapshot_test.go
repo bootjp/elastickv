@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -51,11 +53,7 @@ func TestCanceledMountHelperLookupDoesNotLaunchWorker(t *testing.T) {
 	cancel()
 	_, err := lookupMountHelperContext(ctx, "fusermount3")
 	require.ErrorIs(t, err, context.Canceled)
-	select {
-	case <-called:
-		t.Fatal("already-cancelled lookup launched background work")
-	case <-time.After(10 * time.Millisecond):
-	}
+	testutil.NoRecv(t, called, 10*time.Millisecond, "already-cancelled lookup launched background work")
 }
 
 func TestMountHelperLookupSnapshotSurvivesConcurrentOwner(t *testing.T) {

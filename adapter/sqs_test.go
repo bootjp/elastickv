@@ -10,6 +10,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	json "github.com/goccy/go-json"
 )
 
@@ -190,12 +192,8 @@ func TestSQSServer_ListenlessRunStopRoundTrip(t *testing.T) {
 	time.Sleep(20 * time.Millisecond)
 	srv.Stop()
 
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("run: %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("listenless Run did not return within timeout after Stop")
+	err := testutil.Recv(t, done, 2*time.Second, "listenless Run did not return within timeout after Stop")
+	if err != nil {
+		t.Fatalf("run: %v", err)
 	}
 }

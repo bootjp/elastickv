@@ -15,11 +15,7 @@ import (
 // Watcher.Done() channel avoids the goleak dep and keeps the check local.
 func waitForDone(t *testing.T, w *Watcher, d time.Duration) {
 	t.Helper()
-	select {
-	case <-w.Done():
-	case <-time.After(d):
-		t.Fatalf("watcher goroutine did not exit within %v", d)
-	}
+	testutil.Closed(t, w.Done(), d, "watcher goroutine did not exit within %v", d)
 }
 
 // TestWatcher_FiresOnceAboveThreshold creates a watcher with a threshold

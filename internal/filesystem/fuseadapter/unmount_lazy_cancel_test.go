@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -21,11 +23,7 @@ func TestUnmountLazyCancelsInFlightRequests(t *testing.T) {
 	defer done()
 
 	require.NoError(t, server.UnmountLazy(context.Background()))
-	select {
-	case <-inFlight.Done():
-	case <-time.After(5 * time.Second):
-		t.Fatal("the in-flight request was not cancelled by the lazy detach")
-	}
+	testutil.Closed(t, inFlight.Done(), 5*time.Second, "the in-flight request was not cancelled by the lazy detach")
 
 	late, lateDone := fs.requestContext(nil)
 	defer lateDone()

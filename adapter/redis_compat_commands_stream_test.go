@@ -9,6 +9,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/redis/go-redis/v9"
@@ -102,15 +104,11 @@ func TestRedis_StreamXReadBlockWakesOnXAdd(t *testing.T) {
 	}).Result()
 	require.NoError(t, err)
 
-	select {
-	case res := <-resultCh:
-		require.NoError(t, res.err)
-		require.Len(t, res.streams, 1)
-		require.Len(t, res.streams[0].Messages, 1)
-		require.Equal(t, "2-0", res.streams[0].Messages[0].ID)
-	case <-time.After(6 * time.Second):
-		t.Fatal("XREAD BLOCK did not return after XADD signal")
-	}
+	res := testutil.Recv(t, resultCh, 6*time.Second, "XREAD BLOCK did not return after XADD signal")
+	require.NoError(t, res.err)
+	require.Len(t, res.streams, 1)
+	require.Len(t, res.streams[0].Messages, 1)
+	require.Equal(t, "2-0", res.streams[0].Messages[0].ID)
 }
 
 func TestRedis_StreamXReadIterCtxDeadlineReturnsNull(t *testing.T) {
@@ -239,14 +237,10 @@ func TestRedis_StreamXReadBlockChecksWrongTypeAtDeadline(t *testing.T) {
 	requireStreamWaiterRegistered(t, nodes[0].redisServer.streamWaiters, key, waiterRegistering)
 	require.NoError(t, rdbWriter.Set(ctx, key, "now-a-string", 0).Err())
 
-	select {
-	case res := <-resultCh:
-		require.Error(t, res.err)
-		require.Contains(t, res.err.Error(), "WRONGTYPE")
-		require.Empty(t, res.streams)
-	case <-time.After(blockWindow + 2*time.Second):
-		t.Fatal("XREAD BLOCK did not return after wrong-type overwrite")
-	}
+	res := testutil.Recv(t, resultCh, blockWindow+2*time.Second, "XREAD BLOCK did not return after wrong-type overwrite")
+	require.Error(t, res.err)
+	require.Contains(t, res.err.Error(), "WRONGTYPE")
+	require.Empty(t, res.streams)
 }
 
 // requireStreamWaiterRegistered waits for key's blocking reader to appear.
@@ -1122,15 +1116,11 @@ func TestRedis_StreamXReadShutdownShortCircuits(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	require.NoError(t, nodes[0].redisServer.Close())
 
-	select {
-	case res := <-xreadDone:
-		// BLOCK timeout returns redis.Nil — the same wire-level reply
-		// the client would have seen if the BLOCK had expired
-		// naturally. The server must NOT surface the cancellation as a
-		// -ERR or hang the connection.
-		require.True(t, errors.Is(res.err, redis.Nil),
-			"BLOCK after shutdown must return redis.Nil, got err=%v streams=%v", res.err, res.streams)
-	case <-time.After(2 * time.Second):
-		t.Fatal("XREAD did not return within 2 s of server Close — busy-poll did not honour handlerContext cancel")
-	}
+	res := testutil.Recv(t, xreadDone, 2*time.Second, "XREAD did not return within 2 s of server Close — busy-poll did not honour handlerContext cancel")
+	// BLOCK timeout returns redis.Nil — the same wire-level reply
+	// the client would have seen if the BLOCK had expired
+	// naturally. The server must NOT surface the cancellation as a
+	// -ERR or hang the connection.
+	require.True(t, errors.Is(res.err, redis.Nil),
+		"BLOCK after shutdown must return redis.Nil, got err=%v streams=%v", res.err, res.streams)
 }

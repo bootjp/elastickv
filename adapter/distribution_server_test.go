@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
@@ -1462,12 +1464,8 @@ func TestDistributionServerSplitRange_RetriesCatalogReloadUntilVisible(t *testin
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), resp.CatalogVersion)
 
-	select {
-	case applyErr := <-coordinator.asyncApplyDone:
-		require.NoError(t, applyErr)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for async split apply")
-	}
+	applyErr := testutil.Recv(t, coordinator.asyncApplyDone, time.Second, "timed out waiting for async split apply")
+	require.NoError(t, applyErr)
 }
 
 func TestDistributionServerSplitRange_RequiresCatalogLeaderWhenCoordinatorConfigured(t *testing.T) {

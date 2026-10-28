@@ -6,6 +6,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
@@ -114,21 +116,13 @@ func TestAcknowledgementDoesNotHoldReceiptLockDuringVerification(t *testing.T) {
 	adapter.recordReceipt(7, id)
 	done := make(chan error, 1)
 	go func() { done <- adapter.acknowledgeReceipt(t.Context(), id) }()
-	select {
-	case <-core.verifying:
-	case <-time.After(time.Second):
-		t.Fatal("verification did not start")
-	}
+	testutil.Closed(t, core.verifying, time.Second, "verification did not start")
 	recorded := make(chan struct{})
 	go func() {
 		adapter.recordReceipt(8, filesystem.OperationID{Filesystem: id.Filesystem, Session: id.Session, Sequence: 2})
 		close(recorded)
 	}()
-	select {
-	case <-recorded:
-	case <-time.After(time.Second):
-		t.Fatal("receipt lock held during verification")
-	}
+	testutil.Closed(t, recorded, time.Second, "receipt lock held during verification")
 	close(core.release)
 	require.NoError(t, <-done)
 }
@@ -144,21 +138,13 @@ func TestFsyncDoesNotHoldReceiptLockDuringVerification(t *testing.T) {
 	adapter.recordReceipt(7, id)
 	done := make(chan syscall.Errno, 1)
 	go func() { done <- adapter.Fsync(t.Context(), 7, 9, false) }()
-	select {
-	case <-core.verifying:
-	case <-time.After(time.Second):
-		t.Fatal("verification did not start")
-	}
+	testutil.Closed(t, core.verifying, time.Second, "verification did not start")
 	recorded := make(chan struct{})
 	go func() {
 		adapter.recordReceipt(8, filesystem.OperationID{Filesystem: id.Filesystem, Session: id.Session, Sequence: 2})
 		close(recorded)
 	}()
-	select {
-	case <-recorded:
-	case <-time.After(time.Second):
-		t.Fatal("receipt lock held during fsync verification")
-	}
+	testutil.Closed(t, recorded, time.Second, "receipt lock held during fsync verification")
 	close(core.release)
 	require.Zero(t, <-done)
 }

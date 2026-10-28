@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/bootjp/elastickv/internal/testutil"
 )
 
 // mutatingGroup is an OperationGroup with one PUT (a write that would
@@ -196,13 +198,9 @@ func TestAwaitRegistrationBarrier_CtxCancelFailsClosed(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- c.awaitRegistrationBarrier(ctx) }()
 	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("expected ctx.Canceled fail-closed, got %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("commit did not fail-closed on ctx cancel")
+	err := testutil.Recv(t, done, 2*time.Second, "commit did not fail-closed on ctx cancel")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected ctx.Canceled fail-closed, got %v", err)
 	}
 }
 
@@ -217,12 +215,8 @@ func TestAwaitRegistration_OpenBarrier_CtxCancelFailsClosed(t *testing.T) {
 	done := make(chan error, 1)
 	go func() { done <- c.awaitRegistration(ctx, mutatingGroup()) }()
 	cancel()
-	select {
-	case err := <-done:
-		if !errors.Is(err, context.Canceled) {
-			t.Fatalf("expected ctx.Canceled fail-closed, got %v", err)
-		}
-	case <-time.After(2 * time.Second):
-		t.Fatal("write did not fail-closed on ctx cancel")
+	err := testutil.Recv(t, done, 2*time.Second, "write did not fail-closed on ctx cancel")
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected ctx.Canceled fail-closed, got %v", err)
 	}
 }

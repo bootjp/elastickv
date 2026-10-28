@@ -5,6 +5,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	"github.com/stretchr/testify/require"
 )
 
@@ -18,11 +20,7 @@ func TestBackgroundReservationStartsLiveAfterShutdownBound(t *testing.T) {
 	ran := make(chan error, 1)
 	r.start(time.Second, func(ctx context.Context) { ran <- ctx.Err() })
 	require.NoError(t, <-ran)
-	select {
-	case <-done:
-	case <-time.After(time.Second):
-		t.Fatal("stop did not join reserved cleanup")
-	}
+	testutil.Closed(t, done, time.Second, "stop did not join reserved cleanup")
 }
 
 func TestBackgroundReservationCannotStartAfterStopReturns(t *testing.T) {
@@ -34,9 +32,5 @@ func TestBackgroundReservationCannotStartAfterStopReturns(t *testing.T) {
 	r.start(time.Second, func(context.Context) { ran <- struct{}{} })
 	r.release()
 	require.Zero(t, w.gate.remaining())
-	select {
-	case <-ran:
-		t.Fatal("cleanup started after shutdown returned")
-	case <-time.After(time.Millisecond):
-	}
+	testutil.NoRecv(t, ran, time.Millisecond, "cleanup started after shutdown returned")
 }

@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
+
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -1101,11 +1103,7 @@ func TestDispatchRegularFallsBackToUnaryWhenSendStreamDisabledDuringSend(t *test
 		})
 	}()
 
-	select {
-	case <-sendStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for stream Send to start")
-	}
+	testutil.Closed(t, sendStarted, 5*time.Second, "timed out waiting for stream Send to start")
 	transport.SetSendStreamEnabled(false)
 
 	select {
@@ -1335,11 +1333,7 @@ func TestDispatchRegularStreamCancelsCachedStreamWhenContextDone(t *testing.T) {
 		}))
 	}()
 
-	select {
-	case <-sendStarted:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for stream Send to start")
-	}
+	testutil.Closed(t, sendStarted, 5*time.Second, "timed out waiting for stream Send to start")
 	cancel()
 
 	select {
@@ -1462,12 +1456,8 @@ func collectRaftMessages(t *testing.T, ch <-chan raftpb.Message, count int) []ra
 	t.Helper()
 	got := make([]raftpb.Message, 0, count)
 	for len(got) < count {
-		select {
-		case msg := <-ch:
-			got = append(got, msg)
-		case <-time.After(5 * time.Second):
-			t.Fatalf("timed out waiting for raft message %d/%d", len(got)+1, count)
-		}
+		msg := testutil.Recv(t, ch, 5*time.Second, "timed out waiting for raft message %d/%d", len(got)+1, count)
+		got = append(got, msg)
 	}
 	return got
 }
@@ -1896,13 +1886,9 @@ func TestStreamFSMSnapshotOverGRPCRestoresFollowerFSM(t *testing.T) {
 	}
 	require.NoError(t, sendTransport.streamFSMSnapshot(context.Background(), msg, 77, openFn))
 
-	select {
-	case restoreErr := <-restoredCh:
-		require.NoError(t, restoreErr,
-			"fresh follower FSM must restore cleanly; a short-read EOF here means the trailing partial chunk was dropped in transit")
-	case <-time.After(5 * time.Second):
-		t.Fatal("receiver never ran Restore")
-	}
+	restoreErr := testutil.Recv(t, restoredCh, 5*time.Second, "receiver never ran Restore")
+	require.NoError(t, restoreErr,
+		"fresh follower FSM must restore cleanly; a short-read EOF here means the trailing partial chunk was dropped in transit")
 
 	require.Equal(t, senderFSM.Applied(), receiverFSM.Applied(),
 		"receiver FSM state after Restore must equal sender FSM state")
@@ -1949,12 +1935,8 @@ func TestStreamFSMSnapshotOverGRPCAtChunkBoundary(t *testing.T) {
 	}
 	require.NoError(t, sendTransport.streamFSMSnapshot(context.Background(), msg, 91, openFn))
 
-	select {
-	case got := <-gotCh:
-		require.Equal(t, payload, got.Snapshot.Data)
-	case <-time.After(5 * time.Second):
-		t.Fatal("receiver never observed the snapshot message")
-	}
+	got := testutil.Recv(t, gotCh, 5*time.Second, "receiver never observed the snapshot message")
+	require.Equal(t, payload, got.Snapshot.Data)
 }
 
 func TestStreamFSMSnapshotSendsPayload(t *testing.T) {
