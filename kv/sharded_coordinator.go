@@ -3859,7 +3859,7 @@ func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
 	}
 	rctx, cancel := hlcRecoveryContext(ctx)
 	defer cancel()
-	return c.recoverHLCLeaseTargets(rctx, targets, time.Now().UnixMilli()+hlcPhysicalWindowMs)
+	return c.recoverHLCLeaseTargets(rctx, targets, hlcRecoveryCeiling(c.clock))
 }
 
 func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets []hlcLeaseRecoveryTarget, ceilingMs int64) error {

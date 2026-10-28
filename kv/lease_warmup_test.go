@@ -369,7 +369,7 @@ func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T
 func TestShardedCoordinator_RecoverHLCLease_LogicalCeilingExhausted(t *testing.T) {
 	t.Parallel()
 	clock := NewHLC()
-	ceiling := time.Now().Add(10 * time.Second).UnixMilli()
+	ceiling := time.Now().Add(time.Minute).UnixMilli()
 	clock.SetPhysicalCeiling(ceiling)
 	clock.Observe((uint64(ceiling) << hlcLogicalBits) | hlcLogicalMask)
 	eng := newShardedLeaseEngine(100)
@@ -383,6 +383,24 @@ func TestShardedCoordinator_RecoverHLCLease_LogicalCeilingExhausted(t *testing.T
 	require.NoError(t, err)
 	require.Equal(t, int32(1), eng.proposeCalls.Load())
 	_, err = clock.NextFenced()
+	require.NoError(t, err)
+	require.Greater(t, clock.PhysicalCeiling(), ceiling)
+}
+
+func TestCoordinate_RecoverHLCLease_LogicalCeilingExhausted(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	ceiling := time.Now().Add(time.Minute).UnixMilli()
+	clock.SetPhysicalCeiling(ceiling)
+	clock.Observe((uint64(ceiling) << hlcLogicalBits) | hlcLogicalMask)
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	eng.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := NewCoordinatorWithEngine(nil, eng, WithHLC(clock))
+
+	require.NoError(t, coord.RecoverHLCLease(context.Background()))
+	require.Equal(t, int32(1), eng.proposeCalls.Load())
+	require.Greater(t, clock.PhysicalCeiling(), ceiling)
+	_, err := clock.NextFenced()
 	require.NoError(t, err)
 }
 

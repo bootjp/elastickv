@@ -766,6 +766,15 @@ func hlcCeilingExhausted(clock *HLC) bool {
 		(physical == uint64(ceiling) && last&hlcLogicalMask == hlcLogicalMask)
 }
 
+// hlcRecoveryCeiling advances beyond both the wall clock and the clock's
+// committed or observed physical time. A renewal based only on wall time can
+// be lower than an already committed ceiling after clock skew or logical
+// counter exhaustion, leaving timestamp issuance blocked.
+func hlcRecoveryCeiling(clock *HLC) int64 {
+	base := max(time.Now().UnixMilli(), clock.PhysicalCeiling(), clampUint64ToInt64(clock.Current()>>hlcLogicalBits))
+	return base + hlcPhysicalWindowMs
+}
+
 type tsoCoordinator interface {
 	IsLeader() bool
 	Clock() *HLC

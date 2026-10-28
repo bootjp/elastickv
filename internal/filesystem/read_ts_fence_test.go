@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -75,6 +76,25 @@ func TestServiceReadTSRaisesSnapshotToAllGroupsFenceTimestamp(t *testing.T) {
 	ts, err = svc.readTS(ctx)
 	require.NoError(t, err)
 	require.EqualValues(t, 5, ts, "leader fence remains authoritative when local state is ahead")
+}
+
+func TestServiceReadTSUsesLocalWatermarkForLegacyForwarder(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("key"), []byte("value"), 7, 0))
+	seed, err := NewService(st, &testCoordinator{st: st}, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+	require.NoError(t, seed.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	coord := kv.CoordinatorForwarder{Inner: &kvtest.NopCoordinator{}}
+	svc, err := NewService(st, coord, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+
+	ts, err := svc.readTS(ctx)
+	require.NoError(t, err)
+	require.Equal(t, st.LastCommitTS(), ts, "legacy fence has no leader-side commit watermark")
+	root, err := svc.GetAttr(ctx, RootInode)
+	require.NoError(t, err)
+	require.Equal(t, RootInode, root.Inode)
 }
 
 func TestServiceReadTSPropagatesAllGroupsFenceTimestampError(t *testing.T) {

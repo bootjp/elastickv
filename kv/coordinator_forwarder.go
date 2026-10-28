@@ -200,6 +200,17 @@ func (f CoordinatorForwarder) LeaseReadAllGroupsTimestamp(ctx context.Context) (
 	return LeaseReadAllGroupsTimestampThrough(f.Inner, ctx)
 }
 
+// SupportsAllGroupsLeaseTimestamp reports whether the inner coordinator can
+// return a leader-side commit watermark. The forwarder's timestamp method also
+// fences legacy coordinators, but returns zero for those fences.
+func (f CoordinatorForwarder) SupportsAllGroupsLeaseTimestamp() bool {
+	if support, ok := f.Inner.(interface{ SupportsAllGroupsLeaseTimestamp() bool }); ok {
+		return support.SupportsAllGroupsLeaseTimestamp()
+	}
+	_, ok := f.Inner.(AllGroupsLeaseTimestampCoordinator)
+	return ok
+}
+
 // IsLeaderForGroup / RaftLeaderForGroup / LeaseReadForGroup carry the
 // group-keyed read-fence path. Without them every fence target falls back to
 // key resolution, which re-introduces the legacy wide-column group collapse

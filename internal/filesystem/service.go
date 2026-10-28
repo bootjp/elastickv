@@ -2785,8 +2785,10 @@ func (s *Service) readTS(ctx context.Context) (uint64, error) {
 	if err != nil {
 		return 0, err
 	}
-	if _, ok := s.dispatch.(allGroupsLeaseTimestampReader); ok {
-		return fenceTS, nil
+	if reader, ok := s.dispatch.(allGroupsLeaseTimestampReader); ok {
+		if support, wrapped := reader.(interface{ SupportsAllGroupsLeaseTimestamp() bool }); !wrapped || support.SupportsAllGroupsLeaseTimestamp() {
+			return fenceTS, nil
+		}
 	}
 	return max(s.store.LastCommitTS(), fenceTS), nil
 }
