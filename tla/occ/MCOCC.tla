@@ -13,6 +13,8 @@
 (*   MCOCC_g1_gap.cfg   — known gap G1 (TLC fails on OCC8_NoWriteSkew)     *)
 (*   MCOCC_emptystore_gap.cfg — known gap: empty-store start is MaxUint64  *)
 (*                        (TLC fails on OCC3b_EmptyStoreReadStability)     *)
+(*   MCOCC_multigroup_gap.cfg — known gap: G0 across groups on the         *)
+(*                        one-phase path (TLC fails on OCC-3)              *)
 (*   MCOCC_live.cfg     — OCC-L1 liveness under SpecLive (TLC passes)      *)
 (*                                                                         *)
 (* Run via `make tla-check` from the repository root.                      *)

@@ -167,7 +167,9 @@ is a non-transactional write that raises the watermark.  The lock
 resolver is abstracted into the atomic lock drain inside
 `Commit`/`Abort`; timestamps come from one global counter (unique,
 leader-issued).  `EnableSafety` gates the commit-ts > start-ts
-discipline; `EnableTwoPhase` turns the 2PC path off.
+discipline; `EnableTwoPhase` turns the 2PC path off; `MultiGroup`
+gives every key its own Raft group and watermark (the snapshot start is
+the maximum over groups, the one-phase fence is per group).
 
 Invariants asserted:
 
@@ -189,11 +191,12 @@ Invariants asserted:
 | Config | Checks | Expected |
 |---|---|---|
 | `MCOCC.cfg` | full model; OCC-1, OCC-2, OCC-4, OCC-5 | PASS |
-| `MCOCC_onephase.cfg` | single-shard path only, one Raft group (one watermark); every invariant incl. OCC-3, OCC-8 | PASS |
+| `MCOCC_onephase.cfg` | single-shard path only, one Raft group; every invariant incl. OCC-3, OCC-8 | PASS |
 | `MCOCC_gap.cfg` | `EnableSafety = FALSE` | FAIL on `OCC1_CommitTsAboveStart` (depth ≈ 5) |
 | `MCOCC_g0_gap.cfg` | full model (known gap G0) | FAIL on `OCC3_ReadSnapshotStability` (depth 9: 2PC allocates, a raw write raises the watermark, a reader reads, the 2PC commits below its snapshot) |
 | `MCOCC_g1_gap.cfg` | full model (known gap G1) | FAIL on `OCC8_NoWriteSkew` (a one-phase commit applies between the other txn's PREPARE and COMMIT) |
 | `MCOCC_emptystore_gap.cfg` | single-shard path (known gap: an empty-store start is MaxUint64) | FAIL on `OCC3b_EmptyStoreReadStability` |
+| `MCOCC_multigroup_gap.cfg` | single-shard path, one Raft group per key (known gap: G0 across groups) | FAIL on `OCC3_ReadSnapshotStability` (a one-phase write allocated earlier applies on a lagging group, above that group's watermark but below a reader's max-over-groups snapshot) |
 | `MCOCC_live.cfg` | `SpecLive`, OCC-L1 | PASS |
 
 ### `mvcc/MVCC.tla`

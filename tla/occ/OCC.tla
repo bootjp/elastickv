@@ -44,12 +44,13 @@
 (* With EnableTwoPhase = FALSE (single-shard transactions only) OCC-1..   *)
 (* OCC-5 and OCC-8 all hold (OCC-3b does not).                             *)
 (*                                                                         *)
-(* One watermark: the model is one Raft group.  With several groups the   *)
-(* one-phase fence compares commit_ts against the applying group's own   *)
-(* LastCommitTS, while a snapshot read takes the maximum over all groups  *)
-(* (ShardStore.LastCommitTS); outside Phase D nothing validates such a    *)
-(* start_ts (validateCrossShardReadTimestamp).  Whether that admits G0 on *)
-(* the one-phase path across groups is not checked here.                  *)
+(* Groups.  With MultiGroup = TRUE every key lives in its own Raft group  *)
+(* with its own applied watermark.  The one-phase fence compares commit_ts *)
+(* with the applying group's watermark, while a snapshot start takes the   *)
+(* maximum over all groups (ShardStore.LastCommitTS).  That admits G0 on   *)
+(* the one-phase path across groups (audit "Multi-group deployments"),    *)
+(* pinned by MCOCC_multigroup_gap.cfg.  A one-phase txn must keep its     *)
+(* write and read keys in one group (dispatchTxn singleShard).            *)
 (*                                                                         *)
 (* EnableSafety gates the commit_ts > start_ts discipline (fresh commit    *)
 (* timestamps plus the FSM ErrTxnCommitTSRequired check) so the gap config *)
@@ -71,7 +72,8 @@ CONSTANTS
     MaxTs,          \* upper bound on the abstract HLC counter (state-space)
     MaxOps,         \* upper bound on Write + RawWrite actions (state-space)
     EnableSafety,   \* TRUE: commit_ts > start_ts discipline; FALSE: gap config
-    EnableTwoPhase  \* TRUE: multi-shard 2PC path enabled; FALSE: one-phase only
+    EnableTwoPhase, \* TRUE: multi-shard 2PC path enabled; FALSE: one-phase only
+    MultiGroup      \* TRUE: one Raft group per key; FALSE: a single group
 
 \* Transaction lifecycle states.
 \*   Proposed  — one-phase entry with an allocated commit_ts, not applied yet
@@ -84,7 +86,8 @@ NoLock == [owner |-> "none", lockTs |-> 0]
 
 VARIABLES
     tsCounter,        \* Nat. Abstract leader-issued clock; advances on every allocation.
-    watermark,        \* Nat. Applied commit watermark (store LastCommitTS).
+    watermark,        \* Groups -> Nat. Per-group applied commit watermark
+                      \* (the group store's LastCommitTS).
     txnState,         \* TxnIds -> States
     snapshotRead,     \* TxnIds -> BOOLEAN. TRUE: start_ts = watermark, may read.
     startTs,          \* TxnIds -> Nat   (== read_ts by OCC-5)
@@ -143,12 +146,33 @@ AddVersions(t, ct) ==
         THEN versions[k] \cup {[commitTs |-> ct, owner |-> t]}
         ELSE versions[k]]
 
-RaiseWatermark(ct) == IF ct > watermark THEN ct ELSE watermark
+\* Raft groups: one per key, or a single group.
+Groups == IF MultiGroup THEN Keys ELSE {"g"}
+GroupOf(k) == IF MultiGroup THEN k ELSE "g"
+
+\* The snapshot start: ShardStore.LastCommitTS, the maximum over groups.
+GlobalWatermark ==
+    CHOOSE w \in {watermark[g] : g \in Groups} :
+        \A g \in Groups : watermark[g] <= w
+
+\* Raise the watermark of every group a commit at ct wrote to.
+RaiseWatermark(S, ct) ==
+    [g \in Groups |->
+        IF (\E k \in S : GroupOf(k) = g) /\ ct > watermark[g]
+        THEN ct ELSE watermark[g]]
+
+\* dispatchTxn takes the one-phase path only when every write and read
+\* key is in one group.
+SingleGroup(t) ==
+    \E g \in Groups : \A k \in writeSet[t] \cup readSet[t] : GroupOf(k) = g
+
+\* The group a single-group txn applies on.
+TxnGroup(t) == GroupOf(CHOOSE k \in writeSet[t] : TRUE)
 
 \* === INIT ===
 Init ==
     /\ tsCounter    = 0
-    /\ watermark    = 0
+    /\ watermark    = [g \in Groups |-> 0]
     /\ txnState     = [t \in TxnIds |-> "Idle"]
     /\ snapshotRead = [t \in TxnIds |-> FALSE]
     /\ startTs      = [t \in TxnIds |-> 0]
@@ -176,7 +200,7 @@ BeginTxn(t) ==
     /\ txnState[t] = "Idle"
     /\ txnState'     = [txnState     EXCEPT ![t] = "Active"]
     /\ snapshotRead' = [snapshotRead EXCEPT ![t] = TRUE]
-    /\ startTs'      = [startTs      EXCEPT ![t] = IF watermark = 0 THEN MaxTs ELSE watermark]
+    /\ startTs'      = [startTs      EXCEPT ![t] = IF GlobalWatermark = 0 THEN MaxTs ELSE GlobalWatermark]
     /\ UNCHANGED <<tsCounter, watermark, commitTs, writeSet, readSet,
                    readObs, lockMap, versions, opCount>>
 
@@ -234,7 +258,7 @@ RawWrite(k) ==
     /\ LET ct == tsCounter + 1 IN
         /\ tsCounter' = ct
         /\ versions'  = [versions EXCEPT ![k] = @ \cup {[commitTs |-> ct, owner |-> "raw"]}]
-        /\ watermark' = RaiseWatermark(ct)
+        /\ watermark' = RaiseWatermark({k}, ct)
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<txnState, snapshotRead, startTs, commitTs, writeSet,
                    readSet, readObs, lockMap>>
@@ -248,6 +272,7 @@ RawWrite(k) ==
 AllocateOnePhase(t) ==
     /\ txnState[t] = "Active"
     /\ writeSet[t] # {}
+    /\ SingleGroup(t)
     /\ EnableSafety => tsCounter < MaxTs
     /\ tsCounter' = IF EnableSafety THEN tsCounter + 1 ELSE tsCounter
     /\ commitTs'  = [commitTs EXCEPT ![t] = FreshCommitTs]
@@ -258,7 +283,7 @@ AllocateOnePhase(t) ==
 \* Every check the one-phase apply performs.
 OnePhaseApplies(t) ==
     /\ CommitAboveStart(t)
-    /\ commitTs[t] > watermark                  \* checkCommitTSFence
+    /\ commitTs[t] > watermark[TxnGroup(t)]     \* checkCommitTSFence
     /\ NoForeignLock(t)                          \* assertNoConflictingTxnLocks
     /\ NoNewerVersion(t, writeSet[t])
     /\ NoNewerVersion(t, readSet[t])
@@ -273,7 +298,7 @@ ApplyOnePhase(t) ==
     /\ OnePhaseApplies(t)
     /\ txnState'  = [txnState EXCEPT ![t] = "Committed"]
     /\ versions'  = AddVersions(t, commitTs[t])
-    /\ watermark' = RaiseWatermark(commitTs[t])
+    /\ watermark' = RaiseWatermark(writeSet[t], commitTs[t])
     /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs, writeSet,
                    readSet, readObs, lockMap, opCount>>
 
@@ -330,7 +355,7 @@ Commit(t) ==
     /\ txnState'  = [txnState EXCEPT ![t] = "Committed"]
     /\ versions'  = AddVersions(t, commitTs[t])
     /\ lockMap'   = ReleaseLocks(t)
-    /\ watermark' = RaiseWatermark(commitTs[t])
+    /\ watermark' = RaiseWatermark(writeSet[t], commitTs[t])
     /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs, writeSet,
                    readSet, readObs, opCount>>
 
@@ -403,7 +428,7 @@ StateConstraint ==
 \* version record undetected.
 TypeOK ==
     /\ tsCounter    \in 0..MaxTs
-    /\ watermark    \in 0..MaxTs
+    /\ watermark    \in [Groups -> 0..MaxTs]
     /\ txnState     \in [TxnIds -> States]
     /\ snapshotRead \in [TxnIds -> BOOLEAN]
     /\ startTs      \in [TxnIds -> 0..MaxTs]
