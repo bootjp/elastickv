@@ -1907,7 +1907,7 @@ func (s *EncryptionAdminServer) proposeEncryptionEntryWith(ctx context.Context, 
 	// barrier-exempt ProposeAdmin path.
 	//
 	// ProposeAdmin is barrier-exempt only; the wrap layer above
-	// the engine (kv.wrappedProposer, when configured) still
+	// the engine (kv.dynamicWrappedProposer, when configured) still
 	// applies its wrap closure to ProposeAdmin payloads, so a
 	// post-cutover RotateDEK or RegisterEncryptionWriter
 	// committed at `index > raftEnvelopeCutoverIndex` carries the

@@ -196,7 +196,7 @@ type ProposalResult struct {
 //     writer-registry entry).
 //
 // ProposeAdmin is NOT a wrap-exemption: a payload-wrap layer
-// configured above the engine (kv.wrappedProposer) applies its
+// configured above the engine (kv.dynamicWrappedProposer) applies its
 // wrap closure to both methods identically. Admin entries that
 // land at `index > raftEnvelopeCutoverIndex` (a leader-restart
 // registration, a post-cutover RotateDEK, etc.) must carry the
