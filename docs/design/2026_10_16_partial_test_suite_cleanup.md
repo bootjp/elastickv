@@ -100,7 +100,20 @@ WP-1 to WP-8 can run in parallel. WP-9 to WP-12 start once their dependencies me
 | WP-6 | Landed (same PR as WP-3); see deviation 2. |
 | WP-7 | Landed (same PR as WP-3). |
 | WP-8 | Landed (#1288). |
-| WP-9 to WP-12 | Open. Their dependencies have all landed. |
+| WP-9 to WP-12 | Landed in the same PR as WP-3, with the exceptions listed under "WP-9 to WP-12 results". |
+
+WP-9 to WP-12 results (all four directory sets were migrated together, one commit per pattern):
+
+| Pattern | Before | After | Left as is, and why |
+|---|---|---|---|
+| Receive-or-fail `select` blocks | 276 candidate blocks | 154 replaced by `testutil.Recv` / `NoRecv` / `Closed`; 122 remain | A bare receive becomes `Closed` only when the file closes that channel and `Recv` only when it sends on it. Blocks were kept when that was ambiguous, the case body uses `break`/`goto`, the failure is non-fatal (`t.Error`), or hoisting the case variable could shadow another name. |
+| Legacy list delta key copies | 5 hand-rolled encoders | 0; all use `store.LegacyListMetaDeltaKey` (adapter seq 0, kv seq 1 preserved) | The `internal/backup` mirrors stay independent on purpose. |
+| Encryption fixtures | `store.CounterNonceFactory` exported from production `store`; 10 random-DEK keystore+cipher blocks; 2 byte-identical sidecar writers plus 4 temp-dir writers | `store/encryption_test_helpers.go` deleted (callers use `encryption.NewDeterministicNonceFactory`); 37 `encryptiontest` call sites | Fixed-byte DEKs, sidecar rewrites of an existing path, and `wiringEncryptionObserver` ≈ `recordingEncryptionObserver` (different packages; sharing needs a new package). |
+| Loopback gRPC servers | about 27 | 14 kv servers on `grpctest.Serve` | Servers whose tests assert the `Serve` error, need the listener address before construction, or stop the server mid-test. |
+| Fake Raft engines | 13 full fakes, about 10 `LeaderView`, about 12 `Proposer` | `stubLeaderEngine`/`noopEngine`, `stubFollowerEngine`, `membershipConfigEngine` → `raftenginetest.StubEngine`; three `LeaderView` fakes → `StaticLeaderView`; etcd `testStateMachine` aliases `raftenginetest.TestStateMachine` | Rule 4: fakes whose behaviour is the subject (toggling leader, blocking reads, lease, call recording, panicking `VerifyLeader`, error-injecting proposers). |
+| Fake coordinators | 12 full fakes, 6 in-memory apply coordinators | HELLO/INFO fakes folded into `stubAdapterCoordinator`; `testCoordinatorWrapper`, `phaseDGateCoordinator`, `fakeGroupRoutableCoordinator` embed instead of forwarding; `localAdapterCoordinator`, `occAdapterCoordinator`, `retryOnceCoordinator`, `fstest.MemoryDispatcher` and the filesystem `testCoordinator` dispatch through `kvtest.LocalCoordinator` (new `Clock` option shares the wrapper's HLC) | Rule 4 again for fakes with hooks, counters or scripted failures (`distributionCoordinatorStub`, `stubLeaderCoordinator`, `stubStartupCoordinator`, the TSO fakes). `phaseDGateCoordinator` embeds an interface of exactly its old method set, not `*ShardedCoordinator`, so it gains no optional capabilities. |
+
+Behaviour notes for the `LocalCoordinator` move: dispatches are serialized, elements are copied, `ctx` is checked before applying, the response carries `CommitTS`/`CommitIndex`, unknown ops return `ErrUnknownOp`, and an invalid commit-timestamp patch surfaces kv's validation error instead of `filesystem.ErrInvalid`.
 
 Deviations from the plan, found while implementing:
 
