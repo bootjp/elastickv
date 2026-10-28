@@ -103,8 +103,8 @@ func (t *TransactionManager) Close() {
 // gRPC / S3 / SQS handler's deadline reaches Propose / VerifyLeader without
 // being silently dropped to context.Background. See PR #748 / design doc
 // 2026_05_10_implemented_kv_ctx_plumbing.md for the rationale; the prior
-// signatures lived behind `verifyLeaderEngine`'s 5 s safety bound (#745),
-// which is preserved as the no-ctx defense-in-depth fallback.
+// signatures relied on a 5 s safety bound (#745), which verifyLeaderEngineCtx
+// preserves as the fallback for contexts without a deadline.
 type Transactional interface {
 	Commit(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error)
 	Abort(ctx context.Context, reqs []*pb.Request) (*TransactionResponse, error)

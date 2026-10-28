@@ -309,8 +309,8 @@ func TestCoordinateDispatch_SuccessBeatsConcurrentCancel(t *testing.T) {
 // this test catches it at CI time rather than during a production
 // re-election window. Pinning kv.ErrLeaderNotFound covers the
 // wire-level phrase "leader not found"; raftengine.ErrNotLeader
-// covers both the errors.Is sentinel path AND the string-fallback
-// path ("not leader" substring).
+// covers the string-fallback path ("not leader" substring) after the
+// sentinel identity has been lost during transport.
 //
 // adapter.ErrNotLeader is not pinned here because adapter imports kv,
 // which would create a test-time import cycle. A symmetric pin lives
@@ -331,7 +331,11 @@ func TestIsTransientLeaderError_PinsRealSentinels(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			require.True(t, isTransientLeaderError(tc.err),
+			// A bare errors.New with the same text still matches CockroachDB's
+			// network error identity. Include the transport's diagnostic prefix.
+			wireErr := errors.New("rpc error: code = Unavailable desc = " + tc.err.Error())
+			require.False(t, cerrors.Is(wireErr, tc.err), "fixture must bypass sentinel matching")
+			require.True(t, isTransientLeaderError(wireErr),
 				"sentinel %q (%q) no longer classified as transient — update leaderErrorPhrases or the classifier",
 				tc.name, tc.err.Error())
 		})

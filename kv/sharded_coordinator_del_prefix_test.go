@@ -154,6 +154,7 @@ func TestShardedCoordinatorRejectsPointWriteAtMigrationTimestampFloor(t *testing
 		Elems: []*Elem[OP]{{Op: Put, Key: []byte("z"), Value: []byte("v")}},
 	})
 	require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
+	require.ErrorIs(t, err, store.ErrWriteConflict)
 	require.Empty(t, g1Txn.requests, "coordinator must reject before proposing a floor-violating point write")
 }
 
@@ -183,7 +184,7 @@ func TestShardedCoordinatorRejectsRawDelPrefixMutationAtMigrationTimestampFloor(
 		{Op: pb.Op_DEL_PREFIX, Key: []byte("z")},
 		{Op: pb.Op_DEL_PREFIX, Key: nil},
 	} {
-		err := coord.rejectWriteTimestampFloorMutations([]*pb.Mutation{mut}, 100)
+		err := coord.ensureMutationsWriteAllowedWithBypass([]*pb.Mutation{mut}, 100, nil)
 		require.ErrorIs(t, err, ErrRouteWriteTimestampTooLow)
 	}
 }

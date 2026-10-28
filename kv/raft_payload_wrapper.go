@@ -42,94 +42,19 @@ func applyRaftPayloadWrap(wrap RaftPayloadWrapper, payload []byte) ([]byte, erro
 	return wrapped, nil
 }
 
-// wrappedProposer adapts a raftengine.Proposer so every Propose call
-// transparently runs the configured RaftPayloadWrapper. Used by
-// transaction.go's applyRequests path and by future code that needs
-// to share a single Proposer between callers some of whom wrap and
-// some of whom do not — the wrapping decision lives with the
-// constructed proposer, not the call site.
-//
-// When wrap is nil the wrappedProposer is functionally identical to
-// the inner proposer; this keeps the Stage 3 default a no-op.
-type wrappedProposer struct {
-	inner raftengine.Proposer
-	wrap  RaftPayloadWrapper
-}
-
-// newWrappedProposer returns the inner proposer untouched when the
-// wrapper is nil, so the cipher-disabled path stays a single
-// pointer assignment.
-func newWrappedProposer(inner raftengine.Proposer, wrap RaftPayloadWrapper) raftengine.Proposer {
-	if wrap == nil {
-		return inner
-	}
-	return &wrappedProposer{inner: inner, wrap: wrap}
-}
-
-func (p *wrappedProposer) Propose(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	wrapped, err := applyRaftPayloadWrap(p.wrap, data)
-	if err != nil {
-		return nil, err
-	}
-	res, err := p.inner.Propose(ctx, wrapped)
-	if err != nil {
-		return nil, errors.Wrap(err, "kv: wrapped propose")
-	}
-	return res, nil
-}
-
-// ProposeAdmin applies the configured RaftPayloadWrapper before
-// forwarding the payload to the inner ProposeAdmin path. The wrap
-// layer is NOT a barrier-exemption concern: it exists so that
-// every entry landing at `index > raftEnvelopeCutoverIndex` carries
-// an AEAD envelope the §6.3 strict-`>` apply hook can unwrap.
-// Admin entries (BootstrapEncryption, RotateDEK,
-// RegisterEncryptionWriter, etc.) committed after the cutover are
-// no different from user data in that regard — a cleartext admin
-// entry above cutover would halt the apply loop on unwrap-failure,
-// not be silently passed through.
-//
-// The lone exception is the EnableRaftEnvelope cutover marker
-// itself, which sits exactly at `index == cutover` and must remain
-// cleartext for strict-`>` dispatch to leave it alone. That marker
-// is proposed via a raw engine reference (adapter/encryption_admin.go
-// holds the engine directly as s.proposer), not via the
-// wrappedProposer — so this wrap path is never on its way.
-//
-// ProposeAdmin's only divergence from Propose lives in Stage
-// 6E-2d's §7.1 quiescence-barrier check, which is installed on
-// Propose only.
-func (p *wrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	wrapped, err := applyRaftPayloadWrap(p.wrap, data)
-	if err != nil {
-		return nil, err
-	}
-	res, err := p.inner.ProposeAdmin(ctx, wrapped)
-	if err != nil {
-		return nil, errors.Wrap(err, "kv: wrapped propose-admin")
-	}
-	return res, nil
-}
-
-// dynamicWrappedProposer is the Stage 6E-2c sibling of wrappedProposer
-// for the case where the wrap closure must be swappable at runtime.
+// dynamicWrappedProposer adapts a raftengine.Proposer so the wrap
+// closure can be swapped at runtime.
 // On every Propose / ProposeAdmin call it loads an atomic.Pointer to
 // the currently-active RaftPayloadWrapper; a nil pointer means wrap
 // is inactive (payload passes through verbatim).
 //
-// Why a separate type (vs adding a setter to wrappedProposer): the
-// existing wrappedProposer captures wrap at construction time and is
-// used by static call sites that never need to change wrap state.
 // The Stage 6E-2 cutover model needs runtime swap so the
 // EnableRaftEnvelope admin handler (Stage 6E-2d) can publish the
 // active wrap closure the instant the cutover entry commits, without
 // rebuilding the TransactionManager or stalling in-flight proposals.
-// Splitting the two keeps the static-wrap fast path branch-free and
-// keeps the dynamic path's atomic.Pointer.Load() cost confined to
-// the call sites that need it.
 //
-// The pointer is required to be non-nil; pass an atomic.Pointer that
-// stores nil to express "wrap inactive". This is so the call site
+// For dynamic wrapping, pass a non-nil atomic.Pointer that stores nil
+// to express "wrap inactive". This is so the call site
 // (typically a ShardGroup) owns the storage and the proposer just
 // reads.
 //
@@ -181,23 +106,20 @@ type dynamicWrappedProposer struct {
 // (the construction site is responsible for handing in a valid
 // proposer) and the constructor deliberately does not silently
 // degrade — passing nil to Propose / ProposeAdmin would NPE at
-// the first call site, which is the same fail-fast shape as the
-// sibling newWrappedProposer(nil, wrap) and matches CLAUDE.md's
+// the first call site. This matches CLAUDE.md's
 // "don't validate for scenarios that can't happen" policy at
 // internal boundaries.
 //
-// wrapPtr MAY be nil — that path returns inner verbatim, mirroring
-// newWrappedProposer(inner, nil)'s degraded shape so a wiring site
+// wrapPtr MAY be nil — that path returns inner verbatim, so a wiring site
 // that accidentally drops the pointer downgrades to a no-wrap
 // proposer rather than crashing the engine loop on first use. The
 // caller owns the storage lifetime of the pointer when non-nil.
 func newDynamicWrappedProposer(inner raftengine.Proposer, wrapPtr *atomic.Pointer[RaftPayloadWrapper]) raftengine.Proposer {
 	if wrapPtr == nil {
 		// Defensive degradation: passing a nil pointer would NPE
-		// on the first Propose. Treat as static no-wrap so callers
+		// on the first Propose. Treat as no-wrap so callers
 		// that pass nil by mistake see the Stage 3 default rather
-		// than crashing the engine loop. This matches
-		// newWrappedProposer(inner, nil) returning inner verbatim.
+		// than crashing the engine loop.
 		return inner
 	}
 	return &dynamicWrappedProposer{inner: inner, wrapPtr: wrapPtr}
@@ -392,10 +314,12 @@ func (p *dynamicWrappedProposer) EndCutoverBarrier() {
 	}
 }
 
-// ProposeAdmin mirrors Propose's wrap-applies semantics. See
-// wrappedProposer.ProposeAdmin for the design rationale (the wrap
-// layer is NOT a barrier exemption; the EnableRaftEnvelope cutover
-// marker bypasses wrap at the call site, not the method level).
+// ProposeAdmin applies the current RaftPayloadWrapper before forwarding
+// to inner.ProposeAdmin. It is exempt from the quiescence barrier, not
+// from wrapping: post-cutover admin entries must carry an AEAD envelope
+// for the §6.3 strict-> apply hook. The EnableRaftEnvelope cutover marker
+// itself must remain cleartext at index == cutover and bypasses this
+// proposer via the raw engine at the call site, not at the method level.
 func (p *dynamicWrappedProposer) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
 	wrapped, err := applyRaftPayloadWrap(p.currentWrap(), data)
 	if err != nil {
