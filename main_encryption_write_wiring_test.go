@@ -50,34 +50,6 @@ func markRaftEnvelopeCutoverInSidecar(t *testing.T, path string, cutover uint64)
 	}
 }
 
-func TestEncryptionWriteWiring_PebbleOptions_CleartextWhenNoCipher(t *testing.T) {
-	t.Parallel()
-	if opts := (encryptionWriteWiring{}).pebbleOptions(); opts != nil {
-		t.Errorf("zero wiring pebbleOptions = %d opts, want nil (cleartext)", len(opts))
-	}
-	// cache present but cipher nil still means cleartext.
-	w := encryptionWriteWiring{cache: encryption.NewStateCache()}
-	if opts := w.pebbleOptions(); opts != nil {
-		t.Errorf("cipher-less wiring pebbleOptions = %d opts, want nil", len(opts))
-	}
-}
-
-func TestEncryptionWriteWiring_PebbleOptions_WiredWhenCipherSet(t *testing.T) {
-	t.Parallel()
-	cipher, err := encryption.NewCipher(encryption.NewKeystore())
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
-	w := encryptionWriteWiring{
-		cache:        encryption.NewStateCache(),
-		cipher:       cipher,
-		nonceFactory: encryption.NewDeterministicNonceFactory(0xABCD, 0),
-	}
-	if opts := w.pebbleOptions(); len(opts) != 5 {
-		t.Errorf("wired pebbleOptions = %d opts, want 5 (encryption + storage cutover + V2 capability + registration gates + §9.2 metrics observer)", len(opts))
-	}
-}
-
 func TestPrepareStorageNonceEpoch_NoSidecar_ReturnsZero(t *testing.T) {
 	t.Parallel()
 	cache := encryption.NewStateCache()

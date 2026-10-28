@@ -506,19 +506,6 @@ func buildProcessStartRegistrationGate(
 	}, nil
 }
 
-// readWriterRegistryLastSeen returns the registry's last_seen_local_epoch
-// for (full_node_id, dek_id), or 0 when no row exists (treated as the
-// "propose" trigger per the 7a design §3.1). It builds a fresh registry
-// handle per call; hot/looping callers should build the handle once and
-// use registryLastSeen instead (claude review on PR #847).
-func readWriterRegistryLastSeen(st store.MVCCStore, dekID uint32, fullNodeID uint64) (uint16, error) {
-	reg, err := store.WriterRegistryFor(st)
-	if err != nil {
-		return 0, errors.Wrap(err, "writer registration: registry handle")
-	}
-	return registryLastSeen(reg, dekID, fullNodeID)
-}
-
 // registryLastSeen reads last_seen_local_epoch from an already-built
 // registry handle (no per-call WriterRegistryFor type-assert + alloc),
 // so the verifyRegistered retry loop can reuse one handle.
