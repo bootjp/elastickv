@@ -12,6 +12,14 @@ reports eight findings even though differential CI is green. The WP-1 and WP-3
 PRs must not be called fully accepted by treating differential lint as a full
 repository pass. This bounded maintenance slice removes that prerequisite gap.
 
+PR #1346 also exposed a validation-budget mismatch: the real-Raft migration
+acceptance failed its five-second native-snapshot wait after an acknowledged
+large write, although the enclosing write/snapshot phase already has a
+60-second context. Three isolated two-CPU race repetitions passed. That does
+not identify a production snapshot defect or prove which CI delay occurred;
+this slice must preserve the same four persisted-snapshot requirements while
+using the existing phase deadline consistently and improving failure details.
+
 The work is separate from the test-cleanup WPs, whose production edits are
 limited to removing orphaned code. It does not implement new filesystem
 behavior or supersede PR #1344's journal accounting investigation.
@@ -45,6 +53,13 @@ behavior or supersede PR #1344's journal accounting investigation.
    from `storeRecordAndSession` and audit every caller. They currently all pass
    nil. Keep the general `storeRecordAndSessionAtRoute` effects argument because
    publication uses it; do not change effect or OCC key order.
+7. `adapter/migration_quorum_partition_acceptance_test.go`: replace the separate
+   five-second wait with a context-bound coverage poll using the existing
+   60-second write/snapshot phase context. Require every actual member's
+   `LastSnapshotIndex` to cover the acknowledged write before any restart.
+   Do not enlarge the phase/test lifetime, change Raft settings, reduce payload
+   size, omit the learner, or substitute applied indexes for persisted native
+   snapshots. On failure report the target and observed member snapshot indexes.
 
 ## Invariants and Non-goals
 
@@ -70,6 +85,10 @@ behavior or supersede PR #1344's journal accounting investigation.
    boundaries/copying, and FUSE partial-capability/session/admission behavior.
 4. Inspect the caller audit and diff for preserved ordering before publishing.
    Latest-HEAD review and CI must pass before claiming the PR ready to merge.
+5. A focused wait regression must fail with the old five-second sub-budget and
+   pass when snapshot coverage arrives later within its phase context. Separate
+   cases must reject partial coverage, cancellation, and deadline expiration.
+   The real-Raft scenario and its restored-byte/evidence assertions still run.
 
 ## Rollout
 
