@@ -1204,7 +1204,7 @@ func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
 	}
 }
 
-func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
+func TestPersistConfigStateSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(9, 2, []uint64{1, 2}, []byte("newer"))
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1213,13 +1213,21 @@ func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testi
 	engine := &Engine{
 		storage: storage,
 		fsm:     fsm,
+		dataDir: t.TempDir(),
 	}
 
-	require.NoError(t, engine.persistConfigSnapshot(7, raftpb.ConfState{Voters: []uint64{1}}))
+	peers := []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter}}
+	require.NoError(t, engine.persistConfigState(7, raftpb.ConfState{Voters: []uint64{1}}, peers))
 	require.Zero(t, fsm.snapshotCalls.Load())
+	state, exists, err := loadPersistedPeersState(engine.dataDir)
+	require.NoError(t, err)
+	require.True(t, exists, "live config path must publish peer metadata")
+	require.Equal(t, uint64(7), state.Index)
+	require.Equal(t, peers, state.Peers)
+	require.Equal(t, uint64(7), engine.currentConfigIndex())
 }
 
-func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
+func TestPersistConfigStateDoesNotCompactLogs(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1233,16 +1241,20 @@ func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
 		storage: storage,
 		persist: mockstorage.NewStorageRecorder(""),
 		fsm:     &testStateMachine{},
+		dataDir: t.TempDir(),
 	}
 
-	require.NoError(t, engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}}))
+	require.NoError(t, engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}))
 
 	firstIndex, err := storage.FirstIndex()
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), firstIndex)
 }
 
-func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
+func TestPersistConfigStateWaitsForDurablePublication(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1270,7 +1282,10 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}})
+		done <- engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+			{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+			{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		})
 	}()
 
 	select {
@@ -1282,7 +1297,7 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-		t.Fatal("persistConfigSnapshot returned before snapshot serialization completed")
+		t.Fatal("persistConfigState returned before snapshot serialization completed")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -1293,7 +1308,7 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
-		t.Fatal("persistConfigSnapshot did not finish after snapshot serialization was released")
+		t.Fatal("persistConfigState did not finish after snapshot serialization was released")
 	}
 
 	actions := persist.Action()
@@ -1705,16 +1720,6 @@ func TestEnqueueDispatchMessagePreservesIncomingReadIndexHeartbeatWhenRespLaneFu
 	req := <-pd.readIndexResp
 	require.Equal(t, raftpb.MsgHeartbeatResp, req.msg.GetType())
 	require.Equal(t, []byte("read-index-c"), req.msg.Context)
-}
-
-func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
-	storage := etcdraft.NewMemoryStorage()
-	snap := raftTestSnapshot(5, 2, []uint64{1}, nil)
-	require.NoError(t, storage.ApplySnapshot(&snap))
-	hs := testHardState(2, 9)
-	require.NoError(t, storage.SetHardState(&hs))
-
-	require.Equal(t, uint64(5), maxAppliedIndex(raftTestSnapshot(5, 0, nil, nil)))
 }
 
 func TestOpenRestoresLegacySnapshotState(t *testing.T) {

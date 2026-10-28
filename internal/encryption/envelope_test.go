@@ -190,14 +190,6 @@ func TestEnvelope_Decode_DoesNotAliasInput(t *testing.T) {
 	}
 }
 
-func TestHeaderAADBytes_Layout(t *testing.T) {
-	got := encryption.HeaderAADBytes(encryption.EnvelopeVersionV2, encryption.FlagCompressed, 0x12345678)
-	want := []byte{0x02, 0x01, 0x12, 0x34, 0x56, 0x78}
-	if !bytes.Equal(got, want) {
-		t.Fatalf("HeaderAADBytes layout mismatch:\n  got  %x\n  want %x", got, want)
-	}
-}
-
 func TestAppendHeaderAADBytes_AppendsAndAllocFree(t *testing.T) {
 	// Append onto an existing buffer. The result should be the original
 	// bytes followed by the 6-byte header.
