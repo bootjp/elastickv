@@ -1,6 +1,6 @@
 # Test suite cleanup: redundant tests, live-path retargets, and shared test support
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-10-16
 
@@ -86,6 +86,27 @@ Problems 3 and 5 are fixed by the PR that adds this document (WP-0). The rest ar
 | WP-12 | root `.`, `cmd/**`, `proxy`, `store` | Migrate onto WP-8 helpers | WP-2, WP-6, WP-8 merged |
 
 WP-1 to WP-8 can run in parallel. WP-9 to WP-12 start once their dependencies merge, and can then run in parallel with each other.
+
+## Progress
+
+| WP | State |
+|---|---|
+| WP-0 | Landed with this document (#1277). |
+| WP-1 | Landed (#1345). |
+| WP-2 | Landed (#1292). |
+| WP-3 | Landed (follow-up PR after #1345). |
+| WP-4 | Landed (same PR as WP-3); see deviation 3. |
+| WP-5 | Landed (same PR as WP-3); see deviation 1. |
+| WP-6 | Landed (same PR as WP-3); see deviation 2. |
+| WP-7 | Landed (same PR as WP-3). |
+| WP-8 | Landed (#1288). |
+| WP-9 to WP-12 | Open. Their dependencies have all landed. |
+
+Deviations from the plan, found while implementing:
+
+1. **WP-5 retarget 1 (DynamoDB base-table hash-key mismatch) cannot be written.** `queryLeasePrefix` is only reached from `queryLeaseKey` with an empty `IndexName`, so `keySchemaForQuery` always returns `PrimaryKey` and the `keySchema.HashKey != schema.PrimaryKey.HashKey` branch is unreachable. A base-table key condition that does not pin the hash key fails `buildQueryCondition` and is classified as a skip. The duplicate test was deleted; removing the dead branch is a production change and is listed under Follow-ups.
+2. **WP-6 retarget 3 (pprof/metrics).** The live `PreparePprofServer`/`PrepareMetricsServer` moved to `internal/serverwiring`, whose own tests already pin the address-before-token validation. The root wrappers and their tests were deleted rather than retargeted.
+3. **WP-4 retarget 6 (EXEC dispatch timeout).** `redisDispatchTimeout` is a 30 s constant, so a blocking-store test would take 30 s or need a production change. The rewritten test records the deadline on the stream-deletion scan instead. The mutation named in the plan (`context.Background()` for the EXEC dispatch) survives because `txnContext.dispatchContext` bounds the commit context a second time. Removing that second bound (`dispatchContext` returning an unbounded context) fails the test.
 
 ---
 
@@ -593,6 +614,8 @@ Record each mutation in the PR as a row: file and line, the change, the test tha
 - **FUSE tests are mandatory in CI.** CI installs `fuse3` and sets `ELASTICKV_REQUIRE_FUSE=1`, so missing FUSE coverage fails instead of skipping (WP-0).
 
 ## Follow-ups (out of scope)
+
+- **Dead DynamoDB lease branch.** Remove the unreachable hash-key-mismatch branch in `queryLeasePrefix` (`adapter/dynamodb_lease.go`), or document why it is kept (deviation 1 above).
 
 - **Product bugs found by the audit.** Each needs its own PR with a failing test first.
   - SQS FIFO messages in one group sent within the same millisecond can be received out of order. The visibility key orders by `(visibleAtMillis, random messageID)`. `TestSQSServer_FifoGroupLockHoldsAcrossVisibilityExpiry` and `TestSQSServer_FifoSequenceNumberMonotonic` fail roughly 7/30 and 2/30 runs without `-race`.
