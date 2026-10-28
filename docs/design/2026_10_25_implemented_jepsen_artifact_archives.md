@@ -1,6 +1,6 @@
 # Jepsen artifact archives
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-10-25
 
@@ -24,9 +24,9 @@ consistency criterion, storage implementation, or timeout is relaxed.
 
 ## Milestones and validation
 
-- [ ] Add a regression covering colon-containing directories and preserved bytes.
-- [ ] Package all directly uploaded Jepsen store paths in both CI workflows.
-- [ ] Pass archive regression, actionlint, and encrypted/cleartext Jepsen CI.
+- [x] Add a regression covering colon-containing directories and preserved bytes (`scripts/test-archive-jepsen-store.sh`).
+- [x] Package all directly uploaded Jepsen store paths in both CI workflows (`scripts/archive-jepsen-store.sh` in `jepsen-test.yml` and `jepsen-test-scheduled.yml`).
+- [x] Pass archive regression, actionlint, and encrypted/cleartext Jepsen CI (Jepsen Test is green on `main`, e.g. run 40657220651).
 
 The earlier fixture change reproduces the original failure and passes all 294
 tests locally and in CI. This follow-up addresses the next failure revealed by

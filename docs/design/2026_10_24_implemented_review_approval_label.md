@@ -1,6 +1,6 @@
 # Review approval label
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-10-24
 
@@ -84,7 +84,7 @@ label preservation, and HEAD changes around label writes.
 - [x] Add the privileged updater and read-only event/test workflow.
 - [x] Include SHA-bound review results in Claude responses.
 - [x] Validate local regression tests and workflow syntax.
-- [ ] Merge to the default branch and verify a live reconciliation.
+- [x] Merge to the default branch (#1328) and verify a live reconciliation (the `Update review approval label` workflow runs successfully on `main`, e.g. run 40666978702).
 
 ## Validation and self-review
 
