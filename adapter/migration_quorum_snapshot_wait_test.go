@@ -55,13 +55,27 @@ func TestQuorumAcceptanceSnapshotWaitUsesPhaseBudget(t *testing.T) {
 
 func TestQuorumAcceptanceSnapshotWaitRejectsPartialCoverage(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
 	err := waitForQuorumAcceptanceSnapshots(ctx, 22, func() []uint64 {
+		cancel()
 		return []uint64{22, 22, 22, 21}
 	})
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.ErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, "target=22 snapshots=[22 22 22 21]")
+}
+
+func TestQuorumAcceptanceSnapshotWaitRejectsExpiredPhase(t *testing.T) {
+	t.Parallel()
+	ctx, cancel := context.WithDeadline(t.Context(), time.Time{})
+	defer cancel()
+	calls := 0
+	err := waitForQuorumAcceptanceSnapshots(ctx, 22, func() []uint64 {
+		calls++
+		return []uint64{22, 22, 22, 22}
+	})
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.Zero(t, calls)
 }
 
 func TestQuorumAcceptanceSnapshotWaitRejectsCanceledPhase(t *testing.T) {
@@ -79,10 +93,13 @@ func TestQuorumAcceptanceSnapshotWaitRejectsCanceledPhase(t *testing.T) {
 
 func TestQuorumAcceptanceSnapshotWaitRejectsEmptyCoverage(t *testing.T) {
 	t.Parallel()
-	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Millisecond)
+	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	err := waitForQuorumAcceptanceSnapshots(ctx, 22, func() []uint64 { return nil })
-	require.ErrorIs(t, err, context.DeadlineExceeded)
+	err := waitForQuorumAcceptanceSnapshots(ctx, 22, func() []uint64 {
+		cancel()
+		return nil
+	})
+	require.ErrorIs(t, err, context.Canceled)
 	require.ErrorContains(t, err, "target=22 snapshots=[]")
 }
 
