@@ -2,29 +2,23 @@ package kv
 
 import (
 	"context"
-	"net"
 	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
+	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/metadata"
 )
 
-type adminProposalLeaderView struct {
-	state raftengine.State
-	addr  string
-}
-
-func (v *adminProposalLeaderView) State() raftengine.State { return v.state }
-func (v *adminProposalLeaderView) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{ID: "leader", Address: v.addr}
-}
-func (v *adminProposalLeaderView) VerifyLeader(context.Context) error { return nil }
-func (v *adminProposalLeaderView) LinearizableRead(context.Context) (uint64, error) {
-	return 0, nil
+func adminProposalLeaderView(state raftengine.State, addr string) *raftenginetest.StaticLeaderView {
+	return &raftenginetest.StaticLeaderView{
+		StateValue:  state,
+		LeaderValue: raftengine.LeaderInfo{ID: "leader", Address: addr},
+	}
 }
 
 type recordingAdminProposer struct {
@@ -70,7 +64,7 @@ func TestLeaderAdminProposerUsesLocalVerifiedLeader(t *testing.T) {
 	t.Parallel()
 	local := &recordingAdminProposer{}
 	proposer := NewLeaderAdminProposer(
-		&adminProposalLeaderView{state: raftengine.StateLeader},
+		adminProposalLeaderView(raftengine.StateLeader, ""),
 		local,
 		&GRPCConnCache{},
 	)
@@ -84,23 +78,14 @@ func TestLeaderAdminProposerUsesLocalVerifiedLeader(t *testing.T) {
 
 func TestLeaderAdminProposerForwardsFollowerProposal(t *testing.T) {
 	t.Parallel()
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 	service := &forwardingAdminServer{}
-	server := grpc.NewServer()
-	pb.RegisterInternalServer(server, service)
-	go func() { _ = server.Serve(lis) }()
-	t.Cleanup(func() {
-		server.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(server *grpc.Server) { pb.RegisterInternalServer(server, service) })
 
 	cache := &GRPCConnCache{}
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	local := &recordingAdminProposer{}
 	proposer := NewLeaderAdminProposer(
-		&adminProposalLeaderView{state: raftengine.StateFollower, addr: lis.Addr().String()},
+		adminProposalLeaderView(raftengine.StateFollower, addr),
 		local,
 		cache,
 	)
@@ -115,27 +100,18 @@ func TestLeaderAdminProposerForwardsFollowerProposal(t *testing.T) {
 
 func TestLeaderAdminProposerForwardsBearerToken(t *testing.T) {
 	t.Parallel()
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 	service := &forwardingAdminServer{}
-	server := grpc.NewServer()
-	pb.RegisterInternalServer(server, service)
-	go func() { _ = server.Serve(lis) }()
-	t.Cleanup(func() {
-		server.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(server *grpc.Server) { pb.RegisterInternalServer(server, service) })
 
 	cache := &GRPCConnCache{}
 	t.Cleanup(func() { require.NoError(t, cache.Close()) })
 	proposer := NewLeaderAdminProposer(
-		&adminProposalLeaderView{state: raftengine.StateFollower, addr: lis.Addr().String()},
+		adminProposalLeaderView(raftengine.StateFollower, addr),
 		&recordingAdminProposer{},
 		cache,
 		WithLeaderAdminToken("s3cret"),
 	)
-	_, err = proposer.ProposeAdmin(context.Background(), []byte("pin"))
+	_, err := proposer.ProposeAdmin(context.Background(), []byte("pin"))
 	require.NoError(t, err)
 	service.mu.Lock()
 	require.Equal(t, []string{"Bearer s3cret"}, service.authorization)

@@ -710,8 +710,7 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testi
 	probe := &versionVisibleRawKVServer{
 		visible: map[string]bool{string(stagedKey): true},
 	}
-	addr, stop := startRawKVServer(t, probe)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, probe)
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
@@ -765,8 +764,7 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeBatchesFollowerChecks(t *testing.T
 	for _, key := range keys {
 		probe.visible[string(distribution.MigrationStagedDataKey(9, key))] = true
 	}
-	addr, stop := startRawKVServer(t, probe)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, probe)
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
@@ -1887,8 +1885,7 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 			Exists: true,
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
@@ -1900,7 +1897,7 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	st := NewShardStore(engine, map[uint64]*ShardGroup{
 		1: {
 			Store:  store.NewMVCCStore(),
-			Engine: &stubFollowerEngine{leaderAddr: addr},
+			Engine: newStubFollowerEngine(addr),
 		},
 	})
 	t.Cleanup(func() { _ = st.Close() })
@@ -2693,8 +2690,7 @@ func TestShardStoreProxyScanKeysAtUsesSelectedGroup(t *testing.T) {
 			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	engine := distribution.NewEngine()
@@ -2724,8 +2720,7 @@ func TestShardStoreProxyScanKeysAtCarriesStagedRouteBounds(t *testing.T) {
 			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	g := &ShardGroup{
@@ -2764,8 +2759,7 @@ func TestShardStoreProxyScanAtUsesSelectedGroup(t *testing.T) {
 			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	engine := distribution.NewEngine()
@@ -2799,8 +2793,7 @@ func TestShardStoreProxyForwardPageAdvancesFromRawPage(t *testing.T) {
 			},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	g := &ShardGroup{
@@ -3652,8 +3645,7 @@ func TestShardStoreScanAt_NilStartFanoutUsesExplicitGroupForProxy(t *testing.T) 
 
 	ctx := context.Background()
 	recorder := &recordingRawScanKVServer{}
-	addr, stop := startRawKVServer(t, recorder)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, recorder)
 
 	rawRouteEnd := fskeys.ChunkRouteKey(11, 22)
 	chunkRouteEnd := prefixScanEnd(rawRouteEnd)

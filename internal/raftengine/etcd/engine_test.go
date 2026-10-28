@@ -3,7 +3,6 @@ package etcd
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"io"
 	"net"
 	"path/filepath"
@@ -13,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
 	"github.com/bootjp/elastickv/internal/testutil"
 
 	internalutil "github.com/bootjp/elastickv/internal"
@@ -27,79 +27,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-type testStateMachine struct {
-	mu      sync.Mutex
-	applied [][]byte
-}
-
-func (s *testStateMachine) Apply(data []byte) any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.applied = append(s.applied, append([]byte(nil), data...))
-	return string(data)
-}
-
-func (s *testStateMachine) Applied() [][]byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([][]byte, len(s.applied))
-	for i, item := range s.applied {
-		out[i] = append([]byte(nil), item...)
-	}
-	return out
-}
-
-func (s *testStateMachine) Snapshot() (Snapshot, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var buf bytes.Buffer
-	count, err := uint32Len(len(s.applied))
-	if err != nil {
-		return nil, err
-	}
-	if err := binary.Write(&buf, binary.BigEndian, count); err != nil {
-		return nil, err
-	}
-	for _, item := range s.applied {
-		size, err := uint32Len(len(item))
-		if err != nil {
-			return nil, err
-		}
-		if err := binary.Write(&buf, binary.BigEndian, size); err != nil {
-			return nil, err
-		}
-		if _, err := buf.Write(item); err != nil {
-			return nil, err
-		}
-	}
-	return &testSnapshot{data: buf.Bytes()}, nil
-}
-
-func (s *testStateMachine) Restore(r io.Reader) error {
-	var count uint32
-	if err := binary.Read(r, binary.BigEndian, &count); err != nil {
-		return err
-	}
-
-	applied := make([][]byte, 0, count)
-	for range count {
-		var length uint32
-		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-			return err
-		}
-		item := make([]byte, length)
-		if _, err := io.ReadFull(r, item); err != nil {
-			return err
-		}
-		applied = append(applied, item)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.applied = applied
-	return nil
-}
+type testStateMachine = raftenginetest.TestStateMachine
 
 type testSnapshot struct {
 	data []byte
@@ -2279,7 +2207,10 @@ func waitForConfigSize(t *testing.T, engine *Engine, size int) {
 func mustEncodeSnapshotData(t *testing.T, applied [][]byte) []byte {
 	t.Helper()
 
-	fsm := &testStateMachine{applied: applied}
+	fsm := &testStateMachine{}
+	for _, item := range applied {
+		fsm.Apply(item)
+	}
 	snapshot, err := fsm.Snapshot()
 	require.NoError(t, err)
 	t.Cleanup(func() {

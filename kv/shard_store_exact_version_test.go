@@ -15,11 +15,10 @@ func TestShardStoreAuthoritativeExactVersionProxiesFollower(t *testing.T) {
 	server := &fakeRawKVServer{latestResp: &pb.RawLatestCommitTSResponse{
 		ExactVersionExists: true, ExactVersionSupported: true,
 	}}
-	address, stop := startRawKVServer(t, server)
-	t.Cleanup(stop)
+	address := startRawKVServer(t, server)
 	routes := distribution.NewEngine()
 	routes.UpdateRoute([]byte("a"), nil, 1)
-	follower := &stubFollowerEngine{leaderAddr: address}
+	follower := newStubFollowerEngine(address)
 	shards := NewShardStore(routes, map[uint64]*ShardGroup{
 		1: {Engine: follower, Store: store.NewMVCCStore()},
 	})

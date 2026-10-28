@@ -178,7 +178,7 @@ func TestShardedCoordinatorValidateReadKeysOnShard_UsesStagedVisibility(t *testi
 	readKey := []byte("k")
 	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, readKey), []byte("staged"), 20, 0))
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		1: {Engine: stubLeaderEngine{}, Store: st},
+		1: {Engine: newStubLeaderEngine(), Store: st},
 	}, 1, NewHLC(), nil)
 
 	err := coord.validateReadKeysOnShard(ctx, 1, [][]byte{readKey}, 10)
@@ -1407,27 +1407,6 @@ func (s *stubMVCCStore) MigrationTargetReadinessStates(_ context.Context) ([]sto
 	return s.readiness, nil
 }
 
-// noopEngine satisfies raftengine.Engine for unit tests.
-// LinearizableRead returns immediately (simulates an already-up-to-date FSM).
-type noopEngine struct{}
-
-func (noopEngine) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
-	return &raftengine.ProposalResult{}, nil
-}
-func (e noopEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	return e.Propose(ctx, data)
-}
-func (noopEngine) State() raftengine.State                            { return raftengine.StateLeader }
-func (noopEngine) Leader() raftengine.LeaderInfo                      { return raftengine.LeaderInfo{} }
-func (noopEngine) VerifyLeader(_ context.Context) error               { return nil }
-func (noopEngine) LinearizableRead(_ context.Context) (uint64, error) { return 0, nil }
-func (noopEngine) Status() raftengine.Status                          { return raftengine.Status{} }
-func (noopEngine) Configuration(_ context.Context) (raftengine.Configuration, error) {
-	return raftengine.Configuration{}, nil
-}
-func (noopEngine) SnapshotEvery() uint64 { return 10_000 }
-func (noopEngine) Close() error          { return nil }
-
 func TestValidateReadOnlyShards_DetectsConflictOnReadOnlyShard(t *testing.T) {
 	t.Parallel()
 	engine := distribution.NewEngine()
@@ -1439,7 +1418,7 @@ func TestValidateReadOnlyShards_DetectsConflictOnReadOnlyShard(t *testing.T) {
 	}}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1462,7 +1441,7 @@ func TestValidateReadOnlyShards_SkipsWriteShards(t *testing.T) {
 		"b": 20,
 	}}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		1: {Store: writeStore, Engine: noopEngine{}},
+		1: {Store: writeStore, Engine: newStubLeaderEngine()},
 		2: {},
 	}, 1, NewHLC(), nil)
 
@@ -1484,7 +1463,7 @@ func TestValidateReadOnlyShards_NoConflictWhenKeyUnchanged(t *testing.T) {
 	}}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1535,7 +1514,7 @@ func TestValidateReadOnlyShards_FailsClosedOnTargetReadiness(t *testing.T) {
 	}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1567,7 +1546,7 @@ func TestValidateReadOnlyShards_FailsClosedOnSourceReadFence(t *testing.T) {
 	}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	err := coord.validateReadOnlyShards(context.Background(), map[uint64][][]byte{
@@ -1619,7 +1598,7 @@ func TestValidateReadOnlyShards_ChecksStagedVisibilityLatestCommitTS(t *testing.
 	}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1639,7 +1618,7 @@ func TestValidateReadOnlyShards_PropagatesStoreError(t *testing.T) {
 	readOnlyStore := &stubMVCCStore{returnErr: storeErr}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{

@@ -14,35 +14,6 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// stubLeaderEngine reports State=Leader and a fixed Leader address. It is
-// the minimum surface Coordinate.Dispatch needs to take the local-dispatch
-// path (IsLeader() true) without engaging real raft machinery. Methods
-// beyond that surface return zero values / nil; Dispatch's retry loop
-// never calls them, and refreshLeaseAfterDispatch skips its LeaseProvider
-// branch because this stub does not implement that interface.
-type stubLeaderEngine struct{}
-
-func (stubLeaderEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
-	return &raftengine.ProposalResult{}, nil
-}
-func (e stubLeaderEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	return e.Propose(ctx, data)
-}
-func (stubLeaderEngine) State() raftengine.State { return raftengine.StateLeader }
-func (stubLeaderEngine) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"}
-}
-func (stubLeaderEngine) VerifyLeader(context.Context) error               { return nil }
-func (stubLeaderEngine) LinearizableRead(context.Context) (uint64, error) { return 0, nil }
-func (stubLeaderEngine) Status() raftengine.Status {
-	return raftengine.Status{State: raftengine.StateLeader}
-}
-func (stubLeaderEngine) Configuration(context.Context) (raftengine.Configuration, error) {
-	return raftengine.Configuration{}, nil
-}
-func (stubLeaderEngine) SnapshotEvery() uint64 { return 10_000 }
-func (stubLeaderEngine) Close() error          { return nil }
-
 // scriptedTransactional returns the error registered in errs for the
 // 0-indexed call that triggered Commit; calls without a registered
 // entry succeed. Using a map keyed by uint64 rather than a []error
@@ -134,13 +105,13 @@ func TestFinalDispatchErrPreservesUnknownOutcomeAfterRetryDeadline(t *testing.T)
 	require.ErrorContains(t, got, "forwarded commit response lost")
 }
 
-// newRetryCoordinate wires a Coordinate against stubLeaderEngine and the
+// newRetryCoordinate wires a Coordinate against newStubLeaderEngine and the
 // supplied scripted transaction manager. No engine registration happens,
 // so the caller does not need to call Close.
 func newRetryCoordinate(tx Transactional) *Coordinate {
 	return &Coordinate{
 		transactionManager: tx,
-		engine:             stubLeaderEngine{},
+		engine:             newStubLeaderEngine(),
 		clock:              NewHLC(),
 	}
 }
@@ -262,7 +233,7 @@ func TestCoordinateDispatch_CtxCancelDuringRetrySurfaces(t *testing.T) {
 	}
 	c := &Coordinate{
 		transactionManager: tx,
-		engine:             stubLeaderEngine{},
+		engine:             newStubLeaderEngine(),
 		clock:              NewHLC(),
 	}
 
