@@ -138,7 +138,7 @@ func TestPebbleStoreEncryptedSSTIngestSnapshotRoundTrip(t *testing.T) {
 	cipher, err := encryption.NewCipher(ks)
 	require.NoError(t, err)
 	encryptionOption := func(epoch uint16) PebbleStoreOption {
-		return WithEncryption(cipher, NewCounterNonceFactory(1, epoch), func() (uint32, bool) {
+		return WithEncryption(cipher, encryption.NewDeterministicNonceFactory(1, epoch), func() (uint32, bool) {
 			return keyID, true
 		})
 	}

@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
 	"github.com/bootjp/elastickv/kv"
@@ -87,23 +88,16 @@ func TestCheckEnvelopeCutoverDivergenceSnapshotPayload_SidecarZeroRefusesSnapsho
 // returns the sidecar path.
 func writeMinimalSidecar(t *testing.T, raftAppliedIdx uint64) string {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, encryption.SidecarFilename)
 	sc := &encryption.Sidecar{
 		Version:          encryption.SidecarVersion,
 		RaftAppliedIndex: raftAppliedIdx,
 		Keys:             map[string]encryption.SidecarKey{},
 	}
-	if err := encryption.WriteSidecar(path, sc); err != nil {
-		t.Fatalf("WriteSidecar: %v", err)
-	}
-	return path
+	return encryptiontest.WriteSidecar(t, sc)
 }
 
 func writeRaftCutoverSidecarForStartup(t *testing.T, activeRaft uint32, localEpoch uint16, cutover uint64) string {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, encryption.SidecarFilename)
 	sc := &encryption.Sidecar{
 		Version:                  encryption.SidecarVersion,
 		RaftAppliedIndex:         cutover,
@@ -124,16 +118,11 @@ func writeRaftCutoverSidecarForStartup(t *testing.T, activeRaft uint32, localEpo
 			},
 		},
 	}
-	if err := encryption.WriteSidecar(path, sc); err != nil {
-		t.Fatalf("WriteSidecar: %v", err)
-	}
-	return path
+	return encryptiontest.WriteSidecar(t, sc)
 }
 
 func writeActiveStorageSidecarForStartup(t *testing.T, localEpoch uint16) string {
 	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, encryption.SidecarFilename)
 	sc := &encryption.Sidecar{
 		Version:               encryption.SidecarVersion,
 		RaftAppliedIndex:      1,
@@ -148,10 +137,7 @@ func writeActiveStorageSidecarForStartup(t *testing.T, localEpoch uint16) string
 			},
 		},
 	}
-	if err := encryption.WriteSidecar(path, sc); err != nil {
-		t.Fatalf("WriteSidecar: %v", err)
-	}
-	return path
+	return encryptiontest.WriteSidecar(t, sc)
 }
 
 // TestCheckSidecarBehindRaftLog_DisabledNoop pins the

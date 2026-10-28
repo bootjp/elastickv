@@ -14,7 +14,7 @@ import (
 func encryptedRestoreStore(t *testing.T, cipher *encryption.Cipher, sst bool, nonceEpoch uint16) store.MVCCStore {
 	t.Helper()
 	st, err := store.NewPebbleStore(t.TempDir(), store.WithSSTIngestSnapshots(sst),
-		store.WithEncryption(cipher, store.NewCounterNonceFactory(1, nonceEpoch), func() (uint32, bool) { return 1, true }))
+		store.WithEncryption(cipher, encryption.NewDeterministicNonceFactory(1, nonceEpoch), func() (uint32, bool) { return 1, true }))
 	require.NoError(t, err)
 	t.Cleanup(func() { require.NoError(t, st.Close()) })
 	return st

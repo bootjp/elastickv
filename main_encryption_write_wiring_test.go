@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 )
 
 // wiringFakeKEK is a deterministic KEKUnwrapper for the write-wiring
@@ -21,8 +22,6 @@ func (wiringFakeKEK) Unwrap(wrapped []byte) ([]byte, error) {
 
 func writeActiveStorageSidecar(t *testing.T, storageEpoch uint16) string {
 	t.Helper()
-	dir := t.TempDir()
-	path := dir + "/keys.json"
 	sc := &encryption.Sidecar{
 		Version:               encryption.SidecarVersion,
 		StorageEnvelopeActive: true,
@@ -32,10 +31,7 @@ func writeActiveStorageSidecar(t *testing.T, storageEpoch uint16) string {
 			"4": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("raft-wrapped-bytes-diff"), LocalEpoch: 0},
 		},
 	}
-	if err := encryption.WriteSidecar(path, sc); err != nil {
-		t.Fatalf("WriteSidecar: %v", err)
-	}
-	return path
+	return encryptiontest.WriteSidecar(t, sc)
 }
 
 func markRaftEnvelopeCutoverInSidecar(t *testing.T, path string, cutover uint64) {

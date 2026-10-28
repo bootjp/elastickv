@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -25,7 +26,7 @@ func externalAliasSource(t *testing.T, format string, encrypted bool) (MVCCStore
 		ps, ok := fixture.mvcc.(*pebbleStore)
 		require.True(t, ok)
 		ps.sstIngestSnapshots = format == "sst"
-		return fixture.mvcc, []PebbleStoreOption{WithEncryption(fixture.cipher, NewCounterNonceFactory(0xABCD, 2),
+		return fixture.mvcc, []PebbleStoreOption{WithEncryption(fixture.cipher, encryption.NewDeterministicNonceFactory(0xABCD, 2),
 			func() (uint32, bool) { return fixture.keyID, true })}
 	}
 	if format == "mvcc" {

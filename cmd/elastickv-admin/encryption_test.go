@@ -4,13 +4,13 @@ import (
 	"bytes"
 	"context"
 	"net"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	pb "github.com/bootjp/elastickv/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -63,7 +63,7 @@ func TestRunEncryptionStatus_HelpFlagExitsZero(t *testing.T) {
 
 func TestRunEncryptionStatus_Bootstrapped(t *testing.T) {
 	t.Parallel()
-	path := writeStatusFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		RaftAppliedIndex:         9,
 		StorageEnvelopeActive:    true,
 		RaftEnvelopeCutoverIndex: 25,
@@ -780,16 +780,6 @@ func TestRunEncryptionRegisterWriter_HappyPath(t *testing.T) {
 		call.Writers[0].LocalEpoch != 21 {
 		t.Errorf("RegisterEncryptionWriter call=%+v does not match flag inputs", call)
 	}
-}
-
-func writeStatusFixture(t *testing.T, sc *encryption.Sidecar) string {
-	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := encryption.WriteSidecar(path, sc); err != nil {
-		t.Fatalf("WriteSidecar: %v", err)
-	}
-	return path
 }
 
 // startEncryptionAdminTestServer brings up a real gRPC server on a
