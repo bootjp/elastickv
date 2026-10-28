@@ -38,8 +38,9 @@
 (* (maybeAutoPinObservedRouteVersion); everything else (Redis MULTI/EXEC  *)
 (* with read keys, S3 / SQS / DynamoDB paths that supply StartTS, SQS     *)
 (* HT-FIFO partition keys) commits unpinned and skips verifyComposed1.    *)
-(* BeginTxn chooses either.  For an unpinned commit the model keeps only  *)
-(* the current-owner requirement, standing for the routing at dispatch    *)
+(* BeginTxn chooses either; AutoPin pins an unpinned txn at the Dispatch- *)
+(* time version.  For an unpinned commit the model keeps only the        *)
+(* current-owner requirement, standing for the routing at dispatch        *)
 (* plus the migration serving guard that rejects unpinned writes into     *)
 (* ranges with migration state (fsm_migration_serving.go,                 *)
 (* ErrRouteCutoverPending).  Composed-1 is therefore asserted for pinned  *)
@@ -181,6 +182,23 @@ BeginTxn(t, pinned) ==
                    txnCommitGroup, currentVersionAtCommit>>
 
 (***************************************************************************)
+(* AutoPin(t): ShardedCoordinator.maybeAutoPinObservedRouteVersion stamps  *)
+(* the engine's catalog version at Dispatch onto a request that has no    *)
+(* read keys, no caller-supplied StartTS and no partition-resolver key.   *)
+(* The unpinned txn becomes pinned at the version current at Dispatch,    *)
+(* which may be newer than the one it saw at BeginTxn.  Route changes can *)
+(* still land between this step and Commit (the Raft apply).              *)
+(***************************************************************************)
+AutoPin(t) ==
+    /\ txnState[t] = "Active"
+    /\ ~txnPinned[t]
+    /\ txnPinned'      = [txnPinned      EXCEPT ![t] = TRUE]
+    /\ txnObservedVer' = [txnObservedVer EXCEPT ![t] = catalogVersion]
+    /\ UNCHANGED <<catalogVersion, routes, tsCounter, txnState, txnStartTs,
+                   txnWriteSet, txnCommitTs, txnCommitGroup,
+                   currentVersionAtCommit, opCount>>
+
+(***************************************************************************)
 (* WriteIntent(t, k): buffer a write to k locally.  No lock or version is *)
 (* taken yet (this is the pre-prepare stage); the actual write+commit    *)
 (* happens atomically in Commit below.  Modelled simpler than M2 so the   *)
@@ -252,6 +270,7 @@ Abort(t) ==
 Next ==
     \/ \E k \in Keys, g \in Groups       : ProposeRouteChange(k, g)
     \/ \E t \in TxnIds, p \in BOOLEAN    : BeginTxn(t, p)
+    \/ \E t \in TxnIds                   : AutoPin(t)
     \/ \E t \in TxnIds, k \in Keys       : WriteIntent(t, k)
     \/ \E t \in TxnIds, g \in Groups     : Commit(t, g)
     \/ \E t \in TxnIds                   : Abort(t)

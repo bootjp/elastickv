@@ -565,15 +565,17 @@ The downloaded jar is checksum-pinned. No system-wide install required.
 (and push to `main`) that touches:
 
 - `tla/**` and `Makefile` (the spec and the harness themselves).
-- `kv/hlc*.go`, `kv/coordinator.go`, `kv/sharded_coordinator.go`,
-  `kv/transaction.go`, `kv/fsm.go`, `kv/lock_resolver.go` — the HLC
+- `kv/hlc*.go`, `kv/tso*.go`, `kv/coordinator.go`,
+  `kv/sharded_coordinator.go`, `kv/transaction.go`, `kv/fsm.go`,
+  `kv/fsm_migration_serving.go`, `kv/lock_resolver.go` — the HLC
   renewal scheduler, the timestamp-issuance dispatch path, and the
   OCC commit-ts assignment all live in these files (per Section 3
   anchors); a change here can violate HLC/OCC invariants and must
   re-run `tla-check`.
-- `store/mvcc_store.go`
+- `store/mvcc_store.go`, `store/lsm_store.go`, `adapter/ts.go`
 - `distribution/**`
-- `.github/workflows/tla-check.yml` (the workflow file itself).
+- `scripts/tla-check.sh` and `.github/workflows/tla-check.yml` (the
+  harness and the workflow file itself).
 
 The workflow uses Temurin JDK 21, caches `.cache/tla/tla2tools.jar`
 keyed on the Makefile hash so version-pin changes invalidate the cache
@@ -751,10 +753,10 @@ extra expected-PASS configs.
 | Module | Was | Now | Configs |
 |---|---|---|---|
 | HLC | `BecomeLeader` Observes `maxAppliedHLC` (strategy (c)); the fence was a toggle; logical overflow could issue `ceiling + 1`; leader-only issuance | `IssueTimestamp` is `NextFenced` (no fence before the first ceiling, fail closed at `wall >= ceiling` or when the next value's physical half exceeds the ceiling); no election-time handoff; `IssuanceMode` selects TSO (allocation-floor handoff), legacy `Coordinate` (leader-only, no handoff) or legacy `ShardedCoordinator` (any node stamps) | `MCHLC.cfg` (TSO, pass); `MCHLC_gap.cfg` (TSO without the floor, HLC-4); `MCHLC_legacy_single_gap.cfg` (HLC-4); `MCHLC_legacy_sharded_gap.cfg` (HLC-3, G10) |
-| OCC | Fresh `start_ts`; no read-set validation (snapshot isolation); atomic commit | `start_ts` = applied watermark for reading transactions, fresh for write-only ones; one-phase Allocate / Apply with the commit-ts fence, lock check and read + write validation; 2PC with commit-ts settled before PREPARE, PREPARE validating read and write keys, COMMIT without fence or revalidation; raw writes; new `OCC8_NoWriteSkew` | `MCOCC.cfg` (OCC-1/2/4/5, pass); `MCOCC_onephase.cfg` (single shard, one Raft group, every invariant incl. OCC-3 / OCC-8, pass); `MCOCC_gap.cfg` (OCC-1); `MCOCC_g0_gap.cfg` (OCC-3, G0); `MCOCC_g1_gap.cfg` (OCC-8, G1); `MCOCC_live.cfg` |
+| OCC | Fresh `start_ts`; no read-set validation (snapshot isolation); atomic commit | `start_ts` = applied watermark for reading transactions, fresh for write-only ones; one-phase Allocate / Apply with the commit-ts fence, lock check and read + write validation; 2PC with commit-ts settled before PREPARE, PREPARE validating read and write keys, COMMIT without fence or revalidation; raw writes; new `OCC8_NoWriteSkew` | `MCOCC.cfg` (OCC-1/2/4/5, pass); `MCOCC_onephase.cfg` (single shard, one Raft group, every invariant incl. OCC-3 / OCC-8, pass); `MCOCC_gap.cfg` (OCC-1); `MCOCC_g0_gap.cfg` (OCC-3, G0); `MCOCC_g1_gap.cfg` (OCC-8, G1); `MCOCC_emptystore_gap.cfg` (OCC-3b: an empty-store start is MaxUint64, read-latest); `MCOCC_live.cfg` |
 | MVCC | Atomic `Compact` keeping `>= newMin` plus the newest `< newMin`; unique timestamps assumed | Resumable compaction (pending watermark, per-key prune, finish) keeping `> minTS` plus the newest `<= minTS`; reads below the effective watermark fail closed; `UniqueTs = FALSE` admits a colliding write, which the raw apply path writes over the existing version; new `MVCC5_AckedWriteNotOverwritten` | `MCMVCC.cfg` (pass); `MCMVCC_gap.cfg` (MVCC-4); `MCMVCC_collision_gap.cfg` (MVCC-5, G10) |
 | Routes | Comments claimed the watcher always reads the head snapshot | Comments describe the bounded delta batches of `SyncOnce` and stale-delta rejection; the actions were already general enough | unchanged |
-| Composed | Every transaction pins its catalog version; Composed-2 justified by "SplitRange is same-group only" | `BeginTxn` chooses pinned or unpinned (`ObservedRouteVersion` absent, so `verifyComposed1` short-circuits); Composed-1 asserted for pinned transactions only; Composed-2 documented as not modelled, since cross-group migration has shipped | unchanged |
+| Composed | Every transaction pins its catalog version; Composed-2 justified by "SplitRange is same-group only" | `BeginTxn` chooses pinned or unpinned (`ObservedRouteVersion` absent, so `verifyComposed1` short-circuits), and `AutoPin` pins at the Dispatch-time version (`maybeAutoPinObservedRouteVersion`); Composed-1 asserted for pinned transactions only; Composed-2 documented as not modelled, since cross-group migration has shipped | unchanged |
 
 Known abstractions that remain: one PREPARE step per transaction rather
 than per shard, COMMIT drains every lock at once (no asynchronous

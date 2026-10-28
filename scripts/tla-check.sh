@@ -36,8 +36,8 @@ TLA_MODULES=( "hlc" "occ" "mvcc" "routes" "composed" )
 # independently — composed has two (Composed-1 observed-version
 # guard via EnableSafety, Composed-1a current-version fence via
 # EnableCurrentFence) — or when a config pins a known implementation
-# gap (hlc legacy modes, occ G0 / G1, mvcc timestamp collisions; see
-# the header of each .cfg).
+# gap (hlc legacy modes, occ G0 / G1 / empty-store start, mvcc
+# timestamp collisions; see the header of each .cfg).
 #
 # The expected-invariant string is matched against TLC stdout via
 # grep -F (literal), so a parse error / deadlock / JVM crash /
@@ -54,6 +54,7 @@ gap_configs_for() {
             printf '_gap|Invariant OCC1_CommitTsAboveStart is violated\n'
             printf '_g0_gap|Invariant OCC3_ReadSnapshotStability is violated\n'
             printf '_g1_gap|Invariant OCC8_NoWriteSkew is violated\n'
+            printf '_emptystore_gap|Invariant OCC3b_EmptyStoreReadStability is violated\n'
             ;;
         mvcc)
             printf '_gap|Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated\n'

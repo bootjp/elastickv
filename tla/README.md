@@ -152,7 +152,8 @@ Invariants asserted:
 
 ### `occ/OCC.tla`
 The OCC layer at the FSM / store level.  Reading transactions start
-at the applied commit watermark (`adapter/ts.go snapshotTS`);
+at the applied commit watermark (`adapter/ts.go snapshotTS`; MaxUint64,
+modelled as `MaxTs`, on an empty store);
 write-only ones get a fresh `start_ts`.  Single-shard transactions
 take the one-phase path: `AllocateOnePhase` picks `commit_ts`, and
 `ApplyOnePhase` later applies it (in any order) only if
@@ -178,6 +179,7 @@ Invariants asserted:
 | `OCC3_ReadSnapshotStability` | Every read observation of a live txn still equals `LatestVisible(k, start_ts(t))` — fails on `main` through 2PC (G0) |
 | `OCC4_NoStrandedLockAtQuiescence` | When all txns are in a terminal state, no lock remains |
 | `OCC5_StartTsConsistency` | Every read observation is bounded by the txn's `start_ts` (= `read_ts` by OCC-5) |
+| `OCC3b_EmptyStoreReadStability` | OCC-3 for txns that started on an empty store (start_ts = MaxUint64) — fails on `main`: they read the latest version |
 | `OCC8_NoWriteSkew` | No two committed txns have rw-antidependencies in both directions — fails on `main` through a one-phase commit in a 2PC PREPARE / COMMIT window (G1) |
 | `OCC5_Action` (PROPERTY) | Transition form: `start_ts[t]` is assigned once at `BeginTxn` and never updated |
 | `CommitTsAssignedOnce` (PROPERTY) | Transition form: `commit_ts[t]` is assigned once at `Commit` and never updated |
@@ -191,6 +193,7 @@ Invariants asserted:
 | `MCOCC_gap.cfg` | `EnableSafety = FALSE` | FAIL on `OCC1_CommitTsAboveStart` (depth ≈ 5) |
 | `MCOCC_g0_gap.cfg` | full model (known gap G0) | FAIL on `OCC3_ReadSnapshotStability` (depth 9: 2PC allocates, a raw write raises the watermark, a reader reads, the 2PC commits below its snapshot) |
 | `MCOCC_g1_gap.cfg` | full model (known gap G1) | FAIL on `OCC8_NoWriteSkew` (a one-phase commit applies between the other txn's PREPARE and COMMIT) |
+| `MCOCC_emptystore_gap.cfg` | single-shard path (known gap: an empty-store start is MaxUint64) | FAIL on `OCC3b_EmptyStoreReadStability` |
 | `MCOCC_live.cfg` | `SpecLive`, OCC-L1 | PASS |
 
 ### `mvcc/MVCC.tla`
@@ -297,7 +300,8 @@ two safety properties that no single-module spec can express:
   the Routes catalog snapshot the txn read at `BeginTxn`.  Unpinned
   txns (read keys, caller-supplied `StartTS`, partition-resolver keys)
   skip `verifyComposed1`; the model keeps only the current-owner
-  requirement for them.
+  requirement for them.  `AutoPin` pins an unpinned txn at the
+  Dispatch-time catalog version (`maybeAutoPinObservedRouteVersion`).
 - **Composed-1a** — strictly stronger apply-time fence: every
   committed write key was owned by the committing group at the
   CURRENT catalog version observed by the FSM at apply time

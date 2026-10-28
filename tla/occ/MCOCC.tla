@@ -11,6 +11,8 @@
 (*   MCOCC_g0_gap.cfg   — known gap G0 (TLC fails on                       *)
 (*                        OCC3_ReadSnapshotStability)                      *)
 (*   MCOCC_g1_gap.cfg   — known gap G1 (TLC fails on OCC8_NoWriteSkew)     *)
+(*   MCOCC_emptystore_gap.cfg — known gap: empty-store start is MaxUint64  *)
+(*                        (TLC fails on OCC3b_EmptyStoreReadStability)     *)
 (*   MCOCC_live.cfg     — OCC-L1 liveness under SpecLive (TLC passes)      *)
 (*                                                                         *)
 (* Run via `make tla-check` from the repository root.                      *)

@@ -37,9 +37,12 @@
 (*          snapshot lands after the read).                                *)
 (*   OCC-8  no write skew (no rw-antidependency cycle) — violated by a     *)
 (*          one-phase commit in a 2PC PREPARE / COMMIT window (G1).        *)
+(*   OCC-3b snapshot-read stability for a txn that started on an empty     *)
+(*          store, whose start_ts is MaxUint64 — violated: it reads the    *)
+(*          latest version.                                                *)
 (*                                                                         *)
 (* With EnableTwoPhase = FALSE (single-shard transactions only) OCC-1..   *)
-(* OCC-5 and OCC-8 all hold.                                               *)
+(* OCC-5 and OCC-8 all hold (OCC-3b does not).                             *)
 (*                                                                         *)
 (* One watermark: the model is one Raft group.  With several groups the   *)
 (* one-phase fence compares commit_ts against the applying group's own   *)
@@ -161,9 +164,10 @@ Init ==
 
 (***************************************************************************)
 (* BeginTxn: an adapter transaction pins start_ts to the applied commit   *)
-(* watermark (adapter/ts.go snapshotTS).  No timestamp is allocated.  The *)
-(* implementation maps an empty store (watermark 0) to MaxUint64; the     *)
-(* model keeps 0, which reads nothing either way.                          *)
+(* watermark (adapter/ts.go snapshotTS).  No timestamp is allocated.  On *)
+(* an empty store (watermark 0) snapshotTS returns MaxUint64, modelled as  *)
+(* MaxTs: such a txn reads the latest version, which is not a snapshot,   *)
+(* and can never commit a write (commit_ts > start_ts is impossible).      *)
 (*                                                                         *)
 (* OCC-5 is structurally satisfied: every later op on this txn reads     *)
 (* startTs[t] directly — there is no separate read_ts variable.          *)
@@ -172,7 +176,7 @@ BeginTxn(t) ==
     /\ txnState[t] = "Idle"
     /\ txnState'     = [txnState     EXCEPT ![t] = "Active"]
     /\ snapshotRead' = [snapshotRead EXCEPT ![t] = TRUE]
-    /\ startTs'      = [startTs      EXCEPT ![t] = watermark]
+    /\ startTs'      = [startTs      EXCEPT ![t] = IF watermark = 0 THEN MaxTs ELSE watermark]
     /\ UNCHANGED <<tsCounter, watermark, commitTs, writeSet, readSet,
                    readObs, lockMap, versions, opCount>>
 
@@ -445,9 +449,22 @@ OCC2_NoWriteWriteConflict ==
 \* on main through the 2PC path (audit G0): COMMIT applies a commit_ts
 \* settled before PREPARE, with no watermark fence, below the snapshot
 \* of a reader that already read the key.
+\*
+\* Restricted to txns that started on a non-empty store: an empty-store
+\* start is MaxUint64 (read latest), which OCC3b covers separately.
+ReadStable(t) ==
+    \A k \in readSet[t] : readObs[t][k] = LatestVisible(k, startTs[t])
+
 OCC3_ReadSnapshotStability ==
-    \A t \in LiveTxns, k \in Keys :
-        k \in readSet[t] => readObs[t][k] = LatestVisible(k, startTs[t])
+    \A t \in LiveTxns : startTs[t] # MaxTs => ReadStable(t)
+
+\* OCC-3b — the same stability for txns that started on an empty store
+\* (snapshotTS → MaxUint64).  Violated on main: such a txn reads the
+\* latest version, so a write applied after its read becomes visible at
+\* its start_ts.  It can never commit a write, so the exposure is torn
+\* reads in read-only work against an empty store.
+OCC3b_EmptyStoreReadStability ==
+    \A t \in LiveTxns : startTs[t] = MaxTs => ReadStable(t)
 
 \* OCC-4 — no stranded lock at quiescence.  Bounded safety form: in any
 \* state where every txn is Idle / Committed / Aborted, no lock remains.
