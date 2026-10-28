@@ -2774,14 +2774,19 @@ func (s *Service) openHandleExpiresNsec(now time.Time) int64 {
 	return now.Add(s.openLeaseTTL).UnixNano()
 }
 
-// readTS returns the snapshot timestamp for a read: the local applied
-// watermark, raised to the fence's leader-side commit timestamp when the
-// fence reports one. Lease and linearizable fences return Raft indexes, not
-// commit timestamps, so only the all-groups timestamp fence can raise it.
+// readTS returns the leader-fenced snapshot timestamp when available. A
+// follower's local applied watermark can run ahead of the leader that serves
+// its routed reads. Taking the maximum would let a read at that timestamp
+// miss an in-flight write with the same commit timestamp, so OCC could accept
+// a stale read-modify-write. Older fences report only Raft indexes and still
+// use the local applied watermark.
 func (s *Service) readTS(ctx context.Context) (uint64, error) {
 	fenceTS, err := s.fenceReadSnapshot(ctx)
 	if err != nil {
 		return 0, err
+	}
+	if _, ok := s.dispatch.(allGroupsLeaseTimestampReader); ok {
+		return fenceTS, nil
 	}
 	return max(s.store.LastCommitTS(), fenceTS), nil
 }
