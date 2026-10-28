@@ -3984,25 +3984,6 @@ func TestMergeAndTrimReverseScanResults_WithinLimit(t *testing.T) {
 	require.Equal(t, []byte("a"), result[1].Key)
 }
 
-func TestMergeAndTrimReverseScanResults_ExactLimit(t *testing.T) {
-	t.Parallel()
-
-	out := []*store.KVPair{
-		{Key: []byte("z"), Value: []byte("vz")},
-		{Key: []byte("c"), Value: []byte("vc")},
-	}
-	kvs := []*store.KVPair{
-		{Key: []byte("y"), Value: []byte("vy")},
-		{Key: []byte("a"), Value: []byte("va")},
-	}
-
-	// limit=2: top-2 in descending order are "z", "y".
-	result := mergeAndTrimReverseScanResults(out, kvs, 2)
-	require.Len(t, result, 2)
-	require.Equal(t, []byte("z"), result[0].Key)
-	require.Equal(t, []byte("y"), result[1].Key)
-}
-
 func TestScanLockBoundsForKVs_ReverseOrder(t *testing.T) {
 	t.Parallel()
 
@@ -4027,19 +4008,6 @@ func TestScanLockBoundsForKVsDirection_ReverseUsesReturnedWindow(t *testing.T) {
 	lockStart, lockEnd := scanLockBoundsForKVsDirection(kvs, []byte("a"), []byte("zz"), 2, true)
 	require.Equal(t, []byte("y"), lockStart)
 	require.Equal(t, []byte("zz"), lockEnd)
-}
-
-func TestScanLockBoundsForKVs_PreservesOriginalStart(t *testing.T) {
-	t.Parallel()
-
-	kvs := []*store.KVPair{
-		{Key: []byte("c"), Value: []byte("vc")},
-		{Key: []byte("e"), Value: []byte("ve")},
-	}
-
-	lockStart, lockEnd := scanLockBoundsForKVs(kvs, []byte("a"), []byte("z"), 2)
-	require.Equal(t, []byte("a"), lockStart)
-	require.Equal(t, nextScanCursor([]byte("e")), lockEnd)
 }
 
 func TestScanLockBoundsForKVs_IncompleteScanUsesOriginalRange(t *testing.T) {

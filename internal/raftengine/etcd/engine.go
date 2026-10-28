@@ -1082,7 +1082,7 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 // contract for the full exempt set).
 //
 // The barrier exemption is the SOLE divergence from Propose: a
-// higher-layer wrap (kv.wrappedProposer) applies its wrap closure
+// higher-layer wrap (kv.dynamicWrappedProposer) applies its wrap closure
 // to both methods identically, so admin entries landing above the
 // raft-envelope cutover still carry the AEAD envelope the §6.3
 // strict-`>` apply hook expects. Only the cutover marker itself is

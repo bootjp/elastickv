@@ -288,15 +288,27 @@ func TestLockResolver_LeaderOnlyExecution(t *testing.T) {
 
 	startTS := uint64(40)
 	prepareLock(t, groups[1], startTS, []byte("a"), []byte("a"), []byte("v"), 0)
+	encodedLock, err := st.GetAt(context.Background(), txnLockKey([]byte("a")), ^uint64(0))
+	require.NoError(t, err, "fixture must start with a pending lock")
+	lock, err := decodeTxnLock(encodedLock)
+	require.NoError(t, err)
+	// A zero requested TTL selects the default; explicitly expire the fixture.
+	lock.TTLExpireAt = 1
+	require.NoError(t, st.PutAt(context.Background(), txnLockKey([]byte("a")), encodeTxnLock(lock), startTS, 0))
+	require.True(t, txnLockExpired(lock))
 
 	// Manually call resolveAllGroups — the group's raft is leader so it runs.
 	ctx := context.Background()
+	requireLockResolverGroupReady(t, groups[1])
 	lr.resolveAllGroups(ctx)
 
-	// The lock was expired and primary is pending — the resolver will attempt
-	// to abort. After resolveAllGroups, the key should either be cleaned up
-	// or the resolver logged a warning. Either way, no panic/error from the
-	// resolver itself.
+	_, err = st.GetAt(ctx, txnLockKey([]byte("a")), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "expired lock must be removed")
+	encoded, err := st.GetAt(ctx, txnRollbackKey([]byte("a"), startTS), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, encodeTxnRollbackRecord(), encoded)
+	_, err = ss.GetAt(ctx, []byte("a"), ^uint64(0))
+	require.ErrorIs(t, err, store.ErrKeyNotFound, "aborted intent must not become user data")
 }
 
 func TestLockResolver_CloseStopsBackground(t *testing.T) {

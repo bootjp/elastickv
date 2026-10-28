@@ -16,10 +16,9 @@ import (
 
 // fakeProposer records every Propose / ProposeAdmin call so the
 // wrapper tests can inspect both (a) what bytes the engine would
-// have seen, and (b) which method routed there — so a test that
-// expects wrappedProposer.ProposeAdmin to bypass the wrap layer
-// can assert against adminCalls / adminLast independently of
-// (Propose) calls / last.
+// have seen, and (b) which method routed there. Tests can assert
+// that ProposeAdmin applies wrapping while preserving admin routing
+// independently of user Propose calls.
 type fakeProposer struct {
 	calls      atomic.Int32
 	last       []byte
@@ -78,99 +77,14 @@ func TestApplyRaftPayloadWrap_PropagatesError(t *testing.T) {
 	}
 }
 
-// TestWrappedProposer_ProposeAdminAppliesWrap pins the invariant
-// codex P1 round-1 surfaced: admin entries that land at
-// `index > raftEnvelopeCutoverIndex` (any post-cutover
-// BootstrapEncryption / RotateDEK / RegisterEncryptionWriter
-// committed during normal operation) MUST be wrapped, else the
-// §6.3 strict-`>` apply hook will try to AEAD-decrypt cleartext
-// bytes and halt apply on integrity failure.
-//
-// ProposeAdmin's only divergence from Propose is the future §7.1
-// quiescence-barrier exemption Stage 6E-2d installs on Propose
-// only — wrap behaviour is identical between the two paths. The
-// lone admin entry that must remain cleartext is the
-// EnableRaftEnvelope cutover marker itself (at index == cutover),
-// and that one is handled by routing it through the raw engine
-// reference instead of wrappedProposer, NOT by a method-level
-// wrap bypass.
-//
-// This test pins the corrected behaviour. The earlier round-1
-// shape (wrap-bypass on ProposeAdmin) is gone; an attempt to
-// reintroduce it must visibly fail here.
-func TestWrappedProposer_ProposeAdminAppliesWrap(t *testing.T) {
-	t.Parallel()
-	var wrapCalls atomic.Int32
-	wrap := func(p []byte) ([]byte, error) {
-		wrapCalls.Add(1)
-		out := make([]byte, len(p)+1)
-		out[0] = 'W'
-		copy(out[1:], p)
-		return out, nil
-	}
-	inner := &fakeProposer{}
-	wp := newWrappedProposer(inner, wrap)
-	plain := []byte("post-cutover-admin")
-	if _, err := wp.ProposeAdmin(context.Background(), plain); err != nil {
-		t.Fatalf("ProposeAdmin: %v", err)
-	}
-	if got := wrapCalls.Load(); got != 1 {
-		t.Fatalf("wrap closure ran %d times under ProposeAdmin; want 1 — admin path must apply wrap so post-cutover admin entries survive strict-> unwrap", got)
-	}
-	if got := inner.adminCalls.Load(); got != 1 {
-		t.Fatalf("inner.ProposeAdmin call count = %d, want 1 — admin path must still route through inner.ProposeAdmin so 6E-2d's barrier exemption survives", got)
-	}
-	if got := inner.calls.Load(); got != 0 {
-		t.Fatalf("inner.Propose called %d times under ProposeAdmin; want 0 — admin path must not silently fall back to the non-exempt method", got)
-	}
-	want := append([]byte{'W'}, plain...)
-	if !bytes.Equal(inner.adminLast, want) {
-		t.Fatalf("inner.ProposeAdmin saw %q, want %q (wrapper output)", inner.adminLast, want)
-	}
-}
-
-func TestNewWrappedProposer_NilWrapperReturnsInnerVerbatim(t *testing.T) {
-	t.Parallel()
-	inner := &fakeProposer{}
-	got := newWrappedProposer(inner, nil)
-	// Stage 3 default: identical pointer; no allocation.
-	if got != raftengine.Proposer(inner) {
-		t.Fatal("nil wrapper: newWrappedProposer should return the inner proposer verbatim")
-	}
-}
-
-func TestWrappedProposer_InvokesWrapperOncePerCall(t *testing.T) {
-	t.Parallel()
-	var wrapCalls atomic.Int32
-	wrap := func(p []byte) ([]byte, error) {
-		wrapCalls.Add(1)
-		out := make([]byte, len(p)+1)
-		out[0] = 'W'
-		copy(out[1:], p)
-		return out, nil
-	}
-	inner := &fakeProposer{}
-	wp := newWrappedProposer(inner, wrap)
-	if _, err := wp.Propose(context.Background(), []byte("payload")); err != nil {
-		t.Fatalf("Propose: %v", err)
-	}
-	if got := wrapCalls.Load(); got != 1 {
-		t.Fatalf("wrapper call count = %d, want 1", got)
-	}
-	if got := inner.calls.Load(); got != 1 {
-		t.Fatalf("inner.Propose call count = %d, want 1", got)
-	}
-	want := append([]byte{'W'}, []byte("payload")...)
-	if !bytes.Equal(inner.last, want) {
-		t.Fatalf("inner saw %q, want %q (wrapper output)", inner.last, want)
-	}
-}
-
-func TestWrappedProposer_PropagatesWrapperError(t *testing.T) {
+func TestDynamicWrappedProposer_PropagatesWrapperError(t *testing.T) {
 	t.Parallel()
 	sentinel := errors.New("wrapper denied")
 	inner := &fakeProposer{}
-	wp := newWrappedProposer(inner, func([]byte) ([]byte, error) { return nil, sentinel })
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	var wrap RaftPayloadWrapper = func([]byte) ([]byte, error) { return nil, sentinel }
+	wrapPtr.Store(&wrap)
+	wp := newDynamicWrappedProposer(inner, &wrapPtr)
 	_, err := wp.Propose(context.Background(), []byte("x"))
 	if !errors.Is(err, sentinel) {
 		t.Fatalf("expected sentinel, got %v", err)
@@ -180,14 +94,14 @@ func TestWrappedProposer_PropagatesWrapperError(t *testing.T) {
 	}
 }
 
-// TestWrappedProposer_RoundTripWithRealCipher exercises the seam end-
+// TestDynamicWrappedProposer_RoundTripWithRealCipher exercises the seam end-
 // to-end: wrap with a real raft envelope, the inner proposer
 // observes the encrypted bytes, and a hand-rolled Unwrap recovers
 // the original plaintext (the engine-side hook from
 // internal/raftengine/etcd is unit-tested separately; this test
 // proves the coordinator's wrap output is shape-compatible with
 // what the engine expects).
-func TestWrappedProposer_RoundTripWithRealCipher(t *testing.T) {
+func TestDynamicWrappedProposer_RoundTripWithRealCipher(t *testing.T) {
 	t.Parallel()
 	ks := encryption.NewKeystore()
 	dek := make([]byte, encryption.KeySize)
@@ -203,7 +117,8 @@ func TestWrappedProposer_RoundTripWithRealCipher(t *testing.T) {
 		t.Fatalf("NewCipher: %v", err)
 	}
 
-	wrap := func(p []byte) ([]byte, error) {
+	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	var wrap RaftPayloadWrapper = func(p []byte) ([]byte, error) {
 		nonce := make([]byte, encryption.NonceSize)
 		if _, err := rand.Read(nonce); err != nil {
 			return nil, err
@@ -211,7 +126,8 @@ func TestWrappedProposer_RoundTripWithRealCipher(t *testing.T) {
 		return encryption.WrapRaftPayload(c, kid, nonce, p)
 	}
 	inner := &fakeProposer{}
-	wp := newWrappedProposer(inner, wrap)
+	wrapPtr.Store(&wrap)
+	wp := newDynamicWrappedProposer(inner, &wrapPtr)
 
 	plaintext := []byte("op=put key=k1 v=secret")
 	if _, err := wp.Propose(context.Background(), plaintext); err != nil {
@@ -230,8 +146,7 @@ func TestWrappedProposer_RoundTripWithRealCipher(t *testing.T) {
 // defensive degradation in newDynamicWrappedProposer: if a caller
 // accidentally passes a nil *atomic.Pointer, the wrapper falls back
 // to the inner proposer rather than NPE on the first Propose call.
-// This matches newWrappedProposer(inner, nil)'s shape and keeps a
-// misconfigured wiring from crashing the engine loop.
+// This keeps misconfigured wiring from crashing the engine loop.
 func TestDynamicWrappedProposer_NilPointerReturnsInnerVerbatim(t *testing.T) {
 	t.Parallel()
 	inner := &fakeProposer{}
@@ -293,7 +208,9 @@ func TestDynamicWrappedProposer_LoadsCurrentWrapEveryCall(t *testing.T) {
 	}
 
 	// Install a wrap mid-flight; the next call must see it.
+	var wrapCalls atomic.Int32
 	var wrap RaftPayloadWrapper = func(p []byte) ([]byte, error) {
+		wrapCalls.Add(1)
 		out := make([]byte, len(p)+1)
 		out[0] = 'W'
 		copy(out[1:], p)
@@ -307,6 +224,12 @@ func TestDynamicWrappedProposer_LoadsCurrentWrapEveryCall(t *testing.T) {
 	want := append([]byte{'W'}, []byte("second")...)
 	if !bytes.Equal(inner.last, want) {
 		t.Fatalf("second call: inner saw %q, want %q (wrapped)", inner.last, want)
+	}
+	if got := wrapCalls.Load(); got != 1 {
+		t.Fatalf("wrapper call count = %d, want 1", got)
+	}
+	if got := inner.calls.Load(); got != 2 {
+		t.Fatalf("inner.Propose call count = %d, want 2", got)
 	}
 
 	// Clear the wrap; the next call must see it gone.
@@ -446,10 +369,15 @@ func (e *recordingEngineForShardGroup) ProposeAdmin(ctx context.Context, data []
 // §6.3 strict-`>` apply hook expects. The cutover marker itself
 // bypasses this proposer at the call site (raw engine reference),
 // not at this layer.
+//
+// P1 round-1 regression: bypassing wrapping in ProposeAdmin lets
+// post-cutover cleartext admin entries halt apply on integrity failure.
 func TestDynamicWrappedProposer_ProposeAdminAppliesCurrentWrap(t *testing.T) {
 	t.Parallel()
 	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
+	var wrapCalls atomic.Int32
 	var wrap RaftPayloadWrapper = func(p []byte) ([]byte, error) {
+		wrapCalls.Add(1)
 		out := make([]byte, len(p)+1)
 		out[0] = 'A'
 		copy(out[1:], p)
@@ -462,6 +390,9 @@ func TestDynamicWrappedProposer_ProposeAdminAppliesCurrentWrap(t *testing.T) {
 
 	if _, err := wp.ProposeAdmin(context.Background(), []byte("admin-payload")); err != nil {
 		t.Fatalf("ProposeAdmin: %v", err)
+	}
+	if got := wrapCalls.Load(); got != 1 {
+		t.Fatalf("wrapper call count = %d, want 1", got)
 	}
 	if got := inner.adminCalls.Load(); got != 1 {
 		t.Fatalf("inner.ProposeAdmin calls = %d, want 1", got)

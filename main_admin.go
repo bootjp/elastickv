@@ -199,7 +199,7 @@ func newAdminLeaderProbe(coordinate kv.Coordinator) admin.LeaderProbe {
 		// VerifyLeader receives the request ctx (PR #748): a Caddy probe
 		// or browser preflight that sets its own deadline now bounds the
 		// ReadIndex round-trip, instead of falling back to
-		// verifyLeaderEngine's no-arg 5s safety net (#745). The 5s bound
+		// verifyLeaderEngineCtx's deadline-less 5s safety net (#745). The 5s bound
 		// remains as defense-in-depth for callers without an upstream
 		// ctx (lock resolver, HLC lease tick).
 		return coordinate.VerifyLeader(ctx) == nil
