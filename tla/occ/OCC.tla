@@ -368,16 +368,48 @@ Commit(t) ==
                    readSet, readObs, opCount>>
 
 (***************************************************************************)
-(* Abort: the client gives up before proposing, or the coordinator / lock *)
-(* resolver rolls back a 2PC transaction.  Releases all locks of t.       *)
-(* A proposed one-phase entry is settled by the FSM, not by Abort.        *)
+(* Abort: three ways a transaction ends without committing.               *)
+(*                                                                         *)
+(*   - CancelTxn: the client gives up, or the coordinator stops after      *)
+(*     settling commit_ts but before any PREPARE applied.  Nothing is     *)
+(*     persisted (abortPreparedTxn returns early with no prepared group). *)
+(*   - AbortPrepared: the coordinator rolls back its PREPAREs at a fresh  *)
+(*     timestamp above max(start_ts, commit_ts) (abortTimestamp).         *)
+(*   - ResolverAbort: the lock resolver rolls back a lock whose primary   *)
+(*     is rolled back or expired at abortTSFrom(start_ts, 0) =            *)
+(*     start_ts + 1, a timestamp nothing allocated.                        *)
+(*                                                                         *)
+(* The two rollbacks persist cleanup through ApplyMutationsRaftAt at the  *)
+(* abort timestamp (handleAbortRequest), which raises the group's         *)
+(* LastCommitTS to at least that value.  A proposed one-phase entry is    *)
+(* settled by the FSM, not by Abort.                                       *)
 (***************************************************************************)
-Abort(t) ==
-    /\ txnState[t] \in {"Active", "Allocated", "Prepared"}
+CancelTxn(t) ==
+    /\ txnState[t] \in {"Active", "Allocated"}
+    /\ txnState' = [txnState EXCEPT ![t] = "Aborted"]
+    /\ UNCHANGED <<tsCounter, watermark, snapshotRead, startTs, commitTs,
+                   writeSet, readSet, readObs, lockMap, versions, opCount>>
+
+PersistRollback(t, abortTs) ==
     /\ txnState' = [txnState EXCEPT ![t] = "Aborted"]
     /\ lockMap'  = ReleaseLocks(t)
-    /\ UNCHANGED <<tsCounter, watermark, snapshotRead, startTs, commitTs,
-                   writeSet, readSet, readObs, versions, opCount>>
+    /\ watermark' = RaiseWatermark(writeSet[t], abortTs)
+
+AbortPrepared(t) ==
+    /\ txnState[t] = "Prepared"
+    /\ tsCounter < MaxTs
+    /\ tsCounter' = tsCounter + 1
+    /\ PersistRollback(t, tsCounter + 1)
+    /\ UNCHANGED <<snapshotRead, startTs, commitTs, writeSet, readSet,
+                   readObs, versions, opCount>>
+
+ResolverAbort(t) ==
+    /\ txnState[t] = "Prepared"
+    /\ PersistRollback(t, startTs[t] + 1)
+    /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs, writeSet,
+                   readSet, readObs, versions, opCount>>
+
+Abort(t) == CancelTxn(t) \/ AbortPrepared(t) \/ ResolverAbort(t)
 
 (***************************************************************************)
 (* LockResolve is intentionally NOT a separate action.                     *)
