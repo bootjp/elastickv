@@ -51,6 +51,8 @@ type recordingAppliedIndexFSM struct {
 	failErr  error
 }
 
+var _ raftengine.AppliedIndexWriter = (*recordingAppliedIndexFSM)(nil)
+
 func (f *recordingAppliedIndexFSM) Apply(_ []byte) any          { return nil }
 func (f *recordingAppliedIndexFSM) Snapshot() (Snapshot, error) { return nil, io.EOF }
 func (f *recordingAppliedIndexFSM) Restore(_ io.Reader) error   { return nil }
@@ -335,16 +337,6 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *te
 	require.Equal(t, map[uint64]int{10: 1}, e.protectedReceivedFSMSnaps)
 	require.Empty(t, e.pendingReceivedFSMSnapshotStep)
 	require.FileExists(t, fsmSnapPath(fsmSnapDir, 10))
-}
-
-// TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
-// adjacent assertion: the recording FSM MUST satisfy the writer
-// seam so the engine hook actually fires for it.
-func TestRecordingFSM_SatisfiesAppliedIndexWriter(t *testing.T) {
-	rec := &applyIndexOrderRecorder{}
-	var f any = &recordingAppliedIndexFSM{rec: rec}
-	_, ok := f.(raftengine.AppliedIndexWriter)
-	require.True(t, ok, "recordingAppliedIndexFSM must implement raftengine.AppliedIndexWriter")
 }
 
 // TestPersistCreatedSnapshot_BumpsAppliedIndex exercises Site 1 of

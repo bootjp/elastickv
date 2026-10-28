@@ -3419,27 +3419,6 @@ func applyUpdatedPeerToMap(peers map[uint64]Peer, peer Peer, ok bool) {
 	}
 }
 
-func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState) error {
-	// Fast path (lock-free): avoid unnecessary FSM snapshot when config is already current.
-	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
-		return err
-	} else if upToDate {
-		return nil
-	}
-
-	e.snapshotMu.Lock()
-	defer e.snapshotMu.Unlock()
-
-	payload, err := e.snapshotPayloadLocked(index)
-	if err != nil {
-		if snapshotDeferred(err, "config snapshot", index) {
-			return nil
-		}
-		return err
-	}
-	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
-}
-
 func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, peers []Peer) error {
 	// Config changes are committed in strictly increasing raft index order. Use
 	// the cached durable config index to avoid re-reading peer metadata from
