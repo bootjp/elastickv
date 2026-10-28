@@ -12,30 +12,15 @@ import (
 // fakeGroupRoutableCoordinator is a minimal Coordinator that also
 // implements GroupRoutableCoordinator, mapping each key to a caller-
 // supplied group ID. Only the methods LeaseReadGroupKeys exercises are
-// implemented; the rest panic to catch unexpected use.
+// implemented; the embedded nil Coordinator panics on any other use.
 type fakeGroupRoutableCoordinator struct {
+	Coordinator
 	groupByKey map[string]uint64
 }
 
 func (f *fakeGroupRoutableCoordinator) EngineGroupIDForKey(key []byte) uint64 {
 	return f.groupByKey[string(key)]
 }
-
-func (f *fakeGroupRoutableCoordinator) Dispatch(context.Context, *OperationGroup[OP]) (*CoordinateResponse, error) {
-	panic("unused")
-}
-func (f *fakeGroupRoutableCoordinator) IsLeader() bool                     { panic("unused") }
-func (f *fakeGroupRoutableCoordinator) VerifyLeader(context.Context) error { panic("unused") }
-func (f *fakeGroupRoutableCoordinator) RaftLeader() string                 { panic("unused") }
-func (f *fakeGroupRoutableCoordinator) IsLeaderForKey([]byte) bool         { panic("unused") }
-func (f *fakeGroupRoutableCoordinator) VerifyLeaderForKey(context.Context, []byte) error {
-	panic("unused")
-}
-func (f *fakeGroupRoutableCoordinator) RaftLeaderForKey([]byte) string { panic("unused") }
-func (f *fakeGroupRoutableCoordinator) LinearizableRead(context.Context) (uint64, error) {
-	panic("unused")
-}
-func (f *fakeGroupRoutableCoordinator) Clock() *HLC { panic("unused") }
 
 var _ Coordinator = (*fakeGroupRoutableCoordinator)(nil)
 var _ GroupRoutableCoordinator = (*fakeGroupRoutableCoordinator)(nil)

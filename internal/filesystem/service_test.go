@@ -3,7 +3,6 @@ package filesystem
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"fmt"
 	"math"
 	"sync"
@@ -12,6 +11,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc/codes"
@@ -25,8 +25,28 @@ const (
 	testChunkSize uint64 = 4
 )
 
+// testCoordinator applies groups to st through kvtest.LocalCoordinator with
+// fstest.MemoryDispatcher's policy: commit at max(store+1, requested,
+// StartTS+1), OCC on every group, commit-timestamp patching, and no prefix
+// deletes.
 type testCoordinator struct {
-	st store.MVCCStore
+	st    store.MVCCStore
+	once  sync.Once
+	local *kvtest.LocalCoordinator
+}
+
+func (c *testCoordinator) coordinator() *kvtest.LocalCoordinator {
+	c.once.Do(func() {
+		c.local = kvtest.NewLocalCoordinator(c.st, kvtest.LocalOptions{
+			DelPrefix:        kvtest.PrefixReject,
+			CommitTimestamp:  kvtest.TimestampStoreIncrement,
+			AdvanceCommitTS:  true,
+			OCC:              kvtest.OCCAllGroups,
+			ValidateReadKeys: true,
+			PatchCommitTS:    true,
+		})
+	})
+	return c.local
 }
 
 type rootRaceCoordinator struct {
@@ -57,53 +77,15 @@ func (c *rootRaceCoordinator) Dispatch(
 	return resp, err
 }
 
-func (c *testCoordinator) LinearizableRead(context.Context) (uint64, error) {
-	return c.st.LastCommitTS(), nil
+func (c *testCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
+	return c.coordinator().LinearizableRead(ctx)
 }
 
 func (c *testCoordinator) Dispatch(
 	ctx context.Context,
 	req *kv.OperationGroup[kv.OP],
 ) (*kv.CoordinateResponse, error) {
-	commitTS := c.st.LastCommitTS() + 1
-	if req.CommitTS > commitTS {
-		commitTS = req.CommitTS
-	}
-	if req.IsTxn && commitTS <= req.StartTS {
-		commitTS = req.StartTS + 1
-	}
-	mutations := make([]*store.KVPairMutation, 0, len(req.Elems))
-	for _, elem := range req.Elems {
-		mutation, err := testMutation(elem, commitTS)
-		if err != nil {
-			return nil, err
-		}
-		mutations = append(mutations, mutation)
-	}
-	if err := c.st.ApplyMutations(ctx, mutations, req.ReadKeys, req.StartTS, commitTS); err != nil {
-		return nil, err
-	}
-	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
-}
-
-func testMutation(elem *kv.Elem[kv.OP], commitTS uint64) (*store.KVPairMutation, error) {
-	value := append([]byte(nil), elem.Value...)
-	if elem.CommitTSValueOffset != 0 {
-		if len(value) < 8 || elem.CommitTSValueOffset > uint64(len(value)-8) {
-			return nil, ErrInvalid
-		}
-		binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:], commitTS)
-	}
-	switch elem.Op {
-	case kv.Put:
-		return &store.KVPairMutation{Op: store.OpTypePut, Key: append([]byte(nil), elem.Key...), Value: value}, nil
-	case kv.Del:
-		return &store.KVPairMutation{Op: store.OpTypeDelete, Key: append([]byte(nil), elem.Key...)}, nil
-	case kv.DelPrefix:
-		return nil, store.ErrUnknownOp
-	default:
-		return nil, store.ErrUnknownOp
-	}
+	return c.coordinator().Dispatch(ctx, req)
 }
 
 type recordingCoordinator struct {

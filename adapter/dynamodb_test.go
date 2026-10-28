@@ -371,7 +371,7 @@ func postDynamoRaw(t *testing.T, address, target, body string) (int, string) {
 func wrapDynamoCoordinator(t *testing.T, node *Node) *testCoordinatorWrapper {
 	t.Helper()
 	orig := node.dynamoServer.coordinator
-	wrapped := &testCoordinatorWrapper{inner: orig}
+	wrapped := &testCoordinatorWrapper{Coordinator: orig}
 	node.dynamoServer.coordinator = wrapped
 	t.Cleanup(func() {
 		node.dynamoServer.coordinator = orig
@@ -1762,7 +1762,7 @@ func TestDynamoDB_TransactWriteItems_RetriesOnWriteConflict(t *testing.T) {
 	require.NoError(t, err)
 
 	orig := nodes[0].dynamoServer.coordinator
-	wrapped := &testCoordinatorWrapper{inner: orig}
+	wrapped := &testCoordinatorWrapper{Coordinator: orig}
 	wrapped.failTxnDispatches.Store(1)
 	nodes[0].dynamoServer.coordinator = wrapped
 	defer func() {
@@ -1850,7 +1850,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 
 	orig := nodes[0].dynamoServer.coordinator
 	wrapped := &testCoordinatorWrapper{
-		inner:        orig,
+		Coordinator:  orig,
 		blockEntered: make(chan struct{}),
 		blockRelease: make(chan struct{}),
 	}
@@ -1940,7 +1940,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 var errInjectedLeaseRead = errors.New("injected lease-read failure")
 
 type testCoordinatorWrapper struct {
-	inner kv.Coordinator
+	kv.Coordinator
 
 	failTxnDispatches atomic.Int32
 	injectedFailures  atomic.Int32
@@ -1994,7 +1994,7 @@ func (w *testCoordinatorWrapper) leaseCallCounts() (keyless, keyed int) {
 // EngineGroupIDForKey forwards group resolution so LeaseReadGroupKeys can
 // dedup by group through the wrapper.
 func (w *testCoordinatorWrapper) EngineGroupIDForKey(key []byte) uint64 {
-	if gr, ok := w.inner.(kv.GroupRoutableCoordinator); ok {
+	if gr, ok := w.Coordinator.(kv.GroupRoutableCoordinator); ok {
 		return gr.EngineGroupIDForKey(key)
 	}
 	return 0
@@ -2020,39 +2020,7 @@ func (w *testCoordinatorWrapper) Dispatch(ctx context.Context, reqs *kv.Operatio
 			}
 		}
 	}
-	return w.inner.Dispatch(ctx, reqs)
-}
-
-func (w *testCoordinatorWrapper) IsLeader() bool {
-	return w.inner.IsLeader()
-}
-
-func (w *testCoordinatorWrapper) VerifyLeader(ctx context.Context) error {
-	return w.inner.VerifyLeader(ctx)
-}
-
-func (w *testCoordinatorWrapper) RaftLeader() string {
-	return w.inner.RaftLeader()
-}
-
-func (w *testCoordinatorWrapper) IsLeaderForKey(key []byte) bool {
-	return w.inner.IsLeaderForKey(key)
-}
-
-func (w *testCoordinatorWrapper) VerifyLeaderForKey(ctx context.Context, key []byte) error {
-	return w.inner.VerifyLeaderForKey(ctx, key)
-}
-
-func (w *testCoordinatorWrapper) RaftLeaderForKey(key []byte) string {
-	return w.inner.RaftLeaderForKey(key)
-}
-
-func (w *testCoordinatorWrapper) Clock() *kv.HLC {
-	return w.inner.Clock()
-}
-
-func (w *testCoordinatorWrapper) LinearizableRead(ctx context.Context) (uint64, error) {
-	return w.inner.LinearizableRead(ctx)
+	return w.Coordinator.Dispatch(ctx, reqs)
 }
 
 func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) {
@@ -2062,7 +2030,7 @@ func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) 
 	if w.failLeaseReads.Load() {
 		return 0, errInjectedLeaseRead
 	}
-	return kv.LeaseReadThrough(w.inner, ctx)
+	return kv.LeaseReadThrough(w.Coordinator, ctx)
 }
 
 func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
@@ -2073,5 +2041,5 @@ func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte
 	if w.failLeaseReads.Load() {
 		return 0, errInjectedLeaseRead
 	}
-	return kv.LeaseReadForKeyThrough(w.inner, ctx, key)
+	return kv.LeaseReadForKeyThrough(w.Coordinator, ctx, key)
 }
