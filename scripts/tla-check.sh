@@ -7,8 +7,11 @@
 #   MC<MODULE>.cfg       — the correct-design config (expected PASS)
 #   MC<MODULE>_gap.cfg   — the preconditions-disabled config (expected
 #                          FAIL with a SPECIFIC invariant counterexample,
-#                          checked by string match against
-#                          TLA_<MODULE>_GAP_INVARIANT below)
+#                          checked by string match, see gap_configs_for)
+#   MC<MODULE>_*_gap.cfg — further expected-FAIL configs: other guards,
+#                          or known implementation gaps pinned so that a
+#                          fix surfaces as "unexpectedly passed"
+#   MC<MODULE>_*.cfg     — further expected-PASS configs (pass_configs_for)
 #
 # Adding a new module (M3..M5): append to TLA_MODULES, drop the per-
 # module gap-invariant string into the case statement, and `make
@@ -32,7 +35,9 @@ TLA_MODULES=( "hlc" "occ" "mvcc" "routes" "composed" )
 # may register more than one gap if multiple safety guards toggle
 # independently — composed has two (Composed-1 observed-version
 # guard via EnableSafety, Composed-1a current-version fence via
-# EnableCurrentFence).
+# EnableCurrentFence) — or when a config pins a known implementation
+# gap (hlc legacy modes, occ G0 / G1, mvcc timestamp collisions; see
+# the header of each .cfg).
 #
 # The expected-invariant string is matched against TLC stdout via
 # grep -F (literal), so a parse error / deadlock / JVM crash /
@@ -40,9 +45,20 @@ TLA_MODULES=( "hlc" "occ" "mvcc" "routes" "composed" )
 # expected counterexample (codex P2 on PR #856 round 2).
 gap_configs_for() {
     case "$1" in
-        hlc)      printf '_gap|Invariant HLC4_NoRegressionAcrossTerms is violated\n' ;;
-        occ)      printf '_gap|Invariant OCC1_CommitTsAboveStart is violated\n' ;;
-        mvcc)     printf '_gap|Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated\n' ;;
+        hlc)
+            printf '_gap|Invariant HLC4_NoRegressionAcrossTerms is violated\n'
+            printf '_legacy_single_gap|Invariant HLC4_NoRegressionAcrossTerms is violated\n'
+            printf '_legacy_sharded_gap|Invariant HLC3_LeaderOnly is violated\n'
+            ;;
+        occ)
+            printf '_gap|Invariant OCC1_CommitTsAboveStart is violated\n'
+            printf '_g0_gap|Invariant OCC3_ReadSnapshotStability is violated\n'
+            printf '_g1_gap|Invariant OCC8_NoWriteSkew is violated\n'
+            ;;
+        mvcc)
+            printf '_gap|Invariant MVCC4_NoLostCommitOnSnapshotInstall is violated\n'
+            printf '_collision_gap|Invariant MVCC5_AckedWriteNotOverwritten is violated\n'
+            ;;
         routes)   printf '_gap|Invariant Routes4_NoEngineRegression is violated\n' ;;
         composed)
             printf '_gap|Invariant Composed1_CommitToOwningGroup is violated\n'
@@ -50,6 +66,22 @@ gap_configs_for() {
             ;;
         *)
             echo "ERROR: no gap-config list registered for module '$1'." \
+                "Add a case to scripts/tla-check.sh." >&2
+            exit 64
+            ;;
+    esac
+}
+
+# Per-module additional safety configurations that must PASS, beside
+# MC<MODULE>.cfg.  Returns one "<cfg-stem>" line per config; empty
+# output means none.  occ checks the single-shard path on its own
+# because the full model (with 2PC) pins known OCC-3 / OCC-8 gaps.
+pass_configs_for() {
+    case "$1" in
+        occ) printf '_onephase\n' ;;
+        hlc|mvcc|routes|composed) ;;
+        *)
+            echo "ERROR: no pass-config list registered for module '$1'." \
                 "Add a case to scripts/tla-check.sh." >&2
             exit 64
             ;;
@@ -150,6 +182,28 @@ for module in "${TLA_MODULES[@]}"; do
     fi
     echo
 
+    if ! pass_list="$(pass_configs_for "$module")"; then
+        echo "ERROR: pass_configs_for failed for module '${module}' — see error above." >&2
+        overall_rc=1
+        continue
+    fi
+    if [ -n "$pass_list" ]; then
+        while IFS= read -r pass_stem; do
+            [ -z "$pass_stem" ] && continue
+            pass_cfg="${mc}${pass_stem}.cfg"
+            echo "================================================================"
+            echo "  TLC: tla/${module}/${pass_cfg}  (expected PASS)"
+            echo "================================================================"
+            if ! run_tlc "$module" "$pass_cfg"; then
+                echo
+                echo "ERROR: ${pass_cfg} did not pass — see TLC output above." >&2
+                overall_rc=1
+                continue
+            fi
+            echo
+        done <<< "$pass_list"
+    fi
+
     # Iterate every gap config registered for this module.  Each is a
     # `<cfg-stem>|<invariant-string>` line; modules with one gap have
     # one entry, modules with multiple guards (composed) have more.
@@ -172,7 +226,7 @@ for module in "${TLA_MODULES[@]}"; do
         fi
         gap_cfg="${mc}${gap_stem}.cfg"
         echo "================================================================"
-        echo "  TLC: tla/${module}/${gap_cfg}  (no preconditions, expected FAIL on ${gap_inv})"
+        echo "  TLC: tla/${module}/${gap_cfg}  (expected FAIL on ${gap_inv})"
         echo "================================================================"
         # Capture stdout+stderr so we can validate both the exit code AND the
         # specific invariant string.  Without the string match, a parse
@@ -184,10 +238,11 @@ for module in "${TLA_MODULES[@]}"; do
         if [ "$gap_rc" -eq 0 ]; then
             echo
             echo "ERROR: ${gap_cfg} unexpectedly passed." >&2
-            echo "  The gap configuration disables the safety guard; TLC was" >&2
-            echo "  supposed to surface a counterexample.  A clean pass means" >&2
-            echo "  either the spec no longer encodes the gap correctly or the" >&2
-            echo "  safety guards leaked past the EnableSafety toggle." >&2
+            echo "  The gap configuration disables a safety guard or models a" >&2
+            echo "  known implementation gap; TLC was supposed to surface a" >&2
+            echo "  counterexample.  A clean pass means the spec no longer" >&2
+            echo "  encodes the gap, a guard leaked past its toggle, or the" >&2
+            echo "  implementation gap was fixed and the model must follow." >&2
             overall_rc=1
             continue
         fi

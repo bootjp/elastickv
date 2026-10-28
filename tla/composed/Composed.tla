@@ -21,13 +21,29 @@
 (*               distinctness, but Composed-3 itself is not the gap       *)
 (*               invariant — Composed-1 is.                                *)
 (*                                                                         *)
-(*   Composed-2  Read-after-write across SplitRange is vacuously true     *)
-(*               in this M5 abstraction because the implementation's      *)
-(*               SplitRange is same-group only (per CLAUDE.md).  We       *)
-(*               still model cross-group route changes via                *)
-(*               `ProposeRouteChange` so Composed-1 is non-trivial;       *)
-(*               the cross-group migration clause in Composed-2 is a     *)
-(*               forward-looking guard rail.                              *)
+(*   Composed-2  Read-after-write across a route change.  NOT modelled:  *)
+(*               cross-group range migration has shipped                  *)
+(*               (docs/design/2026_06_11_implemented_hotspot_split_       *)
+(*               milestone2_migration.md, distribution/migrator.go), so   *)
+(*               the clause is reachable in the implementation, but this  *)
+(*               module has no data plane (versions, staged visibility,   *)
+(*               migration copy) to state it against.  The invariant is   *)
+(*               kept as TRUE only so the name stays in the harness       *)
+(*               output; it proves nothing.                                *)
+(*                                                                         *)
+(* Pinning.  Only transactions that carry ObservedRouteVersion get the    *)
+(* FSM owner checks (kv/fsm.go verifyComposed1).  The coordinator         *)
+(* auto-pins at Dispatch only when the request has no read keys, no       *)
+(* caller-supplied StartTS and no partition-resolver key                  *)
+(* (maybeAutoPinObservedRouteVersion); everything else (Redis MULTI/EXEC  *)
+(* with read keys, S3 / SQS / DynamoDB paths that supply StartTS, SQS     *)
+(* HT-FIFO partition keys) commits unpinned and skips verifyComposed1.    *)
+(* BeginTxn chooses either.  For an unpinned commit the model keeps only  *)
+(* the current-owner requirement, standing for the routing at dispatch    *)
+(* plus the migration serving guard that rejects unpinned writes into     *)
+(* ranges with migration state (fsm_migration_serving.go,                 *)
+(* ErrRouteCutoverPending).  Composed-1 is therefore asserted for pinned  *)
+(* transactions only; Composed-1a for all.                                 *)
 (*                                                                         *)
 (* The `EnableSafety` CONSTANT gates the Commit-time owning-group check  *)
 (* — under it the committing group must equal the owning group at the    *)
@@ -80,6 +96,8 @@ VARIABLES
     txnStartTs,             \* [TxnIds -> 0..MaxTs]
     txnObservedVer,         \* [TxnIds -> 0..MaxVersions].  Catalog version this
                             \* txn read at BeginTxn.
+    txnPinned,              \* [TxnIds -> BOOLEAN].  TRUE iff the request
+                            \* carries ObservedRouteVersion.
     txnWriteSet,            \* [TxnIds -> SUBSET Keys]
     txnCommitTs,            \* [TxnIds -> 0..MaxTs]
     txnCommitGroup,         \* [TxnIds -> Groups \cup {NoGroup}]
@@ -95,7 +113,7 @@ VARIABLES
     opCount
 
 vars == <<catalogVersion, routes, tsCounter, txnState, txnStartTs,
-          txnObservedVer, txnWriteSet, txnCommitTs, txnCommitGroup,
+          txnObservedVer, txnPinned, txnWriteSet, txnCommitTs, txnCommitGroup,
           currentVersionAtCommit, opCount>>
 
 \* === HELPERS ===
@@ -112,6 +130,7 @@ Init ==
     /\ txnState               = [t \in TxnIds |-> "Idle"]
     /\ txnStartTs             = [t \in TxnIds |-> 0]
     /\ txnObservedVer         = [t \in TxnIds |-> 0]
+    /\ txnPinned              = [t \in TxnIds |-> FALSE]
     /\ txnWriteSet            = [t \in TxnIds |-> {}]
     /\ txnCommitTs            = [t \in TxnIds |-> 0]
     /\ txnCommitGroup         = [t \in TxnIds |-> NoGroup]
@@ -123,12 +142,12 @@ Init ==
 (***************************************************************************)
 (* ProposeRouteChange(k, g_new): the control plane atomically bumps the   *)
 (* catalog version and reassigns ownership of k to g_new.  Mirrors the    *)
-(* implementation's SplitRange + saveSplitResultViaCoordinator collapsed *)
-(* into a single TLA+ action.  Unlike the real `SplitRange` (which is    *)
-(* same-group only per CLAUDE.md), we let g_new differ from the current  *)
-(* owner so Composed-1's owning-group check has teeth.  Under the gap    *)
-(* config a transaction that observed the old catalog version may still  *)
-(* commit to the new group — that is the Composed-1 violation.           *)
+(* implementation's catalog writers (SplitRange, and the cross-group     *)
+(* migration cutover of distribution/migrator.go) collapsed into a single *)
+(* TLA+ action; the migration's write-fence and staged-visibility phases  *)
+(* are not modelled.  g_new may differ from the current owner.  Under the *)
+(* gap config a transaction that observed the old catalog version may     *)
+(* still commit to the new group — that is the Composed-1 violation.     *)
 (***************************************************************************)
 ProposeRouteChange(k, g_new) ==
     /\ opCount < MaxOps
@@ -138,17 +157,17 @@ ProposeRouteChange(k, g_new) ==
                     [routes[catalogVersion] EXCEPT ![k] = g_new]]
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<tsCounter, txnState, txnStartTs, txnObservedVer,
-                   txnWriteSet, txnCommitTs, txnCommitGroup,
+                   txnPinned, txnWriteSet, txnCommitTs, txnCommitGroup,
                    currentVersionAtCommit>>
 
 (***************************************************************************)
-(* BeginTxn(t): the txn enters Active state, allocates a fresh start_ts  *)
-(* from the monotonic clock, and pins the catalog version it observes at *)
-(* that moment.  txnObservedVer[t] is the load-bearing variable for       *)
-(* Composed-1 — every later WriteIntent / Commit decision is measured    *)
-(* against the catalog as it was at BeginTxn.                            *)
+(* BeginTxn(t, pinned): the txn enters Active state, allocates a fresh    *)
+(* start_ts from the monotonic clock, and records the catalog version it *)
+(* routes by.  With pinned = TRUE that version travels with the request  *)
+(* as ObservedRouteVersion and txnObservedVer[t] is the load-bearing     *)
+(* variable for Composed-1; with pinned = FALSE the FSM never sees it.    *)
 (***************************************************************************)
-BeginTxn(t) ==
+BeginTxn(t, pinned) ==
     /\ txnState[t] = "Idle"
     /\ tsCounter < MaxTs
     /\ opCount < MaxOps
@@ -156,6 +175,7 @@ BeginTxn(t) ==
     /\ txnState'       = [txnState       EXCEPT ![t] = "Active"]
     /\ txnStartTs'     = [txnStartTs     EXCEPT ![t] = tsCounter + 1]
     /\ txnObservedVer' = [txnObservedVer EXCEPT ![t] = catalogVersion]
+    /\ txnPinned'      = [txnPinned      EXCEPT ![t] = pinned]
     /\ opCount'        = opCount + 1
     /\ UNCHANGED <<catalogVersion, routes, txnWriteSet, txnCommitTs,
                    txnCommitGroup, currentVersionAtCommit>>
@@ -173,7 +193,7 @@ WriteIntent(t, k) ==
     /\ txnWriteSet' = [txnWriteSet EXCEPT ![t] = @ \cup {k}]
     /\ opCount' = opCount + 1
     /\ UNCHANGED <<catalogVersion, routes, tsCounter, txnState, txnStartTs,
-                   txnObservedVer, txnCommitTs, txnCommitGroup,
+                   txnObservedVer, txnPinned, txnCommitTs, txnCommitGroup,
                    currentVersionAtCommit>>
 
 (***************************************************************************)
@@ -186,7 +206,7 @@ WriteIntent(t, k) ==
 (* that check is removed and TLC finds the canonical 4-step               *)
 (* counterexample:                                                         *)
 (*                                                                         *)
-(*   BeginTxn(t)                  -- txn observes catalogVersion = 0      *)
+(*   BeginTxn(t, TRUE)            -- txn pins catalogVersion = 0          *)
 (*   WriteIntent(t, k1)           -- k1 owned by g1 at v=0               *)
 (*   ProposeRouteChange(k1, g2)   -- v=1, routes[1][k1] = g2             *)
 (*   Commit(t, g2) -- gap mode    -- but routes[0][k1] = g1 != g2 → fail*)
@@ -194,25 +214,29 @@ WriteIntent(t, k) ==
 Commit(t, g) ==
     /\ txnState[t] = "Active"
     /\ tsCounter < MaxTs
-    \* Composed-1 — observed-version owner check (the spec-level
-    \* refinement of the design doc §4.2(a) check).
-    /\ \/ ~EnableSafety
-       \/ \A k \in txnWriteSet[t] : OwnerAt(txnObservedVer[t], k) = g
-    \* Composed-1a — current-version owner check (the apply-time
-    \* cross-version-read fence from design doc §4.4).  This is the
-    \* strictly stronger guard the implementation adds on top of the
-    \* spec's literal Commit predicate; it prevents the codex P1 trace
-    \* where the observed-version check passes but a later
-    \* ProposeRouteChange has moved the key off the committing group.
-    /\ \/ ~EnableCurrentFence
-       \/ \A k \in txnWriteSet[t] : OwnerAt(catalogVersion, k) = g
+    /\ IF txnPinned[t]
+       THEN \* verifyComposed1 (a): observed-version owner check (the
+            \* spec-level refinement of the design doc §4.2(a) check).
+            /\ \/ ~EnableSafety
+               \/ \A k \in txnWriteSet[t] : OwnerAt(txnObservedVer[t], k) = g
+            \* verifyComposed1 (b): current-version owner check (the
+            \* apply-time cross-version-read fence from design doc §4.4).
+            \* It prevents the codex P1 trace where the observed-version
+            \* check passes but a later ProposeRouteChange has moved the
+            \* key off the committing group.
+            /\ \/ ~EnableCurrentFence
+               \/ \A k \in txnWriteSet[t] : OwnerAt(catalogVersion, k) = g
+       ELSE \* Unpinned: verifyComposed1 short-circuits.  Routing plus the
+            \* migration serving guard keep the write on the current
+            \* owner (see the module header).
+            \A k \in txnWriteSet[t] : OwnerAt(catalogVersion, k) = g
     /\ tsCounter'               = tsCounter + 1
     /\ txnState'                = [txnState               EXCEPT ![t] = "Committed"]
     /\ txnCommitTs'             = [txnCommitTs            EXCEPT ![t] = tsCounter + 1]
     /\ txnCommitGroup'          = [txnCommitGroup         EXCEPT ![t] = g]
     /\ currentVersionAtCommit'  = [currentVersionAtCommit EXCEPT ![t] = catalogVersion]
     /\ UNCHANGED <<catalogVersion, routes, txnStartTs, txnObservedVer,
-                   txnWriteSet, opCount>>
+                   txnPinned, txnWriteSet, opCount>>
 
 (***************************************************************************)
 (* Abort(t): transition Active to Aborted.  No state change beyond txnState.*)
@@ -221,13 +245,13 @@ Abort(t) ==
     /\ txnState[t] = "Active"
     /\ txnState' = [txnState EXCEPT ![t] = "Aborted"]
     /\ UNCHANGED <<catalogVersion, routes, tsCounter, txnStartTs,
-                   txnObservedVer, txnWriteSet, txnCommitTs, txnCommitGroup,
-                   currentVersionAtCommit, opCount>>
+                   txnObservedVer, txnPinned, txnWriteSet, txnCommitTs,
+                   txnCommitGroup, currentVersionAtCommit, opCount>>
 
 \* === NEXT ===
 Next ==
     \/ \E k \in Keys, g \in Groups       : ProposeRouteChange(k, g)
-    \/ \E t \in TxnIds                   : BeginTxn(t)
+    \/ \E t \in TxnIds, p \in BOOLEAN    : BeginTxn(t, p)
     \/ \E t \in TxnIds, k \in Keys       : WriteIntent(t, k)
     \/ \E t \in TxnIds, g \in Groups     : Commit(t, g)
     \/ \E t \in TxnIds                   : Abort(t)
@@ -248,6 +272,7 @@ TypeOK ==
     /\ txnState               \in [TxnIds -> States]
     /\ txnStartTs             \in [TxnIds -> 0..MaxTs]
     /\ txnObservedVer         \in [TxnIds -> 0..MaxVersions]
+    /\ txnPinned              \in [TxnIds -> BOOLEAN]
     /\ txnWriteSet            \in [TxnIds -> SUBSET Keys]
     /\ txnCommitTs            \in [TxnIds -> 0..MaxTs]
     /\ txnCommitGroup         \in [TxnIds -> Groups \cup {NoGroup}]
@@ -256,26 +281,25 @@ TypeOK ==
 
 \* === SAFETY INVARIANTS ===
 
-\* Composed-1 — every committed write key was owned by the committing
-\* group at the txn's observed catalog version.  This is the load-
+\* Composed-1 — every committed write key of a PINNED txn was owned by
+\* the committing group at the txn's observed catalog version.  An
+\* unpinned txn has no observed version on the wire, so the FSM cannot
+\* check it and the model does not assert it.  This is the load-
 \* bearing cross-module invariant: it ties OCC's commit decision to the
 \* Routes catalog snapshot the txn read at BeginTxn.  Under EnableSafety
 \* the Commit action's guard enforces this; under the gap toggle TLC
 \* surfaces the canonical 4-step counterexample.
 Composed1_CommitToOwningGroup ==
-    \A t \in CommittedTxns :
+    \A t \in CommittedTxns : txnPinned[t] =>
         \A k \in txnWriteSet[t] :
             OwnerAt(txnObservedVer[t], k) = txnCommitGroup[t]
 
-\* Composed-2 — read-after-write across SplitRange.  Vacuously TRUE in
-\* this abstraction: the implementation's SplitRange is same-group
-\* only (per CLAUDE.md), so the "key moved to a different group"
-\* clause has no reachable state.  M5's ProposeRouteChange explicitly
-\* DOES allow cross-group moves so Composed-1 has teeth, but the
-\* read-side correctness Composed-2 captures is structurally
-\* preserved by the version-chain encoding (every committed write is
-\* persisted in the per-key versions[k] in the underlying MVCC store
-\* — modelled in M3 and not re-modelled here).
+\* Composed-2 — read-after-write across a route change.  NOT modelled.
+\* Cross-group migration has shipped, so the "key moved to a different
+\* group" clause is reachable in the implementation; checking it needs
+\* the data plane (versions, migration copy, staged visibility), which
+\* this module does not carry.  TRUE here only keeps the name in the
+\* harness output.
 Composed2_ReadAcrossSplitRange == TRUE
 
 \* Composed-3 — strict serialisability bound.  Every pair of distinct

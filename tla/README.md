@@ -12,11 +12,18 @@ run it without touching anything under the Go source tree.
 | Milestone | Scope | Status |
 |---|---|---|
 | M1 | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla`, `make tla-check` | Landed |
-| M2 | `occ/OCC.tla` (safety invariants OCC-1..OCC-5) | Landed |
+| M2 | `occ/OCC.tla` (safety invariants OCC-1..OCC-5, OCC-8) | Landed |
 | M3 | `mvcc/MVCC.tla` (MVCC-1 + MVCC-4; MVCC-2 / MVCC-3 deferred to M5) | Landed |
 | M4 | `routes/Routes.tla` (Routes-1 + Routes-4; Routes-2 / Routes-3 trivially-satisfied in M4 abstraction, full range modelling deferred to M5) | Landed |
-| M5 | `composed/Composed.tla` (Composed-1 + Composed-3; Composed-2 trivially-satisfied under same-group SplitRange) | Landed |
+| M5 | `composed/Composed.tla` (Composed-1 + Composed-1a + Composed-3; Composed-2 not modelled) | Landed |
 | M6 | Liveness checking — OCC-L1 (every Active txn eventually terminates), Routes-L1 (eventual fan-out). HLC / MVCC / Composed liveness deferred. | Partial |
+
+The modules describe the code on `main` (reconciled 2026-10-28, see
+§12 of the design doc).  Where the code falls short of an invariant,
+an expected-failure config pins the gap (`*_legacy_*_gap.cfg`,
+`*_g0_gap.cfg`, `*_g1_gap.cfg`, `*_collision_gap.cfg`); when the code
+is fixed that run reports "unexpectedly passed" and the model and
+config must be updated with the fix.
 
 ## Install
 
@@ -105,15 +112,23 @@ operators that other modules actually need are exposed. `Propose`,
 `Apply`, and `InstallSnapshot` are placeholders for later milestones.
 
 ### `hlc/HLC.tla`
-The HLC layer.  Encodes all three HLC-4 preconditions:
+The HLC layer, as `kv/hlc.go` and the timestamp allocators implement it:
 
 - **(i) bounded skew** — inherited via the Env ASSUME.
-- **(ii) logical-counter handoff** — `BecomeLeader_HLC` calls
-  `Observe(maxAppliedHLC)` on the elected node when
-  `EnableSafety = TRUE`. This is strategy (c) from the design doc.
-- **(iii) ceiling fence** — `IssueTimestamp` has
-  `wallNow[n] < physicalCeiling[n]` as an enabling condition when
-  `EnableSafety = TRUE`.
+- **(ii) logical-counter handoff** — there is no election-time
+  `Observe`.  `IssuanceMode` selects the allocator:
+  - `"tso"` — `RaftTSOAllocator` (`kv/tso_raft.go`): the leader
+    Observes the Raft-committed allocation floor before reserving and
+    commits the new floor before handing the window out (strategy (a)).
+    `EnableSafety` gates this handoff.
+  - `"legacy_single"` — the non-sharded `Coordinate`: leader-only, no
+    handoff.
+  - `"legacy_sharded"` — `ShardedCoordinator` in legacy TSO mode: any
+    node stamps from its own HLC (audit G10), no handoff.
+- **(iii) ceiling fence** — `IssueTimestamp` is `NextFenced`: no fence
+  before the first ceiling; otherwise it fails closed when the wall
+  clock reached the ceiling or the next value's physical half would
+  exceed it.
 
 Invariants asserted:
 
@@ -127,20 +142,31 @@ Invariants asserted:
 | `HLC3_LeaderOnly` | Every committed ts was issued by the leader of its term |
 | `HLC4_NoRegressionAcrossTerms` | Earlier-term commits are strictly less than later-term commits |
 
-### `hlc/MCHLC.tla` + `MCHLC.cfg` / `MCHLC_gap.cfg`
-TLC model-check instance.  Two configurations, one module.  See [Run](#run).
+### `hlc/MCHLC.tla` + configs
+| Config | Mode | Expected |
+|---|---|---|
+| `MCHLC.cfg` | TSO with the floor handoff | PASS |
+| `MCHLC_gap.cfg` | TSO without the floor handoff | FAIL on `HLC4_NoRegressionAcrossTerms` |
+| `MCHLC_legacy_single_gap.cfg` | non-sharded `Coordinate` (known gap) | FAIL on `HLC4_NoRegressionAcrossTerms` |
+| `MCHLC_legacy_sharded_gap.cfg` | `ShardedCoordinator` legacy mode (known gap G10) | FAIL on `HLC3_LeaderOnly` |
 
 ### `occ/OCC.tla`
-The OCC layer.  Models the Percolator-style 2PC transaction lifecycle
-`Idle → Active → Prepared → Committed / Aborted` and the lock map
-`(key, lock_ts) → start_ts`.  The lock-resolver
-(`kv/lock_resolver.go`) is abstracted into the atomic lock drain
-inside `Commit`/`Abort` for M2; the async-resolver case is deferred
-to M5 (composed) — see the block comment in `OCC.tla` where
-`LockResolve` would have lived.  HLC is abstracted to a single global
-monotonic counter for M2; M5 will INSTANCE `HLC.tla` for the real
-48/16 layout.  The `EnableSafety` CONSTANT gates the OCC-1 commit
-guard so the same module drives the safe and gap configurations.
+The OCC layer at the FSM / store level.  Reading transactions start
+at the applied commit watermark (`adapter/ts.go snapshotTS`);
+write-only ones get a fresh `start_ts`.  Single-shard transactions
+take the one-phase path: `AllocateOnePhase` picks `commit_ts`, and
+`ApplyOnePhase` later applies it (in any order) only if
+`commit_ts > start_ts`, `commit_ts` is above the watermark
+(`checkCommitTSFence`), no foreign lock sits on a write key, and no
+write or read key has a version newer than `start_ts`; otherwise
+`RejectOnePhase`.  Multi-shard transactions settle `commit_ts` first,
+then `Prepare` validates read and write keys and locks the write keys,
+and `Commit` applies with no fence and no revalidation.  `RawWrite`
+is a non-transactional write that raises the watermark.  The lock
+resolver is abstracted into the atomic lock drain inside
+`Commit`/`Abort`; timestamps come from one global counter (unique,
+leader-issued).  `EnableSafety` gates the commit-ts > start-ts
+discipline; `EnableTwoPhase` turns the 2PC path off.
 
 Invariants asserted:
 
@@ -149,32 +175,38 @@ Invariants asserted:
 | `TypeOK` | Variable types are well-formed |
 | `OCC1_CommitTsAboveStart` | Every committed txn has `commit_ts > start_ts` |
 | `OCC2_NoWriteWriteConflict` | Two committed txns sharing a write key have distinct commit_ts and one started after the other committed (`commit_ts[earlier] <= start_ts[later]`) |
-| `OCC3_ReadSnapshotStability` | Every read observation equals `LatestVisible(k, start_ts(t))` (the snapshot value remains stable under monotonic-ts allocation in BeginTxn / Commit) |
+| `OCC3_ReadSnapshotStability` | Every read observation of a live txn still equals `LatestVisible(k, start_ts(t))` — fails on `main` through 2PC (G0) |
 | `OCC4_NoStrandedLockAtQuiescence` | When all txns are in a terminal state, no lock remains |
 | `OCC5_StartTsConsistency` | Every read observation is bounded by the txn's `start_ts` (= `read_ts` by OCC-5) |
+| `OCC8_NoWriteSkew` | No two committed txns have rw-antidependencies in both directions — fails on `main` through a one-phase commit in a 2PC PREPARE / COMMIT window (G1) |
 | `OCC5_Action` (PROPERTY) | Transition form: `start_ts[t]` is assigned once at `BeginTxn` and never updated |
 | `CommitTsAssignedOnce` (PROPERTY) | Transition form: `commit_ts[t]` is assigned once at `Commit` and never updated |
-| `OCC_L1_TxnTerminates` (LIVENESS, M6) | `<>[](∀t. txnState[t] ∈ {Idle, Committed, Aborted})` — every txn eventually settles, prevented from staying Active/Prepared forever by `WF_vars(Abort(t))` in `SpecLive` |
+| `OCC_L1_TxnTerminates` (LIVENESS, M6) | `<>[](∀t. txnState[t] ∈ {Idle, Committed, Aborted})` — every txn eventually settles, driven by `WF_vars(Abort(t))` and fairness on settling a proposed one-phase entry in `SpecLive` |
 
-### `occ/MCOCC.tla` + `MCOCC.cfg` / `MCOCC_gap.cfg`
-TLC model-check instance for OCC.  Same one-module / two-config layout
-as MCHLC.  The gap config disables the OCC-1 commit guard; TLC
-produces an `OCC1_CommitTsAboveStart` counterexample at depth ≈ 5.
+### `occ/MCOCC.tla` + configs
+| Config | Checks | Expected |
+|---|---|---|
+| `MCOCC.cfg` | full model; OCC-1, OCC-2, OCC-4, OCC-5 | PASS |
+| `MCOCC_onephase.cfg` | single-shard path only, one Raft group (one watermark); every invariant incl. OCC-3, OCC-8 | PASS |
+| `MCOCC_gap.cfg` | `EnableSafety = FALSE` | FAIL on `OCC1_CommitTsAboveStart` (depth ≈ 5) |
+| `MCOCC_g0_gap.cfg` | full model (known gap G0) | FAIL on `OCC3_ReadSnapshotStability` (depth 9: 2PC allocates, a raw write raises the watermark, a reader reads, the 2PC commits below its snapshot) |
+| `MCOCC_g1_gap.cfg` | full model (known gap G1) | FAIL on `OCC8_NoWriteSkew` (a one-phase commit applies between the other txn's PREPARE and COMMIT) |
+| `MCOCC_live.cfg` | `SpecLive`, OCC-L1 | PASS |
 
 ### `mvcc/MVCC.tla`
 The MVCC layer.  Single-node model of a per-key version chain
-(`versions[k]`) with a `Compact` action that drains older versions
-to bound storage growth.  Carries a ghost variable
-`originalVersions[k]` that records every version ever written and
-is never pruned — MVCC-4 compares the two to assert that no
-committed entry has been lost across compaction.  HLC is abstracted
-to a single monotonic counter (`tsCounter`); M5 (composed) will
-INSTANCE `HLC.tla` for the real 48/16 layout.  The `EnableSafety`
-CONSTANT gates the per-key "retain the latest commit_ts below the
-new minRetained" rule inside `Compact` — under the gap config that
-guard is removed and TLC surfaces a `MVCC-4` counterexample where a
-read at `read_ts ≥ minRetained` now misses a value the original log
-would have shown.
+(`versions[k]`) and the store's resumable compaction:
+`BeginCompact` persists the pending watermark (reads below it fail
+closed), `PruneKey` deletes one key's garbage (idempotent, any
+order), `FinishCompact` commits the watermark.  The prune keeps every
+version with `commit_ts > minTS` plus the newest one `<= minTS`
+(`shouldDeleteCompactionVersion`).  A ghost `originalVersions[k]`
+is the uncompacted chain — MVCC-4 compares the two — and a ghost
+`acked` records every acknowledged write.  `EnableSafety` gates the
+"keep the newest version `<= minTS`" rule.  With `UniqueTs = FALSE`,
+`CollidingWrite` writes at a timestamp the key already has, as
+non-leader stamping produces (G10); the raw apply path replaces the
+existing version.
 
 MVCC-2 (no committed version below the HLC physical ceiling) and
 MVCC-3 (cross-node read consistency) are deferred to M5:
@@ -191,23 +223,26 @@ Invariants asserted:
 |---|---|
 | `TypeOK` | Variable types are well-formed |
 | `MVCC1_VisibleVersionUnique` | No two distinct version records in `versions[k]` share a `commit_ts` |
-| `MVCC4_NoLostCommitOnSnapshotInstall` | For every key and every `read_ts ≥ minRetained`, the visible version in `versions[k]` equals the visible version in the ghost `originalVersions[k]` |
+| `MVCC4_NoLostCommitOnSnapshotInstall` | For every key and every `read_ts` at or above the effective watermark, the visible version in `versions[k]` equals the visible version in the ghost `originalVersions[k]` |
+| `MVCC5_AckedWriteNotOverwritten` | Every acknowledged write is still in the uncompacted chain |
 | `MVCC_TsMonotonic` (PROPERTY) | Transition form: `tsCounter` weakly increases on every step |
-| `MVCC_GhostMonotonic` (PROPERTY) | Transition form: `originalVersions[k]` only grows; `Compact` leaves it `UNCHANGED` |
+| `MVCC_GhostMonotonic` (PROPERTY) | Transition form: the uncompacted chain never loses a timestamp |
+| `MVCC_WatermarkMonotonic` (PROPERTY) | Transition form: the effective watermark never decreases |
 
-### `mvcc/MCMVCC.tla` + `MCMVCC.cfg` / `MCMVCC_gap.cfg`
-TLC model-check instance for MVCC.  Same one-module / two-config
-layout as MCHLC and MCOCC.  The gap config disables the retention
-guard inside `Compact`; TLC produces a
-`MVCC4_NoLostCommitOnSnapshotInstall` counterexample at depth ≈ 3
-(one `Write`, one `Compact(newMin > commit_ts)`).
+### `mvcc/MCMVCC.tla` + configs
+| Config | Expected |
+|---|---|
+| `MCMVCC.cfg` | PASS |
+| `MCMVCC_gap.cfg` (`EnableSafety = FALSE`) | FAIL on `MVCC4_NoLostCommitOnSnapshotInstall` (depth 4: `Write`, `BeginCompact`, `PruneKey`) |
+| `MCMVCC_collision_gap.cfg` (`UniqueTs = FALSE`, known gap G10) | FAIL on `MVCC5_AckedWriteNotOverwritten` |
 
 ### `routes/Routes.tla`
 The route catalog + CatalogWatcher layer.  Models the durable catalog
 as a single monotonic `catalogVersion` counter and each node's
 `RouteEngine` as a per-node `engineVersion[n]` that re-syncs via the
 `CatalogWatcherSync(n)` action (mirroring
-`distribution/watcher.go SyncOnce`).  A ghost variable
+`distribution/watcher.go SyncOnce`, which applies a bounded batch of
+deltas per tick and so can land on an intermediate version).  A ghost variable
 `engineMaxObserved[n]` records the highest version each node has
 ever observed, so Routes-4 (watcher fan-out monotonicity) can be
 stated as a state invariant
@@ -256,10 +291,13 @@ The cross-module composition.  M1..M4 each modelled a single
 subsystem in isolation; M5 captures the seams between them — the
 two safety properties that no single-module spec can express:
 
-- **Composed-1** — every committed write key was owned by the
-  committing group at the txn's observed catalog version.  Ties OCC's
-  commit decision to the Routes catalog snapshot the txn read at
-  `BeginTxn`.
+- **Composed-1** — every committed write key of a pinned txn (one that
+  carries `ObservedRouteVersion`) was owned by the committing group at
+  the txn's observed catalog version.  Ties OCC's commit decision to
+  the Routes catalog snapshot the txn read at `BeginTxn`.  Unpinned
+  txns (read keys, caller-supplied `StartTS`, partition-resolver keys)
+  skip `verifyComposed1`; the model keeps only the current-owner
+  requirement for them.
 - **Composed-1a** — strictly stronger apply-time fence: every
   committed write key was owned by the committing group at the
   CURRENT catalog version observed by the FSM at apply time
@@ -272,14 +310,14 @@ two safety properties that no single-module spec can express:
 - **Composed-3** — every pair of distinct committed transactions has
   distinct `commit_ts` (the strict-serialisability bound).
 
-Composed-2 (read-after-write across SplitRange) is vacuously true in
-this abstraction because the implementation's `SplitRange` is
-same-group only (per CLAUDE.md), so the "key moved to a different
-group" clause has no reachable state.  We still model cross-group
-moves via `ProposeRouteChange` so Composed-1 has teeth — the
-canonical Composed-1 counterexample is a key move from `g1` to `g2`
-followed by a transaction that observed the pre-move catalog but
-commits via `g2`.
+Composed-2 (read-after-write across a route change) is not modelled.
+Cross-group migration has shipped, so the clause is reachable in the
+implementation, but this module carries no data plane to state it
+against; `Composed2_ReadAcrossSplitRange` is `TRUE` only to keep the
+name in the output.  `ProposeRouteChange` moves keys across groups —
+the canonical Composed-1 counterexample is a key move from `g1` to
+`g2` followed by a pinned transaction that observed the pre-move
+catalog but commits via `g2`.
 
 The module does NOT `INSTANCE` the M1..M4 modules — INSTANCEing all
 four would explode the state space well past M5's "<10 min at
@@ -294,9 +332,9 @@ Invariants asserted:
 | Invariant | Statement |
 |---|---|
 | `TypeOK` | Variable types are well-formed |
-| `Composed1_CommitToOwningGroup` | For every committed txn `t` and every `k ∈ writeSet[t]`, `routes[observedVer[t]][k] = commitGroup[t]` |
+| `Composed1_CommitToOwningGroup` | For every committed pinned txn `t` and every `k ∈ writeSet[t]`, `routes[observedVer[t]][k] = commitGroup[t]` |
 | `Composed1a_CommitToCurrentOwner` | For every committed txn `t` and every `k ∈ writeSet[t]`, `routes[currentVersionAtCommit[t]][k] = commitGroup[t]` — strictly stronger than Composed-1, witnesses the §4.4 apply-time fence |
-| `Composed2_ReadAcrossSplitRange` | Vacuously TRUE in M5 (same-group SplitRange) — kept for naming consistency |
+| `Composed2_ReadAcrossSplitRange` | Not modelled (`TRUE`) — kept for naming consistency |
 | `Composed3_DistinctCommitTs` | Distinct committed txns have distinct `commit_ts` |
 | `Composed_CatalogMonotonic` (PROPERTY) | Transition form: `catalogVersion` weakly increases |
 | `Composed_TsMonotonic` (PROPERTY) | Transition form: `tsCounter` weakly increases |
@@ -307,7 +345,7 @@ TLC model-check instance for Composed.  Same one-module / two-config
 layout as the other modules.  The gap config disables the
 owning-group check in `Commit`; TLC produces a
 `Composed1_CommitToOwningGroup` counterexample at depth ≈ 4:
-`BeginTxn(t)` → `WriteIntent(t, k1)` → `ProposeRouteChange(k1, g2)`
+`BeginTxn(t, TRUE)` → `WriteIntent(t, k1)` → `ProposeRouteChange(k1, g2)`
 → `Commit(t, g2)` where the txn observed `routes[0][k1] = g1` but
 commits via `g2`.
 
@@ -330,16 +368,19 @@ To map a state back to the implementation:
 1. The `State N: <ActionName line X col Y of module M>` header names the
    spec action. Look it up in the corresponding `.tla` file.
 2. Each action documents its corresponding implementation anchor in a
-   comment at the action definition. Example: `BecomeLeader_HLC` in
-   `HLC.tla` corresponds to `ShardedCoordinator.RunHLCLeaseRenewal`
-   detecting a new term and calling `hlc.Observe(fsm.MaxAppliedHLC())`.
+   comment at the action definition. Example: `IssueTimestamp` in
+   `HLC.tla` corresponds to `HLC.NextFenced` in `kv/hlc.go`, and in TSO
+   mode to `RaftTSOAllocator.reserveBatchAfterLocked` in
+   `kv/tso_raft.go`.
 3. The state's variable values map to the corresponding Go fields:
    `hlcLast[n]` ↔ `kv/hlc.go HLC.last`, `physicalCeiling[n]` ↔
    `kv/hlc.go HLC.physicalCeiling`, etc.
 
 If the failure is from `tla-check`'s gap-config branch announcing
-"unexpectedly passed", the spec or the toggle wiring has drifted — the
-preconditions are no longer doing what the design doc says they do.
+"unexpectedly passed", either the spec or the toggle wiring has
+drifted, or — for a known-gap config — the implementation gap was
+fixed: update the module to model the fix, move the config's invariant
+into the passing config, and delete the gap config.
 
 ## Reading list
 
