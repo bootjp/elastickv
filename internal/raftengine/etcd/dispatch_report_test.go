@@ -6,7 +6,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/stretchr/testify/require"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )

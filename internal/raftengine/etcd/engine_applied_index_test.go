@@ -6,9 +6,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/require"
 	etcdraft "go.etcd.io/raft/v3"

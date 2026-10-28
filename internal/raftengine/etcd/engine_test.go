@@ -12,11 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
-	"github.com/bootjp/elastickv/internal/testutil"
-
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/server/v3/mock/mockstorage"

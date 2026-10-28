@@ -8,9 +8,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )

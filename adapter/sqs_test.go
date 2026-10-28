@@ -11,7 +11,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/testutil"
-
 	json "github.com/goccy/go-json"
 )
 

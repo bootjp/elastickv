@@ -10,7 +10,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/redis/go-redis/v9"

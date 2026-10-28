@@ -14,7 +14,6 @@ import (
 	"time"
 
 	waitutil "github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"

@@ -7,9 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 )

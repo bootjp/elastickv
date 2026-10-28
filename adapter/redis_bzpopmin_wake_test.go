@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"

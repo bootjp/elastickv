@@ -7,9 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
 )

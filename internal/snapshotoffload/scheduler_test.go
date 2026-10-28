@@ -12,9 +12,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/internal/testutil"
-
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )

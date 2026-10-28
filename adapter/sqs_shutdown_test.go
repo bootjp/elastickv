@@ -5,7 +5,6 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/testutil"
-
 	"github.com/stretchr/testify/require"
 )
 
