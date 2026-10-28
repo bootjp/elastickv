@@ -406,7 +406,7 @@ func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord
 	if err = reserveOperation(&session, record); err != nil {
 		return operationRecord{}, err
 	}
-	return record, j.storeRecordAndSession(ctx, ts, record, session, nil, nil)
+	return record, j.storeRecordAndSession(ctx, ts, record, session)
 }
 
 func reserveOperation(session *operationSession, record operationRecord) error {
@@ -461,8 +461,8 @@ func (j *OperationJournal) loadRecordAt(ctx context.Context, id OperationID, ts 
 	return record, true, nil
 }
 
-func (j *OperationJournal) storeRecordAndSession(ctx context.Context, ts uint64, record operationRecord, session operationSession, extra []*kv.Elem[kv.OP], extraReadKeys [][]byte) error {
-	return j.storeRecordAndSessionAtRoute(ctx, ts, record, session, extra, extraReadKeys, 0)
+func (j *OperationJournal) storeRecordAndSession(ctx context.Context, ts uint64, record operationRecord, session operationSession) error {
+	return j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, 0)
 }
 
 func (j *OperationJournal) storeRecordAndSessionAtRoute(ctx context.Context, ts uint64, record operationRecord, session operationSession, extra []*kv.Elem[kv.OP], extraReadKeys [][]byte, observed uint64) error {

@@ -697,14 +697,13 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	// All members, including the learner, must have an actual persisted native
 	// snapshot covering the ACKed write itself. Status() is a periodically
 	// refreshed diagnostic and can lag the proposal's returned CommitIndex.
-	require.Eventually(t, func() bool {
-		for _, n := range c.nodes {
-			if n.engine.Status().LastSnapshotIndex < target {
-				return false
-			}
+	require.NoError(t, waitForQuorumAcceptanceSnapshots(ctx, target, func() []uint64 {
+		indexes := make([]uint64, len(c.nodes))
+		for index, n := range c.nodes {
+			indexes[index] = n.engine.Status().LastSnapshotIndex
 		}
-		return true
-	}, 5*time.Second, 20*time.Millisecond)
+		return indexes
+	}))
 	t.Logf("all four members persisted native snapshots covering ACKed write index %d", target)
 	for _, n := range c.nodes {
 		n.tx.Close()

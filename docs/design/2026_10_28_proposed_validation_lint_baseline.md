@@ -49,10 +49,13 @@ behavior or supersede PR #1344's journal accounting investigation.
    protection case body, retaining every enabled/tombstone/control-key case,
    all whole-batch rejection/state-preservation assertions, and the successful
    reuse of the rejected batch sequence for ordinary data.
-6. `internal/filesystem/operation_journal.go`: remove the unused `extra` argument
+6. `internal/filesystem/operation_journal.go`: remove the unused `extra` and
+   `extraReadKeys` arguments
    from `storeRecordAndSession` and audit every caller. They currently all pass
-   nil. Keep the general `storeRecordAndSessionAtRoute` effects argument because
-   publication uses it; do not change effect or OCC key order.
+   nil for both. Keep both arguments on the general
+   `storeRecordAndSessionAtRoute` helper because publication uses them; do not
+   change effect or OCC key order. Removing the first unused wrapper argument
+   exposes the second finding, which has the same audited caller evidence.
 7. `adapter/migration_quorum_partition_acceptance_test.go`: replace the separate
    five-second wait with a context-bound coverage poll using the existing
    60-second write/snapshot phase context. Require every actual member's

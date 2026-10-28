@@ -265,55 +265,60 @@ func TestPrepareEvidenceSafetyMigrationCannotReplaceLocalProtocolState(t *testin
 			for _, key := range [][]byte{backupTimestampFloorKey, prepareEvidenceEnabledKey, prepareEvidenceGateKey, prepareEvidenceTimestampFloorKey,
 				replicatedPinStateKey, []byte(store.ReplicatedControlPrefix + "future-state")} {
 				t.Run(fmt.Sprintf("enabled-%t-delete-%t-%s", enabled, tombstone, key), func(t *testing.T) {
-					_, _, fsm := newPrepareSafetyGate(t)
-					if bytes.Equal(key, replicatedPinStateKey) {
-						seedActivatedPinJournal(t, fsm.store)
-						require.NoError(t, fsm.reloadReplicatedBackupPins(t.Context()))
-					}
-					if enabled {
-						require.Nil(t, fsm.Apply(EncodePrepareEvidenceFence(0)))
-					}
-					ctx := context.Background()
-					before, beforeErr := fsm.store.GetAt(ctx, key, ^uint64(0))
-					userKey := []byte("ordinary-imported-user")
-					userVersion := &pb.MVCCVersion{Key: userKey, CommitTs: 1000, Value: []byte("value")}
-					control := &pb.MVCCVersion{Key: key, CommitTs: 1000, Value: []byte{1}, Tombstone: tombstone}
-					if tombstone {
-						control.Value = nil
-					}
-					request := &pb.ImportRangeVersionsRequest{JobId: 7, BracketId: 1, BatchSeq: 1,
-						Cursor: []byte("end"), Versions: []*pb.MVCCVersion{userVersion, control}}
-					command, err := MarshalMigrationImportCommand(request)
-					require.NoError(t, err)
-					result := fsm.Apply(command)
-					applyErr, ok := result.(error)
-					require.True(t, ok, "a control-key import must be a deterministic rejection, got %T", result)
-					require.ErrorIs(t, applyErr, ErrInvalidRequest)
-					for _, rawKey := range [][]byte{key, userKey} {
-						_, err = fsm.store.GetAt(ctx, distribution.MigrationStagedDataKey(7, rawKey), ^uint64(0))
-						require.ErrorIs(t, err, store.ErrKeyNotFound, "the entire rejected batch must remain unapplied")
-					}
-					after, afterErr := fsm.store.GetAt(ctx, key, ^uint64(0))
-					if beforeErr != nil {
-						require.ErrorIs(t, beforeErr, store.ErrKeyNotFound)
-						require.ErrorIs(t, afterErr, store.ErrKeyNotFound)
-					} else {
-						require.NoError(t, afterErr)
-						require.Equal(t, before, after)
-					}
-					// Reuse sequence one: rejected protocol rows must not advance import progress.
-					request.Versions = []*pb.MVCCVersion{userVersion}
-					command, err = MarshalMigrationImportCommand(request)
-					require.NoError(t, err)
-					_, ok = fsm.Apply(command).(store.ImportVersionsResult)
-					require.True(t, ok, "the same batch sequence must still accept ordinary user data")
-					value, err := fsm.store.GetAt(ctx, distribution.MigrationStagedDataKey(7, userKey), ^uint64(0))
-					require.NoError(t, err)
-					require.Equal(t, []byte("value"), value)
+					runPrepareEvidenceSafetyMigrationCase(t, enabled, tombstone, key)
 				})
 			}
 		}
 	}
+}
+
+func runPrepareEvidenceSafetyMigrationCase(t *testing.T, enabled, tombstone bool, key []byte) {
+	t.Helper()
+	_, _, fsm := newPrepareSafetyGate(t)
+	if bytes.Equal(key, replicatedPinStateKey) {
+		seedActivatedPinJournal(t, fsm.store)
+		require.NoError(t, fsm.reloadReplicatedBackupPins(t.Context()))
+	}
+	if enabled {
+		require.Nil(t, fsm.Apply(EncodePrepareEvidenceFence(0)))
+	}
+	ctx := context.Background()
+	before, beforeErr := fsm.store.GetAt(ctx, key, ^uint64(0))
+	userKey := []byte("ordinary-imported-user")
+	userVersion := &pb.MVCCVersion{Key: userKey, CommitTs: 1000, Value: []byte("value")}
+	control := &pb.MVCCVersion{Key: key, CommitTs: 1000, Value: []byte{1}, Tombstone: tombstone}
+	if tombstone {
+		control.Value = nil
+	}
+	request := &pb.ImportRangeVersionsRequest{JobId: 7, BracketId: 1, BatchSeq: 1,
+		Cursor: []byte("end"), Versions: []*pb.MVCCVersion{userVersion, control}}
+	command, err := MarshalMigrationImportCommand(request)
+	require.NoError(t, err)
+	result := fsm.Apply(command)
+	applyErr, ok := result.(error)
+	require.True(t, ok, "a control-key import must be a deterministic rejection, got %T", result)
+	require.ErrorIs(t, applyErr, ErrInvalidRequest)
+	for _, rawKey := range [][]byte{key, userKey} {
+		_, err = fsm.store.GetAt(ctx, distribution.MigrationStagedDataKey(7, rawKey), ^uint64(0))
+		require.ErrorIs(t, err, store.ErrKeyNotFound, "the entire rejected batch must remain unapplied")
+	}
+	after, afterErr := fsm.store.GetAt(ctx, key, ^uint64(0))
+	if beforeErr != nil {
+		require.ErrorIs(t, beforeErr, store.ErrKeyNotFound)
+		require.ErrorIs(t, afterErr, store.ErrKeyNotFound)
+	} else {
+		require.NoError(t, afterErr)
+		require.Equal(t, before, after)
+	}
+	// Reuse sequence one: rejected protocol rows must not advance import progress.
+	request.Versions = []*pb.MVCCVersion{userVersion}
+	command, err = MarshalMigrationImportCommand(request)
+	require.NoError(t, err)
+	_, ok = fsm.Apply(command).(store.ImportVersionsResult)
+	require.True(t, ok, "the same batch sequence must still accept ordinary user data")
+	value, err := fsm.store.GetAt(ctx, distribution.MigrationStagedDataKey(7, userKey), ^uint64(0))
+	require.NoError(t, err)
+	require.Equal(t, []byte("value"), value)
 }
 
 func TestPrepareEvidenceSafetyMarkerCannotBeForgedByTwoPhaseWrite(t *testing.T) {
