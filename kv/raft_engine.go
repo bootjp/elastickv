@@ -9,7 +9,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-// verifyLeaderTimeout caps how long the no-context verifyLeaderEngine path
+// verifyLeaderTimeout caps how long verifyLeaderEngineCtx without a deadline
 // is willing to wait for a ReadIndex round-trip. Without this bound,
 // callers that hold context.Background() (LeaderProxy.Commit/Abort,
 // Coordinate.VerifyLeader, ShardedCoordinator.VerifyLeader[ForKey], and
@@ -70,8 +70,8 @@ func verifyLeaderEngineCtx(ctx context.Context, engine raftengine.LeaderView) er
 	// Redis server's long-lived handlerContext, gemini-flagged background
 	// loops, or any future caller that passes context.Background), wrap
 	// with verifyLeaderTimeout so a stalled ReadIndex still surfaces
-	// fail-fast — same bound the no-arg verifyLeaderEngine wrapper has
-	// provided since #745. Callers that already set a tighter deadline
+	// fail-fast, preserving the safety bound introduced after #745.
+	// Callers that already set a tighter deadline
 	// (Redis dispatch ctx with redisDispatchTimeout, healthz
 	// r.Context()) keep theirs: context.WithTimeout picks the earlier of
 	// the two expirations.
@@ -81,12 +81,6 @@ func verifyLeaderEngineCtx(ctx context.Context, engine raftengine.LeaderView) er
 		defer cancel()
 	}
 	return errors.WithStack(engine.VerifyLeader(ctx))
-}
-
-func verifyLeaderEngine(engine raftengine.LeaderView) error {
-	ctx, cancel := context.WithTimeout(context.Background(), verifyLeaderTimeout)
-	defer cancel()
-	return verifyLeaderEngineCtx(ctx, engine)
 }
 
 func linearizableReadEngineCtx(ctx context.Context, engine raftengine.LeaderView) (uint64, error) {

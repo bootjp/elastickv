@@ -3374,31 +3374,6 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
 	return logs, gids, nil
 }
 
-func (c *ShardedCoordinator) rejectWriteTimestampFloorMutations(muts []*pb.Mutation, commitTS uint64) error {
-	if c == nil || c.engine == nil || commitTS == 0 {
-		return nil
-	}
-	for _, mut := range muts {
-		if err := c.rejectWriteTimestampFloorMutation(mut, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *ShardedCoordinator) rejectWriteTimestampFloorMutation(mut *pb.Mutation, commitTS uint64) error {
-	if mut == nil {
-		return nil
-	}
-	if mut.GetOp() == pb.Op_DEL_PREFIX {
-		return c.rejectWriteTimestampFloorDelPrefix(mut.Key, commitTS)
-	}
-	if len(mut.Key) == 0 {
-		return nil
-	}
-	return c.rejectWriteTimestampFloorPointKey(mut.Key, commitTS)
-}
-
 func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error) {
 	if _, ok := resolveTimestampAllocator(c.tsAllocator); ok {
 		return 0, nil

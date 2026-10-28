@@ -316,7 +316,6 @@ func TestShardedCoordinator_DoesNotRetryReadWriteTxnOnComposed1(t *testing.T) {
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		IsTxn:    true,
-		StartTS:  10,
 		ReadKeys: [][]byte{[]byte("k_read")},
 		Elems: []*Elem[OP]{
 			{Op: Put, Key: []byte("k"), Value: []byte("v")},
@@ -372,7 +371,6 @@ func TestShardedCoordinator_DoesNotAutoPinObservedRouteVersionForReadWriteTxn(t 
 
 	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
 		IsTxn:    true,
-		StartTS:  10,
 		ReadKeys: [][]byte{[]byte("k_read")},
 		// ObservedRouteVersion intentionally left at zero — caller
 		// did not migrate to pin at BeginTxn.
