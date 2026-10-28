@@ -165,7 +165,7 @@ func TestListMetaExpireElemsIncludesLegacyDeltas(t *testing.T) {
 	st := store.NewMVCCStore()
 	server := &RedisServer{store: st}
 	key := []byte("ttl:list:legacy-delta")
-	deltaKey := legacyListMetaDeltaKey(key, 2)
+	deltaKey := store.LegacyListMetaDeltaKey(key, 2, 0)
 	require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 2, 0))
 
 	elems, exists, err := server.listMetaExpireElems(ctx, key, 2, 1234)
@@ -186,7 +186,7 @@ func TestExpiredTTLIndexPrecedesLegacyListDeltaOnlyCollection(t *testing.T) {
 	server := &RedisServer{store: st}
 	key := []byte("ttl:list:legacy-delta-recreate")
 	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), 1, 0))
-	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 3), store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
+	require.NoError(t, st.PutAt(ctx, store.LegacyListMetaDeltaKey(key, 3, 0), store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
 
 	stale, err := expiredTTLIndexPrecedesDeltaOnlyCollection(ctx, st, server, key, redisTypeList, 3)
 

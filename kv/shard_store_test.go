@@ -1351,7 +1351,7 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 		legacyRouting bool
 	}{
 		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
-		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
+		{name: "legacy", key: store.LegacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1377,8 +1377,8 @@ func TestShardStoreScanAt_BroadLegacyListDeltaScansAllRoutes(t *testing.T) {
 	ctx := context.Background()
 	st := newTwoRouteShardStoreForScanTest()
 	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
-	leftKey := legacyListMetaDeltaKey([]byte("left-list"), 10)
-	rightKey := legacyListMetaDeltaKey([]byte("right-list"), 11)
+	leftKey := store.LegacyListMetaDeltaKey([]byte("left-list"), 10, 1)
+	rightKey := store.LegacyListMetaDeltaKey([]byte("right-list"), 11, 1)
 	require.NoError(t, st.groups[1].Store.PutAt(ctx, leftKey, deltaValue, 1, 0))
 	require.NoError(t, st.groups[2].Store.PutAt(ctx, rightKey, deltaValue, 1, 0))
 
@@ -4114,7 +4114,7 @@ func TestShardStoreScanAt_ExactLegacyListDeltaScanMarksRouteGroup(t *testing.T) 
 
 	// "right-list" sorts into the second route's group.
 	userKey := []byte("right-list")
-	key := legacyListMetaDeltaKey(userKey, 11)
+	key := store.LegacyListMetaDeltaKey(userKey, 11, 1)
 	require.NoError(t, st.groups[2].Store.PutAt(ctx, key, deltaValue, 1, 0))
 
 	scanStart := store.LegacyListMetaDeltaScanPrefix(userKey)
