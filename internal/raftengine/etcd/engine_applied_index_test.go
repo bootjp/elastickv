@@ -340,12 +340,7 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *te
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
 // adjacent assertion: the recording FSM MUST satisfy the writer
 // seam so the engine hook actually fires for it.
-func TestRecordingFSM_SatisfiesAppliedIndexWriter(t *testing.T) {
-	rec := &applyIndexOrderRecorder{}
-	var f any = &recordingAppliedIndexFSM{rec: rec}
-	_, ok := f.(raftengine.AppliedIndexWriter)
-	require.True(t, ok, "recordingAppliedIndexFSM must implement raftengine.AppliedIndexWriter")
-}
+var _ raftengine.AppliedIndexWriter = (*recordingAppliedIndexFSM)(nil)
 
 // TestPersistCreatedSnapshot_BumpsAppliedIndex exercises Site 1 of
 // the persist hook. We invoke (*Engine).persistCreatedSnapshot
