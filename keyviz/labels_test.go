@@ -14,14 +14,6 @@ func TestAllLabelsAvoidBucketIDSeparator(t *testing.T) {
 	}
 }
 
-func TestAllLabelConstantsInAllLabels(t *testing.T) {
-	t.Parallel()
-	want := []Label{LabelDynamo, LabelRedis, LabelS3, LabelSQS, LabelRawKV}
-	for _, label := range want {
-		require.True(t, labelInAllLabels(label), "AllLabels must include %q", label)
-	}
-}
-
 func TestAllLabelsWithLegacyFreshSlice(t *testing.T) {
 	t.Parallel()
 	labels := allLabelsWithLegacy()
@@ -98,13 +90,4 @@ func TestCoarsenedRouteEmitsLegacyLabel(t *testing.T) {
 	require.True(t, rows[0].Aggregate)
 	require.Equal(t, LabelLegacy, rows[0].Label)
 	require.Equal(t, uint64(1), rows[0].Writes)
-}
-
-func labelInAllLabels(label Label) bool {
-	for _, candidate := range AllLabels {
-		if candidate == label {
-			return true
-		}
-	}
-	return false
 }

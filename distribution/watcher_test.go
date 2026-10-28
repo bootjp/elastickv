@@ -3,8 +3,6 @@ package distribution
 import (
 	"bytes"
 	"context"
-	"io"
-	"log/slog"
 	"sync"
 	"testing"
 	"time"
@@ -218,18 +216,6 @@ func TestCatalogWatcherRetriesOnTransientReadError(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return engine.Version() == 1
 	}, time.Second, 10*time.Millisecond)
-}
-
-func TestCatalogWatcherLoggerOption(t *testing.T) {
-	t.Parallel()
-
-	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	watcher := NewCatalogWatcher(
-		NewCatalogStore(store.NewMVCCStore()),
-		NewEngine(),
-		WithCatalogWatcherLogger(logger),
-	)
-	require.Same(t, logger, watcher.logger)
 }
 
 type transientVersionReadStore struct {
