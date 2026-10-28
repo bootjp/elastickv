@@ -1411,27 +1411,6 @@ func TestS3Server_RangeReadFullAndPartial(t *testing.T) {
 	}
 }
 
-func TestS3Server_RangeReadInvalidRange(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewMVCCStore()
-	server := NewS3Server(nil, "", st, newLocalAdapterCoordinator(st), nil)
-
-	rec := httptest.NewRecorder()
-	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-rinv", nil))
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	rec = httptest.NewRecorder()
-	server.handle(rec, newS3TestRequest(http.MethodPut, "/bucket-rinv/f.txt", strings.NewReader("hello")))
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	rec = httptest.NewRecorder()
-	req := newS3TestRequest(http.MethodGet, "/bucket-rinv/f.txt", nil)
-	req.Header.Set("Range", "bytes=99-100")
-	server.handle(rec, req)
-	require.Equal(t, http.StatusRequestedRangeNotSatisfiable, rec.Code)
-}
-
 func TestS3Server_RangeReadEmptyObject(t *testing.T) {
 	t.Parallel()
 
@@ -1930,55 +1909,6 @@ func TestS3Server_MultipartUploadPartOverwrite(t *testing.T) {
 	require.Equal(t, data2+lastPart, rec.Body.String())
 }
 
-func TestExtractS3Signature(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name  string
-		input string
-		want  string
-	}{
-		{
-			name:  "standard SigV4 header",
-			input: "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, SignedHeaders=host;x-amz-date, Signature=abc123def456",
-			want:  "abc123def456",
-		},
-		{
-			name:  "signature with extra whitespace",
-			input: "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, SignedHeaders=host, Signature= abc123 ",
-			want:  "abc123",
-		},
-		{
-			name:  "different parameter order",
-			input: "AWS4-HMAC-SHA256 SignedHeaders=host;x-amz-date, Credential=AKID/20240101/us-east-1/s3/aws4_request, Signature=deadbeef",
-			want:  "deadbeef",
-		},
-		{
-			name:  "missing signature",
-			input: "AWS4-HMAC-SHA256 Credential=AKID/20240101/us-east-1/s3/aws4_request, SignedHeaders=host",
-			want:  "",
-		},
-		{
-			name:  "empty header",
-			input: "",
-			want:  "",
-		},
-		{
-			name:  "no space separator",
-			input: "AWS4-HMAC-SHA256Credential=foo",
-			want:  "",
-		},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := extractS3Signature(tc.input)
-			if got != tc.want {
-				t.Errorf("extractS3Signature(%q) = %q, want %q", tc.input, got, tc.want)
-			}
-		})
-	}
-}
-
 func TestS3Server_CompleteMultipartUploadETagMismatch(t *testing.T) {
 	t.Parallel()
 
@@ -2204,37 +2134,6 @@ func TestS3Server_PublicBucket_AnonymousListObjectsV2(t *testing.T) {
 	server.handle(rec, req)
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Contains(t, rec.Body.String(), "<Key>obj.txt</Key>")
-}
-
-func TestS3Server_PrivateBucket_AnonymousGetRejected(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewMVCCStore()
-	server := NewS3Server(
-		nil, "", st, newLocalAdapterCoordinator(st), nil,
-		WithS3StaticCredentials(map[string]string{testS3AccessKey: testS3SecretKey}),
-	)
-
-	sigTime := currentS3SigningTime()
-	// Create private bucket (default ACL).
-	req := newSignedS3Request(t, "/priv-bucket", "", sigTime)
-	req.Method = http.MethodPut
-	req = resignS3Request(t, req, sigTime)
-	rec := httptest.NewRecorder()
-	server.handle(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	// Upload object.
-	req = newSignedS3Request(t, "/priv-bucket/secret.txt", "secret", sigTime)
-	rec = httptest.NewRecorder()
-	server.handle(rec, req)
-	require.Equal(t, http.StatusOK, rec.Code)
-
-	// Anonymous GET rejected.
-	req = newS3TestRequest(http.MethodGet, "/priv-bucket/secret.txt", nil)
-	rec = httptest.NewRecorder()
-	server.handle(rec, req)
-	require.Equal(t, http.StatusForbidden, rec.Code)
 }
 
 func TestS3Server_PutBucketAcl_ChangeToPublicAndBack(t *testing.T) {

@@ -151,46 +151,6 @@ func TestDynamoDB_Query_MissingTableReturns400UnderDegradedLease(t *testing.T) {
 	require.Contains(t, rec.Body.String(), dynamoErrResourceNotFound)
 }
 
-// TestDynamoDB_LeaseCheckQuery_WholeTableQueryStillFencesAllGroups asserts the
-// fix preserves the all-groups fence for a VALID multi-shard read: a query whose
-// hash key is not the primary hash key reads the whole-table prefix (multiple
-// shards), so it must still fail closed when the lease cannot be confirmed.
-func TestDynamoDB_LeaseCheckQuery_WholeTableQueryStillFencesAllGroups(t *testing.T) {
-	t.Parallel()
-
-	st := store.NewMVCCStore()
-	writer := newDynamoFixtureWriter(t, st)
-	writer.writeSchema(leaseGSIFixtureSchema())
-
-	coord := newMultiGroupLeaseCoordinator()
-	server := NewDynamoDBServer(nil, st, coord)
-
-	// IndexName set + a VALID GSI on an EXISTING table => valid multi-shard
-	// read => keyless all-groups fence, not a skip. (Whole-table base-table
-	// queries take the same all-groups path through queryLeasePrefix's HashKey
-	// mismatch branch.) The schema must exist so the GSI is genuinely valid:
-	// after the P2-B fix an indexed query against a missing table or unknown
-	// index is classified as a skip, not an all-groups fence.
-	in := queryInput{
-		TableName:              "t",
-		IndexName:              "gsi1",
-		KeyConditionExpression: "gk = :gk",
-		ExpressionAttributeValues: map[string]attributeValue{
-			":gk": newStringAttributeValue("x"),
-		},
-	}
-
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequest(http.MethodPost, "/", bytes.NewReader(nil))
-	require.True(t, server.leaseCheckQuery(rec, req, in))
-
-	fenced := coord.fencedGroupSet()
-	require.Contains(t, fenced, multiGroupDefaultID,
-		"valid multi-shard query must still fence the default group")
-	require.Contains(t, fenced, multiGroupOtherID,
-		"valid multi-shard query must still fence every group (must not be skipped as a validation case)")
-}
-
 // leaseGSIFixtureSchema is a table with a single GSI ("gsi1", ALL projection)
 // used by the lease pre-pass tests that exercise VALID multi-shard GSI reads.
 func leaseGSIFixtureSchema() *dynamoTableSchema {

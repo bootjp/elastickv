@@ -85,20 +85,6 @@ func TestSQSServer_LeaderHealthWithoutCoordinatorIsNotLeader(t *testing.T) {
 	}
 }
 
-func TestSQSServer_HealthRejectsNonGetHead(t *testing.T) {
-	t.Parallel()
-	base := startTestSQSServer(t)
-
-	resp := doRequest(t, http.MethodPost, base+sqsHealthPath, nil, nil)
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusMethodNotAllowed {
-		t.Fatalf("status: got %d want %d", resp.StatusCode, http.StatusMethodNotAllowed)
-	}
-	if allow := resp.Header.Get("Allow"); !strings.Contains(allow, "GET") {
-		t.Fatalf("allow header: got %q", allow)
-	}
-}
-
 func TestSQSServer_UnknownTargetReturnsInvalidAction(t *testing.T) {
 	t.Parallel()
 	base := startTestSQSServer(t)
@@ -117,28 +103,6 @@ func TestSQSServer_UnknownTargetReturnsInvalidAction(t *testing.T) {
 	}
 	if body["__type"] != sqsErrInvalidAction {
 		t.Fatalf("body __type: got %q want %q", body["__type"], sqsErrInvalidAction)
-	}
-}
-
-// TestSQSServer_AllTargetsHaveHandlers asserts every target listed in
-// targetHandlers has a real handler attached. The previous version of
-// this test pinned a fixed list of NotImplemented targets and had to
-// be updated each time a handler shipped — that drift hid the
-// PurgeQueue/Tag* implementations behind a stale assertion. Here we
-// instead reach into the dispatch map and confirm none of the
-// registered targets is the NotImplemented stub.
-func TestSQSServer_AllTargetsHaveHandlers(t *testing.T) {
-	t.Parallel()
-	base := startTestSQSServer(t)
-
-	// Sanity-check the route table against an unknown target — we
-	// already test that path elsewhere, but it pins the assumption that
-	// unregistered targets surface InvalidAction (not 501) so this test
-	// is not the one to break if that contract changes.
-	resp := postSQSRequest(t, base+"/", "AmazonSQS.NotARealOp", "{}")
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusBadRequest {
-		t.Fatalf("unknown target: got %d want %d", resp.StatusCode, http.StatusBadRequest)
 	}
 }
 

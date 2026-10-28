@@ -1087,7 +1087,7 @@ func (s *SQSServer) nextReceiveFanoutStart(queueName string, partitions uint32) 
 }
 
 // dropReceiveFanoutCounter removes any per-queue fanout-rotation
-// counter for queueName. Mirrors throttle.invalidateQueue: called
+// counter for queueName. Mirrors throttle.invalidateQueueBuckets: called
 // from the same DeleteQueue and genuine-CreateQueue paths so the
 // sync.Map does not retain a counter for every queue name the
 // process has ever served. Without this, repeated create/delete of

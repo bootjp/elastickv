@@ -422,19 +422,3 @@ func extractPresignedSignature(presignedURL string) string {
 	}
 	return parsed.Query().Get("X-Amz-Signature")
 }
-
-// extractS3Signature returns the hex signature value from a SigV4
-// Authorization header (the "Signature=<hex>" component).
-func extractS3Signature(auth string) string {
-	_, params, ok := strings.Cut(auth, " ")
-	if !ok {
-		return ""
-	}
-	for _, param := range strings.Split(params, ",") {
-		key, value, ok := strings.Cut(strings.TrimSpace(param), "=")
-		if ok && key == "Signature" {
-			return strings.TrimSpace(value)
-		}
-	}
-	return ""
-}

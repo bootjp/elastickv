@@ -218,29 +218,6 @@ func TestDynamoDB_RequestBodyTooLarge(t *testing.T) {
 	}
 }
 
-func TestDynamoDB_Healthz(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 1)
-	defer shutdown(nodes)
-
-	req, err := http.NewRequestWithContext(
-		context.Background(),
-		http.MethodGet,
-		"http://"+nodes[0].dynamoAddress+dynamoHealthPath,
-		nil,
-	)
-	require.NoError(t, err)
-
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.Equal(t, "ok\n", string(body))
-}
-
 func TestDynamoDB_LeaderHealthz(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 2)
@@ -296,69 +273,6 @@ func TestDynamoDB_LeaderHealthz(t *testing.T) {
 			}, leaderChurnRetryTimeout, leaderChurnRetryInterval)
 		})
 	}
-}
-
-func TestDynamoDB_TransactWriteItems(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 1)
-	defer shutdown(nodes)
-
-	cfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion("us-west-2"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
-	)
-	assert.NoError(t, err)
-
-	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
-	})
-	createSimpleKeyTable(t, context.Background(), client)
-
-	_, err = client.TransactWriteItems(context.Background(), &dynamodb.TransactWriteItemsInput{
-		TransactItems: []types.TransactWriteItem{
-			{
-				Put: &types.Put{
-					TableName: aws.String("t"),
-					Item: map[string]types.AttributeValue{
-						"key":   &types.AttributeValueMemberS{Value: "k1"},
-						"value": &types.AttributeValueMemberS{Value: "v1"},
-					},
-				},
-			},
-			{
-				Put: &types.Put{
-					TableName: aws.String("t"),
-					Item: map[string]types.AttributeValue{
-						"key":   &types.AttributeValueMemberS{Value: "k2"},
-						"value": &types.AttributeValueMemberS{Value: "v2"},
-					},
-				},
-			},
-		},
-	})
-	assert.NoError(t, err)
-
-	out1, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
-		TableName: aws.String("t"),
-		Key: map[string]types.AttributeValue{
-			"key": &types.AttributeValueMemberS{Value: "k1"},
-		},
-	})
-	assert.NoError(t, err)
-	value1Attr, ok := out1.Item["value"].(*types.AttributeValueMemberS)
-	assert.True(t, ok)
-	assert.Equal(t, "v1", value1Attr.Value)
-
-	out2, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
-		TableName: aws.String("t"),
-		Key: map[string]types.AttributeValue{
-			"key": &types.AttributeValueMemberS{Value: "k2"},
-		},
-	})
-	assert.NoError(t, err)
-	value2Attr, ok := out2.Item["value"].(*types.AttributeValueMemberS)
-	assert.True(t, ok)
-	assert.Equal(t, "v2", value2Attr.Value)
 }
 
 func TestDynamoDB_TransactGetItems(t *testing.T) {

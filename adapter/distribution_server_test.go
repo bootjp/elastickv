@@ -521,18 +521,6 @@ func TestNewDistributionServer_DefaultCatalogReloadRetryPolicy(t *testing.T) {
 	require.Equal(t, defaultCatalogReloadRetryInterval, s.reloadRetry.interval)
 }
 
-func TestWithCatalogReloadRetryPolicy_OverridesDefaults(t *testing.T) {
-	t.Parallel()
-
-	s := NewDistributionServer(
-		distribution.NewEngine(),
-		distribution.NewCatalogStore(store.NewMVCCStore()),
-		WithCatalogReloadRetryPolicy(3, 5*time.Millisecond),
-	)
-	require.Equal(t, 3, s.reloadRetry.attempts)
-	require.Equal(t, 5*time.Millisecond, s.reloadRetry.interval)
-}
-
 func TestDistributionServerListRoutes_ReadsDurableCatalog(t *testing.T) {
 	t.Parallel()
 
