@@ -3847,7 +3847,7 @@ func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
 	}
 	c.hlcRecoveryMu.Lock()
 	defer c.hlcRecoveryMu.Unlock()
-	if !hlcCeilingExpired(c.clock) {
+	if !hlcCeilingExhausted(c.clock) {
 		return nil
 	}
 	if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
@@ -3880,7 +3880,7 @@ func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets
 	for err := range errCh {
 		recoveryErr = combineHLCRecoveryErrors(recoveryErr, err)
 	}
-	if !hlcCeilingExpired(c.clock) {
+	if !hlcCeilingExhausted(c.clock) {
 		return nil
 	}
 	return hlcRecoveryFailedError(recoveryErr)

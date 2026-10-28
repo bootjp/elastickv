@@ -366,6 +366,26 @@ func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T
 	require.NotZero(t, got)
 }
 
+func TestShardedCoordinator_RecoverHLCLease_LogicalCeilingExhausted(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	ceiling := time.Now().Add(10 * time.Second).UnixMilli()
+	clock.SetPhysicalCeiling(ceiling)
+	clock.Observe((uint64(ceiling) << hlcLogicalBits) | hlcLogicalMask)
+	eng := newShardedLeaseEngine(100)
+	eng.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	follower := newShardedLeaseEngine(200)
+	follower.state.Store(raftengine.StateFollower)
+	coord := mustShardedLeaseCoord(t, eng, follower)
+	coord.clock = clock
+
+	_, err := coord.nextTxnTSAfter(context.Background(), 0)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), eng.proposeCalls.Load())
+	_, err = clock.NextFenced()
+	require.NoError(t, err)
+}
+
 func TestShardedCoordinator_RecoverHLCLease_SlowTargetDoesNotBlockSuccessfulPeer(t *testing.T) {
 	t.Parallel()
 	clock := NewHLC()

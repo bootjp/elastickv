@@ -747,12 +747,23 @@ func hlcRecoveryContext(ctx context.Context) (context.Context, context.CancelFun
 	return context.WithTimeout(ctx, dispatchLeaderRetryBudget)
 }
 
-func hlcCeilingExpired(clock *HLC) bool {
+// hlcCeilingExhausted covers both wall-clock expiry and a logical counter
+// that cannot advance beyond the currently committed physical ceiling.
+func hlcCeilingExhausted(clock *HLC) bool {
 	if clock == nil {
 		return false
 	}
 	ceiling := clock.PhysicalCeiling()
-	return ceiling > 0 && time.Now().UnixMilli() >= ceiling
+	if ceiling <= 0 {
+		return false
+	}
+	if time.Now().UnixMilli() >= ceiling {
+		return true
+	}
+	last := clock.Current()
+	physical := last >> hlcLogicalBits
+	return physical > uint64(ceiling) ||
+		(physical == uint64(ceiling) && last&hlcLogicalMask == hlcLogicalMask)
 }
 
 type tsoCoordinator interface {
