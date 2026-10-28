@@ -482,16 +482,20 @@ func isRawApplyVerdict(err error) bool {
 	if errors.Is(err, errTargetReadinessUnproven) {
 		return false
 	}
+	return isRawProtocolVerdict(err) ||
+		isRawRouteVerdict(err) ||
+		errors.Is(err, ErrTxnLocked) ||
+		store.IsApplyVerdict(err)
+}
+
+func isRawProtocolVerdict(err error) bool {
 	return errors.Is(err, ErrInvalidRequest) ||
 		errors.Is(err, ErrMigrationTransferTooLarge) ||
 		errors.Is(err, ErrRouteCutoverPending) ||
 		errors.Is(err, ErrUnknownRequestType) ||
 		errors.Is(err, ErrTTLInlineCapabilityRequired) ||
 		errors.Is(err, ErrBackupTimestampFenced) ||
-		errors.Is(err, ErrPrepareCreationSealed) ||
-		isRawRouteVerdict(err) ||
-		errors.Is(err, ErrTxnLocked) ||
-		store.IsApplyVerdict(err)
+		errors.Is(err, ErrPrepareCreationSealed)
 }
 
 func isRawRouteVerdict(err error) bool {

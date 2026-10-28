@@ -42,21 +42,34 @@ func (d *MemoryDispatcher) Dispatch(
 ) (*kv.CoordinateResponse, error) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
-	commitTS := d.store.LastCommitTS() + 1
+	commitTS := memoryCommitTimestamp(d.store.LastCommitTS(), req)
+	mutations, err := memoryMutations(req.Elems, commitTS)
+	if err != nil {
+		return nil, err
+	}
+	if err := d.store.ApplyMutations(ctx, mutations, req.ReadKeys, req.StartTS, commitTS); err != nil {
+		return nil, errors.Wrap(err, "apply memory dispatcher mutations")
+	}
+	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+}
+
+func memoryCommitTimestamp(lastTS uint64, req *kv.OperationGroup[kv.OP]) uint64 {
+	commitTS := lastTS + 1
 	if req.CommitTS > commitTS {
 		commitTS = req.CommitTS
 	}
 	if req.IsTxn && commitTS <= req.StartTS {
 		commitTS = req.StartTS + 1
 	}
-	mutations := make([]*store.KVPairMutation, 0, len(req.Elems))
-	for _, elem := range req.Elems {
-		value := append([]byte(nil), elem.Value...)
-		if elem.CommitTSValueOffset != 0 {
-			if len(value) < commitTimestampBytes || elem.CommitTSValueOffset > uint64(len(value)-commitTimestampBytes) {
-				return nil, errors.WithStack(filesystem.ErrInvalid)
-			}
-			binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:], commitTS)
+	return commitTS
+}
+
+func memoryMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
+	mutations := make([]*store.KVPairMutation, 0, len(elems))
+	for _, elem := range elems {
+		value, err := memoryMutationValue(elem, commitTS)
+		if err != nil {
+			return nil, err
 		}
 		switch elem.Op {
 		case kv.Put:
@@ -76,10 +89,18 @@ func (d *MemoryDispatcher) Dispatch(
 			return nil, errors.WithStack(store.ErrUnknownOp)
 		}
 	}
-	if err := d.store.ApplyMutations(ctx, mutations, req.ReadKeys, req.StartTS, commitTS); err != nil {
-		return nil, errors.Wrap(err, "apply memory dispatcher mutations")
+	return mutations, nil
+}
+
+func memoryMutationValue(elem *kv.Elem[kv.OP], commitTS uint64) ([]byte, error) {
+	value := append([]byte(nil), elem.Value...)
+	if elem.CommitTSValueOffset != 0 {
+		if len(value) < commitTimestampBytes || elem.CommitTSValueOffset > uint64(len(value)-commitTimestampBytes) {
+			return nil, errors.WithStack(filesystem.ErrInvalid)
+		}
+		binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:], commitTS)
 	}
-	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
+	return value, nil
 }
 
 // NewMemoryService builds a filesystem.Service over a fresh in-memory MVCC
