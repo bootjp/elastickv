@@ -629,7 +629,7 @@ Record each mutation in the PR as a row: file and line, the change, the test tha
 ## Follow-ups (out of scope)
 
 - **Product bugs found by the audit.** Each needs its own PR with a failing test first.
-  - SQS FIFO messages in one group sent within the same millisecond can be received out of order. The visibility key orders by `(visibleAtMillis, random messageID)`. `TestSQSServer_FifoGroupLockHoldsAcrossVisibilityExpiry` and `TestSQSServer_FifoSequenceNumberMonotonic` fail roughly 7/30 and 2/30 runs without `-race`.
+  - Fixed: SQS FIFO messages in one group sent within the same millisecond could be received out of order, because the visibility key orders by `(visibleAtMillis, random messageID)`. See `2026_10_29_implemented_sqs_fifo_same_millisecond_order.md`.
   - The Redis TTL-inline migration builds zero scan plans in production. `startupGatedCoordinator` does not forward `LocalLeaderGroupIDs`, and `keyVizLabeledCoordinator` returns nil when the inner value lacks it. Regression since `a36dac7f`.
   - Admin write authorization: SQS trusts the live role alone; S3 and DynamoDB require both the JWT role and the live role. Tests pin both. A policy decision is needed.
   - S3 SigV4 `ListObjectsV2` returns 500 for an expired continuation token; only the admin path translates `ErrReadTSCompacted`.
