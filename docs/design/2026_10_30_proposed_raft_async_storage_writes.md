@@ -195,3 +195,64 @@ This is a liveness/durability prerequisite discovered while validating S3.
 It is a separate PR, not an S3 semantic change or completion of all design
 documents. Publish measured limits and remaining failure conditions rather
 than claiming progress through an indefinitely unavailable disk or CPU.
+
+## Local Implementation Checkpoint
+
+The reviewed design is accepted; the implementation is not shipped or complete.
+The first implementation checkpoint provides these independently tested pieces:
+
+- Overflow-safe byte/item reservations with idempotent retirement, including
+  zero-byte control work and concurrent acquisition/release.
+- A FIFO worker with nonblocking admission. Reservations remain charged through
+  execution and completed-but-not-retired receipts. A rejected submission keeps
+  caller ownership; a failed operation fences later operations and returns each
+  accepted token exactly once. Quiescing does not cancel an executing Save or
+  discard completions when the owner must resume pumping them.
+- Disk-only append conversion preserving entries, snapshots and full HardState.
+  Every response-bearing append explicitly Syncs, including a response-only
+  flush after previous unsynced work. The completion retains the original local
+  message and opaque responses; it does not itself dispatch responses or claim
+  that a snapshot has been restored.
+
+Local verification on Darwin/arm64:
+
+```sh
+go test -race ./internal/raftengine/etcd \
+  -run '^Test(AsyncStorageAppend|StorageWork)' -count=20
+golangci-lint run ./... --timeout=5m
+go test ./internal/raftengine/etcd -run '^$' \
+  -bench '^BenchmarkStorageWorkerRoundTrip$' -benchmem -count=3
+```
+
+The focused race run passed in 7.150s. Native WAL clean-reopen cases preserve
+term, cleared vote, commit, entry payload and inline snapshot contents. Separate
+Save/Sync gates prove no disk completion while either required operation is held.
+Lifecycle tests cover full completion queues, concurrent shutdown/admission/error,
+independent bulk/control budgets, a successful prefix followed by error/panic, and
+retirement only after owner consumption. A clean reopen is not a crash/power-loss
+test. The actor-only benchmark measured 318.3-321.9 ns/op, 24 B/op and one
+allocation/op on an Apple M1 Max; it measures neither WAL nor FSM throughput.
+
+Five review passes for this checkpoint:
+
+1. Data loss: disk failures preserve error identity and prevent subsequent work;
+   neither quiesce nor cancellation fabricates success or closes storage early.
+   Snapshot resource installation/recovery is still a separate integration gate.
+2. Concurrency/distributed failures: worker/budget race cases pass; only immutable
+   task inputs cross the boundary. No worker calls RawNode. Engine leadership,
+   membership and shutdown callback integration is not yet validated.
+3. Performance: queue/byte accounting is bounded and rejected reservations are
+   rolled back. Actor overhead is measured separately from payload and disk work.
+4. Consistency: complete term/vote/commit and opaque response order are retained.
+   No timestamp policy or active FSM/apply behavior has changed.
+5. Coverage: focused lifecycle/append/budget tests pass, including real WAL codecs.
+   The actual Engine regression still detects stopped heartbeats during held
+   user-entry Save; releasing Save still completes the real proposal. This is
+   retained failing evidence, not a passed engine or full-suite acceptance.
+
+The engine still uses synchronous Ready/Advance. These pieces must be integrated
+with the owner loop, an ordered apply actor, configuration/snapshot handshakes,
+end-to-end ingress/unstable/outbound accounting, control reserves, and pumping
+shutdown before enabling AsyncStorageWrites. The runtime, encrypted recovery,
+native quorum acceptance, full race/Jepsen and final-push review/CI gates above
+remain open. Per-worker accounting alone does not satisfy the whole-engine bound.
