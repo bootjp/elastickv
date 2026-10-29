@@ -1396,7 +1396,7 @@ func (s *SQSServer) tryDeliverCandidate(
 	lockState := fifoLockAcquire
 	var lockKey []byte
 	if rec.MessageGroupId != "" {
-		state, key, err := s.classifyFifoGroupLock(ctx, queueName, meta, cand.partition, gen, rec, readTS)
+		state, key, err := s.classifyFifoCandidate(ctx, queueName, meta, cand, rec, readTS)
 		if err != nil {
 			return nil, false, err
 		}
