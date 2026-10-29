@@ -97,6 +97,9 @@ func (s *S3Server) loadS3MultipartUploadMeta(ctx context.Context, readTS uint64,
 }
 
 func (s *S3Server) loadS3MultipartParts(ctx context.Context, readTS uint64, requested []s3CompleteMultipartUploadPart, completion *s3MultipartCompletion) error {
+	if err := validateS3MultipartReadKeyBudget(completion, len(requested)); err != nil {
+		return err
+	}
 	completion.manifestParts = make([]s3ObjectPart, 0, len(requested))
 	completion.partKeys = make([][]byte, 0, len(requested))
 	md5Concat := md5.New() //nolint:gosec // S3 composite ETag compatibility requires MD5.

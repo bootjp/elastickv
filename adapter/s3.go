@@ -493,13 +493,15 @@ func (s *S3Server) handle(w http.ResponseWriter, r *http.Request) {
 	if s.serveS3LeaderHealthz(w, r) {
 		return
 	}
-	if s.maybeProxyToLeader(w, r) {
-		return
-	}
-
 	bucket, objectKey, hasObject, err := parseS3Path(r)
 	if err != nil {
 		writeS3Error(w, http.StatusBadRequest, "InvalidURI", err.Error(), bucket, objectKey)
+		return
+	}
+	if rejectOversizedS3ObjectKey(w, objectKey, hasObject) {
+		return
+	}
+	if s.maybeProxyToLeader(w, r) {
 		return
 	}
 
