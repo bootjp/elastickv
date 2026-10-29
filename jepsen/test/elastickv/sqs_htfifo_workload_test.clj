@@ -159,3 +159,7 @@
         r    (check-history hist)]
     (is (:valid? r) (str "got " (pr-str r)))
     (is (empty? (:ordering-violations r)))))
+
+(deftest checker-rejects-vacuous-history
+  (is (false? (:valid? (check-history []))))
+  (is (false? (:valid? (check-history [(send-op 100 "g0" 0 :type :info)])))))
