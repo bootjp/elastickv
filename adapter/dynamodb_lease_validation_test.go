@@ -545,3 +545,51 @@ func TestDynamoDB_LeaseCheckQuery_InvalidExclusiveStartKeySkipsLease(t *testing.
 	require.Equal(t, 0, coord.allGroupsCalls,
 		"invalid ExclusiveStartKey must not trigger the lease check — the transaction is doomed by validation")
 }
+
+// TestQueryLeasePrefix_BaseTableClassification pins the base-table lease plan.
+// queryLeasePrefix is reached only for a Query without IndexName, whose key
+// schema is always the primary key, so a valid condition resolves to the
+// single hash-key prefix and anything else is a validation skip: the
+// base-table path never classifies as an all-groups read.
+func TestQueryLeasePrefix_BaseTableClassification(t *testing.T) {
+	t.Parallel()
+
+	schema := leaseGSIFixtureSchema()
+	pinned := queryInput{
+		TableName:                 "t",
+		KeyConditionExpression:    "pk = :pk",
+		ExpressionAttributeValues: map[string]attributeValue{":pk": newStringAttributeValue("tenant")},
+	}
+	wantPrefix, err := queryScanPrefix(schema, pinned, schema.PrimaryKey, newStringAttributeValue("tenant"))
+	require.NoError(t, err)
+
+	for _, tc := range []struct {
+		name       string
+		in         queryInput
+		wantPlan   queryLeasePlan
+		wantPrefix []byte
+	}{
+		{name: "hash key pinned", in: pinned, wantPlan: queryLeaseSingleGroup, wantPrefix: wantPrefix},
+		{
+			name: "condition on a non-key attribute",
+			in: queryInput{
+				TableName:                 "t",
+				KeyConditionExpression:    "gk = :gk",
+				ExpressionAttributeValues: map[string]attributeValue{":gk": newStringAttributeValue("x")},
+			},
+			wantPlan: queryLeaseSkip,
+		},
+		{
+			name:     "malformed condition",
+			in:       queryInput{TableName: "t", KeyConditionExpression: "pk ="},
+			wantPlan: queryLeaseSkip,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			prefix, plan := queryLeasePrefix(tc.in, schema)
+			require.Equal(t, tc.wantPlan, plan)
+			require.Equal(t, tc.wantPrefix, prefix)
+		})
+	}
+}

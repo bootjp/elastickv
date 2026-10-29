@@ -297,10 +297,11 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 }
 
 // queryLeasePrefix resolves the single hash-key prefix a base-table Query
-// reads, classifying the read into queryLeaseSingleGroup (resolved prefix),
-// queryLeaseAllGroups (whole-table prefix: a valid multi-shard read), or
+// reads, classifying the read into queryLeaseSingleGroup (resolved prefix) or
 // queryLeaseSkip (malformed KeyConditionExpression: a validation error the
-// read path rejects identically). The validation error is deliberately not
+// read path rejects identically). It is only reached without an IndexName, so
+// the key schema is always the primary key; GSI queries take
+// gsiQueryLeasePlan instead. The validation error is deliberately not
 // surfaced — only the routing classification matters here, and the read path
 // reports the identical error downstream.
 func queryLeasePrefix(in queryInput, schema *dynamoTableSchema) ([]byte, queryLeasePlan) {
@@ -309,12 +310,6 @@ func queryLeasePrefix(in queryInput, schema *dynamoTableSchema) ([]byte, queryLe
 		// Malformed/unsupported KeyConditionExpression: a deterministic
 		// ValidationException the read path produces without touching data.
 		return nil, queryLeaseSkip
-	}
-	// A query whose key schema hash key differs from the primary hash
-	// key reads the whole-table prefix (see queryScanPrefix), which can
-	// span multiple shards; let the all-groups check cover them.
-	if keySchema.HashKey != schema.PrimaryKey.HashKey {
-		return nil, queryLeaseAllGroups
 	}
 	prefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
 	if err != nil {
