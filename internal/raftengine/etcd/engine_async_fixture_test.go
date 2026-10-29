@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	etcdstorage "go.etcd.io/etcd/server/v3/storage"
 	etcdraft "go.etcd.io/raft/v3"
@@ -308,8 +309,18 @@ func (h *asyncStorageRuntime) propose(payload []byte) chan proposalResult {
 	h.proposals.Add(1)
 	go func() {
 		defer h.proposals.Done()
-		result, err := h.engine.Propose(h.ctx, payload)
-		done <- proposalResult{result: result, err: err}
+		for {
+			result, err := h.engine.Propose(h.ctx, payload)
+			if !errors.Is(err, errStorageWorkBackpressure) {
+				done <- proposalResult{result: result, err: err}
+				return
+			}
+			// This sentinel is returned only by reservation BEFORE request-ID
+			// allocation/copy/handoff. Wait for that admission, never retry an
+			// unknown, leadership error or possibly replicated operation.
+			// Admission assertions call Engine.Propose directly instead.
+			runtime.Gosched()
+		}
 	}()
 	return done
 }

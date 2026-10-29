@@ -5296,9 +5296,9 @@ func cloneDispatchEntries(entries []*raftpb.Entry) []*raftpb.Entry {
 			cloned = append(cloned, nil)
 			continue
 		}
-		clonedEntry := *entry
-		clonedEntry.Data = append([]byte(nil), entry.Data...)
-		cloned = append(cloned, &clonedEntry)
+		// WAL marshaling can concurrently update protobuf's internal cache.
+		// Clone protocol fields, never copy the generated message internals.
+		cloned = append(cloned, proto.CloneOf(entry))
 	}
 	return cloned
 }

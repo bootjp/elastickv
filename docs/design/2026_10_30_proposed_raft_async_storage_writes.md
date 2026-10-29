@@ -478,6 +478,30 @@ fresh export of only staged/tracked files (no unpublished files) passes full
 repository lint and the entire engine race package without any skipped test
 (47.392s). This fixes published-tree hygiene, not the default heartbeat stall.
 
+The first pipeline Go CI also exposed a scheduling assumption in the fault
+fixture: a leader callback can precede reopening bulk proposal admission. The
+baseline was refused by the actual pre-request reservation, before fault
+injection. A single-scheduler local run reproduced the same rejection. The
+fixture now waits only on the private pre-admission budget sentinel; unknown,
+leadership and other errors still terminate the call, and admission tests call
+Engine.Propose directly. No production retry, timeout or capacity change is
+introduced. Reservation/error producers and all callers were audited.
+
+That stronger native repetition then exposed a real concurrent ownership bug:
+WAL proto.Marshal writes an entry's internal size cache while the owner cloned
+an outbound entry with a whole generated-struct copy. A small concurrent-marshal
+regression reproduced the race before the fix (0.825s). Outbound entry cloning
+now uses proto.CloneOf, preserving payload deep-copy, optional presence and
+unknown wire fields without copying internal caches. The clone/wire controls
+pass twenty race repetitions (2.021s); the actual cross-actor fault scenario
+passes one hundred single-scheduler race repetitions (34.386s). Both ordinary
+dispatch and retained removal notifications use this audited clone helper.
+These results do not replace snapshot/configuration ownership acceptance.
+The final tracked-files-only export passes unfiltered repository lint and the
+entire engine race package with no skipped tests (47.629s). Independent review
+and separate single-scheduler repetitions found no remaining clone/admission
+finding. Fresh final-push review and CI are still required for publication.
+
 Configuration application and received/local snapshots remain unsupported by
 this internal runtime. Startup/configuration journals, snapshot restore and
 checkpoint handshakes, full physical ownership/accounting, encrypted recovery,
