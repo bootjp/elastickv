@@ -2,7 +2,9 @@ package admin
 
 import (
 	"context"
+	stdjson "encoding/json"
 	"errors"
+	"io"
 	"log/slog"
 	"net/http"
 	"path"
@@ -65,6 +67,7 @@ type QueueCounters struct {
 // return the structured sentinels below so the handler can map them
 // to HTTP statuses without leaking the adapter's error vocabulary.
 type QueuesSource interface {
+	AdminCreateQueue(ctx context.Context, principal AuthPrincipal, name string, attrs map[string]string) error
 	AdminListQueues(ctx context.Context) ([]string, error)
 	AdminDescribeQueue(ctx context.Context, name string) (*QueueSummary, bool, error)
 	AdminDeleteQueue(ctx context.Context, principal AuthPrincipal, name string) error
@@ -315,6 +318,7 @@ func (h *SqsHandler) WithRoleStore(r RoleStore) *SqsHandler {
 
 // ServeHTTP routes the SQS admin paths:
 //
+//	POST   /admin/api/v1/sqs/queues                       — create
 //	GET    /admin/api/v1/sqs/queues                       — list
 //	GET    /admin/api/v1/sqs/queues/{name}                — describe
 //	DELETE /admin/api/v1/sqs/queues/{name}                — delete
@@ -399,8 +403,10 @@ func (h *SqsHandler) serveCollectionRoot(w http.ResponseWriter, r *http.Request,
 	switch r.Method {
 	case http.MethodGet:
 		h.handleList(w, r)
+	case http.MethodPost:
+		h.handleCreate(w, r)
 	default:
-		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET")
+		writeJSONError(w, http.StatusMethodNotAllowed, "method_not_allowed", "only GET or POST")
 	}
 	return true
 }
@@ -589,6 +595,44 @@ func (h *SqsHandler) handleList(w http.ResponseWriter, r *http.Request) {
 			slog.String("error", err.Error()),
 		)
 	}
+}
+
+const adminSQSCreateBodyLimit = 64 << 10
+
+type createQueueRequest struct {
+	Name       string            `json:"name"`
+	Attributes map[string]string `json:"attributes,omitempty"`
+}
+
+func (h *SqsHandler) handleCreate(w http.ResponseWriter, r *http.Request) {
+	principal, ok := h.principalForWrite(w, r, "create queues")
+	if !ok {
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, adminSQSCreateBodyLimit)
+	dec := stdjson.NewDecoder(r.Body)
+	dec.DisallowUnknownFields()
+	var req createQueueRequest
+	if err := dec.Decode(&req); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "request body must be a JSON object (maximum 64 KiB)")
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); err != io.EOF {
+		writeJSONError(w, http.StatusBadRequest, "invalid_request", "request body must contain a single JSON object")
+		return
+	}
+	if strings.TrimSpace(req.Name) == "" {
+		writeJSONError(w, http.StatusBadRequest, "invalid_queue_name", "queue name is required")
+		return
+	}
+	if err := h.source.AdminCreateQueue(r.Context(), principal, req.Name, req.Attributes); err != nil {
+		writeQueuesError(w, err, h.logger, r)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Location", pathPrefixSqsQueues+req.Name)
+	writeAdminJSONStatus(w, r.Context(), h.logger, http.StatusCreated, map[string]string{"name": req.Name})
 }
 
 func (h *SqsHandler) handleDescribe(w http.ResponseWriter, r *http.Request, name string) {
