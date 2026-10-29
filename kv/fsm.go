@@ -119,6 +119,7 @@ type kvFSM struct {
 	replicatedPins                *replicatedPinJournal
 	replicatedPinLoadErr          error
 	prepareEvidenceEnabled        atomic.Bool
+	commitTSFenceEnabled          atomic.Bool
 	prepareCreationSealed         atomic.Bool
 	prepareEvidenceReleaseFloor   atomic.Uint64
 	prepareEvidenceTimestampFloor atomic.Uint64
@@ -552,6 +553,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeCommitTSFenceActivation:
+		return f.applyCommitTSFenceActivation(ctx, data[1:]), true
 	case data[0] == raftEncodeWatermarkAdvance:
 		return f.applyWatermarkAdvance(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
@@ -835,10 +838,8 @@ func (f *kvFSM) handleRawRequest(ctx context.Context, r *pb.Request, commitTS ui
 	if err := f.recordMigrationWrite(ctx, r.Mutations, commitTS); err != nil {
 		return err
 	}
-	// Raw requests always commit against the latest state; use commitTS as both
-	// the validation snapshot and the commit timestamp.
-	if err := f.store.ApplyMutationsRaftAt(ctx, muts, nil, commitTS, commitTS, f.pendingApplyIdx); err != nil {
-		return errors.WithStack(err)
+	if err := f.applyRawMutations(ctx, muts, commitTS); err != nil {
+		return err
 	}
 	f.notifyApplyObservers(commitTS, r.Mutations)
 	return nil
@@ -2059,6 +2060,9 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 
 	storeMuts, err := f.buildPrepareStoreMutations(ctx, uniq, meta.PrimaryKey, startTS, expireAt, meta.PrepareCommitTS)
 	if err != nil {
+		return err
+	}
+	if err := f.checkPrepareCommitTSFence(meta, storeMuts); err != nil {
 		return err
 	}
 	return f.recordAndApplyPrepare(ctx, uniq, storeMuts, r.ReadKeys, floorTS, startTS)

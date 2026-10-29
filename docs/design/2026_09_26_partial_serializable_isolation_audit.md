@@ -730,11 +730,12 @@ paths G0 names, behind a replicated activation.
   the check passes with `ReadAdvance` and fails without it.
 - **Activation.** A fence changes the FSM verdict, so a per-node flag would
   let replicas of one group disagree. A replicated activation entry (FSM
-  tag `0x18`) persists a marker key per group, reloaded at open and after
+  tag `0x1f`, an invalid protobuf prefix; `0x18` would be a legacy
+  `Request`'s `ts` tag) persists a marker key per group, reloaded at open and after
   a snapshot restore; the FSM fences raw entries and PREPAREs only once the
   marker is set. With `--commitTSFence`, each group's leader proposes the
   activation once it finds the marker missing. The operator enables the
-  flag only after every node runs a binary that knows tag `0x18`; an older
+  flag only after every node runs a binary that knows tag `0x1f`; an older
   replica fails to decode the entry and does not fence, which is the same
   rolling-upgrade rule as `--readWatermarkAdvance`.
 - **Still open:** `DEL_PREFIX`; the replica-determinism caveat above (the

@@ -538,7 +538,13 @@ type ShardedCoordinator struct {
 	// hlcRenewalBlocked lets startup code temporarily suppress background HLC
 	// lease proposals while another startup-only Raft mutation must run first.
 	hlcRenewalBlocked func() bool
-	hlcRecoveryMu     sync.Mutex
+	// commitTSFenceActivation makes the coordinator propose the raw and
+	// PREPARE apply-order fence activation on groups it leads
+	// (WithCommitTSFenceActivation).
+	commitTSFenceActivation         bool
+	commitTSFenceActivationInFlight atomic.Bool
+	commitTSFenceActiveGroups       sync.Map
+	hlcRecoveryMu                   sync.Mutex
 	// hlcRenewalInFlight prevents a slow or quorum-stalled group from stacking
 	// another background HLC lease proposal for the same group on the next tick.
 	hlcRenewalMu       sync.Mutex
@@ -1402,10 +1408,7 @@ func (c *ShardedCoordinator) dispatchExplicitGroupNonTxn(ctx context.Context, re
 
 func (c *ShardedCoordinator) dispatchRawWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP]) (*CoordinateResponse, error) {
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
-		resp, handled, err := c.dispatchBeforeShardRouting(ctx, reqs)
-		if !handled {
-			resp, err = c.dispatchNonTxn(ctx, reqs)
-		}
+		resp, err := c.dispatchRawWithFenceRetry(ctx, reqs)
 		if err == nil {
 			return resp, nil
 		}
@@ -3711,6 +3714,7 @@ func (c *ShardedCoordinator) RunHLCLeaseRenewal(ctx context.Context) {
 				continue
 			}
 			c.renewHLCLeases(ctx)
+			c.activateCommitTSFencesAsync(ctx)
 			timer.Reset(hlcRenewalInterval)
 		case <-ctx.Done():
 			return
