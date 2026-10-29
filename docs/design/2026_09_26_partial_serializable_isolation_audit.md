@@ -1125,6 +1125,41 @@ code at fix time and turns the `N` rows into fixes:
 - gRPC: none in this audit; the API gap (G8) is documented in the positioning
   doc and README.
 
+#### S3 A1 completion plan (2026-10-30)
+
+The unpublished branch described below is historical evidence, not a merge
+or acceptance receipt. Implementation now proceeds from main `c316b829e` on
+`design/serializable-audit-a1-s3-validation`; the open A0 PR #1355 is separate.
+
+- Every completion attempt acquires one read timestamp, loads the bucket,
+  upload metadata, requested part descriptors and replaced manifest at that
+  snapshot, then commits with every consumed descriptor key in `ReadKeys`.
+  A retry repeats those reads and ETag checks rather than reusing a manifest
+  assembled from an earlier snapshot.
+- UploadPart keeps its streamed blob namespace and read voucher, but checks
+  the upload, bucket generation and superseded descriptor again before its
+  descriptor commit. The read set contains the upload metadata, generation
+  key and part key. Bucket deletion re-puts the generation key, preserving
+  its maximum value, in both public and admin deletion transactions. Other
+  object writers do not write that key, so parallel unrelated uploads do
+  not acquire an accidental bucket-wide conflict.
+- Support all 10,000 requested parts during staged-visibility migration as
+  well as normal routing. The physical read-key cap is bounded at
+  `2 * (10_000 + 240)` to include migration aliases and control-key headroom.
+  Retain every existing cap check and every alias; do not accept the older
+  branch's approximately 4,998-part migration limitation as completion.
+- Multipart conflicts that are proven noncommits can use the existing
+  bounded completion retry or a 503 SlowDown response for the consumed
+  upload body. Unknown outcomes must not become permission to replay.
+- Red/green regressions run through the production ShardedCoordinator/FSM,
+  including both part-read windows, deletion/recreation, superseded blob
+  cleanup, unrelated bucket writes, maximum part counts and alias capacity.
+  Test server-side data and cleanup effects, not only HTTP status codes.
+- Verify all changed helper callers, full adapter/KV/store race suites,
+  unfiltered lint, relevant Jepsen checks, and latest-push review/CI. A1 does
+  not establish cross-group serializability before A2's read-lock protocol,
+  nor close any other audit milestone.
+
 Status of the S3 half: landed on branch `design/serializable-audit-a1-s3`
 (from `main`, not pushed): `3a975625` adds
 `adapter/s3_multipart_occ_repro_test.go`, four cases through the real FSM
