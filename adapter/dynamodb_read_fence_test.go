@@ -232,7 +232,7 @@ func TestDynamoDBTransactWriteWaitsForPendingItemUpdate(t *testing.T) {
 	first.ExpressionAttributeValues[":val"] = numberListAttr("2")
 	updateDone := dynamoHandlerStatus(t, server.updateItem, first)
 
-	var firstCommitTS uint64 = testutil.Recv(t, coord.firstEntered, 2*time.Second, "first update did not reach dispatch")
+	var firstCommitTS = testutil.Recv(t, coord.firstEntered, 2*time.Second, "first update did not reach dispatch")
 	// Raise the global watermark past the pending item write. A read fence
 	// cannot observe an entry that has not been proposed to Raft yet.
 	require.NoError(t, st.PutAt(ctx, []byte("other"), []byte("x"), firstCommitTS+1, 0))
@@ -278,7 +278,7 @@ func TestDynamoDBTwoServersSealPendingItemWrite(t *testing.T) {
 	first := appendListInput()
 	first.ExpressionAttributeValues[":val"] = numberListAttr("2")
 	updateDone := dynamoHandlerStatus(t, firstServer.updateItem, first)
-	var firstCommitTS uint64 = testutil.Recv(t, coord.firstEntered, 2*time.Second, "first update did not reach dispatch")
+	var firstCommitTS = testutil.Recv(t, coord.firstEntered, 2*time.Second, "first update did not reach dispatch")
 	require.NoError(t, st.PutAt(ctx, []byte("other"), []byte("x"), firstCommitTS+1, 0))
 	second := transactWriteItemsInput{TransactItems: []transactWriteItem{{Update: &transactUpdateInput{
 		TableName:                 first.TableName,
@@ -317,7 +317,7 @@ func TestDynamoDBSnapshotSealSurvivesLeaderSwitch(t *testing.T) {
 	first := appendListInput()
 	first.ExpressionAttributeValues[":val"] = numberListAttr("2")
 	updateDone := dynamoHandlerStatus(t, firstServer.updateItem, first)
-	var firstCommitTS uint64 = testutil.Recv(t, oldLeader.firstEntered, 2*time.Second, "old leader did not allocate the write timestamp")
+	var firstCommitTS = testutil.Recv(t, oldLeader.firstEntered, 2*time.Second, "old leader did not allocate the write timestamp")
 	require.NoError(t, st.PutAt(ctx, []byte("other"), []byte("x"), firstCommitTS+1, 0))
 	newLeader.Clock().Observe(firstCommitTS + 1)
 	oldLeader.switched.Store(true)
