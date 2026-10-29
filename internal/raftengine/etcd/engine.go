@@ -396,6 +396,9 @@ type Engine struct {
 	runErr  error
 	closed  bool
 	applied uint64
+
+	snapshotConfigurations           snapshotConfigurationHistory
+	snapshotConfigurationReplayIndex uint64
 	// voterCount is the count of nodes in the latest applied
 	// ConfState.Voters (including self if voter). isLearnerNode is the
 	// matching set membership lookup keyed by node ID. Both are written
@@ -578,8 +581,9 @@ type readResult struct {
 }
 
 type snapshotRequest struct {
-	index    uint64
-	snapshot Snapshot
+	index     uint64
+	snapshot  Snapshot
+	confState *raftpb.ConfState
 }
 
 type snapshotResult struct {
@@ -2730,6 +2734,8 @@ func (e *Engine) applyReadySnapshotLocked(snapshot *raftpb.Snapshot) error {
 		return errors.Wrapf(err, "apply snapshot to raft storage index=%d term=%d",
 			snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetTerm())
 	}
+	e.snapshotConfigurations.reset(snapshot.GetMetadata().GetIndex(), snapshot.GetMetadata().GetConfState())
+	e.snapshotConfigurationReplayIndex = 0
 	e.applied = snapshot.GetMetadata().GetIndex()
 	e.appliedIndex.Store(snapshot.GetMetadata().GetIndex())
 	e.clearPendingConfChange(snapshot.GetMetadata().GetIndex())
@@ -2812,8 +2818,17 @@ func (e *Engine) restorePendingConfChangeFenceFromStorage(applied uint64) error 
 	if err != nil {
 		return err
 	}
+	hardState, _, err := e.storage.InitialState()
+	if err != nil {
+		return errors.Wrap(err, "restore configuration replay prefix")
+	}
+	e.snapshotConfigurationReplayIndex = 0
 	for _, entry := range entries {
 		e.restorePendingConfChangeFenceFromEntry(entry)
+		if entry.GetIndex() <= e.applied && entry.GetIndex() <= hardState.GetCommit() &&
+			(entry.GetType() == raftpb.EntryConfChange || entry.GetType() == raftpb.EntryConfChangeV2) {
+			e.snapshotConfigurationReplayIndex = entry.GetIndex()
+		}
 	}
 	return nil
 }
@@ -2878,7 +2893,7 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 	if e.applied <= currentIndex || e.applied-currentIndex < e.snapshotThreshold() {
 		return nil
 	}
-	snapshot, err := e.fsm.Snapshot()
+	req, err := e.captureLocalSnapshotRequest(e.applied)
 	if err != nil {
 		if snapshotDeferred(err, "local snapshot", e.applied) {
 			return nil
@@ -2886,10 +2901,6 @@ func (e *Engine) maybePersistLocalSnapshot() error {
 		return errors.WithStack(err)
 	}
 
-	req := snapshotRequest{
-		index:    e.applied,
-		snapshot: snapshot,
-	}
 	return e.enqueueSnapshotRequest(req)
 }
 
@@ -2992,6 +3003,9 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	if err := e.persistConfigApplyPlan(plan); err != nil {
 		return err
 	}
+	if err := e.recordSnapshotConfiguration(plan); err != nil {
+		return err
+	}
 	e.applyConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), plan.index, plan.confState)
 	e.clearPendingConfChange(plan.index)
 	e.setApplied(plan.index)
@@ -3012,6 +3026,9 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	if err := e.persistConfigApplyPlan(plan); err != nil {
 		return err
 	}
+	if err := e.recordSnapshotConfiguration(plan); err != nil {
+		return err
+	}
 	e.applyConfigChangeV2(cc, plan.index, plan.confState)
 	e.clearPendingConfChange(plan.index)
 	e.setApplied(plan.index)
@@ -3027,6 +3044,9 @@ type configApplyPlan struct {
 }
 
 func (e *Engine) transitionConfChange(index uint64, cc raftpb.ConfChange) (configApplyPlan, error) {
+	if err := e.ensureSnapshotConfigurationHistory(); err != nil {
+		return configApplyPlan{}, err
+	}
 	confState := confStateValue(proto.CloneOf(e.rawNode.ApplyConfChange(&cc)))
 	peers, err := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confState)
 	if err != nil {
@@ -3036,6 +3056,9 @@ func (e *Engine) transitionConfChange(index uint64, cc raftpb.ConfChange) (confi
 }
 
 func (e *Engine) transitionConfChangeV2(index uint64, cc raftpb.ConfChangeV2) (configApplyPlan, error) {
+	if err := e.ensureSnapshotConfigurationHistory(); err != nil {
+		return configApplyPlan{}, err
+	}
 	confState := confStateValue(proto.CloneOf(e.rawNode.ApplyConfChange(&cc)))
 	peers, err := e.nextPeersAfterConfigChangeV2(cc, confState)
 	if err != nil {
@@ -3608,7 +3631,9 @@ func (e *Engine) snapshotPayloadLocked(index uint64) ([]byte, error) {
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
-	if index <= current.GetMetadata().GetIndex() {
+	// A cold-start FSM can lead the configuration replay. Never serialize its
+	// newer contents under an older configuration entry's snapshot index.
+	if index < e.applied || index <= current.GetMetadata().GetIndex() {
 		return nil, errors.WithStack(raftengine.ErrSnapshotDeferred)
 	}
 	if e.fsmSnapDir == "" {
@@ -5344,7 +5369,9 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 		if err != nil {
 			return err
 		}
-		return e.persistLocalSnapshotPayload(req.index, payload)
+		e.snapshotMu.Lock()
+		defer e.snapshotMu.Unlock()
+		return e.persistLocalSnapshotPayloadLocked(req.index, payload, req.confState)
 	}
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
@@ -5371,7 +5398,7 @@ func (e *Engine) persistLocalSnapshot(req snapshotRequest) error {
 		return errors.WithStack(closeErr)
 	}
 	token := encodeSnapshotToken(req.index, crc32c)
-	return e.persistLocalSnapshotPayloadLocked(req.index, token)
+	return e.persistLocalSnapshotPayloadLocked(req.index, token, req.confState)
 }
 
 func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error {
@@ -5381,10 +5408,10 @@ func (e *Engine) persistLocalSnapshotPayload(index uint64, payload []byte) error
 	e.snapshotMu.Lock()
 	defer e.snapshotMu.Unlock()
 
-	return e.persistLocalSnapshotPayloadLocked(index, payload)
+	return e.persistLocalSnapshotPayloadLocked(index, payload, nil)
 }
 
-func (e *Engine) persistLocalSnapshotPayloadLocked(index uint64, payload []byte) error {
+func (e *Engine) persistLocalSnapshotPayloadLocked(index uint64, payload []byte, confState *raftpb.ConfState) error {
 	current, err := e.storage.Snapshot()
 	if err != nil {
 		return errors.WithStack(err)
@@ -5397,7 +5424,7 @@ func (e *Engine) persistLocalSnapshotPayloadLocked(index uint64, payload []byte)
 		return err
 	}
 
-	_, err = persistLocalSnapshotPayload(e.storage, e.persist, index, payload)
+	_, err = persistLocalSnapshotPayloadWithConfiguration(e.storage, e.persist, index, payload, confState)
 	if err := e.handleLocalSnapshotPersistResult(err); err != nil {
 		return err
 	}

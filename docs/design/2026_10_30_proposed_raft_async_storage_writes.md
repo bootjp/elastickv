@@ -508,3 +508,69 @@ checkpoint handshakes, full physical ownership/accounting, encrypted recovery,
 large-write native quorum acceptance and activation still require implementation
 and end-to-end verification. These partial tests do not prove crash/power-loss
 recovery, overload availability or the requested complete engine state.
+
+### Shared Checkpoint Configuration Prefix
+
+Preparing the ordered snapshot path exposed a defect in the production
+synchronous baseline: after configuration snapshot capture returns
+`ErrSnapshotDeferred`, a later ordinary checkpoint copied the old
+MemoryStorage snapshot's ConfState. A successfully applied learner therefore
+disappeared from the later checkpoint metadata even though the FSM prefix and
+published membership included it. Native RawNode V1/V2 apply followed by the
+real local-capture/persist path reproduced this for both inline and file
+payloads before correction; all four cases failed on the missing learner.
+
+Configuration state is now seeded from the selected Raft snapshot, not the
+potentially leading peers file. Successful configuration publication records
+an owned full ConfState. Local capture binds a clone to the same applied
+prefix as the FSM snapshot, and the worker uses that captured state for
+SaveSnap and MemoryStorage publication. It never queries a newer RawNode or
+owner configuration later. An older capture retains its original membership
+when a subsequent configuration is applied before its disk publication.
+Received snapshots replace the history base. Missing configuration state and
+invalid ordered publication fail closed, rather than substituting peer data.
+
+The synchronous path can discard prior configuration versions immediately
+after successful publication: every older capture already owns a clone, and
+future captures run at the current applied prefix. This keeps indefinite FSM
+snapshot deferral from accumulating a configuration history. The indexed
+history helper does not itself prove the async snapshot lifecycle. Async
+capture pins, peer inventories, queue-byte accounting, restore handshakes and
+retirement under failure remain activation requirements; none is waived by
+this synchronous correctness repair.
+
+An ordinary capture is deferred while an unapplied configuration at or before
+the already-durable FSM prefix still needs replay. A configuration proposal
+strictly after that prefix does not block the older valid capture. This keeps
+the cold-start optimization from checkpointing an incomplete configuration
+replay merely because its FSM's data applied index was already ahead.
+
+Independent native startup tests also reproduced an ahead FSM at index 3
+being serialized under replayed configuration index 2 (both entry versions).
+Configuration capture now returns the existing benign deferral before any FSM
+serialization when its requested index is older than the applied FSM. The
+highest pending-configuration fence alone was insufficient: an uncommitted
+configuration at 6 masked a committed configuration at 4 while capturing 5.
+A separate owner-only committed replay fence is seeded from the actual WAL
+entries up to the startup FSM/commit boundary, cleared only after successful
+configuration recording, and reset after a received snapshot. Uncommitted
+future entries cannot hide or indefinitely extend that required replay.
+
+The actual-WAL checkpoint/reopen matrix covers both entry versions and both
+payload formats, checking selected snapshot index, restored data and learner
+membership after Open. Controls cover all ConfState fields and clone ownership,
+missing/nil state, invalid publication order, persistence failures, received
+snapshot reset, split/masked replay and successful capture after replay clears.
+Repeated snapshot deferral through 65 configuration changes per version retains
+one synchronous history entry. The two additional P1 regressions failed under
+race before correction (1.795s), then passed ten race repetitions (12.437s).
+Independent final focused race verification passes (27.524s) with no remaining
+synchronous finding. These are clean-reopen tests, not a power-loss proof or
+automatic repair of previously persisted snapshots with incorrect membership.
+The complete new configuration selection passes ten race repetitions
+(258.793s). A fresh export of the exact staged tree, excluding all unpublished
+files, passes the entire engine race package with no skip (75.177s) and full
+repository lint (zero issues). A separate broad local default-timeout trial
+failed during full-length gRPC sequences and backup/FUSE deadline tests under
+parallel load; isolated unchanged deadline cases pass. This is not an all-Go
+pass or a replacement for final-push CI's existing split full-race workflow.

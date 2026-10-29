@@ -903,9 +903,16 @@ func persistReadyToWAL(persist etcdstorage.Storage, rd etcdraft.Ready) error {
 }
 
 func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdstorage.Storage, applied uint64, payload []byte) (raftpb.Snapshot, error) {
+	return persistLocalSnapshotPayloadWithConfiguration(storage, persist, applied, payload, nil)
+}
+
+func persistLocalSnapshotPayloadWithConfiguration(storage *etcdraft.MemoryStorage, persist etcdstorage.Storage, applied uint64, payload []byte, confState *raftpb.ConfState) (raftpb.Snapshot, error) {
 	snapshot, err := buildLocalSnapshot(storage, applied, payload)
 	if err != nil {
 		return raftpb.Snapshot{}, err
+	}
+	if confState != nil {
+		snapshot.Metadata.ConfState = proto.CloneOf(confState)
 	}
 	return persistCapturedLocalSnapshot(storage, persist, snapshot)
 }
