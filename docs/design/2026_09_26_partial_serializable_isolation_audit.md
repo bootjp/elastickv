@@ -1167,6 +1167,13 @@ or acceptance receipt. Implementation now proceeds from main `c316b829e` on
   including both part-read windows, deletion/recreation, superseded blob
   cleanup, unrelated bucket writes, maximum part counts and alias capacity.
   Test server-side data and cleanup effects, not only HTTP status codes.
+- Add an opt-in S3 multipart register mode to the existing Jepsen workload.
+  Each write races same-body part replacement with completion under one
+  upload ID; the expected object remains the register value regardless of
+  which immutable part version wins. Preserve the existing linearizability
+  checker and honest indeterminate outcomes. Require complete successful
+  final reads so lost referenced chunks cannot be hidden by failed GETs.
+  Keep the default PUT/GET workload unchanged and run both modes in CI.
 - Verify all changed helper callers, full adapter/KV/store race suites,
   unfiltered lint, relevant Jepsen checks, and latest-push review/CI. A1 does
   not establish cross-group serializability before A2's read-lock protocol,
