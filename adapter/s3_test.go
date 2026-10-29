@@ -237,8 +237,7 @@ func TestS3Server_ProxiesFollowerRequests(t *testing.T) {
 	req.Host = "signed-s3.example.test"
 	server.handle(rec, req)
 
-	var got proxiedRequest
-	got = testutil.Recv(t, proxied, 5*time.Second, "request was not proxied to the leader")
+	var got = testutil.Recv(t, proxied, 5*time.Second, "request was not proxied to the leader")
 	require.Equal(t, "signed-s3.example.test", got.host)
 	require.Equal(t, "/", got.path)
 	require.Equal(t, rawQuery, got.rawQuery)

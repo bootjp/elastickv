@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/hex"
+	"log/slog"
+	"os"
 	"slices"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -17,6 +20,8 @@ const (
 	maxOperationEffectKeys = 65535
 	operationJournalRows   = 2
 )
+
+var operationAccountingTrace = os.Getenv("ELASTICKV_FS_ACCOUNTING_TRACE") == "1"
 
 type operationJournalBackend interface {
 	Snapshot(context.Context) (uint64, error)
@@ -406,7 +411,7 @@ func (j *OperationJournal) admitOnce(ctx context.Context, record operationRecord
 	if err = reserveOperation(&session, record); err != nil {
 		return operationRecord{}, err
 	}
-	return record, j.storeRecordAndSession(ctx, ts, record, session, nil, nil)
+	return record, j.storeRecordAndSession(ctx, ts, record, session)
 }
 
 func reserveOperation(session *operationSession, record operationRecord) error {
@@ -461,8 +466,8 @@ func (j *OperationJournal) loadRecordAt(ctx context.Context, id OperationID, ts 
 	return record, true, nil
 }
 
-func (j *OperationJournal) storeRecordAndSession(ctx context.Context, ts uint64, record operationRecord, session operationSession, extra []*kv.Elem[kv.OP], extraReadKeys [][]byte) error {
-	return j.storeRecordAndSessionAtRoute(ctx, ts, record, session, extra, extraReadKeys, 0)
+func (j *OperationJournal) storeRecordAndSession(ctx context.Context, ts uint64, record operationRecord, session operationSession) error {
+	return j.storeRecordAndSessionAtRoute(ctx, ts, record, session, nil, nil, 0)
 }
 
 func (j *OperationJournal) storeRecordAndSessionAtRoute(ctx context.Context, ts uint64, record operationRecord, session operationSession, extra []*kv.Elem[kv.OP], extraReadKeys [][]byte, observed uint64) error {
@@ -487,10 +492,23 @@ func (j *OperationJournal) storeRecordAndSessionAtRoute(ctx context.Context, ts 
 	readKeys := make([][]byte, 0, len(extraReadKeys)+operationJournalRows)
 	readKeys = append(readKeys, record.ID.key(), session.ID.key())
 	readKeys = append(readKeys, extraReadKeys...)
+	var response *kv.CoordinateResponse
 	if observed != 0 {
-		_, err = j.backend.CommitAtRouteVersion(ctx, ts, elems, readKeys, observed)
+		response, err = j.backend.CommitAtRouteVersion(ctx, ts, elems, readKeys, observed)
 	} else {
-		_, err = j.backend.Commit(ctx, ts, elems, readKeys)
+		response, err = j.backend.Commit(ctx, ts, elems, readKeys)
+	}
+	if err == nil && operationAccountingTrace {
+		var commitTS uint64
+		if response != nil {
+			commitTS = response.CommitTS
+		}
+		slog.Info("filesystem journal accounting transition", "kind", "record", "session", hex.EncodeToString(session.ID.Session[:]),
+			"sequence", record.ID.Sequence, "generation", record.Generation, "state", record.State,
+			"reservation", record.Reservation, "fences", len(record.FencedAttempts),
+			"retained_count", session.RetainedCount, "retained_bytes", session.RetainedBytes,
+			"pending", session.Pending, "reject_before", session.RejectBefore, "ack_gaps", len(session.AckGaps),
+			"snapshot_ts", ts, "commit_ts", commitTS)
 	}
 	return errors.Wrap(err, "publish operation journal")
 }

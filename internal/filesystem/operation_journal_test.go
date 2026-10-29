@@ -800,7 +800,7 @@ func TestOperationJournalDoesNotAdvanceLegacyAttempt(t *testing.T) {
 	ts, legacy, session, err := journal.pendingSnapshot(ctx, id)
 	require.NoError(t, err)
 	legacy.RecordIsPrimary = false
-	require.NoError(t, journal.storeRecordAndSession(ctx, ts, legacy, session, nil, nil))
+	require.NoError(t, journal.storeRecordAndSession(ctx, ts, legacy, session))
 	_, err = journal.AdvanceGeneration(ctx, id, old.AttemptID)
 	require.ErrorIs(t, err, kv.ErrTransactionOutcomeUnknown)
 	outcome, _, err := journal.ResolveAttempt(ctx, id, old.AttemptID)
@@ -952,7 +952,7 @@ func TestOperationJournalGenerationFenceRespectsSessionQuota(t *testing.T) {
 	ts, record, session, err := journal.pendingSnapshot(ctx, id)
 	require.NoError(t, err)
 	session.MaxBytes = session.RetainedBytes
-	require.NoError(t, journal.storeRecordAndSession(ctx, ts, record, session, nil, nil))
+	require.NoError(t, journal.storeRecordAndSession(ctx, ts, record, session))
 	_, err = journal.AdvanceGeneration(ctx, id, attempt.AttemptID)
 	require.ErrorIs(t, err, ErrOperationQuota)
 	current, err := journal.BeginAttempt(ctx, id)

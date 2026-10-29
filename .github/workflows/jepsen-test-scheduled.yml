@@ -233,6 +233,7 @@ jobs:
         # mount enforces default_permissions.
         run: |
           set -euo pipefail
+          export ELASTICKV_FS_ACCOUNTING_TRACE=1
           mkdir -p /tmp/elastickv-fs
           BOOTSTRAP_MEMBERS="n1=127.0.0.1:50051,n2=127.0.0.1:50052,n3=127.0.0.1:50053"
           RAFT_REDIS_MAP="127.0.0.1:50051=127.0.0.1:63791,127.0.0.1:50052=127.0.0.1:63792,127.0.0.1:50053=127.0.0.1:63793"
@@ -401,9 +402,9 @@ jobs:
         timeout-minutes: 70
         env:
           FS_TIME_LIMIT: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '1800' || inputs.time-limit || '300' }}
-          FS_RATE: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '0.25' || inputs.rate || '10' }}
-          SQLITE_REQUESTED_KEYS: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '128' || '24' }}
-          SQLITE_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || '64' }}
+          FS_RATE: ${{ inputs.rate != '5' && inputs.rate || (github.event_name == 'schedule' || inputs.long-fuse-run) && '0.25' || inputs.rate || '10' }}
+          SQLITE_REQUESTED_KEYS: ${{ inputs.key-count != '8' && inputs.key-count || (github.event_name == 'schedule' || inputs.long-fuse-run) && '128' || inputs.key-count || '24' }}
+          SQLITE_REQUESTED_WRITES: ${{ (github.event_name == 'schedule' || inputs.long-fuse-run) && '16' || inputs.max-writes-per-key || '64' }}
         run: |
           # Spread the longer run across databases while bounding the
           # ambiguous writes Knossos must explore for any one database.
@@ -465,8 +466,8 @@ jobs:
             wc -l "$log" || true
           done
           tail -n 200 /tmp/elastickv-fs-n1-restarted.log || true
-      - name: Upload filesystem cluster logs on failure
-        if: failure() && (startsWith(matrix.workload, 'filesystem-') || matrix.workload == 'sqlite')
+      - name: Upload filesystem cluster logs
+        if: (always() && matrix.workload == 'sqlite') || (failure() && startsWith(matrix.workload, 'filesystem-'))
         uses: actions/upload-artifact@v7
         with:
           name: elastickv-fs-logs-${{ matrix.workload }}

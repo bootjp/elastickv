@@ -1912,8 +1912,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 	require.NoError(t, err)
 	close(wrapped.blockRelease)
 
-	var txErr error
-	txErr = testutil.Recv(t, txErrCh, 5*time.Second, "timed out waiting for transact result")
+	var txErr = testutil.Recv(t, txErrCh, 5*time.Second, "timed out waiting for transact result")
 	require.ErrorContains(t, txErr, "conditional check failed")
 
 	targetOut, err := client0.GetItem(ctx, &dynamodb.GetItemInput{

@@ -1113,10 +1113,14 @@ func TestPersistConfigStateSkipsSerializationWhenNewerSnapshotExists(t *testing.
 		dataDir: t.TempDir(),
 	}
 
-	require.NoError(t, engine.persistConfigState(7, raftpb.ConfState{Voters: []uint64{1}}, []Peer{
-		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
-	}))
+	peers := []Peer{{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001", Suffrage: SuffrageVoter}}
+	require.NoError(t, engine.persistConfigState(7, raftpb.ConfState{Voters: []uint64{1}}, peers))
 	require.Zero(t, fsm.snapshotCalls.Load())
+	state, exists, err := loadPersistedPeersState(engine.dataDir)
+	require.NoError(t, err)
+	require.True(t, exists, "live config path must publish peer metadata")
+	require.Equal(t, uint64(7), state.Index)
+	require.Equal(t, peers, state.Peers)
 	require.Equal(t, uint64(7), engine.currentConfigIndex())
 }
 
