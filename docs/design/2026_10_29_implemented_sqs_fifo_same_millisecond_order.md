@@ -2,6 +2,9 @@
 
 Status: implemented (milestone 1)
 
+Review follow-up: receive-progress correction proposed; the PR remains unready
+until its runtime regression and latest-head review/CI pass.
+
 ## Problem
 
 FIFO messages in one message group must be delivered in the order they
@@ -108,3 +111,65 @@ the send timestamp and is out of scope here.
   group in one `SendMessageBatch` are received and deleted one by one in
   send order. It failed 14/30 runs before the fix.
 - The two flaky tests above stop failing: 50 repetitions each.
+
+## Receive Progress Follow-Up
+
+Skipping a same-millisecond successor is insufficient when the earliest send
+sorts beyond the first receive page. The outer receive checks its 100 ms work
+budget between pages and restarts at the beginning on every call. Repeating
+expensive tie scans can therefore return empty forever without reaching the
+deliverable head, even when no new message arrives. Retaining send order must
+not turn a live queue into this fixed point.
+
+Replace skip-and-restart with snapshot-scoped head resolution:
+
+1. Keep the original candidate's missing-record, retention and redrive handling
+   before group-lock processing. Standard queues remain unchanged.
+2. For a held or owned group lock, retain the existing lock classification;
+   do not run the free-lock tie scan or replace an owned redelivery head.
+3. For a free lock, scan the candidate's entire visible-at millisecond in its
+   partition at the same read timestamp. Select the minimum sequence of that
+   same group. Ignore missing records and stale visibility entries whose record
+   now names another millisecond. Keep the real selected visibility key,
+   message ID, partition, group route, decoded record and data key together.
+   Page-local sorting is not sufficient.
+4. If another head was selected, apply the existing retention/redrive handling
+   to that selected record too, before attempting delivery. Never rotate the
+   successor's data under the selected head's key or vice versa.
+5. Attempt the selected head directly in the current admitted page using the
+   existing OCC rotation, lock and receipt path. Reaching it must not require
+   another outer page or a later request. A full bucket scan can exceed the
+   soft work budget, as before; this is not a hard request-latency guarantee.
+6. Retain a request-local attempted-group set across outer pages of one
+   partition, not a process-global cursor or cached mutable message record.
+   After a free/owned head is selected, avoid repeating that group's resolution
+   and rotation within the snapshot. A successful rotation changes the OCC
+   keys; a write conflict or transaction lock permits a conservative short
+   receive, but does not prove that those keys changed or that a competing
+   transaction cannot abort. The next receive must retry from fresh state. Original
+   candidates still pass their retention/redrive handling first. Held/foreign
+   lock skips do not mark a group attempted, so its actual owner remains
+   reachable. Start fresh on the next receive, partition or read timestamp.
+
+Operational dispatch errors still propagate, and unknown outcomes are not
+turned into successful/empty receipts. Only existing expected races may skip.
+No durable schema, wire encoding, global cache, wall-clock ordering rule or
+cross-group ordering guarantee is added.
+
+Regression gates:
+
+- Drive the actual partition receive with a live same-group head sorted after
+  its first page and the soft budget expiring during that admitted page. A
+  deadline-bound store barrier makes the current repeated-empty failure
+  deterministic; a head-first positive control must remain deliverable.
+- After correction, the selected head's ID/body/key/receipt and persisted
+  rotation agree; no successor is rotated early. Repeat with pagination and
+  stale entries, other groups, owned/foreign locks, and partition isolation.
+- Cover selected-head retention expiry/redrive, missing records, expected OCC
+  races and operational errors. Audit all callers of the changed classifier
+  and delivery helpers, run focused repeated race checks and unfiltered lint,
+  then request a new latest-push review and CI before merge.
+
+The attempted-group optimization depends on one read snapshot and partition;
+it is not reusable after a dispatch retry obtains a new read timestamp. Its
+state is local to the receive attempt and cannot authorize a rotation itself.
