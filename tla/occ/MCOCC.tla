@@ -15,6 +15,8 @@
 (*                        (TLC fails on OCC3b_EmptyStoreReadStability)     *)
 (*   MCOCC_multigroup_gap.cfg — known gap: G0 across groups on the         *)
 (*                        one-phase path (TLC fails on OCC-3)              *)
+(*   MCOCC_multigroup.cfg — the same with ReadAdvance (read watermark      *)
+(*                        advance enabled; TLC passes everything)          *)
 (*   MCOCC_live.cfg     — OCC-L1 liveness under SpecLive (TLC passes)      *)
 (*                                                                         *)
 (* Run via `make tla-check` from the repository root.                      *)

@@ -723,7 +723,7 @@ does not keep this document in `partial`.
 
 ## 11. References
 
-- `docs/design/2026_09_26_proposed_serializable_isolation_audit.md` —
+- `docs/design/2026_09_26_partial_serializable_isolation_audit.md` —
   the gaps (G0, G1, G10) the expected-failure configs pin.
 
 - `kv/hlc.go` — current HLC implementation and physical ceiling layout.
@@ -753,7 +753,7 @@ extra expected-PASS configs.
 | Module | Was | Now | Configs |
 |---|---|---|---|
 | HLC | `BecomeLeader` Observes `maxAppliedHLC` (strategy (c)); the fence was a toggle; logical overflow could issue `ceiling + 1`; leader-only issuance | `IssueTimestamp` is `NextFenced` (no fence before the first ceiling, fail closed at `wall >= ceiling` or when the next value's physical half exceeds the ceiling); no election-time handoff; `IssuanceMode` selects TSO (allocation-floor handoff), legacy `Coordinate` (leader-only, no handoff) or legacy `ShardedCoordinator` (any node stamps) | `MCHLC.cfg` (TSO, pass); `MCHLC_gap.cfg` (TSO without the floor, HLC-4); `MCHLC_legacy_single_gap.cfg` (HLC-4); `MCHLC_legacy_sharded_gap.cfg` (HLC-3, G10) |
-| OCC | Fresh `start_ts`; no read-set validation (snapshot isolation); atomic commit | `start_ts` = applied watermark for reading transactions, fresh for write-only ones; one-phase Allocate / Apply with the commit-ts fence, lock check and read + write validation; 2PC with commit-ts settled before PREPARE, PREPARE validating read and write keys, COMMIT without fence or revalidation; raw writes; new `OCC8_NoWriteSkew` | `MCOCC.cfg` (OCC-1/2/4/5, pass); `MCOCC_onephase.cfg` (single shard, one Raft group, every invariant incl. OCC-3 / OCC-8, pass); `MCOCC_gap.cfg` (OCC-1); `MCOCC_g0_gap.cfg` (OCC-3, G0); `MCOCC_g1_gap.cfg` (OCC-8, G1); `MCOCC_emptystore_gap.cfg` (OCC-3b: an empty-store start is MaxUint64, read-latest); `MCOCC_multigroup_gap.cfg` (OCC-3: G0 across groups, `MultiGroup = TRUE`); `MCOCC_live.cfg` |
+| OCC | Fresh `start_ts`; no read-set validation (snapshot isolation); atomic commit | `start_ts` = applied watermark for reading transactions, fresh for write-only ones; one-phase Allocate / Apply with the commit-ts fence, lock check and read + write validation; 2PC with commit-ts settled before PREPARE, PREPARE validating read and write keys, COMMIT without fence or revalidation; raw writes; new `OCC8_NoWriteSkew` | `MCOCC.cfg` (OCC-1/2/4/5, pass); `MCOCC_onephase.cfg` (single shard, one Raft group, every invariant incl. OCC-3 / OCC-8, pass); `MCOCC_gap.cfg` (OCC-1); `MCOCC_g0_gap.cfg` (OCC-3, G0); `MCOCC_g1_gap.cfg` (OCC-8, G1); `MCOCC_emptystore_gap.cfg` (OCC-3b: an empty-store start is MaxUint64, read-latest); `MCOCC_multigroup_gap.cfg` (OCC-3: G0 across groups, `MultiGroup = TRUE`, `ReadAdvance = FALSE`); `MCOCC_multigroup.cfg` (the same with `ReadAdvance = TRUE`, every invariant, pass); `MCOCC_live.cfg` |
 | MVCC | Atomic `Compact` keeping `>= newMin` plus the newest `< newMin`; unique timestamps assumed | Resumable compaction (pending watermark, per-key prune, finish) keeping `> minTS` plus the newest `<= minTS`; reads below the effective watermark fail closed; `UniqueTs = FALSE` admits a colliding write, which the raw apply path writes over the existing version; new `MVCC5_AckedWriteNotOverwritten` | `MCMVCC.cfg` (pass); `MCMVCC_gap.cfg` (MVCC-4); `MCMVCC_collision_gap.cfg` (MVCC-5, G10) |
 | Routes | Comments claimed the watcher always reads the head snapshot | Comments describe the bounded delta batches of `SyncOnce` and stale-delta rejection; the actions were already general enough | unchanged |
 | Composed | Every transaction pins its catalog version; Composed-2 justified by "SplitRange is same-group only" | `BeginTxn` chooses pinned or unpinned (`ObservedRouteVersion` absent, so `verifyComposed1` short-circuits), and `AutoPin` pins at the Dispatch-time version (`maybeAutoPinObservedRouteVersion`); Composed-1 asserted for pinned transactions only; Composed-2 documented as not modelled, since cross-group migration has shipped | unchanged |
@@ -769,4 +769,14 @@ own watermark while snapshot starts take the maximum over groups, which
 admits G0 on the one-phase path across groups (the audit's
 "Multi-group deployments" finding; reproduced again on `main` at the
 FSM / store level during this reconciliation).  `MCOCC_multigroup_gap.cfg`
-pins it.
+pins it for the default build.  `ReadAdvance` models the opt-in read
+watermark advance (`--readWatermarkAdvance`, `ShardStore.ensureReadWatermark`):
+a snapshot read first raises the read key's group watermark to the
+snapshot, so a later one-phase apply at or below it is fenced, and
+`MCOCC_multigroup.cfg` passes OCC-3 across groups.  The advance's HLC
+side is not modelled: its apply raises the physical ceiling to the
+advance's physical half, a second ceiling source next to the lease that
+HLC.tla's `ApplyCeiling` does not cover.  The leader admits an advance
+only up to its wall clock plus two lease windows, so the ceiling can sit
+one window further ahead of the wall clock than a lease alone allows;
+HLC-2 (ceiling monotonicity) still holds because every raise is a max.

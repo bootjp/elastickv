@@ -35,6 +35,9 @@ type ShardStore struct {
 	engine            *distribution.Engine
 	groups            map[uint64]*ShardGroup
 	partitionResolver PartitionResolver
+	// readWatermarkAdvance enables ensureReadWatermark. It is opt-in until
+	// every replica understands the advance entry (rolling upgrades).
+	readWatermarkAdvance bool
 
 	connCache GRPCConnCache
 }
@@ -69,6 +72,19 @@ func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *
 // ShardedCoordinator. ShardStore keeps normal byte-range routing for ordinary
 // calls, but backup scanners need the resolver to decide which physical group
 // owns partition-routed keys discovered while scanning every group.
+// WithReadWatermarkAdvance makes cross-group snapshot reads raise a lagging
+// group's watermark to the snapshot before reading (ensureReadWatermark).
+// Enable it only once every replica of every group runs a binary that
+// understands the advance entry: an older replica skips the entry without
+// raising its watermark and would then accept one-phase writes its peers
+// fence.
+func (s *ShardStore) WithReadWatermarkAdvance() *ShardStore {
+	if s != nil {
+		s.readWatermarkAdvance = true
+	}
+	return s
+}
+
 func (s *ShardStore) WithPartitionResolver(r PartitionResolver) *ShardStore {
 	if s != nil {
 		s.partitionResolver = r
@@ -314,6 +330,9 @@ func (s *ShardStore) getRouteAt(ctx context.Context, route distribution.Route, k
 }
 
 func (s *ShardStore) getGroupAt(ctx context.Context, g *ShardGroup, route distribution.Route, key []byte, ts uint64, groupID uint64, readRouteVersion uint64) ([]byte, error) {
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return nil, err
+	}
 	if engineForGroup(g) == nil {
 		return s.localGetAt(ctx, g, route, key, ts)
 	}
@@ -402,6 +421,9 @@ func (s *ShardStore) routeHasVersionAtOrBefore(ctx context.Context, route distri
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g.Store == nil {
 		return false, true, nil
+	}
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return false, true, err
 	}
 	if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
 		return false, true, err
@@ -2430,6 +2452,9 @@ func (s *ShardStore) scanKeyRouteAtWithReadFence(
 	if !ok || g == nil || g.Store == nil {
 		return nil, nil
 	}
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return nil, err
+	}
 
 	// keys_only reads need the same readiness proof as value scans. Without it
 	// an armed source read fence still hands back old-source keys, and an armed
@@ -3054,6 +3079,9 @@ func (s *ShardStore) routeHasVersionsAtOrBefore(
 	if !ok || g.Store == nil {
 		return out, true, nil
 	}
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return out, true, err
+	}
 	for _, key := range keys {
 		if err := s.verifyTargetReadinessForRange(ctx, g, route, key, nextScanCursor(key)); err != nil {
 			return out, true, err
@@ -3223,6 +3251,9 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceRouteFilterPage(
 	if !ok || g == nil || g.Store == nil {
 		return nil, nil, nil
 	}
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return nil, nil, err
+	}
 	markRouteGroup := shouldMarkRouteGroupOnScan(start, explicitGroup, routeStart, routeEnd)
 	engine := engineForGroup(g)
 
@@ -3341,6 +3372,9 @@ func (s *ShardStore) scanRouteAtDirectionWithReadFenceOnce(
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g == nil || g.Store == nil {
 		return nil, nil
+	}
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return nil, err
 	}
 
 	if !reverse {
@@ -3591,6 +3625,9 @@ func (s *ShardStore) scanRouteAtForwardStoredPage(
 	routeStart []byte,
 	routeEnd []byte,
 ) (scanRoutePage, error) {
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return scanRoutePage{}, err
+	}
 	engine := engineForGroup(g)
 	if engine == nil {
 		return s.scanRouteAtForwardLocalPage(ctx, g, route, start, end, limit, ts)
@@ -3696,6 +3733,9 @@ func (s *ShardStore) scanRouteAtDirectionPhysicalLimit(
 	g, ok := s.groupForID(route.GroupID)
 	if !ok || g == nil || g.Store == nil {
 		return nil, false, nil
+	}
+	if err := s.ensureReadWatermark(ctx, g, ts); err != nil {
+		return nil, false, err
 	}
 	markRouteGroup := shouldMarkRouteGroupOnScan(start, false, nil, nil)
 	var err error

@@ -171,7 +171,9 @@ resolver is abstracted into the atomic lock drain inside
 leader-issued).  `EnableSafety` gates the commit-ts > start-ts
 discipline; `EnableTwoPhase` turns the 2PC path off; `MultiGroup`
 gives every key its own Raft group and watermark (the snapshot start is
-the maximum over groups, the one-phase fence is per group).
+the maximum over groups, the one-phase fence is per group); `ReadAdvance` makes a snapshot read raise the read key's group
+watermark to the snapshot first, the opt-in `--readWatermarkAdvance`
+path).
 
 Invariants asserted:
 
@@ -199,6 +201,7 @@ Invariants asserted:
 | `MCOCC_g1_gap.cfg` | full model (known gap G1) | FAIL on `OCC8_NoWriteSkew` (a one-phase commit applies between the other txn's PREPARE and COMMIT) |
 | `MCOCC_emptystore_gap.cfg` | single-shard path (known gap: an empty-store start is MaxUint64) | FAIL on `OCC3b_EmptyStoreReadStability` |
 | `MCOCC_multigroup_gap.cfg` | single-shard path, one Raft group per key (known gap: G0 across groups) | FAIL on `OCC3_ReadSnapshotStability` (a one-phase write allocated earlier applies on a lagging group, above that group's watermark but below a reader's max-over-groups snapshot) |
+| `MCOCC_multigroup.cfg` | the same with `ReadAdvance = TRUE` (read watermark advance) | PASS on every invariant |
 | `MCOCC_live.cfg` | `SpecLive`, OCC-L1 | PASS |
 
 ### `mvcc/MVCC.tla`

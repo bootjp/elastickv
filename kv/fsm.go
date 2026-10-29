@@ -552,6 +552,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeWatermarkAdvance:
+		return f.applyWatermarkAdvance(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
@@ -1633,7 +1635,10 @@ func (f *kvFSM) ApplySnapshotHeader(ceiling, cutover uint64) {
 }
 
 // IsVolatileOnlyPayload satisfies raftengine.VolatileEntryClassifier.
-// Returns true for HLC lease and backup-pin payloads. HLC leases only call
+// Returns true for HLC lease, backup-pin and read-watermark-advance payloads.
+// A watermark advance writes only when it raises the persisted watermark, so
+// a replay is a no-op on the store and restores the HLC ceiling it raised.
+// HLC leases only call
 // HLC.SetPhysicalCeiling, which is monotonic and lives purely in memory.
 // Backup pins restore volatile retention state and also persist a monotonic
 // timestamp floor; replaying the same floor is idempotent. After the cold-start
@@ -1650,7 +1655,8 @@ func (f *kvFSM) ApplySnapshotHeader(ceiling, cutover uint64) {
 // sidecar and re-applying would diverge the sidecar's
 // RaftAppliedIndex from the engine's appliedIndex.
 func (f *kvFSM) IsVolatileOnlyPayload(payload []byte) bool {
-	return len(payload) > 0 && (payload[0] == raftEncodeHLCLease || payload[0] == raftEncodeBackup)
+	return len(payload) > 0 && (payload[0] == raftEncodeHLCLease || payload[0] == raftEncodeBackup ||
+		payload[0] == raftEncodeWatermarkAdvance)
 }
 
 func (f *kvFSM) handleTxnRequest(ctx context.Context, r *pb.Request, commitTS uint64) error {
