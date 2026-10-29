@@ -21,8 +21,8 @@ at `1912a4014b3980cb64540cb96d5548dc42443dbd`, with final reviewed HEAD
 `3847493bae526a86f04227740b60ba5edd831d57`. The merge's first parent is the
 base above and its second parent is that implementation HEAD.
 
-The parent verified the live merge, code and security review, and all CI
-passing for the final HEAD before this documentation update. Those are
+The merge, code/security reviews and CI were verified against GitHub
+for the final HEAD before this documentation update. Those are
 existing implementation results, not checks rerun for this record.
 
 ## Decisions
@@ -92,6 +92,6 @@ The merged PR records five separate review passes:
    `ad93f4f7f9830591f8eadbc67e298bec03898fc8`.
 2. **Complete:** both branches were extracted and focused parity coverage
    was added in `3847493bae526a86f04227740b60ba5edd831d57`.
-3. **Complete:** validation and parent review were completed, followed by
+3. **Complete:** validation and implementation review were completed, followed by
    publication, final-HEAD review/CI, and merge through PR #1356 as recorded
    above. No implementation work remains in this bounded follow-up.
