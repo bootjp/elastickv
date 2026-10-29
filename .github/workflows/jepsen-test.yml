@@ -259,6 +259,13 @@ jobs:
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 10 --concurrency 10 --s3-ports 63901,63902,63903 --host 127.0.0.1
+      - name: Run SQS Standard Jepsen workload against elastickv
+        working-directory: jepsen
+        timeout-minutes: 3
+        run: |
+          timeout 120 ~/lein run -m elastickv.sqs-workload --local \
+            --time-limit 5 --rate 5 --concurrency 5 --drain-time 40 \
+            --sqs-ports 63501,63502,63503 --host 127.0.0.1
       - name: Run SQS HT-FIFO Jepsen workload against elastickv
         working-directory: jepsen
         # The HT-FIFO workload runs sends and receives across a 4-partition

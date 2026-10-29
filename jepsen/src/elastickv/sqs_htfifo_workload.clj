@@ -30,19 +30,11 @@
             [clojure.string :as str]
             [clojure.tools.logging :refer [info warn]]
             [cognitect.aws.client.api :as aws]
-            [cognitect.aws.credentials :as creds]
             [elastickv.cli :as cli]
-            [elastickv.db :as ekdb]
+            [elastickv.sqs-common :as sqs]
             [jepsen [checker :as checker]
                     [client :as client]
-                    [generator :as gen]
-                    [net :as net]]
-            [jepsen.control :as control]
-            [jepsen.db :as jdb]
-            [jepsen.nemesis :as nemesis]
-            [jepsen.nemesis.combined :as combined]
-            [jepsen.os :as os]
-            [jepsen.os.debian :as debian]))
+                    [generator :as gen]]))
 
 ;; ---------------------------------------------------------------------------
 ;; Constants
@@ -71,47 +63,6 @@
   (str "jepsen-htfifo-" (System/currentTimeMillis) ".fifo"))
 
 ;; ---------------------------------------------------------------------------
-;; SQS client construction
-;; ---------------------------------------------------------------------------
-
-(defn- make-sqs-client
-  "Returns a cognitect/aws-api SQS client pointed at http://host:port.
-   Dummy credentials match the elastickv server's open-endpoint mode (no
-   --sqsCredentialsFile passed → adapter accepts any signed request)."
-  [host port region]
-  (aws/client
-    {:api                  :sqs
-     :region               (or region "us-east-1")
-     :credentials-provider (creds/basic-credentials-provider
-                             {:access-key-id     "dummy"
-                              :secret-access-key "dummy"})
-     :endpoint-override    {:protocol :http
-                            :hostname  host
-                            :port      port}}))
-
-(defn- anomaly? [resp]
-  (contains? resp :cognitect.anomalies/category))
-
-(defn- sqs-invoke!
-  "Invoke op against sqs-client, returning the parsed response.
-   Throws ex-info on any error (SQS API error or transport failure).
-   ex-data: :type (SQS __type), :category (anomaly), :resp (raw)."
-  [sqs op request]
-  (let [resp (aws/invoke sqs {:op op :request request})]
-    (if (anomaly? resp)
-      (let [err-type (:__type resp)
-            category (:cognitect.anomalies/category resp)
-            msg      (or (:message resp)
-                         (:Message resp)
-                         (:cognitect.anomalies/message resp)
-                         "")]
-        (throw (ex-info (str "SQS " (or err-type category) ": " msg)
-                        {:type     err-type
-                         :category category
-                         :resp     resp})))
-      resp)))
-
-;; ---------------------------------------------------------------------------
 ;; Queue setup
 ;; ---------------------------------------------------------------------------
 
@@ -127,14 +78,14 @@
                "FifoThroughputLimit"       "perMessageGroupId"
                "DeduplicationScope"        "messageGroup"}
         resp  (try
-                (sqs-invoke! sqs :CreateQueue
+                (sqs/invoke! sqs :CreateQueue
                              {:QueueName  queue-name
                               :Attributes attrs})
                 (catch clojure.lang.ExceptionInfo e
                   (let [err-type (:type (ex-data e))]
                     (if (or (= "QueueAlreadyExists" err-type)
                             (= "QueueNameExists" err-type))
-                      (sqs-invoke! sqs :GetQueueUrl {:QueueName queue-name})
+                      (sqs/invoke! sqs :GetQueueUrl {:QueueName queue-name})
                       (throw e)))))]
     (or (:QueueUrl resp)
         (throw (ex-info "CreateQueue did not return QueueUrl" {:resp resp})))))
@@ -198,12 +149,13 @@
   (open! [this test node]
     (let [port (get node->port node default-sqs-port)
           host (or (:sqs-host test) (name node))]
-      (assoc this :sqs (make-sqs-client host port region))))
+      (assoc this :sqs (sqs/make-client host port region))))
 
   (setup! [this _test]
     (let [url (create-htfifo-queue! sqs queue-name partition-count)]
       (info "HT-FIFO test queue ready" url "partitions=" partition-count)
-      (assoc this :queue-url url)))
+      (reset! queue-url url)
+      this))
 
   (teardown! [_this _test]
     ;; Leave the queue around — the test cluster is torn down by db/teardown!.
@@ -233,8 +185,8 @@
               body    (encode-body group seq-num)
               op'     (assoc op :value [group seq-num])]
           (try
-            (sqs-invoke! sqs :SendMessage
-                         {:QueueUrl      queue-url
+            (sqs/invoke! sqs :SendMessage
+                         {:QueueUrl      @queue-url
                           :MessageBody   body
                           :MessageGroupId group})
             (assoc op' :type :ok)
@@ -247,8 +199,8 @@
                               e)))))
 
         :recv
-        (let [resp (sqs-invoke! sqs :ReceiveMessage
-                                {:QueueUrl            queue-url
+        (let [resp (sqs/invoke! sqs :ReceiveMessage
+                                {:QueueUrl            @queue-url
                                  :MaxNumberOfMessages receive-batch-size
                                  :VisibilityTimeout   visibility-timeout-seconds
                                  :WaitTimeSeconds     receive-wait-seconds})
@@ -273,8 +225,8 @@
           (let [acked (volatile! [])]
             (doseq [{:keys [group seq receipt-handle]} parsed]
               (try
-                (sqs-invoke! sqs :DeleteMessage
-                             {:QueueUrl      queue-url
+                (sqs/invoke! sqs :DeleteMessage
+                             {:QueueUrl      @queue-url
                               :ReceiptHandle receipt-handle})
                 (vswap! acked conj [group seq])
                 (catch clojure.lang.ExceptionInfo e
@@ -408,7 +360,8 @@
             lost (cset/difference committed received-tuples)
             dups (duplicate-receives received-events)
             ord  (ordering-violations received-events)]
-        {:valid?              (and (empty? lost)
+        {:valid?              (and (pos? (count committed))
+                                   (empty? lost)
                                    (empty? dups)
                                    (empty? ord))
          :committed-sends     (count committed)
@@ -434,12 +387,6 @@
   (gen/mix
     (concat (repeat (max 1 (Math/round (* 10.0 (double send-fraction)))) send-op)
             (repeat (max 1 (- 10 (Math/round (* 10.0 (double send-fraction))))) recv-op))))
-
-(defn- drain-generator
-  "Drain phase: only :recv ops, run after the main generator finishes so
-   the checker sees the in-flight messages get delivered."
-  []
-  (gen/repeat {:f :recv}))
 
 ;; ---------------------------------------------------------------------------
 ;; Workload & Test builders
@@ -472,79 +419,18 @@
                                         seq-counters
                                         queue-name
                                         nil  ; sqs (per-worker)
-                                        nil  ; queue-url
+                                        (atom nil)  ; URL shared by setup and execution clients
                                         partition-count)]
     {:client    client
      :generator (mixed-generator send-fraction)
      :checker   (ht-fifo-checker)}))
 
 (defn elastickv-sqs-htfifo-test
-  "Builds a Jepsen test map that drives elastickv's HT-FIFO SQS endpoint."
+  "Build a partitioned FIFO queue test."
   ([] (elastickv-sqs-htfifo-test {}))
   ([opts]
-   (let [nodes      (or (:nodes opts) default-nodes)
-         sqs-ports  (or (:sqs-ports opts)
-                        (repeat (count nodes) (or (:sqs-port opts) default-sqs-port)))
-         node->port (or (:node->port opts) (cli/ports->node-map sqs-ports nodes))
-         sqs-region (or (:sqs-region opts) "us-east-1")
-         local?     (:local opts)
-         db         (if local?
-                      jdb/noop
-                      (ekdb/db {:grpc-port    (or (:grpc-port opts) 50051)
-                                :redis-port   (or (:redis-port opts) 6379)
-                                :sqs-port     node->port
-                                :sqs-region   sqs-region
-                                :raft-groups  (:raft-groups opts)
-                                :shard-ranges (:shard-ranges opts)
-                                :encryption   (:encryption opts)}))
-         rate       (double (or (:rate opts) 5))
-         time-limit (or (:time-limit opts) 30)
-         ;; Drain must outlast the visibility-timeout window plus a
-         ;; safety buffer. Otherwise a message that becomes invisible
-         ;; right at drain start reappears at exactly drain-end (or
-         ;; later) and gen/time-limit can fire before the next :recv
-         ;; surfaces it — the checker would then report a :lost that
-         ;; the server still owns. visibility-timeout + 10s closes
-         ;; that race. The +10s also dominates the (max 5,
-         ;; time-limit/6) short-test floor at any reasonable
-         ;; time-limit, so the floor is no longer needed.
-         drain-time (or (:drain-time opts)
-                        (+ visibility-timeout-seconds 10))
-         faults     (if local?
-                      []
-                      (cli/normalize-faults (or (:faults opts) [:partition :kill])))
-         nemesis-p  (when-not local?
-                      (combined/nemesis-package {:db       db
-                                                 :faults   faults
-                                                 :interval (or (:fault-interval opts) 40)}))
-         nemesis-gen (if nemesis-p
-                       (:generator nemesis-p)
-                       (gen/once {:type :info :f :noop}))
-         workload   (sqs-htfifo-workload (assoc opts :node->port node->port))
-         main-gen   (->> (:generator workload)
-                         (gen/nemesis nemesis-gen)
-                         (gen/stagger (/ rate))
-                         (gen/time-limit time-limit))
-         drain-gen  (->> (drain-generator)
-                         (gen/stagger (/ rate))
-                         (gen/time-limit drain-time))]
-     (merge workload
-            {:name            (or (:name opts) "elastickv-sqs-htfifo")
-             :nodes           nodes
-             :db              db
-             :sqs-host        (:sqs-host opts)
-             :os              (if local? os/noop debian/os)
-             :net             (if local? net/noop net/iptables)
-             :ssh             (merge {:username                  "vagrant"
-                                      :private-key-path          "/home/vagrant/.ssh/id_rsa"
-                                      :strict-host-key-checking  false}
-                                     (when local? {:dummy true})
-                                     (:ssh opts))
-             :remote          control/ssh
-             :nemesis         (if nemesis-p (:nemesis nemesis-p) nemesis/noop)
-             :final-generator nil
-             :concurrency     (or (:concurrency opts) 8)
-             :generator       (gen/phases main-gen drain-gen)}))))
+   (sqs/build-test (assoc opts :name (or (:name opts) "elastickv-sqs-htfifo"))
+                   sqs-htfifo-workload)))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI
