@@ -166,11 +166,6 @@ type asyncStorageRuntime struct {
 // Construct with existing disk/RawNode helpers, but start the actual production
 // run loop only AFTER installing Storage and dispatchFn. The go statement is the
 // happens-before edge: no running loop ever observes a persist replacement.
-func newAsyncStorageRuntime(t *testing.T, fsm *asyncStorageFSM, gate *asyncStorageSaveGate) *asyncStorageRuntime {
-	t.Helper()
-	return newNativeStorageRuntime(t, fsm, gate, newRawNode, nil)
-}
-
 func newNativeStorageRuntime(t *testing.T, fsm *asyncStorageFSM, gate *asyncStorageSaveGate,
 	buildRawNode func(OpenConfig, *etcdraft.MemoryStorage, uint64) (*etcdraft.RawNode, error),
 	configure func(*Engine),

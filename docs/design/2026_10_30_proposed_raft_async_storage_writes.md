@@ -471,6 +471,13 @@ the complete KV package (55.941s) and unchanged native quorum migration gate
 still use the production synchronous runtime; a pass does not prove the
 unactivated async runtime resolves the recurrent large-write failure.
 
+The first push's CI lint exposed one unused sync-only diagnostic factory: the
+local unpublished diagnostic referenced it, but the published tree did not.
+The factory now lives with that local diagnostic, not the shared fixture. A
+fresh export of only staged/tracked files (no unpublished files) passes full
+repository lint and the entire engine race package without any skipped test
+(47.392s). This fixes published-tree hygiene, not the default heartbeat stall.
+
 Configuration application and received/local snapshots remain unsupported by
 this internal runtime. Startup/configuration journals, snapshot restore and
 checkpoint handshakes, full physical ownership/accounting, encrypted recovery,
