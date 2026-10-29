@@ -1,6 +1,6 @@
 # Raft asynchronous storage writes
 
-Status: Proposed
+Status: Proposed; revised after durability and lifecycle review
 Author: bootjp
 Date: 2026-10-30
 
@@ -74,6 +74,102 @@ quorum acceptance's expected rejection/snapshot/restart properties.
   receive appropriate failure/unknown classification, never false success.
 
 ## Acceptance
+
+### Storage accounting and overload
+
+Account retained payload/envelope bytes and work count across ingress,
+RawNode-unstable data, queued/executing/deferred append work, and outstanding
+apply work; moving a reference between stages does not release its reservation.
+This is not a claim to bound the complete Go heap or the durable retained log.
+Outbound deep clones also require a separate bounded byte reservation.
+
+Reserve bulk capacity before accepting a local proposal or bulk network Step.
+Local admission can return backpressure before proposal; network data messages
+can be refused/dropped with normal Raft transport feedback before Step, because
+the sender retries. Already emitted local storage messages cannot be dropped.
+Keep independent ingress capacity for heartbeat, vote and completion traffic;
+do not put them behind a full bulk channel. Configure MaxUncommittedEntriesSize,
+MaxInflightBytes/Msgs and MaxCommittedSizePerReady, but do not mislabel the last
+as an append bound. Release payload reservations only once their retained
+storage/RawNode ownership ends, with separate apply accounting thereafter.
+
+Allow at most one documented maximum-sized Ready overshoot when ownership
+must transfer atomically; account that debt and close bulk admission until it
+clears. A single valid near-64-MiB entry must fit without reducing RawKV's
+contract. Reserve separately bounded control-work capacity. If non-droppable
+control work exhausts that reserve during an indefinitely unavailable disk,
+halt explicitly with a resource error instead of unbounded retention, blocking
+the owner forever, dropping local work, or acknowledging it. This exceptional
+halt is not the normal backpressure path and makes no liveness promise through
+an indefinitely unavailable resource. Tests account every ownership transition,
+overshoot, rejection and release, including follower ingress and snapshots.
+
+### Durable prefix and response routing
+
+Only the append/disk actor calls WAL Save/Sync, SaveSnap/Release, and persistent
+peer/configuration snapshot operations. Snapshot capture/restore workers send
+immutable disk tasks to it; they do not concurrently access the WAL writer.
+Disk tasks are FIFO and never wait for an owner callback while holding a lock.
+
+For every append message with responses, explicitly Sync the required written
+prefix before releasing any response, even if that message is commit-only or
+response-only. An empty message is not permission to skip a flush of prior
+unsynced work. Adjacent tasks may batch writes and one flush, but every response
+retains its original ordering and durable-prefix dependency. Preserve snapshot
+file and directory durability in addition to WAL Sync. Save returning nil alone
+is not a universal durability receipt; only a documented/tested durable Save
+contract may later eliminate a redundant flush.
+
+The actor returns opaque responses and its completed prefix to the owner.
+The owner Steps self-directed responses into RawNode and dispatches remote
+responses through transport; it does not discard them as ordinary local network
+messages. A stale-term response may be ignored by RawNode, but its ownership
+and accounting must still be retired correctly. Async mode never calls Advance.
+
+### Configuration and snapshot phases
+
+| Phase | Owner | Wait rule |
+|---|---|---|
+| Ordinary append | Disk actor | Save and required Sync, then completion; no FSM/owner callback |
+| Ordinary committed data | Apply actor | FIFO, only issued after local stability; completion goes to owner |
+| Configuration front | Apply actor then owner | Earlier applies complete; send owner request, with no locks held |
+| Configuration transition | Owner | ApplyConfChange only; return immutable state/receipts, no disk or worker join |
+| Configuration durability | Apply actor then disk actor | Capture prefix-coherent metadata, submit disk task, await buffered receipt |
+| Configuration publication | Owner | Publish peer/membership/applied state only after ordered durable completion |
+| Received snapshot disk | Disk actor | Persist owned snapshot resources/WAL; then publish disk receipt |
+| Received snapshot restore | Apply actor | FIFO restore barrier after older apply; await disk receipt without locks |
+| Received snapshot acknowledgment | Owner | Disk and restore receipts both required; later append responses stay ordered |
+| Local checkpoint | Apply actor then disk actor | Capture one completed FSM/configuration prefix, persist it as a disk task |
+
+The owner never holds snapshotMu while waiting for a worker. The disk actor
+never calls the FSM, waits for restore, or requests an owner callback. The
+apply actor can wait for disk or a short owner transition only with no storage
+locks held. The owner continues processing those transitions/completions while
+both actors run. This acyclic ownership order replaces cross-worker synchronous
+calls into existing all-in-one persistence helpers.
+
+Snapshot restore fences subsequent applies; disk work may continue in FIFO,
+but the owner withholds dependent acknowledgments/publication until restore
+completes. Retain received files/object pins until every dependent task and
+durability receipt completes, including crash-safe snapshot reference capture.
+Snapshot checkpoints use the configuration belonging to their applied prefix,
+not a newer RawNode configuration. Encryption cutover, registration and key
+state transitions participate in the same apply order; disk tasks receive the
+correct immutable envelope/key-state inputs and never infer authority from a
+later asynchronously published state.
+
+### Quiescing shutdown
+
+Shutdown is an owner-loop state, not an owner-blocking WaitGroup.Wait. Stop
+new proposal/bulk admission and external callbacks, cancel queued cancellable
+work, and keep pumping storage completions and configuration callbacks until
+the worker-done signals and all outstanding ownership counters reach zero.
+Only then join workers, release snapshot resources and close storage. An
+already executing non-cancellable Save must actually return; a deadline is
+not a synthesized completion. Keep diagnostics while waiting rather than
+closing resources underneath it. Tests release their held Save in cleanup.
+
+### Runtime and recovery gates
 
 1. Add a deterministic runtime-red test on the actual engine loop: establish
    a durable leader, gate only a later user-entry Save, and prove heartbeat
