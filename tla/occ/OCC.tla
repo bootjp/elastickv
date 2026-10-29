@@ -29,7 +29,7 @@
 (*     reader's snapshot run ahead of an in-flight 2PC commit_ts.          *)
 (*                                                                         *)
 (* Invariants OCC-1..OCC-5 are the original contract.  Two more pin known *)
-(* gaps from docs/design/2026_09_26_proposed_serializable_isolation_audit *)
+(* gaps from docs/design/2026_09_26_partial_serializable_isolation_audit *)
 (* .md:                                                                    *)
 (*                                                                         *)
 (*   OCC-3  snapshot-read stability — violated through the 2PC path (G0:   *)
@@ -73,7 +73,9 @@ CONSTANTS
     MaxOps,         \* upper bound on Write + RawWrite actions (state-space)
     EnableSafety,   \* TRUE: commit_ts > start_ts discipline; FALSE: gap config
     EnableTwoPhase, \* TRUE: multi-shard 2PC path enabled; FALSE: one-phase only
-    MultiGroup      \* TRUE: one Raft group per key; FALSE: a single group
+    MultiGroup,     \* TRUE: one Raft group per key; FALSE: a single group
+    ReadAdvance     \* TRUE: --readWatermarkAdvance; a snapshot read first
+                    \* raises the read key's group watermark to start_ts
 
 \* Transaction lifecycle states.
 \*   Proposed  — one-phase entry with an allocated commit_ts, not applied yet
@@ -224,15 +226,28 @@ BeginWriteOnly(t) ==
 (* ReadKey: snapshot read on key k at startTs[t].  Blocked while a lock   *)
 (* with lockTs <= startTs[t] is outstanding (modelled as the action being *)
 (* disabled until the lock holder's Commit or Abort drains the lock).     *)
+(*                                                                         *)
+(* With ReadAdvance (ShardStore.ensureReadWatermark), a read on a group   *)
+(* whose watermark is below startTs[t] first raises that watermark to     *)
+(* startTs[t] with a Raft entry and reads after it applies; the two are   *)
+(* one step here.  A start of MaxTs (empty-store sentinel) advances       *)
+(* nothing.  Every later one-phase apply at or below startTs[t] on that   *)
+(* group is then fenced.                                                   *)
 (***************************************************************************)
+AdvancedWatermark(t, k) ==
+    IF ReadAdvance /\ startTs[t] # MaxTs /\ startTs[t] > watermark[GroupOf(k)]
+    THEN [watermark EXCEPT ![GroupOf(k)] = startTs[t]]
+    ELSE watermark
+
 ReadKey(t, k) ==
     /\ txnState[t] = "Active"
     /\ snapshotRead[t]
     /\ k \notin readSet[t]
     /\ ~ConflictingLockExists(k, startTs[t])
+    /\ watermark' = AdvancedWatermark(t, k)
     /\ readSet' = [readSet EXCEPT ![t] = @ \cup {k}]
     /\ readObs' = [readObs EXCEPT ![t] = [@ EXCEPT ![k] = LatestVisible(k, startTs[t])]]
-    /\ UNCHANGED <<tsCounter, watermark, txnState, snapshotRead, startTs,
+    /\ UNCHANGED <<tsCounter, txnState, snapshotRead, startTs,
                    commitTs, writeSet, lockMap, versions, opCount>>
 
 (***************************************************************************)
