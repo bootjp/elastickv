@@ -326,6 +326,9 @@ type Engine struct {
 	fsm       StateMachine
 	peers     map[uint64]Peer
 	transport *GRPCTransport
+	// storagePipeline is installed before run starts. Open keeps the synchronous
+	// path until configuration, snapshots and complete ownership gates are met.
+	storagePipeline *engineStoragePipeline
 
 	// raftCipher and raftCutoverIndex implement the §4.2 / §6.3
 	// pre-apply unwrap hook. raftCipher is nil unless the
@@ -980,7 +983,15 @@ func coldStartPayloadIsVolatile(payload []byte, cfg OpenConfig) bool {
 }
 
 func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64) (*etcdraft.RawNode, error) {
-	rawNode, err := etcdraft.NewRawNode(&etcdraft.Config{
+	return newRawNodeWithStorageMode(cfg, storage, applied, false)
+}
+
+func newStorageRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64) (*etcdraft.RawNode, error) {
+	return newRawNodeWithStorageMode(cfg, storage, applied, true)
+}
+
+func newRawNodeWithStorageMode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64, asynchronous bool) (*etcdraft.RawNode, error) {
+	config := &etcdraft.Config{
 		ID:                        cfg.NodeID,
 		ElectionTick:              cfg.ElectionTick,
 		HeartbeatTick:             cfg.HeartbeatTick,
@@ -993,7 +1004,13 @@ func newRawNode(cfg OpenConfig, storage *etcdraft.MemoryStorage, applied uint64)
 		PreVote:                   preVoteEnabledFromEnv(),
 		ReadOnlyOption:            etcdraft.ReadOnlySafe,
 		DisableProposalForwarding: true,
-	})
+		AsyncStorageWrites:        asynchronous,
+	}
+	if asynchronous {
+		config.MaxUncommittedEntriesSize = pipelineUncommittedBytes
+		config.MaxInflightBytes = pipelineEntryRoom
+	}
+	rawNode, err := etcdraft.NewRawNode(config)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}
@@ -1106,6 +1123,11 @@ func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.Proposal
 	if e == nil {
 		return nil, errors.WithStack(errNilEngine)
 	}
+	permit, err := e.reserveProposalPayload(uint64(len(data)))
+	if err != nil {
+		return nil, err
+	}
+	defer permit.Release()
 
 	req := proposalRequest{
 		ctx:     ctx,
@@ -1121,6 +1143,7 @@ func (e *Engine) propose(ctx context.Context, data []byte) (*raftengine.Proposal
 		return nil, e.currentErrorOrClosed()
 	case e.proposeCh <- req:
 	}
+	req.payload = nil
 
 	select {
 	case <-ctx.Done():
@@ -1840,6 +1863,10 @@ func (e *Engine) checkLeadershipTransfer(ctx context.Context, target Peer, sawPe
 
 func (e *Engine) run() {
 	defer close(e.doneCh)
+	if e.storagePipeline != nil {
+		e.runStoragePipeline()
+		return
+	}
 
 	ticker := time.NewTicker(e.tickInterval)
 	defer ticker.Stop()
@@ -3809,11 +3836,11 @@ func (e *Engine) refreshStatus() {
 	}
 
 	e.mu.Lock()
-	e.status = status
 	if e.closed {
-		e.status.State = raftengine.StateShutdown
-		e.status.PerPeer = nil
+		status.State = raftengine.StateShutdown
+		status.PerPeer = nil
 	}
+	e.status = status
 	// Use the voter count, NOT len(e.peers), so a 1-voter + N-learner
 	// cluster correctly hits the leader-of-1 fast path: a learner does
 	// not vote and is not part of the lease-read denominator. See
@@ -3903,6 +3930,12 @@ func (e *Engine) publishShutdown(err error) bool {
 
 func (e *Engine) shutdown() {
 	e.publishShutdown(nil)
+	e.finishShutdown(errors.WithStack(errClosed))
+}
+
+// finishShutdown joins existing transport/snapshot workers and closes storage.
+// A storage pipeline must drain its own actors before entering this phase.
+func (e *Engine) finishShutdown(err error) {
 	e.stopDispatchWorkers()
 	e.stopSnapshotWorker()
 	_ = closePersist(e.persist)
@@ -3912,7 +3945,7 @@ func (e *Engine) shutdown() {
 			slog.Any("err", err),
 		)
 	}
-	e.failPending(errors.WithStack(errClosed))
+	e.failPending(err)
 }
 
 func (e *Engine) fail(err error) {
@@ -3934,16 +3967,7 @@ func (e *Engine) fail(err error) {
 			slog.Any("err", err),
 		)
 	}
-	e.stopDispatchWorkers()
-	e.stopSnapshotWorker()
-	_ = closePersist(e.persist)
-	if err := e.transport.Close(); err != nil {
-		slog.Warn("etcd raft engine: transport close",
-			slog.String("node_id", e.localID),
-			slog.Any("err", err),
-		)
-	}
-	e.failPending(e.currentErrorOrClosed())
+	e.finishShutdown(e.currentErrorOrClosed())
 }
 
 func (e *Engine) failPending(err error) {
@@ -3960,6 +3984,7 @@ func (e *Engine) failPending(err error) {
 }
 
 func (e *Engine) storePendingProposal(req proposalRequest) {
+	req.payload = nil
 	e.pending.Lock()
 	defer e.pending.Unlock()
 	e.pendingProposals[req.id] = req
@@ -4527,6 +4552,9 @@ func maxAppliedIndex(snapshot raftpb.Snapshot) uint64 {
 }
 
 func (e *Engine) enqueueStep(ctx context.Context, msg raftpb.Message) error {
+	if e.storagePipeline != nil {
+		return e.enqueuePipelineStep(ctx, msg)
+	}
 	ch := e.stepChannelFor(msg.GetType())
 
 	if isBlockingInboundStepMsg(msg.GetType()) {

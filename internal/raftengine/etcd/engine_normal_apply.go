@@ -14,8 +14,8 @@ import (
 // the caller must retain through publication. FSM/cipher lifetime must cover
 // execution, ordered with config/restore. The immutable cutover callback is
 // evaluated during execution, after earlier FSM effects, not during capture.
-// Async integration must also derive duplicate from the apply actor's ordered
-// cursor, not a stale owner-published applied index. Current capture is SYNC.
+// Async execution derives duplicate from the apply actor's ordered cursor,
+// not a stale owner-published applied index. Both paths capture on the owner.
 type normalApplyInput struct {
 	index     uint64
 	data      []byte

@@ -373,3 +373,107 @@ snapshot publication and error semantics; coverage exercises delayed execution,
 prefix failure and deterministic shutdown/snapshot gates. The actual held-user-
 Save heartbeat failure and unchanged near-64-MiB quorum gate remain open. Do not
 enable AsyncStorageWrites until their full integration requirements above pass.
+
+### Unactivated normal-entry owner pipeline
+
+An explicit internal Engine construction now exercises a native
+`AsyncStorageWrites` RawNode with owner-only mutation, FIFO disk/apply actors,
+opaque response routing and a completion-pumping shutdown. Production `Open`
+still constructs the synchronous engine. No public flag selects this partial
+runtime, and it must not be treated as the completed design or a resolution of
+the recurrent near-64-MiB quorum failure.
+
+The owner folds each mutation's Ready without calling Advance. Local append
+responses reach RawNode or the transport only after actual Save/required Sync
+and owner MemoryStorage publication. Apply tasks wait for their issued disk
+prefix to retire, and only completed FSM receipts publish proposal outcomes or
+the applied index. An apply actor sequences its own duplicate cursor and
+evaluates encryption cutover during execution. Successful prefix receipts are
+retained independently of a later task error. Neither actor accesses RawNode.
+
+The metadata-only unstable ledger mirrors the pinned v3.7.0 tail identity and
+current-term stabilization rules. Displaced suffixes and stable prefixes remain
+charged until the complete unstable epoch empties, covering upstream backing
+array retention. Actor references have independent byte/item reservations;
+pointer arrays are detached without copying user payload. Finite ingress,
+deferred-task, actor, completion and routing budgets retain their charges until
+their respective owners retire them. This does NOT yet implement the complete
+ingress/unstable/outbound and atomic-Ready overshoot contract above; in
+particular, resource exhaustion is a terminal prototype error rather than the
+specified debt-driven admission policy.
+
+Transport ingress rejects local storage message types and local-thread
+identities, so a peer cannot fabricate a local durability completion. Append
+acknowledgments retain a separate control admission path when bulk work pauses.
+Proposal admission reserves before copying, and pending proposal metadata does
+not retain the original payload. On shutdown authority is revoked first, new
+work stops, and actual disk/apply completions are consumed before actors join,
+RawNode/unstable ownership is disposed, or storage closes. A late status refresh
+cannot resurrect leader callbacks, the leader mirror or a quorum-ack anchor;
+the native leader regression first reproduced that common-path defect before
+its correction.
+
+The shared two-voter real-WAL fixture now checks a valid native v3.7.0 progress
+witness. The earlier diagnostic incorrectly expected the caller ReadIndex nonce
+in heartbeat.Context: the pinned library encodes an internal little-endian read
+round there and preserves the nonce in MsgReadIndexResp.Entries[0].Data. Both
+sync and async paths now require the post-gate native challenge, its matching
+nonce response and two subsequent periodic heartbeats, with the same two-second
+deadline and unchanged no-early-ACK/FSM/index assertions. Classifier controls
+reject old nonces, pre-challenge ticks, malformed responses and one-tick-only
+histories. No quorum acknowledgment is fabricated in the native Engine tests.
+
+With that same witness, the synchronous default still fails while a later user
+Save is held (round=0, no nonce response or periodic heartbeat), then completes
+the real proposal after release. Explicit async Save, required Sync and FSM
+Apply gates instead maintain native heartbeat progress without premature
+proposal success. Close held behind the real Save revokes authority immediately
+and joins disk/apply actors before storage Close, without manufacturing a
+successful client outcome. Ledger/admission/witness/native runtime selections
+passed twenty race repetitions (31.027s); the complete engine race package passed
+(47.642s), explicitly excluding only the unpublished known-red default-path
+diagnostic. Repository-wide unfiltered lint reported zero issues.
+
+Real-runtime fault cases additionally inject later user Save/required-Sync
+failure while an earlier committed FSM apply remains held, and FSM HaltApply
+or panic while the disk actor remains inside a later actual Save. They check
+completed client-prefix preservation, no failed-client success, first-cause
+retention across the other actor's later error and storage Close error, actor
+joins before Close, retained reservations during held work and zero budgets
+after disposal. These full run-loop checks do not themselves observe the failed
+opaque response at RawNode or attest one multi-entry task's actual range.
+A complementary test-owned native Engine therefore inspects the real deferred
+apply message after actual WAL completion: it contains entries 2 through 4 in
+one task and the original response carries that range in Entries. HaltApply or
+panic at entry 3 publishes only the completed client prefix 2, never executes
+entry 4, and leaves native applied at 1. An explicit negative control Steps the
+original forbidden response only into the disposable test-owned RawNode and
+observes applied become 4, proving the cursor witness detects that violation.
+No production hook or synthetic quorum response is used. Both variants pass
+twenty race repetitions (6.623s). This direct owner-boundary observation
+complements rather than replaces full run-loop, shutdown and recovery gates.
+
+Independent review found that routing-budget rejection after Ready() accepted
+the batch discarded its opaque local message ownership. An actual native
+higher-term Ready with one-byte routing headroom and an earlier real WAL Save
+held reproduced the nil retained-Ready defect. Acquisition now retains the
+Ready before fallible sizing/reservation. The regression synchronously reaches
+owner failure/quiesce with Save still held and verifies the same Ready and
+RawNode remain owned until both actors join; disposal then clears them and
+retires all related reservations. Twenty race repetitions pass (4.056s), and
+independent re-review confirms both the fix and the synchronized witness.
+
+The final combined added-test selection, including all fault and native cursor
+witnesses, passed twenty race repetitions (46.271s). The engine package passed
+again (45.296s, with the same unpublished known-red diagnostic excluded), as did
+the complete KV package (55.941s) and unchanged native quorum migration gate
+(23.070s). Unfiltered repository lint reported zero issues. The latter two
+still use the production synchronous runtime; a pass does not prove the
+unactivated async runtime resolves the recurrent large-write failure.
+
+Configuration application and received/local snapshots remain unsupported by
+this internal runtime. Startup/configuration journals, snapshot restore and
+checkpoint handshakes, full physical ownership/accounting, encrypted recovery,
+large-write native quorum acceptance and activation still require implementation
+and end-to-end verification. These partial tests do not prove crash/power-loss
+recovery, overload availability or the requested complete engine state.
