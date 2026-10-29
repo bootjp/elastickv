@@ -79,20 +79,6 @@ type encryptionAdminEngine interface {
 	raftengine.LeaderView
 }
 
-// encryptionAdminWiringForGroup keeps the read-only capability service on the
-// dedicated TSO listener while withholding every mutating proposal path. The
-// TSO FSM has no encryption applier or writer registry, so allowing a mutator
-// to propose there would commit an entry that cannot update dedicated TSO
-// state. The engine remains available as a LeaderView so ResyncSidecar keeps
-// its quorum-confirmed leader-only freshness contract. Data groups retain the
-// normal flag-driven mutator wiring.
-func encryptionAdminWiringForGroup(groupID uint64, enableMutators bool, engine encryptionAdminEngine) (bool, encryptionAdminEngine) {
-	if groupID == dedicatedTSORaftGroupID {
-		return false, engine
-	}
-	return enableMutators, engine
-}
-
 func encryptionAdminWriterRegistry(sidecarPath string, st store.MVCCStore, groupID uint64) (encryption.WriterRegistryStore, error) {
 	if sidecarPath == "" {
 		return nil, nil

@@ -12,6 +12,15 @@ Date: 2026-05-28
 > `tla-check: all model-check outcomes match the design contract.`
 > M6 remains an optional deep/liveness extension and is outside the
 > initial proposal's implemented scope.
+>
+> **2026-10-28 reconciliation.** The modules were brought back in line
+> with the code on `main`; Section 12 lists every change. In short: the
+> HLC handoff the code provides is the centralized-TSO allocation floor
+> (strategy (a)), not strategy (c), which was never implemented; the
+> OCC model now carries read-set validation, the one-phase apply fence
+> and the 2PC commit-ts-before-PREPARE order; and known implementation
+> gaps (G0, G1, G10 of the serializable isolation audit) are pinned by
+> expected-failure configs instead of being hidden by the model.
 
 ---
 
@@ -98,7 +107,7 @@ design abstraction.
 | Subsystem | Implementation anchors | Modelled state |
 |---|---|---|
 | Raft (abstracted) | `internal/raftengine/etcd`, `kv/fsm.go` | per-group log of committed entries + current leader + term; snapshot install marker |
-| HLC | `kv/hlc.go` (`Next`, `SetPhysicalCeiling`, `Observe`); `kv/coordinator.go` and `kv/sharded_coordinator.go` (`hlcRenewalInterval`, `hlcPhysicalWindowMs`, `RunHLCLeaseRenewal`) | per-node `last` (48-bit physical + 16-bit in-memory logical), per-node `physicalCeiling` (Raft-applied), per-leader `term` |
+| HLC | `kv/hlc.go` (`NextFenced`, `SetPhysicalCeiling`, `Observe`); `kv/coordinator.go` and `kv/sharded_coordinator.go` (`hlcRenewalInterval`, `hlcPhysicalWindowMs`, `RunHLCLeaseRenewal`); `kv/tso_raft.go`, `kv/tso_fsm.go` (allocation floor) | per-node `last` (48-bit physical + 16-bit in-memory logical), per-node `physicalCeiling` (Raft-applied), per-leader `term` |
 | OCC | `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` | per-txn `start_ts` (= `read_ts`), `write_set`, `read_set`, lock map `(key, lock_ts) → start_ts` (the value records the owning transaction's `start_ts`, which corresponds to `txnLock.StartTS` in `kv/txn_codec.go` and equals `read_ts(T)` by OCC-5, so `owner(k, ts)` is derivable for OCC-L1) |
 | MVCC | `store/mvcc_store.go` | per-key version chain `[(commit_ts, value, tombstone?)]` |
 | Route catalog | `distribution/engine.go`, `distribution/catalog.go`, `distribution/watcher.go` | catalog version, per-node cached snapshot, in-flight `SplitRange` |
@@ -241,6 +250,16 @@ cannot check them as state invariants.
     implement any of (a)/(b)/(c), the TLC run for HLC-4 is expected
     to surface a counterexample — surfacing that counterexample is
     one of the motivating reasons for this spec.
+    **As built (2026-10-28).** Strategy (c) was never implemented:
+    there is no `MaxAppliedHLC()` and no election-time `Observe`. The
+    handoff the code provides is strategy (a) in the centralized TSO
+    modes: `RaftTSOAllocator` Observes the Raft-committed allocation
+    floor before reserving a window and commits the window's end as the
+    new floor before handing it out (`kv/tso_raft.go`). `tla/hlc/HLC.tla`
+    models that, and `MCHLC.cfg` checks it. The legacy TSO mode has no
+    handoff; it is pinned by `MCHLC_legacy_single_gap.cfg` (HLC-4) and,
+    because `ShardedCoordinator` stamps on followers (audit G10),
+    `MCHLC_legacy_sharded_gap.cfg` (HLC-3).
   - **(iii) Commit-time ceiling fencing.** Bounded skew (i) and logical
     handoff (ii) are not enough on their own: a leader that misses
     `RunHLCLeaseRenewal` for longer than `hlcPhysicalWindowMs` (e.g.
@@ -546,15 +565,17 @@ The downloaded jar is checksum-pinned. No system-wide install required.
 (and push to `main`) that touches:
 
 - `tla/**` and `Makefile` (the spec and the harness themselves).
-- `kv/hlc*.go`, `kv/coordinator.go`, `kv/sharded_coordinator.go`,
-  `kv/transaction.go`, `kv/fsm.go`, `kv/lock_resolver.go` — the HLC
+- `kv/hlc*.go`, `kv/tso*.go`, `kv/coordinator.go`,
+  `kv/sharded_coordinator.go`, `kv/transaction.go`, `kv/fsm.go`,
+  `kv/fsm_migration_serving.go`, `kv/lock_resolver.go` — the HLC
   renewal scheduler, the timestamp-issuance dispatch path, and the
   OCC commit-ts assignment all live in these files (per Section 3
   anchors); a change here can violate HLC/OCC invariants and must
   re-run `tla-check`.
-- `store/mvcc_store.go`
+- `store/mvcc_store.go`, `store/lsm_store.go`, `adapter/ts.go`
 - `distribution/**`
-- `.github/workflows/tla-check.yml` (the workflow file itself).
+- `scripts/tla-check.sh` and `.github/workflows/tla-check.yml` (the
+  harness and the workflow file itself).
 
 The workflow uses Temurin JDK 21, caches `.cache/tla/tla2tools.jar`
 keyed on the Makefile hash so version-pin changes invalidate the cache
@@ -617,7 +638,7 @@ proves something on its own).
 
 | ID | Scope | Output | Notes |
 |---|---|---|---|
-| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Implemented and passing via `tla/hlc/MCHLC.cfg`; `MCHLC_gap.cfg` fails on `HLC4_NoRegressionAcrossTerms` as designed. | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. |
+| **M1** | `lib/Raft.tla`, `lib/Env.tla`, `hlc/HLC.tla` with invariants HLC-1..HLC-4 (encoding all three HLC-4 preconditions — the bounded-skew `ASSUME`, the logical-handoff strategy, **and** the ceiling-fencing gate from (iii)). `Makefile` `tla-check` target. `tla/README.md`. | Implemented and passing via `tla/hlc/MCHLC.cfg`; `MCHLC_gap.cfg` fails on `HLC4_NoRegressionAcrossTerms` as designed. | Smallest viable PR; sets the directory layout precedent. **Default logical-handoff strategy: (c)** — `BecomeLeader` action calls `Observe(maxHLC)` (Section 5.1, HLC-4 (ii)); deviations from (c) must be justified in the PR. Superseded 2026-10-28: the code implements the TSO allocation floor (strategy (a)) instead, and the model follows it (Section 12). |
 | **M2** | `occ/OCC.tla` with safety invariants OCC-1..OCC-5. | Implemented and passing via `tla/occ/MCOCC.cfg`; `MCOCC_gap.cfg` fails on `OCC1_CommitTsAboveStart` as designed. | Re-uses `lib/Raft.tla`; introduces lock map, read/write sets, and per-transaction `start_ts` consistency. |
 | **M3** | `mvcc/MVCC.tla` with invariants MVCC-1..MVCC-4. | Implemented and passing via `tla/mvcc/MCMVCC.cfg`; `MCMVCC_gap.cfg` fails on `MVCC4_NoLostCommitOnSnapshotInstall` as designed. | Includes a small `InstallSnapshot` action to exercise MVCC-4. |
 | **M4** | `routes/Routes.tla` with invariants Routes-1..Routes-4. | Implemented and passing via `tla/routes/MCRoutes.cfg`; `MCRoutes_gap.cfg` fails on `Routes4_NoEngineRegression` as designed. | Models `SplitRange` (catalog-atomic + handling-node engine sync) and asynchronous `CatalogWatcher` polling on other nodes. |
@@ -702,6 +723,9 @@ does not keep this document in `partial`.
 
 ## 11. References
 
+- `docs/design/2026_09_26_proposed_serializable_isolation_audit.md` —
+  the gaps (G0, G1, G10) the expected-failure configs pin.
+
 - `kv/hlc.go` — current HLC implementation and physical ceiling layout.
 - `kv/transaction.go`, `kv/lock_resolver.go`, `kv/fsm_occ_test.go` — OCC
   surface and lock resolution.
@@ -715,3 +739,34 @@ does not keep this document in `partial`.
   `Raft.tla` interface.
 - CockroachDB and TiDB MVCC / HLC TLA+ models — public prior art for
   Section 5.1–5.3 invariants.
+
+## 12. Model / Implementation Reconciliation (2026-10-28)
+
+A review of the modules against `main` found that several passing
+configs verified behaviour the code does not have. The modules were
+changed to describe the code; where the code falls short of an
+invariant, the shortfall is pinned by an expected-failure config so
+that a fix turns the run into "unexpectedly passed" and forces the
+model to follow. `scripts/tla-check.sh` gained `pass_configs_for` for
+extra expected-PASS configs.
+
+| Module | Was | Now | Configs |
+|---|---|---|---|
+| HLC | `BecomeLeader` Observes `maxAppliedHLC` (strategy (c)); the fence was a toggle; logical overflow could issue `ceiling + 1`; leader-only issuance | `IssueTimestamp` is `NextFenced` (no fence before the first ceiling, fail closed at `wall >= ceiling` or when the next value's physical half exceeds the ceiling); no election-time handoff; `IssuanceMode` selects TSO (allocation-floor handoff), legacy `Coordinate` (leader-only, no handoff) or legacy `ShardedCoordinator` (any node stamps) | `MCHLC.cfg` (TSO, pass); `MCHLC_gap.cfg` (TSO without the floor, HLC-4); `MCHLC_legacy_single_gap.cfg` (HLC-4); `MCHLC_legacy_sharded_gap.cfg` (HLC-3, G10) |
+| OCC | Fresh `start_ts`; no read-set validation (snapshot isolation); atomic commit | `start_ts` = applied watermark for reading transactions, fresh for write-only ones; one-phase Allocate / Apply with the commit-ts fence, lock check and read + write validation; 2PC with commit-ts settled before PREPARE, PREPARE validating read and write keys, COMMIT without fence or revalidation; raw writes; new `OCC8_NoWriteSkew` | `MCOCC.cfg` (OCC-1/2/4/5, pass); `MCOCC_onephase.cfg` (single shard, one Raft group, every invariant incl. OCC-3 / OCC-8, pass); `MCOCC_gap.cfg` (OCC-1); `MCOCC_g0_gap.cfg` (OCC-3, G0); `MCOCC_g1_gap.cfg` (OCC-8, G1); `MCOCC_emptystore_gap.cfg` (OCC-3b: an empty-store start is MaxUint64, read-latest); `MCOCC_multigroup_gap.cfg` (OCC-3: G0 across groups, `MultiGroup = TRUE`); `MCOCC_live.cfg` |
+| MVCC | Atomic `Compact` keeping `>= newMin` plus the newest `< newMin`; unique timestamps assumed | Resumable compaction (pending watermark, per-key prune, finish) keeping `> minTS` plus the newest `<= minTS`; reads below the effective watermark fail closed; `UniqueTs = FALSE` admits a colliding write, which the raw apply path writes over the existing version; new `MVCC5_AckedWriteNotOverwritten` | `MCMVCC.cfg` (pass); `MCMVCC_gap.cfg` (MVCC-4); `MCMVCC_collision_gap.cfg` (MVCC-5, G10) |
+| Routes | Comments claimed the watcher always reads the head snapshot | Comments describe the bounded delta batches of `SyncOnce` and stale-delta rejection; the actions were already general enough | unchanged |
+| Composed | Every transaction pins its catalog version; Composed-2 justified by "SplitRange is same-group only" | `BeginTxn` chooses pinned or unpinned (`ObservedRouteVersion` absent, so `verifyComposed1` short-circuits), and `AutoPin` pins at the Dispatch-time version (`maybeAutoPinObservedRouteVersion`); Composed-1 asserted for pinned transactions only; Composed-2 documented as not modelled, since cross-group migration has shipped | unchanged |
+
+Known abstractions that remain: one PREPARE step per transaction rather
+than per shard, COMMIT drains every lock at once (no asynchronous
+secondary commit, so G12 / G14 are out of scope), the raw write path's
+own reordering window, the Composed migration fence / staged-visibility
+phases, the 2PC COMMIT write-fence bypass, and the single Raft group
+of the HLC model.  The OCC model's `MultiGroup` mode gives every key its
+own group: the one-phase fence compares against the applying group's
+own watermark while snapshot starts take the maximum over groups, which
+admits G0 on the one-phase path across groups (the audit's
+"Multi-group deployments" finding; reproduced again on `main` at the
+FSM / store level during this reconciliation).  `MCOCC_multigroup_gap.cfg`
+pins it.

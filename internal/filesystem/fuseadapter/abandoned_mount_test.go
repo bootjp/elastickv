@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
 )
@@ -50,11 +51,7 @@ func TestReleaseAbandonedMountReturns(t *testing.T) {
 		releaseAbandonedMount(results, fs, mountPoint, fuseTypeFor(opts.Name))
 		close(released)
 	}()
-	select {
-	case <-released:
-	case <-time.After(15 * time.Second):
-		t.Fatal("releaseAbandonedMount did not return; Unmount is waiting for a serve loop that never ran")
-	}
+	testutil.Closed(t, released, 15*time.Second, "releaseAbandonedMount did not return; Unmount is waiting for a serve loop that never ran")
 	// The release cancels the requests in flight, so a handler blocked in
 	// the backend returns before the stores behind it are closed.
 	require.Error(t, inFlight.Err(), "the release must cancel the requests in flight on the late mount")

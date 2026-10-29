@@ -9,7 +9,6 @@ import (
 	"path/filepath"
 	"syscall"
 	"testing"
-	"time"
 
 	"github.com/bootjp/elastickv/internal/backup"
 	"github.com/bootjp/elastickv/internal/raftengine/etcd"
@@ -20,7 +19,7 @@ func TestRunPrepareRestoreRejectsFIFOInputBeforeOpen(t *testing.T) {
 	dir := t.TempDir()
 	input := filepath.Join(dir, "encoded.fsm")
 	require.NoError(t, syscall.Mkfifo(input, 0o600))
-	writeEncodeInfoWithRecordedSHA(t, input, "cluster-a", "unused")
+	writeEncodeInfoWithSHA(t, input, "cluster-a", true, true, "unused")
 
 	code, err := run([]string{
 		"--input", input,
@@ -65,23 +64,4 @@ func TestRunPrepareRestoreRejectsSymlinkInputBeforeOpen(t *testing.T) {
 	}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	require.ErrorIs(t, err, etcd.ErrExternalSnapshotRestoreInvalid)
 	require.Equal(t, exitUserErr, code)
-}
-
-func writeEncodeInfoWithRecordedSHA(t *testing.T, input, clusterID, shaHex string) {
-	t.Helper()
-	info := backup.NewEncodeInfo(time.Unix(0, 0))
-	info.EncoderVersion = "test"
-	info.InputRoot = "dump"
-	info.OutputFSMPath = input
-	info.OutputFSMSHA256 = shaHex
-	info.LastCommitTS = 1234
-	info.ManifestLastCommitTS = 1234
-	info.ManifestClusterID = clusterID
-	info.AdaptersEnabled = []string{"redis"}
-	info.SelfTest = backup.EncodeInfoSelfTest{Ran: true, Matched: true}
-
-	f, err := os.Create(backup.EncodeInfoSidecarPath(input))
-	require.NoError(t, err)
-	require.NoError(t, backup.WriteEncodeInfo(f, info))
-	require.NoError(t, f.Close())
 }

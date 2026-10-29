@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -20,11 +21,7 @@ func requireWaiterSignaled(t *testing.T, ch <-chan struct{}) {
 
 func requireWaiterQuiet(t *testing.T, ch <-chan struct{}) {
 	t.Helper()
-	select {
-	case <-ch:
-		t.Fatal("waiter was unexpectedly signaled")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, ch, 20*time.Millisecond, "waiter was unexpectedly signaled")
 }
 
 func TestRedisApplyObserverSignalsStreamEntryWaiters(t *testing.T) {
@@ -74,18 +71,6 @@ func TestRedisApplyObserverZSetSignalRequiresFullRecheck(t *testing.T) {
 	observer.OnApply(pb.Op_PUT, store.ZSetMemberKey(key, []byte("member")))
 	requireWaiterSignaled(t, waiter.C)
 	require.False(t, waiter.fastSignalAllowed(), "FSM apply zset wake must not use the BZPOPMIN fast recheck")
-}
-
-func TestRedisApplyObserverPendingLocalZSetApplyStillForcesFullRecheck(t *testing.T) {
-	observer := NewRedisApplyObserver()
-	key := []byte("zset-pending-local")
-	waiter, release := observer.zsetWaiters.Register([][]byte{key})
-	defer release()
-
-	observer.OnApply(pb.Op_PUT, store.ZSetMemberKey(key, []byte("member")))
-
-	requireWaiterSignaled(t, waiter.C)
-	require.False(t, waiter.fastSignalAllowed(), "FSM apply zset wake must force the full BZPOPMIN recheck even during a local write")
 }
 
 func TestRedisApplyObserverSignalsLegacyZSetWaiters(t *testing.T) {

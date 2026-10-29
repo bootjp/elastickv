@@ -1,6 +1,8 @@
 # SIGTERM leadership transfer
 
-Status: proposed; implementation and regression tests accompany this change.
+Status: Implemented
+
+Shipped in #1291 (`main_shutdown.go`, wired into `run` and `startRaftServers`). No implementation work follows.
 Issue: https://github.com/bootjp/elastickv/issues/1284
 
 ## Goal

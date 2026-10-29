@@ -1,8 +1,6 @@
 package kv
 
 import (
-	"context"
-	"net"
 	"sync"
 	"testing"
 
@@ -46,20 +44,7 @@ func TestGRPCConnCache_ReusesConnection(t *testing.T) {
 func TestGRPCConnCache_ConcurrentConnFor(t *testing.T) {
 	t.Parallel()
 
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	srv := grpc.NewServer()
-	go func() {
-		_ = srv.Serve(lis)
-	}()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
-
-	addr := lis.Addr().String()
+	addr := grpctest.Serve(t, func(*grpc.Server) {})
 
 	var c GRPCConnCache
 

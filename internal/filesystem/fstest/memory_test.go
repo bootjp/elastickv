@@ -6,7 +6,6 @@ import (
 	"encoding/binary"
 	"testing"
 
-	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/internal/filesystem/fstest"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
@@ -61,7 +60,7 @@ func TestMemoryDispatcherTimestampPatchBoundaries(t *testing.T) {
 			response, err := fstest.NewMemoryDispatcher(st).Dispatch(context.Background(), req)
 			require.Equal(t, original, value)
 			if !tc.valid {
-				require.ErrorIs(t, err, filesystem.ErrInvalid)
+				require.ErrorIs(t, err, kv.ErrInvalidRequest)
 				require.Nil(t, response)
 				require.False(t, st.called)
 				return
@@ -69,7 +68,7 @@ func TestMemoryDispatcherTimestampPatchBoundaries(t *testing.T) {
 			require.NoError(t, err)
 			require.Equal(t, uint64(41), response.CommitIndex)
 			require.Len(t, st.mutations, 1)
-			want := append([]byte(nil), value...)
+			want := bytes.Clone(value)
 			if tc.offset != 0 {
 				binary.BigEndian.PutUint64(want[tc.offset:], response.CommitIndex)
 			}
@@ -123,7 +122,7 @@ func TestMemoryDispatcherTimestampSelectionAndOCC(t *testing.T) {
 				CommitTS: tc.commitTS, StartTS: tc.startTS, IsTxn: tc.isTxn, ReadKeys: reads,
 			})
 			require.ErrorIs(t, err, store.ErrWriteConflict)
-			require.EqualError(t, err, "apply memory dispatcher mutations: write conflict")
+			require.ErrorContains(t, err, "apply memory dispatcher mutations")
 			require.Nil(t, response)
 			require.True(t, st.called)
 			require.Equal(t, tc.want, st.commitTS)
@@ -142,8 +141,8 @@ func TestMemoryDispatcherRejectsUnsupportedOperationsBeforeApply(t *testing.T) {
 	}{
 		{name: "prefix delete", op: kv.DelPrefix, want: store.ErrUnknownOp},
 		{name: "unknown operation", op: kv.OP(-1), want: store.ErrUnknownOp},
-		{name: "patch checked before opcode", op: kv.DelPrefix, offset: 1, want: filesystem.ErrInvalid},
-		{name: "delete patch checked", op: kv.Del, offset: 1, want: filesystem.ErrInvalid},
+		{name: "prefix rejected before patch", op: kv.DelPrefix, offset: 1, want: store.ErrUnknownOp},
+		{name: "delete patch checked", op: kv.Del, offset: 1, want: kv.ErrInvalidRequest},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			st := &mutationCaptureStore{}

@@ -106,7 +106,7 @@ type bucketKey struct {
 // concurrent traffic on different queues never serialises on the same
 // lock; refill + take + release of a single bucket is the only
 // critical section. evicted flips to true exactly once (under mu) when
-// the bucket is removed from the store by sweep / invalidateQueue /
+// the bucket is removed from the store by sweep / invalidateQueueBuckets /
 // loadOrInit reconciliation; charge re-checks it after acquiring mu so
 // goroutines that loaded the now-orphaned bucket retry and converge on
 // the live entry. Without that retry, sweep racing N concurrent chargers
@@ -182,17 +182,6 @@ func (b *bucketStore) queueEpoch(queue string) uint64 {
 		return 0
 	}
 	return epoch.epoch.Load()
-}
-
-func (b *bucketStore) bumpQueueEpoch(queue string) {
-	if b == nil || queue == "" {
-		return
-	}
-	b.queueEpochMu.Lock()
-	defer b.queueEpochMu.Unlock()
-	cell := b.queueEpochCellLocked(queue)
-	cell.epoch.Add(1)
-	cell.updatedUnixNano.Store(b.clock().UnixNano())
 }
 
 func (b *bucketStore) beginQueueReset(queue string, cutoff func() uint64) uint64 {
@@ -302,7 +291,7 @@ func (b *bucketStore) charge(cfg *sqsQueueThrottle, queue, action string, incarn
 // chargeBucket runs the under-mu refill+take for a single bucket and
 // returns retry=true if the caller should drop the reference and reload
 // from the store. Retry is the orphan-bucket signal: sweep /
-// invalidateQueue / loadOrInit reconciliation set evicted=true under
+// invalidateQueueBuckets / loadOrInit reconciliation set evicted=true under
 // mu before dropping the bucket from the map, so a goroutine that
 // loaded the bucket pre-eviction can detect it here.
 func chargeBucket(bucket *tokenBucket, now time.Time, count int) (chargeOutcome, bool) {
@@ -386,7 +375,7 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 		// via LoadOrStore — a one-time burst above the configured
 		// limit right after a config reconciliation. Holding mu
 		// across the whole sequence makes the lock-then-delete-then-
-		// flag ordering match sweep / invalidateQueue, so a charger
+		// flag ordering match sweep / invalidateQueueBuckets, so a charger
 		// blocked on mu sees evicted=true on entry and retries.
 		bucket.mu.Lock()
 		matches := bucket.capacity == capacity && bucket.refillRate == refill
@@ -426,8 +415,9 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 	return bucket
 }
 
-// invalidateQueue drops every bucket belonging to the named queue.
-// Called *after* the Raft commit on SetQueueAttributes / DeleteQueue /
+// invalidateQueueBuckets drops every bucket belonging to the named
+// queue. Called *after* the Raft commit (beginQueueReset bumps the
+// queue epoch before it) on SetQueueAttributes / DeleteQueue /
 // CreateQueue so the next request rebuilds from the freshly committed
 // meta. Mirrors sweep's lock-then-delete-then-flag ordering:
 //
@@ -446,14 +436,6 @@ func (b *bucketStore) loadOrInit(queue, action string, incarnation uint64, capac
 // while evicted is still false, then later requests would create a
 // fresh full-capacity bucket — a 2x burst on every invalidation
 // event.
-func (b *bucketStore) invalidateQueue(queue string) {
-	if b == nil {
-		return
-	}
-	b.bumpQueueEpoch(queue)
-	b.invalidateQueueBuckets(queue)
-}
-
 func (b *bucketStore) invalidateQueueBuckets(queue string) {
 	if b == nil {
 		return
@@ -522,7 +504,7 @@ func (b *bucketStore) runSweepLoop(ctx context.Context) {
 //     lastRefill and skips delete) or blocks on mu until sweep
 //     releases — and on release sees evicted=true and retries.
 //  2. CompareAndDelete with v ensures sweep does not evict a
-//     replacement bucket inserted by invalidateQueue or a future
+//     replacement bucket inserted by invalidateQueueBuckets or a future
 //     reconciliation path.
 //  3. Set evicted=true under mu after a successful CompareAndDelete.
 //     Without this signal, goroutines that loaded the bucket

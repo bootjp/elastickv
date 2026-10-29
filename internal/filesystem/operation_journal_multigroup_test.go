@@ -13,6 +13,7 @@ import (
 	"github.com/bootjp/elastickv/internal/fskeys"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	etcdraftengine "github.com/bootjp/elastickv/internal/raftengine/etcd"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
@@ -184,11 +185,7 @@ func assertJournalCommitsDoNotCollideOnPreparedSession(t *testing.T, ctx context
 	commit := func(sequence uint64) error { return commitWithContext(ctx, sequence) }
 	first := make(chan error, 1)
 	go func() { first <- commit(1000) }()
-	select {
-	case <-held.prepared:
-	case <-time.After(5 * time.Second):
-		t.Fatal("first journal commit did not prepare the session")
-	}
+	testutil.Closed(t, held.prepared, 5*time.Second, "first journal commit did not prepare the session")
 	second := make(chan error, 1)
 	go func() { second <- commit(1001) }()
 	select {
@@ -238,11 +235,7 @@ func assertWriteAfterConcurrentAcknowledgement(t *testing.T, ctx context.Context
 	t.Helper()
 	ackDone := make(chan error, 1)
 	go func() { ackDone <- journal.Acknowledge(ctx, createID) }()
-	select {
-	case <-held.prepared:
-	case <-time.After(5 * time.Second):
-		t.Fatal("acknowledgement did not prepare its session participant")
-	}
+	testutil.Closed(t, held.prepared, 5*time.Second, "acknowledgement did not prepare its session participant")
 	type writeResult struct {
 		count int
 		err   error

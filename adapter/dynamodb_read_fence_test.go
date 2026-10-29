@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	json "github.com/goccy/go-json"
@@ -232,11 +233,7 @@ func TestDynamoDBTransactWriteWaitsForPendingItemUpdate(t *testing.T) {
 	updateDone := dynamoHandlerStatus(t, server.updateItem, first)
 
 	var firstCommitTS uint64
-	select {
-	case firstCommitTS = <-coord.firstEntered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first update did not reach dispatch")
-	}
+	firstCommitTS = testutil.Recv(t, coord.firstEntered, 2*time.Second, "first update did not reach dispatch")
 	// Raise the global watermark past the pending item write. A read fence
 	// cannot observe an entry that has not been proposed to Raft yet.
 	require.NoError(t, st.PutAt(ctx, []byte("other"), []byte("x"), firstCommitTS+1, 0))
@@ -258,11 +255,7 @@ func TestDynamoDBTransactWriteWaitsForPendingItemUpdate(t *testing.T) {
 		// The transaction is waiting on the first write's item lock.
 		close(coord.firstRelease)
 		require.Equal(t, http.StatusOK, <-updateDone)
-		select {
-		case <-coord.secondEntered:
-		case <-time.After(2 * time.Second):
-			t.Fatal("transaction did not reach dispatch after update completed")
-		}
+		testutil.Closed(t, coord.secondEntered, 2*time.Second, "transaction did not reach dispatch after update completed")
 	}
 	close(coord.secondRelease)
 	require.Equal(t, http.StatusOK, <-txnDone)
@@ -287,11 +280,7 @@ func TestDynamoDBTwoServersSealPendingItemWrite(t *testing.T) {
 	first.ExpressionAttributeValues[":val"] = numberListAttr("2")
 	updateDone := dynamoHandlerStatus(t, firstServer.updateItem, first)
 	var firstCommitTS uint64
-	select {
-	case firstCommitTS = <-coord.firstEntered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("first update did not reach dispatch")
-	}
+	firstCommitTS = testutil.Recv(t, coord.firstEntered, 2*time.Second, "first update did not reach dispatch")
 	require.NoError(t, st.PutAt(ctx, []byte("other"), []byte("x"), firstCommitTS+1, 0))
 	second := transactWriteItemsInput{TransactItems: []transactWriteItem{{Update: &transactUpdateInput{
 		TableName:                 first.TableName,
@@ -301,11 +290,7 @@ func TestDynamoDBTwoServersSealPendingItemWrite(t *testing.T) {
 		ExpressionAttributeValues: map[string]attributeValue{":empty": {L: []attributeValue{}}, ":val": numberListAttr("3")},
 	}}}}
 	txnDone := dynamoHandlerStatus(t, secondServer.transactWriteItems, second)
-	select {
-	case <-coord.secondEntered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("second server did not reach dispatch")
-	}
+	testutil.Closed(t, coord.secondEntered, 2*time.Second, "second server did not reach dispatch")
 	close(coord.secondRelease)
 	require.Equal(t, http.StatusOK, <-txnDone)
 	close(coord.firstRelease)
@@ -335,11 +320,7 @@ func TestDynamoDBSnapshotSealSurvivesLeaderSwitch(t *testing.T) {
 	first.ExpressionAttributeValues[":val"] = numberListAttr("2")
 	updateDone := dynamoHandlerStatus(t, firstServer.updateItem, first)
 	var firstCommitTS uint64
-	select {
-	case firstCommitTS = <-oldLeader.firstEntered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("old leader did not allocate the write timestamp")
-	}
+	firstCommitTS = testutil.Recv(t, oldLeader.firstEntered, 2*time.Second, "old leader did not allocate the write timestamp")
 	require.NoError(t, st.PutAt(ctx, []byte("other"), []byte("x"), firstCommitTS+1, 0))
 	newLeader.Clock().Observe(firstCommitTS + 1)
 	oldLeader.switched.Store(true)

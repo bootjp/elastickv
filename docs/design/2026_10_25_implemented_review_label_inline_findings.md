@@ -1,6 +1,8 @@
 # Review label inline findings
 
-Status: Proposed
+Status: Implemented
+
+Shipped in #1336. No implementation work follows.
 Author: bootjp
 Date: 2026-10-25
 

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -140,11 +141,7 @@ func TestShutdownSignalSharesDeadlineAcrossGroups(t *testing.T) {
 			t.Fatal("all transfers must start before the shared deadline")
 		}
 	}
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("shutdown did not finish after the transfer deadline")
-	}
+	testutil.Closed(t, done, 2*time.Second, "shutdown did not finish after the transfer deadline")
 	require.ErrorIs(t, ctx.Err(), context.Canceled)
 }
 

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/require"
 )
@@ -57,11 +58,7 @@ func TestFsyncWaitsForEarlierWrite(t *testing.T) {
 	<-blocked.started
 	fsyncDone := make(chan syscall.Errno, 1)
 	go func() { fsyncDone <- adapter.Fsync(t.Context(), 7, 9, false) }()
-	select {
-	case <-fsyncDone:
-		t.Fatal("fsync overtook an earlier write")
-	case <-time.After(30 * time.Millisecond):
-	}
+	testutil.NoRecv(t, fsyncDone, 30*time.Millisecond, "fsync overtook an earlier write")
 	close(blocked.release)
 	require.Zero(t, <-writeDone)
 	require.Zero(t, <-fsyncDone)
@@ -106,11 +103,7 @@ func TestDirectoryFsyncWaitsForEarlierNamespaceMutation(t *testing.T) {
 	<-blocked.started
 	fsyncDone := make(chan syscall.Errno, 1)
 	go func() { fsyncDone <- adapter.FsyncDirectory(t.Context(), filesystem.RootInode) }()
-	select {
-	case <-fsyncDone:
-		t.Fatal("directory fsync overtook an earlier mkdir")
-	case <-time.After(30 * time.Millisecond):
-	}
+	testutil.NoRecv(t, fsyncDone, 30*time.Millisecond, "directory fsync overtook an earlier mkdir")
 	close(blocked.release)
 	require.Zero(t, <-mkdirDone)
 	require.Zero(t, <-fsyncDone)
@@ -128,11 +121,7 @@ func TestMutationTrackerOrdersSameInodeAndReleasesCanceledWaiter(t *testing.T) {
 		_, result := tracker.begin(waitCtx, 7)
 		secondDone <- result
 	}()
-	select {
-	case <-secondDone:
-		t.Fatal("second mutation overtook its predecessor")
-	case <-time.After(30 * time.Millisecond):
-	}
+	testutil.NoRecv(t, secondDone, 30*time.Millisecond, "second mutation overtook its predecessor")
 	cancel()
 	require.NotZero(t, <-secondDone)
 	tracker.end(first, false)

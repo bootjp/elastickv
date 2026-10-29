@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/require"
 	etcdraft "go.etcd.io/raft/v3"
@@ -132,11 +133,7 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 		persistDone <- e.persistReady(rd)
 	}()
 
-	select {
-	case <-saveStarted:
-	case <-time.After(time.Second):
-		t.Fatal("SaveSnap did not start")
-	}
+	testutil.Closed(t, saveStarted, time.Second, "SaveSnap did not start")
 
 	prepareDone := make(chan error, 1)
 	go func() {
@@ -178,11 +175,7 @@ func TestReleaseProtectedReceivedFSMSnapshotsUpToRetriesAfterSnapshotMuUnlock(t 
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("releaseProtectedReceivedFSMSnapshotsUpTo blocked on snapshotMu")
-	}
+	testutil.Closed(t, done, 100*time.Millisecond, "releaseProtectedReceivedFSMSnapshotsUpTo blocked on snapshotMu")
 	require.Equal(t, map[uint64]int{7: 1}, e.protectedReceivedFSMSnaps)
 
 	e.snapshotMu.Unlock()
@@ -205,12 +198,8 @@ func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {
 	e.appliedIndex.Store(9)
 	e.snapshotMu.Unlock()
 
-	select {
-	case got := <-accepted:
-		require.False(t, got)
-	case <-time.After(time.Second):
-		t.Fatal("protectReceivedFSMSnapshot did not return")
-	}
+	got := testutil.Recv(t, accepted, time.Second, "protectReceivedFSMSnapshot did not return")
+	require.False(t, got)
 	require.Empty(t, e.protectedReceivedFSMSnaps)
 }
 

@@ -166,14 +166,17 @@ func TestBootstrap_RejectsOverCapBatchCount(t *testing.T) {
 		t.Fatalf("encoded bootstrap shorter than expected: %d bytes, want >= %d", got, countOffset+4)
 	}
 	// Overwrite count with maxBootstrapBatchCount + 1 = 16385.
-	// Supply all registration bytes so the wire-bytes check cannot
-	// mask a missing cap check.
 	good[countOffset+0] = 0x00
 	good[countOffset+1] = 0x00
 	good[countOffset+2] = 0x40 // 0x4001 = 16385 = (1<<14) + 1
 	good[countOffset+3] = 0x01
-	good = append(good, make([]byte, 16385*(4+8+2))...)
-	_, err := fsmwire.DecodeBootstrap(good)
+	// Supply all 16385 × 14 registration bytes so the remaining-bytes
+	// check admits the count and only the cap can reject it.
+	const overCapCount, registrationWireSize = 16385, 14
+	payload := make([]byte, 0, countOffset+4+overCapCount*registrationWireSize)
+	payload = append(payload, good[:countOffset+4]...)
+	payload = append(payload, make([]byte, overCapCount*registrationWireSize)...)
+	_, err := fsmwire.DecodeBootstrap(payload)
 	if !errors.Is(err, fsmwire.ErrFSMWireMalformed) {
 		t.Fatalf("expected ErrFSMWireMalformed for over-cap batch count, got %v", err)
 	}

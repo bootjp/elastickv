@@ -1,16 +1,20 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"sort"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/redcon"
 )
 
 // TestRedis_StreamXReadIterCtxDeadlineReturnsNull guards Codex P1 (round 6):
@@ -99,15 +103,11 @@ func TestRedis_StreamXReadBlockWakesOnXAdd(t *testing.T) {
 	}).Result()
 	require.NoError(t, err)
 
-	select {
-	case res := <-resultCh:
-		require.NoError(t, res.err)
-		require.Len(t, res.streams, 1)
-		require.Len(t, res.streams[0].Messages, 1)
-		require.Equal(t, "2-0", res.streams[0].Messages[0].ID)
-	case <-time.After(6 * time.Second):
-		t.Fatal("XREAD BLOCK did not return after XADD signal")
-	}
+	res := testutil.Recv(t, resultCh, 6*time.Second, "XREAD BLOCK did not return after XADD signal")
+	require.NoError(t, res.err)
+	require.Len(t, res.streams, 1)
+	require.Len(t, res.streams[0].Messages, 1)
+	require.Equal(t, "2-0", res.streams[0].Messages[0].ID)
 }
 
 func TestRedis_StreamXReadIterCtxDeadlineReturnsNull(t *testing.T) {
@@ -236,14 +236,10 @@ func TestRedis_StreamXReadBlockChecksWrongTypeAtDeadline(t *testing.T) {
 	requireStreamWaiterRegistered(t, nodes[0].redisServer.streamWaiters, key, waiterRegistering)
 	require.NoError(t, rdbWriter.Set(ctx, key, "now-a-string", 0).Err())
 
-	select {
-	case res := <-resultCh:
-		require.Error(t, res.err)
-		require.Contains(t, res.err.Error(), "WRONGTYPE")
-		require.Empty(t, res.streams)
-	case <-time.After(blockWindow + 2*time.Second):
-		t.Fatal("XREAD BLOCK did not return after wrong-type overwrite")
-	}
+	res := testutil.Recv(t, resultCh, blockWindow+2*time.Second, "XREAD BLOCK did not return after wrong-type overwrite")
+	require.Error(t, res.err)
+	require.Contains(t, res.err.Error(), "WRONGTYPE")
+	require.Empty(t, res.streams)
 }
 
 // requireStreamWaiterRegistered waits for key's blocking reader to appear.
@@ -954,42 +950,82 @@ func TestRedis_StreamXReadAndRangeCountClamp(t *testing.T) {
 }
 
 // TestRedis_StreamMultiExecDelHonoursDispatchTimeout regression-tests the
-// CodeRabbit "buildStreamDeletionElems on server-lifetime ctx" concern.
-// The ctx threaded through buildStreamDeletionElems is the same
-// redisDispatchTimeout-bounded ctx used for Dispatch, so the EXEC of a
-// MULTI/EXEC DEL on a stream key keeps the existing behaviour: the
-// deletion is observable on a fresh XLEN, and the EXEC does not hang
-// past the per-request budget. The test is a smoke-level guard; the
-// actual ctx-cancellation path is documented in commit().
+// CodeRabbit "buildStreamDeletionElems on server-lifetime ctx" concern:
+// the stream-entry scan that a MULTI/EXEC DEL performs inside commit()
+// must run on the redisDispatchTimeout-bounded EXEC context, not on a
+// context without a deadline, so a stalled store cannot hold EXEC past
+// the per-request budget.
 func TestRedis_StreamMultiExecDelHonoursDispatchTimeout(t *testing.T) {
 	t.Parallel()
-	nodes, _, _ := createNode(t, 3)
-	defer shutdown(nodes)
 
-	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-	defer func() { _ = rdb.Close() }()
-	ctx := context.Background()
+	for _, tc := range []struct {
+		name  string
+		dedup bool
+	}{
+		{name: "direct", dedup: false},
+		{name: "dedup", dedup: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
 
-	for i := range 4 {
-		_, err := rdb.XAdd(ctx, &redis.XAddArgs{
-			Stream: "stream-del",
-			ID:     fmt.Sprintf("%d-0", 1_000_000+i),
-			Values: []string{"i", fmt.Sprint(i)},
-		}).Result()
-		require.NoError(t, err)
+			ctx := context.Background()
+			key := []byte("stream-del:" + tc.name)
+			base := store.NewMVCCStore()
+			meta, err := store.MarshalStreamMeta(store.StreamMeta{Length: 2, LastMs: 2})
+			require.NoError(t, err)
+			require.NoError(t, base.PutAt(ctx, store.StreamMetaKey(key), meta, 1, 0))
+			require.NoError(t, base.PutAt(ctx, store.StreamEntryKey(key, 1, 0), []byte("a"), 1, 0))
+			require.NoError(t, base.PutAt(ctx, store.StreamEntryKey(key, 2, 0), []byte("b"), 1, 0))
+
+			st := &scanDeadlineRecordingStore{MVCCStore: base, prefix: store.StreamEntryScanPrefix(key)}
+			server := &RedisServer{
+				store:            st,
+				coordinator:      newLocalAdapterCoordinator(base),
+				scriptCache:      map[string]string{},
+				onePhaseTxnDedup: tc.dedup,
+			}
+
+			_, err = server.runTransaction([]redcon.Command{{Args: [][]byte{[]byte(cmdDel), key}}})
+			require.NoError(t, err)
+
+			deadlines := st.recorded()
+			require.NotEmpty(t, deadlines, "EXEC DEL must scan the stream entries")
+			for _, remaining := range deadlines {
+				require.Positive(t, remaining, "stream deletion scan ran without a dispatch deadline")
+				require.LessOrEqual(t, remaining, redisDispatchTimeout)
+			}
+		})
 	}
+}
 
-	// MULTI / EXEC DEL inside a txn drives the streamDeletions path
-	// inside commit() — that is the path which now passes the
-	// redisDispatchTimeout-bounded ctx into buildStreamDeletionElems.
-	pipe := rdb.TxPipeline()
-	pipe.Del(ctx, "stream-del")
-	_, err := pipe.Exec(ctx)
-	require.NoError(t, err)
+// scanDeadlineRecordingStore records, for every ScanAt under prefix, how
+// long the caller's context had left (0 when it had no deadline).
+type scanDeadlineRecordingStore struct {
+	store.MVCCStore
+	prefix []byte
 
-	xlen, err := rdb.XLen(ctx, "stream-del").Result()
-	require.NoError(t, err)
-	require.Equal(t, int64(0), xlen)
+	mu        sync.Mutex
+	deadlines []time.Duration
+}
+
+func (s *scanDeadlineRecordingStore) ScanAt(ctx context.Context, start []byte, end []byte, limit int, ts uint64) ([]*store.KVPair, error) {
+	if bytes.HasPrefix(start, s.prefix) {
+		var remaining time.Duration
+		if deadline, ok := ctx.Deadline(); ok {
+			remaining = time.Until(deadline)
+		}
+		s.mu.Lock()
+		s.deadlines = append(s.deadlines, remaining)
+		s.mu.Unlock()
+	}
+	kvs, err := s.MVCCStore.ScanAt(ctx, start, end, limit, ts)
+	return kvs, errors.WithStack(err)
+}
+
+func (s *scanDeadlineRecordingStore) recorded() []time.Duration {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]time.Duration(nil), s.deadlines...)
 }
 
 // TestRedis_UserKeyShadowingStreamPrefixSurvivesMultiExec exercises the
@@ -1079,15 +1115,11 @@ func TestRedis_StreamXReadShutdownShortCircuits(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	require.NoError(t, nodes[0].redisServer.Close())
 
-	select {
-	case res := <-xreadDone:
-		// BLOCK timeout returns redis.Nil — the same wire-level reply
-		// the client would have seen if the BLOCK had expired
-		// naturally. The server must NOT surface the cancellation as a
-		// -ERR or hang the connection.
-		require.True(t, errors.Is(res.err, redis.Nil),
-			"BLOCK after shutdown must return redis.Nil, got err=%v streams=%v", res.err, res.streams)
-	case <-time.After(2 * time.Second):
-		t.Fatal("XREAD did not return within 2 s of server Close — busy-poll did not honour handlerContext cancel")
-	}
+	res := testutil.Recv(t, xreadDone, 2*time.Second, "XREAD did not return within 2 s of server Close — busy-poll did not honour handlerContext cancel")
+	// BLOCK timeout returns redis.Nil — the same wire-level reply
+	// the client would have seen if the BLOCK had expired
+	// naturally. The server must NOT surface the cancellation as a
+	// -ERR or hang the connection.
+	require.True(t, errors.Is(res.err, redis.Nil),
+		"BLOCK after shutdown must return redis.Nil, got err=%v streams=%v", res.err, res.streams)
 }

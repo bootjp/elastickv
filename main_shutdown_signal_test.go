@@ -9,6 +9,7 @@ import (
 	"time"
 
 	internalutil "github.com/bootjp/elastickv/internal"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/errors"
 	"github.com/hanwen/go-fuse/v2/fuse"
 	"github.com/stretchr/testify/require"
@@ -38,11 +39,7 @@ func TestInstallShutdownSignalHandlerCancelsOnSignal(t *testing.T) {
 	t.Cleanup(stop)
 
 	require.NoError(t, syscall.Kill(os.Getpid(), syscall.SIGTERM))
-	select {
-	case <-ctx.Done():
-	case <-time.After(shutdownTestTimeout):
-		t.Fatal("SIGTERM did not cancel the root context")
-	}
+	testutil.Closed(t, ctx.Done(), shutdownTestTimeout, "SIGTERM did not cancel the root context")
 	require.True(t, signalShutdown.Load())
 
 	// A repeat signal while the shutdown is in flight must stay with the

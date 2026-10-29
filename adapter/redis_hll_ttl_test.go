@@ -185,7 +185,7 @@ func TestRedisDispatchHLLExpireWritesInlineAnchorAndScanIndex(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, redisHLLKey(key), legacyPayload, 1, 0))
 
 	expireAt := time.Now().Add(time.Hour)
-	applied, err := server.dispatchHLLExpire(ctx, key, 10, expireAt)
+	applied, err := server.dispatchHLLExpireReadTimestamp(ctx, key, testReadTimestamp(t, server, 10), expireAt)
 	require.NoError(t, err)
 	require.True(t, applied)
 

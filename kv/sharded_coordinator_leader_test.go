@@ -2,12 +2,12 @@ package kv
 
 import (
 	"context"
-	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -97,21 +97,12 @@ func TestShardedCoordinatorLeaseReadAllGroups_FencesEveryLeader(t *testing.T) {
 
 func TestShardedCoordinatorLeaseReadAllGroups_ForwardsFollowerToGroupLeader(t *testing.T) {
 	t.Parallel()
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 	service := &leaseReadForwardServer{}
-	server := grpc.NewServer()
-	pb.RegisterInternalServer(server, service)
-	go func() { _ = server.Serve(lis) }()
-	t.Cleanup(func() {
-		server.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(server *grpc.Server) { pb.RegisterInternalServer(server, service) })
 
 	engine := distribution.NewEngine()
 	engine.UpdateRoute([]byte(""), nil, 1)
-	follower := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
+	follower := newStubFollowerEngine(addr)
 	group := &ShardGroup{Engine: follower, Store: store.NewMVCCStore()}
 	proxy := NewLeaderProxyForShardGroup(group)
 	group.SetLeaderReadToken("admin-secret")
@@ -135,8 +126,8 @@ func TestShardedCoordinatorLeaseReadAllGroups_UsesConfiguredAllShardGroups(t *te
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		0: {Engine: &stubFollowerEngine{}},
-		1: {Engine: stubLeaderEngine{}},
+		0: {Engine: newStubFollowerEngine("")},
+		1: {Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil).WithAllShardGroups(1)
 
 	require.NoError(t, coord.LeaseReadAllGroups(context.Background()))

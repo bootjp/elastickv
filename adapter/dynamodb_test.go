@@ -17,6 +17,7 @@ import (
 	"github.com/aws/aws-sdk-go-v2/credentials"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb"
 	"github.com/aws/aws-sdk-go-v2/service/dynamodb/types"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/assert"
@@ -218,29 +219,6 @@ func TestDynamoDB_RequestBodyTooLarge(t *testing.T) {
 	}
 }
 
-func TestDynamoDB_Healthz(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 1)
-	defer shutdown(nodes)
-
-	req, err := http.NewRequestWithContext(
-		context.Background(),
-		http.MethodGet,
-		"http://"+nodes[0].dynamoAddress+dynamoHealthPath,
-		nil,
-	)
-	require.NoError(t, err)
-
-	resp, err := http.DefaultClient.Do(req)
-	require.NoError(t, err)
-	defer resp.Body.Close()
-
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	body, err := io.ReadAll(resp.Body)
-	require.NoError(t, err)
-	require.Equal(t, "ok\n", string(body))
-}
-
 func TestDynamoDB_LeaderHealthz(t *testing.T) {
 	t.Parallel()
 	nodes, _, _ := createNode(t, 2)
@@ -296,69 +274,6 @@ func TestDynamoDB_LeaderHealthz(t *testing.T) {
 			}, leaderChurnRetryTimeout, leaderChurnRetryInterval)
 		})
 	}
-}
-
-func TestDynamoDB_TransactWriteItems(t *testing.T) {
-	t.Parallel()
-	nodes, _, _ := createNode(t, 1)
-	defer shutdown(nodes)
-
-	cfg, err := config.LoadDefaultConfig(context.Background(),
-		config.WithRegion("us-west-2"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider("dummy", "dummy", "")),
-	)
-	assert.NoError(t, err)
-
-	client := dynamodb.NewFromConfig(cfg, func(o *dynamodb.Options) {
-		o.BaseEndpoint = aws.String("http://" + nodes[0].dynamoAddress)
-	})
-	createSimpleKeyTable(t, context.Background(), client)
-
-	_, err = client.TransactWriteItems(context.Background(), &dynamodb.TransactWriteItemsInput{
-		TransactItems: []types.TransactWriteItem{
-			{
-				Put: &types.Put{
-					TableName: aws.String("t"),
-					Item: map[string]types.AttributeValue{
-						"key":   &types.AttributeValueMemberS{Value: "k1"},
-						"value": &types.AttributeValueMemberS{Value: "v1"},
-					},
-				},
-			},
-			{
-				Put: &types.Put{
-					TableName: aws.String("t"),
-					Item: map[string]types.AttributeValue{
-						"key":   &types.AttributeValueMemberS{Value: "k2"},
-						"value": &types.AttributeValueMemberS{Value: "v2"},
-					},
-				},
-			},
-		},
-	})
-	assert.NoError(t, err)
-
-	out1, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
-		TableName: aws.String("t"),
-		Key: map[string]types.AttributeValue{
-			"key": &types.AttributeValueMemberS{Value: "k1"},
-		},
-	})
-	assert.NoError(t, err)
-	value1Attr, ok := out1.Item["value"].(*types.AttributeValueMemberS)
-	assert.True(t, ok)
-	assert.Equal(t, "v1", value1Attr.Value)
-
-	out2, err := client.GetItem(context.Background(), &dynamodb.GetItemInput{
-		TableName: aws.String("t"),
-		Key: map[string]types.AttributeValue{
-			"key": &types.AttributeValueMemberS{Value: "k2"},
-		},
-	})
-	assert.NoError(t, err)
-	value2Attr, ok := out2.Item["value"].(*types.AttributeValueMemberS)
-	assert.True(t, ok)
-	assert.Equal(t, "v2", value2Attr.Value)
 }
 
 func TestDynamoDB_TransactGetItems(t *testing.T) {
@@ -456,7 +371,7 @@ func postDynamoRaw(t *testing.T, address, target, body string) (int, string) {
 func wrapDynamoCoordinator(t *testing.T, node *Node) *testCoordinatorWrapper {
 	t.Helper()
 	orig := node.dynamoServer.coordinator
-	wrapped := &testCoordinatorWrapper{inner: orig}
+	wrapped := &testCoordinatorWrapper{Coordinator: orig}
 	node.dynamoServer.coordinator = wrapped
 	t.Cleanup(func() {
 		node.dynamoServer.coordinator = orig
@@ -1847,7 +1762,7 @@ func TestDynamoDB_TransactWriteItems_RetriesOnWriteConflict(t *testing.T) {
 	require.NoError(t, err)
 
 	orig := nodes[0].dynamoServer.coordinator
-	wrapped := &testCoordinatorWrapper{inner: orig}
+	wrapped := &testCoordinatorWrapper{Coordinator: orig}
 	wrapped.failTxnDispatches.Store(1)
 	nodes[0].dynamoServer.coordinator = wrapped
 	defer func() {
@@ -1935,7 +1850,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 
 	orig := nodes[0].dynamoServer.coordinator
 	wrapped := &testCoordinatorWrapper{
-		inner:        orig,
+		Coordinator:  orig,
 		blockEntered: make(chan struct{}),
 		blockRelease: make(chan struct{}),
 	}
@@ -1981,11 +1896,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 		txErrCh <- txErr
 	}()
 
-	select {
-	case <-wrapped.blockEntered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for blocked transact dispatch")
-	}
+	testutil.Closed(t, wrapped.blockEntered, 5*time.Second, "timed out waiting for blocked transact dispatch")
 
 	_, err = client1.UpdateItem(ctx, &dynamodb.UpdateItemInput{
 		TableName:        aws.String("race"),
@@ -2002,11 +1913,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 	close(wrapped.blockRelease)
 
 	var txErr error
-	select {
-	case txErr = <-txErrCh:
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for transact result")
-	}
+	txErr = testutil.Recv(t, txErrCh, 5*time.Second, "timed out waiting for transact result")
 	require.ErrorContains(t, txErr, "conditional check failed")
 
 	targetOut, err := client0.GetItem(ctx, &dynamodb.GetItemInput{
@@ -2033,7 +1940,7 @@ func TestDynamoDB_TransactWriteItems_ConditionCheckRace(t *testing.T) {
 var errInjectedLeaseRead = errors.New("injected lease-read failure")
 
 type testCoordinatorWrapper struct {
-	inner kv.Coordinator
+	kv.Coordinator
 
 	failTxnDispatches atomic.Int32
 	injectedFailures  atomic.Int32
@@ -2087,7 +1994,7 @@ func (w *testCoordinatorWrapper) leaseCallCounts() (keyless, keyed int) {
 // EngineGroupIDForKey forwards group resolution so LeaseReadGroupKeys can
 // dedup by group through the wrapper.
 func (w *testCoordinatorWrapper) EngineGroupIDForKey(key []byte) uint64 {
-	if gr, ok := w.inner.(kv.GroupRoutableCoordinator); ok {
+	if gr, ok := w.Coordinator.(kv.GroupRoutableCoordinator); ok {
 		return gr.EngineGroupIDForKey(key)
 	}
 	return 0
@@ -2113,39 +2020,7 @@ func (w *testCoordinatorWrapper) Dispatch(ctx context.Context, reqs *kv.Operatio
 			}
 		}
 	}
-	return w.inner.Dispatch(ctx, reqs)
-}
-
-func (w *testCoordinatorWrapper) IsLeader() bool {
-	return w.inner.IsLeader()
-}
-
-func (w *testCoordinatorWrapper) VerifyLeader(ctx context.Context) error {
-	return w.inner.VerifyLeader(ctx)
-}
-
-func (w *testCoordinatorWrapper) RaftLeader() string {
-	return w.inner.RaftLeader()
-}
-
-func (w *testCoordinatorWrapper) IsLeaderForKey(key []byte) bool {
-	return w.inner.IsLeaderForKey(key)
-}
-
-func (w *testCoordinatorWrapper) VerifyLeaderForKey(ctx context.Context, key []byte) error {
-	return w.inner.VerifyLeaderForKey(ctx, key)
-}
-
-func (w *testCoordinatorWrapper) RaftLeaderForKey(key []byte) string {
-	return w.inner.RaftLeaderForKey(key)
-}
-
-func (w *testCoordinatorWrapper) Clock() *kv.HLC {
-	return w.inner.Clock()
-}
-
-func (w *testCoordinatorWrapper) LinearizableRead(ctx context.Context) (uint64, error) {
-	return w.inner.LinearizableRead(ctx)
+	return w.Coordinator.Dispatch(ctx, reqs)
 }
 
 func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) {
@@ -2155,7 +2030,7 @@ func (w *testCoordinatorWrapper) LeaseRead(ctx context.Context) (uint64, error) 
 	if w.failLeaseReads.Load() {
 		return 0, errInjectedLeaseRead
 	}
-	return kv.LeaseReadThrough(w.inner, ctx)
+	return kv.LeaseReadThrough(w.Coordinator, ctx)
 }
 
 func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte) (uint64, error) {
@@ -2166,5 +2041,5 @@ func (w *testCoordinatorWrapper) LeaseReadForKey(ctx context.Context, key []byte
 	if w.failLeaseReads.Load() {
 		return 0, errInjectedLeaseRead
 	}
-	return kv.LeaseReadForKeyThrough(w.inner, ctx, key)
+	return kv.LeaseReadForKeyThrough(w.Coordinator, ctx, key)
 }

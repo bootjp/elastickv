@@ -710,8 +710,7 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeUsesLeaderRoutedReadFence(t *testi
 	probe := &versionVisibleRawKVServer{
 		visible: map[string]bool{string(stagedKey): true},
 	}
-	addr, stop := startRawKVServer(t, probe)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, probe)
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
@@ -765,8 +764,7 @@ func TestShardStoreS3BucketAuxiliaryOwnerProbeBatchesFollowerChecks(t *testing.T
 	for _, key := range keys {
 		probe.visible[string(distribution.MigrationStagedDataKey(9, key))] = true
 	}
-	addr, stop := startRawKVServer(t, probe)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, probe)
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
@@ -1351,7 +1349,7 @@ func TestShardStoreScanAt_RoutesListDeltaScansByUserKey(t *testing.T) {
 		legacyRouting bool
 	}{
 		{name: "current", key: store.ListMetaDeltaKey(userKey, 10, 1), scanStart: store.ListMetaDeltaScanPrefix(userKey)},
-		{name: "legacy", key: legacyListMetaDeltaKey(userKey, 10), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
+		{name: "legacy", key: store.LegacyListMetaDeltaKey(userKey, 10, 1), scanStart: store.LegacyListMetaDeltaScanPrefix(userKey), legacyRouting: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -1377,8 +1375,8 @@ func TestShardStoreScanAt_BroadLegacyListDeltaScansAllRoutes(t *testing.T) {
 	ctx := context.Background()
 	st := newTwoRouteShardStoreForScanTest()
 	deltaValue := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
-	leftKey := legacyListMetaDeltaKey([]byte("left-list"), 10)
-	rightKey := legacyListMetaDeltaKey([]byte("right-list"), 11)
+	leftKey := store.LegacyListMetaDeltaKey([]byte("left-list"), 10, 1)
+	rightKey := store.LegacyListMetaDeltaKey([]byte("right-list"), 11, 1)
 	require.NoError(t, st.groups[1].Store.PutAt(ctx, leftKey, deltaValue, 1, 0))
 	require.NoError(t, st.groups[2].Store.PutAt(ctx, rightKey, deltaValue, 1, 0))
 
@@ -1887,8 +1885,7 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 			Exists: true,
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	engine := distribution.NewEngine()
 	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
@@ -1900,7 +1897,7 @@ func TestShardStore_ForwardsReadFenceStamps(t *testing.T) {
 	st := NewShardStore(engine, map[uint64]*ShardGroup{
 		1: {
 			Store:  store.NewMVCCStore(),
-			Engine: &stubFollowerEngine{leaderAddr: addr},
+			Engine: newStubFollowerEngine(addr),
 		},
 	})
 	t.Cleanup(func() { _ = st.Close() })
@@ -2693,8 +2690,7 @@ func TestShardStoreProxyScanKeysAtUsesSelectedGroup(t *testing.T) {
 			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	engine := distribution.NewEngine()
@@ -2724,8 +2720,7 @@ func TestShardStoreProxyScanKeysAtCarriesStagedRouteBounds(t *testing.T) {
 			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	g := &ShardGroup{
@@ -2764,8 +2759,7 @@ func TestShardStoreProxyScanAtUsesSelectedGroup(t *testing.T) {
 			Kv: []*pb.RawKVPair{{Key: []byte("k"), Value: []byte("v")}},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	engine := distribution.NewEngine()
@@ -2799,8 +2793,7 @@ func TestShardStoreProxyForwardPageAdvancesFromRawPage(t *testing.T) {
 			},
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	ctx := context.Background()
 	g := &ShardGroup{
@@ -3652,8 +3645,7 @@ func TestShardStoreScanAt_NilStartFanoutUsesExplicitGroupForProxy(t *testing.T) 
 
 	ctx := context.Background()
 	recorder := &recordingRawScanKVServer{}
-	addr, stop := startRawKVServer(t, recorder)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, recorder)
 
 	rawRouteEnd := fskeys.ChunkRouteKey(11, 22)
 	chunkRouteEnd := prefixScanEnd(rawRouteEnd)
@@ -4114,7 +4106,7 @@ func TestShardStoreScanAt_ExactLegacyListDeltaScanMarksRouteGroup(t *testing.T) 
 
 	// "right-list" sorts into the second route's group.
 	userKey := []byte("right-list")
-	key := legacyListMetaDeltaKey(userKey, 11)
+	key := store.LegacyListMetaDeltaKey(userKey, 11, 1)
 	require.NoError(t, st.groups[2].Store.PutAt(ctx, key, deltaValue, 1, 0))
 
 	scanStart := store.LegacyListMetaDeltaScanPrefix(userKey)

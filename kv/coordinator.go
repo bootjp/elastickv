@@ -1013,7 +1013,7 @@ func (c *Coordinate) RecoverHLCLease(ctx context.Context) error {
 	}
 	c.hlcRecoveryMu.Lock()
 	defer c.hlcRecoveryMu.Unlock()
-	if !hlcCeilingExpired(c.clock) {
+	if !hlcCeilingExhausted(c.clock) {
 		return nil
 	}
 	if !c.IsLeaderAcceptingWrites() {
@@ -1024,7 +1024,7 @@ func (c *Coordinate) RecoverHLCLease(ctx context.Context) error {
 	}
 	rctx, cancel := hlcRecoveryContext(ctx)
 	defer cancel()
-	ceilingMs := time.Now().UnixMilli() + hlcPhysicalWindowMs
+	ceilingMs := hlcRecoveryCeiling(c.clock)
 	return errors.Wrap(c.ProposeHLCLease(rctx, ceilingMs), "recover hlc lease")
 }
 

@@ -205,7 +205,7 @@ func TestMigrationFrontierAdmissionNonOwnerChildrenNeverGrant(t *testing.T) {
 func TestMigrationFrontierAdmissionStaleFenceRejectedBeforeProxy(t *testing.T) {
 	f, engine, _ := frontierAdmissionSplitFixture(t)
 	shards := NewShardStore(engine, map[uint64]*ShardGroup{
-		2: {Store: f.store, Engine: &stubFollowerEngine{leaderAddr: "127.0.0.1:1"}},
+		2: {Store: f.store, Engine: newStubFollowerEngine("127.0.0.1:1")},
 	})
 	t.Cleanup(func() { require.NoError(t, shards.Close()) })
 	_, err := shards.GetAtWithReadFence(t.Context(), []byte("n"), 200, 0, engine.Version()-1)

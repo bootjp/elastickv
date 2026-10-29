@@ -106,7 +106,7 @@ var errnoMappings = []struct {
 	{filesystem.ErrInvalid, syscall.EINVAL},
 	{filesystem.ErrUnsupported, syscall.EOPNOTSUPP},
 	{filesystem.ErrStaleHome, syscall.EAGAIN},
-	{filesystem.ErrContentionLimit, syscall.EBUSY},
+	{filesystem.ErrContentionLimit, syscall.EAGAIN},
 	{filesystem.ErrOperationQuota, syscall.ENOSPC},
 	{store.ErrWriteConflict, syscall.EAGAIN},
 }

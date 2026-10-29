@@ -7,122 +7,44 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
+// localAdapterCoordinator applies dispatches to an in-memory store through
+// kvtest.LocalCoordinator while keeping stubAdapterCoordinator's configurable
+// leadership surface. Both share one HLC. DEL_PREFIX is applied only as a
+// standalone, non-transactional group, mirroring the production coordinator's
+// dispatch-time rejection rules (Codex P1 on PR #695: a txn mixing Del and
+// DelPrefix must fail here as it does in production).
 type localAdapterCoordinator struct {
 	stubAdapterCoordinator
 	store store.MVCCStore
+	local *kvtest.LocalCoordinator
 }
 
 func newLocalAdapterCoordinator(st store.MVCCStore) *localAdapterCoordinator {
+	return newLocalAdapterCoordinatorWithOptions(st, kvtest.LocalOptions{DelPrefix: kvtest.PrefixApply})
+}
+
+func newLocalAdapterCoordinatorWithOptions(st store.MVCCStore, options kvtest.LocalOptions) *localAdapterCoordinator {
+	clock := kv.NewHLC()
+	options.Clock = clock
 	return &localAdapterCoordinator{
-		stubAdapterCoordinator: stubAdapterCoordinator{clock: kv.NewHLC()},
+		stubAdapterCoordinator: stubAdapterCoordinator{clock: clock},
 		store:                  st,
+		local:                  kvtest.NewLocalCoordinator(st, options),
 	}
 }
 
 func (c *localAdapterCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	if req == nil {
-		return &kv.CoordinateResponse{}, nil
-	}
-	if err := c.validateDispatchShape(req); err != nil {
-		return nil, err
-	}
-	commitTS, err := c.commitTSForRequest(req)
+	resp, err := c.local.Dispatch(ctx, req)
 	if err != nil {
-		return nil, err
+		return nil, errors.WithStack(err)
 	}
-	if err := c.applyElems(ctx, req.Elems, commitTS); err != nil {
-		return nil, err
-	}
-	return &kv.CoordinateResponse{CommitTS: commitTS}, nil
-}
-
-// validateDispatchShape mirrors the production coordinator's
-// dispatch-time rejection rules so tests catch the same class of
-// bug that real clusters would reject. Specifically:
-//
-//   - DEL_PREFIX cannot be in a transactional OperationGroup
-//     (kv/sharded_coordinator.go: dispatchDelPrefixBroadcast
-//     refuses IsTxn=true).
-//   - DEL_PREFIX cannot be mixed with Put or Del in the same
-//     OperationGroup (validateDelPrefixOnly enforces all-or-none).
-//
-// Without these checks, a regression that ships
-// `IsTxn:true with [Del, DelPrefix...]` (Codex P1 on PR #695)
-// would silently pass the local coordinator while production
-// rejected every bucket delete with ErrInvalidRequest.
-func (c *localAdapterCoordinator) validateDispatchShape(req *kv.OperationGroup[kv.OP]) error {
-	hasDelPrefix := false
-	hasOther := false
-	for _, elem := range req.Elems {
-		if elem == nil {
-			continue
-		}
-		if elem.Op == kv.DelPrefix {
-			hasDelPrefix = true
-		} else {
-			hasOther = true
-		}
-	}
-	if !hasDelPrefix {
-		return nil
-	}
-	if req.IsTxn {
-		return errors.Wrap(kv.ErrInvalidRequest, "DEL_PREFIX not supported in transactions")
-	}
-	if hasOther {
-		return errors.Wrap(kv.ErrInvalidRequest, "DEL_PREFIX cannot be mixed with other operations")
-	}
-	return nil
-}
-
-func (c *localAdapterCoordinator) commitTSForRequest(req *kv.OperationGroup[kv.OP]) (uint64, error) {
-	if req == nil {
-		return 0, nil
-	}
-	commitTS := req.CommitTS
-	if commitTS == 0 {
-		commitTS = c.Clock().Next()
-		if req.IsTxn && commitTS <= req.StartTS {
-			c.Clock().Observe(req.StartTS)
-			commitTS = c.Clock().Next()
-		}
-	} else {
-		c.Clock().Observe(commitTS)
-	}
-	if req.IsTxn && commitTS <= req.StartTS {
-		return 0, kv.ErrTxnCommitTSRequired
-	}
-	return commitTS, nil
-}
-
-func (c *localAdapterCoordinator) applyElems(ctx context.Context, elems []*kv.Elem[kv.OP], commitTS uint64) error {
-	for _, elem := range elems {
-		if err := c.applyElem(ctx, elem, commitTS); err != nil {
-			return err
-		}
-	}
-	return nil
-}
-
-func (c *localAdapterCoordinator) applyElem(ctx context.Context, elem *kv.Elem[kv.OP], commitTS uint64) error {
-	if elem == nil {
-		return nil
-	}
-	switch elem.Op {
-	case kv.Put:
-		return c.store.PutAt(ctx, elem.Key, elem.Value, commitTS, 0)
-	case kv.Del:
-		return c.store.DeleteAt(ctx, elem.Key, commitTS)
-	case kv.DelPrefix:
-		return c.store.DeletePrefixAt(ctx, elem.Key, nil, commitTS)
-	default:
-		return nil
-	}
+	return resp, nil
 }
 
 func newLegacyMigrationTestServer(

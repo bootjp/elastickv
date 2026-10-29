@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
 )
@@ -24,11 +25,7 @@ func TestAdminHandlerDrainJoinsHandlerAfterForcedClose(t *testing.T) {
 	<-entered
 	done := make(chan struct{})
 	go func() { drain.join(time.Second); close(done) }()
-	select {
-	case <-done:
-		t.Fatal("join returned while the admitted handler was running")
-	case <-time.After(10 * time.Millisecond):
-	}
+	testutil.NoRecv(t, done, 10*time.Millisecond, "join returned while the admitted handler was running")
 	close(release)
 	select {
 	case <-done:
@@ -69,24 +66,12 @@ func TestAdminLifecycleWaitsForForceClosedHandler(t *testing.T) {
 			_ = response.Body.Close()
 		}
 	}()
-	select {
-	case <-entered:
-	case <-time.After(time.Second):
-		t.Fatal("admin handler did not start")
-	}
+	testutil.Closed(t, entered, time.Second, "admin handler did not start")
 	cancel()
-	select {
-	case <-canceled:
-	case <-time.After(time.Second):
-		t.Fatal("admin connection was not forced closed")
-	}
+	testutil.Closed(t, canceled, time.Second, "admin connection was not forced closed")
 	done := make(chan error, 1)
 	go func() { done <- group.Wait() }()
-	select {
-	case <-done:
-		t.Fatal("admin lifecycle returned before its handler unwound")
-	case <-time.After(10 * time.Millisecond):
-	}
+	testutil.NoRecv(t, done, 10*time.Millisecond, "admin lifecycle returned before its handler unwound")
 	close(release)
 	require.NoError(t, <-done)
 	<-clientDone

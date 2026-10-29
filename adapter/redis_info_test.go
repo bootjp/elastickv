@@ -1,51 +1,19 @@
 package adapter
 
 import (
-	"context"
 	"strings"
 	"testing"
 
-	"github.com/bootjp/elastickv/kv"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
 )
 
-type infoTestCoordinator struct {
-	isLeader   bool
-	raftLeader string
-	clock      *kv.HLC
-}
-
-func (c *infoTestCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	return &kv.CoordinateResponse{}, nil
-}
-func (c *infoTestCoordinator) IsLeader() bool                                   { return c.isLeader }
-func (c *infoTestCoordinator) VerifyLeader(context.Context) error               { return nil }
-func (c *infoTestCoordinator) RaftLeader() string                               { return c.raftLeader }
-func (c *infoTestCoordinator) IsLeaderForKey([]byte) bool                       { return c.isLeader }
-func (c *infoTestCoordinator) VerifyLeaderForKey(context.Context, []byte) error { return nil }
-func (c *infoTestCoordinator) RaftLeaderForKey([]byte) string                   { return c.raftLeader }
-func (c *infoTestCoordinator) Clock() *kv.HLC {
-	if c.clock == nil {
-		c.clock = kv.NewHLC()
-	}
-	return c.clock
-}
-
-func (c *infoTestCoordinator) LinearizableRead(_ context.Context) (uint64, error) { return 0, nil }
-func (c *infoTestCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
-	return c.LinearizableRead(ctx)
-}
-func (c *infoTestCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
-	return c.LinearizableRead(ctx)
-}
-
 func TestRedisServer_Info_LeaderRole(t *testing.T) {
 	r := &RedisServer{
 		redisAddr:   "10.0.0.1:6379",
 		leaderRedis: map[string]string{"raft-1": "10.0.0.1:6379"},
-		coordinator: &infoTestCoordinator{isLeader: true, raftLeader: "raft-1"},
+		coordinator: &stubAdapterCoordinator{leaderSet: true, leader: true, raftLeader: "raft-1"},
 	}
 
 	conn := &recordingConn{}
@@ -66,7 +34,7 @@ func TestRedisServer_Info_FollowerRole(t *testing.T) {
 			"raft-1": "10.0.0.1:6379",
 			"raft-2": "10.0.0.2:6379",
 		},
-		coordinator: &infoTestCoordinator{isLeader: false, raftLeader: "raft-1"},
+		coordinator: &stubAdapterCoordinator{leaderSet: true, leader: false, raftLeader: "raft-1"},
 	}
 
 	conn := &recordingConn{}
@@ -88,7 +56,7 @@ func TestRedisServer_Info_UnknownLeader(t *testing.T) {
 	r := &RedisServer{
 		redisAddr:   "10.0.0.3:6379",
 		leaderRedis: map[string]string{},
-		coordinator: &infoTestCoordinator{isLeader: false, raftLeader: ""},
+		coordinator: &stubAdapterCoordinator{leaderSet: true, leader: false, raftLeader: ""},
 	}
 
 	conn := &recordingConn{}

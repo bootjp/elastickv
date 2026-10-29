@@ -1,5 +1,6 @@
 # Bound SQLite Jepsen register histories
 
+Status: Implemented (shipped in #1333; no implementation work follows)
 Date: 2026-10-25
 
 ## Failure

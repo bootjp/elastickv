@@ -178,16 +178,21 @@ func writeRegistryRow(t *testing.T, st store.MVCCStore, fullNodeID uint64, lastS
 	}
 }
 
-func TestReadWriterRegistryLastSeen(t *testing.T) {
+func TestRegistryLastSeen(t *testing.T) {
 	t.Parallel()
 	st := newRegistrationTestStore(t)
 	const dekID uint32 = 7
 	fullNodeID := etcdraftengine.DeriveNodeID("n1")
 
-	// No row → 0.
-	got, err := readWriterRegistryLastSeen(st, dekID, fullNodeID)
+	reg, err := store.WriterRegistryFor(st)
 	if err != nil {
-		t.Fatalf("readWriterRegistryLastSeen (no row): %v", err)
+		t.Fatalf("WriterRegistryFor: %v", err)
+	}
+
+	// No row → 0.
+	got, err := registryLastSeen(reg, dekID, fullNodeID)
+	if err != nil {
+		t.Fatalf("registryLastSeen (no row): %v", err)
 	}
 	if got != 0 {
 		t.Errorf("no-row last_seen = %d, want 0", got)
@@ -195,9 +200,9 @@ func TestReadWriterRegistryLastSeen(t *testing.T) {
 
 	// After writing last_seen=5 → 5.
 	writeRegistryRow(t, st, fullNodeID, 5)
-	got, err = readWriterRegistryLastSeen(st, dekID, fullNodeID)
+	got, err = registryLastSeen(reg, dekID, fullNodeID)
 	if err != nil {
-		t.Fatalf("readWriterRegistryLastSeen (with row): %v", err)
+		t.Fatalf("registryLastSeen (with row): %v", err)
 	}
 	if got != 5 {
 		t.Errorf("with-row last_seen = %d, want 5", got)
@@ -323,6 +328,13 @@ func TestBuildProcessStartRegistrationGate_NilGateBranches(t *testing.T) {
 		expectRegistered bool
 	}{
 		{name: "encryption_off", w: encryptionWriteWiring{cache: encryption.NewStateCache()}}, // cipher nil
+		// Design §2.3 fail-closed posture: a node that boots in Phase 0
+		// (envelope inactive) skips registration without seeding
+		// Registered(), so the per-DEK gate is NOT registered for the
+		// active DEK. The Phase-0 boot itself emits no encrypted writes;
+		// a runtime EnableStorageEnvelope would then fail closed until
+		// the node (re)registers. This is the safe posture (no fail-OPEN
+		// per §2.3).
 		{name: "phase0_envelope_inactive", w: wiringFor(t, 7, false, 1)},
 		{name: "not_bootstrapped", w: wiringFor(t, 0, true, 1)},
 		{
@@ -831,40 +843,6 @@ func TestValidateRaftRegistrationStartupEpochAllowsStrictlyAhead(t *testing.T) {
 	}
 	if err := validateRaftRegistrationStartupEpoch(&kv.ShardGroup{Store: st}, w, "n1", path); err != nil {
 		t.Fatalf("validateRaftRegistrationStartupEpoch: %v", err)
-	}
-}
-
-// TestBuildProcessStartRegistrationGate_Phase0BootDoesNotMarkRegistered
-// documents the design §2.3 fail-closed posture: a node that boots in
-// Phase 0 (envelope inactive) skips registration without seeding
-// Registered(), so the per-DEK gate is NOT registered for the active
-// DEK. The Phase-0 boot itself emits no encrypted writes (envelope
-// inactive → cleartext, gate unconsulted); a runtime EnableStorageEnvelope
-// would then fail closed until the node (re)registers — the deferred
-// runtime-registration follow-on. This is the safe posture (no fail-OPEN
-// per §2.3), and benign today since the only direct write is the startup
-// catalog bootstrap Save (covered by retryUntilRegistered).
-func TestBuildProcessStartRegistrationGate_Phase0BootDoesNotMarkRegistered(t *testing.T) {
-	t.Parallel()
-	st := newRegistrationTestStore(t)
-	w := wiringFor(t, testRegDEKID, false /*envelope inactive: Phase 0*/, 1)
-
-	eg, _ := errgroup.WithContext(context.Background())
-	gate, err := buildProcessStartRegistrationGate(
-		context.Background(), eg, &kv.ShardedCoordinator{},
-		&kv.ShardGroup{Store: st}, w, "n1")
-	if err != nil {
-		t.Fatalf("buildProcessStartRegistrationGate: %v", err)
-	}
-	if gate == nil || gate.Barrier != nil {
-		t.Fatalf("Phase 0 should be ungated (nil Barrier), got %+v", gate)
-	}
-	// Phase-0 boot did not seed Registered(): the node is not registered
-	// for the active DEK, so a later runtime cutover fail-closes the gate
-	// (deferred runtime-registration). The gate is correctly per-DEK and
-	// fail-closed rather than fail-OPEN (§2.3).
-	if w.cache.Registered() {
-		t.Error("Phase-0 boot unexpectedly marked Registered() — must not seed registration")
 	}
 }
 

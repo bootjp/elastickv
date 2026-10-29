@@ -119,7 +119,7 @@ const minEncryptionCompressionSize = 32
 // the storage layer just calls Next() and uses what comes back.
 //
 // Stage 7 of the encryption rollout will replace the in-tree
-// reference implementation (CounterNonceFactory) with a
+// reference implementation (encryption.DeterministicNonceFactory) with a
 // writer-registry-backed factory that guarantees uniqueness across
 // voters, learners, and historical replicas. The interface stays
 // the same; only the construction changes. Implementations MUST

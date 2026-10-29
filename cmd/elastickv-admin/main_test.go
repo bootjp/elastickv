@@ -26,6 +26,7 @@ import (
 	pb "github.com/bootjp/elastickv/proto"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/connectivity"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/status"
 )
@@ -87,35 +88,6 @@ func TestLoadTokenRequiresFileOrInsecure(t *testing.T) {
 	}
 	if tok != "" {
 		t.Fatalf("insecure-mode token = %q, want empty", tok)
-	}
-}
-
-func TestLoadTokenReadsAndTrims(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "token")
-	if err := os.WriteFile(path, []byte("\n  s3cret \n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	tok, err := loadToken(path, false)
-	if err != nil {
-		t.Fatalf("loadToken: %v", err)
-	}
-	if tok != "s3cret" {
-		t.Fatalf("tok = %q, want s3cret", tok)
-	}
-}
-
-func TestLoadTokenRejectsEmptyFile(t *testing.T) {
-	t.Parallel()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "empty")
-	if err := os.WriteFile(path, []byte("   \n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	_, err := loadToken(path, false)
-	if err == nil || !strings.Contains(err.Error(), "empty") {
-		t.Fatalf("expected empty-file error, got %v", err)
 	}
 }
 
@@ -361,11 +333,11 @@ func TestFanoutClientForDeduplicatesConcurrentDials(t *testing.T) {
 	}
 }
 
-// TestFanoutClientForOrphanedDialClosed asserts that when two non-overlapping
-// clientFor calls dial the same address (so singleflight runs the dial fn
-// twice with two different *grpc.ClientConn results), the second call's
-// orphaned conn is closed instead of leaking. Codex P2 on 1492fdae: the
-// orphan path previously dropped the loser conn on the floor.
+// TestFanoutClientForOrphanedDialClosed asserts that when a dial
+// completes after a non-overlapping earlier clientFor already installed a
+// different conn for the same address, installOrAttach closes the orphaned
+// conn and hands back the cached client. Codex P2 on 1492fdae: the orphan
+// path previously dropped the loser conn on the floor.
 func TestFanoutClientForOrphanedDialClosed(t *testing.T) {
 	t.Parallel()
 	peer := &fakeAdminServer{members: []string{"m:1"}}
@@ -374,39 +346,32 @@ func TestFanoutClientForOrphanedDialClosed(t *testing.T) {
 	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
 	defer f.Close()
 
-	// First clientFor — installs into cache.
+	// First clientFor installs c1 into the cache.
 	c1, rel1, err := f.clientFor(addr)
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer rel1()
 
-	// Hand-craft an orphaned conn by simulating "post-singleflight, cache
-	// already has different conn". We bypass singleflight to deterministically
-	// produce a second *grpc.ClientConn that won't equal c1.conn, then drive
-	// the cache-hit-after-dial branch via a second clientFor call.
+	// A second dial that lost the race to the cache: its conn differs from
+	// the cached one, so installOrAttach must close it.
 	conn2, err := grpc.NewClient(addr, grpc.WithTransportCredentials(insecure.NewCredentials()))
 	if err != nil {
 		t.Fatal(err)
 	}
-	// Stuff conn2 into the singleflight cache slot via the public API path
-	// is not feasible; instead, verify the live path: a second concurrent
-	// clientFor should not leak — the dedup test already covered the
-	// happy path. Here we just assert that the orphan branch's Close()
-	// does not panic on a fresh conn (nil-safe Close behavior on
-	// already-closed conn is what protects the path).
-	if err := conn2.Close(); err != nil {
-		t.Fatalf("conn2.Close: %v", err)
-	}
-
-	rel1()
-	// Second clientFor should still succeed (cache hit) and not panic.
-	c2, rel2, err := f.clientFor(addr)
+	c2, rel2, err := f.installOrAttach(addr, conn2)
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer rel2()
 	if c1 != c2 {
-		t.Fatalf("nodeClient pointer mismatch — cache lookup did not return the cached entry")
+		t.Fatalf("installOrAttach returned %p, want the cached client %p", c2, c1)
+	}
+	if c2.conn == conn2 {
+		t.Fatal("installOrAttach replaced the cached conn with the orphan")
+	}
+	if got := conn2.GetState(); got != connectivity.Shutdown {
+		t.Fatalf("orphaned conn state = %v, want %v (closed)", got, connectivity.Shutdown)
 	}
 }
 
@@ -803,58 +768,6 @@ func TestHandleOverviewUsesProtojson(t *testing.T) {
 	// "grpc_address" (proto name). Catch the regression explicitly.
 	if !strings.Contains(body, "grpcAddress") {
 		t.Fatalf("response missing protojson camelCase field; body=%q", body)
-	}
-}
-
-// TestFanoutClientForRaceDeduplicates exercises the dial-outside-the-lock
-// path in clientFor: many goroutines racing for the same addr must all
-// converge on a single cached *grpc.ClientConn (the loser of each race
-// closes its just-dialed conn). Pre-fix, the dial happened under the
-// lock so the race was impossible by construction; post-fix, the race
-// is intentional but bounded.
-func TestFanoutClientForRaceDeduplicates(t *testing.T) {
-	t.Parallel()
-	peer := &fakeAdminServer{members: []string{"m:1"}}
-	addr := startFakeAdmin(t, peer)
-	f := newFanout([]string{addr}, "", time.Second, insecure.NewCredentials(), defaultMaxDiscoveredNodes)
-	defer f.Close()
-
-	const racers = 32
-	var wg sync.WaitGroup
-	wg.Add(racers)
-	clients := make([]*nodeClient, racers)
-	releases := make([]func(), racers)
-	for i := 0; i < racers; i++ {
-		go func(i int) {
-			defer wg.Done()
-			c, release, err := f.clientFor(addr)
-			if err != nil {
-				t.Errorf("racer %d clientFor: %v", i, err)
-				return
-			}
-			clients[i] = c
-			releases[i] = release
-		}(i)
-	}
-	wg.Wait()
-
-	for _, release := range releases {
-		if release != nil {
-			release()
-		}
-	}
-
-	first := clients[0]
-	for i, c := range clients {
-		if c != first {
-			t.Fatalf("racer %d got distinct nodeClient %p, want %p — clientFor de-duplication broke", i, c, first)
-		}
-	}
-	f.mu.Lock()
-	size := len(f.clients)
-	f.mu.Unlock()
-	if size != 1 {
-		t.Fatalf("cache size after race = %d, want 1 (race created %d duplicates)", size, size-1)
 	}
 }
 

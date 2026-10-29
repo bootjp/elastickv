@@ -4,11 +4,10 @@ package fstest
 
 import (
 	"context"
-	"encoding/binary"
-	"sync"
 
 	"github.com/bootjp/elastickv/internal/filesystem"
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -17,21 +16,27 @@ import (
 // satisfies filesystem.Dispatcher and the optional linearizable-read fence so
 // tests can drive filesystem.Service end to end without replication.
 type MemoryDispatcher struct {
-	mu    sync.Mutex
-	store store.MVCCStore
+	local *kvtest.LocalCoordinator
 }
 
-const commitTimestampBytes = 8
-
 // NewMemoryDispatcher wraps st in a dispatcher that commits every group at
-// the next commit timestamp.
+// max(store+1, requested, StartTS+1), validates OCC read keys on every group,
+// patches commit-timestamp value offsets, and rejects prefix deletes.
 func NewMemoryDispatcher(st store.MVCCStore) *MemoryDispatcher {
-	return &MemoryDispatcher{store: st}
+	return &MemoryDispatcher{local: kvtest.NewLocalCoordinator(st, kvtest.LocalOptions{
+		DelPrefix:        kvtest.PrefixReject,
+		CommitTimestamp:  kvtest.TimestampStoreIncrement,
+		AdvanceCommitTS:  true,
+		OCC:              kvtest.OCCAllGroups,
+		ValidateReadKeys: true,
+		PatchCommitTS:    true,
+	})}
 }
 
 // LinearizableRead returns the latest applied commit timestamp.
-func (d *MemoryDispatcher) LinearizableRead(context.Context) (uint64, error) {
-	return d.store.LastCommitTS(), nil
+func (d *MemoryDispatcher) LinearizableRead(ctx context.Context) (uint64, error) {
+	ts, err := d.local.LinearizableRead(ctx)
+	return ts, errors.WithStack(err)
 }
 
 // Dispatch applies the group's mutations atomically at a fresh commit
@@ -40,67 +45,11 @@ func (d *MemoryDispatcher) Dispatch(
 	ctx context.Context,
 	req *kv.OperationGroup[kv.OP],
 ) (*kv.CoordinateResponse, error) {
-	d.mu.Lock()
-	defer d.mu.Unlock()
-	commitTS := memoryCommitTimestamp(d.store.LastCommitTS(), req)
-	mutations, err := memoryMutations(req.Elems, commitTS)
+	resp, err := d.local.Dispatch(ctx, req)
 	if err != nil {
-		return nil, err
-	}
-	if err := d.store.ApplyMutations(ctx, mutations, req.ReadKeys, req.StartTS, commitTS); err != nil {
 		return nil, errors.Wrap(err, "apply memory dispatcher mutations")
 	}
-	return &kv.CoordinateResponse{CommitIndex: commitTS}, nil
-}
-
-func memoryCommitTimestamp(lastTS uint64, req *kv.OperationGroup[kv.OP]) uint64 {
-	commitTS := lastTS + 1
-	if req.CommitTS > commitTS {
-		commitTS = req.CommitTS
-	}
-	if req.IsTxn && commitTS <= req.StartTS {
-		commitTS = req.StartTS + 1
-	}
-	return commitTS
-}
-
-func memoryMutations(elems []*kv.Elem[kv.OP], commitTS uint64) ([]*store.KVPairMutation, error) {
-	mutations := make([]*store.KVPairMutation, 0, len(elems))
-	for _, elem := range elems {
-		value, err := memoryMutationValue(elem, commitTS)
-		if err != nil {
-			return nil, err
-		}
-		switch elem.Op {
-		case kv.Put:
-			mutations = append(mutations, &store.KVPairMutation{
-				Op:    store.OpTypePut,
-				Key:   append([]byte(nil), elem.Key...),
-				Value: value,
-			})
-		case kv.Del:
-			mutations = append(mutations, &store.KVPairMutation{
-				Op:  store.OpTypeDelete,
-				Key: append([]byte(nil), elem.Key...),
-			})
-		case kv.DelPrefix:
-			return nil, errors.WithStack(store.ErrUnknownOp)
-		default:
-			return nil, errors.WithStack(store.ErrUnknownOp)
-		}
-	}
-	return mutations, nil
-}
-
-func memoryMutationValue(elem *kv.Elem[kv.OP], commitTS uint64) ([]byte, error) {
-	value := append([]byte(nil), elem.Value...)
-	if elem.CommitTSValueOffset != 0 {
-		if len(value) < commitTimestampBytes || elem.CommitTSValueOffset > uint64(len(value)-commitTimestampBytes) {
-			return nil, errors.WithStack(filesystem.ErrInvalid)
-		}
-		binary.BigEndian.PutUint64(value[elem.CommitTSValueOffset:], commitTS)
-	}
-	return value, nil
+	return resp, nil
 }
 
 // NewMemoryService builds a filesystem.Service over a fresh in-memory MVCC
