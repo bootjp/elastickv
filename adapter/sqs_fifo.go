@@ -1,6 +1,7 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -304,6 +305,88 @@ func (s *SQSServer) classifyFifoGroupLock(ctx context.Context, queueName string,
 		return fifoLockOwn, lockKey, nil
 	}
 	return fifoLockSkip, lockKey, nil
+}
+
+// sqsFifoTieScanPage bounds a scan page, not the size of the whole bucket.
+const sqsFifoTieScanPage = 16
+
+type sqsFifoHead struct {
+	candidate sqsMsgCandidate
+	record    *sqsMessageRecord
+	dataKey   []byte
+}
+
+// This state belongs to one partition/read snapshot, never to the server.
+// Expected OCC races may produce a short receive; a fresh receive retries.
+type sqsFifoReceiveState struct {
+	attempted map[string]struct{}
+}
+
+func (f *sqsFifoReceiveState) markAttempted(group string) {
+	if f.attempted == nil {
+		f.attempted = make(map[string]struct{})
+	}
+	f.attempted[group] = struct{}{}
+}
+
+// resolveFifoCandidate returns the minimum same-millisecond group head when a
+// free-lock candidate is a successor. Returning its actual identity lets the
+// admitted page make progress without waiting for another outer scan page.
+func (s *SQSServer) resolveFifoCandidate(ctx context.Context, queueName string, meta *sqsQueueMeta, cand sqsMsgCandidate, rec *sqsMessageRecord, readTS uint64) (*sqsFifoHead, fifoCandidateLockState, []byte, error) {
+	state, lockKey, err := s.classifyFifoGroupLock(ctx, queueName, meta, cand.partition, meta.Generation, rec, readTS)
+	if err != nil || state != fifoLockAcquire {
+		return nil, state, lockKey, err
+	}
+	head, err := s.fifoGroupHeadInMillisecond(ctx, queueName, meta, cand, rec, readTS)
+	if err != nil {
+		return nil, fifoLockSkip, lockKey, err
+	}
+	return head, fifoLockAcquire, lockKey, nil
+}
+
+func (s *SQSServer) fifoGroupHeadInMillisecond(ctx context.Context, queueName string, meta *sqsQueueMeta, cand sqsMsgCandidate, rec *sqsMessageRecord, readTS uint64) (*sqsFifoHead, error) {
+	if rec.VisibleAtMillis <= 0 {
+		return nil, nil
+	}
+	_, start := sqsMsgVisScanBoundsDispatch(meta, queueName, cand.partition, meta.Generation, rec.VisibleAtMillis-1)
+	_, end := sqsMsgVisScanBoundsDispatch(meta, queueName, cand.partition, meta.Generation, rec.VisibleAtMillis)
+	var head *sqsFifoHead
+	minimum := rec.SequenceNumber
+	for {
+		kvs, groupID, err := s.scanVisibleIndexAt(ctx, start, end, sqsFifoTieScanPage, readTS)
+		if err != nil {
+			return nil, err
+		}
+		for _, kvp := range kvs {
+			tie := sqsMsgCandidate{visKey: kvp.Key, messageID: string(kvp.Value), partition: cand.partition, groupID: groupID}
+			selected, err := s.loadEarlierFifoTie(ctx, queueName, meta, tie, rec, readTS, minimum)
+			if err != nil {
+				return nil, err
+			}
+			if selected != nil {
+				head, minimum = selected, selected.record.SequenceNumber
+			}
+		}
+		if len(kvs) < sqsFifoTieScanPage {
+			return head, nil
+		}
+		start = nextScanCursorAfter(kvs[len(kvs)-1].Key)
+	}
+}
+
+func (s *SQSServer) loadEarlierFifoTie(ctx context.Context, queueName string, meta *sqsQueueMeta, cand sqsMsgCandidate, rec *sqsMessageRecord, readTS, minimum uint64) (*sqsFifoHead, error) {
+	if cand.messageID == rec.MessageID {
+		return nil, nil
+	}
+	other, dataKey, gone, err := s.loadCandidateRecord(ctx, queueName, meta, meta.Generation, cand, readTS)
+	if err != nil || gone {
+		return nil, err
+	}
+	if other.MessageGroupId != rec.MessageGroupId || other.VisibleAtMillis != rec.VisibleAtMillis || other.SequenceNumber >= minimum {
+		return nil, nil
+	}
+	cand.visKey = bytes.Clone(cand.visKey)
+	return &sqsFifoHead{candidate: cand, record: other, dataKey: dataKey}, nil
 }
 
 // fifoLockMutationsForReceive returns the OCC ops the receive path
