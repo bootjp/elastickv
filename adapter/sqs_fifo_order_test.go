@@ -15,7 +15,7 @@ import (
 // putFifoTieRecord stores a visible FIFO message (data record and
 // visibility entry) at visibleAt, bypassing the send path so the test
 // controls the MessageId and therefore the visibility-key order.
-func putFifoTieRecord(t *testing.T, st store.MVCCStore, meta *sqsQueueMeta, id, group string, seq uint64, visibleAt int64) *sqsMessageRecord {
+func putFifoTieRecord(t testing.TB, st store.MVCCStore, meta *sqsQueueMeta, id, group string, seq uint64, visibleAt int64) *sqsMessageRecord {
 	t.Helper()
 	ctx := context.Background()
 	rec := &sqsMessageRecord{
@@ -34,12 +34,12 @@ func putFifoTieRecord(t *testing.T, st store.MVCCStore, meta *sqsQueueMeta, id, 
 	return rec
 }
 
-// TestClassifyFifoCandidate_SameMillisecondKeepsSendOrder pins that a FIFO
-// candidate cannot take a free group lock while an earlier send of its
-// group shares its visible-at millisecond. The later send is given the
+// TestResolveFifoCandidate_SameMillisecondKeepsSendOrder pins that a FIFO
+// candidate resolves an earlier send of its group before taking a free group
+// lock when they share a visible-at millisecond. The later send is given the
 // MessageId that sorts first in the visibility index, which is the order
 // the receive scan visits them in.
-func TestClassifyFifoCandidate_SameMillisecondKeepsSendOrder(t *testing.T) {
+func TestResolveFifoCandidate_SameMillisecondKeepsSendOrder(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
 	st := store.NewMVCCStore()
@@ -68,11 +68,12 @@ func TestClassifyFifoCandidate_SameMillisecondKeepsSendOrder(t *testing.T) {
 	require.Negative(t, bytes.Compare(laterVis, firstVis), "fixture: the later send must sort first in the visibility index")
 
 	for _, tc := range []struct {
-		name string
-		rec  *sqsMessageRecord
-		want fifoCandidateLockState
+		name   string
+		rec    *sqsMessageRecord
+		want   fifoCandidateLockState
+		wantID string
 	}{
-		{name: "later send behind an earlier same-millisecond send", rec: later, want: fifoLockSkip},
+		{name: "later send resolves earlier same-millisecond send", rec: later, want: fifoLockAcquire, wantID: first.MessageID},
 		{name: "earliest send of the group", rec: first, want: fifoLockAcquire},
 		{name: "other group in the same millisecond", rec: other, want: fifoLockAcquire},
 		{name: "send alone in its millisecond", rec: next, want: fifoLockAcquire},
@@ -84,9 +85,18 @@ func TestClassifyFifoCandidate_SameMillisecondKeepsSendOrder(t *testing.T) {
 				visKey:    sqsMsgVisKeyDispatch(meta, meta.Name, 0, meta.Generation, tc.rec.VisibleAtMillis, tc.rec.MessageID),
 				messageID: tc.rec.MessageID,
 			}
-			got, _, err := srv.classifyFifoCandidate(ctx, meta.Name, meta, cand, tc.rec, 20)
+			head, got, _, err := srv.resolveFifoCandidate(ctx, meta.Name, meta, cand, tc.rec, 20)
 			require.NoError(t, err)
 			require.Equal(t, tc.want, got)
+			if tc.wantID == "" {
+				require.Nil(t, head)
+				return
+			}
+			require.NotNil(t, head)
+			require.Equal(t, tc.wantID, head.candidate.messageID)
+			require.Equal(t, tc.wantID, head.record.MessageID)
+			require.Equal(t, firstVis, head.candidate.visKey)
+			require.Equal(t, sqsMsgDataKeyDispatch(meta, meta.Name, 0, meta.Generation, tc.wantID), head.dataKey)
 		})
 	}
 }

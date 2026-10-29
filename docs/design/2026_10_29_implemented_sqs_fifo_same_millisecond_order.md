@@ -2,8 +2,8 @@
 
 Status: implemented (milestone 1)
 
-Review follow-up: receive-progress correction proposed; the PR remains unready
-until its runtime regression and latest-head review/CI pass.
+Review follow-up: receive-progress correction implemented and locally verified;
+merge still requires latest-push review and CI.
 
 ## Problem
 
@@ -46,16 +46,14 @@ messages that now sort ahead of it are skipped as before.
 
 ## Design
 
-Break the tie on the receive side, where the sequence number is already
-known. When a FIFO candidate would *acquire* a free group lock
-(`fifoLockAcquire`), `classifyFifoCandidate` first scans the visibility
-index for the candidate's own millisecond only
-(`[visibleAt, visibleAt+1)` in the candidate's partition) and loads each
-entry's record. If another message of the same group in that millisecond
-has a lower `SequenceNumber`, the candidate is skipped. The earlier send
-sits later in the same scan (it shares the millisecond and sorts after
-the candidate), so it is delivered in the same receive call, or on the
-next one if the call ran out of budget.
+Break the tie on the receive side, where the sequence number is already known.
+For a free group lock, `resolveFifoCandidate` scans the candidate's entire
+millisecond/partition at the receive snapshot and resolves the minimum sequence
+of that group. The selected visibility key, ID, decoded record and data key
+travel together into the existing OCC rotation. The admitted outer page can
+therefore attempt that head directly even if it sorts after another outer page.
+Skipping successors and hoping that a later receive reaches the head is not
+sufficient under the soft scan budget.
 
 - No key, value or wire format changes. Stored messages are handled the
   same as new ones, so there is no rollout window.
@@ -82,10 +80,11 @@ next one if the call ran out of budget.
 
 ## Cost
 
-One bounded scan of a single millisecond of one partition's visibility
-index, plus one record read per entry in it, on each lock acquisition. A
-millisecond usually holds only the candidate. Deliveries that refresh an
-owned lock, and standard queues, pay nothing.
+One paginated scan of a single millisecond/partition plus one record read per
+entry when resolving a free group head. The 16-entry page size does not bound
+the whole bucket or enforce hard request latency. A partition/snapshot-local
+attempted-group set avoids repeatedly resolving/rotating that group across
+outer pages. Owned locks do not scan; standard queues do not use this state.
 
 ## Limits
 
@@ -96,17 +95,16 @@ the send timestamp and is out of scope here.
 
 ## Milestones
 
-1. Same-millisecond send-order check on group-lock acquisition, with the
-   tests below.
+1. Same-millisecond head resolution on group-lock acquisition, preserving
+   receive progress across outer-page budgets, with the tests below.
 
 ## Test plan
 
-- `TestClassifyFifoCandidate_SameMillisecondKeepsSendOrder` (new,
+- `TestResolveFifoCandidate_SameMillisecondKeepsSendOrder` (new,
   deterministic): two sends of one group share a millisecond and the later
-  one has the MessageId that sorts first. The later one must be skipped,
-  the earlier one, a message of another group in the same millisecond, and
-  a send alone in its millisecond must acquire. Removing the check fails
-  it.
+  one has the MessageId that sorts first. The later candidate must resolve
+  the earlier record and its keys; the earlier candidate, another group
+  and an isolated send must retain their own identities.
 - `TestSQSServer_FifoBatchDeliversInSendOrder` (new): ten entries of one
   group in one `SendMessageBatch` are received and deleted one by one in
   send order. It failed 14/30 runs before the fix.
@@ -114,14 +112,14 @@ the send timestamp and is out of scope here.
 
 ## Receive Progress Follow-Up
 
-Skipping a same-millisecond successor is insufficient when the earliest send
+The initially implemented skip is insufficient when the earliest send
 sorts beyond the first receive page. The outer receive checks its 100 ms work
 budget between pages and restarts at the beginning on every call. Repeating
 expensive tie scans can therefore return empty forever without reaching the
 deliverable head, even when no new message arrives. Retaining send order must
 not turn a live queue into this fixed point.
 
-Replace skip-and-restart with snapshot-scoped head resolution:
+The correction replaces skip-and-restart with snapshot-scoped head resolution:
 
 1. Keep the original candidate's missing-record, retention and redrive handling
    before group-lock processing. Standard queues remain unchanged.
@@ -173,3 +171,43 @@ Regression gates:
 The attempted-group optimization depends on one read snapshot and partition;
 it is not reusable after a dispatch retry obtains a new read timestamp. Its
 state is local to the receive attempt and cannot authorize a rotation itself.
+
+### Error precedence and caller audit
+
+Error injection also reproduced an empty-success conversion when an unknown
+outcome wrapped a write conflict, or a route fence wrapped a transaction lock.
+`isIgnorableSQSReceiveRace` now excludes unknown outcomes and route fences
+before testing expected races. Its three consumers are receive rotation,
+inline retention expiry and receive-triggered DLQ transfer. Their callers were
+audited through standard/FIFO delivery and original/selected-head cleanup.
+The shared DynamoDB predicate and background reaper were not changed.
+
+### Local validation and five review passes
+
+The original actual-partition regression failed on legacy and partitioned
+queues with three consecutive empty receives, one outer page and two tie scans
+per attempt; head-first controls committed the correct rotation. The correction
+passes the expanded 4/33-message, legacy/partitioned, first/last-head cases,
+including the minimum beyond multiple tie pages (ten race repetitions, 10.574s).
+Separate tests verify owned head reachability, visibility-zero suppression,
+fresh retry after contention, persisted expiry/DLQ cleanup and joined-error
+propagation without successor mutation. The final SQS-related race suite passed
+in 17.197s; unfiltered repository lint reported zero issues.
+
+The local MVCC-only head-discovery benchmark (Apple M1 Max, Darwin/arm64) measured
+2.68/26.7/255 microseconds and 4,823/41,932/326,451 bytes per operation for
+4/33/256 messages. This is neither a Raft/network throughput result nor a hard
+latency guarantee. Only retained selected keys are cloned.
+
+1. Data loss: selected data, indices, lock and receipt stay bound; expiry/DLQ
+   cleanup is one existing OCC operation. Unknown/fenced outcomes remain errors.
+2. Concurrency/distributed failures: snapshot-local suppression is discarded on
+   a fresh receive. Foreign-lock skips do not hide the reachable owned head;
+   expected contention permits a short receive without claiming another commit.
+3. Performance: group attempts are shared across outer pages; bucket occupancy
+   still determines scan cost. No process-global cursor or mutable-record cache.
+4. Consistency: whole-bucket minimum, stale/missing record filtering, partition,
+   generation, selected-body identity and existing snapshot/OCC semantics hold.
+5. Coverage: actual runtime-red precedes the fix; direct, persisted-state and
+   error-injection checks pass. Exact latest-push review and all CI remain merge
+   requirements, not inferred from the source PR or local focused tests.
