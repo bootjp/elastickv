@@ -50,8 +50,7 @@ func TestVerifyLeaderEngine_BoundsBlockingReadIndex(t *testing.T) {
 	go func() {
 		result <- verifyLeaderEngineCtx(ctx, blockingLeaderView{})
 	}()
-	var err error
-	err = testutil.Recv(t, result, 3*verifyLeaderTimeout, "verifyLeaderEngineCtx did not bound a deadline-less context")
+	var err error = testutil.Recv(t, result, 3*verifyLeaderTimeout, "verifyLeaderEngineCtx did not bound a deadline-less context")
 	elapsed := time.Since(start)
 
 	if err == nil {
