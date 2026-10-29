@@ -162,10 +162,12 @@ take the one-phase path: `AllocateOnePhase` picks `commit_ts`, and
 write or read key has a version newer than `start_ts`; otherwise
 `RejectOnePhase`.  Multi-shard transactions settle `commit_ts` first,
 then `Prepare` validates read and write keys and locks the write keys,
-and `Commit` applies with no fence and no revalidation.  `RawWrite`
-is a non-transactional write that raises the watermark (refused on a
-locked key); `Prepare` raises the watermark to `start_ts`, as the lock
-rows' apply does.  The lock
+and `Commit` applies with no fence and no revalidation.  A raw write is
+allocated (`AllocateRaw`) and applied later in any order (`ApplyRaw` /
+`RejectRaw`; refused on a locked key or below a newer version);
+`CommitFence` (`--commitTSFence`) fences raw applies and PREPAREs
+against the group watermark.  `Prepare` raises the watermark to
+`start_ts`, as the lock rows' apply does.  The lock
 resolver is abstracted into the atomic lock drain inside
 `Commit`/`Abort`; timestamps come from one global counter (unique,
 leader-issued).  `EnableSafety` gates the commit-ts > start-ts
@@ -195,7 +197,9 @@ Invariants asserted:
 | Config | Checks | Expected |
 |---|---|---|
 | `MCOCC.cfg` | full model; OCC-1, OCC-2, OCC-4, OCC-5 | PASS |
-| `MCOCC_onephase.cfg` | single-shard path only, one Raft group; every invariant incl. OCC-3, OCC-8 | PASS |
+| `MCOCC_onephase.cfg` | single-shard path only, one Raft group, `CommitFence = TRUE`; every invariant incl. OCC-3, OCC-8 | PASS |
+| `MCOCC_raw_gap.cfg` | the same with `CommitFence = FALSE` (known gap: raw writes unfenced in the default build) | FAIL on `OCC3_ReadSnapshotStability` (two raw entries apply out of timestamp order) |
+| `MCOCC_g0.cfg` | full model, `CommitFence = TRUE` (raw and PREPARE fenced); OCC-1..5 | PASS |
 | `MCOCC_gap.cfg` | `EnableSafety = FALSE` | FAIL on `OCC1_CommitTsAboveStart` (depth ≈ 5) |
 | `MCOCC_g0_gap.cfg` | full model (known gap G0) | FAIL on `OCC3_ReadSnapshotStability` (depth 9: 2PC allocates, a raw write raises the watermark, a reader reads, the 2PC commits below its snapshot) |
 | `MCOCC_g1_gap.cfg` | full model (known gap G1) | FAIL on `OCC8_NoWriteSkew` (a one-phase commit applies between the other txn's PREPARE and COMMIT) |

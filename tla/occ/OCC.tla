@@ -70,12 +70,14 @@ CONSTANTS
     Keys,           \* finite set of keys exercised in the model
     TxnIds,         \* finite set of transaction identifiers
     MaxTs,          \* upper bound on the abstract HLC counter (state-space)
-    MaxOps,         \* upper bound on Write + RawWrite actions (state-space)
+    MaxOps,         \* upper bound on WriteIntent + AllocateRaw actions (state-space)
     EnableSafety,   \* TRUE: commit_ts > start_ts discipline; FALSE: gap config
     EnableTwoPhase, \* TRUE: multi-shard 2PC path enabled; FALSE: one-phase only
     MultiGroup,     \* TRUE: one Raft group per key; FALSE: a single group
-    ReadAdvance     \* TRUE: --readWatermarkAdvance; a snapshot read first
+    ReadAdvance,    \* TRUE: --readWatermarkAdvance; a snapshot read first
                     \* raises the read key's group watermark to start_ts
+    CommitFence     \* TRUE: --commitTSFence; raw applies and PREPAREs are
+                    \* fenced against the group watermark
 
 \* Transaction lifecycle states.
 \*   Proposed  — one-phase entry with an allocated commit_ts, not applied yet
@@ -99,10 +101,12 @@ VARIABLES
     readObs,          \* TxnIds -> [Keys -> Nat]  (commit_ts observed; 0 = no version)
     lockMap,          \* Keys -> [owner: TxnIds \cup {"none"}, lockTs: Nat]
     versions,         \* Keys -> SUBSET [commitTs: Nat, owner: TxnIds \cup {"raw"}]
-    opCount           \* state-space bound
+    opCount,          \* state-space bound
+    rawPending        \* SUBSET [key: Keys, ts: Nat]: raw entries allocated
+                      \* but not yet applied
 
 vars == <<tsCounter, watermark, txnState, snapshotRead, startTs, commitTs,
-          writeSet, readSet, readObs, lockMap, versions, opCount>>
+          writeSet, readSet, readObs, lockMap, versions, opCount, rawPending>>
 
 \* === HELPERS ===
 HasLock(k)        == lockMap[k] # NoLock
@@ -185,6 +189,7 @@ Init ==
     /\ lockMap      = [k \in Keys   |-> NoLock]
     /\ versions     = [k \in Keys   |-> {}]
     /\ opCount      = 0
+    /\ rawPending   = {}
 
 \* === ACTIONS ===
 
@@ -204,7 +209,7 @@ BeginTxn(t) ==
     /\ snapshotRead' = [snapshotRead EXCEPT ![t] = TRUE]
     /\ startTs'      = [startTs      EXCEPT ![t] = IF GlobalWatermark = 0 THEN MaxTs ELSE GlobalWatermark]
     /\ UNCHANGED <<tsCounter, watermark, commitTs, writeSet, readSet,
-                   readObs, lockMap, versions, opCount>>
+                   readObs, lockMap, versions, opCount, rawPending>>
 
 (***************************************************************************)
 (* BeginWriteOnly: a coordinator-stamped transaction (no caller start_ts) *)
@@ -220,7 +225,7 @@ BeginWriteOnly(t) ==
     /\ snapshotRead' = [snapshotRead EXCEPT ![t] = FALSE]
     /\ startTs'      = [startTs      EXCEPT ![t] = tsCounter + 1]
     /\ UNCHANGED <<watermark, commitTs, writeSet, readSet, readObs,
-                   lockMap, versions, opCount>>
+                   lockMap, versions, opCount, rawPending>>
 
 (***************************************************************************)
 (* ReadKey: snapshot read on key k at startTs[t].  Blocked while a lock   *)
@@ -248,7 +253,7 @@ ReadKey(t, k) ==
     /\ readSet' = [readSet EXCEPT ![t] = @ \cup {k}]
     /\ readObs' = [readObs EXCEPT ![t] = [@ EXCEPT ![k] = LatestVisible(k, startTs[t])]]
     /\ UNCHANGED <<tsCounter, txnState, snapshotRead, startTs,
-                   commitTs, writeSet, lockMap, versions, opCount>>
+                   commitTs, writeSet, lockMap, versions, opCount, rawPending>>
 
 (***************************************************************************)
 (* WriteIntent: buffer a write to k locally in the txn's writeSet.        *)
@@ -260,26 +265,49 @@ WriteIntent(t, k) ==
     /\ writeSet' = [writeSet EXCEPT ![t] = @ \cup {k}]
     /\ opCount'  = opCount + 1
     /\ UNCHANGED <<tsCounter, watermark, txnState, snapshotRead, startTs,
-                   commitTs, readSet, readObs, lockMap, versions>>
+                   commitTs, readSet, readObs, lockMap, versions, rawPending>>
 
 (***************************************************************************)
-(* RawWrite(k): a non-transactional write (handleRawRequest).  It is     *)
-(* rejected while a txn lock sits on k (validateRawMutationForApply →     *)
-(* assertNoConflictingTxnLock).  Allocation                                *)
-(* and apply are one step here, so the raw path's own reordering window   *)
-(* is not modelled; its role is to raise the watermark.                    *)
+(* AllocateRaw / ApplyRaw / RejectRaw: a non-transactional write          *)
+(* (handleRawRequest).  The coordinator allocates the timestamp and       *)
+(* proposes the entry; entries apply in any order.  The apply rejects the *)
+(* write while a txn lock sits on k (assertNoConflictingTxnLock), when k  *)
+(* already has a newer version (checkApplyConflicts at start = commit),   *)
+(* and, with CommitFence, when the timestamp is at or below the group     *)
+(* watermark (ApplyMutationsRaftAtFenced).  A rejected raw write is       *)
+(* retried by the coordinator with a fresh timestamp, which is a new      *)
+(* AllocateRaw here.                                                       *)
 (***************************************************************************)
-RawWrite(k) ==
+AllocateRaw(k) ==
     /\ opCount < MaxOps
-    /\ ~HasLock(k)
     /\ tsCounter < MaxTs
-    /\ LET ct == tsCounter + 1 IN
-        /\ tsCounter' = ct
-        /\ versions'  = [versions EXCEPT ![k] = @ \cup {[commitTs |-> ct, owner |-> "raw"]}]
-        /\ watermark' = RaiseWatermark({k}, ct)
-    /\ opCount' = opCount + 1
-    /\ UNCHANGED <<txnState, snapshotRead, startTs, commitTs, writeSet,
-                   readSet, readObs, lockMap>>
+    /\ tsCounter'  = tsCounter + 1
+    /\ rawPending' = rawPending \cup {[key |-> k, ts |-> tsCounter + 1]}
+    /\ opCount'    = opCount + 1
+    /\ UNCHANGED <<watermark, txnState, snapshotRead, startTs, commitTs,
+                   writeSet, readSet, readObs, lockMap, versions>>
+
+RawApplies(e) ==
+    /\ ~HasLock(e.key)
+    /\ \A v \in versions[e.key] : v.commitTs <= e.ts
+    /\ CommitFence => e.ts > watermark[GroupOf(e.key)]
+
+ApplyRaw(e) ==
+    /\ e \in rawPending
+    /\ RawApplies(e)
+    /\ rawPending' = rawPending \ {e}
+    /\ versions'   = [versions EXCEPT ![e.key] = @ \cup {[commitTs |-> e.ts, owner |-> "raw"]}]
+    /\ watermark'  = RaiseWatermark({e.key}, e.ts)
+    /\ UNCHANGED <<tsCounter, txnState, snapshotRead, startTs, commitTs,
+                   writeSet, readSet, readObs, lockMap, opCount>>
+
+RejectRaw(e) ==
+    /\ e \in rawPending
+    /\ ~RawApplies(e)
+    /\ rawPending' = rawPending \ {e}
+    /\ UNCHANGED <<tsCounter, watermark, txnState, snapshotRead, startTs,
+                   commitTs, writeSet, readSet, readObs, lockMap, versions,
+                   opCount>>
 
 \* --- One-phase path ---------------------------------------------------
 
@@ -297,7 +325,7 @@ AllocateOnePhase(t) ==
     /\ commitTs'  = [commitTs EXCEPT ![t] = FreshCommitTs]
     /\ txnState'  = [txnState EXCEPT ![t] = "Proposed"]
     /\ UNCHANGED <<watermark, snapshotRead, startTs, writeSet, readSet,
-                   readObs, lockMap, versions, opCount>>
+                   readObs, lockMap, versions, opCount, rawPending>>
 
 \* Every check the one-phase apply performs.
 OnePhaseApplies(t) ==
@@ -319,14 +347,14 @@ ApplyOnePhase(t) ==
     /\ versions'  = AddVersions(t, commitTs[t])
     /\ watermark' = RaiseWatermark(writeSet[t], commitTs[t])
     /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs, writeSet,
-                   readSet, readObs, lockMap, opCount>>
+                   readSet, readObs, lockMap, opCount, rawPending>>
 
 RejectOnePhase(t) ==
     /\ txnState[t] = "Proposed"
     /\ ~OnePhaseApplies(t)
     /\ txnState' = [txnState EXCEPT ![t] = "Aborted"]
     /\ UNCHANGED <<tsCounter, watermark, snapshotRead, startTs, commitTs,
-                   writeSet, readSet, readObs, lockMap, versions, opCount>>
+                   writeSet, readSet, readObs, lockMap, versions, opCount, rawPending>>
 
 \* --- Two-phase path ---------------------------------------------------
 
@@ -344,7 +372,7 @@ AllocateTwoPhase(t) ==
     /\ commitTs'  = [commitTs EXCEPT ![t] = FreshCommitTs]
     /\ txnState'  = [txnState EXCEPT ![t] = "Allocated"]
     /\ UNCHANGED <<watermark, snapshotRead, startTs, writeSet, readSet,
-                   readObs, lockMap, versions, opCount>>
+                   readObs, lockMap, versions, opCount, rawPending>>
 
 (***************************************************************************)
 (* Prepare: handlePrepareRequest validates the write and read keys        *)
@@ -353,8 +381,16 @@ AllocateTwoPhase(t) ==
 (* are applied at start_ts through ApplyMutationsRaftAt, which raises the *)
 (* group's LastCommitTS to at least start_ts.                              *)
 (***************************************************************************)
+\* With CommitFence, handlePrepareRequest rejects a PREPARE whose settled
+\* commit_ts is at or below the watermark of a group it writes to; the
+\* coordinator then aborts the transaction (CancelTxn here: nothing of a
+\* rejected PREPARE persists).
+PrepareFenceOk(t) ==
+    CommitFence => \A k \in writeSet[t] : commitTs[t] > watermark[GroupOf(k)]
+
 Prepare(t) ==
     /\ txnState[t] = "Allocated"
+    /\ PrepareFenceOk(t)
     /\ NoForeignLock(t)
     /\ NoNewerVersion(t, writeSet[t])
     /\ NoNewerVersion(t, readSet[t])
@@ -365,7 +401,7 @@ Prepare(t) ==
                     ELSE lockMap[k]]
     /\ watermark' = RaiseWatermark(writeSet[t], startTs[t])
     /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs,
-                   writeSet, readSet, readObs, versions, opCount>>
+                   writeSet, readSet, readObs, versions, opCount, rawPending>>
 
 (***************************************************************************)
 (* Commit: handleCommitRequest promotes every lock owned by t into a      *)
@@ -380,7 +416,7 @@ Commit(t) ==
     /\ lockMap'   = ReleaseLocks(t)
     /\ watermark' = RaiseWatermark(writeSet[t], commitTs[t])
     /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs, writeSet,
-                   readSet, readObs, opCount>>
+                   readSet, readObs, opCount, rawPending>>
 
 (***************************************************************************)
 (* Abort: three ways a transaction ends without committing.               *)
@@ -403,7 +439,7 @@ CancelTxn(t) ==
     /\ txnState[t] \in {"Active", "Allocated"}
     /\ txnState' = [txnState EXCEPT ![t] = "Aborted"]
     /\ UNCHANGED <<tsCounter, watermark, snapshotRead, startTs, commitTs,
-                   writeSet, readSet, readObs, lockMap, versions, opCount>>
+                   writeSet, readSet, readObs, lockMap, versions, opCount, rawPending>>
 
 PersistRollback(t, abortTs) ==
     /\ txnState' = [txnState EXCEPT ![t] = "Aborted"]
@@ -416,13 +452,13 @@ AbortPrepared(t) ==
     /\ tsCounter' = tsCounter + 1
     /\ PersistRollback(t, tsCounter + 1)
     /\ UNCHANGED <<snapshotRead, startTs, commitTs, writeSet, readSet,
-                   readObs, versions, opCount>>
+                   readObs, versions, opCount, rawPending>>
 
 ResolverAbort(t) ==
     /\ txnState[t] = "Prepared"
     /\ PersistRollback(t, startTs[t] + 1)
     /\ UNCHANGED <<tsCounter, snapshotRead, startTs, commitTs, writeSet,
-                   readSet, readObs, versions, opCount>>
+                   readSet, readObs, versions, opCount, rawPending>>
 
 Abort(t) == CancelTxn(t) \/ AbortPrepared(t) \/ ResolverAbort(t)
 
@@ -444,7 +480,9 @@ Next ==
     \/ \E t \in TxnIds : BeginWriteOnly(t)
     \/ \E t \in TxnIds, k \in Keys : ReadKey(t, k)
     \/ \E t \in TxnIds, k \in Keys : WriteIntent(t, k)
-    \/ \E k \in Keys : RawWrite(k)
+    \/ \E k \in Keys : AllocateRaw(k)
+    \/ \E e \in rawPending : ApplyRaw(e)
+    \/ \E e \in rawPending : RejectRaw(e)
     \/ \E t \in TxnIds : AllocateOnePhase(t)
     \/ \E t \in TxnIds : ApplyOnePhase(t)
     \/ \E t \in TxnIds : RejectOnePhase(t)
@@ -492,6 +530,7 @@ TypeOK ==
     /\ readSet      \in [TxnIds -> SUBSET Keys]
     /\ readObs      \in [TxnIds -> [Keys -> 0..MaxTs]]
     /\ opCount      \in 0..MaxOps
+    /\ rawPending   \subseteq [key: Keys, ts: 1..MaxTs]
     /\ \A k \in Keys :
         /\ lockMap[k].owner  \in TxnIds \cup {"none"}
         /\ lockMap[k].lockTs \in 0..MaxTs
