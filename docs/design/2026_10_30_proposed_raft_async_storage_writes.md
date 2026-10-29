@@ -256,3 +256,20 @@ end-to-end ingress/unstable/outbound accounting, control reserves, and pumping
 shutdown before enabling AsyncStorageWrites. The runtime, encrypted recovery,
 native quorum acceptance, full race/Jepsen and final-push review/CI gates above
 remain open. Per-worker accounting alone does not satisfy the whole-engine bound.
+
+### Nil-panic compatibility follow-up
+
+A separate runtime-red check under `GODEBUG=panicnil=1` exposed a false success:
+`recover()` returned nil for `panic(nil)`, making a value-only recovery test
+indistinguishable from normal completion. The worker now records whether the
+operation actually returned, independently of the recovered value. A genuine
+nil/nil return remains successful; a nil panic is a fatal worker receipt.
+The focused primitive race suite, including the compatibility case, passed
+twenty repetitions (6.804s), and unfiltered lint reported zero issues.
+
+Five follow-up passes: data-loss review confirms no panic-success receipt;
+concurrency review keeps the environment override in a nonparallel test and
+retains existing FIFO failure fencing; performance adds only a stack-local return
+flag; consistency leaves tokens, durability and timestamp behavior unchanged;
+coverage includes both nil-success and nil-panic controls plus existing queued
+error/panic cases. This does not enable the engine pipeline or close its gates.

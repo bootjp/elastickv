@@ -134,11 +134,16 @@ func (w *storageWorker) run() {
 }
 
 func runStorageWork(run func() (any, error)) (value any, err error) {
+	// With panicnil=1, a recovered panic value can itself be nil.
+	returned := false
 	defer func() {
-		if recovered := recover(); recovered != nil {
+		if !returned {
+			recovered := recover()
 			value = nil
 			err = errors.Wrapf(errStorageWorkerPanic, "%v\n%s", recovered, debug.Stack())
 		}
 	}()
-	return run()
+	value, err = run()
+	returned = true
+	return value, err
 }
