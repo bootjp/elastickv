@@ -217,7 +217,7 @@ implementation, per `CLAUDE.md`.
 ### 6.1 This doc and the audit doc
 
 `2026_09_26_proposed_positioning_and_roadmap.md` (this) and
-`2026_09_26_proposed_serializable_isolation_audit.md`. README gets a short
+`2026_09_26_partial_serializable_isolation_audit.md`. README gets a short
 "Who is this for" section and the two-tier scope once both docs land; the
 consistency claims go into README only after the audit's A0 to A2 fixes,
 the G11 fix (the server-side outcome-unknown error and its mapping in
@@ -381,7 +381,7 @@ more. Can proceed in parallel with 6.2 to 6.4.
 
 | Track | Docs |
 |---|---|
-| Active, correctness | this doc; `2026_09_26_proposed_serializable_isolation_audit.md`; `2026_08_29_proposed_tso_batch_slot_claims.md`; `2026_09_02_partial_prephase_d_resolution_evidence.md`; the security and benchmark docs to be written |
+| Active, correctness | this doc; `2026_09_26_partial_serializable_isolation_audit.md`; `2026_08_29_proposed_tso_batch_slot_claims.md`; `2026_09_02_partial_prephase_d_resolution_evidence.md`; the security and benchmark docs to be written |
 | Active, features | `2026_07_19_partial_physical_snapshot_object_offload.md` (M3); `2026_04_25_partial_s3_raft_blob_offload.md` (M3, M4); `2026_06_11_partial_hotspot_split_milestone2_migration.md` with parent `2026_02_18_partial_hotspot_shard_split.md` |
 | Future track (horizontal scale) | `2026_06_23_proposed_scaling_roadmap.md` (its 06/12 predecessor is already marked superseded). Referenced from README's future goals; re-evaluated when the active list is empty. |
 | Deferred | Remaining Stage 9 of `2026_04_29_partial_data_at_rest_encryption.md` (9C+: rotation budget, rewrap / retire / rewrite, `last_proposed_index_per_raft_dek`, encrypted Jepsen). Stage 5E (the capability fan-out helper) is shipped and wired (`buildEncryptionCapabilityFanout` in `main.go`) although that doc's header still says deferred; the header is corrected in the A5 documentation pass. |

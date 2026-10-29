@@ -17,7 +17,7 @@ import (
 // applying group's own watermark. Without the advance, a write allocated
 // below the snapshot and applied late on a lagging group passes that
 // group's fence and lands below a snapshot that was already read: G0 across
-// groups (docs/design/2026_09_26_proposed_serializable_isolation_audit.md,
+// groups (docs/design/2026_09_26_partial_serializable_isolation_audit.md,
 // "Multi-group deployments"). Once the advance applies, the fence rejects
 // every later one-phase entry at or below the snapshot on that group, so a
 // read at the snapshot stays stable.

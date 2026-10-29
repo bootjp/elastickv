@@ -1,6 +1,6 @@
 # Serializable isolation audit
 
-Status: Proposed
+Status: Partial (read watermark advance, opt-in; see "Partial implementation")
 Author: bootjp
 Date: 2026-09-26
 Related: `2026_09_26_proposed_positioning_and_roadmap.md` §5 and §6.3 (the
@@ -690,8 +690,12 @@ per-group HLC ceilings (the raise lands on the process-wide ceiling, the
 shape `main` already has for every observed commit timestamp); a
 cluster-verified capability gate in place of the operator flag;
 node authentication for the forwarded advance when no admin token is
-configured, and a server-verifiable snapshot voucher; and the read-side
-benchmark.
+configured, and a server-verifiable snapshot voucher; the per-group
+`watermarkAdvancer` that keeps one in-flight advance per lagging group
+(concurrent reads at the same snapshot each propose today; the entries are
+idempotent but cost log entries and latency); skipping the repeated no-op
+forward a follower sends on every page of a long scan while its local
+apply still lags `ts`; and the read-side benchmark.
 
 Open after this branch:
 

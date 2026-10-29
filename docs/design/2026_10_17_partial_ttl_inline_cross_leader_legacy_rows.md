@@ -7,7 +7,7 @@ Date: 2026-10-17
 Related:
 - [2026_04_17_implemented_ttl_inline_value.md](2026_04_17_implemented_ttl_inline_value.md): Phase 2 (background migration) and Phase 3 (removing the legacy `!redis|ttl|` read fallback).
 - [2026_04_16_implemented_centralized_tso.md](2026_04_16_implemented_centralized_tso.md) §7.4: Phase D.
-- [2026_09_26_proposed_serializable_isolation_audit.md](2026_09_26_proposed_serializable_isolation_audit.md): gaps G0 (across groups) and G10, fixes A0 and A0b.
+- [2026_09_26_partial_serializable_isolation_audit.md](2026_09_26_partial_serializable_isolation_audit.md): gaps G0 (across groups) and G10, fixes A0 and A0b.
 - bootjp/elastickv#1278 (merged to main as `e569513`): the per-group migration this proposal builds on, and the review threads that deferred this case to a separate design. Its `ScanGroupOwnedAt`, `ownerHoldsNoVersionAt` and plan rotation are on main, as is the `SyncOnce` ordering §3 C changes.
 
 ## 1. Problem

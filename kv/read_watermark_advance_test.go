@@ -95,7 +95,7 @@ func TestShardStoreSnapshotReadAdvancesLaggingGroupWatermark(t *testing.T) {
 	require.NoError(t, f.onePhase(t, 2, s, 40, "b-k", "old+1", "b-k"))
 }
 
-// The same advance covers range reads.
+// The same advance covers a single-route range read.
 func TestShardStoreSnapshotScanAdvancesLaggingGroupWatermark(t *testing.T) {
 	t.Parallel()
 	ctx := context.Background()
@@ -110,6 +110,25 @@ func TestShardStoreSnapshotScanAdvancesLaggingGroupWatermark(t *testing.T) {
 	require.Len(t, kvs, 1)
 	require.GreaterOrEqual(t, f.stores[2].LastCommitTS(), s)
 	require.ErrorIs(t, f.onePhase(t, 2, 10, 20, "b-k", "new"), store.ErrWriteConflict)
+}
+
+// A scan from "a" visits group 1's route first and group 2's second; the
+// second route's group must advance too. A fresh fixture, because a prior
+// "b" scan would already have advanced group 2.
+func TestShardStoreSnapshotMultiRouteScanAdvancesLaggingGroupWatermark(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newTwoGroupReadFixture(t)
+
+	require.NoError(t, f.onePhase(t, 2, 5, 10, "b-k", "old"))
+	require.NoError(t, f.onePhase(t, 1, 10, 30, "a-k", "x"))
+
+	s := f.shards.LastCommitTS()
+	kvs, err := f.shards.ScanAt(ctx, []byte("a"), nil, 10, s)
+	require.NoError(t, err)
+	require.Len(t, kvs, 2)
+	require.GreaterOrEqual(t, f.stores[2].LastCommitTS(), s,
+		"the second route's group watermark must advance to s")
 }
 
 // A read timestamp above every watermark this node has applied did not
@@ -179,6 +198,9 @@ func TestApplyWatermarkAdvance(t *testing.T) {
 	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts)))
 	require.Equal(t, ts, st.LastCommitTS())
 	require.Greater(t, clock.Next(), ts)
+	exported, err := st.ExportVersions(context.Background(), store.ExportVersionsOptions{MaxVersions: 10})
+	require.NoError(t, err)
+	require.Empty(t, exported.Versions, "the advance must not write a version")
 
 	// Replay and a lower advance leave the watermark where it is.
 	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts)))
