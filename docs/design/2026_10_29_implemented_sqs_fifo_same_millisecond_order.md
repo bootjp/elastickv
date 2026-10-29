@@ -1,6 +1,6 @@
 # SQS FIFO: deliver same-millisecond messages in send order
 
-Status: proposed
+Status: implemented (milestone 1)
 
 ## Problem
 
