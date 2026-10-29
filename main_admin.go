@@ -269,6 +269,16 @@ func (b *sqsQueuesBridge) AdminDescribeQueue(ctx context.Context, name string) (
 	return convertAdminQueueSummary(summary), true, nil
 }
 
+func (b *sqsQueuesBridge) AdminCreateQueue(ctx context.Context, principal admin.AuthPrincipal, name string, attrs map[string]string) error {
+	if err := b.server.AdminCreateQueue(ctx, convertAdminPrincipal(principal), name, attrs); err != nil {
+		if errors.Is(err, adapter.ErrAdminSQSValidation) {
+			return errors.Wrap(admin.ErrQueuesValidation, err.Error())
+		}
+		return translateAdminQueuesError(err)
+	}
+	return nil
+}
+
 func (b *sqsQueuesBridge) AdminDeleteQueue(ctx context.Context, principal admin.AuthPrincipal, name string) error {
 	if err := b.server.AdminDeleteQueue(ctx, convertAdminPrincipal(principal), name); err != nil {
 		return translateAdminQueuesError(err)
