@@ -1,6 +1,8 @@
 # Resolved review findings
 
-Status: Proposed
+Status: Implemented
+
+Shipped in #1340. No implementation work follows.
 Author: bootjp
 Date: 2026-10-26
 

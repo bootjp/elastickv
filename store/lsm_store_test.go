@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -46,17 +47,9 @@ func countPebbleVersions(t *testing.T, st MVCCStore) int {
 func requireChannelBlocked[T any](t *testing.T, ch <-chan T, started <-chan struct{}) {
 	t.Helper()
 
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("goroutine did not start in time")
-	}
+	testutil.Recv(t, started, time.Second, "goroutine did not start in time")
 
-	select {
-	case <-ch:
-		t.Fatal("operation completed while maintenance lock was held")
-	case <-time.After(50 * time.Millisecond):
-	}
+	testutil.NoRecv(t, ch, 50*time.Millisecond, "operation completed while maintenance lock was held")
 }
 
 type cancelAfterErrCallsContext struct {

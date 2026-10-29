@@ -141,7 +141,7 @@ func TestIsListMetaMigrationDeltaRecognizesLegacyRowsByValue(t *testing.T) {
 
 	userKey := []byte("list")
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
-	legacyKey := legacyListMetaDeltaKey(userKey, 2)
+	legacyKey := store.LegacyListMetaDeltaKey(userKey, 2, 0)
 
 	require.True(t, isListMetaMigrationDelta(&store.KVPair{Key: legacyKey, Value: delta}))
 	require.True(t, isListMetaMigrationDelta(&store.KVPair{
@@ -1343,7 +1343,7 @@ func TestDeltaCompactor_DoesNotInheritStaleTTLBeforeDeltaOnlyRecreate(t *testing
 			seed: func(t *testing.T, st store.MVCCStore, key []byte) {
 				t.Helper()
 				require.NoError(t, st.PutAt(ctx, store.ListItemKey(key, 0), []byte("a"), 3, 0))
-				deltaKey := legacyListMetaDeltaKey(key, 3)
+				deltaKey := store.LegacyListMetaDeltaKey(key, 3, 0)
 				require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
 			},
 			build: func(t *testing.T, c *DeltaCompactor, st store.MVCCStore, key []byte, readTS uint64) []*kv.Elem[kv.OP] {
@@ -1724,8 +1724,8 @@ func TestDeltaCompactor_LegacyListDeltaFoldedIntoBaseMeta(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(userKey), metaBytes, 1, 0))
 
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 2})
-	d1Key := legacyListMetaDeltaKey(userKey, 10)
-	d2Key := legacyListMetaDeltaKey(userKey, 11)
+	d1Key := store.LegacyListMetaDeltaKey(userKey, 10, 0)
+	d2Key := store.LegacyListMetaDeltaKey(userKey, 11, 0)
 	require.NoError(t, st.PutAt(ctx, d1Key, delta, 10, 0))
 	require.NoError(t, st.PutAt(ctx, d2Key, delta, 11, 0))
 
@@ -1963,7 +1963,7 @@ func TestDeltaCompactor_LegacyListCursorAdvancesPastFilteredTailAfterBacktrack(t
 	ctx := context.Background()
 	userKey := []byte("compactor-tail")
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
-	acceptedKey := legacyListMetaDeltaKey(userKey, 1)
+	acceptedKey := store.LegacyListMetaDeltaKey(userKey, 1, 0)
 	require.NoError(t, st.PutAt(ctx, acceptedKey, delta, 1, 0))
 
 	meta, err := store.MarshalListMeta(store.ListMeta{Head: 4, Tail: 6, Len: 2})
@@ -1998,7 +1998,7 @@ func TestDeltaCompactor_LegacyListCursorAdvancesPastRejectedPrefixBeforeAccepted
 		require.NoError(t, st.PutAt(ctx, store.ListMetaKey(collidingUserKey), meta, i, 0))
 	}
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
-	acceptedKey := legacyListMetaDeltaKey(userKey, deltaCompactorTickScanLimit)
+	acceptedKey := store.LegacyListMetaDeltaKey(userKey, deltaCompactorTickScanLimit, 0)
 	require.NoError(t, st.PutAt(ctx, acceptedKey, delta, deltaCompactorTickScanLimit, 0))
 
 	h := c.legacyListHandler()
@@ -2018,8 +2018,8 @@ func TestDeltaCompactor_CursorBacktracksBeforeWholeAcceptedTail(t *testing.T) {
 
 	userKey := []byte("compactor-accepted-tail")
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
-	d1 := legacyListMetaDeltaKey(userKey, 1)
-	d2 := legacyListMetaDeltaKey(userKey, 2)
+	d1 := store.LegacyListMetaDeltaKey(userKey, 1, 0)
+	d2 := store.LegacyListMetaDeltaKey(userKey, 2, 0)
 	rawKVs := []*store.KVPair{
 		{Key: d1, Value: delta},
 		{Key: d2, Value: delta},
@@ -2036,8 +2036,8 @@ func TestDeltaCompactor_ListDeltaDeletesPreserveScanRouteGroup(t *testing.T) {
 	ctx := context.Background()
 	userKey := []byte("compactor-route-group")
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
-	d1 := legacyListMetaDeltaKey(userKey, 1)
-	d2 := legacyListMetaDeltaKey(userKey, 2)
+	d1 := store.LegacyListMetaDeltaKey(userKey, 1, 0)
+	d2 := store.LegacyListMetaDeltaKey(userKey, 2, 0)
 
 	elems, err := c.buildListCompactElems(ctx, userKey, []*store.KVPair{
 		{Key: d1, Value: delta, RouteGroupID: 7},

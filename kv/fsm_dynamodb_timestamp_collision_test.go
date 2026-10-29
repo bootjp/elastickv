@@ -23,7 +23,7 @@ func TestDynamoAppendDistinctRaftEntryCannotAcknowledgeTimestampCollision(t *tes
 				require.NoError(t, keys.Set(1, bytes.Repeat([]byte{0x37}, encryption.KeySize)))
 				cipher, err := encryption.NewCipher(keys)
 				require.NoError(t, err)
-				opts = append(opts, store.WithEncryption(cipher, store.NewCounterNonceFactory(1, 1), func() (uint32, bool) { return 1, true }))
+				opts = append(opts, store.WithEncryption(cipher, encryption.NewDeterministicNonceFactory(1, 1), func() (uint32, bool) { return 1, true }))
 			}
 			st, err := store.NewPebbleStore(filepath.Join(t.TempDir(), "fsm.db"), opts...)
 			require.NoError(t, err)

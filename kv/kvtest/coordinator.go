@@ -73,6 +73,9 @@ type LocalOptions struct {
 	// AdvanceCommitTS raises caller-supplied timestamps to at least store+1
 	// and, for transactions, StartTS+1 (the filesystem fake's policy).
 	AdvanceCommitTS bool
+	// Clock, when set, is the HLC the coordinator issues and observes
+	// timestamps on, so a wrapper can share it with its own Clock().
+	Clock *kv.HLC
 }
 
 func (o LocalOptions) valid() bool {
@@ -87,7 +90,11 @@ type LocalCoordinator struct {
 }
 
 func NewLocalCoordinator(st store.MVCCStore, options LocalOptions) *LocalCoordinator {
-	return &LocalCoordinator{st: st, options: options}
+	c := &LocalCoordinator{st: st, options: options}
+	if options.Clock != nil {
+		c.once.Do(func() { c.clock = options.Clock })
+	}
+	return c
 }
 
 func (c *LocalCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {

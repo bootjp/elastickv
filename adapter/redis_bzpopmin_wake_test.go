@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -388,16 +389,12 @@ func TestRedis_BZPopMinWakesOnZAdd(t *testing.T) {
 	).Result()
 	require.NoError(t, err)
 
-	select {
-	case res := <-resultCh:
-		require.NoError(t, res.err)
-		require.NotNil(t, res.zwk)
-		require.Equal(t, "zset-wake", res.zwk.Key)
-		require.Equal(t, "first", res.zwk.Member)
-		require.InDelta(t, 1.0, res.zwk.Score, 1e-9)
-	case <-time.After(6 * time.Second):
-		t.Fatal("BZPOPMIN did not return after ZADD signal")
-	}
+	res := testutil.Recv(t, resultCh, 6*time.Second, "BZPOPMIN did not return after ZADD signal")
+	require.NoError(t, res.err)
+	require.NotNil(t, res.zwk)
+	require.Equal(t, "zset-wake", res.zwk.Key)
+	require.Equal(t, "first", res.zwk.Member)
+	require.InDelta(t, 1.0, res.zwk.Score, 1e-9)
 }
 
 // TestRedis_BZPopMinWakesOnZIncrBy verifies the same wake path but
@@ -431,16 +428,12 @@ func TestRedis_BZPopMinWakesOnZIncrBy(t *testing.T) {
 	_, err := rdbWriter.ZIncrBy(ctx, "zset-incr-wake", 7.5, "alpha").Result()
 	require.NoError(t, err)
 
-	select {
-	case res := <-resultCh:
-		require.NoError(t, res.err)
-		require.NotNil(t, res.zwk)
-		require.Equal(t, "zset-incr-wake", res.zwk.Key)
-		require.Equal(t, "alpha", res.zwk.Member)
-		require.InDelta(t, 7.5, res.zwk.Score, 1e-9)
-	case <-time.After(6 * time.Second):
-		t.Fatal("BZPOPMIN did not return after ZINCRBY signal")
-	}
+	res := testutil.Recv(t, resultCh, 6*time.Second, "BZPOPMIN did not return after ZINCRBY signal")
+	require.NoError(t, res.err)
+	require.NotNil(t, res.zwk)
+	require.Equal(t, "zset-incr-wake", res.zwk.Key)
+	require.Equal(t, "alpha", res.zwk.Member)
+	require.InDelta(t, 7.5, res.zwk.Score, 1e-9)
 }
 
 // TestRedis_BZPopMinRejectsInitialWrongType locks down the
@@ -510,13 +503,9 @@ func TestRedis_BZPopMinDetectsMidBlockWrongType(t *testing.T) {
 	time.Sleep(50 * time.Millisecond)
 	require.NoError(t, rdbWriter.Set(ctx, "bzpop-mid-wrongtype", "I am a string", 0).Err())
 
-	select {
-	case res := <-resultCh:
-		require.Error(t, res.err, "BZPOPMIN must return WRONGTYPE after mid-block SET, got zwk=%v", res.zwk)
-		require.Contains(t, res.err.Error(), "WRONGTYPE")
-	case <-time.After(6 * time.Second):
-		t.Fatal("BZPOPMIN did not return WRONGTYPE within the BLOCK window after a mid-block SET")
-	}
+	res := testutil.Recv(t, resultCh, 6*time.Second, "BZPOPMIN did not return WRONGTYPE within the BLOCK window after a mid-block SET")
+	require.Error(t, res.err, "BZPOPMIN must return WRONGTYPE after mid-block SET, got zwk=%v", res.zwk)
+	require.Contains(t, res.err.Error(), "WRONGTYPE")
 }
 
 // TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad locks down the
@@ -599,13 +588,9 @@ func TestRedis_BZPopMinDetectsWrongTypeUnderSignalLoad(t *testing.T) {
 	require.NoError(t, rdbWriter.Set(context.Background(), "bzpop-press-cold",
 		"I am a string", 0).Err())
 
-	select {
-	case res := <-resultCh:
-		require.Error(t, res.err, "BZPOPMIN must surface WRONGTYPE on bzpop-press-cold under signal load (zwk=%v)", res.zwk)
-		require.Contains(t, res.err.Error(), "WRONGTYPE")
-	case <-time.After(3500 * time.Millisecond):
-		t.Fatal("BZPOPMIN did not return WRONGTYPE under sustained signal load — fast mode likely sticky")
-	}
+	res := testutil.Recv(t, resultCh, 3500*time.Millisecond, "BZPOPMIN did not return WRONGTYPE under sustained signal load — fast mode likely sticky")
+	require.Error(t, res.err, "BZPOPMIN must surface WRONGTYPE on bzpop-press-cold under signal load (zwk=%v)", res.zwk)
+	require.Contains(t, res.err.Error(), "WRONGTYPE")
 }
 
 // TestRedis_BZPopMinTimesOutOnEmptyKey locks down the BLOCK-timeout

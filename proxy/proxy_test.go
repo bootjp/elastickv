@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	waitutil "github.com/bootjp/elastickv/internal/testutil"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/redis/go-redis/v9"
@@ -1392,12 +1393,8 @@ func TestDualWriter_GoAsync_QueuesBurstBeforeDropping(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		// good
-	case <-time.After(time.Second):
-		t.Fatal("goAsync blocked when queue was full")
-	}
+	waitutil.Closed(t, done, time.Second, "goAsync blocked when queue was full")
+	// good
 
 	assert.InDelta(t, 1, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
 	assert.InDelta(t, 1, testutil.ToFloat64(
@@ -1479,12 +1476,8 @@ func TestDualWriter_Script_QueuesWhenScriptLimitIsBusy(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		// good
-	case <-time.After(time.Second):
-		t.Fatal("Script blocked while its replay was queued")
-	}
+	waitutil.Closed(t, done, time.Second, "Script blocked while its replay was queued")
+	// good
 
 	assert.Equal(t, 0, secondary.CallCount())
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncDrops), 0.001)
@@ -1523,18 +1516,10 @@ func TestDualWriter_ScriptConsumesSharedWriteConcurrency(t *testing.T) {
 
 	scriptRan := make(chan struct{})
 	d.goScript(func(context.Context) { close(scriptRan) })
-	select {
-	case <-scriptRan:
-		t.Fatal("script exceeded the shared secondary write concurrency")
-	case <-time.After(50 * time.Millisecond):
-	}
+	waitutil.NoRecv(t, scriptRan, 50*time.Millisecond, "script exceeded the shared secondary write concurrency")
 
 	close(blocker)
-	select {
-	case <-scriptRan:
-	case <-time.After(time.Second):
-		t.Fatal("script did not run after shared capacity became available")
-	}
+	waitutil.Closed(t, scriptRan, time.Second, "script did not run after shared capacity became available")
 	d.Close()
 }
 
@@ -1603,11 +1588,7 @@ func TestDualWriter_ScriptQueueUsesScriptTimeout(t *testing.T) {
 	d.goScript(func(context.Context) { close(ran) })
 	time.Sleep(50 * time.Millisecond)
 	close(blocker)
-	select {
-	case <-ran:
-	case <-time.After(time.Second):
-		t.Fatal("script expired before secondary-script-timeout")
-	}
+	waitutil.Closed(t, ran, time.Second, "script expired before secondary-script-timeout")
 	d.Close()
 
 	assert.InDelta(t, 0, testutil.ToFloat64(
@@ -1792,11 +1773,7 @@ func TestDualWriter_ExpiredQueuedWorkDoesNotWaitForSemaphore(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(200 * time.Millisecond):
-		t.Fatal("expired task waited for an unavailable semaphore")
-	}
+	waitutil.Closed(t, done, 200*time.Millisecond, "expired task waited for an unavailable semaphore")
 
 	assert.InDelta(t, 0, testutil.ToFloat64(metrics.AsyncQueueDepth.WithLabelValues(asyncQueueWrite)), 0.001)
 	assert.InDelta(t, 1, testutil.ToFloat64(

@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -33,7 +34,7 @@ func verifyExternalEncryptedSnapshot(t *testing.T, sst, bearing bool) {
 	}
 	raw := externalTestSnapshot(t, source.mvcc)
 	dir := filepath.Join(t.TempDir(), "destination")
-	options := []PebbleStoreOption{WithEncryption(source.cipher, NewCounterNonceFactory(0xABCD, 2),
+	options := []PebbleStoreOption{WithEncryption(source.cipher, encryption.NewDeterministicNonceFactory(0xABCD, 2),
 		func() (uint32, bool) { return source.keyID, true })}
 	destination, err := NewPebbleStore(dir, options...)
 	require.NoError(t, err)

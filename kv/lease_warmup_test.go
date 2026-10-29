@@ -11,6 +11,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -512,14 +513,10 @@ func TestShardedCoordinator_RenewHLCLeases_UsesProposalTimeoutBeyondCadence(t *t
 	done := coord.renewHLCLeases(context.Background())
 	requireRenewalDone(t, done)
 
-	select {
-	case remaining := <-deadlineRemaining:
-		require.Greater(t, remaining, hlcRenewalInterval,
-			"renewal proposals need a timeout longer than the cadence under load")
-		require.LessOrEqual(t, remaining, hlcRenewalProposalTimeout)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for captured renewal deadline")
-	}
+	remaining := testutil.Recv(t, deadlineRemaining, time.Second, "timed out waiting for captured renewal deadline")
+	require.Greater(t, remaining, hlcRenewalInterval,
+		"renewal proposals need a timeout longer than the cadence under load")
+	require.LessOrEqual(t, remaining, hlcRenewalProposalTimeout)
 }
 
 func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
@@ -606,9 +603,5 @@ func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testi
 
 func requireRenewalDone(t *testing.T, done <-chan struct{}) {
 	t.Helper()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for HLC lease renewals")
-	}
+	testutil.Closed(t, done, 2*time.Second, "timed out waiting for HLC lease renewals")
 }

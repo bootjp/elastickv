@@ -18,18 +18,18 @@ import (
 	"google.golang.org/grpc/status"
 )
 
+// retryOnceCoordinator fails its first dispatch with firstErr and applies
+// every later one through localAdapterCoordinator.
 type retryOnceCoordinator struct {
-	store      store.MVCCStore
-	clock      *kv.HLC
+	*localAdapterCoordinator
 	dispatches int
 	firstErr   error
 }
 
 func newRetryOnceCoordinator(st store.MVCCStore) *retryOnceCoordinator {
 	return &retryOnceCoordinator{
-		store:    st,
-		clock:    kv.NewHLC(),
-		firstErr: store.ErrWriteConflict,
+		localAdapterCoordinator: newLocalAdapterCoordinator(st),
+		firstErr:                store.ErrWriteConflict,
 	}
 }
 
@@ -38,64 +38,7 @@ func (c *retryOnceCoordinator) Dispatch(ctx context.Context, reqs *kv.OperationG
 	if c.dispatches == 1 {
 		return nil, c.firstErr
 	}
-
-	ts := c.clock.Next()
-	for _, elem := range reqs.Elems {
-		var err error
-		switch elem.Op {
-		case kv.Put:
-			err = c.store.PutAt(ctx, elem.Key, elem.Value, ts, 0)
-		case kv.Del:
-			err = c.store.DeleteAt(ctx, elem.Key, ts)
-		case kv.DelPrefix:
-			err = c.store.DeletePrefixAt(ctx, elem.Key, nil, ts)
-		}
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	return &kv.CoordinateResponse{}, nil
-}
-
-func (c *retryOnceCoordinator) IsLeader() bool {
-	return true
-}
-
-func (c *retryOnceCoordinator) VerifyLeader(context.Context) error {
-	return nil
-}
-
-func (c *retryOnceCoordinator) RaftLeader() string {
-	return ""
-}
-
-func (c *retryOnceCoordinator) IsLeaderForKey([]byte) bool {
-	return true
-}
-
-func (c *retryOnceCoordinator) VerifyLeaderForKey(context.Context, []byte) error {
-	return nil
-}
-
-func (c *retryOnceCoordinator) RaftLeaderForKey([]byte) string {
-	return ""
-}
-
-func (c *retryOnceCoordinator) Clock() *kv.HLC {
-	return c.clock
-}
-
-func (c *retryOnceCoordinator) LinearizableRead(_ context.Context) (uint64, error) {
-	return 0, nil
-}
-
-func (c *retryOnceCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
-	return c.LinearizableRead(ctx)
-}
-
-func (c *retryOnceCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
-	return c.LinearizableRead(ctx)
+	return c.localAdapterCoordinator.Dispatch(ctx, reqs)
 }
 
 type recordingConn struct {

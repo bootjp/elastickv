@@ -40,7 +40,7 @@ func newRegGateStore(t *testing.T, registered *bool) *regGateFixture {
 	dir := filepath.Join(t.TempDir(), "pebble")
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0x00AA, 0x0005),
+			encryption.NewDeterministicNonceFactory(0x00AA, 0x0005),
 			func() (uint32, bool) { return regGateDEKID, true }, // DEK always provisioned
 		),
 		WithStorageEnvelopeGate(func() bool { return true }), // cutover fired
@@ -230,7 +230,7 @@ func TestRegistrationGate_NotEncryptingIsUngated(t *testing.T) {
 	registered := false
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0x00BB, 0x0006),
+			encryption.NewDeterministicNonceFactory(0x00BB, 0x0006),
 			func() (uint32, bool) { return 7, true },
 		),
 		WithStorageEnvelopeGate(func() bool { return false }), // cutover NOT fired
@@ -272,7 +272,7 @@ func TestRegistrationGate_UnwiredIsNoOp(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "pebble")
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0x00CC, 0x0007),
+			encryption.NewDeterministicNonceFactory(0x00CC, 0x0007),
 			func() (uint32, bool) { return 7, true },
 		),
 		WithStorageEnvelopeGate(func() bool { return true }),

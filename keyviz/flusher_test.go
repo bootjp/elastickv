@@ -5,6 +5,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -186,11 +187,7 @@ func TestFlushWindowKeepsHotKeyAndCounterInSameColumn(t *testing.T) {
 		s.Observe(1, []byte("hot"), OpWrite, 0, LabelLegacy)
 		close(observed)
 	}()
-	select {
-	case <-observed:
-		t.Fatal("Observe crossed a hot-key flush boundary")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, observed, 20*time.Millisecond, "Observe crossed a hot-key flush boundary")
 	s.flushMu.Unlock()
 	// Unbounded on purpose: a wall-clock budget here fails whenever a
 	// loaded -race runner deschedules the Observe goroutine. A real

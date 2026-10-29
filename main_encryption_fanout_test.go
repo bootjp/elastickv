@@ -135,18 +135,6 @@ func TestRouteGroupFromConfiguration_Empty(t *testing.T) {
 	}
 }
 
-// TestBuildCapabilityFanoutFn_NonNil pins that the builder returns a
-// usable closure (it is only wired when encryption mutators are
-// enabled; the closure's fan-out behavior is exercised end-to-end in
-// 6D-6c-3b).
-func TestBuildCapabilityFanoutFn_NonNil(t *testing.T) {
-	t.Parallel()
-	fn := buildCapabilityFanoutFn(nil, nil, capabilityFanoutTimeout)
-	if fn == nil {
-		t.Fatal("buildCapabilityFanoutFn returned nil")
-	}
-}
-
 // TestBuildEncryptionCapabilityFanout_DisabledReturnsNil pins that the
 // closure is not built when encryption mutators are off — the cutover
 // RPC is then unreachable, so wiring a fan-out would be dead weight.

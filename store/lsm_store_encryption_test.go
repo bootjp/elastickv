@@ -46,7 +46,7 @@ func (f *encryptedStoreFixture) reopen(tb testing.TB) {
 	tb.Helper()
 	mvcc, err := NewPebbleStore(f.dir,
 		WithEncryption(f.cipher,
-			NewCounterNonceFactory(0xABCD, 0x0001),
+			encryption.NewDeterministicNonceFactory(0xABCD, 0x0001),
 			func() (uint32, bool) { return f.keyID, true },
 		),
 	)
@@ -74,7 +74,7 @@ func newEncryptedStoreFixture(t *testing.T, keyID uint32) *encryptedStoreFixture
 	dir := filepath.Join(t.TempDir(), "pebble")
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0xABCD, 0x0001),
+			encryption.NewDeterministicNonceFactory(0xABCD, 0x0001),
 			func() (uint32, bool) { return keyID, true },
 		),
 	)
@@ -228,7 +228,7 @@ func newToggleableEncryptedStore(t *testing.T, keyID uint32, activeFlag *bool) M
 	dir := filepath.Join(t.TempDir(), "pebble")
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0x0011, 0x0002),
+			encryption.NewDeterministicNonceFactory(0x0011, 0x0002),
 			func() (uint32, bool) {
 				if !*activeFlag {
 					return 0, false
@@ -289,7 +289,7 @@ func newGatedEncryptedStore(t *testing.T, keyID uint32, gateFlag *bool) *gatedFi
 	dir := filepath.Join(t.TempDir(), "pebble")
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0x0022, 0x0003),
+			encryption.NewDeterministicNonceFactory(0x0022, 0x0003),
 			func() (uint32, bool) { return keyID, true }, // DEK always provisioned
 		),
 		WithStorageEnvelopeGate(func() bool { return *gateFlag }),
@@ -512,7 +512,7 @@ func TestStorageEnvelopeGate_NilArgumentIsNoOp(t *testing.T) {
 	dir := filepath.Join(t.TempDir(), "pebble")
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0x0033, 0x0004),
+			encryption.NewDeterministicNonceFactory(0x0033, 0x0004),
 			func() (uint32, bool) { return 60, true },
 		),
 		WithStorageEnvelopeGate(nil), // explicit nil → no-op
@@ -874,7 +874,7 @@ func TestEncryption_SnapshotRestoreAtMaxValueSize(t *testing.T) {
 	dstDir := filepath.Join(t.TempDir(), "restore")
 	dst, err := NewPebbleStore(dstDir,
 		WithEncryption(f.cipher,
-			NewCounterNonceFactory(0xABCD, 0x0001),
+			encryption.NewDeterministicNonceFactory(0xABCD, 0x0001),
 			func() (uint32, bool) { return f.keyID, true },
 		),
 	)

@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/bootjp/elastickv/internal/testutil"
 )
 
 func TestKeyWaiterRegistry_SignalWakesRegisteredWaiter(t *testing.T) {
@@ -16,11 +18,7 @@ func TestKeyWaiterRegistry_SignalWakesRegisteredWaiter(t *testing.T) {
 
 	reg.Signal([]byte("z-a"))
 
-	select {
-	case <-w.C:
-	case <-time.After(time.Second):
-		t.Fatal("Signal did not wake waiter")
-	}
+	testutil.Recv(t, w.C, time.Second, "Signal did not wake waiter")
 }
 
 func TestKeyWaiterRegistry_SignalUnrelatedKeyDoesNotWake(t *testing.T) {
@@ -31,11 +29,7 @@ func TestKeyWaiterRegistry_SignalUnrelatedKeyDoesNotWake(t *testing.T) {
 
 	reg.Signal([]byte("z-b"))
 
-	select {
-	case <-w.C:
-		t.Fatal("Signal on unrelated key woke waiter")
-	case <-time.After(50 * time.Millisecond):
-	}
+	testutil.NoRecv(t, w.C, 50*time.Millisecond, "Signal on unrelated key woke waiter")
 }
 
 func TestKeyWaiterRegistry_MultiKeyWaiterWokenByAnyKey(t *testing.T) {
@@ -46,11 +40,7 @@ func TestKeyWaiterRegistry_MultiKeyWaiterWokenByAnyKey(t *testing.T) {
 
 	reg.Signal([]byte("b"))
 
-	select {
-	case <-w.C:
-	case <-time.After(time.Second):
-		t.Fatal("multi-key waiter not woken by middle key")
-	}
+	testutil.Recv(t, w.C, time.Second, "multi-key waiter not woken by middle key")
 }
 
 func TestKeyWaiterRegistry_DuplicateKeysDeduplicated(t *testing.T) {
@@ -61,22 +51,10 @@ func TestKeyWaiterRegistry_DuplicateKeysDeduplicated(t *testing.T) {
 
 	reg.Signal([]byte("dup"))
 
-	select {
-	case <-w.C:
-	case <-time.After(time.Second):
-		t.Fatal("dedup waiter not signaled")
-	}
+	testutil.Recv(t, w.C, time.Second, "dedup waiter not signaled")
 	reg.Signal([]byte("dup"))
-	select {
-	case <-w.C:
-	case <-time.After(time.Second):
-		t.Fatal("post-drain Signal failed to wake waiter")
-	}
-	select {
-	case <-w.C:
-		t.Fatal("waiter received a phantom third wake")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.Recv(t, w.C, time.Second, "post-drain Signal failed to wake waiter")
+	testutil.NoRecv(t, w.C, 20*time.Millisecond, "waiter received a phantom third wake")
 }
 
 func TestKeyWaiterRegistry_CoalescesPreDrainSignals(t *testing.T) {
@@ -89,16 +67,8 @@ func TestKeyWaiterRegistry_CoalescesPreDrainSignals(t *testing.T) {
 	reg.Signal([]byte("k"))
 	reg.Signal([]byte("k"))
 
-	select {
-	case <-w.C:
-	case <-time.After(time.Second):
-		t.Fatal("waiter not signaled by burst")
-	}
-	select {
-	case <-w.C:
-		t.Fatal("burst was not coalesced — waiter saw a second wake")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.Recv(t, w.C, time.Second, "waiter not signaled by burst")
+	testutil.NoRecv(t, w.C, 20*time.Millisecond, "burst was not coalesced — waiter saw a second wake")
 }
 
 func TestKeyWaiterRegistry_SignalFullDowngradesCoalescedFastSignal(t *testing.T) {
@@ -123,21 +93,13 @@ func TestKeyWaiterRegistry_SignalFullPreservesQueuedFullWake(t *testing.T) {
 	defer release()
 
 	reg.SignalFull([]byte("k"))
-	select {
-	case <-w.C:
-	case <-time.After(time.Second):
-		t.Fatal("first SignalFull did not wake waiter")
-	}
+	testutil.Recv(t, w.C, time.Second, "first SignalFull did not wake waiter")
 
 	reg.SignalFull([]byte("k"))
 	if w.fastSignalAllowed() {
 		t.Fatal("first full wake was consumed as a fast signal")
 	}
-	select {
-	case <-w.C:
-	case <-time.After(time.Second):
-		t.Fatal("second SignalFull did not wake waiter")
-	}
+	testutil.Recv(t, w.C, time.Second, "second SignalFull did not wake waiter")
 	if w.fastSignalAllowed() {
 		t.Fatal("second full wake lost its full classification")
 	}
@@ -153,11 +115,7 @@ func TestKeyWaiterRegistry_ReleaseStopsFurtherSignals(t *testing.T) {
 	default:
 	}
 	reg.Signal([]byte("k"))
-	select {
-	case <-w.C:
-		t.Fatal("waiter received signal after release")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, w.C, 20*time.Millisecond, "waiter received signal after release")
 }
 
 func TestKeyWaiterRegistry_ReleaseIsIdempotent(t *testing.T) {
@@ -224,11 +182,7 @@ func TestKeyWaiterRegistry_ManyWaitersFanOut(t *testing.T) {
 	reg.Signal([]byte("fan"))
 
 	for i, w := range waiters {
-		select {
-		case <-w.C:
-		case <-time.After(time.Second):
-			t.Fatalf("waiter %d not signaled", i)
-		}
+		testutil.Recv(t, w.C, time.Second, "waiter %d not signaled", i)
 	}
 }
 

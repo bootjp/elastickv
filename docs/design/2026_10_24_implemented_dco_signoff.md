@@ -1,6 +1,8 @@
 # DCO sign-off checks
 
-Status: Proposed
+Status: Implemented
+
+Shipped in #1306 (`DCO`, `.github/dco.yml`, Renovate `:gitSignOff`). No implementation work follows.
 Author: bootjp
 Date: 2026-10-24
 

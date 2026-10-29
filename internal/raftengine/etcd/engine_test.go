@@ -3,7 +3,6 @@ package etcd
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"io"
 	"net"
 	"path/filepath"
@@ -15,6 +14,8 @@ import (
 
 	internalutil "github.com/bootjp/elastickv/internal"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"go.etcd.io/etcd/server/v3/mock/mockstorage"
@@ -25,79 +26,7 @@ import (
 	"google.golang.org/grpc"
 )
 
-type testStateMachine struct {
-	mu      sync.Mutex
-	applied [][]byte
-}
-
-func (s *testStateMachine) Apply(data []byte) any {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.applied = append(s.applied, append([]byte(nil), data...))
-	return string(data)
-}
-
-func (s *testStateMachine) Applied() [][]byte {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([][]byte, len(s.applied))
-	for i, item := range s.applied {
-		out[i] = append([]byte(nil), item...)
-	}
-	return out
-}
-
-func (s *testStateMachine) Snapshot() (Snapshot, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-
-	var buf bytes.Buffer
-	count, err := uint32Len(len(s.applied))
-	if err != nil {
-		return nil, err
-	}
-	if err := binary.Write(&buf, binary.BigEndian, count); err != nil {
-		return nil, err
-	}
-	for _, item := range s.applied {
-		size, err := uint32Len(len(item))
-		if err != nil {
-			return nil, err
-		}
-		if err := binary.Write(&buf, binary.BigEndian, size); err != nil {
-			return nil, err
-		}
-		if _, err := buf.Write(item); err != nil {
-			return nil, err
-		}
-	}
-	return &testSnapshot{data: buf.Bytes()}, nil
-}
-
-func (s *testStateMachine) Restore(r io.Reader) error {
-	var count uint32
-	if err := binary.Read(r, binary.BigEndian, &count); err != nil {
-		return err
-	}
-
-	applied := make([][]byte, 0, count)
-	for range count {
-		var length uint32
-		if err := binary.Read(r, binary.BigEndian, &length); err != nil {
-			return err
-		}
-		item := make([]byte, length)
-		if _, err := io.ReadFull(r, item); err != nil {
-			return err
-		}
-		applied = append(applied, item)
-	}
-
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	s.applied = applied
-	return nil
-}
+type testStateMachine = raftenginetest.TestStateMachine
 
 type testSnapshot struct {
 	data []byte
@@ -545,13 +474,9 @@ func TestVerifyLeaderUsesReadIndexPath(t *testing.T) {
 		errCh <- engine.VerifyLeader(context.Background())
 	}()
 
-	select {
-	case req := <-engine.readCh:
-		require.False(t, req.waitApplied)
-		req.done <- readResult{index: 9}
-	case <-time.After(time.Second):
-		t.Fatal("verify leader did not issue read-index request")
-	}
+	req := testutil.Recv(t, engine.readCh, time.Second, "verify leader did not issue read-index request")
+	require.False(t, req.waitApplied)
+	req.done <- readResult{index: 9}
 
 	require.NoError(t, <-errCh)
 }
@@ -585,20 +510,12 @@ func TestHandleTransportMessageWaitsForStartup(t *testing.T) {
 		errCh <- engine.handleTransportMessage(context.Background(), raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat)})
 	}()
 
-	select {
-	case <-engine.stepCh:
-		t.Fatal("transport message delivered before startup")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, engine.stepCh, 20*time.Millisecond, "transport message delivered before startup")
 
 	close(engine.startedCh)
 
-	select {
-	case msg := <-engine.stepCh:
-		require.Equal(t, raftpb.MsgHeartbeat, msg.GetType())
-	case <-time.After(time.Second):
-		t.Fatal("transport message was not delivered after startup")
-	}
+	msg := testutil.Recv(t, engine.stepCh, time.Second, "transport message was not delivered after startup")
+	require.Equal(t, raftpb.MsgHeartbeat, msg.GetType())
 
 	require.NoError(t, <-errCh)
 }
@@ -919,11 +836,7 @@ func TestReportFailedDispatchReliablyQueuesMsgSnapFailure(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-		t.Fatal("MsgSnap failure report must wait instead of dropping when report channel is full")
-	case <-time.After(20 * time.Millisecond):
-	}
+	testutil.NoRecv(t, done, 20*time.Millisecond, "MsgSnap failure report must wait instead of dropping when report channel is full")
 
 	<-engine.dispatchReportCh
 	requireSignal(t, done, time.Second, "MsgSnap failure report was not delivered after report channel drained")
@@ -978,11 +891,7 @@ func TestStopDispatchWorkersCancelsInflightDispatch(t *testing.T) {
 	engine.startDispatchWorkers()
 	engine.peerDispatchers[2].heartbeat <- dispatchRequest{msg: raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}}
 
-	select {
-	case <-started:
-	case <-time.After(time.Second):
-		t.Fatal("dispatch worker did not start")
-	}
+	testutil.Closed(t, started, time.Second, "dispatch worker did not start")
 
 	done := make(chan struct{})
 	go func() {
@@ -1069,11 +978,7 @@ func TestRemovePeerClosesDispatcherAndDropsSubsequentMessages(t *testing.T) {
 		engine.dispatchWG.Wait()
 		close(workerDone)
 	}()
-	select {
-	case <-workerDone:
-	case <-time.After(time.Second):
-		t.Fatal("dispatch workers did not exit after channel close")
-	}
+	testutil.Closed(t, workerDone, time.Second, "dispatch workers did not exit after channel close")
 
 	// Subsequent messages to the removed peer must be dropped without panic.
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgHeartbeat), To: uint64Ptr(2)}))
@@ -1144,21 +1049,13 @@ func TestMaybePersistLocalSnapshotRunsInBackground(t *testing.T) {
 		t.Fatal("maybePersistLocalSnapshot blocked on snapshot persistence")
 	}
 
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("snapshot worker did not start")
-	}
+	testutil.Closed(t, fsm.started, time.Second, "snapshot worker did not start")
 
 	require.Empty(t, persist.Action())
 	release()
 
-	select {
-	case result := <-engine.snapshotResCh:
-		require.NoError(t, engine.handleSnapshotResult(result))
-	case <-time.After(time.Second):
-		t.Fatal("snapshot worker did not finish")
-	}
+	result := testutil.Recv(t, engine.snapshotResCh, time.Second, "snapshot worker did not finish")
+	require.NoError(t, engine.handleSnapshotResult(result))
 
 	actions := persist.Action()
 	require.Len(t, actions, 2)
@@ -1204,7 +1101,7 @@ func TestMaybePersistLocalSnapshotReturnsWhenWorkerIsStopped(t *testing.T) {
 	}
 }
 
-func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
+func TestPersistConfigStateSkipsSerializationWhenNewerSnapshotExists(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(9, 2, []uint64{1, 2}, []byte("newer"))
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1213,13 +1110,17 @@ func TestPersistConfigSnapshotSkipsSerializationWhenNewerSnapshotExists(t *testi
 	engine := &Engine{
 		storage: storage,
 		fsm:     fsm,
+		dataDir: t.TempDir(),
 	}
 
-	require.NoError(t, engine.persistConfigSnapshot(7, raftpb.ConfState{Voters: []uint64{1}}))
+	require.NoError(t, engine.persistConfigState(7, raftpb.ConfState{Voters: []uint64{1}}, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+	}))
 	require.Zero(t, fsm.snapshotCalls.Load())
+	require.Equal(t, uint64(7), engine.currentConfigIndex())
 }
 
-func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
+func TestPersistConfigStateDoesNotCompactLogs(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1233,16 +1134,20 @@ func TestPersistConfigSnapshotDoesNotCompactLogs(t *testing.T) {
 		storage: storage,
 		persist: mockstorage.NewStorageRecorder(""),
 		fsm:     &testStateMachine{},
+		dataDir: t.TempDir(),
 	}
 
-	require.NoError(t, engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}}))
+	require.NoError(t, engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+		{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+		{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+	}))
 
 	firstIndex, err := storage.FirstIndex()
 	require.NoError(t, err)
 	require.Equal(t, uint64(2), firstIndex)
 }
 
-func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
+func TestPersistConfigStateWaitsForDurablePublication(t *testing.T) {
 	storage := etcdraft.NewMemoryStorage()
 	snap := raftTestSnapshot(1, 1, []uint64{1}, nil)
 	require.NoError(t, storage.ApplySnapshot(&snap))
@@ -1270,19 +1175,18 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 
 	done := make(chan error, 1)
 	go func() {
-		done <- engine.persistConfigSnapshot(4, raftpb.ConfState{Voters: []uint64{1, 2}})
+		done <- engine.persistConfigState(4, raftpb.ConfState{Voters: []uint64{1, 2}}, []Peer{
+			{NodeID: 1, ID: "n1", Address: "127.0.0.1:7001"},
+			{NodeID: 2, ID: "n2", Address: "127.0.0.1:7002"},
+		})
 	}()
 
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("config snapshot serialization did not start")
-	}
+	testutil.Closed(t, fsm.started, time.Second, "config snapshot serialization did not start")
 
 	select {
 	case err := <-done:
 		require.NoError(t, err)
-		t.Fatal("persistConfigSnapshot returned before snapshot serialization completed")
+		t.Fatal("persistConfigState returned before snapshot serialization completed")
 	case <-time.After(100 * time.Millisecond):
 	}
 
@@ -1293,7 +1197,7 @@ func TestPersistConfigSnapshotWaitsForDurablePublication(t *testing.T) {
 	case err := <-done:
 		require.NoError(t, err)
 	case <-time.After(time.Second):
-		t.Fatal("persistConfigSnapshot did not finish after snapshot serialization was released")
+		t.Fatal("persistConfigState did not finish after snapshot serialization was released")
 	}
 
 	actions := persist.Action()
@@ -1377,11 +1281,7 @@ func TestPersistConfigStateBlocksConcurrentRestore(t *testing.T) {
 		})
 	}()
 
-	select {
-	case <-fsm.started:
-	case <-time.After(time.Second):
-		t.Fatal("config snapshot serialization did not start")
-	}
+	testutil.Closed(t, fsm.started, time.Second, "config snapshot serialization did not start")
 
 	restoreDone := make(chan error, 1)
 	go func() {
@@ -1707,16 +1607,6 @@ func TestEnqueueDispatchMessagePreservesIncomingReadIndexHeartbeatWhenRespLaneFu
 	require.Equal(t, []byte("read-index-c"), req.msg.Context)
 }
 
-func TestMaxAppliedIndexStartsFromSnapshotIndex(t *testing.T) {
-	storage := etcdraft.NewMemoryStorage()
-	snap := raftTestSnapshot(5, 2, []uint64{1}, nil)
-	require.NoError(t, storage.ApplySnapshot(&snap))
-	hs := testHardState(2, 9)
-	require.NoError(t, storage.SetHardState(&hs))
-
-	require.Equal(t, uint64(5), maxAppliedIndex(raftTestSnapshot(5, 0, nil, nil)))
-}
-
 func TestOpenRestoresLegacySnapshotState(t *testing.T) {
 	dir := t.TempDir()
 	require.NoError(t, saveStateFile(stateFilePath(dir), persistedState{
@@ -1886,13 +1776,9 @@ func TestWaitForOpenCanceledContextClosesMultiNodeEngine(t *testing.T) {
 	}
 	close(engine.doneCh)
 
-	select {
-	case got := <-resultCh:
-		require.Nil(t, got.engine)
-		require.ErrorIs(t, got.err, context.Canceled)
-	case <-time.After(time.Second):
-		t.Fatal("waitForOpen did not return after Close completed")
-	}
+	got := testutil.Recv(t, resultCh, time.Second, "waitForOpen did not return after Close completed")
+	require.Nil(t, got.engine)
+	require.ErrorIs(t, got.err, context.Canceled)
 }
 
 func TestOpenMultiNodeReplicatesOverGRPCTransport(t *testing.T) {
@@ -2320,7 +2206,10 @@ func waitForConfigSize(t *testing.T, engine *Engine, size int) {
 func mustEncodeSnapshotData(t *testing.T, applied [][]byte) []byte {
 	t.Helper()
 
-	fsm := &testStateMachine{applied: applied}
+	fsm := &testStateMachine{}
+	for _, item := range applied {
+		fsm.Apply(item)
+	}
 	snapshot, err := fsm.Snapshot()
 	require.NoError(t, err)
 	t.Cleanup(func() {
@@ -2658,11 +2547,7 @@ func TestMultiLaneDispatcher_SnapshotDoesNotBlockReplication(t *testing.T) {
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgSnap), To: uint64Ptr(2)}))
 	require.NoError(t, engine.enqueueDispatchMessage(raftpb.Message{Type: messageTypePtr(raftpb.MsgApp), To: uint64Ptr(2)}))
 
-	select {
-	case <-replicationDone:
-	case <-time.After(time.Second):
-		t.Fatal("MsgApp did not dispatch while MsgSnap was stuck — lanes are not independent")
-	}
+	testutil.Recv(t, replicationDone, time.Second, "MsgApp did not dispatch while MsgSnap was stuck — lanes are not independent")
 
 	close(snapshotBlocking)
 	close(engine.dispatchStopCh)

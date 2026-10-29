@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/coreos/go-semver/semver"
 	"github.com/stretchr/testify/require"
 	etcdraft "go.etcd.io/raft/v3"
@@ -130,11 +131,7 @@ func TestPersistReadyWithSnapshotHoldsSnapshotMuThroughSaveSnap(t *testing.T) {
 		persistDone <- e.persistReady(rd)
 	}()
 
-	select {
-	case <-saveStarted:
-	case <-time.After(time.Second):
-		t.Fatal("SaveSnap did not start")
-	}
+	testutil.Closed(t, saveStarted, time.Second, "SaveSnap did not start")
 
 	prepareDone := make(chan error, 1)
 	go func() {
@@ -176,11 +173,7 @@ func TestReleaseProtectedReceivedFSMSnapshotsUpToRetriesAfterSnapshotMuUnlock(t 
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("releaseProtectedReceivedFSMSnapshotsUpTo blocked on snapshotMu")
-	}
+	testutil.Closed(t, done, 100*time.Millisecond, "releaseProtectedReceivedFSMSnapshotsUpTo blocked on snapshotMu")
 	require.Equal(t, map[uint64]int{7: 1}, e.protectedReceivedFSMSnaps)
 
 	e.snapshotMu.Unlock()
@@ -203,12 +196,8 @@ func TestProtectReceivedFSMSnapshotRechecksAppliedIndexUnderLock(t *testing.T) {
 	e.appliedIndex.Store(9)
 	e.snapshotMu.Unlock()
 
-	select {
-	case got := <-accepted:
-		require.False(t, got)
-	case <-time.After(time.Second):
-		t.Fatal("protectReceivedFSMSnapshot did not return")
-	}
+	got := testutil.Recv(t, accepted, time.Second, "protectReceivedFSMSnapshot did not return")
+	require.False(t, got)
 	require.Empty(t, e.protectedReceivedFSMSnaps)
 }
 
@@ -340,12 +329,7 @@ func TestReleaseIgnoredReceivedFSMSnapshotStepsKeepsSnapshotReadyProtected(t *te
 // TestRecordingFSM_SatisfiesAppliedIndexWriter is a compile-time-
 // adjacent assertion: the recording FSM MUST satisfy the writer
 // seam so the engine hook actually fires for it.
-func TestRecordingFSM_SatisfiesAppliedIndexWriter(t *testing.T) {
-	rec := &applyIndexOrderRecorder{}
-	var f any = &recordingAppliedIndexFSM{rec: rec}
-	_, ok := f.(raftengine.AppliedIndexWriter)
-	require.True(t, ok, "recordingAppliedIndexFSM must implement raftengine.AppliedIndexWriter")
-}
+var _ raftengine.AppliedIndexWriter = (*recordingAppliedIndexFSM)(nil)
 
 // TestPersistCreatedSnapshot_BumpsAppliedIndex exercises Site 1 of
 // the persist hook. We invoke (*Engine).persistCreatedSnapshot

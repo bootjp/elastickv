@@ -24,7 +24,7 @@ func TestCoordinateSamplerReceivesAdapterLabel(t *testing.T) {
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	c := (&Coordinate{
 		transactionManager: &stubTransactional{},
-		engine:             stubLeaderEngine{},
+		engine:             newStubLeaderEngine(),
 		clock:              clock,
 	}).WithSamplerRouteResolver(sampler, func([]byte) (uint64, bool) { return 7, true })
 	labeled := WithKeyVizLabel(c, keyviz.LabelRedis)
@@ -63,7 +63,7 @@ func TestCoordinateSamplerDefaultsToLegacyLabel(t *testing.T) {
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	c := (&Coordinate{
 		transactionManager: &stubTransactional{},
-		engine:             stubLeaderEngine{},
+		engine:             newStubLeaderEngine(),
 		clock:              clock,
 	}).WithSamplerRouteResolver(sampler, func([]byte) (uint64, bool) { return 7, true })
 

@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -64,11 +65,7 @@ func startBlockedManifestCleanup(t *testing.T, s *S3Server, coord *cleanupBlocki
 		UploadID: "upload",
 		Parts:    []s3ObjectPart{{PartNo: 1, ChunkSizes: []uint64{1}}},
 	})
-	select {
-	case <-coord.entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the cleanup never dispatched its delete batch")
-	}
+	testutil.Closed(t, coord.entered, 5*time.Second, "the cleanup never dispatched its delete batch")
 }
 
 // TestS3ServerStopWaitsForCleanupBeforeClosingBlobCluster pins that a
@@ -107,11 +104,7 @@ func TestS3ServerStopCancelsCleanupAfterBound(t *testing.T) {
 	elapsed := time.Since(start)
 	require.GreaterOrEqual(t, elapsed, 150*time.Millisecond, "the cleanup must be given its bound")
 	require.Less(t, elapsed, 3*time.Second, "Stop must not wait on a cleanup past the bound")
-	select {
-	case <-coord.cancelled:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the cleanup's context was not cancelled after the bound")
-	}
+	testutil.Closed(t, coord.cancelled, 5*time.Second, "the cleanup's context was not cancelled after the bound")
 }
 
 // Once Stop has begun, a new background cleanup is not started.

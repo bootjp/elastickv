@@ -33,9 +33,8 @@ import (
 //     restarts is a correctness bug. Always pair NewDeterministicNonceFactory
 //     with a fresh BumpLocalEpoch on the active storage DEK.
 //
-// This is the durable analogue of the test-only
-// store.CounterNonceFactory: identical byte layout, but the epoch
-// here carries the restart-safety guarantee the test factory lacks.
+// Tests construct it directly with a fixed (nodeID, localEpoch); only
+// production wiring pairs it with BumpLocalEpoch for restart safety.
 type DeterministicNonceFactory struct {
 	nodeID     uint16
 	localEpoch uint16
