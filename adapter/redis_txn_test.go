@@ -628,7 +628,7 @@ func TestRedisExecReadFenceUsesRangeRoutesAndExactHashFields(t *testing.T) {
 	}
 	server := &RedisServer{store: st, coordinator: coord}
 
-	got := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+	got := queuedCommandReadFenceGroupKeysForTest(server, []redcon.Command{{
 		Args: [][]byte{[]byte(cmdHSet), key, field, []byte("value")},
 	}})
 
@@ -707,7 +707,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 	}
 	server := &RedisServer{store: st, coordinator: coord}
 
-	getKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+	getKeys := queuedCommandReadFenceGroupKeysForTest(server, []redcon.Command{{
 		Args: [][]byte{[]byte(cmdGet), key},
 	}})
 	require.ElementsMatch(t, [][]byte{
@@ -721,7 +721,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 		zsetDeltaRoute,
 	}, getKeys)
 
-	existsKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+	existsKeys := queuedCommandReadFenceGroupKeysForTest(server, []redcon.Command{{
 		Args: [][]byte{[]byte(cmdExists), key, otherKey},
 	}})
 	require.ElementsMatch(t, [][]byte{
@@ -736,7 +736,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 		otherListTypeRoute,
 	}, existsKeys)
 
-	lrangeKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+	lrangeKeys := queuedCommandReadFenceGroupKeysForTest(server, []redcon.Command{{
 		Args: [][]byte{[]byte(cmdLRange), key, []byte("0"), []byte("-1")},
 	}})
 	require.ElementsMatch(t, [][]byte{
@@ -751,7 +751,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 		zsetDeltaRoute,
 	}, lrangeKeys)
 
-	rpushKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+	rpushKeys := queuedCommandReadFenceGroupKeysForTest(server, []redcon.Command{{
 		Args: [][]byte{[]byte(cmdRPush), key, []byte("value")},
 	}})
 	require.ElementsMatch(t, [][]byte{
@@ -766,7 +766,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 		zsetDeltaRoute,
 	}, rpushKeys)
 
-	zincrbyKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+	zincrbyKeys := queuedCommandReadFenceGroupKeysForTest(server, []redcon.Command{{
 		Args: [][]byte{[]byte(cmdZIncrBy), key, []byte("1"), member},
 	}})
 	require.ElementsMatch(t, [][]byte{
@@ -782,7 +782,7 @@ func TestRedisExecReadFenceUsesOnlyCommandRelevantRanges(t *testing.T) {
 		exactZSetMemberKey,
 	}, zincrbyKeys)
 
-	hsetKeys := server.queuedCommandReadFenceGroupKeys([]redcon.Command{{
+	hsetKeys := queuedCommandReadFenceGroupKeysForTest(server, []redcon.Command{{
 		Args: [][]byte{[]byte(cmdHSet), key, field, []byte("value")},
 	}})
 	require.ElementsMatch(t, [][]byte{
@@ -814,15 +814,16 @@ func TestRedisReadFencedTimestampLeasesBeforeAndAfterSelectingTimestamp(t *testi
 	}
 	server := &RedisServer{store: st, coordinator: coord}
 
-	startTS, readPin, err := server.redisReadFencedTimestamp(
+	readTimestamp, readPin, err := server.redisReadFencedTimestampForTargets(
 		context.Background(),
-		[][]byte{redisStrKey([]byte("txn:fence-order"))},
+		[]kv.ReadFenceTarget{{Key: redisStrKey([]byte("txn:fence-order"))}},
 		server.txnStartTS,
+		"test",
 	)
 	defer readPin.Release()
 
 	require.NoError(t, err)
-	require.Equal(t, uint64(1), startTS)
+	require.Equal(t, uint64(1), readTimestamp.Timestamp())
 	coord.mu.Lock()
 	leaseCalls := coord.leaseCalls
 	coord.mu.Unlock()
@@ -1198,9 +1199,10 @@ func TestRedisExecReadFenceUsesRedisStorageKeys(t *testing.T) {
 	t.Parallel()
 
 	key := []byte("!sqs|user-visible")
-	keys := redisQueuedCommandReadFenceKeys([]redcon.Command{{
+	server := &RedisServer{store: store.NewMVCCStore()}
+	keys := readFenceTargetKeys(server.commandReadFenceTargets(redcon.Command{
 		Args: [][]byte{[]byte(cmdGet), key},
-	}})
+	}))
 	keySet := make(map[string]struct{}, len(keys))
 	for _, got := range keys {
 		keySet[string(got)] = struct{}{}
@@ -2513,4 +2515,18 @@ func TestTxnStartTSUsesLastCommitTS(t *testing.T) {
 	startTS := srv.txnStartTS()
 	require.Equal(t, appliedTS, startTS,
 		"txnStartTS must equal store.LastCommitTS() to prevent lost-write anomaly")
+}
+
+// queuedCommandReadFenceGroupKeysForTest returns the keys of the per-group
+// fence targets EXEC leases for queue.
+func queuedCommandReadFenceGroupKeysForTest(server *RedisServer, queue []redcon.Command) [][]byte {
+	return readFenceTargetKeys(server.queuedCommandReadFenceGroupTargets(queue))
+}
+
+func readFenceTargetKeys(targets []kv.ReadFenceTarget) [][]byte {
+	keys := make([][]byte, 0, len(targets))
+	for _, target := range targets {
+		keys = append(keys, target.Key)
+	}
+	return keys
 }

@@ -1,6 +1,6 @@
 # Test suite cleanup: redundant tests, live-path retargets, and shared test support
 
-Status: Proposed
+Status: Partial
 Author: bootjp
 Date: 2026-10-16
 
@@ -86,6 +86,40 @@ Problems 3 and 5 are fixed by the PR that adds this document (WP-0). The rest ar
 | WP-12 | root `.`, `cmd/**`, `proxy`, `store` | Migrate onto WP-8 helpers | WP-2, WP-6, WP-8 merged |
 
 WP-1 to WP-8 can run in parallel. WP-9 to WP-12 start once their dependencies merge, and can then run in parallel with each other.
+
+## Progress
+
+| WP | State |
+|---|---|
+| WP-0 | Landed with this document (#1277). |
+| WP-1 | Landed (#1345). |
+| WP-2 | Landed (#1292). |
+| WP-3 | Landed (follow-up PR after #1345). |
+| WP-4 | Landed (same PR as WP-3); see deviation 3. |
+| WP-5 | Landed (same PR as WP-3); see deviation 1. |
+| WP-6 | Landed (same PR as WP-3); see deviation 2. |
+| WP-7 | Landed (same PR as WP-3). |
+| WP-8 | Landed (#1288). |
+| WP-9 to WP-12 | Landed in the same PR as WP-3, with the exceptions listed under "WP-9 to WP-12 results". |
+
+WP-9 to WP-12 results (all four directory sets were migrated together, one commit per pattern):
+
+| Pattern | Before | After | Left as is, and why |
+|---|---|---|---|
+| Receive-or-fail `select` blocks | 276 candidate blocks | 154 replaced by `testutil.Recv` / `NoRecv` / `Closed`; 122 remain | A bare receive becomes `Closed` only when the file closes that channel and `Recv` only when it sends on it. Blocks were kept when that was ambiguous, the case body uses `break`/`goto`, the failure is non-fatal (`t.Error`), or hoisting the case variable could shadow another name. |
+| Legacy list delta key copies | 5 hand-rolled encoders | 0; all use `store.LegacyListMetaDeltaKey` (adapter seq 0, kv seq 1 preserved) | The `internal/backup` mirrors stay independent on purpose. |
+| Encryption fixtures | `store.CounterNonceFactory` exported from production `store`; 10 random-DEK keystore+cipher blocks; 2 byte-identical sidecar writers plus 4 temp-dir writers | `store/encryption_test_helpers.go` deleted (callers use `encryption.NewDeterministicNonceFactory`); 37 `encryptiontest` call sites | Fixed-byte DEKs, sidecar rewrites of an existing path, and `wiringEncryptionObserver` ≈ `recordingEncryptionObserver` (different packages; sharing needs a new package). |
+| Loopback gRPC servers | about 27 | 14 kv servers on `grpctest.Serve` | Servers whose tests assert the `Serve` error, need the listener address before construction, or stop the server mid-test. |
+| Fake Raft engines | 13 full fakes, about 10 `LeaderView`, about 12 `Proposer` | `stubLeaderEngine`/`noopEngine`, `stubFollowerEngine`, `membershipConfigEngine` → `raftenginetest.StubEngine`; three `LeaderView` fakes → `StaticLeaderView`; etcd `testStateMachine` aliases `raftenginetest.TestStateMachine` | Rule 4: fakes whose behaviour is the subject (toggling leader, blocking reads, lease, call recording, panicking `VerifyLeader`, error-injecting proposers). |
+| Fake coordinators | 12 full fakes, 6 in-memory apply coordinators | HELLO/INFO fakes folded into `stubAdapterCoordinator`; `testCoordinatorWrapper`, `phaseDGateCoordinator`, `fakeGroupRoutableCoordinator` embed instead of forwarding; `localAdapterCoordinator`, `occAdapterCoordinator`, `retryOnceCoordinator`, `fstest.MemoryDispatcher` and the filesystem `testCoordinator` dispatch through `kvtest.LocalCoordinator` (new `Clock` option shares the wrapper's HLC) | Rule 4 again for fakes with hooks, counters or scripted failures (`distributionCoordinatorStub`, `stubLeaderCoordinator`, `stubStartupCoordinator`, the TSO fakes). `phaseDGateCoordinator` embeds an interface of exactly its old method set, not `*ShardedCoordinator`, so it gains no optional capabilities. |
+
+Behaviour notes for the `LocalCoordinator` move: dispatches are serialized, elements are copied, `ctx` is checked before applying, the response carries `CommitTS`/`CommitIndex`, unknown ops return `ErrUnknownOp`, and an invalid commit-timestamp patch surfaces kv's validation error instead of `filesystem.ErrInvalid`.
+
+Deviations from the plan, found while implementing:
+
+1. **WP-5 retarget 1 (DynamoDB base-table hash-key mismatch) cannot be written.** `queryLeasePrefix` is only reached from `queryLeaseKey` with an empty `IndexName`, so `keySchemaForQuery` always returns `PrimaryKey` and the `keySchema.HashKey != schema.PrimaryKey.HashKey` branch is unreachable. A base-table key condition that does not pin the hash key fails `buildQueryCondition` and is classified as a skip. The duplicate test was deleted; removing the dead branch is a production change and is listed under Follow-ups.
+2. **WP-6 retarget 3 (pprof/metrics).** The live `PreparePprofServer`/`PrepareMetricsServer` moved to `internal/serverwiring`, whose own tests already pin the address-before-token validation. The root wrappers and their tests were deleted rather than retargeted.
+3. **WP-4 retarget 6 (EXEC dispatch timeout).** `redisDispatchTimeout` is a 30 s constant, so a blocking-store test would take 30 s or need a production change. The rewritten test records the deadline on the stream-deletion scan instead. The mutation named in the plan (`context.Background()` for the EXEC dispatch) survives because `txnContext.dispatchContext` bounds the commit context a second time. Removing that second bound (`dispatchContext` returning an unbounded context) fails the test.
 
 ---
 
@@ -593,6 +627,8 @@ Record each mutation in the PR as a row: file and line, the change, the test tha
 - **FUSE tests are mandatory in CI.** CI installs `fuse3` and sets `ELASTICKV_REQUIRE_FUSE=1`, so missing FUSE coverage fails instead of skipping (WP-0).
 
 ## Follow-ups (out of scope)
+
+- **Dead DynamoDB lease branch.** Remove the unreachable hash-key-mismatch branch in `queryLeasePrefix` (`adapter/dynamodb_lease.go`), or document why it is kept (deviation 1 above).
 
 - **Product bugs found by the audit.** Each needs its own PR with a failing test first.
   - SQS FIFO messages in one group sent within the same millisecond can be received out of order. The visibility key orders by `(visibleAtMillis, random messageID)`. `TestSQSServer_FifoGroupLockHoldsAcrossVisibilityExpiry` and `TestSQSServer_FifoSequenceNumberMonotonic` fail roughly 7/30 and 2/30 runs without `-race`.

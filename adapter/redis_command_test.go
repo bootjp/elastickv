@@ -379,48 +379,12 @@ func TestCommand_GetKeysAndFlagsRejected(t *testing.T) {
 	require.Contains(t, conn.writes[0].s, "unsupported")
 }
 
-func TestCommand_RoutedViaServer(t *testing.T) {
-	t.Parallel()
-	// Verify the route wiring: a COMMAND request reaching RedisServer.route
-	// dispatches to r.command. We cannot exercise redcon.Serve in a unit
-	// test without a network listener, so we instead reach into the route
-	// map as the live server would.
-	srv := &RedisServer{}
-	srv.route = map[string]func(conn redcon.Conn, cmd redcon.Command){
-		cmdCommand: srv.command,
-	}
-	handler, ok := srv.route[cmdCommand]
-	require.True(t, ok, "COMMAND must be routed")
-	conn := &commandRecorder{}
-	handler(conn, redcon.Command{Args: [][]byte{[]byte("COMMAND"), []byte("COUNT")}})
-	require.Len(t, conn.writes, 1)
-	require.Equal(t, "int", conn.writes[0].op)
-}
-
 // TestCommand_ArgsLenAllowsBare ensures the validateCmd arity check
 // accepts bare `COMMAND` (no subcommand), matching real Redis where
 // `COMMAND` with no args is the canonical "dump all" call.
 func TestCommand_ArgsLenAllowsBare(t *testing.T) {
 	t.Parallel()
 	require.Equal(t, -1, argsLen[cmdCommand])
-}
-
-// TestCommand_RouteMatchesTable asserts that every command currently
-// routed has a metadata row in redisCommandTable. Catches the common
-// mistake of adding a new handler without extending the table — the
-// runtime path would fall back to zero-metadata + a log warning, but we
-// want hard failure in CI.
-func TestCommand_RouteMatchesTable(t *testing.T) {
-	t.Parallel()
-	srv := &RedisServer{}
-	// Rebuild the route map via NewRedisServer would need a listener; we
-	// instead iterate argsLen (which every routed command has an entry
-	// in — see redis.go) as the closest proxy.
-	for name := range argsLen {
-		_, ok := redisCommandTable[name]
-		require.Truef(t, ok, "command %q routed but missing from redisCommandTable", name)
-	}
-	_ = srv
 }
 
 // TestRedisCommandSpecs_NoDuplicateConstants guards the structural

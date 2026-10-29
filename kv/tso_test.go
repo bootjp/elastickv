@@ -100,7 +100,7 @@ func TestShardedCoordinatorBackupFloorDropsCachedTSOWindow(t *testing.T) {
 	clock.SetPhysicalCeiling(time.Now().Add(testTSOFutureCeiling).UnixMilli())
 	coord := NewShardedCoordinator(
 		distribution.NewEngineWithDefaultRoute(),
-		map[uint64]*ShardGroup{1: {Engine: stubLeaderEngine{}}},
+		map[uint64]*ShardGroup{1: {Engine: newStubLeaderEngine()}},
 		1,
 		clock,
 		nil,
@@ -272,7 +272,7 @@ func TestShardedCoordinatorReportsAnyShardAsTimestampLeader(t *testing.T) {
 
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Engine: stubLeaderEngine{}},
+		2: {Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	require.False(t, coord.IsLeader())
@@ -284,8 +284,8 @@ func TestShardedCoordinatorDedicatedGroupDoesNotBlockDataLeaderTimestampBridge(t
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		0: {Engine: &stubFollowerEngine{}},
-		1: {Engine: stubLeaderEngine{}},
+		0: {Engine: newStubFollowerEngine("")},
+		1: {Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	require.True(t, coord.IsTimestampLeader())
@@ -297,8 +297,8 @@ func TestShardedCoordinatorTimestampBridgeIgnoresReservedGroupLeader(t *testing.
 
 	newCoord := func() *ShardedCoordinator {
 		return NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-			0: {Engine: stubLeaderEngine{}},
-			1: {Engine: &stubFollowerEngine{}},
+			0: {Engine: newStubLeaderEngine()},
+			1: {Engine: newStubFollowerEngine("")},
 		}, 1, NewHLC(), nil)
 	}
 
@@ -317,16 +317,16 @@ func TestShardedCoordinatorUsesDedicatedTimestampGroupLeader(t *testing.T) {
 	engine.UpdateRoute([]byte("m"), nil, 2)
 
 	dataLeaderOnly := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		0: {Engine: &stubFollowerEngine{}},
-		1: {Engine: stubLeaderEngine{}},
-		2: {Engine: &stubFollowerEngine{}},
+		0: {Engine: newStubFollowerEngine("")},
+		1: {Engine: newStubLeaderEngine()},
+		2: {Engine: newStubFollowerEngine("")},
 	}, 1, NewHLC(), nil).WithTimestampGroup(0)
 	require.False(t, dataLeaderOnly.IsTimestampLeader())
 
 	tsoLeader := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		0: {Engine: stubLeaderEngine{}},
-		1: {Engine: &stubFollowerEngine{}},
-		2: {Engine: &stubFollowerEngine{}},
+		0: {Engine: newStubLeaderEngine()},
+		1: {Engine: newStubFollowerEngine("")},
+		2: {Engine: newStubFollowerEngine("")},
 	}, 1, NewHLC(), nil).WithTimestampGroup(0)
 	require.True(t, tsoLeader.IsTimestampLeader())
 }
@@ -558,7 +558,7 @@ func TestShardedCoordinatorRawFollowerDefersTSOAllocationToLeaderPath(t *testing
 	alloc := &blockingTimestampAllocator{}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {
-			Engine: &stubFollowerEngine{},
+			Engine: newStubFollowerEngine(""),
 			Txn:    txn,
 		},
 	}, 1, NewHLC(), nil).WithTSOAllocator(alloc)
@@ -881,9 +881,9 @@ func TestShardedCoordinatorPinsCandidateTimestampGroupOnPhaseD(t *testing.T) {
 
 	state := &mutableTSOCutoverState{}
 	groups := map[uint64]*ShardGroup{
-		0: {Engine: stubLeaderEngine{}},
-		1: {Engine: stubLeaderEngine{}},
-		2: {Engine: stubLeaderEngine{}},
+		0: {Engine: newStubLeaderEngine()},
+		1: {Engine: newStubLeaderEngine()},
+		2: {Engine: newStubLeaderEngine()},
 	}
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).
 		WithAllShardGroups(1, 2).
@@ -923,8 +923,8 @@ func TestShardedCoordinatorKeepsRenewingWithoutTimestampGroupUnderPhaseD(t *test
 	state.cutover.Store(true)
 	state.phaseD.Store(true)
 	groups := map[uint64]*ShardGroup{
-		1: {Engine: stubLeaderEngine{}},
-		2: {Engine: stubLeaderEngine{}},
+		1: {Engine: newStubLeaderEngine()},
+		2: {Engine: newStubLeaderEngine()},
 	}
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).
 		WithTSOCutoverState(state)
@@ -939,8 +939,8 @@ func TestShardedCoordinatorExplicitTimestampGroupStillPinsWithoutPhaseD(t *testi
 	engine.UpdateRoute([]byte(""), nil, 1)
 
 	groups := map[uint64]*ShardGroup{
-		0: {Engine: stubLeaderEngine{}},
-		1: {Engine: &stubFollowerEngine{}},
+		0: {Engine: newStubLeaderEngine()},
+		1: {Engine: newStubFollowerEngine("")},
 	}
 	coord := NewShardedCoordinator(engine, groups, 1, NewHLC(), nil).WithTimestampGroup(0)
 

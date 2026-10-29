@@ -1,6 +1,7 @@
 package kv
 
 import (
+	"context"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -53,4 +54,24 @@ func TestCoordinatorForwarderGroupLeadershipDelegatesToGroupRouter(t *testing.T)
 	require.True(t, f.IsLeaderForGroup(1))
 	require.False(t, f.IsLeaderForGroup(2))
 	require.Equal(t, "n2:50051", f.RaftLeaderForGroup(2))
+}
+
+func TestCoordinatorForwarderTimestampSupportFollowsInner(t *testing.T) {
+	t.Parallel()
+
+	legacy := CoordinatorForwarder{Inner: &nopCoordinator{}}
+	require.False(t, legacy.SupportsAllGroupsLeaseTimestamp())
+	require.False(t, (CoordinatorForwarder{Inner: legacy}).SupportsAllGroupsLeaseTimestamp())
+
+	withTimestamp := CoordinatorForwarder{Inner: timestampCoordinator{Coordinator: &nopCoordinator{}}}
+	require.True(t, withTimestamp.SupportsAllGroupsLeaseTimestamp())
+	require.True(t, (CoordinatorForwarder{Inner: withTimestamp}).SupportsAllGroupsLeaseTimestamp())
+}
+
+type timestampCoordinator struct {
+	Coordinator
+}
+
+func (timestampCoordinator) LeaseReadAllGroupsTimestamp(context.Context) (uint64, error) {
+	return 1, nil
 }

@@ -3,11 +3,11 @@ package store
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"path/filepath"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/stretchr/testify/require"
 	"pgregory.net/rapid"
 )
@@ -25,7 +25,7 @@ import (
 //
 // The fixture is constructed once per Check call so the same
 // keystore + cipher + nonce factory exercises many writes — this
-// catches any nonce-reuse regression in CounterNonceFactory's
+// catches any nonce-reuse regression in DeterministicNonceFactory's
 // atomic counter.
 //
 // Tamper rejection is covered by the deterministic
@@ -56,20 +56,11 @@ func TestEncryption_Property_PutGet(t *testing.T) {
 // counter is shared by all generated writes, including shrinking attempts.
 func newPropEncryptedStore(t *testing.T) MVCCStore {
 	t.Helper()
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	_, _ = rand.Read(dek)
-	if err := ks.Set(7, dek); err != nil {
-		t.Fatalf("Keystore.Set: %v", err)
-	}
-	c, err := encryption.NewCipher(ks)
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
+	c := encryptiontest.NewCipher(t, 7)
 	dir := filepath.Join(t.TempDir(), "pebble")
 	mvcc, err := NewPebbleStore(dir,
 		WithEncryption(c,
-			NewCounterNonceFactory(0xCAFE, 0x0001),
+			encryption.NewDeterministicNonceFactory(0xCAFE, 0x0001),
 			func() (uint32, bool) { return 7, true },
 		),
 	)

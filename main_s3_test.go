@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/sha256"
-	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -17,16 +16,14 @@ import (
 	"golang.org/x/sync/errgroup"
 )
 
-func TestStartS3ServerRejectsVirtualHostedStyleConfig(t *testing.T) {
-	eg, ctx := errgroup.WithContext(context.Background())
-	srv, err := startS3Server(ctx, &net.ListenConfig{}, eg, "localhost:9000", nil, nil, nil, "us-east-1", "", false, nil, nil, nil)
+func TestNewS3ServerRejectsVirtualHostedStyleConfig(t *testing.T) {
+	srv, err := newS3Server("localhost:9000", nil, nil, nil, "us-east-1", "", false, nil, nil, nil, nil, nil, nil)
 	require.ErrorContains(t, err, "virtual-hosted style S3 requests are not implemented")
 	require.Nil(t, srv)
 }
 
-func TestStartS3ServerAllowsEmptyAddress(t *testing.T) {
-	eg, ctx := errgroup.WithContext(context.Background())
-	srv, err := startS3Server(ctx, &net.ListenConfig{}, eg, "", nil, nil, nil, "us-east-1", "", false, nil, nil, nil)
+func TestNewS3ServerAllowsEmptyAddress(t *testing.T) {
+	srv, err := newS3Server("", nil, nil, nil, "us-east-1", "", false, nil, nil, nil, nil, nil, nil)
 	require.NoError(t, err)
 	require.Nil(t, srv)
 }

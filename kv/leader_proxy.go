@@ -69,9 +69,7 @@ func (p *LeaderProxy) commitWithLocalStamp(ctx context.Context, reqs []*pb.Reque
 	}
 	// Verify leadership with a quorum to avoid accepting writes on a stale leader.
 	// The caller's ctx (via verifyLeaderEngineCtx) bounds the ReadIndex
-	// round-trip; verifyLeaderEngine's no-arg variant remains as the
-	// background-caller fallback (#745) but is no longer hit on the
-	// dispatch hot path.
+	// round-trip, with a five-second fallback for deadline-less callers (#745).
 	if err := verifyLeaderEngineCtx(ctx, p.engine); err != nil {
 		return p.forwardWithRetry(ctx, reqs)
 	}

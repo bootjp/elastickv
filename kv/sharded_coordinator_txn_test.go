@@ -178,7 +178,7 @@ func TestShardedCoordinatorValidateReadKeysOnShard_UsesStagedVisibility(t *testi
 	readKey := []byte("k")
 	require.NoError(t, st.PutAt(ctx, distribution.MigrationStagedDataKey(9, readKey), []byte("staged"), 20, 0))
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		1: {Engine: stubLeaderEngine{}, Store: st},
+		1: {Engine: newStubLeaderEngine(), Store: st},
 	}, 1, NewHLC(), nil)
 
 	err := coord.validateReadKeysOnShard(ctx, 1, [][]byte{readKey}, 10)
@@ -457,31 +457,6 @@ func TestShardedCoordinatorDispatchTxn_RejectsMissingPrimaryKey(t *testing.T) {
 		},
 	})
 	require.ErrorIs(t, err, ErrTxnPrimaryKeyRequired)
-}
-
-func TestShardedCoordinatorDispatchNonTxn_RejectsRouteWriteTimestampFloor(t *testing.T) {
-	t.Parallel()
-
-	engine := distribution.NewEngine()
-	require.NoError(t, engine.ApplySnapshot(distribution.CatalogSnapshot{
-		Version: 1,
-		Routes: []distribution.RouteDescriptor{
-			{RouteID: 1, Start: []byte(""), GroupID: 1, State: distribution.RouteStateActive, MinWriteTSExclusive: ^uint64(0)},
-		},
-	}))
-
-	g1Txn := &recordingTransactional{}
-	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		1: {Txn: g1Txn},
-	}, 1, NewHLC(), nil)
-
-	_, err := coord.Dispatch(context.Background(), &OperationGroup[OP]{
-		Elems: []*Elem[OP]{
-			{Op: Put, Key: []byte("b"), Value: []byte("v")},
-		},
-	})
-	require.ErrorIs(t, err, store.ErrWriteConflict)
-	require.Empty(t, g1Txn.requests)
 }
 
 func TestNewShardedCoordinatorCopiesGroupMap(t *testing.T) {
@@ -851,7 +826,7 @@ func TestDispatchWithReadTimestampRevokesVoucherWhenOuterGateRejects(t *testing.
 	prePhaseDErr := errors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD)
 	coord, _, _, _ := newPhaseDCrossShardCoordinator(t, prePhaseDErr)
 	gateErr := errors.New("startup gate rejected dispatch")
-	gated := phaseDGateCoordinator{inner: coord, err: gateErr}
+	gated := phaseDGateCoordinator{phaseDGateInner: coord, err: gateErr}
 
 	readTimestamp, err := BeginReadTimestampThrough(context.Background(), gated, 10, "vouch gated applied watermark")
 	require.NoError(t, err)
@@ -983,9 +958,19 @@ func newPhaseDCrossShardCoordinator(
 	return coord, g1Txn, g2Txn, alloc
 }
 
+// phaseDGateInner is exactly the surface phaseDGateCoordinator forwarded
+// by hand; embedding it keeps the gate from gaining the sharded
+// coordinator's other optional capabilities.
+type phaseDGateInner interface {
+	Coordinator
+	TimestampAllocator() TimestampAllocator
+	VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error
+	RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef)
+}
+
 type phaseDGateCoordinator struct {
-	inner *ShardedCoordinator
-	err   error
+	phaseDGateInner
+	err error
 }
 
 type overlappingReadVoucherCoordinator struct {
@@ -1092,44 +1077,6 @@ func (c *overlappingReadVoucherCoordinator) Clock() *HLC { return c.clock }
 
 func (c phaseDGateCoordinator) Dispatch(context.Context, *OperationGroup[OP]) (*CoordinateResponse, error) {
 	return nil, c.err
-}
-
-func (c phaseDGateCoordinator) IsLeader() bool { return c.inner.IsLeader() }
-
-func (c phaseDGateCoordinator) VerifyLeader(ctx context.Context) error {
-	return c.inner.VerifyLeader(ctx)
-}
-
-func (c phaseDGateCoordinator) LinearizableRead(ctx context.Context) (uint64, error) {
-	return c.inner.LinearizableRead(ctx)
-}
-
-func (c phaseDGateCoordinator) RaftLeader() string { return c.inner.RaftLeader() }
-
-func (c phaseDGateCoordinator) IsLeaderForKey(key []byte) bool {
-	return c.inner.IsLeaderForKey(key)
-}
-
-func (c phaseDGateCoordinator) VerifyLeaderForKey(ctx context.Context, key []byte) error {
-	return c.inner.VerifyLeaderForKey(ctx, key)
-}
-
-func (c phaseDGateCoordinator) RaftLeaderForKey(key []byte) string {
-	return c.inner.RaftLeaderForKey(key)
-}
-
-func (c phaseDGateCoordinator) Clock() *HLC { return c.inner.Clock() }
-
-func (c phaseDGateCoordinator) TimestampAllocator() TimestampAllocator {
-	return c.inner.TimestampAllocator()
-}
-
-func (c phaseDGateCoordinator) VouchAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) error {
-	return c.inner.VouchAppliedReadTimestamp(timestamp, ref)
-}
-
-func (c phaseDGateCoordinator) RevokeAppliedReadTimestamp(timestamp uint64, ref AppliedReadTimestampVoucherRef) {
-	c.inner.RevokeAppliedReadTimestamp(timestamp, ref)
 }
 
 func TestShardedCoordinatorDispatchTxn_SingleShardUsesOnePhase(t *testing.T) {
@@ -1432,27 +1379,6 @@ func (s *stubMVCCStore) MigrationTargetReadinessStates(_ context.Context) ([]sto
 	return s.readiness, nil
 }
 
-// noopEngine satisfies raftengine.Engine for unit tests.
-// LinearizableRead returns immediately (simulates an already-up-to-date FSM).
-type noopEngine struct{}
-
-func (noopEngine) Propose(_ context.Context, _ []byte) (*raftengine.ProposalResult, error) {
-	return &raftengine.ProposalResult{}, nil
-}
-func (e noopEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	return e.Propose(ctx, data)
-}
-func (noopEngine) State() raftengine.State                            { return raftengine.StateLeader }
-func (noopEngine) Leader() raftengine.LeaderInfo                      { return raftengine.LeaderInfo{} }
-func (noopEngine) VerifyLeader(_ context.Context) error               { return nil }
-func (noopEngine) LinearizableRead(_ context.Context) (uint64, error) { return 0, nil }
-func (noopEngine) Status() raftengine.Status                          { return raftengine.Status{} }
-func (noopEngine) Configuration(_ context.Context) (raftengine.Configuration, error) {
-	return raftengine.Configuration{}, nil
-}
-func (noopEngine) SnapshotEvery() uint64 { return 10_000 }
-func (noopEngine) Close() error          { return nil }
-
 func TestValidateReadOnlyShards_DetectsConflictOnReadOnlyShard(t *testing.T) {
 	t.Parallel()
 	engine := distribution.NewEngine()
@@ -1464,7 +1390,7 @@ func TestValidateReadOnlyShards_DetectsConflictOnReadOnlyShard(t *testing.T) {
 	}}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1487,7 +1413,7 @@ func TestValidateReadOnlyShards_SkipsWriteShards(t *testing.T) {
 		"b": 20,
 	}}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
-		1: {Store: writeStore, Engine: noopEngine{}},
+		1: {Store: writeStore, Engine: newStubLeaderEngine()},
 		2: {},
 	}, 1, NewHLC(), nil)
 
@@ -1509,7 +1435,7 @@ func TestValidateReadOnlyShards_NoConflictWhenKeyUnchanged(t *testing.T) {
 	}}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1560,7 +1486,7 @@ func TestValidateReadOnlyShards_FailsClosedOnTargetReadiness(t *testing.T) {
 	}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1592,7 +1518,7 @@ func TestValidateReadOnlyShards_FailsClosedOnSourceReadFence(t *testing.T) {
 	}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	err := coord.validateReadOnlyShards(context.Background(), map[uint64][][]byte{
@@ -1644,7 +1570,7 @@ func TestValidateReadOnlyShards_ChecksStagedVisibilityLatestCommitTS(t *testing.
 	}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{
@@ -1664,7 +1590,7 @@ func TestValidateReadOnlyShards_PropagatesStoreError(t *testing.T) {
 	readOnlyStore := &stubMVCCStore{returnErr: storeErr}
 	coord := NewShardedCoordinator(engine, map[uint64]*ShardGroup{
 		1: {},
-		2: {Store: readOnlyStore, Engine: noopEngine{}},
+		2: {Store: readOnlyStore, Engine: newStubLeaderEngine()},
 	}, 1, NewHLC(), nil)
 
 	groupedReadKeys := map[uint64][][]byte{

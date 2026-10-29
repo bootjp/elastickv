@@ -1082,7 +1082,7 @@ func (e *Engine) Propose(ctx context.Context, data []byte) (*raftengine.Proposal
 // contract for the full exempt set).
 //
 // The barrier exemption is the SOLE divergence from Propose: a
-// higher-layer wrap (kv.wrappedProposer) applies its wrap closure
+// higher-layer wrap (kv.dynamicWrappedProposer) applies its wrap closure
 // to both methods identically, so admin entries landing above the
 // raft-envelope cutover still carry the AEAD envelope the §6.3
 // strict-`>` apply hook expects. Only the cutover marker itself is
@@ -3417,27 +3417,6 @@ func applyUpdatedPeerToMap(peers map[uint64]Peer, peer Peer, ok bool) {
 	if ok {
 		upsertPeerInMap(peers, peer)
 	}
-}
-
-func (e *Engine) persistConfigSnapshot(index uint64, confState raftpb.ConfState) error {
-	// Fast path (lock-free): avoid unnecessary FSM snapshot when config is already current.
-	if upToDate, err := e.configSnapshotUpToDate(index, confState); err != nil {
-		return err
-	} else if upToDate {
-		return nil
-	}
-
-	e.snapshotMu.Lock()
-	defer e.snapshotMu.Unlock()
-
-	payload, err := e.snapshotPayloadLocked(index)
-	if err != nil {
-		if snapshotDeferred(err, "config snapshot", index) {
-			return nil
-		}
-		return err
-	}
-	return e.persistConfigSnapshotPayloadLocked(index, confState, payload)
 }
 
 func (e *Engine) persistConfigState(index uint64, confState raftpb.ConfState, peers []Peer) error {

@@ -3,7 +3,6 @@ package kv
 import (
 	"bytes"
 	"encoding/base64"
-	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -333,15 +332,4 @@ func TestStreamScansAreNotWideColumnCanonicalizable(t *testing.T) {
 	} {
 		require.True(t, redisWideColumnCanonicalizableScan(start))
 	}
-}
-
-func legacyListMetaDeltaKey(userKey []byte, commitTS uint64) []byte {
-	const seqInTxn = uint32(1)
-	key := store.LegacyListMetaDeltaScanPrefix(userKey)
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], commitTS)
-	key = append(key, ts[:]...)
-	var seq [4]byte
-	binary.BigEndian.PutUint32(seq[:], seqInTxn)
-	return append(key, seq[:]...)
 }

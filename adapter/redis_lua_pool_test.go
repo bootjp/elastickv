@@ -140,32 +140,6 @@ func TestLua_VMReuseRestoresRebindsWhitelistedGlobals(t *testing.T) {
 	require.NoError(t, plsB.state.DoString(`assert(string.upper("abc") == "ABC", "string.upper was poisoned")`))
 }
 
-// TestLua_PoolSerialAcquireReusesState verifies the pool serves
-// existing *lua.LState instances in sequential acquire/release cycles
-// — the knob we care about for the heap-pressure win. The channel
-// pool is deterministic on a single goroutine, but the test runs
-// under t.Parallel, so we assert via the hit counter rather than
-// pointer identity (a sibling test could in principle pre-empt
-// between get and put).
-func TestLua_PoolSerialAcquireReusesState(t *testing.T) {
-	t.Parallel()
-
-	pool := newLuaStatePool()
-
-	// Prime the pool so the first Get allocates.
-	pool.put(pool.get(nil))
-
-	const iters = 50
-	for i := 0; i < iters; i++ {
-		pls := pool.get(nil)
-		pool.put(pls)
-	}
-	// At least one hit proves the pool is actually handing back an
-	// existing VM rather than minting a new one every time.
-	require.GreaterOrEqual(t, pool.Hits(), uint64(1),
-		"pool never reported a hit; channel-pool reuse not happening")
-}
-
 // TestLua_PoolRecordsReuseVsAllocation pins down the "is the pool
 // actually doing anything?" question via the hit/miss counters. The
 // test guards against a subtle regression where get() auto-fills on

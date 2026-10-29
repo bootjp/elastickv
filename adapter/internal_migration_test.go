@@ -188,7 +188,7 @@ func TestInternalExportRangeVersionsUsesValueAwareLegacyListDeltaRouteFilter(t *
 	ctx := context.Background()
 	st := store.NewMVCCStore()
 	userKey := []byte("target-list")
-	key := legacyListMetaDeltaKey(userKey, 10)
+	key := store.LegacyListMetaDeltaKey(userKey, 10, 0)
 	value := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
 	require.NoError(t, st.PutAt(ctx, key, value, 10, 0))
 	internal := NewInternalWithEngine(nil, mockInternalLeader{}, nil, nil, WithInternalStore(st))

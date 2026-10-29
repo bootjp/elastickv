@@ -503,22 +503,3 @@ func TestServer_ServerDepsForwarderIsWired(t *testing.T) {
 		"forwarder must be invoked when source returns ErrTablesNotLeader")
 	_ = resp.Body.Close()
 }
-
-func TestServer_WriteRejectsMissingCSRF(t *testing.T) {
-	// Login to obtain a session, then hit cluster with POST to trigger
-	// CSRF on what the router normally rejects as method_not_allowed.
-	// Since /cluster rejects POST at the handler level, we use an
-	// endpoint that would exercise the write path. For P1 we do not
-	// have one yet, so assert via a direct middleware-level test that
-	// composing Server routes a write path through CSRF. This is
-	// already covered by TestCSRF_* in middleware_test.go; here we
-	// spot-check the compose order by sending POST /cluster and
-	// expecting 405 (CSRF runs before method check so we get 403
-	// instead). Either 403 or 405 is acceptable; the important bit
-	// is that no handler state is mutated.
-	srv := newServerForTest(t)
-	req := httptest.NewRequest(http.MethodPost, "/admin/api/v1/cluster", nil)
-	rec := httptest.NewRecorder()
-	srv.Handler().ServeHTTP(rec, req)
-	require.Contains(t, []int{http.StatusUnauthorized, http.StatusForbidden, http.StatusMethodNotAllowed}, rec.Code)
-}

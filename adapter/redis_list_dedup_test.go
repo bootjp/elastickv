@@ -3,7 +3,6 @@ package adapter
 import (
 	"bytes"
 	"context"
-	"encoding/binary"
 	"errors"
 	"sync/atomic"
 	"testing"
@@ -140,7 +139,7 @@ func TestResolveListMetaReadsLegacyDeltaPrefix(t *testing.T) {
 	require.NoError(t, err)
 	require.NoError(t, st.PutAt(ctx, store.ListMetaKey(key), base, 1, 0))
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: -1, LenDelta: 3})
-	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 2), delta, 2, 0))
+	require.NoError(t, st.PutAt(ctx, store.LegacyListMetaDeltaKey(key, 2, 0), delta, 2, 0))
 
 	meta, exists, err := srv.resolveListMeta(ctx, key, 3)
 	require.NoError(t, err)
@@ -162,7 +161,7 @@ func TestResolveListMetaEnforcesDeltaLimitAcrossCurrentAndLegacyPrefixes(t *test
 		require.NoError(t, st.PutAt(ctx, store.ListMetaDeltaKey(key, i, 0), delta, i, 0))
 	}
 	legacyTS := uint64(store.MaxDeltaScanLimit + 1)
-	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, legacyTS), delta, legacyTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.LegacyListMetaDeltaKey(key, legacyTS, 0), delta, legacyTS, 0))
 
 	_, _, err := srv.resolveListMeta(ctx, key, legacyTS)
 	require.ErrorIs(t, err, ErrDeltaScanTruncated)
@@ -223,7 +222,7 @@ func TestResolveListMetaCountsOnlyAcceptedLegacyDeltasForTruncation(t *testing.T
 	}
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
 	deltaTS := uint64(store.MaxDeltaScanLimit + 2)
-	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.LegacyListMetaDeltaKey(key, deltaTS, 0), delta, deltaTS, 0))
 
 	meta, exists, err := srv.resolveListMeta(ctx, key, deltaTS+1)
 	require.NoError(t, err)
@@ -239,7 +238,7 @@ func TestProbeListTypeReadsLegacyDeltaPrefix(t *testing.T) {
 	srv := &RedisServer{store: st}
 	key := []byte("legacy-list-type")
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
-	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 2), delta, 2, 0))
+	require.NoError(t, st.PutAt(ctx, store.LegacyListMetaDeltaKey(key, 2, 0), delta, 2, 0))
 
 	typ, found, err := srv.probeListType(ctx, key, 3)
 	require.NoError(t, err)
@@ -279,7 +278,7 @@ func TestProbeListTypePagesPastLegacyDeltaPrefixCollisions(t *testing.T) {
 	}
 	deltaTS := uint64(store.MaxDeltaScanLimit + 1)
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
-	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, deltaTS), delta, deltaTS, 0))
+	require.NoError(t, st.PutAt(ctx, store.LegacyListMetaDeltaKey(key, deltaTS, 0), delta, deltaTS, 0))
 
 	typ, found, err := srv.probeListType(ctx, key, deltaTS+1)
 	require.NoError(t, err)
@@ -299,7 +298,7 @@ func TestDeleteListElemsFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
 	require.NoError(t, err)
 	collidingMetaKey := store.ListMetaKey(collidingUserKey)
 	require.NoError(t, st.PutAt(ctx, collidingMetaKey, base, 1, 0))
-	deltaKey := legacyListMetaDeltaKey(key, 2)
+	deltaKey := store.LegacyListMetaDeltaKey(key, 2, 0)
 	delta := store.MarshalListMetaDelta(store.ListMetaDelta{HeadDelta: 0, LenDelta: 1})
 	require.NoError(t, st.PutAt(ctx, deltaKey, delta, 2, 0))
 
@@ -315,33 +314,13 @@ func TestDeleteListElemsFiltersLegacyDeltaPrefixCollisions(t *testing.T) {
 	require.NotContains(t, deleted, string(collidingMetaKey))
 }
 
-func legacyListMetaDeltaKey(userKey []byte, commitTS uint64) []byte {
-	key := store.LegacyListMetaDeltaScanPrefix(userKey)
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], commitTS)
-	key = append(key, ts[:]...)
-	var seq [4]byte
-	binary.BigEndian.PutUint32(seq[:], 0)
-	return append(key, seq[:]...)
-}
-
 func deltaLookingListMetaUserKey(fakeUserKey []byte) []byte {
 	return deltaLookingListMetaUserKeyAt(fakeUserKey, 7, 1)
 }
 
 func deltaLookingListMetaUserKeyAt(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
-	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
-	key = append(key, "d|"...)
-	var lenPrefix [4]byte
-	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
-	key = append(key, lenPrefix[:]...)
-	key = append(key, fakeUserKey...)
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], commitTS)
-	key = append(key, ts[:]...)
-	var seq [4]byte
-	binary.BigEndian.PutUint32(seq[:], seqInTxn)
-	return append(key, seq[:]...)
+	// ListMetaKey of the returned user key reads as a legacy list delta key.
+	return bytes.TrimPrefix(store.LegacyListMetaDeltaKey(fakeUserKey, commitTS, seqInTxn), []byte(store.ListMetaPrefix))
 }
 
 func (c *dedupTestCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {

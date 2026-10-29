@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -104,11 +105,7 @@ func TestDynamoDBMigrateLegacySourceItemsPinsReadTS(t *testing.T) {
 
 	close(scanStore.release)
 
-	select {
-	case err := <-done:
-		require.NoError(t, err)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for migrateLegacySourceItems")
-	}
+	err := testutil.Recv(t, done, time.Second, "timed out waiting for migrateLegacySourceItems")
+	require.NoError(t, err)
 	require.Zero(t, tracker.Oldest())
 }

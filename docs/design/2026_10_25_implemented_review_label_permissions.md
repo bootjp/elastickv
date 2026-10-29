@@ -1,6 +1,6 @@
 # Review label permissions
 
-Status: Proposed
+Status: Implemented
 Author: bootjp
 Date: 2026-10-25
 
@@ -23,7 +23,7 @@ maintainer's authenticated CLI, preserving all HEAD/evidence rechecks.
 
 - [x] Validate workflow syntax and the existing reconciliation suite.
 - [x] Verify #1331's label through the same reconciliation helper.
-- [ ] Merge the permission change and verify a live Actions write.
+- [x] Merge the permission change (#1332) and verify a live Actions write (`pull-requests: write` is in `review-approval-label.yml`; the updater runs successfully on `main`, e.g. run 40666978702).
 
 The live Actions failure is the reproduction: POST issues/1331/labels returns
 403 despite a completed clean review. Workflow syntax checks cannot establish

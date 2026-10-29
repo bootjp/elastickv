@@ -228,16 +228,6 @@ func TestLegacyListMetaDeltaHelpersScanOldPrefixWithoutReclassifyingNewDelta(t *
 }
 
 func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
-	buf := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
-	buf = append(buf, "d|"...)
-	var keyLen [4]byte
-	binary.BigEndian.PutUint32(keyLen[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
-	buf = append(buf, keyLen[:]...)
-	buf = append(buf, fakeUserKey...)
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], commitTS)
-	buf = append(buf, ts[:]...)
-	var seq [4]byte
-	binary.BigEndian.PutUint32(seq[:], seqInTxn)
-	return append(buf, seq[:]...)
+	// ListMetaKey of the returned user key reads as a legacy list delta key.
+	return bytes.TrimPrefix(LegacyListMetaDeltaKey(fakeUserKey, commitTS, seqInTxn), []byte(ListMetaPrefix))
 }

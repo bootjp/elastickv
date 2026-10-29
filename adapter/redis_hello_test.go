@@ -1,7 +1,6 @@
 package adapter
 
 import (
-	"context"
 	"io"
 	"math"
 	"net"
@@ -9,7 +8,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/monitoring"
 	"github.com/prometheus/client_golang/prometheus/testutil"
@@ -92,42 +90,10 @@ func (c *helloRecordingConn) ReadPipeline() []redcon.Command { return nil }
 func (c *helloRecordingConn) PeekPipeline() []redcon.Command { return nil }
 func (c *helloRecordingConn) NetConn() net.Conn              { return nil }
 
-// helloTestCoordinator is the minimal kv.Coordinator stub HELLO
-// exercises. HELLO only inspects IsLeader for the role field; the rest
-// of the surface is satisfied with sensible defaults to avoid
-// NPE when handler helpers call through to unrelated methods.
-type helloTestCoordinator struct {
-	isLeader bool
-	clock    *kv.HLC
-}
-
-func (c *helloTestCoordinator) Dispatch(context.Context, *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	return &kv.CoordinateResponse{}, nil
-}
-func (c *helloTestCoordinator) IsLeader() bool                                   { return c.isLeader }
-func (c *helloTestCoordinator) VerifyLeader(context.Context) error               { return nil }
-func (c *helloTestCoordinator) RaftLeader() string                               { return "" }
-func (c *helloTestCoordinator) IsLeaderForKey([]byte) bool                       { return c.isLeader }
-func (c *helloTestCoordinator) VerifyLeaderForKey(context.Context, []byte) error { return nil }
-func (c *helloTestCoordinator) RaftLeaderForKey([]byte) string                   { return "" }
-func (c *helloTestCoordinator) Clock() *kv.HLC {
-	if c.clock == nil {
-		c.clock = kv.NewHLC()
-	}
-	return c.clock
-}
-func (c *helloTestCoordinator) LinearizableRead(_ context.Context) (uint64, error) { return 0, nil }
-func (c *helloTestCoordinator) LeaseRead(ctx context.Context) (uint64, error) {
-	return c.LinearizableRead(ctx)
-}
-func (c *helloTestCoordinator) LeaseReadForKey(ctx context.Context, _ []byte) (uint64, error) {
-	return c.LinearizableRead(ctx)
-}
-
 func newHelloTestServer(t *testing.T, leader bool) *RedisServer {
 	t.Helper()
 	return &RedisServer{
-		coordinator: &helloTestCoordinator{isLeader: leader},
+		coordinator: &stubAdapterCoordinator{leaderSet: true, leader: leader},
 	}
 }
 
@@ -408,7 +374,7 @@ func TestHello_MetricsRecordsKnownCommand(t *testing.T) {
 
 	registry := monitoring.NewRegistry("n1", "10.0.0.1:50051")
 	r := &RedisServer{
-		coordinator:     &helloTestCoordinator{isLeader: true},
+		coordinator:     &stubAdapterCoordinator{leaderSet: true, leader: true},
 		requestObserver: registry.RedisObserver(),
 	}
 

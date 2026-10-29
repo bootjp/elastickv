@@ -2,12 +2,12 @@ package store
 
 import (
 	"context"
-	"crypto/rand"
 	"path/filepath"
 	"sync"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -74,7 +74,7 @@ func (f *observedEncryptedFixture) closeIfOpen(tb testing.TB) {
 func (f *observedEncryptedFixture) options() []PebbleStoreOption {
 	return []PebbleStoreOption{
 		WithEncryption(f.cipher,
-			NewCounterNonceFactory(0xBEEF, 0x0001),
+			encryption.NewDeterministicNonceFactory(0xBEEF, 0x0001),
 			func() (uint32, bool) { return f.keyID, true },
 		),
 		WithEncryptionObserver(f.obs),
@@ -92,14 +92,7 @@ func (f *observedEncryptedFixture) reopen(tb testing.TB) {
 func newObservedEncryptedFixture(t *testing.T, keyID uint32) *observedEncryptedFixture {
 	t.Helper()
 
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	_, err := rand.Read(dek)
-	require.NoError(t, err)
-	require.NoError(t, ks.Set(keyID, dek))
-
-	cipher, err := encryption.NewCipher(ks)
-	require.NoError(t, err)
+	cipher := encryptiontest.NewCipher(t, keyID)
 
 	f := &observedEncryptedFixture{
 		dir:    filepath.Join(t.TempDir(), "pebble"),
@@ -232,20 +225,14 @@ func TestEncryptionObserverIgnoresRebadgeGuardTrialDecrypts(t *testing.T) {
 
 	const keyID = uint32(14)
 
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	_, err := rand.Read(dek)
-	require.NoError(t, err)
-	require.NoError(t, ks.Set(keyID, dek))
-	cipher, err := encryption.NewCipher(ks)
-	require.NoError(t, err)
+	cipher := encryptiontest.NewCipher(t, keyID)
 
 	obs := &recordingEncryptionObserver{}
 	// Cipher wired but the cutover gate is OFF: writes stay
 	// cleartext, and every read runs the rebadge trial-decrypt.
 	mvcc, err := NewPebbleStore(filepath.Join(t.TempDir(), "pebble"),
 		WithEncryption(cipher,
-			NewCounterNonceFactory(0xCAFE, 0x0001),
+			encryption.NewDeterministicNonceFactory(0xCAFE, 0x0001),
 			func() (uint32, bool) { return keyID, true },
 		),
 		WithStorageEnvelopeGate(func() bool { return false }),

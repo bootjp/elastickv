@@ -5,6 +5,7 @@ import (
 	"encoding/binary"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/stretchr/testify/require"
 )
 
@@ -75,7 +76,7 @@ func TestOwnershipPartitionRootManifestExternalRefusal(t *testing.T) {
 				ps.sstIngestSnapshots = format == "encrypted-sst"
 				require.NoError(t, fixture.mvcc.PutAt(t.Context(), key, []byte("root manifest"), 1, 0))
 				raw = externalTestSnapshot(t, fixture.mvcc)
-				options = []PebbleStoreOption{WithEncryption(fixture.cipher, NewCounterNonceFactory(0xABCD, 2), func() (uint32, bool) { return fixture.keyID, true })}
+				options = []PebbleStoreOption{WithEncryption(fixture.cipher, encryption.NewDeterministicNonceFactory(0xABCD, 2), func() (uint32, bool) { return fixture.keyID, true })}
 			} else {
 				source := externalTestMemory(t)
 				require.NoError(t, source.PutAt(t.Context(), key, []byte("root manifest"), 1, 0))

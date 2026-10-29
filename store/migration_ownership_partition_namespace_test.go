@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/stretchr/testify/require"
 )
 
@@ -119,7 +120,7 @@ func activatedPartitionSnapshotSource(t *testing.T, format string) (MVCCStore, [
 	ps, ok := fixture.mvcc.(*pebbleStore)
 	require.True(t, ok)
 	ps.sstIngestSnapshots = format == "encrypted-sst"
-	return fixture.mvcc, []PebbleStoreOption{WithEncryption(fixture.cipher, NewCounterNonceFactory(0xABCD, 2),
+	return fixture.mvcc, []PebbleStoreOption{WithEncryption(fixture.cipher, encryption.NewDeterministicNonceFactory(0xABCD, 2),
 		func() (uint32, bool) { return fixture.keyID, true })}
 }
 

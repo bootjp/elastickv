@@ -200,7 +200,7 @@ func TestCoordinateSamplerObservesRawTxnAndRead(t *testing.T) {
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	c := (&Coordinate{
 		transactionManager: &stubTransactional{},
-		engine:             stubLeaderEngine{},
+		engine:             newStubLeaderEngine(),
 		clock:              clock,
 	}).WithSampler(sampler, routeID)
 
@@ -242,7 +242,7 @@ func TestCoordinateSamplerResolvesRouteForEveryObservedKey(t *testing.T) {
 	clock.SetPhysicalCeiling(time.Now().Add(time.Minute).UnixMilli())
 	c := (&Coordinate{
 		transactionManager: &stubTransactional{},
-		engine:             stubLeaderEngine{},
+		engine:             newStubLeaderEngine(),
 		clock:              clock,
 	}).WithSamplerRouteResolver(sampler, func(key []byte) (uint64, bool) {
 		resolverKeys = append(resolverKeys, append([]byte(nil), key...))
@@ -305,7 +305,7 @@ func TestCoordinateSamplerObservesFollowerIngressBeforeRedirect(t *testing.T) {
 	})
 	require.True(t, sampler.RegisterRoute(routeID, []byte(""), nil, 1))
 	c := (&Coordinate{
-		engine: redirectSamplerFollowerEngine{},
+		engine: redirectSamplerFollowerEngine{newStubLeaderEngine()},
 	}).WithSampler(sampler, routeID)
 
 	_, err := c.dispatchOnce(context.Background(), &OperationGroup[OP]{Elems: []*Elem[OP]{
@@ -317,7 +317,7 @@ func TestCoordinateSamplerObservesFollowerIngressBeforeRedirect(t *testing.T) {
 }
 
 type redirectSamplerFollowerEngine struct {
-	stubLeaderEngine
+	*testEngine
 }
 
 func (redirectSamplerFollowerEngine) State() raftengine.State { return raftengine.StateFollower }

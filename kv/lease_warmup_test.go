@@ -11,6 +11,7 @@ import (
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/monoclock"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
 )
 
@@ -366,6 +367,44 @@ func TestShardedCoordinator_RecoverHLCLease_ProposesToEveryLedGroup(t *testing.T
 	require.NotZero(t, got)
 }
 
+func TestShardedCoordinator_RecoverHLCLease_LogicalCeilingExhausted(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	ceiling := time.Now().Add(time.Minute).UnixMilli()
+	clock.SetPhysicalCeiling(ceiling)
+	clock.Observe((uint64(ceiling) << hlcLogicalBits) | hlcLogicalMask)
+	eng := newShardedLeaseEngine(100)
+	eng.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	follower := newShardedLeaseEngine(200)
+	follower.state.Store(raftengine.StateFollower)
+	coord := mustShardedLeaseCoord(t, eng, follower)
+	coord.clock = clock
+
+	_, err := coord.nextTxnTSAfter(context.Background(), 0)
+	require.NoError(t, err)
+	require.Equal(t, int32(1), eng.proposeCalls.Load())
+	_, err = clock.NextFenced()
+	require.NoError(t, err)
+	require.Greater(t, clock.PhysicalCeiling(), ceiling)
+}
+
+func TestCoordinate_RecoverHLCLease_LogicalCeilingExhausted(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	ceiling := time.Now().Add(time.Minute).UnixMilli()
+	clock.SetPhysicalCeiling(ceiling)
+	clock.Observe((uint64(ceiling) << hlcLogicalBits) | hlcLogicalMask)
+	eng := &fakeLeaseEngine{applied: 11, leaseDur: time.Hour}
+	eng.proposeApply = applyHLCLeaseEntryToClock(t, clock)
+	coord := NewCoordinatorWithEngine(nil, eng, WithHLC(clock))
+
+	require.NoError(t, coord.RecoverHLCLease(context.Background()))
+	require.Equal(t, int32(1), eng.proposeCalls.Load())
+	require.Greater(t, clock.PhysicalCeiling(), ceiling)
+	_, err := clock.NextFenced()
+	require.NoError(t, err)
+}
+
 func TestShardedCoordinator_RecoverHLCLease_SlowTargetDoesNotBlockSuccessfulPeer(t *testing.T) {
 	t.Parallel()
 	clock := NewHLC()
@@ -512,14 +551,10 @@ func TestShardedCoordinator_RenewHLCLeases_UsesProposalTimeoutBeyondCadence(t *t
 	done := coord.renewHLCLeases(context.Background())
 	requireRenewalDone(t, done)
 
-	select {
-	case remaining := <-deadlineRemaining:
-		require.Greater(t, remaining, hlcRenewalInterval,
-			"renewal proposals need a timeout longer than the cadence under load")
-		require.LessOrEqual(t, remaining, hlcRenewalProposalTimeout)
-	case <-time.After(time.Second):
-		t.Fatal("timed out waiting for captured renewal deadline")
-	}
+	remaining := testutil.Recv(t, deadlineRemaining, time.Second, "timed out waiting for captured renewal deadline")
+	require.Greater(t, remaining, hlcRenewalInterval,
+		"renewal proposals need a timeout longer than the cadence under load")
+	require.LessOrEqual(t, remaining, hlcRenewalProposalTimeout)
 }
 
 func TestHLCLeaseRenewalTimingHasPhysicalWindowMargin(t *testing.T) {
@@ -606,9 +641,5 @@ func TestShardedCoordinator_ProposeHLCLease_UsesDedicatedTimestampGroup(t *testi
 
 func requireRenewalDone(t *testing.T, done <-chan struct{}) {
 	t.Helper()
-	select {
-	case <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("timed out waiting for HLC lease renewals")
-	}
+	testutil.Closed(t, done, 2*time.Second, "timed out waiting for HLC lease renewals")
 }

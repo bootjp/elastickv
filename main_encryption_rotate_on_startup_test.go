@@ -16,6 +16,7 @@ import (
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/kv"
 	"github.com/bootjp/elastickv/monitoring"
 	pb "github.com/bootjp/elastickv/proto"
@@ -292,16 +293,8 @@ func TestInstallEncryptionRotateOnStartupRequest_CallbackDoesNotBlockOnDone(t *t
 		controller.becomeLeader()
 		close(returned)
 	}()
-	select {
-	case <-returned:
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("leader-acquired callback blocked before starting async rotation")
-	}
-	select {
-	case <-runner.doneEntered:
-	case <-time.After(2 * time.Second):
-		t.Fatal("async rotation did not reach Done")
-	}
+	testutil.Closed(t, returned, 100*time.Millisecond, "leader-acquired callback blocked before starting async rotation")
+	testutil.Closed(t, runner.doneEntered, 2*time.Second, "async rotation did not reach Done")
 }
 
 func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testing.T) {
@@ -317,11 +310,7 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitTracksAsyncFlight(t *testin
 		t.Fatalf("initial follower wait: %v", err)
 	}
 	controller.becomeLeader()
-	select {
-	case <-runner.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("async rotation did not start")
-	}
+	testutil.Closed(t, runner.started, 2*time.Second, "async rotation did not start")
 
 	waitDone := make(chan error, 1)
 	go func() {
@@ -360,11 +349,7 @@ func TestInstallEncryptionRotateOnStartupRequest_WaitContinuesAfterConcurrentFir
 	go func() {
 		waitDone <- waitStartup.Wait(context.Background())
 	}()
-	select {
-	case <-runner.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("concurrent startup rotation did not start")
-	}
+	testutil.Closed(t, runner.started, 2*time.Second, "concurrent startup rotation did not start")
 	select {
 	case err := <-waitDone:
 		t.Fatalf("startup wait returned before concurrent rotation finished: %v", err)
@@ -395,11 +380,7 @@ func TestInstallEncryptionRotateOnStartupRequest_BlocksMutatorsDuringAsyncStartu
 		t.Fatalf("initial follower wait: %v", err)
 	}
 	controller.becomeLeader()
-	select {
-	case <-runner.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("async startup rotation did not start")
-	}
+	testutil.Closed(t, runner.started, 2*time.Second, "async startup rotation did not start")
 	if !waitStartup.BlockMutators() {
 		t.Fatal("startup mutator gate must remain closed while async rotation is in flight")
 	}
@@ -407,11 +388,7 @@ func TestInstallEncryptionRotateOnStartupRequest_BlocksMutatorsDuringAsyncStartu
 	close(runner.release)
 	deadline := time.After(2 * time.Second)
 	for waitStartup.BlockMutators() {
-		select {
-		case <-deadline:
-			t.Fatal("startup mutator gate did not open after async rotation finished")
-		case <-time.After(10 * time.Millisecond):
-		}
+		testutil.NoRecv(t, deadline, 10*time.Millisecond, "startup mutator gate did not open after async rotation finished")
 	}
 }
 
@@ -887,21 +864,13 @@ func TestEncryptionRotateOnStartupTask_DoneDoesNotWaitForRotateDEK(t *testing.T)
 	go func() {
 		runDone <- task.Run(context.Background())
 	}()
-	select {
-	case <-blocking.started:
-	case <-time.After(2 * time.Second):
-		t.Fatal("RotateDEK proposal did not start")
-	}
+	testutil.Closed(t, blocking.started, 2*time.Second, "RotateDEK proposal did not start")
 
 	doneReturned := make(chan bool, 1)
 	go func() { doneReturned <- task.Done() }()
-	select {
-	case got := <-doneReturned:
-		if got {
-			t.Fatal("task must not be done while RotateDEK is still in flight")
-		}
-	case <-time.After(100 * time.Millisecond):
-		t.Fatal("Done blocked behind in-flight RotateDEK")
+	got := testutil.Recv(t, doneReturned, 100*time.Millisecond, "Done blocked behind in-flight RotateDEK")
+	if got {
+		t.Fatal("task must not be done while RotateDEK is still in flight")
 	}
 
 	close(blocking.release)

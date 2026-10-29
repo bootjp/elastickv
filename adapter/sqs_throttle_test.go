@@ -157,29 +157,6 @@ func TestSQSServer_ChargeQueueWithThrottleDoesNotSyncMetricActions(t *testing.T)
 	require.Empty(t, observer.forgotten)
 }
 
-func TestSQSServer_ChargeQueueWithThrottleSkipsStaleMetricAfterInvalidate(t *testing.T) {
-	t.Parallel()
-	observer := &recordingSQSThrottleObserver{}
-	srv := NewSQSServer(nil, nil, nil, WithSQSThrottleObserver(observer))
-	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
-	srv.throttle = newBucketStore(func() time.Time { return now }, throttleIdleEvictAfter)
-	cfg := &sqsQueueThrottle{SendCapacity: 10, SendRefillPerSecond: 1}
-
-	staleEpoch := srv.throttle.queueEpoch("orders.fifo")
-	srv.throttle.invalidateQueue("orders.fifo")
-
-	rec := httptest.NewRecorder()
-	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, staleEpoch))
-	require.Empty(t, observer.reports, "stale pre-invalidation snapshot must not recreate a reset token gauge")
-
-	freshEpoch := srv.throttle.queueEpoch("orders.fifo")
-	rec = httptest.NewRecorder()
-	require.True(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 1, cfg, 1, freshEpoch))
-	require.Len(t, observer.reports, 1, "fresh post-invalidation snapshot may publish the new token gauge")
-	require.Equal(t, "orders.fifo", observer.reports[0].queue)
-	require.Equal(t, SQSThrottleActionSend, observer.reports[0].action)
-}
-
 func TestSQSServer_BeginThrottleResetSuppressesStaleMetricBeforeCleanup(t *testing.T) {
 	t.Parallel()
 	observer := &recordingSQSThrottleObserver{}
@@ -231,7 +208,8 @@ func TestSQSServer_ChargeQueueWithThrottleCountsStaleRejectionAfterInvalidate(t 
 	cfg := &sqsQueueThrottle{SendCapacity: 1, SendRefillPerSecond: 1}
 
 	staleEpoch := srv.throttle.queueEpoch("orders.fifo")
-	srv.throttle.invalidateQueue("orders.fifo")
+	srv.beginThrottleReset("orders.fifo")
+	srv.throttle.invalidateQueueBuckets("orders.fifo")
 
 	rec := httptest.NewRecorder()
 	require.False(t, srv.chargeQueueWithThrottle(rec, "orders.fifo", bucketActionSend, 2, cfg, 1, staleEpoch))
@@ -652,7 +630,7 @@ func TestBucketStore_OrphanedBucketRetriesToLiveEntry(t *testing.T) {
 // observe evicted=false, and spend tokens against the orphaned
 // bucket. The fix holds bucket.mu across the matches check, the
 // CompareAndDelete, and the evicted=true assignment — matching
-// the lock-then-delete-then-flag ordering sweep / invalidateQueue
+// the lock-then-delete-then-flag ordering sweep / invalidateQueueBuckets
 // already use. This deterministic test replicates the post-
 // reconciliation orphan check by forcing a config mismatch and
 // verifying the orphan bucket is evicted=true after the
@@ -696,7 +674,7 @@ func TestBucketStore_LoadOrInitReconciliationMarksOrphanEvictedUnderMu(t *testin
 }
 
 // TestBucketStore_InvalidateMarksOrphanEvicted pins the
-// invalidateQueue contract: dropped buckets must flip evicted=true under mu
+// invalidateQueueBuckets contract: dropped buckets must flip evicted=true under mu
 // so a sendMessage that loaded meta pre-invalidation and is racing
 // against DeleteQueue / SetQueueAttributes / CreateQueue retries
 // rather than charging the orphan.
@@ -710,17 +688,18 @@ func TestBucketStore_InvalidateMarksOrphanEvicted(t *testing.T) {
 	require.True(t, ok)
 	original, _ := v.(*tokenBucket)
 
-	store.invalidateQueue("orders")
+	store.beginQueueReset("orders", nil)
+	store.invalidateQueueBuckets("orders")
 
 	_, stillThere := store.buckets.Load(key)
-	require.False(t, stillThere, "invalidateQueue must remove the bucket from the map")
+	require.False(t, stillThere, "queue reset must remove the bucket from the map")
 	original.mu.Lock()
-	require.True(t, original.evicted, "invalidateQueue must mark the dropped bucket evicted")
+	require.True(t, original.evicted, "queue reset must mark the dropped bucket evicted")
 	original.mu.Unlock()
 }
 
 // TestBucketStore_InvalidateUnderConcurrencyIsRaceFree pins the
-// invalidateQueue lock ordering. The earlier invalidateQueue used
+// invalidateQueueBuckets lock ordering. The earlier invalidateQueueBuckets used
 // LoadAndDelete-then-lock, which let a concurrent charger that loaded
 // the pointer pre-LoadAndDelete acquire bucket.mu first and observe
 // evicted=false on a bucket that had already been removed from the
@@ -754,7 +733,8 @@ func TestBucketStore_InvalidateUnderConcurrencyIsRaceFree(t *testing.T) {
 	for range invalidates {
 		go func() {
 			defer wg.Done()
-			store.invalidateQueue("orders")
+			store.beginQueueReset("orders", nil)
+			store.invalidateQueueBuckets("orders")
 		}()
 	}
 	for range chargers {
@@ -827,7 +807,7 @@ func TestBucketStore_IncarnationKeyedDoesNotReuseAcrossIncarnations(t *testing.T
 }
 
 // TestBucketStore_InvalidateQueueClearsAllIncarnations pins that
-// invalidateQueue ranges by queue prefix and removes every cached
+// invalidateQueueBuckets ranges by queue prefix and removes every cached
 // incarnation, not just one. Required because the leader's view of
 // "current incarnation" can drift from a follower's during a
 // failover-mid-CreateQueue, and an invalidate that only hit one
@@ -843,11 +823,12 @@ func TestBucketStore_InvalidateQueueClearsAllIncarnations(t *testing.T) {
 	require.True(t, store.charge(cfg, "events", bucketActionSend, 1, 1).allowed)
 	require.Equal(t, 3, countBuckets(store))
 
-	store.invalidateQueue("orders")
+	store.beginQueueReset("orders", nil)
+	store.invalidateQueueBuckets("orders")
 
 	// Both orders incarnations gone, events untouched.
 	require.Equal(t, 1, countBuckets(store),
-		"invalidateQueue must drop every incarnation belonging to the queue")
+		"queue reset must drop every incarnation belonging to the queue")
 	_, hasOrdersInc1 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, incarnation: 1})
 	_, hasOrdersInc2 := store.buckets.Load(bucketKey{queue: "orders", action: bucketActionSend, incarnation: 2})
 	_, hasEvents := store.buckets.Load(bucketKey{queue: "events", action: bucketActionSend, incarnation: 1})
@@ -861,7 +842,8 @@ func TestBucketStore_SweepEvictsIdleQueueEpochs(t *testing.T) {
 	now := time.Date(2026, 4, 27, 10, 0, 0, 0, time.UTC)
 	store := newBucketStore(func() time.Time { return now }, time.Minute)
 
-	store.invalidateQueue("orders")
+	store.beginQueueReset("orders", nil)
+	store.invalidateQueueBuckets("orders")
 	require.Equal(t, uint64(1), store.queueEpoch("orders"))
 	require.Equal(t, 1, countQueueEpochs(store))
 
@@ -939,7 +921,8 @@ func TestBucketStore_InvalidateQueueDropsAllActions(t *testing.T) {
 	require.False(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)
 	require.False(t, store.charge(cfg, "orders", bucketActionReceive, 1, 1).allowed)
 	// Invalidate.
-	store.invalidateQueue("orders")
+	store.beginQueueReset("orders", nil)
+	store.invalidateQueueBuckets("orders")
 	// Both buckets must now be at full capacity again.
 	for range 10 {
 		require.True(t, store.charge(cfg, "orders", bucketActionSend, 1, 1).allowed)

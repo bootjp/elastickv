@@ -1210,17 +1210,6 @@ func TestRenewBackupReleasesResourcesAfterPinFanoutFailure(t *testing.T) {
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
 }
 
-func TestBeginBackupMapsCapacityReservationToResourceExhausted(t *testing.T) {
-	t.Parallel()
-	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
-	proposer := newBackupTestProposer()
-	proposer.responseError[backupSubtypeReserve] = kv.ErrTooManyActiveBackups
-	srv := newBackupControlTestServer(t, &backupTestStore{}, map[uint64]*backupTestGroup{1: group}, map[uint64]*backupTestProposer{1: proposer}, nil)
-
-	_, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
-	require.Equal(t, codes.ResourceExhausted, status.Code(err))
-}
-
 func TestBeginBackupMapsForwardedCapacityReservationStatusToResourceExhausted(t *testing.T) {
 	t.Parallel()
 	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}

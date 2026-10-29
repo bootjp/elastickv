@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/adapter"
 	"github.com/bootjp/elastickv/internal/admin"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 	"golang.org/x/sync/errgroup"
@@ -56,11 +57,7 @@ func TestRegisterAdminLifecycleReturnsCleanAfterForcedClose(t *testing.T) {
 		}
 		reqDone <- err
 	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("admin handler did not start for the stalled request")
-	}
+	testutil.Recv(t, started, 5*time.Second, "admin handler did not start for the stalled request")
 
 	start := time.Now()
 	cancel()

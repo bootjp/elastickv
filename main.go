@@ -4485,30 +4485,12 @@ func runDynamoDBServer(ctx context.Context, eg *errgroup.Group, dynamoServer *ad
 	})
 }
 
-func startPprofServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, pprofAddr string, pprofToken string) error {
-	pprofServer, pprofL, bindAddr, err := serverwiring.PreparePprofServer(ctx, lc, pprofAddr, pprofToken)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	runPreparedPprofServer(ctx, eg, pprofServer, pprofL, bindAddr)
-	return nil
-}
-
 func runPreparedPprofServer(ctx context.Context, eg *errgroup.Group, pprofServer *http.Server, pprofL net.Listener, pprofAddr string) {
 	if pprofServer == nil || pprofL == nil {
 		return
 	}
 	eg.Go(monitoring.PprofShutdownTask(ctx, pprofServer, pprofAddr))
 	eg.Go(monitoring.PprofServeTask(pprofServer, pprofL, pprofAddr))
-}
-
-func startMetricsServer(ctx context.Context, lc *net.ListenConfig, eg *errgroup.Group, metricsAddr string, metricsToken string, handler http.Handler) error {
-	metricsServer, metricsL, bindAddr, err := serverwiring.PrepareMetricsServer(ctx, lc, metricsAddr, metricsToken, handler)
-	if err != nil {
-		return errors.WithStack(err)
-	}
-	runPreparedMetricsServer(ctx, eg, metricsServer, metricsL, bindAddr)
-	return nil
 }
 
 func runPreparedMetricsServer(ctx context.Context, eg *errgroup.Group, metricsServer *http.Server, metricsL net.Listener, metricsAddr string) {

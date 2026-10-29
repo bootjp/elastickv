@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/cockroachdb/errors"
 )
 
@@ -43,14 +44,21 @@ func TestVerifyLeaderEngine_BoundsBlockingReadIndex(t *testing.T) {
 	}
 
 	start := time.Now()
-	err := verifyLeaderEngine(blockingLeaderView{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	go func() {
+		result <- verifyLeaderEngineCtx(ctx, blockingLeaderView{})
+	}()
+	var err error
+	err = testutil.Recv(t, result, 3*verifyLeaderTimeout, "verifyLeaderEngineCtx did not bound a deadline-less context")
 	elapsed := time.Since(start)
 
 	if err == nil {
-		t.Fatalf("verifyLeaderEngine(blocking) returned nil; expected DeadlineExceeded")
+		t.Fatalf("verifyLeaderEngineCtx(blocking) returned nil; expected DeadlineExceeded")
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("verifyLeaderEngine(blocking) err = %v; want DeadlineExceeded", err)
+		t.Fatalf("verifyLeaderEngineCtx(blocking) err = %v; want DeadlineExceeded", err)
 	}
 	// Lower bound: confirm the engine actually held the call until the
 	// deadline fired, not that some other error path returned
@@ -63,11 +71,11 @@ func TestVerifyLeaderEngine_BoundsBlockingReadIndex(t *testing.T) {
 	// not flake.
 	const slack = 200 * time.Millisecond
 	if elapsed+slack < verifyLeaderTimeout {
-		t.Fatalf("verifyLeaderEngine(blocking) returned too early after %s; want >= %s (-%s slack)", elapsed, verifyLeaderTimeout, slack)
+		t.Fatalf("verifyLeaderEngineCtx(blocking) returned too early after %s; want >= %s (-%s slack)", elapsed, verifyLeaderTimeout, slack)
 	}
 	// Upper bound: prove the call returned at all. Generous so a slow
 	// CI host does not flake.
 	if elapsed > 2*verifyLeaderTimeout {
-		t.Fatalf("verifyLeaderEngine(blocking) returned after %s; want <= 2x verifyLeaderTimeout (%s)", elapsed, verifyLeaderTimeout)
+		t.Fatalf("verifyLeaderEngineCtx(blocking) returned after %s; want <= 2x verifyLeaderTimeout (%s)", elapsed, verifyLeaderTimeout)
 	}
 }

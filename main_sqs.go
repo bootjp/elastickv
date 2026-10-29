@@ -75,7 +75,7 @@ func runSQSServer(ctx context.Context, eg *errgroup.Group, sqsServer *adapter.SQ
 	if sqsServer == nil {
 		return
 	}
-	// Two-goroutine shutdown pattern mirrors startS3Server: one goroutine waits
+	// Two-goroutine shutdown pattern mirrors runS3Server: one goroutine waits
 	// on either ctx.Done() or Run completion to call Stop, the other runs the
 	// server and cancels the waiter once it has returned.
 	runDoneCtx, runDoneCancel := context.WithCancel(context.Background())
