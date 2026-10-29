@@ -18,7 +18,7 @@ func newReadWatermarkInternal(t *testing.T, proposer raftengine.Proposer, opts .
 	clock := kv.NewHLC()
 	return NewInternalWithEngine(
 		nil,
-		internalAdminLeaderView{state: raftengine.StateLeader},
+		internalAdminLeaderView(raftengine.StateLeader, 0),
 		clock,
 		nil,
 		append([]InternalOption{WithInternalReadWatermarkProposer(proposer)}, opts...)...,
@@ -83,7 +83,7 @@ func TestInternalForwardReadWatermarkAdvanceDisabled(t *testing.T) {
 	t.Parallel()
 	admin := &internalAdminProposer{}
 	clock := kv.NewHLC()
-	internal := NewInternalWithEngine(nil, internalAdminLeaderView{state: raftengine.StateLeader}, clock, nil,
+	internal := NewInternalWithEngine(nil, internalAdminLeaderView(raftengine.StateLeader, 0), clock, nil,
 		WithInternalAdminProposer(admin))
 	_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{Payload: kv.EncodeWatermarkAdvance(clock.Next())})
 	require.Equal(t, codes.FailedPrecondition, status.Code(err))
