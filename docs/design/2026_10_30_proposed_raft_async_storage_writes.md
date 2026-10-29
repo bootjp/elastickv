@@ -273,3 +273,42 @@ retains existing FIFO failure fencing; performance adds only a stack-local retur
 flag; consistency leaves tokens, durability and timestamp behavior unchanged;
 coverage includes both nil-success and nil-panic controls plus existing queued
 error/panic cases. This does not enable the engine pipeline or close its gates.
+
+### Synchronous configuration phase separation
+
+The real Engine V1/V2 committed-configuration paths now separate the owner-only
+RawNode transition from ordered FSM/persistence work and public publication.
+The transition captures a deep-cloned ConfState and an owned peer inventory;
+it performs no FSM or disk callback. Persistence still calls
+`recordFSMConfiguration` before the unchanged `persistConfigState`. Only a
+successful return reaches membership publication, the pending-config fence,
+admin receipt and applied-index advancement, in their original order.
+
+This is a synchronous preparatory refactor, not an enabled asynchronous engine.
+`persistConfigState`, snapshot locks, durable-index callbacks and existing
+snapshot deferral behavior are unchanged. In particular, `ErrSnapshotDeferred`
+still permits the existing replay-safe configuration publication; it is not
+reclassified as an operational failure. The metadata persistence helper is not
+yet disk-only and cannot be sent wholesale to the append worker.
+
+V1/V2 tests inject failures at configuration recording, FSM snapshot capture,
+durable-index bump, SaveSnap and Release. Each observes no successful admin
+receipt, membership publication or applied-index advancement before success.
+Success and snapshot-deferral controls preserve the existing sequence, and
+later RawNode/peer-cache transitions cannot mutate the captured plan. These
+focused race tests passed twenty repetitions (5.101s); existing snapshot,
+restart, namespace and pending-configuration gates passed twenty repetitions
+(25.008s), with additional membership/unknown-outcome checks passing five
+repetitions (5.508s). This does not prove crash recovery beyond those existing
+tests, and it does not turn the held-Save heartbeat regression green.
+
+The complete local etcd-engine race package passed in 42.798s with only that
+known-red, unpublished heartbeat diagnostic explicitly skipped; unfiltered
+repository lint reported zero issues. This is not an all-tests-passing claim.
+
+Five follow-up passes: data-loss review preserves failure and durable-index
+ordering; concurrency review keeps every phase on the current owner and clones
+the configuration plan; performance adds one bounded configuration-state copy,
+not a user-payload copy; consistency retains V1/V2 publication and deferral
+semantics; coverage includes phase-boundary failures and existing snapshot,
+membership and restart checks. All asynchronous integration gates remain open.

@@ -3021,20 +3021,16 @@ func (e *Engine) applyConfChangeCommitted(entry raftpb.Entry) error {
 	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
 	}
-	confState := e.rawNode.ApplyConfChange(&cc)
-	nextPeers, err := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confStateValue(confState))
+	plan, err := e.transitionConfChange(entry.GetIndex(), cc)
 	if err != nil {
-		return errors.Wrapf(err, "build peer inventory for config change index=%d", entry.GetIndex())
-	}
-	if err := e.recordFSMConfiguration(entry.GetIndex(), confStateValue(confState)); err != nil {
 		return err
 	}
-	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
+	if err := e.persistConfigApplyPlan(plan); err != nil {
 		return err
 	}
-	e.applyConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), entry.GetIndex(), confStateValue(confState))
-	e.clearPendingConfChange(entry.GetIndex())
-	e.setApplied(entry.GetIndex())
+	e.applyConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), plan.index, plan.confState)
+	e.clearPendingConfChange(plan.index)
+	e.setApplied(plan.index)
 	return nil
 }
 
@@ -3045,21 +3041,50 @@ func (e *Engine) applyConfChangeV2Committed(entry raftpb.Entry) error {
 	if err := proto.Unmarshal(entry.GetData(), &cc); err != nil {
 		return errors.WithStack(err)
 	}
-	confState := e.rawNode.ApplyConfChange(&cc)
-	nextPeers, err := e.nextPeersAfterConfigChangeV2(cc, confStateValue(confState))
+	plan, err := e.transitionConfChangeV2(entry.GetIndex(), cc)
 	if err != nil {
-		return errors.Wrapf(err, "build peer inventory for config change v2 index=%d", entry.GetIndex())
-	}
-	if err := e.recordFSMConfiguration(entry.GetIndex(), confStateValue(confState)); err != nil {
 		return err
 	}
-	if err := e.persistConfigState(entry.GetIndex(), confStateValue(confState), nextPeers); err != nil {
+	if err := e.persistConfigApplyPlan(plan); err != nil {
 		return err
 	}
-	e.applyConfigChangeV2(cc, entry.GetIndex(), confStateValue(confState))
-	e.clearPendingConfChange(entry.GetIndex())
-	e.setApplied(entry.GetIndex())
+	e.applyConfigChangeV2(cc, plan.index, plan.confState)
+	e.clearPendingConfChange(plan.index)
+	e.setApplied(plan.index)
 	return nil
+}
+
+// configApplyPlan owns its ConfState and peer inventory. Treat both as immutable
+// after the owner transition; persistence and publication remain synchronous.
+type configApplyPlan struct {
+	index     uint64
+	confState raftpb.ConfState
+	peers     []Peer
+}
+
+func (e *Engine) transitionConfChange(index uint64, cc raftpb.ConfChange) (configApplyPlan, error) {
+	confState := confStateValue(proto.CloneOf(e.rawNode.ApplyConfChange(&cc)))
+	peers, err := e.nextPeersAfterConfigChange(cc.GetType(), cc.GetNodeId(), cc.GetContext(), confState)
+	if err != nil {
+		return configApplyPlan{}, errors.Wrapf(err, "build peer inventory for config change index=%d", index)
+	}
+	return configApplyPlan{index: index, confState: confState, peers: peers}, nil
+}
+
+func (e *Engine) transitionConfChangeV2(index uint64, cc raftpb.ConfChangeV2) (configApplyPlan, error) {
+	confState := confStateValue(proto.CloneOf(e.rawNode.ApplyConfChange(&cc)))
+	peers, err := e.nextPeersAfterConfigChangeV2(cc, confState)
+	if err != nil {
+		return configApplyPlan{}, errors.Wrapf(err, "build peer inventory for config change v2 index=%d", index)
+	}
+	return configApplyPlan{index: index, confState: confState, peers: peers}, nil
+}
+
+func (e *Engine) persistConfigApplyPlan(plan configApplyPlan) error {
+	if err := e.recordFSMConfiguration(plan.index, plan.confState); err != nil {
+		return err
+	}
+	return e.persistConfigState(plan.index, plan.confState, plan.peers)
 }
 
 func (e *Engine) recordFSMConfiguration(index uint64, state raftpb.ConfState) error {
