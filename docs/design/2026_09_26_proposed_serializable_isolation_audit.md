@@ -657,6 +657,34 @@ multi-group transaction begin now fences all group leaders (a local lease
 check where the lease is valid, one `ForwardLeaseRead` per group this node
 does not lead), which the benchmark milestone measures.
 
+**Partial implementation (branch
+`design/serializable-audit-a0-multigroup-read-advance`, reimplemented from
+this section because the four commits above were never pushed).** What
+ships: the advance entry (FSM tag `0x17`, since `0x0f` has since been taken
+by `raftEncodeTargetReadiness`; 8-byte big-endian timestamp; refused for 0
+and `^uint64(0)`; applied through `ApplyMutationsRaftAt` with no mutations;
+idempotent; the apply raises the process HLC ceiling to the timestamp's
+physical half exactly, then observes it), `ShardStore.ensureReadWatermark`
+on every group-level read entry point (point reads, version-presence
+probes, forward, reverse and physical-limit scans, keys-only scans,
+`ScanGroupOwnedAt`), forwarding to a remote leader through
+`Internal.ForwardAdminProposal` with a dedicated proposer wired whether or
+not the admin server runs, and a leader-side admission bound
+(`ReadWatermarkAdvanceAdmissible`: physical half at most
+`max(physical(Current()), ceiling) + hlcPhysicalWindowMs`). Regression
+tests: `kv/read_watermark_advance_test.go` (the reproduction's shape on two
+single-node groups, red on `main`). Provenance is the interim rule "advance
+only when `ts` is at or below the maximum watermark this node has applied
+over its local groups" (a client `Ts` above that is served as before and
+advances nothing), not the typed snapshot API above. Still open from this
+section: the typed coordinator-only snapshot argument and the
+`FailedPrecondition` rejection of client timestamps above a group's
+watermark; leader-authoritative snapshots and the lagging-replica test;
+per-group HLC ceilings (the raise lands on the process-wide ceiling, the
+shape `main` already has for every observed commit timestamp); a
+capability gate for rolling upgrades (a member on an older binary does not
+know tag `0x17`); and the read-side benchmark.
+
 Open after this branch:
 
 - **2PC commit timestamps versus advanced secondaries.** The commit
@@ -965,8 +993,9 @@ Still open for the fix PRs:
   route floors are checked against `startTS + 1`.
 - Cross-group snapshots: the adapters' global-maximum snapshot is not
   honoured by a lagging group's fence (reproduced above); the
-  watermark-advance read path is the fix, on
-  `design/serializable-audit-a0-multigroup` once it exists.
+  watermark-advance read path is the fix; its first part is on
+  `design/serializable-audit-a0-multigroup-read-advance` (see "Partial
+  implementation" above for what remains).
 - Not yet leader-issued: the 2PC ABORT timestamp (unfenced) and the
   pre-allocated paths above; making delta keys independent of the commit
   timestamp would remove the exemption.
