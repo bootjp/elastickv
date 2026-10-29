@@ -70,13 +70,13 @@ Init ==
 \* === ACTIONS ===
 
 (***************************************************************************)
-(* ProposeRouteChange: a control-plane action (SplitRange or a future      *)
-(* merge / move) that atomically bumps the catalog version by 1.  Models  *)
-(* `adapter/distribution_server.go saveSplitResultViaCoordinator` from    *)
-(* the implementation anchor list — by collapsing the full transaction   *)
-(* (write to the default Raft group + apply to the handling node's       *)
-(* RouteEngine) into a single TLA+ step we get Routes-3 atomicity by      *)
-(* construction.  Cross-node propagation is asynchronous via              *)
+(* ProposeRouteChange: a control-plane catalog write (SplitRange, the     *)
+(* split-job / autosplit lifecycle, or a cross-group migration step) that *)
+(* atomically bumps the catalog version by 1.  The catalog store builds   *)
+(* every write as expectedVersion + 1 with a delta whose PreviousVersion  *)
+(* is the version it replaced (distribution/catalog.go).  Collapsing the  *)
+(* write to the default Raft group into a single TLA+ step gives Routes-3 *)
+(* atomicity by construction.  Cross-node propagation is asynchronous via *)
 (* CatalogWatcherSync below.                                              *)
 (***************************************************************************)
 ProposeRouteChange ==
@@ -87,15 +87,18 @@ ProposeRouteChange ==
     /\ UNCHANGED <<engineVersion, engineMaxObserved>>
 
 (***************************************************************************)
-(* CatalogWatcherSync(n): node n's CatalogWatcher fetches a catalog        *)
-(* snapshot.  Models `distribution/watcher.go CatalogWatcher.SyncOnce`.    *)
+(* CatalogWatcherSync(n): one tick of node n's CatalogWatcher.  Models    *)
+(* `distribution/watcher.go CatalogWatcher.SyncOnce`, which reads         *)
+(* ChangesSince(engine version, batchSize) and applies either a bounded   *)
+(* batch of deltas (so the engine can land on an intermediate version     *)
+(* when it is more than batchSize behind) or a full reset snapshot.       *)
 (*                                                                         *)
-(* Under EnableSafety the watcher is allowed to fetch any version v in     *)
-(* [engineMaxObserved[n], catalogVersion].  Skipping intermediate          *)
-(* versions is fine — only regression is forbidden.  This matches the     *)
-(* CatalogWatcher's behaviour: it polls and overwrites the cached         *)
-(* snapshot with whatever the catalog currently shows, which is always >=  *)
-(* the previously cached version under correct ordering.                   *)
+(* Under EnableSafety the tick may land on any version v in               *)
+(* [engineMaxObserved[n], catalogVersion]: a batch can stop anywhere      *)
+(* short of the head, and a stale snapshot or delta is refused by         *)
+(* Engine.ApplySnapshot / ApplyDelta (ErrEngineSnapshotVersionStale),     *)
+(* which leaves the engine where it was (v = engineMaxObserved[n]).  The  *)
+(* PreviousVersion chain check in ApplyDelta is not modelled.             *)
 (*                                                                         *)
 (* Under ~EnableSafety the watcher can fetch ANY v in 0..catalogVersion,  *)
 (* modelling a buggy implementation that overwrites with a stale         *)
@@ -126,9 +129,9 @@ CatalogWatcherSync(n) ==
 (* convergence (the watcher could fire infinitely often always picking a   *)
 (* version < catalogVersion), but WF on the latest-picking sub-action      *)
 (* does — it must eventually fire when its enabling condition              *)
-(* `engineVersion[n] < catalogVersion` holds.  Matches the implementation: *)
-(* the production CatalogWatcher always reads the current catalog          *)
-(* snapshot, never an intermediate version.                                *)
+(* `engineVersion[n] < catalogVersion` holds.  In the implementation one  *)
+(* tick may only apply batchSize deltas; this action stands for the run  *)
+(* of ticks that reaches the head, which every tick makes progress on.   *)
 (***************************************************************************)
 CatalogWatcherSyncLatest(n) ==
     /\ engineVersion[n] < catalogVersion
@@ -155,11 +158,10 @@ Spec == Init /\ [][Next]_vars
 \* is enabled exactly when engineVersion[n] < catalogVersion, so WF
 \* on it forces convergence.
 \*
-\* This matches the production code: the CatalogWatcher reads the
-\* current catalog snapshot every tick, never an intermediate one.
-\* The intermediate flexibility in CatalogWatcherSync was for the
-\* safety gap config (modelling a buggy watcher that overwrites with
-\* a stale version), not for the realistic behaviour.
+\* The production watcher can stop on an intermediate version when a
+\* tick's delta batch does not reach the head, but every tick moves the
+\* engine forward, so fairness on reaching the head is the right
+\* abstraction of "the polling loop keeps running".
 \*
 \* Kept as a separate definition so the existing safety configs
 \* (MCRoutes.cfg / MCRoutes_gap.cfg) remain pure safety checks.  Only
