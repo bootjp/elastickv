@@ -371,12 +371,12 @@ func (d *DynamoDBServer) loadQueryItemsWithMigration(
 	cond queryCondition,
 	readTS uint64,
 ) ([]map[string]attributeValue, error) {
-	items, err := d.queryItemsByKeyCondition(ctx, in, schema, keySchema, cond, readTS)
+	items, err := d.queryItemsByKeyCondition(ctx, in, schema, cond, readTS)
 	if err != nil {
 		return nil, err
 	}
 	return d.mergeReadItemsFromSourceSchema(schema, keySchema, items, func(sourceSchema *dynamoTableSchema) ([]map[string]attributeValue, error) {
-		return d.queryItemsByKeyCondition(ctx, in, sourceSchema, keySchema, cond, readTS)
+		return d.queryItemsByKeyCondition(ctx, in, sourceSchema, cond, readTS)
 	})
 }
 
@@ -861,7 +861,7 @@ func resolveQueryReadBounds(
 	if !schema.usesOrderedKeyEncoding() {
 		return dynamoReadBounds{}, false, nil
 	}
-	basePrefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
+	basePrefix, err := queryScanPrefix(schema, in, cond.hashValue)
 	if err != nil {
 		return dynamoReadBounds{}, false, err
 	}
@@ -1407,14 +1407,13 @@ func (d *DynamoDBServer) queryItemsByKeyCondition(
 	ctx context.Context,
 	in queryInput,
 	schema *dynamoTableSchema,
-	keySchema dynamoKeySchema,
 	cond queryCondition,
 	readTS uint64,
 ) ([]map[string]attributeValue, error) {
 	if strings.TrimSpace(in.IndexName) != "" {
 		return d.queryItemsByGSI(ctx, in, schema, cond, readTS)
 	}
-	scanPrefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
+	scanPrefix, err := queryScanPrefix(schema, in, cond.hashValue)
 	if err != nil {
 		return nil, err
 	}
@@ -1436,11 +1435,10 @@ func (d *DynamoDBServer) queryItemsByGSI(
 	cond queryCondition,
 	readTS uint64,
 ) ([]map[string]attributeValue, error) {
-	keySchema, err := schema.keySchemaForQuery(in.IndexName)
-	if err != nil {
+	if _, err := schema.keySchemaForQuery(in.IndexName); err != nil {
 		return nil, newDynamoAPIError(http.StatusBadRequest, dynamoErrValidation, err.Error())
 	}
-	prefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
+	prefix, err := queryScanPrefix(schema, in, cond.hashValue)
 	if err != nil {
 		return nil, err
 	}
@@ -1691,7 +1689,7 @@ func sendGSIReadResult(ctx context.Context, results chan<- gsiReadResult, result
 	}
 }
 
-func queryScanPrefix(schema *dynamoTableSchema, in queryInput, keySchema dynamoKeySchema, hashValue attributeValue) ([]byte, error) {
+func queryScanPrefix(schema *dynamoTableSchema, in queryInput, hashValue attributeValue) ([]byte, error) {
 	if !schema.usesOrderedKeyEncoding() {
 		hashKey, err := attributeValueAsKey(hashValue)
 		if err != nil {
@@ -1699,9 +1697,6 @@ func queryScanPrefix(schema *dynamoTableSchema, in queryInput, keySchema dynamoK
 		}
 		if strings.TrimSpace(in.IndexName) != "" {
 			return legacyDynamoGSIHashPrefixForTable(in.TableName, schema.Generation, in.IndexName, hashKey), nil
-		}
-		if keySchema.HashKey != schema.PrimaryKey.HashKey {
-			return dynamoItemPrefixForTable(in.TableName, schema.Generation), nil
 		}
 		return legacyDynamoItemHashPrefixForTable(in.TableName, schema.Generation, hashKey), nil
 	}
@@ -1711,9 +1706,6 @@ func queryScanPrefix(schema *dynamoTableSchema, in queryInput, keySchema dynamoK
 	}
 	if strings.TrimSpace(in.IndexName) != "" {
 		return dynamoGSIHashPrefixForTable(in.TableName, schema.Generation, in.IndexName, hashKey), nil
-	}
-	if keySchema.HashKey != schema.PrimaryKey.HashKey {
-		return dynamoItemPrefixForTable(in.TableName, schema.Generation), nil
 	}
 	return dynamoItemHashPrefixForTable(in.TableName, schema.Generation, hashKey), nil
 }
