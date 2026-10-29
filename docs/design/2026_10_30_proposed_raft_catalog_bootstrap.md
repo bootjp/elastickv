@@ -1,6 +1,6 @@
 # Raft catalog bootstrap
 
-Status: Proposed
+Status: Proposed; revised after startup and protocol review, not accepted yet
 Author: bootjp
 Date: 2026-10-30
 
@@ -39,8 +39,9 @@ replica-determinism and legacy-state acceptance obligations are satisfied.
    Do not add a separate public listener or bypass the authentication/TLS and
    encryption-aware proposer wiring.
 3. Retain join readiness and startup rotation ordering. Once rotation allows
-   mutations, start leader HLC lease renewal before requesting the bootstrap
-   commit timestamp. Bootstrap is local leader work, not an inbound public
+   mutations, start leader HLC lease renewal on every node independently of
+   catalog completion, and enter the control-ready stage below before
+   requesting bootstrap timestamps. Bootstrap is local leader work, not an inbound public
    request; it uses the raw configured coordinator, never an exemption that
    an arbitrary forwarded request can claim.
 4. Initialize/wait for the durable catalog through Raft, then apply that
@@ -53,10 +54,59 @@ replica-determinism and legacy-state acceptance obligations are satisfied.
 
 The gate must continue covering RawKV/TransactionalKV, Internal.Forward,
 admin forwarding, distribution/migration mutations and S3 chunk pushes.
-Raft transport, authenticated capability inspection and the existing local
-encryption/registration proposal path must still make progress. Preserve
+Raft transport, capability inspection and the explicitly authorized remote
+encryption/registration control path below must still make progress. Preserve
 existing rotation tests and add catalog-specific admission tests; do not
 infer safety merely from a gate being present.
+
+### Control admission before data readiness
+
+Use three monotone startup states: registration-ready after synchronous
+epoch checks and watcher arming; control-ready after join readiness and
+rotation; data-ready only after local catalog application and route-ID seeding.
+Registration-ready permits node writer registration, because rotation can
+depend on a follower registering on the default-group leader. Control-ready
+permits the following dependencies while ordinary public data remains closed:
+
+- Distribution.GetTimestamp, retaining existing rollout-mode activation
+  authorization and request bounds;
+- RawKV.RawLatestCommitTS for authoritative leader-fenced group floors only,
+  never RawGet, scans, or ordinary RawKV operations;
+- Internal.GetPrepareEvidenceState and ForwardAdminProposal only for fully
+  decoded existing prepare-evidence activation/seal/fence/release payloads;
+  unknown payloads, trailing bytes and other admin proposals remain denied;
+- existing read-only capability/state inspection needed by these paths.
+
+Do not assume these methods are already authenticated: current GetTimestamp
+and writer registration have no AdminTokenAuth protection, and server TLS
+alone does not authenticate a client. Introduce a dedicated
+`--startupControlTokenFile`, with a separate startup-control metadata header.
+It must not infer authority from or reuse admin, migration or blob-peer
+credentials. Preserve any existing underlying admin/method authorization;
+the new check only authorizes the narrow startup-stage exception.
+
+Token-bearing network calls require verified TLS and transport-security
+enforcement by their per-RPC credentials. Explicit `--adminInsecureNoAuth`
+is the only no-auth exception, recorded in acceptance evidence; never infer
+it from loopback, absent credentials or a caller flag. Without a control
+token or that explicit exception, remote control requests remain unavailable.
+Local-only legacy bootstrap can still progress without exposing remote
+control RPCs. Configurations requiring remote Phase-D/registration progress
+must fail with an actionable configuration error rather than wait forever.
+
+Thread the per-node credentials explicitly through timestamp routing,
+group-floor reads, prepare-evidence controls and registration clients. Do
+not add process-global mutable credentials, replace another credential's
+header, accept caller-supplied bypass booleans, log secrets, or send startup
+credentials on unrelated RPCs. Membership, registration epoch, TSO rollout
+and payload-specific authorization still apply. Test missing/wrong credentials,
+wrong stage, wrong method/payload, TLS failure and mixed caller authority.
+
+On shutdown, unregister/stop new HLC and rotation callbacks, cancel attempts,
+and join their owned child proposal goroutines before draining listeners and
+closing stores. `eg.Wait()` or context cancellation alone is not proof that
+the existing detached proposal/rotation work has returned. Add lifecycle
+receipts/joins and tests that hold a proposal during startup cancellation.
 
 ### Replicated catalog initialization
 
@@ -66,11 +116,29 @@ infer safety merely from a gate being present.
   catalog delta metadata with existing codecs. It must not call direct Save.
 - The verified catalog-group leader obtains a leader-issued read timestamp
   and commit timestamp through the existing configured timestamp pipeline.
+  First allocate a positive timestamp through that pipeline and commit/apply
+  an existing read-watermark-advance entry on the catalog group through its
+  encryption-aware proposer. Use the resulting applied group watermark,
+  not merely the allocated future timestamp, as the exact read snapshot.
+  This also avoids treating empty-store StartTS=0 as an auto-allocation request.
+  Main's existing one-phase commit fence rejects any older outstanding
+  bootstrap proposal at or below that applied watermark. Thus absence-CAS
+  does not incorrectly accept a write that lands below a future StartTS.
+  Retain the exact read token/voucher and pin through plan creation/dispatch.
   It rechecks empty catalog state at that exact read timestamp and dispatches
   the complete plan through the encryption-aware coordinator/proposer as an
   existing single-group transaction. Catalog version/next-id absence and all
   plan dependencies are validated at apply. No new timestamp opcode, snapshot
   format or independent wall-clock allocation is introduced.
+- Before using that advance, negotiate bootstrap protocol version 1 from
+  every current catalog-group member, including learners, using a new
+  `bootstrap_protocol_version` field on CatalogCapabilitiesResponse (field 5).
+  Zero/missing/unsupported capability is not safe support. Recheck membership
+  epoch before proposing. This capability promises the existing watermark
+  opcode, one-phase fence and new bootstrap behavior; no release/SHA guessing.
+  Add generated-code compatibility and mixed-version rejection tests.
+- Verify every mutation and read dependency resolves to the catalog group;
+  a leader check on only the version key or default group is insufficient.
 - Followers do not generate timestamps, persist seed routes, or forward
   arbitrary client traffic through a startup exception. They wait until the
   replicated catalog is locally applied, load its authoritative snapshot,
@@ -111,6 +179,8 @@ transactions and mixed-version members. Those remain merge gates for #1355.
   route IDs and local applied state, not just successful TCP connections.
 - Race two leader attempts and lose a success reply. Exactly one version-1
   bootstrap wins; retries load it without another catalog version advance.
+  Include the parked old proposal / future read timestamp counterexample,
+  empty-store zero watermark and a separate Phase-D timestamp-group leader.
 - Delay a follower's catalog apply and prove every public write/read gate
   stays closed until its local catalog is usable. Transport still progresses.
 - Verify restart/join/populated catalog, shutdown/cancellation, leadership
