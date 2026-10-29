@@ -168,13 +168,17 @@ func (f *fifoProgressFixture) ageKey(id string) []byte {
 
 func (f *fifoProgressFixture) receive(t *testing.T) []map[string]any {
 	t.Helper()
+	return f.receiveAfterStartGate(t, nil)
+}
+
+func (f *fifoProgressFixture) receiveAfterStartGate(t *testing.T, startGate <-chan struct{}) []map[string]any {
+	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
 	readTS := f.st.LastCommitTS()
-	deadline := time.Now().Add(sqsVisScanWallClockBudget)
 	gated := &fifoProgressDeadlineStore{
-		MVCCStore: f.st, deadline: deadline,
-		entered: make(chan []*store.KVPair, 1), release: make(chan struct{}),
+		MVCCStore: f.st,
+		entered:   make(chan []*store.KVPair, 1), release: make(chan struct{}),
 	}
 	f.srv.store = gated
 	type result struct {
@@ -184,6 +188,16 @@ func (f *fifoProgressFixture) receive(t *testing.T) []map[string]any {
 	returned, joined := make(chan result, 1), make(chan struct{})
 	go func() {
 		defer close(joined)
+		if startGate != nil {
+			select {
+			case <-startGate:
+			case <-ctx.Done():
+				returned <- result{err: ctx.Err()}
+				return
+			}
+		}
+		deadline := time.Now().Add(sqsVisScanWallClockBudget)
+		gated.deadline = deadline
 		messages, err := f.srv.scanAndDeliverPartition(ctx, f.meta.Name, f.meta, f.partition, readTS, deadline, fifoProgressPageSize,
 			sqsReceiveOptions{Max: 1, VisibilityTimeout: 60, WaitSeconds: 0})
 		returned <- result{messages, err}
@@ -284,6 +298,29 @@ func TestSQSReceiveFIFOProgressAcrossExpiredPageBudget(t *testing.T) {
 					runFIFOProgressCase(t, partitions, count, headFirst)
 				})
 			}
+		}
+	}
+}
+
+func TestSQSReceiveFIFOProgressWithDelayedWorkerStart(t *testing.T) {
+	f := newFIFOProgressFixture(t, 1, 33, false)
+	start, joined := make(chan struct{}), make(chan struct{})
+	go func() {
+		defer close(joined)
+		// Deliberately exceed the receive budget before the worker may start.
+		// Its own admitted-page budget must not include this scheduling delay.
+		timer := time.NewTimer(2 * sqsVisScanWallClockBudget)
+		defer timer.Stop()
+		<-timer.C
+		close(start)
+	}()
+	defer func() { <-joined }()
+	messages := f.receiveAfterStartGate(t, start)
+	require.Len(t, messages, 1)
+	f.requireHeadDelivered(t, messages[0])
+	for _, id := range f.ids {
+		if id != f.head {
+			f.requireUnchanged(t, id)
 		}
 	}
 }

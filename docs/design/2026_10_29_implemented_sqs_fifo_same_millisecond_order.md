@@ -55,8 +55,11 @@ therefore attempt that head directly even if it sorts after another outer page.
 Skipping successors and hoping that a later receive reaches the head is not
 sufficient under the soft scan budget.
 
-- No key, value or wire format changes. Stored messages are handled the
-  same as new ones, so there is no rollout window.
+- No key, value or wire format changes; stored messages need no data migration.
+  There is still a mixed-version rollout window: old ReceiveMessage leaders
+  retain visibility-key ordering until every eligible leader has this fix.
+  The HT-FIFO gate does not cover legacy/single-partition queues, and its
+  keyspace capability does not certify this receive-ordering revision.
 - A candidate that already owns the lock (`fifoLockOwn`) or finds another
   message's lock (`fifoLockSkip`) does not scan.
 - The scan reads at the receive's snapshot. A send that commits after it
@@ -92,6 +95,10 @@ A wall-clock step backwards on the leader, or a leader change onto a node
 whose clock is behind, can still give a later send an earlier
 `visibleAtMillis` than an earlier send. That needs per-queue clamping of
 the send timestamp and is out of scope here.
+
+During rollout, quiesce receives or keep old ReceiveMessage leaders excluded
+until all eligible leaders have been upgraded. Format compatibility alone does
+not provide the new ordering behavior when an old binary wins leadership.
 
 ## Milestones
 
@@ -211,3 +218,11 @@ latency guarantee. Only retained selected keys are cloned.
 5. Coverage: actual runtime-red precedes the fix; direct, persisted-state and
    error-injection checks pass. Exact latest-push review and all CI remain merge
    requirements, not inferred from the source PR or local focused tests.
+
+The test fixture starts its unchanged 100 ms budget inside the receive worker,
+not before scheduling that goroutine. A controlled worker-start delay greater
+than the budget first reproduced failure to reach the initial page; after the
+fixture correction, the expanded progress/resolver checks passed ten race
+repetitions (13.902s). Production budgets and response assertions are unchanged.
+Test-only review confirms no data-path change, both fixture goroutines joined,
+no cross-snapshot state, no widened timeout, and preserved head/receipt checks.
