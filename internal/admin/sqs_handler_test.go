@@ -18,6 +18,10 @@ import (
 // principal that flowed through to the source so tests can assert
 // live-role forwarding.
 type stubQueuesSource struct {
+	createErr             error
+	lastCreateName        string
+	lastCreateAttrs       map[string]string
+	lastCreatePrincipal   AuthPrincipal
 	queues                []string
 	describeErr           error
 	deleteErr             error
@@ -36,6 +40,11 @@ type stubQueuesSource struct {
 	lastPeekOpts          PeekMessageOptions
 	lastPurgeName         string
 	lastPurgePrincipal    AuthPrincipal
+}
+
+func (s *stubQueuesSource) AdminCreateQueue(_ context.Context, principal AuthPrincipal, name string, attrs map[string]string) error {
+	s.lastCreateName, s.lastCreateAttrs, s.lastCreatePrincipal = name, attrs, principal
+	return s.createErr
 }
 
 func (s *stubQueuesSource) AdminListQueues(_ context.Context) ([]string, error) {
@@ -103,6 +112,9 @@ func (s *stubQueuesSource) AdminPurgeQueue(_ context.Context, principal AuthPrin
 // every write the handler serves.
 func sqsWriteRequests() map[string]func() *http.Request {
 	return map[string]func() *http.Request{
+		"create queue": func() *http.Request {
+			return httptest.NewRequest(http.MethodPost, pathSqsQueues, strings.NewReader(`{"name":"orders"}`))
+		},
 		"delete queue": func() *http.Request {
 			return httptest.NewRequest(http.MethodDelete, pathPrefixSqsQueues+"orders", nil)
 		},
@@ -117,7 +129,7 @@ func sqsWriteRequests() map[string]func() *http.Request {
 }
 
 func (s *stubQueuesSource) reachedWrite() bool {
-	return s.lastDeleteName != "" || s.lastSetAttrsName != "" || s.lastPurgeName != ""
+	return s.lastCreateName != "" || s.lastDeleteName != "" || s.lastSetAttrsName != "" || s.lastPurgeName != ""
 }
 
 // TestSqsHandler_Writes_LivePromotionDoesNotWidenJWTRole pins the
@@ -601,4 +613,46 @@ func TestRole_AllowsRead(t *testing.T) {
 	require.True(t, RoleReadOnly.AllowsRead())
 	require.False(t, Role("").AllowsRead())
 	require.False(t, Role("bogus").AllowsRead())
+}
+
+func TestSqsHandler_CreateQueue(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		body      string
+		sourceErr error
+		status    int
+		called    bool
+	}{
+		{"standard", `{"name":"orders"}`, nil, http.StatusCreated, true},
+		{"fifo", `{"name":"orders.fifo","attributes":{"FifoQueue":"true"}}`, nil, http.StatusCreated, true},
+		{"empty", `{"name":""}`, nil, http.StatusBadRequest, false},
+		{"malformed", `{`, nil, http.StatusBadRequest, false},
+		{"trailing", `{"name":"orders"} {}`, nil, http.StatusBadRequest, false},
+		{"unknown", `{"name":"orders","typo":1}`, nil, http.StatusBadRequest, false},
+		{"too large", `{"name":"` + strings.Repeat("x", 65536) + `"}`, nil, http.StatusBadRequest, false},
+		{"validation", `{"name":"orders"}`, ErrQueuesValidation, http.StatusBadRequest, true},
+		{"follower", `{"name":"orders"}`, ErrQueuesNotLeader, http.StatusServiceUnavailable, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			src := &stubQueuesSource{createErr: tc.sourceErr}
+			h := NewSqsHandler(src)
+			req := httptest.NewRequest(http.MethodPost, pathSqsQueues, strings.NewReader(tc.body))
+			principal := AuthPrincipal{AccessKey: "test", Role: RoleFull}
+			req = req.WithContext(context.WithValue(req.Context(), ctxKeyPrincipal, principal))
+			rec := httptest.NewRecorder()
+			h.ServeHTTP(rec, req)
+			require.Equal(t, tc.status, rec.Code, rec.Body.String())
+			require.Equal(t, tc.called, src.lastCreateName != "")
+			if tc.called {
+				require.Equal(t, principal, src.lastCreatePrincipal)
+			}
+			if tc.name == "fifo" {
+				require.Equal(t, map[string]string{"FifoQueue": "true"}, src.lastCreateAttrs)
+			}
+			if tc.status == http.StatusCreated {
+				require.Equal(t, pathPrefixSqsQueues+src.lastCreateName, rec.Header().Get("Location"))
+				require.JSONEq(t, `{"name":"`+src.lastCreateName+`"}`, rec.Body.String())
+			}
+		})
+	}
 }

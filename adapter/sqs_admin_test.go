@@ -486,3 +486,45 @@ func TestCollectDLQSources_StopOnOutOfPrefix(t *testing.T) {
 		t.Fatalf("sources=%v want empty (no record had matching RedrivePolicy)", sources)
 	}
 }
+
+func TestAdminCreateQueue(t *testing.T) {
+	t.Parallel()
+	nodes, _, _ := createNode(t, 1)
+	defer shutdown(nodes)
+	server := sqsLeaderNode(t, nodes).sqsServer
+	ctx := context.Background()
+	if err := server.AdminCreateQueue(ctx, readOnlyAdminPrincipal, "denied", nil); !errors.Is(err, ErrAdminForbidden) {
+		t.Fatalf("read-only create: %v", err)
+	}
+	for _, tc := range []struct {
+		name  string
+		attrs map[string]string
+	}{
+		{"admin-standard", nil},
+		{"admin-fifo.fifo", map[string]string{"FifoQueue": "true", "ContentBasedDeduplication": "true"}},
+	} {
+		for range 2 {
+			if err := server.AdminCreateQueue(ctx, fullAdminPrincipal, tc.name, tc.attrs); err != nil {
+				t.Fatalf("create %s: %v", tc.name, err)
+			}
+		}
+		summary, exists, err := server.AdminDescribeQueue(ctx, tc.name)
+		if err != nil || !exists || summary.IsFIFO != (tc.attrs != nil) {
+			t.Fatalf("describe %s: summary=%+v exists=%v err=%v", tc.name, summary, exists, err)
+		}
+	}
+	for _, tc := range []struct {
+		name  string
+		attrs map[string]string
+	}{
+		{"invalid/name", nil},
+		{" padded ", nil},
+		{"missing-suffix", map[string]string{"FifoQueue": "true"}},
+		{"invalid-attrs", map[string]string{"VisibilityTimeout": "-1"}},
+		{"admin-standard", map[string]string{"VisibilityTimeout": "100"}},
+	} {
+		if err := server.AdminCreateQueue(ctx, fullAdminPrincipal, tc.name, tc.attrs); !errors.Is(err, ErrAdminSQSValidation) {
+			t.Fatalf("invalid create %s: %v", tc.name, err)
+		}
+	}
+}
