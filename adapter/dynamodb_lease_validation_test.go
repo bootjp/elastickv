@@ -560,8 +560,9 @@ func TestQueryLeasePrefix_BaseTableClassification(t *testing.T) {
 		KeyConditionExpression:    "pk = :pk",
 		ExpressionAttributeValues: map[string]attributeValue{":pk": newStringAttributeValue("tenant")},
 	}
-	wantPrefix, err := queryScanPrefix(schema, pinned, schema.PrimaryKey, newStringAttributeValue("tenant"))
+	hashSegment, err := attributeValueAsKeySegment(newStringAttributeValue("tenant"))
 	require.NoError(t, err)
+	wantPrefix := dynamoItemHashPrefixForTable(schema.TableName, schema.Generation, hashSegment)
 
 	for _, tc := range []struct {
 		name       string
@@ -590,6 +591,45 @@ func TestQueryLeasePrefix_BaseTableClassification(t *testing.T) {
 			prefix, plan := queryLeasePrefix(tc.in, schema)
 			require.Equal(t, tc.wantPlan, plan)
 			require.Equal(t, tc.wantPrefix, prefix)
+		})
+	}
+}
+
+// TestQueryScanPrefix_SelectsHashPrefixPerEncoding pins the prefix a Query
+// reads for each key encoding: a base-table Query reads its hash-key item
+// prefix and a GSI Query reads its index hash prefix. Every caller derives
+// the key schema from the same IndexName, so a base-table Query never falls
+// back to the whole-table prefix.
+func TestQueryScanPrefix_SelectsHashPrefixPerEncoding(t *testing.T) {
+	t.Parallel()
+
+	hash := newStringAttributeValue("tenant")
+	segment, err := attributeValueAsKeySegment(hash)
+	require.NoError(t, err)
+	legacyKey, err := attributeValueAsKey(hash)
+	require.NoError(t, err)
+
+	ordered := leaseGSIFixtureSchema()
+	legacy := leaseGSIFixtureSchema()
+	legacy.KeyEncodingVersion = 0
+
+	for _, tc := range []struct {
+		name   string
+		schema *dynamoTableSchema
+		index  string
+		want   []byte
+	}{
+		{name: "ordered base table", schema: ordered, want: dynamoItemHashPrefixForTable("t", 1, segment)},
+		{name: "ordered gsi", schema: ordered, index: "gsi1", want: dynamoGSIHashPrefixForTable("t", 1, "gsi1", segment)},
+		{name: "legacy base table", schema: legacy, want: legacyDynamoItemHashPrefixForTable("t", 1, legacyKey)},
+		{name: "legacy gsi", schema: legacy, index: "gsi1", want: legacyDynamoGSIHashPrefixForTable("t", 1, "gsi1", legacyKey)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := queryScanPrefix(tc.schema, queryInput{TableName: "t", IndexName: tc.index}, hash)
+			require.NoError(t, err)
+			require.Equal(t, tc.want, got)
+			require.NotEqual(t, dynamoItemPrefixForTable("t", 1), got)
 		})
 	}
 }

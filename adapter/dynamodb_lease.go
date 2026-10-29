@@ -305,13 +305,13 @@ func (d *DynamoDBServer) queryLeaseKey(ctx context.Context, in queryInput) ([]by
 // surfaced — only the routing classification matters here, and the read path
 // reports the identical error downstream.
 func queryLeasePrefix(in queryInput, schema *dynamoTableSchema) ([]byte, queryLeasePlan) {
-	keySchema, cond, err := resolveQueryCondition(in, schema)
+	_, cond, err := resolveQueryCondition(in, schema)
 	if err != nil {
 		// Malformed/unsupported KeyConditionExpression: a deterministic
 		// ValidationException the read path produces without touching data.
 		return nil, queryLeaseSkip
 	}
-	prefix, err := queryScanPrefix(schema, in, keySchema, cond.hashValue)
+	prefix, err := queryScanPrefix(schema, in, cond.hashValue)
 	if err != nil {
 		// queryScanPrefix only fails on an unparseable hash-key value — a
 		// ValidationException the read path rejects identically.
