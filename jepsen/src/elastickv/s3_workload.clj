@@ -7,6 +7,7 @@
   (:gen-class)
   (:require [clojure.string :as str]
             [clj-http.client :as http]
+            [clj-http.conn-mgr :as conn]
             [elastickv.cli :as cli]
             [elastickv.db :as ekdb]
             [jepsen [checker :as checker]
@@ -21,7 +22,14 @@
             [knossos.model :as model]
             [jepsen.nemesis.combined :as combined]
             [jepsen.os :as os]
-            [jepsen.os.debian :as debian]))
+            [jepsen.os.debian :as debian])
+  (:import [java.io StringReader]
+           [java.util.concurrent Callable Executors Future TimeUnit]
+           [javax.xml XMLConstants]
+           [javax.xml.parsers DocumentBuilderFactory]
+           [org.w3c.dom Element]
+           [org.xml.sax InputSource]
+           [org.xml.sax.helpers DefaultHandler]))
 
 ;; ---------------------------------------------------------------------------
 ;; Constants
@@ -82,6 +90,134 @@
       (throw (ex-info (str "S3 GET error: HTTP " (:status resp))
                       {:status (:status resp) :body (:body resp)})))))
 
+(defn- xml-root
+  "Parse S3 XML without DTDs, external resources, or user-defined entities."
+  [body]
+  (let [factory (doto (DocumentBuilderFactory/newInstance)
+                  (.setNamespaceAware true)
+                  (.setFeature XMLConstants/FEATURE_SECURE_PROCESSING true)
+                  (.setFeature "http://apache.org/xml/features/disallow-doctype-decl" true)
+                  (.setFeature "http://xml.org/sax/features/external-general-entities" false)
+                  (.setFeature "http://xml.org/sax/features/external-parameter-entities" false)
+                  (.setFeature "http://apache.org/xml/features/nonvalidating/load-external-dtd" false)
+                  (.setAttribute XMLConstants/ACCESS_EXTERNAL_DTD "")
+                  (.setAttribute XMLConstants/ACCESS_EXTERNAL_SCHEMA "")
+                  (.setXIncludeAware false)
+                  (.setExpandEntityReferences false))
+        builder (.newDocumentBuilder factory)]
+    (.setErrorHandler builder (proxy [DefaultHandler] []
+                               (error [e] (throw e))
+                               (fatalError [e] (throw e))))
+    (.getDocumentElement (.parse builder (InputSource. (StringReader. (or body "")))))))
+
+(defn- xml-field
+  [^Element root field]
+  (let [nodes (.getElementsByTagNameNS root "*" field)]
+    (when-not (= 1 (.getLength nodes))
+      (throw (ex-info (str "Missing or duplicate S3 XML " field) {})))
+    (let [^Element node (.item nodes 0)
+          value (.getTextContent node)]
+      (when-not (and (= root (.getParentNode node))
+                     (zero? (.getLength (.getElementsByTagNameNS node "*" "*")))
+                     (not (str/blank? value)))
+        (throw (ex-info (str "Malformed S3 XML " field) {})))
+      value)))
+
+(defn- success!
+  [response]
+  (when-not (<= 200 (:status response) 299)
+    (throw (ex-info (str "S3 multipart HTTP " (:status response)) response)))
+  response)
+
+(defn- result-root!
+  [response expected]
+  (success! response)
+  (let [root (xml-root (:body response))]
+    (when-not (and (= expected (.getLocalName root))
+                   (zero? (.getLength (.getElementsByTagNameNS root "*" "Error"))))
+      (throw (ex-info "S3 multipart error or unexpected XML result" response)))
+    root))
+
+(defn- part-etag!
+  [response]
+  (success! response)
+  (let [etag (get-in response [:headers "etag"])]
+    (when-not (and (string? etag) (re-matches #"\"[0-9a-fA-F]{32}\"" etag))
+      (throw (ex-info "Missing or malformed UploadPart ETag" response)))
+    etag))
+
+(def ^:private multipart-race-timeout-ms 20000)
+
+(defn- race-requests!
+  "Join both bounded HTTP calls, closing their sockets before joining workers
+   on every exit path. No shared future executor survives this write."
+  [manager requests]
+  (let [executor (Executors/newFixedThreadPool 2)
+        tasks (atom [])
+        deadline (+ (System/nanoTime) (* 1000000 multipart-race-timeout-ms))]
+    (try
+      (doseq [request requests]
+        (swap! tasks conj
+               (.submit executor ^Callable
+                        (bound-fn []
+                          (try (request)
+                               (catch Exception e {:exception e}))))))
+      (mapv (fn [^Future task]
+              (.get task (max 1 (- deadline (System/nanoTime))) TimeUnit/NANOSECONDS))
+            @tasks)
+      (finally
+        (doseq [^Future task @tasks] (.cancel task true))
+        (conn/shutdown-manager manager)
+        (.shutdownNow executor)
+        (when-not (.awaitTermination executor 5 TimeUnit/SECONDS)
+          (throw (ex-info "Multipart HTTP workers did not terminate" {})))))))
+
+(defn- response!
+  [response]
+  (if-let [e (:exception response)] (throw e) response))
+
+(defn- no-such-upload?
+  [response]
+  (and (= 404 (:status response))
+       (let [root (xml-root (:body response))]
+         (and (= "Error" (.getLocalName root))
+              (= "NoSuchUpload" (xml-field root "Code"))))))
+
+(defn- s3-multipart-put!
+  [base-url k v]
+  (let [manager (conn/make-reusable-conn-manager {:threads 2 :default-per-route 2})
+        url (object-url base-url k)
+        opts {:connection-manager manager :throw-exceptions false :as :string
+              :conn-timeout 5000 :connection-request-timeout 5000 :socket-timeout 10000
+              :retry-handler (fn [_ _ _] false) :redirect-strategy :none}]
+    (try
+      (let [root (result-root! (http/post url (assoc opts :query-params {"uploads" ""}))
+                               "InitiateMultipartUploadResult")
+            id (xml-field root "UploadId")
+            _ (when (or (> (count id) 1024) (re-find #"[\s\p{Cntrl}]" id))
+                (throw (ex-info "Malformed S3 UploadId" {})))
+            part-opts (assoc opts :query-params {"uploadId" id "partNumber" 1}
+                                 :body (str v) :content-type "text/plain")
+            etag (part-etag! (http/put url part-opts))
+            ;; ETag is the server's quoted MD5, not a locally substituted hash.
+            body (str "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>"
+                      etag "</ETag></Part></CompleteMultipartUpload>")
+            [replacement completion]
+            (race-requests! manager
+                            [#(http/put url part-opts)
+                             #(http/post url (assoc opts :query-params {"uploadId" id}
+                                                         :body body :content-type "application/xml"))])
+            completed (result-root! (response! completion) "CompleteMultipartUploadResult")
+            completed-etag (xml-field completed "ETag")]
+        (when-not (re-matches #"\"[0-9a-fA-F]{32}-1\"" completed-etag)
+          (throw (ex-info "Malformed completion ETag" {})))
+        ;; Upload deletion is expected only after a confirmed completion.
+        (let [replacement (response! replacement)]
+          (when-not (no-such-upload? replacement)
+            (when-not (= etag (part-etag! replacement))
+              (throw (ex-info "Same-body replacement changed ETag" {}))))))
+      (finally (conn/shutdown-manager manager)))))
+
 ;; ---------------------------------------------------------------------------
 ;; Jepsen client
 ;; ---------------------------------------------------------------------------
@@ -101,16 +237,20 @@
   (close! [this _test]
     (assoc this :url nil))
 
-  (invoke! [_this _test op]
+  (invoke! [_this test op]
     (try
-      (let [[k v] (:value op)]
+      (let [[k v] (:value op)
+            ;; Both modes run on the same CI cluster; keep their registers disjoint.
+            object-key (if (:multipart test) (str "multipart-" k) k)]
         (case (:f op)
           :write
-          (do (s3-put! url k v)
+          (do (if (:multipart test)
+                (s3-multipart-put! url object-key v)
+                (s3-put! url k v))
               (assoc op :type :ok))
 
           :read
-          (let [val (s3-get url k)]
+          (let [val (s3-get url object-key)]
             (assoc op :type :ok :value (independent/tuple k val)))))
       (catch java.net.ConnectException _
         (assoc op :type :info :error :connection-refused))
@@ -133,6 +273,41 @@
 ;; ---------------------------------------------------------------------------
 
 (def default-nodes ["n1" "n2" "n3" "n4" "n5"])
+
+(defn multipart-final-read-ops
+  [key-count]
+  (map (fn [k] {:f :read :value (independent/tuple k nil) :final true})
+       (range key-count)))
+
+(defn multipart-final-reads-checker
+  "Global acceptance gate: every configured key must finish its final read;
+   empty histories and runs with no confirmed writes cannot pass."
+  [key-count]
+  (reify checker/Checker
+    (check [_ _test history _opts]
+      (let [expected (set (range key-count))
+            writes (filter #(and (= :write (:f %)) (= :ok (:type %))) history)
+            reads (filter #(and (= :read (:f %)) (= :ok (:type %))) history)
+            finals (filter #(and (:final %) (= :read (:f %))) history)
+            invoked (filter #(= :invoke (:type %)) finals)
+            completed (remove #(= :invoke (:type %)) finals)
+            successful (filter #(= :ok (:type %)) completed)
+            key-of #(first (:value %))
+            written (set (map key-of writes))
+            missing (remove #(contains? (set (map key-of successful)) %) expected)
+            bad (filter #(or (not= :ok (:type %))
+                             (not (or (integer? (second (:value %)))
+                                      (and (nil? (second (:value %)))
+                                           (not (contains? written (key-of %)))))))
+                        completed)]
+        {:valid? (boolean (and (seq expected) (seq writes) (seq reads)
+                               (= expected (set (map key-of invoked)))
+                               (= key-count (count invoked) (count completed))
+                               (empty? missing) (empty? bad)))
+         :completed-writes (count writes)
+         :completed-reads (count reads)
+         :missing-final-keys (vec (sort missing))
+         :bad-final-reads (mapv #(into {} %) bad)}))))
 
 (defn s3-register-checker
   "Builds the per-key S3 register checker. Knossos's default competition
@@ -169,8 +344,11 @@
                     (->> (gen/mix [(map (fn [v] {:f :write :value v}) (range))
                                   (gen/repeat {:f :read})])
                          (gen/limit max-writes))))
-     :checker   (independent/checker
-                  (s3-register-checker))}))
+     :checker   (let [register (independent/checker (s3-register-checker))]
+                  (if (:multipart opts)
+                    (checker/compose {:register register
+                                      :complete-final-reads (multipart-final-reads-checker key-count)})
+                    register))}))
 
 (defn elastickv-s3-test
   "Builds a Jepsen test map that drives elastickv's S3-compatible API
@@ -201,9 +379,16 @@
          nemesis-gen (if nemesis-p
                        (:generator nemesis-p)
                        (gen/once {:type :info :f :noop}))
-         workload   (s3-register-workload (assoc opts :node->port node->port))]
+         workload   (s3-register-workload (assoc opts :node->port node->port))
+         main-gen   (->> (:generator workload)
+                         (gen/nemesis nemesis-gen)
+                         (gen/stagger (/ rate))
+                         (gen/time-limit time-limit))]
      (merge workload
-            {:name            (or (:name opts) "elastickv-s3-register")
+            (when (:multipart opts) {:multipart true})
+            {:name            (or (:name opts) (if (:multipart opts)
+                                                "elastickv-s3-multipart-register"
+                                                "elastickv-s3-register"))
              :nodes           nodes
              :db              db
              :s3-host         (:s3-host opts)
@@ -220,10 +405,14 @@
                                 nemesis/noop)
              :final-generator nil
              :concurrency     (or (:concurrency opts) 10)
-             :generator       (->> (:generator workload)
-                                   (gen/nemesis nemesis-gen)
-                                   (gen/stagger (/ rate))
-                                   (gen/time-limit time-limit))}))))
+             :generator       (if (:multipart opts)
+                                (gen/phases main-gen
+                                            (when nemesis-p
+                                              (gen/phases
+                                                (gen/nemesis (:final-generator nemesis-p))
+                                                (gen/sleep 10)))
+                                            (gen/clients (multipart-final-read-ops (or (:key-count opts) 10))))
+                                main-gen)}))))
 
 ;; ---------------------------------------------------------------------------
 ;; CLI
@@ -231,7 +420,9 @@
 
 (def s3-cli-opts
   "S3-specific CLI options, appended to common opts."
-  [[nil "--s3-ports PORTS" "Comma separated S3 ports (per node)."
+  [[nil "--multipart" "Race same-body UploadPart with CompleteMultipartUpload."
+    :default false]
+   [nil "--s3-ports PORTS" "Comma separated S3 ports (per node)."
     :default nil
     :parse-fn (fn [s]
                 (->> (str/split s #",")

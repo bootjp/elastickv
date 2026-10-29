@@ -255,10 +255,40 @@ jobs:
           path: /tmp/jepsen-store-types.tar.gz
           retention-days: 7
       - name: Run S3 Jepsen workload against elastickv
+        id: s3_register
         working-directory: jepsen
         timeout-minutes: 3
         run: |
           timeout 120 ~/lein run -m elastickv.s3-workload --local --time-limit 5 --rate 10 --concurrency 10 --s3-ports 63901,63902,63903 --host 127.0.0.1
+      - name: Run S3 multipart Jepsen workload against elastickv
+        id: s3_multipart
+        working-directory: jepsen
+        timeout-minutes: 3
+        run: |
+          timeout 120 ~/lein run -m elastickv.s3-workload --local --multipart --time-limit 30 --rate 10 --concurrency 10 --s3-ports 63901,63902,63903 --host 127.0.0.1
+      - name: Archive S3 acceptance histories
+        if: always()
+        env:
+          S3_REGISTER_OUTCOME: ${{ steps.s3_register.outcome }}
+          S3_MULTIPART_OUTCOME: ${{ steps.s3_multipart.outcome }}
+          ENCRYPTION_MODE: ${{ matrix.encryption }}
+        run: |
+          printf 'run_sha=%s\nencryption=%s\nregister=%s\nmultipart=%s\n' \
+            "$GITHUB_SHA" "$ENCRYPTION_MODE" "$S3_REGISTER_OUTCOME" "$S3_MULTIPART_OUTCOME" \
+            > /tmp/s3-acceptance-source.txt
+          bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-s3-register /tmp/s3-register-history.tar.gz
+          bash scripts/archive-jepsen-store.sh jepsen/store/elastickv-s3-multipart-register /tmp/s3-multipart-history.tar.gz
+      - name: Upload S3 acceptance histories
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: s3-acceptance-encryption-${{ matrix.encryption }}
+          path: |
+            /tmp/s3-register-history.tar.gz
+            /tmp/s3-multipart-history.tar.gz
+            /tmp/s3-acceptance-source.txt
+          retention-days: 14
+          if-no-files-found: warn
       - name: Run SQS HT-FIFO Jepsen workload against elastickv
         working-directory: jepsen
         # The HT-FIFO workload runs sends and receives across a 4-partition

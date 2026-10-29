@@ -1538,9 +1538,20 @@ func (c *Coordinate) toRawRequest(req *Elem[OP]) *pb.Request {
 
 var ErrInvalidRequest = errors.New("invalid request")
 
-// maxReadKeys caps the number of keys that may appear in a transaction's read
-// set. Exceeding this limit is rejected to prevent unbounded memory growth.
-const maxReadKeys = 10_000
+// MaxReadKeys bounds the physical read set in a transaction request, including
+// staged-visibility aliases. S3 completion must support all 10,000 parts even
+// during migration: reserve 240 logical keys for metadata/fences and write
+// aliases, then allow two physical keys per logical read. Keep the post-alias
+// checks as well as the input checks to bound accepted physical key counts
+// without dropping conflict keys or reducing the supported part count. This
+// count is not a byte budget or a bound on allocations before alias checks.
+const (
+	maxDataReadKeys = 10_000
+	readKeyHeadroom = 240
+	MaxReadKeys     = 2 * (maxDataReadKeys + readKeyHeadroom)
+)
+
+const maxReadKeys = MaxReadKeys
 
 var ErrLeaderNotFound = errors.New("leader not found")
 

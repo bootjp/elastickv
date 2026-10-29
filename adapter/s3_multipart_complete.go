@@ -26,6 +26,7 @@ type s3MultipartCompletion struct {
 	uploadMetaKey []byte
 	uploadMeta    s3UploadMeta
 	manifestParts []s3ObjectPart
+	partKeys      [][]byte
 	totalSize     int64
 	compositeETag string
 }
@@ -64,33 +65,24 @@ func validateS3MultipartCompletionParts(parts []s3CompleteMultipartUploadPart, b
 	return nil
 }
 
-func (s *S3Server) loadS3MultipartCompletion(ctx context.Context, bucket, objectKey, uploadID string, request s3CompleteMultipartUploadRequest) (s3MultipartCompletion, error) {
+func (s *S3Server) loadS3MultipartCompletion(ctx context.Context, readTS uint64, bucket, objectKey, uploadID string, request s3CompleteMultipartUploadRequest) (s3MultipartCompletion, *s3BucketMeta, error) {
 	completion := s3MultipartCompletion{bucket: bucket, objectKey: objectKey, uploadID: uploadID}
-	readTS := s.readTS()
-	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 complete multipart upload preparation: begin read timestamp")
-	if err != nil {
-		return completion, errors.WithStack(err)
-	}
-	readTS = readTimestamp.Timestamp()
-	readPin := s.pinReadTS(readTS)
-	defer readPin.Release()
-
 	meta, exists, err := s.loadBucketMetaAt(ctx, bucket, readTS)
 	if err != nil {
-		return completion, errors.WithStack(err)
+		return completion, nil, errors.WithStack(err)
 	}
 	if !exists || meta == nil {
-		return completion, newS3ResponseError(http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
+		return completion, nil, newS3ResponseError(http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, bucket, objectKey)
 	}
 	completion.generation = meta.Generation
 	completion.uploadMetaKey = s3keys.UploadMetaKey(bucket, meta.Generation, objectKey, uploadID)
 	if err := s.loadS3MultipartUploadMeta(ctx, readTS, &completion); err != nil {
-		return completion, err
+		return completion, nil, err
 	}
 	if err := s.loadS3MultipartParts(ctx, readTS, request.Parts, &completion); err != nil {
-		return completion, err
+		return completion, nil, err
 	}
-	return completion, nil
+	return completion, meta, nil
 }
 
 func (s *S3Server) loadS3MultipartUploadMeta(ctx context.Context, readTS uint64, completion *s3MultipartCompletion) error {
@@ -106,9 +98,15 @@ func (s *S3Server) loadS3MultipartUploadMeta(ctx context.Context, readTS uint64,
 
 func (s *S3Server) loadS3MultipartParts(ctx context.Context, readTS uint64, requested []s3CompleteMultipartUploadPart, completion *s3MultipartCompletion) error {
 	completion.manifestParts = make([]s3ObjectPart, 0, len(requested))
+	completion.partKeys = make([][]byte, 0, len(requested))
 	md5Concat := md5.New() //nolint:gosec // S3 composite ETag compatibility requires MD5.
 	for i, requestedPart := range requested {
-		part, partMD5, err := s.loadS3MultipartPart(ctx, readTS, requestedPart, i == len(requested)-1, completion)
+		partNo, err := uint64FromInt(requestedPart.PartNumber)
+		if err != nil {
+			return err
+		}
+		partKey := s3keys.UploadPartKey(completion.bucket, completion.generation, completion.objectKey, completion.uploadID, partNo)
+		part, partMD5, err := s.loadS3MultipartPart(ctx, readTS, partKey, requestedPart, i == len(requested)-1, completion)
 		if err != nil {
 			return err
 		}
@@ -116,15 +114,14 @@ func (s *S3Server) loadS3MultipartParts(ctx context.Context, readTS uint64, requ
 			return errors.WithStack(err)
 		}
 		completion.manifestParts = append(completion.manifestParts, part)
+		completion.partKeys = append(completion.partKeys, partKey)
 		completion.totalSize += part.SizeBytes
 	}
 	completion.compositeETag = multipartCompositeETag(md5Concat, len(requested))
 	return nil
 }
 
-func (s *S3Server) loadS3MultipartPart(ctx context.Context, readTS uint64, requested s3CompleteMultipartUploadPart, last bool, completion *s3MultipartCompletion) (s3ObjectPart, []byte, error) {
-	partNo := uint64(requested.PartNumber) //nolint:gosec // validated by validateS3MultipartCompletionParts before loading parts.
-	partKey := s3keys.UploadPartKey(completion.bucket, completion.generation, completion.objectKey, completion.uploadID, partNo)
+func (s *S3Server) loadS3MultipartPart(ctx context.Context, readTS uint64, partKey []byte, requested s3CompleteMultipartUploadPart, last bool, completion *s3MultipartCompletion) (s3ObjectPart, []byte, error) {
 	raw, err := s.store.GetAt(ctx, partKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -157,39 +154,55 @@ func multipartCompositeETag(md5Concat hash.Hash, partCount int) string {
 	return hex.EncodeToString(md5Concat.Sum(nil)) + fmt.Sprintf("-%d", partCount)
 }
 
-func (s *S3Server) commitS3MultipartCompletion(ctx context.Context, completion s3MultipartCompletion) (*s3ObjectManifest, error) {
+func writeS3MultipartMutationError(w http.ResponseWriter, err error, bucket, objectKey string) {
+	var responseErr *s3ResponseError
+	if !errors.As(err, &responseErr) && isRetryableS3MutationErr(err) {
+		writeS3SlowDown(w, bucket, objectKey)
+		return
+	}
+	writeS3MutationError(w, err, bucket, objectKey)
+}
+
+func writeS3SlowDown(w http.ResponseWriter, bucket, objectKey string) {
+	writeS3Error(w, http.StatusServiceUnavailable, "SlowDown", "conflicting operation in progress; retry with backoff", bucket, objectKey)
+}
+
+func (s *S3Server) commitS3MultipartCompletion(ctx context.Context, bucket, objectKey, uploadID string, request s3CompleteMultipartUploadRequest) (s3MultipartCompletion, *s3ObjectManifest, error) {
+	var completion s3MultipartCompletion
 	var previous *s3ObjectManifest
 	err := s.retryS3Mutation(ctx, func() error {
 		var err error
-		previous, err = s.commitS3MultipartCompletionAttempt(ctx, completion)
+		completion, previous, err = s.commitS3MultipartCompletionAttempt(ctx, bucket, objectKey, uploadID, request)
 		return err
 	})
-	return previous, err
+	return completion, previous, err
 }
 
-func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, completion s3MultipartCompletion) (*s3ObjectManifest, error) {
+// A retry rebuilds the manifest from one retained snapshot. Descriptor keys are
+// read-only dependencies: a concurrent part replacement must conflict at apply.
+func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, bucket, objectKey, uploadID string, request s3CompleteMultipartUploadRequest) (s3MultipartCompletion, *s3ObjectManifest, error) {
 	readTS := s.readTS()
 	readTimestamp, err := s.beginTxnReadTimestamp(ctx, readTS, "s3 complete multipart upload: begin read timestamp")
 	if err != nil {
-		return nil, errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
+		return s3MultipartCompletion{}, nil, errors.Wrap(err, "s3: allocate startTS for completeMultipartUpload retry")
 	}
 	readTS = readTimestamp.Timestamp()
 	startTS := readTS
 	readPin := s.pinReadTS(readTS)
 	defer readPin.Release()
 
-	meta, err := s.validateS3MultipartCommitFences(ctx, readTS, completion)
+	completion, meta, err := s.loadS3MultipartCompletion(ctx, readTS, bucket, objectKey, uploadID, request)
 	if err != nil {
-		return nil, err
+		return completion, nil, err
+	}
+	headKey := s3keys.ObjectManifestKey(bucket, meta.Generation, objectKey)
+	previous, _, err := s.loadObjectManifestAt(ctx, headKey, readTS)
+	if err != nil {
+		return completion, nil, errors.WithStack(err)
 	}
 	commitTS, err := s.nextTxnCommitTS(ctx, startTS)
 	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	headKey := s3keys.ObjectManifestKey(completion.bucket, meta.Generation, completion.objectKey)
-	previous, _, err := s.loadObjectManifestAt(ctx, headKey, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
+		return completion, nil, errors.WithStack(err)
 	}
 	manifestBody, err := encodeS3ObjectManifest(&s3ObjectManifest{
 		UploadID:        completion.uploadID,
@@ -201,11 +214,11 @@ func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, compl
 		Parts:           completion.manifestParts,
 	})
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return completion, nil, errors.WithStack(err)
 	}
 	bucketFence, err := encodeS3BucketMeta(meta)
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return completion, nil, errors.WithStack(err)
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
 	_, err = kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, &kv.OperationGroup[kv.OP]{
@@ -218,29 +231,10 @@ func (s *S3Server) commitS3MultipartCompletionAttempt(ctx context.Context, compl
 			{Op: kv.Del, Key: completion.uploadMetaKey},
 			{Op: kv.Del, Key: s3keys.GCUploadKey(completion.bucket, completion.generation, completion.objectKey, completion.uploadID)},
 		},
+		ReadKeys: completion.partKeys,
 	})
 	if err != nil {
-		return nil, errors.WithStack(err)
+		return completion, nil, errors.WithStack(err)
 	}
-	return previous, nil
-}
-
-func (s *S3Server) validateS3MultipartCommitFences(ctx context.Context, readTS uint64, completion s3MultipartCompletion) (*s3BucketMeta, error) {
-	meta, exists, err := s.loadBucketMetaAt(ctx, completion.bucket, readTS)
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
-	if !exists || meta == nil {
-		return nil, newS3ResponseError(http.StatusNotFound, s3ErrNoSuchBucket, s3ErrNoSuchBucketMsg, completion.bucket, completion.objectKey)
-	}
-	if meta.Generation != completion.generation {
-		return nil, newS3ResponseError(http.StatusNotFound, "NoSuchUpload", "upload not found (bucket was recreated)", completion.bucket, completion.objectKey)
-	}
-	if _, err := s.store.GetAt(ctx, completion.uploadMetaKey, readTS); err != nil {
-		if errors.Is(err, store.ErrKeyNotFound) {
-			return nil, newS3ResponseError(http.StatusNotFound, "NoSuchUpload", "upload not found", completion.bucket, completion.objectKey)
-		}
-		return nil, errors.WithStack(err)
-	}
-	return meta, nil
+	return completion, previous, nil
 }
