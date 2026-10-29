@@ -36,6 +36,7 @@ const (
 	quorumAcceptanceHeartbeatTicks = 10
 	quorumAcceptanceElectionWait   = 3 * quorumAcceptanceTick * quorumAcceptanceElectionTicks
 	quorumAcceptanceSnapshotEvery  = 8
+	quorumAcceptanceSnapshotWait   = 30 * time.Second
 )
 
 // Real data-group elections, WAL, transport, ConfChanges and native snapshots.
@@ -697,6 +698,10 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 	// All members, including the learner, must have an actual persisted native
 	// snapshot covering the ACKed write itself. Status() is a periodically
 	// refreshed diagnostic and can lag the proposal's returned CommitIndex.
+	// Each of the four members writes a snapshot holding the 64 MiB value at
+	// the same time; that takes about a second without the race detector and
+	// regularly exceeded a 5 s wait under -race in CI. The phase's own 60 s
+	// budget still bounds the whole large-write/snapshot step.
 	require.Eventually(t, func() bool {
 		for _, n := range c.nodes {
 			if n.engine.Status().LastSnapshotIndex < target {
@@ -704,7 +709,7 @@ func (c *quorumAcceptanceCluster) retainedAndRestart(t *testing.T, root quorumAc
 			}
 		}
 		return true
-	}, 5*time.Second, 20*time.Millisecond)
+	}, quorumAcceptanceSnapshotWait, 20*time.Millisecond)
 	t.Logf("all four members persisted native snapshots covering ACKed write index %d", target)
 	for _, n := range c.nodes {
 		n.tx.Close()
