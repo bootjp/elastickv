@@ -431,17 +431,7 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 		return 0, 0
 	}
 	if a.journaledWrites {
-		writer, ok := a.core.(interface {
-			WriteWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) (int, error)
-		})
-		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
-			return 0, syscall.EOPNOTSUPP
-		}
-		id := a.nextOperationID(ctx)
-		n, writeErr = writer.WriteWithOperation(ctx, id, inode, offset, data)
-		if writeErr == nil {
-			a.recordReceipt(inode, id)
-		}
+		n, writeErr = a.writeWithOperation(ctx, inode, offset, data)
 	} else {
 		n, writeErr = a.core.Write(ctx, inode, fh, offset, data)
 	}
@@ -449,6 +439,21 @@ func (a *Adapter) Write(ctx context.Context, inode uint64, fh uint64, offset uin
 		slog.WarnContext(ctx, "filesystem FUSE write failed", "inode", inode, "offset", offset, "length", len(data), "error", writeErr.Error())
 	}
 	return n, Errno(writeErr)
+}
+
+func (a *Adapter) writeWithOperation(ctx context.Context, inode, offset uint64, data []byte) (int, error) {
+	writer, ok := a.core.(interface {
+		WriteWithOperation(context.Context, filesystem.OperationID, uint64, uint64, []byte) (int, error)
+	})
+	if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+		return 0, filesystem.ErrUnsupported
+	}
+	id := a.nextOperationID(ctx)
+	n, err := writer.WriteWithOperation(ctx, id, inode, offset, data)
+	if err == nil {
+		a.recordReceipt(inode, id)
+	}
+	return n, errors.WithStack(err)
 }
 
 func (a *Adapter) Flush(ctx context.Context, inode uint64, fh uint64) syscall.Errno {
@@ -624,53 +629,70 @@ func (a *Adapter) Mkdir(
 }
 
 func (a *Adapter) Unlink(ctx context.Context, parent uint64, name []byte) (errno syscall.Errno) {
-	ticket, errno := a.mutations.begin(ctx, parent)
-	if errno != 0 {
-		return errno
-	}
-	var err error
-	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	if a.journaledUnlink {
-		unlinker, ok := a.core.(interface {
-			UnlinkWithOperation(context.Context, filesystem.OperationID, uint64, []byte) error
-		})
-		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
-			return syscall.EOPNOTSUPP
-		}
-		id := a.nextOperationID(ctx)
-		err = unlinker.UnlinkWithOperation(ctx, id, parent, name)
-		if err == nil {
-			a.recordReceipt(parent, id)
-		}
-	} else {
-		err = a.core.Unlink(ctx, parent, name)
-	}
-	return Errno(err)
+	return a.removeEntry(ctx, parent, name, a.unlink)
 }
 
 func (a *Adapter) Rmdir(ctx context.Context, parent uint64, name []byte) (errno syscall.Errno) {
+	return a.removeEntry(ctx, parent, name, a.rmdir)
+}
+
+func (a *Adapter) removeEntry(
+	ctx context.Context,
+	parent uint64,
+	name []byte,
+	remove func(context.Context, uint64, []byte) error,
+) syscall.Errno {
 	ticket, errno := a.mutations.begin(ctx, parent)
 	if errno != 0 {
 		return errno
 	}
 	var err error
 	defer func() { a.mutations.end(ticket, errors.Is(err, kv.ErrTransactionOutcomeUnknown)) }()
-	if a.journaledRmdir {
-		remover, ok := a.core.(interface {
-			RmdirWithOperation(context.Context, filesystem.OperationID, uint64, []byte) error
-		})
-		if !ok || a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
-			return syscall.EOPNOTSUPP
-		}
-		id := a.nextOperationID(ctx)
-		err = remover.RmdirWithOperation(ctx, id, parent, name)
-		if err == nil {
-			a.recordReceipt(parent, id)
-		}
-	} else {
-		err = a.core.Rmdir(ctx, parent, name)
-	}
+	err = remove(ctx, parent, name)
 	return Errno(err)
+}
+
+func (a *Adapter) unlink(ctx context.Context, parent uint64, name []byte) error {
+	if !a.journaledUnlink {
+		return errors.WithStack(a.core.Unlink(ctx, parent, name))
+	}
+	unlinker, ok := a.core.(interface {
+		UnlinkWithOperation(context.Context, filesystem.OperationID, uint64, []byte) error
+	})
+	if !ok {
+		return filesystem.ErrUnsupported
+	}
+	return a.removeWithOperation(ctx, parent, name, unlinker.UnlinkWithOperation)
+}
+
+func (a *Adapter) rmdir(ctx context.Context, parent uint64, name []byte) error {
+	if !a.journaledRmdir {
+		return errors.WithStack(a.core.Rmdir(ctx, parent, name))
+	}
+	remover, ok := a.core.(interface {
+		RmdirWithOperation(context.Context, filesystem.OperationID, uint64, []byte) error
+	})
+	if !ok {
+		return filesystem.ErrUnsupported
+	}
+	return a.removeWithOperation(ctx, parent, name, remover.RmdirWithOperation)
+}
+
+func (a *Adapter) removeWithOperation(
+	ctx context.Context,
+	parent uint64,
+	name []byte,
+	remove func(context.Context, filesystem.OperationID, uint64, []byte) error,
+) error {
+	if a.sessionConflict || a.operationSession.Filesystem == [16]byte{} || a.operationSession.Session == [16]byte{} {
+		return filesystem.ErrUnsupported
+	}
+	id := a.nextOperationID(ctx)
+	err := remove(ctx, id, parent, name)
+	if err == nil {
+		a.recordReceipt(parent, id)
+	}
+	return err
 }
 
 func (a *Adapter) Rename(

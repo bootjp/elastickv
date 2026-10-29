@@ -139,7 +139,7 @@ func TestBootstrap_RejectsTruncated(t *testing.T) {
 	}
 }
 
-// TestBootstrap_RejectsOverCapBatchCount is the codex P1 round-3
+// TestBootstrap_RejectsOverCapBatchCount is the P1 round-3
 // regression for PR748: the wire-bytes check (count *
 // registrationSize ≤ remaining) is necessary but NOT sufficient
 // because RegistrationPayload occupies more bytes in memory (24
@@ -180,13 +180,13 @@ func TestBootstrap_RejectsOverCapBatchCount(t *testing.T) {
 	if !errors.Is(err, fsmwire.ErrFSMWireMalformed) {
 		t.Fatalf("expected ErrFSMWireMalformed for over-cap batch count, got %v", err)
 	}
-	if !strings.Contains(err.Error(), "exceeds cap") {
-		t.Fatalf("expected the batch-count cap to reject, got %v", err)
+	if !strings.Contains(err.Error(), "bootstrap: batch count 16385 exceeds cap 16384") {
+		t.Fatalf("expected explicit batch-count cap error, got %v", err)
 	}
 }
 
 // TestBootstrap_RejectsHugeBatchCount is the regression for the
-// codex P1 / gemini security-high finding: a malformed bootstrap
+// security-high finding in PR748: a malformed bootstrap
 // payload that names `count = 0xffffffff` would, before the guard,
 // trigger `make([]RegistrationPayload, count)` (4G × 14 bytes ≈
 // 56 GiB) and OOM the process before the loop tried to read the
@@ -195,7 +195,8 @@ func TestBootstrap_RejectsOverCapBatchCount(t *testing.T) {
 func TestBootstrap_RejectsHugeBatchCount(t *testing.T) {
 	t.Parallel()
 	// Hand-roll a payload whose batch count is huge but which has
-	// only a tiny tail to serve registration rows from. We start
+	// no registration rows. The cap must take precedence over the
+	// remaining-bytes check without allocating a huge payload. We start
 	// from the encoded form of a minimal valid bootstrap, then
 	// rewrite the count prefix in place.
 	good := fsmwire.EncodeBootstrap(fsmwire.BootstrapPayload{
@@ -217,6 +218,9 @@ func TestBootstrap_RejectsHugeBatchCount(t *testing.T) {
 	_, err := fsmwire.DecodeBootstrap(good)
 	if !errors.Is(err, fsmwire.ErrFSMWireMalformed) {
 		t.Fatalf("expected ErrFSMWireMalformed for huge batch count, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "bootstrap: batch count 4294967295 exceeds cap 16384") {
+		t.Fatalf("expected explicit batch-count cap error, got %v", err)
 	}
 }
 

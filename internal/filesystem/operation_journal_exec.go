@@ -34,7 +34,7 @@ func (j *OperationJournal) BeginAttempt(ctx context.Context, id OperationID) (op
 			return operationRecord{}, err
 		}
 		record.Generation++
-		if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
+		if err = j.storeRecordAndSession(ctx, ts, record, session); err != nil {
 			if IsWriteConflict(err) {
 				if err = waitOperationCASRetry(ctx, retry); err != nil {
 					return operationRecord{}, err
@@ -148,10 +148,14 @@ func (j *OperationJournal) PlanSnapshot(ctx context.Context, id OperationID, att
 	if err != nil {
 		return 0, err
 	}
-	if attempt == [16]byte{} || record.AttemptID != attempt {
+	if invalidOperationAttempt(record, attempt) {
 		return 0, errors.WithStack(ErrOperationGeneration)
 	}
 	return ts, nil
+}
+
+func invalidOperationAttempt(record operationRecord, attempt [16]byte) bool {
+	return attempt == [16]byte{} || record.AttemptID != attempt
 }
 
 // AttemptOutcome is backed by the replicated operation row. In particular,
@@ -217,7 +221,7 @@ func (j *OperationJournal) Publish(ctx context.Context, id OperationID, attempt 
 	if err != nil {
 		return j.resolveDuplicatePublication(ctx, id, attempt, plan.Intent, err)
 	}
-	if attempt == [16]byte{} || record.AttemptID != attempt {
+	if invalidOperationAttempt(record, attempt) {
 		return operationRecord{}, errors.WithStack(ErrOperationGeneration)
 	}
 	effectKeys, err := validateOperationPlan(record, session, plan)
@@ -358,7 +362,7 @@ func (j *OperationJournal) RejectAtRoute(ctx context.Context, id OperationID, at
 }
 
 func validateOperationRejection(record operationRecord, attempt [16]byte, intent, result []byte) error {
-	if attempt == [16]byte{} || record.AttemptID != attempt {
+	if invalidOperationAttempt(record, attempt) {
 		return errors.WithStack(ErrOperationGeneration)
 	}
 	if record.Fingerprint != sha256.Sum256(intent) || !bytes.Equal(record.Intent, intent) {
@@ -404,7 +408,7 @@ func (j *OperationJournal) cancelWithResult(ctx context.Context, id OperationID,
 	record.State = OperationCancelled
 	record.Result = append([]byte(nil), result...)
 	session.Pending--
-	if err = j.storeRecordAndSession(ctx, ts, record, session, nil, nil); err != nil {
+	if err = j.storeRecordAndSession(ctx, ts, record, session); err != nil {
 		return operationRecord{}, err
 	}
 	return j.Resolve(ctx, id)
