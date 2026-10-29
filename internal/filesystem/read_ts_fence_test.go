@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -15,6 +16,7 @@ import (
 type allGroupsTimestampFenceCoordinator struct {
 	inner     *testCoordinator
 	fenceTS   uint64
+	fenceFn   func() uint64
 	fenceErr  error
 	calls     int
 	plainCall int
@@ -22,6 +24,9 @@ type allGroupsTimestampFenceCoordinator struct {
 
 func (c *allGroupsTimestampFenceCoordinator) LeaseReadAllGroupsTimestamp(context.Context) (uint64, error) {
 	c.calls++
+	if c.fenceFn != nil {
+		return c.fenceFn(), c.fenceErr
+	}
 	return c.fenceTS, c.fenceErr
 }
 
@@ -70,7 +75,26 @@ func TestServiceReadTSRaisesSnapshotToAllGroupsFenceTimestamp(t *testing.T) {
 	coord.fenceTS = 5
 	ts, err = svc.readTS(ctx)
 	require.NoError(t, err)
-	require.EqualValues(t, 7, ts, "local store ahead of the fence keeps its own watermark")
+	require.EqualValues(t, 5, ts, "leader fence remains authoritative when local state is ahead")
+}
+
+func TestServiceReadTSUsesLocalWatermarkForLegacyForwarder(t *testing.T) {
+	ctx := context.Background()
+	st := store.NewMVCCStore()
+	require.NoError(t, st.PutAt(ctx, []byte("key"), []byte("value"), 7, 0))
+	seed, err := NewService(st, &testCoordinator{st: st}, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+	require.NoError(t, seed.InitializeRoot(ctx, testRootMode, 1000, 1000))
+	coord := kv.CoordinatorForwarder{Inner: &kvtest.NopCoordinator{}}
+	svc, err := NewService(st, coord, WithChunkSize(testChunkSize))
+	require.NoError(t, err)
+
+	ts, err := svc.readTS(ctx)
+	require.NoError(t, err)
+	require.Equal(t, st.LastCommitTS(), ts, "legacy fence has no leader-side commit watermark")
+	root, err := svc.GetAttr(ctx, RootInode)
+	require.NoError(t, err)
+	require.Equal(t, RootInode, root.Inode)
 }
 
 func TestServiceReadTSPropagatesAllGroupsFenceTimestampError(t *testing.T) {
@@ -90,24 +114,18 @@ func TestServiceFollowerReadsObserveOwnForwardedWrite(t *testing.T) {
 	backing := store.NewMVCCStore()
 	local := &laggingStore{MVCCStore: backing}
 	inner := &testCoordinator{st: backing}
-	coord := &allGroupsTimestampFenceCoordinator{inner: inner}
+	coord := &allGroupsTimestampFenceCoordinator{inner: inner, fenceFn: backing.LastCommitTS}
 	svc, err := NewService(local, coord, WithChunkSize(testChunkSize), WithIDAllocator(sequenceIDAllocator(2)))
 	require.NoError(t, err)
-	fence := func() { coord.fenceTS = backing.LastCommitTS() }
-
-	fence()
 	require.NoError(t, svc.InitializeRoot(ctx, testRootMode, 1000, 1000))
-	fence()
 	file, err := svc.Create(ctx, RootInode, []byte("file"), CreateOptions{Mode: testFileMode})
 	require.NoError(t, err)
-	fence()
 	_, err = svc.Write(ctx, file.Inode, 0, 0, []byte("abcd"))
 	require.NoError(t, err)
 
 	// The write committed on the leader (backing store) but this node's
 	// applied watermark still trails it by one commit.
 	local.lag = 1
-	fence()
 
 	stat, err := svc.GetAttr(ctx, file.Inode)
 	require.NoError(t, err)
