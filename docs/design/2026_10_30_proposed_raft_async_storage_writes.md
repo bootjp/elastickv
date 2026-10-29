@@ -312,3 +312,64 @@ the configuration plan; performance adds one bounded configuration-state copy,
 not a user-payload copy; consistency retains V1/V2 publication and deferral
 semantics; coverage includes phase-boundary failures and existing snapshot,
 membership and restart checks. All asynchronous integration gates remain open.
+
+### Normal apply, snapshot and shutdown boundaries
+
+Normal committed entries now capture the immutable execution dependencies and
+borrowed committed bytes, execute without Engine or RawNode access, then return
+an explicit receipt to owner publication. The current path remains synchronous.
+Execution still checks unwrap and HaltApply failures before publication, drops
+data-mutating duplicates but replays volatile effects without an old apply-index
+callback, and preserves a successful prefix before a later fatal entry. Ordinary
+FSM error verdicts remain committed responses. No extra user-payload copy is
+added. The immutable cutover callback is evaluated during ordered execution,
+not when the owner captures an input: a preceding enable entry changes how its
+queued successor must be decoded. A future apply actor must also sequence its
+duplicate/replay cursor; a stale enqueue-time owner applied index is not enough.
+
+Created/configuration snapshots retain their durable-index bump before SaveSnap.
+Local snapshot persistence now exposes capture, disk SaveSnap, MemoryStorage
+publication/compaction, disk Release and cleanup as separate synchronous phases.
+Save and Release use the same captured snapshot. Disk-only methods have no FSM,
+MemoryStorage or owner callbacks. Configuration snapshots still do not compact
+MemoryStorage; received snapshots still bump only after durable WAL snapshot
+persistence. Snapshot locks, benign out-of-date classifications and protected
+resource release remain unchanged. This separation does not itself provide the
+received-snapshot restore barrier or asynchronous checkpoint prefix handshake.
+
+Shutdown authority publication is now a separate non-I/O operation. It publishes
+Shutdown and the original fatal error, clears leader/quorum-ack mirrors and
+invokes nonblocking lease invalidations before logging, worker joins or storage
+teardown can wait. Pending request failure classification and resource teardown
+remain synchronous and unchanged; there is not yet a completion-pumping shutdown
+loop. A gated Storage.Close regression first reproduced stale liveness anchors
+and delayed callbacks for both single-node and quorum anchors, in normal and
+fatal shutdown. A separate gated fatal logger reproduced StateLeader, a live
+anchor and no fatal error while the error log was held. Both actual runtime-red
+checks failed before correction. The corrected shutdown tests pass twenty race
+repetitions (2.050s), including a real snapshot worker held inside SaveSnap that
+must join before storage closes. The logger gate is nonparallel and restores
+the global logger after joining. An independent review also exposed standard
+`log` output/flags leaking from the test: a child-cleanup regression reproduced
+the leak before correction and now verifies both restored output and nonzero
+flags. Related KV lease/timestamp-window callers pass
+five race repetitions (4.441s); all production callback and liveness consumers
+were audited. This does not prove a whole native-engine Close lifecycle.
+
+Normal phase and existing apply/encryption/cold-start race checks passed twenty
+repetitions (1.960s). Snapshot phase checks passed twenty race repetitions
+(13.133s); existing WAL/snapshot/configuration/recovery selections also passed
+(14.082s). Tests preserve successful-prefix publication, queued encryption
+cutover, duplicate classification, snapshot failure ordering, retained pins and
+no receipt before Release. Clean shutdown/reopen and injected failures are not
+power-loss or full native-quorum acceptance.
+
+Five follow-up passes: data-loss review keeps fatal versus committed verdicts
+and snapshot durability order distinct; concurrency review keeps execution free
+of mutable owner state, revokes authority before blocking teardown and retains
+all worker joins; performance preserves borrowed payloads and small captured
+metadata rather than cloning user data; consistency preserves replay, cutover,
+snapshot publication and error semantics; coverage exercises delayed execution,
+prefix failure and deterministic shutdown/snapshot gates. The actual held-user-
+Save heartbeat failure and unchanged near-64-MiB quorum gate remain open. Do not
+enable AsyncStorageWrites until their full integration requirements above pass.

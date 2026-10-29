@@ -907,19 +907,40 @@ func persistLocalSnapshotPayload(storage *etcdraft.MemoryStorage, persist etcdst
 	if err != nil {
 		return raftpb.Snapshot{}, err
 	}
-	if err := persist.SaveSnap(&snapshot); err != nil {
-		return raftpb.Snapshot{}, errors.WithStack(err)
+	return persistCapturedLocalSnapshot(storage, persist, snapshot)
+}
+
+type localSnapshotPublisher interface {
+	CreateSnapshot(uint64, *raftpb.ConfState, []byte) (*raftpb.Snapshot, error)
+	Compact(uint64) error
+}
+
+// persistCapturedLocalSnapshot is synchronous MemoryStorage+disk orchestration,
+// not a disk-only operation. Save and Release use the same captured prefix even
+// if MemoryStorage changes while SaveSnap is executing.
+func persistCapturedLocalSnapshot(storage localSnapshotPublisher, persist etcdstorage.Storage, snapshot raftpb.Snapshot) (raftpb.Snapshot, error) {
+	disk := snapshotDiskPhase{persist: persist}
+	if err := disk.save(&snapshot); err != nil {
+		return raftpb.Snapshot{}, err
 	}
-	if _, err := storage.CreateSnapshot(applied, snapshot.GetMetadata().GetConfState(), payload); err != nil {
-		return raftpb.Snapshot{}, errors.WithStack(err)
+	if err := publishLocalSnapshot(storage, &snapshot); err != nil {
+		return raftpb.Snapshot{}, err
 	}
-	if err := storage.Compact(applied); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
-		return raftpb.Snapshot{}, errors.WithStack(err)
-	}
-	if err := persist.Release(&snapshot); err != nil {
-		return raftpb.Snapshot{}, errors.WithStack(err)
+	if err := disk.release(&snapshot); err != nil {
+		return raftpb.Snapshot{}, err
 	}
 	return snapshot, nil
+}
+
+func publishLocalSnapshot(storage localSnapshotPublisher, snapshot *raftpb.Snapshot) error {
+	index := snapshot.GetMetadata().GetIndex()
+	if _, err := storage.CreateSnapshot(index, snapshot.GetMetadata().GetConfState(), snapshot.GetData()); err != nil {
+		return errors.WithStack(err)
+	}
+	if err := storage.Compact(index); err != nil && !errors.Is(err, etcdraft.ErrCompacted) {
+		return errors.WithStack(err)
+	}
+	return nil
 }
 
 // defaultMaxSnapFiles is the number of .snap/.fsm file pairs to retain.
