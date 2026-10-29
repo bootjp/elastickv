@@ -1174,6 +1174,12 @@ or acceptance receipt. Implementation now proceeds from main `c316b829e` on
   checker and honest indeterminate outcomes. Require complete successful
   final reads so lost referenced chunks cannot be hidden by failed GETs.
   Keep the default PUT/GET workload unchanged and run both modes in CI.
+  Run the new multipart mode for 30 seconds at rate 10 and concurrency 10
+  in each encryption job; a five-second sample produced no confirmed writes
+  under contention in one local run and must not be accepted as evidence.
+  Preserve both named S3 histories, source SHA, encryption mode and step
+  outcomes as unconditional CI artifacts. Do not weaken the nonvacuity or
+  final-read gate to obtain a passing result.
 - Verify all changed helper callers, full adapter/KV/store race suites,
   unfiltered lint, relevant Jepsen checks, and latest-push review/CI. A1 does
   not establish cross-group serializability before A2's read-lock protocol,
