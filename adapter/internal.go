@@ -123,8 +123,9 @@ func WithInternalMigrationExportRouting(groupID uint64, resolver kv.PartitionRes
 }
 
 // WithInternalReadWatermarkProposer sets the proposer that applies forwarded
-// read-watermark advances to this group. It is wired whether or not the admin
-// server runs, because snapshot reads routed through a follower depend on it.
+// read-watermark advances to this group. Without it a forwarded advance is
+// refused. It is wired, whether or not the admin server runs, only when the
+// advance is enabled (--readWatermarkAdvance).
 func WithInternalReadWatermarkProposer(proposer raftengine.Proposer) InternalOption {
 	return func(i *Internal) {
 		i.readWatermarkProposer = proposer
@@ -638,18 +639,16 @@ func (i *Internal) forwardReadWatermarkAdvance(
 	if i.store != nil && ts <= i.store.LastCommitTS() {
 		return &pb.ForwardAdminProposalResponse{}, nil
 	}
-	if !kv.ReadWatermarkAdvanceAdmissible(i.clock, ts) {
+	if i.readWatermarkProposer == nil {
+		return nil, errors.WithStack(status.Error(codes.FailedPrecondition, "read watermark advance is not enabled on this node"))
+	}
+	// The wall clock only bounds how far ahead an advance may reach, the
+	// same role it has as the input to the physical ceiling.
+	if !kv.ReadWatermarkAdvanceAdmissible(time.Now().UnixMilli(), ts) {
 		return nil, errors.WithStack(status.Errorf(codes.FailedPrecondition,
 			"read watermark advance to %d is ahead of this leader's clock", ts))
 	}
-	proposer := i.readWatermarkProposer
-	if proposer == nil {
-		proposer = i.adminProposer
-	}
-	if proposer == nil {
-		return nil, errors.New("read watermark proposer is unavailable")
-	}
-	result, err := proposer.ProposeAdmin(ctx, payload)
+	result, err := i.readWatermarkProposer.ProposeAdmin(ctx, payload)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

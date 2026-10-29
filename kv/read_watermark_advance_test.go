@@ -6,8 +6,10 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/distribution"
+	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
+	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
 )
 
@@ -39,7 +41,7 @@ func newTwoGroupReadFixture(t *testing.T) *twoGroupReadFixture {
 		f.groups[gid] = &ShardGroup{Engine: r, Store: st, Txn: NewLeaderProxyWithEngine(r)}
 		f.stores[gid] = st
 	}
-	f.shards = NewShardStore(engine, f.groups)
+	f.shards = NewShardStore(engine, f.groups).WithReadWatermarkAdvance()
 	return f
 }
 
@@ -192,18 +194,96 @@ func TestApplyWatermarkAdvance(t *testing.T) {
 
 func TestReadWatermarkAdvanceAdmissible(t *testing.T) {
 	t.Parallel()
-	clock := NewHLC()
-	now := clock.Current() >> hlcLogicalBits
-	window := uint64(hlcPhysicalWindowMs)
-	require.True(t, ReadWatermarkAdvanceAdmissible(clock, now<<hlcLogicalBits))
-	require.True(t, ReadWatermarkAdvanceAdmissible(clock, (now+window)<<hlcLogicalBits))
-	require.False(t, ReadWatermarkAdvanceAdmissible(clock, (now+window+1000)<<hlcLogicalBits))
-	require.False(t, ReadWatermarkAdvanceAdmissible(nil, 1))
+	const nowMs = int64(1_800_000_000_000)
+	bound := uint64(nowMs + readWatermarkAdvanceHorizonMs)
+	require.True(t, ReadWatermarkAdvanceAdmissible(nowMs, uint64(nowMs)<<hlcLogicalBits))
+	require.True(t, ReadWatermarkAdvanceAdmissible(nowMs, bound<<hlcLogicalBits|0xffff))
+	require.False(t, ReadWatermarkAdvanceAdmissible(nowMs, (bound+1)<<hlcLogicalBits))
+}
 
-	// A raised physical ceiling widens the bound by the same amount.
-	ahead := now + 10*window
-	clock.SetPhysicalCeiling(clampUint64ToInt64(ahead))
-	require.True(t, ReadWatermarkAdvanceAdmissible(clock, (ahead+window)<<hlcLogicalBits))
+// Accepted advances must not widen the bound for the next one: a bound taken
+// from the clock or ceiling the advance itself raises would let repeated
+// requests staircase the watermark arbitrarily far ahead.
+func TestReadWatermarkAdvanceAdmissionDoesNotStaircase(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	clock := NewHLC()
+	fsm := NewKvFSMWithHLC(st, clock)
+
+	nowMs := time.Now().UnixMilli()
+	ts := uint64(nowMs+readWatermarkAdvanceHorizonMs) << hlcLogicalBits
+	require.True(t, ReadWatermarkAdvanceAdmissible(nowMs, ts))
+	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts)))
+	next := ts + uint64(hlcPhysicalWindowMs)<<hlcLogicalBits
+	require.False(t, ReadWatermarkAdvanceAdmissible(nowMs, next))
+}
+
+// A replica that cannot persist a committed advance must stop applying
+// rather than advance its applied index past it: its peers fence one-phase
+// writes at or below the advance and it would not, diverging the data.
+func TestApplyWatermarkAdvanceHaltsOnPersistFailure(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	fsm := NewKvFSMWithHLC(failingRaftApplyStore{MVCCStore: st}, NewHLC())
+
+	resp := fsm.Apply(EncodeWatermarkAdvance(42))
+	require.Error(t, haltApplyOf(resp))
+}
+
+type failingRaftApplyStore struct {
+	store.MVCCStore
+}
+
+func (failingRaftApplyStore) ApplyMutationsRaftAt(context.Context, []*store.KVPairMutation, [][]byte, uint64, uint64, uint64) error {
+	return errors.New("disk full")
+}
+
+// After a restart the engine's cold-start duplicate skip drops committed
+// entries past the snapshot unless they are classified volatile. The store
+// reopens with the advanced watermark and the HLC observes it, so the
+// advance must replay to restore the ceiling it raised, or every fenced
+// allocation is refused.
+func TestWatermarkAdvanceReplayRestoresCeiling(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	first := NewHLC()
+	first.SetPhysicalCeiling(time.Now().UnixMilli() + hlcPhysicalWindowMs)
+	ts := (first.Next()>>hlcLogicalBits+2*uint64(hlcPhysicalWindowMs))<<hlcLogicalBits | 5
+	require.Nil(t, NewKvFSMWithHLC(st, first).Apply(EncodeWatermarkAdvance(ts)))
+
+	// Restart: a fresh HLC whose ceiling comes from the lease horizon only.
+	clock := NewHLC()
+	clock.SetPhysicalCeiling(time.Now().UnixMilli() + hlcPhysicalWindowMs)
+	fsm := NewKvFSMWithHLC(st, clock)
+	classifier, ok := fsm.(raftengine.VolatileEntryClassifier)
+	require.True(t, ok)
+	require.True(t, classifier.IsVolatileOnlyPayload(EncodeWatermarkAdvance(ts)))
+	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts)))
+	require.Equal(t, ts, st.LastCommitTS())
+	next, err := clock.NextFenced()
+	require.NoError(t, err)
+	require.Greater(t, next, ts)
+}
+
+// Until every replica understands the advance entry, the operator leaves it
+// off and reads behave as before.
+func TestShardStoreReadWatermarkAdvanceIsOptIn(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	f := newTwoGroupReadFixture(t)
+	f.shards = NewShardStore(f.shards.engine, f.groups)
+
+	require.NoError(t, f.onePhase(t, 2, 5, 10, "b-k", "old"))
+	require.NoError(t, f.onePhase(t, 1, 10, 30, "a-k", "x"))
+	_, err := f.shards.GetAt(ctx, []byte("b-k"), f.shards.LastCommitTS())
+	require.NoError(t, err)
+	require.Equal(t, uint64(10), f.stores[2].LastCommitTS())
 }
 
 // An advance from a group whose clock runs ahead must not leave the HLC

@@ -670,8 +670,14 @@ probes, forward, reverse and physical-limit scans, keys-only scans,
 `ScanGroupOwnedAt`), forwarding to a remote leader through
 `Internal.ForwardAdminProposal` with a dedicated proposer wired whether or
 not the admin server runs, and a leader-side admission bound
-(`ReadWatermarkAdvanceAdmissible`: physical half at most
-`max(physical(Current()), ceiling) + hlcPhysicalWindowMs`). Regression
+(`ReadWatermarkAdvanceAdmissible`: physical half at most the leader's wall
+clock plus two lease windows, never derived from the HLC or the ceiling,
+which an accepted advance raises, so repeated requests cannot staircase
+it). A persistence failure halts the apply loop, and the entry is
+classified volatile so a restart replays it and restores the ceiling. The
+whole path is opt-in (`--readWatermarkAdvance`, default off; without it a
+forwarded advance is refused) until every replica understands tag `0x17`,
+which is the rolling-upgrade gate. Regression
 tests: `kv/read_watermark_advance_test.go` (the reproduction's shape on two
 single-node groups, red on `main`). Provenance is the interim rule "advance
 only when `ts` is at or below the maximum watermark this node has applied
@@ -682,8 +688,10 @@ section: the typed coordinator-only snapshot argument and the
 watermark; leader-authoritative snapshots and the lagging-replica test;
 per-group HLC ceilings (the raise lands on the process-wide ceiling, the
 shape `main` already has for every observed commit timestamp); a
-capability gate for rolling upgrades (a member on an older binary does not
-know tag `0x17`); and the read-side benchmark.
+cluster-verified capability gate in place of the operator flag;
+node authentication for the forwarded advance when no admin token is
+configured, and a server-verifiable snapshot voucher; and the read-side
+benchmark.
 
 Open after this branch:
 

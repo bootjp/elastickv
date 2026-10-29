@@ -147,6 +147,7 @@ var (
 	tsoBatchSize                    = flag.Int("tsoBatchSize", defaultTSOBatchSize, "Timestamp batch size used by TSO cutover and shadow validation")
 	tsoModeFile                     = flag.String("tsoModeFile", "", "Path to a runtime-reloadable TSO mode file containing legacy, shadow, cutover, or phase-d")
 	tsoModeReloadInterval           = flag.Duration("tsoModeReloadInterval", defaultTSOReload, "Polling interval for tsoModeFile")
+	readWatermarkAdvance            = flag.Bool("readWatermarkAdvance", false, "Raise a lagging group's commit watermark before a cross-group snapshot read so late one-phase writes cannot land below the snapshot; enable only after every node runs a binary that understands the advance entry")
 	leaderBalance                   = flag.Bool("leaderBalance", false, "Enable automatic count-based Raft-group leader balancing on the default-group leader")
 	leaderBalanceInterval           = flag.Duration("leaderBalanceInterval", defaultLeaderBalanceInterval, "Interval between leader-balance scheduler evaluations")
 	leaderBalanceGroupCooldown      = flag.Duration("leaderBalanceGroupCooldown", defaultLeaderBalanceGroupCooldown, "Minimum time before the scheduler can move the same raft group again")
@@ -612,6 +613,9 @@ func run() error {
 
 	cleanup.Add(readTracker.Close)
 	shardStore := kv.NewShardStore(cfg.engine, shardGroups)
+	if *readWatermarkAdvance {
+		shardStore.WithReadWatermarkAdvance()
+	}
 	cleanup.Add(func() {
 		_ = shardStore.Close()
 		for _, rt := range runtimes {
@@ -4247,6 +4251,9 @@ func startRaftServers(
 			return migrationOwnershipRuntimeReady(trx, shardStore, distServer, rt.spec.id, rt.snapshotEngine())
 		}))
 		internalOpts = append(internalOpts, migrationInternalProtocolOptions(trx, shardStore, distServer, rt)...)
+		if *readWatermarkAdvance {
+			internalOpts = append(internalOpts, adapter.WithInternalReadWatermarkProposer(proposerForGroup(rt, shardGroups)))
+		}
 		staticServingServices := registerS3BlobFetchServer(
 			gs,
 			adminGRPCOpts.s3BlobFetchEnabled,
@@ -4265,7 +4272,6 @@ func startRaftServers(
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
-				adapter.WithInternalReadWatermarkProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
 				adapter.WithInternalActiveTimestampTracker(readTracker),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),

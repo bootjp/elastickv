@@ -73,6 +73,12 @@ func decodeWatermarkAdvanceBody(body []byte) (uint64, error) {
 // this replica until a lease renewal overtook it. The raise is to the
 // physical half exactly, so a group sharing the sender's millisecond does
 // not staircase the ceilings under alternating cross-group traffic.
+//
+// A failure to persist halts the apply loop: a replica that skipped a
+// committed advance would accept one-phase writes its peers fence. The
+// entry is classified volatile (IsVolatileOnlyPayload) so the engine replays
+// it after a restart; the watermark write is then a no-op and the replay
+// restores the ceiling the restored HLC would otherwise lack.
 func (f *kvFSM) applyWatermarkAdvance(ctx context.Context, body []byte) any {
 	ts, err := decodeWatermarkAdvanceBody(body)
 	if err != nil {
@@ -80,7 +86,7 @@ func (f *kvFSM) applyWatermarkAdvance(ctx context.Context, body []byte) any {
 	}
 	if ts > f.store.LastCommitTS() {
 		if err := f.store.ApplyMutationsRaftAt(ctx, nil, nil, ts, ts, f.pendingApplyIdx); err != nil {
-			return errors.Wrap(err, "apply read watermark advance")
+			return haltErr(errors.Wrap(errors.Mark(err, ErrRaftEntryApply), "kv/fsm: apply read watermark advance"))
 		}
 	}
 	if f.hlc != nil {
@@ -121,7 +127,7 @@ func (s *ShardStore) ensureReadWatermark(ctx context.Context, g *ShardGroup, ts 
 // advance: g is Raft-backed, ts is a snapshot this node has applied
 // somewhere, and g's own watermark is still below it.
 func (s *ShardStore) readWatermarkAdvanceNeeded(g *ShardGroup, ts uint64) bool {
-	if g == nil || g.Store == nil || engineForGroup(g) == nil {
+	if !s.readWatermarkAdvance || g == nil || g.Store == nil || engineForGroup(g) == nil {
 		return false
 	}
 	if ts == 0 || ts == ^uint64(0) || ts <= g.Store.LastCommitTS() {
@@ -130,17 +136,19 @@ func (s *ShardStore) readWatermarkAdvanceNeeded(g *ShardGroup, ts uint64) bool {
 	return ts <= s.LastCommitTS()
 }
 
+// readWatermarkAdvanceHorizonMs bounds how far ahead of a leader's wall
+// clock a forwarded advance may reach. A legitimate snapshot was issued by
+// some group's leader at most one lease window (hlcPhysicalWindowMs) ahead
+// of that leader's wall clock; the second window absorbs clock skew between
+// the two leaders.
+const readWatermarkAdvanceHorizonMs = 2 * hlcPhysicalWindowMs
+
 // ReadWatermarkAdvanceAdmissible bounds the timestamp a leader accepts for a
-// forwarded watermark advance: its physical half may not exceed
-// max(physical(clock.Current()), ceiling) + hlcPhysicalWindowMs. A snapshot
-// taken from a group whose clock runs ahead stays inside that bound; a
-// far-future value, which would fence every write on the group until the
-// wall clock caught up, is refused.
-func ReadWatermarkAdvanceAdmissible(clock *HLC, ts uint64) bool {
-	if clock == nil {
-		return false
-	}
-	physical := clampUint64ToInt64(ts >> hlcLogicalBits)
-	base := max(clampUint64ToInt64(clock.Current()>>hlcLogicalBits), clock.PhysicalCeiling())
-	return physical <= base+hlcPhysicalWindowMs
+// forwarded watermark advance: its physical half may not exceed the leader's
+// wall clock plus readWatermarkAdvanceHorizonMs. The bound is taken from the
+// wall clock alone, never from the HLC or the ceiling, because an accepted
+// advance raises both: a bound derived from them would let repeated
+// requests staircase the watermark arbitrarily far into the future.
+func ReadWatermarkAdvanceAdmissible(nowMs int64, ts uint64) bool {
+	return clampUint64ToInt64(ts>>hlcLogicalBits) <= nowMs+readWatermarkAdvanceHorizonMs
 }

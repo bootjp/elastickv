@@ -31,7 +31,7 @@ func TestInternalForwardReadWatermarkAdvanceProposes(t *testing.T) {
 	t.Parallel()
 	proposer := &internalAdminProposer{}
 	internal, clock := newReadWatermarkInternal(t, proposer)
-	payload := kv.EncodeWatermarkAdvance(clock.Current() + 1)
+	payload := kv.EncodeWatermarkAdvance(clock.Next())
 
 	resp, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{Payload: payload})
 	require.NoError(t, err)
@@ -74,4 +74,18 @@ func TestInternalForwardReadWatermarkAdvanceCoveredIsNoop(t *testing.T) {
 	_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{Payload: kv.EncodeWatermarkAdvance(50)})
 	require.NoError(t, err)
 	require.Nil(t, proposer.payload)
+}
+
+// Without the read-watermark proposer (the advance is opt-in until every
+// replica understands it) a forwarded advance is refused, and never falls
+// back to the admin proposer.
+func TestInternalForwardReadWatermarkAdvanceDisabled(t *testing.T) {
+	t.Parallel()
+	admin := &internalAdminProposer{}
+	clock := kv.NewHLC()
+	internal := NewInternalWithEngine(nil, internalAdminLeaderView{state: raftengine.StateLeader}, clock, nil,
+		WithInternalAdminProposer(admin))
+	_, err := internal.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{Payload: kv.EncodeWatermarkAdvance(clock.Next())})
+	require.Equal(t, codes.FailedPrecondition, status.Code(err))
+	require.Nil(t, admin.payload)
 }

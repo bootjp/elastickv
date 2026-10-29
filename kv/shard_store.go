@@ -35,6 +35,9 @@ type ShardStore struct {
 	engine            *distribution.Engine
 	groups            map[uint64]*ShardGroup
 	partitionResolver PartitionResolver
+	// readWatermarkAdvance enables ensureReadWatermark. It is opt-in until
+	// every replica understands the advance entry (rolling upgrades).
+	readWatermarkAdvance bool
 
 	connCache GRPCConnCache
 }
@@ -69,6 +72,19 @@ func NewShardStore(engine *distribution.Engine, groups map[uint64]*ShardGroup) *
 // ShardedCoordinator. ShardStore keeps normal byte-range routing for ordinary
 // calls, but backup scanners need the resolver to decide which physical group
 // owns partition-routed keys discovered while scanning every group.
+// WithReadWatermarkAdvance makes cross-group snapshot reads raise a lagging
+// group's watermark to the snapshot before reading (ensureReadWatermark).
+// Enable it only once every replica of every group runs a binary that
+// understands the advance entry: an older replica skips the entry without
+// raising its watermark and would then accept one-phase writes its peers
+// fence.
+func (s *ShardStore) WithReadWatermarkAdvance() *ShardStore {
+	if s != nil {
+		s.readWatermarkAdvance = true
+	}
+	return s
+}
+
 func (s *ShardStore) WithPartitionResolver(r PartitionResolver) *ShardStore {
 	if s != nil {
 		s.partitionResolver = r
