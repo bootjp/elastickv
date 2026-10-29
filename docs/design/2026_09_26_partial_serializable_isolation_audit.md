@@ -1137,8 +1137,11 @@ or acceptance receipt. Implementation now proceeds from main `c316b829e` on
   A retry repeats those reads and ETag checks rather than reusing a manifest
   assembled from an earlier snapshot.
 - UploadPart keeps its streamed blob namespace and read voucher, but checks
-  the upload, bucket generation and superseded descriptor again before its
-  descriptor commit. The read set contains the upload metadata, generation
+  the upload, bucket generation and superseded descriptor again at exactly
+  the dispatched `StartTS` before its descriptor commit, using the original
+  pre-body read timestamp voucher and retained snapshot. Do not replace that
+  snapshot with a local/latest watermark or rename the already-streamed blob
+  and chunkref namespaces. The read set contains the upload metadata, generation
   key and part key. Bucket deletion re-puts the generation key, preserving
   its maximum value, in both public and admin deletion transactions. Other
   object writers do not write that key, so parallel unrelated uploads do
@@ -1151,6 +1154,12 @@ or acceptance receipt. Implementation now proceeds from main `c316b829e` on
 - Multipart conflicts that are proven noncommits can use the existing
   bounded completion retry or a 503 SlowDown response for the consumed
   upload body. Unknown outcomes must not become permission to replay.
+  Track whether descriptor dispatch was attempted: clean new blobs after
+  pre-dispatch failure or a proven noncommit, but preserve them after an
+  uncertain dispatch result. Clean superseded blobs only after confirmed
+  success. The unknown marker takes precedence over any joined conflict,
+  lock or route-fence cause. This prevents a lost success reply from deleting
+  blobs that a committed descriptor may already reference.
 - Red/green regressions run through the production ShardedCoordinator/FSM,
   including both part-read windows, deletion/recreation, superseded blob
   cleanup, unrelated bucket writes, maximum part counts and alias capacity.
