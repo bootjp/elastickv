@@ -16,6 +16,7 @@ import (
 
 	"github.com/bootjp/elastickv/internal/admin"
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
 	"github.com/bootjp/elastickv/internal/raftengine"
 	pb "github.com/bootjp/elastickv/proto"
@@ -80,7 +81,7 @@ func TestEncryptionAdmin_GetCapability_SidecarMissing(t *testing.T) {
 
 func TestEncryptionAdmin_GetCapability_NotBootstrapped(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		// Active.Storage == 0 means "not bootstrapped" per §5.1.
 		Active: encryption.ActiveKeys{},
 		Keys:   map[string]encryption.SidecarKey{},
@@ -110,7 +111,7 @@ func TestEncryptionAdmin_GetCapability_NotBootstrapped(t *testing.T) {
 
 func TestEncryptionAdmin_GetCapability_Bootstrapped(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 1, Raft: 2},
 		Keys: map[string]encryption.SidecarKey{
 			"1": {Purpose: "storage", Wrapped: []byte("wrapped-1")},
@@ -152,7 +153,7 @@ func TestEncryptionAdmin_GetSidecarState_NoSidecarPath(t *testing.T) {
 
 func TestEncryptionAdmin_GetSidecarState_ShipsWrappedDEKs(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		RaftAppliedIndex:         42,
 		StorageEnvelopeActive:    true,
 		RaftEnvelopeCutoverIndex: 100,
@@ -174,7 +175,7 @@ func TestEncryptionAdmin_GetSidecarState_ShipsWrappedDEKs(t *testing.T) {
 func TestEncryptionAdmin_GetSidecarState_ProjectsLocalWriterRegistry(t *testing.T) {
 	t.Parallel()
 	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		RaftAppliedIndex: 1,
 		Active:           encryption.ActiveKeys{Storage: 10, Raft: 11},
 		Keys: map[string]encryption.SidecarKey{
@@ -205,7 +206,7 @@ func TestEncryptionAdmin_GetSidecarState_ProjectsLocalWriterRegistry(t *testing.
 func TestEncryptionAdmin_GetSidecarState_OmitsRegistryProjectionOnFollower(t *testing.T) {
 	t.Parallel()
 	const callerFullNodeID uint64 = 0xCAFE_BABE_0000_1234
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		RaftAppliedIndex:         42,
 		StorageEnvelopeActive:    true,
 		RaftEnvelopeCutoverIndex: 100,
@@ -280,7 +281,7 @@ func TestEncryptionAdmin_RegistryProjectionUsesAppliedLinearizableRead(t *testin
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			path := writeSidecarFixture(t, &encryption.Sidecar{
+			path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 				Active: encryption.ActiveKeys{Storage: 10, Raft: 11},
 				Keys: map[string]encryption.SidecarKey{
 					"10": {Purpose: "storage", Wrapped: []byte("storage")},
@@ -350,7 +351,7 @@ func runEncryptionAdminRegistryProjectionFenceAfterSidecarTest(
 	call func(*EncryptionAdminServer) (uint32, uint32, map[uint32][]byte, map[uint32]uint32, error),
 ) {
 	t.Helper()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 10, Raft: 11},
 		Keys: map[string]encryption.SidecarKey{
 			"10": {Purpose: "storage", Wrapped: []byte("old-storage")},
@@ -445,7 +446,7 @@ func assertSidecarWrappedDEKs(t *testing.T, got *pb.SidecarStateReport) {
 
 func TestEncryptionAdmin_GetSidecarState_CallbackOverridesSidecarIndex(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		RaftAppliedIndex: 10,
 		Active:           encryption.ActiveKeys{Storage: 1, Raft: 2},
 		Keys: map[string]encryption.SidecarKey{
@@ -468,7 +469,7 @@ func TestEncryptionAdmin_GetSidecarState_CallbackOverridesSidecarIndex(t *testin
 
 func TestEncryptionAdmin_ResyncSidecar_ShipsWrappedDEKs(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		RaftAppliedIndex: 17,
 		Active:           encryption.ActiveKeys{Storage: 3, Raft: 4},
 		Keys: map[string]encryption.SidecarKey{
@@ -511,7 +512,7 @@ func TestEncryptionAdmin_ResyncSidecar_ShipsWrappedDEKs(t *testing.T) {
 func TestEncryptionAdmin_ResyncSidecar_ProjectsCallerWriterRegistry(t *testing.T) {
 	t.Parallel()
 	const callerFullNodeID uint64 = 0xDEAD_BEEF_0000_8888
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		RaftAppliedIndex: 17,
 		Active:           encryption.ActiveKeys{Storage: 3, Raft: 4},
 		Keys: map[string]encryption.SidecarKey{
@@ -541,7 +542,7 @@ func TestEncryptionAdmin_ResyncSidecar_ProjectsCallerWriterRegistry(t *testing.T
 func TestEncryptionAdmin_ResyncSidecar_UsesRegistryLeaderView(t *testing.T) {
 	t.Parallel()
 	const callerFullNodeID uint64 = 0xDEAD_BEEF_0000_8888
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 3, Raft: 4},
 		Keys: map[string]encryption.SidecarKey{
 			"3": {Purpose: "storage", Wrapped: []byte("ws")},
@@ -574,7 +575,7 @@ func TestEncryptionAdmin_ResyncSidecar_UsesRegistryLeaderView(t *testing.T) {
 
 func TestEncryptionAdmin_ResyncSidecar_RejectsMissingCallerID(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 3, Raft: 4},
 		Keys: map[string]encryption.SidecarKey{
 			"3": {Purpose: "storage", Wrapped: []byte("ws")},
@@ -596,7 +597,7 @@ func TestEncryptionAdmin_ResyncSidecar_RejectsWriterRegistryCollision(t *testing
 	t.Parallel()
 	const callerFullNodeID uint64 = 0x0000_0000_0000_ABCD
 	const collidingFullNodeID uint64 = 0x9999_9999_9999_ABCD
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 3, Raft: 4},
 		Keys: map[string]encryption.SidecarKey{
 			"3": {Purpose: "storage", Wrapped: []byte("ws")},
@@ -1265,7 +1266,7 @@ func TestEncryptionAdmin_RotateDEK_RejectsStaleLeader(t *testing.T) {
 // stale leader's outdated sidecar contents.
 func TestEncryptionAdmin_ResyncSidecar_RejectsStaleLeader(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 1, Raft: 2},
 		Keys: map[string]encryption.SidecarKey{
 			"1": {Purpose: "storage", Wrapped: []byte("w")},
@@ -1447,7 +1448,7 @@ func TestEncryptionAdmin_RegisterEncryptionWriter_RejectsBatch(t *testing.T) {
 
 func TestEncryptionAdmin_ResyncSidecar_RejectsOnFollower(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 1, Raft: 2},
 		Keys: map[string]encryption.SidecarKey{
 			"1": {Purpose: "storage", Wrapped: []byte("w")},
@@ -1529,19 +1530,6 @@ func (s stubLeaderView) LinearizableRead(ctx context.Context) (uint64, error) {
 		return s.linearizableReadFn(ctx)
 	}
 	return s.linearizableReadIndex, s.linearizableReadErr
-}
-
-// writeSidecarFixture builds a valid keys.json fixture in a tmpdir and
-// returns the path. The caller's *Sidecar is shallow-copied before
-// WriteSidecar so the fixture's Version is set automatically.
-func writeSidecarFixture(t *testing.T, sc *encryption.Sidecar) string {
-	t.Helper()
-	dir := t.TempDir()
-	path := filepath.Join(dir, "keys.json")
-	if err := encryption.WriteSidecar(path, sc); err != nil {
-		t.Fatalf("WriteSidecar: %v", err)
-	}
-	return path
 }
 
 // fixedCapabilityFanout returns a closure that yields the supplied
@@ -1661,7 +1649,7 @@ func allOKFanoutResult() admin.CapabilityFanoutResult {
 // + re-read it afterwards to verify the apply effect.
 func cutoverReadySidecarFixture(t *testing.T) string {
 	t.Helper()
-	return writeSidecarFixture(t, &encryption.Sidecar{
+	return encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 5, Raft: 6},
 		Keys: map[string]encryption.SidecarKey{
 			"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0},
@@ -1750,7 +1738,7 @@ func TestEncryptionAdmin_EnableStorageEnvelope_RejectsOversizedLocalEpoch(t *tes
 // refuse with a clear hint.
 func TestEncryptionAdmin_EnableStorageEnvelope_RejectsNotBootstrapped(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 0, Raft: 0},
 		Keys:   map[string]encryption.SidecarKey{},
 	})
@@ -1778,7 +1766,7 @@ func TestEncryptionAdmin_EnableStorageEnvelope_RejectsNotBootstrapped(t *testing
 // reflect current cluster shape).
 func TestEncryptionAdmin_EnableStorageEnvelope_IdempotentRetry(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active:                      encryption.ActiveKeys{Storage: 5, Raft: 6},
 		Keys:                        map[string]encryption.SidecarKey{"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0}, "6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0}},
 		StorageEnvelopeActive:       true,
@@ -1825,7 +1813,7 @@ func TestEncryptionAdmin_EnableStorageEnvelope_IdempotentRetry(t *testing.T) {
 // CutoverIndexUnknown=true so operators see the warning.
 func TestEncryptionAdmin_EnableStorageEnvelope_DefensiveCutoverIndexUnknown(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active:                      encryption.ActiveKeys{Storage: 5, Raft: 6},
 		Keys:                        map[string]encryption.SidecarKey{"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0}, "6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0}},
 		StorageEnvelopeActive:       true,
@@ -2537,7 +2525,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RejectsOversizedLocalEpoch(t *testin
 // refuse.
 func TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active: encryption.ActiveKeys{Storage: 0, Raft: 0},
 		Keys:   map[string]encryption.SidecarKey{},
 	})
@@ -2567,7 +2555,7 @@ func TestEncryptionAdmin_EnableRaftEnvelope_RejectsNotBootstrapped(t *testing.T)
 // narrower than the storage variant's idempotent shape.
 func TestEncryptionAdmin_EnableRaftEnvelope_IdempotentRetry(t *testing.T) {
 	t.Parallel()
-	path := writeSidecarFixture(t, &encryption.Sidecar{
+	path := encryptiontest.WriteSidecar(t, &encryption.Sidecar{
 		Active:                   encryption.ActiveKeys{Storage: 5, Raft: 6},
 		Keys:                     map[string]encryption.SidecarKey{"5": {Purpose: encryption.SidecarPurposeStorage, Wrapped: []byte("ws"), Created: "x", LocalEpoch: 0}, "6": {Purpose: encryption.SidecarPurposeRaft, Wrapped: []byte("wr"), Created: "x", LocalEpoch: 0}},
 		RaftEnvelopeCutoverIndex: 777,

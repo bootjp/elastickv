@@ -152,55 +152,6 @@ func newTestSession(dconn *mockDetachedConn) *pubsubSession {
 	}
 }
 
-func TestPubSub_SubscribeDuplicate_IdempotentCount(t *testing.T) {
-	dconn := newMockDetachedConn()
-	s := newTestSession(dconn)
-
-	// Simulate an upstream that's already connected.
-	s.channelSet["ch1"] = struct{}{}
-
-	// Subscribe to ch1 again and ch2 (should count ch1 only once).
-	// We can't call handleSubscribe directly because it needs s.upstream,
-	// so we test the set logic directly.
-	s.channelSet["ch1"] = struct{}{} // re-add same key
-	s.channelSet["ch2"] = struct{}{}
-
-	assert.Equal(t, 2, len(s.channelSet), "duplicate subscribe should not increase count")
-	assert.Equal(t, 2, s.subCount())
-}
-
-func TestPubSub_UnsubscribeNonSubscribed_NoEffect(t *testing.T) {
-	dconn := newMockDetachedConn()
-	s := newTestSession(dconn)
-
-	s.channelSet["ch1"] = struct{}{}
-	s.channelSet["ch2"] = struct{}{}
-
-	// Unsubscribe from "ch3" which was never subscribed.
-	delete(s.channelSet, "ch3")
-
-	assert.Equal(t, 2, len(s.channelSet), "unsubscribe non-subscribed channel should not affect count")
-}
-
-func TestPubSub_UnsubscribeSpecific_RemovesFromSet(t *testing.T) {
-	dconn := newMockDetachedConn()
-	s := newTestSession(dconn)
-
-	s.channelSet["ch1"] = struct{}{}
-	s.channelSet["ch2"] = struct{}{}
-	s.channelSet["ch3"] = struct{}{}
-
-	delete(s.channelSet, "ch2")
-
-	assert.Equal(t, 2, len(s.channelSet))
-	_, hasCh1 := s.channelSet["ch1"]
-	_, hasCh2 := s.channelSet["ch2"]
-	_, hasCh3 := s.channelSet["ch3"]
-	assert.True(t, hasCh1)
-	assert.False(t, hasCh2)
-	assert.True(t, hasCh3)
-}
-
 func TestPubSub_WriteUnsubAll_PerChannelReplies(t *testing.T) {
 	dconn := newMockDetachedConn()
 	s := newTestSession(dconn)

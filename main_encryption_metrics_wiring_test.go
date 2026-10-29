@@ -3,13 +3,14 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/bootjp/elastickv/internal/encryption/kek"
-	"github.com/bootjp/elastickv/monitoring"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -109,22 +110,6 @@ func TestEncryptionObserverReachesStoreThroughProductionWiring(t *testing.T) {
 	}
 }
 
-// TestMetricsRegistryEncryptionObserverSatisfiesStoreInterface pins the
-// production type: main.go passes metricsRegistry.EncryptionObserver()
-// where a store.EncryptionObserver is required, so the monitoring
-// implementation must satisfy the store's interface. A compile-time
-// assertion here fails loudly if either side's method set drifts.
-func TestMetricsRegistryEncryptionObserverSatisfiesStoreInterface(t *testing.T) {
-	t.Parallel()
-
-	var obs store.EncryptionObserver = monitoring.NewRegistry("n1", "127.0.0.1:1").EncryptionObserver()
-	if obs == nil {
-		t.Fatal("registry returned a nil encryption observer")
-	}
-	obs.ObserveEncryptionWrite(1, 10, 42)
-	obs.ObserveEncryptionDecryptFailure(encryption.DecryptFailureReasonTagMismatch)
-}
-
 // countingKEKObserver records how many unwraps were timed.
 type countingKEKObserver struct {
 	mu    sync.Mutex
@@ -151,27 +136,29 @@ func (o *countingKEKObserver) total() int {
 // elastickv_encryption_kek_unwrap_seconds empty despite completed KMS
 // calls, so the decorator must wrap the source before they run.
 func TestTimedKEKUnwrapperCoversStartupPreflightUnwraps(t *testing.T) {
-	t.Parallel()
+	previousEnabled := *encryptionEnabled
+	previousSidecar := *encryptionSidecarPath
+	previousFile := *kekFile
+	previousURI := *kekURI
+	t.Cleanup(func() {
+		*encryptionEnabled = previousEnabled
+		*encryptionSidecarPath = previousSidecar
+		*kekFile = previousFile
+		*kekURI = previousURI
+	})
+
+	// A fresh node: the KEK comes from the environment and the sidecar
+	// does not exist yet, so the KEK preflight is the only unwrap.
+	t.Setenv(kek.EnvVar, base64.StdEncoding.EncodeToString(bytes.Repeat([]byte{0x5a}, encryption.KeySize)))
+	*kekFile = ""
+	*kekURI = ""
+	*encryptionEnabled = true
+	*encryptionSidecarPath = filepath.Join(t.TempDir(), encryption.SidecarFilename)
 
 	obs := &countingKEKObserver{}
-	timed := monitoring.NewTimedKEKUnwrapper(preflightKEK{}, obs)
-	require.NotNil(t, timed)
-
-	// Both preflight paths unwrap through the decorated source.
-	require.NoError(t, kek.VerifyWrapper(timed))
+	wrapper, err := loadKEKAndRunStartupGuards(obs)
+	require.NoError(t, err)
+	require.NotNil(t, wrapper)
 	require.Positive(t, obs.total(),
 		"the startup preflight unwrap must be timed, not bypass the decorator")
-}
-
-// preflightKEK is a minimal kek.Wrapper for the decoration-order test.
-type preflightKEK struct{}
-
-func (preflightKEK) Name() string { return "preflight-fake" }
-
-func (preflightKEK) Wrap(dek []byte) ([]byte, error) {
-	return append([]byte("w:"), dek...), nil
-}
-
-func (preflightKEK) Unwrap(wrapped []byte) ([]byte, error) {
-	return bytes.TrimPrefix(wrapped, []byte("w:")), nil
 }

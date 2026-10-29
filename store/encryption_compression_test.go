@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/cockroachdb/errors"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/golang/snappy"
@@ -70,23 +71,12 @@ func TestEncryption_CompressesOnlyWhenSmaller(t *testing.T) {
 
 func TestEncryption_StorageEnvelopeV2CapabilityGate(t *testing.T) {
 	t.Parallel()
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	if _, err := rand.Read(dek); err != nil {
-		t.Fatalf("rand.Read DEK: %v", err)
-	}
 	const keyID uint32 = 107
-	if err := ks.Set(keyID, dek); err != nil {
-		t.Fatalf("Keystore.Set: %v", err)
-	}
-	cipher, err := encryption.NewCipher(ks)
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
+	cipher := encryptiontest.NewCipher(t, keyID)
 	v2Active := false
 	s := &pebbleStore{
 		cipher:                  cipher,
-		nonceFactory:            NewCounterNonceFactory(0x0102, 0x0304),
+		nonceFactory:            encryption.NewDeterministicNonceFactory(0x0102, 0x0304),
 		activeStorageKeyID:      func() (uint32, bool) { return keyID, true },
 		storageEnvelopeV2Active: func() bool { return v2Active },
 	}
@@ -273,22 +263,11 @@ func TestCompressionRoundTripProperty(t *testing.T) {
 
 func TestEncryptedStoreCompressionRoundTripProperty(t *testing.T) {
 	t.Parallel()
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	if _, err := rand.Read(dek); err != nil {
-		t.Fatalf("rand.Read DEK: %v", err)
-	}
 	const keyID uint32 = 105
-	if err := ks.Set(keyID, dek); err != nil {
-		t.Fatalf("Keystore.Set: %v", err)
-	}
-	cipher, err := encryption.NewCipher(ks)
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
+	cipher := encryptiontest.NewCipher(t, keyID)
 	s := &pebbleStore{
 		cipher:             cipher,
-		nonceFactory:       NewCounterNonceFactory(0x0102, 0x0304),
+		nonceFactory:       encryption.NewDeterministicNonceFactory(0x0102, 0x0304),
 		activeStorageKeyID: func() (uint32, bool) { return keyID, true },
 	}
 	rapid.Check(t, func(t *rapid.T) {
@@ -346,21 +325,10 @@ func TestPebbleCompressionPolicy(t *testing.T) {
 // backed by a single freshly generated DEK.
 func newCompressionTestStore(t *testing.T, keyID uint32) *pebbleStore {
 	t.Helper()
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	if _, err := rand.Read(dek); err != nil {
-		t.Fatalf("rand.Read DEK: %v", err)
-	}
-	if err := ks.Set(keyID, dek); err != nil {
-		t.Fatalf("Keystore.Set: %v", err)
-	}
-	cipher, err := encryption.NewCipher(ks)
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
+	cipher := encryptiontest.NewCipher(t, keyID)
 	return &pebbleStore{
 		cipher:             cipher,
-		nonceFactory:       NewCounterNonceFactory(0x0102, 0x0304),
+		nonceFactory:       encryption.NewDeterministicNonceFactory(0x0102, 0x0304),
 		activeStorageKeyID: func() (uint32, bool) { return keyID, true },
 	}
 }

@@ -293,33 +293,6 @@ func (r *RedisServer) doSetExpire(ctx context.Context, key []byte, ttl int64, ex
 	return 1, nil
 }
 
-func (r *RedisServer) dispatchExpireForType(
-	ctx context.Context,
-	key []byte,
-	readTS uint64,
-	typ redisValueType,
-	expireAt time.Time,
-) (bool, error) {
-	if typ == redisTypeString {
-		// rawKeyTypeAt also reports HLL as redisTypeString; HLL payloads live
-		// under !redis|hll|<key>, so distinguish them from plain strings
-		// before rewriting the TTL-bearing anchor.
-		plain, err := r.isPlainRedisString(ctx, key, readTS)
-		if err != nil {
-			return false, err
-		}
-		if plain {
-			return r.dispatchStringExpire(ctx, key, readTS, expireAt)
-		}
-		return r.dispatchHLLExpire(ctx, key, readTS, expireAt)
-	}
-	if isNonStringCollectionType(typ) {
-		return r.dispatchCollectionExpire(ctx, key, readTS, typ, expireAt)
-	}
-	elems := []*kv.Elem[kv.OP]{{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)}}
-	return true, r.dispatchElems(ctx, true, readTS, elems)
-}
-
 func (r *RedisServer) dispatchExpireForReadTimestamp(
 	ctx context.Context,
 	key []byte,
@@ -380,30 +353,12 @@ func (r *RedisServer) expireDeleteKeyReadTimestamp(ctx context.Context, key []by
 	return 0, nil
 }
 
-// dispatchStringExpire performs a read-modify-write on the string anchor key:
+// dispatchStringExpireReadTimestamp performs a read-modify-write on the string anchor key:
 // it reads the current value at readTS, re-encodes it with the new expiry, and
 // writes both the updated value and the !redis|ttl| scan index in a single Raft
-// entry (IsTxn=true, StartTS=readTS). The coordinator rejects the write with
+// entry (IsTxn=true, StartTS=readTimestamp). The coordinator rejects the write with
 // ErrWriteConflict if any key was modified after readTS, so stale-data safety is
 // guaranteed by OCC — no explicit mutex is required.
-func (r *RedisServer) dispatchStringExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) (bool, error) {
-	userValue, _, readErr := r.readRedisStringAt(key, readTS)
-	if readErr != nil {
-		if cockerrors.Is(readErr, store.ErrKeyNotFound) {
-			// Raced with a delete/expiry between prepareExpire and this read;
-			// do not resurrect the key with an empty anchor.
-			return false, nil
-		}
-		return false, cockerrors.WithStack(readErr)
-	}
-	encoded := encodeRedisStr(userValue, &expireAt)
-	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisStrKey(key), Value: encoded},
-		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
-	}
-	return true, r.dispatchElems(ctx, true, readTS, elems)
-}
-
 func (r *RedisServer) dispatchStringExpireReadTimestamp(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, expireAt time.Time) (bool, error) {
 	readTS := readTimestamp.Timestamp()
 	userValue, _, readErr := r.readRedisStringAt(key, readTS)
@@ -419,29 +374,6 @@ func (r *RedisServer) dispatchStringExpireReadTimestamp(ctx context.Context, key
 		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
 	}
 	return true, r.dispatchReadTimestampElems(ctx, readTimestamp, elems)
-}
-
-func (r *RedisServer) dispatchHLLExpire(ctx context.Context, key []byte, readTS uint64, expireAt time.Time) (bool, error) {
-	raw, err := r.store.GetAt(ctx, redisHLLKey(key), readTS)
-	if err != nil {
-		if cockerrors.Is(err, store.ErrKeyNotFound) {
-			return false, nil
-		}
-		return false, cockerrors.WithStack(err)
-	}
-	value, _, _, err := decodeRedisHLL(raw)
-	if err != nil {
-		return false, err
-	}
-	encoded, err := encodeRedisHLL(value, &expireAt)
-	if err != nil {
-		return false, err
-	}
-	elems := []*kv.Elem[kv.OP]{
-		{Op: kv.Put, Key: redisHLLKey(key), Value: encoded},
-		{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)},
-	}
-	return true, r.dispatchElems(ctx, true, readTS, elems)
 }
 
 func (r *RedisServer) dispatchHLLExpireReadTimestamp(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, expireAt time.Time) (bool, error) {

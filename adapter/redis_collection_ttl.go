@@ -132,22 +132,6 @@ func (r *RedisServer) streamInlineTTLAt(ctx context.Context, userKey []byte, rea
 	return ttl, true, nil
 }
 
-func (r *RedisServer) dispatchCollectionExpire(
-	ctx context.Context,
-	key []byte,
-	readTS uint64,
-	typ redisValueType,
-	expireAt time.Time,
-) (bool, error) {
-	ttlMs := redisExpireAtMillis(expireAt)
-	elems, ok, err := r.collectionExpireElems(ctx, key, readTS, typ, ttlMs)
-	if err != nil || !ok {
-		return ok, err
-	}
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Put, Key: redisTTLKey(key), Value: encodeRedisTTL(expireAt)})
-	return true, r.dispatchElems(ctx, true, readTS, elems)
-}
-
 func (r *RedisServer) dispatchCollectionExpireReadTimestamp(
 	ctx context.Context,
 	key []byte,

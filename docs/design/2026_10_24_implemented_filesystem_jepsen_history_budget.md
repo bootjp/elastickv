@@ -1,5 +1,6 @@
 # Bound filesystem Jepsen histories by write mode
 
+Status: Implemented (shipped in #1321; no implementation work follows)
 Date: 2026-10-24
 
 ## Failure

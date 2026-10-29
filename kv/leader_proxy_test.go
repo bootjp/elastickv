@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
+	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
@@ -74,36 +76,24 @@ func startLeaderProxyBlackhole(t *testing.T) string {
 	return lis.Addr().String()
 }
 
-// stubFollowerEngine is a minimal raftengine.Engine stub that reports the
-// local node as a follower and returns a configured leader address. It is
-// used by TestLeaderProxy_ForwardsWhenFollower to exercise the forwarding
-// code path without running a real two-node raft cluster.
-type stubFollowerEngine struct {
-	leaderAddr string
+// newStubFollowerEngine reports the local node as a follower of a leader at
+// leaderAddr and rejects proposals and reads with ErrNotLeader. It exercises
+// the forwarding code path without running a real two-node raft cluster.
+func newStubFollowerEngine(leaderAddr string) *testEngine {
+	leader := raftengine.LeaderInfo{ID: "leader", Address: leaderAddr}
+	return &testEngine{
+		StaticLeaderView: raftenginetest.StaticLeaderView{
+			StateValue:  raftengine.StateFollower,
+			LeaderValue: leader,
+			ReadErr:     raftengine.ErrNotLeader,
+		},
+		ProposeFunc: func(context.Context, []byte) (*raftengine.ProposalResult, error) {
+			return nil, raftengine.ErrNotLeader
+		},
+		StatusValue:  raftengine.Status{State: raftengine.StateFollower, Leader: leader},
+		SnapshotStep: 10_000,
+	}
 }
-
-func (s *stubFollowerEngine) Propose(context.Context, []byte) (*raftengine.ProposalResult, error) {
-	return nil, raftengine.ErrNotLeader
-}
-func (s *stubFollowerEngine) ProposeAdmin(ctx context.Context, data []byte) (*raftengine.ProposalResult, error) {
-	return s.Propose(ctx, data)
-}
-func (s *stubFollowerEngine) State() raftengine.State { return raftengine.StateFollower }
-func (s *stubFollowerEngine) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{ID: "leader", Address: s.leaderAddr}
-}
-func (s *stubFollowerEngine) VerifyLeader(context.Context) error { return raftengine.ErrNotLeader }
-func (s *stubFollowerEngine) LinearizableRead(context.Context) (uint64, error) {
-	return 0, raftengine.ErrNotLeader
-}
-func (s *stubFollowerEngine) Status() raftengine.Status {
-	return raftengine.Status{State: raftengine.StateFollower, Leader: s.Leader()}
-}
-func (s *stubFollowerEngine) Configuration(context.Context) (raftengine.Configuration, error) {
-	return raftengine.Configuration{}, nil
-}
-func (s *stubFollowerEngine) SnapshotEvery() uint64 { return 10_000 }
-func (s *stubFollowerEngine) Close() error          { return nil }
 
 func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 	t.Parallel()
@@ -137,25 +127,15 @@ func TestLeaderProxy_CommitLocalWhenLeader(t *testing.T) {
 func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 	t.Parallel()
 
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
 	svc := &fakeInternal{resp: &pb.ForwardResponse{Success: true, CommitIndex: 123, CommitTs: 456}}
-	srv := grpc.NewServer()
-	pb.RegisterInternalServer(srv, svc)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
 
 	// Wait briefly so the gRPC server is ready to serve.
 	dialer := &net.Dialer{Timeout: 100 * time.Millisecond}
 	require.Eventually(t, func() bool {
 		dialCtx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		c, err := dialer.DialContext(dialCtx, "tcp", lis.Addr().String())
+		c, err := dialer.DialContext(dialCtx, "tcp", addr)
 		if err != nil {
 			return false
 		}
@@ -163,7 +143,7 @@ func TestLeaderProxy_ForwardsWhenFollower(t *testing.T) {
 		return true
 	}, 2*time.Second, 10*time.Millisecond)
 
-	follower := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
+	follower := newStubFollowerEngine(addr)
 	p := NewLeaderProxyWithEngine(follower)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 
@@ -239,25 +219,16 @@ func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 	// ErrLeaderNotFound, then flip to the real address after a brief
 	// delay. forwardWithRetry must absorb the empty-address window and
 	// succeed once the engine publishes.
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 
 	svc := &fakeInternal{resp: &pb.ForwardResponse{Success: true, CommitIndex: 42}}
-	srv := grpc.NewServer()
-	pb.RegisterInternalServer(srv, svc)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
 
 	// Wait briefly so the gRPC server is ready.
 	dialer := &net.Dialer{Timeout: 100 * time.Millisecond}
 	require.Eventually(t, func() bool {
 		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 		defer cancel()
-		c, err := dialer.DialContext(ctx, "tcp", lis.Addr().String())
+		c, err := dialer.DialContext(ctx, "tcp", addr)
 		if err != nil {
 			return false
 		}
@@ -290,7 +261,7 @@ func TestLeaderProxy_ForwardsAfterLeaderPublishes(t *testing.T) {
 	start := time.Now()
 	go func() {
 		time.Sleep(publishDelay)
-		eng.setLeader(lis.Addr().String())
+		eng.setLeader(addr)
 	}()
 
 	resp, err := p.Commit(context.Background(), reqs)
@@ -347,7 +318,7 @@ func TestLeaderProxy_FailsAfterLeaderBudgetElapses(t *testing.T) {
 func TestLeaderProxy_CanceledForwardReleasesHalfOpenProbe(t *testing.T) {
 	t.Parallel()
 
-	eng := &stubFollowerEngine{leaderAddr: startLeaderProxyBlackhole(t)}
+	eng := newStubFollowerEngine(startLeaderProxyBlackhole(t))
 	p := NewLeaderProxyWithEngine(eng)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 
@@ -372,7 +343,7 @@ func TestLeaderProxy_CanceledForwardReleasesHalfOpenProbe(t *testing.T) {
 func TestLeaderProxy_ProxyBudgetDeadlineCountsTowardBreaker(t *testing.T) {
 	t.Parallel()
 
-	eng := &stubFollowerEngine{leaderAddr: startLeaderProxyBlackhole(t)}
+	eng := newStubFollowerEngine(startLeaderProxyBlackhole(t))
 	p := NewLeaderProxyWithEngine(eng)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 	identity := leaderProxyIdentityFromEngine(eng)
@@ -391,7 +362,7 @@ func TestLeaderProxy_ProxyBudgetDeadlineCountsTowardBreaker(t *testing.T) {
 func TestLeaderProxy_CanceledRecoveryOwnerStopsRetrying(t *testing.T) {
 	t.Parallel()
 
-	eng := &stubFollowerEngine{leaderAddr: "127.0.0.1:1"}
+	eng := newStubFollowerEngine("127.0.0.1:1")
 	p := NewLeaderProxyWithEngine(eng)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 	identity := leaderProxyIdentityFromEngine(eng)
@@ -414,23 +385,14 @@ func TestLeaderProxy_CanceledRecoveryOwnerStopsRetrying(t *testing.T) {
 func TestLeaderProxy_LostForwardResponseDoesNotReplay(t *testing.T) {
 	t.Parallel()
 
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 	svc := &fakeInternal{
 		resp:    &pb.ForwardResponse{Success: true, CommitIndex: 77},
 		err:     status.Error(codes.Unavailable, "startup gate closed"),
 		failFor: leaderProxyBreakerFailureThreshold,
 	}
-	srv := grpc.NewServer()
-	pb.RegisterInternalServer(srv, svc)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
 
-	eng := &stubFollowerEngine{leaderAddr: lis.Addr().String()}
+	eng := newStubFollowerEngine(addr)
 	p := NewLeaderProxyWithEngine(eng)
 	t.Cleanup(func() { _ = p.connCache.Close() })
 
@@ -467,21 +429,12 @@ func TestForwardDecisionEvidence(t *testing.T) {
 func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 	t.Parallel()
 
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 	svc := &fakeInternal{err: ForwardWriteConflictStatus()}
-	srv := grpc.NewServer()
-	pb.RegisterInternalServer(srv, svc)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
 
-	p := NewLeaderProxyWithEngine(&stubFollowerEngine{leaderAddr: lis.Addr().String()})
+	p := NewLeaderProxyWithEngine(newStubFollowerEngine(addr))
 	t.Cleanup(func() { _ = p.connCache.Close() })
-	_, err = p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}})
+	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: true, Phase: pb.Phase_COMMIT}})
 	require.ErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.Equal(t, 1, svc.callCount())
 }
@@ -489,21 +442,12 @@ func TestLeaderProxy_MultiPhaseConflictHasUnknownOutcome(t *testing.T) {
 func TestLeaderProxy_SinglePhaseConflictUsesStructuredStatus(t *testing.T) {
 	t.Parallel()
 
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 	svc := &fakeInternal{err: ForwardWriteConflictStatus()}
-	srv := grpc.NewServer()
-	pb.RegisterInternalServer(srv, svc)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
 
-	p := NewLeaderProxyWithEngine(&stubFollowerEngine{leaderAddr: lis.Addr().String()})
+	p := NewLeaderProxyWithEngine(newStubFollowerEngine(addr))
 	t.Cleanup(func() { _ = p.connCache.Close() })
-	_, err = p.Commit(context.Background(), []*pb.Request{{IsTxn: false, Phase: pb.Phase_NONE}})
+	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: false, Phase: pb.Phase_NONE}})
 	require.ErrorIs(t, err, store.ErrWriteConflict)
 	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.Equal(t, 1, svc.callCount())
@@ -512,21 +456,12 @@ func TestLeaderProxy_SinglePhaseConflictUsesStructuredStatus(t *testing.T) {
 func TestLeaderProxy_SinglePhaseLockUsesStructuredStatus(t *testing.T) {
 	t.Parallel()
 
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
 	svc := &fakeInternal{err: ForwardTxnLockedStatus()}
-	srv := grpc.NewServer()
-	pb.RegisterInternalServer(srv, svc)
-	go func() { _ = srv.Serve(lis) }()
-	t.Cleanup(func() {
-		srv.Stop()
-		_ = lis.Close()
-	})
+	addr := grpctest.Serve(t, func(srv *grpc.Server) { pb.RegisterInternalServer(srv, svc) })
 
-	p := NewLeaderProxyWithEngine(&stubFollowerEngine{leaderAddr: lis.Addr().String()})
+	p := NewLeaderProxyWithEngine(newStubFollowerEngine(addr))
 	t.Cleanup(func() { _ = p.connCache.Close() })
-	_, err = p.Commit(context.Background(), []*pb.Request{{IsTxn: false, Phase: pb.Phase_NONE}})
+	_, err := p.Commit(context.Background(), []*pb.Request{{IsTxn: false, Phase: pb.Phase_NONE}})
 	require.ErrorIs(t, err, ErrTxnLocked)
 	require.NotErrorIs(t, err, ErrTransactionOutcomeUnknown)
 	require.True(t, IsForwardTxnLocked(err))

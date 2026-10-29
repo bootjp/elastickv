@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/stretchr/testify/require"
 	"github.com/tidwall/redcon"
 )
@@ -80,12 +81,8 @@ func TestRedisServerStopWaitsForInflightCommandWithinBound(t *testing.T) {
 	elapsed := time.Since(start)
 	require.GreaterOrEqual(t, elapsed, 150*time.Millisecond, "Stop must give the running command its bound")
 	require.Less(t, elapsed, 3*time.Second, "Stop must not wait on a command that never finishes")
-	select {
-	case err := <-runDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after Stop")
-	}
+	err := testutil.Recv(t, runDone, 5*time.Second, "Run did not return after Stop")
+	require.NoError(t, err)
 
 	start = time.Now()
 	server.Stop()
@@ -109,12 +106,8 @@ func TestRedisServerStopReturnsOnceInflightCommandFinishes(t *testing.T) {
 	elapsed := time.Since(start)
 	require.GreaterOrEqual(t, elapsed, 80*time.Millisecond, "Stop must wait for the running command")
 	require.Less(t, elapsed, 2*time.Second, "Stop must return as soon as the command finished, not after the bound")
-	select {
-	case err := <-runDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after Stop")
-	}
+	err := testutil.Recv(t, runDone, 5*time.Second, "Run did not return after Stop")
+	require.NoError(t, err)
 }
 
 // With nothing in flight Stop returns at once.
@@ -127,12 +120,8 @@ func TestRedisServerStopReturnsPromptlyWhenIdle(t *testing.T) {
 	start := time.Now()
 	server.Stop()
 	require.Less(t, time.Since(start), time.Second)
-	select {
-	case err := <-runDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after Stop")
-	}
+	err := testutil.Recv(t, runDone, 5*time.Second, "Run did not return after Stop")
+	require.NoError(t, err)
 }
 
 // countingRedisCommand is a test-only command that only records that it

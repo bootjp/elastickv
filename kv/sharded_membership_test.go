@@ -9,13 +9,10 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-type membershipConfigEngine struct {
-	noopEngine
-	config raftengine.Configuration
-}
-
-func (e membershipConfigEngine) Configuration(context.Context) (raftengine.Configuration, error) {
-	return e.config, nil
+func membershipConfigEngine(config raftengine.Configuration) *testEngine {
+	engine := newStubLeaderEngine()
+	engine.Config = config
+	return engine
 }
 
 func TestShardedCoordinatorRaftMembersIncludesEveryGroupEndpoint(t *testing.T) {
@@ -25,14 +22,14 @@ func TestShardedCoordinatorRaftMembersIncludesEveryGroupEndpoint(t *testing.T) {
 	routes.UpdateRoute(nil, []byte("m"), 1)
 	routes.UpdateRoute([]byte("m"), nil, 2)
 	groups := map[uint64]*ShardGroup{
-		1: {Engine: membershipConfigEngine{config: raftengine.Configuration{Servers: []raftengine.Server{
+		1: {Engine: membershipConfigEngine(raftengine.Configuration{Servers: []raftengine.Server{
 			{ID: "n1", Address: "127.0.0.1:5101", Suffrage: "voter"},
 			{ID: "n2", Address: "127.0.0.1:5102", Suffrage: "voter"},
-		}}}},
-		2: {Engine: membershipConfigEngine{config: raftengine.Configuration{Servers: []raftengine.Server{
+		}})},
+		2: {Engine: membershipConfigEngine(raftengine.Configuration{Servers: []raftengine.Server{
 			{ID: "n1", Address: "127.0.0.1:5201", Suffrage: "voter"},
 			{ID: "n3", Address: "127.0.0.1:5203", Suffrage: "learner"},
-		}}}},
+		}})},
 	}
 	coordinator := NewShardedCoordinator(routes, groups, 1, NewHLC(), nil)
 

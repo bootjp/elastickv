@@ -9,6 +9,7 @@ import (
 
 	"github.com/bootjp/elastickv/distribution"
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/testutil"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/pebble/v2"
@@ -335,11 +336,7 @@ func TestLockResolver_CloseStopsBackground(t *testing.T) {
 		close(done)
 	}()
 
-	select {
-	case <-done:
-	case <-time.After(5 * time.Second):
-		t.Fatal("LockResolver.Close() did not return within 5s")
-	}
+	testutil.Closed(t, done, 5*time.Second, "LockResolver.Close() did not return within 5s")
 }
 
 func TestLockResolverRaftReadyRequiresSettledLeader(t *testing.T) {

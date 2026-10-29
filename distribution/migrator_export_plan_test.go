@@ -2,7 +2,6 @@ package distribution
 
 import (
 	"bytes"
-	"encoding/binary"
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/fskeys"
@@ -108,7 +107,7 @@ func TestPlanMigrationBracketsDisjointPrefixContainment(t *testing.T) {
 	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(listDelta))
 	require.False(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(listDelta))
 
-	legacyListDelta := legacyListMetaDeltaKey([]byte("legacy-list"), 2, 0)
+	legacyListDelta := store.LegacyListMetaDeltaKey([]byte("legacy-list"), 2, 0)
 	require.True(t, byFamily[MigrationFamilyLegacyListMetaDelta].ContainsRawKey(legacyListDelta))
 	require.False(t, byFamily[MigrationFamilyListMeta].ContainsRawKey(legacyListDelta))
 	require.False(t, byFamily[MigrationFamilyListMetaDelta].ContainsRawKey(legacyListDelta))
@@ -359,7 +358,7 @@ func TestMigrationBracketContainsRoutedKeyUsesLegacyListDeltaUserKey(t *testing.
 	brackets, err := PlanMigrationBrackets([]byte("a"), []byte("z"))
 	require.NoError(t, err)
 	legacy := bracketsByFamily(brackets)[MigrationFamilyLegacyListMetaDelta]
-	raw := legacyListMetaDeltaKey([]byte("target-list"), 10, 0)
+	raw := store.LegacyListMetaDeltaKey([]byte("target-list"), 10, 0)
 	value := store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1})
 
 	require.True(t, legacy.ContainsRoutedVersion(
@@ -580,28 +579,8 @@ func bracketsByFamily(brackets []MigrationBracket) map[uint32]MigrationBracket {
 }
 
 func deltaLookingListMetaUserKey(fakeUserKey []byte, commitTS uint64, seqInTxn uint32) []byte {
-	key := make([]byte, 0, len("d|")+4+len(fakeUserKey)+8+4)
-	key = append(key, "d|"...)
-	var lenPrefix [4]byte
-	binary.BigEndian.PutUint32(lenPrefix[:], uint32(len(fakeUserKey))) //nolint:gosec // test data is small.
-	key = append(key, lenPrefix[:]...)
-	key = append(key, fakeUserKey...)
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], commitTS)
-	key = append(key, ts[:]...)
-	var seq [4]byte
-	binary.BigEndian.PutUint32(seq[:], seqInTxn)
-	return append(key, seq[:]...)
-}
-
-func legacyListMetaDeltaKey(userKey []byte, commitTS uint64, seqInTxn uint32) []byte {
-	key := store.LegacyListMetaDeltaScanPrefix(userKey)
-	var ts [8]byte
-	binary.BigEndian.PutUint64(ts[:], commitTS)
-	key = append(key, ts[:]...)
-	var seq [4]byte
-	binary.BigEndian.PutUint32(seq[:], seqInTxn)
-	return append(key, seq[:]...)
+	// ListMetaKey of the returned user key reads as a legacy list delta key.
+	return bytes.TrimPrefix(store.LegacyListMetaDeltaKey(fakeUserKey, commitTS, seqInTxn), []byte(store.ListMetaPrefix))
 }
 
 // File chunk payloads live under !fs|chk| but route through a virtual

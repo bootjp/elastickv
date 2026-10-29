@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/encryption"
 	"github.com/cockroachdb/pebble/v2"
 	"github.com/stretchr/testify/require"
 )
@@ -30,7 +31,7 @@ func TestOwnershipPartitionSnapshotFormatsAndReopen(t *testing.T) {
 				ps, ok := source.(*pebbleStore)
 				require.True(t, ok)
 				ps.sstIngestSnapshots = format == "encrypted-sst"
-				options = []PebbleStoreOption{WithEncryption(fixture.cipher, NewCounterNonceFactory(0xABCD, 2), func() (uint32, bool) { return fixture.keyID, true })}
+				options = []PebbleStoreOption{WithEncryption(fixture.cipher, encryption.NewDeterministicNonceFactory(0xABCD, 2), func() (uint32, bool) { return fixture.keyID, true })}
 			}
 			_, tx := partitionFixture(t, source)
 			require.NoError(t, partitionStore(t, source).ApplyMigrationOwnershipPartition(t.Context(), tx, 10))

@@ -6,7 +6,7 @@ Date: 2026-10-16
 
 ## Context
 
-The 2026-10-16 code audit (see `2026_10_16_proposed_test_suite_cleanup.md` for the test-side findings) found that most production duplication is small. The valuable cases are the ones where two hand-maintained copies of the same logic have already drifted apart and changed behaviour. This document covers five of them. Each milestone below fixes the drift by making both call sites use one implementation, and pins the result with tests that fail on the current code where a behaviour defect exists.
+The 2026-10-16 code audit (see `2026_10_16_partial_test_suite_cleanup.md` for the test-side findings) found that most production duplication is small. The valuable cases are the ones where two hand-maintained copies of the same logic have already drifted apart and changed behaviour. This document covers five of them. Each milestone below fixes the drift by making both call sites use one implementation, and pins the result with tests that fail on the current code where a behaviour defect exists.
 
 | # | Duplication | Drift already visible |
 |---|---|---|

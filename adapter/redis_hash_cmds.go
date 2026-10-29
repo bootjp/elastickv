@@ -529,41 +529,6 @@ func removeHashFields(value redisHashValue, fields [][]byte) int {
 	return removed
 }
 
-func (r *RedisServer) persistHashTxn(ctx context.Context, key []byte, readTS uint64, value redisHashValue) error {
-	if len(value) == 0 {
-		elems, _, err := r.deleteLogicalKeyElems(ctx, key, readTS)
-		if err != nil {
-			return err
-		}
-		return r.dispatchElems(ctx, true, readTS, elems)
-	}
-	ttlMs, expired, err := legacyTTLMillisForMigrationAt(ctx, r.store, key, readTS)
-	if err != nil {
-		return err
-	}
-	if expired {
-		return r.dispatchElems(ctx, true, readTS, legacyExpiredCollectionCleanupElems(key, redisHashKey(key)))
-	}
-	// Wide-column rewrite: write per-field keys and a new base meta.
-	// deleteLogicalKeyElems (called by the caller when needed) clears old keys.
-	elems := make([]*kv.Elem[kv.OP], 0, len(value)+1)
-	for field, val := range value {
-		elems = append(elems, &kv.Elem[kv.OP]{
-			Op:    kv.Put,
-			Key:   store.HashFieldKey(key, []byte(field)),
-			Value: []byte(val),
-		})
-	}
-	elems = append(elems, &kv.Elem[kv.OP]{
-		Op:    kv.Put,
-		Key:   store.HashMetaKey(key),
-		Value: store.MarshalHashMeta(store.HashMeta{Len: int64(len(value)), ExpireAt: ttlMs}),
-	})
-	// Also remove the legacy blob if it was present.
-	elems = append(elems, &kv.Elem[kv.OP]{Op: kv.Del, Key: redisHashKey(key)})
-	return r.dispatchElems(ctx, true, readTS, elems)
-}
-
 func (r *RedisServer) persistHashReadTimestampTxn(ctx context.Context, key []byte, readTimestamp kv.ReadTimestamp, value redisHashValue) error {
 	readTS := readTimestamp.Timestamp()
 	if len(value) == 0 {

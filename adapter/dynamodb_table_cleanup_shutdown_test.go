@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 	"github.com/stretchr/testify/require"
@@ -29,17 +30,9 @@ func TestDynamoDBServerStopWaitsForTableCleanup(t *testing.T) {
 		d.Stop()
 		close(stopDone)
 	}()
-	select {
-	case <-stopDone:
-		t.Fatal("Stop returned while the table cleanup was still dispatching")
-	case <-time.After(100 * time.Millisecond):
-	}
+	testutil.NoRecv(t, stopDone, 100*time.Millisecond, "Stop returned while the table cleanup was still dispatching")
 	close(coord.release)
-	select {
-	case <-stopDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("Stop did not return once the table cleanup finished")
-	}
+	testutil.Closed(t, stopDone, 5*time.Second, "Stop did not return once the table cleanup finished")
 }
 
 // A table cleanup still running when the bound expires is cancelled and
@@ -131,17 +124,9 @@ func TestBackgroundWorkersReservationHoldsStop(t *testing.T) {
 	started.start(time.Minute, func(context.Context) { <-finish })
 	unused.release()
 	unused.release()
-	select {
-	case <-stopDone:
-		t.Fatal("stop returned while a reserved job was still running")
-	case <-time.After(100 * time.Millisecond):
-	}
+	testutil.NoRecv(t, stopDone, 100*time.Millisecond, "stop returned while a reserved job was still running")
 	close(finish)
-	select {
-	case <-stopDone:
-	case <-time.After(5 * time.Second):
-		t.Fatal("stop did not return once the reserved job finished")
-	}
+	testutil.Closed(t, stopDone, 5*time.Second, "stop did not return once the reserved job finished")
 }
 
 // The public listener answers the stopping refusal with a retryable 503

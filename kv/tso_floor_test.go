@@ -76,8 +76,7 @@ func TestShardStoreGlobalCommittedTimestampFloorUsesEveryGroupLeader(t *testing.
 		},
 		wantLatestGroupID: 2,
 	}
-	addr, stop := startRawKVServer(t, remote)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, remote)
 
 	groups := map[uint64]*ShardGroup{
 		0: {Engine: &recordingTSOEngine{state: raftengine.StateFollower}},
@@ -130,8 +129,7 @@ func TestShardStoreGlobalCommittedTimestampFloorRejectsUnfencedRemoteResponse(t 
 				latestResp:        tc.resp,
 				wantLatestGroupID: 2,
 			}
-			addr, stop := startRawKVServer(t, remote)
-			t.Cleanup(stop)
+			addr := startRawKVServer(t, remote)
 
 			shards := NewShardStore(nil, map[uint64]*ShardGroup{
 				2: {
@@ -203,14 +201,12 @@ func TestShardStoreGlobalCommittedTimestampFloorQueriesGroupsConcurrently(t *tes
 	release := make(chan struct{})
 	started1 := make(chan struct{})
 	started2 := make(chan struct{})
-	addr1, stop1 := startRawKVServer(t, &blockingFloorRawKVServer{
+	addr1 := startRawKVServer(t, &blockingFloorRawKVServer{
 		ts: 11, started: started1, release: release,
 	})
-	addr2, stop2 := startRawKVServer(t, &blockingFloorRawKVServer{
+	addr2 := startRawKVServer(t, &blockingFloorRawKVServer{
 		ts: 22, started: started2, release: release,
 	})
-	t.Cleanup(stop1)
-	t.Cleanup(stop2)
 
 	shards := NewShardStore(nil, map[uint64]*ShardGroup{
 		1: {

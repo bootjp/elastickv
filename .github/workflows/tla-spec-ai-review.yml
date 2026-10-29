@@ -39,12 +39,16 @@ on:
       # the rationale.  Keep this list in sync with the three other
       # sync points (see the §7.3 enumeration in the design doc).
       - 'kv/hlc*.go'
+      - 'kv/tso*.go'
       - 'kv/coordinator.go'
       - 'kv/sharded_coordinator.go'
       - 'kv/transaction.go'
       - 'kv/fsm.go'
+      - 'kv/fsm_migration_serving.go'
       - 'kv/lock_resolver.go'
       - 'store/mvcc_store.go'
+      - 'store/lsm_store.go'
+      - 'adapter/ts.go'
       - 'distribution/**'
 
 concurrency:
@@ -86,7 +90,7 @@ jobs:
           #   3. this ANCHORS regex
           #   4. the enumeration in §7.3 of the design doc
           # Keep all four identical when expanding for M2..M5.
-          ANCHORS='^(kv/hlc[^/]*\.go|kv/coordinator\.go|kv/sharded_coordinator\.go|kv/transaction\.go|kv/fsm\.go|kv/lock_resolver\.go|store/mvcc_store\.go|distribution/.*)$'
+          ANCHORS='^(kv/hlc[^/]*\.go|kv/tso[^/]*\.go|kv/coordinator\.go|kv/sharded_coordinator\.go|kv/transaction\.go|kv/fsm\.go|kv/fsm_migration_serving\.go|kv/lock_resolver\.go|store/mvcc_store\.go|store/lsm_store\.go|adapter/ts\.go|distribution/.*)$'
           git diff --name-only "$BASE_SHA...$HEAD_SHA" \
             | grep -E "$ANCHORS" \
             > anchored_changed.txt || true
@@ -122,11 +126,13 @@ jobs:
               ``,
               `**What to check, by subsystem:**`,
               ``,
-              `- **\`kv/hlc*.go\`** — \`Next()\` must respect the HLC-4 preconditions (i)/(ii)/(iii) from the design doc: bounded skew, logical-counter handoff on leader change (strategy (c) Observe(MaxAppliedHLC)), and the commit-time ceiling fence (fail-closed when \`wall_now >= physicalCeiling\`). Any change to the bit layout (48/16), the CAS loop, or the ceiling getter/setter is in scope.`,
-              `- **\`kv/coordinator.go\`, \`kv/sharded_coordinator.go\`** — \`RunHLCLeaseRenewal\`, \`hlcRenewalInterval\`, \`hlcPhysicalWindowMs\` constants, and the new-term detection that calls \`Observe(fsm.MaxAppliedHLC())\` (strategy (c)). Any change to renewal cadence, group selection, or fail-closed behaviour is in scope.`,
-              `- **\`kv/transaction.go\`, \`kv/lock_resolver.go\`** — OCC commit-ts assignment, lock-map encoding \`(key, lock_ts) -> start_ts\`, and the LockResolver action OCC-3 depends on. (M2 spec will land OCC-1..OCC-5; until then the spec doc §5.2 is the contract.)`,
-              `- **\`kv/fsm.go\`** — FSM apply of HLC lease entries (\`SetPhysicalCeiling\`), and any future \`MaxAppliedHLC()\` accessor that strategy (c) needs.`,
-              `- **\`store/mvcc_store.go\`** — version visibility, snapshot install, and the MVCC-1..MVCC-4 invariants (M3 scope).`,
+              `- **\`kv/hlc*.go\`** — \`Next()\` must respect the HLC-4 preconditions (i)/(ii)/(iii) from the design doc: bounded skew, logical-counter handoff on leader change (the TSO allocation floor; legacy modes have none and are pinned as known gaps), and the \`NextFenced\` ceiling fence (fail-closed when \`wall_now >= physicalCeiling\` or when the next value's physical half exceeds it). Any change to the bit layout (48/16), the CAS loop, or the ceiling getter/setter is in scope.`,
+              `- **\`kv/tso*.go\`** — \`RaftTSOAllocator\` must Observe the committed allocation floor before reserving and commit the new floor before handing a window out (HLC.tla \`IssuanceMode = "tso"\`).`,
+              `- **\`kv/coordinator.go\`, \`kv/sharded_coordinator.go\`** — \`RunHLCLeaseRenewal\`, \`hlcRenewalInterval\`, \`hlcPhysicalWindowMs\` constants, and which node stamps \`StartTS\` / \`CommitTS\` (HLC-3; legacy \`ShardedCoordinator\` stamping is the known gap G10). Any change to renewal cadence, group selection, or fail-closed behaviour is in scope.`,
+              `- **\`kv/transaction.go\`, \`kv/lock_resolver.go\`** — OCC commit-ts assignment, lock-map encoding \`(key, lock_ts) -> start_ts\`, and the LockResolver action OCC-3 depends on (OCC.tla; G0 / G1 are pinned as known gaps).`,
+              `- **\`kv/fsm.go\`, \`kv/fsm_migration_serving.go\`** — FSM apply of HLC lease entries (\`SetPhysicalCeiling\`), the one-phase / PREPARE / COMMIT validation OCC.tla models, \`verifyComposed1\`, and the migration serving guard Composed.tla relies on for unpinned writes.`,
+              `- **\`store/mvcc_store.go\`, \`store/lsm_store.go\`** — version visibility, resumable compaction, the commit-ts apply fence, and the MVCC-1 / MVCC-4 / MVCC-5 invariants.`,
+              `- **\`adapter/ts.go\`** — the snapshot start timestamp OCC.tla assumes (applied watermark; MaxUint64 on an empty store).`,
               `- **\`distribution/**\`** — route catalog versioning, \`SplitRange\` atomicity, and \`CatalogWatcher\` async fan-out (M4 scope).`,
               ``,
               `If the change is correct but requires a spec update, edit \`tla/hlc/HLC.tla\` (or the corresponding M2..M5 module once landed) and the design doc in the same PR. The \`tla-check\` workflow runs the TLC model check on the same paths.`,

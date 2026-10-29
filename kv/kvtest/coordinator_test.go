@@ -313,3 +313,12 @@ func TestLocalCoordinatorAllowsLastNonexhaustingTimestamp(t *testing.T) {
 		require.Equal(t, response.CommitTS, st.LastCommitTS())
 	}
 }
+
+func TestLocalCoordinatorSharesInjectedClock(t *testing.T) {
+	clock := kv.NewHLC()
+	c := kvtest.NewLocalCoordinator(store.NewMVCCStore(), kvtest.LocalOptions{Clock: clock})
+	require.Same(t, clock, c.Clock())
+	result, err := c.Dispatch(context.Background(), &kv.OperationGroup[kv.OP]{Elems: []*kv.Elem[kv.OP]{put("key")}})
+	require.NoError(t, err)
+	require.GreaterOrEqual(t, clock.Current(), result.CommitTS, "the dispatch timestamp must come from the injected clock")
+}

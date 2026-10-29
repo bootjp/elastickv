@@ -72,38 +72,6 @@ func TestRenewBackupKeepsAConcurrentlyRenewedSession(t *testing.T) {
 	require.NotContains(t, proposer.subtypes(), backupSubtypeUnreserve)
 }
 
-// With no concurrent renewal the failing attempt still owns the session, so it
-// must tear the pin down exactly as before.
-func TestRenewBackupStillReleasesWhenItOwnsTheSession(t *testing.T) {
-	t.Parallel()
-
-	group := &backupTestGroup{status: raftengine.Status{AppliedIndex: 100}, every: 10_000}
-	proposer := newBackupTestProposer()
-	srv := newBackupControlTestServer(
-		t,
-		&backupTestStore{},
-		map[uint64]*backupTestGroup{1: group},
-		map[uint64]*backupTestProposer{1: proposer},
-		nil,
-	)
-	begin, err := srv.BeginBackup(context.Background(), &pb.BeginBackupRequest{})
-	require.NoError(t, err)
-	tok, err := srv.decodeBackupToken(begin.GetPinToken())
-	require.NoError(t, err)
-
-	proposer.mu.Lock()
-	proposer.failures[backupSubtypePin] = 8
-	proposer.transportError[backupSubtypePin] = stderrors.New("leader unavailable")
-	proposer.mu.Unlock()
-
-	_, err = srv.RenewBackup(context.Background(), &pb.RenewBackupRequest{PinToken: begin.GetPinToken()})
-	require.Equal(t, codes.Unavailable, status.Code(err))
-	require.Contains(t, proposer.subtypes(), backupSubtypeRelease)
-	require.Contains(t, proposer.subtypes(), backupSubtypeUnreserve)
-	_, err = srv.backupRouteSnapshotForToken(tok)
-	require.Equal(t, codes.FailedPrecondition, status.Code(err))
-}
-
 // A reservation whose proposal fails for any reason other than a capacity
 // rejection is ambiguous: it may have committed with only the response lost.
 // Leaving it in place holds one of the few global active-backup slots until

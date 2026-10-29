@@ -750,7 +750,9 @@ func TestKeyVizFanoutRunPeerOrder(t *testing.T) {
 }
 
 // TestKeyVizFanoutRunPeerExceedsBodyLimit pins the over-cap path
-// (Claude bot round-2 on PR #686). Lowering the per-peer limit to a
+// (security-high review item and Claude bot round-2 on PR #686): a
+// peer that streams more than keyVizPeerResponseBodyLimit bytes must
+// not pin a goroutine on the JSON decoder or balloon memory. Lowering the per-peer limit to a
 // small test value lets us drive the path without serving 64 MiB.
 // The peer streams a body deliberately larger than the cap; the
 // aggregator's countingReader must:
@@ -842,45 +844,6 @@ func TestKeyVizFanoutRunPeerNearCapSucceedsWithWarning(t *testing.T) {
 	require.True(t, merged.Fanout.Nodes[1].OK,
 		"near-cap success path: small JSON with trailing whitespace must decode despite the cap; got error %q",
 		merged.Fanout.Nodes[1].Error)
-}
-
-// TestKeyVizFanoutRunPeerOverlargeBody pins the security-high
-// review item on PR #686: a peer that streams more than
-// keyVizPeerResponseBodyLimit bytes must not pin a goroutine on the
-// JSON decoder or balloon memory. The aggregator caps the decode at
-// the configured limit and surfaces a warning log rather than
-// silently accepting a truncated matrix.
-func TestKeyVizFanoutRunPeerOverlargeBody(t *testing.T) {
-	t.Parallel()
-	// Build a JSON payload whose `rows` array is enormous: many
-	// rows of 4096 zeroed values. We do not actually need to exceed
-	// the production cap (64 MiB) — we just need to assert that the
-	// decode completes promptly and that the peer call ends up
-	// reporting OK with a row count that matches what was on the wire
-	// up to the cap.
-	hugeRow := KeyVizRow{
-		BucketID: "route:big",
-		Values:   make([]uint64, 4096),
-	}
-	rows := make([]KeyVizRow, 64)
-	for i := range rows {
-		rows[i] = hugeRow
-	}
-	body := KeyVizMatrix{
-		ColumnUnixMs: make([]int64, 4096),
-		Rows:         rows,
-		Series:       keyVizSeriesReads,
-	}
-	peer := newKeyVizPeerStub(t, body)
-	defer peer.Close()
-
-	f := NewKeyVizFanout("self:8080", []string{peer.URL}).WithHTTPClient(peer.Client())
-
-	start := time.Now()
-	merged := f.Run(context.Background(), keyVizParams{series: keyVizSeriesReads, rows: 1024}, KeyVizMatrix{Series: keyVizSeriesReads}, nil)
-	require.Less(t, time.Since(start), 5*time.Second, "decode must respect the size cap and complete promptly")
-	require.NotNil(t, merged.Fanout)
-	require.True(t, merged.Fanout.Nodes[1].OK, "in-cap response must succeed; cap is 64 MiB and the synthetic body is well under that")
 }
 
 // newKeyVizPeerStub spins up an httptest.Server that answers

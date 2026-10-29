@@ -61,6 +61,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/kv"
+	"github.com/bootjp/elastickv/kv/kvtest"
 	"github.com/bootjp/elastickv/store"
 	"github.com/cockroachdb/errors"
 )
@@ -74,57 +75,19 @@ var discardLogger = slog.New(slog.NewTextHandler(io.Discard, nil))
 // requests through store.ApplyMutations, enabling write-write conflict
 // detection identical to the production Raft FSM (kv/fsm.go §handleOnePhaseTxnRequest).
 // Non-txn requests fall through to the underlying coordinator unchanged.
+// occAdapterCoordinator validates transactional groups against their read
+// keys with the store's OCC check, as the production coordinator does.
+// Transactional DelPrefix is rejected: ApplyMutations has no prefix-delete op.
 type occAdapterCoordinator struct {
 	*localAdapterCoordinator
 }
 
 func newOCCAdapterCoordinator(st store.MVCCStore) *occAdapterCoordinator {
-	return &occAdapterCoordinator{localAdapterCoordinator: newLocalAdapterCoordinator(st)}
-}
-
-func (c *occAdapterCoordinator) Dispatch(ctx context.Context, req *kv.OperationGroup[kv.OP]) (*kv.CoordinateResponse, error) {
-	if req == nil {
-		return &kv.CoordinateResponse{}, nil
-	}
-	commitTS, err := c.commitTSForRequest(req)
-	if err != nil {
-		return nil, err
-	}
-	if !req.IsTxn {
-		return c.localAdapterCoordinator.Dispatch(ctx, req)
-	}
-	mutations, err := c.collectMutations(ctx, req.Elems, commitTS)
-	if err != nil {
-		return nil, err
-	}
-	if len(mutations) == 0 {
-		return &kv.CoordinateResponse{CommitTS: commitTS}, nil
-	}
-	if err := c.store.ApplyMutations(ctx, mutations, req.ReadKeys, req.StartTS, commitTS); err != nil {
-		return nil, err
-	}
-	return &kv.CoordinateResponse{CommitTS: commitTS}, nil
-}
-
-func (c *occAdapterCoordinator) collectMutations(_ context.Context, elems []*kv.Elem[kv.OP], _ uint64) ([]*store.KVPairMutation, error) {
-	mutations := make([]*store.KVPairMutation, 0, len(elems))
-	for _, elem := range elems {
-		if elem == nil {
-			continue
-		}
-		switch elem.Op {
-		case kv.Put:
-			mutations = append(mutations, &store.KVPairMutation{Op: store.OpTypePut, Key: elem.Key, Value: elem.Value})
-		case kv.Del:
-			mutations = append(mutations, &store.KVPairMutation{Op: store.OpTypeDelete, Key: elem.Key})
-		case kv.DelPrefix:
-			// ApplyMutations has no prefix-delete op; applying it here before the
-			// OCC conflict check would break atomicity. List benchmark ops never
-			// emit DelPrefix, so reject it to make any such misuse explicit.
-			return nil, errors.New("DelPrefix not supported in transactional OCC simulation")
-		}
-	}
-	return mutations, nil
+	return &occAdapterCoordinator{localAdapterCoordinator: newLocalAdapterCoordinatorWithOptions(st, kvtest.LocalOptions{
+		DelPrefix:        kvtest.PrefixApply,
+		OCC:              kvtest.OCCTransactions,
+		ValidateReadKeys: true,
+	})}
 }
 
 // ---- Legacy implementations (main-branch simulation) ------------------------

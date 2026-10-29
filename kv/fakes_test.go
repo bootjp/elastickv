@@ -33,6 +33,22 @@ func (c *nopCoordinator) Clock() *HLC {
 
 type testEngine = raftenginetest.StubEngine
 
+// newStubLeaderEngine reports State=Leader with a fixed Leader address. It is
+// the minimum surface Coordinate.Dispatch needs to take the local-dispatch
+// path without real raft machinery, and it implements no LeaseProvider, so
+// refreshLeaseAfterDispatch skips that branch. LinearizableRead returns
+// immediately (an already-up-to-date FSM).
+func newStubLeaderEngine() *testEngine {
+	return &testEngine{
+		StaticLeaderView: raftenginetest.StaticLeaderView{
+			StateValue:  raftengine.StateLeader,
+			LeaderValue: raftengine.LeaderInfo{ID: "self", Address: "127.0.0.1:0"},
+		},
+		StatusValue:  raftengine.Status{State: raftengine.StateLeader},
+		SnapshotStep: 10_000,
+	}
+}
+
 var _ Coordinator = (*nopCoordinator)(nil)
 
 func TestSharedFakesPreserveFallbacks(t *testing.T) {

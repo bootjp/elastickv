@@ -77,23 +77,6 @@ var txnApplyHandlers = map[string]txnCommandHandler{
 	cmdPExpire: (*txnContext).applyExpireMilliseconds,
 }
 
-func redisTxnReadFenceKeys(userKey []byte) [][]byte {
-	keys := append([][]byte{}, redisTxnReadFencePointKeys(userKey)...)
-	keys = append(keys,
-		store.ListMetaDeltaScanPrefix(userKey),
-		store.ListClaimScanPrefix(userKey),
-		store.HashFieldScanPrefix(userKey),
-		store.HashMetaDeltaScanPrefix(userKey),
-		store.SetMemberScanPrefix(userKey),
-		store.SetMetaDeltaScanPrefix(userKey),
-		store.ZSetMemberScanPrefix(userKey),
-		store.ZSetScoreScanPrefix(userKey),
-		store.ZSetMetaDeltaScanPrefix(userKey),
-		store.StreamEntryScanPrefix(userKey),
-	)
-	return keys
-}
-
 func redisTxnReadFencePointKeys(userKey []byte) [][]byte {
 	keys := [][]byte{
 		redisStrKey(userKey),
@@ -127,10 +110,6 @@ func redisLegacyBareReadFenceAllowed(userKey []byte) bool {
 	return !bytes.HasPrefix(userKey, []byte("!sqs|"))
 }
 
-func (r *RedisServer) redisTxnReadFenceKeysForRanges(userKey []byte, ranges []redisReadFenceRange) [][]byte {
-	return readFenceTargetKeys(r.redisTxnReadFenceTargetsForRanges(userKey, ranges))
-}
-
 // redisTxnReadFenceTargetsForRanges builds the fence set for a user key. Point
 // keys carry no group id and are resolved from bytes; range-derived targets keep
 // the group the range expansion already resolved.
@@ -147,14 +126,6 @@ func (r *RedisServer) redisTxnReadFenceTargetsForRanges(userKey []byte, ranges [
 		targets = append(targets, rangeTargets...)
 	}
 	return targets
-}
-
-func readFenceTargetKeys(targets []kv.ReadFenceTarget) [][]byte {
-	keys := make([][]byte, 0, len(targets))
-	for _, target := range targets {
-		keys = append(keys, target.Key)
-	}
-	return keys
 }
 
 func redisTxnReadFenceRanges(userKey []byte) []redisReadFenceRange {
@@ -275,50 +246,6 @@ func (v redisReadFenceRouteVersion) observedRouteVersion() uint64 {
 	return kv.EncodeObservedRouteVersion(v.version)
 }
 
-func redisQueuedCommandReadFenceKeys(queue []redcon.Command) [][]byte {
-	return redisQueuedCommandReadFenceKeysForServer(nil, queue)
-}
-
-func redisQueuedCommandReadFenceKeysForServer(r *RedisServer, queue []redcon.Command) [][]byte {
-	seen := make(map[string]struct{}, len(queue))
-	keys := make([][]byte, 0, len(queue))
-	appendKey := func(key []byte) {
-		keyID := string(key)
-		if _, ok := seen[keyID]; ok {
-			return
-		}
-		seen[keyID] = struct{}{}
-		keys = append(keys, key)
-	}
-	for _, cmd := range queue {
-		for _, fenceKey := range redisCommandReadFenceKeysForServer(r, cmd) {
-			appendKey(fenceKey)
-		}
-	}
-	return keys
-}
-
-func redisCommandReadFenceKeysForServer(r *RedisServer, cmd redcon.Command) [][]byte {
-	if len(cmd.Args) == 0 {
-		return nil
-	}
-	cmdName := strings.ToUpper(string(cmd.Args[0]))
-	meta, ok := redisCommandTable[cmdName]
-	if !ok {
-		return nil
-	}
-	keys := make([][]byte, 0)
-	for _, userKey := range redisCommandGetKeys(meta, cmd.Args) {
-		if r == nil {
-			keys = append(keys, redisTxnReadFenceKeys(userKey)...)
-			continue
-		}
-		keys = append(keys, r.redisTxnReadFenceKeysForRanges(userKey, redisCommandReadFenceRanges(cmdName, userKey))...)
-	}
-	keys = append(keys, redisCommandExactReadFenceKeys(cmd)...)
-	return keys
-}
-
 func redisCommandReadFenceRanges(cmdName string, userKey []byte) []redisReadFenceRange {
 	switch cmdName {
 	case cmdGet, cmdExists:
@@ -379,14 +306,9 @@ func (r *RedisServer) redisReadFenceGroupTargets(targets []kv.ReadFenceTarget) [
 	return kv.LeaseReadGroupTargets(r.coordinator, targets)
 }
 
-func (r *RedisServer) queuedCommandReadFenceGroupKeys(queue []redcon.Command) [][]byte {
-	return readFenceTargetKeys(r.queuedCommandReadFenceGroupTargets(queue))
-}
-
 // queuedCommandReadFenceGroupTargets collapses the queue's fence set to one
-// target per group, keeping each range-derived group id intact. It mirrors
-// redisQueuedCommandReadFenceKeysForServer exactly, including its per-key dedup,
-// and differs only in carrying the group id alongside each key.
+// target per group, keeping each range-derived group id intact. Targets are
+// deduplicated by key before the per-group collapse.
 func (r *RedisServer) queuedCommandReadFenceGroupTargets(queue []redcon.Command) []kv.ReadFenceTarget {
 	seen := make(map[string]struct{}, len(queue))
 	targets := make([]kv.ReadFenceTarget, 0, len(queue))
@@ -406,8 +328,9 @@ func (r *RedisServer) queuedCommandReadFenceGroupTargets(queue []redcon.Command)
 	return r.redisReadFenceGroupTargets(targets)
 }
 
-// commandReadFenceTargets is the target-carrying form of
-// redisCommandReadFenceKeysForServer.
+// commandReadFenceTargets returns the read-fence targets for one queued
+// command: the type-detection point keys and command-relevant ranges of every
+// key it names, plus its exact hash-field or zset-member keys.
 func (r *RedisServer) commandReadFenceTargets(cmd redcon.Command) []kv.ReadFenceTarget {
 	if len(cmd.Args) == 0 {
 		return nil
@@ -419,12 +342,6 @@ func (r *RedisServer) commandReadFenceTargets(cmd redcon.Command) []kv.ReadFence
 	}
 	targets := make([]kv.ReadFenceTarget, 0)
 	for _, userKey := range redisCommandGetKeys(meta, cmd.Args) {
-		if r == nil {
-			for _, key := range redisTxnReadFenceKeys(userKey) {
-				targets = append(targets, kv.ReadFenceTarget{Key: key})
-			}
-			continue
-		}
 		targets = append(targets, r.redisTxnReadFenceTargetsForRanges(userKey, redisCommandReadFenceRanges(cmdName, userKey))...)
 	}
 	for _, key := range redisCommandExactReadFenceKeys(cmd) {
@@ -590,35 +507,6 @@ func (r *RedisServer) leaseRedisReadFenceTargets(ctx context.Context, targets []
 		}
 	}
 	return nil
-}
-
-func (r *RedisServer) redisReadFencedTimestamp(
-	ctx context.Context,
-	groupKeys [][]byte,
-	selectTS func() uint64,
-) (uint64, *kv.ActiveTimestampToken, error) {
-	readTimestamp, readPin, err := r.redisReadFencedReadTimestamp(
-		ctx, groupKeys, selectTS, "redis read fence: begin read timestamp")
-	if err != nil {
-		return 0, nil, err
-	}
-	return readTimestamp.Timestamp(), readPin, nil
-}
-
-// redisReadFencedReadTimestamp fences by key. Keys carry no group of their own,
-// so each becomes a bare ReadFenceTarget and the fence resolves it the way it
-// always did.
-func (r *RedisServer) redisReadFencedReadTimestamp(
-	ctx context.Context,
-	groupKeys [][]byte,
-	selectTS func() uint64,
-	label string,
-) (kv.ReadTimestamp, *kv.ActiveTimestampToken, error) {
-	targets := make([]kv.ReadFenceTarget, 0, len(groupKeys))
-	for _, key := range groupKeys {
-		targets = append(targets, kv.ReadFenceTarget{Key: key})
-	}
-	return r.redisReadFencedTimestampForTargets(ctx, targets, selectTS, label)
 }
 
 // redisReadFencedTimestampForTargets leases the fence, begins the read

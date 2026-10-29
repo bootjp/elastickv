@@ -18,7 +18,7 @@ func TestInternalForwardAdminProposalRejectsOtherRaftPayloads(t *testing.T) {
 		payload := []byte{byte(opcode), 0}
 		proposer := &internalAdminProposer{}
 		server := NewInternalWithEngine(nil,
-			internalAdminLeaderView{state: raftengine.StateLeader}, nil, nil,
+			internalAdminLeaderView(raftengine.StateLeader, 0), nil, nil,
 			WithInternalAdminProposer(proposer))
 		_, err := server.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{Payload: payload})
 		require.Equal(t, codes.PermissionDenied, status.Code(err), "opcode %x", opcode)
@@ -32,7 +32,7 @@ func TestInternalForwardAdminProposalValidatesEntireEnvelope(t *testing.T) {
 	for _, payload := range [][]byte{nil, valid[:len(valid)-1], append(valid, 0x0d), {0x0e, 0xff}} {
 		proposer := &internalAdminProposer{}
 		server := NewInternalWithEngine(nil,
-			internalAdminLeaderView{state: raftengine.StateLeader}, nil, nil,
+			internalAdminLeaderView(raftengine.StateLeader, 0), nil, nil,
 			WithInternalAdminProposer(proposer))
 		_, err := server.ForwardAdminProposal(context.Background(), &pb.ForwardAdminProposalRequest{Payload: payload})
 		require.Equal(t, codes.PermissionDenied, status.Code(err))

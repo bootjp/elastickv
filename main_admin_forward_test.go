@@ -37,16 +37,6 @@ func TestBuildLeaderForwarder_RejectsMissingDeps(t *testing.T) {
 	}
 }
 
-func TestBuildLeaderForwarder_HappyPathReturnsForwarder(t *testing.T) {
-	// The production bridge does not dial during construction —
-	// resolver / dial calls only happen on the first Forward — so
-	// passing real (zero-value) collaborators is enough to confirm
-	// the wiring itself is well-formed.
-	fwd, err := buildLeaderForwarder(&kv.Coordinate{}, &kv.GRPCConnCache{}, "n1")
-	require.NoError(t, err)
-	require.NotNil(t, fwd)
-}
-
 func TestAdminForwardConnFactory_RejectsEmptyAddr(t *testing.T) {
 	// kv.GRPCConnCache.ConnFor returns ErrLeaderNotFound on "". The
 	// LeaderForwarder catches the empty address before this layer is

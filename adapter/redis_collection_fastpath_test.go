@@ -6,8 +6,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/store"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
+	"github.com/tidwall/redcon"
 )
 
 // These tests pin the semantics of the wide-column fast paths for
@@ -260,39 +262,43 @@ func TestRedis_SISMEMBER_TTLExpired(t *testing.T) {
 	}, "SISMEMBER on an expired set must return 0")
 }
 
-// TestRedis_HGET_FastPathGuardDualEncoding exercises the string-
-// priority guard (hasHigherPriorityStringEncoding) at the HGET
-// wire-protocol level: a key holding both a hash wide-column row AND
-// a string must report WRONGTYPE, not the hash value.
-//
-// The scenario is only reachable under data-corruption recovery; we
-// drive it here by overwriting a pre-existing hash with a SET, which
-// replaceWithStringTxn normally cleans the hash keys for, but by the
-// time SET commits the hash field row may still be observable at the
-// readTS for this HGET. The test tolerates either "WRONGTYPE" or the
-// old hash value being returned, since the exact race window is tiny,
-// but it must NOT panic or silently leak wide-column data as a string
-// hit: the guard is what keeps that outcome consistent with
-// keyTypeAt semantics.
-func TestRedis_HGET_FastPathGuardDualEncodingSmoke(t *testing.T) {
+// TestRedis_FastPathGuardDualEncodingReportsWrongType pins the
+// string-priority guard (hasHigherPriorityStringEncoding) on the HGET,
+// HEXISTS and SISMEMBER fast paths: a key holding both a string and a
+// hash field / set member row must report WRONGTYPE, not the collection
+// value. The dual encoding is only reachable under data-corruption
+// recovery (SET tombstones the collection rows), so the rows are seeded
+// directly in the store.
+func TestRedis_FastPathGuardDualEncodingReportsWrongType(t *testing.T) {
 	t.Parallel()
-	nodes, _, _ := createNode(t, 3)
-	defer shutdown(nodes)
 
 	ctx := context.Background()
-	rdb := redis.NewClient(&redis.Options{Addr: nodes[0].redisAddress})
-	defer func() { _ = rdb.Close() }()
+	st := store.NewMVCCStore()
+	server := &RedisServer{store: st, coordinator: newLocalAdapterCoordinator(st)}
+	key := []byte("dual:key")
+	field := []byte("field")
+	member := []byte("member")
+	require.NoError(t, st.PutAt(ctx, redisStrKey(key), encodeRedisStr([]byte("stringVal"), nil), 10, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashFieldKey(key, field), []byte("hashVal"), 11, 0))
+	require.NoError(t, st.PutAt(ctx, store.HashMetaKey(key), store.MarshalHashMeta(store.HashMeta{Len: 1}), 11, 0))
+	require.NoError(t, st.PutAt(ctx, store.SetMemberKey(key, member), []byte{}, 12, 0))
+	require.NoError(t, st.PutAt(ctx, store.SetMetaKey(key), store.MarshalSetMeta(store.SetMeta{Len: 1}), 12, 0))
 
-	require.NoError(t, rdb.HSet(ctx, "dual:key", "field", "hashVal").Err())
-	require.NoError(t, rdb.Set(ctx, "dual:key", "stringVal", 0).Err())
-
-	// After the SET, HGET must either see WRONGTYPE (string-priority
-	// guard fires, slow path reports the key as string) or nil (the
-	// hash keys were cleaned up). It must NOT return "hashVal".
-	got, err := rdb.HGet(ctx, "dual:key", "field").Result()
-	if err != nil {
-		require.Contains(t, err.Error(), "WRONGTYPE")
-		return
+	for _, tc := range []struct {
+		name    string
+		handler func(redcon.Conn, redcon.Command)
+		args    [][]byte
+	}{
+		{name: "hget", handler: server.hget, args: [][]byte{[]byte(cmdHGet), key, field}},
+		{name: "hexists", handler: server.hexists, args: [][]byte{[]byte(cmdHExists), key, field}},
+		{name: "sismember", handler: server.sismember, args: [][]byte{[]byte(cmdSIsMember), key, member}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			conn := &commandRecorder{}
+			tc.handler(conn, redcon.Command{Args: tc.args})
+			require.Len(t, conn.writes, 1)
+			require.Equal(t, "error", conn.writes[0].op, "must not return the collection value: %+v", conn.writes[0])
+			require.Contains(t, conn.writes[0].s, "WRONGTYPE")
+		})
 	}
-	require.NotEqual(t, "hashVal", got, "fast path must not leak collection data when a string has taken over the key")
 }

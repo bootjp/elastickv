@@ -16,6 +16,7 @@ type stubAdapterCoordinator struct {
 	verifyLeaderErr error
 	leaderSet       bool
 	leader          bool
+	raftLeader      string
 	verifyCalls     atomic.Int32
 }
 
@@ -36,7 +37,7 @@ func (s *stubAdapterCoordinator) VerifyLeader(context.Context) error {
 }
 
 func (s *stubAdapterCoordinator) RaftLeader() string {
-	return ""
+	return s.raftLeader
 }
 
 func (s *stubAdapterCoordinator) IsLeaderForKey([]byte) bool {
@@ -51,7 +52,7 @@ func (s *stubAdapterCoordinator) VerifyLeaderForKey(context.Context, []byte) err
 }
 
 func (s *stubAdapterCoordinator) RaftLeaderForKey([]byte) string {
-	return ""
+	return s.raftLeader
 }
 
 func (s *stubAdapterCoordinator) Clock() *kv.HLC {

@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/bootjp/elastickv/internal/raftengine"
 )
 
@@ -103,19 +104,8 @@ func TestDynamicWrappedProposer_PropagatesWrapperError(t *testing.T) {
 // what the engine expects).
 func TestDynamicWrappedProposer_RoundTripWithRealCipher(t *testing.T) {
 	t.Parallel()
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	if _, err := rand.Read(dek); err != nil {
-		t.Fatalf("rand.Read: %v", err)
-	}
 	const kid uint32 = 0x42
-	if err := ks.Set(kid, dek); err != nil {
-		t.Fatalf("Set: %v", err)
-	}
-	c, err := encryption.NewCipher(ks)
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
+	c := encryptiontest.NewCipher(t, kid)
 
 	var wrapPtr atomic.Pointer[RaftPayloadWrapper]
 	var wrap RaftPayloadWrapper = func(p []byte) ([]byte, error) {

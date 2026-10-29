@@ -3847,7 +3847,7 @@ func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
 	}
 	c.hlcRecoveryMu.Lock()
 	defer c.hlcRecoveryMu.Unlock()
-	if !hlcCeilingExpired(c.clock) {
+	if !hlcCeilingExhausted(c.clock) {
 		return nil
 	}
 	if c.hlcRenewalBlocked != nil && c.hlcRenewalBlocked() {
@@ -3859,7 +3859,7 @@ func (c *ShardedCoordinator) RecoverHLCLease(ctx context.Context) error {
 	}
 	rctx, cancel := hlcRecoveryContext(ctx)
 	defer cancel()
-	return c.recoverHLCLeaseTargets(rctx, targets, time.Now().UnixMilli()+hlcPhysicalWindowMs)
+	return c.recoverHLCLeaseTargets(rctx, targets, hlcRecoveryCeiling(c.clock))
 }
 
 func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets []hlcLeaseRecoveryTarget, ceilingMs int64) error {
@@ -3880,7 +3880,7 @@ func (c *ShardedCoordinator) recoverHLCLeaseTargets(ctx context.Context, targets
 	for err := range errCh {
 		recoveryErr = combineHLCRecoveryErrors(recoveryErr, err)
 	}
-	if !hlcCeilingExpired(c.clock) {
+	if !hlcCeilingExhausted(c.clock) {
 		return nil
 	}
 	return hlcRecoveryFailedError(recoveryErr)

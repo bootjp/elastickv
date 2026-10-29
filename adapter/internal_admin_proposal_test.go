@@ -6,6 +6,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/raftengine"
+	"github.com/bootjp/elastickv/internal/raftengine/raftenginetest"
 	"github.com/bootjp/elastickv/kv"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/stretchr/testify/require"
@@ -13,25 +14,19 @@ import (
 	"google.golang.org/grpc/status"
 )
 
-type internalAdminLeaderView struct {
-	state     raftengine.State
-	readIndex uint64
-}
-
-func (v internalAdminLeaderView) State() raftengine.State { return v.state }
-func (internalAdminLeaderView) Leader() raftengine.LeaderInfo {
-	return raftengine.LeaderInfo{ID: "leader", Address: "leader:50051"}
-}
-func (internalAdminLeaderView) VerifyLeader(context.Context) error { return nil }
-func (v internalAdminLeaderView) LinearizableRead(context.Context) (uint64, error) {
-	return v.readIndex, nil
+func internalAdminLeaderView(state raftengine.State, readIndex uint64) *raftenginetest.StaticLeaderView {
+	return &raftenginetest.StaticLeaderView{
+		StateValue:  state,
+		LeaderValue: raftengine.LeaderInfo{ID: "leader", Address: "leader:50051"},
+		ReadIndex:   readIndex,
+	}
 }
 
 func TestInternalForwardLeaseReadUsesLeaderBarrier(t *testing.T) {
 	t.Parallel()
 	internal := NewInternalWithEngine(
 		nil,
-		internalAdminLeaderView{state: raftengine.StateLeader, readIndex: 23},
+		internalAdminLeaderView(raftengine.StateLeader, 23),
 		nil,
 		nil,
 		WithInternalLastCommitTimestamp(func() uint64 { return 37 }),
@@ -41,7 +36,7 @@ func TestInternalForwardLeaseReadUsesLeaderBarrier(t *testing.T) {
 	require.Equal(t, uint64(23), resp.GetAppliedIndex())
 	require.Equal(t, uint64(37), resp.GetLastCommitTs())
 
-	internal.leader = internalAdminLeaderView{state: raftengine.StateFollower}
+	internal.leader = internalAdminLeaderView(raftengine.StateFollower, 0)
 	_, err = internal.ForwardLeaseRead(context.Background(), &pb.ForwardLeaseReadRequest{})
 	require.ErrorIs(t, err, ErrNotLeader)
 }
@@ -68,7 +63,7 @@ func TestInternalForwardAdminProposalUsesLeaderProposer(t *testing.T) {
 	proposer := &internalAdminProposer{}
 	internal := NewInternalWithEngine(
 		nil,
-		internalAdminLeaderView{state: raftengine.StateLeader},
+		internalAdminLeaderView(raftengine.StateLeader, 0),
 		nil,
 		nil,
 		WithInternalAdminProposer(proposer),
@@ -110,7 +105,7 @@ func TestInternalForwardAdminProposalFailsClosed(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			internal := NewInternalWithEngine(
 				nil,
-				internalAdminLeaderView{state: tc.state},
+				internalAdminLeaderView(tc.state, 0),
 				nil,
 				nil,
 				WithInternalAdminProposer(tc.proposer),

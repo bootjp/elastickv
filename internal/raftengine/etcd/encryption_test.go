@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/cockroachdb/errors"
 	raftpb "go.etcd.io/raft/v3/raftpb"
 )
@@ -36,19 +37,8 @@ func (f *fakeStateMachine) Restore(_ io.Reader) error   { return nil }
 // with one key is enough to exercise the apply hook's gate logic.
 func raftCipherFixture(t *testing.T) (*encryption.Cipher, uint32) {
 	t.Helper()
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	if _, err := rand.Read(dek); err != nil {
-		t.Fatalf("rand.Read DEK: %v", err)
-	}
 	const kid uint32 = 0xDEADBEEF
-	if err := ks.Set(kid, dek); err != nil {
-		t.Fatalf("Set DEK: %v", err)
-	}
-	c, err := encryption.NewCipher(ks)
-	if err != nil {
-		t.Fatalf("NewCipher: %v", err)
-	}
+	c := encryptiontest.NewCipher(t, kid)
 	return c, kid
 }
 

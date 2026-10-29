@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/bootjp/elastickv/internal/testutil"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
 )
@@ -105,11 +106,7 @@ func TestHTTPAdapterStopBoundsStalledRequest(t *testing.T) {
 				}
 				reqDone <- err
 			}()
-			select {
-			case <-started:
-			case <-time.After(5 * time.Second):
-				t.Fatal("handler did not start for the stalled request")
-			}
+			testutil.Recv(t, started, 5*time.Second, "handler did not start for the stalled request")
 
 			start := time.Now()
 			stop()
@@ -148,12 +145,8 @@ func TestHTTPAdapterStopReturnsPromptlyWhenIdle(t *testing.T) {
 			start := time.Now()
 			stop()
 			require.Less(t, time.Since(start), 2*time.Second)
-			select {
-			case err := <-runDone:
-				require.NoError(t, err)
-			case <-time.After(5 * time.Second):
-				t.Fatal("Run did not return after Stop")
-			}
+			err := testutil.Recv(t, runDone, 5*time.Second, "Run did not return after Stop")
+			require.NoError(t, err)
 		})
 	}
 }
@@ -175,11 +168,7 @@ func TestHTTPAdapterStopIsIdempotentAfterForcedClose(t *testing.T) {
 	defer func() { _ = conn.Close() }()
 	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
 	require.NoError(t, err)
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler did not start")
-	}
+	testutil.Recv(t, started, 5*time.Second, "handler did not start")
 
 	stop()
 	start := time.Now()
@@ -266,11 +255,7 @@ func TestS3ServerStopDrainsHTTPBeforeClosingBlobCluster(t *testing.T) {
 			_ = resp.Body.Close()
 		}
 	}()
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler did not start")
-	}
+	testutil.Recv(t, started, 5*time.Second, "handler did not start")
 
 	stopDone := stopInBackground(s)
 	requireStopStillDraining(t, stopDone, cluster)
@@ -383,11 +368,7 @@ func startStalledRequest(t *testing.T, lis net.Listener, started <-chan struct{}
 	t.Cleanup(func() { _ = conn.Close() })
 	_, err = conn.Write([]byte("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"))
 	require.NoError(t, err)
-	select {
-	case <-started:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler did not start")
-	}
+	testutil.Recv(t, started, 5*time.Second, "handler did not start")
 }
 
 // TestHTTPAdapterStopJoinsHandlerAfterForcedClose pins that Stop does not
@@ -413,12 +394,8 @@ func TestHTTPAdapterStopJoinsHandlerAfterForcedClose(t *testing.T) {
 
 			stop()
 			require.True(t, finished.Load(), "Stop returned while the handler on the closed connection was still running")
-			select {
-			case err := <-runDone:
-				require.NoError(t, err)
-			case <-time.After(5 * time.Second):
-				t.Fatal("Run did not return after Stop")
-			}
+			err := testutil.Recv(t, runDone, 5*time.Second, "Run did not return after Stop")
+			require.NoError(t, err)
 		})
 	}
 }
@@ -448,10 +425,6 @@ func TestHTTPAdapterStopBoundsJoinOfHandlerIgnoringClose(t *testing.T) {
 	start = time.Now()
 	stop()
 	require.Less(t, time.Since(start), 50*time.Millisecond, "second Stop must not wait the join bound again")
-	select {
-	case err := <-runDone:
-		require.NoError(t, err)
-	case <-time.After(5 * time.Second):
-		t.Fatal("Run did not return after Stop")
-	}
+	err := testutil.Recv(t, runDone, 5*time.Second, "Run did not return after Stop")
+	require.NoError(t, err)
 }

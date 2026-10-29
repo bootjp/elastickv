@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/bootjp/elastickv/internal/encryption"
+	"github.com/bootjp/elastickv/internal/encryption/encryptiontest"
 	"github.com/cockroachdb/pebble/v2"
 )
 
@@ -128,22 +129,11 @@ func benchmarkEncryptionOptions(b *testing.B, enabled bool) []PebbleStoreOption 
 	if !enabled {
 		return nil
 	}
-	ks := encryption.NewKeystore()
-	dek := make([]byte, encryption.KeySize)
-	if _, err := rand.Read(dek); err != nil {
-		b.Fatalf("rand.Read DEK: %v", err)
-	}
 	const keyID uint32 = 1
-	if err := ks.Set(keyID, dek); err != nil {
-		b.Fatalf("Keystore.Set: %v", err)
-	}
-	cipher, err := encryption.NewCipher(ks)
-	if err != nil {
-		b.Fatalf("NewCipher: %v", err)
-	}
+	cipher := encryptiontest.NewCipher(b, keyID)
 	return []PebbleStoreOption{WithEncryption(
 		cipher,
-		NewCounterNonceFactory(1, 1),
+		encryption.NewDeterministicNonceFactory(1, 1),
 		func() (uint32, bool) { return keyID, true },
 	)}
 }

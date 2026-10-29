@@ -3,10 +3,10 @@ package kv
 import (
 	"context"
 	"fmt"
-	"net"
 	"sync"
 	"testing"
 
+	"github.com/bootjp/elastickv/internal/testutil/grpctest"
 	pb "github.com/bootjp/elastickv/proto"
 	"github.com/bootjp/elastickv/store"
 	"github.com/stretchr/testify/require"
@@ -90,8 +90,7 @@ func TestLeaderRoutedStore_GlobalCommittedTimestampFloorProxiesFencedLeader(t *t
 		wantLatestGroupID: 1,
 		latestResp:        &pb.RawLatestCommitTSResponse{Ts: 30, GroupId: 1, LeaderFenced: true},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 	coord := &stubLeaderCoordinator{leader: addr}
 	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)
 	t.Cleanup(func() { _ = s.Close() })
@@ -189,24 +188,9 @@ func (f *fakeRawKVServer) RawLatestCommitTS(_ context.Context, req *pb.RawLatest
 	return &pb.RawLatestCommitTSResponse{}, nil
 }
 
-func startRawKVServer(t *testing.T, svc pb.RawKVServer) (string, func()) {
+func startRawKVServer(t *testing.T, svc pb.RawKVServer) string {
 	t.Helper()
-
-	var lc net.ListenConfig
-	lis, err := lc.Listen(context.Background(), "tcp", "127.0.0.1:0")
-	require.NoError(t, err)
-
-	grpcServer := grpc.NewServer()
-	pb.RegisterRawKVServer(grpcServer, svc)
-	go func() {
-		_ = grpcServer.Serve(lis)
-	}()
-
-	stop := func() {
-		grpcServer.Stop()
-		_ = lis.Close()
-	}
-	return lis.Addr().String(), stop
+	return grpctest.Serve(t, func(server *grpc.Server) { pb.RegisterRawKVServer(server, svc) })
 }
 
 func TestLeaderRoutedStore_UsesLocalStoreWhenLeaderVerified(t *testing.T) {
@@ -309,8 +293,7 @@ func TestLeaderRoutedStore_ProxiesReadsWhenFollower(t *testing.T) {
 			Exists: true,
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	coord := &stubLeaderCoordinator{
 		isLeader: false,
@@ -360,8 +343,7 @@ func TestLeaderRoutedStore_ForwardsReadFenceStamps(t *testing.T) {
 			Exists: true,
 		},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	coord := &stubLeaderCoordinator{
 		isLeader: false,
@@ -394,8 +376,7 @@ func TestLeaderRoutedStore_ForwardsKeyScanReadFenceWithoutValues(t *testing.T) {
 	fake := &fakeRawKVServer{
 		scanResp: &pb.RawScanAtResponse{Kv: []*pb.RawKVPair{{Key: []byte("k")}}},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	coord := &stubLeaderCoordinator{isLeader: false, leader: addr, clock: NewHLC()}
 	mvcc := store.NewMVCCStore()
@@ -459,8 +440,7 @@ func TestLeaderRoutedStore_GlobalLastCommitTS_ProxiesToLeader(t *testing.T) {
 	fake := &fakeRawKVServer{
 		latestResp: &pb.RawLatestCommitTSResponse{Ts: 99, Exists: true},
 	}
-	addr, stop := startRawKVServer(t, fake)
-	t.Cleanup(stop)
+	addr := startRawKVServer(t, fake)
 
 	coord := &stubLeaderCoordinator{isLeader: false, leader: addr, clock: NewHLC()}
 	s := NewLeaderRoutedStore(store.NewMVCCStore(), coord)

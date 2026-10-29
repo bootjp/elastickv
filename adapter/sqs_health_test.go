@@ -112,26 +112,6 @@ func TestServeSQSHealthz_RejectsNonGETHEAD(t *testing.T) {
 	}
 }
 
-// TestSQSAdvertisedCapabilities_TracksFlag pins the relationship
-// between htfifoCapabilityAdvertised and the emitted list. If a
-// future change flips the constant, the JSON response must reflect
-// it without further wiring — the constant is the single source of
-// truth.
-func TestSQSAdvertisedCapabilities_TracksFlag(t *testing.T) {
-	t.Parallel()
-	caps := sqsAdvertisedCapabilities()
-	if htfifoCapabilityAdvertised {
-		require.Contains(t, caps, sqsCapabilityHTFIFO,
-			"htfifo must be in the list when the flag is true")
-	} else {
-		require.NotContains(t, caps, sqsCapabilityHTFIFO,
-			"htfifo must NOT be in the list when the flag is false; "+
-				"a partial deploy that advertised the capability without "+
-				"the routing + leadership-refusal pair would create new "+
-				"partitioned queues that this binary cannot safely host")
-	}
-}
-
 // TestClientAcceptsSQSHealthJSON_Boundaries pins the substring
 // matcher's edge cases — these are the inputs the catalog-polling
 // caller in Phase 3.D PR 5 will produce, and a regression that

@@ -165,7 +165,7 @@ func TestListMetaExpireElemsIncludesLegacyDeltas(t *testing.T) {
 	st := store.NewMVCCStore()
 	server := &RedisServer{store: st}
 	key := []byte("ttl:list:legacy-delta")
-	deltaKey := legacyListMetaDeltaKey(key, 2)
+	deltaKey := store.LegacyListMetaDeltaKey(key, 2, 0)
 	require.NoError(t, st.PutAt(ctx, deltaKey, store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 2, 0))
 
 	elems, exists, err := server.listMetaExpireElems(ctx, key, 2, 1234)
@@ -186,7 +186,7 @@ func TestExpiredTTLIndexPrecedesLegacyListDeltaOnlyCollection(t *testing.T) {
 	server := &RedisServer{store: st}
 	key := []byte("ttl:list:legacy-delta-recreate")
 	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(time.Now().Add(-time.Hour)), 1, 0))
-	require.NoError(t, st.PutAt(ctx, legacyListMetaDeltaKey(key, 3), store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
+	require.NoError(t, st.PutAt(ctx, store.LegacyListMetaDeltaKey(key, 3, 0), store.MarshalListMetaDelta(store.ListMetaDelta{LenDelta: 1}), 3, 0))
 
 	stale, err := expiredTTLIndexPrecedesDeltaOnlyCollection(ctx, st, server, key, redisTypeList, 3)
 
@@ -268,7 +268,7 @@ func TestRedisCollectionExpireHandlesLegacyBlobs(t *testing.T) {
 			typ, err := server.rawKeyTypeAt(ctx, key, 1)
 			require.NoError(t, err)
 			require.Equal(t, tc.typ, typ)
-			applied, err := server.dispatchExpireForType(ctx, key, 1, typ, expireAt)
+			applied, err := server.dispatchExpireForReadTimestamp(ctx, key, testReadTimestamp(t, server, 1), typ, expireAt)
 			require.NoError(t, err)
 			require.True(t, applied)
 
@@ -470,7 +470,7 @@ func TestRedisCollectionExpireAllowsDeltaHeavyCollections(t *testing.T) {
 			}
 
 			readTS := st.LastCommitTS()
-			applied, err := server.dispatchCollectionExpire(ctx, key, readTS, tc.typ, expireAt)
+			applied, err := server.dispatchCollectionExpireReadTimestamp(ctx, key, testReadTimestamp(t, server, readTS), tc.typ, expireAt)
 			require.NoError(t, err)
 			require.True(t, applied)
 
@@ -545,7 +545,7 @@ func TestRedisCollectionExpireTriggersCompactionForDeltaOnlyTruncatedCollections
 				require.NoError(t, st.PutAt(ctx, tc.deltaKey(key, ts), tc.deltaValue, ts, 0))
 			}
 
-			applied, err := server.dispatchCollectionExpire(ctx, key, st.LastCommitTS(), tc.typ, expireAt)
+			applied, err := server.dispatchCollectionExpireReadTimestamp(ctx, key, testReadTimestamp(t, server, st.LastCommitTS()), tc.typ, expireAt)
 			require.ErrorIs(t, err, ErrDeltaScanTruncated)
 			require.False(t, applied)
 			_, err = st.GetAt(ctx, redisTTLKey(key), st.LastCommitTS())
@@ -623,7 +623,7 @@ func TestRedisCollectionExpireWritesInlineTTLForZeroLengthSimpleMeta(t *testing.
 			key := []byte("ttl:zero-len:" + tc.name)
 			require.NoError(t, st.PutAt(ctx, tc.metaKey(key), tc.metaValue, 1, 0))
 
-			applied, err := server.dispatchCollectionExpire(ctx, key, st.LastCommitTS(), tc.typ, expireAt)
+			applied, err := server.dispatchCollectionExpireReadTimestamp(ctx, key, testReadTimestamp(t, server, st.LastCommitTS()), tc.typ, expireAt)
 			require.NoError(t, err)
 			require.True(t, applied)
 
@@ -693,7 +693,7 @@ func TestRedisCollectionExpireDoesNotReviveDeltaEmptiedSimpleMeta(t *testing.T) 
 			require.NoError(t, st.PutAt(ctx, tc.metaKey(key), tc.metaValue, 1, 0))
 			require.NoError(t, st.PutAt(ctx, tc.deltaKey(key), tc.deltaValue, 2, 0))
 
-			applied, err := server.dispatchCollectionExpire(ctx, key, st.LastCommitTS(), tc.typ, expireAt)
+			applied, err := server.dispatchCollectionExpireReadTimestamp(ctx, key, testReadTimestamp(t, server, st.LastCommitTS()), tc.typ, expireAt)
 			require.NoError(t, err)
 			require.False(t, applied)
 
@@ -1591,6 +1591,15 @@ func requireExistsAt(t *testing.T, st store.MVCCStore, key []byte, readTS uint64
 	require.True(t, exists)
 }
 
+// testReadTimestamp wraps readTS in the kv.ReadTimestamp the live
+// *ReadTimestamp dispatch paths require.
+func testReadTimestamp(t *testing.T, server *RedisServer, readTS uint64) kv.ReadTimestamp {
+	t.Helper()
+	readTimestamp, err := kv.BeginReadTimestampThrough(context.Background(), server.coordinator, readTS, "test")
+	require.NoError(t, err)
+	return readTimestamp
+}
+
 func requireNoTTLAt(t *testing.T, server *RedisServer, st store.MVCCStore, key []byte, readTS uint64) {
 	t.Helper()
 	ttl, err := server.ttlAt(context.Background(), key, readTS)
@@ -1612,7 +1621,9 @@ func TestRedisHDelLegacyRewritePreservesLegacyTTL(t *testing.T) {
 	require.NoError(t, st.PutAt(ctx, redisHashKey(key), raw, 10, 0))
 	require.NoError(t, st.PutAt(ctx, redisTTLKey(key), encodeRedisTTL(expireAt), 11, 0))
 
-	require.NoError(t, server.persistHashTxn(ctx, key, st.LastCommitTS(), redisHashValue{"keep": "value"}))
+	removed, err := server.hdelTxn(ctx, key, [][]byte{[]byte("drop")})
+	require.NoError(t, err)
+	require.Equal(t, 1, removed)
 
 	readTS := st.LastCommitTS()
 	metaRaw, err := st.GetAt(ctx, store.HashMetaKey(key), readTS)
