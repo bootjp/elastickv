@@ -1141,7 +1141,10 @@ or acceptance receipt. Implementation now proceeds from main `c316b829e` on
   the dispatched `StartTS` before its descriptor commit, using the original
   pre-body read timestamp voucher and retained snapshot. Do not replace that
   snapshot with a local/latest watermark or rename the already-streamed blob
-  and chunkref namespaces. The read set contains the upload metadata, generation
+  and chunkref namespaces. Allocate the descriptor commit timestamp after
+  chunk durability in both inline and offloaded modes; keep the reserved
+  inline blob version separate from the descriptor's MVCC commit timestamp.
+  The read set contains the upload metadata, generation
   key and part key. Bucket deletion re-puts the generation key, preserving
   its maximum value, in both public and admin deletion transactions. Other
   object writers do not write that key, so parallel unrelated uploads do
