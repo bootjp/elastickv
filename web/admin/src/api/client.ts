@@ -299,6 +299,11 @@ export interface SqsQueueList {
   queues: string[];
 }
 
+export interface CreateQueueRequest {
+  name: string;
+  attributes?: Record<string, string>;
+}
+
 export interface UpdateQueueAttributesRequest {
   attributes: Record<string, string>;
 }
@@ -559,6 +564,8 @@ export const api = {
       `/s3/buckets/${encodeURIComponent(bucket)}/objects/${base64UrlEncodeBytes(key)}`,
       { method: "DELETE" },
     ),
+  createQueue: (req: CreateQueueRequest) =>
+    apiFetch<{ name: string }>("/sqs/queues", { method: "POST", body: { ...req } }),
   listQueues: (signal?: AbortSignal) =>
     apiFetch<SqsQueueList>("/sqs/queues", { signal }),
   describeQueue: (name: string, signal?: AbortSignal) =>
