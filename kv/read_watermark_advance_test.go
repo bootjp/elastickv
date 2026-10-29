@@ -3,6 +3,7 @@ package kv
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bootjp/elastickv/distribution"
 	pb "github.com/bootjp/elastickv/proto"
@@ -125,4 +126,104 @@ func TestShardStoreReadAboveLocalWatermarksDoesNotAdvance(t *testing.T) {
 		require.NoError(t, err)
 		require.Equal(t, uint64(10), f.stores[2].LastCommitTS(), "ts %d advanced the watermark", ts)
 	}
+}
+
+func TestWatermarkAdvanceCodec(t *testing.T) {
+	t.Parallel()
+	ts, ok, err := DecodeWatermarkAdvance(EncodeWatermarkAdvance(42))
+	require.NoError(t, err)
+	require.True(t, ok)
+	require.Equal(t, uint64(42), ts)
+
+	cases := []struct {
+		name    string
+		payload []byte
+		ok      bool
+	}{
+		{name: "empty", payload: nil, ok: false},
+		{name: "other opcode", payload: []byte{raftEncodeBackup, 1}, ok: false},
+		{name: "short body", payload: []byte{raftEncodeWatermarkAdvance, 1, 2}, ok: true},
+		{name: "zero", payload: EncodeWatermarkAdvance(0), ok: true},
+		{name: "read-latest sentinel", payload: EncodeWatermarkAdvance(^uint64(0)), ok: true},
+	}
+	for _, tc := range cases {
+		_, ok, err := DecodeWatermarkAdvance(tc.payload)
+		require.Equal(t, tc.ok, ok, tc.name)
+		if tc.ok {
+			require.ErrorIs(t, err, ErrInvalidWatermarkAdvance, tc.name)
+		} else {
+			require.NoError(t, err, tc.name)
+		}
+	}
+}
+
+func TestValidateForwardedAdminPayloadAcceptsWatermarkAdvance(t *testing.T) {
+	t.Parallel()
+	require.NoError(t, ValidateForwardedAdminPayload(EncodeWatermarkAdvance(7)))
+	require.ErrorIs(t, ValidateForwardedAdminPayload(EncodeWatermarkAdvance(0)), ErrInvalidWatermarkAdvance)
+}
+
+// The advance raises the watermark without writing a version, never lowers
+// it, and makes the HLC issue above the advanced value.
+func TestApplyWatermarkAdvance(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	clock := NewHLC()
+	fsm := NewKvFSMWithHLC(st, clock)
+
+	ts := clock.Current() + 1<<hlcLogicalBits
+	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts)))
+	require.Equal(t, ts, st.LastCommitTS())
+	require.Greater(t, clock.Next(), ts)
+
+	// Replay and a lower advance leave the watermark where it is.
+	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts)))
+	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts-1)))
+	require.Equal(t, ts, st.LastCommitTS())
+
+	resp := fsm.Apply(EncodeWatermarkAdvance(0))
+	respErr, ok := resp.(error)
+	require.True(t, ok)
+	require.ErrorIs(t, respErr, ErrInvalidWatermarkAdvance)
+	require.Equal(t, ts, st.LastCommitTS())
+}
+
+func TestReadWatermarkAdvanceAdmissible(t *testing.T) {
+	t.Parallel()
+	clock := NewHLC()
+	now := clock.Current() >> hlcLogicalBits
+	window := uint64(hlcPhysicalWindowMs)
+	require.True(t, ReadWatermarkAdvanceAdmissible(clock, now<<hlcLogicalBits))
+	require.True(t, ReadWatermarkAdvanceAdmissible(clock, (now+window)<<hlcLogicalBits))
+	require.False(t, ReadWatermarkAdvanceAdmissible(clock, (now+window+1000)<<hlcLogicalBits))
+	require.False(t, ReadWatermarkAdvanceAdmissible(nil, 1))
+
+	// A raised physical ceiling widens the bound by the same amount.
+	ahead := now + 10*window
+	clock.SetPhysicalCeiling(clampUint64ToInt64(ahead))
+	require.True(t, ReadWatermarkAdvanceAdmissible(clock, (ahead+window)<<hlcLogicalBits))
+}
+
+// An advance from a group whose clock runs ahead must not leave the HLC
+// above its physical ceiling: fenced allocations floor at the ceiling and
+// refuse anything above it, so observing the advance without raising the
+// ceiling first would refuse every persistence timestamp on this replica
+// until a lease renewal overtook it.
+func TestApplyWatermarkAdvanceRaisesCeilingBeforeObserving(t *testing.T) {
+	t.Parallel()
+	st, err := store.NewPebbleStore(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { _ = st.Close() })
+	clock := NewHLC()
+	fsm := NewKvFSMWithHLC(st, clock)
+
+	clock.SetPhysicalCeiling(time.Now().UnixMilli() + hlcPhysicalWindowMs)
+	ts := (clock.Next()>>hlcLogicalBits+2*uint64(hlcPhysicalWindowMs))<<hlcLogicalBits | 5
+	require.Nil(t, fsm.Apply(EncodeWatermarkAdvance(ts)))
+
+	next, err := clock.NextFenced()
+	require.NoError(t, err)
+	require.Greater(t, next, ts)
 }

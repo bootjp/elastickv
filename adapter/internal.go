@@ -122,6 +122,15 @@ func WithInternalMigrationExportRouting(groupID uint64, resolver kv.PartitionRes
 	}
 }
 
+// WithInternalReadWatermarkProposer sets the proposer that applies forwarded
+// read-watermark advances to this group. It is wired whether or not the admin
+// server runs, because snapshot reads routed through a follower depend on it.
+func WithInternalReadWatermarkProposer(proposer raftengine.Proposer) InternalOption {
+	return func(i *Internal) {
+		i.readWatermarkProposer = proposer
+	}
+}
+
 func WithInternalAdminProposer(proposer raftengine.Proposer) InternalOption {
 	return func(i *Internal) {
 		i.adminProposer = proposer
@@ -167,6 +176,7 @@ type Internal struct {
 	clock                           *kv.HLC
 	tsAllocator                     kv.TimestampAllocator
 	adminProposer                   raftengine.Proposer
+	readWatermarkProposer           raftengine.Proposer
 	lastCommitTimestamp             func() uint64
 	relay                           *RedisPubSubRelay
 	store                           store.MVCCStore
@@ -593,6 +603,9 @@ func (i *Internal) ForwardAdminProposal(
 	if err := i.leader.VerifyLeader(ctx); err != nil {
 		return nil, errors.WithStack(ErrNotLeader)
 	}
+	if ts, ok, err := kv.DecodeWatermarkAdvance(req.GetPayload()); ok {
+		return i.forwardReadWatermarkAdvance(ctx, req.GetPayload(), ts, err)
+	}
 	if i.adminProposer == nil {
 		return nil, errors.New("admin proposer is unavailable")
 	}
@@ -600,6 +613,43 @@ func (i *Internal) ForwardAdminProposal(
 		return nil, errors.WithStack(status.Error(codes.PermissionDenied, "admin forwarding requires a supported typed admin entry"))
 	}
 	result, err := i.adminProposer.ProposeAdmin(ctx, req.GetPayload())
+	if err != nil {
+		return nil, errors.WithStack(err)
+	}
+	if err := forwardedAdminProposalResponseError(result); err != nil {
+		return nil, err
+	}
+	return &pb.ForwardAdminProposalResponse{CommitIndex: result.CommitIndex}, nil
+}
+
+// forwardReadWatermarkAdvance applies a read-watermark advance a follower
+// forwarded before serving a snapshot read on this group. It is a no-op when
+// the group already covers ts, and refuses a timestamp beyond the HLC bound
+// so a caller cannot fence the group's writes into the future.
+func (i *Internal) forwardReadWatermarkAdvance(
+	ctx context.Context,
+	payload []byte,
+	ts uint64,
+	decodeErr error,
+) (*pb.ForwardAdminProposalResponse, error) {
+	if decodeErr != nil {
+		return nil, errors.WithStack(status.Error(codes.PermissionDenied, "admin forwarding requires a supported typed admin entry"))
+	}
+	if i.store != nil && ts <= i.store.LastCommitTS() {
+		return &pb.ForwardAdminProposalResponse{}, nil
+	}
+	if !kv.ReadWatermarkAdvanceAdmissible(i.clock, ts) {
+		return nil, errors.WithStack(status.Errorf(codes.FailedPrecondition,
+			"read watermark advance to %d is ahead of this leader's clock", ts))
+	}
+	proposer := i.readWatermarkProposer
+	if proposer == nil {
+		proposer = i.adminProposer
+	}
+	if proposer == nil {
+		return nil, errors.New("read watermark proposer is unavailable")
+	}
+	result, err := proposer.ProposeAdmin(ctx, payload)
 	if err != nil {
 		return nil, errors.WithStack(err)
 	}

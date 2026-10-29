@@ -4265,6 +4265,7 @@ func startRaftServers(
 				adapter.WithInternalStore(rt.store),
 				adapter.WithInternalPrimaryCommitEvidence(shardStore),
 				adapter.WithInternalMigrationProposer(proposerForGroup(rt, shardGroups)),
+				adapter.WithInternalReadWatermarkProposer(proposerForGroup(rt, shardGroups)),
 				adapter.WithInternalRouteEngine(routeEngine),
 				adapter.WithInternalActiveTimestampTracker(readTracker),
 				adapter.WithInternalMigrationExportRouting(rt.spec.id, sqsPartitionResolver),

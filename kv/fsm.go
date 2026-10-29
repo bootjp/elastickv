@@ -548,6 +548,8 @@ func (f *kvFSM) applyReservedOpcode(ctx context.Context, data []byte) (any, bool
 	switch {
 	case data[0] == raftEncodeHLCLease:
 		return f.applyHLCLease(data[1:]), true
+	case data[0] == raftEncodeWatermarkAdvance:
+		return f.applyWatermarkAdvance(ctx, data[1:]), true
 	case data[0] >= fsmwire.OpEncryptionMin && data[0] <= fsmwire.OpEncryptionMax:
 		return f.applyEncryption(f.pendingApplyIdx, data[0], data[1:]), true
 	default:
