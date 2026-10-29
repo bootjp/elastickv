@@ -1180,6 +1180,20 @@ or acceptance receipt. Implementation now proceeds from main `c316b829e` on
   Preserve both named S3 histories, source SHA, encryption mode and step
   outcomes as unconditional CI artifacts. Do not weaken the nonvacuity or
   final-read gate to obtain a passing result.
+- Security acceptance: reject public S3 object keys exceeding 1,024 decoded
+  UTF-8 bytes before proxying, body consumption or mutation. Apply the same
+  creation limit to admin PUT; admin GET/delete remain available for recovery
+  of previously stored nonconforming keys. Before allocating completion
+  descriptor/read-key arrays or reading descriptors, enforce a 24 MiB logical
+  aggregate read-key budget, including escaped segment lengths and fixed key
+  encoding overhead. Use division/subtraction rather than unchecked byte-count
+  multiplication. This supports 10,000 maximum-length conforming keys, including
+  zero-byte escaping; migration alias expansion remains separately bounded by
+  the existing physical key-count cap. The budget bounds this dependency set,
+  not total request/protobuf/Raft heap or concurrency, and does not change RawKV
+  value limits. Existing overlong public S3 keys require the admin recovery API.
+  Add runtime-red HTTP/admin and pre-allocation/no-descriptor-read regressions
+  before the fix, then repeat latest-push code/security review and CI.
 - Verify all changed helper callers, full adapter/KV/store race suites,
   unfiltered lint, relevant Jepsen checks, and latest-push review/CI. A1 does
   not establish cross-group serializability before A2's read-lock protocol,
