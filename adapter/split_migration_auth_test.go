@@ -9,7 +9,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -29,7 +28,7 @@ func TestSplitMigrationRolloutRejectsJobInjectionBeforeEnforcement(t *testing.T)
 			req := &pb.ForwardRequest{Requests: []*pb.Request{{Mutations: []*pb.Mutation{mutation}}}}
 			for _, credential := range []string{"", "Bearer wrong", "Bearer migration-secret"} {
 				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", credential))
-				ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+				ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: migrationTLSInfoFixture(t)})
 				called := false
 				_, err := unary(ctx, req, &grpc.UnaryServerInfo{FullMethod: pb.Internal_Forward_FullMethodName}, func(context.Context, any) (any, error) {
 					called = true
@@ -75,7 +74,7 @@ func TestSplitMigrationTokenAuthProtectsControlAndExport(t *testing.T) {
 			unary, stream := SplitMigrationTokenAuth("migration-secret", false, true)
 			for _, credential := range []string{"", "Bearer wrong", "Bearer migration-secret"} {
 				ctx := metadata.NewIncomingContext(context.Background(), metadata.Pairs("authorization", credential))
-				ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+				ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: migrationTLSInfoFixture(t)})
 				called := false
 				_, err := unary(ctx, nil, &grpc.UnaryServerInfo{FullMethod: method}, func(context.Context, any) (any, error) {
 					called = true
