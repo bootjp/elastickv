@@ -851,7 +851,7 @@ func (s *pebbleStore) findMaxDataCommitTS() (uint64, error) {
 		if userKey == nil {
 			continue
 		}
-		if isLocalAuxiliaryMVCCKey(userKey) {
+		if isNonAdvertisedMVCCKey(userKey) {
 			continue
 		}
 		if ts > maxTS {
@@ -2622,7 +2622,7 @@ func (s *pebbleStore) checkApplyConflictsWith(ctx context.Context, r pebble.Read
 	if err := s.checkAbsenceGuardsWith(ctx, r, mutations); err != nil {
 		return err
 	}
-	if !force && !hasCommitsAfter(startTS) {
+	if !force && !hasCommitsAfter(startTS) && !hasNonAdvertisedMVCCDependencies(mutations, readKeys) {
 		return nil
 	}
 	if err := s.checkConflictsWith(ctx, r, mutations, startTS); err != nil {

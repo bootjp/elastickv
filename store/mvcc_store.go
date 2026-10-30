@@ -782,7 +782,7 @@ func (s *mvccStore) applyMutations(ctx context.Context, mutations []*KVPairMutat
 		return err
 	}
 
-	if s.lastCommitTS > startTS || hasAbsenceGuards(mutations) {
+	if s.lastCommitTS > startTS || hasAbsenceGuards(mutations) || hasNonAdvertisedMVCCDependencies(mutations, readKeys) {
 		if err := s.checkConflictsLocked(mutations, readKeys, startTS); err != nil {
 			return err
 		}

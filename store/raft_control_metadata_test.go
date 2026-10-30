@@ -280,15 +280,15 @@ func TestRaftControlEntryProjectionAndStaleIndex(t *testing.T) {
 			s := factory(t)
 			api := raftMetadata(t, s)
 			require.NoError(t, raftEntryApplier(t, s).ApplyRaftEntry(t.Context(), 9, func(ctx context.Context) error {
-				if err := api.StageRaftEntryMutationsPreservingLastCommitTS(ctx, raftEntryPut("projection", "config"), nil, 1, 1); err != nil {
+				if err := api.StageRaftEntryMutationsPreservingLastCommitTS(ctx, configurationProjection(9), nil, 1, 1); err != nil {
 					return err
 				}
 				return api.StageRaftControlMetadata(ctx, []byte("P"), []byte("generation-9"))
 			}))
 			require.Zero(t, s.LastCommitTS())
-			got, err := s.GetAt(t.Context(), []byte("projection"), 1)
+			got, err := s.GetAt(t.Context(), MigrationConfigurationIndexKey(), 1)
 			require.NoError(t, err)
-			require.Equal(t, []byte("config"), got)
+			require.Equal(t, uint64(9), binary.BigEndian.Uint64(got))
 			err = raftEntryApplier(t, s).ApplyRaftEntry(t.Context(), 8, func(ctx context.Context) error {
 				return api.StageRaftControlMetadata(ctx, []byte("P"), []byte("stale"))
 			})

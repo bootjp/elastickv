@@ -97,7 +97,8 @@ func stageEntryReadinessFloor(sc *raftEntryScope, state TargetStagedReadinessSta
 			return errors.WithStack(err)
 		}
 		sc.advance = true
-		sc.maxCommitTS = max(sc.maxCommitTS, state.MinWriteTSExclusive)
+		sc.maxStagedTS = max(sc.maxStagedTS, state.MinWriteTSExclusive)
+		sc.maxAdvertisedCommitTS = max(sc.maxAdvertisedCommitTS, state.MinWriteTSExclusive)
 	}
 	return nil
 }

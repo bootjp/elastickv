@@ -75,9 +75,10 @@ type raftEntryScope struct {
 	db           *pebble.DB
 	batch        *pebble.Batch
 	appliedIndex uint64
-	// maxCommitTS is the highest commit timestamp staged so far; it becomes
-	// the entry's lastCommitTS advance at commit.
-	maxCommitTS uint64
+	// OCC counts every staged version, including non-advertised projections.
+	// Only advertised commits may advance the data watermark at publication.
+	maxStagedTS           uint64
+	maxAdvertisedCommitTS uint64
 	// advance records that at least one staged request advances
 	// lastCommitTS, mirroring the advanceLastCommitTS argument of the
 	// per-request path.
@@ -118,13 +119,12 @@ func (s *pebbleStore) raftEntryReader(ctx context.Context) pebble.Reader {
 func (sc *raftEntryScope) observe(commitTS uint64, advance bool) {
 	sc.touched = true
 	sc.dataTouched = true
+	sc.maxStagedTS = max(sc.maxStagedTS, commitTS)
 	if !advance {
 		return
 	}
 	sc.advance = true
-	if commitTS > sc.maxCommitTS {
-		sc.maxCommitTS = commitTS
-	}
+	sc.maxAdvertisedCommitTS = max(sc.maxAdvertisedCommitTS, commitTS)
 }
 
 func (sc *raftEntryScope) fail(err error) error {
@@ -140,7 +140,7 @@ func (sc *raftEntryScope) fail(err error) error {
 // request's timestamp is therefore still validated against it, exactly as
 // it is after a per-request commit.
 func (sc *raftEntryScope) hasCommitsAfter(startTS uint64) bool {
-	return sc.store.hasCommitsAfter(startTS) || (sc.advance && sc.maxCommitTS > startTS)
+	return sc.store.hasCommitsAfter(startTS) || sc.maxStagedTS > startTS
 }
 
 func (sc *raftEntryScope) checkIndex(appliedIndex uint64) error {
@@ -243,8 +243,8 @@ func (s *pebbleStore) commitRaftEntryScope(scope *raftEntryScope) error {
 	defer s.mtx.Unlock()
 	newLastTS := s.lastCommitTS
 	if scope.advance {
-		if scope.maxCommitTS > newLastTS {
-			newLastTS = scope.maxCommitTS
+		if scope.maxAdvertisedCommitTS > newLastTS {
+			newLastTS = scope.maxAdvertisedCommitTS
 		}
 	}
 	if err := stageRaftEntryCommitMetadata(scope, newLastTS); err != nil {
@@ -357,7 +357,7 @@ func (s *pebbleStore) stagePreservingMutationsInRaftEntry(ctx context.Context, s
 	if s.db != scope.db {
 		return scope.fail(errors.WithStack(ErrRaftEntryStoreSwapped))
 	}
-	if err := s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, false); err != nil {
+	if err := s.checkApplyConflictsWith(ctx, scope.batch, scope.hasCommitsAfter, mutations, readKeys, startTS, true); err != nil {
 		return scope.failUnlessVerdict(err)
 	}
 	encoded, err := s.encodeMutationsForBatch(mutations, commitTS, false)

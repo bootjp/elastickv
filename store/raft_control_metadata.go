@@ -14,6 +14,7 @@ const RaftControlMetadataPrefix = "!txn|meta|raft-control|"
 
 var ErrRaftControlScopeRequired = errors.New("store: control metadata requires an indexed raft entry scope")
 var ErrRaftControlKey = errors.New("store: invalid raft control metadata key")
+var ErrRaftControlProjectionKey = errors.New("store: unsupported raft control projection key")
 var ErrRaftControlStaleIndex = errors.New("store: protected raft entry would regress applied index")
 var ErrExternalSnapshotControlState = errors.New("store: protected control state requires explicit v5 external rebase")
 
@@ -31,7 +32,10 @@ type RaftControlMetadataStore interface {
 	ApplyRaftControlMetadata(context.Context, func(context.Context) error) error
 	// StageRaftEntryMutationsPreservingLastCommitTS stages an inner MVCC
 	// configuration projection without advertising a new data watermark.
-	// Unlike the direct auxiliary-write API, it requires an indexed scope.
+	// Only the exact MigrationConfigurationIndexKey is supported, not adjacent
+	// keys or arbitrary data. Invalid/mixed key lists fail the entire scope
+	// before staging any mutation, even if the caller ignores the error.
+	// Unlike the unchanged direct auxiliary-write API, it requires an indexed scope.
 	StageRaftEntryMutationsPreservingLastCommitTS(context.Context, []*KVPairMutation, [][]byte, uint64, uint64) error
 	ReadRaftControlMetadata(context.Context, []byte) ([]byte, error)
 	StageRaftControlMetadata(context.Context, []byte, []byte) error
@@ -45,6 +49,9 @@ func (s *pebbleStore) StageRaftEntryMutationsPreservingLastCommitTS(ctx context.
 	}
 	if scope.appliedIndex == 0 {
 		return scope.fail(errors.WithStack(ErrRaftControlScopeRequired))
+	}
+	if err := validateRaftControlProjection(mutations); err != nil {
+		return scope.fail(err)
 	}
 	scope.forceSync = true
 	return s.stagePreservingMutationsInRaftEntry(ctx, scope, mutations, readKeys, startTS, commitTS)
@@ -61,7 +68,19 @@ func (s *mvccStore) StageRaftEntryMutationsPreservingLastCommitTS(ctx context.Co
 	if err := scope.allowData(); err != nil {
 		return err
 	}
+	if err := validateRaftControlProjection(mutations); err != nil {
+		return scope.fail(err)
+	}
 	return scope.result(scope.staged.ApplyMutationsPreservingLastCommitTS(ctx, mutations, readKeys, startTS, commitTS))
+}
+
+func validateRaftControlProjection(mutations []*KVPairMutation) error {
+	for _, mutation := range mutations {
+		if mutation == nil || !bytes.Equal(mutation.Key, MigrationConfigurationIndexKey()) {
+			return errors.WithStack(ErrRaftControlProjectionKey)
+		}
+	}
+	return nil
 }
 
 func (s *pebbleStore) ApplyRaftControlMetadata(ctx context.Context, fn func(context.Context) error) error {
