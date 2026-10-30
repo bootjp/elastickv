@@ -5,7 +5,6 @@ import (
 	"bytes"
 	"encoding/binary"
 	"io"
-	"sync"
 	"sync/atomic"
 
 	"github.com/bootjp/elastickv/internal/encryption/fsmwire"
@@ -47,8 +46,6 @@ const (
 // TSO FSM's own applied state so unrelated shard-group lease renewals cannot
 // advance group-0 state outside the group-0 log.
 type TSOStateMachine struct {
-	claimMu            sync.RWMutex
-	claims             *tsoClaimLedger
 	hlc                *HLC
 	ceilingMs          atomic.Int64
 	allocationFloor    atomic.Uint64
@@ -128,17 +125,6 @@ func NewTSOStateMachine(hlc *HLC, opts ...TSOStateMachineOption) *TSOStateMachin
 }
 
 func (f *TSOStateMachine) Apply(data []byte) any {
-	if f != nil {
-		f.claimMu.Lock()
-		defer f.claimMu.Unlock()
-	}
-	if response, handled := f.applyClaimEnvelope(data); handled {
-		return response
-	}
-	return f.applyScalarPayload(data)
-}
-
-func (f *TSOStateMachine) applyScalarPayload(data []byte) any {
 	if len(data) == 0 {
 		return haltErr(errors.Wrap(ErrTSOStateMachineInvalidEntry, "empty entry"))
 	}
@@ -299,17 +285,12 @@ func (f *TSOStateMachine) PhaseDFloor() uint64 {
 }
 
 func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
-	if f != nil {
-		f.claimMu.RLock()
-		defer f.claimMu.RUnlock()
-	}
 	var ceilingMs int64
 	var allocationFloor uint64
 	var cutoverActive bool
 	var phaseDActive bool
 	var phaseDFloor uint64
 	var pendingFloor uint64
-	var claims *tsoClaimLedger
 	if f != nil {
 		ceilingMs = f.ceilingMs.Load()
 		allocationFloor = f.allocationFloor.Load()
@@ -317,7 +298,6 @@ func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 		phaseDActive = f.phaseDActive.Load()
 		phaseDFloor = f.phaseDFloor.Load()
 		pendingFloor = f.pendingPhaseDFloor.Load()
-		claims = f.claims.clone()
 	}
 	return &tsoFSMSnapshot{
 		ceilingMs:       ceilingMs,
@@ -326,7 +306,6 @@ func (f *TSOStateMachine) Snapshot() (raftengine.Snapshot, error) {
 		phaseDActive:    phaseDActive,
 		phaseDFloor:     phaseDFloor,
 		pendingFloor:    pendingFloor,
-		claims:          claims,
 	}, nil
 }
 
@@ -335,21 +314,6 @@ func (f *TSOStateMachine) Restore(r io.Reader) error {
 		return errors.New("tso fsm snapshot: reader is nil")
 	}
 	br := tsoSnapshotReader(r)
-	if f != nil {
-		f.claimMu.Lock()
-		defer f.claimMu.Unlock()
-	}
-	magic, _ := br.Peek(len(tsoClaimSnapshotMagic))
-	if bytes.Equal(magic, []byte(tsoClaimSnapshotMagic)) {
-		return f.restoreClaimSnapshot(br)
-	}
-	if f != nil && f.claims != nil && f.claims.Term != 0 {
-		return errors.Wrap(ErrTSOClaimInvalid, "scalar snapshot would discard claims")
-	}
-	return f.restoreScalarSnapshot(br)
-}
-
-func (f *TSOStateMachine) restoreScalarSnapshot(br *bufio.Reader) error {
 	if legacy, err := restoreLegacyKVFSMSnapshot(f, br); legacy || err != nil {
 		return err
 	}
@@ -577,9 +541,6 @@ func legacyKVFSMStoreSnapshotMagics() [][]byte {
 }
 
 func (f *TSOStateMachine) IsVolatileOnlyPayload(payload []byte) bool {
-	if isTSOClaimPayload(payload) {
-		return true
-	}
 	if isTSOPendingPhaseDEntry(payload) {
 		return true
 	}
@@ -703,7 +664,6 @@ func marshalTSOPhaseD(floor uint64) []byte {
 }
 
 type tsoFSMSnapshot struct {
-	claims          *tsoClaimLedger
 	ceilingMs       int64
 	allocationFloor uint64
 	cutoverActive   bool
@@ -731,17 +691,6 @@ func (s *tsoFSMSnapshot) WriteTo(w io.Writer) (int64, error) {
 }
 
 func (s *tsoFSMSnapshot) encode() ([]byte, error) {
-	buf, err := s.encodeScalar()
-	if err != nil {
-		return nil, err
-	}
-	if s != nil && s.claims != nil && s.claims.Term != 0 {
-		return encodeTSOClaimSnapshot(buf, s.claims)
-	}
-	return buf, nil
-}
-
-func (s *tsoFSMSnapshot) encodeScalar() ([]byte, error) {
 	if s == nil {
 		s = &tsoFSMSnapshot{}
 	}

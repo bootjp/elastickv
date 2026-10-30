@@ -14,7 +14,6 @@ import (
 type transactionTimestampAdmission struct {
 	store     store.MVCCStore
 	allocator func() TimestampAllocator
-	groupID   func() uint64
 }
 
 // WithTimestampAdmission guards the transaction manager before requests enter
@@ -29,7 +28,7 @@ func WithTimestampAdmission(st store.MVCCStore, allocator func() TimestampAlloca
 // store required to stamp local requests, including its LeaderProxy local path.
 func WithTimestampAdmissionStore(st store.MVCCStore) CoordinatorOption {
 	return func(c *Coordinate) {
-		c.transactionManager = configureTimestampAdmission(c.transactionManager, st, func() TimestampAllocator { return c.tsAllocator }, func() uint64 { return c.claimGroupID })
+		c.transactionManager = configureTimestampAdmission(c.transactionManager, st, func() TimestampAllocator { return c.tsAllocator })
 	}
 }
 
@@ -40,14 +39,7 @@ func (c *ShardedCoordinator) configureTimestampAdmissionForGroup(group *ShardGro
 		// legacy path unchanged; an explicit transaction option remains intact.
 		return
 	}
-	var groupID uint64
-	for id, candidate := range c.groups {
-		if candidate == group {
-			groupID = id
-			break
-		}
-	}
-	group.Txn = configureTimestampAdmission(group.Txn, group.Store, func() TimestampAllocator { return c.tsAllocator }, func() uint64 { return groupID })
+	group.Txn = configureTimestampAdmission(group.Txn, group.Store, func() TimestampAllocator { return c.tsAllocator })
 }
 
 func (a *transactionTimestampAdmission) prepare(ctx context.Context, reqs []*pb.Request) ([]*pb.Request, error) {
@@ -64,25 +56,21 @@ func (a *transactionTimestampAdmission) prepare(ctx context.Context, reqs []*pb.
 	if a.allocator != nil {
 		allocator = a.allocator()
 	}
-	var groupID uint64
-	if a.groupID != nil {
-		groupID = a.groupID()
-	}
-	if err := StampTimestampAdmission(ctx, allocator, a.store, owned, groupID); err != nil {
+	if err := StampTimestampAdmission(ctx, allocator, a.store, owned); err != nil {
 		return nil, err
 	}
 	return owned, nil
 }
 
-func configureTimestampAdmission(tx Transactional, st store.MVCCStore, allocator func() TimestampAllocator, groupID func() uint64) Transactional {
-	admission := &transactionTimestampAdmission{store: st, allocator: allocator, groupID: groupID}
+func configureTimestampAdmission(tx Transactional, st store.MVCCStore, allocator func() TimestampAllocator) Transactional {
+	admission := &transactionTimestampAdmission{store: st, allocator: allocator}
 	switch t := tx.(type) {
 	case *TransactionManager:
 		t.timestampAdmission.Store(admission)
 	case *LeaderProxy:
 		t.tm.timestampAdmission.Store(admission)
 	case *leaseRefreshingTxn:
-		t.inner = configureTimestampAdmission(t.inner, st, allocator, groupID)
+		t.inner = configureTimestampAdmission(t.inner, st, allocator)
 	case *timestampAdmissionTransactional:
 		t.admission.Store(admission)
 	case nil:

@@ -69,16 +69,12 @@ func (i *Internal) inspectPrepareEvidence(ctx context.Context, requestedFloor ui
 	return &pb.PrepareEvidenceStateResponse{
 		Supported: true, ProofEnabled: enabled, UnprovenLocks: unproven,
 		FenceFloor: floor, AppliedIndex: index,
-		TimestampClaimProtocolVersion:     kv.TSOClaimProtocolVersion,
-		TimestampClaimPrepareApplyVersion: i.claimPrepareApplyVersion(),
 	}, nil
 }
 
 func (i *Internal) prepareEvidenceCapabilities() *pb.PrepareEvidenceStateResponse {
 	return &pb.PrepareEvidenceStateResponse{
-		TimestampClaimProtocolVersion:     kv.TSOClaimProtocolVersion,
-		TimestampClaimPrepareApplyVersion: i.claimPrepareApplyVersion(),
-		Supported:                         true, DedicatedTsoConfigured: i.tsoCutoverState != nil && i.tsAllocator != nil,
+		Supported: true, DedicatedTsoConfigured: i.tsoCutoverState != nil && i.tsAllocator != nil,
 		CutoverApplied: i.tsoCutoverState != nil && i.tsoCutoverState.CutoverActive(),
 	}
 }

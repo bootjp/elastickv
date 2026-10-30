@@ -1074,10 +1074,6 @@ func (c *ShardedCoordinator) dispatchBeforeShardRouting(ctx context.Context, req
 	// span multiple shards (or be nil, meaning "all keys"). Broadcast the
 	// operation to every shard group so each FSM scans locally.
 	if hasDelPrefixElem(reqs.Elems) {
-		if TimestampClaimsRequired(c.tsAllocator) {
-			resp, err := c.dispatchClaimedPrefixBroadcast(ctx, reqs)
-			return resp, true, err
-		}
 		resp, err := c.dispatchDelPrefixBroadcast(ctx, reqs.IsTxn, reqs.Elems, reqs.ObservedRouteVersion)
 		return resp, true, err
 	}
@@ -1193,13 +1189,6 @@ func (c *ShardedCoordinator) anyResolverClaimedKey(elems []*Elem[OP]) bool {
 func (c *ShardedCoordinator) dispatchTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
 	c.pinStrictRouteVersion(reqs)
 	c.maybeAutoPinObservedRouteVersion(reqs, callerSuppliedStartTS)
-	if TimestampClaimsRequired(c.tsAllocator) {
-		return c.dispatchClaimedTransaction(ctx, reqs, callerSuppliedStartTS)
-	}
-	return c.dispatchLegacyTxnWithComposed1Retry(ctx, reqs, callerSuppliedStartTS)
-}
-
-func (c *ShardedCoordinator) dispatchLegacyTxnWithComposed1Retry(ctx context.Context, reqs *OperationGroup[OP], callerSuppliedStartTS bool) (*CoordinateResponse, error) {
 
 	for attempt := 0; attempt <= composed1RetryAttempts; attempt++ {
 		resp, err := c.dispatchTxn(
@@ -3382,9 +3371,6 @@ func (c *ShardedCoordinator) rawLogsWithGroups(ctx context.Context, reqs *Operat
 			WriteFenceBypassKeys: bypassKeysByGroup[gid],
 		})
 	}
-	if err := c.claimRawLogs(ctx, reqs, logs, gids); err != nil {
-		return nil, nil, err
-	}
 	return logs, gids, nil
 }
 
@@ -3397,16 +3383,7 @@ func (c *ShardedCoordinator) rawLogTimestamp(ctx context.Context) (uint64, error
 
 func (c *ShardedCoordinator) stampRawRequestTimestamps(ctx context.Context, reqs []*pb.Request) error {
 	for _, r := range reqs {
-		if r == nil || r.IsTxn {
-			continue
-		}
-		if requestUsesTimestampClaim(c.tsAllocator, r) {
-			if err := StampRequestTimestampClaim(ctx, c.tsAllocator, r); err != nil {
-				return err
-			}
-			continue
-		}
-		if r.Ts != 0 {
+		if r == nil || r.IsTxn || r.Ts != 0 {
 			continue
 		}
 		ts, err := c.allocateTimestamp(ctx, "stamp sharded raw log ts")

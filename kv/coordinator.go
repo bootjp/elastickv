@@ -247,7 +247,6 @@ type CoordinateResponse struct {
 }
 
 type Coordinate struct {
-	claimGroupID       uint64
 	transactionManager Transactional
 	engine             raftengine.Engine
 	// lp caches the engine's optional LeaseProvider capability so the
@@ -562,7 +561,7 @@ func (c *Coordinate) Dispatch(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	// Validate the request before any use to avoid panics on malformed input.
 	// Validation errors are not retryable, so do this once outside the loop.
-	if err := c.prepareClaimDispatch(ctx, reqs); err != nil {
+	if err := validateOperationGroup(reqs); err != nil {
 		return nil, err
 	}
 
@@ -797,9 +796,9 @@ func (c *Coordinate) dispatchOnce(ctx context.Context, reqs *OperationGroup[OP])
 	var resp *CoordinateResponse
 	var err error
 	if reqs.IsTxn {
-		resp, err = c.dispatchSelectedTxn(ctx, reqs)
+		resp, err = c.dispatchTxn(ctx, reqs.Elems, reqs.ReadKeys, reqs.StartTS, reqs.CommitTS, reqs.PrevCommitTS, reqs.ObservedRouteVersion, reqs.KeyVizLabel, reqs.PrimaryKey)
 	} else {
-		resp, err = c.dispatchRawOperation(ctx, reqs)
+		resp, err = c.dispatchRaw(ctx, reqs.Elems, reqs.KeyVizLabel)
 	}
 	c.refreshLeaseAfterDispatch(resp, err, dispatchStart, expectedGen)
 	return resp, err
@@ -1362,37 +1361,24 @@ func (c *Coordinate) dispatchTxn(ctx context.Context, reqs []*Elem[OP], readKeys
 	}, nil
 }
 
-func (c *Coordinate) dispatchRaw(ctx context.Context, elems []*Elem[OP], label keyviz.Label) (*CoordinateResponse, error) {
-	return c.dispatchRawOperation(ctx, &OperationGroup[OP]{Elems: elems, KeyVizLabel: label})
-}
-
-func (c *Coordinate) dispatchRawOperation(ctx context.Context, group *OperationGroup[OP]) (*CoordinateResponse, error) {
-	muts := make([]*pb.Mutation, 0, len(group.Elems))
-	for _, elem := range group.Elems {
+func (c *Coordinate) dispatchRaw(ctx context.Context, req []*Elem[OP], label keyviz.Label) (*CoordinateResponse, error) {
+	muts := make([]*pb.Mutation, 0, len(req))
+	for _, elem := range req {
 		mut := elemToMutation(elem)
-		c.observeMutation(mut, group.KeyVizLabel)
+		c.observeMutation(mut, label)
 		muts = append(muts, mut)
 	}
 
+	ts, err := c.allocateTimestamp(ctx, "allocate raw dispatch ts")
+	if err != nil {
+		return nil, err
+	}
 	logs := []*pb.Request{{
 		IsTxn:     false,
 		Phase:     pb.Phase_NONE,
+		Ts:        ts,
 		Mutations: muts,
 	}}
-	logs[0].TimestampIntent, logs[0].TimestampClaim = group.TimestampIntent, group.TimestampClaim
-	logs[0].ObservedRouteVersion = group.ObservedRouteVersion
-	logs[0].TimestampClaimGroupId = c.claimGroupID
-	if TimestampClaimsRequired(c.tsAllocator) {
-		if err := c.stampRetainedOperationClaim(ctx, group, logs[0]); err != nil {
-			return nil, err
-		}
-	} else {
-		ts, err := c.allocateTimestamp(ctx, "allocate raw dispatch ts")
-		if err != nil {
-			return nil, err
-		}
-		logs[0].Ts = ts
-	}
 
 	r, err := c.transactionManager.Commit(ctx, logs)
 	if err != nil {
@@ -1400,7 +1386,7 @@ func (c *Coordinate) dispatchRawOperation(ctx context.Context, group *OperationG
 	}
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
-		CommitTS:    logs[0].Ts,
+		CommitTS:    ts,
 	}, nil
 }
 
@@ -1586,7 +1572,7 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 
 	cli := pb.NewInternalClient(conn)
 
-	requests, err := c.buildStampedRedirectRequests(ctx, reqs)
+	requests, err := c.buildRedirectRequests(reqs)
 	if err != nil {
 		return nil, err
 	}
@@ -1601,9 +1587,6 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 	if !r.Success {
 		return nil, ErrInvalidRequest
 	}
-	if TimestampClaimsRequired(c.tsAllocator) && r.TimestampClaimProtocolVersion != TSOClaimProtocolVersion {
-		return nil, errors.Wrap(ErrTSOProtocolUnsupported, "forward leader did not acknowledge timestamp claims")
-	}
 
 	return &CoordinateResponse{
 		CommitIndex: r.CommitIndex,
@@ -1612,9 +1595,6 @@ func (c *Coordinate) redirect(ctx context.Context, reqs *OperationGroup[OP]) (*C
 }
 
 func (c *Coordinate) buildRedirectRequests(reqs *OperationGroup[OP]) ([]*pb.Request, error) {
-	if TimestampClaimsRequired(c.tsAllocator) {
-		return c.buildClaimRedirectRequests(reqs)
-	}
 	if !reqs.IsTxn {
 		requests := make([]*pb.Request, 0, len(reqs.Elems))
 		for _, req := range reqs.Elems {

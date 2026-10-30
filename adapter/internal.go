@@ -172,7 +172,6 @@ func NewInternalWithEngine(txm kv.Transactional, leader raftengine.LeaderView, c
 }
 
 type Internal struct {
-	timestampClaimGroupID           uint64
 	leader                          raftengine.LeaderView
 	transactionManager              kv.Transactional
 	clock                           *kv.HLC
@@ -258,7 +257,7 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 			CommitIndex: 0,
 		}, errors.WithStack(err)
 	}
-	if err := kv.StampTimestampAdmission(ctx, i.tsAllocator, i.store, req.GetRequests(), i.timestampClaimGroupID); err != nil {
+	if err := kv.StampTimestampAdmission(ctx, i.tsAllocator, i.store, req.GetRequests()); err != nil {
 		return nil, errors.WithStack(err)
 	}
 
@@ -274,10 +273,9 @@ func (i *Internal) Forward(ctx context.Context, req *pb.ForwardRequest) (*pb.For
 	}
 
 	return &pb.ForwardResponse{
-		Success:                       true,
-		CommitIndex:                   r.CommitIndex,
-		CommitTs:                      commitTS,
-		TimestampClaimProtocolVersion: internalClaimProtocolVersion(req.GetRequests()),
+		Success:     true,
+		CommitIndex: r.CommitIndex,
+		CommitTs:    commitTS,
 	}, nil
 }
 
@@ -1588,12 +1586,6 @@ func (i *Internal) stampRawTimestamps(ctx context.Context, reqs []*pb.Request) e
 		if r == nil {
 			continue
 		}
-		if kv.TimestampClaimsRequired(i.tsAllocator) || kv.RequestsUseTimestampClaims([]*pb.Request{r}) {
-			if err := i.stampClaimedRawTimestamp(ctx, r); err != nil {
-				return err
-			}
-			continue
-		}
 		if r.Ts != 0 {
 			// Somebody else already stamped this write. It is the timestamp the
 			// value will be persisted under, and this receiver is downstream of
@@ -1634,13 +1626,6 @@ func (i *Internal) ensureRawWriteAllowed(r *pb.Request) error {
 }
 
 func (i *Internal) stampTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {
-	if kv.TimestampClaimsRequired(i.tsAllocator) || kv.RequestsUseTimestampClaims(reqs) {
-		return i.stampClaimedTxnTimestamps(ctx, reqs)
-	}
-	return i.stampLegacyTxnTimestamps(ctx, reqs)
-}
-
-func (i *Internal) stampLegacyTxnTimestamps(ctx context.Context, reqs []*pb.Request) (uint64, error) {
 	startTS := forwardedTxnStartTS(reqs)
 	if startTS == 0 {
 		ts, err := i.nextTimestamp(ctx, "stampTxnTimestamps startTS")

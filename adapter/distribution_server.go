@@ -588,9 +588,6 @@ func (s *DistributionServer) GetRoute(ctx context.Context, req *pb.GetRouteReque
 // dedicated allocator is configured, only the local group-0 leader can serve
 // the request and the returned window is already durable in that Raft group.
 func (s *DistributionServer) GetTimestamp(ctx context.Context, req *pb.GetTimestampRequest) (*pb.GetTimestampResponse, error) {
-	if req != nil && (len(req.ClaimRequest) != 0 || req.ClaimLookupOnly) {
-		return s.getConcreteTimestampClaim(ctx, req)
-	}
 	count, minTimestamp, err := timestampRequestValues(req)
 	if err != nil {
 		return nil, err
@@ -693,9 +690,6 @@ func (s *DistributionServer) ValidateTimestamp(
 	ctx context.Context,
 	req *pb.ValidateTimestampRequest,
 ) (*pb.ValidateTimestampResponse, error) {
-	if req != nil && req.ClaimedRequest != nil {
-		return s.validateConcreteTimestampClaim(ctx, req)
-	}
 	if req == nil || req.GetTimestamp() == 0 {
 		return nil, errors.WithStack(status.Error(codes.InvalidArgument, "timestamp is required"))
 	}
@@ -713,14 +707,7 @@ func (s *DistributionServer) ValidateTimestamp(
 	if err := validator.ValidateDurableTimestamp(ctx, req.GetTimestamp()); err != nil {
 		return nil, timestampRPCError(err)
 	}
-	return s.scalarTimestampValidationResponse(), nil
-}
-
-func (s *DistributionServer) scalarTimestampValidationResponse() *pb.ValidateTimestampResponse {
 	resp := &pb.ValidateTimestampResponse{Valid: true, PhaseDActive: true}
-	if kv.TimestampClaimsRequired(s.timestampAllocator) {
-		resp.ClaimProtocolVersion = kv.TSOClaimProtocolVersion
-	}
 	if state, ok := s.timestampAllocator.(interface {
 		PhaseDFloor() uint64
 		AllocationFloor() uint64
@@ -728,7 +715,7 @@ func (s *DistributionServer) scalarTimestampValidationResponse() *pb.ValidateTim
 		resp.PhaseDFloor = state.PhaseDFloor()
 		resp.AllocationFloor = state.AllocationFloor()
 	}
-	return resp
+	return resp, nil
 }
 
 func (s *DistributionServer) validateLegacyResolutionTimestamp(ctx context.Context, req *pb.ValidateTimestampRequest) (*pb.ValidateTimestampResponse, error) {

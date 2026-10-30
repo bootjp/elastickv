@@ -311,9 +311,6 @@ func (p *LeaderProxy) forward(callerCtx context.Context, parentCtx context.Conte
 	if !resp.Success {
 		return nil, fmt.Errorf("%w: forward response lacks a decision", ErrTransactionOutcomeUnknown)
 	}
-	if RequestsUseTimestampClaims(reqs) && resp.TimestampClaimProtocolVersion != TSOClaimProtocolVersion {
-		return nil, errors.WithStack(ErrTSOProtocolUnsupported)
-	}
 	return &TransactionResponse{CommitIndex: resp.CommitIndex, CommitTS: resp.CommitTs}, nil
 }
 

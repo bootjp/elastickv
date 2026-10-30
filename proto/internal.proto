@@ -84,53 +84,6 @@ message Request {
   // creation epoch. Producers set it only after validating the unchanged
   // persistence timestamp against the durable TSO allocation range.
   uint64 timestamp_admission_floor = 8;
-  bytes timestamp_claim = 9;
-  TimestampClaimIntent timestamp_intent = 10;
-  uint64 timestamp_claim_group_id = 11;
-  // A DEL_PREFIX broadcast executes one signed participant mutation per
-  // request. Empty means the entire participant payload; other operations
-  // cannot select a partial payload.
-  repeated uint32 timestamp_claim_prefix_indices = 12;
-}
-
-message TimestampClaimIntent {
-  bytes operation_id = 1;
-  bool is_txn = 2;
-  uint64 read_timestamp = 3;
-  reserved 4; // The unpublished full-value manifest must not be accepted.
-  repeated bytes read_keys = 5;
-  bytes primary_key = 6;
-  uint64 observed_route_version = 7;
-  uint64 previous_commit_timestamp = 8;
-  repeated bytes write_fence_bypass_keys = 9;
-  repeated TimestampClaimParticipant participants = 10;
-  uint64 lock_ttl_ms = 11;
-  uint32 manifest_version = 12;
-  // IsTxn plus initial_phase binds raw NONE, one-phase transaction NONE, or
-  // transaction PREPARE. COMMIT/ABORT require the retained PREPARE capsule;
-  // they do not change the original phase in its signed manifest.
-  Phase initial_phase = 13;
-}
-
-message TimestampClaimParticipant {
-  uint64 group_id = 1;
-  reserved 2; // Former full-value mutation plan.
-  repeated bytes read_keys = 3;
-  repeated bytes write_fence_bypass_keys = 4;
-  repeated TimestampClaimMutationEvidence mutations = 5;
-}
-
-// Values occur only in Request.mutations. Receivers recompute this evidence
-// from those bytes; it is not caller-supplied write authority. Mutation order
-// and multiplicity are significant, including repeated writes to the same key.
-message TimestampClaimMutationEvidence {
-  Op op = 1;
-  bytes key = 2;
-  bytes value_sha256 = 3;
-  uint64 value_length = 4;
-  uint64 commit_ts_value_offset = 5;
-  uint32 commit_ts_value_length = 6;
-  bool require_absent = 7;
 }
 
 message RaftCommand {
@@ -147,7 +100,6 @@ message ForwardResponse {
   bool success = 1;
   uint64 commit_index = 2;
   uint64 commit_ts = 3;
-  uint32 timestamp_claim_protocol_version = 4;
 }
 
 message ForwardAdminProposalRequest {
@@ -179,8 +131,6 @@ message PrepareEvidenceStateResponse {
   uint64 applied_index = 5;
   bool cutover_applied = 6;
   bool dedicated_tso_configured = 7;
-  uint32 timestamp_claim_protocol_version = 8;
-  uint32 timestamp_claim_prepare_apply_version = 9;
 }
 
 message RelayPublishRequest {
