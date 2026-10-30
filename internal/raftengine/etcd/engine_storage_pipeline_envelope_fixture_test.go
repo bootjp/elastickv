@@ -154,6 +154,7 @@ func openEnvelopeNativeEngine(t *testing.T, node *transportTestNode, peers []Pee
 	require.NoError(t, e.recoverOpenConfiguration(prepared, e.applied))
 	e.initTransport(prepared.cfg)
 	e.refreshStatus()
+	require.NoError(t, e.attachPipelineSnapshotView(prepared.cfg, &prepared.disk.LocalSnap))
 	go e.run()
 	return e
 }
