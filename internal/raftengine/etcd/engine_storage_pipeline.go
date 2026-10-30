@@ -173,8 +173,8 @@ func (e *Engine) reservePipelineProposal(bytes uint64) (*storageWorkPermit, erro
 	return p.proposalBudget.tryAcquire(bytes*3 + pipelineTaskOverhead)
 }
 
-// enqueuePipelineStep admits immutable transport-owned input, not authenticated
-// local completion tokens. Neither a full queue nor a byte limit waits on disk.
+// enqueuePipelineStep owns accepted transport input, not authenticated local
+// completion tokens. Neither a full queue nor a byte limit waits on disk.
 func (e *Engine) enqueuePipelineStep(ctx context.Context, message raftpb.Message) error {
 	if err := contextErr(ctx); err != nil {
 		return err
@@ -214,9 +214,11 @@ func (e *Engine) admitPipelineStep(message raftpb.Message) error {
 	if message.GetType() == raftpb.MsgSnap {
 		budget = p.snapshotIngressBudget
 	}
-	permit, err := budget.tryAcquire(pipelineMessageBytes(&message))
+	// Use the same conservative bill as outbound ownership, before cloning any
+	// payload. A shallow detach can retain a much larger caller backing array.
+	permit, err := budget.tryAcquire(outboundDispatchBytes(&message))
 	if err == nil {
-		detachPipelineMessage(&message)
+		message = cloneDispatchMessage(message)
 		lease, err := p.snapshotIngressLease(&message)
 		if err != nil {
 			permit.Release()
