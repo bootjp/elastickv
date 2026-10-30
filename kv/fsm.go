@@ -2061,7 +2061,28 @@ func (f *kvFSM) handlePrepareRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
+	if len(r.TimestampClaim) != 0 {
+		return f.bindAndApplyClaimedPrepare(ctx, r, uniq, storeMuts, meta.PrepareCommitTS)
+	}
 	return f.recordAndApplyPrepare(ctx, uniq, storeMuts, r.ReadKeys, floorTS, startTS)
+}
+
+func (f *kvFSM) bindAndApplyClaimedPrepare(ctx context.Context, request *pb.Request, muts []*pb.Mutation, storeMuts []*store.KVPairMutation, persistenceTS uint64) error {
+	bound, err := f.bindPrepareClaimEvidence(ctx, request, storeMuts)
+	if err != nil {
+		return err
+	}
+	return f.recordAndApplyClaimedPrepare(ctx, muts, bound, request.ReadKeys, persistenceTS, request.Ts, persistenceTS)
+}
+
+func (f *kvFSM) recordAndApplyClaimedPrepare(ctx context.Context, muts []*pb.Mutation, storeMuts []*store.KVPairMutation, readKeys [][]byte, floorTS, startTS, persistenceTS uint64) error {
+	if err := f.verifyMigrationTransferSize(ctx, storeMuts); err != nil {
+		return err
+	}
+	if err := f.recordMigrationWrite(ctx, muts, floorTS); err != nil {
+		return err
+	}
+	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, readKeys, startTS, persistenceTS, f.pendingApplyIdx))
 }
 
 func prepareRouteFloorTimestamp(meta TxnMeta, startTS uint64) uint64 {
@@ -2476,17 +2497,17 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	return f.recordAndApplyCommit(ctx, storeMuts, uniq, applyStartTS, commitTS)
+	return f.recordAndApplyCommit(ctx, storeMuts, uniq, startTS, applyStartTS, commitTS)
 }
 
-func (f *kvFSM) recordAndApplyCommit(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
+func (f *kvFSM) recordAndApplyCommit(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, originalStartTS, applyStartTS, commitTS uint64) error {
 	if len(storeMuts) == 0 {
 		return nil
 	}
 	if err := f.recordMigrationWrite(ctx, uniq, commitTS); err != nil {
 		return err
 	}
-	if err := f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, applyStartTS, commitTS); err != nil {
+	if err := f.applyCommitWithIdempotencyFallback(ctx, storeMuts, uniq, originalStartTS, applyStartTS, commitTS); err != nil {
 		return err
 	}
 	f.notifyApplyObserversForStoreMutations(commitTS, storeMuts)
@@ -2553,8 +2574,17 @@ func (f *kvFSM) commitApplyStartTS(ctx context.Context, primaryKey []byte, start
 //
 // The secondary-shard LatestCommitTS scan is intentionally deferred to the
 // write-conflict path so the hot (first-time) commit path pays no extra cost.
-func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, applyStartTS, commitTS uint64) error {
-	err := f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, applyStartTS, commitTS, f.pendingApplyIdx)
+// Concrete prepared claims retain originalStartTS for lock ownership and OCC;
+// only legacy idempotency handling uses the potentially widened applyStartTS.
+func (f *kvFSM) applyCommitWithIdempotencyFallback(ctx context.Context, storeMuts []*store.KVPairMutation, uniq []*pb.Mutation, originalStartTS, applyStartTS, commitTS uint64) error {
+	expected, err := f.expectedPreparedClaimVersions(ctx, storeMuts, originalStartTS, commitTS)
+	if err != nil {
+		return err
+	}
+	if len(expected) != 0 {
+		return f.applyPreparedClaimVersions(ctx, storeMuts, originalStartTS, commitTS, expected)
+	}
+	err = f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, applyStartTS, commitTS, f.pendingApplyIdx)
 	if err == nil {
 		return nil
 	}
@@ -2621,6 +2651,17 @@ func (f *kvFSM) handleAbortRequest(ctx context.Context, r *pb.Request, abortTS u
 
 	if len(storeMuts) == 0 {
 		return nil
+	}
+	return f.applyAbortClaimCleanup(ctx, storeMuts, startTS, abortTS)
+}
+
+func (f *kvFSM) applyAbortClaimCleanup(ctx context.Context, storeMuts []*store.KVPairMutation, startTS, abortTS uint64) error {
+	expected, err := f.expectedPreparedClaimVersions(ctx, storeMuts, startTS, abortTS)
+	if err != nil {
+		return err
+	}
+	if len(expected) != 0 {
+		return f.applyPreparedClaimVersions(ctx, storeMuts, startTS, abortTS, expected)
 	}
 	return errors.WithStack(f.store.ApplyMutationsRaftAt(ctx, storeMuts, nil, startTS, abortTS, f.pendingApplyIdx))
 }

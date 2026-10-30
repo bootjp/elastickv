@@ -5621,7 +5621,18 @@ func applyTxnResolution(ctx context.Context, g *ShardGroup, phase pb.Phase, star
 	for _, k := range keys {
 		muts = append(muts, &pb.Mutation{Op: pb.Op_PUT, Key: k})
 	}
-	_, err := g.Txn.Commit(ctx, []*pb.Request{{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}})
+	request := &pb.Request{IsTxn: true, Phase: phase, Ts: startTS, Mutations: muts}
+	if err := attachRetainedTxnClaim(ctx, g.Store, request, primaryKey); err != nil {
+		return err
+	}
+	if phase == pb.Phase_ABORT && len(request.TimestampClaim) != 0 {
+		proof, err := DecodeRequestTimestampClaim(request.TimestampClaim)
+		if err != nil {
+			return err
+		}
+		meta.Value = EncodeTxnMeta(TxnMeta{PrimaryKey: primaryKey, CommitTS: proof.Proof.Record.Timestamp})
+	}
+	_, err := g.Txn.Commit(ctx, []*pb.Request{request})
 	return errors.WithStack(err)
 }
 

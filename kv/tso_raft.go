@@ -60,6 +60,11 @@ type tsoCutoverState interface {
 // Failed proposals may leak a local window, but they can never expose an
 // uncommitted timestamp or make a later leader reuse a returned timestamp.
 type RaftTSOAllocator struct {
+	claimQueueMu           sync.Mutex
+	claimQueue             []*tsoLiveClaimCall
+	claimQueueFlushing     bool
+	claimAuthority         TSOClaimAuthority
+	claimIdentity          *TSOClaimIdentity
 	group                  *ShardGroup
 	clock                  *HLC
 	state                  *TSOStateMachine
@@ -103,6 +108,9 @@ func NewRaftTSOAllocator(group *ShardGroup, clock *HLC, opts ...RaftTSOAllocator
 }
 
 func (a *RaftTSOAllocator) Next(ctx context.Context) (uint64, error) {
+	if a.claimIdentity != nil {
+		return issueTSOObservation(ctx, a, a.claimIdentity, 1, 0)
+	}
 	return a.NextBatch(ctx, 1)
 }
 
@@ -111,6 +119,9 @@ func (a *RaftTSOAllocator) NextBatch(ctx context.Context, n int) (uint64, error)
 }
 
 func (a *RaftTSOAllocator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	if a.claimIdentity != nil {
+		return issueTSOObservation(ctx, a, a.claimIdentity, 1, min)
+	}
 	return a.NextBatchAfter(ctx, 1, min)
 }
 
@@ -451,6 +462,16 @@ func (a *RaftTSOAllocator) ValidateDurableTimestamp(ctx context.Context, timesta
 		return errors.Wrapf(stderrors.Join(ErrTSOTimestampInvalid, ErrTSOTimestampPrePhaseD),
 			"timestamp=%d phase_d_floor=%d allocation_floor=%d", timestamp, floor, end)
 	}
+	if a.claimIdentity != nil {
+		a.state.claimMu.RLock()
+		defer a.state.claimMu.RUnlock()
+		if a.state.claims == nil {
+			return errors.WithStack(ErrTSOTimestampInvalid)
+		}
+		if _, exists := a.state.claims.Slots[timestamp]; !exists {
+			return errors.WithStack(ErrTSOTimestampInvalid)
+		}
+	}
 	return nil
 }
 
@@ -570,6 +591,9 @@ func NewLeaderRoutedTSOAllocator(
 }
 
 func (a *LeaderRoutedTSOAllocator) Next(ctx context.Context) (uint64, error) {
+	if identity := a.TimestampClaimIdentity(); identity != nil {
+		return issueTSOObservation(ctx, a, identity, 1, 0)
+	}
 	return a.NextBatch(ctx, 1)
 }
 
@@ -578,6 +602,9 @@ func (a *LeaderRoutedTSOAllocator) NextBatch(ctx context.Context, n int) (uint64
 }
 
 func (a *LeaderRoutedTSOAllocator) NextAfter(ctx context.Context, min uint64) (uint64, error) {
+	if identity := a.TimestampClaimIdentity(); identity != nil {
+		return issueTSOObservation(ctx, a, identity, 1, min)
+	}
 	return a.NextBatchAfter(ctx, 1, min)
 }
 
@@ -810,6 +837,9 @@ func (a *LeaderRoutedTSOAllocator) requestRemoteValidation(ctx context.Context, 
 	if !resp.GetValid() || !resp.GetPhaseDActive() {
 		return errors.Wrapf(ErrTSOTimestampInvalid,
 			"leader validation valid=%t phase_d_active=%t", resp.GetValid(), resp.GetPhaseDActive())
+	}
+	if a.TimestampClaimIdentity() != nil && resp.ClaimProtocolVersion != TSOClaimProtocolVersion {
+		return errors.WithStack(ErrTSOProtocolUnsupported)
 	}
 	return nil
 }

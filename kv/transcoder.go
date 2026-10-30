@@ -1,6 +1,9 @@
 package kv
 
-import "github.com/bootjp/elastickv/keyviz"
+import (
+	"github.com/bootjp/elastickv/keyviz"
+	pb "github.com/bootjp/elastickv/proto"
+)
 
 // OP is an operation type.
 type OP int
@@ -72,8 +75,12 @@ type Elem[T OP] struct {
 
 // OperationGroup is a group of operations that should be executed atomically.
 type OperationGroup[T OP] struct {
-	Elems []*Elem[T]
-	IsTxn bool
+	// TimestampIntent preserves the operation identity across routed retries.
+	// Receivers recompute the payload binding; this field is not authority.
+	TimestampIntent *pb.TimestampClaimIntent
+	TimestampClaim  []byte
+	Elems           []*Elem[T]
+	IsTxn           bool
 	// PrimaryKey optionally selects a written key as the transaction's
 	// primary. Empty preserves the lexicographically smallest-key default.
 	// Callers that use it must keep the same key across every attempt.

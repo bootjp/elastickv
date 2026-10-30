@@ -84,6 +84,34 @@ message Request {
   // creation epoch. Producers set it only after validating the unchanged
   // persistence timestamp against the durable TSO allocation range.
   uint64 timestamp_admission_floor = 8;
+  bytes timestamp_claim = 9;
+  TimestampClaimIntent timestamp_intent = 10;
+  uint64 timestamp_claim_group_id = 11;
+  // A DEL_PREFIX broadcast executes one signed participant mutation per
+  // request. Empty means the entire participant payload; other operations
+  // cannot select a partial payload.
+  repeated uint32 timestamp_claim_prefix_indices = 12;
+}
+
+message TimestampClaimIntent {
+  bytes operation_id = 1;
+  bool is_txn = 2;
+  uint64 read_timestamp = 3;
+  repeated Mutation mutations = 4;
+  repeated bytes read_keys = 5;
+  bytes primary_key = 6;
+  uint64 observed_route_version = 7;
+  uint64 previous_commit_timestamp = 8;
+  repeated bytes write_fence_bypass_keys = 9;
+  repeated TimestampClaimParticipant participants = 10;
+  uint64 lock_ttl_ms = 11;
+}
+
+message TimestampClaimParticipant {
+  uint64 group_id = 1;
+  repeated Mutation mutations = 2;
+  repeated bytes read_keys = 3;
+  repeated bytes write_fence_bypass_keys = 4;
 }
 
 message RaftCommand {
@@ -100,6 +128,7 @@ message ForwardResponse {
   bool success = 1;
   uint64 commit_index = 2;
   uint64 commit_ts = 3;
+  uint32 timestamp_claim_protocol_version = 4;
 }
 
 message ForwardAdminProposalRequest {
@@ -131,6 +160,8 @@ message PrepareEvidenceStateResponse {
   uint64 applied_index = 5;
   bool cutover_applied = 6;
   bool dedicated_tso_configured = 7;
+  uint32 timestamp_claim_protocol_version = 8;
+  uint32 timestamp_claim_prepare_apply_version = 9;
 }
 
 message RelayPublishRequest {

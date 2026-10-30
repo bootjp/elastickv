@@ -60,8 +60,11 @@ func (c *ShardedCoordinator) admitBroadcastParticipant(ctx context.Context, grou
 	owned := make([]*pb.Request, len(requests))
 	for i, request := range requests {
 		owned[i] = proto.CloneOf(request)
+		if len(request.TimestampClaim) != 0 {
+			owned[i].TimestampClaimGroupId = groupID
+		}
 	}
-	if err := StampTimestampAdmission(ctx, c.tsAllocator, group.Store, owned); err != nil {
+	if err := StampTimestampAdmission(ctx, c.tsAllocator, group.Store, owned, groupID); err != nil {
 		return nil, err
 	}
 	// Evidence-free legacy groups without a store keep their existing behavior.

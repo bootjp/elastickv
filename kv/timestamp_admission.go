@@ -15,13 +15,24 @@ const timestampAdmissionValidationBudget = 5 * time.Second
 // only after validating its unchanged persistence timestamp against group 0.
 // Resolution is exempt. Incoming creation epochs are never trusted, even when
 // the group has not yet activated the protocol.
-func StampTimestampAdmission(ctx context.Context, allocator TimestampAllocator, st store.MVCCStore, reqs []*pb.Request) error {
+func StampTimestampAdmission(ctx context.Context, allocator TimestampAllocator, st store.MVCCStore, reqs []*pb.Request, expectedGroups ...uint64) error {
+	ctx, cancel := context.WithTimeout(nonNilTSOContext(ctx), timestampAdmissionValidationBudget)
+	defer cancel()
 	creation := clearTimestampAdmission(reqs)
+	var expected uint64
+	if len(expectedGroups) != 0 {
+		expected = expectedGroups[0]
+	}
+	if err := validateRequestTimestampClaims(ctx, allocator, st, reqs, expected); err != nil {
+		return err
+	}
 	if !creation || st == nil {
 		return nil
 	}
-	ctx, cancel := context.WithTimeout(nonNilTSOContext(ctx), timestampAdmissionValidationBudget)
-	defer cancel()
+	return stampTimestampAdmissionEpoch(ctx, allocator, st, reqs)
+}
+
+func stampTimestampAdmissionEpoch(ctx context.Context, allocator TimestampAllocator, st store.MVCCStore, reqs []*pb.Request) error {
 	sealed, floor, err := readPrepareEvidenceCreationGate(ctx, st)
 	if err != nil {
 		return errors.Wrap(err, "read timestamp admission epoch")
@@ -78,8 +89,11 @@ func validateTimestampAdmission(ctx context.Context, allocator TimestampAllocato
 		if err != nil {
 			return errors.WithStack(err)
 		}
-		if timestamp <= floor {
-			return errors.Wrapf(ErrTSOTimestampInvalid, "creation timestamp %d does not exceed admission floor %d", timestamp, floor)
+		if err := checkTimestampAdmissionFloor(timestamp, floor); err != nil {
+			return err
+		}
+		if requestUsesTimestampClaim(allocator, request) {
+			continue
 		}
 		if _, exists := validated[timestamp]; exists {
 			continue
@@ -88,6 +102,17 @@ func validateTimestampAdmission(ctx context.Context, allocator TimestampAllocato
 			return errors.Wrap(err, "validate creation timestamp admission")
 		}
 		validated[timestamp] = struct{}{}
+	}
+	return nil
+}
+
+func requestUsesTimestampClaim(allocator TimestampAllocator, request *pb.Request) bool {
+	return TimestampClaimsRequired(allocator) || len(request.TimestampClaim) != 0 || request.TimestampIntent != nil
+}
+
+func checkTimestampAdmissionFloor(timestamp, floor uint64) error {
+	if timestamp <= floor {
+		return errors.Wrapf(ErrTSOTimestampInvalid, "creation timestamp %d does not exceed admission floor %d", timestamp, floor)
 	}
 	return nil
 }

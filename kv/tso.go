@@ -901,24 +901,35 @@ type windowSnapshot struct {
 // TSOAllocator. The hot path is lock-free: callers claim a slot with atomic Add
 // on the currently published window.
 type BatchAllocator struct {
-	tso        TSOAllocator
-	batchSize  int
-	win        atomic.Pointer[windowSnapshot]
-	epoch      atomic.Uint64
-	phaseDSeen atomic.Bool
+	claimIdentity *TSOClaimIdentity
+	tso           TSOAllocator
+	batchSize     int
+	win           atomic.Pointer[windowSnapshot]
+	epoch         atomic.Uint64
+	phaseDSeen    atomic.Bool
 
 	mu         sync.Mutex
 	refillDone chan struct{}
 }
 
-func NewBatchAllocator(tso TSOAllocator, batchSize int) (*BatchAllocator, error) {
+type BatchAllocatorOption func(*BatchAllocator)
+
+func WithBatchTSOClaimIdentity(identity *TSOClaimIdentity) BatchAllocatorOption {
+	return func(b *BatchAllocator) { b.claimIdentity = identity }
+}
+
+func NewBatchAllocator(tso TSOAllocator, batchSize int, opts ...BatchAllocatorOption) (*BatchAllocator, error) {
 	if tso == nil {
 		return nil, ErrTSOAllocatorRequired
 	}
 	if batchSize <= 0 || batchSize > maxHLCBatchSize {
 		return nil, errors.WithStack(ErrInvalidTSOBatchSize)
 	}
-	return &BatchAllocator{tso: tso, batchSize: batchSize}, nil
+	b := &BatchAllocator{tso: tso, batchSize: batchSize, claimIdentity: timestampClaimIdentity(tso)}
+	for _, opt := range opts {
+		opt(b)
+	}
+	return b, nil
 }
 
 func (b *BatchAllocator) Invalidate() {
@@ -934,6 +945,9 @@ func (b *BatchAllocator) Next(ctx context.Context) (uint64, error) {
 }
 
 func (b *BatchAllocator) FreshAdmissionTimestamp(ctx context.Context) (uint64, error) {
+	if b != nil && b.claimIdentity != nil {
+		return b.Next(ctx)
+	}
 	if b == nil || b.tso == nil {
 		return 0, errors.WithStack(ErrTSOAllocatorRequired)
 	}
@@ -984,6 +998,9 @@ func (b *BatchAllocator) PhaseDFloor() uint64 {
 }
 
 func (b *BatchAllocator) nextAfter(ctx context.Context, min uint64) (uint64, error) {
+	if b.claimIdentity != nil {
+		return issueTSOObservation(ctx, b, b.claimIdentity, b.batchSize, min)
+	}
 	for {
 		if err := ctxErr(ctx); err != nil {
 			return 0, err

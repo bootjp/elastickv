@@ -249,14 +249,18 @@ func optionalV2Fields(m *TxnMeta) []struct {
 }
 
 type txnLock struct {
-	StartTS      uint64
-	CommitTS     uint64
-	TTLExpireAt  uint64
-	PrimaryKey   []byte
-	IsPrimaryKey bool
+	ClaimEvidenceHash [32]byte
+	StartTS           uint64
+	CommitTS          uint64
+	TTLExpireAt       uint64
+	PrimaryKey        []byte
+	IsPrimaryKey      bool
 }
 
 func encodeTxnLock(l txnLock) []byte {
+	if l.ClaimEvidenceHash != ([32]byte{}) {
+		return encodeClaimedTxnLock(l)
+	}
 	// version(1) + StartTS(8) + TTLExpireAt(8) + flags(1) + primaryLen(8) + primaryKey + optional fields
 	size := 1 + uint64FieldSize + uint64FieldSize + 1 + uint64FieldSize + len(l.PrimaryKey)
 	if l.CommitTS != 0 {
@@ -286,6 +290,9 @@ func encodeTxnLock(l txnLock) []byte {
 func decodeTxnLock(b []byte) (txnLock, error) {
 	if len(b) < 1 {
 		return txnLock{}, errors.New("txn lock: empty")
+	}
+	if b[0] == txnClaimLockVersion {
+		return decodeClaimedTxnLock(b)
 	}
 	if b[0] != txnLockVersion {
 		return txnLock{}, errors.WithStack(errors.Newf("txn lock: unsupported version %d", b[0]))
