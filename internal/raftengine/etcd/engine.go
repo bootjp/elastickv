@@ -400,6 +400,7 @@ type Engine struct {
 	snapshotConfigurations           snapshotConfigurationHistory
 	snapshotConfigurationReplayIndex uint64
 	configurationTransition          atomic.Bool
+	snapshotTransition               atomic.Bool
 	// voterCount is the count of nodes in the latest applied
 	// ConfState.Voters (including self if voter). isLearnerNode is the
 	// matching set membership lookup keyed by node ID. Both are written
@@ -593,7 +594,9 @@ type snapshotResult struct {
 }
 
 type dispatchRequest struct {
-	msg raftpb.Message
+	msg               raftpb.Message
+	snapshotUnpin     func()
+	snapshotCloseOnce *sync.Once
 }
 
 // peerQueues holds separate dispatch channels per peer so that heartbeats
@@ -826,6 +829,9 @@ func prepareOpenState(cfg OpenConfig) (preparedOpenState, error) {
 }
 
 func (e *Engine) initTransport(cfg OpenConfig) {
+	if e.storagePipeline != nil {
+		e.initPipelineSnapshotFiles()
+	}
 	if e.transport == nil {
 		return
 	}
@@ -841,6 +847,11 @@ func (e *Engine) initTransport(cfg OpenConfig) {
 	e.transport.SetSpoolDir(cfg.DataDir)
 	e.transport.SetFSMSnapDir(e.fsmSnapDir)
 	e.transport.SetFSMSnapshotPrepare(e.prepareFSMSnapshotWriteLocked)
+	if e.storagePipeline != nil {
+		files := e.storagePipeline.snapshotFiles
+		env := pipelineConfigurationEnvironment{dataDir: e.dataDir, fsmSnapDir: e.fsmSnapDir}
+		e.transport.SetFSMSnapshotPrepare(func(index uint64) error { return files.prepare(env, index) })
+	}
 	e.transport.SetFSMSnapshotProtection(e.protectReceivedFSMSnapshot, e.unprotectReceivedFSMSnapshot)
 	e.transport.SetFSMPayloadReader(e.readFSMPayloadLocked)
 	e.transport.SetFSMPayloadOpener(e.openFSMPayloadLocked)
@@ -1262,7 +1273,7 @@ func (e *Engine) LastQuorumAck() monoclock.Instant {
 	// sneaks past recordQuorumAck (or a tracker entry that survived a
 	// brief step-down/step-up window) could leak stale liveness into
 	// the caller's fast-path validation.
-	if !e.isLeader.Load() || e.configurationTransition.Load() {
+	if !e.isLeader.Load() || e.configurationTransition.Load() || e.snapshotTransition.Load() {
 		return monoclock.Zero
 	}
 	if ns := e.singleNodeLeaderAckMonoNs.Load(); ns != 0 {
@@ -2563,6 +2574,12 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 		return nil
 	}
 	dispatchReq := prepareDispatchRequest(msg)
+	if e.storagePipeline != nil && msg.GetType() == raftpb.MsgSnap && msg.Snapshot != nil {
+		index, files := msg.Snapshot.GetMetadata().GetIndex(), e.storagePipeline.snapshotFiles
+		files.pin(index)
+		dispatchReq.snapshotCloseOnce = &sync.Once{}
+		dispatchReq.snapshotUnpin = func() { files.unpin(index) }
+	}
 	select {
 	case ch <- dispatchReq:
 		return nil
@@ -3794,7 +3811,7 @@ func (e *Engine) handleReadStates(states []etcdraft.ReadState) {
 }
 
 func (e *Engine) resolveReadyReads() {
-	if e.configurationTransition.Load() {
+	if e.configurationTransition.Load() || e.snapshotTransition.Load() {
 		return
 	}
 	for _, req := range e.readyReads(e.applied) {
@@ -5295,6 +5312,9 @@ func prepareDispatchRequest(msg raftpb.Message) dispatchRequest {
 }
 
 func (r dispatchRequest) Close() error {
+	if r.snapshotCloseOnce != nil {
+		r.snapshotCloseOnce.Do(r.snapshotUnpin)
+	}
 	return nil
 }
 

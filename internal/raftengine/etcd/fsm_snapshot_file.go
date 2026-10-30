@@ -677,6 +677,11 @@ func purgeOlderSnapshotPairsBeforeWrite(
 	})
 
 	retention := keepVerifiedPrewriteSnapshots(fsmSnapDir, candidates)
+	for _, candidate := range candidates {
+		if protectedIndexes[candidate.index] {
+			retention.keep[candidate.name] = true
+		}
+	}
 	var combined error
 	combined = errors.CombineErrors(combined, purgeUnretainedPrewriteSnapshots(snapDir, fsmSnapDir, candidates, retention))
 	combined = errors.CombineErrors(combined, removePrewriteFSMOrphansBeforeIndex(
@@ -1092,6 +1097,10 @@ func removeWithWarn(path, label string) {
 // A crash between snap-remove and fsm-remove leaves a .fsm with no token:
 // treated as an orphan on next startup by cleanupStaleFSMSnaps.
 func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
+	return purgeOldSnapshotFilesProtected(snapDir, fsmSnapDir, nil)
+}
+
+func purgeOldSnapshotFilesProtected(snapDir, fsmSnapDir string, protected map[uint64]bool) error {
 	entries, err := os.ReadDir(snapDir)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -1115,6 +1124,9 @@ func purgeOldSnapshotFiles(snapDir, fsmSnapDir string) error {
 	}
 	var combined error
 	for _, name := range snaps[:len(snaps)-maxKeep] {
+		if protected[parseSnapFileIndex(name)] {
+			continue
+		}
 		if err := purgeSnapPair(snapDir, fsmSnapDir, name); err != nil {
 			combined = errors.CombineErrors(combined, err)
 		}

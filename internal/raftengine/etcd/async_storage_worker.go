@@ -51,9 +51,14 @@ type storageWorker struct {
 	requests    chan reservedStorageWork
 	completions chan storageWorkCompletion
 	done        chan struct{}
+	finalize    func() error
 }
 
 func newStorageWorker(queueSize int) (*storageWorker, error) {
+	return newFinalizingStorageWorker(queueSize, nil)
+}
+
+func newFinalizingStorageWorker(queueSize int, finalize func() error) (*storageWorker, error) {
 	if queueSize <= 0 {
 		return nil, errors.WithStack(errInvalidStorageWork)
 	}
@@ -61,6 +66,7 @@ func newStorageWorker(queueSize int) (*storageWorker, error) {
 		requests:    make(chan reservedStorageWork, queueSize),
 		completions: make(chan storageWorkCompletion, queueSize),
 		done:        make(chan struct{}),
+		finalize:    finalize,
 	}
 	go w.run()
 	return w, nil
@@ -130,6 +136,12 @@ func (w *storageWorker) run() {
 		// Do not select on cancellation here: accepted ownership must reach the
 		// owner even after a fatal error, with the original error preserved.
 		w.completions <- completion
+	}
+	if w.finalize != nil {
+		_, err := runStorageWork(func() (any, error) { return nil, w.finalize() })
+		if err != nil {
+			w.completions <- storageWorkCompletion{token: pipelineSnapshotFinalization{}, err: err}
+		}
 	}
 }
 

@@ -1,8 +1,6 @@
 package etcd
 
 import (
-	"path/filepath"
-
 	"github.com/bootjp/elastickv/internal/raftengine"
 	"github.com/cockroachdb/errors"
 	raftpb "go.etcd.io/raft/v3/raftpb"
@@ -33,6 +31,7 @@ type pipelineConfigurationPlan struct {
 	v2                       *raftpb.ConfChangeV2
 	term                     uint64
 	skipPersistence, capture bool
+	snapshotPlan             *pipelineSnapshotPlan
 }
 
 type pipelineConfigurationRequest struct {
@@ -93,7 +92,13 @@ func (e *Engine) prunePipelineConfigurationHistory() error {
 	if err != nil {
 		return errors.WithStack(err)
 	}
-	e.snapshotConfigurations.pruneThrough(snapshot.GetMetadata().GetIndex())
+	floor := snapshot.GetMetadata().GetIndex()
+	for _, index := range p.snapshotPins {
+		if index < floor {
+			floor = index
+		}
+	}
+	e.snapshotConfigurations.pruneThrough(floor)
 	if len(e.snapshotConfigurations.entries) == 0 {
 		return nil
 	}
@@ -178,29 +183,13 @@ func capturePipelineConfiguration(env pipelineConfigurationEnvironment, plan *pi
 		}
 		return nil, errors.WithStack(err)
 	}
-	var payload []byte
-	if env.fsmSnapDir == "" {
-		payload, err = snapshotBytesAndClose(snapshot, env.dataDir)
-	} else {
-		var crc uint32
-		crc, err = writeFSMSnapshotFile(snapshot, env.fsmSnapDir, plan.index)
-		closeErr := snapshot.Close()
-		if err == nil {
-			err = closeErr
-		}
-		payload = encodeSnapshotToken(plan.index, crc)
-	}
-	if err != nil {
-		return nil, errors.WithStack(err)
-	}
+	plan.snapshotPlan.lease.snapshot = snapshot
 	if writer, ok := env.fsm.(raftengine.AppliedIndexWriter); ok {
 		if err := writer.SetDurableAppliedIndex(plan.index); err != nil {
 			return nil, errors.WithStack(err)
 		}
 	}
-	return &raftpb.Snapshot{Data: payload, Metadata: &raftpb.SnapshotMetadata{
-		Index: proto.Uint64(plan.index), Term: proto.Uint64(plan.term), ConfState: proto.CloneOf(&plan.confState),
-	}}, nil
+	return plan.snapshotPlan.snapshot, nil
 }
 
 func (e *Engine) handlePipelineConfiguration(request pipelineConfigurationRequest) error {
@@ -294,6 +283,17 @@ func (e *Engine) finishPipelineConfigurationPlan(task *pipelineTask, plan *pipel
 	}
 	plan.skipPersistence = e.currentConfigIndex() >= plan.index
 	plan.capture = plan.index >= e.applied && plan.index > snapshot.GetMetadata().GetIndex()
+	if plan.capture {
+		captured, err := e.newPipelineSnapshotPlan(nil)
+		if err != nil {
+			return nil, err
+		}
+		captured.snapshot = &raftpb.Snapshot{Metadata: &raftpb.SnapshotMetadata{Index: proto.Uint64(plan.index), Term: proto.Uint64(plan.term), ConfState: proto.CloneOf(&plan.confState)}}
+		captured.peers = append([]Peer(nil), plan.peers...)
+		e.storagePipeline.snapshotPins[captured] = plan.index
+		captured.files.pin(plan.index)
+		plan.snapshotPlan = captured
+	}
 	e.storagePipeline.configuration = plan
 	return plan, e.foldPipelineReady()
 }
@@ -337,17 +337,19 @@ func runPipelineConfigurationDisk(p *engineStoragePipeline, env pipelineConfigur
 		if err := writeCurrentPersistedPeers(env.dataDir, request.plan.index, request.plan.peers); err != nil {
 			return err
 		}
-		if request.plan.capture && env.fsmSnapDir != "" {
-			return prepareFSMSnapshotWriteProtected(filepath.Join(env.dataDir, snapDirName), env.fsmSnapDir, request.plan.index, nil)
-		}
 		return nil
 	case pipelineConfigurationSave:
+		if err := writePipelineCheckpoint(request.plan.snapshotPlan); err != nil {
+			return err
+		}
 		return errors.WithStack(p.persist.SaveSnap(request.snapshot))
 	case pipelineConfigurationRelease:
 		if err := p.persist.Release(request.snapshot); err != nil {
 			return errors.WithStack(err)
 		}
-		snapshotDiskPhase{persist: p.persist, dataDir: env.dataDir, fsmSnapDir: env.fsmSnapDir, maxWALFiles: env.maxWALFiles}.purge()
+		if request.plan.snapshotPlan != nil {
+			_ = request.plan.snapshotPlan.files.purge(env)
+		}
 		return nil
 	case pipelineConfigurationFront, pipelineConfigurationPublish:
 		return errors.WithStack(errInvalidStorageWork)
@@ -383,6 +385,9 @@ func (e *Engine) publishPipelineConfiguration(plan *pipelineConfigurationPlan) e
 	e.singleNodeLeaderAckMonoNs.Store(0)
 	e.configurationTransition.Store(false)
 	e.storagePipeline.configuration = nil
+	if plan.snapshotPlan != nil {
+		e.retirePipelineSnapshot(plan.snapshotPlan)
+	}
 	if !e.storagePipeline.quiescing || plan.index <= e.storagePipeline.shutdownCommit {
 		if plan.v1 != nil {
 			e.resolveConfigChange(plan.index, plan.v1.GetContext())

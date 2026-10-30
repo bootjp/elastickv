@@ -374,13 +374,13 @@ func TestEnginePipelineConfigurationFrontWaitsForActualEarlierApply(t *testing.T
 	fsm.unblock()
 	index := asyncStorageAwait(t, h, gate.entered, "configuration after actual earlier Apply")
 	require.Greater(t, index, priorIndex)
-	select {
-	case result := <-earlier:
-		require.NoError(t, result.err)
-		require.Equal(t, priorIndex, result.result.CommitIndex)
-	default:
-		t.Fatal("configuration transition preceded the earlier successful prefix publication")
-	}
+	// The owner publication is the ordering witness. h.propose forwards the
+	// real receipt through another goroutine, which need not be scheduled
+	// before the independently executing configuration actor reaches its gate.
+	require.GreaterOrEqual(t, h.engine.AppliedIndex(), priorIndex)
+	result := asyncStorageAwait(t, h, earlier, "earlier successful prefix receipt while configuration remains held")
+	require.NoError(t, result.err)
+	require.Equal(t, priorIndex, result.result.CommitIndex)
 	gate.unblock()
 }
 

@@ -636,3 +636,61 @@ without skips (114.235s), whole KV race (107.177s), all SQS/FIFO and the real
 DynamoDB leader-change control (45.934s), and complete lint. That export
 predates the fixture/alarm follow-up; final publication requires a fresh
 source export of those changes rather than reusing its receipts.
+
+## Snapshot Handshake Implementation (Unactivated)
+
+The explicit internal runtime now implements normal local checkpoints and
+received snapshots. Production `Open` still constructs the synchronous
+RawNode. This implementation does not satisfy the outstanding full physical
+accounting, Ready overshoot/debt admission, outbound telemetry, large-write,
+encrypted three-voter acceptance, or final composed-source publication gates.
+
+Local checkpoints enter the FIFO apply stream. At its front, the actor asks
+the owner for the actual completed index, term, full owned ConfState and peer
+inventory. The actor captures the FSM handle and durable index; disk work
+serializes/closes the handle and performs SaveSnap. Only the owner publishes
+MemoryStorage and schedules FIFO Release/cleanup. Configuration captures use
+the same disk serialization and resource lifecycle. Captures retain history
+and file pins; outgoing snapshot requests retain a file pin until their last
+dispatch/report use. These pins are separate from outbound byte accounting.
+
+An incoming snapshot first enters the ordered apply stream, before owner Step
+can replace RawNode's configuration. The owner validates membership and takes
+the tuple. Its genuine native MsgStorageAppend becomes FIFO disk work: verify
+the complete token payload, open its owned reader, SaveSnap and Save/Sync.
+The apply actor then restores the FSM, namespace configuration and durable
+index. Disk work closes the reader, persists peers and performs Release.
+The owner installs MemoryStorage and publishes configuration/applied state
+before routing the original opaque responses. Ordinary append completions
+remain retained in sequence while installation is active. Old-term native
+snapshot receipts still reach RawNode; they are not treated as stale network
+messages. FSM restore consumes the verified reader on the apply actor;
+transport streaming/spooling retains its existing I/O and validation path.
+
+Received-file protections become registered leases at ingress admission, not
+only when the owner consumes ingress. Failure and Close stop admission and
+pump real completions. Disk finalization joins the apply actor before closing
+remaining handles/readers; final owner retirement releases tuple/history pins
+and reservations. No timeout manufactures successful or aborted completion.
+The registry rejects new ownership after finalization. Cold-start restoration,
+external restore lineage and retained-restorable-snapshot validation are not
+replaced or bypassed by this runtime.
+
+Native tests exercise three voters, real WAL/MemoryStorage, streamed gRPC
+snapshot payloads, receiver heartbeat responses during held SaveSnap/restore/
+Release, local capture/serialization/handle Close/durable-index holds, opaque
+response suppression, actor joins, failure/reopen, and real Pebble/KV native
+and SST-ingest snapshots. V1/V2 controls verify an older captured prefix stays
+unchanged through a later deferred membership capture, then select the newer
+local checkpoint and membership on reopen. Unit controls preserve all joint
+ConfState fields, prune behind pins, retain pinned older file pairs, verify
+full CRCs, and reject new leases after finalization. This preserves fields;
+it does not broaden the existing joint-membership admission policy.
+
+Two new-path regressions were reproduced before correction: queued volatile
+work covered by a received snapshot was re-applied after restore, and received
+file protection survived shutdown when its ingress had not been consumed.
+The implementation now discards snapshot-covered queued work without creating
+proposal receipts and includes unconsumed ingress in post-join cleanup. The
+configuration ordering test also observes owner publication directly instead
+of assuming its caller's forwarding goroutine has already run.

@@ -16,8 +16,7 @@ import (
 )
 
 var (
-	errStoragePipelineUnsupported = errors.New("asynchronous storage prototype does not support snapshot installation or local checkpoints")
-	errStoragePipelineResource    = errors.New("asynchronous storage prototype terminal resource limit")
+	errStoragePipelineResource = errors.New("asynchronous storage prototype terminal resource limit")
 )
 
 const (
@@ -36,6 +35,7 @@ const (
 type pipelineIngress struct {
 	message raftpb.Message
 	permit  *storageWorkPermit
+	lease   *pipelineSnapshotLease
 }
 
 type pipelineTask struct {
@@ -50,6 +50,8 @@ type pipelineTask struct {
 	configDisk    *pipelineConfigurationRequest
 	configEnv     pipelineConfigurationEnvironment
 	configPermits []*storageWorkPermit
+	snapshotPlan  *pipelineSnapshotPlan
+	snapshotStage pipelineSnapshotStage
 }
 
 // engineStoragePipeline is an unactivated runtime. Its own
@@ -88,20 +90,35 @@ type engineStoragePipeline struct {
 	configurationHistoryBudget        *storageWorkBudget
 	configurationHistory              []pipelineConfigurationRetention
 	configuration                     *pipelineConfigurationPlan
+	snapshotResources                 *pipelineSnapshotResources
+	snapshotFiles                     *pipelineSnapshotFiles
+	snapshotBudget                    *storageWorkBudget
+	snapshotIngressBudget             *storageWorkBudget
+	snapshotPins                      map[*pipelineSnapshotPlan]uint64
+	checkpoint                        *pipelineSnapshotPlan
+	checkpointAttempt                 uint64
+	receiving                         *pipelineSnapshotPlan
+	heldSnapshotDisk                  []storageWorkCompletion
+	receivedApplyFloor                uint64 // apply actor only
+	publishedSnapshotFloor            uint64 // owner only
 }
 
 func newEngineStoragePipeline(persist etcdstorage.Storage) (*engineStoragePipeline, error) {
 	if persist == nil {
 		return nil, errors.WithStack(errInvalidAsyncStorageAppend)
 	}
-	disk, err := newStorageWorker(pipelineActorQueue)
+	apply, err := newStorageWorker(pipelineActorQueue)
 	if err != nil {
 		return nil, err
 	}
-	apply, err := newStorageWorker(pipelineActorQueue)
+	resources := &pipelineSnapshotResources{}
+	disk, err := newFinalizingStorageWorker(pipelineActorQueue, func() error {
+		<-apply.done
+		return resources.closeAll()
+	})
 	if err != nil {
-		disk.quiesce()
-		<-disk.done
+		apply.quiesce()
+		<-apply.done
 		return nil, err
 	}
 	p := &engineStoragePipeline{
@@ -122,6 +139,10 @@ func newEngineStoragePipeline(persist etcdstorage.Storage) (*engineStoragePipeli
 		priority:                   make(chan pipelineIngress, pipelineControlItems),
 		configurationBudget:        newStorageWorkBudget(pipelineControlBytes, pipelineControlItems),
 		configurationHistoryBudget: newStorageWorkBudget(pipelineControlBytes, pipelineControlItems),
+		snapshotResources:          resources,
+		snapshotBudget:             newStorageWorkBudget(pipelineBulkBytes, pipelineActorQueue),
+		snapshotIngressBudget:      newStorageWorkBudget(pipelineBulkBytes, pipelineActorQueue),
+		snapshotPins:               make(map[*pipelineSnapshotPlan]uint64),
 	}
 	return p, nil
 }
@@ -168,14 +189,11 @@ func (e *Engine) enqueuePipelineStep(ctx context.Context, message raftpb.Message
 }
 
 func validatePipelineIngress(message *raftpb.Message) error {
-	if message.GetType() == raftpb.MsgSnap || !etcdraft.IsEmptySnap(message.Snapshot) {
-		return errors.WithStack(errStoragePipelineUnsupported)
-	}
 	if etcdraft.IsLocalMsg(message.GetType()) || etcdraft.IsLocalMsgTarget(message.GetFrom()) ||
-		etcdraft.IsLocalMsgTarget(message.GetTo()) {
+		etcdraft.IsLocalMsgTarget(message.GetTo()) || len(message.Responses) > 0 {
 		return errors.WithStack(etcdraft.ErrStepLocalMsg)
 	}
-	return nil
+	return validatePipelineSnapshotIngress(message)
 }
 
 // Called with ingressMu held, including the stop-admission check.
@@ -190,13 +208,22 @@ func (e *Engine) admitPipelineStep(message raftpb.Message) error {
 		e.stepQueueFullCount.Add(1)
 		return errors.WithStack(errStepQueueFull)
 	}
+	if message.GetType() == raftpb.MsgSnap {
+		budget = p.snapshotIngressBudget
+	}
 	permit, err := budget.tryAcquire(pipelineMessageBytes(&message))
 	if err == nil {
 		detachPipelineMessage(&message)
+		lease, err := p.snapshotIngressLease(&message)
+		if err != nil {
+			permit.Release()
+			return err
+		}
 		select {
-		case ch <- pipelineIngress{message: message, permit: permit}:
+		case ch <- pipelineIngress{message: message, permit: permit, lease: lease}:
 			return nil
 		default:
+			p.snapshotResources.forget(lease)
 			permit.Release()
 		}
 	}
@@ -246,9 +273,6 @@ func (e *Engine) stepPipelineResponse(message *raftpb.Message) error {
 }
 
 func (e *Engine) sendPipelineMessage(message *raftpb.Message) error {
-	if message.GetType() == raftpb.MsgSnap || !etcdraft.IsEmptySnap(message.Snapshot) {
-		return errors.WithStack(errStoragePipelineUnsupported)
-	}
 	if e.skipDispatchMessage(*message) {
 		return nil
 	}
@@ -311,9 +335,6 @@ func (e *Engine) foldPipelineReady() error {
 }
 
 func (e *Engine) routePipelineReady(rd etcdraft.Ready) error {
-	if !etcdraft.IsEmptySnap(rd.Snapshot) {
-		return errors.WithStack(errStoragePipelineUnsupported)
-	}
 	for _, message := range rd.Messages {
 		if err := e.routePipelineReadyMessage(message); err != nil {
 			return err
@@ -366,7 +387,7 @@ func detachPipelineMessage(message *raftpb.Message) {
 func (e *Engine) queuePipelineAppend(message *raftpb.Message) error {
 	p := e.storagePipeline
 	if !etcdraft.IsEmptySnap(message.Snapshot) {
-		return errors.WithStack(errStoragePipelineUnsupported)
+		return e.queuePipelineReceivedSave(message)
 	}
 	if err := p.ledger.retain(message); err != nil {
 		return errors.Wrap(errStoragePipelineResource, err.Error())
@@ -409,7 +430,7 @@ func (e *Engine) queuePipelineAppend(message *raftpb.Message) error {
 func (e *Engine) queuePipelineApply(message *raftpb.Message) error {
 	p := e.storagePipeline
 	if message.GetTo() != etcdraft.LocalApplyThread || !etcdraft.IsEmptySnap(message.Snapshot) {
-		return errors.WithStack(errStoragePipelineUnsupported)
+		return errors.WithStack(errInvalidStorageWork)
 	}
 	permit, err := p.applyBudget.tryAcquire(pipelineMessageBytes(message))
 	if err != nil {
@@ -439,6 +460,11 @@ func (p *engineStoragePipeline) executePipelineApply(task *pipelineTask) error {
 	for i, input := range task.inputs {
 		if err := p.firstFailure(nil); err != nil {
 			return err
+		}
+		if input.index <= p.receivedApplyFloor {
+			// Unlike cold-start volatile replay, a live received snapshot has
+			// already restored this whole prefix, including volatile state.
+			continue
 		}
 		if task.message.Entries[i].GetType() != raftpb.EntryNormal {
 			if err := p.executePipelineConfiguration(task, task.message.Entries[i]); err != nil {
@@ -495,22 +521,36 @@ func (task *pipelineTask) retire() {
 
 func (e *Engine) completePipelineDisk(completion storageWorkCompletion) error {
 	p := e.storagePipeline
-	defer completion.Release()
 	task, ok := completion.token.(*pipelineTask)
 	if !ok || task == nil {
 		return errors.WithStack(errInvalidStorageWork)
 	}
+	if task.snapshotPlan != nil {
+		defer completion.Release()
+		return e.completePipelineSnapshotDisk(task, completion.err)
+	}
+	if p.receiving != nil && task.configDisk == nil && completion.err == nil {
+		p.heldSnapshotDisk = append(p.heldSnapshotDisk, completion)
+		p.diskRetired = maxUint64(p.diskRetired, task.diskSequence)
+		return nil
+	}
+	defer completion.Release()
 	defer task.retire()
 	p.diskOutstanding--
-	p.diskRetired = task.diskSequence
+	p.diskRetired = maxUint64(p.diskRetired, task.diskSequence)
+	return e.publishPipelineAppend(task, completion.err)
+}
+
+func (e *Engine) publishPipelineAppend(task *pipelineTask, err error) error {
+	p := e.storagePipeline
 	if task.configDisk != nil {
-		return e.completePipelineConfigurationDisk(task.configDisk, completion.err)
+		return e.completePipelineConfigurationDisk(task.configDisk, err)
 	}
-	if completion.err != nil {
-		return completion.err
+	if err != nil {
+		return err
 	}
-	if p.firstFailure(nil) != nil {
-		return nil
+	if failure := p.firstFailure(nil); failure != nil {
+		return failure
 	}
 	message := task.message
 	// MemoryStorage publication is owner-only and follows real Save/Sync.
@@ -533,6 +573,9 @@ func (e *Engine) completePipelineApply(completion storageWorkCompletion) error {
 	}
 	defer task.retire()
 	p.applyOutstanding--
+	if task.snapshotPlan != nil {
+		return e.completePipelineSnapshotApply(task, completion.err)
+	}
 	if err := e.publishPipelineReceipts(task.receipts); err != nil {
 		return err
 	}
@@ -546,7 +589,7 @@ func (e *Engine) completePipelineApply(completion storageWorkCompletion) error {
 	if p.firstFailure(nil) != nil {
 		return nil
 	}
-	return e.routePipelineResponses(task.message.Responses)
+	return e.routePipelineApplyResponses(task.message.Responses)
 }
 
 func (e *Engine) publishPipelineReceipts(receipts []normalApplyReceipt) error {
@@ -569,7 +612,7 @@ func (e *Engine) publishPipelineReceipts(receipts []normalApplyReceipt) error {
 
 func (e *Engine) stepPipelineOwner(message *raftpb.Message) error {
 	if message.GetType() == raftpb.MsgSnap || !etcdraft.IsEmptySnap(message.Snapshot) {
-		return errors.WithStack(errStoragePipelineUnsupported)
+		return e.queuePipelineReceivedFront(message)
 	}
 	e.recordLeaderContact(*message)
 	if err := e.rawNode.Step(message); err != nil {
@@ -663,6 +706,9 @@ func retirePipelineDeferred(queue *[]*pipelineTask, outstanding *int) {
 		if task.configDisk != nil {
 			task.configDisk.reply <- pipelineConfigurationReply{err: errStorageWorkerClosed}
 		}
+		if task.snapshotPlan != nil && (task.snapshotStage == pipelineReceivedSave || task.snapshotStage == pipelineReceivedRelease) {
+			task.snapshotPlan.frontReply <- errStorageWorkerClosed
+		}
 		task.retire()
 		*outstanding--
 	}
@@ -705,6 +751,7 @@ func (p *engineStoragePipeline) retireIngress() {
 func (e *Engine) runStoragePipeline() {
 	p := e.storagePipeline
 	p.applyCursor = e.applied
+	e.initPipelineSnapshotFiles()
 	ticker := time.NewTicker(e.tickInterval)
 	defer ticker.Stop()
 	completions := pipelineCompletionStreams{disk: p.disk.completions, apply: p.apply.completions}
@@ -738,6 +785,7 @@ func (e *Engine) preparePipelineTurn() (bool, error) {
 	if failure := p.firstFailure(nil); failure != nil {
 		e.beginPipelineShutdown(failure)
 		if !p.actorsQuiesced {
+			e.retireHeldSnapshotDisk()
 			p.stopActorsOnFailure()
 		}
 		return false, nil
@@ -755,6 +803,9 @@ func (e *Engine) progressPipelineActors() (bool, error) {
 	p := e.storagePipeline
 	if p.actorsQuiesced {
 		return false, nil
+	}
+	if err := e.maybeQueuePipelineCheckpoint(); err != nil {
+		return false, err
 	}
 	if err := p.flush(); err != nil {
 		return false, err
@@ -780,6 +831,7 @@ func (e *Engine) finishStoragePipeline() {
 	<-p.disk.done
 	<-p.apply.done
 	e.rawNode = nil
+	e.retirePipelineSnapshotPins()
 	p.retireConfigurationHistory()
 	e.snapshotConfigurations = snapshotConfigurationHistory{}
 	p.configuration = nil
@@ -859,6 +911,7 @@ func (e *Engine) handlePipelineAdmin() {
 
 func (e *Engine) tickPipeline() {
 	if e.storagePipeline.firstFailure(nil) == nil {
+		e.storagePipeline.checkpointAttempt = 0
 		e.rawNode.Tick()
 	}
 }
@@ -874,6 +927,9 @@ func (e *Engine) consumePipelineDisk(completion storageWorkCompletion, open bool
 		streams.disk = nil
 		return nil
 	}
+	if _, ok := completion.token.(pipelineSnapshotFinalization); ok {
+		return completion.err
+	}
 	return e.completePipelineDisk(completion)
 }
 
@@ -881,6 +937,9 @@ func (e *Engine) consumePipelineApply(completion storageWorkCompletion, open boo
 	if !open {
 		streams.apply = nil
 		return nil
+	}
+	if request, ok := completion.token.(*pipelineSnapshotRequest); ok {
+		return e.handlePipelineSnapshotRequest(request)
 	}
 	if request, ok := completion.token.(*pipelineConfigurationRequest); ok {
 		return e.handlePipelineConfiguration(*request)
@@ -909,7 +968,13 @@ func (e *Engine) consumePipelineIngress(input pipelineIngress) error {
 	if err := e.storagePipeline.firstFailure(nil); err != nil {
 		return err
 	}
-	if err := e.stepPipelineOwner(&input.message); err != nil {
+	var err error
+	if input.lease != nil {
+		err = e.queuePipelineReceivedFrontWithLease(&input.message, input.lease)
+	} else {
+		err = e.stepPipelineOwner(&input.message)
+	}
+	if err != nil {
 		return err
 	}
 	// Transfer ownership to emitted work/unstable before ingress retirement.
