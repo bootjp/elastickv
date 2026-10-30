@@ -17,6 +17,7 @@ import (
 type crashBoundaryContext struct {
 	context.Context
 	waiting chan struct{}
+	errRead chan error
 	once    sync.Once
 }
 
@@ -25,10 +26,16 @@ func (c *crashBoundaryContext) Done() <-chan struct{} {
 	return c.Context.Done()
 }
 
+func (c *crashBoundaryContext) Err() error {
+	err := c.Context.Err()
+	c.errRead <- err
+	return err
+}
+
 func TestKillAfterPrimaryCommitAcceptedSignalCannotResume(t *testing.T) {
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
-	observed := &crashBoundaryContext{Context: ctx, waiting: make(chan struct{})}
+	observed := &crashBoundaryContext{Context: ctx, waiting: make(chan struct{}), errRead: make(chan error, 1)}
 	primary := &stubTransactional{}
 	type signalCall struct {
 		pid    int
@@ -70,21 +77,18 @@ func TestKillAfterPrimaryCommitAcceptedSignalCannotResume(t *testing.T) {
 	contents, err := os.ReadFile(marker)
 	require.NoError(t, err)
 	require.Equal(t, "primary committed", string(contents))
-	select {
-	case <-observed.waiting:
-		require.NoError(t, ctx.Err(), "the hook must reach its wait before cancellation")
-	case <-finished:
-		result := <-resultCh
-		t.Fatalf("crash hook returned after an accepted SIGKILL: response=%+v err=%v", result.response, result.err)
-	case <-time.After(time.Second):
-		t.Fatal("crash hook neither waited for cancellation nor returned")
-	}
+	testutil.Closed(t, observed.waiting, time.Second, "crash hook did not observe cancellation channel")
+	require.NoError(t, ctx.Err(), "the hook must reach its wait before cancellation")
 	cancel()
 	result := testutil.Recv(t, resultCh, time.Second, "crash hook did not return after cancellation")
 	require.Nil(t, result.response)
 	require.ErrorIs(t, result.err, context.Canceled)
 	testutil.Closed(t, finished, time.Second, "crash hook caller did not finish")
 	require.Empty(t, continued, "a successful crash-hook return would resume secondary commit")
+	// A premature context.Canceled return cannot pass just because waiting and
+	// finished become ready together. Require the hook's actual post-wait Err read.
+	require.Len(t, observed.errRead, 1, "the hook must obtain its returned error from the canceled context")
+	require.ErrorIs(t, <-observed.errRead, context.Canceled)
 }
 
 func TestKillAfterPrimaryCommitSignalErrorCannotReturnSuccess(t *testing.T) {
