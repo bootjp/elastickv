@@ -649,6 +649,9 @@ func (s *SQSServer) loadQueueMetaForSend(ctx context.Context, queueName string, 
 	if !exists {
 		return nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrQueueDoesNotExist, "queue does not exist")
 	}
+	if err := checkFifoDelayReady(meta); err != nil {
+		return nil, readTimestamp, err
+	}
 	// AWS rejects SendMessage when MessageBody is empty (InvalidParameterValue
 	// "Message body cannot be empty"). Silently enqueuing a zero-length
 	// message would let producer bugs (missing serialization, a forgotten
@@ -1105,6 +1108,9 @@ func (s *SQSServer) dropReceiveFanoutCounter(queueName string) {
 // sqsMsgVisScanBoundsDispatch's legacy branch — byte-identical to
 // the pre-fanout scanAndDeliverOnce body.
 func (s *SQSServer) scanAndDeliverPartition(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, readTS uint64, deadline time.Time, pageSize int, opts sqsReceiveOptions) ([]map[string]any, error) {
+	if err := checkFifoDelayReady(meta); err != nil {
+		return nil, err
+	}
 	now := time.Now().UnixMilli()
 	start, end := sqsMsgVisScanBoundsDispatch(meta, queueName, partition, meta.Generation, now)
 	delivered := make([]map[string]any, 0, opts.Max)
@@ -1257,7 +1263,7 @@ func (s *SQSServer) loadCandidateRecord(ctx context.Context, queueName string, m
 		}
 		raw, err = groupGetter.GetGroupAt(ctx, cand.groupID, dataKey, readTS)
 	} else {
-		raw, err = s.store.GetAt(ctx, dataKey, readTS)
+		raw, err = s.getSQSAt(ctx, dataKey, readTS)
 	}
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
@@ -1289,6 +1295,7 @@ func (s *SQSServer) expireMessage(ctx context.Context, queueName string, meta *s
 		{Op: kv.Del, Key: dataKey},
 		{Op: kv.Del, Key: byAgeKey},
 	}
+	elems = appendFifoOrderDelete(elems, meta, queueName, partition, gen, rec)
 	// FIFO retention expiry must release the group lock so a successor
 	// in the same group can become deliverable. This mirrors the delete
 	// and redrive paths.
@@ -1691,6 +1698,7 @@ func (s *SQSServer) buildDeleteOps(ctx context.Context, queueName string, meta *
 		{Op: kv.Del, Key: visKey},
 		{Op: kv.Del, Key: byAgeKey},
 	}
+	elems = appendFifoOrderDelete(elems, meta, queueName, handle.Partition, handle.QueueGeneration, rec)
 	if rec.MessageGroupId != "" {
 		lockKey := sqsMsgGroupKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, rec.MessageGroupId)
 		lock, err := s.loadFifoGroupLock(ctx, queueName, meta, handle.Partition, handle.QueueGeneration, rec.MessageGroupId, readTS)
@@ -1755,7 +1763,7 @@ func (s *SQSServer) loadMessageForDelete(ctx context.Context, queueName string, 
 		return nil, nil, nil, readTimestamp, sqsDeleteProceed, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
 	}
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	raw, err := s.getSQSAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return meta, nil, nil, readTimestamp, sqsDeleteNoOp, nil
@@ -1916,7 +1924,7 @@ func (s *SQSServer) loadAndVerifyMessage(ctx context.Context, queueName string, 
 		return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "receipt handle is not valid for this queue")
 	}
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, handle.Partition, handle.QueueGeneration, handle.MessageIDHex)
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	raw, err := s.getSQSAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil, nil, readTimestamp, newSQSAPIError(http.StatusBadRequest, sqsErrReceiptHandleInvalid, "message not found")

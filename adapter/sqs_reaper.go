@@ -87,12 +87,7 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 			// the queue if loading itself failed (transient).
 			continue
 		}
-		if err := s.reapQueue(queueCtx, name, meta, readTS); err != nil {
-			slog.Warn("sqs reaper queue pass failed", "queue", name, "err", err)
-		}
-		if err := s.reapExpiredDedup(queueCtx, name, meta, readTS); err != nil {
-			slog.Warn("sqs dedup reaper pass failed", "queue", name, "err", err)
-		}
+		s.reapLoadedQueue(queueCtx, name, meta, readTS)
 	}
 	// Tombstones fire on DeleteQueue and outlive the meta row, so a
 	// purely meta-driven enumeration would never reach orphan keys
@@ -101,6 +96,28 @@ func (s *SQSServer) reapAllQueues(ctx context.Context) error {
 		slog.Warn("sqs reaper tombstone pass failed", "err", err)
 	}
 	return nil
+}
+
+func (s *SQSServer) reapLoadedQueue(ctx context.Context, name string, meta *sqsQueueMeta, readTS uint64) {
+	if s.resumeFifoDelayReindex(ctx, name, meta) {
+		return
+	}
+	if err := s.reapQueue(ctx, name, meta, readTS); err != nil {
+		slog.Warn("sqs reaper queue pass failed", "queue", name, "err", err)
+	}
+	if err := s.reapExpiredDedup(ctx, name, meta, readTS); err != nil {
+		slog.Warn("sqs dedup reaper pass failed", "queue", name, "err", err)
+	}
+}
+
+func (s *SQSServer) resumeFifoDelayReindex(ctx context.Context, name string, meta *sqsQueueMeta) bool {
+	if meta.DelayReindex == nil {
+		return false
+	}
+	if _, err := s.advanceFifoDelayReindex(ctx, name); err != nil {
+		slog.Warn("sqs FIFO delay recovery failed", "queue", name, "err", err)
+	}
+	return true
 }
 
 // reapTombstonedQueues enumerates every (queue, gen) tombstone left
@@ -704,7 +721,7 @@ func (s *SQSServer) reapOneRecordPartitioned(ctx context.Context, queueName stri
 // surface to the caller so a transient storage problem is logged and
 // retried on the next tick instead of silently scrubbing the index.
 func (s *SQSServer) loadDataForReaper(ctx context.Context, dataKey []byte, readTS uint64) (*sqsMessageRecord, bool, error) {
-	raw, err := s.store.GetAt(ctx, dataKey, readTS)
+	raw, err := s.getSQSAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil
@@ -904,6 +921,7 @@ func (s *SQSServer) buildReapOps(ctx context.Context, queueName string, meta *sq
 		{Op: kv.Del, Key: dataKey},
 		{Op: kv.Del, Key: visKey},
 	}
+	elems = appendFifoOrderDeleteAlways(elems, meta, queueName, partition, gen, parsed)
 	if parsed.MessageGroupId != "" {
 		lockKey := sqsMsgGroupKeyDispatch(meta, queueName, partition, gen, parsed.MessageGroupId)
 		lock, err := s.loadFifoGroupLock(ctx, queueName, meta, partition, gen, parsed.MessageGroupId, readTS)
