@@ -153,6 +153,11 @@ func newNativeSnapshotCluster(t *testing.T, leaderStage, receiverStage string) *
 
 func newNativeSnapshotClusterWithMachines(t *testing.T, leaderStage, receiverStage string, machines []pipelineNativeConfigurationStateMachine) *nativeSnapshotCluster {
 	t.Helper()
+	return newNativeSnapshotClusterWithHook(t, leaderStage, receiverStage, machines, func(*Engine, int) {})
+}
+
+func newNativeSnapshotClusterWithHook(t *testing.T, leaderStage, receiverStage string, machines []pipelineNativeConfigurationStateMachine, beforeRun func(*Engine, int)) *nativeSnapshotCluster {
+	t.Helper()
 	nodes, peers := newTransportTestNodes(t, 3)
 	startTransportTestServers(nodes, peers)
 	c := &nativeSnapshotCluster{nodes: nodes, wire: make(chan nativeSnapshotEnvelope, 4096), failures: map[uint64]error{}}
@@ -199,6 +204,7 @@ func newNativeSnapshotClusterWithMachines(t *testing.T, leaderStage, receiverSta
 		e.configIndex.Store(1)
 		node.engine = e
 		e.dispatchFn = c.dispatcher(node)
+		beforeRun(e, i)
 		require.NoError(t, e.recoverOpenConfiguration(prepared, e.applied))
 		e.initTransport(prepared.cfg)
 		e.refreshStatus()

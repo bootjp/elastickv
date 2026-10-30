@@ -333,6 +333,9 @@ func (e *Engine) foldPipelineReady() error {
 		}
 		p.failedReady, p.failedReadyPermit = nil, nil
 		permit.Release()
+		// Async Ready is accepted by Ready itself, not a later Advance. Only
+		// now release local drop feedback, including mandatory SnapshotFailure.
+		e.flushDeferredDispatchReports()
 	}
 	return nil
 }
@@ -702,6 +705,9 @@ func (e *Engine) beginPipelineShutdown(err error) {
 		}
 		e.mu.Unlock()
 	}
+	// Quiescence no longer consumes reliable transport reports. Signal their
+	// terminal escape before joining workers, without retiring an active request.
+	e.requestShutdown()
 }
 
 func retirePipelineDeferred(queue *[]*pipelineTask, outstanding *int) {
