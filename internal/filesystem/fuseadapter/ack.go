@@ -119,8 +119,13 @@ func (a *Adapter) processAcknowledgementBatch(ctx context.Context) bool {
 		}
 		a.replyMu.Lock()
 		delete(a.ackPending, id)
+		inode, unknownOpen := a.unknownOpens[id]
+		delete(a.unknownOpens, id)
 		progress = true
 		a.replyMu.Unlock()
+		if unknownOpen {
+			a.mutations.resolveUnknown(inode)
+		}
 	}
 	a.replyMu.Lock()
 	remaining := len(a.ackPending)

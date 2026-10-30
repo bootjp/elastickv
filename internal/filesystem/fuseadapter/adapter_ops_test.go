@@ -89,6 +89,15 @@ type journalLifecycleCore struct {
 	releaseID filesystem.OperationID
 }
 
+type resolvingOpenCore struct {
+	*journalLifecycleCore
+	ackErr error
+}
+
+func (c *resolvingOpenCore) AcknowledgeOperation(context.Context, filesystem.OperationID) error {
+	return c.ackErr
+}
+
 type journalLeaseCore struct {
 	*receiptCore
 	leaseIDs []filesystem.OperationID
@@ -228,6 +237,34 @@ func TestAdapterUnknownOpenStopsLaterFsync(t *testing.T) {
 	require.Equal(t, syscall.EIO, errno)
 	require.Equal(t, syscall.EIO, adapter.Fsync(t.Context(), 7, 9, false))
 	require.False(t, core.fsyncCalled)
+}
+
+func TestAdapterOpenRecoversAfterUnknownReplyIsAcknowledged(t *testing.T) {
+	session := filesystem.OperationSessionID{Filesystem: [16]byte{1}, Session: [16]byte{2}}
+	core := &resolvingOpenCore{journalLifecycleCore: &journalLifecycleCore{
+		receiptCore: &receiptCore{journalMetadataCore: &journalMetadataCore{
+			journalWriteCore: &journalWriteCore{fakeCore: &fakeCore{}},
+		}}, openErr: kv.ErrTransactionOutcomeUnknown,
+	}}
+	adapter := New(core, []byte("fuse-session"), WithHandleKeepaliveInterval(0), WithJournaledOpen(session))
+	adapter.ackCancel()
+	t.Cleanup(adapter.Close)
+
+	_, errno := adapter.Open(withReplyIdentity(t.Context(), 77), 7)
+	require.Equal(t, syscall.EIO, errno)
+	core.openErr = nil
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno, "the unknown attempt must block until its reply is resolved")
+
+	adapter.replyAttempted(77)
+	core.ackErr = context.DeadlineExceeded
+	require.False(t, adapter.processAcknowledgementBatch(t.Context()))
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Equal(t, syscall.EIO, errno, "an unresolved acknowledgement must retain the barrier")
+	core.ackErr = nil
+	require.False(t, adapter.processAcknowledgementBatch(t.Context()))
+	_, errno = adapter.Open(t.Context(), 7)
+	require.Zero(t, errno, "a resolved open must not poison later reads of the inode")
 }
 
 func (c *journalLifecycleCore) ReleaseWithOperation(_ context.Context, id filesystem.OperationID, _ uint64, _ uint64, _ []byte) error {

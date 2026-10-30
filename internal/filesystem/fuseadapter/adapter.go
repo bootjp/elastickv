@@ -78,6 +78,7 @@ type Adapter struct {
 	replyMu           sync.Mutex
 	replyIDs          map[uint64][]filesystem.OperationID
 	ackPending        map[filesystem.OperationID]struct{}
+	unknownOpens      map[filesystem.OperationID]uint64
 	ackCursor         uint64
 	ackWake           chan struct{}
 	ackCancel         context.CancelFunc
@@ -402,6 +403,13 @@ func (a *Adapter) openWithOperation(ctx context.Context, inode uint64) (uint64, 
 	fh, err := opener.OpenWithOperation(ctx, id, inode, a.clientID)
 	if err == nil {
 		a.recordReceipt(inode, id)
+	} else if errors.Is(err, kv.ErrTransactionOutcomeUnknown) {
+		a.replyMu.Lock()
+		if a.unknownOpens == nil {
+			a.unknownOpens = make(map[filesystem.OperationID]uint64)
+		}
+		a.unknownOpens[id] = inode
+		a.replyMu.Unlock()
 	}
 	if err != nil && Errno(err) == syscall.EIO {
 		slog.WarnContext(ctx, "filesystem FUSE open failed", "inode", inode, "error", err.Error())

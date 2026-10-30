@@ -344,8 +344,11 @@ Lease refresh also retries definitive conflicts. Other mutation paths can
 still return `EAGAIN`; this is an incremental implementation of the conflict
 semantics design. If a forwarded transaction's result is unknown, the mount
 returns `EIO`. An unresolved tracked mutation also leaves a sticky barrier
-error for the affected inode or directory until remount. Do not replay a
-non-idempotent operation after that error: it may already have committed.
+error for the affected inode or directory. For a journaled `open` that returned
+`EIO`, the barrier clears once the attempted reply is acknowledged and the
+journal has established a terminal, verified decision. Other unresolved
+mutations continue to block until remount. Do not replay a non-idempotent
+operation after that error: it may already have committed.
 An exhausted retry budget or full local mutation queue returns `EBUSY`;
 a queued request also has a 30-second wait bound. Genuine SQLite byte-range
 lock contention remains `SQLITE_BUSY`.
