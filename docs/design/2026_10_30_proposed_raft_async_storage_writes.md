@@ -814,6 +814,25 @@ encrypted Raft-WAL envelopes/cutover, key rotation, crash/rejoin, SST snapshots,
 full accounting/debt, or production activation. The fixture leaves Raft
 envelope cutover inactive; storage encryption is observed on real large values.
 
+A distinct small-payload native fixture starts with Raft envelope cutover
+already active. Three actual async engines use separate encrypted Pebble stores
+and real gRPC transport. Holding a follower's real WAL Sync with the third voter
+partitioned permits fresh heartbeats but no early ACK, quorum commit, FSM apply
+or client success. The fixture decrypts the actual stored Raft entry, restores
+a streamed snapshot, verifies its CRC and cutover header, and reopens a fresh
+FSM from that exact snapshot plus a later encrypted committed WAL tail. The
+snapshot retains its applied prefix and voter configuration; the tail remains
+outside the selected snapshot and is recovered by real WAL replay.
+
+Committed plaintext after active cutover, a tampered authentication tag and a
+missing Raft cipher each halt without advancing the applied prefix or returning
+client success. Reopening without the Raft cipher refuses the committed tail
+rather than silently downgrading it. The component passes race3 (12.980s), an
+independent parent race3 (13.093s), and full lint. This adds already-active
+envelope/clean-reopen evidence, not evidence of the cutover transition, key
+rotation, crash/rejoin, large envelope payloads or production activation. Those
+gates and physical accounting/Ready debt remain open.
+
 The independent process-kill fixture correction was merged as #1368 at
 e939af5ba6cf9eeb6c6a3eea7754107f5ee25363 after latest-push normal/security
 review and every CI gate. SIGKILL acceptance no longer returns success before
