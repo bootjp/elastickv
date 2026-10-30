@@ -399,6 +399,7 @@ type Engine struct {
 
 	snapshotConfigurations           snapshotConfigurationHistory
 	snapshotConfigurationReplayIndex uint64
+	configurationTransition          atomic.Bool
 	// voterCount is the count of nodes in the latest applied
 	// ConfState.Voters (including self if voter). isLearnerNode is the
 	// matching set membership lookup keyed by node ID. Both are written
@@ -1261,7 +1262,7 @@ func (e *Engine) LastQuorumAck() monoclock.Instant {
 	// sneaks past recordQuorumAck (or a tracker entry that survived a
 	// brief step-down/step-up window) could leak stale liveness into
 	// the caller's fast-path validation.
-	if !e.isLeader.Load() {
+	if !e.isLeader.Load() || e.configurationTransition.Load() {
 		return monoclock.Zero
 	}
 	if ns := e.singleNodeLeaderAckMonoNs.Load(); ns != 0 {
@@ -3131,22 +3132,30 @@ func (e *Engine) resolveProposal(commitIndex uint64, data []byte, response any) 
 // All four steps run on the single-threaded apply loop, so no extra
 // synchronization is needed.
 func (e *Engine) applyConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64, confState raftpb.ConfState) {
+	e.publishConfigChange(changeType, nodeID, context, index, confState)
+	e.resolveConfigChange(index, context)
+}
+
+func (e *Engine) publishConfigChange(changeType raftpb.ConfChangeType, nodeID uint64, context []byte, index uint64, confState raftpb.ConfState) {
 	e.refreshVoterCache(confState)
 	e.applyConfigPeerChange(changeType, nodeID, context)
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
-	e.resolveConfigChange(index, context)
 	e.alarmIfJoinedAsVoter(confState)
 }
 
 func (e *Engine) applyConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
+	e.publishConfigChangeV2(cc, index, confState)
+	e.resolveConfigChange(index, cc.GetContext())
+}
+
+func (e *Engine) publishConfigChangeV2(cc raftpb.ConfChangeV2, index uint64, confState raftpb.ConfState) {
 	e.refreshVoterCache(confState)
 	for _, change := range cc.GetChanges() {
 		e.applyConfigPeerChange(change.GetType(), change.GetNodeId(), cc.GetContext())
 	}
 	e.refreshConfigServers(confState)
 	e.setConfigIndex(index)
-	e.resolveConfigChange(index, cc.GetContext())
 	e.alarmIfJoinedAsVoter(confState)
 }
 
@@ -3785,6 +3794,9 @@ func (e *Engine) handleReadStates(states []etcdraft.ReadState) {
 }
 
 func (e *Engine) resolveReadyReads() {
+	if e.configurationTransition.Load() {
+		return
+	}
 	for _, req := range e.readyReads(e.applied) {
 		req.done <- readResult{index: req.target}
 	}

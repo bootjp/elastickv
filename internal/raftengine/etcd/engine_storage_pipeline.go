@@ -16,7 +16,7 @@ import (
 )
 
 var (
-	errStoragePipelineUnsupported = errors.New("asynchronous storage prototype does not support snapshots or configuration apply")
+	errStoragePipelineUnsupported = errors.New("asynchronous storage prototype does not support snapshot installation or local checkpoints")
 	errStoragePipelineResource    = errors.New("asynchronous storage prototype terminal resource limit")
 )
 
@@ -39,17 +39,20 @@ type pipelineIngress struct {
 }
 
 type pipelineTask struct {
-	work         storageWork
-	permit       *storageWorkPermit
-	message      *raftpb.Message
-	inputs       []normalApplyInput
-	receipts     []normalApplyReceipt // written by apply actor, read after completion
-	startup      bool
-	diskSequence uint64
-	diskFence    uint64
+	work          storageWork
+	permit        *storageWorkPermit
+	message       *raftpb.Message
+	inputs        []normalApplyInput
+	receipts      []normalApplyReceipt // written by apply actor, read after completion
+	startup       bool
+	diskSequence  uint64
+	diskFence     uint64
+	configDisk    *pipelineConfigurationRequest
+	configEnv     pipelineConfigurationEnvironment
+	configPermits []*storageWorkPermit
 }
 
-// engineStoragePipeline is an unactivated, normal-entry-only runtime. Its own
+// engineStoragePipeline is an unactivated runtime. Its own
 // queues have finite byte AND item reservations across deferred, executing and
 // unconsumed completion states. These are not the full ingress/unstable/outbound
 // atomic-Ready debt contract, nor a bound on durable MemoryStorage or FSM memory.
@@ -81,6 +84,10 @@ type engineStoragePipeline struct {
 	startupQueued, startupDone        bool
 	campaignChecked, started          bool
 	quiescing, actorsQuiesced         bool
+	configurationBudget               *storageWorkBudget
+	configurationHistoryBudget        *storageWorkBudget
+	configurationHistory              []pipelineConfigurationRetention
+	configuration                     *pipelineConfigurationPlan
 }
 
 func newEngineStoragePipeline(persist etcdstorage.Storage) (*engineStoragePipeline, error) {
@@ -110,9 +117,11 @@ func newEngineStoragePipeline(persist etcdstorage.Storage) (*engineStoragePipeli
 		priorityIngressBudget: newStorageWorkBudget(pipelineControlBytes, pipelineControlItems),
 		// One owner-held Ready is charged while routing it. On a terminal
 		// routing failure it stays retained until RawNode disposal and joins.
-		readyBudget: newStorageWorkBudget(pipelineBulkBytes, 1),
-		bulk:        make(chan pipelineIngress, pipelineBulkItems),
-		priority:    make(chan pipelineIngress, pipelineControlItems),
+		readyBudget:                newStorageWorkBudget(pipelineBulkBytes, 1),
+		bulk:                       make(chan pipelineIngress, pipelineBulkItems),
+		priority:                   make(chan pipelineIngress, pipelineControlItems),
+		configurationBudget:        newStorageWorkBudget(pipelineControlBytes, pipelineControlItems),
+		configurationHistoryBudget: newStorageWorkBudget(pipelineControlBytes, pipelineControlItems),
 	}
 	return p, nil
 }
@@ -408,6 +417,7 @@ func (e *Engine) queuePipelineApply(message *raftpb.Message) error {
 	}
 	detachPipelineMessage(message)
 	task := &pipelineTask{permit: permit, message: message, inputs: make([]normalApplyInput, len(message.Entries)), diskFence: p.diskIssued}
+	task.configEnv = pipelineConfigurationEnvironment{fsm: e.fsm, dataDir: e.dataDir, fsmSnapDir: e.fsmSnapDir, maxWALFiles: e.maxWALFiles}
 	for i, entry := range message.Entries {
 		task.inputs[i] = e.prepareNormalApply(*entry, false)
 	}
@@ -431,7 +441,10 @@ func (p *engineStoragePipeline) executePipelineApply(task *pipelineTask) error {
 			return err
 		}
 		if task.message.Entries[i].GetType() != raftpb.EntryNormal {
-			return errors.WithStack(errStoragePipelineUnsupported)
+			if err := p.executePipelineConfiguration(task, task.message.Entries[i]); err != nil {
+				return err
+			}
+			continue
 		}
 		input.duplicate = input.index <= p.applyCursor
 		receipt := executeNormalApply(input)
@@ -473,6 +486,9 @@ func (p *engineStoragePipeline) flush() error {
 
 func (task *pipelineTask) retire() {
 	permit := task.permit
+	for _, configPermit := range task.configPermits {
+		configPermit.Release()
+	}
 	*task = pipelineTask{}
 	permit.Release()
 }
@@ -487,6 +503,9 @@ func (e *Engine) completePipelineDisk(completion storageWorkCompletion) error {
 	defer task.retire()
 	p.diskOutstanding--
 	p.diskRetired = task.diskSequence
+	if task.configDisk != nil {
+		return e.completePipelineConfigurationDisk(task.configDisk, completion.err)
+	}
 	if completion.err != nil {
 		return completion.err
 	}
@@ -641,6 +660,9 @@ func (e *Engine) beginPipelineShutdown(err error) {
 
 func retirePipelineDeferred(queue *[]*pipelineTask, outstanding *int) {
 	for _, task := range *queue {
+		if task.configDisk != nil {
+			task.configDisk.reply <- pipelineConfigurationReply{err: errStorageWorkerClosed}
+		}
 		task.retire()
 		*outstanding--
 	}
@@ -703,7 +725,7 @@ func (e *Engine) runStoragePipeline() {
 		if !p.quiescing {
 			e.refreshStatus()
 			e.resolveReadyReads()
-			e.rejectPipelineAdmin()
+			e.handlePipelineAdmin()
 		}
 		if err := e.selectPipelineEvent(ticker.C, &completions); err != nil {
 			e.beginPipelineShutdown(err)
@@ -758,6 +780,9 @@ func (e *Engine) finishStoragePipeline() {
 	<-p.disk.done
 	<-p.apply.done
 	e.rawNode = nil
+	p.retireConfigurationHistory()
+	e.snapshotConfigurations = snapshotConfigurationHistory{}
+	p.configuration = nil
 	p.failedReady = nil
 	p.failedReadyPermit.Release()
 	p.failedReadyPermit = nil
@@ -820,12 +845,14 @@ func (e *Engine) selectPipelineEvent(tick <-chan time.Time, completions *pipelin
 	return nil
 }
 
-func (e *Engine) rejectPipelineAdmin() {
-	// This prototype cannot order configuration/snapshot durability. Reject
-	// without mutating Raft; an unsupported admin caller can wait at most a tick.
+func (e *Engine) handlePipelineAdmin() {
 	select {
 	case request := <-e.adminCh:
-		request.done <- adminResult{err: errors.WithStack(errStoragePipelineUnsupported)}
+		if e.configurationTransition.Load() {
+			request.done <- adminResult{err: errors.WithStack(errMembershipConfChangePending)}
+		} else {
+			e.handleAdmin(request)
+		}
 	default:
 	}
 }
@@ -854,6 +881,9 @@ func (e *Engine) consumePipelineApply(completion storageWorkCompletion, open boo
 	if !open {
 		streams.apply = nil
 		return nil
+	}
+	if request, ok := completion.token.(*pipelineConfigurationRequest); ok {
+		return e.handlePipelineConfiguration(*request)
 	}
 	return e.completePipelineApply(completion)
 }

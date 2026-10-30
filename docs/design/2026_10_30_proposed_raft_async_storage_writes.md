@@ -374,7 +374,7 @@ prefix failure and deterministic shutdown/snapshot gates. The actual held-user-
 Save heartbeat failure and unchanged near-64-MiB quorum gate remain open. Do not
 enable AsyncStorageWrites until their full integration requirements above pass.
 
-### Unactivated normal-entry owner pipeline
+### Initial unactivated normal-entry owner pipeline
 
 An explicit internal Engine construction now exercises a native
 `AsyncStorageWrites` RawNode with owner-only mutation, FIFO disk/apply actors,
@@ -574,3 +574,47 @@ repository lint (zero issues). A separate broad local default-timeout trial
 failed during full-length gRPC sequences and backup/FUSE deadline tests under
 parallel load; isolated unchanged deadline cases pass. This is not an all-Go
 pass or a replacement for final-push CI's existing split full-race workflow.
+
+### Unactivated configuration owner/apply handshake
+
+The internal async runtime now handles committed ConfChange and ConfChangeV2
+instead of rejecting them as unsupported. It remains unavailable through
+production Open. Normal local checkpoints and received snapshot installation,
+their pins/ownership, full physical budgets and debt-driven admission remain
+required before activation; no near-64-MiB quorum or production throughput
+claim follows from this checkpoint.
+
+The apply actor pauses its ordered stream at a configuration and sends typed
+callbacks through its completion stream while retaining the enclosing task.
+The owner alone mutates RawNode, plans the immutable ConfState/peer inventory
+and publishes MemoryStorage, peer/configuration caches and outcomes. Namespace
+configuration recording, FSM snapshot serialization/durable-index updates and
+peer-file/WAL snapshot I/O run on actors. SaveSnap precedes MemoryStorage
+snapshot publication; release/cleanup precedes final configuration publication.
+The task's opaque apply response is held through all configuration work and
+any following entries, not released at the callback boundary.
+
+Lease anchors are withdrawn during the unpublished configuration transition,
+and ready reads do not consume a mixed configuration/FSM image. Publication
+resets the anchor before normal progress resumes. Synchronous call sites retain
+their previous publication/result sequence; the new transition flag is only
+set by the internal async path. All changed publication, namespace, lease and
+ready-read callers were audited. Configuration plans and retained prefix history
+have separate finite byte/item reservations and are released after actual
+completion/disposal, not after merely requesting cancellation.
+
+Native RawNode/WAL tests cover V1/V2, held configuration recording, snapshot
+capture, durable-index update, SaveSnap and Release, subsequent apply ordering,
+whole-task opaque response release, self-removal, errors and completion-pumping
+quiescence. A Unix FIFO withholds bytes from the actual peer-file reader while
+the owner demonstrates native heartbeat progress; this is not a sleeping disk
+mock. Real Pebble/KV snapshot/reopen controls check data and membership. These
+clean-reopen and injected-boundary results do not prove arbitrary power loss,
+the future protected-policy journal, or encrypted three-voter activation.
+
+Before parent integration, the writer's new configuration selection passes three
+race repetitions (33.536s); engine race passes 63.354s, excluding only the
+pre-existing untracked synchronous heartbeat diagnostic, and full lint has zero
+issues. The diagnostic remains unchanged and outside the published tree.
+Independent review, main-dependency integration, exact staged-only export and
+final-push normal/security review plus all CI are separate publication gates.
