@@ -39,12 +39,18 @@ func validateReplicatedControlState(ctx context.Context, key, value []byte) erro
 }
 
 func (s *mvccStore) ApplyReplicatedControlState(ctx context.Context, key, value []byte, _ uint64) (bool, error) {
+	if sc := s.memoryEntryScope(ctx); sc != nil {
+		ok, err := sc.staged.ApplyReplicatedControlState(ctx, key, value, 0)
+		return ok, sc.result(err)
+	}
 	if err := validateReplicatedControlState(ctx, key, value); err != nil {
 		return false, err
 	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
-	if value, exists := s.tree.Get(key); exists {
+	if value, exists := s.entryTreeGet(key); exists {
 		versions, _ := value.([]VersionedValue)
 		for _, version := range versions {
 			if version.TS != 0 || version.Tombstone || version.ExpireAt != 0 {

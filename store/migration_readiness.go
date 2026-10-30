@@ -70,11 +70,16 @@ func validateMigrationTransferSizeGuard(state TargetStagedReadinessState) error 
 	return nil
 }
 
-func (s *mvccStore) ApplyTargetStagedReadiness(_ context.Context, state TargetStagedReadinessState) error {
+func (s *mvccStore) ApplyTargetStagedReadiness(ctx context.Context, state TargetStagedReadinessState) error {
+	if sc := s.memoryEntryScope(ctx); sc != nil {
+		return s.stageMemoryReadiness(ctx, sc, state, 0)
+	}
 	if err := validateTargetStagedReadinessState(state); err != nil {
 		return err
 	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if _, retired := s.migrationRetired[state.JobID]; retired {
 		return errors.WithStack(ErrMigrationRetired)
@@ -89,21 +94,33 @@ func (s *mvccStore) ApplyTargetStagedReadiness(_ context.Context, state TargetSt
 	return nil
 }
 
-func (s *mvccStore) ApplyTargetStagedReadinessAt(ctx context.Context, state TargetStagedReadinessState, _ uint64) error {
+func (s *mvccStore) ApplyTargetStagedReadinessAt(ctx context.Context, state TargetStagedReadinessState, index uint64) error {
+	if sc := s.memoryEntryScope(ctx); sc != nil {
+		return s.stageMemoryReadiness(ctx, sc, state, index)
+	}
 	return s.ApplyTargetStagedReadiness(ctx, state)
 }
 
-func (s *mvccStore) MigrationTargetReadinessStates(_ context.Context) ([]TargetStagedReadinessState, error) {
+func (s *mvccStore) MigrationTargetReadinessStates(ctx context.Context) ([]TargetStagedReadinessState, error) {
+	if staged := s.memoryEntryStore(ctx); staged != nil {
+		return staged.MigrationTargetReadinessStates(ctx)
+	}
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
-	return cloneTargetStagedReadinessStates(s.migrationReadinessCache), nil
+	return mergedEntryReadiness(s.migrationReadinessCache, s.readinessOverlay), nil
 }
 
-func (s *pebbleStore) ApplyTargetStagedReadiness(_ context.Context, state TargetStagedReadinessState) error {
+func (s *pebbleStore) ApplyTargetStagedReadiness(ctx context.Context, state TargetStagedReadinessState) error {
+	if sc := s.raftEntryScopeFrom(ctx); sc != nil {
+		return s.stageEntryReadiness(ctx, sc, state, 0)
+	}
 	return s.applyTargetStagedReadiness(state, 0, false)
 }
 
-func (s *pebbleStore) ApplyTargetStagedReadinessAt(_ context.Context, state TargetStagedReadinessState, appliedIndex uint64) error {
+func (s *pebbleStore) ApplyTargetStagedReadinessAt(ctx context.Context, state TargetStagedReadinessState, appliedIndex uint64) error {
+	if sc := s.raftEntryScopeFrom(ctx); sc != nil {
+		return s.stageEntryReadiness(ctx, sc, state, appliedIndex)
+	}
 	return s.applyTargetStagedReadiness(state, appliedIndex, true)
 }
 
@@ -163,9 +180,12 @@ func stageTargetReadinessGuard(batch *pebble.Batch, state TargetStagedReadinessS
 	return nil
 }
 
-func (s *pebbleStore) MigrationTargetReadinessStates(_ context.Context) ([]TargetStagedReadinessState, error) {
+func (s *pebbleStore) MigrationTargetReadinessStates(ctx context.Context) ([]TargetStagedReadinessState, error) {
 	s.mtx.RLock()
 	defer s.mtx.RUnlock()
+	if sc := s.raftEntryScopeFrom(ctx); sc != nil {
+		return mergedEntryReadiness(s.migrationReadinessCache, sc.readiness), nil
+	}
 	return cloneTargetStagedReadinessStates(s.migrationReadinessCache), nil
 }
 
