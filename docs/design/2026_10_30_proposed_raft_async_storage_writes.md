@@ -764,8 +764,10 @@ caller payload/context/unknown-field backing arrays and mutable protobuf headers
 Maintained regressions reproduced four 1-MiB backing arrays charged as only 783
 bytes, and accepted-message changes after caller mutation. These are now owned
 by the accepted queue item, including snapshot metadata, ConfState and unknown
-fields. Rejection makes no clone or queued item; the existing pre-Step error and
-separate control/snapshot admission behavior remain unchanged.
+fields. Budget rejection makes no clone. A full queue can reject after the
+reserved temporary clone; that permit is released and the untransferred lease
+is forgotten. The existing pre-Step error and separate control/snapshot
+admission behavior remain unchanged.
 
 The existing ingress reservation remains live through actual Step and folding
 the resulting Ready. Downstream actor/unstable reservations are separate; this
@@ -780,3 +782,45 @@ lane and was stopped with its stack saved; the corrected test observes the
 existing snapshot priority lane with a bounded receive, without changing
 production routing, payload size, assertions or engine timeouts. Final-source
 integration, independent review and fresh remote review/CI remain required.
+
+### Composition lifecycle corrections
+
+Independent native three-voter tests found two additional P2s. Fatal quiescence
+stopped consuming reliable snapshot reports without signaling their terminal
+escape: a full report channel prevented worker join and retained the outbound
+byte permit and file pin until an external Close. The owner now signals close
+after authority revocation and first-cause publication; actual dispatch request
+retirement still follows the worker's return, not the shutdown notification.
+
+Separately, a rejected snapshot's local SnapshotFailure stayed in a deferred
+list that only the synchronous loop flushed. Capacity returning did not release
+RawNode's StateSnapshot. The async owner now processes that feedback only after
+the emitted Ready has been accepted and successfully routed. Pinned Raft v3.7
+accepts Ready inside Ready(); SnapshotFailure pauses probing until a subsequent
+heartbeat, rather than immediately regenerating snapshots in an owner loop.
+Both failures were reproduced three times before correction. Maintained real
+gRPC/three-voter regressions and positive lifetime/pressure controls pass race3
+(18.300s), retaining the original failure checks and post-failure-only rescue.
+
+A separate native acceptance slice uses actual encrypted Pebble stores and
+three explicit async engines. With a real follower Sync held after large-entry
+Save, fresh heartbeat/read-index progress continues while quorum commit, ACK,
+FSM application and client success remain withheld. A 63.5-MiB value occupies
+one 66,584,616-byte Raft entry. After actual durable quorum, streamed snapshot
+catch-up and a fresh-FSM clean reopen retain the value digest, baseline,
+three-voter membership and matching durable/published applied prefix. Three
+race repetitions pass (37.260s), with full lint zero issues. This does not prove
+encrypted Raft-WAL envelopes/cutover, key rotation, crash/rejoin, SST snapshots,
+full accounting/debt, or production activation. The fixture leaves Raft
+envelope cutover inactive; storage encryption is observed on real large values.
+
+The independent process-kill fixture correction was merged as #1368 at
+e939af5ba6cf9eeb6c6a3eea7754107f5ee25363 after latest-push normal/security
+review and every CI gate. SIGKILL acceptance no longer returns success before
+process death; kill errors propagate. The original native recovery assertions
+remain unchanged. An additional premature-cancellation mutation escaped the
+first observer in 10/20 trials; the corrected observer rejects all 20. Its
+whole-KV race passes (105.064s), native SIGKILL/reopen race20 passes (26.798s),
+and full lint reports zero issues. That test-only correction is now included
+in this branch's main merge, so new composed-source checks can qualify the
+actual latest source rather than a lucky rerun of the old fault boundary.
