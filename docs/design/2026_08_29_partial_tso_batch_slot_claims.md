@@ -180,12 +180,20 @@ unchanged and this document remains Partial.
 
 Implementation order:
 
-1. Data-group atomic binding store and replay/conflict tests.
+1. Data-group atomic binding store and replay/conflict tests. The current
+   opt-in raw, one-phase and PREPARE FSM apply paths stage the binding and
+   creation in one indexed Raft entry, recompute the manifest digest on every
+   replica, and skip an exact replay. A local lookup checks both indexes for
+   unknown-outcome reconciliation, but a leader read barrier and remote
+   reconciliation path are not wired. Production admission rejects the new
+   operation-ID field until authenticated issuance and activation are wired.
 2. Authenticated issuance and primary/home admission path, including unknown
    outcome reconciliation and cross-group PREPARE/COMMIT/ABORT evidence.
 3. Physical-band group-0 reservation and versioned reservation response;
    prove no duplicate issuance across concurrent allocators, term changes,
-   ambiguous proposals, and ceiling renewal.
+   ambiguous proposals, and ceiling renewal. An opt-in local allocator now
+   commits the band end and tests those transitions. It still rejects active
+   Phase D, has no wire route, and cannot authorize writes.
 4. Whole-cluster activation gate, migration and rolling-upgrade tests, native
    fault campaigns, Jepsen, and throughput/latency comparison with the old
    per-window allocator. No production activation before all gates pass.

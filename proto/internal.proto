@@ -84,6 +84,11 @@ message Request {
   // creation epoch. Producers set it only after validating the unchanged
   // persistence timestamp against the durable TSO allocation range.
   uint64 timestamp_admission_floor = 8;
+  // timestamp_binding_operation_id is a stable retry identity for a
+  // data-group-bound creation. The receiving leader must authenticate the
+  // timestamp source before proposing this field; replicas recompute the
+  // manifest digest from the request rather than trusting a supplied hash.
+  bytes timestamp_binding_operation_id = 9;
 }
 
 message RaftCommand {
