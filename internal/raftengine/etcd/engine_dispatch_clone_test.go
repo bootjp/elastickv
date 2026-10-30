@@ -10,7 +10,7 @@ import (
 	"google.golang.org/protobuf/proto"
 )
 
-func TestCloneDispatchEntriesConcurrentWALMarshal(t *testing.T) {
+func TestCloneDispatchMessageConcurrentWALMarshal(t *testing.T) {
 	entry := &raftpb.Entry{
 		Type: entryTypePtr(raftpb.EntryNormal), Index: uint64Ptr(7), Term: uint64Ptr(3),
 		Data: bytes.Repeat([]byte("payload"), 128),
@@ -36,19 +36,19 @@ func TestCloneDispatchEntriesConcurrentWALMarshal(t *testing.T) {
 	}()
 	close(start)
 	for range 2048 {
-		cloned := cloneDispatchEntries([]*raftpb.Entry{entry})
+		cloned := cloneDispatchMessage(raftpb.Message{Entries: []*raftpb.Entry{entry}}).Entries
 		require.Len(t, cloned, 1)
 		require.True(t, proto.Equal(entry, cloned[0]))
 	}
 	require.NoError(t, <-finished)
 }
 
-func TestCloneDispatchEntriesPreservesWireFieldsAndOwnsPayload(t *testing.T) {
+func TestCloneDispatchMessagePreservesWireFieldsAndOwnsPayload(t *testing.T) {
 	entry := &raftpb.Entry{
 		Type: entryTypePtr(raftpb.EntryNormal), Index: uint64Ptr(0), Data: []byte("payload"),
 	}
 	entry.ProtoReflect().SetUnknown([]byte{0xa0, 0x06, 0x01})
-	cloned := cloneDispatchEntries([]*raftpb.Entry{nil, entry, {Data: []byte{}}})
+	cloned := cloneDispatchMessage(raftpb.Message{Entries: []*raftpb.Entry{nil, entry, {Data: []byte{}}}}).Entries
 	require.Len(t, cloned, 3)
 	require.Nil(t, cloned[0])
 	require.True(t, proto.Equal(entry, cloned[1]))
@@ -58,5 +58,18 @@ func TestCloneDispatchEntriesPreservesWireFieldsAndOwnsPayload(t *testing.T) {
 	cloned[1].Data[0] = 'X'
 	require.Equal(t, []byte("payload"), entry.Data)
 	require.True(t, proto.Equal(&raftpb.Entry{Data: []byte{}}, cloned[2]))
-	require.Nil(t, cloneDispatchEntries(nil))
+	require.Nil(t, cloneDispatchMessage(raftpb.Message{}).Entries)
+}
+
+func TestCloneDispatchMessageOwnsOptionalHeadersAndPreservesNestedNil(t *testing.T) {
+	original := raftpb.Message{Term: uint64Ptr(3), Responses: []*raftpb.Message{nil, {
+		Entries: []*raftpb.Entry{nil}, Term: uint64Ptr(4),
+	}}}
+	cloned := cloneDispatchMessage(original)
+	*original.Term = 9
+	*original.Responses[1].Term = 10
+	require.Equal(t, uint64(3), cloned.GetTerm())
+	require.Equal(t, uint64(4), cloned.Responses[1].GetTerm())
+	require.Nil(t, cloned.Responses[0])
+	require.Nil(t, cloned.Responses[1].Entries[0])
 }

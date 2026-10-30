@@ -595,6 +595,7 @@ type snapshotResult struct {
 
 type dispatchRequest struct {
 	msg               raftpb.Message
+	permit            *storageWorkPermit
 	snapshotUnpin     func()
 	snapshotCloseOnce *sync.Once
 }
@@ -2567,18 +2568,16 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	// is already full. The len/cap check is safe here because this function is
 	// only ever called from the single engine event-loop goroutine.
 	if len(ch) >= cap(ch) {
-		if msg.GetType() == raftpb.MsgHeartbeatResp && coalesceHeartbeatResp(ch, msg) {
+		if msg.GetType() == raftpb.MsgHeartbeatResp && e.coalesceHeartbeatResp(ch, msg) {
 			return nil
 		}
 		e.recordDroppedDispatch(msg)
 		return nil
 	}
-	dispatchReq := prepareDispatchRequest(msg)
-	if e.storagePipeline != nil && msg.GetType() == raftpb.MsgSnap && msg.Snapshot != nil {
-		index, files := msg.Snapshot.GetMetadata().GetIndex(), e.storagePipeline.snapshotFiles
-		files.pin(index)
-		dispatchReq.snapshotCloseOnce = &sync.Once{}
-		dispatchReq.snapshotUnpin = func() { files.unpin(index) }
+	dispatchReq, admitted := e.tryPrepareOwnedDispatchRequest(msg)
+	if !admitted {
+		e.recordDroppedDispatch(msg)
+		return nil
 	}
 	select {
 	case ch <- dispatchReq:
@@ -2590,7 +2589,7 @@ func (e *Engine) enqueueDispatchMessage(msg raftpb.Message) error {
 	}
 }
 
-func coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
+func (e *Engine) coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
 	if ch == nil || cap(ch) == 0 {
 		return false
 	}
@@ -2606,11 +2605,8 @@ func coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
 		if !ok {
 			break
 		}
-		if !replaced && req.msg.GetType() == raftpb.MsgHeartbeatResp && len(req.msg.GetContext()) == 0 {
-			closeDispatchRequest(req)
-			drained = append(drained, prepareDispatchRequest(msg))
-			replaced = true
-			continue
+		if !replaced {
+			req, replaced = e.replacePlainHeartbeatResponse(req, msg)
 		}
 		drained = append(drained, req)
 	}
@@ -2622,8 +2618,8 @@ func coalesceHeartbeatResp(ch chan dispatchRequest, msg raftpb.Message) bool {
 
 func tryReceiveDispatchRequest(ch chan dispatchRequest) (dispatchRequest, bool) {
 	select {
-	case req := <-ch:
-		return req, true
+	case req, ok := <-ch:
+		return req, ok
 	default:
 		return dispatchRequest{}, false
 	}
@@ -4833,6 +4829,7 @@ func closePeerLanes(pd *peerQueues) {
 // immediately re-added, preventing stale goroutines from shadowing new ones.
 func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest) {
 	defer e.dispatchWG.Done()
+	defer retireQueuedDispatchRequests(ch)
 	for {
 		select {
 		case <-e.dispatchStopCh:
@@ -4855,10 +4852,8 @@ func (e *Engine) runDispatchWorker(ctx context.Context, ch chan dispatchRequest)
 }
 
 func (e *Engine) handleDispatchRequest(ctx context.Context, req dispatchRequest) {
+	defer closeDispatchRequest(req)
 	dispatchErr := e.dispatchTransport(ctx, req)
-	if err := req.Close(); err != nil {
-		slog.Error("etcd raft dispatch: failed to close request", "err", err)
-	}
 	if dispatchErr == nil {
 		e.reportSuccessfulDispatch(req.msg)
 		return
@@ -5315,75 +5310,33 @@ func (r dispatchRequest) Close() error {
 	if r.snapshotCloseOnce != nil {
 		r.snapshotCloseOnce.Do(r.snapshotUnpin)
 	}
+	r.permit.Release()
 	return nil
 }
 
 func cloneDispatchMessage(msg raftpb.Message) raftpb.Message {
-	cloned := msg
-	cloned.Entries = cloneDispatchEntries(msg.Entries)
-	cloned.Snapshot = cloneDispatchSnapshot(msg.Snapshot)
-	cloned.Context = append([]byte(nil), msg.Context...)
-	cloned.Responses = cloneDispatchMessages(msg.Responses)
-	return cloned
+	// Unknown fields can own a much larger backing array than their wire length.
+	// Clone the complete protobuf, including optional headers and nested messages.
+	cloned := proto.CloneOf(&msg)
+	preserveDispatchNilMessages(cloned, &msg)
+	return *cloned
 }
 
-func cloneDispatchMessages(messages []*raftpb.Message) []*raftpb.Message {
-	if len(messages) == 0 {
-		return nil
-	}
-	cloned := make([]*raftpb.Message, 0, len(messages))
-	for _, msg := range messages {
-		if msg == nil {
-			cloned = append(cloned, nil)
-			continue
-		}
-		clonedMsg := cloneDispatchMessage(*msg)
-		cloned = append(cloned, &clonedMsg)
-	}
-	return cloned
-}
-
-func cloneDispatchEntries(entries []*raftpb.Entry) []*raftpb.Entry {
-	if len(entries) == 0 {
-		return nil
-	}
-	cloned := make([]*raftpb.Entry, 0, len(entries))
-	for _, entry := range entries {
+func preserveDispatchNilMessages(cloned, source *raftpb.Message) {
+	// Protobuf normalizes nil repeated messages to empty messages. Preserve the
+	// existing nil sentinels rather than manufacture a different input to Raft.
+	for i, entry := range source.Entries {
 		if entry == nil {
-			cloned = append(cloned, nil)
+			cloned.Entries[i] = nil
+		}
+	}
+	for i, response := range source.Responses {
+		if response == nil {
+			cloned.Responses[i] = nil
 			continue
 		}
-		// WAL marshaling can concurrently update protobuf's internal cache.
-		// Clone protocol fields, never copy the generated message internals.
-		cloned = append(cloned, proto.CloneOf(entry))
+		preserveDispatchNilMessages(cloned.Responses[i], response)
 	}
-	return cloned
-}
-
-func cloneDispatchSnapshot(snapshot *raftpb.Snapshot) *raftpb.Snapshot {
-	if snapshot == nil {
-		return nil
-	}
-	cloned := *snapshot
-	cloned.Data = append([]byte(nil), snapshot.Data...)
-	if snapshot.Metadata != nil {
-		metadata := *snapshot.Metadata
-		metadata.ConfState = cloneDispatchConfState(snapshot.Metadata.ConfState)
-		cloned.Metadata = &metadata
-	}
-	return &cloned
-}
-
-func cloneDispatchConfState(conf *raftpb.ConfState) *raftpb.ConfState {
-	if conf == nil {
-		return nil
-	}
-	cloned := *conf
-	cloned.Voters = append([]uint64(nil), conf.Voters...)
-	cloned.Learners = append([]uint64(nil), conf.Learners...)
-	cloned.VotersOutgoing = append([]uint64(nil), conf.VotersOutgoing...)
-	cloned.LearnersNext = append([]uint64(nil), conf.LearnersNext...)
-	return &cloned
 }
 
 func (e *Engine) handleSnapshotResult(result snapshotResult) error {

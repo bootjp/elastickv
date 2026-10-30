@@ -69,6 +69,7 @@ type engineStoragePipeline struct {
 	diskQueueBudget, applyQueueBudget  *storageWorkBudget
 	proposalBudget, bulkIngressBudget  *storageWorkBudget
 	priorityIngressBudget, readyBudget *storageWorkBudget
+	outboundBulk, outboundControl      *storageWorkBudget
 	bulk, priority                     chan pipelineIngress
 	bulkPaused                         atomic.Bool
 	stopping                           atomic.Bool
@@ -132,6 +133,8 @@ func newEngineStoragePipeline(persist etcdstorage.Storage) (*engineStoragePipeli
 		proposalBudget:        newStorageWorkBudget(pipelineBulkBytes, pipelineBulkItems),
 		bulkIngressBudget:     newStorageWorkBudget(pipelineBulkBytes, pipelineBulkItems),
 		priorityIngressBudget: newStorageWorkBudget(pipelineControlBytes, pipelineControlItems),
+		outboundBulk:          newStorageWorkBudget(pipelineBulkBytes, pipelineBulkItems),
+		outboundControl:       newStorageWorkBudget(pipelineControlBytes, pipelineControlItems),
 		// One owner-held Ready is charged while routing it. On a terminal
 		// routing failure it stays retained until RawNode disposal and joins.
 		readyBudget:                newStorageWorkBudget(pipelineBulkBytes, 1),
