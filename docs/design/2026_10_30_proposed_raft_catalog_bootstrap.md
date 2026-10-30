@@ -1,6 +1,6 @@
 # Raft catalog bootstrap
 
-Status: Proposed v5; design accepted; local format/planner foundations implemented in this branch; runtime not implemented
+Status: Proposed v5; design accepted; local format/planner/session/storage components implemented in this branch; runtime not implemented
 Author: bootjp
 Date: 2026-10-30
 
@@ -1080,6 +1080,47 @@ and whole-repository lint (zero issues). The known-red unconnected-startup
 diagnostic remains outside that export and is not silently skipped.
 
 ## Review status and exclusions
+
+### Session And Atomic Storage Components
+
+The branch now also includes separately reviewed connection-bound peer sessions
+and protected control-metadata storage. These are reusable protocol components,
+not a wired production bootstrap or permission to activate policy P/W.
+
+The session component uses the actual server-side mTLS connection, TLS exporter
+and Begin/Finish proof. Subsequent proofs bind method, group, role and payload;
+stream chunks are independently bound. Closed connections revoke their owned
+authority. Public TLS 1.2 and existing public token behavior are preserved;
+nil authorizers, forged TLS wrappers and stale transport references do not
+become peer identity. Native TLS tests exercise the bridge and root fixture,
+not a synthetic TLSInfo context. The production listener, all peer decoders,
+membership policy and receiver-owned bootstrap arbiter remain unconnected.
+
+Protected metadata can be staged with data/configuration projection and applied
+index in one synchronous native indexed batch. Journal-only scopes do not
+advance data progress. The memory implementation uses an affected-key overlay
+with matching writer exclusion and abort behavior, not a whole-database copy.
+Operational staging failures latch and abort the scope; ordinary replicated
+request verdicts remain distinct. External snapshot/backup paths reject
+protected control state rather than silently exporting it as ordinary data.
+
+Independent native reproductions found and corrected projection-induced
+watermark advancement after reopen, lost same/cross-entry OCC dependencies,
+and projection/auxiliary timestamps inflating the actual SST manifest. Only the
+exact configuration projection key is non-advertised; adjacent ordinary keys
+remain data. All projection/blob rows remain in snapshots. Maintained tests
+require the actual memory, row or SST format and verify watermark, data,
+configuration, protected state and applied index after restore and reopen.
+Final storage/backup race suites pass177.074s/3.323s; the original independent
+review regressions plus maintained snapshot tests pass parent race3 (11.147s).
+Full lint has zero issues. These component receipts do not qualify a later
+composed HEAD; its own integration tests, latest-push review and CI are required.
+
+The complete v5 receipt/manifest schema, policy activation, guarded membership,
+journal replay and publication, TSO/control atomicity, agreed native baseline
+and old-member recovery lanes remain acceptance gates. In particular, the
+actual direct-write startup diagnostic above remains red and #1355's replica
+determinism blocker is not fixed by adding these components.
 
 V5 revises only the two new review blockers: explicit generation-bound local
 follower permission distinct from owned leader rotation completion, and
