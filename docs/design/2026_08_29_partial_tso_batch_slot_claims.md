@@ -123,6 +123,8 @@ rollout. Unconfigured legacy issuance still uses the old contract. It becomes
 `_implemented_` only when every production issuer and receiver uses the bound
 contract, the activation gates are installed and the original counterexamples
 are green on those production paths.
+The latest composed retry status is in section 10; earlier verification sections
+record earlier source checkpoints, not a current production activation claim.
 
 ## 5. Contract And Remaining Questions
 
@@ -412,13 +414,14 @@ Full runtime activation remains prohibited until the following are completed:
   capsules retain transaction resolution state. A crash-safe ingress pending-
   attempt journal/recovery protocol before PREPARE/raw publication is still
   required; an in-memory OperationGroup or test clone is not that lifecycle.
-- The store owner must implement atomic
+- The initial store dependency was atomic
   `ApplyPreparedMutationsRaftAt(ctx, mutations, readKeys, originalStartTS,
-  commitTS, expected []store.MVCCVersion, appliedIndex)`. It must preserve user/
+  commitTS, expected []store.MVCCVersion, appliedIndex)`. It preserves user/
   read-key OCC at originalStartTS and exempt only exact compared txn-internal
-  prepared versions. The strict distributed PREPARE/COMMIT test remains RED
-  without this capability. No widened read-start workaround or fake applier is
-  used. Legacy durable resolution across activation and composed route retry
+  prepared versions. The actual capability and full ancestry are now composed;
+  the strict distributed PREPARE/COMMIT test passes as recorded in section 10.
+  No widened read-start workaround or fake applier is used. Legacy durable
+  resolution across activation and composed route retry
   integration also remain release work.
 - Complete authenticated activation, multi-node leadership/crash campaigns,
   snapshot/control composition, retention obligations, full KV race/lint/Jepsen
@@ -464,7 +467,7 @@ Full runtime activation remains prohibited until the following are completed:
 No commit, push or PR has been performed. Connected paths and local green tests
 do not promote this partial integration to full production completion.
 
-## 9. Original-Start Correction And Local Seed Custody
+## 9. Original-Start Correction And Local Seed Custody (Pre-composition)
 
 ### Original Start Versus Retry Baseline
 
@@ -484,10 +487,10 @@ callbacks and legacy retry rules were not weakened.
 
 The maintained
 `TestTSOProductionClaimsPreparedSubsetCheckpointRetainsOriginalStart` preserves
-the independent fixture's assertions: real PREPARE, real primary-only checkpoint,
+the independent fixture's assertions at this checkpoint: real PREPARE, real primary-only checkpoint,
 retained claim validation, two exact remaining prepared versions, then the real
 COMMIT handler. Before the correction it failed with ErrTSOClaimInvalid; after it
-reaches ErrTSOProtocolUnsupported for the absent store API. That is a diagnostic
+reached ErrTSOProtocolUnsupported for the then-absent store API. That was a diagnostic
 P2 green, NOT a successful 2PC transaction. Before/after logs are retained outside
 the writer under `.cache/tso-durable-slot-claims/prepared-subset-{before,after}.log`.
 
@@ -496,8 +499,8 @@ the writer under `.cache/tso-durable-slot-claims/prepared-subset-{before,after}.
 `TestTSOProductionClaimsPreparedFullRetryAfterPrimaryCheckpoint` includes BOTH
 already-resolved b and still-prepared c. It requires actual COMMIT success,
 unchanged b, committed c, lock/intent cleanup and successful replay. It has no
-Unsupported success exemption or fake applier. It remains RED on the local old
-base, as does the original strict distributed prepare/commit success test.
+Unsupported success exemption or fake applier. It remained RED on that old
+base, as did the original strict distributed prepare/commit success test.
 
 Static inspection confirms a separate integration risk: missing primary lock
 already suppresses b's user mutation, but `buildCommitStoreMutations` still adds
@@ -556,8 +559,9 @@ This is a bounded local Unix mode/UID custody boundary. Ownership/permission
 checks cover the FINAL parent directory and file, not every ancestor's access
 policy or ACLs; it does not defend against privileged/same-UID writers or prove
 cluster/node/incarnation identity. Native tests cover the Darwin filesystem;
-Linux uses the corresponding syscall path but has not received runtime testing
-in this worktree. No runtime/bootstrap wiring or auth callback was added.
+Linux uses the corresponding syscall path; the independent parent Linux receipt
+for the unchanged seed component is recorded in section 10. No runtime/bootstrap
+wiring or auth callback was added.
 Durable registration, cluster/node/incarnation binding, P-epoch/creation fences,
 all-member decoder gates and the unknown-attempt journal remain unresolved.
 
@@ -566,3 +570,111 @@ missing-parent/no-generation behavior, unknown version, bad checksum, zero seed,
 truncation/trailing bytes, modes, terminal/ancestor symlinks, hardlinks,
 non-regular files and concurrent no-replace publication/temporary-file cleanup.
 These tests do not establish a power-loss campaign or secure node provisioning.
+
+## 10. Composed Claim-Aware Retry Plan
+
+### Base And Observed Failure
+
+The parent merged the full peer/control ancestry and actual prepared-store
+capability into HEAD `0db8c8786886860dc0b2f5285d91eb264a85522a`, tree
+`e1ab44f7cd97a1f2199e93cd57520ad38952f462`. The five store files were not copied
+alone into the earlier base. Store, proto, auth and seed sources are unchanged
+by this retry correction.
+
+The actual full retry, after real PREPARE and primary-only COMMIT, failed in
+the strict atomic applier. The diagnostic WriteConflictKey was exactly
+`!txn|cmt|b` followed by the original startTS suffix. This was the existing
+primary decision Put, not a prepared-lock ownership failure or missing API.
+The captured actual-path RED is in
+`.cache/tso-durable-slot-claims/composed-retry-exact-red.log` outside the writer.
+
+### Scoped Correction
+
+`handleCommitRequest` now uses `buildCommitRequestStoreMutations`. It first
+builds the unchanged legacy plan. Legacy requests are returned unchanged. For
+a claimed request, only a plan that actually contains the primary decision key
+enters the omission check; a subset with no decision Put receives no new late
+decision validation.
+
+The omission requires an exact local MVCC decision: key, commit timestamp,
+encoded value, non-tombstone, zero expiry and expected key family. It also
+requires the retained PREPARE capsule to match the actual request's entire
+intent, proof and group, with its decoded claim timestamp/read start/primary
+matching transaction metadata. Only the exact decision Put is removed.
+No user mutation is exempted, no commit namespace is exempted in store, and no
+original-start OCC or exact prepared-version comparison is widened.
+
+Missing primary lock already means no primary user write is generated. A later
+valid transaction may therefore update resolved b while c is pending: completing
+c does not overwrite or revalidate b's current value. In contrast, changing the
+still-prepared c remains a user-key write conflict at originalStartTS.
+
+All changed helper callers were audited: the single COMMIT chain uses the new
+plan wrapper; the legacy builder is unchanged; concrete expected-version and
+apply helpers still receive originalStartTS; ABORT retains its existing original
+start path. No read-set revalidation policy was added.
+
+### Witness Lifetime Boundary
+
+Single-request FSM Apply is NOT automatically inside store.RaftEntryApplier.
+The helper does not claim a global applyMu spanning the decision read and
+publication. Its witness relies on retained decision/evidence immutability and
+engine-owned serial FSM apply. Native compaction retains the latest non-TTL
+decision version; migration cleanup/promote/import and engine-owned restore
+are serialized in the audited legitimate writer paths.
+
+The parent-reported independent bounded check inserted Compact between plan
+and prepared publication and passed native plus memory race3 (2.291 seconds,
+skip0) on its captured snapshot. No legitimate breaking writer or validated
+P1/P2 was found there. No broad FSM scope wrapping was added. This is a bounded
+contract/reachability conclusion, not a claim against arbitrary direct store
+mutation or a new general concurrency proof.
+
+### Real Capability Tests
+
+The earlier subset Unsupported assertion is replaced by actual COMMIT success,
+data, cleanup and replay checks. The shared checkpoint now uses real indexed FSM
+Apply for both PREPARE and primary-only COMMIT through the actual store API; it
+does not form that state using a widened-baseline synthetic store write.
+
+Subset/full retry and mismatch/version/user-OCC controls run on BOTH memory
+and native Pebble. The pending-c OCC control covers both subset and full retry
+and checks that the conflict key is c, preserving its newer value and its
+prepared state. Another real claimed one-phase transaction updates resolved b;
+the original decision can still finish c and replay without overwriting b.
+An altered retained operation binding is rejected.
+
+The Pebble checkpoint test closes/reopens while c remains prepared, verifies the
+durable capsule and applied index 3, completes the full retry through indexed
+Apply, verifies index 4/data/cleanup, then reopens and replays again. This is
+graceful native reopen evidence, not a subprocess crash or multi-node campaign.
+The original distributed success test retains RequireAllParticipants=true and
+its original success criteria. No fake applier or Unsupported-success receipt
+is used in these composed tests.
+
+Final focused TSO race3 passed in 24.545 seconds with the three-minute command
+budget. Adapter selected race3 passed in 3.383 seconds with the two-minute
+budget. Current whole-KV race passed in 87.210 seconds: 2,264 test/subtest pass
+events, fail0, skip0, using `go test -race -json ./kv -count=1 -timeout=10m`.
+Whole-repository lint returned zero issues with the unchanged five-minute
+budget/configuration. No result is inferred from the parent's separate checkout.
+Logs are outside the writer at `.cache/tso-durable-slot-claims/`:
+
+- `composed-tso-focused-race3.log`
+- `composed-adapter-selected-race3.log`
+- `composed-whole-kv-race.jsonl`
+
+No test payload, original success assertion, strict-participant requirement,
+iteration count or timeout was weakened. No stage, commit or push was performed.
+
+The unchanged seed component also has a parent-reported independent Linux
+control receipt at the composed base: six seed tests race3 passed in 1.114
+seconds, all TestPreparedMutations store cases race3 passed in 2.518 seconds,
+Docker Go 1.27.2 arm64, network none, 2 CPU/4 GiB. This does not establish Linux
+whole-KV or actual-retry green. The seed's local-custody/auth boundary is unchanged.
+
+Runtime authenticated registration, durable claim activation, unknown-attempt
+journaling and remaining legacy resolution/route-retry integration are still
+release gates. The separately assigned large-payload compatibility probe is
+pending independent validation; this retry delta changes no payload or wire limit.
+The document remains Partial even when the specific composed retry tests pass.

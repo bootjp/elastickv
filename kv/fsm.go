@@ -2493,7 +2493,7 @@ func (f *kvFSM) handleCommitRequest(ctx context.Context, r *pb.Request) error {
 	if err != nil {
 		return err
 	}
-	storeMuts, err := f.buildCommitStoreMutations(ctx, uniq, meta, startTS, commitTS, applyStartTS == commitTS, r.ReadKeys)
+	storeMuts, err := f.buildCommitRequestStoreMutations(ctx, r, uniq, meta, applyStartTS)
 	if err != nil {
 		return err
 	}
