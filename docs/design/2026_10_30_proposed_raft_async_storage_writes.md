@@ -755,3 +755,28 @@ its cause and fault boundary must be repaired or reconciled, not hidden by a
 rerun, skip or relaxed assertion. Earlier KV passes do not qualify the final
 composed source. Fresh full-suite, last-push code/security review and all CI
 remain mandatory before publication readiness.
+
+### Ingress ownership checkpoint
+
+The internal async transport queue now obtains a conservative byte reservation
+before making a complete protobuf clone. The prior pointer-slice detach retained
+caller payload/context/unknown-field backing arrays and mutable protobuf headers.
+Maintained regressions reproduced four 1-MiB backing arrays charged as only 783
+bytes, and accepted-message changes after caller mutation. These are now owned
+by the accepted queue item, including snapshot metadata, ConfState and unknown
+fields. Rejection makes no clone or queued item; the existing pre-Step error and
+separate control/snapshot admission behavior remain unchanged.
+
+The existing ingress reservation remains live through actual Step and folding
+the resulting Ready. Downstream actor/unstable reservations are separate; this
+change does not complete their physical accounting or atomic-Ready debt policy.
+The synchronous/default engine remains unchanged and unactivated.
+
+The initial ownership selection passes race3 (1.800s), the whole engine race
+passes without skips (96.027s), and full lint reports zero issues. Added inline
+snapshot ownership/retirement and 64-MiB-plus-envelope admission controls pass
+race3 (1.772s). One intermediate test-helper run waited on the wrong ingress
+lane and was stopped with its stack saved; the corrected test observes the
+existing snapshot priority lane with a bounded receive, without changing
+production routing, payload size, assertions or engine timeouts. Final-source
+integration, independent review and fresh remote review/CI remain required.
