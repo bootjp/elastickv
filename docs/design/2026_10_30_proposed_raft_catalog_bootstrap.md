@@ -1,6 +1,6 @@
 # Raft catalog bootstrap
 
-Status: Proposed v5; design independently reviewed and accepted; not implemented
+Status: Proposed v5; design accepted; local format/planner foundations implemented in this branch; runtime not implemented
 Author: bootjp
 Date: 2026-10-30
 
@@ -1020,6 +1020,65 @@ protocol choices or evidence that any implementation has passed them.
   coverage as five independent review passes. Do not check the parent
   isolation or all-design-doc goal complete from this prerequisite alone.
 
+## Implementation checkpoint
+
+The branch now contains `internal/raftbootstrap`: strict canonical,
+checksummed intent parsing and intent-before-marker durable publication.
+Each file uses an exclusive same-directory temporary file, mode 0600,
+write-all, file sync/close, rename and directory sync. Inspection reconciles
+the file pair with separately recovered identity/baseline/policy evidence;
+unknown, corrupt, partial, unverified and lost-state outcomes do not grant
+runtime readiness. Retained-policy repair restores only the format barrier,
+never forgotten term/vote history. This package is not wired into startup
+and does not constitute policy/session admission or a usable upgrade command.
+
+`CatalogStore.BuildBootstrapPlanAt` now constructs the initial route, version,
+next-ID and delta mutations without calling Save, selecting a local timestamp
+or updating the store/cache. Reads use exactly the supplied positive fenced
+snapshot. Seed route IDs are assigned in deterministic key order, dependencies
+are cloned into the read set, and partial catalog state is rejected without
+repair. The caller still owes the applied read fence, pin/voucher, every-key
+group validation, current W/admission and a guarded one-phase dispatch.
+
+Local checks at this checkpoint include the complete distribution race suite,
+twenty repetitions of planner race tests, whole-repository lint, and ten
+repetitions of the real legacy startup parser/factory boundary check. The
+planner tests cover actual memory/Pebble concurrent one-winner and independent
+conflicts on every mutation/read dependency. An initial test comparison of
+nil versus empty start bounds was corrected to the existing codec's semantic
+comparison; it was not a production failure. Format tests exercise real
+filesystem errors and process termination at publication boundaries; they
+are not a claim of arbitrary storage-device power-loss guarantees.
+
+The format review found a P2 size-amplification defect in the initial encoder:
+ten members sharing one 2 MiB address serialized beyond 16 MiB, and the
+digest path accepted the oversized result. The retained regression failed
+before repair. Encoding now preflights the total configuration, including
+intent/frame overhead, before cloning/serialization, and every append obeys
+the size/error latch. Digest uses the same bound. Tests accept an exact
+16 MiB frame, reject one extra byte and stop all writes after an error.
+All encoding/digest/publication callers were audited for error propagation.
+
+Independent review of the planner found no validated blocker under its
+explicit caller contract. It also reproduced the future-snapshot
+counterexample when that contract is intentionally violated: plans built
+from empty state at 10 and 100 can both commit at 50 and 150 without an
+applied fence. The second overwrites version 1. Same-snapshot OCC tests do
+not close this gate, nor are read keys a prefix-phantom exclusion protocol.
+
+Production startup still reaches EnsureCatalogSnapshot and direct Save.
+The retained native startup diagnostic still fails with one direct write,
+local LastCommitTS 100 becoming 101, and a locally initialized version 1.
+This is known-red evidence, not an approved passing test or an implemented
+bootstrap. No policy/W, guarded apply/receipt journal, peer-session transport,
+receiver-owned revocation, TSO durability, snapshot manifest, native baseline
+or operational activation gate is marked complete by these foundations.
+
+The exact staged-only source export passes the complete root race suite
+(100.549s), distribution race suite (3.763s), format race suite (9.909s)
+and whole-repository lint (zero issues). The known-red unconnected-startup
+diagnostic remains outside that export and is not silently skipped.
+
 ## Review status and exclusions
 
 V5 revises only the two new review blockers: explicit generation-bound local
@@ -1029,8 +1088,9 @@ evidence after reservation consumption. The original honest-binary/enforcing-
 quorum, strict-marker/session, lost-state nonvoting replacement and indexed
 journal boundaries remain. Independent design re-review accepted these
 contracts after the earlier blocking findings were addressed. This is not
-implementation or merge approval. No runtime tests, lint, Jepsen or security
-review were run for this document-only revision; its implementation and
+implementation or merge approval. The original document-only revision ran
+no runtime tests, lint, Jepsen or security review. The subsequent foundation
+checkpoint above has separate evidence; production implementation and
 native-baseline gates remain open.
 
 Two safety properties are deliberately NOT established here. Historical
