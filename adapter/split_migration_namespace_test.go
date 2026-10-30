@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -18,7 +17,7 @@ import (
 
 func migrationNamespacePeerContext(t *testing.T, authorized bool) context.Context {
 	t.Helper()
-	ctx := peer.NewContext(t.Context(), &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+	ctx := peer.NewContext(t.Context(), &peer.Peer{AuthInfo: migrationTLSInfoFixture(t)})
 	if authorized {
 		ctx = metadata.NewIncomingContext(ctx, metadata.Pairs("authorization", "Bearer "+t.Name()))
 	}

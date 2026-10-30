@@ -44,7 +44,7 @@ func partitionConfiguration(value []byte, err error) (uint64, error) {
 }
 
 func (s *mvccStore) partitionConfigurationLocked() (uint64, error) {
-	v, ok := s.tree.Get(MigrationConfigurationIndexKey())
+	v, ok := s.entryTreeGet(MigrationConfigurationIndexKey())
 	if !ok {
 		return 0, nil
 	}
@@ -109,7 +109,12 @@ func partitionJobOwnerGrant(requested MigrationOwnershipState, operation Migrati
 }
 
 func (s *mvccStore) ApplyMigrationOwnershipPartition(ctx context.Context, t MigrationOwnershipPartitionTransition, index uint64) error {
+	if err := s.rejectMemoryEntry(ctx); err != nil {
+		return err
+	}
+	s.applyMu.Lock()
 	s.mtx.Lock()
+	defer s.applyMu.Unlock()
 	defer s.mtx.Unlock()
 	if err := ctx.Err(); err != nil {
 		return errors.WithStack(err)
