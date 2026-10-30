@@ -499,7 +499,7 @@ func (s *SQSServer) walkPeekPartition(
 // queues.
 func (s *SQSServer) loadPeekMessageRecord(ctx context.Context, meta *sqsQueueMeta, queueName string, partition uint32, messageID string, readTS uint64) (*sqsMessageRecord, bool, error) {
 	dataKey := sqsMsgDataKeyDispatch(meta, queueName, partition, meta.Generation, messageID)
-	b, err := s.store.GetAt(ctx, dataKey, readTS)
+	b, err := s.getSQSAt(ctx, dataKey, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, false, nil

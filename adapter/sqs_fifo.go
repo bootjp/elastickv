@@ -98,7 +98,7 @@ func resolveFifoDedupID(meta *sqsQueueMeta, in sqsSendMessageInput) string {
 // disjoint dedup namespaces (the AWS messageGroup-scope contract).
 func (s *SQSServer) loadFifoDedupRecord(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, groupID, dedupID string, readTS uint64) (*sqsFifoDedupRecord, []byte, error) {
 	key := sqsMsgDedupKeyDispatch(meta, queueName, partition, gen, groupID, dedupID)
-	raw, err := s.store.GetAt(ctx, key, readTS)
+	raw, err := s.getSQSAt(ctx, key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, key, nil
@@ -119,7 +119,7 @@ func (s *SQSServer) loadFifoDedupRecord(ctx context.Context, queueName string, m
 // the given snapshot. Missing keys (fresh queue) read as zero so the
 // first FIFO send observes 1.
 func (s *SQSServer) loadFifoSequence(ctx context.Context, queueName string, readTS uint64) (uint64, error) {
-	raw, err := s.store.GetAt(ctx, sqsQueueSeqKey(queueName), readTS)
+	raw, err := s.getSQSAt(ctx, sqsQueueSeqKey(queueName), readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return 0, nil
@@ -140,7 +140,7 @@ func (s *SQSServer) loadFifoSequence(ctx context.Context, queueName string, read
 // key in scope from a different code path.
 func (s *SQSServer) loadFifoGroupLock(ctx context.Context, queueName string, meta *sqsQueueMeta, partition uint32, gen uint64, groupID string, readTS uint64) (*sqsFifoGroupLock, error) {
 	key := sqsMsgGroupKeyDispatch(meta, queueName, partition, gen, groupID)
-	raw, err := s.store.GetAt(ctx, key, readTS)
+	raw, err := s.getSQSAt(ctx, key, readTS)
 	if err != nil {
 		if errors.Is(err, store.ErrKeyNotFound) {
 			return nil, nil
@@ -251,6 +251,7 @@ func (s *SQSServer) sendFifoMessage(
 		},
 	}
 	dispatchCtx := readTimestamp.WithDispatchVoucher(ctx)
+	appendFifoOrderPut(req, meta, queueName, partition, rec)
 	if _, err := kv.DispatchWithReadTimestamp(dispatchCtx, s.coordinator, req); err != nil {
 		if isRetryableTransactWriteError(err) {
 			return nil, true, nil
@@ -336,6 +337,9 @@ func (s *SQSServer) resolveFifoCandidate(ctx context.Context, queueName string, 
 	state, lockKey, err := s.classifyFifoGroupLock(ctx, queueName, meta, cand.partition, meta.Generation, rec, readTS)
 	if err != nil || state != fifoLockAcquire {
 		return nil, state, lockKey, err
+	}
+	if meta.FifoOrderIndexed {
+		return s.resolveIndexedFifoCandidate(ctx, queueName, meta, cand, rec, readTS, lockKey)
 	}
 	head, err := s.fifoGroupHeadInMillisecond(ctx, queueName, meta, cand, rec, readTS)
 	if err != nil {
