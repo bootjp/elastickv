@@ -13,10 +13,10 @@ func canonicalClaimParticipant(part *pb.TimestampClaimParticipant) (*pb.Timestam
 		return nil, errors.WithStack(ErrTSOClaimInvalid)
 	}
 	out := proto.CloneOf(part)
-	var err error
-	out.Mutations, err = canonicalClaimMutations(out.Mutations)
-	if err != nil {
-		return nil, err
+	for _, mutation := range out.Mutations {
+		if err := validateClaimMutationEvidence(mutation); err != nil {
+			return nil, err
+		}
 	}
 	out.ReadKeys = canonicalClaimKeys(out.ReadKeys)
 	out.WriteFenceBypassKeys = canonicalClaimKeys(out.WriteFenceBypassKeys)

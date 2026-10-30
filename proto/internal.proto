@@ -97,7 +97,7 @@ message TimestampClaimIntent {
   bytes operation_id = 1;
   bool is_txn = 2;
   uint64 read_timestamp = 3;
-  repeated Mutation mutations = 4;
+  reserved 4; // The unpublished full-value manifest must not be accepted.
   repeated bytes read_keys = 5;
   bytes primary_key = 6;
   uint64 observed_route_version = 7;
@@ -105,13 +105,28 @@ message TimestampClaimIntent {
   repeated bytes write_fence_bypass_keys = 9;
   repeated TimestampClaimParticipant participants = 10;
   uint64 lock_ttl_ms = 11;
+  uint32 manifest_version = 12;
 }
 
 message TimestampClaimParticipant {
   uint64 group_id = 1;
-  repeated Mutation mutations = 2;
+  reserved 2; // Former full-value mutation plan.
   repeated bytes read_keys = 3;
   repeated bytes write_fence_bypass_keys = 4;
+  repeated TimestampClaimMutationEvidence mutations = 5;
+}
+
+// Values occur only in Request.mutations. Receivers recompute this evidence
+// from those bytes; it is not caller-supplied write authority. Mutation order
+// and multiplicity are significant, including repeated writes to the same key.
+message TimestampClaimMutationEvidence {
+  Op op = 1;
+  bytes key = 2;
+  bytes value_sha256 = 3;
+  uint64 value_length = 4;
+  uint64 commit_ts_value_offset = 5;
+  uint32 commit_ts_value_length = 6;
+  bool require_absent = 7;
 }
 
 message RaftCommand {

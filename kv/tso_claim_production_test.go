@@ -125,8 +125,8 @@ func TestTSOProductionClaimsUnknownReplyReconstructsDurableAttempt(t *testing.T)
 	foreign.TimestampClaim = nil
 	foreign.Ts = 0
 	foreign.Mutations[0].Value = []byte("different")
-	foreign.TimestampIntent.Mutations[0].Value = []byte("different")
-	foreign.TimestampIntent.Participants[0].Mutations[0].Value = []byte("different")
+	foreign.TimestampIntent.Participants[0].Mutations, err = claimMutationEvidenceList(foreign.Mutations)
+	require.NoError(t, err)
 	err = IssueRequestTimestampClaim(t.Context(), restarted, foreign)
 	require.True(t, errors.Is(err, ErrTSOClaimConflict), "%v", err)
 }
@@ -241,6 +241,17 @@ func TestTSOProductionClaimsPreparedEvidenceResolutionBinding(t *testing.T) {
 		foreign := proto.CloneOf(resolution)
 		foreign.Mutations[1].Key = []byte("c")
 		require.ErrorIs(t, ValidateClaimedTxnResolution(t.Context(), coordinator.tsAllocator, groups[1].Store, foreign), ErrTSOClaimInvalid)
+		for name, change := range map[string]func(*pb.Request){
+			"unbound read alias":   func(r *pb.Request) { r.ReadKeys = [][]byte{[]byte("unbound-read")} },
+			"unbound fence bypass": func(r *pb.Request) { r.WriteFenceBypassKeys = [][]byte{[]byte("b")} },
+			"unknown metadata":     func(r *pb.Request) { r.Mutations[0].ProtoReflect().SetUnknown([]byte{0x30, 1}) },
+		} {
+			t.Run(phase.String()+"/"+name, func(t *testing.T) {
+				forged := proto.CloneOf(resolution)
+				change(forged)
+				require.ErrorIs(t, ValidateClaimedTxnResolution(t.Context(), coordinator.tsAllocator, groups[1].Store, forged), ErrTSOClaimInvalid)
+			})
+		}
 	}
 	forged := proto.CloneOf(request)
 	binary.BigEndian.PutUint64(forged.Mutations[1].Value[1:], commitTS+1)

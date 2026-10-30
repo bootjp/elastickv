@@ -41,21 +41,26 @@ func EnsureRequestTimestampIntent(request *pb.Request) error {
 		return errors.Wrap(err, "create timestamp operation ID")
 	}
 	intent := &pb.TimestampClaimIntent{
-		OperationId: operation, IsTxn: request.IsTxn, Mutations: request.Mutations,
+		OperationId: operation, IsTxn: request.IsTxn, ManifestVersion: TSOClaimProtocolVersion,
 		ReadKeys: request.ReadKeys, ObservedRouteVersion: request.ObservedRouteVersion,
 		WriteFenceBypassKeys: request.WriteFenceBypassKeys,
 	}
+	muts := request.Mutations
 	if request.IsTxn {
-		meta, muts, err := extractTxnMeta(request.Mutations)
+		meta, data, err := extractTxnMeta(request.Mutations)
 		if err != nil {
 			return err
 		}
 		intent.ReadTimestamp, intent.PrimaryKey, intent.PreviousCommitTimestamp = request.Ts, meta.PrimaryKey, meta.PrevCommitTS
 		intent.LockTtlMs = meta.LockTTLms
-		intent.Mutations = muts
+		muts = data
+	}
+	evidence, err := claimMutationEvidenceList(muts)
+	if err != nil {
+		return err
 	}
 	intent.Participants = []*pb.TimestampClaimParticipant{{GroupId: request.TimestampClaimGroupId,
-		Mutations: intent.Mutations, ReadKeys: request.ReadKeys, WriteFenceBypassKeys: request.WriteFenceBypassKeys}}
+		Mutations: evidence, ReadKeys: request.ReadKeys, WriteFenceBypassKeys: request.WriteFenceBypassKeys}}
 	canonical, err := canonicalTimestampIntent(intent)
 	if err != nil {
 		return err
@@ -65,7 +70,7 @@ func EnsureRequestTimestampIntent(request *pb.Request) error {
 }
 
 func canonicalTimestampIntent(intent *pb.TimestampClaimIntent) (*pb.TimestampClaimIntent, error) {
-	if intent == nil || len(intent.OperationId) != len(TSOOperationID{}) || proto.Size(intent) > maxTSOClaimIntentBytes || len(intent.ProtoReflect().GetUnknown()) != 0 {
+	if intent == nil || intent.ManifestVersion != TSOClaimProtocolVersion || len(intent.OperationId) != len(TSOOperationID{}) || proto.Size(intent) > maxTSOClaimIntentBytes || len(intent.ProtoReflect().GetUnknown()) != 0 {
 		return nil, errors.WithStack(ErrTSOClaimInvalid)
 	}
 	if !intent.IsTxn && (intent.ReadTimestamp != 0 || len(intent.PrimaryKey) != 0 || intent.PreviousCommitTimestamp != 0) {
@@ -77,11 +82,6 @@ func canonicalTimestampIntent(intent *pb.TimestampClaimIntent) (*pb.TimestampCla
 func canonicalTimestampIntentContents(intent *pb.TimestampClaimIntent) (*pb.TimestampClaimIntent, error) {
 	out := proto.CloneOf(intent)
 	if err := canonicalClaimParticipants(out); err != nil {
-		return nil, err
-	}
-	var err error
-	out.Mutations, err = canonicalClaimMutations(out.Mutations)
-	if err != nil {
 		return nil, err
 	}
 	out.ReadKeys = canonicalClaimKeys(out.ReadKeys)
@@ -106,39 +106,6 @@ func canonicalClaimKeys(keys [][]byte) [][]byte {
 	return out
 }
 
-func canonicalClaimMutation(mutation *pb.Mutation) (*pb.Mutation, error) {
-	if mutation == nil || len(mutation.ProtoReflect().GetUnknown()) != 0 {
-		return nil, errors.WithStack(ErrTSOClaimInvalid)
-	}
-	if _, known := pb.Op_name[int32(mutation.Op)]; !known {
-		return nil, errors.WithStack(ErrTSOClaimInvalid)
-	}
-	mut := proto.CloneOf(mutation)
-	if mut.CommitTsValueOffset != 0 {
-		if mut.Op != pb.Op_PUT {
-			return nil, errors.WithStack(ErrTSOClaimInvalid)
-		}
-		offset := mut.CommitTsValueOffset
-		if offset > uint64(len(mut.Value)) || uint64(len(mut.Value))-offset < uint64FieldSize {
-			return nil, errors.WithStack(ErrTSOClaimInvalid)
-		}
-		clear(mut.Value[offset : offset+uint64FieldSize])
-	}
-	return mut, nil
-}
-
-func canonicalClaimMutations(mutations []*pb.Mutation) ([]*pb.Mutation, error) {
-	out := make([]*pb.Mutation, len(mutations))
-	for index, mutation := range mutations {
-		mut, err := canonicalClaimMutation(mutation)
-		if err != nil {
-			return nil, err
-		}
-		out[index] = mut
-	}
-	return out, nil
-}
-
 func timestampIntentDigest(intent *pb.TimestampClaimIntent) (TSOIntentDigest, error) {
 	canonical, err := canonicalTimestampIntent(intent)
 	if err != nil {
@@ -155,9 +122,15 @@ func ValidateRequestTimestampIntent(request *pb.Request) error {
 	if request == nil || len(request.ProtoReflect().GetUnknown()) != 0 {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
+	if err := validateClaimMutationHeaders(request.Mutations); err != nil {
+		return err
+	}
 	intent, err := canonicalTimestampIntent(request.GetTimestampIntent())
 	if err != nil {
 		return err
+	}
+	if !proto.Equal(intent, request.TimestampIntent) {
+		return errors.WithStack(ErrTSOClaimInvalid)
 	}
 	if request.IsTxn != intent.IsTxn || request.ObservedRouteVersion != intent.ObservedRouteVersion {
 		return errors.WithStack(ErrTSOClaimInvalid)
@@ -171,6 +144,15 @@ func ValidateRequestTimestampIntent(request *pb.Request) error {
 		muts = data
 	}
 	return validateTimestampIntentProjection(intent, request, muts)
+}
+
+func validateClaimMutationHeaders(mutations []*pb.Mutation) error {
+	for _, mutation := range mutations {
+		if mutation == nil || len(mutation.ProtoReflect().GetUnknown()) != 0 {
+			return errors.WithStack(ErrTSOClaimInvalid)
+		}
+	}
+	return nil
 }
 
 func validateClaimTransactionMeta(request *pb.Request, intent *pb.TimestampClaimIntent) ([]*pb.Mutation, error) {
@@ -215,7 +197,7 @@ func selectClaimPrefixPayload(expected *pb.TimestampClaimParticipant, request *p
 		}
 	}
 	selected := proto.CloneOf(expected)
-	selected.Mutations = []*pb.Mutation{selected.Mutations[indices[0]]}
+	selected.Mutations = []*pb.TimestampClaimMutationEvidence{selected.Mutations[indices[0]]}
 	return selected, nil
 }
 
@@ -231,11 +213,11 @@ func validateClaimParticipantRequest(expected *pb.TimestampClaimParticipant, req
 		}
 	}
 	for index, mut := range muts {
-		copyMut := proto.CloneOf(mut)
-		if err := normalizeClaimedPatch(copyMut, expected.Mutations[index], claimed.Proof.Record.Timestamp); err != nil {
+		evidence, err := claimReceivedMutationEvidence(mut, expected.Mutations[index], claimed.Proof.Record.Timestamp)
+		if err != nil {
 			return err
 		}
-		actual.Mutations = append(actual.Mutations, copyMut)
+		actual.Mutations = append(actual.Mutations, evidence)
 	}
 	canonical, err := canonicalClaimParticipant(actual)
 	if err != nil {
@@ -247,12 +229,15 @@ func validateClaimParticipantRequest(expected *pb.TimestampClaimParticipant, req
 	return nil
 }
 
-func normalizeClaimedPatch(actual, expected *pb.Mutation, timestamp uint64) error {
+func normalizeClaimedPatch(actual *pb.Mutation, expected *pb.TimestampClaimMutationEvidence, timestamp uint64) error {
 	if actual == nil || expected == nil {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
 	offset := expected.CommitTsValueOffset
 	if offset == 0 {
+		if actual.CommitTsValueOffset != 0 {
+			return errors.WithStack(ErrTSOClaimInvalid)
+		}
 		return nil
 	}
 	if err := validateClaimPatchOffset(actual.CommitTsValueOffset, offset, timestamp); err != nil {
@@ -264,7 +249,6 @@ func normalizeClaimedPatch(actual, expected *pb.Mutation, timestamp uint64) erro
 	if timestamp != 0 && binary.BigEndian.Uint64(actual.Value[offset:offset+commitTSPatchLen]) != timestamp {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
-	actual.CommitTsValueOffset = offset
 	return nil
 }
 
@@ -339,21 +323,31 @@ func ValidateRequestTimestampClaim(ctx context.Context, allocator TimestampAlloc
 	if err := ValidateRequestTimestampIntent(request); err != nil {
 		return err
 	}
-	claim, err := DecodeRequestTimestampClaim(request.TimestampClaim)
+	claim, err := validateTimestampIntentClaim(request)
 	if err != nil {
 		return err
 	}
+	return validateRequestClaimRecord(ctx, allocator, request, claim)
+}
+
+// Also used for resolution of an already validated, durable PREPARE capsule.
+// This verifies the signed manifest, not an arbitrary request's payload.
+func validateTimestampIntentClaim(request *pb.Request) (TSORequestClaim, error) {
+	claim, err := DecodeRequestTimestampClaim(request.TimestampClaim)
+	if err != nil {
+		return claim, err
+	}
 	digest, err := timestampIntentDigest(request.TimestampIntent)
 	if err != nil {
-		return err
+		return claim, err
 	}
 	var operation TSOOperationID
 	copy(operation[:], request.TimestampIntent.OperationId)
 	expected := TSOClaimBinding{Owner: TSOClaimOwner(sha256.Sum256(claim.Signed.PublicKey[:])), Operation: operation, Intent: digest, Role: TSOClaimCommit}
 	if err := validateRequestClaimBinding(claim, expected, request.TimestampIntent.ReadTimestamp); err != nil {
-		return err
+		return claim, err
 	}
-	return validateRequestClaimRecord(ctx, allocator, request, claim)
+	return claim, nil
 }
 
 func validateRequestClaimBinding(claim TSORequestClaim, expected TSOClaimBinding, minimum uint64) error {
@@ -371,6 +365,10 @@ func validateRequestClaimRecord(ctx context.Context, allocator TimestampAllocato
 	if timestamp != claim.Proof.Record.Timestamp {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
+	return lookupRequestClaimRecord(ctx, allocator, claim)
+}
+
+func lookupRequestClaimRecord(ctx context.Context, allocator TimestampAllocator, claim TSORequestClaim) error {
 	issuer, ok := allocator.(TSOClaimIssuer)
 	if !ok {
 		return errors.WithStack(ErrTSOProtocolUnsupported)

@@ -15,7 +15,7 @@ func bindParticipantTimestampIntent(requests []*pb.Request, retained *pb.Timesta
 		return nil, errors.WithStack(ErrTSOClaimInvalid)
 	}
 	first := requests[0]
-	root := &pb.TimestampClaimIntent{IsTxn: first.IsTxn, ObservedRouteVersion: first.ObservedRouteVersion}
+	root := &pb.TimestampClaimIntent{IsTxn: first.IsTxn, ObservedRouteVersion: first.ObservedRouteVersion, ManifestVersion: TSOClaimProtocolVersion}
 	if err := initializeParticipantClaimOperation(root, retained); err != nil {
 		return nil, err
 	}
@@ -66,10 +66,13 @@ func appendParticipantClaimIntent(root *pb.TimestampClaimIntent, request *pb.Req
 		root.LockTtlMs = meta.LockTTLms
 		muts = data
 	}
-	root.Mutations = append(root.Mutations, muts...)
+	evidence, err := claimMutationEvidenceList(muts)
+	if err != nil {
+		return err
+	}
 	root.ReadKeys = append(root.ReadKeys, request.ReadKeys...)
 	root.WriteFenceBypassKeys = append(root.WriteFenceBypassKeys, request.WriteFenceBypassKeys...)
-	root.Participants = append(root.Participants, &pb.TimestampClaimParticipant{GroupId: request.TimestampClaimGroupId, Mutations: muts, ReadKeys: request.ReadKeys, WriteFenceBypassKeys: request.WriteFenceBypassKeys})
+	root.Participants = append(root.Participants, &pb.TimestampClaimParticipant{GroupId: request.TimestampClaimGroupId, Mutations: evidence, ReadKeys: request.ReadKeys, WriteFenceBypassKeys: request.WriteFenceBypassKeys})
 	return nil
 }
 
@@ -343,7 +346,7 @@ func claimedResolutionRequest(group *OperationGroup[OP], gid uint64, primary []b
 		return nil, errors.WithStack(ErrTSOClaimInvalid)
 	}
 	request := &pb.Request{IsTxn: true, Phase: phase, Ts: group.StartTS, ObservedRouteVersion: group.ObservedRouteVersion, TimestampClaimGroupId: gid, TimestampIntent: group.TimestampIntent, TimestampClaim: group.TimestampClaim,
-		Mutations: append([]*pb.Mutation{txnMetaMutation(primary, group.TimestampIntent.LockTtlMs, group.CommitTS)}, keyMutations(participant.Mutations)...), WriteFenceBypassKeys: participant.WriteFenceBypassKeys}
+		Mutations: append([]*pb.Mutation{txnMetaMutation(primary, group.TimestampIntent.LockTtlMs, group.CommitTS)}, claimResolutionKeyMutations(participant.Mutations)...), WriteFenceBypassKeys: participant.WriteFenceBypassKeys}
 	return request, nil
 }
 

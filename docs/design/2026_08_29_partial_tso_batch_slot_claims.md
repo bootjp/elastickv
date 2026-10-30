@@ -678,3 +678,59 @@ journaling and remaining legacy resolution/route-retry integration are still
 release gates. The separately assigned large-payload compatibility probe is
 pending independent validation; this retry delta changes no payload or wire limit.
 The document remains Partial even when the specific composed retry tests pass.
+
+## 11. Compact Manifest And Resolution Admission Checkpoint
+
+Sections 7 through 10 retain historical component measurements. This section
+records the later composed candidate; no earlier receipt approves a later HEAD.
+
+Independent actual-path tests found a compatibility defect in the unpublished
+full-value manifest. A legal 33 MiB PUT passed legacy marshal/FSM/readback but
+failed claim issuance. For 22 MiB, issuance succeeded, but the intent contained
+46,137,411 bytes and Forward contained 69,206,575 bytes, exceeding the existing
+67,108,864-byte limit. Both real Raft marshaling and loopback Forward rejected it;
+the same legacy Forward succeeded. Maintained success assertions reproduced
+these failures on the preceding commit, including native 63.5 MiB admission.
+
+Protocol version 2 replaces value copies with typed mutation evidence: operation,
+key, value length, SHA256, absence guard and timestamp-patch offset/length. Values
+occur only in the actual Request. Participants retain the complete ordered plan,
+including repeated writes; the redundant global value plan is removed. Receivers
+recompute the evidence from the actual body. Patch hashing streams the original
+buffer with only its declared eight-byte timestamp normalized; validation also
+checks the actual stamped timestamp. A supplied hash is never write authority.
+Old manifest fields/versions, unknown fields and forged participant/prefix
+projections are rejected. This supersedes an unreleased prototype, not a rolling
+upgrade protocol. Transport, Raft and value limits are not increased or reduced.
+
+Resolution validates the exact durable PREPARE capsule and its applied claim;
+it does not reconstruct imaginary values from hashes. Independent admission
+tests additionally found that unbound read aliases, write-fence bypass keys and
+unknown transaction-metadata fields were accepted. Nine maintained COMMIT/ABORT
+cases reproduced this before repair. Resolution now rejects unknown mutations
+and requires every supplied alias/bypass key to belong to the canonical retained
+participant. Nil or partial retained metadata remains supported for resolvers.
+This is an authority restriction, not new commit-time read-set validation or a
+store OCC exemption. All resolution producers/consumers were audited.
+
+The composed Go candidate passes the complete KV race suite: 2,319 test/subtest
+pass events, fail0/skip0, 88.670 seconds. Final focused claim/transaction/tamper
+race3 passes27.722s; selected adapter race3 passes13.702s. Actual single-voter
+native TSO and data groups exercise 22/33/63.5 MiB Forward, adapter admission,
+Raft commit/apply and full-value Pebble readback with sub-1-KiB manifests. The
+original distributed strict-participant and native checkpoint/retry tests remain.
+Whole-repository lint has zero issues; all-package compile-only checks are
+separate and are not counted as executed-test passes. An independent fixed-source
+crypto/schema/capsule/projection review found no validated P1/P2, including five
+small-value probes over three race repetitions (1.837s).
+
+These receipts do not prove a whole-process heap bound, arbitrary metadata-heavy
+limit combinations, multi-node fault campaigns or production throughput. The
+remaining activation requirements are unchanged: authenticated durable signer
+registration, all-member decoder and future-member fences, commit-time policy
+authority, ingress unknown-attempt journal/recovery, full control/snapshot
+composition, retention obligations, legacy resolution/route-retry acceptance,
+Jepsen and deployment/performance evidence. The error-only authority callback is
+not itself a commit-time epoch witness. Default legacy range admission remains
+unmodified. This document remains Partial; no rollout or complete vulnerability
+closure is claimed before those production gates are implemented.
