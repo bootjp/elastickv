@@ -11,7 +11,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -37,7 +36,7 @@ func TestSplitRangeAuthRejectsProofFreeCatalogMutationDuringRollout(t *testing.T
 				server, coordinator := proofFreeSplitRangeAuthServer(t)
 				ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", tc.credential))
 				if tc.tls {
-					ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+					ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: migrationTLSInfoFixture(t)})
 				}
 				unary, _ := SplitMigrationTokenAuth(tc.configuredToken, false, enforced)
 				request := &pb.SplitRangeRequest{ExpectedCatalogVersion: 1, RouteId: 1, SplitKey: []byte("m")}

@@ -10,7 +10,6 @@ import (
 	"github.com/stretchr/testify/require"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/credentials"
 	"google.golang.org/grpc/metadata"
 	"google.golang.org/grpc/peer"
 	"google.golang.org/grpc/status"
@@ -35,7 +34,7 @@ func TestSplitAndPrepareEvidenceCredentialsRemainIndependent(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			ctx := metadata.NewIncomingContext(t.Context(), metadata.Pairs("authorization", "Bearer "+tc.token))
-			ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: credentials.TLSInfo{}})
+			ctx = peer.NewContext(ctx, &peer.Peer{AuthInfo: migrationTLSInfoFixture(t)})
 			info := &grpc.UnaryServerInfo{FullMethod: tc.method}
 			called := false
 			_, err := migration(ctx, tc.request, info, func(ctx context.Context, request any) (any, error) {
