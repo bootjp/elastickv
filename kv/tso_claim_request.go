@@ -30,7 +30,7 @@ func timestampClaimIdentity(allocator any) *TSOClaimIdentity {
 }
 
 func EnsureRequestTimestampIntent(request *pb.Request) error {
-	if request == nil {
+	if request == nil || !validClaimCreationPhase(request.IsTxn, request.Phase) {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
 	if request.TimestampIntent != nil {
@@ -41,7 +41,7 @@ func EnsureRequestTimestampIntent(request *pb.Request) error {
 		return errors.Wrap(err, "create timestamp operation ID")
 	}
 	intent := &pb.TimestampClaimIntent{
-		OperationId: operation, IsTxn: request.IsTxn, ManifestVersion: TSOClaimProtocolVersion,
+		OperationId: operation, IsTxn: request.IsTxn, InitialPhase: request.Phase, ManifestVersion: TSOClaimProtocolVersion,
 		ReadKeys: request.ReadKeys, ObservedRouteVersion: request.ObservedRouteVersion,
 		WriteFenceBypassKeys: request.WriteFenceBypassKeys,
 	}
@@ -49,6 +49,9 @@ func EnsureRequestTimestampIntent(request *pb.Request) error {
 	if request.IsTxn {
 		meta, data, err := extractTxnMeta(request.Mutations)
 		if err != nil {
+			return err
+		}
+		if err := validateClaimCreationMeta(request.Phase, meta); err != nil {
 			return err
 		}
 		intent.ReadTimestamp, intent.PrimaryKey, intent.PreviousCommitTimestamp = request.Ts, meta.PrimaryKey, meta.PrevCommitTS
@@ -73,8 +76,8 @@ func canonicalTimestampIntent(intent *pb.TimestampClaimIntent) (*pb.TimestampCla
 	if intent == nil || intent.ManifestVersion != TSOClaimProtocolVersion || len(intent.OperationId) != len(TSOOperationID{}) || proto.Size(intent) > maxTSOClaimIntentBytes || len(intent.ProtoReflect().GetUnknown()) != 0 {
 		return nil, errors.WithStack(ErrTSOClaimInvalid)
 	}
-	if !intent.IsTxn && (intent.ReadTimestamp != 0 || len(intent.PrimaryKey) != 0 || intent.PreviousCommitTimestamp != 0) {
-		return nil, errors.WithStack(ErrTSOClaimInvalid)
+	if err := validateClaimIntentMode(intent); err != nil {
+		return nil, err
 	}
 	return canonicalTimestampIntentContents(intent)
 }
@@ -132,7 +135,7 @@ func ValidateRequestTimestampIntent(request *pb.Request) error {
 	if !proto.Equal(intent, request.TimestampIntent) {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
-	if request.IsTxn != intent.IsTxn || request.ObservedRouteVersion != intent.ObservedRouteVersion {
+	if !claimRequestModeMatches(request, intent) || request.ObservedRouteVersion != intent.ObservedRouteVersion {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
 	muts := request.Mutations
@@ -158,6 +161,9 @@ func validateClaimMutationHeaders(mutations []*pb.Mutation) error {
 func validateClaimTransactionMeta(request *pb.Request, intent *pb.TimestampClaimIntent) ([]*pb.Mutation, error) {
 	meta, data, err := extractTxnMeta(request.Mutations)
 	if err != nil {
+		return nil, err
+	}
+	if err := validateClaimCreationMeta(request.Phase, meta); err != nil {
 		return nil, err
 	}
 	if request.Ts != intent.ReadTimestamp || !bytes.Equal(meta.PrimaryKey, intent.PrimaryKey) || meta.PrevCommitTS != intent.PreviousCommitTimestamp || meta.LockTTLms != intent.LockTtlMs {
@@ -299,12 +305,21 @@ func IssueRequestTimestampClaim(ctx context.Context, allocator TimestampAllocato
 }
 
 func stampClaimPersistenceTimestamp(request *pb.Request, timestamp uint64) error {
+	if request == nil || !validClaimCreationPhase(request.IsTxn, request.Phase) {
+		return errors.WithStack(ErrTSOClaimInvalid)
+	}
+	if intent := request.TimestampIntent; intent != nil && !claimRequestModeMatches(request, intent) {
+		return errors.WithStack(ErrTSOClaimInvalid)
+	}
 	if !request.IsTxn {
 		request.Ts = timestamp
 		return StampMutationCommitTS(request.Mutations, timestamp)
 	}
 	meta, muts, err := extractTxnMeta(request.Mutations)
 	if err != nil {
+		return err
+	}
+	if err := validateClaimCreationMeta(request.Phase, meta); err != nil {
 		return err
 	}
 	if request.Phase == pb.Phase_PREPARE {

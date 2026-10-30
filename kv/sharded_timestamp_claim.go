@@ -15,7 +15,7 @@ func bindParticipantTimestampIntent(requests []*pb.Request, retained *pb.Timesta
 		return nil, errors.WithStack(ErrTSOClaimInvalid)
 	}
 	first := requests[0]
-	root := &pb.TimestampClaimIntent{IsTxn: first.IsTxn, ObservedRouteVersion: first.ObservedRouteVersion, ManifestVersion: TSOClaimProtocolVersion}
+	root := &pb.TimestampClaimIntent{IsTxn: first.IsTxn, InitialPhase: first.Phase, ObservedRouteVersion: first.ObservedRouteVersion, ManifestVersion: TSOClaimProtocolVersion}
 	if err := initializeParticipantClaimOperation(root, retained); err != nil {
 		return nil, err
 	}
@@ -53,13 +53,16 @@ func initializeParticipantClaimOperation(root, retained *pb.TimestampClaimIntent
 }
 
 func appendParticipantClaimIntent(root *pb.TimestampClaimIntent, request *pb.Request) error {
-	if request.IsTxn != root.IsTxn || request.ObservedRouteVersion != root.ObservedRouteVersion {
+	if request.IsTxn != root.IsTxn || request.Phase != root.InitialPhase || request.ObservedRouteVersion != root.ObservedRouteVersion {
 		return errors.WithStack(ErrTSOClaimInvalid)
 	}
 	muts := request.Mutations
 	if request.IsTxn {
 		meta, data, err := extractTxnMeta(muts)
 		if err != nil {
+			return err
+		}
+		if err := validateClaimCreationMeta(request.Phase, meta); err != nil {
 			return err
 		}
 		root.ReadTimestamp, root.PrimaryKey, root.PreviousCommitTimestamp = request.Ts, meta.PrimaryKey, meta.PrevCommitTS

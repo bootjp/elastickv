@@ -7,7 +7,7 @@ import (
 	"github.com/cockroachdb/errors"
 )
 
-const TSOClaimProtocolVersion uint32 = 2
+const TSOClaimProtocolVersion uint32 = 3
 
 type TSORequestClaim struct {
 	Signed TSOSignedClaimIntent

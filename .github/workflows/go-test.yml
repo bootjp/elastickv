@@ -14,6 +14,7 @@ jobs:
   test:
     env:
       GRPC_SEQUENCE_TESTS: '^(Test_consistency_satisfy_write_after_read_sequence|Test_grpc_transaction)$'
+      RAFT_NATIVE_MEMORY_TESTS: '^(TestMigrationQuorumCommitFollowsForcedLeadershipTransfer|TestMigrationQuorumPartitionAcceptance|TestTimestampClaimLargeNativeForward)$'
     strategy:
       matrix:
         os: [ [ubuntu-latest] ]
@@ -29,12 +30,17 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y fuse3 sqlite3
       - name: Reject production imports of test support
         run: bash scripts/check-production-imports.sh
-      - name: Run race tests outside full-length gRPC sequences
-        run: go test -race -timeout=30m ./... -skip "$GRPC_SEQUENCE_TESTS"
+      - name: Run race tests outside dedicated large-value and gRPC phases
+        run: go test -race -timeout=30m ./... -skip "$GRPC_SEQUENCE_TESTS|$RAFT_NATIVE_MEMORY_TESTS"
         env:
           # Fail, rather than skip, the kernel-mount tests when FUSE is unusable.
           ELASTICKV_REQUIRE_FUSE: "1"
           ELASTICKV_REQUIRE_SQLITE: "1"
+      # Native large-value fixtures retain several replicas and race shadow
+      # memory. Keep their payloads, assertions and deadlines unchanged, but
+      # avoid competing with other packages' heavy fixtures.
+      - name: Run native migration and timestamp large-value race acceptance
+        run: go test -race -timeout=30m ./adapter -run "$RAFT_NATIVE_MEMORY_TESTS"
       # These unchanged 10,000-iteration tests need a fresh package budget
       # after the serial migration/snapshot acceptance tests have finished.
       - name: Run full-length gRPC consistency sequences

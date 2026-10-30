@@ -180,7 +180,14 @@ func parseClaimResolutionRequest(request *pb.Request) (TxnMeta, []*pb.Mutation, 
 	if err := validateClaimMutationHeaders(request.Mutations); err != nil {
 		return TxnMeta{}, nil, err
 	}
-	return extractTxnMeta(request.Mutations)
+	meta, mutations, err := extractTxnMeta(request.Mutations)
+	if err != nil {
+		return TxnMeta{}, nil, err
+	}
+	if meta.PrepareCommitTS != 0 {
+		return TxnMeta{}, nil, errors.WithStack(ErrTSOClaimInvalid)
+	}
+	return meta, mutations, nil
 }
 
 func retainedResolutionParticipant(request *pb.Request, meta TxnMeta, evidence *pb.Request) (*pb.TimestampClaimParticipant, error) {
@@ -191,7 +198,7 @@ func retainedResolutionParticipant(request *pb.Request, meta TxnMeta, evidence *
 	if err != nil {
 		return nil, err
 	}
-	if !proto.Equal(intent, evidence.TimestampIntent) || request.Ts != intent.ReadTimestamp || request.ObservedRouteVersion != intent.ObservedRouteVersion || !bytes.Equal(meta.PrimaryKey, intent.PrimaryKey) {
+	if intent.InitialPhase != pb.Phase_PREPARE || !proto.Equal(intent, evidence.TimestampIntent) || request.Ts != intent.ReadTimestamp || request.ObservedRouteVersion != intent.ObservedRouteVersion || !bytes.Equal(meta.PrimaryKey, intent.PrimaryKey) {
 		return nil, errors.WithStack(ErrTSOClaimInvalid)
 	}
 	return claimIntentParticipant(intent, request.TimestampClaimGroupId)

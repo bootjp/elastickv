@@ -106,6 +106,10 @@ message TimestampClaimIntent {
   repeated TimestampClaimParticipant participants = 10;
   uint64 lock_ttl_ms = 11;
   uint32 manifest_version = 12;
+  // IsTxn plus initial_phase binds raw NONE, one-phase transaction NONE, or
+  // transaction PREPARE. COMMIT/ABORT require the retained PREPARE capsule;
+  // they do not change the original phase in its signed manifest.
+  Phase initial_phase = 13;
 }
 
 message TimestampClaimParticipant {

@@ -692,7 +692,7 @@ failed claim issuance. For 22 MiB, issuance succeeded, but the intent contained
 the same legacy Forward succeeded. Maintained success assertions reproduced
 these failures on the preceding commit, including native 63.5 MiB admission.
 
-Protocol version 2 replaces value copies with typed mutation evidence: operation,
+The version-2 checkpoint replaced value copies with typed mutation evidence: operation,
 key, value length, SHA256, absence guard and timestamp-patch offset/length. Values
 occur only in the actual Request. Participants retain the complete ordered plan,
 including repeated writes; the redundant global value plan is removed. Receivers
@@ -734,3 +734,60 @@ Jepsen and deployment/performance evidence. The error-only authority callback is
 not itself a commit-time epoch witness. Default legacy range admission remains
 unmodified. This document remains Partial; no rollout or complete vulnerability
 closure is claimed before those production gates are implemented.
+
+## 12. Signed Creation Mode And Phase
+
+Security review of the unpublished d142 checkpoint found that a valid PREPARE
+claim could be relabeled as Phase NONE while its PrepareCommitTS was moved to
+CommitTS. The unchanged signed manifest and ledger proof still passed admission,
+allowing a one-phase write before a distributed decision. A maintained actual
+Forward/Raft test reproduces both successful admission and premature value
+publication on that commit. An earlier fixture with an incorrect metadata key
+failed before admission and is not counted as reproduction evidence.
+
+Protocol version 3 retains compact mutation evidence and additionally signs
+IsTxn plus InitialPhase. Raw NONE, transaction NONE and transaction PREPARE are
+distinct creation modes. Unknown phases, raw transaction phases, resolution as
+creation, mixed participant phases and older manifest versions are rejected.
+Changing both a request and its manifest into a coherent different mode still
+fails the signed digest check. PREPARE must not carry CommitTS, and one-phase
+creation must not carry PrepareCommitTS; moving or populating both slots is not
+a valid substitute for the persistence timestamp checked against the claim.
+
+COMMIT and ABORT do not overwrite InitialPhase in the signed manifest. They
+remain separately authorized by the exact durable PREPARE capsule, matching
+claim, participant projection and stored intents. Resolution rejects an
+irrelevant PrepareCommitTS slot. Legitimate resolver metadata omission/subsets,
+partial/full retries, original-start OCC and exact prepared-version comparisons
+are unchanged. There is no extra store exemption or timestamp-floor shift.
+
+Caller audit covered single-coordinate and sharded raw/one-phase/PREPARE
+construction, retained timestamp restoration, participant stamping, durable
+evidence encoding, internal/Distribution validation, resolver attachment and
+COMMIT/ABORT parsing. Protocol advertisements and strict decoder checks all
+use the same version constant. This supersedes unpublished v2, not a rolling
+upgrade protocol; default runtime activation and legacy range admission remain
+unchanged. All production activation gates in section 11 remain open.
+
+The new focused mode/signature/metadata regressions pass race3 (KV 1.778s),
+and actual Forward/Raft PREPARE, COMMIT/ABORT and idempotent replay pass race3
+(adapter 4.294s). The same actual-path test fails on d142 with successful
+forged admission and visible unprepared data. These receipts do not replace
+fresh whole-suite, CI or exact latest-HEAD normal/security review gates.
+
+After behavior-preserving lint cleanup, the full KV race suite passes 2,343
+test/subtest cases in 87.984 seconds, with zero failures/skips. Whole-repository
+lint reports zero issues. An independent read-only review of the mode-binding
+delta and its final predicate/enum cleanup found no validated P1/P2. Separately,
+the three native large-value fixtures pass race3 in 117.033 seconds with their
+original payloads, internal deadlines and assertions. CI schedules those fixtures
+outside other packages' heavy work without removing any test, followed by the
+unchanged full-length gRPC phase. This does not establish an OOM root cause for
+the earlier CI context-deadline failure. Pinned Buf generation was repeated into
+a separate directory and every generated protobuf file matched byte-for-byte.
+
+An independent fixed-source Linux-arm64 control (Go 1.27.2, network none,
+2 CPU/4 GiB) passes selected mode/signature and distributed/prepared/resolution
+KV regressions in 1.699 seconds, and actual PREPARE/resolution plus native
+22/33/63.5 MiB Forward in 4.947 seconds. This is not Linux whole-suite,
+multi-node fault, production-authentication or deployment evidence.
