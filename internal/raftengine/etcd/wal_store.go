@@ -77,6 +77,9 @@ func prepareDataDirs(dataDir, snapDir, fsmSnapDir string) error {
 	if err := os.MkdirAll(snapDir, defaultDirPerm); err != nil {
 		return errors.WithStack(err)
 	}
+	if err := recoverPipelineSnapshotBackups(snapDir); err != nil {
+		return errors.Wrap(err, "recover interrupted snapshot normalization")
+	}
 	if err := cleanupStaleSnapshotSpools(dataDir); err != nil {
 		return errors.Wrap(err, "cleanup stale snapshot spools")
 	}

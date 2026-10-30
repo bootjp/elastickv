@@ -252,26 +252,9 @@ func skipPipelineWireBytes(file *os.File, end, length int64) error {
 }
 
 func verifyPipelineRaftMetadata(file *os.File, spans []pipelineWireSpan, expected *raftpb.SnapshotMetadata) error {
-	var total, members uint64
-	actual := &raftpb.SnapshotMetadata{}
-	for _, span := range spans {
-		if span.length < 0 || span.length > pipelineControlBytes {
-			return errors.WithStack(errStorageWorkInvalidReservation)
-		}
-		total = pipelineAddBytes(total, uint64(span.length))
-		if total > pipelineControlBytes {
-			return errors.WithStack(errStorageWorkInvalidReservation)
-		}
-		data := make([]byte, int(span.length))
-		if _, err := file.ReadAt(data, span.offset); err != nil {
-			return errors.WithStack(err)
-		}
-		if err := preflightPipelineSnapshotMetadata(data, &members); err != nil {
-			return err
-		}
-		if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(data, actual); err != nil {
-			return errors.WithStack(err)
-		}
+	actual, err := readPipelineRaftMetadata(file, spans)
+	if err != nil {
+		return err
 	}
 	// MemoryStorage.ApplySnapshot calls EnsureSnapshot, which fills absent
 	// scalar defaults in the caller's selected metadata. Compare the same
@@ -280,6 +263,31 @@ func verifyPipelineRaftMetadata(file *os.File, spans []pipelineWireSpan, expecte
 		return errors.Wrap(errInvalidStorageWork, "selected Raft snapshot metadata changed")
 	}
 	return nil
+}
+
+func readPipelineRaftMetadata(file *os.File, spans []pipelineWireSpan) (*raftpb.SnapshotMetadata, error) {
+	var total, members uint64
+	actual := &raftpb.SnapshotMetadata{}
+	for _, span := range spans {
+		if span.length < 0 || span.length > pipelineControlBytes {
+			return nil, errors.WithStack(errStorageWorkInvalidReservation)
+		}
+		total = pipelineAddBytes(total, uint64(span.length))
+		if total > pipelineControlBytes {
+			return nil, errors.WithStack(errStorageWorkInvalidReservation)
+		}
+		data := make([]byte, int(span.length))
+		if _, err := file.ReadAt(data, span.offset); err != nil {
+			return nil, errors.WithStack(err)
+		}
+		if err := preflightPipelineSnapshotMetadata(data, &members); err != nil {
+			return nil, err
+		}
+		if err := (proto.UnmarshalOptions{Merge: true}).Unmarshal(data, actual); err != nil {
+			return nil, errors.WithStack(err)
+		}
+	}
+	return actual, nil
 }
 
 func preflightPipelineSnapshotMetadata(data []byte, members *uint64) error {

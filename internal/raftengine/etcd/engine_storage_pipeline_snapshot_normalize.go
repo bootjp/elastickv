@@ -21,17 +21,18 @@ const (
 // snapshot.Data; the owner reads it after the actual completion. Recovery never
 // captures the selected inline body: its existing Raft file is streamed instead.
 type pipelineSnapshotNormalization struct {
-	snapshot *raftpb.Snapshot
-	inline   []byte
-	path     string
-	env      pipelineConfigurationEnvironment
-	files    *pipelineSnapshotFiles
-	plan     *pipelineSnapshotPlan
-	permit   *storageWorkPermit
-	index    uint64
-	install  bool
-	queued   bool
-	wasToken bool
+	snapshot  *raftpb.Snapshot
+	inline    []byte
+	path      string
+	env       pipelineConfigurationEnvironment
+	files     *pipelineSnapshotFiles
+	plan      *pipelineSnapshotPlan
+	permit    *storageWorkPermit
+	index     uint64
+	install   bool
+	recovered bool
+	queued    bool
+	wasToken  bool
 }
 
 func (e *Engine) newPipelineNormalization(source *raftpb.Snapshot, env pipelineConfigurationEnvironment,
@@ -58,7 +59,7 @@ func (e *Engine) newPipelineNormalization(source *raftpb.Snapshot, env pipelineC
 	}
 	e.initPipelineSnapshotFiles()
 	n := &pipelineSnapshotNormalization{snapshot: proto.CloneOf(&metadata), env: pipelineSnapshotEnvironment(env),
-		files: e.storagePipeline.snapshotFiles, plan: plan, permit: permit, index: source.GetMetadata().GetIndex(), install: recovered, wasToken: isSnapshotToken(source.Data)}
+		files: e.storagePipeline.snapshotFiles, plan: plan, permit: permit, index: source.GetMetadata().GetIndex(), install: recovered, recovered: recovered, wasToken: isSnapshotToken(source.Data)}
 	if recovered {
 		n.path = filepath.Join(env.dataDir, snapDirName, fmt.Sprintf("%016x-%016x.snap", source.GetMetadata().GetTerm(), n.index))
 	} else if !isSnapshotToken(source.Data) {
@@ -101,6 +102,9 @@ func (e *Engine) queuePipelineNormalization(n *pipelineSnapshotNormalization) er
 				return nil, err
 			}
 			if n.install && !n.wasToken {
+				if n.recovered {
+					return nil, persistPipelineRecoveredSnapshot(persist, n)
+				}
 				return nil, persist.SaveSnap(n.snapshot)
 			}
 			return nil, nil
